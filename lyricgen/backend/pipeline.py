@@ -3,6 +3,7 @@
 import json
 import os
 import math
+import random
 import subprocess
 import tempfile
 
@@ -104,12 +105,58 @@ def transcribe(mp3_path: str) -> list[dict]:
 # Step 2 — Full HD lyric video
 # ---------------------------------------------------------------------------
 
+def _find_background_video(style: str) -> str | None:
+    """Find a random background video for the given style.
+
+    Supports two directory layouts:
+      1. Folder per style:  backgrounds/oscuro/01.mp4, backgrounds/oscuro/02.mp4 ...
+      2. Flat with prefix:  backgrounds/oscuro.mp4, backgrounds/oscuro_2.mp4 ...
+
+    Returns a path or None if nothing is found.
+    """
+    candidates: list[str] = []
+
+    # Layout 1 — folder per style
+    style_dir = os.path.join(BACKGROUNDS_DIR, style)
+    if os.path.isdir(style_dir):
+        candidates.extend(
+            os.path.join(style_dir, f)
+            for f in os.listdir(style_dir)
+            if f.lower().endswith(".mp4")
+        )
+
+    # Layout 2 — flat files: {style}.mp4, {style}_2.mp4, {style}_xxx.mp4
+    if os.path.isdir(BACKGROUNDS_DIR):
+        for f in os.listdir(BACKGROUNDS_DIR):
+            if not f.lower().endswith(".mp4"):
+                continue
+            name = os.path.splitext(f)[0]
+            if name == style or name.startswith(f"{style}_"):
+                candidates.append(os.path.join(BACKGROUNDS_DIR, f))
+
+    if candidates:
+        return random.choice(candidates)
+    return None
+
+
 def _get_background_clip(style: str, duration: float) -> VideoFileClip:
-    """Load and loop a background video to match the desired duration."""
-    bg_path = os.path.join(BACKGROUNDS_DIR, f"{style}.mp4")
-    if not os.path.exists(bg_path):
-        bg_path = os.path.join(BACKGROUNDS_DIR, "oscuro.mp4")
-    if not os.path.exists(bg_path):
+    """Load and loop a random background video for the given style."""
+    # Try the requested style first, then fall back to any available video
+    bg_path = _find_background_video(style)
+    if bg_path is None:
+        bg_path = _find_background_video("oscuro")
+    if bg_path is None:
+        # Last resort: pick ANY mp4 from backgrounds dir
+        all_videos = []
+        if os.path.isdir(BACKGROUNDS_DIR):
+            for root, _, files in os.walk(BACKGROUNDS_DIR):
+                all_videos.extend(
+                    os.path.join(root, f)
+                    for f in files if f.lower().endswith(".mp4")
+                )
+        if all_videos:
+            bg_path = random.choice(all_videos)
+    if bg_path is None:
         # Generate a cinematic animated gradient (sunset-like) as fallback
         from moviepy.editor import VideoClip
 
