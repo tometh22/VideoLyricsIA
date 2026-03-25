@@ -8,6 +8,14 @@ import tempfile
 
 import librosa
 import numpy as np
+from moviepy.config import change_settings
+
+# Auto-detect ImageMagick binary
+for _candidate in ["/opt/homebrew/bin/convert", "/usr/local/bin/convert", "/usr/bin/convert"]:
+    if os.path.exists(_candidate):
+        change_settings({"IMAGEMAGICK_BINARY": _candidate})
+        break
+
 from moviepy.editor import (
     AudioFileClip,
     CompositeVideoClip,
