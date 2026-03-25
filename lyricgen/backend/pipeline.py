@@ -110,21 +110,38 @@ def _get_background_clip(style: str, duration: float) -> VideoFileClip:
     if not os.path.exists(bg_path):
         bg_path = os.path.join(BACKGROUNDS_DIR, "oscuro.mp4")
     if not os.path.exists(bg_path):
-        # Generate a gradient background if no video file exists
-        from moviepy.editor import ColorClip
-        def _gradient_frame(t):
-            """Create a dark animated gradient frame."""
-            img = np.zeros((1080, 1920, 3), dtype=np.uint8)
-            for y in range(1080):
-                ratio = y / 1080
-                # Purple-to-dark gradient with subtle animation
-                shift = int(20 * np.sin(t * 0.3 + ratio * 3))
-                r = int(15 + 25 * ratio) + shift
-                g = int(10 + 10 * ratio)
-                b = int(30 + 50 * ratio) + shift
-                img[y, :] = [max(0, min(255, r)), max(0, min(255, g)), max(0, min(255, b))]
-            return img
+        # Generate a cinematic animated gradient (sunset-like) as fallback
         from moviepy.editor import VideoClip
+
+        # Pre-compute gradient rows for performance
+        _rows = np.zeros((1080, 1920, 3), dtype=np.float64)
+        for y in range(1080):
+            ratio = y / 1080
+            # Top: dark teal → Middle: warm pink/magenta → Bottom: dark
+            if ratio < 0.4:
+                r = 15 + 40 * (ratio / 0.4)
+                g = 20 + 30 * (ratio / 0.4)
+                b = 50 + 40 * (ratio / 0.4)
+            elif ratio < 0.65:
+                p = (ratio - 0.4) / 0.25
+                r = 55 + 140 * p
+                g = 50 - 20 * p
+                b = 90 - 30 * p
+            else:
+                p = (ratio - 0.65) / 0.35
+                r = 195 - 170 * p
+                g = 30 - 20 * p
+                b = 60 - 40 * p
+            _rows[y, :] = [r, g, b]
+
+        def _gradient_frame(t):
+            """Animated sunset gradient with slow color shift."""
+            shift = 15 * np.sin(t * 0.15)
+            frame = _rows.copy()
+            frame[:, :, 0] = np.clip(frame[:, :, 0] + shift, 0, 255)
+            frame[:, :, 2] = np.clip(frame[:, :, 2] - shift * 0.5, 0, 255)
+            return frame.astype(np.uint8)
+
         return VideoClip(_gradient_frame, duration=duration).set_fps(24)
 
     clip = VideoFileClip(bg_path)
@@ -136,21 +153,20 @@ def _get_background_clip(style: str, duration: float) -> VideoFileClip:
     return looped.subclip(0, duration)
 
 
-def _make_text_clip(text: str, start: float, end: float) -> TextClip:
-    """Create a centered text overlay for one segment."""
-    txt = TextClip(
-        text,
-        fontsize=80,
-        font="/System/Library/Fonts/Supplemental/Arial Bold.ttf",
-        color="white",
-        stroke_color="black",
-        stroke_width=2,
-        method="caption",
-        size=(1600, None),
-        align="center",
-    )
-    txt = txt.set_position("center").set_start(start).set_end(end)
-    return txt
+# Font detection: find a bold italic font, falling back to bold, then any available
+_FONT_CANDIDATES = [
+    # Bold Italic (preferred — matches reference style)
+    "/System/Library/Fonts/Supplemental/Arial Bold Italic.ttf",
+    "/System/Library/Fonts/Supplemental/Impact.ttf",
+    # Bold fallback
+    "/System/Library/Fonts/Supplemental/Arial Bold.ttf",
+    "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+]
+_LYRIC_FONT = None
+for _fp in _FONT_CANDIDATES:
+    if os.path.exists(_fp):
+        _LYRIC_FONT = _fp
+        break
 
 
 def generate_lyric_video(
@@ -165,9 +181,40 @@ def generate_lyric_video(
     duration = audio.duration
 
     bg = _get_background_clip(style, duration)
-    text_clips = [_make_text_clip(s["text"], s["start"], s["end"]) for s in segments]
 
-    video = CompositeVideoClip([bg] + text_clips, size=(1920, 1080))
+    # Build text overlay clips
+    text_layers = []
+    for s in segments:
+        display_text = s["text"].upper()
+        start, end = s["start"], s["end"]
+
+        # Shadow (slightly offset for depth)
+        shadow = TextClip(
+            display_text,
+            fontsize=90,
+            font=_LYRIC_FONT or "Arial",
+            color="black",
+            method="caption",
+            size=(1500, None),
+            align="center",
+        ).set_position(lambda t: (213, 543)).set_start(start).set_end(end).set_opacity(0.6)
+
+        # Main text
+        txt = TextClip(
+            display_text,
+            fontsize=90,
+            font=_LYRIC_FONT or "Arial",
+            color="white",
+            stroke_color="black",
+            stroke_width=3,
+            method="caption",
+            size=(1500, None),
+            align="center",
+        ).set_position("center").set_start(start).set_end(end)
+
+        text_layers.extend([shadow, txt])
+
+    video = CompositeVideoClip([bg] + text_layers, size=(1920, 1080))
     video = video.set_audio(audio).set_duration(duration)
 
     out_path = os.path.join(job_dir, "lyric_video.mp4")
