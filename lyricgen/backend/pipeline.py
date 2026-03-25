@@ -125,7 +125,7 @@ def _make_text_clip(text: str, start: float, end: float) -> TextClip:
     txt = TextClip(
         text,
         fontsize=80,
-        font="Helvetica-Bold",
+        font="/System/Library/Fonts/Supplemental/Arial Bold.ttf",
         color="white",
         stroke_color="black",
         stroke_width=2,
