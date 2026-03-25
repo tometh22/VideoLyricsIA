@@ -10,8 +10,14 @@ import librosa
 import numpy as np
 from moviepy.config import change_settings
 
-# Auto-detect ImageMagick binary
-for _candidate in ["/opt/homebrew/bin/convert", "/usr/local/bin/convert", "/usr/bin/convert"]:
+# Auto-detect ImageMagick binary (v7 uses "magick", v6 uses "convert")
+for _candidate in [
+    "/opt/homebrew/bin/magick",
+    "/usr/local/bin/magick",
+    "/opt/homebrew/bin/convert",
+    "/usr/local/bin/convert",
+    "/usr/bin/convert",
+]:
     if os.path.exists(_candidate):
         change_settings({"IMAGEMAGICK_BINARY": _candidate})
         break
@@ -119,6 +125,7 @@ def _make_text_clip(text: str, start: float, end: float) -> TextClip:
     txt = TextClip(
         text,
         fontsize=80,
+        font="Helvetica-Bold",
         color="white",
         stroke_color="black",
         stroke_width=2,
