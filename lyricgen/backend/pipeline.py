@@ -51,17 +51,22 @@ def run_pipeline(job_id: str, mp3_path: str, artist: str, style: str):
         # Step 1 — Whisper transcription
         update_job(job_id, current_step="whisper", progress=5)
         segments = transcribe(mp3_path)
-        update_job(job_id, progress=25)
+        update_job(job_id, progress=20)
+
+        # Step 1.5 — Generate AI background if no video files available
+        update_job(job_id, current_step="background", progress=22)
+        bg_image_path = _ensure_background(style, job_dir)
+        update_job(job_id, progress=40)
 
         # Step 2 — Full lyric video
-        update_job(job_id, current_step="video", progress=30)
+        update_job(job_id, current_step="video", progress=42)
         video_path = generate_lyric_video(
-            mp3_path, segments, style, job_dir, artist
+            mp3_path, segments, style, job_dir, artist, bg_image_path
         )
-        update_job(job_id, progress=60)
+        update_job(job_id, progress=65)
 
         # Step 3 — YouTube Short
-        update_job(job_id, current_step="short", progress=65)
+        update_job(job_id, current_step="short", progress=68)
         short_path = generate_short(mp3_path, video_path, segments, job_dir)
         update_job(job_id, progress=85)
 
@@ -99,6 +104,172 @@ def transcribe(mp3_path: str) -> list[dict]:
         for seg in result["segments"]
     ]
     return segments
+
+
+# ---------------------------------------------------------------------------
+# Step 1.5 — AI Background Generation (Stable Diffusion)
+# ---------------------------------------------------------------------------
+
+# Prompt templates per visual style
+_STYLE_PROMPTS = {
+    "oscuro": [
+        "cinematic dark city skyline at night, moody atmosphere, rain reflections, 4k",
+        "dark ocean waves at night, moonlight reflections, cinematic, moody",
+        "dark forest with fog and moonlight, cinematic atmosphere, 4k",
+        "abandoned neon-lit alley at night, rain puddles, cinematic, dark",
+        "dark mountains with aurora borealis, cinematic landscape, 4k",
+    ],
+    "neon": [
+        "neon-lit cyberpunk city street, rain reflections, pink and blue lights, 4k",
+        "neon signs glowing in dark alley, purple and cyan lights, cinematic",
+        "futuristic neon cityscape, holographic lights, cyberpunk, 4k",
+        "neon tunnel with colorful lights, futuristic, cinematic atmosphere",
+        "neon-lit japanese street at night, rain, pink and blue, cinematic",
+    ],
+    "minimal": [
+        "minimalist abstract gradient, soft pastel colors, clean, 4k",
+        "white marble texture with soft lighting, minimal, elegant, 4k",
+        "soft clouds in pale sky, minimalist, clean atmosphere, 4k",
+        "abstract soft geometric shapes, minimal, muted earth tones, 4k",
+        "calm still water with soft sky reflection, minimal, serene, 4k",
+    ],
+    "calido": [
+        "tropical beach sunset with palm trees silhouette, warm golden light, cinematic",
+        "golden hour sunlight through autumn trees, warm tones, cinematic, 4k",
+        "sunset over calm ocean, warm orange and pink sky, cinematic",
+        "desert landscape at golden hour, warm sand dunes, cinematic, 4k",
+        "cozy warm candlelight bokeh, soft amber tones, cinematic",
+    ],
+}
+
+# Cache the SD pipeline so it's only loaded once
+_sd_pipe = None
+
+
+def _get_sd_pipeline():
+    """Load Stable Diffusion pipeline (cached). Uses MPS on Apple Silicon."""
+    global _sd_pipe
+    if _sd_pipe is not None:
+        return _sd_pipe
+
+    import torch
+    from diffusers import StableDiffusionPipeline
+
+    model_id = "runwayml/stable-diffusion-v1-5"
+
+    # Use MPS (Metal) on Apple Silicon, CUDA on NVIDIA, CPU as fallback
+    if torch.backends.mps.is_available():
+        device = "mps"
+        dtype = torch.float16
+    elif torch.cuda.is_available():
+        device = "cuda"
+        dtype = torch.float16
+    else:
+        device = "cpu"
+        dtype = torch.float32
+
+    _sd_pipe = StableDiffusionPipeline.from_pretrained(
+        model_id,
+        torch_dtype=dtype,
+        safety_checker=None,
+    )
+    _sd_pipe = _sd_pipe.to(device)
+
+    # Optimize memory
+    if hasattr(_sd_pipe, "enable_attention_slicing"):
+        _sd_pipe.enable_attention_slicing()
+
+    return _sd_pipe
+
+
+def _generate_ai_background(style: str, output_path: str) -> str:
+    """Generate a unique background image using Stable Diffusion."""
+    prompts = _STYLE_PROMPTS.get(style, _STYLE_PROMPTS["oscuro"])
+    prompt = random.choice(prompts)
+
+    pipe = _get_sd_pipeline()
+
+    # Generate at 768x512 (landscape, fast) then upscale
+    image = pipe(
+        prompt,
+        negative_prompt="text, watermark, logo, words, letters, blurry, low quality",
+        width=768,
+        height=512,
+        num_inference_steps=25,
+        guidance_scale=7.5,
+    ).images[0]
+
+    # Upscale to 1920x1080
+    image = image.resize((1920, 1080), Image.LANCZOS)
+    image.save(output_path, "JPEG", quality=95)
+    return output_path
+
+
+def _ensure_background(style: str, job_dir: str) -> str | None:
+    """Check if background videos exist; if not, generate an AI image.
+
+    Returns the path to a generated background image, or None if video files
+    are available and should be used instead.
+    """
+    # If there are video files, prefer those
+    if _find_background_video(style) is not None:
+        return None
+    if _find_background_video("oscuro") is not None:
+        return None
+
+    # Check if ANY videos exist
+    all_videos = []
+    if os.path.isdir(BACKGROUNDS_DIR):
+        for root, _, files in os.walk(BACKGROUNDS_DIR):
+            all_videos.extend(f for f in files if f.lower().endswith(".mp4"))
+    if all_videos:
+        return None
+
+    # No videos at all — generate with AI
+    bg_path = os.path.join(job_dir, "ai_background.jpg")
+    _generate_ai_background(style, bg_path)
+    return bg_path
+
+
+def _ken_burns_clip(image_path: str, duration: float):
+    """Create an animated Ken Burns (slow zoom + pan) clip from a still image."""
+    from moviepy.editor import VideoClip
+
+    img = np.array(Image.open(image_path))
+    h, w = img.shape[:2]
+
+    # Random zoom direction: zoom in or zoom out
+    zoom_in = random.choice([True, False])
+    # Random pan direction
+    pan_x = random.uniform(-0.05, 0.05)
+    pan_y = random.uniform(-0.03, 0.03)
+
+    def make_frame(t):
+        progress = t / max(duration, 1)
+
+        if zoom_in:
+            scale = 1.0 + 0.15 * progress  # zoom from 1.0x to 1.15x
+        else:
+            scale = 1.15 - 0.15 * progress  # zoom from 1.15x to 1.0x
+
+        # Calculate crop region
+        cw = int(w / scale)
+        ch = int(h / scale)
+        cx = int((w - cw) / 2 + pan_x * progress * w)
+        cy = int((h - ch) / 2 + pan_y * progress * h)
+
+        # Clamp
+        cx = max(0, min(cx, w - cw))
+        cy = max(0, min(cy, h - ch))
+
+        crop = img[cy:cy + ch, cx:cx + cw]
+        # Resize back to full resolution
+        resized = np.array(
+            Image.fromarray(crop).resize((1920, 1080), Image.LANCZOS)
+        )
+        return resized
+
+    return VideoClip(make_frame, duration=duration).set_fps(24)
 
 
 # ---------------------------------------------------------------------------
@@ -222,12 +393,17 @@ def generate_lyric_video(
     style: str,
     job_dir: str,
     artist: str,
+    bg_image_path: str | None = None,
 ) -> str:
     """Generate a 1920x1080 lyric video and return its path."""
     audio = AudioFileClip(mp3_path)
     duration = audio.duration
 
-    bg = _get_background_clip(style, duration)
+    # Use AI-generated image with Ken Burns if available, otherwise use video files
+    if bg_image_path and os.path.exists(bg_image_path):
+        bg = _ken_burns_clip(bg_image_path, duration)
+    else:
+        bg = _get_background_clip(style, duration)
 
     # Build text overlay clips
     text_layers = []

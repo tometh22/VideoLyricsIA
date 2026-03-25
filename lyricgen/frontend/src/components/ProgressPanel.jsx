@@ -1,5 +1,6 @@
 const STEPS = [
   { key: "whisper", label: "Transcribiendo audio con Whisper" },
+  { key: "background", label: "Generando fondo con IA" },
   { key: "video", label: "Generando lyric video Full HD" },
   { key: "short", label: "Creando YouTube Short" },
   { key: "thumbnail", label: "Generando thumbnail" },
