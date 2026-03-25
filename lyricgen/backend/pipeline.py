@@ -91,7 +91,7 @@ def transcribe(mp3_path: str) -> list[dict]:
     """Transcribe an MP3 using local openai-whisper and return segments."""
     import whisper
 
-    model = whisper.load_model("base")
+    model = whisper.load_model("small")
     result = model.transcribe(mp3_path)
     segments = [
         {"start": seg["start"], "end": seg["end"], "text": seg["text"].strip()}
@@ -110,9 +110,22 @@ def _get_background_clip(style: str, duration: float) -> VideoFileClip:
     if not os.path.exists(bg_path):
         bg_path = os.path.join(BACKGROUNDS_DIR, "oscuro.mp4")
     if not os.path.exists(bg_path):
-        # Generate a plain black background if no file exists
+        # Generate a gradient background if no video file exists
         from moviepy.editor import ColorClip
-        return ColorClip(size=(1920, 1080), color=(13, 13, 20)).set_duration(duration)
+        def _gradient_frame(t):
+            """Create a dark animated gradient frame."""
+            img = np.zeros((1080, 1920, 3), dtype=np.uint8)
+            for y in range(1080):
+                ratio = y / 1080
+                # Purple-to-dark gradient with subtle animation
+                shift = int(20 * np.sin(t * 0.3 + ratio * 3))
+                r = int(15 + 25 * ratio) + shift
+                g = int(10 + 10 * ratio)
+                b = int(30 + 50 * ratio) + shift
+                img[y, :] = [max(0, min(255, r)), max(0, min(255, g)), max(0, min(255, b))]
+            return img
+        from moviepy.editor import VideoClip
+        return VideoClip(_gradient_frame, duration=duration).set_fps(24)
 
     clip = VideoFileClip(bg_path)
     if clip.duration >= duration:
@@ -245,53 +258,81 @@ def generate_short(
 # Step 4 — Thumbnail
 # ---------------------------------------------------------------------------
 
+def _draw_text_with_outline(draw, xy, text, font, fill="white", outline="black", width=3):
+    """Draw text with a thick outline for readability."""
+    x, y = xy
+    for ox in range(-width, width + 1):
+        for oy in range(-width, width + 1):
+            if ox != 0 or oy != 0:
+                draw.text((x + ox, y + oy), text, font=font, fill=outline)
+    draw.text((x, y), text, font=font, fill=fill)
+
+
 def generate_thumbnail(
     video_path: str,
     artist: str,
     mp3_path: str,
     job_dir: str,
 ) -> str:
-    """Extract a frame at t=5s and overlay artist/song text."""
-    # Extract frame using moviepy
+    """Generate a stylish thumbnail with artist and song name."""
+    from PIL import ImageFilter, ImageEnhance
+
+    # Extract a frame from the middle of the video (less likely to be blank)
     clip = VideoFileClip(video_path)
-    t = min(5, clip.duration - 0.1)
+    t = min(clip.duration * 0.4, clip.duration - 0.1)
     frame = clip.get_frame(t)
     clip.close()
 
     img = Image.fromarray(frame)
     img = img.resize((1280, 720), Image.LANCZOS)
 
+    # Blur and darken the background to hide lyrics and create depth
+    img = img.filter(ImageFilter.GaussianBlur(radius=15))
+    enhancer = ImageEnhance.Brightness(img)
+    img = enhancer.enhance(0.3)
+
+    # Add a purple/brand color overlay
+    overlay = Image.new("RGB", (1280, 720), (60, 30, 120))
+    img = Image.blend(img, overlay, alpha=0.3)
+
     draw = ImageDraw.Draw(img)
 
     # Song name from the mp3 filename
     song_name = os.path.splitext(os.path.basename(mp3_path))[0]
 
-    # Try to load a nice font, fall back to default
-    try:
-        font_large = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 72)
-        font_medium = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 48)
-    except (OSError, IOError):
-        font_large = ImageFont.load_default()
-        font_medium = ImageFont.load_default()
+    # Load fonts — try macOS paths, then Linux, then default
+    font_paths = [
+        "/System/Library/Fonts/Supplemental/Arial Bold.ttf",
+        "/System/Library/Fonts/Helvetica.ttc",
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+    ]
+    font_artist = ImageFont.load_default()
+    font_song = ImageFont.load_default()
+    for fp in font_paths:
+        if os.path.exists(fp):
+            try:
+                font_artist = ImageFont.truetype(fp, 90)
+                font_song = ImageFont.truetype(fp, 55)
+                break
+            except (OSError, IOError):
+                continue
 
-    # Draw artist name (top center)
-    bbox = draw.textbbox((0, 0), artist, font=font_large)
+    # Draw artist name (centered, upper third)
+    bbox = draw.textbbox((0, 0), artist.upper(), font=font_artist)
     tw = bbox[2] - bbox[0]
     x = (1280 - tw) // 2
-    # Text with outline
-    for ox, oy in [(-2, -2), (-2, 2), (2, -2), (2, 2)]:
-        draw.text((x + ox, 60 + oy), artist, font=font_large, fill="black")
-    draw.text((x, 60), artist, font=font_large, fill="white")
+    _draw_text_with_outline(draw, (x, 220), artist.upper(), font_artist, fill="white", width=4)
 
-    # Draw song name (bottom center)
-    bbox = draw.textbbox((0, 0), song_name, font=font_medium)
+    # Draw a thin purple accent line
+    line_y = 340
+    draw.rectangle([(440, line_y), (840, line_y + 4)], fill=(139, 124, 248))
+
+    # Draw song name (centered, lower third)
+    bbox = draw.textbbox((0, 0), song_name, font=font_song)
     tw = bbox[2] - bbox[0]
     x = (1280 - tw) // 2
-    y = 720 - 120
-    for ox, oy in [(-2, -2), (-2, 2), (2, -2), (2, 2)]:
-        draw.text((x + ox, y + oy), song_name, font=font_medium, fill="black")
-    draw.text((x, y), song_name, font=font_medium, fill="white")
+    _draw_text_with_outline(draw, (x, 400), song_name, font_song, fill=(200, 200, 220), width=3)
 
     out_path = os.path.join(job_dir, "thumbnail.jpg")
-    img.save(out_path, "JPEG", quality=90)
+    img.save(out_path, "JPEG", quality=92)
     return out_path
