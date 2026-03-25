@@ -8,6 +8,9 @@ import tempfile
 
 import librosa
 import numpy as np
+from PIL import Image as _PILImage
+if not hasattr(_PILImage, "ANTIALIAS"):
+    _PILImage.ANTIALIAS = _PILImage.LANCZOS
 from moviepy.config import change_settings
 
 # Auto-detect ImageMagick binary (v7 uses "magick", v6 uses "convert")
