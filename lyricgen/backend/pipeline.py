@@ -586,12 +586,8 @@ def generate_short(
 
     video = VideoFileClip(video_path).subclip(start_time, end_time)
 
-    scaled = video.resize(width=1080)
-    bg = ColorClip(size=(1080, 1920), color=(0, 0, 0)).set_duration(30)
-    final = CompositeVideoClip(
-        [bg, scaled.set_position(("center", "center"))],
-        size=(1080, 1920),
-    )
+    # Cover resize to vertical 1080x1920 (no black bars)
+    final = _cover_resize(video, 1080, 1920)
     final = final.set_audio(video.audio)
 
     out_path = os.path.join(job_dir, "short.mp4")
