@@ -101,11 +101,23 @@ def transcribe(mp3_path: str) -> list[dict]:
     import whisper
 
     model = whisper.load_model("small")
-    result = model.transcribe(mp3_path)
+    result = model.transcribe(mp3_path, word_timestamps=True)
     segments = [
         {"start": seg["start"], "end": seg["end"], "text": seg["text"].strip()}
         for seg in result["segments"]
+        if seg["text"].strip()
     ]
+
+    # Debug: log first 5 segments
+    for i, seg in enumerate(segments[:5]):
+        print(f"[WHISPER] seg {i}: {seg['start']:.2f}–{seg['end']:.2f}  {seg['text'][:60]}")
+
+    # Fix overlapping segments: ensure seg[i].end <= seg[i+1].start
+    GAP = 0.05  # 50ms gap between segments to prevent visual overlap
+    for i in range(len(segments) - 1):
+        if segments[i]["end"] > segments[i + 1]["start"] - GAP:
+            segments[i]["end"] = segments[i + 1]["start"] - GAP
+
     return segments
 
 
@@ -115,32 +127,32 @@ def transcribe(mp3_path: str) -> list[dict]:
 
 _STYLE_PROMPTS = {
     "oscuro": [
-        "cinematic dark city skyline at night, moody atmosphere, rain reflections, 4k",
-        "dark ocean waves at night, moonlight reflections, cinematic, moody",
-        "dark forest with fog and moonlight, cinematic atmosphere, 4k",
-        "abandoned neon-lit alley at night, rain puddles, cinematic, dark",
-        "dark mountains with aurora borealis, cinematic landscape, 4k",
+        "vibrant purple and blue galaxy nebula with bright stars, colorful space, 4k wallpaper",
+        "colorful northern lights aurora over snowy mountains, vivid green and purple sky, 4k",
+        "dramatic sunset with vibrant orange purple clouds over city skyline, colorful, 4k",
+        "colorful abstract liquid art, swirling purple blue and pink paint, vibrant, 4k",
+        "underwater bioluminescent ocean scene, glowing jellyfish, vibrant blue and purple, 4k",
     ],
     "neon": [
-        "neon-lit cyberpunk city street, rain reflections, pink and blue lights, 4k",
-        "neon signs glowing in dark alley, purple and cyan lights, cinematic",
-        "futuristic neon cityscape, holographic lights, cyberpunk, 4k",
-        "neon tunnel with colorful lights, futuristic, cinematic atmosphere",
-        "neon-lit japanese street at night, rain, pink and blue, cinematic",
+        "vibrant neon city street at night, pink blue purple lights everywhere, colorful reflections, 4k",
+        "colorful neon signs and lights in rain, cyberpunk city, vivid pink cyan magenta, 4k",
+        "bright neon geometric shapes floating in space, colorful abstract, pink blue green, 4k",
+        "futuristic neon tunnel with rainbow lights, vibrant colorful, 4k wallpaper",
+        "neon-lit japanese street with cherry blossoms, vibrant pink and blue lights, colorful, 4k",
     ],
     "minimal": [
-        "minimalist abstract gradient, soft pastel colors, clean, 4k",
-        "white marble texture with soft lighting, minimal, elegant, 4k",
-        "soft clouds in pale sky, minimalist, clean atmosphere, 4k",
-        "abstract soft geometric shapes, minimal, muted earth tones, 4k",
-        "calm still water with soft sky reflection, minimal, serene, 4k",
+        "beautiful pastel gradient sky with soft pink orange and lavender clouds, dreamy, 4k",
+        "colorful abstract watercolor wash, soft pink blue and gold blending, artistic, 4k",
+        "bright sunny sky with fluffy white clouds, cheerful vibrant blue, 4k wallpaper",
+        "soft holographic rainbow gradient, iridescent pastel colors, beautiful, 4k",
+        "cherry blossom tree with soft pink petals floating, bright spring day, beautiful, 4k",
     ],
     "calido": [
-        "tropical beach sunset with palm trees silhouette, warm golden light, cinematic",
-        "golden hour sunlight through autumn trees, warm tones, cinematic, 4k",
-        "sunset over calm ocean, warm orange and pink sky, cinematic",
-        "desert landscape at golden hour, warm sand dunes, cinematic, 4k",
-        "cozy warm candlelight bokeh, soft amber tones, cinematic",
+        "stunning tropical sunset over turquoise ocean, vibrant orange pink sky, palm trees, 4k",
+        "colorful hot air balloons floating over green valley at golden hour, vibrant, 4k",
+        "bright sunflower field under vivid blue sky with golden sunlight, cheerful, 4k",
+        "tropical paradise beach with crystal clear water, vibrant turquoise and golden sand, 4k",
+        "colorful autumn forest with bright red orange yellow leaves, golden sunlight, 4k",
     ],
 }
 
@@ -160,7 +172,7 @@ def _get_sd_pipeline():
 
     if torch.backends.mps.is_available():
         device = "mps"
-        dtype = torch.float16
+        dtype = torch.float32  # float16 produces NaN/black images on MPS
     elif torch.cuda.is_available():
         device = "cuda"
         dtype = torch.float16
@@ -196,6 +208,11 @@ def _generate_ai_background(style: str, output_path: str) -> str:
         guidance_scale=7.5,
     ).images[0]
 
+    # Validate the image is not blank/black (SD can fail silently on MPS)
+    arr = np.array(image)
+    if arr.mean() < 5:
+        raise RuntimeError("Stable Diffusion produced a blank/black image")
+
     image = image.resize((1920, 1080), Image.LANCZOS)
     image.save(output_path, "JPEG", quality=95)
     return output_path
@@ -227,25 +244,41 @@ def _ensure_background(style: str, job_dir: str) -> str | None:
 
 
 def _ken_burns_clip(image_path: str, duration: float):
-    """Create an animated Ken Burns (slow zoom + pan) clip from a still image."""
+    """Create an animated Ken Burns clip with periodic direction changes."""
     img = np.array(Image.open(image_path))
     h, w = img.shape[:2]
 
-    zoom_in = random.choice([True, False])
-    pan_x = random.uniform(-0.05, 0.05)
-    pan_y = random.uniform(-0.03, 0.03)
+    # Each cycle lasts ~12 seconds, with a different random direction
+    cycle_dur = 12.0
+    num_cycles = max(1, int(math.ceil(duration / cycle_dur)))
+
+    # Pre-generate random directions for each cycle
+    random.seed(None)
+    cycles = []
+    for _ in range(num_cycles):
+        cycles.append({
+            "zoom_in": random.choice([True, False]),
+            "pan_x": random.uniform(-0.08, 0.08),
+            "pan_y": random.uniform(-0.05, 0.05),
+        })
 
     def make_frame(t):
-        progress = t / max(duration, 1)
-        if zoom_in:
-            scale = 1.0 + 0.15 * progress
+        idx = min(int(t / cycle_dur), num_cycles - 1)
+        c = cycles[idx]
+        progress = (t - idx * cycle_dur) / cycle_dur
+
+        # Smooth ease in/out within each cycle
+        progress = 0.5 - 0.5 * math.cos(progress * math.pi)
+
+        if c["zoom_in"]:
+            scale = 1.0 + 0.25 * progress
         else:
-            scale = 1.15 - 0.15 * progress
+            scale = 1.25 - 0.25 * progress
 
         cw = int(w / scale)
         ch = int(h / scale)
-        cx = int((w - cw) / 2 + pan_x * progress * w)
-        cy = int((h - ch) / 2 + pan_y * progress * h)
+        cx = int((w - cw) / 2 + c["pan_x"] * progress * w)
+        cy = int((h - ch) / 2 + c["pan_y"] * progress * h)
         cx = max(0, min(cx, w - cw))
         cy = max(0, min(cy, h - ch))
 
@@ -287,26 +320,40 @@ def _find_background_video(style: str) -> str | None:
     return None
 
 
-def _make_gradient_clip(duration: float):
+_GRADIENT_PALETTES = {
+    "oscuro": [(10, 10, 30), (30, 15, 60), (80, 20, 80), (40, 10, 50)],
+    "neon": [(10, 5, 40), (80, 0, 120), (0, 100, 130), (120, 0, 80)],
+    "minimal": [(180, 180, 195), (200, 190, 210), (170, 180, 200), (210, 200, 195)],
+    "calido": [(60, 20, 10), (140, 60, 15), (180, 90, 20), (100, 30, 10)],
+}
+
+
+def _make_gradient_clip(duration: float, style: str = "oscuro"):
     """Generate a cinematic animated gradient as fallback background."""
+    palette = _GRADIENT_PALETTES.get(style, _GRADIENT_PALETTES["oscuro"])
+    top = np.array(palette[0], dtype=np.float64)
+    mid1 = np.array(palette[1], dtype=np.float64)
+    mid2 = np.array(palette[2], dtype=np.float64)
+    bot = np.array(palette[3], dtype=np.float64)
+
     _rows = np.zeros((1080, 1920, 3), dtype=np.float64)
     for y in range(1080):
         ratio = y / 1080
-        if ratio < 0.4:
-            r, g, b = 15 + 40 * (ratio / 0.4), 20 + 30 * (ratio / 0.4), 50 + 40 * (ratio / 0.4)
-        elif ratio < 0.65:
-            p = (ratio - 0.4) / 0.25
-            r, g, b = 55 + 140 * p, 50 - 20 * p, 90 - 30 * p
+        if ratio < 0.33:
+            color = top + (mid1 - top) * (ratio / 0.33)
+        elif ratio < 0.66:
+            color = mid1 + (mid2 - mid1) * ((ratio - 0.33) / 0.33)
         else:
-            p = (ratio - 0.65) / 0.35
-            r, g, b = 195 - 170 * p, 30 - 20 * p, 60 - 40 * p
-        _rows[y, :] = [r, g, b]
+            color = mid2 + (bot - mid2) * ((ratio - 0.66) / 0.34)
+        _rows[y, :] = color
 
     def _gradient_frame(t):
-        shift = 15 * np.sin(t * 0.15)
+        shift = 20 * np.sin(t * 0.12)
+        shift2 = 12 * np.cos(t * 0.08)
         frame = _rows.copy()
         frame[:, :, 0] = np.clip(frame[:, :, 0] + shift, 0, 255)
-        frame[:, :, 2] = np.clip(frame[:, :, 2] - shift * 0.5, 0, 255)
+        frame[:, :, 1] = np.clip(frame[:, :, 1] + shift2 * 0.5, 0, 255)
+        frame[:, :, 2] = np.clip(frame[:, :, 2] - shift * 0.6, 0, 255)
         return frame.astype(np.uint8)
 
     return VideoClip(_gradient_frame, duration=duration).set_fps(24)
@@ -329,7 +376,7 @@ def _get_background_clip(style: str, duration: float):
             bg_path = random.choice(all_videos)
 
     if bg_path is None:
-        return _make_gradient_clip(duration)
+        return _make_gradient_clip(duration, style)
 
     clip = VideoFileClip(bg_path)
     if clip.duration >= duration:
@@ -354,40 +401,48 @@ for _fp in _FONT_CANDIDATES:
 
 
 def _make_text_clip(text: str, seg_start: float, seg_end: float):
-    """Create a text clip with shadow for one lyric segment.
-
-    Uses default args to capture seg_start/seg_end by value (not reference).
-    """
+    """Create a text clip with shadow for one lyric segment."""
     display_text = text.upper()
     font = _LYRIC_FONT or "Arial"
+
+    # Reduce font size for long lines to prevent text clipping
+    text_len = len(display_text)
+    if text_len > 80:
+        fontsize = 55
+        text_width = 1700
+    elif text_len > 50:
+        fontsize = 70
+        text_width = 1650
+    else:
+        fontsize = 90
+        text_width = 1500
 
     # Shadow layer
     shadow = TextClip(
         display_text,
-        fontsize=90,
+        fontsize=fontsize,
         font=font,
         color="black",
         method="caption",
-        size=(1500, None),
+        size=(text_width, None),
         align="center",
     ).set_opacity(0.6)
 
-    # Get shadow height to position it slightly below center
     sh = shadow.size[1]
     shadow_y = (1080 - sh) // 2 + 4
-    shadow_x = (1920 - 1500) // 2 + 4
+    shadow_x = (1920 - text_width) // 2 + 4
     shadow = shadow.set_position((shadow_x, shadow_y)).set_start(seg_start).set_end(seg_end)
 
     # Main text layer
     txt = TextClip(
         display_text,
-        fontsize=90,
+        fontsize=fontsize,
         font=font,
         color="white",
         stroke_color="black",
         stroke_width=3,
         method="caption",
-        size=(1500, None),
+        size=(text_width, None),
         align="center",
     ).set_position("center").set_start(seg_start).set_end(seg_end)
 
@@ -414,6 +469,15 @@ def generate_lyric_video(
 
     # Build text clips — each segment gets its own shadow + text
     text_layers = []
+
+    # Show brief artist title card during long instrumental intros
+    first_lyric_start = segments[0]["start"] if segments else duration
+    if first_lyric_start > 5 and artist:
+        # Show for max 5 seconds, fade before lyrics start
+        title_end = min(5.0, first_lyric_start - 1.0)
+        title_layers = _make_text_clip(artist, 0.5, title_end)
+        text_layers.extend(title_layers)
+
     for seg in segments:
         layers = _make_text_clip(seg["text"], seg["start"], seg["end"])
         text_layers.extend(layers)
