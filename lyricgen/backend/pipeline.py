@@ -101,14 +101,41 @@ def transcribe(mp3_path: str) -> list[dict]:
     import whisper
 
     model = whisper.load_model("small")
-    result = model.transcribe(mp3_path, word_timestamps=True)
+
+    # initial_prompt="Lyrics:" prevents Whisper from ignoring early vocals
+    # condition_on_previous_text=False avoids hallucination cascading
+    result = model.transcribe(
+        mp3_path,
+        word_timestamps=True,
+        initial_prompt="Lyrics:",
+        condition_on_previous_text=False,
+    )
     segments = [
         {"start": seg["start"], "end": seg["end"], "text": seg["text"].strip()}
         for seg in result["segments"]
         if seg["text"].strip()
     ]
 
-    # Debug: log first 5 segments
+    # Safety net: if first segment starts very late (>30s), retry without
+    # condition_on_previous_text=False in case it helps
+    if segments and segments[0]["start"] > 30:
+        print(f"[WHISPER] WARNING: first segment at {segments[0]['start']:.1f}s, retrying with fallback settings")
+        result2 = model.transcribe(
+            mp3_path,
+            word_timestamps=True,
+            initial_prompt="Song lyrics transcription:",
+            no_speech_threshold=0.4,
+        )
+        segments2 = [
+            {"start": seg["start"], "end": seg["end"], "text": seg["text"].strip()}
+            for seg in result2["segments"]
+            if seg["text"].strip()
+        ]
+        if segments2 and segments2[0]["start"] < segments[0]["start"]:
+            print(f"[WHISPER] Retry found earlier lyrics at {segments2[0]['start']:.1f}s, using retry result")
+            segments = segments2
+
+    # Log first 5 segments for debug
     for i, seg in enumerate(segments[:5]):
         print(f"[WHISPER] seg {i}: {seg['start']:.2f}–{seg['end']:.2f}  {seg['text'][:60]}")
 
@@ -220,12 +247,7 @@ def _generate_ai_background(style: str, output_path: str) -> str:
 
 def _ensure_background(style: str, job_dir: str) -> str | None:
     """Generate AI background if no video files exist. Safe fallback on failure."""
-    # If there are video files, prefer those
-    if _find_background_video(style) is not None:
-        return None
-    if _find_background_video("oscuro") is not None:
-        return None
-
+    # If there are any video files in backgrounds dir, prefer those
     all_videos = []
     if os.path.isdir(BACKGROUNDS_DIR):
         for root, _, files in os.walk(BACKGROUNDS_DIR):
@@ -295,29 +317,50 @@ def _ken_burns_clip(image_path: str, duration: float):
 # Step 2 — Full HD lyric video
 # ---------------------------------------------------------------------------
 
-def _find_background_video(style: str) -> str | None:
-    """Find a random background video for the given style."""
-    candidates: list[str] = []
+_USED_BACKGROUNDS_FILE = os.path.join(ASSETS_DIR, ".used_backgrounds.json")
 
-    style_dir = os.path.join(BACKGROUNDS_DIR, style)
-    if os.path.isdir(style_dir):
-        candidates.extend(
-            os.path.join(style_dir, f)
-            for f in os.listdir(style_dir)
-            if f.lower().endswith(".mp4")
-        )
 
+def _find_background_video() -> str | None:
+    """Pick a random background video without repeating until all are used."""
+    all_videos: list[str] = []
     if os.path.isdir(BACKGROUNDS_DIR):
-        for f in os.listdir(BACKGROUNDS_DIR):
-            if not f.lower().endswith(".mp4"):
-                continue
-            name = os.path.splitext(f)[0]
-            if name == style or name.startswith(f"{style}_"):
-                candidates.append(os.path.join(BACKGROUNDS_DIR, f))
+        for root, _, files in os.walk(BACKGROUNDS_DIR):
+            all_videos.extend(
+                os.path.join(root, f)
+                for f in files if f.lower().endswith(".mp4")
+            )
 
-    if candidates:
-        return random.choice(candidates)
-    return None
+    if not all_videos:
+        return None
+
+    # Load history of used videos
+    used: list[str] = []
+    if os.path.exists(_USED_BACKGROUNDS_FILE):
+        try:
+            with open(_USED_BACKGROUNDS_FILE) as f:
+                used = json.load(f)
+        except (json.JSONDecodeError, OSError):
+            used = []
+
+    # Filter out already used; if all used, reset the cycle
+    available = [v for v in all_videos if v not in used]
+    if not available:
+        print(f"[BG] All {len(all_videos)} backgrounds used, resetting cycle")
+        used = []
+        available = all_videos
+
+    pick = random.choice(available)
+    used.append(pick)
+
+    # Save updated history
+    try:
+        with open(_USED_BACKGROUNDS_FILE, "w") as f:
+            json.dump(used, f)
+    except OSError:
+        pass
+
+    print(f"[BG] Selected: {os.path.basename(pick)} ({len(all_videos) - len(available)} of {len(all_videos)} used)")
+    return pick
 
 
 _GRADIENT_PALETTES = {
@@ -359,26 +402,29 @@ def _make_gradient_clip(duration: float, style: str = "oscuro"):
     return VideoClip(_gradient_frame, duration=duration).set_fps(24)
 
 
+def _cover_resize(clip, target_w=1920, target_h=1080):
+    """Resize and crop a video clip to cover target_w x target_h (CSS cover)."""
+    src_w, src_h = clip.size
+    # Scale so the smallest dimension fills the target
+    scale = max(target_w / src_w, target_h / src_h)
+    new_w = int(math.ceil(src_w * scale))
+    new_h = int(math.ceil(src_h * scale))
+    resized = clip.resize((new_w, new_h))
+    # Center crop to exact target size
+    x_offset = (new_w - target_w) // 2
+    y_offset = (new_h - target_h) // 2
+    return resized.crop(x1=x_offset, y1=y_offset, width=target_w, height=target_h)
+
+
 def _get_background_clip(style: str, duration: float):
-    """Load and loop a random background video for the given style."""
-    bg_path = _find_background_video(style)
-    if bg_path is None:
-        bg_path = _find_background_video("oscuro")
-    if bg_path is None:
-        all_videos = []
-        if os.path.isdir(BACKGROUNDS_DIR):
-            for root, _, files in os.walk(BACKGROUNDS_DIR):
-                all_videos.extend(
-                    os.path.join(root, f)
-                    for f in files if f.lower().endswith(".mp4")
-                )
-        if all_videos:
-            bg_path = random.choice(all_videos)
+    """Load and loop a random background video (no-repeat cycle)."""
+    bg_path = _find_background_video()
 
     if bg_path is None:
         return _make_gradient_clip(duration, style)
 
     clip = VideoFileClip(bg_path)
+    clip = _cover_resize(clip)
     if clip.duration >= duration:
         return clip.subclip(0, duration)
     loops_needed = math.ceil(duration / clip.duration)
@@ -470,12 +516,14 @@ def generate_lyric_video(
     # Build text clips — each segment gets its own shadow + text
     text_layers = []
 
-    # Show brief artist title card during long instrumental intros
+    # Show artist + song title during instrumental intro
     first_lyric_start = segments[0]["start"] if segments else duration
-    if first_lyric_start > 5 and artist:
-        # Show for max 5 seconds, fade before lyrics start
-        title_end = min(5.0, first_lyric_start - 1.0)
-        title_layers = _make_text_clip(artist, 0.5, title_end)
+    if first_lyric_start > 3 and artist:
+        song_name = os.path.splitext(os.path.basename(mp3_path))[0]
+        title_end = first_lyric_start - 0.5
+        title_layers = _make_text_clip(
+            f"{artist}\n{song_name}", 0.5, title_end
+        )
         text_layers.extend(title_layers)
 
     for seg in segments:

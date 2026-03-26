@@ -9,7 +9,7 @@ const API = "";
 export default function App() {
   const [file, setFile] = useState(null);
   const [artist, setArtist] = useState("");
-  const [style, setStyle] = useState("oscuro");
+  const style = "oscuro"; // style selection removed — backgrounds are random
   const [jobId, setJobId] = useState(null);
   const [jobStatus, setJobStatus] = useState(null);
   const pollingRef = useRef(null);
@@ -57,7 +57,6 @@ export default function App() {
   const handleReset = () => {
     setFile(null);
     setArtist("");
-    setStyle("oscuro");
     setJobId(null);
     setJobStatus(null);
   };
@@ -76,12 +75,7 @@ export default function App() {
       {!jobId && (
         <div className="w-full max-w-2xl space-y-6">
           <UploadZone file={file} onFile={setFile} />
-          <ConfigPanel
-            artist={artist}
-            onArtist={setArtist}
-            style={style}
-            onStyle={setStyle}
-          />
+          <ConfigPanel artist={artist} onArtist={setArtist} />
           <button
             onClick={handleGenerate}
             disabled={!file || !artist.trim()}
