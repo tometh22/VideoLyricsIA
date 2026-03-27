@@ -63,19 +63,24 @@ def run_pipeline(job_id: str, mp3_path: str, artist: str, style: str):
 
         # Step 2 — Full lyric video
         update_job(job_id, current_step="video", progress=42)
-        video_path = generate_lyric_video(
+        video_path, chosen_font, bg_source = generate_lyric_video(
             mp3_path, segments, style, job_dir, artist, bg_image_path
         )
         update_job(job_id, progress=65)
 
-        # Step 3 — YouTube Short
+        # Step 3 — YouTube Short (uses raw background, not lyric video)
         update_job(job_id, current_step="short", progress=68)
-        short_path = generate_short(mp3_path, video_path, segments, job_dir)
+        short_path = generate_short(
+            mp3_path, segments, job_dir, bg_source=bg_source,
+            style=style, font=chosen_font,
+        )
         update_job(job_id, progress=85)
 
-        # Step 4 — Thumbnail
+        # Step 4 — Thumbnail (uses raw background, not lyric video)
         update_job(job_id, current_step="thumbnail", progress=90)
-        thumb_path = generate_thumbnail(video_path, artist, mp3_path, job_dir)
+        thumb_path = generate_thumbnail(
+            artist, mp3_path, job_dir, bg_source=bg_source,
+        )
         update_job(job_id, progress=100)
 
         update_job(
@@ -416,40 +421,52 @@ def _cover_resize(clip, target_w=1920, target_h=1080):
     return resized.crop(x1=x_offset, y1=y_offset, width=target_w, height=target_h)
 
 
-def _get_background_clip(style: str, duration: float):
-    """Load and loop a random background video (no-repeat cycle)."""
-    bg_path = _find_background_video()
-
-    if bg_path is None:
+def _get_background_clip_from_path(bg_path: str, style: str, duration: float):
+    """Load a specific background video, resize and loop it."""
+    try:
+        clip = VideoFileClip(bg_path)
+        clip.get_frame(0)  # validate it's readable
+        clip = _cover_resize(clip)
+    except Exception as e:
+        print(f"[BG] Failed to load {bg_path}: {e}, using gradient fallback")
         return _make_gradient_clip(duration, style)
-
-    clip = VideoFileClip(bg_path)
-    clip = _cover_resize(clip)
     if clip.duration >= duration:
         return clip.subclip(0, duration)
-    loops_needed = math.ceil(duration / clip.duration)
-    looped = concatenate_videoclips([clip] * loops_needed)
+
+    # Loop with fade-out/fade-in at each seam to hide the cut.
+    # Each iteration opens a fresh VideoFileClip to avoid shared ffmpeg reader bugs.
+    fade_dur = min(1.0, clip.duration * 0.2)
+    clip_dur = clip.duration
+    clip.close()
+    loops_needed = math.ceil(duration / clip_dur) + 1
+    clips = []
+    for i in range(loops_needed):
+        c = _cover_resize(VideoFileClip(bg_path))
+        c = c.fadeout(fade_dur)
+        if i > 0:
+            c = c.fadein(fade_dur)
+        clips.append(c)
+    looped = concatenate_videoclips(clips)
     return looped.subclip(0, duration)
 
 
-# Font detection
-_FONT_CANDIDATES = [
-    "/System/Library/Fonts/Supplemental/Arial Bold Italic.ttf",
-    "/System/Library/Fonts/Supplemental/Impact.ttf",
+# Font pool — professional, legible bold fonts only
+_FONT_POOL = [fp for fp in [
     "/System/Library/Fonts/Supplemental/Arial Bold.ttf",
+    "/System/Library/Fonts/Supplemental/Arial Rounded Bold.ttf",
+    "/System/Library/Fonts/Supplemental/DIN Alternate Bold.ttf",
+    "/System/Library/Fonts/Supplemental/DIN Condensed Bold.ttf",
+    "/System/Library/Fonts/Supplemental/Verdana Bold.ttf",
+    "/System/Library/Fonts/Supplemental/Trebuchet MS Bold.ttf",
+    "/System/Library/Fonts/Supplemental/Impact.ttf",
+    "/System/Library/Fonts/Supplemental/Tahoma Bold.ttf",
     "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
-]
-_LYRIC_FONT = None
-for _fp in _FONT_CANDIDATES:
-    if os.path.exists(_fp):
-        _LYRIC_FONT = _fp
-        break
+] if os.path.exists(fp)]
 
 
-def _make_text_clip(text: str, seg_start: float, seg_end: float):
+def _make_text_clip(text: str, seg_start: float, seg_end: float, font: str = "Arial"):
     """Create a text clip with shadow for one lyric segment."""
     display_text = text.upper()
-    font = _LYRIC_FONT or "Arial"
 
     # Reduce font size for long lines to prevent text clipping
     text_len = len(display_text)
@@ -502,16 +519,30 @@ def generate_lyric_video(
     job_dir: str,
     artist: str,
     bg_image_path: str | None = None,
-) -> str:
-    """Generate a 1920x1080 lyric video and return its path."""
+) -> tuple[str, str, str | None]:
+    """Generate a 1920x1080 lyric video. Returns (video_path, font, bg_source).
+
+    bg_source is the path to the raw background (mp4 or jpg) so short/thumbnail
+    can use it without burned-in lyrics.
+    """
     audio = AudioFileClip(mp3_path)
     duration = audio.duration
 
     # Use AI-generated image with Ken Burns if available
+    bg_source = None  # raw background path for reuse by short/thumbnail
     if bg_image_path and os.path.exists(bg_image_path):
         bg = _ken_burns_clip(bg_image_path, duration)
+        bg_source = bg_image_path
     else:
-        bg = _get_background_clip(style, duration)
+        bg_source = _find_background_video()
+        if bg_source:
+            bg = _get_background_clip_from_path(bg_source, style, duration)
+        else:
+            bg = _make_gradient_clip(duration, style)
+
+    # Pick a random font for this job
+    font = random.choice(_FONT_POOL) if _FONT_POOL else "Arial"
+    print(f"[FONT] Selected: {os.path.basename(font)}")
 
     # Build text clips — each segment gets its own shadow + text
     text_layers = []
@@ -522,12 +553,12 @@ def generate_lyric_video(
         song_name = os.path.splitext(os.path.basename(mp3_path))[0]
         title_end = first_lyric_start - 0.5
         title_layers = _make_text_clip(
-            f"{artist}\n{song_name}", 0.5, title_end
+            f"{artist}\n{song_name}", 0.5, title_end, font
         )
         text_layers.extend(title_layers)
 
     for seg in segments:
-        layers = _make_text_clip(seg["text"], seg["start"], seg["end"])
+        layers = _make_text_clip(seg["text"], seg["start"], seg["end"], font)
         text_layers.extend(layers)
 
     video = CompositeVideoClip([bg] + text_layers, size=(1920, 1080))
@@ -545,50 +576,156 @@ def generate_lyric_video(
     audio.close()
     bg.close()
     video.close()
-    return out_path
+    return out_path, font, bg_source
 
 
 # ---------------------------------------------------------------------------
 # Step 3 — YouTube Short (30s, vertical)
 # ---------------------------------------------------------------------------
 
-def _find_peak_moment(mp3_path: str, window_sec: int = 30) -> float:
-    """Find the start time of the most energetic 30-second window."""
-    y, sr = librosa.load(mp3_path, sr=22050)
-    rms = librosa.feature.rms(y=y, frame_length=2048, hop_length=512)[0]
-    frames_per_sec = sr / 512
-    window_frames = int(window_sec * frames_per_sec)
-
-    if len(rms) <= window_frames:
+def _find_chorus_start(segments: list[dict], window_sec: int = 30) -> float:
+    """Find the start of the chorus — the 30s window with most repeated lyrics."""
+    if not segments:
         return 0.0
 
-    cumsum = np.cumsum(rms)
-    window_sums = cumsum[window_frames:] - cumsum[:-window_frames]
-    best_frame = int(np.argmax(window_sums))
-    best_time = best_frame / frames_per_sec
+    total_duration = segments[-1]["end"]
 
-    total_duration = len(y) / sr
-    if best_time + window_sec > total_duration:
-        best_time = max(0, total_duration - window_sec)
+    # Count how many times each line appears (normalized)
+    from collections import Counter
+    line_counts = Counter()
+    for seg in segments:
+        normalized = seg["text"].strip().lower()
+        if len(normalized) > 5:  # skip very short fragments
+            line_counts[normalized] += 1
 
-    return best_time
+    # Score each segment: repeated lines get higher scores
+    for seg in segments:
+        normalized = seg["text"].strip().lower()
+        seg["_chorus_score"] = line_counts.get(normalized, 0)
+
+    # Slide a window and find the 30s with highest total chorus score
+    best_start = 0.0
+    best_score = -1
+    step = 1.0
+    t = 0.0
+    while t + window_sec <= total_duration + step:
+        score = sum(
+            seg["_chorus_score"]
+            for seg in segments
+            if seg["start"] >= t and seg["end"] <= t + window_sec
+        )
+        if score > best_score:
+            best_score = score
+            best_start = t
+        t += step
+
+    # Clean up temp keys
+    for seg in segments:
+        seg.pop("_chorus_score", None)
+
+    # Clamp to valid range
+    best_start = max(0, min(best_start, total_duration - window_sec))
+    print(f"[SHORT] Chorus detected at {best_start:.1f}s (score={best_score})")
+    return best_start
+
+
+def _make_short_text_clip(text: str, seg_start: float, seg_end: float, font: str = "Arial"):
+    """Create text clips sized for vertical 1080x1920 short."""
+    display_text = text.upper()
+
+    text_len = len(display_text)
+    if text_len > 60:
+        fontsize = 40
+        text_width = 950
+    elif text_len > 35:
+        fontsize = 50
+        text_width = 900
+    else:
+        fontsize = 65
+        text_width = 850
+
+    shadow = TextClip(
+        display_text,
+        fontsize=fontsize,
+        font=font,
+        color="black",
+        method="caption",
+        size=(text_width, None),
+        align="center",
+    ).set_opacity(0.6)
+
+    sh = shadow.size[1]
+    shadow_y = (1920 - sh) // 2 + 4
+    shadow_x = (1080 - text_width) // 2 + 4
+    shadow = shadow.set_position((shadow_x, shadow_y)).set_start(seg_start).set_end(seg_end)
+
+    txt = TextClip(
+        display_text,
+        fontsize=fontsize,
+        font=font,
+        color="white",
+        stroke_color="black",
+        stroke_width=3,
+        method="caption",
+        size=(text_width, None),
+        align="center",
+    ).set_position(("center", "center")).set_start(seg_start).set_end(seg_end)
+
+    return [shadow, txt]
 
 
 def generate_short(
     mp3_path: str,
-    video_path: str,
     segments: list[dict],
     job_dir: str,
+    bg_source: str | None = None,
+    style: str = "oscuro",
+    font: str = "Arial",
 ) -> str:
-    """Generate a 1080x1920 vertical short from the most energetic 30s."""
-    start_time = _find_peak_moment(mp3_path)
-    end_time = start_time + 30
+    """Generate a 1080x1920 vertical short from the chorus section."""
+    audio = AudioFileClip(mp3_path)
+    start_time = _find_chorus_start(segments)
+    end_time = min(start_time + 30, audio.duration)
+    short_dur = end_time - start_time
+    short_audio = audio.subclip(start_time, end_time)
 
-    video = VideoFileClip(video_path).subclip(start_time, end_time)
+    # Build vertical background from RAW source (no burned-in lyrics)
+    if bg_source and bg_source.lower().endswith((".jpg", ".jpeg", ".png")):
+        bg_full = _ken_burns_clip(bg_source, short_dur)
+        bg = _cover_resize(bg_full, 1080, 1920)
+    elif bg_source and os.path.exists(bg_source):
+        try:
+            raw = VideoFileClip(bg_source)
+            raw.get_frame(0)
+            raw = _cover_resize(raw, 1080, 1920)
+            if raw.duration >= short_dur:
+                bg = raw.subclip(0, short_dur)
+            else:
+                loops = math.ceil(short_dur / raw.duration) + 1
+                clips = []
+                for i in range(loops):
+                    c = _cover_resize(VideoFileClip(bg_source), 1080, 1920)
+                    clips.append(c)
+                bg = concatenate_videoclips(clips).subclip(0, short_dur)
+        except Exception:
+            bg = _cover_resize(_make_gradient_clip(short_dur, style), 1080, 1920)
+    else:
+        bg = _cover_resize(_make_gradient_clip(short_dur, style), 1080, 1920)
 
-    # Cover resize to vertical 1080x1920 (no black bars)
-    final = _cover_resize(video, 1080, 1920)
-    final = final.set_audio(video.audio)
+    # Build text clips for segments in this 30s window
+    text_layers = []
+    for seg in segments:
+        if seg["end"] <= start_time or seg["start"] >= end_time:
+            continue
+        s = max(0, seg["start"] - start_time)
+        e = min(short_dur, seg["end"] - start_time)
+        if e - s < 0.1:
+            continue
+        layers = _make_short_text_clip(seg["text"], s, e, font)
+        text_layers.extend(layers)
+
+    final = CompositeVideoClip([bg] + text_layers, size=(1080, 1920))
+    final = final.set_audio(short_audio).set_duration(short_dur)
 
     out_path = os.path.join(job_dir, "short.mp4")
     final.write_videofile(
@@ -599,7 +736,7 @@ def generate_short(
         threads=4,
         logger=None,
     )
-    video.close()
+    audio.close()
     final.close()
     return out_path
 
@@ -619,28 +756,34 @@ def _draw_text_with_outline(draw, xy, text, font, fill="white", outline="black",
 
 
 def generate_thumbnail(
-    video_path: str,
     artist: str,
     mp3_path: str,
     job_dir: str,
+    bg_source: str | None = None,
 ) -> str:
-    """Generate a stylish thumbnail with artist and song name."""
+    """Generate a thumbnail from the RAW background with artist and song name."""
     from PIL import ImageFilter, ImageEnhance
 
-    clip = VideoFileClip(video_path)
-    t = min(clip.duration * 0.4, clip.duration - 0.1)
-    frame = clip.get_frame(t)
-    clip.close()
+    # Grab a frame from the raw background (no burned-in lyrics)
+    if bg_source and bg_source.lower().endswith((".jpg", ".jpeg", ".png")):
+        img = Image.open(bg_source)
+    elif bg_source and os.path.exists(bg_source):
+        try:
+            clip = VideoFileClip(bg_source)
+            t = min(clip.duration * 0.4, clip.duration - 0.1)
+            frame = clip.get_frame(t)
+            clip.close()
+            img = Image.fromarray(frame)
+        except Exception:
+            img = Image.new("RGB", (1280, 720), (30, 15, 60))
+    else:
+        img = Image.new("RGB", (1280, 720), (30, 15, 60))
 
-    img = Image.fromarray(frame)
     img = img.resize((1280, 720), Image.LANCZOS)
 
-    img = img.filter(ImageFilter.GaussianBlur(radius=15))
+    # Slight darken so text is readable, but background is clearly visible
     enhancer = ImageEnhance.Brightness(img)
-    img = enhancer.enhance(0.3)
-
-    overlay = Image.new("RGB", (1280, 720), (60, 30, 120))
-    img = Image.blend(img, overlay, alpha=0.3)
+    img = enhancer.enhance(0.6)
 
     draw = ImageDraw.Draw(img)
     song_name = os.path.splitext(os.path.basename(mp3_path))[0]
@@ -655,7 +798,7 @@ def generate_thumbnail(
     for fp in font_paths:
         if os.path.exists(fp):
             try:
-                font_artist = ImageFont.truetype(fp, 90)
+                font_artist = ImageFont.truetype(fp, 100)
                 font_song = ImageFont.truetype(fp, 55)
                 break
             except (OSError, IOError):
@@ -665,16 +808,13 @@ def generate_thumbnail(
     bbox = draw.textbbox((0, 0), artist.upper(), font=font_artist)
     tw = bbox[2] - bbox[0]
     x = (1280 - tw) // 2
-    _draw_text_with_outline(draw, (x, 220), artist.upper(), font_artist, fill="white", width=4)
+    _draw_text_with_outline(draw, (x, 240), artist.upper(), font_artist, fill="white", width=5)
 
-    # Accent line
-    draw.rectangle([(440, 340), (840, 344)], fill=(139, 124, 248))
-
-    # Song name centered
+    # Song name centered below
     bbox = draw.textbbox((0, 0), song_name, font=font_song)
     tw = bbox[2] - bbox[0]
     x = (1280 - tw) // 2
-    _draw_text_with_outline(draw, (x, 400), song_name, font_song, fill=(200, 200, 220), width=3)
+    _draw_text_with_outline(draw, (x, 380), song_name, font_song, fill=(230, 230, 240), width=3)
 
     out_path = os.path.join(job_dir, "thumbnail.jpg")
     img.save(out_path, "JPEG", quality=92)
