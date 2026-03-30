@@ -450,18 +450,13 @@ def _get_background_clip_from_path(bg_path: str, style: str, duration: float):
     return looped.subclip(0, duration)
 
 
-# Font pool — professional, legible bold fonts only
-_FONT_POOL = [fp for fp in [
-    "/System/Library/Fonts/Supplemental/Arial Bold.ttf",
-    "/System/Library/Fonts/Supplemental/Arial Rounded Bold.ttf",
-    "/System/Library/Fonts/Supplemental/DIN Alternate Bold.ttf",
-    "/System/Library/Fonts/Supplemental/DIN Condensed Bold.ttf",
-    "/System/Library/Fonts/Supplemental/Verdana Bold.ttf",
-    "/System/Library/Fonts/Supplemental/Trebuchet MS Bold.ttf",
-    "/System/Library/Fonts/Supplemental/Impact.ttf",
-    "/System/Library/Fonts/Supplemental/Tahoma Bold.ttf",
-    "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
-] if os.path.exists(fp)]
+# Font pool — Google Fonts only (SIL OFL = full commercial use, no royalties)
+_FONTS_DIR = os.path.join(os.path.dirname(__file__), "..", "assets", "fonts")
+_FONT_POOL = [
+    os.path.join(_FONTS_DIR, f)
+    for f in os.listdir(_FONTS_DIR)
+    if f.endswith((".ttf", ".otf")) and os.path.isfile(os.path.join(_FONTS_DIR, f))
+] if os.path.isdir(_FONTS_DIR) else []
 
 
 def _make_text_clip(text: str, seg_start: float, seg_end: float, font: str = "Arial"):
@@ -788,21 +783,16 @@ def generate_thumbnail(
     draw = ImageDraw.Draw(img)
     song_name = os.path.splitext(os.path.basename(mp3_path))[0]
 
-    font_paths = [
-        "/System/Library/Fonts/Supplemental/Arial Bold.ttf",
-        "/System/Library/Fonts/Helvetica.ttc",
-        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
-    ]
-    font_artist = ImageFont.load_default()
-    font_song = ImageFont.load_default()
-    for fp in font_paths:
-        if os.path.exists(fp):
-            try:
-                font_artist = ImageFont.truetype(fp, 100)
-                font_song = ImageFont.truetype(fp, 55)
-                break
-            except (OSError, IOError):
-                continue
+    # Use Montserrat ExtraBold for thumbnails (Google Font, OFL licensed)
+    thumb_font = os.path.join(_FONTS_DIR, "Montserrat-ExtraBold.ttf")
+    if not os.path.exists(thumb_font) and _FONT_POOL:
+        thumb_font = _FONT_POOL[0]
+    try:
+        font_artist = ImageFont.truetype(thumb_font, 100)
+        font_song = ImageFont.truetype(thumb_font, 55)
+    except (OSError, IOError):
+        font_artist = ImageFont.load_default()
+        font_song = ImageFont.load_default()
 
     # Artist name centered
     bbox = draw.textbbox((0, 0), artist.upper(), font=font_artist)
