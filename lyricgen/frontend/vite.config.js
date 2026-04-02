@@ -6,8 +6,12 @@ export default defineConfig({
   server: {
     proxy: {
       "/upload": "http://localhost:8000",
+      "/transcribe": "http://localhost:8000",
+      "/generate": "http://localhost:8000",
       "/status": "http://localhost:8000",
       "/download": "http://localhost:8000",
+      "/preview": "http://localhost:8000",
+      "/jobs": "http://localhost:8000",
     },
   },
 });

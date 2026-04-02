@@ -45,20 +45,26 @@ OUTPUTS_DIR = os.path.join(os.path.dirname(__file__), "..", "outputs")
 BACKGROUNDS_DIR = os.path.join(ASSETS_DIR, "backgrounds")
 
 
-def run_pipeline(job_id: str, mp3_path: str, artist: str, style: str):
+def run_pipeline(job_id: str, mp3_path: str, artist: str, style: str,
+                 language: str = None, segments_override: list[dict] = None):
     """Run the full pipeline for a job. Called synchronously."""
     job_dir = os.path.join(OUTPUTS_DIR, job_id)
     os.makedirs(job_dir, exist_ok=True)
 
     try:
-        # Step 1 — Whisper transcription
+        # Step 1 — Whisper transcription (or use edited segments)
         update_job(job_id, current_step="whisper", progress=5)
-        segments = transcribe(mp3_path)
+        if segments_override:
+            segments = segments_override
+            print(f"[WHISPER] Using {len(segments)} user-edited segments")
+        else:
+            segments = transcribe(mp3_path, language=language)
         update_job(job_id, progress=20)
 
-        # Step 1.5 — Generate AI background if no video files available
+        # Step 1.5 — Generate AI background (Veo 3 with lyrics analysis)
         update_job(job_id, current_step="background", progress=22)
-        bg_image_path = _ensure_background(style, job_dir)
+        lyrics_text = " ".join(seg["text"] for seg in segments)
+        bg_image_path = _ensure_background(style, job_dir, lyrics_text=lyrics_text, artist=artist)
         update_job(job_id, progress=40)
 
         # Step 2 — Full lyric video
@@ -101,51 +107,89 @@ def run_pipeline(job_id: str, mp3_path: str, artist: str, style: str):
 # Step 1 — Whisper transcription
 # ---------------------------------------------------------------------------
 
-def transcribe(mp3_path: str) -> list[dict]:
-    """Transcribe an MP3 using local openai-whisper and return segments."""
+_SPAM_PATTERNS = [
+    "suscri", "subscri", "subscribe", "subete", "like", "comment",
+    "canal", "channel", "descripci", "description", "link", "follow",
+    "sigueme", "intro", "outro", "copyright", "all rights", "derechos",
+    "music by", "produced by", "lyrics by", "escucha en", "disponible",
+    "spotify", "apple music", "deezer", "itunes", "amazon music",
+    "gracias", "thanks for watching", "thanks for listening",
+    "subtitulos", "subtitles", "video oficial", "official video",
+]
+
+
+def transcribe(mp3_path: str, language: str = None) -> list[dict]:
+    """Transcribe: isolate vocals with Demucs, then transcribe with Whisper turbo."""
     import whisper
 
-    model = whisper.load_model("small")
+    # Use original audio — Demucs vocal isolation can introduce artifacts
+    # that confuse Whisper more than the original mix
+    audio_path = mp3_path
 
-    # initial_prompt="Lyrics:" prevents Whisper from ignoring early vocals
-    # condition_on_previous_text=False avoids hallucination cascading
-    result = model.transcribe(
-        mp3_path,
+    # Transcribe with Whisper turbo
+    model = whisper.load_model("turbo")
+
+    kwargs = dict(
         word_timestamps=True,
         initial_prompt="Lyrics:",
         condition_on_previous_text=False,
     )
-    segments = [
-        {"start": seg["start"], "end": seg["end"], "text": seg["text"].strip()}
-        for seg in result["segments"]
-        if seg["text"].strip()
-    ]
+    if language:
+        kwargs["language"] = language
+        print(f"[WHISPER] Forced language: {language}")
 
-    # Safety net: if first segment starts very late (>30s), retry without
-    # condition_on_previous_text=False in case it helps
+    result = model.transcribe(audio_path, **kwargs)
+
+    import re as _re
+
+    segments = []
+    for seg in result["segments"]:
+        text = seg["text"].strip()
+        if not text or len(text) < 3:
+            continue
+        # Filter non-latin characters (Demucs artifacts like "Lil怎麼樣")
+        if _re.search(r'[\u4e00-\u9fff\u3040-\u309f\u30a0-\u30ff\uac00-\ud7af]', text):
+            print(f"[WHISPER] Filtered non-latin artifact: {text[:60]}")
+            continue
+        # Filter spam/non-lyrics
+        if any(spam in text.lower() for spam in _SPAM_PATTERNS):
+            print(f"[WHISPER] Filtered spam: {text[:60]}")
+            continue
+        # Filter high no_speech_prob segments (likely hallucinations)
+        if seg.get("no_speech_prob", 0) > 0.7:
+            print(f"[WHISPER] Filtered low-confidence (no_speech={seg['no_speech_prob']:.2f}): {text[:60]}")
+            continue
+        words = seg.get("words", [])
+        if words:
+            start = words[0]["start"]
+            end = words[-1]["end"]
+        else:
+            start = seg["start"]
+            end = seg["end"]
+        segments.append({"start": start, "end": end, "text": text})
+
+    # Safety net: retry if first segment starts very late
     if segments and segments[0]["start"] > 30:
-        print(f"[WHISPER] WARNING: first segment at {segments[0]['start']:.1f}s, retrying with fallback settings")
-        result2 = model.transcribe(
-            mp3_path,
-            word_timestamps=True,
-            initial_prompt="Song lyrics transcription:",
-            no_speech_threshold=0.4,
-        )
-        segments2 = [
-            {"start": seg["start"], "end": seg["end"], "text": seg["text"].strip()}
-            for seg in result2["segments"]
-            if seg["text"].strip()
-        ]
+        print(f"[WHISPER] WARNING: first seg at {segments[0]['start']:.1f}s, retrying")
+        kwargs2 = dict(kwargs, initial_prompt="Song lyrics transcription:", no_speech_threshold=0.4)
+        result2 = model.transcribe(mp3_path, **kwargs2)
+        segments2 = []
+        for seg in result2["segments"]:
+            text = seg["text"].strip()
+            if not text or len(text) < 3:
+                continue
+            words = seg.get("words", [])
+            if words:
+                segments2.append({"start": words[0]["start"], "end": words[-1]["end"], "text": text})
+            else:
+                segments2.append({"start": seg["start"], "end": seg["end"], "text": text})
         if segments2 and segments2[0]["start"] < segments[0]["start"]:
-            print(f"[WHISPER] Retry found earlier lyrics at {segments2[0]['start']:.1f}s, using retry result")
             segments = segments2
 
-    # Log first 5 segments for debug
     for i, seg in enumerate(segments[:5]):
         print(f"[WHISPER] seg {i}: {seg['start']:.2f}–{seg['end']:.2f}  {seg['text'][:60]}")
 
-    # Fix overlapping segments: ensure seg[i].end <= seg[i+1].start
-    GAP = 0.05  # 50ms gap between segments to prevent visual overlap
+    GAP = 0.05
     for i in range(len(segments) - 1):
         if segments[i]["end"] > segments[i + 1]["start"] - GAP:
             segments[i]["end"] = segments[i + 1]["start"] - GAP
@@ -154,105 +198,316 @@ def transcribe(mp3_path: str) -> list[dict]:
 
 
 # ---------------------------------------------------------------------------
-# Step 1.5 — AI Background Generation (Stable Diffusion)
+# Step 1.5 — AI Background Generation (Google Veo 3 → SD fallback)
 # ---------------------------------------------------------------------------
 
-_STYLE_PROMPTS = {
-    "oscuro": [
-        "vibrant purple and blue galaxy nebula with bright stars, colorful space, 4k wallpaper",
-        "colorful northern lights aurora over snowy mountains, vivid green and purple sky, 4k",
-        "dramatic sunset with vibrant orange purple clouds over city skyline, colorful, 4k",
-        "colorful abstract liquid art, swirling purple blue and pink paint, vibrant, 4k",
-        "underwater bioluminescent ocean scene, glowing jellyfish, vibrant blue and purple, 4k",
-    ],
-    "neon": [
-        "vibrant neon city street at night, pink blue purple lights everywhere, colorful reflections, 4k",
-        "colorful neon signs and lights in rain, cyberpunk city, vivid pink cyan magenta, 4k",
-        "bright neon geometric shapes floating in space, colorful abstract, pink blue green, 4k",
-        "futuristic neon tunnel with rainbow lights, vibrant colorful, 4k wallpaper",
-        "neon-lit japanese street with cherry blossoms, vibrant pink and blue lights, colorful, 4k",
-    ],
-    "minimal": [
-        "beautiful pastel gradient sky with soft pink orange and lavender clouds, dreamy, 4k",
-        "colorful abstract watercolor wash, soft pink blue and gold blending, artistic, 4k",
-        "bright sunny sky with fluffy white clouds, cheerful vibrant blue, 4k wallpaper",
-        "soft holographic rainbow gradient, iridescent pastel colors, beautiful, 4k",
-        "cherry blossom tree with soft pink petals floating, bright spring day, beautiful, 4k",
-    ],
-    "calido": [
-        "stunning tropical sunset over turquoise ocean, vibrant orange pink sky, palm trees, 4k",
-        "colorful hot air balloons floating over green valley at golden hour, vibrant, 4k",
-        "bright sunflower field under vivid blue sky with golden sunlight, cheerful, 4k",
-        "tropical paradise beach with crystal clear water, vibrant turquoise and golden sand, 4k",
-        "colorful autumn forest with bright red orange yellow leaves, golden sunlight, 4k",
-    ],
-}
+_VERTEX_CREDENTIALS = os.path.join(os.path.dirname(__file__), "vertex_credentials.json")
+_VERTEX_PROJECT = "gen-lang-client-0900526123"
+_VERTEX_LOCATION = "us-central1"
 
-_sd_pipe = None
+# Set credentials env var for Google SDK
+os.environ.setdefault("GOOGLE_APPLICATION_CREDENTIALS", _VERTEX_CREDENTIALS)
+
+_genai_client = None
 
 
-def _get_sd_pipeline():
-    """Load Stable Diffusion pipeline (cached). Uses MPS on Apple Silicon."""
-    global _sd_pipe
-    if _sd_pipe is not None:
-        return _sd_pipe
+def _get_genai_client():
+    """Get a cached Vertex AI GenAI client."""
+    global _genai_client
+    if _genai_client is None:
+        from google import genai
+        _genai_client = genai.Client(
+            vertexai=True,
+            project=_VERTEX_PROJECT,
+            location=_VERTEX_LOCATION,
+        )
+    return _genai_client
 
-    import torch
-    from diffusers import StableDiffusionPipeline
+# Combinatorial prompt system — elements combine to create unique prompts.
+# 22 scenes x 12 palettes x 10 cameras x 8 conditions = 21,120 combinations
+_BG_SCENES = [
+    "calm ocean waves on a sandy beach",
+    "northern lights aurora over a mountain lake",
+    "abstract colorful smoke swirling slowly",
+    "sunset clouds forming and dissolving",
+    "underwater light rays through deep blue ocean",
+    "tropical coral reef with colorful fish",
+    "rolling fog over a green mountain valley",
+    "lavender field stretching to the horizon",
+    "gentle rain falling on a still lake",
+    "desert sand dunes with wind patterns",
+    "autumn leaves falling in a forest",
+    "snow falling gently over pine trees",
+    "bioluminescent waves crashing on dark shore",
+    "cherry blossom petals floating in the wind",
+    "crystal clear river flowing over smooth rocks",
+    "volcanic lava flowing slowly into the ocean",
+    "stars and milky way rotating over a landscape",
+    "tropical waterfall cascading into a lagoon",
+    "wildflowers swaying in a meadow breeze",
+    "icebergs floating in arctic blue water",
+    "hot air balloon shadows over green countryside",
+    "lightning illuminating storm clouds from within",
+]
 
-    model_id = "runwayml/stable-diffusion-v1-5"
+_BG_PALETTES = [
+    "golden hour warm tones",
+    "cool blue and teal tones",
+    "vibrant pink and purple sunset",
+    "soft pastel colors",
+    "deep navy and silver moonlight",
+    "warm amber and orange",
+    "vivid turquoise and coral",
+    "moody indigo and violet",
+    "bright green and emerald",
+    "rose gold and blush pink",
+    "fiery red and orange",
+    "icy blue and white",
+]
 
-    if torch.backends.mps.is_available():
-        device = "mps"
-        dtype = torch.float32  # float16 produces NaN/black images on MPS
-    elif torch.cuda.is_available():
-        device = "cuda"
-        dtype = torch.float16
+_BG_CAMERAS = [
+    "slow aerial drone flyover",
+    "smooth dolly forward movement",
+    "gentle sideways tracking shot",
+    "slow upward crane shot",
+    "steady wide angle static shot with subtle movement",
+    "slow orbit around the scene",
+    "smooth descending aerial shot",
+    "gentle push-in zoom",
+    "slow parallax movement",
+    "steady first-person glide forward",
+]
+
+_BG_CONDITIONS = [
+    "cinematic depth of field",
+    "soft natural lighting",
+    "volumetric light rays",
+    "misty atmospheric haze",
+    "crystal clear vivid detail",
+    "dreamy soft focus bokeh",
+    "dramatic rim lighting",
+    "ethereal glow",
+]
+
+_USED_PROMPTS_FILE = os.path.join(ASSETS_DIR, ".used_prompts.json")
+
+
+def _analyze_lyrics_for_background(lyrics_text: str, artist: str) -> dict:
+    """Use Gemini to analyze lyrics and choose visual style + prompt.
+
+    Returns dict with:
+      - style: "video" | "photo" | "illustration"
+      - prompt: the generation prompt for Veo 3 or Imagen 4
+    """
+    from google import genai
+
+    client = _get_genai_client()
+
+    system_prompt = """Respond ONLY with a JSON object, no other text. Example:
+{"style":"video","prompt":"Slow aerial drone shot over calm ocean at golden sunset, warm cinematic light, 4k"}
+
+"style": always "video"
+"prompt": 20-40 word cinematic video scene matching the song's mood and genre. Include camera movement, colors, lighting, atmosphere.
+
+Genre guidance (vary the scenes!):
+- Rock/punk → urban, industrial, neon, gritty streets, dark skies, electric storms
+- Pop/dance → colorful lights, city nightlife, abstract neon, disco reflections
+- Ballad/romantic → sunset, ocean, soft clouds, warm light
+- Latin/reggaeton → tropical, vibrant colors, palm trees, warm tones
+- Hip hop/rap → city skyline at night, luxury abstract, gold and dark tones
+
+NEVER include people, faces, hands, or text in the prompt."""
+
+    lyrics_sample = lyrics_text[:600]
+
+    try:
+        response = client.models.generate_content(
+            model="gemini-2.5-flash",
+            contents=f"Artist: {artist}\n\nLyrics:\n{lyrics_sample}",
+            config=genai.types.GenerateContentConfig(
+                system_instruction=system_prompt,
+                temperature=0.8,
+                max_output_tokens=500,
+                thinking_config=genai.types.ThinkingConfig(thinking_budget=0),
+            ),
+        )
+        text = response.text.strip()
+        print(f"[BG] Gemini raw: {text[:300]}")
+
+        # Parse JSON from response (handles ```json blocks, multiline JSON)
+        import re
+        json_match = re.search(r'\{.*?\}', text, re.DOTALL)
+        if json_match:
+            try:
+                data = json.loads(json_match.group())
+                style = data.get("style", "video")
+                prompt = data.get("prompt", "")
+                if style not in ("video", "photo", "illustration"):
+                    style = "video"
+                if prompt and len(prompt) > 15:
+                    print(f"[BG] Gemini chose: style={style}, prompt={prompt[:80]}...")
+                    return {"style": style, "prompt": prompt}
+            except json.JSONDecodeError:
+                pass
+
+        print("[BG] Failed to parse Gemini JSON, using combinatorial fallback")
+        return {"style": "video", "prompt": None}
+
+    except Exception as e:
+        print(f"[BG] Gemini analysis failed: {e}, using video fallback")
+        return {"style": "video", "prompt": None}
+
+
+def _get_unique_prompt(lyrics_text: str = None, artist: str = "") -> dict:
+    """Get a unique style+prompt combination. Returns {style, prompt}."""
+    used: list[str] = []
+    if os.path.exists(_USED_PROMPTS_FILE):
+        try:
+            with open(_USED_PROMPTS_FILE) as f:
+                used = json.load(f)
+        except (json.JSONDecodeError, OSError):
+            used = []
+
+    # Gemini analysis
+    if lyrics_text:
+        result = _analyze_lyrics_for_background(lyrics_text, artist)
+        if result["prompt"] and result["prompt"] not in used:
+            used.append(result["prompt"])
+            try:
+                with open(_USED_PROMPTS_FILE, "w") as f:
+                    json.dump(used, f)
+            except OSError:
+                pass
+            return result
+
+    # Fallback: combinatorial video prompt
+    for _ in range(50):
+        scene = random.choice(_BG_SCENES)
+        palette = random.choice(_BG_PALETTES)
+        camera = random.choice(_BG_CAMERAS)
+        condition = random.choice(_BG_CONDITIONS)
+        prompt = f"{camera} of {scene}, {palette}, {condition}, 4k, photorealistic"
+        if prompt not in used:
+            used.append(prompt)
+            try:
+                with open(_USED_PROMPTS_FILE, "w") as f:
+                    json.dump(used, f)
+            except OSError:
+                pass
+            return {"style": "video", "prompt": prompt}
+
+    return {
+        "style": "video",
+        "prompt": f"{random.choice(_BG_CAMERAS)} of {random.choice(_BG_SCENES)}, {random.choice(_BG_PALETTES)}, {random.choice(_BG_CONDITIONS)}, 4k, photorealistic",
+    }
+
+
+def _generate_veo_video(prompt: str, output_path: str) -> str:
+    """Generate a video clip with Google Veo 3. Fast fail on rate limit."""
+    from google import genai
+    from google.genai.errors import ClientError
+    import time as _time
+    import requests as _req
+
+    client = _get_genai_client()
+
+    safe_prompt = f"{prompt}. Photorealistic, filmed with cinema camera, real footage. No text, no words, no letters, no people, no faces, no hands, no CGI, no animation."
+
+    # Only 2 quick retries — if rate limited, fall back to Imagen 4 fast
+    for attempt in range(2):
+        try:
+            print(f"[BG] Veo 3: generating video (attempt {attempt + 1})...")
+            operation = client.models.generate_videos(
+                model="veo-3.0-generate-001",
+                prompt=safe_prompt,
+                config=genai.types.GenerateVideosConfig(
+                    aspect_ratio="16:9",
+                    number_of_videos=1,
+                ),
+            )
+            break
+        except ClientError as e:
+            if "429" in str(e) or "RESOURCE_EXHAUSTED" in str(e):
+                if attempt == 0:
+                    print("[BG] Rate limited, waiting 30s...")
+                    _time.sleep(30)
+                else:
+                    raise RuntimeError("Veo 3 rate limited — switching to Imagen 4")
+            else:
+                raise
     else:
-        device = "cpu"
-        dtype = torch.float32
+        raise RuntimeError("Veo 3 rate limited — switching to Imagen 4")
 
-    _sd_pipe = StableDiffusionPipeline.from_pretrained(
-        model_id,
-        torch_dtype=dtype,
-        safety_checker=None,
+    while not operation.done:
+        _time.sleep(10)
+        operation = client.operations.get(operation)
+
+    video = operation.result.generated_videos[0]
+    # Download via authenticated request (Vertex AI)
+    import google.auth
+    import google.auth.transport.requests
+    credentials, _ = google.auth.default()
+    credentials.refresh(google.auth.transport.requests.Request())
+    resp = _req.get(
+        video.video.uri,
+        headers={"Authorization": f"Bearer {credentials.token}"},
     )
-    _sd_pipe = _sd_pipe.to(device)
-    if hasattr(_sd_pipe, "enable_attention_slicing"):
-        _sd_pipe.enable_attention_slicing()
+    resp.raise_for_status()
+    with open(output_path, "wb") as f:
+        f.write(resp.content)
 
-    return _sd_pipe
-
-
-def _generate_ai_background(style: str, output_path: str) -> str:
-    """Generate a unique background image using Stable Diffusion."""
-    prompts = _STYLE_PROMPTS.get(style, _STYLE_PROMPTS["oscuro"])
-    prompt = random.choice(prompts)
-
-    pipe = _get_sd_pipeline()
-
-    image = pipe(
-        prompt,
-        negative_prompt="text, watermark, logo, words, letters, blurry, low quality",
-        width=768,
-        height=512,
-        num_inference_steps=25,
-        guidance_scale=7.5,
-    ).images[0]
-
-    # Validate the image is not blank/black (SD can fail silently on MPS)
-    arr = np.array(image)
-    if arr.mean() < 5:
-        raise RuntimeError("Stable Diffusion produced a blank/black image")
-
-    image = image.resize((1920, 1080), Image.LANCZOS)
-    image.save(output_path, "JPEG", quality=95)
+    print(f"[BG] Veo 3 video saved: {os.path.getsize(output_path)/1024/1024:.1f} MB")
     return output_path
 
 
-def _ensure_background(style: str, job_dir: str) -> str | None:
-    """Generate AI background if no video files exist. Safe fallback on failure."""
-    # If there are any video files in backgrounds dir, prefer those
+def _generate_imagen_image(prompt: str, output_path: str, max_retries: int = 5) -> str:
+    """Generate an image with Google Imagen 4. Auto-retries on rate limit."""
+    from google import genai
+    from google.genai.errors import ClientError
+    import time as _time
+
+    client = _get_genai_client()
+
+    safe_prompt = f"{prompt}. No text, no words, no letters, no people, no faces, no hands."
+
+    for attempt in range(max_retries):
+        try:
+            print(f"[BG] Imagen 4: generating image (attempt {attempt + 1})...")
+            response = client.models.generate_images(
+                model="imagen-4.0-generate-001",
+                prompt=safe_prompt,
+                config=genai.types.GenerateImagesConfig(
+                    number_of_images=1,
+                    aspect_ratio="16:9",
+                ),
+            )
+            break
+        except ClientError as e:
+            if "429" in str(e) or "RESOURCE_EXHAUSTED" in str(e):
+                wait = 60 * (attempt + 1)
+                print(f"[BG] Rate limited, waiting {wait}s before retry...")
+                _time.sleep(wait)
+            else:
+                raise
+    else:
+        raise RuntimeError("Imagen 4 rate limit exceeded after all retries")
+
+    image = response.generated_images[0]
+    # Save image bytes
+    img_bytes = image.image.image_bytes
+    with open(output_path, "wb") as f:
+        f.write(img_bytes)
+
+    print(f"[BG] Imagen 4 saved: {os.path.getsize(output_path)/1024:.0f} KB")
+    return output_path
+
+
+def _ensure_background(style_hint: str, job_dir: str, lyrics_text: str = None, artist: str = "") -> str:
+    """Generate background using AI. Gemini picks the best style for the song.
+
+    Returns path to .mp4 (video style) or .jpg/.png (photo/illustration style).
+    """
+    # If there are video files in backgrounds dir, use those instead
     all_videos = []
     if os.path.isdir(BACKGROUNDS_DIR):
         for root, _, files in os.walk(BACKGROUNDS_DIR):
@@ -260,14 +515,28 @@ def _ensure_background(style: str, job_dir: str) -> str | None:
     if all_videos:
         return None
 
-    # No videos — try Stable Diffusion, but don't crash if it fails
-    try:
-        bg_path = os.path.join(job_dir, "ai_background.jpg")
-        _generate_ai_background(style, bg_path)
-        return bg_path
-    except Exception as e:
-        print(f"[WARNING] Stable Diffusion failed, using gradient fallback: {e}")
-        return None
+    # Generate video background with Veo 3 (always video, no images)
+    result = _get_unique_prompt(lyrics_text, artist)
+    prompt = result["prompt"]
+
+    bg_path = os.path.join(job_dir, "bg_generated.mp4")
+    import time as _time_bg
+    for attempt in range(2):
+        try:
+            _generate_veo_video(prompt, bg_path)
+            return bg_path
+        except Exception as e:
+            print(f"[BG] Veo 3 attempt {attempt + 1} failed: {e}")
+            if attempt == 0:
+                _time_bg.sleep(5)
+
+    # All Veo attempts failed — render a gradient as fallback
+    print("[BG] Veo 3 unavailable, falling back to gradient background")
+    fallback_path = os.path.join(job_dir, "bg_gradient_fallback.mp4")
+    gradient = _make_gradient_clip(30.0, style_hint)
+    gradient.write_videofile(fallback_path, fps=24, logger=None)
+    gradient.close()
+    return fallback_path
 
 
 def _ken_burns_clip(image_path: str, duration: float):
@@ -421,49 +690,95 @@ def _cover_resize(clip, target_w=1920, target_h=1080):
     return resized.crop(x1=x_offset, y1=y_offset, width=target_w, height=target_h)
 
 
-def _get_background_clip_from_path(bg_path: str, style: str, duration: float):
-    """Load a specific background video, resize and loop it."""
+def _prerender_looped_bg(bg_path: str, duration: float, job_dir: str, target_w=1920, target_h=1080) -> str:
+    """Pre-render a seamlessly looped background video using ffmpeg.
+
+    Uses ffmpeg's native looping + scale/crop (much faster and smoother than
+    Python frame-by-frame). The result is a fluent, high-fps MP4 file.
+    """
+    out_path = os.path.join(job_dir, "bg_looped.mp4")
+
+    # ffmpeg: loop input, scale to cover target, center crop, trim to duration
+    # -stream_loop -1 = infinite loop; we trim with -t
+    cmd = [
+        "ffmpeg", "-y",
+        "-stream_loop", "-1",
+        "-i", bg_path,
+        "-t", str(duration),
+        "-vf", (
+            f"scale={target_w}:{target_h}:force_original_aspect_ratio=increase,"
+            f"crop={target_w}:{target_h},"
+            "setpts=PTS-STARTPTS"
+        ),
+        "-c:v", "libx264",
+        "-preset", "fast",
+        "-crf", "20",
+        "-pix_fmt", "yuv420p",
+        "-an",
+        out_path,
+    ]
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode != 0:
+        raise RuntimeError(f"ffmpeg loop failed: {result.stderr[-300:]}")
+
+    size_mb = os.path.getsize(out_path) / 1024 / 1024
+    print(f"[BG] Pre-rendered loop: {duration:.0f}s, {size_mb:.1f} MB")
+    return out_path
+
+
+def _get_background_clip_from_path(bg_path: str, style: str, duration: float, job_dir: str = None):
+    """Load a background video, loop it seamlessly via ffmpeg, return clip."""
     try:
         clip = VideoFileClip(bg_path)
-        clip.get_frame(0)  # validate it's readable
-        clip = _cover_resize(clip)
+        clip.get_frame(0)
+        clip_dur = clip.duration
+        clip.close()
     except Exception as e:
-        print(f"[BG] Failed to load {bg_path}: {e}, using gradient fallback")
-        return _make_gradient_clip(duration, style)
-    if clip.duration >= duration:
-        return clip.subclip(0, duration)
+        raise RuntimeError(f"Cannot load background video: {e}")
 
-    # Loop with fade-out/fade-in at each seam to hide the cut.
-    # Each iteration opens a fresh VideoFileClip to avoid shared ffmpeg reader bugs.
-    fade_dur = min(1.0, clip.duration * 0.2)
-    clip_dur = clip.duration
-    clip.close()
-    loops_needed = math.ceil(duration / clip_dur) + 1
-    clips = []
-    for i in range(loops_needed):
-        c = _cover_resize(VideoFileClip(bg_path))
-        c = c.fadeout(fade_dur)
-        if i > 0:
-            c = c.fadein(fade_dur)
-        clips.append(c)
-    looped = concatenate_videoclips(clips)
-    return looped.subclip(0, duration)
+    if clip_dur >= duration:
+        return _cover_resize(VideoFileClip(bg_path)).subclip(0, duration)
+
+    # Pre-render the looped video with ffmpeg (fast, fluid, native fps)
+    if job_dir:
+        looped_path = _prerender_looped_bg(bg_path, duration, job_dir)
+        return VideoFileClip(looped_path)
+
+    # Fallback: simple concatenation
+    loops = math.ceil(duration / clip_dur) + 1
+    clips = [_cover_resize(VideoFileClip(bg_path)) for _ in range(loops)]
+    return concatenate_videoclips(clips).subclip(0, duration)
 
 
 # Font pool — Google Fonts only (SIL OFL = full commercial use, no royalties)
 _FONTS_DIR = os.path.join(os.path.dirname(__file__), "..", "assets", "fonts")
+_LYRIC_FONTS = [
+    # Sans-serif (clean, modern)
+    "Montserrat-Bold.ttf",
+    "Montserrat-ExtraBold.ttf",
+    "Poppins-Bold.ttf",
+    "Outfit-Bold.ttf",       # Gilroy alternative
+    "Roboto-Bold.ttf",
+    # Display (impactful, bold)
+    "BebasNeue-Regular.ttf",
+    "Oswald-Bold.ttf",
+    "Anton-Regular.ttf",
+]
 _FONT_POOL = [
     os.path.join(_FONTS_DIR, f)
-    for f in os.listdir(_FONTS_DIR)
-    if f.endswith((".ttf", ".otf")) and os.path.isfile(os.path.join(_FONTS_DIR, f))
+    for f in _LYRIC_FONTS
+    if os.path.isfile(os.path.join(_FONTS_DIR, f))
 ] if os.path.isdir(_FONTS_DIR) else []
 
 
 def _make_text_clip(text: str, seg_start: float, seg_end: float, font: str = "Arial"):
-    """Create a text clip with shadow for one lyric segment."""
-    display_text = text.upper()
+    """Create a clean text clip matching pro lyric video style (bold white, subtle shadow)."""
+    import unicodedata
+    # Sanitize text: normalize unicode and remove problematic characters
+    display_text = unicodedata.normalize("NFC", text.upper())
+    # Remove characters that break ImageMagick's @file parsing
+    display_text = display_text.replace("@", "").replace("`", "'").replace("\x00", "")
 
-    # Reduce font size for long lines to prevent text clipping
     text_len = len(display_text)
     if text_len > 80:
         fontsize = 55
@@ -472,36 +787,31 @@ def _make_text_clip(text: str, seg_start: float, seg_end: float, font: str = "Ar
         fontsize = 70
         text_width = 1650
     else:
-        fontsize = 90
+        fontsize = 85
         text_width = 1500
 
-    # Shadow layer
-    shadow = TextClip(
-        display_text,
-        fontsize=fontsize,
-        font=font,
-        color="black",
-        method="caption",
-        size=(text_width, None),
-        align="center",
-    ).set_opacity(0.6)
+    # Fallback font if the selected one fails with ImageMagick
+    fallback_font = os.path.join(_FONTS_DIR, "Montserrat-Bold.ttf")
+
+    def _try_text_clip(text, fsize, fnt, color, **kwargs):
+        try:
+            return TextClip(text, fontsize=fsize, font=fnt, color=color,
+                            method="caption", size=(text_width, None), align="center", **kwargs)
+        except Exception:
+            return TextClip(text, fontsize=fsize, font=fallback_font, color=color,
+                            method="caption", size=(text_width, None), align="center", **kwargs)
+
+    # Soft shadow for depth
+    shadow = _try_text_clip(display_text, fontsize, font, "black").set_opacity(0.4)
 
     sh = shadow.size[1]
-    shadow_y = (1080 - sh) // 2 + 4
-    shadow_x = (1920 - text_width) // 2 + 4
+    shadow_y = (1080 - sh) // 2 + 3
+    shadow_x = (1920 - text_width) // 2 + 3
     shadow = shadow.set_position((shadow_x, shadow_y)).set_start(seg_start).set_end(seg_end)
 
-    # Main text layer
-    txt = TextClip(
-        display_text,
-        fontsize=fontsize,
-        font=font,
-        color="white",
-        stroke_color="black",
-        stroke_width=3,
-        method="caption",
-        size=(text_width, None),
-        align="center",
+    # Main text — clean white, thin stroke
+    txt = _try_text_clip(display_text, fontsize, font, "white",
+                         stroke_color="black", stroke_width=1.5
     ).set_position("center").set_start(seg_start).set_end(seg_end)
 
     return [shadow, txt]
@@ -523,17 +833,17 @@ def generate_lyric_video(
     audio = AudioFileClip(mp3_path)
     duration = audio.duration
 
-    # Use AI-generated image with Ken Burns if available
-    bg_source = None  # raw background path for reuse by short/thumbnail
-    if bg_image_path and os.path.exists(bg_image_path):
-        bg = _ken_burns_clip(bg_image_path, duration)
-        bg_source = bg_image_path
-    else:
+    # Load background — can be video (.mp4) or image (.jpg/.png with Ken Burns)
+    bg_source = bg_image_path
+    if not bg_source:
         bg_source = _find_background_video()
-        if bg_source:
-            bg = _get_background_clip_from_path(bg_source, style, duration)
-        else:
-            bg = _make_gradient_clip(duration, style)
+    if not bg_source:
+        raise RuntimeError("No background available. Check Veo 3 API or add videos to assets/backgrounds/")
+
+    if bg_source.lower().endswith((".jpg", ".jpeg", ".png")):
+        bg = _ken_burns_clip(bg_source, duration)
+    else:
+        bg = _get_background_clip_from_path(bg_source, style, duration, job_dir)
 
     # Pick a random font for this job
     font = random.choice(_FONT_POOL) if _FONT_POOL else "Arial"
@@ -545,10 +855,17 @@ def generate_lyric_video(
     # Show artist + song title during instrumental intro
     first_lyric_start = segments[0]["start"] if segments else duration
     if first_lyric_start > 3 and artist:
-        song_name = os.path.splitext(os.path.basename(mp3_path))[0]
+        raw_name = os.path.splitext(os.path.basename(mp3_path))[0]
+        title_song = raw_name
+        if " - " in raw_name:
+            title_song = raw_name.split(" - ", 1)[1]
+        for sfx in ["(Official Video)", "(Official Audio)", "(Lyric Video)",
+                     "(Official Music Video)", "(Audio)", "(Video)", "(En Vivo)",
+                     "(Live)", "(Lyrics)"]:
+            title_song = title_song.replace(sfx, "").strip()
         title_end = first_lyric_start - 0.5
         title_layers = _make_text_clip(
-            f"{artist}\n{song_name}", 0.5, title_end, font
+            f"{artist}\n{title_song}", 0.5, title_end, font
         )
         text_layers.extend(title_layers)
 
@@ -581,6 +898,9 @@ def generate_lyric_video(
 def _find_chorus_start(segments: list[dict], window_sec: int = 30) -> float:
     """Find the start of the chorus — the 30s window with most repeated lyrics."""
     if not segments:
+        return 0.0
+
+    if not segments[-1].get("end"):
         return 0.0
 
     total_duration = segments[-1]["end"]
@@ -781,7 +1101,17 @@ def generate_thumbnail(
     img = enhancer.enhance(0.6)
 
     draw = ImageDraw.Draw(img)
-    song_name = os.path.splitext(os.path.basename(mp3_path))[0]
+    # Extract song name from filename, removing artist prefix if present
+    raw_name = os.path.splitext(os.path.basename(mp3_path))[0]
+    # Handle "Artist - Song" and "Artist - Song (Extra Info)" formats
+    song_name = raw_name
+    if " - " in raw_name:
+        song_name = raw_name.split(" - ", 1)[1]
+    # Remove common suffixes
+    for suffix in ["(Official Video)", "(Official Audio)", "(Lyric Video)",
+                   "(Official Music Video)", "(Audio)", "(Video)", "(En Vivo)",
+                   "(Live)", "(Lyrics)"]:
+        song_name = song_name.replace(suffix, "").strip()
 
     # Use Montserrat ExtraBold for thumbnails (Google Font, OFL licensed)
     thumb_font = os.path.join(_FONTS_DIR, "Montserrat-ExtraBold.ttf")
