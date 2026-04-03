@@ -46,7 +46,7 @@ function findSuggestion(whisperText, refLines, startIdx) {
   return null;
 }
 
-export default function LyricsEditor({ segments, filename, referenceLyrics, onApprove, onBack, isBatch = false }) {
+export default function LyricsEditor({ segments, filename, referenceLyrics, onApprove, onBack, isBatch = false, batchProgress = "" }) {
   // Each segment gets a unique ID so deletions don't mess up suggestions
   const [edited, setEdited] = useState(() =>
     segments.map((s, i) => ({ ...s, _id: i }))
@@ -120,7 +120,10 @@ export default function LyricsEditor({ segments, filename, referenceLyrics, onAp
           </button>
           <div>
             <h2 className="text-lg font-bold">Revisar lyrics</h2>
-            <p className="text-sm text-gray-500">{name}</p>
+            <p className="text-sm text-gray-500">
+              {name}
+              {batchProgress && <span className="ml-2 text-brand text-xs">({batchProgress})</span>}
+            </p>
           </div>
         </div>
         <button onClick={handleApprove} className="btn-primary text-sm py-2.5 px-5">

@@ -126,8 +126,11 @@ export default function BatchProgress({ jobs, onReset }) {
           </>
         ) : (
           <>
-            <h2 className="text-2xl font-bold mb-1">Procesando batch</h2>
-            <p className="text-gray-500 text-sm">{done} de {total} completado{done !== 1 ? "s" : ""}</p>
+            <h2 className="text-2xl font-bold mb-1">Generando videos</h2>
+            <p className="text-gray-500 text-sm">
+              {done} de {total} completado{done !== 1 ? "s" : ""}
+              {total - done > 0 && <span className="text-gray-600"> — ~{(total - done) * 5} min restantes</span>}
+            </p>
           </>
         )}
       </div>

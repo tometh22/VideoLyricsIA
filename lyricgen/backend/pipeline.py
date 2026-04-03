@@ -402,21 +402,33 @@ def _get_unique_prompt(lyrics_text: str = None, artist: str = "") -> dict:
     }
 
 
+_last_veo_request = 0  # timestamp of last Veo API call
+_VEO_COOLDOWN = 20     # seconds between Veo requests to avoid rate limits
+
+
 def _generate_veo_video(prompt: str, output_path: str) -> str:
-    """Generate a video clip with Google Veo 3. Fast fail on rate limit."""
+    """Generate a video clip with Google Veo 3. Rate-limit aware."""
     from google import genai
     from google.genai.errors import ClientError
     import time as _time
     import requests as _req
+    global _last_veo_request
+
+    # Proactive cooldown — wait if last request was too recent
+    elapsed = _time.time() - _last_veo_request
+    if elapsed < _VEO_COOLDOWN and _last_veo_request > 0:
+        wait = _VEO_COOLDOWN - elapsed
+        print(f"[BG] Cooldown: waiting {wait:.0f}s before next Veo request...")
+        _time.sleep(wait)
 
     client = _get_genai_client()
 
     safe_prompt = f"{prompt}. Photorealistic, filmed with cinema camera, real footage. No text, no words, no letters, no people, no faces, no hands, no CGI, no animation."
 
-    # Only 2 quick retries — if rate limited, fall back to Imagen 4 fast
-    for attempt in range(2):
+    # Patient retries for batch processing — wait and retry up to 5 times
+    for attempt in range(5):
         try:
-            print(f"[BG] Veo 3: generating video (attempt {attempt + 1})...")
+            print(f"[BG] Veo 3: generating video (attempt {attempt + 1}/5)...")
             operation = client.models.generate_videos(
                 model="veo-3.0-generate-001",
                 prompt=safe_prompt,
@@ -428,15 +440,15 @@ def _generate_veo_video(prompt: str, output_path: str) -> str:
             break
         except ClientError as e:
             if "429" in str(e) or "RESOURCE_EXHAUSTED" in str(e):
-                if attempt == 0:
-                    print("[BG] Rate limited, waiting 30s...")
-                    _time.sleep(30)
-                else:
-                    raise RuntimeError("Veo 3 rate limited — switching to Imagen 4")
+                wait = 60 * (attempt + 1)  # 60s, 120s, 180s, 240s, 300s
+                print(f"[BG] Rate limited, waiting {wait}s before retry...")
+                _time.sleep(wait)
             else:
                 raise
     else:
-        raise RuntimeError("Veo 3 rate limited — switching to Imagen 4")
+        raise RuntimeError("Veo 3 rate limit exceeded after 5 retries (~15 min wait)")
+
+    _last_veo_request = _time.time()
 
     while not operation.done:
         _time.sleep(10)
@@ -521,14 +533,16 @@ def _ensure_background(style_hint: str, job_dir: str, lyrics_text: str = None, a
 
     bg_path = os.path.join(job_dir, "bg_generated.mp4")
     import time as _time_bg
-    for attempt in range(2):
+    for attempt in range(3):
         try:
             _generate_veo_video(prompt, bg_path)
             return bg_path
         except Exception as e:
-            print(f"[BG] Veo 3 attempt {attempt + 1} failed: {e}")
-            if attempt == 0:
-                _time_bg.sleep(5)
+            print(f"[BG] Veo 3 attempt {attempt + 1}/3 failed: {e}")
+            if attempt < 2:
+                wait = 30 * (attempt + 1)
+                print(f"[BG] Waiting {wait}s before retry...")
+                _time_bg.sleep(wait)
 
     # All Veo attempts failed — render a gradient as fallback
     print("[BG] Veo 3 unavailable, falling back to gradient background")

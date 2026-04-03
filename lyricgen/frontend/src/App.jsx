@@ -1,5 +1,8 @@
 import { useState, useRef, useCallback, useEffect } from "react";
+import Landing from "./components/Landing";
 import Sidebar from "./components/Sidebar";
+import Dashboard from "./components/Dashboard";
+import HistoryView from "./components/HistoryView";
 import UploadZone from "./components/UploadZone";
 import LyricsEditor from "./components/LyricsEditor";
 import BatchProgress from "./components/BatchProgress";
@@ -8,19 +11,19 @@ import JobDetail from "./components/JobDetail";
 const API = "";
 
 export default function App() {
-  const [files, setFiles] = useState([]); // [{file, artist, language}]
+  const [showLanding, setShowLanding] = useState(true);
+  const [view, setView] = useState("dashboard"); // dashboard, new, history, review, generating, detail
+  const [files, setFiles] = useState([]);
   const style = "oscuro";
 
-  // Lyrics review state
-  const [reviewQueue, setReviewQueue] = useState([]); // files pending review
-  const [currentReview, setCurrentReview] = useState(null); // {file, artist, language, segments}
-  const [approvedJobs, setApprovedJobs] = useState([]); // [{file, artist, segments}]
+  const [reviewQueue, setReviewQueue] = useState([]);
+  const [currentReview, setCurrentReview] = useState(null);
+  const [approvedJobs, setApprovedJobs] = useState([]);
   const [transcribing, setTranscribing] = useState(false);
   const [transcribeError, setTranscribeError] = useState(null);
-  const [readyToGenerate, setReadyToGenerate] = useState(false); // batch summary screen
+  const [readyToGenerate, setReadyToGenerate] = useState(false);
 
   const [jobs, setJobs] = useState([]);
-  const [started, setStarted] = useState(false);
   const [history, setHistory] = useState([]);
   const [selectedJob, setSelectedJob] = useState(null);
   const [sidebarOpen, setSidebarOpen] = useState(true);
@@ -51,14 +54,14 @@ export default function App() {
     });
   }, []);
 
-  // Start transcription + review flow
+  // --- Review flow ---
   const handleStartReview = async () => {
     if (!files.length || !files.every((f) => f.artist.trim())) return;
     setReviewQueue([...files]);
+    setView("review");
     transcribeNext([...files], 0);
   };
 
-  // Skip review — generate directly (fast mode)
   const handleGenerateDirect = () => {
     if (!files.length || !files.every((f) => f.artist.trim())) return;
     const jobList = files.map((f) => ({
@@ -67,12 +70,12 @@ export default function App() {
       progress: 0, job_id: null, error: null,
     }));
     setJobs(jobList);
-    setStarted(true);
+    setView("generating");
     processQueueDirect(jobList);
   };
 
   const transcribeNext = async (queue, idx) => {
-    if (idx >= queue.length) return; // all reviewed
+    if (idx >= queue.length) return;
     const entry = queue[idx];
     setTranscribing(true);
     setTranscribeError(null);
@@ -83,12 +86,9 @@ export default function App() {
 
     try {
       const res = await fetch(`${API}/transcribe`, { method: "POST", body: formData });
-      if (!res.ok) {
-        const errText = await res.text();
-        throw new Error(`Server error ${res.status}: ${errText}`);
-      }
+      if (!res.ok) throw new Error(`Server error ${res.status}`);
       const text = await res.text();
-      if (!text) throw new Error("Empty response from server");
+      if (!text) throw new Error("Empty response");
       const data = JSON.parse(text);
       setTranscribing(false);
       setCurrentReview({
@@ -112,13 +112,10 @@ export default function App() {
 
     const nextIdx = r.queueIdx + 1;
     if (nextIdx < r.queue.length) {
-      // More songs to review
       transcribeNext(r.queue, nextIdx);
     } else if (r.queue.length === 1) {
-      // Single song — generate immediately
       startGenerationWithSegments(newApproved);
     } else {
-      // Batch complete — show summary (don't auto-generate)
       setReadyToGenerate(true);
     }
   };
@@ -130,15 +127,14 @@ export default function App() {
       status: "queued", current_step: null, progress: 0, job_id: null, error: null,
     }));
     setJobs(jobList);
-    setStarted(true);
-    setReviewQueue([]);
+    setView("generating");
+    setReadyToGenerate(false);
     setApprovedJobs([]);
 
     for (let i = 0; i < jobList.length; i++) {
       setJobs((prev) => prev.map((j, idx) =>
         idx === i ? { ...j, status: "processing", current_step: "background", progress: 22 } : j
       ));
-
       const formData = new FormData();
       formData.append("file", jobList[i]._file);
       formData.append("artist", jobList[i].artist);
@@ -153,13 +149,12 @@ export default function App() {
         await pollJob(data.job_id);
       } catch {
         setJobs((prev) => prev.map((j, idx) =>
-          idx === i ? { ...j, status: "error", error: "Upload failed" } : j
+          idx === i ? { ...j, status: "error", error: "Error de conexion" } : j
         ));
       }
     }
   };
 
-  // Direct generation (no review)
   const processQueueDirect = async (jobList) => {
     for (let i = 0; i < jobList.length; i++) {
       setJobs((prev) => prev.map((j, idx) =>
@@ -178,7 +173,7 @@ export default function App() {
         await pollJob(data.job_id);
       } catch {
         setJobs((prev) => prev.map((j, idx) =>
-          idx === i ? { ...j, status: "error", error: "Upload failed" } : j
+          idx === i ? { ...j, status: "error", error: "Error de conexion" } : j
         ));
       }
     }
@@ -188,9 +183,10 @@ export default function App() {
 
   const handleReset = () => {
     if (pollingRef.current) clearInterval(pollingRef.current);
-    setFiles([]); setJobs([]); setStarted(false); setSelectedJob(null);
+    setFiles([]); setJobs([]); setSelectedJob(null);
     setReviewQueue([]); setCurrentReview(null); setApprovedJobs([]);
     setTranscribing(false); setReadyToGenerate(false); setTranscribeError(null);
+    setView("dashboard");
     fetchHistory();
   };
 
@@ -200,57 +196,89 @@ export default function App() {
   };
 
   const handleSelectJob = async (jobId) => {
-    try { setSelectedJob(await (await fetch(`${API}/status/${jobId}`)).json()); setStarted(false); setCurrentReview(null); }
-    catch {}
+    try {
+      setSelectedJob(await (await fetch(`${API}/status/${jobId}`)).json());
+      setView("detail");
+    } catch {}
+  };
+
+  const handleNav = (id) => {
+    if (id === "dashboard") { setView("dashboard"); setSelectedJob(null); }
+    else if (id === "new") { setView("new"); setFiles([]); }
+    else if (id === "history") { setView("history"); }
   };
 
   const allHaveArtist = files.length > 0 && files.every((f) => f.artist.trim());
-  const showUpload = !started && !selectedJob && !currentReview && !transcribing && !readyToGenerate;
-  const showReview = currentReview && !started;
+
+  // --- Landing ---
+  if (showLanding) {
+    return <Landing onStart={() => setShowLanding(false)} />;
+  }
 
   return (
     <div className="min-h-screen bg-surface flex">
       <Sidebar
-        history={history} selectedId={selectedJob?.job_id}
-        onSelect={handleSelectJob}
-        onNew={() => { setSelectedJob(null); setStarted(false); setCurrentReview(null); setTranscribing(false); }}
-        open={sidebarOpen} onToggle={() => setSidebarOpen(!sidebarOpen)}
+        activeView={view === "new" || view === "review" || view === "generating" ? "new" : view === "detail" ? "history" : view}
+        onNav={handleNav}
+        open={sidebarOpen}
+        onToggle={() => setSidebarOpen(!sidebarOpen)}
       />
 
-      <div className={`flex-1 min-h-screen transition-all duration-300 ${sidebarOpen ? "ml-72" : "ml-0"}`}>
+      <div className={`flex-1 min-h-screen transition-all duration-300 ${sidebarOpen ? "ml-64" : "ml-0"}`}>
+        {/* Ambient */}
         <div className="fixed inset-0 pointer-events-none">
           <div className="absolute top-[-30%] left-[20%] w-[600px] h-[600px] bg-brand/[0.03] rounded-full blur-[120px]" />
           <div className="absolute bottom-[-20%] right-[-5%] w-[500px] h-[500px] bg-brand-light/[0.02] rounded-full blur-[100px]" />
         </div>
 
-        <header className="relative z-10 flex items-center justify-between px-8 py-5 border-b border-white/[0.04]">
+        {/* Top bar */}
+        <header className="relative z-10 flex items-center justify-between px-8 py-4 border-b border-white/[0.04]">
           <div className="flex items-center gap-3">
             {!sidebarOpen && (
               <button onClick={() => setSidebarOpen(true)} className="mr-2 text-gray-400 hover:text-white transition-colors">
-                <svg className="w-5 h-5" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24"><path d="M4 6h16M4 12h16M4 18h16" /></svg>
+                <svg className="w-5 h-5" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24"><path d="M4 6h16M4 12h16M4 18h16"/></svg>
               </button>
             )}
-            <div className="w-8 h-8 rounded-lg bg-gradient-to-br from-brand to-brand-light flex items-center justify-center">
-              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="white" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
-                <path d="M9 18V5l12-2v13" /><circle cx="6" cy="18" r="3" /><circle cx="18" cy="16" r="3" />
-              </svg>
-            </div>
-            <span className="text-lg font-bold tracking-tight">LyricGen</span>
-            <span className="text-[10px] font-medium text-brand bg-brand/10 px-2 py-0.5 rounded-full ml-1 uppercase tracking-widest">Pro</span>
           </div>
-          <span className="text-xs text-gray-500 hidden sm:block">Universal Music Group</span>
+          <span className="text-xs text-gray-500">Universal Music Group</span>
         </header>
 
-        <main className="relative z-10 flex flex-col items-center px-6 pt-12 pb-20">
-          {showUpload && (
-            <div className="w-full max-w-xl animate-fade-in">
-              <div className="text-center mb-10">
-                <h1 className="text-3xl sm:text-4xl font-extrabold tracking-tight mb-3 bg-gradient-to-r from-white via-white to-gray-400 bg-clip-text text-transparent">
-                  Crea lyric videos en segundos
-                </h1>
-                <p className="text-gray-400 max-w-md mx-auto leading-relaxed">
-                  Sube uno o varios MP3 y genera lyric videos, YouTube Shorts y thumbnails.
-                </p>
+        {/* Content */}
+        <main className="relative z-10 px-8 pt-8 pb-20">
+
+          {/* Dashboard */}
+          {view === "dashboard" && (
+            <Dashboard
+              history={history}
+              onSelectJob={handleSelectJob}
+              onNewBatch={() => { setView("new"); setFiles([]); }}
+              onViewHistory={() => setView("history")}
+            />
+          )}
+
+          {/* History */}
+          {view === "history" && (
+            <HistoryView
+              history={history}
+              onSelect={handleSelectJob}
+              onBack={() => setView("dashboard")}
+            />
+          )}
+
+          {/* New batch */}
+          {view === "new" && !currentReview && !transcribing && !readyToGenerate && (
+            <div className="w-full max-w-xl mx-auto animate-fade-in">
+              <div className="flex items-center gap-3 mb-8">
+                <button onClick={() => setView("dashboard")}
+                  className="w-9 h-9 rounded-xl glass flex items-center justify-center text-gray-400 hover:text-white transition-colors">
+                  <svg className="w-4 h-4" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
+                    <path d="M19 12H5M12 19l-7-7 7-7" />
+                  </svg>
+                </button>
+                <div>
+                  <h1 className="text-2xl font-bold">Nuevo batch</h1>
+                  <p className="text-sm text-gray-500">Subi archivos MP3 para generar lyric videos</p>
+                </div>
               </div>
 
               <div className="space-y-5">
@@ -276,60 +304,68 @@ export default function App() {
             </div>
           )}
 
+          {/* Transcribing */}
           {transcribing && (
-            <div className="w-full max-w-md mt-16 animate-fade-in text-center">
+            <div className="w-full max-w-md mx-auto mt-16 animate-fade-in text-center">
               <div className="w-12 h-12 mx-auto mb-4 border-2 border-brand border-t-transparent rounded-full animate-spin" />
               <h2 className="text-xl font-bold mb-2">Transcribiendo lyrics</h2>
               <p className="text-gray-500 text-sm">Analizando audio...</p>
+              {reviewQueue.length > 1 && (
+                <p className="text-xs text-gray-600 mt-2">
+                  Cancion {approvedJobs.length + 1} de {reviewQueue.length}
+                </p>
+              )}
             </div>
           )}
 
-          {transcribeError && !transcribing && !started && (
-            <div className="w-full max-w-md mt-8 animate-fade-in">
+          {/* Transcribe error */}
+          {transcribeError && !transcribing && (
+            <div className="w-full max-w-md mx-auto mt-8 animate-fade-in">
               <div className="rounded-xl bg-red-500/10 border border-red-500/20 px-5 py-4 text-center">
                 <p className="text-sm text-red-400">{transcribeError}</p>
-                <button onClick={() => setTranscribeError(null)}
+                <button onClick={() => { setTranscribeError(null); setView("new"); }}
                   className="mt-3 text-xs text-gray-400 hover:text-white transition-colors underline">
-                  Cerrar
+                  Volver
                 </button>
               </div>
             </div>
           )}
 
-          {showReview && (
-            <LyricsEditor
-              segments={currentReview.segments}
-              filename={currentReview.file.name}
-              referenceLyrics={currentReview.referenceLyrics || ""}
-              onApprove={handleApproveLyrics}
-              onBack={handleReset}
-              isBatch={currentReview.queue.length > 1}
-            />
+          {/* Lyrics review */}
+          {currentReview && !transcribing && (
+            <div className="flex justify-center">
+              <LyricsEditor
+                segments={currentReview.segments}
+                filename={currentReview.file.name}
+                referenceLyrics={currentReview.referenceLyrics || ""}
+                onApprove={handleApproveLyrics}
+                onBack={handleReset}
+                isBatch={currentReview.queue.length > 1}
+                batchProgress={currentReview.queue.length > 1
+                  ? `${currentReview.queueIdx + 1} de ${currentReview.queue.length}`
+                  : ""}
+              />
+            </div>
           )}
 
-          {readyToGenerate && !started && (
-            <div className="w-full max-w-xl animate-fade-in">
+          {/* Ready to generate (batch summary) */}
+          {readyToGenerate && (
+            <div className="w-full max-w-xl mx-auto animate-fade-in">
               <div className="text-center mb-8">
                 <div className="w-14 h-14 mx-auto mb-4 rounded-2xl bg-accent/10 flex items-center justify-center">
                   <svg className="w-7 h-7 text-accent" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
                     <polyline points="20 6 9 17 4 12" />
                   </svg>
                 </div>
-                <h2 className="text-2xl font-bold mb-2">
-                  {approvedJobs.length} lyrics aprobadas
-                </h2>
-                <p className="text-gray-500">
-                  Todas las canciones fueron revisadas. Podes generar los videos ahora o dejarlos para mas tarde.
-                </p>
+                <h2 className="text-2xl font-bold mb-2">{approvedJobs.length} lyrics aprobadas</h2>
+                <p className="text-gray-500">Todas las canciones revisadas. Genera los videos cuando quieras.</p>
               </div>
 
               <div className="space-y-1.5 mb-8 max-h-60 overflow-y-auto">
                 {approvedJobs.map((job, i) => (
                   <div key={i} className="flex items-center gap-3 glass rounded-xl px-4 py-2.5">
                     <div className="w-2 h-2 rounded-full bg-accent shrink-0" />
-                    <span className="text-sm text-white truncate flex-1">
-                      {job.file.name.replace(/\.mp3$/i, "")}
-                    </span>
+                    <span className="text-sm text-white truncate flex-1">{job.file.name.replace(/\.mp3$/i, "")}</span>
                     <span className="text-xs text-gray-500">{job.segments.length} lineas</span>
                   </div>
                 ))}
@@ -338,24 +374,24 @@ export default function App() {
               <div className="flex gap-3 justify-center">
                 <button onClick={handleGenerateBatch} className="btn-primary text-lg py-4 px-8">
                   Generar {approvedJobs.length} videos
-                  <svg className="inline-block ml-2 w-5 h-5" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24" strokeLinecap="round" strokeLinejoin="round">
-                    <path d="M5 12h14M12 5l7 7-7 7" />
-                  </svg>
                 </button>
-                <button onClick={handleReset} className="btn-secondary">
-                  Cancelar
-                </button>
+                <button onClick={handleReset} className="btn-secondary">Cancelar</button>
               </div>
-
-              <p className="text-center text-xs text-gray-600 mt-6">
-                La generacion puede tardar varios minutos. Podes cerrar el navegador y volver despues.
-              </p>
             </div>
           )}
 
-          {started && <BatchProgress jobs={jobs} onReset={handleReset} />}
-          {selectedJob && !started && !currentReview && (
-            <JobDetail job={selectedJob} onBack={() => setSelectedJob(null)} />
+          {/* Generating */}
+          {view === "generating" && (
+            <div className="flex justify-center">
+              <BatchProgress jobs={jobs} onReset={handleReset} />
+            </div>
+          )}
+
+          {/* Job detail */}
+          {view === "detail" && selectedJob && (
+            <div className="flex justify-center">
+              <JobDetail job={selectedJob} onBack={() => setView("dashboard")} />
+            </div>
           )}
         </main>
       </div>
