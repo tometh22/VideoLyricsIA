@@ -1,4 +1,5 @@
 import { useState, useEffect } from "react";
+import { useI18n } from "../i18n";
 
 const API = "";
 
@@ -19,6 +20,7 @@ const DEFAULT_SETTINGS = {
 };
 
 export default function Settings({ onBack }) {
+  const { t, lang, setLang } = useI18n();
   const [settings, setSettings] = useState(DEFAULT_SETTINGS);
   const [saved, setSaved] = useState(false);
   const [loading, setLoading] = useState(true);
@@ -60,26 +62,55 @@ export default function Settings({ onBack }) {
           </svg>
         </button>
         <div>
-          <h1 className="text-2xl font-bold">Configuracion</h1>
-          <p className="text-sm text-gray-500">Template de YouTube y preferencias</p>
+          <h1 className="text-2xl font-bold">{t("settings.title")}</h1>
+          <p className="text-sm text-gray-500">{t("settings.subtitle")}</p>
         </div>
       </div>
 
       <div className="space-y-6">
+        {/* App Language */}
+        <div className="glass rounded-2xl p-6">
+          <h3 className="font-semibold mb-1">{t("settings.app_lang")}</h3>
+          <p className="text-xs text-gray-500 mb-4">
+            {lang === "es" ? "Cambia el idioma de toda la interfaz." :
+             lang === "en" ? "Change the language of the entire interface." :
+             "Mude o idioma de toda a interface."}
+          </p>
+          <div className="flex gap-2">
+            {[
+              { code: "es", label: "Español" },
+              { code: "en", label: "English" },
+              { code: "pt", label: "Português" },
+            ].map((l) => (
+              <button
+                key={l.code}
+                onClick={() => setLang(l.code)}
+                className={`px-4 py-2 rounded-xl text-sm font-medium transition-all ${
+                  lang === l.code
+                    ? "bg-brand text-white shadow-glow"
+                    : "glass glass-hover text-gray-400"
+                }`}
+              >
+                {l.label}
+              </button>
+            ))}
+          </div>
+        </div>
+
         {/* YouTube Templates */}
         <div className="glass rounded-2xl p-6">
           <h3 className="font-semibold mb-1 flex items-center gap-2">
             <svg className="w-5 h-5 text-red-500" fill="currentColor" viewBox="0 0 24 24">
               <path d="M22.54 6.42a2.78 2.78 0 00-1.94-2C18.88 4 12 4 12 4s-6.88 0-8.6.46a2.78 2.78 0 00-1.94 2A29 29 0 001 11.75a29 29 0 00.46 5.33A2.78 2.78 0 003.4 19.13C5.12 19.56 12 19.56 12 19.56s6.88 0 8.6-.46a2.78 2.78 0 001.94-2A29 29 0 0023 11.75a29 29 0 00-.46-5.33z"/><polygon points="9.75 15.02 15.5 11.75 9.75 8.48 9.75 15.02" fill="white"/>
             </svg>
-            Template de YouTube
+            {t("settings.yt_template")}
           </h3>
-          <p className="text-xs text-gray-500 mb-5">Configura como se generan los metadatos de cada video.</p>
+          <p className="text-xs text-gray-500 mb-5">{t("settings.yt_template_sub")}</p>
 
           <div className="space-y-4">
             {/* Title format */}
             <div>
-              <label className="block text-xs font-medium text-gray-400 mb-1.5">Formato del titulo</label>
+              <label className="block text-xs font-medium text-gray-400 mb-1.5">{t("settings.title_format")}</label>
               <input
                 type="text"
                 value={settings.titleFormat}
@@ -88,43 +119,43 @@ export default function Settings({ onBack }) {
                 placeholder="{artista} - {cancion} (Letra/Lyrics)"
               />
               <p className="text-[10px] text-gray-600 mt-1">
-                Variables: {"{artista}"}, {"{cancion}"}. Ej: {"{artista}"} - {"{cancion}"} | Lyric Video Oficial
+                {t("settings.title_format_help")}
               </p>
             </div>
 
             {/* Description header */}
             <div>
-              <label className="block text-xs font-medium text-gray-400 mb-1.5">Encabezado de descripcion (fijo)</label>
+              <label className="block text-xs font-medium text-gray-400 mb-1.5">{t("settings.desc_header")}</label>
               <textarea
                 value={settings.descriptionHeader}
                 onChange={(e) => update("descriptionHeader", e.target.value)}
                 rows={3}
                 className="input-field text-sm resize-none"
-                placeholder="Texto que aparece al inicio de todas las descripciones. Ej: Escucha en todas las plataformas..."
+                placeholder={t("settings.desc_header_placeholder")}
               />
               <p className="text-[10px] text-gray-600 mt-1">
-                Se agrega antes de la descripcion generada por IA. Variables: {"{artista}"}, {"{cancion}"}
+                {t("settings.desc_header_help")}
               </p>
             </div>
 
             {/* Description footer */}
             <div>
-              <label className="block text-xs font-medium text-gray-400 mb-1.5">Pie de descripcion (fijo)</label>
+              <label className="block text-xs font-medium text-gray-400 mb-1.5">{t("settings.desc_footer")}</label>
               <textarea
                 value={settings.descriptionFooter}
                 onChange={(e) => update("descriptionFooter", e.target.value)}
                 rows={3}
                 className="input-field text-sm resize-none"
-                placeholder="Texto legal, links a redes, etc. Ej: © 2026 Universal Music. Seguinos en Instagram..."
+                placeholder={t("settings.desc_footer_placeholder")}
               />
               <p className="text-[10px] text-gray-600 mt-1">
-                Se agrega al final de todas las descripciones.
+                {t("settings.desc_footer_help")}
               </p>
             </div>
 
             {/* Mandatory tags */}
             <div>
-              <label className="block text-xs font-medium text-gray-400 mb-1.5">Tags obligatorios</label>
+              <label className="block text-xs font-medium text-gray-400 mb-1.5">{t("settings.mandatory_tags")}</label>
               <input
                 type="text"
                 value={settings.mandatoryTags}
@@ -133,13 +164,13 @@ export default function Settings({ onBack }) {
                 placeholder="Universal Music, VEVO, Warner Music"
               />
               <p className="text-[10px] text-gray-600 mt-1">
-                Separados por coma. Se agregan a los tags generados por IA.
+                {t("settings.mandatory_tags_help")}
               </p>
             </div>
 
             {/* Hashtags */}
             <div>
-              <label className="block text-xs font-medium text-gray-400 mb-1.5">Hashtags (se muestran arriba del titulo)</label>
+              <label className="block text-xs font-medium text-gray-400 mb-1.5">{t("settings.hashtags")}</label>
               <input
                 type="text"
                 value={settings.hashtags}
@@ -148,38 +179,38 @@ export default function Settings({ onBack }) {
                 placeholder="#lyrics #letra #UniversalMusic"
               />
               <p className="text-[10px] text-gray-600 mt-1">
-                YouTube muestra los primeros 3 hashtags arriba del titulo del video.
+                {t("settings.hashtags_help")}
               </p>
             </div>
 
             {/* Metadata language */}
             <div>
-              <label className="block text-xs font-medium text-gray-400 mb-1.5">Idioma de metadata (titulo, descripcion, tags)</label>
+              <label className="block text-xs font-medium text-gray-400 mb-1.5">{t("settings.metadata_lang")}</label>
               <select
                 value={settings.metadataLanguage}
                 onChange={(e) => update("metadataLanguage", e.target.value)}
                 className="input-field text-sm appearance-none cursor-pointer"
               >
-                <option value="es">Espanol</option>
-                <option value="en">English</option>
-                <option value="pt">Portugues</option>
-                <option value="fr">Francais</option>
-                <option value="it">Italiano</option>
-                <option value="de">Deutsch</option>
+                <option value="es">{t("lang.es")}</option>
+                <option value="en">{t("lang.en")}</option>
+                <option value="pt">{t("lang.pt")}</option>
+                <option value="fr">{t("lang.fr")}</option>
+                <option value="it">{t("lang.it")}</option>
+                <option value="de">{t("lang.de")}</option>
               </select>
             </div>
 
             {/* Default privacy */}
             <div>
-              <label className="block text-xs font-medium text-gray-400 mb-1.5">Privacidad por defecto</label>
+              <label className="block text-xs font-medium text-gray-400 mb-1.5">{t("settings.privacy")}</label>
               <select
                 value={settings.defaultPrivacy}
                 onChange={(e) => update("defaultPrivacy", e.target.value)}
                 className="input-field text-sm appearance-none cursor-pointer"
               >
-                <option value="unlisted">No listado (para revision)</option>
-                <option value="private">Privado</option>
-                <option value="public">Publico</option>
+                <option value="unlisted">{t("settings.privacy_unlisted")}</option>
+                <option value="private">{t("settings.privacy_private")}</option>
+                <option value="public">{t("settings.privacy_public")}</option>
               </select>
             </div>
           </div>
@@ -187,35 +218,35 @@ export default function Settings({ onBack }) {
 
         {/* Channel info */}
         <div className="glass rounded-2xl p-6">
-          <h3 className="font-semibold mb-1">Canal de YouTube</h3>
-          <p className="text-xs text-gray-500 mb-4">Canal conectado para subir videos.</p>
+          <h3 className="font-semibold mb-1">{t("settings.channel")}</h3>
+          <p className="text-xs text-gray-500 mb-4">{t("settings.channel_sub")}</p>
           <div>
-            <label className="block text-xs font-medium text-gray-400 mb-1.5">Nombre del canal</label>
+            <label className="block text-xs font-medium text-gray-400 mb-1.5">{t("settings.channel_name")}</label>
             <input
               type="text"
               value={settings.channelName}
               onChange={(e) => update("channelName", e.target.value)}
               className="input-field text-sm"
-              placeholder="Nombre del canal de YouTube"
+              placeholder={t("settings.channel_name")}
             />
           </div>
           <div className="flex items-center gap-2 mt-4">
             <div className="w-2 h-2 rounded-full bg-accent" />
-            <span className="text-xs text-gray-500">Canal autorizado y conectado</span>
+            <span className="text-xs text-gray-500">{t("settings.channel_connected")}</span>
           </div>
         </div>
 
         {/* Save */}
         <div className="flex items-center gap-4">
           <button onClick={handleSave} className="btn-primary py-3 px-8">
-            Guardar configuracion
+            {t("settings.save")}
           </button>
           {saved && (
             <span className="text-sm text-accent animate-fade-in flex items-center gap-1.5">
               <svg className="w-4 h-4" fill="none" stroke="currentColor" strokeWidth="2.5" viewBox="0 0 24 24">
                 <polyline points="20 6 9 17 4 12"/>
               </svg>
-              Guardado
+              {t("settings.saved")}
             </span>
           )}
         </div>

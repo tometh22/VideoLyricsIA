@@ -1,4 +1,5 @@
 import { useState } from "react";
+import { useI18n } from "../i18n";
 
 const API = "";
 
@@ -19,6 +20,7 @@ const TABS = [
 ];
 
 export default function JobDetail({ job, onBack }) {
+  const { t } = useI18n();
   const [activeTab, setActiveTab] = useState("video");
   const [uploading, setUploading] = useState(false);
   const [youtubeResult, setYoutubeResult] = useState(job.youtube || null);
@@ -29,8 +31,8 @@ export default function JobDetail({ job, onBack }) {
   if (job.status !== "done") {
     return (
       <div className="w-full max-w-2xl animate-fade-in text-center py-20">
-        <p className="text-gray-400">Este job no esta disponible para preview.</p>
-        <button onClick={onBack} className="btn-secondary mt-4">Volver</button>
+        <p className="text-gray-400">{t("detail.not_available")}</p>
+        <button onClick={onBack} className="btn-secondary mt-4">{t("detail.back")}</button>
       </div>
     );
   }
@@ -88,14 +90,14 @@ export default function JobDetail({ job, onBack }) {
             <svg className="inline-block w-4 h-4 mr-1.5 -mt-0.5" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
               <path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4" /><polyline points="7 10 12 15 17 10" /><line x1="12" y1="15" x2="12" y2="3" />
             </svg>
-            Descargar
+            {t("detail.download")}
           </button>
           {!youtubeResult && (
             <button onClick={previewMetadata} className="btn-primary text-sm py-2.5 px-4">
               <svg className="inline-block w-4 h-4 mr-1.5 -mt-0.5" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
                 <path d="M22.54 6.42a2.78 2.78 0 00-1.94-2C18.88 4 12 4 12 4s-6.88 0-8.6.46a2.78 2.78 0 00-1.94 2A29 29 0 001 11.75a29 29 0 00.46 5.33A2.78 2.78 0 003.4 19.13C5.12 19.56 12 19.56 12 19.56s6.88 0 8.6-.46a2.78 2.78 0 001.94-2A29 29 0 0023 11.75a29 29 0 00-.46-5.33z"/><polygon points="9.75 15.02 15.5 11.75 9.75 8.48 9.75 15.02"/>
               </svg>
-              Publicar en YouTube
+              {t("detail.publish_youtube")}
             </button>
           )}
           {youtubeResult && !youtubeResult.error && (
@@ -104,7 +106,7 @@ export default function JobDetail({ job, onBack }) {
               <svg className="inline-block w-4 h-4 mr-1.5 -mt-0.5" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
                 <path d="M22.54 6.42a2.78 2.78 0 00-1.94-2C18.88 4 12 4 12 4s-6.88 0-8.6.46a2.78 2.78 0 00-1.94 2A29 29 0 001 11.75a29 29 0 00.46 5.33A2.78 2.78 0 003.4 19.13C5.12 19.56 12 19.56 12 19.56s6.88 0 8.6-.46a2.78 2.78 0 001.94-2A29 29 0 0023 11.75a29 29 0 00-.46-5.33z"/><polygon points="9.75 15.02 15.5 11.75 9.75 8.48 9.75 15.02"/>
               </svg>
-              Ver en YouTube
+              {t("detail.view_youtube")}
             </a>
           )}
         </div>
@@ -159,7 +161,7 @@ export default function JobDetail({ job, onBack }) {
           <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
             <path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4" /><polyline points="7 10 12 15 17 10" /><line x1="12" y1="15" x2="12" y2="3" />
           </svg>
-          Descargar {TABS.find((t) => t.key === activeTab)?.label}
+          {t("detail.download")} {TABS.find((tb) => tb.key === activeTab)?.label}
         </a>
       </div>
 
@@ -170,24 +172,24 @@ export default function JobDetail({ job, onBack }) {
             <svg className="w-5 h-5 text-red-500" fill="currentColor" viewBox="0 0 24 24">
               <path d="M22.54 6.42a2.78 2.78 0 00-1.94-2C18.88 4 12 4 12 4s-6.88 0-8.6.46a2.78 2.78 0 00-1.94 2A29 29 0 001 11.75a29 29 0 00.46 5.33A2.78 2.78 0 003.4 19.13C5.12 19.56 12 19.56 12 19.56s6.88 0 8.6-.46a2.78 2.78 0 001.94-2A29 29 0 0023 11.75a29 29 0 00-.46-5.33z"/><polygon points="9.75 15.02 15.5 11.75 9.75 8.48 9.75 15.02" fill="white"/>
             </svg>
-            Publicar en YouTube
+            {t("detail.publish_youtube")}
           </h3>
 
           {!metadataPreview && !youtubeResult && (
             <div className="flex items-center justify-center py-8">
               <div className="w-6 h-6 border-2 border-brand border-t-transparent rounded-full animate-spin" />
-              <span className="ml-3 text-sm text-gray-400">Generando metadata con IA...</span>
+              <span className="ml-3 text-sm text-gray-400">{t("detail.generating_meta")}</span>
             </div>
           )}
 
           {metadataPreview && !metadataPreview.error && !youtubeResult && (
             <div className="space-y-4">
               <div>
-                <label className="text-xs text-gray-500 uppercase tracking-wider">Titulo</label>
+                <label className="text-xs text-gray-500 uppercase tracking-wider">{t("settings.title_format").split(" ")[0]}</label>
                 <p className="text-sm text-white mt-1 glass rounded-xl px-4 py-2.5">{metadataPreview.title}</p>
               </div>
               <div>
-                <label className="text-xs text-gray-500 uppercase tracking-wider">Descripcion</label>
+                <label className="text-xs text-gray-500 uppercase tracking-wider">{t("settings.desc_header").split(" ")[0]}</label>
                 <p className="text-sm text-gray-300 mt-1 glass rounded-xl px-4 py-2.5 whitespace-pre-line">{metadataPreview.description}</p>
               </div>
               <div>
@@ -203,18 +205,18 @@ export default function JobDetail({ job, onBack }) {
                 <button onClick={() => uploadToYoutube("unlisted")} disabled={uploading}
                   className="btn-primary text-sm py-2.5 px-5 disabled:opacity-50">
                   {uploading ? (
-                    <><div className="inline-block w-4 h-4 border-2 border-white border-t-transparent rounded-full animate-spin mr-2" />Subiendo...</>
+                    <><div className="inline-block w-4 h-4 border-2 border-white border-t-transparent rounded-full animate-spin mr-2" />{t("detail.uploading")}</>
                   ) : (
-                    "Subir como No Listado"
+                    t("detail.upload_unlisted")
                   )}
                 </button>
                 <button onClick={() => uploadToYoutube("public")} disabled={uploading}
                   className="btn-secondary text-sm py-2.5 px-5 disabled:opacity-50">
-                  Subir como Publico
+                  {t("detail.upload_public")}
                 </button>
                 <button onClick={() => setShowYoutubePanel(false)}
                   className="text-xs text-gray-500 hover:text-white transition-colors ml-auto">
-                  Cancelar
+                  {t("detail.cancel")}
                 </button>
               </div>
             </div>
@@ -227,7 +229,7 @@ export default function JobDetail({ job, onBack }) {
                   <polyline points="20 6 9 17 4 12" />
                 </svg>
               </div>
-              <p className="text-sm font-medium text-white mb-1">Video publicado en YouTube</p>
+              <p className="text-sm font-medium text-white mb-1">{t("detail.published")}</p>
               <a href={youtubeResult.url} target="_blank" rel="noopener noreferrer"
                 className="text-sm text-brand hover:text-brand-light transition-colors underline">
                 {youtubeResult.url}

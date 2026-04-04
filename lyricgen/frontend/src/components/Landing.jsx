@@ -1,59 +1,63 @@
-const FEATURES = [
-  {
-    title: "Lyrics automaticas",
-    desc: "IA que transcribe y sincroniza las letras de cualquier cancion, con sugerencias de correccion inteligentes.",
-    icon: <svg className="w-6 h-6" fill="none" stroke="currentColor" strokeWidth="1.5" viewBox="0 0 24 24"><path d="M12 18.5a6.5 6.5 0 006.5-6.5V6a6.5 6.5 0 10-13 0v6a6.5 6.5 0 006.5 6.5z" strokeLinecap="round" strokeLinejoin="round"/><path d="M19 10v2a7 7 0 01-14 0v-2M12 18.5V22M8 22h8" strokeLinecap="round" strokeLinejoin="round"/></svg>,
-  },
-  {
-    title: "Fondos unicos con IA",
-    desc: "Cada video tiene un fondo cinematografico unico, tematico segun la cancion. Generado con Google Veo 3.",
-    icon: <svg className="w-6 h-6" fill="none" stroke="currentColor" strokeWidth="1.5" viewBox="0 0 24 24"><rect x="2" y="2" width="20" height="20" rx="2.18"/><path d="M7 2v20M17 2v20M2 12h20M2 7h5M2 17h5M17 17h5M17 7h5"/></svg>,
-  },
-  {
-    title: "3 outputs por cancion",
-    desc: "Lyric video Full HD, YouTube Short vertical y thumbnail listos para publicar.",
-    icon: <svg className="w-6 h-6" fill="none" stroke="currentColor" strokeWidth="1.5" viewBox="0 0 24 24"><path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4M7 10l5 5 5-5M12 15V3" strokeLinecap="round" strokeLinejoin="round"/></svg>,
-  },
-  {
-    title: "Publicacion directa en YouTube",
-    desc: "Subi videos directo a YouTube con titulo, descripcion, tags y thumbnail optimizados por IA para SEO.",
-    icon: <svg className="w-6 h-6" fill="none" stroke="currentColor" strokeWidth="1.5" viewBox="0 0 24 24"><path d="M22.54 6.42a2.78 2.78 0 00-1.94-2C18.88 4 12 4 12 4s-6.88 0-8.6.46a2.78 2.78 0 00-1.94 2A29 29 0 001 11.75a29 29 0 00.46 5.33A2.78 2.78 0 003.4 19.13C5.12 19.56 12 19.56 12 19.56s6.88 0 8.6-.46a2.78 2.78 0 001.94-2A29 29 0 0023 11.75a29 29 0 00-.46-5.33z"/><polygon points="9.75 15.02 15.5 11.75 9.75 8.48 9.75 15.02"/></svg>,
-  },
-  {
-    title: "Batch processing",
-    desc: "Subi 1 o 100 canciones. Revisa lyrics, aprueba y genera todos los videos automaticamente.",
-    icon: <svg className="w-6 h-6" fill="none" stroke="currentColor" strokeWidth="1.5" viewBox="0 0 24 24"><rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/></svg>,
-  },
-  {
-    title: "100% comercial",
-    desc: "Todos los outputs son propiedad del cliente. Tipografias libres. Sin regalias ni atribuciones.",
-    icon: <svg className="w-6 h-6" fill="none" stroke="currentColor" strokeWidth="1.5" viewBox="0 0 24 24"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z" strokeLinecap="round" strokeLinejoin="round"/></svg>,
-  },
-];
-
-const STEPS = [
-  { num: "01", title: "Subi los MP3", desc: "Arrastra uno o varios archivos con artista e idioma." },
-  { num: "02", title: "Revisa las lyrics", desc: "IA transcribe las letras con sugerencias de correccion." },
-  { num: "03", title: "Publica", desc: "Descarga o publica directo en YouTube con SEO optimizado." },
-];
-
-const PLANS = [
-  { name: "100", videos: "100", price: "800", perVideo: "8.00", popular: false },
-  { name: "250", videos: "250", price: "1,750", perVideo: "7.00", popular: true },
-  { name: "500", videos: "500", price: "3,000", perVideo: "6.00", popular: false },
-  { name: "1,000", videos: "1,000", price: "5,000", perVideo: "5.00", popular: false },
-];
-
-const FAQS = [
-  { q: "Cuanto tarda generar un video?", a: "Menos de 5 minutos por cancion, incluyendo transcripcion, generacion de fondo y render del video." },
-  { q: "Puedo editar las lyrics antes de generar?", a: "Si. La plataforma transcribe automaticamente y muestra sugerencias de correccion. Podes editar cada linea antes de aprobar." },
-  { q: "Los videos son unicos?", a: "Si. Cada video tiene un fondo generado por IA basado en la tematica de la cancion. Nunca se repite." },
-  { q: "Puedo subir videos directo a YouTube?", a: "Si. La plataforma genera titulo, descripcion y tags optimizados para SEO y los sube directamente al canal conectado." },
-  { q: "Quien es dueno del contenido generado?", a: "El cliente es dueno al 100% de todos los videos, thumbnails y shorts generados. Sin regalias ni atribuciones." },
-  { q: "Que idiomas soporta?", a: "Espanol, ingles, portugues, frances, italiano y aleman. Tanto para la transcripcion como para la metadata de YouTube." },
-];
+import { useI18n } from "../i18n";
 
 export default function Landing({ onStart }) {
+  const { t } = useI18n();
+
+  const FEATURES = [
+    {
+      title: t("feat.lyrics"),
+      desc: t("feat.lyrics_desc"),
+      icon: <svg className="w-6 h-6" fill="none" stroke="currentColor" strokeWidth="1.5" viewBox="0 0 24 24"><path d="M12 18.5a6.5 6.5 0 006.5-6.5V6a6.5 6.5 0 10-13 0v6a6.5 6.5 0 006.5 6.5z" strokeLinecap="round" strokeLinejoin="round"/><path d="M19 10v2a7 7 0 01-14 0v-2M12 18.5V22M8 22h8" strokeLinecap="round" strokeLinejoin="round"/></svg>,
+    },
+    {
+      title: t("feat.backgrounds"),
+      desc: t("feat.backgrounds_desc"),
+      icon: <svg className="w-6 h-6" fill="none" stroke="currentColor" strokeWidth="1.5" viewBox="0 0 24 24"><rect x="2" y="2" width="20" height="20" rx="2.18"/><path d="M7 2v20M17 2v20M2 12h20M2 7h5M2 17h5M17 17h5M17 7h5"/></svg>,
+    },
+    {
+      title: t("feat.outputs"),
+      desc: t("feat.outputs_desc"),
+      icon: <svg className="w-6 h-6" fill="none" stroke="currentColor" strokeWidth="1.5" viewBox="0 0 24 24"><path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4M7 10l5 5 5-5M12 15V3" strokeLinecap="round" strokeLinejoin="round"/></svg>,
+    },
+    {
+      title: t("feat.youtube"),
+      desc: t("feat.youtube_desc"),
+      icon: <svg className="w-6 h-6" fill="none" stroke="currentColor" strokeWidth="1.5" viewBox="0 0 24 24"><path d="M22.54 6.42a2.78 2.78 0 00-1.94-2C18.88 4 12 4 12 4s-6.88 0-8.6.46a2.78 2.78 0 00-1.94 2A29 29 0 001 11.75a29 29 0 00.46 5.33A2.78 2.78 0 003.4 19.13C5.12 19.56 12 19.56 12 19.56s6.88 0 8.6-.46a2.78 2.78 0 001.94-2A29 29 0 0023 11.75a29 29 0 00-.46-5.33z"/><polygon points="9.75 15.02 15.5 11.75 9.75 8.48 9.75 15.02"/></svg>,
+    },
+    {
+      title: t("feat.batch"),
+      desc: t("feat.batch_desc"),
+      icon: <svg className="w-6 h-6" fill="none" stroke="currentColor" strokeWidth="1.5" viewBox="0 0 24 24"><rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/></svg>,
+    },
+    {
+      title: t("feat.commercial"),
+      desc: t("feat.commercial_desc"),
+      icon: <svg className="w-6 h-6" fill="none" stroke="currentColor" strokeWidth="1.5" viewBox="0 0 24 24"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z" strokeLinecap="round" strokeLinejoin="round"/></svg>,
+    },
+  ];
+
+  const STEPS = [
+    { num: "01", title: t("landing.step1"), desc: t("landing.step1_desc") },
+    { num: "02", title: t("landing.step2"), desc: t("landing.step2_desc") },
+    { num: "03", title: t("landing.step3"), desc: t("landing.step3_desc") },
+  ];
+
+  const PLANS = [
+    { name: "100", videos: "100", price: "800", perVideo: "8.00", popular: false },
+    { name: "250", videos: "250", price: "1,750", perVideo: "7.00", popular: true },
+    { name: "500", videos: "500", price: "3,000", perVideo: "6.00", popular: false },
+    { name: "1,000", videos: "1,000", price: "5,000", perVideo: "5.00", popular: false },
+  ];
+
+  const FAQS = [
+    { q: t("faq.q1"), a: t("faq.a1") },
+    { q: t("faq.q2"), a: t("faq.a2") },
+    { q: t("faq.q3"), a: t("faq.a3") },
+    { q: t("faq.q4"), a: t("faq.a4") },
+    { q: t("faq.q5"), a: t("faq.a5") },
+    { q: t("faq.q6"), a: t("faq.a6") },
+  ];
+
   return (
     <div className="min-h-screen bg-surface relative overflow-hidden">
       <div className="fixed inset-0 pointer-events-none">
@@ -74,12 +78,12 @@ export default function Landing({ onStart }) {
             <span className="text-lg font-bold tracking-tight">GenLy AI</span>
           </div>
           <div className="hidden md:flex items-center gap-8">
-            <a href="#features" className="text-xs text-gray-400 hover:text-white transition-colors">Caracteristicas</a>
-            <a href="#pricing" className="text-xs text-gray-400 hover:text-white transition-colors">Planes</a>
+            <a href="#features" className="text-xs text-gray-400 hover:text-white transition-colors">{t("landing.features")}</a>
+            <a href="#pricing" className="text-xs text-gray-400 hover:text-white transition-colors">{t("landing.pricing")}</a>
             <a href="#faq" className="text-xs text-gray-400 hover:text-white transition-colors">FAQ</a>
-            <button onClick={onStart} className="btn-primary text-xs py-2 px-5">Comenzar</button>
+            <button onClick={onStart} className="btn-primary text-xs py-2 px-5">{t("nav.start")}</button>
           </div>
-          <button onClick={onStart} className="md:hidden btn-primary text-xs py-2 px-5">Comenzar</button>
+          <button onClick={onStart} className="md:hidden btn-primary text-xs py-2 px-5">{t("nav.start")}</button>
         </div>
       </nav>
 
@@ -88,18 +92,18 @@ export default function Landing({ onStart }) {
         <div className="grid grid-cols-1 lg:grid-cols-2 gap-12 items-center">
           <div>
             <div className="inline-block px-4 py-1.5 rounded-full glass text-xs text-gray-400 mb-6 animate-fade-in">
-              Plataforma de generacion de lyric videos con IA
+              {t("landing.badge")}
             </div>
             <h1 className="text-5xl sm:text-6xl font-extrabold tracking-tight mb-6 leading-[1.1] animate-fade-in">
-              <span className="bg-gradient-to-r from-white via-white to-gray-400 bg-clip-text text-transparent">De MP3 a</span><br />
-              <span className="bg-gradient-to-r from-brand to-brand-light bg-clip-text text-transparent">lyric video</span><br />
-              <span className="bg-gradient-to-r from-white via-white to-gray-400 bg-clip-text text-transparent">en minutos</span>
+              <span className="bg-gradient-to-r from-white via-white to-gray-400 bg-clip-text text-transparent">{t("landing.hero1")}</span><br />
+              <span className="bg-gradient-to-r from-brand to-brand-light bg-clip-text text-transparent">{t("landing.hero2")}</span><br />
+              <span className="bg-gradient-to-r from-white via-white to-gray-400 bg-clip-text text-transparent">{t("landing.hero3")}</span>
             </h1>
             <p className="text-gray-400 text-lg max-w-lg leading-relaxed mb-8 animate-fade-in">
-              Genera lyric videos Full HD, YouTube Shorts y thumbnails. Con fondos cinematograficos unicos por IA y publicacion directa en YouTube.
+              {t("landing.hero_sub")}
             </p>
             <button onClick={onStart} className="btn-primary text-lg py-4 px-10 animate-fade-in">
-              Empezar ahora
+              {t("landing.cta")}
               <svg className="inline-block ml-2 w-5 h-5" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24" strokeLinecap="round" strokeLinejoin="round"><path d="M5 12h14M12 5l7 7-7 7" /></svg>
             </button>
           </div>
@@ -126,8 +130,8 @@ export default function Landing({ onStart }) {
             <div className="absolute -top-4 -right-6 glass rounded-2xl px-4 py-3 shadow-glow flex items-center gap-2">
               <svg className="w-5 h-5 text-red-500" fill="currentColor" viewBox="0 0 24 24"><path d="M22.54 6.42a2.78 2.78 0 00-1.94-2C18.88 4 12 4 12 4s-6.88 0-8.6.46a2.78 2.78 0 00-1.94 2A29 29 0 001 11.75a29 29 0 00.46 5.33A2.78 2.78 0 003.4 19.13C5.12 19.56 12 19.56 12 19.56s6.88 0 8.6-.46a2.78 2.78 0 001.94-2A29 29 0 0023 11.75a29 29 0 00-.46-5.33z"/><polygon points="9.75 15.02 15.5 11.75 9.75 8.48 9.75 15.02" fill="white"/></svg>
               <div>
-                <p className="text-[9px] font-bold text-white/80">Publicacion directa</p>
-                <p className="text-[7px] text-white/40">SEO optimizado con IA</p>
+                <p className="text-[9px] font-bold text-white/80">{t("feat.youtube").split(" ").slice(0, 2).join(" ")}</p>
+                <p className="text-[7px] text-white/40">SEO</p>
               </div>
             </div>
           </div>
@@ -136,10 +140,10 @@ export default function Landing({ onStart }) {
         {/* Stats */}
         <div className="flex justify-center gap-16 mt-20 pt-12 border-t border-white/[0.04]">
           {[
-            { value: "< 5 min", label: "por video" },
-            { value: "3", label: "outputs por cancion" },
-            { value: "100%", label: "comercial" },
-            { value: "6+", label: "idiomas" },
+            { value: "< 5 min", label: t("landing.per_video") },
+            { value: "3", label: t("landing.outputs") },
+            { value: "100%", label: t("landing.commercial") },
+            { value: "6+", label: t("landing.languages") },
           ].map((s) => (
             <div key={s.label} className="text-center">
               <p className="text-3xl font-bold bg-gradient-to-r from-white to-gray-400 bg-clip-text text-transparent">{s.value}</p>
@@ -151,7 +155,7 @@ export default function Landing({ onStart }) {
 
       {/* Integrations */}
       <section className="relative z-10 py-12 px-6 max-w-4xl mx-auto text-center">
-        <p className="text-xs text-gray-600 uppercase tracking-widest mb-6">Integrado con</p>
+        <p className="text-xs text-gray-600 uppercase tracking-widest mb-6">{t("landing.integrated")}</p>
         <div className="flex justify-center items-center gap-12 opacity-40">
           {/* YouTube */}
           <svg className="h-6" viewBox="0 0 90 20" fill="white"><text x="0" y="15" fontSize="14" fontWeight="bold" fontFamily="system-ui">YouTube</text></svg>
@@ -164,8 +168,8 @@ export default function Landing({ onStart }) {
 
       {/* How it works */}
       <section className="relative z-10 py-24 px-6 max-w-5xl mx-auto">
-        <h2 className="text-3xl font-bold text-center mb-4">Como funciona</h2>
-        <p className="text-gray-500 text-center mb-16 max-w-md mx-auto">Tres pasos. Sin instalaciones.</p>
+        <h2 className="text-3xl font-bold text-center mb-4">{t("landing.how")}</h2>
+        <p className="text-gray-500 text-center mb-16 max-w-md mx-auto">{t("landing.how_sub")}</p>
         <div className="grid grid-cols-1 sm:grid-cols-3 gap-10">
           {STEPS.map((step, i) => (
             <div key={step.num} className="relative text-center group">
@@ -180,13 +184,13 @@ export default function Landing({ onStart }) {
 
       {/* Outputs */}
       <section className="relative z-10 py-20 px-6 max-w-5xl mx-auto">
-        <h2 className="text-3xl font-bold text-center mb-4">Un MP3, tres outputs</h2>
-        <p className="text-gray-500 text-center mb-16 max-w-md mx-auto">Todo lo que necesitas para publicar en YouTube.</p>
+        <h2 className="text-3xl font-bold text-center mb-4">{t("landing.outputs_title")}</h2>
+        <p className="text-gray-500 text-center mb-16 max-w-md mx-auto">{t("landing.outputs_sub")}</p>
         <div className="grid grid-cols-1 sm:grid-cols-3 gap-6">
           {[
-            { title: "Lyric Video", res: "1920 x 1080", desc: "Full HD con lyrics sincronizadas", gradient: "from-brand/30 to-brand-dark/30", aspect: "aspect-video" },
-            { title: "YouTube Short", res: "1080 x 1920", desc: "Vertical 30s para Shorts y Reels", gradient: "from-pink-500/20 to-rose-600/30", aspect: "aspect-[9/16] max-h-52" },
-            { title: "Thumbnail", res: "1280 x 720", desc: "Portada lista con artista y cancion", gradient: "from-amber-500/20 to-orange-600/30", aspect: "aspect-video" },
+            { title: "Lyric Video", res: "1920 x 1080", desc: "Full HD", gradient: "from-brand/30 to-brand-dark/30", aspect: "aspect-video" },
+            { title: "YouTube Short", res: "1080 x 1920", desc: "Vertical 30s", gradient: "from-pink-500/20 to-rose-600/30", aspect: "aspect-[9/16] max-h-52" },
+            { title: "Thumbnail", res: "1280 x 720", desc: "1280x720", gradient: "from-amber-500/20 to-orange-600/30", aspect: "aspect-video" },
           ].map((item) => (
             <div key={item.title} className="glass rounded-3xl p-5 text-center glass-hover">
               <div className={`rounded-2xl bg-gradient-to-br ${item.gradient} ${item.aspect} mx-auto mb-4 flex items-center justify-center`}>
@@ -201,8 +205,8 @@ export default function Landing({ onStart }) {
 
       {/* Features */}
       <section id="features" className="relative z-10 py-20 px-6 max-w-5xl mx-auto scroll-mt-20">
-        <h2 className="text-3xl font-bold text-center mb-4">Caracteristicas</h2>
-        <p className="text-gray-500 text-center mb-16 max-w-lg mx-auto">Todo para producir lyric videos a escala, con calidad profesional.</p>
+        <h2 className="text-3xl font-bold text-center mb-4">{t("landing.features")}</h2>
+        <p className="text-gray-500 text-center mb-16 max-w-lg mx-auto">{t("landing.features_sub")}</p>
         <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-5">
           {FEATURES.map((f) => (
             <div key={f.title} className="glass rounded-2xl p-6 glass-hover">
@@ -216,29 +220,29 @@ export default function Landing({ onStart }) {
 
       {/* Pricing */}
       <section id="pricing" className="relative z-10 py-24 px-6 max-w-5xl mx-auto scroll-mt-20">
-        <h2 className="text-3xl font-bold text-center mb-4">Planes</h2>
-        <p className="text-gray-500 text-center mb-16 max-w-md mx-auto">Escala a tu ritmo. Sin contratos anuales obligatorios.</p>
+        <h2 className="text-3xl font-bold text-center mb-4">{t("landing.pricing")}</h2>
+        <p className="text-gray-500 text-center mb-16 max-w-md mx-auto">{t("landing.pricing_sub")}</p>
         <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-5">
           {PLANS.map((plan) => (
             <div key={plan.name} className={`glass rounded-3xl p-6 text-center relative ${plan.popular ? "border-brand/30 shadow-glow" : ""}`}>
-              {plan.popular && <div className="absolute -top-3 left-1/2 -translate-x-1/2 px-3 py-0.5 rounded-full bg-brand text-[10px] font-bold uppercase tracking-wider">Popular</div>}
-              <p className="text-sm text-gray-400 mb-1">{plan.videos} videos/mes</p>
+              {plan.popular && <div className="absolute -top-3 left-1/2 -translate-x-1/2 px-3 py-0.5 rounded-full bg-brand text-[10px] font-bold uppercase tracking-wider">{t("landing.popular")}</div>}
+              <p className="text-sm text-gray-400 mb-1">{plan.videos} {t("landing.videos_month")}</p>
               <p className="text-3xl font-bold my-3">
                 <span className="text-lg text-gray-500">USD</span> {plan.price}
               </p>
-              <p className="text-xs text-gray-500 mb-5">${plan.perVideo} por video</p>
+              <p className="text-xs text-gray-500 mb-5">${plan.perVideo} {t("landing.per_video")}</p>
               <button onClick={onStart} className={`w-full py-2.5 rounded-xl text-sm font-medium transition-all ${plan.popular ? "btn-primary" : "btn-secondary"}`}>
-                Comenzar
+                {t("nav.start")}
               </button>
             </div>
           ))}
         </div>
-        <p className="text-center text-xs text-gray-600 mt-8">Modulo de publicacion en YouTube disponible como add-on. Consultar.</p>
+        <p className="text-center text-xs text-gray-600 mt-8">{t("landing.yt_addon")}</p>
       </section>
 
       {/* FAQ */}
       <section id="faq" className="relative z-10 py-20 px-6 max-w-3xl mx-auto scroll-mt-20">
-        <h2 className="text-3xl font-bold text-center mb-16">Preguntas frecuentes</h2>
+        <h2 className="text-3xl font-bold text-center mb-16">{t("landing.faq")}</h2>
         <div className="space-y-4">
           {FAQS.map((faq, i) => (
             <details key={i} className="glass rounded-2xl group">
@@ -255,10 +259,10 @@ export default function Landing({ onStart }) {
       {/* CTA */}
       <section className="relative z-10 py-24 px-6 text-center">
         <div className="max-w-2xl mx-auto glass rounded-3xl p-12 shadow-glow-lg">
-          <h2 className="text-3xl font-bold mb-4">Listo para empezar?</h2>
-          <p className="text-gray-400 mb-8">Genera tu primer lyric video en minutos.</p>
+          <h2 className="text-3xl font-bold mb-4">{t("landing.ready")}</h2>
+          <p className="text-gray-400 mb-8">{t("landing.ready_sub")}</p>
           <button onClick={onStart} className="btn-primary text-lg py-4 px-10">
-            Crear lyric video
+            {t("landing.create")}
             <svg className="inline-block ml-2 w-5 h-5" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24" strokeLinecap="round" strokeLinejoin="round"><path d="M5 12h14M12 5l7 7-7 7" /></svg>
           </button>
         </div>
@@ -266,7 +270,7 @@ export default function Landing({ onStart }) {
 
       {/* Footer */}
       <footer className="relative z-10 border-t border-white/[0.04] py-8 px-8 text-center">
-        <p className="text-xs text-gray-600">GenLy AI Pro — Plataforma de generacion de lyric videos con inteligencia artificial</p>
+        <p className="text-xs text-gray-600">{t("landing.footer")}</p>
       </footer>
     </div>
   );

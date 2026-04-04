@@ -1,18 +1,20 @@
 import { useRef, useState } from "react";
-
-const LANGUAGES = [
-  { code: "", label: "Auto-detectar" },
-  { code: "es", label: "Espanol" },
-  { code: "en", label: "English" },
-  { code: "pt", label: "Portugues" },
-  { code: "fr", label: "Francais" },
-  { code: "it", label: "Italiano" },
-  { code: "de", label: "Deutsch" },
-];
+import { useI18n } from "../i18n";
 
 export default function UploadZone({ files, onFiles }) {
+  const { t } = useI18n();
   const inputRef = useRef();
   const [dragging, setDragging] = useState(false);
+
+  const LANGUAGES = [
+    { code: "", label: t("lang.auto") },
+    { code: "es", label: t("lang.es") },
+    { code: "en", label: t("lang.en") },
+    { code: "pt", label: t("lang.pt") },
+    { code: "fr", label: t("lang.fr") },
+    { code: "it", label: t("lang.it") },
+    { code: "de", label: t("lang.de") },
+  ];
 
   const addFiles = (fileList) => {
     const mp3s = Array.from(fileList).filter((f) =>
@@ -62,12 +64,12 @@ export default function UploadZone({ files, onFiles }) {
           <div onClick={(e) => e.stopPropagation()}>
             <div className="flex items-center justify-between mb-1">
               <span className="text-sm font-medium text-gray-400">
-                {files.length} archivo{files.length > 1 ? "s" : ""}
+                {files.length} {files.length > 1 ? t("upload.files") : t("upload.file")}
               </span>
               <button
                 onClick={(e) => { e.stopPropagation(); inputRef.current.click(); }}
                 className="text-xs text-brand hover:text-brand-light transition-colors"
-              >+ Agregar mas</button>
+              >{t("upload.add_more")}</button>
             </div>
           </div>
         ) : (
@@ -77,8 +79,8 @@ export default function UploadZone({ files, onFiles }) {
                 <path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4" /><polyline points="17 8 12 3 7 8" /><line x1="12" y1="3" x2="12" y2="15" />
               </svg>
             </div>
-            <p className="text-gray-300 font-medium mb-1">Arrastra archivos MP3</p>
-            <p className="text-gray-600 text-sm">Uno o varios a la vez</p>
+            <p className="text-gray-300 font-medium mb-1">{t("upload.drag")}</p>
+            <p className="text-gray-600 text-sm">{t("upload.drag_sub")}</p>
           </div>
         )}
       </div>
@@ -108,7 +110,7 @@ export default function UploadZone({ files, onFiles }) {
                   type="text"
                   value={entry.artist}
                   onChange={(e) => updateField(i, "artist", e.target.value)}
-                  placeholder="Artista"
+                  placeholder={t("upload.artist")}
                   className="flex-1 px-3 py-1.5 rounded-lg bg-surface-1 border border-white/[0.06]
                     focus:border-brand/50 focus:outline-none text-sm text-white placeholder-gray-500 transition-all"
                 />

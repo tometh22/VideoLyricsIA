@@ -1,3 +1,5 @@
+import { useI18n } from "../i18n";
+
 const API = "";
 
 function timeAgo(ts) {
@@ -18,7 +20,7 @@ function StatCard({ value, label, accent = false }) {
   );
 }
 
-function ActivityItem({ job, onSelect }) {
+function ActivityItem({ job, onSelect, t }) {
   const name = (job.filename || "").replace(/\.mp3$/i, "");
   const artistAndSong = name.includes(" - ") ? name : `${job.artist} - ${name}`;
 
@@ -54,9 +56,9 @@ function ActivityItem({ job, onSelect }) {
       <div className="flex-1 min-w-0">
         <p className="text-sm text-white truncate">{artistAndSong}</p>
         <p className="text-[11px] text-gray-500">
-          {job.status === "done" && "Completado"}
-          {job.status === "processing" && "Procesando..."}
-          {job.status === "error" && "Error"}
+          {job.status === "done" && t("dash.completed")}
+          {job.status === "processing" && t("dash.processing")}
+          {job.status === "error" && t("dash.error")}
           {job.created_at && <span className="ml-2 text-gray-600">{timeAgo(job.created_at)}</span>}
         </p>
       </div>
@@ -72,6 +74,7 @@ function ActivityItem({ job, onSelect }) {
 }
 
 export default function Dashboard({ history, onSelectJob, onNewBatch, onViewHistory }) {
+  const { t } = useI18n();
   const done = history.filter((h) => h.status === "done").length;
   const errors = history.filter((h) => h.status === "error").length;
   const processing = history.filter((h) => h.status === "processing").length;
@@ -87,31 +90,31 @@ export default function Dashboard({ history, onSelectJob, onNewBatch, onViewHist
       {/* Welcome + New batch */}
       <div className="flex items-center justify-between mb-8">
         <div>
-          <h1 className="text-2xl font-bold">Dashboard</h1>
-          <p className="text-sm text-gray-500 mt-1">Resumen de actividad</p>
+          <h1 className="text-2xl font-bold">{t("dash.title")}</h1>
+          <p className="text-sm text-gray-500 mt-1">{t("dash.subtitle")}</p>
         </div>
         <button onClick={onNewBatch} className="btn-primary py-3 px-6">
           <svg className="inline-block w-4 h-4 mr-2 -mt-0.5" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
             <path d="M12 5v14M5 12h14" strokeLinecap="round"/>
           </svg>
-          Nuevo batch
+          {t("nav.new_batch")}
         </button>
       </div>
 
       {/* Stats */}
       <div className="flex gap-4 mb-8">
-        <StatCard value={done} label="Videos generados" accent />
-        <StatCard value={processing} label="En proceso" />
-        <StatCard value={errors} label="Errores" />
-        <StatCard value={history.length} label="Total jobs" />
+        <StatCard value={done} label={t("dash.videos_generated")} accent />
+        <StatCard value={processing} label={t("dash.in_progress")} />
+        <StatCard value={errors} label={t("dash.errors")} />
+        <StatCard value={history.length} label={t("dash.total_jobs")} />
       </div>
 
       {/* Monthly usage */}
       <div className="glass rounded-2xl p-6 mb-8">
         <div className="flex items-center justify-between mb-3">
           <div>
-            <h3 className="text-sm font-semibold">Uso mensual</h3>
-            <p className="text-[11px] text-gray-500 mt-0.5">{monthlyUsed} de {monthlyLimit} videos del plan</p>
+            <h3 className="text-sm font-semibold">{t("dash.monthly_usage")}</h3>
+            <p className="text-[11px] text-gray-500 mt-0.5">{monthlyUsed} {t("dash.monthly_of")} {monthlyLimit} {t("dash.monthly_plan")}</p>
           </div>
           <span className="text-sm font-bold text-brand">{Math.round(usagePercent)}%</span>
         </div>
@@ -127,10 +130,10 @@ export default function Dashboard({ history, onSelectJob, onNewBatch, onViewHist
         {/* Recent activity */}
         <div className="lg:col-span-2 glass rounded-2xl p-6">
           <div className="flex items-center justify-between mb-4">
-            <h3 className="text-sm font-semibold">Actividad reciente</h3>
+            <h3 className="text-sm font-semibold">{t("dash.recent_activity")}</h3>
             {history.length > 8 && (
               <button onClick={onViewHistory} className="text-xs text-brand hover:text-brand-light transition-colors">
-                Ver todo
+                {t("dash.view_all")}
               </button>
             )}
           </div>
@@ -141,15 +144,15 @@ export default function Dashboard({ history, onSelectJob, onNewBatch, onViewHist
                   <path d="M9 18V5l12-2v13" strokeLinecap="round" strokeLinejoin="round"/><circle cx="6" cy="18" r="3"/><circle cx="18" cy="16" r="3"/>
                 </svg>
               </div>
-              <p className="text-sm text-gray-500 mb-4">No hay videos todavia</p>
+              <p className="text-sm text-gray-500 mb-4">{t("dash.no_videos")}</p>
               <button onClick={onNewBatch} className="text-sm text-brand hover:text-brand-light transition-colors">
-                Crear tu primer lyric video
+                {t("dash.first_video")}
               </button>
             </div>
           ) : (
             <div className="space-y-1">
               {recent.map((job) => (
-                <ActivityItem key={job.job_id} job={job} onSelect={onSelectJob} />
+                <ActivityItem key={job.job_id} job={job} onSelect={onSelectJob} t={t} />
               ))}
             </div>
           )}
@@ -159,33 +162,33 @@ export default function Dashboard({ history, onSelectJob, onNewBatch, onViewHist
         <div className="space-y-6">
           {/* Quick actions */}
           <div className="glass rounded-2xl p-6">
-            <h3 className="text-sm font-semibold mb-4">Acciones rapidas</h3>
+            <h3 className="text-sm font-semibold mb-4">{t("dash.quick_actions")}</h3>
             <div className="space-y-2">
               <button onClick={onNewBatch}
                 className="w-full flex items-center gap-3 px-4 py-3 rounded-xl bg-brand/5 hover:bg-brand/10 text-sm text-gray-300 hover:text-white transition-all">
                 <svg className="w-4 h-4 text-brand" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
                   <path d="M12 5v14M5 12h14" strokeLinecap="round"/>
                 </svg>
-                Nuevo batch
+                {t("nav.new_batch")}
               </button>
               <button onClick={onViewHistory}
                 className="w-full flex items-center gap-3 px-4 py-3 rounded-xl bg-surface-3/30 hover:bg-surface-3/50 text-sm text-gray-300 hover:text-white transition-all">
                 <svg className="w-4 h-4 text-gray-500" fill="none" stroke="currentColor" strokeWidth="1.5" viewBox="0 0 24 24">
                   <circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/>
                 </svg>
-                Ver historial completo
+                {t("dash.full_history")}
               </button>
             </div>
           </div>
 
           {/* System status */}
           <div className="glass rounded-2xl p-6">
-            <h3 className="text-sm font-semibold mb-4">Estado del sistema</h3>
+            <h3 className="text-sm font-semibold mb-4">{t("dash.system_status")}</h3>
             <div className="space-y-3">
               {[
-                { name: "Transcripcion (Whisper)", ok: true },
-                { name: "Video IA (Veo 3)", ok: true },
-                { name: "Analisis tematico (Gemini)", ok: true },
+                { name: t("dash.transcription"), ok: true },
+                { name: t("dash.video_ai"), ok: true },
+                { name: t("dash.thematic_ai"), ok: true },
               ].map((s) => (
                 <div key={s.name} className="flex items-center gap-2.5">
                   <div className={`w-2 h-2 rounded-full ${s.ok ? "bg-accent" : "bg-red-400"}`} />

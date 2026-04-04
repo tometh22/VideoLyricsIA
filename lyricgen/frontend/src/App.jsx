@@ -1,4 +1,5 @@
 import { useState, useRef, useCallback, useEffect } from "react";
+import { useI18n } from "./i18n";
 import LoginPage from "./components/LoginPage";
 import Landing from "./components/Landing";
 import Sidebar from "./components/Sidebar";
@@ -33,6 +34,7 @@ function authFetch(url, opts = {}) {
 }
 
 export default function App() {
+  const { t } = useI18n();
   const [token, setToken] = useState(getToken());
   const [user, setUser] = useState(getUser());
   const [showLanding, setShowLanding] = useState(true);
@@ -330,8 +332,8 @@ export default function App() {
                   </svg>
                 </button>
                 <div>
-                  <h1 className="text-2xl font-bold">Nuevo batch</h1>
-                  <p className="text-sm text-gray-500">Subi archivos MP3 para generar lyric videos</p>
+                  <h1 className="text-2xl font-bold">{t("upload.new_batch")}</h1>
+                  <p className="text-sm text-gray-500">{t("upload.new_batch_sub")}</p>
                 </div>
               </div>
 
@@ -341,17 +343,17 @@ export default function App() {
                 {allHaveArtist && (
                   <div className="flex gap-3">
                     <button onClick={handleStartReview} className="btn-primary flex-1 py-4">
-                      Revisar lyrics antes de generar
+                      {t("upload.review_lyrics")}
                     </button>
                     <button onClick={handleGenerateDirect} className="btn-secondary flex-1 py-4 text-sm">
-                      Generar directo
+                      {t("upload.generate_direct")}
                     </button>
                   </div>
                 )}
 
                 {files.length > 0 && !allHaveArtist && (
                   <p className="text-center text-xs text-amber-400/70">
-                    Completa el nombre del artista en todos los archivos
+                    {t("upload.complete_artist")}
                   </p>
                 )}
               </div>
@@ -362,11 +364,11 @@ export default function App() {
           {transcribing && (
             <div className="w-full max-w-md mx-auto mt-16 animate-fade-in text-center">
               <div className="w-12 h-12 mx-auto mb-4 border-2 border-brand border-t-transparent rounded-full animate-spin" />
-              <h2 className="text-xl font-bold mb-2">Transcribiendo lyrics</h2>
-              <p className="text-gray-500 text-sm">Analizando audio...</p>
+              <h2 className="text-xl font-bold mb-2">{t("transcribe.title")}</h2>
+              <p className="text-gray-500 text-sm">{t("transcribe.subtitle")}</p>
               {reviewQueue.length > 1 && (
                 <p className="text-xs text-gray-600 mt-2">
-                  Cancion {approvedJobs.length + 1} de {reviewQueue.length}
+                  {t("transcribe.song")} {approvedJobs.length + 1} {t("editor.song_of")} {reviewQueue.length}
                 </p>
               )}
             </div>
@@ -379,7 +381,7 @@ export default function App() {
                 <p className="text-sm text-red-400">{transcribeError}</p>
                 <button onClick={() => { setTranscribeError(null); setView("new"); }}
                   className="mt-3 text-xs text-gray-400 hover:text-white transition-colors underline">
-                  Volver
+                  {t("detail.back")}
                 </button>
               </div>
             </div>
@@ -396,7 +398,7 @@ export default function App() {
                 onBack={handleReset}
                 isBatch={currentReview.queue.length > 1}
                 batchProgress={currentReview.queue.length > 1
-                  ? `${currentReview.queueIdx + 1} de ${currentReview.queue.length}`
+                  ? `${currentReview.queueIdx + 1} ${t("editor.song_of")} ${currentReview.queue.length}`
                   : ""}
               />
             </div>
@@ -411,8 +413,8 @@ export default function App() {
                     <polyline points="20 6 9 17 4 12" />
                   </svg>
                 </div>
-                <h2 className="text-2xl font-bold mb-2">{approvedJobs.length} lyrics aprobadas</h2>
-                <p className="text-gray-500">Todas las canciones revisadas. Genera los videos cuando quieras.</p>
+                <h2 className="text-2xl font-bold mb-2">{approvedJobs.length} {t("ready.title")}</h2>
+                <p className="text-gray-500">{t("ready.subtitle")}</p>
               </div>
 
               <div className="space-y-1.5 mb-8 max-h-60 overflow-y-auto">
@@ -420,16 +422,16 @@ export default function App() {
                   <div key={i} className="flex items-center gap-3 glass rounded-xl px-4 py-2.5">
                     <div className="w-2 h-2 rounded-full bg-accent shrink-0" />
                     <span className="text-sm text-white truncate flex-1">{job.file.name.replace(/\.mp3$/i, "")}</span>
-                    <span className="text-xs text-gray-500">{job.segments.length} lineas</span>
+                    <span className="text-xs text-gray-500">{job.segments.length} {t("editor.lines")}</span>
                   </div>
                 ))}
               </div>
 
               <div className="flex gap-3 justify-center">
                 <button onClick={handleGenerateBatch} className="btn-primary text-lg py-4 px-8">
-                  Generar {approvedJobs.length} videos
+                  {t("ready.generate")} {approvedJobs.length} {t("ready.videos")}
                 </button>
-                <button onClick={handleReset} className="btn-secondary">Cancelar</button>
+                <button onClick={handleReset} className="btn-secondary">{t("ready.cancel")}</button>
               </div>
             </div>
           )}

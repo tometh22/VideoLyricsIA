@@ -1,16 +1,18 @@
+import { useI18n } from "../i18n";
+
 const API = "";
 
-const STEP_LABELS = {
-  whisper: "Transcribiendo",
-  background: "Generando fondo",
-  video: "Creando video",
-  short: "Creando short",
-  thumbnail: "Thumbnail",
-};
-
-function JobRow({ job, index }) {
+function JobRow({ job, index, t }) {
   const { filename, status, current_step, progress, job_id, error } = job;
   const name = filename.replace(/\.mp3$/i, "");
+
+  const STEP_LABELS = {
+    whisper: t("transcribe.title").split(" ")[0] || "Transcribiendo",
+    background: t("batch.in_progress"),
+    video: t("batch.generating").split(" ")[0] || "Generando",
+    short: "Short",
+    thumbnail: "Thumbnail",
+  };
 
   return (
     <div className={`glass rounded-2xl p-4 transition-all duration-300 ${
@@ -46,10 +48,10 @@ function JobRow({ job, index }) {
         <div className="min-w-0 flex-1">
           <p className="text-sm font-medium text-white truncate">{name}</p>
           <p className="text-[11px] text-gray-500">
-            {status === "done" ? "Completado" :
-             status === "error" ? (error || "Error") :
+            {status === "done" ? t("dash.completed") :
+             status === "error" ? (error || t("dash.error")) :
              status === "processing" ? STEP_LABELS[current_step] || current_step :
-             "En cola"}
+             t("batch.queued")}
           </p>
         </div>
 
@@ -93,6 +95,7 @@ function JobRow({ job, index }) {
 }
 
 export default function BatchProgress({ jobs, onReset }) {
+  const { t } = useI18n();
   const done = jobs.filter((j) => j.status === "done").length;
   const total = jobs.length;
   const allDone = done === total;
@@ -121,15 +124,15 @@ export default function BatchProgress({ jobs, onReset }) {
                 <polyline points="20 6 9 17 4 12" />
               </svg>
             </div>
-            <h2 className="text-2xl font-bold mb-1">Batch completado</h2>
-            <p className="text-gray-500 text-sm">{total} video{total > 1 ? "s" : ""} generado{total > 1 ? "s" : ""}</p>
+            <h2 className="text-2xl font-bold mb-1">{t("batch.completed")}</h2>
+            <p className="text-gray-500 text-sm">{total} video{total > 1 ? "s" : ""} {t("batch.generated")}</p>
           </>
         ) : (
           <>
-            <h2 className="text-2xl font-bold mb-1">Generando videos</h2>
+            <h2 className="text-2xl font-bold mb-1">{t("batch.generating")}</h2>
             <p className="text-gray-500 text-sm">
-              {done} de {total} completado{done !== 1 ? "s" : ""}
-              {total - done > 0 && <span className="text-gray-600"> — ~{(total - done) * 5} min restantes</span>}
+              {done} {t("dash.monthly_of")} {total} {t("batch.completed_of")}
+              {total - done > 0 && <span className="text-gray-600"> — ~{(total - done) * 5} {t("dash.min_remaining")}</span>}
             </p>
           </>
         )}
@@ -150,7 +153,7 @@ export default function BatchProgress({ jobs, onReset }) {
       {/* Job list */}
       <div className="space-y-2 mb-8">
         {jobs.map((job, i) => (
-          <JobRow key={i} job={job} index={i} />
+          <JobRow key={i} job={job} index={i} t={t} />
         ))}
       </div>
 
@@ -161,12 +164,12 @@ export default function BatchProgress({ jobs, onReset }) {
             <svg className="inline-block w-4 h-4 mr-2 -mt-0.5" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
               <path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4" /><polyline points="7 10 12 15 17 10" /><line x1="12" y1="15" x2="12" y2="3" />
             </svg>
-            Descargar todo ({done * 3} archivos)
+            {t("batch.download_all")} ({done * 3} archivos)
           </button>
         )}
         {(allDone || hasErrors) && (
           <button onClick={onReset} className="btn-secondary">
-            Nuevo batch
+            {t("batch.new_batch")}
           </button>
         )}
       </div>

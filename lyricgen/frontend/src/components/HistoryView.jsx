@@ -1,3 +1,5 @@
+import { useI18n } from "../i18n";
+
 const API = "";
 
 function timeAgo(ts) {
@@ -10,6 +12,7 @@ function timeAgo(ts) {
 }
 
 export default function HistoryView({ history, onSelect, onBack }) {
+  const { t } = useI18n();
   // Only show completed and processing jobs, not errors
   const visibleHistory = history.filter((h) => h.status === "done" || h.status === "processing");
 
@@ -24,15 +27,15 @@ export default function HistoryView({ history, onSelect, onBack }) {
             </svg>
           </button>
           <div>
-            <h1 className="text-2xl font-bold">Historial</h1>
-            <p className="text-sm text-gray-500">{visibleHistory.length} videos</p>
+            <h1 className="text-2xl font-bold">{t("history.title")}</h1>
+            <p className="text-sm text-gray-500">{visibleHistory.length} {t("history.videos")}</p>
           </div>
         </div>
       </div>
 
       {visibleHistory.length === 0 ? (
         <div className="text-center py-20">
-          <p className="text-gray-500">No hay videos en el historial</p>
+          <p className="text-gray-500">{t("history.empty")}</p>
         </div>
       ) : (
         <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4">
@@ -75,7 +78,7 @@ export default function HistoryView({ history, onSelect, onBack }) {
                     ${job.status === "done" ? "bg-accent/20 text-accent" :
                       job.status === "error" ? "bg-red-500/20 text-red-400" :
                       "bg-brand/20 text-brand"}`}>
-                    {job.status === "done" ? "Listo" : job.status === "error" ? "Error" : "Procesando"}
+                    {job.status === "done" ? t("history.done") : job.status === "error" ? t("history.error") : t("history.processing")}
                   </div>
 
                   {/* Play overlay */}

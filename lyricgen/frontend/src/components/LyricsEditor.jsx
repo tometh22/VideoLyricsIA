@@ -1,4 +1,5 @@
 import { useState, useMemo } from "react";
+import { useI18n } from "../i18n";
 
 function formatTime(seconds) {
   const m = Math.floor(seconds / 60);
@@ -47,6 +48,7 @@ function findSuggestion(whisperText, refLines, startIdx) {
 }
 
 export default function LyricsEditor({ segments, filename, referenceLyrics, onApprove, onBack, isBatch = false, batchProgress = "" }) {
+  const { t } = useI18n();
   // Each segment gets a unique ID so deletions don't mess up suggestions
   const [edited, setEdited] = useState(() =>
     segments.map((s, i) => ({ ...s, _id: i }))
@@ -119,7 +121,7 @@ export default function LyricsEditor({ segments, filename, referenceLyrics, onAp
             </svg>
           </button>
           <div>
-            <h2 className="text-lg font-bold">Revisar lyrics</h2>
+            <h2 className="text-lg font-bold">{t("editor.title")}</h2>
             <p className="text-sm text-gray-500">
               {name}
               {batchProgress && <span className="ml-2 text-brand text-xs">({batchProgress})</span>}
@@ -127,7 +129,7 @@ export default function LyricsEditor({ segments, filename, referenceLyrics, onAp
           </div>
         </div>
         <button onClick={handleApprove} className="btn-primary text-sm py-2.5 px-5">
-          {isBatch ? "Aprobar y siguiente" : "Aprobar y generar"}
+          {isBatch ? t("editor.approve_next") : t("editor.approve_generate")}
           <svg className="inline-block ml-1.5 w-4 h-4" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
             <path d="M5 12h14M12 5l7 7-7 7" />
           </svg>
@@ -137,12 +139,12 @@ export default function LyricsEditor({ segments, filename, referenceLyrics, onAp
       {hasSuggestions && (
         <div className="flex items-center justify-between mb-4">
           <p className="text-xs text-gray-500">
-            {pendingSuggestions} sugerencia{pendingSuggestions > 1 ? "s" : ""} de correccion.
+            {pendingSuggestions} {t("editor.suggestions")}.
           </p>
           <button onClick={applyAllSuggestions}
             className="text-xs font-medium text-accent hover:text-accent/80 transition-colors flex items-center gap-1 px-3 py-1.5 rounded-lg bg-accent/5 hover:bg-accent/10">
             <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" strokeWidth="2.5" viewBox="0 0 24 24"><polyline points="20 6 9 17 4 12"/></svg>
-            Aplicar todas
+            {t("editor.apply_all")}
           </button>
         </div>
       )}
@@ -196,9 +198,9 @@ export default function LyricsEditor({ segments, filename, referenceLyrics, onAp
       </div>
 
       <div className="mt-4 flex justify-between items-center">
-        <span className="text-xs text-gray-600">{edited.length} lineas</span>
+        <span className="text-xs text-gray-600">{edited.length} {t("editor.lines")}</span>
         <button onClick={handleApprove} className="btn-primary text-sm py-2.5 px-5">
-          {isBatch ? "Aprobar y siguiente" : "Aprobar y generar"}
+          {isBatch ? t("editor.approve_next") : t("editor.approve_generate")}
         </button>
       </div>
     </div>
