@@ -1,4 +1,4 @@
-# LyricGen — Propuesta Comercial
+# GenLy AI — Propuesta Comercial
 
 ## Plataforma de generación automática de Lyric Videos
 
@@ -20,7 +20,7 @@ Para 100 videos mensuales, el proceso manual requiere coordinar múltiples freel
 
 ## La solución
 
-**LyricGen** es una plataforma SaaS que genera automáticamente lyric videos profesionales a partir de un archivo MP3.
+**GenLy AI** es una plataforma SaaS que genera automáticamente lyric videos profesionales a partir de un archivo MP3.
 
 Por cada canción, la plataforma genera:
 
@@ -99,7 +99,7 @@ Subida automática a YouTube con metadata generada por IA.
 
 ## Comparativa
 
-| | Editor freelance | Estudio de producción | **LyricGen** |
+| | Editor freelance | Estudio de producción | **GenLy AI** |
 |---|---|---|---|
 | Costo por video | $10 - $15 | $150 - $500 | **$8 o menos** |
 | Tiempo por video | 2-4 horas | 1-2 días | **5 minutos** |
@@ -112,7 +112,7 @@ Subida automática a YouTube con metadata generada por IA.
 
 ### Ahorro estimado (100 videos/mes):
 
-| vs. | Costo mensual actual | Con LyricGen | Ahorro |
+| vs. | Costo mensual actual | Con GenLy AI | Ahorro |
 |-----|---------------------|-------------|--------|
 | Freelancer ($12/video) | $1,200 | $800 | **$400/mes ($4,800/año)** |
 | Estudio ($200/video) | $20,000 | $800 | **$19,200/mes** |
@@ -167,7 +167,7 @@ La plataforma utiliza infraestructura de Google Cloud (Vertex AI) con las siguie
 
 ## Contacto
 
-**LyricGen**
+**GenLy AI**
 Plataforma de generación automática de lyric videos con inteligencia artificial
 
 *Propuesta válida por 30 días a partir de la fecha de emisión.*

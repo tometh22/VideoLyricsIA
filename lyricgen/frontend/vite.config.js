@@ -5,6 +5,7 @@ export default defineConfig({
   plugins: [react()],
   server: {
     proxy: {
+      "/auth": "http://localhost:8000",
       "/upload": "http://localhost:8000",
       "/transcribe": "http://localhost:8000",
       "/generate": "http://localhost:8000",
@@ -12,6 +13,8 @@ export default defineConfig({
       "/download": "http://localhost:8000",
       "/preview": "http://localhost:8000",
       "/jobs": "http://localhost:8000",
+      "/youtube": "http://localhost:8000",
+      "/settings": "http://localhost:8000",
     },
   },
 });

@@ -75,7 +75,7 @@ export default function Dashboard({ history, onSelectJob, onNewBatch, onViewHist
   const done = history.filter((h) => h.status === "done").length;
   const errors = history.filter((h) => h.status === "error").length;
   const processing = history.filter((h) => h.status === "processing").length;
-  const recent = history.slice(0, 8);
+  const recent = history.filter((h) => h.status === "done").slice(0, 8);
 
   // Fake monthly usage (based on actual history)
   const monthlyLimit = 100;

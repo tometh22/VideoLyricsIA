@@ -1,4 +1,5 @@
 import { useState, useRef, useCallback, useEffect } from "react";
+import LoginPage from "./components/LoginPage";
 import Landing from "./components/Landing";
 import Sidebar from "./components/Sidebar";
 import Dashboard from "./components/Dashboard";
@@ -7,12 +8,35 @@ import UploadZone from "./components/UploadZone";
 import LyricsEditor from "./components/LyricsEditor";
 import BatchProgress from "./components/BatchProgress";
 import JobDetail from "./components/JobDetail";
+import Settings from "./components/Settings";
 
 const API = "";
 
+// --- Auth helpers ---
+function getToken() {
+  return localStorage.getItem("genly_token");
+}
+function getUser() {
+  try {
+    return JSON.parse(localStorage.getItem("genly_user") || "null");
+  } catch {
+    return null;
+  }
+}
+function authHeaders() {
+  const token = getToken();
+  return token ? { Authorization: `Bearer ${token}` } : {};
+}
+function authFetch(url, opts = {}) {
+  const headers = { ...opts.headers, ...authHeaders() };
+  return fetch(url, { ...opts, headers });
+}
+
 export default function App() {
+  const [token, setToken] = useState(getToken());
+  const [user, setUser] = useState(getUser());
   const [showLanding, setShowLanding] = useState(true);
-  const [view, setView] = useState("dashboard"); // dashboard, new, history, review, generating, detail
+  const [view, setView] = useState("dashboard");
   const [files, setFiles] = useState([]);
   const style = "oscuro";
 
@@ -29,17 +53,35 @@ export default function App() {
   const [sidebarOpen, setSidebarOpen] = useState(true);
   const pollingRef = useRef(null);
 
-  useEffect(() => { fetchHistory(); }, []);
-
-  const fetchHistory = async () => {
-    try { setHistory(await (await fetch(`${API}/jobs`)).json()); } catch {}
+  // --- Auth ---
+  const handleLogin = (newToken, newUser) => {
+    localStorage.setItem("genly_token", newToken);
+    localStorage.setItem("genly_user", JSON.stringify(newUser));
+    setToken(newToken);
+    setUser(newUser);
   };
+
+  const handleLogout = () => {
+    localStorage.removeItem("genly_token");
+    localStorage.removeItem("genly_user");
+    setToken(null);
+    setUser(null);
+    setShowLanding(true);
+    setView("dashboard");
+  };
+
+  const fetchHistory = useCallback(async () => {
+    if (!getToken()) return;
+    try { setHistory(await (await authFetch(`${API}/jobs`)).json()); } catch {}
+  }, []);
+
+  useEffect(() => { if (token) fetchHistory(); }, [token, fetchHistory]);
 
   const pollJob = useCallback((jobId) => {
     return new Promise((resolve) => {
       const iv = setInterval(async () => {
         try {
-          const data = await (await fetch(`${API}/status/${jobId}`)).json();
+          const data = await (await authFetch(`${API}/status/${jobId}`)).json();
           setJobs((prev) => prev.map((j) =>
             j.job_id === jobId ? { ...j, status: data.status, current_step: data.current_step, progress: data.progress, error: data.error } : j
           ));
@@ -52,7 +94,9 @@ export default function App() {
       }, 1000);
       pollingRef.current = iv;
     });
-  }, []);
+  }, [fetchHistory]);
+
+  useEffect(() => () => { if (pollingRef.current) clearInterval(pollingRef.current); }, []);
 
   // --- Review flow ---
   const handleStartReview = async () => {
@@ -85,7 +129,7 @@ export default function App() {
     if (entry.language) formData.append("language", entry.language);
 
     try {
-      const res = await fetch(`${API}/transcribe`, { method: "POST", body: formData });
+      const res = await authFetch(`${API}/transcribe`, { method: "POST", body: formData });
       if (!res.ok) throw new Error(`Server error ${res.status}`);
       const text = await res.text();
       if (!text) throw new Error("Empty response");
@@ -143,7 +187,7 @@ export default function App() {
       formData.append("segments_json", JSON.stringify(jobList[i].segments));
 
       try {
-        const res = await fetch(`${API}/generate`, { method: "POST", body: formData });
+        const res = await authFetch(`${API}/generate`, { method: "POST", body: formData });
         const data = await res.json();
         setJobs((prev) => prev.map((j, idx) => (idx === i ? { ...j, job_id: data.job_id } : j)));
         await pollJob(data.job_id);
@@ -167,7 +211,7 @@ export default function App() {
       if (jobList[i].language) formData.append("language", jobList[i].language);
 
       try {
-        const res = await fetch(`${API}/upload`, { method: "POST", body: formData });
+        const res = await authFetch(`${API}/upload`, { method: "POST", body: formData });
         const data = await res.json();
         setJobs((prev) => prev.map((j, idx) => (idx === i ? { ...j, job_id: data.job_id } : j)));
         await pollJob(data.job_id);
@@ -178,8 +222,6 @@ export default function App() {
       }
     }
   };
-
-  useEffect(() => () => { if (pollingRef.current) clearInterval(pollingRef.current); }, []);
 
   const handleReset = () => {
     if (pollingRef.current) clearInterval(pollingRef.current);
@@ -197,7 +239,7 @@ export default function App() {
 
   const handleSelectJob = async (jobId) => {
     try {
-      setSelectedJob(await (await fetch(`${API}/status/${jobId}`)).json());
+      setSelectedJob(await (await authFetch(`${API}/status/${jobId}`)).json());
       setView("detail");
     } catch {}
   };
@@ -206,9 +248,15 @@ export default function App() {
     if (id === "dashboard") { setView("dashboard"); setSelectedJob(null); }
     else if (id === "new") { setView("new"); setFiles([]); }
     else if (id === "history") { setView("history"); }
+    else if (id === "settings") { setView("settings"); }
   };
 
   const allHaveArtist = files.length > 0 && files.every((f) => f.artist.trim());
+
+  // --- Not authenticated: show login ---
+  if (!token) {
+    return <LoginPage onLogin={handleLogin} />;
+  }
 
   // --- Landing ---
   if (showLanding) {
@@ -222,6 +270,8 @@ export default function App() {
         onNav={handleNav}
         open={sidebarOpen}
         onToggle={() => setSidebarOpen(!sidebarOpen)}
+        user={user}
+        onLogout={handleLogout}
       />
 
       <div className={`flex-1 min-h-screen transition-all duration-300 ${sidebarOpen ? "ml-64" : "ml-0"}`}>
@@ -240,7 +290,11 @@ export default function App() {
               </button>
             )}
           </div>
-          <span className="text-xs text-gray-500">Universal Music Group</span>
+          <div className="flex items-center gap-4">
+            {user && (
+              <span className="text-xs text-gray-500">{user.username}</span>
+            )}
+          </div>
         </header>
 
         {/* Content */}
@@ -385,6 +439,11 @@ export default function App() {
             <div className="flex justify-center">
               <BatchProgress jobs={jobs} onReset={handleReset} />
             </div>
+          )}
+
+          {/* Settings */}
+          {view === "settings" && (
+            <Settings onBack={() => setView("dashboard")} />
           )}
 
           {/* Job detail */}

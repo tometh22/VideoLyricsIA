@@ -1,10 +1,10 @@
-# LyricGen — Plan de Negocio y Costos Operativos
+# GenLy AI — Plan de Negocio y Costos Operativos
 
 ## Resumen ejecutivo
 
-LyricGen es una plataforma que genera automáticamente lyric videos (Full HD), YouTube Shorts (vertical) y thumbnails a partir de un archivo MP3. Está diseñada para operar a escala para discográficas como Universal Music Group.
+GenLy AI es una plataforma que genera automáticamente lyric videos (Full HD), YouTube Shorts (vertical) y thumbnails a partir de un archivo MP3. Está diseñada para operar a escala para discográficas como Universal Music Group.
 
-**Propuesta de valor:** Un editor humano cobra entre $50 y $200 USD por lyric video. LyricGen produce 100 videos por mes por menos de lo que cuesta uno solo hecho a mano.
+**Propuesta de valor:** Un editor humano cobra entre $50 y $200 USD por lyric video. GenLy AI produce 100 videos por mes por menos de lo que cuesta uno solo hecho a mano.
 
 ---
 
@@ -87,7 +87,7 @@ Infraestructura y API en el mismo proveedor.
 |--------|----------------|-----------------|---------------|
 | Editor humano freelance | $50 - $200 | 2-4 horas | Baja |
 | Estudio de producción | $150 - $500 | 1-2 días | Media |
-| **LyricGen (100 videos/mes)** | **$0.35 - $0.91** | **~5 minutos** | **Alta** |
+| **GenLy AI (100 videos/mes)** | **$0.35 - $0.91** | **~5 minutos** | **Alta** |
 
 **Ahorro estimado a 100 videos/mes:**
 - vs. freelance ($100 promedio): **$9,909/mes** de ahorro (99% reducción)

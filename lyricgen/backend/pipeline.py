@@ -8,6 +8,9 @@ import subprocess
 import tempfile
 import traceback
 
+from dotenv import load_dotenv
+load_dotenv(os.path.join(os.path.dirname(__file__), ".env"))
+
 import librosa
 import numpy as np
 from PIL import Image as _PILImage
@@ -201,9 +204,12 @@ def transcribe(mp3_path: str, language: str = None) -> list[dict]:
 # Step 1.5 — AI Background Generation (Google Veo 3 → SD fallback)
 # ---------------------------------------------------------------------------
 
-_VERTEX_CREDENTIALS = os.path.join(os.path.dirname(__file__), "vertex_credentials.json")
-_VERTEX_PROJECT = "gen-lang-client-0900526123"
-_VERTEX_LOCATION = "us-central1"
+_VERTEX_CREDENTIALS = os.environ.get(
+    "GOOGLE_APPLICATION_CREDENTIALS",
+    os.path.join(os.path.dirname(__file__), "vertex_credentials.json"),
+)
+_VERTEX_PROJECT = os.environ.get("VERTEX_PROJECT", "gen-lang-client-0900526123")
+_VERTEX_LOCATION = os.environ.get("VERTEX_LOCATION", "us-central1")
 
 # Set credentials env var for Google SDK
 os.environ.setdefault("GOOGLE_APPLICATION_CREDENTIALS", _VERTEX_CREDENTIALS)
