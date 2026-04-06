@@ -15,6 +15,7 @@ export default defineConfig({
       "/jobs": "http://localhost:8000",
       "/youtube": "http://localhost:8000",
       "/settings": "http://localhost:8000",
+      "/usage": "http://localhost:8000",
     },
   },
 });

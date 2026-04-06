@@ -5,6 +5,15 @@ import os
 import time
 from typing import Optional
 
+# --- Plan definitions ---
+PLANS = {
+    "100": {"limit": 100, "price_per_video": 9.00, "overage_rate": 1.30},
+    "250": {"limit": 250, "price_per_video": 8.00, "overage_rate": 1.30},
+    "500": {"limit": 500, "price_per_video": 7.00, "overage_rate": 1.30},
+    "1000": {"limit": 1000, "price_per_video": 6.00, "overage_rate": 1.30},
+    "unlimited": {"limit": 999999, "price_per_video": 0, "overage_rate": 1.0},
+}
+
 from fastapi import Depends, HTTPException, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from jose import JWTError, jwt
@@ -52,6 +61,7 @@ def _ensure_default_admin():
             "hashed_password": pwd_context.hash("genly2026"),
             "role": "admin",
             "tenant_id": "default",
+            "plan": "100",
             "created_at": time.time(),
         }
         _save_users(users)
@@ -66,6 +76,7 @@ def create_user(
     password: str,
     role: str = "user",
     tenant_id: str = "default",
+    plan: str = "100",
 ) -> dict:
     """Create a new user. Returns the user dict (without password)."""
     users = _load_users()
@@ -77,10 +88,11 @@ def create_user(
         "hashed_password": pwd_context.hash(password),
         "role": role,
         "tenant_id": tenant_id,
+        "plan": plan,
         "created_at": time.time(),
     }
     _save_users(users)
-    return {"username": username, "role": role, "tenant_id": tenant_id}
+    return {"username": username, "role": role, "tenant_id": tenant_id, "plan": plan}
 
 
 def authenticate_user(username: str, password: str) -> Optional[dict]:
@@ -95,6 +107,7 @@ def authenticate_user(username: str, password: str) -> Optional[dict]:
         "username": user["username"],
         "role": user["role"],
         "tenant_id": user.get("tenant_id", "default"),
+        "plan": user.get("plan", "100"),
     }
 
 
@@ -104,6 +117,7 @@ def create_token(user: dict) -> str:
         "sub": user["username"],
         "role": user["role"],
         "tenant_id": user.get("tenant_id", "default"),
+        "plan": user.get("plan", "100"),
         "exp": time.time() + JWT_EXPIRE_MINUTES * 60,
         "iat": time.time(),
     }
@@ -136,6 +150,7 @@ async def get_current_user(
         "username": payload["sub"],
         "role": payload.get("role", "user"),
         "tenant_id": payload.get("tenant_id", "default"),
+        "plan": payload.get("plan", "100"),
     }
 
 
@@ -146,4 +161,37 @@ def get_current_user_from_token_param(token: str) -> dict:
         "username": payload["sub"],
         "role": payload.get("role", "user"),
         "tenant_id": payload.get("tenant_id", "default"),
+        "plan": payload.get("plan", "100"),
+    }
+
+
+def get_plan_usage(tenant_id: str, plan_id: str) -> dict:
+    """Get current month usage vs plan limit."""
+    from jobs import get_all_jobs
+    import calendar
+    from datetime import datetime
+
+    now = datetime.now()
+    month_start = datetime(now.year, now.month, 1).timestamp()
+
+    all_jobs = get_all_jobs(tenant_id=tenant_id)
+    monthly_done = [j for j in all_jobs if j.get("status") == "done" and j.get("created_at", 0) >= month_start]
+    used = len(monthly_done)
+
+    plan = PLANS.get(plan_id, PLANS["100"])
+    limit = plan["limit"]
+    overage = max(0, used - limit)
+    overage_cost = overage * plan["price_per_video"] * plan["overage_rate"]
+
+    return {
+        "plan": plan_id,
+        "limit": limit,
+        "used": used,
+        "remaining": max(0, limit - used),
+        "overage": overage,
+        "overage_cost_per_video": round(plan["price_per_video"] * plan["overage_rate"], 2),
+        "overage_total": round(overage_cost, 2),
+        "percent": min(100, round((used / limit) * 100)) if limit > 0 else 0,
+        "alert_80": used >= limit * 0.8,
+        "alert_100": used >= limit,
     }

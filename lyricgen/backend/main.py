@@ -19,6 +19,8 @@ from auth import (
     create_user,
     get_current_user,
     get_current_user_from_token_param,
+    get_plan_usage,
+    PLANS,
 )
 from jobs import create_job, get_job, get_all_jobs, update_job
 from pipeline import run_pipeline, transcribe
@@ -83,6 +85,12 @@ async def register(body: RegisterRequest, current_user: dict = Depends(get_curre
 async def me(current_user: dict = Depends(get_current_user)):
     """Return current user info."""
     return current_user
+
+
+@app.get("/usage")
+async def usage(current_user: dict = Depends(get_current_user)):
+    """Return current plan usage with overage info."""
+    return get_plan_usage(current_user["tenant_id"], current_user.get("plan", "100"))
 
 
 # ---------------------------------------------------------------------------

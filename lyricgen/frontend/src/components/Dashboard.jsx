@@ -1,6 +1,12 @@
+import { useState, useEffect } from "react";
 import { useI18n } from "../i18n";
 
 const API = "";
+
+function authHeaders() {
+  const token = localStorage.getItem("genly_token");
+  return token ? { Authorization: `Bearer ${token}` } : {};
+}
 
 function timeAgo(ts) {
   if (!ts) return "";
@@ -80,10 +86,18 @@ export default function Dashboard({ history, onSelectJob, onNewBatch, onViewHist
   const processing = history.filter((h) => h.status === "processing").length;
   const recent = history.filter((h) => h.status === "done").slice(0, 8);
 
-  // Fake monthly usage (based on actual history)
-  const monthlyLimit = 100;
-  const monthlyUsed = done;
-  const usagePercent = Math.min(100, (monthlyUsed / monthlyLimit) * 100);
+  // Real usage from API
+  const [usage, setUsage] = useState(null);
+  useEffect(() => {
+    fetch(`${API}/usage`, { headers: authHeaders() })
+      .then(r => r.json())
+      .then(setUsage)
+      .catch(() => {});
+  }, [history]);
+
+  const monthlyLimit = usage?.limit || 100;
+  const monthlyUsed = usage?.used || done;
+  const usagePercent = usage?.percent || Math.min(100, (monthlyUsed / monthlyLimit) * 100);
 
   return (
     <div className="w-full max-w-4xl animate-fade-in">
@@ -110,20 +124,41 @@ export default function Dashboard({ history, onSelectJob, onNewBatch, onViewHist
       </div>
 
       {/* Monthly usage */}
-      <div className="glass rounded-2xl p-6 mb-8">
+      <div className={`glass rounded-2xl p-6 mb-8 ${usage?.alert_100 ? "border-amber-500/20" : ""}`}>
         <div className="flex items-center justify-between mb-3">
           <div>
             <h3 className="text-sm font-semibold">{t("dash.monthly_usage")}</h3>
-            <p className="text-[11px] text-gray-500 mt-0.5">{monthlyUsed} {t("dash.monthly_of")} {monthlyLimit} {t("dash.monthly_plan")}</p>
+            <p className="text-[11px] text-gray-500 mt-0.5">
+              {monthlyUsed} {t("dash.monthly_of")} {monthlyLimit} {t("dash.monthly_plan")}
+              {usage?.plan && <span className="ml-2 text-brand">Plan {usage.plan}</span>}
+            </p>
           </div>
-          <span className="text-sm font-bold text-brand">{Math.round(usagePercent)}%</span>
+          <span className={`text-sm font-bold ${usagePercent >= 100 ? "text-amber-400" : "text-brand"}`}>
+            {Math.round(usagePercent)}%
+          </span>
         </div>
         <div className="w-full h-2.5 bg-surface-3/50 rounded-full overflow-hidden">
           <div
-            className="h-full rounded-full bg-gradient-to-r from-brand to-brand-light transition-all duration-500"
-            style={{ width: `${usagePercent}%` }}
+            className={`h-full rounded-full transition-all duration-500 ${
+              usagePercent >= 100
+                ? "bg-gradient-to-r from-amber-500 to-red-500"
+                : usagePercent >= 80
+                  ? "bg-gradient-to-r from-brand to-amber-400"
+                  : "bg-gradient-to-r from-brand to-brand-light"
+            }`}
+            style={{ width: `${Math.min(100, usagePercent)}%` }}
           />
         </div>
+        {usage?.overage > 0 && (
+          <div className="mt-3 flex items-center gap-2 px-3 py-2 rounded-lg bg-amber-500/5 border border-amber-500/10">
+            <span className="text-amber-400 text-xs font-medium">
+              {usage.overage} videos excedentes × ${usage.overage_cost_per_video} = ${usage.overage_total}
+            </span>
+          </div>
+        )}
+        {usage?.alert_80 && !usage?.alert_100 && (
+          <p className="text-[11px] text-amber-400/70 mt-2">80% del plan utilizado este mes</p>
+        )}
       </div>
 
       <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
