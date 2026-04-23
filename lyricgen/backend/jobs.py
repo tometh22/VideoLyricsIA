@@ -55,7 +55,14 @@ def _save_tenant(tenant_id: str) -> None:
 _load_tenant("default")
 
 
-def create_job(artist: str, style: str, filename: str, tenant_id: str = "default") -> str:
+def create_job(
+    artist: str,
+    style: str,
+    filename: str,
+    tenant_id: str = "default",
+    delivery_profile: str = "youtube",
+    umg_spec: Optional[dict] = None,
+) -> str:
     """Create a new job and return its ID."""
     jobs = _load_tenant(tenant_id)
     job_id = uuid.uuid4().hex[:12]
@@ -65,6 +72,8 @@ def create_job(artist: str, style: str, filename: str, tenant_id: str = "default
         "style": style,
         "filename": filename,
         "tenant_id": tenant_id,
+        "delivery_profile": delivery_profile,
+        "umg_spec": umg_spec,
         "status": "processing",
         "current_step": "whisper",
         "progress": 0,
@@ -72,6 +81,7 @@ def create_job(artist: str, style: str, filename: str, tenant_id: str = "default
             "video_url": None,
             "short_url": None,
             "thumbnail_url": None,
+            "umg_master_url": None,
         },
         "error": None,
         "created_at": time.time(),

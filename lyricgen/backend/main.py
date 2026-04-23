@@ -24,6 +24,7 @@ from auth import (
 )
 from jobs import create_job, get_job, get_all_jobs, update_job
 from pipeline import run_pipeline, transcribe
+from render_spec import umg_catalog, validate_umg_config
 
 OUTPUTS_DIR = os.path.join(os.path.dirname(__file__), "..", "outputs")
 
@@ -97,20 +98,67 @@ async def usage(current_user: dict = Depends(get_current_user)):
 # Protected endpoints
 # ---------------------------------------------------------------------------
 
+def _parse_umg_params(
+    delivery_profile: str,
+    umg_frame_size: str,
+    umg_fps: str,
+    umg_prores_profile: str,
+) -> dict | None:
+    """Parse and validate UMG delivery params. Returns umg_spec dict or None."""
+    if delivery_profile not in ("youtube", "umg", "both"):
+        raise HTTPException(
+            status_code=400,
+            detail="delivery_profile must be one of: youtube, umg, both",
+        )
+    if delivery_profile == "youtube":
+        return None
+    if not (umg_frame_size and umg_fps and umg_prores_profile):
+        raise HTTPException(
+            status_code=400,
+            detail="umg_frame_size, umg_fps and umg_prores_profile are required "
+                   "when delivery_profile includes UMG",
+        )
+    try:
+        fps_val = float(umg_fps)
+        profile_val = int(umg_prores_profile)
+    except ValueError:
+        raise HTTPException(
+            status_code=400,
+            detail="umg_fps must be a number and umg_prores_profile an integer",
+        )
+    errors = validate_umg_config(umg_frame_size, fps_val, profile_val)
+    if errors:
+        raise HTTPException(status_code=400, detail="; ".join(errors))
+    return {
+        "frame_size": umg_frame_size,
+        "fps": fps_val,
+        "prores_profile": profile_val,
+    }
+
+
 @app.post("/upload")
 async def upload(
     file: UploadFile = File(...),
     artist: str = Form(...),
     style: str = Form("oscuro"),
     language: str = Form(""),
+    delivery_profile: str = Form("youtube"),
+    umg_frame_size: str = Form(""),
+    umg_fps: str = Form(""),
+    umg_prores_profile: str = Form(""),
     current_user: dict = Depends(get_current_user),
 ):
     """Receive an MP3 and start processing."""
     if not file.filename.lower().endswith(".mp3"):
         raise HTTPException(status_code=400, detail="Only MP3 files are accepted.")
 
+    umg_spec = _parse_umg_params(delivery_profile, umg_frame_size, umg_fps, umg_prores_profile)
+
     tenant_id = current_user["tenant_id"]
-    job_id = create_job(artist=artist, style=style, filename=file.filename, tenant_id=tenant_id)
+    job_id = create_job(
+        artist=artist, style=style, filename=file.filename, tenant_id=tenant_id,
+        delivery_profile=delivery_profile, umg_spec=umg_spec,
+    )
     job_dir = os.path.join(OUTPUTS_DIR, job_id)
     os.makedirs(job_dir, exist_ok=True)
 
@@ -123,7 +171,11 @@ async def upload(
     thread = threading.Thread(
         target=run_pipeline,
         args=(job_id, mp3_path, artist, style),
-        kwargs={"language": lang},
+        kwargs={
+            "language": lang,
+            "delivery_profile": delivery_profile,
+            "umg_spec": umg_spec,
+        },
         daemon=True,
     )
     thread.start()
@@ -193,6 +245,10 @@ async def generate_with_segments(
     style: str = Form("oscuro"),
     language: str = Form(""),
     segments_json: str = Form(...),
+    delivery_profile: str = Form("youtube"),
+    umg_frame_size: str = Form(""),
+    umg_fps: str = Form(""),
+    umg_prores_profile: str = Form(""),
     current_user: dict = Depends(get_current_user),
 ):
     """Generate video using user-edited segments (skips Whisper)."""
@@ -200,9 +256,13 @@ async def generate_with_segments(
         raise HTTPException(status_code=400, detail="Only MP3 files are accepted.")
 
     segments = json.loads(segments_json)
+    umg_spec = _parse_umg_params(delivery_profile, umg_frame_size, umg_fps, umg_prores_profile)
 
     tenant_id = current_user["tenant_id"]
-    job_id = create_job(artist=artist, style=style, filename=file.filename, tenant_id=tenant_id)
+    job_id = create_job(
+        artist=artist, style=style, filename=file.filename, tenant_id=tenant_id,
+        delivery_profile=delivery_profile, umg_spec=umg_spec,
+    )
     job_dir = os.path.join(OUTPUTS_DIR, job_id)
     os.makedirs(job_dir, exist_ok=True)
 
@@ -213,12 +273,25 @@ async def generate_with_segments(
     thread = threading.Thread(
         target=run_pipeline,
         args=(job_id, mp3_path, artist, style),
-        kwargs={"segments_override": segments},
+        kwargs={
+            "segments_override": segments,
+            "delivery_profile": delivery_profile,
+            "umg_spec": umg_spec,
+        },
         daemon=True,
     )
     thread.start()
 
     return {"job_id": job_id}
+
+
+@app.get("/delivery-profiles")
+async def get_delivery_profiles(current_user: dict = Depends(get_current_user)):
+    """Return the catalog of accepted UMG specs for frontend dropdowns."""
+    return {
+        "profiles": ["youtube", "umg", "both"],
+        "umg": umg_catalog(),
+    }
 
 
 @app.get("/status/{job_id}")
@@ -260,13 +333,18 @@ FILE_MAP = {
     "video": "lyric_video.mp4",
     "short": "short.mp4",
     "thumbnail": "thumbnail.jpg",
+    "umg_master": "umg_master.mov",
 }
 
 MEDIA_TYPES = {
     "video": "video/mp4",
     "short": "video/mp4",
     "thumbnail": "image/jpeg",
+    "umg_master": "video/quicktime",
 }
+
+# File types that can't be previewed in-browser (ProRes is not browser-playable).
+NON_PREVIEWABLE = {"umg_master"}
 
 
 @app.get("/download/{job_id}/{file_type}")
@@ -293,6 +371,12 @@ async def preview(job_id: str, file_type: str, token: str = Query(...)):
     current_user = get_current_user_from_token_param(token)
     if file_type not in FILE_MAP:
         raise HTTPException(status_code=400, detail="Invalid file type.")
+    if file_type in NON_PREVIEWABLE:
+        raise HTTPException(
+            status_code=415,
+            detail=f"{file_type} is a delivery master and cannot be previewed in-browser. "
+                   f"Use /download/{job_id}/{file_type} instead.",
+        )
     tenant_id = current_user["tenant_id"]
     job = get_job(job_id, tenant_id=tenant_id)
     if job is None:

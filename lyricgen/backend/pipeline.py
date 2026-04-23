@@ -42,6 +42,7 @@ from moviepy.editor import (
 from PIL import Image, ImageDraw, ImageFont
 
 from jobs import update_job
+from render_spec import RenderSpec
 
 ASSETS_DIR = os.path.join(os.path.dirname(__file__), "..", "assets")
 OUTPUTS_DIR = os.path.join(os.path.dirname(__file__), "..", "outputs")
@@ -49,10 +50,20 @@ BACKGROUNDS_DIR = os.path.join(ASSETS_DIR, "backgrounds")
 
 
 def run_pipeline(job_id: str, mp3_path: str, artist: str, style: str,
-                 language: str = None, segments_override: list[dict] = None):
-    """Run the full pipeline for a job. Called synchronously."""
+                 language: str = None, segments_override: list[dict] = None,
+                 delivery_profile: str = "youtube", umg_spec: dict | None = None):
+    """Run the full pipeline for a job. Called synchronously.
+
+    delivery_profile:
+        "youtube" — only the YouTube MP4 + short + thumbnail (default, legacy).
+        "umg"     — only the UMG ProRes master (no short/thumbnail).
+        "both"    — YouTube bundle + UMG master, sharing bg/font.
+    """
     job_dir = os.path.join(OUTPUTS_DIR, job_id)
     os.makedirs(job_dir, exist_ok=True)
+
+    wants_youtube = delivery_profile in ("youtube", "both")
+    wants_umg = delivery_profile in ("umg", "both")
 
     try:
         # Step 1 — Whisper transcription (or use edited segments)
@@ -68,39 +79,53 @@ def run_pipeline(job_id: str, mp3_path: str, artist: str, style: str,
         update_job(job_id, current_step="background", progress=22)
         lyrics_text = " ".join(seg["text"] for seg in segments)
         bg_image_path = _ensure_background(style, job_dir, lyrics_text=lyrics_text, artist=artist)
-        update_job(job_id, progress=40)
+        update_job(job_id, progress=35)
 
-        # Step 2 — Full lyric video
-        update_job(job_id, current_step="video", progress=42)
-        video_path, chosen_font, bg_source = generate_lyric_video(
-            mp3_path, segments, style, job_dir, artist, bg_image_path
-        )
-        update_job(job_id, progress=65)
+        files = {}
+        chosen_font = None
+        bg_source = bg_image_path
 
-        # Step 3 — YouTube Short (uses raw background, not lyric video)
-        update_job(job_id, current_step="short", progress=68)
-        short_path = generate_short(
-            mp3_path, segments, job_dir, bg_source=bg_source,
-            style=style, font=chosen_font,
-        )
-        update_job(job_id, progress=85)
+        # Step 2 — YouTube lyric video (H.264 / MP4 / 1080p / 24fps)
+        if wants_youtube:
+            update_job(job_id, current_step="video", progress=40)
+            _, chosen_font, bg_source = generate_lyric_video(
+                mp3_path, segments, style, job_dir, artist, bg_image_path
+            )
+            files["video_url"] = f"/download/{job_id}/video"
+            update_job(job_id, progress=55)
 
-        # Step 4 — Thumbnail (uses raw background, not lyric video)
-        update_job(job_id, current_step="thumbnail", progress=90)
-        thumb_path = generate_thumbnail(
-            artist, mp3_path, job_dir, bg_source=bg_source,
-        )
-        update_job(job_id, progress=100)
+        # Step 2b — UMG master (ProRes / .mov / target frame size & fps)
+        if wants_umg:
+            if not umg_spec:
+                raise RuntimeError("UMG delivery requested without umg_spec")
+            update_job(job_id, current_step="umg_master", progress=58)
+            spec = RenderSpec.umg(**umg_spec)
+            # Reuse font/bg from YouTube render if available; otherwise pick fresh.
+            _, chosen_font, bg_source = generate_lyric_video(
+                mp3_path, segments, style, job_dir, artist, bg_image_path,
+                spec=spec, font=chosen_font,
+            )
+            files["umg_master_url"] = f"/download/{job_id}/umg_master"
+            update_job(job_id, progress=70)
 
-        update_job(
-            job_id,
-            status="done",
-            files={
-                "video_url": f"/download/{job_id}/video",
-                "short_url": f"/download/{job_id}/short",
-                "thumbnail_url": f"/download/{job_id}/thumbnail",
-            },
-        )
+        # Step 3 — YouTube Short (only when YouTube delivery is requested)
+        if wants_youtube:
+            update_job(job_id, current_step="short", progress=75)
+            generate_short(
+                mp3_path, segments, job_dir, bg_source=bg_source,
+                style=style, font=chosen_font,
+            )
+            files["short_url"] = f"/download/{job_id}/short"
+            update_job(job_id, progress=88)
+
+            # Step 4 — Thumbnail (uses raw background, not lyric video)
+            update_job(job_id, current_step="thumbnail", progress=92)
+            generate_thumbnail(
+                artist, mp3_path, job_dir, bg_source=bg_source,
+            )
+            files["thumbnail_url"] = f"/download/{job_id}/thumbnail"
+
+        update_job(job_id, status="done", progress=100, files=files)
     except Exception as exc:
         traceback.print_exc()
         update_job(job_id, status="error", error=str(exc))
@@ -559,8 +584,10 @@ def _ensure_background(style_hint: str, job_dir: str, lyrics_text: str = None, a
     return fallback_path
 
 
-def _ken_burns_clip(image_path: str, duration: float):
+def _ken_burns_clip(image_path: str, duration: float, spec: RenderSpec | None = None):
     """Create an animated Ken Burns clip with periodic direction changes."""
+    if spec is None:
+        spec = RenderSpec.youtube_default()
     img = np.array(Image.open(image_path))
     h, w = img.shape[:2]
 
@@ -600,11 +627,11 @@ def _ken_burns_clip(image_path: str, duration: float):
 
         crop = img[cy:cy + ch, cx:cx + cw]
         resized = np.array(
-            Image.fromarray(crop).resize((1920, 1080), Image.LANCZOS)
+            Image.fromarray(crop).resize((spec.width, spec.height), Image.LANCZOS)
         )
         return resized
 
-    return VideoClip(make_frame, duration=duration).set_fps(24)
+    return VideoClip(make_frame, duration=duration).set_fps(spec.fps)
 
 
 # ---------------------------------------------------------------------------
@@ -665,17 +692,20 @@ _GRADIENT_PALETTES = {
 }
 
 
-def _make_gradient_clip(duration: float, style: str = "oscuro"):
+def _make_gradient_clip(duration: float, style: str = "oscuro",
+                        spec: RenderSpec | None = None):
     """Generate a cinematic animated gradient as fallback background."""
+    if spec is None:
+        spec = RenderSpec.youtube_default()
     palette = _GRADIENT_PALETTES.get(style, _GRADIENT_PALETTES["oscuro"])
     top = np.array(palette[0], dtype=np.float64)
     mid1 = np.array(palette[1], dtype=np.float64)
     mid2 = np.array(palette[2], dtype=np.float64)
     bot = np.array(palette[3], dtype=np.float64)
 
-    _rows = np.zeros((1080, 1920, 3), dtype=np.float64)
-    for y in range(1080):
-        ratio = y / 1080
+    _rows = np.zeros((spec.height, spec.width, 3), dtype=np.float64)
+    for y in range(spec.height):
+        ratio = y / spec.height
         if ratio < 0.33:
             color = top + (mid1 - top) * (ratio / 0.33)
         elif ratio < 0.66:
@@ -693,7 +723,7 @@ def _make_gradient_clip(duration: float, style: str = "oscuro"):
         frame[:, :, 2] = np.clip(frame[:, :, 2] - shift * 0.6, 0, 255)
         return frame.astype(np.uint8)
 
-    return VideoClip(_gradient_frame, duration=duration).set_fps(24)
+    return VideoClip(_gradient_frame, duration=duration).set_fps(spec.fps)
 
 
 def _cover_resize(clip, target_w=1920, target_h=1080):
@@ -710,13 +740,15 @@ def _cover_resize(clip, target_w=1920, target_h=1080):
     return resized.crop(x1=x_offset, y1=y_offset, width=target_w, height=target_h)
 
 
-def _prerender_looped_bg(bg_path: str, duration: float, job_dir: str, target_w=1920, target_h=1080) -> str:
+def _prerender_looped_bg(bg_path: str, duration: float, job_dir: str,
+                         target_w=1920, target_h=1080,
+                         out_name: str = "bg_looped.mp4") -> str:
     """Pre-render a seamlessly looped background video using ffmpeg.
 
     Uses ffmpeg's native looping + scale/crop (much faster and smoother than
     Python frame-by-frame). The result is a fluent, high-fps MP4 file.
     """
-    out_path = os.path.join(job_dir, "bg_looped.mp4")
+    out_path = os.path.join(job_dir, out_name)
 
     # ffmpeg: loop input, scale to cover target, center crop, trim to duration
     # -stream_loop -1 = infinite loop; we trim with -t
@@ -746,8 +778,11 @@ def _prerender_looped_bg(bg_path: str, duration: float, job_dir: str, target_w=1
     return out_path
 
 
-def _get_background_clip_from_path(bg_path: str, style: str, duration: float, job_dir: str = None):
+def _get_background_clip_from_path(bg_path: str, style: str, duration: float,
+                                   job_dir: str = None, spec: RenderSpec | None = None):
     """Load a background video, loop it seamlessly via ffmpeg, return clip."""
+    if spec is None:
+        spec = RenderSpec.youtube_default()
     try:
         clip = VideoFileClip(bg_path)
         clip.get_frame(0)
@@ -757,16 +792,25 @@ def _get_background_clip_from_path(bg_path: str, style: str, duration: float, jo
         raise RuntimeError(f"Cannot load background video: {e}")
 
     if clip_dur >= duration:
-        return _cover_resize(VideoFileClip(bg_path)).subclip(0, duration)
+        return _cover_resize(
+            VideoFileClip(bg_path), spec.width, spec.height
+        ).subclip(0, duration)
 
     # Pre-render the looped video with ffmpeg (fast, fluid, native fps)
     if job_dir:
-        looped_path = _prerender_looped_bg(bg_path, duration, job_dir)
+        # Use per-spec filename so YouTube and UMG paths don't clobber each other.
+        looped_name = f"bg_looped_{spec.width}x{spec.height}.mp4"
+        looped_path = _prerender_looped_bg(
+            bg_path, duration, job_dir,
+            target_w=spec.width, target_h=spec.height,
+            out_name=looped_name,
+        )
         return VideoFileClip(looped_path)
 
     # Fallback: simple concatenation
     loops = math.ceil(duration / clip_dur) + 1
-    clips = [_cover_resize(VideoFileClip(bg_path)) for _ in range(loops)]
+    clips = [_cover_resize(VideoFileClip(bg_path), spec.width, spec.height)
+             for _ in range(loops)]
     return concatenate_videoclips(clips).subclip(0, duration)
 
 
@@ -791,27 +835,38 @@ _FONT_POOL = [
 ] if os.path.isdir(_FONTS_DIR) else []
 
 
-def _make_text_clip(text: str, seg_start: float, seg_end: float, font: str = "Arial"):
+def _make_text_clip(text: str, seg_start: float, seg_end: float, font: str = "Arial",
+                    spec: RenderSpec | None = None):
     """Create a clean text clip matching pro lyric video style (bold white, subtle shadow)."""
     import unicodedata
+    if spec is None:
+        spec = RenderSpec.youtube_default()
     # Sanitize text: normalize unicode and remove problematic characters
     display_text = unicodedata.normalize("NFC", text.upper())
     # Remove characters that break ImageMagick's @file parsing
     display_text = display_text.replace("@", "").replace("`", "'").replace("\x00", "")
 
+    scale = spec.text_scale
+
     text_len = len(display_text)
     if text_len > 80:
-        fontsize = 55
-        text_width = 1700
+        fontsize = int(round(55 * scale))
+        text_width = int(round(1700 * scale))
     elif text_len > 50:
-        fontsize = 70
-        text_width = 1650
+        fontsize = int(round(70 * scale))
+        text_width = int(round(1650 * scale))
     else:
-        fontsize = 85
-        text_width = 1500
+        fontsize = int(round(85 * scale))
+        text_width = int(round(1500 * scale))
+
+    # Scale shadow offset proportionally (3 px baseline at 1080p).
+    shadow_offset = max(1, int(round(3 * scale)))
 
     # Fallback font if the selected one fails with ImageMagick
     fallback_font = os.path.join(_FONTS_DIR, "Montserrat-Bold.ttf")
+
+    # Stroke scales too so it stays visually similar at higher resolutions.
+    stroke_width = max(1.0, 1.5 * scale)
 
     def _try_text_clip(text, fsize, fnt, color, **kwargs):
         try:
@@ -825,16 +880,112 @@ def _make_text_clip(text: str, seg_start: float, seg_end: float, font: str = "Ar
     shadow = _try_text_clip(display_text, fontsize, font, "black").set_opacity(0.4)
 
     sh = shadow.size[1]
-    shadow_y = (1080 - sh) // 2 + 3
-    shadow_x = (1920 - text_width) // 2 + 3
+    shadow_y = (spec.height - sh) // 2 + shadow_offset
+    shadow_x = (spec.width - text_width) // 2 + shadow_offset
     shadow = shadow.set_position((shadow_x, shadow_y)).set_start(seg_start).set_end(seg_end)
 
     # Main text — clean white, thin stroke
     txt = _try_text_clip(display_text, fontsize, font, "white",
-                         stroke_color="black", stroke_width=1.5
+                         stroke_color="black", stroke_width=stroke_width
     ).set_position("center").set_start(seg_start).set_end(seg_end)
 
     return [shadow, txt]
+
+
+_UMG_PROFILE_NAMES = {
+    3: {"HQ"},
+    4: {"4444"},
+    5: {"4444 XQ", "XQ"},
+}
+
+
+def _eval_fraction(value: str) -> float:
+    """Evaluate a rational string like '24000/1001' into a float."""
+    if value is None:
+        return 0.0
+    if "/" in value:
+        num, den = value.split("/", 1)
+        try:
+            d = float(den)
+            return float(num) / d if d else 0.0
+        except ValueError:
+            return 0.0
+    try:
+        return float(value)
+    except ValueError:
+        return 0.0
+
+
+def _validate_umg_master(path: str, spec: RenderSpec) -> list[str]:
+    """Run ffprobe on the master and return a list of spec violations."""
+    cmd = [
+        "ffprobe", "-v", "error",
+        "-print_format", "json",
+        "-show_streams", "-show_format",
+        path,
+    ]
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode != 0:
+        return [f"ffprobe failed: {result.stderr[-200:]}"]
+
+    try:
+        probe = json.loads(result.stdout)
+    except json.JSONDecodeError as e:
+        return [f"ffprobe output not JSON: {e}"]
+
+    errors: list[str] = []
+    v_streams = [s for s in probe.get("streams", []) if s.get("codec_type") == "video"]
+    if not v_streams:
+        return ["no video stream found"]
+    v = v_streams[0]
+
+    if v.get("codec_name") != "prores":
+        errors.append(f"codec_name={v.get('codec_name')}, expected prores")
+    expected_profiles = _UMG_PROFILE_NAMES.get(spec.prores_profile, set())
+    if expected_profiles and v.get("profile") not in expected_profiles:
+        errors.append(
+            f"profile={v.get('profile')}, expected one of {expected_profiles}"
+        )
+    if (v.get("width"), v.get("height")) != (spec.width, spec.height):
+        errors.append(
+            f"dimensions={v.get('width')}x{v.get('height')}, "
+            f"expected {spec.width}x{spec.height}"
+        )
+    actual_fps = _eval_fraction(v.get("r_frame_rate"))
+    if abs(actual_fps - spec.fps) > 0.01:
+        errors.append(
+            f"r_frame_rate={v.get('r_frame_rate')} ({actual_fps:.3f}), "
+            f"expected {spec.fps}"
+        )
+    if v.get("pix_fmt") != spec.pix_fmt:
+        errors.append(f"pix_fmt={v.get('pix_fmt')}, expected {spec.pix_fmt}")
+    for key, expected in (
+        ("color_primaries", "bt709"),
+        ("color_transfer", "bt709"),
+        ("color_space", "bt709"),
+    ):
+        if v.get(key) != expected:
+            errors.append(f"{key}={v.get(key)}, expected {expected}")
+    # display_aspect_ratio is reported like "16:9" or "256:135"
+    expected_dar = f"{spec.dar[0]}:{spec.dar[1]}"
+    actual_dar = v.get("display_aspect_ratio")
+    if actual_dar not in (expected_dar, None):
+        # Tolerate equivalent ratios (e.g. "256:135" vs reduced form)
+        if _eval_fraction(actual_dar.replace(":", "/")) and abs(
+            _eval_fraction(actual_dar.replace(":", "/"))
+            - spec.dar[0] / spec.dar[1]
+        ) > 0.01:
+            errors.append(
+                f"display_aspect_ratio={actual_dar}, expected {expected_dar}"
+            )
+    field_order = v.get("field_order")
+    if field_order not in (None, "progressive"):
+        errors.append(f"field_order={field_order}, expected progressive")
+    fmt = probe.get("format", {}).get("format_name", "")
+    if "mov" not in fmt:
+        errors.append(f"format_name={fmt}, expected a mov container")
+
+    return errors
 
 
 def generate_lyric_video(
@@ -844,12 +995,21 @@ def generate_lyric_video(
     job_dir: str,
     artist: str,
     bg_image_path: str | None = None,
+    spec: RenderSpec | None = None,
+    font: str | None = None,
 ) -> tuple[str, str, str | None]:
-    """Generate a 1920x1080 lyric video. Returns (video_path, font, bg_source).
+    """Generate a lyric video. Returns (video_path, font, bg_source).
 
-    bg_source is the path to the raw background (mp4 or jpg) so short/thumbnail
-    can use it without burned-in lyrics.
+    When `spec` is None, produces the YouTube MP4 (H.264 / 1080p / 24 fps /
+    yuv420p). When `spec.profile == "umg"`, produces a ProRes .mov master
+    with BT.709 color tags and display aspect ratio per UMG specs.
+
+    `bg_source` is the path to the raw background (mp4 or jpg) so short/
+    thumbnail can reuse it without burned-in lyrics.
     """
+    if spec is None:
+        spec = RenderSpec.youtube_default()
+
     audio = AudioFileClip(mp3_path)
     duration = audio.duration
 
@@ -861,12 +1021,13 @@ def generate_lyric_video(
         raise RuntimeError("No background available. Check Veo 3 API or add videos to assets/backgrounds/")
 
     if bg_source.lower().endswith((".jpg", ".jpeg", ".png")):
-        bg = _ken_burns_clip(bg_source, duration)
+        bg = _ken_burns_clip(bg_source, duration, spec=spec)
     else:
-        bg = _get_background_clip_from_path(bg_source, style, duration, job_dir)
+        bg = _get_background_clip_from_path(bg_source, style, duration, job_dir, spec=spec)
 
-    # Pick a random font for this job
-    font = random.choice(_FONT_POOL) if _FONT_POOL else "Arial"
+    # Pick a random font for this job (or reuse the caller-provided one)
+    if font is None:
+        font = random.choice(_FONT_POOL) if _FONT_POOL else "Arial"
     print(f"[FONT] Selected: {os.path.basename(font)}")
 
     # Build text clips — each segment gets its own shadow + text
@@ -885,23 +1046,52 @@ def generate_lyric_video(
             title_song = title_song.replace(sfx, "").strip()
         title_end = first_lyric_start - 0.5
         title_layers = _make_text_clip(
-            f"{artist}\n{title_song}", 0.5, title_end, font
+            f"{artist}\n{title_song}", 0.5, title_end, font, spec=spec
         )
         text_layers.extend(title_layers)
 
     for seg in segments:
-        layers = _make_text_clip(seg["text"], seg["start"], seg["end"], font)
+        layers = _make_text_clip(seg["text"], seg["start"], seg["end"], font, spec=spec)
         text_layers.extend(layers)
 
-    video = CompositeVideoClip([bg] + text_layers, size=(1920, 1080))
+    video = CompositeVideoClip([bg] + text_layers, size=(spec.width, spec.height))
     video = video.set_audio(audio).set_duration(duration)
+
+    if spec.profile == "umg":
+        out_path = os.path.join(job_dir, "umg_master.mov")
+        ffmpeg_params = [
+            "-profile:v", str(spec.prores_profile),
+            "-pix_fmt", spec.pix_fmt,
+            "-vendor", "apl0",
+            "-color_primaries", "bt709",
+            "-color_trc", "bt709",
+            "-colorspace", "bt709",
+            "-aspect", f"{spec.dar[0]}:{spec.dar[1]}",
+            "-ar", "48000",
+        ]
+        video.write_videofile(
+            out_path,
+            fps=spec.fps,
+            codec=spec.codec,
+            audio_codec=spec.audio_codec,
+            ffmpeg_params=ffmpeg_params,
+            threads=4,
+            logger=None,
+        )
+        audio.close()
+        bg.close()
+        video.close()
+        errors = _validate_umg_master(out_path, spec)
+        if errors:
+            raise RuntimeError(f"UMG validation failed: {'; '.join(errors)}")
+        return out_path, font, bg_source
 
     out_path = os.path.join(job_dir, "lyric_video.mp4")
     video.write_videofile(
         out_path,
-        fps=24,
-        codec="libx264",
-        audio_codec="aac",
+        fps=spec.fps,
+        codec=spec.codec,
+        audio_codec=spec.audio_codec,
         threads=4,
         logger=None,
     )
