@@ -3,3 +3,5 @@ lyricgen/backend/youtube_oauth.json
 lyricgen/backend/youtube_token.json
 lyricgen/backend/.env
 lyricgen/outputs/_users.json
+__pycache__/
+*.pyc
