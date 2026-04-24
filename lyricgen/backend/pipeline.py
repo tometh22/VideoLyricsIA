@@ -146,16 +146,31 @@ _SPAM_PATTERNS = [
 ]
 
 
+_WHISPER_MODEL = None
+_WHISPER_LOCK = None
+
+
+def _get_whisper_model(name: str = "turbo"):
+    """Load Whisper once per process and reuse. Thread-safe."""
+    global _WHISPER_MODEL, _WHISPER_LOCK
+    import whisper
+    import threading as _t
+    if _WHISPER_LOCK is None:
+        _WHISPER_LOCK = _t.Lock()
+    with _WHISPER_LOCK:
+        if _WHISPER_MODEL is None:
+            print(f"[WHISPER] Loading model '{name}' (one-time)")
+            _WHISPER_MODEL = whisper.load_model(name)
+    return _WHISPER_MODEL
+
+
 def transcribe(mp3_path: str, language: str = None) -> list[dict]:
     """Transcribe: isolate vocals with Demucs, then transcribe with Whisper turbo."""
-    import whisper
-
     # Use original audio — Demucs vocal isolation can introduce artifacts
     # that confuse Whisper more than the original mix
     audio_path = mp3_path
 
-    # Transcribe with Whisper turbo
-    model = whisper.load_model("turbo")
+    model = _get_whisper_model("turbo")
 
     kwargs = dict(
         word_timestamps=True,
@@ -223,6 +238,62 @@ def transcribe(mp3_path: str, language: str = None) -> list[dict]:
             segments[i]["end"] = segments[i + 1]["start"] - GAP
 
     return segments
+
+
+# ---------------------------------------------------------------------------
+# Lyrics reference fetcher — used by /transcribe to show reference text in UI
+# ---------------------------------------------------------------------------
+
+_LYRICS_CACHE_DIR = os.path.join(OUTPUTS_DIR, "_lyrics_cache")
+
+
+def _fetch_lyrics_from_sources(artist: str, song: str) -> list[str]:
+    """Fetch reference lyrics for a song from multiple sources.
+
+    Order: (1) local cache, (2) Genius API if GENIUS_TOKEN set. Returns a list
+    of strings (longest = most complete). Returns [] on any failure — this is a
+    best-effort helper, never raises.
+    """
+    if not artist or not song:
+        return []
+
+    try:
+        os.makedirs(_LYRICS_CACHE_DIR, exist_ok=True)
+        import hashlib
+        key = hashlib.sha1(f"{artist.lower()}|{song.lower()}".encode()).hexdigest()[:16]
+        cache_path = os.path.join(_LYRICS_CACHE_DIR, f"{key}.json")
+        if os.path.exists(cache_path):
+            try:
+                with open(cache_path) as f:
+                    return json.load(f)
+            except (json.JSONDecodeError, OSError):
+                pass
+    except OSError:
+        cache_path = None
+
+    results: list[str] = []
+    token = os.environ.get("GENIUS_TOKEN", "").strip()
+    if token:
+        try:
+            import lyricsgenius
+            g = lyricsgenius.Genius(
+                token, timeout=5, retries=1, verbose=False,
+                remove_section_headers=True, skip_non_songs=True,
+            )
+            song_obj = g.search_song(song, artist)
+            if song_obj and song_obj.lyrics:
+                results.append(song_obj.lyrics)
+        except Exception as e:
+            print(f"[LYRICS] Genius fetch failed: {e}")
+
+    if cache_path and results:
+        try:
+            with open(cache_path, "w") as f:
+                json.dump(results, f)
+        except OSError:
+            pass
+
+    return results
 
 
 # ---------------------------------------------------------------------------
@@ -482,7 +553,11 @@ def _generate_veo_video(prompt: str, output_path: str) -> str:
 
     _last_veo_request = _time.time()
 
+    # Poll with a hard 10-min cap so a stuck operation never hangs a worker.
+    poll_deadline = _time.time() + 600
     while not operation.done:
+        if _time.time() > poll_deadline:
+            raise TimeoutError("Veo 3 operation timed out after 10 min")
         _time.sleep(10)
         operation = client.operations.get(operation)
 
