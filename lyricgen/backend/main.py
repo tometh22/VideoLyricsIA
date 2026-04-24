@@ -98,6 +98,23 @@ async def usage(current_user: dict = Depends(get_current_user)):
 # Protected endpoints
 # ---------------------------------------------------------------------------
 
+def _enforce_plan_quota(current_user: dict) -> None:
+    """Raise 402 if the tenant reached its monthly limit without overage allowed."""
+    plan = current_user.get("plan", "100")
+    tenant_id = current_user["tenant_id"]
+    usage = get_plan_usage(tenant_id, plan)
+    if usage["remaining"] <= 0 and plan != "unlimited":
+        if not current_user.get("allow_overage", False):
+            raise HTTPException(
+                status_code=402,
+                detail=(
+                    f"Plan '{plan}' monthly limit reached "
+                    f"({usage['used']}/{usage['limit']}). "
+                    "Upgrade the plan or enable overage to continue."
+                ),
+            )
+
+
 def _parse_umg_params(
     delivery_profile: str,
     umg_frame_size: str,
@@ -151,6 +168,8 @@ async def upload(
     """Receive an MP3 and start processing."""
     if not file.filename.lower().endswith(".mp3"):
         raise HTTPException(status_code=400, detail="Only MP3 files are accepted.")
+
+    _enforce_plan_quota(current_user)
 
     umg_spec = _parse_umg_params(delivery_profile, umg_frame_size, umg_fps, umg_prores_profile)
 
@@ -254,6 +273,8 @@ async def generate_with_segments(
     """Generate video using user-edited segments (skips Whisper)."""
     if not file.filename.lower().endswith(".mp3"):
         raise HTTPException(status_code=400, detail="Only MP3 files are accepted.")
+
+    _enforce_plan_quota(current_user)
 
     segments = json.loads(segments_json)
     umg_spec = _parse_umg_params(delivery_profile, umg_frame_size, umg_fps, umg_prores_profile)
