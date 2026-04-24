@@ -187,22 +187,24 @@ _SPAM_PATTERNS = [
 ]
 
 
-_WHISPER_MODEL = None
+_WHISPER_MODELS: dict = {}
 _WHISPER_LOCK = None
 
 
 def _get_whisper_model(name: str = "turbo"):
-    """Load Whisper once per process and reuse. Thread-safe."""
-    global _WHISPER_MODEL, _WHISPER_LOCK
+    """Load a Whisper model once per process and reuse. Thread-safe. Supports
+    multiple sizes cached side-by-side so we can fall back turbo -> large-v3
+    without re-loading the first one."""
+    global _WHISPER_LOCK
     import whisper
     import threading as _t
     if _WHISPER_LOCK is None:
         _WHISPER_LOCK = _t.Lock()
     with _WHISPER_LOCK:
-        if _WHISPER_MODEL is None:
+        if name not in _WHISPER_MODELS:
             print(f"[WHISPER] Loading model '{name}' (one-time)")
-            _WHISPER_MODEL = whisper.load_model(name)
-    return _WHISPER_MODEL
+            _WHISPER_MODELS[name] = whisper.load_model(name)
+    return _WHISPER_MODELS[name]
 
 
 def transcribe(mp3_path: str, language: str = None) -> list[dict]:
@@ -269,6 +271,38 @@ def transcribe(mp3_path: str, language: str = None) -> list[dict]:
                 segments2.append({"start": seg["start"], "end": seg["end"], "text": text})
         if segments2 and segments2[0]["start"] < segments[0]["start"]:
             segments = segments2
+
+    # Quality fallback: if turbo produced a sparse/low-confidence result, retry
+    # with large-v3 (slower but much more accurate, especially for noisy vocals
+    # or heavy accents). Gated by WHISPER_FALLBACK_ENABLED to save RAM on small
+    # machines that cannot hold both models at once.
+    if os.environ.get("WHISPER_FALLBACK_ENABLED", "1") != "0":
+        if len(segments) < 5:
+            print(f"[WHISPER] Only {len(segments)} segments with turbo; "
+                  f"falling back to large-v3")
+            try:
+                large = _get_whisper_model("large-v3")
+                result3 = large.transcribe(audio_path, **kwargs)
+                segments3 = []
+                for seg in result3["segments"]:
+                    text = seg["text"].strip()
+                    if not text or len(text) < 3:
+                        continue
+                    if any(spam in text.lower() for spam in _SPAM_PATTERNS):
+                        continue
+                    words = seg.get("words", [])
+                    if words:
+                        segments3.append({"start": words[0]["start"],
+                                          "end": words[-1]["end"], "text": text})
+                    else:
+                        segments3.append({"start": seg["start"],
+                                          "end": seg["end"], "text": text})
+                if len(segments3) > len(segments):
+                    print(f"[WHISPER] large-v3 produced {len(segments3)} "
+                          f"segments (turbo: {len(segments)}); using large-v3")
+                    segments = segments3
+            except Exception as e:
+                print(f"[WHISPER] large-v3 fallback failed: {e}; keeping turbo")
 
     for i, seg in enumerate(segments[:5]):
         print(f"[WHISPER] seg {i}: {seg['start']:.2f}–{seg['end']:.2f}  {seg['text'][:60]}")
@@ -860,24 +894,27 @@ def _cover_resize(clip, target_w=1920, target_h=1080):
 def _prerender_looped_bg(bg_path: str, duration: float, job_dir: str,
                          target_w=1920, target_h=1080,
                          out_name: str = "bg_looped.mp4") -> str:
-    """Pre-render a seamlessly looped background video using ffmpeg.
+    """Pre-render a seamlessly looped background using palindrome (A + reverse(A)).
 
-    Uses ffmpeg's native looping + scale/crop (much faster and smoother than
-    Python frame-by-frame). The result is a fluent, high-fps MP4 file.
+    A straight -stream_loop jumps from the last frame back to the first, which
+    is visible as a "pop" when the scene has camera movement. Concatenating A
+    with its reverse makes the last frame of one pass match the first frame of
+    the next — the loop is mathematically seamless.
+
+    We scale and crop first, then palindrome, then loop the palindrome to fill
+    the requested duration.
     """
     out_path = os.path.join(job_dir, out_name)
-
-    # ffmpeg: loop input, scale to cover target, center crop, trim to duration
-    # -stream_loop -1 = infinite loop; we trim with -t
     cmd = [
         "ffmpeg", "-y",
         "-stream_loop", "-1",
         "-i", bg_path,
         "-t", str(duration),
-        "-vf", (
-            f"scale={target_w}:{target_h}:force_original_aspect_ratio=increase,"
-            f"crop={target_w}:{target_h},"
-            "setpts=PTS-STARTPTS"
+        "-filter_complex", (
+            f"[0:v]scale={target_w}:{target_h}:force_original_aspect_ratio=increase,"
+            f"crop={target_w}:{target_h},setpts=PTS-STARTPTS,split[a][b];"
+            "[b]reverse[br];"
+            "[a][br]concat=n=2:v=1:a=0"
         ),
         "-c:v", "libx264",
         "-preset", "fast",
@@ -888,10 +925,30 @@ def _prerender_looped_bg(bg_path: str, duration: float, job_dir: str,
     ]
     result = subprocess.run(cmd, capture_output=True, text=True)
     if result.returncode != 0:
-        raise RuntimeError(f"ffmpeg loop failed: {result.stderr[-300:]}")
+        # Fall back to the simple loop if the palindrome filter graph fails
+        # (e.g. clip too short or memory-constrained machines).
+        print(f"[BG] Palindrome loop failed, falling back to stream_loop: "
+              f"{result.stderr[-200:]}")
+        cmd_fallback = [
+            "ffmpeg", "-y",
+            "-stream_loop", "-1",
+            "-i", bg_path,
+            "-t", str(duration),
+            "-vf", (
+                f"scale={target_w}:{target_h}:force_original_aspect_ratio=increase,"
+                f"crop={target_w}:{target_h},"
+                "setpts=PTS-STARTPTS"
+            ),
+            "-c:v", "libx264", "-preset", "fast", "-crf", "20",
+            "-pix_fmt", "yuv420p", "-an",
+            out_path,
+        ]
+        result = subprocess.run(cmd_fallback, capture_output=True, text=True)
+        if result.returncode != 0:
+            raise RuntimeError(f"ffmpeg loop failed: {result.stderr[-300:]}")
 
     size_mb = os.path.getsize(out_path) / 1024 / 1024
-    print(f"[BG] Pre-rendered loop: {duration:.0f}s, {size_mb:.1f} MB")
+    print(f"[BG] Pre-rendered palindrome loop: {duration:.0f}s, {size_mb:.1f} MB")
     return out_path
 
 
