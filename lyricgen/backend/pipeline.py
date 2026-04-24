@@ -466,6 +466,7 @@ def _generate_veo_video(prompt: str, output_path: str) -> str:
                 config=genai.types.GenerateVideosConfig(
                     aspect_ratio="16:9",
                     number_of_videos=1,
+                    generate_audio=False,
                 ),
             )
             break
