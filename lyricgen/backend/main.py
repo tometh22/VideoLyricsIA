@@ -22,21 +22,36 @@ from auth import (
 )
 import storage
 from jobs import create_job, get_job, get_all_jobs, update_job
+from observability import init_sentry, init_logging, health_snapshot
 from pipeline import run_pipeline, transcribe
 from queue_jobs import enqueue_pipeline, queue_depth
 from render_spec import umg_catalog, validate_umg_config
+
+init_logging()
+init_sentry()
 
 OUTPUTS_DIR = os.path.join(os.path.dirname(__file__), "..", "outputs")
 
 app = FastAPI(title="GenLy AI API")
 
+# CORS_ORIGINS: comma-separated list, e.g. "https://app.example.com,https://admin.example.com"
+# Leave empty in dev to fall back to "*".
+_cors_env = os.environ.get("CORS_ORIGINS", "").strip()
+_allow_origins = [o.strip() for o in _cors_env.split(",") if o.strip()] or ["*"]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=_allow_origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+@app.get("/health")
+async def health():
+    """Runtime health. No auth — used by load balancers and uptime probes."""
+    return health_snapshot()
 
 
 # ---------------------------------------------------------------------------
@@ -97,6 +112,31 @@ async def usage(current_user: dict = Depends(get_current_user)):
 # ---------------------------------------------------------------------------
 # Protected endpoints
 # ---------------------------------------------------------------------------
+
+MAX_UPLOAD_MB = int(os.environ.get("MAX_UPLOAD_MB", "50"))
+_MP3_MAGIC_BYTES = (b"ID3", b"\xff\xfb", b"\xff\xf3", b"\xff\xf2")
+
+
+def _validate_mp3_upload(file, data: bytes) -> None:
+    """Validate a freshly-read MP3 payload. Raises 400 on any problem.
+
+    Bypassing the `.mp3` extension check is trivial, so we also peek at the
+    first bytes and enforce a size ceiling.
+    """
+    if not file.filename or not file.filename.lower().endswith(".mp3"):
+        raise HTTPException(status_code=400, detail="Only MP3 files are accepted.")
+    size_mb = len(data) / 1024 / 1024
+    if size_mb > MAX_UPLOAD_MB:
+        raise HTTPException(
+            status_code=413,
+            detail=f"File too large ({size_mb:.1f} MB). Max allowed: {MAX_UPLOAD_MB} MB.",
+        )
+    if not data.startswith(_MP3_MAGIC_BYTES):
+        raise HTTPException(
+            status_code=400,
+            detail="File does not look like a valid MP3 (magic bytes check failed).",
+        )
+
 
 def _enforce_plan_quota(current_user: dict) -> None:
     """Raise 402 if the tenant reached its monthly limit without overage allowed."""
@@ -166,8 +206,8 @@ async def upload(
     current_user: dict = Depends(get_current_user),
 ):
     """Receive an MP3 and start processing."""
-    if not file.filename.lower().endswith(".mp3"):
-        raise HTTPException(status_code=400, detail="Only MP3 files are accepted.")
+    data = await file.read()
+    _validate_mp3_upload(file, data)
 
     _enforce_plan_quota(current_user)
 
@@ -183,7 +223,7 @@ async def upload(
 
     mp3_path = os.path.join(job_dir, file.filename)
     with open(mp3_path, "wb") as f:
-        shutil.copyfileobj(file.file, f)
+        f.write(data)
 
     lang = language.strip() if language.strip() else None
 
@@ -270,8 +310,8 @@ async def generate_with_segments(
     current_user: dict = Depends(get_current_user),
 ):
     """Generate video using user-edited segments (skips Whisper)."""
-    if not file.filename.lower().endswith(".mp3"):
-        raise HTTPException(status_code=400, detail="Only MP3 files are accepted.")
+    data = await file.read()
+    _validate_mp3_upload(file, data)
 
     _enforce_plan_quota(current_user)
 
@@ -288,7 +328,7 @@ async def generate_with_segments(
 
     mp3_path = os.path.join(job_dir, file.filename)
     with open(mp3_path, "wb") as f:
-        shutil.copyfileobj(file.file, f)
+        f.write(data)
 
     enqueue_pipeline(
         job_id=job_id,
