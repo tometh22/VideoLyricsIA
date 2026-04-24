@@ -122,12 +122,6 @@ def on_startup():
     logger.info("GenLy AI started — database initialized")
 
 
-# --- Health check ---
-@app.get("/health")
-async def health():
-    return {"status": "ok", "version": "2.0.0"}
-
-
 # --- Background library (public, authenticated) ---
 _BACKGROUNDS_LIB = os.path.join(os.path.dirname(__file__), "..", "assets", "backgrounds", "library")
 

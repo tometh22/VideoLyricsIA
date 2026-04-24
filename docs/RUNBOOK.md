@@ -9,6 +9,8 @@ primeras semanas.
 ```
 [Usuario] → Caddy / nginx → API (uvicorn, 2 workers)
                          ↓
+                  PostgreSQL (state) ─┐
+                         ↓            │
                       Redis  ←→  Worker × 3 (rq)
                          ↓
                  Cloudflare R2 (masters)
@@ -20,28 +22,72 @@ primeras semanas.
   a signed URLs de R2.
 - `worker.py`: corre los jobs en procesos separados. Precarga Whisper turbo
   al arrancar.
+- PostgreSQL: estado canónico de usuarios, jobs, facturas, provenance,
+  audit log, tokens de password reset y email verification. Hard dependency
+  — sin Postgres el API no arranca (`init_db()` corre en startup).
 - Redis: cola de jobs (RQ). Dos colas con prioridad: `enterprise` y
-  `default`.
-- R2: storage permanente de los masters (egress gratis).
-- Sentry: errores + contexto.
+  `default`. Si falta, `queue_jobs.py` cae a `threading.Thread` (solo dev).
+- R2: storage permanente de los masters (egress gratis). Si falta, los
+  deliverables se sirven desde disco local (slow para archivos grandes).
+- Sentry: errores + contexto. Gated por `SENTRY_DSN`.
 
 ## Primera vez que se hace deploy
 
 1. Clonar el repo y ubicarse en la branch de producción.
 2. Copiar `lyricgen/backend/.env.example` a la raíz como `.env`.
 3. Generar JWT_SECRET fuerte: `openssl rand -base64 32`.
-4. Crear bucket en Cloudflare R2 y llenar `R2_*`.
-5. Crear proyecto Sentry → copiar DSN.
-6. Subir `vertex_credentials.json` a `./secrets/`.
-7. `docker compose up -d --build`.
-8. Chequear `curl http://localhost:8000/health` — debe devolver
-   `{"status":"ok", "redis":"up", "r2":"configured", ...}`.
-9. Crear admin con password propio: desde un shell del contenedor API, correr
-   `python -c "from auth import create_user; create_user('tu_usuario', 'tu_password_fuerte', role='admin')"`.
-10. Borrar el admin default por las dudas: edita `outputs/_users.json` y
-    eliminá la entrada `admin` si no la usás.
+4. Configurar `DATABASE_URL` (formato `postgresql://user:pass@host:5432/db`).
+   En docker-compose la base local viene en el servicio `db`.
+5. Configurar `REDIS_URL` (en compose: `redis://redis:6379/0`).
+6. Crear bucket en Cloudflare R2 y llenar `R2_*`.
+7. Crear proyecto Sentry → copiar DSN.
+8. Subir `vertex_credentials.json` a `./secrets/`.
+9. `docker compose up -d --build` (levanta `db`, `redis`, `api`, `worker`).
+10. La primera vez, `init_db()` corre en el evento startup del API y crea
+    las tablas + el admin default (`admin` / valor de `ADMIN_PASSWORD`).
+11. Chequear `curl http://localhost:8000/health` — debe devolver
+    `{"status":"ok", "redis":"up", "r2":"configured", "disk_free_gb": >0, ...}`.
+12. Rotar el admin: crear uno nuevo con tu password,
+    ```bash
+    docker compose exec api python -c "
+    from database import SessionLocal
+    from auth import create_user
+    db = SessionLocal()
+    create_user(db, 'tu_usuario', 'tu_password_fuerte', role='admin')
+    db.close()"
+    ```
+    y desactivar el default desde el AdminPanel UI o con
+    ```bash
+    docker compose exec api python -c "
+    from database import SessionLocal, User
+    db = SessionLocal()
+    db.query(User).filter(User.username=='admin').update({'is_active': False})
+    db.commit(); db.close()"
+    ```
 
 ## Cosas que van a fallar y qué hacer
+
+### PostgreSQL caído
+
+`init_db()` corre en startup, así que un Postgres caído impide arrancar el
+API. Síntoma: `uvicorn` muere con `OperationalError: could not connect`.
+
+```
+docker compose restart db
+docker compose logs -f db          # confirmar que aceptó conexiones
+docker compose restart api worker  # re-arrancar lo que dependa de la DB
+```
+
+Si la corrupción es real (`pg_dump` falla), restaurar desde el último
+backup:
+
+```
+gunzip -c backups/genly-YYYYMMDD.sql.gz | \
+  docker compose exec -T db psql -U genly -d genly
+```
+
+Mientras Postgres está caído, los workers también frenan: usan
+`SessionLocal` para escribir el estado de los jobs.
 
 ### Redis caído
 
@@ -115,7 +161,14 @@ El endpoint `/health` avisa cuando el disco baja de 10 GB libres (status
 - [ ] `curl /health` devuelve `status: ok`.
 - [ ] Test de carga: 10 uploads en paralelo, todos terminan sin errores.
 - [ ] Test de delivery: 1 master real enviado a Santi → pasa QC.
-- [ ] Backup de `outputs/_users.json` y `outputs/_jobs_*.json` configurado.
+- [ ] Backup de PostgreSQL configurado (cron diario):
+      ```
+      docker compose exec -T db pg_dump -U genly genly | gzip > \
+        backups/genly-$(date +%Y%m%d).sql.gz
+      ```
+      Retención mínima: 30 días. Validar restore una vez al mes.
+- [ ] Backup de R2 (versionado del bucket activado o snapshot mensual a
+      otra región).
 
 ## Contactos
 
