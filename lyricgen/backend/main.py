@@ -8,7 +8,7 @@ load_dotenv(os.path.join(os.path.dirname(__file__), ".env"))
 
 from fastapi import FastAPI, File, Form, Query, UploadFile, HTTPException, Depends
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, RedirectResponse
 from pydantic import BaseModel
 
 from auth import (
@@ -20,6 +20,7 @@ from auth import (
     get_plan_usage,
     PLANS,
 )
+import storage
 from jobs import create_job, get_job, get_all_jobs, update_job
 from pipeline import run_pipeline, transcribe
 from queue_jobs import enqueue_pipeline, queue_depth
@@ -385,6 +386,15 @@ async def download(job_id: str, file_type: str, token: str = Query(...)):
         raise HTTPException(status_code=404, detail="Job not found.")
     if job["status"] != "done":
         raise HTTPException(status_code=400, detail="Job is not done yet.")
+
+    # Prefer a pre-signed URL to R2 so the uvicorn worker isn't tied up
+    # streaming multi-GB ProRes masters.
+    s3_key = (job.get("s3_keys") or {}).get(file_type)
+    if s3_key and storage.is_enabled():
+        url = storage.generate_signed_url(s3_key, expiry_seconds=3600)
+        if url:
+            return RedirectResponse(url, status_code=302)
+
     file_path = os.path.join(OUTPUTS_DIR, job_id, FILE_MAP[file_type])
     if not os.path.exists(file_path):
         raise HTTPException(status_code=404, detail="File not found.")

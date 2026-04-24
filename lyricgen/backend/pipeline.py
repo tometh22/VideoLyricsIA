@@ -41,12 +41,48 @@ from moviepy.editor import (
 )
 from PIL import Image, ImageDraw, ImageFont
 
-from jobs import update_job
+from jobs import update_job, get_job
+import storage
 from render_spec import RenderSpec
 
 ASSETS_DIR = os.path.join(os.path.dirname(__file__), "..", "assets")
 OUTPUTS_DIR = os.path.join(os.path.dirname(__file__), "..", "outputs")
 BACKGROUNDS_DIR = os.path.join(ASSETS_DIR, "backgrounds")
+
+
+_DELIVERABLE_FILENAMES = {
+    "video": "lyric_video.mp4",
+    "short": "short.mp4",
+    "thumbnail": "thumbnail.jpg",
+    "umg_master": "umg_master.mov",
+}
+
+
+def _upload_deliverables_to_r2(job_id: str, job_dir: str, files: dict) -> dict:
+    """Upload each produced deliverable to R2. Returns {file_type: s3_key}.
+
+    Non-fatal on upload errors — the local file stays and the job still
+    reports done. Cleanup job will retry or flag.
+    """
+    if not storage.is_enabled():
+        return {}
+    job = get_job(job_id)
+    tenant_id = (job or {}).get("tenant_id", "default")
+    out: dict = {}
+    for file_type, _url in files.items():
+        key_name = _DELIVERABLE_FILENAMES.get(file_type.replace("_url", ""))
+        if not key_name:
+            continue
+        local = os.path.join(job_dir, key_name)
+        if not os.path.exists(local):
+            continue
+        try:
+            key = storage.upload_master(local, tenant_id, job_id, key_name)
+            if key:
+                out[file_type.replace("_url", "")] = key
+        except Exception as e:
+            print(f"[R2] Upload failed for {key_name}: {e}")
+    return out
 
 
 def run_pipeline(job_id: str, mp3_path: str, artist: str, style: str,
@@ -124,6 +160,11 @@ def run_pipeline(job_id: str, mp3_path: str, artist: str, style: str,
                 artist, mp3_path, job_dir, bg_source=bg_source,
             )
             files["thumbnail_url"] = f"/download/{job_id}/thumbnail"
+
+        # Post-render upload to cloud storage. No-op if R2 env not set.
+        s3_keys = _upload_deliverables_to_r2(job_id, job_dir, files)
+        if s3_keys:
+            update_job(job_id, s3_keys=s3_keys)
 
         update_job(job_id, status="done", progress=100, files=files)
     except Exception as exc:
