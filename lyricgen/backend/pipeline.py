@@ -59,10 +59,11 @@ _DELIVERABLE_FILENAMES = {
 
 
 def _upload_deliverables_to_r2(job_id: str, job_dir: str, files: dict) -> dict:
-    """Upload each produced deliverable to R2. Returns {file_type: s3_key}.
+    """Upload each produced deliverable to R2 and delete the local copy on
+    success. Returns {file_type: s3_key}.
 
     Non-fatal on upload errors — the local file stays and the job still
-    reports done. Cleanup job will retry or flag.
+    reports done. Failed uploads will be retried by a later cleanup pass.
     """
     if not storage.is_enabled():
         return {}
@@ -80,9 +81,40 @@ def _upload_deliverables_to_r2(job_id: str, job_dir: str, files: dict) -> dict:
             key = storage.upload_master(local, tenant_id, job_id, key_name)
             if key:
                 out[file_type.replace("_url", "")] = key
+                # Upload confirmed — delete the local copy so the disk doesn't
+                # fill up (a HD ProRes master is ~5 GB, a 240 GB NVMe fills
+                # after ~50 UMG deliveries).
+                try:
+                    os.unlink(local)
+                except OSError as e:
+                    print(f"[R2] Could not remove local {local}: {e}")
         except Exception as e:
             print(f"[R2] Upload failed for {key_name}: {e}")
     return out
+
+
+def _cleanup_local_intermediates(job_dir: str) -> None:
+    """Drop intermediate render artefacts that are not deliverables. Keeps the
+    directory + any leftover deliverable that R2 upload missed, so the job
+    can still be recovered."""
+    leftovers = ("bg_generated.mp4", "bg_gradient_fallback.mp4")
+    for name in leftovers:
+        path = os.path.join(job_dir, name)
+        if os.path.exists(path):
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
+    # Also drop any per-spec looped backgrounds (bg_looped_*.mp4)
+    try:
+        for entry in os.listdir(job_dir):
+            if entry.startswith("bg_looped_") and entry.endswith(".mp4"):
+                try:
+                    os.unlink(os.path.join(job_dir, entry))
+                except OSError:
+                    pass
+    except OSError:
+        pass
 
 
 def run_pipeline(job_id: str, mp3_path: str, artist: str, style: str,
@@ -165,6 +197,10 @@ def run_pipeline(job_id: str, mp3_path: str, artist: str, style: str,
         s3_keys = _upload_deliverables_to_r2(job_id, job_dir, files)
         if s3_keys:
             update_job(job_id, s3_keys=s3_keys)
+
+        # Always drop intermediate files (looped backgrounds, gradient
+        # fallbacks). Deliverables are already removed above when R2 was used.
+        _cleanup_local_intermediates(job_dir)
 
         update_job(job_id, status="done", progress=100, files=files)
     except Exception as exc:

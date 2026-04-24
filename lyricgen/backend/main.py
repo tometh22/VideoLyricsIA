@@ -32,7 +32,20 @@ init_sentry()
 
 OUTPUTS_DIR = os.path.join(os.path.dirname(__file__), "..", "outputs")
 
+# Rate limiter: 120 req/min per IP by default (covers /status polling at 3 s
+# intervals with plenty of headroom). The SlowAPIMiddleware applies the limit
+# to every route without touching each endpoint's signature.
+from slowapi import Limiter, _rate_limit_exceeded_handler
+from slowapi.errors import RateLimitExceeded
+from slowapi.middleware import SlowAPIMiddleware
+from slowapi.util import get_remote_address
+
+limiter = Limiter(key_func=get_remote_address, default_limits=["120/minute"])
+
 app = FastAPI(title="GenLy AI API")
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+app.add_middleware(SlowAPIMiddleware)
 
 # CORS_ORIGINS: comma-separated list, e.g. "https://app.example.com,https://admin.example.com"
 # Leave empty in dev to fall back to "*".
@@ -459,10 +472,20 @@ async def preview(job_id: str, file_type: str, token: str = Query(...)):
         raise HTTPException(status_code=404, detail="Job not found.")
     if job["status"] != "done":
         raise HTTPException(status_code=400, detail="Job is not done yet.")
+
+    # Local copy is removed after R2 upload to keep disk usage bounded. Fall
+    # back to a signed URL for the preview in that case.
     file_path = os.path.join(OUTPUTS_DIR, job_id, FILE_MAP[file_type])
-    if not os.path.exists(file_path):
-        raise HTTPException(status_code=404, detail="File not found.")
-    return FileResponse(file_path, media_type=MEDIA_TYPES[file_type])
+    if os.path.exists(file_path):
+        return FileResponse(file_path, media_type=MEDIA_TYPES[file_type])
+
+    s3_key = (job.get("s3_keys") or {}).get(file_type)
+    if s3_key and storage.is_enabled():
+        url = storage.generate_signed_url(s3_key, expiry_seconds=3600)
+        if url:
+            return RedirectResponse(url, status_code=302)
+
+    raise HTTPException(status_code=404, detail="File not found.")
 
 
 def _settings_path(tenant_id: str = "default") -> str:

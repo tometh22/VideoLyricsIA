@@ -86,8 +86,12 @@ export default function App() {
   useEffect(() => { if (token) fetchHistory(); }, [token, fetchHistory]);
 
   const pollJob = useCallback((jobId) => {
+    // Poll every 3 s (instead of 1 s) and skip the tick entirely when the tab
+    // is hidden. For a user with a few tabs open and 20 active jobs this cuts
+    // the request rate by ~90%.
     return new Promise((resolve) => {
       const iv = setInterval(async () => {
+        if (typeof document !== "undefined" && document.hidden) return;
         try {
           const data = await (await authFetch(`${API}/status/${jobId}`)).json();
           setJobs((prev) => prev.map((j) =>
@@ -99,7 +103,7 @@ export default function App() {
             resolve(data.status);
           }
         } catch {}
-      }, 1000);
+      }, 3000);
       pollingRef.current = iv;
     });
   }, [fetchHistory]);
