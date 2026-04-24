@@ -2,6 +2,11 @@ import { useI18n } from "../i18n";
 
 const API = "";
 
+function tokenParam() {
+  const token = localStorage.getItem("genly_token");
+  return token ? `token=${encodeURIComponent(token)}` : "";
+}
+
 function JobRow({ job, index, t }) {
   const { filename, status, current_step, progress, job_id, error } = job;
   const name = filename.replace(/\.mp3$/i, "");
@@ -12,6 +17,7 @@ function JobRow({ job, index, t }) {
     video: t("batch.generating").split(" ")[0] || "Generando",
     short: "Short",
     thumbnail: "Thumbnail",
+    validation: t("batch.validating") || "Validando",
   };
 
   return (
@@ -22,7 +28,8 @@ function JobRow({ job, index, t }) {
         {/* Status icon */}
         <div className={`w-9 h-9 rounded-xl flex items-center justify-center shrink-0 ${
           status === "done" ? "bg-accent/10" :
-          status === "error" ? "bg-red-500/10" :
+          status === "pending_review" ? "bg-amber-500/10" :
+          status === "error" || status === "validation_failed" ? "bg-red-500/10" :
           status === "processing" ? "bg-brand/10" :
           "bg-surface-3/50"
         }`}>
@@ -31,7 +38,12 @@ function JobRow({ job, index, t }) {
               <polyline points="20 6 9 17 4 12" />
             </svg>
           )}
-          {status === "error" && (
+          {status === "pending_review" && (
+            <svg className="w-4.5 h-4.5 text-amber-400" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
+              <circle cx="12" cy="12" r="10" /><path d="M12 8v4M12 16h.01" />
+            </svg>
+          )}
+          {(status === "error" || status === "validation_failed") && (
             <svg className="w-4.5 h-4.5 text-red-400" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
               <path d="M18 6L6 18M6 6l12 12" />
             </svg>
@@ -49,6 +61,8 @@ function JobRow({ job, index, t }) {
           <p className="text-sm font-medium text-white truncate">{name}</p>
           <p className="text-[11px] text-gray-500">
             {status === "done" ? t("dash.completed") :
+             status === "pending_review" ? (t("batch.pending_review") || "Pendiente de aprobacion") :
+             status === "validation_failed" ? (t("batch.validation_failed") || "Validacion fallida") :
              status === "error" ? (error || t("dash.error")) :
              status === "processing" ? STEP_LABELS[current_step] || current_step :
              t("batch.queued")}
@@ -61,7 +75,7 @@ function JobRow({ job, index, t }) {
             {["video", "short", "thumbnail"].map((type) => (
               <a
                 key={type}
-                href={`${API}/download/${job_id}/${type}`}
+                href={`${API}/download/${job_id}/${type}?${tokenParam()}`}
                 download
                 className="w-8 h-8 rounded-lg bg-surface-1 hover:bg-brand/10 flex items-center justify-center text-gray-400 hover:text-brand transition-colors"
                 title={type === "video" ? "Lyric Video" : type === "short" ? "Short" : "Thumbnail"}
@@ -90,23 +104,30 @@ function JobRow({ job, index, t }) {
           />
         </div>
       )}
+
+      {/* Error detail */}
+      {status === "error" && error && (
+        <div className="mt-2 px-3 py-2 rounded-lg bg-red-500/5 border border-red-500/10">
+          <p className="text-[11px] text-red-400/80">{error}</p>
+        </div>
+      )}
     </div>
   );
 }
 
-export default function BatchProgress({ jobs, onReset }) {
+export default function BatchProgress({ jobs, onReset, onRetry }) {
   const { t } = useI18n();
-  const done = jobs.filter((j) => j.status === "done").length;
+  const done = jobs.filter((j) => j.status === "done" || j.status === "pending_review").length;
   const total = jobs.length;
-  const allDone = done === total;
-  const hasErrors = jobs.some((j) => j.status === "error");
+  const allDone = done === total && !jobs.some((j) => j.status === "processing" || j.status === "queued");
+  const hasErrors = jobs.some((j) => j.status === "error" || j.status === "validation_failed");
 
   const downloadAll = () => {
     jobs.forEach((job) => {
       if (job.status !== "done" || !job.job_id) return;
       ["video", "short", "thumbnail"].forEach((type) => {
         const a = document.createElement("a");
-        a.href = `${API}/download/${job.job_id}/${type}`;
+        a.href = `${API}/download/${job.job_id}/${type}?${tokenParam()}`;
         a.download = "";
         a.click();
       });

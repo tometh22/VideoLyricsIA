@@ -1,6 +1,18 @@
 import { useEffect, useRef, useState } from "react";
 import { useI18n } from "../i18n";
 
+const API = "";
+
+function authHeaders() {
+  const token = localStorage.getItem("genly_token");
+  return token ? { Authorization: `Bearer ${token}` } : {};
+}
+
+function tokenParam() {
+  const token = localStorage.getItem("genly_token");
+  return token ? `token=${encodeURIComponent(token)}` : "";
+}
+
 const UMG_FRAME_SIZES = [
   { key: "HD",     label: "HD 1920×1080 (16:9)" },
   { key: "UHD-4K", label: "UHD 4K 3840×2160 (16:9)" },
@@ -14,14 +26,26 @@ const UMG_PROFILES = [
   { value: 5, label: "ProRes 4444 XQ" },
 ];
 
-export default function UploadZone({ files, onFiles, onDeliveryChange }) {
+export default function UploadZone({
+  files,
+  onFiles,
+  onDeliveryChange,
+  backgroundFile,
+  onBackgroundFile,
+  backgroundId,
+  onBackgroundId,
+}) {
   const { t } = useI18n();
   const inputRef = useRef();
+  const bgInputRef = useRef();
   const [dragging, setDragging] = useState(false);
   const [deliveryProfile, setDeliveryProfile] = useState("youtube");
   const [umgFrameSize, setUmgFrameSize] = useState("HD");
   const [umgFps, setUmgFps] = useState(24);
   const [umgProresProfile, setUmgProresProfile] = useState(3);
+  const [bgMode, setBgMode] = useState("auto"); // auto | library | custom
+  const [libraryBgs, setLibraryBgs] = useState([]);
+  const [libraryLoaded, setLibraryLoaded] = useState(false);
 
   useEffect(() => {
     if (!onDeliveryChange) return;
@@ -33,6 +57,15 @@ export default function UploadZone({ files, onFiles, onDeliveryChange }) {
     });
   }, [deliveryProfile, umgFrameSize, umgFps, umgProresProfile, onDeliveryChange]);
 
+  useEffect(() => {
+    if (bgMode === "library" && !libraryLoaded) {
+      fetch(`${API}/backgrounds`, { headers: authHeaders() })
+        .then(r => r.json())
+        .then(data => { setLibraryBgs(Array.isArray(data) ? data : []); setLibraryLoaded(true); })
+        .catch(() => setLibraryLoaded(true));
+    }
+  }, [bgMode, libraryLoaded]);
+
   const LANGUAGES = [
     { code: "", label: t("lang.auto") },
     { code: "es", label: t("lang.es") },
@@ -43,12 +76,22 @@ export default function UploadZone({ files, onFiles, onDeliveryChange }) {
     { code: "de", label: t("lang.de") },
   ];
 
+  const extractArtist = (filename) => {
+    const name = filename.replace(/\.mp3$/i, "");
+    if (name.includes(" - ")) return name.split(" - ")[0].trim();
+    return "";
+  };
+
   const addFiles = (fileList) => {
     const mp3s = Array.from(fileList).filter((f) =>
       f.name.toLowerCase().endsWith(".mp3")
     );
     if (mp3s.length) {
-      const newEntries = mp3s.map((f) => ({ file: f, artist: "", language: "" }));
+      const newEntries = mp3s.map((f) => ({
+        file: f,
+        artist: extractArtist(f.name),
+        language: "",
+      }));
       onFiles((prev) => [...prev, ...newEntries]);
     }
   };
@@ -179,28 +222,168 @@ export default function UploadZone({ files, onFiles, onDeliveryChange }) {
                   </svg>
                 </button>
               </div>
-              <div className="flex gap-2">
+              <div className="space-y-2">
                 <input
                   type="text"
                   value={entry.artist}
                   onChange={(e) => updateField(i, "artist", e.target.value)}
                   placeholder={t("upload.artist")}
-                  className="flex-1 px-3 py-1.5 rounded-lg bg-surface-1 border border-white/[0.06]
+                  className="w-full px-3 py-1.5 rounded-lg bg-surface-1 border border-white/[0.06]
                     focus:border-brand/50 focus:outline-none text-sm text-white placeholder-gray-500 transition-all"
                 />
-                <select
-                  value={entry.language}
-                  onChange={(e) => updateField(i, "language", e.target.value)}
-                  className="px-3 py-1.5 rounded-lg bg-surface-1 border border-white/[0.06]
-                    focus:border-brand/50 focus:outline-none text-sm text-white transition-all appearance-none cursor-pointer"
-                >
-                  {LANGUAGES.map((l) => (
-                    <option key={l.code} value={l.code}>{l.label}</option>
+                <div className="flex items-center gap-1.5">
+                  <span className="text-[10px] text-gray-600 mr-1">{t("lang.auto")}</span>
+                  {LANGUAGES.filter(l => l.code).map((l) => (
+                    <button
+                      key={l.code}
+                      type="button"
+                      onClick={() => updateField(i, "language", entry.language === l.code ? "" : l.code)}
+                      className={`text-[10px] font-bold px-2 py-1 rounded-md transition-all uppercase
+                        ${entry.language === l.code
+                          ? "bg-brand/20 text-brand"
+                          : "text-gray-600 hover:text-gray-400 hover:bg-white/[0.03]"
+                        }`}
+                    >
+                      {l.code}
+                    </button>
                   ))}
-                </select>
+                </div>
               </div>
             </div>
           ))}
+        </div>
+      )}
+
+      {/* Background selector */}
+      {files.length > 0 && (
+        <div className="mt-4">
+          <input
+            ref={bgInputRef}
+            type="file"
+            accept=".mp4,.mov,.jpg,.jpeg,.png"
+            className="hidden"
+            onChange={(e) => {
+              if (e.target.files[0]) { onBackgroundFile?.(e.target.files[0]); onBackgroundId?.(null); }
+              e.target.value = "";
+            }}
+          />
+
+          <p className="text-[10px] text-gray-600 uppercase tracking-wider mb-2">{t("upload.bg_label") || "Background"}</p>
+
+          {/* Mode selector */}
+          <div className="flex gap-1 p-1 glass rounded-xl w-fit mb-3">
+            {[
+              { id: "auto", label: t("upload.bg_auto") || "IA Auto" },
+              { id: "library", label: t("upload.bg_library") || "Library" },
+              { id: "custom", label: t("upload.bg_custom_tab") || "Upload" },
+            ].map((m) => (
+              <button
+                key={m.id}
+                onClick={() => {
+                  setBgMode(m.id);
+                  if (m.id === "auto") { onBackgroundFile?.(null); onBackgroundId?.(null); }
+                }}
+                className={`px-4 py-1.5 rounded-lg text-[11px] font-medium transition-all ${
+                  bgMode === m.id ? "bg-brand text-white" : "text-gray-400 hover:text-white"
+                }`}
+              >
+                {m.label}
+              </button>
+            ))}
+          </div>
+
+          {/* Auto mode */}
+          {bgMode === "auto" && (
+            <div className="glass rounded-2xl px-4 py-3">
+              <p className="text-xs text-gray-400">
+                <svg className="inline-block w-3.5 h-3.5 mr-1.5 -mt-0.5 text-brand" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
+                  <path d="M13 10V3L4 14h7v7l9-11h-7z"/>
+                </svg>
+                {t("upload.bg_auto_desc") || "AI will generate a unique background based on the song's mood and lyrics."}
+              </p>
+            </div>
+          )}
+
+          {/* Library mode */}
+          {bgMode === "library" && (
+            <div>
+              {libraryBgs.length === 0 ? (
+                <div className="glass rounded-2xl px-4 py-6 text-center">
+                  <p className="text-xs text-gray-500">{t("upload.bg_library_empty") || "No pre-approved backgrounds available. Ask admin to upload some."}</p>
+                </div>
+              ) : (
+                <div className="grid grid-cols-3 gap-2 max-h-48 overflow-y-auto pr-1">
+                  {libraryBgs.map((bg) => (
+                    <button
+                      key={bg.id}
+                      onClick={() => { onBackgroundId?.(bg.id); onBackgroundFile?.(null); }}
+                      className={`rounded-xl overflow-hidden border-2 transition-all ${
+                        backgroundId === bg.id ? "border-brand shadow-glow" : "border-transparent hover:border-white/10"
+                      }`}
+                    >
+                      <div className="aspect-video bg-black/30">
+                        {bg.file_type === "mp4" ? (
+                          <video
+                            src={`${API}/backgrounds/${bg.id}/preview?${tokenParam()}`}
+                            className="w-full h-full object-cover"
+                            muted autoPlay loop playsInline
+                          />
+                        ) : (
+                          <img
+                            src={`${API}/backgrounds/${bg.id}/preview?${tokenParam()}`}
+                            className="w-full h-full object-cover"
+                            alt={bg.name}
+                          />
+                        )}
+                      </div>
+                      <div className="px-2 py-1.5 bg-surface-1">
+                        <p className="text-[10px] text-white truncate">{bg.name}</p>
+                      </div>
+                    </button>
+                  ))}
+                </div>
+              )}
+            </div>
+          )}
+
+          {/* Custom upload mode */}
+          {bgMode === "custom" && (
+            <div>
+              {!backgroundFile ? (
+                <button
+                  onClick={() => bgInputRef.current.click()}
+                  className="w-full rounded-2xl border border-dashed border-white/[0.06] px-4 py-4 text-center hover:border-brand/30 hover:bg-brand/5 transition-all"
+                >
+                  <p className="text-xs text-gray-500">
+                    <svg className="inline-block w-3.5 h-3.5 mr-1.5 -mt-0.5" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
+                      <rect x="3" y="3" width="18" height="18" rx="2" /><circle cx="8.5" cy="8.5" r="1.5" /><polyline points="21 15 16 10 5 21" />
+                    </svg>
+                    {t("upload.custom_bg") || "Custom Background"} — MP4, MOV, JPG, PNG
+                  </p>
+                </button>
+              ) : (
+                <div className="glass rounded-2xl px-4 py-3 flex items-center gap-3">
+                  <div className="w-8 h-8 rounded-lg bg-cyan-500/10 flex items-center justify-center shrink-0">
+                    <svg className="w-4 h-4 text-cyan-400" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
+                      <rect x="3" y="3" width="18" height="18" rx="2" /><circle cx="8.5" cy="8.5" r="1.5" /><polyline points="21 15 16 10 5 21" />
+                    </svg>
+                  </div>
+                  <div className="flex-1 min-w-0">
+                    <p className="text-sm text-white truncate">{backgroundFile.name}</p>
+                    <p className="text-[10px] text-cyan-400">{t("upload.custom_bg_active") || "Custom background - AI generation skipped"}</p>
+                  </div>
+                  <button
+                    onClick={() => onBackgroundFile?.(null)}
+                    className="shrink-0 w-7 h-7 rounded-lg hover:bg-red-500/10 flex items-center justify-center text-gray-500 hover:text-red-400 transition-colors"
+                  >
+                    <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
+                      <path d="M18 6L6 18M6 6l12 12" />
+                    </svg>
+                  </button>
+                </div>
+              )}
+            </div>
+          )}
         </div>
       )}
     </div>

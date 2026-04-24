@@ -10,6 +10,7 @@ import LyricsEditor from "./components/LyricsEditor";
 import BatchProgress from "./components/BatchProgress";
 import JobDetail from "./components/JobDetail";
 import Settings from "./components/Settings";
+import AdminPanel from "./components/AdminPanel";
 
 const API = "";
 
@@ -58,8 +59,38 @@ export default function App() {
   const [jobs, setJobs] = useState([]);
   const [history, setHistory] = useState([]);
   const [selectedJob, setSelectedJob] = useState(null);
+  const [backgroundFile, setBackgroundFile] = useState(null);
+  const [backgroundId, setBackgroundId] = useState(null);
   const [sidebarOpen, setSidebarOpen] = useState(true);
-  const pollingRef = useRef(null);
+  const pollingIntervals = useRef(new Set());
+  const PARALLEL_WORKERS = 5;
+
+  // --- Handle URL params (billing callbacks, email verification) ---
+  useEffect(() => {
+    const params = new URLSearchParams(window.location.search);
+    if (params.get("billing") === "success") {
+      // Refresh user data after successful checkout
+      if (getToken()) {
+        authFetch(`${API}/auth/me`).then(r => r.json()).then(userData => {
+          localStorage.setItem("genly_user", JSON.stringify(userData));
+          setUser(userData);
+        }).catch(() => {});
+      }
+      window.history.replaceState({}, "", window.location.pathname);
+    }
+    if (params.get("verify_email")) {
+      fetch("/auth/verify-email", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ token: params.get("verify_email") }),
+      }).catch(() => {});
+      window.history.replaceState({}, "", window.location.pathname);
+    }
+    if (params.get("reset_password")) {
+      setShowLanding(false);
+      setView("login");
+    }
+  }, []);
 
   // --- Auth ---
   const handleLogin = (newToken, newUser) => {
@@ -80,7 +111,12 @@ export default function App() {
 
   const fetchHistory = useCallback(async () => {
     if (!getToken()) return;
-    try { setHistory(await (await authFetch(`${API}/jobs`)).json()); } catch {}
+    try {
+      const res = await authFetch(`${API}/jobs`);
+      if (res.status === 401) { handleLogout(); return; }
+      const data = await res.json();
+      if (Array.isArray(data)) setHistory(data);
+    } catch {}
   }, []);
 
   useEffect(() => { if (token) fetchHistory(); }, [token, fetchHistory]);
@@ -97,18 +133,21 @@ export default function App() {
           setJobs((prev) => prev.map((j) =>
             j.job_id === jobId ? { ...j, status: data.status, current_step: data.current_step, progress: data.progress, error: data.error } : j
           ));
-          if (data.status === "done" || data.status === "error") {
+          if (data.status === "done" || data.status === "error" || data.status === "pending_review" || data.status === "validation_failed") {
             clearInterval(iv);
+            pollingIntervals.current.delete(iv);
             fetchHistory();
             resolve(data.status);
           }
         } catch {}
       }, 3000);
-      pollingRef.current = iv;
+      pollingIntervals.current.add(iv);
     });
   }, [fetchHistory]);
 
-  useEffect(() => () => { if (pollingRef.current) clearInterval(pollingRef.current); }, []);
+  useEffect(() => () => {
+    pollingIntervals.current.forEach((iv) => clearInterval(iv));
+  }, []);
 
   // --- Review flow ---
   const handleStartReview = async () => {
@@ -154,7 +193,7 @@ export default function App() {
       });
     } catch (err) {
       setTranscribing(false);
-      setTranscribeError("Error transcribiendo: " + err.message);
+      setTranscribeError(t("batch.error_server"));
     }
   };
 
@@ -187,69 +226,99 @@ export default function App() {
     setReadyToGenerate(false);
     setApprovedJobs([]);
 
-    for (let i = 0; i < jobList.length; i++) {
-      setJobs((prev) => prev.map((j, idx) =>
-        idx === i ? { ...j, status: "processing", current_step: "background", progress: 22 } : j
-      ));
-      const formData = new FormData();
-      formData.append("file", jobList[i]._file);
-      formData.append("artist", jobList[i].artist);
-      formData.append("style", style);
-      if (jobList[i].language) formData.append("language", jobList[i].language);
-      formData.append("segments_json", JSON.stringify(jobList[i].segments));
-      formData.append("delivery_profile", delivery.delivery_profile);
-      if (delivery.delivery_profile !== "youtube") {
-        formData.append("umg_frame_size", delivery.umg_frame_size);
-        formData.append("umg_fps", String(delivery.umg_fps));
-        formData.append("umg_prores_profile", String(delivery.umg_prores_profile));
-      }
-
-      try {
-        const res = await authFetch(`${API}/generate`, { method: "POST", body: formData });
-        const data = await res.json();
-        setJobs((prev) => prev.map((j, idx) => (idx === i ? { ...j, job_id: data.job_id } : j)));
-        await pollJob(data.job_id);
-      } catch {
+    let nextIdx = 0;
+    const worker = async () => {
+      while (nextIdx < jobList.length) {
+        const i = nextIdx++;
         setJobs((prev) => prev.map((j, idx) =>
-          idx === i ? { ...j, status: "error", error: "Error de conexion" } : j
+          idx === i ? { ...j, status: "processing", current_step: "background", progress: 22 } : j
         ));
+        const formData = new FormData();
+        formData.append("file", jobList[i]._file);
+        formData.append("artist", jobList[i].artist);
+        formData.append("style", style);
+        if (jobList[i].language) formData.append("language", jobList[i].language);
+        formData.append("segments_json", JSON.stringify(jobList[i].segments));
+        formData.append("delivery_profile", delivery.delivery_profile);
+        if (delivery.delivery_profile !== "youtube") {
+          formData.append("umg_frame_size", delivery.umg_frame_size);
+          formData.append("umg_fps", String(delivery.umg_fps));
+          formData.append("umg_prores_profile", String(delivery.umg_prores_profile));
+        }
+        if (backgroundId) formData.append("background_id", backgroundId);
+        else if (backgroundFile) formData.append("background_file", backgroundFile);
+
+        try {
+          const res = await authFetch(`${API}/generate`, { method: "POST", body: formData });
+          const data = await res.json();
+          if (data.detail) {
+            // Plan limit error
+            setJobs((prev) => prev.map((j, idx) =>
+              idx === i ? { ...j, status: "error", error: data.detail } : j
+            ));
+            continue;
+          }
+          setJobs((prev) => prev.map((j, idx) => (idx === i ? { ...j, job_id: data.job_id } : j)));
+          await pollJob(data.job_id);
+        } catch {
+          setJobs((prev) => prev.map((j, idx) =>
+            idx === i ? { ...j, status: "error", error: t("batch.error_server") } : j
+          ));
+        }
       }
-    }
+    };
+    await Promise.all(Array.from({ length: Math.min(PARALLEL_WORKERS, jobList.length) }, () => worker()));
   };
 
   const processQueueDirect = async (jobList) => {
-    for (let i = 0; i < jobList.length; i++) {
-      setJobs((prev) => prev.map((j, idx) =>
-        idx === i ? { ...j, status: "processing", current_step: "whisper", progress: 0 } : j
-      ));
-      const formData = new FormData();
-      formData.append("file", jobList[i]._file);
-      formData.append("artist", jobList[i].artist);
-      formData.append("style", style);
-      if (jobList[i].language) formData.append("language", jobList[i].language);
-      formData.append("delivery_profile", delivery.delivery_profile);
-      if (delivery.delivery_profile !== "youtube") {
-        formData.append("umg_frame_size", delivery.umg_frame_size);
-        formData.append("umg_fps", String(delivery.umg_fps));
-        formData.append("umg_prores_profile", String(delivery.umg_prores_profile));
-      }
-
-      try {
-        const res = await authFetch(`${API}/upload`, { method: "POST", body: formData });
-        const data = await res.json();
-        setJobs((prev) => prev.map((j, idx) => (idx === i ? { ...j, job_id: data.job_id } : j)));
-        await pollJob(data.job_id);
-      } catch {
+    let nextIdx = 0;
+    const worker = async () => {
+      while (nextIdx < jobList.length) {
+        const i = nextIdx++;
         setJobs((prev) => prev.map((j, idx) =>
-          idx === i ? { ...j, status: "error", error: "Error de conexion" } : j
+          idx === i ? { ...j, status: "processing", current_step: "whisper", progress: 0 } : j
         ));
+        const formData = new FormData();
+        formData.append("file", jobList[i]._file);
+        formData.append("artist", jobList[i].artist);
+        formData.append("style", style);
+        formData.append("delivery_profile", delivery.delivery_profile);
+        if (delivery.delivery_profile !== "youtube") {
+          formData.append("umg_frame_size", delivery.umg_frame_size);
+          formData.append("umg_fps", String(delivery.umg_fps));
+          formData.append("umg_prores_profile", String(delivery.umg_prores_profile));
+        }
+        if (jobList[i].language) formData.append("language", jobList[i].language);
+        if (backgroundId) formData.append("background_id", backgroundId);
+        else if (backgroundFile) formData.append("background_file", backgroundFile);
+
+        try {
+          const res = await authFetch(`${API}/upload`, { method: "POST", body: formData });
+          const data = await res.json();
+          if (data.detail) {
+            setJobs((prev) => prev.map((j, idx) =>
+              idx === i ? { ...j, status: "error", error: data.detail } : j
+            ));
+            continue;
+          }
+          setJobs((prev) => prev.map((j, idx) => (idx === i ? { ...j, job_id: data.job_id } : j)));
+          await pollJob(data.job_id);
+        } catch {
+          setJobs((prev) => prev.map((j, idx) =>
+            idx === i ? { ...j, status: "error", error: t("batch.error_server") } : j
+          ));
+        }
       }
-    }
+    };
+    await Promise.all(Array.from({ length: Math.min(PARALLEL_WORKERS, jobList.length) }, () => worker()));
   };
 
-  const handleReset = () => {
-    if (pollingRef.current) clearInterval(pollingRef.current);
-    setFiles([]); setJobs([]); setSelectedJob(null);
+  const handleReset = (skipConfirm = false) => {
+    const hasActive = jobs.some((j) => j.status === "processing" || j.status === "queued");
+    if (hasActive && !skipConfirm && !window.confirm(t("batch.confirm_cancel"))) return;
+    pollingIntervals.current.forEach((iv) => clearInterval(iv));
+    pollingIntervals.current.clear();
+    setFiles([]); setJobs([]); setSelectedJob(null); setBackgroundFile(null); setBackgroundId(null);
     setReviewQueue([]); setCurrentReview(null); setApprovedJobs([]);
     setTranscribing(false); setReadyToGenerate(false); setTranscribeError(null);
     setView("dashboard");
@@ -273,18 +342,32 @@ export default function App() {
     else if (id === "new") { setView("new"); setFiles([]); }
     else if (id === "history") { setView("history"); }
     else if (id === "settings") { setView("settings"); }
+    else if (id === "admin") { setView("admin"); }
   };
 
   const allHaveArtist = files.length > 0 && files.every((f) => f.artist.trim());
 
-  // --- Not authenticated: show login ---
-  if (!token) {
-    return <LoginPage onLogin={handleLogin} />;
+  // --- Landing (always first, public) ---
+  if (showLanding) {
+    return <Landing
+      onStart={() => { if (token) setShowLanding(false); else setView("login"); setShowLanding(false); }}
+      onLogin={() => { setShowLanding(false); setView("login"); }}
+      isLoggedIn={!!token}
+    />;
   }
 
-  // --- Landing ---
-  if (showLanding) {
-    return <Landing onStart={() => setShowLanding(false)} />;
+  // --- Login/Register ---
+  if (!token && view === "login") {
+    return <LoginPage onLogin={(t, u) => { handleLogin(t, u); setView("dashboard"); }} onBack={() => setShowLanding(true)} />;
+  }
+
+  // --- Not authenticated, redirect to landing ---
+  if (!token) {
+    return <Landing
+      onStart={() => setView("login")}
+      onLogin={() => setView("login")}
+      isLoggedIn={false}
+    />;
   }
 
   return (
@@ -306,7 +389,7 @@ export default function App() {
         </div>
 
         {/* Top bar */}
-        <header className="relative z-10 flex items-center justify-between px-8 py-4 border-b border-white/[0.04]">
+        <header className="sticky top-0 z-20 flex items-center justify-between px-8 py-4 border-b border-white/[0.04] bg-surface/80 backdrop-blur-xl" style={{boxShadow: '0 1px 12px rgba(0,0,0,0.2)'}}>
           <div className="flex items-center gap-3">
             {!sidebarOpen && (
               <button onClick={() => setSidebarOpen(true)} className="mr-2 text-gray-400 hover:text-white transition-colors">
@@ -316,7 +399,12 @@ export default function App() {
           </div>
           <div className="flex items-center gap-4">
             {user && (
-              <span className="text-xs text-gray-500">{user.username}</span>
+              <div className="flex items-center gap-2">
+                <div className="w-7 h-7 rounded-lg bg-gradient-to-br from-brand/20 to-brand-light/20 flex items-center justify-center border border-white/[0.06]">
+                  <span className="text-[10px] font-bold text-brand uppercase">{user.username?.charAt(0)}</span>
+                </div>
+                <span className="text-xs text-gray-500">{user.username}</span>
+              </div>
             )}
           </div>
         </header>
@@ -360,7 +448,15 @@ export default function App() {
               </div>
 
               <div className="space-y-5">
-                <UploadZone files={files} onFiles={setFiles} onDeliveryChange={setDelivery} />
+                <UploadZone
+                  files={files}
+                  onFiles={setFiles}
+                  onDeliveryChange={setDelivery}
+                  backgroundFile={backgroundFile}
+                  onBackgroundFile={setBackgroundFile}
+                  backgroundId={backgroundId}
+                  onBackgroundId={setBackgroundId}
+                />
 
                 {allHaveArtist && (
                   <div className="flex gap-3">
@@ -470,10 +566,19 @@ export default function App() {
             <Settings onBack={() => setView("dashboard")} />
           )}
 
+          {/* Admin panel */}
+          {view === "admin" && user?.role === "admin" && (
+            <AdminPanel onBack={() => setView("dashboard")} />
+          )}
+
           {/* Job detail */}
           {view === "detail" && selectedJob && (
             <div className="flex justify-center">
-              <JobDetail job={selectedJob} onBack={() => setView("dashboard")} />
+              <JobDetail
+                job={selectedJob}
+                onBack={() => setView("dashboard")}
+                onJobUpdate={(updatedJob) => { setSelectedJob(updatedJob); fetchHistory(); }}
+              />
             </div>
           )}
         </main>

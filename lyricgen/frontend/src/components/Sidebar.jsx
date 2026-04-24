@@ -24,8 +24,17 @@ export default function Sidebar({ onNav, activeView, open, onToggle, user, onLog
     },
   ];
 
+  // Admin link for admin users
+  if (user?.role === "admin") {
+    items.push({
+      id: "admin", label: "Admin",
+      icon: <svg className="w-5 h-5" fill="none" stroke="currentColor" strokeWidth="1.5" viewBox="0 0 24 24"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z" strokeLinecap="round" strokeLinejoin="round"/></svg>,
+    });
+  }
+
   return (
-    <aside className="fixed left-0 top-0 bottom-0 w-64 bg-surface-1 border-r border-white/[0.04] z-20 flex flex-col">
+    <aside className="fixed left-0 top-0 bottom-0 w-64 bg-surface-1/95 backdrop-blur-xl border-r border-white/[0.04] z-20 flex flex-col" style={{boxShadow: '4px 0 24px rgba(0,0,0,0.3)'}}>
+
       {/* Logo */}
       <div className="flex items-center justify-between px-5 py-5 border-b border-white/[0.04]">
         <div className="flex items-center gap-2.5">
@@ -63,6 +72,21 @@ export default function Sidebar({ onNav, activeView, open, onToggle, user, onLog
           </button>
         ))}
       </nav>
+
+      {/* Plan badge */}
+      {user && (
+        <div className="px-5 py-3 border-t border-white/[0.04]">
+          <button onClick={() => onNav("settings")}
+            className="w-full flex items-center gap-2 px-3 py-2 rounded-xl bg-brand/5 hover:bg-brand/10 transition-all">
+            <span className="text-[10px] font-bold text-brand uppercase tracking-wider">
+              Plan {user.plan || "free"}
+            </span>
+            <svg className="w-3 h-3 text-gray-500 ml-auto" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
+              <path d="M9 5l7 7-7 7" strokeLinecap="round" strokeLinejoin="round"/>
+            </svg>
+          </button>
+        </div>
+      )}
 
       {/* User & logout */}
       <div className="px-5 py-4 border-t border-white/[0.04] space-y-3">

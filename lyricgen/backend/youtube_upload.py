@@ -64,45 +64,57 @@ def _load_settings() -> dict:
     return {}
 
 
-def generate_youtube_metadata(artist: str, song: str, lyrics_text: str = "") -> dict:
+def generate_youtube_metadata(artist: str, song: str, lyrics_text: str = "", job_id: str = None) -> dict:
     """Use Gemini to generate optimized YouTube metadata."""
     from pipeline import _get_genai_client
     from google import genai
+    from provenance import record_ai_call
 
     client = _get_genai_client()
 
+    prompt_content = (
+        f"Artist: {artist}\nSong: {song}\n"
+        f"Lyrics preview: {lyrics_text[:300]}\n\n"
+        f"Generate YouTube video metadata for a lyric video following YouTube SEO best practices. "
+        f"Write ALL metadata in {_get_language_name()} (title, description, tags). "
+        f"Respond ONLY with JSON: {{\"title\":\"...\",\"description\":\"...\",\"tags\":[\"...\"]}}\n\n"
+        f"TITLE rules (YouTube SEO):\n"
+        f"- Format: '{artist} - {song} (Letra/Lyrics)'\n"
+        f"- Max 70 chars (YouTube truncates longer titles in search)\n"
+        f"- Put the most important keywords first (artist + song name)\n"
+        f"- Include (Letra/Lyrics) at the end for bilingual discovery\n\n"
+        f"DESCRIPTION rules (YouTube SEO):\n"
+        f"- First 2 lines are critical (shown before 'Show more') — include artist, song, and 'lyric video'\n"
+        f"- Include a brief song description or quote from the lyrics\n"
+        f"- Add timestamps: 0:00 {song}\n"
+        f"- Credit line: '{artist} - {song}'\n"
+        f"- 3 relevant hashtags at the very end (YouTube shows first 3 above title)\n"
+        f"- Include '#lyrics #letra #{{artist without spaces}}' as the 3 hashtags\n"
+        f"- Total description: 800-1500 chars (longer descriptions rank better)\n"
+        f"- Include related search phrases naturally: 'lyric video', 'letra completa', 'con letra'\n\n"
+        f"TAGS rules (YouTube SEO):\n"
+        f"- 15-20 tags, mix of broad and specific\n"
+        f"- Start with exact match: '{artist} {song} lyrics', '{artist} {song} letra'\n"
+        f"- Include variations: '{song} lyrics', '{artist} lyrics', '{artist} letra'\n"
+        f"- Include genre tags\n"
+        f"- Include 'lyric video', 'letra', 'con letra', 'lyrics video', 'official lyrics'\n"
+        f"- Include '{artist}' alone as a tag\n"
+        f"- Include '{song}' alone as a tag\n"
+        f"- Include Spanish and English versions of key terms\n"
+    )
+
+    recorder = record_ai_call(
+        job_id=job_id or "unknown",
+        step="yt_metadata",
+        tool_name="gemini-2.5-flash",
+        tool_provider="google_vertex",
+        prompt=prompt_content,
+        input_data_types=["artist_name", "song_name", "lyrics_preview_300chars"],
+    ) if job_id else None
+
     response = client.models.generate_content(
         model="gemini-2.5-flash",
-        contents=(
-            f"Artist: {artist}\nSong: {song}\n"
-            f"Lyrics preview: {lyrics_text[:300]}\n\n"
-            f"Generate YouTube video metadata for a lyric video following YouTube SEO best practices. "
-            f"Write ALL metadata in {_get_language_name()} (title, description, tags). "
-            f"Respond ONLY with JSON: {{\"title\":\"...\",\"description\":\"...\",\"tags\":[\"...\"]}}\n\n"
-            f"TITLE rules (YouTube SEO):\n"
-            f"- Format: '{artist} - {song} (Letra/Lyrics)'\n"
-            f"- Max 70 chars (YouTube truncates longer titles in search)\n"
-            f"- Put the most important keywords first (artist + song name)\n"
-            f"- Include (Letra/Lyrics) at the end for bilingual discovery\n\n"
-            f"DESCRIPTION rules (YouTube SEO):\n"
-            f"- First 2 lines are critical (shown before 'Show more') — include artist, song, and 'lyric video'\n"
-            f"- Include a brief song description or quote from the lyrics\n"
-            f"- Add timestamps: 0:00 {song}\n"
-            f"- Credit line: '{artist} - {song}'\n"
-            f"- 3 relevant hashtags at the very end (YouTube shows first 3 above title)\n"
-            f"- Include '#lyrics #letra #{{artist without spaces}}' as the 3 hashtags\n"
-            f"- Total description: 800-1500 chars (longer descriptions rank better)\n"
-            f"- Include related search phrases naturally: 'lyric video', 'letra completa', 'con letra'\n\n"
-            f"TAGS rules (YouTube SEO):\n"
-            f"- 15-20 tags, mix of broad and specific\n"
-            f"- Start with exact match: '{artist} {song} lyrics', '{artist} {song} letra'\n"
-            f"- Include variations: '{song} lyrics', '{artist} lyrics', '{artist} letra'\n"
-            f"- Include genre tags\n"
-            f"- Include 'lyric video', 'letra', 'con letra', 'lyrics video', 'official lyrics'\n"
-            f"- Include '{artist}' alone as a tag\n"
-            f"- Include '{song}' alone as a tag\n"
-            f"- Include Spanish and English versions of key terms\n"
-        ),
+        contents=prompt_content,
         config=genai.types.GenerateContentConfig(
             temperature=0.3,
             max_output_tokens=1000,
@@ -112,6 +124,8 @@ def generate_youtube_metadata(artist: str, song: str, lyrics_text: str = "") -> 
 
     import re
     text = response.text.strip()
+    if recorder:
+        recorder.finish(response_summary=text[:500])
     json_match = re.search(r'\{.*\}', text, re.DOTALL)
     metadata = None
     if json_match:
@@ -166,13 +180,14 @@ def upload_to_youtube(
     song: str,
     lyrics_text: str = "",
     privacy: str = "unlisted",
+    job_id: str = None,
 ) -> dict:
     """Upload video + thumbnail to YouTube with AI-generated metadata.
 
     Returns dict with video_id and url.
     """
     print(f"[YOUTUBE] Generating metadata for '{artist} - {song}'...")
-    metadata = generate_youtube_metadata(artist, song, lyrics_text)
+    metadata = generate_youtube_metadata(artist, song, lyrics_text, job_id=job_id)
     print(f"[YOUTUBE] Title: {metadata['title']}")
 
     youtube = _get_youtube_client()

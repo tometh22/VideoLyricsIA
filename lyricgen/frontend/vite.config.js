@@ -4,6 +4,7 @@ import react from "@vitejs/plugin-react";
 export default defineConfig({
   plugins: [react()],
   server: {
+    allowedHosts: true,
     proxy: {
       "/auth": "http://localhost:8000",
       "/upload": "http://localhost:8000",
@@ -16,6 +17,10 @@ export default defineConfig({
       "/youtube": "http://localhost:8000",
       "/settings": "http://localhost:8000",
       "/usage": "http://localhost:8000",
+      "/plans": "http://localhost:8000",
+      "/billing": "http://localhost:8000",
+      "/admin": "http://localhost:8000",
+      "/health": "http://localhost:8000",
     },
   },
 });

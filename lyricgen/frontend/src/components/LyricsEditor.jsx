@@ -149,7 +149,10 @@ export default function LyricsEditor({ segments, filename, referenceLyrics, onAp
         </div>
       )}
 
-      <div className="space-y-1 max-h-[60vh] overflow-y-auto pr-1">
+      <div className="relative">
+      {/* Scroll fade indicator */}
+      <div className="absolute bottom-0 left-0 right-0 h-12 bg-gradient-to-t from-surface to-transparent pointer-events-none z-10 rounded-b-2xl" />
+      <div className="space-y-1 max-h-[60vh] overflow-y-auto pr-1 pb-8">
         {edited.map((seg) => {
           const suggestion = suggestionsById[seg._id];
           const isApplied = suggestion && seg.text === suggestion;
@@ -195,6 +198,7 @@ export default function LyricsEditor({ segments, filename, referenceLyrics, onAp
             </div>
           );
         })}
+      </div>
       </div>
 
       <div className="mt-4 flex justify-between items-center">

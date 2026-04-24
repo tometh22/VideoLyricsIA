@@ -23,8 +23,10 @@ export default {
         display: ['"Inter"', "system-ui", "sans-serif"],
       },
       boxShadow: {
-        glow: "0 0 40px rgba(124, 92, 252, 0.15)",
-        "glow-lg": "0 0 80px rgba(124, 92, 252, 0.2)",
+        glow: "0 0 40px rgba(124, 92, 252, 0.15), 0 0 80px rgba(124, 92, 252, 0.05)",
+        "glow-lg": "0 0 80px rgba(124, 92, 252, 0.2), 0 0 120px rgba(124, 92, 252, 0.1)",
+        "depth": "0 2px 4px rgba(0,0,0,0.3), 0 8px 24px rgba(0,0,0,0.2)",
+        "depth-lg": "0 4px 8px rgba(0,0,0,0.4), 0 16px 48px rgba(0,0,0,0.3)",
       },
       animation: {
         "pulse-slow": "pulse 3s ease-in-out infinite",

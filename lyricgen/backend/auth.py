@@ -1,23 +1,34 @@
-"""JWT authentication module for GenLy AI."""
+"""JWT authentication module for GenLy AI — PostgreSQL backed."""
 
-import json
 import os
+import secrets
 import time
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 
-# --- Plan definitions ---
-PLANS = {
-    "100": {"limit": 100, "price_per_video": 9.00, "overage_rate": 1.30},
-    "250": {"limit": 250, "price_per_video": 8.00, "overage_rate": 1.30},
-    "500": {"limit": 500, "price_per_video": 7.00, "overage_rate": 1.30},
-    "1000": {"limit": 1000, "price_per_video": 6.00, "overage_rate": 1.30},
-    "unlimited": {"limit": 999999, "price_per_video": 0, "overage_rate": 1.0},
-}
-
-from fastapi import Depends, HTTPException, status
+from fastapi import Depends, HTTPException, Request, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from jose import JWTError, jwt
 from passlib.context import CryptContext
+from sqlalchemy.orm import Session
+
+from database import User, PasswordResetToken, EmailVerificationToken, get_db, utcnow
+
+# --- Plan definitions ---
+PLANS = {
+    "free": {"limit": 5, "price_per_video": 0, "overage_rate": 0, "monthly_price": 0,
+             "stripe_price_id": None},
+    "100": {"limit": 100, "price_per_video": 9.00, "overage_rate": 1.30, "monthly_price": 900,
+            "stripe_price_id": os.environ.get("STRIPE_PRICE_100")},
+    "250": {"limit": 250, "price_per_video": 8.00, "overage_rate": 1.30, "monthly_price": 2000,
+            "stripe_price_id": os.environ.get("STRIPE_PRICE_250")},
+    "500": {"limit": 500, "price_per_video": 7.00, "overage_rate": 1.30, "monthly_price": 3500,
+            "stripe_price_id": os.environ.get("STRIPE_PRICE_500")},
+    "1000": {"limit": 1000, "price_per_video": 6.00, "overage_rate": 1.30, "monthly_price": 6000,
+             "stripe_price_id": os.environ.get("STRIPE_PRICE_1000")},
+    "unlimited": {"limit": 999999, "price_per_video": 0, "overage_rate": 1.0, "monthly_price": 0,
+                  "stripe_price_id": None},
+}
 
 # --- Configuration (loaded from environment) ---
 _DEFAULT_INSECURE_SECRET = "genly-default-secret-change-me"
@@ -39,97 +50,154 @@ if _ENV in ("prod", "production") and (
 # --- Password hashing ---
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 
-# --- User store ---
-OUTPUTS_DIR = os.path.join(os.path.dirname(__file__), "..", "outputs")
-_USERS_PATH = os.path.join(OUTPUTS_DIR, "_users.json")
-
 security = HTTPBearer()
 
 
-def _load_users() -> dict:
-    """Load users from JSON file."""
-    if os.path.exists(_USERS_PATH):
-        try:
-            with open(_USERS_PATH) as f:
-                return json.load(f)
-        except (json.JSONDecodeError, OSError):
-            pass
-    return {}
+# ---------------------------------------------------------------------------
+# User CRUD
+# ---------------------------------------------------------------------------
+
+def get_user_by_username(db: Session, username: str) -> Optional[User]:
+    return db.query(User).filter(User.username == username).first()
 
 
-def _save_users(users: dict) -> None:
-    """Save users to JSON file."""
-    os.makedirs(os.path.dirname(_USERS_PATH), exist_ok=True)
-    with open(_USERS_PATH, "w") as f:
-        json.dump(users, f, indent=2)
+def get_user_by_email(db: Session, email: str) -> Optional[User]:
+    return db.query(User).filter(User.email == email).first()
 
 
-def _ensure_default_admin():
-    """Create default admin user if no users exist."""
-    users = _load_users()
-    if not users:
-        users["admin"] = {
-            "username": "admin",
-            "hashed_password": pwd_context.hash("genly2026"),
-            "role": "admin",
-            "tenant_id": "default",
-            "plan": "100",
-            "created_at": time.time(),
-        }
-        _save_users(users)
-
-
-# Ensure default admin on import
-_ensure_default_admin()
+def get_user_by_id(db: Session, user_id: int) -> Optional[User]:
+    return db.query(User).filter(User.id == user_id).first()
 
 
 def create_user(
+    db: Session,
     username: str,
     password: str,
+    email: str = None,
     role: str = "user",
-    tenant_id: str = "default",
-    plan: str = "100",
-) -> dict:
-    """Create a new user. Returns the user dict (without password)."""
-    users = _load_users()
-    if username in users:
+    tenant_id: str = None,
+    plan: str = "free",
+) -> User:
+    """Create a new user. Raises ValueError if username/email exists."""
+    if get_user_by_username(db, username):
         raise ValueError(f"User '{username}' already exists")
+    if email and get_user_by_email(db, email):
+        raise ValueError(f"Email '{email}' already registered")
 
-    users[username] = {
-        "username": username,
-        "hashed_password": pwd_context.hash(password),
-        "role": role,
-        "tenant_id": tenant_id,
-        "plan": plan,
-        "created_at": time.time(),
-    }
-    _save_users(users)
-    return {"username": username, "role": role, "tenant_id": tenant_id, "plan": plan}
+    # Auto-generate tenant_id from username if not provided
+    if not tenant_id:
+        tenant_id = username.lower().replace(" ", "_")
+
+    user = User(
+        username=username,
+        email=email,
+        hashed_password=pwd_context.hash(password),
+        role=role,
+        tenant_id=tenant_id,
+        plan_id=plan,
+        ai_authorized=(role == "admin"),
+    )
+    db.add(user)
+    db.commit()
+    db.refresh(user)
+    return user
 
 
-def authenticate_user(username: str, password: str) -> Optional[dict]:
-    """Verify credentials. Returns user dict or None."""
-    users = _load_users()
-    user = users.get(username)
+def authenticate_user(db: Session, username: str, password: str) -> Optional[User]:
+    """Verify credentials. Returns User or None."""
+    # Allow login by username or email
+    user = get_user_by_username(db, username)
     if not user:
+        user = get_user_by_email(db, username)
+    if not user or not user.is_active:
         return None
-    if not pwd_context.verify(password, user["hashed_password"]):
+    if not pwd_context.verify(password, user.hashed_password):
         return None
-    return {
-        "username": user["username"],
-        "role": user["role"],
-        "tenant_id": user.get("tenant_id", "default"),
-        "plan": user.get("plan", "100"),
-    }
+    return user
 
 
-def create_token(user: dict) -> str:
+def ensure_default_admin(db: Session):
+    """Create default admin user if no users exist."""
+    if db.query(User).count() == 0:
+        admin_pw = os.environ.get("ADMIN_PASSWORD", "genly2026")
+        create_user(
+            db,
+            username="admin",
+            password=admin_pw,
+            email=os.environ.get("ADMIN_EMAIL"),
+            role="admin",
+            tenant_id="default",
+            plan="unlimited",
+        )
+
+
+# ---------------------------------------------------------------------------
+# Password reset / email verification
+# ---------------------------------------------------------------------------
+
+def create_password_reset_token(db: Session, user: User) -> str:
+    token = secrets.token_urlsafe(48)
+    db.add(PasswordResetToken(
+        user_id=user.id,
+        token=token,
+        expires_at=datetime.now(timezone.utc) + timedelta(hours=2),
+    ))
+    db.commit()
+    return token
+
+
+def verify_password_reset_token(db: Session, token: str) -> Optional[User]:
+    record = db.query(PasswordResetToken).filter(
+        PasswordResetToken.token == token,
+        PasswordResetToken.used == False,
+        PasswordResetToken.expires_at > datetime.now(timezone.utc),
+    ).first()
+    if not record:
+        return None
+    record.used = True
+    db.commit()
+    return get_user_by_id(db, record.user_id)
+
+
+def create_email_verification_token(db: Session, user: User) -> str:
+    token = secrets.token_urlsafe(48)
+    db.add(EmailVerificationToken(
+        user_id=user.id,
+        token=token,
+        expires_at=datetime.now(timezone.utc) + timedelta(hours=48),
+    ))
+    db.commit()
+    return token
+
+
+def verify_email_token(db: Session, token: str) -> Optional[User]:
+    record = db.query(EmailVerificationToken).filter(
+        EmailVerificationToken.token == token,
+        EmailVerificationToken.used == False,
+        EmailVerificationToken.expires_at > datetime.now(timezone.utc),
+    ).first()
+    if not record:
+        return None
+    record.used = True
+    user = get_user_by_id(db, record.user_id)
+    if user:
+        user.email_verified = True
+    db.commit()
+    return user
+
+
+# ---------------------------------------------------------------------------
+# JWT
+# ---------------------------------------------------------------------------
+
+def create_token(user: User) -> str:
     """Create a JWT token for the given user."""
     payload = {
-        "sub": user["username"],
-        "role": user["role"],
-        "tenant_id": user.get("tenant_id", "default"),
-        "plan": user.get("plan", "100"),
+        "sub": str(user.id),
+        "username": user.username,
+        "role": user.role,
+        "tenant_id": user.tenant_id,
+        "plan": user.plan_id,
         "exp": time.time() + JWT_EXPIRE_MINUTES * 60,
         "iat": time.time(),
     }
@@ -137,7 +205,7 @@ def create_token(user: dict) -> str:
 
 
 def decode_token(token: str) -> dict:
-    """Decode and validate a JWT token. Returns payload or raises."""
+    """Decode and validate a JWT token."""
     try:
         payload = jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGORITHM])
         if payload.get("exp", 0) < time.time():
@@ -155,40 +223,56 @@ def decode_token(token: str) -> dict:
 
 async def get_current_user(
     credentials: HTTPAuthorizationCredentials = Depends(security),
+    db: Session = Depends(get_db),
 ) -> dict:
     """FastAPI dependency — extracts and validates the current user from Bearer token."""
     payload = decode_token(credentials.credentials)
+    # Refresh user data from DB to get latest plan etc.
+    user = get_user_by_id(db, int(payload["sub"]))
+    if not user or not user.is_active:
+        raise HTTPException(status_code=401, detail="User not found or inactive")
     return {
-        "username": payload["sub"],
-        "role": payload.get("role", "user"),
-        "tenant_id": payload.get("tenant_id", "default"),
-        "plan": payload.get("plan", "100"),
+        "id": user.id,
+        "username": user.username,
+        "email": user.email,
+        "role": user.role,
+        "tenant_id": user.tenant_id,
+        "plan": user.plan_id,
+        "stripe_customer_id": user.stripe_customer_id,
     }
 
 
-def get_current_user_from_token_param(token: str) -> dict:
+def get_current_user_from_token_param(token: str, db: Session) -> dict:
     """Validate a token passed as query parameter (for media URLs)."""
     payload = decode_token(token)
+    user = get_user_by_id(db, int(payload["sub"]))
+    if not user or not user.is_active:
+        raise HTTPException(status_code=401, detail="User not found or inactive")
     return {
-        "username": payload["sub"],
-        "role": payload.get("role", "user"),
-        "tenant_id": payload.get("tenant_id", "default"),
-        "plan": payload.get("plan", "100"),
+        "id": user.id,
+        "username": user.username,
+        "role": user.role,
+        "tenant_id": user.tenant_id,
+        "plan": user.plan_id,
     }
 
 
-def get_plan_usage(tenant_id: str, plan_id: str) -> dict:
+# ---------------------------------------------------------------------------
+# Plan usage
+# ---------------------------------------------------------------------------
+
+def get_plan_usage(db: Session, user_id: int, tenant_id: str, plan_id: str) -> dict:
     """Get current month usage vs plan limit."""
-    from jobs import get_all_jobs
-    import calendar
-    from datetime import datetime
+    from database import Job
 
-    now = datetime.now()
-    month_start = datetime(now.year, now.month, 1).timestamp()
+    now = datetime.now(timezone.utc)
+    month_start = datetime(now.year, now.month, 1, tzinfo=timezone.utc)
 
-    all_jobs = get_all_jobs(tenant_id=tenant_id)
-    monthly_done = [j for j in all_jobs if j.get("status") == "done" and j.get("created_at", 0) >= month_start]
-    used = len(monthly_done)
+    used = db.query(Job).filter(
+        Job.tenant_id == tenant_id,
+        Job.status == "done",
+        Job.created_at >= month_start,
+    ).count()
 
     plan = PLANS.get(plan_id, PLANS["100"])
     limit = plan["limit"]
@@ -203,6 +287,7 @@ def get_plan_usage(tenant_id: str, plan_id: str) -> dict:
         "overage": overage,
         "overage_cost_per_video": round(plan["price_per_video"] * plan["overage_rate"], 2),
         "overage_total": round(overage_cost, 2),
+        "monthly_price": plan["monthly_price"],
         "percent": min(100, round((used / limit) * 100)) if limit > 0 else 0,
         "alert_80": used >= limit * 0.8,
         "alert_100": used >= limit,

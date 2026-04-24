@@ -8,6 +8,11 @@ function authHeaders() {
   return token ? { Authorization: `Bearer ${token}` } : {};
 }
 
+function tokenParam() {
+  const token = localStorage.getItem("genly_token");
+  return token ? `token=${encodeURIComponent(token)}` : "";
+}
+
 function timeAgo(ts) {
   if (!ts) return "";
   const diff = Date.now() / 1000 - ts;
@@ -37,9 +42,9 @@ function ActivityItem({ job, onSelect, t }) {
     >
       {/* Thumbnail preview */}
       <div className="w-16 h-10 rounded-lg overflow-hidden shrink-0 bg-surface-3/50">
-        {job.status === "done" && (
+        {(job.status === "done" || job.status === "pending_review") && (
           <img
-            src={`${API}/preview/${job.job_id}/thumbnail`}
+            src={`${API}/preview/${job.job_id}/thumbnail?${tokenParam()}`}
             alt=""
             className="w-full h-full object-cover"
             onError={(e) => { e.target.style.display = "none"; }}
@@ -50,7 +55,7 @@ function ActivityItem({ job, onSelect, t }) {
             <div className="w-4 h-4 border-2 border-brand border-t-transparent rounded-full animate-spin" />
           </div>
         )}
-        {job.status === "error" && (
+        {(job.status === "error" || job.status === "validation_failed") && (
           <div className="w-full h-full flex items-center justify-center">
             <svg className="w-4 h-4 text-red-400" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
               <circle cx="12" cy="12" r="10"/><path d="M15 9l-6 6M9 9l6 6"/>
@@ -63,6 +68,8 @@ function ActivityItem({ job, onSelect, t }) {
         <p className="text-sm text-white truncate">{artistAndSong}</p>
         <p className="text-[11px] text-gray-500">
           {job.status === "done" && t("dash.completed")}
+          {job.status === "pending_review" && (t("batch.pending_review") || "Pending review")}
+          {job.status === "validation_failed" && (t("batch.validation_failed") || "Validation failed")}
           {job.status === "processing" && t("dash.processing")}
           {job.status === "error" && t("dash.error")}
           {job.created_at && <span className="ml-2 text-gray-600">{timeAgo(job.created_at)}</span>}
@@ -72,7 +79,8 @@ function ActivityItem({ job, onSelect, t }) {
       {/* Status */}
       <div className={`w-2.5 h-2.5 rounded-full shrink-0 ${
         job.status === "done" ? "bg-accent" :
-        job.status === "error" ? "bg-red-400" :
+        job.status === "pending_review" ? "bg-amber-400" :
+        job.status === "error" || job.status === "validation_failed" ? "bg-red-400" :
         "bg-brand animate-pulse"
       }`} />
     </button>
@@ -82,9 +90,10 @@ function ActivityItem({ job, onSelect, t }) {
 export default function Dashboard({ history, onSelectJob, onNewBatch, onViewHistory }) {
   const { t } = useI18n();
   const done = history.filter((h) => h.status === "done").length;
-  const errors = history.filter((h) => h.status === "error").length;
+  const pendingReview = history.filter((h) => h.status === "pending_review").length;
+  const errors = history.filter((h) => h.status === "error" || h.status === "validation_failed").length;
   const processing = history.filter((h) => h.status === "processing").length;
-  const recent = history.filter((h) => h.status === "done").slice(0, 8);
+  const recent = history.filter((h) => ["done", "pending_review"].includes(h.status)).slice(0, 8);
 
   // Real usage from API
   const [usage, setUsage] = useState(null);
@@ -116,11 +125,29 @@ export default function Dashboard({ history, onSelectJob, onNewBatch, onViewHist
       </div>
 
       {/* Stats */}
-      <div className="flex gap-4 mb-8">
-        <StatCard value={done} label={t("dash.videos_generated")} accent />
-        <StatCard value={processing} label={t("dash.in_progress")} />
-        <StatCard value={errors} label={t("dash.errors")} />
-        <StatCard value={history.length} label={t("dash.total_jobs")} />
+      <div className={`grid ${pendingReview > 0 ? "grid-cols-5" : "grid-cols-4"} gap-4 mb-8`}>
+        <div className="stat-card">
+          <p className="text-3xl font-bold text-brand">{done}</p>
+          <p className="text-[11px] text-gray-500 mt-1 uppercase tracking-wider">{t("dash.videos_generated")}</p>
+        </div>
+        {pendingReview > 0 && (
+          <div className="stat-card" style={{borderColor: "rgba(245,158,11,0.15)"}}>
+            <p className="text-3xl font-bold text-amber-400">{pendingReview}</p>
+            <p className="text-[11px] text-gray-500 mt-1 uppercase tracking-wider">{t("batch.pending_review") || "Pending Review"}</p>
+          </div>
+        )}
+        <div className="stat-card">
+          <p className="text-3xl font-bold text-white">{processing}</p>
+          <p className="text-[11px] text-gray-500 mt-1 uppercase tracking-wider">{t("dash.in_progress")}</p>
+        </div>
+        <div className="stat-card">
+          <p className="text-3xl font-bold text-white">{errors}</p>
+          <p className="text-[11px] text-gray-500 mt-1 uppercase tracking-wider">{t("dash.errors")}</p>
+        </div>
+        <div className="stat-card">
+          <p className="text-3xl font-bold text-white">{history.length}</p>
+          <p className="text-[11px] text-gray-500 mt-1 uppercase tracking-wider">{t("dash.total_jobs")}</p>
+        </div>
       </div>
 
       {/* Monthly usage */}
@@ -163,7 +190,7 @@ export default function Dashboard({ history, onSelectJob, onNewBatch, onViewHist
 
       <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
         {/* Recent activity */}
-        <div className="lg:col-span-2 glass rounded-2xl p-6">
+        <div className="lg:col-span-2 glass-elevated rounded-2xl p-6">
           <div className="flex items-center justify-between mb-4">
             <h3 className="text-sm font-semibold">{t("dash.recent_activity")}</h3>
             {history.length > 8 && (
@@ -196,7 +223,7 @@ export default function Dashboard({ history, onSelectJob, onNewBatch, onViewHist
         {/* Quick actions + System */}
         <div className="space-y-6">
           {/* Quick actions */}
-          <div className="glass rounded-2xl p-6">
+          <div className="glass-elevated rounded-2xl p-6">
             <h3 className="text-sm font-semibold mb-4">{t("dash.quick_actions")}</h3>
             <div className="space-y-2">
               <button onClick={onNewBatch}
@@ -216,21 +243,37 @@ export default function Dashboard({ history, onSelectJob, onNewBatch, onViewHist
             </div>
           </div>
 
-          {/* System status */}
-          <div className="glass rounded-2xl p-6">
+          {/* Plan info */}
+          <div className="glass-elevated rounded-2xl p-6">
             <h3 className="text-sm font-semibold mb-4">{t("dash.system_status")}</h3>
-            <div className="space-y-3">
-              {[
-                { name: t("dash.transcription"), ok: true },
-                { name: t("dash.video_ai"), ok: true },
-                { name: t("dash.thematic_ai"), ok: true },
-              ].map((s) => (
-                <div key={s.name} className="flex items-center gap-2.5">
-                  <div className={`w-2 h-2 rounded-full ${s.ok ? "bg-accent" : "bg-red-400"}`} />
-                  <span className="text-xs text-gray-400">{s.name}</span>
+            {usage ? (
+              <div className="space-y-3">
+                <div className="flex items-center justify-between">
+                  <span className="text-xs text-gray-400">Plan</span>
+                  <span className="text-xs font-semibold text-brand">{usage.plan} videos/mes</span>
                 </div>
-              ))}
-            </div>
+                <div className="flex items-center justify-between">
+                  <span className="text-xs text-gray-400">{t("dash.videos_generated")}</span>
+                  <span className="text-xs font-semibold text-white">{usage.used}</span>
+                </div>
+                <div className="flex items-center justify-between">
+                  <span className="text-xs text-gray-400">{t("dash.in_progress")}</span>
+                  <span className="text-xs font-semibold text-white">{processing}</span>
+                </div>
+                <div className="pt-2 border-t border-white/[0.04]">
+                  <div className="flex items-center gap-2">
+                    <div className="w-2 h-2 rounded-full bg-accent" />
+                    <span className="text-[11px] text-gray-500">{t("nav.system_ok")}</span>
+                  </div>
+                </div>
+              </div>
+            ) : (
+              <div className="space-y-3">
+                {[1,2,3].map(i => (
+                  <div key={i} className="h-4 bg-surface-3/30 rounded animate-pulse" />
+                ))}
+              </div>
+            )}
           </div>
         </div>
       </div>

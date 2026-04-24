@@ -2,6 +2,11 @@ import { useI18n } from "../i18n";
 
 const API = "";
 
+function tokenParam() {
+  const token = localStorage.getItem("genly_token");
+  return token ? `token=${encodeURIComponent(token)}` : "";
+}
+
 function timeAgo(ts) {
   if (!ts) return "";
   const diff = Date.now() / 1000 - ts;
@@ -54,7 +59,7 @@ export default function HistoryView({ history, onSelect, onBack }) {
                 <div className="aspect-video bg-surface-3/30 relative overflow-hidden">
                   {job.status === "done" && (
                     <img
-                      src={`${API}/preview/${job.job_id}/thumbnail`}
+                      src={`${API}/preview/${job.job_id}/thumbnail?${tokenParam()}`}
                       alt=""
                       className="w-full h-full object-cover group-hover:scale-105 transition-transform duration-500"
                       onError={(e) => { e.target.style.display = "none"; }}
@@ -76,13 +81,18 @@ export default function HistoryView({ history, onSelect, onBack }) {
                   {/* Status badge */}
                   <div className={`absolute top-2 right-2 px-2 py-0.5 rounded-full text-[10px] font-medium backdrop-blur-sm
                     ${job.status === "done" ? "bg-accent/20 text-accent" :
-                      job.status === "error" ? "bg-red-500/20 text-red-400" :
+                      job.status === "pending_review" ? "bg-amber-500/20 text-amber-400" :
+                      job.status === "error" || job.status === "validation_failed" ? "bg-red-500/20 text-red-400" :
                       "bg-brand/20 text-brand"}`}>
-                    {job.status === "done" ? t("history.done") : job.status === "error" ? t("history.error") : t("history.processing")}
+                    {job.status === "done" ? t("history.done") :
+                     job.status === "pending_review" ? (t("batch.pending_review") || "Pending") :
+                     job.status === "validation_failed" ? (t("batch.validation_failed") || "Failed") :
+                     job.status === "error" ? t("history.error") :
+                     t("history.processing")}
                   </div>
 
                   {/* Play overlay */}
-                  {job.status === "done" && (
+                  {(job.status === "done" || job.status === "pending_review") && (
                     <div className="absolute inset-0 flex items-center justify-center opacity-0 group-hover:opacity-100 transition-opacity bg-black/30">
                       <div className="w-12 h-12 rounded-full bg-white/20 backdrop-blur-sm flex items-center justify-center">
                         <svg className="w-5 h-5 text-white ml-0.5" fill="currentColor" viewBox="0 0 24 24">

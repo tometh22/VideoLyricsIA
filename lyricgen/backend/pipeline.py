@@ -22,6 +22,7 @@ from moviepy.config import change_settings
 for _candidate in [
     "/opt/homebrew/bin/magick",
     "/usr/local/bin/magick",
+    "/usr/bin/magick",
     "/opt/homebrew/bin/convert",
     "/usr/local/bin/convert",
     "/usr/bin/convert",
@@ -119,13 +120,18 @@ def _cleanup_local_intermediates(job_dir: str) -> None:
 
 def run_pipeline(job_id: str, mp3_path: str, artist: str, style: str,
                  language: str = None, segments_override: list[dict] = None,
-                 delivery_profile: str = "youtube", umg_spec: dict | None = None):
+                 delivery_profile: str = "youtube", umg_spec: dict | None = None,
+                 background_path: str = None):
     """Run the full pipeline for a job. Called synchronously.
 
     delivery_profile:
-        "youtube" — only the YouTube MP4 + short + thumbnail (default, legacy).
-        "umg"     — only the UMG ProRes master (no short/thumbnail).
+        "youtube" — YouTube MP4 + short + thumbnail (default).
+        "umg"     — UMG ProRes master only (no short/thumbnail).
         "both"    — YouTube bundle + UMG master, sharing bg/font.
+
+    background_path:
+        If provided, skip AI background generation and use the human-provided
+        asset instead (UMG Guideline 10 compliance).
     """
     job_dir = os.path.join(OUTPUTS_DIR, job_id)
     os.makedirs(job_dir, exist_ok=True)
@@ -143,11 +149,32 @@ def run_pipeline(job_id: str, mp3_path: str, artist: str, style: str,
             segments = transcribe(mp3_path, language=language)
         update_job(job_id, progress=20)
 
-        # Step 1.5 — Generate AI background (Veo 3 with lyrics analysis)
+        # Step 1.5 — Background (AI-generated or human-provided)
         update_job(job_id, current_step="background", progress=22)
-        lyrics_text = " ".join(seg["text"] for seg in segments)
-        bg_image_path = _ensure_background(style, job_dir, lyrics_text=lyrics_text, artist=artist)
-        update_job(job_id, progress=35)
+        if background_path:
+            # Human-provided background — skip AI generation (UMG Guideline 10)
+            from provenance import record_ai_call
+            recorder = record_ai_call(
+                job_id=job_id,
+                step="background_human",
+                tool_name="human-provided",
+                tool_provider="user_upload",
+                prompt="User-uploaded background asset (no AI generation)",
+                input_data_types=["user_uploaded_file"],
+            )
+            recorder.finish(
+                response_summary="human_provided_background",
+                output_artifact=background_path,
+            )
+            bg_image_path = background_path
+            print(f"[BG] Using human-provided background: {background_path}")
+        else:
+            lyrics_text = " ".join(seg["text"] for seg in segments)
+            bg_image_path = _ensure_background(
+                style, job_dir,
+                lyrics_text=lyrics_text, artist=artist, job_id=job_id,
+            )
+        update_job(job_id, progress=40)
 
         files = {}
         chosen_font = None
@@ -184,25 +211,47 @@ def run_pipeline(job_id: str, mp3_path: str, artist: str, style: str,
                 style=style, font=chosen_font,
             )
             files["short_url"] = f"/download/{job_id}/short"
-            update_job(job_id, progress=88)
+            update_job(job_id, progress=85)
 
             # Step 4 — Thumbnail (uses raw background, not lyric video)
-            update_job(job_id, current_step="thumbnail", progress=92)
+            update_job(job_id, current_step="thumbnail", progress=90)
             generate_thumbnail(
                 artist, mp3_path, job_dir, bg_source=bg_source,
             )
             files["thumbnail_url"] = f"/download/{job_id}/thumbnail"
+
+        # Step 5 — Content validation (UMG Guideline 15) — only if a YouTube
+        # video was rendered (UMG-only jobs skip validation; masters go to
+        # legal review independently).
+        if wants_youtube:
+            update_job(job_id, current_step="validation", progress=94)
+            from content_validator import validate_video as _validate_video
+            video_path = os.path.join(job_dir, _DELIVERABLE_FILENAMES["video"])
+            validation = _validate_video(video_path, job_id=job_id)
+            update_job(job_id, validation_result=validation)
+
+            if not validation["passed"]:
+                update_job(
+                    job_id,
+                    status="validation_failed",
+                    error=f"Content policy violation detected: {validation['issues']}",
+                )
+                print(f"[VALIDATION] FAILED for job {job_id}: {validation['issues']}")
+                return
 
         # Post-render upload to cloud storage. No-op if R2 env not set.
         s3_keys = _upload_deliverables_to_r2(job_id, job_dir, files)
         if s3_keys:
             update_job(job_id, s3_keys=s3_keys)
 
-        # Always drop intermediate files (looped backgrounds, gradient
-        # fallbacks). Deliverables are already removed above when R2 was used.
+        # Drop intermediate files (looped backgrounds, gradient fallbacks).
+        # Deliverables are already removed above when R2 was used.
         _cleanup_local_intermediates(job_dir)
 
-        update_job(job_id, status="done", progress=100, files=files)
+        _require_review = os.environ.get("REQUIRE_REVIEW", "true").lower() == "true"
+        final_status = "pending_review" if _require_review else "done"
+
+        update_job(job_id, status=final_status, progress=100, files=files)
     except Exception as exc:
         traceback.print_exc()
         update_job(job_id, status="error", error=str(exc))
@@ -505,7 +554,7 @@ _BG_CONDITIONS = [
 _USED_PROMPTS_FILE = os.path.join(ASSETS_DIR, ".used_prompts.json")
 
 
-def _analyze_lyrics_for_background(lyrics_text: str, artist: str) -> dict:
+def _analyze_lyrics_for_background(lyrics_text: str, artist: str, job_id: str = None) -> dict:
     """Use Gemini to analyze lyrics and choose visual style + prompt.
 
     Returns dict with:
@@ -513,6 +562,7 @@ def _analyze_lyrics_for_background(lyrics_text: str, artist: str) -> dict:
       - prompt: the generation prompt for Veo 3 or Imagen 4
     """
     from google import genai
+    from provenance import record_ai_call
 
     client = _get_genai_client()
 
@@ -532,11 +582,25 @@ Genre guidance (vary the scenes!):
 NEVER include people, faces, hands, or text in the prompt."""
 
     lyrics_sample = lyrics_text[:600]
+    # Data minimization (UMG Guideline 14): optionally anonymize artist name
+    _send_artist = os.environ.get("SEND_ARTIST_TO_AI", "true").lower() == "true"
+    artist_label = artist if _send_artist else "the artist"
+    user_content = f"Artist: {artist_label}\n\nLyrics:\n{lyrics_sample}"
+    full_prompt = f"system:{system_prompt}\nuser:{user_content}"
+
+    recorder = record_ai_call(
+        job_id=job_id or "unknown",
+        step="lyrics_analysis",
+        tool_name="gemini-2.5-flash",
+        tool_provider="google_vertex",
+        prompt=full_prompt,
+        input_data_types=["artist_name", "lyrics_text_600chars"],
+    ) if job_id else None
 
     try:
         response = client.models.generate_content(
             model="gemini-2.5-flash",
-            contents=f"Artist: {artist}\n\nLyrics:\n{lyrics_sample}",
+            contents=user_content,
             config=genai.types.GenerateContentConfig(
                 system_instruction=system_prompt,
                 temperature=0.8,
@@ -559,19 +623,25 @@ NEVER include people, faces, hands, or text in the prompt."""
                     style = "video"
                 if prompt and len(prompt) > 15:
                     print(f"[BG] Gemini chose: style={style}, prompt={prompt[:80]}...")
+                    if recorder:
+                        recorder.finish(response_summary=text[:500])
                     return {"style": style, "prompt": prompt}
             except json.JSONDecodeError:
                 pass
 
         print("[BG] Failed to parse Gemini JSON, using combinatorial fallback")
+        if recorder:
+            recorder.finish(response_summary=f"parse_failed: {text[:200]}")
         return {"style": "video", "prompt": None}
 
     except Exception as e:
         print(f"[BG] Gemini analysis failed: {e}, using video fallback")
+        if recorder:
+            recorder.finish(response_summary=f"error: {str(e)[:200]}")
         return {"style": "video", "prompt": None}
 
 
-def _get_unique_prompt(lyrics_text: str = None, artist: str = "") -> dict:
+def _get_unique_prompt(lyrics_text: str = None, artist: str = "", job_id: str = None) -> dict:
     """Get a unique style+prompt combination. Returns {style, prompt}."""
     used: list[str] = []
     if os.path.exists(_USED_PROMPTS_FILE):
@@ -583,7 +653,7 @@ def _get_unique_prompt(lyrics_text: str = None, artist: str = "") -> dict:
 
     # Gemini analysis
     if lyrics_text:
-        result = _analyze_lyrics_for_background(lyrics_text, artist)
+        result = _analyze_lyrics_for_background(lyrics_text, artist, job_id=job_id)
         if result["prompt"] and result["prompt"] not in used:
             used.append(result["prompt"])
             try:
@@ -616,13 +686,14 @@ def _get_unique_prompt(lyrics_text: str = None, artist: str = "") -> dict:
 
 
 _last_veo_request = 0  # timestamp of last Veo API call
-_VEO_COOLDOWN = 20     # seconds between Veo requests to avoid rate limits
+_VEO_COOLDOWN = 5      # seconds between Veo requests (Veo 3.1 has 50 req/min quota)
 
 
-def _generate_veo_video(prompt: str, output_path: str) -> str:
+def _generate_veo_video(prompt: str, output_path: str, job_id: str = None) -> str:
     """Generate a video clip with Google Veo 3. Rate-limit aware."""
     from google import genai
     from google.genai.errors import ClientError
+    from provenance import record_ai_call
     import time as _time
     import requests as _req
     global _last_veo_request
@@ -638,12 +709,21 @@ def _generate_veo_video(prompt: str, output_path: str) -> str:
 
     safe_prompt = f"{prompt}. Photorealistic, filmed with cinema camera, real footage. No text, no words, no letters, no people, no faces, no hands, no CGI, no animation."
 
+    recorder = record_ai_call(
+        job_id=job_id or "unknown",
+        step="video_bg",
+        tool_name="veo-3.1-generate-001",
+        tool_provider="google_vertex",
+        prompt=safe_prompt,
+        input_data_types=["generated_prompt"],
+    ) if job_id else None
+
     # Patient retries for batch processing — wait and retry up to 5 times
     for attempt in range(5):
         try:
             print(f"[BG] Veo 3: generating video (attempt {attempt + 1}/5)...")
             operation = client.models.generate_videos(
-                model="veo-3.0-generate-001",
+                model="veo-3.1-generate-001",
                 prompt=safe_prompt,
                 config=genai.types.GenerateVideosConfig(
                     aspect_ratio="16:9",
@@ -658,8 +738,12 @@ def _generate_veo_video(prompt: str, output_path: str) -> str:
                 print(f"[BG] Rate limited, waiting {wait}s before retry...")
                 _time.sleep(wait)
             else:
+                if recorder:
+                    recorder.finish(response_summary=f"error: {str(e)[:200]}")
                 raise
     else:
+        if recorder:
+            recorder.finish(response_summary="error: rate_limit_exceeded_after_5_retries")
         raise RuntimeError("Veo 3 rate limit exceeded after 5 retries (~15 min wait)")
 
     _last_veo_request = _time.time()
@@ -686,19 +770,35 @@ def _generate_veo_video(prompt: str, output_path: str) -> str:
     with open(output_path, "wb") as f:
         f.write(resp.content)
 
-    print(f"[BG] Veo 3 video saved: {os.path.getsize(output_path)/1024/1024:.1f} MB")
+    size_mb = os.path.getsize(output_path) / 1024 / 1024
+    print(f"[BG] Veo 3 video saved: {size_mb:.1f} MB")
+    if recorder:
+        recorder.finish(
+            response_summary=f"video_generated: {size_mb:.1f}MB",
+            output_artifact=output_path,
+        )
     return output_path
 
 
-def _generate_imagen_image(prompt: str, output_path: str, max_retries: int = 5) -> str:
+def _generate_imagen_image(prompt: str, output_path: str, max_retries: int = 5, job_id: str = None) -> str:
     """Generate an image with Google Imagen 4. Auto-retries on rate limit."""
     from google import genai
     from google.genai.errors import ClientError
+    from provenance import record_ai_call
     import time as _time
 
     client = _get_genai_client()
 
     safe_prompt = f"{prompt}. No text, no words, no letters, no people, no faces, no hands."
+
+    recorder = record_ai_call(
+        job_id=job_id or "unknown",
+        step="image_bg",
+        tool_name="imagen-4.0-generate-001",
+        tool_provider="google_vertex",
+        prompt=safe_prompt,
+        input_data_types=["generated_prompt"],
+    ) if job_id else None
 
     for attempt in range(max_retries):
         try:
@@ -718,8 +818,12 @@ def _generate_imagen_image(prompt: str, output_path: str, max_retries: int = 5) 
                 print(f"[BG] Rate limited, waiting {wait}s before retry...")
                 _time.sleep(wait)
             else:
+                if recorder:
+                    recorder.finish(response_summary=f"error: {str(e)[:200]}")
                 raise
     else:
+        if recorder:
+            recorder.finish(response_summary="error: rate_limit_exceeded")
         raise RuntimeError("Imagen 4 rate limit exceeded after all retries")
 
     image = response.generated_images[0]
@@ -728,11 +832,17 @@ def _generate_imagen_image(prompt: str, output_path: str, max_retries: int = 5) 
     with open(output_path, "wb") as f:
         f.write(img_bytes)
 
-    print(f"[BG] Imagen 4 saved: {os.path.getsize(output_path)/1024:.0f} KB")
+    size_kb = os.path.getsize(output_path) / 1024
+    print(f"[BG] Imagen 4 saved: {size_kb:.0f} KB")
+    if recorder:
+        recorder.finish(
+            response_summary=f"image_generated: {size_kb:.0f}KB",
+            output_artifact=output_path,
+        )
     return output_path
 
 
-def _ensure_background(style_hint: str, job_dir: str, lyrics_text: str = None, artist: str = "") -> str:
+def _ensure_background(style_hint: str, job_dir: str, lyrics_text: str = None, artist: str = "", job_id: str = None) -> str:
     """Generate background using AI. Gemini picks the best style for the song.
 
     Returns path to .mp4 (video style) or .jpg/.png (photo/illustration style).
@@ -746,14 +856,14 @@ def _ensure_background(style_hint: str, job_dir: str, lyrics_text: str = None, a
         return None
 
     # Generate video background with Veo 3 (always video, no images)
-    result = _get_unique_prompt(lyrics_text, artist)
+    result = _get_unique_prompt(lyrics_text, artist, job_id=job_id)
     prompt = result["prompt"]
 
     bg_path = os.path.join(job_dir, "bg_generated.mp4")
     import time as _time_bg
     for attempt in range(3):
         try:
-            _generate_veo_video(prompt, bg_path)
+            _generate_veo_video(prompt, bg_path, job_id=job_id)
             return bg_path
         except Exception as e:
             print(f"[BG] Veo 3 attempt {attempt + 1}/3 failed: {e}")

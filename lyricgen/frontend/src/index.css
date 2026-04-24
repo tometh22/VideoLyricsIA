@@ -1,8 +1,8 @@
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&display=swap');
+
 @tailwind base;
 @tailwind components;
 @tailwind utilities;
-
-@import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&display=swap');
 
 @layer base {
   html {
@@ -22,10 +22,30 @@
 @layer components {
   .glass {
     @apply bg-surface-2/60 backdrop-blur-xl border border-white/[0.06];
+    box-shadow:
+      0 1px 2px rgba(0,0,0,0.3),
+      0 4px 16px rgba(0,0,0,0.2),
+      inset 0 1px 0 rgba(255,255,255,0.03);
   }
 
   .glass-hover {
     @apply hover:bg-surface-2/80 hover:border-white/[0.1] transition-all duration-300;
+  }
+  .glass-hover:hover {
+    box-shadow:
+      0 2px 4px rgba(0,0,0,0.4),
+      0 8px 32px rgba(0,0,0,0.3),
+      0 0 20px rgba(124,92,252,0.05),
+      inset 0 1px 0 rgba(255,255,255,0.05);
+  }
+
+  .glass-elevated {
+    @apply bg-surface-2/70 backdrop-blur-xl border border-white/[0.08];
+    box-shadow:
+      0 2px 4px rgba(0,0,0,0.4),
+      0 8px 32px rgba(0,0,0,0.3),
+      0 0 0 1px rgba(255,255,255,0.02),
+      inset 0 1px 0 rgba(255,255,255,0.05);
   }
 
   .btn-primary {
@@ -34,6 +54,17 @@
       hover:shadow-glow active:scale-[0.98]
       disabled:opacity-30 disabled:cursor-not-allowed disabled:hover:shadow-none
       transition-all duration-300;
+    box-shadow:
+      0 2px 8px rgba(124,92,252,0.3),
+      0 8px 24px rgba(124,92,252,0.15),
+      inset 0 1px 0 rgba(255,255,255,0.15);
+  }
+  .btn-primary:hover:not(:disabled) {
+    box-shadow:
+      0 4px 16px rgba(124,92,252,0.4),
+      0 12px 40px rgba(124,92,252,0.2),
+      inset 0 1px 0 rgba(255,255,255,0.2);
+    transform: translateY(-1px);
   }
 
   .btn-secondary {
@@ -47,6 +78,32 @@
       focus:border-brand/50 focus:ring-2 focus:ring-brand/20 focus:outline-none
       text-white placeholder-gray-500
       transition-all duration-300;
+    box-shadow: inset 0 2px 4px rgba(0,0,0,0.2);
+  }
+  .input-field:focus {
+    box-shadow:
+      inset 0 2px 4px rgba(0,0,0,0.2),
+      0 0 0 3px rgba(124,92,252,0.1);
+  }
+
+  /* Stat cards with subtle gradient */
+  .stat-card {
+    @apply glass rounded-2xl p-5 text-center relative overflow-hidden;
+  }
+  .stat-card::before {
+    content: '';
+    position: absolute;
+    top: 0;
+    left: 0;
+    right: 0;
+    height: 1px;
+    background: linear-gradient(90deg, transparent, rgba(255,255,255,0.08), transparent);
+  }
+
+  /* Section divider */
+  .divider {
+    height: 1px;
+    background: linear-gradient(90deg, transparent, rgba(255,255,255,0.06), transparent);
   }
 }
 

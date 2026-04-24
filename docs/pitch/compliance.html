@@ -1,0 +1,619 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>GenLy AI — AI Tools Compliance & Transparency Report</title>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800;900&display=swap" rel="stylesheet">
+<style>
+* { margin:0; padding:0; box-sizing:border-box; }
+:root {
+  --bg: #09090f;
+  --bg1: #111118;
+  --bg2: #1a1a24;
+  --brand: #7c5cfc;
+  --brand-light: #a78bfa;
+  --accent: #00d4aa;
+  --white: #ffffff;
+  --gray: #9ca3af;
+  --gray-dark: #4b5563;
+  --amber: #f59e0b;
+  --red: #ef4444;
+}
+html { scroll-behavior: smooth; scroll-snap-type: y mandatory; }
+body { font-family: 'Inter', system-ui, sans-serif; background: var(--bg); color: var(--white); overflow-x: hidden; }
+
+.slide {
+  min-height: 100vh;
+  scroll-snap-align: start;
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  align-items: center;
+  padding: 60px 80px;
+  position: relative;
+  overflow: hidden;
+}
+.slide-top { justify-content: flex-start; padding-top: 50px; }
+
+.blob {
+  position: absolute;
+  border-radius: 50%;
+  filter: blur(120px);
+  pointer-events: none;
+}
+.blob-1 { width:600px; height:600px; background:rgba(124,92,252,0.06); top:-20%; left:-10%; }
+.blob-2 { width:400px; height:400px; background:rgba(167,139,250,0.04); bottom:-15%; right:-5%; }
+.blob-3 { width:300px; height:300px; background:rgba(0,212,170,0.03); top:40%; right:10%; }
+
+h1 { font-size: 3.2rem; font-weight: 900; letter-spacing: -0.03em; line-height: 1.1; }
+h2 { font-size: 2.2rem; font-weight: 800; letter-spacing: -0.02em; line-height: 1.2; }
+h3 { font-size: 1.1rem; font-weight: 700; }
+.subtitle { color: var(--gray); font-size: 1rem; line-height: 1.6; max-width: 700px; }
+.small { font-size: 0.65rem; color: var(--gray-dark); text-transform: uppercase; letter-spacing: 0.15em; }
+
+.grad { background: linear-gradient(135deg, var(--white), var(--gray)); -webkit-background-clip: text; -webkit-text-fill-color: transparent; }
+.grad-brand { background: linear-gradient(135deg, var(--brand), var(--brand-light)); -webkit-background-clip: text; -webkit-text-fill-color: transparent; }
+.grad-accent { background: linear-gradient(135deg, var(--accent), #34d399); -webkit-background-clip: text; -webkit-text-fill-color: transparent; }
+
+.card { background: rgba(26,26,36,0.5); border: 1px solid rgba(255,255,255,0.06); border-radius: 20px; padding: 28px; }
+.card-sm { padding: 20px; border-radius: 16px; }
+
+.grid-2 { display: grid; grid-template-columns: 1fr 1fr; gap: 24px; width: 100%; max-width: 1100px; }
+.grid-3 { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 20px; width: 100%; max-width: 1100px; }
+.grid-4 { display: grid; grid-template-columns: 1fr 1fr 1fr 1fr; gap: 16px; width: 100%; max-width: 1100px; }
+
+.badge {
+  display: inline-block;
+  padding: 6px 16px;
+  border-radius: 100px;
+  font-size: 0.6rem;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.1em;
+}
+.badge-glass { background: rgba(26,26,36,0.6); border: 1px solid rgba(255,255,255,0.06); color: var(--gray); }
+.badge-accent { background: rgba(0,212,170,0.15); color: var(--accent); }
+.badge-brand { background: rgba(124,92,252,0.15); color: var(--brand-light); }
+.badge-amber { background: rgba(245,158,11,0.15); color: var(--amber); }
+
+table { width: 100%; border-collapse: collapse; max-width: 1100px; }
+th, td { padding: 10px 16px; text-align: left; font-size: 0.75rem; }
+th { color: var(--gray); font-weight: 600; font-size: 0.6rem; text-transform: uppercase; letter-spacing: 0.1em; border-bottom: 1px solid rgba(255,255,255,0.08); }
+td { border-bottom: 1px solid rgba(255,255,255,0.03); color: #d1d5db; }
+
+.stat { text-align: center; }
+.stat-value { font-size: 2rem; font-weight: 900; }
+.stat-label { font-size: 0.6rem; color: var(--gray-dark); text-transform: uppercase; letter-spacing: 0.12em; margin-top: 4px; }
+
+.icon-circle {
+  width: 40px; height: 40px; border-radius: 12px;
+  display: flex; align-items: center; justify-content: center;
+  flex-shrink: 0;
+}
+.icon-accent { background: rgba(0,212,170,0.1); color: var(--accent); }
+.icon-brand { background: rgba(124,92,252,0.1); color: var(--brand); }
+.icon-amber { background: rgba(245,158,11,0.1); color: var(--amber); }
+
+.check-row { display: flex; align-items: flex-start; gap: 14px; padding: 12px 0; border-bottom: 1px solid rgba(255,255,255,0.03); }
+.check-row:last-child { border-bottom: none; }
+.check-icon { width: 22px; height: 22px; border-radius: 50%; display: flex; align-items: center; justify-content: center; flex-shrink: 0; margin-top: 1px; }
+.check-ok { background: rgba(0,212,170,0.15); }
+.check-ok svg { color: var(--accent); }
+.check-na { background: rgba(75,85,99,0.2); }
+.check-na svg { color: var(--gray-dark); }
+
+.flow-arrow { color: var(--gray-dark); font-size: 1.2rem; display: flex; align-items: center; justify-content: center; }
+
+.mb-1 { margin-bottom: 8px; }
+.mb-2 { margin-bottom: 16px; }
+.mb-3 { margin-bottom: 24px; }
+.mb-4 { margin-bottom: 32px; }
+.mb-5 { margin-bottom: 48px; }
+.mt-2 { margin-top: 16px; }
+.mt-3 { margin-top: 24px; }
+.text-center { text-align: center; }
+.text-accent { color: var(--accent); }
+.text-brand { color: var(--brand-light); }
+.text-amber { color: var(--amber); }
+.text-gray { color: var(--gray); }
+.text-sm { font-size: 0.8rem; }
+.text-xs { font-size: 0.7rem; }
+.text-xxs { font-size: 0.6rem; }
+.fw-600 { font-weight: 600; }
+.fw-700 { font-weight: 700; }
+.w-full { width: 100%; max-width: 1100px; }
+.flex { display: flex; }
+.flex-col { flex-direction: column; }
+.items-center { align-items: center; }
+.gap-2 { gap: 16px; }
+.gap-3 { gap: 24px; }
+
+@media print {
+  body { -webkit-print-color-adjust: exact; print-color-adjust: exact; }
+}
+</style>
+</head>
+<body>
+
+<!-- SLIDE 1: Cover -->
+<div class="slide" id="s1">
+  <div class="blob blob-1"></div>
+  <div class="blob blob-2"></div>
+  <p class="small mb-3">Confidential</p>
+  <h1 class="grad mb-3" style="text-align:center">AI Tools Compliance<br>& Transparency Report</h1>
+  <p class="subtitle text-center mb-4">A comprehensive overview of GenLy AI's AI tool usage, data protection practices, copyright considerations, and content safety framework.</p>
+  <div style="display:flex; gap:12px; align-items:center;">
+    <span class="badge badge-brand">GenLy AI</span>
+    <span class="badge badge-glass">April 2026</span>
+    <span class="badge badge-glass">v1.0</span>
+  </div>
+</div>
+
+<!-- SLIDE 2: Executive Summary -->
+<div class="slide" id="s2">
+  <div class="blob blob-3"></div>
+  <p class="small mb-2">01 — Executive Summary</p>
+  <h2 class="grad mb-4">Compliance at a Glance</h2>
+  <div class="grid-3 mb-3">
+    <div class="card text-center">
+      <div class="stat-value grad-accent">100%</div>
+      <div class="stat-label">AI Calls Logged</div>
+      <p class="text-xxs text-gray mt-2">Every AI invocation recorded with tool, prompt, and data types</p>
+    </div>
+    <div class="card text-center">
+      <div class="stat-value grad-brand">0</div>
+      <div class="stat-label">Prohibited Tools</div>
+      <p class="text-xxs text-gray mt-2">No Midjourney, Sora, Dall-E, Runway, or litigated tools</p>
+    </div>
+    <div class="card text-center">
+      <div class="stat-value grad-accent">3 Layers</div>
+      <div class="stat-label">Content Safety</div>
+      <p class="text-xxs text-gray mt-2">Prompt blocking + AI validation + mandatory human review</p>
+    </div>
+  </div>
+  <div class="grid-4">
+    <div class="card card-sm text-center">
+      <p class="text-xs fw-700 text-accent">Backgrounds Only</p>
+      <p class="text-xxs text-gray mt-2">AI limited to visual backgrounds</p>
+    </div>
+    <div class="card card-sm text-center">
+      <p class="text-xs fw-700 text-brand">Enterprise API</p>
+      <p class="text-xxs text-gray mt-2">Google Vertex AI with DPA</p>
+    </div>
+    <div class="card card-sm text-center">
+      <p class="text-xs fw-700 text-accent">No Training</p>
+      <p class="text-xxs text-gray mt-2">Data never used for model training</p>
+    </div>
+    <div class="card card-sm text-center">
+      <p class="text-xs fw-700 text-brand">Full Provenance</p>
+      <p class="text-xxs text-gray mt-2">Export-ready for copyright filing</p>
+    </div>
+  </div>
+</div>
+
+<!-- SLIDE 3: AI Tools in Use -->
+<div class="slide slide-top" id="s3">
+  <div class="blob blob-1"></div>
+  <p class="small mb-2">02 — AI Tools & Providers</p>
+  <h2 class="grad mb-4">Exclusively Google Vertex AI Enterprise</h2>
+  <table class="mb-3">
+    <thead>
+      <tr><th>Tool</th><th>Provider</th><th>Purpose</th><th>Agreement</th></tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td class="fw-600">Google Veo 3.1</td>
+        <td>Vertex AI Enterprise</td>
+        <td>Background video generation</td>
+        <td><span class="badge badge-accent" style="font-size:0.55rem">Enterprise API</span></td>
+      </tr>
+      <tr>
+        <td class="fw-600">Google Imagen 4</td>
+        <td>Vertex AI Enterprise</td>
+        <td>Background image (fallback)</td>
+        <td><span class="badge badge-accent" style="font-size:0.55rem">Enterprise API</span></td>
+      </tr>
+      <tr>
+        <td class="fw-600">Gemini 2.5 Flash</td>
+        <td>Vertex AI Enterprise</td>
+        <td>Style analysis & YouTube SEO</td>
+        <td><span class="badge badge-accent" style="font-size:0.55rem">Enterprise API</span></td>
+      </tr>
+      <tr>
+        <td class="fw-600">OpenAI Whisper</td>
+        <td style="color:var(--accent)">Self-hosted (local)</td>
+        <td>Audio transcription</td>
+        <td><span class="badge badge-glass" style="font-size:0.55rem">No data leaves infra</span></td>
+      </tr>
+    </tbody>
+  </table>
+  <div class="card w-full" style="background:rgba(124,92,252,0.04); border-color:rgba(124,92,252,0.15);">
+    <p class="text-xs" style="line-height:1.7">
+      <span class="fw-700 text-brand">Key distinction:</span> All Google AI services are accessed through the <strong>Vertex AI Enterprise API</strong> — Google's enterprise cloud platform with full Terms of Service, Data Processing Amendment (DPA), and contractual data governance commitments. This is not the consumer Google AI Studio product.
+    </p>
+  </div>
+</div>
+
+<!-- SLIDE 4: Tools NOT in Use -->
+<div class="slide slide-top" id="s4">
+  <div class="blob blob-2"></div>
+  <p class="small mb-2">02 — AI Tools & Providers (continued)</p>
+  <h2 class="grad mb-3">Verified: No Prohibited Tools</h2>
+  <p class="subtitle mb-4">Full codebase audit confirms zero references to any of the following services:</p>
+  <div class="grid-3 mb-4">
+    <div class="card card-sm" style="border-color:rgba(239,68,68,0.15); background:rgba(239,68,68,0.03);">
+      <p class="text-xs fw-700" style="color:#f87171;">Midjourney</p>
+      <p class="text-xxs text-gray mt-2">Not used</p>
+    </div>
+    <div class="card card-sm" style="border-color:rgba(239,68,68,0.15); background:rgba(239,68,68,0.03);">
+      <p class="text-xs fw-700" style="color:#f87171;">OpenAI Sora / DALL-E</p>
+      <p class="text-xxs text-gray mt-2">Not used</p>
+    </div>
+    <div class="card card-sm" style="border-color:rgba(239,68,68,0.15); background:rgba(239,68,68,0.03);">
+      <p class="text-xs fw-700" style="color:#f87171;">Runway</p>
+      <p class="text-xxs text-gray mt-2">Not used</p>
+    </div>
+    <div class="card card-sm" style="border-color:rgba(239,68,68,0.15); background:rgba(239,68,68,0.03);">
+      <p class="text-xs fw-700" style="color:#f87171;">Hailuo / Minimax</p>
+      <p class="text-xxs text-gray mt-2">Not used</p>
+    </div>
+    <div class="card card-sm" style="border-color:rgba(239,68,68,0.15); background:rgba(239,68,68,0.03);">
+      <p class="text-xs fw-700" style="color:#f87171;">Stability AI</p>
+      <p class="text-xxs text-gray mt-2">Not used</p>
+    </div>
+    <div class="card card-sm" style="border-color:rgba(239,68,68,0.15); background:rgba(239,68,68,0.03);">
+      <p class="text-xs fw-700" style="color:#f87171;">Any litigated tool</p>
+      <p class="text-xxs text-gray mt-2">Not used</p>
+    </div>
+  </div>
+  <p class="small mb-2">Traditional (non-AI) tools used in production:</p>
+  <div class="grid-4">
+    <div class="card card-sm text-center"><p class="text-xs fw-600">moviepy</p><p class="text-xxs text-gray">Video compositing</p></div>
+    <div class="card card-sm text-center"><p class="text-xs fw-600">FFmpeg</p><p class="text-xxs text-gray">Encoding & format</p></div>
+    <div class="card card-sm text-center"><p class="text-xs fw-600">ImageMagick</p><p class="text-xxs text-gray">Text rendering</p></div>
+    <div class="card card-sm text-center"><p class="text-xs fw-600">Google Fonts</p><p class="text-xxs text-gray">SIL OFL licensed</p></div>
+  </div>
+</div>
+
+<!-- SLIDE 5: AI Usage Scope -->
+<div class="slide slide-top" id="s5">
+  <div class="blob blob-3"></div>
+  <p class="small mb-2">03 — AI Usage Scope</p>
+  <h2 class="grad mb-4">AI = Backgrounds Only</h2>
+  <div class="grid-2 mb-3">
+    <div class="card">
+      <div class="icon-circle icon-brand mb-2">
+        <svg width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M15 10l4.553-2.276A1 1 0 0121 8.618v6.764a1 1 0 01-1.447.894L15 14M5 18h8a2 2 0 002-2V8a2 2 0 00-2-2H5a2 2 0 00-2 2v8a2 2 0 002 2z"/></svg>
+      </div>
+      <h3 class="mb-1">AI-Generated</h3>
+      <p class="text-xs text-gray" style="line-height:1.7">Background visuals only — landscapes, abstract scenes, atmospheric effects. No people, faces, characters, or main content. Must be disclaimed for US copyright registration.</p>
+    </div>
+    <div class="card">
+      <div class="icon-circle icon-accent mb-2">
+        <svg width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><polyline points="20 6 9 17 4 12"/></svg>
+      </div>
+      <h3 class="mb-1">Human-Created</h3>
+      <p class="text-xs text-gray" style="line-height:1.7">Lyrics overlay & timing, typography selection, visual composition, audio-visual synchronization, style choices, original audio. All copyrightable.</p>
+    </div>
+  </div>
+  <div class="card w-full">
+    <p class="small mb-2">What AI does NOT do</p>
+    <div class="grid-3">
+      <p class="text-xxs text-gray">No people / faces / hands generation</p>
+      <p class="text-xxs text-gray">No lip-sync or face-swap</p>
+      <p class="text-xxs text-gray">No likeness regeneration</p>
+      <p class="text-xxs text-gray">No audio generation or modification</p>
+      <p class="text-xxs text-gray">No existing footage extension</p>
+      <p class="text-xxs text-gray">No full scene or character creation</p>
+    </div>
+  </div>
+</div>
+
+<!-- SLIDE 6: Human Background Option -->
+<div class="slide" id="s6">
+  <div class="blob blob-1"></div>
+  <p class="small mb-2">03 — AI Usage Scope (continued)</p>
+  <h2 class="grad mb-3">Human-Created Background Option</h2>
+  <p class="subtitle text-center mb-4">Users can upload their own background assets, bypassing AI generation entirely. This option enables workflows where AI modifies or composes over human-created content rather than generating from scratch.</p>
+  <div class="grid-2">
+    <div class="card text-center">
+      <div class="icon-circle icon-brand mb-2" style="margin:0 auto">
+        <svg width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></svg>
+      </div>
+      <h3 class="mb-2">Upload Custom Background</h3>
+      <p class="text-xxs text-gray">MP4, MOV, JPG, or PNG. AI background generation is completely skipped. Provenance records the asset as "human-provided".</p>
+    </div>
+    <div class="card text-center">
+      <div class="icon-circle icon-accent mb-2" style="margin:0 auto">
+        <svg width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z"/></svg>
+      </div>
+      <h3 class="mb-2">Full Copyright Retention</h3>
+      <p class="text-xxs text-gray">When using human-provided backgrounds, the entire visual composition consists of human-created elements — fully copyrightable.</p>
+    </div>
+  </div>
+</div>
+
+<!-- SLIDE 7: Copyright -->
+<div class="slide slide-top" id="s7">
+  <div class="blob blob-2"></div>
+  <p class="small mb-2">04 — Copyright Considerations</p>
+  <h2 class="grad mb-3">Element-Level Copyright Attribution</h2>
+  <table>
+    <thead>
+      <tr><th>Element</th><th>Created By</th><th>Copyright Status</th></tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>Background visuals</td>
+        <td>AI (Veo 3.1 / Imagen 4)</td>
+        <td><span class="badge badge-amber" style="font-size:0.5rem">Disclaim for USCO</span></td>
+      </tr>
+      <tr>
+        <td>Lyrics text overlay & timing</td>
+        <td>Human (reviewed + edited)</td>
+        <td><span class="badge badge-accent" style="font-size:0.5rem">Copyrightable</span></td>
+      </tr>
+      <tr>
+        <td>Typography & font selection</td>
+        <td>Human</td>
+        <td><span class="badge badge-accent" style="font-size:0.5rem">Copyrightable</span></td>
+      </tr>
+      <tr>
+        <td>Composition & layout</td>
+        <td>Human (traditional tools)</td>
+        <td><span class="badge badge-accent" style="font-size:0.5rem">Copyrightable</span></td>
+      </tr>
+      <tr>
+        <td>Audio-visual synchronization</td>
+        <td>Human</td>
+        <td><span class="badge badge-accent" style="font-size:0.5rem">Copyrightable</span></td>
+      </tr>
+      <tr>
+        <td>Audio recording</td>
+        <td>Human (pre-existing)</td>
+        <td><span class="badge badge-accent" style="font-size:0.5rem">Copyrightable</span></td>
+      </tr>
+    </tbody>
+  </table>
+  <div class="card w-full mt-3" style="background:rgba(0,212,170,0.03); border-color:rgba(0,212,170,0.12)">
+    <p class="text-xs" style="line-height:1.7"><span class="fw-700 text-accent">Provenance Export:</span> Every video includes a machine-readable provenance report listing all AI and human elements with copyright status, per the US Copyright Office guidance (Feb 2023). Ready for copyright registration filings.</p>
+  </div>
+</div>
+
+<!-- SLIDE 8: Content Safety -->
+<div class="slide" id="s8">
+  <div class="blob blob-3"></div>
+  <p class="small mb-2">05 — Content Safety</p>
+  <h2 class="grad mb-4">Three-Layer Content Protection</h2>
+  <div class="grid-3">
+    <div class="card text-center">
+      <div style="font-size:2rem; margin-bottom:12px">1</div>
+      <h3 class="mb-2 text-brand">Prompt Blocking</h3>
+      <p class="text-xxs text-gray" style="line-height:1.7">All generation prompts include explicit exclusion of people, faces, hands, text, logos, and trademarks. Enforced at code level — cannot be overridden by users.</p>
+      <div class="card card-sm mt-2" style="background:rgba(0,0,0,0.3); font-family:monospace; font-size:0.55rem; color:var(--gray); text-align:left; line-height:1.6">
+        "No people, no faces,<br>no hands, no text,<br>no words, no letters"
+      </div>
+    </div>
+    <div class="card text-center">
+      <div style="font-size:2rem; margin-bottom:12px">2</div>
+      <h3 class="mb-2 text-brand">AI Validation</h3>
+      <p class="text-xxs text-gray" style="line-height:1.7">After generation, video frames are extracted and analyzed by Gemini Vision to detect prohibited content. If violations are found, the job is automatically blocked.</p>
+      <div class="card card-sm mt-2" style="background:rgba(239,68,68,0.05); border-color:rgba(239,68,68,0.15);">
+        <p class="text-xxs" style="color:#f87171">Blocked automatically if people, faces, text, or logos detected</p>
+      </div>
+    </div>
+    <div class="card text-center">
+      <div style="font-size:2rem; margin-bottom:12px">3</div>
+      <h3 class="mb-2 text-brand">Human Review</h3>
+      <p class="text-xxs text-gray" style="line-height:1.7">Every job requires explicit human approval. Downloads and YouTube publication are blocked until a reviewer approves. Identity and timestamp logged.</p>
+      <div class="card card-sm mt-2" style="background:rgba(0,212,170,0.05); border-color:rgba(0,212,170,0.15);">
+        <p class="text-xxs text-accent">Approve / Reject with notes</p>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- SLIDE 9: Data Protection -->
+<div class="slide slide-top" id="s9">
+  <div class="blob blob-1"></div>
+  <p class="small mb-2">06 — Data Protection</p>
+  <h2 class="grad mb-3">No Training on Client Data</h2>
+  <div class="card w-full mb-3" style="background:rgba(0,212,170,0.03); border-color:rgba(0,212,170,0.12)">
+    <p class="text-xs" style="line-height:1.8"><span class="fw-700 text-accent">Google Cloud Vertex AI Enterprise</span> does not use customer data to train foundation models. Per Google Cloud's Terms of Service and Data Processing Amendment (DPA), customer data is processed in real-time and not retained beyond the API request lifecycle. GenLy AI does not opt in to any training programs and does not perform fine-tuning on any models.</p>
+  </div>
+  <p class="small mb-2">Data sent to each API — minimized by design</p>
+  <table>
+    <thead>
+      <tr><th>API</th><th>Data Sent</th><th>NOT Sent</th></tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td class="fw-600">Gemini (Lyrics)</td>
+        <td class="text-xxs">First 600 chars of lyrics, artist name*</td>
+        <td class="text-xxs">Full audio, full lyrics, user PII</td>
+      </tr>
+      <tr>
+        <td class="fw-600">Veo 3.1 (Video)</td>
+        <td class="text-xxs">Scene prompt only</td>
+        <td class="text-xxs">Audio, lyrics, artist name</td>
+      </tr>
+      <tr>
+        <td class="fw-600">Imagen 4 (Image)</td>
+        <td class="text-xxs">Scene prompt only</td>
+        <td class="text-xxs">Audio, lyrics, artist name</td>
+      </tr>
+      <tr>
+        <td class="fw-600">Gemini (YouTube)</td>
+        <td class="text-xxs">Artist, song, 300 chars lyrics</td>
+        <td class="text-xxs">Full audio, user PII</td>
+      </tr>
+      <tr>
+        <td class="fw-600">Gemini Vision</td>
+        <td class="text-xxs">Video frames (images only)</td>
+        <td class="text-xxs">Audio, lyrics, artist name</td>
+      </tr>
+    </tbody>
+  </table>
+  <p class="text-xxs text-gray mt-2">* Artist name is configurable — can be anonymized via platform settings.</p>
+  <p class="text-xxs text-gray"><strong>Audio files are never sent to any external AI service.</strong> Whisper transcription runs locally.</p>
+</div>
+
+<!-- SLIDE 10: Data Flow -->
+<div class="slide" id="s10">
+  <div class="blob blob-2"></div>
+  <p class="small mb-2">06 — Data Protection (continued)</p>
+  <h2 class="grad mb-4">Data Flow Architecture</h2>
+  <div class="w-full" style="display:flex; flex-direction:column; gap:10px; align-items:center;">
+    <div class="card card-sm" style="width:340px; text-align:center;">
+      <p class="text-xs fw-700">User MP3 Upload</p>
+      <p class="text-xxs text-gray">Audio stays on our infrastructure</p>
+    </div>
+    <div class="flow-arrow">&darr;</div>
+    <div class="card card-sm" style="width:340px; text-align:center; border-color:rgba(0,212,170,0.15)">
+      <p class="text-xs fw-700 text-accent">Whisper (LOCAL)</p>
+      <p class="text-xxs text-gray">Transcription — no data leaves</p>
+    </div>
+    <div class="flow-arrow">&darr;</div>
+    <div class="card card-sm" style="width:340px; text-align:center; border-color:rgba(124,92,252,0.15)">
+      <p class="text-xs fw-700 text-brand">Gemini (600 chars only)</p>
+      <p class="text-xxs text-gray">Lyrics analysis &rarr; scene description</p>
+    </div>
+    <div class="flow-arrow">&darr;</div>
+    <div class="card card-sm" style="width:340px; text-align:center; border-color:rgba(124,92,252,0.15)">
+      <p class="text-xs fw-700 text-brand">Veo 3.1 (prompt only)</p>
+      <p class="text-xxs text-gray">No lyrics or artist data sent</p>
+    </div>
+    <div class="flow-arrow">&darr;</div>
+    <div class="card card-sm" style="width:340px; text-align:center; border-color:rgba(0,212,170,0.15)">
+      <p class="text-xs fw-700 text-accent">moviepy + FFmpeg (LOCAL)</p>
+      <p class="text-xxs text-gray">Compositing — traditional tools, no AI</p>
+    </div>
+  </div>
+</div>
+
+<!-- SLIDE 11: Authorization -->
+<div class="slide" id="s11">
+  <div class="blob blob-3"></div>
+  <p class="small mb-2">07 — Authorization & Clearance</p>
+  <h2 class="grad mb-4">Pre-Authorization + Mandatory Review</h2>
+  <div class="grid-2">
+    <div class="card">
+      <div class="icon-circle icon-brand mb-2">
+        <svg width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M16 7a4 4 0 11-8 0 4 4 0 018 0zM12 14a7 7 0 00-7 7h14a7 7 0 00-7-7z"/></svg>
+      </div>
+      <h3 class="mb-2">User Pre-Authorization</h3>
+      <p class="text-xxs text-gray" style="line-height:1.7">All users must be explicitly authorized by a platform administrator before accessing AI generation features. Unauthorized users receive a 403 Forbidden response. Full audit trail of who authorized whom and when.</p>
+    </div>
+    <div class="card">
+      <div class="icon-circle icon-accent mb-2">
+        <svg width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z"/></svg>
+      </div>
+      <h3 class="mb-2">Mandatory Human Clearance</h3>
+      <p class="text-xxs text-gray" style="line-height:1.7">Every generated video enters "Pending Review" status. A human reviewer must examine video, short, and thumbnail before approving. Downloads and YouTube publication are blocked until explicit approval. Reviewer identity and notes logged.</p>
+    </div>
+  </div>
+  <div class="card w-full mt-3">
+    <p class="small mb-2">Workflow</p>
+    <div style="display:flex; align-items:center; justify-content:center; gap:8px; flex-wrap:wrap;">
+      <span class="badge badge-glass">Upload MP3</span>
+      <span class="text-gray">&rarr;</span>
+      <span class="badge badge-brand">AI Generation</span>
+      <span class="text-gray">&rarr;</span>
+      <span class="badge badge-amber">Content Validation</span>
+      <span class="text-gray">&rarr;</span>
+      <span class="badge badge-amber">Pending Review</span>
+      <span class="text-gray">&rarr;</span>
+      <span class="badge badge-accent">Human Approval</span>
+      <span class="text-gray">&rarr;</span>
+      <span class="badge badge-accent">Available</span>
+    </div>
+  </div>
+</div>
+
+<!-- SLIDE 12: Provenance -->
+<div class="slide slide-top" id="s12">
+  <div class="blob blob-1"></div>
+  <p class="small mb-2">08 — Provenance & Audit Trail</p>
+  <h2 class="grad mb-3">Every AI Call Recorded</h2>
+  <p class="subtitle mb-4">A dedicated provenance system logs every AI tool invocation with full detail, enabling copyright registration, regulatory compliance, and internal audit.</p>
+  <div class="grid-3 mb-3">
+    <div class="card card-sm">
+      <p class="text-xs fw-700 text-brand mb-1">Per Invocation</p>
+      <p class="text-xxs text-gray" style="line-height:1.6">Tool name & version, full prompt, prompt hash (SHA-256), response summary, input data types, output artifact path, duration, timestamp</p>
+    </div>
+    <div class="card card-sm">
+      <p class="text-xs fw-700 text-accent mb-1">UI Timeline</p>
+      <p class="text-xxs text-gray" style="line-height:1.6">Visual provenance tab in every job detail view with collapsible prompt details. Accessible to job owner and administrators.</p>
+    </div>
+    <div class="card card-sm">
+      <p class="text-xs fw-700 text-brand mb-1">Export</p>
+      <p class="text-xxs text-gray" style="line-height:1.6">Machine-readable JSON export with AI vs. human element separation, copyright disclaimers, and data protection info. Ready for filing.</p>
+    </div>
+  </div>
+  <div class="card w-full" style="background:rgba(0,0,0,0.3); font-family:monospace; font-size:0.55rem; color:var(--gray); line-height:1.8;">
+    {<br>
+    &nbsp;&nbsp;"job_id": "a1b2c3d4e5f6",<br>
+    &nbsp;&nbsp;"ai_generated_elements": [{ "element": "video_bg", "tool": "veo-3.1 (google_vertex)", "copyright_status": "disclaim for USCO" }],<br>
+    &nbsp;&nbsp;"human_created_elements": [{ "element": "text_overlay", "copyright_status": "copyrightable" }],<br>
+    &nbsp;&nbsp;"copyright_disclaimer": { "ai_elements_to_disclaim": ["video_bg", "lyrics_analysis"], ... },<br>
+    &nbsp;&nbsp;"data_protection": { "training_policy": "Vertex AI does not train on customer data", ... }<br>
+    }
+  </div>
+</div>
+
+<!-- SLIDE 13: Summary -->
+<div class="slide" id="s13">
+  <div class="blob blob-1"></div>
+  <div class="blob blob-2"></div>
+  <p class="small mb-2">09 — Summary</p>
+  <h2 class="grad mb-4">Compliance Summary</h2>
+  <div class="w-full">
+    <div class="check-row">
+      <div class="check-icon check-ok"><svg width="12" height="12" fill="none" stroke="currentColor" stroke-width="3" viewBox="0 0 24 24"><polyline points="20 6 9 17 4 12"/></svg></div>
+      <div><p class="text-xs fw-600">AI Tools</p><p class="text-xxs text-gray">Exclusively Google Vertex AI Enterprise. No prohibited or litigated tools.</p></div>
+    </div>
+    <div class="check-row">
+      <div class="check-icon check-ok"><svg width="12" height="12" fill="none" stroke="currentColor" stroke-width="3" viewBox="0 0 24 24"><polyline points="20 6 9 17 4 12"/></svg></div>
+      <div><p class="text-xs fw-600">AI Scope</p><p class="text-xxs text-gray">Background elements only. Primary content is human-created and copyrightable.</p></div>
+    </div>
+    <div class="check-row">
+      <div class="check-icon check-ok"><svg width="12" height="12" fill="none" stroke="currentColor" stroke-width="3" viewBox="0 0 24 24"><polyline points="20 6 9 17 4 12"/></svg></div>
+      <div><p class="text-xs fw-600">Copyright</p><p class="text-xxs text-gray">Full provenance export with AI/human element separation and USCO-compliant disclaimers.</p></div>
+    </div>
+    <div class="check-row">
+      <div class="check-icon check-ok"><svg width="12" height="12" fill="none" stroke="currentColor" stroke-width="3" viewBox="0 0 24 24"><polyline points="20 6 9 17 4 12"/></svg></div>
+      <div><p class="text-xs fw-600">Content Safety</p><p class="text-xxs text-gray">Triple protection: prompt blocking + automated AI validation + mandatory human review.</p></div>
+    </div>
+    <div class="check-row">
+      <div class="check-icon check-ok"><svg width="12" height="12" fill="none" stroke="currentColor" stroke-width="3" viewBox="0 0 24 24"><polyline points="20 6 9 17 4 12"/></svg></div>
+      <div><p class="text-xs fw-600">Data Protection</p><p class="text-xxs text-gray">Vertex AI Enterprise — no training on client data. Data minimization active. Audio never sent to AI.</p></div>
+    </div>
+    <div class="check-row">
+      <div class="check-icon check-ok"><svg width="12" height="12" fill="none" stroke="currentColor" stroke-width="3" viewBox="0 0 24 24"><polyline points="20 6 9 17 4 12"/></svg></div>
+      <div><p class="text-xs fw-600">Authorization & Clearance</p><p class="text-xxs text-gray">Pre-authorization required. Mandatory human approval before any content is downloadable.</p></div>
+    </div>
+    <div class="check-row">
+      <div class="check-icon check-ok"><svg width="12" height="12" fill="none" stroke="currentColor" stroke-width="3" viewBox="0 0 24 24"><polyline points="20 6 9 17 4 12"/></svg></div>
+      <div><p class="text-xs fw-600">Provenance & Audit Trail</p><p class="text-xxs text-gray">Every AI call logged with tool, prompt, data types, artifacts. Export-ready for compliance filing.</p></div>
+    </div>
+  </div>
+</div>
+
+<!-- SLIDE 14: Closing -->
+<div class="slide" id="s14">
+  <div class="blob blob-1"></div>
+  <div class="blob blob-3"></div>
+  <p class="small mb-3">Confidential</p>
+  <h1 class="grad mb-3" style="text-align:center; font-size:2.8rem">Built for Compliance.<br><span class="grad-accent">Ready for Review.</span></h1>
+  <p class="subtitle text-center mb-4">GenLy AI is designed to meet the highest standards of AI tool governance, copyright transparency, and content safety in the music industry.</p>
+  <div style="display:flex; gap:12px;">
+    <span class="badge badge-accent">Full Provenance</span>
+    <span class="badge badge-brand">Enterprise Grade</span>
+    <span class="badge badge-glass">April 2026</span>
+  </div>
+  <p class="text-xxs text-gray mt-3">Real-time compliance status available at /compliance/status and /compliance/data-policy</p>
+</div>
+
+</body>
+</html>

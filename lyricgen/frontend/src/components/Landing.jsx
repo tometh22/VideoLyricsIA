@@ -1,7 +1,7 @@
 import { useI18n } from "../i18n";
 
-export default function Landing({ onStart }) {
-  const { t } = useI18n();
+export default function Landing({ onStart, onLogin, isLoggedIn = false }) {
+  const { t, lang, setLang } = useI18n();
 
   const FEATURES = [
     {
@@ -43,10 +43,11 @@ export default function Landing({ onStart }) {
   ];
 
   const PLANS = [
-    { name: "100", videos: "100", price: "800", perVideo: "8.00", popular: false },
-    { name: "250", videos: "250", price: "1,750", perVideo: "7.00", popular: true },
-    { name: "500", videos: "500", price: "3,000", perVideo: "6.00", popular: false },
-    { name: "1,000", videos: "1,000", price: "5,000", perVideo: "5.00", popular: false },
+    { name: "Free", videos: "5", price: "0", perVideo: "0", popular: false, free: true },
+    { name: "100", videos: "100", price: "900", perVideo: "9.00", popular: false },
+    { name: "250", videos: "250", price: "2,000", perVideo: "8.00", popular: true },
+    { name: "500", videos: "500", price: "3,500", perVideo: "7.00", popular: false },
+    { name: "1,000", videos: "1,000", price: "6,000", perVideo: "6.00", popular: false },
   ];
 
   const FAQS = [
@@ -77,13 +78,37 @@ export default function Landing({ onStart }) {
             </div>
             <span className="text-lg font-bold tracking-tight">GenLy AI</span>
           </div>
-          <div className="hidden md:flex items-center gap-8">
+          <div className="hidden md:flex items-center gap-6">
             <a href="#features" className="text-xs text-gray-400 hover:text-white transition-colors">{t("landing.features")}</a>
             <a href="#pricing" className="text-xs text-gray-400 hover:text-white transition-colors">{t("landing.pricing")}</a>
             <a href="#faq" className="text-xs text-gray-400 hover:text-white transition-colors">FAQ</a>
-            <button onClick={onStart} className="btn-primary text-xs py-2 px-5">{t("nav.start")}</button>
+
+            {/* Language switcher */}
+            <div className="flex items-center gap-1 ml-2">
+              {["es", "en", "pt"].map((code) => (
+                <button
+                  key={code}
+                  onClick={() => setLang(code)}
+                  className={`text-[10px] font-bold px-2 py-1 rounded-md transition-all uppercase
+                    ${lang === code ? "text-white bg-white/10" : "text-gray-600 hover:text-gray-400"}`}
+                >
+                  {code}
+                </button>
+              ))}
+            </div>
+
+            {isLoggedIn ? (
+              <button onClick={onStart} className="btn-primary text-xs py-2 px-5">{t("nav.dashboard")}</button>
+            ) : (
+              <div className="flex items-center gap-2">
+                <button onClick={onLogin} className="text-xs text-gray-400 hover:text-white transition-colors">
+                  {t("login.title")}
+                </button>
+                <button onClick={onLogin} className="btn-primary text-xs py-2 px-5">{t("nav.start")}</button>
+              </div>
+            )}
           </div>
-          <button onClick={onStart} className="md:hidden btn-primary text-xs py-2 px-5">{t("nav.start")}</button>
+          <button onClick={isLoggedIn ? onStart : onLogin} className="md:hidden btn-primary text-xs py-2 px-5">{t("nav.start")}</button>
         </div>
       </nav>
 
@@ -156,13 +181,22 @@ export default function Landing({ onStart }) {
       {/* Integrations */}
       <section className="relative z-10 py-12 px-6 max-w-4xl mx-auto text-center">
         <p className="text-xs text-gray-600 uppercase tracking-widest mb-6">{t("landing.integrated")}</p>
-        <div className="flex justify-center items-center gap-12 opacity-40">
+        <div className="flex justify-center items-center gap-10 opacity-40">
           {/* YouTube */}
-          <svg className="h-6" viewBox="0 0 90 20" fill="white"><text x="0" y="15" fontSize="14" fontWeight="bold" fontFamily="system-ui">YouTube</text></svg>
-          {/* Google Cloud */}
-          <svg className="h-6" viewBox="0 0 110 20" fill="white"><text x="0" y="15" fontSize="14" fontWeight="bold" fontFamily="system-ui">Google Cloud</text></svg>
+          <div className="flex items-center gap-2">
+            <svg className="w-5 h-5 text-red-500" fill="currentColor" viewBox="0 0 24 24"><path d="M22.54 6.42a2.78 2.78 0 00-1.94-2C18.88 4 12 4 12 4s-6.88 0-8.6.46a2.78 2.78 0 00-1.94 2A29 29 0 001 11.75a29 29 0 00.46 5.33A2.78 2.78 0 003.4 19.13C5.12 19.56 12 19.56 12 19.56s6.88 0 8.6-.46a2.78 2.78 0 001.94-2A29 29 0 0023 11.75a29 29 0 00-.46-5.33z"/><polygon points="9.75 15.02 15.5 11.75 9.75 8.48" fill="white"/></svg>
+            <span className="text-sm font-semibold text-white">YouTube API</span>
+          </div>
+          {/* Google AI */}
+          <div className="flex items-center gap-2">
+            <svg className="w-5 h-5" viewBox="0 0 24 24" fill="none"><path d="M12 2L2 7l10 5 10-5-10-5z" fill="#4285F4"/><path d="M2 17l10 5 10-5" stroke="#34A853" strokeWidth="2"/><path d="M2 12l10 5 10-5" stroke="#FBBC05" strokeWidth="2"/></svg>
+            <span className="text-sm font-semibold text-white">Google AI</span>
+          </div>
           {/* Whisper */}
-          <svg className="h-6" viewBox="0 0 70 20" fill="white"><text x="0" y="15" fontSize="14" fontWeight="bold" fontFamily="system-ui">Whisper</text></svg>
+          <div className="flex items-center gap-2">
+            <svg className="w-5 h-5 text-gray-300" fill="none" stroke="currentColor" strokeWidth="1.5" viewBox="0 0 24 24"><path d="M12 18.5a6.5 6.5 0 006.5-6.5V6a6.5 6.5 0 10-13 0v6a6.5 6.5 0 006.5 6.5z"/><path d="M19 10v2a7 7 0 01-14 0v-2"/></svg>
+            <span className="text-sm font-semibold text-white">Whisper AI</span>
+          </div>
         </div>
       </section>
 
@@ -222,22 +256,29 @@ export default function Landing({ onStart }) {
       <section id="pricing" className="relative z-10 py-24 px-6 max-w-5xl mx-auto scroll-mt-20">
         <h2 className="text-3xl font-bold text-center mb-4">{t("landing.pricing")}</h2>
         <p className="text-gray-500 text-center mb-16 max-w-md mx-auto">{t("landing.pricing_sub")}</p>
-        <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-5">
+        <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-5 gap-4">
           {PLANS.map((plan) => (
             <div key={plan.name} className={`glass rounded-3xl p-6 text-center relative ${plan.popular ? "border-brand/30 shadow-glow" : ""}`}>
               {plan.popular && <div className="absolute -top-3 left-1/2 -translate-x-1/2 px-3 py-0.5 rounded-full bg-brand text-[10px] font-bold uppercase tracking-wider">{t("landing.popular")}</div>}
               <p className="text-sm text-gray-400 mb-1">{plan.videos} {t("landing.videos_month")}</p>
               <p className="text-3xl font-bold my-3">
-                <span className="text-lg text-gray-500">USD</span> {plan.price}
+                {plan.free ? (
+                  <span className="text-accent">Free</span>
+                ) : (
+                  <><span className="text-lg text-gray-500">USD</span> {plan.price}</>
+                )}
               </p>
-              <p className="text-xs text-gray-500 mb-5">${plan.perVideo} {t("landing.per_video")}</p>
-              <button onClick={onStart} className={`w-full py-2.5 rounded-xl text-sm font-medium transition-all ${plan.popular ? "btn-primary" : "btn-secondary"}`}>
-                {t("nav.start")}
+              <p className="text-xs text-gray-500 mb-5">
+                {plan.free ? t("landing.free_trial") || "Start for free" : `$${plan.perVideo} ${t("landing.per_video")}`}
+              </p>
+              <button onClick={onLogin || onStart} className={`w-full py-2.5 rounded-xl text-sm font-medium transition-all ${plan.popular ? "btn-primary" : plan.free ? "btn-primary !from-accent !to-accent" : "btn-secondary"}`}>
+                {plan.free ? (t("login.register_submit") || "Sign up") : t("nav.start")}
               </button>
             </div>
           ))}
         </div>
-        <p className="text-center text-xs text-gray-600 mt-8">{t("landing.yt_addon")}</p>
+        <p className="text-center text-xs text-gray-500 mt-6">{t("landing.overage")}</p>
+        <p className="text-center text-xs text-gray-600 mt-2">{t("landing.yt_addon")}</p>
       </section>
 
       {/* FAQ */}
