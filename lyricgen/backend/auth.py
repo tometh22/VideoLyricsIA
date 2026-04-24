@@ -20,9 +20,21 @@ from jose import JWTError, jwt
 from passlib.context import CryptContext
 
 # --- Configuration (loaded from environment) ---
-JWT_SECRET = os.environ.get("JWT_SECRET", "genly-default-secret-change-me")
+_DEFAULT_INSECURE_SECRET = "genly-default-secret-change-me"
+JWT_SECRET = os.environ.get("JWT_SECRET", _DEFAULT_INSECURE_SECRET)
 JWT_ALGORITHM = os.environ.get("JWT_ALGORITHM", "HS256")
 JWT_EXPIRE_MINUTES = int(os.environ.get("JWT_EXPIRE_MINUTES", "1440"))
+
+# Anyone who knows the default secret can forge admin tokens, so running with
+# it in production is unacceptable. Fail fast at import time.
+_ENV = os.environ.get("ENV", "dev").lower()
+if _ENV in ("prod", "production") and (
+    not JWT_SECRET or JWT_SECRET == _DEFAULT_INSECURE_SECRET
+):
+    raise RuntimeError(
+        "JWT_SECRET must be set to a strong value when ENV=prod. "
+        "Generate one with: openssl rand -base64 32"
+    )
 
 # --- Password hashing ---
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")

@@ -1,10 +1,37 @@
-import { useRef, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { useI18n } from "../i18n";
 
-export default function UploadZone({ files, onFiles }) {
+const UMG_FRAME_SIZES = [
+  { key: "HD",     label: "HD 1920×1080 (16:9)" },
+  { key: "UHD-4K", label: "UHD 4K 3840×2160 (16:9)" },
+  { key: "DCI-2K", label: "DCI 2K 2048×1080 (256:135)" },
+  { key: "DCI-4K", label: "DCI 4K 4096×2160 (256:135)" },
+];
+const UMG_FPS = [23.976, 24, 25, 29.97, 30, 50, 59.94, 60];
+const UMG_PROFILES = [
+  { value: 3, label: "ProRes 422 HQ (recommended)" },
+  { value: 4, label: "ProRes 4444" },
+  { value: 5, label: "ProRes 4444 XQ" },
+];
+
+export default function UploadZone({ files, onFiles, onDeliveryChange }) {
   const { t } = useI18n();
   const inputRef = useRef();
   const [dragging, setDragging] = useState(false);
+  const [deliveryProfile, setDeliveryProfile] = useState("youtube");
+  const [umgFrameSize, setUmgFrameSize] = useState("HD");
+  const [umgFps, setUmgFps] = useState(24);
+  const [umgProresProfile, setUmgProresProfile] = useState(3);
+
+  useEffect(() => {
+    if (!onDeliveryChange) return;
+    onDeliveryChange({
+      delivery_profile: deliveryProfile,
+      umg_frame_size: umgFrameSize,
+      umg_fps: umgFps,
+      umg_prores_profile: umgProresProfile,
+    });
+  }, [deliveryProfile, umgFrameSize, umgFps, umgProresProfile, onDeliveryChange]);
 
   const LANGUAGES = [
     { code: "", label: t("lang.auto") },
@@ -45,6 +72,53 @@ export default function UploadZone({ files, onFiles }) {
 
   return (
     <div>
+      {/* Delivery profile selector — applied to every file in this batch. */}
+      <div className="glass rounded-2xl px-4 py-3 mb-3">
+        <div className="flex flex-wrap gap-2 items-center">
+          <label className="text-xs text-gray-400 mr-1">Delivery:</label>
+          <select
+            value={deliveryProfile}
+            onChange={(e) => setDeliveryProfile(e.target.value)}
+            className="px-3 py-1.5 rounded-lg bg-surface-1 border border-white/[0.06] focus:border-brand/50 focus:outline-none text-sm text-white"
+          >
+            <option value="youtube">YouTube (MP4 H.264 1080p)</option>
+            <option value="umg">UMG master (ProRes .mov)</option>
+            <option value="both">Both</option>
+          </select>
+          {deliveryProfile !== "youtube" && (
+            <>
+              <select
+                value={umgFrameSize}
+                onChange={(e) => setUmgFrameSize(e.target.value)}
+                className="px-3 py-1.5 rounded-lg bg-surface-1 border border-white/[0.06] focus:border-brand/50 focus:outline-none text-sm text-white"
+              >
+                {UMG_FRAME_SIZES.map((f) => (
+                  <option key={f.key} value={f.key}>{f.label}</option>
+                ))}
+              </select>
+              <select
+                value={umgFps}
+                onChange={(e) => setUmgFps(parseFloat(e.target.value))}
+                className="px-3 py-1.5 rounded-lg bg-surface-1 border border-white/[0.06] focus:border-brand/50 focus:outline-none text-sm text-white"
+              >
+                {UMG_FPS.map((f) => (
+                  <option key={f} value={f}>{f} fps</option>
+                ))}
+              </select>
+              <select
+                value={umgProresProfile}
+                onChange={(e) => setUmgProresProfile(parseInt(e.target.value, 10))}
+                className="px-3 py-1.5 rounded-lg bg-surface-1 border border-white/[0.06] focus:border-brand/50 focus:outline-none text-sm text-white"
+              >
+                {UMG_PROFILES.map((p) => (
+                  <option key={p.value} value={p.value}>{p.label}</option>
+                ))}
+              </select>
+            </>
+          )}
+        </div>
+      </div>
+
       <div
         onDragOver={(e) => { e.preventDefault(); setDragging(true); }}
         onDragLeave={() => setDragging(false)}

@@ -3,14 +3,12 @@
 import json
 import os
 import shutil
-import threading
-
 from dotenv import load_dotenv
 load_dotenv(os.path.join(os.path.dirname(__file__), ".env"))
 
 from fastapi import FastAPI, File, Form, Query, UploadFile, HTTPException, Depends
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, RedirectResponse
 from pydantic import BaseModel
 
 from auth import (
@@ -22,20 +20,51 @@ from auth import (
     get_plan_usage,
     PLANS,
 )
+import storage
 from jobs import create_job, get_job, get_all_jobs, update_job
+from observability import init_sentry, init_logging, health_snapshot
 from pipeline import run_pipeline, transcribe
+from queue_jobs import enqueue_pipeline, queue_depth
+from render_spec import umg_catalog, validate_umg_config
+
+init_logging()
+init_sentry()
 
 OUTPUTS_DIR = os.path.join(os.path.dirname(__file__), "..", "outputs")
 
+# Rate limiter: 120 req/min per IP by default (covers /status polling at 3 s
+# intervals with plenty of headroom). The SlowAPIMiddleware applies the limit
+# to every route without touching each endpoint's signature.
+from slowapi import Limiter, _rate_limit_exceeded_handler
+from slowapi.errors import RateLimitExceeded
+from slowapi.middleware import SlowAPIMiddleware
+from slowapi.util import get_remote_address
+
+limiter = Limiter(key_func=get_remote_address, default_limits=["120/minute"])
+
 app = FastAPI(title="GenLy AI API")
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+app.add_middleware(SlowAPIMiddleware)
+
+# CORS_ORIGINS: comma-separated list, e.g. "https://app.example.com,https://admin.example.com"
+# Leave empty in dev to fall back to "*".
+_cors_env = os.environ.get("CORS_ORIGINS", "").strip()
+_allow_origins = [o.strip() for o in _cors_env.split(",") if o.strip()] or ["*"]
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=_allow_origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+@app.get("/health")
+async def health():
+    """Runtime health. No auth — used by load balancers and uptime probes."""
+    return health_snapshot()
 
 
 # ---------------------------------------------------------------------------
@@ -97,36 +126,130 @@ async def usage(current_user: dict = Depends(get_current_user)):
 # Protected endpoints
 # ---------------------------------------------------------------------------
 
+MAX_UPLOAD_MB = int(os.environ.get("MAX_UPLOAD_MB", "50"))
+_MP3_MAGIC_BYTES = (b"ID3", b"\xff\xfb", b"\xff\xf3", b"\xff\xf2")
+
+
+def _validate_mp3_upload(file, data: bytes) -> None:
+    """Validate a freshly-read MP3 payload. Raises 400 on any problem.
+
+    Bypassing the `.mp3` extension check is trivial, so we also peek at the
+    first bytes and enforce a size ceiling.
+    """
+    if not file.filename or not file.filename.lower().endswith(".mp3"):
+        raise HTTPException(status_code=400, detail="Only MP3 files are accepted.")
+    size_mb = len(data) / 1024 / 1024
+    if size_mb > MAX_UPLOAD_MB:
+        raise HTTPException(
+            status_code=413,
+            detail=f"File too large ({size_mb:.1f} MB). Max allowed: {MAX_UPLOAD_MB} MB.",
+        )
+    if not data.startswith(_MP3_MAGIC_BYTES):
+        raise HTTPException(
+            status_code=400,
+            detail="File does not look like a valid MP3 (magic bytes check failed).",
+        )
+
+
+def _enforce_plan_quota(current_user: dict) -> None:
+    """Raise 402 if the tenant reached its monthly limit without overage allowed."""
+    plan = current_user.get("plan", "100")
+    tenant_id = current_user["tenant_id"]
+    usage = get_plan_usage(tenant_id, plan)
+    if usage["remaining"] <= 0 and plan != "unlimited":
+        if not current_user.get("allow_overage", False):
+            raise HTTPException(
+                status_code=402,
+                detail=(
+                    f"Plan '{plan}' monthly limit reached "
+                    f"({usage['used']}/{usage['limit']}). "
+                    "Upgrade the plan or enable overage to continue."
+                ),
+            )
+
+
+def _parse_umg_params(
+    delivery_profile: str,
+    umg_frame_size: str,
+    umg_fps: str,
+    umg_prores_profile: str,
+) -> dict | None:
+    """Parse and validate UMG delivery params. Returns umg_spec dict or None."""
+    if delivery_profile not in ("youtube", "umg", "both"):
+        raise HTTPException(
+            status_code=400,
+            detail="delivery_profile must be one of: youtube, umg, both",
+        )
+    if delivery_profile == "youtube":
+        return None
+    if not (umg_frame_size and umg_fps and umg_prores_profile):
+        raise HTTPException(
+            status_code=400,
+            detail="umg_frame_size, umg_fps and umg_prores_profile are required "
+                   "when delivery_profile includes UMG",
+        )
+    try:
+        fps_val = float(umg_fps)
+        profile_val = int(umg_prores_profile)
+    except ValueError:
+        raise HTTPException(
+            status_code=400,
+            detail="umg_fps must be a number and umg_prores_profile an integer",
+        )
+    errors = validate_umg_config(umg_frame_size, fps_val, profile_val)
+    if errors:
+        raise HTTPException(status_code=400, detail="; ".join(errors))
+    return {
+        "frame_size": umg_frame_size,
+        "fps": fps_val,
+        "prores_profile": profile_val,
+    }
+
+
 @app.post("/upload")
 async def upload(
     file: UploadFile = File(...),
     artist: str = Form(...),
     style: str = Form("oscuro"),
     language: str = Form(""),
+    delivery_profile: str = Form("youtube"),
+    umg_frame_size: str = Form(""),
+    umg_fps: str = Form(""),
+    umg_prores_profile: str = Form(""),
     current_user: dict = Depends(get_current_user),
 ):
     """Receive an MP3 and start processing."""
-    if not file.filename.lower().endswith(".mp3"):
-        raise HTTPException(status_code=400, detail="Only MP3 files are accepted.")
+    data = await file.read()
+    _validate_mp3_upload(file, data)
+
+    _enforce_plan_quota(current_user)
+
+    umg_spec = _parse_umg_params(delivery_profile, umg_frame_size, umg_fps, umg_prores_profile)
 
     tenant_id = current_user["tenant_id"]
-    job_id = create_job(artist=artist, style=style, filename=file.filename, tenant_id=tenant_id)
+    job_id = create_job(
+        artist=artist, style=style, filename=file.filename, tenant_id=tenant_id,
+        delivery_profile=delivery_profile, umg_spec=umg_spec,
+    )
     job_dir = os.path.join(OUTPUTS_DIR, job_id)
     os.makedirs(job_dir, exist_ok=True)
 
     mp3_path = os.path.join(job_dir, file.filename)
     with open(mp3_path, "wb") as f:
-        shutil.copyfileobj(file.file, f)
+        f.write(data)
 
     lang = language.strip() if language.strip() else None
 
-    thread = threading.Thread(
-        target=run_pipeline,
-        args=(job_id, mp3_path, artist, style),
-        kwargs={"language": lang},
-        daemon=True,
+    enqueue_pipeline(
+        job_id=job_id,
+        mp3_path=mp3_path,
+        artist=artist,
+        style=style,
+        plan=current_user.get("plan", "100"),
+        language=lang,
+        delivery_profile=delivery_profile,
+        umg_spec=umg_spec,
     )
-    thread.start()
 
     return {"job_id": job_id}
 
@@ -193,32 +316,62 @@ async def generate_with_segments(
     style: str = Form("oscuro"),
     language: str = Form(""),
     segments_json: str = Form(...),
+    delivery_profile: str = Form("youtube"),
+    umg_frame_size: str = Form(""),
+    umg_fps: str = Form(""),
+    umg_prores_profile: str = Form(""),
     current_user: dict = Depends(get_current_user),
 ):
     """Generate video using user-edited segments (skips Whisper)."""
-    if not file.filename.lower().endswith(".mp3"):
-        raise HTTPException(status_code=400, detail="Only MP3 files are accepted.")
+    data = await file.read()
+    _validate_mp3_upload(file, data)
+
+    _enforce_plan_quota(current_user)
 
     segments = json.loads(segments_json)
+    umg_spec = _parse_umg_params(delivery_profile, umg_frame_size, umg_fps, umg_prores_profile)
 
     tenant_id = current_user["tenant_id"]
-    job_id = create_job(artist=artist, style=style, filename=file.filename, tenant_id=tenant_id)
+    job_id = create_job(
+        artist=artist, style=style, filename=file.filename, tenant_id=tenant_id,
+        delivery_profile=delivery_profile, umg_spec=umg_spec,
+    )
     job_dir = os.path.join(OUTPUTS_DIR, job_id)
     os.makedirs(job_dir, exist_ok=True)
 
     mp3_path = os.path.join(job_dir, file.filename)
     with open(mp3_path, "wb") as f:
-        shutil.copyfileobj(file.file, f)
+        f.write(data)
 
-    thread = threading.Thread(
-        target=run_pipeline,
-        args=(job_id, mp3_path, artist, style),
-        kwargs={"segments_override": segments},
-        daemon=True,
+    enqueue_pipeline(
+        job_id=job_id,
+        mp3_path=mp3_path,
+        artist=artist,
+        style=style,
+        plan=current_user.get("plan", "100"),
+        segments_override=segments,
+        delivery_profile=delivery_profile,
+        umg_spec=umg_spec,
     )
-    thread.start()
 
     return {"job_id": job_id}
+
+
+@app.get("/admin/queue")
+async def admin_queue(current_user: dict = Depends(get_current_user)):
+    """Return queue depth per priority. Admin only."""
+    if current_user.get("role") != "admin":
+        raise HTTPException(status_code=403, detail="Admin only")
+    return queue_depth()
+
+
+@app.get("/delivery-profiles")
+async def get_delivery_profiles(current_user: dict = Depends(get_current_user)):
+    """Return the catalog of accepted UMG specs for frontend dropdowns."""
+    return {
+        "profiles": ["youtube", "umg", "both"],
+        "umg": umg_catalog(),
+    }
 
 
 @app.get("/status/{job_id}")
@@ -260,13 +413,18 @@ FILE_MAP = {
     "video": "lyric_video.mp4",
     "short": "short.mp4",
     "thumbnail": "thumbnail.jpg",
+    "umg_master": "umg_master.mov",
 }
 
 MEDIA_TYPES = {
     "video": "video/mp4",
     "short": "video/mp4",
     "thumbnail": "image/jpeg",
+    "umg_master": "video/quicktime",
 }
+
+# File types that can't be previewed in-browser (ProRes is not browser-playable).
+NON_PREVIEWABLE = {"umg_master"}
 
 
 @app.get("/download/{job_id}/{file_type}")
@@ -281,6 +439,15 @@ async def download(job_id: str, file_type: str, token: str = Query(...)):
         raise HTTPException(status_code=404, detail="Job not found.")
     if job["status"] != "done":
         raise HTTPException(status_code=400, detail="Job is not done yet.")
+
+    # Prefer a pre-signed URL to R2 so the uvicorn worker isn't tied up
+    # streaming multi-GB ProRes masters.
+    s3_key = (job.get("s3_keys") or {}).get(file_type)
+    if s3_key and storage.is_enabled():
+        url = storage.generate_signed_url(s3_key, expiry_seconds=3600)
+        if url:
+            return RedirectResponse(url, status_code=302)
+
     file_path = os.path.join(OUTPUTS_DIR, job_id, FILE_MAP[file_type])
     if not os.path.exists(file_path):
         raise HTTPException(status_code=404, detail="File not found.")
@@ -293,16 +460,32 @@ async def preview(job_id: str, file_type: str, token: str = Query(...)):
     current_user = get_current_user_from_token_param(token)
     if file_type not in FILE_MAP:
         raise HTTPException(status_code=400, detail="Invalid file type.")
+    if file_type in NON_PREVIEWABLE:
+        raise HTTPException(
+            status_code=415,
+            detail=f"{file_type} is a delivery master and cannot be previewed in-browser. "
+                   f"Use /download/{job_id}/{file_type} instead.",
+        )
     tenant_id = current_user["tenant_id"]
     job = get_job(job_id, tenant_id=tenant_id)
     if job is None:
         raise HTTPException(status_code=404, detail="Job not found.")
     if job["status"] != "done":
         raise HTTPException(status_code=400, detail="Job is not done yet.")
+
+    # Local copy is removed after R2 upload to keep disk usage bounded. Fall
+    # back to a signed URL for the preview in that case.
     file_path = os.path.join(OUTPUTS_DIR, job_id, FILE_MAP[file_type])
-    if not os.path.exists(file_path):
-        raise HTTPException(status_code=404, detail="File not found.")
-    return FileResponse(file_path, media_type=MEDIA_TYPES[file_type])
+    if os.path.exists(file_path):
+        return FileResponse(file_path, media_type=MEDIA_TYPES[file_type])
+
+    s3_key = (job.get("s3_keys") or {}).get(file_type)
+    if s3_key and storage.is_enabled():
+        url = storage.generate_signed_url(s3_key, expiry_seconds=3600)
+        if url:
+            return RedirectResponse(url, status_code=302)
+
+    raise HTTPException(status_code=404, detail="File not found.")
 
 
 def _settings_path(tenant_id: str = "default") -> str:

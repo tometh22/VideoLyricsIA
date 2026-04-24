@@ -40,6 +40,12 @@ export default function App() {
   const [showLanding, setShowLanding] = useState(true);
   const [view, setView] = useState("dashboard");
   const [files, setFiles] = useState([]);
+  const [delivery, setDelivery] = useState({
+    delivery_profile: "youtube",
+    umg_frame_size: "HD",
+    umg_fps: 24,
+    umg_prores_profile: 3,
+  });
   const style = "oscuro";
 
   const [reviewQueue, setReviewQueue] = useState([]);
@@ -80,8 +86,12 @@ export default function App() {
   useEffect(() => { if (token) fetchHistory(); }, [token, fetchHistory]);
 
   const pollJob = useCallback((jobId) => {
+    // Poll every 3 s (instead of 1 s) and skip the tick entirely when the tab
+    // is hidden. For a user with a few tabs open and 20 active jobs this cuts
+    // the request rate by ~90%.
     return new Promise((resolve) => {
       const iv = setInterval(async () => {
+        if (typeof document !== "undefined" && document.hidden) return;
         try {
           const data = await (await authFetch(`${API}/status/${jobId}`)).json();
           setJobs((prev) => prev.map((j) =>
@@ -93,7 +103,7 @@ export default function App() {
             resolve(data.status);
           }
         } catch {}
-      }, 1000);
+      }, 3000);
       pollingRef.current = iv;
     });
   }, [fetchHistory]);
@@ -187,6 +197,12 @@ export default function App() {
       formData.append("style", style);
       if (jobList[i].language) formData.append("language", jobList[i].language);
       formData.append("segments_json", JSON.stringify(jobList[i].segments));
+      formData.append("delivery_profile", delivery.delivery_profile);
+      if (delivery.delivery_profile !== "youtube") {
+        formData.append("umg_frame_size", delivery.umg_frame_size);
+        formData.append("umg_fps", String(delivery.umg_fps));
+        formData.append("umg_prores_profile", String(delivery.umg_prores_profile));
+      }
 
       try {
         const res = await authFetch(`${API}/generate`, { method: "POST", body: formData });
@@ -211,6 +227,12 @@ export default function App() {
       formData.append("artist", jobList[i].artist);
       formData.append("style", style);
       if (jobList[i].language) formData.append("language", jobList[i].language);
+      formData.append("delivery_profile", delivery.delivery_profile);
+      if (delivery.delivery_profile !== "youtube") {
+        formData.append("umg_frame_size", delivery.umg_frame_size);
+        formData.append("umg_fps", String(delivery.umg_fps));
+        formData.append("umg_prores_profile", String(delivery.umg_prores_profile));
+      }
 
       try {
         const res = await authFetch(`${API}/upload`, { method: "POST", body: formData });
@@ -338,7 +360,7 @@ export default function App() {
               </div>
 
               <div className="space-y-5">
-                <UploadZone files={files} onFiles={setFiles} />
+                <UploadZone files={files} onFiles={setFiles} onDeliveryChange={setDelivery} />
 
                 {allHaveArtist && (
                   <div className="flex gap-3">
