@@ -3,8 +3,6 @@
 import json
 import os
 import shutil
-import threading
-
 from dotenv import load_dotenv
 load_dotenv(os.path.join(os.path.dirname(__file__), ".env"))
 
@@ -24,6 +22,7 @@ from auth import (
 )
 from jobs import create_job, get_job, get_all_jobs, update_job
 from pipeline import run_pipeline, transcribe
+from queue_jobs import enqueue_pipeline, queue_depth
 from render_spec import umg_catalog, validate_umg_config
 
 OUTPUTS_DIR = os.path.join(os.path.dirname(__file__), "..", "outputs")
@@ -187,17 +186,16 @@ async def upload(
 
     lang = language.strip() if language.strip() else None
 
-    thread = threading.Thread(
-        target=run_pipeline,
-        args=(job_id, mp3_path, artist, style),
-        kwargs={
-            "language": lang,
-            "delivery_profile": delivery_profile,
-            "umg_spec": umg_spec,
-        },
-        daemon=True,
+    enqueue_pipeline(
+        job_id=job_id,
+        mp3_path=mp3_path,
+        artist=artist,
+        style=style,
+        plan=current_user.get("plan", "100"),
+        language=lang,
+        delivery_profile=delivery_profile,
+        umg_spec=umg_spec,
     )
-    thread.start()
 
     return {"job_id": job_id}
 
@@ -291,19 +289,26 @@ async def generate_with_segments(
     with open(mp3_path, "wb") as f:
         shutil.copyfileobj(file.file, f)
 
-    thread = threading.Thread(
-        target=run_pipeline,
-        args=(job_id, mp3_path, artist, style),
-        kwargs={
-            "segments_override": segments,
-            "delivery_profile": delivery_profile,
-            "umg_spec": umg_spec,
-        },
-        daemon=True,
+    enqueue_pipeline(
+        job_id=job_id,
+        mp3_path=mp3_path,
+        artist=artist,
+        style=style,
+        plan=current_user.get("plan", "100"),
+        segments_override=segments,
+        delivery_profile=delivery_profile,
+        umg_spec=umg_spec,
     )
-    thread.start()
 
     return {"job_id": job_id}
+
+
+@app.get("/admin/queue")
+async def admin_queue(current_user: dict = Depends(get_current_user)):
+    """Return queue depth per priority. Admin only."""
+    if current_user.get("role") != "admin":
+        raise HTTPException(status_code=403, detail="Admin only")
+    return queue_depth()
 
 
 @app.get("/delivery-profiles")
