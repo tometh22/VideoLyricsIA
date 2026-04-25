@@ -375,11 +375,11 @@ def _validate_mp3_upload(file, data: bytes) -> None:
         )
 
 
-def _enforce_plan_quota(current_user: dict) -> None:
+def _enforce_plan_quota(db: Session, current_user: dict) -> None:
     """Raise 402 if the tenant reached its monthly limit without overage allowed."""
     plan = current_user.get("plan", "100")
     tenant_id = current_user["tenant_id"]
-    usage = get_plan_usage(tenant_id, plan)
+    usage = get_plan_usage(db, current_user["id"], tenant_id, plan)
     if usage["remaining"] <= 0 and plan != "unlimited":
         if not current_user.get("allow_overage", False):
             raise HTTPException(
@@ -451,7 +451,7 @@ async def upload(
     data = await file.read()
     _validate_mp3_upload(file, data)
 
-    _enforce_plan_quota(current_user)
+    _enforce_plan_quota(db, current_user)
 
     umg_spec = _parse_umg_params(delivery_profile, umg_frame_size, umg_fps, umg_prores_profile)
 
@@ -586,7 +586,7 @@ async def generate_with_segments(
     data = await file.read()
     _validate_mp3_upload(file, data)
 
-    _enforce_plan_quota(current_user)
+    _enforce_plan_quota(db, current_user)
 
     # Check AI authorization (UMG Guideline 5) — skip if using library background (no AI)
     if not background_id and current_user.get("role") != "admin":
