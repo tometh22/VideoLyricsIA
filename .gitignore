@@ -7,7 +7,6 @@ lyricgen/backend/__pycache__/
 lyricgen/outputs/
 lyricgen/frontend/node_modules/
 lyricgen/frontend/dist/
-lyricgen/frontend/package-lock.json
 lyricgen/nginx/ssl/*.pem
 lyricgen/nginx/ssl/*.key
 lyricgen/.env

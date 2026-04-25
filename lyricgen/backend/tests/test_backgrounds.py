@@ -251,7 +251,7 @@ def test_admin_revoke_user(client, admin_token, user_token):
 
 def test_unauthorized_user_blocked_from_upload(client, user_token):
     """Non-authorized user gets 403 on upload."""
-    fake_mp3 = io.BytesIO(b"\x00" * 256)
+    fake_mp3 = io.BytesIO(b"ID3" + b"\x00" * 253)
     res = client.post(
         "/upload",
         headers=auth(user_token),
@@ -272,7 +272,7 @@ def test_authorized_user_can_upload(client, admin_token, user_token):
     client.post(f"/admin/users/{user_id}/authorize-ai", headers=auth(admin_token))
 
     # Upload should pass the auth check (may fail later on pipeline, but not 403)
-    fake_mp3 = io.BytesIO(b"\x00" * 256)
+    fake_mp3 = io.BytesIO(b"ID3" + b"\x00" * 253)
     res = client.post(
         "/upload",
         headers=auth(user_token),
@@ -292,7 +292,7 @@ def test_revoked_user_blocked_again(client, admin_token, user_token):
     client.post(f"/admin/users/{user_id}/revoke-ai", headers=auth(admin_token))
 
     # Should be blocked
-    fake_mp3 = io.BytesIO(b"\x00" * 256)
+    fake_mp3 = io.BytesIO(b"ID3" + b"\x00" * 253)
     res = client.post(
         "/upload",
         headers=auth(user_token),
@@ -304,7 +304,7 @@ def test_revoked_user_blocked_again(client, admin_token, user_token):
 
 def test_admin_always_passes_ai_auth(client, admin_token):
     """Admins are always allowed regardless of ai_authorized flag."""
-    fake_mp3 = io.BytesIO(b"\x00" * 256)
+    fake_mp3 = io.BytesIO(b"ID3" + b"\x00" * 253)
     res = client.post(
         "/upload",
         headers=auth(admin_token),
@@ -317,7 +317,7 @@ def test_admin_always_passes_ai_auth(client, admin_token):
 
 def test_unauthorized_user_blocked_from_generate(client, user_token):
     """Non-authorized user gets 403 on /generate too."""
-    fake_mp3 = io.BytesIO(b"\x00" * 256)
+    fake_mp3 = io.BytesIO(b"ID3" + b"\x00" * 253)
     res = client.post(
         "/generate",
         headers=auth(user_token),
@@ -340,7 +340,7 @@ def test_library_background_bypasses_ai_auth(client, admin_token, user_token):
     bg_id = bg_res.json()["id"]
 
     # User is NOT ai_authorized, but using library background should bypass
-    fake_mp3 = io.BytesIO(b"\x00" * 256)
+    fake_mp3 = io.BytesIO(b"ID3" + b"\x00" * 253)
     res = client.post(
         "/upload",
         headers=auth(user_token),
