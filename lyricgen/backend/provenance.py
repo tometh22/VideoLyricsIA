@@ -43,6 +43,8 @@ COST_PER_CALL: dict[tuple[str, str], float] = {
     ("whisper-large-v3", "local"): 0.0,
     # Human-provided fallback — no AI cost
     ("human-provided", "user_upload"): 0.0,
+    # Library asset selected after Veo retries failed — no AI cost
+    ("library-fallback", "local"): 0.0,
 }
 
 # Fallback for tools we haven't priced yet. Conservative.

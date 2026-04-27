@@ -176,3 +176,60 @@ El endpoint `/health` avisa cuando el disco baja de 10 GB libres (status
   warning QC por H.264 en la cadena es aceptado y procesan igual.
 - **Soporte Runway** (si migramos de Veo): `support@runwayml.com`.
 - **GCP billing alert:** umbral recomendado $500/mes.
+
+---
+
+## UMG Master smoke test (run before each delivery week)
+
+The UMG ProRes render path has a real spec test fixture and a smoke test that
+verifies end-to-end ffmpeg + moviepy + ffprobe behavior. Run them before
+shipping a batch of UMG masters, especially after dependency updates.
+
+```bash
+cd lyricgen/backend
+
+# Fast unit tests (~seconds; runs in CI by default)
+./venv/bin/pytest tests/test_render_spec.py tests/test_validate_umg_master.py -v
+
+# End-to-end smoke (real ProRes render, ~20s; deselected in CI by default)
+./venv/bin/pytest -m umg_smoke -v
+```
+
+The smoke test exercises:
+- ProRes 422 HQ at 1080p / 24 fps
+- Fractional fps (23.976 → `24000/1001` rational, R1 fix)
+- Deterministic font selection for UMG profile (same `job_dir` → same font)
+- ffprobe validation chain (codec, profile, dimensions, fps, color, container)
+
+If any smoke test fails, **do not deliver to UMG until the failure is
+diagnosed**. Common causes after dep updates:
+
+1. moviepy / ffmpeg version mismatch breaking ProRes encoding flags.
+2. `_validate_umg_master` regression after adding a new field check.
+3. Missing fonts in `lyricgen/assets/fonts/` causing fallback to "Arial".
+
+## Incident response — Sentry pages or uptime alert at 2am
+
+5-line checklist before escalating:
+
+1. **Scope:** is it one tenant or all? Check `/admin/cost` with `?since_days=1`
+   — if only one tenant has spent today, the issue is likely tenant-specific.
+2. **Queue depth:** check the running pipeline count via `docker compose
+   logs worker --tail=50`. If 0 processing, restart the worker:
+   `docker compose restart worker`.
+3. **External APIs:** check Veo / Gemini / Whisper status:
+   - Vertex AI status: <https://status.cloud.google.com/>
+   - If Veo is down, the library-fallback path should kick in automatically;
+     verify by checking `/admin/provenance` for `tool_name=library-fallback`
+     records in the last hour.
+4. **Disk space:** `df -h` — if `/outputs` or the R2 cache hits >90%, run the
+   intermediate cleanup: `docker compose exec backend python -c "from
+   pipeline import _cleanup_local_intermediates; import os; [
+   _cleanup_local_intermediates(os.path.join('outputs', d)) for d in
+   os.listdir('outputs') ]"`.
+5. **Status page:** if the issue exceeds 15 minutes of impact, post to the
+   public status page (or send a single email to the named UMG contact)
+   acknowledging the issue, ETA, and current actions.
+
+If none of the above resolves: read the most recent Sentry stack trace
+end-to-end before changing any code. Don't restart-loop the worker.
