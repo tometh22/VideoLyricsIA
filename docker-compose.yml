@@ -1,0 +1,87 @@
+version: "3.9"
+
+# Usage:
+#   docker compose up -d
+#   docker compose logs -f worker
+#   docker compose down
+#
+# Set REDIS_URL, R2_*, SENTRY_DSN, JWT_SECRET etc in an .env file alongside
+# this compose file (docker compose reads it automatically).
+
+services:
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+  api:
+    build: ./lyricgen/backend
+    restart: unless-stopped
+    environment:
+      - ENV=${ENV:-prod}
+      - REDIS_URL=redis://redis:6379/0
+      - JWT_SECRET=${JWT_SECRET}
+      - JWT_EXPIRE_MINUTES=${JWT_EXPIRE_MINUTES:-1440}
+      - CORS_ORIGINS=${CORS_ORIGINS:-}
+      - SENTRY_DSN=${SENTRY_DSN:-}
+      - LOG_LEVEL=${LOG_LEVEL:-INFO}
+      - R2_ACCESS_KEY_ID=${R2_ACCESS_KEY_ID:-}
+      - R2_SECRET_ACCESS_KEY=${R2_SECRET_ACCESS_KEY:-}
+      - R2_ENDPOINT_URL=${R2_ENDPOINT_URL:-}
+      - R2_BUCKET=${R2_BUCKET:-}
+      - VERTEX_PROJECT=${VERTEX_PROJECT}
+      - VERTEX_LOCATION=${VERTEX_LOCATION:-us-central1}
+      - GOOGLE_APPLICATION_CREDENTIALS=/secrets/vertex_credentials.json
+      - GENIUS_TOKEN=${GENIUS_TOKEN:-}
+      - MAX_UPLOAD_MB=${MAX_UPLOAD_MB:-50}
+    volumes:
+      - ./secrets:/secrets:ro
+      - outputs:/app/../outputs
+    ports:
+      - "8000:8000"
+    depends_on:
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+  worker:
+    build: ./lyricgen/backend
+    restart: unless-stopped
+    command: ["python", "worker.py"]
+    deploy:
+      replicas: 3
+    environment:
+      - ENV=${ENV:-prod}
+      - REDIS_URL=redis://redis:6379/0
+      - JWT_SECRET=${JWT_SECRET}
+      - SENTRY_DSN=${SENTRY_DSN:-}
+      - LOG_LEVEL=${LOG_LEVEL:-INFO}
+      - R2_ACCESS_KEY_ID=${R2_ACCESS_KEY_ID:-}
+      - R2_SECRET_ACCESS_KEY=${R2_SECRET_ACCESS_KEY:-}
+      - R2_ENDPOINT_URL=${R2_ENDPOINT_URL:-}
+      - R2_BUCKET=${R2_BUCKET:-}
+      - VERTEX_PROJECT=${VERTEX_PROJECT}
+      - VERTEX_LOCATION=${VERTEX_LOCATION:-us-central1}
+      - GOOGLE_APPLICATION_CREDENTIALS=/secrets/vertex_credentials.json
+      - GENIUS_TOKEN=${GENIUS_TOKEN:-}
+      - WHISPER_FALLBACK_ENABLED=${WHISPER_FALLBACK_ENABLED:-1}
+    volumes:
+      - ./secrets:/secrets:ro
+      - outputs:/app/../outputs
+    depends_on:
+      redis:
+        condition: service_healthy
+
+volumes:
+  redis-data:
+  outputs:

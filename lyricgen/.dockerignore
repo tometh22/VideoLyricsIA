@@ -1,0 +1,16 @@
+**/__pycache__
+**/*.pyc
+**/.DS_Store
+**/node_modules
+**/dist
+**/venv
+**/.env
+**/outputs/*
+!outputs/.gitkeep
+*.log
+.git
+.gitignore
+nginx/ssl/*
+backend/vertex_credentials.json
+backend/youtube_token.json
+backend/youtube_oauth.json

@@ -1,0 +1,227 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8">
+<title>GenLy AI — Compliance de Herramientas IA</title>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800;900&display=swap" rel="stylesheet">
+<style>
+* { margin:0; padding:0; box-sizing:border-box; }
+:root {
+  --bg: #09090f;
+  --brand: #7c5cfc;
+  --brand-light: #a78bfa;
+  --accent: #00d4aa;
+  --white: #ffffff;
+  --gray: #9ca3af;
+  --gray-dark: #4b5563;
+}
+body { font-family: 'Inter', system-ui, sans-serif; background: var(--bg); color: var(--white); }
+
+.page {
+  width: 1280px;
+  height: 720px;
+  padding: 40px 50px;
+  position: relative;
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+}
+
+.blob {
+  position: absolute; border-radius: 50%; filter: blur(120px); pointer-events: none;
+}
+.blob-1 { width:500px; height:500px; background:rgba(124,92,252,0.05); top:-20%; left:-8%; }
+.blob-2 { width:350px; height:350px; background:rgba(0,212,170,0.03); bottom:-10%; right:-3%; }
+
+/* Header */
+.header {
+  display: flex; justify-content: space-between; align-items: flex-start; margin-bottom: 24px; position: relative; z-index: 1;
+}
+.header h1 { font-size: 1.4rem; font-weight: 800; letter-spacing: -0.02em; }
+.header-right { text-align: right; }
+.header-right p { font-size: 0.55rem; color: var(--gray-dark); text-transform: uppercase; letter-spacing: 0.12em; }
+
+.divider { height: 1px; background: rgba(255,255,255,0.06); margin-bottom: 20px; position: relative; z-index: 1; }
+
+/* Content */
+.content { flex: 1; display: grid; grid-template-columns: 1fr 1fr; gap: 16px; position: relative; z-index: 1; }
+
+.section { display: flex; flex-direction: column; gap: 6px; }
+.section-title {
+  font-size: 0.55rem; font-weight: 700; text-transform: uppercase; letter-spacing: 0.12em;
+  color: var(--brand-light); margin-bottom: 2px;
+}
+
+.item {
+  display: flex; align-items: flex-start; gap: 8px; padding: 6px 0;
+}
+.item-icon {
+  width: 16px; height: 16px; border-radius: 50%; flex-shrink: 0; margin-top: 1px;
+  display: flex; align-items: center; justify-content: center;
+}
+.icon-ok { background: rgba(0,212,170,0.15); }
+.icon-ok svg { color: var(--accent); }
+
+.item-text p { font-size: 0.68rem; color: #e5e7eb; line-height: 1.45; }
+.item-text .label { font-weight: 600; color: var(--white); }
+.item-text .detail { color: var(--gray); font-size: 0.62rem; }
+
+/* Footer */
+.footer {
+  display: flex; justify-content: space-between; align-items: center;
+  padding-top: 14px; border-top: 1px solid rgba(255,255,255,0.04);
+  position: relative; z-index: 1; margin-top: 12px;
+}
+.footer p { font-size: 0.5rem; color: var(--gray-dark); }
+.badge {
+  display: inline-block; padding: 4px 12px; border-radius: 100px;
+  font-size: 0.5rem; font-weight: 600; text-transform: uppercase; letter-spacing: 0.08em;
+}
+.badge-accent { background: rgba(0,212,170,0.12); color: var(--accent); }
+.badge-glass { background: rgba(255,255,255,0.04); border: 1px solid rgba(255,255,255,0.06); color: var(--gray); }
+
+@media print {
+  body { -webkit-print-color-adjust: exact; print-color-adjust: exact; }
+}
+</style>
+</head>
+<body>
+
+<div class="page">
+  <div class="blob blob-1"></div>
+  <div class="blob blob-2"></div>
+
+  <!-- Header -->
+  <div class="header">
+    <div>
+      <h1>GenLy AI — Compliance de Herramientas IA</h1>
+      <p style="font-size:0.65rem; color:var(--gray); margin-top:4px;">Resumen tecnico de cumplimiento para uso de herramientas de imagen y video con inteligencia artificial</p>
+    </div>
+    <div class="header-right">
+      <p>Confidencial</p>
+      <p style="margin-top:2px">Abril 2026</p>
+    </div>
+  </div>
+
+  <div class="divider"></div>
+
+  <!-- Content -->
+  <div class="content">
+
+    <!-- Left Column -->
+    <div style="display:flex; flex-direction:column; gap:14px;">
+
+      <div class="section">
+        <div class="section-title">Herramientas utilizadas</div>
+        <div class="item">
+          <div class="item-icon icon-ok"><svg width="10" height="10" fill="none" stroke="currentColor" stroke-width="3" viewBox="0 0 24 24"><polyline points="20 6 9 17 4 12"/></svg></div>
+          <div class="item-text">
+            <p><span class="label">Exclusivamente Google Vertex AI Enterprise.</span></p>
+            <p class="detail">Veo 3.1, Imagen 4 y Gemini 2.5 Flash a traves de la API enterprise de Vertex AI con acuerdo de procesamiento de datos (DPA) y compromisos contractuales de gobernanza. Whisper corre localmente — ningun audio sale de nuestra infraestructura.</p>
+          </div>
+        </div>
+        <div class="item">
+          <div class="item-icon icon-ok"><svg width="10" height="10" fill="none" stroke="currentColor" stroke-width="3" viewBox="0 0 24 24"><polyline points="20 6 9 17 4 12"/></svg></div>
+          <div class="item-text">
+            <p><span class="label">Ninguna herramienta prohibida o en litigio.</span></p>
+            <p class="detail">Verificado por auditoria de codigo: cero uso de Midjourney, Sora, Dall-E, Runway, Hailuo/Minimax, Stability AI ni ninguna herramienta de empresas en litigio con titulares de derechos.</p>
+          </div>
+        </div>
+      </div>
+
+      <div class="section">
+        <div class="section-title">Alcance del uso de IA</div>
+        <div class="item">
+          <div class="item-icon icon-ok"><svg width="10" height="10" fill="none" stroke="currentColor" stroke-width="3" viewBox="0 0 24 24"><polyline points="20 6 9 17 4 12"/></svg></div>
+          <div class="item-text">
+            <p><span class="label">IA limitada a fondos visuales.</span></p>
+            <p class="detail">La IA genera unicamente backgrounds (paisajes, escenas abstractas). El contenido principal — lyrics, tipografia, composicion, sincronizacion audiovisual — es creado por humanos con herramientas tradicionales. No se generan personas, caras, personajes ni contenido principal.</p>
+          </div>
+        </div>
+        <div class="item">
+          <div class="item-icon icon-ok"><svg width="10" height="10" fill="none" stroke="currentColor" stroke-width="3" viewBox="0 0 24 24"><polyline points="20 6 9 17 4 12"/></svg></div>
+          <div class="item-text">
+            <p><span class="label">Opcion de fondo humano disponible.</span></p>
+            <p class="detail">Los usuarios pueden subir su propio fondo (video o imagen), omitiendo la generacion IA por completo. Cuando se usa fondo propio, todos los elementos visuales son de origen humano.</p>
+          </div>
+        </div>
+      </div>
+
+      <div class="section">
+        <div class="section-title">Copyright</div>
+        <div class="item">
+          <div class="item-icon icon-ok"><svg width="10" height="10" fill="none" stroke="currentColor" stroke-width="3" viewBox="0 0 24 24"><polyline points="20 6 9 17 4 12"/></svg></div>
+          <div class="item-text">
+            <p><span class="label">Atribucion elemento por elemento con disclaimer USCO.</span></p>
+            <p class="detail">Cada video incluye un reporte exportable que separa elementos IA (deben disclaimarse en registro de copyright US) de elementos humanos (protegibles). Los elementos humanos — letras, tipografia, composicion, sincronizacion — constituyen el contenido principal del video.</p>
+          </div>
+        </div>
+      </div>
+
+    </div>
+
+    <!-- Right Column -->
+    <div style="display:flex; flex-direction:column; gap:14px;">
+
+      <div class="section">
+        <div class="section-title">Seguridad de contenido</div>
+        <div class="item">
+          <div class="item-icon icon-ok"><svg width="10" height="10" fill="none" stroke="currentColor" stroke-width="3" viewBox="0 0 24 24"><polyline points="20 6 9 17 4 12"/></svg></div>
+          <div class="item-text">
+            <p><span class="label">Triple capa de proteccion.</span></p>
+            <p class="detail">(1) Bloqueo a nivel de prompt — instrucciones explicitas de exclusion de personas, caras, texto y marcas. (2) Validacion automatizada post-generacion que analiza el output y bloquea contenido prohibido. (3) Revision humana obligatoria — ningun video esta disponible para descarga o publicacion sin aprobacion explicita de un revisor.</p>
+          </div>
+        </div>
+        <div class="item">
+          <div class="item-icon icon-ok"><svg width="10" height="10" fill="none" stroke="currentColor" stroke-width="3" viewBox="0 0 24 24"><polyline points="20 6 9 17 4 12"/></svg></div>
+          <div class="item-text">
+            <p><span class="label">Sin generacion de personas o likenesses.</span></p>
+            <p class="detail">La plataforma no genera, modifica ni extiende imagenes de personas reales. No hay capacidad de face-swap, lip-sync o regeneracion de likeness.</p>
+          </div>
+        </div>
+      </div>
+
+      <div class="section">
+        <div class="section-title">Proteccion de datos</div>
+        <div class="item">
+          <div class="item-icon icon-ok"><svg width="10" height="10" fill="none" stroke="currentColor" stroke-width="3" viewBox="0 0 24 24"><polyline points="20 6 9 17 4 12"/></svg></div>
+          <div class="item-text">
+            <p><span class="label">Sin entrenamiento con datos del cliente.</span></p>
+            <p class="detail">Vertex AI Enterprise no utiliza datos del cliente para entrenar modelos. Los datos se procesan en tiempo real y no se retienen. No se realiza fine-tuning. Se aplica minimizacion de datos: solo se envian fragmentos breves de texto, nunca archivos de audio completos.</p>
+          </div>
+        </div>
+      </div>
+
+      <div class="section">
+        <div class="section-title">Autorizacion y trazabilidad</div>
+        <div class="item">
+          <div class="item-icon icon-ok"><svg width="10" height="10" fill="none" stroke="currentColor" stroke-width="3" viewBox="0 0 24 24"><polyline points="20 6 9 17 4 12"/></svg></div>
+          <div class="item-text">
+            <p><span class="label">Pre-autorizacion obligatoria.</span></p>
+            <p class="detail">Los usuarios deben ser autorizados por un administrador antes de usar funciones de IA generativa. Usuarios no autorizados son bloqueados automaticamente.</p>
+          </div>
+        </div>
+        <div class="item">
+          <div class="item-icon icon-ok"><svg width="10" height="10" fill="none" stroke="currentColor" stroke-width="3" viewBox="0 0 24 24"><polyline points="20 6 9 17 4 12"/></svg></div>
+          <div class="item-text">
+            <p><span class="label">Provenance completo por invocacion.</span></p>
+            <p class="detail">Cada llamada a IA queda registrada con herramienta, modelo, datos enviados, resultado y timestamp. Exportable para filings de copyright y requerimientos de transparencia.</p>
+          </div>
+        </div>
+      </div>
+
+    </div>
+  </div>
+
+  <!-- Footer -->
+  <div class="footer">
+    <div style="display:flex; gap:8px; align-items:center;">
+      <span class="badge badge-accent">GenLy AI</span>
+      <span class="badge badge-glass">Abril 2026</span>
+    </div>
+    <p>Confidencial — Informacion tecnica de cumplimiento</p>
+  </div>
+</div>
+
+</body>
+</html>

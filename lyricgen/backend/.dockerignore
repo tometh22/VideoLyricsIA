@@ -1,0 +1,12 @@
+__pycache__/
+*.pyc
+*.pyo
+.env
+.env.local
+*.log
+outputs/
+vertex_credentials.json
+youtube_token.json
+youtube_oauth.json
+.pytest_cache/
+.mypy_cache/

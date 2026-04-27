@@ -1,0 +1,792 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>GenLy AI — Pitch Deck</title>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800;900&display=swap" rel="stylesheet">
+<style>
+* { margin:0; padding:0; box-sizing:border-box; }
+:root {
+  --bg: #09090f;
+  --bg1: #111118;
+  --bg2: #1a1a24;
+  --brand: #7c5cfc;
+  --brand-light: #a78bfa;
+  --accent: #00d4aa;
+  --white: #ffffff;
+  --gray: #9ca3af;
+  --gray-dark: #4b5563;
+}
+html { scroll-behavior: smooth; scroll-snap-type: y mandatory; }
+body { font-family: 'Inter', system-ui, sans-serif; background: var(--bg); color: var(--white); overflow-x: hidden; }
+
+/* Slides */
+.slide {
+  min-height: 100vh;
+  scroll-snap-align: start;
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  align-items: center;
+  padding: 60px 80px;
+  position: relative;
+  overflow: hidden;
+}
+
+/* Glass */
+.glass {
+  background: rgba(26,26,36,0.6);
+  backdrop-filter: blur(20px);
+  border: 1px solid rgba(255,255,255,0.06);
+  border-radius: 24px;
+}
+
+/* Ambient blobs */
+.blob {
+  position: absolute;
+  border-radius: 50%;
+  filter: blur(120px);
+  pointer-events: none;
+}
+.blob-1 { width:600px; height:600px; background:rgba(124,92,252,0.06); top:-20%; left:-10%; }
+.blob-2 { width:400px; height:400px; background:rgba(167,139,250,0.04); bottom:-15%; right:-5%; }
+.blob-3 { width:300px; height:300px; background:rgba(0,212,170,0.03); top:40%; right:10%; }
+
+/* Typography */
+h1 { font-size: 4rem; font-weight: 900; letter-spacing: -0.03em; line-height: 1.1; }
+h2 { font-size: 2.8rem; font-weight: 800; letter-spacing: -0.02em; line-height: 1.2; }
+h3 { font-size: 1.3rem; font-weight: 700; }
+.subtitle { color: var(--gray); font-size: 1.2rem; line-height: 1.6; max-width: 600px; }
+.small { font-size: 0.75rem; color: var(--gray-dark); text-transform: uppercase; letter-spacing: 0.15em; }
+
+/* Gradient text */
+.grad { background: linear-gradient(135deg, var(--white), var(--gray)); -webkit-background-clip: text; -webkit-text-fill-color: transparent; }
+.grad-brand { background: linear-gradient(135deg, var(--brand), var(--brand-light)); -webkit-background-clip: text; -webkit-text-fill-color: transparent; }
+.grad-accent { background: linear-gradient(135deg, var(--accent), #34d399); -webkit-background-clip: text; -webkit-text-fill-color: transparent; }
+
+/* Cards */
+.card { background: rgba(26,26,36,0.5); border: 1px solid rgba(255,255,255,0.06); border-radius: 20px; padding: 32px; }
+.card:hover { border-color: rgba(255,255,255,0.1); }
+
+/* Grid */
+.grid-2 { display: grid; grid-template-columns: 1fr 1fr; gap: 32px; width: 100%; max-width: 1000px; }
+.grid-3 { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 24px; width: 100%; max-width: 1000px; }
+.grid-4 { display: grid; grid-template-columns: 1fr 1fr 1fr 1fr; gap: 20px; width: 100%; max-width: 1000px; }
+
+/* Badge */
+.badge {
+  display: inline-block;
+  padding: 8px 20px;
+  border-radius: 100px;
+  font-size: 0.7rem;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.1em;
+}
+.badge-glass { background: rgba(26,26,36,0.6); border: 1px solid rgba(255,255,255,0.06); color: var(--gray); }
+.badge-brand { background: var(--brand); color: white; }
+.badge-accent { background: rgba(0,212,170,0.15); color: var(--accent); }
+
+/* Button */
+.btn {
+  display: inline-block;
+  padding: 16px 40px;
+  border-radius: 16px;
+  font-weight: 700;
+  font-size: 1rem;
+  background: linear-gradient(135deg, var(--brand), var(--brand-light));
+  color: white;
+  text-decoration: none;
+  box-shadow: 0 0 40px rgba(124,92,252,0.2);
+}
+
+/* Table */
+table { width: 100%; border-collapse: collapse; max-width: 900px; }
+th, td { padding: 14px 20px; text-align: left; font-size: 0.85rem; }
+th { color: var(--gray); font-weight: 600; font-size: 0.7rem; text-transform: uppercase; letter-spacing: 0.1em; border-bottom: 1px solid rgba(255,255,255,0.06); }
+td { border-bottom: 1px solid rgba(255,255,255,0.03); }
+tr.highlight td { color: var(--brand-light); font-weight: 600; }
+
+/* Stat */
+.stat { text-align: center; }
+.stat-value { font-size: 2.5rem; font-weight: 900; }
+.stat-label { font-size: 0.7rem; color: var(--gray-dark); text-transform: uppercase; letter-spacing: 0.12em; margin-top: 4px; }
+
+/* Icon circle */
+.icon-circle {
+  width: 48px; height: 48px; border-radius: 14px;
+  display: flex; align-items: center; justify-content: center;
+  background: rgba(124,92,252,0.1); color: var(--brand); flex-shrink: 0;
+}
+.icon-circle.accent { background: rgba(0,212,170,0.1); color: var(--accent); }
+
+/* Flow arrow */
+.flow { display: flex; align-items: center; gap: 24px; }
+.flow-arrow { color: var(--gray-dark); font-size: 1.5rem; }
+
+/* Step number */
+.step-num { font-size: 4rem; font-weight: 900; color: rgba(124,92,252,0.15); line-height: 1; }
+
+/* Progress bar */
+.progress-bar { height: 8px; background: var(--bg2); border-radius: 100px; overflow: hidden; }
+.progress-fill { height: 100%; border-radius: 100px; background: linear-gradient(90deg, var(--brand), var(--brand-light)); }
+
+/* Price card */
+.price-card { text-align: center; padding: 40px 24px; position: relative; }
+.price-card.popular { border-color: rgba(124,92,252,0.3); box-shadow: 0 0 60px rgba(124,92,252,0.15); }
+.price-value { font-size: 2.2rem; font-weight: 900; margin: 12px 0; }
+.price-label { font-size: 0.8rem; color: var(--gray); }
+
+/* Slide counter */
+.slide-num {
+  position: absolute;
+  bottom: 30px;
+  right: 40px;
+  font-size: 0.65rem;
+  color: var(--gray-dark);
+  letter-spacing: 0.1em;
+}
+
+/* Print / PDF styles */
+@media print {
+  html { scroll-snap-type: none; }
+  body { background: var(--bg) !important; -webkit-print-color-adjust: exact !important; print-color-adjust: exact !important; }
+  .slide {
+    page-break-after: always;
+    page-break-inside: avoid;
+    min-height: 100vh;
+    background: var(--bg) !important;
+  }
+  .slide:last-child { page-break-after: avoid; }
+  .blob { display: block !important; }
+  #nav { display: none !important; }
+  .glass { background: rgba(26,26,36,0.8) !important; -webkit-print-color-adjust: exact !important; }
+  .card { -webkit-print-color-adjust: exact !important; }
+  * { -webkit-print-color-adjust: exact !important; print-color-adjust: exact !important; }
+}
+
+/* Nav dots */
+#nav {
+  position: fixed;
+  right: 20px;
+  top: 50%;
+  transform: translateY(-50%);
+  z-index: 100;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+#nav a {
+  width: 8px; height: 8px;
+  border-radius: 50%;
+  background: rgba(255,255,255,0.15);
+  display: block;
+  transition: all 0.3s;
+}
+#nav a:hover, #nav a.active { background: var(--brand); transform: scale(1.3); }
+
+/* Checkmark list */
+.check-list { list-style: none; }
+.check-list li {
+  padding: 8px 0;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  font-size: 0.95rem;
+  color: var(--gray);
+}
+.check-list li::before {
+  content: "✓";
+  color: var(--accent);
+  font-weight: 700;
+  font-size: 0.85rem;
+  width: 24px; height: 24px;
+  display: flex; align-items: center; justify-content: center;
+  background: rgba(0,212,170,0.1);
+  border-radius: 8px;
+  flex-shrink: 0;
+}
+
+.w-full { width: 100%; max-width: 1000px; }
+.text-center { text-align: center; }
+.mb-2 { margin-bottom: 16px; }
+.mb-3 { margin-bottom: 24px; }
+.mb-4 { margin-bottom: 32px; }
+.mb-6 { margin-bottom: 48px; }
+.mt-4 { margin-top: 32px; }
+.gap-2 { gap: 16px; }
+.flex { display: flex; }
+.flex-col { flex-direction: column; }
+.items-center { align-items: center; }
+.justify-center { justify-content: center; }
+.justify-between { justify-content: space-between; }
+</style>
+</head>
+<body>
+
+<!-- Nav dots -->
+<div id="nav"></div>
+
+<!-- SLIDE 1: Cover -->
+<div class="slide" id="s1">
+  <div class="blob blob-1"></div>
+  <div class="blob blob-2"></div>
+  <div class="text-center">
+    <div style="width:80px;height:80px;border-radius:20px;background:linear-gradient(135deg,var(--brand),var(--brand-light));display:flex;align-items:center;justify-content:center;margin:0 auto 32px;box-shadow:0 0 60px rgba(124,92,252,0.3)">
+      <svg width="36" height="36" viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M9 18V5l12-2v13"/><circle cx="6" cy="18" r="3"/><circle cx="18" cy="16" r="3"/></svg>
+    </div>
+    <h1 class="mb-3"><span class="grad">De MP3 a </span><span class="grad-brand">lyric video</span><br><span class="grad">en minutos</span></h1>
+    <p class="subtitle text-center" style="margin:0 auto">Plataforma de inteligencia artificial para la generación automática de lyric videos a escala profesional.</p>
+    <div style="margin-top:48px;display:flex;flex-direction:column;align-items:center;gap:12px">
+      <span class="badge badge-glass">Propuesta exclusiva</span>
+      <span style="font-size:1.1rem;font-weight:700;color:var(--gray);letter-spacing:0.05em">Universal Music Argentina</span>
+    </div>
+  </div>
+  <div class="slide-num">01 / 15</div>
+</div>
+
+<!-- SLIDE 2: Problem -->
+<div class="slide" id="s2">
+  <div class="blob blob-1"></div>
+  <div class="w-full">
+    <p class="small mb-2">El problema de la industria</p>
+    <h2 class="mb-3"><span class="grad">La demanda de contenido visual</span><br><span class="grad">crece más rápido que la capacidad de producirlo</span></h2>
+    <div class="grid-3 mt-4">
+      <div class="card">
+        <h3 style="font-size:2.5rem;font-weight:900;color:var(--brand-light);margin-bottom:12px">100M+</h3>
+        <p style="color:var(--gray);font-size:0.9rem">canciones en catálogos globales sin lyric video en YouTube</p>
+      </div>
+      <div class="card">
+        <h3 style="font-size:2.5rem;font-weight:900;color:var(--brand-light);margin-bottom:12px">Manual</h3>
+        <p style="color:var(--gray);font-size:0.9rem">el proceso de producción sigue siendo artesanal y lento</p>
+      </div>
+      <div class="card">
+        <h3 style="font-size:2.5rem;font-weight:900;color:var(--brand-light);margin-bottom:12px">No escala</h3>
+        <p style="color:var(--gray);font-size:0.9rem">los sellos necesitan cientos de videos, el proceso no lo permite</p>
+      </div>
+    </div>
+    <p style="color:var(--gray-dark);font-size:0.85rem;margin-top:32px">Cada lanzamiento necesita video · YouTube es la plataforma #1 de música · Los catálogos crecen más rápido que los equipos</p>
+  </div>
+  <div class="slide-num">02 / 15</div>
+</div>
+
+<!-- SLIDE 3: Solution + How it works (merged) -->
+<div class="slide" id="s3">
+  <div class="blob blob-2"></div>
+  <div class="blob blob-3"></div>
+  <div class="w-full">
+    <p class="small mb-2">La solución</p>
+    <h2 class="mb-6 text-center"><span class="grad-brand">GenLy AI</span><span class="grad"> — De MP3 a video publicado en 3 pasos</span></h2>
+    <div class="grid-3" style="margin-bottom:40px">
+      <div class="card text-center" style="padding:28px 20px">
+        <div class="step-num">01</div>
+        <h3 class="mb-2">Subí los MP3</h3>
+        <p style="color:var(--gray);font-size:0.85rem">Drag & drop, uno o cien. Con artista e idioma.</p>
+      </div>
+      <div class="card text-center" style="padding:28px 20px">
+        <div class="step-num">02</div>
+        <h3 class="mb-2">Revisá las lyrics</h3>
+        <p style="color:var(--gray);font-size:0.85rem">IA transcribe con sugerencias de corrección inteligentes.</p>
+      </div>
+      <div class="card text-center" style="padding:28px 20px">
+        <div class="step-num">03</div>
+        <h3 class="mb-2">Publicá</h3>
+        <p style="color:var(--gray);font-size:0.85rem">Descargá o publicá directo en YouTube con SEO.</p>
+      </div>
+    </div>
+    <div class="flex gap-2 justify-center" style="gap:48px">
+      <div class="stat">
+        <div class="stat-value grad-brand">< 5 min</div>
+        <div class="stat-label">por canción</div>
+      </div>
+      <div class="stat">
+        <div class="stat-value grad-accent">3</div>
+        <div class="stat-label">outputs por canción</div>
+      </div>
+      <div class="stat">
+        <div class="stat-value grad">100%</div>
+        <div class="stat-label">autogestionado, 24/7</div>
+      </div>
+    </div>
+  </div>
+  <div class="slide-num">03 / 15</div>
+</div>
+
+<!-- SLIDE 4: YouTube (GRAN DIFERENCIAL) -->
+<div class="slide" id="s4">
+  <div class="blob blob-1"></div>
+  <div class="blob blob-3"></div>
+  <div class="w-full text-center">
+    <span class="badge badge-brand mb-3" style="display:inline-block;margin-bottom:24px">DIFERENCIAL CLAVE</span>
+    <h2 class="mb-3"><span class="grad">Publicación directa en </span><span style="color:#ff0000">YouTube</span></h2>
+    <p class="subtitle text-center" style="margin:0 auto 40px">El video se genera, se optimiza para SEO y se publica en el canal del cliente. Todo automático, todo con IA.</p>
+    <div class="grid-3">
+      <div class="card text-center" style="padding:28px 20px">
+        <div style="font-size:2.5rem;margin-bottom:12px;font-weight:900;color:var(--brand-light)">🎬</div>
+        <h3 style="margin-bottom:8px">Video + Metadata</h3>
+        <p style="color:var(--gray);font-size:0.8rem">Título, descripción y 15-20 tags generados por IA optimizados para SEO de YouTube</p>
+      </div>
+      <div class="card text-center" style="padding:28px 20px">
+        <div style="font-size:2.5rem;margin-bottom:12px;font-weight:900;color:var(--brand-light)">🖼️</div>
+        <h3 style="margin-bottom:8px">Thumbnail automático</h3>
+        <p style="color:var(--gray);font-size:0.8rem">Se sube como portada del video con el nombre del artista y la canción</p>
+      </div>
+      <div class="card text-center" style="padding:28px 20px">
+        <div style="font-size:2.5rem;margin-bottom:12px;font-weight:900;color:var(--brand-light)">⚙️</div>
+        <h3 style="margin-bottom:8px">Templates por sello</h3>
+        <p style="color:var(--gray);font-size:0.8rem">Cada cliente configura su formato de título, descripción, hashtags y tags obligatorios</p>
+      </div>
+    </div>
+  </div>
+  <div class="slide-num">04 / 15</div>
+</div>
+
+<!-- SLIDE 6: 3 Outputs -->
+<div class="slide" id="s5">
+  <div class="blob blob-2"></div>
+  <div class="w-full">
+    <p class="small mb-2">Outputs</p>
+    <h2 class="mb-6"><span class="grad">Un MP3, tres outputs</span></h2>
+    <div class="grid-3">
+      <div class="card text-center">
+        <div style="background:linear-gradient(135deg,rgba(124,92,252,0.2),rgba(91,63,212,0.2));border-radius:16px;aspect-ratio:16/9;display:flex;align-items:center;justify-content:center;margin-bottom:20px">
+          <span style="font-size:0.8rem;font-weight:700;color:rgba(255,255,255,0.5)">1920 × 1080</span>
+        </div>
+        <h3>Lyric Video</h3>
+        <p style="color:var(--gray);font-size:0.8rem;margin-top:8px">Full HD con lyrics sincronizadas y fondo cinematográfico</p>
+      </div>
+      <div class="card text-center">
+        <div style="background:linear-gradient(135deg,rgba(236,72,153,0.15),rgba(225,29,72,0.2));border-radius:16px;aspect-ratio:9/16;max-height:180px;display:flex;align-items:center;justify-content:center;margin:0 auto 20px">
+          <span style="font-size:0.8rem;font-weight:700;color:rgba(255,255,255,0.5)">1080 × 1920</span>
+        </div>
+        <h3>YouTube Short</h3>
+        <p style="color:var(--gray);font-size:0.8rem;margin-top:8px">Vertical 30s del chorus para Shorts, Reels y TikTok</p>
+      </div>
+      <div class="card text-center">
+        <div style="background:linear-gradient(135deg,rgba(245,158,11,0.15),rgba(234,88,12,0.2));border-radius:16px;aspect-ratio:16/9;display:flex;align-items:center;justify-content:center;margin-bottom:20px">
+          <span style="font-size:0.8rem;font-weight:700;color:rgba(255,255,255,0.5)">1280 × 720</span>
+        </div>
+        <h3>Thumbnail</h3>
+        <p style="color:var(--gray);font-size:0.8rem;margin-top:8px">Portada lista con artista y canción sobre el fondo</p>
+      </div>
+    </div>
+  </div>
+  <div class="slide-num">05 / 15</div>
+</div>
+
+<!-- SLIDE 6: AI Backgrounds -->
+<div class="slide" id="s6">
+  <div class="blob blob-3"></div>
+  <div class="w-full">
+    <p class="small mb-2">Inteligencia artificial</p>
+    <h2 class="mb-3"><span class="grad">La IA entiende la canción</span></h2>
+    <p class="subtitle mb-6">Nuestra IA analiza las lyrics, detecta el género, el mood y la temática, y genera un video cinematográfico único acorde a cada canción. Nunca se repite.</p>
+    <div class="grid-3">
+      <div class="card" style="padding:16px">
+        <div style="border-radius:12px;aspect-ratio:16/9;margin-bottom:12px;overflow:hidden;background:#111">
+          <img src="https://images.unsplash.com/photo-1514525253161-7a46d19cd819?w=400&h=225&fit=crop" style="width:100%;height:100%;object-fit:cover;opacity:0.85" alt="Rock" />
+        </div>
+        <p style="font-size:0.8rem;font-weight:600">Rock / Punk</p>
+        <p style="font-size:0.7rem;color:var(--gray-dark)">Urbano, neon, tormentas eléctricas</p>
+      </div>
+      <div class="card" style="padding:16px">
+        <div style="border-radius:12px;aspect-ratio:16/9;margin-bottom:12px;overflow:hidden;background:#111">
+          <img src="https://images.unsplash.com/photo-1507400492013-162706c8c05e?w=400&h=225&fit=crop" style="width:100%;height:100%;object-fit:cover;opacity:0.85" alt="Ballad" />
+        </div>
+        <p style="font-size:0.8rem;font-weight:600">Ballad / Romántica</p>
+        <p style="font-size:0.7rem;color:var(--gray-dark)">Sunset, océano, atardecer</p>
+      </div>
+      <div class="card" style="padding:16px">
+        <div style="border-radius:12px;aspect-ratio:16/9;margin-bottom:12px;overflow:hidden;background:#111">
+          <img src="https://images.unsplash.com/photo-1470225620780-dba8ba36b745?w=400&h=225&fit=crop" style="width:100%;height:100%;object-fit:cover;opacity:0.85" alt="Pop" />
+        </div>
+        <p style="font-size:0.8rem;font-weight:600">Pop / Dance</p>
+        <p style="font-size:0.7rem;color:var(--gray-dark)">Luces, sparkles, city nights</p>
+      </div>
+    </div>
+  </div>
+  <div class="slide-num">06 / 15</div>
+</div>
+
+<!-- SLIDE 8: Quality Control -->
+<div class="slide" id="s7">
+  <div class="blob blob-2"></div>
+  <div class="w-full">
+    <p class="small mb-2">Control de calidad</p>
+    <h2 class="mb-3"><span class="grad">Lyrics con margen de error mínimo</span></h2>
+    <p class="subtitle mb-6">Múltiples capas de validación para garantizar que las letras sean correctas antes de generar el video.</p>
+    <div class="grid-2">
+      <div>
+        <h3 style="margin-bottom:16px;font-size:0.85rem;color:var(--brand-light)">4 capas de validación:</h3>
+        <ul class="check-list">
+          <li>Capa 1: Transcripción automática con IA</li>
+          <li>Capa 2: Sugerencias de corrección cruzando 3 bases de datos de lyrics</li>
+          <li>Capa 3: Corrección con un click o "Aplicar todas"</li>
+          <li>Capa 4: Revisión y edición manual línea por línea</li>
+        </ul>
+        <div style="margin-top:16px;padding:12px 16px;background:rgba(0,212,170,0.05);border-radius:12px;border:1px solid rgba(0,212,170,0.1)">
+          <p style="font-size:0.8rem;color:var(--accent)">6 idiomas · Batch review · Eliminación de spam automática</p>
+        </div>
+      </div>
+      <div class="card" style="padding:20px">
+        <div style="display:flex;align-items:center;gap:8px;margin-bottom:16px">
+          <div style="width:8px;height:8px;border-radius:50%;background:var(--accent)"></div>
+          <span style="font-size:0.75rem;font-weight:600">Editor de lyrics</span>
+        </div>
+        <div style="display:flex;flex-direction:column;gap:6px">
+          <div style="display:flex;gap:8px;align-items:center">
+            <span style="font-size:0.6rem;color:var(--gray-dark);width:40px;text-align:right;font-family:monospace">0:25</span>
+            <div style="flex:1;background:var(--bg);border:1px solid rgba(255,255,255,0.04);border-radius:10px;padding:8px 12px;font-size:0.8rem">La noche que la vi</div>
+          </div>
+          <div style="display:flex;gap:8px;align-items:center">
+            <span style="font-size:0.6rem;color:var(--gray-dark);width:40px;text-align:right;font-family:monospace">0:42</span>
+            <div style="flex:1;background:var(--bg);border:1px solid rgba(245,158,11,0.15);border-radius:10px;padding:8px 12px;font-size:0.8rem;text-decoration:line-through;opacity:0.5">Al final, desde el invierno</div>
+          </div>
+          <div style="margin-left:48px;display:flex;align-items:center;gap:4px;padding:4px 8px;background:rgba(0,212,170,0.05);border-radius:8px;cursor:pointer;width:fit-content">
+            <span style="color:var(--accent);font-size:0.7rem">✓</span>
+            <span style="font-size:0.7rem;color:var(--accent)">Al final, es del infierno</span>
+          </div>
+          <div style="display:flex;gap:8px;align-items:center">
+            <span style="font-size:0.6rem;color:var(--gray-dark);width:40px;text-align:right;font-family:monospace">0:50</span>
+            <div style="flex:1;background:var(--bg);border:1px solid rgba(255,255,255,0.04);border-radius:10px;padding:8px 12px;font-size:0.8rem">Yo la quiero, ¿dónde estás?</div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+  <div class="slide-num">07 / 15</div>
+</div>
+
+<!-- SLIDE 9: Dashboard + Screenshot -->
+<div class="slide" id="s8">
+  <div class="blob blob-3"></div>
+  <div class="w-full">
+    <p class="small mb-2">Plataforma</p>
+    <h2 class="mb-4"><span class="grad">La plataforma, en acción</span></h2>
+    <div style="margin-bottom:24px;border-radius:20px;overflow:hidden;border:1px solid rgba(255,255,255,0.06);box-shadow:0 0 60px rgba(124,92,252,0.1)">
+      <img src="ss_landing.png" alt="GenLy AI" style="width:100%;display:block" />
+    </div>
+    <div class="grid-3">
+      <div class="card text-center" style="padding:20px">
+        <h3 style="color:var(--brand-light);margin-bottom:4px">Dashboard</h3>
+        <p style="color:var(--gray);font-size:0.75rem">Stats, historial con thumbnails, uso mensual</p>
+      </div>
+      <div class="card text-center" style="padding:20px">
+        <h3 style="color:var(--brand-light);margin-bottom:4px">Multi-idioma</h3>
+        <p style="color:var(--gray);font-size:0.75rem">Español, English, Português</p>
+      </div>
+      <div class="card text-center" style="padding:20px">
+        <h3 style="color:var(--brand-light);margin-bottom:4px">Multi-tenant</h3>
+        <p style="color:var(--gray);font-size:0.75rem">Login seguro, datos aislados por cliente</p>
+      </div>
+    </div>
+  </div>
+  <div class="slide-num">08 / 15</div>
+</div>
+
+<!-- SLIDE 10: Comparison -->
+<div class="slide" id="s9">
+  <div class="blob blob-1"></div>
+  <div class="w-full">
+    <p class="small mb-2">Comparativa</p>
+    <h2 class="mb-6"><span class="grad">GenLy AI vs producción tradicional</span></h2>
+    <table>
+      <tr><th></th><th>Freelancer</th><th>Agencia</th><th style="color:var(--brand-light)">GenLy AI</th></tr>
+      <tr><td style="color:var(--gray)">100 videos</td><td>~1 mes</td><td>~1 mes</td><td style="color:var(--accent);font-weight:700">1 día</td></tr>
+      <tr><td style="color:var(--gray)">Calidad</td><td>Variable</td><td>Consistente</td><td style="color:var(--accent);font-weight:700">Consistente</td></tr>
+      <tr><td style="color:var(--gray)">Disponibilidad</td><td>Vacaciones, enfermedad</td><td>Horario laboral</td><td style="color:var(--accent);font-weight:700">24/7</td></tr>
+      <tr><td style="color:var(--gray)">Escala a 1,000</td><td>Imposible</td><td>Costoso</td><td style="color:var(--accent);font-weight:700">Mismo costo marginal</td></tr>
+      <tr><td style="color:var(--gray)">Lyrics</td><td>Manual</td><td>Manual</td><td style="color:var(--accent);font-weight:700">IA + review en la app</td></tr>
+      <tr><td style="color:var(--gray)">Fondos</td><td>Templates</td><td>Personalizados</td><td style="color:var(--accent);font-weight:700">IA genera fondo temático</td></tr>
+      <tr><td style="color:var(--gray)">YouTube + SEO</td><td>No incluido</td><td>No incluido</td><td style="color:var(--accent);font-weight:700">Publicación directa con IA</td></tr>
+      <tr><td style="color:var(--gray)">Protección legal</td><td>Sin garantía</td><td>Variable</td><td style="color:var(--accent);font-weight:700">Indemnización incluida</td></tr>
+      <tr><td style="color:var(--gray)">Autogestionado</td><td>No</td><td>No</td><td style="color:var(--accent);font-weight:700">Sí, 100%</td></tr>
+    </table>
+  </div>
+  <div class="slide-num">09 / 15</div>
+</div>
+
+<!-- SLIDE 11: Legal & Security (BLINDAJE TOTAL) -->
+<div class="slide" id="s10">
+  <div class="blob blob-2"></div>
+  <div class="w-full">
+    <p class="small mb-2">Seguridad legal y protección de datos</p>
+    <h2 class="mb-4"><span class="grad">Blindaje total para </span><span class="grad-accent">monetizar sin riesgos</span></h2>
+    <div class="grid-2" style="margin-bottom:24px">
+      <div class="card" style="padding:24px;border-color:rgba(0,212,170,0.15)">
+        <div style="display:flex;align-items:center;gap:12px;margin-bottom:16px">
+          <div style="width:40px;height:40px;border-radius:12px;background:rgba(0,212,170,0.1);display:flex;align-items:center;justify-content:center">
+            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="var(--accent)" stroke-width="2"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg>
+          </div>
+          <h3 style="font-size:1rem">Indemnización incluida</h3>
+        </div>
+        <p style="color:var(--gray);font-size:0.82rem;line-height:1.6">Nuestra infraestructura cloud ofrece <strong style="color:white">cláusula de indemnización por derechos de autor</strong> sobre todo el contenido generado. El proveedor respalda legalmente el contenido ante cualquier reclamo de terceros.</p>
+      </div>
+      <div class="card" style="padding:24px;border-color:rgba(0,212,170,0.15)">
+        <div style="display:flex;align-items:center;gap:12px;margin-bottom:16px">
+          <div style="width:40px;height:40px;border-radius:12px;background:rgba(0,212,170,0.1);display:flex;align-items:center;justify-content:center">
+            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="var(--accent)" stroke-width="2"><rect x="3" y="11" width="18" height="11" rx="2" ry="2"/><path d="M7 11V7a5 5 0 0110 0v4"/></svg>
+          </div>
+          <h3 style="font-size:1rem">Datos 100% privados</h3>
+        </div>
+        <p style="color:var(--gray);font-size:0.82rem;line-height:1.6">Los audios y lyrics del cliente se procesan de forma privada y <strong style="color:white">no se utilizan para entrenar los modelos globales</strong> de Google. A diferencia de APIs públicas.</p>
+      </div>
+    </div>
+    <div class="grid-3">
+      <div class="card text-center" style="padding:16px">
+        <p style="font-size:0.75rem;font-weight:700;color:var(--accent);margin-bottom:4px">Modelos seguros</p>
+        <p style="font-size:0.7rem;color:var(--gray)">Modelos entrenados exclusivamente con datos bajo licencia y fuentes públicas curadas</p>
+      </div>
+      <div class="card text-center" style="padding:16px">
+        <p style="font-size:0.75rem;font-weight:700;color:var(--accent);margin-bottom:4px">Tipografías libres</p>
+        <p style="font-size:0.7rem;color:var(--gray)">Google Fonts con licencia SIL Open Font License — uso comercial ilimitado</p>
+      </div>
+      <div class="card text-center" style="padding:16px">
+        <p style="font-size:0.75rem;font-weight:700;color:var(--accent);margin-bottom:4px">Propiedad total</p>
+        <p style="font-size:0.7rem;color:var(--gray)">100% del contenido generado es propiedad del cliente. Sin regalías ni atribuciones</p>
+      </div>
+    </div>
+  </div>
+  <div class="slide-num">10 / 15</div>
+</div>
+
+<!-- SLIDE 11: Why now -->
+<div class="slide" id="s11">
+  <div class="blob blob-3"></div>
+  <div class="w-full text-center">
+    <p class="small mb-2">Por qué ahora</p>
+    <h2 class="mb-6"><span class="grad">La ventana de oportunidad </span><span class="grad-brand">es hoy</span></h2>
+    <div class="grid-3" style="margin-top:32px">
+      <div class="card text-center" style="padding:28px 20px">
+        <p style="font-size:2.5rem;font-weight:900;color:var(--brand-light);margin-bottom:8px">2026</p>
+        <p style="color:var(--gray);font-size:0.85rem">La IA generativa alcanzó el nivel necesario para producir contenido de calidad profesional</p>
+      </div>
+      <div class="card text-center" style="padding:28px 20px">
+        <p style="font-size:2.5rem;font-weight:900;color:var(--brand-light);margin-bottom:8px">100M+</p>
+        <p style="color:var(--gray);font-size:0.85rem">canciones en catálogos globales sin lyric video en YouTube</p>
+      </div>
+      <div class="card text-center" style="padding:28px 20px">
+        <p style="font-size:2.5rem;font-weight:900;color:var(--brand-light);margin-bottom:8px">1ro</p>
+        <p style="color:var(--gray);font-size:0.85rem">El sello que automatice primero captura el mercado antes que la competencia</p>
+      </div>
+    </div>
+  </div>
+  <div class="slide-num">11 / 15</div>
+</div>
+
+<!-- SLIDE 13: Pricing -->
+<div class="slide" id="s12">
+  <div class="blob blob-1"></div>
+  <div class="w-full">
+    <p class="small mb-2">Planes</p>
+    <h2 class="mb-6 text-center"><span class="grad">Precios simples, sin sorpresas</span></h2>
+    <div class="grid-4">
+      <div class="card price-card">
+        <p class="price-label">100 videos/mes</p>
+        <div class="price-value"><span style="font-size:1rem;color:var(--gray)">USD</span> 900</div>
+        <p style="font-size:0.75rem;color:var(--gray-dark)">$9.00 / video</p>
+      </div>
+      <div class="card price-card popular">
+        <span class="badge badge-brand" style="position:absolute;top:-12px;left:50%;transform:translateX(-50%);font-size:0.6rem">Popular</span>
+        <p class="price-label">250 videos/mes</p>
+        <div class="price-value"><span style="font-size:1rem;color:var(--gray)">USD</span> 2,000</div>
+        <p style="font-size:0.75rem;color:var(--gray-dark)">$8.00 / video</p>
+      </div>
+      <div class="card price-card">
+        <p class="price-label">500 videos/mes</p>
+        <div class="price-value"><span style="font-size:1rem;color:var(--gray)">USD</span> 3,500</div>
+        <p style="font-size:0.75rem;color:var(--gray-dark)">$7.00 / video</p>
+      </div>
+      <div class="card price-card">
+        <p class="price-label">1,000 videos/mes</p>
+        <div class="price-value"><span style="font-size:1rem;color:var(--gray)">USD</span> 6,000</div>
+        <p style="font-size:0.75rem;color:var(--gray-dark)">$6.00 / video</p>
+      </div>
+    </div>
+    <div style="text-align:center;margin-top:24px">
+      <p style="color:var(--gray);font-size:0.8rem">Videos excedentes: <strong style="color:white">+30% sobre el precio unitario del plan</strong></p>
+      <p style="color:var(--gray-dark);font-size:0.7rem;margin-top:4px">Ej: Plan 100 ($9/video) → excedente a $11.70/video. Sin cambiar de plan.</p>
+    </div>
+  </div>
+  <div class="slide-num">12 / 15</div>
+</div>
+
+<!-- SLIDE 14: Savings -->
+<div class="slide" id="s13">
+  <div class="blob blob-2"></div>
+  <div class="blob blob-3"></div>
+  <div class="w-full text-center">
+    <p class="small mb-2">Ahorro real</p>
+    <h2 class="mb-6"><span class="grad">Más valor por menos inversión</span></h2>
+    <div class="grid-3" style="max-width:900px;margin:0 auto">
+      <div class="card text-center" style="padding:32px 20px;border-color:rgba(0,212,170,0.15)">
+        <p style="font-size:0.75rem;color:var(--gray-dark);text-transform:uppercase;letter-spacing:0.1em;margin-bottom:8px">Desde</p>
+        <p style="font-size:2.5rem;font-weight:900;color:var(--accent)">$9</p>
+        <p style="font-size:0.8rem;color:var(--gray);margin-top:4px">por canción completa</p>
+      </div>
+      <div class="card text-center" style="padding:32px 20px;border-color:rgba(124,92,252,0.15)">
+        <p style="font-size:0.75rem;color:var(--gray-dark);text-transform:uppercase;letter-spacing:0.1em;margin-bottom:8px">Incluye</p>
+        <p style="font-size:2.5rem;font-weight:900;color:var(--brand-light)">Todo</p>
+        <p style="font-size:0.8rem;color:var(--gray);margin-top:4px">incluido: video + short + thumb + YouTube con SEO</p>
+      </div>
+      <div class="card text-center" style="padding:32px 20px;border-color:rgba(0,212,170,0.15)">
+        <p style="font-size:0.75rem;color:var(--gray-dark);text-transform:uppercase;letter-spacing:0.1em;margin-bottom:8px">Ahorro vs agencia</p>
+        <p style="font-size:2.5rem;font-weight:900;color:var(--accent)">95%</p>
+        <p style="font-size:0.8rem;color:var(--gray);margin-top:4px">de reducción de costos</p>
+      </div>
+    </div>
+    <div style="margin-top:32px;max-width:700px;margin-left:auto;margin-right:auto">
+      <div class="card" style="padding:20px 28px;display:flex;align-items:center;gap:20px;border-color:rgba(0,212,170,0.1)">
+        <span style="font-size:1.5rem">💡</span>
+        <p style="color:var(--gray);font-size:0.85rem">Por $9 por canción: <strong style="color:white">lyric video + short + thumbnail + publicación en YouTube + SEO con IA + fondo temático único</strong>. Autogestionado, en 5 minutos, 24/7, a escala ilimitada.</p>
+      </div>
+    </div>
+  </div>
+  <div class="slide-num">13 / 15</div>
+</div>
+
+<!-- SLIDE 15: Roadmap -->
+<div class="slide" id="s14">
+  <div class="blob blob-2"></div>
+  <div class="w-full">
+    <p class="small mb-2">Roadmap</p>
+    <h2 class="mb-6"><span class="grad">Ya disponible + lo que viene</span></h2>
+    <div class="grid-2" style="gap:20px">
+      <div class="card">
+        <span class="badge badge-accent" style="margin-bottom:12px">YA DISPONIBLE</span>
+        <ul class="check-list">
+          <li>Publicación directa en YouTube con SEO</li>
+          <li>Templates de metadata personalizables</li>
+          <li>Multi-idioma (ES, EN, PT)</li>
+          <li>Dashboard profesional con historial</li>
+          <li>Batch processing (hasta 100+ canciones)</li>
+          <li>Fondos IA temáticos únicos por canción</li>
+          <li>Autenticación y multi-tenant</li>
+        </ul>
+      </div>
+      <div class="card">
+        <span class="badge badge-glass" style="margin-bottom:12px">PRÓXIMAMENTE</span>
+        <ul class="check-list" style="opacity:0.7">
+          <li>Flujo de aprobación interno</li>
+          <li>Programación de publicación en YouTube</li>
+          <li>API pública para integraciones</li>
+          <li>A/B testing de thumbnails</li>
+          <li>Publicación en TikTok e Instagram</li>
+          <li>Dashboard de analytics y métricas</li>
+        </ul>
+      </div>
+    </div>
+  </div>
+  <div class="slide-num">14 / 15</div>
+</div>
+
+
+<!-- SLIDE 16: CTA -->
+<div class="slide" id="s15">
+  <div class="blob blob-1"></div>
+  <div class="blob blob-2"></div>
+  <div class="blob blob-3"></div>
+  <div class="text-center">
+    <div style="width:80px;height:80px;border-radius:20px;background:linear-gradient(135deg,var(--brand),var(--brand-light));display:flex;align-items:center;justify-content:center;margin:0 auto 40px;box-shadow:0 0 80px rgba(124,92,252,0.3)">
+      <svg width="36" height="36" viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M9 18V5l12-2v13"/><circle cx="6" cy="18" r="3"/><circle cx="18" cy="16" r="3"/></svg>
+    </div>
+    <h1 class="mb-4"><span class="grad">El siguiente paso</span></h1>
+    <p class="subtitle text-center" style="margin:0 auto 32px">Coordinemos una demo en vivo con canciones de tu catálogo.<br>En 15 minutos vas a ver los resultados.</p>
+
+    <!-- Contact info (visible in PDF) -->
+    <div id="contact-info" class="glass" style="max-width:440px;margin:0 auto;border-radius:24px;padding:32px;text-align:center;display:none">
+      <p style="font-size:1rem;font-weight:700;color:white;margin-bottom:16px">Agendá una demo</p>
+      <div style="display:flex;align-items:center;gap:12px;justify-content:center;margin-bottom:12px">
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="var(--brand-light)" stroke-width="2"><path d="M4 4h16c1.1 0 2 .9 2 2v12c0 1.1-.9 2-2 2H4c-1.1 0-2-.9-2-2V6c0-1.1.9-2 2-2z"/><polyline points="22,6 12,13 2,6"/></svg>
+        <a href="mailto:info@genlyai.co" style="color:var(--brand-light);font-size:0.95rem;text-decoration:none">info@genlyai.co</a>
+      </div>
+      <p style="color:var(--gray);font-size:0.8rem">Escribinos para coordinar una demo personalizada.<br>Te respondemos en menos de 24 horas.</p>
+    </div>
+
+    <!-- Contact form (visible in web) -->
+    <div id="contact-form" class="glass" style="max-width:440px;margin:0 auto;border-radius:24px;padding:32px;text-align:left">
+      <form action="https://formsubmit.co/info@genlyai.co" method="POST" id="demo-form">
+        <input type="hidden" name="_subject" value="GenLy AI — Solicitud de demo">
+        <input type="hidden" name="_captcha" value="false">
+        <input type="hidden" name="_next" value="https://genlyai.com/gracias">
+        <input type="hidden" name="_template" value="box">
+        <div style="margin-bottom:16px">
+          <label style="display:block;font-size:0.7rem;color:var(--gray);margin-bottom:6px;text-transform:uppercase;letter-spacing:0.1em">Nombre</label>
+          <input type="text" name="name" required placeholder="Tu nombre" style="width:100%;padding:12px 16px;border-radius:12px;background:var(--bg);border:1px solid rgba(255,255,255,0.06);color:white;font-size:0.85rem;outline:none;font-family:inherit">
+        </div>
+        <div style="margin-bottom:16px">
+          <label style="display:block;font-size:0.7rem;color:var(--gray);margin-bottom:6px;text-transform:uppercase;letter-spacing:0.1em">Email</label>
+          <input type="email" name="email" required placeholder="tu@empresa.com" style="width:100%;padding:12px 16px;border-radius:12px;background:var(--bg);border:1px solid rgba(255,255,255,0.06);color:white;font-size:0.85rem;outline:none;font-family:inherit">
+        </div>
+        <div style="margin-bottom:16px">
+          <label style="display:block;font-size:0.7rem;color:var(--gray);margin-bottom:6px;text-transform:uppercase;letter-spacing:0.1em">Empresa / Sello</label>
+          <input type="text" name="company" placeholder="Nombre de la empresa" style="width:100%;padding:12px 16px;border-radius:12px;background:var(--bg);border:1px solid rgba(255,255,255,0.06);color:white;font-size:0.85rem;outline:none;font-family:inherit">
+        </div>
+        <div style="margin-bottom:20px">
+          <label style="display:block;font-size:0.7rem;color:var(--gray);margin-bottom:6px;text-transform:uppercase;letter-spacing:0.1em">Mensaje (opcional)</label>
+          <textarea name="message" rows="2" placeholder="Contanos sobre tu necesidad..." style="width:100%;padding:12px 16px;border-radius:12px;background:var(--bg);border:1px solid rgba(255,255,255,0.06);color:white;font-size:0.85rem;outline:none;font-family:inherit;resize:none"></textarea>
+        </div>
+        <button type="submit" class="btn" style="width:100%;text-align:center;display:block;cursor:pointer;border:none;font-family:inherit">Agendar demo</button>
+      </form>
+      <p style="text-align:center;color:var(--gray-dark);font-size:0.65rem;margin-top:12px">Te respondemos en menos de 24 horas</p>
+    </div>
+
+    <p style="color:var(--gray-dark);font-size:0.75rem;margin-top:32px">GenLy AI Pro — Plataforma de generación de lyric videos con inteligencia artificial</p>
+  </div>
+  <div class="slide-num">15 / 15</div>
+</div>
+
+<script>
+// Build nav dots
+const slides = document.querySelectorAll('.slide');
+const nav = document.getElementById('nav');
+slides.forEach((s, i) => {
+  const a = document.createElement('a');
+  a.href = '#s' + (i+1);
+  a.title = 'Slide ' + (i+1);
+  nav.appendChild(a);
+});
+
+// Highlight active dot
+const observer = new IntersectionObserver((entries) => {
+  entries.forEach(e => {
+    if (e.isIntersecting) {
+      const id = e.target.id;
+      nav.querySelectorAll('a').forEach(a => a.classList.toggle('active', a.getAttribute('href') === '#'+id));
+    }
+  });
+}, { threshold: 0.5 });
+slides.forEach(s => observer.observe(s));
+
+// Click anywhere to advance
+document.addEventListener('click', (e) => {
+  if (e.target.closest('a[href], button')) return;
+  const current = [...slides].findIndex(s => {
+    const rect = s.getBoundingClientRect();
+    return rect.top >= -100 && rect.top < window.innerHeight / 2;
+  });
+  if (current >= 0 && current < slides.length - 1) {
+    slides[current + 1].scrollIntoView({ behavior: 'smooth' });
+  }
+});
+
+// Keyboard navigation
+document.addEventListener('keydown', (e) => {
+  const current = [...slides].findIndex(s => {
+    const rect = s.getBoundingClientRect();
+    return rect.top >= -100 && rect.top < window.innerHeight / 2;
+  });
+  if (e.key === 'ArrowDown' || e.key === 'ArrowRight' || e.key === ' ') {
+    e.preventDefault();
+    if (current < slides.length - 1) slides[current + 1].scrollIntoView({ behavior: 'smooth' });
+  }
+  if (e.key === 'ArrowUp' || e.key === 'ArrowLeft') {
+    e.preventDefault();
+    if (current > 0) slides[current - 1].scrollIntoView({ behavior: 'smooth' });
+  }
+});
+</script>
+
+</body>
+</html>
