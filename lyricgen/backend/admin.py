@@ -240,6 +240,9 @@ class UpdateUserRequest(BaseModel):
     is_active: Optional[bool] = None
     email: Optional[str] = None
     password: Optional[str] = None
+    # Per-tenant volume cap. Set to None to use system default; set to an
+    # integer to override (e.g. raise to 200 for a high-volume tenant).
+    max_videos_per_day: Optional[int] = None
 
 
 @router.patch("/users/{user_id}")
@@ -264,6 +267,9 @@ async def update_user_admin(
         user.email = body.email
     if body.password is not None:
         user.hashed_password = pwd_context.hash(body.password)
+    if body.max_videos_per_day is not None:
+        # Allow 0 to mean "block all uploads"; clamp to non-negative.
+        user.max_videos_per_day = max(0, int(body.max_videos_per_day))
 
     db.commit()
     db.refresh(user)
@@ -360,6 +366,56 @@ async def list_audit_log(
 # ---------------------------------------------------------------------------
 # AI Provenance (UMG Compliance)
 # ---------------------------------------------------------------------------
+
+@router.get("/cost")
+async def admin_cost_dashboard(
+    admin: dict = Depends(require_admin),
+    db: Session = Depends(get_db),
+    since_days: int = Query(30, ge=1, le=365),
+):
+    """Per-tenant AI cost summary for the last `since_days` days.
+
+    Returns one entry per tenant_id present in the jobs table, ordered by
+    spend descending. Use this to spot tenants approaching cap, to validate
+    pricing assumptions, and as the data source for cost alerts.
+    """
+    from provenance import tenant_cost_summary
+
+    tenant_ids = [
+        row[0]
+        for row in db.query(Job.tenant_id).distinct().all()
+    ]
+
+    summaries = []
+    grand_total = 0.0
+    grand_calls = 0
+    for tid in tenant_ids:
+        s = tenant_cost_summary(db, tenant_id=tid, since_days=since_days)
+        summaries.append(s)
+        grand_total += s["total_cost"]
+        grand_calls += s["total_calls"]
+
+    summaries.sort(key=lambda s: s["total_cost"], reverse=True)
+
+    return {
+        "since_days": since_days,
+        "grand_total_cost": round(grand_total, 4),
+        "grand_total_calls": grand_calls,
+        "tenants": summaries,
+    }
+
+
+@router.get("/cost/{tenant_id}")
+async def admin_tenant_cost(
+    tenant_id: str,
+    admin: dict = Depends(require_admin),
+    db: Session = Depends(get_db),
+    since_days: int = Query(30, ge=1, le=365),
+):
+    """Cost summary for a single tenant, broken down by tool."""
+    from provenance import tenant_cost_summary
+    return tenant_cost_summary(db, tenant_id=tenant_id, since_days=since_days)
+
 
 @router.get("/provenance")
 async def list_all_provenance(

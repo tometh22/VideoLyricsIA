@@ -94,6 +94,10 @@ class User(Base):
     ai_authorized_at = Column(DateTime(timezone=True), nullable=True)
     ai_authorized_by = Column(Integer, nullable=True)
 
+    # Per-tenant volume cap. None = use system default DEFAULT_DAILY_CAP.
+    # Catches accidental burst usage (mistake, abuse, or runaway loop).
+    max_videos_per_day = Column(Integer, nullable=True)
+
     created_at = Column(DateTime(timezone=True), default=utcnow)
     updated_at = Column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)
 
@@ -113,6 +117,7 @@ class User(Base):
             "is_active": self.is_active,
             "email_verified": self.email_verified,
             "ai_authorized": self.ai_authorized,
+            "max_videos_per_day": self.max_videos_per_day,
             "stripe_customer_id": self.stripe_customer_id,
             "created_at": self.created_at.isoformat() if self.created_at else None,
         }

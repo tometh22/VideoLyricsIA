@@ -48,7 +48,9 @@ from auth import (
     PLANS,
 )
 import storage
-from database import User, UserSettings, AuditLog, get_db, init_db
+from datetime import datetime, timedelta, timezone
+
+from database import Job, User, UserSettings, AuditLog, get_db, init_db
 from jobs import create_job, get_job, get_all_jobs, update_job
 from observability import init_sentry, init_logging, health_snapshot
 from pipeline import run_pipeline, transcribe
@@ -392,6 +394,43 @@ def _enforce_plan_quota(db: Session, current_user: dict) -> None:
             )
 
 
+# System default for per-tenant daily cap when User.max_videos_per_day is None.
+# Catches accidental burst usage (a UMG user looping a script, accidental retry
+# storm, etc.) before it racks up Veo bills. UMG's verbal commitment is
+# 200/month ≈ 7/day; a 50/day cap allows 7× headroom for legitimate bursts.
+DEFAULT_DAILY_CAP = 50
+
+
+def _enforce_daily_volume_cap(db: Session, current_user: dict) -> None:
+    """Raise 429 if the tenant has hit its per-day video cap. UMG-readiness:
+    prevents a runaway from creating $200 of Veo in an hour."""
+    tenant_id = current_user["tenant_id"]
+    user_model = db.query(User).filter(User.id == current_user["id"]).first()
+
+    cap = (user_model.max_videos_per_day if user_model
+           and user_model.max_videos_per_day is not None
+           else DEFAULT_DAILY_CAP)
+
+    # Count jobs created in the last 24 hours, regardless of status (queueing
+    # 100 broken jobs in an hour still wastes resources and signals abuse).
+    since = datetime.now(timezone.utc) - timedelta(hours=24)
+    used_today = (
+        db.query(Job)
+        .filter(Job.tenant_id == tenant_id)
+        .filter(Job.created_at >= since)
+        .count()
+    )
+
+    if used_today >= cap:
+        raise HTTPException(
+            status_code=429,
+            detail=(
+                f"Daily volume cap reached ({used_today}/{cap} in the last 24h). "
+                "Try again later, or contact support to increase your cap."
+            ),
+        )
+
+
 def _parse_umg_params(
     delivery_profile: str,
     umg_frame_size: str,
@@ -452,6 +491,7 @@ async def upload(
     _validate_mp3_upload(file, data)
 
     _enforce_plan_quota(db, current_user)
+    _enforce_daily_volume_cap(db, current_user)
 
     umg_spec = _parse_umg_params(delivery_profile, umg_frame_size, umg_fps, umg_prores_profile)
 
@@ -587,6 +627,7 @@ async def generate_with_segments(
     _validate_mp3_upload(file, data)
 
     _enforce_plan_quota(db, current_user)
+    _enforce_daily_volume_cap(db, current_user)
 
     # Check AI authorization (UMG Guideline 5) — skip if using library background (no AI)
     if not background_id and current_user.get("role") != "admin":

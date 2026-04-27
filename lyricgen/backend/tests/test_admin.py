@@ -94,3 +94,40 @@ def test_admin_search_users(client, admin_token):
     res = client.get("/admin/users?search=searchable", headers=auth(admin_token))
     assert res.status_code == 200
     assert res.json()["total"] >= 1
+
+
+# ---------------------------------------------------------------------------
+# Cost dashboard endpoints
+# ---------------------------------------------------------------------------
+
+
+def test_admin_cost_dashboard_endpoint(client, admin_token):
+    res = client.get("/admin/cost", headers=auth(admin_token))
+    assert res.status_code == 200
+    data = res.json()
+    assert "since_days" in data
+    assert "grand_total_cost" in data
+    assert "grand_total_calls" in data
+    assert "tenants" in data
+    assert isinstance(data["tenants"], list)
+
+
+def test_admin_cost_dashboard_custom_window(client, admin_token):
+    res = client.get("/admin/cost?since_days=7", headers=auth(admin_token))
+    assert res.status_code == 200
+    assert res.json()["since_days"] == 7
+
+
+def test_admin_cost_per_tenant_endpoint(client, admin_token):
+    res = client.get("/admin/cost/default", headers=auth(admin_token))
+    assert res.status_code == 200
+    data = res.json()
+    assert data["tenant_id"] == "default"
+    assert "total_cost" in data
+    assert "total_calls" in data
+    assert "by_tool" in data
+
+
+def test_admin_cost_denied_for_regular_user(client, user_token):
+    res = client.get("/admin/cost", headers=auth(user_token))
+    assert res.status_code == 403
