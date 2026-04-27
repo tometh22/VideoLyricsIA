@@ -292,22 +292,46 @@ export default function App() {
         if (backgroundId) formData.append("background_id", backgroundId);
         else if (backgroundFile) formData.append("background_file", backgroundFile);
 
-        try {
-          const res = await authFetch(`${API}/upload`, { method: "POST", body: formData });
-          const data = await res.json();
-          if (data.detail) {
-            setJobs((prev) => prev.map((j, idx) =>
-              idx === i ? { ...j, status: "error", error: data.detail } : j
-            ));
-            continue;
+        // Retry-on-429 with exponential backoff. Batch uploads of 30+ files can
+        // briefly exceed the per-user rate limit; 429s are transient, not failures.
+        let res = null;
+        let data = null;
+        let attempt = 0;
+        const MAX_429_RETRIES = 5;
+        let networkError = false;
+        while (attempt <= MAX_429_RETRIES) {
+          try {
+            res = await authFetch(`${API}/upload`, { method: "POST", body: formData });
+          } catch {
+            networkError = true;
+            break;
           }
-          setJobs((prev) => prev.map((j, idx) => (idx === i ? { ...j, job_id: data.job_id } : j)));
-          await pollJob(data.job_id);
-        } catch {
+          if (res.status !== 429) {
+            data = await res.json();
+            break;
+          }
+          // 429: wait 2^attempt seconds (2, 4, 8, 16, 32) then retry.
+          const waitMs = Math.min(32000, 2000 * Math.pow(2, attempt));
+          setJobs((prev) => prev.map((j, idx) =>
+            idx === i ? { ...j, status: "queued", error: null } : j
+          ));
+          await new Promise((r) => setTimeout(r, waitMs));
+          attempt++;
+        }
+        if (networkError || !res || !data) {
           setJobs((prev) => prev.map((j, idx) =>
             idx === i ? { ...j, status: "error", error: t("batch.error_server") } : j
           ));
+          continue;
         }
+        if (data.detail) {
+          setJobs((prev) => prev.map((j, idx) =>
+            idx === i ? { ...j, status: "error", error: data.detail } : j
+          ));
+          continue;
+        }
+        setJobs((prev) => prev.map((j, idx) => (idx === i ? { ...j, job_id: data.job_id } : j)));
+        await pollJob(data.job_id);
       }
     };
     await Promise.all(Array.from({ length: Math.min(PARALLEL_WORKERS, jobList.length) }, () => worker()));

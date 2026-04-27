@@ -43,10 +43,7 @@ export default function UploadZone({
   const [umgFrameSize, setUmgFrameSize] = useState("HD");
   const [umgFps, setUmgFps] = useState(24);
   const [umgProresProfile, setUmgProresProfile] = useState(3);
-  // Library mode is the default — faster (no Veo 3.1 wait), cheaper (no per-call
-  // generation cost), and the assets have been pre-vetted. Users can opt into
-  // "auto" (AI-generated) or "custom" (own upload) explicitly.
-  const [bgMode, setBgMode] = useState("library"); // auto | library | custom
+  const [bgMode, setBgMode] = useState("auto"); // auto | library | custom
   const [libraryBgs, setLibraryBgs] = useState([]);
   const [libraryLoaded, setLibraryLoaded] = useState(false);
 
@@ -273,11 +270,11 @@ export default function UploadZone({
 
           <p className="text-[10px] text-gray-600 uppercase tracking-wider mb-2">{t("upload.bg_label") || "Background"}</p>
 
-          {/* Mode selector — library first because it's the recommended default */}
+          {/* Mode selector */}
           <div className="flex gap-1 p-1 glass rounded-xl w-fit mb-3">
             {[
-              { id: "library", label: t("upload.bg_library") || "Library" },
               { id: "auto", label: t("upload.bg_auto") || "IA Auto" },
+              { id: "library", label: t("upload.bg_library") || "Library" },
               { id: "custom", label: t("upload.bg_custom_tab") || "Upload" },
             ].map((m) => (
               <button
@@ -297,15 +294,12 @@ export default function UploadZone({
 
           {/* Auto mode */}
           {bgMode === "auto" && (
-            <div className="glass rounded-2xl px-4 py-3 space-y-2">
+            <div className="glass rounded-2xl px-4 py-3">
               <p className="text-xs text-gray-400">
                 <svg className="inline-block w-3.5 h-3.5 mr-1.5 -mt-0.5 text-brand" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
                   <path d="M13 10V3L4 14h7v7l9-11h-7z"/>
                 </svg>
                 {t("upload.bg_auto_desc") || "AI will generate a unique background based on the song's mood and lyrics."}
-              </p>
-              <p className="text-[11px] text-amber-400/80">
-                {t("upload.bg_auto_hint") || "AI generation takes 2-3× longer than the Library option."}
               </p>
             </div>
           )}

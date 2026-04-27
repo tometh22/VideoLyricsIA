@@ -862,43 +862,22 @@ def _ensure_background(style_hint: str, job_dir: str, lyrics_text: str = None, a
 
     bg_path = os.path.join(job_dir, "bg_generated.mp4")
     import time as _time_bg
-    # Two Veo attempts. If both fail, fall back to library before a third retry —
-    # at ~$4/Veo call, the third attempt usually isn't worth it; a known-good
-    # library asset is faster and free.
-    for attempt in range(2):
+    for attempt in range(3):
         try:
             _generate_veo_video(prompt, bg_path, job_id=job_id)
             return bg_path
         except Exception as e:
-            print(f"[BG] Veo 3 attempt {attempt + 1}/2 failed: {e}")
-            if attempt < 1:
-                wait = 30
+            print(f"[BG] Veo 3 attempt {attempt + 1}/3 failed: {e}")
+            if attempt < 2:
+                wait = 30 * (attempt + 1)
                 print(f"[BG] Waiting {wait}s before retry...")
                 _time_bg.sleep(wait)
 
-    # Both Veo attempts failed — try a random library asset before gradient.
-    library_pick = _find_background_video()
-    if library_pick:
-        print(f"[BG] Veo 3 unavailable, falling back to library asset: "
-              f"{os.path.basename(library_pick)}")
-        # Record the fallback in provenance so we can audit what UMG actually got.
-        from provenance import record_ai_call
-        recorder = record_ai_call(
-            job_id=job_id,
-            step="background_library_fallback",
-            tool_name="library-fallback",
-            tool_provider="local",
-            prompt=f"Veo 3 failed twice; selected library asset {os.path.basename(library_pick)}",
-            input_data_types=["library_asset"],
-        )
-        recorder.finish(
-            response_summary="library_fallback_used",
-            output_artifact=library_pick,
-        )
-        return library_pick
-
-    # No library available — render a gradient as final fallback.
-    print("[BG] Veo 3 + library both unavailable, falling back to gradient")
+    # All Veo attempts failed — render a gradient as fallback.
+    # We do NOT fall back to a library asset: UMG and other rights-sensitive
+    # tenants need clear provenance of every visual element, and a stock asset
+    # silently substituted into an AI-mode job would break that contract.
+    print("[BG] Veo 3 unavailable, falling back to gradient background")
     fallback_path = os.path.join(job_dir, "bg_gradient_fallback.mp4")
     gradient = _make_gradient_clip(30.0, style_hint)
     gradient.write_videofile(fallback_path, fps=24, logger=None)

@@ -85,8 +85,41 @@ app = FastAPI(
 from slowapi.middleware import SlowAPIMiddleware
 
 _rate_limit_enabled = os.environ.get("RATE_LIMIT_ENABLED", "true").lower() != "false"
+
+
+def _rate_limit_key(request: Request) -> str:
+    """Key the upload rate limit by user_id when authenticated, falling back
+    to IP for unauthenticated requests. This prevents one user's burst from
+    starving another user behind the same NAT (e.g. an office), and makes
+    the limit fair when UMG runs many label-team users from one location.
+
+    The user_id is parsed from the JWT (best-effort; on parse failure we use
+    IP). We don't want to do a DB hit here — slowapi calls this on every
+    request, including ones that 429.
+    """
+    try:
+        auth_header = request.headers.get("authorization", "")
+        if auth_header.lower().startswith("bearer "):
+            token = auth_header.split(None, 1)[1]
+            from auth import JWT_SECRET, JWT_ALGORITHM
+            from jose import jwt as _jwt
+            payload = _jwt.decode(
+                token, JWT_SECRET, algorithms=[JWT_ALGORITHM],
+                options={"verify_exp": False},
+            )
+            uid = payload.get("sub") or payload.get("user_id")
+            if uid:
+                # Distinguish user-keyed limits from IP-keyed ones so they
+                # don't share a bucket when a request occasionally
+                # authenticates from a previously-anonymous IP.
+                return f"user:{uid}"
+    except Exception:
+        pass
+    return f"ip:{get_remote_address(request)}"
+
+
 limiter = Limiter(
-    key_func=get_remote_address,
+    key_func=_rate_limit_key,
     enabled=_rate_limit_enabled,
     default_limits=["120/minute"],
 )
@@ -470,7 +503,7 @@ def _parse_umg_params(
 
 
 @app.post("/upload")
-@limiter.limit("30/minute")
+@limiter.limit("120/minute")
 async def upload(
     request: Request,
     file: UploadFile = File(...),
@@ -605,7 +638,7 @@ async def transcribe_endpoint(
 
 
 @app.post("/generate")
-@limiter.limit("30/minute")
+@limiter.limit("120/minute")
 async def generate_with_segments(
     request: Request,
     file: UploadFile = File(...),
