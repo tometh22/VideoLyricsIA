@@ -434,6 +434,45 @@ def _enforce_plan_quota(db: Session, current_user: dict) -> None:
 DEFAULT_DAILY_CAP = 50
 
 
+DEFAULT_MAX_CONCURRENT_JOBS = 10
+
+
+def _enforce_concurrent_jobs_cap(db: Session, current_user: dict) -> None:
+    """Raise 429 if the tenant already has too many jobs in flight. The cap
+    naturally enforces "one batch at a time" — a UMG user uploads up to N
+    tracks; once they finish processing, the next batch can start.
+
+    "In flight" means status="processing". Jobs in pending_review (awaiting
+    user approval) or terminal states don't consume pipeline resources, so
+    they don't count.
+
+    Default is DEFAULT_MAX_CONCURRENT_JOBS (10). Admin can override per user
+    via PATCH /admin/users/{id} with max_concurrent_jobs.
+    """
+    tenant_id = current_user["tenant_id"]
+    user_model = db.query(User).filter(User.id == current_user["id"]).first()
+
+    cap = (user_model.max_concurrent_jobs if user_model
+           and user_model.max_concurrent_jobs is not None
+           else DEFAULT_MAX_CONCURRENT_JOBS)
+
+    in_flight = (
+        db.query(Job)
+        .filter(Job.tenant_id == tenant_id)
+        .filter(Job.status == "processing")
+        .count()
+    )
+
+    if in_flight >= cap:
+        raise HTTPException(
+            status_code=429,
+            detail=(
+                f"Batch limit reached ({in_flight}/{cap} jobs already in flight). "
+                "Wait for your current batch to finish before starting a new one."
+            ),
+        )
+
+
 def _enforce_daily_volume_cap(db: Session, current_user: dict) -> None:
     """Raise 429 if the tenant has hit its per-day video cap. UMG-readiness:
     prevents a runaway from creating $200 of Veo in an hour."""
@@ -525,6 +564,7 @@ async def upload(
 
     _enforce_plan_quota(db, current_user)
     _enforce_daily_volume_cap(db, current_user)
+    _enforce_concurrent_jobs_cap(db, current_user)
 
     umg_spec = _parse_umg_params(delivery_profile, umg_frame_size, umg_fps, umg_prores_profile)
 
@@ -661,6 +701,7 @@ async def generate_with_segments(
 
     _enforce_plan_quota(db, current_user)
     _enforce_daily_volume_cap(db, current_user)
+    _enforce_concurrent_jobs_cap(db, current_user)
 
     # Check AI authorization (UMG Guideline 5) — skip if using library background (no AI)
     if not background_id and current_user.get("role") != "admin":

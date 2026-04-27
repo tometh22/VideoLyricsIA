@@ -243,6 +243,9 @@ class UpdateUserRequest(BaseModel):
     # Per-tenant volume cap. Set to None to use system default; set to an
     # integer to override (e.g. raise to 200 for a high-volume tenant).
     max_videos_per_day: Optional[int] = None
+    # Per-tenant concurrent-jobs cap (a.k.a. batch size). Default is 10.
+    # Raise for tenants that ship full albums (12-15 tracks) as one batch.
+    max_concurrent_jobs: Optional[int] = None
 
 
 @router.patch("/users/{user_id}")
@@ -270,6 +273,10 @@ async def update_user_admin(
     if body.max_videos_per_day is not None:
         # Allow 0 to mean "block all uploads"; clamp to non-negative.
         user.max_videos_per_day = max(0, int(body.max_videos_per_day))
+    if body.max_concurrent_jobs is not None:
+        # Min 1 — a cap of 0 would block uploads entirely; use is_active=False
+        # for that. Clamp negatives to 1.
+        user.max_concurrent_jobs = max(1, int(body.max_concurrent_jobs))
 
     db.commit()
     db.refresh(user)

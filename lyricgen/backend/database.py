@@ -98,6 +98,12 @@ class User(Base):
     # Catches accidental burst usage (mistake, abuse, or runaway loop).
     max_videos_per_day = Column(Integer, nullable=True)
 
+    # Per-tenant concurrent-jobs cap (a.k.a. "batch size"). None = use system
+    # default DEFAULT_MAX_CONCURRENT_JOBS (10). Counts only jobs in
+    # status="processing"; pending_review and terminal states don't consume
+    # pipeline resources so they don't count.
+    max_concurrent_jobs = Column(Integer, nullable=True)
+
     created_at = Column(DateTime(timezone=True), default=utcnow)
     updated_at = Column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)
 
@@ -118,6 +124,7 @@ class User(Base):
             "email_verified": self.email_verified,
             "ai_authorized": self.ai_authorized,
             "max_videos_per_day": self.max_videos_per_day,
+            "max_concurrent_jobs": self.max_concurrent_jobs,
             "stripe_customer_id": self.stripe_customer_id,
             "created_at": self.created_at.isoformat() if self.created_at else None,
         }

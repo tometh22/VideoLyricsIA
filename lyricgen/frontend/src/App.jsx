@@ -294,11 +294,15 @@ export default function App() {
 
         // Retry-on-429 with exponential backoff. Batch uploads of 30+ files can
         // briefly exceed the per-user rate limit; 429s are transient, not failures.
+        // EXCEPTION: a 429 with "batch limit" is structural — the user has too
+        // many jobs in flight. Retrying won't help until previous jobs finish;
+        // surface the error directly instead of looping.
         let res = null;
         let data = null;
         let attempt = 0;
         const MAX_429_RETRIES = 5;
         let networkError = false;
+        let batchLimitHit = false;
         while (attempt <= MAX_429_RETRIES) {
           try {
             res = await authFetch(`${API}/upload`, { method: "POST", body: formData });
@@ -308,6 +312,16 @@ export default function App() {
           }
           if (res.status !== 429) {
             data = await res.json();
+            break;
+          }
+          // Peek at the body to distinguish rate-limit-burst from batch-limit.
+          // A batch-limit 429 contains "batch limit" in the detail; rate-limit
+          // 429s contain "Rate limit exceeded".
+          let body = null;
+          try { body = await res.clone().json(); } catch { body = null; }
+          if (body && body.detail && /batch limit/i.test(body.detail)) {
+            data = body;
+            batchLimitHit = true;
             break;
           }
           // 429: wait 2^attempt seconds (2, 4, 8, 16, 32) then retry.

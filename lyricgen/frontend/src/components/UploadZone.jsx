@@ -13,6 +13,11 @@ function tokenParam() {
   return token ? `token=${encodeURIComponent(token)}` : "";
 }
 
+// Maximum tracks per batch. Mirrors the backend's DEFAULT_MAX_CONCURRENT_JOBS
+// (10). The backend enforces this server-side too — this is the UX layer that
+// stops the user from picking 50 files and getting 40 of them rejected.
+const MAX_BATCH_SIZE = 10;
+
 const UMG_FRAME_SIZES = [
   { key: "HD",     label: "HD 1920×1080 (16:9)" },
   { key: "UHD-4K", label: "UHD 4K 3840×2160 (16:9)" },
@@ -82,18 +87,29 @@ export default function UploadZone({
     return "";
   };
 
+  const [batchTruncated, setBatchTruncated] = useState(0);
+
   const addFiles = (fileList) => {
     const mp3s = Array.from(fileList).filter((f) =>
       f.name.toLowerCase().endsWith(".mp3")
     );
-    if (mp3s.length) {
-      const newEntries = mp3s.map((f) => ({
+    if (!mp3s.length) return;
+    onFiles((prev) => {
+      const remaining = MAX_BATCH_SIZE - prev.length;
+      if (remaining <= 0) {
+        setBatchTruncated(mp3s.length);
+        return prev;
+      }
+      const accepted = mp3s.slice(0, remaining);
+      const dropped = mp3s.length - accepted.length;
+      if (dropped > 0) setBatchTruncated(dropped);
+      const newEntries = accepted.map((f) => ({
         file: f,
         artist: extractArtist(f.name),
         language: "",
       }));
-      onFiles((prev) => [...prev, ...newEntries]);
-    }
+      return [...prev, ...newEntries];
+    });
   };
 
   const handleDrop = (e) => {
@@ -181,13 +197,32 @@ export default function UploadZone({
           <div onClick={(e) => e.stopPropagation()}>
             <div className="flex items-center justify-between mb-1">
               <span className="text-sm font-medium text-gray-400">
-                {files.length} {files.length > 1 ? t("upload.files") : t("upload.file")}
+                {files.length}/{MAX_BATCH_SIZE} {files.length > 1 ? t("upload.files") : t("upload.file")}
+                {files.length >= MAX_BATCH_SIZE && (
+                  <span className="ml-2 text-[11px] text-amber-400/80">
+                    {t("upload.batch_full") || "batch full"}
+                  </span>
+                )}
               </span>
-              <button
-                onClick={(e) => { e.stopPropagation(); inputRef.current.click(); }}
-                className="text-xs text-brand hover:text-brand-light transition-colors"
-              >{t("upload.add_more")}</button>
+              {files.length < MAX_BATCH_SIZE && (
+                <button
+                  onClick={(e) => { e.stopPropagation(); inputRef.current.click(); }}
+                  className="text-xs text-brand hover:text-brand-light transition-colors"
+                >{t("upload.add_more")}</button>
+              )}
             </div>
+            {batchTruncated > 0 && (
+              <div className="mt-2 px-3 py-2 rounded-lg bg-amber-500/10 border border-amber-500/20">
+                <p className="text-[11px] text-amber-300">
+                  {t("upload.batch_truncated", { dropped: batchTruncated, max: MAX_BATCH_SIZE })
+                    || `${batchTruncated} file(s) ignored — max ${MAX_BATCH_SIZE} per batch. Process this batch first, then upload the rest.`}
+                </p>
+                <button
+                  onClick={(e) => { e.stopPropagation(); setBatchTruncated(0); }}
+                  className="mt-1 text-[10px] text-amber-400/60 hover:text-amber-300"
+                >{t("common.dismiss") || "dismiss"}</button>
+              </div>
+            )}
           </div>
         ) : (
           <div className="py-4">
