@@ -44,7 +44,7 @@ from PIL import Image, ImageDraw, ImageFont
 
 from jobs import update_job, get_job
 import storage
-from render_spec import RenderSpec
+from render_spec import FPS_RATIONAL, RenderSpec
 
 ASSETS_DIR = os.path.join(os.path.dirname(__file__), "..", "assets")
 OUTPUTS_DIR = os.path.join(os.path.dirname(__file__), "..", "outputs")
@@ -1237,7 +1237,17 @@ def _eval_fraction(value: str) -> float:
 
 
 def _validate_umg_master(path: str, spec: RenderSpec) -> list[str]:
-    """Run ffprobe on the master and return a list of spec violations."""
+    """Run ffprobe on the master and return a list of spec violations.
+
+    ffprobe doesn't surface `color_primaries` and `color_transfer` for ProRes
+    output (the colr atom is written but not always parsed). We require
+    `color_space == "bt709"` (reliable, comes from bitstream coefficients) and
+    tolerate missing color_primaries / color_transfer.
+
+    For fractional fps (23.976 / 29.97 / 59.94), we require exact rational
+    match in `r_frame_rate` to catch decimal-vs-rational drift that UMG QC
+    may flag. For integer fps a 0.01 tolerance is fine.
+    """
     cmd = [
         "ffprobe", "-v", "error",
         "-print_format", "json",
@@ -1271,21 +1281,38 @@ def _validate_umg_master(path: str, spec: RenderSpec) -> list[str]:
             f"dimensions={v.get('width')}x{v.get('height')}, "
             f"expected {spec.width}x{spec.height}"
         )
-    actual_fps = _eval_fraction(v.get("r_frame_rate"))
-    if abs(actual_fps - spec.fps) > 0.01:
-        errors.append(
-            f"r_frame_rate={v.get('r_frame_rate')} ({actual_fps:.3f}), "
-            f"expected {spec.fps}"
-        )
+
+    # Frame rate: exact rational for fractional fps (R1); 0.01 tolerance for integer.
+    actual_r_frame_rate = v.get("r_frame_rate")
+    if spec.fps in FPS_RATIONAL:
+        expected_rational = FPS_RATIONAL[spec.fps]
+        if actual_r_frame_rate != expected_rational:
+            errors.append(
+                f"r_frame_rate={actual_r_frame_rate}, expected {expected_rational} "
+                f"(exact rational required for fractional fps)"
+            )
+    else:
+        actual_fps = _eval_fraction(actual_r_frame_rate)
+        if abs(actual_fps - spec.fps) > 0.01:
+            errors.append(
+                f"r_frame_rate={actual_r_frame_rate} ({actual_fps:.3f}), "
+                f"expected {spec.fps}"
+            )
+
     if v.get("pix_fmt") != spec.pix_fmt:
         errors.append(f"pix_fmt={v.get('pix_fmt')}, expected {spec.pix_fmt}")
-    for key, expected in (
-        ("color_primaries", "bt709"),
-        ("color_transfer", "bt709"),
-        ("color_space", "bt709"),
-    ):
-        if v.get(key) != expected:
-            errors.append(f"{key}={v.get(key)}, expected {expected}")
+
+    # Color: only color_space is reliably surfaced for ProRes by ffprobe. The
+    # colr atom (color_primaries + color_transfer) is written by ffmpeg but
+    # ffprobe doesn't parse it for ProRes output across all versions. We
+    # require color_space, and tolerate missing primaries/transfer.
+    if v.get("color_space") != "bt709":
+        errors.append(f"color_space={v.get('color_space')}, expected bt709")
+    for optional_key in ("color_primaries", "color_transfer"):
+        actual = v.get(optional_key)
+        if actual is not None and actual != "bt709":
+            errors.append(f"{optional_key}={actual}, expected bt709 (or absent)")
+
     # display_aspect_ratio is reported like "16:9" or "256:135"
     expected_dar = f"{spec.dar[0]}:{spec.dar[1]}"
     actual_dar = v.get("display_aspect_ratio")
@@ -1380,13 +1407,16 @@ def generate_lyric_video(
     if spec.profile == "umg":
         out_path = os.path.join(job_dir, "umg_master.mov")
         ffmpeg_params = [
+            "-r", spec.fps_str,
             "-profile:v", str(spec.prores_profile),
             "-pix_fmt", spec.pix_fmt,
             "-vendor", "apl0",
             "-color_primaries", "bt709",
             "-color_trc", "bt709",
             "-colorspace", "bt709",
+            "-color_range", "tv",
             "-aspect", f"{spec.dar[0]}:{spec.dar[1]}",
+            "-vf", "setsar=1",
             "-ar", "48000",
         ]
         video.write_videofile(
