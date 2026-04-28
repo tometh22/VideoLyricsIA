@@ -10,6 +10,9 @@ import time
 from dotenv import load_dotenv
 load_dotenv(os.path.join(os.path.dirname(__file__), ".env"))
 
+from credentials_bootstrap import bootstrap_vertex_credentials
+bootstrap_vertex_credentials()
+
 # --- Sentry (must init before FastAPI) ---
 _SENTRY_DSN = os.environ.get("SENTRY_DSN", "")
 if _SENTRY_DSN:

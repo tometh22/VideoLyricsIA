@@ -13,6 +13,9 @@ import os
 import signal
 import sys
 
+from credentials_bootstrap import bootstrap_vertex_credentials
+bootstrap_vertex_credentials()
+
 
 def main():
     redis_url = os.environ.get("REDIS_URL", "").strip()
