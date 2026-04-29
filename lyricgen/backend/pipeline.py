@@ -336,16 +336,35 @@ def _transcribe_via_openai_api(mp3_path: str, language: str | None = None) -> li
     the local model would consume too much worker RAM (~3 GB) and risks OOM.
 
     Cost: ~$0.006 per minute of audio (~$0.02 per song).
+
+    Why whisper-1 and not gpt-4o-transcribe (better text quality):
+        gpt-4o-transcribe and gpt-4o-mini-transcribe only return plain
+        text — no segment timestamps. This pipeline renders lyrics
+        synchronized to the audio, so segment-level start/end times are
+        non-negotiable. whisper-1 (whisper-large-v2) is the only OpenAI
+        transcription model that returns verbose_json with segment
+        timestamps as of 2026-04. We compensate for its older base model
+        by passing initial_prompt and a temperature ladder.
     """
     from openai import OpenAI
 
     client = OpenAI()  # picks up OPENAI_API_KEY from env
-    print(f"[WHISPER-API] transcribing {os.path.basename(mp3_path)} via OpenAI")
+    print(f"[WHISPER-API] transcribing {os.path.basename(mp3_path)} via OpenAI (whisper-1)")
 
+    # Prompt nudges the model to expect song lyrics rather than spoken
+    # word — meaningfully improves transcription on heavily-mixed vocals
+    # like rock songs. The lyrics token vocabulary it primes is also
+    # better for repeated-line detection (chorus).
     kwargs = {
         "model": "whisper-1",
         "response_format": "verbose_json",
         "timestamp_granularities": ["segment"],
+        "prompt": "Letras de canción:" if (language or "").startswith("es")
+                  else "Song lyrics:",
+        # temperature=0 gives the most confident output; we lower the
+        # default 0.0 ladder so it doesn't sample alternative
+        # interpretations on tricky words.
+        "temperature": 0.0,
     }
     if language:
         kwargs["language"] = language
