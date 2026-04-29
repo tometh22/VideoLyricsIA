@@ -605,6 +605,13 @@ def _get_genai_client():
     global _genai_client
     if _genai_client is None:
         from google import genai
+        # Print version once so we can diagnose auth issues that turn out
+        # to be SDK-version-specific (Railway sometimes installs stale
+        # versions if the requirements pin is too loose).
+        print(f"[VERTEX] google-genai version: {genai.__version__}")
+        print(f"[VERTEX] project={_VERTEX_PROJECT} location={_VERTEX_LOCATION}")
+        print(f"[VERTEX] credentials path: {os.environ.get('GOOGLE_APPLICATION_CREDENTIALS')}")
+        print(f"[VERTEX] credentials exists: {os.path.exists(os.environ.get('GOOGLE_APPLICATION_CREDENTIALS', ''))}")
         _genai_client = genai.Client(
             vertexai=True,
             project=_VERTEX_PROJECT,
