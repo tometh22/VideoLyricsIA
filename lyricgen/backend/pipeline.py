@@ -69,7 +69,17 @@ def _upload_deliverables_to_r2(job_id: str, job_dir: str, files: dict) -> dict:
     """
     if not storage.is_enabled():
         return {}
-    job = get_job(job_id)
+    # get_job() requires a SQLAlchemy session, but this function runs in the
+    # worker context with no request-scoped session available. Create one
+    # here just to look up the tenant_id, then close it. (We could pass
+    # tenant_id in from the caller, but the call site already has the job_id
+    # and we need the cheap row read.)
+    from database import SessionLocal
+    _db = SessionLocal()
+    try:
+        job = get_job(_db, job_id)
+    finally:
+        _db.close()
     tenant_id = (job or {}).get("tenant_id", "default")
     out: dict = {}
     for file_type, _url in files.items():
