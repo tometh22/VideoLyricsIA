@@ -68,9 +68,13 @@ def enqueue_pipeline(
     q = _pick_queue(plan)
     if q is not None:
         from pipeline import run_pipeline
+        # RQ's enqueue() does not accept positional args together with the
+        # explicit kwargs= parameter — you have to pass either bare *args/**kwargs
+        # or use both args= and kwargs= explicitly. We use the explicit form
+        # because we want to forward the caller's **kwargs to the worker.
         rq_job = q.enqueue(
             run_pipeline,
-            job_id, mp3_path, artist, style,
+            args=(job_id, mp3_path, artist, style),
             kwargs=kwargs,
             job_timeout=JOB_TIMEOUT,
             result_ttl=RESULT_TTL,
