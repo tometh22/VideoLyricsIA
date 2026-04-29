@@ -383,15 +383,15 @@ def transcribe(mp3_path: str, language: str = None) -> list[dict]:
     Backend selection:
         - If OPENAI_API_KEY is set, route to the OpenAI Whisper API. This is
           the production path: no local model, no OOM risk on 1-2 GB workers.
-        - Otherwise fall back to the local Whisper-turbo model. Works for
-          development on machines with enough RAM, and for self-hosted users
-          who don't want to send audio to OpenAI.
+          Errors propagate — no silent fallback to the 1.5 GB local model
+          that frequently OOMs on small instances.
+        - If OPENAI_API_KEY is not set, fall back to the local Whisper-turbo
+          model. Works for development on machines with enough RAM.
     """
-    if os.environ.get("OPENAI_API_KEY", "").strip():
-        try:
-            return _transcribe_via_openai_api(mp3_path, language=language)
-        except Exception as e:
-            print(f"[WHISPER-API] failed ({e}); falling back to local model")
+    has_key = bool(os.environ.get("OPENAI_API_KEY", "").strip())
+    print(f"[transcribe] OPENAI_API_KEY={'set' if has_key else 'EMPTY'}")
+    if has_key:
+        return _transcribe_via_openai_api(mp3_path, language=language)
 
     # --- local Whisper path ---
     audio_path = mp3_path
