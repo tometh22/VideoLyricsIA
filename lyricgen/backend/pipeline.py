@@ -122,7 +122,9 @@ def _cleanup_local_intermediates(job_dir: str) -> None:
 def run_pipeline(job_id: str, mp3_path: str, artist: str, style: str,
                  language: str = None, segments_override: list[dict] = None,
                  delivery_profile: str = "youtube", umg_spec: dict | None = None,
-                 background_path: str = None):
+                 background_path: str = None,
+                 input_r2_key: str | None = None,
+                 bg_r2_key: str | None = None):
     """Run the full pipeline for a job. Called synchronously.
 
     delivery_profile:
@@ -133,9 +135,34 @@ def run_pipeline(job_id: str, mp3_path: str, artist: str, style: str,
     background_path:
         If provided, skip AI background generation and use the human-provided
         asset instead (UMG Guideline 10 compliance).
+
+    input_r2_key / bg_r2_key:
+        When the API and worker run in separate containers (e.g. Railway), the
+        local mp3_path / background_path written by the API are NOT visible
+        to the worker. The API uploads the input MP3 (and any custom
+        background) to R2 and passes the keys here; we download them locally
+        before processing, restoring the same file paths the rest of the
+        pipeline expects.
     """
     job_dir = os.path.join(OUTPUTS_DIR, job_id)
     os.makedirs(job_dir, exist_ok=True)
+
+    # Materialize R2-stored inputs onto local disk so moviepy/ffmpeg/whisper
+    # can open them. No-op when running on a single host (no R2 keys passed).
+    if input_r2_key and not os.path.exists(mp3_path):
+        if not storage.download_object(input_r2_key, mp3_path):
+            update_job(
+                job_id, status="error",
+                error=f"Failed to fetch input from R2: {input_r2_key}",
+            )
+            return
+    if bg_r2_key and background_path and not os.path.exists(background_path):
+        if not storage.download_object(bg_r2_key, background_path):
+            update_job(
+                job_id, status="error",
+                error=f"Failed to fetch background from R2: {bg_r2_key}",
+            )
+            return
 
     wants_youtube = delivery_profile in ("youtube", "both")
     wants_umg = delivery_profile in ("umg", "both")

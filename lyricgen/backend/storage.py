@@ -46,6 +46,12 @@ def _object_key(tenant_id: str, job_id: str, filename: str) -> str:
     return f"{tenant_id}/{job_id}/{filename}"
 
 
+def _input_object_key(tenant_id: str, job_id: str, filename: str) -> str:
+    """Inputs (user-uploaded MP3s) live under a separate prefix so lifecycle
+    rules can purge them aggressively without touching deliverables."""
+    return f"inputs/{tenant_id}/{job_id}/{filename}"
+
+
 def upload_master(local_path: str, tenant_id: str, job_id: str, filename: str) -> Optional[str]:
     """Upload a rendered file to R2. Returns the object key or None if R2 is
     not configured. Raises on actual S3 errors so the caller can mark the job
@@ -60,6 +66,40 @@ def upload_master(local_path: str, tenant_id: str, job_id: str, filename: str) -
     size_mb = os.path.getsize(local_path) / 1024 / 1024
     print(f"[R2] Uploaded {key} ({size_mb:.1f} MB)")
     return key
+
+
+def upload_input(local_path: str, tenant_id: str, job_id: str, filename: str) -> Optional[str]:
+    """Upload a user-provided input file (MP3, custom background) to R2 so
+    that worker containers can fetch it without sharing a filesystem with the
+    API. Returns the object key or None if R2 is disabled. Raises on errors."""
+    client = _get_client()
+    if client is None:
+        return None
+    key = _input_object_key(tenant_id, job_id, filename)
+    content_type = _guess_content_type(filename) or "application/octet-stream"
+    client.upload_file(
+        local_path, R2_BUCKET, key, ExtraArgs={"ContentType": content_type}
+    )
+    size_mb = os.path.getsize(local_path) / 1024 / 1024
+    print(f"[R2] Uploaded input {key} ({size_mb:.1f} MB)")
+    return key
+
+
+def download_object(key: str, dest_path: str) -> bool:
+    """Download an R2 object to a local path. Returns True on success, False
+    if R2 is disabled or the download fails (caller decides what to do)."""
+    client = _get_client()
+    if client is None:
+        return False
+    os.makedirs(os.path.dirname(dest_path) or ".", exist_ok=True)
+    try:
+        client.download_file(R2_BUCKET, key, dest_path)
+        size_mb = os.path.getsize(dest_path) / 1024 / 1024
+        print(f"[R2] Downloaded {key} -> {dest_path} ({size_mb:.1f} MB)")
+        return True
+    except Exception as e:
+        print(f"[R2] Download failed for {key}: {e}")
+        return False
 
 
 def generate_signed_url(key: str, expiry_seconds: int = 3600) -> Optional[str]:

@@ -596,8 +596,19 @@ async def upload(
     with open(mp3_path, "wb") as f:
         f.write(data)
 
+    # When R2 is configured, upload the input MP3 so the worker (a separate
+    # container) can fetch it. Without this, worker fails with "No such file
+    # or directory" because /app/../outputs/... lives on the API container's
+    # disk only.
+    input_r2_key = None
+    if storage.is_enabled():
+        input_r2_key = storage.upload_input(
+            mp3_path, tenant_id, job_id, file.filename,
+        )
+
     # Resolve background: library asset > custom upload > AI generation
     bg_path = None
+    bg_r2_key = None
     if background_id:
         from database import BackgroundAsset
         asset = db.query(BackgroundAsset).filter(BackgroundAsset.id == background_id, BackgroundAsset.is_active == True).first()
@@ -606,9 +617,15 @@ async def upload(
     elif background_file and background_file.filename:
         bg_ext = os.path.splitext(background_file.filename)[1].lower()
         if bg_ext in (".mp4", ".mov", ".jpg", ".jpeg", ".png"):
-            bg_path = os.path.join(job_dir, f"bg_custom{bg_ext}")
+            bg_filename = f"bg_custom{bg_ext}"
+            bg_path = os.path.join(job_dir, bg_filename)
             with open(bg_path, "wb") as f:
                 shutil.copyfileobj(background_file.file, f)
+            # User-provided backgrounds also need to cross to the worker.
+            if storage.is_enabled():
+                bg_r2_key = storage.upload_input(
+                    bg_path, tenant_id, job_id, bg_filename,
+                )
 
     lang = language.strip() if language.strip() else None
 
@@ -622,6 +639,8 @@ async def upload(
         delivery_profile=delivery_profile,
         umg_spec=umg_spec,
         background_path=bg_path,
+        input_r2_key=input_r2_key,
+        bg_r2_key=bg_r2_key,
     )
 
     return {"job_id": job_id}
@@ -734,8 +753,16 @@ async def generate_with_segments(
     with open(mp3_path, "wb") as f:
         f.write(data)
 
+    # Cross-container input transfer via R2 — see /upload for the full reason.
+    input_r2_key = None
+    if storage.is_enabled():
+        input_r2_key = storage.upload_input(
+            mp3_path, current_user["tenant_id"], job_id, file.filename,
+        )
+
     # Resolve background: library asset > custom upload > AI generation
     bg_path = None
+    bg_r2_key = None
     if background_id:
         from database import BackgroundAsset
         asset = db.query(BackgroundAsset).filter(BackgroundAsset.id == background_id, BackgroundAsset.is_active == True).first()
@@ -744,9 +771,14 @@ async def generate_with_segments(
     elif background_file and background_file.filename:
         bg_ext = os.path.splitext(background_file.filename)[1].lower()
         if bg_ext in (".mp4", ".mov", ".jpg", ".jpeg", ".png"):
-            bg_path = os.path.join(job_dir, f"bg_custom{bg_ext}")
+            bg_filename = f"bg_custom{bg_ext}"
+            bg_path = os.path.join(job_dir, bg_filename)
             with open(bg_path, "wb") as f:
                 shutil.copyfileobj(background_file.file, f)
+            if storage.is_enabled():
+                bg_r2_key = storage.upload_input(
+                    bg_path, current_user["tenant_id"], job_id, bg_filename,
+                )
 
     enqueue_pipeline(
         job_id=job_id,
@@ -758,6 +790,8 @@ async def generate_with_segments(
         delivery_profile=delivery_profile,
         umg_spec=umg_spec,
         background_path=bg_path,
+        input_r2_key=input_r2_key,
+        bg_r2_key=bg_r2_key,
     )
 
     return {"job_id": job_id}
