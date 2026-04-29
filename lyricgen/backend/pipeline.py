@@ -601,22 +601,50 @@ _genai_client = None
 
 
 def _get_genai_client():
-    """Get a cached Vertex AI GenAI client."""
+    """Get a cached Vertex AI GenAI client.
+
+    We pass credentials EXPLICITLY (not relying on the SDK's default
+    application-default-credentials discovery) because Railway's container
+    environment has been triggering "invalid_scope: Invalid OAuth scope or
+    ID token audience provided" with default discovery — the SDK's auth
+    chain ends up requesting an ID token instead of an OAuth2 access token,
+    or hits a regional endpoint that rejects the default scope.
+
+    Building Credentials.from_service_account_file with explicit
+    cloud-platform scope gives us a normal OAuth2 access token that all
+    Vertex endpoints accept. Same credentials work locally — the explicit
+    binding just removes the SDK's environment guesswork.
+    """
     global _genai_client
     if _genai_client is None:
         from google import genai
-        # Print version once so we can diagnose auth issues that turn out
-        # to be SDK-version-specific (Railway sometimes installs stale
-        # versions if the requirements pin is too loose).
+        from google.oauth2 import service_account
+
+        creds_path = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS", "").strip()
         print(f"[VERTEX] google-genai version: {genai.__version__}")
         print(f"[VERTEX] project={_VERTEX_PROJECT} location={_VERTEX_LOCATION}")
-        print(f"[VERTEX] credentials path: {os.environ.get('GOOGLE_APPLICATION_CREDENTIALS')}")
-        print(f"[VERTEX] credentials exists: {os.path.exists(os.environ.get('GOOGLE_APPLICATION_CREDENTIALS', ''))}")
-        _genai_client = genai.Client(
+        print(f"[VERTEX] credentials path: {creds_path}")
+        print(f"[VERTEX] credentials exists: {os.path.exists(creds_path)}")
+
+        client_kwargs = dict(
             vertexai=True,
             project=_VERTEX_PROJECT,
             location=_VERTEX_LOCATION,
         )
+        if creds_path and os.path.exists(creds_path):
+            try:
+                credentials = service_account.Credentials.from_service_account_file(
+                    creds_path,
+                    scopes=["https://www.googleapis.com/auth/cloud-platform"],
+                )
+                client_kwargs["credentials"] = credentials
+                print(f"[VERTEX] using explicit service account credentials "
+                      f"({credentials.service_account_email})")
+            except Exception as e:
+                print(f"[VERTEX] failed to load explicit credentials ({e}); "
+                      f"falling back to ADC discovery")
+
+        _genai_client = genai.Client(**client_kwargs)
     return _genai_client
 
 # Combinatorial prompt system — elements combine to create unique prompts.
