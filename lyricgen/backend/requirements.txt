@@ -6,6 +6,7 @@ python-jose[cryptography]>=3.3.0
 passlib[bcrypt]>=1.7.4
 bcrypt<4.1
 openai-whisper
+openai>=1.50.0
 moviepy==1.0.3
 librosa==0.10.2
 Pillow==11.1.0

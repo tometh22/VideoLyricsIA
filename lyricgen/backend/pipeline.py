@@ -320,10 +320,80 @@ def _get_whisper_model(name: str = "turbo"):
     return _WHISPER_MODELS[name]
 
 
+def _transcribe_via_openai_api(mp3_path: str, language: str | None = None) -> list[dict]:
+    """Transcribe by calling OpenAI's Whisper API. Returns the same segments
+    structure as the local Whisper path. Used in production where loading
+    the local model would consume too much worker RAM (~3 GB) and risks OOM.
+
+    Cost: ~$0.006 per minute of audio (~$0.02 per song).
+    """
+    from openai import OpenAI
+
+    client = OpenAI()  # picks up OPENAI_API_KEY from env
+    print(f"[WHISPER-API] transcribing {os.path.basename(mp3_path)} via OpenAI")
+
+    kwargs = {
+        "model": "whisper-1",
+        "response_format": "verbose_json",
+        "timestamp_granularities": ["segment"],
+    }
+    if language:
+        kwargs["language"] = language
+
+    with open(mp3_path, "rb") as f:
+        kwargs["file"] = f
+        response = client.audio.transcriptions.create(**kwargs)
+
+    raw_segments = response.segments or []
+    import re as _re
+
+    segments: list[dict] = []
+    for seg in raw_segments:
+        text = (seg.text or "").strip()
+        if not text or len(text) < 3:
+            continue
+        # Same filters as local path so behavior matches.
+        if _re.search(r'[一-鿿぀-ゟ゠-ヿ가-힯]', text):
+            print(f"[WHISPER-API] Filtered non-latin: {text[:60]}")
+            continue
+        if any(spam in text.lower() for spam in _SPAM_PATTERNS):
+            print(f"[WHISPER-API] Filtered spam: {text[:60]}")
+            continue
+        if (seg.no_speech_prob or 0) > 0.7:
+            print(f"[WHISPER-API] Filtered low-confidence: {text[:60]}")
+            continue
+        segments.append({
+            "start": float(seg.start),
+            "end": float(seg.end),
+            "text": text,
+        })
+
+    GAP = 0.05
+    for i in range(len(segments) - 1):
+        if segments[i]["end"] > segments[i + 1]["start"] - GAP:
+            segments[i]["end"] = segments[i + 1]["start"] - GAP
+
+    print(f"[WHISPER-API] {len(segments)} segments")
+    return segments
+
+
 def transcribe(mp3_path: str, language: str = None) -> list[dict]:
-    """Transcribe: isolate vocals with Demucs, then transcribe with Whisper turbo."""
-    # Use original audio — Demucs vocal isolation can introduce artifacts
-    # that confuse Whisper more than the original mix
+    """Transcribe an audio file to lyric segments.
+
+    Backend selection:
+        - If OPENAI_API_KEY is set, route to the OpenAI Whisper API. This is
+          the production path: no local model, no OOM risk on 1-2 GB workers.
+        - Otherwise fall back to the local Whisper-turbo model. Works for
+          development on machines with enough RAM, and for self-hosted users
+          who don't want to send audio to OpenAI.
+    """
+    if os.environ.get("OPENAI_API_KEY", "").strip():
+        try:
+            return _transcribe_via_openai_api(mp3_path, language=language)
+        except Exception as e:
+            print(f"[WHISPER-API] failed ({e}); falling back to local model")
+
+    # --- local Whisper path ---
     audio_path = mp3_path
 
     model = _get_whisper_model("turbo")
