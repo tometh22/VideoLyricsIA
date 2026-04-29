@@ -27,12 +27,19 @@ def main():
     from rq import Queue, Worker
 
     # Warm the Whisper model so the first job does not pay the load cost.
-    try:
-        from pipeline import _get_whisper_model
-        _get_whisper_model("turbo")
-        print("[WORKER] Whisper model preloaded")
-    except Exception as e:
-        print(f"[WORKER] Whisper preload failed ({e}); will load on first job")
+    # SKIP this when OPENAI_API_KEY is set — transcription routes through the
+    # OpenAI Whisper API and the local 1.5 GB model is just dead weight that
+    # increases worker RAM and starts the container into immediate OOM
+    # territory on small instances.
+    if os.environ.get("OPENAI_API_KEY", "").strip():
+        print("[WORKER] OPENAI_API_KEY set; skipping local Whisper preload")
+    else:
+        try:
+            from pipeline import _get_whisper_model
+            _get_whisper_model("turbo")
+            print("[WORKER] Whisper model preloaded")
+        except Exception as e:
+            print(f"[WORKER] Whisper preload failed ({e}); will load on first job")
 
     conn = Redis.from_url(redis_url)
     # Enterprise queue first so premium tenants get priority.
