@@ -637,9 +637,26 @@ def _get_genai_client():
                     creds_path,
                     scopes=["https://www.googleapis.com/auth/cloud-platform"],
                 )
+                # Bind the quota project explicitly. Some Vertex AI endpoints
+                # (Veo specifically) reject token requests when quota project
+                # is ambiguous, surfacing as "invalid_scope: Invalid OAuth
+                # scope or ID token audience provided."
+                credentials = credentials.with_quota_project(_VERTEX_PROJECT)
+
+                # Validate the token at startup so we surface auth issues
+                # here in the worker logs instead of inside the model call.
+                from google.auth.transport.requests import Request as _AuthReq
+                try:
+                    credentials.refresh(_AuthReq())
+                    print(f"[VERTEX] token refresh OK; valid={credentials.valid} "
+                          f"expiry={credentials.expiry}")
+                except Exception as refresh_err:
+                    print(f"[VERTEX] token refresh FAILED: {refresh_err}")
+
                 client_kwargs["credentials"] = credentials
                 print(f"[VERTEX] using explicit service account credentials "
-                      f"({credentials.service_account_email})")
+                      f"({credentials.service_account_email}, "
+                      f"quota_project={_VERTEX_PROJECT})")
             except Exception as e:
                 print(f"[VERTEX] failed to load explicit credentials ({e}); "
                       f"falling back to ADC discovery")
