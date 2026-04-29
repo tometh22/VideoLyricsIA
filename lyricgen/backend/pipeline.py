@@ -1236,7 +1236,18 @@ def _get_background_clip_from_path(bg_path: str, style: str, duration: float,
 
 
 # Font pool — Google Fonts only (SIL OFL = full commercial use, no royalties)
-_FONTS_DIR = os.path.join(os.path.dirname(__file__), "..", "assets", "fonts")
+# Fonts: prefer the bundled copy inside the backend (so the Docker image
+# self-contains them and Railway's build context — which is just lyricgen/backend
+# — has them available). Fall back to the repo-level /assets/fonts for local
+# dev runs that haven't moved the files yet.
+_FONTS_DIR_CANDIDATES = [
+    os.path.join(os.path.dirname(__file__), "fonts"),
+    os.path.join(os.path.dirname(__file__), "..", "assets", "fonts"),
+]
+_FONTS_DIR = next(
+    (p for p in _FONTS_DIR_CANDIDATES if os.path.isdir(p)),
+    _FONTS_DIR_CANDIDATES[0],
+)
 _LYRIC_FONTS = [
     # Sans-serif (clean, modern)
     "Montserrat-Bold.ttf",
