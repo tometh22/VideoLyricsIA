@@ -897,6 +897,21 @@ def _veo_access_token() -> str:
     return creds.token
 
 
+def _veo_cache_key(prompt: str, model: str, params: dict) -> str:
+    """Stable hash of the Veo request. Two requests with the same prompt and
+    parameters return the same key, so we can dedupe paid generations across
+    runs (especially during testing — UMG production prompts are unique per
+    song so cache hits are rare there)."""
+    import hashlib as _hash
+    import json as _json
+    payload = _json.dumps(
+        {"prompt": prompt, "model": model, "params": params},
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return _hash.sha256(payload.encode()).hexdigest()[:16]
+
+
 def _generate_veo_video(prompt: str, output_path: str, job_id: str = None) -> str:
     """Generate a video clip with Google Veo 3 via direct Vertex AI REST API.
 
@@ -908,35 +923,65 @@ def _generate_veo_video(prompt: str, output_path: str, job_id: str = None) -> st
 
     Endpoint: predictLongRunning -> poll operation -> download mp4.
     Rate-limit aware (5 attempts with exponential backoff).
+    R2-cached by prompt hash so identical retries do not bill twice.
     """
     from provenance import record_ai_call
+    import storage as _storage
     import time as _time
     import requests as _req
     global _last_veo_request
 
-    # Proactive cooldown — wait if last request was too recent
+    safe_prompt = (
+        f"{prompt}. Photorealistic, filmed with cinema camera, real footage. "
+        "No text, no words, no letters, no signs, no billboards, no posters, "
+        "no banners, no graffiti, no shop windows, no street signs, no neon "
+        "signs, no logos, no trademarks, no brand symbols, no people, "
+        "no faces, no hands, no CGI, no animation."
+    )
+
+    # veo-3.1-fast at $0.10/s (no audio) is 75% cheaper than the standard
+    # veo-3.1-generate at $0.40/s. Visual quality is slightly softer; we
+    # apply a sigma=2 gaussian blur after generation which masks the
+    # softness and improves lyric legibility on top of the background.
+    model = "veo-3.1-fast-generate-001"
+    veo_params = {
+        "aspectRatio": "16:9",
+        "sampleCount": 1,
+        "generateAudio": False,
+    }
+    blur_sigma = 2.0
+
+    cache_key_hash = _veo_cache_key(
+        safe_prompt, model, {**veo_params, "blur_sigma": blur_sigma}
+    )
+    cache_object_key = f"cache/veo/{cache_key_hash}.mp4"
+
+    recorder = record_ai_call(
+        job_id=job_id or "unknown",
+        step="video_bg",
+        tool_name=model,
+        tool_provider="google_vertex",
+        prompt=safe_prompt,
+        input_data_types=["generated_prompt"],
+    ) if job_id else None
+
+    if _storage.is_enabled() and _storage.object_exists(cache_object_key):
+        if _storage.download_object(cache_object_key, output_path):
+            size_mb = os.path.getsize(output_path) / 1024 / 1024
+            print(f"[BG] Veo cache HIT ({cache_key_hash}): {size_mb:.1f} MB — skipped paid generation")
+            if recorder:
+                recorder.finish(
+                    response_summary=f"cache_hit: {size_mb:.1f}MB key={cache_key_hash}",
+                    output_artifact=output_path,
+                )
+            return output_path
+
     elapsed = _time.time() - _last_veo_request
     if elapsed < _VEO_COOLDOWN and _last_veo_request > 0:
         wait = _VEO_COOLDOWN - elapsed
         print(f"[BG] Cooldown: waiting {wait:.0f}s before next Veo request...")
         _time.sleep(wait)
 
-    safe_prompt = (
-        f"{prompt}. Photorealistic, filmed with cinema camera, real footage. "
-        "No text, no words, no letters, no people, no faces, no hands, "
-        "no CGI, no animation."
-    )
-
-    recorder = record_ai_call(
-        job_id=job_id or "unknown",
-        step="video_bg",
-        tool_name="veo-3.1-generate-001",
-        tool_provider="google_vertex",
-        prompt=safe_prompt,
-        input_data_types=["generated_prompt"],
-    ) if job_id else None
-
-    model = "veo-3.1-generate-001"
     base_url = (
         f"https://{_VERTEX_LOCATION}-aiplatform.googleapis.com/v1"
         f"/projects/{_VERTEX_PROJECT}/locations/{_VERTEX_LOCATION}"
@@ -945,11 +990,7 @@ def _generate_veo_video(prompt: str, output_path: str, job_id: str = None) -> st
     submit_url = f"{base_url}:predictLongRunning"
     request_body = {
         "instances": [{"prompt": safe_prompt}],
-        "parameters": {
-            "aspectRatio": "16:9",
-            "sampleCount": 1,
-            "generateAudio": False,
-        },
+        "parameters": veo_params,
     }
 
     operation_name: str | None = None
@@ -1073,10 +1114,46 @@ def _generate_veo_video(prompt: str, output_path: str, job_id: str = None) -> st
         raise RuntimeError(f"Veo video has no uri or bytes: {video_entry}")
 
     size_mb = os.path.getsize(output_path) / 1024 / 1024
-    print(f"[BG] Veo 3 video saved: {size_mb:.1f} MB")
+    print(f"[BG] Veo 3 video saved: {size_mb:.1f} MB (raw)")
+
+    # Apply subtle gaussian blur. Veo Fast outputs are slightly softer than
+    # standard; a small blur normalises that softness, hides minor artefacts,
+    # and improves contrast for the lyric overlay rendered on top.
+    import subprocess as _sp
+    blurred = output_path + ".blurred.mp4"
+    try:
+        _sp.run(
+            [
+                "ffmpeg", "-y", "-loglevel", "error",
+                "-i", output_path,
+                "-vf", f"gblur=sigma={blur_sigma}",
+                "-c:a", "copy",
+                blurred,
+            ],
+            check=True,
+            timeout=60,
+        )
+        os.replace(blurred, output_path)
+        size_mb = os.path.getsize(output_path) / 1024 / 1024
+        print(f"[BG] Blur applied (sigma={blur_sigma}): {size_mb:.1f} MB")
+    except Exception as e:
+        print(f"[BG] Blur skipped (non-fatal): {e}")
+        if os.path.exists(blurred):
+            try:
+                os.unlink(blurred)
+            except OSError:
+                pass
+
+    if _storage.is_enabled():
+        try:
+            _storage.upload_file(output_path, cache_object_key)
+            print(f"[BG] Veo cache STORED: {cache_object_key}")
+        except Exception as e:
+            print(f"[BG] Veo cache upload failed (non-fatal): {e}")
+
     if recorder:
         recorder.finish(
-            response_summary=f"video_generated: {size_mb:.1f}MB",
+            response_summary=f"video_generated: {size_mb:.1f}MB key={cache_key_hash}",
             output_artifact=output_path,
         )
     return output_path

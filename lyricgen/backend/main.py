@@ -967,7 +967,7 @@ _DATA_POLICY = {
             "data_not_sent": ["Full audio files", "User personal data", "Billing information"],
         },
         {
-            "api": "Veo 3.1 (veo-3.1-generate-001)",
+            "api": "Veo 3.1 Fast (veo-3.1-fast-generate-001)",
             "purpose": "Video background generation",
             "data_sent": ["AI-generated scene description prompt (no artist/lyrics data)"],
             "data_not_sent": ["Audio files", "Lyrics text", "Artist name"],
@@ -1012,11 +1012,11 @@ async def compliance_status(
             "guideline_1_tools": {
                 "status": "confirmed" if _VERTEX_ENTERPRISE_CONFIRMED else "pending",
                 "detail": (
-                    "Google Veo 3.1 via Vertex AI Enterprise API is in use. "
+                    "Google Veo 3.1 Fast via Vertex AI Enterprise API is in use. "
                     + ("Enterprise agreement has been confirmed." if _VERTEX_ENTERPRISE_CONFIRMED
                        else "ACTION REQUIRED: Confirm with UMG that your Vertex AI enterprise contract qualifies as the required enterprise-level agreement for Google Veo.")
                 ),
-                "tool": "veo-3.1-generate-001",
+                "tool": "veo-3.1-fast-generate-001",
                 "provider": "Google Cloud Vertex AI",
                 "project": os.environ.get("VERTEX_PROJECT", ""),
             },

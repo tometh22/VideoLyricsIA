@@ -85,6 +85,32 @@ def upload_input(local_path: str, tenant_id: str, job_id: str, filename: str) ->
     return key
 
 
+def object_exists(key: str) -> bool:
+    """Check whether an object exists at the given key. False on R2 disabled
+    or any error (treated as cache miss)."""
+    client = _get_client()
+    if client is None:
+        return False
+    try:
+        client.head_object(Bucket=R2_BUCKET, Key=key)
+        return True
+    except Exception:
+        return False
+
+
+def upload_file(local_path: str, key: str) -> Optional[str]:
+    """Upload a local file to an arbitrary R2 key (used for cache, etc).
+    Returns the key on success, None if R2 disabled. Raises on real errors."""
+    client = _get_client()
+    if client is None:
+        return None
+    content_type = _guess_content_type(key) or "application/octet-stream"
+    client.upload_file(
+        local_path, R2_BUCKET, key, ExtraArgs={"ContentType": content_type}
+    )
+    return key
+
+
 def download_object(key: str, dest_path: str) -> bool:
     """Download an R2 object to a local path. Returns True on success, False
     if R2 is disabled or the download fails (caller decides what to do)."""
