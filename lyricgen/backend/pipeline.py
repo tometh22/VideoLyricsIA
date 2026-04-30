@@ -868,10 +868,38 @@ _last_veo_request = 0  # timestamp of last Veo API call
 _VEO_COOLDOWN = 5      # seconds between Veo requests (Veo 3.1 has 50 req/min quota)
 
 
+def _veo_access_token() -> str:
+    """Build an explicit cloud-platform-scoped access token for the Vertex AI
+    REST API. Bypasses google-genai SDK's internal auth chain which has been
+    triggering invalid_scope errors on Railway despite the credentials being
+    valid (Gemini works on the same token; only Veo rejects through the SDK)."""
+    from google.oauth2 import service_account
+    from google.auth.transport.requests import Request
+
+    creds_path = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS", "").strip()
+    if not creds_path or not os.path.exists(creds_path):
+        raise RuntimeError(f"GOOGLE_APPLICATION_CREDENTIALS not found: {creds_path!r}")
+    creds = service_account.Credentials.from_service_account_file(
+        creds_path,
+        scopes=["https://www.googleapis.com/auth/cloud-platform"],
+    )
+    creds = creds.with_quota_project(_VERTEX_PROJECT)
+    creds.refresh(Request())
+    return creds.token
+
+
 def _generate_veo_video(prompt: str, output_path: str, job_id: str = None) -> str:
-    """Generate a video clip with Google Veo 3. Rate-limit aware."""
-    from google import genai
-    from google.genai.errors import ClientError
+    """Generate a video clip with Google Veo 3 via direct Vertex AI REST API.
+
+    We bypass google-genai SDK for Veo specifically because its internal auth
+    chain hits "invalid_scope: Invalid OAuth scope or ID token audience" on
+    Railway even when our explicit credentials work for Gemini through the
+    same SDK. Direct REST gives us full control over headers, scopes, and
+    endpoints.
+
+    Endpoint: predictLongRunning -> poll operation -> download mp4.
+    Rate-limit aware (5 attempts with exponential backoff).
+    """
     from provenance import record_ai_call
     import time as _time
     import requests as _req
@@ -884,9 +912,11 @@ def _generate_veo_video(prompt: str, output_path: str, job_id: str = None) -> st
         print(f"[BG] Cooldown: waiting {wait:.0f}s before next Veo request...")
         _time.sleep(wait)
 
-    client = _get_genai_client()
-
-    safe_prompt = f"{prompt}. Photorealistic, filmed with cinema camera, real footage. No text, no words, no letters, no people, no faces, no hands, no CGI, no animation."
+    safe_prompt = (
+        f"{prompt}. Photorealistic, filmed with cinema camera, real footage. "
+        "No text, no words, no letters, no people, no faces, no hands, "
+        "no CGI, no animation."
+    )
 
     recorder = record_ai_call(
         job_id=job_id or "unknown",
@@ -897,57 +927,141 @@ def _generate_veo_video(prompt: str, output_path: str, job_id: str = None) -> st
         input_data_types=["generated_prompt"],
     ) if job_id else None
 
-    # Patient retries for batch processing — wait and retry up to 5 times
+    model = "veo-3.1-generate-001"
+    base_url = (
+        f"https://{_VERTEX_LOCATION}-aiplatform.googleapis.com/v1"
+        f"/projects/{_VERTEX_PROJECT}/locations/{_VERTEX_LOCATION}"
+        f"/publishers/google/models/{model}"
+    )
+    submit_url = f"{base_url}:predictLongRunning"
+    request_body = {
+        "instances": [{"prompt": safe_prompt}],
+        "parameters": {
+            "aspectRatio": "16:9",
+            "sampleCount": 1,
+            "generateAudio": False,
+        },
+    }
+
+    operation_name: str | None = None
     for attempt in range(5):
         try:
             print(f"[BG] Veo 3: generating video (attempt {attempt + 1}/5)...")
-            operation = client.models.generate_videos(
-                model="veo-3.1-generate-001",
-                prompt=safe_prompt,
-                config=genai.types.GenerateVideosConfig(
-                    aspect_ratio="16:9",
-                    number_of_videos=1,
-                    generate_audio=False,
-                ),
+            token = _veo_access_token()
+            r = _req.post(
+                submit_url,
+                headers={
+                    "Authorization": f"Bearer {token}",
+                    "Content-Type": "application/json",
+                    "x-goog-user-project": _VERTEX_PROJECT,
+                },
+                json=request_body,
+                timeout=60,
             )
-            break
-        except ClientError as e:
-            if "429" in str(e) or "RESOURCE_EXHAUSTED" in str(e):
-                wait = 60 * (attempt + 1)  # 60s, 120s, 180s, 240s, 300s
-                print(f"[BG] Rate limited, waiting {wait}s before retry...")
+            if r.status_code == 429 or "RESOURCE_EXHAUSTED" in r.text:
+                wait = 60 * (attempt + 1)
+                print(f"[BG] Rate limited (HTTP {r.status_code}), waiting {wait}s before retry...")
                 _time.sleep(wait)
-            else:
-                if recorder:
-                    recorder.finish(response_summary=f"error: {str(e)[:200]}")
-                raise
+                continue
+            if not r.ok:
+                detail = r.text[:500]
+                raise RuntimeError(
+                    f"Veo predictLongRunning HTTP {r.status_code}: {detail}"
+                )
+            payload = r.json()
+            operation_name = payload.get("name")
+            if not operation_name:
+                raise RuntimeError(f"Veo response missing 'name': {payload}")
+            break
+        except RuntimeError:
+            raise
+        except Exception as e:
+            print(f"[BG] Veo 3 attempt {attempt + 1} request error: {e}")
+            wait = 60 * (attempt + 1)
+            _time.sleep(wait)
     else:
         if recorder:
             recorder.finish(response_summary="error: rate_limit_exceeded_after_5_retries")
-        raise RuntimeError("Veo 3 rate limit exceeded after 5 retries (~15 min wait)")
+        raise RuntimeError("Veo 3 rate limit exceeded after 5 retries")
 
     _last_veo_request = _time.time()
+    print(f"[BG] Veo 3 operation: {operation_name}")
 
-    # Poll with a hard 10-min cap so a stuck operation never hangs a worker.
+    # Poll the operation. The REST endpoint mirrors the model URL prefix.
+    poll_url = (
+        f"https://{_VERTEX_LOCATION}-aiplatform.googleapis.com/v1/{operation_name}"
+    )
+    fetch_url = f"{base_url}:fetchPredictOperation"
     poll_deadline = _time.time() + 600
-    while not operation.done:
+    op_payload: dict | None = None
+    while True:
         if _time.time() > poll_deadline:
             raise TimeoutError("Veo 3 operation timed out after 10 min")
         _time.sleep(10)
-        operation = client.operations.get(operation)
+        token = _veo_access_token()
+        # Vertex's long-running publisher operations need the
+        # fetchPredictOperation helper (a plain GET on the operation name
+        # returns 404 for publisher models). Body carries the operation name.
+        r = _req.post(
+            fetch_url,
+            headers={
+                "Authorization": f"Bearer {token}",
+                "Content-Type": "application/json",
+                "x-goog-user-project": _VERTEX_PROJECT,
+            },
+            json={"operationName": operation_name},
+            timeout=30,
+        )
+        if not r.ok:
+            print(f"[BG] poll HTTP {r.status_code}: {r.text[:200]}; retrying...")
+            continue
+        op_payload = r.json()
+        if op_payload.get("done"):
+            break
 
-    video = operation.result.generated_videos[0]
-    # Download via authenticated request (Vertex AI)
-    import google.auth
-    import google.auth.transport.requests
-    credentials, _ = google.auth.default()
-    credentials.refresh(google.auth.transport.requests.Request())
-    resp = _req.get(
-        video.video.uri,
-        headers={"Authorization": f"Bearer {credentials.token}"},
+    if "error" in op_payload:
+        err = op_payload["error"]
+        if recorder:
+            recorder.finish(response_summary=f"error: {str(err)[:200]}")
+        raise RuntimeError(f"Veo operation failed: {err}")
+
+    response_data = op_payload.get("response", {})
+    videos = response_data.get("videos") or response_data.get("generatedVideos") or []
+    if not videos:
+        if recorder:
+            recorder.finish(response_summary=f"error: no videos in response: {response_data}")
+        raise RuntimeError(f"Veo response had no videos: {response_data}")
+
+    video_entry = videos[0]
+    # Field name varies between API versions: gcsUri / videoUri / video.uri
+    video_uri = (
+        video_entry.get("gcsUri")
+        or video_entry.get("videoUri")
+        or (video_entry.get("video") or {}).get("uri")
     )
-    resp.raise_for_status()
-    with open(output_path, "wb") as f:
-        f.write(resp.content)
+    bytes_b64 = video_entry.get("bytesBase64Encoded") or (
+        video_entry.get("video") or {}
+    ).get("bytesBase64Encoded")
+
+    if bytes_b64:
+        # Inline bytes — decode and write directly.
+        import base64 as _b64
+        with open(output_path, "wb") as f:
+            f.write(_b64.b64decode(bytes_b64))
+    elif video_uri:
+        token = _veo_access_token()
+        dl = _req.get(
+            video_uri,
+            headers={"Authorization": f"Bearer {token}"},
+            timeout=120,
+        )
+        dl.raise_for_status()
+        with open(output_path, "wb") as f:
+            f.write(dl.content)
+    else:
+        if recorder:
+            recorder.finish(response_summary=f"error: video has no uri/bytes: {video_entry}")
+        raise RuntimeError(f"Veo video has no uri or bytes: {video_entry}")
 
     size_mb = os.path.getsize(output_path) / 1024 / 1024
     print(f"[BG] Veo 3 video saved: {size_mb:.1f} MB")
