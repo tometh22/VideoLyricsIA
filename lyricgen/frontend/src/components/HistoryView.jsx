@@ -1,6 +1,6 @@
 import { useI18n } from "../i18n";
 
-const API = "";
+const API = import.meta.env.VITE_API_URL || "";
 
 function tokenParam() {
   const token = localStorage.getItem("genly_token");

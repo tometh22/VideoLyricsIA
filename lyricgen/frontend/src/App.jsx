@@ -12,7 +12,7 @@ import JobDetail from "./components/JobDetail";
 import Settings from "./components/Settings";
 import AdminPanel from "./components/AdminPanel";
 
-const API = "";
+const API = import.meta.env.VITE_API_URL || "";
 
 // --- Auth helpers ---
 function getToken() {
