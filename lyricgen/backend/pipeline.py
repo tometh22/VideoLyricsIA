@@ -261,11 +261,20 @@ def run_pipeline(job_id: str, mp3_path: str, artist: str, style: str,
         # Step 5 — Content validation (UMG Guideline 15) — only if a YouTube
         # video was rendered (UMG-only jobs skip validation; masters go to
         # legal review independently).
-        if wants_youtube:
+        #
+        # We validate the BACKGROUND ASSET (bg_source) before lyrics overlay,
+        # not the composited final. The validator looks for prohibited content
+        # like people, logos, foreign text — but the final video has OUR
+        # intentional lyrics burned in, which would be a guaranteed false
+        # positive. The background is what we actually need to police.
+        if wants_youtube and bg_source:
             update_job(job_id, current_step="validation", progress=94)
-            from content_validator import validate_video as _validate_video
-            video_path = os.path.join(job_dir, _DELIVERABLE_FILENAMES["video"])
-            validation = _validate_video(video_path, job_id=job_id)
+            ext = os.path.splitext(bg_source)[1].lower()
+            if ext in (".mp4", ".mov", ".webm"):
+                from content_validator import validate_video as _validate_bg
+            else:
+                from content_validator import validate_image as _validate_bg
+            validation = _validate_bg(bg_source, job_id=job_id)
             update_job(job_id, validation_result=validation)
 
             if not validation["passed"]:
