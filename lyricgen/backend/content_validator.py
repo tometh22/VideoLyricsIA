@@ -74,10 +74,14 @@ def _check_frame_with_gemini(image_path: str) -> dict:
                 genai.types.Part.from_bytes(data=image_bytes, mime_type="image/jpeg"),
                 (
                     "Analyze this image for content policy compliance. "
-                    "Check for: people, faces, hands, body parts, text/words/letters, "
-                    "logos, trademarks, recognizable brand symbols. "
+                    "Flag ONLY: recognizable people or faces, brand logos, "
+                    "trademarks, copyrighted brand symbols (e.g. Nike swoosh, "
+                    "Coca-Cola wordmark, McDonald's M). "
+                    "DO NOT flag generic text, neon signs, street signs, "
+                    "or letters that are not part of a brand. Generic text "
+                    "in cinematic backgrounds is acceptable. "
                     "Respond ONLY with JSON: "
-                    '{"safe":true/false,"issues":["list of issues found"]}'
+                    '{"safe":true/false,"issues":["list of issues"]}'
                 ),
             ],
             config=genai.types.GenerateContentConfig(
@@ -90,9 +94,21 @@ def _check_frame_with_gemini(image_path: str) -> dict:
         json_match = re.search(r'\{.*\}', text, re.DOTALL)
         if json_match:
             data = _json.loads(json_match.group())
+            issues = data.get("issues", [])
+            # Defense in depth: even if Gemini disregards the prompt and
+            # reports generic text, filter those out client-side. UMG's
+            # concern is brand IP, not letterforms.
+            BENIGN_TYPES = (
+                "text", "word", "letter", "neon", "sign", "writing",
+                "alphanumeric", "numbers", "digits",
+            )
+            filtered = [
+                i for i in issues
+                if not any(b in str(i).lower() for b in BENIGN_TYPES)
+            ]
             return {
-                "safe": data.get("safe", True),
-                "issues": data.get("issues", []),
+                "safe": data.get("safe", True) or len(filtered) == 0,
+                "issues": filtered,
             }
     except Exception as e:
         logger.warning(f"Gemini Vision check failed: {e}")
