@@ -110,18 +110,21 @@ class ValidatorQualityCheck(Check):
 
         for label, prompt, expected, category in prompts:
             mp4 = out_root / f"{label}.mp4"
-            try:
-                _clients.generate_veo(prompt, str(mp4))
-                cost_estimate += veo_cost
-            except Exception as e:
-                results.append({
-                    "label": label,
-                    "category": category,
-                    "expected": expected,
-                    "outcome": "veo_error",
-                    "error": f"{type(e).__name__}: {e}",
-                })
-                continue
+            # Local disk cache: re-runs of the same prompt set hit a previously
+            # generated file and skip Veo. Delete the .mp4 to force regen.
+            if not (mp4.exists() and mp4.stat().st_size > 0):
+                try:
+                    _clients.generate_veo(prompt, str(mp4))
+                    cost_estimate += veo_cost
+                except Exception as e:
+                    results.append({
+                        "label": label,
+                        "category": category,
+                        "expected": expected,
+                        "outcome": "veo_error",
+                        "error": f"{type(e).__name__}: {e}",
+                    })
+                    continue
 
             v = _clients.validate_video(str(mp4))
             actual = "pass" if v["passed"] else "fail"

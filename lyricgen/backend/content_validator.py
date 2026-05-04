@@ -73,18 +73,36 @@ def _check_frame_with_gemini(image_path: str) -> dict:
             contents=[
                 genai.types.Part.from_bytes(data=image_bytes, mime_type="image/jpeg"),
                 (
-                    "Analyze this image for content policy compliance. "
-                    "Flag ALL of the following: recognizable people, faces, "
-                    "hands, body parts, ANY visible text, words, letters, "
-                    "numbers, signs, billboards, posters, banners, graffiti, "
-                    "shop signs, street signs, neon signs, logos, "
-                    "trademarks, brand symbols. "
-                    "Even partial, blurred, or background lettering counts. "
-                    "If the image is fully abstract / texture / nature with "
-                    "no humans and no readable characters anywhere, mark "
-                    "safe=true. Otherwise safe=false. "
+                    "You are auditing a frame from a music-video background "
+                    "for risks where AI image generation typically fails. "
+                    "Flag ONLY actual failures, not benign content.\n\n"
+                    "FLAG (safe=false) if you can clearly see ANY of these:\n"
+                    "  - A LARGE, FOREGROUND, or IDENTIFIABLE human face "
+                    "(eyes/nose/mouth clearly visible on a recognizable "
+                    "individual). One small face in a crowd does NOT count.\n"
+                    "  - Visible hands or individual fingers in foreground.\n"
+                    "  - Text matching a REAL brand or company name "
+                    "(Nike, Coca-Cola, McDonald's, Apple, etc.).\n"
+                    "  - Real-world brand logos or trademarks.\n\n"
+                    "DO NOT FLAG (safe=true) any of these — they are "
+                    "acceptable in music-video backgrounds:\n"
+                    "  - Silhouettes, audiences, or distant crowds where "
+                    "individual identities cannot be made out, even if "
+                    "small partial faces are visible in the background.\n"
+                    "  - Invented / gibberish / stylized text strings that "
+                    "do NOT match any real brand. Fake words on signage "
+                    "are fine.\n"
+                    "  - Heavily blurred / motion-blurred / rain-distorted "
+                    "signage.\n"
+                    "  - Abstract glowing shapes, smoke, particles, "
+                    "weather effects, lighting effects.\n"
+                    "  - Generic pattern textures or non-brand graphic "
+                    "elements.\n\n"
+                    "Rule of thumb: flag ONLY if a viewer would recognize "
+                    "a specific real-world person, hand, brand name, or "
+                    "logo. Otherwise mark safe. "
                     "Respond ONLY with JSON: "
-                    '{"safe":true/false,"issues":["list of issues"]}'
+                    '{"safe":true/false,"issues":["specific reason"]}'
                 ),
             ],
             config=genai.types.GenerateContentConfig(
