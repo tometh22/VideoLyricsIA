@@ -1,6 +1,8 @@
 import { useState } from "react";
 import { useI18n } from "../i18n";
 
+const API = import.meta.env.VITE_API_URL || "";
+
 export default function LoginPage({ onLogin, onBack, resetToken, onResetComplete }) {
   const { t, lang, setLang } = useI18n();
   const [mode, setMode] = useState(resetToken ? "reset_password" : "login"); // login, register, forgot, reset_sent, reset_password, reset_done
@@ -18,7 +20,7 @@ export default function LoginPage({ onLogin, onBack, resetToken, onResetComplete
     setLoading(true);
     setError("");
     try {
-      const res = await fetch("/auth/login", {
+      const res = await fetch(`${API}/auth/login`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ username: username.trim(), password }),
@@ -50,7 +52,7 @@ export default function LoginPage({ onLogin, onBack, resetToken, onResetComplete
     setLoading(true);
     setError("");
     try {
-      const res = await fetch("/auth/register", {
+      const res = await fetch(`${API}/auth/register`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ username: username.trim(), password, email: email.trim() }),
@@ -82,7 +84,7 @@ export default function LoginPage({ onLogin, onBack, resetToken, onResetComplete
     setLoading(true);
     setError("");
     try {
-      const res = await fetch("/auth/reset-password", {
+      const res = await fetch(`${API}/auth/reset-password`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ token: resetToken, password }),
@@ -108,7 +110,7 @@ export default function LoginPage({ onLogin, onBack, resetToken, onResetComplete
     setLoading(true);
     setError("");
     try {
-      const res = await fetch("/auth/forgot-password", {
+      const res = await fetch(`${API}/auth/forgot-password`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ email: email.trim() }),
