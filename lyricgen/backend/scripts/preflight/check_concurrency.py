@@ -156,7 +156,7 @@ class ConcurrencyCheck(Check):
             "submit_secs": submit_secs,
             "outcomes": outcomes,
             "final_statuses": {jid: statuses[jid].get("status") for jid in job_ids},
-            "summary": {
+            "tally": {
                 "done": done, "hung": hung, "failed": failed,
                 "validation_failed": validation_fail,
             },

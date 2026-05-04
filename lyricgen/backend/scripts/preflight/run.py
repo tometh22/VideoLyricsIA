@@ -170,8 +170,9 @@ def main() -> int:
                         help="Path to a real MP3 used as input for the concurrency stress test")
     parser.add_argument("--concurrency-n", type=int, default=3,
                         help="Number of parallel jobs for the concurrency test")
-    parser.add_argument("--concurrency-timeout", type=int, default=900,
-                        help="Seconds before the concurrency test marks any job as hung")
+    parser.add_argument("--concurrency-timeout", type=int, default=1500,
+                        help="Seconds before the concurrency test marks any job as hung "
+                             "(parallel jobs share workers and run slower than serial)")
     args = parser.parse_args()
 
     REPORTS_DIR.mkdir(parents=True, exist_ok=True)
