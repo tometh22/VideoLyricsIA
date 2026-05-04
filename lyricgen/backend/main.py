@@ -437,7 +437,32 @@ def _enforce_plan_quota(db: Session, current_user: dict) -> None:
 DEFAULT_DAILY_CAP = 50
 
 
-DEFAULT_MAX_CONCURRENT_JOBS = 10
+DEFAULT_MAX_CONCURRENT_JOBS = 5
+
+# System-wide ceiling. Sum of `processing` jobs across ALL tenants cannot
+# exceed this, even if each individual tenant is below their own cap.
+# Sized at ~2× the worker replica count (3) — enough burst headroom that
+# workers never sit idle, but small enough that a multi-tenant flood
+# cannot saturate the worker pool and starve the premium customer.
+# Override via env GLOBAL_MAX_PROCESSING for capacity tuning during scale-up.
+GLOBAL_MAX_PROCESSING = int(os.environ.get("GLOBAL_MAX_PROCESSING", "8"))
+
+
+def _enforce_global_processing_cap(db: Session) -> None:
+    """Raise 429 if the system as a whole has hit GLOBAL_MAX_PROCESSING jobs
+    in flight. This is the *infrastructure* limit — designed so a noisy
+    tenant cannot push UMG (or any other premium customer) into a long
+    queue. Per-tenant caps still apply on top.
+    """
+    in_flight = db.query(Job).filter(Job.status == "processing").count()
+    if in_flight >= GLOBAL_MAX_PROCESSING:
+        raise HTTPException(
+            status_code=429,
+            detail=(
+                f"System busy ({in_flight}/{GLOBAL_MAX_PROCESSING} jobs in flight). "
+                "Please retry in a couple of minutes."
+            ),
+        )
 
 
 def _enforce_concurrent_jobs_cap(db: Session, current_user: dict) -> None:
@@ -449,8 +474,10 @@ def _enforce_concurrent_jobs_cap(db: Session, current_user: dict) -> None:
     user approval) or terminal states don't consume pipeline resources, so
     they don't count.
 
-    Default is DEFAULT_MAX_CONCURRENT_JOBS (10). Admin can override per user
-    via PATCH /admin/users/{id} with max_concurrent_jobs.
+    Default is DEFAULT_MAX_CONCURRENT_JOBS (5 — sized at ~1.7× worker
+    replicas so jobs queue gracefully instead of choking the worker pool).
+    Admin can override per user via PATCH /admin/users/{id} with
+    max_concurrent_jobs (UMG and other premium tenants get higher).
     """
     tenant_id = current_user["tenant_id"]
     user_model = db.query(User).filter(User.id == current_user["id"]).first()
@@ -565,6 +592,7 @@ async def upload(
     data = await file.read()
     _validate_mp3_upload(file, data)
 
+    _enforce_global_processing_cap(db)
     _enforce_plan_quota(db, current_user)
     _enforce_daily_volume_cap(db, current_user)
     _enforce_concurrent_jobs_cap(db, current_user)
@@ -721,6 +749,7 @@ async def generate_with_segments(
     data = await file.read()
     _validate_mp3_upload(file, data)
 
+    _enforce_global_processing_cap(db)
     _enforce_plan_quota(db, current_user)
     _enforce_daily_volume_cap(db, current_user)
     _enforce_concurrent_jobs_cap(db, current_user)
