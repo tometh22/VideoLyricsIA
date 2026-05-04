@@ -1791,6 +1791,16 @@ def generate_lyric_video(
     else:
         bg = _get_background_clip_from_path(bg_source, style, duration, job_dir, spec=spec)
 
+    # Veo/library MP4 backgrounds may carry an empty/secondary audio track
+    # even when generateAudio=False. CompositeVideoClip preserves that
+    # secondary stream and moviepy's writer ends up emitting two audio
+    # outputs — one with `-c:a copy` from the bg and one with our pcm_s24le
+    # from set_audio(). ffmpeg then refuses any audio filtering on the
+    # copied stream, hanging the encode. Strip bg audio explicitly so the
+    # composite has exactly one audio track (the MP3 we set below).
+    if bg.audio is not None:
+        bg = bg.without_audio()
+
     # Pick a font for this job (or reuse the caller-provided one).
     # For UMG profile, the choice is deterministic (derived from job_dir hash)
     # so retries of the same job produce the same font — UMG QC and editorial
