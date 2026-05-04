@@ -540,3 +540,41 @@ async def delete_background(
     ))
     db.commit()
     return {"ok": True}
+
+
+# ---------------------------------------------------------------------------
+# Storage retention
+# ---------------------------------------------------------------------------
+
+@router.post("/cleanup-inputs")
+async def cleanup_inputs(
+    retention_days: int = Query(30, ge=1, le=365),
+    apply: bool = Query(False),
+    admin: dict = Depends(require_admin),
+    db: Session = Depends(get_db),
+):
+    """Delete user-uploaded MP3 inputs in R2 once they pass the retention
+    window. Inputs live under the `inputs/` prefix; deliverables and
+    caches are not touched.
+
+    Default is dry-run (apply=false) so the admin sees what would be
+    deleted before doing it. Pass apply=true to actually delete.
+    """
+    import storage
+    report = storage.cleanup_old_inputs(
+        retention_days=retention_days,
+        apply=apply,
+        prefix="inputs/",
+    )
+    db.add(AuditLog(
+        user_id=admin["id"],
+        action="admin.cleanup_inputs.apply" if apply else "admin.cleanup_inputs.dryrun",
+        detail={
+            "retention_days": retention_days,
+            "scanned": report.get("scanned"),
+            "expired": report.get("expired"),
+            "deleted": report.get("deleted"),
+        },
+    ))
+    db.commit()
+    return report

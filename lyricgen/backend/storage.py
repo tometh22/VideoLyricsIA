@@ -166,6 +166,89 @@ def generate_signed_url(key: str, expiry_seconds: int = 3600) -> Optional[str]:
     )
 
 
+def cleanup_old_inputs(retention_days: int = 30, apply: bool = False, prefix: str = "inputs/") -> dict:
+    """Delete objects under `prefix` whose LastModified is older than
+    retention_days. Returns a structured report:
+
+        {
+            "scanned": int,                    # total keys under prefix
+            "expired": int,                    # keys older than cutoff
+            "deleted": int,                    # actually removed (apply=True)
+            "bytes_freed": int,                # sum of sizes that were/would-be deleted
+            "sample": [{"key", "size", "age_days"}, ...],  # up to 10 candidates
+            "errors": [...],
+            "apply": bool,
+            "retention_days": int,
+            "cutoff": str,
+        }
+
+    Set apply=False (default) to dry-run. Caller is responsible for not
+    widening `prefix` past inputs/ — deliverables live elsewhere and must
+    not be touched by retention.
+    """
+    from datetime import datetime, timedelta, timezone
+
+    client = _get_client()
+    if client is None:
+        return {"error": "R2 not configured", "scanned": 0, "expired": 0,
+                "deleted": 0, "bytes_freed": 0, "sample": [], "errors": [],
+                "apply": apply, "retention_days": retention_days}
+
+    cutoff = datetime.now(timezone.utc) - timedelta(days=retention_days)
+    paginator = client.get_paginator("list_objects_v2")
+
+    scanned = 0
+    expired: list[tuple[str, int, "datetime"]] = []
+    bytes_to_free = 0
+
+    for page in paginator.paginate(Bucket=R2_BUCKET, Prefix=prefix):
+        for obj in page.get("Contents", []) or []:
+            scanned += 1
+            modified = obj["LastModified"]
+            if modified < cutoff:
+                expired.append((obj["Key"], obj["Size"], modified))
+                bytes_to_free += obj["Size"]
+
+    now = datetime.now(timezone.utc)
+    sample = [
+        {
+            "key": k,
+            "size_mb": round(s / 1024 / 1024, 2),
+            "age_days": (now - m).days,
+        }
+        for (k, s, m) in expired[:10]
+    ]
+
+    deleted = 0
+    errors: list[dict] = []
+    if apply and expired:
+        for i in range(0, len(expired), 1000):
+            batch = expired[i:i + 1000]
+            resp = client.delete_objects(
+                Bucket=R2_BUCKET,
+                Delete={
+                    "Objects": [{"Key": k} for (k, _, _) in batch],
+                    "Quiet": False,
+                },
+            )
+            deleted += len(resp.get("Deleted", []) or [])
+            errors.extend(resp.get("Errors", []) or [])
+
+    return {
+        "apply": apply,
+        "retention_days": retention_days,
+        "prefix": prefix,
+        "cutoff": cutoff.isoformat(timespec="seconds"),
+        "scanned": scanned,
+        "expired": len(expired),
+        "deleted": deleted,
+        "bytes_freed": bytes_to_free if apply else 0,
+        "bytes_to_free_dryrun": bytes_to_free if not apply else 0,
+        "sample": sample,
+        "errors": errors,
+    }
+
+
 def delete_object(key: str) -> None:
     client = _get_client()
     if client is None:
