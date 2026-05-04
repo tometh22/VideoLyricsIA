@@ -116,7 +116,7 @@ export default function Dashboard({ history, onSelectJob, onNewBatch, onViewHist
           <h1 className="text-2xl font-bold">{t("dash.title")}</h1>
           <p className="text-sm text-gray-500 mt-1">{t("dash.subtitle")}</p>
         </div>
-        <button onClick={onNewBatch} className="btn-primary py-3 px-6">
+        <button data-tour="new-batch-cta" onClick={onNewBatch} className="btn-primary py-3 px-6">
           <svg className="inline-block w-4 h-4 mr-2 -mt-0.5" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
             <path d="M12 5v14M5 12h14" strokeLinecap="round"/>
           </svg>
@@ -125,7 +125,7 @@ export default function Dashboard({ history, onSelectJob, onNewBatch, onViewHist
       </div>
 
       {/* Stats */}
-      <div className={`grid ${pendingReview > 0 ? "grid-cols-5" : "grid-cols-4"} gap-4 mb-8`}>
+      <div data-tour="dashboard-stats" className={`grid ${pendingReview > 0 ? "grid-cols-5" : "grid-cols-4"} gap-4 mb-8`}>
         <div className="stat-card">
           <p className="text-3xl font-bold text-brand">{done}</p>
           <p className="text-[11px] text-gray-500 mt-1 uppercase tracking-wider">{t("dash.videos_generated")}</p>
@@ -151,7 +151,7 @@ export default function Dashboard({ history, onSelectJob, onNewBatch, onViewHist
       </div>
 
       {/* Monthly usage */}
-      <div className={`glass rounded-2xl p-6 mb-8 ${usage?.alert_100 ? "border-amber-500/20" : ""}`}>
+      <div data-tour="dashboard-usage" className={`glass rounded-2xl p-6 mb-8 ${usage?.alert_100 ? "border-amber-500/20" : ""}`}>
         <div className="flex items-center justify-between mb-3">
           <div>
             <h3 className="text-sm font-semibold">{t("dash.monthly_usage")}</h3>
