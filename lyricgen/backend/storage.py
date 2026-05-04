@@ -37,9 +37,28 @@ def _get_client():
         endpoint_url=R2_ENDPOINT_URL,
         aws_access_key_id=R2_ACCESS_KEY_ID,
         aws_secret_access_key=R2_SECRET_ACCESS_KEY,
-        config=Config(signature_version="s3v4", retries={"max_attempts": 3, "mode": "standard"}),
+        config=Config(
+            signature_version="s3v4",
+            retries={"max_attempts": 5, "mode": "adaptive"},
+            connect_timeout=30,
+            read_timeout=120,
+        ),
     )
     return _client
+
+
+def _transfer_config():
+    """Tuned multipart settings for multi-GB ProRes masters. boto3 defaults
+    (8 MB chunks, 10 threads) made our 4.5 GB UMG masters take 25+ min;
+    64 MB chunks and 20 threads complete the same payload in 1–3 min on
+    Railway egress."""
+    from boto3.s3.transfer import TransferConfig
+    return TransferConfig(
+        multipart_threshold=64 * 1024 * 1024,
+        multipart_chunksize=64 * 1024 * 1024,
+        max_concurrency=20,
+        use_threads=True,
+    )
 
 
 def _object_key(tenant_id: str, job_id: str, filename: str) -> str:
@@ -62,7 +81,10 @@ def upload_master(local_path: str, tenant_id: str, job_id: str, filename: str) -
     key = _object_key(tenant_id, job_id, filename)
     content_type = _guess_content_type(filename)
     extra = {"ContentType": content_type} if content_type else {}
-    client.upload_file(local_path, R2_BUCKET, key, ExtraArgs=extra)
+    client.upload_file(
+        local_path, R2_BUCKET, key,
+        ExtraArgs=extra, Config=_transfer_config(),
+    )
     size_mb = os.path.getsize(local_path) / 1024 / 1024
     print(f"[R2] Uploaded {key} ({size_mb:.1f} MB)")
     return key
@@ -78,7 +100,9 @@ def upload_input(local_path: str, tenant_id: str, job_id: str, filename: str) ->
     key = _input_object_key(tenant_id, job_id, filename)
     content_type = _guess_content_type(filename) or "application/octet-stream"
     client.upload_file(
-        local_path, R2_BUCKET, key, ExtraArgs={"ContentType": content_type}
+        local_path, R2_BUCKET, key,
+        ExtraArgs={"ContentType": content_type},
+        Config=_transfer_config(),
     )
     size_mb = os.path.getsize(local_path) / 1024 / 1024
     print(f"[R2] Uploaded input {key} ({size_mb:.1f} MB)")
@@ -106,7 +130,9 @@ def upload_file(local_path: str, key: str) -> Optional[str]:
         return None
     content_type = _guess_content_type(key) or "application/octet-stream"
     client.upload_file(
-        local_path, R2_BUCKET, key, ExtraArgs={"ContentType": content_type}
+        local_path, R2_BUCKET, key,
+        ExtraArgs={"ContentType": content_type},
+        Config=_transfer_config(),
     )
     return key
 
