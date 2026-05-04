@@ -27,6 +27,7 @@ import sys
 from pathlib import Path
 
 from ._base import Check, CheckResult
+from . import _clients
 
 
 # Curated prompts. Format: (label, prompt, expected_outcome, category).
@@ -66,15 +67,10 @@ PROMPTS: list[tuple[str, str, str, str]] = [
 ]
 
 
-def _import_pipeline():
-    backend = str(Path(__file__).resolve().parents[2])
-    if backend not in sys.path:
-        sys.path.insert(0, backend)
+def _load_dotenv_once():
+    backend = Path(__file__).resolve().parents[2]
     from dotenv import load_dotenv
-    load_dotenv(Path(backend) / ".env")
-    import pipeline  # noqa: E402
-    import content_validator  # noqa: E402
-    return pipeline, content_validator
+    load_dotenv(backend / ".env")
 
 
 class ValidatorQualityCheck(Check):
@@ -90,25 +86,19 @@ class ValidatorQualityCheck(Check):
         self.max_total_usd = max_total_usd
 
     def run(self) -> CheckResult:
+        _load_dotenv_once()
+
         if not os.environ.get("GOOGLE_APPLICATION_CREDENTIALS"):
             return self._skipped(
                 "GOOGLE_APPLICATION_CREDENTIALS not set — cannot generate Veo "
                 "backgrounds for validator audit"
             )
 
-        try:
-            pipeline, validator = _import_pipeline()
-        except Exception as e:
-            return self._failed(
-                f"could not import pipeline modules: {type(e).__name__}: {e}"
-            )
-
         out_root = Path(__file__).resolve().parent / "reports" / "validator_videos"
         out_root.mkdir(parents=True, exist_ok=True)
 
         prompts = PROMPTS[: self.n_prompts]
-        # Veo Fast is $0.10/sec × 8s = $0.80 worst case. Cache hits cost $0.
-        veo_cost = 0.80
+        veo_cost = 0.80   # Veo Fast: $0.10/sec × 8s
         max_calls = int(self.max_total_usd / veo_cost)
         if len(prompts) > max_calls:
             prompts = prompts[:max_calls]
@@ -121,10 +111,8 @@ class ValidatorQualityCheck(Check):
         for label, prompt, expected, category in prompts:
             mp4 = out_root / f"{label}.mp4"
             try:
-                pipeline._generate_veo_video(
-                    prompt, str(mp4), job_id=f"preflight_{label}"
-                )
-                cost_estimate += veo_cost  # cache may save this; conservative bound
+                _clients.generate_veo(prompt, str(mp4))
+                cost_estimate += veo_cost
             except Exception as e:
                 results.append({
                     "label": label,
@@ -135,7 +123,7 @@ class ValidatorQualityCheck(Check):
                 })
                 continue
 
-            v = validator.validate_video(str(mp4), job_id=f"preflight_{label}")
+            v = _clients.validate_video(str(mp4))
             actual = "pass" if v["passed"] else "fail"
 
             entry = {

@@ -19,11 +19,13 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 from datetime import datetime
 from pathlib import Path
 
 from ._base import Check, Status, execute
+from .check_concurrency import ConcurrencyCheck
 from .check_production_health import ProductionHealthCheck
 from .check_umg_master import UmgMasterCheck
 from .check_validator_quality import ValidatorQualityCheck
@@ -42,13 +44,23 @@ def build_checks(args) -> list[Check]:
         "prores_profile": args.umg_profile,
         "pix_fmt": "yuv422p10le" if args.umg_profile == 3 else "yuv444p10le",
     }
+    api_url = (args.api_url or os.environ.get("PRODUCTION_API_URL")
+               or "https://genly-ai.up.railway.app")
     return [
-        ProductionHealthCheck(args.api_url),
+        ProductionHealthCheck(api_url),
         VolumeCapsCheck(),
         UmgMasterCheck(args.umg_master, umg_expected),
         ValidatorQualityCheck(
             n_prompts=args.validator_prompts,
             max_total_usd=args.validator_budget,
+        ),
+        ConcurrencyCheck(
+            api_url=api_url,
+            username=os.environ.get("PREFLIGHT_USERNAME"),
+            password=os.environ.get("PREFLIGHT_PASSWORD"),
+            mp3_path=args.concurrency_mp3,
+            concurrency=args.concurrency_n,
+            timeout_secs=args.concurrency_timeout,
         ),
     ]
 
@@ -154,6 +166,12 @@ def main() -> int:
                         help="Number of Veo prompts to sample for the validator audit")
     parser.add_argument("--validator-budget", type=float, default=5.0,
                         help="Max USD spend for the validator audit (Veo Fast)")
+    parser.add_argument("--concurrency-mp3", default=None,
+                        help="Path to a real MP3 used as input for the concurrency stress test")
+    parser.add_argument("--concurrency-n", type=int, default=3,
+                        help="Number of parallel jobs for the concurrency test")
+    parser.add_argument("--concurrency-timeout", type=int, default=900,
+                        help="Seconds before the concurrency test marks any job as hung")
     args = parser.parse_args()
 
     REPORTS_DIR.mkdir(parents=True, exist_ok=True)

@@ -115,8 +115,8 @@ export default function LoginPage({ onLogin, onBack, resetToken, onResetComplete
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ email: email.trim() }),
       });
-      const data = await res.json();
-      setMessage(data.message || t("login.reset_sent"));
+      await res.json().catch(() => ({}));
+      setMessage(t("login.reset_sent"));
       setMode("reset_sent");
     } catch {
       setError(t("login.error"));
