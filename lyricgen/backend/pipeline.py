@@ -1835,12 +1835,6 @@ def generate_lyric_video(
 
     if spec.profile == "umg":
         out_path = os.path.join(job_dir, "umg_master.mov")
-        # UMG requires 48 kHz audio. moviepy's `audio_fps` writes the temp
-        # WAV at the right rate AND passes `-ar 48000` to ffmpeg, so
-        # ffmpeg sees a 48 kHz input and emits a 48 kHz stream — no resample
-        # filter needed. (An earlier attempt added `-af aresample=48000`
-        # alongside `audio_fps=48000` and that combo silently hung ProRes
-        # encoding mid-job; fall back to one mechanism at a time.)
         ffmpeg_params = [
             "-r", spec.fps_str,
             "-profile:v", str(spec.prores_profile),
@@ -1853,12 +1847,16 @@ def generate_lyric_video(
             "-aspect", f"{spec.dar[0]}:{spec.dar[1]}",
             "-vf", "setsar=1",
         ]
+        # moviepy 1.0.3 writes audio at the source MP3 rate (typically
+        # 44.1 kHz). `audio_fps=48000` triggers a moviepy bug where it
+        # mixes -c:a copy with an aresample filter and ffmpeg refuses
+        # the combo, so we resample in a separate ffmpeg pass after the
+        # moviepy write — two steps but each one stays in its lane.
         video.write_videofile(
             out_path,
             fps=spec.fps,
             codec=spec.codec,
             audio_codec=spec.audio_codec,
-            audio_fps=48000,
             ffmpeg_params=ffmpeg_params,
             threads=4,
             logger=None,
@@ -1866,6 +1864,29 @@ def generate_lyric_video(
         audio.close()
         bg.close()
         video.close()
+
+        # Post-process: stream-copy the ProRes video and re-encode audio
+        # to pcm_s24le at 48 kHz. UMG requires this exact audio spec; no
+        # CPU is wasted re-encoding the multi-GB ProRes stream.
+        tmp_resampled = out_path + ".audio48k.mov"
+        result = subprocess.run(
+            [
+                "ffmpeg", "-y", "-loglevel", "error",
+                "-i", out_path,
+                "-c:v", "copy",
+                "-c:a", "pcm_s24le",
+                "-ar", "48000",
+                "-ac", "2",
+                tmp_resampled,
+            ],
+            capture_output=True, text=True, timeout=600,
+        )
+        if result.returncode != 0:
+            raise RuntimeError(
+                f"audio resample to 48kHz failed: {result.stderr[-500:]}"
+            )
+        os.replace(tmp_resampled, out_path)
+
         errors = _validate_umg_master(out_path, spec)
         if errors:
             raise RuntimeError(f"UMG validation failed: {'; '.join(errors)}")
