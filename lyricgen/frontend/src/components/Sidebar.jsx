@@ -33,7 +33,7 @@ export default function Sidebar({ onNav, activeView, open, onToggle, user, onLog
   }
 
   return (
-    <aside className="fixed left-0 top-0 bottom-0 w-64 bg-surface-1/95 backdrop-blur-xl border-r border-white/[0.04] z-20 flex flex-col" style={{boxShadow: '4px 0 24px rgba(0,0,0,0.3)'}}>
+    <aside data-tour="sidebar" className="fixed left-0 top-0 bottom-0 w-64 bg-surface-1/95 backdrop-blur-xl border-r border-white/[0.04] z-20 flex flex-col" style={{boxShadow: '4px 0 24px rgba(0,0,0,0.3)'}}>
 
       {/* Logo */}
       <div className="flex items-center justify-between px-5 py-5 border-b border-white/[0.04]">
@@ -60,6 +60,7 @@ export default function Sidebar({ onNav, activeView, open, onToggle, user, onLog
         {items.map((item) => (
           <button
             key={item.id}
+            data-tour={`nav-${item.id}`}
             onClick={() => onNav(item.id)}
             className={`w-full flex items-center gap-3 px-4 py-3 rounded-xl mb-1 text-sm font-medium transition-all duration-200
               ${activeView === item.id

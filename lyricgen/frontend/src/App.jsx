@@ -11,6 +11,7 @@ import BatchProgress from "./components/BatchProgress";
 import JobDetail from "./components/JobDetail";
 import Settings from "./components/Settings";
 import AdminPanel from "./components/AdminPanel";
+import OnboardingTour from "./components/OnboardingTour";
 
 const API = import.meta.env.VITE_API_URL || "";
 
@@ -63,6 +64,7 @@ export default function App() {
   const [backgroundId, setBackgroundId] = useState(null);
   const [sidebarOpen, setSidebarOpen] = useState(true);
   const [resetToken, setResetToken] = useState(null);
+  const [showTour, setShowTour] = useState(false);
   const pollingIntervals = useRef(new Set());
   const PARALLEL_WORKERS = 5;
 
@@ -123,6 +125,32 @@ export default function App() {
   }, []);
 
   useEffect(() => { if (token) fetchHistory(); }, [token, fetchHistory]);
+
+  // --- Onboarding tour: show once for new authenticated users on dashboard ---
+  useEffect(() => {
+    if (!token || view !== "dashboard") return;
+    const done = localStorage.getItem("genly_onboarding_done") === "1";
+    if (!done) {
+      // Delay slightly so the dashboard finishes mounting and elements have rects
+      const tm = setTimeout(() => setShowTour(true), 600);
+      return () => clearTimeout(tm);
+    }
+  }, [token, view]);
+
+  // Allow other components (e.g. Settings) to replay the tour
+  useEffect(() => {
+    const onReplay = () => {
+      if (view !== "dashboard") setView("dashboard");
+      setShowTour(true);
+    };
+    window.addEventListener("genly:replay-tour", onReplay);
+    return () => window.removeEventListener("genly:replay-tour", onReplay);
+  }, [view]);
+
+  const finishTour = () => {
+    localStorage.setItem("genly_onboarding_done", "1");
+    setShowTour(false);
+  };
 
   const pollJob = useCallback((jobId) => {
     // Poll every 3 s (instead of 1 s) and skip the tick entirely when the tab
@@ -629,6 +657,21 @@ export default function App() {
           )}
         </main>
       </div>
+
+      {showTour && view === "dashboard" && (
+        <OnboardingTour
+          steps={[
+            { title: t("tour.s1_title"), body: t("tour.s1_body") },
+            { target: '[data-tour="sidebar"]', placement: "right", title: t("tour.s2_title"), body: t("tour.s2_body") },
+            { target: '[data-tour="new-batch-cta"]', placement: "bottom", title: t("tour.s3_title"), body: t("tour.s3_body") },
+            { target: '[data-tour="dashboard-stats"]', placement: "bottom", title: t("tour.s4_title"), body: t("tour.s4_body") },
+            { target: '[data-tour="dashboard-usage"]', placement: "top", title: t("tour.s5_title"), body: t("tour.s5_body") },
+            { target: '[data-tour="nav-settings"]', placement: "right", title: t("tour.s6_title"), body: t("tour.s6_body") },
+          ]}
+          onFinish={finishTour}
+          onSkip={finishTour}
+        />
+      )}
     </div>
   );
 }

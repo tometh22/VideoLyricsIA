@@ -435,6 +435,25 @@ export default function Settings({ onBack }) {
                 </div>
               </div>
             </div>
+
+            <div className="glass rounded-2xl p-6 mt-4">
+              <div className="flex items-center justify-between gap-4">
+                <div>
+                  <h3 className="font-semibold mb-1">{t("tour.replay")}</h3>
+                  <p className="text-xs text-gray-500">{t("tour.replay_sub")}</p>
+                </div>
+                <button
+                  onClick={() => {
+                    localStorage.removeItem("genly_onboarding_done");
+                    window.dispatchEvent(new CustomEvent("genly:replay-tour"));
+                    onBack?.();
+                  }}
+                  className="btn-secondary text-sm px-4 py-2 shrink-0"
+                >
+                  {t("tour.replay")}
+                </button>
+              </div>
+            </div>
           </>
         )}
       </div>
