@@ -157,6 +157,14 @@ def run_pipeline(job_id: str, mp3_path: str, artist: str, style: str,
     job_dir = os.path.join(OUTPUTS_DIR, job_id)
     os.makedirs(job_dir, exist_ok=True)
 
+    # Worker just claimed this job — flip the user-facing status from
+    # "queued" (sitting in RQ) to "processing" (a worker is actively on it).
+    # This makes the queue visible in the dashboard: jobs piling up in RQ
+    # show as "queued" until a worker picks them, at which point they
+    # immediately go "processing". Idempotent — if the job already says
+    # processing (e.g. on retry), the update is a no-op.
+    update_job(job_id, status="processing", current_step="starting", progress=1)
+
     # Materialize R2-stored inputs onto local disk so moviepy/ffmpeg/whisper
     # can open them. No-op when running on a single host (no R2 keys passed).
     if input_r2_key and not os.path.exists(mp3_path):

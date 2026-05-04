@@ -448,59 +448,12 @@ DEFAULT_MAX_CONCURRENT_JOBS = 5
 GLOBAL_MAX_PROCESSING = int(os.environ.get("GLOBAL_MAX_PROCESSING", "8"))
 
 
-def _enforce_global_processing_cap(db: Session) -> None:
-    """Raise 429 if the system as a whole has hit GLOBAL_MAX_PROCESSING jobs
-    in flight. This is the *infrastructure* limit — designed so a noisy
-    tenant cannot push UMG (or any other premium customer) into a long
-    queue. Per-tenant caps still apply on top.
-    """
-    in_flight = db.query(Job).filter(Job.status == "processing").count()
-    if in_flight >= GLOBAL_MAX_PROCESSING:
-        raise HTTPException(
-            status_code=429,
-            detail=(
-                f"System busy ({in_flight}/{GLOBAL_MAX_PROCESSING} jobs in flight). "
-                "Please retry in a couple of minutes."
-            ),
-        )
-
-
-def _enforce_concurrent_jobs_cap(db: Session, current_user: dict) -> None:
-    """Raise 429 if the tenant already has too many jobs in flight. The cap
-    naturally enforces "one batch at a time" — a UMG user uploads up to N
-    tracks; once they finish processing, the next batch can start.
-
-    "In flight" means status="processing". Jobs in pending_review (awaiting
-    user approval) or terminal states don't consume pipeline resources, so
-    they don't count.
-
-    Default is DEFAULT_MAX_CONCURRENT_JOBS (5 — sized at ~1.7× worker
-    replicas so jobs queue gracefully instead of choking the worker pool).
-    Admin can override per user via PATCH /admin/users/{id} with
-    max_concurrent_jobs (UMG and other premium tenants get higher).
-    """
-    tenant_id = current_user["tenant_id"]
-    user_model = db.query(User).filter(User.id == current_user["id"]).first()
-
-    cap = (user_model.max_concurrent_jobs if user_model
-           and user_model.max_concurrent_jobs is not None
-           else DEFAULT_MAX_CONCURRENT_JOBS)
-
-    in_flight = (
-        db.query(Job)
-        .filter(Job.tenant_id == tenant_id)
-        .filter(Job.status == "processing")
-        .count()
-    )
-
-    if in_flight >= cap:
-        raise HTTPException(
-            status_code=429,
-            detail=(
-                f"Batch limit reached ({in_flight}/{cap} jobs already in flight). "
-                "Wait for your current batch to finish before starting a new one."
-            ),
-        )
+def _enforce_concurrent_jobs_cap(*_, **__) -> None:
+    """Deprecated. Concurrency is now bounded naturally by the RQ worker
+    pool — every submission is accepted with status="queued" and the
+    worker flips it to "processing" the moment it picks the job off the
+    queue. Kept as a no-op so any forgotten callsite is harmless."""
+    return None
 
 
 def _enforce_daily_volume_cap(db: Session, current_user: dict) -> None:
@@ -592,10 +545,12 @@ async def upload(
     data = await file.read()
     _validate_mp3_upload(file, data)
 
-    _enforce_global_processing_cap(db)
     _enforce_plan_quota(db, current_user)
     _enforce_daily_volume_cap(db, current_user)
-    _enforce_concurrent_jobs_cap(db, current_user)
+    # Every submission is accepted as queued; RQ gives it to a worker the
+    # moment one is free, and pipeline.run_pipeline flips status to
+    # "processing" on its first line. No 429 for capacity reasons.
+    initial_status = "queued"
 
     umg_spec = _parse_umg_params(delivery_profile, umg_frame_size, umg_fps, umg_prores_profile)
 
@@ -616,6 +571,7 @@ async def upload(
         artist=artist, style=style, filename=file.filename,
         user_id=current_user["id"], tenant_id=tenant_id,
         delivery_profile=delivery_profile, umg_spec=umg_spec,
+        initial_status=initial_status,
     )
     job_dir = os.path.join(OUTPUTS_DIR, job_id)
     os.makedirs(job_dir, exist_ok=True)
@@ -624,10 +580,10 @@ async def upload(
     with open(mp3_path, "wb") as f:
         f.write(data)
 
-    # When R2 is configured, upload the input MP3 so the worker (a separate
-    # container) can fetch it. Without this, worker fails with "No such file
-    # or directory" because /app/../outputs/... lives on the API container's
-    # disk only.
+    # Upload the input MP3 to R2 regardless of whether the job will run now
+    # or wait in the queue — the worker container fetches from R2 (the API
+    # container disk is ephemeral and may be gone by the time a queued job
+    # promotes to processing minutes/hours later).
     input_r2_key = None
     if storage.is_enabled():
         input_r2_key = storage.upload_input(
@@ -657,6 +613,9 @@ async def upload(
 
     lang = language.strip() if language.strip() else None
 
+    # Always enqueue. RQ's per-priority worker pool naturally caps how many
+    # jobs run at once — the rest wait in Redis. UMG (plan=unlimited) goes
+    # to the enterprise queue, which workers drain before the default queue.
     enqueue_pipeline(
         job_id=job_id,
         mp3_path=mp3_path,
@@ -671,7 +630,7 @@ async def upload(
         bg_r2_key=bg_r2_key,
     )
 
-    return {"job_id": job_id}
+    return {"job_id": job_id, "status": initial_status}
 
 
 @app.post("/transcribe")
@@ -749,10 +708,12 @@ async def generate_with_segments(
     data = await file.read()
     _validate_mp3_upload(file, data)
 
-    _enforce_global_processing_cap(db)
     _enforce_plan_quota(db, current_user)
     _enforce_daily_volume_cap(db, current_user)
-    _enforce_concurrent_jobs_cap(db, current_user)
+    # Every submission is accepted as queued; RQ gives it to a worker the
+    # moment one is free, and pipeline.run_pipeline flips status to
+    # "processing" on its first line. No 429 for capacity reasons.
+    initial_status = "queued"
 
     # Check AI authorization (UMG Guideline 5) — skip if using library background (no AI)
     if not background_id and current_user.get("role") != "admin":
@@ -774,6 +735,7 @@ async def generate_with_segments(
         artist=artist, style=style, filename=file.filename,
         user_id=current_user["id"], tenant_id=tenant_id,
         delivery_profile=delivery_profile, umg_spec=umg_spec,
+        initial_status=initial_status,
     )
     job_dir = os.path.join(OUTPUTS_DIR, job_id)
     os.makedirs(job_dir, exist_ok=True)
@@ -823,7 +785,7 @@ async def generate_with_segments(
         bg_r2_key=bg_r2_key,
     )
 
-    return {"job_id": job_id}
+    return {"job_id": job_id, "status": initial_status}
 
 
 @app.get("/admin/queue")

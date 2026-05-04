@@ -55,6 +55,13 @@ function ActivityItem({ job, onSelect, t }) {
             <div className="w-4 h-4 border-2 border-brand border-t-transparent rounded-full animate-spin" />
           </div>
         )}
+        {job.status === "queued" && (
+          <div className="w-full h-full flex items-center justify-center">
+            <svg className="w-4 h-4 text-gray-400" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
+              <circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/>
+            </svg>
+          </div>
+        )}
         {(job.status === "error" || job.status === "validation_failed") && (
           <div className="w-full h-full flex items-center justify-center">
             <svg className="w-4 h-4 text-red-400" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
@@ -70,6 +77,7 @@ function ActivityItem({ job, onSelect, t }) {
           {job.status === "done" && t("dash.completed")}
           {job.status === "pending_review" && (t("batch.pending_review") || "Pending review")}
           {job.status === "validation_failed" && (t("batch.validation_failed") || "Validation failed")}
+          {job.status === "queued" && (t("dash.queued") || "En cola")}
           {job.status === "processing" && t("dash.processing")}
           {job.status === "error" && t("dash.error")}
           {job.created_at && <span className="ml-2 text-gray-600">{timeAgo(job.created_at)}</span>}
@@ -81,6 +89,7 @@ function ActivityItem({ job, onSelect, t }) {
         job.status === "done" ? "bg-accent" :
         job.status === "pending_review" ? "bg-amber-400" :
         job.status === "error" || job.status === "validation_failed" ? "bg-red-400" :
+        job.status === "queued" ? "bg-gray-500" :
         "bg-brand animate-pulse"
       }`} />
     </button>
@@ -92,7 +101,7 @@ export default function Dashboard({ history, onSelectJob, onNewBatch, onViewHist
   const done = history.filter((h) => h.status === "done").length;
   const pendingReview = history.filter((h) => h.status === "pending_review").length;
   const errors = history.filter((h) => h.status === "error" || h.status === "validation_failed").length;
-  const processing = history.filter((h) => h.status === "processing").length;
+  const processing = history.filter((h) => h.status === "processing" || h.status === "queued").length;
   const recent = history.filter((h) => ["done", "pending_review"].includes(h.status)).slice(0, 8);
 
   // Real usage from API

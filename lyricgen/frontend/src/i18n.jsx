@@ -85,6 +85,7 @@ const translations = {
     "dash.thematic_ai": "Análisis temático",
     "dash.completed": "Completado",
     "dash.processing": "Procesando...",
+    "dash.queued": "En cola",
     "dash.error": "Error",
     "dash.min_remaining": "min restantes",
 
@@ -376,6 +377,7 @@ const translations = {
     "dash.thematic_ai": "Thematic analysis",
     "dash.completed": "Completed",
     "dash.processing": "Processing...",
+    "dash.queued": "Queued",
     "dash.error": "Error",
     "dash.min_remaining": "min remaining",
 
@@ -652,6 +654,7 @@ const translations = {
     "dash.thematic_ai": "Análise temática",
     "dash.completed": "Concluído",
     "dash.processing": "Processando...",
+    "dash.queued": "Na fila",
     "dash.error": "Erro",
     "dash.min_remaining": "min restantes",
 
