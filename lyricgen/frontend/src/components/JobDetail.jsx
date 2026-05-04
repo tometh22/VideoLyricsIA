@@ -303,7 +303,18 @@ export default function JobDetail({ job, onBack, onJobUpdate }) {
       {isValidationFailed && job.error && (
         <div className="mb-6 rounded-2xl bg-red-500/5 border border-red-500/10 px-5 py-4">
           <p className="text-sm font-medium text-red-400 mb-1">{t("detail.validation_issues") || "Content policy issues detected"}</p>
-          <p className="text-xs text-red-400/70">{job.error}</p>
+          <p className="text-xs text-red-400/70 mb-3">{job.error}</p>
+          <div className="px-3 py-2 rounded-lg bg-accent/5 border border-accent/15 mb-3">
+            <p className="text-[11px] text-accent/80">
+              {t("detail.validation_no_quota") || "Este video NO consume tu cuota mensual — solo videos aprobados cuentan."}
+            </p>
+          </div>
+          <button
+            onClick={() => onBack && onBack()}
+            className="btn-primary text-xs py-2 px-4"
+          >
+            {t("detail.upload_again") || "Subir el MP3 de nuevo"}
+          </button>
         </div>
       )}
 
@@ -382,9 +393,14 @@ export default function JobDetail({ job, onBack, onJobUpdate }) {
             </svg>
             {t("review.title") || "Review & Approve"}
           </h3>
-          <p className="text-sm text-gray-400 mb-4">
+          <p className="text-sm text-gray-400 mb-3">
             {t("review.description") || "Review the generated content before making it available for download and YouTube upload."}
           </p>
+          <div className="px-3 py-2 rounded-lg bg-accent/5 border border-accent/15 mb-4">
+            <p className="text-[11px] text-accent/80">
+              {t("review.reject_free") || "Rechazar es gratis — no consume tu cuota mensual. Solo los videos aprobados cuentan."}
+            </p>
+          </div>
           <textarea
             value={reviewNotes}
             onChange={(e) => setReviewNotes(e.target.value)}

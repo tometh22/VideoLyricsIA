@@ -18,6 +18,11 @@ function tokenParam() {
 // stops the user from picking 50 files and getting 40 of them rejected.
 const MAX_BATCH_SIZE = 10;
 
+// Max single-file size. Mirrors backend MAX_UPLOAD_MB default (50). We
+// reject client-side so the user gets immediate feedback instead of a
+// 413 from the server after a long upload.
+const MAX_FILE_MB = 50;
+
 const UMG_FRAME_SIZES = [
   { key: "HD",     label: "HD 1920×1080 (16:9)" },
   { key: "UHD-4K", label: "UHD 4K 3840×2160 (16:9)" },
@@ -88,20 +93,29 @@ export default function UploadZone({
   };
 
   const [batchTruncated, setBatchTruncated] = useState(0);
+  const [oversize, setOversize] = useState([]);
 
   const addFiles = (fileList) => {
     const mp3s = Array.from(fileList).filter((f) =>
       f.name.toLowerCase().endsWith(".mp3")
     );
     if (!mp3s.length) return;
+
+    const max = MAX_FILE_MB * 1024 * 1024;
+    const tooBig = mp3s.filter((f) => f.size > max);
+    const okSize = mp3s.filter((f) => f.size <= max);
+    if (tooBig.length) setOversize(tooBig.map((f) => f.name));
+    else setOversize([]);
+    if (!okSize.length) return;
+
     onFiles((prev) => {
       const remaining = MAX_BATCH_SIZE - prev.length;
       if (remaining <= 0) {
-        setBatchTruncated(mp3s.length);
+        setBatchTruncated(okSize.length);
         return prev;
       }
-      const accepted = mp3s.slice(0, remaining);
-      const dropped = mp3s.length - accepted.length;
+      const accepted = okSize.slice(0, remaining);
+      const dropped = okSize.length - accepted.length;
       if (dropped > 0) setBatchTruncated(dropped);
       const newEntries = accepted.map((f) => ({
         file: f,
@@ -223,6 +237,18 @@ export default function UploadZone({
                 >{t("common.dismiss") || "dismiss"}</button>
               </div>
             )}
+            {oversize.length > 0 && (
+              <div className="mt-2 px-3 py-2 rounded-lg bg-red-500/10 border border-red-500/20">
+                <p className="text-[11px] text-red-300">
+                  {t("upload.oversize", { max: MAX_FILE_MB }) ||
+                    `${oversize.length} archivo(s) excede(n) ${MAX_FILE_MB} MB y fueron ignorados: ${oversize.slice(0,3).join(", ")}${oversize.length > 3 ? "…" : ""}`}
+                </p>
+                <button
+                  onClick={(e) => { e.stopPropagation(); setOversize([]); }}
+                  className="mt-1 text-[10px] text-red-400/60 hover:text-red-300"
+                >{t("common.dismiss") || "dismiss"}</button>
+              </div>
+            )}
           </div>
         ) : (
           <div className="py-4">
@@ -233,6 +259,9 @@ export default function UploadZone({
             </div>
             <p className="text-gray-300 font-medium mb-1">{t("upload.drag")}</p>
             <p className="text-gray-600 text-sm">{t("upload.drag_sub")}</p>
+            <p className="text-gray-700 text-[11px] mt-2">
+              {t("upload.size_hint", { max: MAX_FILE_MB }) || `MP3, máx ${MAX_FILE_MB} MB por archivo, hasta ${MAX_BATCH_SIZE} por lote`}
+            </p>
           </div>
         )}
       </div>
@@ -262,10 +291,17 @@ export default function UploadZone({
                   type="text"
                   value={entry.artist}
                   onChange={(e) => updateField(i, "artist", e.target.value)}
-                  placeholder={t("upload.artist")}
-                  className="w-full px-3 py-1.5 rounded-lg bg-surface-1 border border-white/[0.06]
-                    focus:border-brand/50 focus:outline-none text-sm text-white placeholder-gray-500 transition-all"
+                  placeholder={t("upload.artist") + " *"}
+                  required
+                  className={`w-full px-3 py-1.5 rounded-lg bg-surface-1 border
+                    focus:outline-none text-sm text-white placeholder-gray-500 transition-all
+                    ${entry.artist.trim() ? "border-white/[0.06] focus:border-brand/50" : "border-amber-500/40 focus:border-amber-400"}`}
                 />
+                {!entry.artist.trim() && (
+                  <p className="text-[10px] text-amber-400/80">
+                    {t("upload.artist_required") || "Nombre del artista es requerido"}
+                  </p>
+                )}
                 <div className="flex items-center gap-1.5">
                   <span className="text-[10px] text-gray-600 mr-1">{t("lang.auto")}</span>
                   {LANGUAGES.filter(l => l.code).map((l) => (
