@@ -1725,6 +1725,32 @@ def _validate_umg_master(path: str, spec: RenderSpec) -> list[str]:
     if "mov" not in fmt:
         errors.append(f"format_name={fmt}, expected a mov container")
 
+    # Audio. UMG requires PCM 24-bit, 48 kHz, stereo. Catching this here
+    # prevents the silent regression where moviepy's audio_fps default
+    # (44100) overrides our ffmpeg `-ar 48000` and ships a non-compliant
+    # master. Source MP3s are usually 44.1 kHz so this is a real risk.
+    a_streams = [s for s in probe.get("streams", []) if s.get("codec_type") == "audio"]
+    if not a_streams:
+        errors.append("no audio stream found")
+    else:
+        a = a_streams[0]
+        if a.get("codec_name") != "pcm_s24le":
+            errors.append(
+                f"audio codec_name={a.get('codec_name')}, expected pcm_s24le"
+            )
+        try:
+            sample_rate = int(a.get("sample_rate", 0))
+        except (TypeError, ValueError):
+            sample_rate = 0
+        if sample_rate != 48000:
+            errors.append(
+                f"audio sample_rate={sample_rate}, expected 48000"
+            )
+        if int(a.get("channels", 0)) != 2:
+            errors.append(
+                f"audio channels={a.get('channels')}, expected 2 (stereo)"
+            )
+
     return errors
 
 
@@ -1809,6 +1835,12 @@ def generate_lyric_video(
 
     if spec.profile == "umg":
         out_path = os.path.join(job_dir, "umg_master.mov")
+        # NOTE: -ar in ffmpeg_params alone is silently overridden by moviepy,
+        # which passes its own -ar derived from audio_fps later on the
+        # command line (moviepy default is 44100). The UMG spec requires
+        # 48 kHz, so we force it via audio_fps. We also keep aresample in
+        # ffmpeg_params as belt-and-braces for cases where the input audio
+        # clip has a different rate.
         ffmpeg_params = [
             "-r", spec.fps_str,
             "-profile:v", str(spec.prores_profile),
@@ -1820,13 +1852,14 @@ def generate_lyric_video(
             "-color_range", "tv",
             "-aspect", f"{spec.dar[0]}:{spec.dar[1]}",
             "-vf", "setsar=1",
-            "-ar", "48000",
+            "-af", "aresample=48000",
         ]
         video.write_videofile(
             out_path,
             fps=spec.fps,
             codec=spec.codec,
             audio_codec=spec.audio_codec,
+            audio_fps=48000,
             ffmpeg_params=ffmpeg_params,
             threads=4,
             logger=None,

@@ -51,10 +51,24 @@ class GenLyClient:
             self.login()
         return {"Authorization": f"Bearer {self._token}"}
 
-    def upload(self, mp3_path: str, artist: str = "preflight") -> str:
+    def upload(
+        self,
+        mp3_path: str,
+        artist: str = "preflight",
+        delivery_profile: str = "youtube",
+        umg_frame_size: str = "",
+        umg_fps: str = "",
+        umg_prores_profile: str = "",
+    ) -> str:
         with open(mp3_path, "rb") as f:
             files = {"file": (Path(mp3_path).name, f, "audio/mpeg")}
-            data = {"artist": artist, "delivery_profile": "youtube"}
+            data = {"artist": artist, "delivery_profile": delivery_profile}
+            if delivery_profile == "umg":
+                data.update({
+                    "umg_frame_size": umg_frame_size,
+                    "umg_fps": umg_fps,
+                    "umg_prores_profile": umg_prores_profile,
+                })
             r = requests.post(
                 f"{self.base}/upload",
                 headers=self._headers(),
@@ -73,6 +87,40 @@ class GenLyClient:
         )
         r.raise_for_status()
         return r.json()
+
+    def download(self, job_id: str, kind: str, dest_path: str) -> str:
+        """Download a deliverable. `kind` is one of: video, short, thumbnail,
+        umg_master. The API authenticates downloads via `?token=` query param
+        (so signed R2 redirects work in browsers without losing auth) and
+        302-redirects to a signed R2 URL on success — requests follows that
+        automatically. We do NOT pass the signed-URL request through the
+        bearer header because R2's signature is the auth there."""
+        if not self._token:
+            self.login()
+        r = requests.get(
+            f"{self.base}/download/{job_id}/{kind}",
+            params={"token": self._token},
+            timeout=300,
+            stream=True,
+        )
+        r.raise_for_status()
+        with open(dest_path, "wb") as f:
+            for chunk in r.iter_content(chunk_size=1 << 20):
+                if chunk:
+                    f.write(chunk)
+        return dest_path
+
+    def wait_until_done(
+        self, job_id: str, timeout_secs: int = 1500, poll_secs: int = 10
+    ) -> dict:
+        import time as _time
+        deadline = _time.time() + timeout_secs
+        while _time.time() < deadline:
+            st = self.status(job_id)
+            if st.get("status") in {"done", "validation_failed", "error", "failed", "upload_failed"}:
+                return st
+            _time.sleep(poll_secs)
+        raise TimeoutError(f"job {job_id} did not finish within {timeout_secs}s")
 
 
 def _vertex_token() -> str:
