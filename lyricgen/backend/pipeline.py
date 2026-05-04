@@ -1835,12 +1835,12 @@ def generate_lyric_video(
 
     if spec.profile == "umg":
         out_path = os.path.join(job_dir, "umg_master.mov")
-        # NOTE: -ar in ffmpeg_params alone is silently overridden by moviepy,
-        # which passes its own -ar derived from audio_fps later on the
-        # command line (moviepy default is 44100). The UMG spec requires
-        # 48 kHz, so we force it via audio_fps. We also keep aresample in
-        # ffmpeg_params as belt-and-braces for cases where the input audio
-        # clip has a different rate.
+        # UMG requires 48 kHz audio. moviepy's `audio_fps` writes the temp
+        # WAV at the right rate AND passes `-ar 48000` to ffmpeg, so
+        # ffmpeg sees a 48 kHz input and emits a 48 kHz stream — no resample
+        # filter needed. (An earlier attempt added `-af aresample=48000`
+        # alongside `audio_fps=48000` and that combo silently hung ProRes
+        # encoding mid-job; fall back to one mechanism at a time.)
         ffmpeg_params = [
             "-r", spec.fps_str,
             "-profile:v", str(spec.prores_profile),
@@ -1852,7 +1852,6 @@ def generate_lyric_video(
             "-color_range", "tv",
             "-aspect", f"{spec.dar[0]}:{spec.dar[1]}",
             "-vf", "setsar=1",
-            "-af", "aresample=48000",
         ]
         video.write_videofile(
             out_path,
