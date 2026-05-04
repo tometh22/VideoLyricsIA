@@ -1,9 +1,9 @@
 import { useState } from "react";
 import { useI18n } from "../i18n";
 
-export default function LoginPage({ onLogin, onBack }) {
+export default function LoginPage({ onLogin, onBack, resetToken, onResetComplete }) {
   const { t, lang, setLang } = useI18n();
-  const [mode, setMode] = useState("login"); // login, register, forgot, reset_sent
+  const [mode, setMode] = useState(resetToken ? "reset_password" : "login"); // login, register, forgot, reset_sent, reset_password, reset_done
   const [username, setUsername] = useState("");
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
@@ -61,6 +61,40 @@ export default function LoginPage({ onLogin, onBack }) {
       }
       const data = await res.json();
       onLogin(data.token, data.user);
+    } catch (err) {
+      setError(err.message);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const handleResetPassword = async (e) => {
+    e.preventDefault();
+    if (!password.trim()) return;
+    if (password !== confirmPassword) {
+      setError(t("login.passwords_mismatch"));
+      return;
+    }
+    if (password.length < 8) {
+      setError(t("login.password_min"));
+      return;
+    }
+    setLoading(true);
+    setError("");
+    try {
+      const res = await fetch("/auth/reset-password", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ token: resetToken, password }),
+      });
+      if (!res.ok) {
+        const data = await res.json().catch(() => ({}));
+        throw new Error(data.detail || t("login.reset_invalid"));
+      }
+      const data = await res.json();
+      setMessage(data.message || t("login.reset_done"));
+      setMode("reset_done");
+      onResetComplete?.();
     } catch (err) {
       setError(err.message);
     } finally {
@@ -265,6 +299,63 @@ export default function LoginPage({ onLogin, onBack }) {
                 </button>
               </div>
             </>
+          )}
+
+          {/* Reset password form (came from email link) */}
+          {mode === "reset_password" && (
+            <>
+              <h2 className="text-lg font-bold mb-1">{t("login.reset_title")}</h2>
+              <p className="text-xs text-gray-500 mb-6">{t("login.reset_subtitle")}</p>
+              <form onSubmit={handleResetPassword} className="space-y-4">
+                <div>
+                  <label className="block text-xs text-gray-400 mb-1.5 ml-1">{t("login.new_password")}</label>
+                  <input type="password" value={password} onChange={(e) => setPassword(e.target.value)}
+                    className="input-field" placeholder={t("login.password_min")}
+                    autoComplete="new-password" autoFocus />
+                </div>
+                <div>
+                  <label className="block text-xs text-gray-400 mb-1.5 ml-1">{t("login.confirm_password")}</label>
+                  <input type="password" value={confirmPassword} onChange={(e) => setConfirmPassword(e.target.value)}
+                    className="input-field" placeholder={t("login.confirm_password")}
+                    autoComplete="new-password" />
+                </div>
+                {error && (
+                  <div className="rounded-xl bg-red-500/10 border border-red-500/20 px-4 py-3">
+                    <p className="text-sm text-red-400">{error}</p>
+                  </div>
+                )}
+                <button type="submit" disabled={loading || !password.trim() || !confirmPassword.trim()}
+                  className="btn-primary w-full py-4 mt-2">
+                  {loading ? (
+                    <span className="flex items-center justify-center gap-2">
+                      <span className="w-4 h-4 border-2 border-white border-t-transparent rounded-full animate-spin" />
+                      {t("login.loading")}
+                    </span>
+                  ) : t("login.reset_submit")}
+                </button>
+              </form>
+            </>
+          )}
+
+          {/* Reset done confirmation */}
+          {mode === "reset_done" && (
+            <div className="text-center py-4">
+              <div className="w-14 h-14 mx-auto mb-4 rounded-2xl bg-accent/10 flex items-center justify-center">
+                <svg className="w-7 h-7 text-accent" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
+                  <polyline points="20 6 9 17 4 12" />
+                </svg>
+              </div>
+              <h2 className="text-lg font-bold mb-2">{t("login.reset_done_title")}</h2>
+              <p className="text-sm text-gray-400 mb-6">{message}</p>
+              <button onClick={() => {
+                  setMode("login");
+                  setError(""); setMessage("");
+                  setPassword(""); setConfirmPassword("");
+                }}
+                className="btn-primary w-full py-4">
+                {t("login.go_to_login")}
+              </button>
+            </div>
           )}
 
           {/* Reset sent confirmation */}

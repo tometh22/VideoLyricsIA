@@ -62,6 +62,7 @@ export default function App() {
   const [backgroundFile, setBackgroundFile] = useState(null);
   const [backgroundId, setBackgroundId] = useState(null);
   const [sidebarOpen, setSidebarOpen] = useState(true);
+  const [resetToken, setResetToken] = useState(null);
   const pollingIntervals = useRef(new Set());
   const PARALLEL_WORKERS = 5;
 
@@ -87,8 +88,10 @@ export default function App() {
       window.history.replaceState({}, "", window.location.pathname);
     }
     if (params.get("reset_password")) {
+      setResetToken(params.get("reset_password"));
       setShowLanding(false);
       setView("login");
+      window.history.replaceState({}, "", window.location.pathname);
     }
   }, []);
 
@@ -396,7 +399,12 @@ export default function App() {
 
   // --- Login/Register ---
   if (!token && view === "login") {
-    return <LoginPage onLogin={(t, u) => { handleLogin(t, u); setView("dashboard"); }} onBack={() => setShowLanding(true)} />;
+    return <LoginPage
+      onLogin={(t, u) => { handleLogin(t, u); setView("dashboard"); }}
+      onBack={() => setShowLanding(true)}
+      resetToken={resetToken}
+      onResetComplete={() => setResetToken(null)}
+    />;
   }
 
   // --- Not authenticated, redirect to landing ---
