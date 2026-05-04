@@ -63,6 +63,32 @@ Exit codes: `0` GO, `1` NO-GO, `2` INCONCLUSIVE (every P0 skipped).
 `validator_quality` hits the R2 cache layer in `pipeline.py`, so re-runs
 with the same prompts are free after the first pass.
 
+## Daily smoke (CI)
+
+`scripts/preflight/daily_smoke.py` is a slimmed-down runner that only
+exercises the zero-cost checks (`production_health` + `volume_caps`) and
+posts an HTML alert to `ALERT_EMAIL` via Resend if anything is red. It
+exits non-zero on failure so the calling job is also flagged.
+
+Schedule it from `.github/workflows/daily-smoke.yml` — runs once a day at
+09:00 Buenos Aires (12:00 UTC), or on-demand from the Actions tab.
+
+Required GitHub repository secrets:
+
+| Secret               | Purpose                                                      |
+|----------------------|--------------------------------------------------------------|
+| `PRODUCTION_API_URL` | Base URL of the deployed API (e.g. `https://...railway.app`) |
+| `DATABASE_URL`       | Public Postgres URL — used to audit per-user cap overrides   |
+| `RESEND_API_KEY`     | Same key the API uses for transactional email                |
+| `RESEND_FROM`        | Verified sender (e.g. `noreply@genly.pro`)                   |
+| `ALERT_EMAIL`        | Where failure notifications are delivered                    |
+
+Set them in GitHub: **Settings → Secrets and variables → Actions →
+New repository secret**.
+
+To pause the daily run, either disable the workflow from the Actions
+tab or remove its `schedule:` block.
+
 ## Adding a check
 
 1. Create `check_<name>.py` with a class that subclasses `Check`.

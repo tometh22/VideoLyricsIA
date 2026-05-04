@@ -1,0 +1,43 @@
+name: Daily smoke check
+
+on:
+  schedule:
+    # 12:00 UTC = 09:00 ART (Buenos Aires).
+    - cron: '0 12 * * *'
+  workflow_dispatch:  # Allow manual run from the Actions tab.
+
+permissions:
+  contents: read
+
+jobs:
+  preflight:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install minimal preflight deps
+        # daily_smoke only needs production_health (urllib stdlib) +
+        # volume_caps (DB scan). No moviepy / librosa / google-* required.
+        run: |
+          pip install --quiet \
+            requests==2.32.3 \
+            python-dotenv==1.0.1 \
+            psycopg2-binary==2.9.9 \
+            sqlalchemy==2.0.36
+
+      - name: Run smoke check
+        working-directory: lyricgen/backend
+        env:
+          PRODUCTION_API_URL: ${{ secrets.PRODUCTION_API_URL }}
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          RESEND_API_KEY: ${{ secrets.RESEND_API_KEY }}
+          RESEND_FROM: ${{ secrets.RESEND_FROM }}
+          ALERT_EMAIL: ${{ secrets.ALERT_EMAIL }}
+        run: python -m scripts.preflight.daily_smoke
