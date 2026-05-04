@@ -106,7 +106,11 @@ export default function Dashboard({ history, onSelectJob, onNewBatch, onViewHist
 
   const monthlyLimit = usage?.limit || 100;
   const monthlyUsed = usage?.used || done;
-  const usagePercent = usage?.percent || Math.min(100, (monthlyUsed / monthlyLimit) * 100);
+  const isUnlimited = usage?.plan === "unlimited" || monthlyLimit >= 999999;
+  const monthlyLimitDisplay = isUnlimited ? "∞" : monthlyLimit;
+  const usagePercent = isUnlimited
+    ? 0
+    : (usage?.percent || Math.min(100, (monthlyUsed / monthlyLimit) * 100));
 
   return (
     <div className="w-full max-w-4xl animate-fade-in">
@@ -156,8 +160,8 @@ export default function Dashboard({ history, onSelectJob, onNewBatch, onViewHist
           <div>
             <h3 className="text-sm font-semibold">{t("dash.monthly_usage")}</h3>
             <p className="text-[11px] text-gray-500 mt-0.5">
-              {monthlyUsed} {t("dash.monthly_of")} {monthlyLimit} {t("dash.monthly_plan")}
-              {usage?.plan && <span className="ml-2 text-brand">Plan {usage.plan}</span>}
+              {monthlyUsed} {t("dash.monthly_of")} {monthlyLimitDisplay} {t("dash.monthly_plan")}
+              {usage?.plan && <span className="ml-2 text-brand">· Plan {usage.plan}</span>}
             </p>
           </div>
           <span className={`text-sm font-bold ${usagePercent >= 100 ? "text-amber-400" : "text-brand"}`}>
