@@ -496,20 +496,15 @@ def _enforce_concurrent_jobs_cap(*_, **__) -> None:
 
 
 # Soft per-tenant cap on jobs that need attention (queued + processing +
-# pending_review). Sized so a 3-worker pool can keep moving while a
-# couple of jobs sit in review on cheap plans. Plans that pay for
-# unlimited concurrency (UMG, enterprise) bypass it entirely — they are
-# expected to manage their own backlog and the cap blocking them during
-# their own live demo (2026-05-05) was a launch-day own-goal.
+# pending_review). Forces operators to clear their existing backlog before
+# piling on more work. Tomi communicated this 5-batch ceiling to UMG as
+# the agreed launch-window throughput; do NOT raise without re-aligning
+# with the operator. Admins bypass for test seeding.
 TENANT_BACKLOG_LIMIT = int(os.environ.get("TENANT_BACKLOG_LIMIT", "5"))
-BACKLOG_BYPASS_PLANS = {"unlimited", "enterprise"}
 
 
 def _enforce_tenant_backlog(db: Session, current_user: dict) -> None:
-    plan = (current_user.get("plan") or "").strip().lower()
-    if plan in BACKLOG_BYPASS_PLANS:
-        return
-    # Admins are also exempt — they may legitimately seed many test jobs.
+    # Admins are exempt — they may legitimately seed many test jobs.
     if current_user.get("role") == "admin":
         return
     tenant_id = current_user["tenant_id"]
