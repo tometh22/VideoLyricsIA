@@ -730,7 +730,7 @@ async def transcribe_endpoint(
         #                          to auto-align)
         from pipeline import (
             _fetch_lrclib, _lrc_to_segments, _audio_duration,
-            _slice_audio_prefix,
+            _slice_audio_prefix, _verify_lrclib_alignment,
         )
         lrc = await asyncio.to_thread(_fetch_lrclib, artist_hint, song_hint)
         if lrc:
@@ -786,7 +786,38 @@ async def transcribe_endpoint(
                     song_segs = _lrc_to_segments(
                         synced, lrc_dur, time_offset=offset,
                     )
-                    if song_segs and len(song_segs) >= 8:
+                    # Alignment verification — when we applied an offset, we
+                    # have NO ground-truth that the offset is correct (the
+                    # extra audio could be at the end, not the start). Slice
+                    # ~5 s of the user's audio at where we claim a song line
+                    # starts, run Whisper, fuzzy-match. If the match is weak
+                    # (< 0.4), we don't trust the alignment and fall through
+                    # to plain + Whisper. Cost: 1 extra Whisper call on 5 s
+                    # of audio (~$0.0005) and ~3 s of latency.
+                    if offset > 0 and song_segs:
+                        # Verify mid-song (more robust than first line which
+                        # may be a short ad-lib like "¡Karol!")
+                        mid_idx = min(len(song_segs) - 1, len(song_segs) // 2)
+                        verify_seg = song_segs[mid_idx]
+                        # Skip verification if the chosen text is too short
+                        # to fuzzy-match reliably.
+                        if len(verify_seg["text"]) >= 10:
+                            confidence = await asyncio.to_thread(
+                                _verify_lrclib_alignment,
+                                tmp_path, verify_seg["text"], verify_seg["start"],
+                            )
+                            if confidence is not None:
+                                if confidence < 0.4:
+                                    print(f"[LYRICS] alignment verification FAILED "
+                                          f"(confidence={confidence:.2f} at "
+                                          f"t={verify_seg['start']:.1f}s for "
+                                          f"{verify_seg['text'][:40]!r}) — "
+                                          f"falling back to Whisper+plain")
+                                    use_synced = False
+                                else:
+                                    print(f"[LYRICS] alignment verified "
+                                          f"(confidence={confidence:.2f})")
+                    if use_synced and song_segs and len(song_segs) >= 8:
                         combined = hybrid_intro_segs + song_segs
                         print(f"[LYRICS] lrclib synced hit — "
                               f"{len(combined)} segments "

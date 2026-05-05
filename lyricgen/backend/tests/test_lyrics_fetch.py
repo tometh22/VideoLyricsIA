@@ -496,3 +496,70 @@ def test_slice_audio_prefix_rejects_zero_or_negative_seconds(tmp_path):
     out = str(tmp_path / "out.mp3")
     assert _slice_audio_prefix("/tmp/anything.mp3", out, 0) is False
     assert _slice_audio_prefix("/tmp/anything.mp3", out, -3.0) is False
+
+
+def test_slice_audio_window_rejects_invalid_inputs(tmp_path):
+    from pipeline import _slice_audio_window
+    out = str(tmp_path / "out.mp3")
+    assert _slice_audio_window("/tmp/anything.mp3", out, -1.0, 5.0) is False
+    assert _slice_audio_window("/tmp/anything.mp3", out, 0.0, 0) is False
+    assert _slice_audio_window("/tmp/anything.mp3", out, 0.0, -3.0) is False
+
+
+def test_verify_alignment_returns_none_for_invalid_inputs():
+    from pipeline import _verify_lrclib_alignment
+    assert _verify_lrclib_alignment("/tmp/anything.mp3", "", 10.0) is None
+    assert _verify_lrclib_alignment("/tmp/anything.mp3", "expected", -1.0) is None
+
+
+def test_verify_alignment_high_confidence_when_whisper_matches(monkeypatch, tmp_path):
+    """Stub the slice + whisper helpers so we can exercise the fuzzy-match
+    logic without real audio or API."""
+    import pipeline
+    monkeypatch.setattr(pipeline, "_slice_audio_window",
+                        lambda inp, out, s, d: True)
+    # Whisper returns text identical to expected (modulo punctuation/case)
+    monkeypatch.setattr(pipeline, "_whisper_quick_text",
+                        lambda p: "Si antes te hubiera conocido")
+
+    score = pipeline._verify_lrclib_alignment(
+        "/tmp/fake.mp3", "Si antes te hubiera conocido?", 18.5,
+    )
+    assert score is not None
+    assert score >= 0.9
+
+
+def test_verify_alignment_low_confidence_when_whisper_mismatches(monkeypatch):
+    import pipeline
+    monkeypatch.setattr(pipeline, "_slice_audio_window",
+                        lambda inp, out, s, d: True)
+    # Whisper returns text from a totally different part of the song
+    monkeypatch.setattr(pipeline, "_whisper_quick_text",
+                        lambda p: "ella es timida y yo no")
+
+    score = pipeline._verify_lrclib_alignment(
+        "/tmp/fake.mp3", "Si antes te hubiera conocido?", 18.5,
+    )
+    assert score is not None
+    assert score < 0.4
+
+
+def test_verify_alignment_returns_none_on_slice_failure(monkeypatch):
+    import pipeline
+    monkeypatch.setattr(pipeline, "_slice_audio_window",
+                        lambda inp, out, s, d: False)
+    score = pipeline._verify_lrclib_alignment(
+        "/tmp/fake.mp3", "Some lyric line", 30.0,
+    )
+    assert score is None
+
+
+def test_verify_alignment_returns_none_on_empty_whisper(monkeypatch):
+    import pipeline
+    monkeypatch.setattr(pipeline, "_slice_audio_window",
+                        lambda inp, out, s, d: True)
+    monkeypatch.setattr(pipeline, "_whisper_quick_text", lambda p: "")
+    score = pipeline._verify_lrclib_alignment(
+        "/tmp/fake.mp3", "Some lyric line", 30.0,
+    )
+    assert score is None

@@ -825,6 +825,93 @@ def _audio_duration(mp3_path: str) -> float | None:
         return None
 
 
+def _slice_audio_window(input_path: str, output_path: str,
+                         start_seconds: float, duration_seconds: float) -> bool:
+    """Slice an arbitrary [start, start+duration] window from an MP3.
+
+    Uses ``-ss`` AFTER ``-i`` for sample-accurate seek (slow seek), and
+    re-encodes via libmp3lame so we don't depend on keyframe alignment.
+    Slower than ``_slice_audio_prefix`` (re-encode vs stream copy) but
+    more reliable for arbitrary offsets where MP3 frame boundaries may
+    not line up with the requested cut.
+
+    Returns True on success, False on any failure. Best-effort.
+    """
+    if start_seconds < 0 or duration_seconds <= 0:
+        return False
+    import subprocess as _sp
+    try:
+        _sp.run(
+            ["ffmpeg", "-y", "-i", input_path,
+             "-ss", str(start_seconds), "-t", str(duration_seconds),
+             "-acodec", "libmp3lame", "-q:a", "5",
+             "-loglevel", "error", output_path],
+            check=True, timeout=30,
+        )
+        return os.path.exists(output_path) and os.path.getsize(output_path) > 0
+    except (_sp.CalledProcessError, _sp.TimeoutExpired, FileNotFoundError, OSError) as e:
+        print(f"[LYRICS] _slice_audio_window failed: {e}")
+        return False
+
+
+def _whisper_quick_text(mp3_path: str) -> str:
+    """Minimal whisper-1 transcription of a short clip — used by alignment
+    verification. Returns plain text with no post-processing (no spam
+    filter, no dedup). Best-effort: returns "" on any failure.
+    """
+    if not os.path.exists(mp3_path):
+        return ""
+    try:
+        from openai import OpenAI
+        with open(mp3_path, "rb") as f:
+            r = OpenAI().audio.transcriptions.create(
+                model="whisper-1", file=f, response_format="text",
+            )
+        return (r or "").strip()
+    except Exception as e:
+        print(f"[LYRICS] _whisper_quick_text failed: {e}")
+        return ""
+
+
+def _verify_lrclib_alignment(audio_path: str, expected_text: str,
+                              claimed_start: float, window: float = 5.5) -> float | None:
+    """Slice a ~window-second clip of audio starting just before
+    `claimed_start`, run Whisper on it, fuzzy-match against `expected_text`.
+
+    Returns a similarity ratio in [0, 1] (1.0 = identical, 0 = nothing in
+    common), or None if slicing or Whisper failed and we cannot verify.
+
+    Used to confirm lrclib's offset-shifted timestamps actually line up
+    with what's being sung in the user's audio. Cheap (~3 s, ~$0.0005).
+    Conservative threshold for "trust": ~0.4. For UMG-style operator
+    review, this is the difference between "subtitles look right" and
+    "subtitles are 30 s off and we shipped it."
+    """
+    if claimed_start < 0 or not expected_text:
+        return None
+    import tempfile
+    from difflib import SequenceMatcher
+    import re as _re
+
+    fd, clip_path = tempfile.mkstemp(suffix=".mp3")
+    try:
+        os.close(fd)
+        slice_start = max(0.0, claimed_start - 0.3)
+        if not _slice_audio_window(audio_path, clip_path, slice_start, window):
+            return None
+        actual = _whisper_quick_text(clip_path)
+        if not actual:
+            return None
+        def _norm(s: str) -> str:
+            return _re.sub(r"[^\w\s]", "", s.lower()).strip()
+        return SequenceMatcher(None, _norm(actual), _norm(expected_text)).ratio()
+    finally:
+        try:
+            os.unlink(clip_path)
+        except OSError:
+            pass
+
+
 def _slice_audio_prefix(input_path: str, output_path: str, seconds: float) -> bool:
     """Slice the first ``seconds`` of an MP3 into ``output_path`` using ffmpeg.
 
