@@ -333,7 +333,7 @@ export default function UploadZone({
                 </p>
                 <button
                   onClick={(e) => { e.stopPropagation(); setBatchTruncated(0); }}
-                  className="mt-1 text-[10px] text-amber-400/60 hover:text-amber-300"
+                  className="mt-1 text-[11px] text-amber-400/60 hover:text-amber-300"
                 >{t("common.dismiss") || "dismiss"}</button>
               </div>
             )}
@@ -345,7 +345,7 @@ export default function UploadZone({
                 </p>
                 <button
                   onClick={(e) => { e.stopPropagation(); setOversize([]); }}
-                  className="mt-1 text-[10px] text-red-400/60 hover:text-red-300"
+                  className="mt-1 text-[11px] text-red-400/60 hover:text-red-300"
                 >{t("common.dismiss") || "dismiss"}</button>
               </div>
             )}
@@ -369,31 +369,55 @@ export default function UploadZone({
       {/* Movement-style reference gallery — educational, shown ONCE per
           batch above the file rows so the operator understands what each
           option produces before picking it on a per-track basis below.
-          The 4 sample MP4s are placeholders for v1 and should be swapped
-          with real Veo-generated samples before showing UMG. */}
-      {files.length > 0 && (
-        <div className="mt-3 glass rounded-2xl px-4 py-3">
-          <p className="text-[10px] text-gray-600 uppercase tracking-wider mb-2">
-            {t("upload.movement_gallery_title") || "Referencias de estilo de movimiento"}
-          </p>
-          <div className="grid grid-cols-2 sm:grid-cols-4 gap-2">
-            {MOVEMENT_STYLES.filter((m) => m.sample).map((m) => (
-              <div key={m.code} className="rounded-xl overflow-hidden border border-white/[0.06]">
-                <div className="aspect-video bg-black/30">
-                  <video
-                    src={m.sample}
-                    className="w-full h-full object-cover"
-                    muted autoPlay loop playsInline
-                  />
-                </div>
-                <div className="px-2 py-1.5 bg-surface-1">
-                  <p className="text-[10px] text-white truncate">{m.label}</p>
-                </div>
-              </div>
-            ))}
+          Cards highlight (brand ring) when AT LEAST ONE row in the batch
+          has selected that style, so the gallery doubles as an at-a-glance
+          summary of the batch's visual direction. */}
+      {files.length > 0 && (() => {
+        // Set of movement_style codes currently in use across the batch.
+        const inUse = new Set(files.map((f) => f.movementStyle).filter(Boolean));
+        return (
+          <div className="mt-3 glass rounded-2xl px-4 py-3">
+            <p className="text-[11px] text-gray-500 uppercase tracking-wider mb-2 font-medium">
+              {t("upload.movement_gallery_title") || "Referencias de estilo de movimiento"}
+            </p>
+            <div className="grid grid-cols-2 sm:grid-cols-4 gap-2">
+              {MOVEMENT_STYLES.filter((m) => m.sample).map((m) => {
+                const active = inUse.has(m.code);
+                return (
+                  <div
+                    key={m.code}
+                    className={`rounded-xl overflow-hidden border transition-all duration-200 cursor-default
+                      ${active
+                        ? "border-brand/60 shadow-glow ring-1 ring-brand/40"
+                        : "border-white/[0.06] hover:border-white/[0.18] hover:scale-[1.02]"
+                      }`}
+                  >
+                    <div className="aspect-video bg-black/30 relative">
+                      <video
+                        src={m.sample}
+                        className="w-full h-full object-cover"
+                        muted autoPlay loop playsInline
+                      />
+                      {active && (
+                        <div className="absolute top-1.5 right-1.5 w-5 h-5 rounded-full bg-brand flex items-center justify-center shadow">
+                          <svg className="w-3 h-3 text-white" fill="none" stroke="currentColor" strokeWidth="3" viewBox="0 0 24 24">
+                            <polyline points="20 6 9 17 4 12" />
+                          </svg>
+                        </div>
+                      )}
+                    </div>
+                    <div className="px-2 py-1.5 bg-surface-1">
+                      <p className={`text-[11px] truncate ${active ? "text-white font-medium" : "text-gray-300"}`}>
+                        {m.label}
+                      </p>
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
           </div>
-        </div>
-      )}
+        );
+      })()}
 
       {files.length > 0 && (
         <div className="mt-3 space-y-2 max-h-96 overflow-y-auto pr-1">
@@ -427,18 +451,18 @@ export default function UploadZone({
                     ${entry.artist.trim() ? "border-white/[0.06] focus:border-brand/50" : "border-amber-500/40 focus:border-amber-400"}`}
                 />
                 {!entry.artist.trim() && (
-                  <p className="text-[10px] text-amber-400/80">
+                  <p className="text-[11px] text-amber-400/80">
                     {t("upload.artist_required") || "Nombre del artista es requerido"}
                   </p>
                 )}
                 <div className="flex items-center gap-1.5">
-                  <span className="text-[10px] text-gray-600 mr-1">{t("lang.auto")}</span>
+                  <span className="text-[11px] text-gray-600 mr-1">{t("lang.auto")}</span>
                   {LANGUAGES.filter(l => l.code).map((l) => (
                     <button
                       key={l.code}
                       type="button"
                       onClick={() => updateField(i, "language", entry.language === l.code ? "" : l.code)}
-                      className={`text-[10px] font-bold px-2 py-1 rounded-md transition-all uppercase
+                      className={`text-[11px] font-bold px-2 py-1 rounded-md transition-all uppercase
                         ${entry.language === l.code
                           ? "bg-brand/20 text-brand"
                           : "text-gray-600 hover:text-gray-400 hover:bg-white/[0.03]"
@@ -449,7 +473,7 @@ export default function UploadZone({
                   ))}
                 </div>
                 <div className="flex items-center gap-2 pt-1">
-                  <span className="text-[10px] text-gray-600 shrink-0">
+                  <span className="text-[11px] text-gray-600 shrink-0">
                     {t("upload.genre_label") || "Género:"}
                   </span>
                   <select
@@ -476,7 +500,7 @@ export default function UploadZone({
                     <button
                       type="button"
                       onClick={() => toggleExpanded(i)}
-                      className="mt-1 flex items-center gap-1.5 text-[10px] text-gray-500 hover:text-gray-300 transition-colors"
+                      className="mt-1 flex items-center gap-1.5 text-[11px] text-gray-500 hover:text-gray-300 transition-colors"
                     >
                       <span>
                         {isExpanded
@@ -499,7 +523,7 @@ export default function UploadZone({
                 {expandedRows.has(i) && (
                   <>
                     <div className="flex items-center gap-2 pt-1">
-                      <span className="text-[10px] text-gray-600 shrink-0">
+                      <span className="text-[11px] text-gray-600 shrink-0">
                         {t("upload.concept_label") || "Concepto:"}
                       </span>
                       <select
@@ -514,7 +538,7 @@ export default function UploadZone({
                       </select>
                     </div>
                     <div className="flex items-center gap-2 pt-1">
-                      <span className="text-[10px] text-gray-600 shrink-0">
+                      <span className="text-[11px] text-gray-600 shrink-0">
                         {t("upload.movement_label") || "Movimiento:"}
                       </span>
                       <select
@@ -529,7 +553,7 @@ export default function UploadZone({
                       </select>
                     </div>
                     <div className="flex items-center gap-2 pt-1">
-                      <span className="text-[10px] text-gray-600 shrink-0">
+                      <span className="text-[11px] text-gray-600 shrink-0">
                         {t("upload.font_label") || "Tipografía:"}
                       </span>
                       <select
@@ -575,7 +599,7 @@ export default function UploadZone({
             }}
           />
 
-          <p className="text-[10px] text-gray-600 uppercase tracking-wider mb-2">{t("upload.bg_label") || "Background"}</p>
+          <p className="text-[11px] text-gray-600 uppercase tracking-wider mb-2">{t("upload.bg_label") || "Background"}</p>
 
           {/* Mode selector */}
           <div className="flex gap-1 p-1 glass rounded-xl w-fit mb-3">
@@ -644,7 +668,7 @@ export default function UploadZone({
                         )}
                       </div>
                       <div className="px-2 py-1.5 bg-surface-1">
-                        <p className="text-[10px] text-white truncate">{bg.name}</p>
+                        <p className="text-[11px] text-white truncate">{bg.name}</p>
                       </div>
                     </button>
                   ))}
@@ -678,7 +702,7 @@ export default function UploadZone({
                     </div>
                     <div className="flex-1 min-w-0">
                       <p className="text-sm text-white truncate">{backgroundFile.name}</p>
-                      <p className="text-[10px] text-cyan-400">{t("upload.custom_bg_active") || "Custom background - AI generation skipped"}</p>
+                      <p className="text-[11px] text-cyan-400">{t("upload.custom_bg_active") || "Custom background - AI generation skipped"}</p>
                     </div>
                     <button
                       onClick={() => { onBackgroundFile?.(null); onAnimateImage?.(false); }}
@@ -695,18 +719,25 @@ export default function UploadZone({
                       video uploads (.mp4/.mov) the toggle stays hidden
                       because the file is already a video. */}
                   {/\.(jpe?g|png)$/i.test(backgroundFile.name) && (
-                    <label className="mt-2 flex items-center gap-2 px-3 py-2 rounded-xl bg-surface-1 border border-white/[0.06] cursor-pointer">
+                    <label className="mt-2 flex items-center gap-3 px-3 py-2.5 rounded-xl bg-surface-1 border border-white/[0.06] hover:border-white/[0.12] cursor-pointer transition-colors">
+                      {/* Custom iOS-style toggle. Hidden native checkbox
+                          drives the state for accessibility; the visual
+                          track + thumb are pure Tailwind so the look
+                          matches the rest of the dark glassmorphism. */}
                       <input
                         type="checkbox"
                         checked={!!animateImage}
                         onChange={(e) => onAnimateImage?.(e.target.checked)}
-                        className="w-4 h-4 accent-brand"
+                        className="peer sr-only"
                       />
+                      <div className="relative w-9 h-5 rounded-full bg-surface-3 peer-checked:bg-brand transition-colors duration-200 shrink-0">
+                        <div className="absolute top-0.5 left-0.5 w-4 h-4 rounded-full bg-white shadow transition-transform duration-200 peer-checked:translate-x-4" />
+                      </div>
                       <div className="flex-1">
-                        <p className="text-[11px] text-white">
+                        <p className="text-xs text-white font-medium">
                           {t("upload.animate_image_label") || "Animar con AI"}
                         </p>
-                        <p className="text-[10px] text-gray-500">
+                        <p className="text-[11px] text-gray-500">
                           {t("upload.animate_image_hint") || "Veo anima tu imagen en lugar de usar zoom/pan"}
                         </p>
                       </div>
