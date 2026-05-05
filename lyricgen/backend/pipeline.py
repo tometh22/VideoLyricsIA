@@ -427,11 +427,59 @@ def _transcribe_via_openai_api(mp3_path: str, language: str | None = None) -> li
             "text": text,
         })
 
-    # Whisper occasionally loops on long sustained passages (long held notes,
-    # instrumental breaks, fade-outs) and emits the same line 5–30+ times in
-    # a row. Detect and drop the runaway tail — keep at most 2 consecutive
-    # identical lines, which preserves legitimate "chorus repeat" patterns
-    # but kills hallucination streaks.
+    # Whisper hallucinates loops in two distinct shapes:
+    #   1. SAME LINE REPEATED across consecutive segments — easy: dedupe
+    #      by exact match, keep first 2 (preserves legit chorus repeats).
+    #   2. SAME PHRASE REPEATED INSIDE a single segment's text — happens
+    #      on long sustained / instrumental passages where Whisper emits
+    #      one large segment whose text is "X and X and X and X and …".
+    #      Need to detect intra-segment repetition and truncate.
+    #
+    # Both cases observed in production on "El Plan de la Mariposa - El
+    # Riesgo" (5/5/2026): segment 60-150s contained the line "que podía
+    # reflexionar sobre lo que estaba haciendo y" repeated ~5 times within
+    # the same segment.
+    import re as _re_loops
+
+    def _truncate_intra_loop(text: str) -> str:
+        """If text contains a phrase that repeats 3+ times consecutively,
+        truncate to the first 2 occurrences. Phrase = 4–14 word window —
+        the upper bound matters because Whisper hallucinations sometimes
+        loop on a clause that's 8–12 words long ("estaba haciendo y que
+        podía reflexionar sobre lo que" = 9 words)."""
+        words = text.split()
+        if len(words) < 12:
+            return text
+        for window in range(14, 3, -1):  # try longer windows first
+            if len(words) < window * 3:
+                continue
+            for start in range(len(words) - window * 3 + 1):
+                phrase = words[start:start + window]
+                count = 1
+                pos = start + window
+                while pos + window <= len(words) and words[pos:pos + window] == phrase:
+                    count += 1
+                    pos += window
+                if count >= 3:
+                    cut = start + window * 2
+                    truncated = " ".join(words[:cut])
+                    return truncated.rstrip(",.;: ") + "…"
+        return text
+
+    cleaned: list[dict] = []
+    intra_truncated = 0
+    for seg in segments:
+        original = seg["text"]
+        new_text = _truncate_intra_loop(original)
+        if new_text != original:
+            intra_truncated += 1
+            seg = {**seg, "text": new_text}
+        cleaned.append(seg)
+    if intra_truncated:
+        print(f"[WHISPER-API] Truncated intra-segment loops in {intra_truncated} segment(s)")
+    segments = cleaned
+
+    # Then dedupe consecutive identical segments (case 1 from above).
     deduped: list[dict] = []
     streak_key = None
     streak_count = 0
