@@ -427,6 +427,31 @@ def _transcribe_via_openai_api(mp3_path: str, language: str | None = None) -> li
             "text": text,
         })
 
+    # Whisper occasionally loops on long sustained passages (long held notes,
+    # instrumental breaks, fade-outs) and emits the same line 5–30+ times in
+    # a row. Detect and drop the runaway tail — keep at most 2 consecutive
+    # identical lines, which preserves legitimate "chorus repeat" patterns
+    # but kills hallucination streaks.
+    deduped: list[dict] = []
+    streak_key = None
+    streak_count = 0
+    dropped = 0
+    for seg in segments:
+        key = seg["text"].lower().strip()
+        if key == streak_key:
+            streak_count += 1
+        else:
+            streak_key = key
+            streak_count = 1
+        if streak_count <= 2:
+            deduped.append(seg)
+        else:
+            dropped += 1
+    if dropped:
+        print(f"[WHISPER-API] Dropped {dropped} hallucination repeats "
+              f"(loop on '{streak_key[:60]}…')")
+    segments = deduped
+
     GAP = 0.05
     for i in range(len(segments) - 1):
         if segments[i]["end"] > segments[i + 1]["start"] - GAP:
