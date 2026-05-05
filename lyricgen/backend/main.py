@@ -710,6 +710,38 @@ async def transcribe_endpoint(
             print(f"[LYRICS] no artist supplied for {file.filename!r} — "
                   f"Gemini fetch will be skipped, falling through to lyrics.ovh")
 
+        # Fast-path: lrclib.net often has synced (LRC) lyrics for popular
+        # songs — when that's the case we skip Whisper entirely. Whisper
+        # API is the source of the hallucination problems UMG hit on Karol G
+        # ("¡Karol!" repeated 174x then dropped, leaving the second half
+        # of the song without subtitles). Community-curated synced lyrics
+        # have no such failure mode.
+        from pipeline import _fetch_lrclib, _lrc_to_segments
+        lrc = await asyncio.to_thread(_fetch_lrclib, artist_hint, song_hint)
+        if lrc:
+            synced = lrc.get("synced")
+            plain = lrc.get("plain") or ""
+            if synced:
+                segs = _lrc_to_segments(synced, lrc.get("duration"))
+                if segs and len(segs) >= 8:
+                    print(f"[LYRICS] lrclib synced hit — {len(segs)} segments, "
+                          f"skipping Whisper for {artist_hint!r} - {song_hint!r}")
+                    return {
+                        "segments": segs,
+                        "reference_lyrics": plain or synced,
+                    }
+            # No synced (or too few segments) — but we still have plain text
+            # from lrclib. Use it as the reference so the editor's suggestion
+            # engine fires, and skip the Gemini-grounded search step entirely
+            # (lrclib already gave us a clean source).
+            if plain:
+                print(f"[LYRICS] lrclib plain hit ({len(plain)} chars) — "
+                      f"running Whisper for timestamps, skipping Gemini")
+                segments = await loop.run_in_executor(
+                    None, transcribe, tmp_path, lang,
+                )
+                return {"segments": segments, "reference_lyrics": plain}
+
         # Kick off Gemini-grounded lyrics fetch in parallel with Whisper.
         # The fetcher is best-effort (returns None on any failure); we wrap
         # its result-getter with asyncio.wait_for after Whisper completes

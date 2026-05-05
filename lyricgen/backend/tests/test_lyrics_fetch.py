@@ -326,3 +326,130 @@ def test_records_provenance_with_source_urls(fresh_db, monkeypatch):
     parsed = json.loads(captured["response_summary"])
     assert any("genius.com" in u for u in parsed["grounding_sources"])
     assert parsed["validation_passed"] is True
+
+
+# ---------------------------------------------------------------------------
+# lrclib helpers — _fetch_lrclib + _lrc_to_segments
+# ---------------------------------------------------------------------------
+
+class _StubResp:
+    def __init__(self, status_code, payload=None):
+        self.status_code = status_code
+        self._payload = payload or {}
+    def json(self):
+        return self._payload
+
+
+def test_lrclib_returns_dict_on_success(monkeypatch):
+    from pipeline import _fetch_lrclib
+
+    payload = {
+        "plainLyrics": "line one\nline two\nline three",
+        "syncedLyrics": "[00:01.00] line one\n[00:03.50] line two",
+        "duration": 195.0,
+    }
+    captured = {}
+    def _fake_get(url, **kwargs):
+        captured["url"] = url
+        captured["params"] = kwargs.get("params")
+        return _StubResp(200, payload)
+    monkeypatch.setattr("requests.get", _fake_get)
+
+    out = _fetch_lrclib("Karol G", "Si Antes Te Hubiera Conocido")
+    assert out is not None
+    assert out["plain"].startswith("line one")
+    assert out["synced"].startswith("[00:01.00]")
+    assert out["duration"] == 195.0
+    assert "lrclib.net" in captured["url"]
+    assert captured["params"]["artist_name"] == "Karol G"
+
+
+def test_lrclib_returns_none_on_404(monkeypatch):
+    from pipeline import _fetch_lrclib
+    monkeypatch.setattr("requests.get", lambda *a, **kw: _StubResp(404, {}))
+    assert _fetch_lrclib("Nobody", "Nothing") is None
+
+
+def test_lrclib_returns_none_on_empty_payload(monkeypatch):
+    from pipeline import _fetch_lrclib
+    monkeypatch.setattr(
+        "requests.get",
+        lambda *a, **kw: _StubResp(200, {"plainLyrics": "", "syncedLyrics": ""}),
+    )
+    assert _fetch_lrclib("X", "Y") is None
+
+
+def test_lrclib_returns_none_on_network_error(monkeypatch):
+    from pipeline import _fetch_lrclib
+    def _boom(*a, **kw):
+        raise OSError("network down")
+    monkeypatch.setattr("requests.get", _boom)
+    assert _fetch_lrclib("X", "Y") is None
+
+
+def test_lrclib_returns_none_on_empty_inputs():
+    from pipeline import _fetch_lrclib
+    assert _fetch_lrclib("", "Some Song") is None
+    assert _fetch_lrclib("Some Artist", "") is None
+
+
+def test_lrc_to_segments_basic():
+    from pipeline import _lrc_to_segments
+
+    lrc = (
+        "[00:01.00] First line\n"
+        "[00:03.50] Second line\n"
+        "[00:06.00] Third line\n"
+    )
+    segs = _lrc_to_segments(lrc, audio_duration=10.0)
+    assert len(segs) == 3
+    assert segs[0]["start"] == 1.0
+    assert segs[0]["text"] == "First line"
+    # End of segment 0 = start of segment 1 minus the 50ms gap
+    assert abs(segs[0]["end"] - 3.45) < 0.01
+    # Last segment uses audio_duration as a cap
+    assert segs[-1]["end"] <= 10.0
+
+
+def test_lrc_to_segments_skips_empty_gap_markers():
+    """Empty-text [mm:ss.xx] lines are gap markers (e.g. instrumental break);
+    they don't produce a segment but DO bound the previous one."""
+    from pipeline import _lrc_to_segments
+
+    lrc = (
+        "[00:01.00] Hello\n"
+        "[00:03.00] \n"          # gap
+        "[00:18.55] Si antes te hubiera conocido\n"
+    )
+    segs = _lrc_to_segments(lrc)
+    assert len(segs) == 2
+    assert segs[0]["text"] == "Hello"
+    # First segment ends at the gap marker, not at the next-with-text.
+    assert abs(segs[0]["end"] - 2.95) < 0.01
+    assert segs[1]["start"] == 18.55
+
+
+def test_lrc_to_segments_handles_missing_decimals():
+    """Some LRC files write [mm:ss] with no fractional part."""
+    from pipeline import _lrc_to_segments
+
+    lrc = "[00:01] One\n[00:03] Two\n"
+    segs = _lrc_to_segments(lrc, audio_duration=5.0)
+    assert len(segs) == 2
+    assert segs[0]["start"] == 1.0
+    assert segs[1]["start"] == 3.0
+
+
+def test_lrc_to_segments_returns_empty_on_unparseable_input():
+    from pipeline import _lrc_to_segments
+    assert _lrc_to_segments("") == []
+    assert _lrc_to_segments("not an LRC file at all") == []
+
+
+def test_lrc_to_segments_minimum_duration_floor():
+    """Segments are guaranteed at least 0.5s on screen even if the next
+    line starts immediately after."""
+    from pipeline import _lrc_to_segments
+    lrc = "[00:01.00] First\n[00:01.10] Second\n"
+    segs = _lrc_to_segments(lrc, audio_duration=10.0)
+    assert segs[0]["end"] >= segs[0]["start"] + 0.5

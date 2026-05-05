@@ -696,6 +696,111 @@ def _lyrics_cache_key(artist: str, song: str) -> str:
     ).hexdigest()[:16]
 
 
+def _fetch_lrclib(artist: str, song: str) -> dict | None:
+    """Look up a song on lrclib.net's public API. Returns:
+        {"plain": str|None, "synced": str|None, "duration": float|None}
+    or None if the request failed or the song wasn't found.
+
+    lrclib.net is an open, free, no-auth lyrics database (similar shape to
+    MusicBrainz for lyrics). Public API, no anti-bot, generous rate limits.
+    Crucially: covers Latin / reggaeton / pop catalogues that Gemini-grounded
+    search refuses to answer for due to RECITATION blocking on UMG-owned
+    songs (Karol G, Bad Bunny, J Balvin, etc.). It also frequently has
+    *synced* lyrics with line-level timestamps — when present, those let us
+    skip Whisper transcription entirely and avoid hallucination loops.
+
+    Best-effort — never raises.
+    """
+    if not artist or not song:
+        return None
+    try:
+        import requests as _req
+        r = _req.get(
+            "https://lrclib.net/api/get",
+            params={"artist_name": artist, "track_name": song},
+            timeout=10,
+            headers={"User-Agent": "GenLyAI/1.0 (+https://app.genly.pro)"},
+        )
+        if r.status_code != 200:
+            print(f"[LYRICS] lrclib {r.status_code} for {artist!r} - {song!r}")
+            return None
+        data = r.json()
+        plain = (data.get("plainLyrics") or "").strip() or None
+        synced = (data.get("syncedLyrics") or "").strip() or None
+        if not plain and not synced:
+            return None
+        return {
+            "plain": plain,
+            "synced": synced,
+            "duration": data.get("duration"),
+        }
+    except Exception as e:
+        print(f"[LYRICS] lrclib fetch failed: {e}")
+        return None
+
+
+_LRC_LINE = None  # lazy-compiled regex
+
+
+def _lrc_to_segments(lrc: str, audio_duration: float | None = None) -> list[dict]:
+    """Parse LRC-format synced lyrics into Whisper-shape segments.
+
+    LRC line format: ``[mm:ss.xx] Text``. Empty-text lines (e.g. ``[00:06.00]``
+    in the Karol G example) are gap markers that bound the previous segment
+    but don't produce a segment of their own. Each emitted segment's `end`
+    is set to the next line's `start` minus a tiny gap (50 ms), so subtitles
+    leave the screen exactly when the next line should appear. Tail segment
+    ends at audio_duration when known, otherwise +8 s after its start.
+    """
+    import re as _re
+    global _LRC_LINE
+    if _LRC_LINE is None:
+        _LRC_LINE = _re.compile(r"^\s*\[(\d+):(\d+)(?:[.:](\d+))?\]\s*(.*)$")
+
+    raw: list[dict] = []
+    for line in (lrc or "").splitlines():
+        m = _LRC_LINE.match(line)
+        if not m:
+            continue
+        mm, ss, frac, text = m.group(1), m.group(2), m.group(3), m.group(4)
+        try:
+            start = int(mm) * 60 + int(ss)
+            if frac:
+                start += int(frac) / (10 ** len(frac))
+        except ValueError:
+            continue
+        raw.append({"start": float(start), "text": (text or "").strip()})
+    if not raw:
+        return []
+    raw.sort(key=lambda r: r["start"])
+
+    segments: list[dict] = []
+    n = len(raw)
+    GAP = 0.05
+    for i, item in enumerate(raw):
+        if not item["text"]:
+            continue  # gap marker — used only to bound the previous line
+        # Find the next entry with a strictly greater start to set our end.
+        j = i + 1
+        while j < n and raw[j]["start"] <= item["start"]:
+            j += 1
+        if j < n:
+            end = raw[j]["start"] - GAP
+        elif audio_duration:
+            end = min(float(audio_duration), item["start"] + 8.0)
+        else:
+            end = item["start"] + 5.0
+        # Defensive: keep at least 0.5 s on screen
+        if end < item["start"] + 0.5:
+            end = item["start"] + 0.5
+        segments.append({
+            "start": item["start"],
+            "end": end,
+            "text": item["text"],
+        })
+    return segments
+
+
 def _fetch_lyrics_via_gemini_search(
     artist: str, song: str,
     job_id: str | None = None,
