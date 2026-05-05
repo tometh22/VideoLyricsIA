@@ -303,8 +303,14 @@ def run_pipeline(job_id: str, mp3_path: str, artist: str, style: str,
         # Deliverables are already removed above when R2 was used.
         _cleanup_local_intermediates(job_dir)
 
-        _require_review = os.environ.get("REQUIRE_REVIEW", "true").lower() == "true"
+        _require_review_raw = os.environ.get("REQUIRE_REVIEW", "<unset>")
+        _require_review = _require_review_raw.lower() == "true" if _require_review_raw != "<unset>" else True
         final_status = "pending_review" if _require_review else "done"
+        print(
+            f"[PIPELINE] job={job_id} REQUIRE_REVIEW="
+            f"{_require_review_raw!r} -> require_review={_require_review} "
+            f"final_status={final_status}"
+        )
 
         update_job(job_id, status=final_status, progress=100, files=files)
     except Exception as exc:
