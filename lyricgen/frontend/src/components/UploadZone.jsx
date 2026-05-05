@@ -63,6 +63,18 @@ export default function UploadZone({
   const [bgMode, setBgMode] = useState("auto"); // auto | library | custom
   const [libraryBgs, setLibraryBgs] = useState([]);
   const [libraryLoaded, setLibraryLoaded] = useState(false);
+  // Per-row expansion of the secondary controls (Tipografía / Concepto /
+  // Movimiento). Idioma + Género stay always-visible because operators
+  // tweak those most often; the rest hide behind "Más opciones" so a
+  // 10-song batch doesn't become 60 dropdowns of scroll.
+  const [expandedRows, setExpandedRows] = useState(() => new Set());
+  const toggleExpanded = (idx) => {
+    setExpandedRows((prev) => {
+      const next = new Set(prev);
+      if (next.has(idx)) next.delete(idx); else next.add(idx);
+      return next;
+    });
+  };
 
   useEffect(() => {
     if (!onDeliveryChange) return;
@@ -451,63 +463,98 @@ export default function UploadZone({
                     ))}
                   </select>
                 </div>
-                <div className="flex items-center gap-2 pt-1">
-                  <span className="text-[10px] text-gray-600 shrink-0">
-                    {t("upload.concept_label") || "Concepto:"}
-                  </span>
-                  <select
-                    value={entry.concept || ""}
-                    onChange={(e) => updateField(i, "concept", e.target.value)}
-                    className="flex-1 px-2 py-1 rounded-md bg-surface-1 border border-white/[0.06] focus:border-brand/50 focus:outline-none text-[11px] text-white"
-                    title={t("upload.concept_hint") || "Categoría visual del fondo (sobreescribe el género)"}
-                  >
-                    {CONCEPTS.map((c) => (
-                      <option key={c.code || "auto"} value={c.code}>{c.label}</option>
-                    ))}
-                  </select>
-                </div>
-                <div className="flex items-center gap-2 pt-1">
-                  <span className="text-[10px] text-gray-600 shrink-0">
-                    {t("upload.movement_label") || "Movimiento:"}
-                  </span>
-                  <select
-                    value={entry.movementStyle || ""}
-                    onChange={(e) => updateField(i, "movementStyle", e.target.value)}
-                    className="flex-1 px-2 py-1 rounded-md bg-surface-1 border border-white/[0.06] focus:border-brand/50 focus:outline-none text-[11px] text-white"
-                    title={t("upload.movement_hint") || "Estilo de movimiento del fondo (mirá la galería arriba)"}
-                  >
-                    {MOVEMENT_STYLES.map((m) => (
-                      <option key={m.code || "auto"} value={m.code}>{m.label}</option>
-                    ))}
-                  </select>
-                </div>
-                <div className="flex items-center gap-2 pt-1">
-                  <span className="text-[10px] text-gray-600 shrink-0">
-                    {t("upload.font_label") || "Tipografía:"}
-                  </span>
-                  <select
-                    value={entry.font || ""}
-                    onChange={(e) => updateField(i, "font", e.target.value)}
-                    className="flex-1 px-2 py-1 rounded-md bg-surface-1 border border-white/[0.06] focus:border-brand/50 focus:outline-none text-[11px] text-white"
-                    title={t("upload.font_hint") || "Tipografía del texto en el video"}
-                    style={{
-                      // Render the selected option's value in its own face
-                      // so the field shows the chosen typography directly.
-                      fontFamily: (FONTS.find((f) => f.id === (entry.font || ""))?.css) || undefined,
-                      fontWeight: (FONTS.find((f) => f.id === (entry.font || ""))?.weight) || undefined,
-                    }}
-                  >
-                    {FONTS.map((f) => (
-                      <option
-                        key={f.id || "auto"}
-                        value={f.id}
-                        style={{ fontFamily: f.css || undefined, fontWeight: f.weight || undefined }}
+                {/* Secondary controls collapse-toggle. Idioma + Género stay
+                    always-visible above; Tipografía / Concepto / Movimiento
+                    hide behind this toggle so a 10-song batch doesn't
+                    explode into 60 dropdowns. The toggle shows a small dot
+                    when any of the 3 is set to a non-Auto value, so the
+                    operator knows their picks survive a collapse. */}
+                {(() => {
+                  const isExpanded = expandedRows.has(i);
+                  const hasCustom = !!(entry.font || entry.concept || entry.movementStyle);
+                  return (
+                    <button
+                      type="button"
+                      onClick={() => toggleExpanded(i)}
+                      className="mt-1 flex items-center gap-1.5 text-[10px] text-gray-500 hover:text-gray-300 transition-colors"
+                    >
+                      <span>
+                        {isExpanded
+                          ? (t("upload.fewer_options") || "Menos opciones")
+                          : (t("upload.more_options") || "Más opciones")}
+                      </span>
+                      <svg
+                        className={`w-3 h-3 transition-transform ${isExpanded ? "rotate-180" : ""}`}
+                        fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24"
                       >
-                        {f.label}
-                      </option>
-                    ))}
-                  </select>
-                </div>
+                        <polyline points="6 9 12 15 18 9" />
+                      </svg>
+                      {hasCustom && !isExpanded && (
+                        <span className="w-1.5 h-1.5 rounded-full bg-brand"
+                              title={t("upload.options_customized") || "Hay opciones personalizadas"} />
+                      )}
+                    </button>
+                  );
+                })()}
+                {expandedRows.has(i) && (
+                  <>
+                    <div className="flex items-center gap-2 pt-1">
+                      <span className="text-[10px] text-gray-600 shrink-0">
+                        {t("upload.concept_label") || "Concepto:"}
+                      </span>
+                      <select
+                        value={entry.concept || ""}
+                        onChange={(e) => updateField(i, "concept", e.target.value)}
+                        className="flex-1 px-2 py-1 rounded-md bg-surface-1 border border-white/[0.06] focus:border-brand/50 focus:outline-none text-[11px] text-white"
+                        title={t("upload.concept_hint") || "Categoría visual del fondo (sobreescribe el género)"}
+                      >
+                        {CONCEPTS.map((c) => (
+                          <option key={c.code || "auto"} value={c.code}>{c.label}</option>
+                        ))}
+                      </select>
+                    </div>
+                    <div className="flex items-center gap-2 pt-1">
+                      <span className="text-[10px] text-gray-600 shrink-0">
+                        {t("upload.movement_label") || "Movimiento:"}
+                      </span>
+                      <select
+                        value={entry.movementStyle || ""}
+                        onChange={(e) => updateField(i, "movementStyle", e.target.value)}
+                        className="flex-1 px-2 py-1 rounded-md bg-surface-1 border border-white/[0.06] focus:border-brand/50 focus:outline-none text-[11px] text-white"
+                        title={t("upload.movement_hint") || "Estilo de movimiento del fondo (mirá la galería arriba)"}
+                      >
+                        {MOVEMENT_STYLES.map((m) => (
+                          <option key={m.code || "auto"} value={m.code}>{m.label}</option>
+                        ))}
+                      </select>
+                    </div>
+                    <div className="flex items-center gap-2 pt-1">
+                      <span className="text-[10px] text-gray-600 shrink-0">
+                        {t("upload.font_label") || "Tipografía:"}
+                      </span>
+                      <select
+                        value={entry.font || ""}
+                        onChange={(e) => updateField(i, "font", e.target.value)}
+                        className="flex-1 px-2 py-1 rounded-md bg-surface-1 border border-white/[0.06] focus:border-brand/50 focus:outline-none text-[11px] text-white"
+                        title={t("upload.font_hint") || "Tipografía del texto en el video"}
+                        style={{
+                          fontFamily: (FONTS.find((f) => f.id === (entry.font || ""))?.css) || undefined,
+                          fontWeight: (FONTS.find((f) => f.id === (entry.font || ""))?.weight) || undefined,
+                        }}
+                      >
+                        {FONTS.map((f) => (
+                          <option
+                            key={f.id || "auto"}
+                            value={f.id}
+                            style={{ fontFamily: f.css || undefined, fontWeight: f.weight || undefined }}
+                          >
+                            {f.label}
+                          </option>
+                        ))}
+                      </select>
+                    </div>
+                  </>
+                )}
               </div>
             </div>
           ))}
