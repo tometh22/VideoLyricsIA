@@ -742,7 +742,8 @@ def _fetch_lrclib(artist: str, song: str) -> dict | None:
 _LRC_LINE = None  # lazy-compiled regex
 
 
-def _lrc_to_segments(lrc: str, audio_duration: float | None = None) -> list[dict]:
+def _lrc_to_segments(lrc: str, audio_duration: float | None = None,
+                     time_offset: float = 0.0) -> list[dict]:
     """Parse LRC-format synced lyrics into Whisper-shape segments.
 
     LRC line format: ``[mm:ss.xx] Text``. Empty-text lines (e.g. ``[00:06.00]``
@@ -751,6 +752,12 @@ def _lrc_to_segments(lrc: str, audio_duration: float | None = None) -> list[dict
     is set to the next line's `start` minus a tiny gap (50 ms), so subtitles
     leave the screen exactly when the next line should appear. Tail segment
     ends at audio_duration when known, otherwise +8 s after its start.
+
+    `time_offset` shifts ALL timestamps by the given seconds — used when the
+    user uploads a version of the song with extra audio at the start (e.g.
+    "Official Video" with a dialogue intro that the studio LRC doesn't
+    account for). The caller computes the offset by comparing user audio
+    duration against lrclib's reported duration.
     """
     import re as _re
     global _LRC_LINE
@@ -794,11 +801,28 @@ def _lrc_to_segments(lrc: str, audio_duration: float | None = None) -> list[dict
         if end < item["start"] + 0.5:
             end = item["start"] + 0.5
         segments.append({
-            "start": item["start"],
-            "end": end,
+            "start": item["start"] + time_offset,
+            "end": end + time_offset,
             "text": item["text"],
         })
     return segments
+
+
+def _audio_duration(mp3_path: str) -> float | None:
+    """Best-effort MP3 duration in seconds. Tries mutagen first (~1ms,
+    just reads the header), falls back to moviepy (slower, opens the
+    full file). Returns None if both fail."""
+    try:
+        from mutagen.mp3 import MP3
+        return float(MP3(mp3_path).info.length)
+    except Exception:
+        pass
+    try:
+        from moviepy.editor import AudioFileClip
+        with AudioFileClip(mp3_path) as a:
+            return float(a.duration)
+    except Exception:
+        return None
 
 
 def _fetch_lyrics_via_gemini_search(

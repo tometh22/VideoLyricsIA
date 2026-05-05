@@ -716,24 +716,57 @@ async def transcribe_endpoint(
         # ("¡Karol!" repeated 174x then dropped, leaving the second half
         # of the song without subtitles). Community-curated synced lyrics
         # have no such failure mode.
-        from pipeline import _fetch_lrclib, _lrc_to_segments
+        #
+        # Caveat: lrclib's synced timestamps are tied to a SPECIFIC version
+        # of the audio (usually the studio mix). If the user uploads the
+        # "Official Video" version with a dialogue intro added, every
+        # subtitle will be ~30 s early. We compare audio duration against
+        # lrclib's reported duration:
+        #   diff <= 3 s          → use synced as-is
+        #   3 s < diff <= 60 s   → assume intro added; offset all timestamps
+        #                          by +diff (reasonable for the common case)
+        #   diff > 60 s          → fall back to plain + Whisper (live /
+        #                          extended / remix versions are too risky
+        #                          to auto-align)
+        from pipeline import _fetch_lrclib, _lrc_to_segments, _audio_duration
         lrc = await asyncio.to_thread(_fetch_lrclib, artist_hint, song_hint)
         if lrc:
             synced = lrc.get("synced")
             plain = lrc.get("plain") or ""
+            lrc_dur = lrc.get("duration")
             if synced:
-                segs = _lrc_to_segments(synced, lrc.get("duration"))
-                if segs and len(segs) >= 8:
-                    print(f"[LYRICS] lrclib synced hit — {len(segs)} segments, "
-                          f"skipping Whisper for {artist_hint!r} - {song_hint!r}")
-                    return {
-                        "segments": segs,
-                        "reference_lyrics": plain or synced,
-                    }
-            # No synced (or too few segments) — but we still have plain text
-            # from lrclib. Use it as the reference so the editor's suggestion
-            # engine fires, and skip the Gemini-grounded search step entirely
-            # (lrclib already gave us a clean source).
+                user_dur = await asyncio.to_thread(_audio_duration, tmp_path)
+                offset = 0.0
+                use_synced = True
+                if user_dur is not None and lrc_dur:
+                    diff = user_dur - lrc_dur
+                    if abs(diff) <= 3.0:
+                        offset = 0.0
+                    elif 3.0 < diff <= 60.0:
+                        offset = float(diff)
+                        print(f"[LYRICS] lrclib duration mismatch "
+                              f"(user={user_dur:.1f}s, lrclib={lrc_dur:.1f}s) "
+                              f"— applying +{offset:.2f}s offset (intro added)")
+                    else:
+                        use_synced = False
+                        print(f"[LYRICS] lrclib duration mismatch "
+                              f"(user={user_dur:.1f}s, lrclib={lrc_dur:.1f}s, "
+                              f"diff={diff:+.1f}s) — too risky to auto-align, "
+                              f"falling back to Whisper")
+                if use_synced:
+                    segs = _lrc_to_segments(synced, lrc_dur, time_offset=offset)
+                    if segs and len(segs) >= 8:
+                        print(f"[LYRICS] lrclib synced hit — {len(segs)} segments, "
+                              f"skipping Whisper for {artist_hint!r} - {song_hint!r}")
+                        return {
+                            "segments": segs,
+                            "reference_lyrics": plain or synced,
+                        }
+            # No synced (or too few segments / unreliable timestamps) — but
+            # we still have plain text from lrclib. Use it as the reference
+            # so the editor's suggestion engine fires, and skip the Gemini-
+            # grounded search step entirely (lrclib already gave us a clean
+            # source).
             if plain:
                 print(f"[LYRICS] lrclib plain hit ({len(plain)} chars) — "
                       f"running Whisper for timestamps, skipping Gemini")

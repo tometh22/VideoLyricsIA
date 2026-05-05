@@ -453,3 +453,32 @@ def test_lrc_to_segments_minimum_duration_floor():
     lrc = "[00:01.00] First\n[00:01.10] Second\n"
     segs = _lrc_to_segments(lrc, audio_duration=10.0)
     assert segs[0]["end"] >= segs[0]["start"] + 0.5
+
+
+def test_lrc_to_segments_applies_time_offset():
+    """When user uploads a song with a dialogue intro, timestamps from
+    lrclib (studio version) need a uniform shift forward in time."""
+    from pipeline import _lrc_to_segments
+
+    lrc = (
+        "[00:00.18] ¡¿Qué lo qué?! ¡Tamo' rulay!\n"
+        "[00:18.55] ¿Qué hubiera sido\n"
+        "[00:21.24] Si antes te hubiera conocido?\n"
+    )
+    # Studio version starts at 0.18 s. User's "Official Video" cut has 35 s
+    # of dialogue at the head, so lrclib's 18.55 actually plays at 53.55.
+    segs = _lrc_to_segments(lrc, audio_duration=230.0, time_offset=35.0)
+    assert len(segs) == 3
+    assert abs(segs[0]["start"] - 35.18) < 0.01
+    assert abs(segs[1]["start"] - 53.55) < 0.01
+    assert abs(segs[2]["start"] - 56.24) < 0.01
+    # Ends carry the offset too.
+    assert segs[0]["end"] > segs[0]["start"]
+
+
+def test_audio_duration_returns_float_or_none():
+    """Smoke-check the duration helper. It must never raise — must return
+    a float when it can read the file, None otherwise."""
+    from pipeline import _audio_duration
+    # Non-existent file → graceful None
+    assert _audio_duration("/tmp/does_not_exist_xyz.mp3") is None
