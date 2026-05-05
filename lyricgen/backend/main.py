@@ -757,7 +757,7 @@ async def transcribe_endpoint(
                         if _slice_audio_prefix(tmp_path, intro_path, diff + 1.0):
                             try:
                                 wsegs = await loop.run_in_executor(
-                                    None, transcribe, intro_path, lang,
+                                    None, transcribe, intro_path, lang, plain,
                                 )
                                 # Keep only segments that fully sit in the
                                 # intro window — defensive, in case ffmpeg
@@ -842,9 +842,10 @@ async def transcribe_endpoint(
             # source).
             if plain:
                 print(f"[LYRICS] lrclib plain hit ({len(plain)} chars) — "
-                      f"running Whisper for timestamps, skipping Gemini")
+                      f"running Whisper for timestamps (lyrics_hint primed), "
+                      f"skipping Gemini")
                 segments = await loop.run_in_executor(
-                    None, transcribe, tmp_path, lang,
+                    None, transcribe, tmp_path, lang, plain,
                 )
                 return {"segments": segments, "reference_lyrics": plain}
 

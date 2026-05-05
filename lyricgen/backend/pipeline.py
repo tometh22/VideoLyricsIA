@@ -340,14 +340,23 @@ def run_pipeline(job_id: str, mp3_path: str, artist: str, style: str,
 # Step 1 — Whisper transcription
 # ---------------------------------------------------------------------------
 
+# YouTube-uploader chatter we don't want in the lyrics. Tight-and-narrow:
+# every entry must be a multi-word phrase or unambiguous YouTuber jargon
+# that essentially never shows up in song lyrics. The previous broader
+# list killed legit content on UMG videos that open with dialogue/intros
+# (Karol G "Si Antes Te Hubiera Conocido (Official Video)" had
+# "¡Gracias! ¡Qué linda! ¡Gracias!" filtered as spam — that's the artist
+# thanking the audience in the video, not channel chatter, and the
+# operator wanted it transcribed).
 _SPAM_PATTERNS = [
-    "suscri", "subscri", "subscribe", "subete", "like", "comment",
-    "canal", "channel", "descripci", "description", "link", "follow",
-    "sigueme", "intro", "outro", "copyright", "all rights", "derechos",
-    "music by", "produced by", "lyrics by", "escucha en", "disponible",
-    "spotify", "apple music", "deezer", "itunes", "amazon music",
-    "gracias", "thanks for watching", "thanks for listening",
-    "subtitulos", "subtitles", "video oficial", "official video",
+    "suscribete al canal", "subscribe to my channel",
+    "thanks for watching", "thanks for listening",
+    "link in description", "link in the description",
+    "link en la descripcion", "link en descripcion",
+    "all rights reserved", "todos los derechos reservados",
+    "escucha en spotify", "available on spotify",
+    "apple music", "deezer", "amazon music",
+    "music by", "produced by", "lyrics by",
 ]
 
 
@@ -371,12 +380,25 @@ def _get_whisper_model(name: str = "turbo"):
     return _WHISPER_MODELS[name]
 
 
-def _transcribe_via_openai_api(mp3_path: str, language: str | None = None) -> list[dict]:
+def _transcribe_via_openai_api(mp3_path: str, language: str | None = None,
+                                lyrics_hint: str | None = None) -> list[dict]:
     """Transcribe by calling OpenAI's Whisper API. Returns the same segments
     structure as the local Whisper path. Used in production where loading
     the local model would consume too much worker RAM (~3 GB) and risks OOM.
 
     Cost: ~$0.006 per minute of audio (~$0.02 per song).
+
+    `lyrics_hint`: if provided, the FIRST ~200 tokens of this string are
+    used as Whisper's `prompt` parameter — orienting the model's
+    vocabulary toward the actual lyrics it should expect. This is the
+    documented Whisper-API mechanism for biasing transcription
+    (https://platform.openai.com/docs/guides/speech-to-text/prompting).
+    Significantly reduces hallucination loops on tracks where Whisper
+    otherwise drifts (e.g. confusing artist-name ad-libs for the lyric
+    line). Only the last 224 tokens are read by Whisper and only the
+    first ~30 s of audio benefits from it; on longer tracks the help is
+    most impactful at the song's start where the model establishes its
+    interpretation.
 
     Why whisper-1 and not gpt-4o-transcribe (better text quality):
         gpt-4o-transcribe and gpt-4o-mini-transcribe only return plain
@@ -384,24 +406,32 @@ def _transcribe_via_openai_api(mp3_path: str, language: str | None = None) -> li
         synchronized to the audio, so segment-level start/end times are
         non-negotiable. whisper-1 (whisper-large-v2) is the only OpenAI
         transcription model that returns verbose_json with segment
-        timestamps as of 2026-04. We compensate for its older base model
-        by passing initial_prompt and a temperature ladder.
+        timestamps as of 2026-04.
     """
     from openai import OpenAI
 
     client = OpenAI()  # picks up OPENAI_API_KEY from env
     print(f"[WHISPER-API] transcribing {os.path.basename(mp3_path)} via OpenAI (whisper-1)")
 
-    # Prompt nudges the model to expect song lyrics rather than spoken
-    # word — meaningfully improves transcription on heavily-mixed vocals
-    # like rock songs. The lyrics token vocabulary it primes is also
-    # better for repeated-line detection (chorus).
+    # Build the initial prompt. When the caller has reference lyrics
+    # (typically from lrclib plain), we ship the first ~200 tokens of
+    # them so Whisper expects that vocabulary. Otherwise fall back to a
+    # generic "song lyrics" hint.
+    if lyrics_hint and lyrics_hint.strip():
+        # ~200 tokens ≈ 800 chars for Spanish/English. Whisper truncates
+        # silently if longer; this just keeps logs cleaner.
+        prompt_text = lyrics_hint.strip()[:800]
+        print(f"[WHISPER-API] initial_prompt primed with "
+              f"{len(prompt_text)} chars from reference lyrics")
+    else:
+        prompt_text = ("Letras de canción:" if (language or "").startswith("es")
+                       else "Song lyrics:")
+
     kwargs = {
         "model": "whisper-1",
         "response_format": "verbose_json",
         "timestamp_granularities": ["segment"],
-        "prompt": "Letras de canción:" if (language or "").startswith("es")
-                  else "Song lyrics:",
+        "prompt": prompt_text,
         # temperature=0 gives the most confident output; we lower the
         # default 0.0 ladder so it doesn't sample alternative
         # interpretations on tricky words.
@@ -429,8 +459,14 @@ def _transcribe_via_openai_api(mp3_path: str, language: str | None = None) -> li
         if any(spam in text.lower() for spam in _SPAM_PATTERNS):
             print(f"[WHISPER-API] Filtered spam: {text[:60]}")
             continue
-        if (seg.no_speech_prob or 0) > 0.7:
-            print(f"[WHISPER-API] Filtered low-confidence: {text[:60]}")
+        # Only drop segments that Whisper is VERY sure aren't speech. The
+        # previous 0.7 threshold was tossing legitimate lyric lines on
+        # tracks with dense crowd noise / heavy mix (Karol G's "Yo Me
+        # Caso Contigo" interlude, audience cheering on live cuts). The
+        # operator can prune obvious non-lyrics in the editor; better to
+        # surface borderline content than to silently drop it.
+        if (seg.no_speech_prob or 0) > 0.92:
+            print(f"[WHISPER-API] Filtered very-low-confidence: {text[:60]}")
             continue
         segments.append({
             "start": float(seg.start),
@@ -507,26 +543,43 @@ def _transcribe_via_openai_api(mp3_path: str, language: str | None = None) -> li
         print(f"[WHISPER-API] Truncated intra-segment loops in {intra_truncated} segment(s)")
     segments = cleaned
 
-    # Then dedupe consecutive identical segments (case 1 from above).
-    deduped: list[dict] = []
-    streak_key = None
-    streak_count = 0
-    dropped = 0
+    # Collapse consecutive-identical-text segments into a single segment
+    # spanning the whole streak. This handles two cases the same way:
+    #
+    #  - Whisper hallucination loop ("¡Karol!" 174 times): the original
+    #    code DROPPED segments past the 2nd, leaving a 17 s hole in the
+    #    video. The chant audio is still in the audio track, but the
+    #    subtitle disappears mid-chant — looks broken.
+    #  - Real audience chant or repeated ad-lib in a live cut (Karol G
+    #    "Si Antes Te Hubiera Conocido (Official Video)" has the audience
+    #    chanting "¡Karol!" for ~17 s during the bridge): same shape, but
+    #    here the chant IS legit content the operator may want to keep.
+    #
+    # Either way: the right output is a single subtitle covering the
+    # whole chant, not 174 micro-segments and not silence. The operator
+    # decides in the editor whether to keep or drop.
+    merged: list[dict] = []
+    collapsed_groups = 0
+    collapsed_total = 0
     for seg in segments:
         key = seg["text"].lower().strip()
-        if key == streak_key:
-            streak_count += 1
+        if merged and merged[-1]["text"].lower().strip() == key:
+            # Extend the previous segment's end to cover this duplicate.
+            if seg["end"] > merged[-1]["end"]:
+                merged[-1]["end"] = seg["end"]
+            collapsed_total += 1
+            # First merge in a streak counts as a new collapsed group.
+            if not merged[-1].get("_collapsed"):
+                merged[-1]["_collapsed"] = True
+                collapsed_groups += 1
         else:
-            streak_key = key
-            streak_count = 1
-        if streak_count <= 2:
-            deduped.append(seg)
-        else:
-            dropped += 1
-    if dropped:
-        print(f"[WHISPER-API] Dropped {dropped} hallucination repeats "
-              f"(loop on '{streak_key[:60]}…')")
-    segments = deduped
+            merged.append({**seg})
+    for s in merged:
+        s.pop("_collapsed", None)
+    if collapsed_total:
+        print(f"[WHISPER-API] Merged {collapsed_total} consecutive duplicate "
+              f"segments into {collapsed_groups} chant/loop spans")
+    segments = merged
 
     GAP = 0.05
     for i in range(len(segments) - 1):
@@ -537,7 +590,8 @@ def _transcribe_via_openai_api(mp3_path: str, language: str | None = None) -> li
     return segments
 
 
-def transcribe(mp3_path: str, language: str = None) -> list[dict]:
+def transcribe(mp3_path: str, language: str = None,
+               lyrics_hint: str | None = None) -> list[dict]:
     """Transcribe an audio file to lyric segments.
 
     Backend selection:
@@ -547,11 +601,18 @@ def transcribe(mp3_path: str, language: str = None) -> list[dict]:
           that frequently OOMs on small instances.
         - If OPENAI_API_KEY is not set, fall back to the local Whisper-turbo
           model. Works for development on machines with enough RAM.
+
+    `lyrics_hint`: optional reference text (e.g. lrclib plain lyrics) used
+    as Whisper-API's `prompt` parameter to bias transcription toward the
+    expected vocabulary. See _transcribe_via_openai_api for details. Local
+    Whisper path ignores it (could be added later via `initial_prompt=`).
     """
     has_key = bool(os.environ.get("OPENAI_API_KEY", "").strip())
     print(f"[transcribe] OPENAI_API_KEY={'set' if has_key else 'EMPTY'}")
     if has_key:
-        return _transcribe_via_openai_api(mp3_path, language=language)
+        return _transcribe_via_openai_api(
+            mp3_path, language=language, lyrics_hint=lyrics_hint,
+        )
 
     # --- local Whisper path ---
     audio_path = mp3_path
