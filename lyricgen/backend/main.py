@@ -746,7 +746,7 @@ async def transcribe_endpoint(
                     diff = user_dur - lrc_dur
                     if abs(diff) <= 3.0:
                         offset = 0.0
-                    elif 3.0 < diff <= 60.0:
+                    elif 3.0 < diff <= 120.0:
                         offset = float(diff)
                         # User has extra audio at the start (typical "Official
                         # Video" cut with a dialogue intro). Slice that chunk
@@ -817,6 +817,13 @@ async def transcribe_endpoint(
                                 else:
                                     print(f"[LYRICS] alignment verified "
                                           f"(confidence={confidence:.2f})")
+                            elif diff > 60.0:
+                                # High-diff offsets are riskier — if we can't
+                                # even verify, don't gamble; fall back.
+                                print(f"[LYRICS] alignment verification "
+                                      f"unavailable for high-diff offset "
+                                      f"({diff:.1f}s) — falling back")
+                                use_synced = False
                     if use_synced and song_segs and len(song_segs) >= 8:
                         combined = hybrid_intro_segs + song_segs
                         print(f"[LYRICS] lrclib synced hit — "
