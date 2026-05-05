@@ -659,59 +659,277 @@ def transcribe(mp3_path: str, language: str = None) -> list[dict]:
 
 
 # ---------------------------------------------------------------------------
-# Lyrics reference fetcher — used by /transcribe to show reference text in UI
+# Lyrics reference fetcher — used by /transcribe to show reference text in UI.
+#
+# The reference is fed to LyricsEditor.findSuggestion which fuzzy-matches each
+# Whisper segment to a reference line and surfaces a one-click correction.
+# Quality of suggestions is bounded by quality of the reference, so we lean
+# on Gemini 2.5 Flash with the google_search grounding tool — Google's
+# grounded LLM aggregates from public lyric sites with cleaner provenance
+# than direct API integration with any single commercial lyrics provider
+# (Genius prohibits commercial use without a license; UMG cannot ride that).
 # ---------------------------------------------------------------------------
 
-_LYRICS_CACHE_DIR = os.path.join(OUTPUTS_DIR, "_lyrics_cache")
+# Domains we *prefer* in grounding sources. Soft signal only — Vertex AI
+# Search wraps grounding URIs in a redirect host (vertexaisearch.cloud
+# .google.com/...) so the original target host is often hidden until the
+# redirect is followed. We log it for observability but do NOT reject on
+# absence; the lyrics-shape validation downstream handles hallucination.
+_LYRIC_DOMAINS = {
+    "genius.com", "azlyrics.com", "letras.com", "letras.mus.br",
+    "lyrics.com", "musixmatch.com", "songlyrics.com", "metrolyrics.com",
+    "lyricfind.com", "songmeanings.com",
+}
 
 
-def _fetch_lyrics_from_sources(artist: str, song: str) -> list[str]:
-    """Fetch reference lyrics for a song from multiple sources.
+def _truthy_env(val: str) -> bool:
+    """Robust truthy parser — same shape as REQUIRE_REVIEW (commit 06a42e7)."""
+    return (val or "").strip().strip('"').strip("'").lower() in (
+        "1", "true", "yes", "on", "y", "t",
+    )
 
-    Order: (1) local cache, (2) Genius API if GENIUS_TOKEN set. Returns a list
-    of strings (longest = most complete). Returns [] on any failure — this is a
-    best-effort helper, never raises.
+
+def _lyrics_cache_key(artist: str, song: str) -> str:
+    import hashlib
+    return hashlib.sha1(
+        f"{artist.lower().strip()}|{song.lower().strip()}".encode()
+    ).hexdigest()[:16]
+
+
+def _fetch_lyrics_via_gemini_search(
+    artist: str, song: str,
+    job_id: str | None = None,
+    db=None,
+) -> str | None:
+    """Fetch reference lyrics for (artist, song) via Gemini 2.5 Flash with
+    the google_search grounding tool. Returns plain-text lyrics on success,
+    None on cache miss + fetch failure + validation reject.
+
+    Best-effort — never raises. The /transcribe endpoint falls through to
+    lyrics.ovh when this returns None.
+
+    Provenance: caller passes `job_id` to record an AIProvenance row keyed
+    to that job (UMG audit trail). When called from /transcribe (pre-job),
+    job_id=None and the LyricsCache row itself serves as the audit record
+    (timestamp + source URLs + model name).
     """
     if not artist or not song:
-        return []
+        return None
+
+    # Kill switch — flip to false in Railway if Gemini path misbehaves in prod.
+    if not _truthy_env(os.environ.get("LYRICS_GEMINI_SEARCH_ENABLED", "true")):
+        return None
+
+    cache_key = _lyrics_cache_key(artist, song)
+
+    # Cache lookup (Postgres — shared across the worker fleet).
+    if db is not None:
+        try:
+            from database import LyricsCache
+            row = db.query(LyricsCache).filter(
+                LyricsCache.cache_key == cache_key
+            ).first()
+            if row and row.lyrics:
+                print(f"[LYRICS] cache hit {cache_key} ({len(row.lyrics)} chars)")
+                return row.lyrics
+        except Exception as e:
+            print(f"[LYRICS] cache read failed: {e}")
+
+    # Build Gemini call.
+    from google import genai
+    from google.genai import types
+    from provenance import record_ai_call
+
+    system_prompt = (
+        "You are a lyrics retrieval assistant. Use the google_search tool to "
+        "find the official lyrics of a song from public lyrics websites "
+        "(genius.com, letras.com, azlyrics.com, lyrics.com, musixmatch.com, "
+        "songmeanings.com). Return ONLY the lyrics as plain text, one line "
+        "per song line. No commentary, no bracketed section headers like "
+        "[Chorus] or [Verse], no translation, no annotations. "
+        "If you cannot verify the lyrics from a lyrics website, respond "
+        "exactly with: LYRICS_NOT_FOUND"
+    )
+    user_content = f'Find the lyrics for the song "{song}" by {artist}.'
+    full_prompt = f"system:{system_prompt}\nuser:{user_content}"
+
+    recorder = record_ai_call(
+        job_id=job_id,
+        step="lyrics_reference_fetch",
+        tool_name="gemini-2.5-flash",
+        tool_provider="google_vertex",
+        tool_version=getattr(genai, "__version__", None),
+        prompt=full_prompt,
+        input_data_types=["artist_name", "song_title"],
+    ) if job_id else None
 
     try:
-        os.makedirs(_LYRICS_CACHE_DIR, exist_ok=True)
-        import hashlib
-        key = hashlib.sha1(f"{artist.lower()}|{song.lower()}".encode()).hexdigest()[:16]
-        cache_path = os.path.join(_LYRICS_CACHE_DIR, f"{key}.json")
-        if os.path.exists(cache_path):
+        client = _get_genai_client()
+        search_tool = types.Tool(google_search=types.GoogleSearch())
+        response = client.models.generate_content(
+            model="gemini-2.5-flash",
+            contents=user_content,
+            config=types.GenerateContentConfig(
+                system_instruction=system_prompt,
+                tools=[search_tool],
+                temperature=0.1,
+                max_output_tokens=2000,
+                thinking_config=types.ThinkingConfig(thinking_budget=0),
+            ),
+        )
+
+        text = ""
+        try:
+            text = (response.text or "").strip()
+        except Exception:
+            text = ""
+
+        candidates = getattr(response, "candidates", None) or []
+        if not candidates:
+            if recorder:
+                recorder.finish(response_summary="no_candidates")
+            return None
+        cand = candidates[0]
+        finish_reason = getattr(cand, "finish_reason", None)
+        finish_str = str(finish_reason) if finish_reason is not None else ""
+
+        # Gemini blocks copyrighted recitation aggressively. Degrade silently.
+        if "RECITATION" in finish_str or "SAFETY" in finish_str:
+            print(f"[LYRICS] gemini blocked: finish_reason={finish_str}")
+            if recorder:
+                recorder.finish(response_summary=f"blocked={finish_str}")
+            return None
+        if not text or text.strip() == "LYRICS_NOT_FOUND":
+            if recorder:
+                recorder.finish(response_summary=f"empty_or_sentinel; finish={finish_str}")
+            return None
+
+        # Extract grounding sources (proves the answer was grounded, not
+        # purely hallucinated from training data).
+        gm = getattr(cand, "grounding_metadata", None)
+        chunks = getattr(gm, "grounding_chunks", None) or []
+        source_urls: list[str] = []
+        source_titles: list[str] = []
+        for c in chunks:
+            web = getattr(c, "web", None)
+            if not web:
+                continue
+            uri = getattr(web, "uri", None)
+            title = getattr(web, "title", None)
+            if uri:
+                source_urls.append(uri)
+            if title:
+                source_titles.append(title)
+
+        if not source_urls:
+            print("[LYRICS] no grounding sources — refusing to trust ungrounded text")
+            if recorder:
+                recorder.finish(response_summary="no_grounding_sources")
+            return None
+
+        # Soft signal: did any grounding chunk hit a known lyric site?
+        on_lyric_site = False
+        haystack = " ".join(source_urls + source_titles).lower()
+        for d in _LYRIC_DOMAINS:
+            if d in haystack:
+                on_lyric_site = True
+                break
+        if not on_lyric_site:
+            print(f"[LYRICS] grounding off lyric-domain allow-list (soft warn): "
+                  f"{source_urls[:2]}")
+
+        # Lyrics-shape validation.
+        lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+        if len(lines) < 8:
+            if recorder:
+                recorder.finish(response_summary=f"too_few_lines={len(lines)}")
+            return None
+        if len(text) < 80:
+            if recorder:
+                recorder.finish(response_summary=f"too_short_chars={len(text)}")
+            return None
+
+        # Repetition guard — Gemini hallucination loops on a single line.
+        from collections import Counter
+        most_common, mc_count = Counter(lines).most_common(1)[0]
+        if mc_count / len(lines) > 0.4:
+            if recorder:
+                recorder.finish(response_summary=f"repetition={mc_count}/{len(lines)}")
+            return None
+
+        # Persist to cache.
+        if db is not None:
             try:
-                with open(cache_path) as f:
-                    return json.load(f)
-            except (json.JSONDecodeError, OSError):
-                pass
-    except OSError:
-        cache_path = None
+                from database import LyricsCache
+                row = db.query(LyricsCache).filter(
+                    LyricsCache.cache_key == cache_key
+                ).first()
+                if row is None:
+                    row = LyricsCache(
+                        cache_key=cache_key,
+                        artist=artist[:255],
+                        title=song[:255],
+                        lyrics=text,
+                        source_urls=source_urls[:20],
+                        fetched_by_model="gemini-2.5-flash",
+                    )
+                    db.add(row)
+                    db.commit()
+                # If row already exists (race), keep existing — first writer wins.
+            except Exception as e:
+                print(f"[LYRICS] cache write failed: {e}")
+                try:
+                    db.rollback()
+                except Exception:
+                    pass
 
-    results: list[str] = []
-    token = os.environ.get("GENIUS_TOKEN", "").strip()
-    if token:
-        try:
-            import lyricsgenius
-            g = lyricsgenius.Genius(
-                token, timeout=5, retries=1, verbose=False,
-                remove_section_headers=True, skip_non_songs=True,
+        if recorder:
+            try:
+                summary = json.dumps({
+                    "lyrics_chars": len(text),
+                    "lyrics_lines": len(lines),
+                    "distinct_lines": len(set(lines)),
+                    "grounding_sources": source_urls[:10],
+                    "grounding_titles": source_titles[:10],
+                    "on_lyric_site_allowlist": on_lyric_site,
+                    "finish_reason": finish_str,
+                    "validation_passed": True,
+                })[:2000]
+            except Exception:
+                summary = (f"chars={len(text)} lines={len(lines)} "
+                           f"grounding={len(source_urls)}")
+            recorder.finish(
+                response_summary=summary,
+                output_artifact=f"lyrics_cache:{cache_key}",
             )
-            song_obj = g.search_song(song, artist)
-            if song_obj and song_obj.lyrics:
-                results.append(song_obj.lyrics)
-        except Exception as e:
-            print(f"[LYRICS] Genius fetch failed: {e}")
 
-    if cache_path and results:
-        try:
-            with open(cache_path, "w") as f:
-                json.dump(results, f)
-        except OSError:
-            pass
+        print(f"[LYRICS] gemini fetched {len(text)} chars / {len(lines)} lines / "
+              f"{len(source_urls)} sources for {artist!r} - {song!r}")
+        return text
 
-    return results
+    except Exception as e:
+        print(f"[LYRICS] gemini search failed: {e}")
+        if recorder:
+            try:
+                recorder.finish(response_summary=f"error: {str(e)[:200]}")
+            except Exception:
+                pass
+        return None
+
+
+def _fetch_lyrics_from_sources(
+    artist: str, song: str,
+    job_id: str | None = None,
+    db=None,
+) -> list[str]:
+    """Backward-compat wrapper used by callers that still expect list[str].
+
+    /transcribe in main.py now calls _fetch_lyrics_via_gemini_search directly
+    (it needs the parallel-with-Whisper kickoff), but this wrapper stays so
+    any future caller that wants a single function call still works.
+    """
+    text = _fetch_lyrics_via_gemini_search(artist, song, job_id=job_id, db=db)
+    return [text] if text else []
 
 
 # ---------------------------------------------------------------------------

@@ -670,6 +670,7 @@ async def transcribe_endpoint(
     file: UploadFile = File(...),
     language: str = Form(""),
     current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db),
 ):
     """Transcribe an MP3 and return segments for review/editing."""
     if not file.filename.lower().endswith(".mp3"):
@@ -686,14 +687,11 @@ async def transcribe_endpoint(
     try:
         lang = language.strip() if language.strip() else None
         loop = asyncio.get_event_loop()
-        segments = await loop.run_in_executor(None, transcribe, tmp_path, lang)
 
-        # Fetch reference lyrics: try cache + Genius (broad catalogue)
-        # first, fall back to lyrics.ovh as a safety net for songs Genius
-        # may not index. The suggestion engine in LyricsEditor only fires
-        # when a non-empty reference is returned, so wider coverage here
-        # = more correction suggestions visible to the user.
-        import requests as _req
+        # Parse artist/title from the filename early so we can kick off the
+        # reference-lyrics fetch in parallel with Whisper. Whisper takes
+        # 15-30 s for a 3-minute MP3; Gemini-grounded search takes 5-10 s.
+        # Running them in parallel adds ~0 s to /transcribe latency.
         basename = os.path.splitext(file.filename)[0]
         artist_hint, song_hint = "", basename
         if " - " in basename:
@@ -703,18 +701,54 @@ async def transcribe_endpoint(
                      "- River Plate", "- Luna Park", "- En Vivo"]:
             song_hint = song_hint.replace(sfx, "").strip()
 
+        # Kick off Gemini-grounded lyrics fetch in parallel with Whisper.
+        # The fetcher is best-effort (returns None on any failure); we wrap
+        # its result-getter with asyncio.wait_for after Whisper completes
+        # so a slow Gemini doesn't block /transcribe forever.
+        #
+        # The bg thread gets its OWN DB session, not the request-scoped one
+        # — if the asyncio.wait_for below times out, the thread keeps running
+        # in the background to populate the cache for the next call, and we
+        # don't want it touching a session FastAPI already closed.
+        from pipeline import _fetch_lyrics_via_gemini_search
+        from database import SessionLocal as _SessionLocal
+
+        def _bg_fetch_lyrics(artist, song):
+            s = _SessionLocal()
+            try:
+                return _fetch_lyrics_via_gemini_search(artist, song, db=s)
+            finally:
+                s.close()
+
+        gemini_task = asyncio.create_task(asyncio.to_thread(
+            _bg_fetch_lyrics, artist_hint, song_hint,
+        ))
+
+        segments = await loop.run_in_executor(None, transcribe, tmp_path, lang)
+
+        # Wait up to 2s after Whisper finishes for Gemini to complete.
         reference = ""
         try:
-            from pipeline import _fetch_lyrics_from_sources
-            results = _fetch_lyrics_from_sources(artist_hint, song_hint)
-            if results:
-                reference = max(results, key=len).strip()
+            result = await asyncio.wait_for(gemini_task, timeout=2.0)
+            reference = result or ""
+        except asyncio.TimeoutError:
+            # Gemini still pending — let it finish in the background and
+            # cache the result for the next request. Don't block the user.
+            print("[LYRICS] gemini fetch slower than Whisper+2s — moving on")
+            reference = ""
         except Exception as e:
-            print(f"[LYRICS] cache/Genius fetcher failed: {e}")
+            print(f"[LYRICS] gemini task failed: {e}")
+            reference = ""
 
-        if not reference:
+        # Final fallback: lyrics.ovh (free, no auth, thin catalogue but
+        # covers some mainstream songs Gemini might miss or block).
+        if not reference and artist_hint and song_hint:
             try:
-                res = _req.get(f"https://api.lyrics.ovh/v1/{artist_hint}/{song_hint}", timeout=10)
+                import requests as _req
+                res = _req.get(
+                    f"https://api.lyrics.ovh/v1/{artist_hint}/{song_hint}",
+                    timeout=5,
+                )
                 if res.status_code == 200:
                     reference = res.json().get("lyrics", "").strip()
             except Exception:
