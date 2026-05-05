@@ -2318,6 +2318,7 @@ def _ensure_background(style_hint: str, job_dir: str, lyrics_text: str = None,
                 prompt, bg_path, job_id=job_id,
                 cache_namespace=f"{artist}|{song_title}",
                 image_path=image_to_video_path,
+                movement_style=movement_style,
             )
             return bg_path
         except Exception as e:
