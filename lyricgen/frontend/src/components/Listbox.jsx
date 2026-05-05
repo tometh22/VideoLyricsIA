@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState } from "react";
+import { createPortal } from "react-dom";
 
 /**
  * Drop-in replacement for native <select> that matches the dark / glass
@@ -37,6 +38,12 @@ export default function Listbox({
 }) {
   const [open, setOpen] = useState(false);
   const [highlight, setHighlight] = useState(0);
+  // Popover position is computed from the trigger's getBoundingClientRect
+  // and rendered into document.body via a portal — that's the only way to
+  // escape parent containers with overflow-y-auto / overflow-hidden, which
+  // is exactly what the file-rows wrapper does (max-h-96 overflow-y-auto)
+  // and what was clipping the dropdown at the row's bottom edge.
+  const [popoverPos, setPopoverPos] = useState({ top: 0, left: 0, width: 0 });
   const triggerRef = useRef(null);
   const popoverRef = useRef(null);
 
@@ -55,6 +62,20 @@ export default function Listbox({
     return from;
   };
 
+  // Recompute popover screen position from the trigger's bounding rect.
+  // Called on open and on scroll/resize so the popover follows the trigger
+  // when the page or any parent scrolls.
+  const updatePosition = () => {
+    const t = triggerRef.current;
+    if (!t) return;
+    const r = t.getBoundingClientRect();
+    setPopoverPos({
+      top: r.bottom + 4,         // 4 px gap below the trigger
+      left: r.left,
+      width: r.width,
+    });
+  };
+
   // Click outside closes the popover. Also, opening the popover initialises
   // the highlight to the currently selected option (or the first enabled
   // one if the current is disabled) so keyboard users land on a sensible row.
@@ -66,6 +87,7 @@ export default function Listbox({
       if (idx < 0) idx = 0;
     }
     setHighlight(idx);
+    updatePosition();
     const onDoc = (e) => {
       if (
         popoverRef.current && !popoverRef.current.contains(e.target) &&
@@ -74,8 +96,17 @@ export default function Listbox({
         setOpen(false);
       }
     };
+    const onScrollOrResize = () => updatePosition();
     document.addEventListener("mousedown", onDoc);
-    return () => document.removeEventListener("mousedown", onDoc);
+    // Use capture so we hear scrolls in any ancestor (e.g. the file-rows
+    // overflow-y-auto wrapper) — `scroll` doesn't bubble.
+    window.addEventListener("scroll", onScrollOrResize, true);
+    window.addEventListener("resize", onScrollOrResize);
+    return () => {
+      document.removeEventListener("mousedown", onDoc);
+      window.removeEventListener("scroll", onScrollOrResize, true);
+      window.removeEventListener("resize", onScrollOrResize);
+    };
   }, [open, options, value]);
 
   const onKeyDown = (e) => {
@@ -137,13 +168,20 @@ export default function Listbox({
         </svg>
       </button>
 
-      {open && (
+      {open && createPortal(
         <div
           ref={popoverRef}
           role="listbox"
           aria-label={ariaLabel}
-          className="absolute z-50 mt-1 left-0 right-0 max-h-72 overflow-y-auto
-                     glass rounded-xl border border-white/[0.08] shadow-xl py-1"
+          style={{
+            position: "fixed",
+            top: popoverPos.top,
+            left: popoverPos.left,
+            width: popoverPos.width,
+            zIndex: 1000,
+          }}
+          className="max-h-72 overflow-y-auto glass rounded-xl
+                     border border-white/[0.08] shadow-xl py-1"
         >
           {options.map((opt, idx) => {
             const active = opt.code === value;
@@ -191,7 +229,8 @@ export default function Listbox({
               </button>
             );
           })}
-        </div>
+        </div>,
+        document.body
       )}
     </div>
   );
