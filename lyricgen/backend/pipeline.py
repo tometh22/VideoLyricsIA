@@ -1795,15 +1795,24 @@ def _generate_veo_video(prompt: str, output_path: str, job_id: str = None,
 
     # veo-3.1-fast at $0.10/s (no audio) is 75% cheaper than the standard
     # veo-3.1-generate at $0.40/s. Visual quality is slightly softer; we
-    # apply a sigma=2 gaussian blur after generation which masks the
-    # softness and improves lyric legibility on top of the background.
-    model = "veo-3.1-fast-generate-001"
+    # apply a small gaussian blur after generation to smooth edges and
+    # improve lyric legibility on top of the background.
+    #
+    # Blur sigma was 2.0 originally — UMG flagged the rendered backgrounds
+    # as low-definition during the live demo, and the heavy blur was the
+    # main culprit (compounding the softness Veo Fast already has). Now
+    # 1.0 by default — preserves more detail while still smoothing micro
+    # artefacts. Tune via env var without redeploy if needed.
+    model = os.environ.get("VEO_MODEL", "veo-3.1-fast-generate-001").strip()
     veo_params = {
         "aspectRatio": "16:9",
         "sampleCount": 1,
         "generateAudio": False,
     }
-    blur_sigma = 2.0
+    try:
+        blur_sigma = float(os.environ.get("BG_BLUR_SIGMA", "1.0"))
+    except ValueError:
+        blur_sigma = 1.0
 
     # Cache key includes a per-song namespace (artist|title) so two different
     # songs that happen to receive the same Gemini prompt — common when
