@@ -441,39 +441,56 @@ def _transcribe_via_openai_api(mp3_path: str, language: str | None = None) -> li
     # the same segment.
     import re as _re_loops
 
-    def _truncate_intra_loop(text: str) -> str:
+    def _truncate_intra_loop(text: str) -> tuple[str, float]:
         """If text contains a phrase that repeats 3+ times consecutively,
         truncate to the first 2 occurrences. Phrase = 4–14 word window —
         the upper bound matters because Whisper hallucinations sometimes
-        loop on a clause that's 8–12 words long ("estaba haciendo y que
-        podía reflexionar sobre lo que" = 9 words)."""
+        loop on a clause that's 8–12 words long.
+
+        Returns (truncated_text, ratio_kept) so the caller can shrink the
+        segment's end timestamp proportionally — without that adjustment,
+        the truncated text would stay on screen during the instrumental
+        passage Whisper was hallucinating over, giving a "stuck subtitle"
+        feel. Ratio = 1.0 when nothing changes.
+        """
         words = text.split()
-        if len(words) < 12:
-            return text
+        total = len(words)
+        if total < 12:
+            return text, 1.0
         for window in range(14, 3, -1):  # try longer windows first
-            if len(words) < window * 3:
+            if total < window * 3:
                 continue
-            for start in range(len(words) - window * 3 + 1):
+            for start in range(total - window * 3 + 1):
                 phrase = words[start:start + window]
                 count = 1
                 pos = start + window
-                while pos + window <= len(words) and words[pos:pos + window] == phrase:
+                while pos + window <= total and words[pos:pos + window] == phrase:
                     count += 1
                     pos += window
                 if count >= 3:
                     cut = start + window * 2
                     truncated = " ".join(words[:cut])
-                    return truncated.rstrip(",.;: ") + "…"
-        return text
+                    truncated = truncated.rstrip(",.;: ") + "…"
+                    ratio = cut / total
+                    return truncated, ratio
+        return text, 1.0
 
     cleaned: list[dict] = []
     intra_truncated = 0
     for seg in segments:
         original = seg["text"]
-        new_text = _truncate_intra_loop(original)
+        new_text, ratio = _truncate_intra_loop(original)
         if new_text != original:
             intra_truncated += 1
-            seg = {**seg, "text": new_text}
+            duration = seg["end"] - seg["start"]
+            seg = {
+                **seg,
+                "text": new_text,
+                # Shrink end so the subtitle leaves the screen when the
+                # legitimate spoken phrase ends, not when Whisper's
+                # hallucination tail would have ended.
+                "end": seg["start"] + duration * ratio,
+            }
         cleaned.append(seg)
     if intra_truncated:
         print(f"[WHISPER-API] Truncated intra-segment loops in {intra_truncated} segment(s)")
