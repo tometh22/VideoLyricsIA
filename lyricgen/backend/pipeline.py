@@ -134,7 +134,8 @@ def run_pipeline(job_id: str, mp3_path: str, artist: str, style: str,
                  delivery_profile: str = "youtube", umg_spec: dict | None = None,
                  background_path: str = None,
                  input_r2_key: str | None = None,
-                 bg_r2_key: str | None = None):
+                 bg_r2_key: str | None = None,
+                 genre: str = ""):
     """Run the full pipeline for a job. Called synchronously.
 
     delivery_profile:
@@ -228,7 +229,7 @@ def run_pipeline(job_id: str, mp3_path: str, artist: str, style: str,
             bg_image_path = _ensure_background(
                 style, job_dir,
                 lyrics_text=lyrics_text, artist=artist, job_id=job_id,
-                song_title=_song_title,
+                song_title=_song_title, genre=genre,
             )
         update_job(job_id, progress=40)
 
@@ -863,8 +864,85 @@ _BG_CONDITIONS = [
 _USED_PROMPTS_FILE = os.path.join(ASSETS_DIR, ".used_prompts.json")
 
 
+_GENRE_SCENE_GUIDE = {
+    "rock": (
+        "Urban industrial streets, neon-lit alleyways, gritty rain on asphalt, "
+        "smoke rising past dim streetlamps, electric storms over a dark city, "
+        "abandoned warehouse interiors with shafts of light, distorted blurred "
+        "headlights, raw concrete textures."
+    ),
+    "pop": (
+        "Vibrant colorful neon lights, disco reflections, glittering city "
+        "nightlife, abstract liquid color, mirrored prisms, geometric light "
+        "patterns, energetic confetti motion, glossy gradient skies."
+    ),
+    "ballad": (
+        "Soft sunset over calm ocean, slow drifting clouds, warm golden light "
+        "through trees, candlelight macro, gentle rain on a window, "
+        "single rose-gold reflections, pastel mountain mist."
+    ),
+    "latin": (
+        "Tropical beach at golden hour, palm trees swaying, vibrant flower "
+        "fields, salsa-club neon reds and yellows, sunlit Caribbean water, "
+        "colorful murals motion-blurred, festive lantern strings."
+    ),
+    "reggaeton": (
+        "Night cityscape with red and pink neon, palm-lined boulevards, "
+        "luxury car reflections, abstract gold dust, velvet-textured colors, "
+        "club laser patterns, vibrant rooftop lights."
+    ),
+    "hiphop": (
+        "City skyline at night with gold accents, abstract luxury textures, "
+        "marble and gold reflections, smoke-filled spotlights, rain on dark "
+        "limousine paint, urban rooftop with skyline below."
+    ),
+    "electronic": (
+        "Abstract glowing geometry, particle storms, fractal liquid metal, "
+        "deep space nebulas, laser grid landscapes, holographic surfaces, "
+        "cymatic patterns in colored ink."
+    ),
+    "indie": (
+        "Misty forest at dawn, quiet vintage interiors with warm lamps, "
+        "open road through autumn leaves, lone lighthouse on a cliff, soft "
+        "film grain, dreamy lake reflections, hand-held cinematic frames."
+    ),
+    "folk": (
+        "Mountain vistas at golden hour, dusty roads with sun flares, fields "
+        "of wheat moving in wind, riverside campfire glow, weathered wood "
+        "textures, sun rays through forest canopies."
+    ),
+    "metal": (
+        "Volcanic landscapes with lava streams, dark cathedral interiors, "
+        "stormy thunderclouds with lightning, cracked obsidian textures, "
+        "burning pyres at dusk, abandoned iron mills."
+    ),
+}
+
+
+def _normalize_genre(g: str) -> str:
+    """Map free-text or UI selection to a key in _GENRE_SCENE_GUIDE."""
+    if not g:
+        return ""
+    g = g.strip().lower()
+    aliases = {
+        "rock/punk": "rock", "punk": "rock", "alt rock": "rock",
+        "pop/dance": "pop", "dance": "pop", "edm": "electronic",
+        "house": "electronic", "techno": "electronic",
+        "ballad/romantic": "ballad", "romantic": "ballad", "balada": "ballad",
+        "latin/reggaeton": "latin", "latino": "latin", "salsa": "latin",
+        "cumbia": "latin", "bachata": "latin",
+        "hip hop": "hiphop", "hip-hop": "hiphop", "rap": "hiphop", "trap": "hiphop",
+        "indie rock": "indie", "alternative": "indie",
+    }
+    if g in aliases:
+        return aliases[g]
+    if g in _GENRE_SCENE_GUIDE:
+        return g
+    return ""
+
+
 def _analyze_lyrics_for_background(lyrics_text: str, artist: str, job_id: str = None,
-                                    song_title: str = "") -> dict:
+                                    song_title: str = "", genre: str = "") -> dict:
     """Use Gemini to analyze lyrics and choose visual style + prompt.
 
     Returns dict with:
@@ -876,29 +954,68 @@ def _analyze_lyrics_for_background(lyrics_text: str, artist: str, job_id: str = 
 
     client = _get_genai_client()
 
-    system_prompt = """Respond ONLY with a JSON object, no other text. Example:
-{"style":"video","prompt":"Slow aerial drone shot over calm ocean at golden sunset, warm cinematic light, 4k"}
+    normalized_genre = _normalize_genre(genre)
 
-"style": always "video"
-"prompt": 20-40 word cinematic video scene matching the song's mood and genre. Include camera movement, colors, lighting, atmosphere.
+    if normalized_genre:
+        # User-supplied genre: lock Gemini to that genre's visual vocabulary
+        # and forbid the lazy "ocean sunset" default. This is the high-
+        # certainty path — UMG operators picking the genre at upload time
+        # gets us deterministic visual matching for their catalogue.
+        scene_guide = _GENRE_SCENE_GUIDE[normalized_genre]
+        system_prompt = f"""Respond ONLY with a JSON object, no other text. Example:
+{{"style":"video","prompt":"Slow tracking shot through neon-lit rain-slicked streets, deep blue and red reflections, smoke rising past streetlamps, gritty cinematic 4k"}}
 
-Genre guidance (vary the scenes!):
-- Rock/punk → urban, industrial, neon, gritty streets, dark skies, electric storms
-- Pop/dance → colorful lights, city nightlife, abstract neon, disco reflections
-- Ballad/romantic → sunset, ocean, soft clouds, warm light
-- Latin/reggaeton → tropical, vibrant colors, palm trees, warm tones
-- Hip hop/rap → city skyline at night, luxury abstract, gold and dark tones
+The song genre is: {normalized_genre.upper()}
 
-CRITICAL: Each new song must get a DIFFERENT visual scene. Do NOT default to ocean/sunset for every song. Use the song title and artist as the primary inspiration when lyrics are short or unclear.
+You MUST pick a scene from this genre's visual vocabulary:
+{scene_guide}
 
-NEVER include people, faces, hands, or text in the prompt."""
+Hard rules:
+- "style" must always be "video"
+- "prompt" is 20-40 words: scene + camera movement + colors + lighting + atmosphere
+- Pick a DIFFERENT specific scene each time (don't repeat across songs)
+- Do NOT default to "calm ocean at sunset" unless this song is BALLAD
+- Never include people, faces, hands, or readable text in the scene"""
+    else:
+        # No genre hint: ask Gemini to classify first, then pick.
+        # "Auto" mode for users who don't want to choose.
+        system_prompt = """Respond ONLY with a JSON object, no other text. Example:
+{"style":"video","prompt":"Slow tracking shot through neon-lit rain-slicked streets, deep blue and red reflections, smoke rising past streetlamps, gritty cinematic 4k"}
+
+Step 1: Classify the song's genre using the artist, title, and lyrics. Pick ONE of:
+  rock, pop, ballad, latin, reggaeton, hiphop, electronic, indie, folk, metal
+
+Step 2: Pick a scene from the matching genre's visual vocabulary:
+- rock     → urban industrial streets, neon alleyways, gritty rain, electric storms, abandoned warehouses
+- pop      → vibrant neon, disco reflections, geometric light patterns, glossy gradient skies
+- ballad   → soft sunset, calm ocean, drifting clouds, warm golden light, candlelight
+- latin    → tropical beaches, palm trees, vibrant flowers, festive lanterns, sunlit caribbean water
+- reggaeton → night cityscape with red/pink neon, luxury cars, club lasers
+- hiphop   → city skyline at night with gold, marble luxury textures, smoke-filled spotlights
+- electronic → abstract geometry, particle storms, fractal liquid metal, laser grids
+- indie    → misty forests, vintage interiors, autumn roads, lone lighthouses, dreamy lakes
+- folk     → mountain vistas, dusty roads, wheat fields, riverside campfires
+- metal    → volcanic lava streams, dark cathedrals, stormy lightning, cracked obsidian
+
+Step 3: Output JSON with the chosen scene as a 20-40 word prompt.
+
+Hard rules:
+- "style" must always be "video"
+- Pick a DIFFERENT specific scene each time (don't repeat across songs)
+- Do NOT default to "calm ocean at sunset" unless the song is genuinely BALLAD
+- Never include people, faces, hands, or readable text in the scene"""
 
     lyrics_sample = lyrics_text[:600] if lyrics_text else ""
     # Data minimization (UMG Guideline 14): optionally anonymize artist name
     _send_artist = os.environ.get("SEND_ARTIST_TO_AI", "true").lower() == "true"
     artist_label = artist if _send_artist else "the artist"
     title_part = f"\nSong title: {song_title}" if song_title else ""
-    user_content = f"Artist: {artist_label}{title_part}\n\nLyrics (may be incomplete or noisy):\n{lyrics_sample or '[transcription failed; rely on artist + title]'}"
+    genre_part = f"\nDeclared genre: {normalized_genre}" if normalized_genre else ""
+    user_content = (
+        f"Artist: {artist_label}{title_part}{genre_part}\n\n"
+        f"Lyrics (may be incomplete or noisy):\n"
+        f"{lyrics_sample or '[transcription failed; rely on artist + title + declared genre]'}"
+    )
     full_prompt = f"system:{system_prompt}\nuser:{user_content}"
 
     recorder = record_ai_call(
@@ -955,7 +1072,7 @@ NEVER include people, faces, hands, or text in the prompt."""
 
 
 def _get_unique_prompt(lyrics_text: str = None, artist: str = "", job_id: str = None,
-                       song_title: str = "") -> dict:
+                       song_title: str = "", genre: str = "") -> dict:
     """Get a unique style+prompt combination. Returns {style, prompt}.
 
     Note: the local _USED_PROMPTS_FILE only sees this worker's previous
@@ -976,6 +1093,7 @@ def _get_unique_prompt(lyrics_text: str = None, artist: str = "", job_id: str = 
     if lyrics_text or song_title:
         result = _analyze_lyrics_for_background(
             lyrics_text or "", artist, job_id=job_id, song_title=song_title,
+            genre=genre,
         )
         if result["prompt"] and result["prompt"] not in used:
             used.append(result["prompt"])
@@ -1364,7 +1482,7 @@ def _generate_imagen_image(prompt: str, output_path: str, max_retries: int = 5, 
 
 def _ensure_background(style_hint: str, job_dir: str, lyrics_text: str = None,
                        artist: str = "", job_id: str = None,
-                       song_title: str = "") -> str:
+                       song_title: str = "", genre: str = "") -> str:
     """Generate background using AI. Gemini picks the best style for the song.
 
     Returns path to .mp4 (video style) or .jpg/.png (photo/illustration style).
@@ -1378,7 +1496,9 @@ def _ensure_background(style_hint: str, job_dir: str, lyrics_text: str = None,
         return None
 
     # Generate video background with Veo 3 (always video, no images)
-    result = _get_unique_prompt(lyrics_text, artist, job_id=job_id, song_title=song_title)
+    result = _get_unique_prompt(
+        lyrics_text, artist, job_id=job_id, song_title=song_title, genre=genre,
+    )
     prompt = result["prompt"]
 
     bg_path = os.path.join(job_dir, "bg_generated.mp4")

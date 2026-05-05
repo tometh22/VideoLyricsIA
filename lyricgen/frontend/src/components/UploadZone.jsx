@@ -86,6 +86,24 @@ export default function UploadZone({
     { code: "de", label: t("lang.de") },
   ];
 
+  // Genre passes a hint to Gemini so the AI background lands in the right
+  // visual register (rock → urban industrial, latin → tropical, metal →
+  // volcanic, etc.). "Auto" lets Gemini classify from artist+title+lyrics.
+  // Default is auto so users who don't care don't need to think about it.
+  const GENRES = [
+    { code: "",            label: t("upload.genre_auto") || "Auto" },
+    { code: "rock",        label: "Rock" },
+    { code: "pop",         label: "Pop" },
+    { code: "ballad",      label: t("upload.genre_ballad") || "Balada" },
+    { code: "latin",       label: t("upload.genre_latin") || "Latino" },
+    { code: "reggaeton",   label: "Reggaeton" },
+    { code: "hiphop",      label: "Hip-Hop / Trap" },
+    { code: "electronic",  label: t("upload.genre_electronic") || "Electrónica" },
+    { code: "indie",       label: "Indie" },
+    { code: "folk",        label: "Folk" },
+    { code: "metal",       label: "Metal" },
+  ];
+
   const extractArtist = (filename) => {
     const name = filename.replace(/\.mp3$/i, "");
     if (name.includes(" - ")) return name.split(" - ")[0].trim();
@@ -321,6 +339,21 @@ export default function UploadZone({
                       {l.code}
                     </button>
                   ))}
+                </div>
+                <div className="flex items-center gap-2 pt-1">
+                  <span className="text-[10px] text-gray-600 shrink-0">
+                    {t("upload.genre_label") || "Género:"}
+                  </span>
+                  <select
+                    value={entry.genre || ""}
+                    onChange={(e) => updateField(i, "genre", e.target.value)}
+                    className="flex-1 px-2 py-1 rounded-md bg-surface-1 border border-white/[0.06] focus:border-brand/50 focus:outline-none text-[11px] text-white"
+                    title={t("upload.genre_hint") || "Ayuda al AI a elegir el fondo correcto"}
+                  >
+                    {GENRES.map((g) => (
+                      <option key={g.code} value={g.code}>{g.label}</option>
+                    ))}
+                  </select>
                 </div>
               </div>
             </div>

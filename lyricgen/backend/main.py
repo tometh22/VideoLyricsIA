@@ -565,6 +565,7 @@ async def upload(
     umg_prores_profile: str = Form(""),
     background_id: int = Form(None),
     background_file: UploadFile = File(None),
+    genre: str = Form(""),
     current_user: dict = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
@@ -656,6 +657,7 @@ async def upload(
         background_path=bg_path,
         input_r2_key=input_r2_key,
         bg_r2_key=bg_r2_key,
+        genre=genre,
     )
 
     return {"job_id": job_id, "status": initial_status}
@@ -742,6 +744,7 @@ async def generate_with_segments(
     umg_prores_profile: str = Form(""),
     background_id: int = Form(None),
     background_file: UploadFile = File(None),
+    genre: str = Form(""),
     current_user: dict = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
@@ -825,6 +828,7 @@ async def generate_with_segments(
         background_path=bg_path,
         input_r2_key=input_r2_key,
         bg_r2_key=bg_r2_key,
+        genre=genre,
     )
 
     return {"job_id": job_id, "status": initial_status}

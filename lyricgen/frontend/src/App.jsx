@@ -164,7 +164,8 @@ export default function App() {
     if (!files.length || !files.every((f) => f.artist.trim())) return;
     const jobList = files.map((f) => ({
       filename: f.file.name, _file: f.file, artist: f.artist.trim(),
-      language: f.language, status: "queued", current_step: null,
+      language: f.language, genre: f.genre || "",
+      status: "queued", current_step: null,
       progress: 0, job_id: null, error: null,
     }));
     setJobs(jobList);
@@ -191,6 +192,7 @@ export default function App() {
       setTranscribing(false);
       setCurrentReview({
         file: entry.file, artist: entry.artist, language: entry.language,
+        genre: entry.genre || "",
         segments: data.segments, referenceLyrics: data.reference_lyrics || "",
         queueIdx: idx, queue,
       });
@@ -203,7 +205,8 @@ export default function App() {
   const handleApproveLyrics = (editedSegments) => {
     const r = currentReview;
     const newApproved = [...approvedJobs, {
-      file: r.file, artist: r.artist, language: r.language, segments: editedSegments,
+      file: r.file, artist: r.artist, language: r.language,
+      genre: r.genre || "", segments: editedSegments,
     }];
     setApprovedJobs(newApproved);
     setCurrentReview(null);
@@ -221,7 +224,7 @@ export default function App() {
   const startGenerationWithSegments = async (approved) => {
     const jobList = approved.map((a) => ({
       filename: a.file.name, _file: a.file, artist: a.artist,
-      language: a.language, segments: a.segments,
+      language: a.language, genre: a.genre || "", segments: a.segments,
       status: "queued", current_step: null, progress: 0, job_id: null, error: null,
     }));
     setJobs(jobList);
@@ -241,6 +244,7 @@ export default function App() {
         formData.append("artist", jobList[i].artist);
         formData.append("style", style);
         if (jobList[i].language) formData.append("language", jobList[i].language);
+        if (jobList[i].genre) formData.append("genre", jobList[i].genre);
         formData.append("segments_json", JSON.stringify(jobList[i].segments));
         formData.append("delivery_profile", delivery.delivery_profile);
         if (delivery.delivery_profile !== "youtube") {
@@ -292,6 +296,7 @@ export default function App() {
           formData.append("umg_prores_profile", String(delivery.umg_prores_profile));
         }
         if (jobList[i].language) formData.append("language", jobList[i].language);
+        if (jobList[i].genre) formData.append("genre", jobList[i].genre);
         if (backgroundId) formData.append("background_id", backgroundId);
         else if (backgroundFile) formData.append("background_file", backgroundFile);
 
