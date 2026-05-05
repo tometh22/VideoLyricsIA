@@ -388,29 +388,52 @@ async def list_plans():
 # Protected endpoints
 # ---------------------------------------------------------------------------
 
-MAX_UPLOAD_MB = int(os.environ.get("MAX_UPLOAD_MB", "50"))
+MAX_UPLOAD_MB = int(os.environ.get("MAX_UPLOAD_MB", "100"))
 _MP3_MAGIC_BYTES = (b"ID3", b"\xff\xfb", b"\xff\xf3", b"\xff\xf2")
+_AUDIO_EXTENSIONS = (".mp3", ".wav")
 
 
-def _validate_mp3_upload(file, data: bytes) -> None:
-    """Validate a freshly-read MP3 payload. Raises 400 on any problem.
+def _validate_audio_upload(file, data: bytes) -> None:
+    """Validate a freshly-read audio payload (MP3 or WAV). Raises 400 on
+    any problem. Magic-bytes check supplements the extension check so a
+    renamed file gets caught.
 
-    Bypassing the `.mp3` extension check is trivial, so we also peek at the
-    first bytes and enforce a size ceiling.
+    UMG uploads lossless WAV; everyone else uploads MP3. Both are valid
+    inputs to the rest of the pipeline (Whisper, moviepy, ffmpeg all
+    handle either format). Whisper-API has a hard 25 MB limit which is
+    handled separately at transcribe time — see _transcribe_via_openai_api.
     """
-    if not file.filename or not file.filename.lower().endswith(".mp3"):
-        raise HTTPException(status_code=400, detail="Only MP3 files are accepted.")
+    if not file.filename:
+        raise HTTPException(status_code=400, detail="Missing filename.")
+    name_lower = file.filename.lower()
+    if not name_lower.endswith(_AUDIO_EXTENSIONS):
+        raise HTTPException(
+            status_code=400,
+            detail="Only MP3 and WAV files are accepted.",
+        )
     size_mb = len(data) / 1024 / 1024
     if size_mb > MAX_UPLOAD_MB:
         raise HTTPException(
             status_code=413,
             detail=f"File too large ({size_mb:.1f} MB). Max allowed: {MAX_UPLOAD_MB} MB.",
         )
-    if not data.startswith(_MP3_MAGIC_BYTES):
-        raise HTTPException(
-            status_code=400,
-            detail="File does not look like a valid MP3 (magic bytes check failed).",
-        )
+    if name_lower.endswith(".mp3"):
+        if not data.startswith(_MP3_MAGIC_BYTES):
+            raise HTTPException(
+                status_code=400,
+                detail="File does not look like a valid MP3 (magic bytes check failed).",
+            )
+    elif name_lower.endswith(".wav"):
+        # WAV files start with "RIFF" + 4 bytes size + "WAVE".
+        if len(data) < 12 or data[:4] != b"RIFF" or data[8:12] != b"WAVE":
+            raise HTTPException(
+                status_code=400,
+                detail="File does not look like a valid WAV (RIFF/WAVE header check failed).",
+            )
+
+
+# Back-compat alias — older call sites still reference the MP3 name.
+_validate_mp3_upload = _validate_audio_upload
 
 
 def _enforce_plan_quota(db: Session, current_user: dict) -> None:
@@ -457,14 +480,22 @@ def _enforce_concurrent_jobs_cap(*_, **__) -> None:
 
 
 # Soft per-tenant cap on jobs that need attention (queued + processing +
-# pending_review). Forces operators to clear their existing backlog before
-# piling on more work — otherwise UMG-style users hit "submit 50 at once"
-# and wait hours for the tail to drain. 5 is sized so a 3-worker pool
-# can keep the tenant's queue moving while one or two jobs sit in review.
+# pending_review). Sized so a 3-worker pool can keep moving while a
+# couple of jobs sit in review on cheap plans. Plans that pay for
+# unlimited concurrency (UMG, enterprise) bypass it entirely — they are
+# expected to manage their own backlog and the cap blocking them during
+# their own live demo (2026-05-05) was a launch-day own-goal.
 TENANT_BACKLOG_LIMIT = int(os.environ.get("TENANT_BACKLOG_LIMIT", "5"))
+BACKLOG_BYPASS_PLANS = {"unlimited", "enterprise"}
 
 
 def _enforce_tenant_backlog(db: Session, current_user: dict) -> None:
+    plan = (current_user.get("plan") or "").strip().lower()
+    if plan in BACKLOG_BYPASS_PLANS:
+        return
+    # Admins are also exempt — they may legitimately seed many test jobs.
+    if current_user.get("role") == "admin":
+        return
     tenant_id = current_user["tenant_id"]
     in_flight = (
         db.query(Job)
@@ -674,9 +705,9 @@ async def transcribe_endpoint(
     current_user: dict = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
-    """Transcribe an MP3 and return segments for review/editing."""
-    if not file.filename.lower().endswith(".mp3"):
-        raise HTTPException(status_code=400, detail="Only MP3 files are accepted.")
+    """Transcribe an MP3 or WAV and return segments for review/editing."""
+    if not file.filename.lower().endswith(_AUDIO_EXTENSIONS):
+        raise HTTPException(status_code=400, detail="Only MP3 and WAV files are accepted.")
 
     import tempfile
     import asyncio

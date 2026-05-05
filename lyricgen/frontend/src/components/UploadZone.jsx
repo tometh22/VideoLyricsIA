@@ -18,10 +18,15 @@ function tokenParam() {
 // stops the user from picking 50 files and getting 40 of them rejected.
 const MAX_BATCH_SIZE = 10;
 
-// Max single-file size. Mirrors backend MAX_UPLOAD_MB default (50). We
-// reject client-side so the user gets immediate feedback instead of a
-// 413 from the server after a long upload.
-const MAX_FILE_MB = 50;
+// Max single-file size. Mirrors backend MAX_UPLOAD_MB default (100, raised
+// from 50 to fit lossless WAV uploads — UMG sends WAV at 16/24-bit PCM,
+// which can land at 30-50 MB for a 3-minute track). We reject client-side
+// so the user gets immediate feedback instead of a 413 from the server
+// after a long upload.
+const MAX_FILE_MB = 100;
+// Accepted extensions in lower-case (with leading dot). Must stay in sync
+// with backend _AUDIO_EXTENSIONS.
+const ACCEPTED_EXTS = [".mp3", ".wav"];
 
 const UMG_FRAME_SIZES = [
   { key: "HD",     label: "HD 1920×1080 (16:9)" },
@@ -105,7 +110,7 @@ export default function UploadZone({
   ];
 
   const extractArtist = (filename) => {
-    const name = filename.replace(/\.mp3$/i, "");
+    const name = filename.replace(/\.(mp3|wav)$/i, "");
     if (name.includes(" - ")) return name.split(" - ")[0].trim();
     return "";
   };
@@ -114,9 +119,10 @@ export default function UploadZone({
   const [oversize, setOversize] = useState([]);
 
   const addFiles = (fileList) => {
-    const mp3s = Array.from(fileList).filter((f) =>
-      f.name.toLowerCase().endsWith(".mp3")
-    );
+    const mp3s = Array.from(fileList).filter((f) => {
+      const lower = f.name.toLowerCase();
+      return ACCEPTED_EXTS.some((ext) => lower.endsWith(ext));
+    });
     if (!mp3s.length) return;
 
     const max = MAX_FILE_MB * 1024 * 1024;
@@ -224,7 +230,7 @@ export default function UploadZone({
         `}
       >
         <input
-          ref={inputRef} type="file" accept=".mp3" multiple className="hidden"
+          ref={inputRef} type="file" accept=".mp3,.wav,audio/mpeg,audio/wav,audio/x-wav" multiple className="hidden"
           onChange={(e) => { addFiles(e.target.files); e.target.value = ""; }}
         />
 
@@ -281,7 +287,7 @@ export default function UploadZone({
             <p className="text-gray-300 font-medium mb-1">{t("upload.drag")}</p>
             <p className="text-gray-600 text-sm">{t("upload.drag_sub")}</p>
             <p className="text-gray-700 text-[11px] mt-2">
-              {t("upload.size_hint", { max: MAX_FILE_MB }) || `MP3, máx ${MAX_FILE_MB} MB por archivo, hasta ${MAX_BATCH_SIZE} por lote`}
+              {t("upload.size_hint", { max: MAX_FILE_MB }) || `MP3 o WAV, máx ${MAX_FILE_MB} MB por archivo, hasta ${MAX_BATCH_SIZE} por lote`}
             </p>
           </div>
         )}

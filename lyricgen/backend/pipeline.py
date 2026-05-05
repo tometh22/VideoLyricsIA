@@ -380,6 +380,46 @@ def _get_whisper_model(name: str = "turbo"):
     return _WHISPER_MODELS[name]
 
 
+_WHISPER_API_MAX_BYTES = 24 * 1024 * 1024  # 25 MB ceiling, with 1 MB headroom
+
+
+def _compress_for_whisper(input_path: str) -> str:
+    """If `input_path` exceeds Whisper-API's 25 MB ceiling (typical for
+    UMG-style WAV uploads), produce a temp 128 kbps mono MP3 alongside
+    it and return the new path. Otherwise return the original path
+    unchanged. Caller is responsible for cleaning up the temp file when
+    `_compress_for_whisper(p) != p`.
+
+    Why mono 128 kbps: Whisper's transcription accuracy is bounded well
+    above this bitrate — extra fidelity doesn't help. Stereo→mono cuts
+    size in half with zero impact on Whisper. A 4-min track lands around
+    4 MB, comfortably under the cap.
+    """
+    try:
+        sz = os.path.getsize(input_path)
+    except OSError:
+        return input_path
+    if sz <= _WHISPER_API_MAX_BYTES:
+        return input_path
+    import subprocess as _sp
+    out = input_path + ".whisper.mp3"
+    try:
+        _sp.run(
+            ["ffmpeg", "-y", "-i", input_path,
+             "-ac", "1", "-b:a", "128k", "-loglevel", "error", out],
+            check=True, timeout=120,
+        )
+        if os.path.exists(out) and os.path.getsize(out) > 0:
+            new_sz = os.path.getsize(out)
+            print(f"[WHISPER-API] compressed {sz/1e6:.1f} MB → "
+                  f"{new_sz/1e6:.1f} MB for API limit")
+            return out
+    except (_sp.CalledProcessError, _sp.TimeoutExpired,
+            FileNotFoundError, OSError) as e:
+        print(f"[WHISPER-API] compression failed ({e}); sending original")
+    return input_path
+
+
 def _transcribe_via_openai_api(mp3_path: str, language: str | None = None,
                                 lyrics_hint: str | None = None) -> list[dict]:
     """Transcribe by calling OpenAI's Whisper API. Returns the same segments
@@ -440,9 +480,22 @@ def _transcribe_via_openai_api(mp3_path: str, language: str | None = None,
     if language:
         kwargs["language"] = language
 
-    with open(mp3_path, "rb") as f:
-        kwargs["file"] = f
-        response = client.audio.transcriptions.create(**kwargs)
+    # Whisper-API rejects > 25 MB. UMG uploads lossless WAV (often 30-50
+    # MB for a 3-min track). Transcode-compress only when over the cap;
+    # the compressed copy is just for the API call — original audio is
+    # untouched and used by the rest of the render pipeline.
+    api_path = _compress_for_whisper(mp3_path)
+    cleanup_compressed = api_path != mp3_path
+    try:
+        with open(api_path, "rb") as f:
+            kwargs["file"] = f
+            response = client.audio.transcriptions.create(**kwargs)
+    finally:
+        if cleanup_compressed:
+            try:
+                os.unlink(api_path)
+            except OSError:
+                pass
 
     raw_segments = response.segments or []
     import re as _re
@@ -869,18 +922,32 @@ def _lrc_to_segments(lrc: str, audio_duration: float | None = None,
     return segments
 
 
-def _audio_duration(mp3_path: str) -> float | None:
-    """Best-effort MP3 duration in seconds. Tries mutagen first (~1ms,
-    just reads the header), falls back to moviepy (slower, opens the
-    full file). Returns None if both fail."""
-    try:
-        from mutagen.mp3 import MP3
-        return float(MP3(mp3_path).info.length)
-    except Exception:
-        pass
+def _audio_duration(audio_path: str) -> float | None:
+    """Best-effort audio duration in seconds. Handles both MP3 and WAV.
+    For MP3 we use mutagen.mp3 (header-only, ~1 ms). For WAV we use the
+    stdlib `wave` module (also header-only). Falls back to moviepy
+    (slower, opens the full file) on any failure. Returns None if
+    everything fails."""
+    name_lower = audio_path.lower()
+    if name_lower.endswith(".mp3"):
+        try:
+            from mutagen.mp3 import MP3
+            return float(MP3(audio_path).info.length)
+        except Exception:
+            pass
+    elif name_lower.endswith(".wav"):
+        try:
+            import wave
+            with wave.open(audio_path, "rb") as wf:
+                frames = wf.getnframes()
+                rate = wf.getframerate() or 0
+                if rate > 0:
+                    return float(frames) / rate
+        except Exception:
+            pass
     try:
         from moviepy.editor import AudioFileClip
-        with AudioFileClip(mp3_path) as a:
+        with AudioFileClip(audio_path) as a:
             return float(a.duration)
     except Exception:
         return None
