@@ -303,8 +303,15 @@ def run_pipeline(job_id: str, mp3_path: str, artist: str, style: str,
         # Deliverables are already removed above when R2 was used.
         _cleanup_local_intermediates(job_dir)
 
-        _require_review_raw = os.environ.get("REQUIRE_REVIEW", "<unset>")
-        _require_review = _require_review_raw.lower() == "true" if _require_review_raw != "<unset>" else True
+        # Robust env-var read: tolerate accidental whitespace or quotes that
+        # Railway / .env files sometimes leave around the value. We default to
+        # review-required so the safest behaviour applies if the var is missing.
+        _require_review_raw = os.environ.get("REQUIRE_REVIEW")
+        if _require_review_raw is None:
+            _require_review = True
+        else:
+            _normalized = _require_review_raw.strip().strip('"').strip("'").lower()
+            _require_review = _normalized in ("true", "1", "yes", "y", "on")
         final_status = "pending_review" if _require_review else "done"
         print(
             f"[PIPELINE] job={job_id} REQUIRE_REVIEW="
