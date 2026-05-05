@@ -2418,18 +2418,19 @@ _FONT_POOL = [
 # renders previews in the browser via the Google Fonts CDN — every entry's
 # `google_family` + `google_weight` matches the local TTF in `filename`,
 # so what the operator sees in the dropdown is what the worker renders.
-# UMG asked for explicit per-track typography control (the random pick was
-# making every video look the same).
+# UMG asked for these eight typefaces specifically; Futura and Gilroy are
+# proprietary (Adobe/HypeForType) so we surface their closest libre
+# substitutes (Jost / Outfit) and label the option honestly so the
+# operator knows it's a stylistic match, not the licensed face.
 _FONT_CATALOGUE = [
-    {"id": "montserrat-bold",  "filename": "Montserrat-Bold.ttf",      "label": "Montserrat",       "google_family": "Montserrat",  "google_weight": 700},
-    {"id": "montserrat-extra", "filename": "Montserrat-ExtraBold.ttf", "label": "Montserrat Extra", "google_family": "Montserrat",  "google_weight": 800},
-    {"id": "poppins-bold",     "filename": "Poppins-Bold.ttf",         "label": "Poppins",          "google_family": "Poppins",     "google_weight": 700},
-    {"id": "outfit-bold",      "filename": "Outfit-Bold.ttf",          "label": "Outfit",           "google_family": "Outfit",      "google_weight": 700},
-    {"id": "roboto-bold",      "filename": "Roboto-Bold.ttf",          "label": "Roboto",           "google_family": "Roboto",      "google_weight": 700},
-    {"id": "jost-bold",        "filename": "Jost-Bold.ttf",            "label": "Jost",             "google_family": "Jost",        "google_weight": 700},
-    {"id": "bebas-neue",       "filename": "BebasNeue-Regular.ttf",    "label": "Bebas Neue",       "google_family": "Bebas Neue",  "google_weight": 400},
-    {"id": "oswald-bold",      "filename": "Oswald-Bold.ttf",          "label": "Oswald",           "google_family": "Oswald",      "google_weight": 700},
-    {"id": "anton",            "filename": "Anton-Regular.ttf",        "label": "Anton",            "google_family": "Anton",       "google_weight": 400},
+    {"id": "jost-bold",        "filename": "Jost-Bold.ttf",            "label": "Jost (estilo Futura)",     "google_family": "Jost",        "google_weight": 700},
+    {"id": "montserrat-bold",  "filename": "Montserrat-Bold.ttf",      "label": "Montserrat",                "google_family": "Montserrat",  "google_weight": 700},
+    {"id": "poppins-bold",     "filename": "Poppins-Bold.ttf",         "label": "Poppins",                   "google_family": "Poppins",     "google_weight": 700},
+    {"id": "outfit-bold",      "filename": "Outfit-Bold.ttf",          "label": "Outfit (estilo Gilroy)",   "google_family": "Outfit",      "google_weight": 700},
+    {"id": "roboto-bold",      "filename": "Roboto-Bold.ttf",          "label": "Roboto",                    "google_family": "Roboto",      "google_weight": 700},
+    {"id": "bebas-neue",       "filename": "BebasNeue-Regular.ttf",    "label": "Bebas Neue",                "google_family": "Bebas Neue",  "google_weight": 400},
+    {"id": "oswald-bold",      "filename": "Oswald-Bold.ttf",          "label": "Oswald",                    "google_family": "Oswald",      "google_weight": 700},
+    {"id": "anton",            "filename": "Anton-Regular.ttf",        "label": "Anton",                     "google_family": "Anton",       "google_weight": 400},
 ]
 
 

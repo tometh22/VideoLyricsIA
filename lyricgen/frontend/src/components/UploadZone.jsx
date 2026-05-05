@@ -118,12 +118,11 @@ export default function UploadZone({
   // existing random/deterministic pick.
   const FONTS = [
     { id: "",                  label: t("upload.font_auto") || "Auto",     css: "" },
+    { id: "jost-bold",         label: "Jost (estilo Futura)",              css: "'Jost', sans-serif",       weight: 700 },
     { id: "montserrat-bold",   label: "Montserrat",                        css: "'Montserrat', sans-serif", weight: 700 },
-    { id: "montserrat-extra",  label: "Montserrat Extra",                  css: "'Montserrat', sans-serif", weight: 800 },
     { id: "poppins-bold",      label: "Poppins",                           css: "'Poppins', sans-serif",    weight: 700 },
-    { id: "outfit-bold",       label: "Outfit",                            css: "'Outfit', sans-serif",     weight: 700 },
+    { id: "outfit-bold",       label: "Outfit (estilo Gilroy)",            css: "'Outfit', sans-serif",     weight: 700 },
     { id: "roboto-bold",       label: "Roboto",                            css: "'Roboto', sans-serif",     weight: 700 },
-    { id: "jost-bold",         label: "Jost",                              css: "'Jost', sans-serif",       weight: 700 },
     { id: "bebas-neue",        label: "Bebas Neue",                        css: "'Bebas Neue', sans-serif", weight: 400 },
     { id: "oswald-bold",       label: "Oswald",                            css: "'Oswald', sans-serif",     weight: 700 },
     { id: "anton",             label: "Anton",                             css: "'Anton', sans-serif",      weight: 400 },
