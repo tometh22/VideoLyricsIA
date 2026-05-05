@@ -216,9 +216,19 @@ def run_pipeline(job_id: str, mp3_path: str, artist: str, style: str,
             print(f"[BG] Using human-provided background: {background_path}")
         else:
             lyrics_text = " ".join(seg["text"] for seg in segments)
+            # Extract a clean song title from the MP3 filename so Gemini gets
+            # song-level context even when the lyrics transcription degrades.
+            # The cache key downstream uses (artist|title) as a namespace so
+            # different songs don't share a Veo background.
+            _basename = os.path.splitext(os.path.basename(mp3_path))[0]
+            _song_title = _basename.split(" - ", 1)[1] if " - " in _basename else _basename
+            for _sfx in ["(Official Video)", "(Official Audio)", "(Lyric Video)",
+                         "(Official Music Video)", "(En Vivo)", "(Live)", "(Lyrics)"]:
+                _song_title = _song_title.replace(_sfx, "").strip()
             bg_image_path = _ensure_background(
                 style, job_dir,
                 lyrics_text=lyrics_text, artist=artist, job_id=job_id,
+                song_title=_song_title,
             )
         update_job(job_id, progress=40)
 
@@ -853,7 +863,8 @@ _BG_CONDITIONS = [
 _USED_PROMPTS_FILE = os.path.join(ASSETS_DIR, ".used_prompts.json")
 
 
-def _analyze_lyrics_for_background(lyrics_text: str, artist: str, job_id: str = None) -> dict:
+def _analyze_lyrics_for_background(lyrics_text: str, artist: str, job_id: str = None,
+                                    song_title: str = "") -> dict:
     """Use Gemini to analyze lyrics and choose visual style + prompt.
 
     Returns dict with:
@@ -878,13 +889,16 @@ Genre guidance (vary the scenes!):
 - Latin/reggaeton → tropical, vibrant colors, palm trees, warm tones
 - Hip hop/rap → city skyline at night, luxury abstract, gold and dark tones
 
+CRITICAL: Each new song must get a DIFFERENT visual scene. Do NOT default to ocean/sunset for every song. Use the song title and artist as the primary inspiration when lyrics are short or unclear.
+
 NEVER include people, faces, hands, or text in the prompt."""
 
-    lyrics_sample = lyrics_text[:600]
+    lyrics_sample = lyrics_text[:600] if lyrics_text else ""
     # Data minimization (UMG Guideline 14): optionally anonymize artist name
     _send_artist = os.environ.get("SEND_ARTIST_TO_AI", "true").lower() == "true"
     artist_label = artist if _send_artist else "the artist"
-    user_content = f"Artist: {artist_label}\n\nLyrics:\n{lyrics_sample}"
+    title_part = f"\nSong title: {song_title}" if song_title else ""
+    user_content = f"Artist: {artist_label}{title_part}\n\nLyrics (may be incomplete or noisy):\n{lyrics_sample or '[transcription failed; rely on artist + title]'}"
     full_prompt = f"system:{system_prompt}\nuser:{user_content}"
 
     recorder = record_ai_call(
@@ -940,8 +954,16 @@ NEVER include people, faces, hands, or text in the prompt."""
         return {"style": "video", "prompt": None}
 
 
-def _get_unique_prompt(lyrics_text: str = None, artist: str = "", job_id: str = None) -> dict:
-    """Get a unique style+prompt combination. Returns {style, prompt}."""
+def _get_unique_prompt(lyrics_text: str = None, artist: str = "", job_id: str = None,
+                       song_title: str = "") -> dict:
+    """Get a unique style+prompt combination. Returns {style, prompt}.
+
+    Note: the local _USED_PROMPTS_FILE only sees this worker's previous
+    prompts — Railway containers have ephemeral disk, so dedup across
+    workers / restarts is best-effort. The Veo cache key downstream
+    includes artist+title so even a duplicated Gemini prompt produces a
+    fresh background per song (see `_generate_veo_video`).
+    """
     used: list[str] = []
     if os.path.exists(_USED_PROMPTS_FILE):
         try:
@@ -951,8 +973,10 @@ def _get_unique_prompt(lyrics_text: str = None, artist: str = "", job_id: str = 
             used = []
 
     # Gemini analysis
-    if lyrics_text:
-        result = _analyze_lyrics_for_background(lyrics_text, artist, job_id=job_id)
+    if lyrics_text or song_title:
+        result = _analyze_lyrics_for_background(
+            lyrics_text or "", artist, job_id=job_id, song_title=song_title,
+        )
         if result["prompt"] and result["prompt"] not in used:
             used.append(result["prompt"])
             try:
@@ -1023,7 +1047,8 @@ def _veo_cache_key(prompt: str, model: str, params: dict) -> str:
     return _hash.sha256(payload.encode()).hexdigest()[:16]
 
 
-def _generate_veo_video(prompt: str, output_path: str, job_id: str = None) -> str:
+def _generate_veo_video(prompt: str, output_path: str, job_id: str = None,
+                        cache_namespace: str = "") -> str:
     """Generate a video clip with Google Veo 3 via direct Vertex AI REST API.
 
     We bypass google-genai SDK for Veo specifically because its internal auth
@@ -1062,9 +1087,14 @@ def _generate_veo_video(prompt: str, output_path: str, job_id: str = None) -> st
     }
     blur_sigma = 2.0
 
-    cache_key_hash = _veo_cache_key(
-        safe_prompt, model, {**veo_params, "blur_sigma": blur_sigma}
-    )
+    # Cache key includes a per-song namespace (artist|title) so two different
+    # songs that happen to receive the same Gemini prompt — common when
+    # transcription degrades and Gemini falls back to a generic "ocean
+    # sunset" template — still generate independent Veo backgrounds.
+    # Without this, all problem-songs ended up sharing one cached video
+    # because the cache key was prompt-only.
+    cache_params = {**veo_params, "blur_sigma": blur_sigma, "ns": cache_namespace or ""}
+    cache_key_hash = _veo_cache_key(safe_prompt, model, cache_params)
     cache_object_key = f"cache/veo/{cache_key_hash}.mp4"
 
     recorder = record_ai_call(
@@ -1332,7 +1362,9 @@ def _generate_imagen_image(prompt: str, output_path: str, max_retries: int = 5, 
     return output_path
 
 
-def _ensure_background(style_hint: str, job_dir: str, lyrics_text: str = None, artist: str = "", job_id: str = None) -> str:
+def _ensure_background(style_hint: str, job_dir: str, lyrics_text: str = None,
+                       artist: str = "", job_id: str = None,
+                       song_title: str = "") -> str:
     """Generate background using AI. Gemini picks the best style for the song.
 
     Returns path to .mp4 (video style) or .jpg/.png (photo/illustration style).
@@ -1346,14 +1378,17 @@ def _ensure_background(style_hint: str, job_dir: str, lyrics_text: str = None, a
         return None
 
     # Generate video background with Veo 3 (always video, no images)
-    result = _get_unique_prompt(lyrics_text, artist, job_id=job_id)
+    result = _get_unique_prompt(lyrics_text, artist, job_id=job_id, song_title=song_title)
     prompt = result["prompt"]
 
     bg_path = os.path.join(job_dir, "bg_generated.mp4")
     import time as _time_bg
     for attempt in range(3):
         try:
-            _generate_veo_video(prompt, bg_path, job_id=job_id)
+            _generate_veo_video(
+                prompt, bg_path, job_id=job_id,
+                cache_namespace=f"{artist}|{song_title}",
+            )
             return bg_path
         except Exception as e:
             print(f"[BG] Veo 3 attempt {attempt + 1}/3 failed: {e}")
