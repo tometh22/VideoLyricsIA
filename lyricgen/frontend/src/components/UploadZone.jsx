@@ -116,6 +116,30 @@ export default function UploadZone({
   // option without needing a server-side render. UMG operator picks
   // one per song; "Auto" sends an empty value and the worker keeps the
   // existing random/deterministic pick.
+  // Visual concept for the AI background. Operator-controlled; when set
+  // it hard-overrides the genre's scene vocabulary. Mirror of the backend
+  // _CONCEPT_SCENE_GUIDE keys in pipeline.py — keep in sync. UMG asked
+  // for this on top of genre because the genre alone wasn't tight enough
+  // to control the visual register.
+  const CONCEPTS = [
+    { code: "",             label: t("upload.concept_auto") || "Auto" },
+    { code: "naturaleza",   label: t("upload.concept_naturaleza") || "Naturaleza" },
+    { code: "tropical",     label: t("upload.concept_tropical") || "Tropical" },
+    { code: "acuatico",     label: t("upload.concept_acuatico") || "Acuático" },
+    { code: "ciudad",       label: t("upload.concept_ciudad") || "Ciudad" },
+    { code: "urbano",       label: t("upload.concept_urbano") || "Urbano" },
+    { code: "industrial",   label: t("upload.concept_industrial") || "Industrial" },
+    { code: "abstracto",    label: t("upload.concept_abstracto") || "Abstracto" },
+    { code: "cosmico",      label: t("upload.concept_cosmico") || "Cósmico" },
+    { code: "atmosferico",  label: t("upload.concept_atmosferico") || "Atmosférico" },
+    { code: "romantico",    label: t("upload.concept_romantico") || "Romántico" },
+    { code: "vintage",      label: t("upload.concept_vintage") || "Vintage" },
+    { code: "cinematic",    label: t("upload.concept_cinematic") || "Cinematic" },
+    { code: "club",         label: t("upload.concept_club") || "Club" },
+    { code: "lujo",         label: t("upload.concept_lujo") || "Lujo" },
+    { code: "minimalista",  label: t("upload.concept_minimalista") || "Minimalista" },
+  ];
+
   const FONTS = [
     { id: "",                  label: t("upload.font_auto") || "Auto",     css: "" },
     { id: "jost-bold",         label: "Jost (estilo Futura)",              css: "'Jost', sans-serif",       weight: 700 },
@@ -377,6 +401,21 @@ export default function UploadZone({
                   >
                     {GENRES.map((g) => (
                       <option key={g.code} value={g.code}>{g.label}</option>
+                    ))}
+                  </select>
+                </div>
+                <div className="flex items-center gap-2 pt-1">
+                  <span className="text-[10px] text-gray-600 shrink-0">
+                    {t("upload.concept_label") || "Concepto:"}
+                  </span>
+                  <select
+                    value={entry.concept || ""}
+                    onChange={(e) => updateField(i, "concept", e.target.value)}
+                    className="flex-1 px-2 py-1 rounded-md bg-surface-1 border border-white/[0.06] focus:border-brand/50 focus:outline-none text-[11px] text-white"
+                    title={t("upload.concept_hint") || "Categoría visual del fondo (sobreescribe el género)"}
+                  >
+                    {CONCEPTS.map((c) => (
+                      <option key={c.code || "auto"} value={c.code}>{c.label}</option>
                     ))}
                   </select>
                 </div>

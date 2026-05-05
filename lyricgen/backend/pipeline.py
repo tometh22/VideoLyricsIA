@@ -136,7 +136,8 @@ def run_pipeline(job_id: str, mp3_path: str, artist: str, style: str,
                  input_r2_key: str | None = None,
                  bg_r2_key: str | None = None,
                  genre: str = "",
-                 font: str = ""):
+                 font: str = "",
+                 concept: str = ""):
     """Run the full pipeline for a job. Called synchronously.
 
     delivery_profile:
@@ -230,7 +231,7 @@ def run_pipeline(job_id: str, mp3_path: str, artist: str, style: str,
             bg_image_path = _ensure_background(
                 style, job_dir,
                 lyrics_text=lyrics_text, artist=artist, job_id=job_id,
-                song_title=_song_title, genre=genre,
+                song_title=_song_title, genre=genre, concept=concept,
             )
         update_job(job_id, progress=40)
 
@@ -1541,8 +1542,67 @@ def _normalize_genre(g: str) -> str:
     return ""
 
 
+# Concept selector — operator-controlled visual category for the background.
+# When set, this hard-overrides the genre's scene vocabulary and forces
+# Gemini's prompt into the chosen category. UMG asked for it because the
+# genre alone wasn't tight enough — different songs in the same genre
+# need different visual registers (a Karol G ballad vs a Karol G party
+# anthem are both "latin" but should not look the same).
+#
+# Each value is the English vocabulary Gemini will pick from. Order in
+# the catalogue matches the UI dropdown order.
+_CONCEPT_SCENE_GUIDE = {
+    "naturaleza":   "natural outdoor landscapes — dense forests, mountain valleys, rolling hills, open fields, rivers, sunsets over horizons",
+    "tropical":     "tropical scenes — palm trees, caribbean beaches, vibrant flowers, festive lanterns, sunlit turquoise water, lush jungle",
+    "acuatico":     "water-centric scenes — underwater light rays, rain on glass and pavement, deep ocean, slow-motion water droplets, flowing rivers",
+    "ciudad":       "city skylines — modern downtowns, skyscrapers at golden hour, aerial cityscapes, glass facades, bridges, observation decks",
+    "urbano":       "gritty urban — narrow alleys, neon-lit rain-slicked streets, graffiti walls, rooftops, fire escapes, smoking vents, industrial corners",
+    "industrial":   "industrial environments — factories, exposed pipes, machinery, decaying warehouses, steel beams, smokestacks, foundries",
+    "abstracto":    "abstract visuals — flowing geometric shapes, fractal patterns, particle clouds, color gradients, liquid metal, kaleidoscopic motion",
+    "cosmico":      "cosmic scenes — spiral galaxies, star fields, colorful nebulas, planetary surfaces, deep space, comets, supernovae",
+    "atmosferico":  "atmospheric mood — drifting smoke, dense fog, volumetric light rays, dust motes, soft haze, ethereal glow",
+    "romantico":    "romantic mood — warm sunsets, candlelight, scattered rose petals, soft fabric textures, calm beaches at dusk, fireplace embers",
+    "vintage":      "vintage / retro — Super 8 film grain, sepia tones, faded photographs, retro patterns, analog noise, old-paper textures",
+    "cinematic":    "cinematic dramatic — chiaroscuro lighting, film-noir contrast, dramatic shadows, anamorphic lens flares, moody atmosphere",
+    "club":         "club / dance scene — laser beams, smoke machines, neon strips, disco balls, strobe lights, dancefloor energy (no people, no faces)",
+    "lujo":         "luxury aesthetics — polished marble, gold accents, crystal facets, high-gloss surfaces, fashion textures, jewelry close-ups",
+    "minimalista":  "minimalist design — clean geometric shapes, smooth gradients, solid color planes, single-subject compositions, negative space",
+}
+
+
+def _normalize_concept(c: str) -> str:
+    """Map free-text or UI selection to a key in _CONCEPT_SCENE_GUIDE."""
+    if not c:
+        return ""
+    c = c.strip().lower()
+    # Common alternate spellings (operator might tab in raw or with accents).
+    aliases = {
+        "nature": "naturaleza", "natural": "naturaleza",
+        "city": "ciudad", "downtown": "ciudad", "skyline": "ciudad",
+        "urban": "urbano", "street": "urbano", "alley": "urbano",
+        "tropical/beach": "tropical", "playa": "tropical", "beach": "tropical",
+        "water": "acuatico", "agua": "acuatico", "underwater": "acuatico",
+        "abstract": "abstracto", "geometric": "abstracto",
+        "cosmic": "cosmico", "space": "cosmico", "galaxy": "cosmico",
+        "atmospheric": "atmosferico", "smoke": "atmosferico", "fog": "atmosferico",
+        "romantic": "romantico", "love": "romantico",
+        "vintage/retro": "vintage", "retro": "vintage",
+        "cinematic/film": "cinematic", "film noir": "cinematic", "noir": "cinematic",
+        "club/dance": "club", "rave": "club", "neon": "club",
+        "luxury": "lujo", "premium": "lujo", "fashion": "lujo",
+        "minimalist": "minimalista", "minimal": "minimalista",
+        "industrial/factory": "industrial", "factory": "industrial",
+    }
+    if c in aliases:
+        return aliases[c]
+    if c in _CONCEPT_SCENE_GUIDE:
+        return c
+    return ""
+
+
 def _analyze_lyrics_for_background(lyrics_text: str, artist: str, job_id: str = None,
-                                    song_title: str = "", genre: str = "") -> dict:
+                                    song_title: str = "", genre: str = "",
+                                    concept: str = "") -> dict:
     """Use Gemini to analyze lyrics and choose visual style + prompt.
 
     Returns dict with:
@@ -1555,8 +1615,32 @@ def _analyze_lyrics_for_background(lyrics_text: str, artist: str, job_id: str = 
     client = _get_genai_client()
 
     normalized_genre = _normalize_genre(genre)
+    normalized_concept = _normalize_concept(concept)
 
-    if normalized_genre:
+    if normalized_concept:
+        # Operator picked an explicit visual concept — that hard-overrides
+        # the genre's scene vocabulary. The concept is the controlling
+        # input here; genre still goes into the user content as a stylistic
+        # color hint but does NOT determine the scene type.
+        concept_guide = _CONCEPT_SCENE_GUIDE[normalized_concept]
+        genre_hint = (f"\n\nFor stylistic colour-grading flavour only "
+                      f"(NOT for scene choice), the song genre is: "
+                      f"{normalized_genre.upper()}.") if normalized_genre else ""
+        system_prompt = f"""Respond ONLY with a JSON object, no other text. Example:
+{{"style":"video","prompt":"Slow tracking shot through neon-lit rain-slicked streets, deep blue and red reflections, smoke rising past streetlamps, gritty cinematic 4k"}}
+
+The operator has explicitly requested a {normalized_concept.upper()} background.
+
+You MUST pick a scene that fits this concept's visual vocabulary:
+{concept_guide}{genre_hint}
+
+Hard rules:
+- "style" must always be "video"
+- "prompt" is 20-40 words: scene + camera movement + colors + lighting + atmosphere
+- Pick a DIFFERENT specific scene each time (don't repeat across songs)
+- The concept choice is binding — do NOT drift to a different visual category
+- Never include people, faces, hands, or readable text in the scene"""
+    elif normalized_genre:
         # User-supplied genre: lock Gemini to that genre's visual vocabulary
         # and forbid the lazy "ocean sunset" default. This is the high-
         # certainty path — UMG operators picking the genre at upload time
@@ -1611,10 +1695,11 @@ Hard rules:
     artist_label = artist if _send_artist else "the artist"
     title_part = f"\nSong title: {song_title}" if song_title else ""
     genre_part = f"\nDeclared genre: {normalized_genre}" if normalized_genre else ""
+    concept_part = f"\nDeclared concept: {normalized_concept}" if normalized_concept else ""
     user_content = (
-        f"Artist: {artist_label}{title_part}{genre_part}\n\n"
+        f"Artist: {artist_label}{title_part}{genre_part}{concept_part}\n\n"
         f"Lyrics (may be incomplete or noisy):\n"
-        f"{lyrics_sample or '[transcription failed; rely on artist + title + declared genre]'}"
+        f"{lyrics_sample or '[transcription failed; rely on artist + title + declared metadata]'}"
     )
     full_prompt = f"system:{system_prompt}\nuser:{user_content}"
 
@@ -1672,7 +1757,7 @@ Hard rules:
 
 
 def _get_unique_prompt(lyrics_text: str = None, artist: str = "", job_id: str = None,
-                       song_title: str = "", genre: str = "") -> dict:
+                       song_title: str = "", genre: str = "", concept: str = "") -> dict:
     """Get a unique style+prompt combination. Returns {style, prompt}.
 
     Note: the local _USED_PROMPTS_FILE only sees this worker's previous
@@ -1693,7 +1778,7 @@ def _get_unique_prompt(lyrics_text: str = None, artist: str = "", job_id: str = 
     if lyrics_text or song_title:
         result = _analyze_lyrics_for_background(
             lyrics_text or "", artist, job_id=job_id, song_title=song_title,
-            genre=genre,
+            genre=genre, concept=concept,
         )
         if result["prompt"] and result["prompt"] not in used:
             used.append(result["prompt"])
@@ -2091,7 +2176,8 @@ def _generate_imagen_image(prompt: str, output_path: str, max_retries: int = 5, 
 
 def _ensure_background(style_hint: str, job_dir: str, lyrics_text: str = None,
                        artist: str = "", job_id: str = None,
-                       song_title: str = "", genre: str = "") -> str:
+                       song_title: str = "", genre: str = "",
+                       concept: str = "") -> str:
     """Generate background using AI. Gemini picks the best style for the song.
 
     Returns path to .mp4 (video style) or .jpg/.png (photo/illustration style).
@@ -2107,6 +2193,7 @@ def _ensure_background(style_hint: str, job_dir: str, lyrics_text: str = None,
     # Generate video background with Veo 3 (always video, no images)
     result = _get_unique_prompt(
         lyrics_text, artist, job_id=job_id, song_title=song_title, genre=genre,
+        concept=concept,
     )
     prompt = result["prompt"]
 

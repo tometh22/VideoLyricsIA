@@ -609,6 +609,7 @@ async def upload(
     background_file: UploadFile = File(None),
     genre: str = Form(""),
     font: str = Form(""),
+    concept: str = Form(""),
     current_user: dict = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
@@ -702,6 +703,7 @@ async def upload(
         bg_r2_key=bg_r2_key,
         genre=genre,
         font=font,
+        concept=concept,
     )
 
     return {"job_id": job_id, "status": initial_status}
@@ -972,6 +974,7 @@ async def generate_with_segments(
     background_file: UploadFile = File(None),
     genre: str = Form(""),
     font: str = Form(""),
+    concept: str = Form(""),
     current_user: dict = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
@@ -1057,6 +1060,7 @@ async def generate_with_segments(
         bg_r2_key=bg_r2_key,
         genre=genre,
         font=font,
+        concept=concept,
     )
 
     return {"job_id": job_id, "status": initial_status}
