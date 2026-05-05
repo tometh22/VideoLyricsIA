@@ -145,18 +145,21 @@ export default function UploadZone({
 
   return (
     <div>
-      {/* Delivery profile selector — applied to every file in this batch. */}
+      {/* Delivery profile selector — applied to every file in this batch.
+          ProRes paths exist in the backend but the multi-GB upload-to-R2
+          step is still being hardened, so we expose youtube as the only
+          selectable option for now and label the rest "próximamente". */}
       <div className="glass rounded-2xl px-4 py-3 mb-3">
         <div className="flex flex-wrap gap-2 items-center">
-          <label className="text-xs text-gray-400 mr-1">Delivery:</label>
+          <label className="text-xs text-gray-400 mr-1">{t("upload.delivery") || "Entrega:"}</label>
           <select
             value={deliveryProfile}
             onChange={(e) => setDeliveryProfile(e.target.value)}
             className="px-3 py-1.5 rounded-lg bg-surface-1 border border-white/[0.06] focus:border-brand/50 focus:outline-none text-sm text-white"
           >
-            <option value="youtube">YouTube (MP4 H.264 1080p)</option>
-            <option value="umg">UMG master (ProRes .mov)</option>
-            <option value="both">Both</option>
+            <option value="youtube">MP4 H.264 1080p (YouTube / Instagram / TikTok)</option>
+            <option value="umg" disabled>ProRes 422 HQ master — próximamente</option>
+            <option value="both" disabled>MP4 + ProRes — próximamente</option>
           </select>
           {deliveryProfile !== "youtube" && (
             <>
