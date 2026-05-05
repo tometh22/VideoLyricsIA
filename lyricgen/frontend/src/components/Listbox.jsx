@@ -10,10 +10,11 @@ import { useEffect, useRef, useState } from "react";
  * Props:
  *   value     : current selected option's `code` (string).
  *   onChange  : (newCode: string) => void.
- *   options   : Array<{ code, label, css?, weight?, hint? }>.
+ *   options   : Array<{ code, label, css?, weight?, hint?, disabled?: boolean }>.
  *               `css`/`weight` apply inline `font-family`/`font-weight` to
  *               the option label so the typography picker shows each face
- *               in its own typography.
+ *               in its own typography. `disabled: true` renders the option
+ *               dimmed and skips it in keyboard navigation / click.
  *   className : extra classes for the trigger wrapper.
  *   ariaLabel : accessible label for screen readers.
  *   disabled  : optional, dims the trigger.
@@ -41,13 +42,30 @@ export default function Listbox({
 
   const selected = options.find((o) => o.code === value) || options[0];
 
+  // Helper: index of the next enabled option from `from` in `dir` (1 or -1).
+  // Used by keyboard nav to skip disabled options.
+  const _nextEnabled = (from, dir) => {
+    const n = options.length;
+    if (n === 0) return 0;
+    let i = from;
+    for (let step = 0; step < n; step++) {
+      i = (i + dir + n) % n;
+      if (!options[i]?.disabled) return i;
+    }
+    return from;
+  };
+
   // Click outside closes the popover. Also, opening the popover initialises
-  // the highlight to the currently selected option so keyboard users land
-  // on a sensible row.
+  // the highlight to the currently selected option (or the first enabled
+  // one if the current is disabled) so keyboard users land on a sensible row.
   useEffect(() => {
     if (!open) return;
-    const idx = options.findIndex((o) => o.code === value);
-    setHighlight(idx >= 0 ? idx : 0);
+    let idx = options.findIndex((o) => o.code === value);
+    if (idx < 0 || options[idx]?.disabled) {
+      idx = options.findIndex((o) => !o.disabled);
+      if (idx < 0) idx = 0;
+    }
+    setHighlight(idx);
     const onDoc = (e) => {
       if (
         popoverRef.current && !popoverRef.current.contains(e.target) &&
@@ -74,14 +92,14 @@ export default function Listbox({
       setOpen(false);
     } else if (e.key === "ArrowDown") {
       e.preventDefault();
-      setHighlight((h) => (h + 1) % options.length);
+      setHighlight((h) => _nextEnabled(h, 1));
     } else if (e.key === "ArrowUp") {
       e.preventDefault();
-      setHighlight((h) => (h - 1 + options.length) % options.length);
+      setHighlight((h) => _nextEnabled(h, -1));
     } else if (e.key === "Enter") {
       e.preventDefault();
       const opt = options[highlight];
-      if (opt) {
+      if (opt && !opt.disabled) {
         onChange(opt.code);
         setOpen(false);
       }
@@ -130,29 +148,39 @@ export default function Listbox({
           {options.map((opt, idx) => {
             const active = opt.code === value;
             const highlighted = idx === highlight;
+            const optDisabled = !!opt.disabled;
             return (
               <button
                 key={opt.code || `opt-${idx}`}
                 type="button"
                 role="option"
                 aria-selected={active}
-                onMouseEnter={() => setHighlight(idx)}
+                aria-disabled={optDisabled}
+                disabled={optDisabled}
+                onMouseEnter={() => !optDisabled && setHighlight(idx)}
                 onClick={() => {
+                  if (optDisabled) return;
                   onChange(opt.code);
                   setOpen(false);
                 }}
                 className={`w-full flex items-center gap-2 px-3 py-2 text-[12px] text-left
                   transition-colors
-                  ${highlighted ? "bg-white/[0.06]" : ""}
-                  ${active ? "text-white" : "text-gray-200 hover:text-white"}
+                  ${highlighted && !optDisabled ? "bg-white/[0.06]" : ""}
+                  ${optDisabled
+                    ? "text-gray-600 cursor-not-allowed italic"
+                    : active
+                      ? "text-white"
+                      : "text-gray-200 hover:text-white"
+                  }
                 `}
                 style={{
                   fontFamily: opt.css || undefined,
                   fontWeight: opt.weight || undefined,
                 }}
+                title={opt.hint || undefined}
               >
                 <span className="flex-1 truncate">{opt.label}</span>
-                {active && (
+                {active && !optDisabled && (
                   <svg
                     className="w-3.5 h-3.5 text-brand shrink-0"
                     fill="none" stroke="currentColor" strokeWidth="2.5" viewBox="0 0 24 24"

@@ -29,17 +29,25 @@ const MAX_FILE_MB = 100;
 // with backend _AUDIO_EXTENSIONS.
 const ACCEPTED_EXTS = [".mp3", ".wav"];
 
+// Listbox-shape options (code/label) for the UMG ProRes triplet. The
+// underlying values stay the same as before — `code` strings get parsed
+// at submit time. Frame sizes are uppercase keys (HD, UHD-4K, …),
+// FPS values are numeric strings, ProRes profile codes are integers
+// stringified.
 const UMG_FRAME_SIZES = [
-  { key: "HD",     label: "HD 1920×1080 (16:9)" },
-  { key: "UHD-4K", label: "UHD 4K 3840×2160 (16:9)" },
-  { key: "DCI-2K", label: "DCI 2K 2048×1080 (256:135)" },
-  { key: "DCI-4K", label: "DCI 4K 4096×2160 (256:135)" },
+  { code: "HD",     label: "HD 1920×1080 (16:9)" },
+  { code: "UHD-4K", label: "UHD 4K 3840×2160 (16:9)" },
+  { code: "DCI-2K", label: "DCI 2K 2048×1080 (256:135)" },
+  { code: "DCI-4K", label: "DCI 4K 4096×2160 (256:135)" },
 ];
-const UMG_FPS = [23.976, 24, 25, 29.97, 30, 50, 59.94, 60];
+const UMG_FPS = [23.976, 24, 25, 29.97, 30, 50, 59.94, 60].map((f) => ({
+  code: String(f),
+  label: `${f} fps`,
+}));
 const UMG_PROFILES = [
-  { value: 3, label: "ProRes 422 HQ (recommended)" },
-  { value: 4, label: "ProRes 4444" },
-  { value: 5, label: "ProRes 4444 XQ" },
+  { code: "3", label: "ProRes 422 HQ (recommended)" },
+  { code: "4", label: "ProRes 4444" },
+  { code: "5", label: "ProRes 4444 XQ" },
 ];
 
 export default function UploadZone({
@@ -241,58 +249,57 @@ export default function UploadZone({
     onFiles((prev) => prev.filter((_, i) => i !== idx));
   };
 
-  return (
-    <div>
-      {/* Delivery profile selector — applied to every file in this batch.
-          ProRes paths exist in the backend but the multi-GB upload-to-R2
-          step is still being hardened, so we expose youtube as the only
-          selectable option for now and label the rest "próximamente". */}
-      <div className="glass rounded-2xl px-4 py-3 mb-3">
+  // Hoist sections into named variables so the JSX below can place them
+  // in either single-column (mobile / md) or 2-column (lg+) flow without
+  // duplication. The LEFT column owns the primary action (file drop +
+  // per-track rows). The RIGHT column owns batch-wide settings (delivery
+  // profile, movement-style gallery, background picker). On mobile they
+  // stack: LEFT first, then RIGHT.
+  const _deliveryBlock = (
+    <div className="glass rounded-2xl px-4 py-3">
         <div className="flex flex-wrap gap-2 items-center">
           <label className="text-xs text-gray-400 mr-1">{t("upload.delivery") || "Entrega:"}</label>
-          <select
+          <Listbox
             value={deliveryProfile}
-            onChange={(e) => setDeliveryProfile(e.target.value)}
-            className="px-3 py-1.5 rounded-lg bg-surface-1 border border-white/[0.06] focus:border-brand/50 focus:outline-none text-sm text-white"
-          >
-            <option value="youtube">MP4 H.264 1080p (YouTube / Instagram / TikTok)</option>
-            <option value="umg" disabled>ProRes 422 HQ master — próximamente</option>
-            <option value="both" disabled>MP4 + ProRes — próximamente</option>
-          </select>
+            onChange={(v) => setDeliveryProfile(v)}
+            options={[
+              { code: "youtube", label: "MP4 H.264 1080p (YouTube / Instagram / TikTok)" },
+              { code: "umg",  label: "ProRes 422 HQ master — próximamente", disabled: true },
+              { code: "both", label: "MP4 + ProRes — próximamente",         disabled: true },
+            ]}
+            className="w-72"
+            ariaLabel={t("upload.delivery") || "Entrega"}
+          />
           {deliveryProfile !== "youtube" && (
             <>
-              <select
+              <Listbox
                 value={umgFrameSize}
-                onChange={(e) => setUmgFrameSize(e.target.value)}
-                className="px-3 py-1.5 rounded-lg bg-surface-1 border border-white/[0.06] focus:border-brand/50 focus:outline-none text-sm text-white"
-              >
-                {UMG_FRAME_SIZES.map((f) => (
-                  <option key={f.key} value={f.key}>{f.label}</option>
-                ))}
-              </select>
-              <select
-                value={umgFps}
-                onChange={(e) => setUmgFps(parseFloat(e.target.value))}
-                className="px-3 py-1.5 rounded-lg bg-surface-1 border border-white/[0.06] focus:border-brand/50 focus:outline-none text-sm text-white"
-              >
-                {UMG_FPS.map((f) => (
-                  <option key={f} value={f}>{f} fps</option>
-                ))}
-              </select>
-              <select
-                value={umgProresProfile}
-                onChange={(e) => setUmgProresProfile(parseInt(e.target.value, 10))}
-                className="px-3 py-1.5 rounded-lg bg-surface-1 border border-white/[0.06] focus:border-brand/50 focus:outline-none text-sm text-white"
-              >
-                {UMG_PROFILES.map((p) => (
-                  <option key={p.value} value={p.value}>{p.label}</option>
-                ))}
-              </select>
+                onChange={(v) => setUmgFrameSize(v)}
+                options={UMG_FRAME_SIZES}
+                className="w-56"
+                ariaLabel="UMG frame size"
+              />
+              <Listbox
+                value={String(umgFps)}
+                onChange={(v) => setUmgFps(parseFloat(v))}
+                options={UMG_FPS}
+                className="w-32"
+                ariaLabel="UMG fps"
+              />
+              <Listbox
+                value={String(umgProresProfile)}
+                onChange={(v) => setUmgProresProfile(parseInt(v, 10))}
+                options={UMG_PROFILES}
+                className="w-56"
+                ariaLabel="ProRes profile"
+              />
             </>
           )}
         </div>
       </div>
+  );
 
+  const _dropZone = (
       <div
         onDragOver={(e) => { e.preventDefault(); setDragging(true); }}
         onDragLeave={() => setDragging(false)}
@@ -366,7 +373,10 @@ export default function UploadZone({
           </div>
         )}
       </div>
+  );
 
+  const _galleryBlock = (
+    <>
       {/* Movement-style reference gallery — educational, shown ONCE per
           batch above the file rows so the operator understands what each
           option produces before picking it on a per-track basis below.
@@ -427,7 +437,11 @@ export default function UploadZone({
           </div>
         );
       })()}
+    </>
+  );
 
+  const _filesBlock = (
+    <>
       {files.length > 0 && (
         <div className="mt-3 space-y-2 max-h-96 overflow-y-auto pr-1">
           {files.map((entry, i) => (
@@ -571,7 +585,11 @@ export default function UploadZone({
           ))}
         </div>
       )}
+    </>
+  );
 
+  const _bgBlock = (
+    <>
       {/* Background selector */}
       {files.length > 0 && (
         <div className="mt-4">
@@ -736,6 +754,28 @@ export default function UploadZone({
           )}
         </div>
       )}
+    </>
+  );
+
+  return (
+    <div>
+      <div className="lg:grid lg:grid-cols-5 lg:gap-4 lg:items-start">
+        {/* LEFT (lg) — primary action: file drop + per-track rows.
+            On mobile this stacks first, ABOVE the right column. */}
+        <div className="lg:col-span-3 space-y-3">
+          {_dropZone}
+          {_filesBlock}
+        </div>
+        {/* RIGHT (lg) — batch-wide settings: delivery profile, movement
+            gallery, background picker. On mobile, stacks AFTER the left
+            column. The mt-3 lg:mt-0 keeps spacing consistent across both
+            layouts (gap-4 only applies in grid mode). */}
+        <div className="lg:col-span-2 space-y-3 mt-3 lg:mt-0">
+          {_deliveryBlock}
+          {_galleryBlock}
+          {_bgBlock}
+        </div>
+      </div>
     </div>
   );
 }
