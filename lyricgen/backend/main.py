@@ -456,6 +456,33 @@ def _enforce_concurrent_jobs_cap(*_, **__) -> None:
     return None
 
 
+# Soft per-tenant cap on jobs that need attention (queued + processing +
+# pending_review). Forces operators to clear their existing backlog before
+# piling on more work — otherwise UMG-style users hit "submit 50 at once"
+# and wait hours for the tail to drain. 5 is sized so a 3-worker pool
+# can keep the tenant's queue moving while one or two jobs sit in review.
+TENANT_BACKLOG_LIMIT = int(os.environ.get("TENANT_BACKLOG_LIMIT", "5"))
+
+
+def _enforce_tenant_backlog(db: Session, current_user: dict) -> None:
+    tenant_id = current_user["tenant_id"]
+    in_flight = (
+        db.query(Job)
+        .filter(Job.tenant_id == tenant_id)
+        .filter(Job.status.in_(["queued", "processing", "pending_review"]))
+        .count()
+    )
+    if in_flight >= TENANT_BACKLOG_LIMIT:
+        raise HTTPException(
+            status_code=429,
+            detail=(
+                f"Tu equipo tiene {in_flight} videos en proceso o pendientes "
+                f"de revisión (límite: {TENANT_BACKLOG_LIMIT}). Aprobá o "
+                f"rechazá algunos antes de subir más."
+            ),
+        )
+
+
 def _enforce_daily_volume_cap(db: Session, current_user: dict) -> None:
     """Raise 429 if the tenant has hit its per-day video cap. UMG-readiness:
     prevents a runaway from creating $200 of Veo in an hour."""
@@ -547,6 +574,7 @@ async def upload(
 
     _enforce_plan_quota(db, current_user)
     _enforce_daily_volume_cap(db, current_user)
+    _enforce_tenant_backlog(db, current_user)
     # Every submission is accepted as queued; RQ gives it to a worker the
     # moment one is free, and pipeline.run_pipeline flips status to
     # "processing" on its first line. No 429 for capacity reasons.
@@ -710,6 +738,7 @@ async def generate_with_segments(
 
     _enforce_plan_quota(db, current_user)
     _enforce_daily_volume_cap(db, current_user)
+    _enforce_tenant_backlog(db, current_user)
     # Every submission is accepted as queued; RQ gives it to a worker the
     # moment one is free, and pipeline.run_pipeline flips status to
     # "processing" on its first line. No 429 for capacity reasons.
