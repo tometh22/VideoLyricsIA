@@ -53,8 +53,28 @@ def main():
     signal.signal(signal.SIGTERM, _graceful)
     signal.signal(signal.SIGINT, _graceful)
 
-    print(f"[WORKER] Listening on: enterprise, default")
-    worker.work(with_scheduler=False)
+    # moviepy 1.0.3 leaks memory between renders — VideoFileClip and friends
+    # are not fully released even when user code calls .close(). Long-lived
+    # workers degrade after ~10–15 jobs and end up hanging mid-encode at
+    # video/40%, requiring a manual restart.
+    #
+    # Standard production mitigation: cap the worker's lifetime at N jobs,
+    # then exit cleanly. Railway's restart policy spawns a replacement in
+    # ~30 s. RQ leaves un-claimed jobs in the queue, so nothing is lost —
+    # the next worker picks them up.
+    #
+    # WORKER_MAX_JOBS=10 (default) ≈ 100 min of healthy work between recycles.
+    # Lower (e.g. 5) for very long renders that burn more memory per job.
+    max_jobs_env = os.environ.get("WORKER_MAX_JOBS", "10").strip()
+    try:
+        max_jobs = int(max_jobs_env) if max_jobs_env else None
+        if max_jobs is not None and max_jobs <= 0:
+            max_jobs = None
+    except ValueError:
+        max_jobs = 10
+
+    print(f"[WORKER] Listening on: enterprise, default | max_jobs={max_jobs}")
+    worker.work(with_scheduler=False, max_jobs=max_jobs)
 
 
 if __name__ == "__main__":
