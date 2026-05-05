@@ -669,6 +669,8 @@ async def transcribe_endpoint(
     request: Request,
     file: UploadFile = File(...),
     language: str = Form(""),
+    artist: str = Form(""),
+    title: str = Form(""),
     current_user: dict = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
@@ -688,18 +690,25 @@ async def transcribe_endpoint(
         lang = language.strip() if language.strip() else None
         loop = asyncio.get_event_loop()
 
-        # Parse artist/title from the filename early so we can kick off the
-        # reference-lyrics fetch in parallel with Whisper. Whisper takes
-        # 15-30 s for a 3-minute MP3; Gemini-grounded search takes 5-10 s.
-        # Running them in parallel adds ~0 s to /transcribe latency.
+        # Resolve artist + title for the reference-lyrics fetch. Source order:
+        #   1) explicit form fields (frontend already collects `artist` per
+        #      file in UploadZone — we now forward it),
+        #   2) "Artist - Title" pattern in the filename (legacy fallback),
+        #   3) bare filename as title with no artist (Gemini-search will be
+        #      skipped — see the empty-artist guard inside the fetcher).
+        # Suffixes like "(Official Video)" are scrubbed in either case.
         basename = os.path.splitext(file.filename)[0]
-        artist_hint, song_hint = "", basename
-        if " - " in basename:
+        artist_hint = artist.strip()
+        song_hint = title.strip() or basename
+        if not artist_hint and " - " in basename:
             artist_hint, song_hint = basename.split(" - ", 1)
         for sfx in ["(Official Video)", "(Official Audio)", "(Lyric Video)",
                      "(Official Music Video)", "(En Vivo)", "(Live)", "(Lyrics)",
                      "- River Plate", "- Luna Park", "- En Vivo"]:
             song_hint = song_hint.replace(sfx, "").strip()
+        if not artist_hint:
+            print(f"[LYRICS] no artist supplied for {file.filename!r} — "
+                  f"Gemini fetch will be skipped, falling through to lyrics.ovh")
 
         # Kick off Gemini-grounded lyrics fetch in parallel with Whisper.
         # The fetcher is best-effort (returns None on any failure); we wrap

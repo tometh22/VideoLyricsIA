@@ -182,6 +182,15 @@ export default function App() {
     const formData = new FormData();
     formData.append("file", entry.file);
     if (entry.language) formData.append("language", entry.language);
+    // Forward the artist (and a derived title) so the backend's reference-
+    // lyrics fetcher (Gemini-grounded search) gets clean inputs even when
+    // the MP3 filename is something generic like "track.mp3".
+    if (entry.artist) formData.append("artist", entry.artist);
+    const _title = entry.file.name
+      .replace(/\.mp3$/i, "")
+      .replace(/^.*?\s-\s/, "")
+      .trim();
+    if (_title) formData.append("title", _title);
 
     try {
       const res = await authFetch(`${API}/transcribe`, { method: "POST", body: formData });
