@@ -225,8 +225,16 @@ export default function JobDetail({ job, onBack, onJobUpdate }) {
         body: JSON.stringify({ notes: reviewNotes }),
       });
       if (res.ok) {
-        const updated = await (await fetch(`${API}/status/${job.job_id}`, { headers: authHeaders() })).json();
-        onJobUpdate?.(updated);
+        // Refresh the job state for any listing in the parent so the row
+        // shows "rejected", then go back. Staying on the detail screen
+        // would show "this job is not previewable" because rejected jobs
+        // intentionally can't be re-opened — better UX is to land the
+        // user back on the dashboard / batch view.
+        try {
+          const updated = await (await fetch(`${API}/status/${job.job_id}`, { headers: authHeaders() })).json();
+          onJobUpdate?.(updated);
+        } catch {}
+        onBack?.();
       }
     } catch {}
     setApproving(false);

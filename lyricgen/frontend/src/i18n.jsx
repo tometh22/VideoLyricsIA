@@ -154,11 +154,13 @@ const translations = {
     "prov.response": "Respuesta",
 
     // Review & Approval
-    "review.title": "Revisar y Aprobar",
-    "review.description": "Revisa el contenido generado antes de habilitarlo para descarga y publicacion en YouTube.",
-    "review.notes_placeholder": "Notas (opcional)...",
+    "review.title": "Revisar y aprobar",
+    "review.description": "Revisá el contenido generado antes de habilitarlo para descarga y publicación.",
+    "review.notes_placeholder": "Notas (opcional)…",
     "review.approve": "Aprobar",
     "review.reject": "Rechazar",
+    "review.reject_free": "Rechazar es gratis — no consume tu cuota mensual. Solo los videos aprobados cuentan.",
+    "batch.pending_review_notice": "Algunos videos esperan tu aprobación antes de poder descargarlos. Hacé click en cada uno para revisarlo.",
     "detail.approved": "Aprobado",
     "detail.validation_issues": "Se detectaron problemas de contenido",
 
@@ -439,11 +441,13 @@ const translations = {
     "prov.data_sent": "Data Sent",
     "prov.response": "Response",
 
-    "review.title": "Review & Approve",
-    "review.description": "Review the generated content before making it available for download and YouTube upload.",
-    "review.notes_placeholder": "Notes (optional)...",
+    "review.title": "Review and approve",
+    "review.description": "Review the generated content before making it available for download.",
+    "review.notes_placeholder": "Notes (optional)…",
     "review.approve": "Approve",
     "review.reject": "Reject",
+    "review.reject_free": "Rejecting is free — does not consume your monthly quota. Only approved videos count.",
+    "batch.pending_review_notice": "Some videos are waiting for your approval before they can be downloaded. Click each one to review it.",
     "detail.approved": "Approved",
     "detail.validation_issues": "Content policy issues detected",
 
@@ -716,11 +720,13 @@ const translations = {
     "prov.data_sent": "Dados enviados",
     "prov.response": "Resposta",
 
-    "review.title": "Revisar e Aprovar",
-    "review.description": "Revise o conteudo gerado antes de disponibiliza-lo para download e publicacao no YouTube.",
-    "review.notes_placeholder": "Notas (opcional)...",
+    "review.title": "Revisar e aprovar",
+    "review.description": "Revise o conteúdo gerado antes de disponibilizá-lo para download.",
+    "review.notes_placeholder": "Notas (opcional)…",
     "review.approve": "Aprovar",
     "review.reject": "Rejeitar",
+    "review.reject_free": "Rejeitar é grátis — não consome sua cota mensal. Apenas vídeos aprovados contam.",
+    "batch.pending_review_notice": "Alguns vídeos estão aguardando aprovação antes de poderem ser baixados. Clique em cada um para revisá-lo.",
     "detail.approved": "Aprovado",
     "detail.validation_issues": "Problemas de conteudo detectados",
 

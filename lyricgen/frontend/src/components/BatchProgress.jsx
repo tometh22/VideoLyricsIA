@@ -117,9 +117,18 @@ function JobRow({ job, index, t }) {
 
 export default function BatchProgress({ jobs, onReset, onRetry }) {
   const { t } = useI18n();
+  // `done` includes pending_review for the BATCH PROGRESS view ("processing
+  // is finished, awaiting your review"). But `downloadable` only counts jobs
+  // that are actually approved — pending_review jobs are NOT downloadable
+  // until the operator clicks Approve. Mixing the two created a bug where
+  // the user could download a video from the batch screen before approving,
+  // bypassing the review gate entirely (Tomi spotted this on 2026-05-05).
   const done = jobs.filter((j) => j.status === "done" || j.status === "pending_review").length;
+  const downloadable = jobs.filter((j) => j.status === "done").length;
   const total = jobs.length;
   const allDone = done === total && !jobs.some((j) => j.status === "processing" || j.status === "queued");
+  const allApproved = downloadable === total && !jobs.some((j) => j.status === "processing" || j.status === "queued");
+  const hasPendingReview = jobs.some((j) => j.status === "pending_review");
   const hasErrors = jobs.some((j) => j.status === "error" || j.status === "validation_failed");
 
   const downloadAll = () => {
@@ -178,14 +187,25 @@ export default function BatchProgress({ jobs, onReset, onRetry }) {
         ))}
       </div>
 
+      {/* Pending-review banner — shown when batch finished processing but
+          some videos still need approval before download. */}
+      {allDone && hasPendingReview && (
+        <div className="mb-4 px-4 py-3 rounded-2xl bg-amber-500/5 border border-amber-500/20">
+          <p className="text-xs text-amber-300/90">
+            {t("batch.pending_review_notice") ||
+              "Algunos videos esperan tu aprobación antes de poder descargarlos. Hacé click en cada uno para revisarlo."}
+          </p>
+        </div>
+      )}
+
       {/* Actions */}
       <div className="flex gap-3 justify-center">
-        {allDone && (
+        {allApproved && downloadable > 0 && (
           <button onClick={downloadAll} className="btn-primary">
             <svg className="inline-block w-4 h-4 mr-2 -mt-0.5" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
               <path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4" /><polyline points="7 10 12 15 17 10" /><line x1="12" y1="15" x2="12" y2="3" />
             </svg>
-            {t("batch.download_all")} ({done * 3} archivos)
+            {t("batch.download_all")} ({downloadable * 3} archivos)
           </button>
         )}
         {(allDone || hasErrors) && (
