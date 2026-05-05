@@ -610,6 +610,8 @@ async def upload(
     genre: str = Form(""),
     font: str = Form(""),
     concept: str = Form(""),
+    movement_style: str = Form(""),
+    animate_image: str = Form(""),
     current_user: dict = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
@@ -704,6 +706,8 @@ async def upload(
         genre=genre,
         font=font,
         concept=concept,
+        movement_style=movement_style,
+        animate_image=str(animate_image).strip().lower() in ("true", "1", "yes", "on"),
     )
 
     return {"job_id": job_id, "status": initial_status}
@@ -975,6 +979,8 @@ async def generate_with_segments(
     genre: str = Form(""),
     font: str = Form(""),
     concept: str = Form(""),
+    movement_style: str = Form(""),
+    animate_image: str = Form(""),
     current_user: dict = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
@@ -1061,6 +1067,8 @@ async def generate_with_segments(
         genre=genre,
         font=font,
         concept=concept,
+        movement_style=movement_style,
+        animate_image=str(animate_image).strip().lower() in ("true", "1", "yes", "on"),
     )
 
     return {"job_id": job_id, "status": initial_status}

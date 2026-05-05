@@ -137,7 +137,9 @@ def run_pipeline(job_id: str, mp3_path: str, artist: str, style: str,
                  bg_r2_key: str | None = None,
                  genre: str = "",
                  font: str = "",
-                 concept: str = ""):
+                 concept: str = "",
+                 movement_style: str = "",
+                 animate_image: bool = False):
     """Run the full pipeline for a job. Called synchronously.
 
     delivery_profile:
@@ -200,7 +202,15 @@ def run_pipeline(job_id: str, mp3_path: str, artist: str, style: str,
 
         # Step 1.5 — Background (AI-generated or human-provided)
         update_job(job_id, current_step="background", progress=22)
-        if background_path:
+        # Decide if the operator's upload is a still image they want
+        # animated by Veo image-to-video (vs. used as-is via Ken Burns).
+        # Path requires: animate_image flag set + background_path is a
+        # JPG/PNG (NOT an MP4 — those are already video).
+        _is_still = (background_path and
+                     background_path.lower().endswith((".jpg", ".jpeg", ".png")))
+        _animate_user_image = bool(animate_image and _is_still)
+
+        if background_path and not _animate_user_image:
             # Human-provided background — skip AI generation (UMG Guideline 10)
             from provenance import record_ai_call
             recorder = record_ai_call(
@@ -228,11 +238,23 @@ def run_pipeline(job_id: str, mp3_path: str, artist: str, style: str,
             for _sfx in ["(Official Video)", "(Official Audio)", "(Lyric Video)",
                          "(Official Music Video)", "(En Vivo)", "(Live)", "(Lyrics)"]:
                 _song_title = _song_title.replace(_sfx, "").strip()
+            if _animate_user_image:
+                print(f"[BG] image-to-video: animating user-supplied "
+                      f"{os.path.basename(background_path)} via Veo")
             bg_image_path = _ensure_background(
                 style, job_dir,
                 lyrics_text=lyrics_text, artist=artist, job_id=job_id,
                 song_title=_song_title, genre=genre, concept=concept,
+                movement_style=movement_style,
+                image_to_video_path=(background_path if _animate_user_image else None),
             )
+            # Image-to-video fallback: if Veo failed to produce an MP4 (None
+            # or non-existent path) AND the operator wanted to animate their
+            # image, fall back to using the still image with Ken Burns.
+            if _animate_user_image and (not bg_image_path or not os.path.exists(bg_image_path)):
+                print(f"[BG] image-to-video failed, falling back to Ken Burns "
+                      f"on {background_path}")
+                bg_image_path = background_path
         update_job(job_id, progress=40)
 
         files = {}
@@ -1570,6 +1592,39 @@ _CONCEPT_SCENE_GUIDE = {
 }
 
 
+# Movement-style hints injected into the Gemini system prompt's Hard-Rules
+# section. UMG referenced 3 distinct registers in their meeting; we
+# surface 4 explicit options (plus Auto) so the operator can pick the
+# right "feel" per song. The genre + concept selectors decide WHAT the
+# scene is; this decides HOW it moves.
+_MOVEMENT_STYLE_RULES = {
+    "sutil":         "Movement: minimal and ambient — gentle sway, slow drift, breathing motion. Subjects barely move. Easy to loop seamlessly.",
+    "estandar":      "",  # no extra rule; the existing prompt template controls motion
+    "foto-parallax": "Aesthetic: photographic still with subtle parallax — composition feels like a single photo, motion is restricted to slow camera moves, depth-of-field shifts, and lighting passes. No moving subjects.",
+    "animado":       "Aesthetic: stylised 2D animated illustration — flat shapes, deliberate cartoon-like motion. NOT photorealistic.",
+}
+
+
+def _normalize_movement_style(s: str) -> str:
+    """Map free-text or UI selection to a key in _MOVEMENT_STYLE_RULES.
+    Returns "" for empty / unknown — caller treats that as Auto."""
+    if not s:
+        return ""
+    s = s.strip().lower()
+    aliases = {
+        "subtle": "sutil", "minimal": "sutil", "minimo": "sutil",
+        "standard": "estandar", "default": "estandar",
+        "photo": "foto-parallax", "parallax": "foto-parallax",
+        "foto+parallax": "foto-parallax", "foto_parallax": "foto-parallax",
+        "animated": "animado", "illustration": "animado", "cartoon": "animado",
+    }
+    if s in aliases:
+        return aliases[s]
+    if s in _MOVEMENT_STYLE_RULES:
+        return s
+    return ""
+
+
 def _normalize_concept(c: str) -> str:
     """Map free-text or UI selection to a key in _CONCEPT_SCENE_GUIDE."""
     if not c:
@@ -1602,7 +1657,8 @@ def _normalize_concept(c: str) -> str:
 
 def _analyze_lyrics_for_background(lyrics_text: str, artist: str, job_id: str = None,
                                     song_title: str = "", genre: str = "",
-                                    concept: str = "") -> dict:
+                                    concept: str = "",
+                                    movement_style: str = "") -> dict:
     """Use Gemini to analyze lyrics and choose visual style + prompt.
 
     Returns dict with:
@@ -1616,6 +1672,9 @@ def _analyze_lyrics_for_background(lyrics_text: str, artist: str, job_id: str = 
 
     normalized_genre = _normalize_genre(genre)
     normalized_concept = _normalize_concept(concept)
+    normalized_movement = _normalize_movement_style(movement_style)
+    movement_rule = _MOVEMENT_STYLE_RULES.get(normalized_movement, "")
+    movement_extra_line = f"\n- {movement_rule}" if movement_rule else ""
 
     if normalized_concept:
         # Operator picked an explicit visual concept — that hard-overrides
@@ -1639,7 +1698,7 @@ Hard rules:
 - "prompt" is 20-40 words: scene + camera movement + colors + lighting + atmosphere
 - Pick a DIFFERENT specific scene each time (don't repeat across songs)
 - The concept choice is binding — do NOT drift to a different visual category
-- Never include people, faces, hands, or readable text in the scene"""
+- Never include people, faces, hands, or readable text in the scene{movement_extra_line}"""
     elif normalized_genre:
         # User-supplied genre: lock Gemini to that genre's visual vocabulary
         # and forbid the lazy "ocean sunset" default. This is the high-
@@ -1659,7 +1718,7 @@ Hard rules:
 - "prompt" is 20-40 words: scene + camera movement + colors + lighting + atmosphere
 - Pick a DIFFERENT specific scene each time (don't repeat across songs)
 - Do NOT default to "calm ocean at sunset" unless this song is BALLAD
-- Never include people, faces, hands, or readable text in the scene"""
+- Never include people, faces, hands, or readable text in the scene{movement_extra_line}"""
     else:
         # No genre hint: ask Gemini to classify first, then pick.
         # "Auto" mode for users who don't want to choose.
@@ -1688,6 +1747,8 @@ Hard rules:
 - Pick a DIFFERENT specific scene each time (don't repeat across songs)
 - Do NOT default to "calm ocean at sunset" unless the song is genuinely BALLAD
 - Never include people, faces, hands, or readable text in the scene"""
+        if movement_rule:
+            system_prompt = system_prompt + "\n- " + movement_rule
 
     lyrics_sample = lyrics_text[:600] if lyrics_text else ""
     # Data minimization (UMG Guideline 14): optionally anonymize artist name
@@ -1757,7 +1818,8 @@ Hard rules:
 
 
 def _get_unique_prompt(lyrics_text: str = None, artist: str = "", job_id: str = None,
-                       song_title: str = "", genre: str = "", concept: str = "") -> dict:
+                       song_title: str = "", genre: str = "", concept: str = "",
+                       movement_style: str = "") -> dict:
     """Get a unique style+prompt combination. Returns {style, prompt}.
 
     Note: the local _USED_PROMPTS_FILE only sees this worker's previous
@@ -1778,7 +1840,7 @@ def _get_unique_prompt(lyrics_text: str = None, artist: str = "", job_id: str = 
     if lyrics_text or song_title:
         result = _analyze_lyrics_for_background(
             lyrics_text or "", artist, job_id=job_id, song_title=song_title,
-            genre=genre, concept=concept,
+            genre=genre, concept=concept, movement_style=movement_style,
         )
         if result["prompt"] and result["prompt"] not in used:
             used.append(result["prompt"])
@@ -1851,7 +1913,9 @@ def _veo_cache_key(prompt: str, model: str, params: dict) -> str:
 
 
 def _generate_veo_video(prompt: str, output_path: str, job_id: str = None,
-                        cache_namespace: str = "") -> str:
+                        cache_namespace: str = "",
+                        image_path: str | None = None,
+                        movement_style: str = "") -> str:
     """Generate a video clip with Google Veo 3 via direct Vertex AI REST API.
 
     We bypass google-genai SDK for Veo specifically because its internal auth
@@ -1863,6 +1927,16 @@ def _generate_veo_video(prompt: str, output_path: str, job_id: str = None,
     Endpoint: predictLongRunning -> poll operation -> download mp4.
     Rate-limit aware (5 attempts with exponential backoff).
     R2-cached by prompt hash so identical retries do not bill twice.
+
+    `image_path`: optional path to a JPG/PNG. When provided, the request is
+    sent in image-to-video mode (Veo 3.1 supports a base64-encoded `image`
+    field on `instances[0]`). The user's image is animated according to the
+    prompt while preserving its identity. Defaults to None (text-to-video).
+
+    `movement_style`: when set to "animado", the safe-prompt suffix drops
+    the "no CGI / no animation" clauses so they don't contradict the
+    cartoon-illustration aesthetic. All other safety clauses (no people,
+    no text, etc.) stay in place.
     """
     from provenance import record_ai_call
     import storage as _storage
@@ -1870,13 +1944,27 @@ def _generate_veo_video(prompt: str, output_path: str, job_id: str = None,
     import requests as _req
     global _last_veo_request
 
-    safe_prompt = (
-        f"{prompt}. Photorealistic, filmed with cinema camera, real footage. "
-        "No text, no words, no letters, no signs, no billboards, no posters, "
-        "no banners, no graffiti, no shop windows, no street signs, no neon "
-        "signs, no logos, no trademarks, no brand symbols, no people, "
-        "no faces, no hands, no CGI, no animation."
-    )
+    if movement_style == "animado":
+        # Cartoon / 2D illustration aesthetic — keep all safety clauses
+        # except the "no CGI / no animation" pair, which would directly
+        # contradict the requested look. Other prohibitions (no text, no
+        # people, no logos, etc.) stay in place.
+        safe_prompt = (
+            f"{prompt}. Stylised 2D animated illustration, flat shapes, "
+            "deliberate cartoon-like motion. "
+            "No text, no words, no letters, no signs, no billboards, no posters, "
+            "no banners, no graffiti, no shop windows, no street signs, no neon "
+            "signs, no logos, no trademarks, no brand symbols, no people, "
+            "no faces, no hands."
+        )
+    else:
+        safe_prompt = (
+            f"{prompt}. Photorealistic, filmed with cinema camera, real footage. "
+            "No text, no words, no letters, no signs, no billboards, no posters, "
+            "no banners, no graffiti, no shop windows, no street signs, no neon "
+            "signs, no logos, no trademarks, no brand symbols, no people, "
+            "no faces, no hands, no CGI, no animation."
+        )
 
     # veo-3.1-fast at $0.10/s (no audio) is 75% cheaper than the standard
     # veo-3.1-generate at $0.40/s. Visual quality is slightly softer; we
@@ -1941,8 +2029,31 @@ def _generate_veo_video(prompt: str, output_path: str, job_id: str = None,
         f"/publishers/google/models/{model}"
     )
     submit_url = f"{base_url}:predictLongRunning"
+
+    # Build the instance dict. When the operator supplied an image AND
+    # marked "animar con AI", attach it as base64 — Veo 3.1 then animates
+    # the image while honoring the prompt instead of generating from
+    # scratch. Worker logs this so we can monitor success rate.
+    instance: dict = {"prompt": safe_prompt}
+    if image_path and os.path.isfile(image_path):
+        try:
+            import base64 as _b64
+            with open(image_path, "rb") as _img:
+                img_bytes = _img.read()
+            ext = os.path.splitext(image_path)[1].lower()
+            mime = "image/png" if ext == ".png" else "image/jpeg"
+            instance["image"] = {
+                "bytesBase64Encoded": _b64.b64encode(img_bytes).decode("ascii"),
+                "mimeType": mime,
+            }
+            print(f"[BG] image-to-video Veo call with user image "
+                  f"({len(img_bytes)} bytes, {mime})")
+        except OSError as e:
+            print(f"[BG] failed to read image_path {image_path}: {e}; "
+                  f"falling back to text-to-video")
+
     request_body = {
-        "instances": [{"prompt": safe_prompt}],
+        "instances": [instance],
         "parameters": veo_params,
     }
 
@@ -2177,7 +2288,9 @@ def _generate_imagen_image(prompt: str, output_path: str, max_retries: int = 5, 
 def _ensure_background(style_hint: str, job_dir: str, lyrics_text: str = None,
                        artist: str = "", job_id: str = None,
                        song_title: str = "", genre: str = "",
-                       concept: str = "") -> str:
+                       concept: str = "",
+                       movement_style: str = "",
+                       image_to_video_path: str | None = None) -> str:
     """Generate background using AI. Gemini picks the best style for the song.
 
     Returns path to .mp4 (video style) or .jpg/.png (photo/illustration style).
@@ -2193,7 +2306,7 @@ def _ensure_background(style_hint: str, job_dir: str, lyrics_text: str = None,
     # Generate video background with Veo 3 (always video, no images)
     result = _get_unique_prompt(
         lyrics_text, artist, job_id=job_id, song_title=song_title, genre=genre,
-        concept=concept,
+        concept=concept, movement_style=movement_style,
     )
     prompt = result["prompt"]
 
@@ -2204,6 +2317,7 @@ def _ensure_background(style_hint: str, job_dir: str, lyrics_text: str = None,
             _generate_veo_video(
                 prompt, bg_path, job_id=job_id,
                 cache_namespace=f"{artist}|{song_title}",
+                image_path=image_to_video_path,
             )
             return bg_path
         except Exception as e:

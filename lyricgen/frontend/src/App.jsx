@@ -60,6 +60,7 @@ export default function App() {
   const [history, setHistory] = useState([]);
   const [selectedJob, setSelectedJob] = useState(null);
   const [backgroundFile, setBackgroundFile] = useState(null);
+  const [animateImage, setAnimateImage] = useState(false);
   const [backgroundId, setBackgroundId] = useState(null);
   const [sidebarOpen, setSidebarOpen] = useState(true);
   const [resetToken, setResetToken] = useState(null);
@@ -165,7 +166,7 @@ export default function App() {
     const jobList = files.map((f) => ({
       filename: f.file.name, _file: f.file, artist: f.artist.trim(),
       language: f.language, genre: f.genre || "", font: f.font || "",
-      concept: f.concept || "",
+      concept: f.concept || "", movementStyle: f.movementStyle || "",
       status: "queued", current_step: null,
       progress: 0, job_id: null, error: null,
     }));
@@ -203,7 +204,7 @@ export default function App() {
       setCurrentReview({
         file: entry.file, artist: entry.artist, language: entry.language,
         genre: entry.genre || "", font: entry.font || "",
-        concept: entry.concept || "",
+        concept: entry.concept || "", movementStyle: entry.movementStyle || "",
         segments: data.segments, referenceLyrics: data.reference_lyrics || "",
         queueIdx: idx, queue,
       });
@@ -218,6 +219,7 @@ export default function App() {
     const newApproved = [...approvedJobs, {
       file: r.file, artist: r.artist, language: r.language,
       genre: r.genre || "", font: r.font || "", concept: r.concept || "",
+      movementStyle: r.movementStyle || "",
       segments: editedSegments,
     }];
     setApprovedJobs(newApproved);
@@ -237,7 +239,7 @@ export default function App() {
     const jobList = approved.map((a) => ({
       filename: a.file.name, _file: a.file, artist: a.artist,
       language: a.language, genre: a.genre || "", font: a.font || "",
-      concept: a.concept || "",
+      concept: a.concept || "", movementStyle: a.movementStyle || "",
       segments: a.segments,
       status: "queued", current_step: null, progress: 0, job_id: null, error: null,
     }));
@@ -261,6 +263,8 @@ export default function App() {
         if (jobList[i].genre) formData.append("genre", jobList[i].genre);
         if (jobList[i].font) formData.append("font", jobList[i].font);
         if (jobList[i].concept) formData.append("concept", jobList[i].concept);
+        if (jobList[i].movementStyle) formData.append("movement_style", jobList[i].movementStyle);
+        if (animateImage && backgroundFile) formData.append("animate_image", "true");
         formData.append("segments_json", JSON.stringify(jobList[i].segments));
         formData.append("delivery_profile", delivery.delivery_profile);
         if (delivery.delivery_profile !== "youtube") {
@@ -315,6 +319,8 @@ export default function App() {
         if (jobList[i].genre) formData.append("genre", jobList[i].genre);
         if (jobList[i].font) formData.append("font", jobList[i].font);
         if (jobList[i].concept) formData.append("concept", jobList[i].concept);
+        if (jobList[i].movementStyle) formData.append("movement_style", jobList[i].movementStyle);
+        if (animateImage && backgroundFile) formData.append("animate_image", "true");
         if (backgroundId) formData.append("background_id", backgroundId);
         else if (backgroundFile) formData.append("background_file", backgroundFile);
 
@@ -525,6 +531,8 @@ export default function App() {
                   onBackgroundFile={setBackgroundFile}
                   backgroundId={backgroundId}
                   onBackgroundId={setBackgroundId}
+                  animateImage={animateImage}
+                  onAnimateImage={setAnimateImage}
                 />
 
                 {allHaveArtist && (
