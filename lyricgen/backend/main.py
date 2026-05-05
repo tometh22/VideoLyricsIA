@@ -686,7 +686,11 @@ async def transcribe_endpoint(
         loop = asyncio.get_event_loop()
         segments = await loop.run_in_executor(None, transcribe, tmp_path, lang)
 
-        # Fetch reference lyrics
+        # Fetch reference lyrics: try cache + Genius (broad catalogue)
+        # first, fall back to lyrics.ovh as a safety net for songs Genius
+        # may not index. The suggestion engine in LyricsEditor only fires
+        # when a non-empty reference is returned, so wider coverage here
+        # = more correction suggestions visible to the user.
         import requests as _req
         basename = os.path.splitext(file.filename)[0]
         artist_hint, song_hint = "", basename
@@ -699,11 +703,20 @@ async def transcribe_endpoint(
 
         reference = ""
         try:
-            res = _req.get(f"https://api.lyrics.ovh/v1/{artist_hint}/{song_hint}", timeout=10)
-            if res.status_code == 200:
-                reference = res.json().get("lyrics", "").strip()
-        except Exception:
-            pass
+            from pipeline import _fetch_lyrics_from_sources
+            results = _fetch_lyrics_from_sources(artist_hint, song_hint)
+            if results:
+                reference = max(results, key=len).strip()
+        except Exception as e:
+            print(f"[LYRICS] cache/Genius fetcher failed: {e}")
+
+        if not reference:
+            try:
+                res = _req.get(f"https://api.lyrics.ovh/v1/{artist_hint}/{song_hint}", timeout=10)
+                if res.status_code == 200:
+                    reference = res.json().get("lyrics", "").strip()
+            except Exception:
+                pass
 
         return {"segments": segments, "reference_lyrics": reference}
     finally:
