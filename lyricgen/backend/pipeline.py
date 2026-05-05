@@ -2293,22 +2293,54 @@ def generate_lyric_video(
     # Build text clips — each segment gets its own shadow + text
     text_layers = []
 
-    # Show artist + song title during instrumental intro
+    # Title overlay strategy:
+    # - If there's a meaningful instrumental intro (>= 3 s), show the title
+    #   BIG and centered during the intro (the cinematic "drop" feel).
+    # - ALWAYS also show a small top-of-screen stamp for the first 6 s
+    #   regardless of intro length, so songs that start with vocals
+    #   immediately still surface artist + title to the viewer. UMG flagged
+    #   this — branding the cut with the artist is mandatory for them.
     first_lyric_start = segments[0]["start"] if segments else duration
+    raw_name = os.path.splitext(os.path.basename(mp3_path))[0]
+    title_song = raw_name
+    if " - " in raw_name:
+        title_song = raw_name.split(" - ", 1)[1]
+    for sfx in ["(Official Video)", "(Official Audio)", "(Lyric Video)",
+                 "(Official Music Video)", "(Audio)", "(Video)", "(En Vivo)",
+                 "(Live)", "(Lyrics)"]:
+        title_song = title_song.replace(sfx, "").strip()
+
     if first_lyric_start > 3 and artist:
-        raw_name = os.path.splitext(os.path.basename(mp3_path))[0]
-        title_song = raw_name
-        if " - " in raw_name:
-            title_song = raw_name.split(" - ", 1)[1]
-        for sfx in ["(Official Video)", "(Official Audio)", "(Lyric Video)",
-                     "(Official Music Video)", "(Audio)", "(Video)", "(En Vivo)",
-                     "(Live)", "(Lyrics)"]:
-            title_song = title_song.replace(sfx, "").strip()
         title_end = first_lyric_start - 0.5
         title_layers = _make_text_clip(
             f"{artist}\n{title_song}", 0.5, title_end, font, spec=spec
         )
         text_layers.extend(title_layers)
+
+    # Top-of-screen stamp — small, semi-transparent, never overlaps the
+    # main lyric line in the center.
+    if artist:
+        try:
+            stamp_text = f"{artist.upper()}  •  {title_song}"
+            stamp_size = max(24, int(round(36 * spec.text_scale)))
+            stamp = TextClip(
+                stamp_text,
+                fontsize=stamp_size,
+                font=font,
+                color="white",
+                stroke_color="black",
+                stroke_width=max(1, int(round(1.2 * spec.text_scale))),
+                method="label",
+            ).set_opacity(0.85)
+            sw = stamp.size[0]
+            stamp_x = (spec.width - sw) // 2
+            stamp_y = max(20, int(round(40 * spec.text_scale)))
+            stamp = (stamp.set_position((stamp_x, stamp_y))
+                          .set_start(0.3)
+                          .set_end(min(6.0, duration - 0.1)))
+            text_layers.append(stamp)
+        except Exception as e:
+            print(f"[TITLE] top-stamp render failed ({e}); continuing without it")
 
     for seg in segments:
         layers = _make_text_clip(seg["text"], seg["start"], seg["end"], font, spec=spec)
@@ -2445,19 +2477,25 @@ def _find_chorus_start(segments: list[dict], window_sec: int = 30) -> float:
 
 
 def _make_short_text_clip(text: str, seg_start: float, seg_end: float, font: str = "Arial"):
-    """Create text clips sized for vertical 1080x1920 short."""
+    """Create text clips sized for vertical 1080x1920 short.
+
+    Sizes are tuned for TikTok / Reels / Shorts viewing on mobile — the
+    previous defaults (40 / 50 / 65) read too small on phones held at arm's
+    length. Bumped to 75 / 95 / 115 which fills more of the vertical
+    real-estate and matches what creators on those platforms actually use.
+    """
     display_text = text.upper()
 
     text_len = len(display_text)
     if text_len > 60:
-        fontsize = 40
-        text_width = 950
+        fontsize = 75
+        text_width = 1000
     elif text_len > 35:
-        fontsize = 50
-        text_width = 900
+        fontsize = 95
+        text_width = 980
     else:
-        fontsize = 65
-        text_width = 850
+        fontsize = 115
+        text_width = 950
 
     shadow = TextClip(
         display_text,
@@ -2617,12 +2655,31 @@ def generate_thumbnail(
     thumb_font = os.path.join(_FONTS_DIR, "Montserrat-ExtraBold.ttf")
     if not os.path.exists(thumb_font) and _FONT_POOL:
         thumb_font = _FONT_POOL[0]
-    try:
-        font_artist = ImageFont.truetype(thumb_font, 100)
-        font_song = ImageFont.truetype(thumb_font, 55)
-    except (OSError, IOError):
-        font_artist = ImageFont.load_default()
-        font_song = ImageFont.load_default()
+
+    # Auto-shrink font until the text fits within max_width with a 60px
+    # margin on each side. Without this, long artist names ("El Plan de la
+    # Mariposa") or songs with explanatory subtitles overflow 1280px and
+    # get cropped by the thumbnail frame.
+    def _fit_font(text: str, start_size: int, max_width: int, min_size: int = 28):
+        size = start_size
+        while size > min_size:
+            try:
+                f = ImageFont.truetype(thumb_font, size)
+            except (OSError, IOError):
+                return ImageFont.load_default()
+            bbox = draw.textbbox((0, 0), text, font=f)
+            tw = bbox[2] - bbox[0]
+            if tw <= max_width:
+                return f
+            size -= 4
+        try:
+            return ImageFont.truetype(thumb_font, min_size)
+        except (OSError, IOError):
+            return ImageFont.load_default()
+
+    max_w = 1280 - 120  # 60px margin each side
+    font_artist = _fit_font(artist.upper(), 100, max_w)
+    font_song = _fit_font(song_name, 55, max_w)
 
     # Artist name centered
     bbox = draw.textbbox((0, 0), artist.upper(), font=font_artist)
