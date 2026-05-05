@@ -482,3 +482,17 @@ def test_audio_duration_returns_float_or_none():
     from pipeline import _audio_duration
     # Non-existent file → graceful None
     assert _audio_duration("/tmp/does_not_exist_xyz.mp3") is None
+
+
+def test_slice_audio_prefix_returns_false_on_missing_input(tmp_path):
+    """Helper must never raise; returns False when ffmpeg can't read input."""
+    from pipeline import _slice_audio_prefix
+    out = str(tmp_path / "out.mp3")
+    assert _slice_audio_prefix("/tmp/does_not_exist_xyz.mp3", out, 5.0) is False
+
+
+def test_slice_audio_prefix_rejects_zero_or_negative_seconds(tmp_path):
+    from pipeline import _slice_audio_prefix
+    out = str(tmp_path / "out.mp3")
+    assert _slice_audio_prefix("/tmp/anything.mp3", out, 0) is False
+    assert _slice_audio_prefix("/tmp/anything.mp3", out, -3.0) is False

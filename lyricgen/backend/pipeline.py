@@ -825,6 +825,37 @@ def _audio_duration(mp3_path: str) -> float | None:
         return None
 
 
+def _slice_audio_prefix(input_path: str, output_path: str, seconds: float) -> bool:
+    """Slice the first ``seconds`` of an MP3 into ``output_path`` using ffmpeg.
+
+    Used when the user uploads a song version with extra audio at the start
+    (a dialogue intro on an "Official Video" cut, e.g.) — we slice that
+    intro chunk and feed it to Whisper separately so the operator gets a
+    transcription of the dialogue too. The song proper is timestamped from
+    lrclib's synced lyrics with an offset.
+
+    Uses ``-acodec copy`` so there is no re-encode — just a stream copy of
+    the audio bytes through the cut point. Fast (< 1 s for typical sizes).
+
+    Returns True on success, False on any failure. Best-effort: caller
+    treats False as "no intro transcription available" and continues.
+    """
+    if seconds <= 0:
+        return False
+    import subprocess as _sp
+    try:
+        _sp.run(
+            ["ffmpeg", "-y", "-i", input_path,
+             "-t", str(seconds), "-acodec", "copy",
+             "-loglevel", "error", output_path],
+            check=True, timeout=30,
+        )
+        return os.path.exists(output_path) and os.path.getsize(output_path) > 0
+    except (_sp.CalledProcessError, _sp.TimeoutExpired, FileNotFoundError, OSError) as e:
+        print(f"[LYRICS] _slice_audio_prefix failed: {e}")
+        return False
+
+
 def _fetch_lyrics_via_gemini_search(
     artist: str, song: str,
     job_id: str | None = None,

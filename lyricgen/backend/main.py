@@ -728,7 +728,10 @@ async def transcribe_endpoint(
         #   diff > 60 s          → fall back to plain + Whisper (live /
         #                          extended / remix versions are too risky
         #                          to auto-align)
-        from pipeline import _fetch_lrclib, _lrc_to_segments, _audio_duration
+        from pipeline import (
+            _fetch_lrclib, _lrc_to_segments, _audio_duration,
+            _slice_audio_prefix,
+        )
         lrc = await asyncio.to_thread(_fetch_lrclib, artist_hint, song_hint)
         if lrc:
             synced = lrc.get("synced")
@@ -738,15 +741,41 @@ async def transcribe_endpoint(
                 user_dur = await asyncio.to_thread(_audio_duration, tmp_path)
                 offset = 0.0
                 use_synced = True
+                hybrid_intro_segs: list[dict] = []
                 if user_dur is not None and lrc_dur:
                     diff = user_dur - lrc_dur
                     if abs(diff) <= 3.0:
                         offset = 0.0
                     elif 3.0 < diff <= 60.0:
                         offset = float(diff)
+                        # User has extra audio at the start (typical "Official
+                        # Video" cut with a dialogue intro). Slice that chunk
+                        # and run Whisper on it so the operator gets the
+                        # spoken dialogue subtitled too — they can prune in
+                        # the editor if they don't want to publish it.
+                        intro_path = os.path.join(tmp_dir, "intro.mp3")
+                        if _slice_audio_prefix(tmp_path, intro_path, diff + 1.0):
+                            try:
+                                wsegs = await loop.run_in_executor(
+                                    None, transcribe, intro_path, lang,
+                                )
+                                # Keep only segments that fully sit in the
+                                # intro window — defensive, in case ffmpeg
+                                # cut on a frame boundary slightly past `diff`.
+                                hybrid_intro_segs = [
+                                    s for s in wsegs if s["end"] <= diff + 0.5
+                                ]
+                            except Exception as e:
+                                print(f"[LYRICS] intro Whisper failed: {e}")
+                            finally:
+                                try:
+                                    os.unlink(intro_path)
+                                except OSError:
+                                    pass
                         print(f"[LYRICS] lrclib duration mismatch "
                               f"(user={user_dur:.1f}s, lrclib={lrc_dur:.1f}s) "
-                              f"— applying +{offset:.2f}s offset (intro added)")
+                              f"— +{offset:.2f}s offset on song; intro Whisper "
+                              f"produced {len(hybrid_intro_segs)} segments")
                     else:
                         use_synced = False
                         print(f"[LYRICS] lrclib duration mismatch "
@@ -754,12 +783,18 @@ async def transcribe_endpoint(
                               f"diff={diff:+.1f}s) — too risky to auto-align, "
                               f"falling back to Whisper")
                 if use_synced:
-                    segs = _lrc_to_segments(synced, lrc_dur, time_offset=offset)
-                    if segs and len(segs) >= 8:
-                        print(f"[LYRICS] lrclib synced hit — {len(segs)} segments, "
-                              f"skipping Whisper for {artist_hint!r} - {song_hint!r}")
+                    song_segs = _lrc_to_segments(
+                        synced, lrc_dur, time_offset=offset,
+                    )
+                    if song_segs and len(song_segs) >= 8:
+                        combined = hybrid_intro_segs + song_segs
+                        print(f"[LYRICS] lrclib synced hit — "
+                              f"{len(combined)} segments "
+                              f"({len(hybrid_intro_segs)} intro + "
+                              f"{len(song_segs)} song), skipping main Whisper "
+                              f"for {artist_hint!r} - {song_hint!r}")
                         return {
-                            "segments": segs,
+                            "segments": combined,
                             "reference_lyrics": plain or synced,
                         }
             # No synced (or too few segments / unreliable timestamps) — but
