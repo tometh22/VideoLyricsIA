@@ -135,7 +135,8 @@ def run_pipeline(job_id: str, mp3_path: str, artist: str, style: str,
                  background_path: str = None,
                  input_r2_key: str | None = None,
                  bg_r2_key: str | None = None,
-                 genre: str = ""):
+                 genre: str = "",
+                 font: str = ""):
     """Run the full pipeline for a job. Called synchronously.
 
     delivery_profile:
@@ -234,14 +235,20 @@ def run_pipeline(job_id: str, mp3_path: str, artist: str, style: str,
         update_job(job_id, progress=40)
 
         files = {}
-        chosen_font = None
+        # When the operator picked an explicit font id, resolve it to a
+        # path now and seed `chosen_font`. generate_lyric_video reuses a
+        # truthy `font` argument as-is and only random-picks when None.
+        chosen_font = _resolve_font(font)
+        if chosen_font:
+            print(f"[FONT] Operator-selected: {os.path.basename(chosen_font)}")
         bg_source = bg_image_path
 
         # Step 2 — YouTube lyric video (H.264 / MP4 / 1080p / 24fps)
         if wants_youtube:
             update_job(job_id, current_step="video", progress=40)
             _, chosen_font, bg_source = generate_lyric_video(
-                mp3_path, segments, style, job_dir, artist, bg_image_path
+                mp3_path, segments, style, job_dir, artist, bg_image_path,
+                font=chosen_font,
             )
             files["video_url"] = f"/download/{job_id}/video"
             update_job(job_id, progress=55)
@@ -2405,6 +2412,39 @@ _FONT_POOL = [
     for f in _LYRIC_FONTS
     if os.path.isfile(os.path.join(_FONTS_DIR, f))
 ] if os.path.isdir(_FONTS_DIR) else []
+
+
+# Public-facing font catalogue. The frontend picker mirrors this list and
+# renders previews in the browser via the Google Fonts CDN — every entry's
+# `google_family` + `google_weight` matches the local TTF in `filename`,
+# so what the operator sees in the dropdown is what the worker renders.
+# UMG asked for explicit per-track typography control (the random pick was
+# making every video look the same).
+_FONT_CATALOGUE = [
+    {"id": "montserrat-bold",  "filename": "Montserrat-Bold.ttf",      "label": "Montserrat",       "google_family": "Montserrat",  "google_weight": 700},
+    {"id": "montserrat-extra", "filename": "Montserrat-ExtraBold.ttf", "label": "Montserrat Extra", "google_family": "Montserrat",  "google_weight": 800},
+    {"id": "poppins-bold",     "filename": "Poppins-Bold.ttf",         "label": "Poppins",          "google_family": "Poppins",     "google_weight": 700},
+    {"id": "outfit-bold",      "filename": "Outfit-Bold.ttf",          "label": "Outfit",           "google_family": "Outfit",      "google_weight": 700},
+    {"id": "roboto-bold",      "filename": "Roboto-Bold.ttf",          "label": "Roboto",           "google_family": "Roboto",      "google_weight": 700},
+    {"id": "jost-bold",        "filename": "Jost-Bold.ttf",            "label": "Jost",             "google_family": "Jost",        "google_weight": 700},
+    {"id": "bebas-neue",       "filename": "BebasNeue-Regular.ttf",    "label": "Bebas Neue",       "google_family": "Bebas Neue",  "google_weight": 400},
+    {"id": "oswald-bold",      "filename": "Oswald-Bold.ttf",          "label": "Oswald",           "google_family": "Oswald",      "google_weight": 700},
+    {"id": "anton",            "filename": "Anton-Regular.ttf",        "label": "Anton",            "google_family": "Anton",       "google_weight": 400},
+]
+
+
+def _resolve_font(font_id: str) -> str | None:
+    """Map a public font id to a real path under _FONTS_DIR. Empty string
+    or unknown id → None, signaling the caller to use the random pool
+    (existing "Auto" behavior). Never raises; never returns a missing
+    path."""
+    if not font_id:
+        return None
+    for entry in _FONT_CATALOGUE:
+        if entry["id"] == font_id:
+            path = os.path.join(_FONTS_DIR, entry["filename"])
+            return path if os.path.isfile(path) else None
+    return None
 
 
 def _make_text_clip(text: str, seg_start: float, seg_end: float, font: str = "Arial",

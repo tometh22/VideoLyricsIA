@@ -109,6 +109,26 @@ export default function UploadZone({
     { code: "metal",       label: "Metal" },
   ];
 
+  // Font catalogue for the per-track typography picker. Mirrors the
+  // backend's _FONT_CATALOGUE in pipeline.py — the `css` value is what
+  // the browser uses to render the option label in its own face,
+  // turning the dropdown into a live preview of every typography
+  // option without needing a server-side render. UMG operator picks
+  // one per song; "Auto" sends an empty value and the worker keeps the
+  // existing random/deterministic pick.
+  const FONTS = [
+    { id: "",                  label: t("upload.font_auto") || "Auto",     css: "" },
+    { id: "montserrat-bold",   label: "Montserrat",                        css: "'Montserrat', sans-serif", weight: 700 },
+    { id: "montserrat-extra",  label: "Montserrat Extra",                  css: "'Montserrat', sans-serif", weight: 800 },
+    { id: "poppins-bold",      label: "Poppins",                           css: "'Poppins', sans-serif",    weight: 700 },
+    { id: "outfit-bold",       label: "Outfit",                            css: "'Outfit', sans-serif",     weight: 700 },
+    { id: "roboto-bold",       label: "Roboto",                            css: "'Roboto', sans-serif",     weight: 700 },
+    { id: "jost-bold",         label: "Jost",                              css: "'Jost', sans-serif",       weight: 700 },
+    { id: "bebas-neue",        label: "Bebas Neue",                        css: "'Bebas Neue', sans-serif", weight: 400 },
+    { id: "oswald-bold",       label: "Oswald",                            css: "'Oswald', sans-serif",     weight: 700 },
+    { id: "anton",             label: "Anton",                             css: "'Anton', sans-serif",      weight: 400 },
+  ];
+
   const extractArtist = (filename) => {
     const name = filename.replace(/\.(mp3|wav)$/i, "");
     if (name.includes(" - ")) return name.split(" - ")[0].trim();
@@ -358,6 +378,33 @@ export default function UploadZone({
                   >
                     {GENRES.map((g) => (
                       <option key={g.code} value={g.code}>{g.label}</option>
+                    ))}
+                  </select>
+                </div>
+                <div className="flex items-center gap-2 pt-1">
+                  <span className="text-[10px] text-gray-600 shrink-0">
+                    {t("upload.font_label") || "Tipografía:"}
+                  </span>
+                  <select
+                    value={entry.font || ""}
+                    onChange={(e) => updateField(i, "font", e.target.value)}
+                    className="flex-1 px-2 py-1 rounded-md bg-surface-1 border border-white/[0.06] focus:border-brand/50 focus:outline-none text-[11px] text-white"
+                    title={t("upload.font_hint") || "Tipografía del texto en el video"}
+                    style={{
+                      // Render the selected option's value in its own face
+                      // so the field shows the chosen typography directly.
+                      fontFamily: (FONTS.find((f) => f.id === (entry.font || ""))?.css) || undefined,
+                      fontWeight: (FONTS.find((f) => f.id === (entry.font || ""))?.weight) || undefined,
+                    }}
+                  >
+                    {FONTS.map((f) => (
+                      <option
+                        key={f.id || "auto"}
+                        value={f.id}
+                        style={{ fontFamily: f.css || undefined, fontWeight: f.weight || undefined }}
+                      >
+                        {f.label}
+                      </option>
                     ))}
                   </select>
                 </div>

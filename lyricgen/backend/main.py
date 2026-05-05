@@ -175,6 +175,22 @@ async def list_backgrounds(
     return [a.to_dict() for a in assets]
 
 
+@app.get("/fonts")
+async def list_fonts(current_user: dict = Depends(get_current_user)):
+    """Return the catalogue of selectable typography for the lyric video.
+
+    The frontend renders previews directly via the Google Fonts CDN — every
+    entry's google_family + google_weight matches the local TTF used by
+    the worker, so the picker preview matches the rendered output.
+    """
+    from pipeline import _FONT_CATALOGUE
+    # Strip the filename — that's a backend-only concern.
+    return [
+        {k: v for k, v in entry.items() if k != "filename"}
+        for entry in _FONT_CATALOGUE
+    ]
+
+
 @app.get("/backgrounds/{asset_id}/preview")
 async def preview_background(
     asset_id: int,
@@ -597,6 +613,7 @@ async def upload(
     background_id: int = Form(None),
     background_file: UploadFile = File(None),
     genre: str = Form(""),
+    font: str = Form(""),
     current_user: dict = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
@@ -689,6 +706,7 @@ async def upload(
         input_r2_key=input_r2_key,
         bg_r2_key=bg_r2_key,
         genre=genre,
+        font=font,
     )
 
     return {"job_id": job_id, "status": initial_status}
@@ -958,6 +976,7 @@ async def generate_with_segments(
     background_id: int = Form(None),
     background_file: UploadFile = File(None),
     genre: str = Form(""),
+    font: str = Form(""),
     current_user: dict = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
@@ -1042,6 +1061,7 @@ async def generate_with_segments(
         input_r2_key=input_r2_key,
         bg_r2_key=bg_r2_key,
         genre=genre,
+        font=font,
     )
 
     return {"job_id": job_id, "status": initial_status}
