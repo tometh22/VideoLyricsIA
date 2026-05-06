@@ -1,17 +1,22 @@
 """Bulk-generate the pre-approved background library.
 
+Quality tier (this is the marquee library — render-time generation
+keeps the cheaper tiers):
+  - Imagen 4 Ultra: $0.08 per still
+  - Veo 3.1 standard: $0.40/s × 5s = $2 per clip
+
 Two generators feed the library:
-  - Imagen 4: still photos. Pipeline animates them at render time via
-    Ken Burns / parallax depending on the operator's chosen
-    movement_style. ~$0.04 per image.
-  - Veo 3.1 Fast: 5-second seamless loops. Pipeline palindromes them
-    to fill the song length. ~$2 per clip.
+  - Imagen 4 Ultra: still photos. Pipeline animates them at render time
+    via Ken Burns / parallax depending on the operator's chosen
+    movement_style.
+  - Veo 3.1 standard: 5-second seamless loops. Pipeline palindromes
+    them to fill the song length.
 
 Initial seed library (matches Tomi's launch ask):
-  - 10 still photos (Imagen 4) across 10 concepts
-  - 5 cinematic photorealistic videos (Veo)
-  - 5 simple/illustrated videos (Veo with "animado" movement style)
-  = 20 assets, ~$20.40 total Vertex spend.
+  - 10 still photos (Imagen 4 Ultra) across 10 concepts
+  - 5 cinematic photorealistic videos (Veo standard)
+  - 5 simple/illustrated videos (Veo standard with "animado" style)
+  = 20 assets, ~$20.80 total Vertex spend.
 
 Run locally (NOT in production worker):
 
@@ -40,55 +45,69 @@ from database import SessionLocal, BackgroundAsset
 from pipeline import _generate_imagen_image, _generate_veo_video
 
 
-# Each tuple: (concept, asset_type, prompt)
-# asset_type: "image" → Imagen 4 still | "video_cinematic" → Veo
-# photorealistic | "video_simple" → Veo "animado" / illustrated
-SEED: list[tuple[str, str, str]] = [
-    # ── 10 Imagen 4 stills ───────────────────────────────────────────
-    ("naturaleza",  "image",
-     "Cinematic wide shot of dense lush green forest canopy, golden afternoon sunlight filtering through, soft volumetric haze, deep depth of field, ultra detailed, 8k, photorealistic"),
-    ("tropical",    "image",
-     "Aerial shot of tropical white-sand beach with turquoise water, gentle wave foam, palm trees casting long shadows, late afternoon golden light, no people, no text"),
-    ("acuatico",    "image",
-     "Underwater shot of sunlight rays piercing deep blue ocean, drifting plankton, soft caustics on the seabed, cinematic, ultra clean, photorealistic"),
-    ("ciudad",      "image",
-     "Cinematic skyline of a modern glass city at blue hour, warm office lights, soft fog, reflections in skyscraper glass, slow drifting clouds, no people, no text"),
-    ("urbano",      "image",
-     "Concrete brutalist architecture, dramatic shadows of geometric stairwells, midday harsh sunlight, raw urban texture, cinematic muted palette, no people"),
-    ("cosmico",     "image",
-     "Deep space vista with vibrant nebula clouds in violet and teal, scattered distant stars, cinematic Hubble-style composition"),
-    ("atmosferico", "image",
-     "Lone cinematic mountain peak above sea of clouds at sunrise, soft pink and orange sky, stark dramatic atmosphere, cinematic"),
-    ("romantico",   "image",
-     "Soft warm bokeh string lights at dusk on a wooden terrace, blurred romantic atmosphere, peach and rose tones, cinematic shallow depth, no people, no text"),
-    ("lujo",        "image",
-     "Marble and gold textured surface with dramatic studio lighting, soft caustic reflections, premium luxury cinematic still, ultra clean"),
-    ("minimalista", "image",
-     "Soft pastel gradient backdrop with one floating geometric sphere casting subtle shadow, ultra clean minimal cinematic, studio look"),
+# Quality tiers for the seed library — overridable via env if a project
+# doesn't have Ultra access.
+IMAGEN_MODEL = os.environ.get("LIBRARY_IMAGEN_MODEL", "imagen-4.0-ultra-generate-001")
+VEO_MODEL    = os.environ.get("LIBRARY_VEO_MODEL", "veo-3.1-generate-001")
 
-    # ── 5 cinematic Veo videos (photorealistic, marquee feel) ────────
+# Each tuple: (concept, asset_type, prompt)
+# asset_type: "image" → Imagen 4 Ultra still
+#             "video_cinematic" → Veo photorealistic
+#             "video_simple" → Veo "animado" 2D illustrated
+#
+# Prompts are written in award-cinematography language (lens, color
+# grade, motion direction) because Imagen / Veo respond strongly to
+# specific cinematographic cues. Each one is engineered to:
+#   - have no people / faces / text (Imagen safety + UMG compliance)
+#   - read as a *background* (no dominant subject competing with lyrics)
+#   - hold detail at 1920×1080 after upscaling
+#   - loop seamlessly (the videos)
+SEED: list[tuple[str, str, str]] = [
+    # ── 10 Imagen 4 Ultra stills ─────────────────────────────────────
+    ("naturaleza",  "image",
+     "Award-winning landscape cinematography, dense lush green forest canopy seen from below, dappled golden hour sunlight filtering through leaves, soft volumetric god rays, hyper-detailed leaf texture, shallow depth of field, shot on Arri Alexa, 50mm prime lens, teal-and-gold color grade, photorealistic, ultra sharp 8K"),
+    ("tropical",    "image",
+     "High-end travel cinematography, top-down aerial of a deserted tropical beach, white sand contrasting against gradient turquoise to deep cobalt water, gentle white wave foam curling on shore, three palm trees casting long late-afternoon shadows, golden hour, shot on DJI Inspire 3, photorealistic, ultra sharp 8K"),
+    ("acuatico",    "image",
+     "Underwater cinematic photography, sunlight rays piercing crystalline blue ocean from above, drifting microbubbles catching highlights, soft moving caustics on a sandy seabed, slight god-ray volumetrics, shot on a RED Komodo with underwater housing, deep blue color palette, hyper-detailed, photorealistic 8K"),
+    ("ciudad",      "image",
+     "Cinematic skyline of a modern glass-and-steel megacity at blue hour, warm office lights twinkling against deep navy sky, soft low fog rolling between towers, mirror-like reflections in skyscraper glass, gentle drifting clouds, anamorphic widescreen composition, shot on Sony Venice 2, teal-and-amber grade, ultra sharp photorealistic 8K"),
+    ("urbano",      "image",
+     "Brutalist concrete architecture lit by harsh midday sun, dramatic geometric shadows from a stairwell cascading down a wall, raw textured concrete, severe symmetrical composition, low-saturation muted palette with one accent of cobalt blue, shot on Hasselblad medium format, fine-art photography, ultra sharp 8K"),
+    ("cosmico",     "image",
+     "Deep-space vista with a vibrant nebula in violet, magenta and teal cloud structures, scattered distant stars, faint galaxy spiral in the lower third, hyper-detailed gas turbulence, Hubble-style cinematic composition, dark void negative space for compositing, ultra sharp photorealistic 8K"),
+    ("atmosferico", "image",
+     "Single cinematic mountain peak above an endless sea of low clouds at sunrise, soft pink and apricot sky transitioning to deep cobalt at the top, distant ridge silhouettes, dramatic atmospheric layering, shot on Arri Alexa with anamorphic lens, fine-art landscape photography, ultra sharp 8K"),
+    ("romantico",   "image",
+     "Warm intimate bokeh of fairy string lights wrapped around a wooden pergola at dusk, blurred peach-and-rose color palette, soft creamy bokeh circles, late golden hour, shallow depth of field shot on 85mm f1.4 prime lens, romantic atmosphere, ultra sharp 8K, no people"),
+    ("lujo",        "image",
+     "Premium product photography of a polished black marble surface with thin gold veins, a single soft caustic highlight from diffused studio light, ultra luxurious editorial composition, shot on Hasselblad medium format with macro lens, hyper-detailed, photorealistic 8K"),
+    ("minimalista", "image",
+     "Architectural minimalism, soft pastel gradient wall in cream and dusty rose, one matte off-white sphere floating slightly above the floor casting a long soft shadow, single key light from upper left, ultra clean composition, shot on Hasselblad medium format, editorial photography, ultra sharp 8K"),
+
+    # ── 5 cinematic Veo videos (photorealistic, marquee feel) ───────
     ("cinematic",   "video_cinematic",
-     "Cinematic anamorphic shot of slow drifting clouds across a vast empty highway at dusk, dramatic teal-orange sky, gentle camera dolly forward, photorealistic, 5 second seamless loop"),
+     "Cinematic anamorphic 5-second seamless loop, slow camera dolly forward along an empty rain-soaked highway at dusk, dramatic teal-orange sky with slow drifting cumulus, gentle lens flare, ultra wide vista, photorealistic, shot on Arri Alexa, no text, no people"),
     ("ciudad",      "video_cinematic",
-     "Slow aerial drone shot circling a glass skyscraper at blue hour, soft window lights twinkling, gentle motion, ultra clean photorealistic, seamless loop"),
+     "Cinematic 5-second seamless loop, slow aerial drone orbit around a single glass skyscraper at blue hour, soft warm office lights twinkling individually, mirror reflections of pink-violet sky in the glass, gentle smooth motion, photorealistic, ultra sharp"),
     ("naturaleza",  "video_cinematic",
-     "Slow motion shot of sunlight rays moving through a misty pine forest at dawn, soft particles drifting in air, gentle camera dolly, photorealistic, seamless 5 second loop"),
+     "Cinematic 5-second seamless loop, slow camera push through a misty pine forest at dawn, golden god rays cutting between trees, dust motes drifting through the light, ultra slow tracking shot, shot on Arri Alexa, photorealistic teal-and-gold grade"),
     ("club",        "video_cinematic",
-     "Slow motion shot of magenta and cyan laser beams cutting through smoke in a dark venue, deep contrast, ambient cinematic, photorealistic, seamless 5 second loop, no people, no text"),
+     "Cinematic 5-second seamless loop, slow lateral motion through magenta and cyan laser beams cutting volumetric stage smoke, deep dark room, high contrast, ambient atmospheric, photorealistic, no people, no text"),
     ("acuatico",    "video_cinematic",
-     "Slow underwater shot of sunlight caustics rippling across the deep blue ocean floor, soft drifting bubbles, cinematic, photorealistic, seamless 5 second loop"),
+     "Cinematic 5-second seamless loop, slow underwater tracking shot just below the ocean surface, sunlight caustics dancing on the seabed, soft floating microbubbles, deep blue color palette, photorealistic ultra clean"),
 
     # ── 5 simple/illustrated Veo videos (2D animation feel) ─────────
     ("abstracto",   "video_simple",
-     "Soft flowing pastel ink swirls in violet, teal and peach on a clean background, abstract macro, slow gentle motion, seamless 5 second loop"),
+     "Stylised flat 2D motion graphic, soft flowing pastel ink swirls in violet, teal and peach blending across a clean off-white background, slow elegant fluid motion, seamless 5-second loop, no text, no logos"),
     ("animado",     "video_simple",
-     "Stylised flat 2D animated illustration of slow rolling cartoon hills under a calm sun, soft pastel palette, gentle parallax motion, seamless 5 second loop, no text"),
+     "Stylised flat 2D animated illustration in the style of a modern children's book, slow rolling pastel hills with a soft glowing sun, gentle multi-layer parallax motion, dreamy palette, seamless 5-second loop, no text"),
     ("vintage",     "video_simple",
-     "Soft vintage film grain texture with warm sepia color shifts, slow subtle motion, retro 8mm feel, seamless 5 second loop, no text"),
+     "Stylised retro 8mm film aesthetic, soft warm sepia frames with subtle grain, gentle dust scratches drifting upward, slow vintage color cycling, seamless 5-second loop, no text, no people"),
     ("minimalista", "video_simple",
-     "Single curved line of light slowly drifting across a deep matte black background, abstract minimal architectural, gentle motion, seamless 5 second loop"),
+     "Stylised minimal motion graphic, a single luminous curved line slowly tracing across a deep matte black background then resetting, ultra clean architectural composition, seamless 5-second loop"),
     ("atmosferico", "video_simple",
-     "Slow drifting fog over a still empty plain at twilight, cool blue palette, ambient minimal motion, seamless 5 second loop, no text"),
+     "Stylised cinematic 5-second seamless loop, slow drifting fog rolling across an empty cool-blue plain at twilight, ambient minimal motion, painterly atmospheric quality, no text, no people"),
 ]
 
 
@@ -113,6 +132,11 @@ def main() -> int:
         print("ERROR: VERTEX_PROJECT not set.")
         return 1
 
+    # Force the higher-quality models for this generation. The runtime
+    # render path keeps using the cheaper defaults via env.
+    os.environ["VEO_MODEL"] = VEO_MODEL
+    print(f"Models: imagen={IMAGEN_MODEL}, veo={VEO_MODEL}")
+
     db = SessionLocal()
     created = 0
     skipped = 0
@@ -136,7 +160,7 @@ def main() -> int:
             print(f"      prompt: {prompt[:100]}…")
             try:
                 if asset_type == "image":
-                    _generate_imagen_image(prompt, tmp_path)
+                    _generate_imagen_image(prompt, tmp_path, model=IMAGEN_MODEL)
                 elif asset_type == "video_cinematic":
                     _generate_veo_video(
                         prompt, tmp_path,

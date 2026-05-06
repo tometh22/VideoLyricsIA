@@ -2490,8 +2490,14 @@ def _generate_veo_video(prompt: str, output_path: str, job_id: str = None,
     return output_path
 
 
-def _generate_imagen_image(prompt: str, output_path: str, max_retries: int = 5, job_id: str = None) -> str:
-    """Generate an image with Google Imagen 4. Auto-retries on rate limit."""
+def _generate_imagen_image(prompt: str, output_path: str, max_retries: int = 5,
+                            job_id: str = None, model: str | None = None) -> str:
+    """Generate an image with Google Imagen 4. Auto-retries on rate limit.
+
+    `model` lets the caller override the default. Library generation can
+    pass `imagen-4.0-ultra-generate-001` for marquee-quality stills;
+    runtime job rendering keeps the standard tier for cost reasons.
+    """
     from google import genai
     from google.genai.errors import ClientError
     from provenance import record_ai_call
@@ -2499,12 +2505,16 @@ def _generate_imagen_image(prompt: str, output_path: str, max_retries: int = 5, 
 
     client = _get_genai_client()
 
+    chosen_model = (model
+                    or os.environ.get("IMAGEN_MODEL")
+                    or "imagen-4.0-generate-001").strip()
+
     safe_prompt = f"{prompt}. No text, no words, no letters, no people, no faces, no hands."
 
     recorder = record_ai_call(
         job_id=job_id or "unknown",
         step="image_bg",
-        tool_name="imagen-4.0-generate-001",
+        tool_name=chosen_model,
         tool_provider="google_vertex",
         prompt=safe_prompt,
         input_data_types=["generated_prompt"],
@@ -2512,9 +2522,9 @@ def _generate_imagen_image(prompt: str, output_path: str, max_retries: int = 5, 
 
     for attempt in range(max_retries):
         try:
-            print(f"[BG] Imagen 4: generating image (attempt {attempt + 1})...")
+            print(f"[BG] {chosen_model}: generating image (attempt {attempt + 1})...")
             response = client.models.generate_images(
-                model="imagen-4.0-generate-001",
+                model=chosen_model,
                 prompt=safe_prompt,
                 config=genai.types.GenerateImagesConfig(
                     number_of_images=1,
