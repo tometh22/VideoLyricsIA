@@ -47,7 +47,7 @@ function findSuggestion(whisperText, refLines, startIdx) {
   return null;
 }
 
-export default function LyricsEditor({ segments, filename, referenceLyrics, onApprove, onBack, isBatch = false, batchProgress = "" }) {
+export default function LyricsEditor({ segments, filename, referenceLyrics, coverageWarning = false, recoverySource = "", onApprove, onBack, isBatch = false, batchProgress = "" }) {
   const { t } = useI18n();
   // Each segment gets a unique ID so deletions don't mess up suggestions
   const [edited, setEdited] = useState(() =>
@@ -135,6 +135,17 @@ export default function LyricsEditor({ segments, filename, referenceLyrics, onAp
           </svg>
         </button>
       </div>
+
+      {coverageWarning && (
+        <div className="mb-4 rounded-2xl border border-amber-500/30 bg-amber-500/[0.06] px-4 py-3 flex items-start gap-3">
+          <svg className="w-5 h-5 text-amber-400 flex-shrink-0 mt-0.5" fill="none" stroke="currentColor" strokeWidth="1.8" viewBox="0 0 24 24">
+            <path d="M12 9v4M12 17h.01M10.29 3.86l-8.18 14.14a2 2 0 001.71 3h16.36a2 2 0 001.71-3L13.71 3.86a2 2 0 00-3.42 0z" strokeLinecap="round" strokeLinejoin="round"/>
+          </svg>
+          <p className="text-xs text-amber-200/90 leading-relaxed">
+            {t("editor.coverage_warning")}
+          </p>
+        </div>
+      )}
 
       {hasSuggestions && (
         <div className="flex items-center justify-between mb-4">

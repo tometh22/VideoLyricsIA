@@ -5,6 +5,7 @@ import json
 import os
 import math
 import random
+import re
 import subprocess
 import tempfile
 import traceback
@@ -949,6 +950,160 @@ def _lrc_to_segments(lrc: str, audio_duration: float | None = None,
             "end": end + time_offset,
             "text": item["text"],
         })
+    return segments
+
+
+def _detect_hallucination(segments: list[dict],
+                           audio_duration: float | None) -> tuple[bool, str]:
+    """Whisper hallucination smoke test. Returns (is_hallucinated, reason).
+
+    Three independent signals trigger; ANY one is enough:
+      - segment count is implausibly low for the audio duration,
+      - any single segment is both very long (>15 s) and very wordy
+        (>40 words) — the classic instrumental-passage trap,
+      - any segment shows 3+ near-duplicate phrase windows by token-set
+        Jaccard ≥ 0.75 — synonym loops ("reflexionar" ↔ "pensar") that
+        the exact-match `_truncate_intra_loop` lets through.
+
+    The detector is the GATE for the auto-recover branch: when this fires
+    AND the caller has lrclib plain lyrics, we replace Whisper's output
+    with synthesized segments (see `_synthesize_segments_from_plain`).
+    """
+    if not segments:
+        return True, "empty segment list"
+
+    # Signal 1 — segment count vs audio duration.
+    if audio_duration and audio_duration > 30:
+        minutes = audio_duration / 60.0
+        floor = max(8, int(minutes * 4))
+        if len(segments) < floor:
+            return True, (f"low count: {len(segments)} segments for "
+                          f"{audio_duration:.0f}s audio (floor={floor})")
+
+    # Signal 2 — instrumental-passage mega-segment.
+    for s in segments:
+        dur = float(s.get("end", 0)) - float(s.get("start", 0))
+        words = len((s.get("text") or "").split())
+        if dur > 15.0 and words > 40:
+            return True, (f"implausible segment: {dur:.1f}s × {words} "
+                          f"words — text={(s.get('text') or '')[:60]!r}")
+
+    # Signal 3 — fuzzy intra-loop (token-set Jaccard ≥ 0.75).
+    for s in segments:
+        if _has_fuzzy_intra_loop(s.get("text") or ""):
+            return True, ("fuzzy intra-loop in segment "
+                          f"{(s.get('text') or '')[:60]!r}")
+
+    return False, ""
+
+
+def _has_fuzzy_intra_loop(text: str) -> bool:
+    """Detect 3+ near-duplicate consecutive word-windows in a segment.
+    Two windows count as the same loop when their token-set Jaccard is
+    ≥ 0.75 — catches synonym swaps ("reflexionar" ↔ "pensar") that the
+    exact-equality intra-loop truncator misses.
+
+    Window sizes 4..14 (longer first), same shape as the existing
+    `_truncate_intra_loop`, but only used as a SIGNAL here, not a fix.
+    """
+    words = text.split()
+    total = len(words)
+    if total < 12:
+        return False
+    for window in range(14, 3, -1):
+        if total < window * 3:
+            continue
+        for start in range(total - window * 3 + 1):
+            phrase_set = set(w.lower() for w in words[start:start + window])
+            if not phrase_set:
+                continue
+            count = 1
+            pos = start + window
+            while pos + window <= total:
+                next_set = set(w.lower() for w in words[pos:pos + window])
+                if not next_set:
+                    break
+                inter = len(phrase_set & next_set)
+                union = len(phrase_set | next_set)
+                if union == 0 or (inter / union) < 0.75:
+                    break
+                count += 1
+                pos += window
+            if count >= 3:
+                return True
+    return False
+
+
+# Section markers we strip when distributing lrclib plain lyrics — they're
+# scaffolding metadata, not lines a singer actually performs.
+_PLAIN_SECTION_MARKER = re.compile(
+    r"^\s*[\[(](?:verso|verse|coro|chorus|estribillo|puente|bridge|"
+    r"intro|outro|pre[- ]?coro|pre[- ]?chorus|interlude|instrumental|"
+    r"refr[áa]n|solo)[^\]\)]*[\])]\s*$",
+    re.IGNORECASE,
+)
+
+
+def _synthesize_segments_from_plain(plain: str,
+                                     audio_duration: float,
+                                     anchor_start: float = 0.0) -> list[dict]:
+    """Distribute lrclib plain lyrics evenly across the audio duration.
+
+    Used when Whisper has hallucinated and we need to ship the operator
+    SOMETHING to review instead of 3 broken rows. The timestamps are
+    deliberately rough — operator nudges them in the editor before
+    approving the render. This is the auto-recover fallback path.
+
+    Args:
+        plain: lrclib plain text, one line per lyric line. Section
+            markers like "[Verso]" / "[Chorus]" are filtered out.
+        audio_duration: total audio length in seconds.
+        anchor_start: where to begin the distribution. When the FIRST
+            Whisper segment looked plausible (passes `_detect_hallucination`
+            on its own), the caller can pass that segment's start so the
+            first lyric aligns roughly with it. Defaults to 0.
+
+    Returns segments in the same shape as `transcribe()` — list of
+    {start, end, text} dicts, monotonically increasing, last `end` capped
+    at `audio_duration`.
+    """
+    if not plain or not plain.strip() or not audio_duration:
+        return []
+
+    lines: list[str] = []
+    for raw in plain.splitlines():
+        stripped = raw.strip()
+        if not stripped:
+            continue
+        if _PLAIN_SECTION_MARKER.match(stripped):
+            continue
+        lines.append(stripped)
+
+    if not lines:
+        return []
+
+    # Clamp anchor inside [0, audio_duration - 1) so we always have at
+    # least 1 s of room left to distribute the lines into.
+    if anchor_start < 0:
+        anchor_start = 0.0
+    if anchor_start >= audio_duration - 1:
+        anchor_start = 0.0
+
+    usable = audio_duration - anchor_start
+    n = len(lines)
+    per_line = usable / n
+    GAP = 0.05
+
+    segments: list[dict] = []
+    for i, line in enumerate(lines):
+        start = anchor_start + i * per_line
+        end = anchor_start + (i + 1) * per_line - GAP
+        if end <= start:
+            end = start + 0.5
+        segments.append({"start": start, "end": end, "text": line})
+    # Cap last segment at audio_duration.
+    if segments and segments[-1]["end"] > audio_duration:
+        segments[-1]["end"] = audio_duration
     return segments
 
 

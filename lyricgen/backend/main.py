@@ -781,6 +781,7 @@ async def transcribe_endpoint(
         from pipeline import (
             _fetch_lrclib, _lrc_to_segments, _audio_duration,
             _slice_audio_prefix, _verify_lrclib_alignment,
+            _detect_hallucination, _synthesize_segments_from_plain,
         )
         lrc = await asyncio.to_thread(_fetch_lrclib, artist_hint, song_hint)
         if lrc:
@@ -897,6 +898,39 @@ async def transcribe_endpoint(
                 segments = await loop.run_in_executor(
                     None, transcribe, tmp_path, lang, plain,
                 )
+
+                # Auto-recover: when Whisper hallucinates (3 segments for a
+                # 4-min song, instrumental-passage mega-segments, synonym
+                # loops), fall back to distributing lrclib plain lyrics
+                # evenly across the audio duration. Operator gets the full
+                # lyric text with rough timestamps and only nudges them in
+                # the editor — beats shipping 3 broken rows.
+                user_dur = await asyncio.to_thread(_audio_duration, tmp_path)
+                hallucinated, reason = _detect_hallucination(segments, user_dur)
+                if hallucinated and user_dur:
+                    # Anchor the distribution at the start of the first
+                    # Whisper segment IF that single segment looks plausible
+                    # on its own — gives us a real audio cue for line 1.
+                    anchor = 0.0
+                    if segments:
+                        first = [segments[0]]
+                        first_ok, _ = _detect_hallucination(first, None)
+                        if not first_ok:
+                            anchor = max(0.0, float(segments[0]["start"]))
+                    recovered = _synthesize_segments_from_plain(
+                        plain, user_dur, anchor_start=anchor,
+                    )
+                    if recovered:
+                        print(f"[LYRICS] hallucination detected ({reason}) "
+                              f"— auto-recovered with {len(recovered)} "
+                              f"lines from lrclib plain "
+                              f"(anchor={anchor:.1f}s, dur={user_dur:.1f}s)")
+                        return {
+                            "segments": recovered,
+                            "reference_lyrics": plain,
+                            "coverage_warning": True,
+                            "recovery_source": "lrclib_plain",
+                        }
                 return {"segments": segments, "reference_lyrics": plain}
 
         # Kick off Gemini-grounded lyrics fetch in parallel with Whisper.

@@ -167,6 +167,7 @@ const translations = {
     "editor.approve_generate": "Aprobar y generar",
     "editor.lines": "líneas",
     "editor.song_of": "de",
+    "editor.coverage_warning": "La transcripción automática falló en este audio. Cargamos la letra completa con tiempos aproximados — ajustá los timestamps de cada línea antes de aprobar.",
 
     // Transcribing
     "transcribe.title": "Transcribiendo lyrics",
@@ -506,6 +507,7 @@ const translations = {
     "editor.approve_generate": "Approve & generate",
     "editor.lines": "lines",
     "editor.song_of": "of",
+    "editor.coverage_warning": "Automatic transcription failed for this audio. We loaded the full lyrics with approximate timing — adjust each line's timestamps before approving.",
 
     "transcribe.title": "Transcribing lyrics",
     "transcribe.subtitle": "Analyzing audio...",
@@ -832,6 +834,7 @@ const translations = {
     "editor.approve_next": "Aprovar e próximo",
     "editor.approve_generate": "Aprovar e gerar",
     "editor.lines": "linhas",
+    "editor.coverage_warning": "A transcrição automática falhou neste áudio. Carregamos a letra completa com tempos aproximados — ajuste os timestamps de cada linha antes de aprovar.",
     "editor.song_of": "de",
 
     "transcribe.title": "Transcrevendo lyrics",

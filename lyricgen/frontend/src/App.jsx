@@ -206,6 +206,8 @@ export default function App() {
         genre: entry.genre || "", font: entry.font || "",
         concept: entry.concept || "", movementStyle: entry.movementStyle || "",
         segments: data.segments, referenceLyrics: data.reference_lyrics || "",
+        coverageWarning: !!data.coverage_warning,
+        recoverySource: data.recovery_source || "",
         queueIdx: idx, queue,
       });
     } catch (err) {
@@ -589,6 +591,8 @@ export default function App() {
                 segments={currentReview.segments}
                 filename={currentReview.file.name}
                 referenceLyrics={currentReview.referenceLyrics || ""}
+                coverageWarning={currentReview.coverageWarning}
+                recoverySource={currentReview.recoverySource}
                 onApprove={handleApproveLyrics}
                 onBack={handleReset}
                 isBatch={currentReview.queue.length > 1}
