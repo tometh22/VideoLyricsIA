@@ -174,6 +174,11 @@ const translations = {
     "editor.shift_hint": "Arrastrá si toda la letra está corrida en el tiempo",
     "editor.shift_apply": "Aplicar",
     "editor.shift_reset": "Reset",
+    "editor.propagate_question": "¿Aplicar",
+    "editor.propagate_to": "a las",
+    "editor.propagate_following": "líneas siguientes también?",
+    "editor.propagate_yes": "Sí, aplicar",
+    "editor.propagate_no": "Solo esta",
 
     // Transcribing
     "transcribe.title": "Transcribiendo lyrics",
@@ -529,6 +534,11 @@ const translations = {
     "editor.shift_hint": "Drag if the whole lyrics are off in time",
     "editor.shift_apply": "Apply",
     "editor.shift_reset": "Reset",
+    "editor.propagate_question": "Apply",
+    "editor.propagate_to": "to the next",
+    "editor.propagate_following": "lines too?",
+    "editor.propagate_yes": "Yes, apply",
+    "editor.propagate_no": "Just this one",
 
     "transcribe.title": "Transcribing lyrics",
     "transcribe.subtitle": "Analyzing audio...",
@@ -871,6 +881,11 @@ const translations = {
     "editor.shift_hint": "Arraste se toda a letra está fora de tempo",
     "editor.shift_apply": "Aplicar",
     "editor.shift_reset": "Reset",
+    "editor.propagate_question": "Aplicar",
+    "editor.propagate_to": "às próximas",
+    "editor.propagate_following": "linhas também?",
+    "editor.propagate_yes": "Sim, aplicar",
+    "editor.propagate_no": "Só essa",
     "editor.song_of": "de",
 
     "transcribe.title": "Transcrevendo lyrics",

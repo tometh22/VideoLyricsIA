@@ -115,6 +115,11 @@ export default function LyricsEditor({ segments, filename, audioFile, referenceL
     setEditingId(null);
     setEditValue("");
   };
+  // After committing an edit, capture the delta so we can offer to
+  // propagate it forward. Stored as { segId, delta, count } so we can
+  // undo or apply.
+  const [pendingPropagation, setPendingPropagation] = useState(null);
+
   const commitEditTimestamp = (seg) => {
     const parsed = parseTimestamp(editValue);
     if (parsed == null) {
@@ -123,6 +128,7 @@ export default function LyricsEditor({ segments, filename, audioFile, referenceL
       return;
     }
     const newStart = Math.max(0, Math.min(parsed, duration || parsed));
+    const delta = newStart - seg.start;
     setEdited((prev) => prev.map((s) => {
       if (s._id !== seg._id) return s;
       // Preserve segment duration when the operator nudges the start
@@ -134,7 +140,43 @@ export default function LyricsEditor({ segments, filename, audioFile, referenceL
     }));
     setEditingId(null);
     setEditValue("");
+    // Offer to propagate when the change is meaningful (>0.3s) and
+    // there are following lines to receive it.
+    const followingCount = edited.filter((s) => s.start > seg.start).length;
+    if (Math.abs(delta) >= 0.3 && followingCount > 0) {
+      setPendingPropagation({ segId: seg._id, delta, count: followingCount });
+    } else {
+      setPendingPropagation(null);
+    }
   };
+
+  // Apply the captured delta to every segment that originally started
+  // AFTER the edited one. We use the original start (pre-edit) of the
+  // anchor segment as the threshold so we don't double-shift the line
+  // the operator just edited.
+  const applyPendingPropagation = () => {
+    if (!pendingPropagation) return;
+    const { segId, delta } = pendingPropagation;
+    const anchor = edited.find((s) => s._id === segId);
+    if (!anchor) {
+      setPendingPropagation(null);
+      return;
+    }
+    const anchorOrigStart = anchor.start - delta;
+    setEdited((prev) =>
+      prev.map((s) => {
+        if (s.start <= anchorOrigStart) return s;
+        const segDur = Math.max(0.5, s.end - s.start);
+        const newStart = Math.max(0, s.start + delta);
+        let newEnd = newStart + segDur;
+        if (duration && newEnd > duration) newEnd = duration;
+        return { ...s, start: newStart, end: newEnd };
+      }),
+    );
+    setPendingPropagation(null);
+  };
+
+  const dismissPropagation = () => setPendingPropagation(null);
 
   // Active segment: the one whose [start, end] contains currentTime, or
   // the latest one whose start <= currentTime if no segment "owns" the
@@ -403,9 +445,9 @@ export default function LyricsEditor({ segments, filename, audioFile, referenceL
             </span>
             <input
               type="range"
-              min="-10"
-              max="10"
-              step="0.1"
+              min="-60"
+              max="60"
+              step="0.5"
               value={shiftOffset}
               onChange={(e) => setShiftOffset(parseFloat(e.target.value))}
               onDoubleClick={() => setShiftOffset(0)}
@@ -431,8 +473,40 @@ export default function LyricsEditor({ segments, filename, audioFile, referenceL
             </button>
           </div>
           <p className="text-[10px] text-gray-600 mt-1.5 ml-6">
-            {t("editor.shift_hint") || "Arrastra si toda la letra está corrida en el tiempo"}
+            {t("editor.shift_hint") || "Arrastrá si toda la letra está corrida en el tiempo"}
           </p>
+        </div>
+      )}
+
+      {/* ─── Propagate-from-here banner (after a manual timestamp edit) ─── */}
+      {pendingPropagation && (
+        <div className="mb-3 px-3 py-2.5 rounded-card bg-accent/[0.06] ring-1 ring-accent/25 flex items-center gap-3 animate-fade-in">
+          <svg className="w-4 h-4 text-accent shrink-0" fill="none" stroke="currentColor" strokeWidth="1.8" viewBox="0 0 24 24">
+            <path d="M13 5l7 7-7 7M5 12h15" strokeLinecap="round" strokeLinejoin="round" />
+          </svg>
+          <p className="text-xs text-ink-secondary flex-1">
+            {t("editor.propagate_question") || "¿Aplicar"}{" "}
+            <span className="text-brand-light font-mono">
+              {pendingPropagation.delta > 0 ? "+" : ""}
+              {pendingPropagation.delta.toFixed(1)}s
+            </span>{" "}
+            {t("editor.propagate_to") || "a las"}{" "}
+            <span className="font-medium text-white">{pendingPropagation.count}</span>{" "}
+            {t("editor.propagate_following") || "líneas siguientes también?"}
+          </p>
+          <button
+            onClick={applyPendingPropagation}
+            className="shrink-0 text-[11px] font-medium px-3 py-1.5 rounded-lg bg-accent/20 text-accent
+              ring-1 ring-accent/40 hover:bg-accent/30 transition-colors"
+          >
+            {t("editor.propagate_yes") || "Sí, aplicar"}
+          </button>
+          <button
+            onClick={dismissPropagation}
+            className="shrink-0 text-[11px] text-gray-500 hover:text-white px-2 py-1.5 transition-colors"
+          >
+            {t("editor.propagate_no") || "Solo esta"}
+          </button>
         </div>
       )}
 
