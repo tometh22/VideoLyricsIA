@@ -940,6 +940,7 @@ async def transcribe_endpoint(
                 intro_offset = 0.0
                 transcribe_path = tmp_path
                 trimmed_path = None
+                intro_segments: list[dict] = []
                 if (lrc_dur and user_dur
                         and 3.0 < (user_dur - lrc_dur) <= 120.0):
                     intro_offset = float(user_dur - lrc_dur)
@@ -957,6 +958,47 @@ async def transcribe_endpoint(
                     else:
                         intro_offset = 0.0  # slice failed — fall through
 
+                # Hybrid intro Whisper. The intro region we sliced off may
+                # contain a spoken dialogue / narration that previews the
+                # song's lyrics (verified case: "El Plan de la Mariposa —
+                # El Riesgo" Video Oficial has 73 s of voice-over reciting
+                # the first verse before the song starts). Run Whisper on
+                # the intro chunk with the same lyrics_hint so it
+                # transcribes the spoken text against the known vocabulary
+                # and emits real timestamps for it. The segments returned
+                # here are kept as-is in the user's full-audio frame
+                # (they were never shifted) and prepended to the final
+                # output so the operator sees the dialogue subtitled at
+                # 0:00–intro_offset and the song body subtitled
+                # afterwards.
+                if intro_offset > 0:
+                    intro_path = os.path.join(tmp_dir, "intro_only.mp3")
+                    if await asyncio.to_thread(
+                        _slice_audio_prefix, tmp_path, intro_path,
+                        intro_offset + 1.0,
+                    ):
+                        try:
+                            intro_segs_raw = await loop.run_in_executor(
+                                None, transcribe, intro_path, lang, plain,
+                            )
+                            # Keep only segments that fully sit in the
+                            # intro window; defensive against ffmpeg
+                            # frame-boundary slop.
+                            intro_segments = [
+                                s for s in intro_segs_raw
+                                if s["end"] <= intro_offset + 0.5
+                            ]
+                            print(f"[LYRICS] intro Whisper produced "
+                                  f"{len(intro_segments)} segment(s) for "
+                                  f"the {intro_offset:.0f}s dialogue prefix")
+                        except Exception as e:
+                            print(f"[LYRICS] intro Whisper failed: {e}")
+                        finally:
+                            try:
+                                os.unlink(intro_path)
+                            except OSError:
+                                pass
+
                 try:
                     segments = await loop.run_in_executor(
                         None, transcribe, transcribe_path, lang, plain,
@@ -968,8 +1010,8 @@ async def transcribe_endpoint(
                         except OSError:
                             pass
 
-                # Shift Whisper timestamps back into full-audio frame so
-                # subtitles appear at the right moment in the user's file.
+                # Shift body-Whisper timestamps back into full-audio
+                # frame so the song subtitles appear at the right moment.
                 if intro_offset > 0:
                     segments = [
                         {**s,
@@ -981,30 +1023,38 @@ async def transcribe_endpoint(
                 # Auto-recover: when Whisper still hallucinates after the
                 # trim (instrumental-passage mega-segments, synonym loops,
                 # implausibly low count), fall back to distributing lrclib
-                # plain lyrics across the audio duration. The Whisper
-                # segments that DID survive the per-segment plausibility
-                # check anchor the distribution via fuzzy-matched line
-                # indices, so each lyric line lands near where Whisper
-                # actually heard it instead of floating uniformly.
+                # plain lyrics across the SONG REGION only. start_time =
+                # intro_offset prevents the synthesizer from compressing
+                # the song lines into the spoken-intro region — that would
+                # show 3 lyric lines at 0:00 even though the song hasn't
+                # started yet (the bug the operator reported).
                 hallucinated, reason = _detect_hallucination(segments, user_dur)
                 if hallucinated and user_dur:
                     anchors = _align_whisper_to_plain(segments, plain)
                     recovered = _synthesize_segments_from_plain(
                         plain, user_dur, anchors=anchors,
+                        start_time=intro_offset,
                     )
                     if recovered:
+                        combined = intro_segments + recovered
                         print(f"[LYRICS] hallucination detected ({reason}) "
                               f"— auto-recovered with {len(recovered)} "
                               f"lines from lrclib plain "
                               f"({len(anchors)} time anchors, "
-                              f"dur={user_dur:.1f}s)")
+                              f"start={intro_offset:.1f}s, "
+                              f"dur={user_dur:.1f}s) "
+                              f"+ {len(intro_segments)} intro-Whisper "
+                              f"segment(s)")
                         return {
-                            "segments": recovered,
+                            "segments": combined,
                             "reference_lyrics": plain,
                             "coverage_warning": True,
                             "recovery_source": "lrclib_plain",
                         }
-                return {"segments": segments, "reference_lyrics": plain}
+                # Happy path: Whisper returned plausibly-many segments.
+                # Combine intro Whisper (if any) with the body output.
+                combined = intro_segments + segments
+                return {"segments": combined, "reference_lyrics": plain}
 
         # Kick off Gemini-grounded lyrics fetch in parallel with Whisper.
         # The fetcher is best-effort (returns None on any failure); we wrap

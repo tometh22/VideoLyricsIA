@@ -198,6 +198,45 @@ def test_synthesize_no_audio_duration_returns_empty_list():
     assert _synthesize_segments_from_plain(PLAIN, audio_duration=None) == []
 
 
+def test_synthesize_start_time_offsets_distribution():
+    # The "Video Oficial" of "El Plan de la Mariposa - El Riesgo" has 73 s
+    # of spoken dialogue before the song proper begins. The recovery
+    # synthesizer must distribute the song lyrics over [intro_offset,
+    # audio_duration] — NOT over [0, audio_duration] — otherwise the
+    # first lyric lines compress into the dialogue region and show
+    # multiple lines at 0:00 in the editor.
+    segs = _synthesize_segments_from_plain(
+        PLAIN, audio_duration=342.0, start_time=73.0,
+    )
+    # 5 lyric lines distributed across [73, 342] = 269 s window.
+    assert len(segs) == 5
+    # Line 0 starts at intro_offset (73 s), not at 0.
+    assert abs(segs[0]["start"] - 73.0) < 0.5
+    # Last line ends at or before audio_duration.
+    assert segs[-1]["end"] <= 342.0
+    # Middle line lands at the midpoint of the song region: 73 + 269/2
+    # ≈ 207.5 s for line 2 of 5 (indices 0..4).
+    expected_mid = 73.0 + (2 / 5) * (342.0 - 73.0)
+    assert abs(segs[2]["start"] - expected_mid) < 1.0
+
+
+def test_synthesize_start_time_clamped_to_audio_window():
+    # Defensive: a bogus start_time near or above audio_duration falls
+    # back to a safe upper bound so the synthesizer never produces
+    # zero-length or inverted segments.
+    segs = _synthesize_segments_from_plain(
+        PLAIN, audio_duration=10.0, start_time=15.0,
+    )
+    assert len(segs) == 5
+    # safe_start clamps to audio_duration - 0.5 = 9.5 s.
+    assert segs[0]["start"] >= 0.0
+    assert segs[0]["start"] <= 10.0
+    # All segments stay within the window.
+    for s in segs:
+        assert s["start"] <= 10.0
+        assert s["end"] <= 10.0
+
+
 def test_synthesize_drops_anchors_outside_audio_window():
     # Anchor with time >= audio_duration is silently dropped; falls back
     # to even distribution from 0 (defensive against bad inputs).

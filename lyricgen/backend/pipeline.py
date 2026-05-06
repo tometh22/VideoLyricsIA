@@ -1163,6 +1163,7 @@ def _align_whisper_to_plain(segments: list[dict],
 def _synthesize_segments_from_plain(plain: str,
                                      audio_duration: float,
                                      anchors: list[tuple[int, float]] | None = None,
+                                     start_time: float = 0.0,
                                      ) -> list[dict]:
     """Distribute lrclib plain lyrics across the audio duration.
 
@@ -1178,7 +1179,16 @@ def _synthesize_segments_from_plain(plain: str,
         audio_duration: total audio length in seconds.
         anchors: optional list of (line_index, time_seconds) pairs from
             `_align_whisper_to_plain`. Empty/None falls back to even
-            distribution from 0.
+            distribution from `start_time`.
+        start_time: where the song body actually starts in the user's
+            audio. Default 0 (whole audio is song). When the audio has
+            a spoken-intro / dialogue prefix that the lrclib studio
+            version doesn't have (e.g. the YouTube "Video Oficial" cut
+            of "El Plan de la Mariposa - El Riesgo" has 73 s of
+            dialogue before the song proper begins), the caller passes
+            `start_time=intro_offset` so the synthesized song lyrics
+            distribute over [intro_offset, audio_duration] instead of
+            getting compressed by the spoken intro region.
 
     Returns segments in the same shape as `transcribe()` — list of
     {start, end, text} dicts, monotonically increasing, last `end`
@@ -1211,11 +1221,15 @@ def _synthesize_segments_from_plain(plain: str,
             last_idx_f, last_t_f = idx, t
 
     # Build the piecewise interpolation table. Always end at
-    # (n, audio_duration); start at (0, 0) unless an anchor lives at
-    # line 0.
+    # (n, audio_duration); start at (0, start_time) unless an anchor
+    # lives at line 0. start_time defaults to 0 (whole audio is song);
+    # for tracks with a non-song prefix (spoken intro, dialogue) the
+    # caller passes intro_offset so the song lyrics distribute over
+    # the song region only.
+    safe_start = max(0.0, min(float(start_time), float(audio_duration) - 0.5))
     points: list[tuple[float, float]] = list(monotonic)
     if not points or points[0][0] > 0:
-        points.insert(0, (0.0, 0.0))
+        points.insert(0, (0.0, safe_start))
     if points[-1][0] < float(n):
         points.append((float(n), float(audio_duration)))
 
