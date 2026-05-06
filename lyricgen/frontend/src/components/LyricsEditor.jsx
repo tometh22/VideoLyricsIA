@@ -195,24 +195,53 @@ export default function LyricsEditor({ segments, filename, audioFile, referenceL
     return (containing || lastStarted)?._id ?? null;
   }, [edited, currentTime]);
 
-  // Tap handler: anchor the line at syncCursor to currentTime, advance.
+  // Tap handler: anchor the line at syncCursor to currentTime, then
+  // propagate the same delta to every line AFTER it (the unanchored
+  // ones). If the offset was constant the next line is already roughly
+  // right and the operator only needs to confirm. Already-anchored
+  // lines (idx < syncCursor) are ground truth and stay put.
   const tapAnchor = useCallback(() => {
     if (!syncMode) return;
     if (syncCursor < 0 || syncCursor >= edited.length) return;
     const target = edited[syncCursor];
     if (!target) return;
     const newStart = Math.max(0, currentTime);
+    const delta = newStart - target.start;
+    // Snapshot the future lines BEFORE mutating so undo can restore
+    // every shifted timestamp, not just the anchor's.
+    const futureSnapshot = edited
+      .slice(syncCursor + 1)
+      .map((s) => ({ id: s._id, prevStart: s.start, prevEnd: s.end }));
     setSyncHistory((prev) => [
       ...prev,
-      { id: target._id, prevStart: target.start, prevEnd: target.end, cursor: syncCursor },
+      {
+        id: target._id,
+        prevStart: target.start,
+        prevEnd: target.end,
+        cursor: syncCursor,
+        future: futureSnapshot,
+        delta,
+      },
     ]);
     setEdited((prev) =>
-      prev.map((s) => {
-        if (s._id !== target._id) return s;
-        const segDur = Math.max(0.5, s.end - s.start);
-        let newEnd = newStart + segDur;
-        if (duration && newEnd > duration) newEnd = duration;
-        return { ...s, start: newStart, end: newEnd };
+      prev.map((s, i) => {
+        if (s._id === target._id) {
+          const segDur = Math.max(0.5, s.end - s.start);
+          let newEnd = newStart + segDur;
+          if (duration && newEnd > duration) newEnd = duration;
+          return { ...s, start: newStart, end: newEnd };
+        }
+        // Propagate delta to lines after the cursor when the shift is
+        // meaningful. Skip when delta is tiny to avoid jittering on
+        // micro-adjustments to a line whose original time was correct.
+        if (i > syncCursor && Math.abs(delta) >= 0.2) {
+          const segDur = Math.max(0.5, s.end - s.start);
+          const shifted = Math.max(0, s.start + delta);
+          let newEnd = shifted + segDur;
+          if (duration && newEnd > duration) newEnd = duration;
+          return { ...s, start: shifted, end: newEnd };
+        }
+        return s;
       }),
     );
     // Advance to the next line; auto-exit when past the last one.
@@ -227,10 +256,14 @@ export default function LyricsEditor({ segments, filename, audioFile, referenceL
     setSyncHistory((prev) => {
       if (prev.length === 0) return prev;
       const last = prev[prev.length - 1];
+      const futureMap = new Map((last.future || []).map((f) => [f.id, f]));
       setEdited((segs) =>
-        segs.map((s) =>
-          s._id === last.id ? { ...s, start: last.prevStart, end: last.prevEnd } : s,
-        ),
+        segs.map((s) => {
+          if (s._id === last.id) return { ...s, start: last.prevStart, end: last.prevEnd };
+          const f = futureMap.get(s._id);
+          if (f) return { ...s, start: f.prevStart, end: f.prevEnd };
+          return s;
+        }),
       );
       setSyncCursor(last.cursor);
       return prev.slice(0, -1);
@@ -353,6 +386,37 @@ export default function LyricsEditor({ segments, filename, audioFile, referenceL
 
   const deleteSeg = (id) => {
     setEdited((prev) => prev.filter((seg) => seg._id !== id));
+  };
+
+  // Insert a duplicate of `seg` immediately after it. Same text, same
+  // duration, start placed right after the original ends so the new
+  // row visibly differs in time. Operator typically re-syncs it via
+  // Sync mode tap or manual edit. Useful when Whisper missed a chorus
+  // repeat — duplicate the chorus block, then tap-sync the copies.
+  const duplicateSeg = (id) => {
+    setEdited((prev) => {
+      const idx = prev.findIndex((s) => s._id === id);
+      if (idx === -1) return prev;
+      const orig = prev[idx];
+      const segDur = Math.max(0.5, orig.end - orig.start);
+      const newStart = Math.min(duration || orig.end + segDur, orig.end);
+      const newEnd = Math.min(duration || newStart + segDur, newStart + segDur);
+      const nextId = prev.reduce((m, s) => Math.max(m, s._id), -1) + 1;
+      const dup = { ...orig, _id: nextId, start: newStart, end: newEnd };
+      return [...prev.slice(0, idx + 1), dup, ...prev.slice(idx + 1)];
+    });
+  };
+
+  // Append a blank line at the end of the list. Operator types the
+  // missing lyrics into the text input, then tap-syncs it.
+  const addBlankLine = () => {
+    setEdited((prev) => {
+      const last = prev[prev.length - 1];
+      const baseStart = last ? Math.min(duration || last.end + 2, last.end + 0.5) : 0;
+      const baseEnd = Math.min(duration || baseStart + 3, baseStart + 3);
+      const nextId = prev.reduce((m, s) => Math.max(m, s._id), -1) + 1;
+      return [...prev, { _id: nextId, start: baseStart, end: baseEnd, text: "" }];
+    });
   };
 
   const name = filename.replace(/\.(mp3|wav)$/i, "");
@@ -668,19 +732,42 @@ export default function LyricsEditor({ segments, filename, audioFile, referenceL
                       </button>
                     )}
                   </div>
-                  <button onClick={() => deleteSeg(seg._id)}
-                    className="shrink-0 w-8 h-8 mt-0.5 rounded-lg opacity-0 group-hover:opacity-100
-                      hover:bg-red-500/10 flex items-center justify-center text-gray-600
-                      hover:text-red-400 transition-all"
-                    title="Eliminar línea">
-                    <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
-                      <path d="M18 6L6 18M6 6l12 12" />
-                    </svg>
-                  </button>
+                  <div className="shrink-0 flex items-center gap-0.5 mt-0.5">
+                    <button onClick={() => duplicateSeg(seg._id)}
+                      className="w-8 h-8 rounded-lg opacity-0 group-hover:opacity-100
+                        hover:bg-brand/10 flex items-center justify-center text-gray-600
+                        hover:text-brand-light transition-all"
+                      title={t("editor.duplicate_line") || "Duplicar línea (útil para estribillos repetidos)"}>
+                      <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
+                        <rect x="9" y="9" width="11" height="11" rx="1.5" />
+                        <path d="M5 15V5a1 1 0 011-1h10" />
+                      </svg>
+                    </button>
+                    <button onClick={() => deleteSeg(seg._id)}
+                      className="w-8 h-8 rounded-lg opacity-0 group-hover:opacity-100
+                        hover:bg-red-500/10 flex items-center justify-center text-gray-600
+                        hover:text-red-400 transition-all"
+                      title="Eliminar línea">
+                      <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
+                        <path d="M18 6L6 18M6 6l12 12" />
+                      </svg>
+                    </button>
+                  </div>
                 </div>
               </div>
             );
           })}
+          <button
+            onClick={addBlankLine}
+            className="w-full mt-2 py-2.5 rounded-xl border border-dashed border-white/[0.08]
+              hover:border-brand/40 hover:bg-brand/[0.04] text-gray-500 hover:text-brand-light
+              text-[12px] transition-all flex items-center justify-center gap-1.5"
+          >
+            <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
+              <path d="M12 5v14M5 12h14" />
+            </svg>
+            {t("editor.add_line") || "Agregar línea"}
+          </button>
         </div>
       </div>
 
