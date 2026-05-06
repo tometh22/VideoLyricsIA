@@ -1,5 +1,6 @@
 import { useState, useRef, useCallback, useEffect } from "react";
 import { useI18n } from "./i18n";
+import { IS_PRODUCTION, APP_ENV } from "./env";
 import LoginPage from "./components/LoginPage";
 import Landing from "./components/Landing";
 import Sidebar from "./components/Sidebar";
@@ -12,7 +13,7 @@ import JobDetail from "./components/JobDetail";
 import Settings from "./components/Settings";
 import AdminPanel from "./components/AdminPanel";
 
-const API = "";
+const API = import.meta.env.VITE_API_URL || "";
 
 // --- Auth helpers ---
 function getToken() {
@@ -60,10 +61,19 @@ export default function App() {
   const [history, setHistory] = useState([]);
   const [selectedJob, setSelectedJob] = useState(null);
   const [backgroundFile, setBackgroundFile] = useState(null);
+  const [animateImage, setAnimateImage] = useState(false);
   const [backgroundId, setBackgroundId] = useState(null);
   const [sidebarOpen, setSidebarOpen] = useState(true);
+  const [resetToken, setResetToken] = useState(null);
   const pollingIntervals = useRef(new Set());
   const PARALLEL_WORKERS = 5;
+
+  // --- Stamp the document title with the environment when not in prod ---
+  useEffect(() => {
+    if (!IS_PRODUCTION) {
+      document.title = `[${APP_ENV.toUpperCase()}] GenLy`;
+    }
+  }, []);
 
   // --- Handle URL params (billing callbacks, email verification) ---
   useEffect(() => {
@@ -87,8 +97,10 @@ export default function App() {
       window.history.replaceState({}, "", window.location.pathname);
     }
     if (params.get("reset_password")) {
+      setResetToken(params.get("reset_password"));
       setShowLanding(false);
       setView("login");
+      window.history.replaceState({}, "", window.location.pathname);
     }
   }, []);
 
@@ -161,7 +173,9 @@ export default function App() {
     if (!files.length || !files.every((f) => f.artist.trim())) return;
     const jobList = files.map((f) => ({
       filename: f.file.name, _file: f.file, artist: f.artist.trim(),
-      language: f.language, status: "queued", current_step: null,
+      language: f.language, genre: f.genre || "", font: f.font || "",
+      concept: f.concept || "", movementStyle: f.movementStyle || "",
+      status: "queued", current_step: null,
       progress: 0, job_id: null, error: null,
     }));
     setJobs(jobList);
@@ -178,6 +192,15 @@ export default function App() {
     const formData = new FormData();
     formData.append("file", entry.file);
     if (entry.language) formData.append("language", entry.language);
+    // Forward the artist (and a derived title) so the backend's reference-
+    // lyrics fetcher (Gemini-grounded search) gets clean inputs even when
+    // the MP3 filename is something generic like "track.mp3".
+    if (entry.artist) formData.append("artist", entry.artist);
+    const _title = entry.file.name
+      .replace(/\.mp3$/i, "")
+      .replace(/^.*?\s-\s/, "")
+      .trim();
+    if (_title) formData.append("title", _title);
 
     try {
       const res = await authFetch(`${API}/transcribe`, { method: "POST", body: formData });
@@ -188,7 +211,11 @@ export default function App() {
       setTranscribing(false);
       setCurrentReview({
         file: entry.file, artist: entry.artist, language: entry.language,
+        genre: entry.genre || "", font: entry.font || "",
+        concept: entry.concept || "", movementStyle: entry.movementStyle || "",
         segments: data.segments, referenceLyrics: data.reference_lyrics || "",
+        coverageWarning: !!data.coverage_warning,
+        recoverySource: data.recovery_source || "",
         queueIdx: idx, queue,
       });
     } catch (err) {
@@ -200,7 +227,10 @@ export default function App() {
   const handleApproveLyrics = (editedSegments) => {
     const r = currentReview;
     const newApproved = [...approvedJobs, {
-      file: r.file, artist: r.artist, language: r.language, segments: editedSegments,
+      file: r.file, artist: r.artist, language: r.language,
+      genre: r.genre || "", font: r.font || "", concept: r.concept || "",
+      movementStyle: r.movementStyle || "",
+      segments: editedSegments,
     }];
     setApprovedJobs(newApproved);
     setCurrentReview(null);
@@ -218,7 +248,9 @@ export default function App() {
   const startGenerationWithSegments = async (approved) => {
     const jobList = approved.map((a) => ({
       filename: a.file.name, _file: a.file, artist: a.artist,
-      language: a.language, segments: a.segments,
+      language: a.language, genre: a.genre || "", font: a.font || "",
+      concept: a.concept || "", movementStyle: a.movementStyle || "",
+      segments: a.segments,
       status: "queued", current_step: null, progress: 0, job_id: null, error: null,
     }));
     setJobs(jobList);
@@ -238,6 +270,11 @@ export default function App() {
         formData.append("artist", jobList[i].artist);
         formData.append("style", style);
         if (jobList[i].language) formData.append("language", jobList[i].language);
+        if (jobList[i].genre) formData.append("genre", jobList[i].genre);
+        if (jobList[i].font) formData.append("font", jobList[i].font);
+        if (jobList[i].concept) formData.append("concept", jobList[i].concept);
+        if (jobList[i].movementStyle) formData.append("movement_style", jobList[i].movementStyle);
+        if (animateImage && backgroundFile) formData.append("animate_image", "true");
         formData.append("segments_json", JSON.stringify(jobList[i].segments));
         formData.append("delivery_profile", delivery.delivery_profile);
         if (delivery.delivery_profile !== "youtube") {
@@ -289,6 +326,11 @@ export default function App() {
           formData.append("umg_prores_profile", String(delivery.umg_prores_profile));
         }
         if (jobList[i].language) formData.append("language", jobList[i].language);
+        if (jobList[i].genre) formData.append("genre", jobList[i].genre);
+        if (jobList[i].font) formData.append("font", jobList[i].font);
+        if (jobList[i].concept) formData.append("concept", jobList[i].concept);
+        if (jobList[i].movementStyle) formData.append("movement_style", jobList[i].movementStyle);
+        if (animateImage && backgroundFile) formData.append("animate_image", "true");
         if (backgroundId) formData.append("background_id", backgroundId);
         else if (backgroundFile) formData.append("background_file", backgroundFile);
 
@@ -396,7 +438,12 @@ export default function App() {
 
   // --- Login/Register ---
   if (!token && view === "login") {
-    return <LoginPage onLogin={(t, u) => { handleLogin(t, u); setView("dashboard"); }} onBack={() => setShowLanding(true)} />;
+    return <LoginPage
+      onLogin={(t, u) => { handleLogin(t, u); setView("dashboard"); }}
+      onBack={() => setShowLanding(true)}
+      resetToken={resetToken}
+      onResetComplete={() => setResetToken(null)}
+    />;
   }
 
   // --- Not authenticated, redirect to landing ---
@@ -453,6 +500,7 @@ export default function App() {
           {/* Dashboard */}
           {view === "dashboard" && (
             <Dashboard
+              user={user}
               history={history}
               onSelectJob={handleSelectJob}
               onNewBatch={() => { setView("new"); setFiles([]); }}
@@ -471,7 +519,7 @@ export default function App() {
 
           {/* New batch */}
           {view === "new" && !currentReview && !transcribing && !readyToGenerate && (
-            <div className="w-full max-w-xl mx-auto animate-fade-in">
+            <div className="w-full max-w-4xl mx-auto animate-fade-in">
               <div className="flex items-center gap-3 mb-8">
                 <button onClick={() => setView("dashboard")}
                   className="w-9 h-9 rounded-xl glass flex items-center justify-center text-gray-400 hover:text-white transition-colors">
@@ -485,34 +533,20 @@ export default function App() {
                 </div>
               </div>
 
-              <div className="space-y-5">
-                <UploadZone
-                  files={files}
-                  onFiles={setFiles}
-                  onDeliveryChange={setDelivery}
-                  backgroundFile={backgroundFile}
-                  onBackgroundFile={setBackgroundFile}
-                  backgroundId={backgroundId}
-                  onBackgroundId={setBackgroundId}
-                />
-
-                {allHaveArtist && (
-                  <div className="flex gap-3">
-                    <button onClick={handleStartReview} className="btn-primary flex-1 py-4">
-                      {t("upload.review_lyrics")}
-                    </button>
-                    <button onClick={handleGenerateDirect} className="btn-secondary flex-1 py-4 text-sm">
-                      {t("upload.generate_direct")}
-                    </button>
-                  </div>
-                )}
-
-                {files.length > 0 && !allHaveArtist && (
-                  <p className="text-center text-xs text-amber-400/70">
-                    {t("upload.complete_artist")}
-                  </p>
-                )}
-              </div>
+              <UploadZone
+                files={files}
+                onFiles={setFiles}
+                onDeliveryChange={setDelivery}
+                backgroundFile={backgroundFile}
+                onBackgroundFile={setBackgroundFile}
+                backgroundId={backgroundId}
+                onBackgroundId={setBackgroundId}
+                animateImage={animateImage}
+                onAnimateImage={setAnimateImage}
+                allHaveArtist={allHaveArtist}
+                onStartReview={handleStartReview}
+                onGenerateDirect={handleGenerateDirect}
+              />
             </div>
           )}
 
@@ -549,7 +583,10 @@ export default function App() {
               <LyricsEditor
                 segments={currentReview.segments}
                 filename={currentReview.file.name}
+                audioFile={currentReview.file}
                 referenceLyrics={currentReview.referenceLyrics || ""}
+                coverageWarning={currentReview.coverageWarning}
+                recoverySource={currentReview.recoverySource}
                 onApprove={handleApproveLyrics}
                 onBack={handleReset}
                 isBatch={currentReview.queue.length > 1}

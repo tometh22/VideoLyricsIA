@@ -18,8 +18,13 @@ def create_job(
     tenant_id: str = "default",
     delivery_profile: str = "youtube",
     umg_spec: Optional[dict] = None,
+    initial_status: str = "processing",
 ) -> str:
-    """Create a new job and return its ID."""
+    """Create a new job and return its ID. `initial_status` is "processing"
+    when there's worker capacity OR "queued" when the system / tenant is at
+    its concurrency cap. The caller decides which based on live load."""
+    if initial_status not in ("processing", "queued"):
+        raise ValueError(f"unsupported initial_status {initial_status!r}")
     job_id = uuid.uuid4().hex[:12]
     job = Job(
         job_id=job_id,
@@ -30,8 +35,8 @@ def create_job(
         filename=filename,
         delivery_profile=delivery_profile,
         umg_spec=umg_spec,
-        status="processing",
-        current_step="whisper",
+        status=initial_status,
+        current_step="whisper" if initial_status == "processing" else "queued",
         progress=0,
     )
     db.add(job)

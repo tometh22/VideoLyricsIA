@@ -18,7 +18,39 @@ SMTP_FROM = os.environ.get("SMTP_FROM", "GenLy AI <noreply@genly.ai>")
 SMTP_USE_TLS = os.environ.get("SMTP_USE_TLS", "true").lower() == "true"
 FRONTEND_URL = os.environ.get("FRONTEND_URL", "http://localhost:5173")
 
+# Staging guard. On non-prod, redirect every outbound email to a single
+# allow-listed inbox so we never accidentally email a real customer from
+# tests/dev. Set EMAIL_STAGING_ALLOWLIST to a comma-separated list of
+# addresses to also allow (rare). Setting EMAIL_STAGING_REDIRECT empty
+# silently drops all mail on non-prod (safest default if no test inbox
+# is wired up).
+ENVIRONMENT = (os.environ.get("ENVIRONMENT")
+               or os.environ.get("ENV")
+               or "production").lower().strip()
+EMAIL_STAGING_REDIRECT = os.environ.get("EMAIL_STAGING_REDIRECT", "").strip()
+EMAIL_STAGING_ALLOWLIST = {
+    s.strip().lower() for s in os.environ.get("EMAIL_STAGING_ALLOWLIST", "").split(",")
+    if s.strip()
+}
+
 _enabled = bool(SMTP_HOST and SMTP_USER)
+
+
+def _staging_gate(to: str, subject: str) -> Optional[str]:
+    """Return the address to actually send to, or None to drop the message.
+    Production passes through unchanged.
+    """
+    if ENVIRONMENT == "production":
+        return to
+    if to.strip().lower() in EMAIL_STAGING_ALLOWLIST:
+        return to
+    if EMAIL_STAGING_REDIRECT:
+        logger.info(f"[STAGING] Redirecting email to {EMAIL_STAGING_REDIRECT} "
+                    f"(originally {to}, subject={subject!r})")
+        return EMAIL_STAGING_REDIRECT
+    logger.info(f"[STAGING] Dropping email (no redirect configured): "
+                f"to={to}, subject={subject!r}")
+    return None
 
 
 def _send_email(to: str, subject: str, html_body: str):
@@ -27,10 +59,17 @@ def _send_email(to: str, subject: str, html_body: str):
         logger.debug(f"Email not configured — skipping: {subject} → {to}")
         return
 
+    target = _staging_gate(to, subject)
+    if target is None:
+        return  # dropped by staging guard
+
     msg = MIMEMultipart("alternative")
+    # Stamp the subject so it's obvious in the inbox we're not in prod.
+    if ENVIRONMENT != "production":
+        subject = f"[{ENVIRONMENT.upper()}] {subject}"
     msg["Subject"] = subject
     msg["From"] = SMTP_FROM
-    msg["To"] = to
+    msg["To"] = target
     msg.attach(MIMEText(html_body, "html"))
 
     try:
@@ -41,9 +80,9 @@ def _send_email(to: str, subject: str, html_body: str):
             server = smtplib.SMTP_SSL(SMTP_HOST, SMTP_PORT)
 
         server.login(SMTP_USER, SMTP_PASSWORD)
-        server.sendmail(SMTP_FROM, to, msg.as_string())
+        server.sendmail(SMTP_FROM, target, msg.as_string())
         server.quit()
-        logger.info(f"Email sent: {subject} → {to}")
+        logger.info(f"Email sent: {subject} → {target}")
     except Exception as e:
         logger.error(f"Failed to send email: {e}")
 

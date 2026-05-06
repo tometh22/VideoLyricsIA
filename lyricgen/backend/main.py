@@ -10,6 +10,15 @@ import time
 from dotenv import load_dotenv
 load_dotenv(os.path.join(os.path.dirname(__file__), ".env"))
 
+from credentials_bootstrap import bootstrap_vertex_credentials
+bootstrap_vertex_credentials()
+
+# --- Environment (production | staging | development) ---
+# Single source of truth for "where am I running" — used by Sentry, the
+# /health endpoint, and email gating so staging never sends real-looking
+# mail to a real customer's inbox.
+ENVIRONMENT = os.environ.get("ENVIRONMENT", "production").lower().strip() or "production"
+
 # --- Sentry (must init before FastAPI) ---
 _SENTRY_DSN = os.environ.get("SENTRY_DSN", "")
 if _SENTRY_DSN:
@@ -17,7 +26,8 @@ if _SENTRY_DSN:
     sentry_sdk.init(
         dsn=_SENTRY_DSN,
         traces_sample_rate=float(os.environ.get("SENTRY_TRACES_RATE", "0.1")),
-        environment=os.environ.get("SENTRY_ENV", "production"),
+        # SENTRY_ENV overrides ENVIRONMENT only if explicitly set (back-compat).
+        environment=os.environ.get("SENTRY_ENV") or ENVIRONMENT,
         release=os.environ.get("SENTRY_RELEASE", "genly@2.0.0"),
     )
 
@@ -172,18 +182,48 @@ async def list_backgrounds(
     return [a.to_dict() for a in assets]
 
 
+@app.get("/fonts")
+async def list_fonts(current_user: dict = Depends(get_current_user)):
+    """Return the catalogue of selectable typography for the lyric video.
+
+    The frontend renders previews directly via the Google Fonts CDN — every
+    entry's google_family + google_weight matches the local TTF used by
+    the worker, so the picker preview matches the rendered output.
+    """
+    from pipeline import _FONT_CATALOGUE
+    # Strip the filename — that's a backend-only concern.
+    return [
+        {k: v for k, v in entry.items() if k != "filename"}
+        for entry in _FONT_CATALOGUE
+    ]
+
+
 @app.get("/backgrounds/{asset_id}/preview")
 async def preview_background(
     asset_id: int,
     token: str = Query(...),
     db: Session = Depends(get_db),
 ):
-    """Serve a background asset file for preview."""
+    """Serve a background asset file for preview.
+
+    When the asset lives in R2 (filename starts with `library/`), redirect
+    to a short-lived signed URL so the browser fetches directly from
+    Cloudflare — no streaming through uvicorn for what may be a 5 MB clip.
+    Falls back to FileResponse from disk for legacy / local-only assets.
+    """
     get_current_user_from_token_param(token, db)
     from database import BackgroundAsset
+    import storage
     asset = db.query(BackgroundAsset).filter(BackgroundAsset.id == asset_id).first()
     if not asset:
         raise HTTPException(status_code=404, detail="Asset not found")
+
+    if asset.filename.startswith("library/") and storage.is_enabled():
+        url = storage.generate_signed_url(asset.filename, expiry_seconds=900)
+        if url:
+            return RedirectResponse(url, status_code=302)
+        # If signing failed for any reason, fall through to local fallback.
+
     file_path = os.path.join(_BACKGROUNDS_LIB, asset.filename)
     if not os.path.exists(file_path):
         raise HTTPException(status_code=404, detail="File not found")
@@ -385,29 +425,52 @@ async def list_plans():
 # Protected endpoints
 # ---------------------------------------------------------------------------
 
-MAX_UPLOAD_MB = int(os.environ.get("MAX_UPLOAD_MB", "50"))
+MAX_UPLOAD_MB = int(os.environ.get("MAX_UPLOAD_MB", "100"))
 _MP3_MAGIC_BYTES = (b"ID3", b"\xff\xfb", b"\xff\xf3", b"\xff\xf2")
+_AUDIO_EXTENSIONS = (".mp3", ".wav")
 
 
-def _validate_mp3_upload(file, data: bytes) -> None:
-    """Validate a freshly-read MP3 payload. Raises 400 on any problem.
+def _validate_audio_upload(file, data: bytes) -> None:
+    """Validate a freshly-read audio payload (MP3 or WAV). Raises 400 on
+    any problem. Magic-bytes check supplements the extension check so a
+    renamed file gets caught.
 
-    Bypassing the `.mp3` extension check is trivial, so we also peek at the
-    first bytes and enforce a size ceiling.
+    UMG uploads lossless WAV; everyone else uploads MP3. Both are valid
+    inputs to the rest of the pipeline (Whisper, moviepy, ffmpeg all
+    handle either format). Whisper-API has a hard 25 MB limit which is
+    handled separately at transcribe time — see _transcribe_via_openai_api.
     """
-    if not file.filename or not file.filename.lower().endswith(".mp3"):
-        raise HTTPException(status_code=400, detail="Only MP3 files are accepted.")
+    if not file.filename:
+        raise HTTPException(status_code=400, detail="Missing filename.")
+    name_lower = file.filename.lower()
+    if not name_lower.endswith(_AUDIO_EXTENSIONS):
+        raise HTTPException(
+            status_code=400,
+            detail="Only MP3 and WAV files are accepted.",
+        )
     size_mb = len(data) / 1024 / 1024
     if size_mb > MAX_UPLOAD_MB:
         raise HTTPException(
             status_code=413,
             detail=f"File too large ({size_mb:.1f} MB). Max allowed: {MAX_UPLOAD_MB} MB.",
         )
-    if not data.startswith(_MP3_MAGIC_BYTES):
-        raise HTTPException(
-            status_code=400,
-            detail="File does not look like a valid MP3 (magic bytes check failed).",
-        )
+    if name_lower.endswith(".mp3"):
+        if not data.startswith(_MP3_MAGIC_BYTES):
+            raise HTTPException(
+                status_code=400,
+                detail="File does not look like a valid MP3 (magic bytes check failed).",
+            )
+    elif name_lower.endswith(".wav"):
+        # WAV files start with "RIFF" + 4 bytes size + "WAVE".
+        if len(data) < 12 or data[:4] != b"RIFF" or data[8:12] != b"WAVE":
+            raise HTTPException(
+                status_code=400,
+                detail="File does not look like a valid WAV (RIFF/WAVE header check failed).",
+            )
+
+
+# Back-compat alias — older call sites still reference the MP3 name.
+_validate_mp3_upload = _validate_audio_upload
 
 
 def _enforce_plan_quota(db: Session, current_user: dict) -> None:
@@ -434,41 +497,51 @@ def _enforce_plan_quota(db: Session, current_user: dict) -> None:
 DEFAULT_DAILY_CAP = 50
 
 
-DEFAULT_MAX_CONCURRENT_JOBS = 10
+DEFAULT_MAX_CONCURRENT_JOBS = 5
+
+# System-wide ceiling. Sum of `processing` jobs across ALL tenants cannot
+# exceed this, even if each individual tenant is below their own cap.
+# Sized at ~2× the worker replica count (3) — enough burst headroom that
+# workers never sit idle, but small enough that a multi-tenant flood
+# cannot saturate the worker pool and starve the premium customer.
+# Override via env GLOBAL_MAX_PROCESSING for capacity tuning during scale-up.
+GLOBAL_MAX_PROCESSING = int(os.environ.get("GLOBAL_MAX_PROCESSING", "8"))
 
 
-def _enforce_concurrent_jobs_cap(db: Session, current_user: dict) -> None:
-    """Raise 429 if the tenant already has too many jobs in flight. The cap
-    naturally enforces "one batch at a time" — a UMG user uploads up to N
-    tracks; once they finish processing, the next batch can start.
+def _enforce_concurrent_jobs_cap(*_, **__) -> None:
+    """Deprecated. Concurrency is now bounded naturally by the RQ worker
+    pool — every submission is accepted with status="queued" and the
+    worker flips it to "processing" the moment it picks the job off the
+    queue. Kept as a no-op so any forgotten callsite is harmless."""
+    return None
 
-    "In flight" means status="processing". Jobs in pending_review (awaiting
-    user approval) or terminal states don't consume pipeline resources, so
-    they don't count.
 
-    Default is DEFAULT_MAX_CONCURRENT_JOBS (10). Admin can override per user
-    via PATCH /admin/users/{id} with max_concurrent_jobs.
-    """
+# Soft per-tenant cap on jobs that need attention (queued + processing +
+# pending_review). Forces operators to clear their existing backlog before
+# piling on more work. Tomi communicated this 5-batch ceiling to UMG as
+# the agreed launch-window throughput; do NOT raise without re-aligning
+# with the operator. Admins bypass for test seeding.
+TENANT_BACKLOG_LIMIT = int(os.environ.get("TENANT_BACKLOG_LIMIT", "5"))
+
+
+def _enforce_tenant_backlog(db: Session, current_user: dict) -> None:
+    # Admins are exempt — they may legitimately seed many test jobs.
+    if current_user.get("role") == "admin":
+        return
     tenant_id = current_user["tenant_id"]
-    user_model = db.query(User).filter(User.id == current_user["id"]).first()
-
-    cap = (user_model.max_concurrent_jobs if user_model
-           and user_model.max_concurrent_jobs is not None
-           else DEFAULT_MAX_CONCURRENT_JOBS)
-
     in_flight = (
         db.query(Job)
         .filter(Job.tenant_id == tenant_id)
-        .filter(Job.status == "processing")
+        .filter(Job.status.in_(["queued", "processing", "pending_review"]))
         .count()
     )
-
-    if in_flight >= cap:
+    if in_flight >= TENANT_BACKLOG_LIMIT:
         raise HTTPException(
             status_code=429,
             detail=(
-                f"Batch limit reached ({in_flight}/{cap} jobs already in flight). "
-                "Wait for your current batch to finish before starting a new one."
+                f"Tu equipo tiene {in_flight} videos en proceso o pendientes "
+                f"de revisión (límite: {TENANT_BACKLOG_LIMIT}). Aprobá o "
+                f"rechazá algunos antes de subir más."
             ),
         )
 
@@ -555,6 +628,11 @@ async def upload(
     umg_prores_profile: str = Form(""),
     background_id: int = Form(None),
     background_file: UploadFile = File(None),
+    genre: str = Form(""),
+    font: str = Form(""),
+    concept: str = Form(""),
+    movement_style: str = Form(""),
+    animate_image: str = Form(""),
     current_user: dict = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
@@ -564,7 +642,11 @@ async def upload(
 
     _enforce_plan_quota(db, current_user)
     _enforce_daily_volume_cap(db, current_user)
-    _enforce_concurrent_jobs_cap(db, current_user)
+    _enforce_tenant_backlog(db, current_user)
+    # Every submission is accepted as queued; RQ gives it to a worker the
+    # moment one is free, and pipeline.run_pipeline flips status to
+    # "processing" on its first line. No 429 for capacity reasons.
+    initial_status = "queued"
 
     umg_spec = _parse_umg_params(delivery_profile, umg_frame_size, umg_fps, umg_prores_profile)
 
@@ -585,6 +667,7 @@ async def upload(
         artist=artist, style=style, filename=file.filename,
         user_id=current_user["id"], tenant_id=tenant_id,
         delivery_profile=delivery_profile, umg_spec=umg_spec,
+        initial_status=initial_status,
     )
     job_dir = os.path.join(OUTPUTS_DIR, job_id)
     os.makedirs(job_dir, exist_ok=True)
@@ -593,22 +676,49 @@ async def upload(
     with open(mp3_path, "wb") as f:
         f.write(data)
 
+    # Upload the input MP3 to R2 regardless of whether the job will run now
+    # or wait in the queue — the worker container fetches from R2 (the API
+    # container disk is ephemeral and may be gone by the time a queued job
+    # promotes to processing minutes/hours later).
+    input_r2_key = None
+    if storage.is_enabled():
+        input_r2_key = storage.upload_input(
+            mp3_path, tenant_id, job_id, file.filename,
+        )
+
     # Resolve background: library asset > custom upload > AI generation
     bg_path = None
+    bg_r2_key = None
     if background_id:
         from database import BackgroundAsset
         asset = db.query(BackgroundAsset).filter(BackgroundAsset.id == background_id, BackgroundAsset.is_active == True).first()
         if asset:
-            bg_path = os.path.join(_BACKGROUNDS_LIB, asset.filename)
+            if asset.filename.startswith("library/"):
+                # R2-stored asset: pipeline will download via bg_r2_key.
+                bg_ext = os.path.splitext(asset.filename)[1].lower() or f".{asset.file_type}"
+                bg_path = os.path.join(job_dir, f"bg_library{bg_ext}")
+                bg_r2_key = asset.filename
+            else:
+                # Legacy / dev: file is on local disk.
+                bg_path = os.path.join(_BACKGROUNDS_LIB, asset.filename)
     elif background_file and background_file.filename:
         bg_ext = os.path.splitext(background_file.filename)[1].lower()
         if bg_ext in (".mp4", ".mov", ".jpg", ".jpeg", ".png"):
-            bg_path = os.path.join(job_dir, f"bg_custom{bg_ext}")
+            bg_filename = f"bg_custom{bg_ext}"
+            bg_path = os.path.join(job_dir, bg_filename)
             with open(bg_path, "wb") as f:
                 shutil.copyfileobj(background_file.file, f)
+            # User-provided backgrounds also need to cross to the worker.
+            if storage.is_enabled():
+                bg_r2_key = storage.upload_input(
+                    bg_path, tenant_id, job_id, bg_filename,
+                )
 
     lang = language.strip() if language.strip() else None
 
+    # Always enqueue. RQ's per-priority worker pool naturally caps how many
+    # jobs run at once — the rest wait in Redis. UMG (plan=unlimited) goes
+    # to the enterprise queue, which workers drain before the default queue.
     enqueue_pipeline(
         job_id=job_id,
         mp3_path=mp3_path,
@@ -619,9 +729,16 @@ async def upload(
         delivery_profile=delivery_profile,
         umg_spec=umg_spec,
         background_path=bg_path,
+        input_r2_key=input_r2_key,
+        bg_r2_key=bg_r2_key,
+        genre=genre,
+        font=font,
+        concept=concept,
+        movement_style=movement_style,
+        animate_image=str(animate_image).strip().lower() in ("true", "1", "yes", "on"),
     )
 
-    return {"job_id": job_id}
+    return {"job_id": job_id, "status": initial_status}
 
 
 @app.post("/transcribe")
@@ -630,11 +747,14 @@ async def transcribe_endpoint(
     request: Request,
     file: UploadFile = File(...),
     language: str = Form(""),
+    artist: str = Form(""),
+    title: str = Form(""),
     current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db),
 ):
-    """Transcribe an MP3 and return segments for review/editing."""
-    if not file.filename.lower().endswith(".mp3"):
-        raise HTTPException(status_code=400, detail="Only MP3 files are accepted.")
+    """Transcribe an MP3 or WAV and return segments for review/editing."""
+    if not file.filename.lower().endswith(_AUDIO_EXTENSIONS):
+        raise HTTPException(status_code=400, detail="Only MP3 and WAV files are accepted.")
 
     import tempfile
     import asyncio
@@ -647,26 +767,394 @@ async def transcribe_endpoint(
     try:
         lang = language.strip() if language.strip() else None
         loop = asyncio.get_event_loop()
-        segments = await loop.run_in_executor(None, transcribe, tmp_path, lang)
 
-        # Fetch reference lyrics
-        import requests as _req
+        # Resolve artist + title for the reference-lyrics fetch. Source order:
+        #   1) explicit form fields (frontend already collects `artist` per
+        #      file in UploadZone — we now forward it),
+        #   2) "Artist - Title" pattern in the filename (legacy fallback),
+        #   3) bare filename as title with no artist (Gemini-search will be
+        #      skipped — see the empty-artist guard inside the fetcher).
+        # Suffixes like "(Official Video)" are scrubbed in either case.
         basename = os.path.splitext(file.filename)[0]
-        artist_hint, song_hint = "", basename
-        if " - " in basename:
+        artist_hint = artist.strip()
+        song_hint = title.strip() or basename
+        if not artist_hint and " - " in basename:
             artist_hint, song_hint = basename.split(" - ", 1)
         for sfx in ["(Official Video)", "(Official Audio)", "(Lyric Video)",
                      "(Official Music Video)", "(En Vivo)", "(Live)", "(Lyrics)",
                      "- River Plate", "- Luna Park", "- En Vivo"]:
             song_hint = song_hint.replace(sfx, "").strip()
+        if not artist_hint:
+            print(f"[LYRICS] no artist supplied for {file.filename!r} — "
+                  f"Gemini fetch will be skipped, falling through to lyrics.ovh")
 
+        # Fast-path: lrclib.net often has synced (LRC) lyrics for popular
+        # songs — when that's the case we skip Whisper entirely. Whisper
+        # API is the source of the hallucination problems UMG hit on Karol G
+        # ("¡Karol!" repeated 174x then dropped, leaving the second half
+        # of the song without subtitles). Community-curated synced lyrics
+        # have no such failure mode.
+        #
+        # Caveat: lrclib's synced timestamps are tied to a SPECIFIC version
+        # of the audio (usually the studio mix). If the user uploads the
+        # "Official Video" version with a dialogue intro added, every
+        # subtitle will be ~30 s early. We compare audio duration against
+        # lrclib's reported duration:
+        #   diff <= 3 s          → use synced as-is
+        #   3 s < diff <= 60 s   → assume intro added; offset all timestamps
+        #                          by +diff (reasonable for the common case)
+        #   diff > 60 s          → fall back to plain + Whisper (live /
+        #                          extended / remix versions are too risky
+        #                          to auto-align)
+        from pipeline import (
+            _fetch_lrclib, _lrc_to_segments, _audio_duration,
+            _slice_audio_prefix, _slice_audio_window, _verify_lrclib_alignment,
+            _detect_hallucination, _synthesize_segments_from_plain,
+            _align_whisper_to_plain, _fill_gaps_with_reference,
+        )
+        lrc = await asyncio.to_thread(_fetch_lrclib, artist_hint, song_hint, db)
+        if lrc:
+            synced = lrc.get("synced")
+            plain = lrc.get("plain") or ""
+            lrc_dur = lrc.get("duration")
+            if synced:
+                user_dur = await asyncio.to_thread(_audio_duration, tmp_path)
+                offset = 0.0
+                use_synced = True
+                hybrid_intro_segs: list[dict] = []
+                if user_dur is not None and lrc_dur:
+                    diff = user_dur - lrc_dur
+                    if abs(diff) <= 3.0:
+                        offset = 0.0
+                    elif 3.0 < diff <= 120.0:
+                        offset = float(diff)
+                        # User has extra audio at the start (typical "Official
+                        # Video" cut with a dialogue intro). Slice that chunk
+                        # and run Whisper on it so the operator gets the
+                        # spoken dialogue subtitled too — they can prune in
+                        # the editor if they don't want to publish it.
+                        intro_path = os.path.join(tmp_dir, "intro.mp3")
+                        if _slice_audio_prefix(tmp_path, intro_path, diff + 1.0):
+                            try:
+                                wsegs = await loop.run_in_executor(
+                                    None, transcribe, intro_path, lang, plain,
+                                )
+                                # Keep only segments that fully sit in the
+                                # intro window — defensive, in case ffmpeg
+                                # cut on a frame boundary slightly past `diff`.
+                                hybrid_intro_segs = [
+                                    s for s in wsegs if s["end"] <= diff + 0.5
+                                ]
+                            except Exception as e:
+                                print(f"[LYRICS] intro Whisper failed: {e}")
+                            finally:
+                                try:
+                                    os.unlink(intro_path)
+                                except OSError:
+                                    pass
+                        print(f"[LYRICS] lrclib duration mismatch "
+                              f"(user={user_dur:.1f}s, lrclib={lrc_dur:.1f}s) "
+                              f"— +{offset:.2f}s offset on song; intro Whisper "
+                              f"produced {len(hybrid_intro_segs)} segments")
+                    else:
+                        use_synced = False
+                        print(f"[LYRICS] lrclib duration mismatch "
+                              f"(user={user_dur:.1f}s, lrclib={lrc_dur:.1f}s, "
+                              f"diff={diff:+.1f}s) — too risky to auto-align, "
+                              f"falling back to Whisper")
+                if use_synced:
+                    song_segs = _lrc_to_segments(
+                        synced, lrc_dur, time_offset=offset,
+                    )
+                    # Alignment verification — when we applied an offset, we
+                    # have NO ground-truth that the offset is correct (the
+                    # extra audio could be at the end, not the start). Slice
+                    # ~5 s of the user's audio at where we claim a song line
+                    # starts, run Whisper, fuzzy-match. If the match is weak
+                    # (< 0.4), we don't trust the alignment and fall through
+                    # to plain + Whisper. Cost: 1 extra Whisper call on 5 s
+                    # of audio (~$0.0005) and ~3 s of latency.
+                    if offset > 0 and song_segs:
+                        # Verify mid-song (more robust than first line which
+                        # may be a short ad-lib like "¡Karol!")
+                        mid_idx = min(len(song_segs) - 1, len(song_segs) // 2)
+                        verify_seg = song_segs[mid_idx]
+                        # Skip verification if the chosen text is too short
+                        # to fuzzy-match reliably.
+                        if len(verify_seg["text"]) >= 10:
+                            confidence = await asyncio.to_thread(
+                                _verify_lrclib_alignment,
+                                tmp_path, verify_seg["text"], verify_seg["start"],
+                            )
+                            if confidence is not None:
+                                if confidence < 0.4:
+                                    print(f"[LYRICS] alignment verification FAILED "
+                                          f"(confidence={confidence:.2f} at "
+                                          f"t={verify_seg['start']:.1f}s for "
+                                          f"{verify_seg['text'][:40]!r}) — "
+                                          f"falling back to Whisper+plain")
+                                    use_synced = False
+                                else:
+                                    print(f"[LYRICS] alignment verified "
+                                          f"(confidence={confidence:.2f})")
+                            elif diff > 60.0:
+                                # High-diff offsets are riskier — if we can't
+                                # even verify, don't gamble; fall back.
+                                print(f"[LYRICS] alignment verification "
+                                      f"unavailable for high-diff offset "
+                                      f"({diff:.1f}s) — falling back")
+                                use_synced = False
+                    if use_synced and song_segs and len(song_segs) >= 8:
+                        combined = hybrid_intro_segs + song_segs
+                        print(f"[LYRICS] lrclib synced hit — "
+                              f"{len(combined)} segments "
+                              f"({len(hybrid_intro_segs)} intro + "
+                              f"{len(song_segs)} song), skipping main Whisper "
+                              f"for {artist_hint!r} - {song_hint!r}")
+                        return {
+                            "segments": combined,
+                            "reference_lyrics": plain or synced,
+                        }
+            # No synced (or too few segments / unreliable timestamps) — but
+            # we still have plain text from lrclib. Use it as the reference
+            # so the editor's suggestion engine fires, and skip the Gemini-
+            # grounded search step entirely (lrclib already gave us a clean
+            # source).
+            if plain:
+                print(f"[LYRICS] lrclib plain hit ({len(plain)} chars) — "
+                      f"running Whisper for timestamps (lyrics_hint primed), "
+                      f"skipping Gemini")
+
+                # Pre-Whisper intro trim. The "Video Oficial" cuts of many
+                # tracks add 30-90s of dialogue / extra music at the start
+                # that the studio version (which lrclib indexes) doesn't
+                # have. Feeding all of that to Whisper poisons its context
+                # and causes it to hallucinate or under-segment the actual
+                # song (verified end-to-end on "El Plan de la Mariposa —
+                # El Riesgo": 12 segments on full audio vs 19 on trimmed).
+                # When the user's audio is materially longer than lrclib's
+                # studio length, we slice off the prefix and only send the
+                # body to Whisper, then shift the returned timestamps back
+                # so they align with the user's full file in the editor.
+                user_dur = await asyncio.to_thread(_audio_duration, tmp_path)
+                intro_offset = 0.0
+                transcribe_path = tmp_path
+                trimmed_path = None
+                intro_segments: list[dict] = []
+                if (lrc_dur and user_dur
+                        and 3.0 < (user_dur - lrc_dur) <= 120.0):
+                    intro_offset = float(user_dur - lrc_dur)
+                    candidate = os.path.join(tmp_dir, "body_only.mp3")
+                    sliced = await asyncio.to_thread(
+                        _slice_audio_window, tmp_path, candidate,
+                        intro_offset, user_dur - intro_offset,
+                    )
+                    if sliced:
+                        transcribe_path = candidate
+                        trimmed_path = candidate
+                        print(f"[LYRICS] trimmed {intro_offset:.1f}s intro "
+                              f"before Whisper "
+                              f"(user={user_dur:.1f}s, lrclib={lrc_dur:.1f}s)")
+                    else:
+                        intro_offset = 0.0  # slice failed — fall through
+
+                # Hybrid intro Whisper. The intro region we sliced off may
+                # contain a spoken dialogue / narration that previews the
+                # song's lyrics (verified case: "El Plan de la Mariposa —
+                # El Riesgo" Video Oficial has 73 s of voice-over reciting
+                # the first verse before the song starts). Run Whisper on
+                # the intro chunk with the same lyrics_hint so it
+                # transcribes the spoken text against the known vocabulary
+                # and emits real timestamps for it. The segments returned
+                # here are kept as-is in the user's full-audio frame
+                # (they were never shifted) and prepended to the final
+                # output so the operator sees the dialogue subtitled at
+                # 0:00–intro_offset and the song body subtitled
+                # afterwards.
+                if intro_offset > 0:
+                    intro_path = os.path.join(tmp_dir, "intro_only.mp3")
+                    if await asyncio.to_thread(
+                        _slice_audio_prefix, tmp_path, intro_path,
+                        intro_offset + 1.0,
+                    ):
+                        try:
+                            intro_segs_raw = await loop.run_in_executor(
+                                None, transcribe, intro_path, lang, plain,
+                            )
+                            # Keep only segments that fully sit in the
+                            # intro window; defensive against ffmpeg
+                            # frame-boundary slop.
+                            intro_segments = [
+                                s for s in intro_segs_raw
+                                if s["end"] <= intro_offset + 0.5
+                            ]
+                            print(f"[LYRICS] intro Whisper produced "
+                                  f"{len(intro_segments)} segment(s) for "
+                                  f"the {intro_offset:.0f}s dialogue prefix")
+                        except Exception as e:
+                            print(f"[LYRICS] intro Whisper failed: {e}")
+                        finally:
+                            try:
+                                os.unlink(intro_path)
+                            except OSError:
+                                pass
+
+                try:
+                    segments = await loop.run_in_executor(
+                        None, transcribe, transcribe_path, lang, plain,
+                    )
+                finally:
+                    if trimmed_path:
+                        try:
+                            os.unlink(trimmed_path)
+                        except OSError:
+                            pass
+
+                # Shift body-Whisper timestamps back into full-audio
+                # frame so the song subtitles appear at the right moment.
+                if intro_offset > 0:
+                    segments = [
+                        {**s,
+                         "start": float(s["start"]) + intro_offset,
+                         "end":   float(s["end"])   + intro_offset}
+                        for s in segments
+                    ]
+
+                # Auto-recover: when Whisper still hallucinates after the
+                # trim (instrumental-passage mega-segments, synonym loops,
+                # implausibly low count), fall back to distributing lrclib
+                # plain lyrics across the SONG REGION only. start_time =
+                # intro_offset prevents the synthesizer from compressing
+                # the song lines into the spoken-intro region — that would
+                # show 3 lyric lines at 0:00 even though the song hasn't
+                # started yet (the bug the operator reported).
+                hallucinated, reason = _detect_hallucination(segments, user_dur)
+                if hallucinated and user_dur:
+                    anchors = _align_whisper_to_plain(segments, plain)
+                    recovered = _synthesize_segments_from_plain(
+                        plain, user_dur, anchors=anchors,
+                        start_time=intro_offset,
+                    )
+                    if recovered:
+                        combined = intro_segments + recovered
+                        print(f"[LYRICS] hallucination detected ({reason}) "
+                              f"— auto-recovered with {len(recovered)} "
+                              f"lines from lrclib plain "
+                              f"({len(anchors)} time anchors, "
+                              f"start={intro_offset:.1f}s, "
+                              f"dur={user_dur:.1f}s) "
+                              f"+ {len(intro_segments)} intro-Whisper "
+                              f"segment(s)")
+                        return {
+                            "segments": combined,
+                            "reference_lyrics": plain,
+                            "coverage_warning": True,
+                            "recovery_source": "lrclib_plain",
+                        }
+                # Happy path: Whisper returned plausibly-many segments.
+                # Combine intro Whisper (if any) with the body output.
+                combined = intro_segments + segments
+                return {"segments": combined, "reference_lyrics": plain}
+
+        # Kick off Gemini-grounded lyrics fetch in parallel with Whisper.
+        # The fetcher is best-effort (returns None on any failure); we wrap
+        # its result-getter with asyncio.wait_for after Whisper completes
+        # so a slow Gemini doesn't block /transcribe forever.
+        #
+        # The bg thread gets its OWN DB session, not the request-scoped one
+        # — if the asyncio.wait_for below times out, the thread keeps running
+        # in the background to populate the cache for the next call, and we
+        # don't want it touching a session FastAPI already closed.
+        from pipeline import _fetch_lyrics_via_gemini_search
+        from database import SessionLocal as _SessionLocal
+
+        def _bg_fetch_lyrics(artist, song):
+            s = _SessionLocal()
+            try:
+                return _fetch_lyrics_via_gemini_search(artist, song, db=s)
+            finally:
+                s.close()
+
+        gemini_task = asyncio.create_task(asyncio.to_thread(
+            _bg_fetch_lyrics, artist_hint, song_hint,
+        ))
+
+        segments = await loop.run_in_executor(None, transcribe, tmp_path, lang)
+
+        # Wait up to 2s after Whisper finishes for Gemini to complete.
         reference = ""
         try:
-            res = _req.get(f"https://api.lyrics.ovh/v1/{artist_hint}/{song_hint}", timeout=10)
-            if res.status_code == 200:
-                reference = res.json().get("lyrics", "").strip()
-        except Exception:
-            pass
+            result = await asyncio.wait_for(gemini_task, timeout=2.0)
+            reference = result or ""
+        except asyncio.TimeoutError:
+            # Gemini still pending — let it finish in the background and
+            # cache the result for the next request. Don't block the user.
+            print("[LYRICS] gemini fetch slower than Whisper+2s — moving on")
+            reference = ""
+        except Exception as e:
+            print(f"[LYRICS] gemini task failed: {e}")
+            reference = ""
+
+        # Final fallback: lyrics.ovh (free, no auth, thin catalogue but
+        # covers some mainstream songs Gemini might miss or block).
+        if not reference and artist_hint and song_hint:
+            try:
+                import requests as _req
+                res = _req.get(
+                    f"https://api.lyrics.ovh/v1/{artist_hint}/{song_hint}",
+                    timeout=5,
+                )
+                if res.status_code == 200:
+                    reference = res.json().get("lyrics", "").strip()
+            except Exception:
+                pass
+
+        # Defense-in-depth recovery for the Gemini fallback path. We
+        # don't have lrclib's duration here, so we can't compute
+        # intro_offset — instead we use the gap-filling model that
+        # works for any audio shape:
+        #
+        #   - keep Whisper segments that pass per-segment plausibility
+        #     (preserves the spoken-intro transcription with REAL
+        #     timestamps when present)
+        #   - drop hallucinated segments (mega-segments, fuzzy
+        #     intra-loops)
+        #   - if kept Whisper covers > 70 % of the audio, ship as-is
+        #   - otherwise, distribute reference lines into the
+        #     UNCOVERED gaps proportionally to each gap's duration
+        #
+        # This is generic enough to handle El Plan de la Mariposa
+        # (Whisper captures the dialogue intro at 0–14 s, hallucinates
+        # the song body), Karol G "Si Antes Te Hubiera Conocido"
+        # (similar dialogue prefix), and any future song with the
+        # same "good prefix + bad body" pattern.
+        if reference:
+            user_dur = await asyncio.to_thread(_audio_duration, tmp_path)
+            hallucinated, reason = _detect_hallucination(segments, user_dur)
+            if hallucinated and user_dur:
+                merged = _fill_gaps_with_reference(
+                    segments, reference, user_dur,
+                    audio_path=tmp_path,
+                )
+                if merged is not None:
+                    src = "gemini_or_lyrics_ovh"
+                    plausible_count = sum(
+                        1 for s in merged
+                        if (s.get("text") or "") not in
+                           [r.strip() for r in (reference or "").splitlines() if r.strip()]
+                    )
+                    print(f"[LYRICS] hallucination detected on fallback "
+                          f"path ({reason}) — gap-fill produced "
+                          f"{len(merged)} segments from {src} "
+                          f"(~{plausible_count} kept-Whisper, "
+                          f"{len(merged) - plausible_count} synthesized, "
+                          f"dur={user_dur:.1f}s)")
+                    return {
+                        "segments": merged,
+                        "reference_lyrics": reference,
+                        "coverage_warning": True,
+                        "recovery_source": src,
+                    }
 
         return {"segments": segments, "reference_lyrics": reference}
     finally:
@@ -692,6 +1180,11 @@ async def generate_with_segments(
     umg_prores_profile: str = Form(""),
     background_id: int = Form(None),
     background_file: UploadFile = File(None),
+    genre: str = Form(""),
+    font: str = Form(""),
+    concept: str = Form(""),
+    movement_style: str = Form(""),
+    animate_image: str = Form(""),
     current_user: dict = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
@@ -701,7 +1194,11 @@ async def generate_with_segments(
 
     _enforce_plan_quota(db, current_user)
     _enforce_daily_volume_cap(db, current_user)
-    _enforce_concurrent_jobs_cap(db, current_user)
+    _enforce_tenant_backlog(db, current_user)
+    # Every submission is accepted as queued; RQ gives it to a worker the
+    # moment one is free, and pipeline.run_pipeline flips status to
+    # "processing" on its first line. No 429 for capacity reasons.
+    initial_status = "queued"
 
     # Check AI authorization (UMG Guideline 5) — skip if using library background (no AI)
     if not background_id and current_user.get("role") != "admin":
@@ -723,6 +1220,7 @@ async def generate_with_segments(
         artist=artist, style=style, filename=file.filename,
         user_id=current_user["id"], tenant_id=tenant_id,
         delivery_profile=delivery_profile, umg_spec=umg_spec,
+        initial_status=initial_status,
     )
     job_dir = os.path.join(OUTPUTS_DIR, job_id)
     os.makedirs(job_dir, exist_ok=True)
@@ -731,19 +1229,38 @@ async def generate_with_segments(
     with open(mp3_path, "wb") as f:
         f.write(data)
 
+    # Cross-container input transfer via R2 — see /upload for the full reason.
+    input_r2_key = None
+    if storage.is_enabled():
+        input_r2_key = storage.upload_input(
+            mp3_path, current_user["tenant_id"], job_id, file.filename,
+        )
+
     # Resolve background: library asset > custom upload > AI generation
     bg_path = None
+    bg_r2_key = None
     if background_id:
         from database import BackgroundAsset
         asset = db.query(BackgroundAsset).filter(BackgroundAsset.id == background_id, BackgroundAsset.is_active == True).first()
         if asset:
-            bg_path = os.path.join(_BACKGROUNDS_LIB, asset.filename)
+            if asset.filename.startswith("library/"):
+                # R2-stored asset: pipeline downloads via bg_r2_key.
+                bg_ext = os.path.splitext(asset.filename)[1].lower() or f".{asset.file_type}"
+                bg_path = os.path.join(job_dir, f"bg_library{bg_ext}")
+                bg_r2_key = asset.filename
+            else:
+                bg_path = os.path.join(_BACKGROUNDS_LIB, asset.filename)
     elif background_file and background_file.filename:
         bg_ext = os.path.splitext(background_file.filename)[1].lower()
         if bg_ext in (".mp4", ".mov", ".jpg", ".jpeg", ".png"):
-            bg_path = os.path.join(job_dir, f"bg_custom{bg_ext}")
+            bg_filename = f"bg_custom{bg_ext}"
+            bg_path = os.path.join(job_dir, bg_filename)
             with open(bg_path, "wb") as f:
                 shutil.copyfileobj(background_file.file, f)
+            if storage.is_enabled():
+                bg_r2_key = storage.upload_input(
+                    bg_path, current_user["tenant_id"], job_id, bg_filename,
+                )
 
     enqueue_pipeline(
         job_id=job_id,
@@ -755,9 +1272,16 @@ async def generate_with_segments(
         delivery_profile=delivery_profile,
         umg_spec=umg_spec,
         background_path=bg_path,
+        input_r2_key=input_r2_key,
+        bg_r2_key=bg_r2_key,
+        genre=genre,
+        font=font,
+        concept=concept,
+        movement_style=movement_style,
+        animate_image=str(animate_image).strip().lower() in ("true", "1", "yes", "on"),
     )
 
-    return {"job_id": job_id}
+    return {"job_id": job_id, "status": initial_status}
 
 
 @app.get("/admin/queue")
@@ -930,7 +1454,7 @@ _DATA_POLICY = {
             "data_not_sent": ["Full audio files", "User personal data", "Billing information"],
         },
         {
-            "api": "Veo 3.1 (veo-3.1-generate-001)",
+            "api": "Veo 3.1 Fast (veo-3.1-fast-generate-001)",
             "purpose": "Video background generation",
             "data_sent": ["AI-generated scene description prompt (no artist/lyrics data)"],
             "data_not_sent": ["Audio files", "Lyrics text", "Artist name"],
@@ -975,11 +1499,11 @@ async def compliance_status(
             "guideline_1_tools": {
                 "status": "confirmed" if _VERTEX_ENTERPRISE_CONFIRMED else "pending",
                 "detail": (
-                    "Google Veo 3.1 via Vertex AI Enterprise API is in use. "
+                    "Google Veo 3.1 Fast via Vertex AI Enterprise API is in use. "
                     + ("Enterprise agreement has been confirmed." if _VERTEX_ENTERPRISE_CONFIRMED
                        else "ACTION REQUIRED: Confirm with UMG that your Vertex AI enterprise contract qualifies as the required enterprise-level agreement for Google Veo.")
                 ),
-                "tool": "veo-3.1-generate-001",
+                "tool": "veo-3.1-fast-generate-001",
                 "provider": "Google Cloud Vertex AI",
                 "project": os.environ.get("VERTEX_PROJECT", ""),
             },

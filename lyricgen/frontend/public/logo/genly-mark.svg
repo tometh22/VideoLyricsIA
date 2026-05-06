@@ -1,0 +1,28 @@
+<svg width="256" height="256" viewBox="0 0 256 256" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <linearGradient id="genlyMarkGradient" x1="0" y1="0" x2="256" y2="256" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#8B6BFF"/>
+      <stop offset="100%" stop-color="#6D4AFF"/>
+    </linearGradient>
+  </defs>
+
+  <!-- G mark — same path geometry as the lockup, isolated for favicon /
+       mark-only contexts. viewBox 256×256 keeps the safe area square. -->
+  <path d="M145 44
+           C88 44 44 88 44 145
+           C44 202 88 212 145 212
+           L182 212
+           C195 212 204 203 204 190
+           C204 177 195 168 182 168
+           L145 168
+           C113 168 88 160 88 145
+           C88 109 109 88 145 88
+           L200 88
+           C213 88 222 79 222 66
+           C222 53 213 44 200 44
+           Z"
+        fill="url(#genlyMarkGradient)"/>
+
+  <!-- Teal micro accent — kept exactly as in the lockup geometry. -->
+  <rect x="124" y="156" width="42" height="10" rx="5" fill="#14C8A8"/>
+</svg>

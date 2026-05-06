@@ -104,9 +104,41 @@ cuando Redis volvió son re-encolados automáticamente por `failure_ttl`.
 docker compose restart worker
 ```
 
+En Railway: dashboard → servicio Worker → botón **Restart**.
+
 RQ tiene `job_timeout=2700` (45 min). Si un job excede eso, RQ lo mata y lo
 marca como `failed`. Se puede re-encolar manualmente con
 `rq requeue -u $REDIS_URL --all`.
+
+### Job parece colgado en la UI (barra de progreso quieta)
+
+**No mires los logs primero.** moviepy entra en código C durante el
+compositing y NO emite líneas — la barra UI quieta + logs silentes es
+la apariencia normal de un render lento, no de un hang. La señal
+real de progreso vive en la tabla `jobs`:
+
+```
+echo "SELECT progress, current_step, status, EXTRACT(EPOCH FROM (NOW() - created_at)) AS age_s
+      FROM jobs WHERE job_id='<JOB_ID>';" | railway connect Postgres -e production
+```
+
+Resultados típicos:
+- `progress` cambia entre dos chequeos a 30 s → **vivo**, dejarlo correr
+- `progress` quieto > 10 min en `current_step IN (video, short)` →
+  moviepy se trabó (más probable con backgrounds .mp4 que requieren
+  palindrome loop). Cancelá y reintentá con un asset .jpg de la
+  biblioteca (Ken Burns, mucho más rápido y estable):
+  ```
+  echo "UPDATE jobs SET status='error', error='moviepy hang during <step>'
+        WHERE job_id='<JOB_ID>';" | railway connect Postgres -e production
+  ```
+  Después restart Worker en Railway dashboard.
+- `progress` quieto > 15 min en `whisper`, `lyrics` o `validation` →
+  causa distinta; ahí sí mirá `railway logs --service Worker` por una
+  excepción Python.
+
+Atajo: `python scripts/diagnose_job.py <JOB_ID>` o `--watch` para que
+poll'ee y avise transición.
 
 ### Veo 3 devuelve 429 en masa
 

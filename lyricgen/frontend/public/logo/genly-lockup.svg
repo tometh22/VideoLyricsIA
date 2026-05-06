@@ -1,0 +1,46 @@
+<svg width="1024" height="256" viewBox="0 0 1024 256" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <linearGradient id="genlyGradient" x1="0" y1="0" x2="256" y2="256" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#8B6BFF"/>
+      <stop offset="100%" stop-color="#6D4AFF"/>
+    </linearGradient>
+  </defs>
+
+  <!-- G mark -->
+  <path d="M145 44
+           C88 44 44 88 44 145
+           C44 202 88 212 145 212
+           L182 212
+           C195 212 204 203 204 190
+           C204 177 195 168 182 168
+           L145 168
+           C113 168 88 160 88 145
+           C88 109 109 88 145 88
+           L200 88
+           C213 88 222 79 222 66
+           C222 53 213 44 200 44
+           Z"
+        fill="url(#genlyGradient)"/>
+
+  <!-- Teal accent -->
+  <rect x="124" y="156" width="42" height="10" rx="5" fill="#14C8A8"/>
+
+  <!-- Wordmark -->
+  <g fill="#F5F7FA">
+    <path d="M330 82 C305 82 286 101 286 128 C286 155 305 174 330 174 L360 174 L360 144 L330 144 L330 112 L390 112 C390 95 375 82 330 82Z"/>
+
+    <!-- E -->
+    <rect x="430" y="88" width="52" height="8" rx="4"/>
+    <rect x="430" y="124" width="52" height="8" rx="4" fill="#14C8A8"/>
+    <rect x="430" y="160" width="52" height="8" rx="4"/>
+
+    <!-- N -->
+    <path d="M540 88 L540 168 L556 168 L608 114 L608 168 L624 168 L624 88 L608 88 L556 142 L556 88 Z"/>
+
+    <!-- L -->
+    <path d="M688 88 L688 168 L742 168 L742 152 L704 152 L704 88 Z"/>
+
+    <!-- Y -->
+    <path d="M798 88 L824 126 L850 88 L870 88 L832 142 L832 168 L816 168 L816 142 L778 88 Z"/>
+  </g>
+</svg>

@@ -27,10 +27,13 @@ logger = logging.getLogger("genly.provenance")
 # (the palindrome-loop pattern used by this pipeline). Update when pricing
 # changes or when the per-call generation length changes.
 COST_PER_CALL: dict[tuple[str, str], float] = {
-    # Veo video — ~$0.50/s × 8s = $4.00 per call
-    ("veo-3.1-generate-001", "google_vertex"): 4.00,
-    ("veo-3.0-generate-001", "google_vertex"): 4.00,
-    ("veo-2.0-generate-001", "google_vertex"): 2.00,
+    # Veo video — Fast (no audio) at $0.10/s × 8s = $0.80 per call.
+    # Standard models kept for backwards-compat with existing job rows.
+    ("veo-3.1-fast-generate-001", "google_vertex"): 0.80,
+    ("veo-3.1-generate-001", "google_vertex"): 3.20,
+    ("veo-3.0-fast-generate-001", "google_vertex"): 0.80,
+    ("veo-3.0-generate-001", "google_vertex"): 3.20,
+    ("veo-2.0-generate-001", "google_vertex"): 4.00,
     # Imagen still images
     ("imagen-3.0-generate-001", "google_vertex"): 0.04,
     ("imagen-3.0-fast-generate-001", "google_vertex"): 0.02,

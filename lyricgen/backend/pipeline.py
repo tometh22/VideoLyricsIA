@@ -5,6 +5,7 @@ import json
 import os
 import math
 import random
+import re
 import subprocess
 import tempfile
 import traceback
@@ -69,7 +70,17 @@ def _upload_deliverables_to_r2(job_id: str, job_dir: str, files: dict) -> dict:
     """
     if not storage.is_enabled():
         return {}
-    job = get_job(job_id)
+    # get_job() requires a SQLAlchemy session, but this function runs in the
+    # worker context with no request-scoped session available. Create one
+    # here just to look up the tenant_id, then close it. (We could pass
+    # tenant_id in from the caller, but the call site already has the job_id
+    # and we need the cheap row read.)
+    from database import SessionLocal
+    _db = SessionLocal()
+    try:
+        job = get_job(_db, job_id)
+    finally:
+        _db.close()
     tenant_id = (job or {}).get("tenant_id", "default")
     out: dict = {}
     for file_type, _url in files.items():
@@ -122,7 +133,14 @@ def _cleanup_local_intermediates(job_dir: str) -> None:
 def run_pipeline(job_id: str, mp3_path: str, artist: str, style: str,
                  language: str = None, segments_override: list[dict] = None,
                  delivery_profile: str = "youtube", umg_spec: dict | None = None,
-                 background_path: str = None):
+                 background_path: str = None,
+                 input_r2_key: str | None = None,
+                 bg_r2_key: str | None = None,
+                 genre: str = "",
+                 font: str = "",
+                 concept: str = "",
+                 movement_style: str = "",
+                 animate_image: bool = False):
     """Run the full pipeline for a job. Called synchronously.
 
     delivery_profile:
@@ -133,9 +151,42 @@ def run_pipeline(job_id: str, mp3_path: str, artist: str, style: str,
     background_path:
         If provided, skip AI background generation and use the human-provided
         asset instead (UMG Guideline 10 compliance).
+
+    input_r2_key / bg_r2_key:
+        When the API and worker run in separate containers (e.g. Railway), the
+        local mp3_path / background_path written by the API are NOT visible
+        to the worker. The API uploads the input MP3 (and any custom
+        background) to R2 and passes the keys here; we download them locally
+        before processing, restoring the same file paths the rest of the
+        pipeline expects.
     """
     job_dir = os.path.join(OUTPUTS_DIR, job_id)
     os.makedirs(job_dir, exist_ok=True)
+
+    # Worker just claimed this job — flip the user-facing status from
+    # "queued" (sitting in RQ) to "processing" (a worker is actively on it).
+    # This makes the queue visible in the dashboard: jobs piling up in RQ
+    # show as "queued" until a worker picks them, at which point they
+    # immediately go "processing". Idempotent — if the job already says
+    # processing (e.g. on retry), the update is a no-op.
+    update_job(job_id, status="processing", current_step="starting", progress=1)
+
+    # Materialize R2-stored inputs onto local disk so moviepy/ffmpeg/whisper
+    # can open them. No-op when running on a single host (no R2 keys passed).
+    if input_r2_key and not os.path.exists(mp3_path):
+        if not storage.download_object(input_r2_key, mp3_path):
+            update_job(
+                job_id, status="error",
+                error=f"Failed to fetch input from R2: {input_r2_key}",
+            )
+            return
+    if bg_r2_key and background_path and not os.path.exists(background_path):
+        if not storage.download_object(bg_r2_key, background_path):
+            update_job(
+                job_id, status="error",
+                error=f"Failed to fetch background from R2: {bg_r2_key}",
+            )
+            return
 
     wants_youtube = delivery_profile in ("youtube", "both")
     wants_umg = delivery_profile in ("umg", "both")
@@ -152,7 +203,15 @@ def run_pipeline(job_id: str, mp3_path: str, artist: str, style: str,
 
         # Step 1.5 — Background (AI-generated or human-provided)
         update_job(job_id, current_step="background", progress=22)
-        if background_path:
+        # Decide if the operator's upload is a still image they want
+        # animated by Veo image-to-video (vs. used as-is via Ken Burns).
+        # Path requires: animate_image flag set + background_path is a
+        # JPG/PNG (NOT an MP4 — those are already video).
+        _is_still = (background_path and
+                     background_path.lower().endswith((".jpg", ".jpeg", ".png")))
+        _animate_user_image = bool(animate_image and _is_still)
+
+        if background_path and not _animate_user_image:
             # Human-provided background — skip AI generation (UMG Guideline 10)
             from provenance import record_ai_call
             recorder = record_ai_call(
@@ -171,21 +230,49 @@ def run_pipeline(job_id: str, mp3_path: str, artist: str, style: str,
             print(f"[BG] Using human-provided background: {background_path}")
         else:
             lyrics_text = " ".join(seg["text"] for seg in segments)
+            # Extract a clean song title from the MP3 filename so Gemini gets
+            # song-level context even when the lyrics transcription degrades.
+            # The cache key downstream uses (artist|title) as a namespace so
+            # different songs don't share a Veo background.
+            _basename = os.path.splitext(os.path.basename(mp3_path))[0]
+            _song_title = _basename.split(" - ", 1)[1] if " - " in _basename else _basename
+            for _sfx in ["(Official Video)", "(Official Audio)", "(Lyric Video)",
+                         "(Official Music Video)", "(En Vivo)", "(Live)", "(Lyrics)"]:
+                _song_title = _song_title.replace(_sfx, "").strip()
+            if _animate_user_image:
+                print(f"[BG] image-to-video: animating user-supplied "
+                      f"{os.path.basename(background_path)} via Veo")
             bg_image_path = _ensure_background(
                 style, job_dir,
                 lyrics_text=lyrics_text, artist=artist, job_id=job_id,
+                song_title=_song_title, genre=genre, concept=concept,
+                movement_style=movement_style,
+                image_to_video_path=(background_path if _animate_user_image else None),
             )
+            # Image-to-video fallback: if Veo failed to produce an MP4 (None
+            # or non-existent path) AND the operator wanted to animate their
+            # image, fall back to using the still image with Ken Burns.
+            if _animate_user_image and (not bg_image_path or not os.path.exists(bg_image_path)):
+                print(f"[BG] image-to-video failed, falling back to Ken Burns "
+                      f"on {background_path}")
+                bg_image_path = background_path
         update_job(job_id, progress=40)
 
         files = {}
-        chosen_font = None
+        # When the operator picked an explicit font id, resolve it to a
+        # path now and seed `chosen_font`. generate_lyric_video reuses a
+        # truthy `font` argument as-is and only random-picks when None.
+        chosen_font = _resolve_font(font)
+        if chosen_font:
+            print(f"[FONT] Operator-selected: {os.path.basename(chosen_font)}")
         bg_source = bg_image_path
 
         # Step 2 — YouTube lyric video (H.264 / MP4 / 1080p / 24fps)
         if wants_youtube:
             update_job(job_id, current_step="video", progress=40)
             _, chosen_font, bg_source = generate_lyric_video(
-                mp3_path, segments, style, job_dir, artist, bg_image_path
+                mp3_path, segments, style, job_dir, artist, bg_image_path,
+                font=chosen_font,
             )
             files["video_url"] = f"/download/{job_id}/video"
             update_job(job_id, progress=55)
@@ -224,11 +311,20 @@ def run_pipeline(job_id: str, mp3_path: str, artist: str, style: str,
         # Step 5 — Content validation (UMG Guideline 15) — only if a YouTube
         # video was rendered (UMG-only jobs skip validation; masters go to
         # legal review independently).
-        if wants_youtube:
+        #
+        # We validate the BACKGROUND ASSET (bg_source) before lyrics overlay,
+        # not the composited final. The validator looks for prohibited content
+        # like people, logos, foreign text — but the final video has OUR
+        # intentional lyrics burned in, which would be a guaranteed false
+        # positive. The background is what we actually need to police.
+        if wants_youtube and bg_source:
             update_job(job_id, current_step="validation", progress=94)
-            from content_validator import validate_video as _validate_video
-            video_path = os.path.join(job_dir, _DELIVERABLE_FILENAMES["video"])
-            validation = _validate_video(video_path, job_id=job_id)
+            ext = os.path.splitext(bg_source)[1].lower()
+            if ext in (".mp4", ".mov", ".webm"):
+                from content_validator import validate_video as _validate_bg
+            else:
+                from content_validator import validate_image as _validate_bg
+            validation = _validate_bg(bg_source, job_id=job_id)
             update_job(job_id, validation_result=validation)
 
             if not validation["passed"]:
@@ -249,8 +345,21 @@ def run_pipeline(job_id: str, mp3_path: str, artist: str, style: str,
         # Deliverables are already removed above when R2 was used.
         _cleanup_local_intermediates(job_dir)
 
-        _require_review = os.environ.get("REQUIRE_REVIEW", "true").lower() == "true"
+        # Robust env-var read: tolerate accidental whitespace or quotes that
+        # Railway / .env files sometimes leave around the value. We default to
+        # review-required so the safest behaviour applies if the var is missing.
+        _require_review_raw = os.environ.get("REQUIRE_REVIEW")
+        if _require_review_raw is None:
+            _require_review = True
+        else:
+            _normalized = _require_review_raw.strip().strip('"').strip("'").lower()
+            _require_review = _normalized in ("true", "1", "yes", "y", "on")
         final_status = "pending_review" if _require_review else "done"
+        print(
+            f"[PIPELINE] job={job_id} REQUIRE_REVIEW="
+            f"{_require_review_raw!r} -> require_review={_require_review} "
+            f"final_status={final_status}"
+        )
 
         update_job(job_id, status=final_status, progress=100, files=files)
     except Exception as exc:
@@ -262,14 +371,23 @@ def run_pipeline(job_id: str, mp3_path: str, artist: str, style: str,
 # Step 1 — Whisper transcription
 # ---------------------------------------------------------------------------
 
+# YouTube-uploader chatter we don't want in the lyrics. Tight-and-narrow:
+# every entry must be a multi-word phrase or unambiguous YouTuber jargon
+# that essentially never shows up in song lyrics. The previous broader
+# list killed legit content on UMG videos that open with dialogue/intros
+# (Karol G "Si Antes Te Hubiera Conocido (Official Video)" had
+# "¡Gracias! ¡Qué linda! ¡Gracias!" filtered as spam — that's the artist
+# thanking the audience in the video, not channel chatter, and the
+# operator wanted it transcribed).
 _SPAM_PATTERNS = [
-    "suscri", "subscri", "subscribe", "subete", "like", "comment",
-    "canal", "channel", "descripci", "description", "link", "follow",
-    "sigueme", "intro", "outro", "copyright", "all rights", "derechos",
-    "music by", "produced by", "lyrics by", "escucha en", "disponible",
-    "spotify", "apple music", "deezer", "itunes", "amazon music",
-    "gracias", "thanks for watching", "thanks for listening",
-    "subtitulos", "subtitles", "video oficial", "official video",
+    "suscribete al canal", "subscribe to my channel",
+    "thanks for watching", "thanks for listening",
+    "link in description", "link in the description",
+    "link en la descripcion", "link en descripcion",
+    "all rights reserved", "todos los derechos reservados",
+    "escucha en spotify", "available on spotify",
+    "apple music", "deezer", "amazon music",
+    "music by", "produced by", "lyrics by",
 ]
 
 
@@ -293,10 +411,294 @@ def _get_whisper_model(name: str = "turbo"):
     return _WHISPER_MODELS[name]
 
 
-def transcribe(mp3_path: str, language: str = None) -> list[dict]:
-    """Transcribe: isolate vocals with Demucs, then transcribe with Whisper turbo."""
-    # Use original audio — Demucs vocal isolation can introduce artifacts
-    # that confuse Whisper more than the original mix
+_WHISPER_API_MAX_BYTES = 24 * 1024 * 1024  # 25 MB ceiling, with 1 MB headroom
+
+
+def _compress_for_whisper(input_path: str) -> str:
+    """If `input_path` exceeds Whisper-API's 25 MB ceiling (typical for
+    UMG-style WAV uploads), produce a temp 128 kbps mono MP3 alongside
+    it and return the new path. Otherwise return the original path
+    unchanged. Caller is responsible for cleaning up the temp file when
+    `_compress_for_whisper(p) != p`.
+
+    Why mono 128 kbps: Whisper's transcription accuracy is bounded well
+    above this bitrate — extra fidelity doesn't help. Stereo→mono cuts
+    size in half with zero impact on Whisper. A 4-min track lands around
+    4 MB, comfortably under the cap.
+    """
+    try:
+        sz = os.path.getsize(input_path)
+    except OSError:
+        return input_path
+    if sz <= _WHISPER_API_MAX_BYTES:
+        return input_path
+    import subprocess as _sp
+    out = input_path + ".whisper.mp3"
+    try:
+        _sp.run(
+            ["ffmpeg", "-y", "-i", input_path,
+             "-ac", "1", "-b:a", "128k", "-loglevel", "error", out],
+            check=True, timeout=120,
+        )
+        if os.path.exists(out) and os.path.getsize(out) > 0:
+            new_sz = os.path.getsize(out)
+            print(f"[WHISPER-API] compressed {sz/1e6:.1f} MB → "
+                  f"{new_sz/1e6:.1f} MB for API limit")
+            return out
+    except (_sp.CalledProcessError, _sp.TimeoutExpired,
+            FileNotFoundError, OSError) as e:
+        print(f"[WHISPER-API] compression failed ({e}); sending original")
+    return input_path
+
+
+def _transcribe_via_openai_api(mp3_path: str, language: str | None = None,
+                                lyrics_hint: str | None = None) -> list[dict]:
+    """Transcribe by calling OpenAI's Whisper API. Returns the same segments
+    structure as the local Whisper path. Used in production where loading
+    the local model would consume too much worker RAM (~3 GB) and risks OOM.
+
+    Cost: ~$0.006 per minute of audio (~$0.02 per song).
+
+    `lyrics_hint`: if provided, the FIRST ~200 tokens of this string are
+    used as Whisper's `prompt` parameter — orienting the model's
+    vocabulary toward the actual lyrics it should expect. This is the
+    documented Whisper-API mechanism for biasing transcription
+    (https://platform.openai.com/docs/guides/speech-to-text/prompting).
+    Significantly reduces hallucination loops on tracks where Whisper
+    otherwise drifts (e.g. confusing artist-name ad-libs for the lyric
+    line). Only the last 224 tokens are read by Whisper and only the
+    first ~30 s of audio benefits from it; on longer tracks the help is
+    most impactful at the song's start where the model establishes its
+    interpretation.
+
+    Why whisper-1 and not gpt-4o-transcribe (better text quality):
+        gpt-4o-transcribe and gpt-4o-mini-transcribe only return plain
+        text — no segment timestamps. This pipeline renders lyrics
+        synchronized to the audio, so segment-level start/end times are
+        non-negotiable. whisper-1 (whisper-large-v2) is the only OpenAI
+        transcription model that returns verbose_json with segment
+        timestamps as of 2026-04.
+    """
+    from openai import OpenAI
+
+    client = OpenAI()  # picks up OPENAI_API_KEY from env
+    print(f"[WHISPER-API] transcribing {os.path.basename(mp3_path)} via OpenAI (whisper-1)")
+
+    # Build the initial prompt. When the caller has reference lyrics
+    # (typically from lrclib plain), we ship the first ~200 tokens of
+    # them so Whisper expects that vocabulary. Otherwise fall back to a
+    # generic "song lyrics" hint.
+    if lyrics_hint and lyrics_hint.strip():
+        # ~200 tokens ≈ 800 chars for Spanish/English. Whisper truncates
+        # silently if longer; this just keeps logs cleaner.
+        prompt_text = lyrics_hint.strip()[:800]
+        print(f"[WHISPER-API] initial_prompt primed with "
+              f"{len(prompt_text)} chars from reference lyrics")
+    else:
+        prompt_text = ("Letras de canción:" if (language or "").startswith("es")
+                       else "Song lyrics:")
+
+    kwargs = {
+        "model": "whisper-1",
+        "response_format": "verbose_json",
+        "timestamp_granularities": ["segment"],
+        "prompt": prompt_text,
+        # temperature=0 gives the most confident output; we lower the
+        # default 0.0 ladder so it doesn't sample alternative
+        # interpretations on tricky words.
+        "temperature": 0.0,
+    }
+    if language:
+        kwargs["language"] = language
+
+    # Whisper-API rejects > 25 MB. UMG uploads lossless WAV (often 30-50
+    # MB for a 3-min track). Transcode-compress only when over the cap;
+    # the compressed copy is just for the API call — original audio is
+    # untouched and used by the rest of the render pipeline.
+    api_path = _compress_for_whisper(mp3_path)
+    cleanup_compressed = api_path != mp3_path
+    try:
+        with open(api_path, "rb") as f:
+            kwargs["file"] = f
+            response = client.audio.transcriptions.create(**kwargs)
+    finally:
+        if cleanup_compressed:
+            try:
+                os.unlink(api_path)
+            except OSError:
+                pass
+
+    raw_segments = response.segments or []
+    import re as _re
+
+    segments: list[dict] = []
+    for seg in raw_segments:
+        text = (seg.text or "").strip()
+        if not text or len(text) < 3:
+            continue
+        # Same filters as local path so behavior matches.
+        if _re.search(r'[一-鿿぀-ゟ゠-ヿ가-힯]', text):
+            print(f"[WHISPER-API] Filtered non-latin: {text[:60]}")
+            continue
+        if any(spam in text.lower() for spam in _SPAM_PATTERNS):
+            print(f"[WHISPER-API] Filtered spam: {text[:60]}")
+            continue
+        # Only drop segments that Whisper is VERY sure aren't speech. The
+        # previous 0.7 threshold was tossing legitimate lyric lines on
+        # tracks with dense crowd noise / heavy mix (Karol G's "Yo Me
+        # Caso Contigo" interlude, audience cheering on live cuts). The
+        # operator can prune obvious non-lyrics in the editor; better to
+        # surface borderline content than to silently drop it.
+        if (seg.no_speech_prob or 0) > 0.92:
+            print(f"[WHISPER-API] Filtered very-low-confidence: {text[:60]}")
+            continue
+        segments.append({
+            "start": float(seg.start),
+            "end": float(seg.end),
+            "text": text,
+        })
+
+    # Whisper hallucinates loops in two distinct shapes:
+    #   1. SAME LINE REPEATED across consecutive segments — easy: dedupe
+    #      by exact match, keep first 2 (preserves legit chorus repeats).
+    #   2. SAME PHRASE REPEATED INSIDE a single segment's text — happens
+    #      on long sustained / instrumental passages where Whisper emits
+    #      one large segment whose text is "X and X and X and X and …".
+    #      Need to detect intra-segment repetition and truncate.
+    #
+    # Both cases observed in production on "El Plan de la Mariposa - El
+    # Riesgo" (5/5/2026): segment 60-150s contained the line "que podía
+    # reflexionar sobre lo que estaba haciendo y" repeated ~5 times within
+    # the same segment.
+    import re as _re_loops
+
+    def _truncate_intra_loop(text: str) -> tuple[str, float]:
+        """If text contains a phrase that repeats 3+ times consecutively,
+        truncate to the first 2 occurrences. Phrase = 4–14 word window —
+        the upper bound matters because Whisper hallucinations sometimes
+        loop on a clause that's 8–12 words long.
+
+        Returns (truncated_text, ratio_kept) so the caller can shrink the
+        segment's end timestamp proportionally — without that adjustment,
+        the truncated text would stay on screen during the instrumental
+        passage Whisper was hallucinating over, giving a "stuck subtitle"
+        feel. Ratio = 1.0 when nothing changes.
+        """
+        words = text.split()
+        total = len(words)
+        if total < 12:
+            return text, 1.0
+        for window in range(14, 3, -1):  # try longer windows first
+            if total < window * 3:
+                continue
+            for start in range(total - window * 3 + 1):
+                phrase = words[start:start + window]
+                count = 1
+                pos = start + window
+                while pos + window <= total and words[pos:pos + window] == phrase:
+                    count += 1
+                    pos += window
+                if count >= 3:
+                    cut = start + window * 2
+                    truncated = " ".join(words[:cut])
+                    truncated = truncated.rstrip(",.;: ") + "…"
+                    ratio = cut / total
+                    return truncated, ratio
+        return text, 1.0
+
+    cleaned: list[dict] = []
+    intra_truncated = 0
+    for seg in segments:
+        original = seg["text"]
+        new_text, ratio = _truncate_intra_loop(original)
+        if new_text != original:
+            intra_truncated += 1
+            duration = seg["end"] - seg["start"]
+            seg = {
+                **seg,
+                "text": new_text,
+                # Shrink end so the subtitle leaves the screen when the
+                # legitimate spoken phrase ends, not when Whisper's
+                # hallucination tail would have ended.
+                "end": seg["start"] + duration * ratio,
+            }
+        cleaned.append(seg)
+    if intra_truncated:
+        print(f"[WHISPER-API] Truncated intra-segment loops in {intra_truncated} segment(s)")
+    segments = cleaned
+
+    # Collapse consecutive-identical-text segments into a single segment
+    # spanning the whole streak. This handles two cases the same way:
+    #
+    #  - Whisper hallucination loop ("¡Karol!" 174 times): the original
+    #    code DROPPED segments past the 2nd, leaving a 17 s hole in the
+    #    video. The chant audio is still in the audio track, but the
+    #    subtitle disappears mid-chant — looks broken.
+    #  - Real audience chant or repeated ad-lib in a live cut (Karol G
+    #    "Si Antes Te Hubiera Conocido (Official Video)" has the audience
+    #    chanting "¡Karol!" for ~17 s during the bridge): same shape, but
+    #    here the chant IS legit content the operator may want to keep.
+    #
+    # Either way: the right output is a single subtitle covering the
+    # whole chant, not 174 micro-segments and not silence. The operator
+    # decides in the editor whether to keep or drop.
+    merged: list[dict] = []
+    collapsed_groups = 0
+    collapsed_total = 0
+    for seg in segments:
+        key = seg["text"].lower().strip()
+        if merged and merged[-1]["text"].lower().strip() == key:
+            # Extend the previous segment's end to cover this duplicate.
+            if seg["end"] > merged[-1]["end"]:
+                merged[-1]["end"] = seg["end"]
+            collapsed_total += 1
+            # First merge in a streak counts as a new collapsed group.
+            if not merged[-1].get("_collapsed"):
+                merged[-1]["_collapsed"] = True
+                collapsed_groups += 1
+        else:
+            merged.append({**seg})
+    for s in merged:
+        s.pop("_collapsed", None)
+    if collapsed_total:
+        print(f"[WHISPER-API] Merged {collapsed_total} consecutive duplicate "
+              f"segments into {collapsed_groups} chant/loop spans")
+    segments = merged
+
+    GAP = 0.05
+    for i in range(len(segments) - 1):
+        if segments[i]["end"] > segments[i + 1]["start"] - GAP:
+            segments[i]["end"] = segments[i + 1]["start"] - GAP
+
+    print(f"[WHISPER-API] {len(segments)} segments")
+    return segments
+
+
+def transcribe(mp3_path: str, language: str = None,
+               lyrics_hint: str | None = None) -> list[dict]:
+    """Transcribe an audio file to lyric segments.
+
+    Backend selection:
+        - If OPENAI_API_KEY is set, route to the OpenAI Whisper API. This is
+          the production path: no local model, no OOM risk on 1-2 GB workers.
+          Errors propagate — no silent fallback to the 1.5 GB local model
+          that frequently OOMs on small instances.
+        - If OPENAI_API_KEY is not set, fall back to the local Whisper-turbo
+          model. Works for development on machines with enough RAM.
+
+    `lyrics_hint`: optional reference text (e.g. lrclib plain lyrics) used
+    as Whisper-API's `prompt` parameter to bias transcription toward the
+    expected vocabulary. See _transcribe_via_openai_api for details. Local
+    Whisper path ignores it (could be added later via `initial_prompt=`).
+    """
+    has_key = bool(os.environ.get("OPENAI_API_KEY", "").strip())
+    print(f"[transcribe] OPENAI_API_KEY={'set' if has_key else 'EMPTY'}")
+    if has_key:
+        return _transcribe_via_openai_api(
+            mp3_path, language=language, lyrics_hint=lyrics_hint,
+        )
+
+    # --- local Whisper path ---
     audio_path = mp3_path
 
     model = _get_whisper_model("turbo")
@@ -402,59 +804,1169 @@ def transcribe(mp3_path: str, language: str = None) -> list[dict]:
 
 
 # ---------------------------------------------------------------------------
-# Lyrics reference fetcher — used by /transcribe to show reference text in UI
+# Lyrics reference fetcher — used by /transcribe to show reference text in UI.
+#
+# The reference is fed to LyricsEditor.findSuggestion which fuzzy-matches each
+# Whisper segment to a reference line and surfaces a one-click correction.
+# Quality of suggestions is bounded by quality of the reference, so we lean
+# on Gemini 2.5 Flash with the google_search grounding tool — Google's
+# grounded LLM aggregates from public lyric sites with cleaner provenance
+# than direct API integration with any single commercial lyrics provider
+# (Genius prohibits commercial use without a license; UMG cannot ride that).
 # ---------------------------------------------------------------------------
 
-_LYRICS_CACHE_DIR = os.path.join(OUTPUTS_DIR, "_lyrics_cache")
+# Domains we *prefer* in grounding sources. Soft signal only — Vertex AI
+# Search wraps grounding URIs in a redirect host (vertexaisearch.cloud
+# .google.com/...) so the original target host is often hidden until the
+# redirect is followed. We log it for observability but do NOT reject on
+# absence; the lyrics-shape validation downstream handles hallucination.
+_LYRIC_DOMAINS = {
+    "genius.com", "azlyrics.com", "letras.com", "letras.mus.br",
+    "lyrics.com", "musixmatch.com", "songlyrics.com", "metrolyrics.com",
+    "lyricfind.com", "songmeanings.com",
+}
 
 
-def _fetch_lyrics_from_sources(artist: str, song: str) -> list[str]:
-    """Fetch reference lyrics for a song from multiple sources.
+def _truthy_env(val: str) -> bool:
+    """Robust truthy parser — same shape as REQUIRE_REVIEW (commit 06a42e7)."""
+    return (val or "").strip().strip('"').strip("'").lower() in (
+        "1", "true", "yes", "on", "y", "t",
+    )
 
-    Order: (1) local cache, (2) Genius API if GENIUS_TOKEN set. Returns a list
-    of strings (longest = most complete). Returns [] on any failure — this is a
-    best-effort helper, never raises.
+
+def _lyrics_cache_key(artist: str, song: str) -> str:
+    import hashlib
+    return hashlib.sha1(
+        f"{artist.lower().strip()}|{song.lower().strip()}".encode()
+    ).hexdigest()[:16]
+
+
+def _lrclib_cache_key(artist: str, song: str) -> str:
+    """Stable namespaced key for lrclib results in the LyricsCache table.
+    Same Postgres table the Gemini path uses; the `lrclib:` prefix keeps
+    the two namespaces independent (Gemini stores plain text in `lyrics`,
+    lrclib stores a JSON-encoded dict)."""
+    import hashlib as _h
+    h = _h.sha1(f"{artist.strip().lower()}|{song.strip().lower()}".encode())
+    return f"lrclib:{h.hexdigest()[:16]}"
+
+
+def _fetch_lrclib(artist: str, song: str, db=None) -> dict | None:
+    """Look up a song on lrclib.net's public API. Returns:
+        {"plain": str|None, "synced": str|None, "duration": float|None}
+    or None if the request failed or the song wasn't found.
+
+    lrclib.net is an open, free, no-auth lyrics database (similar shape to
+    MusicBrainz for lyrics). Public API, no anti-bot, generous rate limits.
+    Crucially: covers Latin / reggaeton / pop catalogues that Gemini-grounded
+    search refuses to answer for due to RECITATION blocking on UMG-owned
+    songs (Karol G, Bad Bunny, J Balvin, etc.). It also frequently has
+    *synced* lyrics with line-level timestamps — when present, those let us
+    skip Whisper transcription entirely and avoid hallucination loops.
+
+    `db` (optional): a SQLAlchemy session. When provided, the function
+    consults the LyricsCache table first and writes successful fetches
+    back so that future calls don't depend on lrclib.net's uptime. This
+    is what saves us when Railway's outbound to lrclib gets a transient
+    timeout — once we've fetched a song once, we never re-fetch it.
+
+    Best-effort — never raises.
     """
     if not artist or not song:
+        return None
+    import requests as _req
+    import json as _json
+
+    cache_key = _lrclib_cache_key(artist, song)
+
+    # Cache lookup. Skip entirely on db=None (e.g. the smoke scripts).
+    if db is not None:
+        try:
+            from database import LyricsCache
+            row = db.query(LyricsCache).filter(
+                LyricsCache.cache_key == cache_key
+            ).first()
+            if row and row.lyrics:
+                cached = _json.loads(row.lyrics)
+                if cached.get("plain") or cached.get("synced"):
+                    print(f"[LYRICS] lrclib cache hit {cache_key} "
+                          f"({len((cached.get('plain') or ''))} plain chars, "
+                          f"synced={'yes' if cached.get('synced') else 'no'})")
+                    return cached
+        except Exception as e:
+            print(f"[LYRICS] lrclib cache read failed: {e}")
+    # Two attempts: lrclib reads can spike >10s under load. Total budget
+    # is ~25s in the worst case, well within the user-perceived bound
+    # for /transcribe (Whisper is the long pole anyway).
+    last_err: Exception | None = None
+    r = None
+    for attempt in range(2):
+        try:
+            r = _req.get(
+                "https://lrclib.net/api/get",
+                params={"artist_name": artist, "track_name": song},
+                timeout=20,
+                headers={"User-Agent": "GenLyAI/1.0 (+https://app.genly.pro)"},
+            )
+            break
+        except Exception as e:  # transient network / timeout
+            last_err = e
+            if attempt == 0:
+                print(f"[LYRICS] lrclib attempt 1 failed ({e.__class__.__name__}: "
+                      f"{str(e)[:80]}); retrying once")
+                continue
+            print(f"[LYRICS] lrclib fetch failed after retry: {e}")
+            return None
+    if r is None:
+        return None
+    try:
+        if r.status_code != 200:
+            print(f"[LYRICS] lrclib {r.status_code} for {artist!r} - {song!r}")
+            return None
+        data = r.json()
+        plain = (data.get("plainLyrics") or "").strip() or None
+        synced = (data.get("syncedLyrics") or "").strip() or None
+        if not plain and not synced:
+            return None
+        # Some lrclib records expose only `syncedLyrics` (different bots
+        # populate the two columns independently). The downstream auto-
+        # recover code in /transcribe gates on `if plain:` so when plain
+        # is missing the recovery branch is unreachable. Derive plain
+        # from synced by stripping the `[mm:ss.xx]` timestamps so the
+        # recovery path always has a usable reference. This keeps El
+        # Plan de la Mariposa - El Riesgo (which has only syncedLyrics
+        # in some lrclib records) from falling all the way through to
+        # the no-recovery Gemini fallback.
+        if not plain and synced:
+            import re as _re
+            ts_re = _re.compile(r"^\s*(?:\[\d+:\d+(?:[.:]\d+)?\]\s*)+")
+            derived: list[str] = []
+            for line in synced.splitlines():
+                stripped = ts_re.sub("", line).strip()
+                if stripped:
+                    derived.append(stripped)
+            if derived:
+                plain = "\n".join(derived)
+                print(f"[LYRICS] lrclib derived plain from synced "
+                      f"({len(plain)} chars, {len(derived)} lines)")
+        result = {
+            "plain": plain,
+            "synced": synced,
+            "duration": data.get("duration"),
+        }
+        # Write-through cache. Once stored, this song never depends on
+        # lrclib.net uptime again — important for Railway outbound flakes.
+        if db is not None:
+            try:
+                from database import LyricsCache
+                payload = _json.dumps(result, ensure_ascii=False)
+                row = db.query(LyricsCache).filter(
+                    LyricsCache.cache_key == cache_key
+                ).first()
+                if row:
+                    row.lyrics = payload
+                else:
+                    db.add(LyricsCache(
+                        cache_key=cache_key,
+                        artist=artist,
+                        title=song,
+                        lyrics=payload,
+                        fetched_by_model="lrclib",
+                    ))
+                db.commit()
+                print(f"[LYRICS] lrclib cached {cache_key} "
+                      f"({len(payload)} bytes)")
+            except Exception as e:
+                print(f"[LYRICS] lrclib cache write failed: {e}")
+        return result
+    except Exception as e:
+        print(f"[LYRICS] lrclib fetch failed: {e}")
+        return None
+
+
+_LRC_LINE = None  # lazy-compiled regex
+
+
+def _lrc_to_segments(lrc: str, audio_duration: float | None = None,
+                     time_offset: float = 0.0) -> list[dict]:
+    """Parse LRC-format synced lyrics into Whisper-shape segments.
+
+    LRC line format: ``[mm:ss.xx] Text``. Empty-text lines (e.g. ``[00:06.00]``
+    in the Karol G example) are gap markers that bound the previous segment
+    but don't produce a segment of their own. Each emitted segment's `end`
+    is set to the next line's `start` minus a tiny gap (50 ms), so subtitles
+    leave the screen exactly when the next line should appear. Tail segment
+    ends at audio_duration when known, otherwise +8 s after its start.
+
+    `time_offset` shifts ALL timestamps by the given seconds — used when the
+    user uploads a version of the song with extra audio at the start (e.g.
+    "Official Video" with a dialogue intro that the studio LRC doesn't
+    account for). The caller computes the offset by comparing user audio
+    duration against lrclib's reported duration.
+    """
+    import re as _re
+    global _LRC_LINE
+    if _LRC_LINE is None:
+        _LRC_LINE = _re.compile(r"^\s*\[(\d+):(\d+)(?:[.:](\d+))?\]\s*(.*)$")
+
+    raw: list[dict] = []
+    for line in (lrc or "").splitlines():
+        m = _LRC_LINE.match(line)
+        if not m:
+            continue
+        mm, ss, frac, text = m.group(1), m.group(2), m.group(3), m.group(4)
+        try:
+            start = int(mm) * 60 + int(ss)
+            if frac:
+                start += int(frac) / (10 ** len(frac))
+        except ValueError:
+            continue
+        raw.append({"start": float(start), "text": (text or "").strip()})
+    if not raw:
+        return []
+    raw.sort(key=lambda r: r["start"])
+
+    segments: list[dict] = []
+    n = len(raw)
+    GAP = 0.05
+    for i, item in enumerate(raw):
+        if not item["text"]:
+            continue  # gap marker — used only to bound the previous line
+        # Find the next entry with a strictly greater start to set our end.
+        j = i + 1
+        while j < n and raw[j]["start"] <= item["start"]:
+            j += 1
+        if j < n:
+            end = raw[j]["start"] - GAP
+        elif audio_duration:
+            end = min(float(audio_duration), item["start"] + 8.0)
+        else:
+            end = item["start"] + 5.0
+        # Defensive: keep at least 0.5 s on screen
+        if end < item["start"] + 0.5:
+            end = item["start"] + 0.5
+        segments.append({
+            "start": item["start"] + time_offset,
+            "end": end + time_offset,
+            "text": item["text"],
+        })
+    return segments
+
+
+def _detect_hallucination(segments: list[dict],
+                           audio_duration: float | None) -> tuple[bool, str]:
+    """Whisper hallucination smoke test. Returns (is_hallucinated, reason).
+
+    Three independent signals trigger; ANY one is enough:
+      - segment count is implausibly low for the audio duration,
+      - any single segment is both very long (>15 s) and very wordy
+        (>40 words) — the classic instrumental-passage trap,
+      - any segment shows 3+ near-duplicate phrase windows by token-set
+        Jaccard ≥ 0.75 — synonym loops ("reflexionar" ↔ "pensar") that
+        the exact-match `_truncate_intra_loop` lets through.
+
+    The detector is the GATE for the auto-recover branch: when this fires
+    AND the caller has lrclib plain lyrics, we replace Whisper's output
+    with synthesized segments (see `_synthesize_segments_from_plain`).
+    """
+    if not segments:
+        return True, "empty segment list"
+
+    # Signal 1 — segment count vs audio duration.
+    if audio_duration and audio_duration > 30:
+        minutes = audio_duration / 60.0
+        floor = max(8, int(minutes * 4))
+        if len(segments) < floor:
+            return True, (f"low count: {len(segments)} segments for "
+                          f"{audio_duration:.0f}s audio (floor={floor})")
+
+    # Signal 2 — instrumental-passage mega-segment.
+    for s in segments:
+        dur = float(s.get("end", 0)) - float(s.get("start", 0))
+        words = len((s.get("text") or "").split())
+        if dur > 15.0 and words > 40:
+            return True, (f"implausible segment: {dur:.1f}s × {words} "
+                          f"words — text={(s.get('text') or '')[:60]!r}")
+
+    # Signal 3 — fuzzy intra-loop (token-set Jaccard ≥ 0.75).
+    for s in segments:
+        if _has_fuzzy_intra_loop(s.get("text") or ""):
+            return True, ("fuzzy intra-loop in segment "
+                          f"{(s.get('text') or '')[:60]!r}")
+
+    # Signal 4 — segment whose first and second halves carry the same
+    # content. Catches the Whisper failure mode where the model emits
+    # the SAME phrase exactly twice in one segment
+    # ("¿Qué podía reflexionar sobre lo que estaba haciendo? ¿Qué
+    # podía reflexionar sobre lo que estaba haciendo?") — only 2
+    # repetitions so the fuzzy-loop check (3+) doesn't catch it.
+    # Variety guards (each half needs >= 4 unique normalised tokens)
+    # keep simple repetitive choruses like "la la la la" from being
+    # false-flagged.
+    for s in segments:
+        text = s.get("text") or ""
+        words = [n for n in (_normalize_token(w) for w in text.split()) if n]
+        n = len(words)
+        if n < 12:
+            continue
+        half = n // 2
+        first_half = set(words[:half])
+        second_half = set(words[half:half * 2])
+        if len(first_half) < 4 or len(second_half) < 4:
+            continue
+        inter = len(first_half & second_half)
+        union = len(first_half | second_half)
+        if union > 0 and (inter / union) >= 0.85:
+            dur = float(s.get("end", 0)) - float(s.get("start", 0))
+            return True, (f"duplicate halves in {dur:.1f}s segment "
+                          f"({n} words): {text[:60]!r}")
+
+    return False, ""
+
+
+def _normalize_token(s: str) -> str:
+    """Lowercase + strip combining diacritics + drop non-alphanumeric.
+    Without this, "haciendo," and "haciendo" or "podía" and "podia"
+    register as distinct tokens, breaking the Jaccard fuzzy-loop check
+    on real Whisper output (which carries Spanish accents and clause
+    punctuation). The normalisation matches the behaviour Whisper users
+    intuitively expect when reasoning about repetition."""
+    import unicodedata as _u
+    s = (s or "").lower()
+    s = _u.normalize("NFD", s)
+    return "".join(c for c in s if c.isalnum() and not _u.combining(c))
+
+
+def _has_fuzzy_intra_loop(text: str) -> bool:
+    """Detect 3+ near-duplicate consecutive word-windows in a segment.
+    Two windows count as the same loop when their token-set Jaccard is
+    ≥ 0.75 — catches synonym swaps ("reflexionar" ↔ "pensar") that the
+    exact-equality intra-loop truncator misses.
+
+    Window sizes 4..14 (longer first), same shape as the existing
+    `_truncate_intra_loop`, but only used as a SIGNAL here, not a fix.
+
+    Tokens are normalised (lowercase + accent fold + punctuation strip)
+    before comparison. Earlier versions used `.lower()` only and missed
+    real-world Whisper hallucinations like "que podía reflexionar sobre
+    lo que estaba haciendo, que podía pensar sobre lo que estaba
+    haciendo …" because "haciendo," and "haciendo" tokenised
+    differently.
+    """
+    raw = text.split()
+    words = [n for n in (_normalize_token(w) for w in raw) if n]
+    total = len(words)
+    if total < 12:
+        return False
+    for window in range(14, 3, -1):
+        if total < window * 3:
+            continue
+        for start in range(total - window * 3 + 1):
+            phrase_set = set(words[start:start + window])
+            if not phrase_set:
+                continue
+            count = 1
+            pos = start + window
+            while pos + window <= total:
+                next_set = set(words[pos:pos + window])
+                if not next_set:
+                    break
+                inter = len(phrase_set & next_set)
+                union = len(phrase_set | next_set)
+                if union == 0 or (inter / union) < 0.75:
+                    break
+                count += 1
+                pos += window
+            if count >= 3:
+                return True
+    return False
+
+
+# Section markers we strip when distributing lrclib plain lyrics — they're
+# scaffolding metadata, not lines a singer actually performs.
+_PLAIN_SECTION_MARKER = re.compile(
+    r"^\s*[\[(](?:verso|verse|coro|chorus|estribillo|puente|bridge|"
+    r"intro|outro|pre[- ]?coro|pre[- ]?chorus|interlude|instrumental|"
+    r"refr[áa]n|solo)[^\]\)]*[\])]\s*$",
+    re.IGNORECASE,
+)
+
+
+def _split_plain_lines(plain: str) -> list[str]:
+    """Split lrclib plain text into singable lines.
+    Drops empties + section markers ([Verso], [Chorus], etc.) so the
+    output is exactly the lines a vocalist actually performs.
+    """
+    if not plain:
+        return []
+    out: list[str] = []
+    for raw in plain.splitlines():
+        stripped = raw.strip()
+        if not stripped:
+            continue
+        if _PLAIN_SECTION_MARKER.match(stripped):
+            continue
+        out.append(stripped)
+    return out
+
+
+def _align_whisper_to_plain(segments: list[dict],
+                             plain: str) -> list[tuple[int, float]]:
+    """Find time anchors by fuzzy-matching Whisper's surviving segments
+    against lrclib plain lyric lines.
+
+    Even when Whisper hallucinates the back half of a song, the FIRST
+    segments are usually correct — they anchor onto real audio cues.
+    We can use those segments as time landmarks: "Whisper heard this
+    text at 0.2s; that text matches plain line 0; therefore line 0
+    starts at 0.2s." With multiple anchors, the synthesizer interpolates
+    the rest of the lyric lines piecewise instead of distributing them
+    uniformly across the full duration. Result: timestamps land much
+    closer to the actual singing without any operator effort.
+
+    Returns sorted list of (line_index, time_seconds) tuples. Each
+    anchor satisfies:
+      - the segment passes the per-segment hallucination signals
+        (no mega-segment, no fuzzy intra-loop),
+      - it fuzzy-matches a plain line with token-set Jaccard ≥ 0.3,
+      - and its line index is strictly greater than every prior anchor's
+        (a later-in-time anchor that matches an EARLIER lyric line is
+        almost certainly a wrong match — we drop it rather than confuse
+        the interpolation).
+
+    Empty list when no segment qualifies — caller falls back to uniform
+    distribution from 0.
+    """
+    plain_lines = _split_plain_lines(plain)
+    if not segments or not plain_lines:
         return []
 
+    # Use the same normalisation as _has_fuzzy_intra_loop: lowercase +
+    # accent fold + punctuation strip. Otherwise "podía" / "podia" or
+    # "haciendo," / "haciendo" register as distinct tokens and the
+    # Jaccard match score collapses below the 0.3 threshold.
+    plain_token_sets = [
+        {n for n in (_normalize_token(w) for w in line.split()) if n}
+        for line in plain_lines
+    ]
+
+    raw: list[tuple[int, float]] = []
+    for s in segments:
+        text = (s.get("text") or "").strip()
+        if not text:
+            continue
+        # Per-segment plausibility — same signals the global detector
+        # uses. With no audio_duration only the mega-segment + fuzzy-loop
+        # checks fire.
+        per_seg_bad, _ = _detect_hallucination([s], audio_duration=None)
+        if per_seg_bad:
+            continue
+        seg_set = {n for n in (_normalize_token(w) for w in text.split()) if n}
+        if not seg_set:
+            continue
+        best_idx = -1
+        best_score = 0.0
+        for i, p_set in enumerate(plain_token_sets):
+            if not p_set:
+                continue
+            inter = len(seg_set & p_set)
+            union = len(seg_set | p_set)
+            if union == 0:
+                continue
+            score = inter / union
+            if score > best_score:
+                best_score = score
+                best_idx = i
+        if best_idx >= 0 and best_score >= 0.3:
+            raw.append((best_idx, float(s.get("start", 0.0))))
+
+    raw.sort(key=lambda a: a[1])
+    # Monotonic filter: drop later-in-time anchors that point earlier in
+    # the lyrics (almost always a bad match).
+    filtered: list[tuple[int, float]] = []
+    last_idx = -1
+    for idx, t in raw:
+        if idx > last_idx:
+            filtered.append((idx, t))
+            last_idx = idx
+    return filtered
+
+
+def _synthesize_segments_from_plain(plain: str,
+                                     audio_duration: float,
+                                     anchors: list[tuple[int, float]] | None = None,
+                                     start_time: float = 0.0,
+                                     ) -> list[dict]:
+    """Distribute lrclib plain lyrics across the audio duration.
+
+    Used when Whisper has hallucinated and we need to ship the operator
+    a complete transcription instead of 3 broken rows. With no anchors
+    we distribute lines uniformly; with anchors we interpolate piecewise
+    between (line_index, time) points so each lyric line lands near the
+    moment Whisper actually heard it.
+
+    Args:
+        plain: lrclib plain text, one line per lyric line. Section
+            markers like "[Verso]" / "[Chorus]" are filtered out.
+        audio_duration: total audio length in seconds.
+        anchors: optional list of (line_index, time_seconds) pairs from
+            `_align_whisper_to_plain`. Empty/None falls back to even
+            distribution from `start_time`.
+        start_time: where the song body actually starts in the user's
+            audio. Default 0 (whole audio is song). When the audio has
+            a spoken-intro / dialogue prefix that the lrclib studio
+            version doesn't have (e.g. the YouTube "Video Oficial" cut
+            of "El Plan de la Mariposa - El Riesgo" has 73 s of
+            dialogue before the song proper begins), the caller passes
+            `start_time=intro_offset` so the synthesized song lyrics
+            distribute over [intro_offset, audio_duration] instead of
+            getting compressed by the spoken intro region.
+
+    Returns segments in the same shape as `transcribe()` — list of
+    {start, end, text} dicts, monotonically increasing, last `end`
+    capped at `audio_duration`.
+    """
+    if not plain or not plain.strip() or not audio_duration:
+        return []
+
+    lines = _split_plain_lines(plain)
+    if not lines:
+        return []
+    n = len(lines)
+
+    # Filter / dedupe anchors to keep them strictly inside the line+time
+    # window and strictly monotonic. The aligner already does this, but
+    # we re-check defensively in case the caller hand-built anchors.
+    monotonic: list[tuple[float, float]] = []
+    last_idx_f, last_t_f = -1.0, -1.0
+    for raw_anchor in (anchors or []):
+        try:
+            idx, t = float(raw_anchor[0]), float(raw_anchor[1])
+        except (TypeError, ValueError, IndexError):
+            continue
+        if not (0 <= idx < n):
+            continue
+        if not (0 <= t < audio_duration):
+            continue
+        if idx > last_idx_f and t > last_t_f:
+            monotonic.append((idx, t))
+            last_idx_f, last_t_f = idx, t
+
+    # Build the piecewise interpolation table. Always end at
+    # (n, audio_duration); start at (0, start_time) unless an anchor
+    # lives at line 0. start_time defaults to 0 (whole audio is song);
+    # for tracks with a non-song prefix (spoken intro, dialogue) the
+    # caller passes intro_offset so the song lyrics distribute over
+    # the song region only.
+    safe_start = max(0.0, min(float(start_time), float(audio_duration) - 0.5))
+    points: list[tuple[float, float]] = list(monotonic)
+    if not points or points[0][0] > 0:
+        points.insert(0, (0.0, safe_start))
+    if points[-1][0] < float(n):
+        points.append((float(n), float(audio_duration)))
+
+    def _time_at(line_index: float) -> float:
+        for (l1, t1), (l2, t2) in zip(points, points[1:]):
+            if line_index <= l2:
+                if l2 == l1:
+                    return t1
+                return t1 + (line_index - l1) / (l2 - l1) * (t2 - t1)
+        return points[-1][1]
+
+    GAP = 0.05
+    segments: list[dict] = []
+    for i, line in enumerate(lines):
+        start = _time_at(float(i))
+        end = _time_at(float(i + 1)) - GAP
+        if end <= start:
+            end = start + 0.5
+        segments.append({"start": start, "end": end, "text": line})
+    if segments and segments[-1]["end"] > audio_duration:
+        segments[-1]["end"] = audio_duration
+    return segments
+
+
+def _detect_speech_regions(audio_path: str,
+                            top_db: float = 30.0,
+                            min_region_s: float = 0.4,
+                            merge_gap_s: float = 0.5,
+                            ) -> list[tuple[float, float]]:
+    """Return non-silent intervals from the audio, in seconds.
+
+    Uses librosa's energy-based VAD (`effects.split` on the loaded
+    waveform with a `top_db` threshold below the peak). Generic — works
+    for any song. Output is what we use to decide WHERE in the audio
+    a vocal subtitle could legitimately be placed; gap-fill avoids
+    placing reference lines inside long instrumental silences.
+
+    Defaults tuned for music (top_db=30 keeps quiet vocals in but drops
+    drum-kit-only regions). Returns [] on any failure so the caller
+    can fall back to time-uniform distribution.
+    """
     try:
-        os.makedirs(_LYRICS_CACHE_DIR, exist_ok=True)
-        import hashlib
-        key = hashlib.sha1(f"{artist.lower()}|{song.lower()}".encode()).hexdigest()[:16]
-        cache_path = os.path.join(_LYRICS_CACHE_DIR, f"{key}.json")
-        if os.path.exists(cache_path):
-            try:
-                with open(cache_path) as f:
-                    return json.load(f)
-            except (json.JSONDecodeError, OSError):
-                pass
-    except OSError:
-        cache_path = None
+        import librosa
+        import numpy as np
+        # Mono, native rate sufficient for VAD; 22 kHz is librosa default.
+        y, sr = librosa.load(audio_path, sr=22050, mono=True)
+        intervals = librosa.effects.split(y, top_db=top_db)
+        regions: list[tuple[float, float]] = []
+        for start_sample, end_sample in intervals:
+            start = float(start_sample) / sr
+            end = float(end_sample) / sr
+            if end - start < min_region_s:
+                continue  # too short — likely click/spike, not speech
+            regions.append((start, end))
+        # Merge regions separated by very small gaps (single breath
+        # between two phrases) so consecutive vocal phrases don't get
+        # split into N micro-regions.
+        if not regions:
+            return []
+        merged: list[tuple[float, float]] = [regions[0]]
+        for start, end in regions[1:]:
+            prev_start, prev_end = merged[-1]
+            if start - prev_end <= merge_gap_s:
+                merged[-1] = (prev_start, end)
+            else:
+                merged.append((start, end))
+        return merged
+    except Exception as e:
+        print(f"[VAD] _detect_speech_regions failed ({e}); skipping VAD")
+        return []
 
-    results: list[str] = []
-    token = os.environ.get("GENIUS_TOKEN", "").strip()
-    if token:
+
+def _fill_gaps_with_reference(whisper_segments: list[dict],
+                               reference: str,
+                               audio_duration: float,
+                               coverage_threshold: float = 0.7,
+                               audio_path: str | None = None,
+                               ) -> list[dict] | None:
+    """Generic recovery for outlier songs: keep Whisper's plausible
+    segments, then fill the uncovered time intervals with lines from
+    the reference text distributed proportionally.
+
+    This is the right model whenever Whisper returns SOME real
+    transcription (e.g. a spoken-dialogue intro that captures real
+    words at real timestamps) interleaved with hallucinated segments
+    (instrumental-passage mega-segments, synonym intra-loops). We
+    must not throw the real segments away.
+
+    Returns the merged segment list, or None when there's nothing
+    sensible to return (no plausible Whisper AND no reference). The
+    caller can decide whether to surface a coverage_warning.
+
+    `coverage_threshold`: when the kept Whisper segments cover more
+    than this fraction of the audio, return them as-is (no synthesis
+    needed — Whisper worked). Default 0.7.
+
+    Used by the Gemini-fallback path in /transcribe where lrclib was
+    unavailable and we therefore don't know intro_offset. The lrclib-
+    plain branch uses a different (more accurate) flow because it
+    knows the song-body offset.
+    """
+    if not audio_duration or audio_duration <= 0:
+        return whisper_segments or None
+
+    # 1. Keep only segments that pass per-segment plausibility.
+    kept: list[dict] = []
+    dropped = 0
+    for s in (whisper_segments or []):
+        bad, _ = _detect_hallucination([s], audio_duration=None)
+        if bad:
+            dropped += 1
+            continue
+        kept.append(s)
+    kept.sort(key=lambda x: float(x.get("start", 0)))
+
+    coverage = sum(
+        float(s.get("end", 0)) - float(s.get("start", 0)) for s in kept
+    ) / float(audio_duration)
+
+    # 2. Whisper covers most of the audio → no synthesis needed.
+    if coverage >= coverage_threshold:
+        return kept
+
+    # 3. Sparse coverage: distribute reference lines into the gaps.
+    ref_lines = _split_plain_lines(reference) if reference else []
+    if not ref_lines:
+        # Nothing to synthesize from. Return the (possibly empty) kept
+        # set; caller falls back to whatever default it had.
+        return kept or None
+
+    # Build the gap list. We start from one of two sources:
+    #   - VAD-detected SPEECH regions (preferred when audio_path is
+    #     supplied) — distributing reference lines only where someone
+    #     is actually singing/speaking. This is the right model for
+    #     songs with long instrumental sections where uniform fill
+    #     would land subtitles in silence (verified failure mode for
+    #     "El Plan de la Mariposa - El Riesgo": 73 s spoken intro,
+    #     instrumental gaps, then sung body).
+    #   - Whole-audio gaps (legacy path) when no audio_path is given.
+    # Each "gap" then has the time spans of any kept Whisper segments
+    # subtracted from it so we don't double up subtitles in the same
+    # window.
+    speech_regions: list[tuple[float, float]] = []
+    if audio_path:
+        speech_regions = _detect_speech_regions(audio_path)
+        if speech_regions:
+            print(f"[VAD] {len(speech_regions)} speech regions detected; "
+                  f"reference will be distributed inside them")
+    if not speech_regions:
+        speech_regions = [(0.0, float(audio_duration))]
+
+    # Subtract kept Whisper time-windows from each speech region so
+    # we don't synthesize over a real Whisper segment.
+    kept_intervals = sorted(
+        (float(s["start"]), float(s["end"])) for s in kept
+    )
+
+    def _subtract_kept(start: float, end: float) -> list[tuple[float, float]]:
+        out: list[tuple[float, float]] = []
+        cur = start
+        for ks, ke in kept_intervals:
+            if ke <= cur or ks >= end:
+                continue
+            if ks > cur:
+                out.append((cur, min(ks, end)))
+            cur = max(cur, ke)
+            if cur >= end:
+                break
+        if cur < end:
+            out.append((cur, end))
+        return out
+
+    gaps: list[tuple[float, float]] = []
+    for region_start, region_end in speech_regions:
+        for sub_start, sub_end in _subtract_kept(region_start, region_end):
+            if sub_end - sub_start >= 1.0:
+                gaps.append((sub_start, sub_end))
+
+    if not gaps:
+        return kept
+
+    total_gap = sum(end - start for start, end in gaps)
+    if total_gap <= 0:
+        return kept
+
+    # 4. Allocate reference lines per gap, proportional to gap duration.
+    n_lines = len(ref_lines)
+    GAP_BETWEEN = 0.05
+    output = list(kept)
+    line_cursor = 0
+    for i, (start, end) in enumerate(gaps):
+        gap_dur = end - start
+        # Last gap absorbs all remaining lines so we never under-allocate.
+        if i == len(gaps) - 1:
+            line_count = n_lines - line_cursor
+        else:
+            line_count = max(0, round(gap_dur / total_gap * n_lines))
+            line_count = min(line_count, n_lines - line_cursor)
+        if line_count <= 0:
+            continue
+        per_line = gap_dur / line_count
+        for j in range(line_count):
+            line_idx = line_cursor + j
+            if line_idx >= n_lines:
+                break
+            line_start = start + j * per_line
+            line_end = start + (j + 1) * per_line - GAP_BETWEEN
+            if line_end <= line_start:
+                line_end = line_start + 0.5
+            if line_end > float(audio_duration):
+                line_end = float(audio_duration)
+            output.append({
+                "start": line_start,
+                "end": line_end,
+                "text": ref_lines[line_idx],
+            })
+        line_cursor += line_count
+
+    output.sort(key=lambda s: float(s["start"]))
+    return output
+
+
+def _audio_duration(audio_path: str) -> float | None:
+    """Best-effort audio duration in seconds. Handles both MP3 and WAV.
+    For MP3 we use mutagen.mp3 (header-only, ~1 ms). For WAV we use the
+    stdlib `wave` module (also header-only). Falls back to moviepy
+    (slower, opens the full file) on any failure. Returns None if
+    everything fails."""
+    name_lower = audio_path.lower()
+    if name_lower.endswith(".mp3"):
         try:
-            import lyricsgenius
-            g = lyricsgenius.Genius(
-                token, timeout=5, retries=1, verbose=False,
-                remove_section_headers=True, skip_non_songs=True,
+            from mutagen.mp3 import MP3
+            return float(MP3(audio_path).info.length)
+        except Exception:
+            pass
+    elif name_lower.endswith(".wav"):
+        try:
+            import wave
+            with wave.open(audio_path, "rb") as wf:
+                frames = wf.getnframes()
+                rate = wf.getframerate() or 0
+                if rate > 0:
+                    return float(frames) / rate
+        except Exception:
+            pass
+    try:
+        from moviepy.editor import AudioFileClip
+        with AudioFileClip(audio_path) as a:
+            return float(a.duration)
+    except Exception:
+        return None
+
+
+def _slice_audio_window(input_path: str, output_path: str,
+                         start_seconds: float, duration_seconds: float) -> bool:
+    """Slice an arbitrary [start, start+duration] window from an MP3.
+
+    Uses ``-ss`` AFTER ``-i`` for sample-accurate seek (slow seek), and
+    re-encodes via libmp3lame so we don't depend on keyframe alignment.
+    Slower than ``_slice_audio_prefix`` (re-encode vs stream copy) but
+    more reliable for arbitrary offsets where MP3 frame boundaries may
+    not line up with the requested cut.
+
+    Returns True on success, False on any failure. Best-effort.
+    """
+    if start_seconds < 0 or duration_seconds <= 0:
+        return False
+    import subprocess as _sp
+    try:
+        _sp.run(
+            ["ffmpeg", "-y", "-i", input_path,
+             "-ss", str(start_seconds), "-t", str(duration_seconds),
+             "-acodec", "libmp3lame", "-q:a", "5",
+             "-loglevel", "error", output_path],
+            check=True, timeout=30,
+        )
+        return os.path.exists(output_path) and os.path.getsize(output_path) > 0
+    except (_sp.CalledProcessError, _sp.TimeoutExpired, FileNotFoundError, OSError) as e:
+        print(f"[LYRICS] _slice_audio_window failed: {e}")
+        return False
+
+
+def _whisper_quick_text(mp3_path: str) -> str:
+    """Minimal whisper-1 transcription of a short clip — used by alignment
+    verification. Returns plain text with no post-processing (no spam
+    filter, no dedup). Best-effort: returns "" on any failure.
+    """
+    if not os.path.exists(mp3_path):
+        return ""
+    try:
+        from openai import OpenAI
+        with open(mp3_path, "rb") as f:
+            r = OpenAI().audio.transcriptions.create(
+                model="whisper-1", file=f, response_format="text",
             )
-            song_obj = g.search_song(song, artist)
-            if song_obj and song_obj.lyrics:
-                results.append(song_obj.lyrics)
-        except Exception as e:
-            print(f"[LYRICS] Genius fetch failed: {e}")
+        return (r or "").strip()
+    except Exception as e:
+        print(f"[LYRICS] _whisper_quick_text failed: {e}")
+        return ""
 
-    if cache_path and results:
+
+def _verify_lrclib_alignment(audio_path: str, expected_text: str,
+                              claimed_start: float, window: float = 5.5) -> float | None:
+    """Slice a ~window-second clip of audio starting just before
+    `claimed_start`, run Whisper on it, fuzzy-match against `expected_text`.
+
+    Returns a similarity ratio in [0, 1] (1.0 = identical, 0 = nothing in
+    common), or None if slicing or Whisper failed and we cannot verify.
+
+    Used to confirm lrclib's offset-shifted timestamps actually line up
+    with what's being sung in the user's audio. Cheap (~3 s, ~$0.0005).
+    Conservative threshold for "trust": ~0.4. For UMG-style operator
+    review, this is the difference between "subtitles look right" and
+    "subtitles are 30 s off and we shipped it."
+    """
+    if claimed_start < 0 or not expected_text:
+        return None
+    import tempfile
+    from difflib import SequenceMatcher
+    import re as _re
+
+    fd, clip_path = tempfile.mkstemp(suffix=".mp3")
+    try:
+        os.close(fd)
+        slice_start = max(0.0, claimed_start - 0.3)
+        if not _slice_audio_window(audio_path, clip_path, slice_start, window):
+            return None
+        actual = _whisper_quick_text(clip_path)
+        if not actual:
+            return None
+        def _norm(s: str) -> str:
+            return _re.sub(r"[^\w\s]", "", s.lower()).strip()
+        return SequenceMatcher(None, _norm(actual), _norm(expected_text)).ratio()
+    finally:
         try:
-            with open(cache_path, "w") as f:
-                json.dump(results, f)
+            os.unlink(clip_path)
         except OSError:
             pass
 
-    return results
+
+def _slice_audio_prefix(input_path: str, output_path: str, seconds: float) -> bool:
+    """Slice the first ``seconds`` of an MP3 into ``output_path`` using ffmpeg.
+
+    Used when the user uploads a song version with extra audio at the start
+    (a dialogue intro on an "Official Video" cut, e.g.) — we slice that
+    intro chunk and feed it to Whisper separately so the operator gets a
+    transcription of the dialogue too. The song proper is timestamped from
+    lrclib's synced lyrics with an offset.
+
+    Uses ``-acodec copy`` so there is no re-encode — just a stream copy of
+    the audio bytes through the cut point. Fast (< 1 s for typical sizes).
+
+    Returns True on success, False on any failure. Best-effort: caller
+    treats False as "no intro transcription available" and continues.
+    """
+    if seconds <= 0:
+        return False
+    import subprocess as _sp
+    try:
+        _sp.run(
+            ["ffmpeg", "-y", "-i", input_path,
+             "-t", str(seconds), "-acodec", "copy",
+             "-loglevel", "error", output_path],
+            check=True, timeout=30,
+        )
+        return os.path.exists(output_path) and os.path.getsize(output_path) > 0
+    except (_sp.CalledProcessError, _sp.TimeoutExpired, FileNotFoundError, OSError) as e:
+        print(f"[LYRICS] _slice_audio_prefix failed: {e}")
+        return False
+
+
+def _fetch_lyrics_via_gemini_search(
+    artist: str, song: str,
+    job_id: str | None = None,
+    db=None,
+) -> str | None:
+    """Fetch reference lyrics for (artist, song) via Gemini 2.5 Flash with
+    the google_search grounding tool. Returns plain-text lyrics on success,
+    None on cache miss + fetch failure + validation reject.
+
+    Best-effort — never raises. The /transcribe endpoint falls through to
+    lyrics.ovh when this returns None.
+
+    Provenance: caller passes `job_id` to record an AIProvenance row keyed
+    to that job (UMG audit trail). When called from /transcribe (pre-job),
+    job_id=None and the LyricsCache row itself serves as the audit record
+    (timestamp + source URLs + model name).
+    """
+    if not artist or not song:
+        return None
+
+    # Kill switch — flip to false in Railway if Gemini path misbehaves in prod.
+    if not _truthy_env(os.environ.get("LYRICS_GEMINI_SEARCH_ENABLED", "true")):
+        return None
+
+    cache_key = _lyrics_cache_key(artist, song)
+
+    # Cache lookup (Postgres — shared across the worker fleet).
+    if db is not None:
+        try:
+            from database import LyricsCache
+            row = db.query(LyricsCache).filter(
+                LyricsCache.cache_key == cache_key
+            ).first()
+            if row and row.lyrics:
+                print(f"[LYRICS] cache hit {cache_key} ({len(row.lyrics)} chars)")
+                return row.lyrics
+        except Exception as e:
+            print(f"[LYRICS] cache read failed: {e}")
+
+    # Build Gemini call.
+    from google import genai
+    from google.genai import types
+    from provenance import record_ai_call
+
+    system_prompt = (
+        "You are a lyrics retrieval assistant. Use the google_search tool to "
+        "find the official lyrics of a song from public lyrics websites "
+        "(genius.com, letras.com, azlyrics.com, lyrics.com, musixmatch.com, "
+        "songmeanings.com). Return ONLY the lyrics as plain text, one line "
+        "per song line. No commentary, no bracketed section headers like "
+        "[Chorus] or [Verse], no translation, no annotations. "
+        "If you cannot verify the lyrics from a lyrics website, respond "
+        "exactly with: LYRICS_NOT_FOUND"
+    )
+    user_content = f'Find the lyrics for the song "{song}" by {artist}.'
+    full_prompt = f"system:{system_prompt}\nuser:{user_content}"
+
+    recorder = record_ai_call(
+        job_id=job_id,
+        step="lyrics_reference_fetch",
+        tool_name="gemini-2.5-flash",
+        tool_provider="google_vertex",
+        tool_version=getattr(genai, "__version__", None),
+        prompt=full_prompt,
+        input_data_types=["artist_name", "song_title"],
+    ) if job_id else None
+
+    try:
+        client = _get_genai_client()
+        search_tool = types.Tool(google_search=types.GoogleSearch())
+        response = client.models.generate_content(
+            model="gemini-2.5-flash",
+            contents=user_content,
+            config=types.GenerateContentConfig(
+                system_instruction=system_prompt,
+                tools=[search_tool],
+                temperature=0.1,
+                max_output_tokens=2000,
+                thinking_config=types.ThinkingConfig(thinking_budget=0),
+            ),
+        )
+
+        text = ""
+        try:
+            text = (response.text or "").strip()
+        except Exception:
+            text = ""
+
+        candidates = getattr(response, "candidates", None) or []
+        if not candidates:
+            if recorder:
+                recorder.finish(response_summary="no_candidates")
+            return None
+        cand = candidates[0]
+        finish_reason = getattr(cand, "finish_reason", None)
+        finish_str = str(finish_reason) if finish_reason is not None else ""
+
+        # Gemini blocks copyrighted recitation aggressively. Degrade silently.
+        if "RECITATION" in finish_str or "SAFETY" in finish_str:
+            print(f"[LYRICS] gemini blocked: finish_reason={finish_str}")
+            if recorder:
+                recorder.finish(response_summary=f"blocked={finish_str}")
+            return None
+        if not text or text.strip() == "LYRICS_NOT_FOUND":
+            if recorder:
+                recorder.finish(response_summary=f"empty_or_sentinel; finish={finish_str}")
+            return None
+
+        # Extract grounding sources (proves the answer was grounded, not
+        # purely hallucinated from training data).
+        gm = getattr(cand, "grounding_metadata", None)
+        chunks = getattr(gm, "grounding_chunks", None) or []
+        source_urls: list[str] = []
+        source_titles: list[str] = []
+        for c in chunks:
+            web = getattr(c, "web", None)
+            if not web:
+                continue
+            uri = getattr(web, "uri", None)
+            title = getattr(web, "title", None)
+            if uri:
+                source_urls.append(uri)
+            if title:
+                source_titles.append(title)
+
+        if not source_urls:
+            print("[LYRICS] no grounding sources — refusing to trust ungrounded text")
+            if recorder:
+                recorder.finish(response_summary="no_grounding_sources")
+            return None
+
+        # Soft signal: did any grounding chunk hit a known lyric site?
+        on_lyric_site = False
+        haystack = " ".join(source_urls + source_titles).lower()
+        for d in _LYRIC_DOMAINS:
+            if d in haystack:
+                on_lyric_site = True
+                break
+        if not on_lyric_site:
+            print(f"[LYRICS] grounding off lyric-domain allow-list (soft warn): "
+                  f"{source_urls[:2]}")
+
+        # Lyrics-shape validation.
+        lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+        if len(lines) < 8:
+            if recorder:
+                recorder.finish(response_summary=f"too_few_lines={len(lines)}")
+            return None
+        if len(text) < 80:
+            if recorder:
+                recorder.finish(response_summary=f"too_short_chars={len(text)}")
+            return None
+
+        # Repetition guard — Gemini hallucination loops on a single line.
+        from collections import Counter
+        most_common, mc_count = Counter(lines).most_common(1)[0]
+        if mc_count / len(lines) > 0.4:
+            if recorder:
+                recorder.finish(response_summary=f"repetition={mc_count}/{len(lines)}")
+            return None
+
+        # Persist to cache.
+        if db is not None:
+            try:
+                from database import LyricsCache
+                row = db.query(LyricsCache).filter(
+                    LyricsCache.cache_key == cache_key
+                ).first()
+                if row is None:
+                    row = LyricsCache(
+                        cache_key=cache_key,
+                        artist=artist[:255],
+                        title=song[:255],
+                        lyrics=text,
+                        source_urls=source_urls[:20],
+                        fetched_by_model="gemini-2.5-flash",
+                    )
+                    db.add(row)
+                    db.commit()
+                # If row already exists (race), keep existing — first writer wins.
+            except Exception as e:
+                print(f"[LYRICS] cache write failed: {e}")
+                try:
+                    db.rollback()
+                except Exception:
+                    pass
+
+        if recorder:
+            try:
+                summary = json.dumps({
+                    "lyrics_chars": len(text),
+                    "lyrics_lines": len(lines),
+                    "distinct_lines": len(set(lines)),
+                    "grounding_sources": source_urls[:10],
+                    "grounding_titles": source_titles[:10],
+                    "on_lyric_site_allowlist": on_lyric_site,
+                    "finish_reason": finish_str,
+                    "validation_passed": True,
+                })[:2000]
+            except Exception:
+                summary = (f"chars={len(text)} lines={len(lines)} "
+                           f"grounding={len(source_urls)}")
+            recorder.finish(
+                response_summary=summary,
+                output_artifact=f"lyrics_cache:{cache_key}",
+            )
+
+        print(f"[LYRICS] gemini fetched {len(text)} chars / {len(lines)} lines / "
+              f"{len(source_urls)} sources for {artist!r} - {song!r}")
+        return text
+
+    except Exception as e:
+        print(f"[LYRICS] gemini search failed: {e}")
+        if recorder:
+            try:
+                recorder.finish(response_summary=f"error: {str(e)[:200]}")
+            except Exception:
+                pass
+        return None
+
+
+def _fetch_lyrics_from_sources(
+    artist: str, song: str,
+    job_id: str | None = None,
+    db=None,
+) -> list[str]:
+    """Backward-compat wrapper used by callers that still expect list[str].
+
+    /transcribe in main.py now calls _fetch_lyrics_via_gemini_search directly
+    (it needs the parallel-with-Whisper kickoff), but this wrapper stays so
+    any future caller that wants a single function call still works.
+    """
+    text = _fetch_lyrics_via_gemini_search(artist, song, job_id=job_id, db=db)
+    return [text] if text else []
 
 
 # ---------------------------------------------------------------------------
@@ -475,15 +1987,67 @@ _genai_client = None
 
 
 def _get_genai_client():
-    """Get a cached Vertex AI GenAI client."""
+    """Get a cached Vertex AI GenAI client.
+
+    We pass credentials EXPLICITLY (not relying on the SDK's default
+    application-default-credentials discovery) because Railway's container
+    environment has been triggering "invalid_scope: Invalid OAuth scope or
+    ID token audience provided" with default discovery — the SDK's auth
+    chain ends up requesting an ID token instead of an OAuth2 access token,
+    or hits a regional endpoint that rejects the default scope.
+
+    Building Credentials.from_service_account_file with explicit
+    cloud-platform scope gives us a normal OAuth2 access token that all
+    Vertex endpoints accept. Same credentials work locally — the explicit
+    binding just removes the SDK's environment guesswork.
+    """
     global _genai_client
     if _genai_client is None:
         from google import genai
-        _genai_client = genai.Client(
+        from google.oauth2 import service_account
+
+        creds_path = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS", "").strip()
+        print(f"[VERTEX] google-genai version: {genai.__version__}")
+        print(f"[VERTEX] project={_VERTEX_PROJECT} location={_VERTEX_LOCATION}")
+        print(f"[VERTEX] credentials path: {creds_path}")
+        print(f"[VERTEX] credentials exists: {os.path.exists(creds_path)}")
+
+        client_kwargs = dict(
             vertexai=True,
             project=_VERTEX_PROJECT,
             location=_VERTEX_LOCATION,
         )
+        if creds_path and os.path.exists(creds_path):
+            try:
+                credentials = service_account.Credentials.from_service_account_file(
+                    creds_path,
+                    scopes=["https://www.googleapis.com/auth/cloud-platform"],
+                )
+                # Bind the quota project explicitly. Some Vertex AI endpoints
+                # (Veo specifically) reject token requests when quota project
+                # is ambiguous, surfacing as "invalid_scope: Invalid OAuth
+                # scope or ID token audience provided."
+                credentials = credentials.with_quota_project(_VERTEX_PROJECT)
+
+                # Validate the token at startup so we surface auth issues
+                # here in the worker logs instead of inside the model call.
+                from google.auth.transport.requests import Request as _AuthReq
+                try:
+                    credentials.refresh(_AuthReq())
+                    print(f"[VERTEX] token refresh OK; valid={credentials.valid} "
+                          f"expiry={credentials.expiry}")
+                except Exception as refresh_err:
+                    print(f"[VERTEX] token refresh FAILED: {refresh_err}")
+
+                client_kwargs["credentials"] = credentials
+                print(f"[VERTEX] using explicit service account credentials "
+                      f"({credentials.service_account_email}, "
+                      f"quota_project={_VERTEX_PROJECT})")
+            except Exception as e:
+                print(f"[VERTEX] failed to load explicit credentials ({e}); "
+                      f"falling back to ADC discovery")
+
+        _genai_client = genai.Client(**client_kwargs)
     return _genai_client
 
 # Combinatorial prompt system — elements combine to create unique prompts.
@@ -555,7 +2119,178 @@ _BG_CONDITIONS = [
 _USED_PROMPTS_FILE = os.path.join(ASSETS_DIR, ".used_prompts.json")
 
 
-def _analyze_lyrics_for_background(lyrics_text: str, artist: str, job_id: str = None) -> dict:
+_GENRE_SCENE_GUIDE = {
+    "rock": (
+        "Urban industrial streets, neon-lit alleyways, gritty rain on asphalt, "
+        "smoke rising past dim streetlamps, electric storms over a dark city, "
+        "abandoned warehouse interiors with shafts of light, distorted blurred "
+        "headlights, raw concrete textures."
+    ),
+    "pop": (
+        "Vibrant colorful neon lights, disco reflections, glittering city "
+        "nightlife, abstract liquid color, mirrored prisms, geometric light "
+        "patterns, energetic confetti motion, glossy gradient skies."
+    ),
+    "ballad": (
+        "Soft sunset over calm ocean, slow drifting clouds, warm golden light "
+        "through trees, candlelight macro, gentle rain on a window, "
+        "single rose-gold reflections, pastel mountain mist."
+    ),
+    "latin": (
+        "Tropical beach at golden hour, palm trees swaying, vibrant flower "
+        "fields, salsa-club neon reds and yellows, sunlit Caribbean water, "
+        "colorful murals motion-blurred, festive lantern strings."
+    ),
+    "reggaeton": (
+        "Night cityscape with red and pink neon, palm-lined boulevards, "
+        "luxury car reflections, abstract gold dust, velvet-textured colors, "
+        "club laser patterns, vibrant rooftop lights."
+    ),
+    "hiphop": (
+        "City skyline at night with gold accents, abstract luxury textures, "
+        "marble and gold reflections, smoke-filled spotlights, rain on dark "
+        "limousine paint, urban rooftop with skyline below."
+    ),
+    "electronic": (
+        "Abstract glowing geometry, particle storms, fractal liquid metal, "
+        "deep space nebulas, laser grid landscapes, holographic surfaces, "
+        "cymatic patterns in colored ink."
+    ),
+    "indie": (
+        "Misty forest at dawn, quiet vintage interiors with warm lamps, "
+        "open road through autumn leaves, lone lighthouse on a cliff, soft "
+        "film grain, dreamy lake reflections, hand-held cinematic frames."
+    ),
+    "folk": (
+        "Mountain vistas at golden hour, dusty roads with sun flares, fields "
+        "of wheat moving in wind, riverside campfire glow, weathered wood "
+        "textures, sun rays through forest canopies."
+    ),
+    "metal": (
+        "Volcanic landscapes with lava streams, dark cathedral interiors, "
+        "stormy thunderclouds with lightning, cracked obsidian textures, "
+        "burning pyres at dusk, abandoned iron mills."
+    ),
+}
+
+
+def _normalize_genre(g: str) -> str:
+    """Map free-text or UI selection to a key in _GENRE_SCENE_GUIDE."""
+    if not g:
+        return ""
+    g = g.strip().lower()
+    aliases = {
+        "rock/punk": "rock", "punk": "rock", "alt rock": "rock",
+        "pop/dance": "pop", "dance": "pop", "edm": "electronic",
+        "house": "electronic", "techno": "electronic",
+        "ballad/romantic": "ballad", "romantic": "ballad", "balada": "ballad",
+        "latin/reggaeton": "latin", "latino": "latin", "salsa": "latin",
+        "cumbia": "latin", "bachata": "latin",
+        "hip hop": "hiphop", "hip-hop": "hiphop", "rap": "hiphop", "trap": "hiphop",
+        "indie rock": "indie", "alternative": "indie",
+    }
+    if g in aliases:
+        return aliases[g]
+    if g in _GENRE_SCENE_GUIDE:
+        return g
+    return ""
+
+
+# Concept selector — operator-controlled visual category for the background.
+# When set, this hard-overrides the genre's scene vocabulary and forces
+# Gemini's prompt into the chosen category. UMG asked for it because the
+# genre alone wasn't tight enough — different songs in the same genre
+# need different visual registers (a Karol G ballad vs a Karol G party
+# anthem are both "latin" but should not look the same).
+#
+# Each value is the English vocabulary Gemini will pick from. Order in
+# the catalogue matches the UI dropdown order.
+_CONCEPT_SCENE_GUIDE = {
+    "naturaleza":   "natural outdoor landscapes — dense forests, mountain valleys, rolling hills, open fields, rivers, sunsets over horizons",
+    "tropical":     "tropical scenes — palm trees, caribbean beaches, vibrant flowers, festive lanterns, sunlit turquoise water, lush jungle",
+    "acuatico":     "water-centric scenes — underwater light rays, rain on glass and pavement, deep ocean, slow-motion water droplets, flowing rivers",
+    "ciudad":       "city skylines — modern downtowns, skyscrapers at golden hour, aerial cityscapes, glass facades, bridges, observation decks",
+    "urbano":       "gritty urban — narrow alleys, neon-lit rain-slicked streets, graffiti walls, rooftops, fire escapes, smoking vents, industrial corners",
+    "industrial":   "industrial environments — factories, exposed pipes, machinery, decaying warehouses, steel beams, smokestacks, foundries",
+    "abstracto":    "abstract visuals — flowing geometric shapes, fractal patterns, particle clouds, color gradients, liquid metal, kaleidoscopic motion",
+    "cosmico":      "cosmic scenes — spiral galaxies, star fields, colorful nebulas, planetary surfaces, deep space, comets, supernovae",
+    "atmosferico":  "atmospheric mood — drifting smoke, dense fog, volumetric light rays, dust motes, soft haze, ethereal glow",
+    "romantico":    "romantic mood — warm sunsets, candlelight, scattered rose petals, soft fabric textures, calm beaches at dusk, fireplace embers",
+    "vintage":      "vintage / retro — Super 8 film grain, sepia tones, faded photographs, retro patterns, analog noise, old-paper textures",
+    "cinematic":    "cinematic dramatic — chiaroscuro lighting, film-noir contrast, dramatic shadows, anamorphic lens flares, moody atmosphere",
+    "club":         "club / dance scene — laser beams, smoke machines, neon strips, disco balls, strobe lights, dancefloor energy (no people, no faces)",
+    "lujo":         "luxury aesthetics — polished marble, gold accents, crystal facets, high-gloss surfaces, fashion textures, jewelry close-ups",
+    "minimalista":  "minimalist design — clean geometric shapes, smooth gradients, solid color planes, single-subject compositions, negative space",
+}
+
+
+# Movement-style hints injected into the Gemini system prompt's Hard-Rules
+# section. UMG referenced 3 distinct registers in their meeting; we
+# surface 4 explicit options (plus Auto) so the operator can pick the
+# right "feel" per song. The genre + concept selectors decide WHAT the
+# scene is; this decides HOW it moves.
+_MOVEMENT_STYLE_RULES = {
+    "sutil":         "Movement: minimal and ambient — gentle sway, slow drift, breathing motion. Subjects barely move. Easy to loop seamlessly.",
+    "estandar":      "",  # no extra rule; the existing prompt template controls motion
+    "foto-parallax": "Aesthetic: photographic still with subtle parallax — composition feels like a single photo, motion is restricted to slow camera moves, depth-of-field shifts, and lighting passes. No moving subjects.",
+    "animado":       "Aesthetic: stylised 2D animated illustration — flat shapes, deliberate cartoon-like motion. NOT photorealistic.",
+}
+
+
+def _normalize_movement_style(s: str) -> str:
+    """Map free-text or UI selection to a key in _MOVEMENT_STYLE_RULES.
+    Returns "" for empty / unknown — caller treats that as Auto."""
+    if not s:
+        return ""
+    s = s.strip().lower()
+    aliases = {
+        "subtle": "sutil", "minimal": "sutil", "minimo": "sutil",
+        "standard": "estandar", "default": "estandar",
+        "photo": "foto-parallax", "parallax": "foto-parallax",
+        "foto+parallax": "foto-parallax", "foto_parallax": "foto-parallax",
+        "animated": "animado", "illustration": "animado", "cartoon": "animado",
+    }
+    if s in aliases:
+        return aliases[s]
+    if s in _MOVEMENT_STYLE_RULES:
+        return s
+    return ""
+
+
+def _normalize_concept(c: str) -> str:
+    """Map free-text or UI selection to a key in _CONCEPT_SCENE_GUIDE."""
+    if not c:
+        return ""
+    c = c.strip().lower()
+    # Common alternate spellings (operator might tab in raw or with accents).
+    aliases = {
+        "nature": "naturaleza", "natural": "naturaleza",
+        "city": "ciudad", "downtown": "ciudad", "skyline": "ciudad",
+        "urban": "urbano", "street": "urbano", "alley": "urbano",
+        "tropical/beach": "tropical", "playa": "tropical", "beach": "tropical",
+        "water": "acuatico", "agua": "acuatico", "underwater": "acuatico",
+        "abstract": "abstracto", "geometric": "abstracto",
+        "cosmic": "cosmico", "space": "cosmico", "galaxy": "cosmico",
+        "atmospheric": "atmosferico", "smoke": "atmosferico", "fog": "atmosferico",
+        "romantic": "romantico", "love": "romantico",
+        "vintage/retro": "vintage", "retro": "vintage",
+        "cinematic/film": "cinematic", "film noir": "cinematic", "noir": "cinematic",
+        "club/dance": "club", "rave": "club", "neon": "club",
+        "luxury": "lujo", "premium": "lujo", "fashion": "lujo",
+        "minimalist": "minimalista", "minimal": "minimalista",
+        "industrial/factory": "industrial", "factory": "industrial",
+    }
+    if c in aliases:
+        return aliases[c]
+    if c in _CONCEPT_SCENE_GUIDE:
+        return c
+    return ""
+
+
+def _analyze_lyrics_for_background(lyrics_text: str, artist: str, job_id: str = None,
+                                    song_title: str = "", genre: str = "",
+                                    concept: str = "",
+                                    movement_style: str = "") -> dict:
     """Use Gemini to analyze lyrics and choose visual style + prompt.
 
     Returns dict with:
@@ -567,26 +2302,98 @@ def _analyze_lyrics_for_background(lyrics_text: str, artist: str, job_id: str = 
 
     client = _get_genai_client()
 
-    system_prompt = """Respond ONLY with a JSON object, no other text. Example:
-{"style":"video","prompt":"Slow aerial drone shot over calm ocean at golden sunset, warm cinematic light, 4k"}
+    normalized_genre = _normalize_genre(genre)
+    normalized_concept = _normalize_concept(concept)
+    normalized_movement = _normalize_movement_style(movement_style)
+    movement_rule = _MOVEMENT_STYLE_RULES.get(normalized_movement, "")
+    movement_extra_line = f"\n- {movement_rule}" if movement_rule else ""
 
-"style": always "video"
-"prompt": 20-40 word cinematic video scene matching the song's mood and genre. Include camera movement, colors, lighting, atmosphere.
+    if normalized_concept:
+        # Operator picked an explicit visual concept — that hard-overrides
+        # the genre's scene vocabulary. The concept is the controlling
+        # input here; genre still goes into the user content as a stylistic
+        # color hint but does NOT determine the scene type.
+        concept_guide = _CONCEPT_SCENE_GUIDE[normalized_concept]
+        genre_hint = (f"\n\nFor stylistic colour-grading flavour only "
+                      f"(NOT for scene choice), the song genre is: "
+                      f"{normalized_genre.upper()}.") if normalized_genre else ""
+        system_prompt = f"""Respond ONLY with a JSON object, no other text. Example:
+{{"style":"video","prompt":"Slow tracking shot through neon-lit rain-slicked streets, deep blue and red reflections, smoke rising past streetlamps, gritty cinematic 4k"}}
 
-Genre guidance (vary the scenes!):
-- Rock/punk → urban, industrial, neon, gritty streets, dark skies, electric storms
-- Pop/dance → colorful lights, city nightlife, abstract neon, disco reflections
-- Ballad/romantic → sunset, ocean, soft clouds, warm light
-- Latin/reggaeton → tropical, vibrant colors, palm trees, warm tones
-- Hip hop/rap → city skyline at night, luxury abstract, gold and dark tones
+The operator has explicitly requested a {normalized_concept.upper()} background.
 
-NEVER include people, faces, hands, or text in the prompt."""
+You MUST pick a scene that fits this concept's visual vocabulary:
+{concept_guide}{genre_hint}
 
-    lyrics_sample = lyrics_text[:600]
+Hard rules:
+- "style" must always be "video"
+- "prompt" is 20-40 words: scene + camera movement + colors + lighting + atmosphere
+- Pick a DIFFERENT specific scene each time (don't repeat across songs)
+- The concept choice is binding — do NOT drift to a different visual category
+- Never include people, faces, hands, or readable text in the scene{movement_extra_line}"""
+    elif normalized_genre:
+        # User-supplied genre: lock Gemini to that genre's visual vocabulary
+        # and forbid the lazy "ocean sunset" default. This is the high-
+        # certainty path — UMG operators picking the genre at upload time
+        # gets us deterministic visual matching for their catalogue.
+        scene_guide = _GENRE_SCENE_GUIDE[normalized_genre]
+        system_prompt = f"""Respond ONLY with a JSON object, no other text. Example:
+{{"style":"video","prompt":"Slow tracking shot through neon-lit rain-slicked streets, deep blue and red reflections, smoke rising past streetlamps, gritty cinematic 4k"}}
+
+The song genre is: {normalized_genre.upper()}
+
+You MUST pick a scene from this genre's visual vocabulary:
+{scene_guide}
+
+Hard rules:
+- "style" must always be "video"
+- "prompt" is 20-40 words: scene + camera movement + colors + lighting + atmosphere
+- Pick a DIFFERENT specific scene each time (don't repeat across songs)
+- Do NOT default to "calm ocean at sunset" unless this song is BALLAD
+- Never include people, faces, hands, or readable text in the scene{movement_extra_line}"""
+    else:
+        # No genre hint: ask Gemini to classify first, then pick.
+        # "Auto" mode for users who don't want to choose.
+        system_prompt = """Respond ONLY with a JSON object, no other text. Example:
+{"style":"video","prompt":"Slow tracking shot through neon-lit rain-slicked streets, deep blue and red reflections, smoke rising past streetlamps, gritty cinematic 4k"}
+
+Step 1: Classify the song's genre using the artist, title, and lyrics. Pick ONE of:
+  rock, pop, ballad, latin, reggaeton, hiphop, electronic, indie, folk, metal
+
+Step 2: Pick a scene from the matching genre's visual vocabulary:
+- rock     → urban industrial streets, neon alleyways, gritty rain, electric storms, abandoned warehouses
+- pop      → vibrant neon, disco reflections, geometric light patterns, glossy gradient skies
+- ballad   → soft sunset, calm ocean, drifting clouds, warm golden light, candlelight
+- latin    → tropical beaches, palm trees, vibrant flowers, festive lanterns, sunlit caribbean water
+- reggaeton → night cityscape with red/pink neon, luxury cars, club lasers
+- hiphop   → city skyline at night with gold, marble luxury textures, smoke-filled spotlights
+- electronic → abstract geometry, particle storms, fractal liquid metal, laser grids
+- indie    → misty forests, vintage interiors, autumn roads, lone lighthouses, dreamy lakes
+- folk     → mountain vistas, dusty roads, wheat fields, riverside campfires
+- metal    → volcanic lava streams, dark cathedrals, stormy lightning, cracked obsidian
+
+Step 3: Output JSON with the chosen scene as a 20-40 word prompt.
+
+Hard rules:
+- "style" must always be "video"
+- Pick a DIFFERENT specific scene each time (don't repeat across songs)
+- Do NOT default to "calm ocean at sunset" unless the song is genuinely BALLAD
+- Never include people, faces, hands, or readable text in the scene"""
+        if movement_rule:
+            system_prompt = system_prompt + "\n- " + movement_rule
+
+    lyrics_sample = lyrics_text[:600] if lyrics_text else ""
     # Data minimization (UMG Guideline 14): optionally anonymize artist name
     _send_artist = os.environ.get("SEND_ARTIST_TO_AI", "true").lower() == "true"
     artist_label = artist if _send_artist else "the artist"
-    user_content = f"Artist: {artist_label}\n\nLyrics:\n{lyrics_sample}"
+    title_part = f"\nSong title: {song_title}" if song_title else ""
+    genre_part = f"\nDeclared genre: {normalized_genre}" if normalized_genre else ""
+    concept_part = f"\nDeclared concept: {normalized_concept}" if normalized_concept else ""
+    user_content = (
+        f"Artist: {artist_label}{title_part}{genre_part}{concept_part}\n\n"
+        f"Lyrics (may be incomplete or noisy):\n"
+        f"{lyrics_sample or '[transcription failed; rely on artist + title + declared metadata]'}"
+    )
     full_prompt = f"system:{system_prompt}\nuser:{user_content}"
 
     recorder = record_ai_call(
@@ -642,8 +2449,17 @@ NEVER include people, faces, hands, or text in the prompt."""
         return {"style": "video", "prompt": None}
 
 
-def _get_unique_prompt(lyrics_text: str = None, artist: str = "", job_id: str = None) -> dict:
-    """Get a unique style+prompt combination. Returns {style, prompt}."""
+def _get_unique_prompt(lyrics_text: str = None, artist: str = "", job_id: str = None,
+                       song_title: str = "", genre: str = "", concept: str = "",
+                       movement_style: str = "") -> dict:
+    """Get a unique style+prompt combination. Returns {style, prompt}.
+
+    Note: the local _USED_PROMPTS_FILE only sees this worker's previous
+    prompts — Railway containers have ephemeral disk, so dedup across
+    workers / restarts is best-effort. The Veo cache key downstream
+    includes artist+title so even a duplicated Gemini prompt produces a
+    fresh background per song (see `_generate_veo_video`).
+    """
     used: list[str] = []
     if os.path.exists(_USED_PROMPTS_FILE):
         try:
@@ -653,8 +2469,11 @@ def _get_unique_prompt(lyrics_text: str = None, artist: str = "", job_id: str = 
             used = []
 
     # Gemini analysis
-    if lyrics_text:
-        result = _analyze_lyrics_for_background(lyrics_text, artist, job_id=job_id)
+    if lyrics_text or song_title:
+        result = _analyze_lyrics_for_background(
+            lyrics_text or "", artist, job_id=job_id, song_title=song_title,
+            genre=genre, concept=concept, movement_style=movement_style,
+        )
         if result["prompt"] and result["prompt"] not in used:
             used.append(result["prompt"])
             try:
@@ -690,99 +2509,360 @@ _last_veo_request = 0  # timestamp of last Veo API call
 _VEO_COOLDOWN = 5      # seconds between Veo requests (Veo 3.1 has 50 req/min quota)
 
 
-def _generate_veo_video(prompt: str, output_path: str, job_id: str = None) -> str:
-    """Generate a video clip with Google Veo 3. Rate-limit aware."""
-    from google import genai
-    from google.genai.errors import ClientError
+def _veo_access_token() -> str:
+    """Build an explicit cloud-platform-scoped access token for the Vertex AI
+    REST API. Bypasses google-genai SDK's internal auth chain which has been
+    triggering invalid_scope errors on Railway despite the credentials being
+    valid (Gemini works on the same token; only Veo rejects through the SDK)."""
+    from google.oauth2 import service_account
+    from google.auth.transport.requests import Request
+
+    creds_path = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS", "").strip()
+    if not creds_path or not os.path.exists(creds_path):
+        raise RuntimeError(f"GOOGLE_APPLICATION_CREDENTIALS not found: {creds_path!r}")
+    creds = service_account.Credentials.from_service_account_file(
+        creds_path,
+        scopes=["https://www.googleapis.com/auth/cloud-platform"],
+    )
+    creds = creds.with_quota_project(_VERTEX_PROJECT)
+    creds.refresh(Request())
+    return creds.token
+
+
+def _veo_cache_key(prompt: str, model: str, params: dict) -> str:
+    """Stable hash of the Veo request. Two requests with the same prompt and
+    parameters return the same key, so we can dedupe paid generations across
+    runs (especially during testing — UMG production prompts are unique per
+    song so cache hits are rare there)."""
+    import hashlib as _hash
+    import json as _json
+    payload = _json.dumps(
+        {"prompt": prompt, "model": model, "params": params},
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return _hash.sha256(payload.encode()).hexdigest()[:16]
+
+
+def _generate_veo_video(prompt: str, output_path: str, job_id: str = None,
+                        cache_namespace: str = "",
+                        image_path: str | None = None,
+                        movement_style: str = "") -> str:
+    """Generate a video clip with Google Veo 3 via direct Vertex AI REST API.
+
+    We bypass google-genai SDK for Veo specifically because its internal auth
+    chain hits "invalid_scope: Invalid OAuth scope or ID token audience" on
+    Railway even when our explicit credentials work for Gemini through the
+    same SDK. Direct REST gives us full control over headers, scopes, and
+    endpoints.
+
+    Endpoint: predictLongRunning -> poll operation -> download mp4.
+    Rate-limit aware (5 attempts with exponential backoff).
+    R2-cached by prompt hash so identical retries do not bill twice.
+
+    `image_path`: optional path to a JPG/PNG. When provided, the request is
+    sent in image-to-video mode (Veo 3.1 supports a base64-encoded `image`
+    field on `instances[0]`). The user's image is animated according to the
+    prompt while preserving its identity. Defaults to None (text-to-video).
+
+    `movement_style`: when set to "animado", the safe-prompt suffix drops
+    the "no CGI / no animation" clauses so they don't contradict the
+    cartoon-illustration aesthetic. All other safety clauses (no people,
+    no text, etc.) stay in place.
+    """
     from provenance import record_ai_call
+    import storage as _storage
     import time as _time
     import requests as _req
     global _last_veo_request
 
-    # Proactive cooldown — wait if last request was too recent
+    if movement_style == "animado":
+        # Cartoon / 2D illustration aesthetic — keep all safety clauses
+        # except the "no CGI / no animation" pair, which would directly
+        # contradict the requested look. Other prohibitions (no text, no
+        # people, no logos, etc.) stay in place.
+        safe_prompt = (
+            f"{prompt}. Stylised 2D animated illustration, flat shapes, "
+            "deliberate cartoon-like motion. "
+            "No text, no words, no letters, no signs, no billboards, no posters, "
+            "no banners, no graffiti, no shop windows, no street signs, no neon "
+            "signs, no logos, no trademarks, no brand symbols, no people, "
+            "no faces, no hands."
+        )
+    else:
+        safe_prompt = (
+            f"{prompt}. Photorealistic, filmed with cinema camera, real footage. "
+            "No text, no words, no letters, no signs, no billboards, no posters, "
+            "no banners, no graffiti, no shop windows, no street signs, no neon "
+            "signs, no logos, no trademarks, no brand symbols, no people, "
+            "no faces, no hands, no CGI, no animation."
+        )
+
+    # veo-3.1-fast at $0.10/s (no audio) is 75% cheaper than the standard
+    # veo-3.1-generate at $0.40/s. Visual quality is slightly softer; we
+    # apply a small gaussian blur after generation to smooth edges and
+    # improve lyric legibility on top of the background.
+    #
+    # Blur sigma was 2.0 originally — UMG flagged the rendered backgrounds
+    # as low-definition during the live demo, and the heavy blur was the
+    # main culprit (compounding the softness Veo Fast already has). Now
+    # 1.0 by default — preserves more detail while still smoothing micro
+    # artefacts. Tune via env var without redeploy if needed.
+    model = os.environ.get("VEO_MODEL", "veo-3.1-fast-generate-001").strip()
+    veo_params = {
+        "aspectRatio": "16:9",
+        "sampleCount": 1,
+        "generateAudio": False,
+    }
+    try:
+        blur_sigma = float(os.environ.get("BG_BLUR_SIGMA", "1.0"))
+    except ValueError:
+        blur_sigma = 1.0
+
+    # Cache key includes a per-song namespace (artist|title) so two different
+    # songs that happen to receive the same Gemini prompt — common when
+    # transcription degrades and Gemini falls back to a generic "ocean
+    # sunset" template — still generate independent Veo backgrounds.
+    # Without this, all problem-songs ended up sharing one cached video
+    # because the cache key was prompt-only.
+    cache_params = {**veo_params, "blur_sigma": blur_sigma, "ns": cache_namespace or ""}
+    cache_key_hash = _veo_cache_key(safe_prompt, model, cache_params)
+    cache_object_key = f"cache/veo/{cache_key_hash}.mp4"
+
+    recorder = record_ai_call(
+        job_id=job_id or "unknown",
+        step="video_bg",
+        tool_name=model,
+        tool_provider="google_vertex",
+        prompt=safe_prompt,
+        input_data_types=["generated_prompt"],
+    ) if job_id else None
+
+    if _storage.is_enabled() and _storage.object_exists(cache_object_key):
+        if _storage.download_object(cache_object_key, output_path):
+            size_mb = os.path.getsize(output_path) / 1024 / 1024
+            print(f"[BG] Veo cache HIT ({cache_key_hash}): {size_mb:.1f} MB — skipped paid generation")
+            if recorder:
+                recorder.finish(
+                    response_summary=f"cache_hit: {size_mb:.1f}MB key={cache_key_hash}",
+                    output_artifact=output_path,
+                )
+            return output_path
+
     elapsed = _time.time() - _last_veo_request
     if elapsed < _VEO_COOLDOWN and _last_veo_request > 0:
         wait = _VEO_COOLDOWN - elapsed
         print(f"[BG] Cooldown: waiting {wait:.0f}s before next Veo request...")
         _time.sleep(wait)
 
-    client = _get_genai_client()
+    base_url = (
+        f"https://{_VERTEX_LOCATION}-aiplatform.googleapis.com/v1"
+        f"/projects/{_VERTEX_PROJECT}/locations/{_VERTEX_LOCATION}"
+        f"/publishers/google/models/{model}"
+    )
+    submit_url = f"{base_url}:predictLongRunning"
 
-    safe_prompt = f"{prompt}. Photorealistic, filmed with cinema camera, real footage. No text, no words, no letters, no people, no faces, no hands, no CGI, no animation."
+    # Build the instance dict. When the operator supplied an image AND
+    # marked "animar con AI", attach it as base64 — Veo 3.1 then animates
+    # the image while honoring the prompt instead of generating from
+    # scratch. Worker logs this so we can monitor success rate.
+    instance: dict = {"prompt": safe_prompt}
+    if image_path and os.path.isfile(image_path):
+        try:
+            import base64 as _b64
+            with open(image_path, "rb") as _img:
+                img_bytes = _img.read()
+            ext = os.path.splitext(image_path)[1].lower()
+            mime = "image/png" if ext == ".png" else "image/jpeg"
+            instance["image"] = {
+                "bytesBase64Encoded": _b64.b64encode(img_bytes).decode("ascii"),
+                "mimeType": mime,
+            }
+            print(f"[BG] image-to-video Veo call with user image "
+                  f"({len(img_bytes)} bytes, {mime})")
+        except OSError as e:
+            print(f"[BG] failed to read image_path {image_path}: {e}; "
+                  f"falling back to text-to-video")
 
-    recorder = record_ai_call(
-        job_id=job_id or "unknown",
-        step="video_bg",
-        tool_name="veo-3.1-generate-001",
-        tool_provider="google_vertex",
-        prompt=safe_prompt,
-        input_data_types=["generated_prompt"],
-    ) if job_id else None
+    request_body = {
+        "instances": [instance],
+        "parameters": veo_params,
+    }
 
-    # Patient retries for batch processing — wait and retry up to 5 times
+    operation_name: str | None = None
     for attempt in range(5):
         try:
             print(f"[BG] Veo 3: generating video (attempt {attempt + 1}/5)...")
-            operation = client.models.generate_videos(
-                model="veo-3.1-generate-001",
-                prompt=safe_prompt,
-                config=genai.types.GenerateVideosConfig(
-                    aspect_ratio="16:9",
-                    number_of_videos=1,
-                    generate_audio=False,
-                ),
+            token = _veo_access_token()
+            r = _req.post(
+                submit_url,
+                headers={
+                    "Authorization": f"Bearer {token}",
+                    "Content-Type": "application/json",
+                    "x-goog-user-project": _VERTEX_PROJECT,
+                },
+                json=request_body,
+                timeout=60,
             )
-            break
-        except ClientError as e:
-            if "429" in str(e) or "RESOURCE_EXHAUSTED" in str(e):
-                wait = 60 * (attempt + 1)  # 60s, 120s, 180s, 240s, 300s
-                print(f"[BG] Rate limited, waiting {wait}s before retry...")
+            if r.status_code == 429 or "RESOURCE_EXHAUSTED" in r.text:
+                wait = 60 * (attempt + 1)
+                print(f"[BG] Rate limited (HTTP {r.status_code}), waiting {wait}s before retry...")
                 _time.sleep(wait)
-            else:
-                if recorder:
-                    recorder.finish(response_summary=f"error: {str(e)[:200]}")
-                raise
+                continue
+            if not r.ok:
+                detail = r.text[:500]
+                raise RuntimeError(
+                    f"Veo predictLongRunning HTTP {r.status_code}: {detail}"
+                )
+            payload = r.json()
+            operation_name = payload.get("name")
+            if not operation_name:
+                raise RuntimeError(f"Veo response missing 'name': {payload}")
+            break
+        except RuntimeError:
+            raise
+        except Exception as e:
+            print(f"[BG] Veo 3 attempt {attempt + 1} request error: {e}")
+            wait = 60 * (attempt + 1)
+            _time.sleep(wait)
     else:
         if recorder:
             recorder.finish(response_summary="error: rate_limit_exceeded_after_5_retries")
-        raise RuntimeError("Veo 3 rate limit exceeded after 5 retries (~15 min wait)")
+        raise RuntimeError("Veo 3 rate limit exceeded after 5 retries")
 
     _last_veo_request = _time.time()
+    print(f"[BG] Veo 3 operation: {operation_name}")
 
-    # Poll with a hard 10-min cap so a stuck operation never hangs a worker.
+    # Poll the operation. The REST endpoint mirrors the model URL prefix.
+    poll_url = (
+        f"https://{_VERTEX_LOCATION}-aiplatform.googleapis.com/v1/{operation_name}"
+    )
+    fetch_url = f"{base_url}:fetchPredictOperation"
     poll_deadline = _time.time() + 600
-    while not operation.done:
+    op_payload: dict | None = None
+    while True:
         if _time.time() > poll_deadline:
             raise TimeoutError("Veo 3 operation timed out after 10 min")
         _time.sleep(10)
-        operation = client.operations.get(operation)
+        token = _veo_access_token()
+        # Vertex's long-running publisher operations need the
+        # fetchPredictOperation helper (a plain GET on the operation name
+        # returns 404 for publisher models). Body carries the operation name.
+        r = _req.post(
+            fetch_url,
+            headers={
+                "Authorization": f"Bearer {token}",
+                "Content-Type": "application/json",
+                "x-goog-user-project": _VERTEX_PROJECT,
+            },
+            json={"operationName": operation_name},
+            timeout=30,
+        )
+        if not r.ok:
+            print(f"[BG] poll HTTP {r.status_code}: {r.text[:200]}; retrying...")
+            continue
+        op_payload = r.json()
+        if op_payload.get("done"):
+            break
 
-    video = operation.result.generated_videos[0]
-    # Download via authenticated request (Vertex AI)
-    import google.auth
-    import google.auth.transport.requests
-    credentials, _ = google.auth.default()
-    credentials.refresh(google.auth.transport.requests.Request())
-    resp = _req.get(
-        video.video.uri,
-        headers={"Authorization": f"Bearer {credentials.token}"},
+    if "error" in op_payload:
+        err = op_payload["error"]
+        if recorder:
+            recorder.finish(response_summary=f"error: {str(err)[:200]}")
+        raise RuntimeError(f"Veo operation failed: {err}")
+
+    response_data = op_payload.get("response", {})
+    videos = response_data.get("videos") or response_data.get("generatedVideos") or []
+    if not videos:
+        if recorder:
+            recorder.finish(response_summary=f"error: no videos in response: {response_data}")
+        raise RuntimeError(f"Veo response had no videos: {response_data}")
+
+    video_entry = videos[0]
+    # Field name varies between API versions: gcsUri / videoUri / video.uri
+    video_uri = (
+        video_entry.get("gcsUri")
+        or video_entry.get("videoUri")
+        or (video_entry.get("video") or {}).get("uri")
     )
-    resp.raise_for_status()
-    with open(output_path, "wb") as f:
-        f.write(resp.content)
+    bytes_b64 = video_entry.get("bytesBase64Encoded") or (
+        video_entry.get("video") or {}
+    ).get("bytesBase64Encoded")
+
+    if bytes_b64:
+        # Inline bytes — decode and write directly.
+        import base64 as _b64
+        with open(output_path, "wb") as f:
+            f.write(_b64.b64decode(bytes_b64))
+    elif video_uri:
+        token = _veo_access_token()
+        dl = _req.get(
+            video_uri,
+            headers={"Authorization": f"Bearer {token}"},
+            timeout=120,
+        )
+        dl.raise_for_status()
+        with open(output_path, "wb") as f:
+            f.write(dl.content)
+    else:
+        if recorder:
+            recorder.finish(response_summary=f"error: video has no uri/bytes: {video_entry}")
+        raise RuntimeError(f"Veo video has no uri or bytes: {video_entry}")
 
     size_mb = os.path.getsize(output_path) / 1024 / 1024
-    print(f"[BG] Veo 3 video saved: {size_mb:.1f} MB")
+    print(f"[BG] Veo 3 video saved: {size_mb:.1f} MB (raw)")
+
+    # Apply subtle gaussian blur. Veo Fast outputs are slightly softer than
+    # standard; a small blur normalises that softness, hides minor artefacts,
+    # and improves contrast for the lyric overlay rendered on top.
+    import subprocess as _sp
+    blurred = output_path + ".blurred.mp4"
+    try:
+        _sp.run(
+            [
+                "ffmpeg", "-y", "-loglevel", "error",
+                "-i", output_path,
+                "-vf", f"gblur=sigma={blur_sigma}",
+                "-c:a", "copy",
+                blurred,
+            ],
+            check=True,
+            timeout=60,
+        )
+        os.replace(blurred, output_path)
+        size_mb = os.path.getsize(output_path) / 1024 / 1024
+        print(f"[BG] Blur applied (sigma={blur_sigma}): {size_mb:.1f} MB")
+    except Exception as e:
+        print(f"[BG] Blur skipped (non-fatal): {e}")
+        if os.path.exists(blurred):
+            try:
+                os.unlink(blurred)
+            except OSError:
+                pass
+
+    if _storage.is_enabled():
+        try:
+            _storage.upload_file(output_path, cache_object_key)
+            print(f"[BG] Veo cache STORED: {cache_object_key}")
+        except Exception as e:
+            print(f"[BG] Veo cache upload failed (non-fatal): {e}")
+
     if recorder:
         recorder.finish(
-            response_summary=f"video_generated: {size_mb:.1f}MB",
+            response_summary=f"video_generated: {size_mb:.1f}MB key={cache_key_hash}",
             output_artifact=output_path,
         )
     return output_path
 
 
-def _generate_imagen_image(prompt: str, output_path: str, max_retries: int = 5, job_id: str = None) -> str:
-    """Generate an image with Google Imagen 4. Auto-retries on rate limit."""
+def _generate_imagen_image(prompt: str, output_path: str, max_retries: int = 5,
+                            job_id: str = None, model: str | None = None) -> str:
+    """Generate an image with Google Imagen 4. Auto-retries on rate limit.
+
+    `model` lets the caller override the default. Library generation can
+    pass `imagen-4.0-ultra-generate-001` for marquee-quality stills;
+    runtime job rendering keeps the standard tier for cost reasons.
+    """
     from google import genai
     from google.genai.errors import ClientError
     from provenance import record_ai_call
@@ -790,12 +2870,16 @@ def _generate_imagen_image(prompt: str, output_path: str, max_retries: int = 5, 
 
     client = _get_genai_client()
 
+    chosen_model = (model
+                    or os.environ.get("IMAGEN_MODEL")
+                    or "imagen-4.0-generate-001").strip()
+
     safe_prompt = f"{prompt}. No text, no words, no letters, no people, no faces, no hands."
 
     recorder = record_ai_call(
         job_id=job_id or "unknown",
         step="image_bg",
-        tool_name="imagen-4.0-generate-001",
+        tool_name=chosen_model,
         tool_provider="google_vertex",
         prompt=safe_prompt,
         input_data_types=["generated_prompt"],
@@ -803,9 +2887,9 @@ def _generate_imagen_image(prompt: str, output_path: str, max_retries: int = 5, 
 
     for attempt in range(max_retries):
         try:
-            print(f"[BG] Imagen 4: generating image (attempt {attempt + 1})...")
+            print(f"[BG] {chosen_model}: generating image (attempt {attempt + 1})...")
             response = client.models.generate_images(
-                model="imagen-4.0-generate-001",
+                model=chosen_model,
                 prompt=safe_prompt,
                 config=genai.types.GenerateImagesConfig(
                     number_of_images=1,
@@ -843,7 +2927,12 @@ def _generate_imagen_image(prompt: str, output_path: str, max_retries: int = 5, 
     return output_path
 
 
-def _ensure_background(style_hint: str, job_dir: str, lyrics_text: str = None, artist: str = "", job_id: str = None) -> str:
+def _ensure_background(style_hint: str, job_dir: str, lyrics_text: str = None,
+                       artist: str = "", job_id: str = None,
+                       song_title: str = "", genre: str = "",
+                       concept: str = "",
+                       movement_style: str = "",
+                       image_to_video_path: str | None = None) -> str:
     """Generate background using AI. Gemini picks the best style for the song.
 
     Returns path to .mp4 (video style) or .jpg/.png (photo/illustration style).
@@ -857,14 +2946,22 @@ def _ensure_background(style_hint: str, job_dir: str, lyrics_text: str = None, a
         return None
 
     # Generate video background with Veo 3 (always video, no images)
-    result = _get_unique_prompt(lyrics_text, artist, job_id=job_id)
+    result = _get_unique_prompt(
+        lyrics_text, artist, job_id=job_id, song_title=song_title, genre=genre,
+        concept=concept, movement_style=movement_style,
+    )
     prompt = result["prompt"]
 
     bg_path = os.path.join(job_dir, "bg_generated.mp4")
     import time as _time_bg
     for attempt in range(3):
         try:
-            _generate_veo_video(prompt, bg_path, job_id=job_id)
+            _generate_veo_video(
+                prompt, bg_path, job_id=job_id,
+                cache_namespace=f"{artist}|{song_title}",
+                image_path=image_to_video_path,
+                movement_style=movement_style,
+            )
             return bg_path
         except Exception as e:
             print(f"[BG] Veo 3 attempt {attempt + 1}/3 failed: {e}")
@@ -1139,7 +3236,18 @@ def _get_background_clip_from_path(bg_path: str, style: str, duration: float,
 
 
 # Font pool — Google Fonts only (SIL OFL = full commercial use, no royalties)
-_FONTS_DIR = os.path.join(os.path.dirname(__file__), "..", "assets", "fonts")
+# Fonts: prefer the bundled copy inside the backend (so the Docker image
+# self-contains them and Railway's build context — which is just lyricgen/backend
+# — has them available). Fall back to the repo-level /assets/fonts for local
+# dev runs that haven't moved the files yet.
+_FONTS_DIR_CANDIDATES = [
+    os.path.join(os.path.dirname(__file__), "fonts"),
+    os.path.join(os.path.dirname(__file__), "..", "assets", "fonts"),
+]
+_FONTS_DIR = next(
+    (p for p in _FONTS_DIR_CANDIDATES if os.path.isdir(p)),
+    _FONTS_DIR_CANDIDATES[0],
+)
 _LYRIC_FONTS = [
     # Sans-serif (clean, modern)
     "Montserrat-Bold.ttf",
@@ -1157,6 +3265,40 @@ _FONT_POOL = [
     for f in _LYRIC_FONTS
     if os.path.isfile(os.path.join(_FONTS_DIR, f))
 ] if os.path.isdir(_FONTS_DIR) else []
+
+
+# Public-facing font catalogue. The frontend picker mirrors this list and
+# renders previews in the browser via the Google Fonts CDN — every entry's
+# `google_family` + `google_weight` matches the local TTF in `filename`,
+# so what the operator sees in the dropdown is what the worker renders.
+# UMG asked for these eight typefaces specifically; Futura and Gilroy are
+# proprietary (Adobe/HypeForType) so we surface their closest libre
+# substitutes (Jost / Outfit) and label the option honestly so the
+# operator knows it's a stylistic match, not the licensed face.
+_FONT_CATALOGUE = [
+    {"id": "jost-bold",        "filename": "Jost-Bold.ttf",            "label": "Jost (estilo Futura)",     "google_family": "Jost",        "google_weight": 700},
+    {"id": "montserrat-bold",  "filename": "Montserrat-Bold.ttf",      "label": "Montserrat",                "google_family": "Montserrat",  "google_weight": 700},
+    {"id": "poppins-bold",     "filename": "Poppins-Bold.ttf",         "label": "Poppins",                   "google_family": "Poppins",     "google_weight": 700},
+    {"id": "outfit-bold",      "filename": "Outfit-Bold.ttf",          "label": "Outfit (estilo Gilroy)",   "google_family": "Outfit",      "google_weight": 700},
+    {"id": "roboto-bold",      "filename": "Roboto-Bold.ttf",          "label": "Roboto",                    "google_family": "Roboto",      "google_weight": 700},
+    {"id": "bebas-neue",       "filename": "BebasNeue-Regular.ttf",    "label": "Bebas Neue",                "google_family": "Bebas Neue",  "google_weight": 400},
+    {"id": "oswald-bold",      "filename": "Oswald-Bold.ttf",          "label": "Oswald",                    "google_family": "Oswald",      "google_weight": 700},
+    {"id": "anton",            "filename": "Anton-Regular.ttf",        "label": "Anton",                     "google_family": "Anton",       "google_weight": 400},
+]
+
+
+def _resolve_font(font_id: str) -> str | None:
+    """Map a public font id to a real path under _FONTS_DIR. Empty string
+    or unknown id → None, signaling the caller to use the random pool
+    (existing "Auto" behavior). Never raises; never returns a missing
+    path."""
+    if not font_id:
+        return None
+    for entry in _FONT_CATALOGUE:
+        if entry["id"] == font_id:
+            path = os.path.join(_FONTS_DIR, entry["filename"])
+            return path if os.path.isfile(path) else None
+    return None
 
 
 def _make_text_clip(text: str, seg_start: float, seg_end: float, font: str = "Arial",
@@ -1336,6 +3478,32 @@ def _validate_umg_master(path: str, spec: RenderSpec) -> list[str]:
     if "mov" not in fmt:
         errors.append(f"format_name={fmt}, expected a mov container")
 
+    # Audio. UMG requires PCM 24-bit, 48 kHz, stereo. Catching this here
+    # prevents the silent regression where moviepy's audio_fps default
+    # (44100) overrides our ffmpeg `-ar 48000` and ships a non-compliant
+    # master. Source MP3s are usually 44.1 kHz so this is a real risk.
+    a_streams = [s for s in probe.get("streams", []) if s.get("codec_type") == "audio"]
+    if not a_streams:
+        errors.append("no audio stream found")
+    else:
+        a = a_streams[0]
+        if a.get("codec_name") != "pcm_s24le":
+            errors.append(
+                f"audio codec_name={a.get('codec_name')}, expected pcm_s24le"
+            )
+        try:
+            sample_rate = int(a.get("sample_rate", 0))
+        except (TypeError, ValueError):
+            sample_rate = 0
+        if sample_rate != 48000:
+            errors.append(
+                f"audio sample_rate={sample_rate}, expected 48000"
+            )
+        if int(a.get("channels", 0)) != 2:
+            errors.append(
+                f"audio channels={a.get('channels')}, expected 2 (stereo)"
+            )
+
     return errors
 
 
@@ -1394,22 +3562,74 @@ def generate_lyric_video(
     # Build text clips — each segment gets its own shadow + text
     text_layers = []
 
-    # Show artist + song title during instrumental intro
+    # Title overlay strategy (rebuilt May 2026 after operator reported
+    # the title card disappearing on songs whose first subtitle starts
+    # at t=0 — typical for spoken-prefix audio where intro Whisper now
+    # captures the dialogue at 0-N seconds. The previous logic gated
+    # the centered title on `first_lyric_start > 3`, so any subtitle
+    # at 0 hid the title entirely):
+    #
+    # - ALWAYS render a prominent title card "ARTIST / Title" at the
+    #   top third of the frame for the first 5 seconds. Top placement
+    #   avoids conflicting with the center-aligned lyric subtitles
+    #   regardless of when the first lyric line starts.
+    # - On songs with a real instrumental intro (>= 3 s of silence
+    #   before vocals), ALSO render the same artist+title BIG and
+    #   centered for the cinematic "drop" feel. Both layers coexist;
+    #   the centered one fades out before the first lyric appears.
     first_lyric_start = segments[0]["start"] if segments else duration
-    if first_lyric_start > 3 and artist:
-        raw_name = os.path.splitext(os.path.basename(mp3_path))[0]
-        title_song = raw_name
-        if " - " in raw_name:
-            title_song = raw_name.split(" - ", 1)[1]
-        for sfx in ["(Official Video)", "(Official Audio)", "(Lyric Video)",
-                     "(Official Music Video)", "(Audio)", "(Video)", "(En Vivo)",
-                     "(Live)", "(Lyrics)"]:
-            title_song = title_song.replace(sfx, "").strip()
-        title_end = first_lyric_start - 0.5
-        title_layers = _make_text_clip(
-            f"{artist}\n{title_song}", 0.5, title_end, font, spec=spec
-        )
-        text_layers.extend(title_layers)
+    raw_name = os.path.splitext(os.path.basename(mp3_path))[0]
+    title_song = raw_name
+    if " - " in raw_name:
+        title_song = raw_name.split(" - ", 1)[1]
+    for sfx in ["(Official Video)", "(Official Audio)", "(Lyric Video)",
+                 "(Official Music Video)", "(Audio)", "(Video)", "(En Vivo)",
+                 "(Live)", "(Lyrics)"]:
+        title_song = title_song.replace(sfx, "").strip()
+
+    if artist:
+        # 1. Top-third title card — always on for the opening of the
+        #    video. Position is between the very top edge and the
+        #    upper third (~15-22% from top, depending on font size).
+        try:
+            top_title_text = f"{artist.upper()}\n{title_song}"
+            top_size = max(36, int(round(58 * spec.text_scale)))
+            top_card = TextClip(
+                top_title_text,
+                fontsize=top_size,
+                font=font,
+                color="white",
+                stroke_color="black",
+                stroke_width=max(1, int(round(1.6 * spec.text_scale))),
+                method="caption",
+                size=(int(round(spec.width * 0.85)), None),
+                align="center",
+            ).set_opacity(0.95)
+            tw, th = top_card.size
+            top_x = (spec.width - tw) // 2
+            top_y = max(40, int(round(spec.height * 0.10)))
+            top_end = min(5.0, max(2.0, duration - 0.1))
+            top_card = (top_card.set_position((top_x, top_y))
+                                 .set_start(0.4)
+                                 .set_end(top_end))
+            text_layers.append(top_card)
+        except Exception as e:
+            print(f"[TITLE] top title card failed ({e}); continuing without it")
+
+        # 2. Centered "drop" title — only when the first lyric leaves
+        #    real room. Same artist+title text; bigger font (centered
+        #    via _make_text_clip) so the eye lands there during the
+        #    silent intro. Fades out just before the first lyric.
+        if first_lyric_start > 3:
+            title_end = first_lyric_start - 0.5
+            try:
+                title_layers = _make_text_clip(
+                    f"{artist}\n{title_song}", 0.5, title_end,
+                    font, spec=spec,
+                )
+                text_layers.extend(title_layers)
+            except Exception as e:
+                print(f"[TITLE] center title failed ({e}); continuing")
 
     for seg in segments:
         layers = _make_text_clip(seg["text"], seg["start"], seg["end"], font, spec=spec)
@@ -1431,8 +3651,12 @@ def generate_lyric_video(
             "-color_range", "tv",
             "-aspect", f"{spec.dar[0]}:{spec.dar[1]}",
             "-vf", "setsar=1",
-            "-ar", "48000",
         ]
+        # moviepy 1.0.3 writes audio at the source MP3 rate (typically
+        # 44.1 kHz). `audio_fps=48000` triggers a moviepy bug where it
+        # mixes -c:a copy with an aresample filter and ffmpeg refuses
+        # the combo, so we resample in a separate ffmpeg pass after the
+        # moviepy write — two steps but each one stays in its lane.
         video.write_videofile(
             out_path,
             fps=spec.fps,
@@ -1445,6 +3669,29 @@ def generate_lyric_video(
         audio.close()
         bg.close()
         video.close()
+
+        # Post-process: stream-copy the ProRes video and re-encode audio
+        # to pcm_s24le at 48 kHz. UMG requires this exact audio spec; no
+        # CPU is wasted re-encoding the multi-GB ProRes stream.
+        tmp_resampled = out_path + ".audio48k.mov"
+        result = subprocess.run(
+            [
+                "ffmpeg", "-y", "-loglevel", "error",
+                "-i", out_path,
+                "-c:v", "copy",
+                "-c:a", "pcm_s24le",
+                "-ar", "48000",
+                "-ac", "2",
+                tmp_resampled,
+            ],
+            capture_output=True, text=True, timeout=600,
+        )
+        if result.returncode != 0:
+            raise RuntimeError(
+                f"audio resample to 48kHz failed: {result.stderr[-500:]}"
+            )
+        os.replace(tmp_resampled, out_path)
+
         errors = _validate_umg_master(out_path, spec)
         if errors:
             raise RuntimeError(f"UMG validation failed: {'; '.join(errors)}")
@@ -1519,19 +3766,25 @@ def _find_chorus_start(segments: list[dict], window_sec: int = 30) -> float:
 
 
 def _make_short_text_clip(text: str, seg_start: float, seg_end: float, font: str = "Arial"):
-    """Create text clips sized for vertical 1080x1920 short."""
+    """Create text clips sized for vertical 1080x1920 short.
+
+    Sizes are tuned for TikTok / Reels / Shorts viewing on mobile — the
+    previous defaults (40 / 50 / 65) read too small on phones held at arm's
+    length. Bumped to 75 / 95 / 115 which fills more of the vertical
+    real-estate and matches what creators on those platforms actually use.
+    """
     display_text = text.upper()
 
     text_len = len(display_text)
     if text_len > 60:
-        fontsize = 40
-        text_width = 950
+        fontsize = 75
+        text_width = 1000
     elif text_len > 35:
-        fontsize = 50
-        text_width = 900
+        fontsize = 95
+        text_width = 980
     else:
-        fontsize = 65
-        text_width = 850
+        fontsize = 115
+        text_width = 950
 
     shadow = TextClip(
         display_text,
@@ -1691,12 +3944,31 @@ def generate_thumbnail(
     thumb_font = os.path.join(_FONTS_DIR, "Montserrat-ExtraBold.ttf")
     if not os.path.exists(thumb_font) and _FONT_POOL:
         thumb_font = _FONT_POOL[0]
-    try:
-        font_artist = ImageFont.truetype(thumb_font, 100)
-        font_song = ImageFont.truetype(thumb_font, 55)
-    except (OSError, IOError):
-        font_artist = ImageFont.load_default()
-        font_song = ImageFont.load_default()
+
+    # Auto-shrink font until the text fits within max_width with a 60px
+    # margin on each side. Without this, long artist names ("El Plan de la
+    # Mariposa") or songs with explanatory subtitles overflow 1280px and
+    # get cropped by the thumbnail frame.
+    def _fit_font(text: str, start_size: int, max_width: int, min_size: int = 28):
+        size = start_size
+        while size > min_size:
+            try:
+                f = ImageFont.truetype(thumb_font, size)
+            except (OSError, IOError):
+                return ImageFont.load_default()
+            bbox = draw.textbbox((0, 0), text, font=f)
+            tw = bbox[2] - bbox[0]
+            if tw <= max_width:
+                return f
+            size -= 4
+        try:
+            return ImageFont.truetype(thumb_font, min_size)
+        except (OSError, IOError):
+            return ImageFont.load_default()
+
+    max_w = 1280 - 120  # 60px margin each side
+    font_artist = _fit_font(artist.upper(), 100, max_w)
+    font_song = _fit_font(song_name, 55, max_w)
 
     # Artist name centered
     bbox = draw.textbbox((0, 0), artist.upper(), font=font_artist)

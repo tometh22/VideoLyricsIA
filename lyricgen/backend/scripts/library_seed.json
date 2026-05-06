@@ -1,0 +1,162 @@
+[
+  {
+    "name": "Naturaleza \u2014 image",
+    "filename": "library/c867b1f2df84.jpg",
+    "file_type": "jpg",
+    "tags": "naturaleza,image",
+    "concept": "naturaleza",
+    "asset_type": "image"
+  },
+  {
+    "name": "Tropical \u2014 image",
+    "filename": "library/79e3ccaf6749.jpg",
+    "file_type": "jpg",
+    "tags": "tropical,image",
+    "concept": "tropical",
+    "asset_type": "image"
+  },
+  {
+    "name": "Acuatico \u2014 image",
+    "filename": "library/f4d2ced68d47.jpg",
+    "file_type": "jpg",
+    "tags": "acuatico,image",
+    "concept": "acuatico",
+    "asset_type": "image"
+  },
+  {
+    "name": "Ciudad \u2014 image",
+    "filename": "library/a8ce9ed05362.jpg",
+    "file_type": "jpg",
+    "tags": "ciudad,image",
+    "concept": "ciudad",
+    "asset_type": "image"
+  },
+  {
+    "name": "Urbano \u2014 image",
+    "filename": "library/406aac498ab0.jpg",
+    "file_type": "jpg",
+    "tags": "urbano,image",
+    "concept": "urbano",
+    "asset_type": "image"
+  },
+  {
+    "name": "Cosmico \u2014 image",
+    "filename": "library/4e32f0458838.jpg",
+    "file_type": "jpg",
+    "tags": "cosmico,image",
+    "concept": "cosmico",
+    "asset_type": "image"
+  },
+  {
+    "name": "Atmosferico \u2014 image",
+    "filename": "library/7a725834f206.jpg",
+    "file_type": "jpg",
+    "tags": "atmosferico,image",
+    "concept": "atmosferico",
+    "asset_type": "image"
+  },
+  {
+    "name": "Romantico \u2014 image",
+    "filename": "library/837cb422ac76.jpg",
+    "file_type": "jpg",
+    "tags": "romantico,image",
+    "concept": "romantico",
+    "asset_type": "image"
+  },
+  {
+    "name": "Lujo \u2014 image",
+    "filename": "library/a719d2ec0749.jpg",
+    "file_type": "jpg",
+    "tags": "lujo,image",
+    "concept": "lujo",
+    "asset_type": "image"
+  },
+  {
+    "name": "Minimalista \u2014 image",
+    "filename": "library/42c6e9f6b26b.jpg",
+    "file_type": "jpg",
+    "tags": "minimalista,image",
+    "concept": "minimalista",
+    "asset_type": "image"
+  },
+  {
+    "name": "Cinematic \u2014 video cinematic",
+    "filename": "library/ac6236e54af6.mp4",
+    "file_type": "mp4",
+    "tags": "cinematic,video_cinematic",
+    "concept": "cinematic",
+    "asset_type": "video_cinematic"
+  },
+  {
+    "name": "Ciudad \u2014 video cinematic",
+    "filename": "library/7ba0b9183407.mp4",
+    "file_type": "mp4",
+    "tags": "ciudad,video_cinematic",
+    "concept": "ciudad",
+    "asset_type": "video_cinematic"
+  },
+  {
+    "name": "Naturaleza \u2014 video cinematic",
+    "filename": "library/6d35a9b130f0.mp4",
+    "file_type": "mp4",
+    "tags": "naturaleza,video_cinematic",
+    "concept": "naturaleza",
+    "asset_type": "video_cinematic"
+  },
+  {
+    "name": "Abstracto \u2014 video simple",
+    "filename": "library/40675c60afd9.mp4",
+    "file_type": "mp4",
+    "tags": "abstracto,video_simple",
+    "concept": "abstracto",
+    "asset_type": "video_simple"
+  },
+  {
+    "name": "Animado \u2014 video simple",
+    "filename": "library/bb8097fb483e.mp4",
+    "file_type": "mp4",
+    "tags": "animado,video_simple",
+    "concept": "animado",
+    "asset_type": "video_simple"
+  },
+  {
+    "name": "Vintage \u2014 video simple",
+    "filename": "library/b6ea52b9119c.mp4",
+    "file_type": "mp4",
+    "tags": "vintage,video_simple",
+    "concept": "vintage",
+    "asset_type": "video_simple"
+  },
+  {
+    "name": "Minimalista \u2014 video simple",
+    "filename": "library/5bf6f7cbbd15.mp4",
+    "file_type": "mp4",
+    "tags": "minimalista,video_simple",
+    "concept": "minimalista",
+    "asset_type": "video_simple"
+  },
+  {
+    "name": "Atmosferico \u2014 video simple",
+    "filename": "library/e38ed3a85ebb.mp4",
+    "file_type": "mp4",
+    "tags": "atmosferico,video_simple",
+    "concept": "atmosferico",
+    "asset_type": "video_simple"
+  },
+  {
+    "name": "Club \u2014 video cinematic",
+    "filename": "library/4b26e1682538.mp4",
+    "file_type": "mp4",
+    "tags": "club,video_cinematic",
+    "concept": "club",
+    "asset_type": "video_cinematic"
+  },
+  {
+    "name": "Acuatico \u2014 video cinematic",
+    "filename": "library/c9520ee72477.mp4",
+    "file_type": "mp4",
+    "tags": "acuatico,video_cinematic",
+    "concept": "acuatico",
+    "asset_type": "video_cinematic"
+  }
+]

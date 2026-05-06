@@ -483,21 +483,49 @@ async def upload_background(
     admin: dict = Depends(require_admin),
     db: Session = Depends(get_db),
 ):
-    """Upload a new pre-approved background asset."""
+    """Upload a new pre-approved background asset.
+
+    Storage strategy:
+      - When R2 is configured (production), the file is streamed to a
+        temp path then uploaded to R2 under `library/<uuid><ext>` and
+        the local copy is removed. `BackgroundAsset.filename` stores
+        the full R2 key so the read path can detect it via the
+        `library/` prefix and serve via signed URL.
+      - When R2 is disabled (local dev), falls back to disk write at
+        BACKGROUNDS_DIR. Filename then is just the local basename.
+
+    Either way the read path in main.py supports both shapes — the
+    `library/` prefix is the signal.
+    """
+    import storage
+
     ext = os.path.splitext(file.filename)[1].lower()
     if ext not in (".mp4", ".mov", ".jpg", ".jpeg", ".png"):
         raise HTTPException(status_code=400, detail="Only MP4, MOV, JPG, PNG files accepted.")
 
     file_type = "mp4" if ext in (".mp4", ".mov") else "jpg" if ext in (".jpg", ".jpeg") else "png"
-    unique_name = f"{uuid.uuid4().hex[:12]}{ext}"
-    file_path = os.path.join(BACKGROUNDS_DIR, unique_name)
+    unique_basename = f"{uuid.uuid4().hex[:12]}{ext}"
+    local_path = os.path.join(BACKGROUNDS_DIR, unique_basename)
 
-    with open(file_path, "wb") as f:
+    # Always write to disk first (R2 SDK uploads from a path, not a stream).
+    with open(local_path, "wb") as f:
         shutil.copyfileobj(file.file, f)
+
+    stored_filename = unique_basename
+    if storage.is_enabled():
+        r2_key = f"library/{unique_basename}"
+        try:
+            storage.upload_file(local_path, r2_key)
+            stored_filename = r2_key  # the `library/` prefix is the signal
+            os.unlink(local_path)
+        except Exception as e:
+            logger.error(f"Failed to upload library asset to R2: {e}")
+            # Keep the local copy as a fallback. Filename stays as the
+            # bare basename so the read path uses the disk branch.
 
     asset = BackgroundAsset(
         name=name,
-        filename=unique_name,
+        filename=stored_filename,
         file_type=file_type,
         tags=tags.strip() if tags.strip() else None,
         uploaded_by=admin["id"],
@@ -509,7 +537,7 @@ async def upload_background(
     db.add(AuditLog(
         user_id=admin["id"],
         action="admin.upload_background",
-        detail={"asset_id": asset.id, "name": name},
+        detail={"asset_id": asset.id, "name": name, "storage": "r2" if stored_filename.startswith("library/") else "local"},
     ))
     db.commit()
 
@@ -522,15 +550,24 @@ async def delete_background(
     admin: dict = Depends(require_admin),
     db: Session = Depends(get_db),
 ):
-    """Delete a background asset."""
+    """Delete a background asset (DB row + the underlying object)."""
+    import storage
+
     asset = db.query(BackgroundAsset).filter(BackgroundAsset.id == asset_id).first()
     if not asset:
         raise HTTPException(status_code=404, detail="Asset not found")
 
-    # Delete file
-    file_path = os.path.join(BACKGROUNDS_DIR, asset.filename)
-    if os.path.exists(file_path):
-        os.unlink(file_path)
+    # Delete the underlying object — R2 if it lives there, local disk otherwise.
+    if asset.filename.startswith("library/") and storage.is_enabled():
+        try:
+            client = storage._get_client()
+            client.delete_object(Bucket=storage.R2_BUCKET, Key=asset.filename)
+        except Exception as e:
+            logger.warning(f"Failed to delete R2 object {asset.filename}: {e}")
+    else:
+        file_path = os.path.join(BACKGROUNDS_DIR, asset.filename)
+        if os.path.exists(file_path):
+            os.unlink(file_path)
 
     db.delete(asset)
     db.add(AuditLog(
@@ -540,3 +577,41 @@ async def delete_background(
     ))
     db.commit()
     return {"ok": True}
+
+
+# ---------------------------------------------------------------------------
+# Storage retention
+# ---------------------------------------------------------------------------
+
+@router.post("/cleanup-inputs")
+async def cleanup_inputs(
+    retention_days: int = Query(30, ge=1, le=365),
+    apply: bool = Query(False),
+    admin: dict = Depends(require_admin),
+    db: Session = Depends(get_db),
+):
+    """Delete user-uploaded MP3 inputs in R2 once they pass the retention
+    window. Inputs live under the `inputs/` prefix; deliverables and
+    caches are not touched.
+
+    Default is dry-run (apply=false) so the admin sees what would be
+    deleted before doing it. Pass apply=true to actually delete.
+    """
+    import storage
+    report = storage.cleanup_old_inputs(
+        retention_days=retention_days,
+        apply=apply,
+        prefix="inputs/",
+    )
+    db.add(AuditLog(
+        user_id=admin["id"],
+        action="admin.cleanup_inputs.apply" if apply else "admin.cleanup_inputs.dryrun",
+        detail={
+            "retention_days": retention_days,
+            "scanned": report.get("scanned"),
+            "expired": report.get("expired"),
+            "deleted": report.get("deleted"),
+        },
+    ))
+    db.commit()
+    return report

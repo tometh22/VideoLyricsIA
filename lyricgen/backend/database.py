@@ -341,6 +341,23 @@ class AIProvenance(Base):
     job = relationship("Job", back_populates="provenance")
 
 
+class LyricsCache(Base):
+    """Reference lyrics fetched via Gemini-grounded web search, cached
+    per (artist, title) so we only pay Gemini once per song across the
+    entire worker fleet. Also serves as the audit row UMG can SELECT
+    directly to verify lyrics provenance — every entry carries the
+    grounding source URLs from the original Google Search response."""
+    __tablename__ = "lyrics_cache"
+
+    cache_key = Column(String(40), primary_key=True)  # sha1(artist|title)[:16]
+    artist = Column(String(255), nullable=False)
+    title = Column(String(255), nullable=False)
+    lyrics = Column(Text, nullable=False)
+    source_urls = Column(JSON, nullable=True)         # list of grounding URIs
+    fetched_at = Column(DateTime(timezone=True), default=utcnow, index=True)
+    fetched_by_model = Column(String(64), nullable=True)
+
+
 # ---------------------------------------------------------------------------
 # Init
 # ---------------------------------------------------------------------------

@@ -1,4 +1,6 @@
 import { useI18n } from "../i18n";
+import BrandLockup from "./BrandLockup";
+import { IS_PRODUCTION, APP_ENV } from "../env";
 
 export default function Sidebar({ onNav, activeView, open, onToggle, user, onLogout }) {
   const { t } = useI18n();
@@ -35,18 +37,22 @@ export default function Sidebar({ onNav, activeView, open, onToggle, user, onLog
   return (
     <aside className="fixed left-0 top-0 bottom-0 w-64 bg-surface-1/95 backdrop-blur-xl border-r border-white/[0.04] z-20 flex flex-col" style={{boxShadow: '4px 0 24px rgba(0,0,0,0.3)'}}>
 
-      {/* Logo */}
+      {/* Logo — full lockup per brand kit §10 (navbar uses full lockup,
+          favicon uses mark-only). The "Pro" pill lives outside the
+          locked-up artwork so the brand SVG geometry is preserved. */}
       <div className="flex items-center justify-between px-5 py-5 border-b border-white/[0.04]">
         <div className="flex items-center gap-2.5">
-          <div className="w-8 h-8 rounded-lg bg-gradient-to-br from-brand to-brand-light flex items-center justify-center">
-            <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="white" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
-              <path d="M9 18V5l12-2v13" /><circle cx="6" cy="18" r="3" /><circle cx="18" cy="16" r="3" />
-            </svg>
-          </div>
-          <div>
-            <span className="text-sm font-bold tracking-tight">GenLy AI</span>
-            <span className="text-[8px] font-medium text-brand bg-brand/10 px-1.5 py-0.5 rounded-full ml-1.5 uppercase tracking-widest">Pro</span>
-          </div>
+          <BrandLockup size="md" />
+          {IS_PRODUCTION ? (
+            <span className="text-[8px] font-medium text-brand bg-brand/10 px-1.5 py-0.5 rounded-full uppercase tracking-widest">Pro</span>
+          ) : (
+            <span
+              className="text-[8px] font-bold text-amber-300 bg-amber-500/15 ring-1 ring-amber-500/40 px-1.5 py-0.5 rounded-full uppercase tracking-widest"
+              title={`Environment: ${APP_ENV}`}
+            >
+              {APP_ENV === "development" ? "Dev" : "Staging"}
+            </span>
+          )}
         </div>
         <button onClick={onToggle} className="text-gray-500 hover:text-white transition-colors">
           <svg className="w-4 h-4" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">

@@ -11,8 +11,15 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
  && rm -rf /var/lib/apt/lists/*
 
 # ImageMagick's default policy blocks @file read which breaks moviepy's TextClip.
-# We only use it for short lyric text — safe to relax.
-RUN sed -i 's|<policy domain="path" rights="none" pattern="@\*"/>||' /etc/ImageMagick-6/policy.xml || true
+# We only use it for short lyric text — safe to relax. Debian 12+ ships
+# ImageMagick 7 (policy at /etc/ImageMagick-7/policy.xml), older Debian had
+# v6 (/etc/ImageMagick-6/...). Patch whichever one exists.
+RUN for f in /etc/ImageMagick-6/policy.xml /etc/ImageMagick-7/policy.xml; do \
+      if [ -f "$f" ]; then \
+        sed -i 's|<policy domain="path" rights="none" pattern="@\*"/>||g' "$f"; \
+        echo "Patched ImageMagick policy: $f"; \
+      fi; \
+    done
 
 WORKDIR /app
 
