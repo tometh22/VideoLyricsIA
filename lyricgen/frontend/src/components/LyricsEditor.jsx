@@ -1,7 +1,14 @@
-import { useState, useMemo } from "react";
+import { useState, useMemo, useRef, useEffect, useCallback } from "react";
 import { useI18n } from "../i18n";
 
 function formatTime(seconds) {
+  if (!isFinite(seconds) || seconds < 0) return "0:00";
+  const m = Math.floor(seconds / 60);
+  const s = Math.floor(seconds % 60);
+  return `${m}:${s.toString().padStart(2, "0")}`;
+}
+
+function formatTimestamp(seconds) {
   const m = Math.floor(seconds / 60);
   const s = Math.floor(seconds % 60);
   const ms = Math.floor((seconds % 1) * 10);
@@ -38,7 +45,6 @@ function findSuggestion(whisperText, refLines, startIdx) {
   }
 
   if (bestScore > 0.3 && bestLine) {
-    // Only suggest if there's a real word-level difference (not just punctuation/case)
     const normalize = (s) => s.toLowerCase().replace(/[^a-záéíóúüñ\s]/g, "").replace(/\s+/g, " ").trim();
     if (normalize(bestLine) !== normalize(whisperText)) {
       return bestLine;
@@ -47,19 +53,84 @@ function findSuggestion(whisperText, refLines, startIdx) {
   return null;
 }
 
-export default function LyricsEditor({ segments, filename, referenceLyrics, coverageWarning = false, recoverySource = "", onApprove, onBack, isBatch = false, batchProgress = "" }) {
+export default function LyricsEditor({ segments, filename, audioFile, referenceLyrics, coverageWarning = false, recoverySource = "", onApprove, onBack, isBatch = false, batchProgress = "" }) {
   const { t } = useI18n();
-  // Each segment gets a unique ID so deletions don't mess up suggestions
   const [edited, setEdited] = useState(() =>
     segments.map((s, i) => ({ ...s, _id: i }))
   );
 
+  // ─── Audio sync ─────────────────────────────────────────────────────
+  const audioUrl = useMemo(
+    () => (audioFile ? URL.createObjectURL(audioFile) : null),
+    [audioFile],
+  );
+  useEffect(() => () => { if (audioUrl) URL.revokeObjectURL(audioUrl); }, [audioUrl]);
+
+  const audioRef = useRef(null);
+  const listRef = useRef(null);
+  const rowRefs = useRef({});
+
+  const [isPlaying, setIsPlaying] = useState(false);
+  const [currentTime, setCurrentTime] = useState(0);
+  const [duration, setDuration] = useState(0);
+
+  // Active segment: the one whose [start, end] contains currentTime, or
+  // the latest one whose start <= currentTime if no segment "owns" the
+  // moment (e.g. instrumental gap).
+  const activeId = useMemo(() => {
+    let containing = null;
+    let lastStarted = null;
+    for (const seg of edited) {
+      if (currentTime >= seg.start && currentTime < seg.end) containing = seg;
+      if (currentTime >= seg.start) lastStarted = seg;
+    }
+    return (containing || lastStarted)?._id ?? null;
+  }, [edited, currentTime]);
+
+  // Auto-scroll the active row into view while playing.
+  const lastScrolledIdRef = useRef(null);
+  useEffect(() => {
+    if (!isPlaying || activeId === null) return;
+    if (lastScrolledIdRef.current === activeId) return;
+    lastScrolledIdRef.current = activeId;
+    const el = rowRefs.current[activeId];
+    if (el) el.scrollIntoView({ block: "center", behavior: "smooth" });
+  }, [activeId, isPlaying]);
+
+  const togglePlay = useCallback(() => {
+    const a = audioRef.current;
+    if (!a) return;
+    if (a.paused) a.play().catch(() => {});
+    else a.pause();
+  }, []);
+
+  const seekTo = useCallback((seconds, autoplay = true) => {
+    const a = audioRef.current;
+    if (!a) return;
+    a.currentTime = Math.max(0, seconds);
+    if (autoplay && a.paused) a.play().catch(() => {});
+  }, []);
+
+  // Spacebar toggles play/pause when no input is focused.
+  useEffect(() => {
+    const onKey = (e) => {
+      if (e.code !== "Space") return;
+      const tag = (document.activeElement?.tagName || "").toUpperCase();
+      const editing = tag === "INPUT" || tag === "TEXTAREA" || document.activeElement?.isContentEditable;
+      if (editing) return;
+      e.preventDefault();
+      togglePlay();
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [togglePlay]);
+
+  // ─── Reference lyrics suggestions (unchanged) ───────────────────────
   const refLines = useMemo(() => {
     if (!referenceLyrics) return [];
     return referenceLyrics.split("\n").filter((l) => l.trim());
   }, [referenceLyrics]);
 
-  // Suggestions mapped by _id (stable, not by array index)
   const suggestionsById = useMemo(() => {
     const map = {};
     let refIdx = 0;
@@ -68,7 +139,7 @@ export default function LyricsEditor({ segments, filename, referenceLyrics, cove
       map[i] = suggestion;
       if (suggestion) {
         const idx = refLines.findIndex(
-          (l, i) => i >= refIdx && l.toLowerCase().includes(seg.text.toLowerCase().split(" ")[0]?.toLowerCase())
+          (l, j) => j >= refIdx && l.toLowerCase().includes(seg.text.toLowerCase().split(" ")[0]?.toLowerCase())
         );
         if (idx >= 0) refIdx = idx + 1;
       }
@@ -98,7 +169,7 @@ export default function LyricsEditor({ segments, filename, referenceLyrics, cove
     setEdited((prev) => prev.filter((seg) => seg._id !== id));
   };
 
-  const name = filename.replace(/\.mp3$/i, "");
+  const name = filename.replace(/\.(mp3|wav)$/i, "");
   const pendingSuggestions = edited.filter((seg) => {
     const s = suggestionsById[seg._id];
     return s && s !== seg.text;
@@ -106,29 +177,50 @@ export default function LyricsEditor({ segments, filename, referenceLyrics, cove
   const hasSuggestions = pendingSuggestions > 0;
 
   const handleApprove = () => {
-    // Strip _id before passing up
     onApprove(edited.map(({ _id, ...rest }) => rest));
+  };
+
+  const progressPct = duration > 0 ? (currentTime / duration) * 100 : 0;
+
+  const handleScrub = (e) => {
+    if (!duration) return;
+    const rect = e.currentTarget.getBoundingClientRect();
+    const pct = (e.clientX - rect.left) / rect.width;
+    seekTo(pct * duration, false);
   };
 
   return (
     <div className="w-full max-w-3xl animate-fade-in">
+      {/* Hidden audio element drives playback. */}
+      {audioUrl && (
+        <audio
+          ref={audioRef}
+          src={audioUrl}
+          onTimeUpdate={(e) => setCurrentTime(e.currentTarget.currentTime)}
+          onLoadedMetadata={(e) => setDuration(e.currentTarget.duration || 0)}
+          onPlay={() => setIsPlaying(true)}
+          onPause={() => setIsPlaying(false)}
+          onEnded={() => setIsPlaying(false)}
+        />
+      )}
+
       <div className="flex items-center justify-between mb-6">
         <div className="flex items-center gap-3">
           <button onClick={onBack}
-            className="w-9 h-9 rounded-xl glass flex items-center justify-center text-gray-400 hover:text-white transition-colors">
+            className="w-9 h-9 rounded-xl bg-surface-2/40 ring-1 ring-white/[0.04] hover:ring-white/[0.08] hover:text-white flex items-center justify-center text-gray-400 transition-colors">
             <svg className="w-4 h-4" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
               <path d="M19 12H5M12 19l-7-7 7-7" />
             </svg>
           </button>
           <div>
-            <h2 className="text-lg font-bold">{t("editor.title")}</h2>
-            <p className="text-sm text-gray-500">
+            <h2 className="text-lg font-bold tracking-tight">{t("editor.title")}</h2>
+            <p className="text-sm text-ink-secondary">
               {name}
-              {batchProgress && <span className="ml-2 text-brand text-xs">({batchProgress})</span>}
+              {batchProgress && <span className="ml-2 text-brand-light text-xs">({batchProgress})</span>}
             </p>
           </div>
         </div>
-        <button onClick={handleApprove} className="btn-primary text-sm py-2.5 px-5">
+        <button onClick={handleApprove} className="btn-primary text-sm h-11 px-5">
           {isBatch ? t("editor.approve_next") : t("editor.approve_generate")}
           <svg className="inline-block ml-1.5 w-4 h-4" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
             <path d="M5 12h14M12 5l7 7-7 7" />
@@ -137,7 +229,7 @@ export default function LyricsEditor({ segments, filename, referenceLyrics, cove
       </div>
 
       {coverageWarning && (
-        <div className="mb-4 rounded-2xl border border-accent/25 bg-accent/[0.06] px-4 py-3 flex items-start gap-3">
+        <div className="mb-4 rounded-2xl ring-1 ring-accent/25 bg-accent/[0.06] px-4 py-3 flex items-start gap-3">
           <svg className="w-5 h-5 text-accent flex-shrink-0 mt-0.5" fill="none" stroke="currentColor" strokeWidth="1.8" viewBox="0 0 24 24">
             <circle cx="12" cy="12" r="10" />
             <path d="M12 8v4M12 16h.01" strokeLinecap="round" />
@@ -161,61 +253,114 @@ export default function LyricsEditor({ segments, filename, referenceLyrics, cove
         </div>
       )}
 
-      <div className="relative">
-      {/* Scroll fade indicator */}
-      <div className="absolute bottom-0 left-0 right-0 h-12 bg-gradient-to-t from-surface to-transparent pointer-events-none z-10 rounded-b-2xl" />
-      <div className="space-y-1 max-h-[60vh] overflow-y-auto pr-1 pb-8">
-        {edited.map((seg) => {
-          const suggestion = suggestionsById[seg._id];
-          const isApplied = suggestion && seg.text === suggestion;
+      {/* ─── Audio control bar — sticky-ish above the lyrics list ─── */}
+      {audioUrl && (
+        <div className="mb-4 flex items-center gap-3 px-3 py-2.5 rounded-card bg-surface-2/60 ring-1 ring-white/[0.05]">
+          <button
+            onClick={togglePlay}
+            className="w-10 h-10 rounded-full bg-brand hover:bg-brand-light text-white flex items-center justify-center transition-colors shrink-0"
+            aria-label={isPlaying ? "Pausar" : "Reproducir"}
+          >
+            {isPlaying ? (
+              <svg className="w-4 h-4" fill="currentColor" viewBox="0 0 24 24">
+                <rect x="6" y="5" width="4" height="14" rx="1"/>
+                <rect x="14" y="5" width="4" height="14" rx="1"/>
+              </svg>
+            ) : (
+              <svg className="w-4 h-4 ml-0.5" fill="currentColor" viewBox="0 0 24 24">
+                <path d="M8 5v14l11-7z"/>
+              </svg>
+            )}
+          </button>
+          <span className="text-xs text-ink-secondary tabular-nums shrink-0 w-10 text-right">
+            {formatTime(currentTime)}
+          </span>
+          <button
+            onClick={handleScrub}
+            className="flex-1 h-1.5 bg-surface-3/60 rounded-full overflow-hidden cursor-pointer relative"
+            aria-label="Buscar"
+          >
+            <div
+              className="h-full bg-gradient-to-r from-brand to-brand-light transition-[width] duration-100 ease-linear"
+              style={{ width: `${Math.min(100, Math.max(0, progressPct))}%` }}
+            />
+          </button>
+          <span className="text-xs text-gray-500 tabular-nums shrink-0 w-10">
+            {formatTime(duration)}
+          </span>
+          <span className="hidden sm:inline text-[10px] text-gray-600 ml-1 shrink-0">
+            <kbd className="px-1.5 py-0.5 rounded bg-surface-3/60 ring-1 ring-white/[0.05]">space</kbd>
+          </span>
+        </div>
+      )}
 
-          return (
-            <div key={seg._id} className="group">
-              <div className="flex items-start gap-2">
-                <span className="text-[11px] text-gray-600 font-mono pt-2.5 w-14 shrink-0 text-right">
-                  {formatTime(seg.start)}
-                </span>
-                <div className="flex-1 min-w-0">
-                  <input
-                    type="text"
-                    value={seg.text}
-                    onChange={(e) => updateText(seg._id, e.target.value)}
-                    className={`w-full px-3 py-2 rounded-xl bg-surface-1 border text-sm text-white
-                      focus:border-brand/40 focus:outline-none hover:border-white/[0.08] transition-all
-                      ${suggestion && !isApplied ? "border-amber-500/20" : "border-white/[0.04]"}`}
-                  />
-                  {suggestion && !isApplied && (
-                    <button onClick={() => applySuggestion(seg._id)}
-                      className="flex items-center gap-1.5 mt-1 ml-1 px-2 py-1 rounded-lg
-                        bg-accent/5 hover:bg-accent/15 text-accent/70 hover:text-accent
-                        text-[11px] transition-all group/btn">
-                      <svg className="w-3 h-3" fill="none" stroke="currentColor" strokeWidth="2.5" viewBox="0 0 24 24">
-                        <polyline points="20 6 9 17 4 12"/>
-                      </svg>
-                      <span className="text-gray-500 group-hover/btn:text-accent transition-colors">
-                        {suggestion}
-                      </span>
-                    </button>
-                  )}
+      {/* ─── Lyrics list ──────────────────────────────────────────── */}
+      <div className="relative">
+        <div className="absolute bottom-0 left-0 right-0 h-12 bg-gradient-to-t from-surface to-transparent pointer-events-none z-10 rounded-b-2xl" />
+        <div ref={listRef} className="space-y-1 max-h-[55vh] overflow-y-auto pr-1 pb-8">
+          {edited.map((seg) => {
+            const suggestion = suggestionsById[seg._id];
+            const isApplied = suggestion && seg.text === suggestion;
+            const isActive = seg._id === activeId;
+
+            return (
+              <div
+                key={seg._id}
+                ref={(el) => { rowRefs.current[seg._id] = el; }}
+                className={`group rounded-xl transition-colors ${isActive ? "bg-brand/[0.07] ring-1 ring-brand/25" : ""}`}
+              >
+                <div className="flex items-start gap-2 p-1">
+                  <button
+                    onClick={() => seekTo(seg.start, true)}
+                    title="Reproducir desde aquí"
+                    className={`text-[11px] font-mono pt-2.5 w-14 shrink-0 text-right transition-colors
+                      ${isActive ? "text-brand-light" : "text-gray-600 hover:text-brand-light"}`}
+                  >
+                    {formatTimestamp(seg.start)}
+                  </button>
+                  <div className="flex-1 min-w-0">
+                    <input
+                      type="text"
+                      value={seg.text}
+                      onChange={(e) => updateText(seg._id, e.target.value)}
+                      onFocus={() => seekTo(seg.start, false)}
+                      className={`w-full px-3 py-2 rounded-xl bg-surface-1 border text-sm text-white
+                        focus:border-brand/40 focus:outline-none hover:border-white/[0.08] transition-all
+                        ${suggestion && !isApplied ? "border-amber-500/20" : "border-white/[0.04]"}`}
+                    />
+                    {suggestion && !isApplied && (
+                      <button onClick={() => applySuggestion(seg._id)}
+                        className="flex items-center gap-1.5 mt-1 ml-1 px-2 py-1 rounded-lg
+                          bg-accent/5 hover:bg-accent/15 text-accent/70 hover:text-accent
+                          text-[11px] transition-all group/btn">
+                        <svg className="w-3 h-3" fill="none" stroke="currentColor" strokeWidth="2.5" viewBox="0 0 24 24">
+                          <polyline points="20 6 9 17 4 12"/>
+                        </svg>
+                        <span className="text-gray-500 group-hover/btn:text-accent transition-colors">
+                          {suggestion}
+                        </span>
+                      </button>
+                    )}
+                  </div>
+                  <button onClick={() => deleteSeg(seg._id)}
+                    className="shrink-0 w-8 h-8 mt-0.5 rounded-lg opacity-0 group-hover:opacity-100
+                      hover:bg-red-500/10 flex items-center justify-center text-gray-600
+                      hover:text-red-400 transition-all"
+                    title="Eliminar línea">
+                    <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
+                      <path d="M18 6L6 18M6 6l12 12" />
+                    </svg>
+                  </button>
                 </div>
-                <button onClick={() => deleteSeg(seg._id)}
-                  className="shrink-0 w-8 h-8 mt-0.5 rounded-lg opacity-0 group-hover:opacity-100
-                    hover:bg-red-500/10 flex items-center justify-center text-gray-600
-                    hover:text-red-400 transition-all">
-                  <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
-                    <path d="M18 6L6 18M6 6l12 12" />
-                  </svg>
-                </button>
               </div>
-            </div>
-          );
-        })}
-      </div>
+            );
+          })}
+        </div>
       </div>
 
       <div className="mt-4 flex justify-between items-center">
         <span className="text-xs text-gray-600">{edited.length} {t("editor.lines")}</span>
-        <button onClick={handleApprove} className="btn-primary text-sm py-2.5 px-5">
+        <button onClick={handleApprove} className="btn-primary text-sm h-11 px-5">
           {isBatch ? t("editor.approve_next") : t("editor.approve_generate")}
         </button>
       </div>

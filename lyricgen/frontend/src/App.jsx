@@ -591,6 +591,7 @@ export default function App() {
               <LyricsEditor
                 segments={currentReview.segments}
                 filename={currentReview.file.name}
+                audioFile={currentReview.file}
                 referenceLyrics={currentReview.referenceLyrics || ""}
                 coverageWarning={currentReview.coverageWarning}
                 recoverySource={currentReview.recoverySource}
