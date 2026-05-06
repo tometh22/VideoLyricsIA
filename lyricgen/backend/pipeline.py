@@ -1044,64 +1044,176 @@ _PLAIN_SECTION_MARKER = re.compile(
 )
 
 
-def _synthesize_segments_from_plain(plain: str,
-                                     audio_duration: float,
-                                     anchor_start: float = 0.0) -> list[dict]:
-    """Distribute lrclib plain lyrics evenly across the audio duration.
-
-    Used when Whisper has hallucinated and we need to ship the operator
-    SOMETHING to review instead of 3 broken rows. The timestamps are
-    deliberately rough — operator nudges them in the editor before
-    approving the render. This is the auto-recover fallback path.
-
-    Args:
-        plain: lrclib plain text, one line per lyric line. Section
-            markers like "[Verso]" / "[Chorus]" are filtered out.
-        audio_duration: total audio length in seconds.
-        anchor_start: where to begin the distribution. When the FIRST
-            Whisper segment looked plausible (passes `_detect_hallucination`
-            on its own), the caller can pass that segment's start so the
-            first lyric aligns roughly with it. Defaults to 0.
-
-    Returns segments in the same shape as `transcribe()` — list of
-    {start, end, text} dicts, monotonically increasing, last `end` capped
-    at `audio_duration`.
+def _split_plain_lines(plain: str) -> list[str]:
+    """Split lrclib plain text into singable lines.
+    Drops empties + section markers ([Verso], [Chorus], etc.) so the
+    output is exactly the lines a vocalist actually performs.
     """
-    if not plain or not plain.strip() or not audio_duration:
+    if not plain:
         return []
-
-    lines: list[str] = []
+    out: list[str] = []
     for raw in plain.splitlines():
         stripped = raw.strip()
         if not stripped:
             continue
         if _PLAIN_SECTION_MARKER.match(stripped):
             continue
-        lines.append(stripped)
+        out.append(stripped)
+    return out
 
-    if not lines:
+
+def _align_whisper_to_plain(segments: list[dict],
+                             plain: str) -> list[tuple[int, float]]:
+    """Find time anchors by fuzzy-matching Whisper's surviving segments
+    against lrclib plain lyric lines.
+
+    Even when Whisper hallucinates the back half of a song, the FIRST
+    segments are usually correct — they anchor onto real audio cues.
+    We can use those segments as time landmarks: "Whisper heard this
+    text at 0.2s; that text matches plain line 0; therefore line 0
+    starts at 0.2s." With multiple anchors, the synthesizer interpolates
+    the rest of the lyric lines piecewise instead of distributing them
+    uniformly across the full duration. Result: timestamps land much
+    closer to the actual singing without any operator effort.
+
+    Returns sorted list of (line_index, time_seconds) tuples. Each
+    anchor satisfies:
+      - the segment passes the per-segment hallucination signals
+        (no mega-segment, no fuzzy intra-loop),
+      - it fuzzy-matches a plain line with token-set Jaccard ≥ 0.3,
+      - and its line index is strictly greater than every prior anchor's
+        (a later-in-time anchor that matches an EARLIER lyric line is
+        almost certainly a wrong match — we drop it rather than confuse
+        the interpolation).
+
+    Empty list when no segment qualifies — caller falls back to uniform
+    distribution from 0.
+    """
+    plain_lines = _split_plain_lines(plain)
+    if not segments or not plain_lines:
         return []
 
-    # Clamp anchor inside [0, audio_duration - 1) so we always have at
-    # least 1 s of room left to distribute the lines into.
-    if anchor_start < 0:
-        anchor_start = 0.0
-    if anchor_start >= audio_duration - 1:
-        anchor_start = 0.0
+    plain_token_sets = [
+        set(w.lower() for w in line.split()) for line in plain_lines
+    ]
 
-    usable = audio_duration - anchor_start
+    raw: list[tuple[int, float]] = []
+    for s in segments:
+        text = (s.get("text") or "").strip()
+        if not text:
+            continue
+        # Per-segment plausibility — same signals the global detector
+        # uses. With no audio_duration only the mega-segment + fuzzy-loop
+        # checks fire.
+        per_seg_bad, _ = _detect_hallucination([s], audio_duration=None)
+        if per_seg_bad:
+            continue
+        seg_set = set(w.lower() for w in text.split())
+        if not seg_set:
+            continue
+        best_idx = -1
+        best_score = 0.0
+        for i, p_set in enumerate(plain_token_sets):
+            if not p_set:
+                continue
+            inter = len(seg_set & p_set)
+            union = len(seg_set | p_set)
+            if union == 0:
+                continue
+            score = inter / union
+            if score > best_score:
+                best_score = score
+                best_idx = i
+        if best_idx >= 0 and best_score >= 0.3:
+            raw.append((best_idx, float(s.get("start", 0.0))))
+
+    raw.sort(key=lambda a: a[1])
+    # Monotonic filter: drop later-in-time anchors that point earlier in
+    # the lyrics (almost always a bad match).
+    filtered: list[tuple[int, float]] = []
+    last_idx = -1
+    for idx, t in raw:
+        if idx > last_idx:
+            filtered.append((idx, t))
+            last_idx = idx
+    return filtered
+
+
+def _synthesize_segments_from_plain(plain: str,
+                                     audio_duration: float,
+                                     anchors: list[tuple[int, float]] | None = None,
+                                     ) -> list[dict]:
+    """Distribute lrclib plain lyrics across the audio duration.
+
+    Used when Whisper has hallucinated and we need to ship the operator
+    a complete transcription instead of 3 broken rows. With no anchors
+    we distribute lines uniformly; with anchors we interpolate piecewise
+    between (line_index, time) points so each lyric line lands near the
+    moment Whisper actually heard it.
+
+    Args:
+        plain: lrclib plain text, one line per lyric line. Section
+            markers like "[Verso]" / "[Chorus]" are filtered out.
+        audio_duration: total audio length in seconds.
+        anchors: optional list of (line_index, time_seconds) pairs from
+            `_align_whisper_to_plain`. Empty/None falls back to even
+            distribution from 0.
+
+    Returns segments in the same shape as `transcribe()` — list of
+    {start, end, text} dicts, monotonically increasing, last `end`
+    capped at `audio_duration`.
+    """
+    if not plain or not plain.strip() or not audio_duration:
+        return []
+
+    lines = _split_plain_lines(plain)
+    if not lines:
+        return []
     n = len(lines)
-    per_line = usable / n
-    GAP = 0.05
 
+    # Filter / dedupe anchors to keep them strictly inside the line+time
+    # window and strictly monotonic. The aligner already does this, but
+    # we re-check defensively in case the caller hand-built anchors.
+    monotonic: list[tuple[float, float]] = []
+    last_idx_f, last_t_f = -1.0, -1.0
+    for raw_anchor in (anchors or []):
+        try:
+            idx, t = float(raw_anchor[0]), float(raw_anchor[1])
+        except (TypeError, ValueError, IndexError):
+            continue
+        if not (0 <= idx < n):
+            continue
+        if not (0 <= t < audio_duration):
+            continue
+        if idx > last_idx_f and t > last_t_f:
+            monotonic.append((idx, t))
+            last_idx_f, last_t_f = idx, t
+
+    # Build the piecewise interpolation table. Always end at
+    # (n, audio_duration); start at (0, 0) unless an anchor lives at
+    # line 0.
+    points: list[tuple[float, float]] = list(monotonic)
+    if not points or points[0][0] > 0:
+        points.insert(0, (0.0, 0.0))
+    if points[-1][0] < float(n):
+        points.append((float(n), float(audio_duration)))
+
+    def _time_at(line_index: float) -> float:
+        for (l1, t1), (l2, t2) in zip(points, points[1:]):
+            if line_index <= l2:
+                if l2 == l1:
+                    return t1
+                return t1 + (line_index - l1) / (l2 - l1) * (t2 - t1)
+        return points[-1][1]
+
+    GAP = 0.05
     segments: list[dict] = []
     for i, line in enumerate(lines):
-        start = anchor_start + i * per_line
-        end = anchor_start + (i + 1) * per_line - GAP
+        start = _time_at(float(i))
+        end = _time_at(float(i + 1)) - GAP
         if end <= start:
             end = start + 0.5
         segments.append({"start": start, "end": end, "text": line})
-    # Cap last segment at audio_duration.
     if segments and segments[-1]["end"] > audio_duration:
         segments[-1]["end"] = audio_duration
     return segments

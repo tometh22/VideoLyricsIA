@@ -11,6 +11,7 @@ the timestamps in the editor before approving the render.
 """
 
 from pipeline import (
+    _align_whisper_to_plain,
     _detect_hallucination,
     _has_fuzzy_intra_loop,
     _synthesize_segments_from_plain,
@@ -147,12 +148,33 @@ def test_synthesize_full_distribution_starts_at_zero():
 
 
 def test_synthesize_anchored_starts_at_anchor():
+    # Single anchor at line 0 — first line should start at the anchor time.
     segs = _synthesize_segments_from_plain(
-        PLAIN, audio_duration=100.0, anchor_start=4.2,
+        PLAIN, audio_duration=100.0, anchors=[(0, 4.2)],
     )
-    assert segs[0]["start"] == 4.2
+    assert abs(segs[0]["start"] - 4.2) < 0.01
     # 5 lines into 95.8 s of usable audio → ~19.16 s per line.
     assert abs((segs[1]["start"] - segs[0]["start"]) - 19.16) < 0.1
+
+
+def test_synthesize_piecewise_interpolates_between_anchors():
+    # Two anchors: line 1 at 10s, line 3 at 50s. Lines between/after
+    # interpolate piecewise — line 2 should land near 30s (midpoint of
+    # 10..50), and lines 0, 4 outside the inner span extend to the
+    # outer (0,0)/(N, audio_duration) bounds.
+    segs = _synthesize_segments_from_plain(
+        PLAIN, audio_duration=100.0,
+        anchors=[(1, 10.0), (3, 50.0)],
+    )
+    assert len(segs) == 5
+    # Line 1 anchored at 10s.
+    assert abs(segs[1]["start"] - 10.0) < 0.5
+    # Line 2 sits midway between anchors at line 1 (10s) and line 3 (50s).
+    assert abs(segs[2]["start"] - 30.0) < 1.0
+    # Line 3 anchored at 50s.
+    assert abs(segs[3]["start"] - 50.0) < 0.5
+    # Last segment ends at or before audio_duration.
+    assert segs[-1]["end"] <= 100.0
 
 
 def test_synthesize_strips_section_markers():
@@ -173,10 +195,69 @@ def test_synthesize_no_audio_duration_returns_empty_list():
     assert _synthesize_segments_from_plain(PLAIN, audio_duration=None) == []
 
 
-def test_synthesize_clamps_anchor_when_too_close_to_end():
-    # Anchor inside the last second falls back to 0 — defensive against
-    # bad anchor values from a noisy first Whisper segment.
+def test_synthesize_drops_anchors_outside_audio_window():
+    # Anchor with time >= audio_duration is silently dropped; falls back
+    # to even distribution from 0 (defensive against bad inputs).
     segs = _synthesize_segments_from_plain(
-        PLAIN, audio_duration=10.0, anchor_start=9.5,
+        PLAIN, audio_duration=10.0, anchors=[(0, 12.0)],
     )
-    assert segs[0]["start"] == 0.0
+    assert abs(segs[0]["start"] - 0.0) < 0.01
+
+
+# ----- _align_whisper_to_plain -------------------------------------------
+
+ALIGN_PLAIN = (
+    "Dijo todo bien\n"
+    "Ya se va a pasar la sombra\n"
+    "Que cruce que me anime a ver\n"
+    "Que podia reflexionar\n"
+    "Sobre lo que estaba haciendo\n"
+)
+
+
+def test_align_returns_empty_when_no_segments():
+    assert _align_whisper_to_plain([], ALIGN_PLAIN) == []
+
+
+def test_align_returns_empty_when_no_plain():
+    assert _align_whisper_to_plain([_seg(0, 4, "hola")], "") == []
+
+
+def test_align_picks_anchors_from_matching_segments():
+    # Segments 0 and 1 fuzzy-match plain lines 0 and 2 respectively;
+    # segment 3 doesn't match anything in the plain → no anchor.
+    segments = [
+        _seg(0.5, 4.0, "Dijo todo bien"),                  # → line 0
+        _seg(8.0, 12.0, "Que cruce me anime"),             # → line 2
+        _seg(60.0, 64.0, "completely unrelated noise"),    # → no anchor
+    ]
+    anchors = _align_whisper_to_plain(segments, ALIGN_PLAIN)
+    assert len(anchors) == 2
+    assert anchors[0] == (0, 0.5)
+    assert anchors[1] == (2, 8.0)
+
+
+def test_align_drops_non_monotonic_anchors():
+    # Second segment is at a later time but matches an EARLIER plain line
+    # — almost certainly a wrong match. Drop it.
+    segments = [
+        _seg(0.5, 4.0, "Que podia reflexionar"),     # → line 3, t=0.5
+        _seg(10.0, 14.0, "Dijo todo bien"),          # → line 0, t=10 — drop
+    ]
+    anchors = _align_whisper_to_plain(segments, ALIGN_PLAIN)
+    assert anchors == [(3, 0.5)]
+
+
+def test_align_skips_hallucinated_segments():
+    # A segment with a fuzzy intra-loop fails the per-segment plausibility
+    # check and gets skipped before fuzzy-matching.
+    loopy = ("que podia reflexionar sobre lo que estaba haciendo y "
+             "que podia pensar sobre lo que estaba haciendo y "
+             "que podia reflexionar sobre lo que estaba haciendo y "
+             "que podia pensar sobre lo que estaba haciendo")
+    segments = [
+        _seg(0.5, 4.0, "Dijo todo bien"),       # → line 0
+        _seg(60.0, 90.0, loopy),                # hallucinated → skip
+    ]
+    anchors = _align_whisper_to_plain(segments, ALIGN_PLAIN)
+    assert anchors == [(0, 0.5)]
