@@ -158,22 +158,22 @@ export default function LoginPage({ onLogin, onBack, resetToken, onResetComplete
         </div>
       </div>
 
-      <div className="relative z-10 w-full max-w-md mx-4 animate-fade-in">
+      <div className="relative z-10 w-full max-w-sm mx-4 animate-fade-in">
         {/* Logo — full lockup per brand kit §10 (auth screens use the
             full lockup, not the mark only). */}
-        <div className="text-center mb-10">
-          <BrandLockup size="lg" className="justify-center mb-5" />
-          <p className="text-sm text-ink-secondary">{t("login.platform")}</p>
+        <div className="text-center mb-7">
+          <BrandLockup size="lg" className="mx-auto mb-3" />
+          <p className="text-xs text-ink-secondary">{t("login.platform")}</p>
         </div>
 
         {/* Card */}
-        <div className="glass rounded-3xl p-8 shadow-glow">
+        <div className="glass rounded-2xl p-6">
           {/* Login */}
           {mode === "login" && (
             <>
-              <h2 className="text-lg font-bold mb-1">{t("login.title")}</h2>
-              <p className="text-xs text-gray-500 mb-6">{t("login.subtitle")}</p>
-              <form onSubmit={handleLogin} className="space-y-4">
+              <h2 className="text-base font-bold mb-1">{t("login.title")}</h2>
+              <p className="text-xs text-gray-500 mb-5">{t("login.subtitle")}</p>
+              <form onSubmit={handleLogin} className="space-y-3">
                 <div>
                   <label className="block text-xs text-gray-400 mb-1.5 ml-1">{t("login.username")}</label>
                   <input type="text" value={username} onChange={(e) => setUsername(e.target.value)}
@@ -191,7 +191,7 @@ export default function LoginPage({ onLogin, onBack, resetToken, onResetComplete
                     <p className="text-sm text-red-400">{error}</p>
                   </div>
                 )}
-                <button type="submit" disabled={loading || !username.trim() || !password.trim()} className="btn-primary w-full py-4 mt-2">
+                <button type="submit" disabled={loading || !username.trim() || !password.trim()} className="btn-primary w-full mt-1">
                   {loading ? (
                     <span className="flex items-center justify-center gap-2">
                       <span className="w-4 h-4 border-2 border-white border-t-transparent rounded-full animate-spin" />
@@ -217,9 +217,9 @@ export default function LoginPage({ onLogin, onBack, resetToken, onResetComplete
           {/* Register */}
           {mode === "register" && (
             <>
-              <h2 className="text-lg font-bold mb-1">{t("login.register_title")}</h2>
-              <p className="text-xs text-gray-500 mb-6">{t("login.register_subtitle")}</p>
-              <form onSubmit={handleRegister} className="space-y-4">
+              <h2 className="text-base font-bold mb-1">{t("login.register_title")}</h2>
+              <p className="text-xs text-gray-500 mb-5">{t("login.register_subtitle")}</p>
+              <form onSubmit={handleRegister} className="space-y-3">
                 <div>
                   <label className="block text-xs text-gray-400 mb-1.5 ml-1">{t("login.username")}</label>
                   <input type="text" value={username} onChange={(e) => setUsername(e.target.value)}
@@ -246,7 +246,7 @@ export default function LoginPage({ onLogin, onBack, resetToken, onResetComplete
                   </div>
                 )}
                 <button type="submit" disabled={loading || !username.trim() || !password.trim()}
-                  className="btn-primary w-full py-4 mt-2">
+                  className="btn-primary w-full mt-1">
                   {loading ? (
                     <span className="flex items-center justify-center gap-2">
                       <span className="w-4 h-4 border-2 border-white border-t-transparent rounded-full animate-spin" />
@@ -267,9 +267,9 @@ export default function LoginPage({ onLogin, onBack, resetToken, onResetComplete
           {/* Forgot password */}
           {mode === "forgot" && (
             <>
-              <h2 className="text-lg font-bold mb-1">{t("login.forgot_title")}</h2>
-              <p className="text-xs text-gray-500 mb-6">{t("login.forgot_subtitle")}</p>
-              <form onSubmit={handleForgotPassword} className="space-y-4">
+              <h2 className="text-base font-bold mb-1">{t("login.forgot_title")}</h2>
+              <p className="text-xs text-gray-500 mb-5">{t("login.forgot_subtitle")}</p>
+              <form onSubmit={handleForgotPassword} className="space-y-3">
                 <div>
                   <label className="block text-xs text-gray-400 mb-1.5 ml-1">Email</label>
                   <input type="email" value={email} onChange={(e) => setEmail(e.target.value)}
