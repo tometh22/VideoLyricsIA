@@ -492,6 +492,7 @@ export default function App() {
           {/* Dashboard */}
           {view === "dashboard" && (
             <Dashboard
+              user={user}
               history={history}
               onSelectJob={handleSelectJob}
               onNewBatch={() => { setView("new"); setFiles([]); }}
