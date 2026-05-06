@@ -24,13 +24,54 @@ const DEFAULT_SETTINGS = {
 };
 
 const PLAN_INFO = {
-  free: { label: "Free", videos: 5, price: 0, color: "text-gray-400" },
-  "100": { label: "Plan 100", videos: 100, price: 900, color: "text-brand" },
-  "250": { label: "Plan 250", videos: 250, price: 2000, color: "text-brand" },
-  "500": { label: "Plan 500", videos: 500, price: 3500, color: "text-brand-light" },
-  "1000": { label: "Plan 1000", videos: 1000, price: 6000, color: "text-brand-light" },
-  unlimited: { label: "Unlimited", videos: "∞", price: 0, color: "text-accent" },
+  free:        { label: "Free",        videos: 5,    price: 0,    color: "text-ink-secondary" },
+  "100":       { label: "Plan 100",    videos: 100,  price: 900,  color: "text-brand-light" },
+  "250":       { label: "Plan 250",    videos: 250,  price: 2000, color: "text-brand-light" },
+  "500":       { label: "Plan 500",    videos: 500,  price: 3500, color: "text-brand-light" },
+  "1000":      { label: "Plan 1000",   videos: 1000, price: 6000, color: "text-brand-light" },
+  unlimited:   { label: "Unlimited",   videos: "∞",  price: 0,    color: "text-accent" },
 };
+
+function SectionLabel({ children }) {
+  return (
+    <p className="text-[10px] font-medium text-gray-500 uppercase tracking-[0.18em] mb-3">
+      {children}
+    </p>
+  );
+}
+
+function Card({ children, className = "" }) {
+  return (
+    <div className={`rounded-card bg-surface-2/40 ring-1 ring-white/[0.04] p-6 ${className}`}>
+      {children}
+    </div>
+  );
+}
+
+function Field({ label, help, children }) {
+  return (
+    <div>
+      <label className="block text-xs font-medium text-ink-secondary mb-1.5">{label}</label>
+      {children}
+      {help && <p className="text-[10px] text-gray-600 mt-1.5">{help}</p>}
+    </div>
+  );
+}
+
+function TabPill({ active, onClick, children }) {
+  return (
+    <button
+      onClick={onClick}
+      className={`h-9 px-4 rounded-full text-xs font-medium transition-all ${
+        active
+          ? "bg-brand/15 text-brand-light ring-1 ring-brand/40"
+          : "bg-surface-2/40 text-ink-secondary ring-1 ring-white/[0.04] hover:ring-white/[0.08] hover:text-white"
+      }`}
+    >
+      {children}
+    </button>
+  );
+}
 
 export default function Settings({ onBack }) {
   const { t, lang, setLang } = useI18n();
@@ -39,11 +80,10 @@ export default function Settings({ onBack }) {
   const [loading, setLoading] = useState(true);
   const user = getUser();
 
-  // Billing
   const [subscription, setSubscription] = useState(null);
   const [invoices, setInvoices] = useState([]);
   const [billingLoading, setBillingLoading] = useState(false);
-  const [activeSection, setActiveSection] = useState("youtube"); // youtube, billing, account
+  const [activeSection, setActiveSection] = useState("youtube");
 
   useEffect(() => {
     fetch(`${API}/settings`, { headers: authHeaders() })
@@ -52,15 +92,12 @@ export default function Settings({ onBack }) {
       .catch(() => {})
       .finally(() => setLoading(false));
 
-    // Load billing info
     fetch(`${API}/billing/subscription`, { headers: authHeaders() })
-      .then(r => r.json())
-      .then(setSubscription)
-      .catch(() => {});
+      .then((r) => r.json()).then(setSubscription).catch(() => {});
 
     fetch(`${API}/billing/invoices`, { headers: authHeaders() })
-      .then(r => r.json())
-      .then(data => { if (Array.isArray(data)) setInvoices(data); })
+      .then((r) => r.json())
+      .then((data) => { if (Array.isArray(data)) setInvoices(data); })
       .catch(() => {});
   }, []);
 
@@ -90,185 +127,178 @@ export default function Settings({ onBack }) {
         body: JSON.stringify({ plan_id: planId }),
       });
       const data = await res.json();
-      if (data.checkout_url) {
-        window.location.href = data.checkout_url;
-      }
-    } catch {} finally {
-      setBillingLoading(false);
-    }
+      if (data.checkout_url) window.location.href = data.checkout_url;
+    } catch {} finally { setBillingLoading(false); }
   };
 
   const handleManageBilling = async () => {
     setBillingLoading(true);
     try {
-      const res = await fetch(`${API}/billing/portal`, {
-        method: "POST",
-        headers: authHeaders(),
-      });
+      const res = await fetch(`${API}/billing/portal`, { method: "POST", headers: authHeaders() });
       const data = await res.json();
-      if (data.portal_url) {
-        window.location.href = data.portal_url;
-      }
-    } catch {} finally {
-      setBillingLoading(false);
-    }
+      if (data.portal_url) window.location.href = data.portal_url;
+    } catch {} finally { setBillingLoading(false); }
   };
 
   const currentPlan = user?.plan || "free";
   const planInfo = PLAN_INFO[currentPlan] || PLAN_INFO.free;
 
   if (loading) return (
-    <div className="w-full max-w-2xl animate-fade-in">
-      <div className="space-y-6">
-        {[1,2,3].map(i => (
-          <div key={i} className="glass rounded-card p-6">
-            <div className="h-5 w-40 bg-surface-3/30 rounded animate-pulse mb-4" />
-            <div className="h-10 bg-surface-3/20 rounded-xl animate-pulse" />
-          </div>
-        ))}
-      </div>
+    <div className="w-full max-w-2xl animate-fade-in space-y-4">
+      {[1, 2, 3].map((i) => (
+        <div key={i} className="rounded-card bg-surface-2/40 ring-1 ring-white/[0.04] p-6">
+          <div className="h-3 w-32 bg-surface-3/40 rounded animate-pulse mb-4" />
+          <div className="h-10 bg-surface-3/30 rounded-xl animate-pulse" />
+        </div>
+      ))}
     </div>
   );
 
   return (
     <div className="w-full max-w-2xl animate-fade-in">
-      <div className="flex items-center gap-3 mb-8">
+      {/* ─── Header ─────────────────────────────────────────────── */}
+      <div className="flex items-end gap-3 mb-8">
         <button onClick={onBack}
-          className="w-9 h-9 rounded-xl glass flex items-center justify-center text-gray-400 hover:text-white transition-colors">
+          className="w-9 h-9 rounded-xl bg-surface-2/40 ring-1 ring-white/[0.04] hover:ring-white/[0.08] hover:text-white flex items-center justify-center text-gray-400 transition-colors">
           <svg className="w-4 h-4" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
             <path d="M19 12H5M12 19l-7-7 7-7" />
           </svg>
         </button>
         <div>
-          <h1 className="text-2xl font-bold">{t("settings.title")}</h1>
-          <p className="text-sm text-gray-500">{t("settings.subtitle")}</p>
+          <h1 className="text-[28px] leading-tight font-bold tracking-tight">{t("settings.title")}</h1>
+          <p className="text-sm text-ink-secondary mt-1">{t("settings.subtitle")}</p>
         </div>
       </div>
 
-      {/* Section tabs */}
-      <div className="flex gap-1 mb-8 glass rounded-xl p-1 w-fit">
+      {/* ─── Section tabs ─────────────────────────────────────────── */}
+      <div className="flex flex-wrap gap-2 mb-6">
         {[
           { id: "youtube", label: "YouTube" },
-          { id: "billing", label: t("settings.billing") || "Billing" },
-          { id: "account", label: t("settings.account") || "Account" },
-        ].map(s => (
-          <button key={s.id} onClick={() => setActiveSection(s.id)}
-            className={`px-5 py-2 rounded-lg text-sm font-medium transition-all ${
-              activeSection === s.id ? "bg-brand text-white" : "text-gray-400 hover:text-white"
-            }`}>
+          { id: "billing", label: t("settings.billing") || "Facturación" },
+          { id: "account", label: t("settings.account") || "Cuenta" },
+        ].map((s) => (
+          <TabPill key={s.id} active={activeSection === s.id} onClick={() => setActiveSection(s.id)}>
             {s.label}
-          </button>
+          </TabPill>
         ))}
       </div>
 
-      <div className="space-y-6">
+      <div className="space-y-4">
 
-        {/* ======================== BILLING SECTION ======================== */}
+        {/* ════════════════════ BILLING ════════════════════ */}
         {activeSection === "billing" && (
           <>
             {/* Current plan */}
-            <div className="glass rounded-card p-6">
-              <h3 className="font-semibold mb-4">{t("settings.current_plan") || "Current Plan"}</h3>
-              <div className="flex items-center justify-between mb-4">
+            <Card>
+              <SectionLabel>{t("settings.current_plan") || "Plan actual"}</SectionLabel>
+              <div className="flex items-end justify-between mb-4">
                 <div>
-                  <p className={`text-2xl font-bold ${planInfo.color}`}>{planInfo.label}</p>
-                  <p className="text-xs text-gray-500 mt-1">{planInfo.videos} videos/month</p>
+                  <p className={`text-2xl font-bold tracking-tight ${planInfo.color}`}>{planInfo.label}</p>
+                  <p className="text-xs text-ink-secondary mt-1">{planInfo.videos} videos/mes</p>
                 </div>
                 {planInfo.price > 0 && (
-                  <p className="text-xl font-bold">
-                    <span className="text-sm text-gray-500">USD</span> {planInfo.price.toLocaleString()}
-                    <span className="text-xs text-gray-500">/mo</span>
+                  <p className="text-xl font-bold tracking-tight text-white">
+                    <span className="text-xs text-ink-secondary font-normal">USD </span>
+                    {planInfo.price.toLocaleString()}
+                    <span className="text-xs text-ink-secondary font-normal">/mes</span>
                   </p>
                 )}
               </div>
               {subscription?.subscription && (
-                <div className="space-y-2 pt-3 border-t border-white/[0.06]">
+                <div className="space-y-2 pt-4 border-t border-white/[0.04]">
                   <div className="flex justify-between text-xs">
-                    <span className="text-gray-400">Status</span>
+                    <span className="text-ink-secondary">Estado</span>
                     <span className={`font-medium ${subscription.subscription.status === "active" ? "text-accent" : "text-amber-400"}`}>
                       {subscription.subscription.status}
                     </span>
                   </div>
                   {subscription.subscription.current_period_end && (
                     <div className="flex justify-between text-xs">
-                      <span className="text-gray-400">{t("settings.next_billing") || "Next billing"}</span>
+                      <span className="text-ink-secondary">{t("settings.next_billing") || "Próximo cobro"}</span>
                       <span className="text-gray-300">
                         {new Date(subscription.subscription.current_period_end * 1000).toLocaleDateString()}
                       </span>
                     </div>
                   )}
                   {subscription.subscription.cancel_at_period_end && (
-                    <p className="text-xs text-amber-400 mt-2">{t("settings.cancel_notice") || "Cancels at end of period"}</p>
+                    <p className="text-xs text-amber-400 mt-2">
+                      {t("settings.cancel_notice") || "Se cancela al final del período"}
+                    </p>
                   )}
                 </div>
               )}
               {subscription?.has_subscription && (
                 <button onClick={handleManageBilling} disabled={billingLoading}
-                  className="btn-secondary mt-4 text-sm !py-2.5">
-                  {t("settings.manage_billing") || "Manage Billing"}
+                  className="btn-secondary mt-5 text-xs h-10 px-4">
+                  {t("settings.manage_billing") || "Administrar facturación"}
                 </button>
               )}
-            </div>
+            </Card>
 
             {/* Upgrade/downgrade */}
             {currentPlan !== "unlimited" && (
-              <div className="glass rounded-card p-6">
-                <h3 className="font-semibold mb-1">{t("settings.change_plan") || "Change Plan"}</h3>
-                <p className="text-xs text-gray-500 mb-5">{t("settings.change_plan_sub") || "Upgrade or downgrade your subscription"}</p>
+              <Card>
+                <SectionLabel>{t("settings.change_plan") || "Cambiar plan"}</SectionLabel>
+                <p className="text-xs text-ink-secondary mb-5 -mt-1">
+                  {t("settings.change_plan_sub") || "Subí o bajá tu suscripción cuando quieras"}
+                </p>
                 <div className="grid grid-cols-2 gap-3">
-                  {["100", "250", "500", "1000"].map(planId => {
+                  {["100", "250", "500", "1000"].map((planId) => {
                     const p = PLAN_INFO[planId];
                     const isCurrent = currentPlan === planId;
                     return (
                       <button key={planId} onClick={() => !isCurrent && handleSubscribe(planId)}
                         disabled={isCurrent || billingLoading}
-                        className={`rounded-2xl p-4 text-center transition-all ${
+                        className={`rounded-card p-4 text-left transition-all ring-1 ${
                           isCurrent
-                            ? "glass border-brand/30 shadow-glow cursor-default"
-                            : "glass glass-hover"
+                            ? "bg-brand/[0.08] ring-brand/30 cursor-default"
+                            : "bg-surface-2/40 ring-white/[0.04] hover:ring-white/[0.10] hover:bg-surface-2/70"
                         }`}>
-                        <p className="text-sm font-bold mb-1">{p.videos} videos</p>
-                        <p className="text-xl font-bold">
-                          <span className="text-xs text-gray-500">$</span>{p.price.toLocaleString()}
+                        <p className="text-xs text-ink-secondary mb-1">{p.videos} videos/mes</p>
+                        <p className="text-2xl font-bold tracking-tight text-white">
+                          <span className="text-xs text-ink-secondary font-normal">$</span>
+                          {p.price.toLocaleString()}
                         </p>
-                        <p className="text-[10px] text-gray-500 mt-1">
+                        <p className="text-[10px] text-gray-600 mt-1">
                           ${(p.price / p.videos).toFixed(2)}/video
                         </p>
                         {isCurrent && (
-                          <span className="inline-block mt-2 text-[9px] bg-brand/20 text-brand px-2 py-0.5 rounded-full font-bold uppercase">
-                            {t("settings.current") || "Current"}
+                          <span className="inline-block mt-3 text-[9px] bg-brand/20 text-brand-light px-2 py-0.5 rounded-full font-bold uppercase tracking-wider">
+                            {t("settings.current") || "Actual"}
                           </span>
                         )}
                       </button>
                     );
                   })}
                 </div>
-              </div>
+              </Card>
             )}
 
             {/* Invoice history */}
-            <div className="glass rounded-card p-6">
-              <h3 className="font-semibold mb-4">{t("settings.invoice_history") || "Invoice History"}</h3>
+            <Card>
+              <SectionLabel>{t("settings.invoice_history") || "Historial de facturas"}</SectionLabel>
               {invoices.length === 0 ? (
-                <p className="text-sm text-gray-500 text-center py-4">{t("settings.no_invoices") || "No invoices yet"}</p>
+                <p className="text-sm text-ink-secondary text-center py-4">
+                  {t("settings.no_invoices") || "Sin facturas aún"}
+                </p>
               ) : (
-                <div className="space-y-2">
-                  {invoices.map(inv => (
-                    <div key={inv.id} className="flex items-center justify-between py-2 border-b border-white/[0.03] last:border-0">
+                <div>
+                  {invoices.map((inv) => (
+                    <div key={inv.id} className="flex items-center justify-between py-3 border-b border-white/[0.03] last:border-0">
                       <div>
-                        <p className="text-sm">{inv.description || "Subscription"}</p>
-                        <p className="text-[11px] text-gray-500">
+                        <p className="text-sm text-white">{inv.description || "Suscripción"}</p>
+                        <p className="text-[11px] text-gray-600 mt-0.5">
                           {inv.created_at ? new Date(inv.created_at).toLocaleDateString() : "—"}
                         </p>
                       </div>
                       <div className="flex items-center gap-3">
-                        <span className={`text-sm font-medium ${inv.status === "paid" ? "text-accent" : "text-red-400"}`}>
+                        <span className={`text-sm font-semibold tabular-nums ${inv.status === "paid" ? "text-accent" : "text-red-400"}`}>
                           ${inv.amount?.toFixed(2)}
                         </span>
                         {inv.invoice_url && (
                           <a href={inv.invoice_url} target="_blank" rel="noopener noreferrer"
-                            className="text-xs text-brand hover:text-brand-light">
-                            {t("settings.view_invoice") || "View"}
+                            className="text-xs text-brand-light hover:text-brand transition-colors">
+                            {t("settings.view_invoice") || "Ver"}
                           </a>
                         )}
                       </div>
@@ -276,166 +306,141 @@ export default function Settings({ onBack }) {
                   ))}
                 </div>
               )}
-            </div>
+            </Card>
           </>
         )}
 
-        {/* ======================== YOUTUBE SECTION ======================== */}
+        {/* ════════════════════ YOUTUBE ════════════════════ */}
         {activeSection === "youtube" && (
           <>
-            {/* App Language */}
-            <div className="glass rounded-card p-6">
-              <h3 className="font-semibold mb-1">{t("settings.app_lang")}</h3>
-              <p className="text-xs text-gray-500 mb-4">
-                {lang === "es" ? "Cambia el idioma de toda la interfaz." :
-                 lang === "en" ? "Change the language of the entire interface." :
-                 "Mude o idioma de toda a interface."}
-              </p>
-              <div className="flex gap-2">
+            <Card>
+              <SectionLabel>{t("settings.app_lang")}</SectionLabel>
+              <div className="flex flex-wrap gap-2">
                 {[
                   { code: "es", label: "Español" },
                   { code: "en", label: "English" },
                   { code: "pt", label: "Português" },
                 ].map((l) => (
                   <button key={l.code} onClick={() => setLang(l.code)}
-                    className={`px-4 py-2 rounded-xl text-sm font-medium transition-all ${
-                      lang === l.code ? "bg-brand text-white shadow-glow" : "glass glass-hover text-gray-400"
+                    className={`h-9 px-4 rounded-full text-xs font-medium transition-all ${
+                      lang === l.code
+                        ? "bg-brand/15 text-brand-light ring-1 ring-brand/40"
+                        : "bg-surface-3/40 text-ink-secondary ring-1 ring-white/[0.04] hover:ring-white/[0.08] hover:text-white"
                     }`}>
                     {l.label}
                   </button>
                 ))}
               </div>
-            </div>
+            </Card>
 
-            {/* YouTube Templates */}
-            <div className="glass rounded-card p-6">
-              <h3 className="font-semibold mb-1 flex items-center gap-2">
-                <svg className="w-5 h-5 text-red-500" fill="currentColor" viewBox="0 0 24 24">
-                  <path d="M22.54 6.42a2.78 2.78 0 00-1.94-2C18.88 4 12 4 12 4s-6.88 0-8.6.46a2.78 2.78 0 00-1.94 2A29 29 0 001 11.75a29 29 0 00.46 5.33A2.78 2.78 0 003.4 19.13C5.12 19.56 12 19.56 12 19.56s6.88 0 8.6-.46a2.78 2.78 0 001.94-2A29 29 0 0023 11.75a29 29 0 00-.46-5.33z"/><polygon points="9.75 15.02 15.5 11.75 9.75 8.48 9.75 15.02" fill="white"/>
-                </svg>
-                {t("settings.yt_template")}
-              </h3>
-              <p className="text-xs text-gray-500 mb-5">{t("settings.yt_template_sub")}</p>
+            <Card>
+              <div className="flex items-center gap-2 mb-1">
+                <SectionLabel>{t("settings.yt_template")}</SectionLabel>
+              </div>
+              <p className="text-xs text-ink-secondary mb-5 -mt-1">{t("settings.yt_template_sub")}</p>
 
               <div className="space-y-4">
-                <div>
-                  <label className="block text-xs font-medium text-gray-400 mb-1.5">{t("settings.title_format")}</label>
+                <Field label={t("settings.title_format")} help={t("settings.title_format_help")}>
                   <input type="text" value={settings.titleFormat}
                     onChange={(e) => update("titleFormat", e.target.value)}
                     className="input-field text-sm" placeholder="{artista} - {cancion} (Letra/Lyrics)" />
-                  <p className="text-[10px] text-gray-600 mt-1">{t("settings.title_format_help")}</p>
-                </div>
-                <div>
-                  <label className="block text-xs font-medium text-gray-400 mb-1.5">{t("settings.desc_header")}</label>
+                </Field>
+                <Field label={t("settings.desc_header")} help={t("settings.desc_header_help")}>
                   <textarea value={settings.descriptionHeader}
                     onChange={(e) => update("descriptionHeader", e.target.value)}
                     rows={3} className="input-field text-sm resize-none"
                     placeholder={t("settings.desc_header_placeholder")} />
-                  <p className="text-[10px] text-gray-600 mt-1">{t("settings.desc_header_help")}</p>
-                </div>
-                <div>
-                  <label className="block text-xs font-medium text-gray-400 mb-1.5">{t("settings.desc_footer")}</label>
+                </Field>
+                <Field label={t("settings.desc_footer")} help={t("settings.desc_footer_help")}>
                   <textarea value={settings.descriptionFooter}
                     onChange={(e) => update("descriptionFooter", e.target.value)}
                     rows={3} className="input-field text-sm resize-none"
                     placeholder={t("settings.desc_footer_placeholder")} />
-                  <p className="text-[10px] text-gray-600 mt-1">{t("settings.desc_footer_help")}</p>
-                </div>
-                <div>
-                  <label className="block text-xs font-medium text-gray-400 mb-1.5">{t("settings.mandatory_tags")}</label>
+                </Field>
+                <Field label={t("settings.mandatory_tags")} help={t("settings.mandatory_tags_help")}>
                   <input type="text" value={settings.mandatoryTags}
                     onChange={(e) => update("mandatoryTags", e.target.value)}
-                    className="input-field text-sm" placeholder={t("settings.mandatory_tags_help")} />
-                </div>
-                <div>
-                  <label className="block text-xs font-medium text-gray-400 mb-1.5">{t("settings.hashtags")}</label>
+                    className="input-field text-sm" placeholder="lyrics, letra, musica" />
+                </Field>
+                <Field label={t("settings.hashtags")}>
                   <input type="text" value={settings.hashtags}
                     onChange={(e) => update("hashtags", e.target.value)}
                     className="input-field text-sm" placeholder="#lyrics #letra #musica" />
-                </div>
-                <div>
-                  <label className="block text-xs font-medium text-gray-400 mb-1.5">{t("settings.metadata_lang")}</label>
-                  <select value={settings.metadataLanguage}
-                    onChange={(e) => update("metadataLanguage", e.target.value)}
-                    className="input-field text-sm appearance-none cursor-pointer">
-                    <option value="es">{t("lang.es")}</option>
-                    <option value="en">{t("lang.en")}</option>
-                    <option value="pt">{t("lang.pt")}</option>
-                    <option value="fr">{t("lang.fr")}</option>
-                    <option value="it">{t("lang.it")}</option>
-                    <option value="de">{t("lang.de")}</option>
-                  </select>
-                </div>
-                <div>
-                  <label className="block text-xs font-medium text-gray-400 mb-1.5">{t("settings.privacy")}</label>
-                  <select value={settings.defaultPrivacy}
-                    onChange={(e) => update("defaultPrivacy", e.target.value)}
-                    className="input-field text-sm appearance-none cursor-pointer">
-                    <option value="unlisted">{t("settings.privacy_unlisted")}</option>
-                    <option value="private">{t("settings.privacy_private")}</option>
-                    <option value="public">{t("settings.privacy_public")}</option>
-                  </select>
+                </Field>
+                <div className="grid grid-cols-2 gap-3">
+                  <Field label={t("settings.metadata_lang")}>
+                    <select value={settings.metadataLanguage}
+                      onChange={(e) => update("metadataLanguage", e.target.value)}
+                      className="input-field text-sm appearance-none cursor-pointer">
+                      <option value="es">{t("lang.es")}</option>
+                      <option value="en">{t("lang.en")}</option>
+                      <option value="pt">{t("lang.pt")}</option>
+                      <option value="fr">{t("lang.fr")}</option>
+                      <option value="it">{t("lang.it")}</option>
+                      <option value="de">{t("lang.de")}</option>
+                    </select>
+                  </Field>
+                  <Field label={t("settings.privacy")}>
+                    <select value={settings.defaultPrivacy}
+                      onChange={(e) => update("defaultPrivacy", e.target.value)}
+                      className="input-field text-sm appearance-none cursor-pointer">
+                      <option value="unlisted">{t("settings.privacy_unlisted")}</option>
+                      <option value="private">{t("settings.privacy_private")}</option>
+                      <option value="public">{t("settings.privacy_public")}</option>
+                    </select>
+                  </Field>
                 </div>
               </div>
-            </div>
+            </Card>
 
-            {/* Channel info */}
-            <div className="glass rounded-card p-6">
-              <h3 className="font-semibold mb-1">{t("settings.channel")}</h3>
-              <p className="text-xs text-gray-500 mb-4">{t("settings.channel_sub")}</p>
-              <div>
-                <label className="block text-xs font-medium text-gray-400 mb-1.5">{t("settings.channel_name")}</label>
+            <Card>
+              <SectionLabel>{t("settings.channel")}</SectionLabel>
+              <p className="text-xs text-ink-secondary mb-4 -mt-1">{t("settings.channel_sub")}</p>
+              <Field label={t("settings.channel_name")}>
                 <input type="text" value={settings.channelName}
                   onChange={(e) => update("channelName", e.target.value)}
                   className="input-field text-sm" placeholder={t("settings.channel_name")} />
-              </div>
+              </Field>
               {settings.channelName && (
                 <p className="text-[10px] text-gray-600 mt-2">{t("settings.channel_connected")}</p>
               )}
-            </div>
+            </Card>
 
-            {/* Save */}
-            <div className="flex items-center gap-4">
-              <button onClick={handleSave} className="btn-primary py-3 px-8">
-                {t("settings.save")}
-              </button>
+            <div className="flex items-center justify-end gap-3 pt-2">
               {saved && (
-                <span className="text-sm text-accent animate-fade-in flex items-center gap-1.5">
-                  <svg className="w-4 h-4" fill="none" stroke="currentColor" strokeWidth="2.5" viewBox="0 0 24 24">
+                <span className="text-xs text-accent flex items-center gap-1.5 animate-fade-in">
+                  <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" strokeWidth="2.5" viewBox="0 0 24 24">
                     <polyline points="20 6 9 17 4 12"/>
                   </svg>
                   {t("settings.saved")}
                 </span>
               )}
+              <button onClick={handleSave} className="btn-primary px-6">
+                {t("settings.save")}
+              </button>
             </div>
           </>
         )}
 
-        {/* ======================== ACCOUNT SECTION ======================== */}
+        {/* ════════════════════ ACCOUNT ════════════════════ */}
         {activeSection === "account" && (
-          <>
-            <div className="glass rounded-card p-6">
-              <h3 className="font-semibold mb-4">{t("settings.account_info") || "Account Info"}</h3>
-              <div className="space-y-3">
-                <div className="flex items-center justify-between py-2 border-b border-white/[0.03]">
-                  <span className="text-xs text-gray-400">{t("login.username")}</span>
-                  <span className="text-sm font-medium">{user?.username}</span>
+          <Card>
+            <SectionLabel>{t("settings.account_info") || "Información de cuenta"}</SectionLabel>
+            <div>
+              {[
+                { label: t("login.username"), value: user?.username },
+                { label: "Email",             value: user?.email || "—" },
+                { label: "Plan",              value: planInfo.label, valueClass: planInfo.color + " font-medium" },
+                { label: "Rol",               value: user?.role || "user" },
+              ].map((row, i, arr) => (
+                <div key={row.label}
+                  className={`flex items-center justify-between py-3 ${i < arr.length - 1 ? "border-b border-white/[0.03]" : ""}`}>
+                  <span className="text-xs text-ink-secondary">{row.label}</span>
+                  <span className={`text-sm ${row.valueClass || "text-white"}`}>{row.value}</span>
                 </div>
-                <div className="flex items-center justify-between py-2 border-b border-white/[0.03]">
-                  <span className="text-xs text-gray-400">Email</span>
-                  <span className="text-sm text-gray-300">{user?.email || "—"}</span>
-                </div>
-                <div className="flex items-center justify-between py-2 border-b border-white/[0.03]">
-                  <span className="text-xs text-gray-400">Plan</span>
-                  <span className={`text-sm font-medium ${planInfo.color}`}>{planInfo.label}</span>
-                </div>
-                <div className="flex items-center justify-between py-2">
-                  <span className="text-xs text-gray-400">Role</span>
-                  <span className="text-sm text-gray-300">{user?.role || "user"}</span>
-                </div>
-              </div>
+              ))}
             </div>
-          </>
+          </Card>
         )}
       </div>
     </div>

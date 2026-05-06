@@ -104,6 +104,23 @@ export default function Dashboard({ user, history, onSelectJob, onNewBatch, onVi
       .catch(() => {});
   }, [history.length]);
 
+  // Errors banner is dismissible. We persist the count at dismiss time so
+  // the banner re-surfaces only when *new* errors arrive (otherwise the
+  // operator would have to dismiss it every page load until next month).
+  const errorsKey = (() => {
+    const d = new Date();
+    return `dash_errors_dismissed_${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}`;
+  })();
+  const [errorsDismissedAt, setErrorsDismissedAt] = useState(() => {
+    const v = localStorage.getItem(errorsKey);
+    return v ? parseInt(v, 10) : 0;
+  });
+  const errorsBannerVisible = errors.length > errorsDismissedAt;
+  const dismissErrors = () => {
+    localStorage.setItem(errorsKey, String(errors.length));
+    setErrorsDismissedAt(errors.length);
+  };
+
   const monthlyLimit = usage?.limit ?? null;
   const monthlyUsed = usage?.used ?? 0;
   const isUnlimited = usage?.plan === "unlimited" || (monthlyLimit && monthlyLimit >= 999999);
@@ -174,15 +191,24 @@ export default function Dashboard({ user, history, onSelectJob, onNewBatch, onVi
         </button>
       )}
 
-      {/* ─── Errors banner (rare; secondary tone) ─────────────────── */}
-      {errors.length > 0 && (
+      {/* ─── Errors banner (rare, secondary tone, dismissible) ────── */}
+      {errorsBannerVisible && (
         <div className="w-full mb-4 flex items-center gap-3 px-4 py-3 rounded-xl bg-red-500/[0.06] ring-1 ring-red-500/20">
           <svg className="w-4 h-4 text-red-400 shrink-0" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
             <circle cx="12" cy="12" r="10"/><path d="M15 9l-6 6M9 9l6 6"/>
           </svg>
-          <p className="text-xs text-red-300">
+          <p className="text-xs text-red-300 flex-1">
             {errors.length} {errors.length === 1 ? "video falló este mes" : "videos fallaron este mes"}
           </p>
+          <button
+            onClick={dismissErrors}
+            aria-label="Descartar"
+            className="text-red-400/60 hover:text-red-300 transition-colors p-1 -mr-1"
+          >
+            <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" strokeWidth="2.5" viewBox="0 0 24 24">
+              <path d="M18 6L6 18M6 6l12 12" strokeLinecap="round"/>
+            </svg>
+          </button>
         </div>
       )}
 
