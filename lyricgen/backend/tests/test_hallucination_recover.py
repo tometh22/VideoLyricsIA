@@ -10,9 +10,12 @@ output with lines distributed evenly across the audio; operator nudges
 the timestamps in the editor before approving the render.
 """
 
+from unittest.mock import patch, MagicMock
+
 from pipeline import (
     _align_whisper_to_plain,
     _detect_hallucination,
+    _fetch_lrclib,
     _has_fuzzy_intra_loop,
     _synthesize_segments_from_plain,
 )
@@ -261,3 +264,79 @@ def test_align_skips_hallucinated_segments():
     ]
     anchors = _align_whisper_to_plain(segments, ALIGN_PLAIN)
     assert anchors == [(0, 0.5)]
+
+
+# ----- _fetch_lrclib plain-from-synced derivation ------------------------
+#
+# Some lrclib records expose syncedLyrics but plainLyrics=null. The
+# downstream auto-recover code in main.py gates on `if plain:`, so without
+# this derivation the recovery branch is unreachable for those records.
+# This is the actual root cause of "El Plan de la Mariposa" still
+# returning 3 hallucinated rows in production despite the earlier
+# auto-recover commits.
+
+
+def _mock_lrclib_response(synced=None, plain=None, duration=180):
+    """Build a fake requests.Response for the lrclib endpoint."""
+    payload = {
+        "syncedLyrics": synced,
+        "plainLyrics": plain,
+        "duration": duration,
+    }
+    res = MagicMock()
+    res.status_code = 200
+    res.json.return_value = payload
+    return res
+
+
+def test_fetch_lrclib_derives_plain_from_synced_when_missing():
+    synced = (
+        "[00:01.00]Me dijo, todo bien\n"
+        "[00:05.50]Ya se va a pasar la sombra\n"
+        "[00:10.00]Que cruce, que me anime a ver\n"
+    )
+    with patch("pipeline._req_get", create=True) if False else patch(
+        "requests.get", return_value=_mock_lrclib_response(synced=synced, plain=None),
+    ):
+        result = _fetch_lrclib("El Plan de la Mariposa", "El Riesgo")
+    assert result is not None
+    assert result["synced"] == synced.strip()
+    assert result["plain"] is not None
+    plain_lines = [l for l in result["plain"].splitlines() if l.strip()]
+    assert plain_lines == [
+        "Me dijo, todo bien",
+        "Ya se va a pasar la sombra",
+        "Que cruce, que me anime a ver",
+    ]
+
+
+def test_fetch_lrclib_keeps_plain_unchanged_when_present():
+    synced = "[00:01.00]hola\n[00:05.00]chau"
+    plain = "hola\nchau\nbonus line"  # different shape on purpose
+    with patch("requests.get",
+               return_value=_mock_lrclib_response(synced=synced, plain=plain)):
+        result = _fetch_lrclib("X", "Y")
+    # When the API gave us plain, we don't overwrite it with derived text.
+    assert result["plain"] == plain
+    assert result["synced"] == synced
+
+
+def test_fetch_lrclib_returns_none_when_neither_lyrics_present():
+    with patch("requests.get",
+               return_value=_mock_lrclib_response(synced=None, plain=None)):
+        assert _fetch_lrclib("X", "Y") is None
+
+
+def test_fetch_lrclib_strips_complex_lrc_timestamps():
+    # Real lrclib records sometimes carry multi-timestamp lines (the same
+    # lyric line repeats at multiple timestamps) and millisecond precision.
+    synced = (
+        "[00:01.00][00:55.00]Coro repetido\n"
+        "[01:23.456]Verso con milis\n"
+    )
+    with patch("requests.get",
+               return_value=_mock_lrclib_response(synced=synced, plain=None)):
+        result = _fetch_lrclib("X", "Y")
+    plain_lines = [l for l in result["plain"].splitlines() if l.strip()]
+    assert plain_lines == ["Coro repetido", "Verso con milis"]
+
