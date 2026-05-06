@@ -204,12 +204,26 @@ async def preview_background(
     token: str = Query(...),
     db: Session = Depends(get_db),
 ):
-    """Serve a background asset file for preview."""
+    """Serve a background asset file for preview.
+
+    When the asset lives in R2 (filename starts with `library/`), redirect
+    to a short-lived signed URL so the browser fetches directly from
+    Cloudflare — no streaming through uvicorn for what may be a 5 MB clip.
+    Falls back to FileResponse from disk for legacy / local-only assets.
+    """
     get_current_user_from_token_param(token, db)
     from database import BackgroundAsset
+    import storage
     asset = db.query(BackgroundAsset).filter(BackgroundAsset.id == asset_id).first()
     if not asset:
         raise HTTPException(status_code=404, detail="Asset not found")
+
+    if asset.filename.startswith("library/") and storage.is_enabled():
+        url = storage.generate_signed_url(asset.filename, expiry_seconds=900)
+        if url:
+            return RedirectResponse(url, status_code=302)
+        # If signing failed for any reason, fall through to local fallback.
+
     file_path = os.path.join(_BACKGROUNDS_LIB, asset.filename)
     if not os.path.exists(file_path):
         raise HTTPException(status_code=404, detail="File not found")
@@ -679,7 +693,14 @@ async def upload(
         from database import BackgroundAsset
         asset = db.query(BackgroundAsset).filter(BackgroundAsset.id == background_id, BackgroundAsset.is_active == True).first()
         if asset:
-            bg_path = os.path.join(_BACKGROUNDS_LIB, asset.filename)
+            if asset.filename.startswith("library/"):
+                # R2-stored asset: pipeline will download via bg_r2_key.
+                bg_ext = os.path.splitext(asset.filename)[1].lower() or f".{asset.file_type}"
+                bg_path = os.path.join(job_dir, f"bg_library{bg_ext}")
+                bg_r2_key = asset.filename
+            else:
+                # Legacy / dev: file is on local disk.
+                bg_path = os.path.join(_BACKGROUNDS_LIB, asset.filename)
     elif background_file and background_file.filename:
         bg_ext = os.path.splitext(background_file.filename)[1].lower()
         if bg_ext in (".mp4", ".mov", ".jpg", ".jpeg", ".png"):
@@ -1125,7 +1146,13 @@ async def generate_with_segments(
         from database import BackgroundAsset
         asset = db.query(BackgroundAsset).filter(BackgroundAsset.id == background_id, BackgroundAsset.is_active == True).first()
         if asset:
-            bg_path = os.path.join(_BACKGROUNDS_LIB, asset.filename)
+            if asset.filename.startswith("library/"):
+                # R2-stored asset: pipeline downloads via bg_r2_key.
+                bg_ext = os.path.splitext(asset.filename)[1].lower() or f".{asset.file_type}"
+                bg_path = os.path.join(job_dir, f"bg_library{bg_ext}")
+                bg_r2_key = asset.filename
+            else:
+                bg_path = os.path.join(_BACKGROUNDS_LIB, asset.filename)
     elif background_file and background_file.filename:
         bg_ext = os.path.splitext(background_file.filename)[1].lower()
         if bg_ext in (".mp4", ".mov", ".jpg", ".jpeg", ".png"):
