@@ -841,7 +841,17 @@ def _lyrics_cache_key(artist: str, song: str) -> str:
     ).hexdigest()[:16]
 
 
-def _fetch_lrclib(artist: str, song: str) -> dict | None:
+def _lrclib_cache_key(artist: str, song: str) -> str:
+    """Stable namespaced key for lrclib results in the LyricsCache table.
+    Same Postgres table the Gemini path uses; the `lrclib:` prefix keeps
+    the two namespaces independent (Gemini stores plain text in `lyrics`,
+    lrclib stores a JSON-encoded dict)."""
+    import hashlib as _h
+    h = _h.sha1(f"{artist.strip().lower()}|{song.strip().lower()}".encode())
+    return f"lrclib:{h.hexdigest()[:16]}"
+
+
+def _fetch_lrclib(artist: str, song: str, db=None) -> dict | None:
     """Look up a song on lrclib.net's public API. Returns:
         {"plain": str|None, "synced": str|None, "duration": float|None}
     or None if the request failed or the song wasn't found.
@@ -854,11 +864,37 @@ def _fetch_lrclib(artist: str, song: str) -> dict | None:
     *synced* lyrics with line-level timestamps — when present, those let us
     skip Whisper transcription entirely and avoid hallucination loops.
 
+    `db` (optional): a SQLAlchemy session. When provided, the function
+    consults the LyricsCache table first and writes successful fetches
+    back so that future calls don't depend on lrclib.net's uptime. This
+    is what saves us when Railway's outbound to lrclib gets a transient
+    timeout — once we've fetched a song once, we never re-fetch it.
+
     Best-effort — never raises.
     """
     if not artist or not song:
         return None
     import requests as _req
+    import json as _json
+
+    cache_key = _lrclib_cache_key(artist, song)
+
+    # Cache lookup. Skip entirely on db=None (e.g. the smoke scripts).
+    if db is not None:
+        try:
+            from database import LyricsCache
+            row = db.query(LyricsCache).filter(
+                LyricsCache.cache_key == cache_key
+            ).first()
+            if row and row.lyrics:
+                cached = _json.loads(row.lyrics)
+                if cached.get("plain") or cached.get("synced"):
+                    print(f"[LYRICS] lrclib cache hit {cache_key} "
+                          f"({len((cached.get('plain') or ''))} plain chars, "
+                          f"synced={'yes' if cached.get('synced') else 'no'})")
+                    return cached
+        except Exception as e:
+            print(f"[LYRICS] lrclib cache read failed: {e}")
     # Two attempts: lrclib reads can spike >10s under load. Total budget
     # is ~25s in the worst case, well within the user-perceived bound
     # for /transcribe (Whisper is the long pole anyway).
@@ -913,11 +949,36 @@ def _fetch_lrclib(artist: str, song: str) -> dict | None:
                 plain = "\n".join(derived)
                 print(f"[LYRICS] lrclib derived plain from synced "
                       f"({len(plain)} chars, {len(derived)} lines)")
-        return {
+        result = {
             "plain": plain,
             "synced": synced,
             "duration": data.get("duration"),
         }
+        # Write-through cache. Once stored, this song never depends on
+        # lrclib.net uptime again — important for Railway outbound flakes.
+        if db is not None:
+            try:
+                from database import LyricsCache
+                payload = _json.dumps(result, ensure_ascii=False)
+                row = db.query(LyricsCache).filter(
+                    LyricsCache.cache_key == cache_key
+                ).first()
+                if row:
+                    row.lyrics = payload
+                else:
+                    db.add(LyricsCache(
+                        cache_key=cache_key,
+                        artist=artist,
+                        title=song,
+                        lyrics=payload,
+                        fetched_by_model="lrclib",
+                    ))
+                db.commit()
+                print(f"[LYRICS] lrclib cached {cache_key} "
+                      f"({len(payload)} bytes)")
+            except Exception as e:
+                print(f"[LYRICS] lrclib cache write failed: {e}")
+        return result
     except Exception as e:
         print(f"[LYRICS] lrclib fetch failed: {e}")
         return None

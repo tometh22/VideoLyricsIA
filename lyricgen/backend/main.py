@@ -812,7 +812,7 @@ async def transcribe_endpoint(
             _detect_hallucination, _synthesize_segments_from_plain,
             _align_whisper_to_plain,
         )
-        lrc = await asyncio.to_thread(_fetch_lrclib, artist_hint, song_hint)
+        lrc = await asyncio.to_thread(_fetch_lrclib, artist_hint, song_hint, db)
         if lrc:
             synced = lrc.get("synced")
             plain = lrc.get("plain") or ""
