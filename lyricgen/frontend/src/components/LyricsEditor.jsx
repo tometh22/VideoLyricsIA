@@ -427,7 +427,23 @@ export default function LyricsEditor({ segments, filename, audioFile, referenceL
   const hasSuggestions = pendingSuggestions > 0;
 
   const handleApprove = () => {
-    onApprove(edited.map(({ _id, ...rest }) => rest));
+    // Sort by start and clamp each segment's end to the next segment's
+    // start (with a 50ms gap) so subtitles never visually overlap on
+    // render. Sync mode anchors preserve the original segment duration,
+    // which can leave end > next.start when the operator anchors lines
+    // closer together than the original transcription spaced them.
+    const sorted = [...edited].sort((a, b) => a.start - b.start);
+    const cleaned = sorted.map((seg, i) => {
+      let end = seg.end;
+      if (i + 1 < sorted.length) {
+        const nextStart = sorted[i + 1].start;
+        if (end > nextStart - 0.05) {
+          end = Math.max(seg.start + 0.3, nextStart - 0.05);
+        }
+      }
+      return { ...seg, end };
+    });
+    onApprove(cleaned.map(({ _id, ...rest }) => rest));
   };
 
   const progressPct = duration > 0 ? (currentTime / duration) * 100 : 0;
