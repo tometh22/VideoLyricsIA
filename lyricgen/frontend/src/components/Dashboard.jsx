@@ -24,7 +24,7 @@ function timeAgo(ts) {
 
 function StatCard({ value, label, accent = false }) {
   return (
-    <div className="glass rounded-2xl p-5 flex-1 text-center">
+    <div className="glass rounded-card p-5 flex-1 text-center">
       <p className={`text-3xl font-bold ${accent ? "text-brand" : "text-white"}`}>{value}</p>
       <p className="text-[11px] text-gray-500 mt-1 uppercase tracking-wider">{label}</p>
     </div>
@@ -164,7 +164,7 @@ export default function Dashboard({ history, onSelectJob, onNewBatch, onViewHist
       </div>
 
       {/* Monthly usage */}
-      <div className={`glass rounded-2xl p-6 mb-8 ${usage?.alert_100 ? "border-amber-500/20" : ""}`}>
+      <div className={`glass rounded-card p-6 mb-8 ${usage?.alert_100 ? "border-amber-500/20" : ""}`}>
         <div className="flex items-center justify-between mb-3">
           <div>
             <h3 className="text-sm font-semibold">{t("dash.monthly_usage")}</h3>
@@ -203,7 +203,7 @@ export default function Dashboard({ history, onSelectJob, onNewBatch, onViewHist
 
       <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
         {/* Recent activity */}
-        <div className="lg:col-span-2 glass-elevated rounded-2xl p-6">
+        <div className="lg:col-span-2 glass-elevated rounded-card p-6">
           <div className="flex items-center justify-between mb-4">
             <h3 className="text-sm font-semibold">{t("dash.recent_activity")}</h3>
             {history.length > 8 && (
@@ -236,7 +236,7 @@ export default function Dashboard({ history, onSelectJob, onNewBatch, onViewHist
         {/* Quick actions + System */}
         <div className="space-y-6">
           {/* Quick actions */}
-          <div className="glass-elevated rounded-2xl p-6">
+          <div className="glass-elevated rounded-card p-6">
             <h3 className="text-sm font-semibold mb-4">{t("dash.quick_actions")}</h3>
             <div className="space-y-2">
               <button onClick={onNewBatch}
@@ -257,7 +257,7 @@ export default function Dashboard({ history, onSelectJob, onNewBatch, onViewHist
           </div>
 
           {/* Plan info */}
-          <div className="glass-elevated rounded-2xl p-6">
+          <div className="glass-elevated rounded-card p-6">
             <h3 className="text-sm font-semibold mb-4">{t("dash.system_status")}</h3>
             {usage ? (
               <div className="space-y-3">

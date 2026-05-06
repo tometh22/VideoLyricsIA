@@ -258,7 +258,7 @@ export default function UploadZone({
   // profile, movement-style gallery, background picker). On mobile they
   // stack: LEFT first, then RIGHT.
   const _deliveryBlock = (
-    <div className="glass rounded-2xl px-4 py-3">
+    <div className="glass rounded-card px-4 py-3">
         <div className="flex flex-wrap gap-2 items-center">
           <label className="text-xs text-gray-400 mr-1">{t("upload.delivery") || "Entrega:"}</label>
           <Listbox
@@ -389,7 +389,7 @@ export default function UploadZone({
         // Set of movement_style codes currently in use across the batch.
         const inUse = new Set(files.map((f) => f.movementStyle).filter(Boolean));
         return (
-          <div className="mt-3 glass rounded-2xl px-4 py-3">
+          <div className="mt-3 glass rounded-card px-4 py-3">
             <div className="flex items-baseline justify-between mb-2">
               <p className="text-[11px] text-gray-500 uppercase tracking-wider font-medium">
                 {t("upload.movement_gallery_title") || "Referencias de estilo de movimiento"}
@@ -447,7 +447,7 @@ export default function UploadZone({
       {files.length > 0 && (
         <div className="mt-3 space-y-2 max-h-96 overflow-y-auto pr-1">
           {files.map((entry, i) => (
-            <div key={i} className="glass rounded-2xl px-4 py-3">
+            <div key={i} className="glass rounded-card px-4 py-3">
               <div className="flex items-center gap-3 mb-2">
                 <div className="w-8 h-8 rounded-lg bg-brand/10 flex items-center justify-center shrink-0">
                   <svg className="w-4 h-4 text-brand" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24" strokeLinecap="round" strokeLinejoin="round">
@@ -632,7 +632,7 @@ export default function UploadZone({
 
           {/* Auto mode */}
           {bgMode === "auto" && (
-            <div className="glass rounded-2xl px-4 py-3">
+            <div className="glass rounded-card px-4 py-3">
               <p className="text-xs text-gray-400">
                 <svg className="inline-block w-3.5 h-3.5 mr-1.5 -mt-0.5 text-brand" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
                   <path d="M13 10V3L4 14h7v7l9-11h-7z"/>
@@ -646,7 +646,7 @@ export default function UploadZone({
           {bgMode === "library" && (
             <div>
               {libraryBgs.length === 0 ? (
-                <div className="glass rounded-2xl px-4 py-6 text-center">
+                <div className="glass rounded-card px-4 py-6 text-center">
                   <p className="text-xs text-gray-500">{t("upload.bg_library_empty") || "No pre-approved backgrounds available. Ask admin to upload some."}</p>
                 </div>
               ) : (
@@ -701,7 +701,7 @@ export default function UploadZone({
                 </button>
               ) : (
                 <>
-                  <div className="glass rounded-2xl px-4 py-3 flex items-center gap-3">
+                  <div className="glass rounded-card px-4 py-3 flex items-center gap-3">
                     <div className="w-8 h-8 rounded-lg bg-cyan-500/10 flex items-center justify-center shrink-0">
                       <svg className="w-4 h-4 text-cyan-400" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
                         <rect x="3" y="3" width="18" height="18" rx="2" /><circle cx="8.5" cy="8.5" r="1.5" /><polyline points="21 15 16 10 5 21" />

@@ -327,7 +327,7 @@ export default function JobDetail({ job, onBack, onJobUpdate }) {
       )}
 
       {/* Tabs */}
-      <div className="flex gap-1 mb-6 p-1 glass rounded-2xl w-fit">
+      <div className="flex gap-1 mb-6 p-1 glass rounded-card w-fit">
         {ALL_TABS.map((tab) => (
           <button
             key={tab.key}

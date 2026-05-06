@@ -121,7 +121,7 @@ export default function Settings({ onBack }) {
     <div className="w-full max-w-2xl animate-fade-in">
       <div className="space-y-6">
         {[1,2,3].map(i => (
-          <div key={i} className="glass rounded-2xl p-6">
+          <div key={i} className="glass rounded-card p-6">
             <div className="h-5 w-40 bg-surface-3/30 rounded animate-pulse mb-4" />
             <div className="h-10 bg-surface-3/20 rounded-xl animate-pulse" />
           </div>
@@ -167,7 +167,7 @@ export default function Settings({ onBack }) {
         {activeSection === "billing" && (
           <>
             {/* Current plan */}
-            <div className="glass rounded-2xl p-6">
+            <div className="glass rounded-card p-6">
               <h3 className="font-semibold mb-4">{t("settings.current_plan") || "Current Plan"}</h3>
               <div className="flex items-center justify-between mb-4">
                 <div>
@@ -212,7 +212,7 @@ export default function Settings({ onBack }) {
 
             {/* Upgrade/downgrade */}
             {currentPlan !== "unlimited" && (
-              <div className="glass rounded-2xl p-6">
+              <div className="glass rounded-card p-6">
                 <h3 className="font-semibold mb-1">{t("settings.change_plan") || "Change Plan"}</h3>
                 <p className="text-xs text-gray-500 mb-5">{t("settings.change_plan_sub") || "Upgrade or downgrade your subscription"}</p>
                 <div className="grid grid-cols-2 gap-3">
@@ -247,7 +247,7 @@ export default function Settings({ onBack }) {
             )}
 
             {/* Invoice history */}
-            <div className="glass rounded-2xl p-6">
+            <div className="glass rounded-card p-6">
               <h3 className="font-semibold mb-4">{t("settings.invoice_history") || "Invoice History"}</h3>
               {invoices.length === 0 ? (
                 <p className="text-sm text-gray-500 text-center py-4">{t("settings.no_invoices") || "No invoices yet"}</p>
@@ -284,7 +284,7 @@ export default function Settings({ onBack }) {
         {activeSection === "youtube" && (
           <>
             {/* App Language */}
-            <div className="glass rounded-2xl p-6">
+            <div className="glass rounded-card p-6">
               <h3 className="font-semibold mb-1">{t("settings.app_lang")}</h3>
               <p className="text-xs text-gray-500 mb-4">
                 {lang === "es" ? "Cambia el idioma de toda la interfaz." :
@@ -308,7 +308,7 @@ export default function Settings({ onBack }) {
             </div>
 
             {/* YouTube Templates */}
-            <div className="glass rounded-2xl p-6">
+            <div className="glass rounded-card p-6">
               <h3 className="font-semibold mb-1 flex items-center gap-2">
                 <svg className="w-5 h-5 text-red-500" fill="currentColor" viewBox="0 0 24 24">
                   <path d="M22.54 6.42a2.78 2.78 0 00-1.94-2C18.88 4 12 4 12 4s-6.88 0-8.6.46a2.78 2.78 0 00-1.94 2A29 29 0 001 11.75a29 29 0 00.46 5.33A2.78 2.78 0 003.4 19.13C5.12 19.56 12 19.56 12 19.56s6.88 0 8.6-.46a2.78 2.78 0 001.94-2A29 29 0 0023 11.75a29 29 0 00-.46-5.33z"/><polygon points="9.75 15.02 15.5 11.75 9.75 8.48 9.75 15.02" fill="white"/>
@@ -380,7 +380,7 @@ export default function Settings({ onBack }) {
             </div>
 
             {/* Channel info */}
-            <div className="glass rounded-2xl p-6">
+            <div className="glass rounded-card p-6">
               <h3 className="font-semibold mb-1">{t("settings.channel")}</h3>
               <p className="text-xs text-gray-500 mb-4">{t("settings.channel_sub")}</p>
               <div>
@@ -414,7 +414,7 @@ export default function Settings({ onBack }) {
         {/* ======================== ACCOUNT SECTION ======================== */}
         {activeSection === "account" && (
           <>
-            <div className="glass rounded-2xl p-6">
+            <div className="glass rounded-card p-6">
               <h3 className="font-semibold mb-4">{t("settings.account_info") || "Account Info"}</h3>
               <div className="space-y-3">
                 <div className="flex items-center justify-between py-2 border-b border-white/[0.03]">

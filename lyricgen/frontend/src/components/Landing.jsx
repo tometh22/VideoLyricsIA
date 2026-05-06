@@ -70,14 +70,14 @@ export default function Landing({ onStart, onLogin, isLoggedIn = false }) {
       {/* Sticky Nav */}
       <nav className="sticky top-0 z-30 bg-surface/80 backdrop-blur-xl border-b border-white/[0.04]">
         <div className="flex items-center justify-between px-8 py-4 max-w-6xl mx-auto">
-          <div className="flex items-center gap-3">
-            <div className="w-9 h-9 rounded-xl bg-gradient-to-br from-brand to-brand-light flex items-center justify-center shadow-glow">
-              <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="white" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
-                <path d="M9 18V5l12-2v13" /><circle cx="6" cy="18" r="3" /><circle cx="18" cy="16" r="3" />
-              </svg>
-            </div>
-            <span className="text-lg font-bold tracking-tight">GenLy AI</span>
-          </div>
+          {/* §10 — full lockup in navbar / footer / auth screens.
+              Brand SVG geometry is the single source of truth. */}
+          <img
+            src="/logo/genly-lockup.svg"
+            alt="GenLy"
+            className="h-7 w-auto select-none"
+            draggable={false}
+          />
           <div className="hidden md:flex items-center gap-6">
             <a href="#features" className="text-xs text-gray-400 hover:text-white transition-colors">{t("landing.features")}</a>
             <a href="#pricing" className="text-xs text-gray-400 hover:text-white transition-colors">{t("landing.pricing")}</a>
@@ -146,13 +146,13 @@ export default function Landing({ onStart, onLogin, isLoggedIn = false }) {
               </div>
             </div>
             {/* Floating Short */}
-            <div className="absolute -bottom-6 -left-8 glass rounded-2xl p-2 shadow-glow w-28 animate-pulse-slow">
+            <div className="absolute -bottom-6 -left-8 glass rounded-card p-2 shadow-glow w-28 animate-pulse-slow">
               <div className="rounded-xl bg-gradient-to-b from-pink-500/20 to-brand/20 aspect-[9/16] flex items-center justify-center">
                 <p className="text-[8px] font-bold text-white/70 uppercase">YouTube Short</p>
               </div>
             </div>
             {/* Floating YouTube badge */}
-            <div className="absolute -top-4 -right-6 glass rounded-2xl px-4 py-3 shadow-glow flex items-center gap-2">
+            <div className="absolute -top-4 -right-6 glass rounded-card px-4 py-3 shadow-glow flex items-center gap-2">
               <svg className="w-5 h-5 text-red-500" fill="currentColor" viewBox="0 0 24 24"><path d="M22.54 6.42a2.78 2.78 0 00-1.94-2C18.88 4 12 4 12 4s-6.88 0-8.6.46a2.78 2.78 0 00-1.94 2A29 29 0 001 11.75a29 29 0 00.46 5.33A2.78 2.78 0 003.4 19.13C5.12 19.56 12 19.56 12 19.56s6.88 0 8.6-.46a2.78 2.78 0 001.94-2A29 29 0 0023 11.75a29 29 0 00-.46-5.33z"/><polygon points="9.75 15.02 15.5 11.75 9.75 8.48 9.75 15.02" fill="white"/></svg>
               <div>
                 <p className="text-[9px] font-bold text-white/80">{t("feat.youtube").split(" ").slice(0, 2).join(" ")}</p>
@@ -243,7 +243,7 @@ export default function Landing({ onStart, onLogin, isLoggedIn = false }) {
         <p className="text-gray-500 text-center mb-16 max-w-lg mx-auto">{t("landing.features_sub")}</p>
         <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-5">
           {FEATURES.map((f) => (
-            <div key={f.title} className="glass rounded-2xl p-6 glass-hover">
+            <div key={f.title} className="glass rounded-card p-6 glass-hover">
               <div className="w-11 h-11 rounded-xl bg-brand/10 flex items-center justify-center text-brand mb-4">{f.icon}</div>
               <h3 className="font-semibold mb-2">{f.title}</h3>
               <p className="text-sm text-gray-400 leading-relaxed">{f.desc}</p>
@@ -286,7 +286,7 @@ export default function Landing({ onStart, onLogin, isLoggedIn = false }) {
         <h2 className="text-3xl font-bold text-center mb-16">{t("landing.faq")}</h2>
         <div className="space-y-4">
           {FAQS.map((faq, i) => (
-            <details key={i} className="glass rounded-2xl group">
+            <details key={i} className="glass rounded-card group">
               <summary className="px-6 py-4 cursor-pointer text-sm font-medium text-white flex items-center justify-between list-none">
                 {faq.q}
                 <svg className="w-4 h-4 text-gray-500 group-open:rotate-180 transition-transform" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24"><path d="M6 9l6 6 6-6"/></svg>

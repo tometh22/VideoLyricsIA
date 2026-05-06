@@ -53,7 +53,7 @@ export default function HistoryView({ history, onSelect, onBack }) {
               <button
                 key={job.job_id}
                 onClick={() => onSelect(job.job_id)}
-                className="glass rounded-2xl overflow-hidden text-left hover:border-white/[0.1] hover:shadow-glow transition-all duration-300 group"
+                className="glass rounded-card overflow-hidden text-left hover:border-white/[0.1] hover:shadow-glow transition-all duration-300 group"
               >
                 {/* Thumbnail */}
                 <div className="aspect-video bg-surface-3/30 relative overflow-hidden">

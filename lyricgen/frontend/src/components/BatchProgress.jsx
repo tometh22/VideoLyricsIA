@@ -21,7 +21,7 @@ function JobRow({ job, index, t }) {
   };
 
   return (
-    <div className={`glass rounded-2xl p-4 transition-all duration-300 ${
+    <div className={`glass rounded-card p-4 transition-all duration-300 ${
       status === "processing" ? "border border-brand/20" : ""
     }`}>
       <div className="flex items-center gap-3 mb-3">

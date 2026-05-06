@@ -158,18 +158,16 @@ export default function LoginPage({ onLogin, onBack, resetToken, onResetComplete
       </div>
 
       <div className="relative z-10 w-full max-w-md mx-4 animate-fade-in">
-        {/* Logo */}
+        {/* Logo — full lockup per brand kit §10 (auth screens use the
+            full lockup, not the mark only). */}
         <div className="text-center mb-10">
-          <div className="inline-flex items-center justify-center w-16 h-16 rounded-2xl bg-gradient-to-br from-brand to-brand-light shadow-glow mb-5">
-            <svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="white" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
-              <path d="M9 18V5l12-2v13" /><circle cx="6" cy="18" r="3" /><circle cx="18" cy="16" r="3" />
-            </svg>
-          </div>
-          <h1 className="text-3xl font-extrabold tracking-tight mb-2">
-            <span className="bg-gradient-to-r from-white to-gray-400 bg-clip-text text-transparent">GenLy </span>
-            <span className="bg-gradient-to-r from-brand to-brand-light bg-clip-text text-transparent">AI</span>
-          </h1>
-          <p className="text-sm text-gray-500">{t("login.platform")}</p>
+          <img
+            src="/logo/genly-lockup.svg"
+            alt="GenLy"
+            className="h-10 w-auto mx-auto mb-5 select-none"
+            draggable={false}
+          />
+          <p className="text-sm text-ink-secondary">{t("login.platform")}</p>
         </div>
 
         {/* Card */}

@@ -15,7 +15,7 @@ function fmtDate(iso) {
 
 function StatCard({ value, label, color = "text-white" }) {
   return (
-    <div className="glass rounded-2xl p-5 text-center">
+    <div className="glass rounded-card p-5 text-center">
       <p className={`text-3xl font-bold ${color}`}>{value}</p>
       <p className="text-[11px] text-gray-500 mt-1 uppercase tracking-wider">{label}</p>
     </div>
@@ -186,7 +186,7 @@ export default function AdminPanel({ onBack }) {
   if (loading) return (
     <div className="w-full max-w-5xl animate-fade-in">
       <div className="grid grid-cols-4 gap-4 mb-8">
-        {[1,2,3,4].map(i => <div key={i} className="glass rounded-2xl p-5 h-20 animate-pulse" />)}
+        {[1,2,3,4].map(i => <div key={i} className="glass rounded-card p-5 h-20 animate-pulse" />)}
       </div>
     </div>
   );
@@ -244,7 +244,7 @@ export default function AdminPanel({ onBack }) {
 
           <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
             {/* Monthly */}
-            <div className="glass-elevated rounded-2xl p-6">
+            <div className="glass-elevated rounded-card p-6">
               <h3 className="text-sm font-semibold mb-4">This Month</h3>
               <div className="space-y-3">
                 <div className="flex justify-between">
@@ -263,7 +263,7 @@ export default function AdminPanel({ onBack }) {
             </div>
 
             {/* Plan distribution */}
-            <div className="glass-elevated rounded-2xl p-6">
+            <div className="glass-elevated rounded-card p-6">
               <h3 className="text-sm font-semibold mb-4">Plan Distribution</h3>
               <div className="space-y-2">
                 {Object.entries(stats.plans || {}).map(([plan, count]) => (
@@ -297,7 +297,7 @@ export default function AdminPanel({ onBack }) {
 
           <p className="text-xs text-gray-500">{usersTotal} users total</p>
 
-          <div className="glass rounded-2xl overflow-hidden">
+          <div className="glass rounded-card overflow-hidden">
             <table className="w-full text-sm">
               <thead>
                 <tr className="border-b border-white/[0.06]">
@@ -395,7 +395,7 @@ export default function AdminPanel({ onBack }) {
       {tab === "jobs" && (
         <div className="space-y-4">
           <p className="text-xs text-gray-500">{jobsTotal} jobs total</p>
-          <div className="glass rounded-2xl overflow-hidden">
+          <div className="glass rounded-card overflow-hidden">
             <table className="w-full text-sm">
               <thead>
                 <tr className="border-b border-white/[0.06]">
@@ -435,7 +435,7 @@ export default function AdminPanel({ onBack }) {
       {/* Invoices */}
       {tab === "invoices" && (
         <div className="space-y-4">
-          <div className="glass rounded-2xl overflow-hidden">
+          <div className="glass rounded-card overflow-hidden">
             <table className="w-full text-sm">
               <thead>
                 <tr className="border-b border-white/[0.06]">
@@ -480,7 +480,7 @@ export default function AdminPanel({ onBack }) {
       {tab === "backgrounds" && (
         <div className="space-y-6">
           {/* Upload form */}
-          <div className="glass-elevated rounded-2xl p-6">
+          <div className="glass-elevated rounded-card p-6">
             <h3 className="text-sm font-semibold mb-4">Upload Background</h3>
             <div className="flex gap-3 items-end">
               <div className="flex-1">
@@ -514,7 +514,7 @@ export default function AdminPanel({ onBack }) {
           </div>
 
           {/* Library grid */}
-          <div className="glass-elevated rounded-2xl p-6">
+          <div className="glass-elevated rounded-card p-6">
             <div className="flex items-center justify-between mb-4">
               <h3 className="text-sm font-semibold">Background Library</h3>
               <span className="text-xs text-gray-500">{backgrounds.length} asset{backgrounds.length !== 1 ? "s" : ""}</span>
@@ -575,7 +575,7 @@ export default function AdminPanel({ onBack }) {
             </div>
           ) : (
             <>
-              <div className="glass-elevated rounded-2xl p-6">
+              <div className="glass-elevated rounded-card p-6">
                 <h3 className="text-sm font-semibold mb-1">UMG Compliance Status</h3>
                 <p className="text-[11px] text-gray-500 mb-5">{compliance.guidelines_version}</p>
 
@@ -626,7 +626,7 @@ export default function AdminPanel({ onBack }) {
                 </div>
               </div>
 
-              <div className="glass-elevated rounded-2xl p-6">
+              <div className="glass-elevated rounded-card p-6">
                 <h3 className="text-sm font-semibold mb-4">Data Policy</h3>
                 <p className="text-[11px] text-gray-400 mb-4">
                   View the full data policy at <button
