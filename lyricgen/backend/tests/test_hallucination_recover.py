@@ -58,6 +58,34 @@ def test_fuzzy_loop_short_text_returns_false():
     assert _has_fuzzy_intra_loop("yo soy yo soy yo soy") is False
 
 
+def test_fuzzy_loop_with_punctuation_and_accents():
+    # Real Whisper output for "El Plan de la Mariposa - El Riesgo"
+    # carries Spanish accents AND clause punctuation. Earlier versions
+    # of _has_fuzzy_intra_loop tokenised with `.lower()` only, so
+    # "haciendo," and "haciendo" or "podía" and "podia" registered as
+    # distinct tokens, dropping the Jaccard score below 0.75 and
+    # letting the loop slip through. The normalised tokeniser must
+    # strip both.
+    text = (
+        "Que podía reflexionar sobre lo que estaba haciendo, "
+        "que podía pensar sobre lo que estaba haciendo y "
+        "que podía reflexionar sobre lo que estaba haciendo y "
+        "que podía pensar sobre lo que estaba haciendo."
+    )
+    assert _has_fuzzy_intra_loop(text) is True
+
+
+def test_fuzzy_loop_punctuation_does_not_false_positive_on_normal_text():
+    # Sanity: a normal sentence with clauses + punctuation must NOT
+    # trigger. Token normalisation should only catch real loops.
+    text = (
+        "El sol se pone lentamente sobre el horizonte, mientras las "
+        "nubes se tiñen de naranja, y el viento sopla suavemente entre "
+        "los árboles del jardín tranquilo."
+    )
+    assert _has_fuzzy_intra_loop(text) is False
+
+
 # ----- _detect_hallucination ----------------------------------------------
 
 def test_detect_clean_segments_returns_false():

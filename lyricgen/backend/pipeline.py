@@ -1097,6 +1097,19 @@ def _detect_hallucination(segments: list[dict],
     return False, ""
 
 
+def _normalize_token(s: str) -> str:
+    """Lowercase + strip combining diacritics + drop non-alphanumeric.
+    Without this, "haciendo," and "haciendo" or "podía" and "podia"
+    register as distinct tokens, breaking the Jaccard fuzzy-loop check
+    on real Whisper output (which carries Spanish accents and clause
+    punctuation). The normalisation matches the behaviour Whisper users
+    intuitively expect when reasoning about repetition."""
+    import unicodedata as _u
+    s = (s or "").lower()
+    s = _u.normalize("NFD", s)
+    return "".join(c for c in s if c.isalnum() and not _u.combining(c))
+
+
 def _has_fuzzy_intra_loop(text: str) -> bool:
     """Detect 3+ near-duplicate consecutive word-windows in a segment.
     Two windows count as the same loop when their token-set Jaccard is
@@ -1105,8 +1118,16 @@ def _has_fuzzy_intra_loop(text: str) -> bool:
 
     Window sizes 4..14 (longer first), same shape as the existing
     `_truncate_intra_loop`, but only used as a SIGNAL here, not a fix.
+
+    Tokens are normalised (lowercase + accent fold + punctuation strip)
+    before comparison. Earlier versions used `.lower()` only and missed
+    real-world Whisper hallucinations like "que podía reflexionar sobre
+    lo que estaba haciendo, que podía pensar sobre lo que estaba
+    haciendo …" because "haciendo," and "haciendo" tokenised
+    differently.
     """
-    words = text.split()
+    raw = text.split()
+    words = [n for n in (_normalize_token(w) for w in raw) if n]
     total = len(words)
     if total < 12:
         return False
@@ -1114,13 +1135,13 @@ def _has_fuzzy_intra_loop(text: str) -> bool:
         if total < window * 3:
             continue
         for start in range(total - window * 3 + 1):
-            phrase_set = set(w.lower() for w in words[start:start + window])
+            phrase_set = set(words[start:start + window])
             if not phrase_set:
                 continue
             count = 1
             pos = start + window
             while pos + window <= total:
-                next_set = set(w.lower() for w in words[pos:pos + window])
+                next_set = set(words[pos:pos + window])
                 if not next_set:
                     break
                 inter = len(phrase_set & next_set)
@@ -1193,8 +1214,13 @@ def _align_whisper_to_plain(segments: list[dict],
     if not segments or not plain_lines:
         return []
 
+    # Use the same normalisation as _has_fuzzy_intra_loop: lowercase +
+    # accent fold + punctuation strip. Otherwise "podía" / "podia" or
+    # "haciendo," / "haciendo" register as distinct tokens and the
+    # Jaccard match score collapses below the 0.3 threshold.
     plain_token_sets = [
-        set(w.lower() for w in line.split()) for line in plain_lines
+        {n for n in (_normalize_token(w) for w in line.split()) if n}
+        for line in plain_lines
     ]
 
     raw: list[tuple[int, float]] = []
@@ -1208,7 +1234,7 @@ def _align_whisper_to_plain(segments: list[dict],
         per_seg_bad, _ = _detect_hallucination([s], audio_duration=None)
         if per_seg_bad:
             continue
-        seg_set = set(w.lower() for w in text.split())
+        seg_set = {n for n in (_normalize_token(w) for w in text.split()) if n}
         if not seg_set:
             continue
         best_idx = -1
