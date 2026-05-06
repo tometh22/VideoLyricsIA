@@ -810,7 +810,7 @@ async def transcribe_endpoint(
             _fetch_lrclib, _lrc_to_segments, _audio_duration,
             _slice_audio_prefix, _slice_audio_window, _verify_lrclib_alignment,
             _detect_hallucination, _synthesize_segments_from_plain,
-            _align_whisper_to_plain,
+            _align_whisper_to_plain, _fill_gaps_with_reference,
         )
         lrc = await asyncio.to_thread(_fetch_lrclib, artist_hint, song_hint, db)
         if lrc:
@@ -1109,51 +1109,47 @@ async def transcribe_endpoint(
             except Exception:
                 pass
 
-        # Defense-in-depth recovery: even on this terminal fallback path
-        # (no lrclib hit, only Gemini / lyrics.ovh as reference), if
-        # Whisper still hallucinates we synthesize segments from the
-        # reference text. This is the path El Plan de la Mariposa hits
-        # when lrclib times out — without this, hallucinated 3-row
-        # output ships to the editor unrecovered.
+        # Defense-in-depth recovery for the Gemini fallback path. We
+        # don't have lrclib's duration here, so we can't compute
+        # intro_offset — instead we use the gap-filling model that
+        # works for any audio shape:
         #
-        # Anchor handling here is more conservative than the lrclib-plain
-        # branch: we did NOT trim a spoken intro from the audio, so any
-        # Whisper anchors that land early can come from a dialogue prefix
-        # reading the lyrics aloud. If all anchors cluster in the first
-        # 25 % of the audio AND the audio is > 2 min AND the reference
-        # has many lines, we drop the anchors and distribute uniformly —
-        # that prevents the "first 3 lyric lines all at 0:00" compression
-        # bug verified on El Plan de la Mariposa - El Riesgo.
+        #   - keep Whisper segments that pass per-segment plausibility
+        #     (preserves the spoken-intro transcription with REAL
+        #     timestamps when present)
+        #   - drop hallucinated segments (mega-segments, fuzzy
+        #     intra-loops)
+        #   - if kept Whisper covers > 70 % of the audio, ship as-is
+        #   - otherwise, distribute reference lines into the
+        #     UNCOVERED gaps proportionally to each gap's duration
+        #
+        # This is generic enough to handle El Plan de la Mariposa
+        # (Whisper captures the dialogue intro at 0–14 s, hallucinates
+        # the song body), Karol G "Si Antes Te Hubiera Conocido"
+        # (similar dialogue prefix), and any future song with the
+        # same "good prefix + bad body" pattern.
         if reference:
             user_dur = await asyncio.to_thread(_audio_duration, tmp_path)
             hallucinated, reason = _detect_hallucination(segments, user_dur)
             if hallucinated and user_dur:
-                anchors = _align_whisper_to_plain(segments, reference)
-                ref_line_count = len([
-                    l for l in reference.splitlines() if l.strip()
-                ])
-                anchors_safe = anchors
-                anchor_action = "kept"
-                if (anchors and user_dur > 120 and ref_line_count > 8
-                        and all(t < user_dur * 0.25 for _, t in anchors)):
-                    # Every anchor sits in the first quarter of the audio
-                    # while the reference has many lines — almost certainly
-                    # a spoken-intro / dialogue prefix that confused
-                    # alignment. Trust uniform over forced compression.
-                    anchors_safe = []
-                    anchor_action = "dropped (intro-cluster)"
-                recovered = _synthesize_segments_from_plain(
-                    reference, user_dur, anchors=anchors_safe,
+                merged = _fill_gaps_with_reference(
+                    segments, reference, user_dur,
                 )
-                if recovered:
+                if merged is not None:
                     src = "gemini_or_lyrics_ovh"
+                    plausible_count = sum(
+                        1 for s in merged
+                        if (s.get("text") or "") not in
+                           [r.strip() for r in (reference or "").splitlines() if r.strip()]
+                    )
                     print(f"[LYRICS] hallucination detected on fallback "
-                          f"path ({reason}) — auto-recovered with "
-                          f"{len(recovered)} lines from {src} "
-                          f"({len(anchors)} anchors {anchor_action}, "
+                          f"path ({reason}) — gap-fill produced "
+                          f"{len(merged)} segments from {src} "
+                          f"(~{plausible_count} kept-Whisper, "
+                          f"{len(merged) - plausible_count} synthesized, "
                           f"dur={user_dur:.1f}s)")
                     return {
-                        "segments": recovered,
+                        "segments": merged,
                         "reference_lyrics": reference,
                         "coverage_warning": True,
                         "recovery_source": src,

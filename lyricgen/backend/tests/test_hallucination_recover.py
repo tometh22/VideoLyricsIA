@@ -16,6 +16,7 @@ from pipeline import (
     _align_whisper_to_plain,
     _detect_hallucination,
     _fetch_lrclib,
+    _fill_gaps_with_reference,
     _has_fuzzy_intra_loop,
     _synthesize_segments_from_plain,
 )
@@ -364,6 +365,108 @@ def test_fetch_lrclib_returns_none_when_neither_lyrics_present():
     with patch("requests.get",
                return_value=_mock_lrclib_response(synced=None, plain=None)):
         assert _fetch_lrclib("X", "Y") is None
+
+
+# ----- _fill_gaps_with_reference (generic gap-filling recovery) ---------
+#
+# This is the model the Gemini-fallback recovery uses when lrclib was
+# unavailable so we don't know intro_offset. Goal: keep Whisper's real
+# transcription (e.g. spoken-dialogue prefix at real timestamps) while
+# filling hallucinated gaps with reference text proportional to the
+# gap durations.
+
+GAP_REF = (
+    "Me dijo, todo bien\n"
+    "Ya se va a pasar la sombra\n"
+    "Que cruce que me anime a ver\n"
+    "Que podia reflexionar\n"
+    "Sobre lo que estaba haciendo\n"
+    "Que no tape que me deje ser\n"
+)
+
+
+def test_fill_gaps_returns_whisper_when_coverage_high():
+    # Whisper covered > 70 % of the audio with plausible segments —
+    # don't synthesize anything; ship Whisper's output directly.
+    segs = [
+        _seg(0, 30, "real line one"),
+        _seg(31, 60, "real line two"),
+        _seg(61, 90, "real line three"),
+    ]
+    out = _fill_gaps_with_reference(
+        segs, GAP_REF, audio_duration=100.0,
+    )
+    assert out == segs
+
+
+def test_fill_gaps_keeps_real_intro_and_synthesizes_body():
+    # El Plan failure shape: a real 14-second spoken intro (kept as a
+    # single Whisper segment) followed by hallucinated body. The
+    # filler distributes the reference lines into [14, 342] proportional
+    # to gap duration, so the intro subtitle remains at its real
+    # timestamps and the song-body lyrics fill the rest of the track.
+    intro = _seg(0.0, 14.0, "Me dijo todo bien ya se va a pasar la sombra que cruce que me anime a ver")
+    # Hallucinated body — mega-segment with intra-loop, both red flags.
+    bad = _seg(60.0, 240.0,
+               "que podia reflexionar y que podia pensar y que podia reflexionar "
+               "y que podia pensar y que podia reflexionar y que podia pensar "
+               "y que podia reflexionar y que podia pensar y que podia reflexionar")
+    out = _fill_gaps_with_reference(
+        [intro, bad], GAP_REF, audio_duration=342.0,
+    )
+    assert out is not None
+    # Real intro segment survived, exactly as Whisper produced it.
+    assert any(
+        s["start"] == 0.0 and s["end"] == 14.0 and "ya se va" in s["text"]
+        for s in out
+    )
+    # The hallucinated mega-segment was dropped — its text doesn't
+    # appear in any output row.
+    assert all("y que podia reflexionar y que podia pensar" not in (s["text"] or "")
+               for s in out)
+    # Reference lines distributed AFTER the kept Whisper segment.
+    synth = [s for s in out if s["start"] >= 14.0]
+    assert len(synth) >= 4  # several reference lines fit in the long gap
+    # Lines stay within the audio window.
+    assert all(s["end"] <= 342.0 for s in out)
+    # Output is sorted by start.
+    starts = [s["start"] for s in out]
+    assert starts == sorted(starts)
+
+
+def test_fill_gaps_no_whisper_uniform_distribution():
+    # Whisper returned nothing usable. With reference text we still
+    # ship a complete uniform distribution — better than 3 broken rows.
+    out = _fill_gaps_with_reference(
+        [], GAP_REF, audio_duration=120.0,
+    )
+    assert out is not None
+    assert len(out) == 6  # 6 reference lines
+    # Approximately uniform across [0, 120].
+    assert abs(out[0]["start"] - 0.0) < 0.5
+    assert abs(out[-1]["end"] - 120.0) < 1.5
+
+
+def test_fill_gaps_no_reference_returns_kept_or_none():
+    # Without reference we can't synthesize. Kept Whisper survives;
+    # if Whisper was empty too, return None so the caller falls back
+    # to its default "ship hallucinations" behavior.
+    intro = _seg(0, 5, "real one")
+    out = _fill_gaps_with_reference(
+        [intro], reference="", audio_duration=120.0,
+    )
+    assert out == [intro]
+    out2 = _fill_gaps_with_reference(
+        [], reference="", audio_duration=120.0,
+    )
+    assert out2 is None
+
+
+def test_fill_gaps_zero_audio_duration_returns_input():
+    out = _fill_gaps_with_reference(
+        [_seg(0, 5, "x")], GAP_REF, audio_duration=0,
+    )
+    assert out == [_seg(0, 5, "x")]
 
 
 def test_fetch_lrclib_strips_complex_lrc_timestamps():

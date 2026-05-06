@@ -1333,6 +1333,121 @@ def _synthesize_segments_from_plain(plain: str,
     return segments
 
 
+def _fill_gaps_with_reference(whisper_segments: list[dict],
+                               reference: str,
+                               audio_duration: float,
+                               coverage_threshold: float = 0.7,
+                               ) -> list[dict] | None:
+    """Generic recovery for outlier songs: keep Whisper's plausible
+    segments, then fill the uncovered time intervals with lines from
+    the reference text distributed proportionally.
+
+    This is the right model whenever Whisper returns SOME real
+    transcription (e.g. a spoken-dialogue intro that captures real
+    words at real timestamps) interleaved with hallucinated segments
+    (instrumental-passage mega-segments, synonym intra-loops). We
+    must not throw the real segments away.
+
+    Returns the merged segment list, or None when there's nothing
+    sensible to return (no plausible Whisper AND no reference). The
+    caller can decide whether to surface a coverage_warning.
+
+    `coverage_threshold`: when the kept Whisper segments cover more
+    than this fraction of the audio, return them as-is (no synthesis
+    needed — Whisper worked). Default 0.7.
+
+    Used by the Gemini-fallback path in /transcribe where lrclib was
+    unavailable and we therefore don't know intro_offset. The lrclib-
+    plain branch uses a different (more accurate) flow because it
+    knows the song-body offset.
+    """
+    if not audio_duration or audio_duration <= 0:
+        return whisper_segments or None
+
+    # 1. Keep only segments that pass per-segment plausibility.
+    kept: list[dict] = []
+    dropped = 0
+    for s in (whisper_segments or []):
+        bad, _ = _detect_hallucination([s], audio_duration=None)
+        if bad:
+            dropped += 1
+            continue
+        kept.append(s)
+    kept.sort(key=lambda x: float(x.get("start", 0)))
+
+    coverage = sum(
+        float(s.get("end", 0)) - float(s.get("start", 0)) for s in kept
+    ) / float(audio_duration)
+
+    # 2. Whisper covers most of the audio → no synthesis needed.
+    if coverage >= coverage_threshold:
+        return kept
+
+    # 3. Sparse coverage: distribute reference lines into the gaps.
+    ref_lines = _split_plain_lines(reference) if reference else []
+    if not ref_lines:
+        # Nothing to synthesize from. Return the (possibly empty) kept
+        # set; caller falls back to whatever default it had.
+        return kept or None
+
+    # Build the gap list. A gap is any [t1, t2] interval >= 1 s long
+    # that doesn't overlap with a kept segment. Always seed with a
+    # leading gap from t=0 if the first kept starts after 0.
+    gaps: list[tuple[float, float]] = []
+    cursor = 0.0
+    for s in kept:
+        s_start = float(s["start"])
+        s_end = float(s["end"])
+        if s_start > cursor + 1.0:
+            gaps.append((cursor, s_start))
+        cursor = max(cursor, s_end)
+    if cursor < float(audio_duration) - 1.0:
+        gaps.append((cursor, float(audio_duration)))
+
+    if not gaps:
+        return kept
+
+    total_gap = sum(end - start for start, end in gaps)
+    if total_gap <= 0:
+        return kept
+
+    # 4. Allocate reference lines per gap, proportional to gap duration.
+    n_lines = len(ref_lines)
+    GAP_BETWEEN = 0.05
+    output = list(kept)
+    line_cursor = 0
+    for i, (start, end) in enumerate(gaps):
+        gap_dur = end - start
+        # Last gap absorbs all remaining lines so we never under-allocate.
+        if i == len(gaps) - 1:
+            line_count = n_lines - line_cursor
+        else:
+            line_count = max(0, round(gap_dur / total_gap * n_lines))
+            line_count = min(line_count, n_lines - line_cursor)
+        if line_count <= 0:
+            continue
+        per_line = gap_dur / line_count
+        for j in range(line_count):
+            line_idx = line_cursor + j
+            if line_idx >= n_lines:
+                break
+            line_start = start + j * per_line
+            line_end = start + (j + 1) * per_line - GAP_BETWEEN
+            if line_end <= line_start:
+                line_end = line_start + 0.5
+            if line_end > float(audio_duration):
+                line_end = float(audio_duration)
+            output.append({
+                "start": line_start,
+                "end": line_end,
+                "text": ref_lines[line_idx],
+            })
+        line_cursor += line_count
+
+    output.sort(key=lambda s: float(s["start"]))
+    return output
+
+
 def _audio_duration(audio_path: str) -> float | None:
     """Best-effort audio duration in seconds. Handles both MP3 and WAV.
     For MP3 we use mutagen.mp3 (header-only, ~1 ms). For WAV we use the
