@@ -13,6 +13,12 @@ load_dotenv(os.path.join(os.path.dirname(__file__), ".env"))
 from credentials_bootstrap import bootstrap_vertex_credentials
 bootstrap_vertex_credentials()
 
+# --- Environment (production | staging | development) ---
+# Single source of truth for "where am I running" — used by Sentry, the
+# /health endpoint, and email gating so staging never sends real-looking
+# mail to a real customer's inbox.
+ENVIRONMENT = os.environ.get("ENVIRONMENT", "production").lower().strip() or "production"
+
 # --- Sentry (must init before FastAPI) ---
 _SENTRY_DSN = os.environ.get("SENTRY_DSN", "")
 if _SENTRY_DSN:
@@ -20,7 +26,8 @@ if _SENTRY_DSN:
     sentry_sdk.init(
         dsn=_SENTRY_DSN,
         traces_sample_rate=float(os.environ.get("SENTRY_TRACES_RATE", "0.1")),
-        environment=os.environ.get("SENTRY_ENV", "production"),
+        # SENTRY_ENV overrides ENVIRONMENT only if explicitly set (back-compat).
+        environment=os.environ.get("SENTRY_ENV") or ENVIRONMENT,
         release=os.environ.get("SENTRY_RELEASE", "genly@2.0.0"),
     )
 

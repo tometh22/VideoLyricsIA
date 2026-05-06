@@ -12,7 +12,11 @@ import sys
 import time
 
 SENTRY_DSN = os.environ.get("SENTRY_DSN", "").strip()
-ENV = os.environ.get("ENV", "dev").lower()
+# Single source of truth for environment label. ENVIRONMENT is the Railway /
+# Heroku convention; ENV stays as a back-compat alias.
+ENV = (os.environ.get("ENVIRONMENT")
+       or os.environ.get("ENV")
+       or "dev").lower().strip()
 LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO").upper()
 
 

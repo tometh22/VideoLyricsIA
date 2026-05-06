@@ -1,5 +1,6 @@
 import { useState, useRef, useCallback, useEffect } from "react";
 import { useI18n } from "./i18n";
+import { IS_PRODUCTION, APP_ENV } from "./env";
 import LoginPage from "./components/LoginPage";
 import Landing from "./components/Landing";
 import Sidebar from "./components/Sidebar";
@@ -66,6 +67,13 @@ export default function App() {
   const [resetToken, setResetToken] = useState(null);
   const pollingIntervals = useRef(new Set());
   const PARALLEL_WORKERS = 5;
+
+  // --- Stamp the document title with the environment when not in prod ---
+  useEffect(() => {
+    if (!IS_PRODUCTION) {
+      document.title = `[${APP_ENV.toUpperCase()}] GenLy`;
+    }
+  }, []);
 
   // --- Handle URL params (billing callbacks, email verification) ---
   useEffect(() => {
