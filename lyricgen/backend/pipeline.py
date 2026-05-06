@@ -1094,6 +1094,33 @@ def _detect_hallucination(segments: list[dict],
             return True, ("fuzzy intra-loop in segment "
                           f"{(s.get('text') or '')[:60]!r}")
 
+    # Signal 4 — segment whose first and second halves carry the same
+    # content. Catches the Whisper failure mode where the model emits
+    # the SAME phrase exactly twice in one segment
+    # ("¿Qué podía reflexionar sobre lo que estaba haciendo? ¿Qué
+    # podía reflexionar sobre lo que estaba haciendo?") — only 2
+    # repetitions so the fuzzy-loop check (3+) doesn't catch it.
+    # Variety guards (each half needs >= 4 unique normalised tokens)
+    # keep simple repetitive choruses like "la la la la" from being
+    # false-flagged.
+    for s in segments:
+        text = s.get("text") or ""
+        words = [n for n in (_normalize_token(w) for w in text.split()) if n]
+        n = len(words)
+        if n < 12:
+            continue
+        half = n // 2
+        first_half = set(words[:half])
+        second_half = set(words[half:half * 2])
+        if len(first_half) < 4 or len(second_half) < 4:
+            continue
+        inter = len(first_half & second_half)
+        union = len(first_half | second_half)
+        if union > 0 and (inter / union) >= 0.85:
+            dur = float(s.get("end", 0)) - float(s.get("start", 0))
+            return True, (f"duplicate halves in {dur:.1f}s segment "
+                          f"({n} words): {text[:60]!r}")
+
     return False, ""
 
 
