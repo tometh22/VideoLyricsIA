@@ -570,57 +570,60 @@ export default function LyricsEditor({ segments, filename, audioFile, referenceL
       )}
 
       {audioUrl && syncMode && (
-        <div className="mb-3 px-4 py-3 rounded-card bg-brand/[0.08] ring-1 ring-brand/40 animate-fade-in">
-          <div className="flex items-center justify-between mb-2.5">
-            <div className="flex items-center gap-2">
-              <span className="inline-block w-2 h-2 rounded-full bg-brand animate-pulse" />
-              <span className="text-[11px] font-medium text-brand-light uppercase tracking-wider">
-                {t("editor.sync_mode_on") || "Modo Sync activo"}
+        <div className="mb-3 px-3 py-2 rounded-card bg-brand/[0.08] ring-1 ring-brand/40 animate-fade-in">
+          {/* Top row: status + counter + exit. Compact, single line. */}
+          <div className="flex items-center justify-between mb-1.5">
+            <div className="flex items-center gap-1.5 min-w-0">
+              <span className="inline-block w-1.5 h-1.5 rounded-full bg-brand animate-pulse shrink-0" />
+              <span className="text-[10px] font-semibold text-brand-light uppercase tracking-wider shrink-0">
+                {t("editor.sync_mode_on") || "Sync"}
               </span>
-              <span className="text-[11px] text-gray-500">
-                {syncCursor + 1} / {edited.length}
+              <span className="text-[10px] text-gray-500 tabular-nums shrink-0">
+                {syncCursor + 1}/{edited.length}
+              </span>
+              <span className="hidden sm:inline text-[10px] text-gray-600 ml-2 truncate">
+                <kbd className="px-1 py-0.5 rounded bg-surface-3/60 ring-1 ring-white/[0.05] font-mono text-[9px]">space</kbd>
+                {" anclar · "}
+                <kbd className="px-1 py-0.5 rounded bg-surface-3/60 ring-1 ring-white/[0.05] font-mono text-[9px]">Z</kbd>
+                {" deshace"}
               </span>
             </div>
             <button
               onClick={exitSyncMode}
-              className="text-[11px] text-gray-400 hover:text-white px-2 py-1 transition-colors"
+              className="text-[10px] text-gray-400 hover:text-white px-1.5 py-0.5 transition-colors shrink-0"
             >
-              {t("editor.sync_exit") || "Salir (Esc)"}
+              {t("editor.sync_exit") || "Salir"}
             </button>
           </div>
-          <p className="text-sm text-white font-medium leading-snug mb-1 line-clamp-2">
-            {edited[syncCursor]?.text || ""}
-          </p>
-          <p className="text-[11px] text-gray-500 mb-3">
-            {t("editor.sync_hint") || "Apretá"}{" "}
-            <kbd className="px-1.5 py-0.5 rounded bg-surface-3/60 ring-1 ring-white/[0.05] font-mono text-[10px]">space</kbd>{" "}
-            {t("editor.sync_hint_2") || "cuando arranque esta línea"}
-            {" · "}
-            <kbd className="px-1.5 py-0.5 rounded bg-surface-3/60 ring-1 ring-white/[0.05] font-mono text-[10px]">Z</kbd>{" "}
-            {t("editor.sync_undo") || "deshace"}
-          </p>
+          {/* Action row: line text on left (visual hero), compact button on right. */}
           <div className="flex items-center gap-2">
+            <p className="flex-1 text-sm text-white font-medium leading-snug line-clamp-1 min-w-0">
+              {edited[syncCursor]?.text || <span className="text-gray-500 italic">(sin texto)</span>}
+            </p>
+            <span className="text-[10px] font-mono text-brand-light tabular-nums shrink-0">
+              {formatTime(currentTime)}
+            </span>
             <button
               onClick={tapAnchor}
-              className="flex-1 h-11 rounded-xl bg-brand hover:bg-brand-light text-white font-semibold
-                transition-colors flex items-center justify-center gap-2 shadow-glow"
+              className="shrink-0 h-8 px-3 rounded-lg bg-brand hover:bg-brand-light text-white text-[12px]
+                font-semibold transition-colors flex items-center gap-1.5"
             >
-              <svg className="w-4 h-4" fill="none" stroke="currentColor" strokeWidth="2.5" viewBox="0 0 24 24">
+              <svg className="w-3 h-3" fill="none" stroke="currentColor" strokeWidth="3" viewBox="0 0 24 24">
                 <polyline points="20 6 9 17 4 12" />
               </svg>
-              {t("editor.sync_tap") || "Anclar acá"}
-              <span className="text-[10px] font-mono opacity-70 ml-1">
-                {formatTime(currentTime)}
-              </span>
+              {t("editor.sync_tap") || "Anclar"}
             </button>
             <button
               onClick={undoLastAnchor}
               disabled={syncHistory.length === 0}
-              className="shrink-0 h-11 px-3 rounded-xl bg-surface-2/60 ring-1 ring-white/[0.05]
+              title={t("editor.sync_undo_btn") || "Deshacer"}
+              className="shrink-0 w-8 h-8 rounded-lg bg-surface-2/60 ring-1 ring-white/[0.05]
                 text-gray-300 hover:text-white hover:bg-surface-2 disabled:opacity-30
-                disabled:cursor-not-allowed transition-colors text-[11px] font-medium"
+                disabled:cursor-not-allowed transition-colors flex items-center justify-center"
             >
-              ↶ {t("editor.sync_undo_btn") || "Deshacer"}
+              <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
+                <path d="M3 7v6h6M3 13a9 9 0 109-9" strokeLinecap="round" strokeLinejoin="round" />
+              </svg>
             </button>
           </div>
         </div>
