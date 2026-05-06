@@ -14,10 +14,12 @@ function tokenParam() {
   return token ? `token=${encodeURIComponent(token)}` : "";
 }
 
-// Maximum tracks per batch. Mirrors the backend's DEFAULT_MAX_CONCURRENT_JOBS
-// (10). The backend enforces this server-side too — this is the UX layer that
-// stops the user from picking 50 files and getting 40 of them rejected.
-const MAX_BATCH_SIZE = 10;
+// Maximum tracks per batch. Aligned with the per-tenant backlog cap
+// (TENANT_BACKLOG_LIMIT = 5 in main.py:464) — Tomi committed to UMG that
+// 5 simultáneos is the launch-window throughput, so the staging UI should
+// surface the same number rather than letting the operator queue 10 and
+// hit a 429 on the 6th. The backend enforces this server-side regardless.
+const MAX_BATCH_SIZE = 5;
 
 // Max single-file size. Mirrors backend MAX_UPLOAD_MB default (100, raised
 // from 50 to fit lossless WAV uploads — UMG sends WAV at 16/24-bit PCM,
