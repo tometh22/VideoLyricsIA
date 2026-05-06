@@ -62,6 +62,9 @@ export default function UploadZone({
   onBackgroundId,
   animateImage,
   onAnimateImage,
+  allHaveArtist = false,
+  onStartReview,
+  onGenerateDirect,
 }) {
   const { t } = useI18n();
   const inputRef = useRef();
@@ -71,9 +74,12 @@ export default function UploadZone({
   const [umgFrameSize, setUmgFrameSize] = useState("HD");
   const [umgFps, setUmgFps] = useState(24);
   const [umgProresProfile, setUmgProresProfile] = useState(3);
+  const [deliveryExpanded, setDeliveryExpanded] = useState(false);
   const [bgMode, setBgMode] = useState("auto"); // auto | library | custom
   const [libraryBgs, setLibraryBgs] = useState([]);
   const [libraryLoaded, setLibraryLoaded] = useState(false);
+  // Library filter chip: all | image | video_cinematic | video_simple
+  const [libraryFilter, setLibraryFilter] = useState("all");
   // Per-row expansion of the secondary controls (Tipografía / Concepto /
   // Movimiento). Idioma + Género stay always-visible because operators
   // tweak those most often; the rest hide behind "Más opciones" so a
@@ -257,48 +263,86 @@ export default function UploadZone({
   // per-track rows). The RIGHT column owns batch-wide settings (delivery
   // profile, movement-style gallery, background picker). On mobile they
   // stack: LEFT first, then RIGHT.
+  // Delivery profile is collapsed by default — most operators never
+  // change it from MP4/YouTube. The collapsed pill shows the current
+  // value + a "Cambiar" affordance; click expands the listboxes.
   const _deliveryBlock = (
-    <div className="glass rounded-card px-4 py-3">
-        <div className="flex flex-wrap gap-2 items-center">
-          <label className="text-xs text-gray-400 mr-1">{t("upload.delivery") || "Entrega:"}</label>
-          <Listbox
-            value={deliveryProfile}
-            onChange={(v) => setDeliveryProfile(v)}
-            options={[
-              { code: "youtube", label: "MP4 H.264 1080p (YouTube / Instagram / TikTok)" },
-              { code: "umg",  label: "ProRes 422 HQ master — próximamente", disabled: true },
-              { code: "both", label: "MP4 + ProRes — próximamente",         disabled: true },
-            ]}
-            className="w-72"
-            ariaLabel={t("upload.delivery") || "Entrega"}
-          />
-          {deliveryProfile !== "youtube" && (
-            <>
-              <Listbox
-                value={umgFrameSize}
-                onChange={(v) => setUmgFrameSize(v)}
-                options={UMG_FRAME_SIZES}
-                className="w-56"
-                ariaLabel="UMG frame size"
-              />
-              <Listbox
-                value={String(umgFps)}
-                onChange={(v) => setUmgFps(parseFloat(v))}
-                options={UMG_FPS}
-                className="w-32"
-                ariaLabel="UMG fps"
-              />
-              <Listbox
-                value={String(umgProresProfile)}
-                onChange={(v) => setUmgProresProfile(parseInt(v, 10))}
-                options={UMG_PROFILES}
-                className="w-56"
-                ariaLabel="ProRes profile"
-              />
-            </>
-          )}
+    <div className="rounded-card bg-surface-2/40 ring-1 ring-white/[0.04] px-4 py-3">
+      {!deliveryExpanded ? (
+        <button
+          type="button"
+          onClick={() => setDeliveryExpanded(true)}
+          className="w-full flex items-center justify-between text-left"
+        >
+          <div className="flex items-center gap-2 min-w-0">
+            <span className="text-[10px] uppercase tracking-[0.18em] text-gray-500">
+              {t("upload.delivery") || "Entrega"}
+            </span>
+            <span className="text-sm text-white truncate">
+              {deliveryProfile === "youtube"
+                ? "MP4 H.264 1080p"
+                : `ProRes ${umgFrameSize} ${umgFps} fps`}
+            </span>
+          </div>
+          <span className="text-xs text-brand-light hover:text-brand transition-colors shrink-0">
+            {t("common.change") || "Cambiar"}
+          </span>
+        </button>
+      ) : (
+        <div className="space-y-2">
+          <div className="flex items-center justify-between">
+            <span className="text-[10px] uppercase tracking-[0.18em] text-gray-500">
+              {t("upload.delivery") || "Entrega"}
+            </span>
+            <button
+              type="button"
+              onClick={() => setDeliveryExpanded(false)}
+              className="text-[11px] text-gray-500 hover:text-gray-300 transition-colors"
+            >
+              {t("common.collapse") || "Cerrar"}
+            </button>
+          </div>
+          <div className="flex flex-wrap gap-2 items-center">
+            <Listbox
+              value={deliveryProfile}
+              onChange={(v) => setDeliveryProfile(v)}
+              options={[
+                { code: "youtube", label: "MP4 H.264 1080p (YouTube / Instagram / TikTok)" },
+                { code: "umg",  label: "ProRes 422 HQ master — próximamente", disabled: true },
+                { code: "both", label: "MP4 + ProRes — próximamente",         disabled: true },
+              ]}
+              className="w-72"
+              ariaLabel={t("upload.delivery") || "Entrega"}
+            />
+            {deliveryProfile !== "youtube" && (
+              <>
+                <Listbox
+                  value={umgFrameSize}
+                  onChange={(v) => setUmgFrameSize(v)}
+                  options={UMG_FRAME_SIZES}
+                  className="w-56"
+                  ariaLabel="UMG frame size"
+                />
+                <Listbox
+                  value={String(umgFps)}
+                  onChange={(v) => setUmgFps(parseFloat(v))}
+                  options={UMG_FPS}
+                  className="w-32"
+                  ariaLabel="UMG fps"
+                />
+                <Listbox
+                  value={String(umgProresProfile)}
+                  onChange={(v) => setUmgProresProfile(parseInt(v, 10))}
+                  options={UMG_PROFILES}
+                  className="w-56"
+                  ariaLabel="ProRes profile"
+                />
+              </>
+            )}
+          </div>
         </div>
-      </div>
+      )}
+    </div>
   );
 
   const _dropZone = (
@@ -497,27 +541,37 @@ export default function UploadZone({
                     </button>
                   ))}
                 </div>
-                <div className="flex items-center gap-2 pt-1">
-                  <span className="text-[11px] text-gray-600 shrink-0">
-                    {t("upload.genre_label") || "Género:"}
-                  </span>
-                  <Listbox
-                    value={entry.genre || ""}
-                    onChange={(v) => updateField(i, "genre", v)}
-                    options={GENRES}
-                    className="flex-1"
-                    ariaLabel={t("upload.genre_label") || "Género"}
-                  />
-                </div>
-                {/* Secondary controls collapse-toggle. Idioma + Género stay
-                    always-visible above; Tipografía / Concepto / Movimiento
-                    hide behind this toggle so a 10-song batch doesn't
-                    explode into 60 dropdowns. The toggle shows a small dot
-                    when any of the 3 is set to a non-Auto value, so the
-                    operator knows their picks survive a collapse. */}
+                {/* Genre is only visible in Auto mode — it ONLY feeds
+                    the AI background prompt. When the operator picked a
+                    library / custom background, the worker ignores it. */}
+                {bgMode === "auto" && (
+                  <div className="flex items-center gap-2 pt-1">
+                    <span className="text-[11px] text-gray-600 shrink-0">
+                      {t("upload.genre_label") || "Género:"}
+                    </span>
+                    <Listbox
+                      value={entry.genre || ""}
+                      onChange={(v) => updateField(i, "genre", v)}
+                      options={GENRES}
+                      className="flex-1"
+                      ariaLabel={t("upload.genre_label") || "Género"}
+                    />
+                  </div>
+                )}
+                {/* Secondary controls collapse-toggle. Visible options
+                    inside depend on bgMode:
+                      - auto:           concept · movement · font
+                      - library/custom: font only (concept/movement
+                                        are baked into the asset)
+                    The toggle shows a brand dot when a non-Auto value
+                    survives a collapse, so the operator knows their
+                    picks haven't been lost. */}
                 {(() => {
                   const isExpanded = expandedRows.has(i);
-                  const hasCustom = !!(entry.font || entry.concept || entry.movementStyle);
+                  const hasFontCustom = !!entry.font;
+                  const hasAutoCustom = !!(entry.concept || entry.movementStyle);
+                  const hasCustom =
+                    bgMode === "auto" ? (hasFontCustom || hasAutoCustom) : hasFontCustom;
                   return (
                     <button
                       type="button"
@@ -544,30 +598,34 @@ export default function UploadZone({
                 })()}
                 {expandedRows.has(i) && (
                   <>
-                    <div className="flex items-center gap-2 pt-1">
-                      <span className="text-[11px] text-gray-600 shrink-0">
-                        {t("upload.concept_label") || "Concepto:"}
-                      </span>
-                      <Listbox
-                        value={entry.concept || ""}
-                        onChange={(v) => updateField(i, "concept", v)}
-                        options={CONCEPTS}
-                        className="flex-1"
-                        ariaLabel={t("upload.concept_label") || "Concepto"}
-                      />
-                    </div>
-                    <div className="flex items-center gap-2 pt-1">
-                      <span className="text-[11px] text-gray-600 shrink-0">
-                        {t("upload.movement_label") || "Movimiento:"}
-                      </span>
-                      <Listbox
-                        value={entry.movementStyle || ""}
-                        onChange={(v) => updateField(i, "movementStyle", v)}
-                        options={MOVEMENT_STYLES}
-                        className="flex-1"
-                        ariaLabel={t("upload.movement_label") || "Movimiento"}
-                      />
-                    </div>
+                    {bgMode === "auto" && (
+                      <>
+                        <div className="flex items-center gap-2 pt-1">
+                          <span className="text-[11px] text-gray-600 shrink-0">
+                            {t("upload.concept_label") || "Concepto:"}
+                          </span>
+                          <Listbox
+                            value={entry.concept || ""}
+                            onChange={(v) => updateField(i, "concept", v)}
+                            options={CONCEPTS}
+                            className="flex-1"
+                            ariaLabel={t("upload.concept_label") || "Concepto"}
+                          />
+                        </div>
+                        <div className="flex items-center gap-2 pt-1">
+                          <span className="text-[11px] text-gray-600 shrink-0">
+                            {t("upload.movement_label") || "Movimiento:"}
+                          </span>
+                          <Listbox
+                            value={entry.movementStyle || ""}
+                            onChange={(v) => updateField(i, "movementStyle", v)}
+                            options={MOVEMENT_STYLES}
+                            className="flex-1"
+                            ariaLabel={t("upload.movement_label") || "Movimiento"}
+                          />
+                        </div>
+                      </>
+                    )}
                     <div className="flex items-center gap-2 pt-1">
                       <span className="text-[11px] text-gray-600 shrink-0">
                         {t("upload.font_label") || "Tipografía:"}
@@ -580,6 +638,12 @@ export default function UploadZone({
                         ariaLabel={t("upload.font_label") || "Tipografía"}
                       />
                     </div>
+                    {bgMode !== "auto" && (
+                      <p className="text-[11px] text-ink-secondary pt-1">
+                        {t("upload.fields_baked_into_bg")
+                          || "Concepto y movimiento están horneados en el fondo elegido."}
+                      </p>
+                    )}
                   </>
                 )}
               </div>
@@ -642,47 +706,102 @@ export default function UploadZone({
             </div>
           )}
 
-          {/* Library mode */}
-          {bgMode === "library" && (
-            <div>
-              {libraryBgs.length === 0 ? (
-                <div className="glass rounded-card px-4 py-6 text-center">
-                  <p className="text-xs text-gray-500">{t("upload.bg_library_empty") || "No pre-approved backgrounds available. Ask admin to upload some."}</p>
-                </div>
-              ) : (
-                <div className="grid grid-cols-3 gap-2 max-h-48 overflow-y-auto pr-1">
-                  {libraryBgs.map((bg) => (
-                    <button
-                      key={bg.id}
-                      onClick={() => { onBackgroundId?.(bg.id); onBackgroundFile?.(null); }}
-                      className={`rounded-xl overflow-hidden border-2 transition-all ${
-                        backgroundId === bg.id ? "border-brand shadow-glow" : "border-transparent hover:border-white/10"
-                      }`}
-                    >
-                      <div className="aspect-video bg-black/30">
-                        {bg.file_type === "mp4" ? (
-                          <video
-                            src={`${API}/backgrounds/${bg.id}/preview?${tokenParam()}`}
-                            className="w-full h-full object-cover"
-                            muted autoPlay loop playsInline
-                          />
-                        ) : (
-                          <img
-                            src={`${API}/backgrounds/${bg.id}/preview?${tokenParam()}`}
-                            className="w-full h-full object-cover"
-                            alt={bg.name}
-                          />
-                        )}
-                      </div>
-                      <div className="px-2 py-1.5 bg-surface-1">
-                        <p className="text-[11px] text-white truncate">{bg.name}</p>
-                      </div>
-                    </button>
-                  ))}
-                </div>
-              )}
-            </div>
-          )}
+          {/* Library mode — full-width grid + asset_type filter chips
+              + hover-to-play on video thumbs. Tags carry the
+              concept,asset_type pair (e.g. "naturaleza,image") so
+              client-side filter is just a substring check. */}
+          {bgMode === "library" && (() => {
+            const FILTERS = [
+              { id: "all",             label: t("upload.library_filter_all")       || "Todos",            match: () => true },
+              { id: "image",           label: t("upload.library_filter_images")    || "Imágenes",         match: (b) => b.file_type === "jpg" || b.file_type === "png" },
+              { id: "video_cinematic", label: t("upload.library_filter_cinematic") || "Cinematográfico", match: (b) => (b.tags || []).includes("video_cinematic") },
+              { id: "video_simple",    label: t("upload.library_filter_animated")  || "Animado",          match: (b) => (b.tags || []).includes("video_simple") },
+            ];
+            const counts = FILTERS.reduce((acc, f) => {
+              acc[f.id] = libraryBgs.filter(f.match).length;
+              return acc;
+            }, {});
+            const visible = libraryBgs.filter(
+              (FILTERS.find((f) => f.id === libraryFilter) || FILTERS[0]).match
+            );
+            return (
+              <div>
+                {libraryBgs.length === 0 ? (
+                  <div className="rounded-card bg-surface-2/40 ring-1 ring-white/[0.04] px-4 py-6 text-center">
+                    <p className="text-xs text-gray-500">{t("upload.bg_library_empty") || "No pre-approved backgrounds available. Ask admin to upload some."}</p>
+                  </div>
+                ) : (
+                  <>
+                    {/* Filter chips — match the History pill style. */}
+                    <div className="flex flex-wrap gap-2 mb-3">
+                      {FILTERS.filter((f) => f.id === "all" || counts[f.id] > 0).map((f) => (
+                        <button
+                          key={f.id}
+                          type="button"
+                          onClick={() => setLibraryFilter(f.id)}
+                          className={`flex items-center gap-2 h-8 px-3 rounded-full text-[11px] font-medium transition-all ${
+                            libraryFilter === f.id
+                              ? "bg-brand/15 text-brand-light ring-1 ring-brand/40"
+                              : "bg-surface-2/40 text-ink-secondary ring-1 ring-white/[0.04] hover:ring-white/[0.08] hover:text-white"
+                          }`}
+                        >
+                          {f.label}
+                          <span className={`text-[10px] tabular-nums ${libraryFilter === f.id ? "text-brand-light/80" : "text-gray-500"}`}>
+                            {counts[f.id]}
+                          </span>
+                        </button>
+                      ))}
+                    </div>
+                    {/* Full-width grid; bigger thumbs at all sizes. */}
+                    <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-4 gap-3">
+                      {visible.map((bg) => {
+                        const selected = backgroundId === bg.id;
+                        return (
+                          <button
+                            key={bg.id}
+                            onClick={() => { onBackgroundId?.(bg.id); onBackgroundFile?.(null); }}
+                            className={`rounded-card overflow-hidden text-left group bg-surface-2/40 transition-all ${
+                              selected
+                                ? "ring-2 ring-brand shadow-glow"
+                                : "ring-1 ring-white/[0.04] hover:ring-white/[0.10] hover:bg-surface-2/70"
+                            }`}
+                          >
+                            <div className="aspect-video bg-black/30 relative">
+                              {bg.file_type === "mp4" ? (
+                                <video
+                                  src={`${API}/backgrounds/${bg.id}/preview?${tokenParam()}`}
+                                  className="w-full h-full object-cover"
+                                  preload="metadata"
+                                  muted loop playsInline
+                                  onMouseEnter={(e) => { e.currentTarget.play().catch(() => {}); }}
+                                  onMouseLeave={(e) => { e.currentTarget.pause(); e.currentTarget.currentTime = 0; }}
+                                />
+                              ) : (
+                                <img
+                                  src={`${API}/backgrounds/${bg.id}/preview?${tokenParam()}`}
+                                  className="w-full h-full object-cover group-hover:scale-[1.02] transition-transform duration-500"
+                                  alt={bg.name}
+                                />
+                              )}
+                              {selected && (
+                                <span className="absolute top-2 right-2 inline-flex items-center gap-1 px-2 py-0.5 rounded-full bg-brand text-white text-[10px] font-semibold uppercase tracking-wider shadow">
+                                  <svg className="w-3 h-3" fill="none" stroke="currentColor" strokeWidth="3" viewBox="0 0 24 24"><polyline points="20 6 9 17 4 12" /></svg>
+                                  {t("upload.bg_selected") || "Seleccionado"}
+                                </span>
+                              )}
+                            </div>
+                            <div className="px-3 py-2">
+                              <p className="text-[12px] text-white truncate">{bg.name}</p>
+                            </div>
+                          </button>
+                        );
+                      })}
+                    </div>
+                  </>
+                )}
+              </div>
+            );
+          })()}
 
           {/* Custom upload mode */}
           {bgMode === "custom" && (
@@ -759,25 +878,73 @@ export default function UploadZone({
     </>
   );
 
+  // Summary line for the sticky CTA bar.
+  const summaryParts = [];
+  if (files.length > 0) {
+    summaryParts.push(`${files.length} ${files.length === 1 ? t("upload.file") : t("upload.files")}`);
+  }
+  summaryParts.push(deliveryProfile === "youtube" ? "MP4 1080p" : `ProRes ${umgFrameSize}`);
+  if (bgMode === "library" && backgroundId) {
+    const sel = libraryBgs.find((b) => b.id === backgroundId);
+    if (sel) summaryParts.push(sel.name);
+  } else if (bgMode === "custom" && backgroundFile) {
+    summaryParts.push(backgroundFile.name.length > 28 ? backgroundFile.name.slice(0, 28) + "…" : backgroundFile.name);
+  } else {
+    summaryParts.push(t("upload.bg_auto") || "IA Auto");
+  }
+  const summary = summaryParts.join(" · ");
+
   return (
-    <div>
-      <div className="lg:grid lg:grid-cols-5 lg:gap-4 lg:items-start">
-        {/* LEFT (lg) — primary action: file drop + per-track rows.
-            On mobile this stacks first, ABOVE the right column. */}
-        <div className="lg:col-span-3 space-y-3">
-          {_dropZone}
-          {_filesBlock}
-        </div>
-        {/* RIGHT (lg) — batch-wide settings: delivery profile, movement
-            gallery, background picker. On mobile, stacks AFTER the left
-            column. The mt-3 lg:mt-0 keeps spacing consistent across both
-            layouts (gap-4 only applies in grid mode). */}
-        <div className="lg:col-span-2 space-y-3 mt-3 lg:mt-0">
-          {_deliveryBlock}
-          {_galleryBlock}
-          {_bgBlock}
-        </div>
+    <div className="w-full max-w-4xl mx-auto pb-28">
+      <div className="space-y-4">
+        {_dropZone}
+        {_filesBlock}
+        {_bgBlock}
+        {files.length > 0 && _deliveryBlock}
       </div>
+
+      {/* Sticky bottom CTA bar — replaces the disconnected buttons that
+          previously lived in App.jsx. Stays visible while the operator
+          scrolls a long batch + gallery, with a live summary so they
+          can verify their picks before submitting. */}
+      {files.length > 0 && (
+        <div className="fixed bottom-0 left-64 right-0 z-30 bg-surface-1/85 backdrop-blur-xl border-t border-white/[0.06] px-8 py-4">
+          <div className="max-w-4xl mx-auto flex items-center gap-4">
+            <div className="flex-1 min-w-0">
+              <p className="text-[10px] uppercase tracking-[0.18em] text-gray-500">
+                {t("upload.batch_summary") || "Lote"}
+              </p>
+              <p className="text-sm text-white truncate mt-0.5">{summary}</p>
+              {!allHaveArtist && (
+                <p className="text-[11px] text-amber-400/80 mt-0.5">
+                  {t("upload.complete_artist") || "Completá el nombre del artista en cada archivo"}
+                </p>
+              )}
+            </div>
+            {onGenerateDirect && (
+              <button
+                onClick={onGenerateDirect}
+                disabled={!allHaveArtist}
+                className="btn-secondary text-xs h-11 px-4 disabled:opacity-40 disabled:cursor-not-allowed"
+              >
+                {t("upload.generate_direct") || "Generar directo"}
+              </button>
+            )}
+            {onStartReview && (
+              <button
+                onClick={onStartReview}
+                disabled={!allHaveArtist}
+                className="btn-primary h-11 px-6 disabled:opacity-40 disabled:cursor-not-allowed"
+              >
+                {t("upload.review_lyrics") || "Revisar lyrics"}
+                <svg className="inline-block ml-1.5 w-4 h-4 -mt-0.5" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
+                  <path d="M5 12h14M12 5l7 7-7 7" />
+                </svg>
+              </button>
+            )}
+          </div>
+        </div>
+      )}
     </div>
   );
 }

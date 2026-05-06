@@ -533,36 +533,20 @@ export default function App() {
                 </div>
               </div>
 
-              <div className="space-y-5">
-                <UploadZone
-                  files={files}
-                  onFiles={setFiles}
-                  onDeliveryChange={setDelivery}
-                  backgroundFile={backgroundFile}
-                  onBackgroundFile={setBackgroundFile}
-                  backgroundId={backgroundId}
-                  onBackgroundId={setBackgroundId}
-                  animateImage={animateImage}
-                  onAnimateImage={setAnimateImage}
-                />
-
-                {allHaveArtist && (
-                  <div className="flex gap-3">
-                    <button onClick={handleStartReview} className="btn-primary flex-1 py-4">
-                      {t("upload.review_lyrics")}
-                    </button>
-                    <button onClick={handleGenerateDirect} className="btn-secondary flex-1 py-4 text-sm">
-                      {t("upload.generate_direct")}
-                    </button>
-                  </div>
-                )}
-
-                {files.length > 0 && !allHaveArtist && (
-                  <p className="text-center text-xs text-amber-400/70">
-                    {t("upload.complete_artist")}
-                  </p>
-                )}
-              </div>
+              <UploadZone
+                files={files}
+                onFiles={setFiles}
+                onDeliveryChange={setDelivery}
+                backgroundFile={backgroundFile}
+                onBackgroundFile={setBackgroundFile}
+                backgroundId={backgroundId}
+                onBackgroundId={setBackgroundId}
+                animateImage={animateImage}
+                onAnimateImage={setAnimateImage}
+                allHaveArtist={allHaveArtist}
+                onStartReview={handleStartReview}
+                onGenerateDirect={handleGenerateDirect}
+              />
             </div>
           )}
 
