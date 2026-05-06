@@ -101,6 +101,12 @@ export default function LyricsEditor({ segments, filename, audioFile, referenceL
   const [editingId, setEditingId] = useState(null);
   const [editValue, setEditValue] = useState("");
 
+  // Global timestamp shift — solves the "desfasaje" case where every
+  // line is offset by the same amount. The slider previews live; the
+  // operator clicks "Aplicar" to bake it into segments.
+  const [shiftOffset, setShiftOffset] = useState(0);
+  const shiftedStart = (seg) => seg.start + shiftOffset;
+
   const startEditTimestamp = (seg) => {
     setEditingId(seg._id);
     setEditValue(formatTimestamp(seg.start));
@@ -132,16 +138,19 @@ export default function LyricsEditor({ segments, filename, audioFile, referenceL
 
   // Active segment: the one whose [start, end] contains currentTime, or
   // the latest one whose start <= currentTime if no segment "owns" the
-  // moment (e.g. instrumental gap).
+  // moment (e.g. instrumental gap). Uses shifted starts so the shift
+  // slider previews row highlighting live.
   const activeId = useMemo(() => {
     let containing = null;
     let lastStarted = null;
     for (const seg of edited) {
-      if (currentTime >= seg.start && currentTime < seg.end) containing = seg;
-      if (currentTime >= seg.start) lastStarted = seg;
+      const start = seg.start + shiftOffset;
+      const end = seg.end + shiftOffset;
+      if (currentTime >= start && currentTime < end) containing = seg;
+      if (currentTime >= start) lastStarted = seg;
     }
     return (containing || lastStarted)?._id ?? null;
-  }, [edited, currentTime]);
+  }, [edited, currentTime, shiftOffset]);
 
   // Auto-scroll the active row into view while playing.
   const lastScrolledIdRef = useRef(null);
@@ -232,8 +241,35 @@ export default function LyricsEditor({ segments, filename, audioFile, referenceL
   }).length;
   const hasSuggestions = pendingSuggestions > 0;
 
+  // Bake the live shift into segments. Clamps to [0, duration] so we
+  // never emit negative starts or push end past audio length.
+  const applyShift = () => {
+    if (shiftOffset === 0) return;
+    setEdited((prev) =>
+      prev.map((seg) => {
+        const segDur = Math.max(0.5, seg.end - seg.start);
+        const newStart = Math.max(0, seg.start + shiftOffset);
+        let newEnd = newStart + segDur;
+        if (duration && newEnd > duration) newEnd = duration;
+        return { ...seg, start: newStart, end: newEnd };
+      }),
+    );
+    setShiftOffset(0);
+  };
+
   const handleApprove = () => {
-    onApprove(edited.map(({ _id, ...rest }) => rest));
+    // Auto-bake any pending shift before approving so the worker
+    // gets the operator's final view.
+    const baked = shiftOffset === 0
+      ? edited
+      : edited.map((seg) => {
+          const segDur = Math.max(0.5, seg.end - seg.start);
+          const newStart = Math.max(0, seg.start + shiftOffset);
+          let newEnd = newStart + segDur;
+          if (duration && newEnd > duration) newEnd = duration;
+          return { ...seg, start: newStart, end: newEnd };
+        });
+    onApprove(baked.map(({ _id, ...rest }) => rest));
   };
 
   const progressPct = duration > 0 ? (currentTime / duration) * 100 : 0;
@@ -350,6 +386,56 @@ export default function LyricsEditor({ segments, filename, audioFile, referenceL
         </div>
       )}
 
+      {/* ─── Global shift control ─────────────────────────────────── */}
+      {audioUrl && (
+        <div className="mb-3 px-3 py-2.5 rounded-card bg-surface-2/40 ring-1 ring-white/[0.04]">
+          <div className="flex items-center gap-3">
+            <div className="shrink-0 flex items-center gap-1.5">
+              <svg className="w-4 h-4 text-ink-secondary" fill="none" stroke="currentColor" strokeWidth="1.8" viewBox="0 0 24 24">
+                <path d="M8 7l-4 5 4 5M16 7l4 5-4 5" strokeLinecap="round" strokeLinejoin="round" />
+              </svg>
+              <span className="text-[11px] text-ink-secondary">
+                {t("editor.shift_label") || "Desfasaje"}
+              </span>
+            </div>
+            <span className="text-[11px] font-mono text-brand-light tabular-nums shrink-0 w-14 text-center">
+              {shiftOffset > 0 ? "+" : ""}{shiftOffset.toFixed(1)}s
+            </span>
+            <input
+              type="range"
+              min="-10"
+              max="10"
+              step="0.1"
+              value={shiftOffset}
+              onChange={(e) => setShiftOffset(parseFloat(e.target.value))}
+              onDoubleClick={() => setShiftOffset(0)}
+              className="flex-1 h-1.5 accent-brand cursor-pointer"
+              aria-label="Desfasaje global"
+            />
+            <button
+              onClick={applyShift}
+              disabled={shiftOffset === 0}
+              className="shrink-0 text-[11px] font-medium px-3 py-1.5 rounded-lg bg-brand/15 text-brand-light
+                ring-1 ring-brand/30 hover:bg-brand/25 disabled:opacity-30 disabled:cursor-not-allowed
+                transition-colors"
+            >
+              {t("editor.shift_apply") || "Aplicar"}
+            </button>
+            <button
+              onClick={() => setShiftOffset(0)}
+              disabled={shiftOffset === 0}
+              className="shrink-0 text-[11px] text-gray-500 hover:text-white px-2 py-1.5
+                disabled:opacity-30 disabled:cursor-not-allowed transition-colors"
+            >
+              {t("editor.shift_reset") || "Reset"}
+            </button>
+          </div>
+          <p className="text-[10px] text-gray-600 mt-1.5 ml-6">
+            {t("editor.shift_hint") || "Arrastra si toda la letra está corrida en el tiempo"}
+          </p>
+        </div>
+      )}
+
       {/* ─── Lyrics list ──────────────────────────────────────────── */}
       <p className="text-[11px] text-gray-600 mb-2 px-1">
         {t("editor.list_hint") || "Click en un tiempo para reproducir desde ahí · doble click para editarlo"}
@@ -386,13 +472,14 @@ export default function LyricsEditor({ segments, filename, audioFile, referenceL
                     />
                   ) : (
                     <button
-                      onClick={() => seekTo(seg.start, true)}
+                      onClick={() => seekTo(Math.max(0, shiftedStart(seg)), true)}
                       onDoubleClick={() => startEditTimestamp(seg)}
                       title={t("editor.timestamp_hint") || "Click: ir al tiempo · Doble click: editar"}
                       className={`text-[11px] font-mono pt-2.5 w-14 shrink-0 text-right transition-colors
+                        ${shiftOffset !== 0 ? "italic" : ""}
                         ${isActive ? "text-brand-light" : "text-gray-600 hover:text-brand-light"}`}
                     >
-                      {formatTimestamp(seg.start)}
+                      {formatTimestamp(Math.max(0, shiftedStart(seg)))}
                     </button>
                   )}
                   <div className="flex-1 min-w-0">

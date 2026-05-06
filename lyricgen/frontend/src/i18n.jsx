@@ -170,6 +170,10 @@ const translations = {
     "editor.coverage_warning": "Letra recuperada automáticamente desde nuestra base de letras. Revisá y aprobá.",
     "editor.list_hint": "Click en un tiempo para reproducir desde ahí · doble click para editarlo",
     "editor.timestamp_hint": "Click: reproducir · Doble click: editar tiempo",
+    "editor.shift_label": "Desfasaje",
+    "editor.shift_hint": "Arrastrá si toda la letra está corrida en el tiempo",
+    "editor.shift_apply": "Aplicar",
+    "editor.shift_reset": "Reset",
 
     // Transcribing
     "transcribe.title": "Transcribiendo lyrics",
@@ -521,6 +525,10 @@ const translations = {
     "editor.coverage_warning": "Lyrics auto-recovered from our lyrics database. Review and approve.",
     "editor.list_hint": "Click a timestamp to play from there · double-click to edit it",
     "editor.timestamp_hint": "Click: play · Double-click: edit time",
+    "editor.shift_label": "Time shift",
+    "editor.shift_hint": "Drag if the whole lyrics are off in time",
+    "editor.shift_apply": "Apply",
+    "editor.shift_reset": "Reset",
 
     "transcribe.title": "Transcribing lyrics",
     "transcribe.subtitle": "Analyzing audio...",
@@ -859,6 +867,10 @@ const translations = {
     "editor.coverage_warning": "Letra recuperada automaticamente da nossa base de letras. Revise e aprove.",
     "editor.list_hint": "Clique em um tempo para tocar a partir daí · clique duplo para editá-lo",
     "editor.timestamp_hint": "Clique: tocar · Clique duplo: editar tempo",
+    "editor.shift_label": "Desfase",
+    "editor.shift_hint": "Arraste se toda a letra está fora de tempo",
+    "editor.shift_apply": "Aplicar",
+    "editor.shift_reset": "Reset",
     "editor.song_of": "de",
 
     "transcribe.title": "Transcrevendo lyrics",
