@@ -1113,24 +1113,45 @@ async def transcribe_endpoint(
         # (no lrclib hit, only Gemini / lyrics.ovh as reference), if
         # Whisper still hallucinates we synthesize segments from the
         # reference text. This is the path El Plan de la Mariposa hits
-        # in some lrclib indexings — without this, hallucinated 3-row
-        # output ships to the editor unrecovered. Mirrors the lrclib-
-        # plain branch's recovery shape so the frontend banner code
-        # works unchanged.
+        # when lrclib times out — without this, hallucinated 3-row
+        # output ships to the editor unrecovered.
+        #
+        # Anchor handling here is more conservative than the lrclib-plain
+        # branch: we did NOT trim a spoken intro from the audio, so any
+        # Whisper anchors that land early can come from a dialogue prefix
+        # reading the lyrics aloud. If all anchors cluster in the first
+        # 25 % of the audio AND the audio is > 2 min AND the reference
+        # has many lines, we drop the anchors and distribute uniformly —
+        # that prevents the "first 3 lyric lines all at 0:00" compression
+        # bug verified on El Plan de la Mariposa - El Riesgo.
         if reference:
             user_dur = await asyncio.to_thread(_audio_duration, tmp_path)
             hallucinated, reason = _detect_hallucination(segments, user_dur)
             if hallucinated and user_dur:
                 anchors = _align_whisper_to_plain(segments, reference)
+                ref_line_count = len([
+                    l for l in reference.splitlines() if l.strip()
+                ])
+                anchors_safe = anchors
+                anchor_action = "kept"
+                if (anchors and user_dur > 120 and ref_line_count > 8
+                        and all(t < user_dur * 0.25 for _, t in anchors)):
+                    # Every anchor sits in the first quarter of the audio
+                    # while the reference has many lines — almost certainly
+                    # a spoken-intro / dialogue prefix that confused
+                    # alignment. Trust uniform over forced compression.
+                    anchors_safe = []
+                    anchor_action = "dropped (intro-cluster)"
                 recovered = _synthesize_segments_from_plain(
-                    reference, user_dur, anchors=anchors,
+                    reference, user_dur, anchors=anchors_safe,
                 )
                 if recovered:
                     src = "gemini_or_lyrics_ovh"
                     print(f"[LYRICS] hallucination detected on fallback "
                           f"path ({reason}) — auto-recovered with "
                           f"{len(recovered)} lines from {src} "
-                          f"({len(anchors)} anchors, dur={user_dur:.1f}s)")
+                          f"({len(anchors)} anchors {anchor_action}, "
+                          f"dur={user_dur:.1f}s)")
                     return {
                         "segments": recovered,
                         "reference_lyrics": reference,

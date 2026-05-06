@@ -858,14 +858,32 @@ def _fetch_lrclib(artist: str, song: str) -> dict | None:
     """
     if not artist or not song:
         return None
+    import requests as _req
+    # Two attempts: lrclib reads can spike >10s under load. Total budget
+    # is ~25s in the worst case, well within the user-perceived bound
+    # for /transcribe (Whisper is the long pole anyway).
+    last_err: Exception | None = None
+    r = None
+    for attempt in range(2):
+        try:
+            r = _req.get(
+                "https://lrclib.net/api/get",
+                params={"artist_name": artist, "track_name": song},
+                timeout=20,
+                headers={"User-Agent": "GenLyAI/1.0 (+https://app.genly.pro)"},
+            )
+            break
+        except Exception as e:  # transient network / timeout
+            last_err = e
+            if attempt == 0:
+                print(f"[LYRICS] lrclib attempt 1 failed ({e.__class__.__name__}: "
+                      f"{str(e)[:80]}); retrying once")
+                continue
+            print(f"[LYRICS] lrclib fetch failed after retry: {e}")
+            return None
+    if r is None:
+        return None
     try:
-        import requests as _req
-        r = _req.get(
-            "https://lrclib.net/api/get",
-            params={"artist_name": artist, "track_name": song},
-            timeout=10,
-            headers={"User-Agent": "GenLyAI/1.0 (+https://app.genly.pro)"},
-        )
         if r.status_code != 200:
             print(f"[LYRICS] lrclib {r.status_code} for {artist!r} - {song!r}")
             return None
