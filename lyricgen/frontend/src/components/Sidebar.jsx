@@ -1,4 +1,5 @@
 import { useI18n } from "../i18n";
+import BrandLockup from "./BrandLockup";
 
 export default function Sidebar({ onNav, activeView, open, onToggle, user, onLogout }) {
   const { t } = useI18n();
@@ -40,12 +41,7 @@ export default function Sidebar({ onNav, activeView, open, onToggle, user, onLog
           locked-up artwork so the brand SVG geometry is preserved. */}
       <div className="flex items-center justify-between px-5 py-5 border-b border-white/[0.04]">
         <div className="flex items-center gap-2.5">
-          <img
-            src="/logo/genly-lockup.svg"
-            alt="GenLy"
-            className="h-7 w-auto select-none"
-            draggable={false}
-          />
+          <BrandLockup size="md" />
           <span className="text-[8px] font-medium text-brand bg-brand/10 px-1.5 py-0.5 rounded-full uppercase tracking-widest">Pro</span>
         </div>
         <button onClick={onToggle} className="text-gray-500 hover:text-white transition-colors">

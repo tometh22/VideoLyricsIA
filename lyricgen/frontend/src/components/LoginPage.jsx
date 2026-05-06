@@ -1,5 +1,6 @@
 import { useState } from "react";
 import { useI18n } from "../i18n";
+import BrandLockup from "./BrandLockup";
 
 const API = import.meta.env.VITE_API_URL || "";
 
@@ -161,12 +162,7 @@ export default function LoginPage({ onLogin, onBack, resetToken, onResetComplete
         {/* Logo — full lockup per brand kit §10 (auth screens use the
             full lockup, not the mark only). */}
         <div className="text-center mb-10">
-          <img
-            src="/logo/genly-lockup.svg"
-            alt="GenLy"
-            className="h-10 w-auto mx-auto mb-5 select-none"
-            draggable={false}
-          />
+          <BrandLockup size="lg" className="justify-center mb-5" />
           <p className="text-sm text-ink-secondary">{t("login.platform")}</p>
         </div>
 

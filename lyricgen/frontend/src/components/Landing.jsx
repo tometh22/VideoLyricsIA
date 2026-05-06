@@ -1,4 +1,5 @@
 import { useI18n } from "../i18n";
+import BrandLockup from "./BrandLockup";
 
 export default function Landing({ onStart, onLogin, isLoggedIn = false }) {
   const { t, lang, setLang } = useI18n();
@@ -72,12 +73,7 @@ export default function Landing({ onStart, onLogin, isLoggedIn = false }) {
         <div className="flex items-center justify-between px-8 py-4 max-w-6xl mx-auto">
           {/* §10 — full lockup in navbar / footer / auth screens.
               Brand SVG geometry is the single source of truth. */}
-          <img
-            src="/logo/genly-lockup.svg"
-            alt="GenLy"
-            className="h-7 w-auto select-none"
-            draggable={false}
-          />
+          <BrandLockup size="md" />
           <div className="hidden md:flex items-center gap-6">
             <a href="#features" className="text-xs text-gray-400 hover:text-white transition-colors">{t("landing.features")}</a>
             <a href="#pricing" className="text-xs text-gray-400 hover:text-white transition-colors">{t("landing.pricing")}</a>
