@@ -3479,13 +3479,21 @@ def generate_lyric_video(
     # Build text clips — each segment gets its own shadow + text
     text_layers = []
 
-    # Title overlay strategy:
-    # - If there's a meaningful instrumental intro (>= 3 s), show the title
-    #   BIG and centered during the intro (the cinematic "drop" feel).
-    # - ALWAYS also show a small top-of-screen stamp for the first 6 s
-    #   regardless of intro length, so songs that start with vocals
-    #   immediately still surface artist + title to the viewer. UMG flagged
-    #   this — branding the cut with the artist is mandatory for them.
+    # Title overlay strategy (rebuilt May 2026 after operator reported
+    # the title card disappearing on songs whose first subtitle starts
+    # at t=0 — typical for spoken-prefix audio where intro Whisper now
+    # captures the dialogue at 0-N seconds. The previous logic gated
+    # the centered title on `first_lyric_start > 3`, so any subtitle
+    # at 0 hid the title entirely):
+    #
+    # - ALWAYS render a prominent title card "ARTIST / Title" at the
+    #   top third of the frame for the first 5 seconds. Top placement
+    #   avoids conflicting with the center-aligned lyric subtitles
+    #   regardless of when the first lyric line starts.
+    # - On songs with a real instrumental intro (>= 3 s of silence
+    #   before vocals), ALSO render the same artist+title BIG and
+    #   centered for the cinematic "drop" feel. Both layers coexist;
+    #   the centered one fades out before the first lyric appears.
     first_lyric_start = segments[0]["start"] if segments else duration
     raw_name = os.path.splitext(os.path.basename(mp3_path))[0]
     title_song = raw_name
@@ -3496,37 +3504,49 @@ def generate_lyric_video(
                  "(Live)", "(Lyrics)"]:
         title_song = title_song.replace(sfx, "").strip()
 
-    if first_lyric_start > 3 and artist:
-        title_end = first_lyric_start - 0.5
-        title_layers = _make_text_clip(
-            f"{artist}\n{title_song}", 0.5, title_end, font, spec=spec
-        )
-        text_layers.extend(title_layers)
-
-    # Top-of-screen stamp — small, semi-transparent, never overlaps the
-    # main lyric line in the center.
     if artist:
+        # 1. Top-third title card — always on for the opening of the
+        #    video. Position is between the very top edge and the
+        #    upper third (~15-22% from top, depending on font size).
         try:
-            stamp_text = f"{artist.upper()}  •  {title_song}"
-            stamp_size = max(24, int(round(36 * spec.text_scale)))
-            stamp = TextClip(
-                stamp_text,
-                fontsize=stamp_size,
+            top_title_text = f"{artist.upper()}\n{title_song}"
+            top_size = max(36, int(round(58 * spec.text_scale)))
+            top_card = TextClip(
+                top_title_text,
+                fontsize=top_size,
                 font=font,
                 color="white",
                 stroke_color="black",
-                stroke_width=max(1, int(round(1.2 * spec.text_scale))),
-                method="label",
-            ).set_opacity(0.85)
-            sw = stamp.size[0]
-            stamp_x = (spec.width - sw) // 2
-            stamp_y = max(20, int(round(40 * spec.text_scale)))
-            stamp = (stamp.set_position((stamp_x, stamp_y))
-                          .set_start(0.3)
-                          .set_end(min(6.0, duration - 0.1)))
-            text_layers.append(stamp)
+                stroke_width=max(1, int(round(1.6 * spec.text_scale))),
+                method="caption",
+                size=(int(round(spec.width * 0.85)), None),
+                align="center",
+            ).set_opacity(0.95)
+            tw, th = top_card.size
+            top_x = (spec.width - tw) // 2
+            top_y = max(40, int(round(spec.height * 0.10)))
+            top_end = min(5.0, max(2.0, duration - 0.1))
+            top_card = (top_card.set_position((top_x, top_y))
+                                 .set_start(0.4)
+                                 .set_end(top_end))
+            text_layers.append(top_card)
         except Exception as e:
-            print(f"[TITLE] top-stamp render failed ({e}); continuing without it")
+            print(f"[TITLE] top title card failed ({e}); continuing without it")
+
+        # 2. Centered "drop" title — only when the first lyric leaves
+        #    real room. Same artist+title text; bigger font (centered
+        #    via _make_text_clip) so the eye lands there during the
+        #    silent intro. Fades out just before the first lyric.
+        if first_lyric_start > 3:
+            title_end = first_lyric_start - 0.5
+            try:
+                title_layers = _make_text_clip(
+                    f"{artist}\n{title_song}", 0.5, title_end,
+                    font, spec=spec,
+                )
+                text_layers.extend(title_layers)
+            except Exception as e:
+                print(f"[TITLE] center title failed ({e}); continuing")
 
     for seg in segments:
         layers = _make_text_clip(seg["text"], seg["start"], seg["end"], font, spec=spec)

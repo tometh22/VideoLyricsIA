@@ -168,6 +168,8 @@ const translations = {
     "editor.lines": "líneas",
     "editor.song_of": "de",
     "editor.coverage_warning": "Letra recuperada automáticamente desde nuestra base de letras. Revisá y aprobá.",
+    "editor.list_hint": "Click en un tiempo para reproducir desde ahí · doble click para editarlo",
+    "editor.timestamp_hint": "Click: reproducir · Doble click: editar tiempo",
 
     // Transcribing
     "transcribe.title": "Transcribiendo lyrics",
@@ -517,6 +519,8 @@ const translations = {
     "editor.lines": "lines",
     "editor.song_of": "of",
     "editor.coverage_warning": "Lyrics auto-recovered from our lyrics database. Review and approve.",
+    "editor.list_hint": "Click a timestamp to play from there · double-click to edit it",
+    "editor.timestamp_hint": "Click: play · Double-click: edit time",
 
     "transcribe.title": "Transcribing lyrics",
     "transcribe.subtitle": "Analyzing audio...",
@@ -853,6 +857,8 @@ const translations = {
     "editor.approve_generate": "Aprovar e gerar",
     "editor.lines": "linhas",
     "editor.coverage_warning": "Letra recuperada automaticamente da nossa base de letras. Revise e aprove.",
+    "editor.list_hint": "Clique em um tempo para tocar a partir daí · clique duplo para editá-lo",
+    "editor.timestamp_hint": "Clique: tocar · Clique duplo: editar tempo",
     "editor.song_of": "de",
 
     "transcribe.title": "Transcrevendo lyrics",

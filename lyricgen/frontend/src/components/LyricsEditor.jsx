@@ -15,6 +15,27 @@ function formatTimestamp(seconds) {
   return `${m}:${s.toString().padStart(2, "0")}.${ms}`;
 }
 
+// Parse "M:SS.t", "M:SS", or a raw seconds value into a non-negative
+// float. Returns null when the string can't be interpreted, so the
+// caller can decide to ignore the edit instead of writing garbage.
+function parseTimestamp(str) {
+  if (str == null) return null;
+  const trimmed = String(str).trim().replace(",", ".");
+  if (!trimmed) return null;
+  if (trimmed.includes(":")) {
+    const parts = trimmed.split(":");
+    if (parts.length !== 2) return null;
+    const m = parseInt(parts[0], 10);
+    const s = parseFloat(parts[1]);
+    if (Number.isNaN(m) || Number.isNaN(s)) return null;
+    if (m < 0 || s < 0 || s >= 60) return null;
+    return m * 60 + s;
+  }
+  const v = parseFloat(trimmed);
+  if (Number.isNaN(v) || v < 0) return null;
+  return v;
+}
+
 function findSuggestion(whisperText, refLines, startIdx) {
   if (!refLines.length) return null;
   const wLower = whisperText.toLowerCase().trim();
@@ -73,6 +94,41 @@ export default function LyricsEditor({ segments, filename, audioFile, referenceL
   const [isPlaying, setIsPlaying] = useState(false);
   const [currentTime, setCurrentTime] = useState(0);
   const [duration, setDuration] = useState(0);
+
+  // Inline timestamp edit state. Only one row can be in edit mode at a
+  // time; clicking a different row's timestamp swaps the active editor.
+  // Single-click on a timestamp seeks; double-click switches to edit.
+  const [editingId, setEditingId] = useState(null);
+  const [editValue, setEditValue] = useState("");
+
+  const startEditTimestamp = (seg) => {
+    setEditingId(seg._id);
+    setEditValue(formatTimestamp(seg.start));
+  };
+  const cancelEditTimestamp = () => {
+    setEditingId(null);
+    setEditValue("");
+  };
+  const commitEditTimestamp = (seg) => {
+    const parsed = parseTimestamp(editValue);
+    if (parsed == null) {
+      // Bad input — silently revert.
+      cancelEditTimestamp();
+      return;
+    }
+    const newStart = Math.max(0, Math.min(parsed, duration || parsed));
+    setEdited((prev) => prev.map((s) => {
+      if (s._id !== seg._id) return s;
+      // Preserve segment duration when the operator nudges the start
+      // unless that would push end past audio_duration.
+      const segDur = Math.max(0.5, s.end - s.start);
+      let newEnd = newStart + segDur;
+      if (duration && newEnd > duration) newEnd = duration;
+      return { ...s, start: newStart, end: newEnd };
+    }));
+    setEditingId(null);
+    setEditValue("");
+  };
 
   // Active segment: the one whose [start, end] contains currentTime, or
   // the latest one whose start <= currentTime if no segment "owns" the
@@ -295,6 +351,9 @@ export default function LyricsEditor({ segments, filename, audioFile, referenceL
       )}
 
       {/* ─── Lyrics list ──────────────────────────────────────────── */}
+      <p className="text-[11px] text-gray-600 mb-2 px-1">
+        {t("editor.list_hint") || "Click en un tiempo para reproducir desde ahí · doble click para editarlo"}
+      </p>
       <div className="relative">
         <div className="absolute bottom-0 left-0 right-0 h-12 bg-gradient-to-t from-surface to-transparent pointer-events-none z-10 rounded-b-2xl" />
         <div ref={listRef} className="space-y-1 max-h-[55vh] overflow-y-auto pr-1 pb-8">
@@ -310,14 +369,32 @@ export default function LyricsEditor({ segments, filename, audioFile, referenceL
                 className={`group rounded-xl transition-colors ${isActive ? "bg-brand/[0.07] ring-1 ring-brand/25" : ""}`}
               >
                 <div className="flex items-start gap-2 p-1">
-                  <button
-                    onClick={() => seekTo(seg.start, true)}
-                    title="Reproducir desde aquí"
-                    className={`text-[11px] font-mono pt-2.5 w-14 shrink-0 text-right transition-colors
-                      ${isActive ? "text-brand-light" : "text-gray-600 hover:text-brand-light"}`}
-                  >
-                    {formatTimestamp(seg.start)}
-                  </button>
+                  {editingId === seg._id ? (
+                    <input
+                      type="text"
+                      autoFocus
+                      value={editValue}
+                      onChange={(e) => setEditValue(e.target.value)}
+                      onBlur={() => commitEditTimestamp(seg)}
+                      onKeyDown={(e) => {
+                        if (e.key === "Enter") { e.preventDefault(); commitEditTimestamp(seg); }
+                        else if (e.key === "Escape") { e.preventDefault(); cancelEditTimestamp(); }
+                      }}
+                      className="text-[11px] font-mono pt-2 w-14 shrink-0 text-right bg-surface-1
+                        border border-brand/40 focus:border-brand outline-none rounded-md px-1
+                        text-brand-light"
+                    />
+                  ) : (
+                    <button
+                      onClick={() => seekTo(seg.start, true)}
+                      onDoubleClick={() => startEditTimestamp(seg)}
+                      title={t("editor.timestamp_hint") || "Click: ir al tiempo · Doble click: editar"}
+                      className={`text-[11px] font-mono pt-2.5 w-14 shrink-0 text-right transition-colors
+                        ${isActive ? "text-brand-light" : "text-gray-600 hover:text-brand-light"}`}
+                    >
+                      {formatTimestamp(seg.start)}
+                    </button>
+                  )}
                   <div className="flex-1 min-w-0">
                     <input
                       type="text"
