@@ -787,7 +787,7 @@ async def transcribe_endpoint(
         #                          to auto-align)
         from pipeline import (
             _fetch_lrclib, _lrc_to_segments, _audio_duration,
-            _slice_audio_prefix, _verify_lrclib_alignment,
+            _slice_audio_prefix, _slice_audio_window, _verify_lrclib_alignment,
             _detect_hallucination, _synthesize_segments_from_plain,
             _align_whisper_to_plain,
         )
@@ -903,21 +903,68 @@ async def transcribe_endpoint(
                 print(f"[LYRICS] lrclib plain hit ({len(plain)} chars) — "
                       f"running Whisper for timestamps (lyrics_hint primed), "
                       f"skipping Gemini")
-                segments = await loop.run_in_executor(
-                    None, transcribe, tmp_path, lang, plain,
-                )
 
-                # Auto-recover: when Whisper hallucinates (3 segments for a
-                # 4-min song, instrumental-passage mega-segments, synonym
-                # loops), fall back to distributing lrclib plain lyrics
-                # across the audio duration. We use the Whisper segments
-                # that DID survive the per-segment plausibility check as
-                # time anchors — fuzzy-matched against plain lines via
-                # token-set Jaccard. Each anchor pins a lyric line to a
-                # real audio cue; the synthesizer interpolates between
-                # anchors instead of distributing uniformly. Result: the
-                # operator never has to nudge timestamps manually.
+                # Pre-Whisper intro trim. The "Video Oficial" cuts of many
+                # tracks add 30-90s of dialogue / extra music at the start
+                # that the studio version (which lrclib indexes) doesn't
+                # have. Feeding all of that to Whisper poisons its context
+                # and causes it to hallucinate or under-segment the actual
+                # song (verified end-to-end on "El Plan de la Mariposa —
+                # El Riesgo": 12 segments on full audio vs 19 on trimmed).
+                # When the user's audio is materially longer than lrclib's
+                # studio length, we slice off the prefix and only send the
+                # body to Whisper, then shift the returned timestamps back
+                # so they align with the user's full file in the editor.
                 user_dur = await asyncio.to_thread(_audio_duration, tmp_path)
+                intro_offset = 0.0
+                transcribe_path = tmp_path
+                trimmed_path = None
+                if (lrc_dur and user_dur
+                        and 3.0 < (user_dur - lrc_dur) <= 120.0):
+                    intro_offset = float(user_dur - lrc_dur)
+                    candidate = os.path.join(tmp_dir, "body_only.mp3")
+                    sliced = await asyncio.to_thread(
+                        _slice_audio_window, tmp_path, candidate,
+                        intro_offset, user_dur - intro_offset,
+                    )
+                    if sliced:
+                        transcribe_path = candidate
+                        trimmed_path = candidate
+                        print(f"[LYRICS] trimmed {intro_offset:.1f}s intro "
+                              f"before Whisper "
+                              f"(user={user_dur:.1f}s, lrclib={lrc_dur:.1f}s)")
+                    else:
+                        intro_offset = 0.0  # slice failed — fall through
+
+                try:
+                    segments = await loop.run_in_executor(
+                        None, transcribe, transcribe_path, lang, plain,
+                    )
+                finally:
+                    if trimmed_path:
+                        try:
+                            os.unlink(trimmed_path)
+                        except OSError:
+                            pass
+
+                # Shift Whisper timestamps back into full-audio frame so
+                # subtitles appear at the right moment in the user's file.
+                if intro_offset > 0:
+                    segments = [
+                        {**s,
+                         "start": float(s["start"]) + intro_offset,
+                         "end":   float(s["end"])   + intro_offset}
+                        for s in segments
+                    ]
+
+                # Auto-recover: when Whisper still hallucinates after the
+                # trim (instrumental-passage mega-segments, synonym loops,
+                # implausibly low count), fall back to distributing lrclib
+                # plain lyrics across the audio duration. The Whisper
+                # segments that DID survive the per-segment plausibility
+                # check anchor the distribution via fuzzy-matched line
+                # indices, so each lyric line lands near where Whisper
+                # actually heard it instead of floating uniformly.
                 hallucinated, reason = _detect_hallucination(segments, user_dur)
                 if hallucinated and user_dur:
                     anchors = _align_whisper_to_plain(segments, plain)
