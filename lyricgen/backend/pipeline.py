@@ -1386,10 +1386,59 @@ def _synthesize_segments_from_plain(plain: str,
     return segments
 
 
+def _detect_speech_regions(audio_path: str,
+                            top_db: float = 30.0,
+                            min_region_s: float = 0.4,
+                            merge_gap_s: float = 0.5,
+                            ) -> list[tuple[float, float]]:
+    """Return non-silent intervals from the audio, in seconds.
+
+    Uses librosa's energy-based VAD (`effects.split` on the loaded
+    waveform with a `top_db` threshold below the peak). Generic — works
+    for any song. Output is what we use to decide WHERE in the audio
+    a vocal subtitle could legitimately be placed; gap-fill avoids
+    placing reference lines inside long instrumental silences.
+
+    Defaults tuned for music (top_db=30 keeps quiet vocals in but drops
+    drum-kit-only regions). Returns [] on any failure so the caller
+    can fall back to time-uniform distribution.
+    """
+    try:
+        import librosa
+        import numpy as np
+        # Mono, native rate sufficient for VAD; 22 kHz is librosa default.
+        y, sr = librosa.load(audio_path, sr=22050, mono=True)
+        intervals = librosa.effects.split(y, top_db=top_db)
+        regions: list[tuple[float, float]] = []
+        for start_sample, end_sample in intervals:
+            start = float(start_sample) / sr
+            end = float(end_sample) / sr
+            if end - start < min_region_s:
+                continue  # too short — likely click/spike, not speech
+            regions.append((start, end))
+        # Merge regions separated by very small gaps (single breath
+        # between two phrases) so consecutive vocal phrases don't get
+        # split into N micro-regions.
+        if not regions:
+            return []
+        merged: list[tuple[float, float]] = [regions[0]]
+        for start, end in regions[1:]:
+            prev_start, prev_end = merged[-1]
+            if start - prev_end <= merge_gap_s:
+                merged[-1] = (prev_start, end)
+            else:
+                merged.append((start, end))
+        return merged
+    except Exception as e:
+        print(f"[VAD] _detect_speech_regions failed ({e}); skipping VAD")
+        return []
+
+
 def _fill_gaps_with_reference(whisper_segments: list[dict],
                                reference: str,
                                audio_duration: float,
                                coverage_threshold: float = 0.7,
+                               audio_path: str | None = None,
                                ) -> list[dict] | None:
     """Generic recovery for outlier songs: keep Whisper's plausible
     segments, then fill the uncovered time intervals with lines from
@@ -1443,19 +1492,53 @@ def _fill_gaps_with_reference(whisper_segments: list[dict],
         # set; caller falls back to whatever default it had.
         return kept or None
 
-    # Build the gap list. A gap is any [t1, t2] interval >= 1 s long
-    # that doesn't overlap with a kept segment. Always seed with a
-    # leading gap from t=0 if the first kept starts after 0.
+    # Build the gap list. We start from one of two sources:
+    #   - VAD-detected SPEECH regions (preferred when audio_path is
+    #     supplied) — distributing reference lines only where someone
+    #     is actually singing/speaking. This is the right model for
+    #     songs with long instrumental sections where uniform fill
+    #     would land subtitles in silence (verified failure mode for
+    #     "El Plan de la Mariposa - El Riesgo": 73 s spoken intro,
+    #     instrumental gaps, then sung body).
+    #   - Whole-audio gaps (legacy path) when no audio_path is given.
+    # Each "gap" then has the time spans of any kept Whisper segments
+    # subtracted from it so we don't double up subtitles in the same
+    # window.
+    speech_regions: list[tuple[float, float]] = []
+    if audio_path:
+        speech_regions = _detect_speech_regions(audio_path)
+        if speech_regions:
+            print(f"[VAD] {len(speech_regions)} speech regions detected; "
+                  f"reference will be distributed inside them")
+    if not speech_regions:
+        speech_regions = [(0.0, float(audio_duration))]
+
+    # Subtract kept Whisper time-windows from each speech region so
+    # we don't synthesize over a real Whisper segment.
+    kept_intervals = sorted(
+        (float(s["start"]), float(s["end"])) for s in kept
+    )
+
+    def _subtract_kept(start: float, end: float) -> list[tuple[float, float]]:
+        out: list[tuple[float, float]] = []
+        cur = start
+        for ks, ke in kept_intervals:
+            if ke <= cur or ks >= end:
+                continue
+            if ks > cur:
+                out.append((cur, min(ks, end)))
+            cur = max(cur, ke)
+            if cur >= end:
+                break
+        if cur < end:
+            out.append((cur, end))
+        return out
+
     gaps: list[tuple[float, float]] = []
-    cursor = 0.0
-    for s in kept:
-        s_start = float(s["start"])
-        s_end = float(s["end"])
-        if s_start > cursor + 1.0:
-            gaps.append((cursor, s_start))
-        cursor = max(cursor, s_end)
-    if cursor < float(audio_duration) - 1.0:
-        gaps.append((cursor, float(audio_duration)))
+    for region_start, region_end in speech_regions:
+        for sub_start, sub_end in _subtract_kept(region_start, region_end):
+            if sub_end - sub_start >= 1.0:
+                gaps.append((sub_start, sub_end))
 
     if not gaps:
         return kept

@@ -1134,6 +1134,7 @@ async def transcribe_endpoint(
             if hallucinated and user_dur:
                 merged = _fill_gaps_with_reference(
                     segments, reference, user_dur,
+                    audio_path=tmp_path,
                 )
                 if merged is not None:
                     src = "gemini_or_lyrics_ovh"

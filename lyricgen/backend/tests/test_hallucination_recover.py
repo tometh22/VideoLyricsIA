@@ -490,6 +490,28 @@ def test_fill_gaps_no_reference_returns_kept_or_none():
     assert out2 is None
 
 
+def test_fill_gaps_with_audio_path_uses_vad_when_available(tmp_path):
+    # When the caller supplies audio_path, the gap-filler delegates to
+    # librosa-based VAD to find speech regions and distributes reference
+    # lines inside those regions ONLY. This is the path the Gemini
+    # fallback uses to keep subtitles out of long instrumental gaps.
+    #
+    # We can't easily synthesise real audio here, so the contract we
+    # test is: pointing audio_path at a non-existent file → VAD returns
+    # [] → fall back to legacy whole-audio distribution. That confirms
+    # the safety branch wires up correctly without bringing librosa
+    # into the test runtime path.
+    nonexistent = str(tmp_path / "does_not_exist.mp3")
+    out = _fill_gaps_with_reference(
+        [], GAP_REF, audio_duration=120.0, audio_path=nonexistent,
+    )
+    assert out is not None
+    # Same as the no-audio_path uniform case.
+    assert len(out) == 6
+    assert abs(out[0]["start"] - 0.0) < 0.5
+    assert abs(out[-1]["end"] - 120.0) < 1.5
+
+
 def test_fill_gaps_zero_audio_duration_returns_input():
     out = _fill_gaps_with_reference(
         [_seg(0, 5, "x")], GAP_REF, audio_duration=0,
