@@ -874,6 +874,27 @@ def _fetch_lrclib(artist: str, song: str) -> dict | None:
         synced = (data.get("syncedLyrics") or "").strip() or None
         if not plain and not synced:
             return None
+        # Some lrclib records expose only `syncedLyrics` (different bots
+        # populate the two columns independently). The downstream auto-
+        # recover code in /transcribe gates on `if plain:` so when plain
+        # is missing the recovery branch is unreachable. Derive plain
+        # from synced by stripping the `[mm:ss.xx]` timestamps so the
+        # recovery path always has a usable reference. This keeps El
+        # Plan de la Mariposa - El Riesgo (which has only syncedLyrics
+        # in some lrclib records) from falling all the way through to
+        # the no-recovery Gemini fallback.
+        if not plain and synced:
+            import re as _re
+            ts_re = _re.compile(r"^\s*(?:\[\d+:\d+(?:[.:]\d+)?\]\s*)+")
+            derived: list[str] = []
+            for line in synced.splitlines():
+                stripped = ts_re.sub("", line).strip()
+                if stripped:
+                    derived.append(stripped)
+            if derived:
+                plain = "\n".join(derived)
+                print(f"[LYRICS] lrclib derived plain from synced "
+                      f"({len(plain)} chars, {len(derived)} lines)")
         return {
             "plain": plain,
             "synced": synced,

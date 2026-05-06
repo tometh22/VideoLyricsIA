@@ -1059,6 +1059,35 @@ async def transcribe_endpoint(
             except Exception:
                 pass
 
+        # Defense-in-depth recovery: even on this terminal fallback path
+        # (no lrclib hit, only Gemini / lyrics.ovh as reference), if
+        # Whisper still hallucinates we synthesize segments from the
+        # reference text. This is the path El Plan de la Mariposa hits
+        # in some lrclib indexings — without this, hallucinated 3-row
+        # output ships to the editor unrecovered. Mirrors the lrclib-
+        # plain branch's recovery shape so the frontend banner code
+        # works unchanged.
+        if reference:
+            user_dur = await asyncio.to_thread(_audio_duration, tmp_path)
+            hallucinated, reason = _detect_hallucination(segments, user_dur)
+            if hallucinated and user_dur:
+                anchors = _align_whisper_to_plain(segments, reference)
+                recovered = _synthesize_segments_from_plain(
+                    reference, user_dur, anchors=anchors,
+                )
+                if recovered:
+                    src = "gemini_or_lyrics_ovh"
+                    print(f"[LYRICS] hallucination detected on fallback "
+                          f"path ({reason}) — auto-recovered with "
+                          f"{len(recovered)} lines from {src} "
+                          f"({len(anchors)} anchors, dur={user_dur:.1f}s)")
+                    return {
+                        "segments": recovered,
+                        "reference_lyrics": reference,
+                        "coverage_warning": True,
+                        "recovery_source": src,
+                    }
+
         return {"segments": segments, "reference_lyrics": reference}
     finally:
         try:
