@@ -206,28 +206,39 @@ export default function JobDetail({ job, onBack, onJobUpdate }) {
     } catch {}
   };
   // ProRes is generated lazily server-side from the existing MP4 the
-  // first time it's requested (~60-120 s of ffmpeg transcode). The
-  // browser's native download UI shows a spinner during the wait;
-  // we additionally show a short hint toast so the operator knows
-  // why the click feels slow on this run only. Subsequent clicks are
-  // instant because the .mov is cached on disk + R2.
-  const [proResHint, setProResHint] = useState(false);
-  const downloadProResMaster = async () => {
-    setProResHint(true);
+  // first time it's requested (~60-120 s of ffmpeg transcode). To avoid
+  // the "browser stuck" perception while ffmpeg runs, we fetch the .mov
+  // ourselves (so the toast can stay up for the full duration), then
+  // turn the response into a Blob URL and trigger a normal anchor
+  // download. The toast persists until the bytes arrive or fetch errors.
+  // Subsequent downloads of the same .mov hit the R2 cache (instant).
+  const [proResHint, setProResHint] = useState(null);
+  const fetchProResAndSave = async (fileType, suggestedName) => {
+    setProResHint(fileType);
     try {
-      const url = await getDownloadUrl(job.job_id, "umg_master");
-      window.location.href = url;
-    } catch {}
-    setTimeout(() => setProResHint(false), 8000);
+      const url = await getDownloadUrl(job.job_id, fileType);
+      const res = await fetch(url);
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const blob = await res.blob();
+      const blobUrl = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = blobUrl;
+      a.download = suggestedName;
+      a.click();
+      // Give the browser a beat to pick the blob up before revoking.
+      setTimeout(() => URL.revokeObjectURL(blobUrl), 60_000);
+    } catch (err) {
+      console.error("ProRes download failed:", err);
+      alert(t("detail.prores_failed") || "No se pudo generar el ProRes. Intentá de nuevo en unos segundos.");
+    } finally {
+      setProResHint(null);
+    }
   };
-  const downloadProResShort = async () => {
-    setProResHint(true);
-    try {
-      const url = await getDownloadUrl(job.job_id, "umg_short");
-      window.location.href = url;
-    } catch {}
-    setTimeout(() => setProResHint(false), 8000);
-  };
+  const songSlug = (job.filename || "video").replace(/\.[^.]+$/, "");
+  const downloadProResMaster = () =>
+    fetchProResAndSave("umg_master", `${songSlug}_master.mov`);
+  const downloadProResShort = () =>
+    fetchProResAndSave("umg_short", `${songSlug}_short.mov`);
 
   const previewMetadata = async () => {
     setShowYoutubePanel(true);
@@ -408,7 +419,9 @@ export default function JobDetail({ job, onBack, onJobUpdate }) {
         <div className="mb-4 rounded-card bg-brand/[0.08] ring-1 ring-brand/25 px-4 py-3 flex items-center gap-3">
           <div className="w-4 h-4 border-2 border-brand border-t-transparent rounded-full animate-spin shrink-0" />
           <div className="flex-1 text-sm text-brand-light">
-            Generando Master ProRes desde el MP4… puede tomar 1-2 minutos. Tu descarga arranca cuando esté listo (no cierres la pestaña).
+            {proResHint === "umg_short"
+              ? "Generando Short ProRes (vertical) desde el MP4… puede tomar 1-2 minutos. La descarga arranca cuando esté listo (no cierres la pestaña)."
+              : "Generando Master ProRes desde el MP4… puede tomar 1-2 minutos. La descarga arranca cuando esté listo (no cierres la pestaña)."}
           </div>
         </div>
       )}
@@ -471,16 +484,15 @@ export default function JobDetail({ job, onBack, onJobUpdate }) {
             {t("detail.umg_master_subtitle") || "ProRes no se reproduce en el navegador. Descargá el archivo para reproducirlo en QuickTime / DaVinci / Premiere."}
           </p>
           {canDownload ? (
-            <a
-              href={`${API}/download/${job.job_id}/umg_master?${tokenParam()}`}
-              download
+            <button
+              onClick={downloadProResMaster}
               className="inline-flex items-center gap-2 btn-primary text-sm h-11 px-5"
             >
               <svg className="w-4 h-4" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
                 <path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4" /><polyline points="7 10 12 15 17 10" /><line x1="12" y1="15" x2="12" y2="3" />
               </svg>
               {t("detail.download_master") || "Descargar máster"}
-            </a>
+            </button>
           ) : (
             <p className="text-[11px] text-amber-300/90">
               {t("detail.master_pending_approval") || "Aprobá el video para habilitar la descarga."}

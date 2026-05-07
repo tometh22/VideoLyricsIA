@@ -1534,6 +1534,15 @@ NON_PREVIEWABLE = {"umg_master", "umg_short"}
 _BUNDLE_TYPES = ("video", "short", "thumbnail")
 
 
+# ProRes transcode helpers live in prores.py so the optional pre-warm
+# RQ worker can import them without pulling in the FastAPI app.
+from prores import (
+    ensure_prores_exists,
+    ProResMisconfigured,
+    ProResSourceMissing,
+)
+
+
 @app.get("/download/{job_id}/all")
 async def download_all_zip(
     job_id: str,
@@ -1674,72 +1683,22 @@ async def download(
     file_path = os.path.join(OUTPUTS_DIR, job_id, FILE_MAP[file_type])
 
     # Lazy ProRes: the pipeline no longer produces umg_master.mov or
-    # umg_short.mov at render time (used to be a second moviepy pass
-    # that hung). The first GET /download/{id}/umg_master (or
-    # /umg_short) after a delivery_profile in (umg, both) job triggers
-    # an ffmpeg transcode of the existing MP4/short → ProRes per the
-    # job's umg_spec (master keeps the configured frame size, short
-    # uses 1080×1920 vertical at the same fps + profile). Persists
-    # the .mov so the next download is instant. Blocks the HTTP
-    # request for the duration (~60-120 s for a 3-min song); the
-    # browser's native download UI handles the wait.
+    # umg_short.mov at render time. ensure_prores_exists serialises
+    # parallel callers via a per-(job_id, file_type) lock and writes
+    # via .tmp + os.replace so two simultaneous downloads can never
+    # corrupt the output. The G4 pre-warm worker shares this helper.
     if file_type in ("umg_master", "umg_short") and not os.path.exists(file_path):
-        umg_spec = job.get("umg_spec")
-        if not umg_spec:
-            raise HTTPException(
-                status_code=400,
-                detail="This job did not request UMG delivery; ProRes not available.",
-            )
-        # Pick the source mp4 and the spec for this variant.
-        if file_type == "umg_master":
-            source_filename = FILE_MAP["video"]
-            source_key_name = "video"
-        else:  # umg_short
-            source_filename = FILE_MAP["short"]
-            source_key_name = "short"
-        source_path = os.path.join(OUTPUTS_DIR, job_id, source_filename)
-        if not os.path.exists(source_path):
-            # Source mp4 may live in R2 — fetch it locally so ffmpeg can read it.
-            source_key = (job.get("s3_keys") or {}).get(source_key_name)
-            if source_key and storage.is_enabled():
-                os.makedirs(os.path.dirname(source_path), exist_ok=True)
-                if not storage.download_object(source_key, source_path):
-                    raise HTTPException(
-                        status_code=404,
-                        detail=f"Source {source_filename} not available locally or in R2.",
-                    )
-            else:
-                raise HTTPException(
-                    status_code=404,
-                    detail=f"Source {source_filename} not found; cannot generate ProRes.",
-                )
-        from pipeline import _transcode_to_prores, _short_prores_spec
-        from render_spec import RenderSpec as _RenderSpec
         try:
-            spec = (
-                _RenderSpec.umg(**umg_spec) if file_type == "umg_master"
-                else _short_prores_spec(umg_spec)
-            )
-            _transcode_to_prores(source_path, file_path, spec)
+            ensure_prores_exists(job_id, file_type, job, tenant_id)
+        except ProResMisconfigured as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+        except ProResSourceMissing as exc:
+            raise HTTPException(status_code=404, detail=str(exc))
         except Exception as exc:
             raise HTTPException(
                 status_code=500,
                 detail=f"ProRes transcode failed: {exc}",
             )
-        # Best-effort R2 upload so future downloads of this ProRes skip
-        # the transcode entirely. Don't fail the response if it errors.
-        try:
-            if storage.is_enabled():
-                key = storage.upload_master(
-                    file_path, tenant_id, job_id, FILE_MAP[file_type],
-                )
-                if key:
-                    keys = dict(job.get("s3_keys") or {})
-                    keys[file_type] = key
-                    from jobs import update_job as _update_job
-                    _update_job(job_id, s3_keys=keys)
-        except Exception as e:  # pragma: no cover
-            print(f"[PRORES] R2 upload skipped: {e}")
 
     if not os.path.exists(file_path):
         raise HTTPException(status_code=404, detail="File not found.")

@@ -25,9 +25,20 @@ JOB_TIMEOUT = int(os.environ.get("JOB_TIMEOUT_SECONDS", "2700"))  # 45 min (YouT
 # A 7-min track with a fresh Veo gen + 2-3 retry rounds + ProRes encode
 # + 1.5GB R2 multipart upload can creep past 45min. Give it 90min.
 JOB_TIMEOUT_UMG = int(os.environ.get("JOB_TIMEOUT_UMG_SECONDS", "5400"))
+# Prewarm transcode timeout — a 7-min song's ProRes is ~2 GB; ffmpeg
+# usually finishes in 1-3 min. 15 min is plenty of headroom and still
+# bounds runaway processes.
+PRORES_PREWARM_TIMEOUT = int(os.environ.get("PRORES_PREWARM_TIMEOUT_SECONDS", "900"))
 RESULT_TTL = int(os.environ.get("JOB_RESULT_TTL_SECONDS", "86400"))  # 24 h
 FAILURE_TTL = int(os.environ.get("JOB_FAILURE_TTL_SECONDS", "604800"))  # 7 d
 _ENVIRONMENT = os.environ.get("ENVIRONMENT", "production").lower().strip() or "production"
+
+# Pre-warm the ProRes deliverables in a background worker job as soon as
+# the pipeline finishes the MP4 render. Trade-off: gasta ffmpeg en jobs
+# que tal vez nunca se descarguen en ProRes, pero le ahorra a UMG el
+# 60-120 s wait en el primer click. Default ON since UMG is the only
+# tenant currently triggering the umg/both delivery_profile.
+PRORES_PREWARM_ENABLED = os.environ.get("PRORES_PREWARM", "1").lower() not in ("0", "false", "no")
 
 _redis = None
 _queue_default = None
@@ -120,6 +131,40 @@ def enqueue_pipeline(
     )
     t.start()
     return f"thread:{job_id}"
+
+
+def enqueue_prores_prewarm(job_id: str, file_type: str) -> str | None:
+    """Schedule the ProRes transcode for `job_id` on the enterprise queue.
+
+    Called from run_pipeline right before the job flips to "done" when
+    delivery_profile is umg/both and PRORES_PREWARM is on. The handler
+    is `prores.prewarm_prores`, which wraps `ensure_prores_exists` with
+    DB lookup. Idempotent against the lazy /download path: whichever
+    finishes first wins the os.replace.
+
+    Returns the RQ job id, or None when prewarm is disabled or Redis
+    unreachable (we never raise — prewarm is best-effort by design).
+    """
+    if not PRORES_PREWARM_ENABLED:
+        return None
+    if file_type not in ("umg_master", "umg_short"):
+        logger.warning("[PRORES] prewarm: unsupported file_type %r", file_type)
+        return None
+    _, _, q_enterprise = _init_redis()
+    if q_enterprise is None:
+        logger.info("[PRORES] prewarm: queue unavailable; skipping")
+        return None
+    rq_job = q_enterprise.enqueue(
+        "prores.prewarm_prores",
+        args=(job_id, file_type),
+        job_timeout=PRORES_PREWARM_TIMEOUT,
+        result_ttl=RESULT_TTL,
+        failure_ttl=FAILURE_TTL,
+        # Use a deterministic id so an inadvertent double-enqueue is a
+        # no-op (RQ dedupes by job_id within a queue).
+        job_id=f"prewarm:{job_id}:{file_type}",
+    )
+    return rq_job.id
 
 
 def queue_depth() -> dict:

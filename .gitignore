@@ -15,3 +15,7 @@ __pycache__/
 *.pyc
 .DS_Store
 **/.DS_Store
+# pytest SQLite scratch DB (conftest.py creates it via DATABASE_URL=sqlite:///test.db
+# and removes it on session teardown, but it survives if tests crash)
+lyricgen/backend/test.db
+lyricgen/backend/.pytest_cache/
