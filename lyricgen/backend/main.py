@@ -1054,6 +1054,10 @@ async def transcribe_endpoint(
                 # Happy path: Whisper returned plausibly-many segments.
                 # Combine intro Whisper (if any) with the body output.
                 combined = intro_segments + segments
+                from pipeline import _filter_whisper_hallucinations
+                combined, _dropped = _filter_whisper_hallucinations(combined)
+                if _dropped:
+                    print(f"[TRANSCRIBE] dropped {_dropped} Whisper hallucination phrase(s)")
                 return {"segments": combined, "reference_lyrics": plain}
 
         # Kick off Gemini-grounded lyrics fetch in parallel with Whisper.
@@ -1156,6 +1160,10 @@ async def transcribe_endpoint(
                         "recovery_source": src,
                     }
 
+        from pipeline import _filter_whisper_hallucinations
+        segments, _dropped = _filter_whisper_hallucinations(segments)
+        if _dropped:
+            print(f"[TRANSCRIBE] dropped {_dropped} Whisper hallucination phrase(s)")
         return {"segments": segments, "reference_lyrics": reference}
     finally:
         try:

@@ -488,6 +488,57 @@ _SPAM_PATTERNS = [
 ]
 
 
+# Whisper-1 has a small set of "training-data hallucinations" that fire
+# during silence / quiet music intros — phrases lifted directly from
+# subtitle datasets (Amara.org credits, "♪ music ♪" tags) that the
+# model emits as a sequence completion when there's no real speech.
+# These are NOT YouTube uploader chatter (above) — they're outputs that
+# come straight from training data leakage. Tight match because we want
+# zero false positives on real lyrics.
+_WHISPER_HALLUCINATIONS = [
+    "subtitulos realizados por la comunidad de amara.org",
+    "subtitled by the amara.org community",
+    "subtitles by the amara.org community",
+    "subtitling by the amara.org community",
+    "transcribed by amara",
+    "amara.org",  # short form catches "Visit amara.org"
+    "subtitles created by",
+    "subtitles by:",
+    "subtitulado por",
+    "transcripcion por",
+    "♪ music ♪",
+    "[ music ]",
+    "[music]",
+]
+
+
+def _is_whisper_hallucination(text: str) -> bool:
+    """True if the segment text matches a known Whisper training-data
+    hallucination. Match is case- and accent-insensitive but does NOT
+    use loose substring matching — we compare a normalized string."""
+    if not text:
+        return False
+    s = _normalize_token(text) if "_normalize_token" in globals() else text.lower().strip()
+    # Direct lower-ASCII compare for the denylist (defensive: we don't
+    # rely on _normalize_token having been hoisted yet at module load).
+    import unicodedata as _u
+    s = _u.normalize("NFD", text or "").encode("ascii", "ignore").decode("ascii").lower().strip()
+    s = " ".join(s.split())  # collapse whitespace
+    for needle in _WHISPER_HALLUCINATIONS:
+        if needle in s:
+            return True
+    return False
+
+
+def _filter_whisper_hallucinations(segments: list[dict]) -> tuple[list[dict], int]:
+    """Drop segments whose text is a known Whisper hallucination phrase.
+    Returns (filtered_segments, dropped_count) for logging."""
+    if not segments:
+        return segments, 0
+    out = [s for s in segments if not _is_whisper_hallucination(s.get("text") or "")]
+    return out, len(segments) - len(out)
+
+
 _WHISPER_MODELS: dict = {}
 _WHISPER_LOCK = None
 
