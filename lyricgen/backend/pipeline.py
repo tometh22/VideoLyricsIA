@@ -140,7 +140,11 @@ def _verify_deliverables(job_dir: str, files: dict, audio_duration: float) -> No
         "video_url":      ("lyric_video.mp4", "h264", audio_duration),
         "short_url":      ("short.mp4",        "h264", None),  # short is a fixed clip, not full audio
         "thumbnail_url":  ("thumbnail.jpg",   None,   None),
-        "umg_master_url": ("umg_master.mov",  "prores", audio_duration),
+        # umg_master is generated lazily at download time via ffmpeg from
+        # the MP4 above (see /download/{id}/umg_master). It does NOT
+        # exist on disk after the pipeline finishes, so we don't verify
+        # it here — the download endpoint validates the .mov post-
+        # transcode using _validate_umg_master.
     }
     for url_key, (filename, expected_codec, expected_dur) in expected.items():
         if url_key not in files:
@@ -178,19 +182,8 @@ def _verify_deliverables(job_dir: str, files: dict, audio_duration: float) -> No
                     f"audio {expected_dur:.1f}s by > 2s"
                 )
 
-    # Defense-in-depth re-run UMG validator on the master if present.
-    # generate_lyric_video already runs this, but a corrupted file written
-    # AFTER validation (by some unrelated cleanup gone wrong) would slip
-    # through. Re-running here is cheap.
-    if "umg_master_url" in files:
-        master = _os.path.join(job_dir, "umg_master.mov")
-        # We don't have the original spec here, but the validator works off
-        # the file's embedded metadata vs the spec we look up from the
-        # filename header. Skip the strict re-validation if it'd require
-        # reconstructing the spec; the codec + size + duration checks above
-        # cover the silent-failure category we care about.
-
-    print(f"[VERIFY] all {len(files)} deliverables passed sanity checks")
+    print(f"[VERIFY] all {len(files)} deliverables passed sanity checks "
+          f"(umg_master, if requested, is generated lazily at download)")
 
 
 def _cleanup_local_intermediates(job_dir: str) -> None:
@@ -399,8 +392,17 @@ def run_pipeline(job_id: str, mp3_path: str, artist: str, style: str,
                     "passed": True, "issues": [], "rejections": rejection_log,
                 })
 
-        # Step 2 — YouTube lyric video (H.264 / MP4 / 1080p / 24fps)
-        if wants_youtube:
+        # Step 2 — YouTube lyric video (H.264 / MP4 / 1080p / 24fps).
+        # Always render the MP4 when ANY delivery profile is requested.
+        # The UMG ProRes is now generated lazily at download time from
+        # this MP4 (see _transcode_mp4_to_prores + the /download/{id}/
+        # umg_master endpoint), so the second render that used to live
+        # at Step 2b is gone. That eliminates the duplicate moviepy
+        # palindrome-hang exposure the operator hit on every
+        # delivery_profile in (umg, both).
+        if wants_youtube or wants_umg:
+            if wants_umg and not umg_spec:
+                raise RuntimeError("UMG delivery requested without umg_spec")
             update_job(job_id, current_step="video", progress=40)
             _, chosen_font, bg_source = generate_lyric_video(
                 mp3_path, segments, style, job_dir, artist, bg_image_path,
@@ -409,22 +411,17 @@ def run_pipeline(job_id: str, mp3_path: str, artist: str, style: str,
             files["video_url"] = f"/download/{job_id}/video"
             update_job(job_id, progress=55)
 
-        # Step 2b — UMG master (ProRes / .mov / target frame size & fps)
+        # Lazy ProRes — register the URL so the UI shows a
+        # "Master ProRes" download button. The actual .mov is
+        # generated on the first GET /download/{id}/umg_master from
+        # the existing MP4 via ffmpeg (no moviepy involvement).
         if wants_umg:
-            if not umg_spec:
-                raise RuntimeError("UMG delivery requested without umg_spec")
-            update_job(job_id, current_step="umg_master", progress=58)
-            spec = RenderSpec.umg(**umg_spec)
-            # Reuse font/bg from YouTube render if available; otherwise pick fresh.
-            _, chosen_font, bg_source = generate_lyric_video(
-                mp3_path, segments, style, job_dir, artist, bg_image_path,
-                spec=spec, font=chosen_font,
-            )
             files["umg_master_url"] = f"/download/{job_id}/umg_master"
-            update_job(job_id, progress=70)
 
-        # Step 3 — YouTube Short (only when YouTube delivery is requested)
-        if wants_youtube:
+        # Step 3 — YouTube Short. Generated for any profile that
+        # asked for video/UMG so the operator/UMG team always has the
+        # short clip even on UMG-only orders.
+        if wants_youtube or wants_umg:
             update_job(job_id, current_step="short", progress=75)
             generate_short(
                 mp3_path, segments, job_dir, bg_source=bg_source,
@@ -3677,6 +3674,93 @@ def _eval_fraction(value: str) -> float:
         return float(value)
     except ValueError:
         return 0.0
+
+
+def _transcode_mp4_to_prores(mp4_path: str, mov_path: str,
+                              umg_spec: dict, timeout_sec: int = 600) -> None:
+    """Transcode the rendered MP4 → ProRes .mov per UMG delivery spec.
+
+    Used by /download/{id}/umg_master to produce the master lazily, on
+    the first download click, instead of running a second moviepy
+    render at pipeline time. ffmpeg only — no moviepy involvement —
+    so the moviepy palindrome-loop hang that breaks the dual-render
+    path doesn't apply here.
+
+    Args:
+      mp4_path:   path to the existing lyric_video.mp4 (1080p / 24).
+      mov_path:   destination for the ProRes .mov.
+      umg_spec:   dict matching RenderSpec.umg(...) kwargs:
+                  frame_size, fps, prores_profile.
+      timeout_sec: hard kill after N seconds. 10 min is plenty for a
+                   3-min song; longer means ffmpeg hung on a bad file.
+
+    The output passes _validate_umg_master under normal conditions:
+      - codec=prores_ks, profile per umg_spec
+      - exact width × height per RenderSpec.umg
+      - fps via -r (rational for fractional fps), enforced on the
+        bitstream so ffprobe reports the same value
+      - audio re-encoded to pcm_s24le @ 48 kHz @ 2 ch
+      - bt709 color tags, progressive, mov container, DAR per spec.
+
+    Raises RuntimeError on ffmpeg failure or post-transcode validation
+    failure. The caller is responsible for cleaning up partial output.
+    """
+    spec = RenderSpec.umg(**umg_spec)
+    cmd = [
+        "ffmpeg", "-y", "-loglevel", "error",
+        "-i", mp4_path,
+        # Video filter: scale to target dims (lanczos = sharp upscale,
+        # decent downscale), force fps, normalize SAR so DAR is set
+        # purely by -aspect below.
+        "-vf",
+        f"scale={spec.width}:{spec.height}:flags=lanczos,"
+        f"fps={spec.fps_str},"
+        f"setsar=1",
+        "-r", spec.fps_str,
+        "-c:v", "prores_ks",
+        "-profile:v", str(spec.prores_profile),
+        "-pix_fmt", spec.pix_fmt,
+        "-vendor", "apl0",
+        "-color_primaries", "bt709",
+        "-color_trc", "bt709",
+        "-colorspace", "bt709",
+        "-color_range", "tv",
+        "-aspect", f"{spec.dar[0]}:{spec.dar[1]}",
+        # Audio: re-encode to UMG's required spec regardless of input.
+        "-c:a", "pcm_s24le",
+        "-ar", "48000",
+        "-ac", "2",
+        "-f", "mov",
+        mov_path,
+    ]
+    print(f"[PRORES] transcoding {os.path.basename(mp4_path)} → "
+          f"{os.path.basename(mov_path)} ({spec.width}×{spec.height} @ "
+          f"{spec.fps_str}, profile {spec.prores_profile})")
+    result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout_sec)
+    if result.returncode != 0:
+        # Best-effort cleanup of a partial file before raising.
+        try:
+            if os.path.exists(mov_path):
+                os.unlink(mov_path)
+        except OSError:
+            pass
+        raise RuntimeError(
+            f"ffmpeg ProRes transcode failed (rc={result.returncode}): "
+            f"{result.stderr[-500:]}"
+        )
+
+    errors = _validate_umg_master(mov_path, spec)
+    if errors:
+        try:
+            os.unlink(mov_path)
+        except OSError:
+            pass
+        raise RuntimeError(
+            f"transcoded ProRes failed UMG validation: {'; '.join(errors)}"
+        )
+
+    size_mb = os.path.getsize(mov_path) / 1024 / 1024
+    print(f"[PRORES] master ready: {size_mb:.1f} MB")
 
 
 def _validate_umg_master(path: str, spec: RenderSpec) -> list[str]:

@@ -185,8 +185,17 @@ export default function JobDetail({ job, onBack, onJobUpdate }) {
   const downloadAllZip = () => {
     window.location.href = `${API}/download/${job.job_id}/all?${tokenParam()}`;
   };
+  // ProRes is generated lazily server-side from the existing MP4 the
+  // first time it's requested (~60-120 s of ffmpeg transcode). The
+  // browser's native download UI shows a spinner during the wait;
+  // we additionally show a short hint toast so the operator knows
+  // why the click feels slow on this run only. Subsequent clicks are
+  // instant because the .mov is cached on disk + R2.
+  const [proResHint, setProResHint] = useState(false);
   const downloadProRes = () => {
+    setProResHint(true);
     window.location.href = `${API}/download/${job.job_id}/umg_master?${tokenParam()}`;
+    setTimeout(() => setProResHint(false), 8000);
   };
 
   const previewMetadata = async () => {
@@ -297,8 +306,11 @@ export default function JobDetail({ job, onBack, onJobUpdate }) {
         </div>
         <div className="flex gap-2 shrink-0">
           {canDownload && (() => {
+            // All profiles (youtube, umg, both) now produce the MP4 +
+            // short + thumbnail set in the pipeline, so "Descargar todo"
+            // is always relevant. ProRes is generated on demand via the
+            // dedicated button when the job opted into UMG.
             const profile = job.delivery_profile || "youtube";
-            const onlyUmg = profile === "umg";
             const downloadIcon = (
               <svg className="inline-block w-4 h-4 mr-1.5 -mt-0.5" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
                 <path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4" /><polyline points="7 10 12 15 17 10" /><line x1="12" y1="15" x2="12" y2="3" />
@@ -306,18 +318,16 @@ export default function JobDetail({ job, onBack, onJobUpdate }) {
             );
             return (
               <>
-                {!onlyUmg && (
-                  <button onClick={downloadAllZip} className="btn-secondary text-xs h-10 px-4">
-                    {downloadIcon}
-                    {t("detail.download_all") || "Descargar todo"}
-                  </button>
-                )}
+                <button onClick={downloadAllZip} className="btn-secondary text-xs h-10 px-4">
+                  {downloadIcon}
+                  {t("detail.download_all") || "Descargar todo"}
+                </button>
                 {hasUmgMaster && (
                   <button onClick={downloadProRes} className="btn-secondary text-xs h-10 px-4">
                     {downloadIcon}
                     {profile === "both"
                       ? (t("detail.download_master") || "Master ProRes")
-                      : (t("detail.download") || "Descargar")}
+                      : (t("detail.download_master") || "Master ProRes")}
                   </button>
                 )}
               </>
@@ -342,6 +352,19 @@ export default function JobDetail({ job, onBack, onJobUpdate }) {
           )}
         </div>
       </div>
+
+      {/* ProRes hint toast — only on first click. The transcode runs
+          on the server (~60-120 s for a 3-min song) and the browser
+          shows its native download UI during the wait, so the user
+          knows something is happening; this banner explains why. */}
+      {proResHint && (
+        <div className="mb-4 rounded-card bg-brand/[0.08] ring-1 ring-brand/25 px-4 py-3 flex items-center gap-3">
+          <div className="w-4 h-4 border-2 border-brand border-t-transparent rounded-full animate-spin shrink-0" />
+          <div className="flex-1 text-sm text-brand-light">
+            Generando Master ProRes desde el MP4… puede tomar 1-2 minutos. Tu descarga arranca cuando esté listo (no cierres la pestaña).
+          </div>
+        </div>
+      )}
 
       {/* Validation failed detail */}
       {isValidationFailed && job.error && (

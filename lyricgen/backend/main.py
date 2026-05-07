@@ -1576,6 +1576,61 @@ async def download(
             return RedirectResponse(url, status_code=302)
 
     file_path = os.path.join(OUTPUTS_DIR, job_id, FILE_MAP[file_type])
+
+    # Lazy ProRes: the pipeline no longer produces umg_master.mov at
+    # render time (used to be a second moviepy pass that hung). The
+    # first GET /download/{id}/umg_master after a delivery_profile in
+    # (umg, both) job triggers an ffmpeg transcode of the existing
+    # MP4 → ProRes per the job's umg_spec, persists the .mov so the
+    # next download is instant, and serves the file. Blocks the HTTP
+    # request for the duration (~60-120 s for a 3-min song); the
+    # browser's native download UI handles the wait.
+    if file_type == "umg_master" and not os.path.exists(file_path):
+        umg_spec = job.get("umg_spec")
+        if not umg_spec:
+            raise HTTPException(
+                status_code=400,
+                detail="This job did not request UMG delivery; no master available.",
+            )
+        mp4_path = os.path.join(OUTPUTS_DIR, job_id, FILE_MAP["video"])
+        if not os.path.exists(mp4_path):
+            # MP4 may live in R2 — fetch it locally so ffmpeg can read it.
+            mp4_key = (job.get("s3_keys") or {}).get("video")
+            if mp4_key and storage.is_enabled():
+                os.makedirs(os.path.dirname(mp4_path), exist_ok=True)
+                if not storage.download_object(mp4_key, mp4_path):
+                    raise HTTPException(
+                        status_code=404,
+                        detail="Source MP4 not available locally or in R2.",
+                    )
+            else:
+                raise HTTPException(
+                    status_code=404,
+                    detail="Source MP4 not found; cannot generate ProRes master.",
+                )
+        from pipeline import _transcode_mp4_to_prores
+        try:
+            _transcode_mp4_to_prores(mp4_path, file_path, umg_spec)
+        except Exception as exc:
+            raise HTTPException(
+                status_code=500,
+                detail=f"ProRes transcode failed: {exc}",
+            )
+        # Best-effort R2 upload so future downloads of this master skip
+        # the transcode entirely. Don't fail the response if it errors.
+        try:
+            if storage.is_enabled():
+                key = storage.upload_master(
+                    file_path, tenant_id, job_id, FILE_MAP["umg_master"],
+                )
+                if key:
+                    keys = dict(job.get("s3_keys") or {})
+                    keys["umg_master"] = key
+                    from jobs import update_job as _update_job
+                    _update_job(job_id, s3_keys=keys)
+        except Exception as e:  # pragma: no cover
+            print(f"[PRORES] R2 upload skipped: {e}")
+
     if not os.path.exists(file_path):
         raise HTTPException(status_code=404, detail="File not found.")
     return FileResponse(file_path, filename=FILE_MAP[file_type], media_type="application/octet-stream")
