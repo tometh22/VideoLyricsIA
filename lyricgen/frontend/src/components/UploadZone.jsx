@@ -56,6 +56,7 @@ const UMG_PROFILES = [
 export default function UploadZone({
   files,
   onFiles,
+  delivery,
   onDeliveryChange,
   backgroundFile,
   onBackgroundFile,
@@ -72,10 +73,13 @@ export default function UploadZone({
   const inputRef = useRef();
   const bgInputRef = useRef();
   const [dragging, setDragging] = useState(false);
-  const [deliveryProfile, setDeliveryProfile] = useState("youtube");
-  const [umgFrameSize, setUmgFrameSize] = useState("HD");
-  const [umgFps, setUmgFps] = useState(24);
-  const [umgProresProfile, setUmgProresProfile] = useState(3);
+  // Seed delivery selectors from App-level state when present so coming
+  // back from /review (or any remount) preserves the operator's choice
+  // of "ProRes 422 HQ" / frame size / fps, not just the file list.
+  const [deliveryProfile, setDeliveryProfile] = useState(delivery?.delivery_profile || "youtube");
+  const [umgFrameSize, setUmgFrameSize] = useState(delivery?.umg_frame_size || "HD");
+  const [umgFps, setUmgFps] = useState(delivery?.umg_fps || 24);
+  const [umgProresProfile, setUmgProresProfile] = useState(delivery?.umg_prores_profile || 3);
   const [deliveryExpanded, setDeliveryExpanded] = useState(false);
   const [bgMode, setBgMode] = useState("auto"); // auto | library | custom
   const [libraryBgs, setLibraryBgs] = useState([]);

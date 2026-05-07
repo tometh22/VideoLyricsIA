@@ -528,8 +528,15 @@ export default function App() {
   };
 
   const handleReset = (skipConfirm = false) => {
-    const hasActive = jobs.some((j) => j.status === "processing" || j.status === "queued");
-    if (hasActive && !skipConfirm && !window.confirm(t("batch.confirm_cancel"))) return;
+    // Confirm whenever there's any wizard state at risk — not only when
+    // jobs are running. Without this, the user could lose an in-progress
+    // batch (transcribing / approved / ready-to-generate) without warning.
+    const hasState = jobs.some((j) => j.status === "processing" || j.status === "queued")
+                  || approvedJobs.length > 0
+                  || currentReview !== null
+                  || reviewQueue.length > 0
+                  || files.length > 0;
+    if (hasState && !skipConfirm && !window.confirm(t("batch.confirm_cancel"))) return;
     pollingIntervals.current.forEach((iv) => clearInterval(iv));
     pollingIntervals.current.clear();
     setFiles([]); setJobs([]); setBackgroundFile(null); setBackgroundId(null);
@@ -537,6 +544,44 @@ export default function App() {
     setTranscribing(false); setReadyToGenerate(false); setTranscribeError(null);
     navigate("/dashboard");
     fetchHistory();
+  };
+
+  // Step-back inside the lyrics-review wizard. Walks one step backward
+  // through the batch queue without resetting state:
+  //   - canción N>1 → re-open the editor for canción N-1 with its
+  //     already-edited segments. Pops that entry from approvedJobs
+  //     so it can be re-approved.
+  //   - canción 1 (no approved yet) → /new with files[] still intact.
+  // Distinct from handleReset (which discards the whole batch).
+  const handleBackInReview = () => {
+    if (approvedJobs.length > 0) {
+      const last = approvedJobs[approvedJobs.length - 1];
+      setApprovedJobs(approvedJobs.slice(0, -1));
+      setCurrentReview({
+        file: last.file,
+        artist: last.artist,
+        language: last.language,
+        genre: last.genre || "",
+        font: last.font || "",
+        concept: last.concept || "",
+        movementStyle: last.movementStyle || "",
+        segments: last.segments,
+        referenceLyrics: "",
+        coverageWarning: false,
+        recoverySource: "",
+        queueIdx: approvedJobs.length - 1,
+        queue: reviewQueue,
+      });
+      setReadyToGenerate(false);
+      setTranscribing(false);
+      setTranscribeError(null);
+      return;
+    }
+    setCurrentReview(null);
+    setReviewQueue([]);
+    setTranscribing(false);
+    setTranscribeError(null);
+    navigate("/new");
   };
 
   const handleGenerateBatch = () => {
@@ -610,6 +655,7 @@ export default function App() {
       <UploadZone
         files={files}
         onFiles={setFiles}
+        delivery={delivery}
         onDeliveryChange={setDelivery}
         backgroundFile={backgroundFile}
         onBackgroundFile={setBackgroundFile}
@@ -660,6 +706,12 @@ export default function App() {
       return (
         <div className="flex justify-center">
           <LyricsEditor
+            // key forces a fresh mount when stepping forward/backward
+            // through the batch — LyricsEditor seeds its `edited` state
+            // from props.segments only on mount, so without the key the
+            // editor would keep showing the previous song's segments
+            // when handleBackInReview swaps currentReview underneath it.
+            key={`${currentReview.file.name}:${currentReview.queueIdx}`}
             segments={currentReview.segments}
             filename={currentReview.file.name}
             audioFile={currentReview.file}
@@ -667,7 +719,7 @@ export default function App() {
             coverageWarning={currentReview.coverageWarning}
             recoverySource={currentReview.recoverySource}
             onApprove={handleApproveLyrics}
-            onBack={handleReset}
+            onBack={handleBackInReview}
             isBatch={currentReview.queue.length > 1}
             batchProgress={currentReview.queue.length > 1
               ? `${currentReview.queueIdx + 1} ${t("editor.song_of")} ${currentReview.queue.length}`
@@ -700,11 +752,18 @@ export default function App() {
             ))}
           </div>
 
-          <div className="flex gap-3 justify-center">
+          <div className="flex gap-3 justify-center items-center">
+            <button onClick={handleBackInReview} className="btn-secondary">
+              ← {t("detail.back") || "Volver"}
+            </button>
             <button onClick={handleGenerateBatch} className="btn-primary text-lg py-4 px-8">
               {t("ready.generate")} {approvedJobs.length} {t("ready.videos")}
             </button>
-            <button onClick={handleReset} className="btn-secondary">{t("ready.cancel")}</button>
+          </div>
+          <div className="flex justify-center mt-3">
+            <button onClick={handleReset} className="text-[11px] text-gray-500 hover:text-red-300 transition-colors underline-offset-2 hover:underline">
+              {t("ready.cancel")}
+            </button>
           </div>
         </div>
       );
