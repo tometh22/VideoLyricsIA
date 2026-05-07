@@ -310,11 +310,16 @@ async def list_all_jobs(
     limit: int = Query(50, le=500),
     offset: int = Query(0, ge=0),
     status: str = Query(""),
+    tenant_id: str = Query(""),
 ):
-    """List all jobs across all tenants."""
+    """List all jobs across all tenants. Optional tenant_id filter so the
+    admin can drill into a specific customer (e.g. UMG) and watch their
+    pipeline live."""
     query = db.query(Job).order_by(Job.created_at.desc())
     if status:
         query = query.filter(Job.status == status)
+    if tenant_id:
+        query = query.filter(Job.tenant_id == tenant_id)
 
     total = query.count()
     jobs = query.offset(offset).limit(limit).all()

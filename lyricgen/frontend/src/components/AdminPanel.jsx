@@ -30,6 +30,8 @@ export default function AdminPanel({ onBack }) {
   const [usersTotal, setUsersTotal] = useState(0);
   const [jobs, setJobs] = useState([]);
   const [jobsTotal, setJobsTotal] = useState(0);
+  const [jobsTenantFilter, setJobsTenantFilter] = useState("");
+  const [jobsAutoRefresh, setJobsAutoRefresh] = useState(true);
   const [invoices, setInvoices] = useState([]);
   const [search, setSearch] = useState("");
   const [loading, setLoading] = useState(true);
@@ -54,7 +56,21 @@ export default function AdminPanel({ onBack }) {
     if (tab === "invoices") loadInvoices();
     if (tab === "compliance") loadCompliance();
     if (tab === "backgrounds") loadBackgrounds();
-  }, [tab]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [tab, jobsTenantFilter]);
+
+  // Auto-refresh the Jobs tab every 5s so admin sees real-time progress
+  // of running renders (current_step, progress %). Pauses when the tab
+  // is hidden so we don't hammer the API for an inactive screen.
+  useEffect(() => {
+    if (tab !== "jobs" || !jobsAutoRefresh) return;
+    const iv = setInterval(() => {
+      if (typeof document !== "undefined" && document.hidden) return;
+      loadJobs();
+    }, 5000);
+    return () => clearInterval(iv);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [tab, jobsAutoRefresh, jobsTenantFilter]);
 
   const loadStats = async () => {
     try {
@@ -111,7 +127,8 @@ export default function AdminPanel({ onBack }) {
 
   const loadJobs = async () => {
     try {
-      const res = await fetch(`${API}/admin/jobs?limit=100`, { headers: authHeaders() });
+      const tenantQ = jobsTenantFilter ? `&tenant_id=${encodeURIComponent(jobsTenantFilter)}` : "";
+      const res = await fetch(`${API}/admin/jobs?limit=100${tenantQ}`, { headers: authHeaders() });
       const data = await res.json();
       setJobs(data.jobs || []);
       setJobsTotal(data.total || 0);
@@ -401,8 +418,30 @@ export default function AdminPanel({ onBack }) {
       {/* Jobs */}
       {tab === "jobs" && (
         <div className="space-y-4">
-          <p className="text-xs text-gray-500">{jobsTotal} jobs total</p>
-          <div className="glass rounded-card overflow-hidden">
+          <div className="flex items-center justify-between gap-3 flex-wrap">
+            <p className="text-xs text-gray-500">
+              {jobsTotal} jobs{jobsTenantFilter && <> en tenant <span className="text-brand">{jobsTenantFilter}</span></>}
+            </p>
+            <div className="flex items-center gap-3">
+              <input
+                type="text"
+                placeholder="Filtrar por tenant_id (ej: universal_music)"
+                value={jobsTenantFilter}
+                onChange={e => setJobsTenantFilter(e.target.value.trim())}
+                className="input-field !py-2 text-xs w-72"
+              />
+              <label className="flex items-center gap-1.5 text-xs text-gray-400 cursor-pointer select-none">
+                <input
+                  type="checkbox"
+                  checked={jobsAutoRefresh}
+                  onChange={e => setJobsAutoRefresh(e.target.checked)}
+                  className="accent-brand"
+                />
+                Auto-refresh 5s
+              </label>
+            </div>
+          </div>
+          <div className="glass rounded-card overflow-hidden overflow-x-auto">
             <table className="w-full text-sm">
               <thead>
                 <tr className="border-b border-white/[0.06]">
@@ -411,13 +450,15 @@ export default function AdminPanel({ onBack }) {
                   <th className="text-left px-4 py-3 text-xs text-gray-500 font-medium">File</th>
                   <th className="text-left px-4 py-3 text-xs text-gray-500 font-medium">Tenant</th>
                   <th className="text-left px-4 py-3 text-xs text-gray-500 font-medium">Status</th>
+                  <th className="text-left px-4 py-3 text-xs text-gray-500 font-medium">Step</th>
+                  <th className="text-left px-4 py-3 text-xs text-gray-500 font-medium w-[140px]">Progress</th>
                   <th className="text-left px-4 py-3 text-xs text-gray-500 font-medium">Created</th>
                 </tr>
               </thead>
               <tbody>
                 {jobs.map(j => (
                   <tr key={j.job_id} className="border-b border-white/[0.03]">
-                    <td className="px-4 py-3 font-mono text-xs text-gray-400">{j.job_id}</td>
+                    <td className="px-4 py-3 font-mono text-xs text-gray-400">{j.job_id?.slice(0, 8)}…</td>
                     <td className="px-4 py-3">{j.artist}</td>
                     <td className="px-4 py-3 text-gray-400 truncate max-w-[200px]">{j.filename}</td>
                     <td className="px-4 py-3 text-xs text-gray-500">{j.tenant_id}</td>
@@ -425,10 +466,30 @@ export default function AdminPanel({ onBack }) {
                       <span className={`text-xs px-2 py-1 rounded-lg font-medium ${
                         j.status === "done" ? "bg-accent/10 text-accent" :
                         j.status === "error" ? "bg-red-500/10 text-red-400" :
+                        j.status === "validation_failed" ? "bg-red-500/10 text-red-300" :
+                        j.status === "pending_review" ? "bg-amber-500/10 text-amber-300" :
                         "bg-brand/10 text-brand"
                       }`}>{j.status}</span>
                     </td>
-                    <td className="px-4 py-3 text-xs text-gray-500">
+                    <td className="px-4 py-3 text-xs text-gray-400">
+                      {j.current_step || "—"}
+                    </td>
+                    <td className="px-4 py-3">
+                      {typeof j.progress === "number" && j.status !== "done" && j.status !== "error" ? (
+                        <div className="flex items-center gap-2">
+                          <div className="flex-1 h-1.5 bg-surface-3/60 rounded-full overflow-hidden min-w-[60px]">
+                            <div
+                              className="h-full bg-gradient-to-r from-brand to-brand-light transition-all"
+                              style={{ width: `${Math.max(2, Math.min(100, j.progress))}%` }}
+                            />
+                          </div>
+                          <span className="text-[10px] text-gray-500 tabular-nums w-8 text-right">{j.progress}%</span>
+                        </div>
+                      ) : (
+                        <span className="text-xs text-gray-600">—</span>
+                      )}
+                    </td>
+                    <td className="px-4 py-3 text-xs text-gray-500 whitespace-nowrap">
                       {j.created_at ? new Date(j.created_at * 1000).toLocaleString("es-AR") : "—"}
                     </td>
                   </tr>

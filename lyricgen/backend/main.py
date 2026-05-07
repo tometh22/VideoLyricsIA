@@ -474,18 +474,25 @@ _validate_mp3_upload = _validate_audio_upload
 
 
 def _enforce_plan_quota(db: Session, current_user: dict) -> None:
-    """Raise 402 if the tenant reached its monthly limit without overage allowed."""
+    """Raise 402 if the tenant reached its monthly limit without overage allowed.
+
+    The message is operator-facing (UMG, label teams). It avoids
+    backend-y phrasing ("plan", "overage") and points at a human
+    contact path so the operator knows what to do — keeping it
+    blocking but not a dead-end.
+    """
     plan = current_user.get("plan", "100")
     tenant_id = current_user["tenant_id"]
     usage = get_plan_usage(db, current_user["id"], tenant_id, plan)
     if usage["remaining"] <= 0 and plan != "unlimited":
         if not current_user.get("allow_overage", False):
+            support_email = os.environ.get("SUPPORT_EMAIL", "soporte@genly.pro")
             raise HTTPException(
                 status_code=402,
                 detail=(
-                    f"Plan '{plan}' monthly limit reached "
-                    f"({usage['used']}/{usage['limit']}). "
-                    "Upgrade the plan or enable overage to continue."
+                    f"Llegaste al límite mensual de {usage['limit']} videos "
+                    f"({usage['used']} usados este mes). "
+                    f"Para extender el cupo, contactá a {support_email}."
                 ),
             )
 

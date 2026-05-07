@@ -161,6 +161,55 @@ export default function Dashboard({ user, history, onSelectJob, onNewBatch, onVi
         </button>
       </div>
 
+      {/* ─── Plan-quota proximity warning ─────────────────────────────
+            Shows once usage crosses 80% so the operator has a heads-up
+            before any upload blocks. Hardens to a red, action-required
+            banner at 100% — at that point /generate returns 402 and the
+            user needs a path to support, not silence. */}
+      {!isUnlimited && monthlyLimit && (usage?.alert_100 || usage?.alert_80) && (
+        <div
+          className={`w-full mb-4 flex items-center gap-3 px-5 py-4 rounded-card ring-1 ${
+            usage.alert_100
+              ? "bg-red-500/[0.08] ring-red-500/30"
+              : "bg-amber-500/[0.06] ring-amber-500/25"
+          }`}
+        >
+          <svg
+            className={`w-5 h-5 shrink-0 ${usage.alert_100 ? "text-red-300" : "text-amber-300"}`}
+            fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24"
+          >
+            <path d="M12 9v4M12 17h.01"/><circle cx="12" cy="12" r="10"/>
+          </svg>
+          <div className="flex-1 min-w-0">
+            {usage.alert_100 ? (
+              <>
+                <p className="text-sm font-semibold text-red-200">
+                  Llegaste al límite mensual ({monthlyUsed}/{monthlyLimit})
+                </p>
+                <p className="text-xs text-red-300/80 mt-0.5">
+                  No vas a poder subir más videos hasta el mes que viene. Si necesitás extender el cupo, escribinos a{" "}
+                  <a href="mailto:soporte@genly.pro" className="underline font-medium hover:text-red-200">
+                    soporte@genly.pro
+                  </a>.
+                </p>
+              </>
+            ) : (
+              <>
+                <p className="text-sm font-semibold text-amber-200">
+                  Te quedan {monthlyLimit - monthlyUsed} videos este mes ({monthlyUsed}/{monthlyLimit})
+                </p>
+                <p className="text-xs text-amber-300/80 mt-0.5">
+                  Si vas a necesitar más, contactanos antes de llegar al tope:{" "}
+                  <a href="mailto:soporte@genly.pro" className="underline font-medium hover:text-amber-200">
+                    soporte@genly.pro
+                  </a>.
+                </p>
+              </>
+            )}
+          </div>
+        </div>
+      )}
+
       {/* ─── Pending review CTA — brand violet because it's a positive
             "do this next", not a danger warning ───────────────────── */}
       {pendingReview.length > 0 && (
