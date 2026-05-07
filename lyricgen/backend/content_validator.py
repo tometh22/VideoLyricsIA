@@ -30,10 +30,18 @@ def _safe_ffmpeg_path(path: str) -> str:
     return path
 
 
-def _extract_frames(video_path: str, interval_seconds: int = 3, max_frames: int = 10) -> list[str]:
+def _extract_frames(
+    video_path: str,
+    interval_seconds: int = 3,
+    max_frames: int = 10,
+) -> tuple[list[str], str]:
     """Extract frames from a video at regular intervals using ffmpeg.
 
-    Returns list of temporary file paths (caller must clean up).
+    Returns (frame_paths, tmp_dir). The caller is responsible for cleaning
+    up tmp_dir (and the frames inside it) regardless of whether any frames
+    were successfully extracted — returning the dir explicitly here closes
+    the leak where ffprobe/ffmpeg failures left mkdtemp orphans in /tmp on
+    long-running workers.
     """
     tmp_dir = tempfile.mkdtemp(prefix="genly_validate_")
     safe_video_path = _safe_ffmpeg_path(video_path)
@@ -72,7 +80,7 @@ def _extract_frames(video_path: str, interval_seconds: int = 3, max_frames: int 
         except Exception as e:
             logger.warning(f"Frame extraction failed at {ts}s: {e}")
 
-    return frame_paths
+    return frame_paths, tmp_dir
 
 
 class ValidatorCheckError(Exception):
@@ -176,11 +184,10 @@ def validate_video(video_path: str, job_id: str = None) -> dict:
         input_data_types=["video_frames"],
     ) if job_id else None
 
-    frame_paths = _extract_frames(video_path)
+    frame_paths, tmp_dir = _extract_frames(video_path)
     all_issues = []
     check_errors = 0
     frames_checked = 0
-    tmp_dir = os.path.dirname(frame_paths[0]) if frame_paths else None
 
     try:
         for i, frame_path in enumerate(frame_paths):

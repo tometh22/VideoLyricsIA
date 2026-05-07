@@ -1548,31 +1548,59 @@ def _fill_gaps_with_reference(whisper_segments: list[dict],
         return kept
 
     # 4. Allocate reference lines per gap, proportional to gap duration.
+    #
+    # We use the largest-remainder method (Hamilton method) to guarantee
+    # `sum(allocations) == n_lines` exactly, regardless of how the floats
+    # round. Old `round()`-per-gap allocation could:
+    #   - sum to > n_lines and starve the final gap into negative remainder,
+    #   - sum to << n_lines for songs with one big gap and many tiny ones,
+    #     piling lines into the trailing gap.
     n_lines = len(ref_lines)
     GAP_BETWEEN = 0.05
+    audio_dur_f = float(audio_duration)
     output = list(kept)
+
+    floor_alloc = [int((end - start) / total_gap * n_lines) for (start, end) in gaps]
+    fracs = [
+        ((end - start) / total_gap * n_lines) - floor_alloc[i]
+        for i, (start, end) in enumerate(gaps)
+    ]
+    leftover = n_lines - sum(floor_alloc)
+    # Distribute one extra line at a time to the gap with the largest
+    # fractional part. Tiebreak by gap index for determinism.
+    if leftover > 0:
+        ranked = sorted(range(len(gaps)), key=lambda i: (-fracs[i], i))
+        for idx in ranked[:leftover]:
+            floor_alloc[idx] += 1
+    # `leftover` cannot be negative under largest-remainder, but guard
+    # defensively against fp drift on degenerate inputs.
+    elif leftover < 0:
+        ranked = sorted(range(len(gaps)), key=lambda i: (fracs[i], i))
+        for idx in ranked[:(-leftover)]:
+            if floor_alloc[idx] > 0:
+                floor_alloc[idx] -= 1
+
     line_cursor = 0
     for i, (start, end) in enumerate(gaps):
-        gap_dur = end - start
-        # Last gap absorbs all remaining lines so we never under-allocate.
-        if i == len(gaps) - 1:
-            line_count = n_lines - line_cursor
-        else:
-            line_count = max(0, round(gap_dur / total_gap * n_lines))
-            line_count = min(line_count, n_lines - line_cursor)
+        line_count = floor_alloc[i]
         if line_count <= 0:
             continue
+        gap_dur = end - start
         per_line = gap_dur / line_count
         for j in range(line_count):
             line_idx = line_cursor + j
             if line_idx >= n_lines:
                 break
-            line_start = start + j * per_line
-            line_end = start + (j + 1) * per_line - GAP_BETWEEN
+            # Clamp BOTH start and end to [0, audio_duration]. Old code
+            # only clamped end, which let `start > audio_duration` slip
+            # through and produce inverted segments.
+            line_start = max(0.0, min(start + j * per_line, audio_dur_f))
+            line_end = min(start + (j + 1) * per_line - GAP_BETWEEN, audio_dur_f)
             if line_end <= line_start:
-                line_end = line_start + 0.5
-            if line_end > float(audio_duration):
-                line_end = float(audio_duration)
+                # Drop degenerate (zero-or-negative duration) segments
+                # outright. Pre-fix code synthesized a 0.5 s pad here,
+                # which the renderer then drew on top of the next segment.
+                continue
             output.append({
                 "start": line_start,
                 "end": line_end,
@@ -3230,9 +3258,43 @@ def _prerender_looped_bg(bg_path: str, duration: float, job_dir: str,
     return out_path
 
 
+def _attach_close_chain(target_clip, owned_clips):
+    """Make `target_clip.close()` also close `owned_clips`.
+
+    moviepy's resize/crop/concatenate return new clips that retain refs
+    to their source clips, but their .close() does NOT cascade to the
+    sources. Long-running workers leaked an ffmpeg subprocess + FD per
+    background load until this helper was introduced. Use only on the
+    very clip the caller will eventually close, with the sources whose
+    lifetime should match it.
+    """
+    original_close = target_clip.close
+    def chained_close():
+        try:
+            original_close()
+        finally:
+            for c in owned_clips:
+                try:
+                    c.close()
+                except Exception:
+                    pass
+    target_clip.close = chained_close
+    return target_clip
+
+
 def _get_background_clip_from_path(bg_path: str, style: str, duration: float,
                                    job_dir: str = None, spec: RenderSpec | None = None):
-    """Load a background video, loop it seamlessly via ffmpeg, return clip."""
+    """Load a background video, loop it seamlessly via ffmpeg, return clip.
+
+    Always returns a single VideoFileClip whose lifetime is owned by the
+    caller (the caller is expected to .close() it when the composition
+    is finished). When the source already covers the requested duration
+    we return a derived clip with its source attached via
+    _attach_close_chain so the caller's close cascades. When the source
+    is shorter, we pre-render a single seamless loop file via ffmpeg —
+    the previous "concatenate N opened clips" fallback leaked one
+    VideoFileClip per loop iteration.
+    """
     if spec is None:
         spec = RenderSpec.youtube_default()
     try:
@@ -3244,26 +3306,52 @@ def _get_background_clip_from_path(bg_path: str, style: str, duration: float,
         raise RuntimeError(f"Cannot load background video: {e}")
 
     if clip_dur >= duration:
-        return _cover_resize(
-            VideoFileClip(bg_path), spec.width, spec.height
-        ).subclip(0, duration)
+        # Open ONCE, derive subclip + cover-resize, attach the source so
+        # the caller's eventual close() releases the underlying ffmpeg
+        # reader.
+        src = VideoFileClip(bg_path)
+        derived = _cover_resize(src.subclip(0, duration), spec.width, spec.height)
+        return _attach_close_chain(derived, [src])
 
-    # Pre-render the looped video with ffmpeg (fast, fluid, native fps)
+    # Always pre-render a single seamless loop file. The job_dir-supplied
+    # path was already clean; the no-job_dir fallback used to concatenate
+    # N opened VideoFileClips and leak each one because moviepy's
+    # concatenate_videoclips does NOT cascade-close its inputs.
     if job_dir:
-        # Use per-spec filename so YouTube and UMG paths don't clobber each other.
-        looped_name = f"bg_looped_{spec.width}x{spec.height}.mp4"
-        looped_path = _prerender_looped_bg(
-            bg_path, duration, job_dir,
-            target_w=spec.width, target_h=spec.height,
-            out_name=looped_name,
-        )
-        return VideoFileClip(looped_path)
+        looped_dir = job_dir
+        cleanup_dir = None
+    else:
+        looped_dir = tempfile.mkdtemp(prefix="genly_bg_loop_")
+        cleanup_dir = looped_dir
+    looped_name = f"bg_looped_{spec.width}x{spec.height}.mp4"
+    looped_path = _prerender_looped_bg(
+        bg_path, duration, looped_dir,
+        target_w=spec.width, target_h=spec.height,
+        out_name=looped_name,
+    )
+    looped_clip = VideoFileClip(looped_path)
 
-    # Fallback: simple concatenation
-    loops = math.ceil(duration / clip_dur) + 1
-    clips = [_cover_resize(VideoFileClip(bg_path), spec.width, spec.height)
-             for _ in range(loops)]
-    return concatenate_videoclips(clips).subclip(0, duration)
+    if cleanup_dir is not None:
+        # Sweep the temp dir when the caller closes the clip — no other
+        # process should be reading the looped file by then.
+        def _rmtree_safely():
+            try:
+                if os.path.exists(looped_path):
+                    os.unlink(looped_path)
+            except OSError:
+                pass
+            try:
+                os.rmdir(cleanup_dir)
+            except OSError:
+                pass
+        _orig_close = looped_clip.close
+        def _close_with_cleanup():
+            try:
+                _orig_close()
+            finally:
+                _rmtree_safely()
+        looped_clip.close = _close_with_cleanup
+    return looped_clip
 
 
 # Font pool — Google Fonts only (SIL OFL = full commercial use, no royalties)

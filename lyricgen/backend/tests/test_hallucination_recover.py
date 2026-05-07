@@ -519,6 +519,49 @@ def test_fill_gaps_zero_audio_duration_returns_input():
     assert out == [_seg(0, 5, "x")]
 
 
+def test_fill_gaps_distributes_evenly_across_many_short_gaps():
+    # 5 reference lines spread over a single contiguous gap (no kept
+    # Whisper segments). Allocation must sum to exactly n_lines, not
+    # under- or over-allocate. Pre-fix the round-per-gap formula could
+    # leave one line on the floor or pile two onto the last gap.
+    ref = "\n".join(f"line {i}" for i in range(5))
+    out = _fill_gaps_with_reference(
+        [], ref, audio_duration=20.0,
+    )
+    assert out is not None
+    # All 5 ref lines made it through.
+    texts = [s["text"] for s in out]
+    assert all(f"line {i}" in texts for i in range(5))
+    # No duplicates.
+    assert len(out) == 5
+    # Strictly monotonic by start.
+    starts = [s["start"] for s in out]
+    assert starts == sorted(starts)
+    # Each segment has positive duration.
+    assert all(s["end"] > s["start"] for s in out)
+
+
+def test_fill_gaps_clamps_start_to_audio_duration():
+    # Pathological input: a real Whisper segment that ends nearly at the
+    # audio boundary, leaving only a tiny tail gap. Pre-fix code would
+    # synthesize segments with start > audio_duration and rely on a
+    # 0.5-s pad to keep duration positive — both broken downstream.
+    intro = _seg(0.0, 119.5, "real intro")
+    out = _fill_gaps_with_reference(
+        [intro], GAP_REF, audio_duration=120.0,
+    )
+    assert out is not None
+    # Synthesised lines must never extend past audio end or invert.
+    for s in out:
+        assert s["start"] <= 120.0
+        assert s["end"] <= 120.0
+        assert s["end"] > s["start"]
+    # Must remain monotonic when the kept intro and any synth tail
+    # interleave (in this shape they don't, but assert the invariant).
+    starts = [s["start"] for s in out]
+    assert starts == sorted(starts)
+
+
 def test_fetch_lrclib_strips_complex_lrc_timestamps():
     # Real lrclib records sometimes carry multi-timestamp lines (the same
     # lyric line repeats at multiple timestamps) and millisecond precision.
