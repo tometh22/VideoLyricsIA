@@ -77,7 +77,12 @@ export default function UploadZone({
   // back from /review (or any remount) preserves the operator's choice
   // of "ProRes 422 HQ" / frame size / fps, not just the file list.
   const [deliveryProfile, setDeliveryProfile] = useState(delivery?.delivery_profile || "youtube");
-  const [umgFrameSize, setUmgFrameSize] = useState(delivery?.umg_frame_size || "HD");
+  // umg_frame_size used to be operator-selectable but the source MP4
+  // is always 1920×1080, so anything > HD would be an ffmpeg upscale
+  // (lossy). We keep the field hardcoded to "HD" so the backend still
+  // gets a valid umg_spec; if UMG ever needs 4K from a native 4K
+  // source, expose the dropdown again + change the MP4 render spec.
+  const umgFrameSize = "HD";
   const [umgFps, setUmgFps] = useState(delivery?.umg_fps || 24);
   const [umgProresProfile, setUmgProresProfile] = useState(delivery?.umg_prores_profile || 3);
   const [deliveryExpanded, setDeliveryExpanded] = useState(false);
@@ -287,7 +292,7 @@ export default function UploadZone({
             <span className="text-sm text-white truncate">
               {deliveryProfile === "youtube"
                 ? "MP4 H.264 1080p"
-                : `ProRes ${umgFrameSize} ${umgFps} fps`}
+                : `MP4 + ProRes 1080p · ${umgFps} fps`}
             </span>
           </div>
           <span className="text-xs text-brand-light hover:text-brand transition-colors shrink-0">
@@ -321,13 +326,6 @@ export default function UploadZone({
             />
             {deliveryProfile !== "youtube" && (
               <>
-                <Listbox
-                  value={umgFrameSize}
-                  onChange={(v) => setUmgFrameSize(v)}
-                  options={UMG_FRAME_SIZES}
-                  className="w-56"
-                  ariaLabel="UMG frame size"
-                />
                 <Listbox
                   value={String(umgFps)}
                   onChange={(v) => setUmgFps(parseFloat(v))}
@@ -889,7 +887,7 @@ export default function UploadZone({
   if (files.length > 0) {
     summaryParts.push(`${files.length} ${files.length === 1 ? t("upload.file") : t("upload.files")}`);
   }
-  summaryParts.push(deliveryProfile === "youtube" ? "MP4 1080p" : `ProRes ${umgFrameSize}`);
+  summaryParts.push(deliveryProfile === "youtube" ? "MP4 1080p" : "MP4 + ProRes 1080p");
   if (bgMode === "library" && backgroundId) {
     const sel = libraryBgs.find((b) => b.id === backgroundId);
     if (sel) summaryParts.push(sel.name);
