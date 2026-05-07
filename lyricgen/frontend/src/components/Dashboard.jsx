@@ -1,5 +1,6 @@
 import { useState, useEffect } from "react";
 import { useI18n } from "../i18n";
+import { DashboardTour } from "./OnboardingTour";
 
 const API = import.meta.env.VITE_API_URL || "";
 
@@ -152,7 +153,7 @@ export default function Dashboard({ user, history, onSelectJob, onNewBatch, onVi
           </h1>
           <p className="text-sm text-ink-secondary mt-1.5">{monthlySubtitle}</p>
         </div>
-        <button onClick={onNewBatch} className="btn-primary px-6">
+        <button onClick={onNewBatch} className="btn-primary px-6" data-tour="dashboard-new-batch">
           <svg className="inline-block w-4 h-4 mr-2 -mt-0.5" fill="none" stroke="currentColor" strokeWidth="2.5" viewBox="0 0 24 24">
             <path d="M12 5v14M5 12h14" strokeLinecap="round"/>
           </svg>
@@ -213,7 +214,7 @@ export default function Dashboard({ user, history, onSelectJob, onNewBatch, onVi
       )}
 
       {/* ─── Plan usage — Stripe-style hero number, bar as secondary ── */}
-      <div className="rounded-card p-7 mb-10 bg-surface-2/40 ring-1 ring-white/[0.04]">
+      <div className="rounded-card p-7 mb-10 bg-surface-2/40 ring-1 ring-white/[0.04]" data-tour="dashboard-usage">
         <div className="flex items-end justify-between mb-5">
           <div>
             <SectionLabel>{t("dash.monthly_usage")}</SectionLabel>
@@ -293,7 +294,7 @@ export default function Dashboard({ user, history, onSelectJob, onNewBatch, onVi
 
       {/* ─── Tus últimos videos — visual scan, NOT a copy of History ── */}
       {recentDone.length > 0 && (
-        <div>
+        <div data-tour="dashboard-recent">
           <div className="flex items-center justify-between mb-4">
             <SectionLabel>Tus últimos videos</SectionLabel>
             <button onClick={onViewHistory} className="text-[11px] text-brand hover:text-brand-light transition-colors flex items-center gap-1 -translate-y-1.5">
@@ -310,6 +311,9 @@ export default function Dashboard({ user, history, onSelectJob, onNewBatch, onVi
           </div>
         </div>
       )}
+
+      {/* Onboarding tour — fires only on first dashboard visit for new users */}
+      <DashboardTour user={user} />
 
       {/* ─── Empty state — only when there is literally nothing ─── */}
       {history.length === 0 && (

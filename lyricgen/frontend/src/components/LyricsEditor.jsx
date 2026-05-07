@@ -1,5 +1,6 @@
 import { useState, useMemo, useRef, useEffect, useCallback } from "react";
 import { useI18n } from "../i18n";
+import { EditorTour } from "./OnboardingTour";
 
 function formatTime(seconds) {
   if (!isFinite(seconds) || seconds < 0) return "0:00";
@@ -74,7 +75,7 @@ function findSuggestion(whisperText, refLines, startIdx) {
   return null;
 }
 
-export default function LyricsEditor({ segments, filename, audioFile, referenceLyrics, coverageWarning = false, recoverySource = "", onApprove, onBack, isBatch = false, batchProgress = "" }) {
+export default function LyricsEditor({ segments, filename, audioFile, referenceLyrics, coverageWarning = false, recoverySource = "", onApprove, onBack, isBatch = false, batchProgress = "", user = null }) {
   const { t } = useI18n();
   const [edited, setEdited] = useState(() =>
     segments.map((s, i) => ({ ...s, _id: i }))
@@ -527,7 +528,7 @@ export default function LyricsEditor({ segments, filename, audioFile, referenceL
 
       {/* ─── Audio control bar — sticky-ish above the lyrics list ─── */}
       {audioUrl && (
-        <div className="mb-4 flex items-center gap-3 px-3 py-2.5 rounded-card bg-surface-2/60 ring-1 ring-white/[0.05]">
+        <div className="mb-4 flex items-center gap-3 px-3 py-2.5 rounded-card bg-surface-2/60 ring-1 ring-white/[0.05]" data-tour="editor-playbar">
           <button
             onClick={togglePlay}
             className="w-10 h-10 rounded-full bg-brand hover:bg-brand-light text-white flex items-center justify-center transition-colors shrink-0"
@@ -582,6 +583,7 @@ export default function LyricsEditor({ segments, filename, audioFile, referenceL
             </p>
           </div>
           <button
+            data-tour="editor-sync-entry"
             onClick={enterSyncMode}
             className="shrink-0 text-[11px] font-medium px-3 py-1.5 rounded-lg bg-brand/15 text-brand-light
               ring-1 ring-brand/30 hover:bg-brand/25 transition-colors"
@@ -701,6 +703,7 @@ export default function LyricsEditor({ segments, filename, audioFile, referenceL
               <div
                 key={seg._id}
                 ref={(el) => { rowRefs.current[seg._id] = el; }}
+                {...(idx === 0 ? { "data-tour": "editor-list-row" } : {})}
                 className={`group rounded-xl transition-all
                   ${isArmed ? "bg-brand/[0.18] ring-2 ring-brand shadow-glow scale-[1.01]" : ""}
                   ${!isArmed && isActive ? "bg-brand/[0.07] ring-1 ring-brand/25" : ""}
@@ -760,6 +763,7 @@ export default function LyricsEditor({ segments, filename, audioFile, referenceL
                   <div className="shrink-0 flex items-center gap-0.5 mt-0.5">
                     {!syncMode && (
                       <button onClick={() => enterSyncModeAt(idx)}
+                        {...(idx === 0 ? { "data-tour": "editor-row-sync" } : {})}
                         className="w-8 h-8 rounded-lg opacity-0 group-hover:opacity-100
                           hover:bg-brand/15 flex items-center justify-center text-gray-600
                           hover:text-brand-light transition-all"
@@ -796,6 +800,7 @@ export default function LyricsEditor({ segments, filename, audioFile, referenceL
             );
           })}
           <button
+            data-tour="editor-add-line"
             onClick={addBlankLine}
             className="w-full mt-2 py-2.5 rounded-xl border border-dashed border-white/[0.08]
               hover:border-brand/40 hover:bg-brand/[0.04] text-gray-500 hover:text-brand-light
@@ -821,10 +826,12 @@ export default function LyricsEditor({ segments, filename, audioFile, referenceL
             </span>
           )}
         </div>
-        <button onClick={handleApprove} className="btn-primary text-sm h-11 px-5 shrink-0">
+        <button onClick={handleApprove} className="btn-primary text-sm h-11 px-5 shrink-0" data-tour="editor-approve">
           {isBatch ? t("editor.approve_next") : t("editor.approve_generate")}
         </button>
       </div>
+
+      <EditorTour user={user} />
     </div>
   );
 }

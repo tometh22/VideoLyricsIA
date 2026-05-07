@@ -562,6 +562,7 @@ export default function App() {
                 allHaveArtist={allHaveArtist}
                 onStartReview={handleStartReview}
                 onGenerateDirect={handleGenerateDirect}
+                user={user}
               />
             </div>
           )}
@@ -609,6 +610,7 @@ export default function App() {
                 batchProgress={currentReview.queue.length > 1
                   ? `${currentReview.queueIdx + 1} ${t("editor.song_of")} ${currentReview.queue.length}`
                   : ""}
+                user={user}
               />
             </div>
           )}

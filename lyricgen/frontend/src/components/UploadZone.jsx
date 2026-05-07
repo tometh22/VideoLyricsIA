@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import { useI18n } from "../i18n";
 import Listbox from "./Listbox";
+import { UploadTour } from "./OnboardingTour";
 
 const API = import.meta.env.VITE_API_URL || "";
 
@@ -65,6 +66,7 @@ export default function UploadZone({
   allHaveArtist = false,
   onStartReview,
   onGenerateDirect,
+  user,
 }) {
   const { t } = useI18n();
   const inputRef = useRef();
@@ -347,6 +349,7 @@ export default function UploadZone({
 
   const _dropZone = (
       <div
+        data-tour="upload-dropzone"
         onDragOver={(e) => { e.preventDefault(); setDragging(true); }}
         onDragLeave={() => setDragging(false)}
         onDrop={handleDrop}
@@ -491,7 +494,7 @@ export default function UploadZone({
       {files.length > 0 && (
         <div className="mt-3 space-y-2 max-h-96 overflow-y-auto pr-1">
           {files.map((entry, i) => (
-            <div key={i} className="glass rounded-card px-4 py-3">
+            <div key={i} className="glass rounded-card px-4 py-3" {...(i === 0 ? { "data-tour": "upload-row" } : {})}>
               <div className="flex items-center gap-3 mb-2">
                 <div className="w-8 h-8 rounded-lg bg-brand/10 flex items-center justify-center shrink-0">
                   <svg className="w-4 h-4 text-brand" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24" strokeLinecap="round" strokeLinejoin="round">
@@ -673,7 +676,7 @@ export default function UploadZone({
           <p className="text-[11px] text-gray-600 uppercase tracking-wider mb-2">{t("upload.bg_label") || "Background"}</p>
 
           {/* Mode selector */}
-          <div className="flex gap-1 p-1 glass rounded-xl w-fit mb-3">
+          <div className="flex gap-1 p-1 glass rounded-xl w-fit mb-3" data-tour="upload-bg-tabs">
             {[
               { id: "auto", label: t("upload.bg_auto") || "IA Auto" },
               { id: "library", label: t("upload.bg_library") || "Library" },
@@ -896,6 +899,7 @@ export default function UploadZone({
 
   return (
     <div className="w-full max-w-4xl mx-auto pb-28">
+      <UploadTour user={user} />
       <div className="space-y-4">
         {_dropZone}
         {_filesBlock}
@@ -908,7 +912,7 @@ export default function UploadZone({
           scrolls a long batch + gallery, with a live summary so they
           can verify their picks before submitting. */}
       {files.length > 0 && (
-        <div className="fixed bottom-0 left-64 right-0 z-30 bg-surface-1/85 backdrop-blur-xl border-t border-white/[0.06] px-8 py-4">
+        <div className="fixed bottom-0 left-64 right-0 z-30 bg-surface-1/85 backdrop-blur-xl border-t border-white/[0.06] px-8 py-4" data-tour="upload-cta-bar">
           <div className="max-w-4xl mx-auto flex items-center gap-4">
             <div className="flex-1 min-w-0">
               <p className="text-[10px] uppercase tracking-[0.18em] text-gray-500">

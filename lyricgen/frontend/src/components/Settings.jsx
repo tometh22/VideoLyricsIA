@@ -1,5 +1,6 @@
 import { useState, useEffect } from "react";
 import { useI18n } from "../i18n";
+import { clearAllTourFlags } from "./OnboardingTour";
 
 const API = import.meta.env.VITE_API_URL || "";
 
@@ -424,23 +425,50 @@ export default function Settings({ onBack }) {
 
         {/* ════════════════════ ACCOUNT ════════════════════ */}
         {activeSection === "account" && (
-          <Card>
-            <SectionLabel>{t("settings.account_info") || "Información de cuenta"}</SectionLabel>
-            <div>
-              {[
-                { label: t("login.username"), value: user?.username },
-                { label: "Email",             value: user?.email || "—" },
-                { label: "Plan",              value: planInfo.label, valueClass: planInfo.color + " font-medium" },
-                { label: "Rol",               value: user?.role || "user" },
-              ].map((row, i, arr) => (
-                <div key={row.label}
-                  className={`flex items-center justify-between py-3 ${i < arr.length - 1 ? "border-b border-white/[0.03]" : ""}`}>
-                  <span className="text-xs text-ink-secondary">{row.label}</span>
-                  <span className={`text-sm ${row.valueClass || "text-white"}`}>{row.value}</span>
+          <>
+            <Card>
+              <SectionLabel>{t("settings.account_info") || "Información de cuenta"}</SectionLabel>
+              <div>
+                {[
+                  { label: t("login.username"), value: user?.username },
+                  { label: "Email",             value: user?.email || "—" },
+                  { label: "Plan",              value: planInfo.label, valueClass: planInfo.color + " font-medium" },
+                  { label: "Rol",               value: user?.role || "user" },
+                ].map((row, i, arr) => (
+                  <div key={row.label}
+                    className={`flex items-center justify-between py-3 ${i < arr.length - 1 ? "border-b border-white/[0.03]" : ""}`}>
+                    <span className="text-xs text-ink-secondary">{row.label}</span>
+                    <span className={`text-sm ${row.valueClass || "text-white"}`}>{row.value}</span>
+                  </div>
+                ))}
+              </div>
+            </Card>
+
+            <Card>
+              <SectionLabel>{t("settings.tour_label") || "Tour guiado"}</SectionLabel>
+              <div className="flex items-center justify-between gap-4 py-3">
+                <div className="min-w-0">
+                  <p className="text-sm text-white">
+                    {t("settings.tour_replay_title") || "Volver a ver el tour"}
+                  </p>
+                  <p className="text-xs text-ink-secondary mt-0.5">
+                    {t("settings.tour_replay_hint") || "Repasá las funciones del Inicio, Crear video y Editor."}
+                  </p>
                 </div>
-              ))}
-            </div>
-          </Card>
+                <button
+                  onClick={() => {
+                    clearAllTourFlags();
+                    alert(t("settings.tour_replay_alert") || "Listo. Te llevamos al inicio para empezar el tour.");
+                    window.location.assign("/");
+                  }}
+                  className="shrink-0 text-[12px] font-medium px-4 py-2 rounded-lg bg-brand/15 text-brand-light
+                    ring-1 ring-brand/30 hover:bg-brand/25 transition-colors"
+                >
+                  {t("settings.tour_replay_btn") || "Ver tour de nuevo"}
+                </button>
+              </div>
+            </Card>
+          </>
         )}
       </div>
     </div>
