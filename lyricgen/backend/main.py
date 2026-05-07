@@ -1446,6 +1446,7 @@ FILE_MAP = {
     "short": "short.mp4",
     "thumbnail": "thumbnail.jpg",
     "umg_master": "umg_master.mov",
+    "umg_short": "umg_short.mov",
 }
 
 MEDIA_TYPES = {
@@ -1453,10 +1454,11 @@ MEDIA_TYPES = {
     "short": "video/mp4",
     "thumbnail": "image/jpeg",
     "umg_master": "video/quicktime",
+    "umg_short": "video/quicktime",
 }
 
 # File types that can't be previewed in-browser (ProRes is not browser-playable).
-NON_PREVIEWABLE = {"umg_master"}
+NON_PREVIEWABLE = {"umg_master", "umg_short"}
 
 # Bundled in the "download all" zip. We exclude umg_master deliberately —
 # ProRes masters are 1+ GB and have their own dedicated button in the UI.
@@ -1577,55 +1579,69 @@ async def download(
 
     file_path = os.path.join(OUTPUTS_DIR, job_id, FILE_MAP[file_type])
 
-    # Lazy ProRes: the pipeline no longer produces umg_master.mov at
-    # render time (used to be a second moviepy pass that hung). The
-    # first GET /download/{id}/umg_master after a delivery_profile in
-    # (umg, both) job triggers an ffmpeg transcode of the existing
-    # MP4 → ProRes per the job's umg_spec, persists the .mov so the
-    # next download is instant, and serves the file. Blocks the HTTP
+    # Lazy ProRes: the pipeline no longer produces umg_master.mov or
+    # umg_short.mov at render time (used to be a second moviepy pass
+    # that hung). The first GET /download/{id}/umg_master (or
+    # /umg_short) after a delivery_profile in (umg, both) job triggers
+    # an ffmpeg transcode of the existing MP4/short → ProRes per the
+    # job's umg_spec (master keeps the configured frame size, short
+    # uses 1080×1920 vertical at the same fps + profile). Persists
+    # the .mov so the next download is instant. Blocks the HTTP
     # request for the duration (~60-120 s for a 3-min song); the
     # browser's native download UI handles the wait.
-    if file_type == "umg_master" and not os.path.exists(file_path):
+    if file_type in ("umg_master", "umg_short") and not os.path.exists(file_path):
         umg_spec = job.get("umg_spec")
         if not umg_spec:
             raise HTTPException(
                 status_code=400,
-                detail="This job did not request UMG delivery; no master available.",
+                detail="This job did not request UMG delivery; ProRes not available.",
             )
-        mp4_path = os.path.join(OUTPUTS_DIR, job_id, FILE_MAP["video"])
-        if not os.path.exists(mp4_path):
-            # MP4 may live in R2 — fetch it locally so ffmpeg can read it.
-            mp4_key = (job.get("s3_keys") or {}).get("video")
-            if mp4_key and storage.is_enabled():
-                os.makedirs(os.path.dirname(mp4_path), exist_ok=True)
-                if not storage.download_object(mp4_key, mp4_path):
+        # Pick the source mp4 and the spec for this variant.
+        if file_type == "umg_master":
+            source_filename = FILE_MAP["video"]
+            source_key_name = "video"
+        else:  # umg_short
+            source_filename = FILE_MAP["short"]
+            source_key_name = "short"
+        source_path = os.path.join(OUTPUTS_DIR, job_id, source_filename)
+        if not os.path.exists(source_path):
+            # Source mp4 may live in R2 — fetch it locally so ffmpeg can read it.
+            source_key = (job.get("s3_keys") or {}).get(source_key_name)
+            if source_key and storage.is_enabled():
+                os.makedirs(os.path.dirname(source_path), exist_ok=True)
+                if not storage.download_object(source_key, source_path):
                     raise HTTPException(
                         status_code=404,
-                        detail="Source MP4 not available locally or in R2.",
+                        detail=f"Source {source_filename} not available locally or in R2.",
                     )
             else:
                 raise HTTPException(
                     status_code=404,
-                    detail="Source MP4 not found; cannot generate ProRes master.",
+                    detail=f"Source {source_filename} not found; cannot generate ProRes.",
                 )
-        from pipeline import _transcode_mp4_to_prores
+        from pipeline import _transcode_to_prores, _short_prores_spec
+        from render_spec import RenderSpec as _RenderSpec
         try:
-            _transcode_mp4_to_prores(mp4_path, file_path, umg_spec)
+            spec = (
+                _RenderSpec.umg(**umg_spec) if file_type == "umg_master"
+                else _short_prores_spec(umg_spec)
+            )
+            _transcode_to_prores(source_path, file_path, spec)
         except Exception as exc:
             raise HTTPException(
                 status_code=500,
                 detail=f"ProRes transcode failed: {exc}",
             )
-        # Best-effort R2 upload so future downloads of this master skip
+        # Best-effort R2 upload so future downloads of this ProRes skip
         # the transcode entirely. Don't fail the response if it errors.
         try:
             if storage.is_enabled():
                 key = storage.upload_master(
-                    file_path, tenant_id, job_id, FILE_MAP["umg_master"],
+                    file_path, tenant_id, job_id, FILE_MAP[file_type],
                 )
                 if key:
                     keys = dict(job.get("s3_keys") or {})
-                    keys["umg_master"] = key
+                    keys[file_type] = key
                     from jobs import update_job as _update_job
                     _update_job(job_id, s3_keys=keys)
         except Exception as e:  # pragma: no cover

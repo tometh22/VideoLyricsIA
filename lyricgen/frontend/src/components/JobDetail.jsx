@@ -192,9 +192,14 @@ export default function JobDetail({ job, onBack, onJobUpdate }) {
   // why the click feels slow on this run only. Subsequent clicks are
   // instant because the .mov is cached on disk + R2.
   const [proResHint, setProResHint] = useState(false);
-  const downloadProRes = () => {
+  const downloadProResMaster = () => {
     setProResHint(true);
     window.location.href = `${API}/download/${job.job_id}/umg_master?${tokenParam()}`;
+    setTimeout(() => setProResHint(false), 8000);
+  };
+  const downloadProResShort = () => {
+    setProResHint(true);
+    window.location.href = `${API}/download/${job.job_id}/umg_short?${tokenParam()}`;
     setTimeout(() => setProResHint(false), 8000);
   };
 
@@ -264,6 +269,12 @@ export default function JobDetail({ job, onBack, onJobUpdate }) {
   const hasUmgMaster =
     (job.delivery_profile === "umg" || job.delivery_profile === "both") &&
     !!job.files?.umg_master_url;
+  // Short ProRes follows the same opt-in: any UMG-flavoured job gets a
+  // separate vertical-format master alongside the main one. Generated
+  // lazily by /download/{id}/umg_short the first time it's clicked.
+  const hasUmgShort =
+    (job.delivery_profile === "umg" || job.delivery_profile === "both") &&
+    !!job.files?.umg_short_url;
 
   const ALL_TABS = [
     ...MEDIA_TABS,
@@ -323,11 +334,15 @@ export default function JobDetail({ job, onBack, onJobUpdate }) {
                   {t("detail.download_all") || "Descargar todo"}
                 </button>
                 {hasUmgMaster && (
-                  <button onClick={downloadProRes} className="btn-secondary text-xs h-10 px-4">
+                  <button onClick={downloadProResMaster} className="btn-secondary text-xs h-10 px-4">
                     {downloadIcon}
-                    {profile === "both"
-                      ? (t("detail.download_master") || "Master ProRes")
-                      : (t("detail.download_master") || "Master ProRes")}
+                    {t("detail.download_master") || "Master ProRes"}
+                  </button>
+                )}
+                {hasUmgShort && (
+                  <button onClick={downloadProResShort} className="btn-secondary text-xs h-10 px-4">
+                    {downloadIcon}
+                    {t("detail.download_short_prores") || "Short ProRes"}
                   </button>
                 )}
               </>

@@ -58,6 +58,7 @@ _DELIVERABLE_FILENAMES = {
     "short": "short.mp4",
     "thumbnail": "thumbnail.jpg",
     "umg_master": "umg_master.mov",
+    "umg_short": "umg_short.mov",
 }
 
 
@@ -411,12 +412,15 @@ def run_pipeline(job_id: str, mp3_path: str, artist: str, style: str,
             files["video_url"] = f"/download/{job_id}/video"
             update_job(job_id, progress=55)
 
-        # Lazy ProRes — register the URL so the UI shows a
-        # "Master ProRes" download button. The actual .mov is
-        # generated on the first GET /download/{id}/umg_master from
-        # the existing MP4 via ffmpeg (no moviepy involvement).
+        # Lazy ProRes — register the URLs so the UI shows the
+        # "Master ProRes" + "Short ProRes" download buttons. The
+        # actual .mov files are generated on the first GET
+        # /download/{id}/umg_master or /download/{id}/umg_short
+        # from the existing MP4 / short.mp4 via ffmpeg (no moviepy
+        # involvement).
         if wants_umg:
             files["umg_master_url"] = f"/download/{job_id}/umg_master"
+            files["umg_short_url"] = f"/download/{job_id}/umg_short"
 
         # Step 3 — YouTube Short. Generated for any profile that
         # asked for video/UMG so the operator/UMG team always has the
@@ -3676,27 +3680,54 @@ def _eval_fraction(value: str) -> float:
         return 0.0
 
 
-def _transcode_mp4_to_prores(mp4_path: str, mov_path: str,
-                              umg_spec: dict, timeout_sec: int = 600) -> None:
-    """Transcode the rendered MP4 → ProRes .mov per UMG delivery spec.
+def _short_prores_spec(umg_spec: dict) -> "RenderSpec":
+    """Build a vertical (1080×1920, 9:16) ProRes spec out of a UMG
+    delivery dict. We keep the operator's chosen fps + prores_profile
+    so the ProRes short stays consistent with the master, but flip
+    dimensions and DAR for the short's vertical canvas.
+    """
+    from render_spec import UMG_PRORES_PROFILES
+    profile_id = int(umg_spec.get("prores_profile", 3))
+    fps_val = float(umg_spec.get("fps", 24.0))
+    prof = UMG_PRORES_PROFILES.get(profile_id, UMG_PRORES_PROFILES[3])
+    return RenderSpec(
+        profile="umg",
+        width=1080, height=1920,
+        fps=fps_val,
+        dar=(9, 16),
+        codec="prores_ks",
+        prores_profile=profile_id,
+        pix_fmt=prof["pix_fmt"],
+        audio_codec="pcm_s24le",
+        color_primaries="bt709",
+        container="mov",
+    )
 
-    Used by /download/{id}/umg_master to produce the master lazily, on
-    the first download click, instead of running a second moviepy
-    render at pipeline time. ffmpeg only — no moviepy involvement —
-    so the moviepy palindrome-loop hang that breaks the dual-render
-    path doesn't apply here.
+
+def _transcode_to_prores(input_path: str, mov_path: str,
+                          spec: "RenderSpec",
+                          timeout_sec: int = 600) -> None:
+    """Transcode an h264 mp4 → ProRes .mov per the given RenderSpec.
+
+    Used by /download/{id}/umg_master and /download/{id}/umg_short to
+    produce ProRes deliverables lazily on the first download click,
+    instead of running a second moviepy render at pipeline time.
+    ffmpeg only — no moviepy involvement — so the moviepy palindrome-
+    loop hang that breaks the dual-render path doesn't apply here.
 
     Args:
-      mp4_path:   path to the existing lyric_video.mp4 (1080p / 24).
+      input_path: path to the existing source mp4 (lyric_video.mp4
+                  or short.mp4).
       mov_path:   destination for the ProRes .mov.
-      umg_spec:   dict matching RenderSpec.umg(...) kwargs:
-                  frame_size, fps, prores_profile.
+      spec:       a RenderSpec — RenderSpec.umg(**umg_spec) for the
+                  master, or _short_prores_spec(umg_spec) for the
+                  vertical short.
       timeout_sec: hard kill after N seconds. 10 min is plenty for a
                    3-min song; longer means ffmpeg hung on a bad file.
 
     The output passes _validate_umg_master under normal conditions:
-      - codec=prores_ks, profile per umg_spec
-      - exact width × height per RenderSpec.umg
+      - codec=prores_ks, profile per spec
+      - exact width × height (lanczos scale)
       - fps via -r (rational for fractional fps), enforced on the
         bitstream so ffprobe reports the same value
       - audio re-encoded to pcm_s24le @ 48 kHz @ 2 ch
@@ -3705,10 +3736,9 @@ def _transcode_mp4_to_prores(mp4_path: str, mov_path: str,
     Raises RuntimeError on ffmpeg failure or post-transcode validation
     failure. The caller is responsible for cleaning up partial output.
     """
-    spec = RenderSpec.umg(**umg_spec)
     cmd = [
         "ffmpeg", "-y", "-loglevel", "error",
-        "-i", mp4_path,
+        "-i", input_path,
         # Video filter: scale to target dims (lanczos = sharp upscale,
         # decent downscale), force fps, normalize SAR so DAR is set
         # purely by -aspect below.
@@ -3733,7 +3763,7 @@ def _transcode_mp4_to_prores(mp4_path: str, mov_path: str,
         "-f", "mov",
         mov_path,
     ]
-    print(f"[PRORES] transcoding {os.path.basename(mp4_path)} → "
+    print(f"[PRORES] transcoding {os.path.basename(input_path)} → "
           f"{os.path.basename(mov_path)} ({spec.width}×{spec.height} @ "
           f"{spec.fps_str}, profile {spec.prores_profile})")
     result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout_sec)

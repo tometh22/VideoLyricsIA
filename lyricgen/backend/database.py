@@ -163,6 +163,7 @@ class Job(Base):
     short_url = Column(String(500), nullable=True)
     thumbnail_url = Column(String(500), nullable=True)
     umg_master_url = Column(String(500), nullable=True)
+    umg_short_url = Column(String(500), nullable=True)
 
     # Cloud storage keys (when deliverables are uploaded to R2/S3)
     s3_keys = Column(JSON, nullable=True)
@@ -202,6 +203,7 @@ class Job(Base):
                 "short_url": self.short_url,
                 "thumbnail_url": self.thumbnail_url,
                 "umg_master_url": self.umg_master_url,
+                "umg_short_url": self.umg_short_url,
             },
             "s3_keys": self.s3_keys,
             "error": self.error,
@@ -391,6 +393,7 @@ def _migrate_user_columns():
     from sqlalchemy import text
     column_adds = [
         "ALTER TABLE users ADD COLUMN IF NOT EXISTS allow_overage BOOLEAN DEFAULT FALSE NOT NULL",
+        "ALTER TABLE jobs ADD COLUMN IF NOT EXISTS umg_short_url VARCHAR(500)",
     ]
     with engine.begin() as conn:
         for sql in column_adds:
