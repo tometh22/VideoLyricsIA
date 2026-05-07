@@ -432,6 +432,31 @@ export default function App() {
     }
   };
 
+  const handleBulkDeleteJobs = async (jobIds) => {
+    if (!Array.isArray(jobIds) || jobIds.length === 0) return;
+    try {
+      const res = await authFetch(`${API}/jobs/bulk-delete`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ job_ids: jobIds }),
+      });
+      if (!res.ok) {
+        const data = await res.json().catch(() => ({}));
+        alert(data.detail || "No se pudieron eliminar.");
+        return;
+      }
+      const data = await res.json().catch(() => ({ deleted: [], skipped: {} }));
+      const deletedSet = new Set(data.deleted || []);
+      setHistory((prev) => prev.filter((j) => !deletedSet.has(j.job_id)));
+      const skippedCount = Object.keys(data.skipped || {}).length;
+      if (skippedCount > 0) {
+        alert(`${data.deleted.length} eliminados, ${skippedCount} omitidos (protegidos o no encontrados).`);
+      }
+    } catch {
+      alert("Error de red al eliminar.");
+    }
+  };
+
   const handleNav = (id) => {
     if (id === "dashboard") { setView("dashboard"); setSelectedJob(null); }
     else if (id === "new") { setView("new"); setFiles([]); }
@@ -529,6 +554,7 @@ export default function App() {
               history={history}
               onSelect={handleSelectJob}
               onDelete={handleDeleteJob}
+              onBulkDelete={handleBulkDeleteJobs}
               onBack={() => setView("dashboard")}
             />
           )}

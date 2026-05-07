@@ -61,7 +61,7 @@ import storage
 from datetime import datetime, timedelta, timezone
 
 from database import Job, User, UserSettings, AuditLog, get_db, init_db
-from jobs import create_job, delete_job, get_job, get_all_jobs, update_job
+from jobs import bulk_delete_jobs, create_job, delete_job, get_job, get_all_jobs, update_job
 from observability import init_sentry, init_logging, health_snapshot
 from pipeline import run_pipeline, transcribe
 from queue_jobs import enqueue_pipeline, queue_depth
@@ -1356,6 +1356,28 @@ async def delete_job_endpoint(
             )
         raise HTTPException(status_code=400, detail=reason)
     return {"deleted": job_id}
+
+
+@app.post("/jobs/bulk-delete")
+async def bulk_delete_jobs_endpoint(
+    payload: dict,
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Delete many jobs in one round-trip. Body: {"job_ids": ["aaa", "bbb"]}.
+    Returns {"deleted": [...ids...], "skipped": {"id": reason}} so the UI
+    can surface which IDs were protected (e.g. status=done) or didn't exist.
+    Same safety rules as the single delete: only stuck/failed jobs go through.
+    """
+    tenant_id = current_user["tenant_id"]
+    ids = payload.get("job_ids") if isinstance(payload, dict) else None
+    if not isinstance(ids, list) or not all(isinstance(x, str) for x in ids):
+        raise HTTPException(status_code=400, detail="Body must be {job_ids: [string, ...]}.")
+    # Cap to a reasonable per-request batch so a runaway client can't
+    # nuke the whole table in one call.
+    if len(ids) > 200:
+        raise HTTPException(status_code=400, detail="Too many ids in one request (max 200).")
+    return bulk_delete_jobs(db, ids, tenant_id)
 
 
 FILE_MAP = {

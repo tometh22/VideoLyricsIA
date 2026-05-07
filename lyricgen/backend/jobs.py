@@ -68,15 +68,64 @@ def delete_job(db: Session, job_id: str, tenant_id: str) -> tuple[bool, str]:
     must be kept for the audit trail (UMG compliance + plan-quota counting).
     The operator's intent here is cleaning up junk, not erasing approved
     deliveries.
+
+    AIProvenance has a NOT NULL FK to jobs.job_id without ON DELETE CASCADE,
+    so we have to clean up its rows manually before the parent delete or
+    Postgres raises IntegrityError → 500. Failed/stuck jobs may have started
+    accumulating provenance entries (e.g. lyrics_reference_fetch attempts)
+    even though the render never completed.
     """
+    from database import AIProvenance  # local import to avoid circular
+
     job = db.query(Job).filter(Job.job_id == job_id, Job.tenant_id == tenant_id).first()
     if not job:
         return False, "not_found"
     if job.status not in _DELETABLE_STATUSES:
         return False, f"protected_status:{job.status}"
+    db.query(AIProvenance).filter(AIProvenance.job_id == job_id).delete(synchronize_session=False)
     db.delete(job)
     db.commit()
     return True, "ok"
+
+
+def bulk_delete_jobs(db: Session, job_ids: list[str], tenant_id: str) -> dict:
+    """Delete many jobs in one transaction. Returns {deleted: [...], skipped: {id: reason}}.
+
+    Skipped reasons: 'not_found', 'protected_status:<status>'. The endpoint
+    surfaces this dict so the operator sees exactly which IDs were ignored
+    and why.
+    """
+    from database import AIProvenance
+
+    deleted: list[str] = []
+    skipped: dict[str, str] = {}
+    if not job_ids:
+        return {"deleted": deleted, "skipped": skipped}
+
+    rows = (
+        db.query(Job)
+        .filter(Job.tenant_id == tenant_id, Job.job_id.in_(job_ids))
+        .all()
+    )
+    found_ids = {r.job_id for r in rows}
+    for jid in job_ids:
+        if jid not in found_ids:
+            skipped[jid] = "not_found"
+
+    deletable_ids: list[str] = []
+    for r in rows:
+        if r.status not in _DELETABLE_STATUSES:
+            skipped[r.job_id] = f"protected_status:{r.status}"
+        else:
+            deletable_ids.append(r.job_id)
+
+    if deletable_ids:
+        db.query(AIProvenance).filter(AIProvenance.job_id.in_(deletable_ids)).delete(synchronize_session=False)
+        db.query(Job).filter(Job.tenant_id == tenant_id, Job.job_id.in_(deletable_ids)).delete(synchronize_session=False)
+        db.commit()
+        deleted = deletable_ids
+
+    return {"deleted": deleted, "skipped": skipped}
 
 
 def get_all_jobs(db: Session, tenant_id: str = "default", limit: int = 200) -> list[dict]:
