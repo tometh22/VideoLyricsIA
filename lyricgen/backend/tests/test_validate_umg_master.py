@@ -31,11 +31,21 @@ def _make_prores(out_path: str, *,
                  pix_fmt: str = "yuv422p10le",
                  colorspace: str = "bt709",
                  dar: str = "16:9",
-                 duration: float = 1.0) -> None:
-    """Encode a tiny ProRes test fixture via direct ffmpeg."""
+                 duration: float = 1.0,
+                 with_audio: bool = True) -> None:
+    """Encode a tiny ProRes test fixture via direct ffmpeg.
+
+    Includes a silent stereo PCM audio track by default — UMG masters
+    must ship with audio, and `_validate_umg_master` rejects video-only
+    files. Pass `with_audio=False` to negative-test the audio gate.
+    """
     cmd = [
         "ffmpeg", "-v", "error", "-y",
         "-f", "lavfi", "-i", f"color=c=black:s={width}x{height}:r={fps}",
+    ]
+    if with_audio:
+        cmd += ["-f", "lavfi", "-i", "anullsrc=r=48000:cl=stereo"]
+    cmd += [
         "-t", str(duration),
         "-r", fps,
         "-c:v", "prores_ks",
@@ -48,8 +58,11 @@ def _make_prores(out_path: str, *,
         "-color_range", "tv",
         "-aspect", dar,
         "-vf", "setsar=1",
-        out_path,
     ]
+    if with_audio:
+        # UMG spec requires 24-bit PCM (pcm_s24le) at 48 kHz stereo.
+        cmd += ["-c:a", "pcm_s24le", "-ar", "48000", "-ac", "2", "-shortest"]
+    cmd += [out_path]
     result = subprocess.run(cmd, capture_output=True, text=True)
     assert result.returncode == 0, f"ffmpeg failed: {result.stderr}"
 
