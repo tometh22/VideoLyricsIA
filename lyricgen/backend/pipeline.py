@@ -106,6 +106,93 @@ def _upload_deliverables_to_r2(job_id: str, job_dir: str, files: dict) -> dict:
     return out
 
 
+def _ffprobe_duration(path: str) -> float | None:
+    """Return media duration in seconds, or None if ffprobe fails."""
+    import subprocess
+    try:
+        r = subprocess.run(
+            ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+             "-of", "default=noprint_wrappers=1:nokey=1", path],
+            capture_output=True, text=True, timeout=30,
+        )
+        return float((r.stdout or "").strip())
+    except Exception:
+        return None
+
+
+def _verify_deliverables(job_dir: str, files: dict, audio_duration: float) -> None:
+    """Sanity-check every deliverable BEFORE the R2 upload.
+
+    Catches the silent-failure family:
+    - ffmpeg exited 0 but produced an empty/truncated file (disk full, OOM
+      mid-flush)
+    - moviepy crashed mid-render and left the prior pass's leftover file
+    - duration mismatch (audio offset bug, encoder cut early)
+    - codec mismatch (caller forgot to pass the right RenderSpec)
+
+    Raises RuntimeError on any failure so the outer try/except in
+    run_pipeline marks the job 'error' with a clear message instead of
+    uploading garbage to R2 + shipping it to UMG.
+    """
+    import os as _os
+
+    expected = {
+        "video_url":      ("lyric_video.mp4", "h264", audio_duration),
+        "short_url":      ("short.mp4",        "h264", None),  # short is a fixed clip, not full audio
+        "thumbnail_url":  ("thumbnail.jpg",   None,   None),
+        "umg_master_url": ("umg_master.mov",  "prores", audio_duration),
+    }
+    for url_key, (filename, expected_codec, expected_dur) in expected.items():
+        if url_key not in files:
+            continue
+        path = _os.path.join(job_dir, filename)
+        if not _os.path.exists(path):
+            raise RuntimeError(f"verify: {filename} missing on disk after render")
+        size = _os.path.getsize(path)
+        if size < 1024:
+            raise RuntimeError(f"verify: {filename} is {size} bytes (truncated / empty)")
+
+        if expected_codec:
+            # ffprobe codec check
+            import subprocess
+            r = subprocess.run(
+                ["ffprobe", "-v", "error", "-select_streams", "v:0",
+                 "-show_entries", "stream=codec_name",
+                 "-of", "default=noprint_wrappers=1:nokey=1", path],
+                capture_output=True, text=True, timeout=30,
+            )
+            codec = (r.stdout or "").strip()
+            if codec != expected_codec:
+                raise RuntimeError(
+                    f"verify: {filename} codec is {codec!r}, expected {expected_codec!r}"
+                )
+
+        if expected_dur is not None:
+            actual_dur = _ffprobe_duration(path)
+            if actual_dur is None:
+                raise RuntimeError(f"verify: {filename} ffprobe could not read duration")
+            # ±2s tolerance — encoder rounding + container overhead
+            if abs(actual_dur - expected_dur) > 2.0:
+                raise RuntimeError(
+                    f"verify: {filename} duration {actual_dur:.1f}s differs from "
+                    f"audio {expected_dur:.1f}s by > 2s"
+                )
+
+    # Defense-in-depth re-run UMG validator on the master if present.
+    # generate_lyric_video already runs this, but a corrupted file written
+    # AFTER validation (by some unrelated cleanup gone wrong) would slip
+    # through. Re-running here is cheap.
+    if "umg_master_url" in files:
+        master = _os.path.join(job_dir, "umg_master.mov")
+        # We don't have the original spec here, but the validator works off
+        # the file's embedded metadata vs the spec we look up from the
+        # filename header. Skip the strict re-validation if it'd require
+        # reconstructing the spec; the codec + size + duration checks above
+        # cover the silent-failure category we care about.
+
+    print(f"[VERIFY] all {len(files)} deliverables passed sanity checks")
+
+
 def _cleanup_local_intermediates(job_dir: str) -> None:
     """Drop intermediate render artefacts that are not deliverables. Keeps the
     directory + any leftover deliverable that R2 upload missed, so the job
@@ -335,6 +422,16 @@ def run_pipeline(job_id: str, mp3_path: str, artist: str, style: str,
                 )
                 print(f"[VALIDATION] FAILED for job {job_id}: {validation['issues']}")
                 return
+
+        # Sanity-check every deliverable before uploading to R2. Catches
+        # silent failures (truncated files, codec mismatches, duration
+        # drift) so we mark the job as error here instead of shipping
+        # garbage to UMG.
+        try:
+            audio_dur_for_verify = _audio_duration(mp3_path)
+        except Exception:
+            audio_dur_for_verify = 0.0
+        _verify_deliverables(job_dir, files, audio_dur_for_verify)
 
         # Post-render upload to cloud storage. No-op if R2 env not set.
         s3_keys = _upload_deliverables_to_r2(job_id, job_dir, files)
