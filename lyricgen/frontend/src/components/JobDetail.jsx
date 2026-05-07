@@ -177,13 +177,16 @@ export default function JobDetail({ job, onBack, onJobUpdate }) {
     );
   }
 
-  const downloadAll = () => {
-    ["video", "short", "thumbnail"].forEach((type) => {
-      const a = document.createElement("a");
-      a.href = `${API}/download/${job.job_id}/${type}?${tokenParam()}`;
-      a.download = "";
-      a.click();
-    });
+  // Single navigation to a server-streamed zip. The previous "loop three
+  // <a>.click() calls" approach got blocked as popup spam by Chrome —
+  // the browser would only honour the last click (thumbnail) and open it
+  // in a tab instead of downloading. /download/{id}/all bundles the
+  // small deliverables server-side so we get one click → one file.
+  const downloadAllZip = () => {
+    window.location.href = `${API}/download/${job.job_id}/all?${tokenParam()}`;
+  };
+  const downloadProRes = () => {
+    window.location.href = `${API}/download/${job.job_id}/umg_master?${tokenParam()}`;
   };
 
   const previewMetadata = async () => {
@@ -293,14 +296,33 @@ export default function JobDetail({ job, onBack, onJobUpdate }) {
           </div>
         </div>
         <div className="flex gap-2 shrink-0">
-          {canDownload && (
-            <button onClick={downloadAll} className="btn-secondary text-xs h-10 px-4">
+          {canDownload && (() => {
+            const profile = job.delivery_profile || "youtube";
+            const onlyUmg = profile === "umg";
+            const downloadIcon = (
               <svg className="inline-block w-4 h-4 mr-1.5 -mt-0.5" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
                 <path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4" /><polyline points="7 10 12 15 17 10" /><line x1="12" y1="15" x2="12" y2="3" />
               </svg>
-              {t("detail.download")}
-            </button>
-          )}
+            );
+            return (
+              <>
+                {!onlyUmg && (
+                  <button onClick={downloadAllZip} className="btn-secondary text-xs h-10 px-4">
+                    {downloadIcon}
+                    {t("detail.download_all") || "Descargar todo"}
+                  </button>
+                )}
+                {hasUmgMaster && (
+                  <button onClick={downloadProRes} className="btn-secondary text-xs h-10 px-4">
+                    {downloadIcon}
+                    {profile === "both"
+                      ? (t("detail.download_master") || "Master ProRes")
+                      : (t("detail.download") || "Descargar")}
+                  </button>
+                )}
+              </>
+            );
+          })()}
           {canDownload && !youtubeResult && (
             <button onClick={previewMetadata} className="btn-primary text-xs h-10 px-5">
               <svg className="inline-block w-4 h-4 mr-1.5 -mt-0.5" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">

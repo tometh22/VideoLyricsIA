@@ -33,7 +33,7 @@ if _SENTRY_DSN:
 
 from fastapi import FastAPI, File, Form, Query, UploadFile, HTTPException, Depends, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, JSONResponse, RedirectResponse
+from fastapi.responses import FileResponse, JSONResponse, RedirectResponse, StreamingResponse
 from pydantic import BaseModel
 from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.util import get_remote_address
@@ -1407,6 +1407,97 @@ MEDIA_TYPES = {
 
 # File types that can't be previewed in-browser (ProRes is not browser-playable).
 NON_PREVIEWABLE = {"umg_master"}
+
+# Bundled in the "download all" zip. We exclude umg_master deliberately —
+# ProRes masters are 1+ GB and have their own dedicated button in the UI.
+_BUNDLE_TYPES = ("video", "short", "thumbnail")
+
+
+@app.get("/download/{job_id}/all")
+async def download_all_zip(
+    job_id: str,
+    token: str = Query(...),
+    db: Session = Depends(get_db),
+):
+    """Bundle the small deliverables (video MP4 + short + thumbnail) into a
+    single ZIP so the operator gets one download instead of three rapid
+    a.click() calls (which the browser treats as popup spam and drops).
+
+    UMG ProRes masters are excluded by design: they're huge (1+ GB) and
+    UMG editorial expects them as a stand-alone .mov, not buried in a zip.
+    """
+    import io as _io
+    import zipfile as _zip
+
+    current_user = get_current_user_from_token_param(token, db)
+    tenant_id = current_user["tenant_id"]
+    job = get_job(db, job_id, tenant_id=tenant_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="Job not found.")
+    if job["status"] != "done":
+        raise HTTPException(status_code=400, detail="Job is not done yet.")
+
+    job_files = job.get("files") or {}
+    s3_keys = job.get("s3_keys") or {}
+    bundle = [t for t in _BUNDLE_TYPES if job_files.get(f"{t}_url")]
+    if not bundle:
+        # umg-only jobs land here — they should be downloading the ProRes
+        # master directly via /download/{id}/umg_master, not /all.
+        raise HTTPException(
+            status_code=400,
+            detail="No bundleable deliverables for this job (UMG-only? use the master button).",
+        )
+
+    # Stage R2-stored files into a tmpdir so zipfile can stream them.
+    # Keep files on disk only for the lifetime of this request.
+    import tempfile, shutil
+    tmp_dir = tempfile.mkdtemp(prefix=f"genly_zip_{job_id}_")
+    try:
+        on_disk: list[tuple[str, str]] = []  # (path, name_in_zip)
+        for ftype in bundle:
+            filename = FILE_MAP[ftype]
+            key = s3_keys.get(ftype)
+            if key and storage.is_enabled():
+                local = os.path.join(tmp_dir, filename)
+                if not storage.download_object(key, local):
+                    # Fall through to disk as a last resort.
+                    local = os.path.join(OUTPUTS_DIR, job_id, filename)
+            else:
+                local = os.path.join(OUTPUTS_DIR, job_id, filename)
+            if not os.path.exists(local):
+                print(f"[ZIP] missing source for {ftype}: {local}")
+                continue
+            on_disk.append((local, filename))
+
+        if not on_disk:
+            raise HTTPException(status_code=404, detail="Deliverables not found on disk or R2.")
+
+        buf = _io.BytesIO()
+        with _zip.ZipFile(buf, "w", compression=_zip.ZIP_STORED) as zf:
+            # ZIP_STORED (no compression) — MP4/JPG are already compressed,
+            # re-zipping wastes CPU for ~0% size win.
+            for path, name in on_disk:
+                zf.write(path, arcname=name)
+        buf.seek(0)
+
+        # Filename is best-effort — fall back to job_id if artist/title are
+        # missing so we never produce a zip with weird empty-string names.
+        artist = (job.get("artist") or "").strip() or job_id
+        safe_name = "".join(
+            c if c.isalnum() or c in ("-", "_") else "_" for c in artist
+        ).strip("_") or job_id
+        zip_name = f"genly-{safe_name}.zip"
+
+        return StreamingResponse(
+            buf,
+            media_type="application/zip",
+            headers={"Content-Disposition": f'attachment; filename="{zip_name}"'},
+        )
+    finally:
+        try:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+        except Exception:
+            pass
 
 
 @app.get("/download/{job_id}/{file_type}")

@@ -325,6 +325,7 @@ const translations = {
     // Job detail
     "detail.download": "Descargar",
     "detail.download_all": "Descargar todo",
+    "detail.download_master": "Master ProRes",
     "detail.publish_youtube": "Publicar en YouTube",
     "detail.view_youtube": "Ver en YouTube",
     "detail.not_available": "Todavía no se puede previsualizar este video.",
@@ -740,6 +741,7 @@ const translations = {
 
     "detail.download": "Download",
     "detail.download_all": "Download all",
+    "detail.download_master": "ProRes Master",
     "detail.publish_youtube": "Publish to YouTube",
     "detail.view_youtube": "View on YouTube",
     "detail.not_available": "This video is not ready to preview yet.",
@@ -1150,6 +1152,7 @@ const translations = {
 
     "detail.download": "Baixar",
     "detail.download_all": "Baixar tudo",
+    "detail.download_master": "Master ProRes",
     "detail.publish_youtube": "Publicar no YouTube",
     "detail.view_youtube": "Ver no YouTube",
     "detail.not_available": "Este vídeo ainda não está pronto para preview.",
