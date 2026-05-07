@@ -550,12 +550,55 @@ def _is_whisper_hallucination(text: str) -> bool:
     return False
 
 
+def _is_single_word_loop(text: str, min_repeats: int = 8) -> bool:
+    """True if `text` is essentially the same short word repeated many
+    times — Whisper-1's classic outro/sustained-vocal failure mode
+    ("oh, oh, oh, oh, …" × 100). We detect by checking that, after
+    normalising, ≥ 90 % of tokens are the same single word AND the
+    repeat count is ≥ `min_repeats`.
+
+    This catches the AIRBAG / River Plate case (110 "oh"s in a 30 s
+    segment) without flagging real lyrics: a chorus like "oh-oh-oh I
+    love you oh-oh" stays mixed enough that the dominant token never
+    reaches 90 % concentration.
+    """
+    if not text:
+        return False
+    tokens = [n for n in (_normalize_token(w) for w in text.split()) if n]
+    if len(tokens) < min_repeats:
+        return False
+    from collections import Counter as _C
+    counts = _C(tokens)
+    top_token, top_count = counts.most_common(1)[0]
+    # Require the dominant token to be short (≤ 4 chars) so we don't
+    # collapse a verse that legitimately repeats a longer word.
+    if len(top_token) > 4:
+        return False
+    return top_count / len(tokens) >= 0.9 and top_count >= min_repeats
+
+
 def _filter_whisper_hallucinations(segments: list[dict]) -> tuple[list[dict], int]:
-    """Drop segments whose text is a known Whisper hallucination phrase.
-    Returns (filtered_segments, dropped_count) for logging."""
+    """Drop segments whose text is a known Whisper hallucination phrase
+    OR a single-word loop (e.g. "oh, oh, oh, …" outro fills). The
+    single-word filter runs BEFORE _detect_hallucination in the caller
+    so a legitimate transcription with a loopy outro doesn't get its
+    whole timeline thrown out by the recovery branch.
+
+    Returns (filtered_segments, dropped_count) for logging.
+    """
     if not segments:
         return segments, 0
-    out = [s for s in segments if not _is_whisper_hallucination(s.get("text") or "")]
+    out = []
+    for s in segments:
+        text = s.get("text") or ""
+        if _is_whisper_hallucination(text):
+            continue
+        if _is_single_word_loop(text):
+            print(f"[WHISPER] dropping single-word loop "
+                  f"({(float(s.get('end',0)) - float(s.get('start',0))):.1f}s): "
+                  f"{text[:60]!r}")
+            continue
+        out.append(s)
     return out, len(segments) - len(out)
 
 
@@ -838,6 +881,18 @@ def _transcribe_via_openai_api(mp3_path: str, language: str | None = None,
         if segments[i]["end"] > segments[i + 1]["start"] - GAP:
             segments[i]["end"] = segments[i + 1]["start"] - GAP
 
+    # Drop training-data-leak phrases AND single-word "oh oh oh"
+    # outro loops BEFORE returning, so the caller's hallucination
+    # detector sees a clean timeline. Without this, a 100-"oh"
+    # outro would trip the "implausible mega-segment" detector and
+    # the caller would discard the entire (otherwise good) Whisper
+    # output, replacing it with reference lyrics distributed at
+    # synthetic timestamps — losing the accurate timing of the
+    # legitimate verses.
+    segments, _dropped_loops = _filter_whisper_hallucinations(segments)
+    if _dropped_loops:
+        print(f"[WHISPER-API] filtered {_dropped_loops} hallucination/loop segment(s)")
+
     print(f"[WHISPER-API] {len(segments)} segments")
     return segments
 
@@ -967,6 +1022,11 @@ def transcribe(mp3_path: str, language: str = None,
     for i in range(len(segments) - 1):
         if segments[i]["end"] > segments[i + 1]["start"] - GAP:
             segments[i]["end"] = segments[i + 1]["start"] - GAP
+
+    # Same outro-loop filter as the API path — see notes there.
+    segments, _dropped_loops = _filter_whisper_hallucinations(segments)
+    if _dropped_loops:
+        print(f"[WHISPER] filtered {_dropped_loops} hallucination/loop segment(s)")
 
     return segments
 
