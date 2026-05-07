@@ -117,18 +117,37 @@ def authenticate_user(db: Session, username: str, password: str) -> Optional[Use
 
 
 def ensure_default_admin(db: Session):
-    """Create default admin user if no users exist."""
-    if db.query(User).count() == 0:
-        admin_pw = os.environ.get("ADMIN_PASSWORD", "genly2026")
-        create_user(
-            db,
-            username="admin",
-            password=admin_pw,
-            email=os.environ.get("ADMIN_EMAIL"),
-            role="admin",
-            tenant_id="default",
-            plan="unlimited",
+    """Create default admin user if no users exist.
+
+    In production we refuse to bootstrap with a hardcoded password — anyone
+    who knows the published default ("genly2026") would have root on a
+    fresh DB. The operator must set ADMIN_PASSWORD explicitly.
+    """
+    if db.query(User).count() != 0:
+        return
+
+    admin_pw = os.environ.get("ADMIN_PASSWORD", "")
+    is_prod = _ENV in ("prod", "production")
+    if is_prod and not admin_pw:
+        raise RuntimeError(
+            "Refusing to create default admin in production without "
+            "ADMIN_PASSWORD set. Generate one (e.g. `openssl rand -base64 24`) "
+            "and pass it as an environment variable."
         )
+    if not admin_pw:
+        # Dev / test only — keep the legacy default to avoid breaking
+        # local-first onboarding flows and the existing test suite.
+        admin_pw = "genly2026"
+
+    create_user(
+        db,
+        username="admin",
+        password=admin_pw,
+        email=os.environ.get("ADMIN_EMAIL"),
+        role="admin",
+        tenant_id="default",
+        plan="unlimited",
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -245,6 +264,54 @@ async def get_current_user(
 def get_current_user_from_token_param(token: str, db: Session) -> dict:
     """Validate a token passed as query parameter (for media URLs)."""
     payload = decode_token(token)
+    user = get_user_by_id(db, int(payload["sub"]))
+    if not user or not user.is_active:
+        raise HTTPException(status_code=401, detail="User not found or inactive")
+    return {
+        "id": user.id,
+        "username": user.username,
+        "role": user.role,
+        "tenant_id": user.tenant_id,
+        "plan": user.plan_id,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Short-lived media tokens
+# ---------------------------------------------------------------------------
+#
+# /download and /preview accept a token in the query string. Reusing the
+# 24-hour login JWT there is unsafe: media URLs are saved in browser history,
+# server access logs, and Referer headers when a redirect (R2 signed URL) is
+# followed. Anyone who scrapes a URL gets a full account takeover for 24
+# hours. We mint a *separate* token here, scoped to a single (job_id,
+# file_type) and short-lived, so a leaked URL leaks nothing useful.
+
+MEDIA_TOKEN_EXPIRE_SECONDS = int(os.environ.get("MEDIA_TOKEN_EXPIRE_SECONDS", "300"))
+_MEDIA_TOKEN_TYPE = "media"
+
+
+def create_media_token(user: User, job_id: str, file_type: str) -> str:
+    """Mint a short-lived token scoped to a single job/file_type."""
+    payload = {
+        "sub": str(user.id),
+        "tid": user.tenant_id,
+        "jid": job_id,
+        "ft": file_type,
+        "tt": _MEDIA_TOKEN_TYPE,
+        "exp": time.time() + MEDIA_TOKEN_EXPIRE_SECONDS,
+        "iat": time.time(),
+    }
+    return jwt.encode(payload, JWT_SECRET, algorithm=JWT_ALGORITHM)
+
+
+def verify_media_token(token: str, job_id: str, file_type: str, db: Session) -> dict:
+    """Validate a media token and check it's scoped to (job_id, file_type)."""
+    payload = decode_token(token)
+    if payload.get("tt") != _MEDIA_TOKEN_TYPE:
+        raise HTTPException(status_code=401, detail="Wrong token type for media URL")
+    if payload.get("jid") != job_id or payload.get("ft") != file_type:
+        raise HTTPException(status_code=401, detail="Token scope mismatch")
     user = get_user_by_id(db, int(payload["sub"]))
     if not user or not user.is_active:
         raise HTTPException(status_code=401, detail="User not found or inactive")

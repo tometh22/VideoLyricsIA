@@ -37,10 +37,20 @@ DATABASE_URL = os.environ.get(
 if DATABASE_URL.startswith("postgres://"):
     DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
 
+# Pool sizing is *per-process*. With uvicorn --workers 4 + N RQ workers,
+# the original (pool_size=20, max_overflow=10) easily blew past Postgres'
+# default max_connections=100 under modest load and caused mid-job
+# update_job() failures. Default is now ~5/5 per process (≈40 sockets at
+# 4 API + 4 RQ). Override with DB_POOL_SIZE / DB_MAX_OVERFLOW for capacity
+# tuning, but make sure max_connections on the DB matches:
+#   max_connections >= (api_workers + rq_workers) × (pool_size + max_overflow)
+_DB_POOL_SIZE = int(os.environ.get("DB_POOL_SIZE", "5"))
+_DB_MAX_OVERFLOW = int(os.environ.get("DB_MAX_OVERFLOW", "5"))
+
 engine = create_engine(
     DATABASE_URL,
-    pool_size=20,
-    max_overflow=10,
+    pool_size=_DB_POOL_SIZE,
+    max_overflow=_DB_MAX_OVERFLOW,
     pool_pre_ping=True,
     pool_recycle=300,
     echo=os.environ.get("SQL_ECHO", "").lower() == "true",

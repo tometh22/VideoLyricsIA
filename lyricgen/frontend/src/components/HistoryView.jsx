@@ -1,12 +1,8 @@
 import { useState, useMemo } from "react";
 import { useI18n } from "../i18n";
+import { useMediaUrl } from "../mediaUrl";
 
 const API = import.meta.env.VITE_API_URL || "";
-
-function tokenParam() {
-  const token = localStorage.getItem("genly_token");
-  return token ? `token=${encodeURIComponent(token)}` : "";
-}
 
 function timeAgo(ts) {
   if (!ts) return "";
@@ -56,6 +52,8 @@ function VideoCard({ job, onSelect, t }) {
   const name = (job.filename || "").replace(/\.mp3$/i, "");
   const songName = name.includes(" - ") ? name.split(" - ").slice(1).join(" - ") : name;
   const artistName = job.artist || (name.includes(" - ") ? name.split(" - ")[0] : "");
+  const showThumb = job.status === "done" || job.status === "pending_review";
+  const thumbSrc = useMediaUrl(showThumb ? job.job_id : "", "thumbnail", "preview");
 
   return (
     <button
@@ -63,9 +61,9 @@ function VideoCard({ job, onSelect, t }) {
       className="rounded-card overflow-hidden text-left group bg-surface-2/40 hover:bg-surface-2/70 ring-1 ring-white/[0.04] hover:ring-white/[0.10] transition-all"
     >
       <div className="aspect-video bg-surface-3/30 relative overflow-hidden">
-        {(job.status === "done" || job.status === "pending_review") && (
+        {showThumb && thumbSrc && (
           <img
-            src={`${API}/preview/${job.job_id}/thumbnail?${tokenParam()}`}
+            src={thumbSrc}
             alt=""
             className="w-full h-full object-cover group-hover:scale-[1.04] transition-transform duration-500"
             onError={(e) => { e.target.style.display = "none"; }}

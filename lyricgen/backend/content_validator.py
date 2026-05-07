@@ -52,10 +52,19 @@ def _extract_frames(video_path: str, interval_seconds: int = 3, max_frames: int 
     return frame_paths
 
 
+class ValidatorCheckError(Exception):
+    """Raised when the Vision check could not produce a verdict (network,
+    auth, malformed response). Distinct from "checked-and-flagged" so the
+    caller can fail-closed instead of silently passing."""
+
+
 def _check_frame_with_gemini(image_path: str) -> dict:
     """Use Gemini Vision to check a single frame for prohibited content.
 
-    Returns {"safe": bool, "issues": [str]}
+    Returns {"safe": bool, "issues": [str]} on success.
+    Raises ValidatorCheckError if the verdict cannot be produced (caller
+    must decide policy: pre-fix this fell through to "safe" silently,
+    which let any Vision outage approve every job — Guideline 15 risk).
     """
     from pipeline import _get_genai_client
     from google import genai
@@ -121,9 +130,9 @@ def _check_frame_with_gemini(image_path: str) -> dict:
             }
     except Exception as e:
         logger.warning(f"Gemini Vision check failed: {e}")
+        raise ValidatorCheckError(str(e)) from e
 
-    # If check fails, assume safe (don't block pipeline on validation errors)
-    return {"safe": True, "issues": []}
+    raise ValidatorCheckError("Gemini Vision response did not contain a JSON verdict")
 
 
 def validate_video(video_path: str, job_id: str = None) -> dict:
@@ -146,38 +155,68 @@ def validate_video(video_path: str, job_id: str = None) -> dict:
 
     frame_paths = _extract_frames(video_path)
     all_issues = []
+    check_errors = 0
+    frames_checked = 0
+    tmp_dir = os.path.dirname(frame_paths[0]) if frame_paths else None
 
     try:
         for i, frame_path in enumerate(frame_paths):
-            result = _check_frame_with_gemini(frame_path)
+            try:
+                result = _check_frame_with_gemini(frame_path)
+            except ValidatorCheckError as e:
+                check_errors += 1
+                logger.warning("[VALIDATION] frame %d check error: %s", i, e)
+                continue
+            frames_checked += 1
             if not result["safe"]:
                 for issue in result["issues"]:
-                    all_issues.append({
-                        "frame": i,
-                        "type": issue,
-                    })
+                    all_issues.append({"frame": i, "type": issue})
     finally:
-        # Clean up temp frames
+        # Clean up temp frames + dir even when _extract_frames produced
+        # zero usable frames (mkdtemp leaks otherwise).
         for fp in frame_paths:
             try:
                 os.unlink(fp)
             except OSError:
                 pass
-        # Clean up temp dir
-        if frame_paths:
+        if tmp_dir:
             try:
-                os.rmdir(os.path.dirname(frame_paths[0]))
+                os.rmdir(tmp_dir)
             except OSError:
                 pass
 
-    passed = len(all_issues) == 0
-    summary = f"passed={passed}, frames_checked={len(frame_paths)}, issues={len(all_issues)}"
+    # Fail-closed: if no frames could be successfully checked, refuse to
+    # approve. Pre-fix this returned passed=True, letting any Vision outage
+    # silently bypass the UMG Guideline 15 gate.
+    has_verdict = frames_checked > 0
+    passed = has_verdict and len(all_issues) == 0
+    summary = (
+        f"passed={passed}, frames_checked={frames_checked}, "
+        f"check_errors={check_errors}, issues={len(all_issues)}"
+    )
+
+    if not has_verdict:
+        # Surface a synthetic issue so the operator sees why the job was
+        # blocked instead of "validation failed: 0 issues".
+        all_issues.append({
+            "frame": -1,
+            "type": (
+                "Validator could not produce a verdict for any frame "
+                f"({check_errors} check errors). Treating as failed per "
+                "fail-closed policy."
+            ),
+        })
 
     if recorder:
         recorder.finish(response_summary=summary)
 
     logger.info(f"[VALIDATION] job={job_id}: {summary}")
-    return {"passed": passed, "issues": all_issues, "frames_checked": len(frame_paths)}
+    return {
+        "passed": passed,
+        "issues": all_issues,
+        "frames_checked": frames_checked,
+        "check_errors": check_errors,
+    }
 
 
 def validate_image(image_path: str, job_id: str = None) -> dict:
@@ -193,11 +232,28 @@ def validate_image(image_path: str, job_id: str = None) -> dict:
         input_data_types=["image"],
     ) if job_id else None
 
-    result = _check_frame_with_gemini(image_path)
+    try:
+        result = _check_frame_with_gemini(image_path)
+    except ValidatorCheckError as e:
+        logger.warning("[VALIDATION] image check error: %s", e)
+        if recorder:
+            recorder.finish(response_summary=f"passed=False, check_error={e}")
+        return {
+            "passed": False,
+            "issues": [{
+                "frame": 0,
+                "type": (
+                    "Validator could not produce a verdict (Vision API "
+                    f"error: {e}). Treating as failed per fail-closed policy."
+                ),
+            }],
+            "frames_checked": 0,
+            "check_errors": 1,
+        }
     issues = [{"frame": 0, "type": issue} for issue in result.get("issues", [])]
     passed = result.get("safe", True)
 
     if recorder:
         recorder.finish(response_summary=f"passed={passed}, issues={len(issues)}")
 
-    return {"passed": passed, "issues": issues, "frames_checked": 1}
+    return {"passed": passed, "issues": issues, "frames_checked": 1, "check_errors": 0}

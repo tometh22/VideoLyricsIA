@@ -113,6 +113,12 @@ export default function App() {
   };
 
   const handleLogout = () => {
+    // Stop every active poll BEFORE clearing the token. Otherwise the
+    // intervals keep firing authFetch() with no token, triggering 401s
+    // on every tick until the tab is closed (and re-entering this
+    // handler in a loop).
+    pollingIntervals.current.forEach((iv) => clearInterval(iv));
+    pollingIntervals.current.clear();
     localStorage.removeItem("genly_token");
     localStorage.removeItem("genly_user");
     setToken(null);
@@ -140,8 +146,25 @@ export default function App() {
     return new Promise((resolve) => {
       const iv = setInterval(async () => {
         if (typeof document !== "undefined" && document.hidden) return;
+        // Token can disappear mid-poll if the user logs out from another
+        // tab; bail rather than spamming 401s.
+        if (!getToken()) {
+          clearInterval(iv);
+          pollingIntervals.current.delete(iv);
+          resolve("aborted");
+          return;
+        }
         try {
-          const data = await (await authFetch(`${API}/status/${jobId}`)).json();
+          const res = await authFetch(`${API}/status/${jobId}`);
+          if (res.status === 401) {
+            clearInterval(iv);
+            pollingIntervals.current.delete(iv);
+            handleLogout();
+            resolve("unauthorized");
+            return;
+          }
+          if (!res.ok) return;
+          const data = await res.json();
           setJobs((prev) => prev.map((j) =>
             j.job_id === jobId ? { ...j, status: data.status, current_step: data.current_step, progress: data.progress, error: data.error } : j
           ));

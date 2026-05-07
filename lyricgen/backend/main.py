@@ -56,6 +56,8 @@ from auth import (
     ensure_default_admin,
     pwd_context,
     PLANS,
+    create_media_token,
+    verify_media_token,
 )
 import storage
 from datetime import datetime, timedelta, timezone
@@ -138,16 +140,37 @@ app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 app.add_middleware(SlowAPIMiddleware)
 
 # --- CORS: comma-separated list, e.g. "https://app.example.com,https://admin.example.com"
-# Empty falls back to "*" for local dev.
+# In production we refuse to start with no allowed origins — wildcard +
+# credentials is what Starlette's CORSMiddleware actually emits as
+# "reflect-the-Origin", which lets any site make credentialed requests.
+# Local dev is permitted to fall back to wildcard *without* credentials.
 _cors_env = os.environ.get("CORS_ORIGINS", "").strip()
-_ALLOWED_ORIGINS = [o.strip() for o in _cors_env.split(",") if o.strip()] or ["*"]
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=_ALLOWED_ORIGINS,
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+_ALLOWED_ORIGINS = [o.strip() for o in _cors_env.split(",") if o.strip()]
+
+if not _ALLOWED_ORIGINS:
+    if ENVIRONMENT == "production":
+        raise RuntimeError(
+            "CORS_ORIGINS must be set explicitly in production. Wildcard + "
+            "allow_credentials=True is unsafe (Starlette reflects the request "
+            "Origin, allowing any site to make credentialed requests)."
+        )
+    # Dev: wildcard origins, but DROP credentials so we don't accidentally
+    # ship the same combo to production via env-var typo.
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=["*"],
+        allow_credentials=False,
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
+else:
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=_ALLOWED_ORIGINS,
+        allow_credentials=True,
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
 
 # --- Include routers ---
 app.include_router(billing_router)
@@ -473,10 +496,45 @@ def _validate_audio_upload(file, data: bytes) -> None:
 _validate_mp3_upload = _validate_audio_upload
 
 
+def _job_scope(current_user: dict) -> dict:
+    """Return kwargs for jobs.get_job / jobs.get_all_jobs that scope reads
+    to the calling user's own jobs.
+
+    Self-registered users land in tenant_id="default" by default (and any
+    that explicitly share a tenant with another user) — filtering by
+    tenant_id alone exposes IDOR by job_id enumeration. Admins keep the
+    tenant-wide view so they can audit all jobs from their org's tenant.
+    """
+    if current_user.get("role") == "admin":
+        return {"tenant_id": current_user["tenant_id"]}
+    return {
+        "tenant_id": current_user["tenant_id"],
+        "user_id": current_user["id"],
+    }
+
+
+def _lock_user_for_quota(db: Session, user_id: int) -> None:
+    """Take a row-level lock on the user so the count → insert sequence
+    in /upload becomes atomic.
+
+    Without this, two concurrent uploads at limit-1 both pass the count
+    check before either inserts the new Job row, and the tenant exceeds
+    its quota by N. Postgres SELECT ... FOR UPDATE serializes the reads
+    on the user row; the lock is released when the request's transaction
+    commits or rolls back. SQLite (used by tests) ignores FOR UPDATE.
+    """
+    if "sqlite" in str(db.bind.url):
+        return
+    db.execute(
+        User.__table__.select().where(User.id == user_id).with_for_update()
+    ).first()
+
+
 def _enforce_plan_quota(db: Session, current_user: dict) -> None:
     """Raise 402 if the tenant reached its monthly limit without overage allowed."""
     plan = current_user.get("plan", "100")
     tenant_id = current_user["tenant_id"]
+    _lock_user_for_quota(db, current_user["id"])
     usage = get_plan_usage(db, current_user["id"], tenant_id, plan)
     if usage["remaining"] <= 0 and plan != "unlimited":
         if not current_user.get("allow_overage", False):
@@ -1307,8 +1365,7 @@ async def status(
     current_user: dict = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
-    tenant_id = current_user["tenant_id"]
-    job = get_job(db, job_id, tenant_id=tenant_id)
+    job = get_job(db, job_id, **_job_scope(current_user))
     if job is None:
         raise HTTPException(status_code=404, detail="Job not found.")
     return {
@@ -1329,8 +1386,7 @@ async def list_jobs(
     current_user: dict = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
-    tenant_id = current_user["tenant_id"]
-    return get_all_jobs(db, tenant_id=tenant_id)
+    return get_all_jobs(db, **_job_scope(current_user))
 
 
 FILE_MAP = {
@@ -1351,6 +1407,30 @@ MEDIA_TYPES = {
 NON_PREVIEWABLE = {"umg_master"}
 
 
+@app.get("/media-token/{job_id}/{file_type}")
+async def issue_media_token(
+    job_id: str,
+    file_type: str,
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Mint a short-lived (~5 min) token scoped to a single (job_id, file_type).
+
+    The frontend calls this from a normal Bearer-authenticated request
+    (token never appears in a URL) and embeds the returned token in the
+    ?token=... query string of /download and /preview. Even if that URL
+    leaks via Referer / browser history / server logs, it expires in 5
+    minutes and only works for that exact file.
+    """
+    if file_type not in FILE_MAP:
+        raise HTTPException(status_code=400, detail="Invalid file type.")
+    job = get_job(db, job_id, **_job_scope(current_user))
+    if job is None:
+        raise HTTPException(status_code=404, detail="Job not found.")
+    user_model = db.query(User).filter(User.id == current_user["id"]).first()
+    return {"token": create_media_token(user_model, job_id, file_type)}
+
+
 @app.get("/download/{job_id}/{file_type}")
 async def download(
     job_id: str,
@@ -1358,11 +1438,10 @@ async def download(
     token: str = Query(...),
     db: Session = Depends(get_db),
 ):
-    current_user = get_current_user_from_token_param(token, db)
     if file_type not in FILE_MAP:
         raise HTTPException(status_code=400, detail="Invalid file type.")
-    tenant_id = current_user["tenant_id"]
-    job = get_job(db, job_id, tenant_id=tenant_id)
+    current_user = verify_media_token(token, job_id, file_type, db)
+    job = get_job(db, job_id, **_job_scope(current_user))
     if job is None:
         raise HTTPException(status_code=404, detail="Job not found.")
     if job["status"] != "done":
@@ -1389,7 +1468,6 @@ async def preview(
     token: str = Query(...),
     db: Session = Depends(get_db),
 ):
-    current_user = get_current_user_from_token_param(token, db)
     if file_type not in FILE_MAP:
         raise HTTPException(status_code=400, detail="Invalid file type.")
     if file_type in NON_PREVIEWABLE:
@@ -1398,8 +1476,8 @@ async def preview(
             detail=f"{file_type} is a delivery master and cannot be previewed in-browser. "
                    f"Use /download/{job_id}/{file_type} instead.",
         )
-    tenant_id = current_user["tenant_id"]
-    job = get_job(db, job_id, tenant_id=tenant_id)
+    current_user = verify_media_token(token, job_id, file_type, db)
+    job = get_job(db, job_id, **_job_scope(current_user))
     if job is None:
         raise HTTPException(status_code=404, detail="Job not found.")
     if job["status"] not in ("done", "pending_review"):
@@ -1561,8 +1639,7 @@ async def get_provenance(
 ):
     """Return AI provenance records for a job."""
     from database import AIProvenance
-    tenant_id = current_user["tenant_id"]
-    job = get_job(db, job_id, tenant_id=tenant_id)
+    job = get_job(db, job_id, **_job_scope(current_user))
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
 
@@ -1599,8 +1676,7 @@ async def export_provenance(
 ):
     """Export provenance data for copyright registration filing."""
     from database import AIProvenance
-    tenant_id = current_user["tenant_id"]
-    job = get_job(db, job_id, tenant_id=tenant_id)
+    job = get_job(db, job_id, **_job_scope(current_user))
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
 
@@ -1730,10 +1806,11 @@ async def approve_job(
     from database import Job as JobModel, AuditLog
     from datetime import datetime, timezone
 
-    job = db.query(JobModel).filter(
-        JobModel.job_id == job_id,
-        JobModel.tenant_id == current_user["tenant_id"],
-    ).first()
+    q = db.query(JobModel).filter(JobModel.job_id == job_id)
+    q = q.filter(JobModel.tenant_id == current_user["tenant_id"])
+    if current_user.get("role") != "admin":
+        q = q.filter(JobModel.user_id == current_user["id"])
+    job = q.first()
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
     if job.status != "pending_review":
@@ -1765,10 +1842,11 @@ async def reject_job(
     from database import Job as JobModel, AuditLog
     from datetime import datetime, timezone
 
-    job = db.query(JobModel).filter(
-        JobModel.job_id == job_id,
-        JobModel.tenant_id == current_user["tenant_id"],
-    ).first()
+    q = db.query(JobModel).filter(JobModel.job_id == job_id)
+    q = q.filter(JobModel.tenant_id == current_user["tenant_id"])
+    if current_user.get("role") != "admin":
+        q = q.filter(JobModel.user_id == current_user["id"])
+    job = q.first()
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
     if job.status != "pending_review":
@@ -1832,8 +1910,7 @@ async def youtube_upload(
     db: Session = Depends(get_db),
 ):
     """Upload a completed job's video to YouTube with AI-generated metadata."""
-    tenant_id = current_user["tenant_id"]
-    job = get_job(db, job_id, tenant_id=tenant_id)
+    job = get_job(db, job_id, **_job_scope(current_user))
     if job is None:
         raise HTTPException(status_code=404, detail="Job not found.")
     if job["status"] != "done":
@@ -1873,8 +1950,7 @@ async def youtube_metadata_preview(
     db: Session = Depends(get_db),
 ):
     """Preview the AI-generated YouTube metadata without uploading."""
-    tenant_id = current_user["tenant_id"]
-    job = get_job(db, job_id, tenant_id=tenant_id)
+    job = get_job(db, job_id, **_job_scope(current_user))
     if job is None:
         raise HTTPException(status_code=404, detail="Job not found.")
 
