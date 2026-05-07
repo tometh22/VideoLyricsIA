@@ -480,6 +480,19 @@ def run_pipeline(job_id: str, mp3_path: str, artist: str, style: str,
         )
 
         update_job(job_id, status=final_status, progress=100, files=files)
+
+        # G4: pre-warm the ProRes deliverables in a background worker
+        # job. When UMG eventually clicks "Master ProRes" the .mov is
+        # already on R2 (302 instant) instead of paying 60-120 s of
+        # ffmpeg in the request thread. Best-effort — never fail the
+        # main render because the prewarm couldn't be enqueued.
+        if wants_umg and final_status in ("done", "pending_review"):
+            try:
+                from queue_jobs import enqueue_prores_prewarm
+                enqueue_prores_prewarm(job_id, "umg_master")
+                enqueue_prores_prewarm(job_id, "umg_short")
+            except Exception as e:  # pragma: no cover
+                print(f"[PIPELINE] prores prewarm enqueue skipped: {e}")
     except Exception as exc:
         traceback.print_exc()
         update_job(job_id, status="error", error=str(exc))
