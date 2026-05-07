@@ -79,6 +79,22 @@ export default function AdminPanel({ onBack }) {
     } catch {} finally { setLoading(false); }
   };
 
+  const [health, setHealth] = useState(null);
+  const loadHealth = async () => {
+    try {
+      const res = await fetch(`${API}/health`);
+      setHealth(await res.json());
+    } catch {
+      setHealth({ status: "error", _fetch_failed: true });
+    }
+  };
+  useEffect(() => {
+    if (tab !== "overview") return;
+    loadHealth();
+    const iv = setInterval(loadHealth, 15000);
+    return () => clearInterval(iv);
+  }, [tab]);
+
   const loadCompliance = async () => {
     try {
       const res = await fetch(`${API}/compliance/status`, { headers: authHeaders() });
@@ -248,6 +264,50 @@ export default function AdminPanel({ onBack }) {
       {/* Overview */}
       {tab === "overview" && stats && (
         <div className="space-y-8">
+          {/* System status — live, refreshes every 15s ─────────── */}
+          {health && (() => {
+            const statusColor = health.status === "ok"
+              ? "text-accent" : health.status === "degraded"
+              ? "text-amber-400" : "text-red-400";
+            const statusBg = health.status === "ok"
+              ? "bg-accent/[0.06] ring-accent/20" : health.status === "degraded"
+              ? "bg-amber-500/[0.06] ring-amber-500/25" : "bg-red-500/[0.06] ring-red-500/30";
+            const Pill = ({ ok, label, value }) => (
+              <div className="flex items-center gap-2 text-xs">
+                <span className={`w-2 h-2 rounded-full ${ok ? "bg-accent" : "bg-red-400"}`} />
+                <span className="text-gray-400">{label}</span>
+                <span className="font-mono text-white">{value}</span>
+              </div>
+            );
+            const queue = health.queue_depth || {};
+            const totalQueue = (queue.enterprise ?? 0) + (queue.default ?? 0);
+            return (
+              <div className={`rounded-card ring-1 ${statusBg} px-5 py-4`}>
+                <div className="flex items-center justify-between mb-3">
+                  <div className="flex items-center gap-2">
+                    <span className={`text-xs font-bold uppercase tracking-wider ${statusColor}`}>
+                      System {health.status}
+                    </span>
+                    {health.degraded_reason && (
+                      <span className="text-xs text-amber-300">· {health.degraded_reason}</span>
+                    )}
+                  </div>
+                  <span className="text-[10px] text-gray-500">live · refresh 15s</span>
+                </div>
+                <div className="grid grid-cols-2 md:grid-cols-4 gap-x-4 gap-y-2">
+                  <Pill ok={health.db === "up"} label="Postgres" value={health.db || "?"} />
+                  <Pill ok={health.redis === "up"} label="Redis" value={health.redis || "?"} />
+                  <Pill ok={health.r2 === "configured"} label="R2 storage" value={health.r2 || "?"} />
+                  <Pill ok={(health.workers_alive || 0) > 0} label="Workers" value={health.workers_alive ?? "?"} />
+                  <Pill ok={totalQueue < 50} label="Cola jobs" value={`${totalQueue} (ent ${queue.enterprise ?? 0} + def ${queue.default ?? 0})`} />
+                  <Pill ok={(health.disk_free_gb ?? 0) > 10} label="Disco libre" value={`${health.disk_free_gb ?? "?"} GB`} />
+                  <Pill ok={!!health.api_keys?.openai} label="OpenAI" value={health.api_keys?.openai ? "ok" : "missing"} />
+                  <Pill ok={!!health.api_keys?.vertex} label="Vertex (Veo+Gemini)" value={health.api_keys?.vertex ? "ok" : "missing"} />
+                </div>
+              </div>
+            );
+          })()}
+
           {/* Compliance warning banner */}
           {stats.jobs?.pending_review > 0 && (
             <div className="rounded-2xl bg-amber-500/5 border border-amber-500/20 px-5 py-4 flex items-center gap-3">
