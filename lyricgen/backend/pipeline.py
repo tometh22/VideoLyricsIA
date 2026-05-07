@@ -3739,18 +3739,19 @@ def _transcode_to_prores(input_path: str, mov_path: str,
     cmd = [
         "ffmpeg", "-y", "-loglevel", "error",
         "-i", input_path,
-        # Video filter: scale to target dims (lanczos = sharp upscale,
-        # decent downscale), force fps, normalize SAR so DAR is set
-        # purely by -aspect below. The `colorspace=all=bt709:iall=bt709`
-        # filter actually rewrites the pixel data in the BT.709 matrix
-        # (vs the stream-level -colorspace flag, which only sets the
-        # tag and does NOT propagate into ProRes bitstream coefficients
-        # that ffprobe reads back via stream.color_space).
+        # Video filter chain: scale to target dims (lanczos quality),
+        # force fps, normalize SAR (so DAR is set purely by -aspect),
+        # then `setparams` writes BT.709 colorspace metadata onto each
+        # frame BEFORE the encoder consumes it. setparams is more
+        # reliable for ProRes than the `colorspace` filter (which
+        # rewrites pixel data + sometimes drops metadata) or the
+        # stream-level -colorspace flag (which gets ignored by
+        # prores_ks bitstream coefficients).
         "-vf",
         f"scale={spec.width}:{spec.height}:flags=lanczos,"
         f"fps={spec.fps_str},"
         f"setsar=1,"
-        f"colorspace=all=bt709:iall=bt709",
+        f"setparams=colorspace=bt709:color_primaries=bt709:color_trc=bt709:range=tv",
         "-r", spec.fps_str,
         "-c:v", "prores_ks",
         "-profile:v", str(spec.prores_profile),
@@ -3761,12 +3762,7 @@ def _transcode_to_prores(input_path: str, mov_path: str,
         "-colorspace", "bt709",
         "-color_range", "tv",
         "-aspect", f"{spec.dar[0]}:{spec.dar[1]}",
-        # Bitstream filter — actually writes the color metadata into
-        # the ProRes 'colr' atom so ffprobe reports stream.color_space
-        # = "bt709". Without this, the -colorspace flag above is just
-        # advisory and _validate_umg_master rejects the file.
-        "-bsf:v",
-        "prores_metadata=color_primaries=bt709:color_trc=bt709:matrix_coefficients=bt709",
+        "-movflags", "+faststart+write_colr",
         # Audio: re-encode to UMG's required spec regardless of input.
         "-c:a", "pcm_s24le",
         "-ar", "48000",
@@ -3790,8 +3786,31 @@ def _transcode_to_prores(input_path: str, mov_path: str,
             f"{result.stderr[-500:]}"
         )
 
+    # Log what ffprobe sees on the freshly-encoded master for any future
+    # debugging — colorspace problems are notoriously sticky on ProRes.
+    try:
+        _probe = subprocess.run(
+            ["ffprobe", "-v", "error", "-select_streams", "v:0",
+             "-show_entries",
+             "stream=codec_name,profile,width,height,pix_fmt,"
+             "color_space,color_primaries,color_transfer,color_range,"
+             "field_order,display_aspect_ratio",
+             "-of", "default=noprint_wrappers=1", mov_path],
+            capture_output=True, text=True, timeout=30,
+        )
+        print("[PRORES] ffprobe stream fields:")
+        for line in (_probe.stdout or "").strip().splitlines():
+            print(f"  {line}")
+    except Exception as _e:  # pragma: no cover
+        print(f"[PRORES] ffprobe diagnostic failed: {_e}")
+
     errors = _validate_umg_master(mov_path, spec)
     if errors:
+        # Print errors before deleting so the worker logs surface
+        # what ffprobe reported vs. what we expected — the diagnostic
+        # ffprobe dump above gives the actual values; this line gives
+        # the validator's interpretation.
+        print(f"[PRORES] validation failed: {errors}")
         try:
             os.unlink(mov_path)
         except OSError:
