@@ -981,8 +981,18 @@ async def transcribe_endpoint(
                 transcribe_path = tmp_path
                 trimmed_path = None
                 intro_segments: list[dict] = []
+                # Trigger the intro-trim path ONLY when the user's audio
+                # is *materially* longer than lrclib's studio cut. The
+                # original threshold (3 s) misfired on live recordings
+                # (Airbag "Blues del Infierno - River Plate" is 221 s vs
+                # lrclib's 200 s; the 21-s gap is outro applause, NOT an
+                # intro). A 30-s floor still catches the genuine cases —
+                # "El Plan de la Mariposa - El Riesgo" Video Oficial has
+                # 73 s of spoken-word preamble — without slicing every
+                # live track. Threshold is env-overridable for diagnosis.
+                _trim_floor = float(os.environ.get("INTRO_TRIM_FLOOR_SEC", "30"))
                 if (lrc_dur and user_dur
-                        and 3.0 < (user_dur - lrc_dur) <= 120.0):
+                        and _trim_floor < (user_dur - lrc_dur) <= 120.0):
                     intro_offset = float(user_dur - lrc_dur)
                     candidate = os.path.join(tmp_dir, "body_only.mp3")
                     sliced = await asyncio.to_thread(
