@@ -329,12 +329,17 @@ def run_pipeline(job_id: str, mp3_path: str, artist: str, style: str,
             if _animate_user_image:
                 print(f"[BG] image-to-video: animating user-supplied "
                       f"{os.path.basename(background_path)} via Veo")
+            # UMG / both → prefer Imagen still over Veo video. Avoids the
+            # moviepy palindrome-loop hang that's been hitting every
+            # ProRes job at "video 40%" (operator's "se traba" report).
+            # YouTube-only keeps the animated bg.
             bg_image_path = _ensure_background(
                 style, job_dir,
                 lyrics_text=lyrics_text, artist=artist, job_id=job_id,
                 song_title=_song_title, genre=genre, concept=concept,
                 movement_style=movement_style,
                 image_to_video_path=(background_path if _animate_user_image else None),
+                prefer_image=wants_umg and not _animate_user_image,
             )
             # Image-to-video fallback: if Veo failed to produce an MP4 (None
             # or non-existent path) AND the operator wanted to animate their
@@ -3174,10 +3179,20 @@ def _ensure_background(style_hint: str, job_dir: str, lyrics_text: str = None,
                        song_title: str = "", genre: str = "",
                        concept: str = "",
                        movement_style: str = "",
-                       image_to_video_path: str | None = None) -> str:
+                       image_to_video_path: str | None = None,
+                       prefer_image: bool = False) -> str:
     """Generate background using AI. Gemini picks the best style for the song.
 
     Returns path to .mp4 (video style) or .jpg/.png (photo/illustration style).
+
+    `prefer_image=True` forces a still-image (Imagen 4 → Ken Burns)
+    instead of an animated video (Veo → palindrome loop). The Veo path
+    creates a 100–200 MB pre-rendered palindrome that triggers a
+    moviepy hang during the composite step on certain inputs (operator
+    saw "stuck at video 40%" on every UMG job). Imagen + Ken Burns
+    bypasses moviepy.write_videofile's heavy-clip path entirely. We
+    use it for UMG/both deliveries where stability beats cinematic
+    movement; YouTube-only stays on Veo for the live-feel result.
     """
     # If there are video files in backgrounds dir, use those instead
     all_videos = []
@@ -3187,15 +3202,34 @@ def _ensure_background(style_hint: str, job_dir: str, lyrics_text: str = None,
     if all_videos:
         return None
 
-    # Generate video background with Veo 3 (always video, no images)
     result = _get_unique_prompt(
         lyrics_text, artist, job_id=job_id, song_title=song_title, genre=genre,
         concept=concept, movement_style=movement_style,
     )
     prompt = result["prompt"]
-
-    bg_path = os.path.join(job_dir, "bg_generated.mp4")
     import time as _time_bg
+
+    # Image path — UMG / ProRes / any caller that needs to dodge the
+    # palindrome moviepy hang. Imagen 4 returns a still that the
+    # downstream renderer animates with Ken Burns (fast, stable).
+    if prefer_image:
+        bg_path = os.path.join(job_dir, "bg_generated.jpg")
+        for attempt in range(3):
+            try:
+                _generate_imagen_image(prompt, bg_path, job_id=job_id)
+                return bg_path
+            except Exception as e:
+                print(f"[BG] Imagen 4 attempt {attempt + 1}/3 failed: {e}")
+                if attempt < 2:
+                    wait = 30 * (attempt + 1)
+                    print(f"[BG] Waiting {wait}s before retry...")
+                    _time_bg.sleep(wait)
+        # Fall through to Veo if Imagen exhausts retries — better an
+        # animated bg with possible hang than no render at all.
+        print("[BG] Imagen unavailable, falling through to Veo")
+
+    # Default video path — Veo 3 mp4 + palindrome loop.
+    bg_path = os.path.join(job_dir, "bg_generated.mp4")
     for attempt in range(3):
         try:
             _generate_veo_video(
