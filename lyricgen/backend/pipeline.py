@@ -3741,11 +3741,16 @@ def _transcode_to_prores(input_path: str, mov_path: str,
         "-i", input_path,
         # Video filter: scale to target dims (lanczos = sharp upscale,
         # decent downscale), force fps, normalize SAR so DAR is set
-        # purely by -aspect below.
+        # purely by -aspect below. The `colorspace=all=bt709:iall=bt709`
+        # filter actually rewrites the pixel data in the BT.709 matrix
+        # (vs the stream-level -colorspace flag, which only sets the
+        # tag and does NOT propagate into ProRes bitstream coefficients
+        # that ffprobe reads back via stream.color_space).
         "-vf",
         f"scale={spec.width}:{spec.height}:flags=lanczos,"
         f"fps={spec.fps_str},"
-        f"setsar=1",
+        f"setsar=1,"
+        f"colorspace=all=bt709:iall=bt709",
         "-r", spec.fps_str,
         "-c:v", "prores_ks",
         "-profile:v", str(spec.prores_profile),
@@ -3756,6 +3761,12 @@ def _transcode_to_prores(input_path: str, mov_path: str,
         "-colorspace", "bt709",
         "-color_range", "tv",
         "-aspect", f"{spec.dar[0]}:{spec.dar[1]}",
+        # Bitstream filter — actually writes the color metadata into
+        # the ProRes 'colr' atom so ffprobe reports stream.color_space
+        # = "bt709". Without this, the -colorspace flag above is just
+        # advisory and _validate_umg_master rejects the file.
+        "-bsf:v",
+        "prores_metadata=color_primaries=bt709:color_trc=bt709:matrix_coefficients=bt709",
         # Audio: re-encode to UMG's required spec regardless of input.
         "-c:a", "pcm_s24le",
         "-ar", "48000",
