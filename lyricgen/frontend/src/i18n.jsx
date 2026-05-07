@@ -92,6 +92,7 @@ const translations = {
     // Upload
     "upload.drag": "Arrastrá archivos MP3",
     "upload.drag_sub": "Uno o varios a la vez",
+    "upload.size_hint": "MP3 o WAV · máx 100 MB por archivo · hasta 5 por lote",
     "upload.add_more": "+ Agregar más",
     "upload.artist": "Artista",
     "upload.files": "archivos",
@@ -519,6 +520,7 @@ const translations = {
 
     "upload.drag": "Drag MP3 files here",
     "upload.drag_sub": "One or multiple at once",
+    "upload.size_hint": "MP3 or WAV · max 100 MB per file · up to 5 per batch",
     "upload.add_more": "+ Add more",
     "upload.artist": "Artist",
     "upload.files": "files",
@@ -931,6 +933,7 @@ const translations = {
 
     "upload.drag": "Arraste arquivos MP3",
     "upload.drag_sub": "Um ou vários de uma vez",
+    "upload.size_hint": "MP3 ou WAV · máx 100 MB por arquivo · até 5 por lote",
     "upload.add_more": "+ Adicionar mais",
     "upload.artist": "Artista",
     "upload.files": "arquivos",

@@ -416,7 +416,7 @@ export default function UploadZone({
             <p className="text-gray-300 font-medium mb-1">{t("upload.drag")}</p>
             <p className="text-gray-600 text-sm">{t("upload.drag_sub")}</p>
             <p className="text-gray-700 text-[11px] mt-2">
-              {t("upload.size_hint", { max: MAX_FILE_MB }) || `MP3 o WAV, máx ${MAX_FILE_MB} MB por archivo, hasta ${MAX_BATCH_SIZE} por lote`}
+              {t("upload.size_hint")}
             </p>
           </div>
         )}
