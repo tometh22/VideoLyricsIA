@@ -315,6 +315,24 @@ async def update_user_admin(
 # Jobs
 # ---------------------------------------------------------------------------
 
+@router.get("/stuck-jobs")
+async def admin_stuck_jobs(
+    admin: dict = Depends(require_admin),
+    db: Session = Depends(get_db),
+    threshold_min: int = Query(100, ge=10, le=1440),
+):
+    """List jobs that have been in processing/queued longer than
+    threshold_min. Used by the admin Overview banner so the operator
+    sees zombies before the reaper kills them next pass."""
+    from reaper import find_stuck_jobs
+    stuck = find_stuck_jobs(db, threshold_min)
+    return {
+        "threshold_min": threshold_min,
+        "count": len(stuck),
+        "jobs": [j.to_dict() for j in stuck],
+    }
+
+
 @router.get("/jobs")
 async def list_all_jobs(
     admin: dict = Depends(require_admin),

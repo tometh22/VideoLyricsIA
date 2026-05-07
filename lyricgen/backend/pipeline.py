@@ -482,6 +482,20 @@ def run_pipeline(job_id: str, mp3_path: str, artist: str, style: str,
     except Exception as exc:
         traceback.print_exc()
         update_job(job_id, status="error", error=str(exc))
+        # Surface render failures to Sentry. The worker runs outside
+        # the FastAPI request loop so the framework's auto-capture
+        # doesn't fire — without this explicit hook, ffmpeg hangs,
+        # OOMs, Veo 429-storms, etc. would be invisible. Wrapped to
+        # never let observability break the failure path.
+        try:
+            import sentry_sdk
+            with sentry_sdk.push_scope() as _scope:
+                _scope.set_tag("event", "pipeline.failed")
+                _scope.set_tag("job_id", job_id)
+                _scope.set_tag("artist", artist or "?")
+                sentry_sdk.capture_exception(exc)
+        except Exception:
+            pass
 
 
 # ---------------------------------------------------------------------------

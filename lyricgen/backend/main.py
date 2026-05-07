@@ -157,7 +157,10 @@ app.include_router(admin_router)
 # --- Startup ---
 @app.on_event("startup")
 def on_startup():
-    """Initialize DB and create default admin."""
+    """Initialize DB and create default admin. Also kick off the
+    reaper thread so zombie jobs (worker died mid-render) get
+    auto-flipped to error every 5 min — no manual cleanup, owner gets
+    a digest email + Sentry alert per pass."""
     init_db()
     db = next(get_db())
     try:
@@ -165,6 +168,34 @@ def on_startup():
     finally:
         db.close()
     logger.info("GenLy AI started — database initialized")
+
+    # Background reaper. Daemon → dies with the container. Single
+    # instance is enough; if the API ever scales horizontally, the
+    # reap_all_stuck call is idempotent (filters by status="processing"
+    # so duplicate runs are no-ops on already-reaped rows).
+    import time as _time
+    from reaper import reap_all_stuck as _reap
+
+    def _reaper_loop():
+        # Brief delay so the very first request doesn't compete with
+        # a cold-start reaper holding a DB connection.
+        _time.sleep(60)
+        while True:
+            try:
+                n = _reap()
+                if n > 0:
+                    logger.warning(f"reaper killed {n} stuck job(s)")
+            except Exception:  # pragma: no cover
+                try:
+                    import sentry_sdk
+                    sentry_sdk.capture_exception()
+                except Exception:
+                    pass
+                _time.sleep(60)  # back off on error
+            _time.sleep(300)  # 5 min between successful passes
+
+    threading.Thread(target=_reaper_loop, daemon=True, name="reaper").start()
+    logger.info("reaper thread started (threshold=100min, every 5min)")
 
 
 # --- Background library (public, authenticated) ---

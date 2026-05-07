@@ -88,10 +88,18 @@ export default function AdminPanel({ onBack }) {
       setHealth({ status: "error", _fetch_failed: true });
     }
   };
+  const [stuckJobs, setStuckJobs] = useState({ count: 0, jobs: [] });
+  const loadStuckJobs = async () => {
+    try {
+      const res = await fetch(`${API}/admin/stuck-jobs?threshold_min=100`, { headers: authHeaders() });
+      if (res.ok) setStuckJobs(await res.json());
+    } catch {}
+  };
   useEffect(() => {
     if (tab !== "overview") return;
     loadHealth();
-    const iv = setInterval(loadHealth, 15000);
+    loadStuckJobs();
+    const iv = setInterval(() => { loadHealth(); loadStuckJobs(); }, 15000);
     return () => clearInterval(iv);
   }, [tab]);
 
@@ -264,6 +272,28 @@ export default function AdminPanel({ onBack }) {
       {/* Overview */}
       {tab === "overview" && stats && (
         <div className="space-y-8">
+          {/* Stuck-job banner — shows immediately when zombies exist
+              even before the reaper next pass kills them. */}
+          {stuckJobs.count > 0 && (
+            <div className="rounded-card bg-red-500/[0.08] ring-1 ring-red-500/30 px-5 py-4 flex items-center gap-3">
+              <svg className="w-5 h-5 text-red-300 shrink-0" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
+                <path d="M12 9v4M12 17h.01"/><circle cx="12" cy="12" r="10"/>
+              </svg>
+              <div className="flex-1 min-w-0">
+                <p className="text-sm font-semibold text-red-200">
+                  {stuckJobs.count} {stuckJobs.count === 1 ? "job zombie" : "jobs zombies"} detectado{stuckJobs.count > 1 ? "s" : ""}
+                </p>
+                <p className="text-xs text-red-300/80 mt-0.5">
+                  En "processing" hace más de {stuckJobs.threshold_min} min sin avanzar. El reaper los va a marcar como error en el próximo ciclo (≤5 min). Tenants:{" "}
+                  {[...new Set(stuckJobs.jobs.map(j => j.tenant_id))].slice(0, 5).join(", ")}
+                </p>
+              </div>
+              <button onClick={() => setTab("jobs")} className="text-xs text-red-200 hover:text-white underline shrink-0">
+                Ver
+              </button>
+            </div>
+          )}
+
           {/* System status — live, refreshes every 15s ─────────── */}
           {health && (() => {
             const statusColor = health.status === "ok"
