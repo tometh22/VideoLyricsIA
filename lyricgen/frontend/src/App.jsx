@@ -417,6 +417,21 @@ export default function App() {
     } catch {}
   };
 
+  const handleDeleteJob = async (jobId) => {
+    try {
+      const res = await authFetch(`${API}/jobs/${jobId}`, { method: "DELETE" });
+      if (!res.ok) {
+        const data = await res.json().catch(() => ({}));
+        alert(data.detail || "No se pudo eliminar el video.");
+        return;
+      }
+      // Optimistically drop from local list so the row disappears immediately.
+      setHistory((prev) => prev.filter((j) => j.job_id !== jobId));
+    } catch {
+      alert("Error de red al eliminar.");
+    }
+  };
+
   const handleNav = (id) => {
     if (id === "dashboard") { setView("dashboard"); setSelectedJob(null); }
     else if (id === "new") { setView("new"); setFiles([]); }
@@ -513,6 +528,7 @@ export default function App() {
             <HistoryView
               history={history}
               onSelect={handleSelectJob}
+              onDelete={handleDeleteJob}
               onBack={() => setView("dashboard")}
             />
           )}
@@ -632,7 +648,11 @@ export default function App() {
           {/* Generating */}
           {view === "generating" && (
             <div className="flex justify-center">
-              <BatchProgress jobs={jobs} onReset={handleReset} />
+              <BatchProgress
+                jobs={jobs}
+                onReset={handleReset}
+                onSingleDone={handleSelectJob}
+              />
             </div>
           )}
 

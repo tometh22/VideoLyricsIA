@@ -58,6 +58,27 @@ def get_job_model(db: Session, job_id: str) -> Optional[Job]:
     return db.query(Job).filter(Job.job_id == job_id).first()
 
 
+_DELETABLE_STATUSES = {"processing", "queued", "error", "validation_failed"}
+
+
+def delete_job(db: Session, job_id: str, tenant_id: str) -> tuple[bool, str]:
+    """Hard-delete a job row owned by `tenant_id`. Returns (ok, reason).
+
+    Safety: only stuck/failed jobs can be deleted — done/pending_review jobs
+    must be kept for the audit trail (UMG compliance + plan-quota counting).
+    The operator's intent here is cleaning up junk, not erasing approved
+    deliveries.
+    """
+    job = db.query(Job).filter(Job.job_id == job_id, Job.tenant_id == tenant_id).first()
+    if not job:
+        return False, "not_found"
+    if job.status not in _DELETABLE_STATUSES:
+        return False, f"protected_status:{job.status}"
+    db.delete(job)
+    db.commit()
+    return True, "ok"
+
+
 def get_all_jobs(db: Session, tenant_id: str = "default", limit: int = 200) -> list[dict]:
     """Return all jobs for a tenant, sorted by creation time (newest first)."""
     jobs = (

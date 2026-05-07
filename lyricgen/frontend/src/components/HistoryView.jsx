@@ -52,15 +52,28 @@ function StatusBadge({ status, t }) {
   );
 }
 
-function VideoCard({ job, onSelect, t }) {
+const DELETABLE = new Set(["processing", "queued", "error", "validation_failed"]);
+
+function VideoCard({ job, onSelect, onDelete, t }) {
   const name = (job.filename || "").replace(/\.mp3$/i, "");
   const songName = name.includes(" - ") ? name.split(" - ").slice(1).join(" - ") : name;
   const artistName = job.artist || (name.includes(" - ") ? name.split(" - ")[0] : "");
+  const canDelete = DELETABLE.has(job.status);
+
+  const handleDelete = (e) => {
+    e.stopPropagation();
+    const songLabel = songName || job.filename || job.job_id;
+    if (!confirm(`¿Eliminar "${songLabel}"? Esta acción no se puede deshacer.`)) return;
+    onDelete(job.job_id);
+  };
 
   return (
-    <button
+    <div
+      role="button"
+      tabIndex={0}
       onClick={() => onSelect(job.job_id)}
-      className="rounded-card overflow-hidden text-left group bg-surface-2/40 hover:bg-surface-2/70 ring-1 ring-white/[0.04] hover:ring-white/[0.10] transition-all"
+      onKeyDown={(e) => { if (e.key === "Enter" || e.key === " ") onSelect(job.job_id); }}
+      className="rounded-card overflow-hidden text-left group bg-surface-2/40 hover:bg-surface-2/70 ring-1 ring-white/[0.04] hover:ring-white/[0.10] transition-all cursor-pointer focus:outline-none focus:ring-brand/40"
     >
       <div className="aspect-video bg-surface-3/30 relative overflow-hidden">
         {(job.status === "done" || job.status === "pending_review") && (
@@ -88,6 +101,25 @@ function VideoCard({ job, onSelect, t }) {
           <StatusBadge status={job.status} t={t} />
         </div>
 
+        {/* Delete button — only on stuck/failed rows. Hover-revealed top-left
+            so it doesn't fight the status badge or the play overlay. */}
+        {canDelete && (
+          <button
+            type="button"
+            onClick={handleDelete}
+            className="absolute top-2.5 left-2.5 w-7 h-7 rounded-lg bg-black/50 hover:bg-red-500/80 backdrop-blur-md
+              text-white/70 hover:text-white opacity-0 group-hover:opacity-100 transition-all
+              flex items-center justify-center ring-1 ring-white/10 hover:ring-red-400/50"
+            title={t("history.delete") || "Eliminar"}
+            aria-label="Eliminar video"
+          >
+            <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
+              <polyline points="3 6 5 6 21 6"/>
+              <path d="M19 6l-1 14a2 2 0 01-2 2H8a2 2 0 01-2-2L5 6M10 11v6M14 11v6M8 6V4a2 2 0 012-2h4a2 2 0 012 2v2"/>
+            </svg>
+          </button>
+        )}
+
         {(job.status === "done" || job.status === "pending_review") && (
           <div className="absolute inset-0 flex items-center justify-center opacity-0 group-hover:opacity-100 transition-opacity bg-black/30">
             <div className="w-11 h-11 rounded-full bg-white/15 backdrop-blur-md flex items-center justify-center ring-1 ring-white/20">
@@ -106,7 +138,7 @@ function VideoCard({ job, onSelect, t }) {
           {job.created_at && <span className="ml-1.5 text-gray-600">· {timeAgo(job.created_at)}</span>}
         </p>
       </div>
-    </button>
+    </div>
   );
 }
 
@@ -118,7 +150,7 @@ const FILTERS = [
   { id: "failed",  label: "Fallidos",  match: (j) => j.status === "error" || j.status === "validation_failed" },
 ];
 
-export default function HistoryView({ history, onSelect, onBack }) {
+export default function HistoryView({ history, onSelect, onDelete, onBack }) {
   const { t } = useI18n();
   const [filter, setFilter] = useState("all");
 
@@ -181,7 +213,7 @@ export default function HistoryView({ history, onSelect, onBack }) {
       ) : (
         <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-3">
           {visible.map((job) => (
-            <VideoCard key={job.job_id} job={job} onSelect={onSelect} t={t} />
+            <VideoCard key={job.job_id} job={job} onSelect={onSelect} onDelete={onDelete} t={t} />
           ))}
         </div>
       )}

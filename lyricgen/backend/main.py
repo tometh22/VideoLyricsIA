@@ -61,7 +61,7 @@ import storage
 from datetime import datetime, timedelta, timezone
 
 from database import Job, User, UserSettings, AuditLog, get_db, init_db
-from jobs import create_job, get_job, get_all_jobs, update_job
+from jobs import create_job, delete_job, get_job, get_all_jobs, update_job
 from observability import init_sentry, init_logging, health_snapshot
 from pipeline import run_pipeline, transcribe
 from queue_jobs import enqueue_pipeline, queue_depth
@@ -1331,6 +1331,31 @@ async def list_jobs(
 ):
     tenant_id = current_user["tenant_id"]
     return get_all_jobs(db, tenant_id=tenant_id)
+
+
+@app.delete("/jobs/{job_id}")
+async def delete_job_endpoint(
+    job_id: str,
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Hard-delete a stuck or failed job row. Operator uses this to clean
+    up history rows in `processing` / `queued` / `error` / `validation_failed`
+    state. Done / pending_review jobs are protected (audit trail + plan
+    quota integrity)."""
+    tenant_id = current_user["tenant_id"]
+    ok, reason = delete_job(db, job_id, tenant_id)
+    if not ok:
+        if reason == "not_found":
+            raise HTTPException(status_code=404, detail="Job not found.")
+        if reason.startswith("protected_status:"):
+            status_val = reason.split(":", 1)[1]
+            raise HTTPException(
+                status_code=409,
+                detail=f"Cannot delete a job in status '{status_val}'. Only stuck or failed jobs can be deleted.",
+            )
+        raise HTTPException(status_code=400, detail=reason)
+    return {"deleted": job_id}
 
 
 FILE_MAP = {
