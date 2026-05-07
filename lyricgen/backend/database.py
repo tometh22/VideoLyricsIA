@@ -98,6 +98,14 @@ class User(Base):
     # Catches accidental burst usage (mistake, abuse, or runaway loop).
     max_videos_per_day = Column(Integer, nullable=True)
 
+    # Allow the user to keep generating past their plan's monthly limit,
+    # paying overage rate per extra video. We bill those out-of-band
+    # (transferencia / invoice) — the flag just removes the 402 wall.
+    # Default False: a fresh user hits the cap as a hard block, which
+    # is the safer behaviour for individuals; sales toggles it on for
+    # B2B accounts that prefer overage to a stop-the-world.
+    allow_overage = Column(Boolean, default=False, nullable=False, server_default="false")
+
     # Per-tenant concurrent-jobs cap (a.k.a. "batch size"). None = use system
     # default DEFAULT_MAX_CONCURRENT_JOBS (10). Counts only jobs in
     # status="processing"; pending_review and terminal states don't consume
@@ -125,6 +133,7 @@ class User(Base):
             "ai_authorized": self.ai_authorized,
             "max_videos_per_day": self.max_videos_per_day,
             "max_concurrent_jobs": self.max_concurrent_jobs,
+            "allow_overage": self.allow_overage,
             "stripe_customer_id": self.stripe_customer_id,
             "created_at": self.created_at.isoformat() if self.created_at else None,
         }
@@ -363,8 +372,32 @@ class LyricsCache(Base):
 # ---------------------------------------------------------------------------
 
 def init_db():
-    """Create all tables. Call once at startup."""
+    """Create all tables. Call once at startup.
+
+    Also runs lightweight idempotent column-add migrations so deploys
+    that pre-date a new column (e.g. users.allow_overage) self-heal on
+    boot without an Alembic setup. SQLAlchemy's create_all only creates
+    missing TABLES — it ignores missing COLUMNS on existing tables.
+    """
     Base.metadata.create_all(bind=engine)
+    _migrate_user_columns()
+
+
+def _migrate_user_columns():
+    """Add columns to the `users` table if they're missing. Postgres
+    supports `ADD COLUMN IF NOT EXISTS` natively (>= 9.6); SQLite has it
+    since 3.35. Wrapped in try/except per dialect quirk so a transient
+    failure here never aborts the whole init."""
+    from sqlalchemy import text
+    column_adds = [
+        "ALTER TABLE users ADD COLUMN IF NOT EXISTS allow_overage BOOLEAN DEFAULT FALSE NOT NULL",
+    ]
+    with engine.begin() as conn:
+        for sql in column_adds:
+            try:
+                conn.execute(text(sql))
+            except Exception as e:  # pragma: no cover — dialect-specific
+                print(f"[init_db] migrate skipped: {sql} → {e}")
 
 
 def drop_db():

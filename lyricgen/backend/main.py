@@ -290,6 +290,7 @@ async def login(body: LoginRequest, request: Request, db: Session = Depends(get_
             "role": user.role,
             "tenant_id": user.tenant_id,
             "plan": user.plan_id,
+            "allow_overage": getattr(user, "allow_overage", False) or False,
         },
     }
 
@@ -348,6 +349,7 @@ async def register(body: RegisterRequest, request: Request, db: Session = Depend
             "role": user.role,
             "tenant_id": user.tenant_id,
             "plan": user.plan_id,
+            "allow_overage": getattr(user, "allow_overage", False) or False,
         },
     }
 

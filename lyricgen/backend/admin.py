@@ -172,6 +172,9 @@ class CreateUserRequest(BaseModel):
     # the same shared workspace (e.g. all UMG operators on
     # tenant_id="universal_music" so they see each other's jobs).
     tenant_id: str = ""
+    # If true, the user keeps generating past plan monthly limit and we
+    # invoice the overage out-of-band. Default False = hard wall at limit.
+    allow_overage: bool = False
 
 
 @router.post("/users")
@@ -192,6 +195,10 @@ async def create_user_admin(
             plan=body.plan_id,
             tenant_id=body.tenant_id.strip() or None,
         )
+        if body.allow_overage:
+            user.allow_overage = True
+            db.commit()
+            db.refresh(user)
         return user.to_dict()
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
@@ -253,6 +260,9 @@ class UpdateUserRequest(BaseModel):
     # Per-tenant concurrent-jobs cap (a.k.a. batch size). Default is 10.
     # Raise for tenants that ship full albums (12-15 tracks) as one batch.
     max_concurrent_jobs: Optional[int] = None
+    # B2B / overage opt-in. True = user can keep generating past plan
+    # monthly limit (extra videos invoice out-of-band).
+    allow_overage: Optional[bool] = None
 
 
 @router.patch("/users/{user_id}")
@@ -284,6 +294,8 @@ async def update_user_admin(
         # Min 1 — a cap of 0 would block uploads entirely; use is_active=False
         # for that. Clamp negatives to 1.
         user.max_concurrent_jobs = max(1, int(body.max_concurrent_jobs))
+    if body.allow_overage is not None:
+        user.allow_overage = bool(body.allow_overage)
 
     db.commit()
     db.refresh(user)

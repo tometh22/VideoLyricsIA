@@ -157,7 +157,7 @@ export default function AdminPanel({ onBack }) {
         throw new Error(data.detail || "Error");
       }
       setShowCreate(false);
-      setNewUser({ username: "", password: "", email: "", plan_id: "100", role: "user", tenant_id: "" });
+      setNewUser({ username: "", password: "", email: "", plan_id: "100", role: "user", tenant_id: "", allow_overage: false });
       loadUsers();
     } catch (err) {
       setCreateError(err.message);
@@ -169,6 +169,15 @@ export default function AdminPanel({ onBack }) {
       method: "PATCH",
       headers: { "Content-Type": "application/json", ...authHeaders() },
       body: JSON.stringify({ is_active: !isActive }),
+    });
+    loadUsers();
+  };
+
+  const handleToggleOverage = async (userId, currentValue) => {
+    await fetch(`${API}/admin/users/${userId}`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json", ...authHeaders() },
+      body: JSON.stringify({ allow_overage: !currentValue }),
     });
     loadUsers();
   };
@@ -337,6 +346,7 @@ export default function AdminPanel({ onBack }) {
                         <span className="font-medium">{u.username}</span>
                         {u.role === "admin" && <span className="text-[9px] bg-brand/20 text-brand px-1.5 py-0.5 rounded-full font-bold uppercase">Admin</span>}
                         {u.ai_authorized && <span className="text-[9px] bg-accent/15 text-accent px-1.5 py-0.5 rounded-full font-bold uppercase">AI</span>}
+                        {u.allow_overage && <span className="text-[9px] bg-amber-500/15 text-amber-300 px-1.5 py-0.5 rounded-full font-bold uppercase" title="Puede pasar el cap mensual y se factura el extra">Overage</span>}
                       </div>
                     </td>
                     <td className="px-4 py-3 text-gray-400">{u.email || "—"}</td>
@@ -351,10 +361,15 @@ export default function AdminPanel({ onBack }) {
                     <td className="px-4 py-3 text-gray-400">{u.job_count || 0}</td>
                     <td className="px-4 py-3 text-gray-500 text-xs">{fmtDate(u.created_at)}</td>
                     <td className="px-4 py-3">
-                      <div className="flex gap-1">
+                      <div className="flex gap-1 flex-wrap">
                         <button onClick={() => handleToggleAI(u.id, u.ai_authorized)}
                           className={`text-[10px] px-2 py-1 rounded-lg font-medium ${u.ai_authorized ? "text-amber-400 hover:bg-amber-500/10" : "text-accent hover:bg-accent/10"}`}>
                           {u.ai_authorized ? "Revoke AI" : "Auth AI"}
+                        </button>
+                        <button onClick={() => handleToggleOverage(u.id, u.allow_overage)}
+                          className={`text-[10px] px-2 py-1 rounded-lg font-medium ${u.allow_overage ? "text-amber-400 hover:bg-amber-500/10" : "text-gray-400 hover:bg-white/[0.04]"}`}
+                          title="Permitir pasar el cap mensual con cargo por video extra">
+                          {u.allow_overage ? "Stop Overage" : "Allow Overage"}
                         </button>
                         <button onClick={() => handleToggleUser(u.id, u.is_active)}
                           className={`text-[10px] px-2 py-1 rounded-lg ${u.is_active ? "text-red-400 hover:bg-red-500/10" : "text-accent hover:bg-accent/10"}`}>
@@ -403,6 +418,20 @@ export default function AdminPanel({ onBack }) {
                     <option value="user">User</option>
                     <option value="admin">Admin</option>
                   </select>
+                  <label className="flex items-start gap-2 text-sm text-gray-300 cursor-pointer select-none">
+                    <input
+                      type="checkbox"
+                      checked={newUser.allow_overage || false}
+                      onChange={e => setNewUser({...newUser, allow_overage: e.target.checked})}
+                      className="accent-amber-500 mt-0.5"
+                    />
+                    <span>
+                      Permitir overage
+                      <span className="block text-[11px] text-gray-500 mt-0.5">
+                        El usuario puede pasar el cap mensual; los videos extra se facturan al cierre.
+                      </span>
+                    </span>
+                  </label>
                   {createError && <p className="text-sm text-red-400">{createError}</p>}
                   <div className="flex gap-3 pt-2">
                     <button type="submit" className="btn-primary flex-1 !py-3 text-sm">Create</button>

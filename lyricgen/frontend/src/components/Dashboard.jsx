@@ -162,52 +162,80 @@ export default function Dashboard({ user, history, onSelectJob, onNewBatch, onVi
       </div>
 
       {/* ─── Plan-quota proximity warning ─────────────────────────────
-            Shows once usage crosses 80% so the operator has a heads-up
-            before any upload blocks. Hardens to a red, action-required
-            banner at 100% — at that point /generate returns 402 and the
-            user needs a path to support, not silence. */}
+            Three modes:
+              1. user.allow_overage + alert_100 → "you're billing extra,
+                 here's the running total" (no block).
+              2. plain user + alert_100 → "no more uploads, contact
+                 support" (hard wall — /generate returns 402).
+              3. anyone + alert_80 → "heads-up, X videos left, contact
+                 if you'll need more". */}
       {!isUnlimited && monthlyLimit && (usage?.alert_100 || usage?.alert_80) && (
-        <div
-          className={`w-full mb-4 flex items-center gap-3 px-5 py-4 rounded-card ring-1 ${
-            usage.alert_100
-              ? "bg-red-500/[0.08] ring-red-500/30"
-              : "bg-amber-500/[0.06] ring-amber-500/25"
-          }`}
-        >
-          <svg
-            className={`w-5 h-5 shrink-0 ${usage.alert_100 ? "text-red-300" : "text-amber-300"}`}
-            fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24"
-          >
-            <path d="M12 9v4M12 17h.01"/><circle cx="12" cy="12" r="10"/>
-          </svg>
-          <div className="flex-1 min-w-0">
-            {usage.alert_100 ? (
-              <>
-                <p className="text-sm font-semibold text-red-200">
-                  Llegaste al límite mensual ({monthlyUsed}/{monthlyLimit})
-                </p>
-                <p className="text-xs text-red-300/80 mt-0.5">
-                  No vas a poder subir más videos hasta el mes que viene. Si necesitás extender el cupo, escribinos a{" "}
-                  <a href="mailto:soporte@genly.pro" className="underline font-medium hover:text-red-200">
-                    soporte@genly.pro
-                  </a>.
-                </p>
-              </>
-            ) : (
-              <>
-                <p className="text-sm font-semibold text-amber-200">
-                  Te quedan {monthlyLimit - monthlyUsed} videos este mes ({monthlyUsed}/{monthlyLimit})
-                </p>
-                <p className="text-xs text-amber-300/80 mt-0.5">
-                  Si vas a necesitar más, contactanos antes de llegar al tope:{" "}
-                  <a href="mailto:soporte@genly.pro" className="underline font-medium hover:text-amber-200">
-                    soporte@genly.pro
-                  </a>.
-                </p>
-              </>
-            )}
-          </div>
-        </div>
+        (() => {
+          const overageMode = usage.alert_100 && user?.allow_overage;
+          const blockMode = usage.alert_100 && !user?.allow_overage;
+          return (
+            <div
+              className={`w-full mb-4 flex items-center gap-3 px-5 py-4 rounded-card ring-1 ${
+                blockMode
+                  ? "bg-red-500/[0.08] ring-red-500/30"
+                  : overageMode
+                    ? "bg-brand/[0.08] ring-brand/30"
+                    : "bg-amber-500/[0.06] ring-amber-500/25"
+              }`}
+            >
+              <svg
+                className={`w-5 h-5 shrink-0 ${
+                  blockMode ? "text-red-300" :
+                  overageMode ? "text-brand-light" :
+                  "text-amber-300"
+                }`}
+                fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24"
+              >
+                <path d="M12 9v4M12 17h.01"/><circle cx="12" cy="12" r="10"/>
+              </svg>
+              <div className="flex-1 min-w-0">
+                {overageMode ? (
+                  <>
+                    <p className="text-sm font-semibold text-brand-light">
+                      Pasaste el plan mensual — los extras se facturan al cierre
+                    </p>
+                    <p className="text-xs text-ink-secondary mt-0.5">
+                      {monthlyUsed} videos generados · {usage.overage} adicionales × ${usage.overage_cost_per_video}{" "}
+                      = <span className="font-semibold text-white">${usage.overage_total}</span> a abonar este mes.
+                    </p>
+                  </>
+                ) : blockMode ? (
+                  <>
+                    <p className="text-sm font-semibold text-red-200">
+                      Llegaste al límite mensual ({monthlyUsed}/{monthlyLimit})
+                    </p>
+                    <p className="text-xs text-red-300/80 mt-0.5">
+                      No vas a poder subir más videos hasta el mes que viene. Si necesitás extender el cupo, escribinos a{" "}
+                      <a href="mailto:soporte@genly.pro" className="underline font-medium hover:text-red-200">
+                        soporte@genly.pro
+                      </a>.
+                    </p>
+                  </>
+                ) : (
+                  <>
+                    <p className="text-sm font-semibold text-amber-200">
+                      Te quedan {monthlyLimit - monthlyUsed} videos este mes ({monthlyUsed}/{monthlyLimit})
+                    </p>
+                    <p className="text-xs text-amber-300/80 mt-0.5">
+                      {user?.allow_overage
+                        ? `Pasado el tope, cada video adicional cuesta $${usage.overage_cost_per_video} y se factura al cierre.`
+                        : <>Si vas a necesitar más, contactanos antes de llegar al tope:{" "}
+                            <a href="mailto:soporte@genly.pro" className="underline font-medium hover:text-amber-200">
+                              soporte@genly.pro
+                            </a>.</>
+                      }
+                    </p>
+                  </>
+                )}
+              </div>
+            </div>
+          );
+        })()
       )}
 
       {/* ─── Pending review CTA — brand violet because it's a positive
