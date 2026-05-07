@@ -95,6 +95,27 @@ export default function AdminPanel({ onBack }) {
       if (res.ok) setStuckJobs(await res.json());
     } catch {}
   };
+  const [reaperRunning, setReaperRunning] = useState(false);
+  const [reaperResult, setReaperResult] = useState(null);
+  const runReaperNow = async () => {
+    if (reaperRunning) return;
+    setReaperRunning(true);
+    setReaperResult(null);
+    try {
+      const res = await fetch(`${API}/admin/runbook/reaper-now?threshold_min=100`, {
+        method: "POST",
+        headers: authHeaders(),
+      });
+      const data = await res.json();
+      setReaperResult(data);
+      // Refresh the stuck count immediately so the banner reflects reality.
+      loadStuckJobs();
+    } catch (err) {
+      setReaperResult({ error: String(err) });
+    } finally {
+      setReaperRunning(false);
+    }
+  };
   useEffect(() => {
     if (tab !== "overview") return;
     loadHealth();
@@ -275,7 +296,7 @@ export default function AdminPanel({ onBack }) {
           {/* Stuck-job banner — shows immediately when zombies exist
               even before the reaper next pass kills them. */}
           {stuckJobs.count > 0 && (
-            <div className="rounded-card bg-red-500/[0.08] ring-1 ring-red-500/30 px-5 py-4 flex items-center gap-3">
+            <div className="rounded-card bg-red-500/[0.08] ring-1 ring-red-500/30 px-5 py-4 flex items-center gap-3 flex-wrap">
               <svg className="w-5 h-5 text-red-300 shrink-0" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
                 <path d="M12 9v4M12 17h.01"/><circle cx="12" cy="12" r="10"/>
               </svg>
@@ -284,13 +305,51 @@ export default function AdminPanel({ onBack }) {
                   {stuckJobs.count} {stuckJobs.count === 1 ? "job zombie" : "jobs zombies"} detectado{stuckJobs.count > 1 ? "s" : ""}
                 </p>
                 <p className="text-xs text-red-300/80 mt-0.5">
-                  En "processing" hace más de {stuckJobs.threshold_min} min sin avanzar. El reaper los va a marcar como error en el próximo ciclo (≤5 min). Tenants:{" "}
+                  En "processing" hace más de {stuckJobs.threshold_min} min sin avanzar. El reaper los va a marcar como error en el próximo ciclo (≤5 min), o forzá ahora ↓. Tenants:{" "}
                   {[...new Set(stuckJobs.jobs.map(j => j.tenant_id))].slice(0, 5).join(", ")}
                 </p>
               </div>
-              <button onClick={() => setTab("jobs")} className="text-xs text-red-200 hover:text-white underline shrink-0">
-                Ver
-              </button>
+              <div className="flex items-center gap-2 shrink-0">
+                <button
+                  onClick={runReaperNow}
+                  disabled={reaperRunning}
+                  className="text-xs px-3 py-1.5 rounded-lg bg-red-500/20 hover:bg-red-500/30 text-red-100 font-medium disabled:opacity-50 disabled:cursor-not-allowed"
+                  title="Marca todos los zombies como error inmediatamente"
+                >
+                  {reaperRunning ? "Ejecutando…" : "Forzar reaper ahora"}
+                </button>
+                <button onClick={() => setTab("jobs")} className="text-xs text-red-200 hover:text-white underline shrink-0">
+                  Ver
+                </button>
+              </div>
+            </div>
+          )}
+
+          {/* Reaper result toast — sticks visible after a manual run so
+              the admin sees confirmation of what the runbook did. */}
+          {reaperResult && (
+            <div className={`rounded-card ring-1 px-5 py-3 flex items-center gap-3 text-sm ${
+              reaperResult.error
+                ? "bg-red-500/[0.08] ring-red-500/30 text-red-200"
+                : reaperResult.count > 0
+                  ? "bg-amber-500/[0.06] ring-amber-500/25 text-amber-200"
+                  : "bg-accent/[0.06] ring-accent/20 text-accent"
+            }`}>
+              <svg className="w-4 h-4 shrink-0" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
+                {reaperResult.error
+                  ? <><circle cx="12" cy="12" r="10"/><path d="M15 9l-6 6M9 9l6 6"/></>
+                  : <><path d="M22 11.08V12a10 10 0 11-5.93-9.14"/><polyline points="22 4 12 14.01 9 11.01"/></>
+                }
+              </svg>
+              <div className="flex-1">
+                {reaperResult.error
+                  ? <>Falló el runbook: {reaperResult.error}</>
+                  : reaperResult.count > 0
+                    ? <>Reaper ejecutado · {reaperResult.count} job{reaperResult.count > 1 ? "s" : ""} marcado{reaperResult.count > 1 ? "s" : ""} como error.</>
+                    : <>Reaper ejecutado · ningún zombie encontrado.</>
+                }
+              </div>
+              <button onClick={() => setReaperResult(null)} className="text-xs opacity-60 hover:opacity-100">×</button>
             </div>
           )}
 

@@ -315,6 +315,61 @@ async def update_user_admin(
 # Jobs
 # ---------------------------------------------------------------------------
 
+@router.post("/runbook/reaper-now")
+async def runbook_reaper_now(
+    admin: dict = Depends(require_admin),
+    db: Session = Depends(get_db),
+    threshold_min: int = Query(100, ge=10, le=1440),
+):
+    """Force an immediate reaper pass.
+
+    The reaper already runs every 5 min on its own (see main.py
+    on_startup) — this endpoint is for the operator who just spotted
+    a zombie in admin and doesn't want to wait for the next cycle.
+
+    Snapshots the to-be-killed jobs before reaping so the response
+    can show what was acted on (after the reap they're status=error
+    and indistinguishable from normal failures).
+
+    Audited: every invocation lands in AuditLog with the count and
+    the operator's user_id. Same guardrails as the auto-pass: only
+    jobs in processing/queued past threshold_min get touched.
+    """
+    from reaper import find_stuck_jobs, reap_all_stuck
+
+    targets = find_stuck_jobs(db, threshold_min)
+    snapshot = [
+        {
+            "job_id": j.job_id,
+            "tenant_id": j.tenant_id,
+            "artist": j.artist,
+            "current_step": j.current_step,
+            "progress": j.progress,
+        }
+        for j in targets
+    ]
+
+    # reap_all_stuck owns its own session — we don't pass `db` to it.
+    count = reap_all_stuck(threshold_min)
+
+    db.add(AuditLog(
+        user_id=admin["id"],
+        action="admin.runbook.reaper_now",
+        detail={
+            "count": count,
+            "threshold_min": threshold_min,
+            "killed_jobs": [s["job_id"] for s in snapshot],
+        },
+    ))
+    db.commit()
+
+    return {
+        "count": count,
+        "threshold_min": threshold_min,
+        "killed": snapshot,
+    }
+
+
 @router.get("/stuck-jobs")
 async def admin_stuck_jobs(
     admin: dict = Depends(require_admin),
