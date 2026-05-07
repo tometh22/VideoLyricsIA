@@ -225,7 +225,7 @@ export function EditorTour({ user, forceRun = false, onDone }) {
       target: '[data-tour="editor-sync-entry"]',
       title: t("tour.editor_sync_title") || "Modo Sync",
       content: t("tour.editor_sync_body") ||
-        "Si los tiempos están todos mal, click acá. Apretás Espacio cuando arranca cada línea y se sincronizan en vivo.",
+        "Si necesitás ajustar los tiempos, click acá. Apretás Espacio cuando arranca cada línea y se sincronizan en vivo.",
     },
     {
       target: '[data-tour="editor-row-sync"]',

@@ -576,10 +576,10 @@ export default function LyricsEditor({ segments, filename, audioFile, referenceL
           </svg>
           <div className="flex-1 min-w-0">
             <p className="text-[12px] text-white font-medium leading-tight">
-              {t("editor.sync_cta_title") || "¿Los tiempos están todos mal?"}
+              {t("editor.sync_cta_title") || "¿Necesitás ajustar los tiempos?"}
             </p>
             <p className="text-[10px] text-gray-500 leading-tight mt-0.5">
-              {t("editor.sync_cta_hint") || "Activá modo Sync: apretá Espacio cuando arranque cada línea"}
+              {t("editor.sync_cta_hint") || "Activá modo Sync y apretá Espacio cuando arranque cada línea"}
             </p>
           </div>
           <button
