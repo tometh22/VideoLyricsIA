@@ -58,6 +58,7 @@ from auth import (
     PLANS,
     create_media_token,
     verify_media_token,
+    validate_password_strength,
 )
 import storage
 from datetime import datetime, timedelta, timezone
@@ -256,8 +257,16 @@ async def preview_background(
 
 @app.get("/health")
 async def health():
-    """Runtime health. No auth — used by load balancers and uptime probes."""
-    return health_snapshot()
+    """Runtime health. No auth — used by load balancers and uptime probes.
+
+    Returns 200 when status="ok", 503 otherwise. The previous
+    always-200 behaviour kept the LB green while Redis or R2 was
+    unreachable, so the queue silently dropped jobs.
+    """
+    snap = health_snapshot()
+    if snap.get("status") == "down":
+        return JSONResponse(snap, status_code=503)
+    return snap
 
 
 # ---------------------------------------------------------------------------
@@ -323,8 +332,10 @@ async def register(body: RegisterRequest, request: Request, db: Session = Depend
     """Public self-registration."""
     if len(body.username) < 3:
         raise HTTPException(status_code=400, detail="Username must be at least 3 characters")
-    if len(body.password) < 8:
-        raise HTTPException(status_code=400, detail="Password must be at least 8 characters")
+    try:
+        validate_password_strength(body.password)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
 
     try:
         user = create_user(
@@ -395,8 +406,10 @@ async def forgot_password(body: ForgotPasswordRequest, request: Request, db: Ses
 @limiter.limit("5/minute")
 async def reset_password(body: ResetPasswordRequest, request: Request, db: Session = Depends(get_db)):
     """Reset password using token."""
-    if len(body.password) < 8:
-        raise HTTPException(status_code=400, detail="Password must be at least 8 characters")
+    try:
+        validate_password_strength(body.password)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
 
     user = verify_password_reset_token(db, body.token)
     if not user:
@@ -409,7 +422,8 @@ async def reset_password(body: ResetPasswordRequest, request: Request, db: Sessi
 
 
 @app.post("/auth/verify-email")
-async def verify_email_endpoint(body: VerifyEmailRequest, db: Session = Depends(get_db)):
+@limiter.limit("10/minute")
+async def verify_email_endpoint(body: VerifyEmailRequest, request: Request, db: Session = Depends(get_db)):
     """Verify email address."""
     user = verify_email_token(db, body.token)
     if not user:

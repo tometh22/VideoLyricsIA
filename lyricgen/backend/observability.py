@@ -70,7 +70,16 @@ def init_logging():
 
 
 def health_snapshot() -> dict:
-    """Lightweight report of runtime health."""
+    """Lightweight report of runtime health.
+
+    Status semantics — used by the load balancer / Docker healthcheck:
+      - "ok": all configured dependencies reachable.
+      - "degraded": something is off but the service is partly usable
+        (low disk, Redis configured but unreachable when the API has
+        threads-fallback available outside prod).
+      - "down": a configured-and-required dependency is unreachable
+        (Redis configured but ping failed in prod).
+    """
     snap = {"status": "ok", "env": ENV}
     # Disk
     try:
@@ -81,13 +90,24 @@ def health_snapshot() -> dict:
     except Exception:
         pass
     # Redis
+    redis_url = os.environ.get("REDIS_URL", "").strip()
     try:
         from queue_jobs import _init_redis
         r, _, _ = _init_redis()
-        snap["redis"] = "up" if r is not None else "not_configured"
+        if r is not None:
+            snap["redis"] = "up"
+        elif redis_url:
+            # Configured but unreachable: queue is broken. /enqueue will
+            # raise in production; surface that to the load balancer.
+            snap["redis"] = "down"
+            snap["status"] = "down" if ENV in ("prod", "production") else "degraded"
+        else:
+            snap["redis"] = "not_configured"
     except Exception:
         snap["redis"] = "error"
-    # R2
+        if redis_url:
+            snap["status"] = "down" if ENV in ("prod", "production") else "degraded"
+    # R2 / S3
     try:
         import storage
         snap["r2"] = "configured" if storage.is_enabled() else "not_configured"

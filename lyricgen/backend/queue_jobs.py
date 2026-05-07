@@ -6,18 +6,24 @@ survives API restarts and bounds concurrency. Two queues by priority:
     enterprise  -> UMG and any tenant with plan == "unlimited"
     default     -> everyone else
 
-Workers pick enterprise first. If Redis is unavailable (e.g. local dev without
-Redis running), the helpers fall back to threading.Thread so the dev loop
-still works — production must set REDIS_URL.
+Workers pick enterprise first. If Redis is unavailable AND we're not in
+production, the helpers fall back to threading.Thread so the dev loop still
+works. Production refuses to start the fallback — silently turning the API
+into a fire-and-forget thread runner on a transient Redis blip would lose
+durability, concurrency caps, and timeouts in the worst possible moment.
 """
 
+import logging
 import os
 import threading
+
+logger = logging.getLogger("genly.queue")
 
 REDIS_URL = os.environ.get("REDIS_URL", "").strip()
 JOB_TIMEOUT = int(os.environ.get("JOB_TIMEOUT_SECONDS", "2700"))  # 45 min
 RESULT_TTL = int(os.environ.get("JOB_RESULT_TTL_SECONDS", "86400"))  # 24 h
 FAILURE_TTL = int(os.environ.get("JOB_FAILURE_TTL_SECONDS", "604800"))  # 7 d
+_ENVIRONMENT = os.environ.get("ENVIRONMENT", "production").lower().strip() or "production"
 
 _redis = None
 _queue_default = None
@@ -82,6 +88,19 @@ def enqueue_pipeline(
             job_id=job_id,  # map RQ id to our job_id for easy lookup
         )
         return rq_job.id
+
+    # Redis-less path. In production this would silently bypass JOB_TIMEOUT,
+    # concurrency caps, and durability — refuse instead and let the
+    # operator fix the Redis dependency.
+    if _ENVIRONMENT == "production":
+        logger.error(
+            "Refusing to enqueue %s via thread fallback: Redis is required "
+            "in production but unreachable.", job_id,
+        )
+        raise RuntimeError(
+            "Job queue unavailable: Redis is required in production. "
+            "Check REDIS_URL and the redis service health."
+        )
 
     # Dev fallback: same thread model as before.
     from pipeline import run_pipeline

@@ -1,4 +1,4 @@
-import { useState, useEffect } from "react";
+import { useState, useEffect, useRef } from "react";
 import { useI18n } from "../i18n";
 import { getDownloadUrl, useMediaUrl } from "../mediaUrl";
 
@@ -156,6 +156,12 @@ export default function JobDetail({ job, onBack, onJobUpdate }) {
   const [showYoutubePanel, setShowYoutubePanel] = useState(false);
   const [reviewNotes, setReviewNotes] = useState("");
   const [approving, setApproving] = useState(false);
+  // Synchronous guard against double-click — `approving` (state) is updated
+  // asynchronously by React, so a rapid second click can fire its handler
+  // before the re-render flips the disabled flag. The ref is set BEFORE
+  // any await, so the second handler sees `current=true` immediately and
+  // bails out.
+  const approveLockRef = useRef(false);
   const name = (job.filename || "").replace(/\.mp3$/i, "");
 
   // Short-lived media URLs (re-fetch when the active tab changes).
@@ -216,6 +222,8 @@ export default function JobDetail({ job, onBack, onJobUpdate }) {
   };
 
   const handleApprove = async () => {
+    if (approveLockRef.current) return;
+    approveLockRef.current = true;
     setApproving(true);
     try {
       const res = await fetch(`${API}/approve/${job.job_id}`, {
@@ -229,9 +237,12 @@ export default function JobDetail({ job, onBack, onJobUpdate }) {
       }
     } catch {}
     setApproving(false);
+    approveLockRef.current = false;
   };
 
   const handleReject = async () => {
+    if (approveLockRef.current) return;
+    approveLockRef.current = true;
     setApproving(true);
     try {
       const res = await fetch(`${API}/reject/${job.job_id}`, {
@@ -253,6 +264,7 @@ export default function JobDetail({ job, onBack, onJobUpdate }) {
       }
     } catch {}
     setApproving(false);
+    approveLockRef.current = false;
   };
 
   const ALL_TABS = [

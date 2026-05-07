@@ -12,15 +12,38 @@ import tempfile
 logger = logging.getLogger("genly.validator")
 
 
+def _safe_ffmpeg_path(path: str) -> str:
+    """Make a user-controlled path safe to pass as an ffmpeg/ffprobe input.
+
+    ffmpeg interprets any argument starting with `-` as a flag — so a file
+    literally named `-vf scale=-1:720` (or an attacker-uploaded path that
+    starts with `-`) would inject options into the command line. We force
+    a leading `./` for relative paths so the dash can't appear in argv[0]
+    of the path arg, and we resolve to an absolute path when possible.
+    """
+    if not path:
+        return path
+    if os.path.isabs(path):
+        return path
+    if path.startswith("-"):
+        return os.path.join(".", path)
+    return path
+
+
 def _extract_frames(video_path: str, interval_seconds: int = 3, max_frames: int = 10) -> list[str]:
     """Extract frames from a video at regular intervals using ffmpeg.
 
     Returns list of temporary file paths (caller must clean up).
     """
     tmp_dir = tempfile.mkdtemp(prefix="genly_validate_")
+    safe_video_path = _safe_ffmpeg_path(video_path)
+    # `safe_video_path` already prepends `./` for relative paths beginning
+    # with `-`; that is the most portable defense across ffmpeg/ffprobe
+    # versions (some accept GNU `--`, some don't).
     duration_cmd = [
         "ffprobe", "-v", "error", "-show_entries", "format=duration",
-        "-of", "default=noprint_wrappers=1:nokey=1", video_path,
+        "-of", "default=noprint_wrappers=1:nokey=1",
+        safe_video_path,
     ]
     try:
         result = subprocess.run(duration_cmd, capture_output=True, text=True, timeout=30)
@@ -39,7 +62,7 @@ def _extract_frames(video_path: str, interval_seconds: int = 3, max_frames: int 
     for i, ts in enumerate(timestamps):
         out_path = os.path.join(tmp_dir, f"frame_{i:03d}.jpg")
         cmd = [
-            "ffmpeg", "-y", "-ss", str(ts), "-i", video_path,
+            "ffmpeg", "-y", "-ss", str(ts), "-i", safe_video_path,
             "-frames:v", "1", "-q:v", "2", out_path,
         ]
         try:

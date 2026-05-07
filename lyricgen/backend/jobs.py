@@ -92,14 +92,40 @@ def get_all_jobs(
     return [j.to_list_dict() for j in jobs]
 
 
+_TERMINAL_STATUSES = ("done", "error", "rejected", "validation_failed")
+
+
 def update_job(job_id: str, **kwargs) -> None:
-    """Update fields on an existing job. Creates its own DB session for thread safety."""
+    """Update fields on an existing job. Creates its own DB session for thread safety.
+
+    A status update that targets a non-terminal state is REFUSED for jobs
+    already in a terminal state. This guards against:
+      - A stale worker thread flushing progress=55 / status="processing"
+        after a reaper marked the job error → resurrects a closed job.
+      - Two workers picking the same job and both calling
+        update_job(status="processing") → double-processing.
+
+    Updates that target a terminal state OR fields that are safe to set on
+    terminal jobs (s3_keys, youtube_data, validation_result, etc.) are
+    always applied — the reaper itself relies on the terminal-update path.
+    """
     from database import SessionLocal
+
+    target_status = kwargs.get("status")
+    target_is_terminal = target_status in _TERMINAL_STATUSES
 
     db = SessionLocal()
     try:
         job = db.query(Job).filter(Job.job_id == job_id).first()
         if not job:
+            return
+
+        # Refuse non-terminal mutations of terminal jobs.
+        if (
+            job.status in _TERMINAL_STATUSES
+            and not target_is_terminal
+            and target_status is not None
+        ):
             return
 
         for key, value in kwargs.items():
@@ -122,6 +148,14 @@ def update_job(job_id: str, **kwargs) -> None:
             job.completed_at = datetime.now(timezone.utc)
 
         db.commit()
+    except Exception:
+        # Without an explicit rollback the session is returned to the pool
+        # holding an open transaction; pool_pre_ping only catches
+        # disconnects, not in-tx errors, so the next caller can hit
+        # "current transaction is aborted, commands ignored until end of
+        # transaction block".
+        db.rollback()
+        raise
     finally:
         db.close()
 

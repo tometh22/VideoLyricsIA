@@ -683,7 +683,21 @@ export default function UploadZone({
                 key={m.id}
                 onClick={() => {
                   setBgMode(m.id);
-                  if (m.id === "auto") { onBackgroundFile?.(null); onBackgroundId?.(null); }
+                  // Clear the OTHER mode's state on every switch — the
+                  // upstream consumer (App.jsx ~285) prefers backgroundId
+                  // over backgroundFile, so leaving a stale id behind
+                  // silently overrides a fresh upload. Picking "library"
+                  // discards a previously-uploaded custom file; picking
+                  // "custom" discards a previously-selected library id;
+                  // "auto" clears both.
+                  if (m.id === "auto") {
+                    onBackgroundFile?.(null);
+                    onBackgroundId?.(null);
+                  } else if (m.id === "library") {
+                    onBackgroundFile?.(null);
+                  } else if (m.id === "custom") {
+                    onBackgroundId?.(null);
+                  }
                 }}
                 className={`px-4 py-1.5 rounded-lg text-[11px] font-medium transition-all ${
                   bgMode === m.id ? "bg-brand text-white" : "text-gray-400 hover:text-white"

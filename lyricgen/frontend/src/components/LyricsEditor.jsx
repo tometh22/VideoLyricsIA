@@ -127,22 +127,39 @@ export default function LyricsEditor({ segments, filename, audioFile, referenceL
       cancelEditTimestamp();
       return;
     }
-    const newStart = Math.max(0, Math.min(parsed, duration || parsed));
+
+    // Clamp to the window between the previous segment's end and the
+    // next segment's start (in the original ordering by _id). Without
+    // this, the operator can set a start past the next row's start,
+    // producing overlapping segments that the renderer interprets as
+    // simultaneous on-screen lines. We use the original index to find
+    // neighbors so a previous edit that shifted siblings doesn't cause
+    // the wrong rows to be picked up.
+    const idx = edited.findIndex((s) => s._id === seg._id);
+    const prevSeg = idx > 0 ? edited[idx - 1] : null;
+    const nextSeg = idx >= 0 && idx < edited.length - 1 ? edited[idx + 1] : null;
+    const minAllowed = prevSeg ? prevSeg.end : 0;
+    const maxAllowed = nextSeg ? Math.max(minAllowed, nextSeg.start - 0.1) : (duration || parsed);
+    const newStart = Math.max(minAllowed, Math.min(parsed, maxAllowed));
     const delta = newStart - seg.start;
+
     setEdited((prev) => prev.map((s) => {
       if (s._id !== seg._id) return s;
       // Preserve segment duration when the operator nudges the start
-      // unless that would push end past audio_duration.
+      // unless that would push end past audio_duration or the next row.
       const segDur = Math.max(0.5, s.end - s.start);
       let newEnd = newStart + segDur;
-      if (duration && newEnd > duration) newEnd = duration;
+      const upperBound = nextSeg ? Math.min(nextSeg.start, duration || nextSeg.start) : duration;
+      if (upperBound && newEnd > upperBound) newEnd = upperBound;
       return { ...s, start: newStart, end: newEnd };
     }));
     setEditingId(null);
     setEditValue("");
     // Offer to propagate when the change is meaningful (>0.3s) and
-    // there are following lines to receive it.
-    const followingCount = edited.filter((s) => s.start > seg.start).length;
+    // there are following lines to receive it. We count by INDEX, not
+    // by start-time, so the count is correct even when a large delta
+    // re-orders the list relative to its previous state.
+    const followingCount = idx >= 0 ? edited.length - idx - 1 : 0;
     if (Math.abs(delta) >= 0.3 && followingCount > 0) {
       setPendingPropagation({ segId: seg._id, delta, count: followingCount });
     } else {
@@ -150,22 +167,17 @@ export default function LyricsEditor({ segments, filename, audioFile, referenceL
     }
   };
 
-  // Apply the captured delta to every segment that originally started
-  // AFTER the edited one. We use the original start (pre-edit) of the
-  // anchor segment as the threshold so we don't double-shift the line
-  // the operator just edited.
+  // Apply the captured delta to every segment that originally came AFTER
+  // the edited one (by _id, the stable original index). The previous
+  // implementation used a start-time threshold, which silently skipped or
+  // double-shifted overlapping rows from Whisper's occasional out-of-order
+  // output.
   const applyPendingPropagation = () => {
     if (!pendingPropagation) return;
     const { segId, delta } = pendingPropagation;
-    const anchor = edited.find((s) => s._id === segId);
-    if (!anchor) {
-      setPendingPropagation(null);
-      return;
-    }
-    const anchorOrigStart = anchor.start - delta;
     setEdited((prev) =>
       prev.map((s) => {
-        if (s.start <= anchorOrigStart) return s;
+        if (s._id <= segId) return s;
         const segDur = Math.max(0.5, s.end - s.start);
         const newStart = Math.max(0, s.start + delta);
         let newEnd = newStart + segDur;

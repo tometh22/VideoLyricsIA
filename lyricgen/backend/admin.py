@@ -13,7 +13,7 @@ from pydantic import BaseModel
 from sqlalchemy import func
 from sqlalchemy.orm import Session
 
-from auth import get_current_user, PLANS, pwd_context
+from auth import get_current_user, PLANS, pwd_context, validate_password_strength
 from database import User, Job, Invoice, AuditLog, AIProvenance, BackgroundAsset, get_db
 
 BACKGROUNDS_DIR = os.path.join(os.path.dirname(__file__), "..", "assets", "backgrounds", "library")
@@ -269,6 +269,10 @@ async def update_user_admin(
     if body.email is not None:
         user.email = body.email
     if body.password is not None:
+        try:
+            validate_password_strength(body.password)
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
         user.hashed_password = pwd_context.hash(body.password)
     if body.max_videos_per_day is not None:
         # Allow 0 to mean "block all uploads"; clamp to non-negative.
