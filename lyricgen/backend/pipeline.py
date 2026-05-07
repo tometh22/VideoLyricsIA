@@ -3312,6 +3312,14 @@ def _make_text_clip(text: str, seg_start: float, seg_end: float, font: str = "Ar
     # Remove characters that break ImageMagick's @file parsing
     display_text = display_text.replace("@", "").replace("`", "'").replace("\x00", "")
 
+    # Empty-string guard. ImageMagick errors with "label expected" when
+    # asked to render an empty caption, taking the whole video render
+    # down. Caller filters blanks upstream; this is defense in depth for
+    # cases where sanitization stripped everything (e.g. text was just
+    # "@@@" or all whitespace).
+    if not display_text.strip():
+        return []
+
     scale = spec.text_scale
 
     text_len = len(display_text)
@@ -3558,6 +3566,18 @@ def generate_lyric_video(
         else:
             font = "Arial"
     print(f"[FONT] Selected: {os.path.basename(font)}")
+
+    # Drop empty / whitespace-only segments BEFORE clamping so the
+    # neighbor indices used for overlap clamp are correct. Operator
+    # can leave blank rows from "Agregar línea" if they don't type
+    # lyrics; passing empty text to ImageMagick triggers a "label
+    # expected" error and aborts the whole render.
+    if segments:
+        before = len(segments)
+        segments = [s for s in segments if (s.get("text") or "").strip()]
+        dropped = before - len(segments)
+        if dropped:
+            print(f"[RENDER] dropped {dropped} blank segment(s) before render")
 
     # Defensive normalization — clamp each segment's end to the next
     # segment's start (with a 50ms gap) so two subtitles can never

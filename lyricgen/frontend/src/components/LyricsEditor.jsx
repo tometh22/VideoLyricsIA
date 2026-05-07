@@ -270,16 +270,20 @@ export default function LyricsEditor({ segments, filename, audioFile, referenceL
     });
   }, []);
 
-  const enterSyncMode = () => {
-    setSyncCursor(0);
+  const enterSyncModeAt = (idx) => {
+    if (edited.length === 0) return;
+    const safeIdx = Math.max(0, Math.min(idx, edited.length - 1));
+    setSyncCursor(safeIdx);
     setSyncHistory([]);
     setSyncMode(true);
-    // Position the audio at the first line's current start so the
-    // operator hears the lead-in. Don't autoplay — let them press
-    // play when ready.
-    if (edited.length > 0) seekTo(Math.max(0, edited[0].start - 1.5), false);
+    // Lead-in: scrub to ~1.5s before the chosen line so the operator
+    // hears the run-up. Don't autoplay — let them press play when ready.
+    const target = edited[safeIdx];
+    if (target) seekTo(Math.max(0, target.start - 1.5), false);
     setPendingPropagation(null);
   };
+
+  const enterSyncMode = () => enterSyncModeAt(0);
 
   const exitSyncMode = () => {
     setSyncMode(false);
@@ -425,14 +429,16 @@ export default function LyricsEditor({ segments, filename, audioFile, referenceL
     return s && s !== seg.text;
   }).length;
   const hasSuggestions = pendingSuggestions > 0;
+  const blankCount = edited.filter((seg) => !(seg.text || "").trim()).length;
 
   const handleApprove = () => {
-    // Sort by start and clamp each segment's end to the next segment's
-    // start (with a 50ms gap) so subtitles never visually overlap on
-    // render. Sync mode anchors preserve the original segment duration,
-    // which can leave end > next.start when the operator anchors lines
-    // closer together than the original transcription spaced them.
-    const sorted = [...edited].sort((a, b) => a.start - b.start);
+    // Drop empty / whitespace-only rows BEFORE clamping. Operator can
+    // leave blanks from "Agregar línea" if they didn't type lyrics —
+    // sending those to the worker triggers an ImageMagick "label
+    // expected" crash that aborts the whole render.
+    const sorted = [...edited]
+      .filter((seg) => (seg.text || "").trim())
+      .sort((a, b) => a.start - b.start);
     const cleaned = sorted.map((seg, i) => {
       let end = seg.end;
       if (i + 1 < sorted.length) {
@@ -752,6 +758,19 @@ export default function LyricsEditor({ segments, filename, audioFile, referenceL
                     )}
                   </div>
                   <div className="shrink-0 flex items-center gap-0.5 mt-0.5">
+                    {!syncMode && (
+                      <button onClick={() => enterSyncModeAt(idx)}
+                        className="w-8 h-8 rounded-lg opacity-0 group-hover:opacity-100
+                          hover:bg-brand/15 flex items-center justify-center text-gray-600
+                          hover:text-brand-light transition-all"
+                        title={t("editor.sync_from_here") || "Activar Sync desde esta línea"}>
+                        <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
+                          <circle cx="12" cy="12" r="9" />
+                          <circle cx="12" cy="12" r="4" />
+                          <circle cx="12" cy="12" r="1" fill="currentColor" />
+                        </svg>
+                      </button>
+                    )}
                     <button onClick={() => duplicateSeg(seg._id)}
                       className="w-8 h-8 rounded-lg opacity-0 group-hover:opacity-100
                         hover:bg-brand/10 flex items-center justify-center text-gray-600
@@ -790,9 +809,19 @@ export default function LyricsEditor({ segments, filename, audioFile, referenceL
         </div>
       </div>
 
-      <div className="mt-4 flex justify-between items-center">
-        <span className="text-xs text-gray-600">{edited.length} {t("editor.lines")}</span>
-        <button onClick={handleApprove} className="btn-primary text-sm h-11 px-5">
+      <div className="mt-4 flex justify-between items-center gap-3">
+        <div className="flex items-center gap-2 min-w-0">
+          <span className="text-xs text-gray-600 shrink-0">
+            {edited.length} {t("editor.lines")}
+          </span>
+          {blankCount > 0 && (
+            <span className="text-[11px] text-amber-400 truncate">
+              · {blankCount} {blankCount === 1 ? t("editor.blank_singular") || "línea en blanco" : t("editor.blank_plural") || "líneas en blanco"} —{" "}
+              {t("editor.blanks_dropped") || "se omitirán"}
+            </span>
+          )}
+        </div>
+        <button onClick={handleApprove} className="btn-primary text-sm h-11 px-5 shrink-0">
           {isBatch ? t("editor.approve_next") : t("editor.approve_generate")}
         </button>
       </div>

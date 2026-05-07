@@ -187,6 +187,10 @@ const translations = {
     "editor.sync_undo_btn": "Deshacer",
     "editor.duplicate_line": "Duplicar línea (útil para estribillos repetidos)",
     "editor.add_line": "Agregar línea",
+    "editor.blank_singular": "línea en blanco",
+    "editor.blank_plural": "líneas en blanco",
+    "editor.blanks_dropped": "se omitirán",
+    "editor.sync_from_here": "Activar Sync desde esta línea",
 
     // Transcribing
     "transcribe.title": "Transcribiendo lyrics",
@@ -555,6 +559,10 @@ const translations = {
     "editor.sync_undo_btn": "Undo",
     "editor.duplicate_line": "Duplicate line (useful for repeating choruses)",
     "editor.add_line": "Add line",
+    "editor.blank_singular": "blank line",
+    "editor.blank_plural": "blank lines",
+    "editor.blanks_dropped": "will be skipped",
+    "editor.sync_from_here": "Start Sync mode from this line",
 
     "transcribe.title": "Transcribing lyrics",
     "transcribe.subtitle": "Analyzing audio...",
@@ -910,6 +918,10 @@ const translations = {
     "editor.sync_undo_btn": "Desfazer",
     "editor.duplicate_line": "Duplicar linha (útil para refrões repetidos)",
     "editor.add_line": "Adicionar linha",
+    "editor.blank_singular": "linha em branco",
+    "editor.blank_plural": "linhas em branco",
+    "editor.blanks_dropped": "serão omitidas",
+    "editor.sync_from_here": "Ativar Sync a partir desta linha",
     "editor.song_of": "de",
 
     "transcribe.title": "Transcrevendo lyrics",
