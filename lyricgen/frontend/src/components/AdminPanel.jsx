@@ -41,7 +41,7 @@ export default function AdminPanel({ onBack }) {
 
   // Create user modal
   const [showCreate, setShowCreate] = useState(false);
-  const [newUser, setNewUser] = useState({ username: "", password: "", email: "", plan_id: "100", role: "user" });
+  const [newUser, setNewUser] = useState({ username: "", password: "", email: "", plan_id: "100", role: "user", tenant_id: "" });
   const [createError, setCreateError] = useState("");
 
   useEffect(() => {
@@ -140,7 +140,7 @@ export default function AdminPanel({ onBack }) {
         throw new Error(data.detail || "Error");
       }
       setShowCreate(false);
-      setNewUser({ username: "", password: "", email: "", plan_id: "100", role: "user" });
+      setNewUser({ username: "", password: "", email: "", plan_id: "100", role: "user", tenant_id: "" });
       loadUsers();
     } catch (err) {
       setCreateError(err.message);
@@ -366,6 +366,13 @@ export default function AdminPanel({ onBack }) {
                   <input type="password" placeholder="Password" value={newUser.password}
                     onChange={e => setNewUser({...newUser, password: e.target.value})}
                     className="input-field !py-3 text-sm" required />
+                  <input type="text" placeholder="Tenant ID (deja vacío para que sea único por user)"
+                    value={newUser.tenant_id}
+                    onChange={e => setNewUser({...newUser, tenant_id: e.target.value})}
+                    className="input-field !py-3 text-sm" />
+                  <p className="text-[11px] text-gray-500 -mt-2">
+                    Mismo tenant ID = el equipo comparte historial / videos. Vacío = aislado.
+                  </p>
                   <select value={newUser.plan_id}
                     onChange={e => setNewUser({...newUser, plan_id: e.target.value})}
                     className="input-field !py-3 text-sm">

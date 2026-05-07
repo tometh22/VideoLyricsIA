@@ -166,6 +166,12 @@ class CreateUserRequest(BaseModel):
     email: str = ""
     role: str = "user"
     plan_id: str = "100"
+    # tenant_id: when omitted, auth.create_user() auto-generates it from
+    # the username — fine for solo accounts but produces an isolated
+    # tenant per user. Pass it explicitly to put several teammates into
+    # the same shared workspace (e.g. all UMG operators on
+    # tenant_id="universal_music" so they see each other's jobs).
+    tenant_id: str = ""
 
 
 @router.post("/users")
@@ -184,6 +190,7 @@ async def create_user_admin(
             email=body.email or None,
             role=body.role,
             plan=body.plan_id,
+            tenant_id=body.tenant_id.strip() or None,
         )
         return user.to_dict()
     except ValueError as e:
