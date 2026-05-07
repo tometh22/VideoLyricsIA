@@ -310,8 +310,7 @@ export default function UploadZone({
               onChange={(v) => setDeliveryProfile(v)}
               options={[
                 { code: "youtube", label: "MP4 H.264 1080p (YouTube / Instagram / TikTok)" },
-                { code: "umg",  label: "ProRes 422 HQ master — próximamente", disabled: true },
-                { code: "both", label: "MP4 + ProRes — próximamente",         disabled: true },
+                { code: "both", label: "MP4 + ProRes 422 HQ master (UMG)" },
               ]}
               className="w-72"
               ariaLabel={t("upload.delivery") || "Entrega"}

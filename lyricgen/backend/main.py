@@ -1321,6 +1321,9 @@ async def status(
         "artist": job.get("artist"),
         "filename": job.get("filename"),
         "created_at": job.get("created_at"),
+        # Frontend uses delivery_profile to decide whether to show the
+        # UMG master download tab in JobDetail.
+        "delivery_profile": job.get("delivery_profile", "youtube"),
     }
 
 

@@ -19,6 +19,15 @@ const MEDIA_TABS = [
   { key: "thumbnail", label: "Thumbnail", desc: "1280x720" },
 ];
 
+// UMG master is added conditionally — only when delivery_profile is
+// "umg" or "both". ProRes 422 HQ in a .mov, not previewable in
+// browser, so the tab shows a download-only panel.
+const UMG_MASTER_TAB = {
+  key: "umg_master",
+  label: "Máster UMG",
+  desc: "ProRes 422 HQ · MOV",
+};
+
 function ProvenanceTab({ jobId, t }) {
   const [records, setRecords] = useState(null);
   const [loading, setLoading] = useState(true);
@@ -240,8 +249,13 @@ export default function JobDetail({ job, onBack, onJobUpdate }) {
     setApproving(false);
   };
 
+  const hasUmgMaster =
+    (job.delivery_profile === "umg" || job.delivery_profile === "both") &&
+    !!job.files?.umg_master_url;
+
   const ALL_TABS = [
     ...MEDIA_TABS,
+    ...(hasUmgMaster ? [UMG_MASTER_TAB] : []),
     { key: "provenance", label: t("prov.title") || "Provenance" },
   ];
 
@@ -347,8 +361,44 @@ export default function JobDetail({ job, onBack, onJobUpdate }) {
         </div>
       )}
 
-      {/* Media preview */}
-      {activeTab !== "provenance" && canPreview && (
+      {/* UMG master tab — non-previewable, download-only panel */}
+      {activeTab === "umg_master" && canPreview && (
+        <div className="rounded-card bg-surface-2/40 ring-1 ring-white/[0.04] p-8 mb-6 text-center">
+          <div className="w-14 h-14 mx-auto mb-4 rounded-2xl bg-brand/10 ring-1 ring-brand/25 flex items-center justify-center">
+            <svg className="w-7 h-7 text-brand-light" fill="none" stroke="currentColor" strokeWidth="1.6" viewBox="0 0 24 24">
+              <path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4M7 10l5 5 5-5M12 15V3" strokeLinecap="round" strokeLinejoin="round"/>
+            </svg>
+          </div>
+          <h3 className="text-base font-semibold text-white mb-1.5">
+            {t("detail.umg_master_title") || "Máster ProRes 422 HQ"}
+          </h3>
+          <p className="text-xs text-ink-secondary mb-1">
+            1920×1080 · 24 fps · BT.709 · pcm_s24le · QuickTime .mov
+          </p>
+          <p className="text-[11px] text-gray-600 mb-5">
+            {t("detail.umg_master_subtitle") || "ProRes no se reproduce en el navegador. Descargá el archivo para reproducirlo en QuickTime / DaVinci / Premiere."}
+          </p>
+          {canDownload ? (
+            <a
+              href={`${API}/download/${job.job_id}/umg_master?${tokenParam()}`}
+              download
+              className="inline-flex items-center gap-2 btn-primary text-sm h-11 px-5"
+            >
+              <svg className="w-4 h-4" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
+                <path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4" /><polyline points="7 10 12 15 17 10" /><line x1="12" y1="15" x2="12" y2="3" />
+              </svg>
+              {t("detail.download_master") || "Descargar máster"}
+            </a>
+          ) : (
+            <p className="text-[11px] text-amber-300/90">
+              {t("detail.master_pending_approval") || "Aprobá el video para habilitar la descarga."}
+            </p>
+          )}
+        </div>
+      )}
+
+      {/* Media preview (video / short / thumbnail) */}
+      {activeTab !== "provenance" && activeTab !== "umg_master" && canPreview && (
         <>
           <div className="rounded-card bg-surface-2/40 ring-1 ring-white/[0.04] overflow-hidden mb-4">
             {activeTab === "thumbnail" ? (
