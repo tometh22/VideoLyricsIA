@@ -44,11 +44,24 @@ def create_job(
     return job_id
 
 
-def get_job(db: Session, job_id: str, tenant_id: str = None) -> Optional[dict]:
-    """Return a job dict or None if not found."""
+def get_job(
+    db: Session,
+    job_id: str,
+    tenant_id: str = None,
+    user_id: int = None,
+) -> Optional[dict]:
+    """Return a job dict or None if not found.
+
+    Pass user_id (in addition to tenant_id) for self-serve callers — it
+    closes the IDOR where many self-registered users land in
+    tenant_id="default" (e.g. the admin tenant) and could otherwise see
+    each other's jobs by enumerating job_ids.
+    """
     query = db.query(Job).filter(Job.job_id == job_id)
     if tenant_id:
         query = query.filter(Job.tenant_id == tenant_id)
+    if user_id is not None:
+        query = query.filter(Job.user_id == user_id)
     job = query.first()
     return job.to_dict() if job else None
 
@@ -58,12 +71,21 @@ def get_job_model(db: Session, job_id: str) -> Optional[Job]:
     return db.query(Job).filter(Job.job_id == job_id).first()
 
 
-def get_all_jobs(db: Session, tenant_id: str = "default", limit: int = 200) -> list[dict]:
-    """Return all jobs for a tenant, sorted by creation time (newest first)."""
+def get_all_jobs(
+    db: Session,
+    tenant_id: str = "default",
+    limit: int = 200,
+    user_id: int = None,
+) -> list[dict]:
+    """Return all jobs for a tenant, sorted by creation time (newest first).
+
+    Pass user_id for self-serve callers — see get_job() for rationale.
+    """
+    query = db.query(Job).filter(Job.tenant_id == tenant_id)
+    if user_id is not None:
+        query = query.filter(Job.user_id == user_id)
     jobs = (
-        db.query(Job)
-        .filter(Job.tenant_id == tenant_id)
-        .order_by(Job.created_at.desc())
+        query.order_by(Job.created_at.desc())
         .limit(limit)
         .all()
     )

@@ -21,6 +21,12 @@ stripe.api_key = os.environ.get("STRIPE_SECRET_KEY", "")
 STRIPE_WEBHOOK_SECRET = os.environ.get("STRIPE_WEBHOOK_SECRET", "")
 FRONTEND_URL = os.environ.get("FRONTEND_URL", "http://localhost:5173")
 
+# Refuse to accept unsigned webhook payloads when billing is wired up: an
+# unverified handler lets anyone POST a forged subscription update and grant
+# themselves any plan (or hijack another user's billing identity via
+# metadata.user_id).
+_REQUIRE_WEBHOOK_SIGNATURE = bool(stripe.api_key)
+
 router = APIRouter(prefix="/billing", tags=["billing"])
 
 
@@ -143,7 +149,12 @@ async def change_plan(
     subscription = stripe.Subscription.retrieve(user.stripe_subscription_id)
     current_item_id = subscription["items"]["data"][0].id
 
-    # Update subscription with new price
+    # Idempotency key prevents a retried request (network blip, double-click)
+    # from creating duplicate prorations. The local plan_id is intentionally
+    # NOT mutated here — the customer.subscription.updated webhook is the
+    # authoritative source. This keeps Stripe and our DB consistent even if
+    # this call partially succeeds.
+    idem_key = f"change-plan:{user.id}:{body.plan_id}:{current_item_id}"
     stripe.Subscription.modify(
         user.stripe_subscription_id,
         items=[{
@@ -151,16 +162,13 @@ async def change_plan(
             "price": plan["stripe_price_id"],
         }],
         proration_behavior="create_prorations",
-        metadata={"plan_id": body.plan_id},
+        metadata={"plan_id": body.plan_id, "user_id": str(user.id)},
+        idempotency_key=idem_key,
     )
 
-    # Update local plan
-    user.plan_id = body.plan_id
-    db.commit()
-
-    # Return new token with updated plan
-    new_token = create_token(user)
-    return {"ok": True, "plan": body.plan_id, "token": new_token}
+    # Don't optimistically grant the plan — the webhook will commit it once
+    # Stripe confirms. Return the request was accepted.
+    return {"ok": True, "plan_pending": body.plan_id}
 
 
 @router.get("/invoices")
@@ -218,17 +226,23 @@ async def stripe_webhook(request: Request, db: Session = Depends(get_db)):
     payload = await request.body()
     sig_header = request.headers.get("stripe-signature", "")
 
-    if STRIPE_WEBHOOK_SECRET:
-        try:
-            event = stripe.Webhook.construct_event(
-                payload, sig_header, STRIPE_WEBHOOK_SECRET,
-            )
-        except (ValueError, stripe.error.SignatureVerificationError) as e:
-            logger.warning(f"Webhook signature verification failed: {e}")
-            raise HTTPException(status_code=400, detail="Invalid signature")
-    else:
-        import json
-        event = json.loads(payload)
+    if not STRIPE_WEBHOOK_SECRET:
+        # Without a signing secret the only safe thing to do is refuse the
+        # request. Falling through to json.loads(payload) lets anyone forge
+        # checkout/subscription events.
+        if _REQUIRE_WEBHOOK_SIGNATURE:
+            logger.error("Refusing webhook: STRIPE_WEBHOOK_SECRET is not configured")
+            raise HTTPException(status_code=503, detail="Webhook signing not configured")
+        # No Stripe key at all (local dev with billing disabled): accept and ignore.
+        return JSONResponse({"received": False, "reason": "billing_disabled"})
+
+    try:
+        event = stripe.Webhook.construct_event(
+            payload, sig_header, STRIPE_WEBHOOK_SECRET,
+        )
+    except (ValueError, stripe.error.SignatureVerificationError) as e:
+        logger.warning(f"Webhook signature verification failed: {e}")
+        raise HTTPException(status_code=400, detail="Invalid signature")
 
     event_type = event.get("type", "")
     data = event.get("data", {}).get("object", {})
@@ -259,20 +273,24 @@ def _handle_checkout_completed(db: Session, data: dict):
     metadata = data.get("metadata", {})
     plan_id = metadata.get("plan_id", "100")
 
+    # Only resolve via stripe_customer_id. metadata.user_id was a fallback
+    # path that let a forged event rebind any user's billing identity.
+    # The customer is created server-side in get_or_create_stripe_customer
+    # and its id is stamped on the user row at that moment, so any legit
+    # checkout will already match here.
     user = _find_user_by_customer(db, customer_id)
     if not user:
-        # Try finding by user_id in metadata
-        user_id = metadata.get("user_id")
-        if user_id:
-            user = db.query(User).filter(User.id == int(user_id)).first()
-            if user:
-                user.stripe_customer_id = customer_id
+        logger.warning(
+            "checkout.session.completed for unknown stripe_customer_id=%s; ignoring",
+            customer_id,
+        )
+        return
 
-    if user:
-        user.stripe_subscription_id = subscription_id
+    user.stripe_subscription_id = subscription_id
+    if plan_id in PLANS:
         user.plan_id = plan_id
-        db.commit()
-        logger.info(f"User {user.username} subscribed to plan {plan_id}")
+    db.commit()
+    logger.info(f"User {user.username} subscribed to plan {plan_id}")
 
 
 def _handle_subscription_updated(db: Session, data: dict):
@@ -302,6 +320,8 @@ def _handle_subscription_deleted(db: Session, data: dict):
 
 
 def _handle_invoice_paid(db: Session, data: dict):
+    from sqlalchemy.exc import IntegrityError
+
     customer_id = data.get("customer")
     user = _find_user_by_customer(db, customer_id)
     if not user:
@@ -331,7 +351,15 @@ def _handle_invoice_paid(db: Session, data: dict):
         period_end=datetime.fromtimestamp(period_end, tz=timezone.utc) if period_end else None,
     )
     db.add(invoice)
-    db.commit()
+    try:
+        db.commit()
+    except IntegrityError:
+        # Concurrent webhook delivery (Stripe retries on 5xx) inserted the
+        # same row in parallel. The unique constraint on stripe_invoice_id
+        # caught it — treat as already-applied so Stripe doesn't keep
+        # retrying us.
+        db.rollback()
+        logger.info("invoice.paid duplicate for %s — already recorded", stripe_inv_id)
 
 
 def _handle_invoice_failed(db: Session, data: dict):

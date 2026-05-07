@@ -2689,10 +2689,26 @@ def _generate_veo_video(prompt: str, output_path: str, job_id: str = None,
         "parameters": veo_params,
     }
 
+    # Retry policy
+    # ------------
+    # The previous loop conflated two failure modes (HTTP 429 and arbitrary
+    # exceptions) under the same `for/else: raise "rate limit exceeded"` and
+    # could fall through to the polling stage with operation_name=None on a
+    # transient request error. We now:
+    #   1. Track success/last-error explicitly so the exit reason is honest.
+    #   2. Cap backoff at 120 s (was 60 × 5 = 300 s, exceeding the worker
+    #      timeout under stress).
+    #   3. Distinguish 429/RESOURCE_EXHAUSTED ("rate-limited") from network
+    #      errors ("transient") so the surfaced error message is accurate.
+    MAX_BACKOFF_S = 120
+    MAX_ATTEMPTS = 5
     operation_name: str | None = None
-    for attempt in range(5):
+    last_error: str | None = None
+    rate_limit_hits = 0
+
+    for attempt in range(MAX_ATTEMPTS):
         try:
-            print(f"[BG] Veo 3: generating video (attempt {attempt + 1}/5)...")
+            print(f"[BG] Veo 3: generating video (attempt {attempt + 1}/{MAX_ATTEMPTS})...")
             token = _veo_access_token()
             r = _req.post(
                 submit_url,
@@ -2705,12 +2721,16 @@ def _generate_veo_video(prompt: str, output_path: str, job_id: str = None,
                 timeout=60,
             )
             if r.status_code == 429 or "RESOURCE_EXHAUSTED" in r.text:
-                wait = 60 * (attempt + 1)
+                rate_limit_hits += 1
+                last_error = f"HTTP {r.status_code} rate-limited"
+                wait = min(MAX_BACKOFF_S, 30 * (2 ** attempt))
                 print(f"[BG] Rate limited (HTTP {r.status_code}), waiting {wait}s before retry...")
                 _time.sleep(wait)
                 continue
             if not r.ok:
                 detail = r.text[:500]
+                # Non-retryable: bubble immediately so the caller can mark
+                # the job error with a useful reason.
                 raise RuntimeError(
                     f"Veo predictLongRunning HTTP {r.status_code}: {detail}"
                 )
@@ -2722,13 +2742,24 @@ def _generate_veo_video(prompt: str, output_path: str, job_id: str = None,
         except RuntimeError:
             raise
         except Exception as e:
+            last_error = f"network/transient: {e}"
             print(f"[BG] Veo 3 attempt {attempt + 1} request error: {e}")
-            wait = 60 * (attempt + 1)
+            wait = min(MAX_BACKOFF_S, 15 * (2 ** attempt))
             _time.sleep(wait)
-    else:
+            continue
+
+    if operation_name is None:
+        reason = last_error or "unknown"
+        summary = (
+            f"error: rate_limited_after_{MAX_ATTEMPTS}_retries"
+            if rate_limit_hits == MAX_ATTEMPTS
+            else f"error: {reason} after {MAX_ATTEMPTS} retries"
+        )
         if recorder:
-            recorder.finish(response_summary="error: rate_limit_exceeded_after_5_retries")
-        raise RuntimeError("Veo 3 rate limit exceeded after 5 retries")
+            recorder.finish(response_summary=summary)
+        if rate_limit_hits == MAX_ATTEMPTS:
+            raise RuntimeError(f"Veo 3 rate limit exceeded after {MAX_ATTEMPTS} retries")
+        raise RuntimeError(f"Veo 3 submission failed after {MAX_ATTEMPTS} retries: {reason}")
 
     _last_veo_request = _time.time()
     print(f"[BG] Veo 3 operation: {operation_name}")

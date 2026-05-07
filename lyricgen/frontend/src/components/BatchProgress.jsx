@@ -1,10 +1,16 @@
 import { useI18n } from "../i18n";
+import { getDownloadUrl } from "../mediaUrl";
 
 const API = import.meta.env.VITE_API_URL || "";
 
-function tokenParam() {
-  const token = localStorage.getItem("genly_token");
-  return token ? `token=${encodeURIComponent(token)}` : "";
+async function triggerDownload(jobId, type) {
+  try {
+    const href = await getDownloadUrl(jobId, type);
+    const a = document.createElement("a");
+    a.href = href;
+    a.download = "";
+    a.click();
+  } catch {}
 }
 
 function JobRow({ job, index, t }) {
@@ -73,10 +79,9 @@ function JobRow({ job, index, t }) {
         {status === "done" && job_id && (
           <div className="flex gap-1.5 shrink-0">
             {["video", "short", "thumbnail"].map((type) => (
-              <a
+              <button
                 key={type}
-                href={`${API}/download/${job_id}/${type}?${tokenParam()}`}
-                download
+                onClick={() => triggerDownload(job_id, type)}
                 className="w-8 h-8 rounded-lg bg-surface-1 hover:bg-brand/10 flex items-center justify-center text-gray-400 hover:text-brand transition-colors"
                 title={type === "video" ? "Lyric Video" : type === "short" ? "Short" : "Thumbnail"}
               >
@@ -89,7 +94,7 @@ function JobRow({ job, index, t }) {
                 {type === "thumbnail" && (
                   <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24"><rect x="3" y="3" width="18" height="18" rx="2" /><circle cx="8.5" cy="8.5" r="1.5" /><polyline points="21 15 16 10 5 21" /></svg>
                 )}
-              </a>
+              </button>
             ))}
           </div>
         )}
@@ -131,16 +136,13 @@ export default function BatchProgress({ jobs, onReset, onRetry }) {
   const hasPendingReview = jobs.some((j) => j.status === "pending_review");
   const hasErrors = jobs.some((j) => j.status === "error" || j.status === "validation_failed");
 
-  const downloadAll = () => {
-    jobs.forEach((job) => {
-      if (job.status !== "done" || !job.job_id) return;
-      ["video", "short", "thumbnail"].forEach((type) => {
-        const a = document.createElement("a");
-        a.href = `${API}/download/${job.job_id}/${type}?${tokenParam()}`;
-        a.download = "";
-        a.click();
-      });
-    });
+  const downloadAll = async () => {
+    for (const job of jobs) {
+      if (job.status !== "done" || !job.job_id) continue;
+      for (const type of ["video", "short", "thumbnail"]) {
+        await triggerDownload(job.job_id, type);
+      }
+    }
   };
 
   return (
