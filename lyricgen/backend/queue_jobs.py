@@ -20,7 +20,11 @@ import threading
 logger = logging.getLogger("genly.queue")
 
 REDIS_URL = os.environ.get("REDIS_URL", "").strip()
-JOB_TIMEOUT = int(os.environ.get("JOB_TIMEOUT_SECONDS", "2700"))  # 45 min
+JOB_TIMEOUT = int(os.environ.get("JOB_TIMEOUT_SECONDS", "2700"))  # 45 min (YouTube)
+# UMG / both renders chain MP4 + ProRes + Short + Thumb + Veo retries.
+# A 7-min track with a fresh Veo gen + 2-3 retry rounds + ProRes encode
+# + 1.5GB R2 multipart upload can creep past 45min. Give it 90min.
+JOB_TIMEOUT_UMG = int(os.environ.get("JOB_TIMEOUT_UMG_SECONDS", "5400"))
 RESULT_TTL = int(os.environ.get("JOB_RESULT_TTL_SECONDS", "86400"))  # 24 h
 FAILURE_TTL = int(os.environ.get("JOB_FAILURE_TTL_SECONDS", "604800"))  # 7 d
 _ENVIRONMENT = os.environ.get("ENVIRONMENT", "production").lower().strip() or "production"
@@ -78,11 +82,15 @@ def enqueue_pipeline(
         # explicit kwargs= parameter — you have to pass either bare *args/**kwargs
         # or use both args= and kwargs= explicitly. We use the explicit form
         # because we want to forward the caller's **kwargs to the worker.
+        # Stretch timeout for ProRes-bearing profiles. The kwargs forwarded
+        # to run_pipeline include `delivery_profile` from /generate.
+        delivery = (kwargs.get("delivery_profile") or "youtube").lower()
+        timeout = JOB_TIMEOUT_UMG if delivery in ("umg", "both") else JOB_TIMEOUT
         rq_job = q.enqueue(
             run_pipeline,
             args=(job_id, mp3_path, artist, style),
             kwargs=kwargs,
-            job_timeout=JOB_TIMEOUT,
+            job_timeout=timeout,
             result_ttl=RESULT_TTL,
             failure_ttl=FAILURE_TTL,
             job_id=job_id,  # map RQ id to our job_id for easy lookup

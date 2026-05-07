@@ -33,7 +33,7 @@ if _SENTRY_DSN:
 
 from fastapi import FastAPI, File, Form, Query, UploadFile, HTTPException, Depends, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, JSONResponse, RedirectResponse
+from fastapi.responses import FileResponse, JSONResponse, RedirectResponse, StreamingResponse
 from pydantic import BaseModel
 from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.util import get_remote_address
@@ -64,7 +64,7 @@ import storage
 from datetime import datetime, timedelta, timezone
 
 from database import Job, User, UserSettings, AuditLog, get_db, init_db
-from jobs import create_job, get_job, get_all_jobs, update_job
+from jobs import bulk_delete_jobs, create_job, delete_job, get_job, get_all_jobs, update_job
 from observability import init_sentry, init_logging, health_snapshot
 from pipeline import run_pipeline, transcribe
 from queue_jobs import enqueue_pipeline, queue_depth
@@ -181,7 +181,10 @@ app.include_router(admin_router)
 # --- Startup ---
 @app.on_event("startup")
 def on_startup():
-    """Initialize DB and create default admin."""
+    """Initialize DB and create default admin. Also kick off the
+    reaper thread so zombie jobs (worker died mid-render) get
+    auto-flipped to error every 5 min — no manual cleanup, owner gets
+    a digest email + Sentry alert per pass."""
     init_db()
     db = next(get_db())
     try:
@@ -189,6 +192,34 @@ def on_startup():
     finally:
         db.close()
     logger.info("GenLy AI started — database initialized")
+
+    # Background reaper. Daemon → dies with the container. Single
+    # instance is enough; if the API ever scales horizontally, the
+    # reap_all_stuck call is idempotent (filters by status="processing"
+    # so duplicate runs are no-ops on already-reaped rows).
+    import time as _time
+    from reaper import reap_all_stuck as _reap
+
+    def _reaper_loop():
+        # Brief delay so the very first request doesn't compete with
+        # a cold-start reaper holding a DB connection.
+        _time.sleep(60)
+        while True:
+            try:
+                n = _reap()
+                if n > 0:
+                    logger.warning(f"reaper killed {n} stuck job(s)")
+            except Exception:  # pragma: no cover
+                try:
+                    import sentry_sdk
+                    sentry_sdk.capture_exception()
+                except Exception:
+                    pass
+                _time.sleep(60)  # back off on error
+            _time.sleep(300)  # 5 min between successful passes
+
+    threading.Thread(target=_reaper_loop, daemon=True, name="reaper").start()
+    logger.info("reaper thread started (threshold=100min, every 5min)")
 
 
 # --- Background library (public, authenticated) ---
@@ -322,6 +353,7 @@ async def login(body: LoginRequest, request: Request, db: Session = Depends(get_
             "role": user.role,
             "tenant_id": user.tenant_id,
             "plan": user.plan_id,
+            "allow_overage": getattr(user, "allow_overage", False) or False,
         },
     }
 
@@ -382,6 +414,7 @@ async def register(body: RegisterRequest, request: Request, db: Session = Depend
             "role": user.role,
             "tenant_id": user.tenant_id,
             "plan": user.plan_id,
+            "allow_overage": getattr(user, "allow_overage", False) or False,
         },
     }
 
@@ -511,20 +544,19 @@ _validate_mp3_upload = _validate_audio_upload
 
 
 def _job_scope(current_user: dict) -> dict:
-    """Return kwargs for jobs.get_job / jobs.get_all_jobs that scope reads
-    to the calling user's own jobs.
+    """Return kwargs for jobs.get_job / jobs.get_all_jobs scoping reads
+    to the caller's tenant.
 
-    Self-registered users land in tenant_id="default" by default (and any
-    that explicitly share a tenant with another user) — filtering by
-    tenant_id alone exposes IDOR by job_id enumeration. Admins keep the
-    tenant-wide view so they can audit all jobs from their org's tenant.
+    The product model treats `tenant_id` as a team workspace: every user
+    explicitly placed into a tenant (via `create_user(..., tenant_id=...)`
+    or via admin assignment) is meant to see every other team member's
+    jobs in that workspace. Self-registered users get a tenant derived
+    from their username (see auth.create_user) so they don't share with
+    strangers by accident. We therefore scope by tenant_id only — see
+    tests/test_tenant_isolation.py::test_two_users_same_tenant_share_jobs
+    for the contract this enforces.
     """
-    if current_user.get("role") == "admin":
-        return {"tenant_id": current_user["tenant_id"]}
-    return {
-        "tenant_id": current_user["tenant_id"],
-        "user_id": current_user["id"],
-    }
+    return {"tenant_id": current_user["tenant_id"]}
 
 
 def _lock_user_for_quota(db: Session, user_id: int) -> None:
@@ -545,19 +577,26 @@ def _lock_user_for_quota(db: Session, user_id: int) -> None:
 
 
 def _enforce_plan_quota(db: Session, current_user: dict) -> None:
-    """Raise 402 if the tenant reached its monthly limit without overage allowed."""
+    """Raise 402 if the tenant reached its monthly limit without overage allowed.
+
+    The message is operator-facing (UMG, label teams). It avoids
+    backend-y phrasing ("plan", "overage") and points at a human
+    contact path so the operator knows what to do — keeping it
+    blocking but not a dead-end.
+    """
     plan = current_user.get("plan", "100")
     tenant_id = current_user["tenant_id"]
     _lock_user_for_quota(db, current_user["id"])
     usage = get_plan_usage(db, current_user["id"], tenant_id, plan)
     if usage["remaining"] <= 0 and plan != "unlimited":
         if not current_user.get("allow_overage", False):
+            support_email = os.environ.get("SUPPORT_EMAIL", "soporte@genly.pro")
             raise HTTPException(
                 status_code=402,
                 detail=(
-                    f"Plan '{plan}' monthly limit reached "
-                    f"({usage['used']}/{usage['limit']}). "
-                    "Upgrade the plan or enable overage to continue."
+                    f"Llegaste al límite mensual de {usage['limit']} videos "
+                    f"({usage['used']} usados este mes). "
+                    f"Para extender el cupo, contactá a {support_email}."
                 ),
             )
 
@@ -1013,8 +1052,18 @@ async def transcribe_endpoint(
                 transcribe_path = tmp_path
                 trimmed_path = None
                 intro_segments: list[dict] = []
+                # Trigger the intro-trim path ONLY when the user's audio
+                # is *materially* longer than lrclib's studio cut. The
+                # original threshold (3 s) misfired on live recordings
+                # (Airbag "Blues del Infierno - River Plate" is 221 s vs
+                # lrclib's 200 s; the 21-s gap is outro applause, NOT an
+                # intro). A 30-s floor still catches the genuine cases —
+                # "El Plan de la Mariposa - El Riesgo" Video Oficial has
+                # 73 s of spoken-word preamble — without slicing every
+                # live track. Threshold is env-overridable for diagnosis.
+                _trim_floor = float(os.environ.get("INTRO_TRIM_FLOOR_SEC", "30"))
                 if (lrc_dur and user_dur
-                        and 3.0 < (user_dur - lrc_dur) <= 120.0):
+                        and _trim_floor < (user_dur - lrc_dur) <= 120.0):
                     intro_offset = float(user_dur - lrc_dur)
                     candidate = os.path.join(tmp_dir, "body_only.mp3")
                     sliced = await asyncio.to_thread(
@@ -1126,6 +1175,10 @@ async def transcribe_endpoint(
                 # Happy path: Whisper returned plausibly-many segments.
                 # Combine intro Whisper (if any) with the body output.
                 combined = intro_segments + segments
+                from pipeline import _filter_whisper_hallucinations
+                combined, _dropped = _filter_whisper_hallucinations(combined)
+                if _dropped:
+                    print(f"[TRANSCRIBE] dropped {_dropped} Whisper hallucination phrase(s)")
                 return {"segments": combined, "reference_lyrics": plain}
 
         # Kick off Gemini-grounded lyrics fetch in parallel with Whisper.
@@ -1228,6 +1281,10 @@ async def transcribe_endpoint(
                         "recovery_source": src,
                     }
 
+        from pipeline import _filter_whisper_hallucinations
+        segments, _dropped = _filter_whisper_hallucinations(segments)
+        if _dropped:
+            print(f"[TRANSCRIBE] dropped {_dropped} Whisper hallucination phrase(s)")
         return {"segments": segments, "reference_lyrics": reference}
     finally:
         try:
@@ -1392,6 +1449,9 @@ async def status(
         "artist": job.get("artist"),
         "filename": job.get("filename"),
         "created_at": job.get("created_at"),
+        # Frontend uses delivery_profile to decide whether to show the
+        # UMG master download tab in JobDetail.
+        "delivery_profile": job.get("delivery_profile", "youtube"),
     }
 
 
@@ -1403,11 +1463,59 @@ async def list_jobs(
     return get_all_jobs(db, **_job_scope(current_user))
 
 
+@app.delete("/jobs/{job_id}")
+async def delete_job_endpoint(
+    job_id: str,
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Hard-delete a stuck or failed job row. Operator uses this to clean
+    up history rows in `processing` / `queued` / `error` / `validation_failed`
+    state. Done / pending_review jobs are protected (audit trail + plan
+    quota integrity)."""
+    tenant_id = current_user["tenant_id"]
+    ok, reason = delete_job(db, job_id, tenant_id)
+    if not ok:
+        if reason == "not_found":
+            raise HTTPException(status_code=404, detail="Job not found.")
+        if reason.startswith("protected_status:"):
+            status_val = reason.split(":", 1)[1]
+            raise HTTPException(
+                status_code=409,
+                detail=f"Cannot delete a job in status '{status_val}'. Only stuck or failed jobs can be deleted.",
+            )
+        raise HTTPException(status_code=400, detail=reason)
+    return {"deleted": job_id}
+
+
+@app.post("/jobs/bulk-delete")
+async def bulk_delete_jobs_endpoint(
+    payload: dict,
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Delete many jobs in one round-trip. Body: {"job_ids": ["aaa", "bbb"]}.
+    Returns {"deleted": [...ids...], "skipped": {"id": reason}} so the UI
+    can surface which IDs were protected (e.g. status=done) or didn't exist.
+    Same safety rules as the single delete: only stuck/failed jobs go through.
+    """
+    tenant_id = current_user["tenant_id"]
+    ids = payload.get("job_ids") if isinstance(payload, dict) else None
+    if not isinstance(ids, list) or not all(isinstance(x, str) for x in ids):
+        raise HTTPException(status_code=400, detail="Body must be {job_ids: [string, ...]}.")
+    # Cap to a reasonable per-request batch so a runaway client can't
+    # nuke the whole table in one call.
+    if len(ids) > 200:
+        raise HTTPException(status_code=400, detail="Too many ids in one request (max 200).")
+    return bulk_delete_jobs(db, ids, tenant_id)
+
+
 FILE_MAP = {
     "video": "lyric_video.mp4",
     "short": "short.mp4",
     "thumbnail": "thumbnail.jpg",
     "umg_master": "umg_master.mov",
+    "umg_short": "umg_short.mov",
 }
 
 MEDIA_TYPES = {
@@ -1415,10 +1523,101 @@ MEDIA_TYPES = {
     "short": "video/mp4",
     "thumbnail": "image/jpeg",
     "umg_master": "video/quicktime",
+    "umg_short": "video/quicktime",
 }
 
 # File types that can't be previewed in-browser (ProRes is not browser-playable).
-NON_PREVIEWABLE = {"umg_master"}
+NON_PREVIEWABLE = {"umg_master", "umg_short"}
+
+# Bundled in the "download all" zip. We exclude umg_master deliberately —
+# ProRes masters are 1+ GB and have their own dedicated button in the UI.
+_BUNDLE_TYPES = ("video", "short", "thumbnail")
+
+
+@app.get("/download/{job_id}/all")
+async def download_all_zip(
+    job_id: str,
+    token: str = Query(...),
+    db: Session = Depends(get_db),
+):
+    """Bundle the small deliverables (video MP4 + short + thumbnail) into a
+    single ZIP so the operator gets one download instead of three rapid
+    a.click() calls (which the browser treats as popup spam and drops).
+
+    UMG ProRes masters are excluded by design: they're huge (1+ GB) and
+    UMG editorial expects them as a stand-alone .mov, not buried in a zip.
+    """
+    import io as _io
+    import zipfile as _zip
+
+    current_user = verify_media_token(token, job_id, "all", db)
+    job = get_job(db, job_id, **_job_scope(current_user))
+    if job is None:
+        raise HTTPException(status_code=404, detail="Job not found.")
+    if job["status"] != "done":
+        raise HTTPException(status_code=400, detail="Job is not done yet.")
+
+    job_files = job.get("files") or {}
+    s3_keys = job.get("s3_keys") or {}
+    bundle = [t for t in _BUNDLE_TYPES if job_files.get(f"{t}_url")]
+    if not bundle:
+        # umg-only jobs land here — they should be downloading the ProRes
+        # master directly via /download/{id}/umg_master, not /all.
+        raise HTTPException(
+            status_code=400,
+            detail="No bundleable deliverables for this job (UMG-only? use the master button).",
+        )
+
+    # Stage R2-stored files into a tmpdir so zipfile can stream them.
+    # Keep files on disk only for the lifetime of this request.
+    import tempfile, shutil
+    tmp_dir = tempfile.mkdtemp(prefix=f"genly_zip_{job_id}_")
+    try:
+        on_disk: list[tuple[str, str]] = []  # (path, name_in_zip)
+        for ftype in bundle:
+            filename = FILE_MAP[ftype]
+            key = s3_keys.get(ftype)
+            if key and storage.is_enabled():
+                local = os.path.join(tmp_dir, filename)
+                if not storage.download_object(key, local):
+                    # Fall through to disk as a last resort.
+                    local = os.path.join(OUTPUTS_DIR, job_id, filename)
+            else:
+                local = os.path.join(OUTPUTS_DIR, job_id, filename)
+            if not os.path.exists(local):
+                print(f"[ZIP] missing source for {ftype}: {local}")
+                continue
+            on_disk.append((local, filename))
+
+        if not on_disk:
+            raise HTTPException(status_code=404, detail="Deliverables not found on disk or R2.")
+
+        buf = _io.BytesIO()
+        with _zip.ZipFile(buf, "w", compression=_zip.ZIP_STORED) as zf:
+            # ZIP_STORED (no compression) — MP4/JPG are already compressed,
+            # re-zipping wastes CPU for ~0% size win.
+            for path, name in on_disk:
+                zf.write(path, arcname=name)
+        buf.seek(0)
+
+        # Filename is best-effort — fall back to job_id if artist/title are
+        # missing so we never produce a zip with weird empty-string names.
+        artist = (job.get("artist") or "").strip() or job_id
+        safe_name = "".join(
+            c if c.isalnum() or c in ("-", "_") else "_" for c in artist
+        ).strip("_") or job_id
+        zip_name = f"genly-{safe_name}.zip"
+
+        return StreamingResponse(
+            buf,
+            media_type="application/zip",
+            headers={"Content-Disposition": f'attachment; filename="{zip_name}"'},
+        )
+    finally:
+        try:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+        except Exception:
+            pass
 
 
 @app.get("/media-token/{job_id}/{file_type}")
@@ -1435,8 +1634,11 @@ async def issue_media_token(
     ?token=... query string of /download and /preview. Even if that URL
     leaks via Referer / browser history / server logs, it expires in 5
     minutes and only works for that exact file.
+
+    The pseudo-file_type "all" is permitted for the /download/{id}/all
+    zip endpoint, which bundles the small deliverables in one stream.
     """
-    if file_type not in FILE_MAP:
+    if file_type not in FILE_MAP and file_type != "all":
         raise HTTPException(status_code=400, detail="Invalid file type.")
     job = get_job(db, job_id, **_job_scope(current_user))
     if job is None:
@@ -1470,6 +1672,75 @@ async def download(
             return RedirectResponse(url, status_code=302)
 
     file_path = os.path.join(OUTPUTS_DIR, job_id, FILE_MAP[file_type])
+
+    # Lazy ProRes: the pipeline no longer produces umg_master.mov or
+    # umg_short.mov at render time (used to be a second moviepy pass
+    # that hung). The first GET /download/{id}/umg_master (or
+    # /umg_short) after a delivery_profile in (umg, both) job triggers
+    # an ffmpeg transcode of the existing MP4/short → ProRes per the
+    # job's umg_spec (master keeps the configured frame size, short
+    # uses 1080×1920 vertical at the same fps + profile). Persists
+    # the .mov so the next download is instant. Blocks the HTTP
+    # request for the duration (~60-120 s for a 3-min song); the
+    # browser's native download UI handles the wait.
+    if file_type in ("umg_master", "umg_short") and not os.path.exists(file_path):
+        umg_spec = job.get("umg_spec")
+        if not umg_spec:
+            raise HTTPException(
+                status_code=400,
+                detail="This job did not request UMG delivery; ProRes not available.",
+            )
+        # Pick the source mp4 and the spec for this variant.
+        if file_type == "umg_master":
+            source_filename = FILE_MAP["video"]
+            source_key_name = "video"
+        else:  # umg_short
+            source_filename = FILE_MAP["short"]
+            source_key_name = "short"
+        source_path = os.path.join(OUTPUTS_DIR, job_id, source_filename)
+        if not os.path.exists(source_path):
+            # Source mp4 may live in R2 — fetch it locally so ffmpeg can read it.
+            source_key = (job.get("s3_keys") or {}).get(source_key_name)
+            if source_key and storage.is_enabled():
+                os.makedirs(os.path.dirname(source_path), exist_ok=True)
+                if not storage.download_object(source_key, source_path):
+                    raise HTTPException(
+                        status_code=404,
+                        detail=f"Source {source_filename} not available locally or in R2.",
+                    )
+            else:
+                raise HTTPException(
+                    status_code=404,
+                    detail=f"Source {source_filename} not found; cannot generate ProRes.",
+                )
+        from pipeline import _transcode_to_prores, _short_prores_spec
+        from render_spec import RenderSpec as _RenderSpec
+        try:
+            spec = (
+                _RenderSpec.umg(**umg_spec) if file_type == "umg_master"
+                else _short_prores_spec(umg_spec)
+            )
+            _transcode_to_prores(source_path, file_path, spec)
+        except Exception as exc:
+            raise HTTPException(
+                status_code=500,
+                detail=f"ProRes transcode failed: {exc}",
+            )
+        # Best-effort R2 upload so future downloads of this ProRes skip
+        # the transcode entirely. Don't fail the response if it errors.
+        try:
+            if storage.is_enabled():
+                key = storage.upload_master(
+                    file_path, tenant_id, job_id, FILE_MAP[file_type],
+                )
+                if key:
+                    keys = dict(job.get("s3_keys") or {})
+                    keys[file_type] = key
+                    from jobs import update_job as _update_job
+                    _update_job(job_id, s3_keys=keys)
+        except Exception as e:  # pragma: no cover
+            print(f"[PRORES] R2 upload skipped: {e}")
+
     if not os.path.exists(file_path):
         raise HTTPException(status_code=404, detail="File not found.")
     return FileResponse(file_path, filename=FILE_MAP[file_type], media_type="application/octet-stream")
@@ -1820,11 +2091,12 @@ async def approve_job(
     from database import Job as JobModel, AuditLog
     from datetime import datetime, timezone
 
-    q = db.query(JobModel).filter(JobModel.job_id == job_id)
-    q = q.filter(JobModel.tenant_id == current_user["tenant_id"])
-    if current_user.get("role") != "admin":
-        q = q.filter(JobModel.user_id == current_user["id"])
-    job = q.first()
+    job = (
+        db.query(JobModel)
+        .filter(JobModel.job_id == job_id)
+        .filter(JobModel.tenant_id == current_user["tenant_id"])
+        .first()
+    )
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
     if job.status != "pending_review":
@@ -1856,11 +2128,12 @@ async def reject_job(
     from database import Job as JobModel, AuditLog
     from datetime import datetime, timezone
 
-    q = db.query(JobModel).filter(JobModel.job_id == job_id)
-    q = q.filter(JobModel.tenant_id == current_user["tenant_id"])
-    if current_user.get("role") != "admin":
-        q = q.filter(JobModel.user_id == current_user["id"])
-    job = q.first()
+    job = (
+        db.query(JobModel)
+        .filter(JobModel.job_id == job_id)
+        .filter(JobModel.tenant_id == current_user["tenant_id"])
+        .first()
+    )
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
     if job.status != "pending_review":

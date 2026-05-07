@@ -30,6 +30,8 @@ export default function AdminPanel({ onBack }) {
   const [usersTotal, setUsersTotal] = useState(0);
   const [jobs, setJobs] = useState([]);
   const [jobsTotal, setJobsTotal] = useState(0);
+  const [jobsTenantFilter, setJobsTenantFilter] = useState("");
+  const [jobsAutoRefresh, setJobsAutoRefresh] = useState(true);
   const [invoices, setInvoices] = useState([]);
   const [search, setSearch] = useState("");
   const [loading, setLoading] = useState(true);
@@ -41,7 +43,7 @@ export default function AdminPanel({ onBack }) {
 
   // Create user modal
   const [showCreate, setShowCreate] = useState(false);
-  const [newUser, setNewUser] = useState({ username: "", password: "", email: "", plan_id: "100", role: "user" });
+  const [newUser, setNewUser] = useState({ username: "", password: "", email: "", plan_id: "100", role: "user", tenant_id: "" });
   const [createError, setCreateError] = useState("");
 
   useEffect(() => {
@@ -54,7 +56,21 @@ export default function AdminPanel({ onBack }) {
     if (tab === "invoices") loadInvoices();
     if (tab === "compliance") loadCompliance();
     if (tab === "backgrounds") loadBackgrounds();
-  }, [tab]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [tab, jobsTenantFilter]);
+
+  // Auto-refresh the Jobs tab every 5s so admin sees real-time progress
+  // of running renders (current_step, progress %). Pauses when the tab
+  // is hidden so we don't hammer the API for an inactive screen.
+  useEffect(() => {
+    if (tab !== "jobs" || !jobsAutoRefresh) return;
+    const iv = setInterval(() => {
+      if (typeof document !== "undefined" && document.hidden) return;
+      loadJobs();
+    }, 5000);
+    return () => clearInterval(iv);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [tab, jobsAutoRefresh, jobsTenantFilter]);
 
   const loadStats = async () => {
     try {
@@ -62,6 +78,51 @@ export default function AdminPanel({ onBack }) {
       setStats(await res.json());
     } catch {} finally { setLoading(false); }
   };
+
+  const [health, setHealth] = useState(null);
+  const loadHealth = async () => {
+    try {
+      const res = await fetch(`${API}/health`);
+      setHealth(await res.json());
+    } catch {
+      setHealth({ status: "error", _fetch_failed: true });
+    }
+  };
+  const [stuckJobs, setStuckJobs] = useState({ count: 0, jobs: [] });
+  const loadStuckJobs = async () => {
+    try {
+      const res = await fetch(`${API}/admin/stuck-jobs?threshold_min=100`, { headers: authHeaders() });
+      if (res.ok) setStuckJobs(await res.json());
+    } catch {}
+  };
+  const [reaperRunning, setReaperRunning] = useState(false);
+  const [reaperResult, setReaperResult] = useState(null);
+  const runReaperNow = async () => {
+    if (reaperRunning) return;
+    setReaperRunning(true);
+    setReaperResult(null);
+    try {
+      const res = await fetch(`${API}/admin/runbook/reaper-now?threshold_min=100`, {
+        method: "POST",
+        headers: authHeaders(),
+      });
+      const data = await res.json();
+      setReaperResult(data);
+      // Refresh the stuck count immediately so the banner reflects reality.
+      loadStuckJobs();
+    } catch (err) {
+      setReaperResult({ error: String(err) });
+    } finally {
+      setReaperRunning(false);
+    }
+  };
+  useEffect(() => {
+    if (tab !== "overview") return;
+    loadHealth();
+    loadStuckJobs();
+    const iv = setInterval(() => { loadHealth(); loadStuckJobs(); }, 15000);
+    return () => clearInterval(iv);
+  }, [tab]);
 
   const loadCompliance = async () => {
     try {
@@ -111,7 +172,8 @@ export default function AdminPanel({ onBack }) {
 
   const loadJobs = async () => {
     try {
-      const res = await fetch(`${API}/admin/jobs?limit=100`, { headers: authHeaders() });
+      const tenantQ = jobsTenantFilter ? `&tenant_id=${encodeURIComponent(jobsTenantFilter)}` : "";
+      const res = await fetch(`${API}/admin/jobs?limit=100${tenantQ}`, { headers: authHeaders() });
       const data = await res.json();
       setJobs(data.jobs || []);
       setJobsTotal(data.total || 0);
@@ -140,7 +202,7 @@ export default function AdminPanel({ onBack }) {
         throw new Error(data.detail || "Error");
       }
       setShowCreate(false);
-      setNewUser({ username: "", password: "", email: "", plan_id: "100", role: "user" });
+      setNewUser({ username: "", password: "", email: "", plan_id: "100", role: "user", tenant_id: "", allow_overage: false });
       loadUsers();
     } catch (err) {
       setCreateError(err.message);
@@ -152,6 +214,15 @@ export default function AdminPanel({ onBack }) {
       method: "PATCH",
       headers: { "Content-Type": "application/json", ...authHeaders() },
       body: JSON.stringify({ is_active: !isActive }),
+    });
+    loadUsers();
+  };
+
+  const handleToggleOverage = async (userId, currentValue) => {
+    await fetch(`${API}/admin/users/${userId}`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json", ...authHeaders() },
+      body: JSON.stringify({ allow_overage: !currentValue }),
     });
     loadUsers();
   };
@@ -222,6 +293,110 @@ export default function AdminPanel({ onBack }) {
       {/* Overview */}
       {tab === "overview" && stats && (
         <div className="space-y-8">
+          {/* Stuck-job banner — shows immediately when zombies exist
+              even before the reaper next pass kills them. */}
+          {stuckJobs.count > 0 && (
+            <div className="rounded-card bg-red-500/[0.08] ring-1 ring-red-500/30 px-5 py-4 flex items-center gap-3 flex-wrap">
+              <svg className="w-5 h-5 text-red-300 shrink-0" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
+                <path d="M12 9v4M12 17h.01"/><circle cx="12" cy="12" r="10"/>
+              </svg>
+              <div className="flex-1 min-w-0">
+                <p className="text-sm font-semibold text-red-200">
+                  {stuckJobs.count} {stuckJobs.count === 1 ? "job zombie" : "jobs zombies"} detectado{stuckJobs.count > 1 ? "s" : ""}
+                </p>
+                <p className="text-xs text-red-300/80 mt-0.5">
+                  En "processing" hace más de {stuckJobs.threshold_min} min sin avanzar. El reaper los va a marcar como error en el próximo ciclo (≤5 min), o forzá ahora ↓. Tenants:{" "}
+                  {[...new Set(stuckJobs.jobs.map(j => j.tenant_id))].slice(0, 5).join(", ")}
+                </p>
+              </div>
+              <div className="flex items-center gap-2 shrink-0">
+                <button
+                  onClick={runReaperNow}
+                  disabled={reaperRunning}
+                  className="text-xs px-3 py-1.5 rounded-lg bg-red-500/20 hover:bg-red-500/30 text-red-100 font-medium disabled:opacity-50 disabled:cursor-not-allowed"
+                  title="Marca todos los zombies como error inmediatamente"
+                >
+                  {reaperRunning ? "Ejecutando…" : "Forzar reaper ahora"}
+                </button>
+                <button onClick={() => setTab("jobs")} className="text-xs text-red-200 hover:text-white underline shrink-0">
+                  Ver
+                </button>
+              </div>
+            </div>
+          )}
+
+          {/* Reaper result toast — sticks visible after a manual run so
+              the admin sees confirmation of what the runbook did. */}
+          {reaperResult && (
+            <div className={`rounded-card ring-1 px-5 py-3 flex items-center gap-3 text-sm ${
+              reaperResult.error
+                ? "bg-red-500/[0.08] ring-red-500/30 text-red-200"
+                : reaperResult.count > 0
+                  ? "bg-amber-500/[0.06] ring-amber-500/25 text-amber-200"
+                  : "bg-accent/[0.06] ring-accent/20 text-accent"
+            }`}>
+              <svg className="w-4 h-4 shrink-0" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
+                {reaperResult.error
+                  ? <><circle cx="12" cy="12" r="10"/><path d="M15 9l-6 6M9 9l6 6"/></>
+                  : <><path d="M22 11.08V12a10 10 0 11-5.93-9.14"/><polyline points="22 4 12 14.01 9 11.01"/></>
+                }
+              </svg>
+              <div className="flex-1">
+                {reaperResult.error
+                  ? <>Falló el runbook: {reaperResult.error}</>
+                  : reaperResult.count > 0
+                    ? <>Reaper ejecutado · {reaperResult.count} job{reaperResult.count > 1 ? "s" : ""} marcado{reaperResult.count > 1 ? "s" : ""} como error.</>
+                    : <>Reaper ejecutado · ningún zombie encontrado.</>
+                }
+              </div>
+              <button onClick={() => setReaperResult(null)} className="text-xs opacity-60 hover:opacity-100">×</button>
+            </div>
+          )}
+
+          {/* System status — live, refreshes every 15s ─────────── */}
+          {health && (() => {
+            const statusColor = health.status === "ok"
+              ? "text-accent" : health.status === "degraded"
+              ? "text-amber-400" : "text-red-400";
+            const statusBg = health.status === "ok"
+              ? "bg-accent/[0.06] ring-accent/20" : health.status === "degraded"
+              ? "bg-amber-500/[0.06] ring-amber-500/25" : "bg-red-500/[0.06] ring-red-500/30";
+            const Pill = ({ ok, label, value }) => (
+              <div className="flex items-center gap-2 text-xs">
+                <span className={`w-2 h-2 rounded-full ${ok ? "bg-accent" : "bg-red-400"}`} />
+                <span className="text-gray-400">{label}</span>
+                <span className="font-mono text-white">{value}</span>
+              </div>
+            );
+            const queue = health.queue_depth || {};
+            const totalQueue = (queue.enterprise ?? 0) + (queue.default ?? 0);
+            return (
+              <div className={`rounded-card ring-1 ${statusBg} px-5 py-4`}>
+                <div className="flex items-center justify-between mb-3">
+                  <div className="flex items-center gap-2">
+                    <span className={`text-xs font-bold uppercase tracking-wider ${statusColor}`}>
+                      System {health.status}
+                    </span>
+                    {health.degraded_reason && (
+                      <span className="text-xs text-amber-300">· {health.degraded_reason}</span>
+                    )}
+                  </div>
+                  <span className="text-[10px] text-gray-500">live · refresh 15s</span>
+                </div>
+                <div className="grid grid-cols-2 md:grid-cols-4 gap-x-4 gap-y-2">
+                  <Pill ok={health.db === "up"} label="Postgres" value={health.db || "?"} />
+                  <Pill ok={health.redis === "up"} label="Redis" value={health.redis || "?"} />
+                  <Pill ok={health.r2 === "configured"} label="R2 storage" value={health.r2 || "?"} />
+                  <Pill ok={(health.workers_alive || 0) > 0} label="Workers" value={health.workers_alive ?? "?"} />
+                  <Pill ok={totalQueue < 50} label="Cola jobs" value={`${totalQueue} (ent ${queue.enterprise ?? 0} + def ${queue.default ?? 0})`} />
+                  <Pill ok={(health.disk_free_gb ?? 0) > 10} label="Disco libre" value={`${health.disk_free_gb ?? "?"} GB`} />
+                  <Pill ok={!!health.api_keys?.openai} label="OpenAI" value={health.api_keys?.openai ? "ok" : "missing"} />
+                  <Pill ok={!!health.api_keys?.vertex} label="Vertex (Veo+Gemini)" value={health.api_keys?.vertex ? "ok" : "missing"} />
+                </div>
+              </div>
+            );
+          })()}
+
           {/* Compliance warning banner */}
           {stats.jobs?.pending_review > 0 && (
             <div className="rounded-2xl bg-amber-500/5 border border-amber-500/20 px-5 py-4 flex items-center gap-3">
@@ -320,6 +495,7 @@ export default function AdminPanel({ onBack }) {
                         <span className="font-medium">{u.username}</span>
                         {u.role === "admin" && <span className="text-[9px] bg-brand/20 text-brand px-1.5 py-0.5 rounded-full font-bold uppercase">Admin</span>}
                         {u.ai_authorized && <span className="text-[9px] bg-accent/15 text-accent px-1.5 py-0.5 rounded-full font-bold uppercase">AI</span>}
+                        {u.allow_overage && <span className="text-[9px] bg-amber-500/15 text-amber-300 px-1.5 py-0.5 rounded-full font-bold uppercase" title="Puede pasar el cap mensual y se factura el extra">Overage</span>}
                       </div>
                     </td>
                     <td className="px-4 py-3 text-gray-400">{u.email || "—"}</td>
@@ -334,10 +510,15 @@ export default function AdminPanel({ onBack }) {
                     <td className="px-4 py-3 text-gray-400">{u.job_count || 0}</td>
                     <td className="px-4 py-3 text-gray-500 text-xs">{fmtDate(u.created_at)}</td>
                     <td className="px-4 py-3">
-                      <div className="flex gap-1">
+                      <div className="flex gap-1 flex-wrap">
                         <button onClick={() => handleToggleAI(u.id, u.ai_authorized)}
                           className={`text-[10px] px-2 py-1 rounded-lg font-medium ${u.ai_authorized ? "text-amber-400 hover:bg-amber-500/10" : "text-accent hover:bg-accent/10"}`}>
                           {u.ai_authorized ? "Revoke AI" : "Auth AI"}
+                        </button>
+                        <button onClick={() => handleToggleOverage(u.id, u.allow_overage)}
+                          className={`text-[10px] px-2 py-1 rounded-lg font-medium ${u.allow_overage ? "text-amber-400 hover:bg-amber-500/10" : "text-gray-400 hover:bg-white/[0.04]"}`}
+                          title="Permitir pasar el cap mensual con cargo por video extra">
+                          {u.allow_overage ? "Stop Overage" : "Allow Overage"}
                         </button>
                         <button onClick={() => handleToggleUser(u.id, u.is_active)}
                           className={`text-[10px] px-2 py-1 rounded-lg ${u.is_active ? "text-red-400 hover:bg-red-500/10" : "text-accent hover:bg-accent/10"}`}>
@@ -366,6 +547,13 @@ export default function AdminPanel({ onBack }) {
                   <input type="password" placeholder="Password" value={newUser.password}
                     onChange={e => setNewUser({...newUser, password: e.target.value})}
                     className="input-field !py-3 text-sm" required />
+                  <input type="text" placeholder="Tenant ID (deja vacío para que sea único por user)"
+                    value={newUser.tenant_id}
+                    onChange={e => setNewUser({...newUser, tenant_id: e.target.value})}
+                    className="input-field !py-3 text-sm" />
+                  <p className="text-[11px] text-gray-500 -mt-2">
+                    Mismo tenant ID = el equipo comparte historial / videos. Vacío = aislado.
+                  </p>
                   <select value={newUser.plan_id}
                     onChange={e => setNewUser({...newUser, plan_id: e.target.value})}
                     className="input-field !py-3 text-sm">
@@ -379,6 +567,20 @@ export default function AdminPanel({ onBack }) {
                     <option value="user">User</option>
                     <option value="admin">Admin</option>
                   </select>
+                  <label className="flex items-start gap-2 text-sm text-gray-300 cursor-pointer select-none">
+                    <input
+                      type="checkbox"
+                      checked={newUser.allow_overage || false}
+                      onChange={e => setNewUser({...newUser, allow_overage: e.target.checked})}
+                      className="accent-amber-500 mt-0.5"
+                    />
+                    <span>
+                      Permitir overage
+                      <span className="block text-[11px] text-gray-500 mt-0.5">
+                        El usuario puede pasar el cap mensual; los videos extra se facturan al cierre.
+                      </span>
+                    </span>
+                  </label>
                   {createError && <p className="text-sm text-red-400">{createError}</p>}
                   <div className="flex gap-3 pt-2">
                     <button type="submit" className="btn-primary flex-1 !py-3 text-sm">Create</button>
@@ -394,8 +596,30 @@ export default function AdminPanel({ onBack }) {
       {/* Jobs */}
       {tab === "jobs" && (
         <div className="space-y-4">
-          <p className="text-xs text-gray-500">{jobsTotal} jobs total</p>
-          <div className="glass rounded-card overflow-hidden">
+          <div className="flex items-center justify-between gap-3 flex-wrap">
+            <p className="text-xs text-gray-500">
+              {jobsTotal} jobs{jobsTenantFilter && <> en tenant <span className="text-brand">{jobsTenantFilter}</span></>}
+            </p>
+            <div className="flex items-center gap-3">
+              <input
+                type="text"
+                placeholder="Filtrar por tenant_id (ej: universal_music)"
+                value={jobsTenantFilter}
+                onChange={e => setJobsTenantFilter(e.target.value.trim())}
+                className="input-field !py-2 text-xs w-72"
+              />
+              <label className="flex items-center gap-1.5 text-xs text-gray-400 cursor-pointer select-none">
+                <input
+                  type="checkbox"
+                  checked={jobsAutoRefresh}
+                  onChange={e => setJobsAutoRefresh(e.target.checked)}
+                  className="accent-brand"
+                />
+                Auto-refresh 5s
+              </label>
+            </div>
+          </div>
+          <div className="glass rounded-card overflow-hidden overflow-x-auto">
             <table className="w-full text-sm">
               <thead>
                 <tr className="border-b border-white/[0.06]">
@@ -404,13 +628,15 @@ export default function AdminPanel({ onBack }) {
                   <th className="text-left px-4 py-3 text-xs text-gray-500 font-medium">File</th>
                   <th className="text-left px-4 py-3 text-xs text-gray-500 font-medium">Tenant</th>
                   <th className="text-left px-4 py-3 text-xs text-gray-500 font-medium">Status</th>
+                  <th className="text-left px-4 py-3 text-xs text-gray-500 font-medium">Step</th>
+                  <th className="text-left px-4 py-3 text-xs text-gray-500 font-medium w-[140px]">Progress</th>
                   <th className="text-left px-4 py-3 text-xs text-gray-500 font-medium">Created</th>
                 </tr>
               </thead>
               <tbody>
                 {jobs.map(j => (
                   <tr key={j.job_id} className="border-b border-white/[0.03]">
-                    <td className="px-4 py-3 font-mono text-xs text-gray-400">{j.job_id}</td>
+                    <td className="px-4 py-3 font-mono text-xs text-gray-400">{j.job_id?.slice(0, 8)}…</td>
                     <td className="px-4 py-3">{j.artist}</td>
                     <td className="px-4 py-3 text-gray-400 truncate max-w-[200px]">{j.filename}</td>
                     <td className="px-4 py-3 text-xs text-gray-500">{j.tenant_id}</td>
@@ -418,10 +644,30 @@ export default function AdminPanel({ onBack }) {
                       <span className={`text-xs px-2 py-1 rounded-lg font-medium ${
                         j.status === "done" ? "bg-accent/10 text-accent" :
                         j.status === "error" ? "bg-red-500/10 text-red-400" :
+                        j.status === "validation_failed" ? "bg-red-500/10 text-red-300" :
+                        j.status === "pending_review" ? "bg-amber-500/10 text-amber-300" :
                         "bg-brand/10 text-brand"
                       }`}>{j.status}</span>
                     </td>
-                    <td className="px-4 py-3 text-xs text-gray-500">
+                    <td className="px-4 py-3 text-xs text-gray-400">
+                      {j.current_step || "—"}
+                    </td>
+                    <td className="px-4 py-3">
+                      {typeof j.progress === "number" && j.status !== "done" && j.status !== "error" ? (
+                        <div className="flex items-center gap-2">
+                          <div className="flex-1 h-1.5 bg-surface-3/60 rounded-full overflow-hidden min-w-[60px]">
+                            <div
+                              className="h-full bg-gradient-to-r from-brand to-brand-light transition-all"
+                              style={{ width: `${Math.max(2, Math.min(100, j.progress))}%` }}
+                            />
+                          </div>
+                          <span className="text-[10px] text-gray-500 tabular-nums w-8 text-right">{j.progress}%</span>
+                        </div>
+                      ) : (
+                        <span className="text-xs text-gray-600">—</span>
+                      )}
+                    </td>
+                    <td className="px-4 py-3 text-xs text-gray-500 whitespace-nowrap">
                       {j.created_at ? new Date(j.created_at * 1000).toLocaleString("es-AR") : "—"}
                     </td>
                   </tr>

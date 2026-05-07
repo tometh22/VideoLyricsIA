@@ -58,6 +58,7 @@ _DELIVERABLE_FILENAMES = {
     "short": "short.mp4",
     "thumbnail": "thumbnail.jpg",
     "umg_master": "umg_master.mov",
+    "umg_short": "umg_short.mov",
 }
 
 
@@ -104,6 +105,86 @@ def _upload_deliverables_to_r2(job_id: str, job_dir: str, files: dict) -> dict:
         except Exception as e:
             print(f"[R2] Upload failed for {key_name}: {e}")
     return out
+
+
+def _ffprobe_duration(path: str) -> float | None:
+    """Return media duration in seconds, or None if ffprobe fails."""
+    import subprocess
+    try:
+        r = subprocess.run(
+            ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+             "-of", "default=noprint_wrappers=1:nokey=1", path],
+            capture_output=True, text=True, timeout=30,
+        )
+        return float((r.stdout or "").strip())
+    except Exception:
+        return None
+
+
+def _verify_deliverables(job_dir: str, files: dict, audio_duration: float) -> None:
+    """Sanity-check every deliverable BEFORE the R2 upload.
+
+    Catches the silent-failure family:
+    - ffmpeg exited 0 but produced an empty/truncated file (disk full, OOM
+      mid-flush)
+    - moviepy crashed mid-render and left the prior pass's leftover file
+    - duration mismatch (audio offset bug, encoder cut early)
+    - codec mismatch (caller forgot to pass the right RenderSpec)
+
+    Raises RuntimeError on any failure so the outer try/except in
+    run_pipeline marks the job 'error' with a clear message instead of
+    uploading garbage to R2 + shipping it to UMG.
+    """
+    import os as _os
+
+    expected = {
+        "video_url":      ("lyric_video.mp4", "h264", audio_duration),
+        "short_url":      ("short.mp4",        "h264", None),  # short is a fixed clip, not full audio
+        "thumbnail_url":  ("thumbnail.jpg",   None,   None),
+        # umg_master is generated lazily at download time via ffmpeg from
+        # the MP4 above (see /download/{id}/umg_master). It does NOT
+        # exist on disk after the pipeline finishes, so we don't verify
+        # it here — the download endpoint validates the .mov post-
+        # transcode using _validate_umg_master.
+    }
+    for url_key, (filename, expected_codec, expected_dur) in expected.items():
+        if url_key not in files:
+            continue
+        path = _os.path.join(job_dir, filename)
+        if not _os.path.exists(path):
+            raise RuntimeError(f"verify: {filename} missing on disk after render")
+        size = _os.path.getsize(path)
+        if size < 1024:
+            raise RuntimeError(f"verify: {filename} is {size} bytes (truncated / empty)")
+
+        if expected_codec:
+            # ffprobe codec check
+            import subprocess
+            r = subprocess.run(
+                ["ffprobe", "-v", "error", "-select_streams", "v:0",
+                 "-show_entries", "stream=codec_name",
+                 "-of", "default=noprint_wrappers=1:nokey=1", path],
+                capture_output=True, text=True, timeout=30,
+            )
+            codec = (r.stdout or "").strip()
+            if codec != expected_codec:
+                raise RuntimeError(
+                    f"verify: {filename} codec is {codec!r}, expected {expected_codec!r}"
+                )
+
+        if expected_dur is not None:
+            actual_dur = _ffprobe_duration(path)
+            if actual_dur is None:
+                raise RuntimeError(f"verify: {filename} ffprobe could not read duration")
+            # ±2s tolerance — encoder rounding + container overhead
+            if abs(actual_dur - expected_dur) > 2.0:
+                raise RuntimeError(
+                    f"verify: {filename} duration {actual_dur:.1f}s differs from "
+                    f"audio {expected_dur:.1f}s by > 2s"
+                )
+
+    print(f"[VERIFY] all {len(files)} deliverables passed sanity checks "
+          f"(umg_master, if requested, is generated lazily at download)")
 
 
 def _cleanup_local_intermediates(job_dir: str) -> None:
@@ -267,8 +348,62 @@ def run_pipeline(job_id: str, mp3_path: str, artist: str, style: str,
             print(f"[FONT] Operator-selected: {os.path.basename(chosen_font)}")
         bg_source = bg_image_path
 
-        # Step 2 — YouTube lyric video (H.264 / MP4 / 1080p / 24fps)
+        # Step 1b — Pre-render content validation (UMG Guideline 15).
+        # We validate the BACKGROUND ASSET BEFORE the expensive render so
+        # we don't burn 5+ minutes of CPU only to throw the result away.
+        # Two paths:
+        #   - Operator/AI supplied a specific bg → validate it; if it
+        #     fails, mark validation_failed (we can't auto-substitute).
+        #   - No bg supplied → cycle through library candidates, picking
+        #     the first one that passes (up to 3 attempts).
         if wants_youtube:
+            update_job(job_id, current_step="validation", progress=38)
+            if bg_image_path:
+                from content_validator import validate_video, validate_image
+                ext = os.path.splitext(bg_image_path)[1].lower()
+                _validate_fn = (
+                    validate_video if ext in (".mp4", ".mov", ".webm")
+                    else validate_image
+                )
+                pre_validation = _validate_fn(bg_image_path, job_id=job_id)
+                update_job(job_id, validation_result=pre_validation)
+                if not pre_validation["passed"]:
+                    update_job(
+                        job_id,
+                        status="validation_failed",
+                        error=f"Content policy violation detected: {pre_validation['issues']}",
+                    )
+                    print(f"[VALIDATION] FAILED for job {job_id}: {pre_validation['issues']}")
+                    return
+            else:
+                clean_bg, rejection_log = _select_validated_background(job_id)
+                if not clean_bg:
+                    update_job(
+                        job_id,
+                        status="validation_failed",
+                        error=(
+                            "No clean background found after retries. "
+                            f"Rejections: {rejection_log}"
+                        ),
+                    )
+                    print(f"[VALIDATION] FAILED for job {job_id}: no clean bg after retries")
+                    return
+                bg_image_path = clean_bg
+                update_job(job_id, validation_result={
+                    "passed": True, "issues": [], "rejections": rejection_log,
+                })
+
+        # Step 2 — YouTube lyric video (H.264 / MP4 / 1080p / 24fps).
+        # Always render the MP4 when ANY delivery profile is requested.
+        # The UMG ProRes is now generated lazily at download time from
+        # this MP4 (see _transcode_mp4_to_prores + the /download/{id}/
+        # umg_master endpoint), so the second render that used to live
+        # at Step 2b is gone. That eliminates the duplicate moviepy
+        # palindrome-hang exposure the operator hit on every
+        # delivery_profile in (umg, both).
+        if wants_youtube or wants_umg:
+            if wants_umg and not umg_spec:
+                raise RuntimeError("UMG delivery requested without umg_spec")
             update_job(job_id, current_step="video", progress=40)
             _, chosen_font, bg_source = generate_lyric_video(
                 mp3_path, segments, style, job_dir, artist, bg_image_path,
@@ -277,22 +412,20 @@ def run_pipeline(job_id: str, mp3_path: str, artist: str, style: str,
             files["video_url"] = f"/download/{job_id}/video"
             update_job(job_id, progress=55)
 
-        # Step 2b — UMG master (ProRes / .mov / target frame size & fps)
+        # Lazy ProRes — register the URLs so the UI shows the
+        # "Master ProRes" + "Short ProRes" download buttons. The
+        # actual .mov files are generated on the first GET
+        # /download/{id}/umg_master or /download/{id}/umg_short
+        # from the existing MP4 / short.mp4 via ffmpeg (no moviepy
+        # involvement).
         if wants_umg:
-            if not umg_spec:
-                raise RuntimeError("UMG delivery requested without umg_spec")
-            update_job(job_id, current_step="umg_master", progress=58)
-            spec = RenderSpec.umg(**umg_spec)
-            # Reuse font/bg from YouTube render if available; otherwise pick fresh.
-            _, chosen_font, bg_source = generate_lyric_video(
-                mp3_path, segments, style, job_dir, artist, bg_image_path,
-                spec=spec, font=chosen_font,
-            )
             files["umg_master_url"] = f"/download/{job_id}/umg_master"
-            update_job(job_id, progress=70)
+            files["umg_short_url"] = f"/download/{job_id}/umg_short"
 
-        # Step 3 — YouTube Short (only when YouTube delivery is requested)
-        if wants_youtube:
+        # Step 3 — YouTube Short. Generated for any profile that
+        # asked for video/UMG so the operator/UMG team always has the
+        # short clip even on UMG-only orders.
+        if wants_youtube or wants_umg:
             update_job(job_id, current_step="short", progress=75)
             generate_short(
                 mp3_path, segments, job_dir, bg_source=bg_source,
@@ -308,33 +441,18 @@ def run_pipeline(job_id: str, mp3_path: str, artist: str, style: str,
             )
             files["thumbnail_url"] = f"/download/{job_id}/thumbnail"
 
-        # Step 5 — Content validation (UMG Guideline 15) — only if a YouTube
-        # video was rendered (UMG-only jobs skip validation; masters go to
-        # legal review independently).
-        #
-        # We validate the BACKGROUND ASSET (bg_source) before lyrics overlay,
-        # not the composited final. The validator looks for prohibited content
-        # like people, logos, foreign text — but the final video has OUR
-        # intentional lyrics burned in, which would be a guaranteed false
-        # positive. The background is what we actually need to police.
-        if wants_youtube and bg_source:
-            update_job(job_id, current_step="validation", progress=94)
-            ext = os.path.splitext(bg_source)[1].lower()
-            if ext in (".mp4", ".mov", ".webm"):
-                from content_validator import validate_video as _validate_bg
-            else:
-                from content_validator import validate_image as _validate_bg
-            validation = _validate_bg(bg_source, job_id=job_id)
-            update_job(job_id, validation_result=validation)
+        # Content validation already happened pre-render (Step 1b) so the
+        # background here is guaranteed clean. No post-render check needed.
 
-            if not validation["passed"]:
-                update_job(
-                    job_id,
-                    status="validation_failed",
-                    error=f"Content policy violation detected: {validation['issues']}",
-                )
-                print(f"[VALIDATION] FAILED for job {job_id}: {validation['issues']}")
-                return
+        # Sanity-check every deliverable before uploading to R2. Catches
+        # silent failures (truncated files, codec mismatches, duration
+        # drift) so we mark the job as error here instead of shipping
+        # garbage to UMG.
+        try:
+            audio_dur_for_verify = _audio_duration(mp3_path)
+        except Exception:
+            audio_dur_for_verify = 0.0
+        _verify_deliverables(job_dir, files, audio_dur_for_verify)
 
         # Post-render upload to cloud storage. No-op if R2 env not set.
         s3_keys = _upload_deliverables_to_r2(job_id, job_dir, files)
@@ -365,6 +483,20 @@ def run_pipeline(job_id: str, mp3_path: str, artist: str, style: str,
     except Exception as exc:
         traceback.print_exc()
         update_job(job_id, status="error", error=str(exc))
+        # Surface render failures to Sentry. The worker runs outside
+        # the FastAPI request loop so the framework's auto-capture
+        # doesn't fire — without this explicit hook, ffmpeg hangs,
+        # OOMs, Veo 429-storms, etc. would be invisible. Wrapped to
+        # never let observability break the failure path.
+        try:
+            import sentry_sdk
+            with sentry_sdk.push_scope() as _scope:
+                _scope.set_tag("event", "pipeline.failed")
+                _scope.set_tag("job_id", job_id)
+                _scope.set_tag("artist", artist or "?")
+                sentry_sdk.capture_exception(exc)
+        except Exception:
+            pass
 
 
 # ---------------------------------------------------------------------------
@@ -389,6 +521,100 @@ _SPAM_PATTERNS = [
     "apple music", "deezer", "amazon music",
     "music by", "produced by", "lyrics by",
 ]
+
+
+# Whisper-1 has a small set of "training-data hallucinations" that fire
+# during silence / quiet music intros — phrases lifted directly from
+# subtitle datasets (Amara.org credits, "♪ music ♪" tags) that the
+# model emits as a sequence completion when there's no real speech.
+# These are NOT YouTube uploader chatter (above) — they're outputs that
+# come straight from training data leakage. Tight match because we want
+# zero false positives on real lyrics.
+_WHISPER_HALLUCINATIONS = [
+    "subtitulos realizados por la comunidad de amara.org",
+    "subtitled by the amara.org community",
+    "subtitles by the amara.org community",
+    "subtitling by the amara.org community",
+    "transcribed by amara",
+    "amara.org",  # short form catches "Visit amara.org"
+    "subtitles created by",
+    "subtitles by:",
+    "subtitulado por",
+    "transcripcion por",
+    "♪ music ♪",
+    "[ music ]",
+    "[music]",
+]
+
+
+def _is_whisper_hallucination(text: str) -> bool:
+    """True if the segment text matches a known Whisper training-data
+    hallucination. Match is case- and accent-insensitive but does NOT
+    use loose substring matching — we compare a normalized string."""
+    if not text:
+        return False
+    s = _normalize_token(text) if "_normalize_token" in globals() else text.lower().strip()
+    # Direct lower-ASCII compare for the denylist (defensive: we don't
+    # rely on _normalize_token having been hoisted yet at module load).
+    import unicodedata as _u
+    s = _u.normalize("NFD", text or "").encode("ascii", "ignore").decode("ascii").lower().strip()
+    s = " ".join(s.split())  # collapse whitespace
+    for needle in _WHISPER_HALLUCINATIONS:
+        if needle in s:
+            return True
+    return False
+
+
+def _is_single_word_loop(text: str, min_repeats: int = 8) -> bool:
+    """True if `text` is essentially the same short word repeated many
+    times — Whisper-1's classic outro/sustained-vocal failure mode
+    ("oh, oh, oh, oh, …" × 100). We detect by checking that, after
+    normalising, ≥ 90 % of tokens are the same single word AND the
+    repeat count is ≥ `min_repeats`.
+
+    This catches the AIRBAG / River Plate case (110 "oh"s in a 30 s
+    segment) without flagging real lyrics: a chorus like "oh-oh-oh I
+    love you oh-oh" stays mixed enough that the dominant token never
+    reaches 90 % concentration.
+    """
+    if not text:
+        return False
+    tokens = [n for n in (_normalize_token(w) for w in text.split()) if n]
+    if len(tokens) < min_repeats:
+        return False
+    from collections import Counter as _C
+    counts = _C(tokens)
+    top_token, top_count = counts.most_common(1)[0]
+    # Require the dominant token to be short (≤ 4 chars) so we don't
+    # collapse a verse that legitimately repeats a longer word.
+    if len(top_token) > 4:
+        return False
+    return top_count / len(tokens) >= 0.9 and top_count >= min_repeats
+
+
+def _filter_whisper_hallucinations(segments: list[dict]) -> tuple[list[dict], int]:
+    """Drop segments whose text is a known Whisper hallucination phrase
+    OR a single-word loop (e.g. "oh, oh, oh, …" outro fills). The
+    single-word filter runs BEFORE _detect_hallucination in the caller
+    so a legitimate transcription with a loopy outro doesn't get its
+    whole timeline thrown out by the recovery branch.
+
+    Returns (filtered_segments, dropped_count) for logging.
+    """
+    if not segments:
+        return segments, 0
+    out = []
+    for s in segments:
+        text = s.get("text") or ""
+        if _is_whisper_hallucination(text):
+            continue
+        if _is_single_word_loop(text):
+            print(f"[WHISPER] dropping single-word loop "
+                  f"({(float(s.get('end',0)) - float(s.get('start',0))):.1f}s): "
+                  f"{text[:60]!r}")
+            continue
+        out.append(s)
+    return out, len(segments) - len(out)
 
 
 _WHISPER_MODELS: dict = {}
@@ -670,6 +896,18 @@ def _transcribe_via_openai_api(mp3_path: str, language: str | None = None,
         if segments[i]["end"] > segments[i + 1]["start"] - GAP:
             segments[i]["end"] = segments[i + 1]["start"] - GAP
 
+    # Drop training-data-leak phrases AND single-word "oh oh oh"
+    # outro loops BEFORE returning, so the caller's hallucination
+    # detector sees a clean timeline. Without this, a 100-"oh"
+    # outro would trip the "implausible mega-segment" detector and
+    # the caller would discard the entire (otherwise good) Whisper
+    # output, replacing it with reference lyrics distributed at
+    # synthetic timestamps — losing the accurate timing of the
+    # legitimate verses.
+    segments, _dropped_loops = _filter_whisper_hallucinations(segments)
+    if _dropped_loops:
+        print(f"[WHISPER-API] filtered {_dropped_loops} hallucination/loop segment(s)")
+
     print(f"[WHISPER-API] {len(segments)} segments")
     return segments
 
@@ -799,6 +1037,11 @@ def transcribe(mp3_path: str, language: str = None,
     for i in range(len(segments) - 1):
         if segments[i]["end"] > segments[i + 1]["start"] - GAP:
             segments[i]["end"] = segments[i + 1]["start"] - GAP
+
+    # Same outro-loop filter as the API path — see notes there.
+    segments, _dropped_loops = _filter_whisper_hallucinations(segments)
+    if _dropped_loops:
+        print(f"[WHISPER] filtered {_dropped_loops} hallucination/loop segment(s)")
 
     return segments
 
@@ -3098,8 +3341,14 @@ def _ken_burns_clip(image_path: str, duration: float, spec: RenderSpec | None = 
 _USED_BACKGROUNDS_FILE = os.path.join(ASSETS_DIR, ".used_backgrounds.json")
 
 
-def _find_background_video() -> str | None:
-    """Pick a random background video without repeating until all are used."""
+def _find_background_video(exclude: list[str] | None = None) -> str | None:
+    """Pick a random background video without repeating until all are used.
+
+    `exclude` is a per-call blacklist of paths to skip (used by the
+    content-validation retry loop to avoid re-picking a background that
+    just failed policy in this same job).
+    """
+    exclude = exclude or []
     all_videos: list[str] = []
     if os.path.isdir(BACKGROUNDS_DIR):
         for root, _, files in os.walk(BACKGROUNDS_DIR):
@@ -3120,12 +3369,16 @@ def _find_background_video() -> str | None:
         except (json.JSONDecodeError, OSError):
             used = []
 
-    # Filter out already used; if all used, reset the cycle
-    available = [v for v in all_videos if v not in used]
+    # Filter out already used + per-call exclusions; if nothing left, reset
+    # the cycle but keep honouring the exclusion list (we still don't want
+    # to re-pick a background that already failed validation this job).
+    available = [v for v in all_videos if v not in used and v not in exclude]
     if not available:
         print(f"[BG] All {len(all_videos)} backgrounds used, resetting cycle")
         used = []
-        available = all_videos
+        available = [v for v in all_videos if v not in exclude]
+    if not available:
+        return None
 
     pick = random.choice(available)
     used.append(pick)
@@ -3139,6 +3392,43 @@ def _find_background_video() -> str | None:
 
     print(f"[BG] Selected: {os.path.basename(pick)} ({len(all_videos) - len(available)} of {len(all_videos)} used)")
     return pick
+
+
+def _select_validated_background(job_id: str, max_attempts: int = 3) -> tuple[str | None, list[dict]]:
+    """Pick a library background and validate it against UMG Guideline 15
+    BEFORE the expensive render kicks in. If validation rejects, pick a
+    different background and try again, up to `max_attempts`.
+
+    Returns (chosen_path, all_rejection_issues). chosen_path is None if
+    no clean background was found within the attempts budget.
+    """
+    from content_validator import validate_video, validate_image
+
+    rejected: list[str] = []
+    issues: list[dict] = []
+    for attempt in range(1, max_attempts + 1):
+        candidate = _find_background_video(exclude=rejected)
+        if not candidate:
+            break
+        ext = os.path.splitext(candidate)[1].lower()
+        validate_fn = (
+            validate_video if ext in (".mp4", ".mov", ".webm") else validate_image
+        )
+        result = validate_fn(candidate, job_id=job_id)
+        if result.get("passed"):
+            print(
+                f"[VALIDATION] bg accepted on attempt {attempt}: "
+                f"{os.path.basename(candidate)}"
+            )
+            return candidate, issues
+        print(
+            f"[VALIDATION] bg rejected on attempt {attempt} "
+            f"({os.path.basename(candidate)}): {result.get('issues')}"
+        )
+        for it in result.get("issues") or []:
+            issues.append({"attempt": attempt, "bg": os.path.basename(candidate), **it})
+        rejected.append(candidate)
+    return None, issues
 
 
 _GRADIENT_PALETTES = {
@@ -3431,6 +3721,14 @@ def _make_text_clip(text: str, seg_start: float, seg_end: float, font: str = "Ar
     # Remove characters that break ImageMagick's @file parsing
     display_text = display_text.replace("@", "").replace("`", "'").replace("\x00", "")
 
+    # Empty-string guard. ImageMagick errors with "label expected" when
+    # asked to render an empty caption, taking the whole video render
+    # down. Caller filters blanks upstream; this is defense in depth for
+    # cases where sanitization stripped everything (e.g. text was just
+    # "@@@" or all whitespace).
+    if not display_text.strip():
+        return []
+
     scale = spec.text_scale
 
     text_len = len(display_text)
@@ -3499,6 +3797,149 @@ def _eval_fraction(value: str) -> float:
         return float(value)
     except ValueError:
         return 0.0
+
+
+def _short_prores_spec(umg_spec: dict) -> "RenderSpec":
+    """Build a vertical (1080×1920, 9:16) ProRes spec out of a UMG
+    delivery dict. We keep the operator's chosen fps + prores_profile
+    so the ProRes short stays consistent with the master, but flip
+    dimensions and DAR for the short's vertical canvas.
+    """
+    from render_spec import UMG_PRORES_PROFILES
+    profile_id = int(umg_spec.get("prores_profile", 3))
+    fps_val = float(umg_spec.get("fps", 24.0))
+    prof = UMG_PRORES_PROFILES.get(profile_id, UMG_PRORES_PROFILES[3])
+    return RenderSpec(
+        profile="umg",
+        width=1080, height=1920,
+        fps=fps_val,
+        dar=(9, 16),
+        codec="prores_ks",
+        prores_profile=profile_id,
+        pix_fmt=prof["pix_fmt"],
+        audio_codec="pcm_s24le",
+        color_primaries="bt709",
+        container="mov",
+    )
+
+
+def _transcode_to_prores(input_path: str, mov_path: str,
+                          spec: "RenderSpec",
+                          timeout_sec: int = 600) -> None:
+    """Transcode an h264 mp4 → ProRes .mov per the given RenderSpec.
+
+    Used by /download/{id}/umg_master and /download/{id}/umg_short to
+    produce ProRes deliverables lazily on the first download click,
+    instead of running a second moviepy render at pipeline time.
+    ffmpeg only — no moviepy involvement — so the moviepy palindrome-
+    loop hang that breaks the dual-render path doesn't apply here.
+
+    Args:
+      input_path: path to the existing source mp4 (lyric_video.mp4
+                  or short.mp4).
+      mov_path:   destination for the ProRes .mov.
+      spec:       a RenderSpec — RenderSpec.umg(**umg_spec) for the
+                  master, or _short_prores_spec(umg_spec) for the
+                  vertical short.
+      timeout_sec: hard kill after N seconds. 10 min is plenty for a
+                   3-min song; longer means ffmpeg hung on a bad file.
+
+    The output passes _validate_umg_master under normal conditions:
+      - codec=prores_ks, profile per spec
+      - exact width × height (lanczos scale)
+      - fps via -r (rational for fractional fps), enforced on the
+        bitstream so ffprobe reports the same value
+      - audio re-encoded to pcm_s24le @ 48 kHz @ 2 ch
+      - bt709 color tags, progressive, mov container, DAR per spec.
+
+    Raises RuntimeError on ffmpeg failure or post-transcode validation
+    failure. The caller is responsible for cleaning up partial output.
+    """
+    cmd = [
+        "ffmpeg", "-y", "-loglevel", "error",
+        "-i", input_path,
+        # Video filter chain: scale to target dims (lanczos quality),
+        # force fps, normalize SAR (so DAR is set purely by -aspect),
+        # then `setparams` writes BT.709 colorspace metadata onto each
+        # frame BEFORE the encoder consumes it. setparams is more
+        # reliable for ProRes than the `colorspace` filter (which
+        # rewrites pixel data + sometimes drops metadata) or the
+        # stream-level -colorspace flag (which gets ignored by
+        # prores_ks bitstream coefficients).
+        "-vf",
+        f"scale={spec.width}:{spec.height}:flags=lanczos,"
+        f"fps={spec.fps_str},"
+        f"setsar=1,"
+        f"setparams=colorspace=bt709:color_primaries=bt709:color_trc=bt709:range=tv",
+        "-r", spec.fps_str,
+        "-c:v", "prores_ks",
+        "-profile:v", str(spec.prores_profile),
+        "-pix_fmt", spec.pix_fmt,
+        "-vendor", "apl0",
+        "-color_primaries", "bt709",
+        "-color_trc", "bt709",
+        "-colorspace", "bt709",
+        "-color_range", "tv",
+        "-aspect", f"{spec.dar[0]}:{spec.dar[1]}",
+        "-movflags", "+faststart+write_colr",
+        # Audio: re-encode to UMG's required spec regardless of input.
+        "-c:a", "pcm_s24le",
+        "-ar", "48000",
+        "-ac", "2",
+        "-f", "mov",
+        mov_path,
+    ]
+    print(f"[PRORES] transcoding {os.path.basename(input_path)} → "
+          f"{os.path.basename(mov_path)} ({spec.width}×{spec.height} @ "
+          f"{spec.fps_str}, profile {spec.prores_profile})")
+    result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout_sec)
+    if result.returncode != 0:
+        # Best-effort cleanup of a partial file before raising.
+        try:
+            if os.path.exists(mov_path):
+                os.unlink(mov_path)
+        except OSError:
+            pass
+        raise RuntimeError(
+            f"ffmpeg ProRes transcode failed (rc={result.returncode}): "
+            f"{result.stderr[-500:]}"
+        )
+
+    # Log what ffprobe sees on the freshly-encoded master for any future
+    # debugging — colorspace problems are notoriously sticky on ProRes.
+    try:
+        _probe = subprocess.run(
+            ["ffprobe", "-v", "error", "-select_streams", "v:0",
+             "-show_entries",
+             "stream=codec_name,profile,width,height,pix_fmt,"
+             "color_space,color_primaries,color_transfer,color_range,"
+             "field_order,display_aspect_ratio",
+             "-of", "default=noprint_wrappers=1", mov_path],
+            capture_output=True, text=True, timeout=30,
+        )
+        print("[PRORES] ffprobe stream fields:")
+        for line in (_probe.stdout or "").strip().splitlines():
+            print(f"  {line}")
+    except Exception as _e:  # pragma: no cover
+        print(f"[PRORES] ffprobe diagnostic failed: {_e}")
+
+    errors = _validate_umg_master(mov_path, spec)
+    if errors:
+        # Print errors before deleting so the worker logs surface
+        # what ffprobe reported vs. what we expected — the diagnostic
+        # ffprobe dump above gives the actual values; this line gives
+        # the validator's interpretation.
+        print(f"[PRORES] validation failed: {errors}")
+        try:
+            os.unlink(mov_path)
+        except OSError:
+            pass
+        raise RuntimeError(
+            f"transcoded ProRes failed UMG validation: {'; '.join(errors)}"
+        )
+
+    size_mb = os.path.getsize(mov_path) / 1024 / 1024
+    print(f"[PRORES] master ready: {size_mb:.1f} MB")
 
 
 def _validate_umg_master(path: str, spec: RenderSpec) -> list[str]:
@@ -3678,24 +4119,52 @@ def generate_lyric_video(
             font = "Arial"
     print(f"[FONT] Selected: {os.path.basename(font)}")
 
+    # Drop empty / whitespace-only segments BEFORE clamping so the
+    # neighbor indices used for overlap clamp are correct. Operator
+    # can leave blank rows from "Agregar línea" if they don't type
+    # lyrics; passing empty text to ImageMagick triggers a "label
+    # expected" error and aborts the whole render.
+    if segments:
+        before = len(segments)
+        segments = [s for s in segments if (s.get("text") or "").strip()]
+        dropped = before - len(segments)
+        if dropped:
+            print(f"[RENDER] dropped {dropped} blank segment(s) before render")
+
+    # Defensive normalization — clamp each segment's end to the next
+    # segment's start (with a 50ms gap) so two subtitles can never
+    # render simultaneously. Operator-edited timestamps from sync mode
+    # can leave end > next.start when lines were anchored closer than
+    # the original duration. Frontend also clamps but we re-clamp here
+    # in case other callers (batch CLI, API replays) bypass it.
+    if segments:
+        sorted_segs = sorted(segments, key=lambda s: s["start"])
+        cleaned = []
+        for i, seg in enumerate(sorted_segs):
+            new_end = seg["end"]
+            if i + 1 < len(sorted_segs):
+                next_start = sorted_segs[i + 1]["start"]
+                if new_end > next_start - 0.05:
+                    new_end = max(seg["start"] + 0.3, next_start - 0.05)
+            if new_end > duration:
+                new_end = duration
+            cleaned.append({**seg, "end": new_end})
+        segments = cleaned
+
     # Build text clips — each segment gets its own shadow + text
     text_layers = []
 
-    # Title overlay strategy (rebuilt May 2026 after operator reported
-    # the title card disappearing on songs whose first subtitle starts
-    # at t=0 — typical for spoken-prefix audio where intro Whisper now
-    # captures the dialogue at 0-N seconds. The previous logic gated
-    # the centered title on `first_lyric_start > 3`, so any subtitle
-    # at 0 hid the title entirely):
-    #
-    # - ALWAYS render a prominent title card "ARTIST / Title" at the
-    #   top third of the frame for the first 5 seconds. Top placement
-    #   avoids conflicting with the center-aligned lyric subtitles
-    #   regardless of when the first lyric line starts.
-    # - On songs with a real instrumental intro (>= 3 s of silence
-    #   before vocals), ALSO render the same artist+title BIG and
-    #   centered for the cinematic "drop" feel. Both layers coexist;
-    #   the centered one fades out before the first lyric appears.
+    # Title overlay — pick ONE strategy based on whether there's a
+    # real instrumental intro:
+    # - intro >= 3s of silence before first lyric: cinematic centered
+    #   "drop" title that fills the frame and fades just before the
+    #   first sung line.
+    # - no real intro (first lyric near t=0): compact top-third title
+    #   card for the first 5s, top placement so it doesn't fight the
+    #   centered subtitles.
+    # Never both — they were rendering simultaneously when first_lyric
+    # was past 3s, leaving "ARTIST/Title" stamped at top while the big
+    # drop title also showed centered.
     first_lyric_start = segments[0]["start"] if segments else duration
     raw_name = os.path.splitext(os.path.basename(mp3_path))[0]
     title_song = raw_name
@@ -3707,39 +4176,10 @@ def generate_lyric_video(
         title_song = title_song.replace(sfx, "").strip()
 
     if artist:
-        # 1. Top-third title card — always on for the opening of the
-        #    video. Position is between the very top edge and the
-        #    upper third (~15-22% from top, depending on font size).
-        try:
-            top_title_text = f"{artist.upper()}\n{title_song}"
-            top_size = max(36, int(round(58 * spec.text_scale)))
-            top_card = TextClip(
-                top_title_text,
-                fontsize=top_size,
-                font=font,
-                color="white",
-                stroke_color="black",
-                stroke_width=max(1, int(round(1.6 * spec.text_scale))),
-                method="caption",
-                size=(int(round(spec.width * 0.85)), None),
-                align="center",
-            ).set_opacity(0.95)
-            tw, th = top_card.size
-            top_x = (spec.width - tw) // 2
-            top_y = max(40, int(round(spec.height * 0.10)))
-            top_end = min(5.0, max(2.0, duration - 0.1))
-            top_card = (top_card.set_position((top_x, top_y))
-                                 .set_start(0.4)
-                                 .set_end(top_end))
-            text_layers.append(top_card)
-        except Exception as e:
-            print(f"[TITLE] top title card failed ({e}); continuing without it")
-
-        # 2. Centered "drop" title — only when the first lyric leaves
-        #    real room. Same artist+title text; bigger font (centered
-        #    via _make_text_clip) so the eye lands there during the
-        #    silent intro. Fades out just before the first lyric.
         if first_lyric_start > 3:
+            # Real intro — cinematic centered drop. Bigger font, fades
+            # just before the first lyric so they don't crash into each
+            # other.
             title_end = first_lyric_start - 0.5
             try:
                 title_layers = _make_text_clip(
@@ -3749,6 +4189,34 @@ def generate_lyric_video(
                 text_layers.extend(title_layers)
             except Exception as e:
                 print(f"[TITLE] center title failed ({e}); continuing")
+        else:
+            # First lyric lands at/near t=0 — top-third compact card so
+            # the operator/viewer still gets the artist+title context
+            # without obscuring the lyric below it.
+            try:
+                top_title_text = f"{artist.upper()}\n{title_song}"
+                top_size = max(36, int(round(58 * spec.text_scale)))
+                top_card = TextClip(
+                    top_title_text,
+                    fontsize=top_size,
+                    font=font,
+                    color="white",
+                    stroke_color="black",
+                    stroke_width=max(1, int(round(1.6 * spec.text_scale))),
+                    method="caption",
+                    size=(int(round(spec.width * 0.85)), None),
+                    align="center",
+                ).set_opacity(0.95)
+                tw, th = top_card.size
+                top_x = (spec.width - tw) // 2
+                top_y = max(40, int(round(spec.height * 0.10)))
+                top_end = min(5.0, max(2.0, duration - 0.1))
+                top_card = (top_card.set_position((top_x, top_y))
+                                     .set_start(0.4)
+                                     .set_end(top_end))
+                text_layers.append(top_card)
+            except Exception as e:
+                print(f"[TITLE] top title card failed ({e}); continuing without it")
 
     for seg in segments:
         layers = _make_text_clip(seg["text"], seg["start"], seg["end"], font, spec=spec)

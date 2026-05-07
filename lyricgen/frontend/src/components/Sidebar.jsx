@@ -62,7 +62,7 @@ export default function Sidebar({ onNav, activeView, open, onToggle, user, onLog
       </div>
 
       {/* Nav items */}
-      <nav className="flex-1 py-4 px-3">
+      <nav className="flex-1 py-4 px-3" data-tour="sidebar-nav">
         {items.map((item) => (
           <button
             key={item.id}

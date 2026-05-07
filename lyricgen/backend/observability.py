@@ -72,45 +72,118 @@ def init_logging():
 def health_snapshot() -> dict:
     """Lightweight report of runtime health.
 
+    Designed to be safe on a hot path (uptime probe → every N seconds):
+    every check has its own try/except, every external call has a hard
+    timeout, and worst-case the endpoint still returns in well under a
+    second.
+
     Status semantics — used by the load balancer / Docker healthcheck:
       - "ok": all configured dependencies reachable.
-      - "degraded": something is off but the service is partly usable
-        (low disk, Redis configured but unreachable when the API has
-        threads-fallback available outside prod).
-      - "down": a configured-and-required dependency is unreachable
-        (Redis configured but ping failed in prod).
+      - "degraded": a non-critical issue (low disk, no live workers,
+        Redis not configured outside prod, etc.) but service is usable.
+      - "down": a configured-and-required dependency is unreachable in
+        production — Redis (queue is broken) or Postgres (SELECT 1
+        failed). The /health endpoint translates this to HTTP 503.
     """
     snap = {"status": "ok", "env": ENV}
+    is_prod = ENV in ("prod", "production")
+
+    def _degrade(reason: str) -> None:
+        # First non-fatal problem flips ok→degraded; explicit "down"
+        # elsewhere takes precedence.
+        if snap["status"] == "ok":
+            snap["status"] = "degraded"
+            snap["degraded_reason"] = reason
+
+    def _down(reason: str) -> None:
+        # Hard failure of a required dependency. Used by /health to
+        # return 503 so the load balancer pulls the instance out.
+        snap["status"] = "down"
+        snap["down_reason"] = reason
+
     # Disk
     try:
         du = shutil.disk_usage(os.path.dirname(os.path.abspath(__file__)))
         snap["disk_free_gb"] = round(du.free / 1024 / 1024 / 1024, 1)
         if du.free < 10 * 1024 * 1024 * 1024:  # <10 GB
-            snap["status"] = "degraded"
+            _degrade("disk_low")
     except Exception:
         pass
-    # Redis
+
+    # Postgres — single SELECT 1, no autocommit, no pool exhaustion.
+    try:
+        from sqlalchemy import text
+        from database import engine
+        with engine.connect() as conn:
+            conn.execute(text("SELECT 1"))
+        snap["db"] = "up"
+    except Exception as e:
+        snap["db"] = "down"
+        snap["db_error"] = str(e)[:120]
+        _down("db_down")
+
+    # Redis + RQ stats (queue depth, worker count). Best-effort.
     redis_url = os.environ.get("REDIS_URL", "").strip()
     try:
         from queue_jobs import _init_redis
         r, _, _ = _init_redis()
         if r is not None:
             snap["redis"] = "up"
+            try:
+                from rq import Queue, Worker
+                queues = {}
+                for qname in ("enterprise", "default"):
+                    try:
+                        queues[qname] = Queue(qname, connection=r).count
+                    except Exception:
+                        queues[qname] = -1
+                snap["queue_depth"] = queues
+                try:
+                    snap["workers_alive"] = len(Worker.all(connection=r))
+                except Exception:
+                    snap["workers_alive"] = -1
+                if snap.get("workers_alive") == 0:
+                    _degrade("no_workers")
+            except Exception:
+                # rq not importable in this process — non-fatal for the API
+                pass
         elif redis_url:
             # Configured but unreachable: queue is broken. /enqueue will
             # raise in production; surface that to the load balancer.
             snap["redis"] = "down"
-            snap["status"] = "down" if ENV in ("prod", "production") else "degraded"
+            if is_prod:
+                _down("redis_down")
+            else:
+                _degrade("redis_unreachable")
         else:
             snap["redis"] = "not_configured"
+            # Only flag as degraded in production — outside prod the
+            # threading-based fallback is intentional and the API is
+            # fully usable, so the LB shouldn't see "degraded" just
+            # because a dev box left REDIS_URL unset.
+            if is_prod:
+                _degrade("redis_not_configured")
     except Exception:
         snap["redis"] = "error"
-        if redis_url:
-            snap["status"] = "down" if ENV in ("prod", "production") else "degraded"
+        if redis_url and is_prod:
+            _down("redis_error")
+        else:
+            _degrade("redis_error")
+
     # R2 / S3
     try:
         import storage
         snap["r2"] = "configured" if storage.is_enabled() else "not_configured"
     except Exception:
         snap["r2"] = "error"
+
+    # External API keys — presence only (doesn't probe the API). A 1-RTT
+    # probe per service would burn quota and add latency to every uptime
+    # poll; "key set" is enough for "is the deployment configured?".
+    snap["api_keys"] = {
+        "openai": bool(os.environ.get("OPENAI_API_KEY", "").strip()),
+        "vertex": bool(os.environ.get("VERTEX_PROJECT", "").strip()),
+        "gemini": bool(os.environ.get("GEMINI_API_KEY", "").strip())
+                  or bool(os.environ.get("VERTEX_PROJECT", "").strip()),
+    }
     return snap

@@ -15,6 +15,15 @@ const MEDIA_TABS = [
   { key: "thumbnail", label: "Thumbnail", desc: "1280x720" },
 ];
 
+// UMG master is added conditionally — only when delivery_profile is
+// "umg" or "both". ProRes 422 HQ in a .mov, not previewable in
+// browser, so the tab shows a download-only panel.
+const UMG_MASTER_TAB = {
+  key: "umg_master",
+  label: "Máster UMG",
+  desc: "ProRes 422 HQ · MOV",
+};
+
 function ProvenanceTab({ jobId, t }) {
   const [records, setRecords] = useState(null);
   const [loading, setLoading] = useState(true);
@@ -183,19 +192,41 @@ export default function JobDetail({ job, onBack, onJobUpdate }) {
     );
   }
 
-  const downloadAll = async () => {
-    // Fetch each short-lived media token in parallel, then trigger the
-    // download anchors. Tokens are scoped per (job_id, file_type) so we
-    // can't reuse one across types.
-    const urls = await Promise.all(
-      ["video", "short", "thumbnail"].map((type) => getDownloadUrl(job.job_id, type))
-    );
-    urls.forEach((href) => {
-      const a = document.createElement("a");
-      a.href = href;
-      a.download = "";
-      a.click();
-    });
+  // Single navigation to a server-streamed zip. The previous "loop three
+  // <a>.click() calls" approach got blocked as popup spam by Chrome —
+  // the browser would only honour the last click (thumbnail) and open it
+  // in a tab instead of downloading. /download/{id}/all bundles the
+  // small deliverables server-side so we get one click → one file. We
+  // mint a short-lived media token first so the URL doesn't carry the
+  // long-lived JWT (C3 fix).
+  const downloadAllZip = async () => {
+    try {
+      const url = await getDownloadUrl(job.job_id, "all");
+      window.location.href = url;
+    } catch {}
+  };
+  // ProRes is generated lazily server-side from the existing MP4 the
+  // first time it's requested (~60-120 s of ffmpeg transcode). The
+  // browser's native download UI shows a spinner during the wait;
+  // we additionally show a short hint toast so the operator knows
+  // why the click feels slow on this run only. Subsequent clicks are
+  // instant because the .mov is cached on disk + R2.
+  const [proResHint, setProResHint] = useState(false);
+  const downloadProResMaster = async () => {
+    setProResHint(true);
+    try {
+      const url = await getDownloadUrl(job.job_id, "umg_master");
+      window.location.href = url;
+    } catch {}
+    setTimeout(() => setProResHint(false), 8000);
+  };
+  const downloadProResShort = async () => {
+    setProResHint(true);
+    try {
+      const url = await getDownloadUrl(job.job_id, "umg_short");
+      window.location.href = url;
+    } catch {}
+    setTimeout(() => setProResHint(false), 8000);
   };
 
   const previewMetadata = async () => {
@@ -267,8 +298,19 @@ export default function JobDetail({ job, onBack, onJobUpdate }) {
     approveLockRef.current = false;
   };
 
+  const hasUmgMaster =
+    (job.delivery_profile === "umg" || job.delivery_profile === "both") &&
+    !!job.files?.umg_master_url;
+  // Short ProRes follows the same opt-in: any UMG-flavoured job gets a
+  // separate vertical-format master alongside the main one. Generated
+  // lazily by /download/{id}/umg_short the first time it's clicked.
+  const hasUmgShort =
+    (job.delivery_profile === "umg" || job.delivery_profile === "both") &&
+    !!job.files?.umg_short_url;
+
   const ALL_TABS = [
     ...MEDIA_TABS,
+    ...(hasUmgMaster ? [UMG_MASTER_TAB] : []),
     { key: "provenance", label: t("prov.title") || "Provenance" },
   ];
 
@@ -306,14 +348,38 @@ export default function JobDetail({ job, onBack, onJobUpdate }) {
           </div>
         </div>
         <div className="flex gap-2 shrink-0">
-          {canDownload && (
-            <button onClick={downloadAll} className="btn-secondary text-xs h-10 px-4">
+          {canDownload && (() => {
+            // All profiles (youtube, umg, both) now produce the MP4 +
+            // short + thumbnail set in the pipeline, so "Descargar todo"
+            // is always relevant. ProRes is generated on demand via the
+            // dedicated button when the job opted into UMG.
+            const profile = job.delivery_profile || "youtube";
+            const downloadIcon = (
               <svg className="inline-block w-4 h-4 mr-1.5 -mt-0.5" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
                 <path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4" /><polyline points="7 10 12 15 17 10" /><line x1="12" y1="15" x2="12" y2="3" />
               </svg>
-              {t("detail.download")}
-            </button>
-          )}
+            );
+            return (
+              <>
+                <button onClick={downloadAllZip} className="btn-secondary text-xs h-10 px-4">
+                  {downloadIcon}
+                  {t("detail.download_all") || "Descargar todo"}
+                </button>
+                {hasUmgMaster && (
+                  <button onClick={downloadProResMaster} className="btn-secondary text-xs h-10 px-4">
+                    {downloadIcon}
+                    {t("detail.download_master") || "Master ProRes"}
+                  </button>
+                )}
+                {hasUmgShort && (
+                  <button onClick={downloadProResShort} className="btn-secondary text-xs h-10 px-4">
+                    {downloadIcon}
+                    {t("detail.download_short_prores") || "Short ProRes"}
+                  </button>
+                )}
+              </>
+            );
+          })()}
           {canDownload && !youtubeResult && (
             <button onClick={previewMetadata} className="btn-primary text-xs h-10 px-5">
               <svg className="inline-block w-4 h-4 mr-1.5 -mt-0.5" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
@@ -333,6 +399,19 @@ export default function JobDetail({ job, onBack, onJobUpdate }) {
           )}
         </div>
       </div>
+
+      {/* ProRes hint toast — only on first click. The transcode runs
+          on the server (~60-120 s for a 3-min song) and the browser
+          shows its native download UI during the wait, so the user
+          knows something is happening; this banner explains why. */}
+      {proResHint && (
+        <div className="mb-4 rounded-card bg-brand/[0.08] ring-1 ring-brand/25 px-4 py-3 flex items-center gap-3">
+          <div className="w-4 h-4 border-2 border-brand border-t-transparent rounded-full animate-spin shrink-0" />
+          <div className="flex-1 text-sm text-brand-light">
+            Generando Master ProRes desde el MP4… puede tomar 1-2 minutos. Tu descarga arranca cuando esté listo (no cierres la pestaña).
+          </div>
+        </div>
+      )}
 
       {/* Validation failed detail */}
       {isValidationFailed && job.error && (
@@ -374,8 +453,44 @@ export default function JobDetail({ job, onBack, onJobUpdate }) {
         </div>
       )}
 
-      {/* Media preview */}
-      {activeTab !== "provenance" && canPreview && (
+      {/* UMG master tab — non-previewable, download-only panel */}
+      {activeTab === "umg_master" && canPreview && (
+        <div className="rounded-card bg-surface-2/40 ring-1 ring-white/[0.04] p-8 mb-6 text-center">
+          <div className="w-14 h-14 mx-auto mb-4 rounded-2xl bg-brand/10 ring-1 ring-brand/25 flex items-center justify-center">
+            <svg className="w-7 h-7 text-brand-light" fill="none" stroke="currentColor" strokeWidth="1.6" viewBox="0 0 24 24">
+              <path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4M7 10l5 5 5-5M12 15V3" strokeLinecap="round" strokeLinejoin="round"/>
+            </svg>
+          </div>
+          <h3 className="text-base font-semibold text-white mb-1.5">
+            {t("detail.umg_master_title") || "Máster ProRes 422 HQ"}
+          </h3>
+          <p className="text-xs text-ink-secondary mb-1">
+            1920×1080 · 24 fps · BT.709 · pcm_s24le · QuickTime .mov
+          </p>
+          <p className="text-[11px] text-gray-600 mb-5">
+            {t("detail.umg_master_subtitle") || "ProRes no se reproduce en el navegador. Descargá el archivo para reproducirlo en QuickTime / DaVinci / Premiere."}
+          </p>
+          {canDownload ? (
+            <a
+              href={`${API}/download/${job.job_id}/umg_master?${tokenParam()}`}
+              download
+              className="inline-flex items-center gap-2 btn-primary text-sm h-11 px-5"
+            >
+              <svg className="w-4 h-4" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
+                <path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4" /><polyline points="7 10 12 15 17 10" /><line x1="12" y1="15" x2="12" y2="3" />
+              </svg>
+              {t("detail.download_master") || "Descargar máster"}
+            </a>
+          ) : (
+            <p className="text-[11px] text-amber-300/90">
+              {t("detail.master_pending_approval") || "Aprobá el video para habilitar la descarga."}
+            </p>
+          )}
+        </div>
+      )}
+
+      {/* Media preview (video / short / thumbnail) */}
+      {activeTab !== "provenance" && activeTab !== "umg_master" && canPreview && (
         <>
           <div className="rounded-card bg-surface-2/40 ring-1 ring-white/[0.04] overflow-hidden mb-4">
             {activeTab === "thumbnail" ? (

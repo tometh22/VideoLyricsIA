@@ -1,6 +1,7 @@
 import { useState, useEffect } from "react";
 import { useI18n } from "../i18n";
 import { useMediaUrl } from "../mediaUrl";
+import { DashboardTour } from "./OnboardingTour";
 
 const API = import.meta.env.VITE_API_URL || "";
 
@@ -151,13 +152,90 @@ export default function Dashboard({ user, history, onSelectJob, onNewBatch, onVi
           </h1>
           <p className="text-sm text-ink-secondary mt-1.5">{monthlySubtitle}</p>
         </div>
-        <button onClick={onNewBatch} className="btn-primary px-6">
+        <button onClick={onNewBatch} className="btn-primary px-6" data-tour="dashboard-new-batch">
           <svg className="inline-block w-4 h-4 mr-2 -mt-0.5" fill="none" stroke="currentColor" strokeWidth="2.5" viewBox="0 0 24 24">
             <path d="M12 5v14M5 12h14" strokeLinecap="round"/>
           </svg>
           {t("nav.new_batch")}
         </button>
       </div>
+
+      {/* ─── Plan-quota proximity warning ─────────────────────────────
+            Three modes:
+              1. user.allow_overage + alert_100 → "you're billing extra,
+                 here's the running total" (no block).
+              2. plain user + alert_100 → "no more uploads, contact
+                 support" (hard wall — /generate returns 402).
+              3. anyone + alert_80 → "heads-up, X videos left, contact
+                 if you'll need more". */}
+      {!isUnlimited && monthlyLimit && (usage?.alert_100 || usage?.alert_80) && (
+        (() => {
+          const overageMode = usage.alert_100 && user?.allow_overage;
+          const blockMode = usage.alert_100 && !user?.allow_overage;
+          return (
+            <div
+              className={`w-full mb-4 flex items-center gap-3 px-5 py-4 rounded-card ring-1 ${
+                blockMode
+                  ? "bg-red-500/[0.08] ring-red-500/30"
+                  : overageMode
+                    ? "bg-brand/[0.08] ring-brand/30"
+                    : "bg-amber-500/[0.06] ring-amber-500/25"
+              }`}
+            >
+              <svg
+                className={`w-5 h-5 shrink-0 ${
+                  blockMode ? "text-red-300" :
+                  overageMode ? "text-brand-light" :
+                  "text-amber-300"
+                }`}
+                fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24"
+              >
+                <path d="M12 9v4M12 17h.01"/><circle cx="12" cy="12" r="10"/>
+              </svg>
+              <div className="flex-1 min-w-0">
+                {overageMode ? (
+                  <>
+                    <p className="text-sm font-semibold text-brand-light">
+                      Pasaste el plan mensual — los extras se facturan al cierre
+                    </p>
+                    <p className="text-xs text-ink-secondary mt-0.5">
+                      {monthlyUsed} videos generados · {usage.overage} adicionales × ${usage.overage_cost_per_video}{" "}
+                      = <span className="font-semibold text-white">${usage.overage_total}</span> a abonar este mes.
+                    </p>
+                  </>
+                ) : blockMode ? (
+                  <>
+                    <p className="text-sm font-semibold text-red-200">
+                      Llegaste al límite mensual ({monthlyUsed}/{monthlyLimit})
+                    </p>
+                    <p className="text-xs text-red-300/80 mt-0.5">
+                      No vas a poder subir más videos hasta el mes que viene. Si necesitás extender el cupo, escribinos a{" "}
+                      <a href="mailto:soporte@genly.pro" className="underline font-medium hover:text-red-200">
+                        soporte@genly.pro
+                      </a>.
+                    </p>
+                  </>
+                ) : (
+                  <>
+                    <p className="text-sm font-semibold text-amber-200">
+                      Te quedan {monthlyLimit - monthlyUsed} videos este mes ({monthlyUsed}/{monthlyLimit})
+                    </p>
+                    <p className="text-xs text-amber-300/80 mt-0.5">
+                      {user?.allow_overage
+                        ? `Pasado el tope, cada video adicional cuesta $${usage.overage_cost_per_video} y se factura al cierre.`
+                        : <>Si vas a necesitar más, contactanos antes de llegar al tope:{" "}
+                            <a href="mailto:soporte@genly.pro" className="underline font-medium hover:text-amber-200">
+                              soporte@genly.pro
+                            </a>.</>
+                      }
+                    </p>
+                  </>
+                )}
+              </div>
+            </div>
+          );
+        })()
+      )}
 
       {/* ─── Pending review CTA — brand violet because it's a positive
             "do this next", not a danger warning ───────────────────── */}
@@ -212,7 +290,7 @@ export default function Dashboard({ user, history, onSelectJob, onNewBatch, onVi
       )}
 
       {/* ─── Plan usage — Stripe-style hero number, bar as secondary ── */}
-      <div className="rounded-card p-7 mb-10 bg-surface-2/40 ring-1 ring-white/[0.04]">
+      <div className="rounded-card p-7 mb-10 bg-surface-2/40 ring-1 ring-white/[0.04]" data-tour="dashboard-usage">
         <div className="flex items-end justify-between mb-5">
           <div>
             <SectionLabel>{t("dash.monthly_usage")}</SectionLabel>
@@ -292,7 +370,7 @@ export default function Dashboard({ user, history, onSelectJob, onNewBatch, onVi
 
       {/* ─── Tus últimos videos — visual scan, NOT a copy of History ── */}
       {recentDone.length > 0 && (
-        <div>
+        <div data-tour="dashboard-recent">
           <div className="flex items-center justify-between mb-4">
             <SectionLabel>Tus últimos videos</SectionLabel>
             <button onClick={onViewHistory} className="text-[11px] text-brand hover:text-brand-light transition-colors flex items-center gap-1 -translate-y-1.5">
@@ -309,6 +387,9 @@ export default function Dashboard({ user, history, onSelectJob, onNewBatch, onVi
           </div>
         </div>
       )}
+
+      {/* Onboarding tour — fires only on first dashboard visit for new users */}
+      <DashboardTour user={user} />
 
       {/* ─── Empty state — only when there is literally nothing ─── */}
       {history.length === 0 && (
