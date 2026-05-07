@@ -354,6 +354,51 @@ def run_pipeline(job_id: str, mp3_path: str, artist: str, style: str,
             print(f"[FONT] Operator-selected: {os.path.basename(chosen_font)}")
         bg_source = bg_image_path
 
+        # Step 1b — Pre-render content validation (UMG Guideline 15).
+        # We validate the BACKGROUND ASSET BEFORE the expensive render so
+        # we don't burn 5+ minutes of CPU only to throw the result away.
+        # Two paths:
+        #   - Operator/AI supplied a specific bg → validate it; if it
+        #     fails, mark validation_failed (we can't auto-substitute).
+        #   - No bg supplied → cycle through library candidates, picking
+        #     the first one that passes (up to 3 attempts).
+        if wants_youtube:
+            update_job(job_id, current_step="validation", progress=38)
+            if bg_image_path:
+                from content_validator import validate_video, validate_image
+                ext = os.path.splitext(bg_image_path)[1].lower()
+                _validate_fn = (
+                    validate_video if ext in (".mp4", ".mov", ".webm")
+                    else validate_image
+                )
+                pre_validation = _validate_fn(bg_image_path, job_id=job_id)
+                update_job(job_id, validation_result=pre_validation)
+                if not pre_validation["passed"]:
+                    update_job(
+                        job_id,
+                        status="validation_failed",
+                        error=f"Content policy violation detected: {pre_validation['issues']}",
+                    )
+                    print(f"[VALIDATION] FAILED for job {job_id}: {pre_validation['issues']}")
+                    return
+            else:
+                clean_bg, rejection_log = _select_validated_background(job_id)
+                if not clean_bg:
+                    update_job(
+                        job_id,
+                        status="validation_failed",
+                        error=(
+                            "No clean background found after retries. "
+                            f"Rejections: {rejection_log}"
+                        ),
+                    )
+                    print(f"[VALIDATION] FAILED for job {job_id}: no clean bg after retries")
+                    return
+                bg_image_path = clean_bg
+                update_job(job_id, validation_result={
+                    "passed": True, "issues": [], "rejections": rejection_log,
+                })
+
         # Step 2 — YouTube lyric video (H.264 / MP4 / 1080p / 24fps)
         if wants_youtube:
             update_job(job_id, current_step="video", progress=40)
@@ -395,33 +440,8 @@ def run_pipeline(job_id: str, mp3_path: str, artist: str, style: str,
             )
             files["thumbnail_url"] = f"/download/{job_id}/thumbnail"
 
-        # Step 5 — Content validation (UMG Guideline 15) — only if a YouTube
-        # video was rendered (UMG-only jobs skip validation; masters go to
-        # legal review independently).
-        #
-        # We validate the BACKGROUND ASSET (bg_source) before lyrics overlay,
-        # not the composited final. The validator looks for prohibited content
-        # like people, logos, foreign text — but the final video has OUR
-        # intentional lyrics burned in, which would be a guaranteed false
-        # positive. The background is what we actually need to police.
-        if wants_youtube and bg_source:
-            update_job(job_id, current_step="validation", progress=94)
-            ext = os.path.splitext(bg_source)[1].lower()
-            if ext in (".mp4", ".mov", ".webm"):
-                from content_validator import validate_video as _validate_bg
-            else:
-                from content_validator import validate_image as _validate_bg
-            validation = _validate_bg(bg_source, job_id=job_id)
-            update_job(job_id, validation_result=validation)
-
-            if not validation["passed"]:
-                update_job(
-                    job_id,
-                    status="validation_failed",
-                    error=f"Content policy violation detected: {validation['issues']}",
-                )
-                print(f"[VALIDATION] FAILED for job {job_id}: {validation['issues']}")
-                return
+        # Content validation already happened pre-render (Step 1b) so the
+        # background here is guaranteed clean. No post-render check needed.
 
         # Sanity-check every deliverable before uploading to R2. Catches
         # silent failures (truncated files, codec mismatches, duration
@@ -3187,8 +3207,14 @@ def _ken_burns_clip(image_path: str, duration: float, spec: RenderSpec | None = 
 _USED_BACKGROUNDS_FILE = os.path.join(ASSETS_DIR, ".used_backgrounds.json")
 
 
-def _find_background_video() -> str | None:
-    """Pick a random background video without repeating until all are used."""
+def _find_background_video(exclude: list[str] | None = None) -> str | None:
+    """Pick a random background video without repeating until all are used.
+
+    `exclude` is a per-call blacklist of paths to skip (used by the
+    content-validation retry loop to avoid re-picking a background that
+    just failed policy in this same job).
+    """
+    exclude = exclude or []
     all_videos: list[str] = []
     if os.path.isdir(BACKGROUNDS_DIR):
         for root, _, files in os.walk(BACKGROUNDS_DIR):
@@ -3209,12 +3235,16 @@ def _find_background_video() -> str | None:
         except (json.JSONDecodeError, OSError):
             used = []
 
-    # Filter out already used; if all used, reset the cycle
-    available = [v for v in all_videos if v not in used]
+    # Filter out already used + per-call exclusions; if nothing left, reset
+    # the cycle but keep honouring the exclusion list (we still don't want
+    # to re-pick a background that already failed validation this job).
+    available = [v for v in all_videos if v not in used and v not in exclude]
     if not available:
         print(f"[BG] All {len(all_videos)} backgrounds used, resetting cycle")
         used = []
-        available = all_videos
+        available = [v for v in all_videos if v not in exclude]
+    if not available:
+        return None
 
     pick = random.choice(available)
     used.append(pick)
@@ -3228,6 +3258,43 @@ def _find_background_video() -> str | None:
 
     print(f"[BG] Selected: {os.path.basename(pick)} ({len(all_videos) - len(available)} of {len(all_videos)} used)")
     return pick
+
+
+def _select_validated_background(job_id: str, max_attempts: int = 3) -> tuple[str | None, list[dict]]:
+    """Pick a library background and validate it against UMG Guideline 15
+    BEFORE the expensive render kicks in. If validation rejects, pick a
+    different background and try again, up to `max_attempts`.
+
+    Returns (chosen_path, all_rejection_issues). chosen_path is None if
+    no clean background was found within the attempts budget.
+    """
+    from content_validator import validate_video, validate_image
+
+    rejected: list[str] = []
+    issues: list[dict] = []
+    for attempt in range(1, max_attempts + 1):
+        candidate = _find_background_video(exclude=rejected)
+        if not candidate:
+            break
+        ext = os.path.splitext(candidate)[1].lower()
+        validate_fn = (
+            validate_video if ext in (".mp4", ".mov", ".webm") else validate_image
+        )
+        result = validate_fn(candidate, job_id=job_id)
+        if result.get("passed"):
+            print(
+                f"[VALIDATION] bg accepted on attempt {attempt}: "
+                f"{os.path.basename(candidate)}"
+            )
+            return candidate, issues
+        print(
+            f"[VALIDATION] bg rejected on attempt {attempt} "
+            f"({os.path.basename(candidate)}): {result.get('issues')}"
+        )
+        for it in result.get("issues") or []:
+            issues.append({"attempt": attempt, "bg": os.path.basename(candidate), **it})
+        rejected.append(candidate)
+    return None, issues
 
 
 _GRADIENT_PALETTES = {
