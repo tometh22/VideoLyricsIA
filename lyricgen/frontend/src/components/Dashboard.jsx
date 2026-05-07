@@ -1,5 +1,6 @@
 import { useState, useEffect } from "react";
 import { useI18n } from "../i18n";
+import { useMediaUrl } from "../mediaUrl";
 import { DashboardTour } from "./OnboardingTour";
 
 const API = import.meta.env.VITE_API_URL || "";
@@ -7,11 +8,6 @@ const API = import.meta.env.VITE_API_URL || "";
 function authHeaders() {
   const token = localStorage.getItem("genly_token");
   return token ? { Authorization: `Bearer ${token}` } : {};
-}
-
-function tokenParam() {
-  const token = localStorage.getItem("genly_token");
-  return token ? `token=${encodeURIComponent(token)}` : "";
 }
 
 function timeAgo(ts) {
@@ -56,6 +52,7 @@ function VideoCard({ job, onSelect }) {
   const name = (job.filename || "").replace(/\.mp3$/i, "");
   const songName = name.includes(" - ") ? name.split(" - ").slice(1).join(" - ") : name;
   const artistName = job.artist || (name.includes(" - ") ? name.split(" - ")[0] : "");
+  const thumbSrc = useMediaUrl(job.job_id, "thumbnail", "preview");
 
   return (
     <button
@@ -63,12 +60,14 @@ function VideoCard({ job, onSelect }) {
       className="rounded-card overflow-hidden text-left group bg-surface-2/40 hover:bg-surface-2/70 ring-1 ring-white/[0.04] hover:ring-white/[0.10] transition-all"
     >
       <div className="aspect-video bg-surface-3/30 relative overflow-hidden">
-        <img
-          src={`${API}/preview/${job.job_id}/thumbnail?${tokenParam()}`}
-          alt=""
-          className="w-full h-full object-cover group-hover:scale-[1.04] transition-transform duration-500"
-          onError={(e) => { e.target.style.display = "none"; }}
-        />
+        {thumbSrc && (
+          <img
+            src={thumbSrc}
+            alt=""
+            className="w-full h-full object-cover group-hover:scale-[1.04] transition-transform duration-500"
+            onError={(e) => { e.target.style.display = "none"; }}
+          />
+        )}
         <div className="absolute inset-0 flex items-center justify-center opacity-0 group-hover:opacity-100 transition-opacity bg-black/30">
           <div className="w-10 h-10 rounded-full bg-white/15 backdrop-blur-md flex items-center justify-center ring-1 ring-white/20">
             <svg className="w-4 h-4 text-white ml-0.5" fill="currentColor" viewBox="0 0 24 24">

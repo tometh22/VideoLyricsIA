@@ -1,16 +1,12 @@
-import { useState, useEffect } from "react";
+import { useState, useEffect, useRef } from "react";
 import { useI18n } from "../i18n";
+import { getDownloadUrl, useMediaUrl } from "../mediaUrl";
 
 const API = import.meta.env.VITE_API_URL || "";
 
 function authHeaders() {
   const token = localStorage.getItem("genly_token");
   return token ? { Authorization: `Bearer ${token}` } : {};
-}
-
-function tokenParam() {
-  const token = localStorage.getItem("genly_token");
-  return token ? `token=${encodeURIComponent(token)}` : "";
 }
 
 const MEDIA_TABS = [
@@ -78,17 +74,25 @@ function ProvenanceTab({ jobId, t }) {
     <div className="space-y-3">
       <div className="flex items-center justify-between mb-2">
         <p className="text-xs text-gray-500 uppercase tracking-wider">{t("prov.title") || "AI Provenance"}</p>
-        <a
-          href={`${API}/provenance/${jobId}/export?${tokenParam()}`}
-          target="_blank"
-          rel="noopener noreferrer"
+        <button
+          onClick={async () => {
+            const res = await fetch(`${API}/provenance/${jobId}/export`, { headers: authHeaders() });
+            if (!res.ok) return;
+            const blob = await res.blob();
+            const url = URL.createObjectURL(blob);
+            const a = document.createElement("a");
+            a.href = url;
+            a.download = `${jobId}-provenance.json`;
+            a.click();
+            URL.revokeObjectURL(url);
+          }}
           className="text-xs text-brand hover:text-brand-light transition-colors flex items-center gap-1"
         >
           <svg className="w-3 h-3" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
             <path d="M12 10v6m0 0l-3-3m3 3l3-3m2 8H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" />
           </svg>
           {t("prov.export") || "Export"}
-        </a>
+        </button>
       </div>
 
       {records.map((r) => {
@@ -161,7 +165,18 @@ export default function JobDetail({ job, onBack, onJobUpdate }) {
   const [showYoutubePanel, setShowYoutubePanel] = useState(false);
   const [reviewNotes, setReviewNotes] = useState("");
   const [approving, setApproving] = useState(false);
+  // Synchronous guard against double-click — `approving` (state) is updated
+  // asynchronously by React, so a rapid second click can fire its handler
+  // before the re-render flips the disabled flag. The ref is set BEFORE
+  // any await, so the second handler sees `current=true` immediately and
+  // bails out.
+  const approveLockRef = useRef(false);
   const name = (job.filename || "").replace(/\.mp3$/i, "");
+
+  // Short-lived media URLs (re-fetch when the active tab changes).
+  const previewMediaType = activeTab === "thumbnail" ? "thumbnail" : activeTab;
+  const previewSrc = useMediaUrl(job.job_id, previewMediaType, "preview");
+  const downloadHref = useMediaUrl(job.job_id, previewMediaType, "download");
 
   const canPreview = job.status === "done" || job.status === "pending_review";
   const canDownload = job.status === "done";
@@ -181,9 +196,14 @@ export default function JobDetail({ job, onBack, onJobUpdate }) {
   // <a>.click() calls" approach got blocked as popup spam by Chrome —
   // the browser would only honour the last click (thumbnail) and open it
   // in a tab instead of downloading. /download/{id}/all bundles the
-  // small deliverables server-side so we get one click → one file.
-  const downloadAllZip = () => {
-    window.location.href = `${API}/download/${job.job_id}/all?${tokenParam()}`;
+  // small deliverables server-side so we get one click → one file. We
+  // mint a short-lived media token first so the URL doesn't carry the
+  // long-lived JWT (C3 fix).
+  const downloadAllZip = async () => {
+    try {
+      const url = await getDownloadUrl(job.job_id, "all");
+      window.location.href = url;
+    } catch {}
   };
   // ProRes is generated lazily server-side from the existing MP4 the
   // first time it's requested (~60-120 s of ffmpeg transcode). The
@@ -192,14 +212,20 @@ export default function JobDetail({ job, onBack, onJobUpdate }) {
   // why the click feels slow on this run only. Subsequent clicks are
   // instant because the .mov is cached on disk + R2.
   const [proResHint, setProResHint] = useState(false);
-  const downloadProResMaster = () => {
+  const downloadProResMaster = async () => {
     setProResHint(true);
-    window.location.href = `${API}/download/${job.job_id}/umg_master?${tokenParam()}`;
+    try {
+      const url = await getDownloadUrl(job.job_id, "umg_master");
+      window.location.href = url;
+    } catch {}
     setTimeout(() => setProResHint(false), 8000);
   };
-  const downloadProResShort = () => {
+  const downloadProResShort = async () => {
     setProResHint(true);
-    window.location.href = `${API}/download/${job.job_id}/umg_short?${tokenParam()}`;
+    try {
+      const url = await getDownloadUrl(job.job_id, "umg_short");
+      window.location.href = url;
+    } catch {}
     setTimeout(() => setProResHint(false), 8000);
   };
 
@@ -227,6 +253,8 @@ export default function JobDetail({ job, onBack, onJobUpdate }) {
   };
 
   const handleApprove = async () => {
+    if (approveLockRef.current) return;
+    approveLockRef.current = true;
     setApproving(true);
     try {
       const res = await fetch(`${API}/approve/${job.job_id}`, {
@@ -240,9 +268,12 @@ export default function JobDetail({ job, onBack, onJobUpdate }) {
       }
     } catch {}
     setApproving(false);
+    approveLockRef.current = false;
   };
 
   const handleReject = async () => {
+    if (approveLockRef.current) return;
+    approveLockRef.current = true;
     setApproving(true);
     try {
       const res = await fetch(`${API}/reject/${job.job_id}`, {
@@ -264,6 +295,7 @@ export default function JobDetail({ job, onBack, onJobUpdate }) {
       }
     } catch {}
     setApproving(false);
+    approveLockRef.current = false;
   };
 
   const hasUmgMaster =
@@ -462,21 +494,29 @@ export default function JobDetail({ job, onBack, onJobUpdate }) {
         <>
           <div className="rounded-card bg-surface-2/40 ring-1 ring-white/[0.04] overflow-hidden mb-4">
             {activeTab === "thumbnail" ? (
-              <img
-                src={`${API}/preview/${job.job_id}/thumbnail?${tokenParam()}`}
-                alt="Thumbnail"
-                className="w-full max-h-[500px] object-contain bg-black/40"
-              />
+              previewSrc ? (
+                <img
+                  src={previewSrc}
+                  alt="Thumbnail"
+                  className="w-full max-h-[500px] object-contain bg-black/40"
+                />
+              ) : (
+                <div className="w-full h-[500px] bg-black/40" />
+              )
             ) : (
-              <video
-                key={activeTab}
-                src={`${API}/preview/${job.job_id}/${activeTab}?${tokenParam()}`}
-                controls
-                className={`w-full bg-black/40 ${
-                  activeTab === "short" ? "max-h-[600px] mx-auto" : "max-h-[500px]"
-                }`}
-                style={activeTab === "short" ? { maxWidth: "340px", margin: "0 auto", display: "block" } : {}}
-              />
+              previewSrc ? (
+                <video
+                  key={activeTab}
+                  src={previewSrc}
+                  controls
+                  className={`w-full bg-black/40 ${
+                    activeTab === "short" ? "max-h-[600px] mx-auto" : "max-h-[500px]"
+                  }`}
+                  style={activeTab === "short" ? { maxWidth: "340px", margin: "0 auto", display: "block" } : {}}
+                />
+              ) : (
+                <div className="w-full h-[500px] bg-black/40" />
+              )
             )}
           </div>
 
@@ -486,8 +526,8 @@ export default function JobDetail({ job, onBack, onJobUpdate }) {
               {MEDIA_TABS.find((t) => t.key === activeTab)?.desc}
               {activeTab !== "thumbnail" ? " MP4" : " JPG"}
             </p>
-            {canDownload && (
-              <a href={`${API}/download/${job.job_id}/${activeTab}?${tokenParam()}`} download
+            {canDownload && downloadHref && (
+              <a href={downloadHref} download
                 className="text-xs font-medium text-brand hover:text-brand-light transition-colors flex items-center gap-1.5">
                 <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
                   <path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4" /><polyline points="7 10 12 15 17 10" /><line x1="12" y1="15" x2="12" y2="3" />

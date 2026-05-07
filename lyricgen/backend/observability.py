@@ -75,17 +75,31 @@ def health_snapshot() -> dict:
     Designed to be safe on a hot path (uptime probe → every N seconds):
     every check has its own try/except, every external call has a hard
     timeout, and worst-case the endpoint still returns in well under a
-    second. `status` is 'ok' / 'degraded' / 'error' so a load balancer
-    can decide.
+    second.
+
+    Status semantics — used by the load balancer / Docker healthcheck:
+      - "ok": all configured dependencies reachable.
+      - "degraded": a non-critical issue (low disk, no live workers,
+        Redis not configured outside prod, etc.) but service is usable.
+      - "down": a configured-and-required dependency is unreachable in
+        production — Redis (queue is broken) or Postgres (SELECT 1
+        failed). The /health endpoint translates this to HTTP 503.
     """
     snap = {"status": "ok", "env": ENV}
+    is_prod = ENV in ("prod", "production")
 
     def _degrade(reason: str) -> None:
-        # First problem flips ok→degraded; an explicit "error" elsewhere
-        # may upgrade it further.
+        # First non-fatal problem flips ok→degraded; explicit "down"
+        # elsewhere takes precedence.
         if snap["status"] == "ok":
             snap["status"] = "degraded"
             snap["degraded_reason"] = reason
+
+    def _down(reason: str) -> None:
+        # Hard failure of a required dependency. Used by /health to
+        # return 503 so the load balancer pulls the instance out.
+        snap["status"] = "down"
+        snap["down_reason"] = reason
 
     # Disk
     try:
@@ -105,11 +119,11 @@ def health_snapshot() -> dict:
         snap["db"] = "up"
     except Exception as e:
         snap["db"] = "down"
-        snap["status"] = "error"
         snap["db_error"] = str(e)[:120]
+        _down("db_down")
 
-    # Redis + RQ stats (queue depth, worker count). Best-effort: if
-    # Redis is down we already marked it; just don't blow up here.
+    # Redis + RQ stats (queue depth, worker count). Best-effort.
+    redis_url = os.environ.get("REDIS_URL", "").strip()
     try:
         from queue_jobs import _init_redis
         r, _, _ = _init_redis()
@@ -133,14 +147,30 @@ def health_snapshot() -> dict:
             except Exception:
                 # rq not importable in this process — non-fatal for the API
                 pass
+        elif redis_url:
+            # Configured but unreachable: queue is broken. /enqueue will
+            # raise in production; surface that to the load balancer.
+            snap["redis"] = "down"
+            if is_prod:
+                _down("redis_down")
+            else:
+                _degrade("redis_unreachable")
         else:
             snap["redis"] = "not_configured"
-            _degrade("redis_not_configured")
+            # Only flag as degraded in production — outside prod the
+            # threading-based fallback is intentional and the API is
+            # fully usable, so the LB shouldn't see "degraded" just
+            # because a dev box left REDIS_URL unset.
+            if is_prod:
+                _degrade("redis_not_configured")
     except Exception:
         snap["redis"] = "error"
-        snap["status"] = "error"
+        if redis_url and is_prod:
+            _down("redis_error")
+        else:
+            _degrade("redis_error")
 
-    # R2
+    # R2 / S3
     try:
         import storage
         snap["r2"] = "configured" if storage.is_enabled() else "not_configured"

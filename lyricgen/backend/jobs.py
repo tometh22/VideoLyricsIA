@@ -44,11 +44,24 @@ def create_job(
     return job_id
 
 
-def get_job(db: Session, job_id: str, tenant_id: str = None) -> Optional[dict]:
-    """Return a job dict or None if not found."""
+def get_job(
+    db: Session,
+    job_id: str,
+    tenant_id: str = None,
+    user_id: int = None,
+) -> Optional[dict]:
+    """Return a job dict or None if not found.
+
+    Pass user_id (in addition to tenant_id) for self-serve callers — it
+    closes the IDOR where many self-registered users land in
+    tenant_id="default" (e.g. the admin tenant) and could otherwise see
+    each other's jobs by enumerating job_ids.
+    """
     query = db.query(Job).filter(Job.job_id == job_id)
     if tenant_id:
         query = query.filter(Job.tenant_id == tenant_id)
+    if user_id is not None:
+        query = query.filter(Job.user_id == user_id)
     job = query.first()
     return job.to_dict() if job else None
 
@@ -128,26 +141,61 @@ def bulk_delete_jobs(db: Session, job_ids: list[str], tenant_id: str) -> dict:
     return {"deleted": deleted, "skipped": skipped}
 
 
-def get_all_jobs(db: Session, tenant_id: str = "default", limit: int = 200) -> list[dict]:
-    """Return all jobs for a tenant, sorted by creation time (newest first)."""
+def get_all_jobs(
+    db: Session,
+    tenant_id: str = "default",
+    limit: int = 200,
+    user_id: int = None,
+) -> list[dict]:
+    """Return all jobs for a tenant, sorted by creation time (newest first).
+
+    Pass user_id for self-serve callers — see get_job() for rationale.
+    """
+    query = db.query(Job).filter(Job.tenant_id == tenant_id)
+    if user_id is not None:
+        query = query.filter(Job.user_id == user_id)
     jobs = (
-        db.query(Job)
-        .filter(Job.tenant_id == tenant_id)
-        .order_by(Job.created_at.desc())
+        query.order_by(Job.created_at.desc())
         .limit(limit)
         .all()
     )
     return [j.to_list_dict() for j in jobs]
 
 
+_TERMINAL_STATUSES = ("done", "error", "rejected", "validation_failed")
+
+
 def update_job(job_id: str, **kwargs) -> None:
-    """Update fields on an existing job. Creates its own DB session for thread safety."""
+    """Update fields on an existing job. Creates its own DB session for thread safety.
+
+    A status update that targets a non-terminal state is REFUSED for jobs
+    already in a terminal state. This guards against:
+      - A stale worker thread flushing progress=55 / status="processing"
+        after a reaper marked the job error → resurrects a closed job.
+      - Two workers picking the same job and both calling
+        update_job(status="processing") → double-processing.
+
+    Updates that target a terminal state OR fields that are safe to set on
+    terminal jobs (s3_keys, youtube_data, validation_result, etc.) are
+    always applied — the reaper itself relies on the terminal-update path.
+    """
     from database import SessionLocal
+
+    target_status = kwargs.get("status")
+    target_is_terminal = target_status in _TERMINAL_STATUSES
 
     db = SessionLocal()
     try:
         job = db.query(Job).filter(Job.job_id == job_id).first()
         if not job:
+            return
+
+        # Refuse non-terminal mutations of terminal jobs.
+        if (
+            job.status in _TERMINAL_STATUSES
+            and not target_is_terminal
+            and target_status is not None
+        ):
             return
 
         for key, value in kwargs.items():
@@ -170,6 +218,14 @@ def update_job(job_id: str, **kwargs) -> None:
             job.completed_at = datetime.now(timezone.utc)
 
         db.commit()
+    except Exception:
+        # Without an explicit rollback the session is returned to the pool
+        # holding an open transaction; pool_pre_ping only catches
+        # disconnects, not in-tx errors, so the next caller can hit
+        # "current transaction is aborted, commands ignored until end of
+        # transaction block".
+        db.rollback()
+        raise
     finally:
         db.close()
 

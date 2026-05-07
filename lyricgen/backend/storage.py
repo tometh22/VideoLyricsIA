@@ -5,16 +5,32 @@ signed URL on R2 instead of streaming a 5 GB .mov through uvicorn, and (b) the
 local outputs/ directory doesn't grow unbounded.
 
 All helpers are no-ops when R2_* env vars are missing, so local dev still
-works without cloud storage.
+works without cloud storage. Operators following the docker-compose file
+typically set S3_* env vars instead — those are accepted as fallbacks so
+the same compose file works for both R2 and any S3-compatible backend.
 """
 
 import os
+import re
 from typing import Optional
 
-R2_ACCESS_KEY_ID = os.environ.get("R2_ACCESS_KEY_ID", "").strip()
-R2_SECRET_ACCESS_KEY = os.environ.get("R2_SECRET_ACCESS_KEY", "").strip()
-R2_ENDPOINT_URL = os.environ.get("R2_ENDPOINT_URL", "").strip()
-R2_BUCKET = os.environ.get("R2_BUCKET", "").strip()
+
+def _env(*names: str) -> str:
+    """Return the first non-empty value among the given env var names."""
+    for n in names:
+        v = os.environ.get(n, "").strip()
+        if v:
+            return v
+    return ""
+
+
+# Accept either R2_* (legacy) or S3_* (docker-compose) — the names diverged
+# historically and operators following the compose file ended up with
+# is_enabled()==False and silent disk fallback, masking storage breakage.
+R2_ACCESS_KEY_ID = _env("R2_ACCESS_KEY_ID", "S3_ACCESS_KEY", "S3_ACCESS_KEY_ID")
+R2_SECRET_ACCESS_KEY = _env("R2_SECRET_ACCESS_KEY", "S3_SECRET_KEY", "S3_SECRET_ACCESS_KEY")
+R2_ENDPOINT_URL = _env("R2_ENDPOINT_URL", "S3_ENDPOINT_URL")
+R2_BUCKET = _env("R2_BUCKET", "S3_BUCKET")
 
 _client = None
 
@@ -61,14 +77,40 @@ def _transfer_config():
     )
 
 
+# Keep `_KEY_SAFE` ASCII-only so signed URLs round-trip cleanly through any
+# CDN / proxy — and so an attacker can't slip path-traversal segments
+# (`..`, `%2f`, NUL, etc.) into a filename to land an object outside their
+# tenant prefix and then ask /download to sign that key.
+_KEY_SAFE = re.compile(r"[^A-Za-z0-9._-]+")
+
+
+def _safe_filename(filename: str) -> str:
+    """Sanitize a user-controlled filename so it is safe to use as the
+    last segment of an object key. We:
+      - strip path components (basename only),
+      - collapse anything that isn't ASCII alnum / dot / underscore / dash,
+      - reject leading dots so we can't write "..", "/.hidden", etc.,
+      - cap to 200 chars (S3 max key length is 1024; this keeps the
+        prefix + filename comfortably under that).
+    """
+    base = os.path.basename(filename or "")
+    cleaned = _KEY_SAFE.sub("_", base).strip(".")
+    if not cleaned:
+        cleaned = "file"
+    return cleaned[:200]
+
+
 def _object_key(tenant_id: str, job_id: str, filename: str) -> str:
-    return f"{tenant_id}/{job_id}/{filename}"
+    return f"{_safe_filename(tenant_id)}/{_safe_filename(job_id)}/{_safe_filename(filename)}"
 
 
 def _input_object_key(tenant_id: str, job_id: str, filename: str) -> str:
     """Inputs (user-uploaded MP3s) live under a separate prefix so lifecycle
     rules can purge them aggressively without touching deliverables."""
-    return f"inputs/{tenant_id}/{job_id}/{filename}"
+    return (
+        f"inputs/{_safe_filename(tenant_id)}"
+        f"/{_safe_filename(job_id)}/{_safe_filename(filename)}"
+    )
 
 
 def upload_master(local_path: str, tenant_id: str, job_id: str, filename: str) -> Optional[str]:
@@ -166,6 +208,45 @@ def generate_signed_url(key: str, expiry_seconds: int = 3600) -> Optional[str]:
     )
 
 
+def _active_input_keys() -> set[str]:
+    """Return the set of object keys that belong to a non-terminal job.
+
+    Cleanup must NOT touch these — a job that has been queued for >30 days
+    after an outage still has its input MP3 referenced from the DB, and
+    deleting it from R2 makes the job unrunnable when the worker finally
+    picks it up.
+
+    Empty set is returned when the DB is unreachable; the caller treats
+    that as "no protected keys" and skips deletion entirely (see below).
+    """
+    try:
+        from database import Job, SessionLocal
+    except Exception:
+        return set()
+
+    keys: set[str] = set()
+    try:
+        db = SessionLocal()
+        try:
+            non_terminal = (
+                db.query(Job)
+                .filter(Job.status.in_(("queued", "processing", "pending_review")))
+                .all()
+            )
+            for j in non_terminal:
+                # Whatever the original upload filename was, the worker
+                # writes inputs under inputs/{tenant}/{job_id}/. Match the
+                # prefix rather than the exact key to handle filename
+                # rewrites at upload time.
+                keys.add(f"inputs/{_safe_filename(j.tenant_id)}/{_safe_filename(j.job_id)}/")
+        finally:
+            db.close()
+    except Exception:
+        # DB hiccup — return what we have; caller may decide to abort.
+        pass
+    return keys
+
+
 def cleanup_old_inputs(retention_days: int = 30, apply: bool = False, prefix: str = "inputs/") -> dict:
     """Delete objects under `prefix` whose LastModified is older than
     retention_days. Returns a structured report:
@@ -197,6 +278,12 @@ def cleanup_old_inputs(retention_days: int = 30, apply: bool = False, prefix: st
     cutoff = datetime.now(timezone.utc) - timedelta(days=retention_days)
     paginator = client.get_paginator("list_objects_v2")
 
+    # Build a protect-list of input keys belonging to jobs that are still
+    # queued/processing/pending_review. We skip these even if their
+    # LastModified is past the retention window.
+    protected_prefixes = _active_input_keys()
+    skipped_active = 0
+
     scanned = 0
     expired: list[tuple[str, int, "datetime"]] = []
     bytes_to_free = 0
@@ -206,7 +293,11 @@ def cleanup_old_inputs(retention_days: int = 30, apply: bool = False, prefix: st
             scanned += 1
             modified = obj["LastModified"]
             if modified < cutoff:
-                expired.append((obj["Key"], obj["Size"], modified))
+                key = obj["Key"]
+                if any(key.startswith(p) for p in protected_prefixes):
+                    skipped_active += 1
+                    continue
+                expired.append((key, obj["Size"], modified))
                 bytes_to_free += obj["Size"]
 
     now = datetime.now(timezone.utc)
@@ -242,6 +333,7 @@ def cleanup_old_inputs(retention_days: int = 30, apply: bool = False, prefix: st
         "scanned": scanned,
         "expired": len(expired),
         "deleted": deleted,
+        "skipped_active": skipped_active,
         "bytes_freed": bytes_to_free if apply else 0,
         "bytes_to_free_dryrun": bytes_to_free if not apply else 0,
         "sample": sample,

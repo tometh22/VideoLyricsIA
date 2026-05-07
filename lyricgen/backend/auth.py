@@ -54,6 +54,32 @@ if _ENV in ("prod", "production") and (
 # --- Password hashing ---
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 
+# bcrypt silently truncates input at 72 bytes. A 200-char passphrase has the
+# entropy of its first 72 bytes — and verify() succeeds for ANY password that
+# shares those first 72 bytes. Rejecting outright is safer than silently
+# truncating; if longer passphrases are needed, switch the scheme to
+# bcrypt_sha256 (which pre-hashes with SHA-256).
+BCRYPT_MAX_BYTES = 72
+PASSWORD_MIN_LENGTH = 8
+
+
+def validate_password_strength(password: str) -> None:
+    """Raise ValueError if password fails baseline checks.
+
+    The two checks here are non-negotiable:
+      - At least 8 characters (NIST SP 800-63B baseline).
+      - At most 72 bytes when UTF-8 encoded (bcrypt's hard limit; longer
+        inputs become indistinguishable from their 72-byte prefix).
+    """
+    if len(password) < PASSWORD_MIN_LENGTH:
+        raise ValueError(f"Password must be at least {PASSWORD_MIN_LENGTH} characters")
+    if len(password.encode("utf-8")) > BCRYPT_MAX_BYTES:
+        raise ValueError(
+            f"Password is too long ({BCRYPT_MAX_BYTES}-byte max). "
+            "Consider a passphrase that is shorter than 72 bytes "
+            "(roughly 72 ASCII chars or 36 emoji-heavy chars)."
+        )
+
 security = HTTPBearer()
 
 
@@ -82,7 +108,9 @@ def create_user(
     tenant_id: str = None,
     plan: str = "free",
 ) -> User:
-    """Create a new user. Raises ValueError if username/email exists."""
+    """Create a new user. Raises ValueError if username/email exists or
+    the password fails baseline strength checks."""
+    validate_password_strength(password)
     if get_user_by_username(db, username):
         raise ValueError(f"User '{username}' already exists")
     if email and get_user_by_email(db, email):
@@ -121,18 +149,37 @@ def authenticate_user(db: Session, username: str, password: str) -> Optional[Use
 
 
 def ensure_default_admin(db: Session):
-    """Create default admin user if no users exist."""
-    if db.query(User).count() == 0:
-        admin_pw = os.environ.get("ADMIN_PASSWORD", "genly2026")
-        create_user(
-            db,
-            username="admin",
-            password=admin_pw,
-            email=os.environ.get("ADMIN_EMAIL"),
-            role="admin",
-            tenant_id="default",
-            plan="unlimited",
+    """Create default admin user if no users exist.
+
+    In production we refuse to bootstrap with a hardcoded password — anyone
+    who knows the published default ("genly2026") would have root on a
+    fresh DB. The operator must set ADMIN_PASSWORD explicitly.
+    """
+    if db.query(User).count() != 0:
+        return
+
+    admin_pw = os.environ.get("ADMIN_PASSWORD", "")
+    is_prod = _ENV in ("prod", "production")
+    if is_prod and not admin_pw:
+        raise RuntimeError(
+            "Refusing to create default admin in production without "
+            "ADMIN_PASSWORD set. Generate one (e.g. `openssl rand -base64 24`) "
+            "and pass it as an environment variable."
         )
+    if not admin_pw:
+        # Dev / test only — keep the legacy default to avoid breaking
+        # local-first onboarding flows and the existing test suite.
+        admin_pw = "genly2026"
+
+    create_user(
+        db,
+        username="admin",
+        password=admin_pw,
+        email=os.environ.get("ADMIN_EMAIL"),
+        role="admin",
+        tenant_id="default",
+        plan="unlimited",
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -151,14 +198,45 @@ def create_password_reset_token(db: Session, user: User) -> str:
 
 
 def verify_password_reset_token(db: Session, token: str) -> Optional[User]:
-    record = db.query(PasswordResetToken).filter(
-        PasswordResetToken.token == token,
-        PasswordResetToken.used == False,
-        PasswordResetToken.expires_at > datetime.now(timezone.utc),
-    ).first()
-    if not record:
+    """Atomically claim a password-reset token.
+
+    Two callers concurrently presenting the same valid token would both
+    pass the `used == False` filter and both proceed to set a new
+    password — letting the same token be used twice. We claim the token
+    in a single UPDATE … WHERE used=false statement; only the first
+    claim's rowcount is 1, the second sees 0 and is rejected.
+
+    On successful claim we ALSO invalidate every other outstanding reset
+    token for that user, so a phished token can't survive a self-service
+    reset.
+    """
+    now = datetime.now(timezone.utc)
+    rowcount = (
+        db.query(PasswordResetToken)
+        .filter(
+            PasswordResetToken.token == token,
+            PasswordResetToken.used == False,  # noqa: E712 — SQLAlchemy needs ==
+            PasswordResetToken.expires_at > now,
+        )
+        .update({PasswordResetToken.used: True}, synchronize_session=False)
+    )
+    if rowcount == 0:
+        db.commit()
         return None
-    record.used = True
+    record = (
+        db.query(PasswordResetToken)
+        .filter(PasswordResetToken.token == token)
+        .first()
+    )
+    if record is None:
+        db.commit()
+        return None
+    # Invalidate every other live token for this user.
+    db.query(PasswordResetToken).filter(
+        PasswordResetToken.user_id == record.user_id,
+        PasswordResetToken.token != token,
+        PasswordResetToken.used == False,  # noqa: E712
+    ).update({PasswordResetToken.used: True}, synchronize_session=False)
     db.commit()
     return get_user_by_id(db, record.user_id)
 
@@ -175,14 +253,31 @@ def create_email_verification_token(db: Session, user: User) -> str:
 
 
 def verify_email_token(db: Session, token: str) -> Optional[User]:
-    record = db.query(EmailVerificationToken).filter(
-        EmailVerificationToken.token == token,
-        EmailVerificationToken.used == False,
-        EmailVerificationToken.expires_at > datetime.now(timezone.utc),
-    ).first()
-    if not record:
+    """Atomically claim an email-verification token.
+
+    See verify_password_reset_token() for the race rationale; same fix.
+    """
+    now = datetime.now(timezone.utc)
+    rowcount = (
+        db.query(EmailVerificationToken)
+        .filter(
+            EmailVerificationToken.token == token,
+            EmailVerificationToken.used == False,  # noqa: E712
+            EmailVerificationToken.expires_at > now,
+        )
+        .update({EmailVerificationToken.used: True}, synchronize_session=False)
+    )
+    if rowcount == 0:
+        db.commit()
         return None
-    record.used = True
+    record = (
+        db.query(EmailVerificationToken)
+        .filter(EmailVerificationToken.token == token)
+        .first()
+    )
+    if record is None:
+        db.commit()
+        return None
     user = get_user_by_id(db, record.user_id)
     if user:
         user.email_verified = True
@@ -260,6 +355,54 @@ def get_current_user_from_token_param(token: str, db: Session) -> dict:
         "tenant_id": user.tenant_id,
         "plan": user.plan_id,
         "allow_overage": getattr(user, "allow_overage", False) or False,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Short-lived media tokens
+# ---------------------------------------------------------------------------
+#
+# /download and /preview accept a token in the query string. Reusing the
+# 24-hour login JWT there is unsafe: media URLs are saved in browser history,
+# server access logs, and Referer headers when a redirect (R2 signed URL) is
+# followed. Anyone who scrapes a URL gets a full account takeover for 24
+# hours. We mint a *separate* token here, scoped to a single (job_id,
+# file_type) and short-lived, so a leaked URL leaks nothing useful.
+
+MEDIA_TOKEN_EXPIRE_SECONDS = int(os.environ.get("MEDIA_TOKEN_EXPIRE_SECONDS", "300"))
+_MEDIA_TOKEN_TYPE = "media"
+
+
+def create_media_token(user: User, job_id: str, file_type: str) -> str:
+    """Mint a short-lived token scoped to a single job/file_type."""
+    payload = {
+        "sub": str(user.id),
+        "tid": user.tenant_id,
+        "jid": job_id,
+        "ft": file_type,
+        "tt": _MEDIA_TOKEN_TYPE,
+        "exp": time.time() + MEDIA_TOKEN_EXPIRE_SECONDS,
+        "iat": time.time(),
+    }
+    return jwt.encode(payload, JWT_SECRET, algorithm=JWT_ALGORITHM)
+
+
+def verify_media_token(token: str, job_id: str, file_type: str, db: Session) -> dict:
+    """Validate a media token and check it's scoped to (job_id, file_type)."""
+    payload = decode_token(token)
+    if payload.get("tt") != _MEDIA_TOKEN_TYPE:
+        raise HTTPException(status_code=401, detail="Wrong token type for media URL")
+    if payload.get("jid") != job_id or payload.get("ft") != file_type:
+        raise HTTPException(status_code=401, detail="Token scope mismatch")
+    user = get_user_by_id(db, int(payload["sub"]))
+    if not user or not user.is_active:
+        raise HTTPException(status_code=401, detail="User not found or inactive")
+    return {
+        "id": user.id,
+        "username": user.username,
+        "role": user.role,
+        "tenant_id": user.tenant_id,
+        "plan": user.plan_id,
     }
 
 
