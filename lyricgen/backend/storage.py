@@ -231,6 +231,122 @@ def generate_signed_url(key: str, expiry_seconds: int = 3600) -> Optional[str]:
     )
 
 
+def presign_put_url(
+    tenant_id: str,
+    job_id: str,
+    filename: str,
+    *,
+    content_type: Optional[str] = None,
+    expiry_seconds: int = 900,
+) -> Optional[dict]:
+    """Pre-signed PUT URL for a single-shot upload directly from the
+    browser to R2. Returns {"url": str, "key": str, "expires_in": int}
+    or None when R2 is not configured.
+
+    The browser sends `PUT <url>` with the file body and a matching
+    `Content-Type` header (the URL is signed against that content_type
+    so altering it invalidates the signature). The API container never
+    sees the body — that's the whole point of this path.
+    """
+    client = _get_client()
+    if client is None:
+        return None
+    key = _input_object_key(tenant_id, job_id, filename)
+    params = {"Bucket": R2_BUCKET, "Key": key}
+    if content_type:
+        params["ContentType"] = content_type
+    url = client.generate_presigned_url(
+        "put_object", Params=params, ExpiresIn=expiry_seconds,
+    )
+    return {"url": url, "key": key, "expires_in": expiry_seconds}
+
+
+def multipart_init(
+    tenant_id: str,
+    job_id: str,
+    filename: str,
+    *,
+    content_type: Optional[str] = None,
+) -> Optional[dict]:
+    """Begin a multipart upload. Returns {"upload_id", "key"} or None
+    when R2 is disabled.
+
+    Multipart is the right tool for >16 MB uploads on flaky connections:
+    each part is a separate PUT, parts can be uploaded in parallel, and
+    a failed part retries without re-sending the whole file. Keep an
+    upload_id around until the operator confirms completion (via
+    `multipart_complete`) — abandoned multipart uploads waste R2 storage
+    and need to be aborted by the reaper.
+    """
+    client = _get_client()
+    if client is None:
+        return None
+    key = _input_object_key(tenant_id, job_id, filename)
+    args = {"Bucket": R2_BUCKET, "Key": key}
+    if content_type:
+        args["ContentType"] = content_type
+    resp = client.create_multipart_upload(**args)
+    return {"upload_id": resp["UploadId"], "key": key}
+
+
+def multipart_presign_part(
+    key: str, upload_id: str, part_number: int,
+    *, expiry_seconds: int = 900,
+) -> Optional[str]:
+    """Pre-signed URL for a single multipart part. Browser PUTs the
+    part bytes against this URL and reads the `ETag` header from the
+    response — that ETag goes back in `multipart_complete`."""
+    client = _get_client()
+    if client is None:
+        return None
+    return client.generate_presigned_url(
+        "upload_part",
+        Params={
+            "Bucket": R2_BUCKET,
+            "Key": key,
+            "UploadId": upload_id,
+            "PartNumber": part_number,
+        },
+        ExpiresIn=expiry_seconds,
+    )
+
+
+def multipart_complete(
+    key: str, upload_id: str, parts: list[dict],
+) -> Optional[str]:
+    """Finalize a multipart upload. `parts` is a list of
+    {"PartNumber": int, "ETag": str} dicts (one per uploaded part,
+    sorted by PartNumber). Returns the key on success."""
+    client = _get_client()
+    if client is None:
+        return None
+    sorted_parts = sorted(parts, key=lambda p: int(p["PartNumber"]))
+    client.complete_multipart_upload(
+        Bucket=R2_BUCKET,
+        Key=key,
+        UploadId=upload_id,
+        MultipartUpload={"Parts": sorted_parts},
+    )
+    return key
+
+
+def multipart_abort(key: str, upload_id: str) -> bool:
+    """Abort an in-flight multipart upload. Best-effort — returns False
+    if R2 is disabled or the abort fails (the orphan still costs R2
+    storage; the periodic abort sweep cleans it up)."""
+    client = _get_client()
+    if client is None:
+        return False
+    try:
+        client.abort_multipart_upload(
+            Bucket=R2_BUCKET, Key=key, UploadId=upload_id,
+        )
+        return True
+    except Exception as e:
+        print(f"[R2] multipart_abort {key} {upload_id} failed: {e}")
+        return False
+
+
 def _active_input_keys() -> set[str]:
     """Return the set of object keys that belong to a non-terminal job.
 
@@ -253,7 +369,14 @@ def _active_input_keys() -> set[str]:
         try:
             non_terminal = (
                 db.query(Job)
-                .filter(Job.status.in_(("queued", "processing", "pending_review")))
+                .filter(Job.status.in_((
+                    "queued", "processing", "pending_review",
+                    # Inputs of awaiting_upload / transcribed_pending jobs
+                    # must not be GC'd — the user is still in the middle of
+                    # the upload-edit-generate flow. The reaper handles
+                    # short-TTL cleanup separately.
+                    "awaiting_upload", "transcribed_pending",
+                )))
                 .all()
             )
             for j in non_terminal:

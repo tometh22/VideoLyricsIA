@@ -214,6 +214,8 @@ const translations = {
     // Transcribing
     "transcribe.title": "Transcribiendo lyrics",
     "transcribe.subtitle": "Analizando audio...",
+    "transcribe.uploading": "Subiendo audio",
+    "transcribe.uploading_progress": "Subiendo a almacenamiento ({pct}%)",
     "transcribe.song": "Canción",
 
     // Batch
@@ -284,6 +286,7 @@ const translations = {
     "batch.download_all": "Descargar todo",
     "batch.new_batch": "Crear más videos",
     "batch.queued": "En cola",
+    "batch.step_uploading": "Subiendo",
     "batch.in_progress": "En progreso",
     "batch.validating": "Validando contenido",
     "batch.pending_review": "Pendiente de aprobacion",
@@ -689,6 +692,8 @@ const translations = {
 
     "transcribe.title": "Transcribing lyrics",
     "transcribe.subtitle": "Analyzing audio...",
+    "transcribe.uploading": "Uploading audio",
+    "transcribe.uploading_progress": "Uploading to storage ({pct}%)",
     "transcribe.song": "Song",
 
     "batch.generating": "Generating videos",
@@ -757,6 +762,7 @@ const translations = {
     "batch.download_all": "Download all",
     "batch.new_batch": "Create more videos",
     "batch.queued": "Queued",
+    "batch.step_uploading": "Uploading",
     "batch.in_progress": "In progress",
     "batch.validating": "Validating content",
     "batch.pending_review": "Pending review",
@@ -1147,6 +1153,8 @@ const translations = {
 
     "transcribe.title": "Transcrevendo lyrics",
     "transcribe.subtitle": "Analisando áudio...",
+    "transcribe.uploading": "Enviando áudio",
+    "transcribe.uploading_progress": "Enviando para o armazenamento ({pct}%)",
     "transcribe.song": "Música",
 
     "batch.generating": "Gerando vídeos",
@@ -1223,6 +1231,7 @@ const translations = {
     "prores.generating_tooltip": "O master ProRes está sendo gerado em segundo plano. Demora 1-3 minutos para HD, 3-5 para 4K.",
 
     "batch.queued": "Na fila",
+    "batch.step_uploading": "Enviando",
     "batch.in_progress": "Em progresso",
     "batch.validating": "Validando conteudo",
     "batch.pending_review": "Pendente de aprovacao",

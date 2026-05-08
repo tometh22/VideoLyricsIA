@@ -55,6 +55,14 @@ _TRANSCRIBED_PENDING_TTL_MIN = int(os.environ.get(
     "REAPER_TRANSCRIBED_PENDING_TTL_MIN", "30",
 ))
 
+# awaiting_upload jobs are even shorter-lived: the browser is mid-PUT to
+# R2 with a presigned URL. If the user closes the tab partway through, we
+# need to abort the multipart upload so R2 doesn't keep the parts around
+# (R2 charges for the storage either way until the abort fires).
+_AWAITING_UPLOAD_TTL_MIN = int(os.environ.get(
+    "REAPER_AWAITING_UPLOAD_TTL_MIN", "20",
+))
+
 # Owner inbox for the digest email. Override via env in Railway.
 _OWNER_EMAIL = os.environ.get("OWNER_EMAIL", "tomas@epical.digital")
 
@@ -85,6 +93,24 @@ def find_abandoned_transcribed(
     return (
         db.query(Job)
         .filter(Job.status == "transcribed_pending")
+        .filter(Job.created_at < cutoff)
+        .order_by(Job.created_at.asc())
+        .all()
+    )
+
+
+def find_abandoned_uploads(
+    db: Session,
+    ttl_min: int = _AWAITING_UPLOAD_TTL_MIN,
+) -> list[Job]:
+    """Return jobs stuck in awaiting_upload past the upload TTL. The
+    browser is supposed to PUT bytes directly to R2 within minutes of
+    /upload-url; anything older than ttl_min is a closed tab / abandoned
+    multipart upload."""
+    cutoff = datetime.now(timezone.utc) - timedelta(minutes=ttl_min)
+    return (
+        db.query(Job)
+        .filter(Job.status == "awaiting_upload")
         .filter(Job.created_at < cutoff)
         .order_by(Job.created_at.asc())
         .all()
@@ -130,6 +156,40 @@ def _delete_abandoned_transcribed(db: Session, job: Job) -> None:
             _storage.delete_object(job.input_r2_key)
         except Exception as e:  # pragma: no cover
             logger.debug(f"reaper: R2 delete failed for {job_id}: {e}")
+    db.delete(job)
+
+
+def _delete_abandoned_upload(db: Session, job: Job) -> None:
+    """Hard-delete an abandoned awaiting_upload row.
+
+    Three cleanup paths depending on what state the upload reached:
+      1. Multipart in-flight → abort_multipart_upload to release the
+         parts R2 has accepted so far.
+      2. Single-PUT or completed multipart → delete the object.
+      3. No R2 key recorded yet (browser never started) → just drop
+         the row.
+    """
+    job_id = job.job_id
+    try:
+        import storage as _storage
+        if job.multipart_upload_id and job.input_r2_key:
+            _storage.multipart_abort(job.input_r2_key, job.multipart_upload_id)
+        elif job.input_r2_key:
+            try:
+                _storage.delete_object(job.input_r2_key)
+            except Exception:
+                pass
+    except Exception as e:  # pragma: no cover
+        logger.debug(f"reaper: R2 cleanup failed for {job_id}: {e}")
+    # Local dir (rare for awaiting_upload, but defensive).
+    try:
+        from pipeline import OUTPUTS_DIR
+        local_dir = os.path.join(OUTPUTS_DIR, job_id)
+        if os.path.isdir(local_dir):
+            import shutil as _sh
+            _sh.rmtree(local_dir, ignore_errors=True)
+    except Exception:
+        pass
     db.delete(job)
 
 
@@ -277,15 +337,22 @@ def reap_all_stuck(threshold_min: int = _DEFAULT_THRESHOLD_MIN) -> int:
 
         stuck = find_stuck_jobs(db, threshold_min)
         abandoned = find_abandoned_transcribed(db)
+        abandoned_uploads = find_abandoned_uploads(db)
         # Reap abandoned transcribed_pending rows quietly: the user never
         # got a job started, so the failure isn't operator-visible. Just
         # delete the row and clean up the input file.
         for job in abandoned:
             _delete_abandoned_transcribed(db, job)
-        if abandoned:
+        for job in abandoned_uploads:
+            _delete_abandoned_upload(db, job)
+        if abandoned or abandoned_uploads:
             db.commit()
-            print(f"[REAPER] cleaned up {len(abandoned)} abandoned "
-                  f"transcribed_pending job(s)")
+            if abandoned:
+                print(f"[REAPER] cleaned up {len(abandoned)} abandoned "
+                      f"transcribed_pending job(s)")
+            if abandoned_uploads:
+                print(f"[REAPER] cleaned up {len(abandoned_uploads)} abandoned "
+                      f"awaiting_upload job(s)")
         if not stuck:
             return 0
         for job in stuck:

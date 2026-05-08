@@ -30,8 +30,14 @@ def create_job(
       - "transcribed_pending": user has called /transcribe; the audio is
         persisted but the user is still editing lyrics. /generate will
         flip the row to processing/queued once the segments come in.
+      - "awaiting_upload": browser is still PUTting bytes directly to
+        R2 via a presigned URL. /transcribe-uploaded promotes to
+        transcribed_pending once the upload completes.
     """
-    if initial_status not in ("processing", "queued", "transcribed_pending"):
+    valid_states = (
+        "processing", "queued", "transcribed_pending", "awaiting_upload",
+    )
+    if initial_status not in valid_states:
         raise ValueError(f"unsupported initial_status {initial_status!r}")
     job_id = uuid.uuid4().hex[:12]
     job = Job(
@@ -48,6 +54,7 @@ def create_job(
         current_step=(
             "whisper" if initial_status == "processing"
             else "queued" if initial_status == "queued"
+            else "uploading" if initial_status == "awaiting_upload"
             else "editing"
         ),
         progress=0,
