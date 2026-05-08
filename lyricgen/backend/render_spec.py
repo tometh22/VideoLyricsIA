@@ -89,6 +89,72 @@ class RenderSpec:
         )
 
     @staticmethod
+    def umg_intermediate_master(umg_spec: dict) -> "RenderSpec":
+        """Intermediate MP4 (h264 yuv420p aac mp4) at the EXACT UMG master
+        dims + fps. This is what `pipeline.run_pipeline` renders when a UMG
+        delivery is requested, instead of the legacy YouTube spec.
+
+        Why: rendering directly to ProRes via moviepy hangs on the palindrome
+        loop (the original "dual render" failure). But rendering to ProRes
+        from a 1920×1080/24fps source via ffmpeg's scale+fps filters
+        introduces frame-rate-conversion + chroma-stretch artifacts that
+        UMG's manual QC rejects. Solution: render the cheap codec at the
+        UMG target dims+fps, and the lazy ProRes transcode becomes a pure
+        codec/audio/container swap (no scale, no fps filter).
+        """
+        if "frame_size" not in umg_spec or "fps" not in umg_spec:
+            raise ValueError(
+                "umg_intermediate_master needs umg_spec with frame_size + fps"
+            )
+        frame_size = umg_spec["frame_size"]
+        if frame_size not in UMG_FRAME_SIZES:
+            raise ValueError(
+                f"Invalid UMG frame_size '{frame_size}'. "
+                f"Allowed: {list(UMG_FRAME_SIZES)}"
+            )
+        fps = float(umg_spec["fps"])
+        if fps not in UMG_FPS:
+            raise ValueError(f"Invalid UMG fps {fps}. Allowed: {list(UMG_FPS)}")
+
+        dims = UMG_FRAME_SIZES[frame_size]
+        return RenderSpec(
+            profile="umg_intermediate",
+            width=dims["width"], height=dims["height"],
+            fps=fps,
+            dar=dims["dar"],
+            codec="libx264",
+            prores_profile=None,
+            pix_fmt="yuv420p",
+            audio_codec="aac",
+            color_primaries="bt709",
+            container="mp4",
+        )
+
+    @staticmethod
+    def umg_intermediate_short(umg_spec: dict) -> "RenderSpec":
+        """Intermediate MP4 short (1080×1920 9:16 h264) at UMG fps. Renders
+        the vertical short at the same fps the UMG master will use, so the
+        lazy `umg_short.mov` transcode is a pure recode just like the master.
+        """
+        if "fps" not in umg_spec:
+            raise ValueError("umg_intermediate_short needs umg_spec with fps")
+        fps = float(umg_spec["fps"])
+        if fps not in UMG_FPS:
+            raise ValueError(f"Invalid UMG fps {fps}. Allowed: {list(UMG_FPS)}")
+        return RenderSpec(
+            profile="umg_intermediate",
+            width=1080, height=1920,
+            fps=fps,
+            dar=(9, 16),
+            codec="libx264",
+            prores_profile=None,
+            pix_fmt="yuv420p",
+            audio_codec="aac",
+            color_primaries="bt709",
+            container="mp4",
+        )
+
+    @staticmethod
     def umg(frame_size: str, fps: float, prores_profile: int) -> "RenderSpec":
         if frame_size not in UMG_FRAME_SIZES:
             raise ValueError(

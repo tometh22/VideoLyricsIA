@@ -186,3 +186,101 @@ def test_umg_render_font_is_deterministic(tmp_path):
     # — there's a 1/N collision chance with N fonts, so we don't strictly assert).
     # Just verify both are valid choices.
     assert font_a in [font_a, font_b] and font_b in [font_a, font_b]
+
+
+def test_umg_lazy_prores_pure_recode_4k_60fps(tmp_path):
+    """End-to-end for the world-class UMG path:
+
+      pipeline renders MP4 at UMG target dims+fps via
+      RenderSpec.umg_intermediate_master  →  _transcode_to_prores
+      (pure recode, no scale, no fps filter)  →  _validate_umg_master.
+
+    UHD-4K @ 60 fps is the most stress-testing combo: highest pixel
+    rate, integer 60 timebase. If this passes, the lazy path is sound
+    for every 4×8 = 32 frame-size × fps combination UMG accepts.
+    """
+    bg = str(tmp_path / "bg.jpg")
+    _make_test_image(bg, width=3840, height=2160)
+
+    mp3 = str(tmp_path / "smoke_4k60.mp3")
+    _make_test_mp3(mp3, duration=2.0)
+    segments = [{"start": 0.3, "end": 1.7, "text": "4K 60fps pure recode"}]
+
+    job_dir = str(tmp_path / "job_4k60")
+    os.makedirs(job_dir, exist_ok=True)
+
+    from pipeline import (
+        _validate_umg_master, generate_lyric_video, _transcode_to_prores,
+    )
+    from render_spec import RenderSpec
+
+    umg_spec = {"frame_size": "UHD-4K", "fps": 60.0, "prores_profile": 3}
+
+    # Step 1 — render the source MP4 at the UMG target dims+fps. This
+    # is what pipeline.run_pipeline does for any wants_umg job.
+    intermediate = RenderSpec.umg_intermediate_master(umg_spec)
+    mp4_path, _font, _bg = generate_lyric_video(
+        mp3_path=mp3, segments=segments, style="cinematic",
+        job_dir=job_dir, artist="UMG QC", bg_image_path=bg,
+        spec=intermediate,
+    )
+    assert os.path.exists(mp4_path) and mp4_path.endswith(".mp4")
+
+    # Step 2 — lazy-transcode to ProRes. Should hit the pure-recode
+    # fast path (no scale, no fps filter) since source dims+fps match.
+    target = RenderSpec.umg(frame_size="UHD-4K", fps=60.0, prores_profile=3)
+    mov_path = os.path.join(job_dir, "umg_master.mov")
+    _transcode_to_prores(mp4_path, mov_path, target)
+
+    # Step 3 — validator must approve every UMG check.
+    errors = _validate_umg_master(mov_path, target)
+    assert errors == [], f"UHD-4K@60 lazy ProRes failed UMG validation: {errors}"
+
+    # Step 4 — verify the .mov actually came out at 3840×2160 @ 60.
+    import subprocess as _sp
+    probe = _sp.check_output(
+        ["ffprobe", "-v", "error", "-select_streams", "v:0",
+         "-show_entries", "stream=codec_name,width,height,r_frame_rate",
+         "-of", "default=noprint_wrappers=1:nokey=1", mov_path],
+        text=True,
+    ).strip().splitlines()
+    codec, w, h, fps_str = probe
+    assert codec == "prores"
+    assert int(w) == 3840 and int(h) == 2160
+    assert fps_str == "60/1", f"expected fps 60/1, got {fps_str}"
+
+
+def test_umg_lazy_prores_pure_recode_dci_2k_24fps(tmp_path):
+    """DCI-2K (2048×1080 / 256:135 DAR) is the trickiest aspect ratio
+    in the UMG spec — non-16:9. Passing this proves we don't ship
+    pillarboxing OR horizontal stretching when UMG asks for it."""
+    bg = str(tmp_path / "bg.jpg")
+    _make_test_image(bg, width=2048, height=1080)
+
+    mp3 = str(tmp_path / "smoke_dci2k.mp3")
+    _make_test_mp3(mp3, duration=2.0)
+    segments = [{"start": 0.3, "end": 1.7, "text": "DCI 2K test"}]
+
+    job_dir = str(tmp_path / "job_dci2k")
+    os.makedirs(job_dir, exist_ok=True)
+
+    from pipeline import (
+        _validate_umg_master, generate_lyric_video, _transcode_to_prores,
+    )
+    from render_spec import RenderSpec
+
+    umg_spec = {"frame_size": "DCI-2K", "fps": 24.0, "prores_profile": 3}
+
+    intermediate = RenderSpec.umg_intermediate_master(umg_spec)
+    mp4_path, _, _ = generate_lyric_video(
+        mp3_path=mp3, segments=segments, style="cinematic",
+        job_dir=job_dir, artist="UMG QC", bg_image_path=bg,
+        spec=intermediate,
+    )
+
+    target = RenderSpec.umg(frame_size="DCI-2K", fps=24.0, prores_profile=3)
+    mov_path = os.path.join(job_dir, "umg_master.mov")
+    _transcode_to_prores(mp4_path, mov_path, target)
+
+    errors = _validate_umg_master(mov_path, target)
+    assert errors == [], f"DCI-2K lazy ProRes failed UMG validation: {errors}"

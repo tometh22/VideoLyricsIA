@@ -180,3 +180,78 @@ def test_text_scale_baseline_at_1080p():
 def test_text_scale_doubles_at_2160p():
     spec = RenderSpec.umg(frame_size="UHD-4K", fps=24.0, prores_profile=3)
     assert spec.text_scale == 2.0
+
+
+# ---------------------------------------------------------------------------
+# UMG intermediate specs — what pipeline.run_pipeline renders when wants_umg.
+# These are the world-class UMG path: render the cheap codec at the EXACT
+# UMG target dims+fps so the lazy ProRes transcode is a pure recode.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("frame_size,expected_dims,expected_dar", [
+    ("HD",     (1920, 1080), (16, 9)),
+    ("UHD-4K", (3840, 2160), (16, 9)),
+    ("DCI-2K", (2048, 1080), (256, 135)),
+    ("DCI-4K", (4096, 2160), (256, 135)),
+])
+def test_umg_intermediate_master_matches_target_dims(
+    frame_size, expected_dims, expected_dar,
+):
+    spec = RenderSpec.umg_intermediate_master({
+        "frame_size": frame_size, "fps": 24.0, "prores_profile": 3,
+    })
+    # Dims + DAR mirror the final UMG master (the whole point).
+    assert (spec.width, spec.height) == expected_dims
+    assert spec.dar == expected_dar
+    # Codec is cheap (MP4 / h264 / yuv420p / aac) — the ProRes encoder
+    # only runs lazily, never inside moviepy at render time.
+    assert spec.codec == "libx264"
+    assert spec.pix_fmt == "yuv420p"
+    assert spec.audio_codec == "aac"
+    assert spec.container == "mp4"
+    assert spec.profile == "umg_intermediate"
+
+
+@pytest.mark.parametrize("fps", [23.976, 24.0, 25.0, 29.97, 30.0, 50.0, 59.94, 60.0])
+def test_umg_intermediate_master_carries_target_fps(fps):
+    spec = RenderSpec.umg_intermediate_master({
+        "frame_size": "HD", "fps": fps, "prores_profile": 3,
+    })
+    assert spec.fps == fps
+
+
+def test_umg_intermediate_master_uses_rational_for_fractional_fps():
+    # Same rational mapping as RenderSpec.umg so the lazy transcode's
+    # "source fps == target fps" check matches exactly.
+    spec = RenderSpec.umg_intermediate_master({
+        "frame_size": "HD", "fps": 23.976, "prores_profile": 3,
+    })
+    assert spec.fps_str == "24000/1001"
+
+
+def test_umg_intermediate_short_is_vertical_at_umg_fps():
+    spec = RenderSpec.umg_intermediate_short({
+        "frame_size": "DCI-4K", "fps": 60.0, "prores_profile": 3,
+    })
+    # Short ignores the master frame_size — always vertical 1080×1920.
+    # Only fps follows umg_spec so the lazy ProRes short pure-recodes.
+    assert (spec.width, spec.height) == (1080, 1920)
+    assert spec.dar == (9, 16)
+    assert spec.fps == 60.0
+    assert spec.codec == "libx264"
+    assert spec.container == "mp4"
+
+
+def test_umg_intermediate_master_rejects_invalid_frame_size():
+    with pytest.raises(ValueError, match="frame_size"):
+        RenderSpec.umg_intermediate_master({
+            "frame_size": "8K", "fps": 24.0, "prores_profile": 3,
+        })
+
+
+def test_umg_intermediate_master_rejects_invalid_fps():
+    with pytest.raises(ValueError, match="fps"):
+        RenderSpec.umg_intermediate_master({
+            "frame_size": "HD", "fps": 120.0, "prores_profile": 3,
+        })

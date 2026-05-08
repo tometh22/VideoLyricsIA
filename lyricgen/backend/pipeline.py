@@ -393,21 +393,29 @@ def run_pipeline(job_id: str, mp3_path: str, artist: str, style: str,
                     "passed": True, "issues": [], "rejections": rejection_log,
                 })
 
-        # Step 2 — YouTube lyric video (H.264 / MP4 / 1080p / 24fps).
-        # Always render the MP4 when ANY delivery profile is requested.
-        # The UMG ProRes is now generated lazily at download time from
-        # this MP4 (see _transcode_mp4_to_prores + the /download/{id}/
-        # umg_master endpoint), so the second render that used to live
-        # at Step 2b is gone. That eliminates the duplicate moviepy
-        # palindrome-hang exposure the operator hit on every
-        # delivery_profile in (umg, both).
+        # Step 2 — Render the source MP4 (H.264 yuv420p aac mp4).
+        # Always rendered when ANY delivery profile is requested. The UMG
+        # ProRes is generated lazily at download time from this MP4
+        # (see _transcode_to_prores + /download/{id}/umg_master) so we
+        # avoid the dual-render moviepy-palindrome hang.
+        #
+        # WHEN UMG IS REQUESTED, render the MP4 at the EXACT UMG target
+        # dimensions and fps (still cheap codec). The lazy ProRes
+        # transcode then becomes a pure codec/audio/container swap — no
+        # ffmpeg scale, no fps interpolation, no chroma stretch. This
+        # is what makes the master pass UMG manual QC for any of the
+        # 4 frame sizes × 8 fps the spec sheet allows.
         if wants_youtube or wants_umg:
             if wants_umg and not umg_spec:
                 raise RuntimeError("UMG delivery requested without umg_spec")
             update_job(job_id, current_step="video", progress=40)
+            intermediate_spec = (
+                RenderSpec.umg_intermediate_master(umg_spec) if wants_umg
+                else None  # generate_lyric_video defaults to youtube_default
+            )
             _, chosen_font, bg_source = generate_lyric_video(
                 mp3_path, segments, style, job_dir, artist, bg_image_path,
-                font=chosen_font,
+                font=chosen_font, spec=intermediate_spec,
             )
             files["video_url"] = f"/download/{job_id}/video"
             update_job(job_id, progress=55)
@@ -422,14 +430,14 @@ def run_pipeline(job_id: str, mp3_path: str, artist: str, style: str,
             files["umg_master_url"] = f"/download/{job_id}/umg_master"
             files["umg_short_url"] = f"/download/{job_id}/umg_short"
 
-        # Step 3 — YouTube Short. Generated for any profile that
-        # asked for video/UMG so the operator/UMG team always has the
-        # short clip even on UMG-only orders.
+        # Step 3 — Short (1080×1920 vertical). Same fps as the master
+        # when UMG-bound so the lazy ProRes short is also a pure recode.
         if wants_youtube or wants_umg:
             update_job(job_id, current_step="short", progress=75)
+            short_fps = float(umg_spec["fps"]) if wants_umg else 24
             generate_short(
                 mp3_path, segments, job_dir, bg_source=bg_source,
-                style=style, font=chosen_font,
+                style=style, font=chosen_font, fps=short_fps,
             )
             files["short_url"] = f"/download/{job_id}/short"
             update_job(job_id, progress=85)
@@ -3843,6 +3851,24 @@ def _short_prores_spec(umg_spec: dict) -> "RenderSpec":
     )
 
 
+def _probe_dims_fps(path: str) -> tuple[int, int, str] | None:
+    """ffprobe v:0 to extract (width, height, r_frame_rate). Returns None
+    on any failure — caller falls back to the legacy scale+fps path so a
+    flaky probe never breaks an otherwise-valid transcode."""
+    try:
+        out = subprocess.check_output(
+            ["ffprobe", "-v", "error", "-select_streams", "v:0",
+             "-show_entries", "stream=width,height,r_frame_rate",
+             "-of", "default=noprint_wrappers=1:nokey=1", path],
+            text=True, timeout=30,
+        ).strip().splitlines()
+        if len(out) < 3:
+            return None
+        return int(out[0]), int(out[1]), out[2]
+    except Exception:
+        return None
+
+
 def _transcode_to_prores(input_path: str, mov_path: str,
                           spec: "RenderSpec",
                           timeout_sec: int = 600) -> None:
@@ -3853,6 +3879,22 @@ def _transcode_to_prores(input_path: str, mov_path: str,
     instead of running a second moviepy render at pipeline time.
     ffmpeg only — no moviepy involvement — so the moviepy palindrome-
     loop hang that breaks the dual-render path doesn't apply here.
+
+    PURE RECODE FAST PATH (the world-class case for UMG):
+    when the source MP4 is already at the exact target dimensions and
+    fps (which is what `pipeline.run_pipeline` produces for any
+    delivery_profile in (umg, both) since the world-class refactor),
+    we skip the `scale=` and `fps=` filters entirely. Frames pass
+    through 1:1 — no chroma stretch, no fps interpolation. UMG's
+    manual QC explicitly rejects frame-rate-conversion artifacts, so
+    this path is what makes the master shippable for any of the 4 ×
+    8 frame-size × fps combinations they accept.
+
+    LEGACY SCALE+FPS PATH:
+    when the source dims/fps don't match (older jobs rendered before
+    the refactor, or a custom upload route that bypasses the spec),
+    fall back to the previous behaviour with `scale=lanczos` +
+    `fps=`. Logs a warning because the output may fail UMG manual QC.
 
     Args:
       input_path: path to the existing source mp4 (lyric_video.mp4
@@ -3866,32 +3908,48 @@ def _transcode_to_prores(input_path: str, mov_path: str,
 
     The output passes _validate_umg_master under normal conditions:
       - codec=prores_ks, profile per spec
-      - exact width × height (lanczos scale)
-      - fps via -r (rational for fractional fps), enforced on the
-        bitstream so ffprobe reports the same value
+      - exact width × height (no scale on fast path; lanczos on legacy)
+      - fps via -r (rational for fractional fps); skipped on fast path
+        so the bitstream timebase comes straight from the source
       - audio re-encoded to pcm_s24le @ 48 kHz @ 2 ch
       - bt709 color tags, progressive, mov container, DAR per spec.
 
     Raises RuntimeError on ffmpeg failure or post-transcode validation
     failure. The caller is responsible for cleaning up partial output.
     """
+    src = _probe_dims_fps(input_path)
+    pure_recode = (
+        src is not None
+        and src[0] == spec.width
+        and src[1] == spec.height
+        and src[2] == spec.fps_str
+    )
+
+    vf_chain = (
+        # Fast path: SAR normalize + BT.709 metadata stamp. No scale,
+        # no fps — frames go through 1:1.
+        "setsar=1,setparams=colorspace=bt709:"
+        "color_primaries=bt709:color_trc=bt709:range=tv"
+        if pure_recode
+        else
+        # Legacy path: scale + fps conversion (may produce QC-failing
+        # artifacts; logged below).
+        f"scale={spec.width}:{spec.height}:flags=lanczos,"
+        f"fps={spec.fps_str},setsar=1,"
+        f"setparams=colorspace=bt709:color_primaries=bt709:"
+        f"color_trc=bt709:range=tv"
+    )
+
     cmd = [
         "ffmpeg", "-y", "-loglevel", "error",
         "-i", input_path,
-        # Video filter chain: scale to target dims (lanczos quality),
-        # force fps, normalize SAR (so DAR is set purely by -aspect),
-        # then `setparams` writes BT.709 colorspace metadata onto each
-        # frame BEFORE the encoder consumes it. setparams is more
-        # reliable for ProRes than the `colorspace` filter (which
-        # rewrites pixel data + sometimes drops metadata) or the
-        # stream-level -colorspace flag (which gets ignored by
-        # prores_ks bitstream coefficients).
-        "-vf",
-        f"scale={spec.width}:{spec.height}:flags=lanczos,"
-        f"fps={spec.fps_str},"
-        f"setsar=1,"
-        f"setparams=colorspace=bt709:color_primaries=bt709:color_trc=bt709:range=tv",
-        "-r", spec.fps_str,
+        "-vf", vf_chain,
+    ]
+    if not pure_recode:
+        # Force the timebase only when we're converting fps; the fast
+        # path inherits the source fps which is already exact.
+        cmd += ["-r", spec.fps_str]
+    cmd += [
         "-c:v", "prores_ks",
         "-profile:v", str(spec.prores_profile),
         "-pix_fmt", spec.pix_fmt,
@@ -3909,9 +3967,20 @@ def _transcode_to_prores(input_path: str, mov_path: str,
         "-f", "mov",
         mov_path,
     ]
-    print(f"[PRORES] transcoding {os.path.basename(input_path)} → "
-          f"{os.path.basename(mov_path)} ({spec.width}×{spec.height} @ "
-          f"{spec.fps_str}, profile {spec.prores_profile})")
+
+    if pure_recode:
+        print(f"[PRORES] pure-recode {os.path.basename(input_path)} → "
+              f"{os.path.basename(mov_path)} ({spec.width}×{spec.height} @ "
+              f"{spec.fps_str}, profile {spec.prores_profile}) — "
+              f"source dims+fps match target, no scale/fps filter.")
+    else:
+        src_desc = f"{src[0]}×{src[1]}@{src[2]}" if src else "unknown"
+        print(f"[PRORES] LEGACY scale+fps {os.path.basename(input_path)} "
+              f"({src_desc}) → {os.path.basename(mov_path)} "
+              f"({spec.width}×{spec.height} @ {spec.fps_str}, "
+              f"profile {spec.prores_profile}). "
+              f"WARNING: source mismatch may produce frame-rate-"
+              f"conversion artifacts that fail UMG manual QC.")
     result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout_sec)
     if result.returncode != 0:
         # Best-effort cleanup of a partial file before raising.
@@ -4430,8 +4499,14 @@ def generate_short(
     bg_source: str | None = None,
     style: str = "oscuro",
     font: str = "Arial",
+    fps: float = 24,
 ) -> str:
-    """Generate a 1080x1920 vertical short from the chorus section."""
+    """Generate a 1080x1920 vertical short from the chorus section.
+
+    `fps` is propagated to the final write so the lazy ProRes short can
+    do a pure recode when UMG asks for a non-24 frame rate. Stays at 24
+    by default for the YouTube-only path.
+    """
     audio = AudioFileClip(mp3_path)
     start_time = _find_chorus_start(segments)
     end_time = min(start_time + 30, audio.duration)
@@ -4479,7 +4554,7 @@ def generate_short(
     out_path = os.path.join(job_dir, "short.mp4")
     final.write_videofile(
         out_path,
-        fps=24,
+        fps=fps,
         codec="libx264",
         audio_codec="aac",
         threads=4,
