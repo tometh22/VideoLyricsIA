@@ -76,3 +76,31 @@ def user_token(client):
 def auth(token):
     """Helper: return auth headers."""
     return {"Authorization": f"Bearer {token}"}
+
+
+def pytest_unconfigure(config):
+    """Hard-exit after pytest fully finishes (including its terminal summary).
+
+    Some native libraries we depend on (moviepy/ImageMagick subprocess
+    pools, boto3+urllib3 connection pools, librosa+audioread C
+    extensions) leak threads or hold open handles that get destroyed
+    in random order during interpreter shutdown. On CI Ubuntu runners
+    that's been surfacing as `terminate called without an active
+    exception` followed by SIGABRT (exit 134) — pytest reports
+    "246 passed" and the runner still marks the job failed because of
+    the post-summary abort.
+
+    `pytest_unconfigure` is the LAST pytest hook to fire, after the
+    terminal reporter has already printed the "X passed in Ys" summary.
+    Calling os._exit() here preserves the visible summary and the real
+    exit status, while bypassing the leaky teardown. xdist workers run
+    a separate plugin lifecycle, so their cleanup is unaffected.
+    """
+    if os.environ.get("PYTEST_XDIST_WORKER"):
+        return
+    # `config.testsfailed` is the integer count of failed tests; non-zero
+    # means we should propagate failure.
+    exitstatus = 1 if getattr(config, "testsfailed", 0) else 0
+    sys.stdout.flush()
+    sys.stderr.flush()
+    os._exit(exitstatus)
