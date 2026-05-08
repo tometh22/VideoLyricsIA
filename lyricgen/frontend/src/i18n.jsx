@@ -260,6 +260,19 @@ const translations = {
     "batch.validation_failed": "Validacion fallida",
     "batch.error_server": "Error al procesar. Intentá de nuevo.",
     "batch.confirm_cancel": "Hay videos en proceso. ¿Seguro que querés cancelar?",
+    // Soft-queue messages — shown in amber on the job row when an
+    // upload is being held back by capacity pressure. The user
+    // never sees these as red errors; the retry happens
+    // transparently in the background.
+    "batch.queue_team_backlog": "Esperando que se libere un lugar en el equipo. Te subimos solos en cuanto haya espacio.",
+    "batch.queue_server_busy": "Servidor saturado momentáneamente. Reintentamos solos en unos minutos.",
+    "batch.queue_rate_limit": "Subiendo… reintentamos en unos segundos.",
+
+    // ProRes status badge
+    "prores.ready": "ProRes listo",
+    "prores.ready_tooltip": "El máster ProRes ya está cacheado. Descargá cuando quieras.",
+    "prores.generating": "Generando ProRes…",
+    "prores.generating_tooltip": "El máster ProRes se está generando en segundo plano. Tarda 1-3 minutos para HD, 3-5 para 4K.",
 
     // Provenance (UMG compliance)
     "prov.title": "Provenance IA",
@@ -683,6 +696,14 @@ const translations = {
     "batch.pending_review": "Pending review",
     "batch.validation_failed": "Validation failed",
     "batch.error_server": "Processing error. Please try again.",
+    "batch.queue_team_backlog": "Waiting for a free slot on your team. We'll resume the upload automatically when one frees up.",
+    "batch.queue_server_busy": "Server is busy for a moment. We'll retry automatically in a few minutes.",
+    "batch.queue_rate_limit": "Uploading… retrying in a few seconds.",
+
+    "prores.ready": "ProRes ready",
+    "prores.ready_tooltip": "The ProRes master is cached and ready to download.",
+    "prores.generating": "Generating ProRes…",
+    "prores.generating_tooltip": "The ProRes master is being generated in the background. Takes 1-3 minutes for HD, 3-5 for 4K.",
     "batch.confirm_cancel": "There are videos still processing. Are you sure you want to cancel?",
 
     "prov.title": "AI Provenance",
@@ -1090,6 +1111,15 @@ const translations = {
     "batch.generated": "gerados",
     "batch.download_all": "Baixar tudo",
     "batch.new_batch": "Criar mais vídeos",
+    "batch.queue_team_backlog": "Aguardando uma vaga livre na sua equipe. Vamos retomar o upload automaticamente assim que liberar.",
+    "batch.queue_server_busy": "Servidor ocupado por um momento. Vamos tentar de novo automaticamente em alguns minutos.",
+    "batch.queue_rate_limit": "Enviando… tentando de novo em alguns segundos.",
+
+    "prores.ready": "ProRes pronto",
+    "prores.ready_tooltip": "O master ProRes está em cache e pronto para baixar.",
+    "prores.generating": "Gerando ProRes…",
+    "prores.generating_tooltip": "O master ProRes está sendo gerado em segundo plano. Demora 1-3 minutos para HD, 3-5 para 4K.",
+
     "batch.queued": "Na fila",
     "batch.in_progress": "Em progresso",
     "batch.validating": "Validando conteudo",

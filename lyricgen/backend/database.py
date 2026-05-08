@@ -235,11 +235,22 @@ class Job(Base):
         }
 
     def to_list_dict(self):
+        # `prores_ready` lets the dashboard / history cards show a
+        # subtle badge ("✓ ProRes" vs "⏳ Generando ProRes") without
+        # needing a second round-trip per row. Truthy iff the lazy
+        # transcode has both deliverables on R2.
+        s3 = self.s3_keys or {}
+        wants_umg = (self.delivery_profile or "youtube") in ("umg", "both")
         return {
             "job_id": self.job_id,
             "status": self.status,
             "artist": self.artist,
             "filename": self.filename,
+            "delivery_profile": self.delivery_profile,
+            "prores_ready": (
+                bool(s3.get("umg_master")) and bool(s3.get("umg_short"))
+                if wants_umg else None
+            ),
             "created_at": self.created_at.timestamp() if self.created_at else None,
         }
 
