@@ -446,6 +446,89 @@ def test_transcribe_uploaded_409_when_multipart_incomplete(client, monkeypatch):
 # ---------------------------------------------------------------------------
 
 
+def test_generate_accepts_awaiting_upload_for_direct_path(client, monkeypatch):
+    """processQueueDirect calls /generate with the job_id from /upload-url
+    (status=awaiting_upload) and segments_json='[]'. The worker runs
+    Whisper itself. /generate must accept this; the original reuse path
+    only allowed transcribed_pending."""
+    import main
+    from database import SessionLocal
+    from jobs import get_job_model
+
+    _, token, _, _ = _make_user(client)
+    monkeypatch.setattr("main.storage.is_enabled", lambda: True)
+    monkeypatch.setattr(
+        "main.storage.presign_put_url",
+        lambda *a, **k: {"url": "x", "key": "inputs/x/y/z.wav", "expires_in": 900},
+    )
+    monkeypatch.setattr("main.enqueue_pipeline", lambda **kw: "thread:fake")
+    monkeypatch.setattr(main, "_enforce_disk_capacity", lambda: None)
+    monkeypatch.setattr(main, "_enforce_memory_pressure", lambda: None)
+
+    job_id = client.post(
+        "/upload-url",
+        json={"filename": "z.wav", "size_bytes": 1024},
+        headers=auth(token),
+    ).json()["job_id"]
+
+    res = client.post(
+        "/generate",
+        data={
+            "job_id": job_id,
+            "artist": "X",
+            "style": "oscuro",
+            "segments_json": "[]",
+            "delivery_profile": "youtube",
+        },
+        headers=auth(token),
+    )
+    assert res.status_code == 200, res.text
+
+    s = SessionLocal()
+    try:
+        assert get_job_model(s, job_id).status == "queued"
+    finally:
+        s.close()
+
+
+def test_generate_rejects_awaiting_upload_with_incomplete_multipart(client, monkeypatch):
+    """Same as above but the multipart upload is still in flight (no
+    /upload-multipart-complete). Must 409 — the worker can't fetch a
+    half-uploaded object."""
+    import main
+    _, token, _, _ = _make_user(client)
+    monkeypatch.setattr("main.storage.is_enabled", lambda: True)
+    monkeypatch.setattr(main, "_MULTIPART_THRESHOLD_BYTES", 1)
+    monkeypatch.setattr(
+        "main.storage.multipart_init",
+        lambda *a, **k: {"upload_id": "UP", "key": "inputs/x/y/z.wav"},
+    )
+
+    job_id = client.post(
+        "/upload-url",
+        json={"filename": "z.wav", "size_bytes": 60 * 1024 * 1024},
+        headers=auth(token),
+    ).json()["job_id"]
+    client.post(
+        "/upload-multipart-init",
+        json={"job_id": job_id, "filename": "z.wav"},
+        headers=auth(token),
+    )
+
+    res = client.post(
+        "/generate",
+        data={
+            "job_id": job_id,
+            "artist": "X",
+            "style": "oscuro",
+            "segments_json": "[]",
+            "delivery_profile": "youtube",
+        },
+        headers=auth(token),
+    )
+    assert res.status_code == 409
+
+
 def test_legacy_upload_emits_deprecation_headers(client, monkeypatch):
     """The legacy multipart-form /upload still works for direct API
     callers but flags itself with Deprecation + Sunset headers so we can

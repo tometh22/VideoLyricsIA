@@ -2271,19 +2271,39 @@ async def generate_with_segments(
     reuse = bool(job_id)
 
     if reuse:
-        # Reuse path: verify the transcribed_pending job belongs to caller
-        # and pull the audio path / R2 key from the row.
+        # Reuse path: verify the job belongs to caller and pull the audio
+        # path / R2 key from the row. Two valid entry states:
+        #   - transcribed_pending: editor flow (segments came from
+        #     /transcribe-uploaded; segments_json carries the user-edited
+        #     timings).
+        #   - awaiting_upload: direct-generate flow (no editor;
+        #     segments_json is "[]" so the worker runs Whisper itself
+        #     against the audio that already landed in R2).
         from jobs import get_job_model
         job_row = get_job_model(db, job_id)
         if (not job_row
                 or job_row.user_id != current_user["id"]
                 or job_row.tenant_id != current_user["tenant_id"]):
             raise HTTPException(status_code=404, detail="Job not found.")
-        if job_row.status != "transcribed_pending":
+        if job_row.status not in ("transcribed_pending", "awaiting_upload"):
             raise HTTPException(
                 status_code=409,
-                detail=f"Job is in state {job_row.status!r}, not transcribed_pending.",
+                detail=f"Job is in state {job_row.status!r}, cannot generate.",
             )
+        if job_row.status == "awaiting_upload":
+            # Direct-generate path. The R2 PUT must be finished (no
+            # in-flight multipart) and the key must be recorded — without
+            # those, the worker has nothing to fetch.
+            if job_row.multipart_upload_id:
+                raise HTTPException(
+                    status_code=409,
+                    detail="Multipart upload not completed yet.",
+                )
+            if not job_row.input_r2_key:
+                raise HTTPException(
+                    status_code=409,
+                    detail="Job has no associated upload.",
+                )
         existing_filename = job_row.filename
         existing_input_r2_key = job_row.input_r2_key
     else:
