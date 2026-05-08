@@ -185,11 +185,45 @@ def _email_owner(reaped: list[Job]) -> None:
         logger.warning(f"reaper email failed: {e}")
 
 
+# Postgres advisory lock key. 64-bit signed int, must be the same
+# across every replica that wants to coordinate. The constant is
+# arbitrary; just don't reuse it elsewhere in the app.
+_REAPER_ADVISORY_LOCK_KEY = 9118364455199101
+
+
 def reap_all_stuck(threshold_min: int = _DEFAULT_THRESHOLD_MIN) -> int:
     """One pass. Owns its own DB session — safe to call from a worker
-    thread or a scheduled task. Returns the count of reaped jobs."""
+    thread or a scheduled task. Returns the count of reaped jobs.
+
+    Uses pg_try_advisory_lock so when the API scales horizontally
+    (Railway > 1 replica), only one instance does the reap pass per
+    cycle. Without this, every replica's reaper thread runs in
+    parallel — the work is idempotent but it's 2-3× the DB load and
+    triplicates the Sentry/email notification noise.
+
+    SQLite (tests) silently no-ops the lock and proceeds — the test
+    suite never has competing reapers.
+    """
     db = SessionLocal()
     try:
+        # Try to take the advisory lock. pg_try_advisory_lock is non-
+        # blocking; if another replica already has it, returns false
+        # and we skip this cycle entirely. The lock auto-releases on
+        # session close (we always close in finally below).
+        is_postgres = db.bind.dialect.name == "postgresql"
+        if is_postgres:
+            from sqlalchemy import text
+            got = db.execute(
+                text("SELECT pg_try_advisory_lock(:k)"),
+                {"k": _REAPER_ADVISORY_LOCK_KEY},
+            ).scalar()
+            if not got:
+                logger.debug(
+                    "reaper: another replica holds the advisory lock; "
+                    "skipping this cycle",
+                )
+                return 0
+
         stuck = find_stuck_jobs(db, threshold_min)
         if not stuck:
             return 0
@@ -201,6 +235,20 @@ def reap_all_stuck(threshold_min: int = _DEFAULT_THRESHOLD_MIN) -> int:
         for job in stuck:
             db.expunge(job)
     finally:
+        # Releasing the advisory lock is implicit on session close
+        # (Postgres releases all session-scoped locks automatically),
+        # but we call pg_advisory_unlock explicitly for clarity and
+        # to fail fast if pool reuse ever changes the behaviour.
+        if 'is_postgres' in locals() and is_postgres:
+            try:
+                from sqlalchemy import text
+                db.execute(
+                    text("SELECT pg_advisory_unlock(:k)"),
+                    {"k": _REAPER_ADVISORY_LOCK_KEY},
+                )
+                db.commit()
+            except Exception:
+                pass
         db.close()
 
     # Side-effect notifications happen AFTER the DB commit so a failed

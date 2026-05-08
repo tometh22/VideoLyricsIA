@@ -3007,8 +3007,14 @@ def _generate_veo_video(prompt: str, output_path: str, job_id: str = None,
             if r.status_code == 429 or "RESOURCE_EXHAUSTED" in r.text:
                 rate_limit_hits += 1
                 last_error = f"HTTP {r.status_code} rate-limited"
-                wait = min(MAX_BACKOFF_S, 30 * (2 ** attempt))
-                print(f"[BG] Rate limited (HTTP {r.status_code}), waiting {wait}s before retry...")
+                # Capped exponential backoff + ±20 % jitter. Without
+                # jitter, N concurrent jobs that all hit a 429 at the
+                # same instant retry in lock-step → second wave of
+                # 429s → cascade. Jitter spreads the retry window so
+                # quota recovers naturally.
+                base = min(MAX_BACKOFF_S, 30 * (2 ** attempt))
+                wait = base * random.uniform(0.8, 1.2)
+                print(f"[BG] Rate limited (HTTP {r.status_code}), waiting {wait:.1f}s before retry...")
                 _time.sleep(wait)
                 continue
             if not r.ok:
@@ -3028,7 +3034,8 @@ def _generate_veo_video(prompt: str, output_path: str, job_id: str = None,
         except Exception as e:
             last_error = f"network/transient: {e}"
             print(f"[BG] Veo 3 attempt {attempt + 1} request error: {e}")
-            wait = min(MAX_BACKOFF_S, 15 * (2 ** attempt))
+            base = min(MAX_BACKOFF_S, 15 * (2 ** attempt))
+            wait = base * random.uniform(0.8, 1.2)
             _time.sleep(wait)
             continue
 
