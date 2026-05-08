@@ -280,7 +280,10 @@ export default function UploadZone({
   // change it from MP4/YouTube. The collapsed pill shows the current
   // value + a "Cambiar" affordance; click expands the listboxes.
   const _deliveryBlock = (
-    <div className="rounded-card bg-surface-2/40 ring-1 ring-white/[0.04] px-4 py-3">
+    <div
+      data-tour="upload-delivery"
+      className="rounded-card bg-surface-2/40 ring-1 ring-white/[0.04] px-4 py-3"
+    >
       {!deliveryExpanded ? (
         <button
           type="button"
