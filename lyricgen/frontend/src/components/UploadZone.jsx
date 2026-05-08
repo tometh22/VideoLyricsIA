@@ -32,6 +32,13 @@ const MAX_FILE_MB = 100;
 // with backend _AUDIO_EXTENSIONS.
 const ACCEPTED_EXTS = [".mp3", ".wav"];
 
+// WAV files above this threshold get an amber warning under the filename
+// — they upload fine for a single user, but slow connections and
+// concurrent batches can hit the API container's edge timeout / memory
+// cap and fail with a 502. The warning is informative, not a block:
+// UMG broadcast deliverables need lossless input.
+const WAV_SOFT_WARN_MB = 30;
+
 // Listbox-shape options (code/label) for the UMG ProRes triplet. The
 // underlying values stay the same as before — `code` strings get parsed
 // at submit time. Frame sizes are uppercase keys (HD, UHD-4K, …),
@@ -540,7 +547,17 @@ export default function UploadZone({
                     <path d="M9 18V5l12-2v13" /><circle cx="6" cy="18" r="3" /><circle cx="18" cy="16" r="3" />
                   </svg>
                 </div>
-                <p className="text-sm text-white truncate flex-1 min-w-0">{entry.file.name}</p>
+                <div className="flex-1 min-w-0">
+                  <p className="text-sm text-white truncate">{entry.file.name}</p>
+                  {entry.file.name.toLowerCase().endsWith(".wav") &&
+                   entry.file.size > WAV_SOFT_WARN_MB * 1024 * 1024 && (
+                    <p className="text-[11px] text-amber-400/80 mt-0.5 truncate">
+                      {t("batch.wav_warning_large", {
+                        sizeMB: Math.round(entry.file.size / (1024 * 1024)),
+                      })}
+                    </p>
+                  )}
+                </div>
                 <button
                   onClick={(e) => removeFile(i, e)}
                   className="shrink-0 w-7 h-7 rounded-lg hover:bg-red-500/10 flex items-center justify-center text-gray-500 hover:text-red-400 transition-colors"

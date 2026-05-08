@@ -187,6 +187,12 @@ class Job(Base):
     # Cloud storage keys (when deliverables are uploaded to R2/S3)
     s3_keys = Column(JSON, nullable=True)
 
+    # R2 key of the source audio uploaded by the user. Set by /transcribe
+    # so /generate can hand the worker the same file without forcing the
+    # browser to re-upload it (the previous flow uploaded the file twice
+    # and OOMed the API container on lossless WAVs).
+    input_r2_key = Column(String(500), nullable=True)
+
     # YouTube info
     youtube_data = Column(JSON, nullable=True)
 
@@ -427,6 +433,7 @@ def _migrate_user_columns():
         "ALTER TABLE users ADD COLUMN IF NOT EXISTS allow_overage BOOLEAN DEFAULT FALSE NOT NULL",
         "ALTER TABLE jobs ADD COLUMN IF NOT EXISTS umg_short_url VARCHAR(500)",
         "ALTER TABLE jobs ADD COLUMN IF NOT EXISTS song_title VARCHAR(500)",
+        "ALTER TABLE jobs ADD COLUMN IF NOT EXISTS input_r2_key VARCHAR(500)",
     ]
     with engine.begin() as conn:
         for sql in column_adds:
