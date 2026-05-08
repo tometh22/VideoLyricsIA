@@ -12,6 +12,11 @@ const FLAGS = {
   dashboard: "genly_tour_dashboard_done",
   upload:    "genly_tour_upload_done",
   editor:    "genly_tour_editor_done",
+  // jobdetail covers the approval workflow + ProRes download. Fires
+  // when the user lands on a pending_review job — that's the moment
+  // those affordances actually exist on screen and the explanation
+  // (rejecting is free, ProRes is a separate file, etc.) lands best.
+  jobdetail: "genly_tour_jobdetail_done",
 };
 
 export const TOUR_FLAG_KEYS = Object.values(FLAGS);
@@ -193,6 +198,12 @@ export function UploadTour({ user, forceRun = false, onDone }) {
         "La IA lo genera, lo elegís de la biblioteca de fondos pre-aprobados, o subís uno tuyo.",
     },
     {
+      target: '[data-tour="upload-delivery"]',
+      title: t("tour.upload_delivery_title") || "Formato de entrega",
+      content: t("tour.upload_delivery_body") ||
+        "MP4 H.264 1080p para YouTube, o ProRes 422 HQ + MP4 cuando el cliente pide máster broadcast (4K, DCI, etc.). Default es MP4.",
+    },
+    {
       target: '[data-tour="upload-cta-bar"]',
       title: t("tour.upload_cta_title") || "¿Revisar o generar directo?",
       content: t("tour.upload_cta_body") ||
@@ -249,6 +260,61 @@ export function EditorTour({ user, forceRun = false, onDone }) {
     },
   ], [t]);
   return <TourRunner flagKey={FLAGS.editor} steps={steps} user={user} forceRun={forceRun} onDone={onDone} />;
+}
+
+// ─── Tour 4: Job Detail (approval + delivery) ────────────────────
+// Mounted by JobDetail.jsx and only auto-fires when the user is
+// looking at a `pending_review` job for the first time. The
+// `hasUmgMaster` flag drives whether the ProRes step is included —
+// no point pointing at a button that isn't on screen for a
+// YouTube-only job.
+export function JobDetailTour({ user, hasUmgMaster = false, isPendingReview = false, forceRun = false, onDone }) {
+  const { t } = useI18n();
+  const steps = useMemo(() => {
+    const s = [];
+    if (isPendingReview || forceRun) {
+      s.push({
+        target: '[data-tour="jobdetail-status-badge"]',
+        title: t("tour.jobdetail_pending_title") || "Pendiente de aprobación",
+        content: t("tour.jobdetail_pending_body") ||
+          "El video se renderizó OK pero todavía no se entrega. Vos lo revisás antes de habilitar la descarga — así nada sale a un cliente sin que lo hayas mirado.",
+        disableBeacon: true,
+      });
+    }
+    s.push({
+      target: '[data-tour="jobdetail-preview"]',
+      title: t("tour.jobdetail_preview_title") || "Mirá el video",
+      content: t("tour.jobdetail_preview_body") ||
+        "Reproducí acá el lyric video, el short vertical y el thumbnail. Si algo está mal (lyric mal sincronizado, error de tipeo, fondo raro), rechazá.",
+      placement: "bottom",
+    });
+    if (isPendingReview || forceRun) {
+      s.push({
+        target: '[data-tour="jobdetail-approve-panel"]',
+        title: t("tour.jobdetail_approve_title") || "Aprobar o rechazar",
+        content: t("tour.jobdetail_approve_body") ||
+          "Aprobar habilita la descarga y consume 1 video de tu cuota mensual. Rechazar es gratis y no cuenta — usalo sin culpa si algo no convence.",
+        placement: "top",
+      });
+    }
+    s.push({
+      target: '[data-tour="jobdetail-download-all"]',
+      title: t("tour.jobdetail_download_title") || "Descargar todo",
+      content: t("tour.jobdetail_download_body") ||
+        "Bajás MP4 + Short + Thumbnail empaquetados. Para entrega a YouTube alcanza con esto.",
+    });
+    if (hasUmgMaster) {
+      s.push({
+        target: '[data-tour="jobdetail-prores-master"]',
+        title: t("tour.jobdetail_prores_title") || "Master ProRes",
+        content: t("tour.jobdetail_prores_body") ||
+          "Para entregas tipo UMG: descargás el .mov ProRes 422 HQ (BT.709, audio PCM 24-bit) que pasa QC manual. La primera vez tarda 1-2 min mientras se transcodea; las siguientes son instantáneas.",
+        placement: "bottom",
+      });
+    }
+    return s;
+  }, [t, hasUmgMaster, isPendingReview, forceRun]);
+  return <TourRunner flagKey={FLAGS.jobdetail} steps={steps} user={user} forceRun={forceRun} onDone={onDone} />;
 }
 
 // Helper for the Settings replay button.

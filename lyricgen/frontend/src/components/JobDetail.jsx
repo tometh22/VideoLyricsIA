@@ -1,6 +1,8 @@
 import { useState, useEffect, useRef } from "react";
 import { useI18n } from "../i18n";
 import { getDownloadUrl, useMediaUrl } from "../mediaUrl";
+import { JobDetailTour } from "./OnboardingTour";
+import ProResBadge from "./ProResBadge";
 
 const API = import.meta.env.VITE_API_URL || "";
 
@@ -15,12 +17,14 @@ const MEDIA_TABS = [
   { key: "thumbnail", label: "Thumbnail", desc: "1280x720" },
 ];
 
-// UMG master is added conditionally — only when delivery_profile is
-// "umg" or "both". ProRes 422 HQ in a .mov, not previewable in
-// browser, so the tab shows a download-only panel.
-const UMG_MASTER_TAB = {
+// Broadcast master tab — added conditionally only when the job's
+// delivery_profile is "umg" or "both". ProRes 422 HQ in a .mov, not
+// previewable in browser, so the tab shows a download-only panel.
+// (Internal `umg_master` key is preserved end-to-end on the wire so
+// existing jobs keep working; only the visible label is generic.)
+const PRORES_MASTER_TAB = {
   key: "umg_master",
-  label: "Máster UMG",
+  label: "Máster ProRes",
   desc: "ProRes 422 HQ · MOV",
 };
 
@@ -205,31 +209,64 @@ export default function JobDetail({ job, onBack, onJobUpdate }) {
       window.location.href = url;
     } catch {}
   };
-  // ProRes is generated lazily server-side from the existing MP4 the
-  // first time it's requested (~60-120 s of ffmpeg transcode). To avoid
-  // the "browser stuck" perception while ffmpeg runs, we fetch the .mov
-  // ourselves (so the toast can stay up for the full duration), then
-  // turn the response into a Blob URL and trigger a normal anchor
-  // download. The toast persists until the bytes arrive or fetch errors.
-  // Subsequent downloads of the same .mov hit the R2 cache (instant).
+  // ProRes is generated lazily server-side. Fast path: prewarm has
+  // already produced the .mov → 200 with bytes (or 302 to R2). Slow
+  // path: backend returns 202 + Retry-After when the transcode is
+  // queued or in progress; we keep the toast up and re-fetch until
+  // 200/302 lands. The whole point is to NEVER block a uvicorn worker
+  // for the 60-300 s of ffmpeg — under multi-tenant load, blocking
+  // would tie up workers and hang every other request.
+  //
+  // Hard ceiling at 8 minutes total wait (16 polls × 30 s). 4K@60 cold
+  // transcode + R2 upload is ~3-4 min; 8 min covers a queue depth of
+  // 2-3 jobs ahead before we give up and tell the user to retry.
   const [proResHint, setProResHint] = useState(null);
+  const PRORES_MAX_WAIT_MS = 8 * 60 * 1000;
+  const PRORES_POLL_FALLBACK_MS = 30 * 1000;
+
   const fetchProResAndSave = async (fileType, suggestedName) => {
     setProResHint(fileType);
+    const deadline = Date.now() + PRORES_MAX_WAIT_MS;
     try {
-      const url = await getDownloadUrl(job.job_id, fileType);
-      const res = await fetch(url);
-      if (!res.ok) throw new Error(`HTTP ${res.status}`);
-      const blob = await res.blob();
-      const blobUrl = URL.createObjectURL(blob);
-      const a = document.createElement("a");
-      a.href = blobUrl;
-      a.download = suggestedName;
-      a.click();
-      // Give the browser a beat to pick the blob up before revoking.
-      setTimeout(() => URL.revokeObjectURL(blobUrl), 60_000);
+      while (Date.now() < deadline) {
+        const url = await getDownloadUrl(job.job_id, fileType);
+        const res = await fetch(url);
+        if (res.status === 200) {
+          // Bytes arrived — turn into a blob download and exit.
+          const blob = await res.blob();
+          const blobUrl = URL.createObjectURL(blob);
+          const a = document.createElement("a");
+          a.href = blobUrl;
+          a.download = suggestedName;
+          a.click();
+          setTimeout(() => URL.revokeObjectURL(blobUrl), 60_000);
+          return;
+        }
+        if (res.status === 302) {
+          // Browser will follow this server-side; we trigger it as a
+          // direct navigation to keep the download UX consistent.
+          window.location.href = url;
+          return;
+        }
+        if (res.status === 202) {
+          // Backend queued/in-progress. Honour Retry-After header.
+          const retryHdr = parseInt(res.headers.get("Retry-After") || "", 10);
+          const retryMs = (Number.isFinite(retryHdr) && retryHdr > 0)
+            ? retryHdr * 1000
+            : PRORES_POLL_FALLBACK_MS;
+          await new Promise((r) => setTimeout(r, retryMs));
+          continue;
+        }
+        // Any other status is a hard error (400/404/500).
+        throw new Error(`HTTP ${res.status}`);
+      }
+      throw new Error("Tiempo de espera agotado");
     } catch (err) {
       console.error("ProRes download failed:", err);
-      alert(t("detail.prores_failed") || "No se pudo generar el ProRes. Intentá de nuevo en unos segundos.");
+      alert(
+        t("detail.prores_failed")
+        || `No se pudo generar el ProRes (${err.message || "error"}). Esperá unos minutos y volvé a intentar.`
+      );
     } finally {
       setProResHint(null);
     }
@@ -321,12 +358,22 @@ export default function JobDetail({ job, onBack, onJobUpdate }) {
 
   const ALL_TABS = [
     ...MEDIA_TABS,
-    ...(hasUmgMaster ? [UMG_MASTER_TAB] : []),
+    ...(hasUmgMaster ? [PRORES_MASTER_TAB] : []),
     { key: "provenance", label: t("prov.title") || "Provenance" },
   ];
 
   return (
     <div className="w-full max-w-4xl animate-fade-in">
+      {/* JobDetail tour: auto-fires on the FIRST pending_review job a
+          new operator opens. The tour walks through approval semantics
+          + ProRes download. We read `user` from localStorage here so
+          we don't have to thread it through the route — the age-gate
+          just needs `created_at`. */}
+      <JobDetailTour
+        user={(() => { try { return JSON.parse(localStorage.getItem("genly_user") || "null"); } catch { return null; } })()}
+        hasUmgMaster={hasUmgMaster}
+        isPendingReview={isPendingReview}
+      />
       {/* Header */}
       <div className="flex items-end justify-between gap-4 mb-8">
         <div className="flex items-center gap-3 min-w-0">
@@ -340,7 +387,10 @@ export default function JobDetail({ job, onBack, onJobUpdate }) {
             <div className="flex items-center gap-2 flex-wrap">
               <h2 className="text-xl font-bold tracking-tight truncate">{name}</h2>
               {isPendingReview && (
-                <span className="px-2 py-0.5 rounded-full bg-amber-500/15 text-amber-300 ring-1 ring-amber-500/30 text-[10px] font-semibold uppercase tracking-wider">
+                <span
+                  data-tour="jobdetail-status-badge"
+                  className="px-2 py-0.5 rounded-full bg-amber-500/15 text-amber-300 ring-1 ring-amber-500/30 text-[10px] font-semibold uppercase tracking-wider"
+                >
                   {t("batch.pending_review") || "Pendiente"}
                 </span>
               )}
@@ -349,6 +399,21 @@ export default function JobDetail({ job, onBack, onJobUpdate }) {
                   {t("batch.validation_failed") || "Falló validación"}
                 </span>
               )}
+              <ProResBadge
+                deliveryProfile={job.delivery_profile}
+                proresReady={
+                  // Header lookup: master + short are both R2-cached
+                  // when the prewarm finished. Either field path
+                  // (s3_keys or files.umg_master_url) signals "ready"
+                  // depending on the version of /jobs that returned.
+                  Boolean(
+                    (job.s3_keys && job.s3_keys.umg_master && job.s3_keys.umg_short)
+                    || job.prores_ready
+                  )
+                }
+                jobStatus={job.status}
+                size="md"
+              />
               {job.status === "done" && job.approved_by && (
                 <span className="px-2 py-0.5 rounded-full bg-accent/15 text-accent ring-1 ring-accent/30 text-[10px] font-semibold uppercase tracking-wider">
                   {t("detail.approved") || "Aprobado"}
@@ -372,12 +437,20 @@ export default function JobDetail({ job, onBack, onJobUpdate }) {
             );
             return (
               <>
-                <button onClick={downloadAllZip} className="btn-secondary text-xs h-10 px-4">
+                <button
+                  onClick={downloadAllZip}
+                  className="btn-secondary text-xs h-10 px-4"
+                  data-tour="jobdetail-download-all"
+                >
                   {downloadIcon}
                   {t("detail.download_all") || "Descargar todo"}
                 </button>
                 {hasUmgMaster && (
-                  <button onClick={downloadProResMaster} className="btn-secondary text-xs h-10 px-4">
+                  <button
+                    onClick={downloadProResMaster}
+                    className="btn-secondary text-xs h-10 px-4"
+                    data-tour="jobdetail-prores-master"
+                  >
                     {downloadIcon}
                     {t("detail.download_master") || "Master ProRes"}
                   </button>
@@ -504,7 +577,10 @@ export default function JobDetail({ job, onBack, onJobUpdate }) {
       {/* Media preview (video / short / thumbnail) */}
       {activeTab !== "provenance" && activeTab !== "umg_master" && canPreview && (
         <>
-          <div className="rounded-card bg-surface-2/40 ring-1 ring-white/[0.04] overflow-hidden mb-4">
+          <div
+            data-tour="jobdetail-preview"
+            className="rounded-card bg-surface-2/40 ring-1 ring-white/[0.04] overflow-hidden mb-4"
+          >
             {activeTab === "thumbnail" ? (
               previewSrc ? (
                 <img
@@ -553,7 +629,10 @@ export default function JobDetail({ job, onBack, onJobUpdate }) {
 
       {/* Approval panel for pending_review */}
       {isPendingReview && (
-        <div className="rounded-card p-6 mb-6 animate-fade-in bg-gradient-to-br from-brand/[0.08] via-brand/[0.04] to-transparent ring-1 ring-brand/25">
+        <div
+          data-tour="jobdetail-approve-panel"
+          className="rounded-card p-6 mb-6 animate-fade-in bg-gradient-to-br from-brand/[0.08] via-brand/[0.04] to-transparent ring-1 ring-brand/25"
+        >
           <div className="flex items-center gap-2 mb-1.5">
             <svg className="w-4 h-4 text-brand-light" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
               <path d="M9 11l3 3L22 4M21 12v7a2 2 0 01-2 2H5a2 2 0 01-2-2V5a2 2 0 012-2h11" strokeLinecap="round" strokeLinejoin="round"/>

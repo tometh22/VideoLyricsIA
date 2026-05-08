@@ -1,7 +1,9 @@
 import { useState, useEffect } from "react";
 import { useI18n } from "../i18n";
 import { useMediaUrl } from "../mediaUrl";
+import { fetchWithTimeout } from "../fetchWithTimeout";
 import { DashboardTour } from "./OnboardingTour";
+import ProResBadge from "./ProResBadge";
 
 const API = import.meta.env.VITE_API_URL || "";
 
@@ -77,7 +79,14 @@ function VideoCard({ job, onSelect }) {
         </div>
       </div>
       <div className="px-3.5 py-3">
-        <p className="text-[13px] font-medium text-white truncate">{songName || "Sin nombre"}</p>
+        <div className="flex items-start gap-2 min-w-0">
+          <p className="text-[13px] font-medium text-white truncate flex-1 min-w-0">{songName || "Sin nombre"}</p>
+          <ProResBadge
+            deliveryProfile={job.delivery_profile}
+            proresReady={job.prores_ready}
+            jobStatus={job.status}
+          />
+        </div>
         <p className="text-[11px] text-gray-500 truncate mt-0.5">
           {artistName}
           {job.created_at && <span className="ml-1.5 text-gray-600">· {timeAgo(job.created_at)}</span>}
@@ -87,7 +96,7 @@ function VideoCard({ job, onSelect }) {
   );
 }
 
-export default function Dashboard({ user, history, onSelectJob, onNewBatch, onViewHistory }) {
+export default function Dashboard({ user, history, historyError, onRetryHistory, onSelectJob, onNewBatch, onViewHistory }) {
   const { t } = useI18n();
 
   const pendingReview = history.filter((h) => h.status === "pending_review");
@@ -95,14 +104,23 @@ export default function Dashboard({ user, history, onSelectJob, onNewBatch, onVi
   const recentDone = history.filter((h) => h.status === "done").slice(0, 6);
   const errors = history.filter((h) => h.status === "error" || h.status === "validation_failed");
 
-  // Real plan usage from API.
+  // Real plan usage from API. We surface load failures so the operator
+  // doesn't sit on "cargando..." forever when /usage hangs (CORS,
+  // backend cold start, transient 5xx). 10 s timeout + a retry button
+  // covers the rare case; on success the error state clears itself.
   const [usage, setUsage] = useState(null);
+  const [usageError, setUsageError] = useState(false);
+  const [usageRetryNonce, setUsageRetryNonce] = useState(0);
   useEffect(() => {
-    fetch(`${API}/usage`, { headers: authHeaders() })
-      .then((r) => (r.ok ? r.json() : null))
-      .then(setUsage)
-      .catch(() => {});
-  }, [history.length]);
+    let cancelled = false;
+    setUsageError(false);
+    fetchWithTimeout(`${API}/usage`, { headers: authHeaders() })
+      .then((r) => (r.ok ? r.json() : Promise.reject(new Error(`HTTP ${r.status}`))))
+      .then((data) => { if (!cancelled) setUsage(data); })
+      .catch(() => { if (!cancelled) setUsageError(true); });
+    return () => { cancelled = true; };
+  }, [history.length, usageRetryNonce]);
+  const retryUsage = () => setUsageRetryNonce((n) => n + 1);
 
   // Errors banner is dismissible. We persist the count at dismiss time so
   // the banner re-surfaces only when *new* errors arrive (otherwise the
@@ -305,8 +323,21 @@ export default function Dashboard({ user, history, onSelectJob, onNewBatch, onVi
                   <span className="text-4xl font-bold tracking-tight text-white">{monthlyUsed}</span>
                   <span className="text-sm text-ink-secondary">/ {monthlyLimit}</span>
                 </>
+              ) : usageError ? (
+                <div className="flex items-center gap-3">
+                  <span className="text-sm text-amber-300">
+                    {t("dash.usage_error") || "No se pudo cargar el uso."}
+                  </span>
+                  <button
+                    type="button"
+                    onClick={retryUsage}
+                    className="text-xs font-medium text-brand hover:text-brand-light underline-offset-2 hover:underline"
+                  >
+                    {t("dash.retry") || "Reintentar"}
+                  </button>
+                </div>
               ) : (
-                <span className="text-sm text-ink-secondary">cargando…</span>
+                <span className="text-sm text-ink-secondary">{t("dash.loading") || "cargando…"}</span>
               )}
             </div>
             {usage?.plan && !isUnlimited && (
@@ -391,8 +422,29 @@ export default function Dashboard({ user, history, onSelectJob, onNewBatch, onVi
       {/* Onboarding tour — fires only on first dashboard visit for new users */}
       <DashboardTour user={user} />
 
-      {/* ─── Empty state — only when there is literally nothing ─── */}
-      {history.length === 0 && (
+      {/* ─── Empty state — only when there is literally nothing.
+          historyError takes precedence so a real "couldn't load" never
+          masquerades as "you have no videos yet" (misleading and scary
+          for a returning user with 100 videos in their library). ─── */}
+      {history.length === 0 && historyError && (
+        <div className="rounded-card p-10 text-center bg-amber-500/[0.06] ring-1 ring-amber-500/25">
+          <div className="w-12 h-12 mx-auto mb-4 rounded-2xl bg-amber-500/15 ring-1 ring-amber-500/30 flex items-center justify-center">
+            <svg className="w-6 h-6 text-amber-300" fill="none" stroke="currentColor" strokeWidth="1.6" viewBox="0 0 24 24">
+              <path d="M12 9v3.5m0 3.5h.01M10.29 3.86L1.82 18a2 2 0 001.71 3h16.94a2 2 0 001.71-3L13.71 3.86a2 2 0 00-3.42 0z" strokeLinecap="round" strokeLinejoin="round"/>
+            </svg>
+          </div>
+          <h3 className="text-base font-semibold text-white mb-1.5 tracking-tight">
+            {t("dash.history_error_title") || "No pudimos cargar tu historial"}
+          </h3>
+          <p className="text-sm text-ink-secondary mb-5">
+            {t("dash.history_error_body") || "Puede ser una caída momentánea de la conexión. Probá de nuevo."}
+          </p>
+          <button onClick={onRetryHistory} className="btn-primary px-6">
+            {t("dash.retry") || "Reintentar"}
+          </button>
+        </div>
+      )}
+      {history.length === 0 && !historyError && (
         <div className="rounded-card p-14 text-center bg-surface-2/30 ring-1 ring-white/[0.04]">
           <div className="w-14 h-14 mx-auto mb-5 rounded-2xl bg-brand/10 ring-1 ring-brand/20 flex items-center justify-center">
             <svg className="w-7 h-7 text-brand-light" fill="none" stroke="currentColor" strokeWidth="1.5" viewBox="0 0 24 24">

@@ -174,7 +174,7 @@ def test_ensure_prores_serialises_parallel_callers(fake_outputs):
 def test_prewarm_prores_returns_none_when_job_missing(fake_outputs, monkeypatch):
     """Worker must not raise when the job vanished (deleted) between
     enqueue and execution — RQ would mark it failed."""
-    monkeypatch.setattr("jobs.get_job_model", lambda job_id: None)
+    monkeypatch.setattr("jobs.get_job_model", lambda db, job_id: None)
     assert prores.prewarm_prores("ghost", "umg_master") is None
 
 
@@ -184,5 +184,102 @@ def test_prewarm_prores_swallows_misconfigured(fake_outputs, monkeypatch):
     fake_model = MagicMock()
     fake_model.tenant_id = "t"
     fake_model.to_dict.return_value = {"umg_spec": None, "s3_keys": {}}
-    monkeypatch.setattr("jobs.get_job_model", lambda job_id: fake_model)
+    monkeypatch.setattr("jobs.get_job_model", lambda db, job_id: fake_model)
     assert prores.prewarm_prores("nonumgjob", "umg_master") is None
+
+
+# ---------------------------------------------------------------------------
+# Pure-recode fast path (world-class UMG flow)
+# ---------------------------------------------------------------------------
+
+
+def _captured_argv(mock_run):
+    """Return the ffmpeg argv that subprocess.run was called with —
+    skipping the auxiliary ffprobe diagnostic call after the encode."""
+    for call in mock_run.call_args_list:
+        argv = call.args[0]
+        if argv and argv[0] == "ffmpeg":
+            return argv
+    return None
+
+
+def test_transcode_uses_pure_recode_when_dims_fps_match(fake_outputs, monkeypatch):
+    """When the source MP4 is already at the UMG target dims+fps (the
+    output of pipeline.run_pipeline after the world-class refactor),
+    _transcode_to_prores must NOT add scale= or fps= filters. Frames
+    pass through 1:1 — required to satisfy UMG's manual QC for any of
+    the 32 frame-size × fps combos they accept."""
+    from unittest.mock import patch
+    import pipeline as _pipeline
+    from render_spec import RenderSpec
+
+    spec = RenderSpec.umg(frame_size="HD", fps=24.0, prores_profile=3)
+    src = "/tmp/source.mp4"
+    dst = "/tmp/master.mov"
+
+    # ffprobe says the source already matches the target.
+    monkeypatch.setattr(
+        _pipeline, "_probe_dims_fps",
+        lambda p: (spec.width, spec.height, spec.fps_str),
+    )
+
+    with patch.object(_pipeline.subprocess, "run") as mock_run:
+        # First call (the transcode) returns rc=0; the diagnostic ffprobe
+        # afterwards also returns success.
+        ok = MagicMock()
+        ok.returncode = 0
+        ok.stdout = ""
+        ok.stderr = ""
+        mock_run.return_value = ok
+        # Skip the post-transcode validator (covered separately).
+        monkeypatch.setattr(_pipeline, "_validate_umg_master", lambda *_: [])
+        # Pretend the output file landed on disk with a non-zero size.
+        monkeypatch.setattr(_pipeline.os.path, "exists", lambda p: p == dst)
+        monkeypatch.setattr(_pipeline.os.path, "getsize", lambda p: 1_000_000)
+        _pipeline._transcode_to_prores(src, dst, spec)
+
+    argv = _captured_argv(mock_run)
+    assert argv is not None, "expected an ffmpeg invocation"
+    vf_idx = argv.index("-vf")
+    vf = argv[vf_idx + 1]
+    assert "scale=" not in vf, f"pure-recode must skip scale, got: {vf}"
+    assert "fps=" not in vf, f"pure-recode must skip fps filter, got: {vf}"
+    # No -r either — the timebase comes from the source.
+    assert "-r" not in argv, "pure-recode must not pin -r; source timebase is used"
+
+
+def test_transcode_falls_back_to_legacy_when_dims_mismatch(fake_outputs, monkeypatch):
+    """Old jobs (pre-refactor) had source MP4 at YouTube spec (1080p/24)
+    but UMG might still ask for any dims/fps. _transcode_to_prores must
+    fall back to the legacy scale+fps path so the call doesn't fail —
+    AND must log a warning so operators know the output may fail QC."""
+    from unittest.mock import patch
+    import pipeline as _pipeline
+    from render_spec import RenderSpec
+
+    spec = RenderSpec.umg(frame_size="UHD-4K", fps=60.0, prores_profile=3)
+    src = "/tmp/legacy.mp4"
+    dst = "/tmp/legacy_master.mov"
+
+    # Source is the old YouTube spec — 1920×1080 @ 24fps.
+    monkeypatch.setattr(
+        _pipeline, "_probe_dims_fps",
+        lambda p: (1920, 1080, "24/1"),
+    )
+
+    with patch.object(_pipeline.subprocess, "run") as mock_run:
+        ok = MagicMock(); ok.returncode = 0; ok.stdout = ""; ok.stderr = ""
+        mock_run.return_value = ok
+        monkeypatch.setattr(_pipeline, "_validate_umg_master", lambda *_: [])
+        monkeypatch.setattr(_pipeline.os.path, "exists", lambda p: p == dst)
+        monkeypatch.setattr(_pipeline.os.path, "getsize", lambda p: 1_000_000)
+        _pipeline._transcode_to_prores(src, dst, spec)
+
+    argv = _captured_argv(mock_run)
+    assert argv is not None
+    vf = argv[argv.index("-vf") + 1]
+    # Legacy path keeps the explicit scale+fps for the encode to land
+    # on the right dims/timebase.
+    assert "scale=3840:2160" in vf
+    assert "fps=60" in vf
+    assert "-r" in argv  # legacy pins explicit timebase

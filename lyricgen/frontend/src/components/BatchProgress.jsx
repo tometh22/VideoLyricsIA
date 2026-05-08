@@ -15,7 +15,8 @@ async function triggerDownload(jobId, type) {
 }
 
 function JobRow({ job, index, t }) {
-  const { filename, status, current_step, progress, job_id, error } = job;
+  const { filename, status, current_step, progress, job_id, error,
+          queue_reason, queue_retry_in_s } = job;
   const name = filename.replace(/\.mp3$/i, "");
 
   const STEP_LABELS = {
@@ -26,6 +27,27 @@ function JobRow({ job, index, t }) {
     thumbnail: "Thumbnail",
     validation: t("batch.validating") || "Validando",
   };
+
+  // Friendly substatus when the upload is being held by capacity
+  // pressure (rate-limit, tenant backlog, server disk). The user
+  // never sees a red error for these — just "waiting" with the
+  // reason. Auto-retry is invisible to them.
+  const queueLabel = (() => {
+    if (status !== "queued" || !queue_reason) return null;
+    if (queue_reason === "team_backlog") {
+      return t("batch.queue_team_backlog")
+        || "Esperando que se libere un lugar en el equipo. Reintentamos solos en unos segundos.";
+    }
+    if (queue_reason === "server_busy") {
+      return t("batch.queue_server_busy")
+        || `Servidor saturado momentáneamente. Reintentamos automáticamente en ~${queue_retry_in_s || 60}s.`;
+    }
+    if (queue_reason === "rate_limit") {
+      return t("batch.queue_rate_limit")
+        || "Subiendo… reintentamos en unos segundos.";
+    }
+    return null;
+  })();
 
   return (
     <div className={`glass rounded-card p-4 transition-all duration-300 ${
@@ -66,12 +88,13 @@ function JobRow({ job, index, t }) {
         {/* File info */}
         <div className="min-w-0 flex-1">
           <p className="text-sm font-medium text-white truncate">{name}</p>
-          <p className="text-[11px] text-gray-500">
+          <p className={`text-[11px] ${queueLabel ? "text-amber-300/80" : "text-gray-500"}`}>
             {status === "done" ? t("dash.completed") :
              status === "pending_review" ? (t("batch.pending_review") || "Pendiente de aprobacion") :
              status === "validation_failed" ? (t("batch.validation_failed") || "Validacion fallida") :
              status === "error" ? (error || t("dash.error")) :
              status === "processing" ? STEP_LABELS[current_step] || current_step :
+             queueLabel ? queueLabel :
              t("batch.queued")}
           </p>
         </div>

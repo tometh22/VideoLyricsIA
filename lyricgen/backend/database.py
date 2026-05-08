@@ -44,8 +44,16 @@ if DATABASE_URL.startswith("postgres://"):
 # 4 API + 4 RQ). Override with DB_POOL_SIZE / DB_MAX_OVERFLOW for capacity
 # tuning, but make sure max_connections on the DB matches:
 #   max_connections >= (api_workers + rq_workers) × (pool_size + max_overflow)
-_DB_POOL_SIZE = int(os.environ.get("DB_POOL_SIZE", "5"))
-_DB_MAX_OVERFLOW = int(os.environ.get("DB_MAX_OVERFLOW", "5"))
+# Default 8+8 per process (was 5+5). With 4 uvicorn workers + 3 RQ
+# workers + the prewarm worker, peak demand is roughly:
+#   4 API × (8+8) = 64 sockets
+#   3 RQ × (8+8) = 48 sockets
+# = 112 sockets total under burst, well below typical PG max_connections=200.
+# Bumping to 8+8 absorbs concurrent /upload + /status + /download +
+# update_job traffic during a 5-batch UMG flood without the previous
+# fragile margin where a single slow query could starve the pool.
+_DB_POOL_SIZE = int(os.environ.get("DB_POOL_SIZE", "8"))
+_DB_MAX_OVERFLOW = int(os.environ.get("DB_MAX_OVERFLOW", "8"))
 
 engine = create_engine(
     DATABASE_URL,
@@ -229,12 +237,23 @@ class Job(Base):
         }
 
     def to_list_dict(self):
+        # `prores_ready` lets the dashboard / history cards show a
+        # subtle badge ("✓ ProRes" vs "⏳ Generando ProRes") without
+        # needing a second round-trip per row. Truthy iff the lazy
+        # transcode has both deliverables on R2.
+        s3 = self.s3_keys or {}
+        wants_umg = (self.delivery_profile or "youtube") in ("umg", "both")
         return {
             "job_id": self.job_id,
             "status": self.status,
             "artist": self.artist,
             "song_title": self.song_title,
             "filename": self.filename,
+            "delivery_profile": self.delivery_profile,
+            "prores_ready": (
+                bool(s3.get("umg_master")) and bool(s3.get("umg_short"))
+                if wants_umg else None
+            ),
             "created_at": self.created_at.timestamp() if self.created_at else None,
         }
 

@@ -77,12 +77,14 @@ export default function UploadZone({
   // back from /review (or any remount) preserves the operator's choice
   // of "ProRes 422 HQ" / frame size / fps, not just the file list.
   const [deliveryProfile, setDeliveryProfile] = useState(delivery?.delivery_profile || "youtube");
-  // umg_frame_size used to be operator-selectable but the source MP4
-  // is always 1920×1080, so anything > HD would be an ffmpeg upscale
-  // (lossy). We keep the field hardcoded to "HD" so the backend still
-  // gets a valid umg_spec; if UMG ever needs 4K from a native 4K
-  // source, expose the dropdown again + change the MP4 render spec.
-  const umgFrameSize = "HD";
+  // umg_frame_size: now operator-selectable end-to-end. The pipeline
+  // renders the source MP4 at the chosen UMG dims+fps (via
+  // RenderSpec.umg_intermediate_master) so the lazy ProRes transcode
+  // is a pure recode — no ffmpeg upscale, no fps interpolation —
+  // guaranteed to satisfy UMG manual QC for any of the 4 frame sizes.
+  const [umgFrameSize, setUmgFrameSize] = useState(
+    delivery?.umg_frame_size || "HD",
+  );
   const [umgFps, setUmgFps] = useState(delivery?.umg_fps || 24);
   const [umgProresProfile, setUmgProresProfile] = useState(delivery?.umg_prores_profile || 3);
   const [deliveryExpanded, setDeliveryExpanded] = useState(false);
@@ -304,7 +306,10 @@ export default function UploadZone({
   // change it from MP4/YouTube. The collapsed pill shows the current
   // value + a "Cambiar" affordance; click expands the listboxes.
   const _deliveryBlock = (
-    <div className="rounded-card bg-surface-2/40 ring-1 ring-white/[0.04] px-4 py-3">
+    <div
+      data-tour="upload-delivery"
+      className="rounded-card bg-surface-2/40 ring-1 ring-white/[0.04] px-4 py-3"
+    >
       {!deliveryExpanded ? (
         <button
           type="button"
@@ -318,7 +323,7 @@ export default function UploadZone({
             <span className="text-sm text-white truncate">
               {deliveryProfile === "youtube"
                 ? "MP4 H.264 1080p"
-                : `MP4 + ProRes 1080p · ${umgFps} fps`}
+                : `MP4 + ProRes ${umgFrameSize} · ${umgFps} fps`}
             </span>
           </div>
           <span className="text-xs text-brand-light hover:text-brand transition-colors shrink-0">
@@ -345,13 +350,20 @@ export default function UploadZone({
               onChange={(v) => setDeliveryProfile(v)}
               options={[
                 { code: "youtube", label: "MP4 H.264 1080p (YouTube / Instagram / TikTok)" },
-                { code: "both", label: "MP4 + ProRes 422 HQ master (UMG)" },
+                { code: "both", label: "MP4 + ProRes 422 HQ (broadcast master)" },
               ]}
               className="w-72"
               ariaLabel={t("upload.delivery") || "Entrega"}
             />
             {deliveryProfile !== "youtube" && (
               <>
+                <Listbox
+                  value={umgFrameSize}
+                  onChange={(v) => setUmgFrameSize(v)}
+                  options={UMG_FRAME_SIZES}
+                  className="w-64"
+                  ariaLabel="UMG frame size"
+                />
                 <Listbox
                   value={String(umgFps)}
                   onChange={(v) => setUmgFps(parseFloat(v))}
@@ -958,7 +970,13 @@ export default function UploadZone({
         {_dropZone}
         {_filesBlock}
         {_bgBlock}
-        {files.length > 0 && _deliveryBlock}
+        {/* Delivery selector — broadcast (ProRes) profiles are gated by
+            user.features.prores_export. Non-eligible users get a silent
+            default of MP4/YouTube, which is what `delivery_profile` is
+            already initialised to in state. Hiding the whole block (vs.
+            disabling it) keeps the UI clean for the 99% of users who
+            never need anything other than MP4. */}
+        {files.length > 0 && user?.features?.prores_export && _deliveryBlock}
       </div>
 
       {/* Sticky bottom CTA bar — replaces the disconnected buttons that
