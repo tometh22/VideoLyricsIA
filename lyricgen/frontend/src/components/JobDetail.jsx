@@ -16,12 +16,14 @@ const MEDIA_TABS = [
   { key: "thumbnail", label: "Thumbnail", desc: "1280x720" },
 ];
 
-// UMG master is added conditionally — only when delivery_profile is
-// "umg" or "both". ProRes 422 HQ in a .mov, not previewable in
-// browser, so the tab shows a download-only panel.
-const UMG_MASTER_TAB = {
+// Broadcast master tab — added conditionally only when the job's
+// delivery_profile is "umg" or "both". ProRes 422 HQ in a .mov, not
+// previewable in browser, so the tab shows a download-only panel.
+// (Internal `umg_master` key is preserved end-to-end on the wire so
+// existing jobs keep working; only the visible label is generic.)
+const PRORES_MASTER_TAB = {
   key: "umg_master",
-  label: "Máster UMG",
+  label: "Máster ProRes",
   desc: "ProRes 422 HQ · MOV",
 };
 
@@ -355,7 +357,7 @@ export default function JobDetail({ job, onBack, onJobUpdate }) {
 
   const ALL_TABS = [
     ...MEDIA_TABS,
-    ...(hasUmgMaster ? [UMG_MASTER_TAB] : []),
+    ...(hasUmgMaster ? [PRORES_MASTER_TAB] : []),
     { key: "provenance", label: t("prov.title") || "Provenance" },
   ];
 

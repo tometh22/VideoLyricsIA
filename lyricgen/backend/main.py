@@ -59,6 +59,7 @@ from auth import (
     create_media_token,
     verify_media_token,
     validate_password_strength,
+    has_prores_access,
 )
 import storage
 from datetime import datetime, timedelta, timezone
@@ -379,6 +380,7 @@ async def login(body: LoginRequest, request: Request, db: Session = Depends(get_
             "tenant_id": user.tenant_id,
             "plan": user.plan_id,
             "allow_overage": getattr(user, "allow_overage", False) or False,
+            "features": {"prores_export": has_prores_access(user)},
         },
     }
 
@@ -440,6 +442,7 @@ async def register(body: RegisterRequest, request: Request, db: Session = Depend
             "tenant_id": user.tenant_id,
             "plan": user.plan_id,
             "allow_overage": getattr(user, "allow_overage", False) or False,
+            "features": {"prores_export": has_prores_access(user)},
         },
     }
 
@@ -757,8 +760,17 @@ def _parse_umg_params(
     umg_frame_size: str,
     umg_fps: str,
     umg_prores_profile: str,
+    current_user: dict | None = None,
 ) -> dict | None:
-    """Parse and validate UMG delivery params. Returns umg_spec dict or None."""
+    """Parse and validate UMG delivery params. Returns umg_spec dict or None.
+
+    `current_user` is checked against `has_prores_access` for any non-
+    YouTube profile — broadcast deliverables are gated to allow-listed
+    tenants (PRORES_TENANTS env) plus admins. We refuse with 403 here
+    rather than letting the request go through and silently rendering a
+    YouTube MP4, because the operator's intent ("UMG master") and what
+    we'd produce would diverge — a confusing failure mode.
+    """
     if delivery_profile not in ("youtube", "umg", "both"):
         raise HTTPException(
             status_code=400,
@@ -766,11 +778,17 @@ def _parse_umg_params(
         )
     if delivery_profile == "youtube":
         return None
+    if current_user is not None and not has_prores_access(current_user):
+        raise HTTPException(
+            status_code=403,
+            detail="Broadcast (ProRes) delivery is not enabled for your account. "
+                   "Contact support if you need this feature.",
+        )
     if not (umg_frame_size and umg_fps and umg_prores_profile):
         raise HTTPException(
             status_code=400,
             detail="umg_frame_size, umg_fps and umg_prores_profile are required "
-                   "when delivery_profile includes UMG",
+                   "when delivery_profile is umg or both",
         )
     try:
         fps_val = float(umg_fps)
@@ -825,7 +843,7 @@ async def upload(
     # "processing" on its first line. No 429 for capacity reasons.
     initial_status = "queued"
 
-    umg_spec = _parse_umg_params(delivery_profile, umg_frame_size, umg_fps, umg_prores_profile)
+    umg_spec = _parse_umg_params(delivery_profile, umg_frame_size, umg_fps, umg_prores_profile, current_user=current_user)
 
     # Check AI authorization (UMG Guideline 5) — skip if using library background (no AI)
     if not background_id and current_user.get("role") != "admin":
@@ -1403,7 +1421,7 @@ async def generate_with_segments(
             raise HTTPException(status_code=403, detail="AI tool usage not authorized. Contact admin for approval.")
 
     segments = json.loads(segments_json)
-    umg_spec = _parse_umg_params(delivery_profile, umg_frame_size, umg_fps, umg_prores_profile)
+    umg_spec = _parse_umg_params(delivery_profile, umg_frame_size, umg_fps, umg_prores_profile, current_user=current_user)
 
     # Check plan limits
     usage_info = get_plan_usage(db, current_user["id"], current_user["tenant_id"], current_user.get("plan", "100"))
