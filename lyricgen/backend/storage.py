@@ -40,6 +40,29 @@ def is_enabled() -> bool:
     return bool(R2_ACCESS_KEY_ID and R2_SECRET_ACCESS_KEY and R2_ENDPOINT_URL and R2_BUCKET)
 
 
+def warmup() -> bool:
+    """Force-initialize the boto3 S3 client (no network).
+
+    boto3 lazy-loads service models, regions, and signers the first time
+    a client is constructed — that's ~500–1500 ms of CPU on a fresh
+    Python process. After a Railway rolling deploy, the FIRST user
+    request that signs an R2 URL pays the entire cost in the request
+    thread, which is what made the dashboard look stuck for 1–3 seconds
+    immediately after a deploy. Calling this from /health on the first
+    healthcheck moves that work to the probe path, so user-facing
+    requests start warm.
+
+    Returns True iff the client is now ready, False if not configured
+    or boto3 failed to load (caller should treat as best-effort).
+    """
+    if not is_enabled():
+        return False
+    try:
+        return _get_client() is not None
+    except Exception:
+        return False
+
+
 def _get_client():
     global _client
     if _client is not None:

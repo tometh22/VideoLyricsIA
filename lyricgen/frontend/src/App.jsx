@@ -5,6 +5,7 @@ import {
 } from "react-router-dom";
 import { useI18n } from "./i18n";
 import { IS_PRODUCTION, APP_ENV } from "./env";
+import { fetchWithTimeout } from "./fetchWithTimeout";
 import LoginPage from "./components/LoginPage";
 import Landing from "./components/Landing";
 import Sidebar from "./components/Sidebar";
@@ -37,6 +38,13 @@ function authHeaders() {
 function authFetch(url, opts = {}) {
   const headers = { ...opts.headers, ...authHeaders() };
   return fetch(url, { ...opts, headers });
+}
+// Same as authFetch but aborts after `timeoutMs`. Use for dashboard /
+// list hooks where a hung backend must surface as an error state, not
+// as a permanent spinner.
+function authFetchWithTimeout(url, opts = {}, timeoutMs = 10_000) {
+  const headers = { ...opts.headers, ...authHeaders() };
+  return fetchWithTimeout(url, { ...opts, headers }, timeoutMs);
 }
 
 // --- Routing helpers ---
@@ -261,14 +269,26 @@ export default function App() {
     navigate("/");
   }, [navigate]);
 
+  // `historyError` lets the dashboard surface a "connection failed,
+  // retry" state instead of silently rendering an empty list when /jobs
+  // hangs or 5xx's (CORS misconfig, backend cold start, R2 outage). The
+  // poller and detail-view consumers don't see this — they get the
+  // current `history` array, fresh or stale.
+  const [historyError, setHistoryError] = useState(false);
   const fetchHistory = useCallback(async () => {
     if (!getToken()) return;
     try {
-      const res = await authFetch(`${API}/jobs`);
+      const res = await authFetchWithTimeout(`${API}/jobs`);
       if (res.status === 401) { handleLogout(); return; }
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
       const data = await res.json();
-      if (Array.isArray(data)) setHistory(data);
-    } catch {}
+      if (Array.isArray(data)) {
+        setHistory(data);
+        setHistoryError(false);
+      }
+    } catch {
+      setHistoryError(true);
+    }
   }, [handleLogout]);
 
   useEffect(() => { if (token) fetchHistory(); }, [token, fetchHistory]);
@@ -929,6 +949,8 @@ export default function App() {
             <Dashboard
               user={user}
               history={history}
+              historyError={historyError}
+              onRetryHistory={fetchHistory}
               onSelectJob={handleSelectJob}
               onNewBatch={() => { setFiles([]); navigate("/new"); }}
               onViewHistory={() => navigate("/videos")}
