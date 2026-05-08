@@ -684,6 +684,69 @@ _WHISPER_MODELS: dict = {}
 _WHISPER_LOCK = None
 
 
+def _fix_lrc_first_line_at_zero(
+    segments: list[dict],
+    audio_duration: float | None = None,
+) -> tuple[list[dict], float | None]:
+    """Auto-correct the lrclib "first line at [00:00.00]" quirk.
+
+    A non-trivial fraction of community-curated LRCs anchor line 1 to
+    song time 0 even when there's a long instrumental intro before the
+    first vocal. Trusting the LRC then shows the first lyric pinned to
+    0:00 in the editor / video while the actual vocal entry sits ~15 s
+    later — exactly the bug the operator hit on Intoxicados — "No Tengo
+    Ganas".
+
+    We can't ground-truth the vocal entry without a VAD pass, but the
+    LRC's OWN cadence betrays the quirk: the gap between line 1 and
+    line 2 is dramatically larger than the median gap between
+    subsequent verse / chorus lines. When all three of these hold we
+    relocate line 1 to ``line2.start - median_gap`` (the spot a normal
+    cadence would put it):
+
+      - segments[0].start <= 1.0
+      - gap(line1, line2) > 2 × median(gaps in lines 2..6)
+      - gap(line1, line2) > 8 s in absolute terms
+
+    The thresholds are conservative — a song with a normal 4-second
+    intro on line 1 won't false-positive (gap to line 2 is ~8 s but
+    the ratio against the median typically isn't > 2×).
+
+    Returns (segments_with_first_fixed, suggested_new_start_or_None).
+    The second value is logged by the caller for observability.
+    """
+    if len(segments) < 4:
+        return segments, None
+    first = segments[0]
+    second = segments[1]
+    first_start = float(first.get("start", 0.0))
+    second_start = float(second.get("start", 0.0))
+    if first_start > 1.0:
+        return segments, None
+    gaps: list[float] = []
+    for i in range(1, min(len(segments) - 1, 6)):
+        gaps.append(float(segments[i + 1]["start"]) - float(segments[i]["start"]))
+    if not gaps:
+        return segments, None
+    gaps.sort()
+    median_gap = gaps[len(gaps) // 2]
+    first_gap = second_start - first_start
+    if median_gap <= 0:
+        return segments, None
+    if first_gap < median_gap * 2 or first_gap < 8.0:
+        return segments, None
+    suggested = max(0.0, second_start - median_gap)
+    seg_dur = max(0.5, float(first.get("end", suggested)) - first_start)
+    new_end = suggested + seg_dur
+    if audio_duration:
+        new_end = min(float(audio_duration), new_end)
+    # Don't let the new line bleed into line 2.
+    if new_end > second_start - 0.05:
+        new_end = max(suggested + 0.5, second_start - 0.05)
+    fixed_first = {**first, "start": suggested, "end": new_end}
+    return [fixed_first] + list(segments[1:]), suggested
+
+
 def _get_whisper_model(name: str = "turbo"):
     """Load a Whisper model once per process and reuse. Thread-safe. Supports
     multiple sizes cached side-by-side so we can fall back turbo -> large-v3
