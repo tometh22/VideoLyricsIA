@@ -88,6 +88,11 @@ const translations = {
     "dash.queued": "En cola",
     "dash.error": "Error",
     "dash.min_remaining": "min restantes",
+    "dash.loading": "cargando…",
+    "dash.retry": "Reintentar",
+    "dash.usage_error": "No se pudo cargar el uso.",
+    "dash.history_error_title": "No pudimos cargar tu historial",
+    "dash.history_error_body": "Puede ser una caída momentánea de la conexión. Probá de nuevo.",
 
     // Upload
     "upload.drag": "Arrastrá archivos MP3",
@@ -531,6 +536,11 @@ const translations = {
     "dash.queued": "Queued",
     "dash.error": "Error",
     "dash.min_remaining": "min remaining",
+    "dash.loading": "loading…",
+    "dash.retry": "Retry",
+    "dash.usage_error": "Couldn't load usage.",
+    "dash.history_error_title": "We couldn't load your history",
+    "dash.history_error_body": "Looks like a temporary connection issue. Please try again.",
 
     "upload.drag": "Drag MP3 files here",
     "upload.drag_sub": "One or multiple at once",
@@ -953,6 +963,11 @@ const translations = {
     "dash.queued": "Na fila",
     "dash.error": "Erro",
     "dash.min_remaining": "min restantes",
+    "dash.loading": "carregando…",
+    "dash.retry": "Tentar novamente",
+    "dash.usage_error": "Não foi possível carregar o uso.",
+    "dash.history_error_title": "Não conseguimos carregar seu histórico",
+    "dash.history_error_body": "Parece uma queda momentânea de conexão. Tente novamente.",
 
     "upload.drag": "Arraste arquivos MP3",
     "upload.drag_sub": "Um ou vários de uma vez",

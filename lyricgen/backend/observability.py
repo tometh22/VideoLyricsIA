@@ -186,10 +186,16 @@ def health_snapshot() -> dict:
         else:
             _degrade("redis_error")
 
-    # R2 / S3
+    # R2 / S3 — `warmup()` force-initializes the boto3 client so the
+    # first user request after a deploy doesn't pay the cold-start cost
+    # (the boto3 model loader is ~500-1500 ms on a fresh process). Pure
+    # CPU, no network — safe to run on the hot path.
     try:
         import storage
-        snap["r2"] = "configured" if storage.is_enabled() else "not_configured"
+        if storage.is_enabled():
+            snap["r2"] = "ready" if storage.warmup() else "configured"
+        else:
+            snap["r2"] = "not_configured"
     except Exception:
         snap["r2"] = "error"
 
