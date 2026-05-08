@@ -312,12 +312,20 @@ def run_pipeline(job_id: str, mp3_path: str, artist: str, style: str,
             print(f"[BG] Using human-provided background: {background_path}")
         else:
             lyrics_text = " ".join(seg["text"] for seg in segments)
-            # Extract a clean song title from the MP3 filename so Gemini gets
-            # song-level context even when the lyrics transcription degrades.
-            # The cache key downstream uses (artist|title) as a namespace so
+            # Prefer the structured title the operator set on the job; fall
+            # back to filename parsing for legacy rows / batch uploads. The
+            # cache key downstream uses (artist|title) as a namespace so
             # different songs don't share a Veo background.
-            _basename = os.path.splitext(os.path.basename(mp3_path))[0]
-            _song_title = _basename.split(" - ", 1)[1] if " - " in _basename else _basename
+            if song_title:
+                _song_title = song_title
+            else:
+                _basename = os.path.splitext(os.path.basename(mp3_path))[0]
+                if " - " in _basename:
+                    _song_title = _basename.split(" - ", 1)[1]
+                elif "_" in _basename:
+                    _song_title = _basename.split("_", 1)[0]
+                else:
+                    _song_title = _basename
             for _sfx in ["(Official Video)", "(Official Audio)", "(Lyric Video)",
                          "(Official Music Video)", "(En Vivo)", "(Live)", "(Lyrics)"]:
                 _song_title = _song_title.replace(_sfx, "").strip()
@@ -448,6 +456,7 @@ def run_pipeline(job_id: str, mp3_path: str, artist: str, style: str,
             update_job(job_id, current_step="thumbnail", progress=90)
             generate_thumbnail(
                 artist, mp3_path, job_dir, bg_source=bg_source,
+                song_title=song_title,
             )
             files["thumbnail_url"] = f"/download/{job_id}/thumbnail"
 
@@ -4372,7 +4381,7 @@ def generate_lyric_video(
     first_lyric_start = segments[0]["start"] if segments else duration
     # Prefer the title the user explicitly set on the job — falls back to
     # parsing the filename only when the job didn't carry one (legacy rows
-    # or batch CLI uploads). The filename heuristic now handles both
+    # or batch CLI uploads). The filename heuristic handles both
     # "Artist - Title" and "Title_Artist" so a Suno-style export still
     # gets a real overlay rendered.
     if song_title:
@@ -4389,8 +4398,30 @@ def generate_lyric_video(
                      "(Live)", "(Lyrics)"]:
             title_song = title_song.replace(sfx, "").strip()
 
+    # Defensive scrub: even when the upload pipeline pre-parsed the title,
+    # legacy rows (or a manually-typed value) can still carry the raw
+    # "Title_Artist" or "Artist - Title" filename basename. Re-parse so the
+    # overlay never shows a literal underscore-joined filename like
+    # "No Tengo Ganas_Intoxicados".
+    if title_song:
+        if " - " in title_song and artist and title_song.startswith(artist):
+            title_song = title_song.split(" - ", 1)[1].strip()
+        if artist and title_song.endswith(f"_{artist}"):
+            title_song = title_song[: -(len(artist) + 1)].strip()
+        if "_" in title_song and not artist:
+            title_song = title_song.split("_", 1)[0].strip()
+
     if artist or title_song:
-        title_text = f"{artist}\n{title_song}".strip() if artist else title_song
+        # Single-line "ARTIST - Title" format. Operator wanted the artist
+        # and song name on one row instead of stacked, and the dash
+        # separator makes the parsed title obviously distinct from the raw
+        # underscore-joined Suno filename.
+        if artist and title_song:
+            title_text = f"{artist.upper()} - {title_song}"
+        elif artist:
+            title_text = artist.upper()
+        else:
+            title_text = title_song
         if first_lyric_start > 3:
             # Real intro — cinematic centered drop. Bigger font, fades
             # just before the first lyric so they don't crash into each
@@ -4412,8 +4443,7 @@ def generate_lyric_video(
             # window left "ARTIST / Title" stamped over the first
             # vocal line in songs without an intro silence.
             try:
-                top_title_text = (f"{artist.upper()}\n{title_song}"
-                                  if artist else title_song)
+                top_title_text = title_text
                 top_size = max(36, int(round(58 * spec.text_scale)))
                 top_card = TextClip(
                     top_title_text,
@@ -4719,6 +4749,7 @@ def generate_thumbnail(
     mp3_path: str,
     job_dir: str,
     bg_source: str | None = None,
+    song_title: str = "",
 ) -> str:
     """Generate a thumbnail from the RAW background with artist and song name."""
     from PIL import ImageFilter, ImageEnhance
@@ -4745,17 +4776,30 @@ def generate_thumbnail(
     img = enhancer.enhance(0.6)
 
     draw = ImageDraw.Draw(img)
-    # Extract song name from filename, removing artist prefix if present
-    raw_name = os.path.splitext(os.path.basename(mp3_path))[0]
-    # Handle "Artist - Song" and "Artist - Song (Extra Info)" formats
-    song_name = raw_name
-    if " - " in raw_name:
-        song_name = raw_name.split(" - ", 1)[1]
-    # Remove common suffixes
+    # Prefer the structured title from the job; fall back to the filename
+    # only when it's missing. The filename heuristic handles both
+    # "Artist - Title" and Suno-style "Title_Artist" so the thumbnail
+    # never shows a literal underscore-joined basename.
+    if song_title:
+        song_name = song_title
+    else:
+        raw_name = os.path.splitext(os.path.basename(mp3_path))[0]
+        song_name = raw_name
+        if " - " in raw_name:
+            song_name = raw_name.split(" - ", 1)[1]
+        elif "_" in raw_name:
+            song_name = raw_name.split("_", 1)[0]
     for suffix in ["(Official Video)", "(Official Audio)", "(Lyric Video)",
                    "(Official Music Video)", "(Audio)", "(Video)", "(En Vivo)",
                    "(Live)", "(Lyrics)"]:
         song_name = song_name.replace(suffix, "").strip()
+    # Defensive scrub for legacy / manually-typed values that still carry
+    # the artist concatenated to the title.
+    if song_name:
+        if " - " in song_name and artist and song_name.startswith(artist):
+            song_name = song_name.split(" - ", 1)[1].strip()
+        if artist and song_name.endswith(f"_{artist}"):
+            song_name = song_name[: -(len(artist) + 1)].strip()
 
     # Use Montserrat ExtraBold for thumbnails (Google Font, OFL licensed)
     thumb_font = os.path.join(_FONTS_DIR, "Montserrat-ExtraBold.ttf")
