@@ -1071,13 +1071,30 @@ async def transcribe_endpoint(
                                       f"({diff:.1f}s) — falling back")
                                 use_synced = False
                     if use_synced and song_segs and len(song_segs) >= 8:
-                        from pipeline import _filter_intro_song_overlap
+                        from pipeline import (
+                            _filter_intro_song_overlap,
+                            _fix_lrc_first_line_at_zero,
+                        )
                         hybrid_intro_segs, _dup = _filter_intro_song_overlap(
                             hybrid_intro_segs, song_segs,
                         )
                         if _dup:
                             print(f"[LYRICS] discarded {_dup} intro seg(s) as "
                                   f"song-line hallucinations")
+                        # Only apply the gap-based first-line correction
+                        # when we don't have an intro Whisper pass to
+                        # cover the pre-vocal region — otherwise the
+                        # intro segments naturally sit before line 1 and
+                        # there's no anomaly to fix.
+                        if not hybrid_intro_segs:
+                            song_segs, _moved = _fix_lrc_first_line_at_zero(
+                                song_segs, audio_duration=user_dur,
+                            )
+                            if _moved is not None:
+                                print(f"[LYRICS] lrclib line 1 was anchored "
+                                      f"at 0s with a long gap to line 2; "
+                                      f"shifted to {_moved:.2f}s based on "
+                                      f"median cadence")
                         combined = hybrid_intro_segs + song_segs
                         print(f"[LYRICS] lrclib synced hit — "
                               f"{len(combined)} segments "

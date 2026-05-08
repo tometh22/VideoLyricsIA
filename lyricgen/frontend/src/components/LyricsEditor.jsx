@@ -108,6 +108,14 @@ export default function LyricsEditor({ segments, filename, audioFile, referenceL
   // offset arbitrarily — listening + tapping is ground truth.
   const [syncMode, setSyncMode] = useState(false);
   const [syncCursor, setSyncCursor] = useState(0);
+  // When false (default), each Sync-Mode tap anchors ONLY the current
+  // line — leaves every following timestamp alone. When true, the same
+  // delta propagates to every line after the cursor (the previous-only
+  // behaviour, useful when the whole timeline is uniformly off).
+  // Operators reported that the cascading default was destroying their
+  // already-correct lines when they only wanted to fix a single anchor;
+  // the safer default is single-line.
+  const [syncCascade, setSyncCascade] = useState(false);
   // Stack of {id, prevStart, prevEnd} so "Deshacer" can revert the
   // last tap if the operator overshot.
   const [syncHistory, setSyncHistory] = useState([]);
@@ -217,9 +225,14 @@ export default function LyricsEditor({ segments, filename, audioFile, referenceL
     const delta = newStart - target.start;
     // Snapshot the future lines BEFORE mutating so undo can restore
     // every shifted timestamp, not just the anchor's.
-    const futureSnapshot = edited
-      .slice(syncCursor + 1)
-      .map((s) => ({ id: s._id, prevStart: s.start, prevEnd: s.end }));
+    // Snapshot the future ONLY when we're going to touch it. Without
+    // syncCascade the future array stays empty and Deshacer reverts a
+    // single line — matching the user's mental model.
+    const futureSnapshot = syncCascade
+      ? edited
+          .slice(syncCursor + 1)
+          .map((s) => ({ id: s._id, prevStart: s.start, prevEnd: s.end }))
+      : [];
     setSyncHistory((prev) => [
       ...prev,
       {
@@ -239,10 +252,13 @@ export default function LyricsEditor({ segments, filename, audioFile, referenceL
           if (duration && newEnd > duration) newEnd = duration;
           return { ...s, start: newStart, end: newEnd };
         }
-        // Propagate delta to lines after the cursor when the shift is
-        // meaningful. Skip when delta is tiny to avoid jittering on
-        // micro-adjustments to a line whose original time was correct.
-        if (i > syncCursor && Math.abs(delta) >= 0.2) {
+        // Cascade only when the operator opted in. Skip when delta is
+        // tiny to avoid jittering on micro-adjustments. The previous
+        // unconditional cascade was overwriting already-correct future
+        // timestamps when the operator just wanted to fix the FIRST
+        // line of a song whose lrclib data put line 1 at 0:00 (instead
+        // of the real ~15 s where vocals start).
+        if (syncCascade && i > syncCursor && Math.abs(delta) >= 0.2) {
           const segDur = Math.max(0.5, s.end - s.start);
           const shifted = Math.max(0, s.start + delta);
           let newEnd = shifted + segDur;
@@ -258,7 +274,7 @@ export default function LyricsEditor({ segments, filename, audioFile, referenceL
     } else {
       setSyncCursor(syncCursor + 1);
     }
-  }, [syncMode, syncCursor, edited, currentTime, duration]);
+  }, [syncMode, syncCursor, edited, currentTime, duration, syncCascade]);
 
   const undoLastAnchor = useCallback(() => {
     setSyncHistory((prev) => {
@@ -645,7 +661,7 @@ export default function LyricsEditor({ segments, filename, audioFile, referenceL
       {audioUrl && syncMode && (
         <div className="mb-3 px-3 py-2 rounded-card bg-brand/[0.08] ring-1 ring-brand/40 animate-fade-in">
           {/* Top row: status + counter + exit. Compact, single line. */}
-          <div className="flex items-center justify-between mb-1.5">
+          <div className="flex items-center justify-between mb-1.5 gap-2">
             <div className="flex items-center gap-1.5 min-w-0">
               <span className="inline-block w-1.5 h-1.5 rounded-full bg-brand animate-pulse shrink-0" />
               <span className="text-[10px] font-semibold text-brand-light uppercase tracking-wider shrink-0">
@@ -661,12 +677,24 @@ export default function LyricsEditor({ segments, filename, audioFile, referenceL
                 {" deshace"}
               </span>
             </div>
-            <button
-              onClick={exitSyncMode}
-              className="text-[10px] text-gray-400 hover:text-white px-1.5 py-0.5 transition-colors shrink-0"
-            >
-              {t("editor.sync_exit") || "Salir"}
-            </button>
+            <div className="flex items-center gap-2 shrink-0">
+              <label className="flex items-center gap-1.5 text-[10px] text-gray-400 cursor-pointer select-none"
+                title={t("editor.sync_cascade_hint") || "Cuando está activo, el delta de cada tap se aplica también a las líneas siguientes"}>
+                <input
+                  type="checkbox"
+                  checked={syncCascade}
+                  onChange={(e) => setSyncCascade(e.target.checked)}
+                  className="w-3 h-3 accent-brand"
+                />
+                {t("editor.sync_cascade_label") || "Arrastrar siguientes"}
+              </label>
+              <button
+                onClick={exitSyncMode}
+                className="text-[10px] text-gray-400 hover:text-white px-1.5 py-0.5 transition-colors"
+              >
+                {t("editor.sync_exit") || "Salir"}
+              </button>
+            </div>
           </div>
           {/* Action row: line text on left (visual hero), compact button on right. */}
           <div className="flex items-center gap-2">
@@ -703,41 +731,117 @@ export default function LyricsEditor({ segments, filename, audioFile, referenceL
       )}
 
 
-      {/* ─── Intro-trim banner ─────────────────────────────────────────
-          When the first lyric sits more than 3 s into the audio, the song
-          has a real instrumental intro (or lrclib applied an offset to
-          align the lrc to the user's "Official Video" cut). Offer to
-          collapse that intro down to a 2-second pre-roll or remove it
-          entirely. The shift propagates to every line and is undoable. */}
-      {!syncMode && edited.length > 0 && edited[0].start > 3 && (
-        <div className="mb-3 px-3 py-2.5 rounded-card bg-brand/[0.06] ring-1 ring-brand/20 flex items-center gap-3 animate-fade-in">
-          <svg className="w-4 h-4 text-brand-light shrink-0" fill="none" stroke="currentColor" strokeWidth="1.8" viewBox="0 0 24 24">
-            <path d="M9 18V5l12-2v13" /><circle cx="6" cy="18" r="3" /><circle cx="18" cy="16" r="3" />
-          </svg>
-          <p className="text-xs text-ink-secondary flex-1">
-            {t("editor.intro_long_title") || "Tu canción arranca a"}{" "}
-            <span className="font-mono text-brand-light">{formatTimestamp(edited[0].start)}</span>
-            {" "}
-            <span className="text-gray-500">
-              ({Math.round(edited[0].start)}s {t("editor.intro_long_hint") || "de intro instrumental"})
-            </span>
-          </p>
-          <button
-            onClick={() => shiftAllSegments(-(edited[0].start - 2))}
-            className="shrink-0 text-[11px] font-medium px-3 py-1.5 rounded-lg bg-brand/15 text-brand-light
-              ring-1 ring-brand/30 hover:bg-brand/25 transition-colors"
-          >
-            {t("editor.intro_trim_to_2") || "Recortar a 2s"}
-          </button>
-          <button
-            onClick={() => shiftAllSegments(-edited[0].start)}
-            className="shrink-0 text-[11px] font-medium px-3 py-1.5 rounded-lg bg-surface-2/60
-              ring-1 ring-white/[0.06] text-gray-300 hover:bg-surface-2 hover:text-white transition-colors"
-          >
-            {t("editor.intro_trim_to_0") || "Empezar en 0s"}
-          </button>
-        </div>
-      )}
+      {/* ─── Misaligned-first-line banner ───────────────────────────────
+          Two signals merged into one banner:
+
+          (a) Real instrumental intro: first lyric > 3 s into the audio.
+              Offer to collapse it to 2 s or 0 s of pre-roll.
+
+          (b) LRC author put line 1 at 0:00 even though there's a long
+              instrumental intro before vocals start. Detected by an
+              anomalously large gap between line 1 and line 2 — a chorus
+              line typically follows ~8 s after the first verse line, so
+              a 15+ s gap with line 1 at ~0:00 is a strong signal the
+              author marked line 1 to "show through the intro" and the
+              real vocal entry is roughly where line 2 starts. We offer
+              to nudge line 1 only — leaves the rest of the timeline
+              (which is correct relative to line 2) untouched. */}
+      {(() => {
+        if (syncMode || edited.length === 0) return null;
+        const first = edited[0];
+        const second = edited[1];
+
+        if (first.start > 3) {
+          return (
+            <div className="mb-3 px-3 py-2.5 rounded-card bg-brand/[0.06] ring-1 ring-brand/20 flex items-center gap-3 animate-fade-in">
+              <svg className="w-4 h-4 text-brand-light shrink-0" fill="none" stroke="currentColor" strokeWidth="1.8" viewBox="0 0 24 24">
+                <path d="M9 18V5l12-2v13" /><circle cx="6" cy="18" r="3" /><circle cx="18" cy="16" r="3" />
+              </svg>
+              <p className="text-xs text-ink-secondary flex-1">
+                {t("editor.intro_long_title") || "Tu canción arranca a"}{" "}
+                <span className="font-mono text-brand-light">{formatTimestamp(first.start)}</span>
+                {" "}
+                <span className="text-gray-500">
+                  ({Math.round(first.start)}s {t("editor.intro_long_hint") || "de intro instrumental"})
+                </span>
+              </p>
+              <button
+                onClick={() => shiftAllSegments(-(first.start - 2))}
+                className="shrink-0 text-[11px] font-medium px-3 py-1.5 rounded-lg bg-brand/15 text-brand-light
+                  ring-1 ring-brand/30 hover:bg-brand/25 transition-colors"
+              >
+                {t("editor.intro_trim_to_2") || "Recortar a 2s"}
+              </button>
+              <button
+                onClick={() => shiftAllSegments(-first.start)}
+                className="shrink-0 text-[11px] font-medium px-3 py-1.5 rounded-lg bg-surface-2/60
+                  ring-1 ring-white/[0.06] text-gray-300 hover:bg-surface-2 hover:text-white transition-colors"
+              >
+                {t("editor.intro_trim_to_0") || "Empezar en 0s"}
+              </button>
+            </div>
+          );
+        }
+
+        // Detect lrclib's "first line at 0:00" pattern: line 1 is near
+        // t=0 but line 2 is suspiciously far away — usually an LRC
+        // authoring quirk where the first line is anchored to song
+        // start instead of the first vocal entry.
+        if (first.start <= 1.0 && second && edited.length >= 4) {
+          // Compute typical gap from lines 2..min(6) so a single odd
+          // value doesn't skew the threshold.
+          const gaps = [];
+          for (let i = 1; i < Math.min(edited.length - 1, 6); i++) {
+            gaps.push(edited[i + 1].start - edited[i].start);
+          }
+          const median = gaps.sort((a, b) => a - b)[Math.floor(gaps.length / 2)] || 0;
+          const firstGap = second.start - first.start;
+          // Trigger when line 1 → line 2 is meaningfully longer than
+          // typical gap and the absolute gap is non-trivial. Threshold
+          // is conservative so a normal song-with-no-intro doesn't
+          // false-positive.
+          if (median > 0 && firstGap > median * 2 && firstGap > 8) {
+            const suggested = Math.max(0, second.start - median);
+            const fixFirstOnly = () => {
+              pushEditHistory();
+              setEdited((prev) =>
+                prev.map((s, i) => {
+                  if (i !== 0) return s;
+                  const segDur = Math.max(0.5, s.end - s.start);
+                  let newEnd = suggested + segDur;
+                  if (duration && newEnd > duration) newEnd = duration;
+                  return { ...s, start: suggested, end: newEnd };
+                }),
+              );
+            };
+            return (
+              <div className="mb-3 px-3 py-2.5 rounded-card bg-amber-500/[0.07] ring-1 ring-amber-500/25 flex items-center gap-3 animate-fade-in">
+                <svg className="w-4 h-4 text-amber-400 shrink-0" fill="none" stroke="currentColor" strokeWidth="1.8" viewBox="0 0 24 24">
+                  <circle cx="12" cy="12" r="10" />
+                  <path d="M12 8v4M12 16h.01" strokeLinecap="round" />
+                </svg>
+                <p className="text-xs text-ink-secondary flex-1">
+                  {t("editor.first_line_misaligned") ||
+                    "La primera línea parece estar en 0:00 pero la canción arranca más tarde."}{" "}
+                  <span className="text-gray-500">
+                    {t("editor.first_line_misaligned_hint") || "¿Moverla a"}{" "}
+                    <span className="font-mono text-amber-300">{formatTimestamp(suggested)}</span>?
+                  </span>
+                </p>
+                <button
+                  onClick={fixFirstOnly}
+                  className="shrink-0 text-[11px] font-medium px-3 py-1.5 rounded-lg bg-amber-500/15 text-amber-300
+                    ring-1 ring-amber-500/30 hover:bg-amber-500/25 transition-colors"
+                >
+                  {t("editor.first_line_fix") || "Mover sólo línea 1"}
+                </button>
+              </div>
+            );
+          }
+        }
+
+        return null;
+      })()}
 
       {/* ─── Lyrics list ──────────────────────────────────────────── */}
       <p className="text-[11px] text-gray-600 mb-2 px-1">
