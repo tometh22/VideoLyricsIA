@@ -165,6 +165,7 @@ class Job(Base):
     user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
     tenant_id = Column(String(100), nullable=False, index=True)
     artist = Column(String(255), nullable=False)
+    song_title = Column(String(500), nullable=True)
     style = Column(String(50), default="oscuro")
     filename = Column(String(500), nullable=False)
     status = Column(String(20), nullable=False, default="processing", index=True)
@@ -208,6 +209,7 @@ class Job(Base):
         return {
             "job_id": self.job_id,
             "artist": self.artist,
+            "song_title": self.song_title,
             "style": self.style,
             "filename": self.filename,
             "tenant_id": self.tenant_id,
@@ -245,6 +247,7 @@ class Job(Base):
             "job_id": self.job_id,
             "status": self.status,
             "artist": self.artist,
+            "song_title": self.song_title,
             "filename": self.filename,
             "delivery_profile": self.delivery_profile,
             "prores_ready": (
@@ -423,6 +426,7 @@ def _migrate_user_columns():
     column_adds = [
         "ALTER TABLE users ADD COLUMN IF NOT EXISTS allow_overage BOOLEAN DEFAULT FALSE NOT NULL",
         "ALTER TABLE jobs ADD COLUMN IF NOT EXISTS umg_short_url VARCHAR(500)",
+        "ALTER TABLE jobs ADD COLUMN IF NOT EXISTS song_title VARCHAR(500)",
     ]
     with engine.begin() as conn:
         for sql in column_adds:

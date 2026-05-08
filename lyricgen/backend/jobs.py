@@ -19,6 +19,7 @@ def create_job(
     delivery_profile: str = "youtube",
     umg_spec: Optional[dict] = None,
     initial_status: str = "processing",
+    song_title: str = "",
 ) -> str:
     """Create a new job and return its ID. `initial_status` is "processing"
     when there's worker capacity OR "queued" when the system / tenant is at
@@ -31,6 +32,7 @@ def create_job(
         user_id=user_id,
         tenant_id=tenant_id,
         artist=artist,
+        song_title=song_title or None,
         style=style,
         filename=filename,
         delivery_profile=delivery_profile,

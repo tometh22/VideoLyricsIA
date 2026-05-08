@@ -221,7 +221,8 @@ def run_pipeline(job_id: str, mp3_path: str, artist: str, style: str,
                  font: str = "",
                  concept: str = "",
                  movement_style: str = "",
-                 animate_image: bool = False):
+                 animate_image: bool = False,
+                 song_title: str = ""):
     """Run the full pipeline for a job. Called synchronously.
 
     delivery_profile:
@@ -416,6 +417,7 @@ def run_pipeline(job_id: str, mp3_path: str, artist: str, style: str,
             _, chosen_font, bg_source = generate_lyric_video(
                 mp3_path, segments, style, job_dir, artist, bg_image_path,
                 font=chosen_font, spec=intermediate_spec,
+                song_title=song_title,
             )
             files["video_url"] = f"/download/{job_id}/video"
             update_job(job_id, progress=55)
@@ -638,8 +640,120 @@ def _filter_whisper_hallucinations(segments: list[dict]) -> tuple[list[dict], in
     return out, len(segments) - len(out)
 
 
+def _filter_intro_song_overlap(
+    intro_segs: list[dict],
+    song_segs: list[dict],
+    threshold: float = 0.7,
+) -> tuple[list[dict], int]:
+    """Drop intro Whisper segments that fuzzy-match the song's opening
+    lines. When a user uploads a track with an instrumental intro,
+    Whisper run on the prefix slice often hallucinates the first verse
+    (using the lrclib `lyrics_hint` as a noisy prior) at start≈0. We
+    then concatenate that hallucinated segment in front of the
+    LRCLIB-aligned song segments — producing a phantom "first line at
+    0:00.0" in the editor while the real first line sits at the offset.
+
+    Heuristic: only drop intro segs whose start is before the song's
+    first sung line AND whose normalised text fuzzy-matches one of the
+    first few song segments (≥ `threshold`). Intro segs that sit fully
+    inside the instrumental window but transcribe genuinely different
+    text (e.g. a spoken-word preamble) survive.
+    """
+    if not intro_segs or not song_segs:
+        return intro_segs, 0
+    from difflib import SequenceMatcher
+
+    def _norm(t: str) -> str:
+        return _normalize_token(" ".join((t or "").split()))
+
+    song_heads = [_norm(s.get("text") or "") for s in song_segs[:4]]
+    song_first_start = float(song_segs[0].get("start", 0.0))
+    kept: list[dict] = []
+    dropped = 0
+    for s in intro_segs:
+        t_norm = _norm(s.get("text") or "")
+        if not t_norm:
+            kept.append(s)
+            continue
+        if float(s.get("start", 0.0)) >= song_first_start:
+            kept.append(s)
+            continue
+        is_dup = any(
+            sh and SequenceMatcher(None, t_norm, sh).ratio() >= threshold
+            for sh in song_heads
+        )
+        if is_dup:
+            dropped += 1
+            continue
+        kept.append(s)
+    return kept, dropped
+
+
 _WHISPER_MODELS: dict = {}
 _WHISPER_LOCK = None
+
+
+def _fix_lrc_first_line_at_zero(
+    segments: list[dict],
+    audio_duration: float | None = None,
+) -> tuple[list[dict], float | None]:
+    """Auto-correct the lrclib "first line at [00:00.00]" quirk.
+
+    A non-trivial fraction of community-curated LRCs anchor line 1 to
+    song time 0 even when there's a long instrumental intro before the
+    first vocal. Trusting the LRC then shows the first lyric pinned to
+    0:00 in the editor / video while the actual vocal entry sits ~15 s
+    later — exactly the bug the operator hit on Intoxicados — "No Tengo
+    Ganas".
+
+    We can't ground-truth the vocal entry without a VAD pass, but the
+    LRC's OWN cadence betrays the quirk: the gap between line 1 and
+    line 2 is dramatically larger than the median gap between
+    subsequent verse / chorus lines. When all three of these hold we
+    relocate line 1 to ``line2.start - median_gap`` (the spot a normal
+    cadence would put it):
+
+      - segments[0].start <= 1.0
+      - gap(line1, line2) > 2 × median(gaps in lines 2..6)
+      - gap(line1, line2) > 8 s in absolute terms
+
+    The thresholds are conservative — a song with a normal 4-second
+    intro on line 1 won't false-positive (gap to line 2 is ~8 s but
+    the ratio against the median typically isn't > 2×).
+
+    Returns (segments_with_first_fixed, suggested_new_start_or_None).
+    The second value is logged by the caller for observability.
+    """
+    if len(segments) < 4:
+        return segments, None
+    first = segments[0]
+    second = segments[1]
+    first_start = float(first.get("start", 0.0))
+    second_start = float(second.get("start", 0.0))
+    if first_start > 1.0:
+        return segments, None
+    gaps: list[float] = []
+    for i in range(1, min(len(segments) - 1, 6)):
+        gaps.append(float(segments[i + 1]["start"]) - float(segments[i]["start"]))
+    if not gaps:
+        return segments, None
+    gaps.sort()
+    median_gap = gaps[len(gaps) // 2]
+    first_gap = second_start - first_start
+    if median_gap <= 0:
+        return segments, None
+    if first_gap < median_gap * 2 or first_gap < 8.0:
+        return segments, None
+    suggested = max(0.0, second_start - median_gap)
+    seg_dur = max(0.5, float(first.get("end", suggested)) - first_start)
+    new_end = suggested + seg_dur
+    if audio_duration:
+        new_end = min(float(audio_duration), new_end)
+    # Don't let the new line bleed into line 2.
+    if new_end > second_start - 0.05:
+        new_end = max(suggested + 0.5, second_start - 0.05)
+    fixed_first = {**first, "start": suggested, "end": new_end}
+    return [fixed_first] + list(segments[1:]), suggested
 
 
 def _get_whisper_model(name: str = "turbo"):
@@ -4165,6 +4279,7 @@ def generate_lyric_video(
     bg_image_path: str | None = None,
     spec: RenderSpec | None = None,
     font: str | None = None,
+    song_title: str = "",
 ) -> tuple[str, str, str | None]:
     """Generate a lyric video. Returns (video_path, font, bg_source).
 
@@ -4255,16 +4370,27 @@ def generate_lyric_video(
     # was past 3s, leaving "ARTIST/Title" stamped at top while the big
     # drop title also showed centered.
     first_lyric_start = segments[0]["start"] if segments else duration
-    raw_name = os.path.splitext(os.path.basename(mp3_path))[0]
-    title_song = raw_name
-    if " - " in raw_name:
-        title_song = raw_name.split(" - ", 1)[1]
-    for sfx in ["(Official Video)", "(Official Audio)", "(Lyric Video)",
-                 "(Official Music Video)", "(Audio)", "(Video)", "(En Vivo)",
-                 "(Live)", "(Lyrics)"]:
-        title_song = title_song.replace(sfx, "").strip()
+    # Prefer the title the user explicitly set on the job — falls back to
+    # parsing the filename only when the job didn't carry one (legacy rows
+    # or batch CLI uploads). The filename heuristic now handles both
+    # "Artist - Title" and "Title_Artist" so a Suno-style export still
+    # gets a real overlay rendered.
+    if song_title:
+        title_song = song_title
+    else:
+        raw_name = os.path.splitext(os.path.basename(mp3_path))[0]
+        title_song = raw_name
+        if " - " in raw_name:
+            title_song = raw_name.split(" - ", 1)[1]
+        elif "_" in raw_name:
+            title_song = raw_name.split("_", 1)[0]
+        for sfx in ["(Official Video)", "(Official Audio)", "(Lyric Video)",
+                     "(Official Music Video)", "(Audio)", "(Video)", "(En Vivo)",
+                     "(Live)", "(Lyrics)"]:
+            title_song = title_song.replace(sfx, "").strip()
 
-    if artist:
+    if artist or title_song:
+        title_text = f"{artist}\n{title_song}".strip() if artist else title_song
         if first_lyric_start > 3:
             # Real intro — cinematic centered drop. Bigger font, fades
             # just before the first lyric so they don't crash into each
@@ -4272,18 +4398,22 @@ def generate_lyric_video(
             title_end = first_lyric_start - 0.5
             try:
                 title_layers = _make_text_clip(
-                    f"{artist}\n{title_song}", 0.5, title_end,
+                    title_text, 0.5, title_end,
                     font, spec=spec,
                 )
                 text_layers.extend(title_layers)
             except Exception as e:
                 print(f"[TITLE] center title failed ({e}); continuing")
         else:
-            # First lyric lands at/near t=0 — top-third compact card so
-            # the operator/viewer still gets the artist+title context
-            # without obscuring the lyric below it.
+            # First lyric lands at/near t=0 — top-third compact card.
+            # Cap the card's end at the first lyric's start (minus a
+            # 0.3 s buffer) so the title doesn't sit on top of the
+            # subtitle even when it's short. The previous fixed 5 s
+            # window left "ARTIST / Title" stamped over the first
+            # vocal line in songs without an intro silence.
             try:
-                top_title_text = f"{artist.upper()}\n{title_song}"
+                top_title_text = (f"{artist.upper()}\n{title_song}"
+                                  if artist else title_song)
                 top_size = max(36, int(round(58 * spec.text_scale)))
                 top_card = TextClip(
                     top_title_text,
@@ -4299,11 +4429,16 @@ def generate_lyric_video(
                 tw, th = top_card.size
                 top_x = (spec.width - tw) // 2
                 top_y = max(40, int(round(spec.height * 0.10)))
-                top_end = min(5.0, max(2.0, duration - 0.1))
-                top_card = (top_card.set_position((top_x, top_y))
-                                     .set_start(0.4)
-                                     .set_end(top_end))
-                text_layers.append(top_card)
+                top_end_cap = first_lyric_start - 0.3 if first_lyric_start > 0.7 else 0.4
+                top_end = min(5.0, max(0.4, min(top_end_cap, duration - 0.1)))
+                if top_end > 0.4:
+                    top_card = (top_card.set_position((top_x, top_y))
+                                         .set_start(0.4)
+                                         .set_end(top_end))
+                    text_layers.append(top_card)
+                else:
+                    print(f"[TITLE] first lyric at {first_lyric_start:.2f}s; "
+                          f"skipping top-card to avoid overlap")
             except Exception as e:
                 print(f"[TITLE] top title card failed ({e}); continuing without it")
 
