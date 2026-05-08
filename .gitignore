@@ -19,3 +19,7 @@ __pycache__/
 # and removes it on session teardown, but it survives if tests crash)
 lyricgen/backend/test.db
 lyricgen/backend/.pytest_cache/
+# Redis snapshots — created when running redis-server locally for the
+# stress / load tests; runtime artifact, not source.
+dump.rdb
+*.rdb
