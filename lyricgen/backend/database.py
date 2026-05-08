@@ -44,8 +44,16 @@ if DATABASE_URL.startswith("postgres://"):
 # 4 API + 4 RQ). Override with DB_POOL_SIZE / DB_MAX_OVERFLOW for capacity
 # tuning, but make sure max_connections on the DB matches:
 #   max_connections >= (api_workers + rq_workers) × (pool_size + max_overflow)
-_DB_POOL_SIZE = int(os.environ.get("DB_POOL_SIZE", "5"))
-_DB_MAX_OVERFLOW = int(os.environ.get("DB_MAX_OVERFLOW", "5"))
+# Default 8+8 per process (was 5+5). With 4 uvicorn workers + 3 RQ
+# workers + the prewarm worker, peak demand is roughly:
+#   4 API × (8+8) = 64 sockets
+#   3 RQ × (8+8) = 48 sockets
+# = 112 sockets total under burst, well below typical PG max_connections=200.
+# Bumping to 8+8 absorbs concurrent /upload + /status + /download +
+# update_job traffic during a 5-batch UMG flood without the previous
+# fragile margin where a single slow query could starve the pool.
+_DB_POOL_SIZE = int(os.environ.get("DB_POOL_SIZE", "8"))
+_DB_MAX_OVERFLOW = int(os.environ.get("DB_MAX_OVERFLOW", "8"))
 
 engine = create_engine(
     DATABASE_URL,

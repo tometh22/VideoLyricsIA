@@ -205,31 +205,64 @@ export default function JobDetail({ job, onBack, onJobUpdate }) {
       window.location.href = url;
     } catch {}
   };
-  // ProRes is generated lazily server-side from the existing MP4 the
-  // first time it's requested (~60-120 s of ffmpeg transcode). To avoid
-  // the "browser stuck" perception while ffmpeg runs, we fetch the .mov
-  // ourselves (so the toast can stay up for the full duration), then
-  // turn the response into a Blob URL and trigger a normal anchor
-  // download. The toast persists until the bytes arrive or fetch errors.
-  // Subsequent downloads of the same .mov hit the R2 cache (instant).
+  // ProRes is generated lazily server-side. Fast path: prewarm has
+  // already produced the .mov → 200 with bytes (or 302 to R2). Slow
+  // path: backend returns 202 + Retry-After when the transcode is
+  // queued or in progress; we keep the toast up and re-fetch until
+  // 200/302 lands. The whole point is to NEVER block a uvicorn worker
+  // for the 60-300 s of ffmpeg — under multi-tenant load, blocking
+  // would tie up workers and hang every other request.
+  //
+  // Hard ceiling at 8 minutes total wait (16 polls × 30 s). 4K@60 cold
+  // transcode + R2 upload is ~3-4 min; 8 min covers a queue depth of
+  // 2-3 jobs ahead before we give up and tell the user to retry.
   const [proResHint, setProResHint] = useState(null);
+  const PRORES_MAX_WAIT_MS = 8 * 60 * 1000;
+  const PRORES_POLL_FALLBACK_MS = 30 * 1000;
+
   const fetchProResAndSave = async (fileType, suggestedName) => {
     setProResHint(fileType);
+    const deadline = Date.now() + PRORES_MAX_WAIT_MS;
     try {
-      const url = await getDownloadUrl(job.job_id, fileType);
-      const res = await fetch(url);
-      if (!res.ok) throw new Error(`HTTP ${res.status}`);
-      const blob = await res.blob();
-      const blobUrl = URL.createObjectURL(blob);
-      const a = document.createElement("a");
-      a.href = blobUrl;
-      a.download = suggestedName;
-      a.click();
-      // Give the browser a beat to pick the blob up before revoking.
-      setTimeout(() => URL.revokeObjectURL(blobUrl), 60_000);
+      while (Date.now() < deadline) {
+        const url = await getDownloadUrl(job.job_id, fileType);
+        const res = await fetch(url);
+        if (res.status === 200) {
+          // Bytes arrived — turn into a blob download and exit.
+          const blob = await res.blob();
+          const blobUrl = URL.createObjectURL(blob);
+          const a = document.createElement("a");
+          a.href = blobUrl;
+          a.download = suggestedName;
+          a.click();
+          setTimeout(() => URL.revokeObjectURL(blobUrl), 60_000);
+          return;
+        }
+        if (res.status === 302) {
+          // Browser will follow this server-side; we trigger it as a
+          // direct navigation to keep the download UX consistent.
+          window.location.href = url;
+          return;
+        }
+        if (res.status === 202) {
+          // Backend queued/in-progress. Honour Retry-After header.
+          const retryHdr = parseInt(res.headers.get("Retry-After") || "", 10);
+          const retryMs = (Number.isFinite(retryHdr) && retryHdr > 0)
+            ? retryHdr * 1000
+            : PRORES_POLL_FALLBACK_MS;
+          await new Promise((r) => setTimeout(r, retryMs));
+          continue;
+        }
+        // Any other status is a hard error (400/404/500).
+        throw new Error(`HTTP ${res.status}`);
+      }
+      throw new Error("Tiempo de espera agotado");
     } catch (err) {
       console.error("ProRes download failed:", err);
-      alert(t("detail.prores_failed") || "No se pudo generar el ProRes. Intentá de nuevo en unos segundos.");
+      alert(
+        t("detail.prores_failed")
+        || `No se pudo generar el ProRes (${err.message || "error"}). Esperá unos minutos y volvé a intentar.`
+      );
     } finally {
       setProResHint(null);
     }

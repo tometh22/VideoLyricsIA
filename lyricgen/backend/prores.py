@@ -201,3 +201,133 @@ def prewarm_prores(job_id: str, file_type: str) -> str | None:
         logger.info("[PRORES] prewarm skipped for %s/%s: %s",
                     job_id, file_type, e)
         return None
+
+
+# ---------------------------------------------------------------------------
+# Non-blocking download status — used by /download/{id}/umg_master so a
+# uvicorn worker is never tied up for the 60-300 s of a 4K@60 transcode.
+# ---------------------------------------------------------------------------
+
+class ProResReadiness:
+    """Result of `check_prores_readiness`. Tells the API whether to serve
+    the file, redirect to R2, wait briefly, or return 202 + Retry-After."""
+
+    READY_LOCAL = "ready_local"
+    READY_R2 = "ready_r2"
+    IN_PROGRESS = "in_progress"
+    NOT_STARTED = "not_started"
+    MISCONFIGURED = "misconfigured"
+    SOURCE_MISSING = "source_missing"
+
+    def __init__(self, state: str, *, local_path: str | None = None,
+                 retry_after_seconds: int | None = None,
+                 detail: str | None = None):
+        self.state = state
+        self.local_path = local_path
+        self.retry_after_seconds = retry_after_seconds
+        self.detail = detail
+
+
+def _short_wait_for_lock(job_id: str, file_type: str, max_wait_seconds: float = 15.0) -> bool:
+    """If another caller is mid-transcode, wait briefly for it to finish.
+
+    Returns True iff the lock is acquired within max_wait. Reusing the
+    lock here would deadlock with the prewarm worker that's holding it,
+    so we just check `lock.locked()` and poll for `os.path.exists` on
+    the final path. 15 s catches the common end-of-transcode case
+    without tying up the request thread.
+    """
+    import time
+    final_path = os.path.join(OUTPUTS_DIR, job_id, FILE_MAP_PRORES[file_type])
+    lock = _prores_lock_for(job_id, file_type)
+    if not lock.locked():
+        return False
+    deadline = time.time() + max_wait_seconds
+    while time.time() < deadline:
+        if os.path.exists(final_path):
+            return True
+        time.sleep(0.5)
+    return False
+
+
+def check_prores_readiness(
+    job_id: str,
+    file_type: str,
+    job: dict,
+    tenant_id: str,
+    *,
+    short_wait_seconds: float = 15.0,
+) -> ProResReadiness:
+    """Inspect whether the .mov is ready to serve, in progress, or needs
+    a fresh enqueue. Designed for an HTTP request thread — never runs
+    ffmpeg, never blocks for more than `short_wait_seconds`. The API
+    layer translates the result into 200/302/202/400/404.
+
+    Decision tree:
+      1. .mov on local disk → READY_LOCAL.
+      2. .mov key in job.s3_keys → READY_R2 (caller redirects to signed URL).
+      3. Mid-transcode (lock held): wait up to short_wait_seconds for it
+         to land. If it lands → READY_LOCAL. Else → IN_PROGRESS with
+         retry_after.
+      4. Job has no umg_spec → MISCONFIGURED (400 to caller).
+      5. Source MP4 not local AND not in R2 → SOURCE_MISSING (404).
+      6. Otherwise → NOT_STARTED. Caller enqueues a prewarm and returns
+         202 with retry_after.
+
+    The IN_PROGRESS / NOT_STARTED retry_after values are conservative
+    estimates: 30 s for "almost done", 60 s for "freshly enqueued".
+    A 4K@60 cold transcode is ~90-120 s so 60 s gets a couple polls
+    before reaching it.
+    """
+    if file_type not in FILE_MAP_PRORES:
+        raise ValueError(
+            f"check_prores_readiness: unsupported file_type {file_type!r}"
+        )
+    final_path = os.path.join(OUTPUTS_DIR, job_id, FILE_MAP_PRORES[file_type])
+
+    # 1. local disk hit (post-prewarm or post-lazy)
+    if os.path.exists(final_path):
+        return ProResReadiness(ProResReadiness.READY_LOCAL, local_path=final_path)
+
+    # 2. R2 hit (after the upload, before any new local cache)
+    s3_keys = job.get("s3_keys") or {}
+    if s3_keys.get(file_type):
+        return ProResReadiness(ProResReadiness.READY_R2)
+
+    # 3. Validate job is eligible BEFORE we wait or enqueue.
+    if not job.get("umg_spec"):
+        return ProResReadiness(
+            ProResReadiness.MISCONFIGURED,
+            detail="This job did not request UMG delivery; ProRes not available.",
+        )
+
+    # 4. Mid-transcode: short-wait for completion.
+    if _short_wait_for_lock(job_id, file_type, max_wait_seconds=short_wait_seconds):
+        return ProResReadiness(ProResReadiness.READY_LOCAL, local_path=final_path)
+
+    # If we hit here and the lock is STILL held, the transcode is going
+    # to take a while longer. Tell the caller to poll.
+    if _prores_lock_for(job_id, file_type).locked():
+        return ProResReadiness(
+            ProResReadiness.IN_PROGRESS,
+            retry_after_seconds=30,
+            detail="ProRes transcode in progress; please retry shortly.",
+        )
+
+    # 5. Source MP4 missing locally AND not in R2 → can't transcode.
+    source_filename, source_key_name = _SOURCE_MP4[file_type]
+    source_local = os.path.join(OUTPUTS_DIR, job_id, source_filename)
+    if not os.path.exists(source_local) and not s3_keys.get(source_key_name):
+        return ProResReadiness(
+            ProResReadiness.SOURCE_MISSING,
+            detail=f"Source {source_filename} not available locally or in R2.",
+        )
+
+    # 6. Need to enqueue a prewarm. Caller does the enqueue (we don't
+    # import queue_jobs here to keep the worker entrypoint dependency
+    # graph tight).
+    return ProResReadiness(
+        ProResReadiness.NOT_STARTED,
+        retry_after_seconds=60,
+        detail="ProRes transcode queued; please retry in ~60 seconds.",
+    )

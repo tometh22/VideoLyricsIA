@@ -221,6 +221,31 @@ def on_startup():
     threading.Thread(target=_reaper_loop, daemon=True, name="reaper").start()
     logger.info("reaper thread started (threshold=100min, every 5min)")
 
+    # Outputs cleanup loop. Sweeps OUTPUTS_DIR every hour to keep
+    # local disk bounded — deletes jobs whose deliverables are on R2
+    # and retries the upload for jobs whose R2 push failed earlier.
+    # Without this, a transient R2 outage leaves multi-GB ProRes
+    # masters on disk forever and Railway disk fills over weeks.
+    def _outputs_cleanup_loop():
+        _time.sleep(120)  # let the API come up first
+        while True:
+            try:
+                from scripts.cleanup_old_outputs import cleanup as _cleanup_outputs
+                _cleanup_outputs()
+            except Exception:  # pragma: no cover
+                try:
+                    import sentry_sdk
+                    sentry_sdk.capture_exception()
+                except Exception:
+                    pass
+                _time.sleep(60)
+            _time.sleep(3600)  # 1 h between passes
+
+    threading.Thread(
+        target=_outputs_cleanup_loop, daemon=True, name="outputs-cleanup",
+    ).start()
+    logger.info("outputs-cleanup thread started (every 1 h)")
+
 
 # --- Background library (public, authenticated) ---
 _BACKGROUNDS_LIB = os.path.join(os.path.dirname(__file__), "..", "assets", "backgrounds", "library")
@@ -687,6 +712,46 @@ def _enforce_daily_volume_cap(db: Session, current_user: dict) -> None:
         )
 
 
+# Minimum free disk to accept a new upload. A single 4K@60 UMG render
+# needs ~3-5 GB of working space (source MP4 + ProRes master + short).
+# Refuse new work below this threshold so ffmpeg never trips ENOSPC
+# mid-render — that's the worst failure mode (corrupt output, dangling
+# .tmp files, undeletable locks). The outputs-cleanup loop should free
+# space within minutes; client retries succeed once it does.
+_MIN_FREE_DISK_GB_FOR_UPLOAD = float(
+    os.environ.get("MIN_FREE_DISK_GB_FOR_UPLOAD", "5")
+)
+
+
+def _enforce_disk_capacity() -> None:
+    """503 when local disk is too low to safely take another job.
+
+    The outputs-cleanup loop running in main reclaims space from
+    completed jobs / failed R2 uploads. If it can't keep up (hardware
+    full, R2 down for hours), we'd rather refuse new uploads than
+    half-render a UMG master and corrupt the deliverable.
+    """
+    try:
+        du = shutil.disk_usage(OUTPUTS_DIR)
+    except OSError:
+        return  # disk usage unavailable → don't block uploads on it
+    free_gb = du.free / 1024 / 1024 / 1024
+    if free_gb < _MIN_FREE_DISK_GB_FOR_UPLOAD:
+        logger.error(
+            "/upload refused: only %.1f GB free, minimum %.1f. Cleanup loop "
+            "should reclaim space soon; retry in a few minutes.",
+            free_gb, _MIN_FREE_DISK_GB_FOR_UPLOAD,
+        )
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "Servidor sin espacio en disco temporalmente. La limpieza "
+                "automática se ejecuta cada hora; reintentá en unos minutos."
+            ),
+            headers={"Retry-After": "300"},
+        )
+
+
 def _parse_umg_params(
     delivery_profile: str,
     umg_frame_size: str,
@@ -754,6 +819,7 @@ async def upload(
     _enforce_plan_quota(db, current_user)
     _enforce_daily_volume_cap(db, current_user)
     _enforce_tenant_backlog(db, current_user)
+    _enforce_disk_capacity()
     # Every submission is accepted as queued; RQ gives it to a worker the
     # moment one is free, and pipeline.run_pipeline flips status to
     # "processing" on its first line. No 429 for capacity reasons.
@@ -1324,6 +1390,7 @@ async def generate_with_segments(
     _enforce_plan_quota(db, current_user)
     _enforce_daily_volume_cap(db, current_user)
     _enforce_tenant_backlog(db, current_user)
+    _enforce_disk_capacity()
     # Every submission is accepted as queued; RQ gives it to a worker the
     # moment one is free, and pipeline.run_pipeline flips status to
     # "processing" on its first line. No 429 for capacity reasons.
@@ -1538,6 +1605,8 @@ _BUNDLE_TYPES = ("video", "short", "thumbnail")
 # RQ worker can import them without pulling in the FastAPI app.
 from prores import (
     ensure_prores_exists,
+    check_prores_readiness,
+    ProResReadiness,
     ProResMisconfigured,
     ProResSourceMissing,
 )
@@ -1682,22 +1751,56 @@ async def download(
 
     file_path = os.path.join(OUTPUTS_DIR, job_id, FILE_MAP[file_type])
 
-    # Lazy ProRes: the pipeline no longer produces umg_master.mov or
-    # umg_short.mov at render time. ensure_prores_exists serialises
-    # parallel callers via a per-(job_id, file_type) lock and writes
-    # via .tmp + os.replace so two simultaneous downloads can never
-    # corrupt the output. The G4 pre-warm worker shares this helper.
-    if file_type in ("umg_master", "umg_short") and not os.path.exists(file_path):
-        try:
-            ensure_prores_exists(job_id, file_type, job, tenant_id)
-        except ProResMisconfigured as exc:
-            raise HTTPException(status_code=400, detail=str(exc))
-        except ProResSourceMissing as exc:
-            raise HTTPException(status_code=404, detail=str(exc))
-        except Exception as exc:
-            raise HTTPException(
-                status_code=500,
-                detail=f"ProRes transcode failed: {exc}",
+    # Lazy ProRes path: never run ffmpeg synchronously in the request
+    # thread. check_prores_readiness short-waits up to 15 s if a
+    # transcode is mid-flight; otherwise tells us to enqueue a prewarm
+    # and respond 202 + Retry-After. UMG's "first download" is now
+    # bounded to whatever this thread does — no 60-300 s blocking,
+    # no uvicorn-worker exhaustion under concurrent load.
+    if file_type in ("umg_master", "umg_short"):
+        readiness = check_prores_readiness(job_id, file_type, job, tenant_id)
+        if readiness.state == ProResReadiness.READY_LOCAL:
+            pass  # fall through to FileResponse below
+        elif readiness.state == ProResReadiness.READY_R2:
+            # Re-fetch the s3_keys (a sibling caller may have just uploaded
+            # while we were checking the lock).
+            from jobs import get_job_model as _get_job_model
+            _model = _get_job_model(job_id)
+            s3_key = (_model.s3_keys or {}).get(file_type) if _model else None
+            if s3_key and storage.is_enabled():
+                url = storage.generate_signed_url(s3_key, expiry_seconds=3600)
+                if url:
+                    return RedirectResponse(url, status_code=302)
+            # R2 said yes but signed URL failed — fall through.
+        elif readiness.state == ProResReadiness.MISCONFIGURED:
+            raise HTTPException(status_code=400, detail=readiness.detail)
+        elif readiness.state == ProResReadiness.SOURCE_MISSING:
+            raise HTTPException(status_code=404, detail=readiness.detail)
+        elif readiness.state == ProResReadiness.NOT_STARTED:
+            # Kick off a prewarm in the background, then 202.
+            try:
+                from queue_jobs import enqueue_prores_prewarm
+                enqueue_prores_prewarm(job_id, file_type)
+            except Exception as e:  # pragma: no cover
+                logger.warning("[PRORES] enqueue prewarm from /download failed: %s", e)
+            return JSONResponse(
+                status_code=202,
+                content={
+                    "status": "queued",
+                    "detail": readiness.detail,
+                    "retry_after": readiness.retry_after_seconds,
+                },
+                headers={"Retry-After": str(readiness.retry_after_seconds)},
+            )
+        elif readiness.state == ProResReadiness.IN_PROGRESS:
+            return JSONResponse(
+                status_code=202,
+                content={
+                    "status": "in_progress",
+                    "detail": readiness.detail,
+                    "retry_after": readiness.retry_after_seconds,
+                },
+                headers={"Retry-After": str(readiness.retry_after_seconds)},
             )
 
     if not os.path.exists(file_path):
