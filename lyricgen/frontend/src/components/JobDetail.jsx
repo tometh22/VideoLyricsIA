@@ -1,6 +1,7 @@
 import { useState, useEffect, useRef } from "react";
 import { useI18n } from "../i18n";
 import { getDownloadUrl, useMediaUrl } from "../mediaUrl";
+import { JobDetailTour } from "./OnboardingTour";
 import ProResBadge from "./ProResBadge";
 
 const API = import.meta.env.VITE_API_URL || "";
@@ -363,6 +364,16 @@ export default function JobDetail({ job, onBack, onJobUpdate }) {
 
   return (
     <div className="w-full max-w-4xl animate-fade-in">
+      {/* JobDetail tour: auto-fires on the FIRST pending_review job a
+          new operator opens. The tour walks through approval semantics
+          + ProRes download. We read `user` from localStorage here so
+          we don't have to thread it through the route — the age-gate
+          just needs `created_at`. */}
+      <JobDetailTour
+        user={(() => { try { return JSON.parse(localStorage.getItem("genly_user") || "null"); } catch { return null; } })()}
+        hasUmgMaster={hasUmgMaster}
+        isPendingReview={isPendingReview}
+      />
       {/* Header */}
       <div className="flex items-end justify-between gap-4 mb-8">
         <div className="flex items-center gap-3 min-w-0">
@@ -376,7 +387,10 @@ export default function JobDetail({ job, onBack, onJobUpdate }) {
             <div className="flex items-center gap-2 flex-wrap">
               <h2 className="text-xl font-bold tracking-tight truncate">{name}</h2>
               {isPendingReview && (
-                <span className="px-2 py-0.5 rounded-full bg-amber-500/15 text-amber-300 ring-1 ring-amber-500/30 text-[10px] font-semibold uppercase tracking-wider">
+                <span
+                  data-tour="jobdetail-status-badge"
+                  className="px-2 py-0.5 rounded-full bg-amber-500/15 text-amber-300 ring-1 ring-amber-500/30 text-[10px] font-semibold uppercase tracking-wider"
+                >
                   {t("batch.pending_review") || "Pendiente"}
                 </span>
               )}
@@ -423,12 +437,20 @@ export default function JobDetail({ job, onBack, onJobUpdate }) {
             );
             return (
               <>
-                <button onClick={downloadAllZip} className="btn-secondary text-xs h-10 px-4">
+                <button
+                  onClick={downloadAllZip}
+                  className="btn-secondary text-xs h-10 px-4"
+                  data-tour="jobdetail-download-all"
+                >
                   {downloadIcon}
                   {t("detail.download_all") || "Descargar todo"}
                 </button>
                 {hasUmgMaster && (
-                  <button onClick={downloadProResMaster} className="btn-secondary text-xs h-10 px-4">
+                  <button
+                    onClick={downloadProResMaster}
+                    className="btn-secondary text-xs h-10 px-4"
+                    data-tour="jobdetail-prores-master"
+                  >
                     {downloadIcon}
                     {t("detail.download_master") || "Master ProRes"}
                   </button>
@@ -555,7 +577,10 @@ export default function JobDetail({ job, onBack, onJobUpdate }) {
       {/* Media preview (video / short / thumbnail) */}
       {activeTab !== "provenance" && activeTab !== "umg_master" && canPreview && (
         <>
-          <div className="rounded-card bg-surface-2/40 ring-1 ring-white/[0.04] overflow-hidden mb-4">
+          <div
+            data-tour="jobdetail-preview"
+            className="rounded-card bg-surface-2/40 ring-1 ring-white/[0.04] overflow-hidden mb-4"
+          >
             {activeTab === "thumbnail" ? (
               previewSrc ? (
                 <img
@@ -604,7 +629,10 @@ export default function JobDetail({ job, onBack, onJobUpdate }) {
 
       {/* Approval panel for pending_review */}
       {isPendingReview && (
-        <div className="rounded-card p-6 mb-6 animate-fade-in bg-gradient-to-br from-brand/[0.08] via-brand/[0.04] to-transparent ring-1 ring-brand/25">
+        <div
+          data-tour="jobdetail-approve-panel"
+          className="rounded-card p-6 mb-6 animate-fade-in bg-gradient-to-br from-brand/[0.08] via-brand/[0.04] to-transparent ring-1 ring-brand/25"
+        >
           <div className="flex items-center gap-2 mb-1.5">
             <svg className="w-4 h-4 text-brand-light" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
               <path d="M9 11l3 3L22 4M21 12v7a2 2 0 01-2 2H5a2 2 0 01-2-2V5a2 2 0 012-2h11" strokeLinecap="round" strokeLinejoin="round"/>
