@@ -1002,17 +1002,76 @@ async def transcribe_endpoint(
     current_user: dict = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
-    """Transcribe an MP3 or WAV and return segments for review/editing."""
+    """Transcribe an MP3 or WAV and return segments for review/editing.
+
+    Persists the uploaded audio to OUTPUTS_DIR/<job_id>/<filename> and (if R2
+    is enabled) to R2, and creates a Job row in `transcribed_pending` state.
+    Returns the job_id alongside the segments so the editor can call
+    /generate without re-uploading the file. The previous flow re-read the
+    same WAV twice (transcribe + generate) and OOMed the API container on
+    lossless uploads.
+    """
     if not file.filename.lower().endswith(_AUDIO_EXTENSIONS):
         raise HTTPException(status_code=400, detail="Only MP3 and WAV files are accepted.")
 
     import tempfile
     import asyncio
 
+    # Read the body once and validate (size + magic bytes). We still buffer
+    # the whole file in RAM here — streaming refactor lands in PR 2.
+    data = await file.read()
+    _validate_audio_upload(file, data)
+
+    artist_form = (artist or "").strip()
+    title_form = (title or "").strip()
+    parsed_artist, parsed_title = _parse_filename_artist_title(file.filename or "")
+    job_artist = artist_form or parsed_artist or "Unknown"
+    job_song_title = title_form or parsed_title
+
+    job_id = create_job(
+        db,
+        artist=job_artist,
+        style="oscuro",                    # set for real in /generate
+        filename=file.filename,
+        user_id=current_user["id"],
+        tenant_id=current_user["tenant_id"],
+        delivery_profile="youtube",        # set for real in /generate
+        initial_status="transcribed_pending",
+        song_title=job_song_title,
+    )
+
+    job_dir = os.path.join(OUTPUTS_DIR, job_id)
+    os.makedirs(job_dir, exist_ok=True)
+    audio_path = os.path.join(job_dir, file.filename)
+    with open(audio_path, "wb") as f:
+        f.write(data)
+    del data  # don't keep the body in RAM through the long Whisper / lrclib path
+
+    # Cross-replica handoff. When the API and worker run in separate
+    # containers (Railway production) the file written above is invisible
+    # to /generate if the next request lands on a different replica. Push
+    # to R2 so the worker can fetch it later.
+    if storage.is_enabled():
+        try:
+            input_r2_key = storage.upload_input(
+                audio_path, current_user["tenant_id"], job_id, file.filename,
+            )
+            if input_r2_key:
+                from jobs import get_job_model
+                job_row = get_job_model(db, job_id)
+                if job_row:
+                    job_row.input_r2_key = input_r2_key
+                    db.commit()
+        except Exception as e:
+            # Best-effort. Same-replica fallback still works via local disk;
+            # the cross-replica failure mode is the user re-doing the upload.
+            print(f"[TRANSCRIBE] R2 upload failed for {job_id}: {e}")
+
+    # Per-request scratch dir for intermediate slices (intro/body cuts).
+    # The main audio file lives under job_dir and stays around until
+    # /generate enqueues it (or the reaper cleans it up).
     tmp_dir = tempfile.mkdtemp()
-    tmp_path = os.path.join(tmp_dir, file.filename)
-    with open(tmp_path, "wb") as f:
-        shutil.copyfileobj(file.file, f)
+    tmp_path = audio_path
 
     try:
         lang = language.strip() if language.strip() else None
@@ -1186,6 +1245,7 @@ async def transcribe_endpoint(
                               f"{len(song_segs)} song), skipping main Whisper "
                               f"for {artist_hint!r} - {song_hint!r}")
                         return {
+                            "job_id": job_id,
                             "segments": combined,
                             "reference_lyrics": plain or synced,
                         }
@@ -1337,6 +1397,7 @@ async def transcribe_endpoint(
                               f"+ {len(intro_segments)} intro-Whisper "
                               f"segment(s)")
                         return {
+                            "job_id": job_id,
                             "segments": combined,
                             "reference_lyrics": plain,
                             "coverage_warning": True,
@@ -1356,7 +1417,7 @@ async def transcribe_endpoint(
                 combined, _dropped = _filter_whisper_hallucinations(combined)
                 if _dropped:
                     print(f"[TRANSCRIBE] dropped {_dropped} Whisper hallucination phrase(s)")
-                return {"segments": combined, "reference_lyrics": plain}
+                return {"job_id": job_id, "segments": combined, "reference_lyrics": plain}
 
         # Kick off Gemini-grounded lyrics fetch in parallel with Whisper.
         # The fetcher is best-effort (returns None on any failure); we wrap
@@ -1452,6 +1513,7 @@ async def transcribe_endpoint(
                           f"{len(merged) - plausible_count} synthesized, "
                           f"dur={user_dur:.1f}s)")
                     return {
+                        "job_id": job_id,
                         "segments": merged,
                         "reference_lyrics": reference,
                         "coverage_warning": True,
@@ -1462,12 +1524,14 @@ async def transcribe_endpoint(
         segments, _dropped = _filter_whisper_hallucinations(segments)
         if _dropped:
             print(f"[TRANSCRIBE] dropped {_dropped} Whisper hallucination phrase(s)")
-        return {"segments": segments, "reference_lyrics": reference}
+        return {"job_id": job_id, "segments": segments, "reference_lyrics": reference}
     finally:
+        # tmp_dir holds intermediate slices (intro/body cuts) only — the
+        # main audio (audio_path) is under job_dir and must survive until
+        # /generate enqueues it (or the reaper cleans it up).
         try:
-            os.unlink(tmp_path)
-            os.rmdir(tmp_dir)
-        except OSError:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+        except Exception:
             pass
 
 
@@ -1475,8 +1539,9 @@ async def transcribe_endpoint(
 @limiter.limit("120/minute")
 async def generate_with_segments(
     request: Request,
-    file: UploadFile = File(...),
-    artist: str = Form(...),
+    file: UploadFile = File(None),
+    job_id: str = Form(""),
+    artist: str = Form(""),
     song_title: str = Form(""),
     style: str = Form("oscuro"),
     language: str = Form(""),
@@ -1495,14 +1560,47 @@ async def generate_with_segments(
     current_user: dict = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
-    """Generate video using user-edited segments (skips Whisper)."""
-    data = await file.read()
-    _validate_mp3_upload(file, data)
+    """Generate video using user-edited segments (skips Whisper).
+
+    Two flows:
+      - **Reuse path** (`job_id` provided): the audio was already persisted
+        by /transcribe and we just promote the job to `queued`. No body
+        re-read, no re-upload to R2 — this is the path that fixes the
+        OOM-on-large-WAV bug.
+      - **Direct path** (no job_id, file required): legacy compat for
+        callers that bypassed /transcribe. Streams the file in like before.
+    """
+    job_id = (job_id or "").strip()
+    reuse = bool(job_id)
+
+    if reuse:
+        # Reuse path: verify the transcribed_pending job belongs to caller
+        # and pull the audio path / R2 key from the row.
+        from jobs import get_job_model
+        job_row = get_job_model(db, job_id)
+        if (not job_row
+                or job_row.user_id != current_user["id"]
+                or job_row.tenant_id != current_user["tenant_id"]):
+            raise HTTPException(status_code=404, detail="Job not found.")
+        if job_row.status != "transcribed_pending":
+            raise HTTPException(
+                status_code=409,
+                detail=f"Job is in state {job_row.status!r}, not transcribed_pending.",
+            )
+        existing_filename = job_row.filename
+        existing_input_r2_key = job_row.input_r2_key
+    else:
+        if file is None or not file.filename:
+            raise HTTPException(status_code=400, detail="Missing file or job_id.")
+        data = await file.read()
+        _validate_mp3_upload(file, data)
+        existing_filename = file.filename
+        existing_input_r2_key = None
 
     artist = (artist or "").strip()
     song_title = (song_title or "").strip()
     if not artist or not song_title:
-        parsed_artist, parsed_title = _parse_filename_artist_title(file.filename or "")
+        parsed_artist, parsed_title = _parse_filename_artist_title(existing_filename or "")
         if not artist:
             artist = parsed_artist
         if not song_title:
@@ -1532,27 +1630,55 @@ async def generate_with_segments(
         raise HTTPException(status_code=429, detail="Free plan limit reached. Upgrade to continue.")
 
     tenant_id = current_user["tenant_id"]
-    job_id = create_job(
-        db,
-        artist=artist, style=style, filename=file.filename,
-        user_id=current_user["id"], tenant_id=tenant_id,
-        delivery_profile=delivery_profile, umg_spec=umg_spec,
-        initial_status=initial_status,
-        song_title=song_title,
-    )
+
+    if reuse:
+        # Promote the existing transcribed_pending row in place — fill in
+        # the fields the editor finalised + flip status to queued.
+        job_row = get_job_model(db, job_id)
+        job_row.artist = artist
+        job_row.song_title = song_title or None
+        job_row.style = style
+        job_row.delivery_profile = delivery_profile
+        job_row.umg_spec = umg_spec
+        job_row.status = initial_status
+        job_row.current_step = "queued"
+        db.commit()
+    else:
+        job_id = create_job(
+            db,
+            artist=artist, style=style, filename=existing_filename,
+            user_id=current_user["id"], tenant_id=tenant_id,
+            delivery_profile=delivery_profile, umg_spec=umg_spec,
+            initial_status=initial_status,
+            song_title=song_title,
+        )
+
     job_dir = os.path.join(OUTPUTS_DIR, job_id)
     os.makedirs(job_dir, exist_ok=True)
 
-    mp3_path = os.path.join(job_dir, file.filename)
-    with open(mp3_path, "wb") as f:
-        f.write(data)
+    mp3_path = os.path.join(job_dir, existing_filename)
 
-    # Cross-container input transfer via R2 — see /upload for the full reason.
-    input_r2_key = None
-    if storage.is_enabled():
-        input_r2_key = storage.upload_input(
-            mp3_path, current_user["tenant_id"], job_id, file.filename,
-        )
+    if reuse:
+        input_r2_key = existing_input_r2_key
+        # Local file MAY not be on this replica; the worker fetches from
+        # R2 at run time when input_r2_key is set, so it's fine. If R2 is
+        # disabled and the file isn't here either, the pipeline will
+        # error out — same as any cross-replica edge case.
+    else:
+        with open(mp3_path, "wb") as f:
+            f.write(data)
+        # Cross-container input transfer via R2 — see /upload for the full reason.
+        input_r2_key = None
+        if storage.is_enabled():
+            input_r2_key = storage.upload_input(
+                mp3_path, current_user["tenant_id"], job_id, existing_filename,
+            )
+            if input_r2_key:
+                from jobs import get_job_model
+                job_row = get_job_model(db, job_id)
+                if job_row:
+                    job_row.input_r2_key = input_r2_key
+                    db.commit()
 
     # Resolve background: library asset > custom upload > AI generation
     bg_path = None

@@ -39,6 +39,42 @@ function authFetch(url, opts = {}) {
   const headers = { ...opts.headers, ...authHeaders() };
   return fetch(url, { ...opts, headers });
 }
+
+// Translates a fetch failure (network error or HTTP error response) into a
+// localized, actionable banner string. Replaces the previous generic
+// "Error al procesar. Intentá de nuevo." that hid the real cause —
+// Railway's edge returns 502 with no CORS headers when the API container
+// OOMs/timeouts on a large upload, so the browser sees only "Failed to
+// fetch" and we have to infer the cause from context.
+async function describeFetchError(err, res, t) {
+  if (!res) {
+    // Network-level failure (TypeError "Failed to fetch") OR a CORS-blocked
+    // 502 from the edge proxy. Most common cause in this app: the upload
+    // body was too large/slow and the edge cut the connection.
+    return t("batch.error_network_or_502");
+  }
+  if (res.status === 413) return t("batch.error_too_large");
+  if (res.status === 408 || res.status === 504) return t("batch.error_timeout");
+  if (res.status >= 500) {
+    let detail = "";
+    try {
+      const body = await res.clone().json();
+      detail = body && body.detail ? `: ${String(body.detail).slice(0, 200)}` : "";
+    } catch {
+      try {
+        const text = (await res.clone().text()).slice(0, 200).trim();
+        if (text && !text.startsWith("<")) detail = `: ${text}`;
+      } catch {}
+    }
+    return t("batch.error_server_5xx", { status: res.status }) + detail;
+  }
+  // 4xx (other than 408/413) — try to read a server-provided detail.
+  try {
+    const body = await res.clone().json();
+    if (body && body.detail) return String(body.detail);
+  } catch {}
+  return t("batch.error_http", { status: res.status, detail: "" });
+}
 // Same as authFetch but aborts after `timeoutMs`. Use for dashboard /
 // list hooks where a hung backend must surface as an error state, not
 // as a permanent spinner.
@@ -378,10 +414,16 @@ export default function App() {
     const _title = (entry.songTitle || "").trim();
     if (_title) formData.append("title", _title);
 
+    let transcribeRes = null;
     try {
-      const res = await authFetch(`${API}/transcribe`, { method: "POST", body: formData });
-      if (!res.ok) throw new Error(`Server error ${res.status}`);
-      const text = await res.text();
+      transcribeRes = await authFetch(`${API}/transcribe`, { method: "POST", body: formData });
+      if (!transcribeRes.ok) {
+        const reason = await describeFetchError(null, transcribeRes, t);
+        setTranscribing(false);
+        setTranscribeError(reason);
+        return;
+      }
+      const text = await transcribeRes.text();
       if (!text) throw new Error("Empty response");
       const data = JSON.parse(text);
       setTranscribing(false);
@@ -393,11 +435,16 @@ export default function App() {
         segments: data.segments, referenceLyrics: data.reference_lyrics || "",
         coverageWarning: !!data.coverage_warning,
         recoverySource: data.recovery_source || "",
+        // Backend returns the job_id of the persisted upload so /generate
+        // can reuse the same audio without re-uploading. Older backends
+        // omit this field — the worker falls back to attaching `_file`.
+        transcribeJobId: data.job_id || null,
         queueIdx: idx, queue,
       });
     } catch (err) {
       setTranscribing(false);
-      setTranscribeError(t("batch.error_server"));
+      const reason = await describeFetchError(err, transcribeRes, t);
+      setTranscribeError(reason);
     }
   };
 
@@ -409,6 +456,7 @@ export default function App() {
       genre: r.genre || "", font: r.font || "", concept: r.concept || "",
       movementStyle: r.movementStyle || "",
       segments: editedSegments,
+      transcribeJobId: r.transcribeJobId || null,
     }];
     setApprovedJobs(newApproved);
     setCurrentReview(null);
@@ -430,6 +478,7 @@ export default function App() {
       language: a.language, genre: a.genre || "", font: a.font || "",
       concept: a.concept || "", movementStyle: a.movementStyle || "",
       segments: a.segments,
+      transcribeJobId: a.transcribeJobId || null,
       status: "queued", current_step: null, progress: 0, job_id: null, error: null,
     }));
     setJobs(jobList);
@@ -445,7 +494,15 @@ export default function App() {
           idx === i ? { ...j, status: "processing", current_step: "background", progress: 22 } : j
         ));
         const formData = new FormData();
-        formData.append("file", jobList[i]._file);
+        // When /transcribe persisted the audio for us, send the job_id so
+        // the backend reuses the file from R2 / disk instead of re-reading
+        // a 30-50 MB WAV body. Falls back to the legacy file upload if the
+        // backend didn't return a job_id (older deploy).
+        if (jobList[i].transcribeJobId) {
+          formData.append("job_id", jobList[i].transcribeJobId);
+        } else {
+          formData.append("file", jobList[i]._file);
+        }
         formData.append("artist", jobList[i].artist);
         if (jobList[i].songTitle) formData.append("song_title", jobList[i].songTitle);
         formData.append("style", style);
@@ -465,21 +522,33 @@ export default function App() {
         if (backgroundId) formData.append("background_id", backgroundId);
         else if (backgroundFile) formData.append("background_file", backgroundFile);
 
+        let res = null;
         try {
-          const res = await authFetch(`${API}/generate`, { method: "POST", body: formData });
-          const data = await res.json();
-          if (data.detail) {
-            // Plan limit error
+          res = await authFetch(`${API}/generate`, { method: "POST", body: formData });
+          let data;
+          try {
+            data = await res.json();
+          } catch {
+            // Non-JSON body (HTML error page from edge proxy on 502/504).
+            const reason = await describeFetchError(null, res, t);
             setJobs((prev) => prev.map((j, idx) =>
-              idx === i ? { ...j, status: "error", error: data.detail } : j
+              idx === i ? { ...j, status: "error", error: reason } : j
+            ));
+            continue;
+          }
+          if (!res.ok || data.detail) {
+            const reason = data.detail || await describeFetchError(null, res, t);
+            setJobs((prev) => prev.map((j, idx) =>
+              idx === i ? { ...j, status: "error", error: reason } : j
             ));
             continue;
           }
           setJobs((prev) => prev.map((j, idx) => (idx === i ? { ...j, job_id: data.job_id } : j)));
           await pollJob(data.job_id);
-        } catch {
+        } catch (err) {
+          const reason = await describeFetchError(err, res, t);
           setJobs((prev) => prev.map((j, idx) =>
-            idx === i ? { ...j, status: "error", error: t("batch.error_server") } : j
+            idx === i ? { ...j, status: "error", error: reason } : j
           ));
         }
       }
@@ -555,7 +624,14 @@ export default function App() {
           }
           // Success or terminal non-retryable error.
           if (res.status !== 429 && res.status !== 503) {
-            data = await res.json();
+            try {
+              data = await res.json();
+            } catch {
+              // Non-JSON body (e.g. HTML error page from edge proxy on
+              // 502/504). Synthesize a detail so the post-loop error
+              // surfacer (describeFetchError) can pick it up.
+              data = null;
+            }
             break;
           }
           // Peek at the body so we can pick the right retry strategy.
@@ -626,8 +702,16 @@ export default function App() {
           attempt++;
         }
         if (networkError || !res || !data) {
+          // No response at all (TypeError) → network/CORS-blocked-502.
+          // Have a response but JSON failed → use res to derive a status-
+          // specific message.
+          const reason = await describeFetchError(
+            networkError ? new TypeError("network") : null,
+            networkError ? null : res,
+            t,
+          );
           setJobs((prev) => prev.map((j, idx) =>
-            idx === i ? { ...j, status: "error", error: t("batch.error_server") } : j
+            idx === i ? { ...j, status: "error", error: reason } : j
           ));
           continue;
         }
