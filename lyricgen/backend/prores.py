@@ -182,13 +182,21 @@ def prewarm_prores(job_id: str, file_type: str) -> str | None:
     on os.path.exists. Returns the path either way.
     """
     from jobs import get_job_model
+    from database import SessionLocal
 
-    model = get_job_model(job_id=job_id)
-    if model is None:
-        logger.info("[PRORES] prewarm: job %s vanished; skipping", job_id)
-        return None
-    job = model.to_dict()
-    tenant_id = model.tenant_id
+    db = SessionLocal()
+    try:
+        model = get_job_model(db, job_id)
+        if model is None:
+            logger.info("[PRORES] prewarm: job %s vanished; skipping", job_id)
+            return None
+        # Snapshot the data we need before closing the session — calling
+        # ensure_prores_exists outside the session avoids holding a
+        # connection for the full ffmpeg run.
+        job = model.to_dict()
+        tenant_id = model.tenant_id
+    finally:
+        db.close()
 
     try:
         path = ensure_prores_exists(job_id, file_type, job, tenant_id)

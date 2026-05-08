@@ -1740,6 +1740,7 @@ async def download(
         raise HTTPException(status_code=404, detail="Job not found.")
     if job["status"] != "done":
         raise HTTPException(status_code=400, detail="Job is not done yet.")
+    tenant_id = current_user["tenant_id"]
 
     # Prefer a pre-signed URL to R2 so the uvicorn worker isn't tied up
     # streaming multi-GB ProRes masters.

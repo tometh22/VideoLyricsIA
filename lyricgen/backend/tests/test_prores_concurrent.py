@@ -174,7 +174,7 @@ def test_ensure_prores_serialises_parallel_callers(fake_outputs):
 def test_prewarm_prores_returns_none_when_job_missing(fake_outputs, monkeypatch):
     """Worker must not raise when the job vanished (deleted) between
     enqueue and execution — RQ would mark it failed."""
-    monkeypatch.setattr("jobs.get_job_model", lambda job_id: None)
+    monkeypatch.setattr("jobs.get_job_model", lambda db, job_id: None)
     assert prores.prewarm_prores("ghost", "umg_master") is None
 
 
@@ -184,5 +184,5 @@ def test_prewarm_prores_swallows_misconfigured(fake_outputs, monkeypatch):
     fake_model = MagicMock()
     fake_model.tenant_id = "t"
     fake_model.to_dict.return_value = {"umg_spec": None, "s3_keys": {}}
-    monkeypatch.setattr("jobs.get_job_model", lambda job_id: fake_model)
+    monkeypatch.setattr("jobs.get_job_model", lambda db, job_id: fake_model)
     assert prores.prewarm_prores("nonumgjob", "umg_master") is None
