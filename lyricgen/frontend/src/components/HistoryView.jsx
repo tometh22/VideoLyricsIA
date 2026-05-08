@@ -51,9 +51,28 @@ function StatusBadge({ status, t }) {
 const DELETABLE = new Set(["processing", "queued", "error", "validation_failed"]);
 
 function VideoCard({ job, onSelect, onDelete, selected, onToggleSelect, t }) {
-  const name = (job.filename || "").replace(/\.mp3$/i, "");
-  const songName = name.includes(" - ") ? name.split(" - ").slice(1).join(" - ") : name;
-  const artistName = job.artist || (name.includes(" - ") ? name.split(" - ")[0] : "");
+  // Prefer the structured fields the operator filled in / the backend
+  // backfilled from the filename. Fall back to the legacy filename split
+  // only for jobs that pre-date the song_title column.
+  const fallbackName = (job.filename || "").replace(/\.(mp3|wav|m4a|flac|aac|ogg)$/i, "");
+  let songName = (job.song_title || "").trim();
+  let artistName = (job.artist || "").trim();
+  if (!songName) {
+    if (fallbackName.includes(" - ")) {
+      songName = fallbackName.split(" - ").slice(1).join(" - ");
+    } else if (fallbackName.includes("_")) {
+      songName = fallbackName.split("_")[0];
+    } else {
+      songName = fallbackName;
+    }
+  }
+  if (!artistName) {
+    if (fallbackName.includes(" - ")) {
+      artistName = fallbackName.split(" - ")[0];
+    } else if (fallbackName.includes("_")) {
+      artistName = fallbackName.split("_").slice(1).join("_");
+    }
+  }
   const showThumb = job.status === "done" || job.status === "pending_review";
   const thumbSrc = useMediaUrl(showThumb ? job.job_id : "", "thumbnail", "preview");
   const canDelete = DELETABLE.has(job.status);

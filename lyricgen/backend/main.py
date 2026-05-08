@@ -499,6 +499,43 @@ MAX_UPLOAD_MB = int(os.environ.get("MAX_UPLOAD_MB", "100"))
 _MP3_MAGIC_BYTES = (b"ID3", b"\xff\xfb", b"\xff\xf3", b"\xff\xf2")
 _AUDIO_EXTENSIONS = (".mp3", ".wav")
 
+_TITLE_NOISE_SUFFIXES = (
+    "(Official Video)", "(Official Audio)", "(Lyric Video)",
+    "(Official Music Video)", "(Audio)", "(Video)", "(En Vivo)",
+    "(Live)", "(Lyrics)",
+)
+
+
+def _parse_filename_artist_title(filename: str) -> tuple[str, str]:
+    """Best-effort artist/title extraction from a bare filename. Handles two
+    naming conventions the operator commonly uploads under:
+
+      "Artist - Title.ext"   → ("Artist", "Title")
+      "Title_Artist.ext"     → ("Artist", "Title")   ← Suno/YouTube export form
+
+    Falls back to ("", basename) when neither separator is present so the
+    caller can decide whether to insist on a manual entry. Studio-version
+    suffixes like "(Official Video)" are stripped from the title in either
+    case so the lrclib lookup matches.
+    """
+    if not filename:
+        return "", ""
+    base = filename
+    for ext in (".mp3", ".wav", ".m4a", ".flac", ".aac", ".ogg"):
+        if base.lower().endswith(ext):
+            base = base[: -len(ext)]
+            break
+    artist, title = "", base.strip()
+    if " - " in base:
+        head, _, tail = base.partition(" - ")
+        artist, title = head.strip(), tail.strip()
+    elif "_" in base:
+        head, _, tail = base.partition("_")
+        title, artist = head.strip(), tail.strip()
+    for sfx in _TITLE_NOISE_SUFFIXES:
+        title = title.replace(sfx, "").strip()
+    return artist, title
+
 
 def _validate_audio_upload(file, data: bytes) -> None:
     """Validate a freshly-read audio payload (MP3 or WAV). Raises 400 on
@@ -731,6 +768,7 @@ async def upload(
     request: Request,
     file: UploadFile = File(...),
     artist: str = Form(...),
+    song_title: str = Form(""),
     style: str = Form("oscuro"),
     language: str = Form(""),
     delivery_profile: str = Form("youtube"),
@@ -750,6 +788,21 @@ async def upload(
     """Receive an MP3 and start processing."""
     data = await file.read()
     _validate_mp3_upload(file, data)
+
+    # Backfill artist/title from the filename when the client omitted them.
+    # Two formats are supported (the operator picks whichever is convenient):
+    #   "Artist - Title.ext"     → artist="Artist", title="Title"
+    #   "Title_Artist.ext"       → title="Title",  artist="Artist"
+    # The `_` form is what the YouTube/Suno export tool emits and what the
+    # operator was uploading when the title was lost end-to-end.
+    artist = (artist or "").strip()
+    song_title = (song_title or "").strip()
+    if not artist or not song_title:
+        parsed_artist, parsed_title = _parse_filename_artist_title(file.filename or "")
+        if not artist:
+            artist = parsed_artist
+        if not song_title:
+            song_title = parsed_title
 
     _enforce_plan_quota(db, current_user)
     _enforce_daily_volume_cap(db, current_user)
@@ -779,6 +832,7 @@ async def upload(
         user_id=current_user["id"], tenant_id=tenant_id,
         delivery_profile=delivery_profile, umg_spec=umg_spec,
         initial_status=initial_status,
+        song_title=song_title,
     )
     job_dir = os.path.join(OUTPUTS_DIR, job_id)
     os.makedirs(job_dir, exist_ok=True)
@@ -847,6 +901,7 @@ async def upload(
         concept=concept,
         movement_style=movement_style,
         animate_image=str(animate_image).strip().lower() in ("true", "1", "yes", "on"),
+        song_title=song_title,
     )
 
     return {"job_id": job_id, "status": initial_status}
@@ -1016,6 +1071,13 @@ async def transcribe_endpoint(
                                       f"({diff:.1f}s) — falling back")
                                 use_synced = False
                     if use_synced and song_segs and len(song_segs) >= 8:
+                        from pipeline import _filter_intro_song_overlap
+                        hybrid_intro_segs, _dup = _filter_intro_song_overlap(
+                            hybrid_intro_segs, song_segs,
+                        )
+                        if _dup:
+                            print(f"[LYRICS] discarded {_dup} intro seg(s) as "
+                                  f"song-line hallucinations")
                         combined = hybrid_intro_segs + song_segs
                         print(f"[LYRICS] lrclib synced hit — "
                               f"{len(combined)} segments "
@@ -1157,6 +1219,13 @@ async def transcribe_endpoint(
                         start_time=intro_offset,
                     )
                     if recovered:
+                        from pipeline import _filter_intro_song_overlap
+                        intro_segments, _dup = _filter_intro_song_overlap(
+                            intro_segments, recovered,
+                        )
+                        if _dup:
+                            print(f"[LYRICS] discarded {_dup} intro seg(s) "
+                                  f"as song-line hallucinations (recovery)")
                         combined = intro_segments + recovered
                         print(f"[LYRICS] hallucination detected ({reason}) "
                               f"— auto-recovered with {len(recovered)} "
@@ -1174,6 +1243,13 @@ async def transcribe_endpoint(
                         }
                 # Happy path: Whisper returned plausibly-many segments.
                 # Combine intro Whisper (if any) with the body output.
+                from pipeline import _filter_intro_song_overlap
+                intro_segments, _dup = _filter_intro_song_overlap(
+                    intro_segments, segments,
+                )
+                if _dup:
+                    print(f"[LYRICS] discarded {_dup} intro seg(s) as "
+                          f"song-line hallucinations")
                 combined = intro_segments + segments
                 from pipeline import _filter_whisper_hallucinations
                 combined, _dropped = _filter_whisper_hallucinations(combined)
@@ -1300,6 +1376,7 @@ async def generate_with_segments(
     request: Request,
     file: UploadFile = File(...),
     artist: str = Form(...),
+    song_title: str = Form(""),
     style: str = Form("oscuro"),
     language: str = Form(""),
     segments_json: str = Form(...),
@@ -1320,6 +1397,15 @@ async def generate_with_segments(
     """Generate video using user-edited segments (skips Whisper)."""
     data = await file.read()
     _validate_mp3_upload(file, data)
+
+    artist = (artist or "").strip()
+    song_title = (song_title or "").strip()
+    if not artist or not song_title:
+        parsed_artist, parsed_title = _parse_filename_artist_title(file.filename or "")
+        if not artist:
+            artist = parsed_artist
+        if not song_title:
+            song_title = parsed_title
 
     _enforce_plan_quota(db, current_user)
     _enforce_daily_volume_cap(db, current_user)
@@ -1350,6 +1436,7 @@ async def generate_with_segments(
         user_id=current_user["id"], tenant_id=tenant_id,
         delivery_profile=delivery_profile, umg_spec=umg_spec,
         initial_status=initial_status,
+        song_title=song_title,
     )
     job_dir = os.path.join(OUTPUTS_DIR, job_id)
     os.makedirs(job_dir, exist_ok=True)
@@ -1408,6 +1495,7 @@ async def generate_with_segments(
         concept=concept,
         movement_style=movement_style,
         animate_image=str(animate_image).strip().lower() in ("true", "1", "yes", "on"),
+        song_title=song_title,
     )
 
     return {"job_id": job_id, "status": initial_status}

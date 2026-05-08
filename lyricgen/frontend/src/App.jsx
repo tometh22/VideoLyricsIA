@@ -330,6 +330,7 @@ export default function App() {
     if (!files.length || !files.every((f) => f.artist.trim())) return;
     const jobList = files.map((f) => ({
       filename: f.file.name, _file: f.file, artist: f.artist.trim(),
+      songTitle: (f.songTitle || "").trim(),
       language: f.language, genre: f.genre || "", font: f.font || "",
       concept: f.concept || "", movementStyle: f.movementStyle || "",
       status: "queued", current_step: null,
@@ -349,14 +350,12 @@ export default function App() {
     const formData = new FormData();
     formData.append("file", entry.file);
     if (entry.language) formData.append("language", entry.language);
-    // Forward the artist (and a derived title) so the backend's reference-
-    // lyrics fetcher (Gemini-grounded search) gets clean inputs even when
-    // the MP3 filename is something generic like "track.mp3".
+    // Forward the artist + title the operator filled in (UploadZone
+    // pre-populates them by parsing the filename, but the user can
+    // override) so the backend's reference-lyrics fetcher gets clean
+    // inputs even when the MP3 filename is something generic.
     if (entry.artist) formData.append("artist", entry.artist);
-    const _title = entry.file.name
-      .replace(/\.mp3$/i, "")
-      .replace(/^.*?\s-\s/, "")
-      .trim();
+    const _title = (entry.songTitle || "").trim();
     if (_title) formData.append("title", _title);
 
     try {
@@ -368,6 +367,7 @@ export default function App() {
       setTranscribing(false);
       setCurrentReview({
         file: entry.file, artist: entry.artist, language: entry.language,
+        songTitle: entry.songTitle || "",
         genre: entry.genre || "", font: entry.font || "",
         concept: entry.concept || "", movementStyle: entry.movementStyle || "",
         segments: data.segments, referenceLyrics: data.reference_lyrics || "",
@@ -385,6 +385,7 @@ export default function App() {
     const r = currentReview;
     const newApproved = [...approvedJobs, {
       file: r.file, artist: r.artist, language: r.language,
+      songTitle: r.songTitle || "",
       genre: r.genre || "", font: r.font || "", concept: r.concept || "",
       movementStyle: r.movementStyle || "",
       segments: editedSegments,
@@ -405,6 +406,7 @@ export default function App() {
   const startGenerationWithSegments = async (approved) => {
     const jobList = approved.map((a) => ({
       filename: a.file.name, _file: a.file, artist: a.artist,
+      songTitle: (a.songTitle || "").trim(),
       language: a.language, genre: a.genre || "", font: a.font || "",
       concept: a.concept || "", movementStyle: a.movementStyle || "",
       segments: a.segments,
@@ -425,6 +427,7 @@ export default function App() {
         const formData = new FormData();
         formData.append("file", jobList[i]._file);
         formData.append("artist", jobList[i].artist);
+        if (jobList[i].songTitle) formData.append("song_title", jobList[i].songTitle);
         formData.append("style", style);
         if (jobList[i].language) formData.append("language", jobList[i].language);
         if (jobList[i].genre) formData.append("genre", jobList[i].genre);
@@ -475,6 +478,7 @@ export default function App() {
         const formData = new FormData();
         formData.append("file", jobList[i]._file);
         formData.append("artist", jobList[i].artist);
+        if (jobList[i].songTitle) formData.append("song_title", jobList[i].songTitle);
         formData.append("style", style);
         formData.append("delivery_profile", delivery.delivery_profile);
         if (delivery.delivery_profile !== "youtube") {

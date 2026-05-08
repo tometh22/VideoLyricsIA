@@ -210,10 +210,32 @@ export default function UploadZone({
     { code: "anton",           label: "Anton",                             css: "'Anton', sans-serif",      weight: 400 },
   ];
 
-  const extractArtist = (filename) => {
-    const name = filename.replace(/\.(mp3|wav)$/i, "");
-    if (name.includes(" - ")) return name.split(" - ")[0].trim();
-    return "";
+  // Two upload conventions are supported:
+  //   "Artist - Title.ext"  → artist=Artist, song=Title
+  //   "Title_Artist.ext"    → song=Title,    artist=Artist
+  // The `_` form is what Suno / YouTube exports emit, and what the
+  // operator was uploading when the title was lost end-to-end. Stripping
+  // " (Official Video)" / etc. keeps the lrclib lookup hitting.
+  const parseFilename = (filename) => {
+    const name = filename.replace(/\.(mp3|wav|m4a|flac|aac|ogg)$/i, "");
+    let artist = "";
+    let song = name.trim();
+    if (name.includes(" - ")) {
+      const [head, ...rest] = name.split(" - ");
+      artist = head.trim();
+      song = rest.join(" - ").trim();
+    } else if (name.includes("_")) {
+      const [head, ...rest] = name.split("_");
+      song = head.trim();
+      artist = rest.join("_").trim();
+    }
+    const noise = [
+      "(Official Video)", "(Official Audio)", "(Lyric Video)",
+      "(Official Music Video)", "(Audio)", "(Video)", "(En Vivo)",
+      "(Live)", "(Lyrics)",
+    ];
+    for (const sfx of noise) song = song.replace(sfx, "").trim();
+    return { artist, song };
   };
 
   const [batchTruncated, setBatchTruncated] = useState(0);
@@ -242,11 +264,15 @@ export default function UploadZone({
       const accepted = okSize.slice(0, remaining);
       const dropped = okSize.length - accepted.length;
       if (dropped > 0) setBatchTruncated(dropped);
-      const newEntries = accepted.map((f) => ({
-        file: f,
-        artist: extractArtist(f.name),
-        language: "",
-      }));
+      const newEntries = accepted.map((f) => {
+        const { artist, song } = parseFilename(f.name);
+        return {
+          file: f,
+          artist,
+          songTitle: song,
+          language: "",
+        };
+      });
       return [...prev, ...newEntries];
     });
   };
@@ -526,6 +552,19 @@ export default function UploadZone({
                 {!entry.artist.trim() && (
                   <p className="text-[11px] text-amber-400/80">
                     {t("upload.artist_required") || "Nombre del artista es requerido"}
+                  </p>
+                )}
+                <input
+                  type="text"
+                  value={entry.songTitle || ""}
+                  onChange={(e) => updateField(i, "songTitle", e.target.value)}
+                  placeholder={t("upload.song_title") || "Nombre de la canción"}
+                  className="w-full px-3 py-1.5 rounded-lg bg-surface-1 border border-white/[0.06]
+                    focus:border-brand/50 focus:outline-none text-sm text-white placeholder-gray-500 transition-all"
+                />
+                {!(entry.songTitle || "").trim() && (
+                  <p className="text-[11px] text-gray-600">
+                    {t("upload.song_title_hint") || "Si lo dejás vacío, lo inferimos del nombre del archivo"}
                   </p>
                 )}
                 <div className="flex items-center gap-1.5">
