@@ -40,6 +40,36 @@ JWT_SECRET = os.environ.get("JWT_SECRET", _DEFAULT_INSECURE_SECRET)
 JWT_ALGORITHM = os.environ.get("JWT_ALGORITHM", "HS256")
 JWT_EXPIRE_MINUTES = int(os.environ.get("JWT_EXPIRE_MINUTES", "1440"))
 
+# Tenants allowed to request the broadcast / ProRes deliverable. Comma-
+# separated list, e.g. "umg,warner". The product otherwise hides every
+# ProRes-related affordance — broadcast clients are private B2B and we
+# don't want their brand names visible to retail / self-serve users.
+# Admin role bypasses this list (so the operator account can demo /
+# QC the feature without opting into a specific tenant).
+PRORES_TENANTS = {
+    t.strip().lower()
+    for t in os.environ.get("PRORES_TENANTS", "").split(",")
+    if t.strip()
+}
+
+
+def has_prores_access(user) -> bool:
+    """True iff `user` is allowed to request a broadcast (ProRes) master.
+
+    Accepts either a SQLAlchemy `User` model or the dict produced by
+    `get_current_user`. Returns False for unauthenticated callers. The
+    rule is intentionally simple — admin OR allow-listed tenant —
+    because the policy lives entirely in the operator's hands (env var
+    + tenant assignment when creating the user).
+    """
+    if user is None:
+        return False
+    role = getattr(user, "role", None) if not isinstance(user, dict) else user.get("role")
+    if role == "admin":
+        return True
+    tenant_id = getattr(user, "tenant_id", None) if not isinstance(user, dict) else user.get("tenant_id")
+    return (tenant_id or "").lower() in PRORES_TENANTS
+
 # Anyone who knows the default secret can forge admin tokens, so running with
 # it in production is unacceptable. Fail fast at import time.
 _ENV = os.environ.get("ENV", "dev").lower()
@@ -339,6 +369,12 @@ async def get_current_user(
         "plan": user.plan_id,
         "allow_overage": getattr(user, "allow_overage", False) or False,
         "stripe_customer_id": user.stripe_customer_id,
+        # Capability flags consumed by the frontend to gate UI. Keep
+        # the shape stable — `features.<name>: bool` — so adding new
+        # gates later doesn't churn the client.
+        "features": {
+            "prores_export": has_prores_access(user),
+        },
     }
 
 

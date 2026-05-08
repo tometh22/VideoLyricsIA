@@ -321,7 +321,7 @@ export default function UploadZone({
               onChange={(v) => setDeliveryProfile(v)}
               options={[
                 { code: "youtube", label: "MP4 H.264 1080p (YouTube / Instagram / TikTok)" },
-                { code: "both", label: "MP4 + ProRes 422 HQ master (UMG)" },
+                { code: "both", label: "MP4 + ProRes 422 HQ (broadcast master)" },
               ]}
               className="w-72"
               ariaLabel={t("upload.delivery") || "Entrega"}
@@ -928,7 +928,13 @@ export default function UploadZone({
         {_dropZone}
         {_filesBlock}
         {_bgBlock}
-        {files.length > 0 && _deliveryBlock}
+        {/* Delivery selector — broadcast (ProRes) profiles are gated by
+            user.features.prores_export. Non-eligible users get a silent
+            default of MP4/YouTube, which is what `delivery_profile` is
+            already initialised to in state. Hiding the whole block (vs.
+            disabling it) keeps the UI clean for the 99% of users who
+            never need anything other than MP4. */}
+        {files.length > 0 && user?.features?.prores_export && _deliveryBlock}
       </div>
 
       {/* Sticky bottom CTA bar — replaces the disconnected buttons that
