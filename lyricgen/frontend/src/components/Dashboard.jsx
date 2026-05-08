@@ -2,6 +2,7 @@ import { useState, useEffect } from "react";
 import { useI18n } from "../i18n";
 import { useMediaUrl } from "../mediaUrl";
 import { DashboardTour } from "./OnboardingTour";
+import ProResBadge from "./ProResBadge";
 
 const API = import.meta.env.VITE_API_URL || "";
 
@@ -77,7 +78,14 @@ function VideoCard({ job, onSelect }) {
         </div>
       </div>
       <div className="px-3.5 py-3">
-        <p className="text-[13px] font-medium text-white truncate">{songName || "Sin nombre"}</p>
+        <div className="flex items-start gap-2 min-w-0">
+          <p className="text-[13px] font-medium text-white truncate flex-1 min-w-0">{songName || "Sin nombre"}</p>
+          <ProResBadge
+            deliveryProfile={job.delivery_profile}
+            proresReady={job.prores_ready}
+            jobStatus={job.status}
+          />
+        </div>
         <p className="text-[11px] text-gray-500 truncate mt-0.5">
           {artistName}
           {job.created_at && <span className="ml-1.5 text-gray-600">· {timeAgo(job.created_at)}</span>}

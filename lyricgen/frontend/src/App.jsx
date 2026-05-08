@@ -491,42 +491,112 @@ export default function App() {
         if (backgroundId) formData.append("background_id", backgroundId);
         else if (backgroundFile) formData.append("background_file", backgroundFile);
 
-        // Retry-on-429 with exponential backoff. Batch uploads of 30+ files can
-        // briefly exceed the per-user rate limit; 429s are transient, not failures.
-        // EXCEPTION: a 429 with "batch limit" is structural — the user has too
-        // many jobs in flight. Retrying won't help until previous jobs finish;
-        // surface the error directly instead of looping.
+        // Soft-fail handling: instead of marking the upload as a hard
+        // failure on transient or capacity errors, we keep the job
+        // visible as "esperando" and retry behind the scenes. Three
+        // distinct cases the operator should never see as a red error:
+        //
+        //   • 429 rate-limit (burst):  short backoff, retry up to
+        //     MAX_RATE_LIMIT_RETRIES with exponential 2^attempt s.
+        //   • 429 batch-limit (tenant
+        //     backlog cap reached):    longer poll, retry up to
+        //     MAX_BATCH_LIMIT_RETRIES every BATCH_LIMIT_POLL_MS until
+        //     a slot frees. UMG's batch flow lives or dies on this —
+        //     the operator should perceive it as "tu video se va a
+        //     subir solo cuando se libere un lugar".
+        //   • 503 disk-full (server
+        //     temporarily out of space): honour Retry-After header,
+        //     retry up to MAX_DISK_RETRIES.
+        //
+        // Hard errors (any other 4xx, 5xx, network) still surface as
+        // red so the operator can act. Rate-limit / batch-limit /
+        // disk-full are infrastructure pressure, not user errors.
         let res = null;
         let data = null;
         let attempt = 0;
-        const MAX_429_RETRIES = 5;
+        const MAX_RATE_LIMIT_RETRIES = 5;
+        const MAX_BATCH_LIMIT_RETRIES = 30;     // ≈15 min @ 30 s polls
+        const MAX_DISK_RETRIES = 8;             // ≈40 min worst case
+        const BATCH_LIMIT_POLL_MS = 30_000;
         let networkError = false;
-        let batchLimitHit = false;
-        while (attempt <= MAX_429_RETRIES) {
+        let totalAttempts = 0;
+        const MAX_TOTAL_ATTEMPTS = 40;
+        while (totalAttempts < MAX_TOTAL_ATTEMPTS) {
+          totalAttempts++;
           try {
             res = await authFetch(`${API}/upload`, { method: "POST", body: formData });
           } catch {
             networkError = true;
             break;
           }
-          if (res.status !== 429) {
+          // Success or terminal non-retryable error.
+          if (res.status !== 429 && res.status !== 503) {
             data = await res.json();
             break;
           }
-          // Peek at the body to distinguish rate-limit-burst from batch-limit.
-          // A batch-limit 429 contains "batch limit" in the detail; rate-limit
-          // 429s contain "Rate limit exceeded".
+          // Peek at the body so we can pick the right retry strategy.
           let body = null;
           try { body = await res.clone().json(); } catch { body = null; }
-          if (body && body.detail && /batch limit/i.test(body.detail)) {
-            data = body;
-            batchLimitHit = true;
+          const detail = (body && body.detail) || "";
+
+          if (res.status === 503) {
+            // Disk-full or transient Redis-unreachable. Honour the
+            // Retry-After header (set by the disk gate to 300 s).
+            if (attempt >= MAX_DISK_RETRIES) {
+              data = body || { detail: t("batch.error_server") };
+              break;
+            }
+            const retryAfter = parseInt(res.headers.get("Retry-After") || "", 10);
+            const waitMs = Math.max(15_000, (Number.isFinite(retryAfter) ? retryAfter : 60) * 1000);
+            const nextAt = Math.round(waitMs / 1000);
+            setJobs((prev) => prev.map((j, idx) =>
+              idx === i ? {
+                ...j,
+                status: "queued",
+                error: null,
+                queue_reason: "server_busy",
+                queue_retry_in_s: nextAt,
+              } : j
+            ));
+            await new Promise((r) => setTimeout(r, waitMs));
+            attempt++;
+            continue;
+          }
+
+          // res.status === 429 from here.
+          if (/batch limit|backlog/i.test(detail)) {
+            // Tenant backlog cap. Wait for a slot, retry quietly.
+            if (attempt >= MAX_BATCH_LIMIT_RETRIES) {
+              data = body;
+              break;
+            }
+            setJobs((prev) => prev.map((j, idx) =>
+              idx === i ? {
+                ...j,
+                status: "queued",
+                error: null,
+                queue_reason: "team_backlog",
+                queue_retry_in_s: Math.round(BATCH_LIMIT_POLL_MS / 1000),
+              } : j
+            ));
+            await new Promise((r) => setTimeout(r, BATCH_LIMIT_POLL_MS));
+            attempt++;
+            continue;
+          }
+          // Plain rate-limit burst.
+          if (attempt >= MAX_RATE_LIMIT_RETRIES) {
+            data = body || { detail: t("batch.error_server") };
             break;
           }
-          // 429: wait 2^attempt seconds (2, 4, 8, 16, 32) then retry.
-          const waitMs = Math.min(32000, 2000 * Math.pow(2, attempt));
+          const waitMs = Math.min(32_000, 2000 * Math.pow(2, attempt));
           setJobs((prev) => prev.map((j, idx) =>
-            idx === i ? { ...j, status: "queued", error: null } : j
+            idx === i ? {
+              ...j,
+              status: "queued",
+              error: null,
+              queue_reason: "rate_limit",
+              queue_retry_in_s: Math.round(waitMs / 1000),
+            } : j
           ));
           await new Promise((r) => setTimeout(r, waitMs));
           attempt++;
@@ -543,7 +613,14 @@ export default function App() {
           ));
           continue;
         }
-        setJobs((prev) => prev.map((j, idx) => (idx === i ? { ...j, job_id: data.job_id } : j)));
+        setJobs((prev) => prev.map((j, idx) =>
+          idx === i ? {
+            ...j,
+            job_id: data.job_id,
+            queue_reason: undefined,
+            queue_retry_in_s: undefined,
+          } : j
+        ));
         await pollJob(data.job_id);
       }
     };

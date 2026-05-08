@@ -1,6 +1,7 @@
 import { useState, useEffect, useRef } from "react";
 import { useI18n } from "../i18n";
 import { getDownloadUrl, useMediaUrl } from "../mediaUrl";
+import ProResBadge from "./ProResBadge";
 
 const API = import.meta.env.VITE_API_URL || "";
 
@@ -382,6 +383,21 @@ export default function JobDetail({ job, onBack, onJobUpdate }) {
                   {t("batch.validation_failed") || "Falló validación"}
                 </span>
               )}
+              <ProResBadge
+                deliveryProfile={job.delivery_profile}
+                proresReady={
+                  // Header lookup: master + short are both R2-cached
+                  // when the prewarm finished. Either field path
+                  // (s3_keys or files.umg_master_url) signals "ready"
+                  // depending on the version of /jobs that returned.
+                  Boolean(
+                    (job.s3_keys && job.s3_keys.umg_master && job.s3_keys.umg_short)
+                    || job.prores_ready
+                  )
+                }
+                jobStatus={job.status}
+                size="md"
+              />
               {job.status === "done" && job.approved_by && (
                 <span className="px-2 py-0.5 rounded-full bg-accent/15 text-accent ring-1 ring-accent/30 text-[10px] font-semibold uppercase tracking-wider">
                   {t("detail.approved") || "Aprobado"}
