@@ -112,6 +112,27 @@ export default function LyricsEditor({ segments, filename, audioFile, referenceL
   // last tap if the operator overshot.
   const [syncHistory, setSyncHistory] = useState([]);
 
+  // Manual-edit history. Each entry is the FULL `edited` snapshot taken
+  // BEFORE a mutation lands (single-line timestamp tweak, suggestion
+  // application, intro trim, etc.). Capped at 50 entries — that's enough
+  // to walk back through a normal review session without bloating React
+  // state. Cmd/Ctrl+Z pops one and replays it onto setEdited.
+  const [editHistory, setEditHistory] = useState([]);
+  const pushEditHistory = useCallback(() => {
+    setEditHistory((prev) => {
+      const next = [...prev, edited];
+      return next.length > 50 ? next.slice(next.length - 50) : next;
+    });
+  }, [edited]);
+  const undoEdit = useCallback(() => {
+    setEditHistory((prev) => {
+      if (!prev.length) return prev;
+      const snapshot = prev[prev.length - 1];
+      setEdited(snapshot);
+      return prev.slice(0, -1);
+    });
+  }, []);
+
   const startEditTimestamp = (seg) => {
     setEditingId(seg._id);
     setEditValue(formatTimestamp(seg.start));
@@ -120,10 +141,6 @@ export default function LyricsEditor({ segments, filename, audioFile, referenceL
     setEditingId(null);
     setEditValue("");
   };
-  // After committing an edit, capture the delta so we can offer to
-  // propagate it forward. Stored as { segId, delta, count } so we can
-  // undo or apply.
-  const [pendingPropagation, setPendingPropagation] = useState(null);
 
   const commitEditTimestamp = (seg) => {
     const parsed = parseTimestamp(editValue);
@@ -146,8 +163,12 @@ export default function LyricsEditor({ segments, filename, audioFile, referenceL
     const minAllowed = prevSeg ? prevSeg.end : 0;
     const maxAllowed = nextSeg ? Math.max(minAllowed, nextSeg.start - 0.1) : (duration || parsed);
     const newStart = Math.max(minAllowed, Math.min(parsed, maxAllowed));
-    const delta = newStart - seg.start;
 
+    // No-op edits (clamped value identical to current) shouldn't pollute
+    // the undo stack — the user's Ctrl+Z would feel broken otherwise.
+    if (Math.abs(newStart - seg.start) >= 1e-3) {
+      pushEditHistory();
+    }
     setEdited((prev) => prev.map((s) => {
       if (s._id !== seg._id) return s;
       // Preserve segment duration when the operator nudges the start
@@ -160,40 +181,14 @@ export default function LyricsEditor({ segments, filename, audioFile, referenceL
     }));
     setEditingId(null);
     setEditValue("");
-    // Offer to propagate when the change is meaningful (>0.3s) and
-    // there are following lines to receive it. We count by INDEX, not
-    // by start-time, so the count is correct even when a large delta
-    // re-orders the list relative to its previous state.
-    const followingCount = idx >= 0 ? edited.length - idx - 1 : 0;
-    if (Math.abs(delta) >= 0.3 && followingCount > 0) {
-      setPendingPropagation({ segId: seg._id, delta, count: followingCount });
-    } else {
-      setPendingPropagation(null);
-    }
+    // Manual edits never propagate to neighbouring lines. The earlier
+    // behaviour offered a "shift the rest by the same delta" banner,
+    // which the operator could miss (it sat above a long, scrolling
+    // list) and accidentally accept — they reported a single-line
+    // tweak that silently moved every following timestamp.
+    // Use Sync Mode (Space + tap) when you actually want to anchor
+    // a line and re-flow the rest.
   };
-
-  // Apply the captured delta to every segment that originally came AFTER
-  // the edited one (by _id, the stable original index). The previous
-  // implementation used a start-time threshold, which silently skipped or
-  // double-shifted overlapping rows from Whisper's occasional out-of-order
-  // output.
-  const applyPendingPropagation = () => {
-    if (!pendingPropagation) return;
-    const { segId, delta } = pendingPropagation;
-    setEdited((prev) =>
-      prev.map((s) => {
-        if (s._id <= segId) return s;
-        const segDur = Math.max(0.5, s.end - s.start);
-        const newStart = Math.max(0, s.start + delta);
-        let newEnd = newStart + segDur;
-        if (duration && newEnd > duration) newEnd = duration;
-        return { ...s, start: newStart, end: newEnd };
-      }),
-    );
-    setPendingPropagation(null);
-  };
-
-  const dismissPropagation = () => setPendingPropagation(null);
 
   // Active segment: the one whose [start, end] contains currentTime, or
   // the latest one whose start <= currentTime if no segment "owns" the
@@ -293,7 +288,6 @@ export default function LyricsEditor({ segments, filename, audioFile, referenceL
     // hears the run-up. Don't autoplay — let them press play when ready.
     const target = edited[safeIdx];
     if (target) seekTo(Math.max(0, target.start - 1.5), false);
-    setPendingPropagation(null);
   };
 
   const enterSyncMode = () => enterSyncModeAt(0);
@@ -349,6 +343,13 @@ export default function LyricsEditor({ segments, filename, audioFile, referenceL
         e.preventDefault();
         if (syncMode) tapAnchor();
         else togglePlay();
+      } else if ((e.metaKey || e.ctrlKey) && (e.key === "z" || e.key === "Z")) {
+        // Cmd/Ctrl+Z: undo. Sync Mode rolls back the last anchor (with
+        // its propagated future); outside Sync Mode it pops the manual
+        // edit history (single-line edits, suggestions, intro trim).
+        e.preventDefault();
+        if (syncMode) undoLastAnchor();
+        else undoEdit();
       } else if (syncMode && (e.key === "z" || e.key === "Z")) {
         e.preventDefault();
         undoLastAnchor();
@@ -359,7 +360,7 @@ export default function LyricsEditor({ segments, filename, audioFile, referenceL
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [togglePlay, syncMode, tapAnchor, undoLastAnchor]);
+  }, [togglePlay, syncMode, tapAnchor, undoLastAnchor, undoEdit]);
 
   // ─── Reference lyrics suggestions (unchanged) ───────────────────────
   const refLines = useMemo(() => {
@@ -384,6 +385,7 @@ export default function LyricsEditor({ segments, filename, audioFile, referenceL
   }, [segments, refLines]);
 
   const updateText = (id, text) => {
+    pushEditHistory();
     setEdited((prev) => prev.map((seg) => (seg._id === id ? { ...seg, text } : seg)));
   };
 
@@ -393,6 +395,7 @@ export default function LyricsEditor({ segments, filename, audioFile, referenceL
   };
 
   const applyAllSuggestions = () => {
+    pushEditHistory();
     setEdited((prev) =>
       prev.map((seg) => {
         const suggestion = suggestionsById[seg._id];
@@ -400,6 +403,24 @@ export default function LyricsEditor({ segments, filename, audioFile, referenceL
       })
     );
   };
+
+  // Shift the entire timeline by `delta` seconds, clamping start/end to
+  // [0, duration]. Used by the "Recortar intro" banner so the operator
+  // can collapse a long instrumental intro down to a configurable
+  // pre-roll without manually nudging every line.
+  const shiftAllSegments = useCallback((delta) => {
+    if (Math.abs(delta) < 0.05) return;
+    pushEditHistory();
+    setEdited((prev) =>
+      prev.map((s) => {
+        const segDur = Math.max(0.5, s.end - s.start);
+        const newStart = Math.max(0, s.start + delta);
+        let newEnd = newStart + segDur;
+        if (duration && newEnd > duration) newEnd = duration;
+        return { ...s, start: newStart, end: newEnd };
+      }),
+    );
+  }, [pushEditHistory, duration]);
 
   const deleteSeg = (id) => {
     setEdited((prev) => prev.filter((seg) => seg._id !== id));
@@ -525,16 +546,32 @@ export default function LyricsEditor({ segments, filename, audioFile, referenceL
         </div>
       )}
 
-      {hasSuggestions && (
-        <div className="flex items-center justify-between mb-4">
-          <p className="text-xs text-gray-500">
-            {pendingSuggestions} {t("editor.suggestions")}.
+      {(hasSuggestions || editHistory.length > 0) && (
+        <div className="flex items-center justify-between mb-4 gap-3">
+          <p className="text-xs text-gray-500 truncate">
+            {hasSuggestions
+              ? `${pendingSuggestions} ${t("editor.suggestions")}.`
+              : ""}
           </p>
-          <button onClick={applyAllSuggestions}
-            className="text-xs font-medium text-accent hover:text-accent/80 transition-colors flex items-center gap-1 px-3 py-1.5 rounded-lg bg-accent/5 hover:bg-accent/10">
-            <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" strokeWidth="2.5" viewBox="0 0 24 24"><polyline points="20 6 9 17 4 12"/></svg>
-            {t("editor.apply_all")}
-          </button>
+          <div className="flex items-center gap-2 shrink-0">
+            {editHistory.length > 0 && (
+              <button onClick={undoEdit}
+                title={t("editor.undo_hint") || "Cmd/Ctrl+Z"}
+                className="text-xs font-medium text-gray-400 hover:text-white transition-colors flex items-center gap-1 px-3 py-1.5 rounded-lg bg-white/[0.04] hover:bg-white/[0.08] ring-1 ring-white/[0.06]">
+                <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
+                  <path d="M3 7v6h6M3 13a9 9 0 109-9" strokeLinecap="round" strokeLinejoin="round" />
+                </svg>
+                {t("editor.undo") || "Deshacer"}
+              </button>
+            )}
+            {hasSuggestions && (
+              <button onClick={applyAllSuggestions}
+                className="text-xs font-medium text-accent hover:text-accent/80 transition-colors flex items-center gap-1 px-3 py-1.5 rounded-lg bg-accent/5 hover:bg-accent/10">
+                <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" strokeWidth="2.5" viewBox="0 0 24 24"><polyline points="20 6 9 17 4 12"/></svg>
+                {t("editor.apply_all")}
+              </button>
+            )}
+          </div>
         </div>
       )}
 
@@ -665,34 +702,39 @@ export default function LyricsEditor({ segments, filename, audioFile, referenceL
         </div>
       )}
 
-      {/* ─── Propagate-from-here banner (after a manual timestamp edit) ─── */}
-      {pendingPropagation && (
-        <div className="mb-3 px-3 py-2.5 rounded-card bg-accent/[0.06] ring-1 ring-accent/25 flex items-center gap-3 animate-fade-in">
-          <svg className="w-4 h-4 text-accent shrink-0" fill="none" stroke="currentColor" strokeWidth="1.8" viewBox="0 0 24 24">
-            <path d="M13 5l7 7-7 7M5 12h15" strokeLinecap="round" strokeLinejoin="round" />
+
+      {/* ─── Intro-trim banner ─────────────────────────────────────────
+          When the first lyric sits more than 3 s into the audio, the song
+          has a real instrumental intro (or lrclib applied an offset to
+          align the lrc to the user's "Official Video" cut). Offer to
+          collapse that intro down to a 2-second pre-roll or remove it
+          entirely. The shift propagates to every line and is undoable. */}
+      {!syncMode && edited.length > 0 && edited[0].start > 3 && (
+        <div className="mb-3 px-3 py-2.5 rounded-card bg-brand/[0.06] ring-1 ring-brand/20 flex items-center gap-3 animate-fade-in">
+          <svg className="w-4 h-4 text-brand-light shrink-0" fill="none" stroke="currentColor" strokeWidth="1.8" viewBox="0 0 24 24">
+            <path d="M9 18V5l12-2v13" /><circle cx="6" cy="18" r="3" /><circle cx="18" cy="16" r="3" />
           </svg>
           <p className="text-xs text-ink-secondary flex-1">
-            {t("editor.propagate_question") || "¿Aplicar"}{" "}
-            <span className="text-brand-light font-mono">
-              {pendingPropagation.delta > 0 ? "+" : ""}
-              {pendingPropagation.delta.toFixed(1)}s
-            </span>{" "}
-            {t("editor.propagate_to") || "a las"}{" "}
-            <span className="font-medium text-white">{pendingPropagation.count}</span>{" "}
-            {t("editor.propagate_following") || "líneas siguientes también?"}
+            {t("editor.intro_long_title") || "Tu canción arranca a"}{" "}
+            <span className="font-mono text-brand-light">{formatTimestamp(edited[0].start)}</span>
+            {" "}
+            <span className="text-gray-500">
+              ({Math.round(edited[0].start)}s {t("editor.intro_long_hint") || "de intro instrumental"})
+            </span>
           </p>
           <button
-            onClick={applyPendingPropagation}
-            className="shrink-0 text-[11px] font-medium px-3 py-1.5 rounded-lg bg-accent/20 text-accent
-              ring-1 ring-accent/40 hover:bg-accent/30 transition-colors"
+            onClick={() => shiftAllSegments(-(edited[0].start - 2))}
+            className="shrink-0 text-[11px] font-medium px-3 py-1.5 rounded-lg bg-brand/15 text-brand-light
+              ring-1 ring-brand/30 hover:bg-brand/25 transition-colors"
           >
-            {t("editor.propagate_yes") || "Sí, aplicar"}
+            {t("editor.intro_trim_to_2") || "Recortar a 2s"}
           </button>
           <button
-            onClick={dismissPropagation}
-            className="shrink-0 text-[11px] text-gray-500 hover:text-white px-2 py-1.5 transition-colors"
+            onClick={() => shiftAllSegments(-edited[0].start)}
+            className="shrink-0 text-[11px] font-medium px-3 py-1.5 rounded-lg bg-surface-2/60
+              ring-1 ring-white/[0.06] text-gray-300 hover:bg-surface-2 hover:text-white transition-colors"
           >
-            {t("editor.propagate_no") || "Solo esta"}
+            {t("editor.intro_trim_to_0") || "Empezar en 0s"}
           </button>
         </div>
       )}
