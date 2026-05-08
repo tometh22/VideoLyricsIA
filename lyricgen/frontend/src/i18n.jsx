@@ -289,6 +289,12 @@ const translations = {
     "batch.pending_review": "Pendiente de aprobacion",
     "batch.validation_failed": "Validacion fallida",
     "batch.error_server": "Error al procesar. Intentá de nuevo.",
+    "batch.error_network_or_502": "Sin respuesta del servidor (probable corte por archivo grande). Probá con un MP3 o revisá tu conexión.",
+    "batch.error_too_large": "El archivo supera el límite (100 MB). Convertilo a MP3 o recortalo.",
+    "batch.error_timeout": "La subida tardó demasiado. Probá con un MP3 (más liviano que WAV).",
+    "batch.error_server_5xx": "Error del servidor (HTTP {status}). Reintentá en unos minutos.",
+    "batch.error_http": "Error HTTP {status}: {detail}",
+    "batch.wav_warning_large": "Tu WAV pesa {sizeMB} MB. Las subidas grandes a veces fallan; recomendamos convertirlo a MP3.",
     "batch.confirm_cancel": "Hay videos en proceso. ¿Seguro que querés cancelar?",
     // Soft-queue messages — shown in amber on the job row when an
     // upload is being held back by capacity pressure. The user
@@ -756,6 +762,12 @@ const translations = {
     "batch.pending_review": "Pending review",
     "batch.validation_failed": "Validation failed",
     "batch.error_server": "Processing error. Please try again.",
+    "batch.error_network_or_502": "No response from the server (likely cut off by a large file). Try an MP3 or check your connection.",
+    "batch.error_too_large": "File exceeds the 100 MB limit. Convert it to MP3 or trim it.",
+    "batch.error_timeout": "Upload took too long. Try an MP3 (much smaller than WAV).",
+    "batch.error_server_5xx": "Server error (HTTP {status}). Try again in a few minutes.",
+    "batch.error_http": "HTTP {status}: {detail}",
+    "batch.wav_warning_large": "Your WAV is {sizeMB} MB. Large uploads sometimes fail; we recommend converting it to MP3.",
     "batch.queue_team_backlog": "Waiting for a free slot on your team. We'll resume the upload automatically when one frees up.",
     "batch.queue_server_busy": "Server is busy for a moment. We'll retry automatically in a few minutes.",
     "batch.queue_rate_limit": "Uploading… retrying in a few seconds.",
@@ -1216,6 +1228,12 @@ const translations = {
     "batch.pending_review": "Pendente de aprovacao",
     "batch.validation_failed": "Validacao falhou",
     "batch.error_server": "Erro ao processar. Tente novamente.",
+    "batch.error_network_or_502": "Sem resposta do servidor (provavelmente corte por arquivo grande). Tente um MP3 ou verifique sua conexão.",
+    "batch.error_too_large": "O arquivo excede o limite (100 MB). Converta para MP3 ou corte.",
+    "batch.error_timeout": "O upload demorou demais. Tente um MP3 (mais leve que WAV).",
+    "batch.error_server_5xx": "Erro do servidor (HTTP {status}). Tente novamente em alguns minutos.",
+    "batch.error_http": "Erro HTTP {status}: {detail}",
+    "batch.wav_warning_large": "Seu WAV pesa {sizeMB} MB. Uploads grandes às vezes falham; recomendamos converter para MP3.",
     "batch.confirm_cancel": "Há vídeos em processamento. Tem certeza que deseja cancelar?",
 
     "prov.title": "Provenance IA",
@@ -1393,8 +1411,14 @@ export function I18nProvider({ children }) {
     localStorage.setItem("genly_lang", newLang);
   }, []);
 
-  const t = useCallback((key) => {
-    return translations[lang]?.[key] || translations.es?.[key] || translations.en?.[key] || key;
+  const t = useCallback((key, vars) => {
+    let s = translations[lang]?.[key] || translations.es?.[key] || translations.en?.[key] || key;
+    if (vars) {
+      for (const k of Object.keys(vars)) {
+        s = s.replace(new RegExp(`\\{${k}\\}`, "g"), String(vars[k]));
+      }
+    }
+    return s;
   }, [lang]);
 
   return (

@@ -608,6 +608,103 @@ def _validate_audio_upload(file, data: bytes) -> None:
 _validate_mp3_upload = _validate_audio_upload
 
 
+# Streaming-upload chunk size. 1 MiB strikes a balance between syscall
+# overhead and memory footprint — small enough that 50 concurrent
+# uploads still fit in 256 MiB of buffers, large enough that the read /
+# write loop isn't dominated by Python overhead.
+_UPLOAD_CHUNK_SIZE = 1 << 20  # 1 MiB
+
+
+async def _stream_upload_to_disk(file, dest_path: str, *, max_mb: int = None) -> int:
+    """Stream `file` (Starlette UploadFile) to `dest_path` in 1 MiB chunks
+    and return the number of bytes written.
+
+    Replaces the previous `data = await file.read(); open(...).write(data)`
+    pattern, which buffered the entire body in RAM. On lossless WAV
+    uploads (~30-50 MB) and concurrent batches (3 users × 5 tracks ≈ 750
+    MB of buffers), the old pattern OOMed the API container; Railway
+    returned 502 with no CORS headers and the operator saw only a
+    generic error.
+
+    Acquires a shared upload slot via Redis so simultaneous uploads
+    across replicas can't burst past `MAX_CONCURRENT_UPLOADS`. Raises
+    503 + Retry-After on concurrency cap, 413 if the body exceeds
+    `max_mb` (defaults to `MAX_UPLOAD_MB`). The partial file is unlinked
+    before raising so a refused upload doesn't leave half-written bytes.
+    """
+    if max_mb is None:
+        max_mb = MAX_UPLOAD_MB
+    limit = max_mb * 1024 * 1024
+    size = 0
+    lease = _try_acquire_upload_slot()
+    f = open(dest_path, "wb")
+    try:
+        while True:
+            chunk = await file.read(_UPLOAD_CHUNK_SIZE)
+            if not chunk:
+                break
+            size += len(chunk)
+            if size > limit:
+                f.close()
+                try:
+                    os.unlink(dest_path)
+                except OSError:
+                    pass
+                raise HTTPException(
+                    status_code=413,
+                    detail=f"File too large (>{max_mb} MB).",
+                )
+            f.write(chunk)
+    finally:
+        if not f.closed:
+            f.close()
+        _release_upload_slot(lease)
+    return size
+
+
+def _validate_audio_file_on_disk(filename: str, path: str) -> None:
+    """Header-only audio validation that reads the first 16 bytes off
+    disk instead of the full body. Mirrors `_validate_audio_upload` but
+    without the in-memory size check — `_stream_upload_to_disk` handles
+    that on the way in."""
+    if not filename:
+        raise HTTPException(status_code=400, detail="Missing filename.")
+    name_lower = filename.lower()
+    if not name_lower.endswith(_AUDIO_EXTENSIONS):
+        raise HTTPException(
+            status_code=400,
+            detail="Only MP3 and WAV files are accepted.",
+        )
+    try:
+        with open(path, "rb") as fh:
+            header = fh.read(16)
+    except OSError as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Could not read uploaded file for validation: {e}",
+        )
+    if name_lower.endswith(".mp3"):
+        if not header.startswith(_MP3_MAGIC_BYTES):
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
+            raise HTTPException(
+                status_code=400,
+                detail="File does not look like a valid MP3 (magic bytes check failed).",
+            )
+    elif name_lower.endswith(".wav"):
+        if len(header) < 12 or header[:4] != b"RIFF" or header[8:12] != b"WAVE":
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
+            raise HTTPException(
+                status_code=400,
+                detail="File does not look like a valid WAV (RIFF/WAVE header check failed).",
+            )
+
+
 def _job_scope(current_user: dict) -> dict:
     """Return kwargs for jobs.get_job / jobs.get_all_jobs scoping reads
     to the caller's tenant.
@@ -792,6 +889,118 @@ def _enforce_disk_capacity() -> None:
         )
 
 
+# Memory pressure gate. We refuse new uploads when the API container is
+# already close to its memory cap so a 30-50 MB WAV being streamed in
+# doesn't push uvicorn into an OOM kill (Railway then returns 502 with
+# no CORS headers and the operator only sees a generic error). Set
+# above the streaming overhead headroom (~5%) so we leave room for the
+# upload itself.
+_MAX_MEMORY_PERCENT = float(os.environ.get("MAX_MEMORY_PERCENT", "85"))
+
+
+def _enforce_memory_pressure() -> None:
+    """503 + Retry-After when API container memory is above the cap.
+    Best-effort: psutil missing or read failure → don't block uploads."""
+    try:
+        import psutil
+    except ImportError:
+        return
+    try:
+        pct = psutil.virtual_memory().percent
+    except Exception:
+        return
+    if pct >= _MAX_MEMORY_PERCENT:
+        logger.warning(
+            "/upload refused: memory at %.1f%% (cap %.1f%%). "
+            "The frontend's 503 retry path will pick this up.",
+            pct, _MAX_MEMORY_PERCENT,
+        )
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "Servidor saturado momentáneamente. Reintentamos solos en "
+                "unos minutos."
+            ),
+            headers={"Retry-After": "60"},
+        )
+
+
+# Concurrent-upload counter. With the streaming refactor each upload
+# costs ~1 MiB of RAM regardless of file size, but the kernel's page
+# cache + ffmpeg subprocesses still consume real memory. Capping the
+# count gives a hard ceiling across replicas (Redis-shared) so a
+# UMG-style burst can't melt the API container even if memory_percent
+# hasn't crossed the threshold yet. Disabled when Redis is missing
+# (dev / tests) — the memory gate above still applies in that case.
+_MAX_CONCURRENT_UPLOADS = int(os.environ.get("MAX_CONCURRENT_UPLOADS", "8"))
+_UPLOAD_LEASE_TTL_S = int(os.environ.get("UPLOAD_LEASE_TTL_S", "600"))
+_UPLOAD_COUNTER_KEY = "uploads:in_flight"
+
+
+def _try_acquire_upload_slot() -> str | None:
+    """Reserve an upload slot in Redis. Returns a lease id (string) on
+    success, None when Redis isn't reachable (no enforcement), and
+    raises 503 when the cap is reached.
+
+    Slot release happens via `_release_upload_slot(lease_id)` after the
+    request finishes. The lease auto-expires via TTL so a crashed
+    request doesn't leak slots forever.
+    """
+    redis_url = os.environ.get("REDIS_URL", "").strip()
+    if not redis_url:
+        return None
+    try:
+        import uuid as _uuid
+        from redis import Redis
+        client = Redis.from_url(redis_url, socket_timeout=2)
+        # SADD + SCARD is atomic enough — within a Redis instance
+        # commands are serialized. The lease set holds active lease
+        # ids; we expire the SET so a wedged client can't hold slots
+        # forever (orphans are reaped on the next pass).
+        lease = _uuid.uuid4().hex[:12]
+        pipe = client.pipeline()
+        pipe.sadd(_UPLOAD_COUNTER_KEY, lease)
+        pipe.scard(_UPLOAD_COUNTER_KEY)
+        pipe.expire(_UPLOAD_COUNTER_KEY, _UPLOAD_LEASE_TTL_S)
+        _, count, _ = pipe.execute()
+    except Exception as e:  # pragma: no cover
+        logger.debug("upload concurrency: Redis unavailable (%s)", e)
+        return None
+    if count > _MAX_CONCURRENT_UPLOADS:
+        try:
+            client.srem(_UPLOAD_COUNTER_KEY, lease)
+        except Exception:
+            pass
+        logger.warning(
+            "/upload refused: %d concurrent uploads in flight (cap %d)",
+            count, _MAX_CONCURRENT_UPLOADS,
+        )
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "Estamos saturados con otros uploads. Reintentamos en unos "
+                "segundos."
+            ),
+            headers={"Retry-After": "30"},
+        )
+    return lease
+
+
+def _release_upload_slot(lease_id: str | None) -> None:
+    """Release a previously-acquired upload slot. Best-effort."""
+    if not lease_id:
+        return
+    redis_url = os.environ.get("REDIS_URL", "").strip()
+    if not redis_url:
+        return
+    try:
+        from redis import Redis
+        client = Redis.from_url(redis_url, socket_timeout=2)
+        client.srem(_UPLOAD_COUNTER_KEY, lease_id)
+    except Exception:  # pragma: no cover
+        pass
+
+
 def _parse_umg_params(
     delivery_profile: str,
     umg_frame_size: str,
@@ -869,8 +1078,14 @@ async def upload(
     db: Session = Depends(get_db),
 ):
     """Receive an MP3 and start processing."""
-    data = await file.read()
-    _validate_mp3_upload(file, data)
+    if not file.filename:
+        raise HTTPException(status_code=400, detail="Missing filename.")
+    name_lower = file.filename.lower()
+    if not name_lower.endswith(_AUDIO_EXTENSIONS):
+        raise HTTPException(
+            status_code=400,
+            detail="Only MP3 and WAV files are accepted.",
+        )
 
     # Backfill artist/title from the filename when the client omitted them.
     # Two formats are supported (the operator picks whichever is convenient):
@@ -891,6 +1106,7 @@ async def upload(
     _enforce_daily_volume_cap(db, current_user)
     _enforce_tenant_backlog(db, current_user)
     _enforce_disk_capacity()
+    _enforce_memory_pressure()
     # Every submission is accepted as queued; RQ gives it to a worker the
     # moment one is free, and pipeline.run_pipeline flips status to
     # "processing" on its first line. No 429 for capacity reasons.
@@ -922,8 +1138,8 @@ async def upload(
     os.makedirs(job_dir, exist_ok=True)
 
     mp3_path = os.path.join(job_dir, file.filename)
-    with open(mp3_path, "wb") as f:
-        f.write(data)
+    await _stream_upload_to_disk(file, mp3_path)
+    _validate_audio_file_on_disk(file.filename, mp3_path)
 
     # Upload the input MP3 to R2 regardless of whether the job will run now
     # or wait in the queue — the worker container fetches from R2 (the API
@@ -1002,17 +1218,76 @@ async def transcribe_endpoint(
     current_user: dict = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
-    """Transcribe an MP3 or WAV and return segments for review/editing."""
+    """Transcribe an MP3 or WAV and return segments for review/editing.
+
+    Persists the uploaded audio to OUTPUTS_DIR/<job_id>/<filename> and (if R2
+    is enabled) to R2, and creates a Job row in `transcribed_pending` state.
+    Returns the job_id alongside the segments so the editor can call
+    /generate without re-uploading the file. The previous flow re-read the
+    same WAV twice (transcribe + generate) and OOMed the API container on
+    lossless uploads.
+    """
     if not file.filename.lower().endswith(_AUDIO_EXTENSIONS):
         raise HTTPException(status_code=400, detail="Only MP3 and WAV files are accepted.")
+
+    _enforce_disk_capacity()
+    _enforce_memory_pressure()
 
     import tempfile
     import asyncio
 
+    artist_form = (artist or "").strip()
+    title_form = (title or "").strip()
+    parsed_artist, parsed_title = _parse_filename_artist_title(file.filename or "")
+    job_artist = artist_form or parsed_artist or "Unknown"
+    job_song_title = title_form or parsed_title
+
+    job_id = create_job(
+        db,
+        artist=job_artist,
+        style="oscuro",                    # set for real in /generate
+        filename=file.filename,
+        user_id=current_user["id"],
+        tenant_id=current_user["tenant_id"],
+        delivery_profile="youtube",        # set for real in /generate
+        initial_status="transcribed_pending",
+        song_title=job_song_title,
+    )
+
+    job_dir = os.path.join(OUTPUTS_DIR, job_id)
+    os.makedirs(job_dir, exist_ok=True)
+    audio_path = os.path.join(job_dir, file.filename)
+    # Stream the body in 1 MiB chunks. Lossless WAVs (~30-50 MB for a
+    # 3-min track) used to OOM the API container under concurrent load
+    # because we buffered the full payload in RAM.
+    await _stream_upload_to_disk(file, audio_path)
+    _validate_audio_file_on_disk(file.filename, audio_path)
+
+    # Cross-replica handoff. When the API and worker run in separate
+    # containers (Railway production) the file written above is invisible
+    # to /generate if the next request lands on a different replica. Push
+    # to R2 so the worker can fetch it later.
+    if storage.is_enabled():
+        try:
+            input_r2_key = storage.upload_input(
+                audio_path, current_user["tenant_id"], job_id, file.filename,
+            )
+            if input_r2_key:
+                from jobs import get_job_model
+                job_row = get_job_model(db, job_id)
+                if job_row:
+                    job_row.input_r2_key = input_r2_key
+                    db.commit()
+        except Exception as e:
+            # Best-effort. Same-replica fallback still works via local disk;
+            # the cross-replica failure mode is the user re-doing the upload.
+            print(f"[TRANSCRIBE] R2 upload failed for {job_id}: {e}")
+
+    # Per-request scratch dir for intermediate slices (intro/body cuts).
+    # The main audio file lives under job_dir and stays around until
+    # /generate enqueues it (or the reaper cleans it up).
     tmp_dir = tempfile.mkdtemp()
-    tmp_path = os.path.join(tmp_dir, file.filename)
-    with open(tmp_path, "wb") as f:
-        shutil.copyfileobj(file.file, f)
+    tmp_path = audio_path
 
     try:
         lang = language.strip() if language.strip() else None
@@ -1186,6 +1461,7 @@ async def transcribe_endpoint(
                               f"{len(song_segs)} song), skipping main Whisper "
                               f"for {artist_hint!r} - {song_hint!r}")
                         return {
+                            "job_id": job_id,
                             "segments": combined,
                             "reference_lyrics": plain or synced,
                         }
@@ -1337,6 +1613,7 @@ async def transcribe_endpoint(
                               f"+ {len(intro_segments)} intro-Whisper "
                               f"segment(s)")
                         return {
+                            "job_id": job_id,
                             "segments": combined,
                             "reference_lyrics": plain,
                             "coverage_warning": True,
@@ -1356,7 +1633,7 @@ async def transcribe_endpoint(
                 combined, _dropped = _filter_whisper_hallucinations(combined)
                 if _dropped:
                     print(f"[TRANSCRIBE] dropped {_dropped} Whisper hallucination phrase(s)")
-                return {"segments": combined, "reference_lyrics": plain}
+                return {"job_id": job_id, "segments": combined, "reference_lyrics": plain}
 
         # Kick off Gemini-grounded lyrics fetch in parallel with Whisper.
         # The fetcher is best-effort (returns None on any failure); we wrap
@@ -1452,6 +1729,7 @@ async def transcribe_endpoint(
                           f"{len(merged) - plausible_count} synthesized, "
                           f"dur={user_dur:.1f}s)")
                     return {
+                        "job_id": job_id,
                         "segments": merged,
                         "reference_lyrics": reference,
                         "coverage_warning": True,
@@ -1462,12 +1740,14 @@ async def transcribe_endpoint(
         segments, _dropped = _filter_whisper_hallucinations(segments)
         if _dropped:
             print(f"[TRANSCRIBE] dropped {_dropped} Whisper hallucination phrase(s)")
-        return {"segments": segments, "reference_lyrics": reference}
+        return {"job_id": job_id, "segments": segments, "reference_lyrics": reference}
     finally:
+        # tmp_dir holds intermediate slices (intro/body cuts) only — the
+        # main audio (audio_path) is under job_dir and must survive until
+        # /generate enqueues it (or the reaper cleans it up).
         try:
-            os.unlink(tmp_path)
-            os.rmdir(tmp_dir)
-        except OSError:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+        except Exception:
             pass
 
 
@@ -1475,8 +1755,9 @@ async def transcribe_endpoint(
 @limiter.limit("120/minute")
 async def generate_with_segments(
     request: Request,
-    file: UploadFile = File(...),
-    artist: str = Form(...),
+    file: UploadFile = File(None),
+    job_id: str = Form(""),
+    artist: str = Form(""),
     song_title: str = Form(""),
     style: str = Form("oscuro"),
     language: str = Form(""),
@@ -1495,14 +1776,50 @@ async def generate_with_segments(
     current_user: dict = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
-    """Generate video using user-edited segments (skips Whisper)."""
-    data = await file.read()
-    _validate_mp3_upload(file, data)
+    """Generate video using user-edited segments (skips Whisper).
+
+    Two flows:
+      - **Reuse path** (`job_id` provided): the audio was already persisted
+        by /transcribe and we just promote the job to `queued`. No body
+        re-read, no re-upload to R2 — this is the path that fixes the
+        OOM-on-large-WAV bug.
+      - **Direct path** (no job_id, file required): legacy compat for
+        callers that bypassed /transcribe. Streams the file in like before.
+    """
+    job_id = (job_id or "").strip()
+    reuse = bool(job_id)
+
+    if reuse:
+        # Reuse path: verify the transcribed_pending job belongs to caller
+        # and pull the audio path / R2 key from the row.
+        from jobs import get_job_model
+        job_row = get_job_model(db, job_id)
+        if (not job_row
+                or job_row.user_id != current_user["id"]
+                or job_row.tenant_id != current_user["tenant_id"]):
+            raise HTTPException(status_code=404, detail="Job not found.")
+        if job_row.status != "transcribed_pending":
+            raise HTTPException(
+                status_code=409,
+                detail=f"Job is in state {job_row.status!r}, not transcribed_pending.",
+            )
+        existing_filename = job_row.filename
+        existing_input_r2_key = job_row.input_r2_key
+    else:
+        if file is None or not file.filename:
+            raise HTTPException(status_code=400, detail="Missing file or job_id.")
+        if not file.filename.lower().endswith(_AUDIO_EXTENSIONS):
+            raise HTTPException(
+                status_code=400,
+                detail="Only MP3 and WAV files are accepted.",
+            )
+        existing_filename = file.filename
+        existing_input_r2_key = None
 
     artist = (artist or "").strip()
     song_title = (song_title or "").strip()
     if not artist or not song_title:
-        parsed_artist, parsed_title = _parse_filename_artist_title(file.filename or "")
+        parsed_artist, parsed_title = _parse_filename_artist_title(existing_filename or "")
         if not artist:
             artist = parsed_artist
         if not song_title:
@@ -1512,6 +1829,7 @@ async def generate_with_segments(
     _enforce_daily_volume_cap(db, current_user)
     _enforce_tenant_backlog(db, current_user)
     _enforce_disk_capacity()
+    _enforce_memory_pressure()
     # Every submission is accepted as queued; RQ gives it to a worker the
     # moment one is free, and pipeline.run_pipeline flips status to
     # "processing" on its first line. No 429 for capacity reasons.
@@ -1532,27 +1850,58 @@ async def generate_with_segments(
         raise HTTPException(status_code=429, detail="Free plan limit reached. Upgrade to continue.")
 
     tenant_id = current_user["tenant_id"]
-    job_id = create_job(
-        db,
-        artist=artist, style=style, filename=file.filename,
-        user_id=current_user["id"], tenant_id=tenant_id,
-        delivery_profile=delivery_profile, umg_spec=umg_spec,
-        initial_status=initial_status,
-        song_title=song_title,
-    )
+
+    if reuse:
+        # Promote the existing transcribed_pending row in place — fill in
+        # the fields the editor finalised + flip status to queued.
+        job_row = get_job_model(db, job_id)
+        job_row.artist = artist
+        job_row.song_title = song_title or None
+        job_row.style = style
+        job_row.delivery_profile = delivery_profile
+        job_row.umg_spec = umg_spec
+        job_row.status = initial_status
+        job_row.current_step = "queued"
+        db.commit()
+    else:
+        job_id = create_job(
+            db,
+            artist=artist, style=style, filename=existing_filename,
+            user_id=current_user["id"], tenant_id=tenant_id,
+            delivery_profile=delivery_profile, umg_spec=umg_spec,
+            initial_status=initial_status,
+            song_title=song_title,
+        )
+
     job_dir = os.path.join(OUTPUTS_DIR, job_id)
     os.makedirs(job_dir, exist_ok=True)
 
-    mp3_path = os.path.join(job_dir, file.filename)
-    with open(mp3_path, "wb") as f:
-        f.write(data)
+    mp3_path = os.path.join(job_dir, existing_filename)
 
-    # Cross-container input transfer via R2 — see /upload for the full reason.
-    input_r2_key = None
-    if storage.is_enabled():
-        input_r2_key = storage.upload_input(
-            mp3_path, current_user["tenant_id"], job_id, file.filename,
-        )
+    if reuse:
+        input_r2_key = existing_input_r2_key
+        # Local file MAY not be on this replica; the worker fetches from
+        # R2 at run time when input_r2_key is set, so it's fine. If R2 is
+        # disabled and the file isn't here either, the pipeline will
+        # error out — same as any cross-replica edge case.
+    else:
+        # Stream the body to disk in 1 MiB chunks instead of buffering
+        # the whole upload in RAM (the OOM path that caused the original
+        # bug). Validate the audio header from disk after writing.
+        await _stream_upload_to_disk(file, mp3_path)
+        _validate_audio_file_on_disk(existing_filename, mp3_path)
+        # Cross-container input transfer via R2 — see /upload for the full reason.
+        input_r2_key = None
+        if storage.is_enabled():
+            input_r2_key = storage.upload_input(
+                mp3_path, current_user["tenant_id"], job_id, existing_filename,
+            )
+            if input_r2_key:
+                from jobs import get_job_model
+                job_row = get_job_model(db, job_id)
+                if job_row:
+                    job_row.input_r2_key = input_r2_key
+                    db.commit()
 
     # Resolve background: library asset > custom upload > AI generation
     bg_path = None

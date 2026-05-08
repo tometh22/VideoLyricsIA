@@ -20,11 +20,18 @@ def create_job(
     umg_spec: Optional[dict] = None,
     initial_status: str = "processing",
     song_title: str = "",
+    input_r2_key: Optional[str] = None,
 ) -> str:
-    """Create a new job and return its ID. `initial_status` is "processing"
-    when there's worker capacity OR "queued" when the system / tenant is at
-    its concurrency cap. The caller decides which based on live load."""
-    if initial_status not in ("processing", "queued"):
+    """Create a new job and return its ID.
+
+    `initial_status` values:
+      - "processing": worker is going to pick this up immediately.
+      - "queued": waiting in line behind other jobs at the tenant cap.
+      - "transcribed_pending": user has called /transcribe; the audio is
+        persisted but the user is still editing lyrics. /generate will
+        flip the row to processing/queued once the segments come in.
+    """
+    if initial_status not in ("processing", "queued", "transcribed_pending"):
         raise ValueError(f"unsupported initial_status {initial_status!r}")
     job_id = uuid.uuid4().hex[:12]
     job = Job(
@@ -38,8 +45,13 @@ def create_job(
         delivery_profile=delivery_profile,
         umg_spec=umg_spec,
         status=initial_status,
-        current_step="whisper" if initial_status == "processing" else "queued",
+        current_step=(
+            "whisper" if initial_status == "processing"
+            else "queued" if initial_status == "queued"
+            else "editing"
+        ),
         progress=0,
+        input_r2_key=input_r2_key,
     )
     db.add(job)
     db.commit()

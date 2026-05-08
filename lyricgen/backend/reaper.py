@@ -46,6 +46,15 @@ _REAPED_STATUS = "error"
 # How old a job needs to be before we consider it dead.
 _DEFAULT_THRESHOLD_MIN = int(os.environ.get("REAPER_THRESHOLD_MIN", "100"))
 
+# transcribed_pending jobs are uploaded but waiting on the user to finish
+# the lyrics editor and click Generate. They consume disk + R2 storage,
+# and abandoned ones (closed tab, lost connection) accumulate forever
+# without a separate sweep. A 30-min TTL covers the realistic editing
+# window without prematurely killing live sessions.
+_TRANSCRIBED_PENDING_TTL_MIN = int(os.environ.get(
+    "REAPER_TRANSCRIBED_PENDING_TTL_MIN", "30",
+))
+
 # Owner inbox for the digest email. Override via env in Railway.
 _OWNER_EMAIL = os.environ.get("OWNER_EMAIL", "tomas@epical.digital")
 
@@ -58,6 +67,24 @@ def find_stuck_jobs(db: Session, threshold_min: int = _DEFAULT_THRESHOLD_MIN) ->
     return (
         db.query(Job)
         .filter(Job.status.in_(["processing", "queued"]))
+        .filter(Job.created_at < cutoff)
+        .order_by(Job.created_at.asc())
+        .all()
+    )
+
+
+def find_abandoned_transcribed(
+    db: Session,
+    ttl_min: int = _TRANSCRIBED_PENDING_TTL_MIN,
+) -> list[Job]:
+    """Return jobs stuck in transcribed_pending past the editing TTL.
+    These represent users who transcribed but never clicked Generate
+    (closed tab, lost connection). The associated audio file lives on
+    disk + R2 and needs to be reaped or it accumulates forever."""
+    cutoff = datetime.now(timezone.utc) - timedelta(minutes=ttl_min)
+    return (
+        db.query(Job)
+        .filter(Job.status == "transcribed_pending")
         .filter(Job.created_at < cutoff)
         .order_by(Job.created_at.asc())
         .all()
@@ -80,6 +107,30 @@ def _reason_for(job: Job) -> str:
         f"(probable container restart, timeout o crash). "
         f"Re-uploadeá el archivo para reintentar."
     )
+
+
+def _delete_abandoned_transcribed(db: Session, job: Job) -> None:
+    """Hard-delete an abandoned transcribed_pending row + its audio file.
+    The user never finalized the upload, so there's no operator-facing
+    artifact to preserve."""
+    job_id = job.job_id
+    # Local file under OUTPUTS_DIR.
+    try:
+        from pipeline import OUTPUTS_DIR
+        local_dir = os.path.join(OUTPUTS_DIR, job_id)
+        if os.path.isdir(local_dir):
+            import shutil as _sh
+            _sh.rmtree(local_dir, ignore_errors=True)
+    except Exception as e:  # pragma: no cover
+        logger.debug(f"reaper: local dir cleanup failed for {job_id}: {e}")
+    # R2 object (best-effort; failure is fine — orphan stays for next sweep).
+    if job.input_r2_key:
+        try:
+            import storage as _storage
+            _storage.delete_object(job.input_r2_key)
+        except Exception as e:  # pragma: no cover
+            logger.debug(f"reaper: R2 delete failed for {job_id}: {e}")
+    db.delete(job)
 
 
 def reap_stuck_job(db: Session, job: Job, reason: str) -> None:
@@ -225,6 +276,16 @@ def reap_all_stuck(threshold_min: int = _DEFAULT_THRESHOLD_MIN) -> int:
                 return 0
 
         stuck = find_stuck_jobs(db, threshold_min)
+        abandoned = find_abandoned_transcribed(db)
+        # Reap abandoned transcribed_pending rows quietly: the user never
+        # got a job started, so the failure isn't operator-visible. Just
+        # delete the row and clean up the input file.
+        for job in abandoned:
+            _delete_abandoned_transcribed(db, job)
+        if abandoned:
+            db.commit()
+            print(f"[REAPER] cleaned up {len(abandoned)} abandoned "
+                  f"transcribed_pending job(s)")
         if not stuck:
             return 0
         for job in stuck:

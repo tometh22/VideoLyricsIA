@@ -30,3 +30,4 @@ rq==1.16.2
 boto3==1.35.0
 sentry-sdk[fastapi]==2.14.0
 slowapi==0.1.9
+psutil>=5.9.0
