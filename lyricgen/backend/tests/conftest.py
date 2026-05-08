@@ -7,6 +7,12 @@ import pytest
 # Ensure backend modules are importable
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
+# main.py defaults ENVIRONMENT to "production", which then refuses to
+# import without an explicit CORS_ORIGINS list (security guard against
+# wildcard + credentials). Tests don't go through HTTP, so flag this
+# process as test/dev BEFORE the first `from main import ...` triggers
+# module-level CORS validation.
+os.environ.setdefault("ENVIRONMENT", "test")
 os.environ["DATABASE_URL"] = "sqlite:///test.db"
 os.environ["JWT_SECRET"] = "test-secret-key-for-tests"
 os.environ["ADMIN_PASSWORD"] = "testadmin123"
