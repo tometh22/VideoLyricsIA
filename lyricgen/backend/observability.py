@@ -117,6 +117,22 @@ def health_snapshot() -> dict:
         with engine.connect() as conn:
             conn.execute(text("SELECT 1"))
         snap["db"] = "up"
+        # Pool utilization for capacity alerting. checkedout = sockets
+        # currently in use; total = pool_size + max_overflow ceiling.
+        # Operators alert when in_use / total > 0.8 (sustained burst).
+        try:
+            pool = engine.pool
+            in_use = pool.checkedout()
+            total = pool.size() + pool._max_overflow  # noqa: SLF001 — public API absent
+            snap["db_pool"] = {
+                "in_use": in_use,
+                "total": total,
+                "utilization": round(in_use / total, 2) if total else 0.0,
+            }
+            if total and in_use / total > 0.8:
+                _degrade("db_pool_high")
+        except Exception:
+            pass
     except Exception as e:
         snap["db"] = "down"
         snap["db_error"] = str(e)[:120]
@@ -176,6 +192,20 @@ def health_snapshot() -> dict:
         snap["r2"] = "configured" if storage.is_enabled() else "not_configured"
     except Exception:
         snap["r2"] = "error"
+
+    # ProRes prewarm throttling counters — surfaces when the queue
+    # backpressure (PRORES_PREWARM_MAX_QUEUE_DEPTH) is firing.
+    try:
+        from queue_jobs import (
+            prewarm_skipped_total,
+            prewarm_enqueued_total,
+        )
+        snap["prores_prewarm"] = {
+            "enqueued_total": prewarm_enqueued_total,
+            "skipped_total": prewarm_skipped_total,
+        }
+    except Exception:
+        pass
 
     # External API keys — presence only (doesn't probe the API). A 1-RTT
     # probe per service would burn quota and add latency to every uptime

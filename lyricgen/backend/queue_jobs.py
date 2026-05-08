@@ -40,6 +40,21 @@ _ENVIRONMENT = os.environ.get("ENVIRONMENT", "production").lower().strip() or "p
 # tenant currently triggering the umg/both delivery_profile.
 PRORES_PREWARM_ENABLED = os.environ.get("PRORES_PREWARM", "1").lower() not in ("0", "false", "no")
 
+# Backpressure: when the enterprise queue already has more than this
+# many jobs waiting, skip new prewarm enqueues. The lazy /download path
+# (with its 202+Retry-After contract) handles the wait gracefully, so
+# skipping is strictly better than letting the queue grow unbounded
+# and starve render jobs from the same UMG batch.
+PRORES_PREWARM_MAX_QUEUE_DEPTH = int(
+    os.environ.get("PRORES_PREWARM_MAX_QUEUE_DEPTH", "15")
+)
+
+# Counter exposed via /health so operators can see when prewarm is
+# being throttled. Process-local — fine for single-instance, ok-ish for
+# horizontal scale (each instance reports its own count).
+prewarm_skipped_total = 0
+prewarm_enqueued_total = 0
+
 _redis = None
 _queue_default = None
 _queue_enterprise = None
@@ -145,6 +160,7 @@ def enqueue_prores_prewarm(job_id: str, file_type: str) -> str | None:
     Returns the RQ job id, or None when prewarm is disabled or Redis
     unreachable (we never raise — prewarm is best-effort by design).
     """
+    global prewarm_skipped_total, prewarm_enqueued_total
     if not PRORES_PREWARM_ENABLED:
         return None
     if file_type not in ("umg_master", "umg_short"):
@@ -153,6 +169,23 @@ def enqueue_prores_prewarm(job_id: str, file_type: str) -> str | None:
     _, _, q_enterprise = _init_redis()
     if q_enterprise is None:
         logger.info("[PRORES] prewarm: queue unavailable; skipping")
+        return None
+    # Backpressure: if the enterprise queue is already deep, skip the
+    # prewarm. The lazy /download path will produce the .mov when UMG
+    # actually clicks (with the toast/poll UX). Deep queue = many UMG
+    # batch jobs landing concurrently; better to keep the queue moving
+    # for renders than to pile prewarms behind them.
+    try:
+        depth = q_enterprise.count
+    except Exception:
+        depth = 0
+    if depth > PRORES_PREWARM_MAX_QUEUE_DEPTH:
+        prewarm_skipped_total += 1
+        logger.warning(
+            "[PRORES] prewarm: queue depth %d > %d; skipping prewarm for %s/%s "
+            "(lazy /download will handle it on first click)",
+            depth, PRORES_PREWARM_MAX_QUEUE_DEPTH, job_id, file_type,
+        )
         return None
     rq_job = q_enterprise.enqueue(
         "prores.prewarm_prores",
@@ -164,6 +197,7 @@ def enqueue_prores_prewarm(job_id: str, file_type: str) -> str | None:
         # no-op (RQ dedupes by job_id within a queue).
         job_id=f"prewarm:{job_id}:{file_type}",
     )
+    prewarm_enqueued_total += 1
     return rq_job.id
 
 
