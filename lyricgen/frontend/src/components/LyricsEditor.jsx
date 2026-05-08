@@ -1,5 +1,6 @@
 import { useState, useMemo, useRef, useEffect, useCallback } from "react";
 import { useI18n } from "../i18n";
+import { EditorTour } from "./OnboardingTour";
 
 function formatTime(seconds) {
   if (!isFinite(seconds) || seconds < 0) return "0:00";
@@ -74,7 +75,7 @@ function findSuggestion(whisperText, refLines, startIdx) {
   return null;
 }
 
-export default function LyricsEditor({ segments, filename, audioFile, referenceLyrics, coverageWarning = false, recoverySource = "", onApprove, onBack, isBatch = false, batchProgress = "" }) {
+export default function LyricsEditor({ segments, filename, audioFile, referenceLyrics, coverageWarning = false, recoverySource = "", onApprove, onBack, isBatch = false, batchProgress = "", user = null }) {
   const { t } = useI18n();
   const [edited, setEdited] = useState(() =>
     segments.map((s, i) => ({ ...s, _id: i }))
@@ -101,11 +102,15 @@ export default function LyricsEditor({ segments, filename, audioFile, referenceL
   const [editingId, setEditingId] = useState(null);
   const [editValue, setEditValue] = useState("");
 
-  // Global timestamp shift — solves the "desfasaje" case where every
-  // line is offset by the same amount. The slider previews live; the
-  // operator clicks "Aplicar" to bake it into segments.
-  const [shiftOffset, setShiftOffset] = useState(0);
-  const shiftedStart = (seg) => seg.start + shiftOffset;
+  // Tap-to-sync mode — operator hits Space (or button) while audio
+  // plays to anchor each line at the current playback time. Solves
+  // the generic case where timestamps are stretched, compressed, or
+  // offset arbitrarily — listening + tapping is ground truth.
+  const [syncMode, setSyncMode] = useState(false);
+  const [syncCursor, setSyncCursor] = useState(0);
+  // Stack of {id, prevStart, prevEnd} so "Deshacer" can revert the
+  // last tap if the operator overshot.
+  const [syncHistory, setSyncHistory] = useState([]);
 
   const startEditTimestamp = (seg) => {
     setEditingId(seg._id);
@@ -127,22 +132,39 @@ export default function LyricsEditor({ segments, filename, audioFile, referenceL
       cancelEditTimestamp();
       return;
     }
-    const newStart = Math.max(0, Math.min(parsed, duration || parsed));
+
+    // Clamp to the window between the previous segment's end and the
+    // next segment's start (in the original ordering by _id). Without
+    // this, the operator can set a start past the next row's start,
+    // producing overlapping segments that the renderer interprets as
+    // simultaneous on-screen lines. We use the original index to find
+    // neighbors so a previous edit that shifted siblings doesn't cause
+    // the wrong rows to be picked up.
+    const idx = edited.findIndex((s) => s._id === seg._id);
+    const prevSeg = idx > 0 ? edited[idx - 1] : null;
+    const nextSeg = idx >= 0 && idx < edited.length - 1 ? edited[idx + 1] : null;
+    const minAllowed = prevSeg ? prevSeg.end : 0;
+    const maxAllowed = nextSeg ? Math.max(minAllowed, nextSeg.start - 0.1) : (duration || parsed);
+    const newStart = Math.max(minAllowed, Math.min(parsed, maxAllowed));
     const delta = newStart - seg.start;
+
     setEdited((prev) => prev.map((s) => {
       if (s._id !== seg._id) return s;
       // Preserve segment duration when the operator nudges the start
-      // unless that would push end past audio_duration.
+      // unless that would push end past audio_duration or the next row.
       const segDur = Math.max(0.5, s.end - s.start);
       let newEnd = newStart + segDur;
-      if (duration && newEnd > duration) newEnd = duration;
+      const upperBound = nextSeg ? Math.min(nextSeg.start, duration || nextSeg.start) : duration;
+      if (upperBound && newEnd > upperBound) newEnd = upperBound;
       return { ...s, start: newStart, end: newEnd };
     }));
     setEditingId(null);
     setEditValue("");
     // Offer to propagate when the change is meaningful (>0.3s) and
-    // there are following lines to receive it.
-    const followingCount = edited.filter((s) => s.start > seg.start).length;
+    // there are following lines to receive it. We count by INDEX, not
+    // by start-time, so the count is correct even when a large delta
+    // re-orders the list relative to its previous state.
+    const followingCount = idx >= 0 ? edited.length - idx - 1 : 0;
     if (Math.abs(delta) >= 0.3 && followingCount > 0) {
       setPendingPropagation({ segId: seg._id, delta, count: followingCount });
     } else {
@@ -150,22 +172,17 @@ export default function LyricsEditor({ segments, filename, audioFile, referenceL
     }
   };
 
-  // Apply the captured delta to every segment that originally started
-  // AFTER the edited one. We use the original start (pre-edit) of the
-  // anchor segment as the threshold so we don't double-shift the line
-  // the operator just edited.
+  // Apply the captured delta to every segment that originally came AFTER
+  // the edited one (by _id, the stable original index). The previous
+  // implementation used a start-time threshold, which silently skipped or
+  // double-shifted overlapping rows from Whisper's occasional out-of-order
+  // output.
   const applyPendingPropagation = () => {
     if (!pendingPropagation) return;
     const { segId, delta } = pendingPropagation;
-    const anchor = edited.find((s) => s._id === segId);
-    if (!anchor) {
-      setPendingPropagation(null);
-      return;
-    }
-    const anchorOrigStart = anchor.start - delta;
     setEdited((prev) =>
       prev.map((s) => {
-        if (s.start <= anchorOrigStart) return s;
+        if (s._id <= segId) return s;
         const segDur = Math.max(0.5, s.end - s.start);
         const newStart = Math.max(0, s.start + delta);
         let newEnd = newStart + segDur;
@@ -180,29 +197,131 @@ export default function LyricsEditor({ segments, filename, audioFile, referenceL
 
   // Active segment: the one whose [start, end] contains currentTime, or
   // the latest one whose start <= currentTime if no segment "owns" the
-  // moment (e.g. instrumental gap). Uses shifted starts so the shift
-  // slider previews row highlighting live.
+  // moment (e.g. instrumental gap).
   const activeId = useMemo(() => {
     let containing = null;
     let lastStarted = null;
     for (const seg of edited) {
-      const start = seg.start + shiftOffset;
-      const end = seg.end + shiftOffset;
-      if (currentTime >= start && currentTime < end) containing = seg;
-      if (currentTime >= start) lastStarted = seg;
+      if (currentTime >= seg.start && currentTime < seg.end) containing = seg;
+      if (currentTime >= seg.start) lastStarted = seg;
     }
     return (containing || lastStarted)?._id ?? null;
-  }, [edited, currentTime, shiftOffset]);
+  }, [edited, currentTime]);
 
-  // Auto-scroll the active row into view while playing.
+  // Tap handler: anchor the line at syncCursor to currentTime, then
+  // propagate the same delta to every line AFTER it (the unanchored
+  // ones). If the offset was constant the next line is already roughly
+  // right and the operator only needs to confirm. Already-anchored
+  // lines (idx < syncCursor) are ground truth and stay put.
+  const tapAnchor = useCallback(() => {
+    if (!syncMode) return;
+    if (syncCursor < 0 || syncCursor >= edited.length) return;
+    const target = edited[syncCursor];
+    if (!target) return;
+    const newStart = Math.max(0, currentTime);
+    const delta = newStart - target.start;
+    // Snapshot the future lines BEFORE mutating so undo can restore
+    // every shifted timestamp, not just the anchor's.
+    const futureSnapshot = edited
+      .slice(syncCursor + 1)
+      .map((s) => ({ id: s._id, prevStart: s.start, prevEnd: s.end }));
+    setSyncHistory((prev) => [
+      ...prev,
+      {
+        id: target._id,
+        prevStart: target.start,
+        prevEnd: target.end,
+        cursor: syncCursor,
+        future: futureSnapshot,
+        delta,
+      },
+    ]);
+    setEdited((prev) =>
+      prev.map((s, i) => {
+        if (s._id === target._id) {
+          const segDur = Math.max(0.5, s.end - s.start);
+          let newEnd = newStart + segDur;
+          if (duration && newEnd > duration) newEnd = duration;
+          return { ...s, start: newStart, end: newEnd };
+        }
+        // Propagate delta to lines after the cursor when the shift is
+        // meaningful. Skip when delta is tiny to avoid jittering on
+        // micro-adjustments to a line whose original time was correct.
+        if (i > syncCursor && Math.abs(delta) >= 0.2) {
+          const segDur = Math.max(0.5, s.end - s.start);
+          const shifted = Math.max(0, s.start + delta);
+          let newEnd = shifted + segDur;
+          if (duration && newEnd > duration) newEnd = duration;
+          return { ...s, start: shifted, end: newEnd };
+        }
+        return s;
+      }),
+    );
+    // Advance to the next line; auto-exit when past the last one.
+    if (syncCursor + 1 >= edited.length) {
+      setSyncMode(false);
+    } else {
+      setSyncCursor(syncCursor + 1);
+    }
+  }, [syncMode, syncCursor, edited, currentTime, duration]);
+
+  const undoLastAnchor = useCallback(() => {
+    setSyncHistory((prev) => {
+      if (prev.length === 0) return prev;
+      const last = prev[prev.length - 1];
+      const futureMap = new Map((last.future || []).map((f) => [f.id, f]));
+      setEdited((segs) =>
+        segs.map((s) => {
+          if (s._id === last.id) return { ...s, start: last.prevStart, end: last.prevEnd };
+          const f = futureMap.get(s._id);
+          if (f) return { ...s, start: f.prevStart, end: f.prevEnd };
+          return s;
+        }),
+      );
+      setSyncCursor(last.cursor);
+      return prev.slice(0, -1);
+    });
+  }, []);
+
+  const enterSyncModeAt = (idx) => {
+    if (edited.length === 0) return;
+    const safeIdx = Math.max(0, Math.min(idx, edited.length - 1));
+    setSyncCursor(safeIdx);
+    setSyncHistory([]);
+    setSyncMode(true);
+    // Lead-in: scrub to ~1.5s before the chosen line so the operator
+    // hears the run-up. Don't autoplay — let them press play when ready.
+    const target = edited[safeIdx];
+    if (target) seekTo(Math.max(0, target.start - 1.5), false);
+    setPendingPropagation(null);
+  };
+
+  const enterSyncMode = () => enterSyncModeAt(0);
+
+  const exitSyncMode = () => {
+    setSyncMode(false);
+  };
+
+  // Auto-scroll the active row into view while playing. In sync mode,
+  // scroll to the armed row instead so the operator always sees what
+  // they're about to anchor.
   const lastScrolledIdRef = useRef(null);
   useEffect(() => {
+    if (syncMode) {
+      const armed = edited[syncCursor];
+      if (!armed) return;
+      if (lastScrolledIdRef.current === armed._id) return;
+      lastScrolledIdRef.current = armed._id;
+      const el = rowRefs.current[armed._id];
+      if (el) el.scrollIntoView({ block: "center", behavior: "smooth" });
+      return;
+    }
     if (!isPlaying || activeId === null) return;
     if (lastScrolledIdRef.current === activeId) return;
     lastScrolledIdRef.current = activeId;
     const el = rowRefs.current[activeId];
     if (el) el.scrollIntoView({ block: "center", behavior: "smooth" });
-  }, [activeId, isPlaying]);
+  }, [activeId, isPlaying, syncMode, syncCursor, edited]);
 
   const togglePlay = useCallback(() => {
     const a = audioRef.current;
@@ -218,19 +337,29 @@ export default function LyricsEditor({ segments, filename, audioFile, referenceL
     if (autoplay && a.paused) a.play().catch(() => {});
   }, []);
 
-  // Spacebar toggles play/pause when no input is focused.
+  // Spacebar: in sync mode, anchors the current line; otherwise toggles
+  // play/pause. Cmd/Ctrl+Z (or just Z) reverts the last anchor while
+  // in sync mode so the operator can recover from a mistap.
   useEffect(() => {
     const onKey = (e) => {
-      if (e.code !== "Space") return;
       const tag = (document.activeElement?.tagName || "").toUpperCase();
       const editing = tag === "INPUT" || tag === "TEXTAREA" || document.activeElement?.isContentEditable;
       if (editing) return;
-      e.preventDefault();
-      togglePlay();
+      if (e.code === "Space") {
+        e.preventDefault();
+        if (syncMode) tapAnchor();
+        else togglePlay();
+      } else if (syncMode && (e.key === "z" || e.key === "Z")) {
+        e.preventDefault();
+        undoLastAnchor();
+      } else if (syncMode && e.key === "Escape") {
+        e.preventDefault();
+        exitSyncMode();
+      }
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [togglePlay]);
+  }, [togglePlay, syncMode, tapAnchor, undoLastAnchor]);
 
   // ─── Reference lyrics suggestions (unchanged) ───────────────────────
   const refLines = useMemo(() => {
@@ -276,42 +405,64 @@ export default function LyricsEditor({ segments, filename, audioFile, referenceL
     setEdited((prev) => prev.filter((seg) => seg._id !== id));
   };
 
+  // Insert a duplicate of `seg` immediately after it. Same text, same
+  // duration, start placed right after the original ends so the new
+  // row visibly differs in time. Operator typically re-syncs it via
+  // Sync mode tap or manual edit. Useful when Whisper missed a chorus
+  // repeat — duplicate the chorus block, then tap-sync the copies.
+  const duplicateSeg = (id) => {
+    setEdited((prev) => {
+      const idx = prev.findIndex((s) => s._id === id);
+      if (idx === -1) return prev;
+      const orig = prev[idx];
+      const segDur = Math.max(0.5, orig.end - orig.start);
+      const newStart = Math.min(duration || orig.end + segDur, orig.end);
+      const newEnd = Math.min(duration || newStart + segDur, newStart + segDur);
+      const nextId = prev.reduce((m, s) => Math.max(m, s._id), -1) + 1;
+      const dup = { ...orig, _id: nextId, start: newStart, end: newEnd };
+      return [...prev.slice(0, idx + 1), dup, ...prev.slice(idx + 1)];
+    });
+  };
+
+  // Append a blank line at the end of the list. Operator types the
+  // missing lyrics into the text input, then tap-syncs it.
+  const addBlankLine = () => {
+    setEdited((prev) => {
+      const last = prev[prev.length - 1];
+      const baseStart = last ? Math.min(duration || last.end + 2, last.end + 0.5) : 0;
+      const baseEnd = Math.min(duration || baseStart + 3, baseStart + 3);
+      const nextId = prev.reduce((m, s) => Math.max(m, s._id), -1) + 1;
+      return [...prev, { _id: nextId, start: baseStart, end: baseEnd, text: "" }];
+    });
+  };
+
   const name = filename.replace(/\.(mp3|wav)$/i, "");
   const pendingSuggestions = edited.filter((seg) => {
     const s = suggestionsById[seg._id];
     return s && s !== seg.text;
   }).length;
   const hasSuggestions = pendingSuggestions > 0;
-
-  // Bake the live shift into segments. Clamps to [0, duration] so we
-  // never emit negative starts or push end past audio length.
-  const applyShift = () => {
-    if (shiftOffset === 0) return;
-    setEdited((prev) =>
-      prev.map((seg) => {
-        const segDur = Math.max(0.5, seg.end - seg.start);
-        const newStart = Math.max(0, seg.start + shiftOffset);
-        let newEnd = newStart + segDur;
-        if (duration && newEnd > duration) newEnd = duration;
-        return { ...seg, start: newStart, end: newEnd };
-      }),
-    );
-    setShiftOffset(0);
-  };
+  const blankCount = edited.filter((seg) => !(seg.text || "").trim()).length;
 
   const handleApprove = () => {
-    // Auto-bake any pending shift before approving so the worker
-    // gets the operator's final view.
-    const baked = shiftOffset === 0
-      ? edited
-      : edited.map((seg) => {
-          const segDur = Math.max(0.5, seg.end - seg.start);
-          const newStart = Math.max(0, seg.start + shiftOffset);
-          let newEnd = newStart + segDur;
-          if (duration && newEnd > duration) newEnd = duration;
-          return { ...seg, start: newStart, end: newEnd };
-        });
-    onApprove(baked.map(({ _id, ...rest }) => rest));
+    // Drop empty / whitespace-only rows BEFORE clamping. Operator can
+    // leave blanks from "Agregar línea" if they didn't type lyrics —
+    // sending those to the worker triggers an ImageMagick "label
+    // expected" crash that aborts the whole render.
+    const sorted = [...edited]
+      .filter((seg) => (seg.text || "").trim())
+      .sort((a, b) => a.start - b.start);
+    const cleaned = sorted.map((seg, i) => {
+      let end = seg.end;
+      if (i + 1 < sorted.length) {
+        const nextStart = sorted[i + 1].start;
+        if (end > nextStart - 0.05) {
+          end = Math.max(seg.start + 0.3, nextStart - 0.05);
+        }
+      }
+      return { ...seg, end };
+    });
+    onApprove(cleaned.map(({ _id, ...rest }) => rest));
   };
 
   const progressPct = duration > 0 ? (currentTime / duration) * 100 : 0;
@@ -389,7 +540,7 @@ export default function LyricsEditor({ segments, filename, audioFile, referenceL
 
       {/* ─── Audio control bar — sticky-ish above the lyrics list ─── */}
       {audioUrl && (
-        <div className="mb-4 flex items-center gap-3 px-3 py-2.5 rounded-card bg-surface-2/60 ring-1 ring-white/[0.05]">
+        <div className="mb-4 flex items-center gap-3 px-3 py-2.5 rounded-card bg-surface-2/60 ring-1 ring-white/[0.05]" data-tour="editor-playbar">
           <button
             onClick={togglePlay}
             className="w-10 h-10 rounded-full bg-brand hover:bg-brand-light text-white flex items-center justify-center transition-colors shrink-0"
@@ -428,53 +579,89 @@ export default function LyricsEditor({ segments, filename, audioFile, referenceL
         </div>
       )}
 
-      {/* ─── Global shift control ─────────────────────────────────── */}
-      {audioUrl && (
-        <div className="mb-3 px-3 py-2.5 rounded-card bg-surface-2/40 ring-1 ring-white/[0.04]">
-          <div className="flex items-center gap-3">
-            <div className="shrink-0 flex items-center gap-1.5">
-              <svg className="w-4 h-4 text-ink-secondary" fill="none" stroke="currentColor" strokeWidth="1.8" viewBox="0 0 24 24">
-                <path d="M8 7l-4 5 4 5M16 7l4 5-4 5" strokeLinecap="round" strokeLinejoin="round" />
-              </svg>
-              <span className="text-[11px] text-ink-secondary">
-                {t("editor.shift_label") || "Desfasaje"}
+      {/* ─── Tap-to-sync entry / active panel ────────────────────── */}
+      {audioUrl && !syncMode && (
+        <div className="mb-3 px-3 py-2.5 rounded-card bg-surface-2/40 ring-1 ring-white/[0.04] flex items-center gap-3">
+          <svg className="w-4 h-4 text-ink-secondary shrink-0" fill="none" stroke="currentColor" strokeWidth="1.8" viewBox="0 0 24 24">
+            <circle cx="12" cy="12" r="9" />
+            <path d="M12 7v5l3 2" strokeLinecap="round" />
+          </svg>
+          <div className="flex-1 min-w-0">
+            <p className="text-[12px] text-white font-medium leading-tight">
+              {t("editor.sync_cta_title") || "¿Necesitás ajustar los tiempos?"}
+            </p>
+            <p className="text-[10px] text-gray-500 leading-tight mt-0.5">
+              {t("editor.sync_cta_hint") || "Activá modo Sync y apretá Espacio cuando arranque cada línea"}
+            </p>
+          </div>
+          <button
+            data-tour="editor-sync-entry"
+            onClick={enterSyncMode}
+            className="shrink-0 text-[11px] font-medium px-3 py-1.5 rounded-lg bg-brand/15 text-brand-light
+              ring-1 ring-brand/30 hover:bg-brand/25 transition-colors"
+          >
+            {t("editor.sync_enter") || "Activar modo Sync"}
+          </button>
+        </div>
+      )}
+
+      {audioUrl && syncMode && (
+        <div className="mb-3 px-3 py-2 rounded-card bg-brand/[0.08] ring-1 ring-brand/40 animate-fade-in">
+          {/* Top row: status + counter + exit. Compact, single line. */}
+          <div className="flex items-center justify-between mb-1.5">
+            <div className="flex items-center gap-1.5 min-w-0">
+              <span className="inline-block w-1.5 h-1.5 rounded-full bg-brand animate-pulse shrink-0" />
+              <span className="text-[10px] font-semibold text-brand-light uppercase tracking-wider shrink-0">
+                {t("editor.sync_mode_on") || "Sync"}
+              </span>
+              <span className="text-[10px] text-gray-500 tabular-nums shrink-0">
+                {syncCursor + 1}/{edited.length}
+              </span>
+              <span className="hidden sm:inline text-[10px] text-gray-600 ml-2 truncate">
+                <kbd className="px-1 py-0.5 rounded bg-surface-3/60 ring-1 ring-white/[0.05] font-mono text-[9px]">space</kbd>
+                {" anclar · "}
+                <kbd className="px-1 py-0.5 rounded bg-surface-3/60 ring-1 ring-white/[0.05] font-mono text-[9px]">Z</kbd>
+                {" deshace"}
               </span>
             </div>
-            <span className="text-[11px] font-mono text-brand-light tabular-nums shrink-0 w-14 text-center">
-              {shiftOffset > 0 ? "+" : ""}{shiftOffset.toFixed(1)}s
-            </span>
-            <input
-              type="range"
-              min="-60"
-              max="60"
-              step="0.5"
-              value={shiftOffset}
-              onChange={(e) => setShiftOffset(parseFloat(e.target.value))}
-              onDoubleClick={() => setShiftOffset(0)}
-              className="flex-1 h-1.5 accent-brand cursor-pointer"
-              aria-label="Desfasaje global"
-            />
             <button
-              onClick={applyShift}
-              disabled={shiftOffset === 0}
-              className="shrink-0 text-[11px] font-medium px-3 py-1.5 rounded-lg bg-brand/15 text-brand-light
-                ring-1 ring-brand/30 hover:bg-brand/25 disabled:opacity-30 disabled:cursor-not-allowed
-                transition-colors"
+              onClick={exitSyncMode}
+              className="text-[10px] text-gray-400 hover:text-white px-1.5 py-0.5 transition-colors shrink-0"
             >
-              {t("editor.shift_apply") || "Aplicar"}
-            </button>
-            <button
-              onClick={() => setShiftOffset(0)}
-              disabled={shiftOffset === 0}
-              className="shrink-0 text-[11px] text-gray-500 hover:text-white px-2 py-1.5
-                disabled:opacity-30 disabled:cursor-not-allowed transition-colors"
-            >
-              {t("editor.shift_reset") || "Reset"}
+              {t("editor.sync_exit") || "Salir"}
             </button>
           </div>
-          <p className="text-[10px] text-gray-600 mt-1.5 ml-6">
-            {t("editor.shift_hint") || "Arrastrá si toda la letra está corrida en el tiempo"}
-          </p>
+          {/* Action row: line text on left (visual hero), compact button on right. */}
+          <div className="flex items-center gap-2">
+            <p className="flex-1 text-sm text-white font-medium leading-snug line-clamp-1 min-w-0">
+              {edited[syncCursor]?.text || <span className="text-gray-500 italic">(sin texto)</span>}
+            </p>
+            <span className="text-[10px] font-mono text-brand-light tabular-nums shrink-0">
+              {formatTime(currentTime)}
+            </span>
+            <button
+              onClick={tapAnchor}
+              className="shrink-0 h-8 px-3 rounded-lg bg-brand hover:bg-brand-light text-white text-[12px]
+                font-semibold transition-colors flex items-center gap-1.5"
+            >
+              <svg className="w-3 h-3" fill="none" stroke="currentColor" strokeWidth="3" viewBox="0 0 24 24">
+                <polyline points="20 6 9 17 4 12" />
+              </svg>
+              {t("editor.sync_tap") || "Anclar"}
+            </button>
+            <button
+              onClick={undoLastAnchor}
+              disabled={syncHistory.length === 0}
+              title={t("editor.sync_undo_btn") || "Deshacer"}
+              className="shrink-0 w-8 h-8 rounded-lg bg-surface-2/60 ring-1 ring-white/[0.05]
+                text-gray-300 hover:text-white hover:bg-surface-2 disabled:opacity-30
+                disabled:cursor-not-allowed transition-colors flex items-center justify-center"
+            >
+              <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
+                <path d="M3 7v6h6M3 13a9 9 0 109-9" strokeLinecap="round" strokeLinejoin="round" />
+              </svg>
+            </button>
+          </div>
         </div>
       )}
 
@@ -517,16 +704,22 @@ export default function LyricsEditor({ segments, filename, audioFile, referenceL
       <div className="relative">
         <div className="absolute bottom-0 left-0 right-0 h-12 bg-gradient-to-t from-surface to-transparent pointer-events-none z-10 rounded-b-2xl" />
         <div ref={listRef} className="space-y-1 max-h-[55vh] overflow-y-auto pr-1 pb-8">
-          {edited.map((seg) => {
+          {edited.map((seg, idx) => {
             const suggestion = suggestionsById[seg._id];
             const isApplied = suggestion && seg.text === suggestion;
             const isActive = seg._id === activeId;
+            const isArmed = syncMode && idx === syncCursor;
+            const isAnchored = syncMode && idx < syncCursor;
 
             return (
               <div
                 key={seg._id}
                 ref={(el) => { rowRefs.current[seg._id] = el; }}
-                className={`group rounded-xl transition-colors ${isActive ? "bg-brand/[0.07] ring-1 ring-brand/25" : ""}`}
+                {...(idx === 0 ? { "data-tour": "editor-list-row" } : {})}
+                className={`group rounded-xl transition-all
+                  ${isArmed ? "bg-brand/[0.18] ring-2 ring-brand shadow-glow scale-[1.01]" : ""}
+                  ${!isArmed && isActive ? "bg-brand/[0.07] ring-1 ring-brand/25" : ""}
+                  ${isAnchored ? "opacity-60" : ""}`}
               >
                 <div className="flex items-start gap-2 p-1">
                   {editingId === seg._id ? (
@@ -546,14 +739,13 @@ export default function LyricsEditor({ segments, filename, audioFile, referenceL
                     />
                   ) : (
                     <button
-                      onClick={() => seekTo(Math.max(0, shiftedStart(seg)), true)}
+                      onClick={() => seekTo(Math.max(0, seg.start), true)}
                       onDoubleClick={() => startEditTimestamp(seg)}
                       title={t("editor.timestamp_hint") || "Click: ir al tiempo · Doble click: editar"}
                       className={`text-[11px] font-mono pt-2.5 w-14 shrink-0 text-right transition-colors
-                        ${shiftOffset !== 0 ? "italic" : ""}
                         ${isActive ? "text-brand-light" : "text-gray-600 hover:text-brand-light"}`}
                     >
-                      {formatTimestamp(Math.max(0, shiftedStart(seg)))}
+                      {formatTimestamp(seg.start)}
                     </button>
                   )}
                   <div className="flex-1 min-w-0">
@@ -580,28 +772,78 @@ export default function LyricsEditor({ segments, filename, audioFile, referenceL
                       </button>
                     )}
                   </div>
-                  <button onClick={() => deleteSeg(seg._id)}
-                    className="shrink-0 w-8 h-8 mt-0.5 rounded-lg opacity-0 group-hover:opacity-100
-                      hover:bg-red-500/10 flex items-center justify-center text-gray-600
-                      hover:text-red-400 transition-all"
-                    title="Eliminar línea">
-                    <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
-                      <path d="M18 6L6 18M6 6l12 12" />
-                    </svg>
-                  </button>
+                  <div className="shrink-0 flex items-center gap-0.5 mt-0.5">
+                    {!syncMode && (
+                      <button onClick={() => enterSyncModeAt(idx)}
+                        {...(idx === 0 ? { "data-tour": "editor-row-sync" } : {})}
+                        className="w-8 h-8 rounded-lg opacity-0 group-hover:opacity-100
+                          hover:bg-brand/15 flex items-center justify-center text-gray-600
+                          hover:text-brand-light transition-all"
+                        title={t("editor.sync_from_here") || "Activar Sync desde esta línea"}>
+                        <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
+                          <circle cx="12" cy="12" r="9" />
+                          <circle cx="12" cy="12" r="4" />
+                          <circle cx="12" cy="12" r="1" fill="currentColor" />
+                        </svg>
+                      </button>
+                    )}
+                    <button onClick={() => duplicateSeg(seg._id)}
+                      className="w-8 h-8 rounded-lg opacity-0 group-hover:opacity-100
+                        hover:bg-brand/10 flex items-center justify-center text-gray-600
+                        hover:text-brand-light transition-all"
+                      title={t("editor.duplicate_line") || "Duplicar línea (útil para estribillos repetidos)"}>
+                      <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
+                        <rect x="9" y="9" width="11" height="11" rx="1.5" />
+                        <path d="M5 15V5a1 1 0 011-1h10" />
+                      </svg>
+                    </button>
+                    <button onClick={() => deleteSeg(seg._id)}
+                      className="w-8 h-8 rounded-lg opacity-0 group-hover:opacity-100
+                        hover:bg-red-500/10 flex items-center justify-center text-gray-600
+                        hover:text-red-400 transition-all"
+                      title="Eliminar línea">
+                      <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
+                        <path d="M18 6L6 18M6 6l12 12" />
+                      </svg>
+                    </button>
+                  </div>
                 </div>
               </div>
             );
           })}
+          <button
+            data-tour="editor-add-line"
+            onClick={addBlankLine}
+            className="w-full mt-2 py-2.5 rounded-xl border border-dashed border-white/[0.08]
+              hover:border-brand/40 hover:bg-brand/[0.04] text-gray-500 hover:text-brand-light
+              text-[12px] transition-all flex items-center justify-center gap-1.5"
+          >
+            <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
+              <path d="M12 5v14M5 12h14" />
+            </svg>
+            {t("editor.add_line") || "Agregar línea"}
+          </button>
         </div>
       </div>
 
-      <div className="mt-4 flex justify-between items-center">
-        <span className="text-xs text-gray-600">{edited.length} {t("editor.lines")}</span>
-        <button onClick={handleApprove} className="btn-primary text-sm h-11 px-5">
+      <div className="mt-4 flex justify-between items-center gap-3">
+        <div className="flex items-center gap-2 min-w-0">
+          <span className="text-xs text-gray-600 shrink-0">
+            {edited.length} {t("editor.lines")}
+          </span>
+          {blankCount > 0 && (
+            <span className="text-[11px] text-amber-400 truncate">
+              · {blankCount} {blankCount === 1 ? t("editor.blank_singular") || "línea en blanco" : t("editor.blank_plural") || "líneas en blanco"} —{" "}
+              {t("editor.blanks_dropped") || "se omitirán"}
+            </span>
+          )}
+        </div>
+        <button onClick={handleApprove} className="btn-primary text-sm h-11 px-5 shrink-0" data-tour="editor-approve">
           {isBatch ? t("editor.approve_next") : t("editor.approve_generate")}
         </button>
       </div>
+
+      <EditorTour user={user} />
     </div>
   );
 }

@@ -12,15 +12,46 @@ import tempfile
 logger = logging.getLogger("genly.validator")
 
 
-def _extract_frames(video_path: str, interval_seconds: int = 3, max_frames: int = 10) -> list[str]:
+def _safe_ffmpeg_path(path: str) -> str:
+    """Make a user-controlled path safe to pass as an ffmpeg/ffprobe input.
+
+    ffmpeg interprets any argument starting with `-` as a flag — so a file
+    literally named `-vf scale=-1:720` (or an attacker-uploaded path that
+    starts with `-`) would inject options into the command line. We force
+    a leading `./` for relative paths so the dash can't appear in argv[0]
+    of the path arg, and we resolve to an absolute path when possible.
+    """
+    if not path:
+        return path
+    if os.path.isabs(path):
+        return path
+    if path.startswith("-"):
+        return os.path.join(".", path)
+    return path
+
+
+def _extract_frames(
+    video_path: str,
+    interval_seconds: int = 3,
+    max_frames: int = 10,
+) -> tuple[list[str], str]:
     """Extract frames from a video at regular intervals using ffmpeg.
 
-    Returns list of temporary file paths (caller must clean up).
+    Returns (frame_paths, tmp_dir). The caller is responsible for cleaning
+    up tmp_dir (and the frames inside it) regardless of whether any frames
+    were successfully extracted — returning the dir explicitly here closes
+    the leak where ffprobe/ffmpeg failures left mkdtemp orphans in /tmp on
+    long-running workers.
     """
     tmp_dir = tempfile.mkdtemp(prefix="genly_validate_")
+    safe_video_path = _safe_ffmpeg_path(video_path)
+    # `safe_video_path` already prepends `./` for relative paths beginning
+    # with `-`; that is the most portable defense across ffmpeg/ffprobe
+    # versions (some accept GNU `--`, some don't).
     duration_cmd = [
         "ffprobe", "-v", "error", "-show_entries", "format=duration",
-        "-of", "default=noprint_wrappers=1:nokey=1", video_path,
+        "-of", "default=noprint_wrappers=1:nokey=1",
+        safe_video_path,
     ]
     try:
         result = subprocess.run(duration_cmd, capture_output=True, text=True, timeout=30)
@@ -39,7 +70,7 @@ def _extract_frames(video_path: str, interval_seconds: int = 3, max_frames: int 
     for i, ts in enumerate(timestamps):
         out_path = os.path.join(tmp_dir, f"frame_{i:03d}.jpg")
         cmd = [
-            "ffmpeg", "-y", "-ss", str(ts), "-i", video_path,
+            "ffmpeg", "-y", "-ss", str(ts), "-i", safe_video_path,
             "-frames:v", "1", "-q:v", "2", out_path,
         ]
         try:
@@ -49,7 +80,7 @@ def _extract_frames(video_path: str, interval_seconds: int = 3, max_frames: int 
         except Exception as e:
             logger.warning(f"Frame extraction failed at {ts}s: {e}")
 
-    return frame_paths
+    return frame_paths, tmp_dir
 
 
 class ValidatorCheckError(Exception):
@@ -84,32 +115,50 @@ def _check_frame_with_gemini(image_path: str) -> dict:
                 (
                     "You are auditing a frame from a music-video background "
                     "for risks where AI image generation typically fails. "
-                    "Flag ONLY actual failures, not benign content.\n\n"
-                    "FLAG (safe=false) if you can clearly see ANY of these:\n"
-                    "  - A LARGE, FOREGROUND, or IDENTIFIABLE human face "
+                    "Be CONSERVATIVE — flag only flagrant, prominent "
+                    "violations. Music-video backgrounds routinely include "
+                    "incidental signage, urban scenery, and stylized text "
+                    "as part of the aesthetic; that is acceptable.\n\n"
+                    "FLAG (safe=false) ONLY if ALL of these are true at once:\n"
+                    "  (a) the issue is in the foreground or central to the "
+                    "frame (NOT background scenery, NOT distant signage, "
+                    "NOT a small element in a wider shot),\n"
+                    "  (b) the issue is clearly readable / recognizable "
+                    "without effort (NOT blurred, NOT partial, NOT tiny),\n"
+                    "  (c) the issue falls into one of these categories:\n"
+                    "    - A LARGE, FOREGROUND, IDENTIFIABLE human face "
                     "(eyes/nose/mouth clearly visible on a recognizable "
-                    "individual). One small face in a crowd does NOT count.\n"
-                    "  - Visible hands or individual fingers in foreground.\n"
-                    "  - Text matching a REAL brand or company name "
-                    "(Nike, Coca-Cola, McDonald's, Apple, etc.).\n"
-                    "  - Real-world brand logos or trademarks.\n\n"
+                    "specific individual).\n"
+                    "    - Visible hands or individual fingers as the "
+                    "subject of the frame.\n"
+                    "    - Text matching a globally famous COMMERCIAL brand "
+                    "(Nike, Coca-Cola, McDonald's, Apple, Pepsi, Adidas, "
+                    "Starbucks, Microsoft, Google, Amazon, Disney) shown "
+                    "prominently as the focus of the frame.\n"
+                    "    - A clearly-rendered logo of a globally famous "
+                    "commercial brand shown prominently.\n\n"
                     "DO NOT FLAG (safe=true) any of these — they are "
                     "acceptable in music-video backgrounds:\n"
-                    "  - Silhouettes, audiences, or distant crowds where "
-                    "individual identities cannot be made out, even if "
-                    "small partial faces are visible in the background.\n"
-                    "  - Invented / gibberish / stylized text strings that "
-                    "do NOT match any real brand. Fake words on signage "
-                    "are fine.\n"
-                    "  - Heavily blurred / motion-blurred / rain-distorted "
-                    "signage.\n"
+                    "  - Names of bands, artists, songs, albums, venues, "
+                    "stadiums, sports clubs, cities, countries, places, "
+                    "or events. These are NOT commercial brands for "
+                    "this purpose.\n"
+                    "  - Generic words on signage (BAR, HOTEL, CAFE, OPEN, "
+                    "SALE, etc.) even if real-looking.\n"
+                    "  - Background signage, billboards, marquees, neon "
+                    "signs that are part of the urban/scenic backdrop.\n"
+                    "  - Distant, small, blurred, motion-blurred, rain-"
+                    "distorted, or partially obscured text or logos.\n"
+                    "  - Invented / gibberish / stylized text strings.\n"
+                    "  - Silhouettes, audiences, distant crowds — even "
+                    "with small partial faces.\n"
                     "  - Abstract glowing shapes, smoke, particles, "
-                    "weather effects, lighting effects.\n"
-                    "  - Generic pattern textures or non-brand graphic "
+                    "weather effects, lighting effects, lens flares.\n"
+                    "  - Generic pattern textures, abstract graphic "
                     "elements.\n\n"
-                    "Rule of thumb: flag ONLY if a viewer would recognize "
-                    "a specific real-world person, hand, brand name, or "
-                    "logo. Otherwise mark safe. "
+                    "Rule of thumb: would a typical viewer say 'this video "
+                    "is selling Nike / showing a real celebrity'? If no, "
+                    "mark safe. When in doubt, mark safe. "
                     "Respond ONLY with JSON: "
                     '{"safe":true/false,"issues":["specific reason"]}'
                 ),
@@ -153,11 +202,10 @@ def validate_video(video_path: str, job_id: str = None) -> dict:
         input_data_types=["video_frames"],
     ) if job_id else None
 
-    frame_paths = _extract_frames(video_path)
+    frame_paths, tmp_dir = _extract_frames(video_path)
     all_issues = []
     check_errors = 0
     frames_checked = 0
-    tmp_dir = os.path.dirname(frame_paths[0]) if frame_paths else None
 
     try:
         for i, frame_path in enumerate(frame_paths):

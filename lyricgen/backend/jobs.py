@@ -71,6 +71,76 @@ def get_job_model(db: Session, job_id: str) -> Optional[Job]:
     return db.query(Job).filter(Job.job_id == job_id).first()
 
 
+_DELETABLE_STATUSES = {"processing", "queued", "error", "validation_failed"}
+
+
+def delete_job(db: Session, job_id: str, tenant_id: str) -> tuple[bool, str]:
+    """Hard-delete a job row owned by `tenant_id`. Returns (ok, reason).
+
+    Safety: only stuck/failed jobs can be deleted — done/pending_review jobs
+    must be kept for the audit trail (UMG compliance + plan-quota counting).
+    The operator's intent here is cleaning up junk, not erasing approved
+    deliveries.
+
+    AIProvenance has a NOT NULL FK to jobs.job_id without ON DELETE CASCADE,
+    so we have to clean up its rows manually before the parent delete or
+    Postgres raises IntegrityError → 500. Failed/stuck jobs may have started
+    accumulating provenance entries (e.g. lyrics_reference_fetch attempts)
+    even though the render never completed.
+    """
+    from database import AIProvenance  # local import to avoid circular
+
+    job = db.query(Job).filter(Job.job_id == job_id, Job.tenant_id == tenant_id).first()
+    if not job:
+        return False, "not_found"
+    if job.status not in _DELETABLE_STATUSES:
+        return False, f"protected_status:{job.status}"
+    db.query(AIProvenance).filter(AIProvenance.job_id == job_id).delete(synchronize_session=False)
+    db.delete(job)
+    db.commit()
+    return True, "ok"
+
+
+def bulk_delete_jobs(db: Session, job_ids: list[str], tenant_id: str) -> dict:
+    """Delete many jobs in one transaction. Returns {deleted: [...], skipped: {id: reason}}.
+
+    Skipped reasons: 'not_found', 'protected_status:<status>'. The endpoint
+    surfaces this dict so the operator sees exactly which IDs were ignored
+    and why.
+    """
+    from database import AIProvenance
+
+    deleted: list[str] = []
+    skipped: dict[str, str] = {}
+    if not job_ids:
+        return {"deleted": deleted, "skipped": skipped}
+
+    rows = (
+        db.query(Job)
+        .filter(Job.tenant_id == tenant_id, Job.job_id.in_(job_ids))
+        .all()
+    )
+    found_ids = {r.job_id for r in rows}
+    for jid in job_ids:
+        if jid not in found_ids:
+            skipped[jid] = "not_found"
+
+    deletable_ids: list[str] = []
+    for r in rows:
+        if r.status not in _DELETABLE_STATUSES:
+            skipped[r.job_id] = f"protected_status:{r.status}"
+        else:
+            deletable_ids.append(r.job_id)
+
+    if deletable_ids:
+        db.query(AIProvenance).filter(AIProvenance.job_id.in_(deletable_ids)).delete(synchronize_session=False)
+        db.query(Job).filter(Job.tenant_id == tenant_id, Job.job_id.in_(deletable_ids)).delete(synchronize_session=False)
+        db.commit()
+        deleted = deletable_ids
+
+    return {"deleted": deleted, "skipped": skipped}
+
+
 def get_all_jobs(
     db: Session,
     tenant_id: str = "default",
@@ -92,14 +162,40 @@ def get_all_jobs(
     return [j.to_list_dict() for j in jobs]
 
 
+_TERMINAL_STATUSES = ("done", "error", "rejected", "validation_failed")
+
+
 def update_job(job_id: str, **kwargs) -> None:
-    """Update fields on an existing job. Creates its own DB session for thread safety."""
+    """Update fields on an existing job. Creates its own DB session for thread safety.
+
+    A status update that targets a non-terminal state is REFUSED for jobs
+    already in a terminal state. This guards against:
+      - A stale worker thread flushing progress=55 / status="processing"
+        after a reaper marked the job error → resurrects a closed job.
+      - Two workers picking the same job and both calling
+        update_job(status="processing") → double-processing.
+
+    Updates that target a terminal state OR fields that are safe to set on
+    terminal jobs (s3_keys, youtube_data, validation_result, etc.) are
+    always applied — the reaper itself relies on the terminal-update path.
+    """
     from database import SessionLocal
+
+    target_status = kwargs.get("status")
+    target_is_terminal = target_status in _TERMINAL_STATUSES
 
     db = SessionLocal()
     try:
         job = db.query(Job).filter(Job.job_id == job_id).first()
         if not job:
+            return
+
+        # Refuse non-terminal mutations of terminal jobs.
+        if (
+            job.status in _TERMINAL_STATUSES
+            and not target_is_terminal
+            and target_status is not None
+        ):
             return
 
         for key, value in kwargs.items():
@@ -122,6 +218,14 @@ def update_job(job_id: str, **kwargs) -> None:
             job.completed_at = datetime.now(timezone.utc)
 
         db.commit()
+    except Exception:
+        # Without an explicit rollback the session is returned to the pool
+        # holding an open transaction; pool_pre_ping only catches
+        # disconnects, not in-tx errors, so the next caller can hit
+        # "current transaction is aborted, commands ignored until end of
+        # transaction block".
+        db.rollback()
+        raise
     finally:
         db.close()
 

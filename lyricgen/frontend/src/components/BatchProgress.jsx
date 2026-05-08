@@ -1,3 +1,4 @@
+import { useEffect } from "react";
 import { useI18n } from "../i18n";
 import { getDownloadUrl } from "../mediaUrl";
 
@@ -120,7 +121,7 @@ function JobRow({ job, index, t }) {
   );
 }
 
-export default function BatchProgress({ jobs, onReset, onRetry }) {
+export default function BatchProgress({ jobs, onReset, onRetry, onSingleDone }) {
   const { t } = useI18n();
   // `done` includes pending_review for the BATCH PROGRESS view ("processing
   // is finished, awaiting your review"). But `downloadable` only counts jobs
@@ -135,6 +136,19 @@ export default function BatchProgress({ jobs, onReset, onRetry }) {
   const allApproved = downloadable === total && !jobs.some((j) => j.status === "processing" || j.status === "queued");
   const hasPendingReview = jobs.some((j) => j.status === "pending_review");
   const hasErrors = jobs.some((j) => j.status === "error" || j.status === "validation_failed");
+  const isSingle = total === 1;
+
+  // Single-song flow: jump straight to JobDetail (review/approve) when the
+  // one job lands in pending_review or done — no need to make the operator
+  // navigate through History to find their video.
+  useEffect(() => {
+    if (!isSingle || !onSingleDone) return;
+    const j = jobs[0];
+    if (!j || !j.job_id) return;
+    if (j.status === "pending_review" || j.status === "done") {
+      onSingleDone(j.job_id);
+    }
+  }, [isSingle, jobs, onSingleDone]);
 
   const downloadAll = async () => {
     for (const job of jobs) {
@@ -156,15 +170,27 @@ export default function BatchProgress({ jobs, onReset, onRetry }) {
                 <polyline points="20 6 9 17 4 12" />
               </svg>
             </div>
-            <h2 className="text-2xl font-bold mb-1">{t("batch.completed")}</h2>
-            <p className="text-gray-500 text-sm">{total} video{total > 1 ? "s" : ""} {t("batch.generated")}</p>
+            <h2 className="text-2xl font-bold mb-1">
+              {isSingle ? (t("batch.single_done") || "Video listo") : t("batch.completed")}
+            </h2>
+            <p className="text-gray-500 text-sm">
+              {isSingle
+                ? (t("batch.single_done_sub") || "Te llevamos a revisar y aprobar...")
+                : `${total} videos ${t("batch.generated")}`}
+            </p>
           </>
         ) : (
           <>
-            <h2 className="text-2xl font-bold mb-1">{t("batch.generating")}</h2>
+            <h2 className="text-2xl font-bold mb-1">
+              {isSingle ? (t("batch.single_generating") || "Generando tu video") : t("batch.generating")}
+            </h2>
             <p className="text-gray-500 text-sm">
-              {done} {t("dash.monthly_of")} {total} {t("batch.completed_of")}
-              {total - done > 0 && <span className="text-gray-600"> — ~{(total - done) * 5} {t("dash.min_remaining")}</span>}
+              {isSingle
+                ? (t("batch.single_generating_sub") || "Te avisamos cuando esté listo")
+                : <>
+                    {done} {t("dash.monthly_of")} {total} {t("batch.completed_of")}
+                    {total - done > 0 && <span className="text-gray-600"> — ~{(total - done) * 5} {t("dash.min_remaining")}</span>}
+                  </>}
             </p>
           </>
         )}

@@ -146,7 +146,20 @@ def record_ai_call(
 
 
 class ProvenanceRecorder:
-    """Records a single AI tool invocation with timing."""
+    """Records a single AI tool invocation with timing.
+
+    The row is INSERTED at construction (with response_summary/duration_ms
+    left null to mark the call as in-flight) and UPDATED at finish().
+    Pre-fix the row was inserted only at finish(), so any worker crash
+    between record_ai_call(...) and recorder.finish(...) — Veo polling
+    timeout, OOM kill, network error during download — left no trace of
+    the API call in the audit trail. Now the call is always recorded;
+    in-flight rows simply have null duration_ms / response_summary.
+
+    Also a context manager: `with record_ai_call(...) as rec:` will call
+    finish() automatically, including a synthetic error summary on the
+    exception path.
+    """
 
     def __init__(self, job_id, step, tool_name, tool_provider, prompt,
                  input_data_types=None, tool_version=None):
@@ -158,10 +171,12 @@ class ProvenanceRecorder:
         self.input_data_types = input_data_types
         self.tool_version = tool_version
         self.start_time = time.time()
+        self._row_id: int | None = None
+        self._finished = False
 
-    def finish(self, response_summary: str = None, output_artifact: str = None):
-        """Persist the provenance record to the database."""
-        duration_ms = int((time.time() - self.start_time) * 1000)
+        # Insert the "started" row immediately. If the DB hiccups here we
+        # log and continue with _row_id=None; finish() then becomes a
+        # no-op so provenance bookkeeping never raises out of the worker.
         db = SessionLocal()
         try:
             record = AIProvenance(
@@ -172,19 +187,68 @@ class ProvenanceRecorder:
                 tool_version=self.tool_version,
                 prompt_sent=self.prompt,
                 prompt_hash=hashlib.sha256(self.prompt.encode()).hexdigest(),
-                response_summary=response_summary[:2000] if response_summary else None,
+                response_summary=None,
                 input_data_types=self.input_data_types,
-                output_artifact=output_artifact,
-                duration_ms=duration_ms,
+                output_artifact=None,
+                duration_ms=None,
             )
             db.add(record)
             db.commit()
-            logger.info(
-                f"Provenance recorded: job={self.job_id} step={self.step} "
-                f"tool={self.tool_name} duration={duration_ms}ms"
-            )
+            self._row_id = record.id
         except Exception as e:
-            logger.error(f"Failed to record provenance: {e}")
+            logger.error(f"Failed to insert provenance start row: {e}")
             db.rollback()
         finally:
             db.close()
+
+    def finish(self, response_summary: str = None, output_artifact: str = None):
+        """Update the in-flight provenance row with end-of-call data.
+
+        Idempotent — calling finish() twice is safe. No-op when the
+        initial INSERT failed (self._row_id is None).
+        """
+        if self._finished or self._row_id is None:
+            self._finished = True
+            return
+        self._finished = True
+        duration_ms = int((time.time() - self.start_time) * 1000)
+        db = SessionLocal()
+        try:
+            updated = (
+                db.query(AIProvenance)
+                .filter(AIProvenance.id == self._row_id)
+                .update(
+                    {
+                        "response_summary": response_summary[:2000] if response_summary else None,
+                        "output_artifact": output_artifact,
+                        "duration_ms": duration_ms,
+                    },
+                    synchronize_session=False,
+                )
+            )
+            db.commit()
+            if updated:
+                logger.info(
+                    f"Provenance recorded: job={self.job_id} step={self.step} "
+                    f"tool={self.tool_name} duration={duration_ms}ms"
+                )
+        except Exception as e:
+            logger.error(f"Failed to update provenance row: {e}")
+            db.rollback()
+        finally:
+            db.close()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        if self._finished:
+            return False
+        if exc is not None:
+            try:
+                self.finish(response_summary=f"error: {exc!r}")
+            except Exception:
+                pass
+        else:
+            self.finish()
+        return False  # never swallow exceptions

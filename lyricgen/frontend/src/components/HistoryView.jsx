@@ -1,4 +1,4 @@
-import { useState, useMemo } from "react";
+import { useState, useMemo, useEffect } from "react";
 import { useI18n } from "../i18n";
 import { useMediaUrl } from "../mediaUrl";
 
@@ -48,17 +48,36 @@ function StatusBadge({ status, t }) {
   );
 }
 
-function VideoCard({ job, onSelect, t }) {
+const DELETABLE = new Set(["processing", "queued", "error", "validation_failed"]);
+
+function VideoCard({ job, onSelect, onDelete, selected, onToggleSelect, t }) {
   const name = (job.filename || "").replace(/\.mp3$/i, "");
   const songName = name.includes(" - ") ? name.split(" - ").slice(1).join(" - ") : name;
   const artistName = job.artist || (name.includes(" - ") ? name.split(" - ")[0] : "");
   const showThumb = job.status === "done" || job.status === "pending_review";
   const thumbSrc = useMediaUrl(showThumb ? job.job_id : "", "thumbnail", "preview");
+  const canDelete = DELETABLE.has(job.status);
+
+  const handleDelete = (e) => {
+    e.stopPropagation();
+    const songLabel = songName || job.filename || job.job_id;
+    if (!confirm(`¿Eliminar "${songLabel}"? Esta acción no se puede deshacer.`)) return;
+    onDelete(job.job_id);
+  };
+
+  const handleToggle = (e) => {
+    e.stopPropagation();
+    onToggleSelect(job.job_id);
+  };
 
   return (
-    <button
+    <div
+      role="button"
+      tabIndex={0}
       onClick={() => onSelect(job.job_id)}
-      className="rounded-card overflow-hidden text-left group bg-surface-2/40 hover:bg-surface-2/70 ring-1 ring-white/[0.04] hover:ring-white/[0.10] transition-all"
+      onKeyDown={(e) => { if (e.key === "Enter" || e.key === " ") onSelect(job.job_id); }}
+      className={`rounded-card overflow-hidden text-left group bg-surface-2/40 hover:bg-surface-2/70 ring-1 ring-white/[0.04] hover:ring-white/[0.10] transition-all cursor-pointer focus:outline-none focus:ring-brand/40
+        ${selected ? "ring-2 ring-brand/60" : ""}`}
     >
       <div className="aspect-video bg-surface-3/30 relative overflow-hidden">
         {showThumb && thumbSrc && (
@@ -86,6 +105,47 @@ function VideoCard({ job, onSelect, t }) {
           <StatusBadge status={job.status} t={t} />
         </div>
 
+        {/* Multi-select checkbox + single-delete button — only on stuck/
+            failed rows. Checkbox stays visible when ANY row is selected
+            (so the operator sees the selection state at a glance) but
+            otherwise reveals on hover like the trash icon. */}
+        {canDelete && (
+          <>
+            <button
+              type="button"
+              onClick={handleToggle}
+              className={`absolute top-2.5 left-2.5 w-6 h-6 rounded-md border-2 backdrop-blur-md
+                flex items-center justify-center transition-all
+                ${selected
+                  ? "bg-brand border-brand opacity-100"
+                  : "bg-black/50 border-white/40 hover:border-brand/70 opacity-0 group-hover:opacity-100"}`}
+              title={selected ? "Deseleccionar" : "Seleccionar para eliminar"}
+              aria-label="Seleccionar"
+              aria-pressed={selected}
+            >
+              {selected && (
+                <svg className="w-3.5 h-3.5 text-white" fill="none" stroke="currentColor" strokeWidth="3" viewBox="0 0 24 24">
+                  <polyline points="20 6 9 17 4 12"/>
+                </svg>
+              )}
+            </button>
+            <button
+              type="button"
+              onClick={handleDelete}
+              className="absolute top-2.5 left-11 w-7 h-7 rounded-lg bg-black/50 hover:bg-red-500/80 backdrop-blur-md
+                text-white/70 hover:text-white opacity-0 group-hover:opacity-100 transition-all
+                flex items-center justify-center ring-1 ring-white/10 hover:ring-red-400/50"
+              title={t("history.delete") || "Eliminar"}
+              aria-label="Eliminar video"
+            >
+              <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
+                <polyline points="3 6 5 6 21 6"/>
+                <path d="M19 6l-1 14a2 2 0 01-2 2H8a2 2 0 01-2-2L5 6M10 11v6M14 11v6M8 6V4a2 2 0 012-2h4a2 2 0 012 2v2"/>
+              </svg>
+            </button>
+          </>
+        )}
+
         {(job.status === "done" || job.status === "pending_review") && (
           <div className="absolute inset-0 flex items-center justify-center opacity-0 group-hover:opacity-100 transition-opacity bg-black/30">
             <div className="w-11 h-11 rounded-full bg-white/15 backdrop-blur-md flex items-center justify-center ring-1 ring-white/20">
@@ -104,7 +164,7 @@ function VideoCard({ job, onSelect, t }) {
           {job.created_at && <span className="ml-1.5 text-gray-600">· {timeAgo(job.created_at)}</span>}
         </p>
       </div>
-    </button>
+    </div>
   );
 }
 
@@ -116,9 +176,10 @@ const FILTERS = [
   { id: "failed",  label: "Fallidos",  match: (j) => j.status === "error" || j.status === "validation_failed" },
 ];
 
-export default function HistoryView({ history, onSelect, onBack }) {
+export default function HistoryView({ history, onSelect, onDelete, onBulkDelete, onBack }) {
   const { t } = useI18n();
   const [filter, setFilter] = useState("all");
+  const [selectedIds, setSelectedIds] = useState(() => new Set());
 
   const counts = useMemo(() => {
     const c = {};
@@ -130,6 +191,56 @@ export default function HistoryView({ history, onSelect, onBack }) {
     const f = FILTERS.find((x) => x.id === filter) || FILTERS[0];
     return history.filter(f.match);
   }, [history, filter]);
+
+  // When the history list updates (e.g. row deleted), drop selections
+  // pointing to job_ids that no longer exist.
+  useEffect(() => {
+    const live = new Set(history.map((j) => j.job_id));
+    setSelectedIds((prev) => {
+      const next = new Set([...prev].filter((id) => live.has(id)));
+      return next.size === prev.size ? prev : next;
+    });
+  }, [history]);
+
+  const toggleSelect = (jobId) => {
+    setSelectedIds((prev) => {
+      const next = new Set(prev);
+      if (next.has(jobId)) next.delete(jobId);
+      else next.add(jobId);
+      return next;
+    });
+  };
+
+  const visibleDeletableIds = useMemo(
+    () => visible.filter((j) => DELETABLE.has(j.status)).map((j) => j.job_id),
+    [visible],
+  );
+  const allVisibleSelected = visibleDeletableIds.length > 0 &&
+    visibleDeletableIds.every((id) => selectedIds.has(id));
+
+  const selectAllVisible = () => {
+    if (allVisibleSelected) {
+      // Toggle off — drop just the visible ones from selection
+      setSelectedIds((prev) => {
+        const next = new Set(prev);
+        for (const id of visibleDeletableIds) next.delete(id);
+        return next;
+      });
+    } else {
+      setSelectedIds((prev) => new Set([...prev, ...visibleDeletableIds]));
+    }
+  };
+
+  const handleBulkDelete = async () => {
+    const ids = [...selectedIds];
+    if (ids.length === 0) return;
+    if (!confirm(`¿Eliminar ${ids.length} ${ids.length === 1 ? "video" : "videos"}? Esta acción no se puede deshacer.`)) return;
+    await onBulkDelete?.(ids);
+    setSelectedIds(new Set());
+  };
+
+  const clearSelection = () => setSelectedIds(new Set());
+  const selectedCount = selectedIds.size;
 
   return (
     <div className="w-full max-w-4xl animate-fade-in">
@@ -169,6 +280,52 @@ export default function HistoryView({ history, onSelect, onBack }) {
         </div>
       )}
 
+      {/* ─── Bulk action bar — appears when ≥1 deletable rows exist ── */}
+      {visibleDeletableIds.length > 0 && (
+        <div className="flex items-center justify-between gap-3 mb-4 px-3 py-2 rounded-card bg-surface-2/40 ring-1 ring-white/[0.04]">
+          <div className="flex items-center gap-3 min-w-0">
+            <button
+              onClick={selectAllVisible}
+              className="text-[11px] font-medium text-brand hover:text-brand-light transition-colors flex items-center gap-1.5 shrink-0"
+            >
+              <span className={`w-4 h-4 rounded border-2 flex items-center justify-center transition-colors
+                ${allVisibleSelected ? "bg-brand border-brand" : "border-white/30 hover:border-brand/70"}`}>
+                {allVisibleSelected && (
+                  <svg className="w-2.5 h-2.5 text-white" fill="none" stroke="currentColor" strokeWidth="3" viewBox="0 0 24 24">
+                    <polyline points="20 6 9 17 4 12"/>
+                  </svg>
+                )}
+              </span>
+              {allVisibleSelected
+                ? (t("history.deselect_all") || "Deseleccionar todos")
+                : (t("history.select_all_failed") || `Seleccionar ${visibleDeletableIds.length} eliminables`)}
+            </button>
+            {selectedCount > 0 && (
+              <span className="text-[11px] text-ink-secondary">
+                · {selectedCount} {selectedCount === 1 ? "seleccionado" : "seleccionados"}
+              </span>
+            )}
+          </div>
+          {selectedCount > 0 && (
+            <div className="flex items-center gap-2 shrink-0">
+              <button
+                onClick={clearSelection}
+                className="text-[11px] text-gray-500 hover:text-white px-2 py-1.5 transition-colors"
+              >
+                {t("history.clear_selection") || "Limpiar"}
+              </button>
+              <button
+                onClick={handleBulkDelete}
+                className="text-[11px] font-medium px-3 py-1.5 rounded-lg bg-red-500/15 text-red-300
+                  ring-1 ring-red-500/30 hover:bg-red-500/25 transition-colors"
+              >
+                {t("history.delete_selected") || `Eliminar ${selectedCount}`}
+              </button>
+            </div>
+          )}
+        </div>
+      )}
+
       {/* ─── Grid ─────────────────────────────────────────────── */}
       {visible.length === 0 ? (
         <div className="rounded-card p-14 text-center bg-surface-2/30 ring-1 ring-white/[0.04]">
@@ -179,7 +336,15 @@ export default function HistoryView({ history, onSelect, onBack }) {
       ) : (
         <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-3">
           {visible.map((job) => (
-            <VideoCard key={job.job_id} job={job} onSelect={onSelect} t={t} />
+            <VideoCard
+              key={job.job_id}
+              job={job}
+              onSelect={onSelect}
+              onDelete={onDelete}
+              selected={selectedIds.has(job.job_id)}
+              onToggleSelect={toggleSelect}
+              t={t}
+            />
           ))}
         </div>
       )}

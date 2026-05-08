@@ -13,7 +13,7 @@ from pydantic import BaseModel
 from sqlalchemy import func
 from sqlalchemy.orm import Session
 
-from auth import get_current_user, PLANS, pwd_context
+from auth import get_current_user, PLANS, pwd_context, validate_password_strength
 from database import User, Job, Invoice, AuditLog, AIProvenance, BackgroundAsset, get_db
 
 BACKGROUNDS_DIR = os.path.join(os.path.dirname(__file__), "..", "assets", "backgrounds", "library")
@@ -166,6 +166,15 @@ class CreateUserRequest(BaseModel):
     email: str = ""
     role: str = "user"
     plan_id: str = "100"
+    # tenant_id: when omitted, auth.create_user() auto-generates it from
+    # the username — fine for solo accounts but produces an isolated
+    # tenant per user. Pass it explicitly to put several teammates into
+    # the same shared workspace (e.g. all UMG operators on
+    # tenant_id="universal_music" so they see each other's jobs).
+    tenant_id: str = ""
+    # If true, the user keeps generating past plan monthly limit and we
+    # invoice the overage out-of-band. Default False = hard wall at limit.
+    allow_overage: bool = False
 
 
 @router.post("/users")
@@ -184,7 +193,12 @@ async def create_user_admin(
             email=body.email or None,
             role=body.role,
             plan=body.plan_id,
+            tenant_id=body.tenant_id.strip() or None,
         )
+        if body.allow_overage:
+            user.allow_overage = True
+            db.commit()
+            db.refresh(user)
         return user.to_dict()
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
@@ -246,6 +260,9 @@ class UpdateUserRequest(BaseModel):
     # Per-tenant concurrent-jobs cap (a.k.a. batch size). Default is 10.
     # Raise for tenants that ship full albums (12-15 tracks) as one batch.
     max_concurrent_jobs: Optional[int] = None
+    # B2B / overage opt-in. True = user can keep generating past plan
+    # monthly limit (extra videos invoice out-of-band).
+    allow_overage: Optional[bool] = None
 
 
 @router.patch("/users/{user_id}")
@@ -269,6 +286,10 @@ async def update_user_admin(
     if body.email is not None:
         user.email = body.email
     if body.password is not None:
+        try:
+            validate_password_strength(body.password)
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
         user.hashed_password = pwd_context.hash(body.password)
     if body.max_videos_per_day is not None:
         # Allow 0 to mean "block all uploads"; clamp to non-negative.
@@ -277,6 +298,8 @@ async def update_user_admin(
         # Min 1 — a cap of 0 would block uploads entirely; use is_active=False
         # for that. Clamp negatives to 1.
         user.max_concurrent_jobs = max(1, int(body.max_concurrent_jobs))
+    if body.allow_overage is not None:
+        user.allow_overage = bool(body.allow_overage)
 
     db.commit()
     db.refresh(user)
@@ -296,6 +319,79 @@ async def update_user_admin(
 # Jobs
 # ---------------------------------------------------------------------------
 
+@router.post("/runbook/reaper-now")
+async def runbook_reaper_now(
+    admin: dict = Depends(require_admin),
+    db: Session = Depends(get_db),
+    threshold_min: int = Query(100, ge=10, le=1440),
+):
+    """Force an immediate reaper pass.
+
+    The reaper already runs every 5 min on its own (see main.py
+    on_startup) — this endpoint is for the operator who just spotted
+    a zombie in admin and doesn't want to wait for the next cycle.
+
+    Snapshots the to-be-killed jobs before reaping so the response
+    can show what was acted on (after the reap they're status=error
+    and indistinguishable from normal failures).
+
+    Audited: every invocation lands in AuditLog with the count and
+    the operator's user_id. Same guardrails as the auto-pass: only
+    jobs in processing/queued past threshold_min get touched.
+    """
+    from reaper import find_stuck_jobs, reap_all_stuck
+
+    targets = find_stuck_jobs(db, threshold_min)
+    snapshot = [
+        {
+            "job_id": j.job_id,
+            "tenant_id": j.tenant_id,
+            "artist": j.artist,
+            "current_step": j.current_step,
+            "progress": j.progress,
+        }
+        for j in targets
+    ]
+
+    # reap_all_stuck owns its own session — we don't pass `db` to it.
+    count = reap_all_stuck(threshold_min)
+
+    db.add(AuditLog(
+        user_id=admin["id"],
+        action="admin.runbook.reaper_now",
+        detail={
+            "count": count,
+            "threshold_min": threshold_min,
+            "killed_jobs": [s["job_id"] for s in snapshot],
+        },
+    ))
+    db.commit()
+
+    return {
+        "count": count,
+        "threshold_min": threshold_min,
+        "killed": snapshot,
+    }
+
+
+@router.get("/stuck-jobs")
+async def admin_stuck_jobs(
+    admin: dict = Depends(require_admin),
+    db: Session = Depends(get_db),
+    threshold_min: int = Query(100, ge=10, le=1440),
+):
+    """List jobs that have been in processing/queued longer than
+    threshold_min. Used by the admin Overview banner so the operator
+    sees zombies before the reaper kills them next pass."""
+    from reaper import find_stuck_jobs
+    stuck = find_stuck_jobs(db, threshold_min)
+    return {
+        "threshold_min": threshold_min,
+        "count": len(stuck),
+        "jobs": [j.to_dict() for j in stuck],
+    }
+
+
 @router.get("/jobs")
 async def list_all_jobs(
     admin: dict = Depends(require_admin),
@@ -303,11 +399,16 @@ async def list_all_jobs(
     limit: int = Query(50, le=500),
     offset: int = Query(0, ge=0),
     status: str = Query(""),
+    tenant_id: str = Query(""),
 ):
-    """List all jobs across all tenants."""
+    """List all jobs across all tenants. Optional tenant_id filter so the
+    admin can drill into a specific customer (e.g. UMG) and watch their
+    pipeline live."""
     query = db.query(Job).order_by(Job.created_at.desc())
     if status:
         query = query.filter(Job.status == status)
+    if tenant_id:
+        query = query.filter(Job.tenant_id == tenant_id)
 
     total = query.count()
     jobs = query.offset(offset).limit(limit).all()

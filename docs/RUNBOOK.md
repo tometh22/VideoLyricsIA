@@ -265,3 +265,91 @@ diagnosed**. Common causes after dep updates:
 
 If none of the above resolves: read the most recent Sentry stack trace
 end-to-end before changing any code. Don't restart-loop the worker.
+
+---
+
+## UMG ProRes delivery — failure-mode audit (2026-05-07)
+
+End-to-end audit of every plausible failure mode for UMG ProRes
+exports, what's already protected, what's not, and pre-launch
+checks. Re-read this before sending the first batch to UMG.
+
+### Things already protected
+
+| Risk | Protection | Reference |
+|---|---|---|
+| DB connection saturation under 5 concurrent jobs | `pool_size=20, max_overflow=10` | `database.py:42-44` |
+| Vertex Veo 429 / RESOURCE_EXHAUSTED | 5 attempts, exponential backoff 60→300s | `pipeline.py:2707` |
+| R2 multipart upload timeout / transient failure | `max_attempts=5, mode=adaptive`, 30s connect, 120s read | `storage.py:42-46` |
+| R2 upload of multi-GB masters slow | 64 MB chunks × 20 concurrent threads | `storage.py:50-61` |
+| Worker RAM (24 GB Railway) | ProRes peak ~3 GB; sobra 8× | Railway plan |
+| Empty / whitespace lyric rows | Frontend filter + backend filter + `_make_text_clip` early-return | `pipeline.py:3320-3321`, `LyricsEditor.jsx:431-435` |
+| Job timeout for UMG ProRes | 90 min for `umg`/`both`, 45 min for `youtube` | `queue_jobs.py:18-23, 75-80` |
+| Soft cap simultaneous jobs per tenant | 5 max; rest queue | task #56 |
+| R2 input MP3 cleanup | Auto-delete > 30 days | task #53 |
+| UMG master spec compliance | `_validate_umg_master` runs after every render | `pipeline.py:3393` |
+| Subtitle overlap on render | Clamp `end` to `next.start - 50ms` | `pipeline.py:3577-3593` |
+| Title duplication on render | Pick ONE strategy (centered drop OR top-third), never both | `pipeline.py:3585-3640` |
+
+### Things NOT yet protected — pre-launch checklist
+
+| # | Risk | Action required | Owner |
+|---|---|---|---|
+| 1 | Worker disk efímero < 10 GB on Railway plan | Verify Railway worker plan has ≥10 GB ephemeral disk (Pro plan or higher). UMG master + intermediates can hit ~3-4 GB tmp. | Tomi |
+| 2 | R2 multipart upload incomplete if worker dies | Configure Cloudflare R2 lifecycle rule "abort incomplete multipart > 1 day". 5 min in Cloudflare console, no code change. | Tomi |
+| 3 | UMG QC rejects color metadata `unknown` | If rejected, post-process with `ffmpeg -metadata` to write explicit `color_primaries=bt709, color_trc=bt709`. Currently the `colr` atom is written but ffprobe doesn't surface the stream-level tags. | Tomi (only if UMG flags) |
+| 4 | UMG asks for ProRes 4444 (profile 4) instead of 422 HQ (profile 3) | Add profile 4 option to listbox. RenderSpec already supports it. | Tomi (only if UMG asks) |
+| 5 | Vertex token expires mid-render-storm (>60min) | Improbable; refresh-on-call already in `_get_genai_client()`. Monitor first UMG batch logs. | Tomi |
+
+### Things I cannot test from local — confirm in prod
+
+- **R2 multipart upload of real 1.5 GB file**: local has no R2 creds suitable for the prod bucket. First UMG job in prod is the verification.
+- **3 workers parallel uploading 1 GB each** (3 GB total in flight): Railway egress saturation. If first batch is slow, increase worker concurrency cap or batch size.
+- **R2 5xx errors during multi-GB upload**: boto3 retries 5×; if all fail the job lands in error with `s3_keys` not set. Manual recovery required.
+
+### Failure modes by category
+
+**Hard fails (job ends in error)**:
+- Vertex AI 5xx persistent → Veo gen fails after 5 retries
+- R2 endpoint unreachable → upload step throws
+- `_validate_umg_master` returns errors (e.g. wrong bitrate) → master rejected
+- moviepy / ffmpeg crash on weird audio (very rare; corrupt file)
+
+**Silent fails (job marks done, but output broken)**:
+- ⚠️ R2 upload appears successful but file is corrupted (network silently drops bytes)
+  - **Mitigation**: post-render verify ffprobe each deliverable, assert size + duration + codec match expected before marking job `done`. **TODO** — see task #133.
+- Color metadata stripped silently (only fails downstream UMG QC)
+
+**Performance / queue issues** (not failures, but UX):
+- 5+ simultaneous bursts → 2 wait in queue ~10 min each. By design.
+- Veo cold cache → first batch of new bgs hits Vertex Veo for every video. Subsequent reuses are free via R2 cache.
+
+### Pre-flight check before sending first UMG delivery
+
+1. **Render one test track** with `delivery_profile=both` end-to-end on prod.
+2. **Download the .mov** via the master tab in JobDetail.
+3. **Open in QuickTime + DaVinci** to confirm playback + color + audio.
+4. **Run `ffprobe -show_streams`** locally on the downloaded file. Confirm:
+   - codec_name=prores, profile=HQ
+   - 1920x1080, 24/1 fps
+   - pix_fmt=yuv422p10le, bits_per_raw_sample=10
+   - audio: pcm_s24le, 48000 Hz, 24-bit, 2 channels
+5. **Confirm with UMG** the file passes their QC before scaling to 200/month.
+
+### Recovery procedures
+
+**Job stuck in `processing` > 90 min**:
+1. Check Railway worker logs for the job_id.
+2. Run `python scripts/diagnose_job.py <job_id>` → shows current_step + progress + age.
+3. If stuck on `umg_master` step, render likely OOMing or disk full. Check Railway metrics.
+4. Cancel job via DELETE /jobs/{id} (works on processing). Operator re-uploads.
+
+**Master file corrupted (operator reports playback fails)**:
+1. Check R2 bucket for the object; download and ffprobe locally.
+2. If corrupted, delete the s3_key from the Job row and re-render via `/jobs/{id}/render-master` (when implemented) or full re-submit.
+
+**R2 storage growing unexpectedly**:
+1. Run `aws s3 ls --recursive s3://lyricgen/ | awk '{sum+=$3} END {print sum/1024/1024/1024 " GB"}'`.
+2. Look for incomplete multipart uploads: `aws s3api list-multipart-uploads --bucket lyricgen`.
+3. Abort them: `aws s3api abort-multipart-upload --bucket lyricgen --key X --upload-id Y`.
+4. Long-term: configure R2 lifecycle rule (item #2 above).

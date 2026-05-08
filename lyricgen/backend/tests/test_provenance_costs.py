@@ -13,8 +13,12 @@ from provenance import (
 # ---------------------------------------------------------------------------
 
 
-def test_veo_31_cost_is_4_dollars_per_call():
-    assert cost_for_record("veo-3.1-generate-001", "google_vertex") == 4.00
+def test_veo_31_cost_is_3_20_per_call():
+    # Google Cloud lists Veo 3.1 standard at $0.40/sec; this pipeline
+    # generates 8-second clips, so a single call bills at $3.20. The
+    # rate lives in provenance.COST_PER_CALL — keep this assertion in
+    # lock-step with that table when Google adjusts pricing.
+    assert cost_for_record("veo-3.1-generate-001", "google_vertex") == 3.20
 
 
 def test_gemini_flash_cost_is_one_cent():
@@ -94,12 +98,12 @@ def test_tenant_cost_summary_groups_by_tool(db):
     summary = tenant_cost_summary(db, tenant_id="cost-test-tenant", since_days=30)
 
     assert summary["total_calls"] == 8
-    # 3 × 4.00 + 5 × 0.01 = 12.05
-    assert summary["total_cost"] == 12.05
+    # 3 × 3.20 + 5 × 0.01 = 9.65 (Veo 3.1 standard at $0.40/s × 8 s)
+    assert summary["total_cost"] == 9.65
     # by_tool sorted by cost desc — Veo dominates
     assert summary["by_tool"][0]["tool_name"] == "veo-3.1-generate-001"
     assert summary["by_tool"][0]["calls"] == 3
-    assert summary["by_tool"][0]["cost"] == 12.0
+    assert summary["by_tool"][0]["cost"] == 9.60
     assert summary["by_tool"][1]["tool_name"] == "gemini-2.5-flash"
     assert summary["by_tool"][1]["calls"] == 5
     assert summary["by_tool"][1]["cost"] == 0.05
@@ -131,5 +135,6 @@ def test_tenant_cost_summary_isolates_tenants(db):
 
     a = tenant_cost_summary(db, tenant_id="tenant-a", since_days=30)
     b = tenant_cost_summary(db, tenant_id="tenant-b", since_days=30)
-    assert a["total_calls"] == 1 and a["total_cost"] == 4.0
-    assert b["total_calls"] == 2 and b["total_cost"] == 8.0
+    # Veo 3.1 standard = $3.20/call (see test_veo_31_cost_is_3_20_per_call).
+    assert a["total_calls"] == 1 and a["total_cost"] == 3.20
+    assert b["total_calls"] == 2 and b["total_cost"] == 6.40

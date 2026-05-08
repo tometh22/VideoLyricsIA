@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import { useI18n } from "../i18n";
 import Listbox from "./Listbox";
+import { UploadTour } from "./OnboardingTour";
 
 const API = import.meta.env.VITE_API_URL || "";
 
@@ -55,6 +56,7 @@ const UMG_PROFILES = [
 export default function UploadZone({
   files,
   onFiles,
+  delivery,
   onDeliveryChange,
   backgroundFile,
   onBackgroundFile,
@@ -65,15 +67,24 @@ export default function UploadZone({
   allHaveArtist = false,
   onStartReview,
   onGenerateDirect,
+  user,
 }) {
   const { t } = useI18n();
   const inputRef = useRef();
   const bgInputRef = useRef();
   const [dragging, setDragging] = useState(false);
-  const [deliveryProfile, setDeliveryProfile] = useState("youtube");
-  const [umgFrameSize, setUmgFrameSize] = useState("HD");
-  const [umgFps, setUmgFps] = useState(24);
-  const [umgProresProfile, setUmgProresProfile] = useState(3);
+  // Seed delivery selectors from App-level state when present so coming
+  // back from /review (or any remount) preserves the operator's choice
+  // of "ProRes 422 HQ" / frame size / fps, not just the file list.
+  const [deliveryProfile, setDeliveryProfile] = useState(delivery?.delivery_profile || "youtube");
+  // umg_frame_size used to be operator-selectable but the source MP4
+  // is always 1920×1080, so anything > HD would be an ffmpeg upscale
+  // (lossy). We keep the field hardcoded to "HD" so the backend still
+  // gets a valid umg_spec; if UMG ever needs 4K from a native 4K
+  // source, expose the dropdown again + change the MP4 render spec.
+  const umgFrameSize = "HD";
+  const [umgFps, setUmgFps] = useState(delivery?.umg_fps || 24);
+  const [umgProresProfile, setUmgProresProfile] = useState(delivery?.umg_prores_profile || 3);
   const [deliveryExpanded, setDeliveryExpanded] = useState(false);
   const [bgMode, setBgMode] = useState("auto"); // auto | library | custom
   const [libraryBgs, setLibraryBgs] = useState([]);
@@ -281,7 +292,7 @@ export default function UploadZone({
             <span className="text-sm text-white truncate">
               {deliveryProfile === "youtube"
                 ? "MP4 H.264 1080p"
-                : `ProRes ${umgFrameSize} ${umgFps} fps`}
+                : `MP4 + ProRes 1080p · ${umgFps} fps`}
             </span>
           </div>
           <span className="text-xs text-brand-light hover:text-brand transition-colors shrink-0">
@@ -308,21 +319,13 @@ export default function UploadZone({
               onChange={(v) => setDeliveryProfile(v)}
               options={[
                 { code: "youtube", label: "MP4 H.264 1080p (YouTube / Instagram / TikTok)" },
-                { code: "umg",  label: "ProRes 422 HQ master — próximamente", disabled: true },
-                { code: "both", label: "MP4 + ProRes — próximamente",         disabled: true },
+                { code: "both", label: "MP4 + ProRes 422 HQ master (UMG)" },
               ]}
               className="w-72"
               ariaLabel={t("upload.delivery") || "Entrega"}
             />
             {deliveryProfile !== "youtube" && (
               <>
-                <Listbox
-                  value={umgFrameSize}
-                  onChange={(v) => setUmgFrameSize(v)}
-                  options={UMG_FRAME_SIZES}
-                  className="w-56"
-                  ariaLabel="UMG frame size"
-                />
                 <Listbox
                   value={String(umgFps)}
                   onChange={(v) => setUmgFps(parseFloat(v))}
@@ -347,6 +350,7 @@ export default function UploadZone({
 
   const _dropZone = (
       <div
+        data-tour="upload-dropzone"
         onDragOver={(e) => { e.preventDefault(); setDragging(true); }}
         onDragLeave={() => setDragging(false)}
         onDrop={handleDrop}
@@ -414,7 +418,7 @@ export default function UploadZone({
             <p className="text-gray-300 font-medium mb-1">{t("upload.drag")}</p>
             <p className="text-gray-600 text-sm">{t("upload.drag_sub")}</p>
             <p className="text-gray-700 text-[11px] mt-2">
-              {t("upload.size_hint", { max: MAX_FILE_MB }) || `MP3 o WAV, máx ${MAX_FILE_MB} MB por archivo, hasta ${MAX_BATCH_SIZE} por lote`}
+              {t("upload.size_hint")}
             </p>
           </div>
         )}
@@ -491,7 +495,7 @@ export default function UploadZone({
       {files.length > 0 && (
         <div className="mt-3 space-y-2 max-h-96 overflow-y-auto pr-1">
           {files.map((entry, i) => (
-            <div key={i} className="glass rounded-card px-4 py-3">
+            <div key={i} className="glass rounded-card px-4 py-3" {...(i === 0 ? { "data-tour": "upload-row" } : {})}>
               <div className="flex items-center gap-3 mb-2">
                 <div className="w-8 h-8 rounded-lg bg-brand/10 flex items-center justify-center shrink-0">
                   <svg className="w-4 h-4 text-brand" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24" strokeLinecap="round" strokeLinejoin="round">
@@ -673,7 +677,7 @@ export default function UploadZone({
           <p className="text-[11px] text-gray-600 uppercase tracking-wider mb-2">{t("upload.bg_label") || "Background"}</p>
 
           {/* Mode selector */}
-          <div className="flex gap-1 p-1 glass rounded-xl w-fit mb-3">
+          <div className="flex gap-1 p-1 glass rounded-xl w-fit mb-3" data-tour="upload-bg-tabs">
             {[
               { id: "auto", label: t("upload.bg_auto") || "IA Auto" },
               { id: "library", label: t("upload.bg_library") || "Library" },
@@ -683,7 +687,21 @@ export default function UploadZone({
                 key={m.id}
                 onClick={() => {
                   setBgMode(m.id);
-                  if (m.id === "auto") { onBackgroundFile?.(null); onBackgroundId?.(null); }
+                  // Clear the OTHER mode's state on every switch — the
+                  // upstream consumer (App.jsx ~285) prefers backgroundId
+                  // over backgroundFile, so leaving a stale id behind
+                  // silently overrides a fresh upload. Picking "library"
+                  // discards a previously-uploaded custom file; picking
+                  // "custom" discards a previously-selected library id;
+                  // "auto" clears both.
+                  if (m.id === "auto") {
+                    onBackgroundFile?.(null);
+                    onBackgroundId?.(null);
+                  } else if (m.id === "library") {
+                    onBackgroundFile?.(null);
+                  } else if (m.id === "custom") {
+                    onBackgroundId?.(null);
+                  }
                 }}
                 className={`px-4 py-1.5 rounded-lg text-[11px] font-medium transition-all ${
                   bgMode === m.id ? "bg-brand text-white" : "text-gray-400 hover:text-white"
@@ -883,7 +901,7 @@ export default function UploadZone({
   if (files.length > 0) {
     summaryParts.push(`${files.length} ${files.length === 1 ? t("upload.file") : t("upload.files")}`);
   }
-  summaryParts.push(deliveryProfile === "youtube" ? "MP4 1080p" : `ProRes ${umgFrameSize}`);
+  summaryParts.push(deliveryProfile === "youtube" ? "MP4 1080p" : "MP4 + ProRes 1080p");
   if (bgMode === "library" && backgroundId) {
     const sel = libraryBgs.find((b) => b.id === backgroundId);
     if (sel) summaryParts.push(sel.name);
@@ -896,6 +914,7 @@ export default function UploadZone({
 
   return (
     <div className="w-full max-w-4xl mx-auto pb-28">
+      <UploadTour user={user} />
       <div className="space-y-4">
         {_dropZone}
         {_filesBlock}
@@ -908,7 +927,7 @@ export default function UploadZone({
           scrolls a long batch + gallery, with a live summary so they
           can verify their picks before submitting. */}
       {files.length > 0 && (
-        <div className="fixed bottom-0 left-64 right-0 z-30 bg-surface-1/85 backdrop-blur-xl border-t border-white/[0.06] px-8 py-4">
+        <div className="fixed bottom-0 left-64 right-0 z-30 bg-surface-1/85 backdrop-blur-xl border-t border-white/[0.06] px-8 py-4" data-tour="upload-cta-bar">
           <div className="max-w-4xl mx-auto flex items-center gap-4">
             <div className="flex-1 min-w-0">
               <p className="text-[10px] uppercase tracking-[0.18em] text-gray-500">
