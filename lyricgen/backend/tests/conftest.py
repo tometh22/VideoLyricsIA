@@ -11,6 +11,10 @@ os.environ["DATABASE_URL"] = "sqlite:///test.db"
 os.environ["JWT_SECRET"] = "test-secret-key-for-tests"
 os.environ["ADMIN_PASSWORD"] = "testadmin123"
 os.environ["RATE_LIMIT_ENABLED"] = "false"
+# CI defaults ENVIRONMENT unset → main.py sees "production" and the CORS
+# check (PR #7) raises at import because CORS_ORIGINS is also unset.
+# Tests don't make cross-origin requests, so flag the test env explicitly.
+os.environ.setdefault("ENVIRONMENT", "development")
 
 from fastapi.testclient import TestClient
 from database import Base, engine, SessionLocal, init_db
