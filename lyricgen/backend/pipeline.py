@@ -217,6 +217,9 @@ def run_pipeline(job_id: str, mp3_path: str, artist: str, style: str,
                  background_path: str = None,
                  input_r2_key: str | None = None,
                  bg_r2_key: str | None = None,
+                 variation_source_path: str | None = None,
+                 variation_source_r2_key: str | None = None,
+                 variation_parent_asset_id: int | None = None,
                  genre: str = "",
                  font: str = "",
                  concept: str = "",
@@ -245,6 +248,14 @@ def run_pipeline(job_id: str, mp3_path: str, artist: str, style: str,
         background) to R2 and passes the keys here; we download them locally
         before processing, restoring the same file paths the rest of the
         pipeline expects.
+
+    variation_source_path / variation_source_r2_key / variation_parent_asset_id:
+        Set when the user picked a library asset in "variation" mode. We
+        materialize the source video, extract a representative frame, and
+        feed it to Veo as image-to-video input — Veo then generates a
+        brand-new clip visually derived from the original. This is how UMG
+        gets a unique video off a library asset without needing a real
+        video-to-video model (Veo 3.1 only supports image-to-video).
     """
     job_dir = os.path.join(OUTPUTS_DIR, job_id)
     os.makedirs(job_dir, exist_ok=True)
@@ -273,6 +284,46 @@ def run_pipeline(job_id: str, mp3_path: str, artist: str, style: str,
                 error=f"Failed to fetch background from R2: {bg_r2_key}",
             )
             return
+
+    # Variation mode: materialize the source library video locally and
+    # extract a frame to use as the Veo image-to-video seed. The source
+    # video itself is NOT used as the final background — we only borrow
+    # one frame so Veo can derive a visually similar but distinct clip.
+    variation_seed_image = None
+    if variation_source_path:
+        if variation_source_r2_key and not os.path.exists(variation_source_path):
+            os.makedirs(os.path.dirname(variation_source_path) or ".", exist_ok=True)
+            if not storage.download_object(variation_source_r2_key, variation_source_path):
+                update_job(
+                    job_id, status="error",
+                    error=f"Failed to fetch variation source from R2: {variation_source_r2_key}",
+                )
+                return
+        if not os.path.exists(variation_source_path):
+            update_job(
+                job_id, status="error",
+                error=f"Variation source not found locally: {variation_source_path}",
+            )
+            return
+        variation_seed_image = os.path.join(job_dir, "variation_seed.png")
+        try:
+            _extract_frame_from_video(variation_source_path, variation_seed_image)
+        except Exception as e:
+            update_job(
+                job_id, status="error",
+                error=f"Failed to extract frame for variation: {e}",
+            )
+            return
+        # Hand the extracted frame to the existing image-to-video branch.
+        # `_animate_user_image` (computed below) only fires when the
+        # background file is a JPG/PNG — our extracted frame is a PNG, so
+        # the existing logic will pass it to Veo as the image-to-video
+        # seed and produce a brand-new clip derived from it.
+        background_path = variation_seed_image
+        animate_image = True
+        print(f"[BG] variation: seeded Veo image-to-video from frame of "
+              f"{os.path.basename(variation_source_path)} (parent asset "
+              f"id={variation_parent_asset_id})")
 
     wants_youtube = delivery_profile in ("youtube", "both")
     wants_umg = delivery_profile in ("umg", "both")
@@ -3403,6 +3454,51 @@ def _generate_imagen_image(prompt: str, output_path: str, max_retries: int = 5,
             output_artifact=output_path,
         )
     return output_path
+
+
+def _extract_frame_from_video(video_path: str, output_image_path: str) -> str:
+    """Extract a representative still frame from a video and save it as PNG.
+
+    Used by the "library variation" flow: we pick a frame from the
+    user-selected library video and pass it to Veo as image-to-video
+    seed so Veo derives a new clip visually similar to the original.
+
+    The chosen timestamp is the middle of the clip — the first second
+    is often a fade-in / black frame and the last second a fade-out, so
+    the middle is the most representative single frame.
+
+    Raises RuntimeError if ffprobe/ffmpeg is unavailable or the file is
+    not a readable video.
+    """
+    try:
+        probe = subprocess.run(
+            [
+                "ffprobe", "-v", "error",
+                "-show_entries", "format=duration",
+                "-of", "default=noprint_wrappers=1:nokey=1",
+                video_path,
+            ],
+            capture_output=True, text=True, timeout=30,
+        )
+        duration = float((probe.stdout or "0").strip() or 0.0)
+    except (subprocess.SubprocessError, ValueError, FileNotFoundError) as e:
+        raise RuntimeError(f"ffprobe failed on {video_path}: {e}") from e
+    timestamp = max(0.0, duration / 2.0) if duration > 0 else 0.0
+
+    cmd = [
+        "ffmpeg", "-y",
+        "-ss", f"{timestamp:.3f}",
+        "-i", video_path,
+        "-frames:v", "1",
+        "-vf", "scale='min(1920,iw)':-2",
+        output_image_path,
+    ]
+    result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+    if result.returncode != 0 or not os.path.exists(output_image_path):
+        raise RuntimeError(
+            f"ffmpeg frame extraction failed (rc={result.returncode}): {result.stderr[:300]}"
+        )
+    return output_image_path
 
 
 def _ensure_background(style_hint: str, job_dir: str, lyrics_text: str = None,

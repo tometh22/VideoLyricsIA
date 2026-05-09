@@ -568,12 +568,39 @@ async def list_all_provenance(
 
 @router.get("/backgrounds")
 async def list_backgrounds(
+    owner_tenant_id: Optional[str] = Query(None),
     admin: dict = Depends(require_admin),
     db: Session = Depends(get_db),
 ):
-    """List all background assets."""
-    assets = db.query(BackgroundAsset).order_by(BackgroundAsset.created_at.desc()).all()
+    """List all background assets.
+
+    `owner_tenant_id` filters: pass a tenant string to see only that
+    tenant's exclusive assets, or "__global__" to see only global ones
+    (owner_tenant_id IS NULL). Omit to see everything.
+    """
+    q = db.query(BackgroundAsset)
+    if owner_tenant_id == "__global__":
+        q = q.filter(BackgroundAsset.owner_tenant_id.is_(None))
+    elif owner_tenant_id:
+        q = q.filter(BackgroundAsset.owner_tenant_id == owner_tenant_id)
+    assets = q.order_by(BackgroundAsset.created_at.desc()).all()
     return [a.to_dict() for a in assets]
+
+
+@router.get("/background-tenants")
+async def list_background_tenants(
+    admin: dict = Depends(require_admin),
+    db: Session = Depends(get_db),
+):
+    """List the tenants that have at least one user, plus the special
+    "global" entry. Used by the admin upload UI to populate the
+    "Assign to tenant" dropdown without us hardcoding the UMG name."""
+    tenants = [
+        t[0]
+        for t in db.query(User.tenant_id).distinct().order_by(User.tenant_id).all()
+        if t[0]
+    ]
+    return {"tenants": tenants}
 
 
 @router.post("/backgrounds")
@@ -581,6 +608,7 @@ async def upload_background(
     file: UploadFile = File(...),
     name: str = Form(...),
     tags: str = Form(""),
+    owner_tenant_id: str = Form(""),
     admin: dict = Depends(require_admin),
     db: Session = Depends(get_db),
 ):
@@ -597,6 +625,12 @@ async def upload_background(
 
     Either way the read path in main.py supports both shapes — the
     `library/` prefix is the signal.
+
+    `owner_tenant_id` (optional form field): if provided, the asset is
+    locked to that tenant — only users of that tenant (and admins) will
+    see it in /backgrounds. Empty string means "global / visible to
+    everyone", which is the right default for fallback assets but the
+    wrong default for paying clients like UMG.
     """
     import storage
 
@@ -624,12 +658,14 @@ async def upload_background(
             # Keep the local copy as a fallback. Filename stays as the
             # bare basename so the read path uses the disk branch.
 
+    tenant_scope = (owner_tenant_id or "").strip() or None
     asset = BackgroundAsset(
         name=name,
         filename=stored_filename,
         file_type=file_type,
         tags=tags.strip() if tags.strip() else None,
         uploaded_by=admin["id"],
+        owner_tenant_id=tenant_scope,
     )
     db.add(asset)
     db.commit()
@@ -638,7 +674,12 @@ async def upload_background(
     db.add(AuditLog(
         user_id=admin["id"],
         action="admin.upload_background",
-        detail={"asset_id": asset.id, "name": name, "storage": "r2" if stored_filename.startswith("library/") else "local"},
+        detail={
+            "asset_id": asset.id,
+            "name": name,
+            "owner_tenant_id": tenant_scope,
+            "storage": "r2" if stored_filename.startswith("library/") else "local",
+        },
     ))
     db.commit()
 

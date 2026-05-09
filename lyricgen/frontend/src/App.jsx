@@ -275,6 +275,11 @@ export default function App() {
   const [backgroundFile, setBackgroundFile] = useState(null);
   const [animateImage, setAnimateImage] = useState(false);
   const [backgroundId, setBackgroundId] = useState(null);
+  // "as_is" reuses the library asset directly. "variation" tells the
+  // backend to extract a frame and run Veo image-to-video to derive a
+  // brand-new clip — UMG's path for getting a unique video off a
+  // library asset they already used (or want to differentiate from).
+  const [backgroundMode, setBackgroundMode] = useState("as_is");
   const [sidebarOpen, setSidebarOpen] = useState(true);
   const [resetToken, setResetToken] = useState(null);
   const pollingIntervals = useRef(new Set());
@@ -565,8 +570,10 @@ export default function App() {
           formData.append("umg_fps", String(delivery.umg_fps));
           formData.append("umg_prores_profile", String(delivery.umg_prores_profile));
         }
-        if (backgroundId) formData.append("background_id", backgroundId);
-        else if (backgroundFile) formData.append("background_file", backgroundFile);
+        if (backgroundId) {
+          formData.append("background_id", backgroundId);
+          formData.append("background_mode", backgroundMode);
+        } else if (backgroundFile) formData.append("background_file", backgroundFile);
 
         let res = null;
         try {
@@ -671,8 +678,10 @@ export default function App() {
         generateBody.append("lyric_transition", jobList[i].lyricTransition || "cut");
         generateBody.append("text_motion", jobList[i].textMotion || "none");
         if (animateImage && backgroundFile) generateBody.append("animate_image", "true");
-        if (backgroundId) generateBody.append("background_id", backgroundId);
-        else if (backgroundFile) generateBody.append("background_file", backgroundFile);
+        if (backgroundId) {
+          generateBody.append("background_id", backgroundId);
+          generateBody.append("background_mode", backgroundMode);
+        } else if (backgroundFile) generateBody.append("background_file", backgroundFile);
 
         let genRes = null;
         try {
@@ -842,6 +851,8 @@ export default function App() {
         onBackgroundFile={setBackgroundFile}
         backgroundId={backgroundId}
         onBackgroundId={setBackgroundId}
+        backgroundMode={backgroundMode}
+        onBackgroundMode={setBackgroundMode}
         animateImage={animateImage}
         onAnimateImage={setAnimateImage}
         allHaveArtist={allHaveArtist}

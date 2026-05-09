@@ -69,6 +69,8 @@ export default function UploadZone({
   onBackgroundFile,
   backgroundId,
   onBackgroundId,
+  backgroundMode,
+  onBackgroundMode,
   animateImage,
   onAnimateImage,
   allHaveArtist = false,
@@ -100,6 +102,11 @@ export default function UploadZone({
   const [libraryLoaded, setLibraryLoaded] = useState(false);
   // Library filter chip: all | image | video_cinematic | video_simple
   const [libraryFilter, setLibraryFilter] = useState("all");
+  // Per-asset usage map keyed by asset id. Populated lazily once the
+  // library list lands so we can paint "ya usado" badges without
+  // blocking the picker render. Shape: { [id]: { used, last_used_at,
+  // use_count } }.
+  const [usageMap, setUsageMap] = useState({});
   // Per-row expansion of the secondary controls (Tipografía / Concepto /
   // Movimiento). Idioma + Género stay always-visible because operators
   // tweak those most often; the rest hide behind "Más opciones" so a
@@ -127,10 +134,40 @@ export default function UploadZone({
     if (bgMode === "library" && !libraryLoaded) {
       fetch(`${API}/backgrounds`, { headers: authHeaders() })
         .then(r => r.json())
-        .then(data => { setLibraryBgs(Array.isArray(data) ? data : []); setLibraryLoaded(true); })
+        .then(data => {
+          const list = Array.isArray(data) ? data : [];
+          setLibraryBgs(list);
+          setLibraryLoaded(true);
+          // Fan out per-asset usage probes. The backend returns the
+          // tenant-scoped count, so this is what powers the "ya usado"
+          // chip. Failures are swallowed — a missing badge is fine.
+          list.forEach((bg) => {
+            fetch(`${API}/backgrounds/${bg.id}/usage`, { headers: authHeaders() })
+              .then((r) => (r.ok ? r.json() : null))
+              .then((u) => { if (u) setUsageMap((prev) => ({ ...prev, [bg.id]: u })); })
+              .catch(() => {});
+          });
+        })
         .catch(() => setLibraryLoaded(true));
     }
   }, [bgMode, libraryLoaded]);
+
+  // When the user clears the library selection (or switches mode),
+  // reset the variation toggle so a fresh pick starts in the safe
+  // "as-is" default rather than inheriting the previous song's choice.
+  useEffect(() => {
+    if (!backgroundId && backgroundMode !== "as_is") {
+      onBackgroundMode?.("as_is");
+    }
+  }, [backgroundId, backgroundMode, onBackgroundMode]);
+
+  const _formatUsageDate = (iso) => {
+    if (!iso) return "";
+    try {
+      const d = new Date(iso);
+      return d.toLocaleDateString(undefined, { day: "2-digit", month: "short", year: "numeric" });
+    } catch { return ""; }
+  };
 
   const LANGUAGES = [
     { code: "", label: t("lang.auto") },
@@ -947,6 +984,15 @@ export default function UploadZone({
                                   {t("upload.bg_selected") || "Seleccionado"}
                                 </span>
                               )}
+                              {usageMap[bg.id]?.used && (
+                                <span
+                                  className="absolute top-2 left-2 inline-flex items-center gap-1 px-2 py-0.5 rounded-full bg-amber-500/90 text-black text-[10px] font-semibold uppercase tracking-wider shadow"
+                                  title={`${t("upload.bg_used_tooltip") || "Usado"} ${usageMap[bg.id].use_count}× — ${_formatUsageDate(usageMap[bg.id].last_used_at)}`}
+                                >
+                                  {t("upload.bg_used") || "Ya usado"}
+                                  {usageMap[bg.id].last_used_at ? ` · ${_formatUsageDate(usageMap[bg.id].last_used_at)}` : ""}
+                                </span>
+                              )}
                             </div>
                             <div className="px-3 py-2">
                               <p className="text-[12px] text-white truncate">{bg.name}</p>
@@ -955,6 +1001,38 @@ export default function UploadZone({
                         );
                       })}
                     </div>
+                    {backgroundId && libraryBgs.find((b) => b.id === backgroundId) && (
+                      <div className="mt-3 rounded-card bg-surface-2/40 ring-1 ring-white/[0.04] px-3 py-2.5">
+                        <p className="text-[11px] text-ink-secondary mb-2">
+                          {t("upload.bg_variation_prompt") || "Cómo querés usar este fondo:"}
+                        </p>
+                        <div className="flex flex-wrap gap-2">
+                          {[
+                            { id: "as_is",     label: t("upload.bg_use_as_is")     || "Usar tal cual" },
+                            { id: "variation", label: t("upload.bg_use_variation") || "Generar variación" },
+                          ].map((m) => (
+                            <button
+                              key={m.id}
+                              type="button"
+                              onClick={() => onBackgroundMode?.(m.id)}
+                              className={`h-8 px-3 rounded-full text-[11px] font-medium transition-all ${
+                                backgroundMode === m.id
+                                  ? "bg-brand/15 text-brand-light ring-1 ring-brand/40"
+                                  : "bg-surface-2/40 text-ink-secondary ring-1 ring-white/[0.04] hover:ring-white/[0.08] hover:text-white"
+                              }`}
+                            >
+                              {m.label}
+                            </button>
+                          ))}
+                        </div>
+                        {backgroundMode === "variation" && (
+                          <p className="mt-2 text-[10.5px] text-ink-secondary/80 leading-snug">
+                            {t("upload.bg_variation_help") ||
+                              "Veo usará un frame de este video como referencia visual y generará un clip nuevo derivado del original."}
+                          </p>
+                        )}
+                      </div>
+                    )}
                   </>
                 )}
               </div>
