@@ -1524,6 +1524,10 @@ async def upload(
     concept: str = Form(""),
     movement_style: str = Form(""),
     animate_image: str = Form(""),
+    text_case: str = Form("upper"),
+    font_scale: str = Form("1.0"),
+    lyric_transition: str = Form("cut"),
+    text_motion: str = Form("none"),
     current_user: dict = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
@@ -1640,6 +1644,12 @@ async def upload(
     # Always enqueue. RQ's per-priority worker pool naturally caps how many
     # jobs run at once — the rest wait in Redis. UMG (plan=unlimited) goes
     # to the enterprise queue, which workers drain before the default queue.
+    _font_scale = 1.0
+    try:
+        _font_scale = max(0.6, min(1.5, float(font_scale or "1.0")))
+    except (ValueError, TypeError):
+        pass
+
     enqueue_pipeline(
         job_id=job_id,
         mp3_path=mp3_path,
@@ -1658,6 +1668,10 @@ async def upload(
         movement_style=movement_style,
         animate_image=str(animate_image).strip().lower() in ("true", "1", "yes", "on"),
         song_title=song_title,
+        text_case=text_case if text_case in ("upper", "title", "lower", "original") else "upper",
+        font_scale=_font_scale,
+        lyric_transition=lyric_transition if lyric_transition in ("cut", "fade", "fade_slow") else "cut",
+        text_motion=text_motion if text_motion in ("none", "subtle", "float") else "none",
     )
 
     return {"job_id": job_id, "status": initial_status}
@@ -2254,6 +2268,10 @@ async def generate_with_segments(
     concept: str = Form(""),
     movement_style: str = Form(""),
     animate_image: str = Form(""),
+    text_case: str = Form("upper"),
+    font_scale: str = Form("1.0"),
+    lyric_transition: str = Form("cut"),
+    text_motion: str = Form("none"),
     current_user: dict = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
@@ -2430,6 +2448,12 @@ async def generate_with_segments(
                     bg_path, current_user["tenant_id"], job_id, bg_filename,
                 )
 
+    _font_scale_gen = 1.0
+    try:
+        _font_scale_gen = max(0.6, min(1.5, float(font_scale or "1.0")))
+    except (ValueError, TypeError):
+        pass
+
     enqueue_pipeline(
         job_id=job_id,
         mp3_path=mp3_path,
@@ -2448,6 +2472,10 @@ async def generate_with_segments(
         movement_style=movement_style,
         animate_image=str(animate_image).strip().lower() in ("true", "1", "yes", "on"),
         song_title=song_title,
+        text_case=text_case if text_case in ("upper", "title", "lower", "original") else "upper",
+        font_scale=_font_scale_gen,
+        lyric_transition=lyric_transition if lyric_transition in ("cut", "fade", "fade_slow") else "cut",
+        text_motion=text_motion if text_motion in ("none", "subtle", "float") else "none",
     )
 
     return {"job_id": job_id, "status": initial_status}

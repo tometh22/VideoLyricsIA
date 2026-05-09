@@ -280,6 +280,10 @@ export default function UploadZone({
           artist,
           songTitle: song,
           language: "",
+          textCase: "upper",
+          fontScale: "1.0",
+          lyricTransition: "cut",
+          textMotion: "none",
         };
       });
       return [...prev, ...newEntries];
@@ -708,6 +712,74 @@ export default function UploadZone({
                         options={FONTS}
                         className="flex-1"
                         ariaLabel={t("upload.font_label") || "Tipografía"}
+                      />
+                    </div>
+                    {/* ── Text style controls ── */}
+                    <div className="flex items-center gap-2 pt-1">
+                      <span className="text-[11px] text-gray-600 shrink-0">
+                        {t("upload.text_case_label") || "Estilo texto:"}
+                      </span>
+                      <Listbox
+                        value={entry.textCase || "upper"}
+                        onChange={(v) => updateField(i, "textCase", v)}
+                        options={[
+                          { code: "upper",    label: t("upload.case_upper")    || "MAYÚSCULAS" },
+                          { code: "title",    label: t("upload.case_title")    || "Título" },
+                          { code: "lower",    label: t("upload.case_lower")    || "minúsculas" },
+                          { code: "original", label: t("upload.case_original") || "Original" },
+                        ]}
+                        className="flex-1"
+                        ariaLabel={t("upload.text_case_label") || "Estilo texto"}
+                      />
+                    </div>
+                    <div className="flex items-center gap-2 pt-1">
+                      <span className="text-[11px] text-gray-600 shrink-0">
+                        {t("upload.font_scale_label") || "Tamaño lyrics:"}
+                      </span>
+                      <Listbox
+                        value={entry.fontScale || "1.0"}
+                        onChange={(v) => updateField(i, "fontScale", v)}
+                        options={[
+                          { code: "0.75", label: t("upload.scale_xs") || "Chico" },
+                          { code: "0.9",  label: t("upload.scale_sm") || "Pequeño" },
+                          { code: "1.0",  label: t("upload.scale_md") || "Normal" },
+                          { code: "1.15", label: t("upload.scale_lg") || "Grande" },
+                          { code: "1.3",  label: t("upload.scale_xl") || "Muy grande" },
+                        ]}
+                        className="flex-1"
+                        ariaLabel={t("upload.font_scale_label") || "Tamaño lyrics"}
+                      />
+                    </div>
+                    <div className="flex items-center gap-2 pt-1">
+                      <span className="text-[11px] text-gray-600 shrink-0">
+                        {t("upload.transition_label") || "Transición:"}
+                      </span>
+                      <Listbox
+                        value={entry.lyricTransition || "cut"}
+                        onChange={(v) => updateField(i, "lyricTransition", v)}
+                        options={[
+                          { code: "cut",       label: t("upload.transition_cut")  || "Corte directo" },
+                          { code: "fade",      label: t("upload.transition_fade") || "Fade suave" },
+                          { code: "fade_slow", label: t("upload.transition_slow") || "Fade lento" },
+                        ]}
+                        className="flex-1"
+                        ariaLabel={t("upload.transition_label") || "Transición"}
+                      />
+                    </div>
+                    <div className="flex items-center gap-2 pt-1">
+                      <span className="text-[11px] text-gray-600 shrink-0">
+                        {t("upload.motion_label") || "Movimiento texto:"}
+                      </span>
+                      <Listbox
+                        value={entry.textMotion || "none"}
+                        onChange={(v) => updateField(i, "textMotion", v)}
+                        options={[
+                          { code: "none",   label: t("upload.motion_none")   || "Estático" },
+                          { code: "subtle", label: t("upload.motion_subtle") || "Sutil" },
+                          { code: "float",  label: t("upload.motion_float")  || "Flotante" },
+                        ]}
+                        className="flex-1"
+                        ariaLabel={t("upload.motion_label") || "Movimiento texto"}
                       />
                     </div>
                     {bgMode !== "auto" && (

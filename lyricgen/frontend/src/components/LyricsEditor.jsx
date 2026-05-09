@@ -75,7 +75,76 @@ function findSuggestion(whisperText, refLines, startIdx) {
   return null;
 }
 
-export default function LyricsEditor({ segments, filename, audioFile, referenceLyrics, coverageWarning = false, recoverySource = "", onApprove, onBack, isBatch = false, batchProgress = "", user = null }) {
+// ─── Font-code → CSS map (mirrors UploadZone FONTS) ────────────────────────
+const FONT_CSS_MAP = {
+  "jost-bold":       "'Jost', sans-serif",
+  "montserrat-bold": "'Montserrat', sans-serif",
+  "poppins-bold":    "'Poppins', sans-serif",
+  "outfit-bold":     "'Outfit', sans-serif",
+  "roboto-bold":     "'Roboto', sans-serif",
+  "bebas-neue":      "'Bebas Neue', sans-serif",
+  "oswald-bold":     "'Oswald', sans-serif",
+  "anton":           "'Anton', sans-serif",
+  "":                "'Montserrat', sans-serif",
+};
+
+// Backend tier params (baseline 1920×1080, scale = 1.0).
+const TIERS = [
+  { maxChars: 50, sizePx: 85, maxWidthPx: 1500 },
+  { maxChars: 80, sizePx: 70, maxWidthPx: 1650 },
+  { maxChars: Infinity, sizePx: 55, maxWidthPx: 1700 },
+];
+
+function getTier(text) {
+  const len = text.length;
+  return TIERS.find((t) => len <= t.maxChars) || TIERS[TIERS.length - 1];
+}
+
+// Simulate moviepy's word-wrap with canvas.measureText.
+// Returns the number of visual lines the segment will occupy in the video.
+function estimateWrappedLines(text, fontCss, sizePx, maxWidthPx) {
+  try {
+    const canvas = document.createElement("canvas");
+    const ctx = canvas.getContext("2d");
+    ctx.font = `bold ${sizePx}px ${fontCss}`;
+    const spaceW = ctx.measureText(" ").width;
+    const words = text.split(" ");
+    let lines = 1;
+    let lineW = 0;
+    for (const word of words) {
+      const ww = ctx.measureText(word).width;
+      if (lineW > 0 && lineW + spaceW + ww > maxWidthPx) {
+        lines++;
+        lineW = ww;
+      } else {
+        lineW = lineW > 0 ? lineW + spaceW + ww : ww;
+      }
+    }
+    return lines;
+  } catch {
+    return 1;
+  }
+}
+
+// Apply the same case transform as the backend _apply_case().
+function applyCase(text, textCase) {
+  if (textCase === "upper") return text.toUpperCase();
+  if (textCase === "title") return text.replace(/\b\w/g, (c) => c.toUpperCase());
+  if (textCase === "lower") return text.toLowerCase();
+  return text;
+}
+
+export default function LyricsEditor({
+  segments, filename, audioFile, referenceLyrics,
+  coverageWarning = false, recoverySource = "",
+  onApprove, onBack, isBatch = false, batchProgress = "",
+  user = null,
+  font = "",
+  textCase = "upper",
+  fontScale = 1.0,
+  lyricTransition = "cut",
+  textMotion = "none",
+}) {
   const { t } = useI18n();
   const [edited, setEdited] = useState(() =>
     segments.map((s, i) => ({ ...s, _id: i }))
@@ -95,6 +164,8 @@ export default function LyricsEditor({ segments, filename, audioFile, referenceL
   const [isPlaying, setIsPlaying] = useState(false);
   const [currentTime, setCurrentTime] = useState(0);
   const [duration, setDuration] = useState(0);
+  const [wrapWarning, setWrapWarning] = useState(null); // {ids: [...]} for 3+ line segs
+  const [focusedSegId, setFocusedSegId] = useState(null); // for preview panel
 
   // Inline timestamp edit state. Only one row can be in edit mode at a
   // time; clicking a different row's timestamp swaps the active editor.
@@ -442,6 +513,59 @@ export default function LyricsEditor({ segments, filename, audioFile, referenceL
     setEdited((prev) => prev.filter((seg) => seg._id !== id));
   };
 
+  // Compute how many visual lines a segment will occupy in the video.
+  const linesForSeg = useCallback((text) => {
+    const displayText = applyCase(text || "", textCase);
+    const tier = getTier(displayText);
+    const fontCss = FONT_CSS_MAP[font] || FONT_CSS_MAP[""];
+    const sizePx = Math.round(tier.sizePx * Math.max(0.6, Math.min(1.5, fontScale)));
+    return estimateWrappedLines(displayText, fontCss, sizePx, tier.maxWidthPx);
+  }, [font, textCase, fontScale]);
+
+  // Split a segment at the optimal word boundary (last word that fits on line 1).
+  // Creates two child segments with timestamps split proportionally to word count.
+  const splitSeg = (id) => {
+    pushEditHistory();
+    setEdited((prev) => {
+      const idx = prev.findIndex((s) => s._id === id);
+      if (idx === -1) return prev;
+      const seg = prev[idx];
+      const displayText = applyCase(seg.text || "", textCase);
+      const tier = getTier(displayText);
+      const fontCss = FONT_CSS_MAP[font] || FONT_CSS_MAP[""];
+      const sizePx = Math.round(tier.sizePx * Math.max(0.6, Math.min(1.5, fontScale)));
+
+      // Find the split word index: last word whose prefix fits in maxWidthPx
+      const words = seg.text.split(" ");
+      const canvas = document.createElement("canvas");
+      const ctx = canvas.getContext("2d");
+      ctx.font = `bold ${sizePx}px ${fontCss}`;
+      const spaceW = ctx.measureText(" ").width;
+      let lineW = 0;
+      let splitIdx = Math.floor(words.length / 2); // fallback: half
+      for (let wi = 0; wi < words.length - 1; wi++) {
+        const ww = ctx.measureText(applyCase(words[wi], textCase)).width;
+        lineW = lineW > 0 ? lineW + spaceW + ww : ww;
+        if (lineW > tier.maxWidthPx) {
+          splitIdx = wi > 0 ? wi : 1;
+          break;
+        }
+        splitIdx = wi + 1;
+      }
+
+      const part1 = words.slice(0, splitIdx).join(" ");
+      const part2 = words.slice(splitIdx).join(" ");
+      const ratio = splitIdx / words.length;
+      const midTime = seg.start + (seg.end - seg.start) * ratio;
+      const gap = 0.05;
+      const nextId1 = prev.reduce((m, s) => Math.max(m, s._id), -1) + 1;
+      const nextId2 = nextId1 + 1;
+      const s1 = { ...seg, _id: nextId1, text: part1, end: Math.max(seg.start + 0.3, midTime - gap) };
+      const s2 = { ...seg, _id: nextId2, text: part2, start: Math.min(seg.end - 0.3, midTime), end: seg.end };
+      return [...prev.slice(0, idx), s1, s2, ...prev.slice(idx + 1)];
+    });
+  };
+
   // Insert a duplicate of `seg` immediately after it. Same text, same
   // duration, start placed right after the original ends so the new
   // row visibly differs in time. Operator typically re-syncs it via
@@ -481,15 +605,11 @@ export default function LyricsEditor({ segments, filename, audioFile, referenceL
   const hasSuggestions = pendingSuggestions > 0;
   const blankCount = edited.filter((seg) => !(seg.text || "").trim()).length;
 
-  const handleApprove = () => {
-    // Drop empty / whitespace-only rows BEFORE clamping. Operator can
-    // leave blanks from "Agregar línea" if they didn't type lyrics —
-    // sending those to the worker triggers an ImageMagick "label
-    // expected" crash that aborts the whole render.
+  const _buildCleanedSegments = () => {
     const sorted = [...edited]
       .filter((seg) => (seg.text || "").trim())
       .sort((a, b) => a.start - b.start);
-    const cleaned = sorted.map((seg, i) => {
+    return sorted.map((seg, i) => {
       let end = seg.end;
       if (i + 1 < sorted.length) {
         const nextStart = sorted[i + 1].start;
@@ -499,6 +619,21 @@ export default function LyricsEditor({ segments, filename, audioFile, referenceL
       }
       return { ...seg, end };
     });
+  };
+
+  const handleApprove = () => {
+    // Check for 3+ line segments before submitting — show a warning banner
+    // so the operator can auto-split them rather than discover the issue
+    // after waiting for the full video render.
+    const problematic = edited.filter(
+      (seg) => (seg.text || "").trim() && linesForSeg(seg.text) >= 3
+    );
+    if (problematic.length > 0 && !wrapWarning) {
+      setWrapWarning({ ids: problematic.map((s) => s._id) });
+      return;
+    }
+    setWrapWarning(null);
+    const cleaned = _buildCleanedSegments();
     onApprove(cleaned.map(({ _id, ...rest }) => rest));
   };
 
@@ -899,11 +1034,44 @@ export default function LyricsEditor({ segments, filename, audioFile, referenceL
                       type="text"
                       value={seg.text}
                       onChange={(e) => updateText(seg._id, e.target.value)}
-                      onFocus={() => seekTo(seg.start, false)}
+                      onFocus={() => { seekTo(seg.start, false); setFocusedSegId(seg._id); }}
                       className={`w-full px-3 py-2 rounded-xl bg-surface-1 border text-sm text-white
                         focus:border-brand/40 focus:outline-none hover:border-white/[0.08] transition-all
                         ${suggestion && !isApplied ? "border-amber-500/20" : "border-white/[0.04]"}`}
                     />
+                    {/* Wrap indicator + split action */}
+                    {(() => {
+                      if (!(seg.text || "").trim()) return null;
+                      const lines = linesForSeg(seg.text);
+                      if (lines <= 1) return null;
+                      return (
+                        <div className="flex items-center gap-2 mt-1 ml-1">
+                          {lines === 2 ? (
+                            <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full
+                              bg-amber-500/10 text-amber-300 ring-1 ring-amber-500/25 text-[10px] font-medium">
+                              <span className="relative flex h-1.5 w-1.5">
+                                <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-amber-400 opacity-60"/>
+                                <span className="relative inline-flex rounded-full h-1.5 w-1.5 bg-amber-400"/>
+                              </span>
+                              ⚠ 2 líneas
+                            </span>
+                          ) : (
+                            <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full
+                              bg-red-500/10 text-red-300 ring-1 ring-red-500/25 text-[10px] font-medium">
+                              ✗ {lines} líneas
+                            </span>
+                          )}
+                          <button
+                            onClick={() => splitSeg(seg._id)}
+                            className="text-[10px] text-brand hover:text-brand-light transition-colors
+                              flex items-center gap-0.5 px-2 py-0.5 rounded-lg
+                              bg-brand/5 hover:bg-brand/15 ring-1 ring-brand/20"
+                          >
+                            ✂ Dividir
+                          </button>
+                        </div>
+                      );
+                    })()}
                     {suggestion && !isApplied && (
                       <button onClick={() => applySuggestion(seg._id)}
                         className="flex items-center gap-1.5 mt-1 ml-1 px-2 py-1 rounded-lg
@@ -988,6 +1156,104 @@ export default function LyricsEditor({ segments, filename, audioFile, referenceL
           {isBatch ? t("editor.approve_next") : t("editor.approve_generate")}
         </button>
       </div>
+
+      {/* ── 3+ line wrap warning banner ────────────────────────────── */}
+      {wrapWarning && (
+        <div className="mt-3 rounded-card bg-red-500/[0.06] ring-1 ring-red-500/20 px-5 py-4 animate-fade-in">
+          <p className="text-sm font-semibold text-red-300 mb-1">
+            {wrapWarning.ids.length === 1
+              ? "1 línea ocupará 3+ renglones en el video"
+              : `${wrapWarning.ids.length} líneas ocuparán 3+ renglones en el video`}
+          </p>
+          <p className="text-xs text-red-400/70 mb-3">
+            Las líneas marcadas en rojo quedarán muy largas. Podés dividirlas ahora o continuar igual.
+          </p>
+          <div className="flex gap-3">
+            <button
+              onClick={() => {
+                // Auto-split all problematic segments
+                wrapWarning.ids.forEach((id) => splitSeg(id));
+                setWrapWarning(null);
+              }}
+              className="inline-flex items-center gap-1.5 h-9 px-4 rounded-button text-xs font-semibold
+                text-white bg-brand hover:bg-brand/90 transition-colors"
+            >
+              ✂ Auto-dividir todo
+            </button>
+            <button
+              onClick={() => {
+                setWrapWarning(null);
+                const cleaned = _buildCleanedSegments();
+                onApprove(cleaned.map(({ _id, ...rest }) => rest));
+              }}
+              className="btn-secondary h-9 px-4 text-xs"
+            >
+              Continuar igual
+            </button>
+          </div>
+        </div>
+      )}
+
+      {/* ── Live preview panel ──────────────────────────────────────── */}
+      {focusedSegId !== null && (() => {
+        const seg = edited.find((s) => s._id === focusedSegId);
+        if (!seg || !(seg.text || "").trim()) return null;
+        const displayText = applyCase(seg.text, textCase);
+        const tier = getTier(displayText);
+        const fontCss = FONT_CSS_MAP[font] || FONT_CSS_MAP[""];
+        const basePx = tier.sizePx;
+        const scaledPx = Math.round(basePx * Math.max(0.6, Math.min(1.5, fontScale)));
+        // Scale down to preview container (preview is ~480px wide → video is 1920px)
+        const previewRatio = 480 / 1920;
+        const previewFontPx = Math.max(10, Math.round(scaledPx * previewRatio));
+        const lines = estimateWrappedLines(displayText, fontCss, scaledPx, tier.maxWidthPx);
+        return (
+          <div className="mt-4 rounded-card bg-surface-2/40 ring-1 ring-white/[0.04] overflow-hidden animate-fade-in">
+            <div className="flex items-center justify-between px-4 py-2 border-b border-white/[0.04]">
+              <span className="text-[11px] text-gray-500 uppercase tracking-wider">Preview — cómo quedarán las lyrics</span>
+              <button onClick={() => setFocusedSegId(null)} className="text-gray-600 hover:text-white text-xs transition-colors">✕</button>
+            </div>
+            {/* 16:9 preview card */}
+            <div
+              className="relative w-full flex items-center justify-center bg-gradient-to-b from-gray-900 to-black"
+              style={{ aspectRatio: "16/9", maxHeight: "180px" }}
+            >
+              <p
+                style={{
+                  fontFamily: fontCss,
+                  fontSize: `${previewFontPx}px`,
+                  fontWeight: 700,
+                  color: "white",
+                  textShadow: "1px 1px 3px rgba(0,0,0,0.8), -1px -1px 2px rgba(0,0,0,0.6)",
+                  textTransform: "none",
+                  textAlign: "center",
+                  maxWidth: `${Math.round(tier.maxWidthPx * previewRatio)}px`,
+                  lineHeight: 1.25,
+                  wordBreak: "break-word",
+                  padding: "0 12px",
+                }}
+              >
+                {displayText}
+              </p>
+              {/* line count badge overlay */}
+              <span className={`absolute bottom-2 right-3 text-[10px] font-medium px-2 py-0.5 rounded-full ${
+                lines === 1 ? "bg-accent/20 text-accent" :
+                lines === 2 ? "bg-amber-500/20 text-amber-300" :
+                "bg-red-500/20 text-red-300"
+              }`}>
+                {lines} {lines === 1 ? "línea" : "líneas"} en el video
+              </span>
+            </div>
+            <div className="px-4 py-2 flex gap-4 text-[10px] text-gray-600">
+              <span>Fuente: {font || "Auto"}</span>
+              <span>Tamaño: {fontScale}×</span>
+              <span>Caja: {textCase === "upper" ? "MAYÚSCULAS" : textCase === "title" ? "Título" : textCase === "lower" ? "minúsculas" : "Original"}</span>
+              <span>Transición: {lyricTransition === "cut" ? "Corte" : lyricTransition === "fade" ? "Fade" : "Fade lento"}</span>
+              <span>Movimiento: {textMotion === "none" ? "Estático" : textMotion === "subtle" ? "Sutil" : "Flotante"}</span>
+            </div>
+          </div>
+        );
+      })()}
 
       <EditorTour user={user} />
     </div>
