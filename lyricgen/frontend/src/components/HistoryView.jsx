@@ -203,10 +203,27 @@ const FILTERS = [
   { id: "failed",  label: "Fallidos",  match: (j) => j.status === "error" || j.status === "validation_failed" },
 ];
 
-export default function HistoryView({ history, onSelect, onDelete, onBulkDelete, onBack }) {
+export default function HistoryView({
+  history,
+  historyError = false,
+  historyLoaded = true,
+  onRetryHistory,
+  onSelect,
+  onDelete,
+  onBulkDelete,
+  onBack,
+}) {
   const { t } = useI18n();
   const [filter, setFilter] = useState("all");
   const [selectedIds, setSelectedIds] = useState(() => new Set());
+
+  // Three terminal states share the "no rows" branch: still loading the
+  // first fetch, fetch failed, or the tenant genuinely has zero jobs. We
+  // must distinguish them — rendering "Aún no hay videos" while /jobs is
+  // mid-retry or 5xx'ing is the bug that made operators think their
+  // catalog was deleted.
+  const isInitialLoading = !historyLoaded && !historyError;
+  const isLoadFailed = historyError && history.length === 0;
 
   const counts = useMemo(() => {
     const c = {};
@@ -283,7 +300,11 @@ export default function HistoryView({ history, onSelect, onDelete, onBulkDelete,
           <div>
             <h1 className="text-[28px] leading-tight font-bold tracking-tight">{t("history.title")}</h1>
             <p className="text-sm text-ink-secondary mt-1">
-              {history.length === 0
+              {isInitialLoading
+                ? (t("history.loading") || "Cargando…")
+                : isLoadFailed
+                ? (t("history.load_failed_subtitle") || "No pudimos cargar tu historial")
+                : history.length === 0
                 ? "Aún no hay videos"
                 : `${history.length} ${history.length === 1 ? "video en total" : "videos en total"}`}
             </p>
@@ -353,8 +374,37 @@ export default function HistoryView({ history, onSelect, onDelete, onBulkDelete,
         </div>
       )}
 
-      {/* ─── Grid ─────────────────────────────────────────────── */}
-      {visible.length === 0 ? (
+      {/* ─── Grid ───────────────────────────────────────────────
+          Order matters: loading > error > empty-but-loaded > populated.
+          The error branch must beat the empty branch so a slow /jobs
+          never silently masquerades as "you have no videos". */}
+      {isInitialLoading ? (
+        <div className="rounded-card p-14 text-center bg-surface-2/30 ring-1 ring-white/[0.04]">
+          <div className="w-10 h-10 mx-auto mb-4 border-2 border-brand border-t-transparent rounded-full animate-spin" />
+          <p className="text-sm text-ink-secondary">
+            {t("history.loading") || "Cargando historial…"}
+          </p>
+        </div>
+      ) : isLoadFailed ? (
+        <div className="rounded-card p-10 text-center bg-amber-500/[0.06] ring-1 ring-amber-500/25">
+          <div className="w-12 h-12 mx-auto mb-4 rounded-2xl bg-amber-500/15 ring-1 ring-amber-500/30 flex items-center justify-center">
+            <svg className="w-6 h-6 text-amber-300" fill="none" stroke="currentColor" strokeWidth="1.6" viewBox="0 0 24 24">
+              <path d="M12 9v3.5m0 3.5h.01M10.29 3.86L1.82 18a2 2 0 001.71 3h16.94a2 2 0 001.71-3L13.71 3.86a2 2 0 00-3.42 0z" strokeLinecap="round" strokeLinejoin="round"/>
+            </svg>
+          </div>
+          <h3 className="text-base font-semibold text-white mb-1.5 tracking-tight">
+            {t("dash.history_error_title") || "No pudimos cargar tu historial"}
+          </h3>
+          <p className="text-sm text-ink-secondary mb-5">
+            {t("dash.history_error_body") || "Puede ser una caída momentánea de la conexión. Probá de nuevo."}
+          </p>
+          {onRetryHistory && (
+            <button onClick={onRetryHistory} className="btn-primary px-6">
+              {t("dash.retry") || "Reintentar"}
+            </button>
+          )}
+        </div>
+      ) : visible.length === 0 ? (
         <div className="rounded-card p-14 text-center bg-surface-2/30 ring-1 ring-white/[0.04]">
           <p className="text-sm text-ink-secondary">
             {history.length === 0 ? t("history.empty") : "No hay videos en esta vista"}
