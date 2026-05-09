@@ -230,7 +230,29 @@ export default function JobDetail({ job, onBack, onJobUpdate }) {
     try {
       while (Date.now() < deadline) {
         const url = await getDownloadUrl(job.job_id, fileType);
-        const res = await fetch(url);
+        // `redirect: 'manual'` is critical here: when the prewarm has
+        // already finished, /download responds with 302 → R2 signed
+        // URL. Default `redirect: 'follow'` makes the browser fetch
+        // the R2 URL via XHR/fetch, which fails with a generic "Load
+        // failed" if R2's bucket isn't CORS-configured for our origin
+        // — even though the file is sitting right there. With
+        // 'manual' we get an opaqueredirect response; we then trigger
+        // a real browser navigation to /download (same-origin), which
+        // follows the 302 to R2 natively. Cross-origin navigation
+        // doesn't need CORS — only cross-origin fetch does.
+        const res = await fetch(url, { redirect: "manual" });
+        if (res.type === "opaqueredirect") {
+          const a = document.createElement("a");
+          a.href = url;
+          a.download = suggestedName;
+          a.target = "_blank";
+          a.rel = "noopener";
+          a.style.display = "none";
+          document.body.appendChild(a);
+          a.click();
+          document.body.removeChild(a);
+          return;
+        }
         if (res.status === 200) {
           // Bytes arrived — turn into a blob download and exit.
           const blob = await res.blob();
@@ -240,12 +262,6 @@ export default function JobDetail({ job, onBack, onJobUpdate }) {
           a.download = suggestedName;
           a.click();
           setTimeout(() => URL.revokeObjectURL(blobUrl), 60_000);
-          return;
-        }
-        if (res.status === 302) {
-          // Browser will follow this server-side; we trigger it as a
-          // direct navigation to keep the download UX consistent.
-          window.location.href = url;
           return;
         }
         if (res.status === 202) {
