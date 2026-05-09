@@ -14,10 +14,11 @@ async function triggerDownload(jobId, type) {
   } catch {}
 }
 
-function JobRow({ job, index, t }) {
+function JobRow({ job, index, t, onSelectJob }) {
   const { filename, status, current_step, progress, job_id, error,
           queue_reason, queue_retry_in_s } = job;
-  const name = filename.replace(/\.mp3$/i, "");
+  const name = filename.replace(/\.(mp3|wav)$/i, "");
+  const isClickable = (status === "pending_review" || status === "done") && job_id && onSelectJob;
 
   const STEP_LABELS = {
     // current_step="uploading" is set by processQueueDirect while the
@@ -53,9 +54,12 @@ function JobRow({ job, index, t }) {
   })();
 
   return (
-    <div className={`glass rounded-card p-4 transition-all duration-300 ${
-      status === "processing" ? "border border-brand/20" : ""
-    }`}>
+    <div
+      onClick={isClickable ? () => onSelectJob(job_id) : undefined}
+      className={`glass rounded-card p-4 transition-all duration-300 ${
+        status === "processing" ? "border border-brand/20" : ""
+      } ${isClickable ? "cursor-pointer hover:bg-white/[0.02] hover:ring-1 hover:ring-brand/20" : ""}`}
+    >
       <div className="flex items-center gap-3 mb-3">
         {/* Status icon */}
         <div className={`w-9 h-9 rounded-xl flex items-center justify-center shrink-0 ${
@@ -90,7 +94,14 @@ function JobRow({ job, index, t }) {
 
         {/* File info */}
         <div className="min-w-0 flex-1">
-          <p className="text-sm font-medium text-white truncate">{name}</p>
+          <div className="flex items-center gap-1.5 min-w-0">
+            <p className="text-sm font-medium text-white truncate">{name}</p>
+            {isClickable && (
+              <svg className="w-3.5 h-3.5 text-brand/60 shrink-0" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
+                <path d="M9 18l6-6-6-6" />
+              </svg>
+            )}
+          </div>
           <p className={`text-[11px] ${queueLabel ? "text-amber-300/80" : "text-gray-500"}`}>
             {status === "done" ? t("dash.completed") :
              status === "pending_review" ? (t("batch.pending_review") || "Pendiente de aprobacion") :
@@ -151,7 +162,7 @@ function JobRow({ job, index, t }) {
   );
 }
 
-export default function BatchProgress({ jobs, onReset, onRetry, onSingleDone }) {
+export default function BatchProgress({ jobs, onReset, onSingleDone, onSelectJob }) {
   const { t } = useI18n();
   // `done` includes pending_review for the BATCH PROGRESS view ("processing
   // is finished, awaiting your review"). But `downloadable` only counts jobs
@@ -241,7 +252,7 @@ export default function BatchProgress({ jobs, onReset, onRetry, onSingleDone }) 
       {/* Job list */}
       <div className="space-y-2 mb-8">
         {jobs.map((job, i) => (
-          <JobRow key={i} job={job} index={i} t={t} />
+          <JobRow key={i} job={job} index={i} t={t} onSelectJob={onSelectJob} />
         ))}
       </div>
 
@@ -251,7 +262,7 @@ export default function BatchProgress({ jobs, onReset, onRetry, onSingleDone }) 
         <div className="mb-4 px-4 py-3 rounded-2xl bg-amber-500/5 border border-amber-500/20">
           <p className="text-xs text-amber-300/90">
             {t("batch.pending_review_notice") ||
-              "Algunos videos esperan tu aprobación antes de poder descargarlos. Hacé click en cada uno para revisarlo."}
+              "Algunos videos esperan tu aprobación antes de poder descargarlos. Hacé click en cada card para revisarlo y aprobarlo."}
           </p>
         </div>
       )}
