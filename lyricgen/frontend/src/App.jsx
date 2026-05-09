@@ -502,6 +502,10 @@ export default function App() {
       songTitle: r.songTitle || "",
       genre: r.genre || "", font: r.font || "", concept: r.concept || "",
       movementStyle: r.movementStyle || "",
+      textCase: r.textCase || "upper",
+      fontScale: r.fontScale || "1.0",
+      lyricTransition: r.lyricTransition || "cut",
+      textMotion: r.textMotion || "none",
       segments: editedSegments,
       transcribeJobId: r.transcribeJobId || null,
     }];
@@ -524,6 +528,10 @@ export default function App() {
       songTitle: (a.songTitle || "").trim(),
       language: a.language, genre: a.genre || "", font: a.font || "",
       concept: a.concept || "", movementStyle: a.movementStyle || "",
+      textCase: a.textCase || "upper",
+      fontScale: a.fontScale || "1.0",
+      lyricTransition: a.lyricTransition || "cut",
+      textMotion: a.textMotion || "none",
       segments: a.segments,
       transcribeJobId: a.transcribeJobId || null,
       status: "queued", current_step: null, progress: 0, job_id: null, error: null,
@@ -755,6 +763,10 @@ export default function App() {
         font: last.font || "",
         concept: last.concept || "",
         movementStyle: last.movementStyle || "",
+        textCase: last.textCase || "upper",
+        fontScale: last.fontScale || "1.0",
+        lyricTransition: last.lyricTransition || "cut",
+        textMotion: last.textMotion || "none",
         segments: last.segments,
         referenceLyrics: "",
         coverageWarning: false,
@@ -859,6 +871,7 @@ export default function App() {
         onStartReview={handleStartReview}
         onGenerateDirect={handleGenerateDirect}
         user={user}
+        sidebarOpen={sidebarOpen}
       />
     </div>
   );
@@ -1003,6 +1016,7 @@ export default function App() {
           jobs={jobs}
           onReset={handleReset}
           onSingleDone={handleSelectJob}
+          onSelectJob={handleSelectJob}
         />
       </div>
     )

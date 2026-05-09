@@ -77,6 +77,7 @@ export default function UploadZone({
   onStartReview,
   onGenerateDirect,
   user,
+  sidebarOpen = true,
 }) {
   const { t } = useI18n();
   const inputRef = useRef();
@@ -1151,7 +1152,10 @@ export default function UploadZone({
           scrolls a long batch + gallery, with a live summary so they
           can verify their picks before submitting. */}
       {files.length > 0 && (
-        <div className="fixed bottom-0 left-64 right-0 z-30 bg-surface-1/85 backdrop-blur-xl border-t border-white/[0.06] px-8 py-4" data-tour="upload-cta-bar">
+        <div
+          className={`fixed bottom-0 right-0 z-30 bg-surface-1/85 backdrop-blur-xl border-t border-white/[0.06] px-8 py-4 transition-all duration-300 ${sidebarOpen ? "left-64" : "left-0"}`}
+          data-tour="upload-cta-bar"
+        >
           <div className="max-w-4xl mx-auto flex items-center gap-4">
             <div className="flex-1 min-w-0">
               <p className="text-[10px] uppercase tracking-[0.18em] text-gray-500">
