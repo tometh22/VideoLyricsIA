@@ -380,6 +380,15 @@ class BackgroundAsset(Base):
     file_type = Column(String(10), nullable=False)  # mp4, jpg, png
     tags = Column(String(500), nullable=True)        # comma-separated: "landscape,ocean,calm"
     uploaded_by = Column(Integer, ForeignKey("users.id"), nullable=True)
+    # NULL = global (visible to every tenant). A tenant_id string = exclusive
+    # to that tenant. Set per-asset by the admin uploader and used as the
+    # contractual gate for clients like Universal Music that require their
+    # library to be unavailable to anyone else.
+    owner_tenant_id = Column(String(100), nullable=True, index=True)
+    # If this asset was generated as a variation derived from another library
+    # asset (image-to-video off a frame of the parent), this is the parent's
+    # id. Useful for audit and for surfacing "derived from X" in the UI.
+    parent_asset_id = Column(Integer, ForeignKey("background_assets.id"), nullable=True)
     is_active = Column(Boolean, default=True)
     created_at = Column(DateTime(timezone=True), default=utcnow)
 
@@ -391,8 +400,42 @@ class BackgroundAsset(Base):
             "file_type": self.file_type,
             "tags": self.tags.split(",") if self.tags else [],
             "uploaded_by": self.uploaded_by,
+            "owner_tenant_id": self.owner_tenant_id,
+            "parent_asset_id": self.parent_asset_id,
             "is_active": self.is_active,
             "created_at": self.created_at.isoformat() if self.created_at else None,
+        }
+
+
+class AssetUsage(Base):
+    """Tracks every time a tenant uses a library asset in a generation job.
+
+    Backs the "you already used this background on [date]" warning in the
+    library picker (per-tenant, not per-user) and the usage audit that UMG
+    asked for to enforce video uniqueness in their workflow.
+    """
+    __tablename__ = "asset_usage"
+    __table_args__ = (
+        Index("ix_asset_usage_asset_tenant", "asset_id", "tenant_id"),
+    )
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    asset_id = Column(Integer, ForeignKey("background_assets.id"), nullable=False, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+    tenant_id = Column(String(100), nullable=False, index=True)
+    job_id = Column(String(12), nullable=True, index=True)
+    mode = Column(String(20), nullable=False, default="as_is")  # "as_is" | "variation"
+    used_at = Column(DateTime(timezone=True), default=utcnow, index=True)
+
+    def to_dict(self):
+        return {
+            "id": self.id,
+            "asset_id": self.asset_id,
+            "user_id": self.user_id,
+            "tenant_id": self.tenant_id,
+            "job_id": self.job_id,
+            "mode": self.mode,
+            "used_at": self.used_at.isoformat() if self.used_at else None,
         }
 
 

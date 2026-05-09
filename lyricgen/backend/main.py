@@ -64,7 +64,7 @@ from auth import (
 import storage
 from datetime import datetime, timedelta, timezone
 
-from database import Job, User, UserSettings, AuditLog, get_db, init_db
+from database import Job, User, UserSettings, AuditLog, get_db, init_db, BackgroundAsset, AssetUsage
 from jobs import bulk_delete_jobs, create_job, delete_job, get_job, get_all_jobs, update_job
 from observability import init_sentry, init_logging, health_snapshot
 from pipeline import run_pipeline, transcribe
@@ -252,15 +252,161 @@ def on_startup():
 _BACKGROUNDS_LIB = os.path.join(os.path.dirname(__file__), "..", "assets", "backgrounds", "library")
 
 
+def _user_can_use_asset(asset: "BackgroundAsset", current_user: dict) -> bool:
+    """Tenant gate for library assets. Admins see everything; everyone else
+    can only see assets that are global (owner_tenant_id IS NULL) or owned
+    by their own tenant. Backs the UMG exclusivity contract."""
+    if current_user.get("role") == "admin":
+        return True
+    if asset.owner_tenant_id is None:
+        return True
+    return asset.owner_tenant_id == current_user.get("tenant_id")
+
+
+def _apply_asset_tenant_filter(query, current_user: dict):
+    """Add a tenant scope to a BackgroundAsset query. Admins get the
+    unfiltered query back; everyone else gets `owner IS NULL OR owner = mine`.
+    """
+    if current_user.get("role") == "admin":
+        return query
+    from sqlalchemy import or_
+    return query.filter(
+        or_(
+            BackgroundAsset.owner_tenant_id.is_(None),
+            BackgroundAsset.owner_tenant_id == current_user.get("tenant_id"),
+        )
+    )
+
+
 @app.get("/backgrounds")
 async def list_backgrounds(
     current_user: dict = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
-    """List active pre-approved background assets."""
-    from database import BackgroundAsset
-    assets = db.query(BackgroundAsset).filter(BackgroundAsset.is_active == True).order_by(BackgroundAsset.created_at.desc()).all()
+    """List active pre-approved background assets visible to the caller.
+
+    Tenant scope: a non-admin user only sees assets either marked global
+    (owner_tenant_id IS NULL) or owned by their own tenant_id. Admins see
+    everything for moderation/audit.
+    """
+    q = db.query(BackgroundAsset).filter(BackgroundAsset.is_active == True)
+    q = _apply_asset_tenant_filter(q, current_user)
+    assets = q.order_by(BackgroundAsset.created_at.desc()).all()
     return [a.to_dict() for a in assets]
+
+
+@app.get("/backgrounds/{asset_id}/usage")
+async def background_usage(
+    asset_id: int,
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Per-tenant usage summary for a library asset.
+
+    Powers the "you already used this on [date]" warning in the picker.
+    Returns whether the caller's tenant has used this asset before, the
+    last-used timestamp, total use count, and per-mode breakdown so the
+    UI can distinguish "used as-is" from "used as variation source".
+    """
+    asset = db.query(BackgroundAsset).filter(BackgroundAsset.id == asset_id).first()
+    if not asset or not _user_can_use_asset(asset, current_user):
+        raise HTTPException(status_code=404, detail="Asset not found")
+
+    tenant_id = current_user["tenant_id"]
+    rows = (
+        db.query(AssetUsage)
+        .filter(AssetUsage.asset_id == asset_id, AssetUsage.tenant_id == tenant_id)
+        .order_by(AssetUsage.used_at.desc())
+        .all()
+    )
+    use_count = len(rows)
+    last_used_at = rows[0].used_at.isoformat() if rows and rows[0].used_at else None
+    as_is_count = sum(1 for r in rows if r.mode == "as_is")
+    variation_count = sum(1 for r in rows if r.mode == "variation")
+    return {
+        "asset_id": asset_id,
+        "tenant_id": tenant_id,
+        "used": use_count > 0,
+        "use_count": use_count,
+        "as_is_count": as_is_count,
+        "variation_count": variation_count,
+        "last_used_at": last_used_at,
+    }
+
+
+def _resolve_library_background(
+    background_id: int,
+    background_mode: str,
+    current_user: dict,
+    db: Session,
+    job_dir: str,
+    job_id: str,
+):
+    """Common library-asset resolver shared by /upload and /generate.
+
+    Enforces tenant access, registers an AssetUsage row for the warning &
+    audit, and returns the tuple consumed by enqueue_pipeline:
+        (bg_path, bg_r2_key, variation_source_path, variation_source_r2_key)
+
+    For mode="as_is": bg_path/bg_r2_key point at the library file directly
+    so the worker uses it unchanged.
+    For mode="variation": variation_source_* point at the library file and
+    bg_path is None — the pipeline will extract a frame and run Veo
+    image-to-video to derive a brand-new clip from it.
+    """
+    asset = (
+        db.query(BackgroundAsset)
+        .filter(BackgroundAsset.id == background_id, BackgroundAsset.is_active == True)
+        .first()
+    )
+    if not asset:
+        raise HTTPException(status_code=404, detail="Background not found.")
+    if not _user_can_use_asset(asset, current_user):
+        # Don't reveal whether the asset exists — same response as not found.
+        raise HTTPException(status_code=404, detail="Background not found.")
+
+    bg_path = None
+    bg_r2_key = None
+    var_path = None
+    var_r2_key = None
+    bg_ext = os.path.splitext(asset.filename)[1].lower() or f".{asset.file_type}"
+
+    if asset.filename.startswith("library/"):
+        local_path = os.path.join(job_dir, f"bg_library{bg_ext}")
+        if background_mode == "variation":
+            var_path = local_path
+            var_r2_key = asset.filename
+        else:
+            bg_path = local_path
+            bg_r2_key = asset.filename
+    else:
+        local_path = os.path.join(_BACKGROUNDS_LIB, asset.filename)
+        if background_mode == "variation":
+            var_path = local_path
+        else:
+            bg_path = local_path
+
+    # Audit + per-tenant usage warning. We log on enqueue rather than
+    # waiting for render completion so the warning fires the next time
+    # UMG opens the picker, even if the job ends up failing — they still
+    # "used" it (the contract is about exclusive availability, not a
+    # successful render).
+    try:
+        db.add(
+            AssetUsage(
+                asset_id=asset.id,
+                user_id=current_user["id"],
+                tenant_id=current_user["tenant_id"],
+                job_id=job_id,
+                mode=background_mode,
+            )
+        )
+        db.commit()
+    except Exception:
+        db.rollback()
+        logger.exception("Failed to record asset usage for asset=%s job=%s", asset.id, job_id)
+
+    return bg_path, bg_r2_key, var_path, var_r2_key, asset.id
 
 
 @app.get("/fonts")
@@ -292,11 +438,10 @@ async def preview_background(
     Cloudflare — no streaming through uvicorn for what may be a 5 MB clip.
     Falls back to FileResponse from disk for legacy / local-only assets.
     """
-    get_current_user_from_token_param(token, db)
-    from database import BackgroundAsset
+    user = get_current_user_from_token_param(token, db)
     import storage
     asset = db.query(BackgroundAsset).filter(BackgroundAsset.id == asset_id).first()
-    if not asset:
+    if not asset or not _user_can_use_asset(asset, user):
         raise HTTPException(status_code=404, detail="Asset not found")
 
     if asset.filename.startswith("library/") and storage.is_enabled():
@@ -1518,6 +1663,7 @@ async def upload(
     umg_fps: str = Form(""),
     umg_prores_profile: str = Form(""),
     background_id: int = Form(None),
+    background_mode: str = Form("as_is"),
     background_file: UploadFile = File(None),
     genre: str = Form(""),
     font: str = Form(""),
@@ -1537,6 +1683,7 @@ async def upload(
     still works for direct-API callers but the API container now bears
     the upload memory + bandwidth cost. Removal: 2026-08-01.
     """
+    background_mode = background_mode if background_mode in ("as_is", "variation") else "as_is"
     _set_deprecation_headers(response, "/upload")
     if not file.filename:
         raise HTTPException(status_code=400, detail="Missing filename.")
@@ -1614,18 +1761,15 @@ async def upload(
     # Resolve background: library asset > custom upload > AI generation
     bg_path = None
     bg_r2_key = None
+    variation_source_path = None
+    variation_source_r2_key = None
+    variation_parent_id = None
     if background_id:
-        from database import BackgroundAsset
-        asset = db.query(BackgroundAsset).filter(BackgroundAsset.id == background_id, BackgroundAsset.is_active == True).first()
-        if asset:
-            if asset.filename.startswith("library/"):
-                # R2-stored asset: pipeline will download via bg_r2_key.
-                bg_ext = os.path.splitext(asset.filename)[1].lower() or f".{asset.file_type}"
-                bg_path = os.path.join(job_dir, f"bg_library{bg_ext}")
-                bg_r2_key = asset.filename
-            else:
-                # Legacy / dev: file is on local disk.
-                bg_path = os.path.join(_BACKGROUNDS_LIB, asset.filename)
+        bg_path, bg_r2_key, variation_source_path, variation_source_r2_key, variation_parent_id = (
+            _resolve_library_background(
+                background_id, background_mode, current_user, db, job_dir, job_id,
+            )
+        )
     elif background_file and background_file.filename:
         bg_ext = os.path.splitext(background_file.filename)[1].lower()
         if bg_ext in (".mp4", ".mov", ".jpg", ".jpeg", ".png"):
@@ -1662,6 +1806,9 @@ async def upload(
         background_path=bg_path,
         input_r2_key=input_r2_key,
         bg_r2_key=bg_r2_key,
+        variation_source_path=variation_source_path,
+        variation_source_r2_key=variation_source_r2_key,
+        variation_parent_asset_id=variation_parent_id,
         genre=genre,
         font=font,
         concept=concept,
@@ -2262,6 +2409,7 @@ async def generate_with_segments(
     umg_fps: str = Form(""),
     umg_prores_profile: str = Form(""),
     background_id: int = Form(None),
+    background_mode: str = Form("as_is"),
     background_file: UploadFile = File(None),
     genre: str = Form(""),
     font: str = Form(""),
@@ -2425,17 +2573,16 @@ async def generate_with_segments(
     # Resolve background: library asset > custom upload > AI generation
     bg_path = None
     bg_r2_key = None
+    variation_source_path = None
+    variation_source_r2_key = None
+    variation_parent_id = None
+    background_mode = background_mode if background_mode in ("as_is", "variation") else "as_is"
     if background_id:
-        from database import BackgroundAsset
-        asset = db.query(BackgroundAsset).filter(BackgroundAsset.id == background_id, BackgroundAsset.is_active == True).first()
-        if asset:
-            if asset.filename.startswith("library/"):
-                # R2-stored asset: pipeline downloads via bg_r2_key.
-                bg_ext = os.path.splitext(asset.filename)[1].lower() or f".{asset.file_type}"
-                bg_path = os.path.join(job_dir, f"bg_library{bg_ext}")
-                bg_r2_key = asset.filename
-            else:
-                bg_path = os.path.join(_BACKGROUNDS_LIB, asset.filename)
+        bg_path, bg_r2_key, variation_source_path, variation_source_r2_key, variation_parent_id = (
+            _resolve_library_background(
+                background_id, background_mode, current_user, db, job_dir, job_id,
+            )
+        )
     elif background_file and background_file.filename:
         bg_ext = os.path.splitext(background_file.filename)[1].lower()
         if bg_ext in (".mp4", ".mov", ".jpg", ".jpeg", ".png"):
@@ -2466,6 +2613,9 @@ async def generate_with_segments(
         background_path=bg_path,
         input_r2_key=input_r2_key,
         bg_r2_key=bg_r2_key,
+        variation_source_path=variation_source_path,
+        variation_source_r2_key=variation_source_r2_key,
+        variation_parent_asset_id=variation_parent_id,
         genre=genre,
         font=font,
         concept=concept,

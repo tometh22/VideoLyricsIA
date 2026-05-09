@@ -40,6 +40,15 @@ export default function AdminPanel({ onBack }) {
   const [bgUploading, setBgUploading] = useState(false);
   const [bgName, setBgName] = useState("");
   const [bgTags, setBgTags] = useState("");
+  // Empty string here means "global / visible to all". Anything else is
+  // a tenant_id the asset gets locked to. UMG exclusivity hangs off this.
+  const [bgOwnerTenant, setBgOwnerTenant] = useState("");
+  // Tenants that have at least one user; populated from
+  // /admin/background-tenants so we don't hardcode the UMG name.
+  const [bgTenants, setBgTenants] = useState([]);
+  // Library list filter: "" = all, "__global__" = unowned, anything else =
+  // exact tenant match. Server-side via the same endpoint.
+  const [bgListFilter, setBgListFilter] = useState("");
 
   // Create user modal
   const [showCreate, setShowCreate] = useState(false);
@@ -57,7 +66,7 @@ export default function AdminPanel({ onBack }) {
     if (tab === "compliance") loadCompliance();
     if (tab === "backgrounds") loadBackgrounds();
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [tab, jobsTenantFilter]);
+  }, [tab, jobsTenantFilter, bgListFilter]);
 
   // Auto-refresh the Jobs tab every 5s so admin sees real-time progress
   // of running renders (current_step, progress %). Pauses when the tab
@@ -133,8 +142,14 @@ export default function AdminPanel({ onBack }) {
 
   const loadBackgrounds = async () => {
     try {
-      const res = await fetch(`${API}/admin/backgrounds`, { headers: authHeaders() });
+      const q = bgListFilter ? `?owner_tenant_id=${encodeURIComponent(bgListFilter)}` : "";
+      const res = await fetch(`${API}/admin/backgrounds${q}`, { headers: authHeaders() });
       setBackgrounds(await res.json());
+    } catch {}
+    try {
+      const res = await fetch(`${API}/admin/background-tenants`, { headers: authHeaders() });
+      const data = await res.json();
+      setBgTenants(Array.isArray(data?.tenants) ? data.tenants : []);
     } catch {}
   };
 
@@ -145,6 +160,7 @@ export default function AdminPanel({ onBack }) {
     formData.append("file", file);
     formData.append("name", bgName.trim());
     formData.append("tags", bgTags.trim());
+    if (bgOwnerTenant) formData.append("owner_tenant_id", bgOwnerTenant);
     try {
       await fetch(`${API}/admin/backgrounds`, { method: "POST", headers: authHeaders(), body: formData });
       setBgName("");
@@ -728,8 +744,8 @@ export default function AdminPanel({ onBack }) {
           {/* Upload form */}
           <div className="glass-elevated rounded-card p-6">
             <h3 className="text-sm font-semibold mb-4">Upload Background</h3>
-            <div className="flex gap-3 items-end">
-              <div className="flex-1">
+            <div className="flex gap-3 items-end flex-wrap">
+              <div className="flex-1 min-w-[180px]">
                 <label className="text-[10px] text-gray-500 uppercase tracking-wider">Name</label>
                 <input
                   type="text" value={bgName} onChange={(e) => setBgName(e.target.value)}
@@ -737,13 +753,26 @@ export default function AdminPanel({ onBack }) {
                   className="w-full mt-1 px-3 py-2 rounded-lg bg-surface-1 border border-white/[0.06] focus:border-brand/50 focus:outline-none text-sm text-white placeholder-gray-500"
                 />
               </div>
-              <div className="flex-1">
+              <div className="flex-1 min-w-[180px]">
                 <label className="text-[10px] text-gray-500 uppercase tracking-wider">Tags (comma-separated)</label>
                 <input
                   type="text" value={bgTags} onChange={(e) => setBgTags(e.target.value)}
                   placeholder="e.g. ocean,sunset,calm"
                   className="w-full mt-1 px-3 py-2 rounded-lg bg-surface-1 border border-white/[0.06] focus:border-brand/50 focus:outline-none text-sm text-white placeholder-gray-500"
                 />
+              </div>
+              <div className="min-w-[180px]">
+                <label className="text-[10px] text-gray-500 uppercase tracking-wider">Assign to tenant</label>
+                <select
+                  value={bgOwnerTenant}
+                  onChange={(e) => setBgOwnerTenant(e.target.value)}
+                  className="w-full mt-1 px-3 py-2 rounded-lg bg-surface-1 border border-white/[0.06] focus:border-brand/50 focus:outline-none text-sm text-white"
+                >
+                  <option value="">Global (visible to all)</option>
+                  {bgTenants.map((tid) => (
+                    <option key={tid} value={tid}>{tid}</option>
+                  ))}
+                </select>
               </div>
               <div>
                 <label className={`btn-primary text-sm py-2 px-4 cursor-pointer ${bgUploading || !bgName.trim() ? "opacity-50 pointer-events-none" : ""}`}>
@@ -756,14 +785,29 @@ export default function AdminPanel({ onBack }) {
                 </label>
               </div>
             </div>
-            <p className="text-[10px] text-gray-600 mt-2">MP4, MOV, JPG, or PNG. These will be available for all users to select when generating videos.</p>
+            <p className="text-[10px] text-gray-600 mt-2">
+              MP4, MOV, JPG, or PNG. <strong>Global</strong> assets are visible to every tenant; assigning to a tenant locks the asset to that tenant only (e.g. Universal Music exclusivity).
+            </p>
           </div>
 
           {/* Library grid */}
           <div className="glass-elevated rounded-card p-6">
-            <div className="flex items-center justify-between mb-4">
+            <div className="flex items-center justify-between mb-4 gap-3 flex-wrap">
               <h3 className="text-sm font-semibold">Background Library</h3>
-              <span className="text-xs text-gray-500">{backgrounds.length} asset{backgrounds.length !== 1 ? "s" : ""}</span>
+              <div className="flex items-center gap-3">
+                <select
+                  value={bgListFilter}
+                  onChange={(e) => setBgListFilter(e.target.value)}
+                  className="px-2 py-1.5 rounded-lg bg-surface-1 border border-white/[0.06] focus:border-brand/50 focus:outline-none text-xs text-white"
+                >
+                  <option value="">All tenants</option>
+                  <option value="__global__">Global only</option>
+                  {bgTenants.map((tid) => (
+                    <option key={tid} value={tid}>{tid}</option>
+                  ))}
+                </select>
+                <span className="text-xs text-gray-500">{backgrounds.length} asset{backgrounds.length !== 1 ? "s" : ""}</span>
+              </div>
             </div>
             {backgrounds.length === 0 ? (
               <p className="text-center text-gray-500 text-sm py-8">No backgrounds uploaded yet</p>
@@ -787,7 +831,19 @@ export default function AdminPanel({ onBack }) {
                       )}
                     </div>
                     <div className="px-3 py-2">
-                      <p className="text-xs font-medium text-white truncate">{bg.name}</p>
+                      <div className="flex items-center justify-between gap-2">
+                        <p className="text-xs font-medium text-white truncate">{bg.name}</p>
+                        <span
+                          className={`shrink-0 px-1.5 py-0.5 rounded text-[9px] uppercase tracking-wider ${
+                            bg.owner_tenant_id
+                              ? "bg-brand/15 text-brand-light ring-1 ring-brand/30"
+                              : "bg-surface-1 text-gray-500"
+                          }`}
+                          title={bg.owner_tenant_id ? `Exclusive to tenant: ${bg.owner_tenant_id}` : "Visible to all tenants"}
+                        >
+                          {bg.owner_tenant_id || "global"}
+                        </span>
+                      </div>
                       <div className="flex items-center justify-between mt-1">
                         <div className="flex gap-1 flex-wrap">
                           {bg.tags?.map((tag, i) => (
