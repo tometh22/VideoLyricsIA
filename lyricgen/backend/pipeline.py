@@ -809,16 +809,33 @@ def _compress_for_whisper(input_path: str) -> str:
             ["ffmpeg", "-y", "-i", input_path,
              "-ac", "1", "-b:a", "128k", "-loglevel", "error", out],
             check=True, timeout=120,
+            capture_output=True, text=True,
         )
-        if os.path.exists(out) and os.path.getsize(out) > 0:
-            new_sz = os.path.getsize(out)
-            print(f"[WHISPER-API] compressed {sz/1e6:.1f} MB → "
-                  f"{new_sz/1e6:.1f} MB for API limit")
-            return out
     except (_sp.CalledProcessError, _sp.TimeoutExpired,
             FileNotFoundError, OSError) as e:
-        print(f"[WHISPER-API] compression failed ({e}); sending original")
-    return input_path
+        # Previously this swallowed the error and returned the original
+        # 30-50 MB file. The Whisper API would then 413 / 400 and the
+        # operator saw a generic "Error al procesar" with no diagnostic.
+        # Surface the real cause via the pipeline catch-all (which sets
+        # job.error and tags Sentry) instead.
+        stderr = (getattr(e, "stderr", "") or "") if isinstance(
+            e, _sp.CalledProcessError
+        ) else ""
+        raise RuntimeError(
+            f"audio_compression_failed: ffmpeg no pudo transcodificar "
+            f"{os.path.basename(input_path)} para Whisper API "
+            f"(tamaño {sz/1e6:.1f} MB > {_WHISPER_API_MAX_BYTES/1e6:.0f} MB). "
+            f"Detalle: {(stderr or str(e))[-500:]}"
+        ) from e
+    if not os.path.exists(out) or os.path.getsize(out) == 0:
+        raise RuntimeError(
+            f"audio_compression_failed: ffmpeg returned 0 but produced "
+            f"an empty/missing output at {out!r}"
+        )
+    new_sz = os.path.getsize(out)
+    print(f"[WHISPER-API] compressed {sz/1e6:.1f} MB → "
+          f"{new_sz/1e6:.1f} MB for API limit")
+    return out
 
 
 def _transcribe_via_openai_api(mp3_path: str, language: str | None = None,

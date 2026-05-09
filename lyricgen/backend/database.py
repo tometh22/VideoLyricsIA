@@ -215,6 +215,11 @@ class Job(Base):
     # and OOMed the API container on lossless WAVs).
     input_r2_key = Column(String(500), nullable=True)
 
+    # In-flight multipart upload id while the browser is still PUTting
+    # parts directly to R2. Cleared on multipart_complete (or aborted by
+    # the reaper if the upload is abandoned).
+    multipart_upload_id = Column(String(255), nullable=True)
+
     # YouTube info
     youtube_data = Column(JSON, nullable=True)
 
@@ -456,6 +461,7 @@ def _migrate_user_columns():
         "ALTER TABLE jobs ADD COLUMN IF NOT EXISTS umg_short_url VARCHAR(500)",
         "ALTER TABLE jobs ADD COLUMN IF NOT EXISTS song_title VARCHAR(500)",
         "ALTER TABLE jobs ADD COLUMN IF NOT EXISTS input_r2_key VARCHAR(500)",
+        "ALTER TABLE jobs ADD COLUMN IF NOT EXISTS multipart_upload_id VARCHAR(255)",
     ]
     with engine.begin() as conn:
         for sql in column_adds:

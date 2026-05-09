@@ -20,6 +20,9 @@ function JobRow({ job, index, t }) {
   const name = filename.replace(/\.mp3$/i, "");
 
   const STEP_LABELS = {
+    // current_step="uploading" is set by processQueueDirect while the
+    // browser PUTs to R2. `progress` carries the upload %.
+    uploading: t("batch.step_uploading") || "Subiendo",
     whisper: t("transcribe.title").split(" ")[0] || "Transcribiendo",
     background: t("batch.in_progress"),
     video: t("batch.generating").split(" ")[0] || "Generando",
@@ -93,7 +96,11 @@ function JobRow({ job, index, t }) {
              status === "pending_review" ? (t("batch.pending_review") || "Pendiente de aprobacion") :
              status === "validation_failed" ? (t("batch.validation_failed") || "Validacion fallida") :
              status === "error" ? (error || t("dash.error")) :
-             status === "processing" ? STEP_LABELS[current_step] || current_step :
+             status === "processing" ? (
+               current_step === "uploading"
+                 ? `${STEP_LABELS.uploading} ${progress || 0}%`
+                 : STEP_LABELS[current_step] || current_step
+             ) :
              queueLabel ? queueLabel :
              t("batch.queued")}
           </p>

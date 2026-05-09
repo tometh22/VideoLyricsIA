@@ -214,6 +214,8 @@ const translations = {
     // Transcribing
     "transcribe.title": "Transcribiendo lyrics",
     "transcribe.subtitle": "Analizando audio...",
+    "transcribe.uploading": "Subiendo audio",
+    "transcribe.uploading_progress": "Subiendo a almacenamiento ({pct}%)",
     "transcribe.song": "Canción",
 
     // Batch
@@ -284,6 +286,7 @@ const translations = {
     "batch.download_all": "Descargar todo",
     "batch.new_batch": "Crear más videos",
     "batch.queued": "En cola",
+    "batch.step_uploading": "Subiendo",
     "batch.in_progress": "En progreso",
     "batch.validating": "Validando contenido",
     "batch.pending_review": "Pendiente de aprobacion",
@@ -379,6 +382,9 @@ const translations = {
     "detail.download_all": "Descargar todo",
     "detail.download_master": "Master ProRes",
     "detail.download_short_prores": "Short ProRes",
+    "detail.prores_failed": "No se pudo generar el ProRes ({reason}). Esperá unos minutos y volvé a intentar.",
+    "detail.prores_source_missing": "No se puede regenerar el ProRes: el video fuente (MP4) ya no está disponible en el servidor. Volvé a generar el video desde el audio original.",
+    "detail.prores_timeout": "El ProRes está tardando más de lo esperado. Cerrá este aviso y probá de nuevo en unos minutos — la generación sigue corriendo en el servidor.",
     "detail.publish_youtube": "Publicar en YouTube",
     "detail.view_youtube": "Ver en YouTube",
     "detail.not_available": "Todavía no se puede previsualizar este video.",
@@ -691,6 +697,8 @@ const translations = {
 
     "transcribe.title": "Transcribing lyrics",
     "transcribe.subtitle": "Analyzing audio...",
+    "transcribe.uploading": "Uploading audio",
+    "transcribe.uploading_progress": "Uploading to storage ({pct}%)",
     "transcribe.song": "Song",
 
     "batch.generating": "Generating videos",
@@ -759,6 +767,7 @@ const translations = {
     "batch.download_all": "Download all",
     "batch.new_batch": "Create more videos",
     "batch.queued": "Queued",
+    "batch.step_uploading": "Uploading",
     "batch.in_progress": "In progress",
     "batch.validating": "Validating content",
     "batch.pending_review": "Pending review",
@@ -843,6 +852,9 @@ const translations = {
     "detail.download_all": "Download all",
     "detail.download_master": "ProRes Master",
     "detail.download_short_prores": "ProRes Short",
+    "detail.prores_failed": "Couldn't generate the ProRes ({reason}). Wait a few minutes and try again.",
+    "detail.prores_source_missing": "Can't regenerate the ProRes: the source video (MP4) is no longer available on the server. Re-render the video from the original audio.",
+    "detail.prores_timeout": "ProRes is taking longer than expected. Close this notice and try again in a few minutes — generation is still running on the server.",
     "detail.publish_youtube": "Publish to YouTube",
     "detail.view_youtube": "View on YouTube",
     "detail.not_available": "This video is not ready to preview yet.",
@@ -1151,6 +1163,8 @@ const translations = {
 
     "transcribe.title": "Transcrevendo lyrics",
     "transcribe.subtitle": "Analisando áudio...",
+    "transcribe.uploading": "Enviando áudio",
+    "transcribe.uploading_progress": "Enviando para o armazenamento ({pct}%)",
     "transcribe.song": "Música",
 
     "batch.generating": "Gerando vídeos",
@@ -1227,6 +1241,7 @@ const translations = {
     "prores.generating_tooltip": "O master ProRes está sendo gerado em segundo plano. Demora 1-3 minutos para HD, 3-5 para 4K.",
 
     "batch.queued": "Na fila",
+    "batch.step_uploading": "Enviando",
     "batch.in_progress": "Em progresso",
     "batch.validating": "Validando conteudo",
     "batch.pending_review": "Pendente de aprovacao",
@@ -1301,6 +1316,9 @@ const translations = {
     "detail.download_all": "Baixar tudo",
     "detail.download_master": "Master ProRes",
     "detail.download_short_prores": "Short ProRes",
+    "detail.prores_failed": "Não foi possível gerar o ProRes ({reason}). Aguarde alguns minutos e tente novamente.",
+    "detail.prores_source_missing": "Não é possível regenerar o ProRes: o vídeo fonte (MP4) não está mais disponível no servidor. Gere o vídeo novamente a partir do áudio original.",
+    "detail.prores_timeout": "O ProRes está demorando mais do que o esperado. Feche este aviso e tente novamente em alguns minutos — a geração continua rodando no servidor.",
     "detail.publish_youtube": "Publicar no YouTube",
     "detail.view_youtube": "Ver no YouTube",
     "detail.not_available": "Este vídeo ainda não está pronto para preview.",

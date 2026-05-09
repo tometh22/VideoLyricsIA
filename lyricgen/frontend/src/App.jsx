@@ -6,6 +6,7 @@ import {
 import { useI18n } from "./i18n";
 import { IS_PRODUCTION, APP_ENV } from "./env";
 import { fetchWithTimeout } from "./fetchWithTimeout";
+import { uploadFileToR2 } from "./r2Upload";
 import LoginPage from "./components/LoginPage";
 import Landing from "./components/Landing";
 import Sidebar from "./components/Sidebar";
@@ -264,6 +265,9 @@ export default function App() {
   const [approvedJobs, setApprovedJobs] = useState([]);
   const [transcribing, setTranscribing] = useState(false);
   const [transcribeError, setTranscribeError] = useState(null);
+  // {phase: "uploading"|"transcribing", loaded, total} during the
+  // upload→whisper handoff. Drives the progress bar in /review.
+  const [transcribeProgress, setTranscribeProgress] = useState(null);
   const [readyToGenerate, setReadyToGenerate] = useState(false);
 
   const [jobs, setJobs] = useState([]);
@@ -421,31 +425,48 @@ export default function App() {
     const entry = queue[idx];
     setTranscribing(true);
     setTranscribeError(null);
-
-    const formData = new FormData();
-    formData.append("file", entry.file);
-    if (entry.language) formData.append("language", entry.language);
-    // Forward the artist + title the operator filled in (UploadZone
-    // pre-populates them by parsing the filename, but the user can
-    // override) so the backend's reference-lyrics fetcher gets clean
-    // inputs even when the MP3 filename is something generic.
-    if (entry.artist) formData.append("artist", entry.artist);
-    const _title = (entry.songTitle || "").trim();
-    if (_title) formData.append("title", _title);
+    setTranscribeProgress({ phase: "uploading", loaded: 0, total: entry.file.size });
 
     let transcribeRes = null;
     try {
-      transcribeRes = await authFetch(`${API}/transcribe`, { method: "POST", body: formData });
+      // Step 1: stream the audio body straight to R2 via a presigned URL.
+      // The API container never sees the bytes — that's the whole point
+      // of the v2 flow. uploadFileToR2 picks single-PUT or multipart
+      // automatically based on file size.
+      const { jobId: uploadJobId } = await uploadFileToR2(entry.file, {
+        meta: {
+          artist: entry.artist || "",
+          title: (entry.songTitle || "").trim(),
+        },
+        onProgress: (loaded, total) => {
+          setTranscribeProgress({ phase: "uploading", loaded, total });
+        },
+      });
+
+      // Step 2: tell the API to fetch the just-uploaded audio from R2,
+      // run Whisper / lrclib, return segments. Same shape as the
+      // legacy /transcribe response.
+      setTranscribeProgress({ phase: "transcribing", loaded: 0, total: 0 });
+      transcribeRes = await authFetch(`${API}/transcribe-uploaded`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          job_id: uploadJobId,
+          language: entry.language || "",
+          artist: entry.artist || "",
+          title: (entry.songTitle || "").trim(),
+        }),
+      });
       if (!transcribeRes.ok) {
         const reason = await describeFetchError(null, transcribeRes, t);
         setTranscribing(false);
+        setTranscribeProgress(null);
         setTranscribeError(reason);
         return;
       }
-      const text = await transcribeRes.text();
-      if (!text) throw new Error("Empty response");
-      const data = JSON.parse(text);
+      const data = await transcribeRes.json();
       setTranscribing(false);
+      setTranscribeProgress(null);
       setCurrentReview({
         file: entry.file, artist: entry.artist, language: entry.language,
         songTitle: entry.songTitle || "",
@@ -454,14 +475,14 @@ export default function App() {
         segments: data.segments, referenceLyrics: data.reference_lyrics || "",
         coverageWarning: !!data.coverage_warning,
         recoverySource: data.recovery_source || "",
-        // Backend returns the job_id of the persisted upload so /generate
-        // can reuse the same audio without re-uploading. Older backends
-        // omit this field — the worker falls back to attaching `_file`.
-        transcribeJobId: data.job_id || null,
+        // Same job_id covers the whole upload→transcribe→generate flow
+        // now (it's minted in /upload-url and reused throughout).
+        transcribeJobId: data.job_id || uploadJobId,
         queueIdx: idx, queue,
       });
     } catch (err) {
       setTranscribing(false);
+      setTranscribeProgress(null);
       const reason = await describeFetchError(err, transcribeRes, t);
       setTranscribeError(reason);
     }
@@ -576,179 +597,102 @@ export default function App() {
   };
 
   const processQueueDirect = async (jobList) => {
+    // v2 flow: browser → R2 (presigned PUT) → /generate with job_id +
+    // empty segments_json (auto-transcribe in worker). The audio body
+    // never touches the API container, so we don't need the 429/503
+    // soft-fail retry maze that wrapped the old /upload — R2 is its own
+    // throttle domain and r2Upload.js already retries failed parts.
     let nextIdx = 0;
     const worker = async () => {
       while (nextIdx < jobList.length) {
         const i = nextIdx++;
         setJobs((prev) => prev.map((j, idx) =>
-          idx === i ? { ...j, status: "processing", current_step: "whisper", progress: 0 } : j
+          idx === i ? {
+            ...j, status: "processing", current_step: "uploading", progress: 0,
+          } : j
         ));
-        const formData = new FormData();
-        formData.append("file", jobList[i]._file);
-        formData.append("artist", jobList[i].artist);
-        if (jobList[i].songTitle) formData.append("song_title", jobList[i].songTitle);
-        formData.append("style", style);
-        formData.append("delivery_profile", delivery.delivery_profile);
-        if (delivery.delivery_profile !== "youtube") {
-          formData.append("umg_frame_size", delivery.umg_frame_size);
-          formData.append("umg_fps", String(delivery.umg_fps));
-          formData.append("umg_prores_profile", String(delivery.umg_prores_profile));
-        }
-        if (jobList[i].language) formData.append("language", jobList[i].language);
-        if (jobList[i].genre) formData.append("genre", jobList[i].genre);
-        if (jobList[i].font) formData.append("font", jobList[i].font);
-        if (jobList[i].concept) formData.append("concept", jobList[i].concept);
-        if (jobList[i].movementStyle) formData.append("movement_style", jobList[i].movementStyle);
-        if (animateImage && backgroundFile) formData.append("animate_image", "true");
-        if (backgroundId) formData.append("background_id", backgroundId);
-        else if (backgroundFile) formData.append("background_file", backgroundFile);
-
-        // Soft-fail handling: instead of marking the upload as a hard
-        // failure on transient or capacity errors, we keep the job
-        // visible as "esperando" and retry behind the scenes. Three
-        // distinct cases the operator should never see as a red error:
-        //
-        //   • 429 rate-limit (burst):  short backoff, retry up to
-        //     MAX_RATE_LIMIT_RETRIES with exponential 2^attempt s.
-        //   • 429 batch-limit (tenant
-        //     backlog cap reached):    longer poll, retry up to
-        //     MAX_BATCH_LIMIT_RETRIES every BATCH_LIMIT_POLL_MS until
-        //     a slot frees. UMG's batch flow lives or dies on this —
-        //     the operator should perceive it as "tu video se va a
-        //     subir solo cuando se libere un lugar".
-        //   • 503 disk-full (server
-        //     temporarily out of space): honour Retry-After header,
-        //     retry up to MAX_DISK_RETRIES.
-        //
-        // Hard errors (any other 4xx, 5xx, network) still surface as
-        // red so the operator can act. Rate-limit / batch-limit /
-        // disk-full are infrastructure pressure, not user errors.
-        let res = null;
-        let data = null;
-        let attempt = 0;
-        const MAX_RATE_LIMIT_RETRIES = 5;
-        const MAX_BATCH_LIMIT_RETRIES = 30;     // ≈15 min @ 30 s polls
-        const MAX_DISK_RETRIES = 8;             // ≈40 min worst case
-        const BATCH_LIMIT_POLL_MS = 30_000;
-        let networkError = false;
-        let totalAttempts = 0;
-        const MAX_TOTAL_ATTEMPTS = 40;
-        while (totalAttempts < MAX_TOTAL_ATTEMPTS) {
-          totalAttempts++;
-          try {
-            res = await authFetch(`${API}/upload`, { method: "POST", body: formData });
-          } catch {
-            networkError = true;
-            break;
-          }
-          // Success or terminal non-retryable error.
-          if (res.status !== 429 && res.status !== 503) {
-            try {
-              data = await res.json();
-            } catch {
-              // Non-JSON body (e.g. HTML error page from edge proxy on
-              // 502/504). Synthesize a detail so the post-loop error
-              // surfacer (describeFetchError) can pick it up.
-              data = null;
-            }
-            break;
-          }
-          // Peek at the body so we can pick the right retry strategy.
-          let body = null;
-          try { body = await res.clone().json(); } catch { body = null; }
-          const detail = (body && body.detail) || "";
-
-          if (res.status === 503) {
-            // Disk-full or transient Redis-unreachable. Honour the
-            // Retry-After header (set by the disk gate to 300 s).
-            if (attempt >= MAX_DISK_RETRIES) {
-              data = body || { detail: t("batch.error_server") };
-              break;
-            }
-            const retryAfter = parseInt(res.headers.get("Retry-After") || "", 10);
-            const waitMs = Math.max(15_000, (Number.isFinite(retryAfter) ? retryAfter : 60) * 1000);
-            const nextAt = Math.round(waitMs / 1000);
-            setJobs((prev) => prev.map((j, idx) =>
-              idx === i ? {
-                ...j,
-                status: "queued",
-                error: null,
-                queue_reason: "server_busy",
-                queue_retry_in_s: nextAt,
-              } : j
-            ));
-            await new Promise((r) => setTimeout(r, waitMs));
-            attempt++;
-            continue;
-          }
-
-          // res.status === 429 from here.
-          if (/batch limit|backlog/i.test(detail)) {
-            // Tenant backlog cap. Wait for a slot, retry quietly.
-            if (attempt >= MAX_BATCH_LIMIT_RETRIES) {
-              data = body;
-              break;
-            }
-            setJobs((prev) => prev.map((j, idx) =>
-              idx === i ? {
-                ...j,
-                status: "queued",
-                error: null,
-                queue_reason: "team_backlog",
-                queue_retry_in_s: Math.round(BATCH_LIMIT_POLL_MS / 1000),
-              } : j
-            ));
-            await new Promise((r) => setTimeout(r, BATCH_LIMIT_POLL_MS));
-            attempt++;
-            continue;
-          }
-          // Plain rate-limit burst.
-          if (attempt >= MAX_RATE_LIMIT_RETRIES) {
-            data = body || { detail: t("batch.error_server") };
-            break;
-          }
-          const waitMs = Math.min(32_000, 2000 * Math.pow(2, attempt));
-          setJobs((prev) => prev.map((j, idx) =>
-            idx === i ? {
-              ...j,
-              status: "queued",
-              error: null,
-              queue_reason: "rate_limit",
-              queue_retry_in_s: Math.round(waitMs / 1000),
-            } : j
-          ));
-          await new Promise((r) => setTimeout(r, waitMs));
-          attempt++;
-        }
-        if (networkError || !res || !data) {
-          // No response at all (TypeError) → network/CORS-blocked-502.
-          // Have a response but JSON failed → use res to derive a status-
-          // specific message.
-          const reason = await describeFetchError(
-            networkError ? new TypeError("network") : null,
-            networkError ? null : res,
-            t,
-          );
+        let uploadJobId = null;
+        try {
+          const result = await uploadFileToR2(jobList[i]._file, {
+            meta: {
+              artist: jobList[i].artist,
+              title: jobList[i].songTitle || "",
+            },
+            onProgress: (loaded, total) => {
+              const pct = total > 0 ? Math.round((loaded / total) * 100) : 0;
+              setJobs((prev) => prev.map((j, idx) =>
+                idx === i ? {
+                  ...j, current_step: "uploading", progress: pct,
+                } : j
+              ));
+            },
+          });
+          uploadJobId = result.jobId;
+        } catch (err) {
+          const reason = await describeFetchError(err, err.response || null, t);
           setJobs((prev) => prev.map((j, idx) =>
             idx === i ? { ...j, status: "error", error: reason } : j
           ));
           continue;
         }
-        if (data.detail) {
-          setJobs((prev) => prev.map((j, idx) =>
-            idx === i ? { ...j, status: "error", error: data.detail } : j
-          ));
-          continue;
-        }
+
+        // Upload finished. Hand the job off to the worker; segments_json=[]
+        // tells the pipeline to run Whisper itself (no editor flow).
         setJobs((prev) => prev.map((j, idx) =>
           idx === i ? {
-            ...j,
-            job_id: data.job_id,
-            queue_reason: undefined,
-            queue_retry_in_s: undefined,
+            ...j, current_step: "whisper", progress: 0, job_id: uploadJobId,
           } : j
         ));
-        await pollJob(data.job_id);
+        const generateBody = new FormData();
+        generateBody.append("job_id", uploadJobId);
+        generateBody.append("artist", jobList[i].artist);
+        if (jobList[i].songTitle) generateBody.append("song_title", jobList[i].songTitle);
+        generateBody.append("style", style);
+        generateBody.append("segments_json", "[]");
+        generateBody.append("delivery_profile", delivery.delivery_profile);
+        if (delivery.delivery_profile !== "youtube") {
+          generateBody.append("umg_frame_size", delivery.umg_frame_size);
+          generateBody.append("umg_fps", String(delivery.umg_fps));
+          generateBody.append("umg_prores_profile", String(delivery.umg_prores_profile));
+        }
+        if (jobList[i].language) generateBody.append("language", jobList[i].language);
+        if (jobList[i].genre) generateBody.append("genre", jobList[i].genre);
+        if (jobList[i].font) generateBody.append("font", jobList[i].font);
+        if (jobList[i].concept) generateBody.append("concept", jobList[i].concept);
+        if (jobList[i].movementStyle) generateBody.append("movement_style", jobList[i].movementStyle);
+        if (animateImage && backgroundFile) generateBody.append("animate_image", "true");
+        if (backgroundId) generateBody.append("background_id", backgroundId);
+        else if (backgroundFile) generateBody.append("background_file", backgroundFile);
+
+        let genRes = null;
+        try {
+          genRes = await authFetch(`${API}/generate`, {
+            method: "POST", body: generateBody,
+          });
+          let data;
+          try {
+            data = await genRes.json();
+          } catch {
+            const reason = await describeFetchError(null, genRes, t);
+            setJobs((prev) => prev.map((j, idx) =>
+              idx === i ? { ...j, status: "error", error: reason } : j
+            ));
+            continue;
+          }
+          if (!genRes.ok || data.detail) {
+            const reason = data.detail || await describeFetchError(null, genRes, t);
+            setJobs((prev) => prev.map((j, idx) =>
+              idx === i ? { ...j, status: "error", error: reason } : j
+            ));
+            continue;
+          }
+          await pollJob(uploadJobId);
+        } catch (err) {
+          const reason = await describeFetchError(err, genRes, t);
+          setJobs((prev) => prev.map((j, idx) =>
+            idx === i ? { ...j, status: "error", error: reason } : j
+          ));
+        }
       }
     };
     await Promise.all(Array.from({ length: Math.min(PARALLEL_WORKERS, jobList.length) }, () => worker()));
@@ -916,11 +860,38 @@ export default function App() {
       );
     }
     if (transcribing) {
+      const phase = transcribeProgress?.phase;
+      const loaded = transcribeProgress?.loaded || 0;
+      const total = transcribeProgress?.total || 0;
+      const pct = phase === "uploading" && total > 0
+        ? Math.round((loaded / total) * 100)
+        : null;
+      const phaseLabel = (
+        phase === "uploading" ? t("transcribe.uploading") :
+        phase === "transcribing" ? t("transcribe.title") :
+        t("transcribe.title")
+      );
+      const phaseSub = (
+        phase === "uploading" && pct !== null
+          ? t("transcribe.uploading_progress", { pct })
+          : t("transcribe.subtitle")
+      );
       return (
         <div className="w-full max-w-md mx-auto mt-16 animate-fade-in text-center">
-          <div className="w-12 h-12 mx-auto mb-4 border-2 border-brand border-t-transparent rounded-full animate-spin" />
-          <h2 className="text-xl font-bold mb-2">{t("transcribe.title")}</h2>
-          <p className="text-gray-500 text-sm">{t("transcribe.subtitle")}</p>
+          {pct !== null ? (
+            <div className="w-full max-w-xs mx-auto mb-4">
+              <div className="h-1.5 bg-surface-1 rounded-full overflow-hidden">
+                <div
+                  className="h-full rounded-full bg-gradient-to-r from-brand to-brand-light transition-all duration-300"
+                  style={{ width: `${pct}%` }}
+                />
+              </div>
+            </div>
+          ) : (
+            <div className="w-12 h-12 mx-auto mb-4 border-2 border-brand border-t-transparent rounded-full animate-spin" />
+          )}
+          <h2 className="text-xl font-bold mb-2">{phaseLabel}</h2>
+          <p className="text-gray-500 text-sm">{phaseSub}</p>
           {reviewQueue.length > 1 && (
             <p className="text-xs text-gray-600 mt-2">
               {t("transcribe.song")} {approvedJobs.length + 1} {t("editor.song_of")} {reviewQueue.length}

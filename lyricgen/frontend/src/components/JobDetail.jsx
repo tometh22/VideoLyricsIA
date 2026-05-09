@@ -257,16 +257,38 @@ export default function JobDetail({ job, onBack, onJobUpdate }) {
           await new Promise((r) => setTimeout(r, retryMs));
           continue;
         }
-        // Any other status is a hard error (400/404/500).
-        throw new Error(`HTTP ${res.status}`);
+        // Hard error (400/404/500). Surface the backend's own `detail`
+        // string when present so the operator sees a real reason instead
+        // of a generic HTTP code. 404 specifically means the source MP4
+        // is no longer on disk/R2 — irrecoverable, needs a full re-render.
+        let backendDetail = "";
+        try {
+          const body = await res.json();
+          backendDetail = (body && body.detail) || "";
+        } catch {
+          /* non-JSON body — fall through with empty detail */
+        }
+        const err = new Error(`HTTP ${res.status}`);
+        err.status = res.status;
+        err.detail = backendDetail;
+        throw err;
       }
-      throw new Error("Tiempo de espera agotado");
+      const err = new Error("timeout");
+      err.kind = "timeout";
+      throw err;
     } catch (err) {
       console.error("ProRes download failed:", err);
-      alert(
-        t("detail.prores_failed")
-        || `No se pudo generar el ProRes (${err.message || "error"}). Esperá unos minutos y volvé a intentar.`
-      );
+      let message;
+      if (err.kind === "timeout") {
+        message = t("detail.prores_timeout");
+      } else if (err.status === 404) {
+        // Source MP4 missing on the server — only a full re-render fixes it.
+        message = t("detail.prores_source_missing");
+      } else {
+        const reason = err.detail || err.message || "error";
+        message = t("detail.prores_failed", { reason });
+      }
+      alert(message);
     } finally {
       setProResHint(null);
     }
@@ -346,15 +368,24 @@ export default function JobDetail({ job, onBack, onJobUpdate }) {
     approveLockRef.current = false;
   };
 
-  const hasUmgMaster =
-    (job.delivery_profile === "umg" || job.delivery_profile === "both") &&
-    !!job.files?.umg_master_url;
+  // ProRes button visibility — gated by delivery profile + done status,
+  // NOT by the presence of `files.umg_master_url`. The download endpoint
+  // (/download/{id}/umg_master) handles the missing-file case by
+  // enqueueing a lazy prewarm and returning 202 + Retry-After; the
+  // fetchProResAndSave polls until ready (up to 8 min).
+  //
+  // Why decouple from the URL: jobs created before the prewarm feature
+  // existed (or whose prewarm died silently) sit forever with
+  // umg_master_url=null and no way for the operator to recover the file.
+  // Showing the button always lets clicking it trigger the recovery.
+  const isUmgJob =
+    job.delivery_profile === "umg" || job.delivery_profile === "both";
+  const isJobDone = job.status === "done";
+  const hasUmgMaster = isUmgJob && isJobDone;
   // Short ProRes follows the same opt-in: any UMG-flavoured job gets a
   // separate vertical-format master alongside the main one. Generated
   // lazily by /download/{id}/umg_short the first time it's clicked.
-  const hasUmgShort =
-    (job.delivery_profile === "umg" || job.delivery_profile === "both") &&
-    !!job.files?.umg_short_url;
+  const hasUmgShort = isUmgJob && isJobDone;
 
   const ALL_TABS = [
     ...MEDIA_TABS,
