@@ -300,11 +300,11 @@ export default function App() {
   };
 
   const handleLogout = useCallback(() => {
-    // Stop every active poll BEFORE clearing the token. Otherwise the
-    // intervals keep firing authFetch() with no token, triggering 401s
-    // on every tick until the tab is closed (and re-entering this
-    // handler in a loop).
-    pollingIntervals.current.forEach((iv) => clearInterval(iv));
+    // Stop every active poll / SSE stream BEFORE clearing the token.
+    pollingIntervals.current.forEach((handle) => {
+      if (handle && typeof handle.close === "function") handle.close(); // EventSource
+      else clearInterval(handle);
+    });
     pollingIntervals.current.clear();
     localStorage.removeItem("genly_token");
     localStorage.removeItem("genly_user");
@@ -357,48 +357,102 @@ export default function App() {
   useEffect(() => { if (token) fetchHistory(); }, [token, fetchHistory]);
 
   const pollJob = useCallback((jobId) => {
-    // Poll every 3 s (instead of 1 s) and skip the tick entirely when the tab
-    // is hidden. For a user with a few tabs open and 20 active jobs this cuts
-    // the request rate by ~90%.
+    // Use SSE when available; fall back to 3 s polling for proxies that buffer
+    // text/event-stream (some corporate HTTPS interceptors).
+    const TERMINAL = new Set(["done", "pending_review", "error", "validation_failed"]);
+
     return new Promise((resolve) => {
-      const iv = setInterval(async () => {
-        if (typeof document !== "undefined" && document.hidden) return;
-        // Token can disappear mid-poll if the user logs out from another
-        // tab; bail rather than spamming 401s.
-        if (!getToken()) {
-          clearInterval(iv);
-          pollingIntervals.current.delete(iv);
-          resolve("aborted");
-          return;
-        }
-        try {
-          const res = await authFetch(`${API}/status/${jobId}`);
-          if (res.status === 401) {
+      const token = getToken();
+      if (!token) { resolve("aborted"); return; }
+
+      // --- SSE path ---
+      let es;
+      try {
+        // Append the auth token as a query param — EventSource doesn't support
+        // custom headers; the backend's get_current_user_from_token_param dep
+        // handles token= on GET endpoints.
+        es = new EventSource(`${API}/events/${jobId}?token=${encodeURIComponent(token)}`);
+      } catch {
+        es = null;
+      }
+
+      if (es) {
+        const cleanup = () => { es.close(); pollingIntervals.current.delete(es); };
+        pollingIntervals.current.add(es);
+        es.onmessage = (e) => {
+          try {
+            const data = JSON.parse(e.data);
+            setJobs((prev) => prev.map((j) =>
+              j.job_id === jobId
+                ? { ...j, status: data.status, current_step: data.current_step,
+                    progress: data.progress, error: data.error,
+                    created_at: data.created_at ?? j.created_at,
+                    completed_at: data.completed_at ?? j.completed_at }
+                : j
+            ));
+            if (TERMINAL.has(data.status)) {
+              cleanup();
+              fetchHistory();
+              resolve(data.status);
+            }
+          } catch {}
+        };
+        es.onerror = () => {
+          // SSE connection dropped (e.g. proxy buffering). Fall through to polling.
+          cleanup();
+          startPolling();
+        };
+        return;
+      }
+
+      // --- Polling fallback ---
+      function startPolling() {
+        const iv = setInterval(async () => {
+          if (typeof document !== "undefined" && document.hidden) return;
+          if (!getToken()) {
             clearInterval(iv);
             pollingIntervals.current.delete(iv);
-            handleLogout();
-            resolve("unauthorized");
+            resolve("aborted");
             return;
           }
-          if (!res.ok) return;
-          const data = await res.json();
-          setJobs((prev) => prev.map((j) =>
-            j.job_id === jobId ? { ...j, status: data.status, current_step: data.current_step, progress: data.progress, error: data.error } : j
-          ));
-          if (data.status === "done" || data.status === "error" || data.status === "pending_review" || data.status === "validation_failed") {
-            clearInterval(iv);
-            pollingIntervals.current.delete(iv);
-            fetchHistory();
-            resolve(data.status);
-          }
-        } catch {}
-      }, 3000);
-      pollingIntervals.current.add(iv);
+          try {
+            const res = await authFetch(`${API}/status/${jobId}`);
+            if (res.status === 401) {
+              clearInterval(iv);
+              pollingIntervals.current.delete(iv);
+              handleLogout();
+              resolve("unauthorized");
+              return;
+            }
+            if (!res.ok) return;
+            const data = await res.json();
+            setJobs((prev) => prev.map((j) =>
+              j.job_id === jobId
+                ? { ...j, status: data.status, current_step: data.current_step,
+                    progress: data.progress, error: data.error,
+                    created_at: data.created_at ?? j.created_at,
+                    completed_at: data.completed_at ?? j.completed_at }
+                : j
+            ));
+            if (TERMINAL.has(data.status)) {
+              clearInterval(iv);
+              pollingIntervals.current.delete(iv);
+              fetchHistory();
+              resolve(data.status);
+            }
+          } catch {}
+        }, 3000);
+        pollingIntervals.current.add(iv);
+      }
+      startPolling();
     });
-  }, [fetchHistory]);
+  }, [fetchHistory, handleLogout]);
 
   useEffect(() => () => {
-    pollingIntervals.current.forEach((iv) => clearInterval(iv));
+    pollingIntervals.current.forEach((handle) => {
+      if (handle && typeof handle.close === "function") handle.close();
+      else clearInterval(handle);
+    });
   }, []);
 
   // Pre-upload + transcribe songs at indices fromIdx..queue.length-1 in the

@@ -60,10 +60,27 @@ const UMG_PROFILES = [
   { code: "5", label: "ProRes 4444 XQ" },
 ];
 
+// Gradient swatches mirror _GRADIENT_PALETTES in pipeline.py exactly so
+// the UI preview matches what the worker actually renders.
 const STYLES = [
-  { code: "oscuro",  label: "Dark / Cinematográfico",  icon: "🎬" },
-  { code: "neon",    label: "Neon / Vibrante",          icon: "⚡" },
-  { code: "minimal", label: "Minimal / Limpio",         icon: "◻" },
+  {
+    code: "oscuro",
+    label: "Dark",
+    sub: "Cinematográfico",
+    swatch: "linear-gradient(135deg, #0a0a1e 0%, #1e0f3c 40%, #501450 70%, #280a32 100%)",
+  },
+  {
+    code: "neon",
+    label: "Neon",
+    sub: "Vibrante",
+    swatch: "linear-gradient(135deg, #0a0528 0%, #500078 40%, #006482 70%, #780050 100%)",
+  },
+  {
+    code: "minimal",
+    label: "Minimal",
+    sub: "Limpio",
+    swatch: "linear-gradient(135deg, #b4b4c3 0%, #c8bed2 40%, #aab4c8 70%, #d2c8c3 100%)",
+  },
 ];
 
 export default function UploadZone({
@@ -1082,14 +1099,23 @@ export default function UploadZone({
                   key={s.code}
                   type="button"
                   onClick={() => onStyleChange(s.code)}
-                  className={`flex-1 flex flex-col items-center gap-1 px-3 py-2.5 rounded-xl border text-[11px] font-medium transition-all duration-200
+                  className={`flex-1 flex flex-col items-center gap-2 px-3 py-2.5 rounded-xl border text-[11px] font-medium transition-all duration-200
                     ${style === s.code
-                      ? "bg-brand/15 border-brand/50 text-white ring-1 ring-brand/40"
+                      ? "border-brand/50 text-white ring-1 ring-brand/40 scale-[1.02]"
                       : "border-white/[0.06] text-gray-400 hover:border-white/[0.16] hover:text-white"
                     }`}
                 >
-                  <span className="text-lg leading-none">{s.icon}</span>
-                  <span className="truncate w-full text-center">{s.label}</span>
+                  {/* Gradient swatch — exact palette from pipeline.py */}
+                  <span
+                    className={`w-full h-8 rounded-lg block ring-1 transition-all duration-200 ${
+                      style === s.code ? "ring-brand/50 shadow-[0_0_12px_2px_rgba(139,92,246,0.3)]" : "ring-white/[0.06]"
+                    }`}
+                    style={{ background: s.swatch }}
+                  />
+                  <span className="leading-tight text-center">
+                    <span className="block font-semibold">{s.label}</span>
+                    <span className="block text-[10px] text-gray-500">{s.sub}</span>
+                  </span>
                 </button>
               ))}
             </div>

@@ -217,29 +217,91 @@ function ApprovalCard({ job, t, onSelectJob, onApprove, approving }) {
 }
 
 // ─── Celebration screen ──────────────────────────────────────────────────────
+
+// Simple CSS-only particles — no library. Each particle is a tiny coloured
+// circle that flies out from the center using a keyframe defined inline via
+// style.animationName. We generate the keyframes once and inject them into
+// a <style> tag rendered inside the component.
+const PARTICLE_COLORS = ["#8b5cf6", "#06b6d4", "#10b981", "#f59e0b", "#ec4899", "#fff"];
+const PARTICLES = Array.from({ length: 24 }, (_, i) => {
+  const angle = (i / 24) * 360;
+  const dist = 80 + Math.random() * 80;
+  const dx = Math.cos((angle * Math.PI) / 180) * dist;
+  const dy = Math.sin((angle * Math.PI) / 180) * dist;
+  return {
+    id: i,
+    color: PARTICLE_COLORS[i % PARTICLE_COLORS.length],
+    dx,
+    dy,
+    size: 4 + Math.random() * 5,
+    delay: Math.random() * 400,
+    duration: 700 + Math.random() * 500,
+  };
+});
+
 function CelebrationScreen({ jobs, total, downloadable, onDownloadAll, onReset, t }) {
   const [show, setShow] = useState(false);
+  const [burst, setBurst] = useState(false);
 
-  // Animate in after a brief delay so the transition from the grid is smooth.
+  // Count actual downloadable files across all done jobs.
+  const fileCount = jobs
+    .filter((j) => j.status === "done")
+    .reduce((acc, j) => {
+      const f = j.files || {};
+      return acc + [f.video_url, f.short_url, f.thumbnail_url].filter(Boolean).length;
+    }, 0) || downloadable * 3;
+
+  // Animate in; trigger particle burst slightly after mount.
   useEffect(() => {
-    const tid = setTimeout(() => setShow(true), 80);
-    return () => clearTimeout(tid);
+    const t1 = setTimeout(() => setShow(true), 80);
+    const t2 = setTimeout(() => setBurst(true), 200);
+    return () => { clearTimeout(t1); clearTimeout(t2); };
   }, []);
 
   // Total batch processing time (earliest created_at → latest completed_at).
+  // Timestamps are Unix epoch floats from the backend's .timestamp() call.
   const batchDurationLabel = (() => {
     const completedJobs = jobs.filter((j) => j.completed_at && j.created_at);
     if (completedJobs.length === 0) return null;
-    const start = Math.min(...completedJobs.map((j) => new Date(j.created_at).getTime()));
-    const end = Math.max(...completedJobs.map((j) => new Date(j.completed_at).getTime()));
+    const toMs = (v) => v > 1e10 ? v : v * 1000; // handle both ms and s
+    const start = Math.min(...completedJobs.map((j) => toMs(j.created_at)));
+    const end = Math.max(...completedJobs.map((j) => toMs(j.completed_at)));
     const mins = Math.round((end - start) / 60000);
     return mins >= 1 ? `${mins} min` : "<1 min";
   })();
 
   return (
     <div className={`text-center transition-all duration-700 ${show ? "opacity-100 translate-y-0" : "opacity-0 translate-y-4"}`}>
-      {/* Glowing icon */}
+      {/* Particle keyframe — injected once, scoped to this component's lifetime */}
+      <style>{`
+        @keyframes particle-fly {
+          0%   { transform: translate(-50%, -50%) scale(1); opacity: 1; }
+          80%  { opacity: 0.6; }
+          100% { transform: translate(calc(-50% + var(--dx)), calc(-50% + var(--dy))) scale(0); opacity: 0; }
+        }
+      `}</style>
+      {/* Glowing icon + particle burst */}
       <div className="relative w-20 h-20 mx-auto mb-6">
+        {/* Particles */}
+        {burst && PARTICLES.map((p) => (
+          <span
+            key={p.id}
+            className="absolute rounded-full pointer-events-none"
+            style={{
+              width: p.size,
+              height: p.size,
+              background: p.color,
+              top: "50%",
+              left: "50%",
+              transform: "translate(-50%, -50%)",
+              animation: `particle-fly ${p.duration}ms ease-out ${p.delay}ms both`,
+              // Inline keyframe via CSS custom properties — avoids needing a
+              // global stylesheet or an animation library.
+              "--dx": `${p.dx}px`,
+              "--dy": `${p.dy}px`,
+            }}
+          />
+        ))}
         <div className="absolute inset-0 rounded-3xl bg-accent/20 animate-ping" style={{ animationDuration: "2s" }} />
         <div className="absolute inset-0 rounded-3xl bg-accent/10 animate-ping" style={{ animationDuration: "2.5s", animationDelay: "0.3s" }} />
         <div className="relative w-20 h-20 rounded-3xl bg-gradient-to-br from-accent/30 to-brand/30 ring-1 ring-accent/40 flex items-center justify-center">
@@ -267,7 +329,7 @@ function CelebrationScreen({ jobs, total, downloadable, onDownloadAll, onReset, 
           <span className="font-semibold text-white">{downloadable}</span> {downloadable === 1 ? "video" : "videos"}
         </div>
         <div className="px-3 py-1.5 rounded-full bg-surface-2/60 ring-1 ring-white/[0.06] text-xs text-gray-400">
-          <span className="font-semibold text-white">{downloadable * 3}</span> archivos
+          <span className="font-semibold text-white">{fileCount}</span> archivos
         </div>
         {batchDurationLabel && (
           <div className="px-3 py-1.5 rounded-full bg-surface-2/60 ring-1 ring-white/[0.06] text-xs text-gray-400">
@@ -282,7 +344,7 @@ function CelebrationScreen({ jobs, total, downloadable, onDownloadAll, onReset, 
           <svg className="inline-block w-4 h-4 mr-2 -mt-0.5" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
             <path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4" /><polyline points="7 10 12 15 17 10" /><line x1="12" y1="15" x2="12" y2="3" />
           </svg>
-          {t("batch.download_all") || "Descargar todo"} ({downloadable * 3} archivos)
+          {t("batch.download_all") || "Descargar todo"} ({fileCount} archivos)
         </button>
         <button onClick={onReset} className="btn-secondary h-12 px-6 text-sm">
           {t("batch.new_batch") || "Nuevo batch"}
@@ -312,12 +374,13 @@ export default function BatchProgress({ jobs, onReset, onSingleDone, onSelectJob
   // Show the approval grid when all done and there are multi-video batches pending.
   const showApprovalGrid = allDone && !allApproved && total > 1;
 
-  // Real ETA: average duration of completed jobs.
+  // Real ETA: average duration of completed jobs (Unix epoch float timestamps).
   const etaLabel = (() => {
     if (total - done <= 0) return null;
+    const toMs = (v) => v > 1e10 ? v : v * 1000;
     const completedMs = jobs
       .filter((j) => (j.status === "done" || j.status === "pending_review") && j.completed_at && j.created_at)
-      .map((j) => new Date(j.completed_at) - new Date(j.created_at));
+      .map((j) => toMs(j.completed_at) - toMs(j.created_at));
     const avgMin = completedMs.length > 0
       ? completedMs.reduce((a, b) => a + b, 0) / completedMs.length / 60000
       : 8;
@@ -427,17 +490,22 @@ export default function BatchProgress({ jobs, onReset, onSingleDone, onSelectJob
           </div>
         )}
 
-        {/* Thumbnail grid */}
+        {/* Thumbnail grid — cards stagger in for a polished entrance */}
         <div className="grid grid-cols-2 sm:grid-cols-3 gap-3 mb-8">
           {jobs.map((job, i) => (
-            <ApprovalCard
+            <div
               key={job.job_id || i}
-              job={job}
-              t={t}
-              onSelectJob={onSelectJob}
-              onApprove={handleApproveOne}
-              approving={approvingIds.has(job.job_id)}
-            />
+              className="animate-fade-in"
+              style={{ animationDelay: `${i * 60}ms`, animationFillMode: "both" }}
+            >
+              <ApprovalCard
+                job={job}
+                t={t}
+                onSelectJob={onSelectJob}
+                onApprove={handleApproveOne}
+                approving={approvingIds.has(job.job_id)}
+              />
+            </div>
           ))}
         </div>
 
