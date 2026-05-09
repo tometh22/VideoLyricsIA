@@ -220,6 +220,15 @@ export default function JobDetail({ job, onBack, onJobUpdate }) {
   // Hard ceiling at 8 minutes total wait (16 polls × 30 s). 4K@60 cold
   // transcode + R2 upload is ~3-4 min; 8 min covers a queue depth of
   // 2-3 jobs ahead before we give up and tell the user to retry.
+  // Local readiness state so the badge turns green immediately after a
+  // successful ProRes download — no server re-fetch needed.
+  const [localProresReady, setLocalProresReady] = useState(
+    Boolean(
+      (job.s3_keys && job.s3_keys.umg_master && job.s3_keys.umg_short)
+      || job.prores_ready
+    )
+  );
+
   const [proResHint, setProResHint] = useState(null);
   const PRORES_MAX_WAIT_MS = 8 * 60 * 1000;
   const PRORES_POLL_FALLBACK_MS = 30 * 1000;
@@ -230,27 +239,24 @@ export default function JobDetail({ job, onBack, onJobUpdate }) {
     try {
       while (Date.now() < deadline) {
         const url = await getDownloadUrl(job.job_id, fileType);
-        // `redirect: 'manual'` is critical here: when the prewarm has
-        // already finished, /download responds with 302 → R2 signed
-        // URL. Default `redirect: 'follow'` makes the browser fetch
-        // the R2 URL via XHR/fetch, which fails with a generic "Load
-        // failed" if R2's bucket isn't CORS-configured for our origin
-        // — even though the file is sitting right there. With
-        // 'manual' we get an opaqueredirect response; we then trigger
-        // a real browser navigation to /download (same-origin), which
-        // follows the 302 to R2 natively. Cross-origin navigation
-        // doesn't need CORS — only cross-origin fetch does.
+        // `redirect: 'manual'` is critical: /download responds with
+        // 302 → R2 signed URL when the file is cached. Default
+        // `redirect: 'follow'` would make fetch hit R2 cross-origin
+        // and fail CORS (R2 doesn't allow XHR from our origin).
+        // With 'manual' we get opaqueredirect → we then navigate the
+        // main window to the same-origin /download URL which follows
+        // the 302 natively. The R2 signed URL includes
+        // ResponseContentDisposition: attachment so the browser
+        // downloads without navigating away.
         const res = await fetch(url, { redirect: "manual" });
         if (res.type === "opaqueredirect") {
-          const a = document.createElement("a");
-          a.href = url;
-          a.download = suggestedName;
-          a.target = "_blank";
-          a.rel = "noopener";
-          a.style.display = "none";
-          document.body.appendChild(a);
-          a.click();
-          document.body.removeChild(a);
+          // Navigate same-tab: the 302 → R2 URL carries
+          // Content-Disposition: attachment so the browser triggers
+          // a download, not a page navigation. _blank would open
+          // a new tab AND lose the Content-Disposition hint for
+          // cross-origin URLs.
+          window.location.href = url;
+          setLocalProresReady(true);
           return;
         }
         if (res.status === 200) {
@@ -262,6 +268,7 @@ export default function JobDetail({ job, onBack, onJobUpdate }) {
           a.download = suggestedName;
           a.click();
           setTimeout(() => URL.revokeObjectURL(blobUrl), 60_000);
+          setLocalProresReady(true);
           return;
         }
         if (res.status === 202) {
@@ -448,16 +455,7 @@ export default function JobDetail({ job, onBack, onJobUpdate }) {
               )}
               <ProResBadge
                 deliveryProfile={job.delivery_profile}
-                proresReady={
-                  // Header lookup: master + short are both R2-cached
-                  // when the prewarm finished. Either field path
-                  // (s3_keys or files.umg_master_url) signals "ready"
-                  // depending on the version of /jobs that returned.
-                  Boolean(
-                    (job.s3_keys && job.s3_keys.umg_master && job.s3_keys.umg_short)
-                    || job.prores_ready
-                  )
-                }
+                proresReady={localProresReady}
                 jobStatus={job.status}
                 size="md"
               />

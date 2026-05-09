@@ -219,14 +219,29 @@ def download_object(key: str, dest_path: str) -> bool:
         return False
 
 
-def generate_signed_url(key: str, expiry_seconds: int = 3600) -> Optional[str]:
-    """Pre-signed GET URL for the stored object. None if R2 is disabled."""
+def generate_signed_url(
+    key: str,
+    expiry_seconds: int = 3600,
+    *,
+    download_filename: str | None = None,
+) -> Optional[str]:
+    """Pre-signed GET URL for the stored object. None if R2 is disabled.
+
+    Pass `download_filename` to force R2 to send Content-Disposition:
+    attachment so the browser downloads the file instead of opening it.
+    Always set this for ProRes/MOV masters downloaded by the user.
+    """
     client = _get_client()
     if client is None:
         return None
+    params: dict = {"Bucket": R2_BUCKET, "Key": key}
+    if download_filename:
+        params["ResponseContentDisposition"] = (
+            f'attachment; filename="{download_filename}"'
+        )
     return client.generate_presigned_url(
         "get_object",
-        Params={"Bucket": R2_BUCKET, "Key": key},
+        Params=params,
         ExpiresIn=expiry_seconds,
     )
 
