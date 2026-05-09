@@ -346,15 +346,24 @@ export default function JobDetail({ job, onBack, onJobUpdate }) {
     approveLockRef.current = false;
   };
 
-  const hasUmgMaster =
-    (job.delivery_profile === "umg" || job.delivery_profile === "both") &&
-    !!job.files?.umg_master_url;
+  // ProRes button visibility — gated by delivery profile + done status,
+  // NOT by the presence of `files.umg_master_url`. The download endpoint
+  // (/download/{id}/umg_master) handles the missing-file case by
+  // enqueueing a lazy prewarm and returning 202 + Retry-After; the
+  // fetchProResAndSave polls until ready (up to 8 min).
+  //
+  // Why decouple from the URL: jobs created before the prewarm feature
+  // existed (or whose prewarm died silently) sit forever with
+  // umg_master_url=null and no way for the operator to recover the file.
+  // Showing the button always lets clicking it trigger the recovery.
+  const isUmgJob =
+    job.delivery_profile === "umg" || job.delivery_profile === "both";
+  const isJobDone = job.status === "done";
+  const hasUmgMaster = isUmgJob && isJobDone;
   // Short ProRes follows the same opt-in: any UMG-flavoured job gets a
   // separate vertical-format master alongside the main one. Generated
   // lazily by /download/{id}/umg_short the first time it's clicked.
-  const hasUmgShort =
-    (job.delivery_profile === "umg" || job.delivery_profile === "both") &&
-    !!job.files?.umg_short_url;
+  const hasUmgShort = isUmgJob && isJobDone;
 
   const ALL_TABS = [
     ...MEDIA_TABS,
