@@ -2716,10 +2716,15 @@ async def download(
     tenant_id = current_user["tenant_id"]
 
     # Prefer a pre-signed URL to R2 so the uvicorn worker isn't tied up
-    # streaming multi-GB ProRes masters.
+    # streaming multi-GB ProRes masters. Pass download_filename so R2
+    # sends Content-Disposition: attachment and the browser downloads
+    # instead of opening the file inline.
     s3_key = (job.get("s3_keys") or {}).get(file_type)
     if s3_key and storage.is_enabled():
-        url = storage.generate_signed_url(s3_key, expiry_seconds=3600)
+        url = storage.generate_signed_url(
+            s3_key, expiry_seconds=3600,
+            download_filename=FILE_MAP.get(file_type),
+        )
         if url:
             return RedirectResponse(url, status_code=302)
 
@@ -2742,7 +2747,10 @@ async def download(
             _model = _get_job_model(job_id)
             s3_key = (_model.s3_keys or {}).get(file_type) if _model else None
             if s3_key and storage.is_enabled():
-                url = storage.generate_signed_url(s3_key, expiry_seconds=3600)
+                url = storage.generate_signed_url(
+                    s3_key, expiry_seconds=3600,
+                    download_filename=FILE_MAP.get(file_type),
+                )
                 if url:
                     return RedirectResponse(url, status_code=302)
             # R2 said yes but signed URL failed — fall through.
