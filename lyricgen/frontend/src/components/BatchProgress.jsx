@@ -1,6 +1,6 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { useI18n } from "../i18n";
-import { getDownloadUrl } from "../mediaUrl";
+import { getDownloadUrl, useMediaUrl } from "../mediaUrl";
 
 const API = import.meta.env.VITE_API_URL || "";
 
@@ -14,6 +14,7 @@ async function triggerDownload(jobId, type) {
   } catch {}
 }
 
+// ─── Processing list row (shown while jobs are still running) ───────────────
 function JobRow({ job, index, t, onSelectJob }) {
   const { filename, status, current_step, progress, job_id, error,
           queue_reason, queue_retry_in_s } = job;
@@ -21,8 +22,6 @@ function JobRow({ job, index, t, onSelectJob }) {
   const isClickable = (status === "pending_review" || status === "done") && job_id && onSelectJob;
 
   const STEP_LABELS = {
-    // current_step="uploading" is set by processQueueDirect while the
-    // browser PUTs to R2. `progress` carries the upload %.
     uploading: t("batch.step_uploading") || "Subiendo",
     whisper: t("transcribe.title").split(" ")[0] || "Transcribiendo",
     background: t("batch.in_progress"),
@@ -32,24 +31,11 @@ function JobRow({ job, index, t, onSelectJob }) {
     validation: t("batch.validating") || "Validando",
   };
 
-  // Friendly substatus when the upload is being held by capacity
-  // pressure (rate-limit, tenant backlog, server disk). The user
-  // never sees a red error for these — just "waiting" with the
-  // reason. Auto-retry is invisible to them.
   const queueLabel = (() => {
     if (status !== "queued" || !queue_reason) return null;
-    if (queue_reason === "team_backlog") {
-      return t("batch.queue_team_backlog")
-        || "Esperando que se libere un lugar en el equipo. Reintentamos solos en unos segundos.";
-    }
-    if (queue_reason === "server_busy") {
-      return t("batch.queue_server_busy")
-        || `Servidor saturado momentáneamente. Reintentamos automáticamente en ~${queue_retry_in_s || 60}s.`;
-    }
-    if (queue_reason === "rate_limit") {
-      return t("batch.queue_rate_limit")
-        || "Subiendo… reintentamos en unos segundos.";
-    }
+    if (queue_reason === "team_backlog") return t("batch.queue_team_backlog") || "Esperando lugar en el equipo…";
+    if (queue_reason === "server_busy") return t("batch.queue_server_busy") || `Servidor saturado, reintentamos en ~${queue_retry_in_s || 60}s`;
+    if (queue_reason === "rate_limit") return t("batch.queue_rate_limit") || "Subiendo… reintentamos en unos segundos";
     return null;
   })();
 
@@ -61,7 +47,6 @@ function JobRow({ job, index, t, onSelectJob }) {
       } ${isClickable ? "cursor-pointer hover:bg-white/[0.02] hover:ring-1 hover:ring-brand/20" : ""}`}
     >
       <div className="flex items-center gap-3 mb-3">
-        {/* Status icon */}
         <div className={`w-9 h-9 rounded-xl flex items-center justify-center shrink-0 ${
           status === "done" ? "bg-accent/10" :
           status === "pending_review" ? "bg-amber-500/10" :
@@ -69,30 +54,12 @@ function JobRow({ job, index, t, onSelectJob }) {
           status === "processing" ? "bg-brand/10" :
           "bg-surface-3/50"
         }`}>
-          {status === "done" && (
-            <svg className="w-4.5 h-4.5 text-accent" fill="none" stroke="currentColor" strokeWidth="2.5" viewBox="0 0 24 24">
-              <polyline points="20 6 9 17 4 12" />
-            </svg>
-          )}
-          {status === "pending_review" && (
-            <svg className="w-4.5 h-4.5 text-amber-400" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
-              <circle cx="12" cy="12" r="10" /><path d="M12 8v4M12 16h.01" />
-            </svg>
-          )}
-          {(status === "error" || status === "validation_failed") && (
-            <svg className="w-4.5 h-4.5 text-red-400" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
-              <path d="M18 6L6 18M6 6l12 12" />
-            </svg>
-          )}
-          {status === "processing" && (
-            <div className="w-4 h-4 border-2 border-brand border-t-transparent rounded-full animate-spin" />
-          )}
-          {status === "queued" && (
-            <span className="text-xs font-bold text-gray-500">{index + 1}</span>
-          )}
+          {status === "done" && <svg className="w-4.5 h-4.5 text-accent" fill="none" stroke="currentColor" strokeWidth="2.5" viewBox="0 0 24 24"><polyline points="20 6 9 17 4 12" /></svg>}
+          {status === "pending_review" && <svg className="w-4.5 h-4.5 text-amber-400" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10" /><path d="M12 8v4M12 16h.01" /></svg>}
+          {(status === "error" || status === "validation_failed") && <svg className="w-4.5 h-4.5 text-red-400" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24"><path d="M18 6L6 18M6 6l12 12" /></svg>}
+          {status === "processing" && <div className="w-4 h-4 border-2 border-brand border-t-transparent rounded-full animate-spin" />}
+          {status === "queued" && <span className="text-xs font-bold text-gray-500">{index + 1}</span>}
         </div>
-
-        {/* File info */}
         <div className="min-w-0 flex-1">
           <div className="flex items-center gap-1.5 min-w-0">
             <p className="text-sm font-medium text-white truncate">{name}</p>
@@ -104,8 +71,8 @@ function JobRow({ job, index, t, onSelectJob }) {
           </div>
           <p className={`text-[11px] ${queueLabel ? "text-amber-300/80" : "text-gray-500"}`}>
             {status === "done" ? t("dash.completed") :
-             status === "pending_review" ? (t("batch.pending_review") || "Pendiente de aprobacion") :
-             status === "validation_failed" ? (t("batch.validation_failed") || "Validacion fallida") :
+             status === "pending_review" ? (t("batch.pending_review") || "Pendiente de aprobación") :
+             status === "validation_failed" ? (t("batch.validation_failed") || "Validación fallida") :
              status === "error" ? (error || t("dash.error")) :
              status === "processing" ? (
                current_step === "uploading"
@@ -116,43 +83,28 @@ function JobRow({ job, index, t, onSelectJob }) {
              t("batch.queued")}
           </p>
         </div>
-
-        {/* Download buttons for done jobs */}
         {status === "done" && job_id && (
           <div className="flex gap-1.5 shrink-0">
             {["video", "short", "thumbnail"].map((type) => (
               <button
                 key={type}
-                onClick={() => triggerDownload(job_id, type)}
+                onClick={(e) => { e.stopPropagation(); triggerDownload(job_id, type); }}
                 className="w-8 h-8 rounded-lg bg-surface-1 hover:bg-brand/10 flex items-center justify-center text-gray-400 hover:text-brand transition-colors"
                 title={type === "video" ? "Lyric Video" : type === "short" ? "Short" : "Thumbnail"}
               >
-                {type === "video" && (
-                  <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24"><rect x="2" y="2" width="20" height="20" rx="2" /><path d="M10 8l6 4-6 4V8z" /></svg>
-                )}
-                {type === "short" && (
-                  <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24"><rect x="5" y="2" width="14" height="20" rx="2" /><line x1="12" y1="18" x2="12.01" y2="18" /></svg>
-                )}
-                {type === "thumbnail" && (
-                  <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24"><rect x="3" y="3" width="18" height="18" rx="2" /><circle cx="8.5" cy="8.5" r="1.5" /><polyline points="21 15 16 10 5 21" /></svg>
-                )}
+                {type === "video" && <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24"><rect x="2" y="2" width="20" height="20" rx="2" /><path d="M10 8l6 4-6 4V8z" /></svg>}
+                {type === "short" && <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24"><rect x="5" y="2" width="14" height="20" rx="2" /><line x1="12" y1="18" x2="12.01" y2="18" /></svg>}
+                {type === "thumbnail" && <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24"><rect x="3" y="3" width="18" height="18" rx="2" /><circle cx="8.5" cy="8.5" r="1.5" /><polyline points="21 15 16 10 5 21" /></svg>}
               </button>
             ))}
           </div>
         )}
       </div>
-
-      {/* Progress bar for active job */}
       {status === "processing" && (
         <div className="w-full h-1.5 bg-surface-1 rounded-full overflow-hidden">
-          <div
-            className="h-full rounded-full bg-gradient-to-r from-brand to-brand-light transition-all duration-700"
-            style={{ width: `${progress}%` }}
-          />
+          <div className="h-full rounded-full bg-gradient-to-r from-brand to-brand-light transition-all duration-700" style={{ width: `${progress}%` }} />
         </div>
       )}
-
-      {/* Error detail */}
       {status === "error" && error && (
         <div className="mt-2 px-3 py-2 rounded-lg bg-red-500/5 border border-red-500/10">
           <p className="text-[11px] text-red-400/80">{error}</p>
@@ -162,27 +114,205 @@ function JobRow({ job, index, t, onSelectJob }) {
   );
 }
 
+// ─── Approval grid card (shown when all done, REQUIRE_REVIEW=true) ───────────
+function ApprovalCard({ job, t, onSelectJob, onApprove, approving }) {
+  const name = (job.filename || "").replace(/\.(mp3|wav)$/i, "");
+  const thumbSrc = useMediaUrl(job.job_id, "thumbnail", "preview");
+  const isDone = job.status === "done";
+  const isPending = job.status === "pending_review";
+
+  return (
+    <div
+      className={`rounded-card overflow-hidden ring-1 transition-all duration-300 ${
+        isDone
+          ? "ring-accent/40 bg-accent/[0.04]"
+          : isPending
+          ? "ring-white/[0.06] bg-surface-2/40"
+          : "ring-red-500/20 bg-red-500/[0.04]"
+      }`}
+    >
+      {/* Thumbnail */}
+      <div
+        className="aspect-video bg-black/40 relative cursor-pointer group overflow-hidden"
+        onClick={() => job.job_id && onSelectJob?.(job.job_id)}
+      >
+        {thumbSrc ? (
+          <img
+            src={thumbSrc}
+            alt={name}
+            className="w-full h-full object-cover group-hover:scale-[1.03] transition-transform duration-500"
+          />
+        ) : (
+          <div className="w-full h-full flex items-center justify-center">
+            <div className="w-6 h-6 border-2 border-white/20 border-t-white/60 rounded-full animate-spin" />
+          </div>
+        )}
+
+        {/* Status overlay */}
+        <div className="absolute inset-0 bg-gradient-to-t from-black/70 via-transparent to-transparent" />
+        <div className="absolute bottom-2 left-2 right-2 flex items-end justify-between">
+          <p className="text-xs font-semibold text-white truncate">{name}</p>
+          {isDone && (
+            <span className="shrink-0 ml-2 inline-flex items-center gap-1 px-2 py-0.5 rounded-full bg-accent text-white text-[10px] font-semibold">
+              <svg className="w-2.5 h-2.5" fill="none" stroke="currentColor" strokeWidth="3" viewBox="0 0 24 24"><polyline points="20 6 9 17 4 12" /></svg>
+              {t("detail.approved") || "Aprobado"}
+            </span>
+          )}
+          {isPending && (
+            <span className="shrink-0 ml-2 inline-flex items-center gap-1 px-2 py-0.5 rounded-full bg-amber-500/80 text-white text-[10px] font-semibold">
+              {t("batch.pending_review") || "Pendiente"}
+            </span>
+          )}
+        </div>
+
+        {/* Play hint on hover */}
+        {thumbSrc && (
+          <div className="absolute inset-0 flex items-center justify-center opacity-0 group-hover:opacity-100 transition-opacity duration-200">
+            <div className="w-10 h-10 rounded-full bg-black/50 backdrop-blur-sm flex items-center justify-center">
+              <svg className="w-5 h-5 text-white ml-0.5" fill="currentColor" viewBox="0 0 24 24"><path d="M8 5v14l11-7z" /></svg>
+            </div>
+          </div>
+        )}
+      </div>
+
+      {/* Card footer */}
+      <div className="px-3 py-2.5">
+        <p className="text-[11px] text-gray-400 truncate mb-2">{job.artist}</p>
+        {isPending && (
+          <div className="flex gap-1.5">
+            <button
+              onClick={() => onApprove?.(job.job_id)}
+              disabled={approving}
+              className="flex-1 inline-flex items-center justify-center gap-1 h-7 rounded-lg bg-accent/15 text-accent ring-1 ring-accent/30 text-[11px] font-semibold hover:bg-accent/25 transition-colors disabled:opacity-40"
+            >
+              {approving ? (
+                <div className="w-3 h-3 border-2 border-accent border-t-transparent rounded-full animate-spin" />
+              ) : (
+                <>
+                  <svg className="w-3 h-3" fill="none" stroke="currentColor" strokeWidth="2.5" viewBox="0 0 24 24"><polyline points="20 6 9 17 4 12" /></svg>
+                  {t("review.approve") || "Aprobar"}
+                </>
+              )}
+            </button>
+            <button
+              onClick={() => job.job_id && onSelectJob?.(job.job_id)}
+              className="h-7 px-2 rounded-lg text-gray-400 ring-1 ring-white/[0.06] text-[11px] hover:text-white hover:ring-white/[0.12] transition-colors"
+            >
+              {t("detail.back") ? "Ver" : "Ver"}
+            </button>
+          </div>
+        )}
+        {isDone && (
+          <button
+            onClick={() => triggerDownload(job.job_id, "video")}
+            className="w-full inline-flex items-center justify-center gap-1 h-7 rounded-lg text-accent/80 ring-1 ring-accent/20 text-[11px] hover:bg-accent/10 transition-colors"
+          >
+            <svg className="w-3 h-3" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24"><path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4" /><polyline points="7 10 12 15 17 10" /><line x1="12" y1="15" x2="12" y2="3" /></svg>
+            {t("detail.download") || "Descargar"}
+          </button>
+        )}
+      </div>
+    </div>
+  );
+}
+
+// ─── Celebration screen ──────────────────────────────────────────────────────
+function CelebrationScreen({ jobs, total, downloadable, onDownloadAll, onReset, t }) {
+  const [show, setShow] = useState(false);
+
+  // Animate in after a brief delay so the transition from the grid is smooth.
+  useEffect(() => {
+    const tid = setTimeout(() => setShow(true), 80);
+    return () => clearTimeout(tid);
+  }, []);
+
+  // Total batch processing time (earliest created_at → latest completed_at).
+  const batchDurationLabel = (() => {
+    const completedJobs = jobs.filter((j) => j.completed_at && j.created_at);
+    if (completedJobs.length === 0) return null;
+    const start = Math.min(...completedJobs.map((j) => new Date(j.created_at).getTime()));
+    const end = Math.max(...completedJobs.map((j) => new Date(j.completed_at).getTime()));
+    const mins = Math.round((end - start) / 60000);
+    return mins >= 1 ? `${mins} min` : "<1 min";
+  })();
+
+  return (
+    <div className={`text-center transition-all duration-700 ${show ? "opacity-100 translate-y-0" : "opacity-0 translate-y-4"}`}>
+      {/* Glowing icon */}
+      <div className="relative w-20 h-20 mx-auto mb-6">
+        <div className="absolute inset-0 rounded-3xl bg-accent/20 animate-ping" style={{ animationDuration: "2s" }} />
+        <div className="absolute inset-0 rounded-3xl bg-accent/10 animate-ping" style={{ animationDuration: "2.5s", animationDelay: "0.3s" }} />
+        <div className="relative w-20 h-20 rounded-3xl bg-gradient-to-br from-accent/30 to-brand/30 ring-1 ring-accent/40 flex items-center justify-center">
+          <svg className="w-10 h-10 text-accent" fill="none" stroke="currentColor" strokeWidth="1.8" viewBox="0 0 24 24">
+            <path d="M22 11.08V12a10 10 0 11-5.93-9.14" strokeLinecap="round" strokeLinejoin="round"/>
+            <polyline points="22 4 12 14.01 9 11.01" strokeLinecap="round" strokeLinejoin="round"/>
+          </svg>
+        </div>
+      </div>
+
+      <h2 className="text-3xl font-bold tracking-tight mb-2">
+        {total === 1
+          ? (t("batch.celebration_single") || "¡Video listo!")
+          : (t("batch.celebration_batch") || `¡${total} videos aprobados!`)}
+      </h2>
+      <p className="text-gray-400 mb-6">
+        {total === 1
+          ? (t("batch.celebration_sub_single") || "Tu lyric video está aprobado y listo para descargar.")
+          : (t("batch.celebration_sub_batch") || "Todos los videos están aprobados y listos para descargar.")}
+      </p>
+
+      {/* Stats chips */}
+      <div className="flex items-center justify-center gap-3 mb-8 flex-wrap">
+        <div className="px-3 py-1.5 rounded-full bg-surface-2/60 ring-1 ring-white/[0.06] text-xs text-gray-400">
+          <span className="font-semibold text-white">{downloadable}</span> {downloadable === 1 ? "video" : "videos"}
+        </div>
+        <div className="px-3 py-1.5 rounded-full bg-surface-2/60 ring-1 ring-white/[0.06] text-xs text-gray-400">
+          <span className="font-semibold text-white">{downloadable * 3}</span> archivos
+        </div>
+        {batchDurationLabel && (
+          <div className="px-3 py-1.5 rounded-full bg-surface-2/60 ring-1 ring-white/[0.06] text-xs text-gray-400">
+            generado en <span className="font-semibold text-white">{batchDurationLabel}</span>
+          </div>
+        )}
+      </div>
+
+      {/* Actions */}
+      <div className="flex gap-3 justify-center">
+        <button onClick={onDownloadAll} className="btn-primary h-12 px-7 text-sm">
+          <svg className="inline-block w-4 h-4 mr-2 -mt-0.5" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
+            <path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4" /><polyline points="7 10 12 15 17 10" /><line x1="12" y1="15" x2="12" y2="3" />
+          </svg>
+          {t("batch.download_all") || "Descargar todo"} ({downloadable * 3} archivos)
+        </button>
+        <button onClick={onReset} className="btn-secondary h-12 px-6 text-sm">
+          {t("batch.new_batch") || "Nuevo batch"}
+        </button>
+      </div>
+    </div>
+  );
+}
+
+// ─── Main component ──────────────────────────────────────────────────────────
 export default function BatchProgress({ jobs, onReset, onSingleDone, onSelectJob, onBulkApprove }) {
   const { t } = useI18n();
   const [bulkApproving, setBulkApproving] = useState(false);
+  // Per-card approving state: Set of job_ids currently being approved.
+  const [approvingIds, setApprovingIds] = useState(new Set());
 
-  // `done` includes pending_review for the BATCH PROGRESS view ("processing
-  // is finished, awaiting your review"). But `downloadable` only counts jobs
-  // that are actually approved — pending_review jobs are NOT downloadable
-  // until the operator clicks Approve. Mixing the two created a bug where
-  // the user could download a video from the batch screen before approving,
-  // bypassing the review gate entirely (Tomi spotted this on 2026-05-05).
   const done = jobs.filter((j) => j.status === "done" || j.status === "pending_review").length;
   const downloadable = jobs.filter((j) => j.status === "done").length;
   const total = jobs.length;
   const allDone = done === total && !jobs.some((j) => j.status === "processing" || j.status === "queued");
-  const allApproved = downloadable === total && !jobs.some((j) => j.status === "processing" || j.status === "queued");
+  const allApproved = downloadable === total && !jobs.some((j) => j.status === "processing" || j.status === "queued") && total > 0;
   const hasPendingReview = jobs.some((j) => j.status === "pending_review");
   const hasErrors = jobs.some((j) => j.status === "error" || j.status === "validation_failed");
   const isSingle = total === 1;
   const pendingReviewIds = jobs.filter((j) => j.status === "pending_review" && j.job_id).map((j) => j.job_id);
 
-  // Real ETA: average duration of already-completed jobs, fallback 8 min.
+  // Show the approval grid when all done and there are multi-video batches pending.
+  const showApprovalGrid = allDone && !allApproved && total > 1;
+
+  // Real ETA: average duration of completed jobs.
   const etaLabel = (() => {
     if (total - done <= 0) return null;
     const completedMs = jobs
@@ -195,9 +325,7 @@ export default function BatchProgress({ jobs, onReset, onSingleDone, onSelectJob
     return `~${etaMin} ${t("dash.min_remaining") || "min restantes"}`;
   })();
 
-  // Single-song flow: jump straight to JobDetail (review/approve) when the
-  // one job lands in pending_review or done — no need to make the operator
-  // navigate through History to find their video.
+  // Single-song auto-redirect.
   useEffect(() => {
     if (!isSingle || !onSingleDone) return;
     const j = jobs[0];
@@ -223,6 +351,112 @@ export default function BatchProgress({ jobs, onReset, onSingleDone, onSelectJob
     setBulkApproving(false);
   };
 
+  // Per-card individual approve (used in the approval grid).
+  const handleApproveOne = async (jobId) => {
+    if (!onBulkApprove || approvingIds.has(jobId)) return;
+    setApprovingIds((prev) => new Set([...prev, jobId]));
+    await onBulkApprove([jobId]);
+    setApprovingIds((prev) => { const s = new Set(prev); s.delete(jobId); return s; });
+  };
+
+  // ── Celebration screen ────────────────────────────────────────────────────
+  if (allApproved && !isSingle) {
+    return (
+      <div className="w-full max-w-xl mt-12 animate-fade-in">
+        <CelebrationScreen
+          jobs={jobs}
+          total={total}
+          downloadable={downloadable}
+          onDownloadAll={downloadAll}
+          onReset={onReset}
+          t={t}
+        />
+      </div>
+    );
+  }
+
+  // ── Approval grid (multi-video batch, all done, some pending) ─────────────
+  if (showApprovalGrid) {
+    return (
+      <div className="w-full max-w-3xl mt-12 animate-fade-in">
+        {/* Header */}
+        <div className="text-center mb-8">
+          <div className="w-14 h-14 mx-auto mb-4 rounded-2xl bg-amber-500/10 ring-1 ring-amber-500/20 flex items-center justify-center">
+            <svg className="w-7 h-7 text-amber-400" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
+              <path d="M9 11l3 3L22 4M21 12v7a2 2 0 01-2 2H5a2 2 0 01-2-2V5a2 2 0 012-2h11" strokeLinecap="round" strokeLinejoin="round"/>
+            </svg>
+          </div>
+          <h2 className="text-2xl font-bold mb-1">
+            {t("batch.approval_title") || "Revisá y aprobá tus videos"}
+          </h2>
+          <p className="text-gray-500 text-sm">
+            {pendingReviewIds.length === 0
+              ? (t("batch.all_approved_sub") || "Todos aprobados. Podés descargarlos.")
+              : (t("batch.approval_sub") || `${pendingReviewIds.length} de ${total} videos necesitan aprobación`)}
+          </p>
+        </div>
+
+        {/* Approval bar */}
+        {pendingReviewIds.length > 0 && (
+          <div className="mb-6 flex items-center justify-between gap-4">
+            <div className="flex-1">
+              <div className="w-full h-1.5 bg-surface-2 rounded-full overflow-hidden">
+                <div
+                  className="h-full rounded-full bg-gradient-to-r from-accent to-brand transition-all duration-700"
+                  style={{ width: `${(downloadable / total) * 100}%` }}
+                />
+              </div>
+              <p className="text-[11px] text-gray-500 mt-1">{downloadable} de {total} aprobados</p>
+            </div>
+            {onBulkApprove && pendingReviewIds.length > 1 && (
+              <button
+                onClick={handleBulkApprove}
+                disabled={bulkApproving}
+                className="shrink-0 inline-flex items-center gap-1.5 h-9 px-4 rounded-lg bg-accent/15 text-accent ring-1 ring-accent/30 text-xs font-semibold hover:bg-accent/25 transition-colors disabled:opacity-50"
+              >
+                {bulkApproving ? (
+                  <div className="w-3 h-3 border-2 border-accent border-t-transparent rounded-full animate-spin" />
+                ) : (
+                  <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" strokeWidth="2.5" viewBox="0 0 24 24">
+                    <polyline points="20 6 9 17 4 12" />
+                  </svg>
+                )}
+                {t("batch.approve_all") || "Aprobar todos"}
+              </button>
+            )}
+          </div>
+        )}
+
+        {/* Thumbnail grid */}
+        <div className="grid grid-cols-2 sm:grid-cols-3 gap-3 mb-8">
+          {jobs.map((job, i) => (
+            <ApprovalCard
+              key={job.job_id || i}
+              job={job}
+              t={t}
+              onSelectJob={onSelectJob}
+              onApprove={handleApproveOne}
+              approving={approvingIds.has(job.job_id)}
+            />
+          ))}
+        </div>
+
+        <div className="flex gap-3 justify-center">
+          {downloadable > 0 && (
+            <button onClick={downloadAll} className="btn-secondary text-sm">
+              <svg className="inline-block w-4 h-4 mr-1.5 -mt-0.5" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
+                <path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4" /><polyline points="7 10 12 15 17 10" /><line x1="12" y1="15" x2="12" y2="3" />
+              </svg>
+              {t("batch.download_approved") || "Descargar aprobados"} ({downloadable})
+            </button>
+          )}
+          <button onClick={onReset} className="btn-secondary text-sm">{t("batch.new_batch") || "Nuevo batch"}</button>
+        </div>
+      </div>
+    );
+  }
+
+  // ── Processing view (jobs still running) ──────────────────────────────────
   return (
     <div className="w-full max-w-xl mt-12 animate-fade-in">
       {/* Header */}
@@ -260,7 +494,7 @@ export default function BatchProgress({ jobs, onReset, onSingleDone, onSelectJob
         )}
       </div>
 
-      {/* Overall progress */}
+      {/* Overall progress bar */}
       {!allDone && (
         <div className="mb-6">
           <div className="w-full h-2 bg-surface-2 rounded-full overflow-hidden">
@@ -279,14 +513,14 @@ export default function BatchProgress({ jobs, onReset, onSingleDone, onSelectJob
         ))}
       </div>
 
-      {/* Pending-review panel — shown when batch finished but jobs await approval. */}
-      {allDone && hasPendingReview && (
+      {/* Single pending_review notice (single-song or mixed state) */}
+      {allDone && hasPendingReview && !showApprovalGrid && (
         <div className="mb-4 rounded-2xl bg-amber-500/5 border border-amber-500/20 overflow-hidden">
           <div className="px-4 py-3 flex items-center justify-between gap-3">
             <p className="text-xs text-amber-300/90 flex-1">
               {pendingReviewIds.length === 1
                 ? (t("batch.pending_review_notice_one") || "Un video espera tu aprobación. Hacé click en la card para revisarlo.")
-                : (t("batch.pending_review_notice") || `${pendingReviewIds.length} videos esperan aprobación. Revisá cada card o aprobá todos de una vez.`)}
+                : (t("batch.pending_review_notice") || `${pendingReviewIds.length} videos esperan aprobación.`)}
             </p>
             {pendingReviewIds.length > 1 && onBulkApprove && (
               <button
@@ -294,13 +528,9 @@ export default function BatchProgress({ jobs, onReset, onSingleDone, onSelectJob
                 disabled={bulkApproving}
                 className="shrink-0 inline-flex items-center gap-1.5 h-8 px-3 rounded-lg bg-accent/15 text-accent ring-1 ring-accent/30 text-[11px] font-semibold hover:bg-accent/25 transition-colors disabled:opacity-50"
               >
-                {bulkApproving ? (
-                  <div className="w-3 h-3 border-2 border-accent border-t-transparent rounded-full animate-spin" />
-                ) : (
-                  <svg className="w-3 h-3" fill="none" stroke="currentColor" strokeWidth="2.5" viewBox="0 0 24 24">
-                    <polyline points="20 6 9 17 4 12" />
-                  </svg>
-                )}
+                {bulkApproving
+                  ? <div className="w-3 h-3 border-2 border-accent border-t-transparent rounded-full animate-spin" />
+                  : <svg className="w-3 h-3" fill="none" stroke="currentColor" strokeWidth="2.5" viewBox="0 0 24 24"><polyline points="20 6 9 17 4 12" /></svg>}
                 {t("batch.approve_all") || "Aprobar todos"}
               </button>
             )}

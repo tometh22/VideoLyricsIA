@@ -60,11 +60,19 @@ const UMG_PROFILES = [
   { code: "5", label: "ProRes 4444 XQ" },
 ];
 
+const STYLES = [
+  { code: "oscuro",  label: "Dark / Cinematográfico",  icon: "🎬" },
+  { code: "neon",    label: "Neon / Vibrante",          icon: "⚡" },
+  { code: "minimal", label: "Minimal / Limpio",         icon: "◻" },
+];
+
 export default function UploadZone({
   files,
   onFiles,
   delivery,
   onDeliveryChange,
+  style = "oscuro",
+  onStyleChange,
   backgroundFile,
   onBackgroundFile,
   backgroundId,
@@ -1060,6 +1068,33 @@ export default function UploadZone({
         {_dropZone}
         {_filesBlock}
         {_bgBlock}
+        {/* Visual style selector — batch-wide. Maps to pipeline.py's
+            _GRADIENT_PALETTES (oscuro / neon / minimal). Shown only once
+            a file is in the batch so the empty state stays clean. */}
+        {files.length > 0 && onStyleChange && (
+          <div className="rounded-card bg-surface-2/40 ring-1 ring-white/[0.04] px-4 py-3">
+            <p className="text-[10px] uppercase tracking-[0.18em] text-gray-500 mb-2">
+              Estilo visual
+            </p>
+            <div className="flex gap-2">
+              {STYLES.map((s) => (
+                <button
+                  key={s.code}
+                  type="button"
+                  onClick={() => onStyleChange(s.code)}
+                  className={`flex-1 flex flex-col items-center gap-1 px-3 py-2.5 rounded-xl border text-[11px] font-medium transition-all duration-200
+                    ${style === s.code
+                      ? "bg-brand/15 border-brand/50 text-white ring-1 ring-brand/40"
+                      : "border-white/[0.06] text-gray-400 hover:border-white/[0.16] hover:text-white"
+                    }`}
+                >
+                  <span className="text-lg leading-none">{s.icon}</span>
+                  <span className="truncate w-full text-center">{s.label}</span>
+                </button>
+              ))}
+            </div>
+          </div>
+        )}
         {/* Delivery selector — broadcast (ProRes) profiles are gated by
             user.features.prores_export. Non-eligible users get a silent
             default of MP4/YouTube, which is what `delivery_profile` is

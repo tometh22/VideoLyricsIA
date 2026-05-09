@@ -258,7 +258,7 @@ export default function App() {
     umg_fps: 24,
     umg_prores_profile: 3,
   });
-  const style = "oscuro";
+  const [style, setStyle] = useState("oscuro");
 
   const [reviewQueue, setReviewQueue] = useState([]);
   const [currentReview, setCurrentReview] = useState(null);
@@ -942,6 +942,8 @@ export default function App() {
         onFiles={setFiles}
         delivery={delivery}
         onDeliveryChange={setDelivery}
+        style={style}
+        onStyleChange={setStyle}
         backgroundFile={backgroundFile}
         onBackgroundFile={setBackgroundFile}
         backgroundId={backgroundId}
