@@ -31,7 +31,7 @@ if _SENTRY_DSN:
         release=os.environ.get("SENTRY_RELEASE", "genly@2.0.0"),
     )
 
-from fastapi import FastAPI, File, Form, Query, UploadFile, HTTPException, Depends, Request
+from fastapi import FastAPI, File, Form, Query, UploadFile, HTTPException, Depends, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, RedirectResponse, StreamingResponse
 from pydantic import BaseModel
@@ -1054,10 +1054,460 @@ def _parse_umg_params(
     }
 
 
+# ---------------------------------------------------------------------------
+# Direct-to-R2 upload (presigned PUT) — primary flow as of PR #24.
+#
+# The browser PUTs the audio body straight to R2 using a presigned URL the
+# API generates here. The API container never sees the bytes, which:
+#
+#   1. Decouples the API memory footprint from upload size — the lossless
+#      WAV OOM path that motivated PR #23 disappears entirely.
+#   2. Frees uvicorn workers from holding the connection open for the
+#      slow upload (a 50 MB WAV at 1 MB/s used to tie up a worker for 50
+#      seconds; now /upload-url returns in ~10 ms).
+#   3. Lets us add R2 multipart uploads for resumability / parallelism
+#      without further backend churn.
+#
+# Multipart kicks in for files above _MULTIPART_THRESHOLD_BYTES (16 MB by
+# default) — under that, single-PUT is simpler and fast enough.
+#
+# The legacy multipart-form endpoints (/upload, /transcribe with file body)
+# stay around as deprecated fallbacks for direct API callers; the frontend
+# uses the presigned flow exclusively.
+# ---------------------------------------------------------------------------
+
+# Threshold above which the frontend should switch to multipart upload.
+# Single-PUT is simpler but a connection drop wastes the entire transfer;
+# multipart lets us retry just the failed part.
+_MULTIPART_THRESHOLD_BYTES = int(
+    os.environ.get("MULTIPART_THRESHOLD_BYTES", str(16 * 1024 * 1024))
+)
+# Max size of a single multipart part. R2 accepts up to 5 GB / part but
+# 8 MB is a healthy sweet spot for browser parallelism + retry granularity.
+_MULTIPART_PART_SIZE_BYTES = int(
+    os.environ.get("MULTIPART_PART_SIZE_BYTES", str(8 * 1024 * 1024))
+)
+_PRESIGN_PUT_TTL_S = int(os.environ.get("PRESIGN_PUT_TTL_S", "900"))
+
+
+class _UploadUrlReq(BaseModel):
+    filename: str
+    content_type: str = ""
+    size_bytes: int = 0
+    artist: str = ""
+    title: str = ""
+
+
+def _validate_audio_filename_only(filename: str) -> None:
+    """Cheap pre-flight check: just the extension. The full magic-bytes
+    check happens after the bytes land on R2 / disk via the existing
+    `_validate_audio_file_on_disk`."""
+    if not filename:
+        raise HTTPException(status_code=400, detail="Missing filename.")
+    if not filename.lower().endswith(_AUDIO_EXTENSIONS):
+        raise HTTPException(
+            status_code=400,
+            detail="Only MP3 and WAV files are accepted.",
+        )
+
+
+@app.post("/upload-url")
+@limiter.limit("120/minute")
+async def upload_url(
+    request: Request,
+    body: _UploadUrlReq,
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Mint a presigned PUT URL for a single-shot direct-to-R2 upload.
+
+    Returns:
+        {
+          "job_id": "...",
+          "upload_url": "https://...",
+          "key": "inputs/<tenant>/<job>/<filename>",
+          "expires_in": 900,
+          "use_multipart": false,
+          "part_size": 8388608,    # only meaningful when use_multipart=true
+        }
+
+    When `size_bytes` indicates a body above _MULTIPART_THRESHOLD_BYTES,
+    use_multipart is True and `upload_url` is null — the browser must
+    fall through to /upload-multipart-init for the per-part presigning
+    machinery.
+    """
+    _validate_audio_filename_only(body.filename)
+    if body.size_bytes and body.size_bytes > MAX_UPLOAD_MB * 1024 * 1024:
+        raise HTTPException(
+            status_code=413,
+            detail=f"File too large (>{MAX_UPLOAD_MB} MB).",
+        )
+
+    # Disk gate is informational here: the bytes never touch local disk
+    # during upload. We still enforce it so a downstream /transcribe-
+    # uploaded run won't ENOSPC on Whisper temp files. Memory pressure
+    # gate is intentionally NOT applied — a presigned URL costs ~0 bytes
+    # of API memory.
+    _enforce_plan_quota(db, current_user)
+    _enforce_daily_volume_cap(db, current_user)
+    _enforce_tenant_backlog(db, current_user)
+    _enforce_disk_capacity()
+
+    if not storage.is_enabled():
+        raise HTTPException(
+            status_code=503,
+            detail="Direct-to-R2 uploads require object storage. Configure R2_* env vars.",
+        )
+
+    artist_form = (body.artist or "").strip()
+    title_form = (body.title or "").strip()
+    parsed_artist, parsed_title = _parse_filename_artist_title(body.filename)
+    job_artist = artist_form or parsed_artist or "Unknown"
+    job_song_title = title_form or parsed_title
+
+    job_id = create_job(
+        db,
+        artist=job_artist,
+        style="oscuro",                # set for real on /generate
+        filename=body.filename,
+        user_id=current_user["id"],
+        tenant_id=current_user["tenant_id"],
+        delivery_profile="youtube",    # set for real on /generate
+        initial_status="awaiting_upload",
+        song_title=job_song_title,
+    )
+
+    use_multipart = (
+        body.size_bytes > 0 and body.size_bytes >= _MULTIPART_THRESHOLD_BYTES
+    )
+    response = {
+        "job_id": job_id,
+        "key": _input_object_key_for_job(
+            current_user["tenant_id"], job_id, body.filename,
+        ),
+        "expires_in": _PRESIGN_PUT_TTL_S,
+        "use_multipart": use_multipart,
+        "part_size": _MULTIPART_PART_SIZE_BYTES,
+        "upload_url": None,
+    }
+    if not use_multipart:
+        signed = storage.presign_put_url(
+            current_user["tenant_id"], job_id, body.filename,
+            content_type=body.content_type or None,
+            expiry_seconds=_PRESIGN_PUT_TTL_S,
+        )
+        if not signed:
+            raise HTTPException(
+                status_code=503,
+                detail="Could not sign upload URL.",
+            )
+        response["upload_url"] = signed["url"]
+        response["key"] = signed["key"]
+        # Persist the key now so /transcribe-uploaded can find it without
+        # re-deriving (which would reject if the filename gets sanitized
+        # differently between calls).
+        from jobs import get_job_model
+        job_row = get_job_model(db, job_id)
+        if job_row:
+            job_row.input_r2_key = signed["key"]
+            db.commit()
+    return response
+
+
+def _input_object_key_for_job(tenant_id: str, job_id: str, filename: str) -> str:
+    """Public-facing wrapper around storage._input_object_key — the
+    underscore prefix on the storage helper signals intent (private),
+    but the API surface needs the same key."""
+    return storage._input_object_key(tenant_id, job_id, filename)
+
+
+class _MultipartInitReq(BaseModel):
+    job_id: str
+    filename: str
+    content_type: str = ""
+
+
+@app.post("/upload-multipart-init")
+@limiter.limit("60/minute")
+async def upload_multipart_init(
+    request: Request,
+    body: _MultipartInitReq,
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Begin a multipart upload for a job that was created via /upload-url
+    with use_multipart=true. Returns the upload_id and key the browser
+    needs to start signing parts."""
+    _validate_audio_filename_only(body.filename)
+    from jobs import get_job_model
+    job_row = get_job_model(db, body.job_id)
+    if (not job_row
+            or job_row.user_id != current_user["id"]
+            or job_row.tenant_id != current_user["tenant_id"]):
+        raise HTTPException(status_code=404, detail="Job not found.")
+    if job_row.status != "awaiting_upload":
+        raise HTTPException(
+            status_code=409,
+            detail=f"Job is in state {job_row.status!r}, not awaiting_upload.",
+        )
+    if job_row.multipart_upload_id:
+        # Idempotent: return the existing upload_id so a flaky frontend
+        # retry doesn't create two parallel multipart uploads (which would
+        # leave one orphaned in R2 storage).
+        return {
+            "upload_id": job_row.multipart_upload_id,
+            "key": job_row.input_r2_key,
+            "part_size": _MULTIPART_PART_SIZE_BYTES,
+            "presign_ttl_s": _PRESIGN_PUT_TTL_S,
+        }
+    if not storage.is_enabled():
+        raise HTTPException(status_code=503, detail="Object storage not configured.")
+    init = storage.multipart_init(
+        current_user["tenant_id"], body.job_id, body.filename,
+        content_type=body.content_type or None,
+    )
+    if not init:
+        raise HTTPException(status_code=503, detail="Could not initiate multipart upload.")
+    job_row.input_r2_key = init["key"]
+    job_row.multipart_upload_id = init["upload_id"]
+    db.commit()
+    return {
+        "upload_id": init["upload_id"],
+        "key": init["key"],
+        "part_size": _MULTIPART_PART_SIZE_BYTES,
+        "presign_ttl_s": _PRESIGN_PUT_TTL_S,
+    }
+
+
+class _MultipartPartReq(BaseModel):
+    job_id: str
+    part_number: int
+
+
+@app.post("/upload-multipart-part-url")
+@limiter.limit("600/minute")
+async def upload_multipart_part_url(
+    request: Request,
+    body: _MultipartPartReq,
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Sign one part of a multipart upload. The frontend calls this
+    once per part; PUTs the bytes against the returned URL; reads the
+    `ETag` response header; submits {part_number, etag} back via
+    /upload-multipart-complete."""
+    if body.part_number < 1 or body.part_number > 10_000:
+        raise HTTPException(status_code=400, detail="part_number out of range")
+    from jobs import get_job_model
+    job_row = get_job_model(db, body.job_id)
+    if (not job_row
+            or job_row.user_id != current_user["id"]
+            or job_row.tenant_id != current_user["tenant_id"]):
+        raise HTTPException(status_code=404, detail="Job not found.")
+    if job_row.status != "awaiting_upload" or not job_row.multipart_upload_id:
+        raise HTTPException(
+            status_code=409,
+            detail="Job is not in an active multipart upload.",
+        )
+    url = storage.multipart_presign_part(
+        job_row.input_r2_key, job_row.multipart_upload_id,
+        body.part_number, expiry_seconds=_PRESIGN_PUT_TTL_S,
+    )
+    if not url:
+        raise HTTPException(status_code=503, detail="Could not sign part URL.")
+    return {"url": url, "expires_in": _PRESIGN_PUT_TTL_S}
+
+
+class _MultipartCompleteReq(BaseModel):
+    job_id: str
+    parts: list  # list of {"part_number": int, "etag": str}
+
+
+@app.post("/upload-multipart-complete")
+@limiter.limit("60/minute")
+async def upload_multipart_complete(
+    request: Request,
+    body: _MultipartCompleteReq,
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Finalize a multipart upload. Once R2 stitches the parts, the job
+    stays in awaiting_upload until /transcribe-uploaded promotes it."""
+    from jobs import get_job_model
+    job_row = get_job_model(db, body.job_id)
+    if (not job_row
+            or job_row.user_id != current_user["id"]
+            or job_row.tenant_id != current_user["tenant_id"]):
+        raise HTTPException(status_code=404, detail="Job not found.")
+    if job_row.status != "awaiting_upload" or not job_row.multipart_upload_id:
+        raise HTTPException(
+            status_code=409,
+            detail="Job is not in an active multipart upload.",
+        )
+    parts_payload = []
+    for p in body.parts:
+        try:
+            part_no = int(p.get("part_number"))
+            etag = str(p.get("etag") or "").strip().strip('"')
+        except (AttributeError, TypeError, ValueError):
+            raise HTTPException(status_code=400, detail="Invalid part format.")
+        if not etag:
+            raise HTTPException(status_code=400, detail="Part etag missing.")
+        parts_payload.append({"PartNumber": part_no, "ETag": f'"{etag}"'})
+    try:
+        storage.multipart_complete(
+            job_row.input_r2_key, job_row.multipart_upload_id, parts_payload,
+        )
+    except Exception as e:
+        raise HTTPException(
+            status_code=502,
+            detail=f"R2 multipart_complete failed: {e}",
+        )
+    # Clear the upload_id so the row is recognisably "complete" but
+    # input_r2_key + status still need /transcribe-uploaded.
+    job_row.multipart_upload_id = None
+    db.commit()
+    return {"job_id": body.job_id, "key": job_row.input_r2_key}
+
+
+class _MultipartAbortReq(BaseModel):
+    job_id: str
+
+
+@app.post("/upload-multipart-abort")
+@limiter.limit("30/minute")
+async def upload_multipart_abort(
+    request: Request,
+    body: _MultipartAbortReq,
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """User cancelled the upload. Tell R2 to garbage-collect the parts
+    and drop the Job row. Idempotent — calling twice is fine."""
+    from jobs import get_job_model
+    job_row = get_job_model(db, body.job_id)
+    if (not job_row
+            or job_row.user_id != current_user["id"]
+            or job_row.tenant_id != current_user["tenant_id"]):
+        return {"ok": True}  # idempotent
+    if job_row.multipart_upload_id and job_row.input_r2_key:
+        storage.multipart_abort(job_row.input_r2_key, job_row.multipart_upload_id)
+    if job_row.status == "awaiting_upload":
+        db.delete(job_row)
+        db.commit()
+    return {"ok": True}
+
+
+class _TranscribeUploadedReq(BaseModel):
+    job_id: str
+    language: str = ""
+    artist: str = ""
+    title: str = ""
+
+
+@app.post("/transcribe-uploaded")
+@limiter.limit("60/minute")
+async def transcribe_uploaded(
+    request: Request,
+    body: _TranscribeUploadedReq,
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Promote an awaiting_upload job to transcribed_pending, downloading
+    the audio from R2 to local disk for Whisper / lrclib lookup.
+
+    Returns the same shape as the legacy /transcribe (segments,
+    reference_lyrics, plus job_id) so the frontend's editor flow
+    plugs in unchanged.
+    """
+    from jobs import get_job_model
+    job_row = get_job_model(db, body.job_id)
+    if (not job_row
+            or job_row.user_id != current_user["id"]
+            or job_row.tenant_id != current_user["tenant_id"]):
+        raise HTTPException(status_code=404, detail="Job not found.")
+    if job_row.status not in ("awaiting_upload", "transcribed_pending"):
+        raise HTTPException(
+            status_code=409,
+            detail=f"Job is in state {job_row.status!r}, cannot transcribe.",
+        )
+    if job_row.multipart_upload_id:
+        raise HTTPException(
+            status_code=409,
+            detail="Multipart upload not completed yet.",
+        )
+    if not job_row.input_r2_key:
+        raise HTTPException(
+            status_code=409,
+            detail="Job has no associated upload.",
+        )
+
+    _enforce_disk_capacity()
+    _enforce_memory_pressure()
+
+    # Materialize the audio onto local disk for Whisper / ffmpeg / etc.
+    job_id = body.job_id
+    job_dir = os.path.join(OUTPUTS_DIR, job_id)
+    os.makedirs(job_dir, exist_ok=True)
+    audio_path = os.path.join(job_dir, job_row.filename)
+
+    if not os.path.exists(audio_path):
+        ok = storage.download_object(job_row.input_r2_key, audio_path)
+        if not ok:
+            raise HTTPException(
+                status_code=502,
+                detail=f"Could not fetch upload from object storage ({job_row.input_r2_key}).",
+            )
+    _validate_audio_file_on_disk(job_row.filename, audio_path)
+
+    # Reuse the existing Whisper / lrclib machinery from the legacy
+    # /transcribe handler. Keeping the implementation in one place via
+    # the helper below means the lyrics-recovery / hallucination logic
+    # stays in lockstep with the legacy fallback.
+    job_row.status = "transcribed_pending"
+    job_row.current_step = "editing"
+    db.commit()
+
+    return await _run_transcription_for_job(
+        request, db, current_user, job_id, audio_path,
+        language=body.language, artist=body.artist, title=body.title,
+    )
+
+
+# Deprecation metadata for the legacy multipart-form endpoints. RFC 8594
+# `Sunset` + RFC 9745 `Deprecation` so any tooling that monitors the API
+# (curl scripts, custom clients) gets a structured signal. Frontend now
+# uses /upload-url + /transcribe-uploaded.
+_DEPRECATION_DATE = "2026-08-01"  # mid-target removal
+_DEPRECATION_HEADERS = {
+    # Deprecation: signed integer (epoch seconds, or "true" per draft)
+    "Deprecation": "true",
+    "Sunset": "Mon, 01 Aug 2026 00:00:00 GMT",
+    "Link": (
+        '</docs/upload-url>; rel="successor-version", '
+        '</docs/upload-url>; rel="deprecation"'
+    ),
+}
+
+
+def _set_deprecation_headers(response: Response, endpoint: str) -> None:
+    """Attach deprecation headers + log once per request so we can grep
+    Sentry / Railway logs to find any remaining legacy callers before
+    the sunset date."""
+    for k, v in _DEPRECATION_HEADERS.items():
+        response.headers[k] = v
+    logger.warning(
+        "[DEPRECATED] %s called — sunset %s. Use the presigned-R2 flow "
+        "(/upload-url + /transcribe-uploaded) instead.",
+        endpoint, _DEPRECATION_DATE,
+    )
+
+
 @app.post("/upload")
 @limiter.limit("120/minute")
 async def upload(
     request: Request,
+    response: Response,
     file: UploadFile = File(...),
     artist: str = Form(...),
     song_title: str = Form(""),
@@ -1077,7 +1527,13 @@ async def upload(
     current_user: dict = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
-    """Receive an MP3 and start processing."""
+    """Receive an MP3 and start processing.
+
+    DEPRECATED: prefer POST /upload-url (presigned-R2 flow). This endpoint
+    still works for direct-API callers but the API container now bears
+    the upload memory + bandwidth cost. Removal: 2026-08-01.
+    """
+    _set_deprecation_headers(response, "/upload")
     if not file.filename:
         raise HTTPException(status_code=400, detail="Missing filename.")
     name_lower = file.filename.lower()
@@ -1211,6 +1667,7 @@ async def upload(
 @limiter.limit("20/minute")
 async def transcribe_endpoint(
     request: Request,
+    response: Response,
     file: UploadFile = File(...),
     language: str = Form(""),
     artist: str = Form(""),
@@ -1220,13 +1677,12 @@ async def transcribe_endpoint(
 ):
     """Transcribe an MP3 or WAV and return segments for review/editing.
 
-    Persists the uploaded audio to OUTPUTS_DIR/<job_id>/<filename> and (if R2
-    is enabled) to R2, and creates a Job row in `transcribed_pending` state.
-    Returns the job_id alongside the segments so the editor can call
-    /generate without re-uploading the file. The previous flow re-read the
-    same WAV twice (transcribe + generate) and OOMed the API container on
-    lossless uploads.
+    DEPRECATED: prefer the presigned-R2 flow (/upload-url +
+    /transcribe-uploaded). This endpoint still works but the audio body
+    flows through the API container, defeating the OOM fix. Removal:
+    2026-08-01.
     """
+    _set_deprecation_headers(response, "/transcribe")
     if not file.filename.lower().endswith(_AUDIO_EXTENSIONS):
         raise HTTPException(status_code=400, detail="Only MP3 and WAV files are accepted.")
 
@@ -1286,6 +1742,31 @@ async def transcribe_endpoint(
     # Per-request scratch dir for intermediate slices (intro/body cuts).
     # The main audio file lives under job_dir and stays around until
     # /generate enqueues it (or the reaper cleans it up).
+    return await _run_transcription_for_job(
+        request, db, current_user, job_id, audio_path,
+        language=language, artist=artist, title=title,
+        filename=file.filename,
+    )
+
+
+async def _run_transcription_for_job(
+    request, db, current_user, job_id: str, audio_path: str,
+    *, language: str = "", artist: str = "", title: str = "",
+    filename: str = "",
+):
+    """Shared transcription pipeline: lrclib synced/plain → Whisper →
+    hallucination recovery → segments. Used by both /transcribe (legacy
+    multipart upload) and /transcribe-uploaded (presigned-R2 path).
+
+    Returns the standard `{job_id, segments, reference_lyrics, ...}`
+    dict. Cleans up its own scratch dir but never touches `audio_path`
+    (caller owns that file)."""
+    import tempfile
+    import asyncio
+
+    if not filename:
+        filename = os.path.basename(audio_path)
+
     tmp_dir = tempfile.mkdtemp()
     tmp_path = audio_path
 
@@ -1300,7 +1781,7 @@ async def transcribe_endpoint(
         #   3) bare filename as title with no artist (Gemini-search will be
         #      skipped — see the empty-artist guard inside the fetcher).
         # Suffixes like "(Official Video)" are scrubbed in either case.
-        basename = os.path.splitext(file.filename)[0]
+        basename = os.path.splitext(filename)[0]
         artist_hint = artist.strip()
         song_hint = title.strip() or basename
         if not artist_hint and " - " in basename:
@@ -1310,7 +1791,7 @@ async def transcribe_endpoint(
                      "- River Plate", "- Luna Park", "- En Vivo"]:
             song_hint = song_hint.replace(sfx, "").strip()
         if not artist_hint:
-            print(f"[LYRICS] no artist supplied for {file.filename!r} — "
+            print(f"[LYRICS] no artist supplied for {filename!r} — "
                   f"Gemini fetch will be skipped, falling through to lyrics.ovh")
 
         # Fast-path: lrclib.net often has synced (LRC) lyrics for popular
@@ -1790,19 +2271,39 @@ async def generate_with_segments(
     reuse = bool(job_id)
 
     if reuse:
-        # Reuse path: verify the transcribed_pending job belongs to caller
-        # and pull the audio path / R2 key from the row.
+        # Reuse path: verify the job belongs to caller and pull the audio
+        # path / R2 key from the row. Two valid entry states:
+        #   - transcribed_pending: editor flow (segments came from
+        #     /transcribe-uploaded; segments_json carries the user-edited
+        #     timings).
+        #   - awaiting_upload: direct-generate flow (no editor;
+        #     segments_json is "[]" so the worker runs Whisper itself
+        #     against the audio that already landed in R2).
         from jobs import get_job_model
         job_row = get_job_model(db, job_id)
         if (not job_row
                 or job_row.user_id != current_user["id"]
                 or job_row.tenant_id != current_user["tenant_id"]):
             raise HTTPException(status_code=404, detail="Job not found.")
-        if job_row.status != "transcribed_pending":
+        if job_row.status not in ("transcribed_pending", "awaiting_upload"):
             raise HTTPException(
                 status_code=409,
-                detail=f"Job is in state {job_row.status!r}, not transcribed_pending.",
+                detail=f"Job is in state {job_row.status!r}, cannot generate.",
             )
+        if job_row.status == "awaiting_upload":
+            # Direct-generate path. The R2 PUT must be finished (no
+            # in-flight multipart) and the key must be recorded — without
+            # those, the worker has nothing to fetch.
+            if job_row.multipart_upload_id:
+                raise HTTPException(
+                    status_code=409,
+                    detail="Multipart upload not completed yet.",
+                )
+            if not job_row.input_r2_key:
+                raise HTTPException(
+                    status_code=409,
+                    detail="Job has no associated upload.",
+                )
         existing_filename = job_row.filename
         existing_input_r2_key = job_row.input_r2_key
     else:

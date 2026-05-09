@@ -1,0 +1,25 @@
+{
+  "CORSRules": [
+    {
+      "ID": "genly-presigned-uploads",
+      "AllowedOrigins": [
+        "https://genly.pro",
+        "https://www.genly.pro",
+        "http://localhost:5173",
+        "http://localhost:3000"
+      ],
+      "AllowedMethods": ["GET", "PUT", "HEAD"],
+      "AllowedHeaders": [
+        "Authorization",
+        "Content-Type",
+        "Content-Length",
+        "Content-MD5",
+        "x-amz-content-sha256",
+        "x-amz-date",
+        "x-amz-security-token"
+      ],
+      "ExposeHeaders": ["ETag"],
+      "MaxAgeSeconds": 3000
+    }
+  ]
+}
