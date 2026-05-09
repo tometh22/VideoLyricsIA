@@ -3231,6 +3231,78 @@ async def reject_job(
     return {"ok": True, "status": "rejected", "job_id": job_id}
 
 
+@app.post("/retry/{job_id}")
+async def retry_job(
+    job_id: str,
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Re-enqueue a failed or validation_failed job using the audio still stored
+    in R2. Avoids forcing the user to re-upload a 30-50 MB WAV. Only allowed
+    when the job is in an unrecoverable terminal state (error or
+    validation_failed) and the source audio is still available in object
+    storage (input_r2_key is set and the object exists)."""
+    from database import Job as JobModel, AuditLog
+
+    job = (
+        db.query(JobModel)
+        .filter(JobModel.job_id == job_id)
+        .filter(JobModel.tenant_id == current_user["tenant_id"])
+        .first()
+    )
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+    if job.status not in ("error", "validation_failed"):
+        raise HTTPException(
+            status_code=400,
+            detail=f"Job cannot be retried from status '{job.status}'. "
+                   "Only 'error' and 'validation_failed' jobs are retryable.",
+        )
+    if not job.input_r2_key:
+        raise HTTPException(
+            status_code=422,
+            detail="Source audio no longer available — please upload the file again.",
+        )
+
+    # Reset job to initial processing state before re-enqueueing.
+    job.status = "processing"
+    job.current_step = "whisper"
+    job.progress = 0
+    job.error = None
+    job.validation_result = None
+    job.video_url = None
+    job.short_url = None
+    job.thumbnail_url = None
+    job.umg_master_url = None
+    job.umg_short_url = None
+    job.s3_keys = None
+    job.completed_at = None
+    job.approved_by = None
+    job.approved_at = None
+
+    db.add(AuditLog(
+        user_id=current_user["id"],
+        action="job.retry",
+        detail={"job_id": job_id, "previous_status": job.status},
+    ))
+    db.commit()
+
+    umg_spec = job.umg_spec or {}
+    enqueue_pipeline(
+        job_id=job_id,
+        mp3_path=None,
+        artist=job.artist,
+        style=job.style or "oscuro",
+        plan=current_user.get("plan", "100"),
+        delivery_profile=job.delivery_profile or "youtube",
+        input_r2_key=job.input_r2_key,
+        song_title=job.song_title or "",
+        umg_spec=umg_spec,
+    )
+
+    return {"ok": True, "status": "processing", "job_id": job_id}
+
+
 # ---------------------------------------------------------------------------
 # Settings
 # ---------------------------------------------------------------------------

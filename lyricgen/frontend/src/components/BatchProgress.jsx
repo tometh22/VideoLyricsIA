@@ -1,4 +1,4 @@
-import { useEffect } from "react";
+import { useEffect, useState } from "react";
 import { useI18n } from "../i18n";
 import { getDownloadUrl } from "../mediaUrl";
 
@@ -162,8 +162,10 @@ function JobRow({ job, index, t, onSelectJob }) {
   );
 }
 
-export default function BatchProgress({ jobs, onReset, onSingleDone, onSelectJob }) {
+export default function BatchProgress({ jobs, onReset, onSingleDone, onSelectJob, onBulkApprove }) {
   const { t } = useI18n();
+  const [bulkApproving, setBulkApproving] = useState(false);
+
   // `done` includes pending_review for the BATCH PROGRESS view ("processing
   // is finished, awaiting your review"). But `downloadable` only counts jobs
   // that are actually approved — pending_review jobs are NOT downloadable
@@ -178,6 +180,20 @@ export default function BatchProgress({ jobs, onReset, onSingleDone, onSelectJob
   const hasPendingReview = jobs.some((j) => j.status === "pending_review");
   const hasErrors = jobs.some((j) => j.status === "error" || j.status === "validation_failed");
   const isSingle = total === 1;
+  const pendingReviewIds = jobs.filter((j) => j.status === "pending_review" && j.job_id).map((j) => j.job_id);
+
+  // Real ETA: average duration of already-completed jobs, fallback 8 min.
+  const etaLabel = (() => {
+    if (total - done <= 0) return null;
+    const completedMs = jobs
+      .filter((j) => (j.status === "done" || j.status === "pending_review") && j.completed_at && j.created_at)
+      .map((j) => new Date(j.completed_at) - new Date(j.created_at));
+    const avgMin = completedMs.length > 0
+      ? completedMs.reduce((a, b) => a + b, 0) / completedMs.length / 60000
+      : 8;
+    const etaMin = Math.max(1, Math.ceil((total - done) * avgMin));
+    return `~${etaMin} ${t("dash.min_remaining") || "min restantes"}`;
+  })();
 
   // Single-song flow: jump straight to JobDetail (review/approve) when the
   // one job lands in pending_review or done — no need to make the operator
@@ -198,6 +214,13 @@ export default function BatchProgress({ jobs, onReset, onSingleDone, onSelectJob
         await triggerDownload(job.job_id, type);
       }
     }
+  };
+
+  const handleBulkApprove = async () => {
+    if (!onBulkApprove || pendingReviewIds.length === 0 || bulkApproving) return;
+    setBulkApproving(true);
+    await onBulkApprove(pendingReviewIds);
+    setBulkApproving(false);
   };
 
   return (
@@ -230,7 +253,7 @@ export default function BatchProgress({ jobs, onReset, onSingleDone, onSelectJob
                 ? (t("batch.single_generating_sub") || "Te avisamos cuando esté listo")
                 : <>
                     {done} {t("dash.monthly_of")} {total} {t("batch.completed_of")}
-                    {total - done > 0 && <span className="text-gray-600"> — ~{(total - done) * 5} {t("dash.min_remaining")}</span>}
+                    {etaLabel && <span className="text-gray-600"> — {etaLabel}</span>}
                   </>}
             </p>
           </>
@@ -256,14 +279,32 @@ export default function BatchProgress({ jobs, onReset, onSingleDone, onSelectJob
         ))}
       </div>
 
-      {/* Pending-review banner — shown when batch finished processing but
-          some videos still need approval before download. */}
+      {/* Pending-review panel — shown when batch finished but jobs await approval. */}
       {allDone && hasPendingReview && (
-        <div className="mb-4 px-4 py-3 rounded-2xl bg-amber-500/5 border border-amber-500/20">
-          <p className="text-xs text-amber-300/90">
-            {t("batch.pending_review_notice") ||
-              "Algunos videos esperan tu aprobación antes de poder descargarlos. Hacé click en cada card para revisarlo y aprobarlo."}
-          </p>
+        <div className="mb-4 rounded-2xl bg-amber-500/5 border border-amber-500/20 overflow-hidden">
+          <div className="px-4 py-3 flex items-center justify-between gap-3">
+            <p className="text-xs text-amber-300/90 flex-1">
+              {pendingReviewIds.length === 1
+                ? (t("batch.pending_review_notice_one") || "Un video espera tu aprobación. Hacé click en la card para revisarlo.")
+                : (t("batch.pending_review_notice") || `${pendingReviewIds.length} videos esperan aprobación. Revisá cada card o aprobá todos de una vez.`)}
+            </p>
+            {pendingReviewIds.length > 1 && onBulkApprove && (
+              <button
+                onClick={handleBulkApprove}
+                disabled={bulkApproving}
+                className="shrink-0 inline-flex items-center gap-1.5 h-8 px-3 rounded-lg bg-accent/15 text-accent ring-1 ring-accent/30 text-[11px] font-semibold hover:bg-accent/25 transition-colors disabled:opacity-50"
+              >
+                {bulkApproving ? (
+                  <div className="w-3 h-3 border-2 border-accent border-t-transparent rounded-full animate-spin" />
+                ) : (
+                  <svg className="w-3 h-3" fill="none" stroke="currentColor" strokeWidth="2.5" viewBox="0 0 24 24">
+                    <polyline points="20 6 9 17 4 12" />
+                  </svg>
+                )}
+                {t("batch.approve_all") || "Aprobar todos"}
+              </button>
+            )}
+          </div>
         </div>
       )}
 

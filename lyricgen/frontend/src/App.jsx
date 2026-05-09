@@ -271,6 +271,10 @@ export default function App() {
   const [readyToGenerate, setReadyToGenerate] = useState(false);
 
   const [jobs, setJobs] = useState([]);
+  // Pre-fetched transcription results for batch review songs 1..N-1.
+  // While the user edits song 0, songs 1..N are uploaded + transcribed
+  // in background. keyed by queue index.
+  const prefetchCache = useRef({});
   const [history, setHistory] = useState([]);
   const [backgroundFile, setBackgroundFile] = useState(null);
   const [animateImage, setAnimateImage] = useState(false);
@@ -397,9 +401,46 @@ export default function App() {
     pollingIntervals.current.forEach((iv) => clearInterval(iv));
   }, []);
 
+  // Pre-upload + transcribe songs at indices fromIdx..queue.length-1 in the
+  // background while the user is actively reviewing a different song. Results
+  // land in prefetchCache.current[idx] so transcribeNext can serve them
+  // instantly instead of making the user wait for the round-trip.
+  const prefetchRemaining = useCallback(async (queue, fromIdx) => {
+    for (let idx = fromIdx; idx < queue.length; idx++) {
+      // Skip if already fetched or in-flight.
+      if (prefetchCache.current[idx]) continue;
+      prefetchCache.current[idx] = { status: "loading" };
+      const entry = queue[idx];
+      try {
+        const { jobId } = await uploadFileToR2(entry.file, {
+          meta: { artist: entry.artist || "", title: (entry.songTitle || "").trim() },
+        });
+        const res = await authFetch(`${API}/transcribe-uploaded`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            job_id: jobId,
+            language: entry.language || "",
+            artist: entry.artist || "",
+            title: (entry.songTitle || "").trim(),
+          }),
+        });
+        if (res.ok) {
+          const data = await res.json();
+          prefetchCache.current[idx] = { status: "ready", data, jobId };
+        } else {
+          prefetchCache.current[idx] = { status: "error" };
+        }
+      } catch {
+        prefetchCache.current[idx] = { status: "error" };
+      }
+    }
+  }, []);
+
   // --- Review flow ---
   const handleStartReview = async () => {
     if (!files.length || !files.every((f) => f.artist.trim())) return;
+    prefetchCache.current = {};
     setReviewQueue([...files]);
     navigate("/review");
     transcribeNext([...files], 0);
@@ -423,6 +464,34 @@ export default function App() {
   const transcribeNext = async (queue, idx) => {
     if (idx >= queue.length) return;
     const entry = queue[idx];
+
+    // Fast path: a background prefetch already finished for this index.
+    const cached = prefetchCache.current[idx];
+    if (cached?.status === "ready") {
+      const { data, jobId } = cached;
+      setTranscribing(false);
+      setTranscribeProgress(null);
+      setCurrentReview({
+        file: entry.file, artist: entry.artist, language: entry.language,
+        songTitle: entry.songTitle || "",
+        genre: entry.genre || "", font: entry.font || "",
+        concept: entry.concept || "", movementStyle: entry.movementStyle || "",
+        textCase: entry.textCase || "upper",
+        fontScale: entry.fontScale || "1.0",
+        lyricTransition: entry.lyricTransition || "cut",
+        textMotion: entry.textMotion || "none",
+        segments: data.segments, referenceLyrics: data.reference_lyrics || "",
+        coverageWarning: !!data.coverage_warning,
+        recoverySource: data.recovery_source || "",
+        transcribeJobId: data.job_id || jobId,
+        queueIdx: idx, queue,
+      });
+      // Kick off prefetch for all remaining songs.
+      prefetchRemaining(queue, idx + 1);
+      return;
+    }
+
+    // Slow path: upload + transcribe now (first song, or prefetch missed).
     setTranscribing(true);
     setTranscribeError(null);
     setTranscribeProgress({ phase: "uploading", loaded: 0, total: entry.file.size });
@@ -482,6 +551,9 @@ export default function App() {
         transcribeJobId: data.job_id || uploadJobId,
         queueIdx: idx, queue,
       });
+      // Kick off background upload+transcription for songs idx+1..N-1
+      // while the user is reading/editing the current song's lyrics.
+      prefetchRemaining(queue, idx + 1);
     } catch (err) {
       setTranscribing(false);
       setTranscribeProgress(null);
@@ -728,6 +800,7 @@ export default function App() {
     if (hasState && !skipConfirm && !window.confirm(t("batch.confirm_cancel"))) return;
     pollingIntervals.current.forEach((iv) => clearInterval(iv));
     pollingIntervals.current.clear();
+    prefetchCache.current = {};
     setFiles([]); setJobs([]); setBackgroundFile(null); setBackgroundId(null);
     setReviewQueue([]); setCurrentReview(null); setApprovedJobs([]);
     setTranscribing(false); setReadyToGenerate(false); setTranscribeError(null);
@@ -784,6 +857,25 @@ export default function App() {
 
   const handleSelectJob = (jobId) => {
     navigate(`/videos/${jobId}`);
+  };
+
+  const handleBulkApproveBatch = async (jobIds) => {
+    if (!Array.isArray(jobIds) || jobIds.length === 0) return;
+    for (const jobId of jobIds) {
+      try {
+        const res = await authFetch(`${API}/approve/${jobId}`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ notes: "" }),
+        });
+        if (res.ok) {
+          setJobs((prev) =>
+            prev.map((j) => j.job_id === jobId ? { ...j, status: "done" } : j)
+          );
+        }
+      } catch {}
+    }
+    fetchHistory();
   };
 
   const handleDeleteJob = async (jobId) => {
@@ -1006,6 +1098,7 @@ export default function App() {
           onReset={handleReset}
           onSingleDone={handleSelectJob}
           onSelectJob={handleSelectJob}
+          onBulkApprove={handleBulkApproveBatch}
         />
       </div>
     )
