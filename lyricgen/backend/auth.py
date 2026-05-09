@@ -72,12 +72,16 @@ def has_prores_access(user) -> bool:
 
 # Anyone who knows the default secret can forge admin tokens, so running with
 # it in production is unacceptable. Fail fast at import time.
-_ENV = os.environ.get("ENV", "dev").lower()
+_ENV = (
+    os.environ.get("ENV")
+    or os.environ.get("ENVIRONMENT")
+    or "dev"
+).lower()
 if _ENV in ("prod", "production") and (
     not JWT_SECRET or JWT_SECRET == _DEFAULT_INSECURE_SECRET
 ):
     raise RuntimeError(
-        "JWT_SECRET must be set to a strong value when ENV=prod. "
+        "JWT_SECRET must be set to a strong value when ENV=prod/production or ENVIRONMENT=production. "
         "Generate one with: openssl rand -base64 32"
     )
 
