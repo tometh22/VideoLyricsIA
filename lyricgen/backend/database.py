@@ -10,12 +10,14 @@ from sqlalchemy import (
     Enum,
     Float,
     ForeignKey,
+    Index,
     Integer,
     String,
     Text,
     JSON,
     create_engine,
     event,
+    text,
 )
 from sqlalchemy.orm import (
     DeclarativeBase,
@@ -159,6 +161,26 @@ class User(Base):
 
 class Job(Base):
     __tablename__ = "jobs"
+    # __table_args__ uses the deferred-string form for the DESC column
+    # so the Index() can be declared before the Column() it references.
+    # SQLAlchemy resolves the names at mapper-config time.
+    __table_args__ = (
+        # Composite indexes that back the dashboard hot path. Mirrors
+        # migration 8802e2187632. created_at is DESC to match the SQL
+        # in /jobs (ORDER BY created_at DESC LIMIT 200) so Postgres can
+        # forward-scan instead of backward-scanning the index.
+        Index(
+            "ix_jobs_tenant_status_created",
+            "tenant_id",
+            "status",
+            text("created_at DESC"),
+        ),
+        Index(
+            "ix_jobs_tenant_created",
+            "tenant_id",
+            text("created_at DESC"),
+        ),
+    )
 
     id = Column(Integer, primary_key=True, autoincrement=True)
     job_id = Column(String(12), unique=True, nullable=False, index=True)

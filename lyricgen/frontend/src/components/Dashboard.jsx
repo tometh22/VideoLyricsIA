@@ -96,7 +96,7 @@ function VideoCard({ job, onSelect }) {
   );
 }
 
-export default function Dashboard({ user, history, historyError, onRetryHistory, onSelectJob, onNewBatch, onViewHistory }) {
+export default function Dashboard({ user, history, historyError, historyLoaded = true, onRetryHistory, onSelectJob, onNewBatch, onViewHistory }) {
   const { t } = useI18n();
 
   const pendingReview = history.filter((h) => h.status === "pending_review");
@@ -423,9 +423,18 @@ export default function Dashboard({ user, history, historyError, onRetryHistory,
       <DashboardTour user={user} />
 
       {/* ─── Empty state — only when there is literally nothing.
-          historyError takes precedence so a real "couldn't load" never
-          masquerades as "you have no videos yet" (misleading and scary
-          for a returning user with 100 videos in their library). ─── */}
+          Order: loading > error > empty. We must beat the empty branch
+          while /jobs is in flight or 5xx'ing, so a returning user with
+          100 videos in their library never sees "Empezá tu primer
+          lote" during the initial fetch. ─── */}
+      {history.length === 0 && !historyLoaded && !historyError && (
+        <div className="rounded-card p-14 text-center bg-surface-2/30 ring-1 ring-white/[0.04]">
+          <div className="w-10 h-10 mx-auto mb-4 border-2 border-brand border-t-transparent rounded-full animate-spin" />
+          <p className="text-sm text-ink-secondary">
+            {t("history.loading") || "Cargando historial…"}
+          </p>
+        </div>
+      )}
       {history.length === 0 && historyError && (
         <div className="rounded-card p-10 text-center bg-amber-500/[0.06] ring-1 ring-amber-500/25">
           <div className="w-12 h-12 mx-auto mb-4 rounded-2xl bg-amber-500/15 ring-1 ring-amber-500/30 flex items-center justify-center">
@@ -444,7 +453,7 @@ export default function Dashboard({ user, history, historyError, onRetryHistory,
           </button>
         </div>
       )}
-      {history.length === 0 && !historyError && (
+      {history.length === 0 && historyLoaded && !historyError && (
         <div className="rounded-card p-14 text-center bg-surface-2/30 ring-1 ring-white/[0.04]">
           <div className="w-14 h-14 mx-auto mb-5 rounded-2xl bg-brand/10 ring-1 ring-brand/20 flex items-center justify-center">
             <svg className="w-7 h-7 text-brand-light" fill="none" stroke="currentColor" strokeWidth="1.5" viewBox="0 0 24 24">

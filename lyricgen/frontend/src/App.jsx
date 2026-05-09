@@ -315,19 +315,38 @@ export default function App() {
   // poller and detail-view consumers don't see this — they get the
   // current `history` array, fresh or stale.
   const [historyError, setHistoryError] = useState(false);
+  // `historyLoaded` distinguishes "first fetch still in flight" from
+  // "fetch returned []". Without it, HistoryView showed "Aún no hay
+  // videos" during the initial load on slow tenants — operators with
+  // hundreds of jobs thought their catalog was wiped.
+  const [historyLoaded, setHistoryLoaded] = useState(false);
   const fetchHistory = useCallback(async () => {
     if (!getToken()) return;
-    try {
-      const res = await authFetchWithTimeout(`${API}/jobs`);
-      if (res.status === 401) { handleLogout(); return; }
-      if (!res.ok) throw new Error(`HTTP ${res.status}`);
-      const data = await res.json();
-      if (Array.isArray(data)) {
+    // /jobs has historically been the slow query for big tenants (no
+    // composite index on tenant_id+created_at), so a single 10s timeout
+    // turns into "permanent" empty state. Two short retries with
+    // exponential backoff usually catch the second call after PG has
+    // the plan cached, without bashing the backend.
+    const maxAttempts = 3;
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+      try {
+        const res = await authFetchWithTimeout(`${API}/jobs`);
+        if (res.status === 401) { handleLogout(); return; }
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        const data = await res.json();
+        if (!Array.isArray(data)) throw new Error("malformed");
         setHistory(data);
         setHistoryError(false);
+        setHistoryLoaded(true);
+        return;
+      } catch {
+        if (attempt < maxAttempts) {
+          await new Promise((r) => setTimeout(r, 1000 * 2 ** attempt));
+          continue;
+        }
+        setHistoryError(true);
+        setHistoryLoaded(true);
       }
-    } catch {
-      setHistoryError(true);
     }
   }, [handleLogout]);
 
@@ -1009,6 +1028,7 @@ export default function App() {
               user={user}
               history={history}
               historyError={historyError}
+              historyLoaded={historyLoaded}
               onRetryHistory={fetchHistory}
               onSelectJob={handleSelectJob}
               onNewBatch={() => { setFiles([]); navigate("/new"); }}
@@ -1021,6 +1041,9 @@ export default function App() {
           <Route path="/videos" element={
             <HistoryView
               history={history}
+              historyError={historyError}
+              historyLoaded={historyLoaded}
+              onRetryHistory={fetchHistory}
               onSelect={handleSelectJob}
               onDelete={handleDeleteJob}
               onBulkDelete={handleBulkDeleteJobs}
