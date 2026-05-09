@@ -1,6 +1,6 @@
 import { useState, useEffect } from "react";
 import { useI18n } from "../i18n";
-import { clearAllTourFlags } from "./OnboardingTour";
+import { startReplaySession } from "./OnboardingTour";
 
 const API = import.meta.env.VITE_API_URL || "";
 
@@ -457,8 +457,7 @@ export default function Settings({ onBack }) {
                 </div>
                 <button
                   onClick={() => {
-                    clearAllTourFlags();
-                    alert(t("settings.tour_replay_alert") || "Listo. Te llevamos al inicio para empezar el tour.");
+                    startReplaySession();
                     window.location.assign("/");
                   }}
                   className="shrink-0 text-[12px] font-medium px-4 py-2 rounded-lg bg-brand/15 text-brand-light

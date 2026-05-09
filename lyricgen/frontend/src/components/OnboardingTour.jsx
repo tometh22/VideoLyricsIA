@@ -21,6 +21,11 @@ const FLAGS = {
 
 export const TOUR_FLAG_KEYS = Object.values(FLAGS);
 
+// sessionStorage key set by the Settings replay button. Lives for the
+// browser session so the user can walk Home → Upload → Editor and each
+// tour fires in turn, then dies on tab close.
+const REPLAY_KEY = "genly_tour_replay";
+
 // Age gate: if the user is more than 14 days old, don't auto-fire.
 // Existing users on next deploy don't get tour-blasted; they can
 // replay manually from Settings.
@@ -33,11 +38,19 @@ function daysSince(isoDate) {
   return (Date.now() - t) / 86400000;
 }
 
+function isReplayActive() {
+  if (typeof window === "undefined") return false;
+  try { return sessionStorage.getItem(REPLAY_KEY) === "1"; } catch { return false; }
+}
+
 function shouldAutoRun(flagKey, user) {
   if (typeof window === "undefined") return false;
   if (localStorage.getItem(flagKey) === "1") return false;
   // No user yet (still loading) → defer
   if (!user) return false;
+  // Replay session bypasses the age gate. Each tour still self-terminates
+  // by setting its own done-flag after first play, so we don't loop.
+  if (isReplayActive()) return true;
   return daysSince(user.created_at) < AGE_GATE_DAYS;
 }
 
@@ -322,4 +335,12 @@ export function clearAllTourFlags() {
   for (const k of TOUR_FLAG_KEYS) {
     try { localStorage.removeItem(k); } catch {}
   }
+}
+
+// Called by the Settings replay button. Clears done-flags and marks
+// the session as a replay so shouldAutoRun bypasses the 14-day age
+// gate. The flag clears on tab close — no manual teardown needed.
+export function startReplaySession() {
+  clearAllTourFlags();
+  try { sessionStorage.setItem(REPLAY_KEY, "1"); } catch {}
 }
