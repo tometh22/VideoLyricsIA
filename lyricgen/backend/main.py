@@ -2492,6 +2492,11 @@ async def status(
         # Frontend uses delivery_profile to decide whether to show the
         # UMG master download tab in JobDetail.
         "delivery_profile": job.get("delivery_profile", "youtube"),
+        # ProRes readiness — drives the badge in JobDetail. Must be
+        # included here so the badge reflects server state when the
+        # user opens a job that already had ProRes generated.
+        "s3_keys": job.get("s3_keys"),
+        "prores_ready": job.get("prores_ready", False),
     }
 
 
@@ -2744,7 +2749,7 @@ async def download(
             # Re-fetch the s3_keys (a sibling caller may have just uploaded
             # while we were checking the lock).
             from jobs import get_job_model as _get_job_model
-            _model = _get_job_model(job_id)
+            _model = _get_job_model(db, job_id)
             s3_key = (_model.s3_keys or {}).get(file_type) if _model else None
             if s3_key and storage.is_enabled():
                 url = storage.generate_signed_url(
