@@ -3993,36 +3993,39 @@ def _apply_case(text: str, case: str) -> str:
     return text  # "original" — keep as transcribed
 
 
-def _text_position_func(spec, motion: str, seg_duration: float, shadow_offset: int = 0):
-    """Return a position callable (or "center") for the text clip.
+def _text_position_func(spec, motion: str, seg_duration: float,
+                        clip_x: int = 0, clip_y: int = 0,
+                        shadow_offset: int = 0):
+    """Return a position callable (or string/tuple) for a text clip.
 
-    `shadow_offset` shifts the position so the shadow clip aligns with
-    the main text. Motion values: "none" | "subtle" | "float".
+    clip_x / clip_y are the top-left pixel coordinates that would place
+    the clip centered on screen (computed by the caller from actual clip
+    dimensions). shadow_offset shifts both axes so the shadow sits just
+    behind the main text. Motion values: "none" | "subtle" | "float".
     """
     import math
     if motion == "none" or not motion:
         if shadow_offset:
-            return (spec.width // 2 + shadow_offset, spec.height // 2 + shadow_offset)
+            return (clip_x + shadow_offset, clip_y + shadow_offset)
         return "center"
 
-    cy = spec.height // 2
-    cx = spec.width // 2
     period = max(seg_duration, 0.5)
+    amp_scale = spec.text_scale
 
     if motion == "subtle":
-        amplitude = max(2, int(round(4 * spec.text_scale)))
+        amplitude = max(2, int(round(4 * amp_scale)))
 
         def pos(t):
             dy = amplitude * math.sin(2 * math.pi * t / period)
-            return (cx + shadow_offset, cy + int(dy) + shadow_offset)
+            return (clip_x + shadow_offset, clip_y + int(dy) + shadow_offset)
     else:  # "float"
-        amp_y = max(4, int(round(8 * spec.text_scale)))
-        amp_x = max(1, int(round(3 * spec.text_scale)))
+        amp_y = max(4, int(round(8 * amp_scale)))
+        amp_x = max(1, int(round(3 * amp_scale)))
 
         def pos(t):
             dy = amp_y * math.sin(2 * math.pi * t / period)
             dx = amp_x * math.sin(math.pi * t / period + 0.5)
-            return (cx + int(dx) + shadow_offset, cy + int(dy) + shadow_offset)
+            return (clip_x + int(dx) + shadow_offset, clip_y + int(dy) + shadow_offset)
 
     return pos
 
@@ -4089,16 +4092,21 @@ def _make_text_clip(
 
     shadow = _try_text_clip(display_text, fontsize, font, "black").set_opacity(0.4)
     sh = shadow.size[1]
-    shadow_y = (spec.height - sh) // 2 + shadow_offset
-    shadow_x = (spec.width - text_width) // 2 + shadow_offset
-    shadow_pos = _text_position_func(spec, text_motion, seg_duration, shadow_offset=shadow_offset)
+    # Centered top-left coordinates for a clip of size (text_width, sh)
+    base_x = (spec.width - text_width) // 2
+    base_y = (spec.height - sh) // 2
+    shadow_pos = _text_position_func(spec, text_motion, seg_duration,
+                                     clip_x=base_x, clip_y=base_y,
+                                     shadow_offset=shadow_offset)
     if callable(shadow_pos):
         shadow = shadow.set_position(lambda t, _p=shadow_pos: _p(t))
     else:
-        shadow = shadow.set_position((shadow_x, shadow_y))
+        shadow = shadow.set_position((base_x + shadow_offset, base_y + shadow_offset))
     shadow = shadow.set_start(seg_start).set_end(seg_end)
 
-    txt_pos = _text_position_func(spec, text_motion, seg_duration, shadow_offset=0)
+    txt_pos = _text_position_func(spec, text_motion, seg_duration,
+                                  clip_x=base_x, clip_y=base_y,
+                                  shadow_offset=0)
     txt = _try_text_clip(display_text, fontsize, font, "white",
                          stroke_color="black", stroke_width=stroke_width)
     if callable(txt_pos):
