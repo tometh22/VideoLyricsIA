@@ -257,16 +257,38 @@ export default function JobDetail({ job, onBack, onJobUpdate }) {
           await new Promise((r) => setTimeout(r, retryMs));
           continue;
         }
-        // Any other status is a hard error (400/404/500).
-        throw new Error(`HTTP ${res.status}`);
+        // Hard error (400/404/500). Surface the backend's own `detail`
+        // string when present so the operator sees a real reason instead
+        // of a generic HTTP code. 404 specifically means the source MP4
+        // is no longer on disk/R2 — irrecoverable, needs a full re-render.
+        let backendDetail = "";
+        try {
+          const body = await res.json();
+          backendDetail = (body && body.detail) || "";
+        } catch {
+          /* non-JSON body — fall through with empty detail */
+        }
+        const err = new Error(`HTTP ${res.status}`);
+        err.status = res.status;
+        err.detail = backendDetail;
+        throw err;
       }
-      throw new Error("Tiempo de espera agotado");
+      const err = new Error("timeout");
+      err.kind = "timeout";
+      throw err;
     } catch (err) {
       console.error("ProRes download failed:", err);
-      alert(
-        t("detail.prores_failed")
-        || `No se pudo generar el ProRes (${err.message || "error"}). Esperá unos minutos y volvé a intentar.`
-      );
+      let message;
+      if (err.kind === "timeout") {
+        message = t("detail.prores_timeout");
+      } else if (err.status === 404) {
+        // Source MP4 missing on the server — only a full re-render fixes it.
+        message = t("detail.prores_source_missing");
+      } else {
+        const reason = err.detail || err.message || "error";
+        message = t("detail.prores_failed", { reason });
+      }
+      alert(message);
     } finally {
       setProResHint(null);
     }
