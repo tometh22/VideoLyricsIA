@@ -222,7 +222,11 @@ def run_pipeline(job_id: str, mp3_path: str, artist: str, style: str,
                  concept: str = "",
                  movement_style: str = "",
                  animate_image: bool = False,
-                 song_title: str = ""):
+                 song_title: str = "",
+                 text_case: str = "upper",
+                 font_scale: float = 1.0,
+                 lyric_transition: str = "cut",
+                 text_motion: str = "none"):
     """Run the full pipeline for a job. Called synchronously.
 
     delivery_profile:
@@ -426,6 +430,10 @@ def run_pipeline(job_id: str, mp3_path: str, artist: str, style: str,
                 mp3_path, segments, style, job_dir, artist, bg_image_path,
                 font=chosen_font, spec=intermediate_spec,
                 song_title=song_title,
+                text_case=text_case,
+                font_scale=font_scale,
+                lyric_transition=lyric_transition,
+                text_motion=text_motion,
             )
             files["video_url"] = f"/download/{job_id}/video"
             update_job(job_id, progress=55)
@@ -3878,67 +3886,134 @@ def _resolve_font(font_id: str) -> str | None:
     return None
 
 
-def _make_text_clip(text: str, seg_start: float, seg_end: float, font: str = "Arial",
-                    spec: RenderSpec | None = None):
+def _apply_case(text: str, case: str) -> str:
+    """Apply text-case transformation matching the user's choice."""
+    if case == "upper":
+        return text.upper()
+    if case == "title":
+        return text.title()
+    if case == "lower":
+        return text.lower()
+    return text  # "original" — keep as transcribed
+
+
+def _text_position_func(spec, motion: str, seg_duration: float, shadow_offset: int = 0):
+    """Return a position callable (or "center") for the text clip.
+
+    `shadow_offset` shifts the position so the shadow clip aligns with
+    the main text. Motion values: "none" | "subtle" | "float".
+    """
+    import math
+    if motion == "none" or not motion:
+        if shadow_offset:
+            return (spec.width // 2 + shadow_offset, spec.height // 2 + shadow_offset)
+        return "center"
+
+    cy = spec.height // 2
+    cx = spec.width // 2
+    period = max(seg_duration, 0.5)
+
+    if motion == "subtle":
+        amplitude = max(2, int(round(4 * spec.text_scale)))
+
+        def pos(t):
+            dy = amplitude * math.sin(2 * math.pi * t / period)
+            return (cx + shadow_offset, cy + int(dy) + shadow_offset)
+    else:  # "float"
+        amp_y = max(4, int(round(8 * spec.text_scale)))
+        amp_x = max(1, int(round(3 * spec.text_scale)))
+
+        def pos(t):
+            dy = amp_y * math.sin(2 * math.pi * t / period)
+            dx = amp_x * math.sin(math.pi * t / period + 0.5)
+            return (cx + int(dx) + shadow_offset, cy + int(dy) + shadow_offset)
+
+    return pos
+
+
+def _make_text_clip(
+    text: str,
+    seg_start: float,
+    seg_end: float,
+    font: str = "Arial",
+    spec: RenderSpec | None = None,
+    text_case: str = "upper",
+    font_scale: float = 1.0,
+    lyric_transition: str = "cut",
+    text_motion: str = "none",
+):
     """Create a clean text clip matching pro lyric video style (bold white, subtle shadow)."""
     import unicodedata
     if spec is None:
         spec = RenderSpec.youtube_default()
-    # Sanitize text: normalize unicode and remove problematic characters
-    display_text = unicodedata.normalize("NFC", text.upper())
-    # Remove characters that break ImageMagick's @file parsing
+
+    # Apply case transform then sanitize for ImageMagick
+    display_text = unicodedata.normalize("NFC", _apply_case(text, text_case))
     display_text = display_text.replace("@", "").replace("`", "'").replace("\x00", "")
 
-    # Empty-string guard. ImageMagick errors with "label expected" when
-    # asked to render an empty caption, taking the whole video render
-    # down. Caller filters blanks upstream; this is defense in depth for
-    # cases where sanitization stripped everything (e.g. text was just
-    # "@@@" or all whitespace).
+    # Empty-string guard — ImageMagick errors with "label expected" on blank input
     if not display_text.strip():
         return []
 
     scale = spec.text_scale
+    # font_scale is the user-chosen size multiplier (default 1.0 = unchanged)
+    font_scale = max(0.6, min(1.5, float(font_scale or 1.0)))
 
     text_len = len(display_text)
     if text_len > 80:
-        fontsize = int(round(55 * scale))
+        base_fontsize = int(round(55 * scale))
         text_width = int(round(1700 * scale))
     elif text_len > 50:
-        fontsize = int(round(70 * scale))
+        base_fontsize = int(round(70 * scale))
         text_width = int(round(1650 * scale))
     else:
-        fontsize = int(round(85 * scale))
+        base_fontsize = int(round(85 * scale))
         text_width = int(round(1500 * scale))
 
-    # Scale shadow offset proportionally (3 px baseline at 1080p).
+    fontsize = max(18, int(round(base_fontsize * font_scale)))
+
     shadow_offset = max(1, int(round(3 * scale)))
-
-    # Fallback font if the selected one fails with ImageMagick
     fallback_font = os.path.join(_FONTS_DIR, "Montserrat-Bold.ttf")
-
-    # Stroke scales too so it stays visually similar at higher resolutions.
     stroke_width = max(1.0, 1.5 * scale)
 
-    def _try_text_clip(text, fsize, fnt, color, **kwargs):
+    seg_duration = max(0.1, seg_end - seg_start)
+
+    # Fade duration — capped at 1/3 of segment so short clips don't break
+    _FADE_DURATIONS = {"fade": 0.15, "fade_slow": 0.30}
+    fade_dur = _FADE_DURATIONS.get(lyric_transition, 0.0)
+    fade_dur = min(fade_dur, seg_duration / 3)
+
+    def _try_text_clip(txt, fsize, fnt, color, **kwargs):
         try:
-            return TextClip(text, fontsize=fsize, font=fnt, color=color,
+            return TextClip(txt, fontsize=fsize, font=fnt, color=color,
                             method="caption", size=(text_width, None), align="center", **kwargs)
         except Exception:
-            return TextClip(text, fontsize=fsize, font=fallback_font, color=color,
+            return TextClip(txt, fontsize=fsize, font=fallback_font, color=color,
                             method="caption", size=(text_width, None), align="center", **kwargs)
 
-    # Soft shadow for depth
     shadow = _try_text_clip(display_text, fontsize, font, "black").set_opacity(0.4)
-
     sh = shadow.size[1]
     shadow_y = (spec.height - sh) // 2 + shadow_offset
     shadow_x = (spec.width - text_width) // 2 + shadow_offset
-    shadow = shadow.set_position((shadow_x, shadow_y)).set_start(seg_start).set_end(seg_end)
+    shadow_pos = _text_position_func(spec, text_motion, seg_duration, shadow_offset=shadow_offset)
+    if callable(shadow_pos):
+        shadow = shadow.set_position(lambda t, _p=shadow_pos: _p(t))
+    else:
+        shadow = shadow.set_position((shadow_x, shadow_y))
+    shadow = shadow.set_start(seg_start).set_end(seg_end)
 
-    # Main text — clean white, thin stroke
+    txt_pos = _text_position_func(spec, text_motion, seg_duration, shadow_offset=0)
     txt = _try_text_clip(display_text, fontsize, font, "white",
-                         stroke_color="black", stroke_width=stroke_width
-    ).set_position("center").set_start(seg_start).set_end(seg_end)
+                         stroke_color="black", stroke_width=stroke_width)
+    if callable(txt_pos):
+        txt = txt.set_position(lambda t, _p=txt_pos: _p(t))
+    else:
+        txt = txt.set_position("center")
+    txt = txt.set_start(seg_start).set_end(seg_end)
+
+    if fade_dur > 0:
+        shadow = shadow.crossfadein(fade_dur).crossfadeout(fade_dur)
+        txt = txt.crossfadein(fade_dur).crossfadeout(fade_dur)
 
     return [shadow, txt]
 
@@ -4306,6 +4381,10 @@ def generate_lyric_video(
     spec: RenderSpec | None = None,
     font: str | None = None,
     song_title: str = "",
+    text_case: str = "upper",
+    font_scale: float = 1.0,
+    lyric_transition: str = "cut",
+    text_motion: str = "none",
 ) -> tuple[str, str, str | None]:
     """Generate a lyric video. Returns (video_path, font, bg_source).
 
@@ -4429,68 +4508,109 @@ def generate_lyric_video(
             title_song = title_song.split("_", 1)[0].strip()
 
     if artist or title_song:
-        # Single-line "ARTIST - Title" format. Operator wanted the artist
-        # and song name on one row instead of stacked, and the dash
-        # separator makes the parsed title obviously distinct from the raw
-        # underscore-joined Suno filename.
-        if artist and title_song:
-            title_text = f"{artist.upper()} - {title_song}"
-        elif artist:
-            title_text = artist.upper()
-        else:
-            title_text = title_song
+        # Artist name renders in ExtraBold (heavier weight) to visually
+        # distinguish it from the song title, which stays in Bold.
+        extrabold_font = os.path.join(_FONTS_DIR, "Montserrat-ExtraBold.ttf")
+        if not os.path.exists(extrabold_font):
+            extrabold_font = font  # graceful fallback
+
+        artist_upper = artist.upper() if artist else ""
+        # Title uses the user's chosen case; default to title-case for the
+        # song name in the header card (it's not a lyric line).
+        title_display = title_song if title_song else ""
+
         if first_lyric_start > 3:
-            # Real intro — cinematic centered drop. Bigger font, fades
-            # just before the first lyric so they don't crash into each
-            # other.
+            # Real intro — render artist (ExtraBold) and song title (Bold)
+            # as two stacked TextClips so they can have independent weights.
             title_end = first_lyric_start - 0.5
             try:
-                title_layers = _make_text_clip(
-                    title_text, 0.5, title_end,
-                    font, spec=spec,
-                )
-                text_layers.extend(title_layers)
+                title_card_clips = []
+                scale = spec.text_scale
+                artist_size = max(30, int(round(62 * scale)))
+                title_size = max(24, int(round(46 * scale)))
+                card_width = int(round(spec.width * 0.80))
+                stroke_w = max(1, int(round(1.6 * scale)))
+
+                if artist_upper:
+                    artist_clip = TextClip(
+                        artist_upper, fontsize=artist_size, font=extrabold_font,
+                        color="white", stroke_color="black", stroke_width=stroke_w,
+                        method="caption", size=(card_width, None), align="center",
+                    ).set_opacity(0.97)
+                    title_card_clips.append(artist_clip)
+
+                if title_display:
+                    song_clip = TextClip(
+                        title_display, fontsize=title_size, font=font,
+                        color="white", stroke_color="black", stroke_width=max(1, int(round(1.2 * scale))),
+                        method="caption", size=(card_width, None), align="center",
+                    ).set_opacity(0.85)
+                    title_card_clips.append(song_clip)
+
+                if title_card_clips:
+                    # Stack clips vertically, center the block
+                    total_h = sum(c.size[1] for c in title_card_clips) + 8 * (len(title_card_clips) - 1)
+                    y_cursor = (spec.height - total_h) // 2
+                    cx = spec.width // 2
+                    for clip in title_card_clips:
+                        cw, ch = clip.size
+                        clip = (clip.set_position((cx - cw // 2, y_cursor))
+                                    .set_start(0.5).set_end(title_end))
+                        text_layers.append(clip)
+                        y_cursor += ch + 8
             except Exception as e:
                 print(f"[TITLE] center title failed ({e}); continuing")
         else:
-            # First lyric lands at/near t=0 — top-third compact card.
-            # Cap the card's end at the first lyric's start (minus a
-            # 0.3 s buffer) so the title doesn't sit on top of the
-            # subtitle even when it's short. The previous fixed 5 s
-            # window left "ARTIST / Title" stamped over the first
-            # vocal line in songs without an intro silence.
+            # No real intro — compact top-third card
             try:
-                top_title_text = title_text
-                top_size = max(36, int(round(58 * spec.text_scale)))
-                top_card = TextClip(
-                    top_title_text,
-                    fontsize=top_size,
-                    font=font,
-                    color="white",
-                    stroke_color="black",
-                    stroke_width=max(1, int(round(1.6 * spec.text_scale))),
-                    method="caption",
-                    size=(int(round(spec.width * 0.85)), None),
-                    align="center",
-                ).set_opacity(0.95)
-                tw, th = top_card.size
-                top_x = (spec.width - tw) // 2
+                scale = spec.text_scale
+                card_width = int(round(spec.width * 0.85))
                 top_y = max(40, int(round(spec.height * 0.10)))
                 top_end_cap = first_lyric_start - 0.3 if first_lyric_start > 0.7 else 0.4
                 top_end = min(5.0, max(0.4, min(top_end_cap, duration - 0.1)))
-                if top_end > 0.4:
-                    top_card = (top_card.set_position((top_x, top_y))
-                                         .set_start(0.4)
-                                         .set_end(top_end))
-                    text_layers.append(top_card)
+
+                if top_end <= 0.4:
+                    print(f"[TITLE] first lyric at {first_lyric_start:.2f}s; skipping top-card")
                 else:
-                    print(f"[TITLE] first lyric at {first_lyric_start:.2f}s; "
-                          f"skipping top-card to avoid overlap")
+                    top_clips = []
+                    artist_size = max(28, int(round(44 * scale)))
+                    title_size = max(22, int(round(34 * scale)))
+                    stroke_w = max(1, int(round(1.6 * scale)))
+
+                    if artist_upper:
+                        a_clip = TextClip(
+                            artist_upper, fontsize=artist_size, font=extrabold_font,
+                            color="white", stroke_color="black", stroke_width=stroke_w,
+                            method="caption", size=(card_width, None), align="center",
+                        ).set_opacity(0.97)
+                        top_clips.append(a_clip)
+
+                    if title_display:
+                        s_clip = TextClip(
+                            title_display, fontsize=title_size, font=font,
+                            color="white", stroke_color="black", stroke_width=max(1, int(round(1.2 * scale))),
+                            method="caption", size=(card_width, None), align="center",
+                        ).set_opacity(0.85)
+                        top_clips.append(s_clip)
+
+                    y_cur = top_y
+                    cx = spec.width // 2
+                    for clip in top_clips:
+                        cw, ch = clip.size
+                        clip = (clip.set_position((cx - cw // 2, y_cur))
+                                    .set_start(0.4).set_end(top_end))
+                        text_layers.append(clip)
+                        y_cur += ch + 6
+
             except Exception as e:
                 print(f"[TITLE] top title card failed ({e}); continuing without it")
 
     for seg in segments:
-        layers = _make_text_clip(seg["text"], seg["start"], seg["end"], font, spec=spec)
+        layers = _make_text_clip(
+            seg["text"], seg["start"], seg["end"], font, spec=spec,
+            text_case=text_case, font_scale=font_scale,
+            lyric_transition=lyric_transition, text_motion=text_motion,
+        )
         text_layers.extend(layers)
 
     video = CompositeVideoClip([bg] + text_layers, size=(spec.width, spec.height))

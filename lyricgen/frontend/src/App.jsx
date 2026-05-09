@@ -472,11 +472,13 @@ export default function App() {
         songTitle: entry.songTitle || "",
         genre: entry.genre || "", font: entry.font || "",
         concept: entry.concept || "", movementStyle: entry.movementStyle || "",
+        textCase: entry.textCase || "upper",
+        fontScale: entry.fontScale || "1.0",
+        lyricTransition: entry.lyricTransition || "cut",
+        textMotion: entry.textMotion || "none",
         segments: data.segments, referenceLyrics: data.reference_lyrics || "",
         coverageWarning: !!data.coverage_warning,
         recoverySource: data.recovery_source || "",
-        // Same job_id covers the whole upload→transcribe→generate flow
-        // now (it's minted in /upload-url and reused throughout).
         transcribeJobId: data.job_id || uploadJobId,
         queueIdx: idx, queue,
       });
@@ -551,6 +553,10 @@ export default function App() {
         if (jobList[i].font) formData.append("font", jobList[i].font);
         if (jobList[i].concept) formData.append("concept", jobList[i].concept);
         if (jobList[i].movementStyle) formData.append("movement_style", jobList[i].movementStyle);
+        formData.append("text_case", jobList[i].textCase || "upper");
+        formData.append("font_scale", String(jobList[i].fontScale || "1.0"));
+        formData.append("lyric_transition", jobList[i].lyricTransition || "cut");
+        formData.append("text_motion", jobList[i].textMotion || "none");
         if (animateImage && backgroundFile) formData.append("animate_image", "true");
         formData.append("segments_json", JSON.stringify(jobList[i].segments));
         formData.append("delivery_profile", delivery.delivery_profile);
@@ -660,6 +666,10 @@ export default function App() {
         if (jobList[i].font) generateBody.append("font", jobList[i].font);
         if (jobList[i].concept) generateBody.append("concept", jobList[i].concept);
         if (jobList[i].movementStyle) generateBody.append("movement_style", jobList[i].movementStyle);
+        generateBody.append("text_case", jobList[i].textCase || "upper");
+        generateBody.append("font_scale", String(jobList[i].fontScale || "1.0"));
+        generateBody.append("lyric_transition", jobList[i].lyricTransition || "cut");
+        generateBody.append("text_motion", jobList[i].textMotion || "none");
         if (animateImage && backgroundFile) generateBody.append("animate_image", "true");
         if (backgroundId) generateBody.append("background_id", backgroundId);
         else if (backgroundFile) generateBody.append("background_file", backgroundFile);
@@ -923,6 +933,11 @@ export default function App() {
               ? `${currentReview.queueIdx + 1} ${t("editor.song_of")} ${currentReview.queue.length}`
               : ""}
             user={user}
+            font={currentReview.font || ""}
+            textCase={currentReview.textCase || "upper"}
+            fontScale={parseFloat(currentReview.fontScale || "1.0")}
+            lyricTransition={currentReview.lyricTransition || "cut"}
+            textMotion={currentReview.textMotion || "none"}
           />
         </div>
       );
