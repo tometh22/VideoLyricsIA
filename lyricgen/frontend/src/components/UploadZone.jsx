@@ -126,6 +126,7 @@ export default function UploadZone({
   const [bgMode, setBgMode] = useState("auto"); // auto | library | custom
   const [libraryBgs, setLibraryBgs] = useState([]);
   const [libraryLoaded, setLibraryLoaded] = useState(false);
+  const [libraryFetchFailed, setLibraryFetchFailed] = useState(false);
   // Library filter chip: all | image | video_cinematic | video_simple
   const [libraryFilter, setLibraryFilter] = useState("all");
   // Per-asset usage map keyed by asset id. Populated lazily once the
@@ -174,7 +175,7 @@ export default function UploadZone({
               .catch(() => {});
           });
         })
-        .catch(() => setLibraryLoaded(true));
+        .catch(() => { setLibraryFetchFailed(true); setLibraryLoaded(true); });
     }
   }, [bgMode, libraryLoaded]);
 
@@ -949,7 +950,20 @@ export default function UploadZone({
               <div>
                 {libraryBgs.length === 0 ? (
                   <div className="rounded-card bg-surface-2/40 ring-1 ring-white/[0.04] px-4 py-6 text-center">
-                    <p className="text-xs text-gray-500">{t("upload.bg_library_empty") || "No pre-approved backgrounds available. Ask admin to upload some."}</p>
+                    {libraryFetchFailed ? (
+                      <>
+                        <p className="text-xs text-red-400 mb-2">{t("upload.bg_library_error") || "Error al cargar la biblioteca."}</p>
+                        <button
+                          type="button"
+                          onClick={() => { setLibraryLoaded(false); setLibraryFetchFailed(false); }}
+                          className="text-xs text-brand hover:text-brand-light transition-colors font-medium"
+                        >
+                          {t("upload.retry") || "Reintentar"}
+                        </button>
+                      </>
+                    ) : (
+                      <p className="text-xs text-gray-500">{t("upload.bg_library_empty") || "No pre-approved backgrounds available. Ask admin to upload some."}</p>
+                    )}
                   </div>
                 ) : (
                   <>
@@ -1168,8 +1182,11 @@ export default function UploadZone({
             a file is in the batch so the empty state stays clean. */}
         {files.length > 0 && onStyleChange && (
           <div className="rounded-card bg-surface-2/40 ring-1 ring-white/[0.04] px-4 py-3">
-            <p className="text-[10px] uppercase tracking-[0.18em] text-gray-500 mb-2">
+            <p className="text-[10px] uppercase tracking-[0.18em] text-gray-500">
               Estilo visual
+            </p>
+            <p className="text-[10px] text-gray-500 mb-2 mt-0.5">
+              {t("upload.style_desc") || "Paleta de colores del fondo generado por IA"}
             </p>
             <div className="flex gap-2">
               {STYLES.map((s) => (
