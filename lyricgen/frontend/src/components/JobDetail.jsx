@@ -169,6 +169,7 @@ export default function JobDetail({ job, onBack, onJobUpdate }) {
   const [showYoutubePanel, setShowYoutubePanel] = useState(false);
   const [reviewNotes, setReviewNotes] = useState("");
   const [approving, setApproving] = useState(false);
+  const [retrying, setRetrying] = useState(false);
   // Synchronous guard against double-click — `approving` (state) is updated
   // asynchronously by React, so a rapid second click can fire its handler
   // before the re-render flips the disabled flag. The ref is set BEFORE
@@ -186,12 +187,50 @@ export default function JobDetail({ job, onBack, onJobUpdate }) {
   const canDownload = job.status === "done";
   const isPendingReview = job.status === "pending_review";
   const isValidationFailed = job.status === "validation_failed";
+  const isError = job.status === "error";
 
-  if (!canPreview && !isValidationFailed) {
+  if (!canPreview && !isValidationFailed && !isError) {
     return (
       <div className="w-full max-w-2xl animate-fade-in text-center py-20">
         <p className="text-gray-400">{t("detail.not_available")}</p>
         <button onClick={onBack} className="btn-secondary mt-4">{t("detail.back")}</button>
+      </div>
+    );
+  }
+
+  // Error state: show a compact error panel with retry option.
+  if (isError && !isValidationFailed) {
+    return (
+      <div className="w-full max-w-2xl animate-fade-in">
+        <div className="flex items-center gap-3 mb-6">
+          <button onClick={onBack} className="w-9 h-9 shrink-0 rounded-xl bg-surface-2/40 ring-1 ring-white/[0.04] hover:ring-white/[0.08] flex items-center justify-center text-gray-400 hover:text-white transition-colors">
+            <svg className="w-4 h-4" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24"><path d="M19 12H5M12 19l-7-7 7-7" /></svg>
+          </button>
+          <div>
+            <h2 className="text-xl font-bold">{name}</h2>
+            <p className="text-sm text-gray-500">{job.artist}</p>
+          </div>
+        </div>
+        <div className="rounded-card bg-red-500/[0.06] ring-1 ring-red-500/20 px-5 py-5">
+          <p className="text-sm font-semibold text-red-300 mb-1">{t("detail.error_title") || "El video falló durante la generación"}</p>
+          <p className="text-xs text-red-400/70 mb-4">{job.error || t("detail.error_unknown") || "Error desconocido"}</p>
+          <div className="flex gap-2">
+            <button
+              onClick={handleRetry}
+              disabled={retrying}
+              className="btn-primary text-xs h-9 px-4 disabled:opacity-50"
+            >
+              {retrying ? (
+                <><div className="inline-block w-3 h-3 border-2 border-white border-t-transparent rounded-full animate-spin mr-1.5" />Reintentando…</>
+              ) : (
+                t("detail.retry") || "Reintentar sin re-subir"
+              )}
+            </button>
+            <button onClick={() => onBack && onBack()} className="btn-secondary text-xs h-9 px-4">
+              {t("detail.back") || "Volver"}
+            </button>
+          </div>
+        </div>
       </div>
     );
   }
@@ -362,6 +401,29 @@ export default function JobDetail({ job, onBack, onJobUpdate }) {
     } catch {}
     setApproving(false);
     approveLockRef.current = false;
+  };
+
+  const handleRetry = async () => {
+    if (retrying) return;
+    setRetrying(true);
+    try {
+      const res = await fetch(`${API}/retry/${job.job_id}`, {
+        method: "POST",
+        headers: authHeaders(),
+      });
+      if (res.ok) {
+        const updated = await (await fetch(`${API}/status/${job.job_id}`, { headers: authHeaders() })).json();
+        onJobUpdate?.(updated);
+        // Navigate back so the user sees the batch/history with the job now processing.
+        onBack?.();
+      } else {
+        const body = await res.json().catch(() => ({}));
+        alert(body.detail || "No se pudo reintentar el video.");
+      }
+    } catch {
+      alert("Error de red al reintentar.");
+    }
+    setRetrying(false);
   };
 
   const handleReject = async () => {
@@ -554,9 +616,22 @@ export default function JobDetail({ job, onBack, onJobUpdate }) {
               {t("detail.validation_no_quota") || "Este video NO consume tu cuota mensual — solo los aprobados cuentan."}
             </p>
           </div>
-          <button onClick={() => onBack && onBack()} className="btn-primary text-xs h-9 px-4">
-            {t("detail.upload_again") || "Subir el MP3 de nuevo"}
-          </button>
+          <div className="flex gap-2">
+            <button
+              onClick={handleRetry}
+              disabled={retrying}
+              className="btn-primary text-xs h-9 px-4 disabled:opacity-50"
+            >
+              {retrying ? (
+                <><div className="inline-block w-3 h-3 border-2 border-white border-t-transparent rounded-full animate-spin mr-1.5" />Reintentando…</>
+              ) : (
+                t("detail.retry") || "Reintentar sin re-subir"
+              )}
+            </button>
+            <button onClick={() => onBack && onBack()} className="btn-secondary text-xs h-9 px-4">
+              {t("detail.upload_again") || "Subir nuevo archivo"}
+            </button>
+          </div>
         </div>
       )}
 

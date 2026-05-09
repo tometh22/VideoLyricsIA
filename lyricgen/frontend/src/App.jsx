@@ -258,7 +258,7 @@ export default function App() {
     umg_fps: 24,
     umg_prores_profile: 3,
   });
-  const style = "oscuro";
+  const [style, setStyle] = useState("oscuro");
 
   const [reviewQueue, setReviewQueue] = useState([]);
   const [currentReview, setCurrentReview] = useState(null);
@@ -271,6 +271,10 @@ export default function App() {
   const [readyToGenerate, setReadyToGenerate] = useState(false);
 
   const [jobs, setJobs] = useState([]);
+  // Pre-fetched transcription results for batch review songs 1..N-1.
+  // While the user edits song 0, songs 1..N are uploaded + transcribed
+  // in background. keyed by queue index.
+  const prefetchCache = useRef({});
   const [history, setHistory] = useState([]);
   const [backgroundFile, setBackgroundFile] = useState(null);
   const [animateImage, setAnimateImage] = useState(false);
@@ -301,11 +305,11 @@ export default function App() {
   };
 
   const handleLogout = useCallback(() => {
-    // Stop every active poll BEFORE clearing the token. Otherwise the
-    // intervals keep firing authFetch() with no token, triggering 401s
-    // on every tick until the tab is closed (and re-entering this
-    // handler in a loop).
-    pollingIntervals.current.forEach((iv) => clearInterval(iv));
+    // Stop every active poll / SSE stream BEFORE clearing the token.
+    pollingIntervals.current.forEach((handle) => {
+      if (handle && typeof handle.close === "function") handle.close(); // EventSource
+      else clearInterval(handle);
+    });
     pollingIntervals.current.clear();
     localStorage.removeItem("genly_token");
     localStorage.removeItem("genly_user");
@@ -358,53 +362,144 @@ export default function App() {
   useEffect(() => { if (token) fetchHistory(); }, [token, fetchHistory]);
 
   const pollJob = useCallback((jobId) => {
-    // Poll every 3 s (instead of 1 s) and skip the tick entirely when the tab
-    // is hidden. For a user with a few tabs open and 20 active jobs this cuts
-    // the request rate by ~90%.
+    // Use SSE when available; fall back to 3 s polling for proxies that buffer
+    // text/event-stream (some corporate HTTPS interceptors).
+    const TERMINAL = new Set(["done", "pending_review", "error", "validation_failed"]);
+
     return new Promise((resolve) => {
-      const iv = setInterval(async () => {
-        if (typeof document !== "undefined" && document.hidden) return;
-        // Token can disappear mid-poll if the user logs out from another
-        // tab; bail rather than spamming 401s.
-        if (!getToken()) {
-          clearInterval(iv);
-          pollingIntervals.current.delete(iv);
-          resolve("aborted");
-          return;
-        }
-        try {
-          const res = await authFetch(`${API}/status/${jobId}`);
-          if (res.status === 401) {
+      const token = getToken();
+      if (!token) { resolve("aborted"); return; }
+
+      // --- SSE path ---
+      let es;
+      try {
+        // Append the auth token as a query param — EventSource doesn't support
+        // custom headers; the backend's get_current_user_from_token_param dep
+        // handles token= on GET endpoints.
+        es = new EventSource(`${API}/events/${jobId}?token=${encodeURIComponent(token)}`);
+      } catch {
+        es = null;
+      }
+
+      if (es) {
+        const cleanup = () => { es.close(); pollingIntervals.current.delete(es); };
+        pollingIntervals.current.add(es);
+        es.onmessage = (e) => {
+          try {
+            const data = JSON.parse(e.data);
+            setJobs((prev) => prev.map((j) =>
+              j.job_id === jobId
+                ? { ...j, status: data.status, current_step: data.current_step,
+                    progress: data.progress, error: data.error,
+                    created_at: data.created_at ?? j.created_at,
+                    completed_at: data.completed_at ?? j.completed_at }
+                : j
+            ));
+            if (TERMINAL.has(data.status)) {
+              cleanup();
+              fetchHistory();
+              resolve(data.status);
+            }
+          } catch {}
+        };
+        es.onerror = () => {
+          // SSE connection dropped (e.g. proxy buffering). Fall through to polling.
+          cleanup();
+          startPolling();
+        };
+        return;
+      }
+
+      // --- Polling fallback ---
+      function startPolling() {
+        const iv = setInterval(async () => {
+          if (typeof document !== "undefined" && document.hidden) return;
+          if (!getToken()) {
             clearInterval(iv);
             pollingIntervals.current.delete(iv);
-            handleLogout();
-            resolve("unauthorized");
+            resolve("aborted");
             return;
           }
-          if (!res.ok) return;
-          const data = await res.json();
-          setJobs((prev) => prev.map((j) =>
-            j.job_id === jobId ? { ...j, status: data.status, current_step: data.current_step, progress: data.progress, error: data.error } : j
-          ));
-          if (data.status === "done" || data.status === "error" || data.status === "pending_review" || data.status === "validation_failed") {
-            clearInterval(iv);
-            pollingIntervals.current.delete(iv);
-            fetchHistory();
-            resolve(data.status);
-          }
-        } catch {}
-      }, 3000);
-      pollingIntervals.current.add(iv);
+          try {
+            const res = await authFetch(`${API}/status/${jobId}`);
+            if (res.status === 401) {
+              clearInterval(iv);
+              pollingIntervals.current.delete(iv);
+              handleLogout();
+              resolve("unauthorized");
+              return;
+            }
+            if (!res.ok) return;
+            const data = await res.json();
+            setJobs((prev) => prev.map((j) =>
+              j.job_id === jobId
+                ? { ...j, status: data.status, current_step: data.current_step,
+                    progress: data.progress, error: data.error,
+                    created_at: data.created_at ?? j.created_at,
+                    completed_at: data.completed_at ?? j.completed_at }
+                : j
+            ));
+            if (TERMINAL.has(data.status)) {
+              clearInterval(iv);
+              pollingIntervals.current.delete(iv);
+              fetchHistory();
+              resolve(data.status);
+            }
+          } catch {}
+        }, 3000);
+        pollingIntervals.current.add(iv);
+      }
+      startPolling();
     });
-  }, [fetchHistory]);
+  }, [fetchHistory, handleLogout]);
 
   useEffect(() => () => {
-    pollingIntervals.current.forEach((iv) => clearInterval(iv));
+    pollingIntervals.current.forEach((handle) => {
+      if (handle && typeof handle.close === "function") handle.close();
+      else clearInterval(handle);
+    });
+  }, []);
+
+  // Pre-upload + transcribe songs at indices fromIdx..queue.length-1 in the
+  // background while the user is actively reviewing a different song. Results
+  // land in prefetchCache.current[idx] so transcribeNext can serve them
+  // instantly instead of making the user wait for the round-trip.
+  const prefetchRemaining = useCallback(async (queue, fromIdx) => {
+    for (let idx = fromIdx; idx < queue.length; idx++) {
+      // Skip if already fetched or in-flight.
+      if (prefetchCache.current[idx]) continue;
+      prefetchCache.current[idx] = { status: "loading" };
+      const entry = queue[idx];
+      try {
+        const { jobId } = await uploadFileToR2(entry.file, {
+          meta: { artist: entry.artist || "", title: (entry.songTitle || "").trim() },
+        });
+        const res = await authFetch(`${API}/transcribe-uploaded`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            job_id: jobId,
+            language: entry.language || "",
+            artist: entry.artist || "",
+            title: (entry.songTitle || "").trim(),
+          }),
+        });
+        if (res.ok) {
+          const data = await res.json();
+          prefetchCache.current[idx] = { status: "ready", data, jobId };
+        } else {
+          prefetchCache.current[idx] = { status: "error" };
+        }
+      } catch {
+        prefetchCache.current[idx] = { status: "error" };
+      }
+    }
   }, []);
 
   // --- Review flow ---
   const handleStartReview = async () => {
     if (!files.length || !files.every((f) => f.artist.trim())) return;
+    prefetchCache.current = {};
     setReviewQueue([...files]);
     navigate("/review");
     transcribeNext([...files], 0);
@@ -428,6 +523,34 @@ export default function App() {
   const transcribeNext = async (queue, idx) => {
     if (idx >= queue.length) return;
     const entry = queue[idx];
+
+    // Fast path: a background prefetch already finished for this index.
+    const cached = prefetchCache.current[idx];
+    if (cached?.status === "ready") {
+      const { data, jobId } = cached;
+      setTranscribing(false);
+      setTranscribeProgress(null);
+      setCurrentReview({
+        file: entry.file, artist: entry.artist, language: entry.language,
+        songTitle: entry.songTitle || "",
+        genre: entry.genre || "", font: entry.font || "",
+        concept: entry.concept || "", movementStyle: entry.movementStyle || "",
+        textCase: entry.textCase || "upper",
+        fontScale: entry.fontScale || "1.0",
+        lyricTransition: entry.lyricTransition || "cut",
+        textMotion: entry.textMotion || "none",
+        segments: data.segments, referenceLyrics: data.reference_lyrics || "",
+        coverageWarning: !!data.coverage_warning,
+        recoverySource: data.recovery_source || "",
+        transcribeJobId: data.job_id || jobId,
+        queueIdx: idx, queue,
+      });
+      // Kick off prefetch for all remaining songs.
+      prefetchRemaining(queue, idx + 1);
+      return;
+    }
+
+    // Slow path: upload + transcribe now (first song, or prefetch missed).
     setTranscribing(true);
     setTranscribeError(null);
     setTranscribeProgress({ phase: "uploading", loaded: 0, total: entry.file.size });
@@ -487,6 +610,9 @@ export default function App() {
         transcribeJobId: data.job_id || uploadJobId,
         queueIdx: idx, queue,
       });
+      // Kick off background upload+transcription for songs idx+1..N-1
+      // while the user is reading/editing the current song's lyrics.
+      prefetchRemaining(queue, idx + 1);
     } catch (err) {
       setTranscribing(false);
       setTranscribeProgress(null);
@@ -737,6 +863,7 @@ export default function App() {
     if (hasState && !skipConfirm && !window.confirm(t("batch.confirm_cancel"))) return;
     pollingIntervals.current.forEach((iv) => clearInterval(iv));
     pollingIntervals.current.clear();
+    prefetchCache.current = {};
     setFiles([]); setJobs([]); setBackgroundFile(null); setBackgroundId(null);
     setReviewQueue([]); setCurrentReview(null); setApprovedJobs([]);
     setTranscribing(false); setReadyToGenerate(false); setTranscribeError(null);
@@ -793,6 +920,25 @@ export default function App() {
 
   const handleSelectJob = (jobId) => {
     navigate(`/videos/${jobId}`);
+  };
+
+  const handleBulkApproveBatch = async (jobIds) => {
+    if (!Array.isArray(jobIds) || jobIds.length === 0) return;
+    for (const jobId of jobIds) {
+      try {
+        const res = await authFetch(`${API}/approve/${jobId}`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ notes: "" }),
+        });
+        if (res.ok) {
+          setJobs((prev) =>
+            prev.map((j) => j.job_id === jobId ? { ...j, status: "done" } : j)
+          );
+        }
+      } catch {}
+    }
+    fetchHistory();
   };
 
   const handleDeleteJob = async (jobId) => {
@@ -859,6 +1005,8 @@ export default function App() {
         onFiles={setFiles}
         delivery={delivery}
         onDeliveryChange={setDelivery}
+        style={style}
+        onStyleChange={setStyle}
         backgroundFile={backgroundFile}
         onBackgroundFile={setBackgroundFile}
         backgroundId={backgroundId}
@@ -1017,6 +1165,7 @@ export default function App() {
           onReset={handleReset}
           onSingleDone={handleSelectJob}
           onSelectJob={handleSelectJob}
+          onBulkApprove={handleBulkApproveBatch}
         />
       </div>
     )
