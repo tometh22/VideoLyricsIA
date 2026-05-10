@@ -515,12 +515,17 @@ def _migrate_user_columns():
         "ALTER TABLE background_assets ADD COLUMN IF NOT EXISTS parent_asset_id INTEGER REFERENCES background_assets(id)",
         "CREATE INDEX IF NOT EXISTS ix_background_assets_owner_tenant_id ON background_assets(owner_tenant_id)",
     ]
-    with engine.begin() as conn:
-        for sql in column_adds:
-            try:
+    # Each statement gets its own transaction. In Postgres, a failed statement
+    # inside a transaction puts it in aborted state — subsequent execute()
+    # calls are silently ignored even if caught in Python. One tx per stmt
+    # ensures a failed ADD COLUMN (column already exists via Alembic) never
+    # blocks the ALTER COLUMN widening that follows it.
+    for sql in column_adds:
+        try:
+            with engine.begin() as conn:
                 conn.execute(text(sql))
-            except Exception as e:  # pragma: no cover — dialect-specific
-                print(f"[init_db] migrate skipped: {sql} → {e}")
+        except Exception as e:  # pragma: no cover — dialect-specific
+            print(f"[init_db] migrate skipped: {sql} → {e}")
 
 
 def drop_db():
