@@ -85,6 +85,19 @@ if _ENV in ("prod", "production") and (
         "Generate one with: openssl rand -base64 32"
     )
 
+# Transcription falls back to a local Whisper model (~1.5 GB RAM per request)
+# when OPENAI_API_KEY is missing — see pipeline._transcribe in pipeline.py.
+# That fallback can't sustain more than a couple of concurrent users, which
+# is fine for dev but unacceptable for paying clients. Fail boot in prod
+# if the key is missing so the deployment never accidentally serves customer
+# traffic from the local-Whisper path.
+if _ENV in ("prod", "production") and not os.environ.get("OPENAI_API_KEY", "").strip():
+    raise RuntimeError(
+        "OPENAI_API_KEY must be set when ENV=prod/production. "
+        "The local Whisper fallback uses ~1.5 GB RAM per request and won't scale. "
+        "Get a key at https://platform.openai.com/api-keys."
+    )
+
 # --- Password hashing ---
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 

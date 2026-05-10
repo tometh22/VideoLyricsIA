@@ -1095,9 +1095,14 @@ _TRANSCRIPTION_COUNTER_KEY = "transcriptions:in_flight"
 def _try_acquire_transcription_slot() -> str | None:
     """Reserve a Whisper slot in Redis. Same pattern as _try_acquire_upload_slot.
 
-    Returns a lease id on success, None when Redis is unavailable (dev/test),
-    raises 503 when the global cap is reached.
+    Returns a lease id on success, None when Redis is unavailable (dev/test)
+    or when OpenAI's Whisper API is configured (no local memory used, no need
+    to gate concurrency). Raises 503 only on the local-Whisper code path.
     """
+    # OpenAI's Whisper API handles concurrency for us — each transcription
+    # is a remote HTTP call, not a local model load. No reason to cap.
+    if os.environ.get("OPENAI_API_KEY", "").strip():
+        return None
     redis_url = os.environ.get("REDIS_URL", "").strip()
     if not redis_url:
         return None
