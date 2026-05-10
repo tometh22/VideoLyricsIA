@@ -1,9 +1,16 @@
-import { useEffect, useState, useMemo, lazy, Suspense } from "react";
+import { useEffect, useState, useMemo, useCallback, Component } from "react";
+import { Joyride } from "react-joyride";
 import { useI18n } from "../i18n";
 
-// Lazy-load Joyride so it only ships in the bundle when a tour
-// actually mounts. shouldRun=false short-circuits before the import.
-const Joyride = lazy(() => import("react-joyride"));
+// Catches any error thrown by Joyride (e.g. internal React reconciliation
+// errors in react-floater) so the crash stays scoped to the tour widget
+// and doesn't unmount the entire app.
+class TourErrorBoundary extends Component {
+  constructor(props) { super(props); this.state = { failed: false }; }
+  static getDerivedStateFromError() { return { failed: true }; }
+  componentDidCatch(err) { console.error("[Tour] Joyride error caught:", err); }
+  render() { return this.state.failed ? null : this.props.children; }
+}
 
 // localStorage flags. Each tour persists independently so a user
 // who already saw the dashboard tour but hasn't been to the editor
@@ -95,7 +102,7 @@ function TourRunner({ flagKey, steps, user, forceRun = false, onDone }) {
     setRun(forceRun || shouldAutoRun(flagKey, user));
   }, [flagKey, user, forceRun]);
 
-  const handleCallback = (data) => {
+  const handleCallback = useCallback((data) => {
     const { status, type } = data;
     // 'finished' = user reached the end. 'skipped' = user clicked Skip.
     // Both should mark the flag. Joyride emits 'tour:end' lifecycle
@@ -105,25 +112,25 @@ function TourRunner({ flagKey, steps, user, forceRun = false, onDone }) {
       setRun(false);
       onDone && onDone();
     }
-  };
+  }, [flagKey, onDone]);
 
-  const localized = useMemo(() => steps.map((s) => ({
-    ...s,
-    locale: {
-      back:  t("tour.back")  || "Atrás",
-      next:  t("tour.next")  || "Siguiente",
-      skip:  t("tour.skip")  || "Saltar tour",
-      last:  t("tour.finish")|| "Listo",
-      close: "✕",
-    },
-  })), [steps, t]);
+  // Memoize locale so Joyride never receives a new object reference on
+  // re-render. Passing an inline literal causes Joyride v3 to setState on
+  // every render, triggering an infinite loop (React #306 = black screen).
+  const locale = useMemo(() => ({
+    back:  t("tour.back")  || "Atrás",
+    next:  t("tour.next")  || "Siguiente",
+    skip:  t("tour.skip")  || "Saltar tour",
+    last:  t("tour.finish")|| "Listo",
+    close: "✕",
+  }), [t]);
 
   if (!run) return null;
 
   return (
-    <Suspense fallback={null}>
+    <TourErrorBoundary>
       <Joyride
-        steps={localized}
+        steps={steps}
         run={run}
         continuous
         showProgress
@@ -132,15 +139,9 @@ function TourRunner({ flagKey, steps, user, forceRun = false, onDone }) {
         scrollToFirstStep
         styles={STYLES}
         callback={handleCallback}
-        locale={{
-          back:  t("tour.back")  || "Atrás",
-          next:  t("tour.next")  || "Siguiente",
-          skip:  t("tour.skip")  || "Saltar tour",
-          last:  t("tour.finish")|| "Listo",
-          close: "✕",
-        }}
+        locale={locale}
       />
-    </Suspense>
+    </TourErrorBoundary>
   );
 }
 
