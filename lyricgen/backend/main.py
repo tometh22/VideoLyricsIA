@@ -1589,6 +1589,41 @@ async def upload_multipart_part_url(
     return {"url": url, "expires_in": _PRESIGN_PUT_TTL_S}
 
 
+@app.post("/upload-part-proxy")
+@limiter.limit("600/minute")
+async def upload_part_proxy(
+    request: Request,
+    job_id: str,
+    part_number: int,
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Proxy a multipart chunk to R2 server-side. The browser POSTs raw
+    bytes here (same-origin, no CORS preflight) instead of PUTting directly
+    to r2.cloudflarestorage.com which would require R2 bucket CORS config."""
+    if part_number < 1 or part_number > 10_000:
+        raise HTTPException(status_code=400, detail="part_number out of range")
+    from jobs import get_job_model
+    job_row = get_job_model(db, job_id)
+    if (not job_row
+            or job_row.user_id != current_user["id"]
+            or job_row.tenant_id != current_user["tenant_id"]):
+        raise HTTPException(status_code=404, detail="Job not found.")
+    if job_row.status != "awaiting_upload" or not job_row.multipart_upload_id:
+        raise HTTPException(
+            status_code=409, detail="Job is not in an active multipart upload."
+        )
+    data = await request.body()
+    if not data:
+        raise HTTPException(status_code=400, detail="Empty chunk.")
+    etag = storage.upload_part(
+        job_row.input_r2_key, job_row.multipart_upload_id, part_number, data
+    )
+    if etag is None:
+        raise HTTPException(status_code=502, detail="R2 part upload failed.")
+    return {"etag": etag}
+
+
 class _MultipartCompleteReq(BaseModel):
     job_id: str
     parts: list  # list of {"part_number": int, "etag": str}

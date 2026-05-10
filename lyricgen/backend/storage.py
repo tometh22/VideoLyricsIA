@@ -338,6 +338,28 @@ def multipart_presign_part(
     )
 
 
+def upload_part(
+    key: str, upload_id: str, part_number: int, data: bytes,
+) -> Optional[str]:
+    """Upload one multipart part server-side. Returns ETag (without quotes) or None."""
+    client = _get_client()
+    if client is None:
+        return None
+    try:
+        response = client.upload_part(
+            Bucket=R2_BUCKET,
+            Key=key,
+            UploadId=upload_id,
+            PartNumber=part_number,
+            Body=data,
+        )
+        return response["ETag"].strip('"')
+    except Exception as exc:
+        import logging
+        logging.getLogger(__name__).error("upload_part failed: %s", exc, exc_info=True)
+        return None
+
+
 def multipart_complete(
     key: str, upload_id: str, parts: list[dict],
 ) -> Optional[str]:
