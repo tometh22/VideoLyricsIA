@@ -1495,7 +1495,16 @@ async def upload_multipart_init(
         content_type=body.content_type or None,
     )
     if not init:
-        raise HTTPException(status_code=503, detail="Could not initiate multipart upload.")
+        # Most common cause: R2 credentials missing/wrong, or R2 bucket
+        # config (CORS, ACL) rejecting create_multipart_upload. The
+        # full traceback is in the API container logs (see storage.py).
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "No pudimos iniciar la subida del archivo grande. "
+                "Revisá la conexión y reintentá; si persiste, contactá soporte."
+            ),
+        )
     job_row.input_r2_key = init["key"]
     job_row.multipart_upload_id = init["upload_id"]
     db.commit()
