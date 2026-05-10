@@ -559,6 +559,38 @@ def run_pipeline(job_id: str, mp3_path: str, artist: str, style: str,
 
         update_job(job_id, status=final_status, progress=100, files=files)
 
+        # Send job completion email to the user (best-effort, never blocks render).
+        try:
+            import emails as _emails
+            from database import SessionLocal as _SessionLocal, Job as _Job
+            from database import User as _User, UserSettings as _UserSettings
+            _ndb = _SessionLocal()
+            try:
+                _job_row = _ndb.query(_Job).filter(_Job.job_id == job_id).first()
+                if _job_row and _job_row.user_id:
+                    _usr = _ndb.query(_User).filter(_User.id == _job_row.user_id).first()
+                    if _usr and _usr.email:
+                        _settings = _ndb.query(_UserSettings).filter(
+                            _UserSettings.user_id == _usr.id
+                        ).first()
+                        _prefs = (_settings.settings_json or {}) if _settings else {}
+                        if _prefs.get("notif_jobs", False):
+                            threading.Thread(
+                                target=_emails.send_job_completed,
+                                kwargs={
+                                    "email": _usr.email,
+                                    "username": _usr.username,
+                                    "artist": artist or "",
+                                    "filename": os.path.basename(mp3_path),
+                                    "job_id": job_id,
+                                },
+                                daemon=True,
+                            ).start()
+            finally:
+                _ndb.close()
+        except Exception as _email_err:
+            print(f"[PIPELINE] job completion email skipped: {_email_err}")
+
         # G4: pre-warm the ProRes deliverables in a background worker
         # job. When UMG eventually clicks "Master ProRes" the .mov is
         # already on R2 (302 instant) instead of paying 60-120 s of

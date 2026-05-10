@@ -60,11 +60,12 @@ from auth import (
     verify_media_token,
     validate_password_strength,
     has_prores_access,
+    generate_api_key,
 )
 import storage
 from datetime import datetime, timedelta, timezone
 
-from database import Job, User, UserSettings, AuditLog, get_db, init_db, BackgroundAsset, AssetUsage
+from database import Job, User, UserSettings, AuditLog, APIKey, get_db, init_db, BackgroundAsset, AssetUsage
 from jobs import bulk_delete_jobs, create_job, delete_job, get_job, get_all_jobs, update_job
 from observability import init_sentry, init_logging, health_snapshot
 from pipeline import run_pipeline, transcribe
@@ -520,6 +521,10 @@ class DeleteAccountRequest(BaseModel):
     password: str
 
 
+class CreateAPIKeyRequest(BaseModel):
+    name: str
+
+
 @app.post("/auth/login")
 @limiter.limit("10/minute")
 async def login(body: LoginRequest, request: Request, db: Session = Depends(get_db)):
@@ -742,6 +747,91 @@ async def delete_account(
     user.username = f"deleted_{user.id}"
     db.add(AuditLog(
         user_id=user.id, action="auth.delete_account",
+        ip_address=request.client.host if request.client else None,
+    ))
+    db.commit()
+    return {"ok": True}
+
+
+@app.get("/auth/api-keys")
+async def list_api_keys(
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """List the current user's active API keys (secrets never returned)."""
+    keys = db.query(APIKey).filter(
+        APIKey.user_id == current_user["id"],
+        APIKey.is_active.is_(True),
+    ).order_by(APIKey.created_at.desc()).all()
+    return [
+        {
+            "id": k.id,
+            "name": k.name,
+            "prefix": k.key_prefix,
+            "created_at": k.created_at.isoformat() if k.created_at else None,
+            "last_used_at": k.last_used_at.isoformat() if k.last_used_at else None,
+        }
+        for k in keys
+    ]
+
+
+@app.post("/auth/api-keys")
+@limiter.limit("10/minute")
+async def create_api_key(
+    body: CreateAPIKeyRequest,
+    request: Request,
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Create a new API key. The full secret is returned exactly once."""
+    if not body.name.strip():
+        raise HTTPException(status_code=400, detail="Key name is required")
+    active_count = db.query(APIKey).filter(
+        APIKey.user_id == current_user["id"],
+        APIKey.is_active.is_(True),
+    ).count()
+    if active_count >= 10:
+        raise HTTPException(status_code=400, detail="Maximum 10 API keys per account")
+    full_key, prefix, key_hash = generate_api_key()
+    key = APIKey(
+        user_id=current_user["id"],
+        name=body.name.strip(),
+        key_prefix=prefix,
+        key_hash=key_hash,
+    )
+    db.add(key)
+    db.add(AuditLog(
+        user_id=current_user["id"], action="auth.api_key.create",
+        ip_address=request.client.host if request.client else None,
+    ))
+    db.commit()
+    db.refresh(key)
+    return {
+        "id": key.id,
+        "name": key.name,
+        "prefix": prefix,
+        "key": full_key,
+        "created_at": key.created_at.isoformat() if key.created_at else None,
+    }
+
+
+@app.delete("/auth/api-keys/{key_id}")
+async def revoke_api_key(
+    key_id: int,
+    request: Request,
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Revoke an API key by ID."""
+    key = db.query(APIKey).filter(
+        APIKey.id == key_id,
+        APIKey.user_id == current_user["id"],
+    ).first()
+    if not key:
+        raise HTTPException(status_code=404, detail="API key not found")
+    key.is_active = False
+    db.add(AuditLog(
+        user_id=current_user["id"], action="auth.api_key.revoke",
         ip_address=request.client.host if request.client else None,
     ))
     db.commit()
@@ -988,6 +1078,59 @@ def _lock_user_for_quota(db: Session, user_id: int) -> None:
     ).first()
 
 
+def _try_send_usage_alert(db: Session, current_user: dict, usage: dict) -> None:
+    """Fire a usage-alert email at the 80% and 100% thresholds — once per
+    threshold per calendar month per user.  Uses AuditLog for deduplication so
+    concurrent requests at the same quota level don't fan-out duplicate mail.
+    Best-effort: any exception is swallowed so it never blocks a job submit.
+    """
+    try:
+        percent = usage["percent"]
+        if percent < 80:
+            return
+        action = "usage_alert_100" if percent >= 100 else "usage_alert_80"
+
+        now = datetime.now(timezone.utc)
+        month_start = datetime(now.year, now.month, 1, tzinfo=timezone.utc)
+        already_sent = db.query(AuditLog).filter(
+            AuditLog.user_id == current_user["id"],
+            AuditLog.action == action,
+            AuditLog.created_at >= month_start,
+        ).first()
+        if already_sent:
+            return
+
+        user_obj = db.query(User).filter(User.id == current_user["id"]).first()
+        if not user_obj or not user_obj.email:
+            return
+
+        notif_key = "notif_quota_100" if percent >= 100 else "notif_quota_80"
+        user_settings = db.query(UserSettings).filter(
+            UserSettings.user_id == user_obj.id
+        ).first()
+        prefs = (user_settings.settings_json or {}) if user_settings else {}
+        if not prefs.get(notif_key, True):
+            return
+
+        db.add(AuditLog(user_id=user_obj.id, action=action, detail={"percent": percent}))
+        db.commit()
+
+        threading.Thread(
+            target=emails.send_usage_alert,
+            kwargs={
+                "email": user_obj.email,
+                "username": user_obj.username,
+                "percent": percent,
+                "used": usage["used"],
+                "limit": usage["limit"],
+                "plan": usage["plan"],
+            },
+            daemon=True,
+        ).start()
+    except Exception as _e:
+        logger.warning("usage alert skipped: %s", _e)
+
+
 def _enforce_plan_quota(db: Session, current_user: dict) -> None:
     """Raise 402 if the tenant reached its monthly limit without overage allowed.
 
@@ -1000,6 +1143,8 @@ def _enforce_plan_quota(db: Session, current_user: dict) -> None:
     tenant_id = current_user["tenant_id"]
     _lock_user_for_quota(db, current_user["id"])
     usage = get_plan_usage(db, current_user["id"], tenant_id, plan)
+    if plan != "unlimited" and usage["percent"] >= 80:
+        _try_send_usage_alert(db, current_user, usage)
     if usage["remaining"] <= 0 and plan != "unlimited":
         if not current_user.get("allow_overage", False):
             support_email = os.environ.get("SUPPORT_EMAIL", "soporte@genly.pro")

@@ -230,3 +230,22 @@ def send_invoice_paid(email: str, username: str, amount: float, currency: str, i
     <p style="color:#888;font-size:13px;">Thank you for using GenLy AI.</p>
     """
     _send_email(email, f"Payment received — ${amount:.2f}", _wrap_template(content))
+
+
+def send_payment_failed(email: str, username: str, amount: float, currency: str):
+    """Notify user that their payment failed and action is required."""
+    content = f"""
+    <h2 style="color:#ef4444;margin:0 0 16px;">Payment failed</h2>
+    <p>Hi <strong>{username}</strong>,</p>
+    <p>We were unable to process your payment of
+    <strong>${amount:.2f} {currency.upper()}</strong>.</p>
+    <p>Please update your payment method to keep your subscription active and avoid
+    interruptions to your video generation.</p>
+    {_button(FRONTEND_URL + "/?view=settings&tab=facturacion", "Update Payment Method")}
+    <p style="color:#888;font-size:13px;">If you have questions, reply to this email.</p>
+    """
+    _send_email(
+        email,
+        "Action required: Payment failed — GenLy AI",
+        _wrap_template(content),
+    )

@@ -1,5 +1,6 @@
 """JWT authentication module for GenLy AI — PostgreSQL backed."""
 
+import hashlib
 import os
 import secrets
 import time
@@ -127,7 +128,44 @@ def validate_password_strength(password: str) -> None:
             "(roughly 72 ASCII chars or 36 emoji-heavy chars)."
         )
 
-security = HTTPBearer()
+security = HTTPBearer(auto_error=False)
+
+
+def generate_api_key() -> tuple[str, str, str]:
+    """Return (full_key, prefix, key_hash). The full key is shown to the user
+    exactly once and never stored in plaintext — only the SHA-256 hash is kept."""
+    raw = secrets.token_hex(32)
+    full_key = f"gly_{raw}"
+    prefix = full_key[:12]
+    key_hash = hashlib.sha256(full_key.encode()).hexdigest()
+    return full_key, prefix, key_hash
+
+
+def verify_api_key(db: Session, full_key: str) -> Optional[dict]:
+    """Verify a raw API key and return the user dict, or None if invalid."""
+    from database import APIKey
+    key_hash = hashlib.sha256(full_key.encode()).hexdigest()
+    key = db.query(APIKey).filter(
+        APIKey.key_hash == key_hash,
+        APIKey.is_active.is_(True),
+    ).first()
+    if not key:
+        return None
+    user = get_user_by_id(db, key.user_id)
+    if not user or not user.is_active:
+        return None
+    key.last_used_at = datetime.now(timezone.utc)
+    db.commit()
+    return {
+        "id": user.id,
+        "username": user.username,
+        "email": user.email,
+        "role": user.role,
+        "tenant_id": user.tenant_id,
+        "plan": user.plan_id,
+        "allow_overage": getattr(user, "allow_overage", False) or False,
+        "features": {"prores_export": has_prores_access(user)},
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -376,10 +414,22 @@ def decode_token(token: str) -> dict:
 
 
 async def get_current_user(
-    credentials: HTTPAuthorizationCredentials = Depends(security),
+    request: Request,
+    credentials: Optional[HTTPAuthorizationCredentials] = Depends(security),
     db: Session = Depends(get_db),
 ) -> dict:
-    """FastAPI dependency — extracts and validates the current user from Bearer token."""
+    """FastAPI dependency — accepts either a JWT Bearer token or an X-API-Key header."""
+    # API key path (enterprise integrations)
+    api_key_value = request.headers.get("X-API-Key")
+    if api_key_value:
+        user_dict = verify_api_key(db, api_key_value)
+        if not user_dict:
+            raise HTTPException(status_code=401, detail="Invalid or revoked API key")
+        return user_dict
+
+    # JWT path (browser/app)
+    if not credentials:
+        raise HTTPException(status_code=401, detail="Authentication required")
     payload = decode_token(credentials.credentials)
     # Refresh user data from DB to get latest plan etc.
     user = get_user_by_id(db, int(payload["sub"]))

@@ -380,6 +380,19 @@ export default function Dashboard({ user, history, historyError, historyLoaded =
             </span>
           </div>
         )}
+        {usage?.plan === "free" && !isUnlimited && (
+          <div className="mt-4 flex items-center justify-between px-3.5 py-2.5 rounded-xl bg-brand/8 ring-1 ring-brand/20">
+            <span className="text-xs text-gray-300">
+              Necesitás más videos este mes?
+            </span>
+            <a
+              href="/account?tab=facturacion"
+              className="text-xs font-semibold text-brand-light hover:text-white transition-colors underline-offset-2 hover:underline"
+            >
+              Ver planes Pro →
+            </a>
+          </div>
+        )}
       </div>
 
       {/* ─── En proceso ahora — only when there's live work ─────── */}

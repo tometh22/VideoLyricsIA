@@ -5,12 +5,15 @@ import logging
 from datetime import datetime, timezone
 from typing import Optional
 
+import threading
+
 import stripe
 from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
+import emails
 from auth import get_current_user, PLANS, create_token
 from database import User, Invoice, get_db
 
@@ -360,6 +363,23 @@ def _handle_invoice_paid(db: Session, data: dict):
         # retrying us.
         db.rollback()
         logger.info("invoice.paid duplicate for %s — already recorded", stripe_inv_id)
+        return
+
+    if user.email:
+        amount_paid = data.get("amount_paid", 0) / 100
+        currency = data.get("currency", "usd")
+        invoice_url = data.get("hosted_invoice_url", "")
+        threading.Thread(
+            target=emails.send_invoice_paid,
+            kwargs={
+                "email": user.email,
+                "username": user.username,
+                "amount": amount_paid,
+                "currency": currency,
+                "invoice_url": invoice_url,
+            },
+            daemon=True,
+        ).start()
 
 
 def _handle_invoice_failed(db: Session, data: dict):
@@ -384,3 +404,17 @@ def _handle_invoice_failed(db: Session, data: dict):
         db.add(invoice)
     db.commit()
     logger.warning(f"Payment failed for user {user.username}")
+
+    if user.email:
+        amount_due = data.get("amount_due", 0) / 100
+        currency = data.get("currency", "usd")
+        threading.Thread(
+            target=emails.send_payment_failed,
+            kwargs={
+                "email": user.email,
+                "username": user.username,
+                "amount": amount_due,
+                "currency": currency,
+            },
+            daemon=True,
+        ).start()
