@@ -1093,6 +1093,72 @@ _MAX_CONCURRENT_UPLOADS = int(os.environ.get("MAX_CONCURRENT_UPLOADS", "8"))
 _UPLOAD_LEASE_TTL_S = int(os.environ.get("UPLOAD_LEASE_TTL_S", "600"))
 _UPLOAD_COUNTER_KEY = "uploads:in_flight"
 
+# Global cap on simultaneous inline Whisper runs. Whisper loads a model
+# into memory (~500 MB for base/small) and keeps it for the duration of
+# the request. Without a global ceiling, N users transcribing at the same
+# time spike memory together, each passing the per-request 85% gate in a
+# race, and then collectively push the container into OOM. Two concurrent
+# transcriptions is the safe ceiling for a 1-2 GB API container.
+_MAX_CONCURRENT_TRANSCRIPTIONS = int(os.environ.get("MAX_CONCURRENT_TRANSCRIPTIONS", "2"))
+_TRANSCRIPTION_LEASE_TTL_S = int(os.environ.get("TRANSCRIPTION_LEASE_TTL_S", "300"))
+_TRANSCRIPTION_COUNTER_KEY = "transcriptions:in_flight"
+
+
+def _try_acquire_transcription_slot() -> str | None:
+    """Reserve a Whisper slot in Redis. Same pattern as _try_acquire_upload_slot.
+
+    Returns a lease id on success, None when Redis is unavailable (dev/test),
+    raises 503 when the global cap is reached.
+    """
+    redis_url = os.environ.get("REDIS_URL", "").strip()
+    if not redis_url:
+        return None
+    try:
+        import uuid as _uuid
+        from redis import Redis
+        client = Redis.from_url(redis_url, socket_timeout=2)
+        lease = _uuid.uuid4().hex[:12]
+        pipe = client.pipeline()
+        pipe.sadd(_TRANSCRIPTION_COUNTER_KEY, lease)
+        pipe.scard(_TRANSCRIPTION_COUNTER_KEY)
+        pipe.expire(_TRANSCRIPTION_COUNTER_KEY, _TRANSCRIPTION_LEASE_TTL_S)
+        _, count, _ = pipe.execute()
+    except Exception as e:  # pragma: no cover
+        logger.debug("transcription concurrency: Redis unavailable (%s)", e)
+        return None
+    if count > _MAX_CONCURRENT_TRANSCRIPTIONS:
+        try:
+            client.srem(_TRANSCRIPTION_COUNTER_KEY, lease)
+        except Exception:
+            pass
+        logger.warning(
+            "/transcribe-uploaded refused: %d concurrent transcriptions in flight (cap %d)",
+            count, _MAX_CONCURRENT_TRANSCRIPTIONS,
+        )
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "Transcripción temporalmente saturada. Reintentá en unos segundos."
+            ),
+            headers={"Retry-After": "30"},
+        )
+    return lease
+
+
+def _release_transcription_slot(lease_id: str | None) -> None:
+    """Release a previously-acquired transcription slot. Best-effort."""
+    if not lease_id:
+        return
+    redis_url = os.environ.get("REDIS_URL", "").strip()
+    if not redis_url:
+        return
+    try:
+        from redis import Redis
+        client = Redis.from_url(redis_url, socket_timeout=2)
+        client.srem(_TRANSCRIPTION_COUNTER_KEY, lease_id)
+    except Exception:  # pragma: no cover
+        pass
+
 
 def _try_acquire_upload_slot() -> str | None:
     """Reserve an upload slot in Redis. Returns a lease id (string) on
@@ -1601,34 +1667,37 @@ async def transcribe_uploaded(
 
     _enforce_disk_capacity()
     _enforce_memory_pressure()
+    transcription_lease = _try_acquire_transcription_slot()
+    try:
+        # Materialize the audio onto local disk for Whisper / ffmpeg / etc.
+        job_id = body.job_id
+        job_dir = os.path.join(OUTPUTS_DIR, job_id)
+        os.makedirs(job_dir, exist_ok=True)
+        audio_path = os.path.join(job_dir, job_row.filename)
 
-    # Materialize the audio onto local disk for Whisper / ffmpeg / etc.
-    job_id = body.job_id
-    job_dir = os.path.join(OUTPUTS_DIR, job_id)
-    os.makedirs(job_dir, exist_ok=True)
-    audio_path = os.path.join(job_dir, job_row.filename)
+        if not os.path.exists(audio_path):
+            ok = storage.download_object(job_row.input_r2_key, audio_path)
+            if not ok:
+                raise HTTPException(
+                    status_code=502,
+                    detail=f"Could not fetch upload from object storage ({job_row.input_r2_key}).",
+                )
+        _validate_audio_file_on_disk(job_row.filename, audio_path)
 
-    if not os.path.exists(audio_path):
-        ok = storage.download_object(job_row.input_r2_key, audio_path)
-        if not ok:
-            raise HTTPException(
-                status_code=502,
-                detail=f"Could not fetch upload from object storage ({job_row.input_r2_key}).",
-            )
-    _validate_audio_file_on_disk(job_row.filename, audio_path)
+        # Reuse the existing Whisper / lrclib machinery from the legacy
+        # /transcribe handler. Keeping the implementation in one place via
+        # the helper below means the lyrics-recovery / hallucination logic
+        # stays in lockstep with the legacy fallback.
+        job_row.status = "transcribed_pending"
+        job_row.current_step = "editing"
+        db.commit()
 
-    # Reuse the existing Whisper / lrclib machinery from the legacy
-    # /transcribe handler. Keeping the implementation in one place via
-    # the helper below means the lyrics-recovery / hallucination logic
-    # stays in lockstep with the legacy fallback.
-    job_row.status = "transcribed_pending"
-    job_row.current_step = "editing"
-    db.commit()
-
-    return await _run_transcription_for_job(
-        request, db, current_user, job_id, audio_path,
-        language=body.language, artist=body.artist, title=body.title,
-    )
+        return await _run_transcription_for_job(
+            request, db, current_user, job_id, audio_path,
+            language=body.language, artist=body.artist, title=body.title,
+        )
+    finally:
+        _release_transcription_slot(transcription_lease)
 
 
 # Deprecation metadata for the legacy multipart-form endpoints. RFC 8594
