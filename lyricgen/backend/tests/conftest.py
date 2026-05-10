@@ -13,7 +13,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 # process as test/dev BEFORE the first `from main import ...` triggers
 # module-level CORS validation.
 os.environ.setdefault("ENVIRONMENT", "test")
-os.environ["DATABASE_URL"] = "sqlite:///test.db"
+os.environ.setdefault("DATABASE_URL", "sqlite:///test.db")
 os.environ["JWT_SECRET"] = "test-secret-key-for-tests"
 os.environ["ADMIN_PASSWORD"] = "testadmin123"
 os.environ["RATE_LIMIT_ENABLED"] = "false"

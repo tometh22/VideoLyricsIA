@@ -14,6 +14,21 @@ jobs:
       run:
         working-directory: lyricgen/backend
 
+    services:
+      postgres:
+        image: postgres:15
+        env:
+          POSTGRES_USER: genly
+          POSTGRES_PASSWORD: genly
+          POSTGRES_DB: genly_test
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+        ports:
+          - 5432:5432
+
     steps:
       - uses: actions/checkout@v4
 
@@ -30,7 +45,7 @@ jobs:
 
       - name: Run tests
         env:
-          DATABASE_URL: "sqlite:///test.db"
+          DATABASE_URL: "postgresql://genly:genly@localhost:5432/genly_test"
           JWT_SECRET: "ci-test-secret-key"
           ADMIN_PASSWORD: "testadmin123"
         run: python -m pytest tests/ -v --tb=short
