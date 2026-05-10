@@ -188,7 +188,14 @@ async def create_user_admin(
     admin: dict = Depends(require_admin),
     db: Session = Depends(get_db),
 ):
-    """Create a new user (admin)."""
+    """Create a new user (admin).
+
+    Note: the admin form defaults `ai_authorized=False` (opposite of the
+    public `/auth/register` default) because admin-created accounts
+    typically belong to regulated tenants like UMG that require an
+    explicit auth step. To create with AI enabled, pass
+    `ai_authorized=True` — the same transaction stamps the audit fields.
+    """
     from auth import create_user
     try:
         user = create_user(
@@ -199,13 +206,15 @@ async def create_user_admin(
             role=body.role,
             plan=body.plan_id,
             tenant_id=body.tenant_id.strip() or None,
+            ai_authorized=body.ai_authorized,
         )
         _post_create_dirty = False
         if body.allow_overage:
             user.allow_overage = True
             _post_create_dirty = True
         if body.ai_authorized:
-            user.ai_authorized = True
+            # Stamp audit fields so the authorization is attributable to
+            # the admin that created the user, mirroring authorize-ai.
             user.ai_authorized_at = datetime.now(timezone.utc)
             user.ai_authorized_by = admin["id"]
             _post_create_dirty = True

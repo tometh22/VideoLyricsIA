@@ -137,9 +137,17 @@ def create_user(
     role: str = "user",
     tenant_id: str = None,
     plan: str = "free",
+    ai_authorized: bool = True,
 ) -> User:
     """Create a new user. Raises ValueError if username/email exists or
-    the password fails baseline strength checks."""
+    the password fails baseline strength checks.
+
+    `ai_authorized` defaults to True so that self-registered users (the
+    public funnel) can generate immediately. Admins creating users for
+    regulated tenants (e.g. UMG, where Guideline 5 requires explicit
+    per-operator authorization) must pass `ai_authorized=False` and use
+    `/admin/users/{id}/authorize-ai` once the user has been cleared.
+    """
     validate_password_strength(password)
     if get_user_by_username(db, username):
         raise ValueError(f"User '{username}' already exists")
@@ -157,7 +165,7 @@ def create_user(
         role=role,
         tenant_id=tenant_id,
         plan_id=plan,
-        ai_authorized=(role == "admin"),
+        ai_authorized=ai_authorized,
     )
     db.add(user)
     db.commit()

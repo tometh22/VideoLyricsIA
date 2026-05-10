@@ -249,12 +249,12 @@ def test_admin_revoke_user(client, admin_token, user_token):
     assert res.json()["ai_authorized"] is False
 
 
-def test_unauthorized_user_blocked_from_upload(client, user_token):
+def test_unauthorized_user_blocked_from_upload(client, unauthorized_user_token):
     """Non-authorized user gets 403 on upload."""
     fake_mp3 = io.BytesIO(b"ID3" + b"\x00" * 253)
     res = client.post(
         "/upload",
-        headers=auth(user_token),
+        headers=auth(unauthorized_user_token),
         files={"file": ("test.mp3", fake_mp3, "audio/mpeg")},
         data={"artist": "Test Artist", "style": "oscuro"},
     )
@@ -315,19 +315,19 @@ def test_admin_always_passes_ai_auth(client, admin_token):
     assert res.status_code != 403, f"Admin should not get 403, got {res.status_code}"
 
 
-def test_unauthorized_user_blocked_from_generate(client, user_token):
+def test_unauthorized_user_blocked_from_generate(client, unauthorized_user_token):
     """Non-authorized user gets 403 on /generate too."""
     fake_mp3 = io.BytesIO(b"ID3" + b"\x00" * 253)
     res = client.post(
         "/generate",
-        headers=auth(user_token),
+        headers=auth(unauthorized_user_token),
         files={"file": ("test.mp3", fake_mp3, "audio/mpeg")},
         data={"artist": "Test", "style": "oscuro", "segments_json": "[]"},
     )
     assert res.status_code == 403
 
 
-def test_library_background_bypasses_ai_auth(client, admin_token, user_token):
+def test_library_background_bypasses_ai_auth(client, admin_token, unauthorized_user_token):
     """Using a library background skips AI auth check (no AI generation needed)."""
     # Upload a background as admin
     fake_bg = io.BytesIO(b"\x00" * 512)
@@ -343,7 +343,7 @@ def test_library_background_bypasses_ai_auth(client, admin_token, user_token):
     fake_mp3 = io.BytesIO(b"ID3" + b"\x00" * 253)
     res = client.post(
         "/upload",
-        headers=auth(user_token),
+        headers=auth(unauthorized_user_token),
         files={"file": ("test.mp3", fake_mp3, "audio/mpeg")},
         data={"artist": "Test Artist", "style": "oscuro", "background_id": str(bg_id)},
     )
