@@ -534,6 +534,7 @@ def _migrate_user_columns():
     for sql in column_adds:
         try:
             with engine.begin() as conn:
+                conn.execute(text("SET LOCAL lock_timeout = '3s'"))
                 conn.execute(text(sql))
         except Exception as e:  # pragma: no cover — dialect-specific
             print(f"[init_db] migrate skipped: {sql} → {e}")
@@ -559,6 +560,7 @@ def _widen_column_to_text(table: str, column: str) -> None:
         if row and row[0].lower() == "text":
             return  # already widened — no lock needed
         with engine.begin() as conn:
+            conn.execute(text("SET LOCAL lock_timeout = '3s'"))
             conn.execute(text(f"ALTER TABLE {table} ALTER COLUMN {column} TYPE TEXT"))
     except Exception as e:  # pragma: no cover
         print(f"[init_db] widen skipped: {table}.{column} → {e}")
