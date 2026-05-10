@@ -87,7 +87,12 @@ def admin_token(client):
 
 @pytest.fixture
 def user_token(client):
-    """Register a test user and return token."""
+    """Register a test user and return token.
+
+    Self-registered users default to `ai_authorized=True` so the public
+    funnel works without admin friction. Tests that need an
+    explicitly-blocked user should use `unauthorized_user_token`.
+    """
     import uuid
     username = f"testuser_{uuid.uuid4().hex[:6]}"
     res = client.post("/auth/register", json={
@@ -96,6 +101,21 @@ def user_token(client):
         "email": f"{username}@test.com",
     })
     return res.json()["token"]
+
+
+@pytest.fixture
+def unauthorized_user_token(client, admin_token, user_token):
+    """A self-registered user with ai_authorized revoked.
+
+    Models a regulated-tenant operator (UMG-style) who has not been
+    cleared by an admin yet — i.e. should hit the AI auth gate.
+    """
+    me = client.get("/auth/me", headers={"Authorization": f"Bearer {user_token}"}).json()
+    client.post(
+        f"/admin/users/{me['id']}/revoke-ai",
+        headers={"Authorization": f"Bearer {admin_token}"},
+    )
+    return user_token
 
 
 def auth(token):

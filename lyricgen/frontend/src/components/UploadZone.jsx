@@ -182,11 +182,19 @@ export default function UploadZone({
   // When the user clears the library selection (or switches mode),
   // reset the variation toggle so a fresh pick starts in the safe
   // "as-is" default rather than inheriting the previous song's choice.
+  // Also reset when the selected asset is a still — variation requires
+  // a video source.
   useEffect(() => {
-    if (!backgroundId && backgroundMode !== "as_is") {
+    if (backgroundMode === "as_is") return;
+    if (!backgroundId) {
+      onBackgroundMode?.("as_is");
+      return;
+    }
+    const sel = libraryBgs.find((b) => b.id === backgroundId);
+    if (sel && sel.file_type !== "mp4") {
       onBackgroundMode?.("as_is");
     }
-  }, [backgroundId, backgroundMode, onBackgroundMode]);
+  }, [backgroundId, backgroundMode, libraryBgs, onBackgroundMode]);
 
   const _formatUsageDate = (iso) => {
     if (!iso) return "";
@@ -1041,7 +1049,10 @@ export default function UploadZone({
                         );
                       })}
                     </div>
-                    {backgroundId && libraryBgs.find((b) => b.id === backgroundId) && (
+                    {backgroundId && (() => {
+                      const sel = libraryBgs.find((b) => b.id === backgroundId);
+                      return sel && sel.file_type === "mp4";
+                    })() && (
                       <div className="mt-3 rounded-card bg-surface-2/40 ring-1 ring-white/[0.04] px-3 py-2.5">
                         <p className="text-[11px] text-ink-secondary mb-2">
                           {t("upload.bg_variation_prompt") || "Cómo querés usar este fondo:"}

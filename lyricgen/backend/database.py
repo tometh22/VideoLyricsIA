@@ -505,6 +505,14 @@ def _migrate_user_columns():
         "ALTER TABLE jobs ADD COLUMN IF NOT EXISTS song_title VARCHAR(500)",
         "ALTER TABLE jobs ADD COLUMN IF NOT EXISTS input_r2_key VARCHAR(500)",
         "ALTER TABLE jobs ADD COLUMN IF NOT EXISTS multipart_upload_id VARCHAR(255)",
+        # Library exclusivity (UMG): tenant-owned and variation-parent
+        # references on background_assets. Alembic owns the data migration
+        # that backfills owner_tenant_id for the existing library; here we
+        # only ensure the columns exist so a pod that boots before
+        # `alembic upgrade head` doesn't break /backgrounds.
+        "ALTER TABLE background_assets ADD COLUMN IF NOT EXISTS owner_tenant_id VARCHAR(100)",
+        "ALTER TABLE background_assets ADD COLUMN IF NOT EXISTS parent_asset_id INTEGER REFERENCES background_assets(id)",
+        "CREATE INDEX IF NOT EXISTS ix_background_assets_owner_tenant_id ON background_assets(owner_tenant_id)",
     ]
     with engine.begin() as conn:
         for sql in column_adds:
