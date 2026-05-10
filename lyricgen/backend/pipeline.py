@@ -529,7 +529,10 @@ def run_pipeline(job_id: str, mp3_path: str, artist: str, style: str,
         try:
             audio_dur_for_verify = _audio_duration(mp3_path)
         except Exception:
-            audio_dur_for_verify = 0.0
+            audio_dur_for_verify = None
+        if audio_dur_for_verify is None:
+            # _audio_duration uses mutagen/wave; fall back to ffprobe for any format
+            audio_dur_for_verify = _ffprobe_duration(mp3_path)
         _verify_deliverables(job_dir, files, audio_dur_for_verify)
 
         # Post-render upload to cloud storage. No-op if R2 env not set.
