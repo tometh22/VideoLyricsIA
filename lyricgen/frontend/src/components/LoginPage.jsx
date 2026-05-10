@@ -1,6 +1,7 @@
 import { useState } from "react";
 import { useI18n } from "../i18n";
 import BrandLockup from "./BrandLockup";
+import { fetchWithTimeout } from "../fetchWithTimeout";
 
 const API = import.meta.env.VITE_API_URL || "";
 
@@ -21,11 +22,11 @@ export default function LoginPage({ onLogin, onBack, resetToken, onResetComplete
     setLoading(true);
     setError("");
     try {
-      const res = await fetch(`${API}/auth/login`, {
+      const res = await fetchWithTimeout(`${API}/auth/login`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ username: username.trim(), password }),
-      });
+      }, 15000);
       if (!res.ok) {
         const data = await res.json().catch(() => ({}));
         throw new Error(data.detail || t("login.error"));
@@ -33,7 +34,7 @@ export default function LoginPage({ onLogin, onBack, resetToken, onResetComplete
       const data = await res.json();
       onLogin(data.token, data.user);
     } catch (err) {
-      setError(err.message);
+      setError(err.name === "TimeoutError" ? t("login.timeout") || "El servidor tardó demasiado. Intentá de nuevo." : err.message);
     } finally {
       setLoading(false);
     }
@@ -53,11 +54,11 @@ export default function LoginPage({ onLogin, onBack, resetToken, onResetComplete
     setLoading(true);
     setError("");
     try {
-      const res = await fetch(`${API}/auth/register`, {
+      const res = await fetchWithTimeout(`${API}/auth/register`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ username: username.trim(), password, email: email.trim() }),
-      });
+      }, 15000);
       if (!res.ok) {
         const data = await res.json().catch(() => ({}));
         throw new Error(data.detail || t("login.register_error"));
@@ -85,11 +86,11 @@ export default function LoginPage({ onLogin, onBack, resetToken, onResetComplete
     setLoading(true);
     setError("");
     try {
-      const res = await fetch(`${API}/auth/reset-password`, {
+      const res = await fetchWithTimeout(`${API}/auth/reset-password`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ token: resetToken, password }),
-      });
+      }, 15000);
       if (!res.ok) {
         const data = await res.json().catch(() => ({}));
         throw new Error(data.detail || t("login.reset_invalid"));
@@ -111,11 +112,11 @@ export default function LoginPage({ onLogin, onBack, resetToken, onResetComplete
     setLoading(true);
     setError("");
     try {
-      const res = await fetch(`${API}/auth/forgot-password`, {
+      const res = await fetchWithTimeout(`${API}/auth/forgot-password`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ email: email.trim() }),
-      });
+      }, 15000);
       await res.json().catch(() => ({}));
       setMessage(t("login.reset_sent"));
       setMode("reset_sent");
