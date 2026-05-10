@@ -93,7 +93,7 @@ function RequireAuth({ token, children }) {
 // Handles one-shot URL-param callbacks (Stripe billing return, email
 // verification, password-reset deep links). Mounted once inside the
 // router, NOT as a child of <Routes>, so it doesn't remount per nav.
-function RootEffects({ setUser, setResetToken }) {
+function RootEffects({ setUser, setResetToken, setBillingSuccess }) {
   const navigate = useNavigate();
   const location = useLocation();
   const ranRef = useRef(false);
@@ -109,6 +109,7 @@ function RootEffects({ setUser, setResetToken }) {
           setUser(userData);
         }).catch(() => {});
       }
+      setBillingSuccess(true);
       navigate(location.pathname, { replace: true });
     }
     if (params.get("verify_email")) {
@@ -126,6 +127,35 @@ function RootEffects({ setUser, setResetToken }) {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
   return null;
+}
+
+// Floating success toast for post-checkout confirmation.
+function BillingSuccessToast({ onDismiss }) {
+  useEffect(() => {
+    const t = setTimeout(onDismiss, 6000);
+    return () => clearTimeout(t);
+  }, [onDismiss]);
+
+  return (
+    <div className="fixed bottom-6 right-6 z-[200] animate-fade-in">
+      <div className="flex items-center gap-3 px-5 py-3.5 rounded-2xl bg-[#1a1a24] ring-1 ring-green-500/30 shadow-2xl">
+        <div className="w-8 h-8 rounded-full bg-green-500/15 flex items-center justify-center shrink-0">
+          <svg className="w-4 h-4 text-green-400" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
+            <path strokeLinecap="round" strokeLinejoin="round" d="M5 13l4 4L19 7"/>
+          </svg>
+        </div>
+        <div>
+          <p className="text-sm font-semibold text-white">Plan activado</p>
+          <p className="text-xs text-gray-400">Gracias por tu confianza en GenLy AI</p>
+        </div>
+        <button onClick={onDismiss} className="ml-2 text-gray-500 hover:text-gray-300 transition-colors">
+          <svg className="w-4 h-4" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
+            <path strokeLinecap="round" strokeLinejoin="round" d="M6 18L18 6M6 6l12 12"/>
+          </svg>
+        </button>
+      </div>
+    </div>
+  );
 }
 
 // Layout shell for authenticated routes. Computes Sidebar's activeView
@@ -289,6 +319,7 @@ export default function App() {
   const [backgroundMode, setBackgroundMode] = useState("as_is");
   const [sidebarOpen, setSidebarOpen] = useState(true);
   const [resetToken, setResetToken] = useState(null);
+  const [billingSuccess, setBillingSuccess] = useState(false);
   const pollingIntervals = useRef(new Set());
   const PARALLEL_WORKERS = 5;
 
@@ -320,6 +351,18 @@ export default function App() {
     setUser(null);
     navigate("/");
   }, [navigate]);
+
+  // Sync logout across multiple browser tabs: when genly_token is removed
+  // in another tab, log out this tab too so stale sessions don't linger.
+  useEffect(() => {
+    const onStorage = (e) => {
+      if (e.key === "genly_token" && e.newValue === null && token) {
+        handleLogout();
+      }
+    };
+    window.addEventListener("storage", onStorage);
+    return () => window.removeEventListener("storage", onStorage);
+  }, [token, handleLogout]);
 
   // `historyError` lets the dashboard surface a "connection failed,
   // retry" state instead of silently rendering an empty list when /jobs
@@ -1194,7 +1237,8 @@ export default function App() {
 
   return (
     <>
-      <RootEffects setUser={setUser} setResetToken={setResetToken} />
+      <RootEffects setUser={setUser} setResetToken={setResetToken} setBillingSuccess={setBillingSuccess} />
+      {billingSuccess && <BillingSuccessToast onDismiss={() => setBillingSuccess(false)} />}
       <Routes>
         <Route
           path="/"

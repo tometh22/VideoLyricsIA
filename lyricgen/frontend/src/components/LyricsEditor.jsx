@@ -149,6 +149,15 @@ export default function LyricsEditor({
   const [edited, setEdited] = useState(() =>
     segments.map((s, i) => ({ ...s, _id: i }))
   );
+  const [isDirty, setIsDirty] = useState(false);
+
+  // Warn browser on tab-close / external navigation when there are unsaved edits.
+  useEffect(() => {
+    if (!isDirty) return;
+    const handler = (e) => { e.preventDefault(); e.returnValue = ""; };
+    window.addEventListener("beforeunload", handler);
+    return () => window.removeEventListener("beforeunload", handler);
+  }, [isDirty]);
 
   // ─── Audio sync ─────────────────────────────────────────────────────
   const audioUrl = useMemo(
@@ -198,6 +207,7 @@ export default function LyricsEditor({
   // state. Cmd/Ctrl+Z pops one and replays it onto setEdited.
   const [editHistory, setEditHistory] = useState([]);
   const pushEditHistory = useCallback(() => {
+    setIsDirty(true);
     setEditHistory((prev) => {
       const next = [...prev, edited];
       return next.length > 50 ? next.slice(next.length - 50) : next;
@@ -633,6 +643,7 @@ export default function LyricsEditor({
       return;
     }
     setWrapWarning(null);
+    setIsDirty(false);
     const cleaned = _buildCleanedSegments();
     onApprove(cleaned.map(({ _id, ...rest }) => rest));
   };

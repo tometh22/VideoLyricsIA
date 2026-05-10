@@ -1078,6 +1078,59 @@ def _lock_user_for_quota(db: Session, user_id: int) -> None:
     ).first()
 
 
+def _try_send_usage_alert(db: Session, current_user: dict, usage: dict) -> None:
+    """Fire a usage-alert email at the 80% and 100% thresholds — once per
+    threshold per calendar month per user.  Uses AuditLog for deduplication so
+    concurrent requests at the same quota level don't fan-out duplicate mail.
+    Best-effort: any exception is swallowed so it never blocks a job submit.
+    """
+    try:
+        percent = usage["percent"]
+        if percent < 80:
+            return
+        action = "usage_alert_100" if percent >= 100 else "usage_alert_80"
+
+        now = datetime.now(timezone.utc)
+        month_start = datetime(now.year, now.month, 1, tzinfo=timezone.utc)
+        already_sent = db.query(AuditLog).filter(
+            AuditLog.user_id == current_user["id"],
+            AuditLog.action == action,
+            AuditLog.created_at >= month_start,
+        ).first()
+        if already_sent:
+            return
+
+        user_obj = db.query(User).filter(User.id == current_user["id"]).first()
+        if not user_obj or not user_obj.email:
+            return
+
+        notif_key = "notif_quota_100" if percent >= 100 else "notif_quota_80"
+        user_settings = db.query(UserSettings).filter(
+            UserSettings.user_id == user_obj.id
+        ).first()
+        prefs = (user_settings.settings_json or {}) if user_settings else {}
+        if not prefs.get(notif_key, True):
+            return
+
+        db.add(AuditLog(user_id=user_obj.id, action=action, detail={"percent": percent}))
+        db.commit()
+
+        threading.Thread(
+            target=emails.send_usage_alert,
+            kwargs={
+                "email": user_obj.email,
+                "username": user_obj.username,
+                "percent": percent,
+                "used": usage["used"],
+                "limit": usage["limit"],
+                "plan": usage["plan"],
+            },
+            daemon=True,
+        ).start()
+    except Exception as _e:
+        logger.warning("usage alert skipped: %s", _e)
+
+
 def _enforce_plan_quota(db: Session, current_user: dict) -> None:
     """Raise 402 if the tenant reached its monthly limit without overage allowed.
 
@@ -1090,6 +1143,8 @@ def _enforce_plan_quota(db: Session, current_user: dict) -> None:
     tenant_id = current_user["tenant_id"]
     _lock_user_for_quota(db, current_user["id"])
     usage = get_plan_usage(db, current_user["id"], tenant_id, plan)
+    if plan != "unlimited" and usage["percent"] >= 80:
+        _try_send_usage_alert(db, current_user, usage)
     if usage["remaining"] <= 0 and plan != "unlimited":
         if not current_user.get("allow_overage", False):
             support_email = os.environ.get("SUPPORT_EMAIL", "soporte@genly.pro")
