@@ -566,17 +566,26 @@ export default function UploadZone({
   const _batchSettingsBlock = files.length > 0 ? (
     <div className="mt-3 glass rounded-card px-4 py-4">
       <p className="text-[10px] uppercase tracking-[0.18em] text-gray-500 mb-3">
-        {t("upload.batch_settings_title") || "Configuración del lote"}
+        {files.length > 1
+          ? (t("upload.batch_settings_title") || "Configuración del lote")
+          : (t("upload.single_settings_title") || "Ajustes del video")}
       </p>
 
       {/* Movement gallery — click a card to apply to all tracks */}
       <div className="mb-4">
-        <div className="flex items-baseline justify-between mb-2">
-          <p className="text-[11px] text-gray-400 font-medium">
-            {t("upload.movement_gallery_title") || "Movimiento del fondo"}
-          </p>
-          <p className="text-[10px] text-gray-600">
-            {t("upload.movement_gallery_hint") || "Click para aplicar a todos · personalizable por canción"}
+        <div className="mb-2">
+          <div className="flex items-baseline justify-between">
+            <p className="text-[11px] text-gray-400 font-medium">
+              {t("upload.movement_gallery_title") || "Movimiento del fondo"}
+            </p>
+            {files.length > 1 && (
+              <p className="text-[10px] text-gray-600">
+                {t("upload.movement_gallery_hint") || "Click para aplicar a todos · personalizable por canción"}
+              </p>
+            )}
+          </div>
+          <p className="text-[10px] text-gray-600 mt-0.5">
+            {t("upload.movement_gallery_desc") || "Cómo se anima el fondo del video · no afecta los colores"}
           </p>
         </div>
         <div className="grid grid-cols-2 sm:grid-cols-4 gap-2">
@@ -1388,7 +1397,7 @@ export default function UploadZone({
           <div className="max-w-5xl mx-auto flex flex-wrap items-center gap-3">
             <div className="flex-1 min-w-0">
               <p className="text-[10px] uppercase tracking-[0.18em] text-gray-500">
-                {t("upload.batch_summary") || "Lote"}
+                {files.length > 1 ? (t("upload.batch_summary") || "Lote") : (t("upload.single_settings_title") || "Ajustes del video")}
               </p>
               <p className="text-sm text-white truncate mt-0.5">{summary}</p>
               {!allHaveArtist && (
