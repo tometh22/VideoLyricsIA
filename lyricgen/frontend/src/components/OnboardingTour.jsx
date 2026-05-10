@@ -1,5 +1,5 @@
 import { useEffect, useState, useMemo, useCallback, Component } from "react";
-import Joyride from "react-joyride";
+import { Joyride } from "react-joyride";
 import { useI18n } from "../i18n";
 
 // Catches any error thrown by Joyride (e.g. internal React reconciliation
