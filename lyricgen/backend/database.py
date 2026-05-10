@@ -217,8 +217,10 @@ class Job(Base):
 
     # In-flight multipart upload id while the browser is still PUTting
     # parts directly to R2. Cleared on multipart_complete (or aborted by
-    # the reaper if the upload is abandoned).
-    multipart_upload_id = Column(String(255), nullable=True)
+    # the reaper if the upload is abandoned). Uses Text because Cloudflare
+    # R2 returns ~300+ char ids (the original VARCHAR(255) silently
+    # truncated and crashed the commit on every >50MB upload).
+    multipart_upload_id = Column(Text, nullable=True)
 
     # YouTube info
     youtube_data = Column(JSON, nullable=True)
@@ -505,11 +507,9 @@ def _migrate_user_columns():
         "ALTER TABLE jobs ADD COLUMN IF NOT EXISTS song_title VARCHAR(500)",
         "ALTER TABLE jobs ADD COLUMN IF NOT EXISTS input_r2_key VARCHAR(500)",
         "ALTER TABLE jobs ADD COLUMN IF NOT EXISTS multipart_upload_id VARCHAR(255)",
-        # Library exclusivity (UMG): tenant-owned and variation-parent
-        # references on background_assets. Alembic owns the data migration
-        # that backfills owner_tenant_id for the existing library; here we
-        # only ensure the columns exist so a pod that boots before
-        # `alembic upgrade head` doesn't break /backgrounds.
+        # Cloudflare R2 multipart UploadIds are ~300+ chars; VARCHAR(255) truncated.
+        "ALTER TABLE jobs ALTER COLUMN multipart_upload_id TYPE TEXT",
+        # Library exclusivity (UMG): tenant-owned and variation-parent references.
         "ALTER TABLE background_assets ADD COLUMN IF NOT EXISTS owner_tenant_id VARCHAR(100)",
         "ALTER TABLE background_assets ADD COLUMN IF NOT EXISTS parent_asset_id INTEGER REFERENCES background_assets(id)",
         "CREATE INDEX IF NOT EXISTS ix_background_assets_owner_tenant_id ON background_assets(owner_tenant_id)",

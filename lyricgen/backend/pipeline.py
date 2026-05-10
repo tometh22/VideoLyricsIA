@@ -967,6 +967,35 @@ def _transcribe_via_openai_api(mp3_path: str, language: str | None = None,
         with open(api_path, "rb") as f:
             kwargs["file"] = f
             response = client.audio.transcriptions.create(**kwargs)
+    except Exception as exc:
+        # Translate OpenAI errors into HTTPExceptions that the existing
+        # review-error UI can show with the retry button. Without this,
+        # they bubble up as generic 500s with a stack trace and the user
+        # sees "Sin respuesta del servidor".
+        # Imports inline so the module loads even if openai isn't installed
+        # in dev environments running the local Whisper path.
+        from fastapi import HTTPException
+        try:
+            from openai import RateLimitError, APIConnectionError, APIError
+        except ImportError:
+            RateLimitError = APIConnectionError = APIError = ()
+        if isinstance(exc, RateLimitError):
+            raise HTTPException(
+                status_code=503,
+                detail="Servicio de transcripción ocupado. Reintentamos en unos segundos.",
+                headers={"Retry-After": "10"},
+            ) from exc
+        if isinstance(exc, APIConnectionError):
+            raise HTTPException(
+                status_code=502,
+                detail="No pudimos contactar el servicio de transcripción. Reintentá en unos segundos.",
+            ) from exc
+        if isinstance(exc, APIError):
+            raise HTTPException(
+                status_code=502,
+                detail=f"Servicio de transcripción no disponible: {exc!s}",
+            ) from exc
+        raise
     finally:
         if cleanup_compressed:
             try:

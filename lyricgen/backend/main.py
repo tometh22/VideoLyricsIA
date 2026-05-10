@@ -1039,32 +1039,63 @@ def _enforce_concurrent_jobs_cap(*_, **__) -> None:
     return None
 
 
-# Soft per-tenant cap on jobs that need attention (queued + processing +
-# pending_review). Forces operators to clear their existing backlog before
-# piling on more work. Tomi communicated this 5-batch ceiling to UMG as
-# the agreed launch-window throughput; do NOT raise without re-aligning
-# with the operator. Admins bypass for test seeding.
-TENANT_BACKLOG_LIMIT = int(os.environ.get("TENANT_BACKLOG_LIMIT", "5"))
+# Soft caps on jobs that need attention (queued + processing +
+# pending_review). Two layers:
+#   * USER_BACKLOG_LIMIT:   one user (operator) can have N jobs in-flight.
+#     Matches the 5-batch ceiling Tomi committed to UMG per operator.
+#   * TENANT_BACKLOG_LIMIT: the whole tenant (e.g. Universal with 3
+#     operators) can have M jobs in-flight. Default = 5x USER limit so
+#     up to 5 operators can be at full throughput without colliding.
+# Admins bypass both for test seeding. Both limits are env-tunable so
+# enterprise tenants can be raised without a redeploy.
+USER_BACKLOG_LIMIT = int(os.environ.get("USER_BACKLOG_LIMIT", "5"))
+TENANT_BACKLOG_LIMIT = int(os.environ.get("TENANT_BACKLOG_LIMIT", str(USER_BACKLOG_LIMIT * 5)))
+
+_BACKLOG_STATUSES = ["queued", "processing", "pending_review"]
 
 
 def _enforce_tenant_backlog(db: Session, current_user: dict) -> None:
+    """Two-layer backlog gate. Per-user fires first so a single operator
+    can't monopolise their tenant's tenant-wide quota; per-tenant catches
+    the case where multiple operators collectively saturate.
+    """
     # Admins are exempt — they may legitimately seed many test jobs.
     if current_user.get("role") == "admin":
         return
     tenant_id = current_user["tenant_id"]
-    in_flight = (
+    user_id = current_user["id"]
+
+    # Per-user check first (faster to fail and more relevant feedback).
+    user_in_flight = (
         db.query(Job)
-        .filter(Job.tenant_id == tenant_id)
-        .filter(Job.status.in_(["queued", "processing", "pending_review"]))
+        .filter(Job.user_id == user_id)
+        .filter(Job.status.in_(_BACKLOG_STATUSES))
         .count()
     )
-    if in_flight >= TENANT_BACKLOG_LIMIT:
+    if user_in_flight >= USER_BACKLOG_LIMIT:
         raise HTTPException(
             status_code=429,
             detail=(
-                f"Tu equipo tiene {in_flight} videos en proceso o pendientes "
-                f"de revisión (límite: {TENANT_BACKLOG_LIMIT}). Aprobá o "
-                f"rechazá algunos antes de subir más."
+                f"Tenés {user_in_flight} videos en proceso o pendientes de "
+                f"revisión (límite: {USER_BACKLOG_LIMIT} por usuario). "
+                f"Aprobá o rechazá algunos antes de subir más."
+            ),
+        )
+
+    # Per-tenant check second.
+    tenant_in_flight = (
+        db.query(Job)
+        .filter(Job.tenant_id == tenant_id)
+        .filter(Job.status.in_(_BACKLOG_STATUSES))
+        .count()
+    )
+    if tenant_in_flight >= TENANT_BACKLOG_LIMIT:
+        raise HTTPException(
+            status_code=429,
+            detail=(
+                f"Tu equipo tiene {tenant_in_flight} videos en proceso o "
+                f"pendientes de revisión (límite: {TENANT_BACKLOG_LIMIT} por "
+                f"equipo). Esperá a que se completen algunos antes de subir más."
             ),
         )
 
@@ -1176,15 +1207,89 @@ def _enforce_memory_pressure() -> None:
 
 
 # Concurrent-upload counter. With the streaming refactor each upload
-# costs ~1 MiB of RAM regardless of file size, but the kernel's page
-# cache + ffmpeg subprocesses still consume real memory. Capping the
-# count gives a hard ceiling across replicas (Redis-shared) so a
-# UMG-style burst can't melt the API container even if memory_percent
-# hasn't crossed the threshold yet. Disabled when Redis is missing
-# (dev / tests) — the memory gate above still applies in that case.
-_MAX_CONCURRENT_UPLOADS = int(os.environ.get("MAX_CONCURRENT_UPLOADS", "8"))
+# costs ~1 MiB of RAM regardless of file size, AND uploads >50MB go
+# direct browser->R2 (zero API container bandwidth/memory). Capping the
+# count gives a hard ceiling across replicas (Redis-shared) so a burst
+# from a single tenant can't melt the API even if memory_percent hasn't
+# crossed the threshold yet. Default raised from the original 8 to 32
+# so a multi-tenant burst (e.g. 6 paying clients × 5 simultaneous
+# uploads each) doesn't block at the slot counter. Tune via env var
+# without redeploying. Disabled when Redis is missing (dev / tests) —
+# the memory gate above still applies in that case.
+_MAX_CONCURRENT_UPLOADS = int(os.environ.get("MAX_CONCURRENT_UPLOADS", "32"))
 _UPLOAD_LEASE_TTL_S = int(os.environ.get("UPLOAD_LEASE_TTL_S", "600"))
 _UPLOAD_COUNTER_KEY = "uploads:in_flight"
+
+# Global cap on simultaneous inline Whisper runs. Whisper loads a model
+# into memory (~500 MB for base/small) and keeps it for the duration of
+# the request. Without a global ceiling, N users transcribing at the same
+# time spike memory together, each passing the per-request 85% gate in a
+# race, and then collectively push the container into OOM. Two concurrent
+# transcriptions is the safe ceiling for a 1-2 GB API container.
+_MAX_CONCURRENT_TRANSCRIPTIONS = int(os.environ.get("MAX_CONCURRENT_TRANSCRIPTIONS", "2"))
+_TRANSCRIPTION_LEASE_TTL_S = int(os.environ.get("TRANSCRIPTION_LEASE_TTL_S", "300"))
+_TRANSCRIPTION_COUNTER_KEY = "transcriptions:in_flight"
+
+
+def _try_acquire_transcription_slot() -> str | None:
+    """Reserve a Whisper slot in Redis. Same pattern as _try_acquire_upload_slot.
+
+    Returns a lease id on success, None when Redis is unavailable (dev/test)
+    or when OpenAI's Whisper API is configured (no local memory used, no need
+    to gate concurrency). Raises 503 only on the local-Whisper code path.
+    """
+    # OpenAI's Whisper API handles concurrency for us — each transcription
+    # is a remote HTTP call, not a local model load. No reason to cap.
+    if os.environ.get("OPENAI_API_KEY", "").strip():
+        return None
+    redis_url = os.environ.get("REDIS_URL", "").strip()
+    if not redis_url:
+        return None
+    try:
+        import uuid as _uuid
+        from redis import Redis
+        client = Redis.from_url(redis_url, socket_timeout=2)
+        lease = _uuid.uuid4().hex[:12]
+        pipe = client.pipeline()
+        pipe.sadd(_TRANSCRIPTION_COUNTER_KEY, lease)
+        pipe.scard(_TRANSCRIPTION_COUNTER_KEY)
+        pipe.expire(_TRANSCRIPTION_COUNTER_KEY, _TRANSCRIPTION_LEASE_TTL_S)
+        _, count, _ = pipe.execute()
+    except Exception as e:  # pragma: no cover
+        logger.debug("transcription concurrency: Redis unavailable (%s)", e)
+        return None
+    if count > _MAX_CONCURRENT_TRANSCRIPTIONS:
+        try:
+            client.srem(_TRANSCRIPTION_COUNTER_KEY, lease)
+        except Exception:
+            pass
+        logger.warning(
+            "/transcribe-uploaded refused: %d concurrent transcriptions in flight (cap %d)",
+            count, _MAX_CONCURRENT_TRANSCRIPTIONS,
+        )
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "Transcripción temporalmente saturada. Reintentá en unos segundos."
+            ),
+            headers={"Retry-After": "30"},
+        )
+    return lease
+
+
+def _release_transcription_slot(lease_id: str | None) -> None:
+    """Release a previously-acquired transcription slot. Best-effort."""
+    if not lease_id:
+        return
+    redis_url = os.environ.get("REDIS_URL", "").strip()
+    if not redis_url:
+        return
+    try:
+        from redis import Redis
+        client = Redis.from_url(redis_url, socket_timeout=2)
+        client.srem(_TRANSCRIPTION_COUNTER_KEY, lease_id)
+    except Exception:  # pragma: no cover
+        pass
 
 
 def _try_acquire_upload_slot() -> str | None:
@@ -1517,7 +1622,16 @@ async def upload_multipart_init(
         content_type=body.content_type or None,
     )
     if not init:
-        raise HTTPException(status_code=503, detail="Could not initiate multipart upload.")
+        # Most common cause: R2 credentials missing/wrong, or R2 bucket
+        # config (CORS, ACL) rejecting create_multipart_upload. The
+        # full traceback is in the API container logs (see storage.py).
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "No pudimos iniciar la subida del archivo grande. "
+                "Revisá la conexión y reintentá; si persiste, contactá soporte."
+            ),
+        )
     job_row.input_r2_key = init["key"]
     job_row.multipart_upload_id = init["upload_id"]
     db.commit()
@@ -1694,34 +1808,37 @@ async def transcribe_uploaded(
 
     _enforce_disk_capacity()
     _enforce_memory_pressure()
+    transcription_lease = _try_acquire_transcription_slot()
+    try:
+        # Materialize the audio onto local disk for Whisper / ffmpeg / etc.
+        job_id = body.job_id
+        job_dir = os.path.join(OUTPUTS_DIR, job_id)
+        os.makedirs(job_dir, exist_ok=True)
+        audio_path = os.path.join(job_dir, job_row.filename)
 
-    # Materialize the audio onto local disk for Whisper / ffmpeg / etc.
-    job_id = body.job_id
-    job_dir = os.path.join(OUTPUTS_DIR, job_id)
-    os.makedirs(job_dir, exist_ok=True)
-    audio_path = os.path.join(job_dir, job_row.filename)
+        if not os.path.exists(audio_path):
+            ok = storage.download_object(job_row.input_r2_key, audio_path)
+            if not ok:
+                raise HTTPException(
+                    status_code=502,
+                    detail=f"Could not fetch upload from object storage ({job_row.input_r2_key}).",
+                )
+        _validate_audio_file_on_disk(job_row.filename, audio_path)
 
-    if not os.path.exists(audio_path):
-        ok = storage.download_object(job_row.input_r2_key, audio_path)
-        if not ok:
-            raise HTTPException(
-                status_code=502,
-                detail=f"Could not fetch upload from object storage ({job_row.input_r2_key}).",
-            )
-    _validate_audio_file_on_disk(job_row.filename, audio_path)
+        # Reuse the existing Whisper / lrclib machinery from the legacy
+        # /transcribe handler. Keeping the implementation in one place via
+        # the helper below means the lyrics-recovery / hallucination logic
+        # stays in lockstep with the legacy fallback.
+        job_row.status = "transcribed_pending"
+        job_row.current_step = "editing"
+        db.commit()
 
-    # Reuse the existing Whisper / lrclib machinery from the legacy
-    # /transcribe handler. Keeping the implementation in one place via
-    # the helper below means the lyrics-recovery / hallucination logic
-    # stays in lockstep with the legacy fallback.
-    job_row.status = "transcribed_pending"
-    job_row.current_step = "editing"
-    db.commit()
-
-    return await _run_transcription_for_job(
-        request, db, current_user, job_id, audio_path,
-        language=body.language, artist=body.artist, title=body.title,
-    )
+        return await _run_transcription_for_job(
+            request, db, current_user, job_id, audio_path,
+            language=body.language, artist=body.artist, title=body.title,
+        )
+    finally:
+        _release_transcription_slot(transcription_lease)
 
 
 # Deprecation metadata for the legacy multipart-form endpoints. RFC 8594

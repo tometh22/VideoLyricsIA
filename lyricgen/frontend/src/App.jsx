@@ -290,7 +290,9 @@ export default function App() {
   const [sidebarOpen, setSidebarOpen] = useState(true);
   const [resetToken, setResetToken] = useState(null);
   const pollingIntervals = useRef(new Set());
-  const PARALLEL_WORKERS = 5;
+  // 2 concurrent workers: enough to keep the queue fed without spiking
+  // the API with 5 simultaneous upload-url+generate calls from one user.
+  const PARALLEL_WORKERS = 2;
 
   // --- Stamp the document title with the environment when not in prod ---
   useEffect(() => {

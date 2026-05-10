@@ -300,7 +300,19 @@ def multipart_init(
     args = {"Bucket": R2_BUCKET, "Key": key}
     if content_type:
         args["ContentType"] = content_type
-    resp = client.create_multipart_upload(**args)
+    try:
+        resp = client.create_multipart_upload(**args)
+    except Exception as exc:
+        # boto3 ClientError or network error to R2. Without this guard the
+        # exception bubbles up as an unhandled 500 with no body, which the
+        # browser then misreports as a CORS error. Returning None lets the
+        # endpoint emit a proper 503 with a useful message.
+        import logging
+        logging.getLogger(__name__).error(
+            "multipart_init failed for key=%s bucket=%s: %s",
+            key, R2_BUCKET, exc, exc_info=True,
+        )
+        return None
     return {"upload_id": resp["UploadId"], "key": key}
 
 
