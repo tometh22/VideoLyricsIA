@@ -65,20 +65,20 @@ const UMG_PROFILES = [
 const STYLES = [
   {
     code: "oscuro",
-    label: "Dark",
-    sub: "Cinematográfico",
+    labelKey: "upload.style_dark",
+    subKey: "upload.style_dark_sub",
     swatch: "linear-gradient(135deg, #0a0a1e 0%, #1e0f3c 40%, #501450 70%, #280a32 100%)",
   },
   {
     code: "neon",
-    label: "Neon",
-    sub: "Vibrante",
+    labelKey: "upload.style_neon",
+    subKey: "upload.style_neon_sub",
     swatch: "linear-gradient(135deg, #0a0528 0%, #500078 40%, #006482 70%, #780050 100%)",
   },
   {
     code: "minimal",
-    label: "Minimal",
-    sub: "Limpio",
+    labelKey: "upload.style_minimal",
+    subKey: "upload.style_minimal_sub",
     swatch: "linear-gradient(135deg, #b4b4c3 0%, #c8bed2 40%, #aab4c8 70%, #d2c8c3 100%)",
   },
 ];
@@ -160,7 +160,7 @@ export default function UploadZone({
   useEffect(() => {
     if (bgMode === "library" && !libraryLoaded) {
       fetch(`${API}/backgrounds`, { headers: authHeaders() })
-        .then(r => r.json())
+        .then(r => { if (!r.ok) throw new Error(r.status); return r.json(); })
         .then(data => {
           const list = Array.isArray(data) ? data : [];
           setLibraryBgs(list);
@@ -1183,7 +1183,7 @@ export default function UploadZone({
         {files.length > 0 && onStyleChange && (
           <div className="rounded-card bg-surface-2/40 ring-1 ring-white/[0.04] px-4 py-3">
             <p className="text-[10px] uppercase tracking-[0.18em] text-gray-500">
-              Estilo visual
+              {t("upload.style_label")}
             </p>
             <p className="text-[10px] text-gray-500 mb-2 mt-0.5">
               {t("upload.style_desc") || "Paleta de colores del fondo generado por IA"}
@@ -1208,8 +1208,8 @@ export default function UploadZone({
                     style={{ background: s.swatch }}
                   />
                   <span className="leading-tight text-center">
-                    <span className="block font-semibold">{s.label}</span>
-                    <span className="block text-[10px] text-gray-500">{s.sub}</span>
+                    <span className="block font-semibold">{t(s.labelKey)}</span>
+                    <span className="block text-[10px] text-gray-500">{t(s.subKey)}</span>
                   </span>
                 </button>
               ))}
