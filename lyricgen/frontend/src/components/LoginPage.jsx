@@ -8,9 +8,11 @@ const API = import.meta.env.VITE_API_URL || "";
 // Retries on timeout (backend cold start / slow mobile network).
 // Fails immediately on any server response (4xx/5xx) to avoid
 // locking accounts with repeated bad-credential attempts.
-async function fetchWithRetry(url, opts, { timeout = 8000, maxAttempts = 3 } = {}) {
+// onRetry(attempt) is called before each retry so the UI can show progress.
+async function fetchWithRetry(url, opts, { timeout = 15000, maxAttempts = 4, onRetry } = {}) {
   let lastErr;
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    if (attempt > 1) onRetry?.(attempt);
     try {
       return await fetchWithTimeout(url, opts, timeout);
     } catch (err) {
@@ -30,6 +32,7 @@ export default function LoginPage({ onLogin, onBack, resetToken, onResetComplete
   const [confirmPassword, setConfirmPassword] = useState("");
   const [error, setError] = useState("");
   const [loading, setLoading] = useState(false);
+  const [retryMsg, setRetryMsg] = useState("");
   const [message, setMessage] = useState("");
 
   const handleLogin = async (e) => {
@@ -37,12 +40,13 @@ export default function LoginPage({ onLogin, onBack, resetToken, onResetComplete
     if (!username.trim() || !password.trim()) return;
     setLoading(true);
     setError("");
+    setRetryMsg("");
     try {
       const res = await fetchWithRetry(`${API}/auth/login`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ username: username.trim(), password }),
-      });
+      }, { onRetry: (n) => setRetryMsg(`Reconectando... (${n}/4)`) });
       if (!res.ok) {
         const data = await res.json().catch(() => ({}));
         throw new Error(data.detail || t("login.error"));
@@ -55,6 +59,7 @@ export default function LoginPage({ onLogin, onBack, resetToken, onResetComplete
         : err.message);
     } finally {
       setLoading(false);
+      setRetryMsg("");
     }
   };
 
@@ -71,12 +76,13 @@ export default function LoginPage({ onLogin, onBack, resetToken, onResetComplete
     }
     setLoading(true);
     setError("");
+    setRetryMsg("");
     try {
       const res = await fetchWithRetry(`${API}/auth/register`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ username: username.trim(), password, email: email.trim() }),
-      });
+      }, { onRetry: (n) => setRetryMsg(`Reconectando... (${n}/4)`) });
       if (!res.ok) {
         const data = await res.json().catch(() => ({}));
         throw new Error(data.detail || t("login.register_error"));
@@ -89,6 +95,7 @@ export default function LoginPage({ onLogin, onBack, resetToken, onResetComplete
         : err.message);
     } finally {
       setLoading(false);
+      setRetryMsg("");
     }
   };
 
@@ -207,6 +214,9 @@ export default function LoginPage({ onLogin, onBack, resetToken, onResetComplete
                     className="input-field" placeholder={t("login.password_placeholder")}
                     autoComplete="current-password" />
                 </div>
+                {retryMsg && (
+                  <p className="text-xs text-gray-400 text-center animate-pulse">{retryMsg}</p>
+                )}
                 {error && (
                   <div className="rounded-xl bg-red-500/10 border border-red-500/20 px-4 py-3">
                     <p className="text-sm text-red-400">{error}</p>
@@ -261,6 +271,9 @@ export default function LoginPage({ onLogin, onBack, resetToken, onResetComplete
                   <input type="password" value={confirmPassword} onChange={(e) => setConfirmPassword(e.target.value)}
                     className="input-field" placeholder={t("login.confirm_password")} />
                 </div>
+                {retryMsg && (
+                  <p className="text-xs text-gray-400 text-center animate-pulse">{retryMsg}</p>
+                )}
                 {error && (
                   <div className="rounded-xl bg-red-500/10 border border-red-500/20 px-4 py-3">
                     <p className="text-sm text-red-400">{error}</p>
