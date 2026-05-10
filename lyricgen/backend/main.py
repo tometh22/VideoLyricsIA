@@ -151,12 +151,33 @@ app.add_middleware(SlowAPIMiddleware)
 _cors_env = os.environ.get("CORS_ORIGINS", "").strip()
 _ALLOWED_ORIGINS = [o.strip() for o in _cors_env.split(",") if o.strip()]
 
+if not _ALLOWED_ORIGINS and ENVIRONMENT == "production":
+    # Railway-only safety net: if CORS_ORIGINS was not copied to the service,
+    # derive a strict single-origin allowlist from known deploy URLs so the
+    # app can boot and answer healthchecks (instead of crashlooping).
+    fallback_candidates = [
+        os.environ.get("FRONTEND_URL", "").strip(),
+        os.environ.get("APP_URL", "").strip(),
+        os.environ.get("RAILWAY_PUBLIC_DOMAIN", "").strip(),
+    ]
+    for candidate in fallback_candidates:
+        if not candidate:
+            continue
+        if candidate.startswith("http://") or candidate.startswith("https://"):
+            _ALLOWED_ORIGINS = [candidate.rstrip("/")]
+        else:
+            _ALLOWED_ORIGINS = [f"https://{candidate.rstrip('/')}" ]
+        logger.warning(
+            "CORS_ORIGINS missing in production; falling back to derived origin %s.",
+            _ALLOWED_ORIGINS[0],
+        )
+        break
+
 if not _ALLOWED_ORIGINS:
     if ENVIRONMENT == "production":
         raise RuntimeError(
-            "CORS_ORIGINS must be set explicitly in production. Wildcard + "
-            "allow_credentials=True is unsafe (Starlette reflects the request "
-            "Origin, allowing any site to make credentialed requests)."
+            "CORS_ORIGINS must be set explicitly in production. Set CORS_ORIGINS "
+            "or FRONTEND_URL/APP_URL/RAILWAY_PUBLIC_DOMAIN for safe fallback."
         )
     # Dev: wildcard origins, but DROP credentials so we don't accidentally
     # ship the same combo to production via env-var typo.
