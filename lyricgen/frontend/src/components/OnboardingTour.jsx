@@ -175,7 +175,14 @@ function TourRunner({ flagKey, steps, user, forceRun = false, onDone }) {
   const helpersRef = useRef(null);
 
   useEffect(() => {
-    setRun(forceRun || shouldAutoRun(flagKey, user));
+    const shouldRun = forceRun || shouldAutoRun(flagKey, user);
+    if (shouldRun) {
+      // Mark as seen the moment the tour fires, not when it ends.
+      // Otherwise navigating away before finishing leaves the flag unset
+      // and the tour re-fires on every return visit.
+      try { localStorage.setItem(flagKey, "1"); } catch {}
+    }
+    setRun(shouldRun);
   }, [flagKey, user, forceRun]);
 
   // When TourRunner unmounts mid-tour (e.g. user navigates to another page),
