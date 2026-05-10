@@ -19,11 +19,28 @@
   </head>
   <body class="min-h-screen">
     <div id="root">
-      <div style="min-height:100vh;display:flex;align-items:center;justify-content:center;background:#12121A;">
+      <div id="_loader" style="min-height:100vh;display:flex;flex-direction:column;align-items:center;justify-content:center;background:#12121A;gap:16px;">
         <div style="width:40px;height:40px;border:2px solid #6D4AFF;border-top-color:transparent;border-radius:50%;animation:_spin 0.8s linear infinite;"></div>
+        <p id="_loader_msg" style="color:#A0A3B1;font-family:sans-serif;font-size:13px;margin:0;"></p>
       </div>
       <style>@keyframes _spin{to{transform:rotate(360deg)}}</style>
     </div>
+    <script>
+      // If React hasn't mounted after 12s, show the JS error visibly
+      var _t = setTimeout(function() {
+        var el = document.getElementById('_loader_msg');
+        if (el) el.textContent = 'Error al cargar la app. Recargá la página.';
+      }, 12000);
+      window.addEventListener('error', function(e) {
+        clearTimeout(_t);
+        var el = document.getElementById('_loader_msg');
+        if (el) el.textContent = 'JS Error: ' + (e.message || 'desconocido') + ' — ' + (e.filename || '');
+      });
+      window.addEventListener('unhandledrejection', function(e) {
+        var el = document.getElementById('_loader_msg');
+        if (el && !el.textContent) el.textContent = 'Promise error: ' + String(e.reason);
+      });
+    </script>
     <script type="module" src="/src/main.jsx"></script>
   </body>
 </html>
