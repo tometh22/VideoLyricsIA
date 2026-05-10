@@ -511,6 +511,15 @@ class VerifyEmailRequest(BaseModel):
     token: str
 
 
+class ChangePasswordRequest(BaseModel):
+    current_password: str
+    new_password: str
+
+
+class DeleteAccountRequest(BaseModel):
+    password: str
+
+
 @app.post("/auth/login")
 @limiter.limit("10/minute")
 async def login(body: LoginRequest, request: Request, db: Session = Depends(get_db)):
@@ -653,6 +662,90 @@ async def verify_email_endpoint(body: VerifyEmailRequest, request: Request, db: 
 async def me(current_user: dict = Depends(get_current_user)):
     """Return current user info."""
     return current_user
+
+
+@app.post("/auth/change-password")
+@limiter.limit("5/minute")
+async def change_password(
+    body: ChangePasswordRequest,
+    request: Request,
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Change the authenticated user's password."""
+    user = db.query(User).filter(User.id == current_user["id"]).first()
+    if not user or not pwd_context.verify(body.current_password, user.hashed_password):
+        raise HTTPException(status_code=400, detail="Current password is incorrect")
+    try:
+        validate_password_strength(body.new_password)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    user.hashed_password = pwd_context.hash(body.new_password)
+    db.add(AuditLog(
+        user_id=user.id, action="auth.change_password",
+        ip_address=request.client.host if request.client else None,
+    ))
+    db.commit()
+    return {"ok": True}
+
+
+@app.get("/auth/data-export")
+async def data_export(
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """GDPR data export — returns all user data as a downloadable JSON file."""
+    user = db.query(User).filter(User.id == current_user["id"]).first()
+    settings = db.query(UserSettings).filter(UserSettings.user_id == user.id).first()
+    jobs = db.query(Job).filter(Job.user_id == user.id).order_by(Job.created_at.desc()).all()
+    data = {
+        "account": {
+            "username": user.username,
+            "email": user.email,
+            "plan": user.plan_id,
+            "role": user.role,
+            "created_at": user.created_at.isoformat() if user.created_at else None,
+        },
+        "settings": settings.settings_json if settings else {},
+        "jobs": [
+            {
+                "job_id": j.job_id,
+                "artist": j.artist,
+                "song_title": j.song_title,
+                "status": j.status,
+                "created_at": j.created_at.isoformat() if j.created_at else None,
+            }
+            for j in jobs
+        ],
+    }
+    return Response(
+        content=json.dumps(data, ensure_ascii=False, indent=2),
+        media_type="application/json",
+        headers={"Content-Disposition": "attachment; filename=genly-data-export.json"},
+    )
+
+
+@app.delete("/auth/account")
+@limiter.limit("2/minute")
+async def delete_account(
+    body: DeleteAccountRequest,
+    request: Request,
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Soft-delete the authenticated user's account (anonymise, deactivate)."""
+    user = db.query(User).filter(User.id == current_user["id"]).first()
+    if not user or not pwd_context.verify(body.password, user.hashed_password):
+        raise HTTPException(status_code=400, detail="Incorrect password")
+    user.is_active = False
+    user.email = None
+    user.username = f"deleted_{user.id}"
+    db.add(AuditLog(
+        user_id=user.id, action="auth.delete_account",
+        ip_address=request.client.host if request.client else None,
+    ))
+    db.commit()
+    return {"ok": True}
 
 
 @app.get("/usage")
