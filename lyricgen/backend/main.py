@@ -153,20 +153,34 @@ _ALLOWED_ORIGINS = [o.strip() for o in _cors_env.split(",") if o.strip()]
 
 if not _ALLOWED_ORIGINS:
     if ENVIRONMENT == "production":
-        raise RuntimeError(
-            "CORS_ORIGINS must be set explicitly in production. Wildcard + "
-            "allow_credentials=True is unsafe (Starlette reflects the request "
-            "Origin, allowing any site to make credentialed requests)."
+        # Don't crash — a startup crash means the healthcheck never passes and
+        # Railway rolls back every deploy, making it impossible to fix via a
+        # new deploy. Log so the operator sees it in Railway logs, then apply
+        # an empty-origins policy (blocks all browser cross-origin requests)
+        # until CORS_ORIGINS is configured in Railway's env vars.
+        print(
+            "[CRITICAL] CORS_ORIGINS is not set. Cross-origin browser requests "
+            "will be blocked. Set CORS_ORIGINS=https://your-domain.com in "
+            "Railway env vars to restore normal operation.",
+            flush=True,
         )
-    # Dev: wildcard origins, but DROP credentials so we don't accidentally
-    # ship the same combo to production via env-var typo.
-    app.add_middleware(
-        CORSMiddleware,
-        allow_origins=["*"],
-        allow_credentials=False,
-        allow_methods=["*"],
-        allow_headers=["*"],
-    )
+        app.add_middleware(
+            CORSMiddleware,
+            allow_origins=[],
+            allow_credentials=False,
+            allow_methods=["*"],
+            allow_headers=["*"],
+        )
+    else:
+        # Dev: wildcard origins, but DROP credentials so we don't accidentally
+        # ship the same combo to production via env-var typo.
+        app.add_middleware(
+            CORSMiddleware,
+            allow_origins=["*"],
+            allow_credentials=False,
+            allow_methods=["*"],
+            allow_headers=["*"],
+        )
 else:
     app.add_middleware(
         CORSMiddleware,
