@@ -1,10 +1,10 @@
-import { useEffect, useState, useMemo, useCallback, Component } from "react";
+import { useEffect, useRef, useState, useMemo, useCallback, Component } from "react";
 import { Joyride } from "react-joyride";
 import { useI18n } from "../i18n";
 
-// Catches any error thrown by Joyride (e.g. internal React reconciliation
-// errors in react-floater) so the crash stays scoped to the tour widget
-// and doesn't unmount the entire app.
+// ─── Error boundary ───────────────────────────────────────────────
+// Catches any error thrown by Joyride so the crash stays scoped to the
+// tour widget and doesn't unmount the entire app.
 class TourErrorBoundary extends Component {
   constructor(props) { super(props); this.state = { failed: false }; }
   static getDerivedStateFromError() { return { failed: true }; }
@@ -12,17 +12,127 @@ class TourErrorBoundary extends Component {
   render() { return this.state.failed ? null : this.props.children; }
 }
 
-// localStorage flags. Each tour persists independently so a user
-// who already saw the dashboard tour but hasn't been to the editor
-// still gets the editor tour on first arrival.
+// ─── Custom beacon ────────────────────────────────────────────────
+// Replaces Joyride's default blue dot with a pulsing brand-violet ring.
+function TourBeacon({ continuous, index, isLastStep, size, step, ...rest }) {
+  return (
+    <button
+      {...rest}
+      aria-label="Abrir tour guiado"
+      className="relative flex h-5 w-5 items-center justify-center focus:outline-none"
+    >
+      <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-brand opacity-60" />
+      <span className="relative inline-flex h-3 w-3 rounded-full bg-brand shadow-glow" />
+    </button>
+  );
+}
+
+// ─── Custom tooltip ───────────────────────────────────────────────
+// Fully glass-styled tooltip that matches the app's design system.
+// Layout: left accent bar | title + body | dot progress + nav buttons
+function TourTooltip({
+  continuous,
+  index,
+  isLastStep,
+  size,
+  step,
+  backProps,
+  primaryProps,
+  skipProps,
+  tooltipProps,
+}) {
+  return (
+    <div
+      {...tooltipProps}
+      style={{ maxWidth: 340, ...tooltipProps?.style }}
+      className="relative flex gap-3 rounded-2xl border border-white/[0.06] bg-[#181821]/90 p-4 shadow-depth-lg backdrop-blur-xl animate-fade-in"
+    >
+      {/* Brand accent bar */}
+      <div className="mt-0.5 w-[3px] shrink-0 self-stretch rounded-full bg-brand" />
+
+      <div className="flex min-w-0 flex-col gap-3">
+        {/* Title */}
+        {step.title && (
+          <p className="text-[13px] font-semibold leading-snug text-[#F5F7FA]">
+            {step.title}
+          </p>
+        )}
+
+        {/* Content */}
+        <div className="text-[12px] leading-relaxed text-[#A0A3B1]">
+          {step.content}
+        </div>
+
+        {/* Footer: pill-dots progress + nav buttons */}
+        <div className="flex items-center justify-between gap-3 pt-0.5">
+          {/* Dot progress indicator — active step becomes a pill */}
+          <div className="flex items-center gap-1">
+            {Array.from({ length: size }).map((_, i) => (
+              <span
+                key={i}
+                className={`inline-block h-1.5 rounded-full transition-all duration-240 ${
+                  i === index
+                    ? "w-4 bg-brand"
+                    : i < index
+                    ? "w-1.5 bg-brand/40"
+                    : "w-1.5 bg-white/20"
+                }`}
+              />
+            ))}
+          </div>
+
+          {/* Navigation buttons */}
+          <div className="flex shrink-0 items-center gap-2">
+            {index > 0 && (
+              <button
+                {...backProps}
+                className="text-[11px] text-[#A0A3B1] transition-colors duration-240 hover:text-[#F5F7FA]"
+              >
+                ← Atrás
+              </button>
+            )}
+            {!isLastStep && (
+              <button
+                {...skipProps}
+                className="text-[11px] text-[#A0A3B1]/50 transition-colors duration-240 hover:text-[#A0A3B1]"
+              >
+                Saltar
+              </button>
+            )}
+            <button
+              {...primaryProps}
+              className="rounded-[10px] bg-brand px-3.5 py-1.5 text-[11px] font-semibold text-white shadow-glow transition-all duration-240 hover:bg-brand-light active:scale-95"
+            >
+              {isLastStep ? "Listo ✓" : "Siguiente →"}
+            </button>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ─── Joyride styles ───────────────────────────────────────────────
+// Minimal — layout and colors are fully handled by the custom components.
+const STYLES = {
+  options: {
+    arrowColor: "transparent",       // custom tooltip has no arrow
+    overlayColor: "rgba(5,5,10,0.6)",
+    zIndex: 9000,                    // beats sidebar (z-20), modals (z-50), popovers (z-1000)
+  },
+  spotlight: { borderRadius: 12 },
+};
+
+// ─── Persistence flags ────────────────────────────────────────────
+// Each tour persists independently so a user who already saw the dashboard
+// tour but hasn't been to the editor still gets the editor tour on arrival.
 const FLAGS = {
   dashboard: "genly_tour_dashboard_done",
   upload:    "genly_tour_upload_done",
   editor:    "genly_tour_editor_done",
   // jobdetail covers the approval workflow + ProRes download. Fires
   // when the user lands on a pending_review job — that's the moment
-  // those affordances actually exist on screen and the explanation
-  // (rejecting is free, ProRes is a separate file, etc.) lands best.
+  // those affordances actually exist on screen.
   jobdetail: "genly_tour_jobdetail_done",
 };
 
@@ -53,74 +163,42 @@ function isReplayActive() {
 function shouldAutoRun(flagKey, user) {
   if (typeof window === "undefined") return false;
   if (localStorage.getItem(flagKey) === "1") return false;
-  // No user yet (still loading) → defer
   if (!user) return false;
-  // Replay session bypasses the age gate. Each tour still self-terminates
-  // by setting its own done-flag after first play, so we don't loop.
   if (isReplayActive()) return true;
   return daysSince(user.created_at) < AGE_GATE_DAYS;
 }
 
-// Brand-matched styles for the Joyride tooltips. Matches the
-// surface-2 + brand-purple palette used elsewhere.
-const STYLES = {
-  options: {
-    primaryColor: "#8B5CF6",         // brand
-    backgroundColor: "#1A1B2E",      // surface-2
-    textColor: "#E5E5F0",            // ink-primary
-    arrowColor: "#1A1B2E",
-    overlayColor: "rgba(0, 0, 0, 0.55)",
-    zIndex: 50,
-    width: 360,
-  },
-  tooltip: { borderRadius: 12, padding: 16 },
-  tooltipTitle: { fontSize: 15, fontWeight: 600 },
-  tooltipContent: { fontSize: 13, lineHeight: 1.55, padding: "8px 0" },
-  buttonNext: {
-    backgroundColor: "#8B5CF6",
-    borderRadius: 8,
-    fontSize: 12,
-    fontWeight: 600,
-    padding: "8px 14px",
-  },
-  buttonBack: { color: "#9CA3AF", fontSize: 12, marginRight: 8 },
-  buttonSkip: { color: "#6B7280", fontSize: 11 },
-  buttonClose: { display: "none" },
-  spotlight: { borderRadius: 12 },
-};
-
-// Shared Joyride wrapper: runs only when shouldAutoRun is true OR
-// `forceRun` is set (used by the Settings replay button).
+// ─── Shared Joyride runner ────────────────────────────────────────
 function TourRunner({ flagKey, steps, user, forceRun = false, onDone }) {
   const { t } = useI18n();
   const [run, setRun] = useState(false);
+  const helpersRef = useRef(null);
 
-  // Decide once on mount whether to run. Avoid running mid-render or
-  // on every re-render — Joyride doesn't like its `run` prop flipping
-  // unexpectedly.
   useEffect(() => {
     setRun(forceRun || shouldAutoRun(flagKey, user));
   }, [flagKey, user, forceRun]);
 
+  // When TourRunner unmounts mid-tour (e.g. user navigates to another page),
+  // Joyride's overlay and beacon are rendered into document.body via its own
+  // portals and won't be removed by React's teardown. reset(true) forces
+  // Joyride to clean up those DOM nodes before we disappear.
+  useEffect(() => {
+    return () => { helpersRef.current?.reset(true); };
+  }, []);
+
   const handleCallback = useCallback((data) => {
     const { status, type } = data;
-    // 'finished' = user reached the end. 'skipped' = user clicked Skip.
-    // Both should mark the flag. Joyride emits 'tour:end' lifecycle
-    // event for both terminal states.
     if (type === "tour:end" || status === "finished" || status === "skipped") {
       try { localStorage.setItem(flagKey, "1"); } catch {}
       setRun(false);
-      onDone && onDone();
+      onDone?.();
     }
   }, [flagKey, onDone]);
 
-  // Memoize locale so Joyride never receives a new object reference on
-  // re-render. Passing an inline literal causes Joyride v3 to setState on
-  // every render, triggering an infinite loop (React #306 = black screen).
   const locale = useMemo(() => ({
     back:  t("tour.back")  || "Atrás",
     next:  t("tour.next")  || "Siguiente",
-    skip:  t("tour.skip")  || "Saltar tour",
+    skip:  t("tour.skip")  || "Saltar",
     last:  t("tour.finish")|| "Listo",
     close: "✕",
   }), [t]);
@@ -133,13 +211,23 @@ function TourRunner({ flagKey, steps, user, forceRun = false, onDone }) {
         steps={steps}
         run={run}
         continuous
-        showProgress
         showSkipButton
-        disableOverlayClose
         scrollToFirstStep
+        disableOverlayClose={false}
+        spotlightClicks={false}
+        beaconComponent={TourBeacon}
+        tooltipComponent={TourTooltip}
+        getHelpers={(h) => { helpersRef.current = h; }}
         styles={STYLES}
         callback={handleCallback}
         locale={locale}
+        floaterProps={{
+          styles: {
+            floater: {
+              transition: "opacity 200ms ease, transform 200ms cubic-bezier(.2,.8,.2,1)",
+            },
+          },
+        }}
       />
     </TourErrorBoundary>
   );
@@ -215,7 +303,7 @@ export function UploadTour({ user, forceRun = false, onDone }) {
       target: '[data-tour="upload-delivery"]',
       title: t("tour.upload_delivery_title") || "Formato de entrega",
       content: t("tour.upload_delivery_body") ||
-        "MP4 H.264 1080p para YouTube, o ProRes 422 HQ + MP4 cuando el cliente pide máster broadcast (4K, DCI, etc.). Default es MP4.",
+        "MP4 H.264 1080p para YouTube, o ProRes 422 HQ + MP4 cuando el cliente pide máster broadcast. Default es MP4.",
     },
     {
       target: '[data-tour="upload-cta-bar"]',
@@ -277,11 +365,8 @@ export function EditorTour({ user, forceRun = false, onDone }) {
 }
 
 // ─── Tour 4: Job Detail (approval + delivery) ────────────────────
-// Mounted by JobDetail.jsx and only auto-fires when the user is
-// looking at a `pending_review` job for the first time. The
-// `hasUmgMaster` flag drives whether the ProRes step is included —
-// no point pointing at a button that isn't on screen for a
-// YouTube-only job.
+// Only auto-fires on a `pending_review` job for the first time.
+// `hasUmgMaster` controls whether the ProRes step is shown.
 export function JobDetailTour({ user, hasUmgMaster = false, isPendingReview = false, forceRun = false, onDone }) {
   const { t } = useI18n();
   const steps = useMemo(() => {
@@ -299,7 +384,7 @@ export function JobDetailTour({ user, hasUmgMaster = false, isPendingReview = fa
       target: '[data-tour="jobdetail-preview"]',
       title: t("tour.jobdetail_preview_title") || "Mirá el video",
       content: t("tour.jobdetail_preview_body") ||
-        "Reproducí acá el lyric video, el short vertical y el thumbnail. Si algo está mal (lyric mal sincronizado, error de tipeo, fondo raro), rechazá.",
+        "Reproducí acá el lyric video, el short vertical y el thumbnail. Si algo está mal, rechazá.",
       placement: "bottom",
     });
     if (isPendingReview || forceRun) {
@@ -307,7 +392,7 @@ export function JobDetailTour({ user, hasUmgMaster = false, isPendingReview = fa
         target: '[data-tour="jobdetail-approve-panel"]',
         title: t("tour.jobdetail_approve_title") || "Aprobar o rechazar",
         content: t("tour.jobdetail_approve_body") ||
-          "Aprobar habilita la descarga y consume 1 video de tu cuota mensual. Rechazar es gratis y no cuenta — usalo sin culpa si algo no convence.",
+          "Aprobar habilita la descarga y consume 1 video de tu cuota mensual. Rechazar es gratis — usalo sin culpa si algo no convence.",
         placement: "top",
       });
     }
@@ -322,7 +407,7 @@ export function JobDetailTour({ user, hasUmgMaster = false, isPendingReview = fa
         target: '[data-tour="jobdetail-prores-master"]',
         title: t("tour.jobdetail_prores_title") || "Master ProRes",
         content: t("tour.jobdetail_prores_body") ||
-          "Para entregas tipo UMG: descargás el .mov ProRes 422 HQ (BT.709, audio PCM 24-bit) que pasa QC manual. La primera vez tarda 1-2 min mientras se transcodea; las siguientes son instantáneas.",
+          "Para entregas broadcast: descargás el .mov ProRes 422 HQ que pasa QC manual. La primera vez tarda 1-2 min; las siguientes son instantáneas.",
         placement: "bottom",
       });
     }
@@ -331,7 +416,7 @@ export function JobDetailTour({ user, hasUmgMaster = false, isPendingReview = fa
   return <TourRunner flagKey={FLAGS.jobdetail} steps={steps} user={user} forceRun={forceRun} onDone={onDone} />;
 }
 
-// Helper for the Settings replay button.
+// ─── Settings helpers ─────────────────────────────────────────────
 export function clearAllTourFlags() {
   for (const k of TOUR_FLAG_KEYS) {
     try { localStorage.removeItem(k); } catch {}
@@ -339,8 +424,7 @@ export function clearAllTourFlags() {
 }
 
 // Called by the Settings replay button. Clears done-flags and marks
-// the session as a replay so shouldAutoRun bypasses the 14-day age
-// gate. The flag clears on tab close — no manual teardown needed.
+// the session as a replay so shouldAutoRun bypasses the 14-day age gate.
 export function startReplaySession() {
   clearAllTourFlags();
   try { sessionStorage.setItem(REPLAY_KEY, "1"); } catch {}
