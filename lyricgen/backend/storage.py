@@ -338,6 +338,28 @@ def multipart_presign_part(
     )
 
 
+def put_object_bytes(key: str, data: bytes, content_type: str = "application/octet-stream") -> bool:
+    """Upload raw bytes to an arbitrary R2 key (single-PUT proxy path).
+    Returns True on success, False if R2 is disabled or the call fails."""
+    client = _get_client()
+    if client is None:
+        return False
+    try:
+        client.put_object(
+            Bucket=R2_BUCKET,
+            Key=key,
+            Body=data,
+            ContentType=content_type,
+        )
+        return True
+    except Exception as exc:
+        import logging
+        logging.getLogger(__name__).error(
+            "put_object_bytes failed for key=%s: %s", key, exc, exc_info=True
+        )
+        return False
+
+
 def upload_part(
     key: str, upload_id: str, part_number: int, data: bytes,
 ) -> Optional[str]:

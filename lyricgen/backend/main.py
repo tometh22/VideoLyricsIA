@@ -958,7 +958,9 @@ def _enforce_concurrent_jobs_cap(*_, **__) -> None:
 USER_BACKLOG_LIMIT = int(os.environ.get("USER_BACKLOG_LIMIT", "5"))
 TENANT_BACKLOG_LIMIT = int(os.environ.get("TENANT_BACKLOG_LIMIT", str(USER_BACKLOG_LIMIT * 5)))
 
-_BACKLOG_STATUSES = ["queued", "processing", "pending_review"]
+_BACKLOG_STATUSES = [
+    "awaiting_upload", "queued", "processing", "pending_review",
+]
 
 
 def _enforce_tenant_backlog(db: Session, current_user: dict) -> None:
@@ -1613,6 +1615,9 @@ async def upload_part_proxy(
         raise HTTPException(
             status_code=409, detail="Job is not in an active multipart upload."
         )
+    content_length = int(request.headers.get("content-length") or 0)
+    if content_length > _MULTIPART_PART_SIZE_BYTES + 1024:
+        raise HTTPException(status_code=413, detail="Chunk exceeds part size limit.")
     data = await request.body()
     if not data:
         raise HTTPException(status_code=400, detail="Empty chunk.")
@@ -1622,6 +1627,45 @@ async def upload_part_proxy(
     if etag is None:
         raise HTTPException(status_code=502, detail="R2 part upload failed.")
     return {"etag": etag}
+
+
+@app.post("/upload-file-proxy")
+@limiter.limit("120/minute")
+async def upload_file_proxy(
+    request: Request,
+    job_id: str,
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Proxy a single-PUT file to R2 server-side. The browser POSTs raw
+    bytes here (same-origin, no CORS preflight) instead of PUTting directly
+    to r2.cloudflarestorage.com which would require R2 bucket CORS config.
+    Mirrors /upload-part-proxy for the non-multipart (<16 MB) path."""
+    from jobs import get_job_model
+    job_row = get_job_model(db, job_id)
+    if (not job_row
+            or job_row.user_id != current_user["id"]
+            or job_row.tenant_id != current_user["tenant_id"]):
+        raise HTTPException(status_code=404, detail="Job not found.")
+    if job_row.status != "awaiting_upload":
+        raise HTTPException(
+            status_code=409, detail="Job is not awaiting upload."
+        )
+    if not job_row.input_r2_key:
+        raise HTTPException(
+            status_code=409, detail="Job has no R2 key allocated."
+        )
+    content_length = int(request.headers.get("content-length") or 0)
+    if content_length > MAX_UPLOAD_MB * 1024 * 1024:
+        raise HTTPException(status_code=413, detail="File exceeds maximum upload size.")
+    data = await request.body()
+    if not data:
+        raise HTTPException(status_code=400, detail="Empty file body.")
+    content_type = request.headers.get("content-type") or "application/octet-stream"
+    ok = storage.put_object_bytes(job_row.input_r2_key, data, content_type)
+    if not ok:
+        raise HTTPException(status_code=502, detail="R2 upload failed.")
+    return {"job_id": job_id, "key": job_row.input_r2_key}
 
 
 class _MultipartCompleteReq(BaseModel):
@@ -1759,11 +1803,16 @@ async def transcribe_uploaded(
         audio_path = os.path.join(job_dir, job_row.filename)
 
         if not os.path.exists(audio_path):
-            ok = storage.download_object(job_row.input_r2_key, audio_path)
-            if not ok:
+            import asyncio as _asyncio
+            for _attempt in range(5):
+                if storage.download_object(job_row.input_r2_key, audio_path):
+                    break
+                if _attempt < 4:
+                    await _asyncio.sleep(0.5 * (2 ** _attempt))
+            else:
                 raise HTTPException(
                     status_code=502,
-                    detail=f"Could not fetch upload from object storage ({job_row.input_r2_key}).",
+                    detail="No pudimos leer el archivo subido. Reintentá en unos segundos.",
                 )
         _validate_audio_file_on_disk(job_row.filename, audio_path)
 
