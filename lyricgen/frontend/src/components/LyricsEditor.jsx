@@ -144,6 +144,7 @@ export default function LyricsEditor({
   fontScale = 1.0,
   lyricTransition = "cut",
   textMotion = "none",
+  textContrast = "medium",
 }) {
   const { t } = useI18n();
   const [edited, setEdited] = useState(() =>
@@ -1235,7 +1236,12 @@ export default function LyricsEditor({
                   fontSize: `${previewFontPx}px`,
                   fontWeight: 700,
                   color: "white",
-                  textShadow: "1px 1px 3px rgba(0,0,0,0.8), -1px -1px 2px rgba(0,0,0,0.6)",
+                  textShadow: textContrast === "strong"
+                    ? "0 0 8px rgba(0,0,0,1), -1px -1px 0 #000, 1px -1px 0 #000, -1px 1px 0 #000, 1px 1px 0 #000, 2px 2px 4px rgba(0,0,0,0.9)"
+                    : textContrast === "medium"
+                    ? "0 0 4px rgba(0,0,0,0.9), 1px 1px 3px rgba(0,0,0,0.8)"
+                    : "1px 1px 2px rgba(0,0,0,0.6)",
+                  WebkitTextStroke: textContrast === "strong" ? "1px black" : textContrast === "medium" ? "0.5px black" : "0px",
                   textTransform: "none",
                   textAlign: "center",
                   maxWidth: `${Math.round(tier.maxWidthPx * previewRatio)}px`,
@@ -1261,6 +1267,7 @@ export default function LyricsEditor({
               <span>Caja: {textCase === "upper" ? "MAYÚSCULAS" : textCase === "title" ? "Título" : textCase === "lower" ? "minúsculas" : "Original"}</span>
               <span>Transición: {lyricTransition === "cut" ? "Corte" : lyricTransition === "fade" ? "Fade" : "Fade lento"}</span>
               <span>Movimiento: {textMotion === "none" ? "Estático" : textMotion === "subtle" ? "Sutil" : "Flotante"}</span>
+              <span>Contraste: {textContrast === "subtle" ? "Suave" : textContrast === "strong" ? "Fuerte" : "Medio"}</span>
             </div>
           </div>
         );

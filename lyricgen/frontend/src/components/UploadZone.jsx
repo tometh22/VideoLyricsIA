@@ -145,7 +145,7 @@ export default function UploadZone({
   // drawer lets an operator override individual fields without affecting others.
   const [batchDefaults, setBatchDefaults] = useState({
     genre: "", concept: "", movementStyle: "", font: "",
-    textCase: "upper", fontScale: "1.0", lyricTransition: "cut", textMotion: "none",
+    textCase: "upper", fontScale: "1.0", lyricTransition: "cut", textMotion: "none", textContrast: "medium",
   });
   const batchDefaultsRef = useRef(batchDefaults);
   useEffect(() => { batchDefaultsRef.current = batchDefaults; }, [batchDefaults]);
@@ -740,7 +740,7 @@ export default function UploadZone({
       </div>
 
       {/* Text motion icon buttons */}
-      <div className="flex items-center gap-2">
+      <div className="flex items-center gap-2 mb-3">
         <span className="text-[11px] text-gray-600 shrink-0">{t("upload.motion_label") || "Movimiento del texto:"}</span>
         <div className="flex gap-1">
           {[
@@ -762,6 +762,31 @@ export default function UploadZone({
           ))}
         </div>
       </div>
+
+      {/* Text contrast pills */}
+      <div className="flex items-center gap-2">
+        <span className="text-[11px] text-gray-600 shrink-0">{t("upload.contrast_label") || "Contraste:"}</span>
+        <div className="flex gap-1">
+          {[
+            { code: "subtle", style: { WebkitTextStroke: "0px", textShadow: "none" },         label: t("upload.contrast_subtle") || "Suave" },
+            { code: "medium", style: { WebkitTextStroke: "0.5px black", textShadow: "0 0 3px rgba(0,0,0,0.8)" }, label: t("upload.contrast_medium") || "Medio" },
+            { code: "strong", style: { WebkitTextStroke: "1px black",   textShadow: "0 0 6px rgba(0,0,0,1), -1px -1px 0 #000, 1px 1px 0 #000" }, label: t("upload.contrast_strong") || "Fuerte" },
+          ].map((opt) => (
+            <button
+              key={opt.code}
+              type="button"
+              title={opt.label}
+              onClick={() => updateBatchDefault("textContrast", opt.code)}
+              className={`px-2 py-1 rounded-md text-[13px] font-bold text-white transition-all
+                ${batchDefaults.textContrast === opt.code
+                  ? "bg-brand/20 ring-1 ring-brand/40"
+                  : "bg-surface-3/40 hover:bg-surface-3/60"
+                }`}
+              style={opt.style}
+            >A</button>
+          ))}
+        </div>
+      </div>
     </div>
   ) : null;
 
@@ -778,7 +803,8 @@ export default function UploadZone({
           (entry.textCase     || "upper") !== (bd.textCase     || "upper") ||
           (entry.fontScale    || "1.0")   !== (bd.fontScale    || "1.0")   ||
           (entry.lyricTransition || "cut") !== (bd.lyricTransition || "cut") ||
-          (entry.textMotion   || "none")  !== (bd.textMotion   || "none");
+          (entry.textMotion   || "none")  !== (bd.textMotion   || "none")  ||
+          (entry.textContrast || "medium") !== (bd.textContrast || "medium");
 
         return (
           <div key={i} className="glass rounded-card px-4 py-3" {...(i === 0 ? { "data-tour": "upload-row" } : {})}>
@@ -982,6 +1008,27 @@ export default function UploadZone({
                               : "bg-surface-3/40 text-gray-500 hover:text-gray-300"
                             }`}
                         >{opt.icon}</button>
+                      ))}
+                    </div>
+                  </div>
+                  {/* Text contrast */}
+                  <div className="flex items-center gap-2">
+                    <span className="text-[11px] text-gray-600 shrink-0">{t("upload.contrast_label") || "Contraste:"}</span>
+                    <div className="flex gap-1">
+                      {[
+                        { code: "subtle", style: { WebkitTextStroke: "0px", textShadow: "none" },         label: t("upload.contrast_subtle") || "Suave" },
+                        { code: "medium", style: { WebkitTextStroke: "0.5px black", textShadow: "0 0 3px rgba(0,0,0,0.8)" }, label: t("upload.contrast_medium") || "Medio" },
+                        { code: "strong", style: { WebkitTextStroke: "1px black",   textShadow: "0 0 6px rgba(0,0,0,1), -1px -1px 0 #000, 1px 1px 0 #000" }, label: t("upload.contrast_strong") || "Fuerte" },
+                      ].map((opt) => (
+                        <button key={opt.code} type="button" title={opt.label}
+                          onClick={() => updateField(i, "textContrast", opt.code)}
+                          className={`px-2 py-1 rounded-md text-[13px] font-bold text-white transition-all
+                            ${(entry.textContrast || "medium") === opt.code
+                              ? "bg-brand/20 ring-1 ring-brand/40"
+                              : "bg-surface-3/40 hover:bg-surface-3/60"
+                            }`}
+                          style={opt.style}
+                        >A</button>
                       ))}
                     </div>
                   </div>
