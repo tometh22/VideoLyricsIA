@@ -60,11 +60,12 @@ from auth import (
     verify_media_token,
     validate_password_strength,
     has_prores_access,
+    generate_api_key,
 )
 import storage
 from datetime import datetime, timedelta, timezone
 
-from database import Job, User, UserSettings, AuditLog, get_db, init_db, BackgroundAsset, AssetUsage
+from database import Job, User, UserSettings, AuditLog, APIKey, get_db, init_db, BackgroundAsset, AssetUsage
 from jobs import bulk_delete_jobs, create_job, delete_job, get_job, get_all_jobs, update_job
 from observability import init_sentry, init_logging, health_snapshot
 from pipeline import run_pipeline, transcribe
@@ -520,6 +521,10 @@ class DeleteAccountRequest(BaseModel):
     password: str
 
 
+class CreateAPIKeyRequest(BaseModel):
+    name: str
+
+
 @app.post("/auth/login")
 @limiter.limit("10/minute")
 async def login(body: LoginRequest, request: Request, db: Session = Depends(get_db)):
@@ -742,6 +747,91 @@ async def delete_account(
     user.username = f"deleted_{user.id}"
     db.add(AuditLog(
         user_id=user.id, action="auth.delete_account",
+        ip_address=request.client.host if request.client else None,
+    ))
+    db.commit()
+    return {"ok": True}
+
+
+@app.get("/auth/api-keys")
+async def list_api_keys(
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """List the current user's active API keys (secrets never returned)."""
+    keys = db.query(APIKey).filter(
+        APIKey.user_id == current_user["id"],
+        APIKey.is_active.is_(True),
+    ).order_by(APIKey.created_at.desc()).all()
+    return [
+        {
+            "id": k.id,
+            "name": k.name,
+            "prefix": k.key_prefix,
+            "created_at": k.created_at.isoformat() if k.created_at else None,
+            "last_used_at": k.last_used_at.isoformat() if k.last_used_at else None,
+        }
+        for k in keys
+    ]
+
+
+@app.post("/auth/api-keys")
+@limiter.limit("10/minute")
+async def create_api_key(
+    body: CreateAPIKeyRequest,
+    request: Request,
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Create a new API key. The full secret is returned exactly once."""
+    if not body.name.strip():
+        raise HTTPException(status_code=400, detail="Key name is required")
+    active_count = db.query(APIKey).filter(
+        APIKey.user_id == current_user["id"],
+        APIKey.is_active.is_(True),
+    ).count()
+    if active_count >= 10:
+        raise HTTPException(status_code=400, detail="Maximum 10 API keys per account")
+    full_key, prefix, key_hash = generate_api_key()
+    key = APIKey(
+        user_id=current_user["id"],
+        name=body.name.strip(),
+        key_prefix=prefix,
+        key_hash=key_hash,
+    )
+    db.add(key)
+    db.add(AuditLog(
+        user_id=current_user["id"], action="auth.api_key.create",
+        ip_address=request.client.host if request.client else None,
+    ))
+    db.commit()
+    db.refresh(key)
+    return {
+        "id": key.id,
+        "name": key.name,
+        "prefix": prefix,
+        "key": full_key,
+        "created_at": key.created_at.isoformat() if key.created_at else None,
+    }
+
+
+@app.delete("/auth/api-keys/{key_id}")
+async def revoke_api_key(
+    key_id: int,
+    request: Request,
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Revoke an API key by ID."""
+    key = db.query(APIKey).filter(
+        APIKey.id == key_id,
+        APIKey.user_id == current_user["id"],
+    ).first()
+    if not key:
+        raise HTTPException(status_code=404, detail="API key not found")
+    key.is_active = False
+    db.add(AuditLog(
+        user_id=current_user["id"], action="auth.api_key.revoke",
         ip_address=request.client.host if request.client else None,
     ))
     db.commit()

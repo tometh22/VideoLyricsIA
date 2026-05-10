@@ -22,6 +22,11 @@ const DEFAULT_SETTINGS = {
   metadataLanguage: "es",
   defaultPrivacy: "unlisted",
   channelName: "",
+  channels: [],
+  notif_quota_80: true,
+  notif_quota_100: true,
+  notif_billing: true,
+  notif_jobs: false,
 };
 
 const PLAN_INFO = {
@@ -108,6 +113,23 @@ function UsageBar({ percent, alert80, alert100 }) {
   );
 }
 
+function Toggle({ value, onChange }) {
+  return (
+    <button
+      role="switch"
+      aria-checked={value}
+      onClick={() => onChange(!value)}
+      className={`relative inline-flex h-5 w-9 shrink-0 items-center rounded-full transition-colors ${
+        value ? "bg-brand" : "bg-surface-3/60 ring-1 ring-white/[0.08]"
+      }`}
+    >
+      <span className={`inline-block h-3.5 w-3.5 transform rounded-full bg-white shadow-sm transition-transform ${
+        value ? "translate-x-[18px]" : "translate-x-0.5"
+      }`} />
+    </button>
+  );
+}
+
 function AlertBanner({ variant, children }) {
   const styles = {
     amber: "bg-amber-500/[0.06] ring-amber-500/15 text-amber-400",
@@ -154,6 +176,14 @@ export default function Settings({ onBack }) {
   // Data export
   const [exportLoading, setExportLoading] = useState(false);
 
+  // API keys
+  const [apiKeys, setApiKeys] = useState([]);
+  const [apiKeyName, setApiKeyName] = useState("");
+  const [apiKeyCreating, setApiKeyCreating] = useState(false);
+  const [newKeySecret, setNewKeySecret] = useState(null);
+  const [keyCopied, setKeyCopied] = useState(false);
+  const [revokingId, setRevokingId] = useState(null);
+
   useEffect(() => {
     fetch(`${API}/settings`, { headers: authHeaders() })
       .then((r) => r.json())
@@ -171,6 +201,11 @@ export default function Settings({ onBack }) {
 
     fetch(`${API}/usage`, { headers: authHeaders() })
       .then((r) => r.json()).then(setUsage).catch(() => {});
+
+    fetch(`${API}/auth/api-keys`, { headers: authHeaders() })
+      .then((r) => r.json())
+      .then((data) => { if (Array.isArray(data)) setApiKeys(data); })
+      .catch(() => {});
   }, []);
 
   const handleSave = async () => {
@@ -284,6 +319,58 @@ export default function Settings({ onBack }) {
     }
   };
 
+  const toggleNotif = async (key) => {
+    const next = { ...settings, [key]: !settings[key] };
+    setSettings(next);
+    try {
+      await fetch(`${API}/settings`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", ...authHeaders() },
+        body: JSON.stringify(next),
+      });
+    } catch {}
+  };
+
+  const handleCreateApiKey = async () => {
+    if (!apiKeyName.trim()) return;
+    setApiKeyCreating(true);
+    try {
+      const res = await fetch(`${API}/auth/api-keys`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", ...authHeaders() },
+        body: JSON.stringify({ name: apiKeyName.trim() }),
+      });
+      const data = await res.json();
+      if (!res.ok) return;
+      setNewKeySecret(data.key);
+      setApiKeys((prev) => [{ id: data.id, name: data.name, prefix: data.prefix, created_at: data.created_at, last_used_at: null }, ...prev]);
+      setApiKeyName("");
+    } catch {} finally {
+      setApiKeyCreating(false);
+    }
+  };
+
+  const handleRevokeApiKey = async (keyId) => {
+    setRevokingId(keyId);
+    try {
+      const res = await fetch(`${API}/auth/api-keys/${keyId}`, {
+        method: "DELETE",
+        headers: authHeaders(),
+      });
+      if (res.ok) setApiKeys((prev) => prev.filter((k) => k.id !== keyId));
+    } catch {} finally {
+      setRevokingId(null);
+    }
+  };
+
+  const handleCopyKey = async (key) => {
+    try {
+      await navigator.clipboard.writeText(key);
+      setKeyCopied(true);
+      setTimeout(() => setKeyCopied(false), 2500);
+    } catch {}
+  };
+
   const currentPlan = user?.plan || "free";
   const planInfo = PLAN_INFO[currentPlan] || PLAN_INFO.free;
 
@@ -349,6 +436,117 @@ export default function Settings({ onBack }) {
                   </div>
                 ))}
               </div>
+            </Card>
+
+            {/* Notifications */}
+            <Card>
+              <SectionLabel>{t("settings.notifications") || "Notificaciones por email"}</SectionLabel>
+              <p className="text-xs text-ink-secondary mb-4 -mt-1">
+                {t("settings.notifications_sub") || "Elegí qué alertas recibir en tu casilla."}
+              </p>
+              <div className="space-y-0">
+                {[
+                  { key: "notif_quota_80",  label: t("settings.notif_quota_80"),  sub: t("settings.notif_quota_80_sub") },
+                  { key: "notif_quota_100", label: t("settings.notif_quota_100"), sub: t("settings.notif_quota_100_sub") },
+                  { key: "notif_billing",   label: t("settings.notif_billing"),   sub: t("settings.notif_billing_sub") },
+                  { key: "notif_jobs",      label: t("settings.notif_jobs"),      sub: t("settings.notif_jobs_sub") },
+                ].map(({ key, label, sub }, i, arr) => (
+                  <div key={key}
+                    className={`flex items-center justify-between gap-4 py-3 ${i < arr.length - 1 ? "border-b border-white/[0.03]" : ""}`}>
+                    <div>
+                      <p className="text-sm text-white">{label}</p>
+                      <p className="text-xs text-ink-secondary mt-0.5">{sub}</p>
+                    </div>
+                    <Toggle value={!!settings[key]} onChange={() => toggleNotif(key)} />
+                  </div>
+                ))}
+              </div>
+            </Card>
+
+            {/* API Keys */}
+            <Card>
+              <SectionLabel>{t("settings.api_keys") || "API Keys"}</SectionLabel>
+              <p className="text-xs text-ink-secondary mb-4 -mt-1">
+                {t("settings.api_keys_sub") || "Tokens de acceso para integraciones externas."}
+              </p>
+
+              {/* New key disclosed once */}
+              {newKeySecret && (
+                <div className="mb-4 p-3 rounded-xl bg-accent/[0.06] ring-1 ring-accent/20 animate-fade-in">
+                  <p className="text-xs font-medium text-accent mb-2">
+                    {t("settings.api_key_created_hint") || "Guardá esta clave ahora. No se mostrará de nuevo."}
+                  </p>
+                  <div className="flex items-center gap-2">
+                    <code className="flex-1 text-[11px] font-mono text-white bg-surface-3/50 px-3 py-2 rounded-lg truncate">
+                      {newKeySecret}
+                    </code>
+                    <button onClick={() => handleCopyKey(newKeySecret)}
+                      className="shrink-0 text-xs font-medium px-3 py-2 rounded-lg bg-accent/15 text-accent ring-1 ring-accent/30 hover:bg-accent/25 transition-colors">
+                      {keyCopied ? (t("settings.api_key_copied") || "Copiado") : (t("settings.api_key_copy") || "Copiar")}
+                    </button>
+                  </div>
+                  <button onClick={() => setNewKeySecret(null)}
+                    className="mt-2 text-[11px] text-ink-secondary hover:text-white transition-colors">
+                    × {t("settings.cancel") || "Cerrar"}
+                  </button>
+                </div>
+              )}
+
+              {/* Existing keys */}
+              {apiKeys.length === 0 && !newKeySecret ? (
+                <p className="text-xs text-ink-secondary mb-4">
+                  {t("settings.api_key_no_keys") || "Sin API keys."}
+                </p>
+              ) : (
+                <div className="mb-4 space-y-0">
+                  {apiKeys.map((k, i) => (
+                    <div key={k.id}
+                      className={`flex items-center justify-between gap-3 py-2.5 ${i < apiKeys.length - 1 ? "border-b border-white/[0.03]" : ""}`}>
+                      <div className="min-w-0">
+                        <p className="text-sm text-white truncate">{k.name}</p>
+                        <p className="text-[11px] text-gray-600 font-mono mt-0.5">{k.prefix}•••</p>
+                        <p className="text-[10px] text-gray-600 mt-0.5">
+                          {t("settings.api_key_last_used") || "Último uso"}:{" "}
+                          {k.last_used_at
+                            ? new Date(k.last_used_at).toLocaleDateString()
+                            : (t("settings.api_key_never_used") || "Nunca usado")}
+                        </p>
+                      </div>
+                      <button
+                        onClick={() => handleRevokeApiKey(k.id)}
+                        disabled={revokingId === k.id}
+                        className="shrink-0 text-[11px] font-medium px-3 py-1.5 rounded-lg bg-red-500/10 text-red-400 ring-1 ring-red-500/15 hover:bg-red-500/20 transition-colors disabled:opacity-40">
+                        {revokingId === k.id ? "…" : (t("settings.api_key_revoke") || "Revocar")}
+                      </button>
+                    </div>
+                  ))}
+                </div>
+              )}
+
+              {/* Create new key */}
+              {apiKeys.length < 10 && (
+                <div className="flex gap-2 pt-2 border-t border-white/[0.03]">
+                  <input
+                    type="text"
+                    value={apiKeyName}
+                    onChange={(e) => setApiKeyName(e.target.value)}
+                    onKeyDown={(e) => e.key === "Enter" && handleCreateApiKey()}
+                    placeholder={t("settings.api_key_new_name") || "Nombre de la integración"}
+                    className="input-field text-sm flex-1 h-9"
+                  />
+                  <button
+                    onClick={handleCreateApiKey}
+                    disabled={apiKeyCreating || !apiKeyName.trim()}
+                    className="shrink-0 btn-primary text-xs h-9 px-4 disabled:opacity-40 disabled:cursor-not-allowed">
+                    {apiKeyCreating ? "…" : (t("settings.api_key_create") || "Crear")}
+                  </button>
+                </div>
+              )}
+              {apiKeys.length >= 10 && (
+                <p className="text-[11px] text-ink-secondary pt-2 border-t border-white/[0.03]">
+                  {t("settings.api_key_limit") || "Máx 10 por cuenta"}
+                </p>
+              )}
             </Card>
 
             {/* Change password */}
@@ -725,15 +923,69 @@ export default function Settings({ onBack }) {
             </Card>
 
             <Card>
-              <SectionLabel>{t("settings.channel")}</SectionLabel>
-              <p className="text-xs text-ink-secondary mb-4 -mt-1">{t("settings.channel_sub")}</p>
-              <Field
-                label={t("settings.channel_name")}
-                help={t("settings.channel_name_hint") || "Solo informativo. La conexión real se gestiona vía OAuth en tu cuenta de YouTube."}>
-                <input type="text" value={settings.channelName}
-                  onChange={(e) => update("channelName", e.target.value)}
-                  className="input-field text-sm" placeholder="Mi Canal de Música" />
-              </Field>
+              <SectionLabel>{t("settings.channels") || "Canales de YouTube"}</SectionLabel>
+              <p className="text-xs text-ink-secondary mb-4 -mt-1">
+                {t("settings.channels_sub") || "Gestioná los canales asociados a esta cuenta (máx 5)."}
+              </p>
+
+              {(!settings.channels || settings.channels.length === 0) ? (
+                <p className="text-xs text-ink-secondary mb-4">
+                  {t("settings.channel_empty") || "Ningún canal configurado."}
+                </p>
+              ) : (
+                <div className="mb-4 space-y-0">
+                  {settings.channels.map((ch, idx) => (
+                    <div key={idx}
+                      className={`flex items-center gap-3 py-2.5 ${idx < settings.channels.length - 1 ? "border-b border-white/[0.03]" : ""}`}>
+                      <div className="flex-1 min-w-0">
+                        <input
+                          type="text"
+                          value={ch.name}
+                          onChange={(e) => {
+                            const next = settings.channels.map((c, i) => i === idx ? { ...c, name: e.target.value } : c);
+                            update("channels", next);
+                          }}
+                          placeholder={t("settings.channel_placeholder_name") || "Nombre del canal"}
+                          className="input-field text-sm w-full"
+                        />
+                      </div>
+                      <div className="w-32 shrink-0">
+                        <input
+                          type="text"
+                          value={ch.handle || ""}
+                          onChange={(e) => {
+                            const next = settings.channels.map((c, i) => i === idx ? { ...c, handle: e.target.value } : c);
+                            update("channels", next);
+                          }}
+                          placeholder="@handle"
+                          className="input-field text-sm w-full"
+                        />
+                      </div>
+                      <button
+                        onClick={() => update("channels", settings.channels.filter((_, i) => i !== idx))}
+                        className="shrink-0 w-8 h-8 flex items-center justify-center rounded-lg text-gray-600 hover:text-red-400 hover:bg-red-500/10 transition-colors">
+                        <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" strokeWidth="2.5" viewBox="0 0 24 24">
+                          <line x1="18" y1="6" x2="6" y2="18" /><line x1="6" y1="6" x2="18" y2="18" />
+                        </svg>
+                      </button>
+                    </div>
+                  ))}
+                </div>
+              )}
+
+              {(settings.channels || []).length < 5 && (
+                <button
+                  onClick={() => update("channels", [...(settings.channels || []), { name: "", handle: "" }])}
+                  className="flex items-center gap-1.5 text-xs font-medium text-brand-light hover:text-white transition-colors">
+                  <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" strokeWidth="2.5" viewBox="0 0 24 24">
+                    <line x1="12" y1="5" x2="12" y2="19" /><line x1="5" y1="12" x2="19" y2="12" />
+                  </svg>
+                  {t("settings.channel_add") || "Agregar canal"}
+                </button>
+              )}
+              {(settings.channels || []).length >= 5 && (
+                <p className="text-[11px] text-ink-secondary">{t("settings.channel_max") || "Máximo 5 canales."}</p>
+              )}
             </Card>
 
             <div className="flex items-center justify-end gap-3 pt-2">
