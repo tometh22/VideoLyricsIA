@@ -521,9 +521,6 @@ def _migrate_user_columns():
         "ALTER TABLE jobs ADD COLUMN IF NOT EXISTS song_title VARCHAR(500)",
         "ALTER TABLE jobs ADD COLUMN IF NOT EXISTS input_r2_key VARCHAR(500)",
         "ALTER TABLE jobs ADD COLUMN IF NOT EXISTS multipart_upload_id VARCHAR(255)",
-        # R2 keys and UploadIds can exceed 255 chars; widen both to TEXT.
-        "ALTER TABLE jobs ALTER COLUMN input_r2_key TYPE TEXT",
-        "ALTER TABLE jobs ALTER COLUMN multipart_upload_id TYPE TEXT",
         # Library exclusivity (UMG): tenant-owned and variation-parent references.
         "ALTER TABLE background_assets ADD COLUMN IF NOT EXISTS owner_tenant_id VARCHAR(100)",
         "ALTER TABLE background_assets ADD COLUMN IF NOT EXISTS parent_asset_id INTEGER REFERENCES background_assets(id)",
@@ -540,6 +537,31 @@ def _migrate_user_columns():
                 conn.execute(text(sql))
         except Exception as e:  # pragma: no cover — dialect-specific
             print(f"[init_db] migrate skipped: {sql} → {e}")
+
+    # Widen VARCHAR columns to TEXT — only when not already text, to avoid
+    # acquiring an ACCESS EXCLUSIVE lock on the jobs table during rolling
+    # deploys (new container starts while old one still holds connections).
+    _widen_column_to_text("jobs", "input_r2_key")
+    _widen_column_to_text("jobs", "multipart_upload_id")
+
+
+def _widen_column_to_text(table: str, column: str) -> None:
+    """Run ALTER COLUMN TYPE TEXT only if the column is not already text.
+    Skipping avoids an ACCESS EXCLUSIVE lock that would block during a
+    rolling deploy where the previous replica is still accepting requests."""
+    from sqlalchemy import text
+    try:
+        with engine.connect() as conn:
+            row = conn.execute(text(
+                "SELECT data_type FROM information_schema.columns "
+                "WHERE table_name = :t AND column_name = :c"
+            ), {"t": table, "c": column}).fetchone()
+        if row and row[0].lower() == "text":
+            return  # already widened — no lock needed
+        with engine.begin() as conn:
+            conn.execute(text(f"ALTER TABLE {table} ALTER COLUMN {column} TYPE TEXT"))
+    except Exception as e:  # pragma: no cover
+        print(f"[init_db] widen skipped: {table}.{column} → {e}")
 
 
 def drop_db():

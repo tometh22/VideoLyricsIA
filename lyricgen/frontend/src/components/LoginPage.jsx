@@ -8,9 +8,11 @@ const API = import.meta.env.VITE_API_URL || "";
 // Retries on timeout (backend cold start / slow mobile network).
 // Fails immediately on any server response (4xx/5xx) to avoid
 // locking accounts with repeated bad-credential attempts.
-async function fetchWithRetry(url, opts, { timeout = 8000, maxAttempts = 3 } = {}) {
+// onRetry(attempt) lets the UI show progress while retrying.
+async function fetchWithRetry(url, opts, { timeout = 30000, maxAttempts = 3, onRetry } = {}) {
   let lastErr;
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    if (attempt > 1) onRetry?.(attempt);
     try {
       return await fetchWithTimeout(url, opts, timeout);
     } catch (err) {
@@ -30,6 +32,7 @@ export default function LoginPage({ onLogin, onBack, resetToken, onResetComplete
   const [confirmPassword, setConfirmPassword] = useState("");
   const [error, setError] = useState("");
   const [loading, setLoading] = useState(false);
+  const [retryMsg, setRetryMsg] = useState("");
   const [message, setMessage] = useState("");
 
   const handleLogin = async (e) => {
@@ -37,12 +40,13 @@ export default function LoginPage({ onLogin, onBack, resetToken, onResetComplete
     if (!username.trim() || !password.trim()) return;
     setLoading(true);
     setError("");
+    setRetryMsg("");
     try {
       const res = await fetchWithRetry(`${API}/auth/login`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ username: username.trim(), password }),
-      });
+      }, { onRetry: (n) => setRetryMsg(`Servidor arrancando, reintentando (${n}/3)...`) });
       if (!res.ok) {
         const data = await res.json().catch(() => ({}));
         throw new Error(data.detail || t("login.error"));
@@ -55,6 +59,7 @@ export default function LoginPage({ onLogin, onBack, resetToken, onResetComplete
         : err.message);
     } finally {
       setLoading(false);
+      setRetryMsg("");
     }
   };
 
