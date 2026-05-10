@@ -34,4 +34,8 @@ ENV PYTHONUNBUFFERED=1 \
 EXPOSE 8000
 
 # Default command runs the API; override with `python worker.py` for workers.
-CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "2"]
+# Use ${PORT:-8000} so Railway's injected PORT env var is honoured — Railway
+# sets PORT to match the "Target port" in Dashboard (e.g. 8080). Hardcoding
+# 8000 while Railway targets a different port causes connection-refused on
+# every healthcheck attempt ("service unavailable", all retries).
+CMD ["sh", "-c", "uvicorn main:app --host 0.0.0.0 --port ${PORT:-8000} --workers 2"]
