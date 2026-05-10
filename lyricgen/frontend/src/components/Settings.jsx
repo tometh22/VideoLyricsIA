@@ -25,12 +25,12 @@ const DEFAULT_SETTINGS = {
 };
 
 const PLAN_INFO = {
-  free:        { label: "Free",        videos: 5,    price: 0,    color: "text-ink-secondary" },
-  "100":       { label: "Plan 100",    videos: 100,  price: 900,  color: "text-brand-light" },
-  "250":       { label: "Plan 250",    videos: 250,  price: 2000, color: "text-brand-light" },
-  "500":       { label: "Plan 500",    videos: 500,  price: 3500, color: "text-brand-light" },
-  "1000":      { label: "Plan 1000",   videos: 1000, price: 6000, color: "text-brand-light" },
-  unlimited:   { label: "Unlimited",   videos: "∞",  price: 0,    color: "text-accent" },
+  free:      { label: "Free",      videos: 5,    price: 0,    color: "text-ink-secondary" },
+  "100":     { label: "Plan 100",  videos: 100,  price: 900,  color: "text-brand-light" },
+  "250":     { label: "Plan 250",  videos: 250,  price: 2000, color: "text-brand-light" },
+  "500":     { label: "Plan 500",  videos: 500,  price: 3500, color: "text-brand-light" },
+  "1000":    { label: "Plan 1000", videos: 1000, price: 6000, color: "text-brand-light" },
+  unlimited: { label: "Unlimited", videos: "∞",  price: 0,    color: "text-accent" },
 };
 
 function SectionLabel({ children }) {
@@ -74,6 +74,56 @@ function TabPill({ active, onClick, children }) {
   );
 }
 
+function InlineSuccess({ message }) {
+  return (
+    <span className="text-xs text-accent flex items-center gap-1.5 animate-fade-in">
+      <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" strokeWidth="2.5" viewBox="0 0 24 24">
+        <polyline points="20 6 9 17 4 12" />
+      </svg>
+      {message}
+    </span>
+  );
+}
+
+function InlineError({ message }) {
+  return (
+    <p className="text-xs text-red-400 flex items-center gap-1.5">
+      <svg className="w-3.5 h-3.5 shrink-0" fill="none" stroke="currentColor" strokeWidth="2.5" viewBox="0 0 24 24">
+        <circle cx="12" cy="12" r="10" /><line x1="12" y1="8" x2="12" y2="12" /><line x1="12" y1="16" x2="12.01" y2="16" />
+      </svg>
+      {message}
+    </p>
+  );
+}
+
+function UsageBar({ percent, alert80, alert100 }) {
+  const color = alert100 ? "bg-red-500" : alert80 ? "bg-amber-400" : "bg-brand";
+  return (
+    <div className="h-1.5 w-full rounded-full bg-surface-3/40 overflow-hidden">
+      <div
+        className={`h-full rounded-full transition-all duration-700 ${color}`}
+        style={{ width: `${Math.min(percent, 100)}%` }}
+      />
+    </div>
+  );
+}
+
+function AlertBanner({ variant, children }) {
+  const styles = {
+    amber: "bg-amber-500/[0.06] ring-amber-500/15 text-amber-400",
+    red:   "bg-red-500/[0.06] ring-red-500/15 text-red-400",
+  };
+  return (
+    <div className={`mt-3 flex items-start gap-2 p-3 rounded-xl ring-1 ${styles[variant]}`}>
+      <svg className="w-4 h-4 shrink-0 mt-0.5" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
+        <path d="M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z" />
+        <line x1="12" y1="9" x2="12" y2="13" /><line x1="12" y1="17" x2="12.01" y2="17" />
+      </svg>
+      <div>{children}</div>
+    </div>
+  );
+}
+
 export default function Settings({ onBack }) {
   const { t, lang, setLang } = useI18n();
   const [settings, setSettings] = useState(DEFAULT_SETTINGS);
@@ -83,8 +133,26 @@ export default function Settings({ onBack }) {
 
   const [subscription, setSubscription] = useState(null);
   const [invoices, setInvoices] = useState([]);
+  const [usage, setUsage] = useState(null);
   const [billingLoading, setBillingLoading] = useState(false);
-  const [activeSection, setActiveSection] = useState("youtube");
+  const [activeSection, setActiveSection] = useState("cuenta");
+
+  // Change password
+  const [pwCurrent, setPwCurrent] = useState("");
+  const [pwNew, setPwNew] = useState("");
+  const [pwConfirm, setPwConfirm] = useState("");
+  const [pwLoading, setPwLoading] = useState(false);
+  const [pwSuccess, setPwSuccess] = useState(false);
+  const [pwError, setPwError] = useState("");
+
+  // Delete account
+  const [showDelete, setShowDelete] = useState(false);
+  const [deletePassword, setDeletePassword] = useState("");
+  const [deleteLoading, setDeleteLoading] = useState(false);
+  const [deleteError, setDeleteError] = useState("");
+
+  // Data export
+  const [exportLoading, setExportLoading] = useState(false);
 
   useEffect(() => {
     fetch(`${API}/settings`, { headers: authHeaders() })
@@ -100,6 +168,9 @@ export default function Settings({ onBack }) {
       .then((r) => r.json())
       .then((data) => { if (Array.isArray(data)) setInvoices(data); })
       .catch(() => {});
+
+    fetch(`${API}/usage`, { headers: authHeaders() })
+      .then((r) => r.json()).then(setUsage).catch(() => {});
   }, []);
 
   const handleSave = async () => {
@@ -141,6 +212,78 @@ export default function Settings({ onBack }) {
     } catch {} finally { setBillingLoading(false); }
   };
 
+  const handleChangePassword = async () => {
+    setPwError("");
+    if (pwNew !== pwConfirm) {
+      setPwError(t("settings.password_error_match"));
+      return;
+    }
+    if (pwNew.length < 8) {
+      setPwError(t("settings.password_error_strength"));
+      return;
+    }
+    setPwLoading(true);
+    try {
+      const res = await fetch(`${API}/auth/change-password`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", ...authHeaders() },
+        body: JSON.stringify({ current_password: pwCurrent, new_password: pwNew }),
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        setPwError(data.detail || t("settings.password_error_current"));
+      } else {
+        setPwSuccess(true);
+        setPwCurrent(""); setPwNew(""); setPwConfirm("");
+        setTimeout(() => setPwSuccess(false), 4000);
+      }
+    } catch {
+      setPwError(t("settings.password_error_current"));
+    } finally {
+      setPwLoading(false);
+    }
+  };
+
+  const handleExportData = async () => {
+    setExportLoading(true);
+    try {
+      const res = await fetch(`${API}/auth/data-export`, { headers: authHeaders() });
+      const blob = await res.blob();
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = "genly-data-export.json";
+      a.click();
+      URL.revokeObjectURL(url);
+    } catch {} finally {
+      setExportLoading(false);
+    }
+  };
+
+  const handleDeleteAccount = async () => {
+    setDeleteError("");
+    setDeleteLoading(true);
+    try {
+      const res = await fetch(`${API}/auth/account`, {
+        method: "DELETE",
+        headers: { "Content-Type": "application/json", ...authHeaders() },
+        body: JSON.stringify({ password: deletePassword }),
+      });
+      if (!res.ok) {
+        const data = await res.json();
+        setDeleteError(data.detail || t("settings.delete_error"));
+      } else {
+        localStorage.removeItem("genly_token");
+        localStorage.removeItem("genly_user");
+        window.location.assign("/");
+      }
+    } catch {
+      setDeleteError(t("settings.delete_error"));
+    } finally {
+      setDeleteLoading(false);
+    }
+  };
+
   const currentPlan = user?.plan || "free";
   const planInfo = PLAN_INFO[currentPlan] || PLAN_INFO.free;
 
@@ -157,7 +300,7 @@ export default function Settings({ onBack }) {
 
   return (
     <div className="w-full max-w-2xl animate-fade-in">
-      {/* ─── Header ─────────────────────────────────────────────── */}
+      {/* ─── Header ───────────────────────────────────────────────── */}
       <div className="flex items-end gap-3 mb-8">
         <button onClick={onBack}
           className="w-9 h-9 rounded-xl bg-surface-2/40 ring-1 ring-white/[0.04] hover:ring-white/[0.08] hover:text-white flex items-center justify-center text-gray-400 transition-colors">
@@ -171,12 +314,12 @@ export default function Settings({ onBack }) {
         </div>
       </div>
 
-      {/* ─── Section tabs ─────────────────────────────────────────── */}
+      {/* ─── Tabs ─────────────────────────────────────────────────── */}
       <div className="flex flex-wrap gap-2 mb-6">
         {[
-          { id: "youtube", label: "YouTube" },
-          { id: "billing", label: t("settings.billing") || "Facturación" },
-          { id: "account", label: t("settings.account") || "Cuenta" },
+          { id: "cuenta",      label: t("settings.account") || "Cuenta" },
+          { id: "facturacion", label: t("settings.billing") || "Facturación" },
+          { id: "youtube",     label: "YouTube" },
         ].map((s) => (
           <TabPill key={s.id} active={activeSection === s.id} onClick={() => setActiveSection(s.id)}>
             {s.label}
@@ -186,31 +329,213 @@ export default function Settings({ onBack }) {
 
       <div className="space-y-4">
 
-        {/* ════════════════════ BILLING ════════════════════ */}
-        {activeSection === "billing" && (
+        {/* ════════════════════ CUENTA ════════════════════ */}
+        {activeSection === "cuenta" && (
           <>
+            {/* Account info */}
+            <Card>
+              <SectionLabel>{t("settings.account_info") || "Información de cuenta"}</SectionLabel>
+              <div>
+                {[
+                  { label: t("login.username"),                           value: user?.username },
+                  { label: "Email",                                       value: user?.email || "—" },
+                  { label: t("settings.current_plan") || "Plan",         value: planInfo.label, valueClass: planInfo.color + " font-medium" },
+                  { label: "Rol",                                         value: user?.role || "user" },
+                ].map((row, i, arr) => (
+                  <div key={row.label}
+                    className={`flex items-center justify-between py-3 ${i < arr.length - 1 ? "border-b border-white/[0.03]" : ""}`}>
+                    <span className="text-xs text-ink-secondary">{row.label}</span>
+                    <span className={`text-sm ${row.valueClass || "text-white"}`}>{row.value}</span>
+                  </div>
+                ))}
+              </div>
+            </Card>
+
+            {/* Change password */}
+            <Card>
+              <SectionLabel>{t("settings.change_password") || "Cambiar contraseña"}</SectionLabel>
+              <p className="text-xs text-ink-secondary mb-4 -mt-1">
+                {t("settings.change_password_sub") || "Elegí una contraseña nueva para tu cuenta."}
+              </p>
+              <div className="space-y-3">
+                <Field label={t("settings.current_password") || "Contraseña actual"}>
+                  <input type="password" value={pwCurrent}
+                    onChange={(e) => { setPwCurrent(e.target.value); setPwError(""); }}
+                    className="input-field text-sm" autoComplete="current-password" />
+                </Field>
+                <Field label={t("settings.new_password") || "Nueva contraseña"}>
+                  <input type="password" value={pwNew}
+                    onChange={(e) => { setPwNew(e.target.value); setPwError(""); }}
+                    className="input-field text-sm" autoComplete="new-password" />
+                </Field>
+                <Field label={t("settings.confirm_new_password") || "Confirmar nueva contraseña"}>
+                  <input type="password" value={pwConfirm}
+                    onChange={(e) => { setPwConfirm(e.target.value); setPwError(""); }}
+                    className="input-field text-sm" autoComplete="new-password" />
+                </Field>
+              </div>
+              {pwError && <div className="mt-3"><InlineError message={pwError} /></div>}
+              <div className="flex items-center justify-end gap-3 mt-4">
+                {pwSuccess && <InlineSuccess message={t("settings.password_updated") || "Contraseña actualizada"} />}
+                <button onClick={handleChangePassword}
+                  disabled={pwLoading || !pwCurrent || !pwNew || !pwConfirm}
+                  className="btn-primary px-5 disabled:opacity-40 disabled:cursor-not-allowed">
+                  {pwLoading ? "…" : (t("settings.update_password") || "Actualizar contraseña")}
+                </button>
+              </div>
+            </Card>
+
+            {/* Guided tour */}
+            <Card>
+              <SectionLabel>{t("settings.tour_label") || "Tour guiado"}</SectionLabel>
+              <div className="flex items-center justify-between gap-4 py-1">
+                <div className="min-w-0">
+                  <p className="text-sm text-white">{t("settings.tour_replay_title") || "Volver a ver el tour"}</p>
+                  <p className="text-xs text-ink-secondary mt-0.5">
+                    {t("settings.tour_replay_hint") || "Repasá las funciones del Inicio, Crear video y Editor."}
+                  </p>
+                </div>
+                <button
+                  onClick={() => { startReplaySession(); window.location.assign("/"); }}
+                  className="shrink-0 text-[12px] font-medium px-4 py-2 rounded-lg bg-brand/15 text-brand-light ring-1 ring-brand/30 hover:bg-brand/25 transition-colors"
+                >
+                  {t("settings.tour_replay_btn") || "Ver tour de nuevo"}
+                </button>
+              </div>
+            </Card>
+
+            {/* Danger zone */}
+            <Card className="ring-red-500/[0.08]">
+              <SectionLabel>{t("settings.danger_zone") || "Zona de peligro"}</SectionLabel>
+
+              {/* Data export */}
+              <div className="flex items-center justify-between gap-4 py-3 border-b border-white/[0.03]">
+                <div>
+                  <p className="text-sm text-white">{t("settings.export_data") || "Exportar mis datos"}</p>
+                  <p className="text-xs text-ink-secondary mt-0.5">
+                    {t("settings.export_data_sub") || "Descargá un JSON con tu cuenta, configuración e historial de videos (GDPR)."}
+                  </p>
+                </div>
+                <button onClick={handleExportData} disabled={exportLoading}
+                  className="shrink-0 flex items-center gap-1.5 text-[12px] font-medium px-4 py-2 rounded-lg bg-surface-3/40 text-ink-secondary ring-1 ring-white/[0.06] hover:text-white hover:ring-white/[0.12] transition-colors disabled:opacity-40">
+                  <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
+                    <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" />
+                    <polyline points="7 10 12 15 17 10" /><line x1="12" y1="15" x2="12" y2="3" />
+                  </svg>
+                  {exportLoading ? "…" : (t("settings.export_data_btn") || "Exportar")}
+                </button>
+              </div>
+
+              {/* Delete account */}
+              <div className="pt-3">
+                <div className="flex items-center justify-between gap-4">
+                  <div>
+                    <p className="text-sm text-white">{t("settings.delete_account") || "Eliminar cuenta"}</p>
+                    <p className="text-xs text-ink-secondary mt-0.5">
+                      {t("settings.delete_account_sub") || "Acción irreversible. Todos tus datos serán eliminados."}
+                    </p>
+                  </div>
+                  <button
+                    onClick={() => { setShowDelete(!showDelete); setDeleteError(""); setDeletePassword(""); }}
+                    className="shrink-0 text-[12px] font-medium px-4 py-2 rounded-lg bg-red-500/10 text-red-400 ring-1 ring-red-500/20 hover:bg-red-500/20 transition-colors">
+                    {showDelete ? (t("settings.cancel") || "Cancelar") : (t("settings.delete_account") || "Eliminar")}
+                  </button>
+                </div>
+
+                {showDelete && (
+                  <div className="mt-4 pt-4 border-t border-red-500/10 space-y-3 animate-fade-in">
+                    <Field label={t("settings.delete_confirm_label") || "Ingresá tu contraseña para confirmar"}>
+                      <input type="password" value={deletePassword}
+                        onChange={(e) => { setDeletePassword(e.target.value); setDeleteError(""); }}
+                        className="input-field text-sm" placeholder="••••••••" />
+                    </Field>
+                    {deleteError && <InlineError message={deleteError} />}
+                    <button onClick={handleDeleteAccount}
+                      disabled={!deletePassword || deleteLoading}
+                      className="w-full h-10 rounded-xl bg-red-500/15 text-red-400 text-sm font-medium ring-1 ring-red-500/25 hover:bg-red-500/25 transition-colors disabled:opacity-40 disabled:cursor-not-allowed">
+                      {deleteLoading ? "…" : (t("settings.delete_confirm_btn") || "Confirmar eliminación")}
+                    </button>
+                  </div>
+                )}
+              </div>
+            </Card>
+          </>
+        )}
+
+        {/* ════════════════════ FACTURACIÓN ════════════════════ */}
+        {activeSection === "facturacion" && (
+          <>
+            {/* Usage widget */}
+            {usage && (
+              <Card>
+                <div className="flex items-start justify-between mb-4">
+                  <div>
+                    <SectionLabel>{t("settings.usage") || "Uso del plan"}</SectionLabel>
+                    <div className="flex items-baseline gap-1.5">
+                      <span className="text-3xl font-bold tracking-tight text-white tabular-nums">{usage.used}</span>
+                      <span className="text-sm text-ink-secondary">
+                        {t("settings.usage_of") || "de"} {usage.limit >= 999999 ? "∞" : usage.limit} {t("settings.usage_videos") || "videos este mes"}
+                      </span>
+                    </div>
+                  </div>
+                  <div className="text-right">
+                    <span className={`text-2xl font-bold tabular-nums ${
+                      usage.alert_100 ? "text-red-400" : usage.alert_80 ? "text-amber-400" : "text-brand-light"
+                    }`}>
+                      {usage.percent}%
+                    </span>
+                    <p className="text-[10px] text-ink-secondary mt-0.5">
+                      {usage.remaining} {t("settings.usage_remaining") || "restantes"}
+                    </p>
+                  </div>
+                </div>
+                <UsageBar percent={usage.percent} alert80={usage.alert_80} alert100={usage.alert_100} />
+
+                {usage.alert_100 && (
+                  <AlertBanner variant="red">
+                    <p className="text-xs font-medium">{t("settings.usage_alert_100") || "Límite mensual alcanzado"}</p>
+                    {usage.overage > 0 && (
+                      <p className="text-[11px] opacity-70 mt-0.5">
+                        {usage.overage} {t("settings.usage_overage_videos") || "videos en overage"} · ${usage.overage_total?.toFixed(2)} adicionales
+                      </p>
+                    )}
+                  </AlertBanner>
+                )}
+                {usage.alert_80 && !usage.alert_100 && (
+                  <AlertBanner variant="amber">
+                    <p className="text-xs">{t("settings.usage_alert_80") || "Estás al 80% de tu cuota mensual."}</p>
+                  </AlertBanner>
+                )}
+              </Card>
+            )}
+
             {/* Current plan */}
             <Card>
               <SectionLabel>{t("settings.current_plan") || "Plan actual"}</SectionLabel>
               <div className="flex items-end justify-between mb-4">
                 <div>
                   <p className={`text-2xl font-bold tracking-tight ${planInfo.color}`}>{planInfo.label}</p>
-                  <p className="text-xs text-ink-secondary mt-1">{planInfo.videos} videos/mes</p>
+                  <p className="text-xs text-ink-secondary mt-1">
+                    {planInfo.videos} {t("settings.videos_month") || "videos/mes"}
+                  </p>
                 </div>
                 {planInfo.price > 0 && (
                   <p className="text-xl font-bold tracking-tight text-white">
                     <span className="text-xs text-ink-secondary font-normal">USD </span>
                     {planInfo.price.toLocaleString()}
-                    <span className="text-xs text-ink-secondary font-normal">/mes</span>
+                    <span className="text-xs text-ink-secondary font-normal">/{t("settings.per_month") || "mes"}</span>
                   </p>
                 )}
               </div>
+
               {subscription?.subscription && (
                 <div className="space-y-2 pt-4 border-t border-white/[0.04]">
                   <div className="flex justify-between text-xs">
-                    <span className="text-ink-secondary">Estado</span>
+                    <span className="text-ink-secondary">{t("settings.status") || "Estado"}</span>
                     <span className={`font-medium ${subscription.subscription.status === "active" ? "text-accent" : "text-amber-400"}`}>
-                      {subscription.subscription.status}
+                      {subscription.subscription.status === "active"
+                        ? (t("settings.status_active") || "Activo")
+                        : subscription.subscription.status}
                     </span>
                   </div>
                   {subscription.subscription.current_period_end && (
@@ -222,12 +547,13 @@ export default function Settings({ onBack }) {
                     </div>
                   )}
                   {subscription.subscription.cancel_at_period_end && (
-                    <p className="text-xs text-amber-400 mt-2">
-                      {t("settings.cancel_notice") || "Se cancela al final del período"}
-                    </p>
+                    <div className="mt-2 p-2.5 rounded-xl bg-amber-500/[0.06] ring-1 ring-amber-500/15">
+                      <p className="text-xs text-amber-400">{t("settings.cancel_notice") || "Se cancela al final del período"}</p>
+                    </div>
                   )}
                 </div>
               )}
+
               {subscription?.has_subscription && (
                 <button onClick={handleManageBilling} disabled={billingLoading}
                   className="btn-secondary mt-5 text-xs h-10 px-4">
@@ -236,7 +562,7 @@ export default function Settings({ onBack }) {
               )}
             </Card>
 
-            {/* Upgrade/downgrade */}
+            {/* Change plan */}
             {currentPlan !== "unlimited" && (
               <Card>
                 <SectionLabel>{t("settings.change_plan") || "Cambiar plan"}</SectionLabel>
@@ -255,13 +581,15 @@ export default function Settings({ onBack }) {
                             ? "bg-brand/[0.08] ring-brand/30 cursor-default"
                             : "bg-surface-2/40 ring-white/[0.04] hover:ring-white/[0.10] hover:bg-surface-2/70"
                         }`}>
-                        <p className="text-xs text-ink-secondary mb-1">{p.videos} videos/mes</p>
+                        <p className="text-xs text-ink-secondary mb-1">
+                          {p.videos} {t("settings.videos_month") || "videos/mes"}
+                        </p>
                         <p className="text-2xl font-bold tracking-tight text-white">
                           <span className="text-xs text-ink-secondary font-normal">$</span>
                           {p.price.toLocaleString()}
                         </p>
                         <p className="text-[10px] text-gray-600 mt-1">
-                          ${(p.price / p.videos).toFixed(2)}/video
+                          ${(p.price / p.videos).toFixed(2)}/{t("settings.per_video") || "video"}
                         </p>
                         {isCurrent && (
                           <span className="inline-block mt-3 text-[9px] bg-brand/20 text-brand-light px-2 py-0.5 rounded-full font-bold uppercase tracking-wider">
@@ -285,7 +613,8 @@ export default function Settings({ onBack }) {
               ) : (
                 <div>
                   {invoices.map((inv) => (
-                    <div key={inv.id} className="flex items-center justify-between py-3 border-b border-white/[0.03] last:border-0">
+                    <div key={inv.id}
+                      className="flex items-center justify-between py-3 border-b border-white/[0.03] last:border-0">
                       <div>
                         <p className="text-sm text-white">{inv.description || "Suscripción"}</p>
                         <p className="text-[11px] text-gray-600 mt-0.5">
@@ -298,8 +627,12 @@ export default function Settings({ onBack }) {
                         </span>
                         {inv.invoice_url && (
                           <a href={inv.invoice_url} target="_blank" rel="noopener noreferrer"
-                            className="text-xs text-brand-light hover:text-brand transition-colors">
-                            {t("settings.view_invoice") || "Ver"}
+                            className="flex items-center gap-1.5 text-xs text-ink-secondary hover:text-white transition-colors px-3 py-1.5 rounded-lg ring-1 ring-white/[0.06] hover:ring-white/[0.12] bg-surface-3/30">
+                            <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
+                              <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" />
+                              <polyline points="7 10 12 15 17 10" /><line x1="12" y1="15" x2="12" y2="3" />
+                            </svg>
+                            {t("settings.download_invoice") || "PDF"}
                           </a>
                         )}
                       </div>
@@ -335,11 +668,8 @@ export default function Settings({ onBack }) {
             </Card>
 
             <Card>
-              <div className="flex items-center gap-2 mb-1">
-                <SectionLabel>{t("settings.yt_template")}</SectionLabel>
-              </div>
+              <SectionLabel>{t("settings.yt_template")}</SectionLabel>
               <p className="text-xs text-ink-secondary mb-5 -mt-1">{t("settings.yt_template_sub")}</p>
-
               <div className="space-y-4">
                 <Field label={t("settings.title_format")} help={t("settings.title_format_help")}>
                   <input type="text" value={settings.titleFormat}
@@ -363,7 +693,7 @@ export default function Settings({ onBack }) {
                     onChange={(e) => update("mandatoryTags", e.target.value)}
                     className="input-field text-sm" placeholder="lyrics, letra, musica" />
                 </Field>
-                <Field label={t("settings.hashtags")}>
+                <Field label={t("settings.hashtags")} help={t("settings.hashtags_help")}>
                   <input type="text" value={settings.hashtags}
                     onChange={(e) => update("hashtags", e.target.value)}
                     className="input-field text-sm" placeholder="#lyrics #letra #musica" />
@@ -397,25 +727,17 @@ export default function Settings({ onBack }) {
             <Card>
               <SectionLabel>{t("settings.channel")}</SectionLabel>
               <p className="text-xs text-ink-secondary mb-4 -mt-1">{t("settings.channel_sub")}</p>
-              <Field label={t("settings.channel_name")}>
+              <Field
+                label={t("settings.channel_name")}
+                help={t("settings.channel_name_hint") || "Solo informativo. La conexión real se gestiona vía OAuth en tu cuenta de YouTube."}>
                 <input type="text" value={settings.channelName}
                   onChange={(e) => update("channelName", e.target.value)}
-                  className="input-field text-sm" placeholder={t("settings.channel_name")} />
+                  className="input-field text-sm" placeholder="Mi Canal de Música" />
               </Field>
-              {settings.channelName && (
-                <p className="text-[10px] text-gray-600 mt-2">{t("settings.channel_connected")}</p>
-              )}
             </Card>
 
             <div className="flex items-center justify-end gap-3 pt-2">
-              {saved && (
-                <span className="text-xs text-accent flex items-center gap-1.5 animate-fade-in">
-                  <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" strokeWidth="2.5" viewBox="0 0 24 24">
-                    <polyline points="20 6 9 17 4 12"/>
-                  </svg>
-                  {t("settings.saved")}
-                </span>
-              )}
+              {saved && <InlineSuccess message={t("settings.saved")} />}
               <button onClick={handleSave} className="btn-primary px-6">
                 {t("settings.save")}
               </button>
@@ -423,52 +745,6 @@ export default function Settings({ onBack }) {
           </>
         )}
 
-        {/* ════════════════════ ACCOUNT ════════════════════ */}
-        {activeSection === "account" && (
-          <>
-            <Card>
-              <SectionLabel>{t("settings.account_info") || "Información de cuenta"}</SectionLabel>
-              <div>
-                {[
-                  { label: t("login.username"), value: user?.username },
-                  { label: "Email",             value: user?.email || "—" },
-                  { label: "Plan",              value: planInfo.label, valueClass: planInfo.color + " font-medium" },
-                  { label: "Rol",               value: user?.role || "user" },
-                ].map((row, i, arr) => (
-                  <div key={row.label}
-                    className={`flex items-center justify-between py-3 ${i < arr.length - 1 ? "border-b border-white/[0.03]" : ""}`}>
-                    <span className="text-xs text-ink-secondary">{row.label}</span>
-                    <span className={`text-sm ${row.valueClass || "text-white"}`}>{row.value}</span>
-                  </div>
-                ))}
-              </div>
-            </Card>
-
-            <Card>
-              <SectionLabel>{t("settings.tour_label") || "Tour guiado"}</SectionLabel>
-              <div className="flex items-center justify-between gap-4 py-3">
-                <div className="min-w-0">
-                  <p className="text-sm text-white">
-                    {t("settings.tour_replay_title") || "Volver a ver el tour"}
-                  </p>
-                  <p className="text-xs text-ink-secondary mt-0.5">
-                    {t("settings.tour_replay_hint") || "Repasá las funciones del Inicio, Crear video y Editor."}
-                  </p>
-                </div>
-                <button
-                  onClick={() => {
-                    startReplaySession();
-                    window.location.assign("/");
-                  }}
-                  className="shrink-0 text-[12px] font-medium px-4 py-2 rounded-lg bg-brand/15 text-brand-light
-                    ring-1 ring-brand/30 hover:bg-brand/25 transition-colors"
-                >
-                  {t("settings.tour_replay_btn") || "Ver tour de nuevo"}
-                </button>
-              </div>
-            </Card>
-          </>
-        )}
       </div>
     </div>
   );
