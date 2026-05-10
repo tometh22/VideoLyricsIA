@@ -213,7 +213,7 @@ class Job(Base):
     # so /generate can hand the worker the same file without forcing the
     # browser to re-upload it (the previous flow uploaded the file twice
     # and OOMed the API container on lossless WAVs).
-    input_r2_key = Column(String(500), nullable=True)
+    input_r2_key = Column(Text, nullable=True)
 
     # In-flight multipart upload id while the browser is still PUTting
     # parts directly to R2. Cleared on multipart_complete (or aborted by
@@ -507,19 +507,25 @@ def _migrate_user_columns():
         "ALTER TABLE jobs ADD COLUMN IF NOT EXISTS song_title VARCHAR(500)",
         "ALTER TABLE jobs ADD COLUMN IF NOT EXISTS input_r2_key VARCHAR(500)",
         "ALTER TABLE jobs ADD COLUMN IF NOT EXISTS multipart_upload_id VARCHAR(255)",
-        # Cloudflare R2 multipart UploadIds are ~300+ chars; VARCHAR(255) truncated.
+        # R2 keys and UploadIds can exceed 255 chars; widen both to TEXT.
+        "ALTER TABLE jobs ALTER COLUMN input_r2_key TYPE TEXT",
         "ALTER TABLE jobs ALTER COLUMN multipart_upload_id TYPE TEXT",
         # Library exclusivity (UMG): tenant-owned and variation-parent references.
         "ALTER TABLE background_assets ADD COLUMN IF NOT EXISTS owner_tenant_id VARCHAR(100)",
         "ALTER TABLE background_assets ADD COLUMN IF NOT EXISTS parent_asset_id INTEGER REFERENCES background_assets(id)",
         "CREATE INDEX IF NOT EXISTS ix_background_assets_owner_tenant_id ON background_assets(owner_tenant_id)",
     ]
-    with engine.begin() as conn:
-        for sql in column_adds:
-            try:
+    # Each statement gets its own transaction. In Postgres, a failed statement
+    # inside a transaction puts it in aborted state — subsequent execute()
+    # calls are silently ignored even if caught in Python. One tx per stmt
+    # ensures a failed ADD COLUMN (column already exists via Alembic) never
+    # blocks the ALTER COLUMN widening that follows it.
+    for sql in column_adds:
+        try:
+            with engine.begin() as conn:
                 conn.execute(text(sql))
-            except Exception as e:  # pragma: no cover — dialect-specific
-                print(f"[init_db] migrate skipped: {sql} → {e}")
+        except Exception as e:  # pragma: no cover — dialect-specific
+            print(f"[init_db] migrate skipped: {sql} → {e}")
 
 
 def drop_db():
