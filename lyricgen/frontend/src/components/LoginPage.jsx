@@ -212,6 +212,9 @@ export default function LoginPage({ onLogin, onBack, resetToken, onResetComplete
                     className="input-field" placeholder={t("login.password_placeholder")}
                     autoComplete="current-password" />
                 </div>
+                {retryMsg && (
+                  <p className="text-xs text-center text-gray-400 animate-pulse">{retryMsg}</p>
+                )}
                 {error && (
                   <div className="rounded-xl bg-red-500/10 border border-red-500/20 px-4 py-3">
                     <p className="text-sm text-red-400">{error}</p>
