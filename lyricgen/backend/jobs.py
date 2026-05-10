@@ -1,12 +1,16 @@
 """Job management — PostgreSQL backed."""
 
+import logging
 import uuid
 from datetime import datetime, timezone
 from typing import Optional
 
 from sqlalchemy.orm import Session
 
+import storage
 from database import Job, get_db
+
+_logger = logging.getLogger("genly.jobs")
 
 
 def create_job(
@@ -92,6 +96,25 @@ def get_job_model(db: Session, job_id: str) -> Optional[Job]:
     return db.query(Job).filter(Job.job_id == job_id).first()
 
 
+def _delete_r2_objects(job: Job) -> None:
+    """Best-effort delete all R2 objects tied to a job.
+
+    Called before the DB row is removed so we still have the keys.
+    Errors are swallowed — R2 cleanup must never block the DB delete.
+    """
+    keys: list[str] = []
+    if job.input_r2_key:
+        keys.append(job.input_r2_key)
+    s3 = job.s3_keys or {}
+    if isinstance(s3, dict):
+        keys.extend(v for v in s3.values() if isinstance(v, str) and v)
+    for key in keys:
+        try:
+            storage.delete_object(key)
+        except Exception as exc:
+            _logger.warning("R2 delete failed key=%r: %s", key, exc)
+
+
 _DELETABLE_STATUSES = {"processing", "queued", "error", "validation_failed"}
 
 
@@ -116,6 +139,7 @@ def delete_job(db: Session, job_id: str, tenant_id: str) -> tuple[bool, str]:
         return False, "not_found"
     if job.status not in _DELETABLE_STATUSES:
         return False, f"protected_status:{job.status}"
+    _delete_r2_objects(job)
     db.query(AIProvenance).filter(AIProvenance.job_id == job_id).delete(synchronize_session=False)
     db.delete(job)
     db.commit()
@@ -154,10 +178,19 @@ def bulk_delete_jobs(db: Session, job_ids: list[str], tenant_id: str) -> dict:
             deletable_ids.append(r.job_id)
 
     if deletable_ids:
+        # Collect R2 keys from already-fetched rows BEFORE the bulk DELETE
+        # removes them — the bulk query returns no data after deletion.
+        deletable_set = set(deletable_ids)
+        r2_rows = [r for r in rows if r.job_id in deletable_set]
+
         db.query(AIProvenance).filter(AIProvenance.job_id.in_(deletable_ids)).delete(synchronize_session=False)
         db.query(Job).filter(Job.tenant_id == tenant_id, Job.job_id.in_(deletable_ids)).delete(synchronize_session=False)
         db.commit()
         deleted = deletable_ids
+
+        # Best-effort R2 cleanup after successful DB commit.
+        for r in r2_rows:
+            _delete_r2_objects(r)
 
     return {"deleted": deleted, "skipped": skipped}
 
