@@ -275,6 +275,9 @@ export default function App() {
   // While the user edits song 0, songs 1..N are uploaded + transcribed
   // in background. keyed by queue index.
   const prefetchCache = useRef({});
+  // Stores {queue, idx} of the last failed transcribeNext call so the
+  // retry button can re-run it without losing the batch context.
+  const transcribeRetryCtx = useRef(null);
   const [history, setHistory] = useState([]);
   const [backgroundFile, setBackgroundFile] = useState(null);
   const [animateImage, setAnimateImage] = useState(false);
@@ -616,7 +619,10 @@ export default function App() {
     } catch (err) {
       setTranscribing(false);
       setTranscribeProgress(null);
-      const reason = await describeFetchError(err, transcribeRes, t);
+      // err.response carries the actual HTTP response when uploadFileToR2
+      // (or apiPost inside it) threw — transcribeRes is null in that case.
+      const reason = await describeFetchError(err, transcribeRes ?? err?.response ?? null, t);
+      transcribeRetryCtx.current = { queue, idx };
       setTranscribeError(reason);
     }
   };
@@ -1033,10 +1039,25 @@ export default function App() {
         <div className="w-full max-w-md mx-auto mt-8 animate-fade-in">
           <div className="rounded-xl bg-red-500/10 border border-red-500/20 px-5 py-4 text-center">
             <p className="text-sm text-red-400">{transcribeError}</p>
-            <button onClick={() => { setTranscribeError(null); navigate("/new"); }}
-              className="mt-3 text-xs text-gray-400 hover:text-white transition-colors underline">
-              {t("detail.back")}
-            </button>
+            <div className="mt-3 flex items-center justify-center gap-4">
+              {transcribeRetryCtx.current && (
+                <button
+                  onClick={() => {
+                    const ctx = transcribeRetryCtx.current;
+                    setTranscribeError(null);
+                    transcribeRetryCtx.current = null;
+                    transcribeNext(ctx.queue, ctx.idx);
+                  }}
+                  className="text-xs text-brand hover:text-brand-light transition-colors font-medium"
+                >
+                  {t("upload.retry") || "Reintentar"}
+                </button>
+              )}
+              <button onClick={() => { setTranscribeError(null); navigate("/new"); }}
+                className="text-xs text-gray-400 hover:text-white transition-colors underline">
+                {t("detail.back")}
+              </button>
+            </div>
           </div>
         </div>
       );
