@@ -442,7 +442,7 @@ export default function UploadZone({
               {t("common.collapse") || "Cerrar"}
             </button>
           </div>
-          <div className="flex flex-wrap gap-2 items-center">
+          <div className="flex flex-col gap-2">
             <Listbox
               value={deliveryProfile}
               onChange={(v) => setDeliveryProfile(v)}
@@ -450,7 +450,7 @@ export default function UploadZone({
                 { code: "youtube", label: "MP4 H.264 1080p (YouTube / Instagram / TikTok)" },
                 { code: "both", label: "MP4 + ProRes 422 HQ (broadcast master)" },
               ]}
-              className="w-72"
+              className="w-full sm:w-72"
               ariaLabel={t("upload.delivery") || "Entrega"}
             />
             {deliveryProfile !== "youtube" && (
@@ -459,23 +459,25 @@ export default function UploadZone({
                   value={umgFrameSize}
                   onChange={(v) => setUmgFrameSize(v)}
                   options={UMG_FRAME_SIZES}
-                  className="w-64"
+                  className="w-full sm:w-64"
                   ariaLabel="UMG frame size"
                 />
-                <Listbox
-                  value={String(umgFps)}
-                  onChange={(v) => setUmgFps(parseFloat(v))}
-                  options={UMG_FPS}
-                  className="w-32"
-                  ariaLabel="UMG fps"
-                />
-                <Listbox
-                  value={String(umgProresProfile)}
-                  onChange={(v) => setUmgProresProfile(parseInt(v, 10))}
-                  options={UMG_PROFILES}
-                  className="w-56"
-                  ariaLabel="ProRes profile"
-                />
+                <div className="flex gap-2">
+                  <Listbox
+                    value={String(umgFps)}
+                    onChange={(v) => setUmgFps(parseFloat(v))}
+                    options={UMG_FPS}
+                    className="flex-1"
+                    ariaLabel="UMG fps"
+                  />
+                  <Listbox
+                    value={String(umgProresProfile)}
+                    onChange={(v) => setUmgProresProfile(parseInt(v, 10))}
+                    options={UMG_PROFILES}
+                    className="flex-1"
+                    ariaLabel="ProRes profile"
+                  />
+                </div>
               </>
             )}
           </div>
@@ -1380,10 +1382,10 @@ export default function UploadZone({
       {/* Sticky bottom CTA bar */}
       {files.length > 0 && (
         <div
-          className={`fixed bottom-0 right-0 z-30 bg-surface-1/85 backdrop-blur-xl border-t border-white/[0.06] px-8 py-4 transition-all duration-300 ${sidebarOpen ? "left-64" : "left-0"}`}
+          className={`fixed bottom-0 left-0 right-0 z-30 bg-surface-1/85 backdrop-blur-xl border-t border-white/[0.06] px-4 md:px-8 py-4 transition-all duration-300 ${sidebarOpen ? "md:left-64" : "md:left-0"}`}
           data-tour="upload-cta-bar"
         >
-          <div className="max-w-5xl mx-auto flex items-center gap-4">
+          <div className="max-w-5xl mx-auto flex flex-wrap items-center gap-3">
             <div className="flex-1 min-w-0">
               <p className="text-[10px] uppercase tracking-[0.18em] text-gray-500">
                 {t("upload.batch_summary") || "Lote"}

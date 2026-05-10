@@ -491,7 +491,7 @@ export default function JobDetail({ job, onBack, onJobUpdate }) {
         isPendingReview={isPendingReview}
       />
       {/* Header */}
-      <div className="flex items-end justify-between gap-4 mb-8">
+      <div className="flex flex-col sm:flex-row sm:items-end sm:justify-between gap-3 mb-8">
         <div className="flex items-center gap-3 min-w-0">
           <button onClick={onBack}
             className="w-9 h-9 shrink-0 rounded-xl bg-surface-2/40 ring-1 ring-white/[0.04] hover:ring-white/[0.08] hover:text-white flex items-center justify-center text-gray-400 transition-colors">
@@ -530,7 +530,7 @@ export default function JobDetail({ job, onBack, onJobUpdate }) {
             <p className="text-sm text-ink-secondary mt-0.5 truncate">{job.artist}</p>
           </div>
         </div>
-        <div className="flex gap-2 shrink-0">
+        <div className="flex flex-wrap gap-2">
           {canDownload && (() => {
             // All profiles (youtube, umg, both) now produce the MP4 +
             // short + thumbnail set in the pipeline, so "Descargar todo"
@@ -776,7 +776,7 @@ export default function JobDetail({ job, onBack, onJobUpdate }) {
             className="input-field text-sm mb-4 resize-none"
             rows="2"
           />
-          <div className="flex gap-3">
+          <div className="flex flex-wrap gap-3">
             <button
               onClick={handleApprove}
               disabled={approving}
