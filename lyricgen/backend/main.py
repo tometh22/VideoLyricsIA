@@ -52,6 +52,7 @@ from auth import (
     get_current_user_from_token_param,
     get_user_by_username,
     get_user_by_email,
+    get_user_by_id,
     get_plan_usage,
     ensure_default_admin,
     pwd_context,
@@ -667,6 +668,24 @@ async def verify_email_endpoint(body: VerifyEmailRequest, request: Request, db: 
 async def me(current_user: dict = Depends(get_current_user)):
     """Return current user info."""
     return current_user
+
+
+@app.post("/auth/refresh")
+@limiter.limit("60/minute")
+async def refresh_token(
+    request: Request,
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Issue a fresh JWT for the authenticated user without requiring re-login.
+
+    The frontend calls this proactively when the stored token is close to
+    expiry so sessions extend seamlessly without the user noticing.
+    """
+    user = get_user_by_id(db, current_user["id"])
+    if not user or not user.is_active:
+        raise HTTPException(status_code=401, detail="User not found or inactive")
+    return {"token": create_token(user)}
 
 
 @app.post("/auth/change-password")
