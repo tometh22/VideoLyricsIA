@@ -217,8 +217,10 @@ class Job(Base):
 
     # In-flight multipart upload id while the browser is still PUTting
     # parts directly to R2. Cleared on multipart_complete (or aborted by
-    # the reaper if the upload is abandoned).
-    multipart_upload_id = Column(String(255), nullable=True)
+    # the reaper if the upload is abandoned). Uses Text because Cloudflare
+    # R2 returns ~300+ char ids (the original VARCHAR(255) silently
+    # truncated and crashed the commit on every >50MB upload).
+    multipart_upload_id = Column(Text, nullable=True)
 
     # YouTube info
     youtube_data = Column(JSON, nullable=True)
@@ -505,6 +507,12 @@ def _migrate_user_columns():
         "ALTER TABLE jobs ADD COLUMN IF NOT EXISTS song_title VARCHAR(500)",
         "ALTER TABLE jobs ADD COLUMN IF NOT EXISTS input_r2_key VARCHAR(500)",
         "ALTER TABLE jobs ADD COLUMN IF NOT EXISTS multipart_upload_id VARCHAR(255)",
+        # Cloudflare R2 multipart UploadIds are ~300+ chars; the original
+        # VARCHAR(255) silently truncated and crashed every multipart commit
+        # with StringDataRightTruncation. Widen to TEXT (no length cap).
+        # Idempotent: ALTER COLUMN to a wider type is a no-op metadata
+        # change in Postgres if already TEXT.
+        "ALTER TABLE jobs ALTER COLUMN multipart_upload_id TYPE TEXT",
     ]
     with engine.begin() as conn:
         for sql in column_adds:
