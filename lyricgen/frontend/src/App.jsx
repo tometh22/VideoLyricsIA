@@ -22,6 +22,14 @@ import AdminPanel from "./components/AdminPanel";
 const API = import.meta.env.VITE_API_URL || "";
 
 // --- Auth helpers ---
+function getTokenExp(token) {
+  try {
+    return JSON.parse(atob(token.split(".")[1])).exp ?? null;
+  } catch {
+    return null;
+  }
+}
+
 function getToken() {
   return localStorage.getItem("genly_token");
 }
@@ -350,7 +358,9 @@ export default function App() {
     setUser(newUser);
   };
 
-  const handleLogout = useCallback(() => {
+  // reason="expired" → /login so the user can re-authenticate immediately.
+  // reason="manual" (default) → / (landing page) for intentional logouts.
+  const handleLogout = useCallback((reason = "manual") => {
     // Stop every active poll / SSE stream BEFORE clearing the token.
     pollingIntervals.current.forEach((handle) => {
       if (handle && typeof handle.close === "function") handle.close(); // EventSource
@@ -361,7 +371,7 @@ export default function App() {
     localStorage.removeItem("genly_user");
     setToken(null);
     setUser(null);
-    navigate("/");
+    navigate(reason === "expired" ? "/login" : "/");
   }, [navigate]);
 
   // Sync logout across multiple browser tabs: when genly_token is removed
@@ -369,12 +379,32 @@ export default function App() {
   useEffect(() => {
     const onStorage = (e) => {
       if (e.key === "genly_token" && e.newValue === null && token) {
-        handleLogout();
+        handleLogout("expired");
       }
     };
     window.addEventListener("storage", onStorage);
     return () => window.removeEventListener("storage", onStorage);
   }, [token, handleLogout]);
+
+  // Proactively refresh the JWT when it has less than 1 day left, so users
+  // with active sessions never hit a sudden 401 mid-session. Runs once per
+  // token value (i.e. on load and whenever a fresh token is stored).
+  useEffect(() => {
+    if (!token) return;
+    const exp = getTokenExp(token);
+    if (!exp) return;
+    const secondsLeft = exp - Math.floor(Date.now() / 1000);
+    if (secondsLeft > 86400) return; // more than 1 day left — no action needed
+    authFetch(`${API}/auth/refresh`, { method: "POST" })
+      .then((r) => (r.ok ? r.json() : null))
+      .then((data) => {
+        if (data?.token) {
+          localStorage.setItem("genly_token", data.token);
+          setToken(data.token);
+        }
+      })
+      .catch(() => {});
+  }, [token]);
 
   // `historyError` lets the dashboard surface a "connection failed,
   // retry" state instead of silently rendering an empty list when /jobs
@@ -398,7 +428,7 @@ export default function App() {
     for (let attempt = 1; attempt <= maxAttempts; attempt++) {
       try {
         const res = await authFetchWithTimeout(`${API}/jobs`);
-        if (res.status === 401) { handleLogout(); return; }
+        if (res.status === 401) { handleLogout("expired"); return; }
         if (!res.ok) throw new Error(`HTTP ${res.status}`);
         const data = await res.json();
         if (!Array.isArray(data)) throw new Error("malformed");
@@ -483,7 +513,7 @@ export default function App() {
             if (res.status === 401) {
               clearInterval(iv);
               pollingIntervals.current.delete(iv);
-              handleLogout();
+              handleLogout("expired");
               resolve("unauthorized");
               return;
             }

@@ -39,7 +39,7 @@ PLANS = {
 _DEFAULT_INSECURE_SECRET = "genly-default-secret-change-me"
 JWT_SECRET = os.environ.get("JWT_SECRET", _DEFAULT_INSECURE_SECRET)
 JWT_ALGORITHM = os.environ.get("JWT_ALGORITHM", "HS256")
-JWT_EXPIRE_MINUTES = int(os.environ.get("JWT_EXPIRE_MINUTES", "1440"))
+JWT_EXPIRE_MINUTES = int(os.environ.get("JWT_EXPIRE_MINUTES", "10080"))  # 7 days
 
 # Tenants allowed to request the broadcast / ProRes deliverable. Comma-
 # separated list, e.g. "umg,warner". The product otherwise hides every
