@@ -432,7 +432,7 @@ export default function Settings({ onBack }) {
                   <div key={row.label}
                     className={`flex items-center justify-between py-3 ${i < arr.length - 1 ? "border-b border-white/[0.03]" : ""}`}>
                     <span className="text-xs text-ink-secondary">{row.label}</span>
-                    <span className={`text-sm ${row.valueClass || "text-white"}`}>{row.value}</span>
+                    <span className={`text-sm truncate max-w-[60%] text-right ${row.valueClass || "text-white"}`}>{row.value}</span>
                   </div>
                 ))}
               </div>
@@ -812,7 +812,7 @@ export default function Settings({ onBack }) {
                 <div>
                   {invoices.map((inv) => (
                     <div key={inv.id}
-                      className="flex items-center justify-between py-3 border-b border-white/[0.03] last:border-0">
+                      className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2 py-3 border-b border-white/[0.03] last:border-0">
                       <div>
                         <p className="text-sm text-white">{inv.description || "Suscripción"}</p>
                         <p className="text-[11px] text-gray-600 mt-0.5">

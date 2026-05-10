@@ -189,7 +189,14 @@ function AppShell({ user, sidebarOpen, setSidebarOpen, onLogout }) {
         onLogout={onLogout}
       />
 
-      <div className={`flex-1 min-h-screen transition-all duration-300 ${sidebarOpen ? "ml-64" : "ml-0"}`}>
+      {sidebarOpen && (
+        <div
+          className="fixed inset-0 bg-black/50 z-10 md:hidden"
+          onClick={() => setSidebarOpen(false)}
+        />
+      )}
+
+      <div className={`flex-1 min-h-screen transition-all duration-300 ${sidebarOpen ? "md:ml-64" : "md:ml-0"}`}>
         {/* Ambient */}
         <div className="fixed inset-0 pointer-events-none">
           <div className="absolute top-[-30%] left-[20%] w-[600px] h-[600px] bg-brand/[0.03] rounded-full blur-[120px]" />
@@ -197,13 +204,14 @@ function AppShell({ user, sidebarOpen, setSidebarOpen, onLogout }) {
         </div>
 
         {/* Top bar */}
-        <header className="sticky top-0 z-20 flex items-center justify-between px-8 py-4 border-b border-white/[0.04] bg-surface/80 backdrop-blur-xl" style={{boxShadow: '0 1px 12px rgba(0,0,0,0.2)'}}>
+        <header className="sticky top-0 z-20 flex items-center justify-between px-4 md:px-8 py-4 border-b border-white/[0.04] bg-surface/80 backdrop-blur-xl" style={{boxShadow: '0 1px 12px rgba(0,0,0,0.2)'}}>
           <div className="flex items-center gap-3">
-            {!sidebarOpen && (
-              <button onClick={() => setSidebarOpen(true)} className="mr-2 text-gray-400 hover:text-white transition-colors">
-                <svg className="w-5 h-5" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24"><path d="M4 6h16M4 12h16M4 18h16"/></svg>
-              </button>
-            )}
+            <button
+              onClick={() => setSidebarOpen(!sidebarOpen)}
+              className={`mr-2 text-gray-400 hover:text-white transition-colors ${sidebarOpen ? "md:hidden" : ""}`}
+            >
+              <svg className="w-5 h-5" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24"><path d="M4 6h16M4 12h16M4 18h16"/></svg>
+            </button>
           </div>
           <div className="flex items-center gap-4">
             {user && (
@@ -218,7 +226,7 @@ function AppShell({ user, sidebarOpen, setSidebarOpen, onLogout }) {
         </header>
 
         {/* Content */}
-        <main className="relative z-10 px-8 pt-8 pb-20">
+        <main className="relative z-10 px-4 md:px-8 pt-6 md:pt-8 pb-20">
           <Outlet />
         </main>
       </div>
@@ -317,7 +325,9 @@ export default function App() {
   // brand-new clip — UMG's path for getting a unique video off a
   // library asset they already used (or want to differentiate from).
   const [backgroundMode, setBackgroundMode] = useState("as_is");
-  const [sidebarOpen, setSidebarOpen] = useState(true);
+  const [sidebarOpen, setSidebarOpen] = useState(
+    typeof window !== "undefined" && window.innerWidth >= 768
+  );
   const [resetToken, setResetToken] = useState(null);
   const [billingSuccess, setBillingSuccess] = useState(false);
   const pollingIntervals = useRef(new Set());

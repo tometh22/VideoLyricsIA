@@ -158,7 +158,7 @@ export default function LoginPage({ onLogin, onBack, resetToken, onResetComplete
         </div>
       </div>
 
-      <div className="relative z-10 w-full max-w-sm mx-4 animate-fade-in">
+      <div className="relative z-10 w-full max-w-sm mx-4 sm:mx-auto animate-fade-in">
         {/* Logo — full lockup per brand kit §10 (auth screens use the
             full lockup, not the mark only). */}
         <div className="text-center mb-7">
