@@ -991,8 +991,7 @@ export default function UploadZone({
   const _bgBlock = (
     <>
       {/* Background selector */}
-      {files.length > 0 && (
-        <div className="mt-4">
+      <div className="rounded-card bg-surface-2/40 ring-1 ring-white/[0.04] px-4 py-3">
           <input
             ref={bgInputRef}
             type="file"
@@ -1004,7 +1003,12 @@ export default function UploadZone({
             }}
           />
 
-          <p className="text-[11px] text-gray-600 uppercase tracking-wider mb-2">{t("upload.bg_label") || "Background"}</p>
+          <p className="text-[10px] uppercase tracking-[0.18em] text-gray-500">Fondo del video</p>
+          <p className="text-[11px] text-gray-600 mb-2 mt-0.5">
+            {bgMode === "auto" ? "IA genera un fondo único por canción"
+              : bgMode === "library" ? "Fondo compartido para todo el lote"
+              : "Tu fondo personalizado"}
+          </p>
 
           {/* Mode selector */}
           <div className="flex gap-1 p-1 glass rounded-xl w-fit mb-3" data-tour="upload-bg-tabs">
@@ -1279,7 +1283,6 @@ export default function UploadZone({
             </div>
           )}
         </div>
-      )}
     </>
   );
 
@@ -1300,71 +1303,87 @@ export default function UploadZone({
   const summary = summaryParts.join(" · ");
 
   return (
-    <div className="w-full max-w-4xl mx-auto pb-28">
+    <div className="w-full max-w-5xl mx-auto pb-28">
       <UploadTour user={user} />
-      <div className="space-y-4">
-        {_dropZone}
-        {_filesBlock}
-        {_batchSettingsBlock}
-        {_bgBlock}
-        {/* Visual style selector — batch-wide. Maps to pipeline.py's
-            _GRADIENT_PALETTES (oscuro / neon / minimal). Shown only once
-            a file is in the batch so the empty state stays clean. */}
-        {files.length > 0 && onStyleChange && (
-          <div className="rounded-card bg-surface-2/40 ring-1 ring-white/[0.04] px-4 py-3">
-            <p className="text-[10px] uppercase tracking-[0.18em] text-gray-500">
-              {t("upload.style_label")}
-            </p>
-            <p className="text-[10px] text-gray-500 mb-2 mt-0.5">
-              {t("upload.style_desc") || "Paleta de colores del fondo generado por IA"}
-            </p>
-            <div className="flex gap-2">
-              {STYLES.map((s) => (
-                <button
-                  key={s.code}
-                  type="button"
-                  onClick={() => onStyleChange(s.code)}
-                  className={`flex-1 flex flex-col items-center gap-2 px-3 py-2.5 rounded-xl border text-[11px] font-medium transition-all duration-200
-                    ${style === s.code
-                      ? "border-brand/50 text-white ring-1 ring-brand/40 scale-[1.02]"
-                      : "border-white/[0.06] text-gray-400 hover:border-white/[0.16] hover:text-white"
-                    }`}
-                >
-                  {/* Gradient swatch — exact palette from pipeline.py */}
-                  <span
-                    className={`w-full h-8 rounded-lg block ring-1 transition-all duration-200 ${
-                      style === s.code ? "ring-brand/50 shadow-[0_0_12px_2px_rgba(139,92,246,0.3)]" : "ring-white/[0.06]"
-                    }`}
-                    style={{ background: s.swatch }}
-                  />
-                  <span className="leading-tight text-center">
-                    <span className="block font-semibold">{t(s.labelKey)}</span>
-                    <span className="block text-[10px] text-gray-500">{t(s.subKey)}</span>
-                  </span>
-                </button>
-              ))}
-            </div>
+      <div className="flex flex-col md:grid md:grid-cols-[minmax(0,1fr)_340px] lg:grid-cols-[minmax(0,1fr)_380px] gap-6 items-start">
+
+        {/* LEFT COLUMN — drop zone + file list */}
+        <div className="space-y-4 min-w-0">
+          {_dropZone}
+          {_filesBlock}
+        </div>
+
+        {/* RIGHT COLUMN — batch settings, sticky on md+ */}
+        {files.length > 0 && (
+          <div className="md:sticky md:top-4 md:self-start space-y-4">
+
+            {/* Batch scope badge */}
+            {files.length > 1 && (
+              <div className="flex items-center gap-1.5 px-1">
+                <span className="inline-flex items-center gap-1.5 text-[10px] text-gray-500 uppercase tracking-[0.16em]">
+                  <svg className="w-3 h-3 shrink-0" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
+                    <path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/>
+                    <path d="M23 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/>
+                  </svg>
+                  Aplica a los {files.length} tracks
+                </span>
+              </div>
+            )}
+
+            {/* 1. Visual style */}
+            {onStyleChange && (
+              <div className="rounded-card bg-surface-2/40 ring-1 ring-white/[0.04] px-4 py-3">
+                <p className="text-[10px] uppercase tracking-[0.18em] text-gray-500">{t("upload.style_label")}</p>
+                <p className="text-[11px] text-gray-600 mb-2 mt-0.5">
+                  {t("upload.style_desc") || "Paleta de colores del fondo IA y del gradiente animado"}
+                </p>
+                <div className="grid grid-cols-2 gap-2">
+                  {STYLES.map((s) => (
+                    <button
+                      key={s.code}
+                      type="button"
+                      onClick={() => onStyleChange(s.code)}
+                      className={`flex flex-col items-center gap-2 px-2 py-2.5 rounded-xl border text-[11px] font-medium transition-all duration-200
+                        ${style === s.code
+                          ? "border-brand/50 text-white ring-1 ring-brand/40 scale-[1.02]"
+                          : "border-white/[0.06] text-gray-400 hover:border-white/[0.16] hover:text-white"
+                        }`}
+                    >
+                      <span
+                        className={`w-full h-7 rounded-lg block ring-1 transition-all duration-200 ${
+                          style === s.code ? "ring-brand/50 shadow-[0_0_12px_2px_rgba(139,92,246,0.3)]" : "ring-white/[0.06]"
+                        }`}
+                        style={{ background: s.swatch }}
+                      />
+                      <span className="leading-tight text-center">
+                        <span className="block font-semibold">{t(s.labelKey)}</span>
+                        <span className="block text-[10px] text-gray-500">{t(s.subKey)}</span>
+                      </span>
+                    </button>
+                  ))}
+                </div>
+              </div>
+            )}
+
+            {/* 2. Background selector */}
+            {_bgBlock}
+
+            {/* 3. Batch-wide controls: movement gallery + text defaults */}
+            {_batchSettingsBlock}
+
+            {/* 4. Delivery selector — ProRes gated */}
+            {user?.features?.prores_export && _deliveryBlock}
           </div>
         )}
-        {/* Delivery selector — broadcast (ProRes) profiles are gated by
-            user.features.prores_export. Non-eligible users get a silent
-            default of MP4/YouTube, which is what `delivery_profile` is
-            already initialised to in state. Hiding the whole block (vs.
-            disabling it) keeps the UI clean for the 99% of users who
-            never need anything other than MP4. */}
-        {files.length > 0 && user?.features?.prores_export && _deliveryBlock}
       </div>
 
-      {/* Sticky bottom CTA bar — replaces the disconnected buttons that
-          previously lived in App.jsx. Stays visible while the operator
-          scrolls a long batch + gallery, with a live summary so they
-          can verify their picks before submitting. */}
+      {/* Sticky bottom CTA bar */}
       {files.length > 0 && (
         <div
           className={`fixed bottom-0 right-0 z-30 bg-surface-1/85 backdrop-blur-xl border-t border-white/[0.06] px-8 py-4 transition-all duration-300 ${sidebarOpen ? "left-64" : "left-0"}`}
           data-tour="upload-cta-bar"
         >
-          <div className="max-w-4xl mx-auto flex items-center gap-4">
+          <div className="max-w-5xl mx-auto flex items-center gap-4">
             <div className="flex-1 min-w-0">
               <p className="text-[10px] uppercase tracking-[0.18em] text-gray-500">
                 {t("upload.batch_summary") || "Lote"}
