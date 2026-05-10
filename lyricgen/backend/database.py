@@ -513,6 +513,13 @@ def _migrate_user_columns():
         # Idempotent: ALTER COLUMN to a wider type is a no-op metadata
         # change in Postgres if already TEXT.
         "ALTER TABLE jobs ALTER COLUMN multipart_upload_id TYPE TEXT",
+        # background_assets.owner_tenant_id was added in alembic migration
+        # c91e3a4f2b18 (tenant scope). Mirror it here so deployments that
+        # don't run alembic (some Railway setups) still get the column —
+        # otherwise GET /backgrounds 500s with UndefinedColumn and the
+        # library tab shows empty (browser then misreports as CORS).
+        "ALTER TABLE background_assets ADD COLUMN IF NOT EXISTS owner_tenant_id VARCHAR(100)",
+        "CREATE INDEX IF NOT EXISTS ix_background_assets_owner_tenant_id ON background_assets (owner_tenant_id)",
     ]
     with engine.begin() as conn:
         for sql in column_adds:

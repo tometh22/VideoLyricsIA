@@ -934,32 +934,63 @@ def _enforce_concurrent_jobs_cap(*_, **__) -> None:
     return None
 
 
-# Soft per-tenant cap on jobs that need attention (queued + processing +
-# pending_review). Forces operators to clear their existing backlog before
-# piling on more work. Tomi communicated this 5-batch ceiling to UMG as
-# the agreed launch-window throughput; do NOT raise without re-aligning
-# with the operator. Admins bypass for test seeding.
-TENANT_BACKLOG_LIMIT = int(os.environ.get("TENANT_BACKLOG_LIMIT", "5"))
+# Soft caps on jobs that need attention (queued + processing +
+# pending_review). Two layers:
+#   * USER_BACKLOG_LIMIT:   one user (operator) can have N jobs in-flight.
+#     Matches the 5-batch ceiling Tomi committed to UMG per operator.
+#   * TENANT_BACKLOG_LIMIT: the whole tenant (e.g. Universal with 3
+#     operators) can have M jobs in-flight. Default = 5x USER limit so
+#     up to 5 operators can be at full throughput without colliding.
+# Admins bypass both for test seeding. Both limits are env-tunable so
+# enterprise tenants can be raised without a redeploy.
+USER_BACKLOG_LIMIT = int(os.environ.get("USER_BACKLOG_LIMIT", "5"))
+TENANT_BACKLOG_LIMIT = int(os.environ.get("TENANT_BACKLOG_LIMIT", str(USER_BACKLOG_LIMIT * 5)))
+
+_BACKLOG_STATUSES = ["queued", "processing", "pending_review"]
 
 
 def _enforce_tenant_backlog(db: Session, current_user: dict) -> None:
+    """Two-layer backlog gate. Per-user fires first so a single operator
+    can't monopolise their tenant's tenant-wide quota; per-tenant catches
+    the case where multiple operators collectively saturate.
+    """
     # Admins are exempt — they may legitimately seed many test jobs.
     if current_user.get("role") == "admin":
         return
     tenant_id = current_user["tenant_id"]
-    in_flight = (
+    user_id = current_user["id"]
+
+    # Per-user check first (faster to fail and more relevant feedback).
+    user_in_flight = (
         db.query(Job)
-        .filter(Job.tenant_id == tenant_id)
-        .filter(Job.status.in_(["queued", "processing", "pending_review"]))
+        .filter(Job.user_id == user_id)
+        .filter(Job.status.in_(_BACKLOG_STATUSES))
         .count()
     )
-    if in_flight >= TENANT_BACKLOG_LIMIT:
+    if user_in_flight >= USER_BACKLOG_LIMIT:
         raise HTTPException(
             status_code=429,
             detail=(
-                f"Tu equipo tiene {in_flight} videos en proceso o pendientes "
-                f"de revisión (límite: {TENANT_BACKLOG_LIMIT}). Aprobá o "
-                f"rechazá algunos antes de subir más."
+                f"Tenés {user_in_flight} videos en proceso o pendientes de "
+                f"revisión (límite: {USER_BACKLOG_LIMIT} por usuario). "
+                f"Aprobá o rechazá algunos antes de subir más."
+            ),
+        )
+
+    # Per-tenant check second.
+    tenant_in_flight = (
+        db.query(Job)
+        .filter(Job.tenant_id == tenant_id)
+        .filter(Job.status.in_(_BACKLOG_STATUSES))
+        .count()
+    )
+    if tenant_in_flight >= TENANT_BACKLOG_LIMIT:
+        raise HTTPException(
+            status_code=429,
+            detail=(
+                f"Tu equipo tiene {tenant_in_flight} videos en proceso o "
+                f"pendientes de revisión (límite: {TENANT_BACKLOG_LIMIT} por "
+                f"equipo). Esperá a que se completen algunos antes de subir más."
             ),
         )
 
@@ -1071,13 +1102,16 @@ def _enforce_memory_pressure() -> None:
 
 
 # Concurrent-upload counter. With the streaming refactor each upload
-# costs ~1 MiB of RAM regardless of file size, but the kernel's page
-# cache + ffmpeg subprocesses still consume real memory. Capping the
-# count gives a hard ceiling across replicas (Redis-shared) so a
-# UMG-style burst can't melt the API container even if memory_percent
-# hasn't crossed the threshold yet. Disabled when Redis is missing
-# (dev / tests) — the memory gate above still applies in that case.
-_MAX_CONCURRENT_UPLOADS = int(os.environ.get("MAX_CONCURRENT_UPLOADS", "8"))
+# costs ~1 MiB of RAM regardless of file size, AND uploads >50MB go
+# direct browser->R2 (zero API container bandwidth/memory). Capping the
+# count gives a hard ceiling across replicas (Redis-shared) so a burst
+# from a single tenant can't melt the API even if memory_percent hasn't
+# crossed the threshold yet. Default raised from the original 8 to 32
+# so a multi-tenant burst (e.g. 6 paying clients × 5 simultaneous
+# uploads each) doesn't block at the slot counter. Tune via env var
+# without redeploying. Disabled when Redis is missing (dev / tests) —
+# the memory gate above still applies in that case.
+_MAX_CONCURRENT_UPLOADS = int(os.environ.get("MAX_CONCURRENT_UPLOADS", "32"))
 _UPLOAD_LEASE_TTL_S = int(os.environ.get("UPLOAD_LEASE_TTL_S", "600"))
 _UPLOAD_COUNTER_KEY = "uploads:in_flight"
 
