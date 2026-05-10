@@ -175,6 +175,11 @@ class CreateUserRequest(BaseModel):
     # If true, the user keeps generating past plan monthly limit and we
     # invoice the overage out-of-band. Default False = hard wall at limit.
     allow_overage: bool = False
+    # UMG Guideline 5: gate for AI tool usage. Default False keeps the
+    # current "auth-after-create" workflow intact. When True, the same
+    # transaction sets ai_authorized_at/by so the operator doesn't have
+    # to follow up with a separate authorize-ai call.
+    ai_authorized: bool = False
 
 
 @router.post("/users")
@@ -195,8 +200,16 @@ async def create_user_admin(
             plan=body.plan_id,
             tenant_id=body.tenant_id.strip() or None,
         )
+        _post_create_dirty = False
         if body.allow_overage:
             user.allow_overage = True
+            _post_create_dirty = True
+        if body.ai_authorized:
+            user.ai_authorized = True
+            user.ai_authorized_at = datetime.now(timezone.utc)
+            user.ai_authorized_by = admin["id"]
+            _post_create_dirty = True
+        if _post_create_dirty:
             db.commit()
             db.refresh(user)
         return user.to_dict()

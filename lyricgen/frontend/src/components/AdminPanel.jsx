@@ -165,6 +165,10 @@ export default function AdminPanel({ onBack }) {
       await fetch(`${API}/admin/backgrounds`, { method: "POST", headers: authHeaders(), body: formData });
       setBgName("");
       setBgTags("");
+      // Reset the tenant selector too so the next asset doesn't silently
+      // inherit the previous assignment (e.g. a Global upload landing in
+      // UMG's library because the dropdown was sticky).
+      setBgOwnerTenant("");
       loadBackgrounds();
     } catch {}
     setBgUploading(false);
@@ -218,7 +222,7 @@ export default function AdminPanel({ onBack }) {
         throw new Error(data.detail || "Error");
       }
       setShowCreate(false);
-      setNewUser({ username: "", password: "", email: "", plan_id: "100", role: "user", tenant_id: "", allow_overage: false });
+      setNewUser({ username: "", password: "", email: "", plan_id: "100", role: "user", tenant_id: "", allow_overage: false, ai_authorized: false });
       loadUsers();
     } catch (err) {
       setCreateError(err.message);
@@ -594,6 +598,20 @@ export default function AdminPanel({ onBack }) {
                       Permitir overage
                       <span className="block text-[11px] text-gray-500 mt-0.5">
                         El usuario puede pasar el cap mensual; los videos extra se facturan al cierre.
+                      </span>
+                    </span>
+                  </label>
+                  <label className="flex items-start gap-2 text-sm text-gray-300 cursor-pointer select-none">
+                    <input
+                      type="checkbox"
+                      checked={newUser.ai_authorized || false}
+                      onChange={e => setNewUser({...newUser, ai_authorized: e.target.checked})}
+                      className="accent-brand mt-0.5"
+                    />
+                    <span>
+                      Autorizar uso de IA
+                      <span className="block text-[11px] text-gray-500 mt-0.5">
+                        Permite generar variaciones y fondos con IA (UMG Guideline 5). Si lo dejás sin tildar podés autorizarlo después desde la lista.
                       </span>
                     </span>
                   </label>

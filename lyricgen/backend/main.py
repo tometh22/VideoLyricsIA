@@ -365,6 +365,18 @@ def _resolve_library_background(
         # Don't reveal whether the asset exists — same response as not found.
         raise HTTPException(status_code=404, detail="Background not found.")
 
+    # Variation requires a video source — _extract_frame_from_video calls
+    # ffprobe and explodes on stills. The UI hides the toggle for images,
+    # but a direct API caller could still send the combo; fall back to
+    # as_is silently rather than failing the job.
+    if background_mode == "variation" and asset.file_type != "mp4":
+        logger.warning(
+            "asset %s is %s — falling back to as_is (variation requires video)",
+            asset.id,
+            asset.file_type,
+        )
+        background_mode = "as_is"
+
     bg_path = None
     bg_r2_key = None
     var_path = None
@@ -1721,8 +1733,12 @@ async def upload(
 
     umg_spec = _parse_umg_params(delivery_profile, umg_frame_size, umg_fps, umg_prores_profile, current_user=current_user)
 
-    # Check AI authorization (UMG Guideline 5) — skip if using library background (no AI)
-    if not background_id and current_user.get("role") != "admin":
+    # Check AI authorization (UMG Guideline 5). The skip applies only when
+    # the operator picks a library asset AND uses it as-is — no AI invoked.
+    # Variation mode still calls Veo image-to-video on a frame of the
+    # source, which IS AI generation, so the auth gate must apply.
+    _needs_ai_auth = (not background_id) or (background_mode == "variation")
+    if _needs_ai_auth and current_user.get("role") != "admin":
         user_model = db.query(User).filter(User.id == current_user["id"]).first()
         if user_model and not user_model.ai_authorized:
             raise HTTPException(status_code=403, detail="AI tool usage not authorized. Contact admin for approval.")
@@ -2502,8 +2518,16 @@ async def generate_with_segments(
     # "processing" on its first line. No 429 for capacity reasons.
     initial_status = "queued"
 
-    # Check AI authorization (UMG Guideline 5) — skip if using library background (no AI)
-    if not background_id and current_user.get("role") != "admin":
+    # Sanitize early — the AI-auth check below depends on background_mode
+    # so we can't defer normalization to the resolve-library section.
+    background_mode = background_mode if background_mode in ("as_is", "variation") else "as_is"
+
+    # Check AI authorization (UMG Guideline 5). The skip applies only when
+    # the operator picks a library asset AND uses it as-is — no AI invoked.
+    # Variation mode still calls Veo image-to-video on a frame of the
+    # source, which IS AI generation, so the auth gate must apply.
+    _needs_ai_auth = (not background_id) or (background_mode == "variation")
+    if _needs_ai_auth and current_user.get("role") != "admin":
         user_model = db.query(User).filter(User.id == current_user["id"]).first()
         if user_model and not user_model.ai_authorized:
             raise HTTPException(status_code=403, detail="AI tool usage not authorized. Contact admin for approval.")
@@ -2576,7 +2600,6 @@ async def generate_with_segments(
     variation_source_path = None
     variation_source_r2_key = None
     variation_parent_id = None
-    background_mode = background_mode if background_mode in ("as_is", "variation") else "as_is"
     if background_id:
         bg_path, bg_r2_key, variation_source_path, variation_source_r2_key, variation_parent_id = (
             _resolve_library_background(
