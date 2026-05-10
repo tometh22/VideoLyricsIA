@@ -88,6 +88,85 @@ function putToR2WithProgress(url, blob, contentType, onProgress, signal) {
   });
 }
 
+/** Upload a small file (<16 MB) via the backend proxy (POST raw bytes).
+ * Avoids browser→R2 CORS preflight by routing through the same-origin API. */
+function uploadFileProxy(jobId, blob, contentType, onProgress, signal) {
+  return new Promise((resolve, reject) => {
+    const xhr = new XMLHttpRequest();
+    xhr.open("POST", `${API}/upload-file-proxy?job_id=${encodeURIComponent(jobId)}`, true);
+    const token = localStorage.getItem("genly_token");
+    if (token) xhr.setRequestHeader("Authorization", `Bearer ${token}`);
+    if (contentType) xhr.setRequestHeader("Content-Type", contentType);
+    if (xhr.upload && onProgress) {
+      xhr.upload.onprogress = (e) => {
+        if (e.lengthComputable) onProgress(e.loaded, e.total);
+      };
+    }
+    xhr.onload = () => {
+      if (xhr.status >= 200 && xhr.status < 300) {
+        try {
+          const { key } = JSON.parse(xhr.responseText);
+          resolve({ key });
+        } catch {
+          reject(new Error("File proxy upload: invalid response"));
+        }
+      } else {
+        let detail = "";
+        try { detail = JSON.parse(xhr.responseText).detail || ""; } catch {}
+        reject(new Error(`File proxy upload failed (${xhr.status})${detail ? ": " + detail : ""}`));
+      }
+    };
+    xhr.onerror = () => reject(new Error("File proxy upload network error"));
+    xhr.onabort = () => reject(Object.assign(new Error("aborted"), { aborted: true }));
+    if (signal) {
+      if (signal.aborted) { xhr.abort(); return; }
+      signal.addEventListener("abort", () => xhr.abort(), { once: true });
+    }
+    xhr.send(blob);
+  });
+}
+
+/** Upload one multipart part via the backend proxy (POST raw bytes).
+ * Avoids browser→R2 CORS preflight by routing through the same-origin API. */
+function uploadPartProxy(jobId, partNumber, blob, onProgress, signal) {
+  return new Promise((resolve, reject) => {
+    const xhr = new XMLHttpRequest();
+    xhr.open(
+      "POST",
+      `${API}/upload-part-proxy?job_id=${encodeURIComponent(jobId)}&part_number=${partNumber}`,
+      true,
+    );
+    const token = localStorage.getItem("genly_token");
+    if (token) xhr.setRequestHeader("Authorization", `Bearer ${token}`);
+    if (xhr.upload && onProgress) {
+      xhr.upload.onprogress = (e) => {
+        if (e.lengthComputable) onProgress(e.loaded, e.total);
+      };
+    }
+    xhr.onload = () => {
+      if (xhr.status >= 200 && xhr.status < 300) {
+        try {
+          const { etag } = JSON.parse(xhr.responseText);
+          resolve(etag);
+        } catch {
+          reject(new Error("Proxy upload: invalid response"));
+        }
+      } else {
+        let detail = "";
+        try { detail = JSON.parse(xhr.responseText).detail || ""; } catch {}
+        reject(new Error(`Proxy upload failed (${xhr.status})${detail ? ": " + detail : ""}`));
+      }
+    };
+    xhr.onerror = () => reject(new Error("Proxy upload network error"));
+    xhr.onabort = () => reject(Object.assign(new Error("aborted"), { aborted: true }));
+    if (signal) {
+      if (signal.aborted) { xhr.abort(); return; }
+      signal.addEventListener("abort", () => xhr.abort(), { once: true });
+    }
+    xhr.send(blob);
+  });
+}
+
 /** Backoff helper for retrying a single multipart part. */
 async function withRetry(fn, { maxAttempts = 4, baseMs = 1000 } = {}) {
   let lastErr;
@@ -142,33 +221,21 @@ async function multipartUpload({
       const blob = file.slice(start, end);
       try {
         const etag = await withRetry(async () => {
-          const { url } = await apiPost("/upload-multipart-part-url", {
-            job_id: jobId, part_number: partNumber,
-          });
           // Reset the part's progress on retry so the UI doesn't
           // double-count (otherwise a retry from byte 0 would push the
           // global counter past 100%).
           perPartLoaded[i] = 0;
           reportProgress();
-          const res = await putToR2WithProgress(
-            url, blob, contentType,
-            (loaded /* total */) => {
-              perPartLoaded[i] = loaded;
-              reportProgress();
-            },
+          const result = await uploadPartProxy(
+            jobId, partNumber, blob,
+            (loaded) => { perPartLoaded[i] = loaded; reportProgress(); },
             signal,
           );
-          if (!res.etag) {
-            throw new Error(
-              `Part ${partNumber}: R2 returned no ETag — likely a CORS ` +
-              `exposeHeaders config issue. See r2_cors.json.`
-            );
-          }
           // ensure final byte count is reflected even if onprogress
           // missed the very last chunk.
           perPartLoaded[i] = blob.size;
           reportProgress();
-          return res.etag;
+          return result;
         });
         parts.push({ part_number: partNumber, etag });
       } catch (err) {
@@ -223,10 +290,9 @@ export async function uploadFileToR2(
   const contentType = file.type || "application/octet-stream";
 
   if (!ticket.use_multipart) {
-    // Single-PUT path.
-    await putToR2WithProgress(
-      ticket.upload_url, file, contentType, onProgress, signal,
-    );
+    // Route through the backend proxy so R2 bucket CORS is never on the
+    // critical path — same approach as the multipart part proxy.
+    await uploadFileProxy(ticket.job_id, file, contentType, onProgress, signal);
     return { jobId: ticket.job_id, key: ticket.key };
   }
 
