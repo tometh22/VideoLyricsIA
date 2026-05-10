@@ -18,7 +18,12 @@
     <link href="https://fonts.googleapis.com/css2?family=Anton&family=Bebas+Neue&family=Jost:wght@700&family=Montserrat:wght@700;800&family=Outfit:wght@700&family=Oswald:wght@700&family=Poppins:wght@700&family=Roboto:wght@700&display=swap" rel="stylesheet">
   </head>
   <body class="min-h-screen">
-    <div id="root"></div>
+    <div id="root">
+      <div style="min-height:100vh;display:flex;align-items:center;justify-content:center;background:#12121A;">
+        <div style="width:40px;height:40px;border:2px solid #6D4AFF;border-top-color:transparent;border-radius:50%;animation:_spin 0.8s linear infinite;"></div>
+      </div>
+      <style>@keyframes _spin{to{transform:rotate(360deg)}}</style>
+    </div>
     <script type="module" src="/src/main.jsx"></script>
   </body>
 </html>
