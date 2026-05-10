@@ -168,7 +168,7 @@ function uploadPartProxy(jobId, partNumber, blob, onProgress, signal) {
 }
 
 /** Backoff helper for retrying a single multipart part. */
-async function withRetry(fn, { maxAttempts = 4, baseMs = 1000 } = {}) {
+async function withRetry(fn, { maxAttempts = 6, baseMs = 1000 } = {}) {
   let lastErr;
   for (let attempt = 0; attempt < maxAttempts; attempt++) {
     try {
