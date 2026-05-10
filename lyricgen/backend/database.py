@@ -57,6 +57,18 @@ if DATABASE_URL.startswith("postgres://"):
 _DB_POOL_SIZE = int(os.environ.get("DB_POOL_SIZE", "8"))
 _DB_MAX_OVERFLOW = int(os.environ.get("DB_MAX_OVERFLOW", "8"))
 
+_keepalive_args: dict = {}
+if DATABASE_URL.startswith("postgresql"):
+    # TCP keepalives so PG notices a dead client in ~80s instead of
+    # Railway's 2h default. Prevents zombie idle-in-transaction sessions
+    # from a container that Railway killed during a failed deploy.
+    _keepalive_args = {
+        "keepalives": 1,
+        "keepalives_idle": 30,
+        "keepalives_interval": 10,
+        "keepalives_count": 5,
+    }
+
 engine = create_engine(
     DATABASE_URL,
     pool_size=_DB_POOL_SIZE,
@@ -64,6 +76,7 @@ engine = create_engine(
     pool_pre_ping=True,
     pool_recycle=300,
     echo=os.environ.get("SQL_ECHO", "").lower() == "true",
+    connect_args=_keepalive_args,
 )
 
 SessionLocal = sessionmaker(bind=engine, autoflush=False, expire_on_commit=False)
