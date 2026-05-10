@@ -233,6 +233,17 @@ class Job(Base):
     approved_at = Column(DateTime(timezone=True), nullable=True)
     review_notes = Column(Text, nullable=True)
 
+    # Edit requests (post-approval partial re-renders)
+    # segments_json — persisted Whisper output so re-renders skip re-transcription.
+    # render_params  — font/typography/motion settings used at render time.
+    # edit_count     — how many partial re-renders the reviewer has requested (max 3).
+    # bg_r2_key_cached — R2 key for the AI-generated background so typography-only
+    #   edits can re-use it without paying for Veo again.
+    segments_json = Column(JSON, nullable=True)
+    render_params = Column(JSON, nullable=True)
+    edit_count = Column(Integer, default=0, nullable=False, server_default="0")
+    bg_r2_key_cached = Column(Text, nullable=True)
+
     created_at = Column(DateTime(timezone=True), default=utcnow, index=True)
     completed_at = Column(DateTime(timezone=True), nullable=True)
 
@@ -267,6 +278,8 @@ class Job(Base):
             "approved_by": self.approved_by,
             "approved_at": self.approved_at.isoformat() if self.approved_at else None,
             "review_notes": self.review_notes,
+            "edit_count": self.edit_count or 0,
+            "render_params": self.render_params,
             "created_at": self.created_at.timestamp() if self.created_at else None,
             "completed_at": self.completed_at.timestamp() if self.completed_at else None,
         }
@@ -525,6 +538,11 @@ def _migrate_user_columns():
         "ALTER TABLE background_assets ADD COLUMN IF NOT EXISTS owner_tenant_id VARCHAR(100)",
         "ALTER TABLE background_assets ADD COLUMN IF NOT EXISTS parent_asset_id INTEGER REFERENCES background_assets(id)",
         "CREATE INDEX IF NOT EXISTS ix_background_assets_owner_tenant_id ON background_assets(owner_tenant_id)",
+        # Edit-requests feature: partial re-render support at review stage.
+        "ALTER TABLE jobs ADD COLUMN IF NOT EXISTS segments_json JSONB",
+        "ALTER TABLE jobs ADD COLUMN IF NOT EXISTS render_params JSONB",
+        "ALTER TABLE jobs ADD COLUMN IF NOT EXISTS edit_count INTEGER NOT NULL DEFAULT 0",
+        "ALTER TABLE jobs ADD COLUMN IF NOT EXISTS bg_r2_key_cached TEXT",
     ]
     # Each statement gets its own transaction. In Postgres, a failed statement
     # inside a transaction puts it in aborted state — subsequent execute()
