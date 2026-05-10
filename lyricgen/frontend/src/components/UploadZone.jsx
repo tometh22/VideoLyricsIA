@@ -65,21 +65,27 @@ const UMG_PROFILES = [
 const STYLES = [
   {
     code: "oscuro",
-    label: "Dark",
-    sub: "Cinematográfico",
+    labelKey: "upload.style_dark",
+    subKey: "upload.style_dark_sub",
     swatch: "linear-gradient(135deg, #0a0a1e 0%, #1e0f3c 40%, #501450 70%, #280a32 100%)",
   },
   {
     code: "neon",
-    label: "Neon",
-    sub: "Vibrante",
+    labelKey: "upload.style_neon",
+    subKey: "upload.style_neon_sub",
     swatch: "linear-gradient(135deg, #0a0528 0%, #500078 40%, #006482 70%, #780050 100%)",
   },
   {
     code: "minimal",
-    label: "Minimal",
-    sub: "Limpio",
+    labelKey: "upload.style_minimal",
+    subKey: "upload.style_minimal_sub",
     swatch: "linear-gradient(135deg, #b4b4c3 0%, #c8bed2 40%, #aab4c8 70%, #d2c8c3 100%)",
+  },
+  {
+    code: "calido",
+    labelKey: "upload.style_calido",
+    subKey: "upload.style_calido_sub",
+    swatch: "linear-gradient(135deg, #3c140a 0%, #8c3c0f 40%, #b45a14 70%, #641e0a 100%)",
   },
 ];
 
@@ -134,13 +140,25 @@ export default function UploadZone({
   // blocking the picker render. Shape: { [id]: { used, last_used_at,
   // use_count } }.
   const [usageMap, setUsageMap] = useState({});
-  // Per-row expansion of the secondary controls (Tipografía / Concepto /
-  // Movimiento). Idioma + Género stay always-visible because operators
-  // tweak those most often; the rest hide behind "Más opciones" so a
-  // 10-song batch doesn't become 60 dropdowns of scroll.
-  const [expandedRows, setExpandedRows] = useState(() => new Set());
-  const toggleExpanded = (idx) => {
-    setExpandedRows((prev) => {
+  // Batch-wide defaults applied to all tracks. Controls in _batchSettingsBlock
+  // write here and fan out to every file entry. Per-track "Personalizar"
+  // drawer lets an operator override individual fields without affecting others.
+  const [batchDefaults, setBatchDefaults] = useState({
+    genre: "", concept: "", movementStyle: "", font: "",
+    textCase: "upper", fontScale: "1.0", lyricTransition: "cut", textMotion: "none",
+  });
+  const batchDefaultsRef = useRef(batchDefaults);
+  useEffect(() => { batchDefaultsRef.current = batchDefaults; }, [batchDefaults]);
+
+  const updateBatchDefault = (field, value) => {
+    setBatchDefaults((prev) => ({ ...prev, [field]: value }));
+    onFiles((prev) => prev.map((f) => ({ ...f, [field]: value })));
+  };
+
+  // Set of track indices with the inline "Personalizar" drawer open.
+  const [expandedPersonalize, setExpandedPersonalize] = useState(() => new Set());
+  const togglePersonalize = (idx) => {
+    setExpandedPersonalize((prev) => {
       const next = new Set(prev);
       if (next.has(idx)) next.delete(idx); else next.add(idx);
       return next;
@@ -160,7 +178,7 @@ export default function UploadZone({
   useEffect(() => {
     if (bgMode === "library" && !libraryLoaded) {
       fetch(`${API}/backgrounds`, { headers: authHeaders() })
-        .then(r => r.json())
+        .then(r => { if (!r.ok) throw new Error(r.status); return r.json(); })
         .then(data => {
           const list = Array.isArray(data) ? data : [];
           setLibraryBgs(list);
@@ -219,17 +237,17 @@ export default function UploadZone({
   // volcanic, etc.). "Auto" lets Gemini classify from artist+title+lyrics.
   // Default is auto so users who don't care don't need to think about it.
   const GENRES = [
-    { code: "",            label: t("upload.genre_auto") || "Auto" },
-    { code: "rock",        label: "Rock" },
-    { code: "pop",         label: "Pop" },
-    { code: "ballad",      label: t("upload.genre_ballad") || "Balada" },
-    { code: "latin",       label: t("upload.genre_latin") || "Latino" },
-    { code: "reggaeton",   label: "Reggaeton" },
-    { code: "hiphop",      label: "Hip-Hop / Trap" },
-    { code: "electronic",  label: t("upload.genre_electronic") || "Electrónica" },
-    { code: "indie",       label: "Indie" },
-    { code: "folk",        label: "Folk" },
-    { code: "metal",       label: "Metal" },
+    { code: "",            label: t("upload.genre_auto") },
+    { code: "rock",        label: t("upload.genre_rock") },
+    { code: "pop",         label: t("upload.genre_pop") },
+    { code: "ballad",      label: t("upload.genre_ballad") },
+    { code: "latin",       label: t("upload.genre_latin") },
+    { code: "reggaeton",   label: t("upload.genre_reggaeton") },
+    { code: "hiphop",      label: t("upload.genre_hiphop") },
+    { code: "electronic",  label: t("upload.genre_electronic") },
+    { code: "indie",       label: t("upload.genre_indie") },
+    { code: "folk",        label: t("upload.genre_folk") },
+    { code: "metal",       label: t("upload.genre_metal") },
   ];
 
   // Font catalogue for the per-track typography picker. Mirrors the
@@ -352,10 +370,7 @@ export default function UploadZone({
           artist,
           songTitle: song,
           language: "",
-          textCase: "upper",
-          fontScale: "1.0",
-          lyricTransition: "cut",
-          textMotion: "none",
+          ...batchDefaultsRef.current,
         };
       });
       return [...prev, ...newEntries];
@@ -546,329 +561,432 @@ export default function UploadZone({
       </div>
   );
 
-  const _galleryBlock = (
-    <>
-      {/* Movement-style reference gallery — educational, shown ONCE per
-          batch above the file rows so the operator understands what each
-          option produces before picking it on a per-track basis below.
-          Cards highlight (brand ring) when AT LEAST ONE row in the batch
-          has selected that style, so the gallery doubles as an at-a-glance
-          summary of the batch's visual direction. */}
-      {files.length > 0 && (() => {
-        // Set of movement_style codes currently in use across the batch.
-        const inUse = new Set(files.map((f) => f.movementStyle).filter(Boolean));
-        return (
-          <div className="mt-3 glass rounded-card px-4 py-3">
-            <div className="flex items-baseline justify-between mb-2">
-              <p className="text-[11px] text-gray-500 uppercase tracking-wider font-medium">
-                {t("upload.movement_gallery_title") || "Referencias de estilo de movimiento"}
-              </p>
-              <p className="text-[11px] text-gray-500">
-                {t("upload.movement_gallery_hint") || "Click una para aplicarla a todas las canciones"}
-              </p>
-            </div>
-            <div className="grid grid-cols-2 sm:grid-cols-4 gap-2">
-              {MOVEMENT_STYLES.filter((m) => m.sample).map((m) => {
-                const active = inUse.has(m.code);
-                return (
-                  <button
-                    key={m.code}
-                    type="button"
-                    onClick={() => onFiles((prev) => prev.map((f) => ({ ...f, movementStyle: m.code })))}
-                    aria-label={`${t("upload.movement_apply_all") || "Aplicar a todas"}: ${m.label}`}
-                    className={`text-left rounded-xl overflow-hidden border transition-all duration-200 cursor-pointer
-                      ${active
-                        ? "border-brand/60 shadow-glow ring-1 ring-brand/40"
-                        : "border-white/[0.06] hover:border-white/[0.20] hover:scale-[1.02]"
-                      }`}
-                  >
-                    <div className="aspect-video bg-black/30 relative">
-                      <video
-                        src={m.sample}
-                        className="w-full h-full object-cover pointer-events-none"
-                        muted autoPlay loop playsInline
-                      />
-                      {active && (
-                        <div className="absolute top-1.5 right-1.5 w-5 h-5 rounded-full bg-brand flex items-center justify-center shadow">
-                          <svg className="w-3 h-3 text-white" fill="none" stroke="currentColor" strokeWidth="3" viewBox="0 0 24 24">
-                            <polyline points="20 6 9 17 4 12" />
-                          </svg>
-                        </div>
-                      )}
-                    </div>
-                    <div className="px-2 py-1.5 bg-surface-1">
-                      <p className={`text-[11px] truncate ${active ? "text-white font-medium" : "text-gray-300"}`}>
-                        {m.label}
-                      </p>
-                    </div>
-                  </button>
-                );
-              })}
-            </div>
-          </div>
-        );
-      })()}
-    </>
-  );
+  const _batchSettingsBlock = files.length > 0 ? (
+    <div className="mt-3 glass rounded-card px-4 py-4">
+      <p className="text-[10px] uppercase tracking-[0.18em] text-gray-500 mb-3">
+        {t("upload.batch_settings_title") || "Configuración del lote"}
+      </p>
 
-  const _filesBlock = (
-    <>
-      {files.length > 0 && (
-        <div className="mt-3 space-y-2 max-h-96 overflow-y-auto pr-1">
-          {files.map((entry, i) => (
-            <div key={i} className="glass rounded-card px-4 py-3" {...(i === 0 ? { "data-tour": "upload-row" } : {})}>
-              <div className="flex items-center gap-3 mb-2">
-                <div className="w-8 h-8 rounded-lg bg-brand/10 flex items-center justify-center shrink-0">
-                  <svg className="w-4 h-4 text-brand" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24" strokeLinecap="round" strokeLinejoin="round">
-                    <path d="M9 18V5l12-2v13" /><circle cx="6" cy="18" r="3" /><circle cx="18" cy="16" r="3" />
-                  </svg>
+      {/* Movement gallery — click a card to apply to all tracks */}
+      <div className="mb-4">
+        <div className="flex items-baseline justify-between mb-2">
+          <p className="text-[11px] text-gray-400 font-medium">
+            {t("upload.movement_gallery_title") || "Movimiento del fondo"}
+          </p>
+          <p className="text-[10px] text-gray-600">
+            {t("upload.movement_gallery_hint") || "Click para aplicar a todos · personalizable por canción"}
+          </p>
+        </div>
+        <div className="grid grid-cols-2 sm:grid-cols-4 gap-2">
+          {MOVEMENT_STYLES.filter((m) => m.sample).map((m) => {
+            const active = batchDefaults.movementStyle === m.code;
+            return (
+              <button
+                key={m.code}
+                type="button"
+                onClick={() => updateBatchDefault("movementStyle", m.code)}
+                aria-label={`${t("upload.movement_apply_all") || "Aplicar a todas"}: ${m.label}`}
+                className={`text-left rounded-xl overflow-hidden border transition-all duration-200 cursor-pointer
+                  ${active
+                    ? "border-brand/60 shadow-glow ring-1 ring-brand/40"
+                    : "border-white/[0.06] hover:border-white/[0.20] hover:scale-[1.02]"
+                  }`}
+              >
+                <div className="aspect-video bg-black/30 relative">
+                  <video
+                    src={m.sample}
+                    className="w-full h-full object-cover pointer-events-none"
+                    muted autoPlay loop playsInline
+                  />
+                  {active && (
+                    <div className="absolute top-1.5 right-1.5 w-5 h-5 rounded-full bg-brand flex items-center justify-center shadow">
+                      <svg className="w-3 h-3 text-white" fill="none" stroke="currentColor" strokeWidth="3" viewBox="0 0 24 24">
+                        <polyline points="20 6 9 17 4 12" />
+                      </svg>
+                    </div>
+                  )}
                 </div>
-                <div className="flex-1 min-w-0">
-                  <p className="text-sm text-white truncate">{entry.file.name}</p>
-                  {entry.file.name.toLowerCase().endsWith(".wav") &&
-                   entry.file.size > WAV_SOFT_WARN_MB * 1024 * 1024 && (
-                    <p className="text-[11px] text-amber-400/80 mt-0.5 truncate">
-                      {t("batch.wav_warning_large", {
-                        sizeMB: Math.round(entry.file.size / (1024 * 1024)),
-                      })}
+                <div className="px-2 py-1.5 bg-surface-1">
+                  <p className={`text-[11px] truncate ${active ? "text-white font-medium" : "text-gray-300"}`}>
+                    {m.label}
+                  </p>
+                </div>
+              </button>
+            );
+          })}
+        </div>
+      </div>
+
+      {/* Genre + Concept — only meaningful in AI Auto mode */}
+      {bgMode === "auto" && (
+        <div className="flex flex-wrap gap-3 mb-4">
+          <div className="flex items-center gap-2">
+            <span className="text-[11px] text-gray-600 shrink-0">{t("upload.genre_label") || "Género:"}</span>
+            <Listbox
+              value={batchDefaults.genre}
+              onChange={(v) => updateBatchDefault("genre", v)}
+              options={GENRES}
+              className="w-44"
+              ariaLabel={t("upload.genre_label") || "Género"}
+            />
+          </div>
+          <div className="flex items-center gap-2">
+            <span className="text-[11px] text-gray-600 shrink-0">{t("upload.concept_label") || "Concepto:"}</span>
+            <Listbox
+              value={batchDefaults.concept}
+              onChange={(v) => updateBatchDefault("concept", v)}
+              options={CONCEPTS}
+              className="w-44"
+              ariaLabel={t("upload.concept_label") || "Concepto"}
+            />
+          </div>
+        </div>
+      )}
+
+      {/* Font */}
+      <div className="flex items-center gap-2 mb-3">
+        <span className="text-[11px] text-gray-600 shrink-0">{t("upload.font_label") || "Tipografía:"}</span>
+        <Listbox
+          value={batchDefaults.font}
+          onChange={(v) => updateBatchDefault("font", v)}
+          options={FONTS}
+          className="flex-1"
+          ariaLabel={t("upload.font_label") || "Tipografía"}
+        />
+      </div>
+
+      {/* Text case pill buttons: MAY / Aa / min / ori */}
+      <div className="flex items-center gap-2 mb-3">
+        <span className="text-[11px] text-gray-600 shrink-0">{t("upload.text_case_label") || "Texto:"}</span>
+        <div className="flex gap-1">
+          {[
+            { code: "upper",    d: "MAY" },
+            { code: "title",    d: "Aa"  },
+            { code: "lower",    d: "min" },
+            { code: "original", d: "ori" },
+          ].map((opt) => (
+            <button
+              key={opt.code}
+              type="button"
+              onClick={() => updateBatchDefault("textCase", opt.code)}
+              className={`px-2.5 py-1 rounded-md text-[11px] font-mono font-bold transition-all
+                ${batchDefaults.textCase === opt.code
+                  ? "bg-brand/20 text-brand ring-1 ring-brand/40"
+                  : "bg-surface-3/40 text-gray-500 hover:text-gray-300"
+                }`}
+            >{opt.d}</button>
+          ))}
+        </div>
+      </div>
+
+      {/* Font scale — 5 A's in increasing sizes */}
+      <div className="flex items-center gap-2 mb-3">
+        <span className="text-[11px] text-gray-600 shrink-0">{t("upload.font_scale_label") || "Tamaño:"}</span>
+        <div className="flex items-end gap-1">
+          {[
+            { code: "0.75", cls: "text-[9px]"  },
+            { code: "0.9",  cls: "text-[11px]" },
+            { code: "1.0",  cls: "text-[13px]" },
+            { code: "1.15", cls: "text-[16px]" },
+            { code: "1.3",  cls: "text-[19px]" },
+          ].map((opt) => (
+            <button
+              key={opt.code}
+              type="button"
+              onClick={() => updateBatchDefault("fontScale", opt.code)}
+              className={`w-7 h-7 flex items-center justify-center rounded-md font-bold transition-all ${opt.cls}
+                ${batchDefaults.fontScale === opt.code
+                  ? "bg-brand/20 text-brand ring-1 ring-brand/40"
+                  : "bg-surface-3/40 text-gray-500 hover:text-gray-300"
+                }`}
+            >A</button>
+          ))}
+        </div>
+      </div>
+
+      {/* Lyric transition icon buttons */}
+      <div className="flex items-center gap-2 mb-3">
+        <span className="text-[11px] text-gray-600 shrink-0">{t("upload.transition_label") || "Transición:"}</span>
+        <div className="flex gap-1">
+          {[
+            { code: "cut",       icon: "│",   label: t("upload.transition_cut")  || "Corte" },
+            { code: "fade",      icon: "⟿",  label: t("upload.transition_fade") || "Fade"  },
+            { code: "fade_slow", icon: "⟿⟿", label: t("upload.transition_slow") || "Lento" },
+          ].map((opt) => (
+            <button
+              key={opt.code}
+              type="button"
+              title={opt.label}
+              onClick={() => updateBatchDefault("lyricTransition", opt.code)}
+              className={`px-2.5 py-1 rounded-md text-[13px] transition-all
+                ${batchDefaults.lyricTransition === opt.code
+                  ? "bg-brand/20 text-brand ring-1 ring-brand/40"
+                  : "bg-surface-3/40 text-gray-500 hover:text-gray-300"
+                }`}
+            >{opt.icon}</button>
+          ))}
+        </div>
+      </div>
+
+      {/* Text motion icon buttons */}
+      <div className="flex items-center gap-2">
+        <span className="text-[11px] text-gray-600 shrink-0">{t("upload.motion_label") || "Movimiento del texto:"}</span>
+        <div className="flex gap-1">
+          {[
+            { code: "none",   icon: "·", label: t("upload.motion_none")   || "Estático" },
+            { code: "subtle", icon: "↕", label: t("upload.motion_subtle") || "Sutil"    },
+            { code: "float",  icon: "∿", label: t("upload.motion_float")  || "Flotante" },
+          ].map((opt) => (
+            <button
+              key={opt.code}
+              type="button"
+              title={opt.label}
+              onClick={() => updateBatchDefault("textMotion", opt.code)}
+              className={`px-2.5 py-1 rounded-md text-[13px] transition-all
+                ${batchDefaults.textMotion === opt.code
+                  ? "bg-brand/20 text-brand ring-1 ring-brand/40"
+                  : "bg-surface-3/40 text-gray-500 hover:text-gray-300"
+                }`}
+            >{opt.icon}</button>
+          ))}
+        </div>
+      </div>
+    </div>
+  ) : null;
+
+  const _filesBlock = files.length > 0 ? (
+    <div className="mt-3 space-y-2 max-h-[36rem] overflow-y-auto pr-1">
+      {files.map((entry, i) => {
+        const isPersonalizing = expandedPersonalize.has(i);
+        const bd = batchDefaults;
+        const hasDiff =
+          (entry.genre        || "") !== (bd.genre        || "") ||
+          (entry.concept      || "") !== (bd.concept      || "") ||
+          (entry.movementStyle || "") !== (bd.movementStyle || "") ||
+          (entry.font         || "") !== (bd.font         || "") ||
+          (entry.textCase     || "upper") !== (bd.textCase     || "upper") ||
+          (entry.fontScale    || "1.0")   !== (bd.fontScale    || "1.0")   ||
+          (entry.lyricTransition || "cut") !== (bd.lyricTransition || "cut") ||
+          (entry.textMotion   || "none")  !== (bd.textMotion   || "none");
+
+        return (
+          <div key={i} className="glass rounded-card px-4 py-3" {...(i === 0 ? { "data-tour": "upload-row" } : {})}>
+            {/* Header */}
+            <div className="flex items-center gap-3 mb-2">
+              <div className="w-8 h-8 rounded-lg bg-brand/10 flex items-center justify-center shrink-0">
+                <svg className="w-4 h-4 text-brand" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24" strokeLinecap="round" strokeLinejoin="round">
+                  <path d="M9 18V5l12-2v13" /><circle cx="6" cy="18" r="3" /><circle cx="18" cy="16" r="3" />
+                </svg>
+              </div>
+              <div className="flex-1 min-w-0">
+                <p className="text-sm text-white truncate">{entry.file.name}</p>
+                {entry.file.name.toLowerCase().endsWith(".wav") &&
+                 entry.file.size > WAV_SOFT_WARN_MB * 1024 * 1024 && (
+                  <p className="text-[11px] text-amber-400/80 mt-0.5 truncate">
+                    {t("batch.wav_warning_large", { sizeMB: Math.round(entry.file.size / (1024 * 1024)) })}
+                  </p>
+                )}
+              </div>
+              <button
+                onClick={(e) => removeFile(i, e)}
+                className="shrink-0 w-7 h-7 rounded-lg hover:bg-red-500/10 flex items-center justify-center text-gray-500 hover:text-red-400 transition-colors"
+              >
+                <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
+                  <path d="M18 6L6 18M6 6l12 12" />
+                </svg>
+              </button>
+            </div>
+
+            {/* Core fields */}
+            <div className="space-y-2">
+              <input
+                type="text"
+                value={entry.artist}
+                onChange={(e) => updateField(i, "artist", e.target.value)}
+                placeholder={t("upload.artist") + " *"}
+                required
+                className={`w-full px-3 py-1.5 rounded-lg bg-surface-1 border
+                  focus:outline-none text-sm text-white placeholder-gray-500 transition-all
+                  ${entry.artist.trim() ? "border-white/[0.06] focus:border-brand/50" : "border-amber-500/40 focus:border-amber-400"}`}
+              />
+              {!entry.artist.trim() && (
+                <p className="text-[11px] text-amber-400/80">
+                  {t("upload.artist_required") || "Nombre del artista es requerido"}
+                </p>
+              )}
+              <input
+                type="text"
+                value={entry.songTitle || ""}
+                onChange={(e) => updateField(i, "songTitle", e.target.value)}
+                placeholder={t("upload.song_title") || "Nombre de la canción"}
+                className="w-full px-3 py-1.5 rounded-lg bg-surface-1 border border-white/[0.06]
+                  focus:border-brand/50 focus:outline-none text-sm text-white placeholder-gray-500 transition-all"
+              />
+              {!(entry.songTitle || "").trim() && (
+                <p className="text-[11px] text-gray-600">
+                  {t("upload.song_title_hint") || "Si lo dejás vacío, lo inferimos del nombre del archivo"}
+                </p>
+              )}
+              {/* Language pills */}
+              <div className="flex items-center gap-1.5">
+                <span className="text-[11px] text-gray-600 mr-1">{t("lang.auto")}</span>
+                {LANGUAGES.filter((l) => l.code).map((l) => (
+                  <button
+                    key={l.code}
+                    type="button"
+                    onClick={() => updateField(i, "language", entry.language === l.code ? "" : l.code)}
+                    className={`text-[11px] font-bold px-2 py-1 rounded-md transition-all uppercase
+                      ${entry.language === l.code
+                        ? "bg-brand/20 text-brand"
+                        : "text-gray-600 hover:text-gray-400 hover:bg-white/[0.03]"
+                      }`}
+                  >{l.code}</button>
+                ))}
+              </div>
+
+              {/* Personalizar toggle */}
+              <button
+                type="button"
+                onClick={() => togglePersonalize(i)}
+                className="mt-1 flex items-center gap-1.5 text-[11px] text-gray-500 hover:text-gray-300 transition-colors"
+              >
+                <span>
+                  {isPersonalizing
+                    ? (t("upload.fewer_options") || "Cerrar")
+                    : (t("upload.personalize_track") || "Personalizar")}
+                </span>
+                <svg
+                  className={`w-3 h-3 transition-transform ${isPersonalizing ? "rotate-180" : ""}`}
+                  fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24"
+                >
+                  <polyline points="6 9 12 15 18 9" />
+                </svg>
+                {hasDiff && !isPersonalizing && (
+                  <span
+                    className="w-1.5 h-1.5 rounded-full bg-brand"
+                    title={t("upload.track_overrides_active") || "Tiene ajustes propios"}
+                  />
+                )}
+              </button>
+
+              {/* Per-track override drawer */}
+              {isPersonalizing && (
+                <div className="mt-2 pt-2 border-t border-white/[0.06] space-y-2">
+                  <p className="text-[10px] text-gray-600 uppercase tracking-[0.14em]">
+                    {t("upload.personalize_track") || "Personalizar esta canción"}
+                  </p>
+                  {bgMode === "auto" && (
+                    <>
+                      <div className="flex items-center gap-2">
+                        <span className="text-[11px] text-gray-600 shrink-0">{t("upload.genre_label") || "Género:"}</span>
+                        <Listbox value={entry.genre || ""} onChange={(v) => updateField(i, "genre", v)} options={GENRES} className="flex-1" ariaLabel={t("upload.genre_label")} />
+                      </div>
+                      <div className="flex items-center gap-2">
+                        <span className="text-[11px] text-gray-600 shrink-0">{t("upload.concept_label") || "Concepto:"}</span>
+                        <Listbox value={entry.concept || ""} onChange={(v) => updateField(i, "concept", v)} options={CONCEPTS} className="flex-1" ariaLabel={t("upload.concept_label")} />
+                      </div>
+                      <div className="flex items-center gap-2">
+                        <span className="text-[11px] text-gray-600 shrink-0">{t("upload.movement_label") || "Movimiento:"}</span>
+                        <Listbox value={entry.movementStyle || ""} onChange={(v) => updateField(i, "movementStyle", v)} options={MOVEMENT_STYLES} className="flex-1" ariaLabel={t("upload.movement_label")} />
+                      </div>
+                    </>
+                  )}
+                  <div className="flex items-center gap-2">
+                    <span className="text-[11px] text-gray-600 shrink-0">{t("upload.font_label") || "Tipografía:"}</span>
+                    <Listbox value={entry.font || ""} onChange={(v) => updateField(i, "font", v)} options={FONTS} className="flex-1" ariaLabel={t("upload.font_label")} />
+                  </div>
+                  {/* Text case pills */}
+                  <div className="flex items-center gap-2">
+                    <span className="text-[11px] text-gray-600 shrink-0">{t("upload.text_case_label") || "Texto:"}</span>
+                    <div className="flex gap-1">
+                      {[
+                        { code: "upper", d: "MAY" }, { code: "title", d: "Aa" },
+                        { code: "lower", d: "min" }, { code: "original", d: "ori" },
+                      ].map((opt) => (
+                        <button key={opt.code} type="button"
+                          onClick={() => updateField(i, "textCase", opt.code)}
+                          className={`px-2.5 py-1 rounded-md text-[11px] font-mono font-bold transition-all
+                            ${(entry.textCase || "upper") === opt.code
+                              ? "bg-brand/20 text-brand ring-1 ring-brand/40"
+                              : "bg-surface-3/40 text-gray-500 hover:text-gray-300"
+                            }`}
+                        >{opt.d}</button>
+                      ))}
+                    </div>
+                  </div>
+                  {/* Font scale */}
+                  <div className="flex items-center gap-2">
+                    <span className="text-[11px] text-gray-600 shrink-0">{t("upload.font_scale_label") || "Tamaño:"}</span>
+                    <div className="flex items-end gap-1">
+                      {[
+                        { code: "0.75", cls: "text-[9px]"  }, { code: "0.9",  cls: "text-[11px]" },
+                        { code: "1.0",  cls: "text-[13px]" }, { code: "1.15", cls: "text-[16px]" },
+                        { code: "1.3",  cls: "text-[19px]" },
+                      ].map((opt) => (
+                        <button key={opt.code} type="button"
+                          onClick={() => updateField(i, "fontScale", opt.code)}
+                          className={`w-7 h-7 flex items-center justify-center rounded-md font-bold transition-all ${opt.cls}
+                            ${(entry.fontScale || "1.0") === opt.code
+                              ? "bg-brand/20 text-brand ring-1 ring-brand/40"
+                              : "bg-surface-3/40 text-gray-500 hover:text-gray-300"
+                            }`}
+                        >A</button>
+                      ))}
+                    </div>
+                  </div>
+                  {/* Transition */}
+                  <div className="flex items-center gap-2">
+                    <span className="text-[11px] text-gray-600 shrink-0">{t("upload.transition_label") || "Transición:"}</span>
+                    <div className="flex gap-1">
+                      {[
+                        { code: "cut",       icon: "│",   label: t("upload.transition_cut")  || "Corte" },
+                        { code: "fade",      icon: "⟿",  label: t("upload.transition_fade") || "Fade"  },
+                        { code: "fade_slow", icon: "⟿⟿", label: t("upload.transition_slow") || "Lento" },
+                      ].map((opt) => (
+                        <button key={opt.code} type="button" title={opt.label}
+                          onClick={() => updateField(i, "lyricTransition", opt.code)}
+                          className={`px-2.5 py-1 rounded-md text-[13px] transition-all
+                            ${(entry.lyricTransition || "cut") === opt.code
+                              ? "bg-brand/20 text-brand ring-1 ring-brand/40"
+                              : "bg-surface-3/40 text-gray-500 hover:text-gray-300"
+                            }`}
+                        >{opt.icon}</button>
+                      ))}
+                    </div>
+                  </div>
+                  {/* Text motion */}
+                  <div className="flex items-center gap-2">
+                    <span className="text-[11px] text-gray-600 shrink-0">{t("upload.motion_label") || "Movimiento del texto:"}</span>
+                    <div className="flex gap-1">
+                      {[
+                        { code: "none",   icon: "·", label: t("upload.motion_none")   || "Estático" },
+                        { code: "subtle", icon: "↕", label: t("upload.motion_subtle") || "Sutil"    },
+                        { code: "float",  icon: "∿", label: t("upload.motion_float")  || "Flotante" },
+                      ].map((opt) => (
+                        <button key={opt.code} type="button" title={opt.label}
+                          onClick={() => updateField(i, "textMotion", opt.code)}
+                          className={`px-2.5 py-1 rounded-md text-[13px] transition-all
+                            ${(entry.textMotion || "none") === opt.code
+                              ? "bg-brand/20 text-brand ring-1 ring-brand/40"
+                              : "bg-surface-3/40 text-gray-500 hover:text-gray-300"
+                            }`}
+                        >{opt.icon}</button>
+                      ))}
+                    </div>
+                  </div>
+                  {bgMode !== "auto" && (
+                    <p className="text-[11px] text-ink-secondary pt-1">
+                      {t("upload.fields_baked_into_bg") || "Concepto y movimiento están horneados en el fondo elegido."}
                     </p>
                   )}
                 </div>
-                <button
-                  onClick={(e) => removeFile(i, e)}
-                  className="shrink-0 w-7 h-7 rounded-lg hover:bg-red-500/10 flex items-center justify-center text-gray-500 hover:text-red-400 transition-colors"
-                >
-                  <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
-                    <path d="M18 6L6 18M6 6l12 12" />
-                  </svg>
-                </button>
-              </div>
-              <div className="space-y-2">
-                <input
-                  type="text"
-                  value={entry.artist}
-                  onChange={(e) => updateField(i, "artist", e.target.value)}
-                  placeholder={t("upload.artist") + " *"}
-                  required
-                  className={`w-full px-3 py-1.5 rounded-lg bg-surface-1 border
-                    focus:outline-none text-sm text-white placeholder-gray-500 transition-all
-                    ${entry.artist.trim() ? "border-white/[0.06] focus:border-brand/50" : "border-amber-500/40 focus:border-amber-400"}`}
-                />
-                {!entry.artist.trim() && (
-                  <p className="text-[11px] text-amber-400/80">
-                    {t("upload.artist_required") || "Nombre del artista es requerido"}
-                  </p>
-                )}
-                <input
-                  type="text"
-                  value={entry.songTitle || ""}
-                  onChange={(e) => updateField(i, "songTitle", e.target.value)}
-                  placeholder={t("upload.song_title") || "Nombre de la canción"}
-                  className="w-full px-3 py-1.5 rounded-lg bg-surface-1 border border-white/[0.06]
-                    focus:border-brand/50 focus:outline-none text-sm text-white placeholder-gray-500 transition-all"
-                />
-                {!(entry.songTitle || "").trim() && (
-                  <p className="text-[11px] text-gray-600">
-                    {t("upload.song_title_hint") || "Si lo dejás vacío, lo inferimos del nombre del archivo"}
-                  </p>
-                )}
-                <div className="flex items-center gap-1.5">
-                  <span className="text-[11px] text-gray-600 mr-1">{t("lang.auto")}</span>
-                  {LANGUAGES.filter(l => l.code).map((l) => (
-                    <button
-                      key={l.code}
-                      type="button"
-                      onClick={() => updateField(i, "language", entry.language === l.code ? "" : l.code)}
-                      className={`text-[11px] font-bold px-2 py-1 rounded-md transition-all uppercase
-                        ${entry.language === l.code
-                          ? "bg-brand/20 text-brand"
-                          : "text-gray-600 hover:text-gray-400 hover:bg-white/[0.03]"
-                        }`}
-                    >
-                      {l.code}
-                    </button>
-                  ))}
-                </div>
-                {/* Genre is only visible in Auto mode — it ONLY feeds
-                    the AI background prompt. When the operator picked a
-                    library / custom background, the worker ignores it. */}
-                {bgMode === "auto" && (
-                  <div className="flex items-center gap-2 pt-1">
-                    <span className="text-[11px] text-gray-600 shrink-0">
-                      {t("upload.genre_label") || "Género:"}
-                    </span>
-                    <Listbox
-                      value={entry.genre || ""}
-                      onChange={(v) => updateField(i, "genre", v)}
-                      options={GENRES}
-                      className="flex-1"
-                      ariaLabel={t("upload.genre_label") || "Género"}
-                    />
-                  </div>
-                )}
-                {/* Secondary controls collapse-toggle. Visible options
-                    inside depend on bgMode:
-                      - auto:           concept · movement · font
-                      - library/custom: font only (concept/movement
-                                        are baked into the asset)
-                    The toggle shows a brand dot when a non-Auto value
-                    survives a collapse, so the operator knows their
-                    picks haven't been lost. */}
-                {(() => {
-                  const isExpanded = expandedRows.has(i);
-                  const hasFontCustom = !!entry.font;
-                  const hasAutoCustom = !!(entry.concept || entry.movementStyle);
-                  const hasCustom =
-                    bgMode === "auto" ? (hasFontCustom || hasAutoCustom) : hasFontCustom;
-                  return (
-                    <button
-                      type="button"
-                      onClick={() => toggleExpanded(i)}
-                      className="mt-1 flex items-center gap-1.5 text-[11px] text-gray-500 hover:text-gray-300 transition-colors"
-                    >
-                      <span>
-                        {isExpanded
-                          ? (t("upload.fewer_options") || "Menos opciones")
-                          : (t("upload.more_options") || "Más opciones")}
-                      </span>
-                      <svg
-                        className={`w-3 h-3 transition-transform ${isExpanded ? "rotate-180" : ""}`}
-                        fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24"
-                      >
-                        <polyline points="6 9 12 15 18 9" />
-                      </svg>
-                      {hasCustom && !isExpanded && (
-                        <span className="w-1.5 h-1.5 rounded-full bg-brand"
-                              title={t("upload.options_customized") || "Hay opciones personalizadas"} />
-                      )}
-                    </button>
-                  );
-                })()}
-                {expandedRows.has(i) && (
-                  <>
-                    {bgMode === "auto" && (
-                      <>
-                        <div className="flex items-center gap-2 pt-1">
-                          <span className="text-[11px] text-gray-600 shrink-0">
-                            {t("upload.concept_label") || "Concepto:"}
-                          </span>
-                          <Listbox
-                            value={entry.concept || ""}
-                            onChange={(v) => updateField(i, "concept", v)}
-                            options={CONCEPTS}
-                            className="flex-1"
-                            ariaLabel={t("upload.concept_label") || "Concepto"}
-                          />
-                        </div>
-                        <div className="flex items-center gap-2 pt-1">
-                          <span className="text-[11px] text-gray-600 shrink-0">
-                            {t("upload.movement_label") || "Movimiento:"}
-                          </span>
-                          <Listbox
-                            value={entry.movementStyle || ""}
-                            onChange={(v) => updateField(i, "movementStyle", v)}
-                            options={MOVEMENT_STYLES}
-                            className="flex-1"
-                            ariaLabel={t("upload.movement_label") || "Movimiento"}
-                          />
-                        </div>
-                      </>
-                    )}
-                    <div className="flex items-center gap-2 pt-1">
-                      <span className="text-[11px] text-gray-600 shrink-0">
-                        {t("upload.font_label") || "Tipografía:"}
-                      </span>
-                      <Listbox
-                        value={entry.font || ""}
-                        onChange={(v) => updateField(i, "font", v)}
-                        options={FONTS}
-                        className="flex-1"
-                        ariaLabel={t("upload.font_label") || "Tipografía"}
-                      />
-                    </div>
-                    {/* ── Text style controls ── */}
-                    <div className="flex items-center gap-2 pt-1">
-                      <span className="text-[11px] text-gray-600 shrink-0">
-                        {t("upload.text_case_label") || "Estilo texto:"}
-                      </span>
-                      <Listbox
-                        value={entry.textCase || "upper"}
-                        onChange={(v) => updateField(i, "textCase", v)}
-                        options={[
-                          { code: "upper",    label: t("upload.case_upper")    || "MAYÚSCULAS" },
-                          { code: "title",    label: t("upload.case_title")    || "Título" },
-                          { code: "lower",    label: t("upload.case_lower")    || "minúsculas" },
-                          { code: "original", label: t("upload.case_original") || "Original" },
-                        ]}
-                        className="flex-1"
-                        ariaLabel={t("upload.text_case_label") || "Estilo texto"}
-                      />
-                    </div>
-                    <div className="flex items-center gap-2 pt-1">
-                      <span className="text-[11px] text-gray-600 shrink-0">
-                        {t("upload.font_scale_label") || "Tamaño lyrics:"}
-                      </span>
-                      <Listbox
-                        value={entry.fontScale || "1.0"}
-                        onChange={(v) => updateField(i, "fontScale", v)}
-                        options={[
-                          { code: "0.75", label: t("upload.scale_xs") || "Chico" },
-                          { code: "0.9",  label: t("upload.scale_sm") || "Pequeño" },
-                          { code: "1.0",  label: t("upload.scale_md") || "Normal" },
-                          { code: "1.15", label: t("upload.scale_lg") || "Grande" },
-                          { code: "1.3",  label: t("upload.scale_xl") || "Muy grande" },
-                        ]}
-                        className="flex-1"
-                        ariaLabel={t("upload.font_scale_label") || "Tamaño lyrics"}
-                      />
-                    </div>
-                    <div className="flex items-center gap-2 pt-1">
-                      <span className="text-[11px] text-gray-600 shrink-0">
-                        {t("upload.transition_label") || "Transición:"}
-                      </span>
-                      <Listbox
-                        value={entry.lyricTransition || "cut"}
-                        onChange={(v) => updateField(i, "lyricTransition", v)}
-                        options={[
-                          { code: "cut",       label: t("upload.transition_cut")  || "Corte directo" },
-                          { code: "fade",      label: t("upload.transition_fade") || "Fade suave" },
-                          { code: "fade_slow", label: t("upload.transition_slow") || "Fade lento" },
-                        ]}
-                        className="flex-1"
-                        ariaLabel={t("upload.transition_label") || "Transición"}
-                      />
-                    </div>
-                    <div className="flex items-center gap-2 pt-1">
-                      <span className="text-[11px] text-gray-600 shrink-0">
-                        {t("upload.motion_label") || "Movimiento texto:"}
-                      </span>
-                      <Listbox
-                        value={entry.textMotion || "none"}
-                        onChange={(v) => updateField(i, "textMotion", v)}
-                        options={[
-                          { code: "none",   label: t("upload.motion_none")   || "Estático" },
-                          { code: "subtle", label: t("upload.motion_subtle") || "Sutil" },
-                          { code: "float",  label: t("upload.motion_float")  || "Flotante" },
-                        ]}
-                        className="flex-1"
-                        ariaLabel={t("upload.motion_label") || "Movimiento texto"}
-                      />
-                    </div>
-                    {bgMode !== "auto" && (
-                      <p className="text-[11px] text-ink-secondary pt-1">
-                        {t("upload.fields_baked_into_bg")
-                          || "Concepto y movimiento están horneados en el fondo elegido."}
-                      </p>
-                    )}
-                  </>
-                )}
-              </div>
+              )}
             </div>
-          ))}
-        </div>
-      )}
-    </>
-  );
+          </div>
+        );
+      })}
+    </div>
+  ) : null;
 
   const _bgBlock = (
     <>
@@ -1187,6 +1305,7 @@ export default function UploadZone({
       <div className="space-y-4">
         {_dropZone}
         {_filesBlock}
+        {_batchSettingsBlock}
         {_bgBlock}
         {/* Visual style selector — batch-wide. Maps to pipeline.py's
             _GRADIENT_PALETTES (oscuro / neon / minimal). Shown only once
@@ -1194,7 +1313,7 @@ export default function UploadZone({
         {files.length > 0 && onStyleChange && (
           <div className="rounded-card bg-surface-2/40 ring-1 ring-white/[0.04] px-4 py-3">
             <p className="text-[10px] uppercase tracking-[0.18em] text-gray-500">
-              Estilo visual
+              {t("upload.style_label")}
             </p>
             <p className="text-[10px] text-gray-500 mb-2 mt-0.5">
               {t("upload.style_desc") || "Paleta de colores del fondo generado por IA"}
@@ -1219,8 +1338,8 @@ export default function UploadZone({
                     style={{ background: s.swatch }}
                   />
                   <span className="leading-tight text-center">
-                    <span className="block font-semibold">{s.label}</span>
-                    <span className="block text-[10px] text-gray-500">{s.sub}</span>
+                    <span className="block font-semibold">{t(s.labelKey)}</span>
+                    <span className="block text-[10px] text-gray-500">{t(s.subKey)}</span>
                   </span>
                 </button>
               ))}
