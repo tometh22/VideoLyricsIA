@@ -229,7 +229,8 @@ def run_pipeline(job_id: str, mp3_path: str, artist: str, style: str,
                  text_case: str = "upper",
                  font_scale: float = 1.0,
                  lyric_transition: str = "cut",
-                 text_motion: str = "none"):
+                 text_motion: str = "none",
+                 text_contrast: str = "medium"):
     """Run the full pipeline for a job. Called synchronously.
 
     delivery_profile:
@@ -485,6 +486,7 @@ def run_pipeline(job_id: str, mp3_path: str, artist: str, style: str,
                 font_scale=font_scale,
                 lyric_transition=lyric_transition,
                 text_motion=text_motion,
+                text_contrast=text_contrast,
             )
             files["video_url"] = f"/download/{job_id}/video"
             update_job(job_id, progress=55)
@@ -4094,6 +4096,13 @@ def _text_position_func(spec, motion: str, seg_duration: float,
     return pos
 
 
+_CONTRAST_SETTINGS = {
+    "subtle": {"stroke_mult": 1.5, "shadow_opacity": 0.40, "extra_shadow": False},
+    "medium": {"stroke_mult": 2.5, "shadow_opacity": 0.55, "extra_shadow": False},
+    "strong": {"stroke_mult": 3.5, "shadow_opacity": 0.65, "extra_shadow": True},
+}
+
+
 def _make_text_clip(
     text: str,
     seg_start: float,
@@ -4104,8 +4113,9 @@ def _make_text_clip(
     font_scale: float = 1.0,
     lyric_transition: str = "cut",
     text_motion: str = "none",
+    text_contrast: str = "medium",
 ):
-    """Create a clean text clip matching pro lyric video style (bold white, subtle shadow)."""
+    """Create a clean text clip matching pro lyric video style (bold white, outline + shadow)."""
     import unicodedata
     if spec is None:
         spec = RenderSpec.youtube_default()
@@ -4137,7 +4147,8 @@ def _make_text_clip(
 
     shadow_offset = max(1, int(round(3 * scale)))
     fallback_font = os.path.join(_FONTS_DIR, "Montserrat-Bold.ttf")
-    stroke_width = max(1.0, 1.5 * scale)
+    contrast = _CONTRAST_SETTINGS.get(text_contrast, _CONTRAST_SETTINGS["medium"])
+    stroke_width = max(1.0, contrast["stroke_mult"] * scale)
 
     seg_duration = max(0.1, seg_end - seg_start)
 
@@ -4154,7 +4165,7 @@ def _make_text_clip(
             return TextClip(txt, fontsize=fsize, font=fallback_font, color=color,
                             method="caption", size=(text_width, None), align="center", **kwargs)
 
-    shadow = _try_text_clip(display_text, fontsize, font, "black").set_opacity(0.4)
+    shadow = _try_text_clip(display_text, fontsize, font, "black").set_opacity(contrast["shadow_opacity"])
     sh = shadow.size[1]
     # Centered top-left coordinates for a clip of size (text_width, sh)
     base_x = (spec.width - text_width) // 2
@@ -4167,6 +4178,25 @@ def _make_text_clip(
     else:
         shadow = shadow.set_position((base_x + shadow_offset, base_y + shadow_offset))
     shadow = shadow.set_start(seg_start).set_end(seg_end)
+
+    layers = []
+
+    # "strong" mode: add a counter-shadow at the opposite offset to widen the halo
+    if contrast["extra_shadow"]:
+        shadow2 = _try_text_clip(display_text, fontsize, font, "black").set_opacity(contrast["shadow_opacity"] * 0.5)
+        shadow2_pos = _text_position_func(spec, text_motion, seg_duration,
+                                          clip_x=base_x, clip_y=base_y,
+                                          shadow_offset=-shadow_offset)
+        if callable(shadow2_pos):
+            shadow2 = shadow2.set_position(lambda t, _p=shadow2_pos: _p(t))
+        else:
+            shadow2 = shadow2.set_position((base_x - shadow_offset, base_y - shadow_offset))
+        shadow2 = shadow2.set_start(seg_start).set_end(seg_end)
+        if fade_dur > 0:
+            shadow2 = shadow2.crossfadein(fade_dur).crossfadeout(fade_dur)
+        layers.append(shadow2)
+
+    layers.append(shadow)
 
     txt_pos = _text_position_func(spec, text_motion, seg_duration,
                                   clip_x=base_x, clip_y=base_y,
@@ -4183,7 +4213,8 @@ def _make_text_clip(
         shadow = shadow.crossfadein(fade_dur).crossfadeout(fade_dur)
         txt = txt.crossfadein(fade_dur).crossfadeout(fade_dur)
 
-    return [shadow, txt]
+    layers.append(txt)
+    return layers
 
 
 _UMG_PROFILE_NAMES = {
@@ -4553,6 +4584,7 @@ def generate_lyric_video(
     font_scale: float = 1.0,
     lyric_transition: str = "cut",
     text_motion: str = "none",
+    text_contrast: str = "medium",
 ) -> tuple[str, str, str | None]:
     """Generate a lyric video. Returns (video_path, font, bg_source).
 
@@ -4778,6 +4810,7 @@ def generate_lyric_video(
             seg["text"], seg["start"], seg["end"], font, spec=spec,
             text_case=text_case, font_scale=font_scale,
             lyric_transition=lyric_transition, text_motion=text_motion,
+            text_contrast=text_contrast,
         )
         text_layers.extend(layers)
 
