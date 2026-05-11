@@ -12,8 +12,8 @@ in-process — no RQ, no FastAPI app, no real time.
 import uuid
 from datetime import datetime, timedelta, timezone
 
-from database import Job, SessionLocal
-from reaper import find_stuck_jobs, reap_all_stuck
+from database import AIProvenance, Job, SessionLocal
+from reaper import find_orphan_polling_jobs, find_stuck_jobs, reap_all_stuck
 
 
 def _seed(db, *, status: str, age_minutes: float, job_id: str | None = None):
@@ -35,7 +35,36 @@ def _seed(db, *, status: str, age_minutes: float, job_id: str | None = None):
     return jid
 
 
+def _seed_provenance(
+    db,
+    *,
+    job_id: str,
+    age_minutes: float,
+    duration_ms: int | None,
+    step: str = "video_bg",
+    tool_name: str = "veo-3.1-fast-generate-001",
+):
+    """Insert an ai_provenance row at a synthetic age. duration_ms=None
+    simulates an in-flight call (call started, never returned)."""
+    db.add(AIProvenance(
+        job_id=job_id,
+        step=step,
+        tool_name=tool_name,
+        tool_provider="google_vertex",
+        prompt_sent="(synthetic test prompt)",
+        duration_ms=duration_ms,
+        created_at=datetime.now(timezone.utc) - timedelta(minutes=age_minutes),
+    ))
+    db.commit()
+
+
 def _cleanup(db):
+    job_ids = [j.job_id for j in db.query(Job).filter(
+        Job.tenant_id == "tenant_reap_test").all()]
+    if job_ids:
+        db.query(AIProvenance).filter(AIProvenance.job_id.in_(job_ids)).delete(
+            synchronize_session=False,
+        )
     db.query(Job).filter(Job.tenant_id == "tenant_reap_test").delete()
     db.commit()
 
@@ -93,6 +122,133 @@ def test_terminal_jobs_are_never_touched():
         assert done_id not in stuck_ids
         assert review_id not in stuck_ids
         assert err_id not in stuck_ids
+    finally:
+        _cleanup(db)
+        db.close()
+
+
+def test_orphan_in_flight_veo_is_flagged_fast():
+    """The actual deploy-death signature: a young job (25 min old, well
+    under the 100-min global threshold) whose Veo provenance row is
+    stale (15 min, never got duration_ms filled in). Must be flagged by
+    the orphan sweep so the user sees an error inside one coffee break
+    instead of two hours."""
+    db = SessionLocal()
+    try:
+        _cleanup(db)
+        jid = _seed(db, status="processing", age_minutes=25)
+        _seed_provenance(db, job_id=jid, age_minutes=15, duration_ms=None)
+        orphans = find_orphan_polling_jobs(db, threshold_min=10)
+        assert any(j.job_id == jid for j in orphans), (
+            "orphan sweep must catch a young job with a stale in-flight "
+            "provenance row"
+        )
+    finally:
+        _cleanup(db)
+        db.close()
+
+
+def test_healthy_in_flight_veo_is_left_alone():
+    """A Veo call that started 2 min ago is healthy — Veo p99 is ~2 min.
+    Must NOT be reaped just because duration_ms is still NULL."""
+    db = SessionLocal()
+    try:
+        _cleanup(db)
+        jid = _seed(db, status="processing", age_minutes=3)
+        _seed_provenance(db, job_id=jid, age_minutes=2, duration_ms=None)
+        orphans = find_orphan_polling_jobs(db, threshold_min=10)
+        assert all(j.job_id != jid for j in orphans), (
+            "a 2-min-old in-flight call is healthy, not orphaned"
+        )
+    finally:
+        _cleanup(db)
+        db.close()
+
+
+def test_completed_veo_call_is_never_orphan():
+    """An old provenance row with duration_ms FILLED means the call
+    succeeded — even if the row itself is 99 min old. Only NULL means
+    in-flight."""
+    db = SessionLocal()
+    try:
+        _cleanup(db)
+        jid = _seed(db, status="processing", age_minutes=99)
+        _seed_provenance(db, job_id=jid, age_minutes=99, duration_ms=87_000)
+        orphans = find_orphan_polling_jobs(db, threshold_min=10)
+        assert all(j.job_id != jid for j in orphans), (
+            "filled duration_ms means the call returned — not an orphan"
+        )
+    finally:
+        _cleanup(db)
+        db.close()
+
+
+def test_orphan_in_terminal_status_is_left_alone():
+    """A job that already moved on to done/error/pending_review is not a
+    zombie even if a stale in-flight provenance row from an earlier
+    crashed call still exists."""
+    db = SessionLocal()
+    try:
+        _cleanup(db)
+        jid = _seed(db, status="done", age_minutes=120)
+        _seed_provenance(db, job_id=jid, age_minutes=110, duration_ms=None)
+        orphans = find_orphan_polling_jobs(db, threshold_min=10)
+        assert all(j.job_id != jid for j in orphans), (
+            "terminal-status jobs are out of scope for the orphan sweep"
+        )
+    finally:
+        _cleanup(db)
+        db.close()
+
+
+def test_reap_all_stuck_reaps_orphans_with_user_facing_message():
+    """End-to-end: orphan sweep flips the row to error with a Spanish
+    operator-friendly message that mentions retry-without-re-upload."""
+    db = SessionLocal()
+    try:
+        _cleanup(db)
+        jid = _seed(db, status="processing", age_minutes=25)
+        _seed_provenance(db, job_id=jid, age_minutes=15, duration_ms=None)
+
+        n = reap_all_stuck(threshold_min=100)
+        assert n >= 1, "reaper should have flagged the orphan"
+
+        row = db.query(Job).filter(Job.job_id == jid).first()
+        db.refresh(row)
+        assert row.status == "error", f"expected 'error', got {row.status!r}"
+        assert row.error and "reintentar" in row.error.lower(), (
+            f"expected retry hint in error message, got {row.error!r}"
+        )
+        assert row.completed_at is not None
+    finally:
+        _cleanup(db)
+        db.close()
+
+
+def test_no_double_reap_when_job_is_both_old_and_orphan():
+    """A job that's BOTH past the global age threshold AND has a stale
+    in-flight row should be reaped exactly once (no duplicate audit log,
+    no duplicate Sentry hit). The age-based sweep wins; orphan sweep
+    skips it."""
+    db = SessionLocal()
+    try:
+        _cleanup(db)
+        jid = _seed(db, status="processing", age_minutes=110)
+        _seed_provenance(db, job_id=jid, age_minutes=100, duration_ms=None)
+
+        n = reap_all_stuck(threshold_min=100)
+        # The exact count depends on other test data; what matters is
+        # that the same row didn't get hit twice in one pass. We assert
+        # the post-state is consistent and the message comes from the
+        # age path ("abandonó"), not the orphan path ("se reinició"),
+        # since stuck is processed first and orphans are filtered.
+        assert n >= 1
+        row = db.query(Job).filter(Job.job_id == jid).first()
+        db.refresh(row)
+        assert row.status == "error"
+        assert "abandonó" in row.error.lower(), (
+            f"expected age-based message for double-hit job, got {row.error!r}"
+        )
     finally:
         _cleanup(db)
         db.close()

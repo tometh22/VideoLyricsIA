@@ -27,6 +27,9 @@ stripe>=8.0.0,<9.0.0
 # --- Queue, observability, storage ---
 redis==5.0.8
 rq==1.16.2
+# Test-only: tests/test_queue_retry.py uses fakeredis to assert RQ
+# retry/failure-callback wiring without a real Redis instance.
+fakeredis==2.26.2
 boto3==1.35.0
 sentry-sdk[fastapi]==2.14.0
 slowapi==0.1.9
