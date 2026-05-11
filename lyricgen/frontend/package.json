@@ -6,6 +6,8 @@
   "scripts": {
     "dev": "vite",
     "check:i18n": "node scripts/check-i18n-keys.mjs",
+    "check:fetch": "node scripts/check-fetch-error-handling.mjs",
+    "check": "npm run check:i18n && npm run check:fetch",
     "build": "npm run check:i18n && vite build",
     "preview": "vite preview"
   },
