@@ -1255,10 +1255,12 @@ export default function LyricsEditor({
                 {lines} {lines === 1 ? "línea" : "líneas"} en el video
               </span>
             </div>
-            <div className="px-4 py-2 flex gap-4 text-[10px] text-gray-600">
+            <div className="px-4 py-2 flex flex-wrap gap-x-4 gap-y-1 text-[10px] text-gray-600">
               <span>Fuente: {font || "Auto"}</span>
               <span>Tamaño: {fontScale}×</span>
-              <span>Caja: {textCase === "upper" ? "MAYÚSCULAS" : textCase === "title" ? "Título" : textCase === "lower" ? "minúsculas" : "Original"}</span>
+              <span className={textCase === "title" ? "text-amber-400 font-medium" : ""}>
+                Caja: {textCase === "upper" ? "MAYÚSCULAS" : textCase === "title" ? "Título (cada palabra capitalizada)" : textCase === "lower" ? "minúsculas" : "Original"}
+              </span>
               <span>Transición: {lyricTransition === "cut" ? "Corte" : lyricTransition === "fade" ? "Fade" : "Fade lento"}</span>
               <span>Movimiento: {textMotion === "none" ? "Estático" : textMotion === "subtle" ? "Sutil" : "Flotante"}</span>
             </div>

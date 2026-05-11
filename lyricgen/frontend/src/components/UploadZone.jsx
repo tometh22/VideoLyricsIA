@@ -22,6 +22,20 @@ function tokenParam() {
 // hit a 429 on the 6th. The backend enforces this server-side regardless.
 const MAX_BATCH_SIZE = 5;
 
+const SAMPLE_LYRIC = "Como el viento que se va";
+function applyTextCase(text, c) {
+  if (c === "upper") return text.toUpperCase();
+  if (c === "title") return text.replace(/\b\w/g, (ch) => ch.toUpperCase());
+  if (c === "lower") return text.toLowerCase();
+  return text;
+}
+const TEXT_CASE_OPTS = [
+  { code: "upper",    d: "MAY", label: "Todo en MAYÚSCULAS" },
+  { code: "title",    d: "Aa",  label: "Primera letra de Cada Palabra" },
+  { code: "lower",    d: "min", label: "todo en minúsculas" },
+  { code: "original", d: "ori", label: "Sin cambios (como está escrito)" },
+];
+
 // Max single-file size. Mirrors backend MAX_UPLOAD_MB default (100, raised
 // from 50 to fit lossless WAV uploads — UMG sends WAV at 16/24-bit PCM,
 // which can land at 30-50 MB for a 3-minute track). We reject client-side
@@ -154,6 +168,9 @@ export default function UploadZone({
     setBatchDefaults((prev) => ({ ...prev, [field]: value }));
     onFiles((prev) => prev.map((f) => ({ ...f, [field]: value })));
   };
+
+  const [hoverCaseBatch, setHoverCaseBatch] = useState(null);
+  const [hoverCaseRow, setHoverCaseRow] = useState(null); // { idx, code }
 
   // Set of track indices with the inline "Personalizar" drawer open.
   const [expandedPersonalize, setExpandedPersonalize] = useState(() => new Set());
@@ -658,27 +675,35 @@ export default function UploadZone({
       </div>
 
       {/* Text case pill buttons: MAY / Aa / min / ori */}
-      <div className="flex items-center gap-2 mb-3">
-        <span className="text-[11px] text-gray-600 shrink-0">{t("upload.text_case_label") || "Texto:"}</span>
-        <div className="flex gap-1">
-          {[
-            { code: "upper",    d: "MAY" },
-            { code: "title",    d: "Aa"  },
-            { code: "lower",    d: "min" },
-            { code: "original", d: "ori" },
-          ].map((opt) => (
-            <button
-              key={opt.code}
-              type="button"
-              onClick={() => updateBatchDefault("textCase", opt.code)}
-              className={`px-2.5 py-1 rounded-md text-[11px] font-mono font-bold transition-all
-                ${batchDefaults.textCase === opt.code
-                  ? "bg-brand/20 text-brand ring-1 ring-brand/40"
-                  : "bg-surface-3/40 text-gray-500 hover:text-gray-300"
-                }`}
-            >{opt.d}</button>
-          ))}
+      <div className="mb-3">
+        <div className="flex items-center gap-2">
+          <span className="text-[11px] text-gray-600 shrink-0">{t("upload.text_case_label") || "Texto:"}</span>
+          <div className="flex gap-1">
+            {TEXT_CASE_OPTS.map((opt) => (
+              <button
+                key={opt.code}
+                type="button"
+                title={opt.label}
+                onClick={() => updateBatchDefault("textCase", opt.code)}
+                onMouseEnter={() => setHoverCaseBatch(opt.code)}
+                onMouseLeave={() => setHoverCaseBatch(null)}
+                className={`px-2.5 py-1 rounded-md text-[11px] font-mono font-bold transition-all
+                  ${batchDefaults.textCase === opt.code
+                    ? "bg-brand/20 text-brand ring-1 ring-brand/40"
+                    : "bg-surface-3/40 text-gray-500 hover:text-gray-300"
+                  }`}
+              >{opt.d}</button>
+            ))}
+          </div>
         </div>
+        {hoverCaseBatch && (
+          <div className="mt-1.5 px-3 py-1.5 rounded-md bg-black/40 ring-1 ring-white/[0.06] flex items-baseline gap-2 animate-fade-in">
+            <span className="text-[11px] font-mono text-white/80 tracking-wide">
+              {applyTextCase(SAMPLE_LYRIC, hoverCaseBatch)}
+            </span>
+            <span className="text-[10px] text-gray-600">← así quedarán tus letras</span>
+          </div>
+        )}
       </div>
 
       {/* Font scale — 5 A's in increasing sizes */}
@@ -898,23 +923,33 @@ export default function UploadZone({
                     <Listbox value={entry.font || ""} onChange={(v) => updateField(i, "font", v)} options={FONTS} className="flex-1" ariaLabel={t("upload.font_label")} />
                   </div>
                   {/* Text case pills */}
-                  <div className="flex items-center gap-2">
-                    <span className="text-[11px] text-gray-600 shrink-0">{t("upload.text_case_label") || "Texto:"}</span>
-                    <div className="flex gap-1">
-                      {[
-                        { code: "upper", d: "MAY" }, { code: "title", d: "Aa" },
-                        { code: "lower", d: "min" }, { code: "original", d: "ori" },
-                      ].map((opt) => (
-                        <button key={opt.code} type="button"
-                          onClick={() => updateField(i, "textCase", opt.code)}
-                          className={`px-2.5 py-1 rounded-md text-[11px] font-mono font-bold transition-all
-                            ${(entry.textCase || "upper") === opt.code
-                              ? "bg-brand/20 text-brand ring-1 ring-brand/40"
-                              : "bg-surface-3/40 text-gray-500 hover:text-gray-300"
-                            }`}
-                        >{opt.d}</button>
-                      ))}
+                  <div>
+                    <div className="flex items-center gap-2">
+                      <span className="text-[11px] text-gray-600 shrink-0">{t("upload.text_case_label") || "Texto:"}</span>
+                      <div className="flex gap-1">
+                        {TEXT_CASE_OPTS.map((opt) => (
+                          <button key={opt.code} type="button"
+                            title={opt.label}
+                            onClick={() => updateField(i, "textCase", opt.code)}
+                            onMouseEnter={() => setHoverCaseRow({ idx: i, code: opt.code })}
+                            onMouseLeave={() => setHoverCaseRow(null)}
+                            className={`px-2.5 py-1 rounded-md text-[11px] font-mono font-bold transition-all
+                              ${(entry.textCase || "upper") === opt.code
+                                ? "bg-brand/20 text-brand ring-1 ring-brand/40"
+                                : "bg-surface-3/40 text-gray-500 hover:text-gray-300"
+                              }`}
+                          >{opt.d}</button>
+                        ))}
+                      </div>
                     </div>
+                    {hoverCaseRow?.idx === i && (
+                      <div className="mt-1.5 px-3 py-1.5 rounded-md bg-black/40 ring-1 ring-white/[0.06] flex items-baseline gap-2 animate-fade-in">
+                        <span className="text-[11px] font-mono text-white/80 tracking-wide">
+                          {applyTextCase(SAMPLE_LYRIC, hoverCaseRow.code)}
+                        </span>
+                        <span className="text-[10px] text-gray-600">← así quedarán tus letras</span>
+                      </div>
+                    )}
                   </div>
                   {/* Font scale */}
                   <div className="flex items-center gap-2">
