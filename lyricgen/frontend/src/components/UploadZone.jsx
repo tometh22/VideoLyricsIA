@@ -771,7 +771,11 @@ export default function UploadZone({
           {[
             { code: "none",   icon: "·", label: t("upload.motion_none")   || "Estático" },
             { code: "subtle", icon: "↕", label: t("upload.motion_subtle") || "Sutil"    },
-            { code: "float",  icon: "∿", label: t("upload.motion_float")  || "Flotante" },
+            // "float" temporarily disabled — see pipeline.py
+            // _text_position_func: per-frame position callable kills
+            // moviepy compositing speed, long songs hit RQ 20-min
+            // timeout. Backend aliases to "subtle". Re-enable when text
+            // layer moves to ffmpeg overlay filters.
           ].map((opt) => (
             <button
               key={opt.code}

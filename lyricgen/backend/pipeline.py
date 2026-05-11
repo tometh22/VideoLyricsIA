@@ -4264,8 +4264,20 @@ def _text_position_func(spec, motion: str, seg_duration: float,
     the clip centered on screen (computed by the caller from actual clip
     dimensions). shadow_offset shifts both axes so the shadow sits just
     behind the main text. Motion values: "none" | "subtle" | "float".
+
+    NOTE: "float" is temporarily aliased to "subtle". The per-frame
+    position callable forces moviepy's CompositeVideoClip to evaluate
+    `pos(t)` for every frame of every text layer, blocking the
+    optimizations that let static positions cache. For songs with 30+
+    lyric lines × 4320 frames (3 min @ 24fps) that's an order of
+    magnitude slower and was hitting the 20-min RQ timeout on prod.
+    Re-enable the distinct "float" amplitude once we move the text
+    layer rendering to ffmpeg overlay filters (where per-frame motion
+    is essentially free).
     """
     import math
+    if motion == "float":
+        motion = "subtle"
     if motion == "none" or not motion:
         if shadow_offset:
             return (clip_x + shadow_offset, clip_y + shadow_offset)

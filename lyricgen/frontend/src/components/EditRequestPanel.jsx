@@ -1,4 +1,4 @@
-import { useRef, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { useI18n } from "../i18n";
 
 const API = import.meta.env.VITE_API_URL || "";
@@ -47,7 +47,11 @@ const TRANSITION_OPTS = [
 const MOTION_OPTS = [
   { code: "none",   label: "Estático" },
   { code: "subtle", label: "Movimiento sutil" },
-  { code: "float",  label: "Flotante" },
+  // "float" temporarily hidden — per-frame position callable in moviepy
+  // (pipeline.py:_text_position_func) blocks compositing optimizations,
+  // making long songs hit the 20-min RQ timeout. Backend aliases any
+  // float requests to "subtle" for safety. Will re-enable once we
+  // refactor the text layer to ffmpeg overlay filters.
 ];
 
 const SCALE_STEPS = [0.8, 1.0, 1.2, 1.5, 1.8, 2.0];
@@ -75,6 +79,16 @@ export default function EditRequestPanel({ job, onEditTriggered }) {
   // `current=true` immediately and bails. Mirrors the approveLockRef
   // pattern used in JobDetail.jsx.
   const submitLockRef = useRef(false);
+  // The panel unmounts the instant submit() succeeds: onEditTriggered
+  // flips job.status to "editing" upstream, the parent's isPendingReview
+  // gate goes false, EditRequestPanel disappears from the tree. The
+  // `finally` block below still runs setSubmitting(false) on an
+  // unmounted component, which in prod React 18 manifests as Minified
+  // Error #300 ("Maximum update depth exceeded") because the leftover
+  // state update cascades through Suspense/StrictMode in unexpected
+  // ways. Track mount state and skip leftover setState calls.
+  const mountedRef = useRef(true);
+  useEffect(() => () => { mountedRef.current = false; }, []);
 
   const limitReached = editsRemaining <= 0;
 
@@ -103,13 +117,16 @@ export default function EditRequestPanel({ job, onEditTriggered }) {
     // for the same video, and burns one of their 3 edits.
     const payload = buildPayload(type);
     if (type === "typography" && Object.keys(payload).length === 1) {
-      setError(t("edit.no_changes") || "No cambiaste ninguna opción — no hay nada que re-renderizar.");
+      if (mountedRef.current) {
+        setError(t("edit.no_changes") || "No cambiaste ninguna opción — no hay nada que re-renderizar.");
+      }
       submitLockRef.current = false;
       return;
     }
 
-    setSubmitting(true);
-    setError(null);
+    if (mountedRef.current) setSubmitting(true);
+    if (mountedRef.current) setError(null);
+    let succeeded = false;
     try {
       const res = await fetch(`${API}/edit/${job.job_id}`, {
         method: "POST",
@@ -118,18 +135,33 @@ export default function EditRequestPanel({ job, onEditTriggered }) {
       });
       const data = await res.json().catch(() => ({}));
       if (!res.ok) {
-        setError(data.detail || `Error ${res.status}`);
+        if (mountedRef.current) setError(data.detail || `Error ${res.status}`);
         return;
       }
-      // Server flipped status to "editing" — close the panel, let parent
-      // pick up the new state via its /status poll.
-      setMode(null);
+      succeeded = true;
+      // IMPORTANT: clear UI state BEFORE notifying the parent.
+      // onEditTriggered flips job.status="editing" upstream → parent
+      // re-renders with isPendingReview=false → THIS component
+      // unmounts. Any setState we'd queue after that lands on a dead
+      // component and (in prod React 18) cascades into Minified Error
+      // #300. We mutate refs (safe post-unmount) and SKIP the finally's
+      // setSubmitting since mountedRef will be false by then.
+      submitLockRef.current = false;
+      if (mountedRef.current) {
+        setMode(null);
+        setSubmitting(false);
+      }
       if (onEditTriggered) onEditTriggered(data);
     } catch (e) {
-      setError(e?.message || "Network error");
+      if (mountedRef.current) setError(e?.message || "Network error");
     } finally {
       submitLockRef.current = false;
-      setSubmitting(false);
+      // Only touch React state if we're still mounted. Success path
+      // already cleared submitting above (and likely unmounted); error
+      // path needs us to flip submitting back so the user can retry.
+      if (!succeeded && mountedRef.current) {
+        setSubmitting(false);
+      }
     }
   };
 
