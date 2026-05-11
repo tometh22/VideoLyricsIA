@@ -881,7 +881,8 @@ export default function UploadZone({
                 ))}
               </div>
 
-              {/* Personalizar toggle */}
+              {/* Personalizar toggle — only shown in batch mode (2+ songs) */}
+              {files.length > 1 && (
               <button
                 type="button"
                 onClick={() => togglePersonalize(i)}
@@ -905,9 +906,10 @@ export default function UploadZone({
                   />
                 )}
               </button>
+              )}
 
-              {/* Per-track override drawer */}
-              {isPersonalizing && (
+              {/* Per-track override drawer — only in batch mode */}
+              {files.length > 1 && isPersonalizing && (
                 <div className="mt-2 pt-2 border-t border-white/[0.06] space-y-2">
                   <p className="text-[10px] text-gray-600 uppercase tracking-[0.14em]">
                     {t("upload.personalize_track") || "Personalizar esta canción"}
