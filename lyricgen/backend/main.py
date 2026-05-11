@@ -72,7 +72,7 @@ from database import Job, User, UserSettings, AuditLog, APIKey, get_db, init_db,
 from jobs import bulk_delete_jobs, create_job, delete_job, get_job, get_all_jobs, update_job
 from observability import init_sentry, init_logging, health_snapshot
 from pipeline import run_pipeline, transcribe
-from queue_jobs import enqueue_pipeline, queue_depth
+from queue_jobs import enqueue_pipeline, enqueue_edit, queue_depth
 from render_spec import umg_catalog, validate_umg_config
 from billing import router as billing_router
 from admin import router as admin_router
@@ -4027,6 +4027,15 @@ class ApproveJobRequest(BaseModel):
     notes: str = ""
 
 
+class EditJobRequest(BaseModel):
+    edit_type: str  # "typography" | "background"
+    font: str | None = None
+    font_scale: float | None = None
+    text_case: str | None = None
+    lyric_transition: str | None = None
+    text_motion: str | None = None
+
+
 @app.post("/approve/{job_id}")
 async def approve_job(
     job_id: str,
@@ -4099,6 +4108,116 @@ async def reject_job(
     db.commit()
 
     return {"ok": True, "status": "rejected", "job_id": job_id}
+
+
+@app.post("/edit/{job_id}")
+async def request_edit(
+    job_id: str,
+    body: EditJobRequest,
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Request a partial re-render of a job that is pending_review.
+
+    edit_type="typography": re-render with new font/size/case settings.
+        Reuses the cached background from R2 — no AI cost.
+    edit_type="background": regenerate Veo background only, keep segments.
+        Costs ~$0.90 (Veo + validation).
+
+    Limited to 3 edits per job. After the 3rd edit the reviewer must
+    approve or reject — no further edits are allowed.
+    """
+    from database import Job as JobModel, AuditLog
+    from pipeline import _MAX_EDITS
+
+    job = (
+        db.query(JobModel)
+        .filter(JobModel.job_id == job_id)
+        .filter(JobModel.tenant_id == current_user["tenant_id"])
+        .first()
+    )
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+    if job.status != "pending_review":
+        raise HTTPException(
+            status_code=400,
+            detail=f"Job must be in pending_review to request edits (current: {job.status})",
+        )
+
+    current_edit_count = job.edit_count or 0
+    if current_edit_count >= _MAX_EDITS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Maximum edit limit ({_MAX_EDITS}) reached. Please approve or reject.",
+        )
+
+    valid_edit_types = ("typography", "background")
+    if body.edit_type not in valid_edit_types:
+        raise HTTPException(
+            status_code=400,
+            detail=f"edit_type must be one of {valid_edit_types}",
+        )
+
+    if body.edit_type == "typography" and not job.bg_r2_key_cached:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "No cached background available for this job. "
+                "Use edit_type='background' to regenerate it."
+            ),
+        )
+
+    if not job.segments_json:
+        raise HTTPException(
+            status_code=400,
+            detail="Job has no persisted transcription. Cannot re-render.",
+        )
+
+    edit_params: dict = {}
+    if body.font is not None:
+        edit_params["font"] = body.font
+    if body.font_scale is not None:
+        edit_params["font_scale"] = body.font_scale
+    if body.text_case is not None:
+        edit_params["text_case"] = body.text_case
+    if body.lyric_transition is not None:
+        edit_params["lyric_transition"] = body.lyric_transition
+    if body.text_motion is not None:
+        edit_params["text_motion"] = body.text_motion
+
+    new_edit_count = current_edit_count + 1
+
+    # Flip to editing immediately so the UI can show progress.
+    job.status = "editing"
+    job.edit_count = new_edit_count
+    job.current_step = "video" if body.edit_type == "typography" else "background"
+    job.progress = 0
+    db.add(AuditLog(
+        user_id=current_user["id"],
+        action="job.edit_request",
+        detail={
+            "job_id": job_id,
+            "edit_type": body.edit_type,
+            "edit_params": edit_params,
+            "edit_count": new_edit_count,
+        },
+    ))
+    db.commit()
+
+    enqueue_edit(
+        job_id=job_id,
+        edit_type=body.edit_type,
+        edit_params=edit_params,
+        plan=current_user.get("plan", "100"),
+    )
+
+    return {
+        "ok": True,
+        "job_id": job_id,
+        "edit_type": body.edit_type,
+        "edit_count": new_edit_count,
+        "edits_remaining": _MAX_EDITS - new_edit_count,
+    }
 
 
 @app.post("/retry/{job_id}")
