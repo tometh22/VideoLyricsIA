@@ -2887,51 +2887,59 @@ Hard rules:
 - The concept choice is binding — do NOT drift to a different visual category
 - Never include people, faces, hands, or readable text in the scene{movement_extra_line}"""
     elif normalized_genre:
-        # User-supplied genre: lock Gemini to that genre's visual vocabulary
-        # and forbid the lazy "ocean sunset" default. This is the high-
-        # certainty path — UMG operators picking the genre at upload time
-        # gets us deterministic visual matching for their catalogue.
+        # User-supplied genre: genre now controls color/mood/lighting only.
+        # Lyrics theme is the PRIMARY scene anchor — if the lyrics are clearly
+        # about something specific (sport, ocean, city, etc.) we use that
+        # instead of the genre vocabulary. Genre vocabulary is the fallback.
         scene_guide = _GENRE_SCENE_GUIDE[normalized_genre]
         system_prompt = f"""Respond ONLY with a JSON object, no other text. Example:
 {{"style":"video","prompt":"Slow tracking shot through neon-lit rain-slicked streets, deep blue and red reflections, smoke rising past streetlamps, gritty cinematic 4k"}}
 
 The song genre is: {normalized_genre.upper()}
 
-You MUST pick a scene from this genre's visual vocabulary:
+STEP 0 — Read the lyrics and identify the PRIMARY VISUAL SUBJECT: the concrete setting, object, or action the song is literally about (e.g., a football/soccer match, the ocean, a city at night, a road, a dance floor, rain, a forest). This is your FIRST input for scene choice.
+
+STEP 1 — Choose the scene:
+- If the lyrics have a CLEAR visual subject → build the scene around that subject. Apply the {normalized_genre.upper()} genre's color palette, lighting, and atmosphere to STYLE it — but the SCENE must reflect what the song is literally about.
+- If the lyrics are abstract or purely emotional with no specific visual subject → fall back to this genre's visual vocabulary:
 {scene_guide}
 
 Hard rules:
 - "style" must always be "video"
 - "prompt" is 20-40 words: scene + camera movement + colors + lighting + atmosphere
 - Pick a DIFFERENT specific scene each time (don't repeat across songs)
+- If lyrics reference a sport (football, basketball, etc.) → use field/pitch/arena/equipment, NOT cars or generic cityscapes
 - Do NOT default to "calm ocean at sunset" unless this song is BALLAD
 - Never include people, faces, hands, or readable text in the scene{movement_extra_line}"""
     else:
-        # No genre hint: ask Gemini to classify first, then pick.
-        # "Auto" mode for users who don't want to choose.
+        # No genre hint: lyrics theme is the PRIMARY scene anchor.
+        # Genre classification is secondary — it controls color/mood/lighting
+        # only, not the scene subject. "Auto" mode for users who don't choose.
         system_prompt = """Respond ONLY with a JSON object, no other text. Example:
 {"style":"video","prompt":"Slow tracking shot through neon-lit rain-slicked streets, deep blue and red reflections, smoke rising past streetlamps, gritty cinematic 4k"}
 
-Step 1: Classify the song's genre using the artist, title, and lyrics. Pick ONE of:
-  rock, pop, ballad, latin, reggaeton, hiphop, electronic, indie, folk, metal
+STEP 0 — Read the lyrics and identify the PRIMARY VISUAL SUBJECT: the concrete setting, object, or action the song is literally about (e.g., a football/soccer match, the ocean, a city at night, a road trip, a dance floor, rain, a forest). This is your FIRST input for scene choice.
 
-Step 2: Pick a scene from the matching genre's visual vocabulary:
-- rock     → urban industrial streets, neon alleyways, gritty rain, electric storms, abandoned warehouses
-- pop      → vibrant neon, disco reflections, geometric light patterns, glossy gradient skies
-- ballad   → soft sunset, calm ocean, drifting clouds, warm golden light, candlelight
-- latin    → tropical beaches, palm trees, vibrant flowers, festive lanterns, sunlit caribbean water
-- reggaeton → night cityscape with red/pink neon, luxury cars, club lasers
-- hiphop   → city skyline at night with gold, marble luxury textures, smoke-filled spotlights
-- electronic → abstract geometry, particle storms, fractal liquid metal, laser grids
-- indie    → misty forests, vintage interiors, autumn roads, lone lighthouses, dreamy lakes
-- folk     → mountain vistas, dusty roads, wheat fields, riverside campfires
-- metal    → volcanic lava streams, dark cathedrals, stormy lightning, cracked obsidian
+STEP 1 — Choose the scene:
+- If the lyrics have a CLEAR visual subject → build the scene around that subject. Then classify genre (rock/pop/ballad/latin/reggaeton/hiphop/electronic/indie/folk/metal) to determine the COLOR PALETTE, LIGHTING, and ATMOSPHERE only — not the scene itself.
+- If the lyrics are abstract or purely emotional with no specific visual subject → classify genre, then pick from the genre's vocabulary:
+  - rock     → urban industrial streets, neon alleyways, gritty rain, electric storms, abandoned warehouses
+  - pop      → vibrant neon, disco reflections, geometric light patterns, glossy gradient skies
+  - ballad   → soft sunset, calm ocean, drifting clouds, warm golden light, candlelight
+  - latin    → tropical beaches, palm trees, vibrant flowers, festive lanterns, sunlit caribbean water
+  - reggaeton → night cityscape with red/pink neon, abstract color bursts, club laser patterns
+  - hiphop   → city skyline at night with gold, marble luxury textures, smoke-filled spotlights
+  - electronic → abstract geometry, particle storms, fractal liquid metal, laser grids
+  - indie    → misty forests, vintage interiors, autumn roads, lone lighthouses, dreamy lakes
+  - folk     → mountain vistas, dusty roads, wheat fields, riverside campfires
+  - metal    → volcanic lava streams, dark cathedrals, stormy lightning, cracked obsidian
 
-Step 3: Output JSON with the chosen scene as a 20-40 word prompt.
+STEP 2 — Output JSON with a 20-40 word prompt: scene + camera movement + colors + lighting + atmosphere.
 
 Hard rules:
 - "style" must always be "video"
 - Pick a DIFFERENT specific scene each time (don't repeat across songs)
+- If lyrics reference a sport (football, basketball, etc.) → use field/pitch/arena/equipment, NOT cars or generic cityscapes
 - Do NOT default to "calm ocean at sunset" unless the song is genuinely BALLAD
 - Never include people, faces, hands, or readable text in the scene"""
         if movement_rule:
