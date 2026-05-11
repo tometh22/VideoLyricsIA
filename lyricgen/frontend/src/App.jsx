@@ -627,6 +627,7 @@ export default function App() {
         fontScale: entry.fontScale || "1.0",
         lyricTransition: entry.lyricTransition || "cut",
         textMotion: entry.textMotion || "none",
+        textContrast: entry.textContrast || "medium",
         segments: data.segments, referenceLyrics: data.reference_lyrics || "",
         coverageWarning: !!data.coverage_warning,
         recoverySource: data.recovery_source || "",
@@ -692,6 +693,7 @@ export default function App() {
         fontScale: entry.fontScale || "1.0",
         lyricTransition: entry.lyricTransition || "cut",
         textMotion: entry.textMotion || "none",
+        textContrast: entry.textContrast || "medium",
         segments: data.segments, referenceLyrics: data.reference_lyrics || "",
         coverageWarning: !!data.coverage_warning,
         recoverySource: data.recovery_source || "",
@@ -723,6 +725,7 @@ export default function App() {
       fontScale: r.fontScale || "1.0",
       lyricTransition: r.lyricTransition || "cut",
       textMotion: r.textMotion || "none",
+      textContrast: r.textContrast || "medium",
       segments: editedSegments,
       transcribeJobId: r.transcribeJobId || null,
     }];
@@ -749,6 +752,7 @@ export default function App() {
       fontScale: a.fontScale || "1.0",
       lyricTransition: a.lyricTransition || "cut",
       textMotion: a.textMotion || "none",
+      textContrast: a.textContrast || "medium",
       segments: a.segments,
       transcribeJobId: a.transcribeJobId || null,
       status: "queued", current_step: null, progress: 0, job_id: null, error: null,
@@ -787,6 +791,7 @@ export default function App() {
         formData.append("font_scale", String(jobList[i].fontScale || "1.0"));
         formData.append("lyric_transition", jobList[i].lyricTransition || "cut");
         formData.append("text_motion", jobList[i].textMotion || "none");
+        formData.append("text_contrast", jobList[i].textContrast || "medium");
         if (animateImage && backgroundFile) formData.append("animate_image", "true");
         formData.append("segments_json", JSON.stringify(jobList[i].segments));
         formData.append("delivery_profile", delivery.delivery_profile);
@@ -902,6 +907,7 @@ export default function App() {
         generateBody.append("font_scale", String(jobList[i].fontScale || "1.0"));
         generateBody.append("lyric_transition", jobList[i].lyricTransition || "cut");
         generateBody.append("text_motion", jobList[i].textMotion || "none");
+        generateBody.append("text_contrast", jobList[i].textContrast || "medium");
         if (animateImage && backgroundFile) generateBody.append("animate_image", "true");
         if (backgroundId) {
           generateBody.append("background_id", backgroundId);
@@ -985,6 +991,7 @@ export default function App() {
         fontScale: last.fontScale || "1.0",
         lyricTransition: last.lyricTransition || "cut",
         textMotion: last.textMotion || "none",
+        textContrast: last.textContrast || "medium",
         segments: last.segments,
         referenceLyrics: "",
         coverageWarning: false,
@@ -1216,6 +1223,7 @@ export default function App() {
             fontScale={parseFloat(currentReview.fontScale || "1.0")}
             lyricTransition={currentReview.lyricTransition || "cut"}
             textMotion={currentReview.textMotion || "none"}
+            textContrast={currentReview.textContrast || "medium"}
           />
         </div>
       );
