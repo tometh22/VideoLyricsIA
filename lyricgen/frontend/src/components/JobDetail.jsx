@@ -172,6 +172,37 @@ export default function JobDetail({ job, onBack, onJobUpdate }) {
   const [reviewNotes, setReviewNotes] = useState("");
   const [approving, setApproving] = useState(false);
   const [retrying, setRetrying] = useState(false);
+
+  // handleRetry MUST estar definida antes del early-return que la usa
+  // (línea ~311 para jobs con status=error). Si se la pone más abajo
+  // junto a los otros handlers, el JSX del early-return accede a la
+  // const en su temporal dead zone → ReferenceError "Cannot access
+  // 'handleRetry' before initialization" → GlobalErrorBoundary catch
+  // → app entera crashea. Lo aprendimos cuando un job en error rompió
+  // toda la dashboard de un cliente.
+  const handleRetry = async () => {
+    if (retrying) return;
+    setRetrying(true);
+    try {
+      const res = await fetch(`${API}/retry/${job.job_id}`, {
+        method: "POST",
+        headers: authHeaders(),
+      });
+      if (res.ok) {
+        const updated = await (await fetch(`${API}/status/${job.job_id}`, { headers: authHeaders() })).json();
+        onJobUpdate?.(updated);
+        // Navigate back so the user sees the batch/history with the job now processing.
+        onBack?.();
+      } else {
+        const body = await res.json().catch(() => ({}));
+        alert(body.detail || "No se pudo reintentar el video.");
+      }
+    } catch {
+      alert("Error de red al reintentar.");
+    }
+    setRetrying(false);
+  };
+
   // Synchronous guard against double-click — `approving` (state) is updated
   // asynchronously by React, so a rapid second click can fire its handler
   // before the re-render flips the disabled flag. The ref is set BEFORE
@@ -495,28 +526,8 @@ export default function JobDetail({ job, onBack, onJobUpdate }) {
     approveLockRef.current = false;
   };
 
-  const handleRetry = async () => {
-    if (retrying) return;
-    setRetrying(true);
-    try {
-      const res = await fetch(`${API}/retry/${job.job_id}`, {
-        method: "POST",
-        headers: authHeaders(),
-      });
-      if (res.ok) {
-        const updated = await (await fetch(`${API}/status/${job.job_id}`, { headers: authHeaders() })).json();
-        onJobUpdate?.(updated);
-        // Navigate back so the user sees the batch/history with the job now processing.
-        onBack?.();
-      } else {
-        const body = await res.json().catch(() => ({}));
-        alert(body.detail || "No se pudo reintentar el video.");
-      }
-    } catch {
-      alert("Error de red al reintentar.");
-    }
-    setRetrying(false);
-  };
+  // handleRetry está definida más arriba (~línea 175) para que esté
+  // disponible antes del early-return de status=error. No duplicar acá.
 
   const handleReject = async () => {
     if (approveLockRef.current) return;
