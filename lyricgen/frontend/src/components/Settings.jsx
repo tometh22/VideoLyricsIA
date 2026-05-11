@@ -208,16 +208,25 @@ export default function Settings({ onBack }) {
       .catch(() => {});
   }, []);
 
+  const [saveError, setSaveError] = useState(null);
   const handleSave = async () => {
+    setSaveError(null);
     try {
-      await fetch(`${API}/settings`, {
+      const res = await fetch(`${API}/settings`, {
         method: "POST",
         headers: { "Content-Type": "application/json", ...authHeaders() },
         body: JSON.stringify(settings),
       });
+      if (!res.ok) {
+        const data = await res.json().catch(() => ({}));
+        throw new Error(data.detail || `Error ${res.status}`);
+      }
       setSaved(true);
       setTimeout(() => setSaved(false), 3000);
-    } catch {}
+    } catch (err) {
+      setSaveError(err.message || String(err));
+      setTimeout(() => setSaveError(null), 6000);
+    }
   };
 
   const update = (key, value) => {
@@ -225,26 +234,41 @@ export default function Settings({ onBack }) {
     setSaved(false);
   };
 
+  const [billingError, setBillingError] = useState(null);
   const handleSubscribe = async (planId) => {
     setBillingLoading(true);
+    setBillingError(null);
     try {
       const res = await fetch(`${API}/billing/checkout`, {
         method: "POST",
         headers: { "Content-Type": "application/json", ...authHeaders() },
         body: JSON.stringify({ plan_id: planId }),
       });
+      if (!res.ok) {
+        const data = await res.json().catch(() => ({}));
+        throw new Error(data.detail || `Error ${res.status}`);
+      }
       const data = await res.json();
       if (data.checkout_url) window.location.href = data.checkout_url;
-    } catch {} finally { setBillingLoading(false); }
+    } catch (err) {
+      setBillingError(err.message || String(err));
+    } finally { setBillingLoading(false); }
   };
 
   const handleManageBilling = async () => {
     setBillingLoading(true);
+    setBillingError(null);
     try {
       const res = await fetch(`${API}/billing/portal`, { method: "POST", headers: authHeaders() });
+      if (!res.ok) {
+        const data = await res.json().catch(() => ({}));
+        throw new Error(data.detail || `Error ${res.status}`);
+      }
       const data = await res.json();
       if (data.portal_url) window.location.href = data.portal_url;
-    } catch {} finally { setBillingLoading(false); }
+    } catch (err) {
+      setBillingError(err.message || String(err));
+    } finally { setBillingLoading(false); }
   };
 
   const handleChangePassword = async () => {
@@ -320,15 +344,26 @@ export default function Settings({ onBack }) {
   };
 
   const toggleNotif = async (key) => {
+    const prev = settings;
     const next = { ...settings, [key]: !settings[key] };
     setSettings(next);
     try {
-      await fetch(`${API}/settings`, {
+      const res = await fetch(`${API}/settings`, {
         method: "POST",
         headers: { "Content-Type": "application/json", ...authHeaders() },
         body: JSON.stringify(next),
       });
-    } catch {}
+      if (!res.ok) {
+        const data = await res.json().catch(() => ({}));
+        throw new Error(data.detail || `Error ${res.status}`);
+      }
+    } catch (err) {
+      // Revertir optimistic update: si el server rechazó, el toggle
+      // local no debería quedarse mostrando el nuevo estado.
+      setSettings(prev);
+      setSaveError(`Toggle de notificación falló: ${err.message || err}`);
+      setTimeout(() => setSaveError(null), 6000);
+    }
   };
 
   const handleCreateApiKey = async () => {
@@ -988,6 +1023,11 @@ export default function Settings({ onBack }) {
               )}
             </Card>
 
+            {(saveError || billingError) && (
+              <div className="rounded-card bg-red-500/[0.08] ring-1 ring-red-500/30 px-4 py-3 text-sm text-red-200">
+                {saveError || billingError}
+              </div>
+            )}
             <div className="flex items-center justify-end gap-3 pt-2">
               {saved && <InlineSuccess message={t("settings.saved")} />}
               <button onClick={handleSave} className="btn-primary px-6">

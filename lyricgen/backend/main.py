@@ -35,7 +35,7 @@ if _SENTRY_DSN:
 from fastapi import FastAPI, File, Form, Query, UploadFile, HTTPException, Depends, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, RedirectResponse, StreamingResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.util import get_remote_address
 from slowapi.errors import RateLimitExceeded
@@ -681,41 +681,45 @@ async def health():
 # Auth endpoints (public)
 # ---------------------------------------------------------------------------
 
+# Pydantic max_length aplicado consistente a TODOS los inputs de
+# cliente — ver CONTRIBUTING.md para convenciones de tamaños.
+# Defensa contra DoS por payload size: sin esto un atacante manda
+# 100 MB de string en cualquier field.
 class LoginRequest(BaseModel):
-    username: str
-    password: str
+    username: str = Field(..., max_length=200)
+    password: str = Field(..., max_length=200)
 
 
 class RegisterRequest(BaseModel):
-    username: str
-    password: str
-    email: str = ""
+    username: str = Field(..., max_length=200)
+    password: str = Field(..., max_length=200)
+    email: str = Field(default="", max_length=320)  # RFC 5321 max email length
 
 
 class ForgotPasswordRequest(BaseModel):
-    email: str
+    email: str = Field(..., max_length=320)
 
 
 class ResetPasswordRequest(BaseModel):
-    token: str
-    password: str
+    token: str = Field(..., max_length=500)
+    password: str = Field(..., max_length=200)
 
 
 class VerifyEmailRequest(BaseModel):
-    token: str
+    token: str = Field(..., max_length=500)
 
 
 class ChangePasswordRequest(BaseModel):
-    current_password: str
-    new_password: str
+    current_password: str = Field(..., max_length=200)
+    new_password: str = Field(..., max_length=200)
 
 
 class DeleteAccountRequest(BaseModel):
-    password: str
+    password: str = Field(..., max_length=200)
 
 
 class CreateAPIKeyRequest(BaseModel):
-    name: str
+    name: str = Field(..., max_length=100)
 
 
 @app.post("/auth/login")
@@ -1804,11 +1808,11 @@ _PRESIGN_PUT_TTL_S = int(os.environ.get("PRESIGN_PUT_TTL_S", "900"))
 
 
 class _UploadUrlReq(BaseModel):
-    filename: str
-    content_type: str = ""
+    filename: str = Field(..., max_length=500)
+    content_type: str = Field(default="", max_length=200)
     size_bytes: int = 0
-    artist: str = ""
-    title: str = ""
+    artist: str = Field(default="", max_length=200)
+    title: str = Field(default="", max_length=300)
 
 
 def _validate_audio_filename_only(filename: str) -> None:
@@ -1935,9 +1939,9 @@ def _input_object_key_for_job(tenant_id: str, job_id: str, filename: str) -> str
 
 
 class _MultipartInitReq(BaseModel):
-    job_id: str
-    filename: str
-    content_type: str = ""
+    job_id: str = Field(..., max_length=64)
+    filename: str = Field(..., max_length=500)
+    content_type: str = Field(default="", max_length=200)
 
 
 @app.post("/upload-multipart-init")
@@ -2002,7 +2006,7 @@ async def upload_multipart_init(
 
 
 class _MultipartPartReq(BaseModel):
-    job_id: str
+    job_id: str = Field(..., max_length=64)
     part_number: int
 
 
@@ -2118,8 +2122,8 @@ async def upload_file_proxy(
 
 
 class _MultipartCompleteReq(BaseModel):
-    job_id: str
-    parts: list  # list of {"part_number": int, "etag": str}
+    job_id: str = Field(..., max_length=64)
+    parts: list = Field(..., max_length=10000)  # R2 max 10k parts per upload
 
 
 @app.post("/upload-multipart-complete")
@@ -2170,7 +2174,7 @@ async def upload_multipart_complete(
 
 
 class _MultipartAbortReq(BaseModel):
-    job_id: str
+    job_id: str = Field(..., max_length=64)
 
 
 @app.post("/upload-multipart-abort")
@@ -2198,10 +2202,10 @@ async def upload_multipart_abort(
 
 
 class _TranscribeUploadedReq(BaseModel):
-    job_id: str
-    language: str = ""
-    artist: str = ""
-    title: str = ""
+    job_id: str = Field(..., max_length=64)
+    language: str = Field(default="", max_length=16)
+    artist: str = Field(default="", max_length=200)
+    title: str = Field(default="", max_length=300)
 
 
 @app.post("/transcribe-uploaded")
@@ -2316,27 +2320,27 @@ async def upload(
     request: Request,
     response: Response,
     file: UploadFile = File(...),
-    artist: str = Form(...),
-    song_title: str = Form(""),
-    style: str = Form("oscuro"),
-    language: str = Form(""),
-    delivery_profile: str = Form("youtube"),
-    umg_frame_size: str = Form(""),
-    umg_fps: str = Form(""),
-    umg_prores_profile: str = Form(""),
+    artist: str = Form(..., max_length=200),
+    song_title: str = Form("", max_length=300),
+    style: str = Form("oscuro", max_length=100),
+    language: str = Form("", max_length=16),
+    delivery_profile: str = Form("youtube", max_length=16),
+    umg_frame_size: str = Form("", max_length=16),
+    umg_fps: str = Form("", max_length=16),
+    umg_prores_profile: str = Form("", max_length=4),
     background_id: int = Form(None),
-    background_mode: str = Form("as_is"),
+    background_mode: str = Form("as_is", max_length=16),
     background_file: UploadFile = File(None),
-    genre: str = Form(""),
-    font: str = Form(""),
-    concept: str = Form(""),
-    movement_style: str = Form(""),
-    animate_image: str = Form(""),
-    text_case: str = Form("upper"),
-    font_scale: str = Form("1.0"),
-    lyric_transition: str = Form("cut"),
-    text_motion: str = Form("none"),
-    text_contrast: str = Form("medium"),
+    genre: str = Form("", max_length=64),
+    font: str = Form("", max_length=64),
+    concept: str = Form("", max_length=2000),
+    movement_style: str = Form("", max_length=64),
+    animate_image: str = Form("", max_length=8),
+    text_case: str = Form("upper", max_length=16),
+    font_scale: str = Form("1.0", max_length=8),
+    lyric_transition: str = Form("cut", max_length=16),
+    text_motion: str = Form("none", max_length=16),
+    text_contrast: str = Form("medium", max_length=16),
     match_lyrics: bool = Form(True),
     current_user: dict = Depends(get_current_user),
     db: Session = Depends(get_db),
@@ -2500,9 +2504,9 @@ async def transcribe_endpoint(
     request: Request,
     response: Response,
     file: UploadFile = File(...),
-    language: str = Form(""),
-    artist: str = Form(""),
-    title: str = Form(""),
+    language: str = Form("", max_length=16),
+    artist: str = Form("", max_length=200),
+    title: str = Form("", max_length=300),
     current_user: dict = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
@@ -3068,29 +3072,32 @@ async def _run_transcription_for_job(
 async def generate_with_segments(
     request: Request,
     file: UploadFile = File(None),
-    job_id: str = Form(""),
-    artist: str = Form(""),
-    song_title: str = Form(""),
-    style: str = Form("oscuro"),
-    language: str = Form(""),
-    segments_json: str = Form(...),
-    delivery_profile: str = Form("youtube"),
-    umg_frame_size: str = Form(""),
-    umg_fps: str = Form(""),
-    umg_prores_profile: str = Form(""),
+    job_id: str = Form("", max_length=64),
+    artist: str = Form("", max_length=200),
+    song_title: str = Form("", max_length=300),
+    style: str = Form("oscuro", max_length=100),
+    language: str = Form("", max_length=16),
+    # segments_json es el payload del frontend con timing de cada lyric;
+    # un video largo puede pesar varios cientos de KB. 5 MB es techo
+    # generoso que rechaza payload absurdo sin restringir casos reales.
+    segments_json: str = Form(..., max_length=5_000_000),
+    delivery_profile: str = Form("youtube", max_length=16),
+    umg_frame_size: str = Form("", max_length=16),
+    umg_fps: str = Form("", max_length=16),
+    umg_prores_profile: str = Form("", max_length=4),
     background_id: int = Form(None),
-    background_mode: str = Form("as_is"),
+    background_mode: str = Form("as_is", max_length=16),
     background_file: UploadFile = File(None),
-    genre: str = Form(""),
-    font: str = Form(""),
-    concept: str = Form(""),
-    movement_style: str = Form(""),
-    animate_image: str = Form(""),
-    text_case: str = Form("upper"),
-    font_scale: str = Form("1.0"),
-    lyric_transition: str = Form("cut"),
-    text_motion: str = Form("none"),
-    text_contrast: str = Form("medium"),
+    genre: str = Form("", max_length=64),
+    font: str = Form("", max_length=64),
+    concept: str = Form("", max_length=2000),
+    movement_style: str = Form("", max_length=64),
+    animate_image: str = Form("", max_length=8),
+    text_case: str = Form("upper", max_length=16),
+    font_scale: str = Form("1.0", max_length=8),
+    lyric_transition: str = Form("cut", max_length=16),
+    text_motion: str = Form("none", max_length=16),
+    text_contrast: str = Form("medium", max_length=16),
     match_lyrics: bool = Form(True),
     current_user: dict = Depends(get_current_user),
     db: Session = Depends(get_db),
@@ -3403,15 +3410,35 @@ async def job_events(
 
     TERMINAL = {"done", "pending_review", "error", "validation_failed"}
     scope = _job_scope(current_user)
+    # Capturamos identidad+tenant al abrir para re-validar en cada poll.
+    # Sin esto, si un admin transfiere al user entre tenants mid-stream
+    # el SSE seguiría emitiendo eventos del job viejo (que ya pertenece
+    # a otro tenant). Improbable hoy pero el costo de revalidar es 1
+    # SELECT por poll cada 2 s → trivial.
+    _initial_user_id = current_user["id"]
+    _initial_tenant_id = current_user.get("tenant_id")
 
     async def event_generator():
         last_sig = None
+        # Merge de dos fixes:
+        #   - PR #97: scoped_db() per tick para evitar pool starvation.
+        #   - PR #95: re-validar tenant del user en cada tick (cierra el
+        #     window donde admin transfiere user entre tenants mid-stream).
+        # Ambas queries (User refresh + job fetch) ocurren dentro de la
+        # misma sesión corta del context manager → 1 connection por tick,
+        # ~2 SELECTs, devuelta al pool en milisegundos.
+        unauthorized = False
         while True:
-            # Open + close a session for every poll tick. Cheap and
-            # bounded — a single SELECT per 2 s — and zero pool risk
-            # because the session is returned within milliseconds.
             with scoped_db() as db_tick:
-                job = get_job(db_tick, job_id, **scope)
+                fresh_user = db_tick.query(User).filter(User.id == _initial_user_id).first()
+                if not fresh_user or fresh_user.tenant_id != _initial_tenant_id:
+                    unauthorized = True
+                    job = None
+                else:
+                    job = get_job(db_tick, job_id, **scope)
+            if unauthorized:
+                yield f"event: unauthorized\ndata: {json.dumps({'reason': 'tenant_changed'})}\n\n"
+                break
             if job is None:
                 break
             sig = (job["status"], job["current_step"], job["progress"])
@@ -4080,25 +4107,25 @@ async def export_provenance(
 # ---------------------------------------------------------------------------
 
 class ApproveJobRequest(BaseModel):
-    notes: str = ""
+    notes: str = Field(default="", max_length=2048)
 
 
 class EditJobRequest(BaseModel):
-    edit_type: str  # "typography" | "background"
-    font: str | None = None
+    edit_type: str = Field(..., max_length=32)  # "typography" | "background"
+    font: str | None = Field(default=None, max_length=64)
     font_scale: float | None = None
-    text_case: str | None = None
-    lyric_transition: str | None = None
-    text_motion: str | None = None
+    text_case: str | None = Field(default=None, max_length=16)
+    lyric_transition: str | None = Field(default=None, max_length=16)
+    text_motion: str | None = Field(default=None, max_length=16)
 
 
 class EnableProResRequest(BaseModel):
     """Body para POST /enable-prores/{job_id}. Mismos campos que el upload
     UMG. Strings sin parsear — _parse_umg_params se encarga de validar y
     convertir a tipos correctos."""
-    umg_frame_size: str       # "1920x1080" | "3840x2160" | "1280x720"
-    umg_fps: str              # "23.976" | "24" | "25" | "29.97" | "30"
-    umg_prores_profile: str   # "1" (LT) | "2" (Standard) | "3" (HQ) | "4" (4444)
+    umg_frame_size: str = Field(..., max_length=16)      # "HD" | "UHD-4K" | "DCI-4K" | "DCI-2K"
+    umg_fps: str = Field(..., max_length=16)             # "23.976"...".60"
+    umg_prores_profile: str = Field(..., max_length=4)   # "3" (422 HQ) | "4" (4444) | "5" (4444 XQ)
 
 
 @app.post("/approve/{job_id}")
@@ -4195,10 +4222,18 @@ async def request_edit(
     from database import Job as JobModel, AuditLog
     from pipeline import _MAX_EDITS
 
+    # with_for_update() toma row-level lock en Postgres para serializar
+    # el read-validate-write de edit_count. Sin esto, dos POST /edit del
+    # mismo job en rápida sucesión leen el mismo edit_count, ambos pasan
+    # el check < _MAX_EDITS, y ambos incrementan → user excede el límite
+    # de 3 edits y la app cobra Veo extra (~$0.90 por background regen).
+    # No-op en SQLite (igual que _lock_user_for_quota); lock real en
+    # Postgres. Se libera con db.commit() al final del flow.
     job = (
         db.query(JobModel)
         .filter(JobModel.job_id == job_id)
         .filter(JobModel.tenant_id == current_user["tenant_id"])
+        .with_for_update()
         .first()
     )
     if not job:
@@ -4402,6 +4437,13 @@ async def retry_job(
             detail="Source audio no longer available — please upload the file again.",
         )
 
+    # Capturar status PREVIO antes de mutar. Sin esto el AuditLog
+    # registraba siempre "processing" como previous_status (la línea de
+    # abajo lee job.status DESPUÉS del mutate), haciendo el log
+    # inservible para forensics ("¿en qué estado estaba el job cuando
+    # el operador apretó retry?" → siempre 'processing').
+    _previous_status = job.status
+
     # Reset job to initial processing state before re-enqueueing.
     job.status = "processing"
     job.current_step = "whisper"
@@ -4417,11 +4459,17 @@ async def retry_job(
     job.completed_at = None
     job.approved_by = None
     job.approved_at = None
+    # Resetear edit_count: el retry trae el job a estado limpio para
+    # re-procesar; los edits hechos antes del fail quedan en AuditLog
+    # pero el job vuelve a tener 3 edits disponibles. Sin esto, un job
+    # que hizo 3 edits y falló queda permanentemente bloqueado de
+    # re-editar tras el retry.
+    job.edit_count = 0
 
     db.add(AuditLog(
         user_id=current_user["id"],
         action="job.retry",
-        detail={"job_id": job_id, "previous_status": job.status},
+        detail={"job_id": job_id, "previous_status": _previous_status},
     ))
     db.commit()
 

@@ -495,7 +495,9 @@ export default function BatchProgress({ jobs, onReset, onSingleDone, onSelectJob
         <div className="grid grid-cols-2 sm:grid-cols-3 gap-3 mb-8">
           {jobs.map((job, i) => (
             <div
-              key={job.job_id || i}
+              // Diferenciamos placeholder keys de keys reales así dos jobs sin
+              // job_id no colisionan al reordenarse/filtrarse.
+              key={job.job_id || `pending-${i}`}
               className="animate-fade-in"
               style={{ animationDelay: `${i * 60}ms`, animationFillMode: "both" }}
             >
