@@ -30,12 +30,25 @@ from __future__ import annotations
 
 import logging
 import os
+import time
 from datetime import datetime, timedelta, timezone
 from typing import Iterable
 
+from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import Session
 
 from database import AuditLog, Job, SessionLocal
+
+# Markers for Postgres connection drops that we should silently retry
+# instead of letting the reaper thread emit Sentry noise every 5 min.
+# Same list as the HTTP retry middleware in main.py — kept duplicated
+# here because the reaper runs in a thread, bypassing the ASGI stack.
+_TRANSIENT_DB_MARKERS = (
+    "SSL connection has been closed",
+    "server closed the connection",
+    "connection already closed",
+    "could not connect to server",
+)
 
 logger = logging.getLogger("genly.reaper")
 
@@ -303,6 +316,34 @@ _REAPER_ADVISORY_LOCK_KEY = 9118364455199101
 
 
 def reap_all_stuck(threshold_min: int = _DEFAULT_THRESHOLD_MIN) -> int:
+    """Public entrypoint with a transient-error retry. The reaper runs
+    in a background thread (main.py:_reaper_loop) which is OUTSIDE the
+    ASGI stack — the HTTP retry middleware can't catch a Postgres SSL
+    drop here. Without this wrapper, Railway's idle-connection eviction
+    on the reaper's first query of the cycle bubbles all the way up to
+    Sentry every few minutes, even though the reaper itself recovers on
+    the next cycle. One retry with a fresh session swallows the noise.
+    """
+    last_exc: Exception | None = None
+    for attempt in (1, 2):
+        try:
+            return _reap_all_stuck_inner(threshold_min)
+        except OperationalError as exc:
+            if not any(m in str(exc) for m in _TRANSIENT_DB_MARKERS):
+                raise
+            last_exc = exc
+            logger.warning(
+                "reaper: transient DB error on attempt %d (%s) — retrying",
+                attempt, type(exc).__name__,
+            )
+            time.sleep(0.5)
+    # Both attempts hit transient errors. Surface the original so Sentry
+    # still has visibility on persistent outages.
+    assert last_exc is not None
+    raise last_exc
+
+
+def _reap_all_stuck_inner(threshold_min: int) -> int:
     """One pass. Owns its own DB session — safe to call from a worker
     thread or a scheduled task. Returns the count of reaped jobs.
 
