@@ -12,6 +12,7 @@ services:
   redis:
     image: redis:7-alpine
     restart: unless-stopped
+    command: redis-server --maxmemory 2gb --maxmemory-policy allkeys-lru
     volumes:
       - redis-data:/data
     healthcheck:
@@ -59,7 +60,14 @@ services:
     restart: unless-stopped
     command: ["python", "worker.py"]
     deploy:
-      replicas: 3
+      replicas: 5
+      resources:
+        limits:
+          cpus: "6"
+          memory: 14G
+        reservations:
+          cpus: "4"
+          memory: 8G
     environment:
       - ENV=${ENV:-prod}
       - REDIS_URL=redis://redis:6379/0
@@ -85,3 +93,9 @@ services:
 volumes:
   redis-data:
   outputs:
+    driver: local
+    # To use a dedicated large disk, replace with:
+    # driver_opts:
+    #   type: none
+    #   o: bind
+    #   device: /mnt/disk/outputs   # mount a 100GB+ disk here
