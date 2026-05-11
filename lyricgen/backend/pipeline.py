@@ -337,7 +337,8 @@ def run_pipeline(job_id: str, mp3_path: str, artist: str, style: str,
             print(f"[WHISPER] Using {len(segments)} user-edited segments")
         else:
             segments = transcribe(mp3_path, language=language)
-        update_job(job_id, progress=20)
+        # Persist segments so edit re-renders can skip re-transcription.
+        update_job(job_id, segments_json=segments, progress=20)
 
         # Step 1.5 — Background (AI-generated or human-provided)
         update_job(job_id, current_step="background", progress=22)
@@ -403,6 +404,40 @@ def run_pipeline(job_id: str, mp3_path: str, artist: str, style: str,
                       f"on {background_path}")
                 bg_image_path = background_path
         update_job(job_id, progress=40)
+
+        # Persist render params so edit re-renders can override individual
+        # fields without losing the rest of the original settings.
+        update_job(job_id, render_params={
+            "font": font,
+            "text_case": text_case,
+            "font_scale": font_scale,
+            "lyric_transition": lyric_transition,
+            "text_motion": text_motion,
+            "style": style,
+            "genre": genre,
+            "concept": concept,
+            "movement_style": movement_style,
+        })
+
+        # Cache AI-generated background to R2 so a typography-only edit
+        # can re-use it without another Veo call ($0.80 saved per edit).
+        # Only worth doing when storage is available and the background is
+        # a file we own (not a human-provided upload — those already have
+        # their own R2 key in bg_r2_key).
+        if bg_image_path and os.path.exists(bg_image_path) and not background_path:
+            import storage as _storage
+            if _storage.is_enabled():
+                try:
+                    _bg_ext = os.path.splitext(bg_image_path)[1] or ".mp4"
+                    _bg_cache_key = _storage.upload_file(
+                        bg_image_path,
+                        f"backgrounds/{job_id}/bg_cached{_bg_ext}",
+                    )
+                    if _bg_cache_key:
+                        update_job(job_id, bg_r2_key_cached=_bg_cache_key)
+                        print(f"[EDIT] Cached background to R2: {_bg_cache_key}")
+                except Exception as _e:
+                    print(f"[EDIT] Warning: background cache upload failed: {_e}")
 
         files = {}
         # When the operator picked an explicit font id, resolve it to a
@@ -5184,3 +5219,195 @@ def generate_thumbnail(
     out_path = os.path.join(job_dir, "thumbnail.jpg")
     img.save(out_path, "JPEG", quality=92)
     return out_path
+
+
+# ---------------------------------------------------------------------------
+# Edit pipeline — partial re-render at the review stage
+# ---------------------------------------------------------------------------
+
+_MAX_EDITS = 3
+
+
+def run_edit_pipeline(
+    job_id: str,
+    edit_type: str,
+    edit_params: dict,
+) -> None:
+    """Partial re-render triggered from POST /edit/{job_id}.
+
+    edit_type:
+        "typography" — keep existing background + segments; only re-render
+            with new font/size/case/transition settings.  Cost: ~$0.
+        "background" — re-generate Veo background; keep segments and
+            (optionally) render params.  Cost: ~$0.90.
+
+    After completion the job returns to "pending_review" so the reviewer
+    can approve, reject, or request another edit (up to _MAX_EDITS total).
+    """
+    from database import SessionLocal, Job as JobModel
+
+    db = SessionLocal()
+    try:
+        job_row = db.query(JobModel).filter(JobModel.job_id == job_id).first()
+        if not job_row:
+            raise RuntimeError(f"Job {job_id} not found")
+        segments = job_row.segments_json
+        if not segments:
+            raise RuntimeError(f"Job {job_id} has no persisted segments — cannot edit")
+        base_params = dict(job_row.render_params or {})
+        artist = job_row.artist
+        song_title = job_row.song_title or ""
+        style = base_params.get("style") or job_row.style or "oscuro"
+        delivery_profile = job_row.delivery_profile or "youtube"
+        wants_youtube = delivery_profile in ("youtube", "both")
+        wants_umg = delivery_profile in ("umg", "both")
+        umg_spec = job_row.umg_spec
+        tenant_id = job_row.tenant_id
+        bg_r2_key_cached = job_row.bg_r2_key_cached
+        input_r2_key = job_row.input_r2_key
+    finally:
+        db.close()
+
+    # Merge base render params with the requested overrides.
+    merged = {**base_params, **edit_params}
+    font_id = merged.get("font") or ""
+    text_case = merged.get("text_case") or "upper"
+    font_scale = float(merged.get("font_scale") or 1.0)
+    lyric_transition = merged.get("lyric_transition") or "cut"
+    text_motion = merged.get("text_motion") or "none"
+    genre = merged.get("genre") or ""
+    concept = merged.get("concept") or ""
+    movement_style = merged.get("movement_style") or ""
+
+    job_dir = os.path.join(OUTPUTS_DIR, job_id)
+    os.makedirs(job_dir, exist_ok=True)
+
+    try:
+        # ----------------------------------------------------------------
+        # Fetch the source audio
+        # ----------------------------------------------------------------
+        mp3_path = os.path.join(job_dir, "source_audio.mp3")
+        if not os.path.exists(mp3_path):
+            if input_r2_key and storage.is_enabled():
+                ok = storage.download_object(input_r2_key, mp3_path)
+                if not ok:
+                    raise RuntimeError("Could not download source audio from R2")
+            else:
+                raise RuntimeError("Source audio not available locally and no R2 key")
+
+        # ----------------------------------------------------------------
+        # Resolve background
+        # ----------------------------------------------------------------
+        if edit_type == "typography":
+            update_job(job_id, status="editing", current_step="video", progress=35)
+            bg_image_path = os.path.join(job_dir, "bg_cached_edit.mp4")
+            if not os.path.exists(bg_image_path):
+                if bg_r2_key_cached and storage.is_enabled():
+                    ok = storage.download_object(bg_r2_key_cached, bg_image_path)
+                    if not ok:
+                        raise RuntimeError("Could not download cached background from R2")
+                else:
+                    raise RuntimeError(
+                        "No cached background available for typography edit. "
+                        "Use edit_type='background' to regenerate."
+                    )
+
+        elif edit_type == "background":
+            update_job(job_id, status="editing", current_step="background", progress=22)
+            lyrics_text = " ".join(seg["text"] for seg in segments)
+            bg_image_path = _ensure_background(
+                style, job_dir,
+                lyrics_text=lyrics_text, artist=artist, job_id=job_id,
+                song_title=song_title, genre=genre, concept=concept,
+                movement_style=movement_style,
+            )
+            update_job(job_id, progress=35)
+            # Re-cache the new background so future typography edits work.
+            if bg_image_path and os.path.exists(bg_image_path) and storage.is_enabled():
+                try:
+                    _bg_ext = os.path.splitext(bg_image_path)[1] or ".mp4"
+                    new_bg_key = storage.upload_file(
+                        bg_image_path,
+                        f"backgrounds/{job_id}/bg_cached{_bg_ext}",
+                    )
+                    if new_bg_key:
+                        update_job(job_id, bg_r2_key_cached=new_bg_key)
+                except Exception as _e:
+                    print(f"[EDIT] Warning: re-cache of new background failed: {_e}")
+        else:
+            raise ValueError(f"Unknown edit_type {edit_type!r}")
+
+        # ----------------------------------------------------------------
+        # Resolve font
+        # ----------------------------------------------------------------
+        chosen_font = _resolve_font(font_id)
+        if chosen_font:
+            print(f"[EDIT] Operator font: {os.path.basename(chosen_font)}")
+
+        # ----------------------------------------------------------------
+        # Re-render video
+        # ----------------------------------------------------------------
+        update_job(job_id, current_step="video", progress=40)
+        intermediate_spec = (
+            RenderSpec.umg_intermediate_master(umg_spec) if wants_umg
+            else None
+        )
+        _, chosen_font, bg_source = generate_lyric_video(
+            mp3_path, segments, style, job_dir, artist, bg_image_path,
+            font=chosen_font, spec=intermediate_spec,
+            song_title=song_title,
+            text_case=text_case,
+            font_scale=font_scale,
+            lyric_transition=lyric_transition,
+            text_motion=text_motion,
+        )
+        files = {"video_url": f"/download/{job_id}/video"}
+        update_job(job_id, progress=55)
+
+        if wants_umg:
+            files["umg_master_url"] = f"/download/{job_id}/umg_master"
+            files["umg_short_url"] = f"/download/{job_id}/umg_short"
+
+        # ----------------------------------------------------------------
+        # Re-render short + thumbnail
+        # ----------------------------------------------------------------
+        if wants_youtube or wants_umg:
+            update_job(job_id, current_step="short", progress=75)
+            short_fps = float(umg_spec["fps"]) if wants_umg and umg_spec else 24
+            generate_short(
+                mp3_path, segments, job_dir, bg_source=bg_source,
+                style=style, font=chosen_font, fps=short_fps,
+            )
+            files["short_url"] = f"/download/{job_id}/short"
+            update_job(job_id, progress=85)
+
+            update_job(job_id, current_step="thumbnail", progress=90)
+            generate_thumbnail(artist, mp3_path, job_dir, bg_source=bg_source, song_title=song_title)
+            files["thumbnail_url"] = f"/download/{job_id}/thumbnail"
+
+        # ----------------------------------------------------------------
+        # Verify + upload to R2 (replacing previous deliverables)
+        # ----------------------------------------------------------------
+        try:
+            audio_dur = _audio_duration(mp3_path)
+        except Exception:
+            audio_dur = _ffprobe_duration(mp3_path)
+        _verify_deliverables(job_dir, files, audio_dur)
+
+        s3_keys = _upload_deliverables_to_r2(job_id, job_dir, files)
+        if s3_keys:
+            update_job(job_id, s3_keys=s3_keys)
+
+        _cleanup_local_intermediates(job_dir)
+
+        # Persist the merged render params so the next edit sees them.
+        update_job(job_id, render_params=merged)
+
+        # Back to pending_review — the reviewer decides what to do next.
+        update_job(job_id, status="pending_review", progress=100, files=files)
+        print(f"[EDIT] job={job_id} edit_type={edit_type} → pending_review")
+
+    except Exception as exc:
+        print(f"[EDIT] job={job_id} FAILED: {exc}")
+        update_job(job_id, status="error", error=f"Edit failed: {exc}")
+        raise
