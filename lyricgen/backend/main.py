@@ -4256,8 +4256,11 @@ async def enable_prores_for_job(
     ya tiene el lazy path armado (202 + Retry-After mientras transcode,
     302 a R2 cuando está listo).
 
-    Idempotente: si el job ya tiene umg_spec, sobreescribe (permite
-    re-generar con specs distintas) y re-encola la transcodificación.
+    Re-llamar con specs distintas sobreescribe umg_spec en la DB y
+    re-encola, PERO si el .mov anterior ya existe en disco o R2,
+    ensure_prores_exists hace short-circuit y devuelve ese archivo
+    (las specs nuevas no toman efecto). Si querés forzar re-transcode
+    con specs distintas, primero borrá el .mov de R2 + outputs/.
     """
     from database import Job as JobModel, AuditLog
 
