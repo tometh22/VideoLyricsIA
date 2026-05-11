@@ -4922,8 +4922,9 @@ def generate_lyric_video(
             card_width = int(round(spec.width * 0.80))
             stroke_w = max(1, int(round(1.6 * scale)))
 
-            FADE_IN  = 0.4   # seconds to fade in
-            FADE_OUT = 0.7   # seconds to fade out
+            FADE_IN_BASE  = 0.4   # ideal fade-in for long intros
+            FADE_OUT_BASE = 0.7   # ideal fade-out
+            MIN_FULL_OPACITY = 0.8  # reserve at least this much full-opacity time
             START_T  = 0.3   # when the card starts
 
             # End just before the first lyric; cap at START_T + 8s for very long intros
@@ -4934,6 +4935,22 @@ def generate_lyric_video(
 
             if title_end is not None:
                 clip_dur = title_end - START_T
+
+                # Scale fades down for short intros so the title actually
+                # spends visible time at full opacity. Whisper often picks
+                # up an intro vocalization ("Uoh-oh-oh") as the first
+                # "lyric" 2-3s in, leaving a 1.5s title window. With the
+                # base 0.4+0.7 fades that ate the whole clip — title
+                # appeared as a 0.4s flash and the user couldn't read it.
+                # Now we reserve ~0.8s of full-opacity display when
+                # possible, shrinking fades proportionally to fit.
+                fade_budget = max(0.1, clip_dur - MIN_FULL_OPACITY)
+                if fade_budget >= (FADE_IN_BASE + FADE_OUT_BASE):
+                    FADE_IN, FADE_OUT = FADE_IN_BASE, FADE_OUT_BASE
+                else:
+                    ratio_in = FADE_IN_BASE / (FADE_IN_BASE + FADE_OUT_BASE)
+                    FADE_IN = max(0.05, fade_budget * ratio_in)
+                    FADE_OUT = max(0.05, fade_budget * (1 - ratio_in))
 
                 def _make_fade_opacity(base_op, c_dur, fi=FADE_IN, fo=FADE_OUT):
                     """Opacity function: fade-in then fade-out, scaled by base_op."""
