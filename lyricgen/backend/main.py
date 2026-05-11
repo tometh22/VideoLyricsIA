@@ -1,5 +1,6 @@
 """FastAPI application for GenLy AI — Production SaaS."""
 
+import asyncio
 import json
 import logging
 import os
@@ -38,6 +39,7 @@ from pydantic import BaseModel
 from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.util import get_remote_address
 from slowapi.errors import RateLimitExceeded
+from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import Session
 
 from auth import (
@@ -196,6 +198,85 @@ else:
         allow_methods=["*"],
         allow_headers=["*"],
     )
+
+# --- Transient DB error retry middleware ---
+# Postgres on Railway occasionally drops idle pool connections in ways
+# that pool_pre_ping + TCP keepalives don't fully prevent (drops happen
+# mid-query, after the pre-ping). Symptom is `psycopg2.OperationalError:
+# SSL connection has been closed unexpectedly`, surfacing as a 500 to
+# the client on the very first request after an idle period.
+#
+# SQLAlchemy auto-invalidates the dead connection on error, so the next
+# checkout gets a fresh one. We just need to retry once.
+_TRANSIENT_DB_MARKERS = (
+    "SSL connection has been closed",
+    "server closed the connection",
+    "connection already closed",
+    "could not connect to server",
+)
+
+
+# Hard cap on request bodies eligible for replay-on-retry. Above this size
+# we let the request fail naturally — buffering 50+ MB MP3 uploads into
+# memory just to retry on a transient DB error costs more than the bug.
+_RETRY_BODY_MAX_BYTES = 1 * 1024 * 1024  # 1 MiB
+
+
+@app.middleware("http")
+async def db_transient_retry_middleware(request: Request, call_next):
+    """Retry once if a Postgres connection drops mid-request.
+
+    For small POST/PUT/PATCH JSON bodies we cache the body so the second
+    attempt can replay it — FastAPI consumes the request stream on first
+    read. File uploads (multipart, large bodies) are passed through
+    without retry to avoid buffering MB-sized payloads into memory; the
+    client is expected to retry those itself.
+    """
+    body_bytes: bytes = b""
+    needs_replay = False
+    if request.method in ("POST", "PUT", "PATCH"):
+        content_type = request.headers.get("content-type", "")
+        content_length = request.headers.get("content-length", "")
+        is_multipart = content_type.startswith("multipart/")
+        try:
+            size = int(content_length) if content_length else 0
+        except ValueError:
+            size = 0
+        # Skip body buffering for multipart uploads or anything larger
+        # than the cap. Unknown size (chunked) also skips — we can't
+        # tell if it's a 200-byte JSON or a 50-MB stream.
+        if not is_multipart and 0 < size <= _RETRY_BODY_MAX_BYTES:
+            body_bytes = await request.body()
+            needs_replay = True
+
+            async def _replay_receive():
+                return {"type": "http.request", "body": body_bytes, "more_body": False}
+
+            request._receive = _replay_receive  # type: ignore[attr-defined]
+
+    try:
+        return await call_next(request)
+    except OperationalError as e:
+        if not any(marker in str(e) for marker in _TRANSIENT_DB_MARKERS):
+            raise
+        if not needs_replay and request.method in ("POST", "PUT", "PATCH"):
+            # Can't safely replay an upload — bubble up. Client retries.
+            logger.warning(
+                "Transient DB error on %s %s but body not buffered — not retrying",
+                request.method,
+                request.url.path,
+            )
+            raise
+        logger.warning(
+            "Transient DB error on %s %s — retrying once",
+            request.method,
+            request.url.path,
+        )
+        if needs_replay:
+            request._receive = _replay_receive  # type: ignore[attr-defined]
+        await asyncio.sleep(0.15)
+        return await call_next(request)
+
 
 # --- Include routers ---
 app.include_router(billing_router)
