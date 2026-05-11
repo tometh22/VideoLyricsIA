@@ -7,6 +7,7 @@ import { useI18n } from "./i18n";
 import { IS_PRODUCTION, APP_ENV } from "./env";
 import { fetchWithTimeout } from "./fetchWithTimeout";
 import { uploadFileToR2 } from "./r2Upload";
+import * as wizardPersistence from "./wizardPersistence";
 import LoginPage from "./components/LoginPage";
 import Landing from "./components/Landing";
 import Sidebar from "./components/Sidebar";
@@ -169,6 +170,7 @@ function BillingSuccessToast({ onDismiss }) {
 // Layout shell for authenticated routes. Computes Sidebar's activeView
 // from the current pathname so Sidebar.jsx itself doesn't change.
 function AppShell({ user, sidebarOpen, setSidebarOpen, onLogout }) {
+  const { t } = useI18n();
   const navigate = useNavigate();
   const { pathname } = useLocation();
   const activeView =
@@ -179,6 +181,25 @@ function AppShell({ user, sidebarOpen, setSidebarOpen, onLogout }) {
     "dashboard";
 
   const handleNav = (id) => {
+    // If the operator is in the middle of a wizard batch (uploaded /
+    // transcribed / approved any song) and clicks a sidebar item that
+    // moves them off the wizard, ask first. We read directly from the
+    // persistence layer (sessionStorage) instead of plumbing state down
+    // through props — the persistence useEffect in App keeps the snapshot
+    // in sync within one render, and the confirm dialog tolerates that
+    // tiny lag.
+    const onWizardRoute =
+      pathname === "/new" ||
+      pathname === "/review" ||
+      pathname === "/generating";
+    const leavingWizard = onWizardRoute && id !== "new";
+    if (leavingWizard
+        && wizardPersistence.hasResumableContent(wizardPersistence.load())) {
+      const msg =
+        t("wizard.confirm_leave") ||
+        "Tenés un batch en progreso. Si te vas, podés retomarlo al volver desde el banner amarillo, pero perdés el contexto actual. ¿Continuar?";
+      if (!window.confirm(msg)) return;
+    }
     if (id === "dashboard") navigate("/dashboard");
     else if (id === "new") navigate("/new");
     else if (id === "history") navigate("/videos");
@@ -285,7 +306,17 @@ function JobDetailRoute({ fetchHistory }) {
       <JobDetail
         job={job}
         onBack={() => navigate("/dashboard")}
-        onJobUpdate={(updatedJob) => { setJob(updatedJob); fetchHistory(); }}
+        onJobUpdate={(updatedJob) => {
+          // fetchHistory() is the expensive call (lists every job in the
+          // tenant). It only needs to refresh on a status BOUNDARY —
+          // pending_review → editing, editing → pending_review, etc. The
+          // /status poll during editing fires every 5s with progress
+          // updates only; if we ran fetchHistory on each tick we'd hit
+          // /jobs ~150 times during a 13-min edit. Skip those.
+          const statusChanged = job?.status !== updatedJob?.status;
+          setJob(updatedJob);
+          if (statusChanged) fetchHistory();
+        }}
       />
     </div>
   );
@@ -342,6 +373,100 @@ export default function App() {
   // 2 concurrent workers: enough to keep the queue fed without spiking
   // the API with 5 simultaneous upload-url+generate calls from one user.
   const PARALLEL_WORKERS = 2;
+
+  // ─── Wizard persistence ──────────────────────────────────────────────
+  // Snapshot of any pending batch found in sessionStorage at mount time.
+  // Drives the resume banner. Cleared when the operator clicks
+  // Continuar/Descartar or starts a fresh batch.
+  const [resumableWizard, setResumableWizard] = useState(() => {
+    const snap = wizardPersistence.load();
+    return wizardPersistence.hasResumableContent(snap) ? snap : null;
+  });
+  // Skip persistence saves while we're actively restoring state — otherwise
+  // the useEffect below fires on every setX call from the restore and
+  // overwrites the snapshot mid-restore with partial data.
+  const restoringRef = useRef(false);
+
+  // Persist every meaningful state change. Debounced via microtask
+  // batching: setX calls inside the same handler all trigger one save
+  // after React commits. We DON'T persist `jobs` (those are
+  // generation-in-progress, already on the server) or wizard control
+  // flags like `transcribing`/`transcribeError` (transient, not worth
+  // resurrecting).
+  useEffect(() => {
+    if (restoringRef.current) return;
+    const anyState =
+      files.length > 0 ||
+      approvedJobs.length > 0 ||
+      currentReview !== null ||
+      reviewQueue.length > 0;
+    if (!anyState) {
+      // Fresh wizard / cleared explicitly → blow away the snapshot too.
+      wizardPersistence.clear();
+      return;
+    }
+    wizardPersistence.save({ files, approvedJobs, currentReview, reviewQueue });
+  }, [files, approvedJobs, currentReview, reviewQueue]);
+
+  // beforeunload warning — covers closing the tab, refreshing, or
+  // navigating to an external URL. LyricsEditor already has its own
+  // "unsaved text edits" warning (lines ~155-161 of LyricsEditor.jsx);
+  // this one is broader (any wizard state at all). Returning a string
+  // is enough — browsers ignore the message text these days and show
+  // their generic "Reload site?" / "Leave site?" prompt.
+  useEffect(() => {
+    const handler = (e) => {
+      const anyState =
+        files.length > 0 ||
+        approvedJobs.length > 0 ||
+        currentReview !== null ||
+        reviewQueue.length > 0;
+      if (!anyState) return undefined;
+      e.preventDefault();
+      e.returnValue = "";
+      return "";
+    };
+    window.addEventListener("beforeunload", handler);
+    return () => window.removeEventListener("beforeunload", handler);
+  }, [files, approvedJobs, currentReview, reviewQueue]);
+
+  // Imperative resume — called by the banner's "Continuar" button.
+  const resumeWizard = useCallback(() => {
+    const snap = wizardPersistence.load();
+    if (!snap) {
+      setResumableWizard(null);
+      return;
+    }
+    restoringRef.current = true;
+    try {
+      // Restore in the order LyricsEditor / UploadZone read from. Files
+      // get rehydrated stubs so existing code that reads `file.name`
+      // works; audio playback stays disabled until re-upload but
+      // segment editing works fine.
+      setFiles((snap.files || []).map(wizardPersistence.rehydrateQueueEntry));
+      setReviewQueue((snap.reviewQueue || []).map(wizardPersistence.rehydrateQueueEntry));
+      setApprovedJobs((snap.approvedJobs || []).map(wizardPersistence.rehydrateQueueEntry));
+      setCurrentReview(wizardPersistence.rehydrateReview(snap.currentReview));
+      setResumableWizard(null);
+      // If we have a draft in progress → /review. If only approved jobs
+      // (came back between songs) → /review too, lets handleBackInReview
+      // pop the last one. If only files staged → /new for re-upload.
+      if (snap.currentReview || (snap.approvedJobs?.length || 0) > 0) {
+        navigate("/review");
+      } else {
+        navigate("/new");
+      }
+    } finally {
+      // Defer flag flip past the React commit so the persistence useEffect
+      // runs once with the FULLY restored state and writes a fresh snapshot.
+      setTimeout(() => { restoringRef.current = false; }, 0);
+    }
+  }, [navigate]);
+
+  const discardResumable = useCallback(() => {
+    wizardPersistence.clear();
+    setResumableWizard(null);
+  }, []);
 
   // --- Stamp the document title with the environment when not in prod ---
   useEffect(() => {
@@ -1083,6 +1208,55 @@ export default function App() {
 
   // --- Per-route screens (kept inline so they share App-level state) ---
 
+  // Resume banner shown on /new and /review when sessionStorage has a
+  // pending batch from a prior visit. Lets the operator restore their
+  // approved-jobs + current-review (segments included) or drop the
+  // snapshot. Hidden once they're actively working again — only meant
+  // to bridge the "I navigated away and came back" gap.
+  const resumeBanner = resumableWizard
+    ? (() => {
+        const s = wizardPersistence.summarize(resumableWizard);
+        return (
+          <div className="mb-6 rounded-card bg-amber-500/[0.08] ring-1 ring-amber-500/30 px-4 py-3 flex items-start gap-3 animate-fade-in">
+            <svg className="w-5 h-5 text-amber-400 shrink-0 mt-0.5" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
+              <circle cx="12" cy="12" r="10" />
+              <path d="M12 7v5l3 2" strokeLinecap="round" />
+            </svg>
+            <div className="flex-1 min-w-0">
+              <p className="text-sm font-semibold text-white">
+                {t("wizard.resume_title") || "Tenés un batch sin terminar"}
+              </p>
+              <p className="text-xs text-ink-secondary mt-0.5">
+                {s.approved > 0 ? `${s.approved} canción${s.approved === 1 ? "" : "es"} aprobada${s.approved === 1 ? "" : "s"}` : "Sin aprobaciones"}
+                {s.inProgress > 0 && " · 1 en edición"}
+                {s.total > 0 && ` · ${s.total} en el lote`}
+                {" · "}hace {s.mins} min
+              </p>
+              {s.songNames.length > 0 && (
+                <p className="text-[11px] text-gray-500 mt-1 truncate">
+                  {s.songNames.join(" · ")}{s.songNames.length < s.total ? " · …" : ""}
+                </p>
+              )}
+            </div>
+            <div className="flex gap-2 shrink-0">
+              <button
+                onClick={resumeWizard}
+                className="btn-primary text-xs h-9 px-3"
+              >
+                {t("wizard.resume_continue") || "Continuar"}
+              </button>
+              <button
+                onClick={discardResumable}
+                className="text-xs h-9 px-3 rounded-lg text-gray-400 hover:text-white hover:bg-white/[0.04] ring-1 ring-white/[0.06]"
+              >
+                {t("wizard.resume_discard") || "Descartar"}
+              </button>
+            </div>
+          </div>
+        );
+      })()
+    : null;
+
   const newBatchScreen = (
     <div className="w-full max-w-4xl mx-auto animate-fade-in">
       <div className="flex items-center gap-3 mb-8">
@@ -1097,6 +1271,8 @@ export default function App() {
           <p className="text-sm text-gray-500">{t("upload.new_batch_sub")}</p>
         </div>
       </div>
+
+      {resumeBanner}
 
       <UploadZone
         files={files}
@@ -1335,7 +1511,30 @@ export default function App() {
               historyLoaded={historyLoaded}
               onRetryHistory={fetchHistory}
               onSelectJob={handleSelectJob}
-              onNewBatch={() => { setFiles([]); navigate("/new"); }}
+              onNewBatch={() => {
+                // Guard the "Nuevo batch" CTA — clicking it while a
+                // batch is in progress used to silently wipe everything
+                // (setFiles([]) + navigate). Confirm first, then clear
+                // both in-memory state AND the persisted snapshot so
+                // the resume banner doesn't immediately reappear.
+                const hasState =
+                  files.length > 0 ||
+                  approvedJobs.length > 0 ||
+                  currentReview !== null ||
+                  reviewQueue.length > 0;
+                if (hasState) {
+                  const msg =
+                    t("wizard.confirm_discard_batch") ||
+                    "Vas a empezar un batch nuevo y perdés el progreso actual (lyrics corregidas, canciones aprobadas). ¿Seguro?";
+                  if (!window.confirm(msg)) return;
+                }
+                setFiles([]);
+                setApprovedJobs([]);
+                setCurrentReview(null);
+                setReviewQueue([]);
+                wizardPersistence.clear();
+                navigate("/new");
+              }}
               onViewHistory={() => navigate("/videos")}
             />
           } />

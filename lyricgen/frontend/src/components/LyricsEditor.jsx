@@ -1221,6 +1221,15 @@ export default function LyricsEditor({
         if (!seg || !(seg.text || "").trim()) return null;
         const displayText = applyCase(seg.text, textCase);
         const tier = getTier(displayText);
+        // AUTO means the worker random-picks per-job from an 8-font pool
+        // at render time (pipeline.py:_FONT_POOL + random.choice). The
+        // preview can't honestly show what that pick will be, so we
+        // render with a neutral fallback (Montserrat) and dim it +
+        // surface a badge so the operator knows the final font will
+        // differ. Without this the preview looks identical for every
+        // song in a batch and the operator (rightly) thinks the worker
+        // is going to render them all the same.
+        const isAutoFont = !font;
         const fontCss = FONT_CSS_MAP[font] || FONT_CSS_MAP[""];
         const basePx = tier.sizePx;
         const scaledPx = Math.round(basePx * Math.max(0.6, Math.min(1.5, fontScale)));
@@ -1231,9 +1240,27 @@ export default function LyricsEditor({
         return (
           <div className="mt-4 rounded-card bg-surface-2/40 ring-1 ring-white/[0.04] overflow-hidden animate-fade-in">
             <div className="flex items-center justify-between px-4 py-2 border-b border-white/[0.04]">
-              <span className="text-[11px] text-gray-500 uppercase tracking-wider">Preview — cómo quedarán las lyrics</span>
+              <span className="text-[11px] text-gray-500 uppercase tracking-wider">
+                {t("editor.preview_header") || "Preview — cómo quedarán las lyrics"}
+              </span>
               <button onClick={() => setFocusedSegId(null)} className="text-gray-600 hover:text-white text-xs transition-colors">✕</button>
             </div>
+            {/* AUTO badge: shown only when no explicit font picked. Sits
+                above the 16:9 preview so it's the first thing the eye
+                hits before reading the rendered text. */}
+            {isAutoFont && (
+              <div className="px-4 py-2 bg-amber-500/[0.06] border-b border-amber-500/20 flex items-start gap-2">
+                <svg className="w-3.5 h-3.5 text-amber-400 shrink-0 mt-0.5" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
+                  <circle cx="12" cy="12" r="10" />
+                  <path d="M12 8h.01M11 12h1v4h1" strokeLinecap="round" strokeLinejoin="round"/>
+                </svg>
+                <p className="text-[11px] text-amber-200/90 leading-relaxed">
+                  <span className="font-semibold">{t("editor.auto_font_badge") || "Tipografía: Auto"}</span>
+                  {" · "}
+                  {t("editor.auto_font_explainer") || "el render va a elegir una de 8 fuentes al azar por canción. Esta vista previa usa Montserrat solo de referencia — el video final puede verse distinto."}
+                </p>
+              </div>
+            )}
             {/* 16:9 preview card */}
             <div
               className="relative w-full flex items-center justify-center bg-gradient-to-b from-gray-900 to-black"
@@ -1245,6 +1272,8 @@ export default function LyricsEditor({
                   fontSize: `${previewFontPx}px`,
                   fontWeight: 700,
                   color: "white",
+                  // Dim AUTO previews so they don't read as "final look"
+                  opacity: isAutoFont ? 0.7 : 1,
                   textShadow: textContrast === "strong"
                     ? "0 0 8px rgba(0,0,0,1), -1px -1px 0 #000, 1px -1px 0 #000, -1px 1px 0 #000, 1px 1px 0 #000, 2px 2px 4px rgba(0,0,0,0.9)"
                     : textContrast === "medium"
@@ -1271,7 +1300,9 @@ export default function LyricsEditor({
               </span>
             </div>
             <div className="px-4 py-2 flex flex-wrap gap-x-4 gap-y-1 text-[10px] text-gray-600">
-              <span>Fuente: {font || "Auto"}</span>
+              <span className={isAutoFont ? "text-amber-400 font-medium" : ""}>
+                Fuente: {font || (t("editor.auto_font_inline") || "Auto (se elige al renderizar)")}
+              </span>
               <span>Tamaño: {fontScale}×</span>
               <span className={textCase === "title" ? "text-amber-400 font-medium" : ""}>
                 Caja: {textCase === "upper" ? "MAYÚSCULAS" : textCase === "title" ? "Título (cada palabra capitalizada)" : textCase === "lower" ? "minúsculas" : "Original"}

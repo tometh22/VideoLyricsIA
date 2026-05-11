@@ -38,6 +38,7 @@ function StatusBadge({ status, t }) {
     pending_review:     { label: t("batch.pending_review") || "Pending",  cls: "bg-amber-500/15 text-amber-300 ring-1 ring-amber-500/30" },
     processing:         { label: t("history.processing"),                 cls: "bg-brand/15 text-brand-light ring-1 ring-brand/30" },
     queued:             { label: "En cola",                                cls: "bg-surface-3/60 text-ink-secondary ring-1 ring-white/[0.06]" },
+    editing:            { label: t("history.editing") || "Re-renderizando", cls: "bg-brand/15 text-brand-light ring-1 ring-brand/30" },
     error:              { label: t("history.error"),                      cls: "bg-red-500/15 text-red-300 ring-1 ring-red-500/30" },
     validation_failed:  { label: t("batch.validation_failed") || "Failed", cls: "bg-red-500/15 text-red-300 ring-1 ring-red-500/30" },
   };
@@ -74,7 +75,10 @@ function VideoCard({ job, onSelect, onDelete, selected, onToggleSelect, t }) {
       artistName = fallbackName.split("_").slice(1).join("_");
     }
   }
-  const showThumb = job.status === "done" || job.status === "pending_review";
+  // Show thumbnail for editing too — there's a prior rendered video on R2
+  // (the user is requesting a re-render OF an existing video) so the
+  // thumbnail is real, just temporarily stale.
+  const showThumb = job.status === "done" || job.status === "pending_review" || job.status === "editing";
   const thumbSrc = useMediaUrl(showThumb ? job.job_id : "", "thumbnail", "preview");
   const canDelete = DELETABLE.has(job.status);
 
@@ -108,7 +112,7 @@ function VideoCard({ job, onSelect, onDelete, selected, onToggleSelect, t }) {
             onError={(e) => { e.target.style.display = "none"; }}
           />
         )}
-        {(job.status === "processing" || job.status === "queued") && (
+        {(job.status === "processing" || job.status === "queued" || job.status === "editing") && (
           <div className="absolute inset-0 flex items-center justify-center">
             <div className="w-7 h-7 border-2 border-brand border-t-transparent rounded-full animate-spin" />
           </div>
@@ -199,7 +203,7 @@ const FILTERS = [
   { id: "all",     label: "Todos",     match: () => true },
   { id: "done",    label: "Listos",    match: (j) => j.status === "done" },
   { id: "pending", label: "Pendientes", match: (j) => j.status === "pending_review" },
-  { id: "active",  label: "En curso",  match: (j) => j.status === "processing" || j.status === "queued" },
+  { id: "active",  label: "En curso",  match: (j) => j.status === "processing" || j.status === "queued" || j.status === "editing" },
   { id: "failed",  label: "Fallidos",  match: (j) => j.status === "error" || j.status === "validation_failed" },
 ];
 

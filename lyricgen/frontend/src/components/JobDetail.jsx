@@ -3,6 +3,7 @@ import { useI18n } from "../i18n";
 import { getDownloadUrl, useMediaUrl } from "../mediaUrl";
 import { JobDetailTour } from "./OnboardingTour";
 import ProResBadge from "./ProResBadge";
+import EditRequestPanel from "./EditRequestPanel";
 
 const API = import.meta.env.VITE_API_URL || "";
 
@@ -186,8 +187,98 @@ export default function JobDetail({ job, onBack, onJobUpdate }) {
   const canPreview = job.status === "done" || job.status === "pending_review";
   const canDownload = job.status === "done";
   const isPendingReview = job.status === "pending_review";
+  const isEditing = job.status === "editing";
   const isValidationFailed = job.status === "validation_failed";
   const isError = job.status === "error";
+
+  // While the worker is re-rendering an edit request, poll /status every
+  // 5s and propagate updates up so the rest of the screen (status badge,
+  // approve panel visibility, preview URLs) stays in sync. The interval
+  // cleans itself up the moment status leaves "editing".
+  useEffect(() => {
+    if (!isEditing) return;
+    let cancelled = false;
+    const tick = async () => {
+      try {
+        const res = await fetch(`${API}/status/${job.job_id}`, { headers: authHeaders() });
+        if (!res.ok || cancelled) return;
+        const updated = await res.json();
+        if (cancelled) return;
+        // Merge into existing job so we don't drop fields /status doesn't return
+        // (youtube_data, etc.). onJobUpdate flows it back through App state.
+        if (onJobUpdate) onJobUpdate({ ...job, ...updated });
+      } catch {}
+    };
+    const iv = setInterval(tick, 5000);
+    tick(); // first tick immediately, no need to wait 5s
+    return () => { cancelled = true; clearInterval(iv); };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [isEditing, job.job_id]);
+
+  const handleEditTriggered = (resp) => {
+    // Server already flipped status to "editing" + bumped edit_count.
+    // Reflect that immediately in the UI so the approve panel hides and
+    // the editing overlay appears, then let polling take over.
+    if (onJobUpdate) {
+      onJobUpdate({
+        ...job,
+        status: "editing",
+        edit_count: resp?.edit_count ?? (job.edit_count || 0) + 1,
+        edits_remaining: resp?.edits_remaining ?? Math.max(0, (job.edits_remaining ?? 3) - 1),
+        current_step: resp?.edit_type === "background" ? "background" : "video",
+        progress: 0,
+      });
+    }
+  };
+
+  // Editing in progress: render a focused panel instead of falling through
+  // to the "not available" early-return below. canPreview is false during
+  // editing (the video bytes are being rewritten on R2) but we DO want to
+  // show progress + clear messaging — not the generic dead-end message.
+  if (isEditing) {
+    return (
+      <div className="w-full max-w-2xl animate-fade-in">
+        <div className="flex items-center gap-3 mb-6">
+          <button onClick={onBack} className="w-9 h-9 shrink-0 rounded-xl bg-surface-2/40 ring-1 ring-white/[0.04] hover:ring-white/[0.08] flex items-center justify-center text-gray-400 hover:text-white transition-colors">
+            <svg className="w-4 h-4" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24"><path d="M19 12H5M12 19l-7-7 7-7" /></svg>
+          </button>
+          <div>
+            <h2 className="text-xl font-bold">{name}</h2>
+            <p className="text-sm text-gray-500">{job.artist}</p>
+          </div>
+        </div>
+        <div className="rounded-card p-5 bg-brand/[0.08] ring-1 ring-brand/25">
+          <div className="flex items-start gap-3">
+            <div className="w-9 h-9 rounded-lg bg-brand/15 ring-1 ring-brand/30 flex items-center justify-center shrink-0">
+              <span className="w-4 h-4 border-2 border-brand-light border-t-transparent rounded-full animate-spin" />
+            </div>
+            <div className="flex-1 min-w-0">
+              <p className="text-sm font-semibold text-white">
+                {t("edit.in_progress_title") || "Aplicando tus cambios..."}
+              </p>
+              <p className="text-xs text-ink-secondary mt-0.5">
+                {job.current_step === "background"
+                  ? (t("edit.in_progress_bg") || "Generando nuevo fondo con Veo · mantiene lyrics y tiempos · ~10-15 min")
+                  : (t("edit.in_progress_typo") || "Re-renderizando con la tipografía nueva · usa el fondo cacheado · ~5-10 min")}
+              </p>
+              <div className="mt-3 h-1.5 rounded-full bg-surface-3/60 overflow-hidden">
+                <div
+                  className="h-full bg-gradient-to-r from-brand to-brand-light transition-[width] duration-700 ease-out"
+                  style={{ width: `${Math.min(100, Math.max(3, job.progress || 0))}%` }}
+                />
+              </div>
+              <p className="text-[10px] text-gray-500 mt-1 font-mono">
+                {job.current_step || "?"} · {job.progress || 0}%
+              </p>
+              <p className="text-[11px] text-gray-500 mt-3 leading-relaxed">
+                {t("edit.no_video_during_editing") || "El video viejo se está reemplazando con tus cambios. Cuando termine vas a poder verlo acá."}
+              </p>
+            </div>
+          </div>
+        </div>
+      </div>
+    );
+  }
 
   if (!canPreview && !isValidationFailed && !isError) {
     return (
@@ -745,6 +836,15 @@ export default function JobDetail({ job, onBack, onJobUpdate }) {
             )}
           </div>
         </>
+      )}
+
+      {/* The dedicated full-page editing UI lives in the early return at
+          the top of the component — by the time we get down here, status
+          is pending_review or done, so no editing overlay needed. */}
+
+      {/* Edit request panel for pending_review (above approve) */}
+      {isPendingReview && (
+        <EditRequestPanel job={job} onEditTriggered={handleEditTriggered} />
       )}
 
       {/* Approval panel for pending_review */}
