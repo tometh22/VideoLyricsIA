@@ -2882,7 +2882,7 @@ You MUST pick a scene that fits this concept's visual vocabulary:
 
 Hard rules:
 - "style" must always be "video"
-- "prompt" is 20-40 words: scene + camera movement + colors + lighting + atmosphere
+- "prompt" is 80-120 words. Describe: (1) specific scene subject and setting in detail, (2) exact camera movement and framing, (3) color palette and dominant tones, (4) lighting type and direction, (5) atmosphere, mood, and at least one specific texture or material detail. Be precise and cinematic — avoid vague adjectives like "beautiful" or "amazing".
 - Pick a DIFFERENT specific scene each time (don't repeat across songs)
 - The concept choice is binding — do NOT drift to a different visual category
 - Never include people, faces, hands, or readable text in the scene{movement_extra_line}"""
@@ -2906,7 +2906,7 @@ STEP 1 — Choose the scene:
 
 Hard rules:
 - "style" must always be "video"
-- "prompt" is 20-40 words: scene + camera movement + colors + lighting + atmosphere
+- "prompt" is 80-120 words. Describe: (1) specific scene subject and setting in detail, (2) exact camera movement and framing, (3) color palette and dominant tones, (4) lighting type and direction, (5) atmosphere, mood, and at least one specific texture or material detail. Be precise and cinematic — avoid vague adjectives like "beautiful" or "amazing".
 - Pick a DIFFERENT specific scene each time (don't repeat across songs)
 - If lyrics reference a sport (football, basketball, etc.) → use field/pitch/arena/equipment, NOT cars or generic cityscapes
 - Do NOT default to "calm ocean at sunset" unless this song is BALLAD
@@ -2934,7 +2934,7 @@ STEP 1 — Choose the scene:
   - folk     → mountain vistas, dusty roads, wheat fields, riverside campfires
   - metal    → volcanic lava streams, dark cathedrals, stormy lightning, cracked obsidian
 
-STEP 2 — Output JSON with a 20-40 word prompt: scene + camera movement + colors + lighting + atmosphere.
+STEP 2 — Output JSON with an 80-120 word prompt. Describe: (1) specific scene subject and setting in detail, (2) exact camera movement and framing, (3) color palette and dominant tones, (4) lighting type and direction, (5) atmosphere, mood, and at least one specific texture or material detail. Be precise and cinematic — avoid vague adjectives like "beautiful" or "amazing".
 
 Hard rules:
 - "style" must always be "video"
@@ -3573,6 +3573,54 @@ def _extract_frame_from_video(video_path: str, output_image_path: str) -> str:
     return output_image_path
 
 
+def _score_video_relevance(video_path: str, prompt: str) -> int:
+    """Ask Gemini Vision whether the video matches the intended scene prompt.
+
+    Extracts one frame and returns a relevance score 1-10.
+    Fails open (returns 8) so a Gemini error never blocks a good video.
+    """
+    from google import genai
+    import tempfile
+
+    tmp_frame = None
+    try:
+        with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as f:
+            tmp_frame = f.name
+        _extract_frame_from_video(video_path, tmp_frame)
+
+        client = _get_genai_client()
+        with open(tmp_frame, "rb") as f:
+            image_bytes = f.read()
+
+        response = client.models.generate_content(
+            model="gemini-2.5-flash",
+            contents=[
+                genai.types.Part.from_bytes(data=image_bytes, mime_type="image/jpeg"),
+                (
+                    f"This is a frame from an AI-generated background video.\n"
+                    f"Intended scene: \"{prompt}\"\n\n"
+                    f"Score how well the frame matches the intended scene, 1-10.\n"
+                    f"Focus on whether the MAIN SUBJECT is correct "
+                    f"(e.g. if the scene should show a football pitch but shows cars, score 1-2).\n"
+                    f"Respond with ONLY a single integer, nothing else."
+                ),
+            ],
+            config=genai.types.GenerateContentConfig(
+                temperature=0.0,
+                max_output_tokens=5,
+                thinking_config=genai.types.ThinkingConfig(thinking_budget=0),
+            ),
+        )
+        score = int(response.text.strip())
+        return max(1, min(10, score))
+    except Exception as e:
+        print(f"[BG] Relevance score error (fail-open): {e}")
+        return 8
+    finally:
+        if tmp_frame and os.path.exists(tmp_frame):
+            os.unlink(tmp_frame)
+
+
 def _ensure_background(style_hint: str, job_dir: str, lyrics_text: str = None,
                        artist: str = "", job_id: str = None,
                        song_title: str = "", genre: str = "",
@@ -3600,6 +3648,7 @@ def _ensure_background(style_hint: str, job_dir: str, lyrics_text: str = None,
 
     bg_path = os.path.join(job_dir, "bg_generated.mp4")
     import time as _time_bg
+    quality_retry_used = False
     for attempt in range(3):
         try:
             _generate_veo_video(
@@ -3608,6 +3657,19 @@ def _ensure_background(style_hint: str, job_dir: str, lyrics_text: str = None,
                 image_path=image_to_video_path,
                 movement_style=movement_style,
             )
+            # Semantic relevance check — cap at one retry to bound cost (+$0.80 worst case)
+            if not quality_retry_used:
+                score = _score_video_relevance(bg_path, prompt)
+                print(f"[BG] Relevance score: {score}/10 for prompt: {prompt[:60]}...")
+                if score < 7:
+                    quality_retry_used = True
+                    print(f"[BG] Score {score} < 7 — generating new prompt and retrying VEO")
+                    result = _get_unique_prompt(
+                        lyrics_text, artist, job_id=job_id, song_title=song_title,
+                        genre=genre, concept=concept, movement_style=movement_style,
+                    )
+                    prompt = result["prompt"]
+                    continue
             return bg_path
         except Exception as e:
             print(f"[BG] Veo 3 attempt {attempt + 1}/3 failed: {e}")
