@@ -4,6 +4,7 @@ import { getDownloadUrl, useMediaUrl } from "../mediaUrl";
 import { JobDetailTour } from "./OnboardingTour";
 import ProResBadge from "./ProResBadge";
 import EditRequestPanel from "./EditRequestPanel";
+import EnableProResModal from "./EnableProResModal";
 
 const API = import.meta.env.VITE_API_URL || "";
 
@@ -554,10 +555,29 @@ export default function JobDetail({ job, onBack, onJobUpdate }) {
   // existed (or whose prewarm died silently) sit forever with
   // umg_master_url=null and no way for the operator to recover the file.
   // Showing the button always lets clicking it trigger the recovery.
+  // Un job es "UMG" si fue creado con delivery_profile=umg/both, O si
+  // se le habilitó ProRes retroactivamente via POST /enable-prores
+  // (que persiste umg_spec sin tocar delivery_profile, para no perder
+  // el dato histórico de cómo se rindió originalmente).
   const isUmgJob =
-    job.delivery_profile === "umg" || job.delivery_profile === "both";
+    job.delivery_profile === "umg"
+    || job.delivery_profile === "both"
+    || !!job.umg_spec;
   const isJobDone = job.status === "done";
   const hasUmgMaster = isUmgJob && isJobDone;
+
+  // El botón "Exportar a ProRes" aparece solo cuando el job está done,
+  // NO tiene ProRes habilitado todavía, y el usuario tiene el feature
+  // flag prores_export. Click → modal que persiste umg_spec en el job
+  // y dispara el transcoding. Una vez hecho, isUmgJob flipea a true en
+  // el próximo /status poll y aparece el tab de ProRes Master.
+  const user = (() => {
+    try { return JSON.parse(localStorage.getItem("genly_user") || "null"); } catch { return null; }
+  })();
+  const canEnableProRes =
+    isJobDone && !isUmgJob && user?.features?.prores_export === true;
+  const [showProResModal, setShowProResModal] = useState(false);
+  const [proResToast, setProResToast] = useState(null);
   // Short ProRes follows the same opt-in: any UMG-flavoured job gets a
   // separate vertical-format master alongside the main one. Generated
   // lazily by /download/{id}/umg_short the first time it's clicked.
@@ -903,6 +923,58 @@ export default function JobDetail({ job, onBack, onJobUpdate }) {
             </button>
           </div>
         </div>
+      )}
+
+      {/* Exportar a ProRes — para jobs MP4-only cuyo tenant tiene
+          prores_export habilitado. Persiste umg_spec retroactivo y
+          dispara el transcoding lazy. */}
+      {canEnableProRes && (
+        <div className="rounded-card bg-surface-2/40 ring-1 ring-white/[0.04] p-5 mb-4 flex items-start gap-4">
+          <div className="w-10 h-10 shrink-0 rounded-xl bg-brand/10 ring-1 ring-brand/30 flex items-center justify-center text-brand">
+            <svg className="w-5 h-5" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
+              <path d="M12 4v12m0 0l-4-4m4 4l4-4M4 20h16" strokeLinecap="round" strokeLinejoin="round" />
+            </svg>
+          </div>
+          <div className="flex-1 min-w-0">
+            <div className="text-sm font-semibold text-white">
+              {t("prores.cta_title") || "Exportar a ProRes (.mov broadcast)"}
+            </div>
+            <div className="text-xs text-gray-400 mt-0.5">
+              {t("prores.cta_desc") ||
+                "Este video se rindió como MP4. Generá una versión ProRes para broadcast / cliente."}
+            </div>
+            {proResToast && (
+              <div className="mt-2 text-xs text-accent">
+                {proResToast}
+              </div>
+            )}
+          </div>
+          <button
+            type="button"
+            onClick={() => setShowProResModal(true)}
+            className="shrink-0 px-4 py-2 rounded-md text-sm font-medium text-white bg-brand hover:bg-brand-strong ring-1 ring-brand/30 transition-colors"
+          >
+            {t("prores.cta_button") || "Exportar"}
+          </button>
+        </div>
+      )}
+
+      {showProResModal && (
+        <EnableProResModal
+          jobId={job.job_id}
+          onClose={() => setShowProResModal(false)}
+          onSuccess={(data) => {
+            setShowProResModal(false);
+            setProResToast(
+              t("prores.queued_toast") ||
+                "ProRes encolado. En 1-5 min va a estar disponible para descargar.",
+            );
+            // Trigger un refresh del job en el próximo tick para que
+            // isUmgJob flipee a true (gracias al umg_spec recién
+            // persistido) y aparezca el tab de Máster ProRes.
+            onJobUpdate?.({ ...job, umg_spec: data.umg_spec });
+          }}
+        />
       )}
 
       {/* YouTube Panel (only for approved/done jobs) */}
