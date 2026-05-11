@@ -44,7 +44,25 @@ def main():
     conn = Redis.from_url(redis_url)
     # Enterprise queue first so premium tenants get priority.
     queues = [Queue("enterprise", connection=conn), Queue("default", connection=conn)]
-    worker = Worker(queues, connection=conn)
+    # Heartbeat (job_monitoring_interval) controls how often the worker
+    # writes its "I'm alive" timestamp to Redis. The default 30 s is
+    # fine; the related value that matters for deploy resilience is the
+    # worker_ttl — how long after a missed heartbeat RQ declares the
+    # worker dead. RQ defaults that to job_monitoring_interval * 12 =
+    # 360 s (~6 min), which is the "deploy zombie window" users see in
+    # the UI: jobs that look "processing" but no one's working on them.
+    # We pin worker_ttl to 90 s so cleanup_ghosts runs ~90 s after a
+    # worker death instead of 6 min — most users won't notice the gap,
+    # and the new orphan-no-worker reaper sweep (reaper.py) is the
+    # backstop if RQ's own cleanup misses.
+    monitoring_interval = int(os.environ.get("RQ_JOB_MONITORING_INTERVAL", "30"))
+    worker_ttl = int(os.environ.get("RQ_WORKER_TTL", "90"))
+    worker = Worker(
+        queues,
+        connection=conn,
+        job_monitoring_interval=monitoring_interval,
+        worker_ttl=worker_ttl,
+    )
 
     def _graceful(signum, _frame):
         print(f"[WORKER] Received signal {signum}; requesting stop after current job")

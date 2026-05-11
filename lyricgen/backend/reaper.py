@@ -71,6 +71,21 @@ _ORPHAN_POLL_THRESHOLD_MIN = int(os.environ.get(
     "REAPER_ORPHAN_POLL_THRESHOLD_MIN", "10",
 ))
 
+# Fast-lane threshold for jobs where Postgres says "processing" but no
+# RQ worker claims the job_id in its currently_executing registry. This
+# catches the worst case the AI-provenance sweep can't: a worker that
+# died DURING moviepy/ffmpeg render (current_step='video'), which has
+# no provenance row to age out on.
+# Set higher than _ORPHAN_POLL_THRESHOLD_MIN because RQ's worker
+# heartbeat (worker_ttl, default 420 s = 7 min, tuned down to 90 s in
+# worker.py) is the canonical "is the worker alive" timer — we don't
+# want to race it. 15 min gives heartbeat-expiry + cleanup_ghosts +
+# Retry interval room to do their thing first; if THEY haven't
+# recovered the job in that window, the reaper takes over.
+_ORPHAN_NO_RQ_THRESHOLD_MIN = int(os.environ.get(
+    "REAPER_ORPHAN_NO_RQ_THRESHOLD_MIN", "15",
+))
+
 # transcribed_pending jobs are uploaded but waiting on the user to finish
 # the lyrics editor and click Generate. They consume disk + R2 storage,
 # and abandoned ones (closed tab, lost connection) accumulate forever
@@ -134,6 +149,103 @@ def find_orphan_polling_jobs(
     )
 
 
+def _live_rq_job_ids() -> set[str] | None:
+    """Return the set of job_ids RQ currently considers in-flight, or
+    None when we can't talk to Redis (Redis unreachable, RQ not
+    importable, etc.). Caller treats None as "skip the sweep this
+    cycle" — we never want to mass-reap jobs just because Redis
+    blipped.
+
+    We union three sources to maximize false-negative tolerance:
+      - StartedJobRegistry per queue (the canonical "owned by a live
+        worker" registry).
+      - ScheduledJobRegistry per queue (pre-scheduled retries from
+        Retry()).
+      - Queue.get_job_ids() (still pending, not yet picked up — for
+        the case where a freshly-enqueued job hasn't been claimed
+        yet but is fully legitimate).
+    Any job_id present in any of those three is "live to RQ" and
+    NOT a candidate for orphan reaping.
+    """
+    try:
+        from queue_jobs import _init_redis
+        r, q_default, q_enterprise = _init_redis()
+        if r is None:
+            return None
+        from rq.registry import (
+            StartedJobRegistry,
+            ScheduledJobRegistry,
+        )
+        live: set[str] = set()
+        for q in (q_default, q_enterprise):
+            if q is None:
+                continue
+            try:
+                # currently_executing — the strongest signal.
+                live.update(StartedJobRegistry(queue=q).get_job_ids())
+            except Exception:
+                pass
+            try:
+                # Scheduled retries (Retry(max=1, interval=30) lands
+                # here in the 30-s window between attempts).
+                live.update(ScheduledJobRegistry(queue=q).get_job_ids())
+            except Exception:
+                pass
+            try:
+                # Pending — fresh enqueues not yet claimed.
+                live.update(q.get_job_ids())
+            except Exception:
+                pass
+        return live
+    except Exception:
+        return None
+
+
+def find_orphan_no_worker_jobs(
+    db: Session,
+    threshold_min: int = _ORPHAN_NO_RQ_THRESHOLD_MIN,
+    live_rq_ids: set[str] | None = None,
+) -> list[Job]:
+    """Return jobs in processing/queued that RQ doesn't know about
+    AND that have aged past threshold_min since `created_at`.
+
+    Why this exists: the AI-provenance sweep
+    (find_orphan_polling_jobs) only catches stalls during an in-flight
+    AI call. Stalls during the moviepy/ffmpeg render step
+    (current_step='video') have no provenance row to time out on —
+    those previously waited the full 100 min age-based sweep before
+    the reaper noticed. This finder cuts that recovery to 15 min by
+    consulting RQ directly: if Postgres says a worker owns this job
+    but Redis says no live worker claims it, the worker is gone.
+
+    Returns [] when:
+      - Redis is unreachable (live_rq_ids is None) — we can't
+        confidently say "no worker has this" when the source of
+        truth is offline.
+      - The job is brand new (age < threshold_min) — it's normal for
+        a fresh enqueue to take a few seconds to show in the
+        registry; never reap on that race.
+
+    `live_rq_ids`: passed in by `_reap_all_stuck_inner` so the Redis
+    snapshot is taken once per cycle and reused across the three
+    finders. Tests can pass a fake set to avoid Redis dependency."""
+    if live_rq_ids is None:
+        live_rq_ids = _live_rq_job_ids()
+    if live_rq_ids is None:
+        # Redis blip — bail out rather than risk a false-positive sweep.
+        logger.debug("reaper: Redis unavailable; skipping no-worker sweep")
+        return []
+    cutoff = datetime.now(timezone.utc) - timedelta(minutes=threshold_min)
+    candidates = (
+        db.query(Job)
+        .filter(Job.status.in_(["processing", "queued"]))
+        .filter(Job.created_at < cutoff)
+        .order_by(Job.created_at.asc())
+        .all()
+    )
+    return [j for j in candidates if j.job_id not in live_rq_ids]
+
+
 def find_abandoned_transcribed(
     db: Session,
     ttl_min: int = _TRANSCRIBED_PENDING_TTL_MIN,
@@ -191,6 +303,20 @@ def _reason_for(job: Job) -> str:
 def _reason_for_orphan(job: Job) -> str:
     return (
         "El servidor se reinició mientras generábamos el video de fondo. "
+        "Tu MP3 sigue guardado: apretá \"Reintentar sin re-subir\" "
+        "para volver a generarlo."
+    )
+
+
+def _reason_for_no_worker(job: Job) -> str:
+    # Generic phrasing that covers both "worker died mid-render"
+    # (most common) and "RQ heartbeat expired without re-queue"
+    # (rarer, but happens during Railway maintenance windows). The
+    # user-actionable bit is identical to the AI-orphan path: their
+    # MP3 is intact and Reintentar is the right move.
+    step = job.current_step or "render"
+    return (
+        f"El servidor se reinició durante el paso '{step}' del render. "
         "Tu MP3 sigue guardado: apretá \"Reintentar sin re-subir\" "
         "para volver a generarlo."
     )
@@ -425,12 +551,19 @@ def _reap_all_stuck_inner(threshold_min: int) -> int:
                 return 0
 
         stuck = find_stuck_jobs(db, threshold_min)
+        # Snapshot Redis once per cycle so the three orphan sweeps see
+        # a consistent view (and we don't hammer RQ for every finder).
+        live_rq_ids = _live_rq_job_ids()
         orphans = find_orphan_polling_jobs(db)
-        # Drop jobs that already appear in `stuck` so we don't double-reap
-        # the same row (the age-based and provenance-based sweeps overlap
-        # for jobs that are both very old AND have an in-flight AI call).
+        no_worker = find_orphan_no_worker_jobs(db, live_rq_ids=live_rq_ids)
+        # Drop jobs that already appear in earlier sweeps so we don't
+        # double-reap the same row (the three sweeps overlap for jobs
+        # that are very old AND have an in-flight AI call AND have no
+        # live worker).
         stuck_ids = {j.job_id for j in stuck}
         orphans = [j for j in orphans if j.job_id not in stuck_ids]
+        seen = stuck_ids | {j.job_id for j in orphans}
+        no_worker = [j for j in no_worker if j.job_id not in seen]
         abandoned = find_abandoned_transcribed(db)
         abandoned_uploads = find_abandoned_uploads(db)
         # Reap abandoned transcribed_pending rows quietly: the user never
@@ -448,12 +581,14 @@ def _reap_all_stuck_inner(threshold_min: int) -> int:
             if abandoned_uploads:
                 print(f"[REAPER] cleaned up {len(abandoned_uploads)} abandoned "
                       f"awaiting_upload job(s)")
-        if not stuck and not orphans:
+        if not stuck and not orphans and not no_worker:
             return 0
         for job in stuck:
             reap_stuck_job(db, job, _reason_for(job))
         for job in orphans:
             reap_stuck_job(db, job, _reason_for_orphan(job))
+        for job in no_worker:
+            reap_stuck_job(db, job, _reason_for_no_worker(job))
         db.commit()
         # Detach so we can pass to background helpers without keeping the
         # session open. The fields we need are already populated.
@@ -461,10 +596,12 @@ def _reap_all_stuck_inner(threshold_min: int) -> int:
             db.expunge(job)
         for job in orphans:
             db.expunge(job)
-        # Merge orphan reaps into the same notification batch as age-based
-        # ones — operators care about "what got reaped this cycle", not
-        # which sweep flagged it.
-        stuck = stuck + orphans
+        for job in no_worker:
+            db.expunge(job)
+        # Merge all reaps into the same notification batch — operators
+        # care about "what got reaped this cycle", not which sweep
+        # flagged it.
+        stuck = stuck + orphans + no_worker
     finally:
         # Releasing the advisory lock is implicit on session close
         # (Postgres releases all session-scoped locks automatically),

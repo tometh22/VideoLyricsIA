@@ -5,6 +5,7 @@ import { JobDetailTour } from "./OnboardingTour";
 import ProResBadge from "./ProResBadge";
 import EditRequestPanel from "./EditRequestPanel";
 import EnableProResModal from "./EnableProResModal";
+import ProgressPanel from "./ProgressPanel";
 
 const API = import.meta.env.VITE_API_URL || "";
 
@@ -222,13 +223,22 @@ export default function JobDetail({ job, onBack, onJobUpdate }) {
   const isEditing = job.status === "editing";
   const isValidationFailed = job.status === "validation_failed";
   const isError = job.status === "error";
+  // Any in-flight worker phase: fresh render or queued. Pre-fix this
+  // dropped into the generic "Todavía no se puede previsualizar" dead-
+  // end below; now it routes to ProgressPanel.
+  const isProcessing = job.status === "processing" || job.status === "queued";
 
-  // While the worker is re-rendering an edit request, poll /status every
-  // 5s and propagate updates up so the rest of the screen (status badge,
-  // approve panel visibility, preview URLs) stays in sync. The interval
-  // cleans itself up the moment status leaves "editing".
+  // Live status while the worker has the job. Covers BOTH `processing`
+  // (fresh render) and `editing` (partial re-render). We keep the 5-s
+  // /status polling as a fallback for browsers/proxies that strip SSE
+  // (corporate firewalls, some CDNs) — but the SSE channel below
+  // delivers updates instantly when it works, so the user sees the
+  // progress bar tick forward without the 5-s lag.
+  //
+  // The polling loop ends the moment status leaves the live set, so
+  // there's no risk of hammering /status on completed jobs.
   useEffect(() => {
-    if (!isEditing) return;
+    if (!isEditing && !isProcessing) return;
     let cancelled = false;
     const tick = async () => {
       try {
@@ -245,7 +255,7 @@ export default function JobDetail({ job, onBack, onJobUpdate }) {
     tick(); // first tick immediately, no need to wait 5s
     return () => { cancelled = true; clearInterval(iv); };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [isEditing, job.job_id]);
+  }, [isEditing, isProcessing, job.job_id]);
 
   const handleEditTriggered = (resp) => {
     // Server already flipped status to "editing" + bumped edit_count.
@@ -263,52 +273,21 @@ export default function JobDetail({ job, onBack, onJobUpdate }) {
     }
   };
 
-  // Editing in progress: render a focused panel instead of falling through
-  // to the "not available" early-return below. canPreview is false during
-  // editing (the video bytes are being rewritten on R2) but we DO want to
-  // show progress + clear messaging — not the generic dead-end message.
-  if (isEditing) {
+  // Live worker phase (editing OR fresh render). Pre-fix, processing
+  // dropped into the generic "Todavía no se puede previsualizar" dead
+  // end below — the user had no way to see step/progress without
+  // bouncing back to Historial. ProgressPanel covers both flows with
+  // a shared layout, step-localized Spanish labels, a "tardando más
+  // de lo usual" banner, and a Force-fail escape hatch.
+  if (isEditing || isProcessing) {
     return (
-      <div className="w-full max-w-2xl animate-fade-in">
-        <div className="flex items-center gap-3 mb-6">
-          <button onClick={onBack} className="w-9 h-9 shrink-0 rounded-xl bg-surface-2/40 ring-1 ring-white/[0.04] hover:ring-white/[0.08] flex items-center justify-center text-gray-400 hover:text-white transition-colors">
-            <svg className="w-4 h-4" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24"><path d="M19 12H5M12 19l-7-7 7-7" /></svg>
-          </button>
-          <div>
-            <h2 className="text-xl font-bold">{name}</h2>
-            <p className="text-sm text-gray-500">{job.artist}</p>
-          </div>
-        </div>
-        <div className="rounded-card p-5 bg-brand/[0.08] ring-1 ring-brand/25">
-          <div className="flex items-start gap-3">
-            <div className="w-9 h-9 rounded-lg bg-brand/15 ring-1 ring-brand/30 flex items-center justify-center shrink-0">
-              <span className="w-4 h-4 border-2 border-brand-light border-t-transparent rounded-full animate-spin" />
-            </div>
-            <div className="flex-1 min-w-0">
-              <p className="text-sm font-semibold text-white">
-                {t("edit.in_progress_title") || "Aplicando tus cambios..."}
-              </p>
-              <p className="text-xs text-ink-secondary mt-0.5">
-                {job.current_step === "background"
-                  ? (t("edit.in_progress_bg") || "Generando nuevo fondo con Veo · mantiene lyrics y tiempos · ~10-15 min")
-                  : (t("edit.in_progress_typo") || "Re-renderizando con la tipografía nueva · usa el fondo cacheado · ~5-10 min")}
-              </p>
-              <div className="mt-3 h-1.5 rounded-full bg-surface-3/60 overflow-hidden">
-                <div
-                  className="h-full bg-gradient-to-r from-brand to-brand-light transition-[width] duration-700 ease-out"
-                  style={{ width: `${Math.min(100, Math.max(3, job.progress || 0))}%` }}
-                />
-              </div>
-              <p className="text-[10px] text-gray-500 mt-1 font-mono">
-                {job.current_step || "?"} · {job.progress || 0}%
-              </p>
-              <p className="text-[11px] text-gray-500 mt-3 leading-relaxed">
-                {t("edit.no_video_during_editing") || "El video viejo se está reemplazando con tus cambios. Cuando termine vas a poder verlo acá."}
-              </p>
-            </div>
-          </div>
-        </div>
-      </div>
+      <ProgressPanel
+        job={job}
+        onBack={onBack}
+        onForceFail={(updated) => {
+          if (onJobUpdate) onJobUpdate({ ...job, ...updated });
+        }}
+      />
     );
   }
 

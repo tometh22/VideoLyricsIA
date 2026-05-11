@@ -4498,6 +4498,96 @@ async def retry_job(
     return {"ok": True, "status": "processing", "job_id": job_id}
 
 
+@app.post("/jobs/{job_id}/force-fail")
+async def force_fail_job(
+    job_id: str,
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Manually mark an in-flight job as `error` so the Retry button
+    surfaces and the user doesn't have to wait for the reaper.
+
+    Use case: ProgressPanel's "tardando más de lo usual" banner — the
+    user sees a render stuck for 5+ min past expected duration and
+    wants to abort cleanly without restarting the worker or asking an
+    operator. Reaper would catch it eventually (10 min orphan-poll
+    sweep or 100 min age sweep), but for a user staring at a frozen
+    progress bar that's an eternity.
+
+    Safety:
+      - Only `processing` / `queued` / `editing` are valid sources.
+        Anything else returns 400 — you can't "force fail" a `done`
+        job, and idempotency is preserved (a second call on an
+        already-errored job is a no-op 200).
+      - Tenant-scoped same as /retry — a user can only fail their own
+        jobs, admins can fail any (current_user role check).
+      - Records an AuditLog entry with the previous step/progress so
+        forensics can tell whether the job was 1% in or 95% in when
+        the operator gave up.
+
+    Note: this does NOT cancel the underlying RQ job. The worker, if
+    still alive, will continue running until it completes or its job
+    process gets recycled. When it tries to write back via update_job,
+    the row will already be in `error` and the worker's write becomes
+    a no-op (it sees the existing row but doesn't clobber the
+    operator-set state, per jobs.py:update_job semantics).
+    Pragmatically: by the time a user hits this button, the worker is
+    almost always dead or hung; the row update is the user-visible
+    side effect that matters."""
+    from database import Job as JobModel, AuditLog
+
+    is_admin = current_user.get("role") == "admin"
+    q = db.query(JobModel).filter(JobModel.job_id == job_id)
+    if not is_admin:
+        q = q.filter(JobModel.tenant_id == current_user["tenant_id"])
+    job = q.first()
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+
+    # Idempotency: already errored → no-op success. The client UI will
+    # transition to the retry view either way.
+    if job.status == "error":
+        return {"ok": True, "status": "error", "job_id": job_id, "no_op": True}
+
+    if job.status not in ("processing", "queued", "editing"):
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Job cannot be force-failed from status '{job.status}'. "
+                "Only in-flight statuses (processing/queued/editing) "
+                "can be flagged this way."
+            ),
+        )
+
+    _previous = {
+        "status": job.status,
+        "current_step": job.current_step,
+        "progress": job.progress,
+    }
+
+    job.status = "error"
+    job.error = (
+        "El usuario marcó este job como error manualmente porque tardaba "
+        "más de lo usual. Tu MP3 sigue guardado: apretá \"Reintentar sin "
+        "re-subir\"."
+    )
+    job.completed_at = datetime.now(timezone.utc)
+
+    db.add(AuditLog(
+        user_id=current_user["id"],
+        action="job.force_fail",
+        detail={"job_id": job_id, **_previous},
+    ))
+    db.commit()
+
+    return {
+        "ok": True,
+        "status": "error",
+        "job_id": job_id,
+        "previous": _previous,
+    }
+
+
 # ---------------------------------------------------------------------------
 # Settings
 # ---------------------------------------------------------------------------
