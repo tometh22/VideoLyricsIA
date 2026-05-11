@@ -69,6 +69,22 @@ def init_logging():
     root.addHandler(handler)
 
 
+# Wallclock-style timestamp captured the first time this module is
+# imported. Used by health_snapshot() as a startup grace window: during
+# the first STARTUP_GRACE_S seconds the endpoint reports "starting"
+# instead of "down" when a dependency is briefly unreachable. Without
+# this, Railway's healthcheck (30-90 s window) trips on the first
+# /health hit if Postgres hasn't fully accepted its first connection
+# yet — the deploy then aborts even though the API would be healthy 5 s
+# later.
+_PROCESS_START_TS = time.monotonic()
+STARTUP_GRACE_S = int(os.environ.get("HEALTH_STARTUP_GRACE_S", "20"))
+
+
+def _within_startup_grace() -> bool:
+    return (time.monotonic() - _PROCESS_START_TS) < STARTUP_GRACE_S
+
+
 def health_snapshot() -> dict:
     """Lightweight report of runtime health.
 
@@ -79,6 +95,10 @@ def health_snapshot() -> dict:
 
     Status semantics — used by the load balancer / Docker healthcheck:
       - "ok": all configured dependencies reachable.
+      - "starting": we're within the startup grace window AND a
+        required dependency is briefly unreachable. Returned as 200 by
+        /health so Railway's first healthcheck attempt doesn't roll
+        back a deploy that's still warming up.
       - "degraded": a non-critical issue (low disk, no live workers,
         Redis not configured outside prod, etc.) but service is usable.
       - "down": a configured-and-required dependency is unreachable in
@@ -87,6 +107,7 @@ def health_snapshot() -> dict:
     """
     snap = {"status": "ok", "env": ENV}
     is_prod = ENV in ("prod", "production")
+    starting = _within_startup_grace()
 
     def _degrade(reason: str) -> None:
         # First non-fatal problem flips ok→degraded; explicit "down"
@@ -98,6 +119,13 @@ def health_snapshot() -> dict:
     def _down(reason: str) -> None:
         # Hard failure of a required dependency. Used by /health to
         # return 503 so the load balancer pulls the instance out.
+        # During the startup grace window we report "starting" instead
+        # so Railway's first probe doesn't roll back the deploy on a
+        # cold-cache miss.
+        if starting:
+            snap["status"] = "starting"
+            snap["starting_reason"] = reason
+            return
         snap["status"] = "down"
         snap["down_reason"] = reason
 
