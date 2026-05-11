@@ -161,11 +161,20 @@ export default function LyricsEditor({
   }, [isDirty]);
 
   // ─── Audio sync ─────────────────────────────────────────────────────
-  const audioUrl = useMemo(
-    () => (audioFile ? URL.createObjectURL(audioFile) : null),
-    [audioFile],
-  );
-  useEffect(() => () => { if (audioUrl) URL.revokeObjectURL(audioUrl); }, [audioUrl]);
+  // Blob URL lifecycle must live in useEffect, not useMemo. useMemo is
+  // not a lifecycle hook and React 18 StrictMode double-invokes its
+  // callback in dev, leaking one URL per mount. More importantly, pairing
+  // a useMemo-created URL with a useEffect cleanup keyed on [audioUrl]
+  // causes StrictMode's simulated unmount to revoke the URL while the
+  // <audio> element in the DOM still references it — playback dies a few
+  // seconds in once the initial buffered range is consumed.
+  const [audioUrl, setAudioUrl] = useState(null);
+  useEffect(() => {
+    if (!audioFile) { setAudioUrl(null); return undefined; }
+    const url = URL.createObjectURL(audioFile);
+    setAudioUrl(url);
+    return () => URL.revokeObjectURL(url);
+  }, [audioFile]);
 
   const audioRef = useRef(null);
   const listRef = useRef(null);
