@@ -613,6 +613,50 @@ const translations = {
     "faq.a5": "El cliente es dueño al 100% de todos los videos, thumbnails y shorts generados. Sin regalías ni atribuciones.",
     "faq.q6": "¿Qué idiomas soporta?",
     "faq.a6": "Español, inglés, portugués, francés, italiano y alemán. Tanto para la transcripción como para la metadata de YouTube.",
+
+    // Wizard persistence (PR #78)
+    "wizard.confirm_leave": "Tenés un batch en progreso. Si te vas, podés retomarlo al volver desde el banner amarillo, pero perdés el contexto actual. ¿Continuar?",
+    "wizard.confirm_discard_batch": "Vas a empezar un batch nuevo y perdés el progreso actual (lyrics corregidas, canciones aprobadas). ¿Seguro?",
+    "wizard.resume_title": "Tenés un batch sin terminar",
+    "wizard.resume_continue": "Continuar",
+    "wizard.resume_discard": "Descartar",
+
+    // Edit request panel (post-render typography / background re-render)
+    "edit.panel_title": "¿Necesitás ajustes?",
+    "edit.panel_desc": "Cambiá tipografía o regenerá el fondo sin volver a transcribir.",
+    "edit.remaining_one": "1 ed. restante",
+    "edit.remaining_many": "ed. restantes",
+    "edit.typography_title": "Cambiar tipografía",
+    "edit.typography_cost": "~5-10 min · sin costo extra · reutiliza el fondo actual",
+    "edit.typography_submit": "Pedir re-render con estos cambios",
+    "edit.background_title": "Regenerar fondo",
+    "edit.background_cost": "~10-15 min · ~US$0.90 · nuevo Veo manteniendo lyrics",
+    "edit.background_confirm_title": "Confirmá regenerar el fondo",
+    "edit.background_confirm_desc": "Genera un fondo nuevo con Veo manteniendo las lyrics y los tiempos. Cuesta ~US$0.90 (Veo) y tarda ~10-15 min. La tipografía actual se mantiene.",
+    "edit.background_submit": "Regenerar fondo (~US$0.90)",
+    "edit.cancel": "Cancelar",
+    "edit.submitting": "Enviando...",
+    "edit.no_changes": "No cambiaste ninguna opción — no hay nada que re-renderizar.",
+    "edit.limit_reached_title": "Ya pediste 3 ediciones",
+    "edit.limit_reached_desc": "Aprobá o rechazá el video. Si todavía no estás conforme, rechazá y empezá un nuevo job.",
+    "edit.in_progress_title": "Aplicando tus cambios...",
+    "edit.in_progress_bg": "Generando nuevo fondo con Veo · mantiene lyrics y tiempos · ~10-15 min",
+    "edit.in_progress_typo": "Re-renderizando con la tipografía nueva · usa el fondo cacheado · ~5-10 min",
+    "edit.preview_label": "Vista previa:",
+    "edit.preview_hint": "Así se va a ver el texto en el video con los cambios.",
+    "edit.sample_lyric": "Como el viento que se va",
+    "edit.no_video_during_editing": "El video viejo se está reemplazando con tus cambios. Cuando termine vas a poder verlo acá.",
+
+    // Auto-font preview in LyricsEditor
+    "editor.preview_header": "Preview — cómo quedarán las lyrics",
+    "editor.auto_font_badge": "Tipografía: Auto",
+    "editor.auto_font_explainer": "el render va a elegir una de 8 fuentes al azar por canción. Esta vista previa usa Montserrat solo de referencia — el video final puede verse distinto.",
+    "editor.auto_font_inline": "Auto (se elige al renderizar)",
+
+    // Dashboard / History / Batch for the new editing status
+    "dash.editing": "Re-renderizando",
+    "history.editing": "Re-renderizando",
+    "batch.editing": "Re-renderizando",
   },
 
   en: {

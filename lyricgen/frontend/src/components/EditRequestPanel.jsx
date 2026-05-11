@@ -11,16 +11,25 @@ function authHeaders() {
 // Same font list the operator chose during upload — keeps the cached
 // background usable (we only render new typography over the existing video).
 const FONTS = [
-  { code: "",                label: "Auto" },
-  { code: "jost-bold",       label: "Jost (estilo Futura)" },
-  { code: "montserrat-bold", label: "Montserrat" },
-  { code: "poppins-bold",    label: "Poppins" },
-  { code: "outfit-bold",     label: "Outfit (estilo Gilroy)" },
-  { code: "roboto-bold",     label: "Roboto" },
-  { code: "bebas-neue",      label: "Bebas Neue" },
-  { code: "oswald-bold",     label: "Oswald" },
-  { code: "anton",           label: "Anton" },
+  { code: "",                label: "Auto",                      css: "'Montserrat', sans-serif" },
+  { code: "jost-bold",       label: "Jost (estilo Futura)",      css: "'Jost', sans-serif" },
+  { code: "montserrat-bold", label: "Montserrat",                css: "'Montserrat', sans-serif" },
+  { code: "poppins-bold",    label: "Poppins",                   css: "'Poppins', sans-serif" },
+  { code: "outfit-bold",     label: "Outfit (estilo Gilroy)",    css: "'Outfit', sans-serif" },
+  { code: "roboto-bold",     label: "Roboto",                    css: "'Roboto', sans-serif" },
+  { code: "bebas-neue",      label: "Bebas Neue",                css: "'Bebas Neue', sans-serif" },
+  { code: "oswald-bold",     label: "Oswald",                    css: "'Oswald', sans-serif" },
+  { code: "anton",           label: "Anton",                     css: "'Anton', sans-serif" },
 ];
+
+const FONT_CSS_BY_CODE = FONTS.reduce((acc, f) => { acc[f.code] = f.css; return acc; }, {});
+
+function applyCaseToPreview(text, caseCode) {
+  if (caseCode === "upper") return text.toUpperCase();
+  if (caseCode === "lower") return text.toLowerCase();
+  if (caseCode === "title") return text.replace(/\b\w/g, (c) => c.toUpperCase());
+  return text;
+}
 
 const CASE_OPTS = [
   { code: "upper",    d: "MAY", label: "Todo en MAYÚSCULAS" },
@@ -208,6 +217,60 @@ export default function EditRequestPanel({ job, onEditTriggered }) {
 
       {mode === "typography" && (
         <div className="space-y-3 animate-fade-in">
+          {/* Live preview — renders the sample lyric with the controls
+              the operator is touching so they can see the result before
+              firing the ~5min re-render. The 16:9 frame is the same
+              aspect the worker outputs. AUTO falls back to Montserrat
+              with a note so the operator knows the final font won't
+              actually be Montserrat at render time. */}
+          {(() => {
+            const sample = t("edit.sample_lyric") || "Como el viento que se va";
+            const previewText = applyCaseToPreview(sample, form.text_case);
+            const fontCss = FONT_CSS_BY_CODE[form.font] || FONT_CSS_BY_CODE[""];
+            const isAuto = !form.font;
+            // Preview is ~480px wide vs 1920px video, so font scales down ~4×
+            const basePx = 70;
+            const scaledPx = Math.max(14, Math.round(basePx * form.font_scale * (480 / 1920)));
+            return (
+              <div>
+                <label className="text-[11px] text-ink-secondary uppercase tracking-wider block mb-1">
+                  {t("edit.preview_label") || "Vista previa"}
+                </label>
+                <div className="rounded-xl overflow-hidden ring-1 ring-white/[0.06]">
+                  <div
+                    className="relative w-full flex items-center justify-center bg-gradient-to-b from-gray-900 to-black"
+                    style={{ aspectRatio: "16/9", maxHeight: "140px" }}
+                  >
+                    <p
+                      style={{
+                        fontFamily: fontCss,
+                        fontSize: `${scaledPx}px`,
+                        fontWeight: 700,
+                        color: "white",
+                        opacity: isAuto ? 0.65 : 1,
+                        textShadow: "0 0 4px rgba(0,0,0,0.9), 1px 1px 3px rgba(0,0,0,0.8)",
+                        textAlign: "center",
+                        lineHeight: 1.2,
+                        padding: "0 12px",
+                        wordBreak: "break-word",
+                        margin: 0,
+                      }}
+                    >
+                      {previewText}
+                    </p>
+                  </div>
+                  {isAuto && (
+                    <div className="px-3 py-1.5 bg-amber-500/[0.08] border-t border-amber-500/20 text-[10px] text-amber-200/90">
+                      {t("editor.auto_font_badge") || "Tipografía: Auto"}
+                      {" · "}
+                      {t("editor.auto_font_explainer") || "el render va a elegir una de 8 fuentes al azar."}
+                    </div>
+                  )}
+                </div>
+              </div>
+            );
+          })()}
+
           {/* Font */}
           <div>
             <label className="text-[11px] text-ink-secondary uppercase tracking-wider block mb-1">
