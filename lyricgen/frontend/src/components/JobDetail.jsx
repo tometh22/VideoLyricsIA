@@ -488,6 +488,10 @@ export default function JobDetail({ job, onBack, onJobUpdate }) {
     setShowYoutubePanel(true);
     try {
       const res = await fetch(`${API}/youtube/metadata/${job.job_id}`, { method: "POST", headers: authHeaders() });
+      if (!res.ok) {
+        const data = await res.json().catch(() => ({}));
+        throw new Error(data.detail || `Error ${res.status}`);
+      }
       const data = await res.json();
       setMetadataPreview(data);
     } catch (err) {
@@ -499,6 +503,10 @@ export default function JobDetail({ job, onBack, onJobUpdate }) {
     setUploading(true);
     try {
       const res = await fetch(`${API}/youtube/upload/${job.job_id}?privacy=${privacy}`, { method: "POST", headers: authHeaders() });
+      if (!res.ok) {
+        const data = await res.json().catch(() => ({}));
+        throw new Error(data.detail || `Error ${res.status}`);
+      }
       const data = await res.json();
       setYoutubeResult(data);
     } catch (err) {

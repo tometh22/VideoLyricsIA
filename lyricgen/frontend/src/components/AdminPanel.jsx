@@ -50,6 +50,18 @@ export default function AdminPanel({ onBack }) {
   // exact tenant match. Server-side via the same endpoint.
   const [bgListFilter, setBgListFilter] = useState("");
 
+  // Inline error banner — usado por handlers que hacen mutaciones
+  // (delete bg, toggle user, change plan, etc.) y necesitan informar
+  // al operador cuando el backend rechaza. Auto-clear en 8 s.
+  // Antes los handlers ignoraban res.ok → operador creía que su
+  // acción se cumplió cuando el server había rechazado. Audit lo
+  // detectó. Ver CONTRIBUTING.md §4.
+  const [adminError, setAdminError] = useState(null);
+  const flashError = (msg) => {
+    setAdminError(msg);
+    setTimeout(() => setAdminError((cur) => (cur === msg ? null : cur)), 8000);
+  };
+
   // Create user modal
   const [showCreate, setShowCreate] = useState(false);
   const [newUser, setNewUser] = useState({ username: "", password: "", email: "", plan_id: "100", role: "user", tenant_id: "" });
@@ -115,12 +127,16 @@ export default function AdminPanel({ onBack }) {
         method: "POST",
         headers: authHeaders(),
       });
+      if (!res.ok) {
+        const data = await res.json().catch(() => ({}));
+        throw new Error(data.detail || `Error ${res.status}`);
+      }
       const data = await res.json();
       setReaperResult(data);
       // Refresh the stuck count immediately so the banner reflects reality.
       loadStuckJobs();
     } catch (err) {
-      setReaperResult({ error: String(err) });
+      setReaperResult({ error: String(err.message || err) });
     } finally {
       setReaperRunning(false);
     }
@@ -162,7 +178,11 @@ export default function AdminPanel({ onBack }) {
     formData.append("tags", bgTags.trim());
     if (bgOwnerTenant) formData.append("owner_tenant_id", bgOwnerTenant);
     try {
-      await fetch(`${API}/admin/backgrounds`, { method: "POST", headers: authHeaders(), body: formData });
+      const res = await fetch(`${API}/admin/backgrounds`, { method: "POST", headers: authHeaders(), body: formData });
+      if (!res.ok) {
+        const data = await res.json().catch(() => ({}));
+        throw new Error(data.detail || `Error ${res.status}`);
+      }
       setBgName("");
       setBgTags("");
       // Reset the tenant selector too so the next asset doesn't silently
@@ -170,14 +190,24 @@ export default function AdminPanel({ onBack }) {
       // UMG's library because the dropdown was sticky).
       setBgOwnerTenant("");
       loadBackgrounds();
-    } catch {}
+    } catch (err) {
+      flashError(`Subida de background falló: ${err.message || err}`);
+    }
     setBgUploading(false);
   };
 
   const handleDeleteBg = async (id) => {
     if (!window.confirm("Delete this background?")) return;
-    await fetch(`${API}/admin/backgrounds/${id}`, { method: "DELETE", headers: authHeaders() });
-    loadBackgrounds();
+    try {
+      const res = await fetch(`${API}/admin/backgrounds/${id}`, { method: "DELETE", headers: authHeaders() });
+      if (!res.ok) {
+        const data = await res.json().catch(() => ({}));
+        throw new Error(data.detail || `Error ${res.status}`);
+      }
+      loadBackgrounds();
+    } catch (err) {
+      flashError(`Borrar background falló: ${err.message || err}`);
+    }
   };
 
   const loadUsers = async () => {
@@ -229,40 +259,53 @@ export default function AdminPanel({ onBack }) {
     }
   };
 
-  const handleToggleUser = async (userId, isActive) => {
-    await fetch(`${API}/admin/users/${userId}`, {
-      method: "PATCH",
-      headers: { "Content-Type": "application/json", ...authHeaders() },
-      body: JSON.stringify({ is_active: !isActive }),
-    });
-    loadUsers();
+  // Helper para los 4 PATCH/POST sobre /admin/users/{id} que comparten
+  // el mismo manejo de error: chequear res.ok, extraer data.detail,
+  // mostrar en el banner. loadUsers() se llama incluso en error porque
+  // queremos invalidar cualquier optimistic update local.
+  const _patchUser = async (userId, body, errorLabel) => {
+    try {
+      const res = await fetch(`${API}/admin/users/${userId}`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json", ...authHeaders() },
+        body: JSON.stringify(body),
+      });
+      if (!res.ok) {
+        const data = await res.json().catch(() => ({}));
+        throw new Error(data.detail || `Error ${res.status}`);
+      }
+      loadUsers();
+    } catch (err) {
+      flashError(`${errorLabel}: ${err.message || err}`);
+      loadUsers();  // revierte cualquier optimistic local
+    }
   };
 
-  const handleToggleOverage = async (userId, currentValue) => {
-    await fetch(`${API}/admin/users/${userId}`, {
-      method: "PATCH",
-      headers: { "Content-Type": "application/json", ...authHeaders() },
-      body: JSON.stringify({ allow_overage: !currentValue }),
-    });
-    loadUsers();
-  };
+  const handleToggleUser = (userId, isActive) =>
+    _patchUser(userId, { is_active: !isActive }, "Toggle activo falló");
 
-  const handleChangePlan = async (userId, planId) => {
-    await fetch(`${API}/admin/users/${userId}`, {
-      method: "PATCH",
-      headers: { "Content-Type": "application/json", ...authHeaders() },
-      body: JSON.stringify({ plan_id: planId }),
-    });
-    loadUsers();
-  };
+  const handleToggleOverage = (userId, currentValue) =>
+    _patchUser(userId, { allow_overage: !currentValue }, "Toggle overage falló");
+
+  const handleChangePlan = (userId, planId) =>
+    _patchUser(userId, { plan_id: planId }, "Cambiar plan falló");
 
   const handleToggleAI = async (userId, isAuthorized) => {
     const endpoint = isAuthorized ? "revoke-ai" : "authorize-ai";
-    await fetch(`${API}/admin/users/${userId}/${endpoint}`, {
-      method: "POST",
-      headers: authHeaders(),
-    });
-    loadUsers();
+    try {
+      const res = await fetch(`${API}/admin/users/${userId}/${endpoint}`, {
+        method: "POST",
+        headers: authHeaders(),
+      });
+      if (!res.ok) {
+        const data = await res.json().catch(() => ({}));
+        throw new Error(data.detail || `Error ${res.status}`);
+      }
+      loadUsers();
+    } catch (err) {
+      flashError(`Toggle AI auth falló: ${err.message || err}`);
+      loadUsers();
+    }
   };
 
   const tabs = [
@@ -297,6 +340,28 @@ export default function AdminPanel({ onBack }) {
           <p className="text-sm text-gray-500">Platform management</p>
         </div>
       </div>
+
+      {/* Banner de error de acción admin — visible cuando una mutación
+          (delete, toggle, change-plan, etc.) es rechazada por el backend.
+          Reemplaza el silencio del bug anterior donde el operador creía
+          que la acción se cumplió. Ver flashError(). */}
+      {adminError && (
+        <div className="mb-4 rounded-card bg-red-500/[0.08] ring-1 ring-red-500/30 px-4 py-3 flex items-start gap-3">
+          <svg className="w-5 h-5 text-red-400 shrink-0 mt-0.5" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
+            <circle cx="12" cy="12" r="10" />
+            <line x1="12" y1="8" x2="12" y2="12" />
+            <line x1="12" y1="16" x2="12.01" y2="16" />
+          </svg>
+          <div className="flex-1 text-sm text-red-200">{adminError}</div>
+          <button
+            type="button"
+            onClick={() => setAdminError(null)}
+            className="text-xs text-red-300 hover:text-red-100 px-2 py-1"
+          >
+            ✕
+          </button>
+        </div>
+      )}
 
       {/* Tabs */}
       <div className="flex gap-1 mb-8 glass rounded-xl p-1 w-fit">
