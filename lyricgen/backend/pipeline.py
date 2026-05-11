@@ -229,7 +229,8 @@ def run_pipeline(job_id: str, mp3_path: str, artist: str, style: str,
                  text_case: str = "upper",
                  font_scale: float = 1.0,
                  lyric_transition: str = "cut",
-                 text_motion: str = "none"):
+                 text_motion: str = "none",
+                 match_lyrics: bool = True):
     """Run the full pipeline for a job. Called synchronously.
 
     delivery_profile:
@@ -393,6 +394,7 @@ def run_pipeline(job_id: str, mp3_path: str, artist: str, style: str,
                 song_title=_song_title, genre=genre, concept=concept,
                 movement_style=movement_style,
                 image_to_video_path=(background_path if _animate_user_image else None),
+                match_lyrics=match_lyrics,
             )
             # Image-to-video fallback: if Veo failed to produce an MP4 (None
             # or non-existent path) AND the operator wanted to animate their
@@ -2845,8 +2847,12 @@ def _normalize_concept(c: str) -> str:
 def _analyze_lyrics_for_background(lyrics_text: str, artist: str, job_id: str = None,
                                     song_title: str = "", genre: str = "",
                                     concept: str = "",
-                                    movement_style: str = "") -> dict:
+                                    movement_style: str = "",
+                                    match_lyrics: bool = True) -> dict:
     """Use Gemini to analyze lyrics and choose visual style + prompt.
+
+    match_lyrics=True  ("Inspirado en la letra"): lyrics anchor or infuse the scene.
+    match_lyrics=False: concept/genre vocabulary only, lyrics are ignored.
 
     Returns dict with:
       - style: "video" | "photo" | "illustration"
@@ -2863,17 +2869,55 @@ def _analyze_lyrics_for_background(lyrics_text: str, artist: str, job_id: str = 
     movement_rule = _MOVEMENT_STYLE_RULES.get(normalized_movement, "")
     movement_extra_line = f"\n- {movement_rule}" if movement_rule else ""
 
+    _PROMPT_RULES = (
+        "- \"style\" must always be \"video\"\n"
+        "- \"prompt\" is 80-120 words. Describe: (1) specific scene subject and setting "
+        "in detail, (2) exact camera movement and framing, (3) color palette and dominant "
+        "tones, (4) lighting type and direction, (5) atmosphere, mood, and at least one "
+        "specific texture or material detail. Be precise and cinematic — avoid vague "
+        "adjectives like \"beautiful\" or \"amazing\".\n"
+        "- Pick a DIFFERENT specific scene each time (don't repeat across songs)\n"
+        "- Never include people, faces, hands, or readable text in the scene"
+    )
+    _EXAMPLE = (
+        "{\"style\":\"video\",\"prompt\":\"Slow tracking shot through neon-lit "
+        "rain-slicked streets, deep blue and red reflections, smoke rising past "
+        "streetlamps, gritty cinematic 4k\"}"
+    )
+
     if normalized_concept:
-        # Operator picked an explicit visual concept — that hard-overrides
-        # the genre's scene vocabulary. The concept is the controlling
-        # input here; genre still goes into the user content as a stylistic
-        # color hint but does NOT determine the scene type.
         concept_guide = _CONCEPT_SCENE_GUIDE[normalized_concept]
         genre_hint = (f"\n\nFor stylistic colour-grading flavour only "
                       f"(NOT for scene choice), the song genre is: "
                       f"{normalized_genre.upper()}.") if normalized_genre else ""
-        system_prompt = f"""Respond ONLY with a JSON object, no other text. Example:
-{{"style":"video","prompt":"Slow tracking shot through neon-lit rain-slicked streets, deep blue and red reflections, smoke rising past streetlamps, gritty cinematic 4k"}}
+
+        if match_lyrics:
+            # "Inspirado en la letra": concept sets the visual register,
+            # lyrics theme infuses the specific execution within it.
+            system_prompt = f"""Respond ONLY with a JSON object, no other text. Example:
+{_EXAMPLE}
+
+The operator has chosen the visual register: {normalized_concept.upper()}.
+The scene MUST stay within this concept's visual vocabulary:
+{concept_guide}{genre_hint}
+
+STEP 0 — Read the lyrics and identify the SOUL of the song: its core theme, emotion, or story (e.g., football passion, longing for home, celebration, heartbreak, nature, freedom).
+
+STEP 1 — Build a scene that:
+- Is firmly within the {normalized_concept.upper()} visual vocabulary (non-negotiable)
+- Expresses the song's theme through specific choices of color, shape, motion, and composition
+- Examples:
+  · ABSTRACTO + football → dynamic circular forms in green/white with kinetic energy
+  · COSMICO + heartbreak → cold distant nebula, muted purples, slow lonely drift
+  · NATURALEZA + summer joy → golden sun-drenched meadow, warm swaying grass, long shadows
+
+Hard rules:
+{_PROMPT_RULES}
+- The concept vocabulary is the hard boundary — never exit it{movement_extra_line}"""
+        else:
+            # Strict concept mode: operator's visual choice, no lyrics influence.
+            system_prompt = f"""Respond ONLY with a JSON object, no other text. Example:
+{_EXAMPLE}
 
 The operator has explicitly requested a {normalized_concept.upper()} background.
 
@@ -2881,19 +2925,16 @@ You MUST pick a scene that fits this concept's visual vocabulary:
 {concept_guide}{genre_hint}
 
 Hard rules:
-- "style" must always be "video"
-- "prompt" is 80-120 words. Describe: (1) specific scene subject and setting in detail, (2) exact camera movement and framing, (3) color palette and dominant tones, (4) lighting type and direction, (5) atmosphere, mood, and at least one specific texture or material detail. Be precise and cinematic — avoid vague adjectives like "beautiful" or "amazing".
-- Pick a DIFFERENT specific scene each time (don't repeat across songs)
-- The concept choice is binding — do NOT drift to a different visual category
-- Never include people, faces, hands, or readable text in the scene{movement_extra_line}"""
+{_PROMPT_RULES}
+- The concept choice is binding — do NOT drift to a different visual category{movement_extra_line}"""
+
     elif normalized_genre:
-        # User-supplied genre: genre now controls color/mood/lighting only.
-        # Lyrics theme is the PRIMARY scene anchor — if the lyrics are clearly
-        # about something specific (sport, ocean, city, etc.) we use that
-        # instead of the genre vocabulary. Genre vocabulary is the fallback.
         scene_guide = _GENRE_SCENE_GUIDE[normalized_genre]
-        system_prompt = f"""Respond ONLY with a JSON object, no other text. Example:
-{{"style":"video","prompt":"Slow tracking shot through neon-lit rain-slicked streets, deep blue and red reflections, smoke rising past streetlamps, gritty cinematic 4k"}}
+
+        if match_lyrics:
+            # "Inspirado en la letra": lyrics anchor the scene, genre styles it.
+            system_prompt = f"""Respond ONLY with a JSON object, no other text. Example:
+{_EXAMPLE}
 
 The song genre is: {normalized_genre.upper()}
 
@@ -2905,18 +2946,29 @@ STEP 1 — Choose the scene:
 {scene_guide}
 
 Hard rules:
-- "style" must always be "video"
-- "prompt" is 80-120 words. Describe: (1) specific scene subject and setting in detail, (2) exact camera movement and framing, (3) color palette and dominant tones, (4) lighting type and direction, (5) atmosphere, mood, and at least one specific texture or material detail. Be precise and cinematic — avoid vague adjectives like "beautiful" or "amazing".
-- Pick a DIFFERENT specific scene each time (don't repeat across songs)
+{_PROMPT_RULES}
 - If lyrics reference a sport (football, basketball, etc.) → use field/pitch/arena/equipment, NOT cars or generic cityscapes
-- Do NOT default to "calm ocean at sunset" unless this song is BALLAD
-- Never include people, faces, hands, or readable text in the scene{movement_extra_line}"""
+- Do NOT default to "calm ocean at sunset" unless this song is BALLAD{movement_extra_line}"""
+        else:
+            # Strict genre mode: pick from genre vocabulary, ignore lyrics.
+            system_prompt = f"""Respond ONLY with a JSON object, no other text. Example:
+{_EXAMPLE}
+
+The song genre is: {normalized_genre.upper()}
+
+You MUST pick a scene from this genre's visual vocabulary:
+{scene_guide}
+
+Hard rules:
+{_PROMPT_RULES}
+- Do NOT default to "calm ocean at sunset" unless this song is BALLAD{movement_extra_line}"""
+
     else:
-        # No genre hint: lyrics theme is the PRIMARY scene anchor.
-        # Genre classification is secondary — it controls color/mood/lighting
-        # only, not the scene subject. "Auto" mode for users who don't choose.
-        system_prompt = """Respond ONLY with a JSON object, no other text. Example:
-{"style":"video","prompt":"Slow tracking shot through neon-lit rain-slicked streets, deep blue and red reflections, smoke rising past streetlamps, gritty cinematic 4k"}
+        if match_lyrics:
+            # "Inspirado en la letra" + auto: lyrics anchor the scene,
+            # genre classification controls color/mood only.
+            system_prompt = f"""Respond ONLY with a JSON object, no other text. Example:
+{_EXAMPLE}
 
 STEP 0 — Read the lyrics and identify the PRIMARY VISUAL SUBJECT: the concrete setting, object, or action the song is literally about (e.g., a football/soccer match, the ocean, a city at night, a road trip, a dance floor, rain, a forest). This is your FIRST input for scene choice.
 
@@ -2940,6 +2992,33 @@ Hard rules:
 - "style" must always be "video"
 - Pick a DIFFERENT specific scene each time (don't repeat across songs)
 - If lyrics reference a sport (football, basketball, etc.) → use field/pitch/arena/equipment, NOT cars or generic cityscapes
+- Do NOT default to "calm ocean at sunset" unless the song is genuinely BALLAD
+- Never include people, faces, hands, or readable text in the scene"""
+        else:
+            # Strict auto mode: classify genre, pick vocabulary, no lyrics.
+            system_prompt = """Respond ONLY with a JSON object, no other text. Example:
+{"style":"video","prompt":"Slow tracking shot through neon-lit rain-slicked streets, deep blue and red reflections, smoke rising past streetlamps, gritty cinematic 4k"}
+
+Step 1: Classify the song's genre using the artist, title, and lyrics. Pick ONE of:
+  rock, pop, ballad, latin, reggaeton, hiphop, electronic, indie, folk, metal
+
+Step 2: Pick a scene from the matching genre's visual vocabulary:
+- rock     → urban industrial streets, neon alleyways, gritty rain, electric storms, abandoned warehouses
+- pop      → vibrant neon, disco reflections, geometric light patterns, glossy gradient skies
+- ballad   → soft sunset, calm ocean, drifting clouds, warm golden light, candlelight
+- latin    → tropical beaches, palm trees, vibrant flowers, festive lanterns, sunlit caribbean water
+- reggaeton → night cityscape with red/pink neon, abstract color bursts, club laser patterns
+- hiphop   → city skyline at night with gold, marble luxury textures, smoke-filled spotlights
+- electronic → abstract geometry, particle storms, fractal liquid metal, laser grids
+- indie    → misty forests, vintage interiors, autumn roads, lone lighthouses, dreamy lakes
+- folk     → mountain vistas, dusty roads, wheat fields, riverside campfires
+- metal    → volcanic lava streams, dark cathedrals, stormy lightning, cracked obsidian
+
+Step 3: Output JSON with the chosen scene as an 80-120 word prompt.
+
+Hard rules:
+- "style" must always be "video"
+- Pick a DIFFERENT specific scene each time (don't repeat across songs)
 - Do NOT default to "calm ocean at sunset" unless the song is genuinely BALLAD
 - Never include people, faces, hands, or readable text in the scene"""
         if movement_rule:
@@ -3014,7 +3093,7 @@ Hard rules:
 
 def _get_unique_prompt(lyrics_text: str = None, artist: str = "", job_id: str = None,
                        song_title: str = "", genre: str = "", concept: str = "",
-                       movement_style: str = "") -> dict:
+                       movement_style: str = "", match_lyrics: bool = True) -> dict:
     """Get a unique style+prompt combination. Returns {style, prompt}.
 
     Note: the local _USED_PROMPTS_FILE only sees this worker's previous
@@ -3036,6 +3115,7 @@ def _get_unique_prompt(lyrics_text: str = None, artist: str = "", job_id: str = 
         result = _analyze_lyrics_for_background(
             lyrics_text or "", artist, job_id=job_id, song_title=song_title,
             genre=genre, concept=concept, movement_style=movement_style,
+            match_lyrics=match_lyrics,
         )
         if result["prompt"] and result["prompt"] not in used:
             used.append(result["prompt"])
@@ -3626,7 +3706,8 @@ def _ensure_background(style_hint: str, job_dir: str, lyrics_text: str = None,
                        song_title: str = "", genre: str = "",
                        concept: str = "",
                        movement_style: str = "",
-                       image_to_video_path: str | None = None) -> str:
+                       image_to_video_path: str | None = None,
+                       match_lyrics: bool = True) -> str:
     """Generate background using AI. Gemini picks the best style for the song.
 
     Returns path to .mp4 (video style) or .jpg/.png (photo/illustration style).
@@ -3642,7 +3723,7 @@ def _ensure_background(style_hint: str, job_dir: str, lyrics_text: str = None,
     # Generate video background with Veo 3 (always video, no images)
     result = _get_unique_prompt(
         lyrics_text, artist, job_id=job_id, song_title=song_title, genre=genre,
-        concept=concept, movement_style=movement_style,
+        concept=concept, movement_style=movement_style, match_lyrics=match_lyrics,
     )
     prompt = result["prompt"]
 
@@ -3667,6 +3748,7 @@ def _ensure_background(style_hint: str, job_dir: str, lyrics_text: str = None,
                     result = _get_unique_prompt(
                         lyrics_text, artist, job_id=job_id, song_title=song_title,
                         genre=genre, concept=concept, movement_style=movement_style,
+                        match_lyrics=match_lyrics,
                     )
                     prompt = result["prompt"]
                     continue
