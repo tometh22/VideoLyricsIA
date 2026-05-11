@@ -145,17 +145,22 @@ def health_snapshot() -> dict:
         with engine.connect() as conn:
             conn.execute(text("SELECT 1"))
         snap["db"] = "up"
-        # Pool utilization for capacity alerting. checkedout = sockets
-        # currently in use; total = pool_size + max_overflow ceiling.
-        # Operators alert when in_use / total > 0.8 (sustained burst).
+        # Pool utilization for capacity alerting. checked_out = sockets
+        # currently in use; total_capacity = pool_size + max_overflow.
+        # Operators alert when checked_out / total > 0.8 (sustained burst).
         try:
-            pool = engine.pool
-            in_use = pool.checkedout()
-            total = pool.size() + pool._max_overflow  # noqa: SLF001 — public API absent
+            from database import pool_stats
+            stats = pool_stats()
+            in_use = stats.get("checked_out", 0)
+            total = stats.get("total_capacity", 0)
             snap["db_pool"] = {
                 "in_use": in_use,
                 "total": total,
                 "utilization": round(in_use / total, 2) if total else 0.0,
+                # Extra detail for at-a-glance debugging when the pool
+                # gets tight. None of these are required by the LB.
+                "available": stats.get("available", 0),
+                "overflow_open": stats.get("overflow", 0),
             }
             if total and in_use / total > 0.8:
                 _degrade("db_pool_high")
