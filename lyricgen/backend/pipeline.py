@@ -3691,14 +3691,19 @@ def _score_video_relevance(video_path: str, prompt: str) -> int:
                 thinking_config=genai.types.ThinkingConfig(thinking_budget=0),
             ),
         )
-        score = int(response.text.strip())
+        import re as _re
+        m = _re.search(r'\b(10|[1-9])\b', response.text)
+        score = int(m.group()) if m else 5
         return max(1, min(10, score))
     except Exception as e:
         print(f"[BG] Relevance score error (fail-open): {e}")
         return 8
     finally:
-        if tmp_frame and os.path.exists(tmp_frame):
-            os.unlink(tmp_frame)
+        if tmp_frame:
+            try:
+                os.unlink(tmp_frame)
+            except OSError:
+                pass
 
 
 def _ensure_background(style_hint: str, job_dir: str, lyrics_text: str = None,
@@ -3738,20 +3743,24 @@ def _ensure_background(style_hint: str, job_dir: str, lyrics_text: str = None,
                 image_path=image_to_video_path,
                 movement_style=movement_style,
             )
-            # Semantic relevance check — cap at one retry to bound cost (+$0.80 worst case)
-            if not quality_retry_used:
-                score = _score_video_relevance(bg_path, prompt)
-                print(f"[BG] Relevance score: {score}/10 for prompt: {prompt[:60]}...")
-                if score < 7:
-                    quality_retry_used = True
-                    print(f"[BG] Score {score} < 7 — generating new prompt and retrying VEO")
-                    result = _get_unique_prompt(
-                        lyrics_text, artist, job_id=job_id, song_title=song_title,
-                        genre=genre, concept=concept, movement_style=movement_style,
-                        match_lyrics=match_lyrics,
-                    )
-                    prompt = result["prompt"]
-                    continue
+            # Semantic relevance check — always score, but cap retries at one
+            # to bound cost (+$0.80 worst case). quality_retry_used gates the
+            # re-generation decision, not the scoring itself, so the retry's
+            # result is also evaluated before we accept and return it.
+            score = _score_video_relevance(bg_path, prompt)
+            print(f"[BG] Relevance score: {score}/10 for prompt: {prompt[:60]}...")
+            if score < 7 and not quality_retry_used:
+                quality_retry_used = True
+                print(f"[BG] Score {score} < 7 — generating new prompt and retrying VEO")
+                result = _get_unique_prompt(
+                    lyrics_text, artist, job_id=job_id, song_title=song_title,
+                    genre=genre, concept=concept, movement_style=movement_style,
+                    match_lyrics=match_lyrics,
+                )
+                prompt = result["prompt"]
+                continue
+            if score < 7:
+                print(f"[BG] Score {score} < 7 after retry — accepting best available result")
             return bg_path
         except Exception as e:
             print(f"[BG] Veo 3 attempt {attempt + 1}/3 failed: {e}")
