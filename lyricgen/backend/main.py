@@ -681,32 +681,37 @@ async def health():
 # Auth endpoints (public)
 # ---------------------------------------------------------------------------
 
-# Pydantic max_length aplicado consistente a TODOS los inputs de
-# cliente — ver CONTRIBUTING.md para convenciones de tamaños.
-# Defensa contra DoS por payload size: sin esto un atacante manda
-# 100 MB de string en cualquier field.
+# Pydantic max_length DEBE ser <= al VARCHAR(N) de la columna en
+# database.py — sino el INSERT rompe con 500 antes de llegar al límite
+# de Pydantic. Ver database.py:User para los Column(String(N)) reales.
+#
+# Hoy: username/tenant_id = 100, email = 255, password (bcrypt 72 byte
+# max) = 72. password en el BaseModel admite hasta el límite bcrypt,
+# y el handler valida con bcrypt al hashear (más informativo que 422).
+#
+# Defensa contra DoS por payload size + alineación con DB schema.
 class LoginRequest(BaseModel):
-    username: str = Field(..., max_length=200)
-    password: str = Field(..., max_length=200)
+    username: str = Field(..., max_length=100)
+    password: str = Field(..., max_length=200)  # validado por bcrypt en handler
 
 
 class RegisterRequest(BaseModel):
-    username: str = Field(..., max_length=200)
+    username: str = Field(..., max_length=100)
     password: str = Field(..., max_length=200)
-    email: str = Field(default="", max_length=320)  # RFC 5321 max email length
+    email: str = Field(default="", max_length=255)  # DB column VARCHAR(255)
 
 
 class ForgotPasswordRequest(BaseModel):
-    email: str = Field(..., max_length=320)
+    email: str = Field(..., max_length=255)
 
 
 class ResetPasswordRequest(BaseModel):
-    token: str = Field(..., max_length=500)
+    token: str = Field(..., max_length=255)  # DB column VARCHAR(255)
     password: str = Field(..., max_length=200)
 
 
 class VerifyEmailRequest(BaseModel):
-    token: str = Field(..., max_length=500)
+    token: str = Field(..., max_length=255)
 
 
 class ChangePasswordRequest(BaseModel):
@@ -719,7 +724,7 @@ class DeleteAccountRequest(BaseModel):
 
 
 class CreateAPIKeyRequest(BaseModel):
-    name: str = Field(..., max_length=100)
+    name: str = Field(..., max_length=100)  # DB column VARCHAR(100)
 
 
 @app.post("/auth/login")
@@ -1808,11 +1813,11 @@ _PRESIGN_PUT_TTL_S = int(os.environ.get("PRESIGN_PUT_TTL_S", "900"))
 
 
 class _UploadUrlReq(BaseModel):
-    filename: str = Field(..., max_length=500)
+    filename: str = Field(..., max_length=500)       # DB Job.filename = VARCHAR(500)
     content_type: str = Field(default="", max_length=200)
     size_bytes: int = 0
-    artist: str = Field(default="", max_length=200)
-    title: str = Field(default="", max_length=300)
+    artist: str = Field(default="", max_length=255)  # DB Job.artist = VARCHAR(255)
+    title: str = Field(default="", max_length=500)   # DB Job.song_title = VARCHAR(500)
 
 
 def _validate_audio_filename_only(filename: str) -> None:
@@ -1939,7 +1944,7 @@ def _input_object_key_for_job(tenant_id: str, job_id: str, filename: str) -> str
 
 
 class _MultipartInitReq(BaseModel):
-    job_id: str = Field(..., max_length=64)
+    job_id: str = Field(..., max_length=12)            # DB Job.job_id = VARCHAR(12)
     filename: str = Field(..., max_length=500)
     content_type: str = Field(default="", max_length=200)
 
@@ -2006,7 +2011,7 @@ async def upload_multipart_init(
 
 
 class _MultipartPartReq(BaseModel):
-    job_id: str = Field(..., max_length=64)
+    job_id: str = Field(..., max_length=12)            # DB Job.job_id = VARCHAR(12)
     part_number: int
 
 
@@ -2122,7 +2127,7 @@ async def upload_file_proxy(
 
 
 class _MultipartCompleteReq(BaseModel):
-    job_id: str = Field(..., max_length=64)
+    job_id: str = Field(..., max_length=12)            # DB Job.job_id = VARCHAR(12)
     parts: list = Field(..., max_length=10000)  # R2 max 10k parts per upload
 
 
@@ -2174,7 +2179,7 @@ async def upload_multipart_complete(
 
 
 class _MultipartAbortReq(BaseModel):
-    job_id: str = Field(..., max_length=64)
+    job_id: str = Field(..., max_length=12)            # DB Job.job_id = VARCHAR(12)
 
 
 @app.post("/upload-multipart-abort")
@@ -2202,10 +2207,10 @@ async def upload_multipart_abort(
 
 
 class _TranscribeUploadedReq(BaseModel):
-    job_id: str = Field(..., max_length=64)
+    job_id: str = Field(..., max_length=12)
     language: str = Field(default="", max_length=16)
-    artist: str = Field(default="", max_length=200)
-    title: str = Field(default="", max_length=300)
+    artist: str = Field(default="", max_length=255)    # DB Job.artist = VARCHAR(255)
+    title: str = Field(default="", max_length=500)     # DB Job.song_title = VARCHAR(500)
 
 
 @app.post("/transcribe-uploaded")
@@ -2320,11 +2325,12 @@ async def upload(
     request: Request,
     response: Response,
     file: UploadFile = File(...),
-    artist: str = Form(..., max_length=200),
-    song_title: str = Form("", max_length=300),
-    style: str = Form("oscuro", max_length=100),
+    # Alineados con database.py:Job columns:
+    artist: str = Form(..., max_length=255),         # Job.artist = VARCHAR(255)
+    song_title: str = Form("", max_length=500),      # Job.song_title = VARCHAR(500)
+    style: str = Form("oscuro", max_length=50),      # Job.style = VARCHAR(50)
     language: str = Form("", max_length=16),
-    delivery_profile: str = Form("youtube", max_length=16),
+    delivery_profile: str = Form("youtube", max_length=20),  # Job.delivery_profile = VARCHAR(20)
     umg_frame_size: str = Form("", max_length=16),
     umg_fps: str = Form("", max_length=16),
     umg_prores_profile: str = Form("", max_length=4),
@@ -2505,8 +2511,8 @@ async def transcribe_endpoint(
     response: Response,
     file: UploadFile = File(...),
     language: str = Form("", max_length=16),
-    artist: str = Form("", max_length=200),
-    title: str = Form("", max_length=300),
+    artist: str = Form("", max_length=255),     # Job.artist = VARCHAR(255)
+    title: str = Form("", max_length=500),      # Job.song_title = VARCHAR(500)
     current_user: dict = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
@@ -3072,16 +3078,16 @@ async def _run_transcription_for_job(
 async def generate_with_segments(
     request: Request,
     file: UploadFile = File(None),
-    job_id: str = Form("", max_length=64),
-    artist: str = Form("", max_length=200),
-    song_title: str = Form("", max_length=300),
-    style: str = Form("oscuro", max_length=100),
+    job_id: str = Form("", max_length=12),       # Job.job_id = VARCHAR(12)
+    artist: str = Form("", max_length=255),      # Job.artist = VARCHAR(255)
+    song_title: str = Form("", max_length=500),  # Job.song_title = VARCHAR(500)
+    style: str = Form("oscuro", max_length=50),  # Job.style = VARCHAR(50)
     language: str = Form("", max_length=16),
     # segments_json es el payload del frontend con timing de cada lyric;
     # un video largo puede pesar varios cientos de KB. 5 MB es techo
     # generoso que rechaza payload absurdo sin restringir casos reales.
     segments_json: str = Form(..., max_length=5_000_000),
-    delivery_profile: str = Form("youtube", max_length=16),
+    delivery_profile: str = Form("youtube", max_length=20),  # Job.delivery_profile = VARCHAR(20)
     umg_frame_size: str = Form("", max_length=16),
     umg_fps: str = Form("", max_length=16),
     umg_prores_profile: str = Form("", max_length=4),
@@ -4111,6 +4117,9 @@ class ApproveJobRequest(BaseModel):
 
 
 class EditJobRequest(BaseModel):
+    # Estos campos NO se persisten a columnas VARCHAR — viajan dentro
+    # de Job.render_params (JSON column). Pero igual ponemos límites
+    # razonables al payload del cliente para evitar JSON gigante.
     edit_type: str = Field(..., max_length=32)  # "typography" | "background"
     font: str | None = Field(default=None, max_length=64)
     font_scale: float | None = None
