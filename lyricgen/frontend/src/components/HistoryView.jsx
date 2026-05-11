@@ -50,7 +50,13 @@ function StatusBadge({ status, t }) {
   );
 }
 
-const DELETABLE = new Set(["processing", "queued", "error", "validation_failed"]);
+// Mantener sincronizado con backend/jobs.py:_DELETABLE_STATUSES.
+// "editing" y "transcribed_pending" se agregaron para que el operador
+// pueda matar jobs colgados sin pedirle al admin que actualice la DB.
+const DELETABLE = new Set([
+  "processing", "queued", "error", "validation_failed",
+  "editing", "transcribed_pending",
+]);
 
 function VideoCard({ job, onSelect, onDelete, selected, onToggleSelect, t }) {
   // Prefer the structured fields the operator filled in / the backend
