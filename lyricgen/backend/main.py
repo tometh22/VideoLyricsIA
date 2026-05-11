@@ -72,7 +72,7 @@ from database import Job, User, UserSettings, AuditLog, APIKey, get_db, init_db,
 from jobs import bulk_delete_jobs, create_job, delete_job, get_job, get_all_jobs, update_job
 from observability import init_sentry, init_logging, health_snapshot
 from pipeline import run_pipeline, transcribe
-from queue_jobs import enqueue_pipeline, enqueue_edit, queue_depth
+from queue_jobs import enqueue_pipeline, enqueue_edit, queue_depth, enqueue_prores_prewarm
 from render_spec import umg_catalog, validate_umg_config
 from billing import router as billing_router
 from admin import router as admin_router
@@ -4049,6 +4049,15 @@ class EditJobRequest(BaseModel):
     text_motion: str | None = None
 
 
+class EnableProResRequest(BaseModel):
+    """Body para POST /enable-prores/{job_id}. Mismos campos que el upload
+    UMG. Strings sin parsear — _parse_umg_params se encarga de validar y
+    convertir a tipos correctos."""
+    umg_frame_size: str       # "1920x1080" | "3840x2160" | "1280x720"
+    umg_fps: str              # "23.976" | "24" | "25" | "29.97" | "30"
+    umg_prores_profile: str   # "1" (LT) | "2" (Standard) | "3" (HQ) | "4" (4444)
+
+
 @app.post("/approve/{job_id}")
 async def approve_job(
     job_id: str,
@@ -4230,6 +4239,87 @@ async def request_edit(
         "edit_type": body.edit_type,
         "edit_count": new_edit_count,
         "edits_remaining": _MAX_EDITS - new_edit_count,
+    }
+
+
+@app.post("/enable-prores/{job_id}")
+async def enable_prores_for_job(
+    job_id: str,
+    body: EnableProResRequest,
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Habilita ProRes export retroactivo para un job que se rindió como
+    MP4 only (delivery_profile=youtube en el upload original). Persiste
+    umg_spec en la fila del job y dispara el transcoding via prewarm
+    queue. La descarga posterior va por /download/{id}/umg_master que
+    ya tiene el lazy path armado (202 + Retry-After mientras transcode,
+    302 a R2 cuando está listo).
+
+    Idempotente: si el job ya tiene umg_spec, sobreescribe (permite
+    re-generar con specs distintas) y re-encola la transcodificación.
+    """
+    from database import Job as JobModel, AuditLog
+
+    if not has_prores_access(current_user):
+        raise HTTPException(
+            status_code=403,
+            detail="Broadcast (ProRes) delivery is not enabled for your account.",
+        )
+
+    job = (
+        db.query(JobModel)
+        .filter(JobModel.job_id == job_id)
+        .filter(JobModel.tenant_id == current_user["tenant_id"])
+        .first()
+    )
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+    if job.status != "done":
+        raise HTTPException(
+            status_code=400,
+            detail=f"Job must be done before enabling ProRes export (current: {job.status})",
+        )
+
+    # Reusa la validación canónica. delivery_profile="umg" fuerza el
+    # parseo y rechaza inputs inválidos con HTTPException 400.
+    umg_spec = _parse_umg_params(
+        delivery_profile="umg",
+        umg_frame_size=body.umg_frame_size,
+        umg_fps=body.umg_fps,
+        umg_prores_profile=body.umg_prores_profile,
+        current_user=current_user,
+    )
+
+    job.umg_spec = umg_spec
+    db.add(AuditLog(
+        user_id=current_user["id"],
+        action="job.enable_prores",
+        detail={"job_id": job_id, "umg_spec": umg_spec},
+    ))
+    db.commit()
+
+    # Encola ambos masters. enqueue_prores_prewarm es best-effort: si el
+    # tenant tiene la cola enterprise saturada hace skip (el lazy path
+    # del /download los va a generar bajo demanda igual).
+    enqueued = []
+    try:
+        for file_type in ("umg_master", "umg_short"):
+            rq_id = enqueue_prores_prewarm(job_id, file_type)
+            if rq_id:
+                enqueued.append(file_type)
+    except Exception as e:  # pragma: no cover
+        logger.warning("[PRORES] enable-prores prewarm enqueue failed: %s", e)
+
+    return {
+        "ok": True,
+        "job_id": job_id,
+        "umg_spec": umg_spec,
+        "enqueued": enqueued,
+        "status": "queued",
+        # Cliente debe poll /status hasta prores_ready=true, luego pegar
+        # /download/{id}/umg_master para bajar el .mov.
+        "retry_after": 90,
     }
 
 
