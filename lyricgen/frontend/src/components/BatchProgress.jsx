@@ -19,7 +19,7 @@ function JobRow({ job, index, t, onSelectJob }) {
   const { filename, status, current_step, progress, job_id, error,
           queue_reason, queue_retry_in_s } = job;
   const name = filename.replace(/\.(mp3|wav)$/i, "");
-  const isClickable = (status === "pending_review" || status === "done") && job_id && onSelectJob;
+  const isClickable = (status === "pending_review" || status === "done" || status === "editing") && job_id && onSelectJob;
 
   const STEP_LABELS = {
     uploading: t("batch.step_uploading") || "Subiendo",
@@ -43,7 +43,7 @@ function JobRow({ job, index, t, onSelectJob }) {
     <div
       onClick={isClickable ? () => onSelectJob(job_id) : undefined}
       className={`glass rounded-card p-4 transition-all duration-300 ${
-        status === "processing" ? "border border-brand/20" : ""
+        (status === "processing" || status === "editing") ? "border border-brand/20" : ""
       } ${isClickable ? "cursor-pointer hover:bg-white/[0.02] hover:ring-1 hover:ring-brand/20" : ""}`}
     >
       <div className="flex items-center gap-3 mb-3">
@@ -51,13 +51,13 @@ function JobRow({ job, index, t, onSelectJob }) {
           status === "done" ? "bg-accent/10" :
           status === "pending_review" ? "bg-amber-500/10" :
           status === "error" || status === "validation_failed" ? "bg-red-500/10" :
-          status === "processing" ? "bg-brand/10" :
+          (status === "processing" || status === "editing") ? "bg-brand/10" :
           "bg-surface-3/50"
         }`}>
           {status === "done" && <svg className="w-4.5 h-4.5 text-accent" fill="none" stroke="currentColor" strokeWidth="2.5" viewBox="0 0 24 24"><polyline points="20 6 9 17 4 12" /></svg>}
           {status === "pending_review" && <svg className="w-4.5 h-4.5 text-amber-400" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10" /><path d="M12 8v4M12 16h.01" /></svg>}
           {(status === "error" || status === "validation_failed") && <svg className="w-4.5 h-4.5 text-red-400" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24"><path d="M18 6L6 18M6 6l12 12" /></svg>}
-          {status === "processing" && <div className="w-4 h-4 border-2 border-brand border-t-transparent rounded-full animate-spin" />}
+          {(status === "processing" || status === "editing") && <div className="w-4 h-4 border-2 border-brand border-t-transparent rounded-full animate-spin" />}
           {status === "queued" && <span className="text-xs font-bold text-gray-500">{index + 1}</span>}
         </div>
         <div className="min-w-0 flex-1">
@@ -74,6 +74,7 @@ function JobRow({ job, index, t, onSelectJob }) {
              status === "pending_review" ? (t("batch.pending_review") || "Pendiente de aprobación") :
              status === "validation_failed" ? (t("batch.validation_failed") || "Validación fallida") :
              status === "error" ? (error || t("dash.error")) :
+             status === "editing" ? (t("batch.editing") || `Re-renderizando · ${STEP_LABELS[current_step] || current_step || "..."} ${progress || 0}%`) :
              status === "processing" ? (
                current_step === "uploading"
                  ? `${STEP_LABELS.uploading} ${progress || 0}%`
@@ -100,7 +101,7 @@ function JobRow({ job, index, t, onSelectJob }) {
           </div>
         )}
       </div>
-      {status === "processing" && (
+      {(status === "processing" || status === "editing") && (
         <div className="w-full h-1.5 bg-surface-1 rounded-full overflow-hidden">
           <div className="h-full rounded-full bg-gradient-to-r from-brand to-brand-light transition-all duration-700" style={{ width: `${progress}%` }} />
         </div>

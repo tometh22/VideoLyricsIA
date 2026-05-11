@@ -1,0 +1,73 @@
+# Railway project config.
+#
+# Why this file exists:
+#   The Worker service generates videos by polling Veo for 60-120 s per
+#   job. When Railway redeploys (push to main, manual restart, platform
+#   maintenance) the running container gets SIGTERM → SIGKILL. If KILL
+#   fires before the in-flight job has a chance to finish or be
+#   re-queued, the user sees a forever-spinning "Generando" until the
+#   reaper sweeps the row 10-100 min later.
+#
+#   This config tightens the three knobs that turn that incident into a
+#   non-event:
+#     • healthcheckTimeout — Railway holds the old replica around until
+#       the new one is healthy (rolling overlap).
+#     • restartPolicy      — restart loops are bounded; a real bug stops
+#       eating users instead of hot-looping forever.
+#     • Per-service deploy settings live in each service's section, so
+#       the Worker can have a different graceful-shutdown budget than
+#       the API.
+#
+# What you still need to verify in the Railway dashboard:
+#   1. Plan tier supports overlapping deploys (Pro plan and above).
+#      Hobby plan does the "kill-then-spawn" sequence regardless of
+#      this file.
+#   2. `RAILWAY_SHUTDOWN_TIMEOUT_SECONDS` env var is set to >= 180 on
+#      the Worker service. This is the SIGTERM→SIGKILL grace period;
+#      RQ workers honor SIGTERM by finishing the current job, but
+#      Railway's default grace is 30 s which cuts a Veo poll in half.
+#   3. Health check endpoints respond fast (< 1 s). The API exposes
+#      /health; the worker has none and runs as a daemon — that's fine,
+#      Railway just won't wait on it for the overlap window (see the
+#      `[services.worker]` block below).
+
+[build]
+builder = "DOCKERFILE"
+
+# --- Defaults aplicados a TODOS los servicios ---
+#
+# Solo lo que aplica a ambos (API + Worker). HEALTHCHECK NO va acá
+# porque el Worker es un daemon RQ sin HTTP. Cuando estaba global
+# Railway falló el deploy con "5/5 replicas never became healthy"
+# porque el Worker nunca responde GET /health. Los settings de
+# healthcheck ahora viven en [services.api.deploy].
+
+[deploy]
+restartPolicyType = "ON_FAILURE"
+restartPolicyMaxRetries = 5
+
+# --- API service (FastAPI on uvicorn) ---
+#
+# CRITICAL: el service name DEBE matchear exacto el nombre en Railway
+# dashboard (case-sensitive). En Genly IA es `api` minúscula. Si lo
+# escribís en mayúscula o con otro casing, Railway ignora silenciosamente
+# el override y el servicio cae al [deploy] default sin healthcheck.
+
+[services.api.deploy]
+healthcheckPath = "/health"
+healthcheckTimeout = 30
+
+# --- Worker service overrides ---
+#
+# CRITICAL: el service en Railway dashboard se llama `Worker` con W
+# MAYÚSCULA. La versión anterior decía `worker` (lowercase) → no
+# matcheaba → Railway aplicaba el [deploy] global con healthcheck
+# /health → Worker no tiene HTTP → 5/5 replicas fail → deploy abortaba.
+#
+# No ponemos healthcheckPath acá: el Worker es daemon RQ. La resiliencia
+# viene de SIGTERM handler (worker.py:_graceful drain in-flight) + RQ
+# Retry en queue_jobs.py (auto-recover si el worker muere mid-job).
+
+[services.Worker.deploy]
+restartPolicyType = "ON_FAILURE"
+restartPolicyMaxRetries = 10

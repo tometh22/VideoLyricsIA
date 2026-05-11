@@ -3,6 +3,8 @@ import { useI18n } from "../i18n";
 import { getDownloadUrl, useMediaUrl } from "../mediaUrl";
 import { JobDetailTour } from "./OnboardingTour";
 import ProResBadge from "./ProResBadge";
+import EditRequestPanel from "./EditRequestPanel";
+import EnableProResModal from "./EnableProResModal";
 
 const API = import.meta.env.VITE_API_URL || "";
 
@@ -170,6 +172,37 @@ export default function JobDetail({ job, onBack, onJobUpdate }) {
   const [reviewNotes, setReviewNotes] = useState("");
   const [approving, setApproving] = useState(false);
   const [retrying, setRetrying] = useState(false);
+
+  // handleRetry MUST estar definida antes del early-return que la usa
+  // (línea ~311 para jobs con status=error). Si se la pone más abajo
+  // junto a los otros handlers, el JSX del early-return accede a la
+  // const en su temporal dead zone → ReferenceError "Cannot access
+  // 'handleRetry' before initialization" → GlobalErrorBoundary catch
+  // → app entera crashea. Lo aprendimos cuando un job en error rompió
+  // toda la dashboard de un cliente.
+  const handleRetry = async () => {
+    if (retrying) return;
+    setRetrying(true);
+    try {
+      const res = await fetch(`${API}/retry/${job.job_id}`, {
+        method: "POST",
+        headers: authHeaders(),
+      });
+      if (res.ok) {
+        const updated = await (await fetch(`${API}/status/${job.job_id}`, { headers: authHeaders() })).json();
+        onJobUpdate?.(updated);
+        // Navigate back so the user sees the batch/history with the job now processing.
+        onBack?.();
+      } else {
+        const body = await res.json().catch(() => ({}));
+        alert(body.detail || "No se pudo reintentar el video.");
+      }
+    } catch {
+      alert("Error de red al reintentar.");
+    }
+    setRetrying(false);
+  };
+
   // Synchronous guard against double-click — `approving` (state) is updated
   // asynchronously by React, so a rapid second click can fire its handler
   // before the re-render flips the disabled flag. The ref is set BEFORE
@@ -186,8 +219,98 @@ export default function JobDetail({ job, onBack, onJobUpdate }) {
   const canPreview = job.status === "done" || job.status === "pending_review";
   const canDownload = job.status === "done";
   const isPendingReview = job.status === "pending_review";
+  const isEditing = job.status === "editing";
   const isValidationFailed = job.status === "validation_failed";
   const isError = job.status === "error";
+
+  // While the worker is re-rendering an edit request, poll /status every
+  // 5s and propagate updates up so the rest of the screen (status badge,
+  // approve panel visibility, preview URLs) stays in sync. The interval
+  // cleans itself up the moment status leaves "editing".
+  useEffect(() => {
+    if (!isEditing) return;
+    let cancelled = false;
+    const tick = async () => {
+      try {
+        const res = await fetch(`${API}/status/${job.job_id}`, { headers: authHeaders() });
+        if (!res.ok || cancelled) return;
+        const updated = await res.json();
+        if (cancelled) return;
+        // Merge into existing job so we don't drop fields /status doesn't return
+        // (youtube_data, etc.). onJobUpdate flows it back through App state.
+        if (onJobUpdate) onJobUpdate({ ...job, ...updated });
+      } catch {}
+    };
+    const iv = setInterval(tick, 5000);
+    tick(); // first tick immediately, no need to wait 5s
+    return () => { cancelled = true; clearInterval(iv); };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [isEditing, job.job_id]);
+
+  const handleEditTriggered = (resp) => {
+    // Server already flipped status to "editing" + bumped edit_count.
+    // Reflect that immediately in the UI so the approve panel hides and
+    // the editing overlay appears, then let polling take over.
+    if (onJobUpdate) {
+      onJobUpdate({
+        ...job,
+        status: "editing",
+        edit_count: resp?.edit_count ?? (job.edit_count || 0) + 1,
+        edits_remaining: resp?.edits_remaining ?? Math.max(0, (job.edits_remaining ?? 3) - 1),
+        current_step: resp?.edit_type === "background" ? "background" : "video",
+        progress: 0,
+      });
+    }
+  };
+
+  // Editing in progress: render a focused panel instead of falling through
+  // to the "not available" early-return below. canPreview is false during
+  // editing (the video bytes are being rewritten on R2) but we DO want to
+  // show progress + clear messaging — not the generic dead-end message.
+  if (isEditing) {
+    return (
+      <div className="w-full max-w-2xl animate-fade-in">
+        <div className="flex items-center gap-3 mb-6">
+          <button onClick={onBack} className="w-9 h-9 shrink-0 rounded-xl bg-surface-2/40 ring-1 ring-white/[0.04] hover:ring-white/[0.08] flex items-center justify-center text-gray-400 hover:text-white transition-colors">
+            <svg className="w-4 h-4" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24"><path d="M19 12H5M12 19l-7-7 7-7" /></svg>
+          </button>
+          <div>
+            <h2 className="text-xl font-bold">{name}</h2>
+            <p className="text-sm text-gray-500">{job.artist}</p>
+          </div>
+        </div>
+        <div className="rounded-card p-5 bg-brand/[0.08] ring-1 ring-brand/25">
+          <div className="flex items-start gap-3">
+            <div className="w-9 h-9 rounded-lg bg-brand/15 ring-1 ring-brand/30 flex items-center justify-center shrink-0">
+              <span className="w-4 h-4 border-2 border-brand-light border-t-transparent rounded-full animate-spin" />
+            </div>
+            <div className="flex-1 min-w-0">
+              <p className="text-sm font-semibold text-white">
+                {t("edit.in_progress_title") || "Aplicando tus cambios..."}
+              </p>
+              <p className="text-xs text-ink-secondary mt-0.5">
+                {job.current_step === "background"
+                  ? (t("edit.in_progress_bg") || "Generando nuevo fondo con Veo · mantiene lyrics y tiempos · ~10-15 min")
+                  : (t("edit.in_progress_typo") || "Re-renderizando con la tipografía nueva · usa el fondo cacheado · ~5-10 min")}
+              </p>
+              <div className="mt-3 h-1.5 rounded-full bg-surface-3/60 overflow-hidden">
+                <div
+                  className="h-full bg-gradient-to-r from-brand to-brand-light transition-[width] duration-700 ease-out"
+                  style={{ width: `${Math.min(100, Math.max(3, job.progress || 0))}%` }}
+                />
+              </div>
+              <p className="text-[10px] text-gray-500 mt-1 font-mono">
+                {job.current_step || "?"} · {job.progress || 0}%
+              </p>
+              <p className="text-[11px] text-gray-500 mt-3 leading-relaxed">
+                {t("edit.no_video_during_editing") || "El video viejo se está reemplazando con tus cambios. Cuando termine vas a poder verlo acá."}
+              </p>
+            </div>
+          </div>
+        </div>
+      </div>
+    );
+  }
 
   if (!canPreview && !isValidationFailed && !isError) {
     return (
@@ -403,28 +526,8 @@ export default function JobDetail({ job, onBack, onJobUpdate }) {
     approveLockRef.current = false;
   };
 
-  const handleRetry = async () => {
-    if (retrying) return;
-    setRetrying(true);
-    try {
-      const res = await fetch(`${API}/retry/${job.job_id}`, {
-        method: "POST",
-        headers: authHeaders(),
-      });
-      if (res.ok) {
-        const updated = await (await fetch(`${API}/status/${job.job_id}`, { headers: authHeaders() })).json();
-        onJobUpdate?.(updated);
-        // Navigate back so the user sees the batch/history with the job now processing.
-        onBack?.();
-      } else {
-        const body = await res.json().catch(() => ({}));
-        alert(body.detail || "No se pudo reintentar el video.");
-      }
-    } catch {
-      alert("Error de red al reintentar.");
-    }
-    setRetrying(false);
-  };
+  // handleRetry está definida más arriba (~línea 175) para que esté
+  // disponible antes del early-return de status=error. No duplicar acá.
 
   const handleReject = async () => {
     if (approveLockRef.current) return;
@@ -463,10 +566,29 @@ export default function JobDetail({ job, onBack, onJobUpdate }) {
   // existed (or whose prewarm died silently) sit forever with
   // umg_master_url=null and no way for the operator to recover the file.
   // Showing the button always lets clicking it trigger the recovery.
+  // Un job es "UMG" si fue creado con delivery_profile=umg/both, O si
+  // se le habilitó ProRes retroactivamente via POST /enable-prores
+  // (que persiste umg_spec sin tocar delivery_profile, para no perder
+  // el dato histórico de cómo se rindió originalmente).
   const isUmgJob =
-    job.delivery_profile === "umg" || job.delivery_profile === "both";
+    job.delivery_profile === "umg"
+    || job.delivery_profile === "both"
+    || !!job.umg_spec;
   const isJobDone = job.status === "done";
   const hasUmgMaster = isUmgJob && isJobDone;
+
+  // El botón "Exportar a ProRes" aparece solo cuando el job está done,
+  // NO tiene ProRes habilitado todavía, y el usuario tiene el feature
+  // flag prores_export. Click → modal que persiste umg_spec en el job
+  // y dispara el transcoding. Una vez hecho, isUmgJob flipea a true en
+  // el próximo /status poll y aparece el tab de ProRes Master.
+  const user = (() => {
+    try { return JSON.parse(localStorage.getItem("genly_user") || "null"); } catch { return null; }
+  })();
+  const canEnableProRes =
+    isJobDone && !isUmgJob && user?.features?.prores_export === true;
+  const [showProResModal, setShowProResModal] = useState(false);
+  const [proResToast, setProResToast] = useState(null);
   // Short ProRes follows the same opt-in: any UMG-flavoured job gets a
   // separate vertical-format master alongside the main one. Generated
   // lazily by /download/{id}/umg_short the first time it's clicked.
@@ -747,6 +869,15 @@ export default function JobDetail({ job, onBack, onJobUpdate }) {
         </>
       )}
 
+      {/* The dedicated full-page editing UI lives in the early return at
+          the top of the component — by the time we get down here, status
+          is pending_review or done, so no editing overlay needed. */}
+
+      {/* Edit request panel for pending_review (above approve) */}
+      {isPendingReview && (
+        <EditRequestPanel job={job} onEditTriggered={handleEditTriggered} />
+      )}
+
       {/* Approval panel for pending_review */}
       {isPendingReview && (
         <div
@@ -803,6 +934,58 @@ export default function JobDetail({ job, onBack, onJobUpdate }) {
             </button>
           </div>
         </div>
+      )}
+
+      {/* Exportar a ProRes — para jobs MP4-only cuyo tenant tiene
+          prores_export habilitado. Persiste umg_spec retroactivo y
+          dispara el transcoding lazy. */}
+      {canEnableProRes && (
+        <div className="rounded-card bg-surface-2/40 ring-1 ring-white/[0.04] p-5 mb-4 flex items-start gap-4">
+          <div className="w-10 h-10 shrink-0 rounded-xl bg-brand/10 ring-1 ring-brand/30 flex items-center justify-center text-brand">
+            <svg className="w-5 h-5" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
+              <path d="M12 4v12m0 0l-4-4m4 4l4-4M4 20h16" strokeLinecap="round" strokeLinejoin="round" />
+            </svg>
+          </div>
+          <div className="flex-1 min-w-0">
+            <div className="text-sm font-semibold text-white">
+              {t("prores.cta_title") || "Exportar a ProRes (.mov broadcast)"}
+            </div>
+            <div className="text-xs text-gray-400 mt-0.5">
+              {t("prores.cta_desc") ||
+                "Este video se rindió como MP4. Generá una versión ProRes para broadcast / cliente."}
+            </div>
+            {proResToast && (
+              <div className="mt-2 text-xs text-accent">
+                {proResToast}
+              </div>
+            )}
+          </div>
+          <button
+            type="button"
+            onClick={() => setShowProResModal(true)}
+            className="shrink-0 px-4 py-2 rounded-md text-sm font-medium text-white bg-brand hover:bg-brand-strong ring-1 ring-brand/30 transition-colors"
+          >
+            {t("prores.cta_button") || "Exportar"}
+          </button>
+        </div>
+      )}
+
+      {showProResModal && (
+        <EnableProResModal
+          jobId={job.job_id}
+          onClose={() => setShowProResModal(false)}
+          onSuccess={(data) => {
+            setShowProResModal(false);
+            setProResToast(
+              t("prores.queued_toast") ||
+                "ProRes encolado. En 1-5 min va a estar disponible para descargar.",
+            );
+            // Trigger un refresh del job en el próximo tick para que
+            // isUmgJob flipee a true (gracias al umg_spec recién
+            // persistido) y aparezca el tab de Máster ProRes.
+            onJobUpdate?.({ ...job, umg_spec: data.umg_spec });
+          }}
+        />
       )}
 
       {/* YouTube Panel (only for approved/done jobs) */}

@@ -6,10 +6,20 @@
     <title>GenLy</title>
     <!-- §10 Logo implementation — single source of truth. The favicon
          uses the G mark only (per the brand kit rules); the navbar /
-         footer / auth screens use the full lockup. -->
-    <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
+         footer / auth screens use the full lockup. PNG variants cover
+         every browser/device; .ico catches naive GET /favicon.ico hits
+         (avoids the SPA fallback returning index.html as a "favicon");
+         apple-touch-icon is what iOS Safari uses for "Add to Home
+         Screen". SVG is a base64-wrapped PNG so SVG-preferring browsers
+         render the same image as the PNG fallback (the prior hand-coded
+         vector SVG was a different earlier design without the blue
+         dot). -->
     <link rel="icon" type="image/png" sizes="32x32" href="/favicon-32.png" />
     <link rel="icon" type="image/png" sizes="16x16" href="/favicon-16.png" />
+    <link rel="icon" type="image/png" sizes="192x192" href="/favicon-192.png" />
+    <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
+    <link rel="shortcut icon" href="/favicon.ico" />
+    <link rel="apple-touch-icon" sizes="180x180" href="/apple-touch-icon.png" />
     <!-- Google Fonts for the lyric-video font picker preview. The 8 families
          here mirror the backend's _FONT_CATALOGUE so what the operator sees
          in the dropdown is exactly what the worker renders. -->

@@ -229,7 +229,9 @@ def run_pipeline(job_id: str, mp3_path: str, artist: str, style: str,
                  text_case: str = "upper",
                  font_scale: float = 1.0,
                  lyric_transition: str = "cut",
-                 text_motion: str = "none"):
+                 text_motion: str = "none",
+                 match_lyrics: bool = True,
+                 text_contrast: str = "medium"):
     """Run the full pipeline for a job. Called synchronously.
 
     delivery_profile:
@@ -394,6 +396,7 @@ def run_pipeline(job_id: str, mp3_path: str, artist: str, style: str,
                 song_title=_song_title, genre=genre, concept=concept,
                 movement_style=movement_style,
                 image_to_video_path=(background_path if _animate_user_image else None),
+                match_lyrics=match_lyrics,
             )
             # Image-to-video fallback: if Veo failed to produce an MP4 (None
             # or non-existent path) AND the operator wanted to animate their
@@ -520,6 +523,7 @@ def run_pipeline(job_id: str, mp3_path: str, artist: str, style: str,
                 font_scale=font_scale,
                 lyric_transition=lyric_transition,
                 text_motion=text_motion,
+                text_contrast=text_contrast,
             )
             files["video_url"] = f"/download/{job_id}/video"
             update_job(job_id, progress=55)
@@ -2880,8 +2884,12 @@ def _normalize_concept(c: str) -> str:
 def _analyze_lyrics_for_background(lyrics_text: str, artist: str, job_id: str = None,
                                     song_title: str = "", genre: str = "",
                                     concept: str = "",
-                                    movement_style: str = "") -> dict:
+                                    movement_style: str = "",
+                                    match_lyrics: bool = True) -> dict:
     """Use Gemini to analyze lyrics and choose visual style + prompt.
+
+    match_lyrics=True  ("Inspirado en la letra"): lyrics anchor or infuse the scene.
+    match_lyrics=False: concept/genre vocabulary only, lyrics are ignored.
 
     Returns dict with:
       - style: "video" | "photo" | "illustration"
@@ -2898,17 +2906,55 @@ def _analyze_lyrics_for_background(lyrics_text: str, artist: str, job_id: str = 
     movement_rule = _MOVEMENT_STYLE_RULES.get(normalized_movement, "")
     movement_extra_line = f"\n- {movement_rule}" if movement_rule else ""
 
+    _PROMPT_RULES = (
+        "- \"style\" must always be \"video\"\n"
+        "- \"prompt\" is 80-120 words. Describe: (1) specific scene subject and setting "
+        "in detail, (2) exact camera movement and framing, (3) color palette and dominant "
+        "tones, (4) lighting type and direction, (5) atmosphere, mood, and at least one "
+        "specific texture or material detail. Be precise and cinematic — avoid vague "
+        "adjectives like \"beautiful\" or \"amazing\".\n"
+        "- Pick a DIFFERENT specific scene each time (don't repeat across songs)\n"
+        "- Never include people, faces, hands, or readable text in the scene"
+    )
+    _EXAMPLE = (
+        "{\"style\":\"video\",\"prompt\":\"Slow tracking shot through neon-lit "
+        "rain-slicked streets, deep blue and red reflections, smoke rising past "
+        "streetlamps, gritty cinematic 4k\"}"
+    )
+
     if normalized_concept:
-        # Operator picked an explicit visual concept — that hard-overrides
-        # the genre's scene vocabulary. The concept is the controlling
-        # input here; genre still goes into the user content as a stylistic
-        # color hint but does NOT determine the scene type.
         concept_guide = _CONCEPT_SCENE_GUIDE[normalized_concept]
         genre_hint = (f"\n\nFor stylistic colour-grading flavour only "
                       f"(NOT for scene choice), the song genre is: "
                       f"{normalized_genre.upper()}.") if normalized_genre else ""
-        system_prompt = f"""Respond ONLY with a JSON object, no other text. Example:
-{{"style":"video","prompt":"Slow tracking shot through neon-lit rain-slicked streets, deep blue and red reflections, smoke rising past streetlamps, gritty cinematic 4k"}}
+
+        if match_lyrics:
+            # "Inspirado en la letra": concept sets the visual register,
+            # lyrics theme infuses the specific execution within it.
+            system_prompt = f"""Respond ONLY with a JSON object, no other text. Example:
+{_EXAMPLE}
+
+The operator has chosen the visual register: {normalized_concept.upper()}.
+The scene MUST stay within this concept's visual vocabulary:
+{concept_guide}{genre_hint}
+
+STEP 0 — Read the lyrics and identify the SOUL of the song: its core theme, emotion, or story (e.g., football passion, longing for home, celebration, heartbreak, nature, freedom).
+
+STEP 1 — Build a scene that:
+- Is firmly within the {normalized_concept.upper()} visual vocabulary (non-negotiable)
+- Expresses the song's theme through specific choices of color, shape, motion, and composition
+- Examples:
+  · ABSTRACTO + football → dynamic circular forms in green/white with kinetic energy
+  · COSMICO + heartbreak → cold distant nebula, muted purples, slow lonely drift
+  · NATURALEZA + summer joy → golden sun-drenched meadow, warm swaying grass, long shadows
+
+Hard rules:
+{_PROMPT_RULES}
+- The concept vocabulary is the hard boundary — never exit it{movement_extra_line}"""
+        else:
+            # Strict concept mode: operator's visual choice, no lyrics influence.
+            system_prompt = f"""Respond ONLY with a JSON object, no other text. Example:
+{_EXAMPLE}
 
 The operator has explicitly requested a {normalized_concept.upper()} background.
 
@@ -2916,19 +2962,34 @@ You MUST pick a scene that fits this concept's visual vocabulary:
 {concept_guide}{genre_hint}
 
 Hard rules:
-- "style" must always be "video"
-- "prompt" is 20-40 words: scene + camera movement + colors + lighting + atmosphere
-- Pick a DIFFERENT specific scene each time (don't repeat across songs)
-- The concept choice is binding — do NOT drift to a different visual category
-- Never include people, faces, hands, or readable text in the scene{movement_extra_line}"""
+{_PROMPT_RULES}
+- The concept choice is binding — do NOT drift to a different visual category{movement_extra_line}"""
+
     elif normalized_genre:
-        # User-supplied genre: lock Gemini to that genre's visual vocabulary
-        # and forbid the lazy "ocean sunset" default. This is the high-
-        # certainty path — UMG operators picking the genre at upload time
-        # gets us deterministic visual matching for their catalogue.
         scene_guide = _GENRE_SCENE_GUIDE[normalized_genre]
-        system_prompt = f"""Respond ONLY with a JSON object, no other text. Example:
-{{"style":"video","prompt":"Slow tracking shot through neon-lit rain-slicked streets, deep blue and red reflections, smoke rising past streetlamps, gritty cinematic 4k"}}
+
+        if match_lyrics:
+            # "Inspirado en la letra": lyrics anchor the scene, genre styles it.
+            system_prompt = f"""Respond ONLY with a JSON object, no other text. Example:
+{_EXAMPLE}
+
+The song genre is: {normalized_genre.upper()}
+
+STEP 0 — Read the lyrics and identify the PRIMARY VISUAL SUBJECT: the concrete setting, object, or action the song is literally about (e.g., a football/soccer match, the ocean, a city at night, a road, a dance floor, rain, a forest). This is your FIRST input for scene choice.
+
+STEP 1 — Choose the scene:
+- If the lyrics have a CLEAR visual subject → build the scene around that subject. Apply the {normalized_genre.upper()} genre's color palette, lighting, and atmosphere to STYLE it — but the SCENE must reflect what the song is literally about.
+- If the lyrics are abstract or purely emotional with no specific visual subject → fall back to this genre's visual vocabulary:
+{scene_guide}
+
+Hard rules:
+{_PROMPT_RULES}
+- If lyrics reference a sport (football, basketball, etc.) → use field/pitch/arena/equipment, NOT cars or generic cityscapes
+- Do NOT default to "calm ocean at sunset" unless this song is BALLAD{movement_extra_line}"""
+        else:
+            # Strict genre mode: pick from genre vocabulary, ignore lyrics.
+            system_prompt = f"""Respond ONLY with a JSON object, no other text. Example:
+{_EXAMPLE}
 
 The song genre is: {normalized_genre.upper()}
 
@@ -2936,15 +2997,43 @@ You MUST pick a scene from this genre's visual vocabulary:
 {scene_guide}
 
 Hard rules:
-- "style" must always be "video"
-- "prompt" is 20-40 words: scene + camera movement + colors + lighting + atmosphere
-- Pick a DIFFERENT specific scene each time (don't repeat across songs)
-- Do NOT default to "calm ocean at sunset" unless this song is BALLAD
-- Never include people, faces, hands, or readable text in the scene{movement_extra_line}"""
+{_PROMPT_RULES}
+- Do NOT default to "calm ocean at sunset" unless this song is BALLAD{movement_extra_line}"""
+
     else:
-        # No genre hint: ask Gemini to classify first, then pick.
-        # "Auto" mode for users who don't want to choose.
-        system_prompt = """Respond ONLY with a JSON object, no other text. Example:
+        if match_lyrics:
+            # "Inspirado en la letra" + auto: lyrics anchor the scene,
+            # genre classification controls color/mood only.
+            system_prompt = f"""Respond ONLY with a JSON object, no other text. Example:
+{_EXAMPLE}
+
+STEP 0 — Read the lyrics and identify the PRIMARY VISUAL SUBJECT: the concrete setting, object, or action the song is literally about (e.g., a football/soccer match, the ocean, a city at night, a road trip, a dance floor, rain, a forest). This is your FIRST input for scene choice.
+
+STEP 1 — Choose the scene:
+- If the lyrics have a CLEAR visual subject → build the scene around that subject. Then classify genre (rock/pop/ballad/latin/reggaeton/hiphop/electronic/indie/folk/metal) to determine the COLOR PALETTE, LIGHTING, and ATMOSPHERE only — not the scene itself.
+- If the lyrics are abstract or purely emotional with no specific visual subject → classify genre, then pick from the genre's vocabulary:
+  - rock     → urban industrial streets, neon alleyways, gritty rain, electric storms, abandoned warehouses
+  - pop      → vibrant neon, disco reflections, geometric light patterns, glossy gradient skies
+  - ballad   → soft sunset, calm ocean, drifting clouds, warm golden light, candlelight
+  - latin    → tropical beaches, palm trees, vibrant flowers, festive lanterns, sunlit caribbean water
+  - reggaeton → night cityscape with red/pink neon, abstract color bursts, club laser patterns
+  - hiphop   → city skyline at night with gold, marble luxury textures, smoke-filled spotlights
+  - electronic → abstract geometry, particle storms, fractal liquid metal, laser grids
+  - indie    → misty forests, vintage interiors, autumn roads, lone lighthouses, dreamy lakes
+  - folk     → mountain vistas, dusty roads, wheat fields, riverside campfires
+  - metal    → volcanic lava streams, dark cathedrals, stormy lightning, cracked obsidian
+
+STEP 2 — Output JSON with an 80-120 word prompt. Describe: (1) specific scene subject and setting in detail, (2) exact camera movement and framing, (3) color palette and dominant tones, (4) lighting type and direction, (5) atmosphere, mood, and at least one specific texture or material detail. Be precise and cinematic — avoid vague adjectives like "beautiful" or "amazing".
+
+Hard rules:
+- "style" must always be "video"
+- Pick a DIFFERENT specific scene each time (don't repeat across songs)
+- If lyrics reference a sport (football, basketball, etc.) → use field/pitch/arena/equipment, NOT cars or generic cityscapes
+- Do NOT default to "calm ocean at sunset" unless the song is genuinely BALLAD
+- Never include people, faces, hands, or readable text in the scene"""
+        else:
+            # Strict auto mode: classify genre, pick vocabulary, no lyrics.
+            system_prompt = """Respond ONLY with a JSON object, no other text. Example:
 {"style":"video","prompt":"Slow tracking shot through neon-lit rain-slicked streets, deep blue and red reflections, smoke rising past streetlamps, gritty cinematic 4k"}
 
 Step 1: Classify the song's genre using the artist, title, and lyrics. Pick ONE of:
@@ -2955,14 +3044,14 @@ Step 2: Pick a scene from the matching genre's visual vocabulary:
 - pop      → vibrant neon, disco reflections, geometric light patterns, glossy gradient skies
 - ballad   → soft sunset, calm ocean, drifting clouds, warm golden light, candlelight
 - latin    → tropical beaches, palm trees, vibrant flowers, festive lanterns, sunlit caribbean water
-- reggaeton → night cityscape with red/pink neon, luxury cars, club lasers
+- reggaeton → night cityscape with red/pink neon, abstract color bursts, club laser patterns
 - hiphop   → city skyline at night with gold, marble luxury textures, smoke-filled spotlights
 - electronic → abstract geometry, particle storms, fractal liquid metal, laser grids
 - indie    → misty forests, vintage interiors, autumn roads, lone lighthouses, dreamy lakes
 - folk     → mountain vistas, dusty roads, wheat fields, riverside campfires
 - metal    → volcanic lava streams, dark cathedrals, stormy lightning, cracked obsidian
 
-Step 3: Output JSON with the chosen scene as a 20-40 word prompt.
+Step 3: Output JSON with the chosen scene as an 80-120 word prompt.
 
 Hard rules:
 - "style" must always be "video"
@@ -3041,7 +3130,7 @@ Hard rules:
 
 def _get_unique_prompt(lyrics_text: str = None, artist: str = "", job_id: str = None,
                        song_title: str = "", genre: str = "", concept: str = "",
-                       movement_style: str = "") -> dict:
+                       movement_style: str = "", match_lyrics: bool = True) -> dict:
     """Get a unique style+prompt combination. Returns {style, prompt}.
 
     Note: the local _USED_PROMPTS_FILE only sees this worker's previous
@@ -3063,6 +3152,7 @@ def _get_unique_prompt(lyrics_text: str = None, artist: str = "", job_id: str = 
         result = _analyze_lyrics_for_background(
             lyrics_text or "", artist, job_id=job_id, song_title=song_title,
             genre=genre, concept=concept, movement_style=movement_style,
+            match_lyrics=match_lyrics,
         )
         if result["prompt"] and result["prompt"] not in used:
             used.append(result["prompt"])
@@ -3600,12 +3690,66 @@ def _extract_frame_from_video(video_path: str, output_image_path: str) -> str:
     return output_image_path
 
 
+def _score_video_relevance(video_path: str, prompt: str) -> int:
+    """Ask Gemini Vision whether the video matches the intended scene prompt.
+
+    Extracts one frame and returns a relevance score 1-10.
+    Fails open (returns 8) so a Gemini error never blocks a good video.
+    """
+    from google import genai
+    import tempfile
+
+    tmp_frame = None
+    try:
+        with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as f:
+            tmp_frame = f.name
+        _extract_frame_from_video(video_path, tmp_frame)
+
+        client = _get_genai_client()
+        with open(tmp_frame, "rb") as f:
+            image_bytes = f.read()
+
+        response = client.models.generate_content(
+            model="gemini-2.5-flash",
+            contents=[
+                genai.types.Part.from_bytes(data=image_bytes, mime_type="image/jpeg"),
+                (
+                    f"This is a frame from an AI-generated background video.\n"
+                    f"Intended scene: \"{prompt}\"\n\n"
+                    f"Score how well the frame matches the intended scene, 1-10.\n"
+                    f"Focus on whether the MAIN SUBJECT is correct "
+                    f"(e.g. if the scene should show a football pitch but shows cars, score 1-2).\n"
+                    f"Respond with ONLY a single integer, nothing else."
+                ),
+            ],
+            config=genai.types.GenerateContentConfig(
+                temperature=0.0,
+                max_output_tokens=5,
+                thinking_config=genai.types.ThinkingConfig(thinking_budget=0),
+            ),
+        )
+        import re as _re
+        m = _re.search(r'\b(10|[1-9])\b', response.text)
+        score = int(m.group()) if m else 5
+        return max(1, min(10, score))
+    except Exception as e:
+        print(f"[BG] Relevance score error (fail-open): {e}")
+        return 8
+    finally:
+        if tmp_frame:
+            try:
+                os.unlink(tmp_frame)
+            except OSError:
+                pass
+
+
 def _ensure_background(style_hint: str, job_dir: str, lyrics_text: str = None,
                        artist: str = "", job_id: str = None,
                        song_title: str = "", genre: str = "",
                        concept: str = "",
                        movement_style: str = "",
-                       image_to_video_path: str | None = None) -> str:
+                       image_to_video_path: str | None = None,
+                       match_lyrics: bool = True) -> str:
     """Generate background using AI. Gemini picks the best style for the song.
 
     Returns path to .mp4 (video style) or .jpg/.png (photo/illustration style).
@@ -3621,12 +3765,13 @@ def _ensure_background(style_hint: str, job_dir: str, lyrics_text: str = None,
     # Generate video background with Veo 3 (always video, no images)
     result = _get_unique_prompt(
         lyrics_text, artist, job_id=job_id, song_title=song_title, genre=genre,
-        concept=concept, movement_style=movement_style,
+        concept=concept, movement_style=movement_style, match_lyrics=match_lyrics,
     )
     prompt = result["prompt"]
 
     bg_path = os.path.join(job_dir, "bg_generated.mp4")
     import time as _time_bg
+    quality_retry_used = False
     for attempt in range(3):
         try:
             _generate_veo_video(
@@ -3635,6 +3780,24 @@ def _ensure_background(style_hint: str, job_dir: str, lyrics_text: str = None,
                 image_path=image_to_video_path,
                 movement_style=movement_style,
             )
+            # Semantic relevance check — always score, but cap retries at one
+            # to bound cost (+$0.80 worst case). quality_retry_used gates the
+            # re-generation decision, not the scoring itself, so the retry's
+            # result is also evaluated before we accept and return it.
+            score = _score_video_relevance(bg_path, prompt)
+            print(f"[BG] Relevance score: {score}/10 for prompt: {prompt[:60]}...")
+            if score < 7 and not quality_retry_used:
+                quality_retry_used = True
+                print(f"[BG] Score {score} < 7 — generating new prompt and retrying VEO")
+                result = _get_unique_prompt(
+                    lyrics_text, artist, job_id=job_id, song_title=song_title,
+                    genre=genre, concept=concept, movement_style=movement_style,
+                    match_lyrics=match_lyrics,
+                )
+                prompt = result["prompt"]
+                continue
+            if score < 7:
+                print(f"[BG] Score {score} < 7 after retry — accepting best available result")
             return bg_path
         except Exception as e:
             print(f"[BG] Veo 3 attempt {attempt + 1}/3 failed: {e}")
@@ -4101,8 +4264,20 @@ def _text_position_func(spec, motion: str, seg_duration: float,
     the clip centered on screen (computed by the caller from actual clip
     dimensions). shadow_offset shifts both axes so the shadow sits just
     behind the main text. Motion values: "none" | "subtle" | "float".
+
+    NOTE: "float" is temporarily aliased to "subtle". The per-frame
+    position callable forces moviepy's CompositeVideoClip to evaluate
+    `pos(t)` for every frame of every text layer, blocking the
+    optimizations that let static positions cache. For songs with 30+
+    lyric lines × 4320 frames (3 min @ 24fps) that's an order of
+    magnitude slower and was hitting the 20-min RQ timeout on prod.
+    Re-enable the distinct "float" amplitude once we move the text
+    layer rendering to ffmpeg overlay filters (where per-frame motion
+    is essentially free).
     """
     import math
+    if motion == "float":
+        motion = "subtle"
     if motion == "none" or not motion:
         if shadow_offset:
             return (clip_x + shadow_offset, clip_y + shadow_offset)
@@ -4129,6 +4304,13 @@ def _text_position_func(spec, motion: str, seg_duration: float,
     return pos
 
 
+_CONTRAST_SETTINGS = {
+    "subtle": {"stroke_mult": 1.5, "shadow_opacity": 0.40, "extra_shadow": False},
+    "medium": {"stroke_mult": 2.5, "shadow_opacity": 0.55, "extra_shadow": False},
+    "strong": {"stroke_mult": 3.5, "shadow_opacity": 0.65, "extra_shadow": True},
+}
+
+
 def _make_text_clip(
     text: str,
     seg_start: float,
@@ -4139,8 +4321,9 @@ def _make_text_clip(
     font_scale: float = 1.0,
     lyric_transition: str = "cut",
     text_motion: str = "none",
+    text_contrast: str = "medium",
 ):
-    """Create a clean text clip matching pro lyric video style (bold white, subtle shadow)."""
+    """Create a clean text clip matching pro lyric video style (bold white, outline + shadow)."""
     import unicodedata
     if spec is None:
         spec = RenderSpec.youtube_default()
@@ -4172,7 +4355,8 @@ def _make_text_clip(
 
     shadow_offset = max(1, int(round(3 * scale)))
     fallback_font = os.path.join(_FONTS_DIR, "Montserrat-Bold.ttf")
-    stroke_width = max(1.0, 1.5 * scale)
+    contrast = _CONTRAST_SETTINGS.get(text_contrast, _CONTRAST_SETTINGS["medium"])
+    stroke_width = max(1.0, contrast["stroke_mult"] * scale)
 
     seg_duration = max(0.1, seg_end - seg_start)
 
@@ -4189,7 +4373,7 @@ def _make_text_clip(
             return TextClip(txt, fontsize=fsize, font=fallback_font, color=color,
                             method="caption", size=(text_width, None), align="center", **kwargs)
 
-    shadow = _try_text_clip(display_text, fontsize, font, "black").set_opacity(0.4)
+    shadow = _try_text_clip(display_text, fontsize, font, "black").set_opacity(contrast["shadow_opacity"])
     sh = shadow.size[1]
     # Centered top-left coordinates for a clip of size (text_width, sh)
     base_x = (spec.width - text_width) // 2
@@ -4202,6 +4386,25 @@ def _make_text_clip(
     else:
         shadow = shadow.set_position((base_x + shadow_offset, base_y + shadow_offset))
     shadow = shadow.set_start(seg_start).set_end(seg_end)
+
+    layers = []
+
+    # "strong" mode: add a counter-shadow at the opposite offset to widen the halo
+    if contrast["extra_shadow"]:
+        shadow2 = _try_text_clip(display_text, fontsize, font, "black").set_opacity(contrast["shadow_opacity"] * 0.5)
+        shadow2_pos = _text_position_func(spec, text_motion, seg_duration,
+                                          clip_x=base_x, clip_y=base_y,
+                                          shadow_offset=-shadow_offset)
+        if callable(shadow2_pos):
+            shadow2 = shadow2.set_position(lambda t, _p=shadow2_pos: _p(t))
+        else:
+            shadow2 = shadow2.set_position((base_x - shadow_offset, base_y - shadow_offset))
+        shadow2 = shadow2.set_start(seg_start).set_end(seg_end)
+        if fade_dur > 0:
+            shadow2 = shadow2.crossfadein(fade_dur).crossfadeout(fade_dur)
+        layers.append(shadow2)
+
+    layers.append(shadow)
 
     txt_pos = _text_position_func(spec, text_motion, seg_duration,
                                   clip_x=base_x, clip_y=base_y,
@@ -4218,7 +4421,8 @@ def _make_text_clip(
         shadow = shadow.crossfadein(fade_dur).crossfadeout(fade_dur)
         txt = txt.crossfadein(fade_dur).crossfadeout(fade_dur)
 
-    return [shadow, txt]
+    layers.append(txt)
+    return layers
 
 
 _UMG_PROFILE_NAMES = {
@@ -4588,6 +4792,7 @@ def generate_lyric_video(
     font_scale: float = 1.0,
     lyric_transition: str = "cut",
     text_motion: str = "none",
+    text_contrast: str = "medium",
 ) -> tuple[str, str, str | None]:
     """Generate a lyric video. Returns (video_path, font, bg_source).
 
@@ -4718,101 +4923,97 @@ def generate_lyric_video(
             extrabold_font = font  # graceful fallback
 
         artist_upper = artist.upper() if artist else ""
-        # Title uses the user's chosen case; default to title-case for the
-        # song name in the header card (it's not a lyric line).
         title_display = title_song if title_song else ""
 
-        if first_lyric_start > 3:
-            # Real intro — render artist (ExtraBold) and song title (Bold)
-            # as two stacked TextClips so they can have independent weights.
-            title_end = first_lyric_start - 0.5
-            try:
+        # Always render the title card centered, regardless of intro length.
+        # Fades in over 0.4s and fades out over 0.7s before the first lyric.
+        try:
+            scale = spec.text_scale
+            artist_size = max(30, int(round(62 * scale)))
+            title_size = max(24, int(round(46 * scale)))
+            card_width = int(round(spec.width * 0.80))
+            stroke_w = max(1, int(round(1.6 * scale)))
+
+            FADE_IN_BASE  = 0.4   # ideal fade-in for long intros
+            FADE_OUT_BASE = 0.7   # ideal fade-out
+            MIN_FULL_OPACITY = 0.8  # reserve at least this much full-opacity time
+            START_T  = 0.3   # when the card starts
+
+            # End just before the first lyric; cap at START_T + 8s for very long intros
+            if first_lyric_start > START_T + 0.5:
+                title_end = min(first_lyric_start - 0.2, START_T + 8.0)
+            else:
+                title_end = None  # intro too short — skip
+
+            if title_end is not None:
+                clip_dur = title_end - START_T
+
+                # Scale fades down for short intros so the title actually
+                # spends visible time at full opacity. Whisper often picks
+                # up an intro vocalization ("Uoh-oh-oh") as the first
+                # "lyric" 2-3s in, leaving a 1.5s title window. With the
+                # base 0.4+0.7 fades that ate the whole clip — title
+                # appeared as a 0.4s flash and the user couldn't read it.
+                # Now we reserve ~0.8s of full-opacity display when
+                # possible, shrinking fades proportionally to fit.
+                fade_budget = max(0.1, clip_dur - MIN_FULL_OPACITY)
+                if fade_budget >= (FADE_IN_BASE + FADE_OUT_BASE):
+                    FADE_IN, FADE_OUT = FADE_IN_BASE, FADE_OUT_BASE
+                else:
+                    ratio_in = FADE_IN_BASE / (FADE_IN_BASE + FADE_OUT_BASE)
+                    FADE_IN = max(0.05, fade_budget * ratio_in)
+                    FADE_OUT = max(0.05, fade_budget * (1 - ratio_in))
+
+                def _make_fade_opacity(base_op, c_dur, fi=FADE_IN, fo=FADE_OUT):
+                    """Opacity function: fade-in then fade-out, scaled by base_op."""
+                    def _op(t):
+                        alpha = min(1.0, t / fi) if fi > 0 else 1.0
+                        remaining = c_dur - t
+                        alpha = min(alpha, min(1.0, remaining / fo) if fo > 0 else 1.0)
+                        return base_op * max(0.0, alpha)
+                    return _op
+
                 title_card_clips = []
-                scale = spec.text_scale
-                artist_size = max(30, int(round(62 * scale)))
-                title_size = max(24, int(round(46 * scale)))
-                card_width = int(round(spec.width * 0.80))
-                stroke_w = max(1, int(round(1.6 * scale)))
 
                 if artist_upper:
                     artist_clip = TextClip(
                         artist_upper, fontsize=artist_size, font=extrabold_font,
                         color="white", stroke_color="black", stroke_width=stroke_w,
                         method="caption", size=(card_width, None), align="center",
-                    ).set_opacity(0.97)
-                    title_card_clips.append(artist_clip)
+                    )
+                    title_card_clips.append((artist_clip, 0.97))
 
                 if title_display:
                     song_clip = TextClip(
                         title_display, fontsize=title_size, font=font,
                         color="white", stroke_color="black", stroke_width=max(1, int(round(1.2 * scale))),
                         method="caption", size=(card_width, None), align="center",
-                    ).set_opacity(0.85)
-                    title_card_clips.append(song_clip)
+                    )
+                    title_card_clips.append((song_clip, 0.85))
 
                 if title_card_clips:
-                    # Stack clips vertically, center the block
-                    total_h = sum(c.size[1] for c in title_card_clips) + 8 * (len(title_card_clips) - 1)
+                    total_h = sum(c.size[1] for c, _ in title_card_clips) + 8 * (len(title_card_clips) - 1)
                     y_cursor = (spec.height - total_h) // 2
                     cx = spec.width // 2
-                    for clip in title_card_clips:
+                    for clip, base_op in title_card_clips:
                         cw, ch = clip.size
-                        clip = (clip.set_position((cx - cw // 2, y_cursor))
-                                    .set_start(0.5).set_end(title_end))
+                        clip = (clip
+                                .set_opacity(_make_fade_opacity(base_op, clip_dur))
+                                .set_position((cx - cw // 2, y_cursor))
+                                .set_start(START_T).set_end(title_end))
                         text_layers.append(clip)
                         y_cursor += ch + 8
-            except Exception as e:
-                print(f"[TITLE] center title failed ({e}); continuing")
-        else:
-            # No real intro — compact top-third card
-            try:
-                scale = spec.text_scale
-                card_width = int(round(spec.width * 0.85))
-                top_y = max(40, int(round(spec.height * 0.10)))
-                top_end_cap = first_lyric_start - 0.3 if first_lyric_start > 0.7 else 0.4
-                top_end = min(5.0, max(0.4, min(top_end_cap, duration - 0.1)))
-
-                if top_end <= 0.4:
-                    print(f"[TITLE] first lyric at {first_lyric_start:.2f}s; skipping top-card")
-                else:
-                    top_clips = []
-                    artist_size = max(28, int(round(44 * scale)))
-                    title_size = max(22, int(round(34 * scale)))
-                    stroke_w = max(1, int(round(1.6 * scale)))
-
-                    if artist_upper:
-                        a_clip = TextClip(
-                            artist_upper, fontsize=artist_size, font=extrabold_font,
-                            color="white", stroke_color="black", stroke_width=stroke_w,
-                            method="caption", size=(card_width, None), align="center",
-                        ).set_opacity(0.97)
-                        top_clips.append(a_clip)
-
-                    if title_display:
-                        s_clip = TextClip(
-                            title_display, fontsize=title_size, font=font,
-                            color="white", stroke_color="black", stroke_width=max(1, int(round(1.2 * scale))),
-                            method="caption", size=(card_width, None), align="center",
-                        ).set_opacity(0.85)
-                        top_clips.append(s_clip)
-
-                    y_cur = top_y
-                    cx = spec.width // 2
-                    for clip in top_clips:
-                        cw, ch = clip.size
-                        clip = (clip.set_position((cx - cw // 2, y_cur))
-                                    .set_start(0.4).set_end(top_end))
-                        text_layers.append(clip)
-                        y_cur += ch + 6
-
-            except Exception as e:
-                print(f"[TITLE] top title card failed ({e}); continuing without it")
+            else:
+                print(f"[TITLE] first lyric at {first_lyric_start:.2f}s; intro too short, skipping title card")
+        except Exception as e:
+            print(f"[TITLE] title card failed ({e}); continuing")
 
     for seg in segments:
         layers = _make_text_clip(
             seg["text"], seg["start"], seg["end"], font, spec=spec,
             text_case=text_case, font_scale=font_scale,
             lyric_transition=lyric_transition, text_motion=text_motion,
+            text_contrast=text_contrast,
         )
         text_layers.extend(layers)
 

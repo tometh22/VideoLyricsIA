@@ -44,7 +44,11 @@ function ProcessingRow({ job, onSelect, t }) {
         {(job.filename || "").replace(/\.mp3$/i, "")}
       </span>
       <span className="text-[11px] text-gray-500 shrink-0">
-        {job.status === "queued" ? (t("dash.queued") || "En cola") : t("dash.processing")}
+        {job.status === "queued"
+          ? (t("dash.queued") || "En cola")
+          : job.status === "editing"
+            ? (t("dash.editing") || "Re-renderizando")
+            : t("dash.processing")}
       </span>
     </button>
   );
@@ -100,7 +104,10 @@ export default function Dashboard({ user, history, historyError, historyLoaded =
   const { t } = useI18n();
 
   const pendingReview = history.filter((h) => h.status === "pending_review");
-  const processing = history.filter((h) => h.status === "processing" || h.status === "queued");
+  // "editing" jobs are mid edit-request re-render — UX-wise they're the
+  // same as the initial processing state (worker is rendering, user can't
+  // approve yet), so we bucket them together with processing/queued.
+  const processing = history.filter((h) => h.status === "processing" || h.status === "queued" || h.status === "editing");
   const recentDone = history.filter((h) => h.status === "done").slice(0, 6);
   const errors = history.filter((h) => h.status === "error" || h.status === "validation_failed");
 

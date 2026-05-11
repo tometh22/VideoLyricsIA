@@ -22,6 +22,25 @@ function tokenParam() {
 // hit a 429 on the 6th. The backend enforces this server-side regardless.
 const MAX_BATCH_SIZE = 5;
 
+// Motion picker hidden hasta que decidamos qué animación implementar.
+// Backend default queda en text_motion="none". Cambiar a true para
+// re-mostrar el dropdown sin tocar nada más.
+const SHOW_MOTION_PICKER = false;
+
+const SAMPLE_LYRIC = "Como el viento que se va";
+function applyTextCase(text, c) {
+  if (c === "upper") return text.toUpperCase();
+  if (c === "title") return text.replace(/\b\w/g, (ch) => ch.toUpperCase());
+  if (c === "lower") return text.toLowerCase();
+  return text;
+}
+const TEXT_CASE_OPTS = [
+  { code: "upper",    d: "MAY", label: "Todo en MAYÚSCULAS" },
+  { code: "title",    d: "Aa",  label: "Primera letra de Cada Palabra" },
+  { code: "lower",    d: "min", label: "todo en minúsculas" },
+  { code: "original", d: "ori", label: "Sin cambios (como está escrito)" },
+];
+
 // Max single-file size. Mirrors backend MAX_UPLOAD_MB default (100, raised
 // from 50 to fit lossless WAV uploads — UMG sends WAV at 16/24-bit PCM,
 // which can land at 30-50 MB for a 3-minute track). We reject client-side
@@ -145,7 +164,7 @@ export default function UploadZone({
   // drawer lets an operator override individual fields without affecting others.
   const [batchDefaults, setBatchDefaults] = useState({
     genre: "", concept: "", movementStyle: "", font: "",
-    textCase: "upper", fontScale: "1.0", lyricTransition: "cut", textMotion: "none",
+    textCase: "upper", fontScale: "1.0", lyricTransition: "cut", textMotion: "none", textContrast: "medium",
   });
   const batchDefaultsRef = useRef(batchDefaults);
   useEffect(() => { batchDefaultsRef.current = batchDefaults; }, [batchDefaults]);
@@ -154,6 +173,9 @@ export default function UploadZone({
     setBatchDefaults((prev) => ({ ...prev, [field]: value }));
     onFiles((prev) => prev.map((f) => ({ ...f, [field]: value })));
   };
+
+  const [hoverCaseBatch, setHoverCaseBatch] = useState(null);
+  const [hoverCaseRow, setHoverCaseRow] = useState(null); // { idx, code }
 
   // Set of track indices with the inline "Personalizar" drawer open.
   const [expandedPersonalize, setExpandedPersonalize] = useState(() => new Set());
@@ -566,17 +588,26 @@ export default function UploadZone({
   const _batchSettingsBlock = files.length > 0 ? (
     <div className="mt-3 glass rounded-card px-4 py-4">
       <p className="text-[10px] uppercase tracking-[0.18em] text-gray-500 mb-3">
-        {t("upload.batch_settings_title") || "Configuración del lote"}
+        {files.length > 1
+          ? (t("upload.batch_settings_title") || "Configuración del lote")
+          : (t("upload.single_settings_title") || "Ajustes del video")}
       </p>
 
       {/* Movement gallery — click a card to apply to all tracks */}
       <div className="mb-4">
-        <div className="flex items-baseline justify-between mb-2">
-          <p className="text-[11px] text-gray-400 font-medium">
-            {t("upload.movement_gallery_title") || "Movimiento del fondo"}
-          </p>
-          <p className="text-[10px] text-gray-600">
-            {t("upload.movement_gallery_hint") || "Click para aplicar a todos · personalizable por canción"}
+        <div className="mb-2">
+          <div className="flex items-baseline justify-between">
+            <p className="text-[11px] text-gray-400 font-medium">
+              {t("upload.movement_gallery_title") || "Movimiento del fondo"}
+            </p>
+            {files.length > 1 && (
+              <p className="text-[10px] text-gray-600">
+                {t("upload.movement_gallery_hint") || "Click para aplicar a todos · personalizable por canción"}
+              </p>
+            )}
+          </div>
+          <p className="text-[10px] text-gray-600 mt-0.5">
+            {t("upload.movement_gallery_desc") || "Cómo se anima el fondo del video · no afecta los colores"}
           </p>
         </div>
         <div className="grid grid-cols-2 sm:grid-cols-4 gap-2">
@@ -658,27 +689,35 @@ export default function UploadZone({
       </div>
 
       {/* Text case pill buttons: MAY / Aa / min / ori */}
-      <div className="flex items-center gap-2 mb-3">
-        <span className="text-[11px] text-gray-600 shrink-0">{t("upload.text_case_label") || "Texto:"}</span>
-        <div className="flex gap-1">
-          {[
-            { code: "upper",    d: "MAY" },
-            { code: "title",    d: "Aa"  },
-            { code: "lower",    d: "min" },
-            { code: "original", d: "ori" },
-          ].map((opt) => (
-            <button
-              key={opt.code}
-              type="button"
-              onClick={() => updateBatchDefault("textCase", opt.code)}
-              className={`px-2.5 py-1 rounded-md text-[11px] font-mono font-bold transition-all
-                ${batchDefaults.textCase === opt.code
-                  ? "bg-brand/20 text-brand ring-1 ring-brand/40"
-                  : "bg-surface-3/40 text-gray-500 hover:text-gray-300"
-                }`}
-            >{opt.d}</button>
-          ))}
+      <div className="mb-3">
+        <div className="flex items-center gap-2">
+          <span className="text-[11px] text-gray-600 shrink-0">{t("upload.text_case_label") || "Texto:"}</span>
+          <div className="flex gap-1">
+            {TEXT_CASE_OPTS.map((opt) => (
+              <button
+                key={opt.code}
+                type="button"
+                title={opt.label}
+                onClick={() => updateBatchDefault("textCase", opt.code)}
+                onMouseEnter={() => setHoverCaseBatch(opt.code)}
+                onMouseLeave={() => setHoverCaseBatch(null)}
+                className={`px-2.5 py-1 rounded-md text-[11px] font-mono font-bold transition-all
+                  ${batchDefaults.textCase === opt.code
+                    ? "bg-brand/20 text-brand ring-1 ring-brand/40"
+                    : "bg-surface-3/40 text-gray-500 hover:text-gray-300"
+                  }`}
+              >{opt.d}</button>
+            ))}
+          </div>
         </div>
+        {hoverCaseBatch && (
+          <div className="mt-1.5 px-3 py-1.5 rounded-md bg-black/40 ring-1 ring-white/[0.06] flex items-baseline gap-2 animate-fade-in">
+            <span className="text-[11px] font-mono text-white/80 tracking-wide">
+              {applyTextCase(SAMPLE_LYRIC, hoverCaseBatch)}
+            </span>
+            <span className="text-[10px] text-gray-600">← así quedarán tus letras</span>
+          </div>
+        )}
       </div>
 
       {/* Font scale — 5 A's in increasing sizes */}
@@ -731,13 +770,18 @@ export default function UploadZone({
       </div>
 
       {/* Text motion icon buttons */}
-      <div className="flex items-center gap-2">
+      {SHOW_MOTION_PICKER && (
+      <div className="flex items-center gap-2 mb-3">
         <span className="text-[11px] text-gray-600 shrink-0">{t("upload.motion_label") || "Movimiento del texto:"}</span>
         <div className="flex gap-1">
           {[
             { code: "none",   icon: "·", label: t("upload.motion_none")   || "Estático" },
             { code: "subtle", icon: "↕", label: t("upload.motion_subtle") || "Sutil"    },
-            { code: "float",  icon: "∿", label: t("upload.motion_float")  || "Flotante" },
+            // "float" temporarily disabled — see pipeline.py
+            // _text_position_func: per-frame position callable kills
+            // moviepy compositing speed, long songs hit RQ 20-min
+            // timeout. Backend aliases to "subtle". Re-enable when text
+            // layer moves to ffmpeg overlay filters.
           ].map((opt) => (
             <button
               key={opt.code}
@@ -750,6 +794,32 @@ export default function UploadZone({
                   : "bg-surface-3/40 text-gray-500 hover:text-gray-300"
                 }`}
             >{opt.icon}</button>
+          ))}
+        </div>
+      </div>
+      )}
+
+      {/* Text contrast pills */}
+      <div className="flex items-center gap-2">
+        <span className="text-[11px] text-gray-600 shrink-0">{t("upload.contrast_label") || "Contraste:"}</span>
+        <div className="flex gap-1">
+          {[
+            { code: "subtle", style: { WebkitTextStroke: "0px", textShadow: "none" },         label: t("upload.contrast_subtle") || "Suave" },
+            { code: "medium", style: { WebkitTextStroke: "0.5px black", textShadow: "0 0 3px rgba(0,0,0,0.8)" }, label: t("upload.contrast_medium") || "Medio" },
+            { code: "strong", style: { WebkitTextStroke: "1px black",   textShadow: "0 0 6px rgba(0,0,0,1), -1px -1px 0 #000, 1px 1px 0 #000" }, label: t("upload.contrast_strong") || "Fuerte" },
+          ].map((opt) => (
+            <button
+              key={opt.code}
+              type="button"
+              title={opt.label}
+              onClick={() => updateBatchDefault("textContrast", opt.code)}
+              className={`px-2 py-1 rounded-md text-[13px] font-bold text-white transition-all
+                ${batchDefaults.textContrast === opt.code
+                  ? "bg-brand/20 ring-1 ring-brand/40"
+                  : "bg-surface-3/40 hover:bg-surface-3/60"
+                }`}
+              style={opt.style}
+            >A</button>
           ))}
         </div>
       </div>
@@ -769,7 +839,8 @@ export default function UploadZone({
           (entry.textCase     || "upper") !== (bd.textCase     || "upper") ||
           (entry.fontScale    || "1.0")   !== (bd.fontScale    || "1.0")   ||
           (entry.lyricTransition || "cut") !== (bd.lyricTransition || "cut") ||
-          (entry.textMotion   || "none")  !== (bd.textMotion   || "none");
+          (entry.textMotion   || "none")  !== (bd.textMotion   || "none")  ||
+          (entry.textContrast || "medium") !== (bd.textContrast || "medium");
 
         return (
           <div key={i} className="glass rounded-card px-4 py-3" {...(i === 0 ? { "data-tour": "upload-row" } : {})}>
@@ -846,7 +917,8 @@ export default function UploadZone({
                 ))}
               </div>
 
-              {/* Personalizar toggle */}
+              {/* Personalizar toggle — only shown in batch mode (2+ songs) */}
+              {files.length > 1 && (
               <button
                 type="button"
                 onClick={() => togglePersonalize(i)}
@@ -870,9 +942,10 @@ export default function UploadZone({
                   />
                 )}
               </button>
+              )}
 
-              {/* Per-track override drawer */}
-              {isPersonalizing && (
+              {/* Per-track override drawer — only in batch mode */}
+              {files.length > 1 && isPersonalizing && (
                 <div className="mt-2 pt-2 border-t border-white/[0.06] space-y-2">
                   <p className="text-[10px] text-gray-600 uppercase tracking-[0.14em]">
                     {t("upload.personalize_track") || "Personalizar esta canción"}
@@ -898,23 +971,33 @@ export default function UploadZone({
                     <Listbox value={entry.font || ""} onChange={(v) => updateField(i, "font", v)} options={FONTS} className="flex-1" ariaLabel={t("upload.font_label")} />
                   </div>
                   {/* Text case pills */}
-                  <div className="flex items-center gap-2">
-                    <span className="text-[11px] text-gray-600 shrink-0">{t("upload.text_case_label") || "Texto:"}</span>
-                    <div className="flex gap-1">
-                      {[
-                        { code: "upper", d: "MAY" }, { code: "title", d: "Aa" },
-                        { code: "lower", d: "min" }, { code: "original", d: "ori" },
-                      ].map((opt) => (
-                        <button key={opt.code} type="button"
-                          onClick={() => updateField(i, "textCase", opt.code)}
-                          className={`px-2.5 py-1 rounded-md text-[11px] font-mono font-bold transition-all
-                            ${(entry.textCase || "upper") === opt.code
-                              ? "bg-brand/20 text-brand ring-1 ring-brand/40"
-                              : "bg-surface-3/40 text-gray-500 hover:text-gray-300"
-                            }`}
-                        >{opt.d}</button>
-                      ))}
+                  <div>
+                    <div className="flex items-center gap-2">
+                      <span className="text-[11px] text-gray-600 shrink-0">{t("upload.text_case_label") || "Texto:"}</span>
+                      <div className="flex gap-1">
+                        {TEXT_CASE_OPTS.map((opt) => (
+                          <button key={opt.code} type="button"
+                            title={opt.label}
+                            onClick={() => updateField(i, "textCase", opt.code)}
+                            onMouseEnter={() => setHoverCaseRow({ idx: i, code: opt.code })}
+                            onMouseLeave={() => setHoverCaseRow(null)}
+                            className={`px-2.5 py-1 rounded-md text-[11px] font-mono font-bold transition-all
+                              ${(entry.textCase || "upper") === opt.code
+                                ? "bg-brand/20 text-brand ring-1 ring-brand/40"
+                                : "bg-surface-3/40 text-gray-500 hover:text-gray-300"
+                              }`}
+                          >{opt.d}</button>
+                        ))}
+                      </div>
                     </div>
+                    {hoverCaseRow?.idx === i && (
+                      <div className="mt-1.5 px-3 py-1.5 rounded-md bg-black/40 ring-1 ring-white/[0.06] flex items-baseline gap-2 animate-fade-in">
+                        <span className="text-[11px] font-mono text-white/80 tracking-wide">
+                          {applyTextCase(SAMPLE_LYRIC, hoverCaseRow.code)}
+                        </span>
+                        <span className="text-[10px] text-gray-600">← así quedarán tus letras</span>
+                      </div>
+                    )}
                   </div>
                   {/* Font scale */}
                   <div className="flex items-center gap-2">
@@ -957,6 +1040,7 @@ export default function UploadZone({
                     </div>
                   </div>
                   {/* Text motion */}
+                  {SHOW_MOTION_PICKER && (
                   <div className="flex items-center gap-2">
                     <span className="text-[11px] text-gray-600 shrink-0">{t("upload.motion_label") || "Movimiento del texto:"}</span>
                     <div className="flex gap-1">
@@ -973,6 +1057,28 @@ export default function UploadZone({
                               : "bg-surface-3/40 text-gray-500 hover:text-gray-300"
                             }`}
                         >{opt.icon}</button>
+                      ))}
+                    </div>
+                  </div>
+                  )}
+                  {/* Text contrast */}
+                  <div className="flex items-center gap-2">
+                    <span className="text-[11px] text-gray-600 shrink-0">{t("upload.contrast_label") || "Contraste:"}</span>
+                    <div className="flex gap-1">
+                      {[
+                        { code: "subtle", style: { WebkitTextStroke: "0px", textShadow: "none" },         label: t("upload.contrast_subtle") || "Suave" },
+                        { code: "medium", style: { WebkitTextStroke: "0.5px black", textShadow: "0 0 3px rgba(0,0,0,0.8)" }, label: t("upload.contrast_medium") || "Medio" },
+                        { code: "strong", style: { WebkitTextStroke: "1px black",   textShadow: "0 0 6px rgba(0,0,0,1), -1px -1px 0 #000, 1px 1px 0 #000" }, label: t("upload.contrast_strong") || "Fuerte" },
+                      ].map((opt) => (
+                        <button key={opt.code} type="button" title={opt.label}
+                          onClick={() => updateField(i, "textContrast", opt.code)}
+                          className={`px-2 py-1 rounded-md text-[13px] font-bold text-white transition-all
+                            ${(entry.textContrast || "medium") === opt.code
+                              ? "bg-brand/20 ring-1 ring-brand/40"
+                              : "bg-surface-3/40 hover:bg-surface-3/60"
+                            }`}
+                          style={opt.style}
+                        >A</button>
                       ))}
                     </div>
                   </div>
@@ -1388,7 +1494,7 @@ export default function UploadZone({
           <div className="max-w-5xl mx-auto flex flex-wrap items-center gap-3">
             <div className="flex-1 min-w-0">
               <p className="text-[10px] uppercase tracking-[0.18em] text-gray-500">
-                {t("upload.batch_summary") || "Lote"}
+                {files.length > 1 ? (t("upload.batch_summary") || "Lote") : (t("upload.single_settings_title") || "Ajustes del video")}
               </p>
               <p className="text-sm text-white truncate mt-0.5">{summary}</p>
               {!allHaveArtist && (

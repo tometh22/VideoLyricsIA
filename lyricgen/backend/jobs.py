@@ -115,7 +115,20 @@ def _delete_r2_objects(job: Job) -> None:
             _logger.warning("R2 delete failed key=%r: %s", key, exc)
 
 
-_DELETABLE_STATUSES = {"processing", "queued", "error", "validation_failed"}
+# Estados que el operador puede borrar desde la UI. La idea: cualquier
+# estado "en progreso o atascado" es deletable; solo protegemos done /
+# pending_review por audit trail + workflow.
+#
+# Caso real que motivó incluir "editing" y "transcribed_pending": un job
+# que entra a edit_pipeline y el worker muere (timeout, OOM, deploy) se
+# queda colgado en status="editing" para siempre porque no hay heartbeat
+# de auto-fail. Sin esto, el operador no puede limpiar la fila y termina
+# pidiendo al admin que actualice la DB a mano.
+_DELETABLE_STATUSES = {
+    "processing", "queued", "error", "validation_failed",
+    "editing",              # edit pipeline corriendo o colgada
+    "transcribed_pending",  # tras pérdida de wizard state
+}
 
 
 def delete_job(db: Session, job_id: str, tenant_id: str) -> tuple[bool, str]:
