@@ -54,6 +54,11 @@ const MOTION_OPTS = [
   // refactor the text layer to ffmpeg overlay filters.
 ];
 
+// Motion picker hidden hasta decidir qué animación implementar.
+// Backend default queda en text_motion="none". Cambiar a true para
+// re-mostrar el dropdown sin tocar nada más.
+const SHOW_MOTION_PICKER = false;
+
 const SCALE_STEPS = [0.8, 1.0, 1.2, 1.5, 1.8, 2.0];
 
 export default function EditRequestPanel({ job, onEditTriggered }) {
@@ -68,7 +73,13 @@ export default function EditRequestPanel({ job, onEditTriggered }) {
     font_scale:       initialParams.font_scale       ?? 1.0,
     text_case:        initialParams.text_case        ?? "upper",
     lyric_transition: initialParams.lyric_transition ?? "cut",
-    text_motion:      initialParams.text_motion      ?? "none",
+    // Si el picker está oculto, forzamos "none" en lugar de heredar de
+    // initialParams. Sin esto, un job viejo que se renderizó con
+    // text_motion="subtle" mantendría motion al ser re-editado, y volvería
+    // a pegar contra el timeout de moviepy. Con SHOW_MOTION_PICKER=false
+    // el diff calcula form="none" vs initial="subtle" → manda
+    // text_motion:"none" al backend → re-render rápido y estable.
+    text_motion:      SHOW_MOTION_PICKER ? (initialParams.text_motion ?? "none") : "none",
   });
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState(null);
@@ -384,6 +395,7 @@ export default function EditRequestPanel({ job, onEditTriggered }) {
           </div>
 
           {/* Motion */}
+          {SHOW_MOTION_PICKER && (
           <div>
             <label className="text-[11px] text-ink-secondary uppercase tracking-wider block mb-1">
               {t("upload.motion_label") || "Movimiento del texto"}
@@ -403,6 +415,7 @@ export default function EditRequestPanel({ job, onEditTriggered }) {
               ))}
             </div>
           </div>
+          )}
 
           {error && (
             <div className="text-xs text-red-300 px-3 py-2 rounded-md bg-red-500/10 ring-1 ring-red-500/30">

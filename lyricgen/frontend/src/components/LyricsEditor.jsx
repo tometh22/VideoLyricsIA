@@ -2,6 +2,10 @@ import { useState, useMemo, useRef, useEffect, useCallback } from "react";
 import { useI18n } from "../i18n";
 import { EditorTour } from "./OnboardingTour";
 
+// Mismo flag que UploadZone/EditRequestPanel — oculta el label de motion
+// en el strip de metadata mientras la feature de animación está pausada.
+const SHOW_MOTION_PICKER = false;
+
 function formatTime(seconds) {
   if (!isFinite(seconds) || seconds < 0) return "0:00";
   const m = Math.floor(seconds / 60);
@@ -1308,7 +1312,9 @@ export default function LyricsEditor({
                 Caja: {textCase === "upper" ? "MAYÚSCULAS" : textCase === "title" ? "Título (cada palabra capitalizada)" : textCase === "lower" ? "minúsculas" : "Original"}
               </span>
               <span>Transición: {lyricTransition === "cut" ? "Corte" : lyricTransition === "fade" ? "Fade" : "Fade lento"}</span>
-              <span>Movimiento: {textMotion === "none" ? "Estático" : textMotion === "subtle" ? "Sutil" : "Flotante"}</span>
+              {SHOW_MOTION_PICKER && (
+                <span>Movimiento: {textMotion === "none" ? "Estático" : textMotion === "subtle" ? "Sutil" : "Flotante"}</span>
+              )}
               <span>Contraste: {textContrast === "subtle" ? "Suave" : textContrast === "strong" ? "Fuerte" : "Medio"}</span>
             </div>
           </div>

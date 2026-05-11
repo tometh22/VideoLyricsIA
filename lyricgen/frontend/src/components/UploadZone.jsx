@@ -22,6 +22,11 @@ function tokenParam() {
 // hit a 429 on the 6th. The backend enforces this server-side regardless.
 const MAX_BATCH_SIZE = 5;
 
+// Motion picker hidden hasta que decidamos qué animación implementar.
+// Backend default queda en text_motion="none". Cambiar a true para
+// re-mostrar el dropdown sin tocar nada más.
+const SHOW_MOTION_PICKER = false;
+
 const SAMPLE_LYRIC = "Como el viento que se va";
 function applyTextCase(text, c) {
   if (c === "upper") return text.toUpperCase();
@@ -765,6 +770,7 @@ export default function UploadZone({
       </div>
 
       {/* Text motion icon buttons */}
+      {SHOW_MOTION_PICKER && (
       <div className="flex items-center gap-2 mb-3">
         <span className="text-[11px] text-gray-600 shrink-0">{t("upload.motion_label") || "Movimiento del texto:"}</span>
         <div className="flex gap-1">
@@ -791,6 +797,7 @@ export default function UploadZone({
           ))}
         </div>
       </div>
+      )}
 
       {/* Text contrast pills */}
       <div className="flex items-center gap-2">
@@ -1033,6 +1040,7 @@ export default function UploadZone({
                     </div>
                   </div>
                   {/* Text motion */}
+                  {SHOW_MOTION_PICKER && (
                   <div className="flex items-center gap-2">
                     <span className="text-[11px] text-gray-600 shrink-0">{t("upload.motion_label") || "Movimiento del texto:"}</span>
                     <div className="flex gap-1">
@@ -1052,6 +1060,7 @@ export default function UploadZone({
                       ))}
                     </div>
                   </div>
+                  )}
                   {/* Text contrast */}
                   <div className="flex items-center gap-2">
                     <span className="text-[11px] text-gray-600 shrink-0">{t("upload.contrast_label") || "Contraste:"}</span>
