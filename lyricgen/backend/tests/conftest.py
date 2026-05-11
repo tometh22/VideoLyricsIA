@@ -123,6 +123,35 @@ def auth(token):
     return {"Authorization": f"Bearer {token}"}
 
 
+def pytest_configure(config):
+    config.addinivalue_line(
+        "markers",
+        "postgres: test que requiere Postgres real (concurrency / row locks). Skip en sqlite.",
+    )
+
+
+def pytest_collection_modifyitems(config, items):
+    """Skip tests marcados `postgres` cuando la DB activa es SQLite.
+
+    Patrones como `with_for_update()` y `pg_try_advisory_lock` son
+    no-ops en SQLite (por diseño de SQLAlchemy/SQLite). Tests que
+    validan esos patterns DAN FALSE-GREEN en SQLite — pasarían sin la
+    fix aplicada. CI corre Postgres (.github/workflows/ci.yml:18-29) y
+    los ejecuta de verdad; local sin Postgres los skipea con razón
+    clara.
+    """
+    from database import engine
+    is_postgres = engine.dialect.name == "postgresql"
+    if is_postgres:
+        return
+    skip_pg = pytest.mark.skip(
+        reason="requiere Postgres (with_for_update/advisory_lock son no-op en sqlite)"
+    )
+    for item in items:
+        if "postgres" in item.keywords:
+            item.add_marker(skip_pg)
+
+
 def pytest_unconfigure(config):
     """Hard-exit after pytest fully finishes (including its terminal summary).
 
