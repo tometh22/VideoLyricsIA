@@ -201,6 +201,47 @@ def enqueue_prores_prewarm(job_id: str, file_type: str) -> str | None:
     return rq_job.id
 
 
+def enqueue_edit(
+    job_id: str,
+    edit_type: str,
+    edit_params: dict,
+    plan: str = "100",
+) -> str:
+    """Enqueue a run_edit_pipeline job (partial re-render).
+
+    Uses the same queue priority logic as enqueue_pipeline. Typography edits
+    finish in ~5 min; background regenerations take ~10 min (Veo included).
+    A 20-min timeout is plenty of headroom for either case.
+    """
+    q = _pick_queue(plan)
+    if q is not None:
+        from pipeline import run_edit_pipeline
+        rq_job = q.enqueue(
+            run_edit_pipeline,
+            args=(job_id, edit_type, edit_params),
+            job_timeout=1200,  # 20 min — generous for Veo + re-render
+            result_ttl=RESULT_TTL,
+            failure_ttl=FAILURE_TTL,
+            job_id=f"edit:{job_id}",  # deterministic — double-click deduped
+        )
+        return rq_job.id
+
+    if _ENVIRONMENT == "production":
+        logger.error(
+            "Refusing to enqueue edit %s via thread fallback: Redis required.", job_id,
+        )
+        raise RuntimeError("Job queue unavailable: Redis is required in production.")
+
+    from pipeline import run_edit_pipeline
+    t = threading.Thread(
+        target=run_edit_pipeline,
+        args=(job_id, edit_type, edit_params),
+        daemon=True,
+    )
+    t.start()
+    return f"thread:edit:{job_id}"
+
+
 def queue_depth() -> dict:
     """Return {'default': n, 'enterprise': n, 'backend': 'redis'|'threads'}."""
     _, q_default, q_enterprise = _init_redis()
