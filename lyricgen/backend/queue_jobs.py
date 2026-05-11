@@ -209,9 +209,16 @@ def enqueue_edit(
 ) -> str:
     """Enqueue a run_edit_pipeline job (partial re-render).
 
-    Uses the same queue priority logic as enqueue_pipeline. Typography edits
-    finish in ~5 min; background regenerations take ~10 min (Veo included).
-    A 20-min timeout is plenty of headroom for either case.
+    Uses the same queue priority logic as enqueue_pipeline. Typography
+    edits with no/none motion finish in ~5 min, but the per-frame
+    position callable used by subtle/float motion blows up moviepy's
+    compositing — a 4-min song with 60+ lyric lines and motion enabled
+    can run 30-40 min in the video step alone (see pipeline.py
+    _text_position_func — TODO: rewrite text layer with ffmpeg overlay
+    filters where per-frame motion is essentially free). Background
+    regenerations also add the Veo step. The original 20-min budget was
+    too tight for long songs; we now match the main pipeline's
+    YouTube-only allowance to keep the worst-case edit alive.
     """
     q = _pick_queue(plan)
     if q is not None:
@@ -219,7 +226,9 @@ def enqueue_edit(
         rq_job = q.enqueue(
             run_edit_pipeline,
             args=(job_id, edit_type, edit_params),
-            job_timeout=1200,  # 20 min — generous for Veo + re-render
+            # 60 min — covers worst-case long-song edits with motion enabled
+            # until we land the ffmpeg-overlay rewrite.
+            job_timeout=3600,
             result_ttl=RESULT_TTL,
             failure_ttl=FAILURE_TTL,
             job_id=f"edit:{job_id}",  # deterministic — double-click deduped
