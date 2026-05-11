@@ -208,6 +208,11 @@ else:
 #
 # SQLAlchemy auto-invalidates the dead connection on error, so the next
 # checkout gets a fresh one. We just need to retry once.
+#
+# Implemented as raw ASGI middleware (not BaseHTTPMiddleware) because we
+# need to buffer the request body before the inner app consumes it and
+# then synthesize a fresh `receive` callable on retry. BaseHTTPMiddleware
+# does not let you re-call the inner app with a replayed body.
 _TRANSIENT_DB_MARKERS = (
     "SSL connection has been closed",
     "server closed the connection",
@@ -215,67 +220,135 @@ _TRANSIENT_DB_MARKERS = (
     "could not connect to server",
 )
 
-
-# Hard cap on request bodies eligible for replay-on-retry. Above this size
-# we let the request fail naturally — buffering 50+ MB MP3 uploads into
-# memory just to retry on a transient DB error costs more than the bug.
+# Hard cap on request bodies eligible for replay-on-retry. Above this we
+# let the request fail naturally — buffering 50+ MB MP3 uploads into
+# memory just to recover from a transient DB blip costs more than the bug.
 _RETRY_BODY_MAX_BYTES = 1 * 1024 * 1024  # 1 MiB
 
 
-@app.middleware("http")
-async def db_transient_retry_middleware(request: Request, call_next):
+class DbTransientRetryMiddleware:
     """Retry once if a Postgres connection drops mid-request.
 
-    For small POST/PUT/PATCH JSON bodies we cache the body so the second
-    attempt can replay it — FastAPI consumes the request stream on first
-    read. File uploads (multipart, large bodies) are passed through
-    without retry to avoid buffering MB-sized payloads into memory; the
-    client is expected to retry those itself.
+    Small POST/PUT/PATCH JSON bodies are buffered up front and the inner
+    app is invoked with a replay-able `receive`. On a matching
+    OperationalError, we retry by invoking the inner app again with a
+    fresh `receive` over the same buffered bytes.
+
+    File uploads (multipart) and large bodies (> 1 MiB) are passed
+    through verbatim, no retry — the client is expected to handle those.
+    Requests that have already started streaming a response cannot be
+    retried (we'd corrupt the wire), so we only retry when nothing has
+    been sent to the client yet.
     """
-    body_bytes: bytes = b""
-    needs_replay = False
-    if request.method in ("POST", "PUT", "PATCH"):
-        content_type = request.headers.get("content-type", "")
-        content_length = request.headers.get("content-length", "")
-        is_multipart = content_type.startswith("multipart/")
+
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope.get("type") != "http":
+            await self.app(scope, receive, send)
+            return
+
+        method = scope.get("method", "")
+        body_buffered = False
+        body_bytes = b""
+
+        if method in ("POST", "PUT", "PATCH"):
+            headers = {k.decode("latin-1").lower(): v.decode("latin-1", "replace")
+                       for k, v in scope.get("headers", [])}
+            content_type = headers.get("content-type", "")
+            try:
+                content_length = int(headers.get("content-length", "") or 0)
+            except ValueError:
+                content_length = 0
+            if (not content_type.startswith("multipart/")
+                    and 0 < content_length <= _RETRY_BODY_MAX_BYTES):
+                # Buffer body now so we can replay on retry. Drain until
+                # more_body == False (or client disconnects).
+                chunks = []
+                while True:
+                    msg = await receive()
+                    mtype = msg.get("type")
+                    if mtype == "http.disconnect":
+                        # Client gave up — propagate as normal disconnect.
+                        await self.app(scope, _disconnect_receive, send)
+                        return
+                    if mtype == "http.request":
+                        chunks.append(msg.get("body", b""))
+                        if not msg.get("more_body", False):
+                            break
+                body_bytes = b"".join(chunks)
+                body_buffered = True
+
+        # First attempt. Capture send so we can tell if the response
+        # already started (in which case retrying is unsafe).
+        response_started = False
+        captured_exc = None
+
+        async def wrapped_send(message):
+            nonlocal response_started
+            if message.get("type") == "http.response.start":
+                response_started = True
+            await send(message)
+
+        first_receive = _make_replay_receive(body_bytes) if body_buffered else receive
         try:
-            size = int(content_length) if content_length else 0
-        except ValueError:
-            size = 0
-        # Skip body buffering for multipart uploads or anything larger
-        # than the cap. Unknown size (chunked) also skips — we can't
-        # tell if it's a 200-byte JSON or a 50-MB stream.
-        if not is_multipart and 0 < size <= _RETRY_BODY_MAX_BYTES:
-            body_bytes = await request.body()
-            needs_replay = True
+            await self.app(scope, first_receive, wrapped_send)
+            return
+        except OperationalError as e:
+            captured_exc = e
+            transient = any(m in str(e) for m in _TRANSIENT_DB_MARKERS)
+            if not transient:
+                raise
+            if response_started:
+                logger.warning(
+                    "Transient DB error on %s %s after response started — can't retry",
+                    method, scope.get("path", ""),
+                )
+                raise
+            if method in ("POST", "PUT", "PATCH") and not body_buffered:
+                logger.warning(
+                    "Transient DB error on %s %s but body not buffered — not retrying",
+                    method, scope.get("path", ""),
+                )
+                raise
 
-            async def _replay_receive():
-                return {"type": "http.request", "body": body_bytes, "more_body": False}
-
-            request._receive = _replay_receive  # type: ignore[attr-defined]
-
-    try:
-        return await call_next(request)
-    except OperationalError as e:
-        if not any(marker in str(e) for marker in _TRANSIENT_DB_MARKERS):
-            raise
-        if not needs_replay and request.method in ("POST", "PUT", "PATCH"):
-            # Can't safely replay an upload — bubble up. Client retries.
-            logger.warning(
-                "Transient DB error on %s %s but body not buffered — not retrying",
-                request.method,
-                request.url.path,
-            )
-            raise
+        # Retry path. Fresh receive over the same body. Real send.
         logger.warning(
             "Transient DB error on %s %s — retrying once",
-            request.method,
-            request.url.path,
+            method, scope.get("path", ""),
         )
-        if needs_replay:
-            request._receive = _replay_receive  # type: ignore[attr-defined]
         await asyncio.sleep(0.15)
-        return await call_next(request)
+        second_receive = _make_replay_receive(body_bytes) if body_buffered else receive
+        try:
+            await self.app(scope, second_receive, send)
+        except OperationalError:
+            # Second attempt also failed — surface the ORIGINAL error so
+            # logs/Sentry show "this is the SSL drop case, not a fresh bug".
+            assert captured_exc is not None
+            raise captured_exc
+
+
+def _make_replay_receive(body: bytes):
+    """Return an ASGI `receive` callable that yields `body` once and
+    then keeps returning http.disconnect (mirrors a closed stream)."""
+    delivered = False
+
+    async def _replay_receive():
+        nonlocal delivered
+        if not delivered:
+            delivered = True
+            return {"type": "http.request", "body": body, "more_body": False}
+        return {"type": "http.disconnect"}
+
+    return _replay_receive
+
+
+async def _disconnect_receive():
+    return {"type": "http.disconnect"}
+
+
+app.add_middleware(DbTransientRetryMiddleware)
 
 
 # --- Include routers ---
