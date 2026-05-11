@@ -34,25 +34,40 @@
 [build]
 builder = "DOCKERFILE"
 
-# --- API service (FastAPI on uvicorn) ---
+# --- Defaults aplicados a TODOS los servicios ---
 #
-# The API is stateless — overlap is purely a question of routing
-# incoming HTTP at the right replica.
+# Solo lo que aplica a ambos (API + Worker). HEALTHCHECK NO va acá
+# porque el Worker es un daemon RQ sin HTTP. Cuando estaba global
+# Railway falló el deploy con "5/5 replicas never became healthy"
+# porque el Worker nunca responde GET /health. Los settings de
+# healthcheck ahora viven en [services.api.deploy].
 
 [deploy]
-healthcheckPath = "/health"
-healthcheckTimeout = 30
 restartPolicyType = "ON_FAILURE"
 restartPolicyMaxRetries = 5
 
+# --- API service (FastAPI on uvicorn) ---
+#
+# CRITICAL: el service name DEBE matchear exacto el nombre en Railway
+# dashboard (case-sensitive). En Genly IA es `api` minúscula. Si lo
+# escribís en mayúscula o con otro casing, Railway ignora silenciosamente
+# el override y el servicio cae al [deploy] default sin healthcheck.
+
+[services.api.deploy]
+healthcheckPath = "/health"
+healthcheckTimeout = 30
+
 # --- Worker service overrides ---
 #
-# The Worker has no HTTP endpoint, so Railway can't probe it for
-# readiness. We rely on RQ's SIGTERM handler (worker.py:_graceful) to
-# drain in-flight jobs, plus the new RQ Retry config in queue_jobs.py to
-# auto-recover jobs that were lost despite the graceful shutdown.
+# CRITICAL: el service en Railway dashboard se llama `Worker` con W
+# MAYÚSCULA. La versión anterior decía `worker` (lowercase) → no
+# matcheaba → Railway aplicaba el [deploy] global con healthcheck
+# /health → Worker no tiene HTTP → 5/5 replicas fail → deploy abortaba.
+#
+# No ponemos healthcheckPath acá: el Worker es daemon RQ. La resiliencia
+# viene de SIGTERM handler (worker.py:_graceful drain in-flight) + RQ
+# Retry en queue_jobs.py (auto-recover si el worker muere mid-job).
 
-[services.worker.deploy]
-# No healthcheck path — worker isn't HTTP.
+[services.Worker.deploy]
 restartPolicyType = "ON_FAILURE"
 restartPolicyMaxRetries = 10
