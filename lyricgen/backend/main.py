@@ -3318,9 +3318,11 @@ async def status(
     current_user: dict = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
+    from pipeline import _MAX_EDITS
     job = get_job(db, job_id, **_job_scope(current_user))
     if job is None:
         raise HTTPException(status_code=404, detail="Job not found.")
+    edit_count = job.get("edit_count") or 0
     return {
         "job_id": job["job_id"],
         "status": job["status"],
@@ -3340,6 +3342,13 @@ async def status(
         "s3_keys": job.get("s3_keys"),
         "prores_ready": job.get("prores_ready", False),
         "completed_at": job.get("completed_at"),
+        # Edit request state — drives the "Pedir cambios" panel in
+        # LyricsEditor. edits_remaining = _MAX_EDITS - edit_count, clamped
+        # at zero. render_params holds the typography settings the last
+        # edit applied (or the initial render) so the UI can preload them.
+        "edit_count": edit_count,
+        "edits_remaining": max(0, _MAX_EDITS - edit_count),
+        "render_params": job.get("render_params"),
     }
 
 

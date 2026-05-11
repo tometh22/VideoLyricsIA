@@ -285,7 +285,17 @@ function JobDetailRoute({ fetchHistory }) {
       <JobDetail
         job={job}
         onBack={() => navigate("/dashboard")}
-        onJobUpdate={(updatedJob) => { setJob(updatedJob); fetchHistory(); }}
+        onJobUpdate={(updatedJob) => {
+          // fetchHistory() is the expensive call (lists every job in the
+          // tenant). It only needs to refresh on a status BOUNDARY —
+          // pending_review → editing, editing → pending_review, etc. The
+          // /status poll during editing fires every 5s with progress
+          // updates only; if we ran fetchHistory on each tick we'd hit
+          // /jobs ~150 times during a 13-min edit. Skip those.
+          const statusChanged = job?.status !== updatedJob?.status;
+          setJob(updatedJob);
+          if (statusChanged) fetchHistory();
+        }}
       />
     </div>
   );
