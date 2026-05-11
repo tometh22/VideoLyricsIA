@@ -658,6 +658,36 @@ const translations = {
     "history.editing": "Re-renderizando",
     "batch.editing": "Re-renderizando",
 
+    // Keys que estaban faltando en es/en/pt — la UI mostraba la key
+    // literal ("detail.error_title", etc.) porque t() devuelve la key
+    // cuando no hay traducción, y el `|| fallback` del JSX nunca se
+    // dispara contra un truthy string. Agregadas tras ver el bug en
+    // prod cuando un cliente abrió un job en error.
+    "detail.error_title": "El video falló durante la generación",
+    "detail.error_unknown": "Error desconocido",
+    "detail.retry": "Reintentar sin re-subir",
+    "detail.master_pending_approval": "Aprobá el video para habilitar la descarga.",
+    "detail.umg_master_title": "Máster ProRes 422 HQ",
+    "detail.umg_master_subtitle": "ProRes no se reproduce en el navegador. Descargá el archivo para reproducirlo en QuickTime / DaVinci / Premiere.",
+
+    "batch.all_approved_sub": "Todos aprobados. Podés descargarlos.",
+    "batch.approval_title": "Revisá y aprobá tus videos",
+    "batch.approve_all": "Aprobar todos",
+    "batch.celebration_single": "¡Video listo!",
+    "batch.celebration_sub_batch": "Todos los videos están aprobados y listos para descargar.",
+    "batch.celebration_sub_single": "Tu lyric video está aprobado y listo para descargar.",
+    "batch.download_approved": "Descargar aprobados",
+    "batch.pending_review_notice_one": "Un video espera tu aprobación. Hacé click en la card para revisarlo.",
+
+    "landing.free_trial": "Comenzar gratis",
+
+    "upload.bg_use_as_is": "Usar tal cual",
+    "upload.bg_use_variation": "Generar variación",
+    "upload.bg_used": "Ya usado",
+    "upload.bg_used_tooltip": "Usado",
+    "upload.bg_variation_help": "Veo usará un frame de este video como referencia visual y generará un clip nuevo derivado del original.",
+    "upload.bg_variation_prompt": "Cómo querés usar este fondo:",
+
     // ProRes export retroactivo (botón en JobDetail + modal)
     "prores.cta_title": "Exportar a ProRes (.mov broadcast)",
     "prores.cta_desc": "Este video se rindió como MP4. Generá una versión ProRes para broadcast / cliente.",
@@ -1260,6 +1290,33 @@ const translations = {
     "faq.q6": "What languages are supported?",
     "faq.a6": "Spanish, English, Portuguese, French, Italian and German. For both transcription and YouTube metadata.",
 
+    // See es section comment — keys missing in all langs, app showed
+    // raw keys to users for these.
+    "detail.error_title": "Video failed during generation",
+    "detail.error_unknown": "Unknown error",
+    "detail.retry": "Retry without re-uploading",
+    "detail.master_pending_approval": "Approve the video to enable download.",
+    "detail.umg_master_title": "ProRes 422 HQ Master",
+    "detail.umg_master_subtitle": "ProRes won't play in the browser. Download the file to play it in QuickTime / DaVinci / Premiere.",
+
+    "batch.all_approved_sub": "All approved. Ready to download.",
+    "batch.approval_title": "Review and approve your videos",
+    "batch.approve_all": "Approve all",
+    "batch.celebration_single": "Video ready!",
+    "batch.celebration_sub_batch": "All videos are approved and ready to download.",
+    "batch.celebration_sub_single": "Your lyric video is approved and ready to download.",
+    "batch.download_approved": "Download approved",
+    "batch.pending_review_notice_one": "One video is awaiting your approval. Click the card to review it.",
+
+    "landing.free_trial": "Start for free",
+
+    "upload.bg_use_as_is": "Use as is",
+    "upload.bg_use_variation": "Generate variation",
+    "upload.bg_used": "Already used",
+    "upload.bg_used_tooltip": "Used",
+    "upload.bg_variation_help": "Veo will use a frame from this video as visual reference and generate a new clip derived from the original.",
+    "upload.bg_variation_prompt": "How do you want to use this background:",
+
     // ProRes retroactive export (button in JobDetail + modal)
     "prores.cta_title": "Export to ProRes (.mov broadcast)",
     "prores.cta_desc": "This video was rendered as MP4. Generate a ProRes version for broadcast / client delivery.",
@@ -1859,6 +1916,32 @@ const translations = {
     "faq.a5": "O cliente é dono de 100% de todos os vídeos, thumbnails e shorts gerados. Sem royalties ou atribuições.",
     "faq.q6": "Quais idiomas são suportados?",
     "faq.a6": "Espanhol, inglês, português, francês, italiano e alemão. Tanto para a transcrição quanto para os metadados do YouTube.",
+
+    // Ver comentário na seção es — chaves faltavam em todos os idiomas.
+    "detail.error_title": "O vídeo falhou durante a geração",
+    "detail.error_unknown": "Erro desconhecido",
+    "detail.retry": "Tentar novamente sem reenviar",
+    "detail.master_pending_approval": "Aprove o vídeo para habilitar o download.",
+    "detail.umg_master_title": "Master ProRes 422 HQ",
+    "detail.umg_master_subtitle": "ProRes não toca no navegador. Baixe o arquivo para reproduzir no QuickTime / DaVinci / Premiere.",
+
+    "batch.all_approved_sub": "Todos aprovados. Podem ser baixados.",
+    "batch.approval_title": "Revise e aprove seus vídeos",
+    "batch.approve_all": "Aprovar todos",
+    "batch.celebration_single": "Vídeo pronto!",
+    "batch.celebration_sub_batch": "Todos os vídeos estão aprovados e prontos para download.",
+    "batch.celebration_sub_single": "Seu lyric video está aprovado e pronto para download.",
+    "batch.download_approved": "Baixar aprovados",
+    "batch.pending_review_notice_one": "Um vídeo aguarda sua aprovação. Clique no card para revisar.",
+
+    "landing.free_trial": "Começar grátis",
+
+    "upload.bg_use_as_is": "Usar como está",
+    "upload.bg_use_variation": "Gerar variação",
+    "upload.bg_used": "Já usado",
+    "upload.bg_used_tooltip": "Usado",
+    "upload.bg_variation_help": "Veo usará um frame deste vídeo como referência visual e gerará um clipe novo derivado do original.",
+    "upload.bg_variation_prompt": "Como você quer usar este fundo:",
 
     // ProRes exportação retroativa (botão no JobDetail + modal)
     "prores.cta_title": "Exportar para ProRes (.mov broadcast)",
