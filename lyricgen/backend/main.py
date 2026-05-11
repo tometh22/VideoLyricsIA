@@ -1,5 +1,6 @@
 """FastAPI application for GenLy AI — Production SaaS."""
 
+import asyncio
 import json
 import logging
 import os
@@ -38,6 +39,7 @@ from pydantic import BaseModel
 from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.util import get_remote_address
 from slowapi.errors import RateLimitExceeded
+from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import Session
 
 from auth import (
@@ -196,6 +198,158 @@ else:
         allow_methods=["*"],
         allow_headers=["*"],
     )
+
+# --- Transient DB error retry middleware ---
+# Postgres on Railway occasionally drops idle pool connections in ways
+# that pool_pre_ping + TCP keepalives don't fully prevent (drops happen
+# mid-query, after the pre-ping). Symptom is `psycopg2.OperationalError:
+# SSL connection has been closed unexpectedly`, surfacing as a 500 to
+# the client on the very first request after an idle period.
+#
+# SQLAlchemy auto-invalidates the dead connection on error, so the next
+# checkout gets a fresh one. We just need to retry once.
+#
+# Implemented as raw ASGI middleware (not BaseHTTPMiddleware) because we
+# need to buffer the request body before the inner app consumes it and
+# then synthesize a fresh `receive` callable on retry. BaseHTTPMiddleware
+# does not let you re-call the inner app with a replayed body.
+_TRANSIENT_DB_MARKERS = (
+    "SSL connection has been closed",
+    "server closed the connection",
+    "connection already closed",
+    "could not connect to server",
+)
+
+# Hard cap on request bodies eligible for replay-on-retry. Above this we
+# let the request fail naturally — buffering 50+ MB MP3 uploads into
+# memory just to recover from a transient DB blip costs more than the bug.
+_RETRY_BODY_MAX_BYTES = 1 * 1024 * 1024  # 1 MiB
+
+
+class DbTransientRetryMiddleware:
+    """Retry once if a Postgres connection drops mid-request.
+
+    Small POST/PUT/PATCH JSON bodies are buffered up front and the inner
+    app is invoked with a replay-able `receive`. On a matching
+    OperationalError, we retry by invoking the inner app again with a
+    fresh `receive` over the same buffered bytes.
+
+    File uploads (multipart) and large bodies (> 1 MiB) are passed
+    through verbatim, no retry — the client is expected to handle those.
+    Requests that have already started streaming a response cannot be
+    retried (we'd corrupt the wire), so we only retry when nothing has
+    been sent to the client yet.
+    """
+
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope.get("type") != "http":
+            await self.app(scope, receive, send)
+            return
+
+        method = scope.get("method", "")
+        body_buffered = False
+        body_bytes = b""
+
+        if method in ("POST", "PUT", "PATCH"):
+            headers = {k.decode("latin-1").lower(): v.decode("latin-1", "replace")
+                       for k, v in scope.get("headers", [])}
+            content_type = headers.get("content-type", "")
+            try:
+                content_length = int(headers.get("content-length", "") or 0)
+            except ValueError:
+                content_length = 0
+            if (not content_type.startswith("multipart/")
+                    and 0 < content_length <= _RETRY_BODY_MAX_BYTES):
+                # Buffer body now so we can replay on retry. Drain until
+                # more_body == False (or client disconnects).
+                chunks = []
+                while True:
+                    msg = await receive()
+                    mtype = msg.get("type")
+                    if mtype == "http.disconnect":
+                        # Client gave up — propagate as normal disconnect.
+                        await self.app(scope, _disconnect_receive, send)
+                        return
+                    if mtype == "http.request":
+                        chunks.append(msg.get("body", b""))
+                        if not msg.get("more_body", False):
+                            break
+                body_bytes = b"".join(chunks)
+                body_buffered = True
+
+        # First attempt. Capture send so we can tell if the response
+        # already started (in which case retrying is unsafe).
+        response_started = False
+        captured_exc = None
+
+        async def wrapped_send(message):
+            nonlocal response_started
+            if message.get("type") == "http.response.start":
+                response_started = True
+            await send(message)
+
+        first_receive = _make_replay_receive(body_bytes) if body_buffered else receive
+        try:
+            await self.app(scope, first_receive, wrapped_send)
+            return
+        except OperationalError as e:
+            captured_exc = e
+            transient = any(m in str(e) for m in _TRANSIENT_DB_MARKERS)
+            if not transient:
+                raise
+            if response_started:
+                logger.warning(
+                    "Transient DB error on %s %s after response started — can't retry",
+                    method, scope.get("path", ""),
+                )
+                raise
+            if method in ("POST", "PUT", "PATCH") and not body_buffered:
+                logger.warning(
+                    "Transient DB error on %s %s but body not buffered — not retrying",
+                    method, scope.get("path", ""),
+                )
+                raise
+
+        # Retry path. Fresh receive over the same body. Real send.
+        logger.warning(
+            "Transient DB error on %s %s — retrying once",
+            method, scope.get("path", ""),
+        )
+        await asyncio.sleep(0.15)
+        second_receive = _make_replay_receive(body_bytes) if body_buffered else receive
+        try:
+            await self.app(scope, second_receive, send)
+        except OperationalError:
+            # Second attempt also failed — surface the ORIGINAL error so
+            # logs/Sentry show "this is the SSL drop case, not a fresh bug".
+            assert captured_exc is not None
+            raise captured_exc
+
+
+def _make_replay_receive(body: bytes):
+    """Return an ASGI `receive` callable that yields `body` once and
+    then keeps returning http.disconnect (mirrors a closed stream)."""
+    delivered = False
+
+    async def _replay_receive():
+        nonlocal delivered
+        if not delivered:
+            delivered = True
+            return {"type": "http.request", "body": body, "more_body": False}
+        return {"type": "http.disconnect"}
+
+    return _replay_receive
+
+
+async def _disconnect_receive():
+    return {"type": "http.disconnect"}
+
+
+app.add_middleware(DbTransientRetryMiddleware)
+
 
 # --- Include routers ---
 app.include_router(billing_router)
@@ -2165,6 +2319,7 @@ async def upload(
     font_scale: str = Form("1.0"),
     lyric_transition: str = Form("cut"),
     text_motion: str = Form("none"),
+    text_contrast: str = Form("medium"),
     current_user: dict = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
@@ -2314,6 +2469,7 @@ async def upload(
         font_scale=_font_scale,
         lyric_transition=lyric_transition if lyric_transition in ("cut", "fade", "fade_slow") else "cut",
         text_motion=text_motion if text_motion in ("none", "subtle", "float") else "none",
+        text_contrast=text_contrast if text_contrast in ("subtle", "medium", "strong") else "medium",
     )
 
     return {"job_id": job_id, "status": initial_status}
@@ -2915,6 +3071,7 @@ async def generate_with_segments(
     font_scale: str = Form("1.0"),
     lyric_transition: str = Form("cut"),
     text_motion: str = Form("none"),
+    text_contrast: str = Form("medium"),
     current_user: dict = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
@@ -3128,6 +3285,7 @@ async def generate_with_segments(
         font_scale=_font_scale_gen,
         lyric_transition=lyric_transition if lyric_transition in ("cut", "fade", "fade_slow") else "cut",
         text_motion=text_motion if text_motion in ("none", "subtle", "float") else "none",
+        text_contrast=text_contrast if text_contrast in ("subtle", "medium", "strong") else "medium",
     )
 
     return {"job_id": job_id, "status": initial_status}

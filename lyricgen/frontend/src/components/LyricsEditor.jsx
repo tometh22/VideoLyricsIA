@@ -144,6 +144,7 @@ export default function LyricsEditor({
   fontScale = 1.0,
   lyricTransition = "cut",
   textMotion = "none",
+  textContrast = "medium",
 }) {
   const { t } = useI18n();
   const [edited, setEdited] = useState(() =>
@@ -160,11 +161,20 @@ export default function LyricsEditor({
   }, [isDirty]);
 
   // ─── Audio sync ─────────────────────────────────────────────────────
-  const audioUrl = useMemo(
-    () => (audioFile ? URL.createObjectURL(audioFile) : null),
-    [audioFile],
-  );
-  useEffect(() => () => { if (audioUrl) URL.revokeObjectURL(audioUrl); }, [audioUrl]);
+  // Blob URL lifecycle must live in useEffect, not useMemo. useMemo is
+  // not a lifecycle hook and React 18 StrictMode double-invokes its
+  // callback in dev, leaking one URL per mount. More importantly, pairing
+  // a useMemo-created URL with a useEffect cleanup keyed on [audioUrl]
+  // causes StrictMode's simulated unmount to revoke the URL while the
+  // <audio> element in the DOM still references it — playback dies a few
+  // seconds in once the initial buffered range is consumed.
+  const [audioUrl, setAudioUrl] = useState(null);
+  useEffect(() => {
+    if (!audioFile) { setAudioUrl(null); return undefined; }
+    const url = URL.createObjectURL(audioFile);
+    setAudioUrl(url);
+    return () => URL.revokeObjectURL(url);
+  }, [audioFile]);
 
   const audioRef = useRef(null);
   const listRef = useRef(null);
@@ -1235,7 +1245,12 @@ export default function LyricsEditor({
                   fontSize: `${previewFontPx}px`,
                   fontWeight: 700,
                   color: "white",
-                  textShadow: "1px 1px 3px rgba(0,0,0,0.8), -1px -1px 2px rgba(0,0,0,0.6)",
+                  textShadow: textContrast === "strong"
+                    ? "0 0 8px rgba(0,0,0,1), -1px -1px 0 #000, 1px -1px 0 #000, -1px 1px 0 #000, 1px 1px 0 #000, 2px 2px 4px rgba(0,0,0,0.9)"
+                    : textContrast === "medium"
+                    ? "0 0 4px rgba(0,0,0,0.9), 1px 1px 3px rgba(0,0,0,0.8)"
+                    : "1px 1px 2px rgba(0,0,0,0.6)",
+                  WebkitTextStroke: textContrast === "strong" ? "1px black" : textContrast === "medium" ? "0.5px black" : "0px",
                   textTransform: "none",
                   textAlign: "center",
                   maxWidth: `${Math.round(tier.maxWidthPx * previewRatio)}px`,
@@ -1263,6 +1278,7 @@ export default function LyricsEditor({
               </span>
               <span>Transición: {lyricTransition === "cut" ? "Corte" : lyricTransition === "fade" ? "Fade" : "Fade lento"}</span>
               <span>Movimiento: {textMotion === "none" ? "Estático" : textMotion === "subtle" ? "Sutil" : "Flotante"}</span>
+              <span>Contraste: {textContrast === "subtle" ? "Suave" : textContrast === "strong" ? "Fuerte" : "Medio"}</span>
             </div>
           </div>
         );

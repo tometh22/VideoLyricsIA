@@ -230,7 +230,8 @@ def run_pipeline(job_id: str, mp3_path: str, artist: str, style: str,
                  font_scale: float = 1.0,
                  lyric_transition: str = "cut",
                  text_motion: str = "none",
-                 match_lyrics: bool = True):
+                 match_lyrics: bool = True,
+                 text_contrast: str = "medium"):
     """Run the full pipeline for a job. Called synchronously.
 
     delivery_profile:
@@ -487,6 +488,7 @@ def run_pipeline(job_id: str, mp3_path: str, artist: str, style: str,
                 font_scale=font_scale,
                 lyric_transition=lyric_transition,
                 text_motion=text_motion,
+                text_contrast=text_contrast,
             )
             files["video_url"] = f"/download/{job_id}/video"
             update_job(job_id, progress=55)
@@ -4255,6 +4257,13 @@ def _text_position_func(spec, motion: str, seg_duration: float,
     return pos
 
 
+_CONTRAST_SETTINGS = {
+    "subtle": {"stroke_mult": 1.5, "shadow_opacity": 0.40, "extra_shadow": False},
+    "medium": {"stroke_mult": 2.5, "shadow_opacity": 0.55, "extra_shadow": False},
+    "strong": {"stroke_mult": 3.5, "shadow_opacity": 0.65, "extra_shadow": True},
+}
+
+
 def _make_text_clip(
     text: str,
     seg_start: float,
@@ -4265,8 +4274,9 @@ def _make_text_clip(
     font_scale: float = 1.0,
     lyric_transition: str = "cut",
     text_motion: str = "none",
+    text_contrast: str = "medium",
 ):
-    """Create a clean text clip matching pro lyric video style (bold white, subtle shadow)."""
+    """Create a clean text clip matching pro lyric video style (bold white, outline + shadow)."""
     import unicodedata
     if spec is None:
         spec = RenderSpec.youtube_default()
@@ -4298,7 +4308,8 @@ def _make_text_clip(
 
     shadow_offset = max(1, int(round(3 * scale)))
     fallback_font = os.path.join(_FONTS_DIR, "Montserrat-Bold.ttf")
-    stroke_width = max(1.0, 1.5 * scale)
+    contrast = _CONTRAST_SETTINGS.get(text_contrast, _CONTRAST_SETTINGS["medium"])
+    stroke_width = max(1.0, contrast["stroke_mult"] * scale)
 
     seg_duration = max(0.1, seg_end - seg_start)
 
@@ -4315,7 +4326,7 @@ def _make_text_clip(
             return TextClip(txt, fontsize=fsize, font=fallback_font, color=color,
                             method="caption", size=(text_width, None), align="center", **kwargs)
 
-    shadow = _try_text_clip(display_text, fontsize, font, "black").set_opacity(0.4)
+    shadow = _try_text_clip(display_text, fontsize, font, "black").set_opacity(contrast["shadow_opacity"])
     sh = shadow.size[1]
     # Centered top-left coordinates for a clip of size (text_width, sh)
     base_x = (spec.width - text_width) // 2
@@ -4328,6 +4339,25 @@ def _make_text_clip(
     else:
         shadow = shadow.set_position((base_x + shadow_offset, base_y + shadow_offset))
     shadow = shadow.set_start(seg_start).set_end(seg_end)
+
+    layers = []
+
+    # "strong" mode: add a counter-shadow at the opposite offset to widen the halo
+    if contrast["extra_shadow"]:
+        shadow2 = _try_text_clip(display_text, fontsize, font, "black").set_opacity(contrast["shadow_opacity"] * 0.5)
+        shadow2_pos = _text_position_func(spec, text_motion, seg_duration,
+                                          clip_x=base_x, clip_y=base_y,
+                                          shadow_offset=-shadow_offset)
+        if callable(shadow2_pos):
+            shadow2 = shadow2.set_position(lambda t, _p=shadow2_pos: _p(t))
+        else:
+            shadow2 = shadow2.set_position((base_x - shadow_offset, base_y - shadow_offset))
+        shadow2 = shadow2.set_start(seg_start).set_end(seg_end)
+        if fade_dur > 0:
+            shadow2 = shadow2.crossfadein(fade_dur).crossfadeout(fade_dur)
+        layers.append(shadow2)
+
+    layers.append(shadow)
 
     txt_pos = _text_position_func(spec, text_motion, seg_duration,
                                   clip_x=base_x, clip_y=base_y,
@@ -4344,7 +4374,8 @@ def _make_text_clip(
         shadow = shadow.crossfadein(fade_dur).crossfadeout(fade_dur)
         txt = txt.crossfadein(fade_dur).crossfadeout(fade_dur)
 
-    return [shadow, txt]
+    layers.append(txt)
+    return layers
 
 
 _UMG_PROFILE_NAMES = {
@@ -4714,6 +4745,7 @@ def generate_lyric_video(
     font_scale: float = 1.0,
     lyric_transition: str = "cut",
     text_motion: str = "none",
+    text_contrast: str = "medium",
 ) -> tuple[str, str, str | None]:
     """Generate a lyric video. Returns (video_path, font, bg_source).
 
@@ -4844,101 +4876,80 @@ def generate_lyric_video(
             extrabold_font = font  # graceful fallback
 
         artist_upper = artist.upper() if artist else ""
-        # Title uses the user's chosen case; default to title-case for the
-        # song name in the header card (it's not a lyric line).
         title_display = title_song if title_song else ""
 
-        if first_lyric_start > 3:
-            # Real intro — render artist (ExtraBold) and song title (Bold)
-            # as two stacked TextClips so they can have independent weights.
-            title_end = first_lyric_start - 0.5
-            try:
+        # Always render the title card centered, regardless of intro length.
+        # Fades in over 0.4s and fades out over 0.7s before the first lyric.
+        try:
+            scale = spec.text_scale
+            artist_size = max(30, int(round(62 * scale)))
+            title_size = max(24, int(round(46 * scale)))
+            card_width = int(round(spec.width * 0.80))
+            stroke_w = max(1, int(round(1.6 * scale)))
+
+            FADE_IN  = 0.4   # seconds to fade in
+            FADE_OUT = 0.7   # seconds to fade out
+            START_T  = 0.3   # when the card starts
+
+            # End just before the first lyric; cap at START_T + 8s for very long intros
+            if first_lyric_start > START_T + 0.5:
+                title_end = min(first_lyric_start - 0.2, START_T + 8.0)
+            else:
+                title_end = None  # intro too short — skip
+
+            if title_end is not None:
+                clip_dur = title_end - START_T
+
+                def _make_fade_opacity(base_op, c_dur, fi=FADE_IN, fo=FADE_OUT):
+                    """Opacity function: fade-in then fade-out, scaled by base_op."""
+                    def _op(t):
+                        alpha = min(1.0, t / fi) if fi > 0 else 1.0
+                        remaining = c_dur - t
+                        alpha = min(alpha, min(1.0, remaining / fo) if fo > 0 else 1.0)
+                        return base_op * max(0.0, alpha)
+                    return _op
+
                 title_card_clips = []
-                scale = spec.text_scale
-                artist_size = max(30, int(round(62 * scale)))
-                title_size = max(24, int(round(46 * scale)))
-                card_width = int(round(spec.width * 0.80))
-                stroke_w = max(1, int(round(1.6 * scale)))
 
                 if artist_upper:
                     artist_clip = TextClip(
                         artist_upper, fontsize=artist_size, font=extrabold_font,
                         color="white", stroke_color="black", stroke_width=stroke_w,
                         method="caption", size=(card_width, None), align="center",
-                    ).set_opacity(0.97)
-                    title_card_clips.append(artist_clip)
+                    )
+                    title_card_clips.append((artist_clip, 0.97))
 
                 if title_display:
                     song_clip = TextClip(
                         title_display, fontsize=title_size, font=font,
                         color="white", stroke_color="black", stroke_width=max(1, int(round(1.2 * scale))),
                         method="caption", size=(card_width, None), align="center",
-                    ).set_opacity(0.85)
-                    title_card_clips.append(song_clip)
+                    )
+                    title_card_clips.append((song_clip, 0.85))
 
                 if title_card_clips:
-                    # Stack clips vertically, center the block
-                    total_h = sum(c.size[1] for c in title_card_clips) + 8 * (len(title_card_clips) - 1)
+                    total_h = sum(c.size[1] for c, _ in title_card_clips) + 8 * (len(title_card_clips) - 1)
                     y_cursor = (spec.height - total_h) // 2
                     cx = spec.width // 2
-                    for clip in title_card_clips:
+                    for clip, base_op in title_card_clips:
                         cw, ch = clip.size
-                        clip = (clip.set_position((cx - cw // 2, y_cursor))
-                                    .set_start(0.5).set_end(title_end))
+                        clip = (clip
+                                .set_opacity(_make_fade_opacity(base_op, clip_dur))
+                                .set_position((cx - cw // 2, y_cursor))
+                                .set_start(START_T).set_end(title_end))
                         text_layers.append(clip)
                         y_cursor += ch + 8
-            except Exception as e:
-                print(f"[TITLE] center title failed ({e}); continuing")
-        else:
-            # No real intro — compact top-third card
-            try:
-                scale = spec.text_scale
-                card_width = int(round(spec.width * 0.85))
-                top_y = max(40, int(round(spec.height * 0.10)))
-                top_end_cap = first_lyric_start - 0.3 if first_lyric_start > 0.7 else 0.4
-                top_end = min(5.0, max(0.4, min(top_end_cap, duration - 0.1)))
-
-                if top_end <= 0.4:
-                    print(f"[TITLE] first lyric at {first_lyric_start:.2f}s; skipping top-card")
-                else:
-                    top_clips = []
-                    artist_size = max(28, int(round(44 * scale)))
-                    title_size = max(22, int(round(34 * scale)))
-                    stroke_w = max(1, int(round(1.6 * scale)))
-
-                    if artist_upper:
-                        a_clip = TextClip(
-                            artist_upper, fontsize=artist_size, font=extrabold_font,
-                            color="white", stroke_color="black", stroke_width=stroke_w,
-                            method="caption", size=(card_width, None), align="center",
-                        ).set_opacity(0.97)
-                        top_clips.append(a_clip)
-
-                    if title_display:
-                        s_clip = TextClip(
-                            title_display, fontsize=title_size, font=font,
-                            color="white", stroke_color="black", stroke_width=max(1, int(round(1.2 * scale))),
-                            method="caption", size=(card_width, None), align="center",
-                        ).set_opacity(0.85)
-                        top_clips.append(s_clip)
-
-                    y_cur = top_y
-                    cx = spec.width // 2
-                    for clip in top_clips:
-                        cw, ch = clip.size
-                        clip = (clip.set_position((cx - cw // 2, y_cur))
-                                    .set_start(0.4).set_end(top_end))
-                        text_layers.append(clip)
-                        y_cur += ch + 6
-
-            except Exception as e:
-                print(f"[TITLE] top title card failed ({e}); continuing without it")
+            else:
+                print(f"[TITLE] first lyric at {first_lyric_start:.2f}s; intro too short, skipping title card")
+        except Exception as e:
+            print(f"[TITLE] title card failed ({e}); continuing")
 
     for seg in segments:
         layers = _make_text_clip(
             seg["text"], seg["start"], seg["end"], font, spec=spec,
             text_case=text_case, font_scale=font_scale,
             lyric_transition=lyric_transition, text_motion=text_motion,
+            text_contrast=text_contrast,
         )
         text_layers.extend(layers)
 
