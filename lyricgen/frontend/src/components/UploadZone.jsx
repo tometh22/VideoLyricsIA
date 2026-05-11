@@ -1365,7 +1365,10 @@ export default function UploadZone({
   return (
     <div className="w-full max-w-5xl mx-auto pb-28">
       <UploadTour user={user} />
-      <div className="flex flex-col md:grid md:grid-cols-[minmax(0,1fr)_340px] lg:grid-cols-[minmax(0,1fr)_380px] gap-6 items-start">
+      <div className={files.length > 1
+        ? "flex flex-col md:grid md:grid-cols-[minmax(0,1fr)_340px] lg:grid-cols-[minmax(0,1fr)_380px] gap-6 items-start"
+        : "flex flex-col gap-4"
+      }>
 
         {/* LEFT COLUMN — drop zone + file list */}
         <div className="space-y-4 min-w-0">
@@ -1373,9 +1376,9 @@ export default function UploadZone({
           {_filesBlock}
         </div>
 
-        {/* RIGHT COLUMN — batch settings, sticky on md+ */}
+        {/* RIGHT / BELOW — batch settings. Sticky sidebar for batch, stacked grid for single */}
         {files.length > 0 && (
-          <div className="md:sticky md:top-4 md:self-start space-y-4">
+          <div className={files.length > 1 ? "md:sticky md:top-4 md:self-start space-y-4" : "space-y-4"}>
 
             {/* Batch scope badge */}
             {files.length > 1 && (
@@ -1390,43 +1393,88 @@ export default function UploadZone({
               </div>
             )}
 
-            {/* 1. Visual style */}
-            {onStyleChange && (
-              <div className="rounded-card bg-surface-2/40 ring-1 ring-white/[0.04] px-4 py-3">
-                <p className="text-[10px] uppercase tracking-[0.18em] text-gray-500">{t("upload.style_label")}</p>
-                <p className="text-[11px] text-gray-600 mb-2 mt-0.5">
-                  {t("upload.style_desc") || "Paleta de colores del fondo IA y del gradiente animado"}
-                </p>
-                <div className="grid grid-cols-2 gap-2">
-                  {STYLES.map((s) => (
-                    <button
-                      key={s.code}
-                      type="button"
-                      onClick={() => onStyleChange(s.code)}
-                      className={`flex flex-col items-center gap-2 px-2 py-2.5 rounded-xl border text-[11px] font-medium transition-all duration-200
-                        ${style === s.code
-                          ? "border-brand/50 text-white ring-1 ring-brand/40 scale-[1.02]"
-                          : "border-white/[0.06] text-gray-400 hover:border-white/[0.16] hover:text-white"
-                        }`}
-                    >
-                      <span
-                        className={`w-full h-7 rounded-lg block ring-1 transition-all duration-200 ${
-                          style === s.code ? "ring-brand/50 shadow-[0_0_12px_2px_rgba(139,92,246,0.3)]" : "ring-white/[0.06]"
-                        }`}
-                        style={{ background: s.swatch }}
-                      />
-                      <span className="leading-tight text-center">
-                        <span className="block font-semibold">{t(s.labelKey)}</span>
-                        <span className="block text-[10px] text-gray-500">{t(s.subKey)}</span>
-                      </span>
-                    </button>
-                  ))}
-                </div>
-              </div>
-            )}
+            {/* For single song: colors + background side by side to avoid an empty left column */}
+            {files.length === 1 ? (
+              <div className="grid sm:grid-cols-2 gap-4">
+                {/* 1. Visual style */}
+                {onStyleChange && (
+                  <div className="rounded-card bg-surface-2/40 ring-1 ring-white/[0.04] px-4 py-3">
+                    <p className="text-[10px] uppercase tracking-[0.18em] text-gray-500">{t("upload.style_label")}</p>
+                    <p className="text-[11px] text-gray-600 mb-2 mt-0.5">
+                      {t("upload.style_desc") || "Paleta de colores del fondo IA y del gradiente animado"}
+                    </p>
+                    <div className="grid grid-cols-2 gap-2">
+                      {STYLES.map((s) => (
+                        <button
+                          key={s.code}
+                          type="button"
+                          onClick={() => onStyleChange(s.code)}
+                          className={`flex flex-col items-center gap-2 px-2 py-2.5 rounded-xl border text-[11px] font-medium transition-all duration-200
+                            ${style === s.code
+                              ? "border-brand/50 text-white ring-1 ring-brand/40 scale-[1.02]"
+                              : "border-white/[0.06] text-gray-400 hover:border-white/[0.16] hover:text-white"
+                            }`}
+                        >
+                          <span
+                            className={`w-full h-7 rounded-lg block ring-1 transition-all duration-200 ${
+                              style === s.code ? "ring-brand/50 shadow-[0_0_12px_2px_rgba(139,92,246,0.3)]" : "ring-white/[0.06]"
+                            }`}
+                            style={{ background: s.swatch }}
+                          />
+                          <span className="leading-tight text-center">
+                            <span className="block font-semibold">{t(s.labelKey)}</span>
+                            <span className="block text-[10px] text-gray-500">{t(s.subKey)}</span>
+                          </span>
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+                )}
 
-            {/* 2. Background selector */}
-            {_bgBlock}
+                {/* 2. Background selector */}
+                <div>{_bgBlock}</div>
+              </div>
+            ) : (
+              <>
+                {/* 1. Visual style */}
+                {onStyleChange && (
+                  <div className="rounded-card bg-surface-2/40 ring-1 ring-white/[0.04] px-4 py-3">
+                    <p className="text-[10px] uppercase tracking-[0.18em] text-gray-500">{t("upload.style_label")}</p>
+                    <p className="text-[11px] text-gray-600 mb-2 mt-0.5">
+                      {t("upload.style_desc") || "Paleta de colores del fondo IA y del gradiente animado"}
+                    </p>
+                    <div className="grid grid-cols-2 gap-2">
+                      {STYLES.map((s) => (
+                        <button
+                          key={s.code}
+                          type="button"
+                          onClick={() => onStyleChange(s.code)}
+                          className={`flex flex-col items-center gap-2 px-2 py-2.5 rounded-xl border text-[11px] font-medium transition-all duration-200
+                            ${style === s.code
+                              ? "border-brand/50 text-white ring-1 ring-brand/40 scale-[1.02]"
+                              : "border-white/[0.06] text-gray-400 hover:border-white/[0.16] hover:text-white"
+                            }`}
+                        >
+                          <span
+                            className={`w-full h-7 rounded-lg block ring-1 transition-all duration-200 ${
+                              style === s.code ? "ring-brand/50 shadow-[0_0_12px_2px_rgba(139,92,246,0.3)]" : "ring-white/[0.06]"
+                            }`}
+                            style={{ background: s.swatch }}
+                          />
+                          <span className="leading-tight text-center">
+                            <span className="block font-semibold">{t(s.labelKey)}</span>
+                            <span className="block text-[10px] text-gray-500">{t(s.subKey)}</span>
+                          </span>
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+                )}
+
+                {/* 2. Background selector */}
+                {_bgBlock}
+              </>
+            )}
 
             {/* 3. Batch-wide controls: movement gallery + text defaults */}
             {_batchSettingsBlock}
