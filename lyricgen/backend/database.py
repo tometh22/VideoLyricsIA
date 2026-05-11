@@ -12,19 +12,32 @@ from sqlalchemy import (
     ForeignKey,
     Index,
     Integer,
+    JSON,
     String,
     Text,
     create_engine,
     event,
     text,
 )
-from sqlalchemy.dialects.postgresql import JSONB
+from sqlalchemy.types import TypeDecorator
 from sqlalchemy.orm import (
     DeclarativeBase,
     Session,
     relationship,
     sessionmaker,
 )
+
+
+class JSONB(TypeDecorator):
+    """JSONB on PostgreSQL (supports equality operator); JSON on SQLite (tests)."""
+    impl = JSON
+    cache_ok = True
+
+    def load_dialect_impl(self, dialect):
+        if dialect.name == "postgresql":
+            from sqlalchemy.dialects.postgresql import JSONB as _JSONB
+            return dialect.type_descriptor(_JSONB())
+        return dialect.type_descriptor(JSON())
 
 # ---------------------------------------------------------------------------
 # Connection
@@ -611,8 +624,11 @@ def _widen_column_to_text(table: str, column: str) -> None:
 
 
 def _cast_json_to_jsonb(table: str, column: str) -> None:
-    """ALTER COLUMN TYPE JSONB only if currently json. Skips when already jsonb
-    to avoid an unnecessary ACCESS EXCLUSIVE lock during rolling deploys."""
+    """ALTER COLUMN TYPE JSONB only if currently json. No-op on non-PostgreSQL
+    backends (SQLite in tests). Skips when already jsonb to avoid an
+    unnecessary ACCESS EXCLUSIVE lock during rolling deploys."""
+    if engine.dialect.name != "postgresql":
+        return
     from sqlalchemy import text
     try:
         with engine.connect() as conn:
