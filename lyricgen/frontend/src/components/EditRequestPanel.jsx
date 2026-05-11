@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useRef, useState } from "react";
 import { useI18n } from "../i18n";
 
 const API = import.meta.env.VITE_API_URL || "";
@@ -59,6 +59,13 @@ export default function EditRequestPanel({ job, onEditTriggered }) {
   });
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState(null);
+  // Synchronous guard against double-click. `submitting` is async (React
+  // schedules the re-render after the click handler returns) so a rapid
+  // second click can fire its handler before the disabled flag flips.
+  // The ref is set BEFORE any await so the second handler sees
+  // `current=true` immediately and bails. Mirrors the approveLockRef
+  // pattern used in JobDetail.jsx.
+  const submitLockRef = useRef(false);
 
   const limitReached = editsRemaining <= 0;
 
@@ -78,19 +85,31 @@ export default function EditRequestPanel({ job, onEditTriggered }) {
   };
 
   const submit = async (type) => {
-    if (submitting || limitReached) return;
+    if (submitLockRef.current || limitReached) return;
+    submitLockRef.current = true;
+
+    // Defensive: catch the "user clicked submit without changing
+    // anything" case BEFORE hitting the API. Otherwise the backend
+    // happily re-renders with identical params, the user waits ~5min
+    // for the same video, and burns one of their 3 edits.
+    const payload = buildPayload(type);
+    if (type === "typography" && Object.keys(payload).length === 1) {
+      setError(t("edit.no_changes") || "No cambiaste ninguna opción — no hay nada que re-renderizar.");
+      submitLockRef.current = false;
+      return;
+    }
+
     setSubmitting(true);
     setError(null);
     try {
       const res = await fetch(`${API}/edit/${job.job_id}`, {
         method: "POST",
         headers: { ...authHeaders(), "Content-Type": "application/json" },
-        body: JSON.stringify(buildPayload(type)),
+        body: JSON.stringify(payload),
       });
       const data = await res.json().catch(() => ({}));
       if (!res.ok) {
         setError(data.detail || `Error ${res.status}`);
-        setSubmitting(false);
         return;
       }
       // Server flipped status to "editing" — close the panel, let parent
@@ -100,6 +119,7 @@ export default function EditRequestPanel({ job, onEditTriggered }) {
     } catch (e) {
       setError(e?.message || "Network error");
     } finally {
+      submitLockRef.current = false;
       setSubmitting(false);
     }
   };
