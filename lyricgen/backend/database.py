@@ -39,23 +39,35 @@ DATABASE_URL = os.environ.get(
 if DATABASE_URL.startswith("postgres://"):
     DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
 
-# Pool sizing is *per-process*. With uvicorn --workers 4 + N RQ workers,
-# the original (pool_size=20, max_overflow=10) easily blew past Postgres'
-# default max_connections=100 under modest load and caused mid-job
-# update_job() failures. Default is now ~5/5 per process (≈40 sockets at
-# 4 API + 4 RQ). Override with DB_POOL_SIZE / DB_MAX_OVERFLOW for capacity
-# tuning, but make sure max_connections on the DB matches:
+# Pool sizing is *per-process*. The formula that has to hold under
+# burst is:
+#
 #   max_connections >= (api_workers + rq_workers) × (pool_size + max_overflow)
-# Default 8+8 per process (was 5+5). With 4 uvicorn workers + 3 RQ
-# workers + the prewarm worker, peak demand is roughly:
-#   4 API × (8+8) = 64 sockets
-#   3 RQ × (8+8) = 48 sockets
-# = 112 sockets total under burst, well below typical PG max_connections=200.
-# Bumping to 8+8 absorbs concurrent /upload + /status + /download +
-# update_job traffic during a 5-batch UMG flood without the previous
-# fragile margin where a single slow query could starve the pool.
-_DB_POOL_SIZE = int(os.environ.get("DB_POOL_SIZE", "8"))
-_DB_MAX_OVERFLOW = int(os.environ.get("DB_MAX_OVERFLOW", "8"))
+#
+# Railway's default Postgres ships with max_connections=100. With
+# 4 API workers + 4 RQ workers = 8 processes, that leaves
+#   ceil((100 − 5_reserved_for_admin) / 8) ≈ 11 sockets per process.
+# So 5 + 5 = 10 is the most we can run *with the default DB plan*.
+#
+# After fix/db-pool-streaming-scale: streaming endpoints (/preview,
+# /download, /backgrounds/.../preview, /jobs/.../events, /download/all)
+# release their pool slot before the file/SSE stream begins via
+# scoped_db(). That lifts the per-process concurrency ceiling from
+# "≤10 short queries + 0 streams" to "≤10 short queries, unbounded
+# concurrent streams". 6 + 4 is now a comfortable default — 6 steady
+# slots for the hot dashboard/auth/status endpoints, 4 overflow for
+# bursts (UMG batch submissions, multiple operators logging in
+# concurrently). The total is still 10 per process, fits the 100-cap.
+#
+# When (not if) you migrate to a bigger DB plan or front Postgres with
+# PgBouncer (see docs/SCALING.md), raise:
+#   - DB_POOL_SIZE      (steady-state per-process)
+#   - DB_MAX_OVERFLOW   (burst headroom per-process)
+# and confirm max_connections still bounds the product above. The fix
+# above changes the failure shape — the cap is now real concurrent
+# short queries, not concurrent downloads.
+_DB_POOL_SIZE = int(os.environ.get("DB_POOL_SIZE", "6"))
+_DB_MAX_OVERFLOW = int(os.environ.get("DB_MAX_OVERFLOW", "4"))
 
 _keepalive_args: dict = {}
 if DATABASE_URL.startswith("postgresql"):
@@ -89,6 +101,61 @@ def get_db():
         yield db
     finally:
         db.close()
+
+
+from contextlib import contextmanager  # noqa: E402 — kept next to the helper it powers
+
+
+@contextmanager
+def scoped_db():
+    """Short-lived DB session for endpoints that stream large responses.
+
+    `Depends(get_db)` releases the session AFTER FastAPI is done sending
+    the response. For a 4 GB ProRes download or a 60-min SSE stream
+    that means one pooled connection per in-flight request, held for
+    the full duration of the transfer. With pool_size=8 + overflow=8
+    per process, a handful of concurrent downloads is enough to lock
+    out unrelated short queries (`/usage`, `/jobs`) until the pool
+    timeout fires.
+
+    Pattern:
+        with scoped_db() as db:
+            current_user = verify_media_token(token, job_id, ftype, db)
+            job = get_job(db, job_id, ...)
+        return FileResponse(file_path, ...)   # session already closed
+
+    Read-only inside the block: no commit happens here. If you write,
+    call db.commit() before returning from the block.
+    """
+    db = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
+
+
+def pool_stats() -> dict:
+    """Best-effort snapshot of the SQLAlchemy connection pool.
+
+    Returned by `/health` so operators can see exhaustion approaching
+    instead of finding out via the 30-second QueuePool timeout in
+    Sentry. All counters are per-process — multiply by uvicorn worker
+    count for the API-side total.
+    """
+    p = engine.pool
+    try:
+        return {
+            "size": p.size(),               # configured pool_size
+            "checked_out": p.checkedout(),  # in-use connections
+            "overflow": p.overflow(),       # overflow connections currently open
+            "available": p.checkedin(),     # idle in pool
+            "max_overflow": _DB_MAX_OVERFLOW,
+            "total_capacity": _DB_POOL_SIZE + _DB_MAX_OVERFLOW,
+        }
+    except Exception:
+        # Pool subclasses without these methods (e.g. SQLite StaticPool
+        # in tests) silently degrade to an empty dict.
+        return {}
 
 
 # ---------------------------------------------------------------------------

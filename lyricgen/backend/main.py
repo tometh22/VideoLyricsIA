@@ -68,7 +68,10 @@ from auth import (
 import storage
 from datetime import datetime, timedelta, timezone
 
-from database import Job, User, UserSettings, AuditLog, APIKey, get_db, init_db, BackgroundAsset, AssetUsage
+from database import (
+    Job, User, UserSettings, AuditLog, APIKey, get_db, init_db,
+    BackgroundAsset, AssetUsage, scoped_db, pool_stats,
+)
 from jobs import bulk_delete_jobs, create_job, delete_job, get_job, get_all_jobs, update_job
 from observability import init_sentry, init_logging, health_snapshot
 from pipeline import run_pipeline, transcribe
@@ -618,7 +621,6 @@ async def list_fonts(current_user: dict = Depends(get_current_user)):
 async def preview_background(
     asset_id: int,
     token: str = Query(...),
-    db: Session = Depends(get_db),
 ):
     """Serve a background asset file for preview.
 
@@ -626,23 +628,30 @@ async def preview_background(
     to a short-lived signed URL so the browser fetches directly from
     Cloudflare — no streaming through uvicorn for what may be a 5 MB clip.
     Falls back to FileResponse from disk for legacy / local-only assets.
-    """
-    user = get_current_user_from_token_param(token, db)
-    import storage
-    asset = db.query(BackgroundAsset).filter(BackgroundAsset.id == asset_id).first()
-    if not asset or not _user_can_use_asset(asset, user):
-        raise HTTPException(status_code=404, detail="Asset not found")
 
-    if asset.filename.startswith("library/") and storage.is_enabled():
-        url = storage.generate_signed_url(asset.filename, expiry_seconds=900)
+    No Depends(get_db) — scoped_db() releases the pool slot before
+    the FileResponse hand-off so concurrent background grid renders
+    don't queue against the pool."""
+    import storage
+    with scoped_db() as db:
+        user = get_current_user_from_token_param(token, db)
+        asset = db.query(BackgroundAsset).filter(BackgroundAsset.id == asset_id).first()
+        if not asset or not _user_can_use_asset(asset, user):
+            raise HTTPException(status_code=404, detail="Asset not found")
+        # Snapshot the fields we need before closing the session.
+        asset_filename = asset.filename
+        asset_file_type = asset.file_type
+
+    if asset_filename.startswith("library/") and storage.is_enabled():
+        url = storage.generate_signed_url(asset_filename, expiry_seconds=900)
         if url:
             return RedirectResponse(url, status_code=302)
         # If signing failed for any reason, fall through to local fallback.
 
-    file_path = os.path.join(_BACKGROUNDS_LIB, asset.filename)
+    file_path = os.path.join(_BACKGROUNDS_LIB, asset_filename)
     if not os.path.exists(file_path):
         raise HTTPException(status_code=404, detail="File not found")
-    media_type = "video/mp4" if asset.file_type == "mp4" else f"image/{asset.file_type}"
+    media_type = "video/mp4" if asset_file_type == "mp4" else f"image/{asset_file_type}"
     return FileResponse(file_path, media_type=media_type)
 
 
@@ -3364,53 +3373,63 @@ async def status(
 async def job_events(
     job_id: str,
     token: str = Query(..., description="Auth token (EventSource can't send Bearer headers)"),
-    db: Session = Depends(get_db),
 ):
     """Server-Sent Events stream for a single job. Emits one event whenever
     the job's status, step, or progress changes, then closes on any terminal
     state. The client passes the login JWT as ?token= because EventSource
-    does not support custom request headers."""
+    does not support custom request headers.
+
+    Connection budget: this is the worst pool-hog in the codebase
+    pre-fix because an SSE stream can live for the full render
+    duration (60+ min). The previous code grabbed Depends(get_db)
+    AND opened a second session inside the generator — two
+    connections per open dashboard tab. The current shape only
+    opens a session for each 2-second poll tick, releasing it
+    immediately so a hundred dashboards = a hundred brief tickle
+    queries, not a hundred permanently-held sockets."""
     import asyncio
 
-    try:
-        current_user = get_current_user_from_token_param(token, db)
-    except HTTPException:
-        raise HTTPException(status_code=401, detail="Invalid or expired token.")
-
-    job_check = get_job(db, job_id, **_job_scope(current_user))
-    if job_check is None:
-        raise HTTPException(status_code=404, detail="Job not found.")
+    # Validate auth + job access up front with a short-lived session.
+    # If anything below fails the client gets a normal HTTP error
+    # without ever entering the SSE generator.
+    with scoped_db() as db:
+        try:
+            current_user = get_current_user_from_token_param(token, db)
+        except HTTPException:
+            raise HTTPException(status_code=401, detail="Invalid or expired token.")
+        job_check = get_job(db, job_id, **_job_scope(current_user))
+        if job_check is None:
+            raise HTTPException(status_code=404, detail="Job not found.")
 
     TERMINAL = {"done", "pending_review", "error", "validation_failed"}
     scope = _job_scope(current_user)
 
     async def event_generator():
         last_sig = None
-        from database import get_db as _get_db
-        db_local = next(_get_db())
-        try:
-            while True:
-                job = get_job(db_local, job_id, **scope)
-                if job is None:
-                    break
-                sig = (job["status"], job["current_step"], job["progress"])
-                if sig != last_sig:
-                    last_sig = sig
-                    payload = {
-                        "job_id": job["job_id"],
-                        "status": job["status"],
-                        "current_step": job["current_step"],
-                        "progress": job["progress"],
-                        "error": job.get("error"),
-                        "created_at": job.get("created_at"),
-                        "completed_at": job.get("completed_at"),
-                    }
-                    yield f"data: {json.dumps(payload)}\n\n"
-                if job["status"] in TERMINAL:
-                    break
-                await asyncio.sleep(2)
-        finally:
-            db_local.close()
+        while True:
+            # Open + close a session for every poll tick. Cheap and
+            # bounded — a single SELECT per 2 s — and zero pool risk
+            # because the session is returned within milliseconds.
+            with scoped_db() as db_tick:
+                job = get_job(db_tick, job_id, **scope)
+            if job is None:
+                break
+            sig = (job["status"], job["current_step"], job["progress"])
+            if sig != last_sig:
+                last_sig = sig
+                payload = {
+                    "job_id": job["job_id"],
+                    "status": job["status"],
+                    "current_step": job["current_step"],
+                    "progress": job["progress"],
+                    "error": job.get("error"),
+                    "created_at": job.get("created_at"),
+                    "completed_at": job.get("completed_at"),
+                }
+                yield f"data: {json.dumps(payload)}\n\n"
+            if job["status"] in TERMINAL:
+                break
+            await asyncio.sleep(2)
 
     return StreamingResponse(
         event_generator(),
@@ -3513,7 +3532,6 @@ from prores import (
 async def download_all_zip(
     job_id: str,
     token: str = Query(...),
-    db: Session = Depends(get_db),
 ):
     """Bundle the small deliverables (video MP4 + short + thumbnail) into a
     single ZIP so the operator gets one download instead of three rapid
@@ -3521,16 +3539,21 @@ async def download_all_zip(
 
     UMG ProRes masters are excluded by design: they're huge (1+ GB) and
     UMG editorial expects them as a stand-alone .mov, not buried in a zip.
-    """
+
+    No Depends(get_db) — zip-build holds a session through the R2
+    fetch + zip assembly + StreamingResponse. Releasing it after the
+    metadata reads is enough for downstream code (R2 + zip are
+    DB-free)."""
     import io as _io
     import zipfile as _zip
 
-    current_user = verify_media_token(token, job_id, "all", db)
-    job = get_job(db, job_id, **_job_scope(current_user))
-    if job is None:
-        raise HTTPException(status_code=404, detail="Job not found.")
-    if job["status"] != "done":
-        raise HTTPException(status_code=400, detail="Job is not done yet.")
+    with scoped_db() as db:
+        current_user = verify_media_token(token, job_id, "all", db)
+        job = get_job(db, job_id, **_job_scope(current_user))
+        if job is None:
+            raise HTTPException(status_code=404, detail="Job not found.")
+        if job["status"] != "done":
+            raise HTTPException(status_code=400, detail="Job is not done yet.")
 
     job_files = job.get("files") or {}
     s3_keys = job.get("s3_keys") or {}
@@ -3627,16 +3650,19 @@ async def download(
     job_id: str,
     file_type: str,
     token: str = Query(...),
-    db: Session = Depends(get_db),
 ):
+    # No Depends(get_db) — see scoped_db() docstring. /download serves
+    # multi-GB ProRes masters; holding a pool slot for the full upload
+    # is one of the cheapest ways to lock the API out under load.
     if file_type not in FILE_MAP:
         raise HTTPException(status_code=400, detail="Invalid file type.")
-    current_user = verify_media_token(token, job_id, file_type, db)
-    job = get_job(db, job_id, **_job_scope(current_user))
-    if job is None:
-        raise HTTPException(status_code=404, detail="Job not found.")
-    if job["status"] != "done":
-        raise HTTPException(status_code=400, detail="Job is not done yet.")
+    with scoped_db() as db:
+        current_user = verify_media_token(token, job_id, file_type, db)
+        job = get_job(db, job_id, **_job_scope(current_user))
+        if job is None:
+            raise HTTPException(status_code=404, detail="Job not found.")
+        if job["status"] != "done":
+            raise HTTPException(status_code=400, detail="Job is not done yet.")
     tenant_id = current_user["tenant_id"]
 
     # Prefer a pre-signed URL to R2 so the uvicorn worker isn't tied up
@@ -3666,10 +3692,13 @@ async def download(
             pass  # fall through to FileResponse below
         elif readiness.state == ProResReadiness.READY_R2:
             # Re-fetch the s3_keys (a sibling caller may have just uploaded
-            # while we were checking the lock).
+            # while we were checking the lock). Short-lived DB session
+            # only for this re-read.
             from jobs import get_job_model as _get_job_model
-            _model = _get_job_model(db, job_id)
-            s3_key = (_model.s3_keys or {}).get(file_type) if _model else None
+            with scoped_db() as _db:
+                _model = _get_job_model(_db, job_id)
+                _s3_keys = dict(_model.s3_keys or {}) if _model else {}
+            s3_key = _s3_keys.get(file_type)
             if s3_key and storage.is_enabled():
                 url = storage.generate_signed_url(
                     s3_key, expiry_seconds=3600,
@@ -3719,8 +3748,12 @@ async def preview(
     job_id: str,
     file_type: str,
     token: str = Query(...),
-    db: Session = Depends(get_db),
 ):
+    # No Depends(get_db) — see scoped_db() docstring. The dashboard fires
+    # 6+ /preview/.../thumbnail calls in parallel on every refresh; with
+    # the dependency-injected session that's 6 connections held for the
+    # full streaming duration. Under modest concurrent dashboard load
+    # this exhausted the pool and broke /usage (the original incident).
     if file_type not in FILE_MAP:
         raise HTTPException(status_code=400, detail="Invalid file type.")
     if file_type in NON_PREVIEWABLE:
@@ -3729,12 +3762,15 @@ async def preview(
             detail=f"{file_type} is a delivery master and cannot be previewed in-browser. "
                    f"Use /download/{job_id}/{file_type} instead.",
         )
-    current_user = verify_media_token(token, job_id, file_type, db)
-    job = get_job(db, job_id, **_job_scope(current_user))
-    if job is None:
-        raise HTTPException(status_code=404, detail="Job not found.")
-    if job["status"] not in ("done", "pending_review"):
-        raise HTTPException(status_code=400, detail="Job is not ready for preview.")
+    with scoped_db() as db:
+        current_user = verify_media_token(token, job_id, file_type, db)
+        job = get_job(db, job_id, **_job_scope(current_user))
+        if job is None:
+            raise HTTPException(status_code=404, detail="Job not found.")
+        if job["status"] not in ("done", "pending_review"):
+            raise HTTPException(status_code=400, detail="Job is not ready for preview.")
+        s3_key = (job.get("s3_keys") or {}).get(file_type)
+    # DB session closed — pool is free for /usage and friends.
 
     # Local copy is removed after R2 upload to keep disk usage bounded. Fall
     # back to a signed URL for the preview in that case.
@@ -3742,7 +3778,6 @@ async def preview(
     if os.path.exists(file_path):
         return FileResponse(file_path, media_type=MEDIA_TYPES[file_type])
 
-    s3_key = (job.get("s3_keys") or {}).get(file_type)
     if s3_key and storage.is_enabled():
         url = storage.generate_signed_url(s3_key, expiry_seconds=3600)
         if url:
