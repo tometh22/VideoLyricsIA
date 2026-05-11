@@ -10,12 +10,15 @@ function authHeaders() {
     : { "Content-Type": "application/json" };
 }
 
-// Opciones espejadas de _parse_umg_params + validate_umg_config en el
-// backend. Si se agregan profiles/fps nuevos en backend, actualizar acá.
+// Valores ESPEJADOS de backend/render_spec.py:UMG_FRAME_SIZES /
+// UMG_FPS / UMG_PRORES_PROFILES. Si cambian los allowed values en
+// backend, actualizar este archivo también — validate_umg_config
+// rechaza con 400 cualquier valor fuera del set.
 const FRAME_SIZES = [
-  { value: "1920x1080", label: "1080p (1920×1080)" },
-  { value: "3840x2160", label: "4K UHD (3840×2160)" },
-  { value: "1280x720",  label: "720p (1280×720)" },
+  { value: "HD",     label: "HD 1080p (1920×1080)" },
+  { value: "UHD-4K", label: "UHD 4K (3840×2160)" },
+  { value: "DCI-4K", label: "DCI 4K (4096×2160)" },
+  { value: "DCI-2K", label: "DCI 2K (2048×1080)" },
 ];
 
 const FPS_OPTS = [
@@ -24,19 +27,21 @@ const FPS_OPTS = [
   { value: "25",     label: "25 fps (PAL)" },
   { value: "29.97",  label: "29.97 fps (NTSC)" },
   { value: "30",     label: "30 fps" },
+  { value: "50",     label: "50 fps" },
+  { value: "59.94",  label: "59.94 fps" },
+  { value: "60",     label: "60 fps" },
 ];
 
 const PROFILE_OPTS = [
-  { value: "1", label: "ProRes LT" },
-  { value: "2", label: "ProRes Standard" },
   { value: "3", label: "ProRes 422 HQ (broadcast)" },
   { value: "4", label: "ProRes 4444 (master)" },
+  { value: "5", label: "ProRes 4444 XQ" },
 ];
 
 // Defaults broadcast estándar — confirmado con el usuario:
-// 1080p, 29.97 fps, ProRes 422 HQ (profile=3).
+// HD 1080p, 29.97 fps, ProRes 422 HQ (profile=3).
 const DEFAULTS = {
-  umg_frame_size:    "1920x1080",
+  umg_frame_size:    "HD",
   umg_fps:           "29.97",
   umg_prores_profile: "3",
 };
@@ -155,7 +160,7 @@ export default function EnableProResModal({ jobId, onClose, onSuccess }) {
             disabled={submitting}
             className="flex-1 py-2 rounded-md text-sm font-medium text-gray-300 bg-surface-3/40 hover:bg-surface-3/60 ring-1 ring-white/[0.04] transition-colors disabled:opacity-40"
           >
-            {t("common.cancel") || "Cancelar"}
+            {t("edit.cancel")}
           </button>
           <button
             type="button"

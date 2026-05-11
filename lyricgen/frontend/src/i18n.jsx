@@ -657,6 +657,19 @@ const translations = {
     "dash.editing": "Re-renderizando",
     "history.editing": "Re-renderizando",
     "batch.editing": "Re-renderizando",
+
+    // ProRes export retroactivo (botón en JobDetail + modal)
+    "prores.cta_title": "Exportar a ProRes (.mov broadcast)",
+    "prores.cta_desc": "Este video se rindió como MP4. Generá una versión ProRes para broadcast / cliente.",
+    "prores.cta_button": "Exportar",
+    "prores.enable_title": "Exportar a ProRes",
+    "prores.enable_desc": "Generamos un máster ProRes (.mov) a partir del MP4 ya renderizado. Tarda 1-5 minutos según la duración.",
+    "prores.frame_size": "Resolución",
+    "prores.fps": "Frame rate",
+    "prores.profile": "Perfil ProRes",
+    "prores.submit": "Generar ProRes",
+    "prores.submitting": "Encolando…",
+    "prores.queued_toast": "ProRes encolado. En 1-5 min va a estar disponible para descargar.",
   },
 
   en: {
@@ -1246,6 +1259,19 @@ const translations = {
     "faq.a5": "The client owns 100% of all generated videos, thumbnails and shorts. No royalties or attributions.",
     "faq.q6": "What languages are supported?",
     "faq.a6": "Spanish, English, Portuguese, French, Italian and German. For both transcription and YouTube metadata.",
+
+    // ProRes retroactive export (button in JobDetail + modal)
+    "prores.cta_title": "Export to ProRes (.mov broadcast)",
+    "prores.cta_desc": "This video was rendered as MP4. Generate a ProRes version for broadcast / client delivery.",
+    "prores.cta_button": "Export",
+    "prores.enable_title": "Export to ProRes",
+    "prores.enable_desc": "We generate a ProRes (.mov) master from the existing MP4. Takes 1-5 minutes depending on length.",
+    "prores.frame_size": "Resolution",
+    "prores.fps": "Frame rate",
+    "prores.profile": "ProRes profile",
+    "prores.submit": "Generate ProRes",
+    "prores.submitting": "Queueing…",
+    "prores.queued_toast": "ProRes queued. Will be available to download in 1-5 min.",
   },
 
   pt: {
@@ -1833,6 +1859,19 @@ const translations = {
     "faq.a5": "O cliente é dono de 100% de todos os vídeos, thumbnails e shorts gerados. Sem royalties ou atribuições.",
     "faq.q6": "Quais idiomas são suportados?",
     "faq.a6": "Espanhol, inglês, português, francês, italiano e alemão. Tanto para a transcrição quanto para os metadados do YouTube.",
+
+    // ProRes exportação retroativa (botão no JobDetail + modal)
+    "prores.cta_title": "Exportar para ProRes (.mov broadcast)",
+    "prores.cta_desc": "Este vídeo foi renderizado como MP4. Gere uma versão ProRes para broadcast / cliente.",
+    "prores.cta_button": "Exportar",
+    "prores.enable_title": "Exportar para ProRes",
+    "prores.enable_desc": "Geramos um master ProRes (.mov) a partir do MP4 já renderizado. Leva 1-5 minutos dependendo da duração.",
+    "prores.frame_size": "Resolução",
+    "prores.fps": "Frame rate",
+    "prores.profile": "Perfil ProRes",
+    "prores.submit": "Gerar ProRes",
+    "prores.submitting": "Enfileirando…",
+    "prores.queued_toast": "ProRes na fila. Em 1-5 min estará disponível para download.",
   },
 };
 
