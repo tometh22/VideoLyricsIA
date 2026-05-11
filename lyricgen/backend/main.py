@@ -2320,6 +2320,7 @@ async def upload(
     lyric_transition: str = Form("cut"),
     text_motion: str = Form("none"),
     text_contrast: str = Form("medium"),
+    match_lyrics: bool = Form(True),
     current_user: dict = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
@@ -2470,6 +2471,7 @@ async def upload(
         lyric_transition=lyric_transition if lyric_transition in ("cut", "fade", "fade_slow") else "cut",
         text_motion=text_motion if text_motion in ("none", "subtle", "float") else "none",
         text_contrast=text_contrast if text_contrast in ("subtle", "medium", "strong") else "medium",
+        match_lyrics=match_lyrics,
     )
 
     return {"job_id": job_id, "status": initial_status}
@@ -3072,6 +3074,7 @@ async def generate_with_segments(
     lyric_transition: str = Form("cut"),
     text_motion: str = Form("none"),
     text_contrast: str = Form("medium"),
+    match_lyrics: bool = Form(True),
     current_user: dict = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
@@ -3286,6 +3289,7 @@ async def generate_with_segments(
         lyric_transition=lyric_transition if lyric_transition in ("cut", "fade", "fade_slow") else "cut",
         text_motion=text_motion if text_motion in ("none", "subtle", "float") else "none",
         text_contrast=text_contrast if text_contrast in ("subtle", "medium", "strong") else "medium",
+        match_lyrics=match_lyrics,
     )
 
     return {"job_id": job_id, "status": initial_status}
