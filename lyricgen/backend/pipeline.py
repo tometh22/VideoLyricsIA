@@ -272,6 +272,19 @@ def run_pipeline(job_id: str, mp3_path: str, artist: str, style: str,
 
     # Materialize R2-stored inputs onto local disk so moviepy/ffmpeg/whisper
     # can open them. No-op when running on a single host (no R2 keys passed).
+    #
+    # The /retry endpoint (main.py:retry_job) calls enqueue_pipeline with
+    # mp3_path=None because the audio only lives in R2 — the caller has
+    # no local path to hand us. Detect that and derive one from the R2
+    # key's basename. Without this, os.path.exists(None) raises:
+    #   TypeError: stat: path should be string, bytes, os.PathLike or
+    #   integer, not NoneType
+    # which RQ surfaces to pipeline_failure_callback and the user gets
+    # "El render falló tras reintentos" — same row, same retry loop.
+    # Discovered 2026-05-11 22:43 UTC when admin retried two jobs that
+    # had been reaped from a 4K render stall.
+    if mp3_path is None and input_r2_key:
+        mp3_path = os.path.join(job_dir, os.path.basename(input_r2_key))
     if input_r2_key and not os.path.exists(mp3_path):
         if not storage.download_object(input_r2_key, mp3_path):
             update_job(
