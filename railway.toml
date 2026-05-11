@@ -55,7 +55,24 @@ restartPolicyMaxRetries = 5
 
 [services.api.deploy]
 healthcheckPath = "/health"
-healthcheckTimeout = 30
+# Cold-start budget. The API does a lot on boot:
+#   • sentry init                            (~1-2 s)
+#   • SQLAlchemy engine + first PG connect  (3-15 s, Railway PG cold)
+#   • init_db()                              (table + column migrations,
+#                                              1-5 s — runs in-process at
+#                                              startup, see database.py)
+#   • alembic schema validation              (no-op in prod; instant)
+#   • reaper thread + outputs-cleanup thread (instant)
+#   • Whisper model preload SKIPPED on api  (OPENAI_API_KEY set)
+#
+# Total p99 around 25 s, peak ~45 s when PG also needs to warm. 30 s
+# was a coin-flip — one deploy on 2026-05-11 22:00 UTC failed 5/5
+# replicas with "service unavailable" because /health returned 503 on
+# the first hit (PG SELECT 1 inside health_snapshot tripped on a fresh
+# pool that hadn't established its first socket yet). 90 s gives us
+# 3× headroom over the observed peak without making genuinely broken
+# deploys take forever to fail.
+healthcheckTimeout = 90
 
 # --- Worker service overrides ---
 #

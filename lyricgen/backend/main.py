@@ -650,9 +650,17 @@ async def preview_background(
 async def health():
     """Runtime health. No auth — used by load balancers and uptime probes.
 
-    Returns 200 when status="ok", 503 otherwise. The previous
-    always-200 behaviour kept the LB green while Redis or R2 was
-    unreachable, so the queue silently dropped jobs.
+    Status → HTTP mapping:
+      - ok, degraded, starting → 200 (LB keeps the instance in rotation)
+      - down                   → 503 (LB pulls the instance out)
+
+    "starting" is reported by health_snapshot() during the first
+    STARTUP_GRACE_S seconds (default 20) when a required dependency
+    (Postgres SELECT 1, Redis ping) is briefly unreachable. Without
+    that grace window Railway's first healthcheck probe on a fresh
+    container can fire before the SQLAlchemy pool seats its first
+    socket, returning 503 and aborting the deploy 5/5 replicas. See
+    observability.py:_within_startup_grace.
     """
     snap = health_snapshot()
     if snap.get("status") == "down":
