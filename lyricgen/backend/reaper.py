@@ -34,6 +34,7 @@ import time
 from datetime import datetime, timedelta, timezone
 from typing import Iterable
 
+from sqlalchemy import exists
 from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import Session
 
@@ -122,14 +123,17 @@ def find_orphan_polling_jobs(
     we KNOW the AI call started and never finished, instead of guessing
     from age."""
     cutoff = datetime.now(timezone.utc) - timedelta(minutes=threshold_min)
+    orphan_provenance = (
+        exists()
+        .where(AIProvenance.job_id == Job.job_id)
+        .where(AIProvenance.duration_ms.is_(None))
+        .where(AIProvenance.created_at < cutoff)
+    )
     return (
         db.query(Job)
-        .join(AIProvenance, AIProvenance.job_id == Job.job_id)
         .filter(Job.status == "processing")
-        .filter(AIProvenance.duration_ms.is_(None))
-        .filter(AIProvenance.created_at < cutoff)
+        .filter(orphan_provenance)
         .order_by(Job.created_at.asc())
-        .distinct()
         .all()
     )
 

@@ -12,19 +12,32 @@ from sqlalchemy import (
     ForeignKey,
     Index,
     Integer,
+    JSON,
     String,
     Text,
-    JSON,
     create_engine,
     event,
     text,
 )
+from sqlalchemy.types import TypeDecorator
 from sqlalchemy.orm import (
     DeclarativeBase,
     Session,
     relationship,
     sessionmaker,
 )
+
+
+class JSONB(TypeDecorator):
+    """JSONB on PostgreSQL (supports equality operator); JSON on SQLite (tests)."""
+    impl = JSON
+    cache_ok = True
+
+    def load_dialect_impl(self, dialect):
+        if dialect.name == "postgresql":
+            from sqlalchemy.dialects.postgresql import JSONB as _JSONB
+            return dialect.type_descriptor(_JSONB())
+        return dialect.type_descriptor(JSON())
 
 # ---------------------------------------------------------------------------
 # Connection
@@ -277,7 +290,7 @@ class Job(Base):
 
     # Delivery profile (youtube | umg)
     delivery_profile = Column(String(20), default="youtube", nullable=False)
-    umg_spec = Column(JSON, nullable=True)
+    umg_spec = Column(JSONB, nullable=True)
 
     # File paths (relative to outputs dir)
     video_url = Column(String(500), nullable=True)
@@ -287,7 +300,7 @@ class Job(Base):
     umg_short_url = Column(String(500), nullable=True)
 
     # Cloud storage keys (when deliverables are uploaded to R2/S3)
-    s3_keys = Column(JSON, nullable=True)
+    s3_keys = Column(JSONB, nullable=True)
 
     # R2 key of the source audio uploaded by the user. Set by /transcribe
     # so /generate can hand the worker the same file without forcing the
@@ -303,10 +316,10 @@ class Job(Base):
     multipart_upload_id = Column(Text, nullable=True)
 
     # YouTube info
-    youtube_data = Column(JSON, nullable=True)
+    youtube_data = Column(JSONB, nullable=True)
 
     # Content validation (UMG Guideline 15)
-    validation_result = Column(JSON, nullable=True)
+    validation_result = Column(JSONB, nullable=True)
 
     # Approval workflow (UMG compliance)
     approved_by = Column(Integer, ForeignKey("users.id"), nullable=True)
@@ -319,8 +332,8 @@ class Job(Base):
     # edit_count     — how many partial re-renders the reviewer has requested (max 3).
     # bg_r2_key_cached — R2 key for the AI-generated background so typography-only
     #   edits can re-use it without paying for Veo again.
-    segments_json = Column(JSON, nullable=True)
-    render_params = Column(JSON, nullable=True)
+    segments_json = Column(JSONB, nullable=True)
+    render_params = Column(JSONB, nullable=True)
     edit_count = Column(Integer, default=0, nullable=False, server_default="0")
     bg_r2_key_cached = Column(Text, nullable=True)
 
@@ -425,7 +438,7 @@ class UserSettings(Base):
 
     id = Column(Integer, primary_key=True, autoincrement=True)
     user_id = Column(Integer, ForeignKey("users.id"), unique=True, nullable=False)
-    settings_json = Column(JSON, default=dict)
+    settings_json = Column(JSONB, default=dict)
     updated_at = Column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)
 
     user = relationship("User", back_populates="settings")
@@ -474,7 +487,7 @@ class AuditLog(Base):
     id = Column(Integer, primary_key=True, autoincrement=True)
     user_id = Column(Integer, ForeignKey("users.id"), nullable=True)
     action = Column(String(100), nullable=False, index=True)
-    detail = Column(JSON, nullable=True)
+    detail = Column(JSONB, nullable=True)
     ip_address = Column(String(45), nullable=True)
     created_at = Column(DateTime(timezone=True), default=utcnow, index=True)
 
@@ -561,7 +574,7 @@ class AIProvenance(Base):
     prompt_sent = Column(Text, nullable=False)
     prompt_hash = Column(String(64), nullable=True)      # SHA-256 for dedup/search
     response_summary = Column(Text, nullable=True)       # truncated response
-    input_data_types = Column(JSON, nullable=True)       # ["lyrics_text", "artist_name"]
+    input_data_types = Column(JSONB, nullable=True)      # ["lyrics_text", "artist_name"]
     output_artifact = Column(String(500), nullable=True) # path to generated file
     duration_ms = Column(Integer, nullable=True)
     created_at = Column(DateTime(timezone=True), default=utcnow, index=True)
@@ -581,7 +594,7 @@ class LyricsCache(Base):
     artist = Column(String(255), nullable=False)
     title = Column(String(255), nullable=False)
     lyrics = Column(Text, nullable=False)
-    source_urls = Column(JSON, nullable=True)         # list of grounding URIs
+    source_urls = Column(JSONB, nullable=True)        # list of grounding URIs
     fetched_at = Column(DateTime(timezone=True), default=utcnow, index=True)
     fetched_by_model = Column(String(64), nullable=True)
 
@@ -643,6 +656,19 @@ def _migrate_user_columns():
     _widen_column_to_text("jobs", "input_r2_key")
     _widen_column_to_text("jobs", "multipart_upload_id")
 
+    # Cast JSON → JSONB so PostgreSQL equality operators work (required for
+    # DISTINCT queries and index support). Safe: JSONB is a strict superset.
+    _cast_json_to_jsonb("jobs", "umg_spec")
+    _cast_json_to_jsonb("jobs", "s3_keys")
+    _cast_json_to_jsonb("jobs", "youtube_data")
+    _cast_json_to_jsonb("jobs", "validation_result")
+    _cast_json_to_jsonb("jobs", "segments_json")
+    _cast_json_to_jsonb("jobs", "render_params")
+    _cast_json_to_jsonb("user_settings", "settings_json")
+    _cast_json_to_jsonb("audit_log", "detail")
+    _cast_json_to_jsonb("ai_provenance", "input_data_types")
+    _cast_json_to_jsonb("lyrics_cache", "source_urls")
+
 
 def _widen_column_to_text(table: str, column: str) -> None:
     """Run ALTER COLUMN TYPE TEXT only if the column is not already text.
@@ -662,6 +688,31 @@ def _widen_column_to_text(table: str, column: str) -> None:
             conn.execute(text(f"ALTER TABLE {table} ALTER COLUMN {column} TYPE TEXT"))
     except Exception as e:  # pragma: no cover
         print(f"[init_db] widen skipped: {table}.{column} → {e}")
+
+
+def _cast_json_to_jsonb(table: str, column: str) -> None:
+    """ALTER COLUMN TYPE JSONB only if currently json. No-op on non-PostgreSQL
+    backends (SQLite in tests). Skips when already jsonb to avoid an
+    unnecessary ACCESS EXCLUSIVE lock during rolling deploys."""
+    if engine.dialect.name != "postgresql":
+        return
+    from sqlalchemy import text
+    try:
+        with engine.connect() as conn:
+            row = conn.execute(text(
+                "SELECT data_type FROM information_schema.columns "
+                "WHERE table_name = :t AND column_name = :c"
+            ), {"t": table, "c": column}).fetchone()
+        if not row or row[0].lower() == "jsonb":
+            return
+        with engine.begin() as conn:
+            conn.execute(text("SET LOCAL lock_timeout = '3s'"))
+            conn.execute(text(
+                f"ALTER TABLE {table} ALTER COLUMN {column} TYPE JSONB "
+                f"USING {column}::text::jsonb"
+            ))
+    except Exception as e:  # pragma: no cover
+        print(f"[init_db] cast_json_to_jsonb skipped: {table}.{column} → {e}")
 
 
 def drop_db():
