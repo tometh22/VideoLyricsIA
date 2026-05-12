@@ -162,15 +162,46 @@ export default function UploadZone({
   // Batch-wide defaults applied to all tracks. Controls in _batchSettingsBlock
   // write here and fan out to every file entry. Per-track "Personalizar"
   // drawer lets an operator override individual fields without affecting others.
-  const [batchDefaults, setBatchDefaults] = useState({
+  //
+  // Persistence: we mirror the picks to localStorage so a re-upload (same
+  // browser, same user) restores the operator's last choices instead of
+  // resetting font/style/concept/etc. to hardcoded defaults. Confirmed in
+  // prod that without this, the same song uploaded twice ends up with
+  // completely different render_params each time (font, text_case,
+  // concept all rotated arbitrarily) — which is why Mujer Amante kept
+  // losing the "ROMANTICO" concept across Agus's re-uploads.
+  const BATCH_DEFAULTS_STORAGE_KEY = "genly:wizardBatchDefaultsV1";
+  const HARDCODED_BATCH_DEFAULTS = {
     genre: "", concept: "", movementStyle: "", font: "",
     textCase: "upper", fontScale: "1.0", lyricTransition: "cut", textMotion: "none", textContrast: "medium",
-  });
+  };
+  const loadStoredBatchDefaults = () => {
+    try {
+      const raw = localStorage.getItem(BATCH_DEFAULTS_STORAGE_KEY);
+      if (!raw) return HARDCODED_BATCH_DEFAULTS;
+      const parsed = JSON.parse(raw);
+      // Merge keeps any future fields safe-defaulted when the user has an
+      // older saved object missing the new key.
+      return { ...HARDCODED_BATCH_DEFAULTS, ...parsed };
+    } catch {
+      return HARDCODED_BATCH_DEFAULTS;
+    }
+  };
+  const [batchDefaults, setBatchDefaults] = useState(loadStoredBatchDefaults);
   const batchDefaultsRef = useRef(batchDefaults);
   useEffect(() => { batchDefaultsRef.current = batchDefaults; }, [batchDefaults]);
 
   const updateBatchDefault = (field, value) => {
-    setBatchDefaults((prev) => ({ ...prev, [field]: value }));
+    setBatchDefaults((prev) => {
+      const next = { ...prev, [field]: value };
+      try {
+        localStorage.setItem(BATCH_DEFAULTS_STORAGE_KEY, JSON.stringify(next));
+      } catch {
+        // Quota exceeded / private-mode storage off — the picks still work
+        // in-session, they just won't survive a refresh. Don't block the UI.
+      }
+      return next;
+    });
     onFiles((prev) => prev.map((f) => ({ ...f, [field]: value })));
   };
 
