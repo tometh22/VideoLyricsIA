@@ -4359,6 +4359,11 @@ async def request_edit(
     # back through Veo, which is the `background` step.
     job.current_step = "background" if body.edit_type == "background" else "video"
     job.progress = 0
+    # Stamp the moment editing began so the reaper can spot edits that
+    # died mid-render (worker killed by Railway deploy / OOM / crash).
+    # Without this the reaper has to guess from created_at, which is wrong
+    # for lyrics edits on already-old done/rejected jobs.
+    job.editing_started_at = datetime.now(timezone.utc)
     db.add(AuditLog(
         user_id=current_user["id"],
         action="job.edit_request",
