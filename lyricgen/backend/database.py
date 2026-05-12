@@ -337,6 +337,13 @@ class Job(Base):
     render_params = Column(JSONB, nullable=True)
     edit_count = Column(Integer, default=0, nullable=False, server_default="0")
     bg_r2_key_cached = Column(Text, nullable=True)
+    # Variantes: cuando este job fue creado via POST /jobs/{id}/variant,
+    # parent_job_id apunta al job_id que sirvió de base (mismo audio +
+    # mismo segments_json, distinto Veo prompt / concept / style).
+    # NULL para jobs primarios (uploads frescos). Soft FK — si el padre
+    # se borra, la variante sobrevive como job independiente. Indexado
+    # para listar hijos en /jobs eficientemente.
+    parent_job_id = Column(String(32), nullable=True, index=True)
     # Set by /edit when the operator triggers an edit (typography/lyrics/
     # background). The reaper uses this to detect edits that died mid-render
     # (worker killed by deploy/OOM): if a job is status="editing" and
@@ -399,6 +406,10 @@ class Job(Base):
             # then rejects with a raw English error.
             "segments_json": self.segments_json,
             "bg_r2_key_cached": self.bg_r2_key_cached,
+            # Lineage de variantes — el JobDetail muestra un pill "Variante
+            # de X" cuando este field está set. variant_count se calcula
+            # en el handler (query separada para evitar lazy load N+1).
+            "parent_job_id": self.parent_job_id,
             "created_at": self.created_at.timestamp() if self.created_at else None,
             "completed_at": self.completed_at.timestamp() if self.completed_at else None,
         }
@@ -421,6 +432,11 @@ class Job(Base):
                 bool(s3.get("umg_master")) and bool(s3.get("umg_short"))
                 if wants_umg else None
             ),
+            # Lineage badges en la lista — "Variante" cuando parent_job_id
+            # está set, "N hijos" cuando este job tiene variantes. La cuenta
+            # de hijos se computa por separado (subquery en /jobs handler)
+            # para evitar lazy load N+1.
+            "parent_job_id": self.parent_job_id,
             "created_at": self.created_at.timestamp() if self.created_at else None,
         }
 
@@ -718,6 +734,13 @@ def _migrate_user_columns():
         # reaper.find_stalled_renders to catch processing jobs whose worker
         # died in a non-AI step (ffmpeg, moviepy, R2 upload).
         "ALTER TABLE jobs ADD COLUMN IF NOT EXISTS last_progress_at TIMESTAMPTZ",
+        # Variantes: POST /jobs/{id}/variant crea un job nuevo que hereda
+        # audio + segments del padre pero re-genera el Veo background.
+        # parent_job_id apunta al padre. Soft FK (no REFERENCES) para que
+        # delete del padre no rompa la variante. Indexado para que el
+        # /jobs liste con `variant_count` eficientemente.
+        "ALTER TABLE jobs ADD COLUMN IF NOT EXISTS parent_job_id VARCHAR(32)",
+        "CREATE INDEX IF NOT EXISTS ix_jobs_parent_job_id ON jobs(parent_job_id)",
     ]
     # Each statement gets its own transaction. In Postgres, a failed statement
     # inside a transaction puts it in aborted state — subsequent execute()

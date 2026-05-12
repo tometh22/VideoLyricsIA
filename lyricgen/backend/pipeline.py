@@ -283,7 +283,14 @@ def run_pipeline(job_id: str, mp3_path: str, artist: str, style: str,
                  lyric_transition: str = "cut",
                  text_motion: str = "none",
                  match_lyrics: bool = True,
-                 text_contrast: str = "medium"):
+                 text_contrast: str = "medium",
+                 # Background_hint llega solo desde el flow de variantes
+                 # (POST /jobs/{id}/variant). En el upload normal viene
+                 # vacío y el prompt Gemini se arma 100% desde concept +
+                 # genre + lyrics. Cuando viene set, _ensure_background
+                 # lo inyecta como [OPERATOR OVERRIDE] en el user_content
+                 # de Gemini, misma mecánica que /edit (PR #116).
+                 background_hint: str | None = None):
     """Run the full pipeline for a job. Called synchronously.
 
     delivery_profile:
@@ -494,6 +501,7 @@ def run_pipeline(job_id: str, mp3_path: str, artist: str, style: str,
                 movement_style=movement_style,
                 image_to_video_path=(background_path if _animate_user_image else None),
                 match_lyrics=match_lyrics,
+                background_hint=background_hint,
             )
             # Image-to-video fallback: if Veo failed to produce an MP4 (None
             # or non-existent path) AND the operator wanted to animate their

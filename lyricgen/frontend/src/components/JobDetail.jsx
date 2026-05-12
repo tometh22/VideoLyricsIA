@@ -6,6 +6,7 @@ import ProResBadge from "./ProResBadge";
 import EditRequestPanel from "./EditRequestPanel";
 import EnableProResModal from "./EnableProResModal";
 import DriveTransferModal from "./DriveTransferModal";
+import VariantCreateModal from "./VariantCreateModal";
 
 const API = import.meta.env.VITE_API_URL || "";
 
@@ -666,6 +667,9 @@ export default function JobDetail({ job, onBack, onJobUpdate }) {
   const driveFeatureEnabled = user?.features?.drive_export === true;
   const [driveConnected, setDriveConnected] = useState(false);
   const [showDriveModal, setShowDriveModal] = useState(false);
+  // Variantes: solo se ofrecen sobre jobs done. El botón abre un modal
+  // que crea un job nuevo (cuenta como video pago) heredando segments.
+  const [showVariantModal, setShowVariantModal] = useState(false);
   // file_type a transferir cuando el user abre el modal: por default el
   // umg_master si está disponible, sino el video MP4.
   const driveFileType = isUmgJob ? "umg_master" : "video";
@@ -746,6 +750,19 @@ export default function JobDetail({ job, onBack, onJobUpdate }) {
                   {t("detail.approved") || "Aprobado"}
                 </span>
               )}
+              {/* Lineage pill: visible si este job es variante de otro.
+                  Click lleva al padre. Si no hay parent_job_id, no se
+                  renderea nada — los jobs primarios no muestran badge. */}
+              {job.parent_job_id && (
+                <button
+                  type="button"
+                  onClick={() => { window.location.href = `/job/${job.parent_job_id}`; }}
+                  className="px-2 py-0.5 rounded-full bg-purple-500/15 text-purple-300 ring-1 ring-purple-500/30 text-[10px] font-semibold uppercase tracking-wider hover:bg-purple-500/25 transition-colors"
+                  title={t("detail.variant_of_tooltip") || "Ver job padre"}
+                >
+                  {t("detail.variant_of") || "Variante"}
+                </button>
+              )}
             </div>
             <p className="text-sm text-ink-secondary mt-0.5 truncate">{job.artist}</p>
           </div>
@@ -791,6 +808,21 @@ export default function JobDetail({ job, onBack, onJobUpdate }) {
               </>
             );
           })()}
+          {/* Variantes: visible cuando el job está done. Crea un job
+              nuevo (mismo audio + lyrics) con otro background Veo. */}
+          {canDownload && (
+            <button
+              onClick={() => setShowVariantModal(true)}
+              className="btn-secondary text-xs h-10 px-4"
+              title={t("detail.variant_tooltip") ||
+                "Crear otro video con las mismas lyrics aprobadas (cuesta 1 video del plan)"}
+            >
+              <svg className="inline-block w-4 h-4 mr-1.5 -mt-0.5" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
+                <path d="M12 5v14M5 12h14" strokeLinecap="round" />
+              </svg>
+              {t("detail.create_variant") || "Crear variante"}
+            </button>
+          )}
           {canDownload && !youtubeResult && (
             <button onClick={previewMetadata} className="btn-primary text-xs h-10 px-5">
               <svg className="inline-block w-4 h-4 mr-1.5 -mt-0.5" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
@@ -1127,6 +1159,19 @@ export default function JobDetail({ job, onBack, onJobUpdate }) {
           jobId={job.job_id}
           fileType={driveFileType}
           onClose={() => setShowDriveModal(false)}
+        />
+      )}
+
+      {showVariantModal && (
+        <VariantCreateModal
+          job={job}
+          onClose={() => setShowVariantModal(false)}
+          onCreated={(newJobId) => {
+            setShowVariantModal(false);
+            // El caller (Dashboard / parent) decide cómo navegar. Por
+            // simplicidad, redirigimos al detalle del nuevo job.
+            window.location.href = `/job/${newJobId}`;
+          }}
         />
       )}
 

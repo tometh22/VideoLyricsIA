@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import { useI18n } from "../i18n";
+import BackgroundHintField from "./BackgroundHintField";
 
 const API = import.meta.env.VITE_API_URL || "";
 
@@ -686,29 +687,12 @@ export default function EditRequestPanel({
             </p>
           </div>
 
-          <div>
-            <label className="block text-[11px] text-ink-secondary mb-1.5 tracking-wide">
-              {t("edit.background_hint_label") || "¿Querés aclarar qué tipo de fondo? (opcional)"}
-            </label>
-            <textarea
-              value={backgroundHint}
-              onChange={(e) => setBackgroundHint(e.target.value.slice(0, 300))}
-              placeholder={t("edit.background_hint_placeholder") ||
-                "ej: 'paisaje romántico al atardecer con tonos cálidos' · 'abstracto con ondas de luz suave' · 'interior cálido tipo café íntimo'"}
-              rows={3}
-              disabled={submitting}
-              className="w-full text-xs px-3 py-2 rounded-md bg-surface-3/40 ring-1 ring-white/[0.06] focus:ring-brand/40 focus:outline-none resize-none text-white placeholder:text-ink-tertiary disabled:opacity-50"
-            />
-            <div className="flex items-center justify-between mt-1">
-              <p className="text-[10px] text-ink-tertiary">
-                {t("edit.background_hint_help") ||
-                  "Sirve cuando los fondos anteriores no captaron el tono. Dejá vacío para que el sistema decida."}
-              </p>
-              <p className="text-[10px] text-ink-tertiary font-mono tabular-nums">
-                {backgroundHint.length}/300
-              </p>
-            </div>
-          </div>
+          <BackgroundHintField
+            value={backgroundHint}
+            onChange={setBackgroundHint}
+            disabled={submitting}
+          />
+
 
           {error && (
             <div className="text-xs text-red-300 px-3 py-2 rounded-md bg-red-500/10 ring-1 ring-red-500/30">
