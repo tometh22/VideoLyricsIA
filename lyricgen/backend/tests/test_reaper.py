@@ -16,6 +16,7 @@ from database import AIProvenance, Job, SessionLocal
 from reaper import (
     find_abandoned_edits,
     find_orphan_polling_jobs,
+    find_stalled_renders,
     find_stuck_jobs,
     reap_all_stuck,
 )
@@ -23,18 +24,26 @@ from reaper import (
 
 def _seed(db, *, status: str, age_minutes: float, job_id: str | None = None,
           editing_started_minutes_ago: float | None = None,
+          last_progress_minutes_ago: float | None = None,
           edit_count: int = 0,
           progress: int = 20,
           current_step: str = "video"):
     """Insert a Job row at a synthetic age. editing_started_minutes_ago
-    drives the find_abandoned_edits clock; pass None to leave the column
-    unset (mirrors a row that never went through /edit)."""
+    drives the find_abandoned_edits clock; last_progress_minutes_ago
+    drives the find_stalled_renders clock. Pass None to leave the
+    column unset (mirrors legacy rows / paths that never tick progress)."""
     jid = job_id or f"reap_{uuid.uuid4().hex[:8]}"
     editing_started_at = None
     if editing_started_minutes_ago is not None:
         editing_started_at = (
             datetime.now(timezone.utc)
             - timedelta(minutes=editing_started_minutes_ago)
+        )
+    last_progress_at = None
+    if last_progress_minutes_ago is not None:
+        last_progress_at = (
+            datetime.now(timezone.utc)
+            - timedelta(minutes=last_progress_minutes_ago)
         )
     db.add(Job(
         job_id=jid,
@@ -49,6 +58,7 @@ def _seed(db, *, status: str, age_minutes: float, job_id: str | None = None,
         delivery_profile="youtube",
         edit_count=edit_count,
         editing_started_at=editing_started_at,
+        last_progress_at=last_progress_at,
         created_at=datetime.now(timezone.utc) - timedelta(minutes=age_minutes),
     ))
     db.commit()
@@ -375,6 +385,109 @@ def test_edit_count_floor_at_zero():
         assert row.edit_count == 0, (
             f"edit_count must not go negative, got {row.edit_count}"
         )
+    finally:
+        _cleanup(db)
+        db.close()
+
+
+# ───────────────────────────────────────────────────
+# Stalled-render sweep (worker died during non-AI step)
+# ───────────────────────────────────────────────────
+
+def test_fresh_processing_job_with_recent_progress_is_left_alone():
+    """A processing job whose progress was just updated (1 min ago) is
+    healthy — the worker is alive and ticking."""
+    db = SessionLocal()
+    try:
+        _cleanup(db)
+        jid = _seed(
+            db, status="processing", age_minutes=10,
+            last_progress_minutes_ago=1, progress=40,
+        )
+        stalled = find_stalled_renders(db, threshold_min=20)
+        assert all(j.job_id != jid for j in stalled), (
+            "a 1-min-old progress update means worker is alive"
+        )
+    finally:
+        _cleanup(db)
+        db.close()
+
+
+def test_stalled_processing_job_is_reaped():
+    """The exact Agus / job 2144aacb453e scenario: worker died during
+    ffmpeg at video/40%, no AIProvenance in-flight, age below 100 min.
+    The new sweep must catch this within the 20-min threshold."""
+    db = SessionLocal()
+    try:
+        _cleanup(db)
+        jid = _seed(
+            db, status="processing", age_minutes=30,
+            last_progress_minutes_ago=25, progress=40,
+            current_step="video",
+        )
+        n = reap_all_stuck(threshold_min=100)
+        assert n >= 1, "stalled-render sweep should reap this job"
+
+        row = db.query(Job).filter(Job.job_id == jid).first()
+        db.refresh(row)
+        assert row.status == "error", (
+            f"expected status=error after stalled reap, got {row.status!r}"
+        )
+        assert row.error and "reinici" in row.error.lower(), (
+            f"expected Spanish 'servidor se reinició' message, got {row.error!r}"
+        )
+    finally:
+        _cleanup(db)
+        db.close()
+
+
+def test_processing_without_progress_timestamp_is_not_touched():
+    """Legacy rows that pre-date the last_progress_at column (NULL value)
+    must not be reaped by find_stalled_renders — without the timestamp we
+    have no clock. The age-based find_stuck_jobs still covers them at
+    100 min, just slower."""
+    db = SessionLocal()
+    try:
+        _cleanup(db)
+        jid = _seed(
+            db, status="processing", age_minutes=50,
+            last_progress_minutes_ago=None,  # NULL
+            progress=40,
+        )
+        stalled = find_stalled_renders(db, threshold_min=20)
+        assert all(j.job_id != jid for j in stalled), (
+            "processing job with NULL last_progress_at should be skipped"
+        )
+    finally:
+        _cleanup(db)
+        db.close()
+
+
+def test_stalled_sweep_only_targets_processing():
+    """Editing, queued, pending_review, done — none of these are in the
+    stalled-render sweep's scope. Editing has its own dedicated reaper
+    (find_abandoned_edits) with different revert semantics; the rest are
+    waiting on humans or have already finished."""
+    db = SessionLocal()
+    try:
+        _cleanup(db)
+        edit_jid = _seed(
+            db, status="editing", age_minutes=30,
+            last_progress_minutes_ago=25,
+        )
+        queued_jid = _seed(
+            db, status="queued", age_minutes=30,
+            last_progress_minutes_ago=25,
+        )
+        done_jid = _seed(
+            db, status="done", age_minutes=30,
+            last_progress_minutes_ago=25,
+        )
+        stalled = find_stalled_renders(db, threshold_min=20)
+        stalled_ids = {j.job_id for j in stalled}
+        assert edit_jid not in stalled_ids
+        assert queued_jid not in stalled_ids
+        assert done_jid not in stalled_ids
     finally:
         _cleanup(db)
         db.close()

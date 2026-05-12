@@ -98,6 +98,19 @@ _EDIT_ABANDON_THRESHOLD_MIN = int(os.environ.get(
     "REAPER_EDIT_ABANDON_THRESHOLD_MIN", "30",
 ))
 
+# Stalled-render threshold. Catches jobs in `processing` whose progress
+# hasn't moved in N minutes — the gap between find_orphan_polling_jobs
+# (which fires on stale in-flight AI calls) and find_stuck_jobs (which
+# uses a 100-min created_at threshold). A healthy worker calls
+# jobs.update_job(progress=...) at every step transition and at multiple
+# checkpoints within a step, so a 20-min gap is a strong "worker is dead"
+# signal. Veo polling can pause progress ~3 min p99, ffmpeg composite can
+# run silently ~5 min on long songs — 20 min gives 4-6× headroom over any
+# healthy phase.
+_STALLED_RENDER_THRESHOLD_MIN = int(os.environ.get(
+    "REAPER_STALLED_RENDER_THRESHOLD_MIN", "20",
+))
+
 # Owner inbox for the digest email. Override via env in Railway.
 _OWNER_EMAIL = os.environ.get("OWNER_EMAIL", "tomas@epical.digital")
 
@@ -179,6 +192,40 @@ def find_abandoned_uploads(
         .filter(Job.status == "awaiting_upload")
         .filter(Job.created_at < cutoff)
         .order_by(Job.created_at.asc())
+        .all()
+    )
+
+
+def find_stalled_renders(
+    db: Session,
+    threshold_min: int = _STALLED_RENDER_THRESHOLD_MIN,
+) -> list[Job]:
+    """Return jobs in `processing` whose progress hasn't moved in
+    threshold_min minutes.
+
+    The scenario this catches: worker SIGKILLed during ffmpeg / moviepy /
+    R2 upload — a non-AI step where there is no in-flight AIProvenance
+    row to anchor find_orphan_polling_jobs, and find_stuck_jobs's 100-min
+    created_at cutoff is too long. Confirmed in prod 2026-05-12: job
+    2144aacb453e killed at video/40% during a deploy, invisible to any
+    reaper for 87 min.
+
+    Signal: last_progress_at, written by jobs.update_job() at every
+    progress call. A healthy worker hits multiple progress checkpoints
+    per minute across whisper / background / video / thumbnail steps.
+    A 20-min gap means the worker is gone.
+
+    Rows with last_progress_at IS NULL are skipped — they predate this
+    column (or status=queued, never picked up). The age-based
+    find_stuck_jobs covers those at 100 min.
+    """
+    cutoff = datetime.now(timezone.utc) - timedelta(minutes=threshold_min)
+    return (
+        db.query(Job)
+        .filter(Job.status == "processing")
+        .filter(Job.last_progress_at.isnot(None))
+        .filter(Job.last_progress_at < cutoff)
+        .order_by(Job.last_progress_at.asc())
         .all()
     )
 
@@ -290,6 +337,14 @@ def _reason_for_orphan(job: Job) -> str:
         "El servidor se reinició mientras generábamos el video de fondo. "
         "Tu MP3 sigue guardado: apretá \"Reintentar sin re-subir\" "
         "para volver a generarlo."
+    )
+
+
+def _reason_for_stalled(job: Job) -> str:
+    return (
+        "El servidor se reinició mientras renderizábamos tu video. "
+        "Tu archivo sigue guardado: apretá \"Reintentar\" para "
+        "volver a procesarlo."
     )
 
 
@@ -523,11 +578,17 @@ def _reap_all_stuck_inner(threshold_min: int) -> int:
 
         stuck = find_stuck_jobs(db, threshold_min)
         orphans = find_orphan_polling_jobs(db)
-        # Drop jobs that already appear in `stuck` so we don't double-reap
-        # the same row (the age-based and provenance-based sweeps overlap
-        # for jobs that are both very old AND have an in-flight AI call).
+        stalled = find_stalled_renders(db)
+        # De-dupe across the three processing-status sweeps. `stuck` (age-
+        # based) wins over both, then `orphans` (AI in-flight) wins over
+        # `stalled` (last_progress_at). Same root cause "worker dead" so
+        # the operator only needs one reaped-notification per job; we just
+        # pick the most specific reason.
         stuck_ids = {j.job_id for j in stuck}
         orphans = [j for j in orphans if j.job_id not in stuck_ids]
+        orphan_ids = {j.job_id for j in orphans}
+        stalled = [j for j in stalled
+                   if j.job_id not in stuck_ids and j.job_id not in orphan_ids]
         abandoned = find_abandoned_transcribed(db)
         abandoned_uploads = find_abandoned_uploads(db)
         abandoned_edits = find_abandoned_edits(db)
@@ -553,12 +614,14 @@ def _reap_all_stuck_inner(threshold_min: int) -> int:
             if abandoned_edits:
                 print(f"[REAPER] reverted {len(abandoned_edits)} abandoned "
                       f"edit job(s) back to pending_review")
-        if not stuck and not orphans:
+        if not stuck and not orphans and not stalled:
             return 0
         for job in stuck:
             reap_stuck_job(db, job, _reason_for(job))
         for job in orphans:
             reap_stuck_job(db, job, _reason_for_orphan(job))
+        for job in stalled:
+            reap_stuck_job(db, job, _reason_for_stalled(job))
         db.commit()
         # Detach so we can pass to background helpers without keeping the
         # session open. The fields we need are already populated.
@@ -566,10 +629,12 @@ def _reap_all_stuck_inner(threshold_min: int) -> int:
             db.expunge(job)
         for job in orphans:
             db.expunge(job)
-        # Merge orphan reaps into the same notification batch as age-based
-        # ones — operators care about "what got reaped this cycle", not
-        # which sweep flagged it.
-        stuck = stuck + orphans
+        for job in stalled:
+            db.expunge(job)
+        # Merge all three sweeps into one notification batch — operators
+        # care about "what got reaped this cycle", not which sweep flagged
+        # it. de-dup above already guaranteed no overlap.
+        stuck = stuck + orphans + stalled
     finally:
         # Releasing the advisory lock is implicit on session close
         # (Postgres releases all session-scoped locks automatically),
