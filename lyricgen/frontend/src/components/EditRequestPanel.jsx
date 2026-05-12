@@ -120,6 +120,43 @@ export default function EditRequestPanel({
   useEffect(() => () => { mountedRef.current = false; }, []);
 
   const limitReached = editsRemaining <= 0;
+  // Typography reuses the cached bg from R2 to skip Veo. Without a
+  // cached key the backend rejects the edit. Disable the button up-front
+  // instead of letting the user fill the form and getting a raw English
+  // 400 in the face.
+  const typographyAvailable = Boolean(job.bg_r2_key_cached);
+
+  // Clear stale error banners when the job transitions into "editing" —
+  // means the regen actually kicked off, so a previous failure message
+  // should not linger above the in-progress UI.
+  useEffect(() => {
+    if (job.status === "editing" && error) setError(null);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [job.status]);
+
+  // Map raw backend HTTPException details to friendly Spanish copy. If
+  // the backend message doesn't match a known prefix we fall through to
+  // the original `data.detail` so nothing gets swallowed silently.
+  const translateBackendError = (raw) => {
+    if (typeof raw !== "string") return raw;
+    if (raw.startsWith("No cached background available")) {
+      return t("edit.error_no_bg_cache") ||
+        "Este video no tiene un fondo cacheado para reusar. Regenerá el fondo primero (cuesta ~US$0.90).";
+    }
+    if (raw.startsWith("Job must be in pending_review")) {
+      return t("edit.error_wrong_status") ||
+        "Esta regeneración ya está en marcha o el video pasó a otro estado.";
+    }
+    if (raw.startsWith("Maximum edit limit")) {
+      return t("edit.error_limit_reached") ||
+        "Alcanzaste el límite de 3 regeneraciones para este video.";
+    }
+    if (raw.startsWith("Lyrics edit requires") || raw.startsWith("Job has no persisted")) {
+      return t("edit.error_no_segments") ||
+        "Este video no tiene letras guardadas para editar. Subí la canción de nuevo.";
+    }
+    return raw;
+  };
 
   // Only send the fields the operator actually changed — the backend
   // treats missing fields as "keep the prior value".
@@ -214,7 +251,8 @@ export default function EditRequestPanel({
       });
       const data = await res.json().catch(() => ({}));
       if (!res.ok) {
-        if (mountedRef.current) setError(data.detail || `Error ${res.status}`);
+        const friendly = translateBackendError(data.detail) || `Error ${res.status}`;
+        if (mountedRef.current) setError(friendly);
         return;
       }
       succeeded = true;
@@ -291,7 +329,7 @@ export default function EditRequestPanel({
           allowedModes.length === 2 ? "sm:grid-cols-2" :
           "sm:grid-cols-3"
         }`}>
-          {allowsTypography && (
+          {allowsTypography && typographyAvailable && (
           <button
             type="button"
             onClick={() => setMode("typography")}
@@ -309,6 +347,22 @@ export default function EditRequestPanel({
               {t("edit.typography_cost") || "~5-10 min · sin costo extra · reutiliza el fondo actual"}
             </p>
           </button>
+          )}
+          {allowsTypography && !typographyAvailable && (
+          <div className="text-left p-4 rounded-xl bg-surface-3/20 ring-1 ring-white/[0.03] opacity-60 cursor-not-allowed">
+            <div className="flex items-center gap-2 mb-1">
+              <svg className="w-4 h-4 text-ink-secondary" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
+                <path d="M4 7V4h16v3M9 20h6M12 4v16" strokeLinecap="round" />
+              </svg>
+              <span className="text-sm font-medium text-ink-secondary">
+                {t("edit.typography_title") || "Cambiar tipografía"}
+              </span>
+            </div>
+            <p className="text-[11px] text-amber-300/80">
+              {t("edit.typography_needs_bg") ||
+                "Este video no tiene fondo cacheado. Regenerá el fondo primero para poder cambiar la tipografía."}
+            </p>
+          </div>
           )}
 
           {allowsLyrics && (
