@@ -61,13 +61,31 @@ const SHOW_MOTION_PICKER = false;
 
 const SCALE_STEPS = [0.8, 1.0, 1.2, 1.5, 1.8, 2.0];
 
-export default function EditRequestPanel({ job, onEditTriggered }) {
+export default function EditRequestPanel({
+  job,
+  onEditTriggered,
+  // Which edit modes the user can pick from. Defaults to all three so
+  // the existing pending_review call sites keep working unchanged. When
+  // a job is in done/rejected, JobDetail narrows this to ["lyrics"] so
+  // the user can fix typos but can't trigger fresh Veo regens or
+  // typography re-renders on already-approved/rejected videos.
+  allowedModes = ["typography", "lyrics", "background"],
+}) {
+  const allowsTypography = allowedModes.includes("typography");
+  const allowsLyrics = allowedModes.includes("lyrics");
+  const allowsBackground = allowedModes.includes("background");
   const { t } = useI18n();
   const editCount = job.edit_count ?? 0;
   const editsRemaining = job.edits_remaining ?? Math.max(0, 3 - editCount);
   const initialParams = job.render_params || {};
 
-  const [mode, setMode] = useState(null); // null | "typography" | "background"
+  const [mode, setMode] = useState(null); // null | "typography" | "background" | "lyrics"
+  // Lyrics editing state. Hydrated from job.segments_json when the user
+  // enters lyrics mode. We keep the array shape the backend expects
+  // (start, end, text) and let the user mutate text inline. Timing
+  // edits go through Sync Mode in the dedicated LyricsEditor — kept
+  // out of this panel to avoid duplicating that complexity here.
+  const [lyricsDraft, setLyricsDraft] = useState([]);
   const [form, setForm] = useState({
     font:             initialParams.font             ?? "",
     font_scale:       initialParams.font_scale       ?? 1.0,
@@ -109,6 +127,16 @@ export default function EditRequestPanel({ job, onEditTriggered }) {
     if (type === "background") {
       return { edit_type: "background" };
     }
+    if (type === "lyrics") {
+      return {
+        edit_type: "lyrics",
+        segments: lyricsDraft.map((s) => ({
+          start: Number(s.start) || 0,
+          end: Number(s.end) || 0,
+          text: String(s.text || ""),
+        })),
+      };
+    }
     const p = { edit_type: "typography" };
     if (form.font             !== (initialParams.font             ?? "")) p.font = form.font;
     if (form.font_scale       !== (initialParams.font_scale       ?? 1.0)) p.font_scale = form.font_scale;
@@ -117,6 +145,21 @@ export default function EditRequestPanel({ job, onEditTriggered }) {
     if (form.text_motion      !== (initialParams.text_motion      ?? "none")) p.text_motion = form.text_motion;
     return p;
   };
+
+  // When the operator enters lyrics mode, hydrate the draft from the
+  // job's persisted segments (or an empty array if none — the UI shows
+  // a banner in that case). Re-runs whenever the job's segments change
+  // upstream (e.g. another edit just completed).
+  useEffect(() => {
+    if (mode === "lyrics") {
+      const segs = Array.isArray(job.segments_json) ? job.segments_json : [];
+      setLyricsDraft(segs.map((s) => ({
+        start: s.start,
+        end: s.end,
+        text: s.text || "",
+      })));
+    }
+  }, [mode, job.segments_json]);
 
   const submit = async (type) => {
     if (submitLockRef.current || limitReached) return;
@@ -133,6 +176,31 @@ export default function EditRequestPanel({ job, onEditTriggered }) {
       }
       submitLockRef.current = false;
       return;
+    }
+    if (type === "lyrics") {
+      if (!payload.segments || payload.segments.length === 0) {
+        if (mountedRef.current) {
+          setError(t("edit.lyrics_empty") || "Las letras quedaron vacías — no hay nada que renderizar.");
+        }
+        submitLockRef.current = false;
+        return;
+      }
+      // No-change short-circuit: if every line text is identical to
+      // job.segments_json's, don't burn an edit.
+      const original = Array.isArray(job.segments_json) ? job.segments_json : [];
+      const unchanged = original.length === payload.segments.length &&
+        original.every((s, i) =>
+          s.text === payload.segments[i].text &&
+          Math.abs((s.start ?? 0) - payload.segments[i].start) < 0.001 &&
+          Math.abs((s.end ?? 0) - payload.segments[i].end) < 0.001
+        );
+      if (unchanged) {
+        if (mountedRef.current) {
+          setError(t("edit.no_changes") || "No cambiaste ninguna opción — no hay nada que re-renderizar.");
+        }
+        submitLockRef.current = false;
+        return;
+      }
     }
 
     if (mountedRef.current) setSubmitting(true);
@@ -218,7 +286,12 @@ export default function EditRequestPanel({ job, onEditTriggered }) {
       </div>
 
       {!mode && (
-        <div className="grid sm:grid-cols-2 gap-3">
+        <div className={`grid gap-3 ${
+          allowedModes.length === 1 ? "" :
+          allowedModes.length === 2 ? "sm:grid-cols-2" :
+          "sm:grid-cols-3"
+        }`}>
+          {allowsTypography && (
           <button
             type="button"
             onClick={() => setMode("typography")}
@@ -236,7 +309,29 @@ export default function EditRequestPanel({ job, onEditTriggered }) {
               {t("edit.typography_cost") || "~5-10 min · sin costo extra · reutiliza el fondo actual"}
             </p>
           </button>
+          )}
 
+          {allowsLyrics && (
+          <button
+            type="button"
+            onClick={() => setMode("lyrics")}
+            className="text-left p-4 rounded-xl bg-surface-3/40 hover:bg-surface-3/60 ring-1 ring-white/[0.04] hover:ring-brand-light/30 transition-all"
+          >
+            <div className="flex items-center gap-2 mb-1">
+              <svg className="w-4 h-4 text-brand-light" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
+                <path d="M9 19V6l12-2v13M9 19a2 2 0 11-4 0 2 2 0 014 0zM21 17a2 2 0 11-4 0 2 2 0 014 0z" strokeLinecap="round" />
+              </svg>
+              <span className="text-sm font-medium text-white">
+                {t("edit.lyrics_title") || "Corregir letras"}
+              </span>
+            </div>
+            <p className="text-[11px] text-ink-secondary">
+              {t("edit.lyrics_cost") || "~5-10 min · sin costo extra · cambiá palabras o frases mal transcriptas"}
+            </p>
+          </button>
+          )}
+
+          {allowsBackground && (
           <button
             type="button"
             onClick={() => setMode("background")}
@@ -255,6 +350,75 @@ export default function EditRequestPanel({ job, onEditTriggered }) {
               {t("edit.background_cost") || "~10-15 min · ~US$0.90 · nuevo Veo manteniendo lyrics"}
             </p>
           </button>
+          )}
+        </div>
+      )}
+
+      {mode === "lyrics" && (
+        <div className="space-y-3 animate-fade-in">
+          <div className="flex items-center justify-between gap-2">
+            <p className="text-xs text-ink-secondary">
+              {t("edit.lyrics_panel_hint") ||
+                "Corregí texto de cualquier línea. Los tiempos no cambian — para mover líneas individuales usá el editor completo desde la subida."}
+            </p>
+            <button
+              type="button"
+              onClick={() => { setMode(null); setError(null); }}
+              className="text-[11px] text-gray-400 hover:text-white px-2 py-1 transition-colors shrink-0"
+            >
+              {t("edit.cancel") || "Cancelar"}
+            </button>
+          </div>
+
+          {lyricsDraft.length === 0 ? (
+            <div className="rounded-card px-3 py-4 bg-amber-500/[0.08] ring-1 ring-amber-500/25">
+              <p className="text-xs text-amber-200">
+                {t("edit.lyrics_no_segments") ||
+                  "Este job no tiene letras guardadas. Esto pasa con jobs muy viejos. Subí la canción de nuevo para editar letras."}
+              </p>
+            </div>
+          ) : (
+            <div className="rounded-card bg-surface-1/40 ring-1 ring-white/[0.04] max-h-[55vh] overflow-y-auto">
+              <ul className="divide-y divide-white/[0.04]">
+                {lyricsDraft.map((seg, idx) => (
+                  <li key={idx} className="flex items-start gap-3 px-3 py-2">
+                    <span className="text-[10px] font-mono text-gray-600 tabular-nums w-14 shrink-0 mt-2">
+                      {seg.start.toFixed(2)}s
+                    </span>
+                    <input
+                      type="text"
+                      value={seg.text}
+                      onChange={(e) => {
+                        const v = e.target.value;
+                        setLyricsDraft((prev) => prev.map((s, i) =>
+                          i === idx ? { ...s, text: v } : s
+                        ));
+                      }}
+                      className="flex-1 text-sm bg-transparent border-none outline-none focus:bg-surface-2/40 rounded px-2 py-1.5 text-white"
+                      maxLength={500}
+                    />
+                  </li>
+                ))}
+              </ul>
+            </div>
+          )}
+
+          {error && (
+            <p className="text-[11px] text-red-400">{error}</p>
+          )}
+
+          <div className="flex items-center justify-end gap-2">
+            <button
+              type="button"
+              onClick={() => submit("lyrics")}
+              disabled={submitting || lyricsDraft.length === 0}
+              className="btn-primary text-xs h-9 px-4 disabled:opacity-50"
+            >
+              {submitting
+                ? (t("edit.submitting") || "Aplicando...")
+                : (t("edit.lyrics_submit") || "Re-renderizar con letras corregidas")}
+            </button>
+          </div>
         </div>
       )}
 

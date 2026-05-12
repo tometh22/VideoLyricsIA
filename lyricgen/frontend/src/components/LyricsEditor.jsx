@@ -202,6 +202,15 @@ export default function LyricsEditor({
   // offset arbitrarily — listening + tapping is ground truth.
   const [syncMode, setSyncMode] = useState(false);
   const [syncCursor, setSyncCursor] = useState(0);
+  // Global timing offset panel — UX entry point for "the whole song is
+  // shifted by N ms" cases. Different from Sync Mode (which anchors a
+  // line + propagates) and the "intro is too long" banner (which only
+  // appears when first.start > 3 s). This panel is always available
+  // and lets the operator nudge every line by ±1 s with a slider or
+  // ±125/250/500 ms presets. Collapsed by default to keep the editor
+  // tidy.
+  const [shiftPanelOpen, setShiftPanelOpen] = useState(false);
+  const [shiftDraftMs, setShiftDraftMs] = useState(0); // -1000..+1000
   // When false (default), each Sync-Mode tap anchors ONLY the current
   // line — leaves every following timestamp alone. When true, the same
   // delta propagates to every line after the cursor (the previous-only
@@ -347,13 +356,17 @@ export default function LyricsEditor({
           if (duration && newEnd > duration) newEnd = duration;
           return { ...s, start: newStart, end: newEnd };
         }
-        // Cascade only when the operator opted in. Skip when delta is
-        // tiny to avoid jittering on micro-adjustments. The previous
-        // unconditional cascade was overwriting already-correct future
-        // timestamps when the operator just wanted to fix the FIRST
-        // line of a song whose lrclib data put line 1 at 0:00 (instead
-        // of the real ~15 s where vocals start).
-        if (syncCascade && i > syncCursor && Math.abs(delta) >= 0.2) {
+        // Cascade only when the operator opted in. We used to have a
+        // 200 ms dead-zone here, intended to avoid jittering on
+        // micro-adjustments. In practice that swallowed the most
+        // common real correction (Whisper drifts of 100-300 ms), so
+        // operators reported "Arrastrar siguientes anda mal — apreté
+        // y no pasó nada" — when actually the cascade math was running
+        // but rejecting the delta as "too small to matter". 10 ms is
+        // tight enough to filter pure floating-point noise without
+        // discarding legitimate user-driven shifts. The user remains
+        // in control via the explicit `syncCascade` opt-in.
+        if (syncCascade && i > syncCursor && Math.abs(delta) >= 0.01) {
           const segDur = Math.max(0.5, s.end - s.start);
           const shifted = Math.max(0, s.start + delta);
           let newEnd = shifted + segDur;
@@ -1002,6 +1015,102 @@ export default function LyricsEditor({
 
         return null;
       })()}
+
+      {/* ─── Global timing offset ───────────────────────────────────
+          Always-available panel for the common "the whole song is ±N ms
+          off" case. Whisper's per-segment timestamps can drift by 200-
+          800 ms (codec lag, intro silence, etc.); rather than nudging
+          every line manually, the operator shifts the entire timeline.
+          Collapsed by default — opens when user clicks the toggle.   */}
+      <div className="mb-3">
+        <button
+          onClick={() => setShiftPanelOpen((v) => !v)}
+          className="w-full flex items-center justify-between px-3 py-2 rounded-card bg-surface-2/40 ring-1 ring-white/[0.04] hover:ring-white/[0.08] text-xs text-gray-300 hover:text-white transition-colors"
+        >
+          <span className="flex items-center gap-2">
+            <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
+              <path d="M8 7h12M8 12h12M8 17h12M4 7h.01M4 12h.01M4 17h.01" />
+            </svg>
+            {t("editor.shift_panel_title") || "Mover toda la canción"}
+          </span>
+          <svg
+            className={`w-3.5 h-3.5 transition-transform ${shiftPanelOpen ? "rotate-180" : ""}`}
+            fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24"
+          ><path d="M19 9l-7 7-7-7" /></svg>
+        </button>
+
+        {shiftPanelOpen && (
+          <div className="mt-2 px-3 py-3 rounded-card bg-surface-1/40 ring-1 ring-white/[0.04] space-y-3 animate-fade-in">
+            <p className="text-[11px] text-gray-500 leading-relaxed">
+              {t("editor.shift_panel_hint") ||
+                "Aplica un offset uniforme a todas las líneas. Valores positivos atrasan las letras (aparecen más tarde); negativos las adelantan."}
+            </p>
+
+            {/* Slider continuo */}
+            <div className="flex items-center gap-3">
+              <span className="text-[10px] font-mono text-gray-500 w-12 text-right">-1000ms</span>
+              <input
+                type="range"
+                min={-1000}
+                max={1000}
+                step={10}
+                value={shiftDraftMs}
+                onChange={(e) => setShiftDraftMs(parseInt(e.target.value, 10))}
+                className="flex-1 accent-brand"
+              />
+              <span className="text-[10px] font-mono text-gray-500 w-12">+1000ms</span>
+            </div>
+
+            {/* Presets + valor actual + input custom */}
+            <div className="flex flex-wrap items-center gap-2">
+              {[-500, -250, 0, 250, 500].map((preset) => (
+                <button
+                  key={preset}
+                  onClick={() => setShiftDraftMs(preset)}
+                  className={`text-[11px] font-mono px-2.5 py-1 rounded ring-1 transition-colors ${
+                    shiftDraftMs === preset
+                      ? "bg-brand/20 ring-brand/40 text-brand-light"
+                      : "bg-surface-2/40 ring-white/[0.05] text-gray-300 hover:text-white"
+                  }`}
+                >
+                  {preset > 0 ? "+" : ""}{preset}ms
+                </button>
+              ))}
+              <span className="text-[10px] text-gray-500">{t("editor.shift_or_custom") || "o"}</span>
+              <input
+                type="number"
+                step={10}
+                value={shiftDraftMs}
+                onChange={(e) => {
+                  const v = parseInt(e.target.value || "0", 10);
+                  if (!Number.isNaN(v)) {
+                    // clamp to slider range; users can still apply by
+                    // calling repeatedly if they need bigger shifts.
+                    setShiftDraftMs(Math.max(-1000, Math.min(1000, v)));
+                  }
+                }}
+                className="w-20 text-[11px] font-mono px-2 py-1 rounded bg-surface-2/40 ring-1 ring-white/[0.05] text-white"
+              />
+              <span className="text-[10px] text-gray-500">ms</span>
+              <button
+                onClick={() => {
+                  if (shiftDraftMs === 0) return;
+                  shiftAllSegments(shiftDraftMs / 1000);  // ms → seconds
+                  setShiftDraftMs(0);
+                }}
+                disabled={shiftDraftMs === 0}
+                className="ml-auto text-[11px] font-semibold px-3 py-1.5 rounded-lg bg-brand/20 ring-1 ring-brand/40 text-brand-light hover:bg-brand/30 transition-colors disabled:opacity-30 disabled:cursor-not-allowed"
+              >
+                {t("editor.shift_apply") || "Aplicar"}
+              </button>
+            </div>
+
+            <p className="text-[10px] text-gray-600 leading-relaxed">
+              {t("editor.shift_undo_hint") || "Deshacer con Cmd/Ctrl+Z o el botón de deshacer."}
+            </p>
+          </div>
+        )}
+      </div>
 
       {/* ─── Lyrics list ──────────────────────────────────────────── */}
       <p className="text-[11px] text-gray-600 mb-2 px-1">

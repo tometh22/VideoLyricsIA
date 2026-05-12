@@ -13,23 +13,49 @@ max_length=...)`).
 llena DB / RAM. DoS trivial. Audit del 2026-05-11 encontró ~12 modelos
 sin límites. Ya fixeado pero el patrón se debe mantener.
 
-**Tamaños sugeridos**:
-| Tipo de campo | max_length |
-|---|---|
-| Identifiers (job_id, tenant_id) | 64 |
-| FPS / frame_size / profile codes | 4–16 |
-| Lang codes (es, en-US, …) | 16 |
-| Usernames / artist names | 200 |
-| Song titles | 300 |
-| Email (RFC 5321) | 320 |
-| Tokens / JWT | 500 |
-| Style prompts / concepts | 2000–4000 |
-| Free-form notes | 2048 |
-| JSON arbitrario (segments_json) | 5_000_000 (5 MB) |
+**Regla crítica**: si el campo se persiste a una columna `VARCHAR(N)`
+en `database.py`, **el `max_length` Pydantic NO puede ser mayor que
+`N`**. Sino Pydantic deja pasar el request, el INSERT explota con 500
+(en lugar de un 422 limpio). Detectamos esto post-deploy del PR #95
+cuando `username:str=Field(max_length=200)` fallaba contra
+`Column(String(100))`. Hotfix en PR #102 alineó todos.
+
+**Tamaños alineados con el DB schema actual** (`database.py:User, Job`, etc.):
+
+| Campo | DB column | max_length Pydantic |
+|---|---|---|
+| User.username | VARCHAR(100) | 100 |
+| User.email | VARCHAR(255) | 255 |
+| User.tenant_id | VARCHAR(100) | 100 |
+| Job.job_id | VARCHAR(12) | 12 |
+| Job.artist | VARCHAR(255) | 255 |
+| Job.song_title | VARCHAR(500) | 500 |
+| Job.style | VARCHAR(50) | 50 |
+| Job.filename | VARCHAR(500) | 500 |
+| Job.delivery_profile | VARCHAR(20) | 20 |
+| reset / verify_token | VARCHAR(255) | 255 |
+
+**Campos que NO van a VARCHAR** (libres dentro de razón):
+- bcrypt password: 200 max (bcrypt corta a 72 bytes internamente, el handler propaga el error)
+- Lang codes: 16
+- FPS / frame_size codes: 4–16
+- Free-form notes (a JSON column): 2048
+- Style prompts (JSON column): 2000–4000
+- segments_json (JSON column, audio timing): 5_000_000 (5 MB)
+
+**Cómo verificar antes de mergear**:
+```bash
+grep "Column(String" lyricgen/backend/database.py
+# Cruzar contra tu max_length para cada nuevo BaseModel/Form.
+# Si subís un max_length, mirá que la DB lo soporte; si bajás un
+# VARCHAR, mirá que ningún max_length Pydantic lo exceda.
+```
 
 ```python
 class MyRequest(BaseModel):
-    user_id: str = Field(..., max_length=64)
+    # Si username persiste a User.username = Column(String(100)):
+    username: str = Field(..., max_length=100)
+    # notes va a JSON column → no DB-bound
     notes: str = Field(default="", max_length=2048)
 ```
 

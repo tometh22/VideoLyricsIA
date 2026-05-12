@@ -34,6 +34,20 @@ from drive_oauth import (
 from database import UserDriveTokens  # noqa: E402
 
 
+@pytest.fixture(autouse=True)
+def _clean_drive_tokens_between_tests(db):
+    """Wipe user_drive_tokens before each test in this module.
+
+    Tests share a single admin user across the pytest session (post-PR
+    #109 the Drive endpoints are admin-only). Without this cleanup, a
+    UserDriveTokens row created in one test leaks into the next and
+    breaks assertions like "user starts with no Drive connection".
+    """
+    db.query(UserDriveTokens).delete()
+    db.commit()
+    yield
+
+
 # ─── Encryption ────────────────────────────────────────────────────
 
 def test_encrypt_decrypt_roundtrip():
@@ -106,8 +120,8 @@ def test_auth_url_requires_login(client):
     assert res.status_code == 401
 
 
-def test_auth_url_returns_google_url_with_state(client, user_token):
-    res = client.get("/drive/auth-url", headers={"Authorization": f"Bearer {user_token}"})
+def test_auth_url_returns_google_url_with_state(client, admin_token):
+    res = client.get("/drive/auth-url", headers={"Authorization": f"Bearer {admin_token}"})
     assert res.status_code == 200
     body = res.json()
     assert "auth_url" in body
@@ -120,16 +134,16 @@ def test_auth_url_returns_google_url_with_state(client, user_token):
 
 # ─── /drive/status endpoint ───────────────────────────────────────
 
-def test_status_no_connection(client, user_token):
+def test_status_no_connection(client, admin_token):
     """User que nunca conectó Drive → {connected: false}."""
-    res = client.get("/drive/status", headers={"Authorization": f"Bearer {user_token}"})
+    res = client.get("/drive/status", headers={"Authorization": f"Bearer {admin_token}"})
     assert res.status_code == 200
     assert res.json() == {"connected": False}
 
 
-def test_status_after_connection(client, user_token, db):
+def test_status_after_connection(client, admin_token, db):
     """Con una row en user_drive_tokens, status debe reflejarlo."""
-    me = client.get("/auth/me", headers={"Authorization": f"Bearer {user_token}"}).json()
+    me = client.get("/auth/me", headers={"Authorization": f"Bearer {admin_token}"}).json()
     row = UserDriveTokens(
         user_id=me["id"],
         encrypted_refresh_token=encrypt_token("test-refresh"),
@@ -139,7 +153,7 @@ def test_status_after_connection(client, user_token, db):
     db.add(row)
     db.commit()
 
-    res = client.get("/drive/status", headers={"Authorization": f"Bearer {user_token}"})
+    res = client.get("/drive/status", headers={"Authorization": f"Bearer {admin_token}"})
     assert res.status_code == 200
     data = res.json()
     assert data["connected"] is True
@@ -148,14 +162,14 @@ def test_status_after_connection(client, user_token, db):
 
 # ─── /drive/disconnect endpoint ───────────────────────────────────
 
-def test_disconnect_when_not_connected(client, user_token):
-    res = client.delete("/drive/disconnect", headers={"Authorization": f"Bearer {user_token}"})
+def test_disconnect_when_not_connected(client, admin_token):
+    res = client.delete("/drive/disconnect", headers={"Authorization": f"Bearer {admin_token}"})
     assert res.status_code == 200
     assert res.json() == {"ok": True, "was_connected": False}
 
 
-def test_disconnect_removes_row_and_revokes(client, user_token, db):
-    me = client.get("/auth/me", headers={"Authorization": f"Bearer {user_token}"}).json()
+def test_disconnect_removes_row_and_revokes(client, admin_token, db):
+    me = client.get("/auth/me", headers={"Authorization": f"Bearer {admin_token}"}).json()
     db.add(UserDriveTokens(
         user_id=me["id"],
         encrypted_refresh_token=encrypt_token("test-refresh-to-revoke"),
@@ -165,7 +179,7 @@ def test_disconnect_removes_row_and_revokes(client, user_token, db):
     db.commit()
 
     with patch("drive_oauth.revoke_refresh_token", return_value=True) as mock_revoke:
-        res = client.delete("/drive/disconnect", headers={"Authorization": f"Bearer {user_token}"})
+        res = client.delete("/drive/disconnect", headers={"Authorization": f"Bearer {admin_token}"})
 
     assert res.status_code == 200
     assert res.json() == {"ok": True, "was_connected": True}
@@ -200,10 +214,10 @@ def test_callback_with_user_rejection_redirects(client):
     assert "access_denied" in res.headers["location"]
 
 
-def test_callback_happy_path_saves_tokens(client, user_token, db):
+def test_callback_happy_path_saves_tokens(client, admin_token, db):
     """Mock Google exchange + userinfo, verificá que la row se crea
     con el refresh_token encriptado."""
-    me = client.get("/auth/me", headers={"Authorization": f"Bearer {user_token}"}).json()
+    me = client.get("/auth/me", headers={"Authorization": f"Bearer {admin_token}"}).json()
     state = build_state_token(me["id"])
 
     fake_tokens = {
@@ -235,10 +249,10 @@ def test_callback_happy_path_saves_tokens(client, user_token, db):
     assert decrypt_token(row.encrypted_refresh_token) == "1//06fake-refresh-token-from-google"
 
 
-def test_callback_overwrites_existing_connection(client, user_token, db):
+def test_callback_overwrites_existing_connection(client, admin_token, db):
     """Re-conectar Drive (user revocó en Google y volvió) debe
     sobreescribir la row existente, no crear duplicado."""
-    me = client.get("/auth/me", headers={"Authorization": f"Bearer {user_token}"}).json()
+    me = client.get("/auth/me", headers={"Authorization": f"Bearer {admin_token}"}).json()
 
     # Conexión inicial directa en DB (simula estado previo)
     db.add(UserDriveTokens(

@@ -682,32 +682,37 @@ async def health():
 # Auth endpoints (public)
 # ---------------------------------------------------------------------------
 
-# Pydantic max_length aplicado consistente a TODOS los inputs de
-# cliente — ver CONTRIBUTING.md para convenciones de tamaños.
-# Defensa contra DoS por payload size: sin esto un atacante manda
-# 100 MB de string en cualquier field.
+# Pydantic max_length DEBE ser <= al VARCHAR(N) de la columna en
+# database.py — sino el INSERT rompe con 500 antes de llegar al límite
+# de Pydantic. Ver database.py:User para los Column(String(N)) reales.
+#
+# Hoy: username/tenant_id = 100, email = 255, password (bcrypt 72 byte
+# max) = 72. password en el BaseModel admite hasta el límite bcrypt,
+# y el handler valida con bcrypt al hashear (más informativo que 422).
+#
+# Defensa contra DoS por payload size + alineación con DB schema.
 class LoginRequest(BaseModel):
-    username: str = Field(..., max_length=200)
-    password: str = Field(..., max_length=200)
+    username: str = Field(..., max_length=100)
+    password: str = Field(..., max_length=200)  # validado por bcrypt en handler
 
 
 class RegisterRequest(BaseModel):
-    username: str = Field(..., max_length=200)
+    username: str = Field(..., max_length=100)
     password: str = Field(..., max_length=200)
-    email: str = Field(default="", max_length=320)  # RFC 5321 max email length
+    email: str = Field(default="", max_length=255)  # DB column VARCHAR(255)
 
 
 class ForgotPasswordRequest(BaseModel):
-    email: str = Field(..., max_length=320)
+    email: str = Field(..., max_length=255)
 
 
 class ResetPasswordRequest(BaseModel):
-    token: str = Field(..., max_length=500)
+    token: str = Field(..., max_length=255)  # DB column VARCHAR(255)
     password: str = Field(..., max_length=200)
 
 
 class VerifyEmailRequest(BaseModel):
-    token: str = Field(..., max_length=500)
+    token: str = Field(..., max_length=255)
 
 
 class ChangePasswordRequest(BaseModel):
@@ -720,7 +725,7 @@ class DeleteAccountRequest(BaseModel):
 
 
 class CreateAPIKeyRequest(BaseModel):
-    name: str = Field(..., max_length=100)
+    name: str = Field(..., max_length=100)  # DB column VARCHAR(100)
 
 
 @app.post("/auth/login")
@@ -1984,11 +1989,11 @@ _PRESIGN_PUT_TTL_S = int(os.environ.get("PRESIGN_PUT_TTL_S", "900"))
 
 
 class _UploadUrlReq(BaseModel):
-    filename: str = Field(..., max_length=500)
+    filename: str = Field(..., max_length=500)       # DB Job.filename = VARCHAR(500)
     content_type: str = Field(default="", max_length=200)
     size_bytes: int = 0
-    artist: str = Field(default="", max_length=200)
-    title: str = Field(default="", max_length=300)
+    artist: str = Field(default="", max_length=255)  # DB Job.artist = VARCHAR(255)
+    title: str = Field(default="", max_length=500)   # DB Job.song_title = VARCHAR(500)
 
 
 def _validate_audio_filename_only(filename: str) -> None:
@@ -2115,7 +2120,7 @@ def _input_object_key_for_job(tenant_id: str, job_id: str, filename: str) -> str
 
 
 class _MultipartInitReq(BaseModel):
-    job_id: str = Field(..., max_length=64)
+    job_id: str = Field(..., max_length=12)            # DB Job.job_id = VARCHAR(12)
     filename: str = Field(..., max_length=500)
     content_type: str = Field(default="", max_length=200)
 
@@ -2182,7 +2187,7 @@ async def upload_multipart_init(
 
 
 class _MultipartPartReq(BaseModel):
-    job_id: str = Field(..., max_length=64)
+    job_id: str = Field(..., max_length=12)            # DB Job.job_id = VARCHAR(12)
     part_number: int
 
 
@@ -2298,7 +2303,7 @@ async def upload_file_proxy(
 
 
 class _MultipartCompleteReq(BaseModel):
-    job_id: str = Field(..., max_length=64)
+    job_id: str = Field(..., max_length=12)            # DB Job.job_id = VARCHAR(12)
     parts: list = Field(..., max_length=10000)  # R2 max 10k parts per upload
 
 
@@ -2350,7 +2355,7 @@ async def upload_multipart_complete(
 
 
 class _MultipartAbortReq(BaseModel):
-    job_id: str = Field(..., max_length=64)
+    job_id: str = Field(..., max_length=12)            # DB Job.job_id = VARCHAR(12)
 
 
 @app.post("/upload-multipart-abort")
@@ -2378,10 +2383,10 @@ async def upload_multipart_abort(
 
 
 class _TranscribeUploadedReq(BaseModel):
-    job_id: str = Field(..., max_length=64)
+    job_id: str = Field(..., max_length=12)
     language: str = Field(default="", max_length=16)
-    artist: str = Field(default="", max_length=200)
-    title: str = Field(default="", max_length=300)
+    artist: str = Field(default="", max_length=255)    # DB Job.artist = VARCHAR(255)
+    title: str = Field(default="", max_length=500)     # DB Job.song_title = VARCHAR(500)
 
 
 @app.post("/transcribe-uploaded")
@@ -2496,11 +2501,12 @@ async def upload(
     request: Request,
     response: Response,
     file: UploadFile = File(...),
-    artist: str = Form(..., max_length=200),
-    song_title: str = Form("", max_length=300),
-    style: str = Form("oscuro", max_length=100),
+    # Alineados con database.py:Job columns:
+    artist: str = Form(..., max_length=255),         # Job.artist = VARCHAR(255)
+    song_title: str = Form("", max_length=500),      # Job.song_title = VARCHAR(500)
+    style: str = Form("oscuro", max_length=50),      # Job.style = VARCHAR(50)
     language: str = Form("", max_length=16),
-    delivery_profile: str = Form("youtube", max_length=16),
+    delivery_profile: str = Form("youtube", max_length=20),  # Job.delivery_profile = VARCHAR(20)
     umg_frame_size: str = Form("", max_length=16),
     umg_fps: str = Form("", max_length=16),
     umg_prores_profile: str = Form("", max_length=4),
@@ -2681,8 +2687,8 @@ async def transcribe_endpoint(
     response: Response,
     file: UploadFile = File(...),
     language: str = Form("", max_length=16),
-    artist: str = Form("", max_length=200),
-    title: str = Form("", max_length=300),
+    artist: str = Form("", max_length=255),     # Job.artist = VARCHAR(255)
+    title: str = Form("", max_length=500),      # Job.song_title = VARCHAR(500)
     current_user: dict = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
@@ -3248,16 +3254,16 @@ async def _run_transcription_for_job(
 async def generate_with_segments(
     request: Request,
     file: UploadFile = File(None),
-    job_id: str = Form("", max_length=64),
-    artist: str = Form("", max_length=200),
-    song_title: str = Form("", max_length=300),
-    style: str = Form("oscuro", max_length=100),
+    job_id: str = Form("", max_length=12),       # Job.job_id = VARCHAR(12)
+    artist: str = Form("", max_length=255),      # Job.artist = VARCHAR(255)
+    song_title: str = Form("", max_length=500),  # Job.song_title = VARCHAR(500)
+    style: str = Form("oscuro", max_length=50),  # Job.style = VARCHAR(50)
     language: str = Form("", max_length=16),
     # segments_json es el payload del frontend con timing de cada lyric;
     # un video largo puede pesar varios cientos de KB. 5 MB es techo
     # generoso que rechaza payload absurdo sin restringir casos reales.
     segments_json: str = Form(..., max_length=5_000_000),
-    delivery_profile: str = Form("youtube", max_length=16),
+    delivery_profile: str = Form("youtube", max_length=20),  # Job.delivery_profile = VARCHAR(20)
     umg_frame_size: str = Form("", max_length=16),
     umg_fps: str = Form("", max_length=16),
     umg_prores_profile: str = Form("", max_length=4),
@@ -4287,13 +4293,16 @@ class ApproveJobRequest(BaseModel):
 
 
 class EditJobRequest(BaseModel):
-    # "typography" | "background" | "lyrics"
+    # edit_type values:
     #  - typography: re-render with new font/size/case/motion settings
     #  - background: regenerate Veo, keep persisted segments
     #  - lyrics:     re-render with caller-supplied segments. Background
     #                reuses bg_r2_key_cached (no Veo cost). Use case:
     #                fix a typo/timing/word in a pending_review or done
     #                video without re-uploading the MP3.
+    # Los campos posteriores NO se persisten a columnas VARCHAR — viajan
+    # dentro de Job.render_params (JSON column). Los max_length acá son
+    # límites del payload del cliente para evitar JSON gigante.
     edit_type: str = Field(..., max_length=32)
     font: str | None = Field(default=None, max_length=64)
     font_scale: float | None = None
@@ -4429,7 +4438,6 @@ async def request_edit(
     )
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
-
     valid_edit_types = ("typography", "background", "lyrics")
     if body.edit_type not in valid_edit_types:
         raise HTTPException(
@@ -4792,9 +4800,19 @@ async def get_drive_transfer(
 # ---------------------------------------------------------------------------
 
 
+class RetryJobRequest(BaseModel):
+    """Optional body for POST /retry. All fields are overrides — when
+    omitted, the existing values on the job row are kept. Today we only
+    support overriding frame_size (UMG accepts HD/2K/UHD-4K/DCI-4K) so
+    operators can downgrade a 4K render that OOMed the worker to HD on
+    retry, without re-uploading the audio."""
+    frame_size: str | None = Field(default=None, max_length=16)
+
+
 @app.post("/retry/{job_id}")
 async def retry_job(
     job_id: str,
+    body: RetryJobRequest | None = None,
     current_user: dict = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
@@ -4802,7 +4820,14 @@ async def retry_job(
     in R2. Avoids forcing the user to re-upload a 30-50 MB WAV. Only allowed
     when the job is in an unrecoverable terminal state (error or
     validation_failed) and the source audio is still available in object
-    storage (input_r2_key is set and the object exists)."""
+    storage (input_r2_key is set and the object exists).
+
+    Body (all optional):
+      frame_size: "HD" | "UHD-4K" | "DCI-4K" | "DCI-2K" — override the
+        job's stored umg_spec.frame_size. Used by the JobDetail Retry
+        button's HD/2K/4K selector so the user can downgrade a 4K render
+        that OOMed to HD without re-uploading.
+    """
     from database import Job as JobModel, AuditLog
 
     job = (
@@ -4824,6 +4849,21 @@ async def retry_job(
             status_code=422,
             detail="Source audio no longer available — please upload the file again.",
         )
+
+    # Apply optional frame_size override BEFORE we capture umg_spec for
+    # the enqueue below. Validates against the same allow-list the
+    # upload endpoint enforces.
+    if body and body.frame_size is not None:
+        allowed_frame_sizes = ("HD", "DCI-2K", "UHD-4K", "DCI-4K")
+        if body.frame_size not in allowed_frame_sizes:
+            raise HTTPException(
+                status_code=400,
+                detail=f"frame_size must be one of {allowed_frame_sizes}",
+            )
+        if job.umg_spec:
+            new_spec = dict(job.umg_spec)
+            new_spec["frame_size"] = body.frame_size
+            job.umg_spec = new_spec
 
     # Capturar status PREVIO antes de mutar. Sin esto el AuditLog
     # registraba siempre "processing" como previous_status (la línea de
