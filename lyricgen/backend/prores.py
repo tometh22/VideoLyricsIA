@@ -158,9 +158,30 @@ def ensure_prores_exists(
                     file_path, tenant_id, job_id, FILE_MAP_PRORES[file_type],
                 )
                 if key:
-                    keys = dict(job.get("s3_keys") or {})
-                    keys[file_type] = key
-                    update_job(job_id, s3_keys=keys)
+                    # Re-read s3_keys FRESH from the DB before merging.
+                    # The `job` dict was snapshot in prewarm_prores BEFORE
+                    # the 60-300 s transcode; if the OTHER ProRes prewarm
+                    # (umg_master vs umg_short — both are enqueued together
+                    # in main.py:enable_prores_for_job) finished while ours
+                    # was running, it already wrote its key to s3_keys.
+                    # Using the stale snapshot here would overwrite that
+                    # key — the file stays in R2 but the row reports it as
+                    # missing, and the app shows "Generando ProRes..."
+                    # forever. Confirmed in prod 2026-05-12: 8 of 18 done-
+                    # UMG jobs had a phantom-missing key (reconciled in a
+                    # one-off SQL script).
+                    from jobs import get_job_model
+                    from database import SessionLocal
+                    _db = SessionLocal()
+                    try:
+                        _fresh = get_job_model(_db, job_id)
+                        current_keys = dict(
+                            (_fresh.s3_keys if _fresh else None) or {}
+                        )
+                    finally:
+                        _db.close()
+                    current_keys[file_type] = key
+                    update_job(job_id, s3_keys=current_keys)
         except Exception as e:  # pragma: no cover
             logger.warning("[PRORES] R2 upload skipped: %s", e)
 
