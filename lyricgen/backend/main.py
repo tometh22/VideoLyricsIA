@@ -4312,6 +4312,13 @@ class EditJobRequest(BaseModel):
     # Required when edit_type=="lyrics". Each segment must have start
     # (s), end (s), text (str). Anything else is ignored.
     segments: list[dict] | None = Field(default=None)
+    # Optional free-form hint for edit_type=="background". The operator
+    # types what they want the new background to convey ("paisaje cálido
+    # al atardecer", "abstracto con ondas de luz suave", etc.) and the
+    # pipeline forwards it to Gemini's system prompt as an explicit
+    # operator override. Max 300 chars to keep Gemini input cheap and
+    # bounded; longer hints rarely add signal and inflate prompt cost.
+    background_hint: str | None = Field(default=None, max_length=300)
 
 
 class EnableProResRequest(BaseModel):
@@ -4536,6 +4543,12 @@ async def request_edit(
             {"start": float(s["start"]), "end": float(s["end"]), "text": str(s["text"])}
             for s in body.segments
         ]
+    if body.edit_type == "background" and body.background_hint and body.background_hint.strip():
+        # Operator's free-form description of what they want the new
+        # background to convey. Forwarded to Gemini's user_content as a
+        # high-priority override block so it pisa los defaults that
+        # produced the rejected background.
+        edit_params["background_hint"] = body.background_hint.strip()
 
     new_edit_count = current_edit_count + 1
 
