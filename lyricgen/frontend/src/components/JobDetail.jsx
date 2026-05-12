@@ -603,6 +603,10 @@ export default function JobDetail({ job, onBack, onJobUpdate }) {
   // decidir si mostrar el botón "Guardar en Drive". El status también
   // se polea cada N min por si el user se desconectó en otra tab.
   // No bloqueamos el render del job — el botón aparece cuando llega.
+  //
+  // Canary mode: features.drive_export gatea TODO el flow Drive.
+  // Sin el flag no peguemos a /drive/status (evita 403 noise en logs).
+  const driveFeatureEnabled = user?.features?.drive_export === true;
   const [driveConnected, setDriveConnected] = useState(false);
   const [showDriveModal, setShowDriveModal] = useState(false);
   // file_type a transferir cuando el user abre el modal: por default el
@@ -610,6 +614,7 @@ export default function JobDetail({ job, onBack, onJobUpdate }) {
   const driveFileType = isUmgJob ? "umg_master" : "video";
   useEffect(() => {
     if (!isJobDone) return;
+    if (!driveFeatureEnabled) return;
     let cancelled = false;
     (async () => {
       try {
@@ -624,7 +629,7 @@ export default function JobDetail({ job, onBack, onJobUpdate }) {
       }
     })();
     return () => { cancelled = true; };
-  }, [isJobDone, job.job_id]);
+  }, [isJobDone, job.job_id, driveFeatureEnabled]);
   // Short ProRes follows the same opt-in: any UMG-flavoured job gets a
   // separate vertical-format master alongside the main one. Generated
   // lazily by /download/{id}/umg_short the first time it's clicked.
@@ -1029,7 +1034,7 @@ export default function JobDetail({ job, onBack, onJobUpdate }) {
           es ~30x más rápido que descargar+subir desde casa para ProRes
           de 16 GB. Si el user no tiene Drive conectado, en Settings está
           el botón Conectar. */}
-      {isJobDone && driveConnected && (
+      {isJobDone && driveFeatureEnabled && driveConnected && (
         <div className="rounded-card bg-surface-2/40 ring-1 ring-white/[0.04] p-5 mb-4 flex items-start gap-4">
           <div className="w-10 h-10 shrink-0 rounded-xl bg-accent/10 ring-1 ring-accent/30 flex items-center justify-center text-accent">
             <svg className="w-5 h-5" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
