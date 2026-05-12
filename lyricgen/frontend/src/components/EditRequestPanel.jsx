@@ -86,6 +86,11 @@ export default function EditRequestPanel({
   // edits go through Sync Mode in the dedicated LyricsEditor — kept
   // out of this panel to avoid duplicating that complexity here.
   const [lyricsDraft, setLyricsDraft] = useState([]);
+  // Operator-typed background hint for edit_type="background". Empty
+  // string when the operator hasn't typed anything (we send no field in
+  // that case and the pipeline falls back to Gemini's lyrics-only
+  // analysis with the debiased system prompt + 3 contrastive examples).
+  const [backgroundHint, setBackgroundHint] = useState("");
   const [form, setForm] = useState({
     font:             initialParams.font             ?? "",
     font_scale:       initialParams.font_scale       ?? 1.0,
@@ -162,7 +167,10 @@ export default function EditRequestPanel({
   // treats missing fields as "keep the prior value".
   const buildPayload = (type) => {
     if (type === "background") {
-      return { edit_type: "background" };
+      const p = { edit_type: "background" };
+      const hint = (backgroundHint || "").trim();
+      if (hint) p.background_hint = hint;
+      return p;
     }
     if (type === "lyrics") {
       return {
@@ -676,6 +684,30 @@ export default function EditRequestPanel({
             <p className="text-[11px] text-ink-secondary leading-relaxed">
               {t("edit.background_confirm_desc") || "Genera un fondo nuevo con Veo manteniendo las lyrics y los tiempos. Cuesta ~US$0.90 (Veo) y tarda ~10-15 min. La tipografía actual se mantiene."}
             </p>
+          </div>
+
+          <div>
+            <label className="block text-[11px] text-ink-secondary mb-1.5 tracking-wide">
+              {t("edit.background_hint_label") || "¿Querés aclarar qué tipo de fondo? (opcional)"}
+            </label>
+            <textarea
+              value={backgroundHint}
+              onChange={(e) => setBackgroundHint(e.target.value.slice(0, 300))}
+              placeholder={t("edit.background_hint_placeholder") ||
+                "ej: 'paisaje romántico al atardecer con tonos cálidos' · 'abstracto con ondas de luz suave' · 'interior cálido tipo café íntimo'"}
+              rows={3}
+              disabled={submitting}
+              className="w-full text-xs px-3 py-2 rounded-md bg-surface-3/40 ring-1 ring-white/[0.06] focus:ring-brand/40 focus:outline-none resize-none text-white placeholder:text-ink-tertiary disabled:opacity-50"
+            />
+            <div className="flex items-center justify-between mt-1">
+              <p className="text-[10px] text-ink-tertiary">
+                {t("edit.background_hint_help") ||
+                  "Sirve cuando los fondos anteriores no captaron el tono. Dejá vacío para que el sistema decida."}
+              </p>
+              <p className="text-[10px] text-ink-tertiary font-mono tabular-nums">
+                {backgroundHint.length}/300
+              </p>
+            </div>
           </div>
 
           {error && (
