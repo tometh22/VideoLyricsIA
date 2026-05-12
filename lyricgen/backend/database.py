@@ -373,6 +373,14 @@ class Job(Base):
             "review_notes": self.review_notes,
             "edit_count": self.edit_count or 0,
             "render_params": self.render_params,
+            # EditRequestPanel needs both to drive its UI: segments_json hydrates
+            # the inline lyrics editor; bg_r2_key_cached gates the typography
+            # mode (you can only re-render typography on top of a cached bg).
+            # Without these, the panel falsely tells the user the job has no
+            # lyrics and lets them attempt typography edits that the backend
+            # then rejects with a raw English error.
+            "segments_json": self.segments_json,
+            "bg_r2_key_cached": self.bg_r2_key_cached,
             "created_at": self.created_at.timestamp() if self.created_at else None,
             "completed_at": self.completed_at.timestamp() if self.completed_at else None,
         }
