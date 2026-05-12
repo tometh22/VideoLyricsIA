@@ -24,6 +24,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     fonts-liberation \
     ca-certificates \
     curl \
+    unzip \
     && rm -rf /var/lib/apt/lists/* \
     && curl -fsSL https://rclone.org/install.sh | bash \
     && rclone version
