@@ -75,7 +75,7 @@ from database import (
 from jobs import bulk_delete_jobs, create_job, delete_job, get_job, get_all_jobs, update_job
 from observability import init_sentry, init_logging, health_snapshot
 from pipeline import run_pipeline, transcribe
-from queue_jobs import enqueue_pipeline, enqueue_edit, queue_depth, enqueue_prores_prewarm
+from queue_jobs import enqueue_pipeline, enqueue_edit, queue_depth, enqueue_prores_prewarm, enqueue_drive_delivery
 from render_spec import umg_catalog, validate_umg_config
 from billing import router as billing_router
 from admin import router as admin_router
@@ -4272,12 +4272,22 @@ class ApproveJobRequest(BaseModel):
 
 
 class EditJobRequest(BaseModel):
-    edit_type: str = Field(..., max_length=32)  # "typography" | "background"
+    # "typography" | "background" | "lyrics"
+    #  - typography: re-render with new font/size/case/motion settings
+    #  - background: regenerate Veo, keep persisted segments
+    #  - lyrics:     re-render with caller-supplied segments. Background
+    #                reuses bg_r2_key_cached (no Veo cost). Use case:
+    #                fix a typo/timing/word in a pending_review or done
+    #                video without re-uploading the MP3.
+    edit_type: str = Field(..., max_length=32)
     font: str | None = Field(default=None, max_length=64)
     font_scale: float | None = None
     text_case: str | None = Field(default=None, max_length=16)
     lyric_transition: str | None = Field(default=None, max_length=16)
     text_motion: str | None = Field(default=None, max_length=16)
+    # Required when edit_type=="lyrics". Each segment must have start
+    # (s), end (s), text (str). Anything else is ignored.
+    segments: list[dict] | None = Field(default=None)
 
 
 class EnableProResRequest(BaseModel):
@@ -4287,6 +4297,11 @@ class EnableProResRequest(BaseModel):
     umg_frame_size: str = Field(..., max_length=16)      # "HD" | "UHD-4K" | "DCI-4K" | "DCI-2K"
     umg_fps: str = Field(..., max_length=16)             # "23.976"...".60"
     umg_prores_profile: str = Field(..., max_length=4)   # "3" (422 HQ) | "4" (4444) | "5" (4444 XQ)
+
+
+class DeliverToDriveRequest(BaseModel):
+    """Body para POST /jobs/{job_id}/deliver-to-drive."""
+    file_type: str = Field(..., max_length=20)  # "umg_master" | "umg_short" | "video" | "short"
 
 
 @app.post("/approve/{job_id}")
@@ -4399,7 +4414,31 @@ async def request_edit(
     )
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
-    if job.status != "pending_review":
+
+    valid_edit_types = ("typography", "background", "lyrics")
+    if body.edit_type not in valid_edit_types:
+        raise HTTPException(
+            status_code=400,
+            detail=f"edit_type must be one of {valid_edit_types}",
+        )
+
+    # Status gate. Lyrics edit accepts a wider set of terminal-ish states
+    # so users can fix typos/timing on videos that already finished
+    # rendering (done, in approval queue, or even rejected) without
+    # having to re-upload the MP3. typography/background stay strict —
+    # they're billed as "edits in the review loop" and only make sense
+    # while the reviewer is still deciding.
+    if body.edit_type == "lyrics":
+        allowed = ("done", "pending_review", "rejected")
+        if job.status not in allowed:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"Lyrics edit requires the job to be done, pending_review, "
+                    f"or rejected (current: {job.status})"
+                ),
+            )
+    elif job.status != "pending_review":
         raise HTTPException(
             status_code=400,
             detail=f"Job must be in pending_review to request edits (current: {job.status})",
@@ -4412,23 +4451,45 @@ async def request_edit(
             detail=f"Maximum edit limit ({_MAX_EDITS}) reached. Please approve or reject.",
         )
 
-    valid_edit_types = ("typography", "background")
-    if body.edit_type not in valid_edit_types:
-        raise HTTPException(
-            status_code=400,
-            detail=f"edit_type must be one of {valid_edit_types}",
-        )
-
-    if body.edit_type == "typography" and not job.bg_r2_key_cached:
+    # Both typography and lyrics reuse the cached background. Without
+    # bg_r2_key_cached set, the worker can't avoid re-running Veo —
+    # which defeats the point of these fast-path edits.
+    if body.edit_type in ("typography", "lyrics") and not job.bg_r2_key_cached:
         raise HTTPException(
             status_code=400,
             detail=(
-                "No cached background available for this job. "
+                f"No cached background available for {body.edit_type} edit. "
                 "Use edit_type='background' to regenerate it."
             ),
         )
 
-    if not job.segments_json:
+    # Lyrics edit specifically needs the new segments array on the body.
+    # typography/background still need segments_json on the row.
+    if body.edit_type == "lyrics":
+        if not body.segments or len(body.segments) == 0:
+            raise HTTPException(
+                status_code=400,
+                detail="Lyrics edit requires 'segments' in the request body (non-empty list).",
+            )
+        # Validate shape: every segment must have start, end, text.
+        for i, seg in enumerate(body.segments):
+            if not isinstance(seg, dict):
+                raise HTTPException(status_code=400, detail=f"segments[{i}] must be an object")
+            for k in ("start", "end", "text"):
+                if k not in seg:
+                    raise HTTPException(status_code=400, detail=f"segments[{i}] missing '{k}'")
+            try:
+                if float(seg["start"]) < 0 or float(seg["end"]) <= float(seg["start"]):
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"segments[{i}] has invalid timing (start={seg['start']}, end={seg['end']})",
+                    )
+            except (TypeError, ValueError):
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"segments[{i}] start/end must be numbers",
+                )
+    elif not job.segments_json:
         raise HTTPException(
             status_code=400,
             detail="Job has no persisted transcription. Cannot re-render.",
@@ -4445,13 +4506,23 @@ async def request_edit(
         edit_params["lyric_transition"] = body.lyric_transition
     if body.text_motion is not None:
         edit_params["text_motion"] = body.text_motion
+    if body.edit_type == "lyrics":
+        # Normalize to just the fields the pipeline needs — strip
+        # anything else the client may have sent (_id, etc.).
+        edit_params["segments"] = [
+            {"start": float(s["start"]), "end": float(s["end"]), "text": str(s["text"])}
+            for s in body.segments
+        ]
 
     new_edit_count = current_edit_count + 1
 
     # Flip to editing immediately so the UI can show progress.
     job.status = "editing"
     job.edit_count = new_edit_count
-    job.current_step = "video" if body.edit_type == "typography" else "background"
+    # Both typography and lyrics edits jump straight into the video
+    # compositing step (cached bg reused). Only background edit goes
+    # back through Veo, which is the `background` step.
+    job.current_step = "background" if body.edit_type == "background" else "video"
     job.progress = 0
     db.add(AuditLog(
         user_id=current_user["id"],
@@ -4565,6 +4636,143 @@ async def enable_prores_for_job(
     }
 
 
+# ---------------------------------------------------------------------------
+# Drive delivery — botón "Guardar en Drive"
+# ---------------------------------------------------------------------------
+
+@app.post("/jobs/{job_id}/deliver-to-drive")
+async def deliver_to_drive(
+    job_id: str,
+    body: DeliverToDriveRequest,
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Encola una transferencia R2 → Google Drive del user. Devuelve un
+    transfer_id que el frontend usa para polear progress vía
+    GET /drive/transfers/{transfer_id}.
+
+    Requiere que el user haya conectado Drive previamente
+    (GET /drive/status devuelve connected=true). Si no, 412.
+
+    Filename en Drive: '<job_id>__<filename>' para evitar colisiones
+    cuando varios jobs tienen el mismo umg_master.mov.
+    """
+    import uuid
+    from database import Job as JobModel, DriveTransfer, UserDriveTokens
+    from drive_uploader import FILE_TYPE_TO_DRIVE_NAME
+
+    if body.file_type not in FILE_TYPE_TO_DRIVE_NAME:
+        raise HTTPException(
+            status_code=400,
+            detail=f"file_type debe ser uno de {list(FILE_TYPE_TO_DRIVE_NAME)}",
+        )
+
+    # Verificar que el user tiene Drive conectado
+    drive_tokens = db.query(UserDriveTokens).filter(
+        UserDriveTokens.user_id == current_user["id"]
+    ).first()
+    if drive_tokens is None:
+        raise HTTPException(
+            status_code=412,
+            detail="Drive no está conectado. Conectalo en Settings antes de exportar.",
+        )
+
+    # Verificar que el job existe + es del tenant del user + está done
+    job = (
+        db.query(JobModel)
+        .filter(JobModel.job_id == job_id)
+        .filter(JobModel.tenant_id == current_user["tenant_id"])
+        .first()
+    )
+    if job is None:
+        raise HTTPException(status_code=404, detail="Job not found")
+    if job.status != "done":
+        raise HTTPException(
+            status_code=400,
+            detail=f"Job debe estar done para exportar a Drive (actual: {job.status})",
+        )
+
+    # Para umg_master / umg_short, el job debe tener umg_spec persistido
+    # (sino no existe el archivo). Para video / short, siempre existe
+    # post-done.
+    if body.file_type in ("umg_master", "umg_short") and not job.umg_spec:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Este job no tiene ProRes generado. Pegale a /enable-prores "
+                "primero o seleccioná file_type=video/short."
+            ),
+        )
+
+    transfer = DriveTransfer(
+        id=uuid.uuid4().hex[:32],
+        user_id=current_user["id"],
+        job_id=job_id,
+        file_type=body.file_type,
+        status="queued",
+        progress_pct=0,
+    )
+    db.add(transfer)
+    db.commit()
+
+    try:
+        enqueue_drive_delivery(transfer.id, plan=current_user.get("plan", "100"))
+    except Exception as e:
+        # Si Redis cae, dejamos la row queued con error visible.
+        transfer.status = "error"
+        transfer.error = f"No se pudo encolar el job: {e}"
+        db.commit()
+        raise HTTPException(
+            status_code=503,
+            detail="No se pudo encolar la transferencia. Reintentá en unos segundos.",
+        )
+
+    return {
+        "ok": True,
+        "transfer_id": transfer.id,
+        "status": "queued",
+        "poll_url": f"/drive/transfers/{transfer.id}",
+    }
+
+
+@app.get("/drive/transfers/{transfer_id}")
+async def get_drive_transfer(
+    transfer_id: str,
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Status actual de una transferencia. Frontend polea esto cada 3s
+    mientras el modal de transferencia está abierto."""
+    from database import DriveTransfer
+
+    transfer = (
+        db.query(DriveTransfer)
+        .filter(DriveTransfer.id == transfer_id)
+        .filter(DriveTransfer.user_id == current_user["id"])
+        .first()
+    )
+    if transfer is None:
+        raise HTTPException(status_code=404, detail="Transfer not found")
+
+    return {
+        "id": transfer.id,
+        "job_id": transfer.job_id,
+        "file_type": transfer.file_type,
+        "status": transfer.status,
+        "progress_pct": transfer.progress_pct or 0,
+        "bytes_transferred": transfer.bytes_transferred or 0,
+        "bytes_total": transfer.bytes_total or 0,
+        "drive_file_id": transfer.drive_file_id,
+        "web_view_link": transfer.web_view_link,
+        "error": transfer.error,
+        "created_at": transfer.created_at.isoformat() if transfer.created_at else None,
+        "completed_at": transfer.completed_at.isoformat() if transfer.completed_at else None,
+    }
+
+
+# ---------------------------------------------------------------------------
+
+
 @app.post("/retry/{job_id}")
 async def retry_job(
     job_id: str,
@@ -4635,6 +4843,14 @@ async def retry_job(
     db.commit()
 
     umg_spec = job.umg_spec or {}
+    # Preserve the user's lyric edits across retries. Without this, the
+    # pipeline re-ran Whisper from scratch on every retry and silently
+    # blew away any manual corrections the user had made in the wizard.
+    # The pipeline ALSO falls back to job.segments_json if we don't
+    # pass segments_override (belt-and-suspenders), but passing it
+    # explicitly here makes the intent visible at the call site and
+    # keeps the retry path symmetrical with the /generate path.
+    segments_override = job.segments_json if job.segments_json else None
     enqueue_pipeline(
         job_id=job_id,
         mp3_path=None,
@@ -4645,9 +4861,15 @@ async def retry_job(
         input_r2_key=job.input_r2_key,
         song_title=job.song_title or "",
         umg_spec=umg_spec,
+        segments_override=segments_override,
     )
 
-    return {"ok": True, "status": "processing", "job_id": job_id}
+    return {
+        "ok": True,
+        "status": "processing",
+        "job_id": job_id,
+        "preserved_lyrics": segments_override is not None,
+    }
 
 
 # ---------------------------------------------------------------------------

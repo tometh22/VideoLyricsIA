@@ -1,6 +1,7 @@
 import { useState, useEffect } from "react";
 import { useI18n } from "../i18n";
 import { startReplaySession } from "./OnboardingTour";
+import DriveConnectButton from "./DriveConnectButton";
 
 const API = import.meta.env.VITE_API_URL || "";
 
@@ -439,9 +440,10 @@ export default function Settings({ onBack }) {
       {/* ─── Tabs ─────────────────────────────────────────────────── */}
       <div className="flex flex-wrap gap-2 mb-6">
         {[
-          { id: "cuenta",      label: t("settings.account") || "Cuenta" },
-          { id: "facturacion", label: t("settings.billing") || "Facturación" },
-          { id: "youtube",     label: "YouTube" },
+          { id: "cuenta",         label: t("settings.account") || "Cuenta" },
+          { id: "facturacion",    label: t("settings.billing") || "Facturación" },
+          { id: "integraciones",  label: t("settings.integrations_tab") || "Integraciones" },
+          { id: "youtube",        label: "YouTube" },
         ].map((s) => (
           <TabPill key={s.id} active={activeSection === s.id} onClick={() => setActiveSection(s.id)}>
             {s.label}
@@ -873,6 +875,20 @@ export default function Settings({ onBack }) {
                   ))}
                 </div>
               )}
+            </Card>
+          </>
+        )}
+
+        {/* ════════════════════ INTEGRACIONES ════════════════════ */}
+        {activeSection === "integraciones" && (
+          <>
+            <Card>
+              <SectionLabel>{t("settings.integrations_drive_label") || "Google Drive"}</SectionLabel>
+              <p className="text-xs text-ink-secondary mb-3">
+                {t("settings.integrations_drive_help") ||
+                  "Conectá Google Drive para subir los ProRes desde la app sin pasar por tu máquina. Para archivos grandes (16 GB) es ~30x más rápido que descargar y resubir."}
+              </p>
+              <DriveConnectButton />
             </Card>
           </>
         )}
