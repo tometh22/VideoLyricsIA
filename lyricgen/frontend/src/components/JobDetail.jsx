@@ -172,6 +172,16 @@ export default function JobDetail({ job, onBack, onJobUpdate }) {
   const [reviewNotes, setReviewNotes] = useState("");
   const [approving, setApproving] = useState(false);
   const [retrying, setRetrying] = useState(false);
+  // Dropdown for HD/2K/4K selection on retry. Only shown when the job
+  // has a meaningful umg_spec to override (i.e. went through the UMG
+  // pipeline). YouTube-only jobs hide this — they don't have a frame
+  // size concept the user can pick.
+  const [retryFrameSize, setRetryFrameSize] = useState(
+    job.umg_spec?.frame_size || null
+  );
+  const showRetrySpecSelector =
+    (job.delivery_profile === "umg" || job.delivery_profile === "both") &&
+    job.umg_spec != null;
 
   // handleRetry MUST estar definida antes del early-return que la usa
   // (línea ~311 para jobs con status=error). Si se la pone más abajo
@@ -180,14 +190,23 @@ export default function JobDetail({ job, onBack, onJobUpdate }) {
   // 'handleRetry' before initialization" → GlobalErrorBoundary catch
   // → app entera crashea. Lo aprendimos cuando un job en error rompió
   // toda la dashboard de un cliente.
-  const handleRetry = async () => {
+  const handleRetry = async (overrideFrameSize) => {
     if (retrying) return;
     setRetrying(true);
     try {
-      const res = await fetch(`${API}/retry/${job.job_id}`, {
+      // If the caller (or the dropdown) gave us a frame_size that
+      // differs from what's currently on the job, pass it in the body.
+      // Otherwise call /retry plain — backend keeps the existing spec.
+      const fs = overrideFrameSize ?? retryFrameSize;
+      const wantOverride = fs && fs !== job.umg_spec?.frame_size;
+      const fetchOpts = {
         method: "POST",
-        headers: authHeaders(),
-      });
+        headers: { ...authHeaders(), "Content-Type": "application/json" },
+      };
+      if (wantOverride) {
+        fetchOpts.body = JSON.stringify({ frame_size: fs });
+      }
+      const res = await fetch(`${API}/retry/${job.job_id}`, fetchOpts);
       if (res.ok) {
         const updated = await (await fetch(`${API}/status/${job.job_id}`, { headers: authHeaders() })).json();
         onJobUpdate?.(updated);
@@ -219,9 +238,22 @@ export default function JobDetail({ job, onBack, onJobUpdate }) {
   const canPreview = job.status === "done" || job.status === "pending_review";
   const canDownload = job.status === "done";
   const isPendingReview = job.status === "pending_review";
+  const isDone = job.status === "done";
+  const isRejected = job.status === "rejected";
   const isEditing = job.status === "editing";
   const isValidationFailed = job.status === "validation_failed";
   const isError = job.status === "error";
+  // Lyrics edit is allowed on done/pending_review/rejected per backend
+  // validation (main.py:/edit). The panel renders for ANY of those
+  // statuses with allowedModes scoped per state:
+  //   - pending_review → all three (operator is reviewing, full toolkit)
+  //   - done           → lyrics only (video already accepted, only typo
+  //                                    corrections warrant re-render)
+  //   - rejected       → lyrics only (recovery path instead of re-upload)
+  const canEditLyrics = isPendingReview || isDone || isRejected;
+  const editPanelAllowedModes = isPendingReview
+    ? ["typography", "lyrics", "background"]
+    : ["lyrics"];
 
   // While the worker is re-rendering an edit request, poll /status every
   // 5s and propagate updates up so the rest of the screen (status badge,
@@ -337,9 +369,34 @@ export default function JobDetail({ job, onBack, onJobUpdate }) {
         <div className="rounded-card bg-red-500/[0.06] ring-1 ring-red-500/20 px-5 py-5">
           <p className="text-sm font-semibold text-red-300 mb-1">{t("detail.error_title") || "El video falló durante la generación"}</p>
           <p className="text-xs text-red-400/70 mb-4">{job.error || t("detail.error_unknown") || "Error desconocido"}</p>
+
+          {showRetrySpecSelector && (
+            <div className="mb-3">
+              <label className="text-[11px] text-gray-400 uppercase tracking-wider block mb-1.5">
+                {t("detail.retry_spec_label") || "Resolución al reintentar"}
+              </label>
+              <select
+                value={retryFrameSize || "HD"}
+                onChange={(e) => setRetryFrameSize(e.target.value)}
+                className="text-xs bg-surface-2/60 ring-1 ring-white/[0.08] rounded-lg px-3 py-2 text-white focus:ring-brand outline-none"
+              >
+                <option value="HD">HD · 1920×1080 (más rápido, menos RAM)</option>
+                <option value="DCI-2K">2K · 2048×1080</option>
+                <option value="UHD-4K">4K UHD · 3840×2160 (puede OOMear)</option>
+                <option value="DCI-4K">4K DCI · 4096×2160 (puede OOMear)</option>
+              </select>
+              {retryFrameSize !== (job.umg_spec?.frame_size || "HD") && (
+                <p className="text-[10px] text-amber-300/70 mt-1.5">
+                  {t("detail.retry_spec_changed") ||
+                    "Esta resolución se aplicará en el reintento — sobrescribe la original del job."}
+                </p>
+              )}
+            </div>
+          )}
+
           <div className="flex gap-2">
             <button
-              onClick={handleRetry}
+              onClick={() => handleRetry()}
               disabled={retrying}
               className="btn-primary text-xs h-9 px-4 disabled:opacity-50"
             >
@@ -881,9 +938,15 @@ export default function JobDetail({ job, onBack, onJobUpdate }) {
           the top of the component — by the time we get down here, status
           is pending_review or done, so no editing overlay needed. */}
 
-      {/* Edit request panel for pending_review (above approve) */}
-      {isPendingReview && (
-        <EditRequestPanel job={job} onEditTriggered={handleEditTriggered} />
+      {/* Edit request panel:
+            - pending_review: full toolkit (typography / lyrics / background)
+            - done / rejected: lyrics-only (typo recovery without re-upload) */}
+      {canEditLyrics && (
+        <EditRequestPanel
+          job={job}
+          onEditTriggered={handleEditTriggered}
+          allowedModes={editPanelAllowedModes}
+        />
       )}
 
       {/* Approval panel for pending_review */}

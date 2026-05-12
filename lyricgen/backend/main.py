@@ -4120,12 +4120,15 @@ class EditJobRequest(BaseModel):
     # Estos campos NO se persisten a columnas VARCHAR — viajan dentro
     # de Job.render_params (JSON column). Pero igual ponemos límites
     # razonables al payload del cliente para evitar JSON gigante.
-    edit_type: str = Field(..., max_length=32)  # "typography" | "background"
+    edit_type: str = Field(..., max_length=32)  # "typography" | "background" | "lyrics"
     font: str | None = Field(default=None, max_length=64)
     font_scale: float | None = None
     text_case: str | None = Field(default=None, max_length=16)
     lyric_transition: str | None = Field(default=None, max_length=16)
     text_motion: str | None = Field(default=None, max_length=16)
+    # Required when edit_type=="lyrics". Each segment must have start
+    # (s), end (s), text (str). Anything else is ignored.
+    segments: list[dict] | None = Field(default=None)
 
 
 class EnableProResRequest(BaseModel):
@@ -4247,7 +4250,30 @@ async def request_edit(
     )
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
-    if job.status != "pending_review":
+    valid_edit_types = ("typography", "background", "lyrics")
+    if body.edit_type not in valid_edit_types:
+        raise HTTPException(
+            status_code=400,
+            detail=f"edit_type must be one of {valid_edit_types}",
+        )
+
+    # Status gate. Lyrics edit accepts a wider set of terminal-ish states
+    # so users can fix typos/timing on videos that already finished
+    # rendering (done, in approval queue, or even rejected) without
+    # having to re-upload the MP3. typography/background stay strict —
+    # they're billed as "edits in the review loop" and only make sense
+    # while the reviewer is still deciding.
+    if body.edit_type == "lyrics":
+        allowed = ("done", "pending_review", "rejected")
+        if job.status not in allowed:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"Lyrics edit requires the job to be done, pending_review, "
+                    f"or rejected (current: {job.status})"
+                ),
+            )
+    elif job.status != "pending_review":
         raise HTTPException(
             status_code=400,
             detail=f"Job must be in pending_review to request edits (current: {job.status})",
@@ -4260,23 +4286,45 @@ async def request_edit(
             detail=f"Maximum edit limit ({_MAX_EDITS}) reached. Please approve or reject.",
         )
 
-    valid_edit_types = ("typography", "background")
-    if body.edit_type not in valid_edit_types:
-        raise HTTPException(
-            status_code=400,
-            detail=f"edit_type must be one of {valid_edit_types}",
-        )
-
-    if body.edit_type == "typography" and not job.bg_r2_key_cached:
+    # Both typography and lyrics reuse the cached background. Without
+    # bg_r2_key_cached set, the worker can't avoid re-running Veo —
+    # which defeats the point of these fast-path edits.
+    if body.edit_type in ("typography", "lyrics") and not job.bg_r2_key_cached:
         raise HTTPException(
             status_code=400,
             detail=(
-                "No cached background available for this job. "
+                f"No cached background available for {body.edit_type} edit. "
                 "Use edit_type='background' to regenerate it."
             ),
         )
 
-    if not job.segments_json:
+    # Lyrics edit specifically needs the new segments array on the body.
+    # typography/background still need segments_json on the row.
+    if body.edit_type == "lyrics":
+        if not body.segments or len(body.segments) == 0:
+            raise HTTPException(
+                status_code=400,
+                detail="Lyrics edit requires 'segments' in the request body (non-empty list).",
+            )
+        # Validate shape: every segment must have start, end, text.
+        for i, seg in enumerate(body.segments):
+            if not isinstance(seg, dict):
+                raise HTTPException(status_code=400, detail=f"segments[{i}] must be an object")
+            for k in ("start", "end", "text"):
+                if k not in seg:
+                    raise HTTPException(status_code=400, detail=f"segments[{i}] missing '{k}'")
+            try:
+                if float(seg["start"]) < 0 or float(seg["end"]) <= float(seg["start"]):
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"segments[{i}] has invalid timing (start={seg['start']}, end={seg['end']})",
+                    )
+            except (TypeError, ValueError):
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"segments[{i}] start/end must be numbers",
+                )
+    elif not job.segments_json:
         raise HTTPException(
             status_code=400,
             detail="Job has no persisted transcription. Cannot re-render.",
@@ -4293,13 +4341,23 @@ async def request_edit(
         edit_params["lyric_transition"] = body.lyric_transition
     if body.text_motion is not None:
         edit_params["text_motion"] = body.text_motion
+    if body.edit_type == "lyrics":
+        # Normalize to just the fields the pipeline needs — strip
+        # anything else the client may have sent (_id, etc.).
+        edit_params["segments"] = [
+            {"start": float(s["start"]), "end": float(s["end"]), "text": str(s["text"])}
+            for s in body.segments
+        ]
 
     new_edit_count = current_edit_count + 1
 
     # Flip to editing immediately so the UI can show progress.
     job.status = "editing"
     job.edit_count = new_edit_count
-    job.current_step = "video" if body.edit_type == "typography" else "background"
+    # Both typography and lyrics edits jump straight into the video
+    # compositing step (cached bg reused). Only background edit goes
+    # back through Veo, which is the `background` step.
+    job.current_step = "background" if body.edit_type == "background" else "video"
     job.progress = 0
     db.add(AuditLog(
         user_id=current_user["id"],
@@ -4413,9 +4471,20 @@ async def enable_prores_for_job(
     }
 
 
+class RetryJobRequest(BaseModel):
+    """Optional body for POST /retry. All fields are overrides — when
+    omitted, the existing values on the job row are kept. Today we only
+    support overriding frame_size (UMG accepts HD/2K/UHD-4K/DCI-4K) so
+    operators can downgrade a 4K render that OOMed the worker to HD on
+    retry, without re-uploading the audio."""
+    frame_size: str | None = Field(default=None, max_length=16)
+
+
+
 @app.post("/retry/{job_id}")
 async def retry_job(
     job_id: str,
+    body: RetryJobRequest | None = None,
     current_user: dict = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
@@ -4423,7 +4492,14 @@ async def retry_job(
     in R2. Avoids forcing the user to re-upload a 30-50 MB WAV. Only allowed
     when the job is in an unrecoverable terminal state (error or
     validation_failed) and the source audio is still available in object
-    storage (input_r2_key is set and the object exists)."""
+    storage (input_r2_key is set and the object exists).
+
+    Body (all optional):
+      frame_size: "HD" | "UHD-4K" | "DCI-4K" | "DCI-2K" — override the
+        job's stored umg_spec.frame_size. Used by the JobDetail Retry
+        button's HD/2K/4K selector so the user can downgrade a 4K render
+        that OOMed to HD without re-uploading.
+    """
     from database import Job as JobModel, AuditLog
 
     job = (
@@ -4445,6 +4521,21 @@ async def retry_job(
             status_code=422,
             detail="Source audio no longer available — please upload the file again.",
         )
+
+    # Apply optional frame_size override BEFORE we capture umg_spec for
+    # the enqueue below. Validates against the same allow-list the
+    # upload endpoint enforces.
+    if body and body.frame_size is not None:
+        allowed_frame_sizes = ("HD", "DCI-2K", "UHD-4K", "DCI-4K")
+        if body.frame_size not in allowed_frame_sizes:
+            raise HTTPException(
+                status_code=400,
+                detail=f"frame_size must be one of {allowed_frame_sizes}",
+            )
+        if job.umg_spec:
+            new_spec = dict(job.umg_spec)
+            new_spec["frame_size"] = body.frame_size
+            job.umg_spec = new_spec
 
     # Capturar status PREVIO antes de mutar. Sin esto el AuditLog
     # registraba siempre "processing" como previous_status (la línea de
@@ -4483,6 +4574,10 @@ async def retry_job(
     db.commit()
 
     umg_spec = job.umg_spec or {}
+    # Preserve the user's lyric edits across retries. Without this, the
+    # pipeline re-ran Whisper from scratch on every retry and silently
+    # blew away any manual corrections the user had made in the wizard.
+    segments_override = job.segments_json if job.segments_json else None
     enqueue_pipeline(
         job_id=job_id,
         mp3_path=None,
@@ -4493,9 +4588,15 @@ async def retry_job(
         input_r2_key=job.input_r2_key,
         song_title=job.song_title or "",
         umg_spec=umg_spec,
+        segments_override=segments_override,
     )
 
-    return {"ok": True, "status": "processing", "job_id": job_id}
+    return {
+        "ok": True,
+        "status": "processing",
+        "job_id": job_id,
+        "preserved_lyrics": segments_override is not None,
+    }
 
 
 # ---------------------------------------------------------------------------

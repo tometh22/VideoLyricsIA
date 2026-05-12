@@ -211,6 +211,58 @@ def _cleanup_local_intermediates(job_dir: str) -> None:
         pass
 
 
+def _get_persisted_segments(job_id: str) -> list[dict] | None:
+    """Return job_row.segments_json if it's a non-empty list, else None.
+
+    Used by run_pipeline's "preserve user edits across retries" branch.
+    Opens its own short-lived DB session so the caller doesn't have to
+    pass one in (matching the rest of pipeline.py's update_job pattern).
+    Best-effort: any exception returns None and the caller falls back to
+    a fresh Whisper transcription — we never want a DB hiccup to
+    silently produce a worse video.
+    """
+    try:
+        from database import SessionLocal, Job
+        with SessionLocal() as db:
+            row = db.query(Job).filter(Job.job_id == job_id).first()
+            if row is None:
+                return None
+            segs = row.segments_json
+            if not segs or not isinstance(segs, list) or len(segs) == 0:
+                return None
+            return segs
+    except Exception as e:  # pragma: no cover
+        print(f"[PIPELINE] _get_persisted_segments({job_id}) failed: {e}")
+        return None
+
+
+def _best_effort_lyrics_hint(artist: str, song_title: str) -> str | None:
+    """Fetch the reference lyrics from the Gemini-grounded search cache
+    (or fresh search) to use as Whisper's `prompt` parameter.
+
+    Why this exists: `/transcribe` already does this on the upload path,
+    biasing Whisper toward the song's actual vocabulary. The pipeline
+    path (run_pipeline → transcribe) used to skip the hint, so the same
+    audio produced WORSE transcriptions on retry than on first upload.
+    The user surfaced this as "el upload fresco siempre acierta, el
+    retry alucina" — root cause was just this missing hint.
+
+    Best-effort: returns None on any error so the caller transcribes
+    without bias rather than crashing.
+    """
+    if not artist or not song_title:
+        return None
+    try:
+        from database import SessionLocal
+        with SessionLocal() as db:
+            return _fetch_lyrics_via_gemini_search(
+                artist, song_title, job_id=None, db=db,
+            )
+    except Exception as e:  # pragma: no cover
+        print(f"[PIPELINE] lyrics_hint fetch failed: {e}")
+        return None
+
+
 def run_pipeline(job_id: str, mp3_path: str, artist: str, style: str,
                  language: str = None, segments_override: list[dict] = None,
                  delivery_profile: str = "youtube", umg_spec: dict | None = None,
@@ -344,15 +396,47 @@ def run_pipeline(job_id: str, mp3_path: str, artist: str, style: str,
     wants_umg = delivery_profile in ("umg", "both")
 
     try:
-        # Step 1 — Whisper transcription (or use edited segments)
+        # Step 1 — Whisper transcription (or reuse persisted segments).
+        # Precedence:
+        #   1. Caller-passed segments_override (e.g. /generate after the
+        #      wizard's lyrics editor)
+        #   2. Job row's segments_json (e.g. /retry path — preserves the
+        #      user's previous corrections instead of re-running Whisper
+        #      and clobbering them, which is the bug observed on 2026-05-
+        #      11 when admin retried after a deploy and lost their lyric
+        #      edits)
+        #   3. Fresh Whisper transcription (first-ever processing of this
+        #      audio). Pass lyrics_hint sourced from artist+song so
+        #      Whisper biases toward the right vocabulary — same trick
+        #      /transcribe uses on the upload path, restored here so the
+        #      retry path matches its quality.
         update_job(job_id, current_step="whisper", progress=5)
+        _persist_segments = True
         if segments_override:
             segments = segments_override
-            print(f"[WHISPER] Using {len(segments)} user-edited segments")
+            print(f"[WHISPER] Using {len(segments)} caller-supplied segments")
         else:
-            segments = transcribe(mp3_path, language=language)
+            # Re-fetch the job row in case the caller (retry) didn't
+            # pass us segments but the row has them from a previous
+            # generate. update_job above already opened a session so we
+            # do this in a fresh, short-lived one.
+            persisted = _get_persisted_segments(job_id)
+            if persisted:
+                segments = persisted
+                _persist_segments = False  # don't rewrite identical data
+                print(f"[WHISPER] Reusing {len(segments)} persisted segments "
+                      f"(skip Whisper — preserves user corrections)")
+            else:
+                lyrics_hint = _best_effort_lyrics_hint(artist, song_title)
+                segments = transcribe(
+                    mp3_path, language=language, lyrics_hint=lyrics_hint,
+                )
         # Persist segments so edit re-renders can skip re-transcription.
-        update_job(job_id, segments_json=segments, progress=20)
+        # Skip when we just read them from the same row — pointless write.
+        if _persist_segments:
+            update_job(job_id, segments_json=segments, progress=20)
+        else:
+            update_job(job_id, progress=20)
 
         # Step 1.5 — Background (AI-generated or human-provided)
         update_job(job_id, current_step="background", progress=22)
@@ -4938,86 +5022,133 @@ def generate_lyric_video(
         artist_upper = artist.upper() if artist else ""
         title_display = title_song if title_song else ""
 
-        # Always render the title card centered, regardless of intro length.
-        # Fades in over 0.4s and fades out over 0.7s before the first lyric.
+        # The title card MUST always appear — users (UMG, internal QA)
+        # want the artist+song readable on every video. Two layouts:
+        #
+        #   LONG intro (>0.8 s before first lyric):
+        #     Centered "card" with large artist+song. Fades in/out over
+        #     the intro period before the first lyric. Same visual as
+        #     before the 2026-05-11 rewrite.
+        #
+        #   SHORT intro (≤0.8 s; Whisper often hallucinates the first
+        #   "lyric" near t=0 even when there's a real instrumental):
+        #     Compact lower-left "lower-third" overlay. Smaller font,
+        #     sits in the bottom-left corner so it doesn't overlap the
+        #     centred lyric line. Visible for 6 s, with crossfade in/out.
+        #
+        # The old code skipped the title entirely on short intros,
+        # producing the "title NEVER appears" bug the user reported.
+        #
+        # Implementation note: moviepy 1.0.3 accepts crossfadein/
+        # crossfadeout as clip transforms, but its set_opacity broke
+        # when passed a function (TypeError: 'function' * 'float').
+        # We now use STATIC opacity + crossfade transforms, which work
+        # uniformly across moviepy versions.
+        try:
+            from moviepy.video.fx.crossfadein import crossfadein
+            from moviepy.video.fx.crossfadeout import crossfadeout
+        except Exception:  # pragma: no cover — older moviepy paths
+            crossfadein = crossfadeout = None
+
         try:
             scale = spec.text_scale
-            artist_size = max(30, int(round(62 * scale)))
-            title_size = max(24, int(round(46 * scale)))
-            card_width = int(round(spec.width * 0.80))
-            stroke_w = max(1, int(round(1.6 * scale)))
+            START_T = 0.3            # delay before card appears
 
-            FADE_IN_BASE  = 0.4   # ideal fade-in for long intros
-            FADE_OUT_BASE = 0.7   # ideal fade-out
-            MIN_FULL_OPACITY = 0.8  # reserve at least this much full-opacity time
-            START_T  = 0.3   # when the card starts
+            # Decide layout based on how much intro time we have. 0.8 s
+            # is the minimum window for a readable centred card; below
+            # that the user can't actually read it before the lyrics
+            # take over.
+            has_long_intro = first_lyric_start > START_T + 0.5
 
-            # End just before the first lyric; cap at START_T + 8s for very long intros
-            if first_lyric_start > START_T + 0.5:
+            if has_long_intro:
+                # ----- CENTRED FULL CARD (long intro) -----
+                artist_size = max(30, int(round(62 * scale)))
+                title_size = max(24, int(round(46 * scale)))
+                card_width = int(round(spec.width * 0.80))
+                stroke_w = max(1, int(round(1.6 * scale)))
                 title_end = min(first_lyric_start - 0.2, START_T + 8.0)
-            else:
-                title_end = None  # intro too short — skip
-
-            if title_end is not None:
                 clip_dur = title_end - START_T
-
-                # Scale fades down for short intros so the title actually
-                # spends visible time at full opacity. Whisper often picks
-                # up an intro vocalization ("Uoh-oh-oh") as the first
-                # "lyric" 2-3s in, leaving a 1.5s title window. With the
-                # base 0.4+0.7 fades that ate the whole clip — title
-                # appeared as a 0.4s flash and the user couldn't read it.
-                # Now we reserve ~0.8s of full-opacity display when
-                # possible, shrinking fades proportionally to fit.
-                fade_budget = max(0.1, clip_dur - MIN_FULL_OPACITY)
-                if fade_budget >= (FADE_IN_BASE + FADE_OUT_BASE):
-                    FADE_IN, FADE_OUT = FADE_IN_BASE, FADE_OUT_BASE
-                else:
-                    ratio_in = FADE_IN_BASE / (FADE_IN_BASE + FADE_OUT_BASE)
-                    FADE_IN = max(0.05, fade_budget * ratio_in)
-                    FADE_OUT = max(0.05, fade_budget * (1 - ratio_in))
-
-                def _make_fade_opacity(base_op, c_dur, fi=FADE_IN, fo=FADE_OUT):
-                    """Opacity function: fade-in then fade-out, scaled by base_op."""
-                    def _op(t):
-                        alpha = min(1.0, t / fi) if fi > 0 else 1.0
-                        remaining = c_dur - t
-                        alpha = min(alpha, min(1.0, remaining / fo) if fo > 0 else 1.0)
-                        return base_op * max(0.0, alpha)
-                    return _op
-
-                title_card_clips = []
-
-                if artist_upper:
-                    artist_clip = TextClip(
-                        artist_upper, fontsize=artist_size, font=extrabold_font,
-                        color="white", stroke_color="black", stroke_width=stroke_w,
-                        method="caption", size=(card_width, None), align="center",
-                    )
-                    title_card_clips.append((artist_clip, 0.97))
-
-                if title_display:
-                    song_clip = TextClip(
-                        title_display, fontsize=title_size, font=font,
-                        color="white", stroke_color="black", stroke_width=max(1, int(round(1.2 * scale))),
-                        method="caption", size=(card_width, None), align="center",
-                    )
-                    title_card_clips.append((song_clip, 0.85))
-
-                if title_card_clips:
-                    total_h = sum(c.size[1] for c, _ in title_card_clips) + 8 * (len(title_card_clips) - 1)
-                    y_cursor = (spec.height - total_h) // 2
-                    cx = spec.width // 2
-                    for clip, base_op in title_card_clips:
-                        cw, ch = clip.size
-                        clip = (clip
-                                .set_opacity(_make_fade_opacity(base_op, clip_dur))
-                                .set_position((cx - cw // 2, y_cursor))
-                                .set_start(START_T).set_end(title_end))
-                        text_layers.append(clip)
-                        y_cursor += ch + 8
+                # Fades scale down for short available windows so we
+                # always get at least a moment of full opacity.
+                fade_in = min(0.4, max(0.1, clip_dur * 0.25))
+                fade_out = min(0.7, max(0.1, clip_dur * 0.35))
+                position_y_center = True
+                position_x_center = True
+                base_opacity_artist = 0.97
+                base_opacity_song = 0.85
             else:
-                print(f"[TITLE] first lyric at {first_lyric_start:.2f}s; intro too short, skipping title card")
+                # ----- LOWER-LEFT BADGE (short intro fallback) -----
+                # Smaller because it sits next to the active lyric line;
+                # we never want it to compete for the user's attention,
+                # just provide identification.
+                artist_size = max(20, int(round(36 * scale)))
+                title_size = max(16, int(round(28 * scale)))
+                card_width = int(round(spec.width * 0.45))
+                stroke_w = max(1, int(round(1.2 * scale)))
+                title_end = START_T + 6.0
+                clip_dur = title_end - START_T
+                fade_in = 0.4
+                fade_out = 0.8
+                position_y_center = False     # bottom-anchored
+                position_x_center = False     # left-anchored
+                base_opacity_artist = 0.92
+                base_opacity_song = 0.80
+                print(
+                    f"[TITLE] first lyric at {first_lyric_start:.2f}s — "
+                    f"using lower-left badge (intro too short for centred card)"
+                )
+
+            title_card_clips = []
+
+            if artist_upper:
+                artist_clip = TextClip(
+                    artist_upper, fontsize=artist_size, font=extrabold_font,
+                    color="white", stroke_color="black", stroke_width=stroke_w,
+                    method="caption", size=(card_width, None), align="center" if position_x_center else "West",
+                )
+                title_card_clips.append((artist_clip, base_opacity_artist))
+
+            if title_display:
+                song_clip = TextClip(
+                    title_display, fontsize=title_size, font=font,
+                    color="white", stroke_color="black", stroke_width=max(1, int(round(1.2 * scale))),
+                    method="caption", size=(card_width, None), align="center" if position_x_center else "West",
+                )
+                title_card_clips.append((song_clip, base_opacity_song))
+
+            if title_card_clips:
+                total_h = sum(c.size[1] for c, _ in title_card_clips) + 8 * (len(title_card_clips) - 1)
+
+                if position_y_center:
+                    y_cursor = (spec.height - total_h) // 2
+                else:
+                    # Bottom margin = 8% of frame height — comfortable
+                    # safe-area for broadcast and YouTube.
+                    bottom_margin = int(spec.height * 0.08)
+                    y_cursor = spec.height - bottom_margin - total_h
+
+                if position_x_center:
+                    cx = spec.width // 2
+                else:
+                    # Left margin = 6% of frame width.
+                    left_margin = int(spec.width * 0.06)
+
+                for clip, base_op in title_card_clips:
+                    cw, ch = clip.size
+                    if position_x_center:
+                        x = cx - cw // 2
+                    else:
+                        x = left_margin
+                    clip = (clip
+                            .set_opacity(base_op)
+                            .set_position((x, y_cursor))
+                            .set_start(START_T).set_end(title_end))
+                    # Apply crossfade transforms if moviepy provides them.
+                    # Skipping fades on older paths still beats no title.
+                    if crossfadein is not None and crossfadeout is not None:
+                        clip = clip.fx(crossfadein, fade_in).fx(crossfadeout, fade_out)
+                    text_layers.append(clip)
+                    y_cursor += ch + 8
         except Exception as e:
             print(f"[TITLE] title card failed ({e}); continuing")
 
@@ -5421,6 +5552,11 @@ def run_edit_pipeline(
             with new font/size/case/transition settings.  Cost: ~$0.
         "background" — re-generate Veo background; keep segments and
             (optionally) render params.  Cost: ~$0.90.
+        "lyrics"     — keep cached background; replace segments with the
+            caller-supplied list (edit_params["segments"]). Re-renders
+            video/short/thumbnail.  Cost: ~$0. After success, the new
+            segments overwrite segments_json so subsequent edits see
+            the corrected version.
 
     After completion the job returns to "pending_review" so the reviewer
     can approve, reject, or request another edit (up to _MAX_EDITS total).
@@ -5432,9 +5568,19 @@ def run_edit_pipeline(
         job_row = db.query(JobModel).filter(JobModel.job_id == job_id).first()
         if not job_row:
             raise RuntimeError(f"Job {job_id} not found")
-        segments = job_row.segments_json
-        if not segments:
-            raise RuntimeError(f"Job {job_id} has no persisted segments — cannot edit")
+        # Source of segments depends on edit_type. Lyrics edit uses the
+        # caller-supplied list (they're the new "ground truth"); the
+        # other two reuse what's already persisted.
+        if edit_type == "lyrics":
+            segments = edit_params.get("segments")
+            if not segments or not isinstance(segments, list):
+                raise RuntimeError(
+                    f"Job {job_id}: edit_type='lyrics' requires non-empty segments in edit_params"
+                )
+        else:
+            segments = job_row.segments_json
+            if not segments:
+                raise RuntimeError(f"Job {job_id} has no persisted segments — cannot edit")
         base_params = dict(job_row.render_params or {})
         artist = job_row.artist
         song_title = job_row.song_title or ""
@@ -5479,7 +5625,10 @@ def run_edit_pipeline(
         # ----------------------------------------------------------------
         # Resolve background
         # ----------------------------------------------------------------
-        if edit_type == "typography":
+        if edit_type in ("typography", "lyrics"):
+            # Both reuse the cached background — only the foreground layer
+            # (text overlays) changes. Lyrics edit ALSO swaps the segments,
+            # but that already happened at function entry above.
             update_job(job_id, status="editing", current_step="video", progress=35)
             bg_image_path = os.path.join(job_dir, "bg_cached_edit.mp4")
             if not os.path.exists(bg_image_path):
@@ -5489,8 +5638,8 @@ def run_edit_pipeline(
                         raise RuntimeError("Could not download cached background from R2")
                 else:
                     raise RuntimeError(
-                        "No cached background available for typography edit. "
-                        "Use edit_type='background' to regenerate."
+                        f"No cached background available for {edit_type} edit. "
+                        "Use edit_type='background' to regenerate it."
                     )
 
         elif edit_type == "background":
@@ -5583,6 +5732,14 @@ def run_edit_pipeline(
 
         # Persist the merged render params so the next edit sees them.
         update_job(job_id, render_params=merged)
+
+        # For lyrics edits, also persist the new segments so subsequent
+        # actions (another edit, a retry) see the corrected version.
+        # Without this, the corrections would only live in the rendered
+        # video bytes; any later run_pipeline call would read the OLD
+        # segments_json and re-render with the bad words.
+        if edit_type == "lyrics":
+            update_job(job_id, segments_json=segments)
 
         # Back to pending_review — the reviewer decides what to do next.
         update_job(job_id, status="pending_review", progress=100, files=files)
