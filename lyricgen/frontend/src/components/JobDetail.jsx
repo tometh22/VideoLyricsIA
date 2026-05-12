@@ -5,6 +5,7 @@ import { JobDetailTour } from "./OnboardingTour";
 import ProResBadge from "./ProResBadge";
 import EditRequestPanel from "./EditRequestPanel";
 import EnableProResModal from "./EnableProResModal";
+import DriveTransferModal from "./DriveTransferModal";
 
 const API = import.meta.env.VITE_API_URL || "";
 
@@ -654,6 +655,38 @@ export default function JobDetail({ job, onBack, onJobUpdate }) {
     isJobDone && !isUmgJob && user?.features?.prores_export === true;
   const [showProResModal, setShowProResModal] = useState(false);
   const [proResToast, setProResToast] = useState(null);
+
+  // Drive integration: poleamos /drive/status al cargar el job para
+  // decidir si mostrar el botón "Guardar en Drive". El status también
+  // se polea cada N min por si el user se desconectó en otra tab.
+  // No bloqueamos el render del job — el botón aparece cuando llega.
+  //
+  // Canary mode: features.drive_export gatea TODO el flow Drive.
+  // Sin el flag no peguemos a /drive/status (evita 403 noise en logs).
+  const driveFeatureEnabled = user?.features?.drive_export === true;
+  const [driveConnected, setDriveConnected] = useState(false);
+  const [showDriveModal, setShowDriveModal] = useState(false);
+  // file_type a transferir cuando el user abre el modal: por default el
+  // umg_master si está disponible, sino el video MP4.
+  const driveFileType = isUmgJob ? "umg_master" : "video";
+  useEffect(() => {
+    if (!isJobDone) return;
+    if (!driveFeatureEnabled) return;
+    let cancelled = false;
+    (async () => {
+      try {
+        const res = await fetch(`${API}/drive/status`, { headers: authHeaders() });
+        if (!res.ok) return;
+        const data = await res.json();
+        if (!cancelled) setDriveConnected(!!data.connected);
+      } catch {
+        // Silent fail — si /drive/status no responde, no mostramos el
+        // botón, lo cual es la conducta segura. El user puede ir a
+        // Settings a conectar.
+      }
+    })();
+    return () => { cancelled = true; };
+  }, [isJobDone, job.job_id, driveFeatureEnabled]);
   // Short ProRes follows the same opt-in: any UMG-flavoured job gets a
   // separate vertical-format master alongside the main one. Generated
   // lazily by /download/{id}/umg_short the first time it's clicked.
@@ -1056,6 +1089,44 @@ export default function JobDetail({ job, onBack, onJobUpdate }) {
             // persistido) y aparezca el tab de Máster ProRes.
             onJobUpdate?.({ ...job, umg_spec: data.umg_spec });
           }}
+        />
+      )}
+
+      {/* Guardar en Drive — botón visible cuando el job está done y el
+          user tiene Drive conectado. El flow R2 → Drive server-to-server
+          es ~30x más rápido que descargar+subir desde casa para ProRes
+          de 16 GB. Si el user no tiene Drive conectado, en Settings está
+          el botón Conectar. */}
+      {isJobDone && driveFeatureEnabled && driveConnected && (
+        <div className="rounded-card bg-surface-2/40 ring-1 ring-white/[0.04] p-5 mb-4 flex items-start gap-4">
+          <div className="w-10 h-10 shrink-0 rounded-xl bg-accent/10 ring-1 ring-accent/30 flex items-center justify-center text-accent">
+            <svg className="w-5 h-5" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
+              <path d="M3 8l3-5h12l3 5M3 8v11a2 2 0 002 2h14a2 2 0 002-2V8M3 8h18M12 12v6" strokeLinecap="round" strokeLinejoin="round" />
+            </svg>
+          </div>
+          <div className="flex-1 min-w-0">
+            <div className="text-sm font-semibold text-white">
+              {t("drive.cta_title")}
+            </div>
+            <div className="text-xs text-gray-400 mt-0.5">
+              {t("drive.cta_desc")}
+            </div>
+          </div>
+          <button
+            type="button"
+            onClick={() => setShowDriveModal(true)}
+            className="shrink-0 px-4 py-2 rounded-md text-sm font-medium text-white bg-accent hover:bg-accent/90 ring-1 ring-accent/30 transition-colors"
+          >
+            {t("drive.cta_button")}
+          </button>
+        </div>
+      )}
+
+      {showDriveModal && (
+        <DriveTransferModal
+          jobId={job.job_id}
+          fileType={driveFileType}
+          onClose={() => setShowDriveModal(false)}
         />
       )}
 

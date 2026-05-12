@@ -63,6 +63,7 @@ from auth import (
     verify_media_token,
     validate_password_strength,
     has_prores_access,
+    has_drive_access,
     generate_api_key,
 )
 import storage
@@ -75,7 +76,7 @@ from database import (
 from jobs import bulk_delete_jobs, create_job, delete_job, get_job, get_all_jobs, update_job
 from observability import init_sentry, init_logging, health_snapshot
 from pipeline import run_pipeline, transcribe
-from queue_jobs import enqueue_pipeline, enqueue_edit, queue_depth, enqueue_prores_prewarm
+from queue_jobs import enqueue_pipeline, enqueue_edit, queue_depth, enqueue_prores_prewarm, enqueue_drive_delivery
 from render_spec import umg_catalog, validate_umg_config
 from billing import router as billing_router
 from admin import router as admin_router
@@ -1056,6 +1057,181 @@ async def revoke_api_key(
     ))
     db.commit()
     return {"ok": True}
+
+
+# ---------------------------------------------------------------------------
+# Google Drive integration — OAuth endpoints
+# ---------------------------------------------------------------------------
+# Permite al operador conectar su cuenta de Google Drive a la app para
+# que el botón "Guardar en Drive" (PR-D2/D3) pueda subir ProRes
+# directamente desde R2 a Drive (server-to-server, ~30x más rápido
+# que el flow descargar-luego-subir desde casa).
+#
+# Scope: drive.file (limitado a archivos que la app crea). No requiere
+# Google app verification. Ver lyricgen/backend/drive_oauth.py.
+
+
+@app.get("/drive/auth-url")
+async def drive_auth_url(
+    current_user: dict = Depends(get_current_user),
+):
+    """Devuelve la URL de OAuth a la que el frontend redirige al user.
+    El state token está HMAC-signed y bindea la sesión OAuth a este
+    user — sin esto un atacante podría forzar callbacks a otra cuenta."""
+    if not has_drive_access(current_user):
+        raise HTTPException(status_code=403, detail="Drive integration not enabled for your account.")
+    from drive_oauth import build_authorization_url, DriveOAuthError
+    try:
+        url = build_authorization_url(current_user["id"])
+    except DriveOAuthError as e:
+        raise HTTPException(status_code=503, detail=str(e))
+    return {"auth_url": url}
+
+
+@app.get("/drive/callback")
+async def drive_callback(
+    code: str = Query("", max_length=2048),
+    state: str = Query("", max_length=2048),
+    error: str = Query("", max_length=200),
+    db: Session = Depends(get_db),
+):
+    """Callback de Google después del consent screen. Verifica el state
+    (HMAC), intercambia el code por tokens, encripta y guarda el
+    refresh_token en user_drive_tokens. Después redirige al frontend
+    con un fragmento que el cliente parsea para mostrar 'conectado ✓'.
+
+    Nota: este endpoint NO usa get_current_user porque Google no manda
+    el JWT del user — la identidad viene del state token que firmamos
+    al construir la auth URL.
+    """
+    from drive_oauth import (
+        DriveOAuthError, exchange_code_for_tokens, encrypt_token,
+        fetch_userinfo, verify_state_token,
+    )
+    from database import UserDriveTokens
+
+    # Frontend public URL para redirigir tras éxito / error. Lo
+    # parametrizamos via env var FRONTEND_URL si está, sino derivamos
+    # del GOOGLE_OAUTH_REDIRECT_URI (mismo host base).
+    frontend_url = os.environ.get(
+        "FRONTEND_URL",
+        "https://www.genly.pro",
+    )
+    success_redirect = f"{frontend_url}/settings?drive=connected"
+    error_redirect = f"{frontend_url}/settings?drive=error"
+
+    if error:
+        # User cerró el consent screen o lo rechazó.
+        logger.info("[drive_oauth] callback error=%s", error)
+        return RedirectResponse(f"{error_redirect}&reason={error}", status_code=302)
+
+    try:
+        user_id = verify_state_token(state)
+    except DriveOAuthError as e:
+        logger.warning("[drive_oauth] invalid state: %s", e)
+        return RedirectResponse(f"{error_redirect}&reason=invalid_state", status_code=302)
+
+    # Canary gate: el state token vino firmado por nosotros, pero igual
+    # re-chequeamos has_drive_access del user_id contenido — si su
+    # acceso fue revocado entre auth-url y callback, no guardamos tokens.
+    callback_user = db.query(User).filter(User.id == user_id).first()
+    if not has_drive_access(callback_user):
+        logger.warning("[drive_oauth] callback for user %s without drive access", user_id)
+        return RedirectResponse(f"{error_redirect}&reason=not_enabled", status_code=302)
+
+    try:
+        tokens = exchange_code_for_tokens(code)
+    except DriveOAuthError as e:
+        logger.warning("[drive_oauth] code exchange failed: %s", e)
+        return RedirectResponse(f"{error_redirect}&reason=exchange_failed", status_code=302)
+
+    refresh_token = tokens["refresh_token"]
+    scope = tokens.get("scope", "")
+    access_token = tokens.get("access_token", "")
+
+    # Userinfo es best-effort — si falla, igual guardamos los tokens.
+    info = fetch_userinfo(access_token) if access_token else {}
+    google_email = info.get("email")
+
+    # Upsert: si el user ya tenía Drive conectado, sobreescribimos con
+    # los tokens nuevos (caso típico: revocó en Google y reconecta).
+    existing = db.query(UserDriveTokens).filter(UserDriveTokens.user_id == user_id).first()
+    encrypted = encrypt_token(refresh_token)
+    if existing is None:
+        existing = UserDriveTokens(
+            user_id=user_id,
+            encrypted_refresh_token=encrypted,
+            scope=scope,
+            google_email=google_email,
+        )
+        db.add(existing)
+    else:
+        existing.encrypted_refresh_token = encrypted
+        existing.scope = scope
+        existing.google_email = google_email
+        existing.connected_at = datetime.now(timezone.utc)
+    db.commit()
+
+    return RedirectResponse(success_redirect, status_code=302)
+
+
+@app.get("/drive/status")
+async def drive_status(
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Devuelve si este user tiene Drive conectado y, si sí, qué cuenta.
+    El frontend lo usa para decidir si mostrar 'Conectar' o 'Conectado
+    como X — Desconectar' en Settings."""
+    if not has_drive_access(current_user):
+        raise HTTPException(status_code=403, detail="Drive integration not enabled for your account.")
+    from database import UserDriveTokens
+    row = db.query(UserDriveTokens).filter(UserDriveTokens.user_id == current_user["id"]).first()
+    if row is None:
+        return {"connected": False}
+    return {
+        "connected": True,
+        "email": row.google_email,
+        "connected_at": row.connected_at.isoformat() if row.connected_at else None,
+        "last_used_at": row.last_used_at.isoformat() if row.last_used_at else None,
+    }
+
+
+@app.delete("/drive/disconnect")
+async def drive_disconnect(
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Revoca el refresh_token en Google (best-effort) y borra la row
+    local. Si Google falla, igual borramos la row — el user ya no
+    quiere conexión y los tokens viejos quedarán huérfanos del lado
+    de Google, sin afectarnos."""
+    if not has_drive_access(current_user):
+        raise HTTPException(status_code=403, detail="Drive integration not enabled for your account.")
+    from drive_oauth import decrypt_token, revoke_refresh_token, DriveTokenDecryptError
+    from database import UserDriveTokens
+
+    row = db.query(UserDriveTokens).filter(UserDriveTokens.user_id == current_user["id"]).first()
+    if row is None:
+        return {"ok": True, "was_connected": False}
+
+    # Best-effort revoke en Google. Si la encryption key rotó, no
+    # podemos decrypt el token — igual borramos la row local.
+    try:
+        refresh = decrypt_token(row.encrypted_refresh_token)
+        revoke_refresh_token(refresh)
+    except DriveTokenDecryptError:
+        logger.warning(
+            "[drive_oauth] decrypt failed for user %s on disconnect — borrando row igual",
+            current_user["id"],
+        )
+
+    db.delete(row)
+    db.commit()
+    return {"ok": True, "was_connected": True}
+
+
+# ---------------------------------------------------------------------------
 
 
 @app.get("/usage")
@@ -4117,10 +4293,17 @@ class ApproveJobRequest(BaseModel):
 
 
 class EditJobRequest(BaseModel):
-    # Estos campos NO se persisten a columnas VARCHAR — viajan dentro
-    # de Job.render_params (JSON column). Pero igual ponemos límites
-    # razonables al payload del cliente para evitar JSON gigante.
-    edit_type: str = Field(..., max_length=32)  # "typography" | "background" | "lyrics"
+    # edit_type values:
+    #  - typography: re-render with new font/size/case/motion settings
+    #  - background: regenerate Veo, keep persisted segments
+    #  - lyrics:     re-render with caller-supplied segments. Background
+    #                reuses bg_r2_key_cached (no Veo cost). Use case:
+    #                fix a typo/timing/word in a pending_review or done
+    #                video without re-uploading the MP3.
+    # Los campos posteriores NO se persisten a columnas VARCHAR — viajan
+    # dentro de Job.render_params (JSON column). Los max_length acá son
+    # límites del payload del cliente para evitar JSON gigante.
+    edit_type: str = Field(..., max_length=32)
     font: str | None = Field(default=None, max_length=64)
     font_scale: float | None = None
     text_case: str | None = Field(default=None, max_length=16)
@@ -4138,6 +4321,11 @@ class EnableProResRequest(BaseModel):
     umg_frame_size: str = Field(..., max_length=16)      # "HD" | "UHD-4K" | "DCI-4K" | "DCI-2K"
     umg_fps: str = Field(..., max_length=16)             # "23.976"...".60"
     umg_prores_profile: str = Field(..., max_length=4)   # "3" (422 HQ) | "4" (4444) | "5" (4444 XQ)
+
+
+class DeliverToDriveRequest(BaseModel):
+    """Body para POST /jobs/{job_id}/deliver-to-drive."""
+    file_type: str = Field(..., max_length=20)  # "umg_master" | "umg_short" | "video" | "short"
 
 
 @app.post("/approve/{job_id}")
@@ -4476,6 +4664,147 @@ async def enable_prores_for_job(
     }
 
 
+# ---------------------------------------------------------------------------
+# Drive delivery — botón "Guardar en Drive"
+# ---------------------------------------------------------------------------
+
+@app.post("/jobs/{job_id}/deliver-to-drive")
+async def deliver_to_drive(
+    job_id: str,
+    body: DeliverToDriveRequest,
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Encola una transferencia R2 → Google Drive del user. Devuelve un
+    transfer_id que el frontend usa para polear progress vía
+    GET /drive/transfers/{transfer_id}.
+
+    Requiere que el user haya conectado Drive previamente
+    (GET /drive/status devuelve connected=true). Si no, 412.
+
+    Filename en Drive: '<job_id>__<filename>' para evitar colisiones
+    cuando varios jobs tienen el mismo umg_master.mov.
+    """
+    if not has_drive_access(current_user):
+        raise HTTPException(status_code=403, detail="Drive integration not enabled for your account.")
+    import uuid
+    from database import Job as JobModel, DriveTransfer, UserDriveTokens
+    from drive_uploader import FILE_TYPE_TO_DRIVE_NAME
+
+    if body.file_type not in FILE_TYPE_TO_DRIVE_NAME:
+        raise HTTPException(
+            status_code=400,
+            detail=f"file_type debe ser uno de {list(FILE_TYPE_TO_DRIVE_NAME)}",
+        )
+
+    # Verificar que el user tiene Drive conectado
+    drive_tokens = db.query(UserDriveTokens).filter(
+        UserDriveTokens.user_id == current_user["id"]
+    ).first()
+    if drive_tokens is None:
+        raise HTTPException(
+            status_code=412,
+            detail="Drive no está conectado. Conectalo en Settings antes de exportar.",
+        )
+
+    # Verificar que el job existe + es del tenant del user + está done
+    job = (
+        db.query(JobModel)
+        .filter(JobModel.job_id == job_id)
+        .filter(JobModel.tenant_id == current_user["tenant_id"])
+        .first()
+    )
+    if job is None:
+        raise HTTPException(status_code=404, detail="Job not found")
+    if job.status != "done":
+        raise HTTPException(
+            status_code=400,
+            detail=f"Job debe estar done para exportar a Drive (actual: {job.status})",
+        )
+
+    # Para umg_master / umg_short, el job debe tener umg_spec persistido
+    # (sino no existe el archivo). Para video / short, siempre existe
+    # post-done.
+    if body.file_type in ("umg_master", "umg_short") and not job.umg_spec:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Este job no tiene ProRes generado. Pegale a /enable-prores "
+                "primero o seleccioná file_type=video/short."
+            ),
+        )
+
+    transfer = DriveTransfer(
+        id=uuid.uuid4().hex[:32],
+        user_id=current_user["id"],
+        job_id=job_id,
+        file_type=body.file_type,
+        status="queued",
+        progress_pct=0,
+    )
+    db.add(transfer)
+    db.commit()
+
+    try:
+        enqueue_drive_delivery(transfer.id, plan=current_user.get("plan", "100"))
+    except Exception as e:
+        # Si Redis cae, dejamos la row queued con error visible.
+        transfer.status = "error"
+        transfer.error = f"No se pudo encolar el job: {e}"
+        db.commit()
+        raise HTTPException(
+            status_code=503,
+            detail="No se pudo encolar la transferencia. Reintentá en unos segundos.",
+        )
+
+    return {
+        "ok": True,
+        "transfer_id": transfer.id,
+        "status": "queued",
+        "poll_url": f"/drive/transfers/{transfer.id}",
+    }
+
+
+@app.get("/drive/transfers/{transfer_id}")
+async def get_drive_transfer(
+    transfer_id: str,
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Status actual de una transferencia. Frontend polea esto cada 3s
+    mientras el modal de transferencia está abierto."""
+    if not has_drive_access(current_user):
+        raise HTTPException(status_code=403, detail="Drive integration not enabled for your account.")
+    from database import DriveTransfer
+
+    transfer = (
+        db.query(DriveTransfer)
+        .filter(DriveTransfer.id == transfer_id)
+        .filter(DriveTransfer.user_id == current_user["id"])
+        .first()
+    )
+    if transfer is None:
+        raise HTTPException(status_code=404, detail="Transfer not found")
+
+    return {
+        "id": transfer.id,
+        "job_id": transfer.job_id,
+        "file_type": transfer.file_type,
+        "status": transfer.status,
+        "progress_pct": transfer.progress_pct or 0,
+        "bytes_transferred": transfer.bytes_transferred or 0,
+        "bytes_total": transfer.bytes_total or 0,
+        "drive_file_id": transfer.drive_file_id,
+        "web_view_link": transfer.web_view_link,
+        "error": transfer.error,
+        "created_at": transfer.created_at.isoformat() if transfer.created_at else None,
+        "completed_at": transfer.completed_at.isoformat() if transfer.completed_at else None,
+    }
+
+
+# ---------------------------------------------------------------------------
+
+
 class RetryJobRequest(BaseModel):
     """Optional body for POST /retry. All fields are overrides — when
     omitted, the existing values on the job row are kept. Today we only
@@ -4483,7 +4812,6 @@ class RetryJobRequest(BaseModel):
     operators can downgrade a 4K render that OOMed the worker to HD on
     retry, without re-uploading the audio."""
     frame_size: str | None = Field(default=None, max_length=16)
-
 
 
 @app.post("/retry/{job_id}")
@@ -4582,6 +4910,10 @@ async def retry_job(
     # Preserve the user's lyric edits across retries. Without this, the
     # pipeline re-ran Whisper from scratch on every retry and silently
     # blew away any manual corrections the user had made in the wizard.
+    # The pipeline ALSO falls back to job.segments_json if we don't
+    # pass segments_override (belt-and-suspenders), but passing it
+    # explicitly here makes the intent visible at the call site and
+    # keeps the retry path symmetrical with the /generate path.
     segments_override = job.segments_json if job.segments_json else None
     enqueue_pipeline(
         job_id=job_id,

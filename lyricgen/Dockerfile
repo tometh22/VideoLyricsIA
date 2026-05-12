@@ -13,14 +13,21 @@ RUN npm run build
 # --- Stage 2: Backend ---
 FROM python:3.11-slim AS backend
 
-# System deps for whisper, moviepy, imagemagick
+# System deps for whisper, moviepy, imagemagick.
+# rclone para el worker que sube ProRes (16 GB) desde R2 a Drive
+# server-to-server (~30x más rápido que descargar-y-resubir desde casa).
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ffmpeg \
     imagemagick \
     libmagickwand-dev \
     fonts-dejavu-core \
     fonts-liberation \
-    && rm -rf /var/lib/apt/lists/*
+    ca-certificates \
+    curl \
+    unzip \
+    && rm -rf /var/lib/apt/lists/* \
+    && curl -fsSL https://rclone.org/install.sh | bash \
+    && rclone version
 
 # Fix ImageMagick policy to allow PDF/SVG operations
 RUN sed -i 's/rights="none" pattern="@\*"/rights="read|write" pattern="@*"/' /etc/ImageMagick-6/policy.xml 2>/dev/null || true
