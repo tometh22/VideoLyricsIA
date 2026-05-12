@@ -2340,6 +2340,40 @@ def _slice_audio_prefix(input_path: str, output_path: str, seconds: float) -> bo
         return False
 
 
+def _sanitize_gemini_lyrics(text):
+    """Strip section/pilcrow markers that some Spanish lyrics sites use
+    as estrofa separators (Letras.com, AZLyrics, etc.). These are HTML
+    structure artifacts from scraping — they never appear in the actual
+    sung lyrics.
+
+    Why this matters: the cleaned text is used in two downstream paths
+    that both fail when these chars leak through:
+      1. Cached into lyrics_cache.lyrics — the row gets returned to all
+         future callers including the lyrics_hint primer for Whisper.
+      2. Passed as Whisper's `prompt` parameter — when the prompt
+         contains `§`, Whisper biases toward emitting `§` in its own
+         transcription output, which then lands in jobs.segments_json
+         and renders as visible text in the lyric video (root cause
+         of the Mujer Amante / Rata Blanca incident, 2026-05-12).
+
+    Strictly conservative: removes only U+00A7 SECTION SIGN and U+00B6
+    PILCROW. Diacritics, em-dashes, Spanish quotes, and every other
+    char that legitimately appears in lyrics are preserved.
+    """
+    if not text:
+        return text
+    cleaned = text.replace("§", "").replace("¶", "")
+    if cleaned != text:
+        stripped = len(text) - len(cleaned)
+        # Logged at WARNING so the operator can see which Gemini-grounded
+        # sources keep returning these chars — over time, this surfaces
+        # which lyric sites are dirty and whether the sanitizer needs
+        # to grow (e.g. another scraping artifact appears).
+        print(f"[lyrics_sanitize] stripped {stripped} char(s) (§/¶) "
+              f"from Gemini response")
+    return cleaned
+
+
 def _fetch_lyrics_via_gemini_search(
     artist: str, song: str,
     job_id: str | None = None,
@@ -2375,7 +2409,10 @@ def _fetch_lyrics_via_gemini_search(
             ).first()
             if row and row.lyrics:
                 print(f"[LYRICS] cache hit {cache_key} ({len(row.lyrics)} chars)")
-                return row.lyrics
+                # Sanitize on read so existing poisoned rows (cached
+                # before this fix shipped) still return clean text to
+                # downstream callers without requiring a DB cleanup.
+                return _sanitize_gemini_lyrics(row.lyrics)
         except Exception as e:
             print(f"[LYRICS] cache read failed: {e}")
 
@@ -2427,6 +2464,14 @@ def _fetch_lyrics_via_gemini_search(
             text = (response.text or "").strip()
         except Exception:
             text = ""
+
+        # Sanitize ONCE here, before everything downstream sees the text.
+        # Some Spanish lyrics sites (Letras.com, AZLyrics) use § as estrofa
+        # separators; the Gemini scrape leaks them into our string. Without
+        # this strip the text would land in lyrics_cache.lyrics AND be
+        # passed as Whisper's prompt parameter, biasing transcription to
+        # emit § in segments_json. See _sanitize_gemini_lyrics for context.
+        text = _sanitize_gemini_lyrics(text)
 
         candidates = getattr(response, "candidates", None) or []
         if not candidates:
