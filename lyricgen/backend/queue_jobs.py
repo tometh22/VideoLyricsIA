@@ -329,6 +329,54 @@ def enqueue_edit(
     return f"thread:edit:{job_id}"
 
 
+def enqueue_drive_delivery(transfer_id: str, plan: str = "100") -> str:
+    """Encola una transferencia R2 → Google Drive en el worker.
+
+    El worker corre `drive_uploader.run_drive_delivery(transfer_id)`
+    que lee el resto del estado de la DB (user_id, job_id, file_type)
+    desde la row drive_transfers — esto mantiene la signature simple
+    y permite que el worker se reanude tras un crash sin necesitar
+    re-pasar args.
+
+    Timeout 60 min: un ProRes de 16 GB a 500 Mbps tarda ~4 min, pero
+    si Drive rate-limita o la conexión cloud↔cloud va lenta podría
+    estirar a 30-40 min. 60 min da headroom sin permitir colgados.
+
+    Usa la enterprise queue para no competir con render jobs comunes —
+    el operador que clickea "Guardar en Drive" típicamente tiene
+    delivery_profile=umg/both (UMG plan).
+    """
+    _, _, q_enterprise = _init_redis()
+    if q_enterprise is None:
+        if _ENVIRONMENT == "production":
+            logger.error(
+                "Refusing to enqueue drive_delivery via thread fallback: "
+                "Redis required in production."
+            )
+            raise RuntimeError(
+                "Job queue unavailable: Redis is required in production."
+            )
+        # Dev fallback
+        from drive_uploader import run_drive_delivery
+        t = threading.Thread(
+            target=run_drive_delivery, args=(transfer_id,), daemon=True,
+        )
+        t.start()
+        return f"thread:drive:{transfer_id}"
+
+    rq_job = q_enterprise.enqueue(
+        "drive_uploader.run_drive_delivery",
+        args=(transfer_id,),
+        job_timeout=3600,  # 60 min — ver docstring arriba
+        result_ttl=RESULT_TTL,
+        failure_ttl=FAILURE_TTL,
+        # Deterministic id: un mismo transfer_id se enqueue solo una vez
+        # (RQ dedupes). El operador puede crear N transfers distintos.
+        job_id=f"drive:{transfer_id}",
+    )
+    return rq_job.id
+
+
 def queue_depth() -> dict:
     """Return {'default': n, 'enterprise': n, 'backend': 'redis'|'threads'}."""
     _, q_default, q_enterprise = _init_redis()
