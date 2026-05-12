@@ -280,6 +280,15 @@ def update_job(job_id: str, **kwargs) -> None:
             elif hasattr(job, key):
                 setattr(job, key, value)
 
+        # Heartbeat for the reaper. Any progress update means the worker is
+        # alive (even when progress is the same value as before — the call
+        # itself proves liveness). reaper.find_stalled_renders flips a
+        # processing job to error when this timestamp goes stale, catching
+        # workers SIGKILLed during non-AI steps where there is no in-flight
+        # AIProvenance row to anchor find_orphan_polling_jobs.
+        if "progress" in kwargs:
+            job.last_progress_at = datetime.now(timezone.utc)
+
         # Mark completed_at when pipeline finishes (done or pending_review)
         if kwargs.get("status") in ("done", "pending_review") and not job.completed_at:
             job.completed_at = datetime.now(timezone.utc)

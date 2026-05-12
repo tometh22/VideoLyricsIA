@@ -22,10 +22,18 @@
 #   1. Plan tier supports overlapping deploys (Pro plan and above).
 #      Hobby plan does the "kill-then-spawn" sequence regardless of
 #      this file.
-#   2. `RAILWAY_SHUTDOWN_TIMEOUT_SECONDS` env var is set to >= 180 on
-#      the Worker service. This is the SIGTERM→SIGKILL grace period;
-#      RQ workers honor SIGTERM by finishing the current job, but
-#      Railway's default grace is 30 s which cuts a Veo poll in half.
+#   2. `RAILWAY_SHUTDOWN_TIMEOUT_SECONDS` env var is set to **1200** (20
+#      min) on the Worker service. This is the SIGTERM→SIGKILL grace
+#      period; RQ workers honor SIGTERM by finishing the current job
+#      (worker.py:_graceful), but Railway's default grace is 30 s which
+#      cuts a Veo poll in half. A background edit can take ~15 min end-
+#      to-end (Veo ~3 min + composite ~5-8 min + headroom), so 30 s ≈
+#      guaranteed mid-render kill on every deploy. Set 1200 once in the
+#      Worker service env and the SIGTERM path actually completes.
+#      Even with this, the reaper.find_abandoned_edits sweep is the
+#      belt-and-suspenders fallback if a worker DOES die: it reverts
+#      status=editing rows back to pending_review at the 30-min mark
+#      and restores edit_count so the user gets the failed attempt back.
 #   3. Health check endpoints respond fast (< 1 s). The API exposes
 #      /health; the worker has none and runs as a daemon — that's fine,
 #      Railway just won't wait on it for the overlap window (see the

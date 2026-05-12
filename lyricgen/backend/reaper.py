@@ -89,6 +89,28 @@ _AWAITING_UPLOAD_TTL_MIN = int(os.environ.get(
     "REAPER_AWAITING_UPLOAD_TTL_MIN", "20",
 ))
 
+# Edit-request abandon threshold. The worst case is a background edit
+# which re-runs Veo (~3 min p99) plus the full video composite (~5-8 min
+# for a 4-min song). 30 min gives 2-3× headroom over the slowest healthy
+# edit; anything older than that is a worker death (deploy/OOM) we need
+# to surface to the user instead of leaving them watching "40%" forever.
+_EDIT_ABANDON_THRESHOLD_MIN = int(os.environ.get(
+    "REAPER_EDIT_ABANDON_THRESHOLD_MIN", "30",
+))
+
+# Stalled-render threshold. Catches jobs in `processing` whose progress
+# hasn't moved in N minutes — the gap between find_orphan_polling_jobs
+# (which fires on stale in-flight AI calls) and find_stuck_jobs (which
+# uses a 100-min created_at threshold). A healthy worker calls
+# jobs.update_job(progress=...) at every step transition and at multiple
+# checkpoints within a step, so a 20-min gap is a strong "worker is dead"
+# signal. Veo polling can pause progress ~3 min p99, ffmpeg composite can
+# run silently ~5 min on long songs — 20 min gives 4-6× headroom over any
+# healthy phase.
+_STALLED_RENDER_THRESHOLD_MIN = int(os.environ.get(
+    "REAPER_STALLED_RENDER_THRESHOLD_MIN", "20",
+))
+
 # Owner inbox for the digest email. Override via env in Railway.
 _OWNER_EMAIL = os.environ.get("OWNER_EMAIL", "tomas@epical.digital")
 
@@ -174,6 +196,124 @@ def find_abandoned_uploads(
     )
 
 
+def find_stalled_renders(
+    db: Session,
+    threshold_min: int = _STALLED_RENDER_THRESHOLD_MIN,
+) -> list[Job]:
+    """Return jobs in `processing` whose progress hasn't moved in
+    threshold_min minutes.
+
+    The scenario this catches: worker SIGKILLed during ffmpeg / moviepy /
+    R2 upload — a non-AI step where there is no in-flight AIProvenance
+    row to anchor find_orphan_polling_jobs, and find_stuck_jobs's 100-min
+    created_at cutoff is too long. Confirmed in prod 2026-05-12: job
+    2144aacb453e killed at video/40% during a deploy, invisible to any
+    reaper for 87 min.
+
+    Signal: last_progress_at, written by jobs.update_job() at every
+    progress call. A healthy worker hits multiple progress checkpoints
+    per minute across whisper / background / video / thumbnail steps.
+    A 20-min gap means the worker is gone.
+
+    Rows with last_progress_at IS NULL are skipped — they predate this
+    column (or status=queued, never picked up). The age-based
+    find_stuck_jobs covers those at 100 min.
+    """
+    cutoff = datetime.now(timezone.utc) - timedelta(minutes=threshold_min)
+    return (
+        db.query(Job)
+        .filter(Job.status == "processing")
+        .filter(Job.last_progress_at.isnot(None))
+        .filter(Job.last_progress_at < cutoff)
+        .order_by(Job.last_progress_at.asc())
+        .all()
+    )
+
+
+def find_abandoned_edits(
+    db: Session,
+    threshold_min: int = _EDIT_ABANDON_THRESHOLD_MIN,
+) -> list[Job]:
+    """Return jobs stuck in `status='editing'` past the edit threshold.
+
+    The scenario this catches: operator clicks "Regenerate background" /
+    "Change typography" / "Fix lyrics", worker picks up the RQ job, then
+    Railway redeploys mid-render. Worker process dies. RQ moves the
+    queue entry to FailedJobRegistry with AbandonedJobError, but the
+    Postgres row stays at status='editing'/progress=N% because the worker
+    never reached its except handler. From the user's POV, the video is
+    stuck at "40%" indefinitely.
+
+    Why we don't use created_at like find_stuck_jobs: lyrics edits are
+    allowed from `done` and `rejected` status, so editing_started_at
+    might be hours/days after created_at. The dedicated timestamp is set
+    by the /edit handler (main.py) the moment the row flips to editing.
+    """
+    cutoff = datetime.now(timezone.utc) - timedelta(minutes=threshold_min)
+    return (
+        db.query(Job)
+        .filter(Job.status == "editing")
+        .filter(Job.editing_started_at.isnot(None))
+        .filter(Job.editing_started_at < cutoff)
+        .order_by(Job.editing_started_at.asc())
+        .all()
+    )
+
+
+def revert_abandoned_edit(db: Session, job: Job) -> None:
+    """Roll an abandoned edit back to pending_review so the user can
+    re-try. The video on R2 from the prior successful render is still
+    intact (the worker overwrites only at the very end of the pipeline,
+    after the composite is finalized — if it died mid-render no bytes
+    were written). Decrement edit_count so the failed attempt doesn't
+    burn one of the operator's 3 allowed edits — Railway's fault, not
+    theirs. Caller commits.
+    """
+    prev_edit_count = job.edit_count or 0
+    new_edit_count = max(0, prev_edit_count - 1)
+    age = 0.0
+    if job.editing_started_at:
+        started = job.editing_started_at
+        if started.tzinfo is None:
+            started = started.replace(tzinfo=timezone.utc)
+        age = (datetime.now(timezone.utc) - started).total_seconds() / 60.0
+    job.status = "pending_review"
+    # The pre-edit terminal state was current_step="thumbnail"/progress=100
+    # for any job that made it to pending_review. Restoring those values
+    # keeps the progress bar / status badge consistent with what the user
+    # saw before they clicked the edit button.
+    job.current_step = "thumbnail"
+    job.progress = 100
+    job.edit_count = new_edit_count
+    job.editing_started_at = None
+    job.error = None
+    db.add(AuditLog(
+        action="reaper.reverted_edit",
+        detail={
+            "job_id": job.job_id,
+            "tenant_id": job.tenant_id,
+            "artist": job.artist,
+            "song_title": job.song_title,
+            "age_minutes": round(age, 1),
+            "reason": (
+                "Edit request abandoned by worker (probable Railway deploy "
+                "or OOM mid-render). Reverted to pending_review with "
+                "edit_count restored so the user can re-try at no cost."
+            ),
+            "previous": {
+                "status": "editing",
+                "current_step": job.current_step,
+                "progress": job.progress,
+                "edit_count": prev_edit_count,
+            },
+            "now": {
+                "status": "pending_review",
+                "edit_count": new_edit_count,
+            },
+        },
+    ))
+
+
 def _age_minutes(job: Job) -> float:
     if not job.created_at:
         return 0.0
@@ -197,6 +337,14 @@ def _reason_for_orphan(job: Job) -> str:
         "El servidor se reinició mientras generábamos el video de fondo. "
         "Tu MP3 sigue guardado: apretá \"Reintentar sin re-subir\" "
         "para volver a generarlo."
+    )
+
+
+def _reason_for_stalled(job: Job) -> str:
+    return (
+        "El servidor se reinició mientras renderizábamos tu video. "
+        "Tu archivo sigue guardado: apretá \"Reintentar\" para "
+        "volver a procesarlo."
     )
 
 
@@ -430,13 +578,20 @@ def _reap_all_stuck_inner(threshold_min: int) -> int:
 
         stuck = find_stuck_jobs(db, threshold_min)
         orphans = find_orphan_polling_jobs(db)
-        # Drop jobs that already appear in `stuck` so we don't double-reap
-        # the same row (the age-based and provenance-based sweeps overlap
-        # for jobs that are both very old AND have an in-flight AI call).
+        stalled = find_stalled_renders(db)
+        # De-dupe across the three processing-status sweeps. `stuck` (age-
+        # based) wins over both, then `orphans` (AI in-flight) wins over
+        # `stalled` (last_progress_at). Same root cause "worker dead" so
+        # the operator only needs one reaped-notification per job; we just
+        # pick the most specific reason.
         stuck_ids = {j.job_id for j in stuck}
         orphans = [j for j in orphans if j.job_id not in stuck_ids]
+        orphan_ids = {j.job_id for j in orphans}
+        stalled = [j for j in stalled
+                   if j.job_id not in stuck_ids and j.job_id not in orphan_ids]
         abandoned = find_abandoned_transcribed(db)
         abandoned_uploads = find_abandoned_uploads(db)
+        abandoned_edits = find_abandoned_edits(db)
         # Reap abandoned transcribed_pending rows quietly: the user never
         # got a job started, so the failure isn't operator-visible. Just
         # delete the row and clean up the input file.
@@ -444,7 +599,11 @@ def _reap_all_stuck_inner(threshold_min: int) -> int:
             _delete_abandoned_transcribed(db, job)
         for job in abandoned_uploads:
             _delete_abandoned_upload(db, job)
-        if abandoned or abandoned_uploads:
+        # Abandoned edits get reverted (not deleted) — the prior render
+        # is still on R2 and the user wants to re-approve or re-try.
+        for job in abandoned_edits:
+            revert_abandoned_edit(db, job)
+        if abandoned or abandoned_uploads or abandoned_edits:
             db.commit()
             if abandoned:
                 print(f"[REAPER] cleaned up {len(abandoned)} abandoned "
@@ -452,12 +611,17 @@ def _reap_all_stuck_inner(threshold_min: int) -> int:
             if abandoned_uploads:
                 print(f"[REAPER] cleaned up {len(abandoned_uploads)} abandoned "
                       f"awaiting_upload job(s)")
-        if not stuck and not orphans:
+            if abandoned_edits:
+                print(f"[REAPER] reverted {len(abandoned_edits)} abandoned "
+                      f"edit job(s) back to pending_review")
+        if not stuck and not orphans and not stalled:
             return 0
         for job in stuck:
             reap_stuck_job(db, job, _reason_for(job))
         for job in orphans:
             reap_stuck_job(db, job, _reason_for_orphan(job))
+        for job in stalled:
+            reap_stuck_job(db, job, _reason_for_stalled(job))
         db.commit()
         # Detach so we can pass to background helpers without keeping the
         # session open. The fields we need are already populated.
@@ -465,10 +629,12 @@ def _reap_all_stuck_inner(threshold_min: int) -> int:
             db.expunge(job)
         for job in orphans:
             db.expunge(job)
-        # Merge orphan reaps into the same notification batch as age-based
-        # ones — operators care about "what got reaped this cycle", not
-        # which sweep flagged it.
-        stuck = stuck + orphans
+        for job in stalled:
+            db.expunge(job)
+        # Merge all three sweeps into one notification batch — operators
+        # care about "what got reaped this cycle", not which sweep flagged
+        # it. de-dup above already guaranteed no overlap.
+        stuck = stuck + orphans + stalled
     finally:
         # Releasing the advisory lock is implicit on session close
         # (Postgres releases all session-scoped locks automatically),

@@ -337,6 +337,23 @@ class Job(Base):
     render_params = Column(JSONB, nullable=True)
     edit_count = Column(Integer, default=0, nullable=False, server_default="0")
     bg_r2_key_cached = Column(Text, nullable=True)
+    # Set by /edit when the operator triggers an edit (typography/lyrics/
+    # background). The reaper uses this to detect edits that died mid-render
+    # (worker killed by deploy/OOM): if a job is status="editing" and
+    # editing_started_at is older than ~30 min, the worker is gone.
+    # Created_at can't be used as a proxy because it represents the
+    # original upload time — lyrics edits on day-old "done" jobs would
+    # otherwise look ancient the instant they kicked off.
+    editing_started_at = Column(DateTime(timezone=True), nullable=True)
+    # Updated by jobs.update_job whenever the worker reports progress. The
+    # reaper uses this to detect the "dead zone" between find_orphan_polling_jobs
+    # (which requires an in-flight AIProvenance row) and find_stuck_jobs (which
+    # has a 100-min created_at threshold). A worker SIGKILLed during ffmpeg or
+    # moviepy compositing has no provenance to anchor the orphan sweep and 100
+    # min is too long to make the user wait. Confirmed in prod 2026-05-12:
+    # job 2144aacb453e killed at video/40% during a deploy, invisible to any
+    # reaper for 87 min.
+    last_progress_at = Column(DateTime(timezone=True), nullable=True)
 
     created_at = Column(DateTime(timezone=True), default=utcnow, index=True)
     completed_at = Column(DateTime(timezone=True), nullable=True)
@@ -374,6 +391,14 @@ class Job(Base):
             "review_notes": self.review_notes,
             "edit_count": self.edit_count or 0,
             "render_params": self.render_params,
+            # EditRequestPanel needs both to drive its UI: segments_json hydrates
+            # the inline lyrics editor; bg_r2_key_cached gates the typography
+            # mode (you can only re-render typography on top of a cached bg).
+            # Without these, the panel falsely tells the user the job has no
+            # lyrics and lets them attempt typography edits that the backend
+            # then rejects with a raw English error.
+            "segments_json": self.segments_json,
+            "bg_r2_key_cached": self.bg_r2_key_cached,
             "created_at": self.created_at.timestamp() if self.created_at else None,
             "completed_at": self.completed_at.timestamp() if self.completed_at else None,
         }
@@ -683,6 +708,16 @@ def _migrate_user_columns():
         "ALTER TABLE jobs ADD COLUMN IF NOT EXISTS render_params JSONB",
         "ALTER TABLE jobs ADD COLUMN IF NOT EXISTS edit_count INTEGER NOT NULL DEFAULT 0",
         "ALTER TABLE jobs ADD COLUMN IF NOT EXISTS bg_r2_key_cached TEXT",
+        # Reaper signal for "edit died mid-render". Set by /edit handler,
+        # read by reaper.find_abandoned_edits to detect worker deaths
+        # without relying on the original created_at (which would be stale
+        # for lyrics edits on day-old "done" jobs).
+        "ALTER TABLE jobs ADD COLUMN IF NOT EXISTS editing_started_at TIMESTAMPTZ",
+        # Reaper signal for the "stalled render" dead-zone. Set by
+        # jobs.update_job() whenever the worker reports progress; read by
+        # reaper.find_stalled_renders to catch processing jobs whose worker
+        # died in a non-AI step (ffmpeg, moviepy, R2 upload).
+        "ALTER TABLE jobs ADD COLUMN IF NOT EXISTS last_progress_at TIMESTAMPTZ",
     ]
     # Each statement gets its own transaction. In Postgres, a failed statement
     # inside a transaction puts it in aborted state — subsequent execute()

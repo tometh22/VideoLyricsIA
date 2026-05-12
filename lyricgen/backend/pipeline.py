@@ -3027,11 +3027,15 @@ def _analyze_lyrics_for_background(lyrics_text: str, artist: str, job_id: str = 
                                     song_title: str = "", genre: str = "",
                                     concept: str = "",
                                     movement_style: str = "",
-                                    match_lyrics: bool = True) -> dict:
+                                    match_lyrics: bool = True,
+                                    background_hint: str | None = None) -> dict:
     """Use Gemini to analyze lyrics and choose visual style + prompt.
 
     match_lyrics=True  ("Inspirado en la letra"): lyrics anchor or infuse the scene.
     match_lyrics=False: concept/genre vocabulary only, lyrics are ignored.
+    background_hint: optional free-form text from the operator (set by /edit)
+      describing what they want the new background to convey. Overrides
+      Gemini's default interpretation when present.
 
     Returns dict with:
       - style: "video" | "photo" | "illustration"
@@ -3058,11 +3062,40 @@ def _analyze_lyrics_for_background(lyrics_text: str, artist: str, job_id: str = 
         "- Pick a DIFFERENT specific scene each time (don't repeat across songs)\n"
         "- Never include people, faces, hands, or readable text in the scene"
     )
-    _EXAMPLE = (
-        "{\"style\":\"video\",\"prompt\":\"Slow tracking shot through neon-lit "
-        "rain-slicked streets, deep blue and red reflections, smoke rising past "
-        "streetlamps, gritty cinematic 4k\"}"
-    )
+    # 3 contrastive examples (rock/urban, romantic ballad, acoustic) + an
+    # explicit "do not copy verbatim" disclaimer. Replaces the prior
+    # single example which biased Gemini toward "neon-lit rain-slicked
+    # streets" output whenever concept/genre came empty (prompt-bleed
+    # observed in prod 2026-05-12 on Rata Blanca "Mujer Amante" — a
+    # ballad that got rendered as an industrial alley). Plus a hard guard
+    # rail for ballads / love songs at the bottom.
+    _BASE_INSTRUCTIONS = """Respond ONLY with a JSON object, no other text.
+
+Output JSON shape — do NOT copy any of these example scenes verbatim;
+they show only the format and the breadth of valid visual registers:
+
+Example for rock / urban / gritty track:
+{"style":"video","prompt":"Slow tracking shot through neon-lit rain-slicked streets, deep blue and red reflections, smoke rising past streetlamps, gritty cinematic 4k"}
+
+Example for romantic ballad / love song:
+{"style":"video","prompt":"Slow drift through a sunlit room at golden hour, warm light streaming through gauze curtains, soft focus on a glass catching the light, dust motes floating in the warm beam, intimate and calm, cinematic 4k"}
+
+Example for introspective acoustic / folk track:
+{"style":"video","prompt":"Slow aerial pull-back over a misty mountain valley at dawn, layers of soft blue and pink sky, distant silhouettes of pine trees, gentle wind moving low fog, contemplative and vast, cinematic 4k"}
+
+GENRE-TONE COHERENCE (critical):
+If the lyrics or declared genre suggest a love song, romantic ballad,
+soft rock, acoustic, intimate or emotional theme, DO NOT default to
+industrial, urban, dystopian, sewer, alleyway, or neon-rain backgrounds.
+Bias toward warm interiors, golden-hour light, natural landscapes
+(sunset, ocean, mountains at dusk), or symbolic intimate imagery (a
+window, a candle, a glass catching light, hands intertwined). Industrial
+alleys, neon streets, smoke, and rain are reserved for rock / metal /
+punk / hip-hop tracks where the genre or lyrics anchor that vocabulary
+explicitly. When in doubt, prefer warm/natural over urban/industrial."""
+    # Keep _EXAMPLE pointing to the new block so existing f-strings below
+    # absorb the change without further edits.
+    _EXAMPLE = _BASE_INSTRUCTIONS
 
     if normalized_concept:
         concept_guide = _CONCEPT_SCENE_GUIDE[normalized_concept]
@@ -3073,8 +3106,7 @@ def _analyze_lyrics_for_background(lyrics_text: str, artist: str, job_id: str = 
         if match_lyrics:
             # "Inspirado en la letra": concept sets the visual register,
             # lyrics theme infuses the specific execution within it.
-            system_prompt = f"""Respond ONLY with a JSON object, no other text. Example:
-{_EXAMPLE}
+            system_prompt = f"""{_EXAMPLE}
 
 The operator has chosen the visual register: {normalized_concept.upper()}.
 The scene MUST stay within this concept's visual vocabulary:
@@ -3095,8 +3127,7 @@ Hard rules:
 - The concept vocabulary is the hard boundary — never exit it{movement_extra_line}"""
         else:
             # Strict concept mode: operator's visual choice, no lyrics influence.
-            system_prompt = f"""Respond ONLY with a JSON object, no other text. Example:
-{_EXAMPLE}
+            system_prompt = f"""{_EXAMPLE}
 
 The operator has explicitly requested a {normalized_concept.upper()} background.
 
@@ -3112,8 +3143,7 @@ Hard rules:
 
         if match_lyrics:
             # "Inspirado en la letra": lyrics anchor the scene, genre styles it.
-            system_prompt = f"""Respond ONLY with a JSON object, no other text. Example:
-{_EXAMPLE}
+            system_prompt = f"""{_EXAMPLE}
 
 The song genre is: {normalized_genre.upper()}
 
@@ -3130,8 +3160,7 @@ Hard rules:
 - Do NOT default to "calm ocean at sunset" unless this song is BALLAD{movement_extra_line}"""
         else:
             # Strict genre mode: pick from genre vocabulary, ignore lyrics.
-            system_prompt = f"""Respond ONLY with a JSON object, no other text. Example:
-{_EXAMPLE}
+            system_prompt = f"""{_EXAMPLE}
 
 The song genre is: {normalized_genre.upper()}
 
@@ -3146,8 +3175,7 @@ Hard rules:
         if match_lyrics:
             # "Inspirado en la letra" + auto: lyrics anchor the scene,
             # genre classification controls color/mood only.
-            system_prompt = f"""Respond ONLY with a JSON object, no other text. Example:
-{_EXAMPLE}
+            system_prompt = f"""{_EXAMPLE}
 
 STEP 0 — Read the lyrics and identify the PRIMARY VISUAL SUBJECT: the concrete setting, object, or action the song is literally about (e.g., a football/soccer match, the ocean, a city at night, a road trip, a dance floor, rain, a forest). This is your FIRST input for scene choice.
 
@@ -3175,8 +3203,7 @@ Hard rules:
 - Never include people, faces, hands, or readable text in the scene"""
         else:
             # Strict auto mode: classify genre, pick vocabulary, no lyrics.
-            system_prompt = """Respond ONLY with a JSON object, no other text. Example:
-{"style":"video","prompt":"Slow tracking shot through neon-lit rain-slicked streets, deep blue and red reflections, smoke rising past streetlamps, gritty cinematic 4k"}
+            system_prompt = f"""{_EXAMPLE}
 
 Step 1: Classify the song's genre using the artist, title, and lyrics. Pick ONE of:
   rock, pop, ballad, latin, reggaeton, hiphop, electronic, indie, folk, metal
@@ -3210,7 +3237,24 @@ Hard rules:
     title_part = f"\nSong title: {song_title}" if song_title else ""
     genre_part = f"\nDeclared genre: {normalized_genre}" if normalized_genre else ""
     concept_part = f"\nDeclared concept: {normalized_concept}" if normalized_concept else ""
+    # Operator hint (set by /edit when the user clicked "Regenerar fondo"
+    # and typed a free-form description of what they want). Sits at the
+    # TOP of user_content with a strong header so Gemini treats it as the
+    # dominant signal — overriding genre/concept/lyrics defaults that
+    # caused off-tone backgrounds the operator already rejected.
+    hint_block = ""
+    if background_hint:
+        hint_block = (
+            f"[OPERATOR OVERRIDE — HIGHEST PRIORITY]\n"
+            f"The operator was unhappy with previous backgrounds for this song "
+            f"and wants the new one to convey: {background_hint.strip()}\n"
+            f"Build the visual scene around this hint. This overrides the "
+            f"default interpretation of genre/concept/lyrics — the operator's "
+            f"explicit guidance wins. Stay coherent with the song's emotional "
+            f"tone, but the IMAGERY must follow the hint.\n\n"
+        )
     user_content = (
+        f"{hint_block}"
         f"Artist: {artist_label}{title_part}{genre_part}{concept_part}\n\n"
         f"Lyrics (may be incomplete or noisy):\n"
         f"{lyrics_sample or '[transcription failed; rely on artist + title + declared metadata]'}"
@@ -3272,7 +3316,8 @@ Hard rules:
 
 def _get_unique_prompt(lyrics_text: str = None, artist: str = "", job_id: str = None,
                        song_title: str = "", genre: str = "", concept: str = "",
-                       movement_style: str = "", match_lyrics: bool = True) -> dict:
+                       movement_style: str = "", match_lyrics: bool = True,
+                       background_hint: str | None = None) -> dict:
     """Get a unique style+prompt combination. Returns {style, prompt}.
 
     Note: the local _USED_PROMPTS_FILE only sees this worker's previous
@@ -3294,7 +3339,7 @@ def _get_unique_prompt(lyrics_text: str = None, artist: str = "", job_id: str = 
         result = _analyze_lyrics_for_background(
             lyrics_text or "", artist, job_id=job_id, song_title=song_title,
             genre=genre, concept=concept, movement_style=movement_style,
-            match_lyrics=match_lyrics,
+            match_lyrics=match_lyrics, background_hint=background_hint,
         )
         if result["prompt"] and result["prompt"] not in used:
             used.append(result["prompt"])
@@ -3891,8 +3936,13 @@ def _ensure_background(style_hint: str, job_dir: str, lyrics_text: str = None,
                        concept: str = "",
                        movement_style: str = "",
                        image_to_video_path: str | None = None,
-                       match_lyrics: bool = True) -> str:
+                       match_lyrics: bool = True,
+                       background_hint: str | None = None) -> str:
     """Generate background using AI. Gemini picks the best style for the song.
+
+    background_hint: optional free-form operator description, set via /edit
+    when the user clicks "Regenerar fondo" and types what they want. Flows
+    into Gemini's user_content as a [OPERATOR OVERRIDE] block.
 
     Returns path to .mp4 (video style) or .jpg/.png (photo/illustration style).
     """
@@ -3908,6 +3958,7 @@ def _ensure_background(style_hint: str, job_dir: str, lyrics_text: str = None,
     result = _get_unique_prompt(
         lyrics_text, artist, job_id=job_id, song_title=song_title, genre=genre,
         concept=concept, movement_style=movement_style, match_lyrics=match_lyrics,
+        background_hint=background_hint,
     )
     prompt = result["prompt"]
 
@@ -5650,6 +5701,10 @@ def run_edit_pipeline(
     genre = merged.get("genre") or ""
     concept = merged.get("concept") or ""
     movement_style = merged.get("movement_style") or ""
+    # Per-edit operator hint for background regen (set by /edit when the
+    # user typed in the "Aclarar tipo de fondo" textarea). None if absent;
+    # propagates only into the `background` branch below.
+    background_hint = edit_params.get("background_hint") or None
 
     job_dir = os.path.join(OUTPUTS_DIR, job_id)
     os.makedirs(job_dir, exist_ok=True)
@@ -5695,6 +5750,7 @@ def run_edit_pipeline(
                 lyrics_text=lyrics_text, artist=artist, job_id=job_id,
                 song_title=song_title, genre=genre, concept=concept,
                 movement_style=movement_style,
+                background_hint=background_hint,
             )
             update_job(job_id, progress=35)
             # Re-cache the new background so future typography edits work.
