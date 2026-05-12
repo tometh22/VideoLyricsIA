@@ -4,6 +4,7 @@ import os
 from datetime import datetime, timezone
 
 from sqlalchemy import (
+    BigInteger,
     Boolean,
     Column,
     DateTime,
@@ -451,6 +452,52 @@ class EmailVerificationToken(Base):
     expires_at = Column(DateTime(timezone=True), nullable=False)
     used = Column(Boolean, default=False)
     created_at = Column(DateTime(timezone=True), default=utcnow)
+
+
+class UserDriveTokens(Base):
+    """OAuth tokens para la integración Google Drive, uno por user.
+
+    El refresh_token va Fernet-encrypted at rest (DRIVE_TOKEN_ENCRYPTION_KEY
+    en env). Access tokens son short-lived (~1h) y se derivan del refresh
+    en cada uso → no se persisten.
+
+    Scope que usamos: `drive.file` — Drive solo le da acceso a archivos
+    que la app crea, no a todo el Drive del user. Evita Google app
+    verification y mantiene el blast radius chico.
+    """
+    __tablename__ = "user_drive_tokens"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    user_id = Column(Integer, ForeignKey("users.id"), unique=True, nullable=False, index=True)
+    encrypted_refresh_token = Column(String(2048), nullable=False)
+    scope = Column(String(500), nullable=False)
+    google_email = Column(String(255), nullable=True)  # display only en Settings
+    connected_at = Column(DateTime(timezone=True), default=utcnow)
+    last_used_at = Column(DateTime(timezone=True), nullable=True)
+
+
+class DriveTransfer(Base):
+    """Track de una transferencia R2 → Google Drive (uno por click de
+    'Guardar en Drive'). El worker que corre rclone va updateando
+    progress_pct + bytes_transferred mientras corre.
+    """
+    __tablename__ = "drive_transfers"
+
+    # uuid hex (12 chars como job_id). Suficiente para evitar collisions.
+    id = Column(String(32), primary_key=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    job_id = Column(String(12), ForeignKey("jobs.job_id"), nullable=False, index=True)
+    file_type = Column(String(20), nullable=False)  # "umg_master" | "umg_short" | "video" | "short"
+    status = Column(String(20), nullable=False, default="queued", index=True)
+    # queued → running → done | error
+    progress_pct = Column(Integer, default=0)
+    bytes_transferred = Column(BigInteger, default=0)
+    bytes_total = Column(BigInteger, default=0)
+    drive_file_id = Column(String(100), nullable=True)
+    web_view_link = Column(String(500), nullable=True)
+    error = Column(Text, nullable=True)
+    created_at = Column(DateTime(timezone=True), default=utcnow, index=True)
+    completed_at = Column(DateTime(timezone=True), nullable=True)
 
 
 class APIKey(Base):

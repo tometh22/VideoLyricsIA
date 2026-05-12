@@ -3,6 +3,10 @@ uvicorn[standard]==0.34.0
 python-multipart==0.0.20
 python-dotenv>=1.0.0,<2.0.0
 python-jose[cryptography]>=3.3.0,<4.0.0
+# Explicit cryptography pin para Fernet (Drive OAuth token encryption).
+# python-jose[cryptography] ya lo jala como dep transitiva, pero lo
+# declaramos también para que dependabot lo trackee.
+cryptography>=42.0.0,<46.0.0
 passlib[bcrypt]>=1.7.4,<2.0.0
 bcrypt<4.1
 openai-whisper
