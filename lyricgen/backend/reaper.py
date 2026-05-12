@@ -89,6 +89,15 @@ _AWAITING_UPLOAD_TTL_MIN = int(os.environ.get(
     "REAPER_AWAITING_UPLOAD_TTL_MIN", "20",
 ))
 
+# Edit-request abandon threshold. The worst case is a background edit
+# which re-runs Veo (~3 min p99) plus the full video composite (~5-8 min
+# for a 4-min song). 30 min gives 2-3× headroom over the slowest healthy
+# edit; anything older than that is a worker death (deploy/OOM) we need
+# to surface to the user instead of leaving them watching "40%" forever.
+_EDIT_ABANDON_THRESHOLD_MIN = int(os.environ.get(
+    "REAPER_EDIT_ABANDON_THRESHOLD_MIN", "30",
+))
+
 # Owner inbox for the digest email. Override via env in Railway.
 _OWNER_EMAIL = os.environ.get("OWNER_EMAIL", "tomas@epical.digital")
 
@@ -172,6 +181,90 @@ def find_abandoned_uploads(
         .order_by(Job.created_at.asc())
         .all()
     )
+
+
+def find_abandoned_edits(
+    db: Session,
+    threshold_min: int = _EDIT_ABANDON_THRESHOLD_MIN,
+) -> list[Job]:
+    """Return jobs stuck in `status='editing'` past the edit threshold.
+
+    The scenario this catches: operator clicks "Regenerate background" /
+    "Change typography" / "Fix lyrics", worker picks up the RQ job, then
+    Railway redeploys mid-render. Worker process dies. RQ moves the
+    queue entry to FailedJobRegistry with AbandonedJobError, but the
+    Postgres row stays at status='editing'/progress=N% because the worker
+    never reached its except handler. From the user's POV, the video is
+    stuck at "40%" indefinitely.
+
+    Why we don't use created_at like find_stuck_jobs: lyrics edits are
+    allowed from `done` and `rejected` status, so editing_started_at
+    might be hours/days after created_at. The dedicated timestamp is set
+    by the /edit handler (main.py) the moment the row flips to editing.
+    """
+    cutoff = datetime.now(timezone.utc) - timedelta(minutes=threshold_min)
+    return (
+        db.query(Job)
+        .filter(Job.status == "editing")
+        .filter(Job.editing_started_at.isnot(None))
+        .filter(Job.editing_started_at < cutoff)
+        .order_by(Job.editing_started_at.asc())
+        .all()
+    )
+
+
+def revert_abandoned_edit(db: Session, job: Job) -> None:
+    """Roll an abandoned edit back to pending_review so the user can
+    re-try. The video on R2 from the prior successful render is still
+    intact (the worker overwrites only at the very end of the pipeline,
+    after the composite is finalized — if it died mid-render no bytes
+    were written). Decrement edit_count so the failed attempt doesn't
+    burn one of the operator's 3 allowed edits — Railway's fault, not
+    theirs. Caller commits.
+    """
+    prev_edit_count = job.edit_count or 0
+    new_edit_count = max(0, prev_edit_count - 1)
+    age = 0.0
+    if job.editing_started_at:
+        started = job.editing_started_at
+        if started.tzinfo is None:
+            started = started.replace(tzinfo=timezone.utc)
+        age = (datetime.now(timezone.utc) - started).total_seconds() / 60.0
+    job.status = "pending_review"
+    # The pre-edit terminal state was current_step="thumbnail"/progress=100
+    # for any job that made it to pending_review. Restoring those values
+    # keeps the progress bar / status badge consistent with what the user
+    # saw before they clicked the edit button.
+    job.current_step = "thumbnail"
+    job.progress = 100
+    job.edit_count = new_edit_count
+    job.editing_started_at = None
+    job.error = None
+    db.add(AuditLog(
+        action="reaper.reverted_edit",
+        detail={
+            "job_id": job.job_id,
+            "tenant_id": job.tenant_id,
+            "artist": job.artist,
+            "song_title": job.song_title,
+            "age_minutes": round(age, 1),
+            "reason": (
+                "Edit request abandoned by worker (probable Railway deploy "
+                "or OOM mid-render). Reverted to pending_review with "
+                "edit_count restored so the user can re-try at no cost."
+            ),
+            "previous": {
+                "status": "editing",
+                "current_step": job.current_step,
+                "progress": job.progress,
+                "edit_count": prev_edit_count,
+            },
+            "now": {
+                "status": "pending_review",
+                "edit_count": new_edit_count,
+            },
+        },
+    ))
 
 
 def _age_minutes(job: Job) -> float:
@@ -437,6 +530,7 @@ def _reap_all_stuck_inner(threshold_min: int) -> int:
         orphans = [j for j in orphans if j.job_id not in stuck_ids]
         abandoned = find_abandoned_transcribed(db)
         abandoned_uploads = find_abandoned_uploads(db)
+        abandoned_edits = find_abandoned_edits(db)
         # Reap abandoned transcribed_pending rows quietly: the user never
         # got a job started, so the failure isn't operator-visible. Just
         # delete the row and clean up the input file.
@@ -444,7 +538,11 @@ def _reap_all_stuck_inner(threshold_min: int) -> int:
             _delete_abandoned_transcribed(db, job)
         for job in abandoned_uploads:
             _delete_abandoned_upload(db, job)
-        if abandoned or abandoned_uploads:
+        # Abandoned edits get reverted (not deleted) — the prior render
+        # is still on R2 and the user wants to re-approve or re-try.
+        for job in abandoned_edits:
+            revert_abandoned_edit(db, job)
+        if abandoned or abandoned_uploads or abandoned_edits:
             db.commit()
             if abandoned:
                 print(f"[REAPER] cleaned up {len(abandoned)} abandoned "
@@ -452,6 +550,9 @@ def _reap_all_stuck_inner(threshold_min: int) -> int:
             if abandoned_uploads:
                 print(f"[REAPER] cleaned up {len(abandoned_uploads)} abandoned "
                       f"awaiting_upload job(s)")
+            if abandoned_edits:
+                print(f"[REAPER] reverted {len(abandoned_edits)} abandoned "
+                      f"edit job(s) back to pending_review")
         if not stuck and not orphans:
             return 0
         for job in stuck:

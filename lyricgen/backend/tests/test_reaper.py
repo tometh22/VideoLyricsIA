@@ -13,12 +13,29 @@ import uuid
 from datetime import datetime, timedelta, timezone
 
 from database import AIProvenance, Job, SessionLocal
-from reaper import find_orphan_polling_jobs, find_stuck_jobs, reap_all_stuck
+from reaper import (
+    find_abandoned_edits,
+    find_orphan_polling_jobs,
+    find_stuck_jobs,
+    reap_all_stuck,
+)
 
 
-def _seed(db, *, status: str, age_minutes: float, job_id: str | None = None):
-    """Insert a Job row at a synthetic age."""
+def _seed(db, *, status: str, age_minutes: float, job_id: str | None = None,
+          editing_started_minutes_ago: float | None = None,
+          edit_count: int = 0,
+          progress: int = 20,
+          current_step: str = "video"):
+    """Insert a Job row at a synthetic age. editing_started_minutes_ago
+    drives the find_abandoned_edits clock; pass None to leave the column
+    unset (mirrors a row that never went through /edit)."""
     jid = job_id or f"reap_{uuid.uuid4().hex[:8]}"
+    editing_started_at = None
+    if editing_started_minutes_ago is not None:
+        editing_started_at = (
+            datetime.now(timezone.utc)
+            - timedelta(minutes=editing_started_minutes_ago)
+        )
     db.add(Job(
         job_id=jid,
         user_id=1,
@@ -27,8 +44,11 @@ def _seed(db, *, status: str, age_minutes: float, job_id: str | None = None):
         filename="x.mp3",
         style="oscuro",
         status=status,
-        progress=20,
+        progress=progress,
+        current_step=current_step,
         delivery_profile="youtube",
+        edit_count=edit_count,
+        editing_started_at=editing_started_at,
         created_at=datetime.now(timezone.utc) - timedelta(minutes=age_minutes),
     ))
     db.commit()
@@ -248,6 +268,112 @@ def test_no_double_reap_when_job_is_both_old_and_orphan():
         assert row.status == "error"
         assert "abandonó" in row.error.lower(), (
             f"expected age-based message for double-hit job, got {row.error!r}"
+        )
+    finally:
+        _cleanup(db)
+        db.close()
+
+
+# ───────────────────────────────────────────────────
+# Abandoned-edit sweep (worker died during /edit re-render)
+# ───────────────────────────────────────────────────
+
+def test_fresh_editing_job_is_not_reverted():
+    """An edit that just started (5 min ago) is healthy, not abandoned."""
+    db = SessionLocal()
+    try:
+        _cleanup(db)
+        jid = _seed(
+            db, status="editing", age_minutes=60,
+            editing_started_minutes_ago=5, edit_count=1,
+        )
+        abandoned = find_abandoned_edits(db, threshold_min=30)
+        assert all(j.job_id != jid for j in abandoned), (
+            "5-min-old edit should not be abandoned at threshold=30"
+        )
+    finally:
+        _cleanup(db)
+        db.close()
+
+
+def test_old_editing_job_is_reverted_to_pending_review():
+    """Edit started 45 min ago and still in editing/40% → worker is
+    dead. Reaper reverts to pending_review and restores edit_count so
+    the user gets the failed attempt back."""
+    db = SessionLocal()
+    try:
+        _cleanup(db)
+        jid = _seed(
+            db, status="editing", age_minutes=120,
+            editing_started_minutes_ago=45, edit_count=2,
+            progress=40, current_step="video",
+        )
+        n = reap_all_stuck(threshold_min=100)
+        # The age-based sweep (find_stuck_jobs) might also catch this
+        # because the row is 120 min old. What we assert is the final
+        # state, not the headline count.
+        assert n >= 0  # may be 0 if a different status path won the race
+
+        row = db.query(Job).filter(Job.job_id == jid).first()
+        db.refresh(row)
+        assert row.status == "pending_review", (
+            f"expected revert to pending_review, got {row.status!r}"
+        )
+        assert row.edit_count == 1, (
+            f"edit_count should be decremented (2 → 1), got {row.edit_count}"
+        )
+        assert row.progress == 100, (
+            f"progress should be reset to 100 (terminal), got {row.progress}"
+        )
+        assert row.current_step == "thumbnail", (
+            f"current_step should be reset to thumbnail, got {row.current_step!r}"
+        )
+        assert row.editing_started_at is None, (
+            "editing_started_at should be cleared so the next edit re-stamps it"
+        )
+        assert row.error is None, (
+            f"error should be None on revert (the original render is fine), got {row.error!r}"
+        )
+    finally:
+        _cleanup(db)
+        db.close()
+
+
+def test_editing_without_timestamp_is_not_touched():
+    """Legacy editing rows that pre-date the editing_started_at column
+    (NULL value) must not be reverted — we cannot tell when the edit
+    began, so we err on the side of not interfering."""
+    db = SessionLocal()
+    try:
+        _cleanup(db)
+        jid = _seed(
+            db, status="editing", age_minutes=200,
+            editing_started_minutes_ago=None, edit_count=1,
+        )
+        abandoned = find_abandoned_edits(db, threshold_min=30)
+        assert all(j.job_id != jid for j in abandoned), (
+            "edit with NULL editing_started_at should be skipped (no clock)"
+        )
+    finally:
+        _cleanup(db)
+        db.close()
+
+
+def test_edit_count_floor_at_zero():
+    """Defensive: if a job is at edit_count=0 (corrupted state, manual
+    reset) when reaped, decrementing must not produce -1."""
+    db = SessionLocal()
+    try:
+        _cleanup(db)
+        jid = _seed(
+            db, status="editing", age_minutes=120,
+            editing_started_minutes_ago=60, edit_count=0,
+        )
+        reap_all_stuck(threshold_min=100)
+        row = db.query(Job).filter(Job.job_id == jid).first()
+        db.refresh(row)
+        assert row.edit_count == 0, (
+            f"edit_count must not go negative, got {row.edit_count}"
         )
     finally:
         _cleanup(db)

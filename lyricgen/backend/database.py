@@ -336,6 +336,14 @@ class Job(Base):
     render_params = Column(JSONB, nullable=True)
     edit_count = Column(Integer, default=0, nullable=False, server_default="0")
     bg_r2_key_cached = Column(Text, nullable=True)
+    # Set by /edit when the operator triggers an edit (typography/lyrics/
+    # background). The reaper uses this to detect edits that died mid-render
+    # (worker killed by deploy/OOM): if a job is status="editing" and
+    # editing_started_at is older than ~30 min, the worker is gone.
+    # Created_at can't be used as a proxy because it represents the
+    # original upload time — lyrics edits on day-old "done" jobs would
+    # otherwise look ancient the instant they kicked off.
+    editing_started_at = Column(DateTime(timezone=True), nullable=True)
 
     created_at = Column(DateTime(timezone=True), default=utcnow, index=True)
     completed_at = Column(DateTime(timezone=True), nullable=True)
@@ -636,6 +644,11 @@ def _migrate_user_columns():
         "ALTER TABLE jobs ADD COLUMN IF NOT EXISTS render_params JSONB",
         "ALTER TABLE jobs ADD COLUMN IF NOT EXISTS edit_count INTEGER NOT NULL DEFAULT 0",
         "ALTER TABLE jobs ADD COLUMN IF NOT EXISTS bg_r2_key_cached TEXT",
+        # Reaper signal for "edit died mid-render". Set by /edit handler,
+        # read by reaper.find_abandoned_edits to detect worker deaths
+        # without relying on the original created_at (which would be stale
+        # for lyrics edits on day-old "done" jobs).
+        "ALTER TABLE jobs ADD COLUMN IF NOT EXISTS editing_started_at TIMESTAMPTZ",
     ]
     # Each statement gets its own transaction. In Postgres, a failed statement
     # inside a transaction puts it in aborted state — subsequent execute()
