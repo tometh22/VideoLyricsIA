@@ -345,6 +345,15 @@ class Job(Base):
     # original upload time — lyrics edits on day-old "done" jobs would
     # otherwise look ancient the instant they kicked off.
     editing_started_at = Column(DateTime(timezone=True), nullable=True)
+    # Updated by jobs.update_job whenever the worker reports progress. The
+    # reaper uses this to detect the "dead zone" between find_orphan_polling_jobs
+    # (which requires an in-flight AIProvenance row) and find_stuck_jobs (which
+    # has a 100-min created_at threshold). A worker SIGKILLed during ffmpeg or
+    # moviepy compositing has no provenance to anchor the orphan sweep and 100
+    # min is too long to make the user wait. Confirmed in prod 2026-05-12:
+    # job 2144aacb453e killed at video/40% during a deploy, invisible to any
+    # reaper for 87 min.
+    last_progress_at = Column(DateTime(timezone=True), nullable=True)
 
     created_at = Column(DateTime(timezone=True), default=utcnow, index=True)
     completed_at = Column(DateTime(timezone=True), nullable=True)
@@ -704,6 +713,11 @@ def _migrate_user_columns():
         # without relying on the original created_at (which would be stale
         # for lyrics edits on day-old "done" jobs).
         "ALTER TABLE jobs ADD COLUMN IF NOT EXISTS editing_started_at TIMESTAMPTZ",
+        # Reaper signal for the "stalled render" dead-zone. Set by
+        # jobs.update_job() whenever the worker reports progress; read by
+        # reaper.find_stalled_renders to catch processing jobs whose worker
+        # died in a non-AI step (ffmpeg, moviepy, R2 upload).
+        "ALTER TABLE jobs ADD COLUMN IF NOT EXISTS last_progress_at TIMESTAMPTZ",
     ]
     # Each statement gets its own transaction. In Postgres, a failed statement
     # inside a transaction puts it in aborted state — subsequent execute()
