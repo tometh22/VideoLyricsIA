@@ -4950,6 +4950,199 @@ async def retry_job(
 
 
 # ---------------------------------------------------------------------------
+# Variantes — re-generar un job aprobado con otro Veo background
+# ---------------------------------------------------------------------------
+
+class VariantJobRequest(BaseModel):
+    """Body para POST /jobs/{parent_job_id}/variant.
+
+    Crea un job NUEVO (cuenta como video pago del plan) que hereda del
+    padre: audio (input_r2_key), segments_json (lyrics aprobadas), artist,
+    song_title, umg_spec, delivery_profile, typography (font/case/etc).
+    Re-genera SOLO el background Veo, opcionalmente con un hint o concept
+    distinto al original. Use case: el operador ya tiene un video aprobado
+    pero quiere probar otra estética sin perder el trabajo de lyrics ya
+    afinadas.
+
+    Todos los campos son opcionales — si no se mandan, el job hereda los
+    valores del padre. La única forma "barata" de crear variante es no
+    mandar nada y dejar que Gemini re-elija el prompt con el system prompt
+    desbiaseado (PR #116).
+    """
+    # Mismo formato y max_length que EditJobRequest.background_hint —
+    # va al user_content de Gemini con header [OPERATOR OVERRIDE].
+    background_hint: str | None = Field(default=None, max_length=300)
+    # Override del concept del padre. 2000 chars igual que /generate.
+    # Alimenta _get_unique_prompt() junto con genre/style/lyrics.
+    concept: str | None = Field(default=None, max_length=2000)
+    # Override del style preset (gradient palette + visual register).
+    style: str | None = Field(default=None, max_length=50)
+
+
+@app.post("/jobs/{parent_job_id}/variant")
+async def create_variant(
+    parent_job_id: str,
+    body: VariantJobRequest,
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Crea una variante del job padre. Job nuevo con su propio job_id,
+    propio review flow, y propio cobro al plan. Mismo audio + mismo
+    segments_json — solo cambia el background Veo (y opcionalmente
+    typography si el padre tenía y se quiere mantener).
+
+    El padre debe estar en status='done'. La variante arranca en 'processing'
+    y va por el pipeline normal saltando Whisper (segments_override).
+
+    400 si padre no done. 402 si el plan está sin capacidad. 403 si el
+    padre no es del tenant del user. 404 si el padre no existe.
+    """
+    import uuid
+    from database import Job as JobModel, AuditLog
+
+    parent = (
+        db.query(JobModel)
+        .filter(JobModel.job_id == parent_job_id)
+        .filter(JobModel.tenant_id == current_user["tenant_id"])
+        .first()
+    )
+    if not parent:
+        raise HTTPException(status_code=404, detail="Parent job not found")
+    if parent.status != "done":
+        raise HTTPException(
+            status_code=400,
+            detail=f"Solo se pueden crear variantes de jobs aprobados (status='done'). "
+                   f"Este job está en status='{parent.status}'.",
+        )
+    if not parent.segments_json:
+        # Sanity: un job "done" SIN segments_json no sirve como padre
+        # porque la variante no podría saltar Whisper. No debería pasar
+        # — todos los jobs done post-PR #106 persisten segments — pero
+        # guard explícito.
+        raise HTTPException(
+            status_code=422,
+            detail="Este job no tiene lyrics persistidas — no se puede "
+                   "crear variante sin re-subir el audio.",
+        )
+    if not parent.input_r2_key:
+        raise HTTPException(
+            status_code=422,
+            detail="Audio del job padre ya no está disponible en storage — "
+                   "no se puede crear variante.",
+        )
+
+    # Plan capacity check — misma lógica que /generate. Variante cuenta
+    # como 1 video del plan.
+    plan = current_user.get("plan", "100")
+    usage_info = get_plan_usage(db, current_user["id"], current_user["tenant_id"], plan)
+    if usage_info["alert_100"] and plan == "free":
+        raise HTTPException(
+            status_code=429,
+            detail="Free plan limit reached. Upgrade to continue.",
+        )
+    # Para planes pagos, allow_overage decide si se permite pasarse del cap.
+    user_model = db.query(User).filter(User.id == current_user["id"]).first()
+    if usage_info.get("alert_100") and not (user_model and user_model.allow_overage):
+        raise HTTPException(
+            status_code=402,
+            detail=f"Llegaste al límite de tu plan ({usage_info.get('limit', '?')} videos). "
+                   f"Activá overage o subí de plan para crear más variantes.",
+        )
+
+    # Merge: render_params del padre + overrides del body.
+    parent_render_params = dict(parent.render_params or {})
+    new_render_params = dict(parent_render_params)
+    if body.background_hint is not None:
+        new_render_params["background_hint"] = body.background_hint
+    if body.concept is not None:
+        new_render_params["concept"] = body.concept
+
+    # Style: override o herencia.
+    new_style = body.style if body.style is not None else (parent.style or "oscuro")
+
+    # Crear el job nuevo. NO usamos jobs.create_job() porque queremos
+    # control fino sobre segments_json + parent_job_id + render_params
+    # mergeados, y create_job no acepta esos params.
+    new_job_id = uuid.uuid4().hex[:12]
+    new_job = JobModel(
+        job_id=new_job_id,
+        user_id=current_user["id"],
+        tenant_id=current_user["tenant_id"],
+        artist=parent.artist,
+        song_title=parent.song_title,
+        style=new_style,
+        filename=parent.filename,
+        delivery_profile=parent.delivery_profile,
+        umg_spec=parent.umg_spec,
+        status="processing",
+        current_step="background",  # salta Whisper
+        progress=0,
+        input_r2_key=parent.input_r2_key,
+        segments_json=parent.segments_json,
+        render_params=new_render_params,
+        edit_count=0,
+        parent_job_id=parent.job_id,
+    )
+    db.add(new_job)
+    db.add(AuditLog(
+        user_id=current_user["id"],
+        action="job.variant_created",
+        detail={
+            "parent_job_id": parent.job_id,
+            "new_job_id": new_job_id,
+            "background_hint": body.background_hint,
+            "concept_overridden": body.concept is not None,
+            "style_overridden": body.style is not None,
+        },
+    ))
+    db.commit()
+
+    # Encolar con segments_override para saltar Whisper. Mismo kwargs
+    # shape que /retry, más concept/background_hint si vinieron.
+    pipeline_kwargs = {
+        "delivery_profile": parent.delivery_profile or "youtube",
+        "input_r2_key": parent.input_r2_key,
+        "song_title": parent.song_title or "",
+        "umg_spec": parent.umg_spec or {},
+        "segments_override": parent.segments_json,
+    }
+    # render_params del padre + overrides — los param de typography
+    # (font, font_scale, etc) se pasan como kwargs individuales que
+    # run_pipeline acepta. concept también va por kwarg.
+    for k in ("font", "font_scale", "text_case", "lyric_transition",
+              "text_motion", "text_contrast", "movement_style",
+              "animate_image", "genre", "match_lyrics"):
+        if k in new_render_params:
+            pipeline_kwargs[k] = new_render_params[k]
+    if body.concept is not None:
+        pipeline_kwargs["concept"] = body.concept
+    elif parent_render_params.get("concept"):
+        pipeline_kwargs["concept"] = parent_render_params["concept"]
+    # background_hint llega solo si el operador escribió algo en el
+    # textarea del modal. Si está vacío, run_pipeline lo recibe como
+    # None y _ensure_background sigue el flow default (PR #116
+    # system prompt desbiaseado).
+    if body.background_hint is not None:
+        pipeline_kwargs["background_hint"] = body.background_hint
+
+    enqueue_pipeline(
+        job_id=new_job_id,
+        mp3_path=None,
+        artist=parent.artist,
+        style=new_style,
+        plan=plan,
+        **pipeline_kwargs,
+    )
+
+    return {
+        "ok": True,
+        "job_id": new_job_id,
+        "parent_job_id": parent.job_id,
+        "status": "processing",
+    }
+
+
+# ---------------------------------------------------------------------------
 # Settings
 # ---------------------------------------------------------------------------
 
