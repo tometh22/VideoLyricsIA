@@ -442,9 +442,13 @@ export default function Settings({ onBack }) {
         {[
           { id: "cuenta",         label: t("settings.account") || "Cuenta" },
           { id: "facturacion",    label: t("settings.billing") || "Facturación" },
-          { id: "integraciones",  label: t("settings.integrations_tab") || "Integraciones" },
+          // Integraciones por ahora sólo contiene Drive — escondemos
+          // toda la tab cuando el feature flag está off (canary mode).
+          user?.features?.drive_export
+            ? { id: "integraciones", label: t("settings.integrations_tab") || "Integraciones" }
+            : null,
           { id: "youtube",        label: "YouTube" },
-        ].map((s) => (
+        ].filter(Boolean).map((s) => (
           <TabPill key={s.id} active={activeSection === s.id} onClick={() => setActiveSection(s.id)}>
             {s.label}
           </TabPill>
@@ -880,7 +884,10 @@ export default function Settings({ onBack }) {
         )}
 
         {/* ════════════════════ INTEGRACIONES ════════════════════ */}
-        {activeSection === "integraciones" && (
+        {/* Canary: el card Drive sólo aparece si features.drive_export.
+            Por ahora = admin only. Cuando se abra a tenant X, los users
+            de ese tenant verán automáticamente la card sin más cambios. */}
+        {activeSection === "integraciones" && user?.features?.drive_export && (
           <>
             <Card>
               <SectionLabel>{t("settings.integrations_drive_label") || "Google Drive"}</SectionLabel>

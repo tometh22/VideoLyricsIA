@@ -63,6 +63,7 @@ from auth import (
     verify_media_token,
     validate_password_strength,
     has_prores_access,
+    has_drive_access,
     generate_api_key,
 )
 import storage
@@ -1072,6 +1073,8 @@ async def drive_auth_url(
     """Devuelve la URL de OAuth a la que el frontend redirige al user.
     El state token está HMAC-signed y bindea la sesión OAuth a este
     user — sin esto un atacante podría forzar callbacks a otra cuenta."""
+    if not has_drive_access(current_user):
+        raise HTTPException(status_code=403, detail="Drive integration not enabled for your account.")
     from drive_oauth import build_authorization_url, DriveOAuthError
     try:
         url = build_authorization_url(current_user["id"])
@@ -1123,6 +1126,14 @@ async def drive_callback(
         logger.warning("[drive_oauth] invalid state: %s", e)
         return RedirectResponse(f"{error_redirect}&reason=invalid_state", status_code=302)
 
+    # Canary gate: el state token vino firmado por nosotros, pero igual
+    # re-chequeamos has_drive_access del user_id contenido — si su
+    # acceso fue revocado entre auth-url y callback, no guardamos tokens.
+    callback_user = db.query(User).filter(User.id == user_id).first()
+    if not has_drive_access(callback_user):
+        logger.warning("[drive_oauth] callback for user %s without drive access", user_id)
+        return RedirectResponse(f"{error_redirect}&reason=not_enabled", status_code=302)
+
     try:
         tokens = exchange_code_for_tokens(code)
     except DriveOAuthError as e:
@@ -1167,6 +1178,8 @@ async def drive_status(
     """Devuelve si este user tiene Drive conectado y, si sí, qué cuenta.
     El frontend lo usa para decidir si mostrar 'Conectar' o 'Conectado
     como X — Desconectar' en Settings."""
+    if not has_drive_access(current_user):
+        raise HTTPException(status_code=403, detail="Drive integration not enabled for your account.")
     from database import UserDriveTokens
     row = db.query(UserDriveTokens).filter(UserDriveTokens.user_id == current_user["id"]).first()
     if row is None:
@@ -1188,6 +1201,8 @@ async def drive_disconnect(
     local. Si Google falla, igual borramos la row — el user ya no
     quiere conexión y los tokens viejos quedarán huérfanos del lado
     de Google, sin afectarnos."""
+    if not has_drive_access(current_user):
+        raise HTTPException(status_code=403, detail="Drive integration not enabled for your account.")
     from drive_oauth import decrypt_token, revoke_refresh_token, DriveTokenDecryptError
     from database import UserDriveTokens
 
@@ -4657,6 +4672,8 @@ async def deliver_to_drive(
     Filename en Drive: '<job_id>__<filename>' para evitar colisiones
     cuando varios jobs tienen el mismo umg_master.mov.
     """
+    if not has_drive_access(current_user):
+        raise HTTPException(status_code=403, detail="Drive integration not enabled for your account.")
     import uuid
     from database import Job as JobModel, DriveTransfer, UserDriveTokens
     from drive_uploader import FILE_TYPE_TO_DRIVE_NAME
@@ -4743,6 +4760,8 @@ async def get_drive_transfer(
 ):
     """Status actual de una transferencia. Frontend polea esto cada 3s
     mientras el modal de transferencia está abierto."""
+    if not has_drive_access(current_user):
+        raise HTTPException(status_code=403, detail="Drive integration not enabled for your account.")
     from database import DriveTransfer
 
     transfer = (

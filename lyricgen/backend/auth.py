@@ -71,6 +71,34 @@ def has_prores_access(user) -> bool:
     tenant_id = getattr(user, "tenant_id", None) if not isinstance(user, dict) else user.get("tenant_id")
     return (tenant_id or "").lower() in PRORES_TENANTS
 
+
+# Tenants con acceso a la integración Google Drive ("Guardar en Drive").
+# Canary: default vacío → SOLO admin pasa. Cuando se quiera abrir a un
+# tenant específico (UMG, Warner, etc) se setea DRIVE_ENABLED_TENANTS=umg
+# en env vars sin redeploy de código. Mismo patrón que PRORES_TENANTS.
+DRIVE_ENABLED_TENANTS = {
+    t.strip().lower()
+    for t in os.environ.get("DRIVE_ENABLED_TENANTS", "").split(",")
+    if t.strip()
+}
+
+
+def has_drive_access(user) -> bool:
+    """True iff `user` puede usar la integración Google Drive.
+
+    Admin role siempre pasa. Para usuarios no-admin se chequea contra
+    DRIVE_ENABLED_TENANTS (vacío por defecto = solo admin). Mismo shape
+    que has_prores_access — operator policy vía env var.
+    """
+    if user is None:
+        return False
+    role = getattr(user, "role", None) if not isinstance(user, dict) else user.get("role")
+    if role == "admin":
+        return True
+    tenant_id = getattr(user, "tenant_id", None) if not isinstance(user, dict) else user.get("tenant_id")
+    return (tenant_id or "").lower() in DRIVE_ENABLED_TENANTS
+
+
 # Anyone who knows the default secret can forge admin tokens, so running with
 # it in production is unacceptable. Fail fast at import time.
 _ENV = (
@@ -164,7 +192,10 @@ def verify_api_key(db: Session, full_key: str) -> Optional[dict]:
         "tenant_id": user.tenant_id,
         "plan": user.plan_id,
         "allow_overage": getattr(user, "allow_overage", False) or False,
-        "features": {"prores_export": has_prores_access(user)},
+        "features": {
+            "prores_export": has_prores_access(user),
+            "drive_export": has_drive_access(user),
+        },
     }
 
 
@@ -449,6 +480,7 @@ async def get_current_user(
         # gates later doesn't churn the client.
         "features": {
             "prores_export": has_prores_access(user),
+            "drive_export": has_drive_access(user),
         },
     }
 
