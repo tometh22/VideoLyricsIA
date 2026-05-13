@@ -2630,6 +2630,33 @@ def _fetch_lyrics_via_gemini_search(
                 recorder.finish(response_summary=f"too_short_chars={len(text)}")
             return None
 
+        # Merged-line quality guard. Algunos sitios de letras devuelven
+        # las estrofas como párrafos largos en vez de líneas separadas
+        # (ej. Letras.com en flow mode). Si Gemini scrapea ese formato,
+        # avg chars/line se dispara (paragraph-style ~80+ chars vs
+        # lyric-style ~20-40 chars). Cuando este texto se usa como
+        # `lyrics_hint` de Whisper o como reference para gap-fill, el
+        # output queda mergeado de a 2-3 líneas con timestamps mal
+        # distribuidos (caso real: Noches Sin Sueño Rata Blanca en
+        # staging, Gemini devolvió 439 chars / 12 lines = 36.6 chars/line
+        # cuando lrclib synced tenía ~30 líneas para esa canción).
+        #
+        # Threshold 50: lyric lines típicas de pop/rock/balada son 20-40
+        # chars. 50+ es signature de merged-stanza scraping. Rechazar
+        # es preferible a contaminar — el caller cae al path de Whisper
+        # sin hint en vez de Whisper sesgado con merged-text.
+        avg_chars_per_line = sum(len(l) for l in lines) / len(lines)
+        if avg_chars_per_line > 50.0:
+            print(f"[LYRICS] gemini output looks merged "
+                  f"(avg {avg_chars_per_line:.1f} chars/line over "
+                  f"{len(lines)} lines) — rejecting")
+            if recorder:
+                recorder.finish(
+                    response_summary=f"rejected_merged_lines="
+                                     f"{avg_chars_per_line:.1f}cpl/{len(lines)}",
+                )
+            return None
+
         # Repetition guard — Gemini hallucination loops on a single line.
         from collections import Counter
         most_common, mc_count = Counter(lines).most_common(1)[0]
