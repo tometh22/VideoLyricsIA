@@ -1325,12 +1325,31 @@ export default function AdminPanel({ onBack }) {
                 </div>
               </details>
 
-              <p className="text-[10px] text-gray-600 leading-relaxed">
-                Whisper se cobra como API de OpenAI a ~$0.006/min de audio (estimado en $0.021 por llamada · canción promedio ~3.5 min).
-                Veo Fast a $0.80/call (palindrome loop 8s) · Veo Standard $3.20.
-                Margen calculado contra revenue manual editable arriba (default $8/video = contrato Universal $2k / 250 videos).
-                Los rejected y errored cuentan como "videos no entregables" pero su Veo cost SÍ se incluye en el gasto total — por eso el costo real por deliverable es mayor que el marginal de un render limpio.
-              </p>
+              <div className="rounded-card bg-surface-3/30 ring-1 ring-white/[0.04] p-4 space-y-2">
+                <p className="text-[11px] text-gray-300 font-medium uppercase tracking-wide">
+                  Cómo leer estos números
+                </p>
+                <ul className="text-[10px] text-gray-500 leading-relaxed list-disc pl-4 space-y-1">
+                  <li>
+                    <b>Veo Fast</b> a $0.80/call (palindrome loop 8s) · <b>Veo Standard</b> $3.20.
+                  </li>
+                  <li>
+                    <b>Whisper</b> cobrado como API de OpenAI a ~$0.006/min de audio (estimado en $0.021/call · canción promedio ~3.5 min). Las canciones más largas pueden costar +50%.
+                  </li>
+                  <li>
+                    <b>Margen</b> calculado contra revenue editable arriba (default $8/video = contrato Universal $2k / 250 videos). No incluye costos de infra (Railway + R2 ≈ $50/mes fijo) ni Stripe fees.
+                  </li>
+                  <li>
+                    <b>Costo / deliverable</b> incluye rejects y retries — por eso es mayor que el marginal de un render limpio.
+                  </li>
+                  <li>
+                    <b>Veo in-flight</b> (calls con duration NULL): se cuentan como costo aunque Google probablemente no las facture si el render no completó. Sobre-estimación máxima ~$1.60.
+                  </li>
+                  <li>
+                    Provenance de Whisper antes del 2026-05-13 fue backfilled con rows sintéticas (un row por job que llegó a status done/pending/rejected/editing). Jobs nuevos quedan tracked automáticamente.
+                  </li>
+                </ul>
+              </div>
             </>
           )}
         </div>

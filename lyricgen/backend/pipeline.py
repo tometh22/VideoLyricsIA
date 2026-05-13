@@ -283,7 +283,14 @@ def run_pipeline(job_id: str, mp3_path: str, artist: str, style: str,
                  lyric_transition: str = "cut",
                  text_motion: str = "none",
                  match_lyrics: bool = True,
-                 text_contrast: str = "medium"):
+                 text_contrast: str = "medium",
+                 # Background_hint llega solo desde el flow de variantes
+                 # (POST /jobs/{id}/variant). En el upload normal viene
+                 # vacío y el prompt Gemini se arma 100% desde concept +
+                 # genre + lyrics. Cuando viene set, _ensure_background
+                 # lo inyecta como [OPERATOR OVERRIDE] en el user_content
+                 # de Gemini, misma mecánica que /edit (PR #116).
+                 background_hint: str | None = None):
     """Run the full pipeline for a job. Called synchronously.
 
     delivery_profile:
@@ -430,6 +437,7 @@ def run_pipeline(job_id: str, mp3_path: str, artist: str, style: str,
                 lyrics_hint = _best_effort_lyrics_hint(artist, song_title)
                 segments = transcribe(
                     mp3_path, language=language, lyrics_hint=lyrics_hint,
+                    job_id=job_id,
                 )
         # Persist segments so edit re-renders can skip re-transcription.
         # Skip when we just read them from the same row — pointless write.
@@ -494,6 +502,7 @@ def run_pipeline(job_id: str, mp3_path: str, artist: str, style: str,
                 movement_style=movement_style,
                 image_to_video_path=(background_path if _animate_user_image else None),
                 match_lyrics=match_lyrics,
+                background_hint=background_hint,
             )
             # Image-to-video fallback: if Veo failed to produce an MP4 (None
             # or non-existent path) AND the operator wanted to animate their
@@ -1069,7 +1078,8 @@ def _compress_for_whisper(input_path: str) -> str:
 
 
 def _transcribe_via_openai_api(mp3_path: str, language: str | None = None,
-                                lyrics_hint: str | None = None) -> list[dict]:
+                                lyrics_hint: str | None = None,
+                                job_id: str | None = None) -> list[dict]:
     """Transcribe by calling OpenAI's Whisper API. Returns the same segments
     structure as the local Whisper path. Used in production where loading
     the local model would consume too much worker RAM (~3 GB) and risks OOM.
@@ -1134,6 +1144,21 @@ def _transcribe_via_openai_api(mp3_path: str, language: str | None = None,
     # untouched and used by the rest of the render pipeline.
     api_path = _compress_for_whisper(mp3_path)
     cleanup_compressed = api_path != mp3_path
+    # Provenance record for the cost dashboard. job_id is optional — paths
+    # that call transcribe() without a job_id (one-off scripts, tests)
+    # skip the recording, and the cost panel just under-reports those
+    # outliers. The OpenAI call itself is the same either way.
+    recorder = None
+    if job_id:
+        from provenance import record_ai_call
+        recorder = record_ai_call(
+            job_id=job_id,
+            step="whisper_transcribe",
+            tool_name="whisper-1",
+            tool_provider="openai",
+            prompt=prompt_text[:500],
+            input_data_types=["audio_file"],
+        )
     try:
         with open(api_path, "rb") as f:
             kwargs["file"] = f
@@ -1173,6 +1198,14 @@ def _transcribe_via_openai_api(mp3_path: str, language: str | None = None,
                 os.unlink(api_path)
             except OSError:
                 pass
+
+    if recorder is not None:
+        # Mark the provenance row finished so the dashboard counts this
+        # call and the reaper does not mistake it for an in-flight orphan.
+        try:
+            recorder.finish(response_summary=f"whisper_transcribe_ok")
+        except Exception:
+            pass
 
     raw_segments = response.segments or []
     import re as _re
@@ -1333,7 +1366,8 @@ def _transcribe_via_openai_api(mp3_path: str, language: str | None = None,
 
 
 def transcribe(mp3_path: str, language: str = None,
-               lyrics_hint: str | None = None) -> list[dict]:
+               lyrics_hint: str | None = None,
+               job_id: str | None = None) -> list[dict]:
     """Transcribe an audio file to lyric segments.
 
     Backend selection:
@@ -1354,6 +1388,7 @@ def transcribe(mp3_path: str, language: str = None,
     if has_key:
         return _transcribe_via_openai_api(
             mp3_path, language=language, lyrics_hint=lyrics_hint,
+            job_id=job_id,
         )
 
     # --- local Whisper path ---
@@ -2335,19 +2370,40 @@ def _slice_audio_window(input_path: str, output_path: str,
         return False
 
 
-def _whisper_quick_text(mp3_path: str) -> str:
+def _whisper_quick_text(mp3_path: str, job_id: str | None = None) -> str:
     """Minimal whisper-1 transcription of a short clip — used by alignment
     verification. Returns plain text with no post-processing (no spam
     filter, no dedup). Best-effort: returns "" on any failure.
+
+    `job_id` is optional; when provided, the call gets recorded in
+    ai_provenance so the cost dashboard counts it. These clips are
+    short (~5 s) so the cost is ~$0.0005 each, but at scale across
+    every job the cents add up.
     """
     if not os.path.exists(mp3_path):
         return ""
+    recorder = None
+    if job_id:
+        from provenance import record_ai_call
+        recorder = record_ai_call(
+            job_id=job_id,
+            step="whisper_quick_align",
+            tool_name="whisper-1",
+            tool_provider="openai",
+            prompt="(audio alignment short clip)",
+            input_data_types=["audio_file_short"],
+        )
     try:
         from openai import OpenAI
         with open(mp3_path, "rb") as f:
             r = OpenAI().audio.transcriptions.create(
                 model="whisper-1", file=f, response_format="text",
             )
+        if recorder is not None:
+            try:
+                recorder.finish(response_summary="whisper_quick_ok")
+            except Exception:
+                pass
         return (r or "").strip()
     except Exception as e:
         print(f"[LYRICS] _whisper_quick_text failed: {e}")
