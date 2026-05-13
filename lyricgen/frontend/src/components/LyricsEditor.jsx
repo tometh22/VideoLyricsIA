@@ -1180,7 +1180,7 @@ export default function LyricsEditor({
           <div className="mt-2 px-3 py-3 rounded-card bg-surface-1/40 ring-1 ring-white/[0.04] space-y-3 animate-fade-in">
             <p className="text-[11px] text-gray-500 leading-relaxed">
               {t("editor.shift_panel_hint") ||
-                "Aplica un offset uniforme a todas las líneas. Valores positivos atrasan las letras (aparecen más tarde); negativos las adelantan."}
+                "Aplica un offset uniforme a todas las líneas. Si la letra aparece tarde, usá valores negativos (anticipar). Si aparece antes de tiempo, positivos (atrasar). Drift típico de lyrics curadas: 100-200ms."}
             </p>
 
             {/* Slider continuo */}
@@ -1198,9 +1198,11 @@ export default function LyricsEditor({
               <span className="text-[10px] font-mono text-gray-500 w-12">+1000ms</span>
             </div>
 
-            {/* Presets + valor actual + input custom */}
+            {/* Presets + valor actual + input custom. Granularidad fina
+                para drift típico de lrclib synced (100-200ms) + presets
+                más gruesos para mismatches mayores. */}
             <div className="flex flex-wrap items-center gap-2">
-              {[-500, -250, 0, 250, 500].map((preset) => (
+              {[-250, -150, -100, -50, 0, 50, 100, 150, 250].map((preset) => (
                 <button
                   key={preset}
                   onClick={() => setShiftDraftMs(preset)}
