@@ -3555,6 +3555,16 @@ async def status(
         "edit_count": edit_count,
         "edits_remaining": max(0, _MAX_EDITS - edit_count),
         "render_params": job.get("render_params"),
+        # EditRequestPanel reads these to drive the lyrics-edit and
+        # typography-edit UIs. segments_json hydrates the inline lyrics
+        # editor; bg_r2_key_cached gates the typography mode. Without
+        # them, the panel falsely tells the user "este job no tiene
+        # letras guardadas" even when the DB row has segments — exactly
+        # the bug PR #111 fixed for `/jobs/{id}` but missed in this
+        # endpoint, which is the one the frontend actually polls
+        # (JobDetail.jsx fetches `/status/${job_id}`, never `/jobs/{id}`).
+        "segments_json": job.get("segments_json"),
+        "bg_r2_key_cached": job.get("bg_r2_key_cached"),
     }
 
 
