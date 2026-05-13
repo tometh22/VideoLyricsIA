@@ -79,6 +79,48 @@ function findSuggestion(whisperText, refLines, startIdx) {
   return null;
 }
 
+// Find two consecutive lines in `refLines` whose concatenation matches
+// `segText`. Used by the auto-split banner: when a Whisper segment
+// captures 2 lyric lines mergeadas en uno solo, lrclib plain (passed as
+// referenceLyrics) has them como 2 entries. Si el match es lo
+// suficientemente fuerte (>0.5), devolvemos el [lineA, lineB] que el
+// caller usa para crear 2 segments separados.
+//
+// Threshold 0.5 — más permisivo que findSuggestion (0.3) porque acá
+// estamos comparando contra la CONCATENACIÓN de 2 líneas vs 1 segment,
+// el set de words es más grande y el match esperado es más alto.
+function findReferenceSplitLines(segText, refLines) {
+  if (!refLines || refLines.length < 2) return null;
+  const normalize = (s) =>
+    s.toLowerCase().replace(/[^a-záéíóúüñ\s]/g, "").replace(/\s+/g, " ").trim();
+  const segNorm = normalize(segText);
+  if (!segNorm) return null;
+  const segWords = segNorm.split(/\s+/);
+  if (segWords.length < 4) return null; // demasiado corto para split fiable
+
+  let bestScore = 0;
+  let bestPair = null;
+  for (let i = 0; i < refLines.length - 1; i++) {
+    const a = refLines[i];
+    const b = refLines[i + 1];
+    if (!a || !b) continue;
+    const cNorm = normalize(a + " " + b);
+    if (!cNorm) continue;
+    const cWords = cNorm.split(/\s+/);
+    let matches = 0;
+    for (const w of segWords) {
+      if (cWords.includes(w)) matches++;
+    }
+    const score = matches / Math.max(segWords.length, cWords.length);
+    if (score > bestScore) {
+      bestScore = score;
+      bestPair = [a, b];
+    }
+  }
+  if (bestScore > 0.5) return bestPair;
+  return null;
+}
+
 // ─── Font-code → CSS map (mirrors UploadZone FONTS) ────────────────────────
 const FONT_CSS_MAP = {
   "jost-bold":       "'Jost', sans-serif",
@@ -508,6 +550,71 @@ export default function LyricsEditor({
     return map;
   }, [segments, refLines]);
 
+  // Detección de segments mergeados (2 lyric lines en 1 segment) usando
+  // lrclib plain como oracle. Caso real motivador: Whisper agrupa
+  // 2 versos consecutivos en un solo segment ("Siento el calor de toda
+  // tu piel en mi cuerpo otra vez") cuando lrclib los tiene como
+  // entries separadas. El banner banner-prominent al tope del editor
+  // ofrece auto-dividir TODO el lote con 1 click.
+  const mergeableSegments = useMemo(() => {
+    if (refLines.length < 2) return [];
+    const out = [];
+    edited.forEach((seg) => {
+      if (!seg.text || !seg.text.trim()) return;
+      const pair = findReferenceSplitLines(seg.text, refLines);
+      if (pair) out.push({ _id: seg._id, splitLines: pair });
+    });
+    return out;
+  }, [edited, refLines]);
+
+  // Auto-dividir TODOS los segments mergeados usando reference como
+  // oracle. Para cada uno: timestamp split proporcional al char-count
+  // de cada línea (lineA más larga = más tiempo). Reverse-order para
+  // no romper índices durante la mutación.
+  const autoSplitAllFromReference = () => {
+    if (mergeableSegments.length === 0) return;
+    pushEditHistory();
+    setEdited((prev) => {
+      // Map id → splitLines para lookup rápido
+      const byId = new Map(
+        mergeableSegments.map((m) => [m._id, m.splitLines]),
+      );
+      const result = [];
+      let nextId = prev.reduce((m, s) => Math.max(m, s._id), -1) + 1;
+      for (const seg of prev) {
+        const splitLines = byId.get(seg._id);
+        if (!splitLines) {
+          result.push(seg);
+          continue;
+        }
+        const [lineA, lineB] = splitLines;
+        const totalChars = lineA.length + lineB.length;
+        if (totalChars === 0) {
+          result.push(seg);
+          continue;
+        }
+        const ratio = lineA.length / totalChars;
+        const dur = Math.max(0.6, seg.end - seg.start);
+        const midTime = seg.start + dur * ratio;
+        const gap = 0.05;
+        result.push({
+          ...seg,
+          _id: nextId++,
+          text: lineA,
+          end: Math.max(seg.start + 0.3, midTime - gap),
+        });
+        result.push({
+          ...seg,
+          _id: nextId++,
+          text: lineB,
+          start: Math.min(seg.end - 0.3, midTime),
+          end: seg.end,
+        });
+      }
+      return result;
+    });
+  };
+
   const updateText = (id, text) => {
     pushEditHistory();
     setEdited((prev) => prev.map((seg) => (seg._id === id ? { ...seg, text } : seg)));
@@ -732,6 +839,36 @@ export default function LyricsEditor({
           <p className="text-xs text-ink-secondary leading-relaxed">
             {t("editor.coverage_warning")}
           </p>
+        </div>
+      )}
+
+      {/* Auto-split banner. Solo aparece cuando detectamos ≥1 segment
+          que matchea contra 2 lineas consecutivas de la referencia.
+          Es la acción primaria sugerida cuando la pipeline cayó al
+          recovery path o cualquier output mergeó 2 lyric lines en 1. */}
+      {mergeableSegments.length > 0 && (
+        <div className="mb-4 rounded-2xl ring-1 ring-amber-500/30 bg-amber-500/[0.08] px-4 py-3 flex items-start gap-3">
+          <svg className="w-5 h-5 text-amber-400 flex-shrink-0 mt-0.5" fill="none" stroke="currentColor" strokeWidth="1.8" viewBox="0 0 24 24">
+            <path d="M12 9v3.75m9-.75a9 9 0 11-18 0 9 9 0 0118 0zm-9 3.75h.008v.008H12v-.008z" strokeLinecap="round" strokeLinejoin="round" />
+          </svg>
+          <div className="flex-1 min-w-0">
+            <p className="text-xs font-medium text-white">
+              {(t("editor.auto_split_title") || "Detectamos {n} segments con 2 líneas mergeadas")
+                .replace("{n}", mergeableSegments.length)}
+            </p>
+            <p className="text-[11px] text-ink-secondary mt-0.5 leading-relaxed">
+              {t("editor.auto_split_desc") ||
+                "Podemos auto-dividirlos usando tu letra de referencia para que cada línea tenga su propio timestamp."}
+            </p>
+          </div>
+          <button
+            type="button"
+            onClick={autoSplitAllFromReference}
+            className="shrink-0 px-3 py-1.5 rounded-md text-xs font-medium text-white bg-amber-500/80 hover:bg-amber-500 ring-1 ring-amber-400/30 transition-colors"
+          >
+            {(t("editor.auto_split_button") || "Auto-dividir {n}")
+              .replace("{n}", mergeableSegments.length)}
+          </button>
         </div>
       )}
 
