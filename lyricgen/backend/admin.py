@@ -547,6 +547,27 @@ async def admin_tenant_cost(
     return tenant_cost_summary(db, tenant_id=tenant_id, since_days=since_days)
 
 
+@router.get("/margin")
+async def admin_margin_dashboard(
+    admin: dict = Depends(require_admin),
+    db: Session = Depends(get_db),
+    since_days: int = Query(30, ge=1, le=365),
+    revenue_per_video_usd: float = Query(8.0, ge=0, le=10000),
+):
+    """Global margin dashboard for the operator. Returns total AI spend,
+    per-provider breakdown (veo/gemini/whisper/...), video counts
+    (done/pending/rejected/error), cost-per-deliverable and a margin
+    estimate against `revenue_per_video_usd` (default $8 reflects the
+    current Universal contract: $2,000 / 250 videos). Tighter window =
+    fresher signal but noisier, looser window = stable averages."""
+    from provenance import cost_dashboard_global
+    return cost_dashboard_global(
+        db,
+        since_days=since_days,
+        revenue_per_video_usd=revenue_per_video_usd,
+    )
+
+
 @router.get("/provenance")
 async def list_all_provenance(
     admin: dict = Depends(require_admin),

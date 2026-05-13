@@ -50,6 +50,29 @@ export default function AdminPanel({ onBack }) {
   // exact tenant match. Server-side via the same endpoint.
   const [bgListFilter, setBgListFilter] = useState("");
 
+  // Cost panel — populated by GET /admin/margin. Period selector lets the
+  // operator switch between fresh (7d) and stable-average (90d) views;
+  // revenue per video defaults to $8 (Universal contract: $2k / 250
+  // videos) and is editable so we can model other deals.
+  const [costSinceDays, setCostSinceDays] = useState(30);
+  const [costRevenuePerVideo, setCostRevenuePerVideo] = useState(8);
+  const [costDashboard, setCostDashboard] = useState(null);
+  const [costLoading, setCostLoading] = useState(false);
+  const loadCostDashboard = async () => {
+    setCostLoading(true);
+    try {
+      const u = `${API}/admin/margin?since_days=${costSinceDays}` +
+        `&revenue_per_video_usd=${costRevenuePerVideo}`;
+      const res = await fetch(u, { headers: authHeaders() });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      setCostDashboard(await res.json());
+    } catch (err) {
+      flashError(`No pude cargar el panel de costos: ${err.message || err}`);
+    } finally {
+      setCostLoading(false);
+    }
+  };
+
   // Inline error banner — usado por handlers que hacen mutaciones
   // (delete bg, toggle user, change plan, etc.) y necesitan informar
   // al operador cuando el backend rechaza. Auto-clear en 8 s.
@@ -77,8 +100,9 @@ export default function AdminPanel({ onBack }) {
     if (tab === "invoices") loadInvoices();
     if (tab === "compliance") loadCompliance();
     if (tab === "backgrounds") loadBackgrounds();
+    if (tab === "costs") loadCostDashboard();
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [tab, jobsTenantFilter, bgListFilter]);
+  }, [tab, jobsTenantFilter, bgListFilter, costSinceDays, costRevenuePerVideo]);
 
   // Auto-refresh the Jobs tab every 5s so admin sees real-time progress
   // of running renders (current_step, progress %). Pauses when the tab
@@ -315,6 +339,7 @@ export default function AdminPanel({ onBack }) {
     { id: "invoices", label: "Invoices" },
     { id: "backgrounds", label: "Backgrounds" },
     { id: "compliance", label: "Compliance" },
+    { id: "costs", label: "Costos" },
   ];
 
   if (loading) return (
@@ -1039,6 +1064,183 @@ export default function AdminPanel({ onBack }) {
                   </a>
                 </div>
               </div>
+            </>
+          )}
+        </div>
+      )}
+
+      {/* Costos — panel de margen del operador */}
+      {tab === "costs" && (
+        <div className="space-y-6">
+          {/* Period + revenue selectors */}
+          <div className="glass rounded-card p-4 flex items-center gap-4 flex-wrap">
+            <div className="flex items-center gap-2">
+              <span className="text-[11px] text-gray-500 uppercase tracking-wide">Período</span>
+              {[7, 30, 90].map((d) => (
+                <button
+                  key={d}
+                  onClick={() => setCostSinceDays(d)}
+                  className={`px-3 py-1 rounded-md text-xs ring-1 transition-colors ${
+                    costSinceDays === d
+                      ? "bg-brand/20 ring-brand/40 text-white"
+                      : "ring-white/[0.06] text-gray-400 hover:text-white"
+                  }`}
+                >
+                  {d}d
+                </button>
+              ))}
+            </div>
+            <div className="flex items-center gap-2 ml-auto">
+              <span className="text-[11px] text-gray-500 uppercase tracking-wide">Revenue / video</span>
+              <span className="text-xs text-gray-400">USD</span>
+              <input
+                type="number"
+                step="0.5"
+                min="0"
+                value={costRevenuePerVideo}
+                onChange={(e) => setCostRevenuePerVideo(Math.max(0, Number(e.target.value) || 0))}
+                className="w-20 bg-surface-3/40 ring-1 ring-white/[0.06] focus:ring-brand/40 focus:outline-none rounded-md px-2 py-1 text-xs text-white text-right"
+              />
+            </div>
+          </div>
+
+          {costLoading || !costDashboard ? (
+            <div className="flex items-center justify-center py-12">
+              <div className="w-6 h-6 border-2 border-brand border-t-transparent rounded-full animate-spin" />
+            </div>
+          ) : (
+            <>
+              {/* Headline cards: spend, deliverable count, cost/video, margin */}
+              <div className="grid grid-cols-2 lg:grid-cols-4 gap-4">
+                <div className="glass-elevated rounded-card p-5">
+                  <p className="text-[10px] text-gray-500 uppercase tracking-wider mb-1">Gasto IA total</p>
+                  <p className="text-2xl font-bold tabular-nums">${costDashboard.total_cost.toFixed(2)}</p>
+                  <p className="text-[11px] text-gray-500 mt-1">{costDashboard.total_calls} calls · últimos {costDashboard.since_days}d</p>
+                </div>
+                <div className="glass-elevated rounded-card p-5">
+                  <p className="text-[10px] text-gray-500 uppercase tracking-wider mb-1">Videos deliverable</p>
+                  <p className="text-2xl font-bold tabular-nums">{costDashboard.video_counts.deliverable}</p>
+                  <p className="text-[11px] text-gray-500 mt-1">{costDashboard.video_counts.done} done · {costDashboard.video_counts.pending_review} pending</p>
+                </div>
+                <div className="glass-elevated rounded-card p-5">
+                  <p className="text-[10px] text-gray-500 uppercase tracking-wider mb-1">Costo / deliverable</p>
+                  <p className="text-2xl font-bold tabular-nums">
+                    {costDashboard.cost_per_deliverable !== null
+                      ? `$${costDashboard.cost_per_deliverable.toFixed(2)}`
+                      : "—"}
+                  </p>
+                  <p className="text-[11px] text-gray-500 mt-1">
+                    incluye rejects + retries
+                  </p>
+                </div>
+                <div className="glass-elevated rounded-card p-5">
+                  <p className="text-[10px] text-gray-500 uppercase tracking-wider mb-1">Margen estimado</p>
+                  <p className="text-2xl font-bold tabular-nums text-accent">
+                    {costDashboard.margin_per_video !== null
+                      ? `$${costDashboard.margin_per_video.toFixed(2)}`
+                      : "—"}
+                  </p>
+                  <p className="text-[11px] text-gray-500 mt-1">
+                    /video · total ${costDashboard.margin_total !== null
+                      ? costDashboard.margin_total.toFixed(2)
+                      : "—"}
+                  </p>
+                </div>
+              </div>
+
+              {/* Rejection rate + video counts breakdown */}
+              <div className="glass-elevated rounded-card p-5">
+                <div className="flex items-center justify-between mb-4">
+                  <h3 className="text-sm font-semibold">Salud del pipeline</h3>
+                  <span className="text-[11px] text-gray-500">% rejects + status counts</span>
+                </div>
+                <div className="grid grid-cols-2 lg:grid-cols-5 gap-3">
+                  <div>
+                    <p className="text-[10px] text-gray-500 uppercase tracking-wider mb-0.5">Done</p>
+                    <p className="text-base font-bold text-accent tabular-nums">{costDashboard.video_counts.done}</p>
+                  </div>
+                  <div>
+                    <p className="text-[10px] text-gray-500 uppercase tracking-wider mb-0.5">Pending</p>
+                    <p className="text-base font-bold text-amber-400 tabular-nums">{costDashboard.video_counts.pending_review}</p>
+                  </div>
+                  <div>
+                    <p className="text-[10px] text-gray-500 uppercase tracking-wider mb-0.5">Rejected</p>
+                    <p className="text-base font-bold text-red-400 tabular-nums">{costDashboard.video_counts.rejected}</p>
+                  </div>
+                  <div>
+                    <p className="text-[10px] text-gray-500 uppercase tracking-wider mb-0.5">Error</p>
+                    <p className="text-base font-bold text-red-500 tabular-nums">{costDashboard.video_counts.error}</p>
+                  </div>
+                  <div>
+                    <p className="text-[10px] text-gray-500 uppercase tracking-wider mb-0.5">% rejects</p>
+                    <p className="text-base font-bold tabular-nums">
+                      {costDashboard.rejection_rate !== null
+                        ? `${(costDashboard.rejection_rate * 100).toFixed(1)}%`
+                        : "—"}
+                    </p>
+                  </div>
+                </div>
+              </div>
+
+              {/* Per-provider breakdown */}
+              <div className="glass-elevated rounded-card p-5">
+                <div className="flex items-center justify-between mb-4">
+                  <h3 className="text-sm font-semibold">Desglose por proveedor</h3>
+                  <span className="text-[11px] text-gray-500">{costDashboard.by_provider.length} buckets</span>
+                </div>
+                <div className="space-y-2">
+                  {costDashboard.by_provider.map((p) => {
+                    const pct = costDashboard.total_cost > 0
+                      ? (p.cost / costDashboard.total_cost) * 100
+                      : 0;
+                    return (
+                      <div key={p.provider} className="flex items-center gap-3">
+                        <span className="w-20 text-xs font-medium capitalize">{p.provider}</span>
+                        <div className="flex-1 h-2 rounded-full bg-surface-3/40 overflow-hidden">
+                          <div
+                            className="h-full bg-brand/60"
+                            style={{ width: `${Math.min(100, pct)}%` }}
+                          />
+                        </div>
+                        <span className="w-20 text-[11px] text-gray-400 tabular-nums text-right">
+                          {p.calls} calls
+                        </span>
+                        <span className="w-20 text-xs font-mono tabular-nums text-right">
+                          ${p.cost.toFixed(2)}
+                        </span>
+                        <span className="w-12 text-[11px] text-gray-500 tabular-nums text-right">
+                          {pct.toFixed(0)}%
+                        </span>
+                      </div>
+                    );
+                  })}
+                </div>
+              </div>
+
+              {/* Per-tool detail (collapsed by default mental load — just a small table) */}
+              <details className="glass rounded-card p-5">
+                <summary className="text-xs text-gray-400 cursor-pointer select-none">
+                  Detalle por modelo ({costDashboard.by_tool.length} tools)
+                </summary>
+                <div className="mt-4 space-y-1.5">
+                  {costDashboard.by_tool.map((t) => (
+                    <div key={`${t.tool_name}|${t.tool_provider}`} className="flex items-center gap-3 text-[11px]">
+                      <span className="flex-1 font-mono text-gray-300 truncate">{t.tool_name}</span>
+                      <span className="text-gray-500">{t.tool_provider}</span>
+                      <span className="w-16 text-right tabular-nums">{t.calls}×</span>
+                      <span className="w-16 text-right tabular-nums font-mono">${t.rate_per_call.toFixed(3)}</span>
+                      <span className="w-20 text-right tabular-nums font-mono text-white">${t.cost.toFixed(2)}</span>
+                    </div>
+                  ))}
+                </div>
+              </details>
+
+              <p className="text-[10px] text-gray-600 leading-relaxed">
+                Whisper se cobra como API de OpenAI a ~$0.006/min de audio (estimado en $0.021 por llamada · canción promedio ~3.5 min).
+                Veo Fast a $0.80/call (palindrome loop 8s) · Veo Standard $3.20.
+                Margen calculado contra revenue manual editable arriba (default $8/video = contrato Universal $2k / 250 videos).
+                Los rejected y errored cuentan como "videos no entregables" pero su Veo cost SÍ se incluye en el gasto total — por eso el costo real por deliverable es mayor que el marginal de un render limpio.
+              </p>
             </>
           )}
         </div>

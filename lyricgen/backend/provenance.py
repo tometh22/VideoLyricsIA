@@ -44,6 +44,11 @@ COST_PER_CALL: dict[tuple[str, str], float] = {
     # Whisper local — runs on our compute, no API charge
     ("whisper", "local"): 0.0,
     ("whisper-large-v3", "local"): 0.0,
+    # Whisper OpenAI API — billed at $0.006/min of audio. We pay per call,
+    # but it bills per-minute; using an average song length of ~3.5 min
+    # gives ~$0.021 per call. Cheap to bump if real audio lengths drift.
+    ("whisper-1", "openai"): 0.021,
+    ("whisper", "openai"): 0.021,
     # Human-provided fallback — no AI cost
     ("human-provided", "user_upload"): 0.0,
 }
@@ -115,6 +120,144 @@ def tenant_cost_summary(
         "total_cost": round(total_cost, 4),
         "total_calls": total_calls,
         "by_tool": by_tool,
+    }
+
+
+# Provider buckets for the global dashboard. Maps the tool_provider /
+# tool_name prefix to a short user-visible label. Keep aligned with the
+# Veo / Gemini / Whisper / Imagen split shown in the cost panel.
+_PROVIDER_BUCKETS = (
+    ("veo",     lambda n, p: n.startswith("veo-")),
+    ("gemini",  lambda n, p: n.startswith("gemini-")),
+    ("imagen",  lambda n, p: n.startswith("imagen-")),
+    ("whisper", lambda n, p: n.startswith("whisper") and p in ("openai", "local")),
+    ("other",   lambda n, p: True),  # catch-all, must stay last
+)
+
+
+def _bucket_for(tool_name: str, tool_provider: str) -> str:
+    for label, predicate in _PROVIDER_BUCKETS:
+        if predicate(tool_name, tool_provider):
+            return label
+    return "other"
+
+
+def cost_dashboard_global(db: Session, since_days: int = 30,
+                          revenue_per_video_usd: float = 8.0) -> dict:
+    """Margin-style cost dashboard across all tenants.
+
+    Powers /admin/margin. Returns enough data for the operator panel to
+    show: total AI spend, per-provider breakdown, video counts (done /
+    pending_review / rejected / error), rejection rate, cost per
+    deliverable, and a margin estimate against an assumed revenue per
+    video. `revenue_per_video_usd` is just for the margin display — it
+    does not affect cost numbers.
+
+    Whisper calls are priced via the COST_PER_CALL table — the row
+    `("whisper-1", "openai")` is what catches our prod transcriptions.
+    Local Whisper stays at 0 (matches actual marginal cost).
+    """
+    since = datetime.now(timezone.utc) - timedelta(days=since_days)
+
+    # --- AI spend by tool/provider ---
+    rows = (
+        db.query(
+            AIProvenance.tool_name,
+            AIProvenance.tool_provider,
+            func.count(AIProvenance.id).label("calls"),
+        )
+        .filter(AIProvenance.created_at >= since)
+        .group_by(AIProvenance.tool_name, AIProvenance.tool_provider)
+        .all()
+    )
+
+    by_tool = []
+    by_provider: dict[str, dict] = {}
+    total_cost = 0.0
+    total_calls = 0
+    for tool_name, tool_provider, calls in rows:
+        rate = cost_for_record(tool_name, tool_provider)
+        cost = calls * rate
+        bucket = _bucket_for(tool_name, tool_provider)
+        total_cost += cost
+        total_calls += calls
+        by_tool.append({
+            "tool_name": tool_name,
+            "tool_provider": tool_provider,
+            "calls": calls,
+            "rate_per_call": rate,
+            "cost": round(cost, 4),
+            "provider_bucket": bucket,
+        })
+        agg = by_provider.setdefault(
+            bucket, {"calls": 0, "cost": 0.0}
+        )
+        agg["calls"] += calls
+        agg["cost"] += cost
+
+    by_tool.sort(key=lambda r: r["cost"], reverse=True)
+    by_provider_list = sorted(
+        [{"provider": k, **v, "cost": round(v["cost"], 4)}
+         for k, v in by_provider.items()],
+        key=lambda r: r["cost"],
+        reverse=True,
+    )
+
+    # --- Video counts (same window so the cost-per-video math is honest) ---
+    video_counts = dict(
+        db.query(Job.status, func.count(Job.id))
+        .filter(Job.created_at >= since)
+        .group_by(Job.status)
+        .all()
+    )
+    done = int(video_counts.get("done", 0))
+    pending = int(video_counts.get("pending_review", 0))
+    rejected = int(video_counts.get("rejected", 0))
+    error = int(video_counts.get("error", 0))
+    finished = done + pending + rejected + error
+    deliverable = done + pending
+
+    # Avoid divide-by-zero in fresh tenants / very short windows.
+    cost_per_done = round(total_cost / done, 4) if done else None
+    cost_per_deliverable = (
+        round(total_cost / deliverable, 4) if deliverable else None
+    )
+    rejection_rate = round(rejected / finished, 4) if finished else None
+
+    # Margin against a revenue assumption. Pure display math — caller
+    # passes revenue_per_video_usd; default $8 reflects the Universal
+    # contract ($2,000 / 250 videos).
+    margin_per_video = None
+    margin_total = None
+    if cost_per_deliverable is not None and revenue_per_video_usd > 0:
+        margin_per_video = round(
+            revenue_per_video_usd - cost_per_deliverable, 4
+        )
+        margin_total = round(
+            (revenue_per_video_usd - cost_per_deliverable) * deliverable, 2
+        )
+
+    return {
+        "since": since.isoformat(),
+        "since_days": since_days,
+        "total_cost": round(total_cost, 4),
+        "total_calls": total_calls,
+        "by_tool": by_tool,
+        "by_provider": by_provider_list,
+        "video_counts": {
+            "done": done,
+            "pending_review": pending,
+            "rejected": rejected,
+            "error": error,
+            "finished": finished,
+            "deliverable": deliverable,
+        },
+        "cost_per_done": cost_per_done,
+        "cost_per_deliverable": cost_per_deliverable,
+        "rejection_rate": rejection_rate,
+        "revenue_per_video_usd": revenue_per_video_usd,
+        "margin_per_video": margin_per_video,
+        "margin_total": margin_total,
     }
 
 
