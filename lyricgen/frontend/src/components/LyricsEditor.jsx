@@ -253,6 +253,18 @@ export default function LyricsEditor({
   // tidy.
   const [shiftPanelOpen, setShiftPanelOpen] = useState(false);
   const [shiftDraftMs, setShiftDraftMs] = useState(0); // -1000..+1000
+  // After applying a shift the slider resets to 0 so the next draft
+  // starts clean. Without a confirmation chip the operator can't tell
+  // whether the click landed — they see the preset highlight clear and
+  // assume nothing happened, then re-apply, doubling the shift.
+  // appliedShiftMs holds the last applied delta for ~2.5s purely as
+  // visual receipt.
+  const [appliedShiftMs, setAppliedShiftMs] = useState(null);
+  useEffect(() => {
+    if (appliedShiftMs == null) return undefined;
+    const id = setTimeout(() => setAppliedShiftMs(null), 2500);
+    return () => clearTimeout(id);
+  }, [appliedShiftMs]);
   // When false (default), each Sync-Mode tap anchors ONLY the current
   // line — leaves every following timestamp alone. When true, the same
   // delta propagates to every line after the cursor (the previous-only
@@ -1234,7 +1246,9 @@ export default function LyricsEditor({
               <button
                 onClick={() => {
                   if (shiftDraftMs === 0) return;
-                  shiftAllSegments(shiftDraftMs / 1000);  // ms → seconds
+                  const applied = shiftDraftMs;
+                  shiftAllSegments(applied / 1000);  // ms → seconds
+                  setAppliedShiftMs(applied);
                   setShiftDraftMs(0);
                 }}
                 disabled={shiftDraftMs === 0}
@@ -1243,6 +1257,23 @@ export default function LyricsEditor({
                 {t("editor.shift_apply") || "Aplicar"}
               </button>
             </div>
+
+            {/* Inline confirmation chip — clears after 2.5s. Without it
+                the operator can't distinguish "applied" from "didn't
+                register" because the slider returns to 0 on success. */}
+            {appliedShiftMs != null && (
+              <div className="flex items-center gap-2 text-[11px] text-emerald-300 animate-fade-in">
+                <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" strokeWidth="2.5" viewBox="0 0 24 24">
+                  <polyline points="20 6 9 17 4 12" strokeLinecap="round" strokeLinejoin="round" />
+                </svg>
+                <span className="font-mono">
+                  {(t("editor.shift_applied") || "Aplicado: {n}ms")
+                    .replace("{n}", appliedShiftMs > 0 ? `+${appliedShiftMs}` : appliedShiftMs)}
+                </span>
+                <span className="text-gray-500">·</span>
+                <span className="text-gray-400">{t("editor.shift_applied_undo") || "Cmd/Ctrl+Z para revertir"}</span>
+              </div>
+            )}
 
             <p className="text-[10px] text-gray-600 leading-relaxed">
               {t("editor.shift_undo_hint") || "Deshacer con Cmd/Ctrl+Z o el botón de deshacer."}

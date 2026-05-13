@@ -261,6 +261,8 @@ const translations = {
     "editor.shift_panel_hint": "Aplica un offset uniforme a todas las líneas. Valores positivos atrasan las letras (aparecen más tarde); negativos las adelantan.",
     "editor.shift_or_custom": "o",
     "editor.shift_apply": "Aplicar",
+    "editor.shift_applied": "Aplicado: {n}ms",
+    "editor.shift_applied_undo": "Cmd/Ctrl+Z para revertir",
     "editor.shift_undo_hint": "Deshacer con Cmd/Ctrl+Z o el botón de deshacer.",
 
     // Transcribing
