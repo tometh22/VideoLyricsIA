@@ -2847,7 +2847,19 @@ async def _run_transcription_for_job(
                 hybrid_intro_segs: list[dict] = []
                 if user_dur is not None and lrc_dur:
                     diff = user_dur - lrc_dur
-                    if abs(diff) <= 3.0:
+                    # diff < 0 = user audio SHORTER than lrclib studio version.
+                    # Common cases: radio edit, album cut con fade-out
+                    # diferente, intro/outro trimmed. Hasta -15s el body de
+                    # la canción es idéntico — lrclib synced timestamps
+                    # siguen siendo válidos para las líneas que caen dentro
+                    # del audio del user. _lrc_to_segments ya clampa el `end`
+                    # del último segment a `audio_duration` (línea 1739-1742
+                    # de pipeline.py), así que líneas que caigan después del
+                    # final del audio quedan con end=audio_duration sin
+                    # romper nada. Caso real que motivó esto: Mujer Amante
+                    # Rata Blanca, user_dur=365.2, lrclib=374.0, diff=-8.8.
+                    # Antes caía a Whisper innecesariamente y mergeaba 2-en-1.
+                    if -15.0 <= diff <= 3.0:
                         offset = 0.0
                     elif 3.0 < diff <= 120.0:
                         offset = float(diff)
