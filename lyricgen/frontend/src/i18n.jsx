@@ -95,9 +95,9 @@ const translations = {
     "dash.history_error_body": "Puede ser una caída momentánea de la conexión. Probá de nuevo.",
 
     // Upload
-    "upload.drag": "Arrastrá archivos MP3",
+    "upload.drag": "Arrastrá archivos MP3 o WAV",
     "upload.drag_sub": "Uno o varios a la vez",
-    "upload.size_hint": "MP3 o WAV · máx 100 MB por archivo · hasta 5 por lote",
+    "upload.size_hint": "Máx 100 MB por archivo · hasta 5 por lote",
     "upload.add_more": "+ Agregar más",
     "upload.artist": "Artista",
     "upload.song_title": "Nombre de la canción",
@@ -858,9 +858,9 @@ const translations = {
     "dash.history_error_title": "We couldn't load your history",
     "dash.history_error_body": "Looks like a temporary connection issue. Please try again.",
 
-    "upload.drag": "Drag MP3 files here",
+    "upload.drag": "Drag MP3 or WAV files here",
     "upload.drag_sub": "One or multiple at once",
-    "upload.size_hint": "MP3 or WAV · max 100 MB per file · up to 5 per batch",
+    "upload.size_hint": "Max 100 MB per file · up to 5 per batch",
     "upload.add_more": "+ Add more",
     "upload.artist": "Artist",
     "upload.song_title": "Song title",
@@ -1517,9 +1517,9 @@ const translations = {
     "dash.history_error_title": "Não conseguimos carregar seu histórico",
     "dash.history_error_body": "Parece uma queda momentânea de conexão. Tente novamente.",
 
-    "upload.drag": "Arraste arquivos MP3",
+    "upload.drag": "Arraste arquivos MP3 ou WAV",
     "upload.drag_sub": "Um ou vários de uma vez",
-    "upload.size_hint": "MP3 ou WAV · máx 100 MB por arquivo · até 5 por lote",
+    "upload.size_hint": "Máx 100 MB por arquivo · até 5 por lote",
     "upload.add_more": "+ Adicionar mais",
     "upload.artist": "Artista",
     "upload.song_title": "Nome da música",
