@@ -79,6 +79,48 @@ function findSuggestion(whisperText, refLines, startIdx) {
   return null;
 }
 
+// Find two consecutive lines in `refLines` whose concatenation matches
+// `segText`. Used by the auto-split banner: when a Whisper segment
+// captures 2 lyric lines mergeadas en uno solo, lrclib plain (passed as
+// referenceLyrics) has them como 2 entries. Si el match es lo
+// suficientemente fuerte (>0.5), devolvemos el [lineA, lineB] que el
+// caller usa para crear 2 segments separados.
+//
+// Threshold 0.5 — más permisivo que findSuggestion (0.3) porque acá
+// estamos comparando contra la CONCATENACIÓN de 2 líneas vs 1 segment,
+// el set de words es más grande y el match esperado es más alto.
+function findReferenceSplitLines(segText, refLines) {
+  if (!refLines || refLines.length < 2) return null;
+  const normalize = (s) =>
+    s.toLowerCase().replace(/[^a-záéíóúüñ\s]/g, "").replace(/\s+/g, " ").trim();
+  const segNorm = normalize(segText);
+  if (!segNorm) return null;
+  const segWords = segNorm.split(/\s+/);
+  if (segWords.length < 4) return null; // demasiado corto para split fiable
+
+  let bestScore = 0;
+  let bestPair = null;
+  for (let i = 0; i < refLines.length - 1; i++) {
+    const a = refLines[i];
+    const b = refLines[i + 1];
+    if (!a || !b) continue;
+    const cNorm = normalize(a + " " + b);
+    if (!cNorm) continue;
+    const cWords = cNorm.split(/\s+/);
+    let matches = 0;
+    for (const w of segWords) {
+      if (cWords.includes(w)) matches++;
+    }
+    const score = matches / Math.max(segWords.length, cWords.length);
+    if (score > bestScore) {
+      bestScore = score;
+      bestPair = [a, b];
+    }
+  }
+  if (bestScore > 0.5) return bestPair;
+  return null;
+}
+
 // ─── Font-code → CSS map (mirrors UploadZone FONTS) ────────────────────────
 const FONT_CSS_MAP = {
   "jost-bold":       "'Jost', sans-serif",
@@ -211,6 +253,18 @@ export default function LyricsEditor({
   // tidy.
   const [shiftPanelOpen, setShiftPanelOpen] = useState(false);
   const [shiftDraftMs, setShiftDraftMs] = useState(0); // -1000..+1000
+  // After applying a shift the slider resets to 0 so the next draft
+  // starts clean. Without a confirmation chip the operator can't tell
+  // whether the click landed — they see the preset highlight clear and
+  // assume nothing happened, then re-apply, doubling the shift.
+  // appliedShiftMs holds the last applied delta for ~2.5s purely as
+  // visual receipt.
+  const [appliedShiftMs, setAppliedShiftMs] = useState(null);
+  useEffect(() => {
+    if (appliedShiftMs == null) return undefined;
+    const id = setTimeout(() => setAppliedShiftMs(null), 2500);
+    return () => clearTimeout(id);
+  }, [appliedShiftMs]);
   // When false (default), each Sync-Mode tap anchors ONLY the current
   // line — leaves every following timestamp alone. When true, the same
   // delta propagates to every line after the cursor (the previous-only
@@ -508,6 +562,71 @@ export default function LyricsEditor({
     return map;
   }, [segments, refLines]);
 
+  // Detección de segments mergeados (2 lyric lines en 1 segment) usando
+  // lrclib plain como oracle. Caso real motivador: Whisper agrupa
+  // 2 versos consecutivos en un solo segment ("Siento el calor de toda
+  // tu piel en mi cuerpo otra vez") cuando lrclib los tiene como
+  // entries separadas. El banner banner-prominent al tope del editor
+  // ofrece auto-dividir TODO el lote con 1 click.
+  const mergeableSegments = useMemo(() => {
+    if (refLines.length < 2) return [];
+    const out = [];
+    edited.forEach((seg) => {
+      if (!seg.text || !seg.text.trim()) return;
+      const pair = findReferenceSplitLines(seg.text, refLines);
+      if (pair) out.push({ _id: seg._id, splitLines: pair });
+    });
+    return out;
+  }, [edited, refLines]);
+
+  // Auto-dividir TODOS los segments mergeados usando reference como
+  // oracle. Para cada uno: timestamp split proporcional al char-count
+  // de cada línea (lineA más larga = más tiempo). Reverse-order para
+  // no romper índices durante la mutación.
+  const autoSplitAllFromReference = () => {
+    if (mergeableSegments.length === 0) return;
+    pushEditHistory();
+    setEdited((prev) => {
+      // Map id → splitLines para lookup rápido
+      const byId = new Map(
+        mergeableSegments.map((m) => [m._id, m.splitLines]),
+      );
+      const result = [];
+      let nextId = prev.reduce((m, s) => Math.max(m, s._id), -1) + 1;
+      for (const seg of prev) {
+        const splitLines = byId.get(seg._id);
+        if (!splitLines) {
+          result.push(seg);
+          continue;
+        }
+        const [lineA, lineB] = splitLines;
+        const totalChars = lineA.length + lineB.length;
+        if (totalChars === 0) {
+          result.push(seg);
+          continue;
+        }
+        const ratio = lineA.length / totalChars;
+        const dur = Math.max(0.6, seg.end - seg.start);
+        const midTime = seg.start + dur * ratio;
+        const gap = 0.05;
+        result.push({
+          ...seg,
+          _id: nextId++,
+          text: lineA,
+          end: Math.max(seg.start + 0.3, midTime - gap),
+        });
+        result.push({
+          ...seg,
+          _id: nextId++,
+          text: lineB,
+          start: Math.min(seg.end - 0.3, midTime),
+          end: seg.end,
+        });
+      }
+      return result;
+    });
+  };
+
   const updateText = (id, text) => {
     pushEditHistory();
     setEdited((prev) => prev.map((seg) => (seg._id === id ? { ...seg, text } : seg)));
@@ -732,6 +851,36 @@ export default function LyricsEditor({
           <p className="text-xs text-ink-secondary leading-relaxed">
             {t("editor.coverage_warning")}
           </p>
+        </div>
+      )}
+
+      {/* Auto-split banner. Solo aparece cuando detectamos ≥1 segment
+          que matchea contra 2 lineas consecutivas de la referencia.
+          Es la acción primaria sugerida cuando la pipeline cayó al
+          recovery path o cualquier output mergeó 2 lyric lines en 1. */}
+      {mergeableSegments.length > 0 && (
+        <div className="mb-4 rounded-2xl ring-1 ring-amber-500/30 bg-amber-500/[0.08] px-4 py-3 flex items-start gap-3">
+          <svg className="w-5 h-5 text-amber-400 flex-shrink-0 mt-0.5" fill="none" stroke="currentColor" strokeWidth="1.8" viewBox="0 0 24 24">
+            <path d="M12 9v3.75m9-.75a9 9 0 11-18 0 9 9 0 0118 0zm-9 3.75h.008v.008H12v-.008z" strokeLinecap="round" strokeLinejoin="round" />
+          </svg>
+          <div className="flex-1 min-w-0">
+            <p className="text-xs font-medium text-white">
+              {(t("editor.auto_split_title") || "Detectamos {n} segments con 2 líneas mergeadas")
+                .replace("{n}", mergeableSegments.length)}
+            </p>
+            <p className="text-[11px] text-ink-secondary mt-0.5 leading-relaxed">
+              {t("editor.auto_split_desc") ||
+                "Podemos auto-dividirlos usando tu letra de referencia para que cada línea tenga su propio timestamp."}
+            </p>
+          </div>
+          <button
+            type="button"
+            onClick={autoSplitAllFromReference}
+            className="shrink-0 px-3 py-1.5 rounded-md text-xs font-medium text-white bg-amber-500/80 hover:bg-amber-500 ring-1 ring-amber-400/30 transition-colors"
+          >
+            {(t("editor.auto_split_button") || "Auto-dividir {n}")
+              .replace("{n}", mergeableSegments.length)}
+          </button>
         </div>
       )}
 
@@ -1043,7 +1192,7 @@ export default function LyricsEditor({
           <div className="mt-2 px-3 py-3 rounded-card bg-surface-1/40 ring-1 ring-white/[0.04] space-y-3 animate-fade-in">
             <p className="text-[11px] text-gray-500 leading-relaxed">
               {t("editor.shift_panel_hint") ||
-                "Aplica un offset uniforme a todas las líneas. Valores positivos atrasan las letras (aparecen más tarde); negativos las adelantan."}
+                "Aplica un offset uniforme a todas las líneas. Si la letra aparece tarde, usá valores negativos (anticipar). Si aparece antes de tiempo, positivos (atrasar). Drift típico de lyrics curadas: 100-200ms."}
             </p>
 
             {/* Slider continuo */}
@@ -1061,9 +1210,11 @@ export default function LyricsEditor({
               <span className="text-[10px] font-mono text-gray-500 w-12">+1000ms</span>
             </div>
 
-            {/* Presets + valor actual + input custom */}
+            {/* Presets + valor actual + input custom. Granularidad fina
+                para drift típico de lrclib synced (100-200ms) + presets
+                más gruesos para mismatches mayores. */}
             <div className="flex flex-wrap items-center gap-2">
-              {[-500, -250, 0, 250, 500].map((preset) => (
+              {[-250, -150, -100, -50, 0, 50, 100, 150, 250].map((preset) => (
                 <button
                   key={preset}
                   onClick={() => setShiftDraftMs(preset)}
@@ -1095,7 +1246,9 @@ export default function LyricsEditor({
               <button
                 onClick={() => {
                   if (shiftDraftMs === 0) return;
-                  shiftAllSegments(shiftDraftMs / 1000);  // ms → seconds
+                  const applied = shiftDraftMs;
+                  shiftAllSegments(applied / 1000);  // ms → seconds
+                  setAppliedShiftMs(applied);
                   setShiftDraftMs(0);
                 }}
                 disabled={shiftDraftMs === 0}
@@ -1104,6 +1257,23 @@ export default function LyricsEditor({
                 {t("editor.shift_apply") || "Aplicar"}
               </button>
             </div>
+
+            {/* Inline confirmation chip — clears after 2.5s. Without it
+                the operator can't distinguish "applied" from "didn't
+                register" because the slider returns to 0 on success. */}
+            {appliedShiftMs != null && (
+              <div className="flex items-center gap-2 text-[11px] text-emerald-300 animate-fade-in">
+                <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" strokeWidth="2.5" viewBox="0 0 24 24">
+                  <polyline points="20 6 9 17 4 12" strokeLinecap="round" strokeLinejoin="round" />
+                </svg>
+                <span className="font-mono">
+                  {(t("editor.shift_applied") || "Aplicado: {n}ms")
+                    .replace("{n}", appliedShiftMs > 0 ? `+${appliedShiftMs}` : appliedShiftMs)}
+                </span>
+                <span className="text-gray-500">·</span>
+                <span className="text-gray-400">{t("editor.shift_applied_undo") || "Cmd/Ctrl+Z para revertir"}</span>
+              </div>
+            )}
 
             <p className="text-[10px] text-gray-600 leading-relaxed">
               {t("editor.shift_undo_hint") || "Deshacer con Cmd/Ctrl+Z o el botón de deshacer."}

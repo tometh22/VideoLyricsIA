@@ -1616,70 +1616,191 @@ def _fetch_lrclib(artist: str, song: str, db=None) -> dict | None:
             print(f"[LYRICS] lrclib fetch failed after retry: {e}")
             return None
     if r is None:
+        result = None
+    elif r.status_code != 200:
+        print(f"[LYRICS] lrclib /get {r.status_code} for {artist!r} - {song!r}")
+        result = None
+    else:
+        try:
+            result = _parse_lrclib_record(r.json())
+        except Exception as e:
+            print(f"[LYRICS] lrclib /get parse failed: {e}")
+            result = None
+
+    # Fallback: si /api/get no devolvió un record útil (404, transient,
+    # null fields), intentar /api/search. Es fuzzy: busca con keywords
+    # combinados y devuelve hasta N candidates. Pickeamos el que mejor
+    # matchee artist+song con preferencia para syncedLyrics. Caso real
+    # motivador: Noches Sin Sueño (Rata Blanca) — /api/get devolvió 404
+    # transient en staging, /api/search habría devuelto 4 candidates
+    # válidos con synced perfecto, evitando el bug del Gemini fallback.
+    if result is None:
+        candidates = _try_lrclib_search(artist, song)
+        if candidates:
+            best = _pick_best_lrclib_candidate(candidates, artist, song)
+            if best is not None:
+                print(f"[LYRICS] lrclib /get failed but /search rescued "
+                      f"candidate id={best.get('id')} "
+                      f"({best.get('artistName')!r} - {best.get('trackName')!r}, "
+                      f"synced={'yes' if best.get('syncedLyrics') else 'no'})")
+                try:
+                    result = _parse_lrclib_record(best)
+                except Exception as e:
+                    print(f"[LYRICS] lrclib /search parse failed: {e}")
+                    result = None
+
+    if result is None:
         return None
+
+    # Write-through cache. Once stored, this song never depends on
+    # lrclib.net uptime again — important for Railway outbound flakes.
+    if db is not None:
+        try:
+            from database import LyricsCache
+            payload = _json.dumps(result, ensure_ascii=False)
+            row = db.query(LyricsCache).filter(
+                LyricsCache.cache_key == cache_key
+            ).first()
+            if row:
+                row.lyrics = payload
+            else:
+                db.add(LyricsCache(
+                    cache_key=cache_key,
+                    artist=artist,
+                    title=song,
+                    lyrics=payload,
+                    fetched_by_model="lrclib",
+                ))
+            db.commit()
+            print(f"[LYRICS] lrclib cached {cache_key} "
+                  f"({len(payload)} bytes)")
+        except Exception as e:
+            print(f"[LYRICS] lrclib cache write failed: {e}")
+    return result
+
+
+def _parse_lrclib_record(data: dict) -> dict | None:
+    """Parsea un dict crudo de lrclib (de /api/get o de un item de
+    /api/search) al shape `{plain, synced, duration}` que usa el rest
+    del pipeline. Devuelve None si el record no tiene ni plain ni synced.
+
+    Extraído del cuerpo de `_fetch_lrclib` para que el fallback a
+    /api/search pueda reusar la misma lógica (incluido el derive de
+    plain desde synced cuando lrclib solo expone synced).
+    """
+    plain = (data.get("plainLyrics") or "").strip() or None
+    synced = (data.get("syncedLyrics") or "").strip() or None
+    if not plain and not synced:
+        return None
+    # Some lrclib records expose only `syncedLyrics` (different bots
+    # populate the two columns independently). The downstream auto-
+    # recover code in /transcribe gates on `if plain:` so when plain
+    # is missing the recovery branch is unreachable. Derive plain from
+    # synced by stripping the `[mm:ss.xx]` timestamps so the recovery
+    # path always has a usable reference.
+    if not plain and synced:
+        import re as _re
+        ts_re = _re.compile(r"^\s*(?:\[\d+:\d+(?:[.:]\d+)?\]\s*)+")
+        derived: list[str] = []
+        for line in synced.splitlines():
+            stripped = ts_re.sub("", line).strip()
+            if stripped:
+                derived.append(stripped)
+        if derived:
+            plain = "\n".join(derived)
+            print(f"[LYRICS] lrclib derived plain from synced "
+                  f"({len(plain)} chars, {len(derived)} lines)")
+    return {
+        "plain": plain,
+        "synced": synced,
+        "duration": data.get("duration"),
+    }
+
+
+def _try_lrclib_search(artist: str, song: str) -> list:
+    """GET /api/search?q=<artist> <song>. Endpoint fuzzy de lrclib.net
+    que devuelve hasta N candidates (cada uno con el mismo shape que
+    /api/get: id, trackName, artistName, plainLyrics, syncedLyrics,
+    duration, instrumental).
+
+    Best-effort: cualquier error (network, parsing, status != 200)
+    devuelve [] sin raise. El caller decide qué hacer si no hay
+    resultados (típicamente: caer al Gemini fallback original).
+    """
+    if not artist or not song:
+        return []
+    import requests as _req
     try:
+        q = f"{artist} {song}".strip()
+        r = _req.get(
+            "https://lrclib.net/api/search",
+            params={"q": q},
+            timeout=8.0,
+            headers={"User-Agent": "GenLyAI/1.0 (+https://app.genly.pro)"},
+        )
         if r.status_code != 200:
-            print(f"[LYRICS] lrclib {r.status_code} for {artist!r} - {song!r}")
-            return None
+            print(f"[LYRICS] lrclib /search {r.status_code} for q={q!r}")
+            return []
         data = r.json()
-        plain = (data.get("plainLyrics") or "").strip() or None
-        synced = (data.get("syncedLyrics") or "").strip() or None
-        if not plain and not synced:
-            return None
-        # Some lrclib records expose only `syncedLyrics` (different bots
-        # populate the two columns independently). The downstream auto-
-        # recover code in /transcribe gates on `if plain:` so when plain
-        # is missing the recovery branch is unreachable. Derive plain
-        # from synced by stripping the `[mm:ss.xx]` timestamps so the
-        # recovery path always has a usable reference. This keeps El
-        # Plan de la Mariposa - El Riesgo (which has only syncedLyrics
-        # in some lrclib records) from falling all the way through to
-        # the no-recovery Gemini fallback.
-        if not plain and synced:
-            import re as _re
-            ts_re = _re.compile(r"^\s*(?:\[\d+:\d+(?:[.:]\d+)?\]\s*)+")
-            derived: list[str] = []
-            for line in synced.splitlines():
-                stripped = ts_re.sub("", line).strip()
-                if stripped:
-                    derived.append(stripped)
-            if derived:
-                plain = "\n".join(derived)
-                print(f"[LYRICS] lrclib derived plain from synced "
-                      f"({len(plain)} chars, {len(derived)} lines)")
-        result = {
-            "plain": plain,
-            "synced": synced,
-            "duration": data.get("duration"),
-        }
-        # Write-through cache. Once stored, this song never depends on
-        # lrclib.net uptime again — important for Railway outbound flakes.
-        if db is not None:
-            try:
-                from database import LyricsCache
-                payload = _json.dumps(result, ensure_ascii=False)
-                row = db.query(LyricsCache).filter(
-                    LyricsCache.cache_key == cache_key
-                ).first()
-                if row:
-                    row.lyrics = payload
-                else:
-                    db.add(LyricsCache(
-                        cache_key=cache_key,
-                        artist=artist,
-                        title=song,
-                        lyrics=payload,
-                        fetched_by_model="lrclib",
-                    ))
-                db.commit()
-                print(f"[LYRICS] lrclib cached {cache_key} "
-                      f"({len(payload)} bytes)")
-            except Exception as e:
-                print(f"[LYRICS] lrclib cache write failed: {e}")
-        return result
+        if not isinstance(data, list):
+            return []
+        return data
     except Exception as e:
-        print(f"[LYRICS] lrclib fetch failed: {e}")
+        print(f"[LYRICS] lrclib /search failed: {e}")
+        return []
+
+
+def _pick_best_lrclib_candidate(candidates: list, artist: str,
+                                 song: str) -> dict | None:
+    """Scorea cada candidate de /api/search contra el (artist, song)
+    pedido. Devuelve el de mayor score si supera el threshold 0.5,
+    sino None.
+
+    Scoring:
+      - Artist match exacto: +0.5; substring: +0.3; else 0.
+      - Song match exacto: +0.3; substring: +0.2; else 0.
+      - Bonus +0.2 si el candidate tiene syncedLyrics (preferimos
+        synced sobre plain para output con timestamps exactos).
+      - Threshold 0.5: requiere mínimo artist+song match O synced+song
+        match razonable. Evita aceptar matches débiles que generarían
+        output peor que el Gemini fallback existente.
+    """
+    if not candidates:
         return None
+
+    def _norm(s: str) -> str:
+        return (s or "").lower().strip()
+
+    artist_n = _norm(artist)
+    song_n = _norm(song)
+    if not artist_n or not song_n:
+        return None
+
+    best = None
+    best_score = 0.0
+    for c in candidates:
+        if not isinstance(c, dict):
+            continue
+        c_artist = _norm(c.get("artistName"))
+        c_song = _norm(c.get("trackName"))
+        a_score = (
+            0.5 if c_artist == artist_n
+            else 0.3 if artist_n and (artist_n in c_artist or c_artist in artist_n)
+            else 0.0
+        )
+        s_score = (
+            0.3 if c_song == song_n
+            else 0.2 if song_n and (song_n in c_song or c_song in song_n)
+            else 0.0
+        )
+        sync_score = 0.2 if c.get("syncedLyrics") else 0.0
+        score = a_score + s_score + sync_score
+        if score > best_score:
+            best_score = score
+            best = c
+    if best_score >= 0.5:
+        return best
+    return None
 
 
 _LRC_LINE = None  # lazy-compiled regex
@@ -2676,6 +2797,33 @@ def _fetch_lyrics_via_gemini_search(
         if len(text) < 80:
             if recorder:
                 recorder.finish(response_summary=f"too_short_chars={len(text)}")
+            return None
+
+        # Merged-line quality guard. Algunos sitios de letras devuelven
+        # las estrofas como párrafos largos en vez de líneas separadas
+        # (ej. Letras.com en flow mode). Si Gemini scrapea ese formato,
+        # avg chars/line se dispara (paragraph-style ~80+ chars vs
+        # lyric-style ~20-40 chars). Cuando este texto se usa como
+        # `lyrics_hint` de Whisper o como reference para gap-fill, el
+        # output queda mergeado de a 2-3 líneas con timestamps mal
+        # distribuidos (caso real: Noches Sin Sueño Rata Blanca en
+        # staging, Gemini devolvió 439 chars / 12 lines = 36.6 chars/line
+        # cuando lrclib synced tenía ~30 líneas para esa canción).
+        #
+        # Threshold 50: lyric lines típicas de pop/rock/balada son 20-40
+        # chars. 50+ es signature de merged-stanza scraping. Rechazar
+        # es preferible a contaminar — el caller cae al path de Whisper
+        # sin hint en vez de Whisper sesgado con merged-text.
+        avg_chars_per_line = sum(len(l) for l in lines) / len(lines)
+        if avg_chars_per_line > 50.0:
+            print(f"[LYRICS] gemini output looks merged "
+                  f"(avg {avg_chars_per_line:.1f} chars/line over "
+                  f"{len(lines)} lines) — rejecting")
+            if recorder:
+                recorder.finish(
+                    response_summary=f"rejected_merged_lines="
+                                     f"{avg_chars_per_line:.1f}cpl/{len(lines)}",
+                )
             return None
 
         # Repetition guard — Gemini hallucination loops on a single line.
