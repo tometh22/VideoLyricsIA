@@ -237,6 +237,154 @@ def cost_dashboard_global(db: Session, since_days: int = 30,
             (revenue_per_video_usd - cost_per_deliverable) * deliverable, 2
         )
 
+    # --- Per-tenant breakdown ---
+    # Cost: sum cost_for_record across each tenant's provenance rows.
+    tenant_rows = (
+        db.query(
+            Job.tenant_id,
+            AIProvenance.tool_name,
+            AIProvenance.tool_provider,
+            func.count(AIProvenance.id).label("calls"),
+        )
+        .join(Job, Job.job_id == AIProvenance.job_id)
+        .filter(AIProvenance.created_at >= since)
+        .group_by(Job.tenant_id, AIProvenance.tool_name, AIProvenance.tool_provider)
+        .all()
+    )
+    tenant_cost: dict[str, dict] = {}
+    for tenant_id, tool_name, tool_provider, calls in tenant_rows:
+        agg = tenant_cost.setdefault(
+            tenant_id, {"calls": 0, "cost": 0.0}
+        )
+        rate = cost_for_record(tool_name, tool_provider)
+        agg["calls"] += calls
+        agg["cost"] += calls * rate
+
+    # Video status counts per tenant (same window).
+    tenant_status_rows = (
+        db.query(Job.tenant_id, Job.status, func.count(Job.id))
+        .filter(Job.created_at >= since)
+        .group_by(Job.tenant_id, Job.status)
+        .all()
+    )
+    tenant_status: dict[str, dict[str, int]] = {}
+    for tenant_id, status, n in tenant_status_rows:
+        tenant_status.setdefault(tenant_id, {})[status] = int(n)
+
+    # Union of tenants seen in spend OR jobs so a 0-cost tenant with
+    # jobs still shows up (and vice versa).
+    by_tenant = []
+    for tid in set(tenant_cost.keys()) | set(tenant_status.keys()):
+        spend = tenant_cost.get(tid, {"calls": 0, "cost": 0.0})
+        sts = tenant_status.get(tid, {})
+        t_done = int(sts.get("done", 0))
+        t_pending = int(sts.get("pending_review", 0))
+        t_rejected = int(sts.get("rejected", 0))
+        t_error = int(sts.get("error", 0))
+        t_finished = t_done + t_pending + t_rejected + t_error
+        t_deliverable = t_done + t_pending
+        by_tenant.append({
+            "tenant_id": tid,
+            "calls": spend["calls"],
+            "cost": round(spend["cost"], 4),
+            "done": t_done,
+            "pending_review": t_pending,
+            "rejected": t_rejected,
+            "error": t_error,
+            "deliverable": t_deliverable,
+            "cost_per_deliverable": (
+                round(spend["cost"] / t_deliverable, 4)
+                if t_deliverable else None
+            ),
+            "rejection_rate": (
+                round(t_rejected / t_finished, 4) if t_finished else None
+            ),
+        })
+    by_tenant.sort(key=lambda r: r["cost"], reverse=True)
+
+    # --- Per-user breakdown ---
+    # Same pattern but grouped by Job.user_id + joined to User for the
+    # display name. Users without finished jobs in the window get
+    # filtered (no useful display).
+    from database import User as UserModel
+    user_rows = (
+        db.query(
+            Job.user_id,
+            Job.tenant_id,
+            UserModel.username,
+            AIProvenance.tool_name,
+            AIProvenance.tool_provider,
+            func.count(AIProvenance.id).label("calls"),
+        )
+        .join(Job, Job.job_id == AIProvenance.job_id)
+        .outerjoin(UserModel, UserModel.id == Job.user_id)
+        .filter(AIProvenance.created_at >= since)
+        .group_by(Job.user_id, Job.tenant_id, UserModel.username,
+                  AIProvenance.tool_name, AIProvenance.tool_provider)
+        .all()
+    )
+    user_cost: dict = {}
+    for user_id, tenant_id, username, tool_name, tool_provider, calls in user_rows:
+        key = (user_id, tenant_id)
+        agg = user_cost.setdefault(key, {
+            "user_id": user_id,
+            "username": username,
+            "tenant_id": tenant_id,
+            "calls": 0,
+            "cost": 0.0,
+        })
+        rate = cost_for_record(tool_name, tool_provider)
+        agg["calls"] += calls
+        agg["cost"] += calls * rate
+
+    user_status_rows = (
+        db.query(Job.user_id, Job.tenant_id, Job.status, func.count(Job.id))
+        .filter(Job.created_at >= since)
+        .group_by(Job.user_id, Job.tenant_id, Job.status)
+        .all()
+    )
+    user_status: dict = {}
+    for user_id, tenant_id, status, n in user_status_rows:
+        key = (user_id, tenant_id)
+        user_status.setdefault(key, {})[status] = int(n)
+
+    by_user = []
+    for key in set(user_cost.keys()) | set(user_status.keys()):
+        spend = user_cost.get(key, {
+            "user_id": key[0],
+            "username": None,
+            "tenant_id": key[1],
+            "calls": 0,
+            "cost": 0.0,
+        })
+        sts = user_status.get(key, {})
+        u_done = int(sts.get("done", 0))
+        u_pending = int(sts.get("pending_review", 0))
+        u_rejected = int(sts.get("rejected", 0))
+        u_error = int(sts.get("error", 0))
+        u_finished = u_done + u_pending + u_rejected + u_error
+        u_deliverable = u_done + u_pending
+        by_user.append({
+            "user_id": spend["user_id"],
+            "username": spend["username"],
+            "tenant_id": spend["tenant_id"],
+            "calls": spend["calls"],
+            "cost": round(spend["cost"], 4),
+            "done": u_done,
+            "pending_review": u_pending,
+            "rejected": u_rejected,
+            "error": u_error,
+            "deliverable": u_deliverable,
+            "cost_per_deliverable": (
+                round(spend["cost"] / u_deliverable, 4)
+                if u_deliverable else None
+            ),
+            "rejection_rate": (
+                round(u_rejected / u_finished, 4) if u_finished else None
+            ),
+        })
+    by_user.sort(key=lambda r: r["cost"], reverse=True)
+
     return {
         "since": since.isoformat(),
         "since_days": since_days,
@@ -244,6 +392,8 @@ def cost_dashboard_global(db: Session, since_days: int = 30,
         "total_calls": total_calls,
         "by_tool": by_tool,
         "by_provider": by_provider_list,
+        "by_tenant": by_tenant,
+        "by_user": by_user,
         "video_counts": {
             "done": done,
             "pending_review": pending,

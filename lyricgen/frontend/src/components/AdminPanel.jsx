@@ -1217,6 +1217,96 @@ export default function AdminPanel({ onBack }) {
                 </div>
               </div>
 
+              {/* Per-tenant breakdown */}
+              <div className="glass-elevated rounded-card p-5">
+                <div className="flex items-center justify-between mb-4">
+                  <h3 className="text-sm font-semibold">Costo por tenant</h3>
+                  <span className="text-[11px] text-gray-500">{costDashboard.by_tenant.length} tenants</span>
+                </div>
+                <div className="overflow-x-auto">
+                  <table className="w-full text-[11px]">
+                    <thead>
+                      <tr className="text-gray-500 uppercase tracking-wide text-[10px]">
+                        <th className="text-left font-medium pb-2 pr-3">Tenant</th>
+                        <th className="text-right font-medium pb-2 px-3">Calls</th>
+                        <th className="text-right font-medium pb-2 px-3">Gasto</th>
+                        <th className="text-right font-medium pb-2 px-3">Done</th>
+                        <th className="text-right font-medium pb-2 px-3">Pending</th>
+                        <th className="text-right font-medium pb-2 px-3">Rejected</th>
+                        <th className="text-right font-medium pb-2 px-3">Deliverable</th>
+                        <th className="text-right font-medium pb-2 px-3">$/deliver</th>
+                        <th className="text-right font-medium pb-2 pl-3">% rejects</th>
+                      </tr>
+                    </thead>
+                    <tbody className="divide-y divide-white/[0.04]">
+                      {costDashboard.by_tenant.map((t) => (
+                        <tr key={t.tenant_id} className="hover:bg-white/[0.02]">
+                          <td className="py-2 pr-3 font-mono text-white">{t.tenant_id || "—"}</td>
+                          <td className="py-2 px-3 text-right tabular-nums text-gray-300">{t.calls}</td>
+                          <td className="py-2 px-3 text-right tabular-nums font-mono text-white">${t.cost.toFixed(2)}</td>
+                          <td className="py-2 px-3 text-right tabular-nums text-accent">{t.done}</td>
+                          <td className="py-2 px-3 text-right tabular-nums text-amber-400">{t.pending_review}</td>
+                          <td className="py-2 px-3 text-right tabular-nums text-red-400">{t.rejected}</td>
+                          <td className="py-2 px-3 text-right tabular-nums text-gray-300">{t.deliverable}</td>
+                          <td className="py-2 px-3 text-right tabular-nums font-mono text-gray-300">
+                            {t.cost_per_deliverable !== null ? `$${t.cost_per_deliverable.toFixed(2)}` : "—"}
+                          </td>
+                          <td className="py-2 pl-3 text-right tabular-nums text-gray-400">
+                            {t.rejection_rate !== null ? `${(t.rejection_rate * 100).toFixed(1)}%` : "—"}
+                          </td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              </div>
+
+              {/* Per-user breakdown */}
+              <div className="glass-elevated rounded-card p-5">
+                <div className="flex items-center justify-between mb-4">
+                  <h3 className="text-sm font-semibold">Costo por usuario</h3>
+                  <span className="text-[11px] text-gray-500">{costDashboard.by_user.length} usuarios</span>
+                </div>
+                <div className="overflow-x-auto">
+                  <table className="w-full text-[11px]">
+                    <thead>
+                      <tr className="text-gray-500 uppercase tracking-wide text-[10px]">
+                        <th className="text-left font-medium pb-2 pr-3">Usuario</th>
+                        <th className="text-left font-medium pb-2 px-3">Tenant</th>
+                        <th className="text-right font-medium pb-2 px-3">Calls</th>
+                        <th className="text-right font-medium pb-2 px-3">Gasto</th>
+                        <th className="text-right font-medium pb-2 px-3">Done</th>
+                        <th className="text-right font-medium pb-2 px-3">Pending</th>
+                        <th className="text-right font-medium pb-2 px-3">Rejected</th>
+                        <th className="text-right font-medium pb-2 px-3">$/deliver</th>
+                        <th className="text-right font-medium pb-2 pl-3">% rejects</th>
+                      </tr>
+                    </thead>
+                    <tbody className="divide-y divide-white/[0.04]">
+                      {costDashboard.by_user.map((u) => (
+                        <tr key={`${u.user_id}|${u.tenant_id}`} className="hover:bg-white/[0.02]">
+                          <td className="py-2 pr-3 text-white">
+                            {u.username || <span className="text-gray-500 italic">user #{u.user_id ?? "—"}</span>}
+                          </td>
+                          <td className="py-2 px-3 font-mono text-gray-400">{u.tenant_id || "—"}</td>
+                          <td className="py-2 px-3 text-right tabular-nums text-gray-300">{u.calls}</td>
+                          <td className="py-2 px-3 text-right tabular-nums font-mono text-white">${u.cost.toFixed(2)}</td>
+                          <td className="py-2 px-3 text-right tabular-nums text-accent">{u.done}</td>
+                          <td className="py-2 px-3 text-right tabular-nums text-amber-400">{u.pending_review}</td>
+                          <td className="py-2 px-3 text-right tabular-nums text-red-400">{u.rejected}</td>
+                          <td className="py-2 px-3 text-right tabular-nums font-mono text-gray-300">
+                            {u.cost_per_deliverable !== null ? `$${u.cost_per_deliverable.toFixed(2)}` : "—"}
+                          </td>
+                          <td className="py-2 pl-3 text-right tabular-nums text-gray-400">
+                            {u.rejection_rate !== null ? `${(u.rejection_rate * 100).toFixed(1)}%` : "—"}
+                          </td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              </div>
+
               {/* Per-tool detail (collapsed by default mental load — just a small table) */}
               <details className="glass rounded-card p-5">
                 <summary className="text-xs text-gray-400 cursor-pointer select-none">
