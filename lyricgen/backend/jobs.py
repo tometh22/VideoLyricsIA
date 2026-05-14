@@ -5,12 +5,27 @@ import uuid
 from datetime import datetime, timezone
 from typing import Optional
 
+from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import Session
 
 import storage
 from database import Job, get_db
 
 _logger = logging.getLogger("genly.jobs")
+
+# Postgres on Railway occasionally drops idle connections in ways that
+# pool_pre_ping + TCP keepalives don't fully prevent — the drop happens
+# AFTER the pre-ping and BEFORE the actual query, a narrow race we can
+# only catch by retrying. Markers cover the SQLAlchemy/psycopg2 strings
+# we've actually observed in production logs on /upload-part-proxy. Kept
+# in sync with main.py:_TRANSIENT_DB_MARKERS — both lists are short, so
+# the duplication is cheaper than a new shared module.
+_TRANSIENT_DB_MARKERS = (
+    "SSL connection has been closed",
+    "server closed the connection",
+    "connection already closed",
+    "could not connect to server",
+)
 
 
 def create_job(
@@ -94,6 +109,49 @@ def get_job(
 def get_job_model(db: Session, job_id: str) -> Optional[Job]:
     """Return the raw Job model instance."""
     return db.query(Job).filter(Job.job_id == job_id).first()
+
+
+def get_job_model_resilient(
+    db: Session, job_id: str, max_attempts: int = 2
+) -> Optional[Job]:
+    """Same as get_job_model but retries once on transient Postgres SSL drops.
+
+    The global DbTransientRetryMiddleware (main.py) can't recover the
+    upload-proxy endpoints because each multipart part body is 8 MB and
+    the middleware refuses to buffer anything over 1 MiB for replay.
+    The result is a 500 → frontend retry from byte 0 → user sees the
+    progress bar fall to ~0% (concurrency=4, all four in-flight parts
+    can fail together on one connection drop).
+
+    We do the retry inline, BEFORE reading the body, so no replay is
+    needed. On a transient OperationalError we rollback (which marks
+    the connection invalid; SQLAlchemy will check out a fresh one) and
+    retry the query. Non-transient errors propagate unchanged.
+
+    Observed in prod 2026-05-14:
+        sqlalchemy.exc.OperationalError: (psycopg2.OperationalError)
+        SSL connection has been closed unexpectedly
+    on POST /upload-part-proxy, 5 times across recent uploads.
+    """
+    last_err: Optional[OperationalError] = None
+    for attempt in range(max_attempts):
+        try:
+            return get_job_model(db, job_id)
+        except OperationalError as e:
+            if not any(m in str(e) for m in _TRANSIENT_DB_MARKERS):
+                raise
+            last_err = e
+            try:
+                db.rollback()
+            except OperationalError:
+                # Rollback against an already-dead connection can throw
+                # the same error. SQLAlchemy still invalidates the conn
+                # so the next checkout is fresh — swallow this one.
+                pass
+    # Exhausted retries — propagate the last transient error so the
+    # caller (and global middleware) sees the real cause.
+    assert last_err is not None
+    raise last_err
 
 
 def touch_user_activity(db: Session, job: Job) -> None:
