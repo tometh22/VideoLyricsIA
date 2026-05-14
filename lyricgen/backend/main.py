@@ -1981,9 +1981,14 @@ _MULTIPART_THRESHOLD_BYTES = int(
     os.environ.get("MULTIPART_THRESHOLD_BYTES", str(16 * 1024 * 1024))
 )
 # Max size of a single multipart part. R2 accepts up to 5 GB / part but
-# 8 MB is a healthy sweet spot for browser parallelism + retry granularity.
+# 4 MB is a sweet spot for residential/mobile uploaders: each part fits
+# inside Cloudflare's ~100 s HTTP request timeout even on slow upstreams
+# (~400 Kbps gets a 4 MB part through in ~80 s with headroom), and a
+# retry-from-byte-0 wastes half as many bytes as the old 8 MB setting.
+# Previously 8 MB — bumped down 2026-05-14 after Agus (WAV, residential)
+# repeatedly hit progress resets on parts that timed out at the proxy.
 _MULTIPART_PART_SIZE_BYTES = int(
-    os.environ.get("MULTIPART_PART_SIZE_BYTES", str(8 * 1024 * 1024))
+    os.environ.get("MULTIPART_PART_SIZE_BYTES", str(4 * 1024 * 1024))
 )
 _PRESIGN_PUT_TTL_S = int(os.environ.get("PRESIGN_PUT_TTL_S", "900"))
 
