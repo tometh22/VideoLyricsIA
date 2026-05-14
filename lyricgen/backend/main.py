@@ -4456,6 +4456,48 @@ async def reject_job(
     return {"ok": True, "status": "rejected", "job_id": job_id}
 
 
+@app.get("/jobs/{job_id}/source-audio-url")
+async def get_source_audio_url(
+    job_id: str,
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Pre-signed URL to the original MP3 uploaded by the user.
+
+    Powers the post-approval lyrics editor: when an operator opens the
+    full LyricsEditor on a done/rejected job to fix sync, the <audio>
+    element needs to stream the source so the operator can hear what
+    they're aligning to. Returning a signed URL (instead of proxying
+    bytes through uvicorn) keeps the API container free during long
+    editor sessions.
+
+    Owner / same-tenant only — same auth model as /download/<job>/<file>.
+    Returns 404 if the job has no input_r2_key (very old jobs uploaded
+    before R2-first flow, or jobs whose input was purged by lifecycle).
+    """
+    from database import Job as JobModel
+    job = (
+        db.query(JobModel)
+        .filter(JobModel.job_id == job_id)
+        .filter(JobModel.tenant_id == current_user["tenant_id"])
+        .first()
+    )
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+    if not job.input_r2_key:
+        raise HTTPException(
+            status_code=404,
+            detail="Source audio is not available for this job.",
+        )
+    url = storage.generate_signed_url(job.input_r2_key, expiry_seconds=3600)
+    if not url:
+        raise HTTPException(
+            status_code=503,
+            detail="Object storage is unavailable.",
+        )
+    return {"url": url, "expires_in": 3600}
+
+
 class SaveSegmentsRequest(BaseModel):
     # Persisted to Job.segments_json (JSONB). Same shape /generate and
     # /edit accept. 5 MB upper bound mirrors /generate's segments_json

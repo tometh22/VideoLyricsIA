@@ -193,6 +193,16 @@ export default function LyricsEditor({
   textContrast = "medium",
   transcribeJobId = null,
   onPersistSegments = null,
+  // Post-approval / re-sync mode. The wizard's upload flow never sets
+  // these (defaults preserve original behavior); the JobDetail /edit
+  // modal mounts this same editor with audioUrl + the disable flags so
+  // the operator can fix sync on an already-approved job without
+  // pulling in features that no longer apply.
+  audioUrl: audioUrlProp = null,
+  disableAutoSplit = false,
+  disableBeforeUnload = false,
+  disableAutosave = false,
+  submitLabel = null,
 }) {
   const { t } = useI18n();
   const [edited, setEdited] = useState(() =>
@@ -201,12 +211,15 @@ export default function LyricsEditor({
   const [isDirty, setIsDirty] = useState(false);
 
   // Warn browser on tab-close / external navigation when there are unsaved edits.
+  // disableBeforeUnload skips this for the post-approval modal — closing
+  // the modal already IS the explicit "discard" gesture, a native confirm
+  // on top is noise.
   useEffect(() => {
-    if (!isDirty) return;
+    if (disableBeforeUnload || !isDirty) return;
     const handler = (e) => { e.preventDefault(); e.returnValue = ""; };
     window.addEventListener("beforeunload", handler);
     return () => window.removeEventListener("beforeunload", handler);
-  }, [isDirty]);
+  }, [isDirty, disableBeforeUnload]);
 
   // Debounced autosave to backend: every 3s after the last edit, persist
   // the current segments to /jobs/{id}/save-segments. This bumps the
@@ -215,6 +228,7 @@ export default function LyricsEditor({
   // lyrics for 90 min and all 5 jobs got reaped before "Crear videos").
   // No-op when the parent didn't wire the callback (e.g. unit tests).
   useEffect(() => {
+    if (disableAutosave) return undefined;
     if (!onPersistSegments || !transcribeJobId) return undefined;
     if (!Array.isArray(edited) || edited.length === 0) return undefined;
     const tid = setTimeout(() => {
@@ -222,7 +236,7 @@ export default function LyricsEditor({
       onPersistSegments(transcribeJobId, cleaned);
     }, 3000);
     return () => clearTimeout(tid);
-  }, [edited, transcribeJobId, onPersistSegments]);
+  }, [edited, transcribeJobId, onPersistSegments, disableAutosave]);
 
   // ─── Audio sync ─────────────────────────────────────────────────────
   // Blob URL lifecycle must live in useEffect, not useMemo. useMemo is
@@ -234,11 +248,17 @@ export default function LyricsEditor({
   // seconds in once the initial buffered range is consumed.
   const [audioUrl, setAudioUrl] = useState(null);
   useEffect(() => {
+    // audioUrlProp wins over audioFile when the parent already has a
+    // streamable URL (post-approval modal: signed R2 URL via GET
+    // /jobs/{id}/source-audio-url). Don't createObjectURL in that case —
+    // the URL is already valid for <audio src> and revoking would be a
+    // no-op anyway.
+    if (audioUrlProp) { setAudioUrl(audioUrlProp); return undefined; }
     if (!audioFile) { setAudioUrl(null); return undefined; }
     const url = URL.createObjectURL(audioFile);
     setAudioUrl(url);
     return () => URL.revokeObjectURL(url);
-  }, [audioFile]);
+  }, [audioFile, audioUrlProp]);
 
   const audioRef = useRef(null);
   const listRef = useRef(null);
@@ -853,7 +873,7 @@ export default function LyricsEditor({
           </div>
         </div>
         <button onClick={handleApprove} className="btn-primary text-sm h-11 px-5">
-          {isBatch ? t("editor.approve_next") : t("editor.approve_generate")}
+          {submitLabel || (isBatch ? t("editor.approve_next") : t("editor.approve_generate"))}
           <svg className="inline-block ml-1.5 w-4 h-4" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
             <path d="M5 12h14M12 5l7 7-7 7" />
           </svg>
@@ -876,7 +896,7 @@ export default function LyricsEditor({
           que matchea contra 2 lineas consecutivas de la referencia.
           Es la acción primaria sugerida cuando la pipeline cayó al
           recovery path o cualquier output mergeó 2 lyric lines en 1. */}
-      {mergeableSegments.length > 0 && (
+      {!disableAutoSplit && mergeableSegments.length > 0 && (
         <div className="mb-4 rounded-2xl ring-1 ring-amber-500/30 bg-amber-500/[0.08] px-4 py-3 flex items-start gap-3">
           <svg className="w-5 h-5 text-amber-400 flex-shrink-0 mt-0.5" fill="none" stroke="currentColor" strokeWidth="1.8" viewBox="0 0 24 24">
             <path d="M12 9v3.75m9-.75a9 9 0 11-18 0 9 9 0 0118 0zm-9 3.75h.008v.008H12v-.008z" strokeLinecap="round" strokeLinejoin="round" />
@@ -1475,7 +1495,7 @@ export default function LyricsEditor({
           )}
         </div>
         <button onClick={handleApprove} className="btn-primary text-sm h-11 px-5 shrink-0" data-tour="editor-approve">
-          {isBatch ? t("editor.approve_next") : t("editor.approve_generate")}
+          {submitLabel || (isBatch ? t("editor.approve_next") : t("editor.approve_generate"))}
         </button>
       </div>
 
