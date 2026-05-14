@@ -34,7 +34,7 @@ import time
 from datetime import datetime, timedelta, timezone
 from typing import Iterable
 
-from sqlalchemy import exists
+from sqlalchemy import exists, func
 from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import Session
 
@@ -167,12 +167,24 @@ def find_abandoned_transcribed(
     """Return jobs stuck in transcribed_pending past the editing TTL.
     These represent users who transcribed but never clicked Generate
     (closed tab, lost connection). The associated audio file lives on
-    disk + R2 and needs to be reaped or it accumulates forever."""
+    disk + R2 and needs to be reaped or it accumulates forever.
+
+    Staleness anchor is coalesce(last_user_activity_at, created_at): any
+    authenticated touch (POST /save-segments, /status poll, etc) bumps
+    last_user_activity_at, so an active batch-edit session keeps the job
+    alive past the TTL. Older rows with NULL last_user_activity_at fall
+    back to created_at — preserves pre-migration behavior.
+
+    Incident 2026-05-14: a user batch-editing 5 lyrics for 90 min got
+    reaped at 30 min and lost everything because the anchor was just
+    created_at. The coalesce + /save-segments together fix that.
+    """
     cutoff = datetime.now(timezone.utc) - timedelta(minutes=ttl_min)
+    anchor = func.coalesce(Job.last_user_activity_at, Job.created_at)
     return (
         db.query(Job)
         .filter(Job.status == "transcribed_pending")
-        .filter(Job.created_at < cutoff)
+        .filter(anchor < cutoff)
         .order_by(Job.created_at.asc())
         .all()
     )
