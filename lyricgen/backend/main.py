@@ -1981,9 +1981,14 @@ _MULTIPART_THRESHOLD_BYTES = int(
     os.environ.get("MULTIPART_THRESHOLD_BYTES", str(16 * 1024 * 1024))
 )
 # Max size of a single multipart part. R2 accepts up to 5 GB / part but
-# 8 MB is a healthy sweet spot for browser parallelism + retry granularity.
+# 4 MB is a sweet spot for residential/mobile uploaders: each part fits
+# inside Cloudflare's ~100 s HTTP request timeout even on slow upstreams
+# (~400 Kbps gets a 4 MB part through in ~80 s with headroom), and a
+# retry-from-byte-0 wastes half as many bytes as the old 8 MB setting.
+# Previously 8 MB — bumped down 2026-05-14 after Agus (WAV, residential)
+# repeatedly hit progress resets on parts that timed out at the proxy.
 _MULTIPART_PART_SIZE_BYTES = int(
-    os.environ.get("MULTIPART_PART_SIZE_BYTES", str(8 * 1024 * 1024))
+    os.environ.get("MULTIPART_PART_SIZE_BYTES", str(4 * 1024 * 1024))
 )
 _PRESIGN_PUT_TTL_S = int(os.environ.get("PRESIGN_PUT_TTL_S", "900"))
 
@@ -2239,8 +2244,12 @@ async def upload_part_proxy(
     to r2.cloudflarestorage.com which would require R2 bucket CORS config."""
     if part_number < 1 or part_number > 10_000:
         raise HTTPException(status_code=400, detail="part_number out of range")
-    from jobs import get_job_model
-    job_row = get_job_model(db, job_id)
+    # Resilient lookup: the global DbTransientRetryMiddleware can't
+    # replay this request (body > 1 MiB), so we handle SSL drops inline
+    # before reading the body. See jobs.get_job_model_resilient for the
+    # production incident this addresses.
+    from jobs import get_job_model_resilient
+    job_row = get_job_model_resilient(db, job_id)
     if (not job_row
             or job_row.user_id != current_user["id"]
             or job_row.tenant_id != current_user["tenant_id"]):
@@ -2275,8 +2284,10 @@ async def upload_file_proxy(
     bytes here (same-origin, no CORS preflight) instead of PUTting directly
     to r2.cloudflarestorage.com which would require R2 bucket CORS config.
     Mirrors /upload-part-proxy for the non-multipart (<16 MB) path."""
-    from jobs import get_job_model
-    job_row = get_job_model(db, job_id)
+    # Resilient lookup — see /upload-part-proxy for why the global
+    # middleware can't help (body too large to buffer for replay).
+    from jobs import get_job_model_resilient
+    job_row = get_job_model_resilient(db, job_id)
     if (not job_row
             or job_row.user_id != current_user["id"]
             or job_row.tenant_id != current_user["tenant_id"]):

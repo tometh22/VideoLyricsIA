@@ -100,7 +100,19 @@ engine = create_engine(
     pool_size=_DB_POOL_SIZE,
     max_overflow=_DB_MAX_OVERFLOW,
     pool_pre_ping=True,
-    pool_recycle=300,
+    # Force-recycle pool connections every 120 s. Defensive layer on top
+    # of pool_pre_ping for Railway Postgres, which drops idle conns in a
+    # narrow window between the pre-ping and the actual query — a race
+    # we see surface as `psycopg2.OperationalError: SSL connection has
+    # been closed unexpectedly` on hot endpoints (/upload-part-proxy).
+    # Previously 300 s. Lower = more reconnect churn but less stale
+    # surface area.
+    pool_recycle=120,
+    # Rollback any in-flight transaction state when a session returns to
+    # the pool. Prevents a half-aborted tx from a previous request from
+    # poisoning the next checkout. No-op in SQLite (used in tests); on
+    # Postgres this is a cheap ROLLBACK at checkin time.
+    pool_reset_on_return="rollback",
     echo=os.environ.get("SQL_ECHO", "").lower() == "true",
     connect_args=_keepalive_args,
 )

@@ -338,6 +338,66 @@ def multipart_presign_part(
     )
 
 
+_TRANSIENT_BOTOCORE_EXC_NAMES = (
+    "EndpointConnectionError",
+    "ReadTimeoutError",
+    "ConnectionClosedError",
+    "ConnectTimeoutError",
+    "IncompleteReadError",
+)
+
+
+def _is_transient_boto_error(exc: BaseException) -> bool:
+    """True if the exception is a network/timeout error worth retrying.
+
+    Complements boto3's built-in retry (configured in _get_client with
+    max_attempts=5, adaptive mode). boto3 already handles most 5xx and
+    throttling, but a few connection-level errors slip through —
+    especially on Railway when egress to R2 has a brief hiccup. We add
+    a short retry on top so the operator doesn't have to wait the full
+    frontend backoff (1s → 2s → 4s …) before recovery.
+    """
+    if exc.__class__.__name__ in _TRANSIENT_BOTOCORE_EXC_NAMES:
+        return True
+    # botocore.exceptions.ClientError with a 5xx response also counts.
+    response = getattr(exc, "response", None)
+    if isinstance(response, dict):
+        status = (response.get("ResponseMetadata") or {}).get("HTTPStatusCode")
+        if isinstance(status, int) and status >= 500:
+            return True
+    return False
+
+
+def _retry_transient(fn, label: str, max_attempts: int = 3, base_delay: float = 0.5):
+    """Run `fn()`, retrying on transient boto errors with exponential backoff.
+
+    Total max wait at default config: 0.5 + 1.0 = 1.5 s before final
+    attempt. Cheap compared to the frontend's per-part retry (~1-32 s
+    backoff). Permanent errors (4xx other than throttling) propagate on
+    the first hit so we don't burn time on hopeless retries.
+    """
+    import logging
+    import time as _time
+    last_exc: BaseException | None = None
+    for attempt in range(max_attempts):
+        try:
+            return fn()
+        except Exception as exc:  # noqa: BLE001 — bounded by transient check below
+            if not _is_transient_boto_error(exc):
+                raise
+            last_exc = exc
+            if attempt == max_attempts - 1:
+                break
+            wait = base_delay * (2 ** attempt)
+            logging.getLogger(__name__).warning(
+                "[R2] %s transient error (attempt %d/%d), retrying in %.1fs: %s",
+                label, attempt + 1, max_attempts, wait, exc,
+            )
+            _time.sleep(wait)
+    assert last_exc is not None
+    raise last_exc
+
+
 def put_object_bytes(key: str, data: bytes, content_type: str = "application/octet-stream") -> bool:
     """Upload raw bytes to an arbitrary R2 key (single-PUT proxy path).
     Returns True on success, False if R2 is disabled or the call fails."""
@@ -345,11 +405,14 @@ def put_object_bytes(key: str, data: bytes, content_type: str = "application/oct
     if client is None:
         return False
     try:
-        client.put_object(
-            Bucket=R2_BUCKET,
-            Key=key,
-            Body=data,
-            ContentType=content_type,
+        _retry_transient(
+            lambda: client.put_object(
+                Bucket=R2_BUCKET,
+                Key=key,
+                Body=data,
+                ContentType=content_type,
+            ),
+            label=f"put_object key={key}",
         )
         return True
     except Exception as exc:
@@ -368,12 +431,15 @@ def upload_part(
     if client is None:
         return None
     try:
-        response = client.upload_part(
-            Bucket=R2_BUCKET,
-            Key=key,
-            UploadId=upload_id,
-            PartNumber=part_number,
-            Body=data,
+        response = _retry_transient(
+            lambda: client.upload_part(
+                Bucket=R2_BUCKET,
+                Key=key,
+                UploadId=upload_id,
+                PartNumber=part_number,
+                Body=data,
+            ),
+            label=f"upload_part key={key} part={part_number}",
         )
         return response["ETag"].strip('"')
     except Exception as exc:
