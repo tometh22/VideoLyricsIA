@@ -2453,11 +2453,6 @@ class _TranscribeUploadedReq(BaseModel):
     language: str = Field(default="", max_length=16)
     artist: str = Field(default="", max_length=255)    # DB Job.artist = VARCHAR(255)
     title: str = Field(default="", max_length=500)     # DB Job.song_title = VARCHAR(500)
-    # When True (default), LRCLib/Whisper-produced segments get their
-    # `end` capped at the estimated voice-end so the editor doesn't show
-    # lines stretched through instrumental fills. Operator can override
-    # per-job from the upload wizard.
-    auto_trim_lyrics: bool = True
 
 
 @app.post("/transcribe-uploaded")
@@ -2532,7 +2527,6 @@ async def transcribe_uploaded(
         return await _run_transcription_for_job(
             request, db, current_user, job_id, audio_path,
             language=body.language, artist=body.artist, title=body.title,
-            auto_trim_lyrics=body.auto_trim_lyrics,
         )
     finally:
         _release_transcription_slot(transcription_lease)
@@ -2841,7 +2835,7 @@ async def transcribe_endpoint(
 async def _run_transcription_for_job(
     request, db, current_user, job_id: str, audio_path: str,
     *, language: str = "", artist: str = "", title: str = "",
-    filename: str = "", auto_trim_lyrics: bool = True,
+    filename: str = "",
 ):
     """Shared transcription pipeline: lrclib synced/plain → Whisper →
     hallucination recovery → segments. Used by both /transcribe (legacy
@@ -3215,11 +3209,6 @@ async def _run_transcription_for_job(
                 combined, _dropped = _filter_whisper_hallucinations(combined)
                 if _dropped:
                     print(f"[TRANSCRIBE] dropped {_dropped} Whisper hallucination phrase(s)")
-                if auto_trim_lyrics:
-                    from pipeline import _trim_segments_to_voice_end
-                    combined, _t, _r = _trim_segments_to_voice_end(combined)
-                    if _t:
-                        print(f"[LYRICS] auto-trim: shortened {_t} lines, recovered {_r:.1f}s")
                 return {"job_id": job_id, "segments": combined, "reference_lyrics": plain}
 
         # Kick off Gemini-grounded lyrics fetch in parallel with Whisper.
@@ -3327,11 +3316,6 @@ async def _run_transcription_for_job(
         segments, _dropped = _filter_whisper_hallucinations(segments)
         if _dropped:
             print(f"[TRANSCRIBE] dropped {_dropped} Whisper hallucination phrase(s)")
-        if auto_trim_lyrics:
-            from pipeline import _trim_segments_to_voice_end
-            segments, _t, _r = _trim_segments_to_voice_end(segments)
-            if _t:
-                print(f"[LYRICS] auto-trim: shortened {_t} lines, recovered {_r:.1f}s")
         return {"job_id": job_id, "segments": segments, "reference_lyrics": reference}
     finally:
         # tmp_dir holds intermediate slices (intro/body cuts) only — the
@@ -3375,12 +3359,6 @@ async def generate_with_segments(
     text_motion: str = Form("none", max_length=16),
     text_contrast: str = Form("medium", max_length=16),
     match_lyrics: bool = Form(True),
-    # When True (default), the pipeline shortens any segment whose `end`
-    # extends past the natural sung duration (LRCLib pins each line's end
-    # to the start of the next, which leaves text hanging through
-    # instrumental fills/outros). Operator can turn it off per-job in the
-    # upload wizard to keep the raw LRCLib timing.
-    auto_trim_lyrics: bool = Form(True),
     current_user: dict = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
@@ -3596,7 +3574,6 @@ async def generate_with_segments(
         text_motion=text_motion if text_motion in ("none", "subtle", "float") else "none",
         text_contrast=text_contrast if text_contrast in ("subtle", "medium", "strong") else "medium",
         match_lyrics=match_lyrics,
-        auto_trim_lyrics=auto_trim_lyrics,
     )
 
     return {"job_id": job_id, "status": initial_status}

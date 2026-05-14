@@ -707,7 +707,9 @@ export default function LyricsEditor({
     setEdited((prev) => prev.filter((seg) => seg._id !== id));
   };
 
-  // V2 formula — must stay in sync with backend pipeline._estimate_voice_end_duration.
+  // Text-length-based cap. Used by the per-row ✂ button + bulk-trim
+  // action in this editor. There is NO automatic application — the
+  // operator chooses when (and per-segment whether) to apply.
   const TRIM_FLOOR_S = 3.5;
   const TRIM_PER_CHAR_S = 0.10;
   const TRIM_MARGIN_S = 1.0;
@@ -715,8 +717,9 @@ export default function LyricsEditor({
     Math.max(TRIM_FLOOR_S, (text || "").length * TRIM_PER_CHAR_S + TRIM_MARGIN_S);
 
   /** Cap a single segment's `end` to the estimated voice-end of its text.
-   * Used by the per-row ✂ button — operator can punch one line at a time
-   * when the auto-trim missed a case or was disabled at upload. */
+   * Used by the per-row ✂ button — operator marks one hanging line at a
+   * time. ONLY modifies the `end` of the matched segment; no other
+   * segment is touched, and `start` is preserved. */
   const trimSeg = (id) => {
     pushEditHistory();
     setEdited((prev) =>
@@ -730,8 +733,9 @@ export default function LyricsEditor({
     );
   };
 
-  /** Bulk: trim every segment whose duration exceeds the cap. Useful when
-   * re-editing an old job that pre-dates the auto-trim feature. */
+  /** Bulk: trim every segment whose duration exceeds the cap. Each
+   * segment is trimmed independently — only its own `end` is modified
+   * based on its own text length and start. No cross-segment effect. */
   const trimAllLongSegs = () => {
     pushEditHistory();
     setEdited((prev) =>
