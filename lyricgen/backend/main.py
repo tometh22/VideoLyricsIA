@@ -2239,8 +2239,12 @@ async def upload_part_proxy(
     to r2.cloudflarestorage.com which would require R2 bucket CORS config."""
     if part_number < 1 or part_number > 10_000:
         raise HTTPException(status_code=400, detail="part_number out of range")
-    from jobs import get_job_model
-    job_row = get_job_model(db, job_id)
+    # Resilient lookup: the global DbTransientRetryMiddleware can't
+    # replay this request (body > 1 MiB), so we handle SSL drops inline
+    # before reading the body. See jobs.get_job_model_resilient for the
+    # production incident this addresses.
+    from jobs import get_job_model_resilient
+    job_row = get_job_model_resilient(db, job_id)
     if (not job_row
             or job_row.user_id != current_user["id"]
             or job_row.tenant_id != current_user["tenant_id"]):
@@ -2275,8 +2279,10 @@ async def upload_file_proxy(
     bytes here (same-origin, no CORS preflight) instead of PUTting directly
     to r2.cloudflarestorage.com which would require R2 bucket CORS config.
     Mirrors /upload-part-proxy for the non-multipart (<16 MB) path."""
-    from jobs import get_job_model
-    job_row = get_job_model(db, job_id)
+    # Resilient lookup — see /upload-part-proxy for why the global
+    # middleware can't help (body too large to buffer for replay).
+    from jobs import get_job_model_resilient
+    job_row = get_job_model_resilient(db, job_id)
     if (not job_row
             or job_row.user_id != current_user["id"]
             or job_row.tenant_id != current_user["tenant_id"]):
