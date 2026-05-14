@@ -148,6 +148,47 @@ def test_api_error_not_retryable(patched_transcribe):
     assert create_mock.call_count == 1
 
 
+def test_insufficient_quota_bails_without_retry(patched_transcribe):
+    """When OpenAI returns 429 with insufficient_quota (cuenta sin créditos),
+    the SDK raises RateLimitError but the cause is PERMANENT — retrying just
+    wastes 30s and surfaces a stale error to the user. Verify we detect the
+    quota keyword in the message and bail on the FIRST attempt with a
+    clearer "sin cuota" message (no Retry-After header).
+
+    Incident 2026-05-14: balance OpenAI llegó a $0, los users vieron 30s+
+    de retries fallidos antes del 503. Tras este fix, falla en <1s con
+    mensaje claro."""
+    import pipeline
+    from fastapi import HTTPException
+    from openai import RateLimitError
+
+    # Build a RateLimitError whose stringified body matches what OpenAI
+    # actually returns (we use a regex-like keyword match in production code).
+    quota_exc = RateLimitError.__new__(RateLimitError)
+    quota_exc.message = (
+        "Error code: 429 - {'error': {'message': 'You exceeded your current "
+        "quota, please check your plan and billing details.', "
+        "'type': 'insufficient_quota', 'code': 'insufficient_quota'}}"
+    )
+    quota_exc.args = (quota_exc.message,)
+
+    create_mock = patched_transcribe([quota_exc])
+
+    with pytest.raises(HTTPException) as exc_info:
+        pipeline._transcribe_via_openai_api("/tmp/_test.mp3", language="es")
+
+    # Bailed on attempt 1, no retries.
+    assert create_mock.call_count == 1, (
+        f"Expected exactly 1 attempt for insufficient_quota; got {create_mock.call_count}"
+    )
+    # 503 with the new "sin cuota" message, NO Retry-After (it's permanent).
+    assert exc_info.value.status_code == 503
+    assert "sin cuota" in exc_info.value.detail.lower() or "sin créditos" in exc_info.value.detail.lower() or "administrador" in exc_info.value.detail.lower()
+    # No Retry-After header (don't tell the user to retry — won't help).
+    headers = exc_info.value.headers or {}
+    assert "Retry-After" not in headers and "retry-after" not in headers
+
+
 def test_env_var_caps_retries(patched_transcribe, monkeypatch):
     """WHISPER_MAX_RETRIES=2 → bail after 2 attempts. Lets ops tune the
     budget on Railway without redeploying code."""
