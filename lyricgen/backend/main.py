@@ -1980,15 +1980,18 @@ def _parse_umg_params(
 _MULTIPART_THRESHOLD_BYTES = int(
     os.environ.get("MULTIPART_THRESHOLD_BYTES", str(16 * 1024 * 1024))
 )
-# Max size of a single multipart part. R2 accepts up to 5 GB / part but
-# 4 MB is a sweet spot for residential/mobile uploaders: each part fits
-# inside Cloudflare's ~100 s HTTP request timeout even on slow upstreams
-# (~400 Kbps gets a 4 MB part through in ~80 s with headroom), and a
-# retry-from-byte-0 wastes half as many bytes as the old 8 MB setting.
-# Previously 8 MB — bumped down 2026-05-14 after Agus (WAV, residential)
-# repeatedly hit progress resets on parts that timed out at the proxy.
+# Max size of a single multipart part. S3/R2 require parts >= 5 MiB
+# (except the last). 4 MiB violated that and made every multipart-
+# complete fail with EntityTooSmall — confirmed in prod 2026-05-14 16:30
+# right after the part-size-down change went live. Back to 8 MiB, the
+# pre-incident default, which gives headroom over the 5 MiB floor and
+# keeps part counts low for browser parallelism.
+#
+# Cloudflare proxy timeout (originally why we tried 4 MiB) is being
+# addressed separately by restoring direct browser → R2 PUT (no proxy
+# in the data path); see PR for r2_cors + frontend rollback.
 _MULTIPART_PART_SIZE_BYTES = int(
-    os.environ.get("MULTIPART_PART_SIZE_BYTES", str(4 * 1024 * 1024))
+    os.environ.get("MULTIPART_PART_SIZE_BYTES", str(8 * 1024 * 1024))
 )
 _PRESIGN_PUT_TTL_S = int(os.environ.get("PRESIGN_PUT_TTL_S", "900"))
 
