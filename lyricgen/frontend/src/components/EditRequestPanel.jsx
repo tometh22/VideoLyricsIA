@@ -760,64 +760,126 @@ export default function EditRequestPanel({
           audio streams from a signed R2 URL, no auto-split / autosave /
           beforeunload, submit button renamed to communicate the re-render
           intent. The operator's Approve callback hands us the cleaned
-          segments which we POST to /edit (with the 409 YouTube guard). */}
-      {mode === "lyrics" && (
-        <div className="fixed inset-0 z-50 bg-bg/95 backdrop-blur-sm overflow-y-auto">
-          <div className="min-h-screen px-4 py-8 sm:px-8">
-            {lyricsAudioError && (
-              <div className="max-w-3xl mx-auto mb-4 rounded-2xl ring-1 ring-amber-500/30 bg-amber-500/[0.08] px-4 py-3">
-                <p className="text-xs text-amber-200">{lyricsAudioError}</p>
-              </div>
-            )}
-            {error && (
-              <div className="max-w-3xl mx-auto mb-4 rounded-2xl ring-1 ring-red-500/30 bg-red-500/[0.08] px-4 py-3">
-                <p className="text-xs text-red-300">{error}</p>
-              </div>
-            )}
-            {(!Array.isArray(job.segments_json) || job.segments_json.length === 0) ? (
-              <div className="max-w-3xl mx-auto rounded-2xl ring-1 ring-amber-500/30 bg-amber-500/[0.08] px-4 py-4">
-                <p className="text-sm text-amber-200 mb-3">
-                  {t("edit.lyrics_no_segments") ||
-                    "Este job no tiene letras guardadas. Esto pasa con jobs muy viejos. Subí la canción de nuevo para editar letras."}
-                </p>
-                <button
-                  type="button"
-                  onClick={() => { setMode(null); setError(null); }}
-                  className="btn-secondary text-xs h-9 px-4"
-                >
-                  {t("edit.cancel") || "Cancelar"}
-                </button>
-              </div>
-            ) : (
-              <LyricsEditor
-                segments={job.segments_json}
-                filename={job.filename || job.artist || "lyrics"}
-                audioFile={null}
-                audioUrl={lyricsAudioUrl}
-                referenceLyrics=""
-                onApprove={submitLyricsWithSegments}
-                onBack={() => { setMode(null); setError(null); }}
-                isBatch={false}
-                user={null}
-                font={initialParams.font || ""}
-                textCase={initialParams.text_case || "upper"}
-                fontScale={initialParams.font_scale || 1.0}
-                lyricTransition={initialParams.lyric_transition || "cut"}
-                textMotion={initialParams.text_motion || "none"}
-                disableAutoSplit
-                disableBeforeUnload
-                disableAutosave
-                submitLabel={
-                  submitting
-                    ? (t("edit.submitting") || "Aplicando...")
-                    : (t("edit.lyrics_resync_submit") ||
-                      "Re-renderizar con letras y tiempos corregidos")
-                }
-              />
-            )}
-          </div>
+          segments which we POST to /edit (with the 409 YouTube guard).
+
+          Layout notes:
+          - flex justify-center wraps the editor — its root is
+            max-w-3xl without mx-auto (the wizard parent does that
+            centering), so without this wrapper the editor renders
+            flush-left and leaves a huge dead space on the right.
+          - Body scroll lock so the underlying JobDetail content
+            doesn't scroll around behind the overlay when the operator
+            scrolls the editor's long segment list.
+          - Solid bg (no /95 + backdrop-blur) — the blur effect
+            distorted text legibility on the underlying job preview. */}
+      <LyricsEditModal
+        open={mode === "lyrics"}
+        audioError={lyricsAudioError}
+        error={error}
+        job={job}
+        onClose={() => { setMode(null); setError(null); }}
+        audioUrl={lyricsAudioUrl}
+        onApprove={submitLyricsWithSegments}
+        submitting={submitting}
+        initialParams={initialParams}
+        t={t}
+      />
+    </div>
+  );
+}
+
+/** Full-screen modal that hosts the LyricsEditor for post-approval re-sync.
+ *
+ * Split out from EditRequestPanel's render tree so the body-scroll-lock
+ * useEffect can hook on `open` without polluting the parent component's
+ * concerns, and so the heavy LyricsEditor only mounts when the modal is
+ * actually opened (preserves the editor's "fresh start on each open"
+ * behavior — editHistory, syncMode, etc are reset).
+ */
+function LyricsEditModal({
+  open, audioError, error, job, onClose, audioUrl, onApprove,
+  submitting, initialParams, t,
+}) {
+  // Lock the underlying body scroll while the modal is open. Without
+  // this, scrolling on the modal's segment list bleeds through to the
+  // JobDetail page underneath on macOS/Safari, which felt broken.
+  useEffect(() => {
+    if (!open) return;
+    const prev = document.body.style.overflow;
+    document.body.style.overflow = "hidden";
+    return () => { document.body.style.overflow = prev; };
+  }, [open]);
+
+  // Close on Escape — standard modal behavior.
+  useEffect(() => {
+    if (!open) return;
+    const onKey = (e) => { if (e.key === "Escape") onClose(); };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [open, onClose]);
+
+  if (!open) return null;
+  const noSegments = !Array.isArray(job.segments_json) || job.segments_json.length === 0;
+
+  return (
+    <div className="fixed inset-0 z-[60] bg-bg overflow-y-auto">
+      <div className="min-h-screen px-4 py-8 sm:px-8">
+        <div className="max-w-3xl mx-auto">
+          {audioError && (
+            <div className="mb-4 rounded-2xl ring-1 ring-amber-500/30 bg-amber-500/[0.08] px-4 py-3">
+              <p className="text-xs text-amber-200">{audioError}</p>
+            </div>
+          )}
+          {error && (
+            <div className="mb-4 rounded-2xl ring-1 ring-red-500/30 bg-red-500/[0.08] px-4 py-3">
+              <p className="text-xs text-red-300">{error}</p>
+            </div>
+          )}
         </div>
-      )}
+        <div className="flex justify-center">
+          {noSegments ? (
+            <div className="max-w-3xl w-full rounded-2xl ring-1 ring-amber-500/30 bg-amber-500/[0.08] px-4 py-4">
+              <p className="text-sm text-amber-200 mb-3">
+                {t("edit.lyrics_no_segments") ||
+                  "Este job no tiene letras guardadas. Esto pasa con jobs muy viejos. Subí la canción de nuevo para editar letras."}
+              </p>
+              <button
+                type="button"
+                onClick={onClose}
+                className="btn-secondary text-xs h-9 px-4"
+              >
+                {t("edit.cancel") || "Cancelar"}
+              </button>
+            </div>
+          ) : (
+            <LyricsEditor
+              segments={job.segments_json}
+              filename={job.filename || job.artist || "lyrics"}
+              audioFile={null}
+              audioUrl={audioUrl}
+              referenceLyrics=""
+              onApprove={onApprove}
+              onBack={onClose}
+              isBatch={false}
+              user={null}
+              font={initialParams.font || ""}
+              textCase={initialParams.text_case || "upper"}
+              fontScale={initialParams.font_scale || 1.0}
+              lyricTransition={initialParams.lyric_transition || "cut"}
+              textMotion={initialParams.text_motion || "none"}
+              disableAutoSplit
+              disableBeforeUnload
+              disableAutosave
+              submitLabel={
+                submitting
+                  ? (t("edit.submitting") || "Aplicando...")
+                  : (t("edit.lyrics_resync_submit") ||
+                    "Re-renderizar con letras y tiempos corregidos")
+              }
+            />
+          )}
+        </div>
+      </div>
     </div>
   );
 }
