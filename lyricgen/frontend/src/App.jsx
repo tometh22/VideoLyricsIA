@@ -93,6 +93,31 @@ function authFetchWithTimeout(url, opts = {}, timeoutMs = 10_000) {
   return fetchWithTimeout(url, { ...opts, headers }, timeoutMs);
 }
 
+// authFetch + client-side retry on 503 with Retry-After header. Used for
+// endpoints that may transiently saturate (Whisper transcription on burst
+// load, where the server retries internally but if it exhausts retries
+// it surfaces 503 with Retry-After).
+//
+// Backend retry handles fast transients (1-30s); this client retry handles
+// the rare case where backend exhausts its retries — operator gets
+// "Reintentando..." instead of a hard error.
+//
+// maxRetries=3, max wait 60s per try (cap honors backend's "Retry-After: 60").
+async function authFetchWithRetryOn503(url, opts = {}, { maxRetries = 3, onRetry = null } = {}) {
+  for (let attempt = 0; attempt <= maxRetries; attempt++) {
+    const res = await authFetch(url, opts);
+    if (res.status !== 503 || attempt === maxRetries) return res;
+    // 503 → check Retry-After (seconds). Cap at 60s to avoid waiting forever.
+    let waitS = parseInt(res.headers.get("Retry-After") || "10", 10);
+    if (!Number.isFinite(waitS) || waitS <= 0) waitS = 10;
+    waitS = Math.min(waitS, 60);
+    if (onRetry) onRetry({ attempt: attempt + 1, waitS });
+    await new Promise((r) => setTimeout(r, waitS * 1000));
+  }
+  // Unreachable, but TS-style return for clarity.
+  return authFetch(url, opts);
+}
+
 // --- Routing helpers ---
 function RequireAuth({ token, children }) {
   if (!token) return <Navigate to="/" replace />;
@@ -687,7 +712,7 @@ export default function App() {
         const { jobId } = await uploadFileToR2(entry.file, {
           meta: { artist: entry.artist || "", title: (entry.songTitle || "").trim() },
         });
-        const res = await authFetch(`${API}/transcribe-uploaded`, {
+        const res = await authFetchWithRetryOn503(`${API}/transcribe-uploaded`, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
@@ -696,7 +721,7 @@ export default function App() {
             artist: entry.artist || "",
             title: (entry.songTitle || "").trim(),
           }),
-        });
+        }, { maxRetries: 3 });
         if (res.ok) {
           const data = await res.json();
           prefetchCache.current[idx] = { status: "ready", data, jobId };
@@ -789,7 +814,7 @@ export default function App() {
       // run Whisper / lrclib, return segments. Same shape as the
       // legacy /transcribe response.
       setTranscribeProgress({ phase: "transcribing", loaded: 0, total: 0 });
-      transcribeRes = await authFetch(`${API}/transcribe-uploaded`, {
+      transcribeRes = await authFetchWithRetryOn503(`${API}/transcribe-uploaded`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -798,6 +823,18 @@ export default function App() {
           artist: entry.artist || "",
           title: (entry.songTitle || "").trim(),
         }),
+      }, {
+        maxRetries: 3,
+        onRetry: ({ attempt, waitS }) => {
+          // Surface to UI so the operator sees we're retrying, not stuck.
+          setTranscribeProgress({
+            phase: "transcribing",
+            loaded: 0,
+            total: 0,
+            retryAttempt: attempt,
+            retryWaitS: waitS,
+          });
+        },
       });
       if (!transcribeRes.ok) {
         const reason = await describeFetchError(null, transcribeRes, t);
