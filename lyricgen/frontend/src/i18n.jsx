@@ -656,6 +656,7 @@ const translations = {
     "edit.background_hint_label": "¿Querés aclarar qué tipo de fondo? (opcional)",
     "edit.background_hint_placeholder": "ej: 'paisaje romántico al atardecer con tonos cálidos' · 'abstracto con ondas de luz suave' · 'interior cálido tipo café íntimo'",
     "edit.background_hint_help": "Sirve cuando los fondos anteriores no captaron el tono. Dejá vacío para que el sistema decida.",
+    "edit.youtube_drift_confirm": "Este video ya está publicado en YouTube. La re-sincronización actualizará el archivo en la plataforma pero NO reemplazará el video en YouTube (la API de YouTube no permite reemplazar archivos, solo metadata).\n\n¿Continuar igual?",
     "detail.create_variant": "Crear variante",
     "detail.variant_tooltip": "Crear otro video con las mismas lyrics aprobadas (cuesta 1 video del plan)",
     "detail.variant_of": "Variante",
