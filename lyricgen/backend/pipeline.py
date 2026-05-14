@@ -1264,6 +1264,30 @@ def _transcribe_via_openai_api(mp3_path: str, language: str | None = None,
                 break
             except Exception as exc:
                 last_exc = exc
+                # OpenAI SDK raises RateLimitError for BOTH transient
+                # rate-limits AND persistent quota exhaustion (insufficient_quota,
+                # account billing issues). The two have different `code` strings
+                # inside the error body — retrying insufficient_quota wastes
+                # ~32s and gives the user a delayed error instead of an instant
+                # actionable message. Incident 2026-05-14: balance hit $0,
+                # users saw 30s+ retries that all failed. Detect & bail fast.
+                if isinstance(exc, RateLimitError):
+                    quota_keywords = (
+                        "insufficient_quota",
+                        "exceeded your current quota",
+                        "billing",
+                        "payment",
+                    )
+                    msg_lower = str(exc).lower()
+                    is_quota_exhaustion = any(k in msg_lower for k in quota_keywords)
+                    if is_quota_exhaustion:
+                        print(
+                            f"[WHISPER-API][⚠ INSUFFICIENT_QUOTA] OpenAI rejected with "
+                            f"quota/billing error: {exc!s}; NOT retrying. "
+                            f"Recargá créditos en https://platform.openai.com/settings/organization/billing"
+                        )
+                        # Bail immediately — no retry helps a quota issue.
+                        break
                 # Retryable transients: rate-limit + connection drops.
                 if isinstance(exc, (RateLimitError, APIConnectionError)):
                     if attempt < _MAX_RETRIES - 1:
@@ -1287,6 +1311,25 @@ def _transcribe_via_openai_api(mp3_path: str, language: str | None = None,
         if response is None:
             # Translate the final exception to HTTPException for the UI.
             if isinstance(last_exc, RateLimitError):
+                quota_keywords = (
+                    "insufficient_quota",
+                    "exceeded your current quota",
+                    "billing",
+                    "payment",
+                )
+                msg_lower = str(last_exc).lower()
+                if any(k in msg_lower for k in quota_keywords):
+                    # Quota exhaustion — different message, NO Retry-After
+                    # (the frontend retry would just hit the same wall).
+                    # Status 503 stays so the frontend's error handling treats
+                    # it as a server-side issue, but no auto-retry kicks in.
+                    raise HTTPException(
+                        status_code=503,
+                        detail=(
+                            "Servicio AI temporalmente sin cuota. "
+                            "El administrador fue notificado."
+                        ),
+                    ) from last_exc
                 raise HTTPException(
                     status_code=503,
                     detail=(
