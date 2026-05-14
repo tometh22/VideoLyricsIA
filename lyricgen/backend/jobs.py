@@ -96,6 +96,18 @@ def get_job_model(db: Session, job_id: str) -> Optional[Job]:
     return db.query(Job).filter(Job.job_id == job_id).first()
 
 
+def touch_user_activity(db: Session, job: Job) -> None:
+    """Bump last_user_activity_at = now(). Caller commits.
+
+    Used as the staleness anchor for find_abandoned_transcribed: any
+    authenticated user touch on the job (POST /save-segments, GET /status,
+    etc) refreshes the timestamp, so the reaper only barre genuinely
+    abandoned sessions instead of slow batch-edit sessions.
+    """
+    from datetime import datetime, timezone
+    job.last_user_activity_at = datetime.now(timezone.utc)
+
+
 def _delete_r2_objects(job: Job) -> None:
     """Best-effort delete all R2 objects tied to a job.
 

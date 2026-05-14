@@ -369,6 +369,14 @@ class Job(Base):
     # so an operator can roll back a bad re-sync (manually fetch the .vN
     # key from R2). NULL for jobs that have never been edited.
     previous_versions = Column(JSONB, nullable=True)
+    # Touched by every authenticated user action that signals "I'm still
+    # working on this job" (POST /jobs/{id}/save-segments, GET /status/{id},
+    # etc). find_abandoned_transcribed uses coalesce(last_user_activity_at,
+    # created_at) as the staleness anchor, so an editor session that takes
+    # 90 min to review 5 songs no longer gets reaped at the 30-min mark.
+    # Confirmed in prod 2026-05-14: Agus lost 5 jobs to the old created_at-
+    # only threshold while batch-editing.
+    last_user_activity_at = Column(DateTime(timezone=True), nullable=True)
 
     created_at = Column(DateTime(timezone=True), default=utcnow, index=True)
     completed_at = Column(DateTime(timezone=True), nullable=True)
@@ -796,6 +804,10 @@ def _migrate_user_columns():
         # reaper.find_stalled_renders to catch processing jobs whose worker
         # died in a non-AI step (ffmpeg, moviepy, R2 upload).
         "ALTER TABLE jobs ADD COLUMN IF NOT EXISTS last_progress_at TIMESTAMPTZ",
+        # User-side staleness anchor. The reaper coalesces this with
+        # created_at to decide if a transcribed_pending job is abandoned.
+        # Filled by /save-segments and any other authenticated touch.
+        "ALTER TABLE jobs ADD COLUMN IF NOT EXISTS last_user_activity_at TIMESTAMPTZ",
         # Variantes: POST /jobs/{id}/variant crea un job nuevo que hereda
         # audio + segments del padre pero re-genera el Veo background.
         # parent_job_id apunta al padre. Soft FK (no REFERENCES) para que

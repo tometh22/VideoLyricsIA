@@ -839,6 +839,35 @@ export default function App() {
     }
   };
 
+  // Autosave segments to the backend while the user is editing a lyric.
+  // Two reasons:
+  //   1. Reaper anchor — POST /jobs/{id}/save-segments bumps
+  //      last_user_activity_at, so a 90-min batch-edit session won't get
+  //      reaped at the 30-min mark (incident 2026-05-14, Agus, 5 jobs
+  //      deleted mid-batch).
+  //   2. Cross-device recovery — segments live in the DB, not just in
+  //      sessionStorage, so if the tab dies we don't lose corrections.
+  // Errors are swallowed: this is a best-effort autosave, the real
+  // commit still happens at POST /generate.
+  const persistSegmentsToBackend = useCallback(async (jobId, segments) => {
+    if (!jobId || !Array.isArray(segments) || segments.length === 0) return;
+    try {
+      const res = await authFetch(`${API}/jobs/${jobId}/save-segments`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ segments }),
+      });
+      if (!res.ok && res.status !== 404) {
+        // 404 means the job was already reaped — nothing to save against.
+        // We log it as a soft warning; the user will see the real error
+        // when they click "Crear videos" and /generate returns 404.
+        console.warn("[autosave] /save-segments failed", res.status);
+      }
+    } catch (err) {
+      console.warn("[autosave] /save-segments network error", err);
+    }
+  }, []);
+
   const handleApproveLyrics = (editedSegments) => {
     const r = currentReview;
     const newApproved = [...approvedJobs, {
@@ -856,6 +885,14 @@ export default function App() {
     }];
     setApprovedJobs(newApproved);
     setCurrentReview(null);
+
+    // Fire-and-forget commit of the just-approved segments to the backend.
+    // Bumps last_user_activity_at and persists segments_json so the reaper
+    // won't barre the job before the operator hits "Crear videos" on the
+    // next song. See persistSegmentsToBackend comment for context.
+    if (r.transcribeJobId) {
+      persistSegmentsToBackend(r.transcribeJobId, editedSegments);
+    }
 
     const nextIdx = r.queueIdx + 1;
     if (nextIdx < r.queue.length) {
@@ -945,7 +982,14 @@ export default function App() {
             continue;
           }
           if (!res.ok || data.detail) {
-            const reason = data.detail || await describeFetchError(null, res, t);
+            // 404 here means the transcribed job was reaped before we got
+            // to /generate. Surface a clear message instead of the raw
+            // "Job not found." so the operator knows it's a session-expired
+            // issue, not a corrupt video.
+            const reason = (res.status === 404)
+              ? (t("generate.session_expired")
+                 || "La sesión expiró antes de generar. Re-subí el audio para regenerar.")
+              : (data.detail || await describeFetchError(null, res, t));
             setJobs((prev) => prev.map((j, idx) =>
               idx === i ? { ...j, status: "error", error: reason } : j
             ));
@@ -1055,7 +1099,11 @@ export default function App() {
             continue;
           }
           if (!genRes.ok || data.detail) {
-            const reason = data.detail || await describeFetchError(null, genRes, t);
+            // Same session-expired handling as the legacy /generate path.
+            const reason = (genRes.status === 404)
+              ? (t("generate.session_expired")
+                 || "La sesión expiró antes de generar. Re-subí el audio para regenerar.")
+              : (data.detail || await describeFetchError(null, genRes, t));
             setJobs((prev) => prev.map((j, idx) =>
               idx === i ? { ...j, status: "error", error: reason } : j
             ));
@@ -1389,6 +1437,8 @@ export default function App() {
             recoverySource={currentReview.recoverySource}
             onApprove={handleApproveLyrics}
             onBack={handleBackInReview}
+            transcribeJobId={currentReview.transcribeJobId || null}
+            onPersistSegments={persistSegmentsToBackend}
             isBatch={currentReview.queue.length > 1}
             batchProgress={currentReview.queue.length > 1
               ? `${currentReview.queueIdx + 1} ${t("editor.song_of")} ${currentReview.queue.length}`

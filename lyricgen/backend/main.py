@@ -4456,6 +4456,80 @@ async def reject_job(
     return {"ok": True, "status": "rejected", "job_id": job_id}
 
 
+class SaveSegmentsRequest(BaseModel):
+    # Persisted to Job.segments_json (JSONB). Same shape /generate and
+    # /edit accept. 5 MB upper bound mirrors /generate's segments_json
+    # form-field cap — a long video can legitimately ship a few hundred
+    # KB of segments.
+    segments: list[dict] = Field(..., max_length=10000)
+
+
+@app.post("/jobs/{job_id}/save-segments")
+@limiter.limit("60/minute")
+async def save_segments(
+    request: Request,
+    job_id: str,
+    body: SaveSegmentsRequest,
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Persist user-edited segments while the wizard is still in the
+    editing phase (status=transcribed_pending). Two reasons this exists:
+
+    1. The reaper's staleness anchor (last_user_activity_at) gets bumped
+       every save, so a 90-min batch-edit session doesn't get reaped at
+       the 30-min mark. Before this endpoint, segments only touched the
+       backend at POST /generate — so the reaper had no signal that the
+       user was actively working.
+    2. Cross-tab / refresh recovery: if the wizard tab dies mid-batch,
+       we can rehydrate the editor from segments_json on the server
+       instead of relying on browser sessionStorage (which is per-tab).
+
+    Validates ownership the same way as /generate's reuse path.
+    """
+    from jobs import get_job_model, touch_user_activity
+
+    job = get_job_model(db, job_id)
+    if (not job
+            or job.user_id != current_user["id"]
+            or job.tenant_id != current_user["tenant_id"]):
+        raise HTTPException(status_code=404, detail="Job not found.")
+
+    # Only allow saving while the user is genuinely in the editing window.
+    # Other statuses have their own write paths (/edit for pending_review,
+    # /generate for the final commit).
+    if job.status != "transcribed_pending":
+        raise HTTPException(
+            status_code=409,
+            detail=f"save-segments requires status=transcribed_pending (current: {job.status})",
+        )
+
+    segs = body.segments or []
+    # Light shape check — full validation lives in /generate's pipeline.
+    # We just want to reject obviously broken payloads early so the
+    # autosave doesn't silently store garbage.
+    for i, seg in enumerate(segs):
+        if not isinstance(seg, dict):
+            raise HTTPException(status_code=400, detail=f"segments[{i}] must be an object")
+        for k in ("start", "end", "text"):
+            if k not in seg:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"segments[{i}] missing required key {k!r}",
+                )
+
+    job.segments_json = segs
+    touch_user_activity(db, job)
+    db.commit()
+
+    return {
+        "ok": True,
+        "job_id": job_id,
+        "saved_at": job.last_user_activity_at.isoformat() if job.last_user_activity_at else None,
+        "count": len(segs),
+    }
+
+
 @app.post("/edit/{job_id}")
 async def request_edit(
     job_id: str,
