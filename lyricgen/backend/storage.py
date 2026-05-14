@@ -398,22 +398,31 @@ def _retry_transient(fn, label: str, max_attempts: int = 3, base_delay: float = 
     raise last_exc
 
 
-def put_object_bytes(key: str, data: bytes, content_type: str = "application/octet-stream") -> bool:
-    """Upload raw bytes to an arbitrary R2 key (single-PUT proxy path).
-    Returns True on success, False if R2 is disabled or the call fails."""
+def put_object_bytes(key: str, data, content_type: str = "application/octet-stream") -> bool:
+    """Upload to R2 from raw bytes OR a seekable file-like object.
+
+    `data` historically was bytes; the proxy handlers now pass a
+    SpooledTemporaryFile so the worker can yield to the event loop
+    while the body streams in from a slow upstream. boto3 accepts
+    both natively. On retry we rewind the file (seek(0)) since
+    boto3 doesn't auto-reset on its own.
+    """
     client = _get_client()
     if client is None:
         return False
-    try:
-        _retry_transient(
-            lambda: client.put_object(
-                Bucket=R2_BUCKET,
-                Key=key,
-                Body=data,
-                ContentType=content_type,
-            ),
-            label=f"put_object key={key}",
+
+    def _do_put():
+        if hasattr(data, "seek"):
+            data.seek(0)
+        return client.put_object(
+            Bucket=R2_BUCKET,
+            Key=key,
+            Body=data,
+            ContentType=content_type,
         )
+
+    try:
+        _retry_transient(_do_put, label=f"put_object key={key}")
         return True
     except Exception as exc:
         import logging
@@ -424,21 +433,29 @@ def put_object_bytes(key: str, data: bytes, content_type: str = "application/oct
 
 
 def upload_part(
-    key: str, upload_id: str, part_number: int, data: bytes,
+    key: str, upload_id: str, part_number: int, data,
 ) -> Optional[str]:
-    """Upload one multipart part server-side. Returns ETag (without quotes) or None."""
+    """Upload one multipart part from bytes OR a seekable file-like.
+    Returns ETag (without quotes) or None. Same dual-input contract as
+    put_object_bytes — see there for rationale."""
     client = _get_client()
     if client is None:
         return None
+
+    def _do_upload():
+        if hasattr(data, "seek"):
+            data.seek(0)
+        return client.upload_part(
+            Bucket=R2_BUCKET,
+            Key=key,
+            UploadId=upload_id,
+            PartNumber=part_number,
+            Body=data,
+        )
+
     try:
         response = _retry_transient(
-            lambda: client.upload_part(
-                Bucket=R2_BUCKET,
-                Key=key,
-                UploadId=upload_id,
-                PartNumber=part_number,
-                Body=data,
-            ),
+            _do_upload,
             label=f"upload_part key={key} part={part_number}",
         )
         return response["ETag"].strip('"')

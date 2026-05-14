@@ -2230,6 +2230,43 @@ async def upload_multipart_part_url(
     return {"url": url, "expires_in": _PRESIGN_PUT_TTL_S}
 
 
+async def _drain_to_spooled(request: Request, max_bytes: int):
+    """Stream the request body into a SpooledTemporaryFile.
+
+    Async-generator driven (`async for chunk in request.stream()`) so
+    the worker yields to the event loop between chunks. Crucial for
+    concurrent uploads from slow upstreams: previously `await
+    request.body()` blocked the worker for the full upstream duration
+    (~80 s per 4 MB part on a residential connection). With 5 audios
+    × 4 parts in flight, all 20 workers were pinned waiting for bytes,
+    starving every other endpoint and tanking effective throughput.
+
+    Memory profile: SpooledTemporaryFile keeps the body in RAM up to
+    `max_size` (8 MiB) and spills to disk only above that. For our
+    4 MB part size the body stays in RAM — same footprint as before,
+    but worker time is freed.
+
+    Returns a rewound file object ready for boto3 to read. Raises
+    HTTPException(413) if `max_bytes` is exceeded mid-stream.
+    """
+    from tempfile import SpooledTemporaryFile
+    f = SpooledTemporaryFile(max_size=8 * 1024 * 1024, mode="w+b")
+    total = 0
+    async for chunk in request.stream():
+        if not chunk:
+            continue
+        total += len(chunk)
+        if total > max_bytes:
+            f.close()
+            raise HTTPException(status_code=413, detail="Body exceeds size limit.")
+        f.write(chunk)
+    if total == 0:
+        f.close()
+        raise HTTPException(status_code=400, detail="Empty body.")
+    f.seek(0)
+    return f
+
+
 @app.post("/upload-part-proxy")
 @limiter.limit("600/minute")
 async def upload_part_proxy(
@@ -2241,7 +2278,11 @@ async def upload_part_proxy(
 ):
     """Proxy a multipart chunk to R2 server-side. The browser POSTs raw
     bytes here (same-origin, no CORS preflight) instead of PUTting directly
-    to r2.cloudflarestorage.com which would require R2 bucket CORS config."""
+    to r2.cloudflarestorage.com which would require R2 bucket CORS config.
+
+    Body is read via async streaming into a spooled temp file (see
+    _drain_to_spooled). boto3 then runs in a thread executor so the
+    event loop stays free for other concurrent requests."""
     if part_number < 1 or part_number > 10_000:
         raise HTTPException(status_code=400, detail="part_number out of range")
     # Resilient lookup: the global DbTransientRetryMiddleware can't
@@ -2261,12 +2302,17 @@ async def upload_part_proxy(
     content_length = int(request.headers.get("content-length") or 0)
     if content_length > _MULTIPART_PART_SIZE_BYTES + 1024:
         raise HTTPException(status_code=413, detail="Chunk exceeds part size limit.")
-    data = await request.body()
-    if not data:
-        raise HTTPException(status_code=400, detail="Empty chunk.")
-    etag = storage.upload_part(
-        job_row.input_r2_key, job_row.multipart_upload_id, part_number, data
-    )
+
+    key = job_row.input_r2_key
+    upload_id = job_row.multipart_upload_id
+    body = await _drain_to_spooled(request, _MULTIPART_PART_SIZE_BYTES + 1024)
+    try:
+        loop = asyncio.get_event_loop()
+        etag = await loop.run_in_executor(
+            None, storage.upload_part, key, upload_id, part_number, body,
+        )
+    finally:
+        body.close()
     if etag is None:
         raise HTTPException(status_code=502, detail="R2 part upload failed.")
     return {"etag": etag}
@@ -2303,14 +2349,20 @@ async def upload_file_proxy(
     content_length = int(request.headers.get("content-length") or 0)
     if content_length > MAX_UPLOAD_MB * 1024 * 1024:
         raise HTTPException(status_code=413, detail="File exceeds maximum upload size.")
-    data = await request.body()
-    if not data:
-        raise HTTPException(status_code=400, detail="Empty file body.")
+
     content_type = request.headers.get("content-type") or "application/octet-stream"
-    ok = storage.put_object_bytes(job_row.input_r2_key, data, content_type)
+    key = job_row.input_r2_key
+    body = await _drain_to_spooled(request, MAX_UPLOAD_MB * 1024 * 1024)
+    try:
+        loop = asyncio.get_event_loop()
+        ok = await loop.run_in_executor(
+            None, storage.put_object_bytes, key, body, content_type,
+        )
+    finally:
+        body.close()
     if not ok:
         raise HTTPException(status_code=502, detail="R2 upload failed.")
-    return {"job_id": job_id, "key": job_row.input_r2_key}
+    return {"job_id": job_id, "key": key}
 
 
 class _MultipartCompleteReq(BaseModel):
