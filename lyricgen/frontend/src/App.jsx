@@ -363,6 +363,17 @@ export default function App() {
   // falls back to pure genre/concept vocab. UMG 2026-05-14 incident
   // motivation — operator wants a lever to control this per batch.
   const [inspiredByLyrics, setInspiredByLyrics] = useState(true);
+  // auto_trim_lyrics toggle: when ON (default), pipeline caps each
+  // segment's `end` to the estimated voice-end so LRCLib-driven texts
+  // don't stay pinned during instrumental fills. Stored in localStorage
+  // so the operator's last preference persists across sessions.
+  const [autoTrimLyrics, setAutoTrimLyrics] = useState(() => {
+    const v = localStorage.getItem("genly_auto_trim_lyrics");
+    return v === null ? true : v === "true";
+  });
+  useEffect(() => {
+    localStorage.setItem("genly_auto_trim_lyrics", String(autoTrimLyrics));
+  }, [autoTrimLyrics]);
   const [backgroundId, setBackgroundId] = useState(null);
   // "as_is" reuses the library asset directly. "variation" tells the
   // backend to extract a frame and run Veo image-to-video to derive a
@@ -700,6 +711,7 @@ export default function App() {
             language: entry.language || "",
             artist: entry.artist || "",
             title: (entry.songTitle || "").trim(),
+            auto_trim_lyrics: autoTrimLyrics,
           }),
         });
         if (res.ok) {
@@ -802,6 +814,7 @@ export default function App() {
           language: entry.language || "",
           artist: entry.artist || "",
           title: (entry.songTitle || "").trim(),
+          auto_trim_lyrics: autoTrimLyrics,
         }),
       });
       if (!transcribeRes.ok) {
@@ -961,6 +974,7 @@ export default function App() {
         formData.append("text_contrast", jobList[i].textContrast || "medium");
         if (animateImage && backgroundFile) formData.append("animate_image", "true");
         formData.append("match_lyrics", String(!!inspiredByLyrics));
+        formData.append("auto_trim_lyrics", String(!!autoTrimLyrics));
         formData.append("segments_json", JSON.stringify(jobList[i].segments));
         formData.append("delivery_profile", delivery.delivery_profile);
         if (delivery.delivery_profile !== "youtube") {
@@ -1085,6 +1099,7 @@ export default function App() {
         generateBody.append("text_contrast", jobList[i].textContrast || "medium");
         if (animateImage && backgroundFile) generateBody.append("animate_image", "true");
         generateBody.append("match_lyrics", String(!!inspiredByLyrics));
+        generateBody.append("auto_trim_lyrics", String(!!autoTrimLyrics));
         if (backgroundId) {
           generateBody.append("background_id", backgroundId);
           generateBody.append("background_mode", backgroundMode);
@@ -1346,6 +1361,8 @@ export default function App() {
         onAnimateImage={setAnimateImage}
         inspiredByLyrics={inspiredByLyrics}
         onInspiredByLyricsChange={setInspiredByLyrics}
+        autoTrimLyrics={autoTrimLyrics}
+        onAutoTrimLyricsChange={setAutoTrimLyrics}
         allHaveArtist={allHaveArtist}
         onStartReview={handleStartReview}
         onGenerateDirect={handleGenerateDirect}
