@@ -283,3 +283,83 @@ def test_transcode_falls_back_to_legacy_when_dims_mismatch(fake_outputs, monkeyp
     assert "scale=3840:2160" in vf
     assert "fps=60" in vf
     assert "-r" in argv  # legacy pins explicit timebase
+
+
+# ───────────────────────────────────────────────────
+# Race: parallel prewarm of umg_master + umg_short
+# ───────────────────────────────────────────────────
+
+
+def test_parallel_prewarm_does_not_overwrite_other_key(fake_outputs, monkeypatch):
+    """Reproduces the prod bug fixed 2026-05-12: two prewarm_prores
+    invocations running in parallel for the same job (one for umg_master,
+    one for umg_short) each receive a STALE snapshot of s3_keys via the
+    `job` dict. When each finishes, the buggy code did
+    `keys = dict(job["s3_keys"])` then wrote the merged dict back —
+    overwriting the OTHER prewarm's key.
+
+    The fix re-reads s3_keys from the DB right before merging. This
+    test simulates the race by stubbing get_job_model to return a job
+    whose s3_keys has been updated by a sibling prewarm between the
+    upload and the merge, and asserts that the second update_job call
+    preserves the sibling's key.
+    """
+    import storage
+    import jobs as jobs_module
+
+    job_id = "racejob"
+    _seed_source_mp4(fake_outputs, job_id, "lyric_video.mp4")
+
+    # Stale snapshot: caller thinks s3_keys is empty.
+    stale_job = {"umg_spec": {"frame_size": "HD", "fps": 24.0, "prores_profile": 3},
+                 "s3_keys": {}}
+
+    # By the time our transcode finishes, a sibling prewarm has already
+    # added its key. get_job_model needs to return THIS fresh state.
+    sibling_added = {"umg_short": "tenant/racejob/umg_short.mov"}
+
+    fresh_model = MagicMock()
+    fresh_model.s3_keys = dict(sibling_added)
+
+    captured_keys: dict = {}
+
+    def fake_update_job(job_id_, **kwargs):
+        # Capture the final s3_keys value that ensure_prores_exists
+        # decided to write — this is the assertion target.
+        if "s3_keys" in kwargs:
+            captured_keys.update(kwargs["s3_keys"])
+
+    def fake_get_job_model(_db, _job_id):
+        return fresh_model
+
+    monkeypatch.setattr(jobs_module, "update_job", fake_update_job)
+    monkeypatch.setattr(jobs_module, "get_job_model", fake_get_job_model)
+    # storage.upload_master returns the key the helper wrote.
+    monkeypatch.setattr(
+        storage, "upload_master",
+        lambda *_a, **_k: "tenant/racejob/umg_master.mov",
+    )
+    monkeypatch.setattr(storage, "is_enabled", lambda: True)
+
+    # Fake the transcode itself — we only care about the s3_keys merge.
+    def fake_transcode(src, dst, spec):
+        os.makedirs(os.path.dirname(dst), exist_ok=True)
+        with open(dst, "wb") as f:
+            f.write(b"fake-prores")
+
+    import pipeline as _pipeline
+    monkeypatch.setattr(_pipeline, "_transcode_to_prores", fake_transcode)
+
+    prores.ensure_prores_exists(job_id, "umg_master", stale_job, tenant_id="tenant")
+
+    # Both keys must survive — ours (umg_master, just written) AND the
+    # sibling's (umg_short, written during our transcode).
+    assert "umg_master" in captured_keys, (
+        "ensure_prores_exists should write umg_master after upload"
+    )
+    assert "umg_short" in captured_keys, (
+        "ensure_prores_exists must NOT wipe the sibling's umg_short — "
+        "this is the race the fix exists to prevent"
+    )
+    assert captured_keys["umg_master"] == "tenant/racejob/umg_master.mov"
+    assert captured_keys["umg_short"] == "tenant/racejob/umg_short.mov"

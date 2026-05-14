@@ -194,8 +194,18 @@ export default function EditRequestPanel({
 
   // When the operator enters lyrics mode, hydrate the draft from the
   // job's persisted segments (or an empty array if none — the UI shows
-  // a banner in that case). Re-runs whenever the job's segments change
-  // upstream (e.g. another edit just completed).
+  // a banner in that case).
+  //
+  // CRITICAL: deps must be [mode] only. Adding `job.segments_json` here
+  // causes React error #300 (Maximum update depth exceeded) because
+  // /status polling (every 5 s while a JobDetail tab is open) returns
+  // segments_json as a FRESH array reference on every response — same
+  // content, new object. React compares deps by reference, so the
+  // effect re-fires every poll, setLyricsDraft re-runs, the component
+  // re-renders, and the loop never settles. Confirmed in prod 2026-
+  // 05-13 right after PR #121 started exposing segments_json in /status.
+  // Pre-#121 the field was always undefined → reference stable → no
+  // loop. The exhaustive-deps lint warning is intentional.
   useEffect(() => {
     if (mode === "lyrics") {
       const segs = Array.isArray(job.segments_json) ? job.segments_json : [];
@@ -205,7 +215,8 @@ export default function EditRequestPanel({
         text: s.text || "",
       })));
     }
-  }, [mode, job.segments_json]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [mode]);
 
   const submit = async (type) => {
     if (submitLockRef.current || limitReached) return;
