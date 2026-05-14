@@ -4352,6 +4352,12 @@ class EditJobRequest(BaseModel):
     # operator override. Max 300 chars to keep Gemini input cheap and
     # bounded; longer hints rarely add signal and inflate prompt cost.
     background_hint: str | None = Field(default=None, max_length=300)
+    # Explicit ack that the caller understands re-syncing lyrics on a job
+    # already published to YouTube will update R2 but NOT replace the
+    # YouTube video file (the YouTube API doesn't allow file replacement,
+    # only metadata). Defaults to False so the API fails closed with a
+    # 409 — the frontend prompts the operator, who has to opt in.
+    allow_youtube_drift: bool = False
 
 
 class EnableProResRequest(BaseModel):
@@ -4500,6 +4506,29 @@ async def request_edit(
                     f"Lyrics edit requires the job to be done, pending_review, "
                     f"or rejected (current: {job.status})"
                 ),
+            )
+        # YouTube API does not allow replacing an uploaded video's file
+        # (only metadata). Re-syncing lyrics on a published job would
+        # update R2 silently while YouTube continued serving the old
+        # out-of-sync cut. Fail closed; the frontend prompts the operator
+        # and retries with allow_youtube_drift=true if they confirm.
+        if job.youtube_data and not body.allow_youtube_drift:
+            yt_url = (
+                job.youtube_data.get("url")
+                if isinstance(job.youtube_data, dict) else None
+            )
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "youtube_already_published",
+                    "message": (
+                        "Job already published to YouTube. Lyrics re-sync "
+                        "will update the file in our platform but NOT "
+                        "replace the YouTube video. Pass "
+                        "allow_youtube_drift=true to proceed anyway."
+                    ),
+                    "youtube_url": yt_url,
+                },
             )
     elif job.status != "pending_review":
         raise HTTPException(

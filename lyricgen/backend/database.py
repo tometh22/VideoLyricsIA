@@ -361,6 +361,14 @@ class Job(Base):
     # job 2144aacb453e killed at video/40% during a deploy, invisible to any
     # reaper for 87 min.
     last_progress_at = Column(DateTime(timezone=True), nullable=True)
+    # Archive of deliverable s3_keys overwritten by a previous re-render
+    # (typography/lyrics/background edit). Each entry:
+    #   {"version": N, "edit_type": "lyrics", "archived_at": "ISO-8601",
+    #    "keys": {"video": "...v1", "short": "...v1", ...}}
+    # Populated by run_edit_pipeline right before _upload_deliverables_to_r2
+    # so an operator can roll back a bad re-sync (manually fetch the .vN
+    # key from R2). NULL for jobs that have never been edited.
+    previous_versions = Column(JSONB, nullable=True)
 
     created_at = Column(DateTime(timezone=True), default=utcnow, index=True)
     completed_at = Column(DateTime(timezone=True), nullable=True)
@@ -795,6 +803,11 @@ def _migrate_user_columns():
         # /jobs liste con `variant_count` eficientemente.
         "ALTER TABLE jobs ADD COLUMN IF NOT EXISTS parent_job_id VARCHAR(32)",
         "CREATE INDEX IF NOT EXISTS ix_jobs_parent_job_id ON jobs(parent_job_id)",
+        # Archive of previous deliverable s3_keys overwritten by a partial
+        # re-render (lyrics/typography/background edit). Populated by
+        # run_edit_pipeline before _upload_deliverables_to_r2 so an operator
+        # can roll back a bad re-sync — the {key}.vN object stays in R2.
+        "ALTER TABLE jobs ADD COLUMN IF NOT EXISTS previous_versions JSONB",
     ]
     # Each statement gets its own transaction. In Postgres, a failed statement
     # inside a transaction puts it in aborted state — subsequent execute()

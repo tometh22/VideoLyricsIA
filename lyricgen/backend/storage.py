@@ -565,6 +565,32 @@ def delete_object(key: str) -> None:
     client.delete_object(Bucket=R2_BUCKET, Key=key)
 
 
+def copy_object(src_key: str, dst_key: str) -> bool:
+    """Server-side copy from src_key to dst_key within the same bucket.
+
+    Used by run_edit_pipeline to archive the previous version of a deliverable
+    (video/short/thumbnail) before the re-rendered file overwrites it. R2's
+    copy_object completes without re-uploading bytes through us, so even
+    multi-GB ProRes masters version in milliseconds.
+
+    Returns True on success, False if R2 is disabled or the source key does
+    not exist (treated as "nothing to archive"). Raises on real S3 errors so
+    the caller can surface them.
+    """
+    client = _get_client()
+    if client is None:
+        return False
+    if not object_exists(src_key):
+        return False
+    client.copy_object(
+        Bucket=R2_BUCKET,
+        Key=dst_key,
+        CopySource={"Bucket": R2_BUCKET, "Key": src_key},
+    )
+    print(f"[R2] Copied {src_key} -> {dst_key}")
+    return True
+
+
 def _guess_content_type(filename: str) -> Optional[str]:
     low = filename.lower()
     if low.endswith(".mov"):
