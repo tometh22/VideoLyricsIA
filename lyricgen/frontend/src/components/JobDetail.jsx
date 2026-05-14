@@ -15,6 +15,18 @@ function authHeaders() {
   return token ? { Authorization: `Bearer ${token}` } : {};
 }
 
+// Read the cached user out of localStorage. App.jsx is the source of truth
+// (it sets/clears genly_user on login/logout) so we don't keep a separate
+// copy of the parsing logic here — duplicated 6 lines, but reaching for a
+// shared hook just for this would force prop-drilling through JobDetailRoute.
+function readCurrentUser() {
+  try {
+    return JSON.parse(localStorage.getItem("genly_user") || "null");
+  } catch {
+    return null;
+  }
+}
+
 const MEDIA_TABS = [
   { key: "video", label: "Lyric Video", desc: "1920x1080" },
   { key: "short", label: "Short", desc: "1080x1920" },
@@ -174,6 +186,57 @@ export default function JobDetail({ job, onBack, onJobUpdate }) {
   const [reviewNotes, setReviewNotes] = useState("");
   const [approving, setApproving] = useState(false);
   const [retrying, setRetrying] = useState(false);
+
+  // "Enviar a UMG" button state. Gated by role=admin AND status=done — we
+  // resolve the role at render time from localStorage so we don't need to
+  // pass `user` through JobDetailRoute. isInUmgPortal mirrors the value
+  // /status returns (server-side source of truth) but is optimistically
+  // flipped to true the moment the POST succeeds, so the user sees the
+  // "Ya en UMG" state immediately without a poll round-trip.
+  const currentUser = readCurrentUser();
+  const isUmgAdmin = currentUser?.role === "admin";
+  const [sendingUmg, setSendingUmg] = useState(false);
+  const [isInUmgPortal, setIsInUmgPortal] = useState(
+    Boolean(job.is_in_umg_portal),
+  );
+  // Keep local mirror in sync if the parent re-fetches /status. Without this
+  // the button would stay "✓ En UMG" even after the entry is deleted from
+  // the portal (the server would have flipped the flag back, but our local
+  // state wouldn't know).
+  useEffect(() => {
+    setIsInUmgPortal(Boolean(job.is_in_umg_portal));
+  }, [job.is_in_umg_portal]);
+
+  const handleSendToUMG = async () => {
+    if (sendingUmg) return;
+    setSendingUmg(true);
+    try {
+      const resp = await fetch(`${API}/admin/deliveries/from-job/${job.job_id}`, {
+        method: "POST",
+        headers: { ...authHeaders(), "Content-Type": "application/json" },
+        body: JSON.stringify({}),
+      });
+      if (!resp.ok) {
+        const body = await resp.json().catch(() => ({}));
+        // 409 = files not yet in R2 (renders still cooking). 400 = not
+        // approved yet. 403 = caller isn't admin (shouldn't happen here
+        // since the button is hidden, but defensive). Surface the message
+        // straight from the backend so the operator knows what to fix.
+        alert(body.detail || "No se pudo enviar a UMG.");
+        return;
+      }
+      const result = await resp.json();
+      setIsInUmgPortal(true);
+      const label = result.label || "";
+      const verbed = result.replaced ? "actualizado" : "publicado";
+      alert(`Video ${verbed} en umg.genly.pro como "${label}".`);
+    } catch (err) {
+      console.error("Send to UMG failed:", err);
+      alert("Error de red al enviar a UMG.");
+    } finally {
+      setSendingUmg(false);
+    }
+  };
   // Dropdown for HD/2K/4K selection on retry. Only shown when the job
   // has a meaningful umg_spec to override (i.e. went through the UMG
   // pipeline). YouTube-only jobs hide this — they don't have a frame
@@ -803,6 +866,26 @@ export default function JobDetail({ job, onBack, onJobUpdate }) {
                   <button onClick={downloadProResShort} className="btn-secondary text-xs h-10 px-4">
                     {downloadIcon}
                     {t("detail.download_short_prores") || "Short ProRes"}
+                  </button>
+                )}
+                {/* "Enviar a UMG" — admin only, only for approved jobs. Publishes
+                    the 5-file set (ProRes master + ProRes short + MP4 + MP4 short
+                    + thumbnail) to umg.genly.pro. Re-sending the same job_id
+                    replaces the existing entry rather than duplicating. */}
+                {isUmgAdmin && isDone && job.approved_by && (
+                  <button
+                    onClick={handleSendToUMG}
+                    disabled={sendingUmg || isInUmgPortal}
+                    className="btn-secondary text-xs h-10 px-4 disabled:opacity-60"
+                    title={isInUmgPortal
+                      ? "Este video ya está publicado en umg.genly.pro"
+                      : "Publicar este video en umg.genly.pro (visible para Universal Music)"}
+                  >
+                    {isInUmgPortal
+                      ? (t("detail.in_umg_portal") || "✓ En UMG")
+                      : sendingUmg
+                        ? (t("detail.sending_umg") || "Enviando…")
+                        : (t("detail.send_umg") || "Enviar a UMG")}
                   </button>
                 )}
               </>
