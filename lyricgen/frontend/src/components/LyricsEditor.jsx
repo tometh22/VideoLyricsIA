@@ -707,6 +707,48 @@ export default function LyricsEditor({
     setEdited((prev) => prev.filter((seg) => seg._id !== id));
   };
 
+  // V2 formula — must stay in sync with backend pipeline._estimate_voice_end_duration.
+  const TRIM_FLOOR_S = 3.5;
+  const TRIM_PER_CHAR_S = 0.10;
+  const TRIM_MARGIN_S = 1.0;
+  const estimateVoiceEndDuration = (text) =>
+    Math.max(TRIM_FLOOR_S, (text || "").length * TRIM_PER_CHAR_S + TRIM_MARGIN_S);
+
+  /** Cap a single segment's `end` to the estimated voice-end of its text.
+   * Used by the per-row ✂ button — operator can punch one line at a time
+   * when the auto-trim missed a case or was disabled at upload. */
+  const trimSeg = (id) => {
+    pushEditHistory();
+    setEdited((prev) =>
+      prev.map((seg) => {
+        if (seg._id !== id) return seg;
+        const dur = seg.end - seg.start;
+        const cap = estimateVoiceEndDuration(seg.text);
+        if (dur <= cap) return seg;  // already short enough
+        return { ...seg, end: seg.start + cap };
+      }),
+    );
+  };
+
+  /** Bulk: trim every segment whose duration exceeds the cap. Useful when
+   * re-editing an old job that pre-dates the auto-trim feature. */
+  const trimAllLongSegs = () => {
+    pushEditHistory();
+    setEdited((prev) =>
+      prev.map((seg) => {
+        const dur = seg.end - seg.start;
+        const cap = estimateVoiceEndDuration(seg.text);
+        if (dur <= cap) return seg;
+        return { ...seg, end: seg.start + cap };
+      }),
+    );
+  };
+
+  const longSegCount = edited.filter((seg) => {
+    const dur = seg.end - seg.start;
+    return dur > estimateVoiceEndDuration(seg.text);
+  }).length;
+
   // Compute how many visual lines a segment will occupy in the video.
   const linesForSeg = useCallback((text) => {
     const displayText = applyCase(text || "", textCase);
@@ -1210,6 +1252,30 @@ export default function LyricsEditor({
           every line manually, the operator shifts the entire timeline.
           Collapsed by default — opens when user clicks the toggle.   */}
       <div className="mb-3">
+        {/* Bulk trim banner — only when there are long lines that would
+            benefit. Each click is one undo-able operation. Useful when
+            re-editing an old job that pre-dates the auto-trim feature. */}
+        {longSegCount > 0 && (
+          <button
+            onClick={trimAllLongSegs}
+            className="w-full mb-2 flex items-center justify-between px-3 py-2 rounded-card bg-amber-500/[0.08] ring-1 ring-amber-500/25 hover:ring-amber-500/40 text-xs text-amber-200 hover:text-amber-100 transition-colors"
+            title="Aplica el cap dinámico (V2) a las líneas marcadas. Cada línea se acorta a su duración estimada de voz."
+          >
+            <span className="flex items-center gap-2">
+              <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
+                <circle cx="6" cy="6" r="3" />
+                <circle cx="6" cy="18" r="3" />
+                <path d="M20 4L8.12 15.88M14.47 14.48L20 20M8.12 8.12L12 12" />
+              </svg>
+              {(t("editor.trim_all_long_label") ||
+                "Recortar {n} líneas con texto colgado").replace("{n}", longSegCount)}
+            </span>
+            <span className="text-[10px] text-amber-300/70">
+              {t("editor.trim_all_long_hint") || "voz termina antes que el silencio"}
+            </span>
+          </button>
+        )}
+
         <button
           onClick={() => setShiftPanelOpen((v) => !v)}
           className="w-full flex items-center justify-between px-3 py-2 rounded-card bg-surface-2/40 ring-1 ring-white/[0.04] hover:ring-white/[0.08] text-xs text-gray-300 hover:text-white transition-colors"
@@ -1453,6 +1519,24 @@ export default function LyricsEditor({
                         <path d="M5 15V5a1 1 0 011-1h10" />
                       </svg>
                     </button>
+                    {/* ✂ Trim line: caps `end` to estimated voice-end so the
+                        text doesn't stay pinned through a fill / outro. Only
+                        shows when the current duration actually exceeds the
+                        cap; otherwise the button would be a no-op. */}
+                    {(seg.end - seg.start) > estimateVoiceEndDuration(seg.text) && (
+                      <button onClick={() => trimSeg(seg._id)}
+                        className="w-8 h-8 rounded-lg opacity-0 group-hover:opacity-100
+                          hover:bg-amber-500/15 flex items-center justify-center text-gray-600
+                          hover:text-amber-400 transition-all"
+                        title={t("editor.trim_line") ||
+                          "Recortar al final natural (cuando la voz termina y empieza un fill)"}>
+                        <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
+                          <circle cx="6" cy="6" r="3" />
+                          <circle cx="6" cy="18" r="3" />
+                          <path d="M20 4L8.12 15.88M14.47 14.48L20 20M8.12 8.12L12 12" />
+                        </svg>
+                      </button>
+                    )}
                     <button onClick={() => deleteSeg(seg._id)}
                       className="w-8 h-8 rounded-lg opacity-0 group-hover:opacity-100
                         hover:bg-red-500/10 flex items-center justify-center text-gray-600

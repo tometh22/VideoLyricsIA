@@ -275,6 +275,79 @@ def _cleanup_local_intermediates(job_dir: str) -> None:
         pass
 
 
+# ---------------------------------------------------------------------------
+# Auto-trim "hanging text" on segments
+# ---------------------------------------------------------------------------
+#
+# The problem: LRCLib (and to a lesser extent Whisper) gives each line an
+# `end` time that runs all the way to the start of the NEXT line. When the
+# song has an instrumental fill / solo / outro between two lyric lines, the
+# previous line's text stays pinned on screen for the entire silence —
+# sometimes 20–60 seconds. Confirmed in prod 2026-05-14 on "De La Guitarra"
+# (Intoxicados): 15/29 lines had dur > 6 s, with the worst at 62 s.
+#
+# Fix: estimate a natural "voice end" per line from text length and cap the
+# segment's end to that. Sung text averages ~3 syllables/sec → ~0.1 s/char
+# is a safe upper bound. Add a 1 s margin so we don't cut mid-word; floor
+# at 3.5 s so very short lines ("Sí." "Ohh") aren't bonsai'd. Variant V2
+# selected after running 3 candidates against the De La Guitarra fixture —
+# trims 17/29 lines, recovers 102 s of overstay, doesn't touch lines that
+# are already in the natural 3–5 s range.
+
+
+_TRIM_FLOOR_S = 3.5
+_TRIM_PER_CHAR_S = 0.10
+_TRIM_MARGIN_S = 1.0
+
+
+def _estimate_voice_end_duration(text: str) -> float:
+    """Upper bound on how long the sung voice for `text` should remain on
+    screen, in seconds. Same V2 formula the frontend trim button uses —
+    keep both sides in sync if you tune it.
+    """
+    return max(_TRIM_FLOOR_S, len(text) * _TRIM_PER_CHAR_S + _TRIM_MARGIN_S)
+
+
+def _trim_segments_to_voice_end(
+    segments: list[dict], min_dur: float = 0.5,
+) -> tuple[list[dict], int, float]:
+    """Cap each segment's `end` to `start + voice_end(text)` when that is
+    shorter than the existing `end`. Returns (new_segments, trimmed_count,
+    total_seconds_recovered).
+
+    Always leaves a `min_dur` floor so we don't render a flash of text.
+    """
+    if not segments:
+        return segments, 0, 0.0
+    out: list[dict] = []
+    trimmed = 0
+    recovered = 0.0
+    for s in segments:
+        new = dict(s)
+        try:
+            start = float(new.get("start", 0))
+            end = float(new.get("end", 0))
+        except (TypeError, ValueError):
+            out.append(new)
+            continue
+        if end <= start:
+            out.append(new)
+            continue
+        text = (new.get("text") or "").strip()
+        if not text:
+            out.append(new)
+            continue
+        cap = _estimate_voice_end_duration(text)
+        cap = max(cap, min_dur)
+        new_end = min(end, start + cap)
+        if new_end < end - 0.05:  # only count meaningful trims
+            recovered += (end - new_end)
+            trimmed += 1
+            new["end"] = new_end
+        out.append(new)
+    return out, trimmed, recovered
+
+
 def _get_persisted_segments(job_id: str) -> list[dict] | None:
     """Return job_row.segments_json if it's a non-empty list, else None.
 
@@ -354,7 +427,14 @@ def run_pipeline(job_id: str, mp3_path: str, artist: str, style: str,
                  # genre + lyrics. Cuando viene set, _ensure_background
                  # lo inyecta como [OPERATOR OVERRIDE] en el user_content
                  # de Gemini, misma mecánica que /edit (PR #116).
-                 background_hint: str | None = None):
+                 background_hint: str | None = None,
+                 # auto_trim_lyrics: cap segment `end` to estimated voice-
+                 # end so LRCLib-driven texts don't stay pinned during
+                 # instrumental fills. Default True; the upload wizard
+                 # toggles it per-job. Has no effect on the
+                 # segments_override path — the operator's manual
+                 # corrections are always preserved.
+                 auto_trim_lyrics: bool = True):
     """Run the full pipeline for a job. Called synchronously.
 
     delivery_profile:
@@ -503,6 +583,17 @@ def run_pipeline(job_id: str, mp3_path: str, artist: str, style: str,
                     mp3_path, language=language, lyrics_hint=lyrics_hint,
                     job_id=job_id,
                 )
+        # Auto-trim "hanging text" caused by LRCLib's start-of-next-line
+        # convention for `end`. Operator-overridden segments
+        # (segments_override path above) are NOT trimmed — those are the
+        # operator's intent and we trust them. Job-level toggle controls
+        # this; default True. Disabled? Worker prints the count so we can
+        # see how often it would have helped.
+        if auto_trim_lyrics and segments and not segments_override:
+            segments, _trimmed, _recovered = _trim_segments_to_voice_end(segments)
+            if _trimmed > 0:
+                print(f"[LYRICS] auto-trim: shortened {_trimmed} lines, "
+                      f"recovered {_recovered:.1f}s of on-screen text")
         # Persist segments so edit re-renders can skip re-transcription.
         # Skip when we just read them from the same row — pointless write.
         if _persist_segments:
