@@ -15,14 +15,16 @@ Cuándo usar este flujo: el video ya pasó por revisión (`status=done`) y el ba
    - Dashboard → click en el job afectado, o History → click en la fila.
    - Verificar que el preview reproduce con el sync mal y que el background visualmente está OK.
 
-2. **Abrir el panel de edición**
+2. **Abrir el editor completo**
    - En `JobDetail`, baja al panel "¿Necesitás ajustes?".
    - Para jobs en `done` el único modo disponible es **Lyrics** (los modos Typography y Background solo se ofrecen en `pending_review`).
-   - Click en **Lyrics**.
+   - Click en **Lyrics** → se abre un overlay full-screen con el **mismo editor que usás en el wizard de upload**, ahora cargando el MP3 fuente via signed R2 URL para playback.
 
 3. **Corregir los timings**
-   - **Offset global** (lo más común): si todas las líneas están corridas por el mismo delta, usar los presets `±125ms`, `±250ms`, `±500ms` o el slider de `±1000ms`. El cambio se aplica a todo el timeline.
-   - **Edición línea-a-línea**: para casos donde el desfase es irregular (p. ej. el cantante adelanta una estrofa), editar `start`/`end` por línea. El editor evita que líneas adyacentes se solapen.
+   - **Reproducir el audio** mientras editás (botón play o tecla Space) para escuchar y ajustar.
+   - **Offset global** (lo más común): si todas las líneas están corridas por el mismo delta, abrir "Mover toda la canción" y usar los presets `±125ms`, `±250ms`, `±500ms` o el slider de `±1000ms`. El cambio se aplica a todo el timeline.
+   - **Sync mode (tap-anchor)**: tocá Space mientras reproduce para anclar cada línea al tiempo de playback actual. Útil cuando el desfase es irregular o estirado.
+   - **Edición línea-a-línea**: editá `start`/`end` por línea con el clamping a vecinos.
    - El editor parte de `segments_json` (la transcripción original guardada), así que no hay que re-transcribir.
 
 4. **Submit**
