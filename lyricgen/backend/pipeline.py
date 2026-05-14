@@ -3125,10 +3125,14 @@ _USED_PROMPTS_FILE = os.path.join(ASSETS_DIR, ".used_prompts.json")
 
 _GENRE_SCENE_GUIDE = {
     "rock": (
-        "Urban industrial streets, neon-lit alleyways, gritty rain on asphalt, "
-        "smoke rising past dim streetlamps, electric storms over a dark city, "
-        "abandoned warehouse interiors with shafts of light, distorted blurred "
-        "headlights, raw concrete textures."
+        "High-energy dramatic scenes — concert stage lights cutting through "
+        "smoke and laser beams (no people), stormy desert highway at dusk, "
+        "mountain peaks during a lightning storm, vintage analog amplifiers "
+        "and electric guitars in close-up (no hands), empty arena tunnels "
+        "with shafts of light, raw weather over open plains, dramatic "
+        "chiaroscuro on raw concrete or asphalt textures. Vary the setting "
+        "per song — alleyways and narrow streets are ONE option among many, "
+        "NOT the default."
     ),
     "pop": (
         "Vibrant colorful neon lights, disco reflections, glittering city "
@@ -3342,8 +3346,8 @@ def _analyze_lyrics_for_background(lyrics_text: str, artist: str, job_id: str = 
 Output JSON shape — do NOT copy any of these example scenes verbatim;
 they show only the format and the breadth of valid visual registers:
 
-Example for rock / urban / gritty track:
-{"style":"video","prompt":"Slow tracking shot through neon-lit rain-slicked streets, deep blue and red reflections, smoke rising past streetlamps, gritty cinematic 4k"}
+Example for rock / energetic / dramatic track:
+{"style":"video","prompt":"Slow drone over a stormy desert highway at dusk, lightning fracturing distant clouds, asphalt reflecting the dying light, vintage road sign blurred in the foreground, dramatic and raw, cinematic 4k"}
 
 Example for romantic ballad / love song:
 {"style":"video","prompt":"Slow drift through a sunlit room at golden hour, warm light streaming through gauze curtains, soft focus on a glass catching the light, dust motes floating in the warm beam, intimate and calm, cinematic 4k"}
@@ -3450,7 +3454,7 @@ STEP 0 — Read the lyrics and identify the PRIMARY VISUAL SUBJECT: the concrete
 STEP 1 — Choose the scene:
 - If the lyrics have a CLEAR visual subject → build the scene around that subject. Then classify genre (rock/pop/ballad/latin/reggaeton/hiphop/electronic/indie/folk/metal) to determine the COLOR PALETTE, LIGHTING, and ATMOSPHERE only — not the scene itself.
 - If the lyrics are abstract or purely emotional with no specific visual subject → classify genre, then pick from the genre's vocabulary:
-  - rock     → urban industrial streets, neon alleyways, gritty rain, electric storms, abandoned warehouses
+  - rock     → varied dramatic settings: concert stage smoke, stormy highways, mountain storms, vintage amps in close-up, empty arena tunnels, raw plains (alleys allowed but NOT the default)
   - pop      → vibrant neon, disco reflections, geometric light patterns, glossy gradient skies
   - ballad   → soft sunset, calm ocean, drifting clouds, warm golden light, candlelight
   - latin    → tropical beaches, palm trees, vibrant flowers, festive lanterns, sunlit caribbean water
@@ -3477,7 +3481,7 @@ Step 1: Classify the song's genre using the artist, title, and lyrics. Pick ONE 
   rock, pop, ballad, latin, reggaeton, hiphop, electronic, indie, folk, metal
 
 Step 2: Pick a scene from the matching genre's visual vocabulary:
-- rock     → urban industrial streets, neon alleyways, gritty rain, electric storms, abandoned warehouses
+- rock     → varied dramatic settings: concert stage smoke, stormy highways, mountain storms, vintage amps in close-up, empty arena tunnels, raw plains (alleys allowed but NOT the default)
 - pop      → vibrant neon, disco reflections, geometric light patterns, glossy gradient skies
 - ballad   → soft sunset, calm ocean, drifting clouds, warm golden light, candlelight
 - latin    → tropical beaches, palm trees, vibrant flowers, festive lanterns, sunlit caribbean water
@@ -3498,7 +3502,12 @@ Hard rules:
         if movement_rule:
             system_prompt = system_prompt + "\n- " + movement_rule
 
-    lyrics_sample = lyrics_text[:600] if lyrics_text else ""
+    # Expanded from 600 → 1800 so canciones largas (3-4 min) llegan completas
+    # a Gemini. Antes el truncado a 600 chars cortaba al medio del verso 2 y
+    # Gemini no veía el chorus → fallback al genre vocab (callejón). UMG
+    # 2026-05-14: rock arg con letras claras igual rendía callejones porque
+    # el sample no llegaba al subject visual real.
+    lyrics_sample = lyrics_text[:1800] if lyrics_text else ""
     # Data minimization (UMG Guideline 14): optionally anonymize artist name
     _send_artist = os.environ.get("SEND_ARTIST_TO_AI", "true").lower() == "true"
     artist_label = artist if _send_artist else "the artist"
@@ -3546,7 +3555,13 @@ Hard rules:
                 system_instruction=system_prompt,
                 temperature=0.8,
                 max_output_tokens=500,
-                thinking_config=genai.types.ThinkingConfig(thinking_budget=0),
+                # thinking_budget=512: Gemini hace chain-of-thought corto
+                # para extraer el visual subject de las letras antes de
+                # commitearse a una escena. Sin esto (=0), saltaba el
+                # STEP 0 del system prompt y caía al genre fallback
+                # (UMG 2026-05-14: 80% rock → callejón porque Gemini
+                # nunca leía las letras como subject visual). +$0.0002/call.
+                thinking_config=genai.types.ThinkingConfig(thinking_budget=512),
             ),
         )
         text = response.text.strip()
@@ -3564,6 +3579,21 @@ Hard rules:
                     style = "video"
                 if prompt and len(prompt) > 15:
                     print(f"[BG] Gemini chose: style={style}, prompt={prompt[:80]}...")
+                    # Alley-bias telemetry: si Gemini igual eligió callejón
+                    # cuando el operador NO pidió urbano, dejá rastro en
+                    # logs para auditar post-deploy. Detecta el caso real
+                    # del incidente UMG 2026-05-14.
+                    _alley_keywords = ("alley", "callejón", "callejon",
+                                       "narrow street", "back street",
+                                       "back-street", "rain-slicked street")
+                    if (any(k in prompt.lower() for k in _alley_keywords)
+                            and normalized_concept != "urbano"):
+                        print(
+                            f"[BG][⚠ ALLEY-BIAS DETECTED] "
+                            f"genre={normalized_genre or 'auto'} "
+                            f"concept={normalized_concept or 'none'} "
+                            f"match_lyrics={match_lyrics} job={job_id}"
+                        )
                     if recorder:
                         recorder.finish(response_summary=text[:500])
                     return {"style": style, "prompt": prompt}
@@ -3682,7 +3712,8 @@ def _veo_cache_key(prompt: str, model: str, params: dict) -> str:
 def _generate_veo_video(prompt: str, output_path: str, job_id: str = None,
                         cache_namespace: str = "",
                         image_path: str | None = None,
-                        movement_style: str = "") -> str:
+                        movement_style: str = "",
+                        normalized_concept: str = "") -> str:
     """Generate a video clip with Google Veo 3 via direct Vertex AI REST API.
 
     We bypass google-genai SDK for Veo specifically because its internal auth
@@ -3711,6 +3742,17 @@ def _generate_veo_video(prompt: str, output_path: str, job_id: str = None,
     import requests as _req
     global _last_veo_request
 
+    # Bias-buster: cuando el operador NO eligió concept=urbano explícito,
+    # prohibimos callejón/alley como subject. UMG 2026-05-14: con genre=rock
+    # y concept vacío, Gemini elegía alley ~80% del tiempo aún con guard-
+    # rails en el system prompt. El negative en safe_prompt es la última
+    # red de seguridad antes de Veo. Si el operador SÍ pidió urbano, no
+    # bloqueamos (es su decisión consciente).
+    no_alley = "" if normalized_concept == "urbano" else (
+        "Avoid generic narrow alleyway, dark alley, callejón, and neon-lit "
+        "back-street as the primary subject unless the lyrics demand it. "
+    )
+
     if movement_style == "animado":
         # Cartoon / 2D illustration aesthetic — keep all safety clauses
         # except the "no CGI / no animation" pair, which would directly
@@ -3719,6 +3761,7 @@ def _generate_veo_video(prompt: str, output_path: str, job_id: str = None,
         safe_prompt = (
             f"{prompt}. Stylised 2D animated illustration, flat shapes, "
             "deliberate cartoon-like motion. "
+            f"{no_alley}"
             "No text, no words, no letters, no signs, no billboards, no posters, "
             "no banners, no graffiti, no shop windows, no street signs, no neon "
             "signs, no logos, no trademarks, no brand symbols, no people, "
@@ -3727,6 +3770,7 @@ def _generate_veo_video(prompt: str, output_path: str, job_id: str = None,
     else:
         safe_prompt = (
             f"{prompt}. Photorealistic, filmed with cinema camera, real footage. "
+            f"{no_alley}"
             "No text, no words, no letters, no signs, no billboards, no posters, "
             "no banners, no graffiti, no shop windows, no street signs, no neon "
             "signs, no logos, no trademarks, no brand symbols, no people, "
@@ -4240,6 +4284,7 @@ def _ensure_background(style_hint: str, job_dir: str, lyrics_text: str = None,
                 cache_namespace=f"{artist}|{song_title}",
                 image_path=image_to_video_path,
                 movement_style=movement_style,
+                normalized_concept=_normalize_concept(concept),
             )
             # Semantic relevance check — always score, but cap retries at one
             # to bound cost (+$0.80 worst case). quality_retry_used gates the

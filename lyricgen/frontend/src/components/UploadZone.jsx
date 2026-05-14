@@ -123,6 +123,8 @@ export default function UploadZone({
   onBackgroundMode,
   animateImage,
   onAnimateImage,
+  inspiredByLyrics = true,
+  onInspiredByLyricsChange,
   allHaveArtist = false,
   onStartReview,
   onGenerateDirect,
@@ -1502,6 +1504,34 @@ export default function UploadZone({
                   ))}
                 </div>
               </div>
+            )}
+
+            {/* 1.5 Inspired-by-lyrics toggle.
+                Controls match_lyrics on /generate. When ON, Gemini reads
+                the song's lyrics and builds the background around the
+                primary visual subject (sea, road, stadium...). When OFF,
+                falls back to genre/concept vocabulary only. Default ON.
+                Surfaced here because UMG (2026-05-14) saw ~80% of rock
+                tracks rendered as alleys — operator now has a visible
+                lever and can audit which mode produced each video. */}
+            {onInspiredByLyricsChange && (
+              <label className="rounded-card bg-surface-2/40 ring-1 ring-white/[0.04] px-4 py-3 flex items-center gap-3 cursor-pointer hover:ring-white/[0.08] transition-colors">
+                <input
+                  type="checkbox"
+                  checked={!!inspiredByLyrics}
+                  onChange={(e) => onInspiredByLyricsChange(e.target.checked)}
+                  className="peer sr-only"
+                />
+                <div className="relative w-9 h-5 rounded-full bg-surface-3 peer-checked:bg-brand transition-colors duration-200 shrink-0">
+                  <div className="absolute top-0.5 left-0.5 w-4 h-4 rounded-full bg-white shadow transition-transform duration-200 peer-checked:translate-x-4" />
+                </div>
+                <div className="flex-1 min-w-0">
+                  <p className="text-[10px] uppercase tracking-[0.18em] text-gray-500">{t("upload.inspired_by_lyrics_label") || "Inspirado en la letra"}</p>
+                  <p className="text-[11px] text-gray-600 mt-0.5">
+                    {t("upload.inspired_by_lyrics_hint") || "Cuando está activo, el fondo se construye alrededor de lo que dice la canción. Apagalo para escenas más genéricas según el género."}
+                  </p>
+                </div>
+              </label>
             )}
 
             {/* 2. Background selector */}
