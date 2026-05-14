@@ -441,6 +441,60 @@ class Job(Base):
         }
 
 
+class Delivery(Base):
+    # Versions exposed on the UMG deliverables portal (umg.genly.pro).
+    # Replaces the previous static items.json workflow — admins click
+    # "Enviar a UMG" on an approved job and a row lands here; the portal
+    # fetches the list dynamically and signs R2 URLs on demand.
+    __tablename__ = "deliveries"
+    __table_args__ = (
+        # The portal lists active (non-removed) deliveries grouped by
+        # song. Composite index supports the listing query without a
+        # full scan once we have a few hundred entries.
+        Index("ix_deliveries_active", "removed_at", "added_at"),
+    )
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    # job_id references the short hash on jobs.job_id, NOT the integer PK.
+    # No FK constraint because some legacy job rows have been hard-deleted
+    # but their R2 files remain — we want those to still be deliverable.
+    job_id = Column(String(12), nullable=False, index=True)
+    label = Column(String(120), nullable=False, default="Renderizado")
+    # JSON list of file_type identifiers the portal should expose for this
+    # entry. Matches keys in Job.s3_keys (umg_master, umg_short, video,
+    # short, thumbnail). Stored as a list so future deliveries with a
+    # different mix (e.g. master-only) don't need a schema change.
+    file_types = Column(JSONB, nullable=False)
+    # Snapshot of song metadata at publish time. Job rows can be soft-
+    # deleted later or have their artist/title corrected; the portal
+    # should keep showing whatever was approved at the moment of publish.
+    artist_snapshot = Column(String(255), nullable=False)
+    song_title_snapshot = Column(String(500), nullable=False)
+    tenant_snapshot = Column(String(100), nullable=False)
+    frame_size_snapshot = Column(String(20), nullable=True)  # HD | UHD-4K | DCI-4K
+    added_by_user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+    added_at = Column(DateTime(timezone=True), default=utcnow, nullable=False)
+    # Soft delete: keeps the row + R2 files but hides from the portal.
+    # Hard delete + R2 cleanup is intentionally not implemented yet —
+    # an accidental delete from the portal would otherwise be unrecoverable.
+    removed_at = Column(DateTime(timezone=True), nullable=True, index=True)
+    removed_by_user_id = Column(Integer, ForeignKey("users.id"), nullable=True)
+
+    def to_dict(self):
+        return {
+            "id": self.id,
+            "job_id": self.job_id,
+            "label": self.label,
+            "file_types": list(self.file_types or []),
+            "artist": self.artist_snapshot,
+            "song_title": self.song_title_snapshot,
+            "tenant": self.tenant_snapshot,
+            "frame_size": self.frame_size_snapshot,
+            "added_at": self.added_at.isoformat() if self.added_at else None,
+            "removed_at": self.removed_at.isoformat() if self.removed_at else None,
+        }
+
+
 class Invoice(Base):
     __tablename__ = "invoices"
 

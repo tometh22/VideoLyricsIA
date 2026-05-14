@@ -32,7 +32,7 @@ if _SENTRY_DSN:
         release=os.environ.get("SENTRY_RELEASE", "genly@2.0.0"),
     )
 
-from fastapi import FastAPI, File, Form, Query, UploadFile, HTTPException, Depends, Request, Response
+from fastapi import FastAPI, File, Form, Header, Query, UploadFile, HTTPException, Depends, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, RedirectResponse, StreamingResponse
 from pydantic import BaseModel, Field
@@ -71,7 +71,7 @@ from datetime import datetime, timedelta, timezone
 
 from database import (
     Job, User, UserSettings, AuditLog, APIKey, get_db, init_db,
-    BackgroundAsset, AssetUsage, scoped_db, pool_stats,
+    BackgroundAsset, AssetUsage, Delivery, scoped_db, pool_stats,
 )
 from jobs import bulk_delete_jobs, create_job, delete_job, get_job, get_all_jobs, update_job
 from observability import init_sentry, init_logging, health_snapshot
@@ -3577,6 +3577,17 @@ async def status(
         # (JobDetail.jsx fetches `/status/${job_id}`, never `/jobs/{id}`).
         "segments_json": job.get("segments_json"),
         "bg_r2_key_cached": job.get("bg_r2_key_cached"),
+        # Whether this job is currently published on the UMG deliverables
+        # portal. Drives the "Enviar a UMG" button state in JobDetail.jsx
+        # (hidden / available / "✓ Ya en UMG"). Single boolean is enough —
+        # JobDetail doesn't need the delivery id, just the on/off state.
+        "is_in_umg_portal": (
+            db.query(Delivery.id)
+            .filter(Delivery.job_id == job_id)
+            .filter(Delivery.removed_at.is_(None))
+            .first()
+            is not None
+        ),
     }
 
 
@@ -5266,3 +5277,376 @@ async def youtube_metadata_preview(
         None, partial(generate_youtube_metadata, job.get("artist", ""), song, "", job_id=job_id),
     )
     return metadata
+
+
+# =============================================================================
+# UMG deliveries portal (umg.genly.pro)
+# =============================================================================
+# Two surfaces:
+#   1. /admin/deliveries/*   — JWT auth, admin role only. Used by the
+#      "Enviar a UMG" button in JobDetail.jsx.
+#   2. /api/deliveries/*     — portal-token auth (X-Portal-Token header).
+#      Used by the static portal page to fetch the listing and to soft-
+#      delete entries. The portal token is the same shared password
+#      Universal already uses to enter the portal — separate from JWT
+#      because the portal has no login flow.
+#
+# R2 keys are computed deterministically from (tenant, job_id, file_type)
+# — same convention gen_page.py used. The listing endpoint signs URLs
+# on demand with 7-day expiry (R2 max) and caches the response 60 s in
+# memory so a page refresh doesn't re-sign 80+ URLs per click.
+# =============================================================================
+
+# File type → filename in R2 + extension + label. Single source of truth
+# for the portal listing. Adding a new file type (e.g. lossless audio)
+# means appending here and the rest of the pipeline picks it up.
+_DELIVERY_FILE_TYPES: dict[str, dict[str, str]] = {
+    "umg_master": {"filename": "umg_master.mov", "ext": "mov", "label": "ProRes Master (broadcast)"},
+    "umg_short":  {"filename": "umg_short.mov",  "ext": "mov", "label": "ProRes Short vertical (broadcast)"},
+    "video":      {"filename": "lyric_video.mp4","ext": "mp4", "label": "MP4 HD (web/YouTube)"},
+    "short":      {"filename": "short.mp4",      "ext": "mp4", "label": "MP4 Short vertical (Reels/TikTok)"},
+    "thumbnail":  {"filename": "thumbnail.jpg",  "ext": "jpg", "label": "Thumbnail (cover art)"},
+}
+# All five files we ship to UMG by default. Validated against R2 before
+# we even create the Delivery row — no point publishing a partial entry.
+_DEFAULT_DELIVERY_FILE_TYPES = ["umg_master", "video", "umg_short", "short", "thumbnail"]
+_DELIVERY_URL_EXPIRY_S = 7 * 24 * 3600  # R2 max
+_DELIVERY_LIST_CACHE: dict = {"signed_at": 0.0, "payload": None}
+_DELIVERY_LIST_CACHE_TTL_S = 60
+
+
+def _r2_key_for_delivery(tenant: str, job_id: str, file_type: str) -> str:
+    """Reproduce the convention `{tenant}/{job_id}/{filename}` used by
+    the legacy gen_page.py. Keeping the same shape so the backfill works
+    without touching R2."""
+    info = _DELIVERY_FILE_TYPES[file_type]
+    return f"{tenant}/{job_id}/{info['filename']}"
+
+
+def _delivery_safe_filename(artist: str, song: str) -> str:
+    """User-facing download filename for the Content-Disposition header."""
+    base = f"{artist} - {song}".strip()
+    out = "".join(c if (c.isalnum() or c in " -_") else "_" for c in base).strip()
+    return out.replace(" ", "_") or "video"
+
+
+def _verify_portal_token(authorization: str | None) -> None:
+    """Raise 401 unless the X-Portal-Token header matches the configured
+    portal password. The portal is a static page so we can't use JWT —
+    this is the same shared password Universal enters in the portal UI."""
+    expected = os.environ.get("DELIVERY_PORTAL_TOKEN") or os.environ.get("DELIVERY_PASSWORD")
+    if not expected:
+        # If the env var isn't set the portal endpoints are effectively
+        # disabled — better than silently allowing unauth access.
+        raise HTTPException(status_code=503, detail="Portal not configured")
+    if not authorization or authorization != expected:
+        raise HTTPException(status_code=401, detail="Invalid portal token")
+
+
+class SendToUMGRequest(BaseModel):
+    """Optional overrides when publishing a job to the portal."""
+    label: str | None = None  # default: "Renderizado" or "Opción N"
+
+
+@app.post("/admin/deliveries/from-job/{job_id}")
+async def admin_create_delivery_from_job(
+    job_id: str,
+    body: SendToUMGRequest | None = None,
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Publish an approved job to the UMG portal. Admin only.
+
+    Behaviour when the same job is re-sent: the existing active row is
+    UPDATED (label refreshed, added_at bumped) instead of duplicated.
+    Matches the manual workflow today — corrected re-renders replace
+    the previous version rather than stack up as "Opción N".
+    """
+    if current_user.get("role") != "admin":
+        raise HTTPException(status_code=403, detail="Admin only")
+
+    job = db.query(Job).filter(Job.job_id == job_id).first()
+    if job is None:
+        raise HTTPException(status_code=404, detail="Job not found")
+    if job.status != "done" or job.approved_at is None:
+        raise HTTPException(
+            status_code=400,
+            detail="Job must be approved (status=done) before it can be published",
+        )
+
+    # Validate all 5 files exist in R2. If even one is missing we refuse
+    # to create the Delivery — a half-empty portal entry is worse than
+    # asking the operator to wait for the render to finish.
+    missing = []
+    for ft in _DEFAULT_DELIVERY_FILE_TYPES:
+        key = _r2_key_for_delivery(job.tenant_id, job.job_id, ft)
+        if not storage.object_exists(key):
+            missing.append(ft)
+    if missing:
+        raise HTTPException(
+            status_code=409,
+            detail=f"Files not yet in R2: {', '.join(missing)}. Wait for the render to finish.",
+        )
+
+    # Compute label. If caller passed one, honor it. Otherwise: first
+    # delivery for this song gets "Renderizado"; subsequent ones get
+    # "Opción N". Matches the manual items.json conventions.
+    label = (body.label if body else None) or _compute_default_delivery_label(
+        db, job.artist, job.song_title
+    )
+
+    # Replace-not-duplicate: if there's already an active Delivery for
+    # this job_id, update it in place. Operator clicks "Enviar a UMG"
+    # again after a re-render → we refresh the label + timestamp, the
+    # R2 files stay the same (worker overwrites on edit).
+    existing = (
+        db.query(Delivery)
+        .filter(Delivery.job_id == job_id)
+        .filter(Delivery.removed_at.is_(None))
+        .first()
+    )
+    if existing:
+        existing.label = label
+        existing.file_types = _DEFAULT_DELIVERY_FILE_TYPES
+        existing.added_by_user_id = current_user["id"]
+        existing.added_at = datetime.now(timezone.utc)
+        # Refresh snapshot in case the artist/title was corrected on the
+        # job row between the original publish and now.
+        existing.artist_snapshot = job.artist
+        existing.song_title_snapshot = job.song_title or ""
+        existing.tenant_snapshot = job.tenant_id
+        existing.frame_size_snapshot = (job.umg_spec or {}).get("frame_size")
+        delivery = existing
+        action = "delivery.update"
+    else:
+        delivery = Delivery(
+            job_id=job_id,
+            label=label,
+            file_types=_DEFAULT_DELIVERY_FILE_TYPES,
+            artist_snapshot=job.artist,
+            song_title_snapshot=job.song_title or "",
+            tenant_snapshot=job.tenant_id,
+            frame_size_snapshot=(job.umg_spec or {}).get("frame_size"),
+            added_by_user_id=current_user["id"],
+            added_at=datetime.now(timezone.utc),
+        )
+        db.add(delivery)
+        action = "delivery.create"
+
+    db.add(AuditLog(
+        user_id=current_user["id"],
+        action=action,
+        detail={"job_id": job_id, "label": label, "artist": job.artist, "song": job.song_title},
+    ))
+    db.commit()
+    db.refresh(delivery)
+
+    _invalidate_delivery_list_cache()
+    return {
+        "ok": True,
+        "delivery_id": delivery.id,
+        "job_id": delivery.job_id,
+        "label": delivery.label,
+        "artist": delivery.artist_snapshot,
+        "song": delivery.song_title_snapshot,
+        "replaced": action == "delivery.update",
+    }
+
+
+def _compute_default_delivery_label(db: Session, artist: str, song_title: str | None) -> str:
+    """Default label for a new delivery.
+
+    Rule: first active delivery for an (artist, song) gets "Renderizado".
+    If there's already at least one, the new one is "Opción N" where N
+    is the count of active deliveries + 1. This mirrors the way items.json
+    labels were written by hand.
+    """
+    existing_count = (
+        db.query(Delivery)
+        .filter(Delivery.artist_snapshot == artist)
+        .filter(Delivery.song_title_snapshot == (song_title or ""))
+        .filter(Delivery.removed_at.is_(None))
+        .count()
+    )
+    if existing_count == 0:
+        return "Renderizado"
+    return f"Opción {existing_count + 1}"
+
+
+def _invalidate_delivery_list_cache() -> None:
+    _DELIVERY_LIST_CACHE["payload"] = None
+    _DELIVERY_LIST_CACHE["signed_at"] = 0.0
+
+
+@app.delete("/admin/deliveries/{delivery_id}")
+async def admin_delete_delivery(
+    delivery_id: int,
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Soft-delete a portal entry. Admin only (JWT)."""
+    if current_user.get("role") != "admin":
+        raise HTTPException(status_code=403, detail="Admin only")
+    return _soft_delete_delivery(db, delivery_id, current_user["id"])
+
+
+def _soft_delete_delivery(db: Session, delivery_id: int, actor_user_id: int | None):
+    delivery = db.query(Delivery).filter(Delivery.id == delivery_id).first()
+    if delivery is None or delivery.removed_at is not None:
+        raise HTTPException(status_code=404, detail="Delivery not found")
+    delivery.removed_at = datetime.now(timezone.utc)
+    delivery.removed_by_user_id = actor_user_id
+    db.add(AuditLog(
+        user_id=actor_user_id,
+        action="delivery.delete",
+        detail={
+            "delivery_id": delivery_id,
+            "job_id": delivery.job_id,
+            "artist": delivery.artist_snapshot,
+            "song": delivery.song_title_snapshot,
+        },
+    ))
+    db.commit()
+    _invalidate_delivery_list_cache()
+    return {"ok": True}
+
+
+@app.delete("/api/deliveries/{delivery_id}")
+async def portal_delete_delivery(
+    delivery_id: int,
+    x_portal_token: str | None = Header(default=None, alias="X-Portal-Token"),
+    db: Session = Depends(get_db),
+):
+    """Soft-delete from the portal itself. Auth: shared portal token."""
+    _verify_portal_token(x_portal_token)
+    # actor_user_id=None because the portal has no per-user identity.
+    # The audit log entry records the action and which delivery; if we
+    # later add per-recipient logins to the portal this will carry their
+    # user id instead.
+    return _soft_delete_delivery(db, delivery_id, actor_user_id=None)
+
+
+@app.get("/api/deliveries/meta")
+async def portal_get_meta(
+    x_portal_token: str | None = Header(default=None, alias="X-Portal-Token"),
+):
+    """Title/description/expiry for the portal header. Public (portal token)."""
+    _verify_portal_token(x_portal_token)
+    import time
+    return {
+        "title": "Entregables — GenLy AI",
+        "description": (
+            "Lyric videos generados con GenLy AI. Cada canción puede ofrecer más de "
+            "una versión; elegí la que mejor se adapte a tu uso (ProRes master para "
+            "broadcast, MP4 para web/YouTube, Short vertical y Thumbnail)."
+        ),
+        # URLs en /items son válidas por 7 días desde la firma. El cache TTL
+        # es de 60s así que efectivamente las URLs entregadas duran entre
+        # 7d-60s y 7d. Mostramos 7d para no confundir al cliente.
+        "expires_at_ts": time.time() + _DELIVERY_URL_EXPIRY_S,
+    }
+
+
+@app.get("/api/deliveries/items")
+async def portal_get_items(
+    x_portal_token: str | None = Header(default=None, alias="X-Portal-Token"),
+    db: Session = Depends(get_db),
+):
+    """Return the portal listing in the shape the frontend expects.
+
+    Cached 60 s in process memory. The cache key is global (not per-token)
+    because the listing itself doesn't vary by caller — auth is just a
+    gate. Mutations (POST/DELETE) bust the cache so a publish/delete is
+    visible immediately."""
+    _verify_portal_token(x_portal_token)
+    import time
+
+    now = time.time()
+    cached = _DELIVERY_LIST_CACHE
+    if cached["payload"] is not None and now - cached["signed_at"] < _DELIVERY_LIST_CACHE_TTL_S:
+        return cached["payload"]
+
+    deliveries = (
+        db.query(Delivery)
+        .filter(Delivery.removed_at.is_(None))
+        .order_by(Delivery.artist_snapshot, Delivery.song_title_snapshot, Delivery.added_at)
+        .all()
+    )
+
+    # Group by (artist, song). Within each group, versions stay in
+    # added_at order (oldest first), matching how items.json reads.
+    songs: dict[tuple[str, str], dict] = {}
+    file_type_labels = {ft: info["label"] for ft, info in _DELIVERY_FILE_TYPES.items()}
+
+    for d in deliveries:
+        key = (d.artist_snapshot, d.song_title_snapshot)
+        bucket = songs.setdefault(key, {"artist": d.artist_snapshot, "song": d.song_title_snapshot, "versions": []})
+        files = []
+        preview_url: str | None = None
+        short_preview_url: str | None = None
+        for ft in (d.file_types or []):
+            if ft not in _DELIVERY_FILE_TYPES:
+                continue
+            r2_key = _r2_key_for_delivery(d.tenant_snapshot, d.job_id, ft)
+            dl_name = f"{_delivery_safe_filename(d.artist_snapshot, d.song_title_snapshot)}.{_DELIVERY_FILE_TYPES[ft]['ext']}"
+            try:
+                url = storage.generate_signed_url(
+                    r2_key,
+                    expiry_seconds=_DELIVERY_URL_EXPIRY_S,
+                    download_filename=dl_name,
+                )
+                size_bytes = None
+                try:
+                    # Best-effort size for the UI. If R2 is offline we
+                    # still want to return the listing (link will 404
+                    # at click time, less bad than a full portal outage).
+                    client = storage._get_client()
+                    if client is not None:
+                        head = client.head_object(Bucket=storage.R2_BUCKET, Key=r2_key)
+                        size_bytes = head.get("ContentLength")
+                except Exception:
+                    size_bytes = None
+                available = url is not None and size_bytes is not None
+            except Exception:
+                url = None
+                size_bytes = None
+                available = False
+            files.append({
+                "type": ft,
+                "label": file_type_labels.get(ft, ft),
+                "url": url,
+                "size": _fmt_size_mb(size_bytes),
+                "available": available,
+            })
+            if ft == "video" and url is not None:
+                preview_url = storage.generate_signed_url(r2_key, expiry_seconds=_DELIVERY_URL_EXPIRY_S)
+            elif ft == "short" and url is not None:
+                short_preview_url = storage.generate_signed_url(r2_key, expiry_seconds=_DELIVERY_URL_EXPIRY_S)
+        bucket["versions"].append({
+            "delivery_id": d.id,
+            "job_id": d.job_id,
+            "label": d.label,
+            "frame_size": d.frame_size_snapshot,
+            "files": files,
+            "preview_url": preview_url,
+            "short_preview_url": short_preview_url,
+        })
+
+    payload = {
+        "songs": list(songs.values()),
+        "file_type_labels": file_type_labels,
+        "expires_at_ts": now + _DELIVERY_URL_EXPIRY_S,
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+    }
+    _DELIVERY_LIST_CACHE["payload"] = payload
+    _DELIVERY_LIST_CACHE["signed_at"] = now
+    return payload
+
+
+def _fmt_size_mb(size_bytes: int | None) -> str:
+    if not size_bytes:
+        return "—"
+    mb = size_bytes / 1024 / 1024
+    if mb >= 1024:
+        return f"{mb / 1024:.1f} GB"
+    return f"{mb:.0f} MB"
