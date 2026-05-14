@@ -107,6 +107,70 @@ def _upload_deliverables_to_r2(job_id: str, job_dir: str, files: dict) -> dict:
     return out
 
 
+def _write_edit_audit(action: str, detail: dict) -> None:
+    """Insert an audit_log row from the worker context.
+
+    main.py:request_edit writes job.edit_request when the operator hits
+    /edit; this helper closes the loop with job.edit_completed (success)
+    or job.edit_failed (raised exception). user_id is left NULL because
+    the worker has no request user — the original requester is already
+    captured on the job.edit_request row. Best-effort: a failure here
+    must never mask the real error from the pipeline.
+    """
+    try:
+        from database import SessionLocal, AuditLog
+        _db = SessionLocal()
+        try:
+            _db.add(AuditLog(user_id=None, action=action, detail=detail))
+            _db.commit()
+        finally:
+            _db.close()
+    except Exception as e:
+        print(f"[EDIT] audit log write failed ({action}): {e}")
+
+
+def _snapshot_previous_deliverables(
+    prior_s3_keys: dict | None,
+    version_n: int,
+) -> dict | None:
+    """Server-side-copy each deliverable in `prior_s3_keys` to `{key}.v{N}`
+    so the about-to-overwrite re-render preserves the prior cut.
+
+    Called from run_edit_pipeline right before _upload_deliverables_to_r2.
+    Returns a dict suitable to append to job.previous_versions:
+        {"version": N, "archived_at": iso, "keys": {file_type: archived_key}}
+    or None if there's nothing to archive (no prior keys / storage off).
+
+    Tolerant of partial failures: a copy that fails is logged and skipped,
+    not raised — the re-render must still succeed and overwrite the
+    survivor; losing a rollback path for one file type is better than
+    aborting the whole edit.
+    """
+    if not prior_s3_keys or not isinstance(prior_s3_keys, dict):
+        return None
+    if not storage.is_enabled():
+        return None
+    from datetime import datetime, timezone
+    archived: dict = {}
+    for file_type, src_key in prior_s3_keys.items():
+        if not src_key or not isinstance(src_key, str):
+            continue
+        dst_key = f"{src_key}.v{version_n}"
+        try:
+            ok = storage.copy_object(src_key, dst_key)
+            if ok:
+                archived[file_type] = dst_key
+        except Exception as e:
+            print(f"[EDIT] snapshot copy failed for {file_type} ({src_key}): {e}")
+    if not archived:
+        return None
+    return {
+        "version": version_n,
+        "archived_at": datetime.now(timezone.utc).isoformat(),
+        "keys": archived,
+    }
+
+
 def _ffprobe_duration(path: str) -> float | None:
     """Return media duration in seconds, or None if ffprobe fails."""
     import subprocess
@@ -5861,8 +5925,10 @@ def run_edit_pipeline(
     After completion the job returns to "pending_review" so the reviewer
     can approve, reject, or request another edit (up to _MAX_EDITS total).
     """
+    import time as _time
     from database import SessionLocal, Job as JobModel
 
+    started_at = _time.monotonic()
     db = SessionLocal()
     try:
         job_row = db.query(JobModel).filter(JobModel.job_id == job_id).first()
@@ -5892,6 +5958,13 @@ def run_edit_pipeline(
         tenant_id = job_row.tenant_id
         bg_r2_key_cached = job_row.bg_r2_key_cached
         input_r2_key = job_row.input_r2_key
+        # Snapshot inputs: edit_count was already incremented by the /edit
+        # handler before enqueuing, so it's the "version we're about to
+        # produce". Archived .vN keys use this number so v1 is the file
+        # that existed at the moment of the 1st edit, v2 at the 2nd, etc.
+        prior_s3_keys = dict(job_row.s3_keys) if job_row.s3_keys else None
+        version_n = int(job_row.edit_count or 0)
+        prior_versions = list(job_row.previous_versions or [])
     finally:
         db.close()
 
@@ -6029,6 +6102,19 @@ def run_edit_pipeline(
             audio_dur = _ffprobe_duration(mp3_path)
         _verify_deliverables(job_dir, files, audio_dur)
 
+        # Archive previous deliverables to {key}.vN before the upload
+        # overwrites them. Non-fatal — if storage.copy_object errors out
+        # for some keys we still want the new render to land. The
+        # archived metadata (or None) goes into job.previous_versions so
+        # an operator can find the rollback target without scraping R2.
+        snapshot_entry = _snapshot_previous_deliverables(prior_s3_keys, version_n)
+        if snapshot_entry:
+            snapshot_entry["edit_type"] = edit_type
+            update_job(
+                job_id,
+                previous_versions=prior_versions + [snapshot_entry],
+            )
+
         s3_keys = _upload_deliverables_to_r2(job_id, job_dir, files)
         if s3_keys:
             update_job(job_id, s3_keys=s3_keys)
@@ -6050,7 +6136,33 @@ def run_edit_pipeline(
         update_job(job_id, status="pending_review", progress=100, files=files)
         print(f"[EDIT] job={job_id} edit_type={edit_type} → pending_review")
 
+        # Audit log: completion. The corresponding job.edit_request entry
+        # was written by main.py at request time; this closes the loop
+        # with duration + archived version so UMG can trace every change.
+        _write_edit_audit(
+            action="job.edit_completed",
+            detail={
+                "job_id": job_id,
+                "edit_type": edit_type,
+                "edit_count": version_n,
+                "duration_seconds": round(_time.monotonic() - started_at, 2),
+                "archived_version": snapshot_entry["version"] if snapshot_entry else None,
+                "segments_count": len(segments) if segments else 0,
+                "files_updated": sorted(list(s3_keys.keys())) if s3_keys else [],
+            },
+        )
+
     except Exception as exc:
         print(f"[EDIT] job={job_id} FAILED: {exc}")
         update_job(job_id, status="error", error=f"Edit failed: {exc}")
+        _write_edit_audit(
+            action="job.edit_failed",
+            detail={
+                "job_id": job_id,
+                "edit_type": edit_type,
+                "edit_count": version_n,
+                "duration_seconds": round(_time.monotonic() - started_at, 2),
+                "error": str(exc),
+            },
+        )
         raise

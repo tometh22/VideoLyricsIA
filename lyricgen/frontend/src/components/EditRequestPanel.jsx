@@ -264,12 +264,36 @@ export default function EditRequestPanel({
     if (mountedRef.current) setError(null);
     let succeeded = false;
     try {
-      const res = await fetch(`${API}/edit/${job.job_id}`, {
+      // POST /edit. On 409 youtube_already_published the backend is
+      // telling us this job has a YouTube video that re-syncing won't
+      // update (YouTube API does not allow replacing a video's file
+      // bytes). Confirm with the operator and retry with the explicit
+      // drift override — otherwise the platform file would diverge
+      // silently from the YouTube cut.
+      let res = await fetch(`${API}/edit/${job.job_id}`, {
         method: "POST",
         headers: { ...authHeaders(), "Content-Type": "application/json" },
         body: JSON.stringify(payload),
       });
-      const data = await res.json().catch(() => ({}));
+      let data = await res.json().catch(() => ({}));
+      if (
+        res.status === 409 &&
+        data?.detail?.code === "youtube_already_published"
+      ) {
+        const url = data.detail.youtube_url;
+        const msg = (t("edit.youtube_drift_confirm") ||
+          "Este video ya está publicado en YouTube. La re-sincronización actualizará el archivo en la plataforma pero NO reemplazará el video en YouTube (la API de YouTube no permite reemplazar archivos, solo metadata).\n\n¿Continuar igual?")
+          + (url ? `\n\nYouTube: ${url}` : "");
+        if (!window.confirm(msg)) {
+          return;
+        }
+        res = await fetch(`${API}/edit/${job.job_id}`, {
+          method: "POST",
+          headers: { ...authHeaders(), "Content-Type": "application/json" },
+          body: JSON.stringify({ ...payload, allow_youtube_drift: true }),
+        });
+        data = await res.json().catch(() => ({}));
+      }
       if (!res.ok) {
         const friendly = translateBackendError(data.detail) || `Error ${res.status}`;
         if (mountedRef.current) setError(friendly);
