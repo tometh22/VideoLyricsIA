@@ -3577,6 +3577,14 @@ async def status(
         # (JobDetail.jsx fetches `/status/${job_id}`, never `/jobs/{id}`).
         "segments_json": job.get("segments_json"),
         "bg_r2_key_cached": job.get("bg_r2_key_cached"),
+        # Approval state. JobDetail uses these to render the "Aprobado"
+        # badge and to gate the "Enviar a UMG" button (admin-only). Both
+        # were missing from this response since the endpoint was first
+        # written for the upload-render flow, before the human-review
+        # workflow existed — the badge silently never rendered because
+        # the frontend reads job.approved_by directly from /status.
+        "approved_by": job.get("approved_by"),
+        "approved_at": job.get("approved_at"),
         # Whether this job is currently published on the UMG deliverables
         # portal. Drives the "Enviar a UMG" button state in JobDetail.jsx
         # (hidden / available / "✓ Ya en UMG"). Single boolean is enough —
