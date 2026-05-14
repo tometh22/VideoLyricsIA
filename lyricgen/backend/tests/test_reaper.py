@@ -15,6 +15,7 @@ from datetime import datetime, timedelta, timezone
 from database import AIProvenance, Job, SessionLocal
 from reaper import (
     find_abandoned_edits,
+    find_abandoned_transcribed,
     find_orphan_polling_jobs,
     find_stalled_renders,
     find_stuck_jobs,
@@ -25,6 +26,7 @@ from reaper import (
 def _seed(db, *, status: str, age_minutes: float, job_id: str | None = None,
           editing_started_minutes_ago: float | None = None,
           last_progress_minutes_ago: float | None = None,
+          last_user_activity_minutes_ago: float | None = None,
           edit_count: int = 0,
           progress: int = 20,
           current_step: str = "video"):
@@ -45,6 +47,12 @@ def _seed(db, *, status: str, age_minutes: float, job_id: str | None = None,
             datetime.now(timezone.utc)
             - timedelta(minutes=last_progress_minutes_ago)
         )
+    last_user_activity_at = None
+    if last_user_activity_minutes_ago is not None:
+        last_user_activity_at = (
+            datetime.now(timezone.utc)
+            - timedelta(minutes=last_user_activity_minutes_ago)
+        )
     db.add(Job(
         job_id=jid,
         user_id=1,
@@ -59,6 +67,7 @@ def _seed(db, *, status: str, age_minutes: float, job_id: str | None = None,
         edit_count=edit_count,
         editing_started_at=editing_started_at,
         last_progress_at=last_progress_at,
+        last_user_activity_at=last_user_activity_at,
         created_at=datetime.now(timezone.utc) - timedelta(minutes=age_minutes),
     ))
     db.commit()
@@ -488,6 +497,106 @@ def test_stalled_sweep_only_targets_processing():
         assert edit_jid not in stalled_ids
         assert queued_jid not in stalled_ids
         assert done_jid not in stalled_ids
+    finally:
+        _cleanup(db)
+        db.close()
+
+
+# -----------------------------------------------------------------------------
+# find_abandoned_transcribed: coalesce(last_user_activity_at, created_at)
+# -----------------------------------------------------------------------------
+# Incident 2026-05-14: a user batch-editing 5 lyrics for ~90 min got reaped at
+# 30 min because the anchor was created_at. The endpoint POST /save-segments
+# bumps last_user_activity_at every time the user edits, so active sessions
+# stay alive past the TTL.
+
+def test_transcribed_pending_with_recent_user_activity_is_kept():
+    """Old created_at but recent last_user_activity_at → active session, keep."""
+    db = SessionLocal()
+    try:
+        _cleanup(db)
+        jid = _seed(
+            db,
+            status="transcribed_pending",
+            age_minutes=90,                       # would be reaped on old logic
+            last_user_activity_minutes_ago=5,     # user was editing 5 min ago
+        )
+        abandoned = find_abandoned_transcribed(db, ttl_min=30)
+        assert all(j.job_id != jid for j in abandoned), (
+            "transcribed_pending with recent activity must NOT be reaped"
+        )
+    finally:
+        _cleanup(db)
+        db.close()
+
+
+def test_transcribed_pending_with_stale_user_activity_is_reaped():
+    """Old created_at AND stale last_user_activity_at → genuinely abandoned."""
+    db = SessionLocal()
+    try:
+        _cleanup(db)
+        jid = _seed(
+            db,
+            status="transcribed_pending",
+            age_minutes=120,
+            last_user_activity_minutes_ago=60,    # last touch was an hour ago
+        )
+        abandoned = find_abandoned_transcribed(db, ttl_min=30)
+        assert any(j.job_id == jid for j in abandoned), (
+            "transcribed_pending with stale activity should be reaped"
+        )
+    finally:
+        _cleanup(db)
+        db.close()
+
+
+def test_transcribed_pending_null_activity_falls_back_to_created_at():
+    """Legacy rows pre-migration (NULL last_user_activity_at) must keep
+    behaving the same way they did before: anchored on created_at."""
+    db = SessionLocal()
+    try:
+        _cleanup(db)
+        # Stale created_at, no activity timestamp → reaped.
+        old_jid = _seed(
+            db,
+            status="transcribed_pending",
+            age_minutes=90,
+            last_user_activity_minutes_ago=None,
+        )
+        # Fresh created_at, no activity timestamp → kept.
+        new_jid = _seed(
+            db,
+            status="transcribed_pending",
+            age_minutes=10,
+            last_user_activity_minutes_ago=None,
+        )
+        abandoned_ids = {j.job_id for j in find_abandoned_transcribed(db, ttl_min=30)}
+        assert old_jid in abandoned_ids, "old NULL-activity row should reap"
+        assert new_jid not in abandoned_ids, "fresh NULL-activity row should stay"
+    finally:
+        _cleanup(db)
+        db.close()
+
+
+def test_transcribed_pending_sweep_skips_other_statuses():
+    """find_abandoned_transcribed only looks at transcribed_pending. Other
+    statuses are handled by their own sweeps."""
+    db = SessionLocal()
+    try:
+        _cleanup(db)
+        processing_jid = _seed(
+            db, status="processing", age_minutes=120,
+        )
+        editing_jid = _seed(
+            db, status="editing", age_minutes=120,
+        )
+        done_jid = _seed(
+            db, status="done", age_minutes=120,
+        )
+        abandoned_ids = {j.job_id for j in find_abandoned_transcribed(db, ttl_min=30)}
+        assert processing_jid not in abandoned_ids
+        assert editing_jid not in abandoned_ids
+        assert done_jid not in abandoned_ids
     finally:
         _cleanup(db)
         db.close()

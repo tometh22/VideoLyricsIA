@@ -191,6 +191,8 @@ export default function LyricsEditor({
   lyricTransition = "cut",
   textMotion = "none",
   textContrast = "medium",
+  transcribeJobId = null,
+  onPersistSegments = null,
 }) {
   const { t } = useI18n();
   const [edited, setEdited] = useState(() =>
@@ -205,6 +207,22 @@ export default function LyricsEditor({
     window.addEventListener("beforeunload", handler);
     return () => window.removeEventListener("beforeunload", handler);
   }, [isDirty]);
+
+  // Debounced autosave to backend: every 3s after the last edit, persist
+  // the current segments to /jobs/{id}/save-segments. This bumps the
+  // reaper's last_user_activity_at anchor so long edit sessions don't get
+  // barre at the 30-min TTL (incident 2026-05-14 — Agus batch-edited 5
+  // lyrics for 90 min and all 5 jobs got reaped before "Crear videos").
+  // No-op when the parent didn't wire the callback (e.g. unit tests).
+  useEffect(() => {
+    if (!onPersistSegments || !transcribeJobId) return undefined;
+    if (!Array.isArray(edited) || edited.length === 0) return undefined;
+    const tid = setTimeout(() => {
+      const cleaned = edited.map(({ _id, ...rest }) => rest);
+      onPersistSegments(transcribeJobId, cleaned);
+    }, 3000);
+    return () => clearTimeout(tid);
+  }, [edited, transcribeJobId, onPersistSegments]);
 
   // ─── Audio sync ─────────────────────────────────────────────────────
   // Blob URL lifecycle must live in useEffect, not useMemo. useMemo is

@@ -145,14 +145,19 @@ def _retry_r2_upload(job_id: str, job_dir: str, job_dict: dict) -> bool:
     # Persist any newly-uploaded keys so /download can serve them.
     try:
         from jobs import update_job, get_job_model
-        model = get_job_model(job_id)
-        if model is None:
-            return False
-        merged = dict(model.s3_keys or {})
-        merged.update(new_keys)
-        update_job(job_id, s3_keys=merged)
-        # Re-evaluate completeness with the merged set.
-        return all(merged.get(k) for k in _should_have_keys(job_dict))
+        from database import SessionLocal
+        db = SessionLocal()
+        try:
+            model = get_job_model(db, job_id)
+            if model is None:
+                return False
+            merged = dict(model.s3_keys or {})
+            merged.update(new_keys)
+            update_job(job_id, s3_keys=merged)
+            # Re-evaluate completeness with the merged set.
+            return all(merged.get(k) for k in _should_have_keys(job_dict))
+        finally:
+            db.close()
     except Exception as e:
         logger.warning("update_job after R2 retry failed for %s: %s", job_id, e)
         return False
@@ -166,68 +171,73 @@ def cleanup() -> dict:
 
     try:
         from jobs import get_job_model
+        from database import SessionLocal
     except Exception as e:
         logger.error("cannot import jobs.get_job_model: %s", e)
         return {"error": str(e)}
 
     scanned = deleted = retried = freed = 0
+    db = SessionLocal()
 
-    for entry in os.listdir(OUTPUTS_DIR):
-        job_dir = os.path.join(OUTPUTS_DIR, entry)
-        if not os.path.isdir(job_dir):
-            continue
-        scanned += 1
-        age_min = _job_dir_age_minutes(job_dir)
+    try:
+        for entry in os.listdir(OUTPUTS_DIR):
+            job_dir = os.path.join(OUTPUTS_DIR, entry)
+            if not os.path.isdir(job_dir):
+                continue
+            scanned += 1
+            age_min = _job_dir_age_minutes(job_dir)
 
-        try:
-            model = get_job_model(entry)
-        except Exception as e:
-            logger.warning("DB lookup failed for %s: %s", entry, e)
-            continue
+            try:
+                model = get_job_model(db, entry)
+            except Exception as e:
+                logger.warning("DB lookup failed for %s: %s", entry, e)
+                continue
 
-        if model is None:
-            # Orphan — no DB row.
-            if age_min > _KEEP_ORPHAN_MIN:
-                freed += _delete_dir(job_dir, f"orphan (age {age_min:.0f} min)")
-                deleted += 1
-            continue
+            if model is None:
+                # Orphan — no DB row.
+                if age_min > _KEEP_ORPHAN_MIN:
+                    freed += _delete_dir(job_dir, f"orphan (age {age_min:.0f} min)")
+                    deleted += 1
+                continue
 
-        job_dict = model.to_dict()
-        status = job_dict.get("status")
+            job_dict = model.to_dict()
+            status = job_dict.get("status")
 
-        if status in _NON_TERMINAL:
-            continue  # job still running, never touch
+            if status in _NON_TERMINAL:
+                continue  # job still running, never touch
 
-        if status in _TERMINAL_DONE:
-            if _all_keys_present(job_dict) and age_min > _KEEP_DONE_MIN:
-                freed += _delete_dir(
-                    job_dir,
-                    f"done + R2 complete (age {age_min:.0f} min)",
-                )
-                deleted += 1
-            elif age_min > _RETRY_FAILED_MIN:
-                # Some R2 upload failed earlier — retry once.
-                retried += 1
-                if _retry_r2_upload(entry, job_dir, job_dict):
+            if status in _TERMINAL_DONE:
+                if _all_keys_present(job_dict) and age_min > _KEEP_DONE_MIN:
                     freed += _delete_dir(
-                        job_dir, "done + R2 retry succeeded",
+                        job_dir,
+                        f"done + R2 complete (age {age_min:.0f} min)",
                     )
                     deleted += 1
-                else:
-                    logger.info(
-                        "%s: R2 retry incomplete; will try again next cycle",
-                        entry,
-                    )
-            continue
+                elif age_min > _RETRY_FAILED_MIN:
+                    # Some R2 upload failed earlier — retry once.
+                    retried += 1
+                    if _retry_r2_upload(entry, job_dir, job_dict):
+                        freed += _delete_dir(
+                            job_dir, "done + R2 retry succeeded",
+                        )
+                        deleted += 1
+                    else:
+                        logger.info(
+                            "%s: R2 retry incomplete; will try again next cycle",
+                            entry,
+                        )
+                continue
 
-        if status in _TERMINAL_FAILED:
-            if age_min > _KEEP_FAILED_MIN:
-                freed += _delete_dir(
-                    job_dir,
-                    f"{status} (age {age_min:.0f} min)",
-                )
-                deleted += 1
-            continue
+            if status in _TERMINAL_FAILED:
+                if age_min > _KEEP_FAILED_MIN:
+                    freed += _delete_dir(
+                        job_dir,
+                        f"{status} (age {age_min:.0f} min)",
+                    )
+                    deleted += 1
+                continue
+    finally:
+        db.close()
 
     summary = {
         "scanned": scanned,
