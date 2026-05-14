@@ -215,6 +215,47 @@ def get_user_by_id(db: Session, user_id: int) -> Optional[User]:
     return db.query(User).filter(User.id == user_id).first()
 
 
+# Same markers as jobs.get_job_model_resilient — Railway Postgres drops
+# idle conns AFTER pool_pre_ping. Auth dependency hits the DB on every
+# request, and upload-proxy bodies > 1 MiB can't be replayed by the
+# global middleware, so we retry inline here too. Confirmed in prod
+# logs 2026-05-14 15:59 on /upload-part-proxy AFTER the jobs.py fix
+# deployed — the same drop was happening one layer earlier.
+_AUTH_TRANSIENT_DB_MARKERS = (
+    "SSL connection has been closed",
+    "server closed the connection",
+    "connection already closed",
+    "could not connect to server",
+)
+
+
+def get_user_by_id_resilient(
+    db: Session, user_id: int, max_attempts: int = 3
+) -> Optional[User]:
+    """get_user_by_id with retry on transient Postgres SSL drops.
+
+    Used by get_current_user (the auth dependency for every protected
+    endpoint, including the upload proxies). Without this, an idle-drop
+    bubbles up before the handler-level get_job_model_resilient gets a
+    chance to run, and the request 500s.
+    """
+    from sqlalchemy.exc import OperationalError
+    last_err: Optional[OperationalError] = None
+    for attempt in range(max_attempts):
+        try:
+            return get_user_by_id(db, user_id)
+        except OperationalError as e:
+            if not any(m in str(e) for m in _AUTH_TRANSIENT_DB_MARKERS):
+                raise
+            last_err = e
+            try:
+                db.rollback()
+            except OperationalError:
+                pass
+    assert last_err is not None
+    raise last_err
+
+
 def create_user(
     db: Session,
     username: str,
@@ -463,7 +504,10 @@ async def get_current_user(
         raise HTTPException(status_code=401, detail="Authentication required")
     payload = decode_token(credentials.credentials)
     # Refresh user data from DB to get latest plan etc.
-    user = get_user_by_id(db, int(payload["sub"]))
+    # Resilient: see get_user_by_id_resilient — auth dep runs on every
+    # /upload-part-proxy request and the global middleware can't replay
+    # multi-MB bodies if this throws an SSL drop.
+    user = get_user_by_id_resilient(db, int(payload["sub"]))
     if not user or not user.is_active:
         raise HTTPException(status_code=401, detail="User not found or inactive")
     return {
