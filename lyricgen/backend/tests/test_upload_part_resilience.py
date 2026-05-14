@@ -113,7 +113,7 @@ def test_helper_propagates_non_transient_error(db, monkeypatch):
 
 
 def test_helper_exhausts_retries_then_raises(db, monkeypatch):
-    """Both attempts hit transient errors → propagate the last one."""
+    """All attempts hit transient errors → propagate the last one."""
     import jobs
 
     call_count = {"n": 0}
@@ -128,8 +128,10 @@ def test_helper_exhausts_retries_then_raises(db, monkeypatch):
 
     monkeypatch.setattr(jobs, "get_job_model", always_drop)
 
+    # Pass max_attempts=2 explicitly so the test is independent of the
+    # production default (which we may tune up/down over time).
     with pytest.raises(OperationalError) as ei:
-        get_job_model_resilient(db, "anyjob")
+        get_job_model_resilient(db, "anyjob", max_attempts=2)
     assert "server closed the connection" in str(ei.value)
     assert call_count["n"] == 2, "should attempt exactly max_attempts times"
 

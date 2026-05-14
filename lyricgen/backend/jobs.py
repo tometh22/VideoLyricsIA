@@ -112,7 +112,7 @@ def get_job_model(db: Session, job_id: str) -> Optional[Job]:
 
 
 def get_job_model_resilient(
-    db: Session, job_id: str, max_attempts: int = 2
+    db: Session, job_id: str, max_attempts: int = 3
 ) -> Optional[Job]:
     """Same as get_job_model but retries once on transient Postgres SSL drops.
 
