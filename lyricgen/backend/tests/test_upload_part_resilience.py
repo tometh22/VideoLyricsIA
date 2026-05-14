@@ -139,6 +139,65 @@ def test_helper_exhausts_retries_then_raises(db, monkeypatch):
 # ── End-to-end: /upload-part-proxy actually uses the resilient path ─────
 
 
+# ── R2 retry wrapper tests ──────────────────────────────────────────────
+
+
+def test_storage_retry_retries_transient_endpoint_error(monkeypatch):
+    """EndpointConnectionError → retry → success on second try."""
+    from storage import _retry_transient
+
+    class FakeEndpointConnectionError(Exception):
+        pass
+    FakeEndpointConnectionError.__name__ = "EndpointConnectionError"
+
+    call_count = {"n": 0}
+
+    def flaky():
+        call_count["n"] += 1
+        if call_count["n"] == 1:
+            raise FakeEndpointConnectionError("connection refused")
+        return "ok"
+
+    # base_delay=0 so the test doesn't actually sleep.
+    result = _retry_transient(flaky, label="test", base_delay=0)
+    assert result == "ok"
+    assert call_count["n"] == 2
+
+
+def test_storage_retry_propagates_permanent_error(monkeypatch):
+    """ValueError (not a transient marker) → propagates without retry."""
+    from storage import _retry_transient
+
+    call_count = {"n": 0}
+
+    def always_fail():
+        call_count["n"] += 1
+        raise ValueError("bad request")
+
+    with pytest.raises(ValueError):
+        _retry_transient(always_fail, label="test", base_delay=0)
+    assert call_count["n"] == 1, "permanent error must not retry"
+
+
+def test_storage_retry_respects_max_attempts(monkeypatch):
+    """All attempts transient → propagate the last error after max_attempts."""
+    from storage import _retry_transient
+
+    class FakeReadTimeout(Exception):
+        pass
+    FakeReadTimeout.__name__ = "ReadTimeoutError"
+
+    call_count = {"n": 0}
+
+    def always_timeout():
+        call_count["n"] += 1
+        raise FakeReadTimeout("read timed out")
+
+    with pytest.raises(Exception):
+        _retry_transient(always_timeout, label="test", max_attempts=3, base_delay=0)
+    assert call_count["n"] == 3
+
+
 def test_upload_part_proxy_recovers_from_transient_ssl_drop(
     client, admin_token, db, monkeypatch,
 ):
