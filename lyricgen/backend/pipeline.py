@@ -3365,6 +3365,88 @@ def _normalize_concept(c: str) -> str:
     return ""
 
 
+def _parse_gemini_bg_response(text: str) -> dict | None:
+    """Parse Gemini's background-generation response into {style, prompt}.
+
+    Handles three failure modes observed in prod:
+      1. Bare JSON: `{"style":"video","prompt":"..."}` — happy path.
+      2. Markdown-wrapped: ```json\\n{...}\\n``` — common with newer Gemini
+         models that prefer fenced output.
+      3. Truncated: `{"style":"video","prompt":"... mid-sentence` — when
+         max_output_tokens is hit. The original parser failed here because
+         `re.search(r'\\{.*?\\}')` requires a closing brace; without one,
+         it returns None and the whole pipeline falls to the combinatorial
+         random scene picker, ignoring concept/lyrics/hint.
+
+    Returns the parsed dict on success, None if the response is so
+    malformed that nothing usable can be extracted. The caller falls back
+    to the combinatorial random only on None.
+    """
+    import re
+
+    if not text:
+        return None
+
+    # Strip markdown code fences if present. Handles both ```json...``` and
+    # bare ``` blocks. We only need to remove the fence markers; the JSON
+    # body survives intact.
+    cleaned = text.strip()
+    if cleaned.startswith("```"):
+        # Drop the opening fence (with optional language tag) and any
+        # closing fence. Be defensive about partial fences (truncation).
+        cleaned = re.sub(r"^```[a-zA-Z]*\s*\n?", "", cleaned)
+        cleaned = re.sub(r"\n?```\s*$", "", cleaned)
+        cleaned = cleaned.strip()
+
+    # Stage 1: greedy match for the largest possible {...} block. Greedy
+    # is intentional — the non-greedy version stops at the first inner `}`
+    # which breaks on prompts containing JSON-encoded objects. The body of
+    # `prompt` is a plain string, so a greedy match to the LAST `}` works.
+    match = re.search(r"\{.*\}", cleaned, re.DOTALL)
+    if match:
+        try:
+            data = json.loads(match.group())
+            # Accept either complete shape or partial with at least prompt.
+            if isinstance(data, dict) and ("prompt" in data or "style" in data):
+                return data
+        except json.JSONDecodeError:
+            pass
+
+    # Stage 2: the JSON is malformed (truncated, unescaped, etc.). Try to
+    # recover the prompt field directly with a regex. We accept any quoted
+    # string after `"prompt":` even if the closing quote and brace are
+    # missing — better to render something coherent than fall to random.
+    # Pattern: "prompt": "<content>" where <content> is everything up to
+    # the next unescaped quote OR end of input. The `(?:\\.|[^"\\])*`
+    # matches escaped chars (\", \\, \n) and plain non-quote chars.
+    prompt_match = re.search(
+        r'"prompt"\s*:\s*"((?:\\.|[^"\\])*)',
+        cleaned, re.DOTALL,
+    )
+    if prompt_match:
+        prompt_value = prompt_match.group(1)
+        # Decode common JSON escapes manually since we may not have a
+        # closing quote. Only handle the cheap ones; if Gemini emitted
+        # exotic unicode escapes the prompt will still be usable.
+        prompt_value = (prompt_value
+                        .replace('\\"', '"')
+                        .replace("\\n", " ")
+                        .replace("\\\\", "\\")
+                        .strip())
+        # Only return if we recovered something substantive (≥15 chars
+        # matches the existing length gate downstream).
+        if len(prompt_value) >= 15:
+            # Extract style too if it survived; default to "video".
+            style_match = re.search(r'"style"\s*:\s*"(\w+)"', cleaned)
+            style = style_match.group(1) if style_match else "video"
+            print(f"[BG] Recovered prompt from truncated JSON "
+                  f"(raw_len={len(text)}, prompt_len={len(prompt_value)})")
+            return {"style": style, "prompt": prompt_value}
+
+    # Nothing recoverable.
+    return None
+
+
 def _analyze_lyrics_for_background(lyrics_text: str, artist: str, job_id: str = None,
                                     song_title: str = "", genre: str = "",
                                     concept: str = "",
@@ -3647,7 +3729,19 @@ Hard rules:
             config=genai.types.GenerateContentConfig(
                 system_instruction=system_prompt,
                 temperature=0.8,
-                max_output_tokens=500,
+                # max_output_tokens=1500 (was 500): the concept+match_lyrics=True
+                # branch in #152 expanded the system_prompt with 6 worked examples
+                # and lyrics-anchor instructions. Gemini's output got more verbose
+                # to match the richer prompt and started truncating at 500 tokens
+                # — observed in prod 2026-05-15 on jobs 7e89f00cd130 ("Lunes Por
+                # La Madrugada") and 7fd94fb30fc1 ("Me late"): JSON cut at
+                # `"prompt": "...then a ge` (mid-word), parse failed, fallback
+                # combinatorial fired 100% of jobs and pinned random scenes like
+                # "northern lights aurora over a mountain lake" regardless of
+                # concept. 1500 covers a 120-word prompt + JSON envelope + any
+                # preamble verbosity Gemini adds, with ~3× headroom. Cost impact
+                # marginal (~$0.0001 extra per call at worst case).
+                max_output_tokens=1500,
                 # thinking_budget=512: Gemini hace chain-of-thought corto
                 # para extraer el visual subject de las letras antes de
                 # commitearse a una escena. Sin esto (=0), saltaba el
@@ -3658,42 +3752,73 @@ Hard rules:
             ),
         )
         text = response.text.strip()
-        print(f"[BG] Gemini raw: {text[:300]}")
+        # Log full text length and a longer preview so future parse-failure
+        # incidents have enough evidence. Previously truncated to 300 chars
+        # which hid the actual truncation point during the 2026-05-15 incident
+        # (couldn't tell from logs alone whether Gemini hit max_output_tokens
+        # or returned malformed JSON).
+        print(f"[BG] Gemini raw ({len(text)} chars): {text[:800]}")
 
-        # Parse JSON from response (handles ```json blocks, multiline JSON)
-        import re
-        json_match = re.search(r'\{.*?\}', text, re.DOTALL)
-        if json_match:
-            try:
-                data = json.loads(json_match.group())
-                style = data.get("style", "video")
-                prompt = data.get("prompt", "")
-                if style not in ("video", "photo", "illustration"):
-                    style = "video"
-                if prompt and len(prompt) > 15:
-                    print(f"[BG] Gemini chose: style={style}, prompt={prompt[:80]}...")
-                    # Alley-bias telemetry: si Gemini igual eligió callejón
-                    # cuando el operador NO pidió urbano, dejá rastro en
-                    # logs para auditar post-deploy. Detecta el caso real
-                    # del incidente UMG 2026-05-14.
-                    _alley_keywords = ("alley", "callejón", "callejon",
-                                       "narrow street", "back street",
-                                       "back-street", "rain-slicked street")
-                    if (any(k in prompt.lower() for k in _alley_keywords)
-                            and normalized_concept != "urbano"):
-                        print(
-                            f"[BG][⚠ ALLEY-BIAS DETECTED] "
-                            f"genre={normalized_genre or 'auto'} "
-                            f"concept={normalized_concept or 'none'} "
-                            f"match_lyrics={match_lyrics} job={job_id}"
-                        )
-                    if recorder:
-                        recorder.finish(response_summary=text[:500])
-                    return {"style": style, "prompt": prompt}
-            except json.JSONDecodeError:
-                pass
+        # Parse Gemini's response. The model usually returns one of:
+        #   {"style":"...","prompt":"..."}                     ← bare JSON
+        #   ```json\n{"style":"...","prompt":"..."}\n```       ← markdown-wrapped
+        #   <preamble>\n{...}                                  ← chatty preamble
+        #   {"style":"...","prompt":"... <TRUNCATED>            ← cut off by
+        #                                                        max_output_tokens
+        #
+        # The original regex `\{.*?\}` (non-greedy) only handled the first two,
+        # and failed catastrophically on the truncation case: no closing `}`
+        # meant no match, no match meant fallback to the combinatorial random
+        # scene picker which ignores concept/lyrics/hint entirely. Prod 2026-
+        # 05-15 incident showed this firing on 100% of jobs after #152
+        # expanded the system_prompt; a richer prompt → more verbose output
+        # → hitting the 500-token cap mid-property.
+        #
+        # New strategy: three-stage parser.
+        #   1. Try strict JSON via greedy match (handles full + markdown-wrapped)
+        #   2. If that fails, regex-extract the "prompt" field value directly
+        #      so we recover even when the JSON closing brace is missing
+        #   3. Only then fall back to the combinatorial random
+        parsed = _parse_gemini_bg_response(text)
+        if parsed is not None:
+            style = parsed.get("style", "video")
+            prompt = parsed.get("prompt", "")
+            if style not in ("video", "photo", "illustration"):
+                style = "video"
+            if prompt and len(prompt) > 15:
+                print(f"[BG] Gemini chose: style={style}, prompt={prompt[:80]}...")
+                # Alley-bias telemetry: si Gemini igual eligió callejón
+                # cuando el operador NO pidió urbano, dejá rastro en
+                # logs para auditar post-deploy. Detecta el caso real
+                # del incidente UMG 2026-05-14.
+                _alley_keywords = ("alley", "callejón", "callejon",
+                                   "narrow street", "back street",
+                                   "back-street", "rain-slicked street")
+                if (any(k in prompt.lower() for k in _alley_keywords)
+                        and normalized_concept != "urbano"):
+                    print(
+                        f"[BG][⚠ ALLEY-BIAS DETECTED] "
+                        f"genre={normalized_genre or 'auto'} "
+                        f"concept={normalized_concept or 'none'} "
+                        f"match_lyrics={match_lyrics} job={job_id}"
+                    )
+                if recorder:
+                    recorder.finish(response_summary=text[:500])
+                return {"style": style, "prompt": prompt}
 
-        print("[BG] Failed to parse Gemini JSON, using combinatorial fallback")
+        # finish_reason on Gemini response indicates whether the generation
+        # was cut by MAX_TOKENS, SAFETY, RECITATION, or completed naturally.
+        # Best-effort introspect; never raise from the log line.
+        finish_reason = "unknown"
+        try:
+            if hasattr(response, "candidates") and response.candidates:
+                fr = getattr(response.candidates[0], "finish_reason", None)
+                if fr is not None:
+                    finish_reason = str(fr)
+        except Exception:
+            pass
+        print(f"[BG] Failed to parse Gemini JSON, using combinatorial fallback. "
+              f"raw_len={len(text)} finish_reason={finish_reason}")
         if recorder:
             recorder.finish(response_summary=f"parse_failed: {text[:200]}")
         return {"style": "video", "prompt": None}
