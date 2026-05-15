@@ -5600,8 +5600,15 @@ _DELIVERY_FILE_TYPES: dict[str, dict[str, str]] = {
 # we even create the Delivery row — no point publishing a partial entry.
 _DEFAULT_DELIVERY_FILE_TYPES = ["umg_master", "video", "umg_short", "short", "thumbnail"]
 _DELIVERY_URL_EXPIRY_S = 7 * 24 * 3600  # R2 max
-_DELIVERY_LIST_CACHE: dict = {"signed_at": 0.0, "payload": None}
-_DELIVERY_LIST_CACHE_TTL_S = 60
+# No in-process cache for the deliveries listing. Railway runs the app
+# with multiple uvicorn workers (Dockerfile: --workers 2), so a per-
+# process cache silently desynced after a POST/DELETE: the writer
+# invalidated its own cache, the next read landed on another worker
+# whose cache was still warm with the pre-publish snapshot, and the
+# operator saw "everything OK" while the portal listing was stale for
+# up to 60 s. The listing query is cheap (single filter + order_by),
+# the only meaningful cost is the per-file head_object calls — those
+# happen on every render anyway since they validate file availability.
 
 
 def _r2_key_for_delivery(tenant: str, job_id: str, file_type: str) -> str:
@@ -5730,7 +5737,6 @@ async def admin_create_delivery_from_job(
     db.commit()
     db.refresh(delivery)
 
-    _invalidate_delivery_list_cache()
     return {
         "ok": True,
         "delivery_id": delivery.id,
@@ -5762,11 +5768,6 @@ def _compute_default_delivery_label(db: Session, artist: str, song_title: str | 
     return f"Opción {existing_count + 1}"
 
 
-def _invalidate_delivery_list_cache() -> None:
-    _DELIVERY_LIST_CACHE["payload"] = None
-    _DELIVERY_LIST_CACHE["signed_at"] = 0.0
-
-
 @app.delete("/admin/deliveries/{delivery_id}")
 async def admin_delete_delivery(
     delivery_id: int,
@@ -5796,7 +5797,6 @@ def _soft_delete_delivery(db: Session, delivery_id: int, actor_user_id: int | No
         },
     ))
     db.commit()
-    _invalidate_delivery_list_cache()
     return {"ok": True}
 
 
@@ -5843,18 +5843,13 @@ async def portal_get_items(
 ):
     """Return the portal listing in the shape the frontend expects.
 
-    Cached 60 s in process memory. The cache key is global (not per-token)
-    because the listing itself doesn't vary by caller — auth is just a
-    gate. Mutations (POST/DELETE) bust the cache so a publish/delete is
-    visible immediately."""
+    Queries the DB fresh on every call. Previous in-process cache broke
+    under Railway's multi-worker setup — see the module-level note next
+    to _DELIVERY_URL_EXPIRY_S."""
     _verify_portal_token(x_portal_token)
     import time
 
     now = time.time()
-    cached = _DELIVERY_LIST_CACHE
-    if cached["payload"] is not None and now - cached["signed_at"] < _DELIVERY_LIST_CACHE_TTL_S:
-        return cached["payload"]
-
     deliveries = (
         db.query(Delivery)
         .filter(Delivery.removed_at.is_(None))
@@ -5921,15 +5916,12 @@ async def portal_get_items(
             "short_preview_url": short_preview_url,
         })
 
-    payload = {
+    return {
         "songs": list(songs.values()),
         "file_type_labels": file_type_labels,
         "expires_at_ts": now + _DELIVERY_URL_EXPIRY_S,
         "generated_at": datetime.now(timezone.utc).isoformat(),
     }
-    _DELIVERY_LIST_CACHE["payload"] = payload
-    _DELIVERY_LIST_CACHE["signed_at"] = now
-    return payload
 
 
 def _fmt_size_mb(size_bytes: int | None) -> str:
