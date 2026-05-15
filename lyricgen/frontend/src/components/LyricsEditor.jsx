@@ -412,19 +412,70 @@ export default function LyricsEditor({
   // ones). If the offset was constant the next line is already roughly
   // right and the operator only needs to confirm. Already-anchored
   // lines (idx < syncCursor) are ground truth and stay put.
+  // Empirical compensation for the gap between `audio.currentTime` (the
+  // *decoded* position, what the API reports) and what the operator
+  // actually hears coming out of the speakers. Browsers buffer ~30-100 ms
+  // of decoded audio before it's audible — when the operator hits Space
+  // synced with their ear, currentTime has already advanced past the
+  // moment they meant to anchor. 80 ms is the empirical mid-point of
+  // observed latency on Chrome/Firefox/Safari with non-Bluetooth output.
+  // Operators using BT headsets may need more compensation; expose later
+  // as a calibration setting if reports persist.
+  const AUDIO_LATENCY_COMPENSATION_S = 0.08;
+  // Floor between adjacent segments so an anchor can't push a line into
+  // (or before) its neighbor. 50 ms is below human flicker perception
+  // but enough to keep moviepy's transitions clean.
+  const MIN_GAP_S = 0.05;
+  // Cascade safety net: if a single anchor would propagate a > 1.5 s
+  // shift to every line after it, that's almost certainly a mistap (the
+  // operator was paused, scrolled, or got distracted) — confirm before
+  // walking the rest of the song into the wrong place.
+  const CASCADE_DELTA_CONFIRM_S = 1.5;
+
   const tapAnchor = useCallback(() => {
     if (!syncMode) return;
     if (syncCursor < 0 || syncCursor >= edited.length) return;
     const target = edited[syncCursor];
     if (!target) return;
-    const newStart = Math.max(0, currentTime);
+
+    // Compensate audio latency so the anchor matches what the operator
+    // *heard* at press time, not what was decoded by then. See the
+    // AUDIO_LATENCY_COMPENSATION_S comment above.
+    const rawStart = Math.max(0, currentTime - AUDIO_LATENCY_COMPENSATION_S);
+
+    // Clamp to neighbors so the timeline can't go non-monotonic. If the
+    // operator presses Space too late (after the next line has started)
+    // or too early (before the previous one ended), pin to the safe edge
+    // instead of producing overlapping segments that render as a flicker.
+    const prevSeg = syncCursor > 0 ? edited[syncCursor - 1] : null;
+    const nextSeg = syncCursor + 1 < edited.length ? edited[syncCursor + 1] : null;
+    const lowerBound = prevSeg ? prevSeg.end + MIN_GAP_S : 0;
+    const upperBound = nextSeg
+      ? nextSeg.start - MIN_GAP_S
+      : (duration && duration > 0 ? duration : Infinity);
+    const newStart = Math.max(lowerBound, Math.min(rawStart, upperBound));
+
     const delta = newStart - target.start;
+
+    // Cascade safety: huge delta = probable mistap. Ask before walking
+    // every subsequent line by the same amount. Bail if operator cancels —
+    // the current line gets the anchor but the cascade is skipped.
+    let applyCascade = syncCascade;
+    if (applyCascade && Math.abs(delta) > CASCADE_DELTA_CONFIRM_S) {
+      const tail = edited.length - syncCursor - 1;
+      const ok = window.confirm(
+        `Detectamos un salto de ${delta.toFixed(2)}s en este anchor. ` +
+        `¿Aplicar a las ${tail} líneas siguientes? ` +
+        `(Cancelar = solo anclar la línea actual.)`
+      );
+      if (!ok) applyCascade = false;
+    }
+
     // Snapshot the future lines BEFORE mutating so undo can restore
-    // every shifted timestamp, not just the anchor's.
-    // Snapshot the future ONLY when we're going to touch it. Without
-    // syncCascade the future array stays empty and Deshacer reverts a
-    // single line — matching the user's mental model.
-    const futureSnapshot = syncCascade
+    // every shifted timestamp, not just the anchor's. Skip when we're
+    // not going to touch the future — keeps the undo behaviour matching
+    // the user's mental model (single line revert).
+    const futureSnapshot = applyCascade
       ? edited
           .slice(syncCursor + 1)
           .map((s) => ({ id: s._id, prevStart: s.start, prevEnd: s.end }))
@@ -448,17 +499,12 @@ export default function LyricsEditor({
           if (duration && newEnd > duration) newEnd = duration;
           return { ...s, start: newStart, end: newEnd };
         }
-        // Cascade only when the operator opted in. We used to have a
-        // 200 ms dead-zone here, intended to avoid jittering on
-        // micro-adjustments. In practice that swallowed the most
-        // common real correction (Whisper drifts of 100-300 ms), so
-        // operators reported "Arrastrar siguientes anda mal — apreté
-        // y no pasó nada" — when actually the cascade math was running
-        // but rejecting the delta as "too small to matter". 10 ms is
-        // tight enough to filter pure floating-point noise without
-        // discarding legitimate user-driven shifts. The user remains
-        // in control via the explicit `syncCascade` opt-in.
-        if (syncCascade && i > syncCursor && Math.abs(delta) >= 0.01) {
+        // Cascade only when the operator opted in AND the delta isn't a
+        // suspect mistap (handled by the confirm above). 10 ms threshold
+        // filters pure floating-point noise; below that we skip the
+        // shift, above we apply it. See git blame for the prior 200 ms
+        // dead-zone that swallowed legit user corrections.
+        if (applyCascade && i > syncCursor && Math.abs(delta) >= 0.01) {
           const segDur = Math.max(0.5, s.end - s.start);
           const shifted = Math.max(0, s.start + delta);
           let newEnd = shifted + segDur;
@@ -475,6 +521,21 @@ export default function LyricsEditor({
       setSyncCursor(syncCursor + 1);
     }
   }, [syncMode, syncCursor, edited, currentTime, duration, syncCascade]);
+
+  // Keep syncCursor inside the bounds of `edited` after split/delete
+  // operations performed mid-sync. Without this, deleting line 8 while
+  // the cursor is on line 5 leaves the UI showing line 5 but the next
+  // tapAnchor reads from an array that may have shifted under the hood.
+  useEffect(() => {
+    if (!syncMode) return;
+    if (edited.length === 0) {
+      setSyncMode(false);
+      return;
+    }
+    if (syncCursor >= edited.length) {
+      setSyncCursor(edited.length - 1);
+    }
+  }, [edited.length, syncMode, syncCursor]);
 
   const undoLastAnchor = useCallback(() => {
     setSyncHistory((prev) => {
@@ -556,6 +617,11 @@ export default function LyricsEditor({
       const editing = tag === "INPUT" || tag === "TEXTAREA" || document.activeElement?.isContentEditable;
       if (editing) return;
       if (e.code === "Space") {
+        // Ignore keyboard autorepeat / sustained press so the operator
+        // doesn't anchor 3 lines from one apparent tap. Native autorepeat
+        // fires keydown ~20 times per second on most OSes — one anchor
+        // is the operator's intent, the rest are noise.
+        if (e.repeat) { e.preventDefault(); return; }
         e.preventDefault();
         if (syncMode) tapAnchor();
         else togglePlay();

@@ -4881,6 +4881,16 @@ def _make_text_clip(
     _FADE_DURATIONS = {"fade": 0.15, "fade_slow": 0.30}
     fade_dur = _FADE_DURATIONS.get(lyric_transition, 0.0)
     fade_dur = min(fade_dur, seg_duration / 3)
+    # Compensate for fade-in perception. The text starts at seg_start with
+    # opacity=0 and ramps linearly to 100%. Humans perceive "the text
+    # appeared" around the ~50% opacity mark — so without compensation the
+    # operator's anchored timestamp shows up perceptually fade_dur/2 LATE.
+    # Subtracting half the fade from the start time aligns the perceptual
+    # midpoint with the anchor, which is what the Sync Mode operator
+    # actually targeted with their Space tap. Cuts == 0 → no compensation.
+    fade_perceptual_offset = fade_dur / 2.0
+    adjusted_start = max(0.0, seg_start - fade_perceptual_offset)
+    adjusted_end = seg_end  # End is unaffected; only the visual onset shifts.
 
     def _try_text_clip(txt, fsize, fnt, color, **kwargs):
         try:
@@ -4902,7 +4912,7 @@ def _make_text_clip(
         shadow = shadow.set_position(lambda t, _p=shadow_pos: _p(t))
     else:
         shadow = shadow.set_position((base_x + shadow_offset, base_y + shadow_offset))
-    shadow = shadow.set_start(seg_start).set_end(seg_end)
+    shadow = shadow.set_start(adjusted_start).set_end(adjusted_end)
 
     layers = []
 
@@ -4916,7 +4926,7 @@ def _make_text_clip(
             shadow2 = shadow2.set_position(lambda t, _p=shadow2_pos: _p(t))
         else:
             shadow2 = shadow2.set_position((base_x - shadow_offset, base_y - shadow_offset))
-        shadow2 = shadow2.set_start(seg_start).set_end(seg_end)
+        shadow2 = shadow2.set_start(adjusted_start).set_end(adjusted_end)
         if fade_dur > 0:
             shadow2 = shadow2.crossfadein(fade_dur).crossfadeout(fade_dur)
         layers.append(shadow2)
@@ -4932,7 +4942,7 @@ def _make_text_clip(
         txt = txt.set_position(lambda t, _p=txt_pos: _p(t))
     else:
         txt = txt.set_position("center")
-    txt = txt.set_start(seg_start).set_end(seg_end)
+    txt = txt.set_start(adjusted_start).set_end(adjusted_end)
 
     if fade_dur > 0:
         shadow = shadow.crossfadein(fade_dur).crossfadeout(fade_dur)
