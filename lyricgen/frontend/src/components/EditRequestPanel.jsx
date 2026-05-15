@@ -93,6 +93,15 @@ export default function EditRequestPanel({
   // that case and the pipeline falls back to Gemini's lyrics-only
   // analysis with the debiased system prompt + 3 contrastive examples).
   const [backgroundHint, setBackgroundHint] = useState("");
+  // Latest segments from the nested LyricsEditor (updated synchronously
+  // on every edit via `onEditedChange`). Held in a ref so buildPayload
+  // can read it without re-renders. Used to include the operator's
+  // pending text corrections in a background-regen POST, closing the
+  // 3 s autosave race documented in the LyricsEditor comment above.
+  // Null until the operator touches the editor; we keep it null when
+  // untouched so we don't accidentally overwrite segments_json with a
+  // mirror of itself on a no-op edit.
+  const latestEditedSegments = useRef(null);
   const [form, setForm] = useState({
     font:             initialParams.font             ?? "",
     font_scale:       initialParams.font_scale       ?? 1.0,
@@ -167,11 +176,23 @@ export default function EditRequestPanel({
 
   // Only send the fields the operator actually changed — the backend
   // treats missing fields as "keep the prior value".
+  //
+  // Both `background` and `typography` paths now optionally include
+  // `segments` when the operator was editing lyric text inside the
+  // modal's LyricsEditor and clicked the regen button before the 3 s
+  // autosave debounce fired. The backend persists these segments to
+  // segments_json before enqueueing, so the worker reads the corrected
+  // text regardless of edit_type. Incident 2026-05-15: Bersuit lyric
+  // "de la amor" → "del amor" was silently dropped on background
+  // re-renders because of this race.
   const buildPayload = (type) => {
     if (type === "background") {
       const p = { edit_type: "background" };
       const hint = (backgroundHint || "").trim();
       if (hint) p.background_hint = hint;
+      if (latestEditedSegments.current && latestEditedSegments.current.length > 0) {
+        p.segments = latestEditedSegments.current;
+      }
       return p;
     }
     // edit_type === "lyrics" no longer builds via this function — it's
@@ -183,6 +204,9 @@ export default function EditRequestPanel({
     if (form.text_case        !== (initialParams.text_case        ?? "upper")) p.text_case = form.text_case;
     if (form.lyric_transition !== (initialParams.lyric_transition ?? "cut")) p.lyric_transition = form.lyric_transition;
     if (form.text_motion      !== (initialParams.text_motion      ?? "none")) p.text_motion = form.text_motion;
+    if (latestEditedSegments.current && latestEditedSegments.current.length > 0) {
+      p.segments = latestEditedSegments.current;
+    }
     return p;
   };
 
@@ -869,7 +893,34 @@ function LyricsEditModal({
               textMotion={initialParams.text_motion || "none"}
               disableAutoSplit
               disableBeforeUnload
-              disableAutosave
+              // Autosave ON inside the /edit modal: backend's
+              // /save-segments now accepts pending_review (incident
+              // 2026-05-15 — without this, text corrections made
+              // here lived only in component state and got dropped
+              // on any subsequent background re-render).
+              transcribeJobId={job.job_id}
+              onPersistSegments={async (jobId, segs) => {
+                try {
+                  await fetch(`${API}/jobs/${jobId}/save-segments`, {
+                    method: "POST",
+                    headers: {
+                      "Content-Type": "application/json",
+                      ...authHeaders(),
+                    },
+                    body: JSON.stringify({ segments: segs }),
+                  });
+                } catch (e) {
+                  // Best-effort autosave; if it fails the operator can
+                  // still click "Apply lyrics" to commit segments via
+                  // the explicit /edit?edit_type=lyrics path.
+                  // eslint-disable-next-line no-console
+                  console.warn("[EditRequestPanel] autosave failed", e);
+                }
+              }}
+              // Synchronous mirror of the editor's current segments,
+              // captured into a ref so buildPayload can include them
+              // in /edit POSTs without racing the 3 s autosave debounce.
+              onEditedChange={(segs) => { latestEditedSegments.current = segs; }}
               submitLabel={
                 submitting
                   ? (t("edit.submitting") || "Aplicando...")
