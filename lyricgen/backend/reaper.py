@@ -116,15 +116,29 @@ _OWNER_EMAIL = os.environ.get("OWNER_EMAIL", "tomas@epical.digital")
 
 
 def find_stuck_jobs(db: Session, threshold_min: int = _DEFAULT_THRESHOLD_MIN) -> list[Job]:
-    """Return jobs in processing/queued whose `created_at` is older than
-    threshold. Pending_review is intentionally excluded — those are
-    waiting on a human, not a worker."""
+    """Return jobs in processing/queued whose staleness anchor is older
+    than threshold. Pending_review is intentionally excluded — those are
+    waiting on a human, not a worker.
+
+    Staleness anchor is coalesce(last_progress_at, created_at):
+      - Worker calls update_job(progress=X) at every step; last_progress_at
+        ticks on each call. A genuine worker death stops the ticks → the
+        coalesce falls forward to a stale value and the row gets reaped.
+      - A queued row that no worker has touched yet has last_progress_at
+        NULL → coalesce falls back to created_at, preserving the original
+        "100 min in the queue is dead" guarantee.
+      - /retry resets last_progress_at = NOW(), so a retried job created
+        12 h ago is no longer insta-killed on the next reaper sweep.
+        Pre-fix incident 2026-05-15: programmatic retry of 4 omg jobs
+        from 13:45 was killed at 16:51 because the reaper still anchored
+        on created_at."""
     cutoff = datetime.now(timezone.utc) - timedelta(minutes=threshold_min)
+    anchor = func.coalesce(Job.last_progress_at, Job.created_at)
     return (
         db.query(Job)
         .filter(Job.status.in_(["processing", "queued"]))
-        .filter(Job.created_at < cutoff)
-        .order_by(Job.created_at.asc())
+        .filter(anchor < cutoff)
+        .order_by(anchor.asc())
         .all()
     )
 

@@ -5236,6 +5236,15 @@ async def retry_job(
     # que hizo 3 edits y falló queda permanentemente bloqueado de
     # re-editar tras el retry.
     job.edit_count = 0
+    # Resetear el reloj del reaper. Sin esto, un job creado hace 12 h
+    # que el usuario reintenta ahora cae inmediatamente en find_stalled_renders
+    # (last_progress_at viejo) o find_stuck_jobs (created_at viejo) y la
+    # próxima pasada del reaper lo mata otra vez. Incidente 2026-05-15:
+    # /retry programático restauró 4 omg jobs a `processing`, el reaper
+    # los killió 5 min después porque created_at era de 13:45 (>100 min).
+    # NOW() sobre last_progress_at es la fuente de verdad nueva — find_stuck_jobs
+    # ahora hace coalesce(last_progress_at, created_at) en ese mismo PR.
+    job.last_progress_at = datetime.now(timezone.utc)
 
     db.add(AuditLog(
         user_id=current_user["id"],

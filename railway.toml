@@ -104,21 +104,28 @@ restartPolicyType = "ON_FAILURE"
 restartPolicyMaxRetries = 10
 # Horizontal scale. UMG enterprise jobs run ~12-20 min each (Whisper +
 # Veo + composite + ProRes encode + ~5 GB R2 upload). With 1 replica a
-# batch of 5 UMG renders queues at ~80-100 min — the wait the operator
-# saw on 2026-05-15. 3 replicas processes 3 in parallel; agus's typical
-# batch of 5 finishes in 2 waves (~25 min) instead of 5 sequential
-# (~80 min).
+# batch of 5 UMG renders queues at ~80-100 min — the wait agus saw on
+# 2026-05-15. 7 replicas covers the typical UMG batch (5-7 songs) in a
+# single ~15-min wave, with 2 spare for concurrent /edit requests, and
+# stays well below the Whisper / Veo upstream rate ceilings.
 #
-# RAM math at current Railway plan: 24 GB total budget for the service /
-# 3 replicas = 8 GB per replica. ProRes encode peaks at ~5 GB (master +
-# short held by ffmpeg), so 8 GB gives headroom for the Python heap +
-# Whisper buffer + safety margin. Veo / ffmpeg parallelise cleanly; R2
-# multipart upload is bandwidth-bound, not CPU.
+# RAM / vCPU math on Railway Pro: budget is 1 TB RAM / 1,000 vCPU per
+# service, with each replica capped at 24 GB / 24 vCPU. ProRes encode
+# peaks at ~5 GB (ffmpeg holds master + short), so we run with the
+# default replica size — plenty of headroom for the Python heap +
+# Whisper buffer + safety margin. 7 × 24 GB = 168 GB ceiling, far
+# below the 1 TB service limit.
 #
-# To scale further (e.g. 5 replicas for a 10-song agus batch): bump
-# via Railway dashboard → Worker → Settings → Replicas. Needs the
-# Railway service RAM ceiling raised proportionally (8 GB × N). Keep
-# numReplicas here in sync — the dashboard value is a runtime override,
-# but the next deploy reads this file as source of truth and would
-# revert to the lower count.
-numReplicas = 3
+# Upstream rate-limit ceiling (the real bottleneck above ~10 replicas):
+#   - OpenAI Whisper: ~50 req/min on current tier — 7 parallel workers
+#     × ~3 req/job = peak ~21 req/min, safe.
+#   - Veo 3: per-project quota; observed degradation past 10 concurrent.
+#   - Gemini: 60 req/min standard tier.
+# Past 10 replicas, jobs will 429 in cascade and the whisper-retry
+# logic in pipeline.py (#145/#146) eats the slack but only buys
+# minutes. To go higher, raise the OpenAI tier first.
+#
+# Keep `numReplicas` here in sync with the dashboard — Railway treats
+# the file as source of truth and the next deploy would revert a
+# dashboard-only bump back to this value.
+numReplicas = 7
