@@ -3135,9 +3135,21 @@ async def _run_transcription_for_job(
                             except OSError:
                                 pass
 
+                # When LRCLIB_PLAIN_ALIGNER_ENABLED, request word-level
+                # timestamps so we can re-bucket Whisper's output against
+                # LRCLib's curated line structure (see aligner pass below).
+                # Default off — flip via env for staged rollout.
+                aligner_enabled = (
+                    os.environ.get("LRCLIB_PLAIN_ALIGNER_ENABLED", "0")
+                    .strip().lower() in ("1", "true", "yes", "on", "y", "t")
+                )
                 try:
                     segments = await loop.run_in_executor(
-                        None, transcribe, transcribe_path, lang, plain,
+                        None,
+                        lambda: transcribe(
+                            transcribe_path, lang, plain,
+                            return_words=aligner_enabled,
+                        ),
                     )
                 finally:
                     if trimmed_path:
@@ -3148,13 +3160,71 @@ async def _run_transcription_for_job(
 
                 # Shift body-Whisper timestamps back into full-audio
                 # frame so the song subtitles appear at the right moment.
+                # Shift `words` together with segment times — the aligner
+                # below reads from them.
                 if intro_offset > 0:
-                    segments = [
-                        {**s,
-                         "start": float(s["start"]) + intro_offset,
-                         "end":   float(s["end"])   + intro_offset}
-                        for s in segments
-                    ]
+                    def _shift(s):
+                        out = {**s,
+                               "start": float(s["start"]) + intro_offset,
+                               "end":   float(s["end"])   + intro_offset}
+                        if "words" in s:
+                            out["words"] = [
+                                {**w,
+                                 "start": float(w["start"]) + intro_offset,
+                                 "end":   float(w["end"])   + intro_offset}
+                                for w in s["words"]
+                            ]
+                        return out
+                    segments = [_shift(s) for s in segments]
+
+                # LRCLib-plain aligner: re-bucket Whisper words against
+                # LRCLib's human-curated line structure. The renderer
+                # otherwise uses Whisper's segmentation, which merges
+                # short adjacent lines and splits long ones differently
+                # than LRCLib — producing karaoke where one subtitle
+                # covers two musical phrases or vice versa. The aligner
+                # keeps LRCLib's line boundaries and pulls timing from
+                # the first/last word in each matched span.
+                #
+                # Falls through to raw Whisper segments when:
+                #   - the env flag is off (default)
+                #   - the aligner couldn't match enough lines (< 50%
+                #     coverage) — usually means Whisper missed most of
+                #     the song, in which case downstream hallucination
+                #     recovery is the better fallback.
+                if aligner_enabled:
+                    try:
+                        from lrclib_aligner import align_lrclib_to_whisper
+                        plain_lines_count = sum(
+                            1 for ln in plain.splitlines() if ln.strip()
+                        )
+                        aligned = align_lrclib_to_whisper(plain, segments)
+                        coverage = (
+                            len(aligned) / plain_lines_count
+                            if plain_lines_count else 0.0
+                        )
+                        if coverage >= 0.5 and len(aligned) >= 8:
+                            print(f"[LYRICS] aligner: {len(aligned)}/"
+                                  f"{plain_lines_count} LRCLib lines aligned "
+                                  f"({coverage*100:.0f}% coverage) — "
+                                  f"replacing Whisper segmentation")
+                            segments = [
+                                {"start": a["start"],
+                                 "end": a["end"],
+                                 "text": a["text"]}
+                                for a in aligned
+                            ]
+                        else:
+                            print(f"[LYRICS] aligner: low coverage "
+                                  f"({len(aligned)}/{plain_lines_count} = "
+                                  f"{coverage*100:.0f}%) — keeping raw "
+                                  f"Whisper segments and falling through to "
+                                  f"hallucination recovery")
+                    except Exception as e:
+                        # Opt-in and conservative: any aligner failure
+                        # must NOT break the existing pipeline.
+                        print(f"[LYRICS] aligner error: {e!r} — keeping "
+                              f"raw Whisper segments")
 
                 # Auto-recover: when Whisper still hallucinates after the
                 # trim (instrumental-passage mega-segments, synonym loops,
