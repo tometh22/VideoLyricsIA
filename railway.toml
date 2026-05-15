@@ -104,16 +104,21 @@ restartPolicyType = "ON_FAILURE"
 restartPolicyMaxRetries = 10
 # Horizontal scale. UMG enterprise jobs run ~12-20 min each (Whisper +
 # Veo + composite + ProRes encode + ~5 GB R2 upload). With 1 replica a
-# batch of 5 UMG renders queues at ~80-100 min, which is the operator-
-# facing wait. 2 replicas halves that for the common case (one tenant
-# submitting a batch) without doubling peak RAM — Veo / ffmpeg are
-# parallelisable, the R2 multipart upload is bandwidth-bound not CPU,
-# and the worker's resident set stays ~1-1.5 GB outside the ProRes
-# encode peak (which only one of two replicas would hit at a time in
-# practice given enqueue cadence).
+# batch of 5 UMG renders queues at ~80-100 min — the wait the operator
+# saw on 2026-05-15. 3 replicas processes 3 in parallel; agus's typical
+# batch of 5 finishes in 2 waves (~25 min) instead of 5 sequential
+# (~80 min).
 #
-# Why not 3+: peak combined memory across replicas can hit Railway's
-# per-service RAM ceiling during simultaneous ProRes encodes (5 GB
-# master + 600 MB short held in memory by ffmpeg). 2 is the sweet
-# spot for the current job mix; bump via dashboard for a one-off batch.
-numReplicas = 2
+# RAM math at current Railway plan: 24 GB total budget for the service /
+# 3 replicas = 8 GB per replica. ProRes encode peaks at ~5 GB (master +
+# short held by ffmpeg), so 8 GB gives headroom for the Python heap +
+# Whisper buffer + safety margin. Veo / ffmpeg parallelise cleanly; R2
+# multipart upload is bandwidth-bound, not CPU.
+#
+# To scale further (e.g. 5 replicas for a 10-song agus batch): bump
+# via Railway dashboard → Worker → Settings → Replicas. Needs the
+# Railway service RAM ceiling raised proportionally (8 GB × N). Keep
+# numReplicas here in sync — the dashboard value is a runtime override,
+# but the next deploy reads this file as source of truth and would
+# revert to the lower count.
+numReplicas = 3

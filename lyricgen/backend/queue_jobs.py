@@ -91,11 +91,50 @@ def _init_redis():
         return None, None, None
 
 
-def _pick_queue(plan: str):
-    """Enterprise queue for premium plans, default otherwise."""
+# Tenant IDs that always route to the enterprise queue regardless of
+# the operator's stated `plan`. These are the B2B customers whose
+# batches are time-sensitive (UMG release schedules, OMG delivery
+# windows) — they should never queue behind a free-tier user.
+#
+# Override via env (`ENTERPRISE_TENANTS=umg,omg,acme`). Comma-separated,
+# case-insensitive. Default covers the two tenants paying right now.
+#
+# Why this lives next to _pick_queue and not in a tenants.py file: it
+# changes the routing of every enqueue path (generate, edit, prewarm,
+# variant). Co-locating the policy with the function that consumes it
+# makes the precedence rules visible at the call site.
+_ENTERPRISE_TENANTS = frozenset(
+    t.strip().lower()
+    for t in os.environ.get("ENTERPRISE_TENANTS", "umg,omg").split(",")
+    if t.strip()
+)
+
+
+def _pick_queue(plan: str, tenant_id: str = ""):
+    """Enterprise queue for premium plans OR B2B tenants, default otherwise.
+
+    Precedence (highest first):
+      1. tenant_id matches `_ENTERPRISE_TENANTS` — UMG/OMG always jump
+         the default queue even on plan="100". 2026-05-15 incident:
+         agus.cafisi (omg) batch of 5 songs was queuing behind tomas's
+         single-user work because both were on default queue.
+      2. plan == "unlimited" or "enterprise" — legacy SaaS path; kept
+         so a non-B2B tenant on an "enterprise" plan still gets fast
+         lane.
+      3. Everything else lands on default.
+
+    Workers listen to enterprise first then default, so an enterprise
+    job always pre-empts a default job at the worker-pickup point.
+    Higher tenant priority within a single queue is RQ's natural FIFO,
+    so a fresh enterprise enqueue still waits for the current
+    enterprise job to finish — but never for a default-queue job.
+    """
     _, q_default, q_enterprise = _init_redis()
     if q_default is None:
         return None
+    tid = (tenant_id or "").strip().lower()
+    if tid and tid in _ENTERPRISE_TENANTS:
+        return q_enterprise
     if plan in ("unlimited", "enterprise"):
         return q_enterprise
     return q_default
@@ -231,11 +270,12 @@ def enqueue_pipeline(
     artist: str,
     style: str,
     plan: str = "100",
+    tenant_id: str = "",
     **kwargs,
 ) -> str:
     """Enqueue a run_pipeline job. Returns RQ job id (or 'thread:<job_id>' in
     the Redis-less fallback path)."""
-    q = _pick_queue(plan)
+    q = _pick_queue(plan, tenant_id=tenant_id)
     if q is not None:
         from rq import Retry
         from pipeline import run_pipeline
@@ -353,6 +393,7 @@ def enqueue_edit(
     edit_type: str,
     edit_params: dict,
     plan: str = "100",
+    tenant_id: str = "",
 ) -> str:
     """Enqueue a run_edit_pipeline job (partial re-render).
 
@@ -367,7 +408,7 @@ def enqueue_edit(
     too tight for long songs; we now match the main pipeline's
     YouTube-only allowance to keep the worst-case edit alive.
     """
-    q = _pick_queue(plan)
+    q = _pick_queue(plan, tenant_id=tenant_id)
     if q is not None:
         from pipeline import run_edit_pipeline
         rq_job = q.enqueue(

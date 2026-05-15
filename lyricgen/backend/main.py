@@ -2720,6 +2720,7 @@ async def upload(
         artist=artist,
         style=style,
         plan=current_user.get("plan", "100"),
+        tenant_id=current_user.get("tenant_id", ""),
         language=lang,
         delivery_profile=delivery_profile,
         umg_spec=umg_spec,
@@ -3623,6 +3624,7 @@ async def generate_with_segments(
         artist=artist,
         style=style,
         plan=current_user.get("plan", "100"),
+        tenant_id=current_user.get("tenant_id", ""),
         segments_override=segments,
         delivery_profile=delivery_profile,
         umg_spec=umg_spec,
@@ -4904,6 +4906,7 @@ async def request_edit(
         edit_type=body.edit_type,
         edit_params=edit_params,
         plan=current_user.get("plan", "100"),
+        tenant_id=current_user.get("tenant_id", ""),
     )
 
     return {
@@ -5256,6 +5259,7 @@ async def retry_job(
         artist=job.artist,
         style=job.style or "oscuro",
         plan=current_user.get("plan", "100"),
+        tenant_id=current_user.get("tenant_id", ""),
         delivery_profile=job.delivery_profile or "youtube",
         input_r2_key=job.input_r2_key,
         song_title=job.song_title or "",
@@ -5453,6 +5457,7 @@ async def create_variant(
         artist=parent.artist,
         style=new_style,
         plan=plan,
+        tenant_id=current_user.get("tenant_id", ""),
         **pipeline_kwargs,
     )
 
