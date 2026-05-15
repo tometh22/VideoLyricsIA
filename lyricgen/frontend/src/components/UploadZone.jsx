@@ -125,8 +125,6 @@ export default function UploadZone({
   onAnimateImage,
   inspiredByLyrics = true,
   onInspiredByLyricsChange,
-  autoTrimLyrics = true,
-  onAutoTrimLyricsChange,
   allHaveArtist = false,
   onStartReview,
   onGenerateDirect,
@@ -1531,33 +1529,6 @@ export default function UploadZone({
                   <p className="text-[10px] uppercase tracking-[0.18em] text-gray-500">{t("upload.inspired_by_lyrics_label") || "Inspirado en la letra"}</p>
                   <p className="text-[11px] text-gray-600 mt-0.5">
                     {t("upload.inspired_by_lyrics_hint") || "Cuando está activo, el fondo se construye alrededor de lo que dice la canción. Apagalo para escenas más genéricas según el género."}
-                  </p>
-                </div>
-              </label>
-            )}
-
-            {/* 1.6 Auto-trim lyrics toggle.
-                LRCLib gives every lyric line an `end` equal to the start of
-                the NEXT line — instrumental fills / solos / outros leave the
-                text pinned for tens of seconds. When ON (default), the
-                pipeline shortens each segment to the estimated voice-end
-                based on text length. Operator can override per-line in the
-                editor afterward. */}
-            {onAutoTrimLyricsChange && (
-              <label className="rounded-card bg-surface-2/40 ring-1 ring-white/[0.04] px-4 py-3 flex items-center gap-3 cursor-pointer hover:ring-white/[0.08] transition-colors">
-                <input
-                  type="checkbox"
-                  checked={!!autoTrimLyrics}
-                  onChange={(e) => onAutoTrimLyricsChange(e.target.checked)}
-                  className="peer sr-only"
-                />
-                <div className="relative w-9 h-5 rounded-full bg-surface-3 peer-checked:bg-brand transition-colors duration-200 shrink-0">
-                  <div className="absolute top-0.5 left-0.5 w-4 h-4 rounded-full bg-white shadow transition-transform duration-200 peer-checked:translate-x-4" />
-                </div>
-                <div className="flex-1 min-w-0">
-                  <p className="text-[10px] uppercase tracking-[0.18em] text-gray-500">{t("upload.auto_trim_lyrics_label") || "Recortar texto colgado"}</p>
-                  <p className="text-[11px] text-gray-600 mt-0.5">
-                    {t("upload.auto_trim_lyrics_hint") || "Cuando hay un silencio largo entre líneas (solos, fills, outros), recorta el texto cuando termina la voz en vez de dejarlo en pantalla hasta la próxima línea."}
                   </p>
                 </div>
               </label>
