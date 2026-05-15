@@ -2720,6 +2720,7 @@ async def upload(
         artist=artist,
         style=style,
         plan=current_user.get("plan", "100"),
+        tenant_id=current_user.get("tenant_id", ""),
         language=lang,
         delivery_profile=delivery_profile,
         umg_spec=umg_spec,
@@ -3623,6 +3624,7 @@ async def generate_with_segments(
         artist=artist,
         style=style,
         plan=current_user.get("plan", "100"),
+        tenant_id=current_user.get("tenant_id", ""),
         segments_override=segments,
         delivery_profile=delivery_profile,
         umg_spec=umg_spec,
@@ -4904,6 +4906,7 @@ async def request_edit(
         edit_type=body.edit_type,
         edit_params=edit_params,
         plan=current_user.get("plan", "100"),
+        tenant_id=current_user.get("tenant_id", ""),
     )
 
     return {
@@ -5233,6 +5236,15 @@ async def retry_job(
     # que hizo 3 edits y falló queda permanentemente bloqueado de
     # re-editar tras el retry.
     job.edit_count = 0
+    # Resetear el reloj del reaper. Sin esto, un job creado hace 12 h
+    # que el usuario reintenta ahora cae inmediatamente en find_stalled_renders
+    # (last_progress_at viejo) o find_stuck_jobs (created_at viejo) y la
+    # próxima pasada del reaper lo mata otra vez. Incidente 2026-05-15:
+    # /retry programático restauró 4 omg jobs a `processing`, el reaper
+    # los killió 5 min después porque created_at era de 13:45 (>100 min).
+    # NOW() sobre last_progress_at es la fuente de verdad nueva — find_stuck_jobs
+    # ahora hace coalesce(last_progress_at, created_at) en ese mismo PR.
+    job.last_progress_at = datetime.now(timezone.utc)
 
     db.add(AuditLog(
         user_id=current_user["id"],
@@ -5256,6 +5268,7 @@ async def retry_job(
         artist=job.artist,
         style=job.style or "oscuro",
         plan=current_user.get("plan", "100"),
+        tenant_id=current_user.get("tenant_id", ""),
         delivery_profile=job.delivery_profile or "youtube",
         input_r2_key=job.input_r2_key,
         song_title=job.song_title or "",
@@ -5453,6 +5466,7 @@ async def create_variant(
         artist=parent.artist,
         style=new_style,
         plan=plan,
+        tenant_id=current_user.get("tenant_id", ""),
         **pipeline_kwargs,
     )
 

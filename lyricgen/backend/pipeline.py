@@ -1236,39 +1236,121 @@ def _transcribe_via_openai_api(mp3_path: str, language: str | None = None,
             prompt=prompt_text[:500],
             input_data_types=["audio_file"],
         )
+    # Retry loop with exponential backoff + jitter for transient failures
+    # (rate-limits, connection drops). Before this loop, a single 429 from
+    # OpenAI bubbled straight to the user as 503 with no retry — the message
+    # claimed "Reintentamos en unos segundos" but actually didn't.
+    # Incident 2026-05-14: Agus + admin transcribiendo en paralelo →
+    # cascade 503. Now: 5 attempts over ~30s before surrendering.
+    from fastapi import HTTPException
     try:
-        with open(api_path, "rb") as f:
-            kwargs["file"] = f
-            response = client.audio.transcriptions.create(**kwargs)
-    except Exception as exc:
-        # Translate OpenAI errors into HTTPExceptions that the existing
-        # review-error UI can show with the retry button. Without this,
-        # they bubble up as generic 500s with a stack trace and the user
-        # sees "Sin respuesta del servidor".
-        # Imports inline so the module loads even if openai isn't installed
-        # in dev environments running the local Whisper path.
-        from fastapi import HTTPException
-        try:
-            from openai import RateLimitError, APIConnectionError, APIError
-        except ImportError:
-            RateLimitError = APIConnectionError = APIError = ()
-        if isinstance(exc, RateLimitError):
-            raise HTTPException(
-                status_code=503,
-                detail="Servicio de transcripción ocupado. Reintentamos en unos segundos.",
-                headers={"Retry-After": "10"},
-            ) from exc
-        if isinstance(exc, APIConnectionError):
-            raise HTTPException(
-                status_code=502,
-                detail="No pudimos contactar el servicio de transcripción. Reintentá en unos segundos.",
-            ) from exc
-        if isinstance(exc, APIError):
-            raise HTTPException(
-                status_code=502,
-                detail=f"Servicio de transcripción no disponible: {exc!s}",
-            ) from exc
-        raise
+        from openai import RateLimitError, APIConnectionError, APIError
+    except ImportError:
+        RateLimitError = APIConnectionError = APIError = ()
+
+    import random
+    import time as _time_retry
+    _MAX_RETRIES = int(os.environ.get("WHISPER_MAX_RETRIES", "5"))
+    response = None
+    last_exc = None
+    try:
+        for attempt in range(_MAX_RETRIES):
+            try:
+                with open(api_path, "rb") as f:
+                    kwargs["file"] = f
+                    response = client.audio.transcriptions.create(**kwargs)
+                if attempt > 0:
+                    print(f"[WHISPER-API] succeeded on attempt {attempt + 1}/{_MAX_RETRIES}")
+                break
+            except Exception as exc:
+                last_exc = exc
+                # OpenAI SDK raises RateLimitError for BOTH transient
+                # rate-limits AND persistent quota exhaustion (insufficient_quota,
+                # account billing issues). The two have different `code` strings
+                # inside the error body — retrying insufficient_quota wastes
+                # ~32s and gives the user a delayed error instead of an instant
+                # actionable message. Incident 2026-05-14: balance hit $0,
+                # users saw 30s+ retries that all failed. Detect & bail fast.
+                if isinstance(exc, RateLimitError):
+                    quota_keywords = (
+                        "insufficient_quota",
+                        "exceeded your current quota",
+                        "billing",
+                        "payment",
+                    )
+                    msg_lower = str(exc).lower()
+                    is_quota_exhaustion = any(k in msg_lower for k in quota_keywords)
+                    if is_quota_exhaustion:
+                        print(
+                            f"[WHISPER-API][⚠ INSUFFICIENT_QUOTA] OpenAI rejected with "
+                            f"quota/billing error: {exc!s}; NOT retrying. "
+                            f"Recargá créditos en https://platform.openai.com/settings/organization/billing"
+                        )
+                        # Bail immediately — no retry helps a quota issue.
+                        break
+                # Retryable transients: rate-limit + connection drops.
+                if isinstance(exc, (RateLimitError, APIConnectionError)):
+                    if attempt < _MAX_RETRIES - 1:
+                        # 2^attempt + jitter: 1-2s, 2-3s, 4-5s, 8-9s, 16-17s
+                        sleep_s = (2 ** attempt) + random.uniform(0, 1)
+                        kind = "rate-limit" if isinstance(exc, RateLimitError) else "connection"
+                        print(
+                            f"[WHISPER-API] transient {kind} error on attempt "
+                            f"{attempt + 1}/{_MAX_RETRIES}: {exc!s}; "
+                            f"sleeping {sleep_s:.1f}s then retrying"
+                        )
+                        _time_retry.sleep(sleep_s)
+                        continue
+                    # Last attempt failed — fall through to raise below.
+                # Non-retryable (APIError, OSError, etc.) — bail immediately.
+                break
+        else:
+            # for/else: only reached if loop completed without break (shouldn't happen)
+            pass
+
+        if response is None:
+            # Translate the final exception to HTTPException for the UI.
+            if isinstance(last_exc, RateLimitError):
+                quota_keywords = (
+                    "insufficient_quota",
+                    "exceeded your current quota",
+                    "billing",
+                    "payment",
+                )
+                msg_lower = str(last_exc).lower()
+                if any(k in msg_lower for k in quota_keywords):
+                    # Quota exhaustion — different message, NO Retry-After
+                    # (the frontend retry would just hit the same wall).
+                    # Status 503 stays so the frontend's error handling treats
+                    # it as a server-side issue, but no auto-retry kicks in.
+                    raise HTTPException(
+                        status_code=503,
+                        detail=(
+                            "Servicio AI temporalmente sin cuota. "
+                            "El administrador fue notificado."
+                        ),
+                    ) from last_exc
+                raise HTTPException(
+                    status_code=503,
+                    detail=(
+                        f"Servicio de transcripción saturado tras {_MAX_RETRIES} reintentos. "
+                        "Reintentá en un minuto."
+                    ),
+                    headers={"Retry-After": "60"},
+                ) from last_exc
+            if isinstance(last_exc, APIConnectionError):
+                raise HTTPException(
+                    status_code=502,
+                    detail="No pudimos contactar el servicio de transcripción. Reintentá en unos segundos.",
+                ) from last_exc
+            if isinstance(last_exc, APIError):
+                raise HTTPException(
+                    status_code=502,
+                    detail=f"Servicio de transcripción no disponible: {last_exc!s}",
+                ) from last_exc
+            # Unknown exception type — re-raise the original.
+            if last_exc is not None:
+                raise last_exc
     finally:
         if cleanup_compressed:
             try:
