@@ -2008,7 +2008,8 @@ def _lrc_to_segments(lrc: str, audio_duration: float | None = None,
 
 
 def _detect_hallucination(segments: list[dict],
-                           audio_duration: float | None) -> tuple[bool, str]:
+                           audio_duration: float | None,
+                           language: str | None = None) -> tuple[bool, str]:
     """Whisper hallucination smoke test. Returns (is_hallucinated, reason).
 
     Three independent signals trigger; ANY one is enough:
@@ -2022,6 +2023,17 @@ def _detect_hallucination(segments: list[dict],
     The detector is the GATE for the auto-recover branch: when this fires
     AND the caller has lrclib plain lyrics, we replace Whisper's output
     with synthesized segments (see `_synthesize_segments_from_plain`).
+
+    `language` is the ISO code the caller passed to Whisper (or None when
+    auto-detected). Spanish songs typically pack lines with longer pauses
+    between (instrumental fills, sustained vocals) and produce 6-7
+    segments per minute legitimately; English at 8/min was an empirically
+    valid floor for an English-tuned threshold and is too strict for
+    Spanish — audited 2026-05-15 on Noches Sin Sueño (Rata Blanca):
+    Whisper with language='es' returned 23 segments in 371s of audio
+    (= 3.7/min), legitimately good text + timing, but the old floor of
+    max(8, 4*minutes) = max(8, 24) = 24 flagged it as hallucinated and
+    pushed it into the synthesizer path with bad timestamps.
     """
     if not segments:
         return True, "empty segment list"
@@ -2029,10 +2041,17 @@ def _detect_hallucination(segments: list[dict],
     # Signal 1 — segment count vs audio duration.
     if audio_duration and audio_duration > 30:
         minutes = audio_duration / 60.0
-        floor = max(8, int(minutes * 4))
+        is_spanish = (language or "").lower().startswith("es")
+        if is_spanish:
+            # Empirically validated 2026-05-15 — Spanish songs naturally
+            # sit at 3-4 segs/min, not 4+.
+            floor = max(6, int(minutes * 3.5))
+        else:
+            floor = max(8, int(minutes * 4))
         if len(segments) < floor:
             return True, (f"low count: {len(segments)} segments for "
-                          f"{audio_duration:.0f}s audio (floor={floor})")
+                          f"{audio_duration:.0f}s audio (floor={floor}, "
+                          f"lang={language or 'auto'})")
 
     # Signal 2 — instrumental-passage mega-segment.
     for s in segments:
