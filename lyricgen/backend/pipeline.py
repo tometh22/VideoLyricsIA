@@ -4306,10 +4306,17 @@ def _ensure_background(style_hint: str, job_dir: str, lyrics_text: str = None,
             if score < 7 and not quality_retry_used:
                 quality_retry_used = True
                 print(f"[BG] Score {score} < 7 — generating new prompt and retrying VEO")
+                # Propagate background_hint into the quality retry. Without it,
+                # Gemini regenerates from lyrics/genre alone and the operator's
+                # explicit guidance is silently dropped — the same input that
+                # produced a low-score first attempt is more likely to drift to
+                # something unrelated (Enanitos Verdes "Amigos" 2026-05-15:
+                # hint "fogón con bosque" → retry picked an iceberg scene).
                 result = _get_unique_prompt(
                     lyrics_text, artist, job_id=job_id, song_title=song_title,
                     genre=genre, concept=concept, movement_style=movement_style,
                     match_lyrics=match_lyrics,
+                    background_hint=background_hint,
                 )
                 prompt = result["prompt"]
                 continue
