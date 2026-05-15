@@ -156,6 +156,75 @@ def pipeline_failure_callback(job, connection, type_, value, traceback) -> None:
         logger.warning("pipeline_failure_callback failed: %s", e)
 
 
+def cancel_rq_job(job_id: str) -> bool:
+    """Delete a job from RQ entirely. Returns True if a job was removed.
+
+    Closes the reaper-vs-RQ desync where the reaper marks a row as
+    `error` in Postgres but the RQ entry stays alive — on the next
+    worker restart, RQ's Retry / cleanup_ghosts path resurrects the
+    job and the worker burns 20 min re-processing a row that is
+    already terminal. The worker's pipeline-end update is then
+    refused by jobs.update_job's terminal-state guard, silently
+    discarding the result.
+
+    Strategy: remove from every registry that could re-enqueue it.
+    - StartedJobRegistry: jobs claimed by a worker that died.
+    - FailedJobRegistry: jobs RQ already marked failed; deleting
+      prevents an operator-triggered RQ requeue from picking them up.
+    - DeferredJobRegistry / ScheduledJobRegistry: jobs waiting on a
+      retry timer (PIPELINE_RETRY_INTERVAL_S backoff).
+    - The queue itself: pending jobs not yet picked.
+    - Job.delete(): the canonical RQ hash + dependency links.
+
+    Best-effort: any failure is logged and swallowed. Reaper still
+    completes its DB updates — RQ leftovers are a recoverable mess,
+    a crashing reaper is not.
+    """
+    if not job_id:
+        return False
+    r, q_default, q_enterprise = _init_redis()
+    if r is None:
+        return False
+    try:
+        from rq.job import Job as RqJob
+        from rq.exceptions import NoSuchJobError
+    except Exception as e:  # pragma: no cover
+        logger.warning("RQ import failed in cancel_rq_job: %s", e)
+        return False
+    try:
+        rq_job = RqJob.fetch(job_id, connection=r)
+    except NoSuchJobError:
+        return False
+    except Exception as e:  # pragma: no cover
+        logger.warning("RQ fetch failed for %s: %s", job_id, e)
+        return False
+    try:
+        from rq.registry import (
+            StartedJobRegistry, FailedJobRegistry,
+            DeferredJobRegistry, ScheduledJobRegistry,
+        )
+        for q in (q_default, q_enterprise):
+            if q is None:
+                continue
+            try:
+                q.remove(job_id)
+            except Exception:
+                pass
+            for reg_cls in (StartedJobRegistry, FailedJobRegistry,
+                            DeferredJobRegistry, ScheduledJobRegistry):
+                try:
+                    reg_cls(queue=q).remove(job_id, delete_job=False)
+                except Exception:
+                    pass
+    except Exception as e:  # pragma: no cover
+        logger.warning("RQ registry cleanup failed for %s: %s", job_id, e)
+    try:
+        rq_job.delete()
+    except Exception as e:  # pragma: no cover
+        logger.warning("RQ Job.delete failed for %s: %s", job_id, e)
+    return True
+
+
 def enqueue_pipeline(
     job_id: str,
     mp3_path: str,

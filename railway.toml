@@ -23,7 +23,13 @@
 #      Hobby plan does the "kill-then-spawn" sequence regardless of
 #      this file.
 #   2. `RAILWAY_SHUTDOWN_TIMEOUT_SECONDS` env var is set to **1200** (20
-#      min) on the Worker service. This is the SIGTERM→SIGKILL grace
+#      min) on the Worker service.
+#      ⚠️ 2026-05-15 INCIDENT: this var is NOT set on staging. Railway's
+#      default 30 s SIGTERM→SIGKILL window killed in-flight UMG renders
+#      on every deploy today. Apply manually via Railway dashboard →
+#      Worker service → Variables before merging this PR, OR a deploy
+#      will repeat the same outage. (railway.toml cannot set platform
+#      env vars; this has to be a dashboard step.) This is the SIGTERM→SIGKILL grace
 #      period; RQ workers honor SIGTERM by finishing the current job
 #      (worker.py:_graceful), but Railway's default grace is 30 s which
 #      cuts a Veo poll in half. A background edit can take ~15 min end-
@@ -96,3 +102,18 @@ healthcheckTimeout = 90
 [services.Worker.deploy]
 restartPolicyType = "ON_FAILURE"
 restartPolicyMaxRetries = 10
+# Horizontal scale. UMG enterprise jobs run ~12-20 min each (Whisper +
+# Veo + composite + ProRes encode + ~5 GB R2 upload). With 1 replica a
+# batch of 5 UMG renders queues at ~80-100 min, which is the operator-
+# facing wait. 2 replicas halves that for the common case (one tenant
+# submitting a batch) without doubling peak RAM — Veo / ffmpeg are
+# parallelisable, the R2 multipart upload is bandwidth-bound not CPU,
+# and the worker's resident set stays ~1-1.5 GB outside the ProRes
+# encode peak (which only one of two replicas would hit at a time in
+# practice given enqueue cadence).
+#
+# Why not 3+: peak combined memory across replicas can hit Railway's
+# per-service RAM ceiling during simultaneous ProRes encodes (5 GB
+# master + 600 MB short held in memory by ffmpeg). 2 is the sweet
+# spot for the current job mix; bump via dashboard for a one-off batch.
+numReplicas = 2

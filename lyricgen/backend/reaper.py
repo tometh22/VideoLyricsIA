@@ -280,7 +280,15 @@ def revert_abandoned_edit(db: Session, job: Job) -> None:
     were written). Decrement edit_count so the failed attempt doesn't
     burn one of the operator's 3 allowed edits — Railway's fault, not
     theirs. Caller commits.
+
+    Also cancels the RQ entry so a worker restart can't resurrect the
+    half-finished edit and silently overwrite the user's good video.
     """
+    try:
+        from queue_jobs import cancel_rq_job
+        cancel_rq_job(job.job_id)
+    except Exception as e:  # pragma: no cover
+        logger.warning("cancel_rq_job (edit) failed for %s: %s", job.job_id, e)
     prev_edit_count = job.edit_count or 0
     new_edit_count = max(0, prev_edit_count - 1)
     age = 0.0
@@ -419,7 +427,25 @@ def _delete_abandoned_upload(db: Session, job: Job) -> None:
 
 
 def reap_stuck_job(db: Session, job: Job, reason: str) -> None:
-    """Flip the row to error and log it. Caller commits."""
+    """Flip the row to error, cancel the RQ job, and log it. Caller commits.
+
+    Cancelling the RQ entry is critical: without it, RQ's Retry / cleanup
+    path resurrects the abandoned job on the next worker boot. The worker
+    then re-runs the pipeline against a row already marked `error`, and
+    `jobs.update_job`'s terminal-state guard silently discards the result
+    at the end — 20 min of compute thrown away while the user keeps seeing
+    the "Worker abandonó el job" message.
+
+    Incident 2026-05-15: 4 omg jobs got reaped, then resurrected by RQ on
+    the next worker restart, re-processed silently, and ended in the same
+    `error` state. Fixing the desync here closes the loop.
+    """
+    rq_removed = False
+    try:
+        from queue_jobs import cancel_rq_job
+        rq_removed = cancel_rq_job(job.job_id)
+    except Exception as e:  # pragma: no cover
+        logger.warning("cancel_rq_job failed for %s: %s", job.job_id, e)
     job.status = _REAPED_STATUS
     job.error = reason
     job.completed_at = datetime.now(timezone.utc)
@@ -435,6 +461,7 @@ def reap_stuck_job(db: Session, job: Job, reason: str) -> None:
             "progress": job.progress,
             "age_minutes": round(_age_minutes(job), 1),
             "reason": reason,
+            "rq_removed": rq_removed,
         },
     ))
 
