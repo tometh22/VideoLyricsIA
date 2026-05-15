@@ -1548,11 +1548,19 @@ def transcribe(mp3_path: str, language: str = None,
                         continue
                     words = seg.get("words", [])
                     if words:
-                        segments3.append({"start": words[0]["start"],
-                                          "end": words[-1]["end"], "text": text})
+                        out_seg = {"start": words[0]["start"],
+                                   "end": words[-1]["end"], "text": text}
                     else:
-                        segments3.append({"start": seg["start"],
-                                          "end": seg["end"], "text": text})
+                        out_seg = {"start": seg["start"],
+                                   "end": seg["end"], "text": text}
+                    if return_words and words:
+                        out_seg["words"] = [
+                            {"word": (w.get("word") or "").strip(),
+                             "start": float(w.get("start", out_seg["start"])),
+                             "end": float(w.get("end", out_seg["end"]))}
+                            for w in words if (w.get("word") or "").strip()
+                        ]
+                    segments3.append(out_seg)
                 if len(segments3) > len(segments):
                     print(f"[WHISPER] large-v3 produced {len(segments3)} "
                           f"segments (turbo: {len(segments)}); using large-v3")
@@ -3066,7 +3074,7 @@ def _get_genai_client():
     return _genai_client
 
 # Combinatorial prompt system — elements combine to create unique prompts.
-# 22 scenes x 12 palettes x 10 cameras x 8 conditions = 21,120 combinations
+# 21 scenes x 12 palettes x 10 cameras x 8 conditions = 20,160 combinations
 _BG_SCENES = [
     "calm ocean waves on a sandy beach",
     "northern lights aurora over a mountain lake",
@@ -3087,7 +3095,6 @@ _BG_SCENES = [
     "stars and milky way rotating over a landscape",
     "tropical waterfall cascading into a lagoon",
     "wildflowers swaying in a meadow breeze",
-    "icebergs floating in arctic blue water",
     "hot air balloon shadows over green countryside",
     "lightning illuminating storm clouds from within",
 ]
@@ -3343,7 +3350,12 @@ def _analyze_lyrics_for_background(lyrics_text: str, artist: str, job_id: str = 
         "specific texture or material detail. Be precise and cinematic — avoid vague "
         "adjectives like \"beautiful\" or \"amazing\".\n"
         "- Pick a DIFFERENT specific scene each time (don't repeat across songs)\n"
-        "- Never include people, faces, hands, or readable text in the scene"
+        "- Never include people, faces, hands, or readable text in the scene\n"
+        "- When a concept and lyrics are both present, the LYRICS dictate the "
+        "subject of the scene and the CONCEPT dictates its visual styling "
+        "(palette, texture, atmosphere, register). Concept never replaces or "
+        "contradicts the literal subject of the lyrics unless match_lyrics is "
+        "explicitly disabled."
     )
     # 3 contrastive examples (rock/urban, romantic ballad, acoustic) + an
     # explicit "do not copy verbatim" disclaimer. Replaces the prior
@@ -3387,27 +3399,45 @@ explicitly. When in doubt, prefer warm/natural over urban/industrial."""
                       f"{normalized_genre.upper()}.") if normalized_genre else ""
 
         if match_lyrics:
-            # "Inspirado en la letra": concept sets the visual register,
-            # lyrics theme infuses the specific execution within it.
+            # "Inspirado en la letra" + concept: LYRICS anchor the scene's
+            # subject; the concept controls the visual styling (palette,
+            # texture, atmosphere, register). Inverted from the prior
+            # "concept binding" model because the lyrics are the product's
+            # unique asset — no other generative video tool has them. When
+            # the operator opts in to "Inspirado en la letra" they want
+            # the song's literal imagery to drive the scene, with the
+            # concept selector acting as the aesthetic filter. Strict
+            # concept-only mode lives in the `else` branch below
+            # (match_lyrics=False) for the cases where the operator wants
+            # to suppress the literal subject (covers, instrumentals,
+            # ironic juxtaposition).
             system_prompt = f"""{_EXAMPLE}
 
-The operator has chosen the visual register: {normalized_concept.upper()}.
-The scene MUST stay within this concept's visual vocabulary:
+The operator has chosen the visual STYLING register: {normalized_concept.upper()}.
+The concept's vocabulary controls palette, texture, atmosphere, and aesthetic register:
 {concept_guide}{genre_hint}
 
-STEP 0 — Read the lyrics and identify the SOUL of the song: its core theme, emotion, or story (e.g., football passion, longing for home, celebration, heartbreak, nature, freedom).
+STEP 0 — Read the lyrics and identify the PRIMARY VISUAL SUBJECT: the concrete setting, object, or action the song is literally about (e.g., a campfire in a forest, the ocean at night, a football match, a road trip, rain on glass, friends sharing warmth, a long goodbye at a station).
 
-STEP 1 — Build a scene that:
-- Is firmly within the {normalized_concept.upper()} visual vocabulary (non-negotiable)
-- Expresses the song's theme through specific choices of color, shape, motion, and composition
-- Examples:
-  · ABSTRACTO + football → dynamic circular forms in green/white with kinetic energy
-  · COSMICO + heartbreak → cold distant nebula, muted purples, slow lonely drift
-  · NATURALEZA + summer joy → golden sun-drenched meadow, warm swaying grass, long shadows
+STEP 1 — Build a scene where:
+- The SUBJECT comes from the lyrics' literal or strongly figurative imagery
+- The STYLING (palette, texture, atmosphere, mood) comes from the {normalized_concept.upper()} visual register
+- The two are fused, not stacked: the lyrics' subject is rendered through the concept's aesthetic
+
+Examples:
+  · Lyrics: campfire with friends in a forest + concept ABSTRACTO → organic flowing shapes of orange and green light, fire-like kinetic energy radiating outward, abstract bark and ember textures
+  · Lyrics: football match + concept COSMICO → goalpost silhouettes against nebula colors, kinetic energy in deep blue and purple, stars suggesting a crowd
+  · Lyrics: heartbreak + concept TROPICAL → empty beach at dusk, palms swaying but no people, melancholic warm light, abandoned beach chair
+  · Lyrics: night drive + concept MINIMALISTA → single road line receding to vanishing point, two color planes (deep blue + warm tail-light glow), negative space dominant
+  · Lyrics: longing for home + concept INDUSTRIAL → distant lit window viewed through factory pipework, warm interior glow contrasting with cold steel textures
+  · Lyrics: celebration + concept VINTAGE → confetti and streamers rendered in Super 8 grain, sepia tones, faded warmth
+
+If the lyrics are purely abstract or emotional with no concrete visual subject, fall back to the concept's own scene vocabulary as the scene itself.
 
 Hard rules:
 {_PROMPT_RULES}
-- The concept vocabulary is the hard boundary — never exit it{movement_extra_line}"""
+- The lyrics control WHAT the scene shows; the concept controls HOW it looks
+- Concept styling must be visible and recognizable in palette, texture, and mood — it is not optional, it is the aesthetic layer over the subject{movement_extra_line}"""
         else:
             # Strict concept mode: operator's visual choice, no lyrics influence.
             system_prompt = f"""{_EXAMPLE}
