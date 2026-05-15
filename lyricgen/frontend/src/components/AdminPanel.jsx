@@ -31,6 +31,7 @@ export default function AdminPanel({ onBack }) {
   const [jobs, setJobs] = useState([]);
   const [jobsTotal, setJobsTotal] = useState(0);
   const [jobsTenantFilter, setJobsTenantFilter] = useState("");
+  const [jobsStatusFilter, setJobsStatusFilter] = useState("");
   const [jobsAutoRefresh, setJobsAutoRefresh] = useState(true);
   const [invoices, setInvoices] = useState([]);
   const [search, setSearch] = useState("");
@@ -102,7 +103,7 @@ export default function AdminPanel({ onBack }) {
     if (tab === "backgrounds") loadBackgrounds();
     if (tab === "costs") loadCostDashboard();
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [tab, jobsTenantFilter, bgListFilter, costSinceDays, costRevenuePerVideo]);
+  }, [tab, jobsTenantFilter, jobsStatusFilter, bgListFilter, costSinceDays, costRevenuePerVideo]);
 
   // Auto-refresh the Jobs tab every 5s so admin sees real-time progress
   // of running renders (current_step, progress %). Pauses when the tab
@@ -115,7 +116,7 @@ export default function AdminPanel({ onBack }) {
     }, 5000);
     return () => clearInterval(iv);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [tab, jobsAutoRefresh, jobsTenantFilter]);
+  }, [tab, jobsAutoRefresh, jobsTenantFilter, jobsStatusFilter]);
 
   const loadStats = async () => {
     try {
@@ -247,7 +248,8 @@ export default function AdminPanel({ onBack }) {
   const loadJobs = async () => {
     try {
       const tenantQ = jobsTenantFilter ? `&tenant_id=${encodeURIComponent(jobsTenantFilter)}` : "";
-      const res = await fetch(`${API}/admin/jobs?limit=100${tenantQ}`, { headers: authHeaders() });
+      const statusQ = jobsStatusFilter ? `&status=${encodeURIComponent(jobsStatusFilter)}` : "";
+      const res = await fetch(`${API}/admin/jobs?limit=200${tenantQ}${statusQ}`, { headers: authHeaders() });
       const data = await res.json();
       setJobs(data.jobs || []);
       setJobsTotal(data.total || 0);
@@ -722,9 +724,25 @@ export default function AdminPanel({ onBack }) {
         <div className="space-y-4">
           <div className="flex items-center justify-between gap-3 flex-wrap">
             <p className="text-xs text-gray-500">
-              {jobsTotal} jobs{jobsTenantFilter && <> en tenant <span className="text-brand">{jobsTenantFilter}</span></>}
+              {jobsTotal} jobs
+              {jobsTenantFilter && <> en tenant <span className="text-brand">{jobsTenantFilter}</span></>}
+              {jobsStatusFilter && <> con status <span className="text-brand">{jobsStatusFilter}</span></>}
             </p>
             <div className="flex items-center gap-3">
+              <select
+                value={jobsStatusFilter}
+                onChange={e => setJobsStatusFilter(e.target.value)}
+                className="input-field !py-2 text-xs"
+              >
+                <option value="">Todos los status</option>
+                <option value="done">done (aprobado)</option>
+                <option value="pending_review">pending_review</option>
+                <option value="processing">processing</option>
+                <option value="queued">queued</option>
+                <option value="error">error</option>
+                <option value="rejected">rejected</option>
+                <option value="validation_failed">validation_failed</option>
+              </select>
               <input
                 type="text"
                 placeholder="Filtrar por tenant_id (ej: universal_music)"
