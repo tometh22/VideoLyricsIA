@@ -5862,6 +5862,7 @@ async def portal_get_items(
     to _DELIVERY_URL_EXPIRY_S."""
     _verify_portal_token(x_portal_token)
     import time
+    from concurrent.futures import ThreadPoolExecutor
 
     now = time.time()
     deliveries = (
@@ -5871,12 +5872,50 @@ async def portal_get_items(
         .all()
     )
 
+    # Resolve every (delivery, file) pair's R2 size in parallel BEFORE
+    # building the response. Sequential head_object calls were the root
+    # cause of Vercel 502s on the portal: 5 files × ~30 deliveries × 200ms
+    # blew past the 30s rewrite timeout. A bounded thread pool brings the
+    # whole batch down to a couple of seconds. Per-call timeout is short
+    # so a single hung R2 request can't poison the listing — failed
+    # head_objects fall through to size=None / available=False, same as
+    # the old per-iteration except.
+    head_jobs: list[tuple[int, str, str]] = []  # (delivery_idx, file_type, r2_key)
+    for di, d in enumerate(deliveries):
+        for ft in (d.file_types or []):
+            if ft not in _DELIVERY_FILE_TYPES:
+                continue
+            r2_key = _r2_key_for_delivery(d.tenant_snapshot, d.job_id, ft)
+            head_jobs.append((di, ft, r2_key))
+
+    size_map: dict[tuple[int, str], int | None] = {}
+
+    def _head_size(job: tuple[int, str, str]) -> tuple[tuple[int, str], int | None]:
+        di, ft, r2_key = job
+        try:
+            client = storage._get_client()
+            if client is None:
+                return (di, ft), None
+            head = client.head_object(Bucket=storage.R2_BUCKET, Key=r2_key)
+            return (di, ft), head.get("ContentLength")
+        except Exception:
+            return (di, ft), None
+
+    if head_jobs:
+        # Cap concurrency so we don't open hundreds of R2 sockets at once
+        # on a portal with many active deliveries. 16 workers is a good
+        # tradeoff: handles ~80 head calls/sec with R2's typical 200ms
+        # latency, well under any reasonable portal cardinality.
+        with ThreadPoolExecutor(max_workers=16) as pool:
+            for k, v in pool.map(_head_size, head_jobs):
+                size_map[k] = v
+
     # Group by (artist, song). Within each group, versions stay in
     # added_at order (oldest first), matching how items.json reads.
     songs: dict[tuple[str, str], dict] = {}
     file_type_labels = {ft: info["label"] for ft, info in _DELIVERY_FILE_TYPES.items()}
 
-    for d in deliveries:
+    for di, d in enumerate(deliveries):
         key = (d.artist_snapshot, d.song_title_snapshot)
         bucket = songs.setdefault(key, {"artist": d.artist_snapshot, "song": d.song_title_snapshot, "versions": []})
         files = []
@@ -5893,17 +5932,7 @@ async def portal_get_items(
                     expiry_seconds=_DELIVERY_URL_EXPIRY_S,
                     download_filename=dl_name,
                 )
-                size_bytes = None
-                try:
-                    # Best-effort size for the UI. If R2 is offline we
-                    # still want to return the listing (link will 404
-                    # at click time, less bad than a full portal outage).
-                    client = storage._get_client()
-                    if client is not None:
-                        head = client.head_object(Bucket=storage.R2_BUCKET, Key=r2_key)
-                        size_bytes = head.get("ContentLength")
-                except Exception:
-                    size_bytes = None
+                size_bytes = size_map.get((di, ft))
                 available = url is not None and size_bytes is not None
             except Exception:
                 url = None
