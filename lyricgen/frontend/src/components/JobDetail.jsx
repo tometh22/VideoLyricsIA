@@ -344,6 +344,44 @@ export default function JobDetail({ job, onBack, onJobUpdate }) {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [isEditing, job.job_id]);
 
+  // Hooks moved before early returns (React rules of hooks: no hooks after
+  // conditional returns). These were previously declared after the
+  // isEditing / isError / canPreview guards and caused React error #300.
+  const [localProresReady, setLocalProresReady] = useState(
+    Boolean(
+      (job.s3_keys && job.s3_keys.umg_master && job.s3_keys.umg_short)
+      || job.prores_ready
+    )
+  );
+  const [proResHint, setProResHint] = useState(null);
+  const [showProResModal, setShowProResModal] = useState(false);
+  const [proResToast, setProResToast] = useState(null);
+  const [driveConnected, setDriveConnected] = useState(false);
+  const [showDriveModal, setShowDriveModal] = useState(false);
+  const [showVariantModal, setShowVariantModal] = useState(false);
+  const user = (() => {
+    try { return JSON.parse(localStorage.getItem("genly_user") || "null"); } catch { return null; }
+  })();
+  const driveFeatureEnabled = user?.features?.drive_export === true;
+  useEffect(() => {
+    if (!isDone) return;
+    if (!driveFeatureEnabled) return;
+    let cancelled = false;
+    (async () => {
+      try {
+        const res = await fetch(`${API}/drive/status`, { headers: authHeaders() });
+        if (!res.ok) return;
+        const data = await res.json();
+        if (!cancelled) setDriveConnected(!!data.connected);
+      } catch {
+        // Silent fail — si /drive/status no responde, no mostramos el
+        // botón, lo cual es la conducta segura. El user puede ir a
+        // Settings a conectar.
+      }
+    })();
+    return () => { cancelled = true; };
+  }, [isDone, job.job_id, driveFeatureEnabled]);
+
   const handleEditTriggered = (resp) => {
     // Server already flipped status to "editing" + bumped edit_count.
     // Reflect that immediately in the UI so the approve panel hides and
@@ -504,16 +542,7 @@ export default function JobDetail({ job, onBack, onJobUpdate }) {
   // Hard ceiling at 8 minutes total wait (16 polls × 30 s). 4K@60 cold
   // transcode + R2 upload is ~3-4 min; 8 min covers a queue depth of
   // 2-3 jobs ahead before we give up and tell the user to retry.
-  // Local readiness state so the badge turns green immediately after a
-  // successful ProRes download — no server re-fetch needed.
-  const [localProresReady, setLocalProresReady] = useState(
-    Boolean(
-      (job.s3_keys && job.s3_keys.umg_master && job.s3_keys.umg_short)
-      || job.prores_ready
-    )
-  );
-
-  const [proResHint, setProResHint] = useState(null);
+  // localProresReady / proResHint are declared before the early returns above.
   const PRORES_MAX_WAIT_MS = 8 * 60 * 1000;
   const PRORES_POLL_FALLBACK_MS = 30 * 1000;
 
@@ -712,48 +741,14 @@ export default function JobDetail({ job, onBack, onJobUpdate }) {
   // flag prores_export. Click → modal que persiste umg_spec en el job
   // y dispara el transcoding. Una vez hecho, isUmgJob flipea a true en
   // el próximo /status poll y aparece el tab de ProRes Master.
-  const user = (() => {
-    try { return JSON.parse(localStorage.getItem("genly_user") || "null"); } catch { return null; }
-  })();
+  // user / driveFeatureEnabled / showProResModal / proResToast /
+  // driveConnected / showDriveModal / showVariantModal / Drive useEffect
+  // are all declared before the early returns above (hooks rules).
   const canEnableProRes =
     isJobDone && !isUmgJob && user?.features?.prores_export === true;
-  const [showProResModal, setShowProResModal] = useState(false);
-  const [proResToast, setProResToast] = useState(null);
-
-  // Drive integration: poleamos /drive/status al cargar el job para
-  // decidir si mostrar el botón "Guardar en Drive". El status también
-  // se polea cada N min por si el user se desconectó en otra tab.
-  // No bloqueamos el render del job — el botón aparece cuando llega.
-  //
-  // Canary mode: features.drive_export gatea TODO el flow Drive.
-  // Sin el flag no peguemos a /drive/status (evita 403 noise en logs).
-  const driveFeatureEnabled = user?.features?.drive_export === true;
-  const [driveConnected, setDriveConnected] = useState(false);
-  const [showDriveModal, setShowDriveModal] = useState(false);
-  // Variantes: solo se ofrecen sobre jobs done. El botón abre un modal
-  // que crea un job nuevo (cuenta como video pago) heredando segments.
-  const [showVariantModal, setShowVariantModal] = useState(false);
   // file_type a transferir cuando el user abre el modal: por default el
   // umg_master si está disponible, sino el video MP4.
   const driveFileType = isUmgJob ? "umg_master" : "video";
-  useEffect(() => {
-    if (!isJobDone) return;
-    if (!driveFeatureEnabled) return;
-    let cancelled = false;
-    (async () => {
-      try {
-        const res = await fetch(`${API}/drive/status`, { headers: authHeaders() });
-        if (!res.ok) return;
-        const data = await res.json();
-        if (!cancelled) setDriveConnected(!!data.connected);
-      } catch {
-        // Silent fail — si /drive/status no responde, no mostramos el
-        // botón, lo cual es la conducta segura. El user puede ir a
-        // Settings a conectar.
-      }
-    })();
-    return () => { cancelled = true; };
-  }, [isJobDone, job.job_id, driveFeatureEnabled]);
   // Short ProRes follows the same opt-in: any UMG-flavoured job gets a
   // separate vertical-format master alongside the main one. Generated
   // lazily by /download/{id}/umg_short the first time it's clicked.
