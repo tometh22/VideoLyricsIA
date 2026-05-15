@@ -91,11 +91,50 @@ def _init_redis():
         return None, None, None
 
 
-def _pick_queue(plan: str):
-    """Enterprise queue for premium plans, default otherwise."""
+# Tenant IDs that always route to the enterprise queue regardless of
+# the operator's stated `plan`. These are the B2B customers whose
+# batches are time-sensitive (UMG release schedules, OMG delivery
+# windows) — they should never queue behind a free-tier user.
+#
+# Override via env (`ENTERPRISE_TENANTS=umg,omg,acme`). Comma-separated,
+# case-insensitive. Default covers the two tenants paying right now.
+#
+# Why this lives next to _pick_queue and not in a tenants.py file: it
+# changes the routing of every enqueue path (generate, edit, prewarm,
+# variant). Co-locating the policy with the function that consumes it
+# makes the precedence rules visible at the call site.
+_ENTERPRISE_TENANTS = frozenset(
+    t.strip().lower()
+    for t in os.environ.get("ENTERPRISE_TENANTS", "umg,omg").split(",")
+    if t.strip()
+)
+
+
+def _pick_queue(plan: str, tenant_id: str = ""):
+    """Enterprise queue for premium plans OR B2B tenants, default otherwise.
+
+    Precedence (highest first):
+      1. tenant_id matches `_ENTERPRISE_TENANTS` — UMG/OMG always jump
+         the default queue even on plan="100". 2026-05-15 incident:
+         agus.cafisi (omg) batch of 5 songs was queuing behind tomas's
+         single-user work because both were on default queue.
+      2. plan == "unlimited" or "enterprise" — legacy SaaS path; kept
+         so a non-B2B tenant on an "enterprise" plan still gets fast
+         lane.
+      3. Everything else lands on default.
+
+    Workers listen to enterprise first then default, so an enterprise
+    job always pre-empts a default job at the worker-pickup point.
+    Higher tenant priority within a single queue is RQ's natural FIFO,
+    so a fresh enterprise enqueue still waits for the current
+    enterprise job to finish — but never for a default-queue job.
+    """
     _, q_default, q_enterprise = _init_redis()
     if q_default is None:
         return None
+    tid = (tenant_id or "").strip().lower()
+    if tid and tid in _ENTERPRISE_TENANTS:
+        return q_enterprise
     if plan in ("unlimited", "enterprise"):
         return q_enterprise
     return q_default
@@ -156,17 +195,87 @@ def pipeline_failure_callback(job, connection, type_, value, traceback) -> None:
         logger.warning("pipeline_failure_callback failed: %s", e)
 
 
+def cancel_rq_job(job_id: str) -> bool:
+    """Delete a job from RQ entirely. Returns True if a job was removed.
+
+    Closes the reaper-vs-RQ desync where the reaper marks a row as
+    `error` in Postgres but the RQ entry stays alive — on the next
+    worker restart, RQ's Retry / cleanup_ghosts path resurrects the
+    job and the worker burns 20 min re-processing a row that is
+    already terminal. The worker's pipeline-end update is then
+    refused by jobs.update_job's terminal-state guard, silently
+    discarding the result.
+
+    Strategy: remove from every registry that could re-enqueue it.
+    - StartedJobRegistry: jobs claimed by a worker that died.
+    - FailedJobRegistry: jobs RQ already marked failed; deleting
+      prevents an operator-triggered RQ requeue from picking them up.
+    - DeferredJobRegistry / ScheduledJobRegistry: jobs waiting on a
+      retry timer (PIPELINE_RETRY_INTERVAL_S backoff).
+    - The queue itself: pending jobs not yet picked.
+    - Job.delete(): the canonical RQ hash + dependency links.
+
+    Best-effort: any failure is logged and swallowed. Reaper still
+    completes its DB updates — RQ leftovers are a recoverable mess,
+    a crashing reaper is not.
+    """
+    if not job_id:
+        return False
+    r, q_default, q_enterprise = _init_redis()
+    if r is None:
+        return False
+    try:
+        from rq.job import Job as RqJob
+        from rq.exceptions import NoSuchJobError
+    except Exception as e:  # pragma: no cover
+        logger.warning("RQ import failed in cancel_rq_job: %s", e)
+        return False
+    try:
+        rq_job = RqJob.fetch(job_id, connection=r)
+    except NoSuchJobError:
+        return False
+    except Exception as e:  # pragma: no cover
+        logger.warning("RQ fetch failed for %s: %s", job_id, e)
+        return False
+    try:
+        from rq.registry import (
+            StartedJobRegistry, FailedJobRegistry,
+            DeferredJobRegistry, ScheduledJobRegistry,
+        )
+        for q in (q_default, q_enterprise):
+            if q is None:
+                continue
+            try:
+                q.remove(job_id)
+            except Exception:
+                pass
+            for reg_cls in (StartedJobRegistry, FailedJobRegistry,
+                            DeferredJobRegistry, ScheduledJobRegistry):
+                try:
+                    reg_cls(queue=q).remove(job_id, delete_job=False)
+                except Exception:
+                    pass
+    except Exception as e:  # pragma: no cover
+        logger.warning("RQ registry cleanup failed for %s: %s", job_id, e)
+    try:
+        rq_job.delete()
+    except Exception as e:  # pragma: no cover
+        logger.warning("RQ Job.delete failed for %s: %s", job_id, e)
+    return True
+
+
 def enqueue_pipeline(
     job_id: str,
     mp3_path: str,
     artist: str,
     style: str,
     plan: str = "100",
+    tenant_id: str = "",
     **kwargs,
 ) -> str:
     """Enqueue a run_pipeline job. Returns RQ job id (or 'thread:<job_id>' in
     the Redis-less fallback path)."""
-    q = _pick_queue(plan)
+    q = _pick_queue(plan, tenant_id=tenant_id)
     if q is not None:
         from rq import Retry
         from pipeline import run_pipeline
@@ -284,6 +393,7 @@ def enqueue_edit(
     edit_type: str,
     edit_params: dict,
     plan: str = "100",
+    tenant_id: str = "",
 ) -> str:
     """Enqueue a run_edit_pipeline job (partial re-render).
 
@@ -298,7 +408,7 @@ def enqueue_edit(
     too tight for long songs; we now match the main pipeline's
     YouTube-only allowance to keep the worst-case edit alive.
     """
-    q = _pick_queue(plan)
+    q = _pick_queue(plan, tenant_id=tenant_id)
     if q is not None:
         from pipeline import run_edit_pipeline
         rq_job = q.enqueue(

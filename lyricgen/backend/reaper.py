@@ -116,15 +116,29 @@ _OWNER_EMAIL = os.environ.get("OWNER_EMAIL", "tomas@epical.digital")
 
 
 def find_stuck_jobs(db: Session, threshold_min: int = _DEFAULT_THRESHOLD_MIN) -> list[Job]:
-    """Return jobs in processing/queued whose `created_at` is older than
-    threshold. Pending_review is intentionally excluded — those are
-    waiting on a human, not a worker."""
+    """Return jobs in processing/queued whose staleness anchor is older
+    than threshold. Pending_review is intentionally excluded — those are
+    waiting on a human, not a worker.
+
+    Staleness anchor is coalesce(last_progress_at, created_at):
+      - Worker calls update_job(progress=X) at every step; last_progress_at
+        ticks on each call. A genuine worker death stops the ticks → the
+        coalesce falls forward to a stale value and the row gets reaped.
+      - A queued row that no worker has touched yet has last_progress_at
+        NULL → coalesce falls back to created_at, preserving the original
+        "100 min in the queue is dead" guarantee.
+      - /retry resets last_progress_at = NOW(), so a retried job created
+        12 h ago is no longer insta-killed on the next reaper sweep.
+        Pre-fix incident 2026-05-15: programmatic retry of 4 omg jobs
+        from 13:45 was killed at 16:51 because the reaper still anchored
+        on created_at."""
     cutoff = datetime.now(timezone.utc) - timedelta(minutes=threshold_min)
+    anchor = func.coalesce(Job.last_progress_at, Job.created_at)
     return (
         db.query(Job)
         .filter(Job.status.in_(["processing", "queued"]))
-        .filter(Job.created_at < cutoff)
-        .order_by(Job.created_at.asc())
+        .filter(anchor < cutoff)
+        .order_by(anchor.asc())
         .all()
     )
 
@@ -280,7 +294,15 @@ def revert_abandoned_edit(db: Session, job: Job) -> None:
     were written). Decrement edit_count so the failed attempt doesn't
     burn one of the operator's 3 allowed edits — Railway's fault, not
     theirs. Caller commits.
+
+    Also cancels the RQ entry so a worker restart can't resurrect the
+    half-finished edit and silently overwrite the user's good video.
     """
+    try:
+        from queue_jobs import cancel_rq_job
+        cancel_rq_job(job.job_id)
+    except Exception as e:  # pragma: no cover
+        logger.warning("cancel_rq_job (edit) failed for %s: %s", job.job_id, e)
     prev_edit_count = job.edit_count or 0
     new_edit_count = max(0, prev_edit_count - 1)
     age = 0.0
@@ -419,7 +441,25 @@ def _delete_abandoned_upload(db: Session, job: Job) -> None:
 
 
 def reap_stuck_job(db: Session, job: Job, reason: str) -> None:
-    """Flip the row to error and log it. Caller commits."""
+    """Flip the row to error, cancel the RQ job, and log it. Caller commits.
+
+    Cancelling the RQ entry is critical: without it, RQ's Retry / cleanup
+    path resurrects the abandoned job on the next worker boot. The worker
+    then re-runs the pipeline against a row already marked `error`, and
+    `jobs.update_job`'s terminal-state guard silently discards the result
+    at the end — 20 min of compute thrown away while the user keeps seeing
+    the "Worker abandonó el job" message.
+
+    Incident 2026-05-15: 4 omg jobs got reaped, then resurrected by RQ on
+    the next worker restart, re-processed silently, and ended in the same
+    `error` state. Fixing the desync here closes the loop.
+    """
+    rq_removed = False
+    try:
+        from queue_jobs import cancel_rq_job
+        rq_removed = cancel_rq_job(job.job_id)
+    except Exception as e:  # pragma: no cover
+        logger.warning("cancel_rq_job failed for %s: %s", job.job_id, e)
     job.status = _REAPED_STATUS
     job.error = reason
     job.completed_at = datetime.now(timezone.utc)
@@ -435,6 +475,7 @@ def reap_stuck_job(db: Session, job: Job, reason: str) -> None:
             "progress": job.progress,
             "age_minutes": round(_age_minutes(job), 1),
             "reason": reason,
+            "rq_removed": rq_removed,
         },
     ))
 

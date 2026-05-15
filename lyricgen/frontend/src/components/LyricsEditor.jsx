@@ -193,6 +193,16 @@ export default function LyricsEditor({
   textContrast = "medium",
   transcribeJobId = null,
   onPersistSegments = null,
+  // Post-approval / re-sync mode. The wizard's upload flow never sets
+  // these (defaults preserve original behavior); the JobDetail /edit
+  // modal mounts this same editor with audioUrl + the disable flags so
+  // the operator can fix sync on an already-approved job without
+  // pulling in features that no longer apply.
+  audioUrl: audioUrlProp = null,
+  disableAutoSplit = false,
+  disableBeforeUnload = false,
+  disableAutosave = false,
+  submitLabel = null,
 }) {
   const { t } = useI18n();
   const [edited, setEdited] = useState(() =>
@@ -201,12 +211,32 @@ export default function LyricsEditor({
   const [isDirty, setIsDirty] = useState(false);
 
   // Warn browser on tab-close / external navigation when there are unsaved edits.
+  // disableBeforeUnload skips this for the post-approval modal — closing
+  // the modal already IS the explicit "discard" gesture, a native confirm
+  // on top is noise.
   useEffect(() => {
-    if (!isDirty) return;
+    if (disableBeforeUnload || !isDirty) return;
     const handler = (e) => { e.preventDefault(); e.returnValue = ""; };
     window.addEventListener("beforeunload", handler);
     return () => window.removeEventListener("beforeunload", handler);
-  }, [isDirty]);
+  }, [isDirty, disableBeforeUnload]);
+
+  // Debounced autosave to backend: every 3s after the last edit, persist
+  // the current segments to /jobs/{id}/save-segments. This bumps the
+  // reaper's last_user_activity_at anchor so long edit sessions don't get
+  // barre at the 30-min TTL (incident 2026-05-14 — Agus batch-edited 5
+  // lyrics for 90 min and all 5 jobs got reaped before "Crear videos").
+  // No-op when the parent didn't wire the callback (e.g. unit tests).
+  useEffect(() => {
+    if (disableAutosave) return undefined;
+    if (!onPersistSegments || !transcribeJobId) return undefined;
+    if (!Array.isArray(edited) || edited.length === 0) return undefined;
+    const tid = setTimeout(() => {
+      const cleaned = edited.map(({ _id, ...rest }) => rest);
+      onPersistSegments(transcribeJobId, cleaned);
+    }, 3000);
+    return () => clearTimeout(tid);
+  }, [edited, transcribeJobId, onPersistSegments, disableAutosave]);
 
   // Debounced autosave to backend: every 3s after the last edit, persist
   // the current segments to /jobs/{id}/save-segments. This bumps the
@@ -234,11 +264,17 @@ export default function LyricsEditor({
   // seconds in once the initial buffered range is consumed.
   const [audioUrl, setAudioUrl] = useState(null);
   useEffect(() => {
+    // audioUrlProp wins over audioFile when the parent already has a
+    // streamable URL (post-approval modal: signed R2 URL via GET
+    // /jobs/{id}/source-audio-url). Don't createObjectURL in that case —
+    // the URL is already valid for <audio src> and revoking would be a
+    // no-op anyway.
+    if (audioUrlProp) { setAudioUrl(audioUrlProp); return undefined; }
     if (!audioFile) { setAudioUrl(null); return undefined; }
     const url = URL.createObjectURL(audioFile);
     setAudioUrl(url);
     return () => URL.revokeObjectURL(url);
-  }, [audioFile]);
+  }, [audioFile, audioUrlProp]);
 
   const audioRef = useRef(null);
   const listRef = useRef(null);
@@ -392,19 +428,70 @@ export default function LyricsEditor({
   // ones). If the offset was constant the next line is already roughly
   // right and the operator only needs to confirm. Already-anchored
   // lines (idx < syncCursor) are ground truth and stay put.
+  // Empirical compensation for the gap between `audio.currentTime` (the
+  // *decoded* position, what the API reports) and what the operator
+  // actually hears coming out of the speakers. Browsers buffer ~30-100 ms
+  // of decoded audio before it's audible — when the operator hits Space
+  // synced with their ear, currentTime has already advanced past the
+  // moment they meant to anchor. 80 ms is the empirical mid-point of
+  // observed latency on Chrome/Firefox/Safari with non-Bluetooth output.
+  // Operators using BT headsets may need more compensation; expose later
+  // as a calibration setting if reports persist.
+  const AUDIO_LATENCY_COMPENSATION_S = 0.08;
+  // Floor between adjacent segments so an anchor can't push a line into
+  // (or before) its neighbor. 50 ms is below human flicker perception
+  // but enough to keep moviepy's transitions clean.
+  const MIN_GAP_S = 0.05;
+  // Cascade safety net: if a single anchor would propagate a > 1.5 s
+  // shift to every line after it, that's almost certainly a mistap (the
+  // operator was paused, scrolled, or got distracted) — confirm before
+  // walking the rest of the song into the wrong place.
+  const CASCADE_DELTA_CONFIRM_S = 1.5;
+
   const tapAnchor = useCallback(() => {
     if (!syncMode) return;
     if (syncCursor < 0 || syncCursor >= edited.length) return;
     const target = edited[syncCursor];
     if (!target) return;
-    const newStart = Math.max(0, currentTime);
+
+    // Compensate audio latency so the anchor matches what the operator
+    // *heard* at press time, not what was decoded by then. See the
+    // AUDIO_LATENCY_COMPENSATION_S comment above.
+    const rawStart = Math.max(0, currentTime - AUDIO_LATENCY_COMPENSATION_S);
+
+    // Clamp to neighbors so the timeline can't go non-monotonic. If the
+    // operator presses Space too late (after the next line has started)
+    // or too early (before the previous one ended), pin to the safe edge
+    // instead of producing overlapping segments that render as a flicker.
+    const prevSeg = syncCursor > 0 ? edited[syncCursor - 1] : null;
+    const nextSeg = syncCursor + 1 < edited.length ? edited[syncCursor + 1] : null;
+    const lowerBound = prevSeg ? prevSeg.end + MIN_GAP_S : 0;
+    const upperBound = nextSeg
+      ? nextSeg.start - MIN_GAP_S
+      : (duration && duration > 0 ? duration : Infinity);
+    const newStart = Math.max(lowerBound, Math.min(rawStart, upperBound));
+
     const delta = newStart - target.start;
+
+    // Cascade safety: huge delta = probable mistap. Ask before walking
+    // every subsequent line by the same amount. Bail if operator cancels —
+    // the current line gets the anchor but the cascade is skipped.
+    let applyCascade = syncCascade;
+    if (applyCascade && Math.abs(delta) > CASCADE_DELTA_CONFIRM_S) {
+      const tail = edited.length - syncCursor - 1;
+      const ok = window.confirm(
+        `Detectamos un salto de ${delta.toFixed(2)}s en este anchor. ` +
+        `¿Aplicar a las ${tail} líneas siguientes? ` +
+        `(Cancelar = solo anclar la línea actual.)`
+      );
+      if (!ok) applyCascade = false;
+    }
+
     // Snapshot the future lines BEFORE mutating so undo can restore
-    // every shifted timestamp, not just the anchor's.
-    // Snapshot the future ONLY when we're going to touch it. Without
-    // syncCascade the future array stays empty and Deshacer reverts a
-    // single line — matching the user's mental model.
-    const futureSnapshot = syncCascade
+    // every shifted timestamp, not just the anchor's. Skip when we're
+    // not going to touch the future — keeps the undo behaviour matching
+    // the user's mental model (single line revert).
+    const futureSnapshot = applyCascade
       ? edited
           .slice(syncCursor + 1)
           .map((s) => ({ id: s._id, prevStart: s.start, prevEnd: s.end }))
@@ -428,17 +515,12 @@ export default function LyricsEditor({
           if (duration && newEnd > duration) newEnd = duration;
           return { ...s, start: newStart, end: newEnd };
         }
-        // Cascade only when the operator opted in. We used to have a
-        // 200 ms dead-zone here, intended to avoid jittering on
-        // micro-adjustments. In practice that swallowed the most
-        // common real correction (Whisper drifts of 100-300 ms), so
-        // operators reported "Arrastrar siguientes anda mal — apreté
-        // y no pasó nada" — when actually the cascade math was running
-        // but rejecting the delta as "too small to matter". 10 ms is
-        // tight enough to filter pure floating-point noise without
-        // discarding legitimate user-driven shifts. The user remains
-        // in control via the explicit `syncCascade` opt-in.
-        if (syncCascade && i > syncCursor && Math.abs(delta) >= 0.01) {
+        // Cascade only when the operator opted in AND the delta isn't a
+        // suspect mistap (handled by the confirm above). 10 ms threshold
+        // filters pure floating-point noise; below that we skip the
+        // shift, above we apply it. See git blame for the prior 200 ms
+        // dead-zone that swallowed legit user corrections.
+        if (applyCascade && i > syncCursor && Math.abs(delta) >= 0.01) {
           const segDur = Math.max(0.5, s.end - s.start);
           const shifted = Math.max(0, s.start + delta);
           let newEnd = shifted + segDur;
@@ -455,6 +537,21 @@ export default function LyricsEditor({
       setSyncCursor(syncCursor + 1);
     }
   }, [syncMode, syncCursor, edited, currentTime, duration, syncCascade]);
+
+  // Keep syncCursor inside the bounds of `edited` after split/delete
+  // operations performed mid-sync. Without this, deleting line 8 while
+  // the cursor is on line 5 leaves the UI showing line 5 but the next
+  // tapAnchor reads from an array that may have shifted under the hood.
+  useEffect(() => {
+    if (!syncMode) return;
+    if (edited.length === 0) {
+      setSyncMode(false);
+      return;
+    }
+    if (syncCursor >= edited.length) {
+      setSyncCursor(edited.length - 1);
+    }
+  }, [edited.length, syncMode, syncCursor]);
 
   const undoLastAnchor = useCallback(() => {
     setSyncHistory((prev) => {
@@ -536,6 +633,11 @@ export default function LyricsEditor({
       const editing = tag === "INPUT" || tag === "TEXTAREA" || document.activeElement?.isContentEditable;
       if (editing) return;
       if (e.code === "Space") {
+        // Ignore keyboard autorepeat / sustained press so the operator
+        // doesn't anchor 3 lines from one apparent tap. Native autorepeat
+        // fires keydown ~20 times per second on most OSes — one anchor
+        // is the operator's intent, the rest are noise.
+        if (e.repeat) { e.preventDefault(); return; }
         e.preventDefault();
         if (syncMode) tapAnchor();
         else togglePlay();
@@ -686,6 +788,52 @@ export default function LyricsEditor({
   const deleteSeg = (id) => {
     setEdited((prev) => prev.filter((seg) => seg._id !== id));
   };
+
+  // Text-length-based cap. Used by the per-row ✂ button + bulk-trim
+  // action in this editor. There is NO automatic application — the
+  // operator chooses when (and per-segment whether) to apply.
+  const TRIM_FLOOR_S = 3.5;
+  const TRIM_PER_CHAR_S = 0.10;
+  const TRIM_MARGIN_S = 1.0;
+  const estimateVoiceEndDuration = (text) =>
+    Math.max(TRIM_FLOOR_S, (text || "").length * TRIM_PER_CHAR_S + TRIM_MARGIN_S);
+
+  /** Cap a single segment's `end` to the estimated voice-end of its text.
+   * Used by the per-row ✂ button — operator marks one hanging line at a
+   * time. ONLY modifies the `end` of the matched segment; no other
+   * segment is touched, and `start` is preserved. */
+  const trimSeg = (id) => {
+    pushEditHistory();
+    setEdited((prev) =>
+      prev.map((seg) => {
+        if (seg._id !== id) return seg;
+        const dur = seg.end - seg.start;
+        const cap = estimateVoiceEndDuration(seg.text);
+        if (dur <= cap) return seg;  // already short enough
+        return { ...seg, end: seg.start + cap };
+      }),
+    );
+  };
+
+  /** Bulk: trim every segment whose duration exceeds the cap. Each
+   * segment is trimmed independently — only its own `end` is modified
+   * based on its own text length and start. No cross-segment effect. */
+  const trimAllLongSegs = () => {
+    pushEditHistory();
+    setEdited((prev) =>
+      prev.map((seg) => {
+        const dur = seg.end - seg.start;
+        const cap = estimateVoiceEndDuration(seg.text);
+        if (dur <= cap) return seg;
+        return { ...seg, end: seg.start + cap };
+      }),
+    );
+  };
+
+  const longSegCount = edited.filter((seg) => {
+    const dur = seg.end - seg.start;
+    return dur > estimateVoiceEndDuration(seg.text);
+  }).length;
 
   // Compute how many visual lines a segment will occupy in the video.
   const linesForSeg = useCallback((text) => {
@@ -853,7 +1001,7 @@ export default function LyricsEditor({
           </div>
         </div>
         <button onClick={handleApprove} className="btn-primary text-sm h-11 px-5">
-          {isBatch ? t("editor.approve_next") : t("editor.approve_generate")}
+          {submitLabel || (isBatch ? t("editor.approve_next") : t("editor.approve_generate"))}
           <svg className="inline-block ml-1.5 w-4 h-4" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
             <path d="M5 12h14M12 5l7 7-7 7" />
           </svg>
@@ -876,7 +1024,7 @@ export default function LyricsEditor({
           que matchea contra 2 lineas consecutivas de la referencia.
           Es la acción primaria sugerida cuando la pipeline cayó al
           recovery path o cualquier output mergeó 2 lyric lines en 1. */}
-      {mergeableSegments.length > 0 && (
+      {!disableAutoSplit && mergeableSegments.length > 0 && (
         <div className="mb-4 rounded-2xl ring-1 ring-amber-500/30 bg-amber-500/[0.08] px-4 py-3 flex items-start gap-3">
           <svg className="w-5 h-5 text-amber-400 flex-shrink-0 mt-0.5" fill="none" stroke="currentColor" strokeWidth="1.8" viewBox="0 0 24 24">
             <path d="M12 9v3.75m9-.75a9 9 0 11-18 0 9 9 0 0118 0zm-9 3.75h.008v.008H12v-.008z" strokeLinecap="round" strokeLinejoin="round" />
@@ -1190,6 +1338,30 @@ export default function LyricsEditor({
           every line manually, the operator shifts the entire timeline.
           Collapsed by default — opens when user clicks the toggle.   */}
       <div className="mb-3">
+        {/* Bulk trim banner — only when there are long lines that would
+            benefit. Each click is one undo-able operation. Useful when
+            re-editing an old job that pre-dates the auto-trim feature. */}
+        {longSegCount > 0 && (
+          <button
+            onClick={trimAllLongSegs}
+            className="w-full mb-2 flex items-center justify-between px-3 py-2 rounded-card bg-amber-500/[0.08] ring-1 ring-amber-500/25 hover:ring-amber-500/40 text-xs text-amber-200 hover:text-amber-100 transition-colors"
+            title="Aplica el cap dinámico (V2) a las líneas marcadas. Cada línea se acorta a su duración estimada de voz."
+          >
+            <span className="flex items-center gap-2">
+              <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
+                <circle cx="6" cy="6" r="3" />
+                <circle cx="6" cy="18" r="3" />
+                <path d="M20 4L8.12 15.88M14.47 14.48L20 20M8.12 8.12L12 12" />
+              </svg>
+              {(t("editor.trim_all_long_label") ||
+                "Recortar {n} líneas con texto colgado").replace("{n}", longSegCount)}
+            </span>
+            <span className="text-[10px] text-amber-300/70">
+              {t("editor.trim_all_long_hint") || "voz termina antes que el silencio"}
+            </span>
+          </button>
+        )}
+
         <button
           onClick={() => setShiftPanelOpen((v) => !v)}
           className="w-full flex items-center justify-between px-3 py-2 rounded-card bg-surface-2/40 ring-1 ring-white/[0.04] hover:ring-white/[0.08] text-xs text-gray-300 hover:text-white transition-colors"
@@ -1433,6 +1605,33 @@ export default function LyricsEditor({
                         <path d="M5 15V5a1 1 0 011-1h10" />
                       </svg>
                     </button>
+                    {/* ✂ Trim line: caps `end` to estimated voice-end so the
+                        text doesn't stay pinned through a fill / outro. Only
+                        renders when the current duration exceeds the cap.
+
+                        Unlike the other row actions (duplicate, split, delete)
+                        which are hover-only, this button is **always visible**
+                        on hanging lines because it doubles as an INDICATOR —
+                        when the operator opens the editor on a song with 12
+                        hanging lines, all 12 ✂ icons are visible at once so
+                        the operator can scan and decide per-line without
+                        hovering each row. Faded baseline opacity so it doesn't
+                        compete visually with the lyric text; goes full opacity
+                        on hover when the operator is targeting it. */}
+                    {(seg.end - seg.start) > estimateVoiceEndDuration(seg.text) && (
+                      <button onClick={() => trimSeg(seg._id)}
+                        className="w-8 h-8 rounded-lg opacity-60 hover:opacity-100
+                          hover:bg-amber-500/15 flex items-center justify-center text-amber-500/80
+                          hover:text-amber-400 transition-all"
+                        title={t("editor.trim_line") ||
+                          "Recortar al final natural (cuando la voz termina y empieza un fill)"}>
+                        <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
+                          <circle cx="6" cy="6" r="3" />
+                          <circle cx="6" cy="18" r="3" />
+                          <path d="M20 4L8.12 15.88M14.47 14.48L20 20M8.12 8.12L12 12" />
+                        </svg>
+                      </button>
+                    )}
                     <button onClick={() => deleteSeg(seg._id)}
                       className="w-8 h-8 rounded-lg opacity-0 group-hover:opacity-100
                         hover:bg-red-500/10 flex items-center justify-center text-gray-600
@@ -1475,7 +1674,7 @@ export default function LyricsEditor({
           )}
         </div>
         <button onClick={handleApprove} className="btn-primary text-sm h-11 px-5 shrink-0" data-tour="editor-approve">
-          {isBatch ? t("editor.approve_next") : t("editor.approve_generate")}
+          {submitLabel || (isBatch ? t("editor.approve_next") : t("editor.approve_generate"))}
         </button>
       </div>
 

@@ -3,9 +3,13 @@
     {
       "ID": "genly-presigned-uploads",
       "AllowedOrigins": [
+        "https://app.genly.pro",
+        "https://staging.app.genly.pro",
         "https://genly.pro",
         "https://www.genly.pro",
+        "https://*.vercel.app",
         "http://localhost:5173",
+        "http://localhost:5174",
         "http://localhost:3000"
       ],
       "AllowedMethods": ["GET", "PUT", "HEAD"],
