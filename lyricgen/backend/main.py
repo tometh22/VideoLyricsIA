@@ -4901,13 +4901,28 @@ async def request_edit(
     ))
     db.commit()
 
-    enqueue_edit(
-        job_id=job_id,
-        edit_type=body.edit_type,
-        edit_params=edit_params,
-        plan=current_user.get("plan", "100"),
-        tenant_id=current_user.get("tenant_id", ""),
-    )
+    try:
+        enqueue_edit(
+            job_id=job_id,
+            edit_type=body.edit_type,
+            edit_params=edit_params,
+            plan=current_user.get("plan", "100"),
+            tenant_id=current_user.get("tenant_id", ""),
+        )
+    except Exception as exc:
+        # Enqueue failed (Redis down, unexpected RQ error). Roll back the DB
+        # to pending_review so the user can retry without waiting for the reaper.
+        logger.error("enqueue_edit failed for %s: %s", job_id, exc)
+        job.status = "pending_review"
+        job.edit_count = current_edit_count
+        job.editing_started_at = None
+        job.progress = 100
+        job.current_step = "thumbnail"
+        db.commit()
+        raise HTTPException(
+            status_code=503,
+            detail="Cola de trabajos no disponible. Intentá de nuevo en unos segundos.",
+        )
 
     return {
         "ok": True,
