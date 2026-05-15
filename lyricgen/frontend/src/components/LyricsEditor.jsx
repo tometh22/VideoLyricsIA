@@ -193,6 +193,14 @@ export default function LyricsEditor({
   textContrast = "medium",
   transcribeJobId = null,
   onPersistSegments = null,
+  // Synchronous per-edit callback (no debounce). Parent receives the
+  // current cleaned segments on every change. Required by the /edit
+  // modal so it can include the latest segments in the body of
+  // /edit?edit_type=background without racing the 3s autosave debounce.
+  // Without this, an operator who edits a line and clicks "Regenerar
+  // fondo" within 3 s ends up re-rendering with the pre-edit segments_json
+  // because autosave hasn't flushed yet. Incident 2026-05-15.
+  onEditedChange = null,
   // Post-approval / re-sync mode. The wizard's upload flow never sets
   // these (defaults preserve original behavior); the JobDetail /edit
   // modal mounts this same editor with audioUrl + the disable flags so
@@ -237,6 +245,33 @@ export default function LyricsEditor({
     }, 3000);
     return () => clearTimeout(tid);
   }, [edited, transcribeJobId, onPersistSegments, disableAutosave]);
+
+  // Synchronous per-edit callback: fires on every `edited` change with no
+  // debounce, so the parent can hold the latest segments in a ref and
+  // include them in the next /edit POST without racing the 3 s autosave
+  // window. No-op when the parent didn't wire the callback. Cheap enough
+  // to fire per keystroke — a single map() over the segments array.
+  useEffect(() => {
+    if (!onEditedChange || !Array.isArray(edited)) return;
+    const cleaned = edited.map(({ _id, ...rest }) => rest);
+    onEditedChange(cleaned);
+  }, [edited, onEditedChange]);
+
+  // Debounced autosave to backend: every 3s after the last edit, persist
+  // the current segments to /jobs/{id}/save-segments. This bumps the
+  // reaper's last_user_activity_at anchor so long edit sessions don't get
+  // barre at the 30-min TTL (incident 2026-05-14 — Agus batch-edited 5
+  // lyrics for 90 min and all 5 jobs got reaped before "Crear videos").
+  // No-op when the parent didn't wire the callback (e.g. unit tests).
+  useEffect(() => {
+    if (!onPersistSegments || !transcribeJobId) return undefined;
+    if (!Array.isArray(edited) || edited.length === 0) return undefined;
+    const tid = setTimeout(() => {
+      const cleaned = edited.map(({ _id, ...rest }) => rest);
+      onPersistSegments(transcribeJobId, cleaned);
+    }, 3000);
+    return () => clearTimeout(tid);
+  }, [edited, transcribeJobId, onPersistSegments]);
 
   // ─── Audio sync ─────────────────────────────────────────────────────
   // Blob URL lifecycle must live in useEffect, not useMemo. useMemo is
