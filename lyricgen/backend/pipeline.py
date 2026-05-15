@@ -1154,7 +1154,8 @@ def _compress_for_whisper(input_path: str) -> str:
 
 def _transcribe_via_openai_api(mp3_path: str, language: str | None = None,
                                 lyrics_hint: str | None = None,
-                                job_id: str | None = None) -> list[dict]:
+                                job_id: str | None = None,
+                                return_words: bool = False) -> list[dict]:
     """Transcribe by calling OpenAI's Whisper API. Returns the same segments
     structure as the local Whisper path. Used in production where loading
     the local model would consume too much worker RAM (~3 GB) and risks OOM.
@@ -1200,10 +1201,11 @@ def _transcribe_via_openai_api(mp3_path: str, language: str | None = None,
         prompt_text = ("Letras de canción:" if (language or "").startswith("es")
                        else "Song lyrics:")
 
+    granularities = ["word", "segment"] if return_words else ["segment"]
     kwargs = {
         "model": "whisper-1",
         "response_format": "verbose_json",
-        "timestamp_granularities": ["segment"],
+        "timestamp_granularities": granularities,
         "prompt": prompt_text,
         # temperature=0 gives the most confident output; we lower the
         # default 0.0 ladder so it doesn't sample alternative
@@ -1283,11 +1285,41 @@ def _transcribe_via_openai_api(mp3_path: str, language: str | None = None,
             pass
 
     raw_segments = response.segments or []
+    raw_words = (getattr(response, "words", None) or []) if return_words else []
     import re as _re
+
+    # Word granularity returns a flat top-level word list, not per-segment.
+    # Walk both lists in parallel to bucket each word into the segment
+    # whose [start, end) covers its start time. Cursor is monotonic so
+    # this is O(W + S).
+    word_cursor = 0
+
+    def _words_for_segment(seg) -> list[dict]:
+        nonlocal word_cursor
+        if not raw_words:
+            return []
+        s_start = float(seg.start)
+        s_end = float(seg.end)
+        bucket: list[dict] = []
+        while word_cursor < len(raw_words):
+            w = raw_words[word_cursor]
+            w_start = float(getattr(w, "start", 0.0))
+            if w_start >= s_end:
+                break
+            word_cursor += 1
+            if w_start < s_start:
+                continue
+            bucket.append({
+                "word": (getattr(w, "word", "") or "").strip(),
+                "start": w_start,
+                "end": float(getattr(w, "end", w_start)),
+            })
+        return bucket
 
     segments: list[dict] = []
     for seg in raw_segments:
         text = (seg.text or "").strip()
+        seg_words = _words_for_segment(seg) if return_words else []
         if not text or len(text) < 3:
             continue
         # Same filters as local path so behavior matches.
@@ -1306,11 +1338,14 @@ def _transcribe_via_openai_api(mp3_path: str, language: str | None = None,
         if (seg.no_speech_prob or 0) > 0.92:
             print(f"[WHISPER-API] Filtered very-low-confidence: {text[:60]}")
             continue
-        segments.append({
+        out_seg = {
             "start": float(seg.start),
             "end": float(seg.end),
             "text": text,
-        })
+        }
+        if return_words:
+            out_seg["words"] = seg_words
+        segments.append(out_seg)
 
     # Whisper hallucinates loops in two distinct shapes:
     #   1. SAME LINE REPEATED across consecutive segments — easy: dedupe
@@ -1442,7 +1477,8 @@ def _transcribe_via_openai_api(mp3_path: str, language: str | None = None,
 
 def transcribe(mp3_path: str, language: str = None,
                lyrics_hint: str | None = None,
-               job_id: str | None = None) -> list[dict]:
+               job_id: str | None = None,
+               return_words: bool = False) -> list[dict]:
     """Transcribe an audio file to lyric segments.
 
     Backend selection:
@@ -1463,7 +1499,7 @@ def transcribe(mp3_path: str, language: str = None,
     if has_key:
         return _transcribe_via_openai_api(
             mp3_path, language=language, lyrics_hint=lyrics_hint,
-            job_id=job_id,
+            job_id=job_id, return_words=return_words,
         )
 
     # --- local Whisper path ---
@@ -1508,7 +1544,15 @@ def transcribe(mp3_path: str, language: str = None,
         else:
             start = seg["start"]
             end = seg["end"]
-        segments.append({"start": start, "end": end, "text": text})
+        out_seg = {"start": start, "end": end, "text": text}
+        if return_words and words:
+            out_seg["words"] = [
+                {"word": (w.get("word") or "").strip(),
+                 "start": float(w.get("start", start)),
+                 "end": float(w.get("end", end))}
+                for w in words if (w.get("word") or "").strip()
+            ]
+        segments.append(out_seg)
 
     # Safety net: retry if first segment starts very late
     if segments and segments[0]["start"] > 30:
@@ -1522,9 +1566,17 @@ def transcribe(mp3_path: str, language: str = None,
                 continue
             words = seg.get("words", [])
             if words:
-                segments2.append({"start": words[0]["start"], "end": words[-1]["end"], "text": text})
+                out_seg = {"start": words[0]["start"], "end": words[-1]["end"], "text": text}
             else:
-                segments2.append({"start": seg["start"], "end": seg["end"], "text": text})
+                out_seg = {"start": seg["start"], "end": seg["end"], "text": text}
+            if return_words and words:
+                out_seg["words"] = [
+                    {"word": (w.get("word") or "").strip(),
+                     "start": float(w.get("start", out_seg["start"])),
+                     "end": float(w.get("end", out_seg["end"]))}
+                    for w in words if (w.get("word") or "").strip()
+                ]
+            segments2.append(out_seg)
         if segments2 and segments2[0]["start"] < segments[0]["start"]:
             segments = segments2
 
