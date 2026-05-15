@@ -822,7 +822,7 @@ function LyricsEditModal({
   const noSegments = !Array.isArray(job.segments_json) || job.segments_json.length === 0;
 
   return (
-    <div className="fixed inset-0 z-[60] bg-bg overflow-y-auto">
+    <div className="fixed inset-0 z-[60] bg-surface overflow-y-auto">
       <div className="min-h-screen px-4 py-8 sm:px-8">
         <div className="max-w-3xl mx-auto">
           {audioError && (
