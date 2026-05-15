@@ -23,7 +23,13 @@
 #      Hobby plan does the "kill-then-spawn" sequence regardless of
 #      this file.
 #   2. `RAILWAY_SHUTDOWN_TIMEOUT_SECONDS` env var is set to **1200** (20
-#      min) on the Worker service. This is the SIGTERM→SIGKILL grace
+#      min) on the Worker service.
+#      ⚠️ 2026-05-15 INCIDENT: this var is NOT set on staging. Railway's
+#      default 30 s SIGTERM→SIGKILL window killed in-flight UMG renders
+#      on every deploy today. Apply manually via Railway dashboard →
+#      Worker service → Variables before merging this PR, OR a deploy
+#      will repeat the same outage. (railway.toml cannot set platform
+#      env vars; this has to be a dashboard step.) This is the SIGTERM→SIGKILL grace
 #      period; RQ workers honor SIGTERM by finishing the current job
 #      (worker.py:_graceful), but Railway's default grace is 30 s which
 #      cuts a Veo poll in half. A background edit can take ~15 min end-
@@ -96,3 +102,30 @@ healthcheckTimeout = 90
 [services.Worker.deploy]
 restartPolicyType = "ON_FAILURE"
 restartPolicyMaxRetries = 10
+# Horizontal scale. UMG enterprise jobs run ~12-20 min each (Whisper +
+# Veo + composite + ProRes encode + ~5 GB R2 upload). With 1 replica a
+# batch of 5 UMG renders queues at ~80-100 min — the wait agus saw on
+# 2026-05-15. 7 replicas covers the typical UMG batch (5-7 songs) in a
+# single ~15-min wave, with 2 spare for concurrent /edit requests, and
+# stays well below the Whisper / Veo upstream rate ceilings.
+#
+# RAM / vCPU math on Railway Pro: budget is 1 TB RAM / 1,000 vCPU per
+# service, with each replica capped at 24 GB / 24 vCPU. ProRes encode
+# peaks at ~5 GB (ffmpeg holds master + short), so we run with the
+# default replica size — plenty of headroom for the Python heap +
+# Whisper buffer + safety margin. 7 × 24 GB = 168 GB ceiling, far
+# below the 1 TB service limit.
+#
+# Upstream rate-limit ceiling (the real bottleneck above ~10 replicas):
+#   - OpenAI Whisper: ~50 req/min on current tier — 7 parallel workers
+#     × ~3 req/job = peak ~21 req/min, safe.
+#   - Veo 3: per-project quota; observed degradation past 10 concurrent.
+#   - Gemini: 60 req/min standard tier.
+# Past 10 replicas, jobs will 429 in cascade and the whisper-retry
+# logic in pipeline.py (#145/#146) eats the slack but only buys
+# minutes. To go higher, raise the OpenAI tier first.
+#
+# Keep `numReplicas` here in sync with the dashboard — Railway treats
+# the file as source of truth and the next deploy would revert a
+# dashboard-only bump back to this value.
+numReplicas = 7
