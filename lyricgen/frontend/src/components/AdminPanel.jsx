@@ -91,6 +91,76 @@ export default function AdminPanel({ onBack }) {
   const [newUser, setNewUser] = useState({ username: "", password: "", email: "", plan_id: "100", role: "user", tenant_id: "" });
   const [createError, setCreateError] = useState("");
 
+  // Change requests panel — UMG (and any portal user) leaves comments
+  // on a delivery version via "Solicitar cambios". They land in
+  // delivery_change_requests pending. The operator reviews them here.
+  const [crStatusFilter, setCrStatusFilter] = useState("pending");
+  const [crItems, setCrItems] = useState([]);
+  const [crPending, setCrPending] = useState(0);
+  const [crResolved, setCrResolved] = useState(0);
+  const [crLoading, setCrLoading] = useState(false);
+  // Per-row state for the inline "marcar resuelto" note input. Key is
+  // the change-request id, value is the typed note.
+  const [crResolveDraft, setCrResolveDraft] = useState({});
+  const [crResolvingId, setCrResolvingId] = useState(null);
+  const loadChangeRequests = async () => {
+    setCrLoading(true);
+    try {
+      const res = await fetch(
+        `${API}/admin/change-requests?status=${crStatusFilter}&limit=200`,
+        { headers: authHeaders() },
+      );
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const data = await res.json();
+      setCrItems(data.items || []);
+      setCrPending(data.pending_count || 0);
+      setCrResolved(data.resolved_count || 0);
+    } catch (err) {
+      flashError(`No pude cargar los cambios: ${err.message || err}`);
+    } finally {
+      setCrLoading(false);
+    }
+  };
+  const resolveChangeRequest = async (id) => {
+    setCrResolvingId(id);
+    try {
+      const note = (crResolveDraft[id] || "").trim();
+      const res = await fetch(`${API}/admin/change-requests/${id}/resolve`, {
+        method: "POST",
+        headers: { ...authHeaders(), "Content-Type": "application/json" },
+        body: JSON.stringify({ resolution_note: note }),
+      });
+      if (!res.ok) {
+        const data = await res.json().catch(() => ({}));
+        throw new Error(data.detail || `Error ${res.status}`);
+      }
+      setCrResolveDraft((d) => { const n = { ...d }; delete n[id]; return n; });
+      await loadChangeRequests();
+    } catch (err) {
+      flashError(`No pude marcar como resuelto: ${err.message || err}`);
+    } finally {
+      setCrResolvingId(null);
+    }
+  };
+  const reopenChangeRequest = async (id) => {
+    setCrResolvingId(id);
+    try {
+      const res = await fetch(`${API}/admin/change-requests/${id}/reopen`, {
+        method: "POST",
+        headers: authHeaders(),
+      });
+      if (!res.ok) {
+        const data = await res.json().catch(() => ({}));
+        throw new Error(data.detail || `Error ${res.status}`);
+      }
+      await loadChangeRequests();
+    } catch (err) {
+      flashError(`No pude reabrir: ${err.message || err}`);
+    } finally {
+      setCrResolvingId(null);
+    }
+  };
+
   useEffect(() => {
     loadStats();
   }, []);
@@ -102,8 +172,9 @@ export default function AdminPanel({ onBack }) {
     if (tab === "compliance") loadCompliance();
     if (tab === "backgrounds") loadBackgrounds();
     if (tab === "costs") loadCostDashboard();
+    if (tab === "changes") loadChangeRequests();
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [tab, jobsTenantFilter, jobsStatusFilter, bgListFilter, costSinceDays, costRevenuePerVideo]);
+  }, [tab, jobsTenantFilter, jobsStatusFilter, bgListFilter, costSinceDays, costRevenuePerVideo, crStatusFilter]);
 
   // Auto-refresh the Jobs tab every 5s so admin sees real-time progress
   // of running renders (current_step, progress %). Pauses when the tab
@@ -338,6 +409,7 @@ export default function AdminPanel({ onBack }) {
     { id: "overview", label: "Overview" },
     { id: "users", label: "Users" },
     { id: "jobs", label: "Jobs" },
+    { id: "changes", label: "Cambios", badge: crPending || (stats?.deliveries?.pending_change_requests ?? 0) },
     { id: "invoices", label: "Invoices" },
     { id: "backgrounds", label: "Backgrounds" },
     { id: "compliance", label: "Compliance" },
@@ -394,10 +466,17 @@ export default function AdminPanel({ onBack }) {
       <div className="flex gap-1 mb-8 glass rounded-xl p-1 w-fit">
         {tabs.map(t => (
           <button key={t.id} onClick={() => setTab(t.id)}
-            className={`px-5 py-2 rounded-lg text-sm font-medium transition-all ${
+            className={`px-5 py-2 rounded-lg text-sm font-medium transition-all flex items-center gap-2 ${
               tab === t.id ? "bg-brand text-white" : "text-gray-400 hover:text-white"
             }`}>
             {t.label}
+            {t.badge > 0 && (
+              <span className={`text-[10px] font-bold rounded-full px-1.5 min-w-[1.25rem] text-center ${
+                tab === t.id ? "bg-white/20 text-white" : "bg-amber-500/20 text-amber-300"
+              }`}>
+                {t.badge}
+              </span>
+            )}
           </button>
         ))}
       </div>
@@ -817,6 +896,183 @@ export default function AdminPanel({ onBack }) {
               </tbody>
             </table>
           </div>
+        </div>
+      )}
+
+      {/* Cambios — change requests from the portal (UMG asks for edits) */}
+      {tab === "changes" && (
+        <div className="space-y-5">
+          {/* Headline counters */}
+          <div className="grid grid-cols-2 gap-4 max-w-md">
+            <StatCard value={crPending} label="Pendientes" color={crPending > 0 ? "text-amber-300" : "text-gray-400"} />
+            <StatCard value={crResolved} label="Resueltos" color="text-emerald-300" />
+          </div>
+
+          {/* Filter pills */}
+          <div className="flex items-center gap-2">
+            {[
+              { id: "pending", label: "Pendientes" },
+              { id: "resolved", label: "Resueltos" },
+              { id: "all", label: "Todos" },
+            ].map(opt => (
+              <button
+                key={opt.id}
+                onClick={() => setCrStatusFilter(opt.id)}
+                className={`text-xs px-3 py-1.5 rounded-full font-medium transition ${
+                  crStatusFilter === opt.id
+                    ? "bg-brand text-white"
+                    : "bg-surface-3/40 text-gray-400 hover:text-white hover:bg-surface-3/70"
+                }`}
+              >
+                {opt.label}
+              </button>
+            ))}
+            <button
+              onClick={loadChangeRequests}
+              className="ml-auto text-xs text-gray-400 hover:text-white px-3 py-1.5"
+              title="Recargar"
+            >
+              {crLoading ? "Cargando…" : "↻ Recargar"}
+            </button>
+          </div>
+
+          {/* List */}
+          {crLoading && crItems.length === 0 ? (
+            <div className="glass rounded-card p-8 text-center text-sm text-gray-500">
+              Cargando cambios…
+            </div>
+          ) : crItems.length === 0 ? (
+            <div className="glass rounded-card p-8 text-center text-sm text-gray-500">
+              {crStatusFilter === "pending"
+                ? "No hay pedidos de cambio pendientes. ✓"
+                : crStatusFilter === "resolved"
+                ? "Todavía no se resolvió ningún pedido."
+                : "Sin pedidos de cambio."}
+            </div>
+          ) : (
+            <div className="space-y-3">
+              {crItems.map(item => {
+                const d = item.delivery;
+                const isResolved = !!item.resolved_at;
+                const submitted = item.submitted_at
+                  ? new Date(item.submitted_at).toLocaleString("es-AR", { dateStyle: "short", timeStyle: "short" })
+                  : "—";
+                const resolved = item.resolved_at
+                  ? new Date(item.resolved_at).toLocaleString("es-AR", { dateStyle: "short", timeStyle: "short" })
+                  : null;
+                const draft = crResolveDraft[item.id] || "";
+                return (
+                  <div
+                    key={item.id}
+                    className={`glass rounded-card p-5 border-l-4 ${
+                      isResolved ? "border-emerald-500/60 opacity-75" : "border-amber-400"
+                    }`}
+                  >
+                    {/* Top: delivery context */}
+                    <div className="flex items-start justify-between gap-3 mb-3 flex-wrap">
+                      <div className="min-w-0">
+                        <p className="text-[10px] uppercase tracking-wider text-brand font-bold mb-0.5">
+                          {d?.artist || "(sin artista)"}
+                        </p>
+                        <h3 className="text-base font-bold leading-snug">
+                          {d?.song || "(canción eliminada)"}
+                        </h3>
+                        <div className="flex items-center gap-2 mt-1 flex-wrap text-[11px] text-gray-500">
+                          {d?.label && <span>{d.label}</span>}
+                          {d?.frame_size && (
+                            <>
+                              <span>·</span>
+                              <span className="text-brand-light">{d.frame_size}</span>
+                            </>
+                          )}
+                          {d?.job_id && (
+                            <>
+                              <span>·</span>
+                              <span className="font-mono">job {d.job_id}</span>
+                            </>
+                          )}
+                          {d?.tenant && (
+                            <>
+                              <span>·</span>
+                              <span>{d.tenant}</span>
+                            </>
+                          )}
+                          {d?.removed_at && (
+                            <span className="text-red-300">· entrega eliminada</span>
+                          )}
+                        </div>
+                      </div>
+                      <span
+                        className={`text-[10px] font-bold uppercase px-2 py-1 rounded-full shrink-0 ${
+                          isResolved
+                            ? "bg-emerald-500/15 text-emerald-300"
+                            : "bg-amber-500/15 text-amber-300"
+                        }`}
+                      >
+                        {isResolved ? "✓ Resuelto" : "⏳ Pendiente"}
+                      </span>
+                    </div>
+
+                    {/* Comment */}
+                    <div className="rounded-lg bg-surface-3/30 ring-1 ring-white/[0.04] p-3 text-sm leading-relaxed whitespace-pre-wrap">
+                      {item.comment}
+                    </div>
+
+                    {/* Submission meta */}
+                    <p className="text-[11px] text-gray-500 mt-2">
+                      UMG envió este pedido el {submitted}
+                    </p>
+
+                    {/* Resolution section */}
+                    {isResolved ? (
+                      <div className="mt-3 pt-3 border-t border-white/[0.06] flex items-start justify-between gap-3 flex-wrap">
+                        <div className="text-[11px] text-gray-400 min-w-0">
+                          <span className="text-emerald-300 font-medium">Resuelto</span>
+                          {item.resolved_by && <> por <b>{item.resolved_by}</b></>}
+                          {" "}el {resolved}
+                          {item.resolution_note && (
+                            <p className="mt-1 text-gray-300 whitespace-pre-wrap">
+                              <span className="text-gray-500">Respuesta: </span>
+                              {item.resolution_note}
+                            </p>
+                          )}
+                        </div>
+                        <button
+                          onClick={() => reopenChangeRequest(item.id)}
+                          disabled={crResolvingId === item.id}
+                          className="text-[11px] text-amber-300 hover:text-amber-200 disabled:opacity-50"
+                        >
+                          Reabrir
+                        </button>
+                      </div>
+                    ) : (
+                      <div className="mt-3 pt-3 border-t border-white/[0.06] space-y-2">
+                        <input
+                          type="text"
+                          placeholder="Respuesta opcional (ej: re-renderizado con la línea corregida)"
+                          value={draft}
+                          onChange={(e) =>
+                            setCrResolveDraft({ ...crResolveDraft, [item.id]: e.target.value })
+                          }
+                          className="input-field !py-2 text-xs w-full"
+                          maxLength={2000}
+                        />
+                        <div className="flex justify-end">
+                          <button
+                            onClick={() => resolveChangeRequest(item.id)}
+                            disabled={crResolvingId === item.id}
+                            className="btn-primary !py-1.5 !px-3 text-xs disabled:opacity-50"
+                          >
+                            {crResolvingId === item.id ? "Guardando…" : "Marcar resuelto"}
+                          </button>
+                        </div>
+                      </div>
+                    )}
+                  </div>
+                );
+              })}
+            </div>
+          )}
         </div>
       )}
 
