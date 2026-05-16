@@ -100,7 +100,19 @@ engine = create_engine(
     pool_size=_DB_POOL_SIZE,
     max_overflow=_DB_MAX_OVERFLOW,
     pool_pre_ping=True,
-    pool_recycle=300,
+    # Force-recycle pool connections every 120 s. Defensive layer on top
+    # of pool_pre_ping for Railway Postgres, which drops idle conns in a
+    # narrow window between the pre-ping and the actual query — a race
+    # we see surface as `psycopg2.OperationalError: SSL connection has
+    # been closed unexpectedly` on hot endpoints (/upload-part-proxy).
+    # Previously 300 s. Lower = more reconnect churn but less stale
+    # surface area.
+    pool_recycle=120,
+    # Rollback any in-flight transaction state when a session returns to
+    # the pool. Prevents a half-aborted tx from a previous request from
+    # poisoning the next checkout. No-op in SQLite (used in tests); on
+    # Postgres this is a cheap ROLLBACK at checkin time.
+    pool_reset_on_return="rollback",
     echo=os.environ.get("SQL_ECHO", "").lower() == "true",
     connect_args=_keepalive_args,
 )
@@ -361,6 +373,14 @@ class Job(Base):
     # job 2144aacb453e killed at video/40% during a deploy, invisible to any
     # reaper for 87 min.
     last_progress_at = Column(DateTime(timezone=True), nullable=True)
+    # Archive of deliverable s3_keys overwritten by a previous re-render
+    # (typography/lyrics/background edit). Each entry:
+    #   {"version": N, "edit_type": "lyrics", "archived_at": "ISO-8601",
+    #    "keys": {"video": "...v1", "short": "...v1", ...}}
+    # Populated by run_edit_pipeline right before _upload_deliverables_to_r2
+    # so an operator can roll back a bad re-sync (manually fetch the .vN
+    # key from R2). NULL for jobs that have never been edited.
+    previous_versions = Column(JSONB, nullable=True)
     # Touched by every authenticated user action that signals "I'm still
     # working on this job" (POST /jobs/{id}/save-segments, GET /status/{id},
     # etc). find_abandoned_transcribed uses coalesce(last_user_activity_at,
@@ -807,6 +827,11 @@ def _migrate_user_columns():
         # /jobs liste con `variant_count` eficientemente.
         "ALTER TABLE jobs ADD COLUMN IF NOT EXISTS parent_job_id VARCHAR(32)",
         "CREATE INDEX IF NOT EXISTS ix_jobs_parent_job_id ON jobs(parent_job_id)",
+        # Archive of previous deliverable s3_keys overwritten by a partial
+        # re-render (lyrics/typography/background edit). Populated by
+        # run_edit_pipeline before _upload_deliverables_to_r2 so an operator
+        # can roll back a bad re-sync — the {key}.vN object stays in R2.
+        "ALTER TABLE jobs ADD COLUMN IF NOT EXISTS previous_versions JSONB",
     ]
     # Each statement gets its own transaction. In Postgres, a failed statement
     # inside a transaction puts it in aborted state — subsequent execute()

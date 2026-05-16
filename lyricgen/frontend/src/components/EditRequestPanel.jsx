@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import { useI18n } from "../i18n";
 import BackgroundHintField from "./BackgroundHintField";
+import LyricsEditor from "./LyricsEditor";
 
 const API = import.meta.env.VITE_API_URL || "";
 
@@ -81,17 +82,26 @@ export default function EditRequestPanel({
   const initialParams = job.render_params || {};
 
   const [mode, setMode] = useState(null); // null | "typography" | "background" | "lyrics"
-  // Lyrics editing state. Hydrated from job.segments_json when the user
-  // enters lyrics mode. We keep the array shape the backend expects
-  // (start, end, text) and let the user mutate text inline. Timing
-  // edits go through Sync Mode in the dedicated LyricsEditor — kept
-  // out of this panel to avoid duplicating that complexity here.
-  const [lyricsDraft, setLyricsDraft] = useState([]);
+  // Audio source URL for the full-editor modal. Fetched lazily when the
+  // operator opens "Lyrics" — same MP3 the worker would use for a re-
+  // render. Null while loading; non-null once /jobs/{id}/source-audio-url
+  // responds; we surface the error inline if R2 has lost the input.
+  const [lyricsAudioUrl, setLyricsAudioUrl] = useState(null);
+  const [lyricsAudioError, setLyricsAudioError] = useState(null);
   // Operator-typed background hint for edit_type="background". Empty
   // string when the operator hasn't typed anything (we send no field in
   // that case and the pipeline falls back to Gemini's lyrics-only
   // analysis with the debiased system prompt + 3 contrastive examples).
   const [backgroundHint, setBackgroundHint] = useState("");
+  // Latest segments from the nested LyricsEditor (updated synchronously
+  // on every edit via `onEditedChange`). Held in a ref so buildPayload
+  // can read it without re-renders. Used to include the operator's
+  // pending text corrections in a background-regen POST, closing the
+  // 3 s autosave race documented in the LyricsEditor comment above.
+  // Null until the operator touches the editor; we keep it null when
+  // untouched so we don't accidentally overwrite segments_json with a
+  // mirror of itself on a no-op edit.
+  const latestEditedSegments = useRef(null);
   const [form, setForm] = useState({
     font:             initialParams.font             ?? "",
     font_scale:       initialParams.font_scale       ?? 1.0,
@@ -166,29 +176,37 @@ export default function EditRequestPanel({
 
   // Only send the fields the operator actually changed — the backend
   // treats missing fields as "keep the prior value".
+  //
+  // Both `background` and `typography` paths now optionally include
+  // `segments` when the operator was editing lyric text inside the
+  // modal's LyricsEditor and clicked the regen button before the 3 s
+  // autosave debounce fired. The backend persists these segments to
+  // segments_json before enqueueing, so the worker reads the corrected
+  // text regardless of edit_type. Incident 2026-05-15: Bersuit lyric
+  // "de la amor" → "del amor" was silently dropped on background
+  // re-renders because of this race.
   const buildPayload = (type) => {
     if (type === "background") {
       const p = { edit_type: "background" };
       const hint = (backgroundHint || "").trim();
       if (hint) p.background_hint = hint;
+      if (latestEditedSegments.current && latestEditedSegments.current.length > 0) {
+        p.segments = latestEditedSegments.current;
+      }
       return p;
     }
-    if (type === "lyrics") {
-      return {
-        edit_type: "lyrics",
-        segments: lyricsDraft.map((s) => ({
-          start: Number(s.start) || 0,
-          end: Number(s.end) || 0,
-          text: String(s.text || ""),
-        })),
-      };
-    }
+    // edit_type === "lyrics" no longer builds via this function — it's
+    // owned by submitLyricsWithSegments() which receives segments from
+    // the modal LyricsEditor's onApprove callback.
     const p = { edit_type: "typography" };
     if (form.font             !== (initialParams.font             ?? "")) p.font = form.font;
     if (form.font_scale       !== (initialParams.font_scale       ?? 1.0)) p.font_scale = form.font_scale;
     if (form.text_case        !== (initialParams.text_case        ?? "upper")) p.text_case = form.text_case;
     if (form.lyric_transition !== (initialParams.lyric_transition ?? "cut")) p.lyric_transition = form.lyric_transition;
     if (form.text_motion      !== (initialParams.text_motion      ?? "none")) p.text_motion = form.text_motion;
+    if (latestEditedSegments.current && latestEditedSegments.current.length > 0) {
+      p.segments = latestEditedSegments.current;
+    }
     return p;
   };
 
@@ -207,16 +225,132 @@ export default function EditRequestPanel({
   // Pre-#121 the field was always undefined → reference stable → no
   // loop. The exhaustive-deps lint warning is intentional.
   useEffect(() => {
-    if (mode === "lyrics") {
-      const segs = Array.isArray(job.segments_json) ? job.segments_json : [];
-      setLyricsDraft(segs.map((s) => ({
-        start: s.start,
-        end: s.end,
-        text: s.text || "",
-      })));
-    }
+    if (mode !== "lyrics") return;
+    let cancelled = false;
+    setLyricsAudioError(null);
+    setLyricsAudioUrl(null);
+    (async () => {
+      try {
+        const res = await fetch(`${API}/jobs/${job.job_id}/source-audio-url`, {
+          headers: authHeaders(),
+        });
+        if (cancelled) return;
+        if (!res.ok) {
+          const data = await res.json().catch(() => ({}));
+          setLyricsAudioError(
+            (typeof data.detail === "string" ? data.detail : null)
+            || (t("edit.lyrics_audio_unavailable") ||
+              "El audio fuente no está disponible — solo podrás editar texto sin escuchar playback.")
+          );
+          return;
+        }
+        const data = await res.json();
+        if (!cancelled) setLyricsAudioUrl(data.url);
+      } catch (e) {
+        if (!cancelled) setLyricsAudioError(e?.message || "Network error");
+      }
+    })();
+    return () => { cancelled = true; };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [mode]);
+  }, [mode, job.job_id]);
+
+  // Single POST with 409 youtube_already_published retry handling.
+  // Returns {ok, data, status, cancelled} so the caller can decide
+  // what to do — setError on failure, propagate onEditTriggered on
+  // success. cancelled=true means the operator declined the confirm.
+  const postEditWithRetry = async (payload) => {
+    let res = await fetch(`${API}/edit/${job.job_id}`, {
+      method: "POST",
+      headers: { ...authHeaders(), "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    });
+    let data = await res.json().catch(() => ({}));
+    if (
+      res.status === 409 &&
+      data?.detail?.code === "youtube_already_published"
+    ) {
+      const url = data.detail.youtube_url;
+      const msg = (t("edit.youtube_drift_confirm") ||
+        "Este video ya está publicado en YouTube. La re-sincronización actualizará el archivo en la plataforma pero NO reemplazará el video en YouTube (la API de YouTube no permite reemplazar archivos, solo metadata).\n\n¿Continuar igual?")
+        + (url ? `\n\nYouTube: ${url}` : "");
+      if (!window.confirm(msg)) {
+        return { ok: false, cancelled: true };
+      }
+      res = await fetch(`${API}/edit/${job.job_id}`, {
+        method: "POST",
+        headers: { ...authHeaders(), "Content-Type": "application/json" },
+        body: JSON.stringify({ ...payload, allow_youtube_drift: true }),
+      });
+      data = await res.json().catch(() => ({}));
+    }
+    return { ok: res.ok, status: res.status, data };
+  };
+
+  // Lyrics submit path used by the full-editor modal: the operator
+  // edits segments in LyricsEditor and on Approve we receive them
+  // directly (no internal draft state). Validates non-empty, short-
+  // circuits the "nothing actually changed" case, fires POST + 409
+  // retry, and notifies the parent on success.
+  const submitLyricsWithSegments = async (segments) => {
+    if (submitLockRef.current || limitReached) return;
+    submitLockRef.current = true;
+    if (!Array.isArray(segments) || segments.length === 0) {
+      if (mountedRef.current) {
+        setError(t("edit.lyrics_empty") || "Las letras quedaron vacías — no hay nada que renderizar.");
+      }
+      submitLockRef.current = false;
+      return;
+    }
+    const payload = {
+      edit_type: "lyrics",
+      segments: segments.map((s) => ({
+        start: Number(s.start) || 0,
+        end: Number(s.end) || 0,
+        text: String(s.text || ""),
+      })),
+    };
+    // No-change short-circuit: same exact array as the persisted one.
+    const original = Array.isArray(job.segments_json) ? job.segments_json : [];
+    const unchanged = original.length === payload.segments.length &&
+      original.every((s, i) =>
+        s.text === payload.segments[i].text &&
+        Math.abs((s.start ?? 0) - payload.segments[i].start) < 0.001 &&
+        Math.abs((s.end ?? 0) - payload.segments[i].end) < 0.001
+      );
+    if (unchanged) {
+      if (mountedRef.current) {
+        setError(t("edit.no_changes") || "No cambiaste ninguna opción — no hay nada que re-renderizar.");
+      }
+      submitLockRef.current = false;
+      return;
+    }
+    if (mountedRef.current) setSubmitting(true);
+    if (mountedRef.current) setError(null);
+    let succeeded = false;
+    try {
+      const { ok, status, data, cancelled } = await postEditWithRetry(payload);
+      if (cancelled) return;
+      if (!ok) {
+        const friendly = translateBackendError(data?.detail) || `Error ${status}`;
+        if (mountedRef.current) setError(friendly);
+        return;
+      }
+      succeeded = true;
+      submitLockRef.current = false;
+      if (mountedRef.current) {
+        setMode(null);
+        setSubmitting(false);
+      }
+      if (onEditTriggered) onEditTriggered(data);
+    } catch (e) {
+      if (mountedRef.current) setError(e?.message || "Network error");
+    } finally {
+      submitLockRef.current = false;
+      if (!succeeded && mountedRef.current) {
+        setSubmitting(false);
+      }
+    }
+  };
 
   const submit = async (type) => {
     if (submitLockRef.current || limitReached) return;
@@ -234,44 +368,15 @@ export default function EditRequestPanel({
       submitLockRef.current = false;
       return;
     }
-    if (type === "lyrics") {
-      if (!payload.segments || payload.segments.length === 0) {
-        if (mountedRef.current) {
-          setError(t("edit.lyrics_empty") || "Las letras quedaron vacías — no hay nada que renderizar.");
-        }
-        submitLockRef.current = false;
-        return;
-      }
-      // No-change short-circuit: if every line text is identical to
-      // job.segments_json's, don't burn an edit.
-      const original = Array.isArray(job.segments_json) ? job.segments_json : [];
-      const unchanged = original.length === payload.segments.length &&
-        original.every((s, i) =>
-          s.text === payload.segments[i].text &&
-          Math.abs((s.start ?? 0) - payload.segments[i].start) < 0.001 &&
-          Math.abs((s.end ?? 0) - payload.segments[i].end) < 0.001
-        );
-      if (unchanged) {
-        if (mountedRef.current) {
-          setError(t("edit.no_changes") || "No cambiaste ninguna opción — no hay nada que re-renderizar.");
-        }
-        submitLockRef.current = false;
-        return;
-      }
-    }
 
     if (mountedRef.current) setSubmitting(true);
     if (mountedRef.current) setError(null);
     let succeeded = false;
     try {
-      const res = await fetch(`${API}/edit/${job.job_id}`, {
-        method: "POST",
-        headers: { ...authHeaders(), "Content-Type": "application/json" },
-        body: JSON.stringify(payload),
-      });
-      const data = await res.json().catch(() => ({}));
-      if (!res.ok) {
-        const friendly = translateBackendError(data.detail) || `Error ${res.status}`;
+      const { ok, status, data, cancelled } = await postEditWithRetry(payload);
+      if (cancelled) return;
+      if (!ok) {
+        const friendly = translateBackendError(data?.detail) || `Error ${status}`;
         if (mountedRef.current) setError(friendly);
         return;
       }
@@ -428,73 +533,10 @@ export default function EditRequestPanel({
         </div>
       )}
 
-      {mode === "lyrics" && (
-        <div className="space-y-3 animate-fade-in">
-          <div className="flex items-center justify-between gap-2">
-            <p className="text-xs text-ink-secondary">
-              {t("edit.lyrics_panel_hint") ||
-                "Corregí texto de cualquier línea. Los tiempos no cambian — para mover líneas individuales usá el editor completo desde la subida."}
-            </p>
-            <button
-              type="button"
-              onClick={() => { setMode(null); setError(null); }}
-              className="text-[11px] text-gray-400 hover:text-white px-2 py-1 transition-colors shrink-0"
-            >
-              {t("edit.cancel") || "Cancelar"}
-            </button>
-          </div>
-
-          {lyricsDraft.length === 0 ? (
-            <div className="rounded-card px-3 py-4 bg-amber-500/[0.08] ring-1 ring-amber-500/25">
-              <p className="text-xs text-amber-200">
-                {t("edit.lyrics_no_segments") ||
-                  "Este job no tiene letras guardadas. Esto pasa con jobs muy viejos. Subí la canción de nuevo para editar letras."}
-              </p>
-            </div>
-          ) : (
-            <div className="rounded-card bg-surface-1/40 ring-1 ring-white/[0.04] max-h-[55vh] overflow-y-auto">
-              <ul className="divide-y divide-white/[0.04]">
-                {lyricsDraft.map((seg, idx) => (
-                  <li key={idx} className="flex items-start gap-3 px-3 py-2">
-                    <span className="text-[10px] font-mono text-gray-600 tabular-nums w-14 shrink-0 mt-2">
-                      {seg.start.toFixed(2)}s
-                    </span>
-                    <input
-                      type="text"
-                      value={seg.text}
-                      onChange={(e) => {
-                        const v = e.target.value;
-                        setLyricsDraft((prev) => prev.map((s, i) =>
-                          i === idx ? { ...s, text: v } : s
-                        ));
-                      }}
-                      className="flex-1 text-sm bg-transparent border-none outline-none focus:bg-surface-2/40 rounded px-2 py-1.5 text-white"
-                      maxLength={500}
-                    />
-                  </li>
-                ))}
-              </ul>
-            </div>
-          )}
-
-          {error && (
-            <p className="text-[11px] text-red-400">{error}</p>
-          )}
-
-          <div className="flex items-center justify-end gap-2">
-            <button
-              type="button"
-              onClick={() => submit("lyrics")}
-              disabled={submitting || lyricsDraft.length === 0}
-              className="btn-primary text-xs h-9 px-4 disabled:opacity-50"
-            >
-              {submitting
-                ? (t("edit.submitting") || "Aplicando...")
-                : (t("edit.lyrics_submit") || "Re-renderizar con letras corregidas")}
-            </button>
-          </div>
-        </div>
-      )}
+      {/* Lyrics mode renders as a full-screen modal overlay at the very
+          end of this component — the inline panel collapses while it's
+          open. See the {mode === "lyrics" && ...} block below the
+          background section. */}
 
       {mode === "typography" && (
         <div className="space-y-3 animate-fade-in">
@@ -736,6 +778,159 @@ export default function EditRequestPanel({
           </div>
         </div>
       )}
+
+      {/* Lyrics re-sync modal. Full-screen overlay that mounts the same
+          LyricsEditor used by the wizard, but in "post-approval" mode:
+          audio streams from a signed R2 URL, no auto-split / autosave /
+          beforeunload, submit button renamed to communicate the re-render
+          intent. The operator's Approve callback hands us the cleaned
+          segments which we POST to /edit (with the 409 YouTube guard).
+
+          Layout notes:
+          - flex justify-center wraps the editor — its root is
+            max-w-3xl without mx-auto (the wizard parent does that
+            centering), so without this wrapper the editor renders
+            flush-left and leaves a huge dead space on the right.
+          - Body scroll lock so the underlying JobDetail content
+            doesn't scroll around behind the overlay when the operator
+            scrolls the editor's long segment list.
+          - Solid bg (no /95 + backdrop-blur) — the blur effect
+            distorted text legibility on the underlying job preview. */}
+      <LyricsEditModal
+        open={mode === "lyrics"}
+        audioError={lyricsAudioError}
+        error={error}
+        job={job}
+        onClose={() => { setMode(null); setError(null); }}
+        audioUrl={lyricsAudioUrl}
+        onApprove={submitLyricsWithSegments}
+        submitting={submitting}
+        initialParams={initialParams}
+        t={t}
+      />
+    </div>
+  );
+}
+
+/** Full-screen modal that hosts the LyricsEditor for post-approval re-sync.
+ *
+ * Split out from EditRequestPanel's render tree so the body-scroll-lock
+ * useEffect can hook on `open` without polluting the parent component's
+ * concerns, and so the heavy LyricsEditor only mounts when the modal is
+ * actually opened (preserves the editor's "fresh start on each open"
+ * behavior — editHistory, syncMode, etc are reset).
+ */
+function LyricsEditModal({
+  open, audioError, error, job, onClose, audioUrl, onApprove,
+  submitting, initialParams, t,
+}) {
+  // Lock the underlying body scroll while the modal is open. Without
+  // this, scrolling on the modal's segment list bleeds through to the
+  // JobDetail page underneath on macOS/Safari, which felt broken.
+  useEffect(() => {
+    if (!open) return;
+    const prev = document.body.style.overflow;
+    document.body.style.overflow = "hidden";
+    return () => { document.body.style.overflow = prev; };
+  }, [open]);
+
+  // Close on Escape — standard modal behavior.
+  useEffect(() => {
+    if (!open) return;
+    const onKey = (e) => { if (e.key === "Escape") onClose(); };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [open, onClose]);
+
+  if (!open) return null;
+  const noSegments = !Array.isArray(job.segments_json) || job.segments_json.length === 0;
+
+  return (
+    <div className="fixed inset-0 z-[60] bg-surface overflow-y-auto">
+      <div className="min-h-screen px-4 py-8 sm:px-8">
+        <div className="max-w-3xl mx-auto">
+          {audioError && (
+            <div className="mb-4 rounded-2xl ring-1 ring-amber-500/30 bg-amber-500/[0.08] px-4 py-3">
+              <p className="text-xs text-amber-200">{audioError}</p>
+            </div>
+          )}
+          {error && (
+            <div className="mb-4 rounded-2xl ring-1 ring-red-500/30 bg-red-500/[0.08] px-4 py-3">
+              <p className="text-xs text-red-300">{error}</p>
+            </div>
+          )}
+        </div>
+        <div className="flex justify-center">
+          {noSegments ? (
+            <div className="max-w-3xl w-full rounded-2xl ring-1 ring-amber-500/30 bg-amber-500/[0.08] px-4 py-4">
+              <p className="text-sm text-amber-200 mb-3">
+                {t("edit.lyrics_no_segments") ||
+                  "Este job no tiene letras guardadas. Esto pasa con jobs muy viejos. Subí la canción de nuevo para editar letras."}
+              </p>
+              <button
+                type="button"
+                onClick={onClose}
+                className="btn-secondary text-xs h-9 px-4"
+              >
+                {t("edit.cancel") || "Cancelar"}
+              </button>
+            </div>
+          ) : (
+            <LyricsEditor
+              segments={job.segments_json}
+              filename={job.filename || job.artist || "lyrics"}
+              audioFile={null}
+              audioUrl={audioUrl}
+              referenceLyrics=""
+              onApprove={onApprove}
+              onBack={onClose}
+              isBatch={false}
+              user={null}
+              font={initialParams.font || ""}
+              textCase={initialParams.text_case || "upper"}
+              fontScale={initialParams.font_scale || 1.0}
+              lyricTransition={initialParams.lyric_transition || "cut"}
+              textMotion={initialParams.text_motion || "none"}
+              disableAutoSplit
+              disableBeforeUnload
+              // Autosave ON inside the /edit modal: backend's
+              // /save-segments now accepts pending_review (incident
+              // 2026-05-15 — without this, text corrections made
+              // here lived only in component state and got dropped
+              // on any subsequent background re-render).
+              transcribeJobId={job.job_id}
+              onPersistSegments={async (jobId, segs) => {
+                try {
+                  await fetch(`${API}/jobs/${jobId}/save-segments`, {
+                    method: "POST",
+                    headers: {
+                      "Content-Type": "application/json",
+                      ...authHeaders(),
+                    },
+                    body: JSON.stringify({ segments: segs }),
+                  });
+                } catch (e) {
+                  // Best-effort autosave; if it fails the operator can
+                  // still click "Apply lyrics" to commit segments via
+                  // the explicit /edit?edit_type=lyrics path.
+                  // eslint-disable-next-line no-console
+                  console.warn("[EditRequestPanel] autosave failed", e);
+                }
+              }}
+              // Synchronous mirror of the editor's current segments,
+              // captured into a ref so buildPayload can include them
+              // in /edit POSTs without racing the 3 s autosave debounce.
+              onEditedChange={(segs) => { latestEditedSegments.current = segs; }}
+              submitLabel={
+                submitting
+                  ? (t("edit.submitting") || "Aplicando...")
+                  : (t("edit.lyrics_resync_submit") ||
+                    "Re-renderizar con letras y tiempos corregidos")
+              }
+            />
+          )}
+        </div>
+      </div>
     </div>
   );
 }

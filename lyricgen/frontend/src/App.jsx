@@ -383,6 +383,11 @@ export default function App() {
   const [history, setHistory] = useState([]);
   const [backgroundFile, setBackgroundFile] = useState(null);
   const [animateImage, setAnimateImage] = useState(false);
+  // match_lyrics toggle: when ON (default), Gemini reads the lyrics and
+  // builds the background around the song's primary visual subject. OFF
+  // falls back to pure genre/concept vocab. UMG 2026-05-14 incident
+  // motivation — operator wants a lever to control this per batch.
+  const [inspiredByLyrics, setInspiredByLyrics] = useState(true);
   const [backgroundId, setBackgroundId] = useState(null);
   // "as_is" reuses the library asset directly. "variation" tells the
   // backend to extract a frame and run Veo image-to-video to derive a
@@ -992,6 +997,7 @@ export default function App() {
         formData.append("text_motion", jobList[i].textMotion || "none");
         formData.append("text_contrast", jobList[i].textContrast || "medium");
         if (animateImage && backgroundFile) formData.append("animate_image", "true");
+        formData.append("match_lyrics", String(!!inspiredByLyrics));
         formData.append("segments_json", JSON.stringify(jobList[i].segments));
         formData.append("delivery_profile", delivery.delivery_profile);
         if (delivery.delivery_profile !== "youtube") {
@@ -1115,6 +1121,7 @@ export default function App() {
         generateBody.append("text_motion", jobList[i].textMotion || "none");
         generateBody.append("text_contrast", jobList[i].textContrast || "medium");
         if (animateImage && backgroundFile) generateBody.append("animate_image", "true");
+        generateBody.append("match_lyrics", String(!!inspiredByLyrics));
         if (backgroundId) {
           generateBody.append("background_id", backgroundId);
           generateBody.append("background_mode", backgroundMode);
@@ -1374,6 +1381,8 @@ export default function App() {
         onBackgroundMode={setBackgroundMode}
         animateImage={animateImage}
         onAnimateImage={setAnimateImage}
+        inspiredByLyrics={inspiredByLyrics}
+        onInspiredByLyricsChange={setInspiredByLyrics}
         allHaveArtist={allHaveArtist}
         onStartReview={handleStartReview}
         onGenerateDirect={handleGenerateDirect}

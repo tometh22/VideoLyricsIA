@@ -14,7 +14,14 @@
  *      a failed part retries with exponential backoff before failing
  *      the whole upload.
  *
- * The API container never sees the audio body — that's the point.
+ * The API container never sees the audio body — that's the point. This
+ * file historically routed through /upload-part-proxy (the API
+ * container relayed bytes to R2) to dodge a CORS 403 from R2. Root
+ * cause was the wrong AllowedOrigins in the bucket CORS policy. With
+ * scripts/r2_cors.json updated to include app.genly.pro and
+ * staging.app.genly.pro and applied via configure_r2_cors.sh, direct
+ * PUT works again and we no longer take Cloudflare's ~100 s proxy
+ * timeout on slow upstreams.
  *
  * Returns the job_id once the upload finishes; the caller follows up
  * with /transcribe-uploaded (editor flow) or /generate (direct).
@@ -48,7 +55,7 @@ async function apiPost(path, body) {
 }
 
 /**
- * Single-PUT upload with progress + abort support.
+ * PUT a blob to R2 via a presigned URL with progress + abort support.
  *
  * Why XHR and not fetch: the fetch API only emits `Response` body
  * progress (download), not request body progress (upload). XHR's
@@ -67,9 +74,10 @@ function putToR2WithProgress(url, blob, contentType, onProgress, signal) {
     }
     xhr.onload = () => {
       if (xhr.status >= 200 && xhr.status < 300) {
-        // ETag header is what `multipart_complete` needs. Browsers
-        // can sometimes block reading it (CORS exposure rules), but
-        // for single-PUT we don't need it.
+        // ETag header is required for multipart_complete. R2's CORS
+        // policy must expose it via ExposeHeaders: ["ETag"] (see
+        // scripts/r2_cors.json). If the policy is missing, ETag reads
+        // as null and the multipart upload finalizes broken.
         resolve({ etag: xhr.getResponseHeader("ETag") || null });
       } else {
         reject(new Error(`R2 PUT failed: ${xhr.status} ${xhr.statusText}`));
@@ -82,85 +90,6 @@ function putToR2WithProgress(url, blob, contentType, onProgress, signal) {
         xhr.abort();
         return;
       }
-      signal.addEventListener("abort", () => xhr.abort(), { once: true });
-    }
-    xhr.send(blob);
-  });
-}
-
-/** Upload a small file (<16 MB) via the backend proxy (POST raw bytes).
- * Avoids browser→R2 CORS preflight by routing through the same-origin API. */
-function uploadFileProxy(jobId, blob, contentType, onProgress, signal) {
-  return new Promise((resolve, reject) => {
-    const xhr = new XMLHttpRequest();
-    xhr.open("POST", `${API}/upload-file-proxy?job_id=${encodeURIComponent(jobId)}`, true);
-    const token = localStorage.getItem("genly_token");
-    if (token) xhr.setRequestHeader("Authorization", `Bearer ${token}`);
-    if (contentType) xhr.setRequestHeader("Content-Type", contentType);
-    if (xhr.upload && onProgress) {
-      xhr.upload.onprogress = (e) => {
-        if (e.lengthComputable) onProgress(e.loaded, e.total);
-      };
-    }
-    xhr.onload = () => {
-      if (xhr.status >= 200 && xhr.status < 300) {
-        try {
-          const { key } = JSON.parse(xhr.responseText);
-          resolve({ key });
-        } catch {
-          reject(new Error("File proxy upload: invalid response"));
-        }
-      } else {
-        let detail = "";
-        try { detail = JSON.parse(xhr.responseText).detail || ""; } catch {}
-        reject(new Error(`File proxy upload failed (${xhr.status})${detail ? ": " + detail : ""}`));
-      }
-    };
-    xhr.onerror = () => reject(new Error("File proxy upload network error"));
-    xhr.onabort = () => reject(Object.assign(new Error("aborted"), { aborted: true }));
-    if (signal) {
-      if (signal.aborted) { xhr.abort(); return; }
-      signal.addEventListener("abort", () => xhr.abort(), { once: true });
-    }
-    xhr.send(blob);
-  });
-}
-
-/** Upload one multipart part via the backend proxy (POST raw bytes).
- * Avoids browser→R2 CORS preflight by routing through the same-origin API. */
-function uploadPartProxy(jobId, partNumber, blob, onProgress, signal) {
-  return new Promise((resolve, reject) => {
-    const xhr = new XMLHttpRequest();
-    xhr.open(
-      "POST",
-      `${API}/upload-part-proxy?job_id=${encodeURIComponent(jobId)}&part_number=${partNumber}`,
-      true,
-    );
-    const token = localStorage.getItem("genly_token");
-    if (token) xhr.setRequestHeader("Authorization", `Bearer ${token}`);
-    if (xhr.upload && onProgress) {
-      xhr.upload.onprogress = (e) => {
-        if (e.lengthComputable) onProgress(e.loaded, e.total);
-      };
-    }
-    xhr.onload = () => {
-      if (xhr.status >= 200 && xhr.status < 300) {
-        try {
-          const { etag } = JSON.parse(xhr.responseText);
-          resolve(etag);
-        } catch {
-          reject(new Error("Proxy upload: invalid response"));
-        }
-      } else {
-        let detail = "";
-        try { detail = JSON.parse(xhr.responseText).detail || ""; } catch {}
-        reject(new Error(`Proxy upload failed (${xhr.status})${detail ? ": " + detail : ""}`));
-      }
-    };
-    xhr.onerror = () => reject(new Error("Proxy upload network error"));
-    xhr.onabort = () => reject(Object.assign(new Error("aborted"), { aborted: true }));
-    if (signal) {
-      if (signal.aborted) { xhr.abort(); return; }
       signal.addEventListener("abort", () => xhr.abort(), { once: true });
     }
     xhr.send(blob);
@@ -184,8 +113,9 @@ async function withRetry(fn, { maxAttempts = 6, baseMs = 1000 } = {}) {
   throw lastErr;
 }
 
-/** Multipart upload. Slices the File, presigns each part, PUTs in
- * parallel (capped concurrency), tracks per-part progress, finalizes. */
+/** Multipart upload. Slices the File, presigns each part, PUTs directly
+ * to R2 in parallel (capped concurrency), tracks per-part progress,
+ * finalizes via the backend. */
 async function multipartUpload({
   file,
   jobId,
@@ -226,16 +156,32 @@ async function multipartUpload({
           // global counter past 100%).
           perPartLoaded[i] = 0;
           reportProgress();
-          const result = await uploadPartProxy(
-            jobId, partNumber, blob,
-            (loaded) => { perPartLoaded[i] = loaded; reportProgress(); },
+          // Presign per-part (presigns are short-TTL so we sign on each
+          // attempt rather than once up-front). Direct PUT to R2 from
+          // the browser — no API container in the data path.
+          const { url } = await apiPost("/upload-multipart-part-url", {
+            job_id: jobId, part_number: partNumber,
+          });
+          const res = await putToR2WithProgress(
+            url, blob, contentType,
+            (loaded /* total */) => {
+              perPartLoaded[i] = loaded;
+              reportProgress();
+            },
             signal,
           );
+          if (!res.etag) {
+            throw new Error(
+              `Part ${partNumber}: R2 returned no ETag — ` +
+              `likely a CORS ExposeHeaders: ["ETag"] config issue. ` +
+              `Re-apply scripts/r2_cors.json via configure_r2_cors.sh.`
+            );
+          }
           // ensure final byte count is reflected even if onprogress
           // missed the very last chunk.
           perPartLoaded[i] = blob.size;
           reportProgress();
-          return result;
+          return res.etag;
         });
         parts.push({ part_number: partNumber, etag });
       } catch (err) {
@@ -270,7 +216,7 @@ async function multipartUpload({
  * `meta` is forwarded to /upload-url:
  *   - artist, title: optional pre-fill so the backend can short-circuit
  *     the lrclib lookup with a clean string instead of parsing the
- *     filename. Frontend already collects these per-row in UploadZone.
+ *     filename.
  *
  * `onProgress(loaded, total)` is called with cumulative byte counts as
  * upload progresses (single-PUT and multipart both report).
@@ -290,9 +236,10 @@ export async function uploadFileToR2(
   const contentType = file.type || "application/octet-stream";
 
   if (!ticket.use_multipart) {
-    // Route through the backend proxy so R2 bucket CORS is never on the
-    // critical path — same approach as the multipart part proxy.
-    await uploadFileProxy(ticket.job_id, file, contentType, onProgress, signal);
+    // Single-PUT path: one XHR.PUT direct to the presigned URL.
+    await putToR2WithProgress(
+      ticket.upload_url, file, contentType, onProgress, signal,
+    );
     return { jobId: ticket.job_id, key: ticket.key };
   }
 

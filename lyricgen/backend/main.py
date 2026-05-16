@@ -1980,8 +1980,16 @@ def _parse_umg_params(
 _MULTIPART_THRESHOLD_BYTES = int(
     os.environ.get("MULTIPART_THRESHOLD_BYTES", str(16 * 1024 * 1024))
 )
-# Max size of a single multipart part. R2 accepts up to 5 GB / part but
-# 8 MB is a healthy sweet spot for browser parallelism + retry granularity.
+# Max size of a single multipart part. S3/R2 require parts >= 5 MiB
+# (except the last). 4 MiB violated that and made every multipart-
+# complete fail with EntityTooSmall — confirmed in prod 2026-05-14 16:30
+# right after the part-size-down change went live. Back to 8 MiB, the
+# pre-incident default, which gives headroom over the 5 MiB floor and
+# keeps part counts low for browser parallelism.
+#
+# Cloudflare proxy timeout (originally why we tried 4 MiB) is being
+# addressed separately by restoring direct browser → R2 PUT (no proxy
+# in the data path); see PR for r2_cors + frontend rollback.
 _MULTIPART_PART_SIZE_BYTES = int(
     os.environ.get("MULTIPART_PART_SIZE_BYTES", str(8 * 1024 * 1024))
 )
@@ -2225,6 +2233,43 @@ async def upload_multipart_part_url(
     return {"url": url, "expires_in": _PRESIGN_PUT_TTL_S}
 
 
+async def _drain_to_spooled(request: Request, max_bytes: int):
+    """Stream the request body into a SpooledTemporaryFile.
+
+    Async-generator driven (`async for chunk in request.stream()`) so
+    the worker yields to the event loop between chunks. Crucial for
+    concurrent uploads from slow upstreams: previously `await
+    request.body()` blocked the worker for the full upstream duration
+    (~80 s per 4 MB part on a residential connection). With 5 audios
+    × 4 parts in flight, all 20 workers were pinned waiting for bytes,
+    starving every other endpoint and tanking effective throughput.
+
+    Memory profile: SpooledTemporaryFile keeps the body in RAM up to
+    `max_size` (8 MiB) and spills to disk only above that. For our
+    4 MB part size the body stays in RAM — same footprint as before,
+    but worker time is freed.
+
+    Returns a rewound file object ready for boto3 to read. Raises
+    HTTPException(413) if `max_bytes` is exceeded mid-stream.
+    """
+    from tempfile import SpooledTemporaryFile
+    f = SpooledTemporaryFile(max_size=8 * 1024 * 1024, mode="w+b")
+    total = 0
+    async for chunk in request.stream():
+        if not chunk:
+            continue
+        total += len(chunk)
+        if total > max_bytes:
+            f.close()
+            raise HTTPException(status_code=413, detail="Body exceeds size limit.")
+        f.write(chunk)
+    if total == 0:
+        f.close()
+        raise HTTPException(status_code=400, detail="Empty body.")
+    f.seek(0)
+    return f
+
+
 @app.post("/upload-part-proxy")
 @limiter.limit("600/minute")
 async def upload_part_proxy(
@@ -2236,11 +2281,19 @@ async def upload_part_proxy(
 ):
     """Proxy a multipart chunk to R2 server-side. The browser POSTs raw
     bytes here (same-origin, no CORS preflight) instead of PUTting directly
-    to r2.cloudflarestorage.com which would require R2 bucket CORS config."""
+    to r2.cloudflarestorage.com which would require R2 bucket CORS config.
+
+    Body is read via async streaming into a spooled temp file (see
+    _drain_to_spooled). boto3 then runs in a thread executor so the
+    event loop stays free for other concurrent requests."""
     if part_number < 1 or part_number > 10_000:
         raise HTTPException(status_code=400, detail="part_number out of range")
-    from jobs import get_job_model
-    job_row = get_job_model(db, job_id)
+    # Resilient lookup: the global DbTransientRetryMiddleware can't
+    # replay this request (body > 1 MiB), so we handle SSL drops inline
+    # before reading the body. See jobs.get_job_model_resilient for the
+    # production incident this addresses.
+    from jobs import get_job_model_resilient
+    job_row = get_job_model_resilient(db, job_id)
     if (not job_row
             or job_row.user_id != current_user["id"]
             or job_row.tenant_id != current_user["tenant_id"]):
@@ -2252,12 +2305,17 @@ async def upload_part_proxy(
     content_length = int(request.headers.get("content-length") or 0)
     if content_length > _MULTIPART_PART_SIZE_BYTES + 1024:
         raise HTTPException(status_code=413, detail="Chunk exceeds part size limit.")
-    data = await request.body()
-    if not data:
-        raise HTTPException(status_code=400, detail="Empty chunk.")
-    etag = storage.upload_part(
-        job_row.input_r2_key, job_row.multipart_upload_id, part_number, data
-    )
+
+    key = job_row.input_r2_key
+    upload_id = job_row.multipart_upload_id
+    body = await _drain_to_spooled(request, _MULTIPART_PART_SIZE_BYTES + 1024)
+    try:
+        loop = asyncio.get_event_loop()
+        etag = await loop.run_in_executor(
+            None, storage.upload_part, key, upload_id, part_number, body,
+        )
+    finally:
+        body.close()
     if etag is None:
         raise HTTPException(status_code=502, detail="R2 part upload failed.")
     return {"etag": etag}
@@ -2275,8 +2333,10 @@ async def upload_file_proxy(
     bytes here (same-origin, no CORS preflight) instead of PUTting directly
     to r2.cloudflarestorage.com which would require R2 bucket CORS config.
     Mirrors /upload-part-proxy for the non-multipart (<16 MB) path."""
-    from jobs import get_job_model
-    job_row = get_job_model(db, job_id)
+    # Resilient lookup — see /upload-part-proxy for why the global
+    # middleware can't help (body too large to buffer for replay).
+    from jobs import get_job_model_resilient
+    job_row = get_job_model_resilient(db, job_id)
     if (not job_row
             or job_row.user_id != current_user["id"]
             or job_row.tenant_id != current_user["tenant_id"]):
@@ -2292,14 +2352,20 @@ async def upload_file_proxy(
     content_length = int(request.headers.get("content-length") or 0)
     if content_length > MAX_UPLOAD_MB * 1024 * 1024:
         raise HTTPException(status_code=413, detail="File exceeds maximum upload size.")
-    data = await request.body()
-    if not data:
-        raise HTTPException(status_code=400, detail="Empty file body.")
+
     content_type = request.headers.get("content-type") or "application/octet-stream"
-    ok = storage.put_object_bytes(job_row.input_r2_key, data, content_type)
+    key = job_row.input_r2_key
+    body = await _drain_to_spooled(request, MAX_UPLOAD_MB * 1024 * 1024)
+    try:
+        loop = asyncio.get_event_loop()
+        ok = await loop.run_in_executor(
+            None, storage.put_object_bytes, key, body, content_type,
+        )
+    finally:
+        body.close()
     if not ok:
         raise HTTPException(status_code=502, detail="R2 upload failed.")
-    return {"job_id": job_id, "key": job_row.input_r2_key}
+    return {"job_id": job_id, "key": key}
 
 
 class _MultipartCompleteReq(BaseModel):
@@ -2654,6 +2720,7 @@ async def upload(
         artist=artist,
         style=style,
         plan=current_user.get("plan", "100"),
+        tenant_id=current_user.get("tenant_id", ""),
         language=lang,
         delivery_profile=delivery_profile,
         umg_spec=umg_spec,
@@ -3069,9 +3136,21 @@ async def _run_transcription_for_job(
                             except OSError:
                                 pass
 
+                # When LRCLIB_PLAIN_ALIGNER_ENABLED, request word-level
+                # timestamps so we can re-bucket Whisper's output against
+                # LRCLib's curated line structure (see aligner pass below).
+                # Default off — flip via env for staged rollout.
+                aligner_enabled = (
+                    os.environ.get("LRCLIB_PLAIN_ALIGNER_ENABLED", "0")
+                    .strip().lower() in ("1", "true", "yes", "on", "y", "t")
+                )
                 try:
                     segments = await loop.run_in_executor(
-                        None, transcribe, transcribe_path, lang, plain,
+                        None,
+                        lambda: transcribe(
+                            transcribe_path, lang, plain,
+                            return_words=aligner_enabled,
+                        ),
                     )
                 finally:
                     if trimmed_path:
@@ -3082,13 +3161,71 @@ async def _run_transcription_for_job(
 
                 # Shift body-Whisper timestamps back into full-audio
                 # frame so the song subtitles appear at the right moment.
+                # Shift `words` together with segment times — the aligner
+                # below reads from them.
                 if intro_offset > 0:
-                    segments = [
-                        {**s,
-                         "start": float(s["start"]) + intro_offset,
-                         "end":   float(s["end"])   + intro_offset}
-                        for s in segments
-                    ]
+                    def _shift(s):
+                        out = {**s,
+                               "start": float(s["start"]) + intro_offset,
+                               "end":   float(s["end"])   + intro_offset}
+                        if "words" in s:
+                            out["words"] = [
+                                {**w,
+                                 "start": float(w["start"]) + intro_offset,
+                                 "end":   float(w["end"])   + intro_offset}
+                                for w in s["words"]
+                            ]
+                        return out
+                    segments = [_shift(s) for s in segments]
+
+                # LRCLib-plain aligner: re-bucket Whisper words against
+                # LRCLib's human-curated line structure. The renderer
+                # otherwise uses Whisper's segmentation, which merges
+                # short adjacent lines and splits long ones differently
+                # than LRCLib — producing karaoke where one subtitle
+                # covers two musical phrases or vice versa. The aligner
+                # keeps LRCLib's line boundaries and pulls timing from
+                # the first/last word in each matched span.
+                #
+                # Falls through to raw Whisper segments when:
+                #   - the env flag is off (default)
+                #   - the aligner couldn't match enough lines (< 50%
+                #     coverage) — usually means Whisper missed most of
+                #     the song, in which case downstream hallucination
+                #     recovery is the better fallback.
+                if aligner_enabled:
+                    try:
+                        from lrclib_aligner import align_lrclib_to_whisper
+                        plain_lines_count = sum(
+                            1 for ln in plain.splitlines() if ln.strip()
+                        )
+                        aligned = align_lrclib_to_whisper(plain, segments)
+                        coverage = (
+                            len(aligned) / plain_lines_count
+                            if plain_lines_count else 0.0
+                        )
+                        if coverage >= 0.5 and len(aligned) >= 8:
+                            print(f"[LYRICS] aligner: {len(aligned)}/"
+                                  f"{plain_lines_count} LRCLib lines aligned "
+                                  f"({coverage*100:.0f}% coverage) — "
+                                  f"replacing Whisper segmentation")
+                            segments = [
+                                {"start": a["start"],
+                                 "end": a["end"],
+                                 "text": a["text"]}
+                                for a in aligned
+                            ]
+                        else:
+                            print(f"[LYRICS] aligner: low coverage "
+                                  f"({len(aligned)}/{plain_lines_count} = "
+                                  f"{coverage*100:.0f}%) — keeping raw "
+                                  f"Whisper segments and falling through to "
+                                  f"hallucination recovery")
+                    except Exception as e:
+                        # Opt-in and conservative: any aligner failure
+                        # must NOT break the existing pipeline.
+                        print(f"[LYRICS] aligner error: {e!r} — keeping "
+                              f"raw Whisper segments")
 
                 # Auto-recover: when Whisper still hallucinates after the
                 # trim (instrumental-passage mega-segments, synonym loops,
@@ -3487,6 +3624,7 @@ async def generate_with_segments(
         artist=artist,
         style=style,
         plan=current_user.get("plan", "100"),
+        tenant_id=current_user.get("tenant_id", ""),
         segments_override=segments,
         delivery_profile=delivery_profile,
         umg_spec=umg_spec,
@@ -4350,8 +4488,12 @@ class EditJobRequest(BaseModel):
     text_case: str | None = Field(default=None, max_length=16)
     lyric_transition: str | None = Field(default=None, max_length=16)
     text_motion: str | None = Field(default=None, max_length=16)
-    # Required when edit_type=="lyrics". Each segment must have start
-    # (s), end (s), text (str). Anything else is ignored.
+    # Required when edit_type=="lyrics". For edit_type=="background" or
+    # "typography", segments is OPTIONAL — if the operator made text
+    # corrections inside the modal's LyricsEditor that autosave hasn't
+    # flushed yet, send them here and the API will persist them to
+    # segments_json before enqueueing. Each segment must have start (s),
+    # end (s), text (str); anything else is ignored.
     segments: list[dict] | None = Field(default=None)
     # Optional free-form hint for edit_type=="background". The operator
     # types what they want the new background to convey ("paisaje cálido
@@ -4360,6 +4502,12 @@ class EditJobRequest(BaseModel):
     # operator override. Max 300 chars to keep Gemini input cheap and
     # bounded; longer hints rarely add signal and inflate prompt cost.
     background_hint: str | None = Field(default=None, max_length=300)
+    # Explicit ack that the caller understands re-syncing lyrics on a job
+    # already published to YouTube will update R2 but NOT replace the
+    # YouTube video file (the YouTube API doesn't allow file replacement,
+    # only metadata). Defaults to False so the API fails closed with a
+    # 409 — the frontend prompts the operator, who has to opt in.
+    allow_youtube_drift: bool = False
 
 
 class EnableProResRequest(BaseModel):
@@ -4450,6 +4598,48 @@ async def reject_job(
     return {"ok": True, "status": "rejected", "job_id": job_id}
 
 
+@app.get("/jobs/{job_id}/source-audio-url")
+async def get_source_audio_url(
+    job_id: str,
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Pre-signed URL to the original MP3 uploaded by the user.
+
+    Powers the post-approval lyrics editor: when an operator opens the
+    full LyricsEditor on a done/rejected job to fix sync, the <audio>
+    element needs to stream the source so the operator can hear what
+    they're aligning to. Returning a signed URL (instead of proxying
+    bytes through uvicorn) keeps the API container free during long
+    editor sessions.
+
+    Owner / same-tenant only — same auth model as /download/<job>/<file>.
+    Returns 404 if the job has no input_r2_key (very old jobs uploaded
+    before R2-first flow, or jobs whose input was purged by lifecycle).
+    """
+    from database import Job as JobModel
+    job = (
+        db.query(JobModel)
+        .filter(JobModel.job_id == job_id)
+        .filter(JobModel.tenant_id == current_user["tenant_id"])
+        .first()
+    )
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+    if not job.input_r2_key:
+        raise HTTPException(
+            status_code=404,
+            detail="Source audio is not available for this job.",
+        )
+    url = storage.generate_signed_url(job.input_r2_key, expiry_seconds=3600)
+    if not url:
+        raise HTTPException(
+            status_code=503,
+            detail="Object storage is unavailable.",
+        )
+    return {"url": url, "expires_in": 3600}
+
+
 class SaveSegmentsRequest(BaseModel):
     # Persisted to Job.segments_json (JSONB). Same shape /generate and
     # /edit accept. 5 MB upper bound mirrors /generate's segments_json
@@ -4467,8 +4657,9 @@ async def save_segments(
     current_user: dict = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
-    """Persist user-edited segments while the wizard is still in the
-    editing phase (status=transcribed_pending). Two reasons this exists:
+    """Persist user-edited segments while the LyricsEditor is mounted.
+
+    Three reasons this exists:
 
     1. The reaper's staleness anchor (last_user_activity_at) gets bumped
        every save, so a 90-min batch-edit session doesn't get reaped at
@@ -4478,6 +4669,14 @@ async def save_segments(
     2. Cross-tab / refresh recovery: if the wizard tab dies mid-batch,
        we can rehydrate the editor from segments_json on the server
        instead of relying on browser sessionStorage (which is per-tab).
+    3. Post-approval lyrics fixes: the same LyricsEditor is reused inside
+       the /edit modal on pending_review jobs. The operator typing a
+       correction (e.g. "de la amor" → "del amor") needs that change
+       persisted before any subsequent re-render reads `segments_json`.
+
+    Allowed statuses are the ones where the LyricsEditor is operationally
+    mounted. Other statuses (done, error, processing, queued, awaiting_upload)
+    have their own write paths.
 
     Validates ownership the same way as /generate's reuse path.
     """
@@ -4489,13 +4688,23 @@ async def save_segments(
             or job.tenant_id != current_user["tenant_id"]):
         raise HTTPException(status_code=404, detail="Job not found.")
 
-    # Only allow saving while the user is genuinely in the editing window.
-    # Other statuses have their own write paths (/edit for pending_review,
-    # /generate for the final commit).
-    if job.status != "transcribed_pending":
+    # Wizard (transcribed_pending) is the original use case; pending_review
+    # / rejected enable the post-approval /edit modal's autosave so text
+    # corrections persist even if the operator never clicks "Apply lyrics"
+    # explicitly. `editing` covers the transient state during a /edit run.
+    # Incident 2026-05-15: Bersuit's "enfermera del amor" lyric reverted
+    # to "de la amor" on 3 of 4 occurrences after a background re-render
+    # because autosave 409'd against pending_review here.
+    _SAVE_SEGMENTS_ALLOWED = (
+        "transcribed_pending", "pending_review", "rejected", "editing",
+    )
+    if job.status not in _SAVE_SEGMENTS_ALLOWED:
         raise HTTPException(
             status_code=409,
-            detail=f"save-segments requires status=transcribed_pending (current: {job.status})",
+            detail=(
+                f"save-segments requires status in {_SAVE_SEGMENTS_ALLOWED} "
+                f"(current: {job.status})"
+            ),
         )
 
     segs = body.segments or []
@@ -4583,6 +4792,29 @@ async def request_edit(
                     f"or rejected (current: {job.status})"
                 ),
             )
+        # YouTube API does not allow replacing an uploaded video's file
+        # (only metadata). Re-syncing lyrics on a published job would
+        # update R2 silently while YouTube continued serving the old
+        # out-of-sync cut. Fail closed; the frontend prompts the operator
+        # and retries with allow_youtube_drift=true if they confirm.
+        if job.youtube_data and not body.allow_youtube_drift:
+            yt_url = (
+                job.youtube_data.get("url")
+                if isinstance(job.youtube_data, dict) else None
+            )
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "youtube_already_published",
+                    "message": (
+                        "Job already published to YouTube. Lyrics re-sync "
+                        "will update the file in our platform but NOT "
+                        "replace the YouTube video. Pass "
+                        "allow_youtube_drift=true to proceed anyway."
+                    ),
+                    "youtube_url": yt_url,
+                },
+            )
     elif job.status != "pending_review":
         raise HTTPException(
             status_code=400,
@@ -4608,15 +4840,29 @@ async def request_edit(
             ),
         )
 
-    # Lyrics edit specifically needs the new segments array on the body.
-    # typography/background still need segments_json on the row.
-    if body.edit_type == "lyrics":
-        if not body.segments or len(body.segments) == 0:
-            raise HTTPException(
-                status_code=400,
-                detail="Lyrics edit requires 'segments' in the request body (non-empty list).",
-            )
-        # Validate shape: every segment must have start, end, text.
+    # Segments handling. Two cases:
+    #
+    #   - edit_type=lyrics: caller MUST send segments (it's the whole point
+    #     of the edit), and we forward them via edit_params so the worker
+    #     can use them as the explicit override without a DB roundtrip.
+    #
+    #   - edit_type=background / typography: caller MAY send segments. If
+    #     they do (operator was editing text inside the modal alongside
+    #     other changes), we persist them to segments_json BEFORE the
+    #     enqueue so `run_edit_pipeline`'s `else: segments = job.segments_json`
+    #     branch (pipeline.py:6309) reads the corrected text. Incident
+    #     2026-05-15: Bersuit lyric "de la amor" → "del amor" was silently
+    #     dropped on every background re-render because /edit only persisted
+    #     segments for the lyrics path. Operator's edits lived in the
+    #     LyricsEditor's local state and never reached the worker.
+    #
+    # Either way, shape validation runs once if segments are present.
+    if body.edit_type == "lyrics" and (not body.segments or len(body.segments) == 0):
+        raise HTTPException(
+            status_code=400,
+            detail="Lyrics edit requires 'segments' in the request body (non-empty list).",
+        )
+    if body.segments and len(body.segments) > 0:
         for i, seg in enumerate(body.segments):
             if not isinstance(seg, dict):
                 raise HTTPException(status_code=400, detail=f"segments[{i}] must be an object")
@@ -4634,11 +4880,25 @@ async def request_edit(
                     status_code=400,
                     detail=f"segments[{i}] start/end must be numbers",
                 )
-    elif not job.segments_json:
+    elif body.edit_type != "lyrics" and not job.segments_json:
         raise HTTPException(
             status_code=400,
             detail="Job has no persisted transcription. Cannot re-render.",
         )
+
+    # Normalize segments once (used both for persistence and the lyrics
+    # edit_params payload).
+    normalized_segments = None
+    if body.segments and len(body.segments) > 0:
+        normalized_segments = [
+            {"start": float(s["start"]), "end": float(s["end"]), "text": str(s["text"])}
+            for s in body.segments
+        ]
+        # Persist immediately so any subsequent reader (worker, /status
+        # poll, the operator opening another tab) sees the corrected text.
+        # The /edit handler is the right place for this — it's already
+        # mutating the row a few lines below.
+        job.segments_json = normalized_segments
 
     edit_params: dict = {}
     if body.font is not None:
@@ -4652,12 +4912,10 @@ async def request_edit(
     if body.text_motion is not None:
         edit_params["text_motion"] = body.text_motion
     if body.edit_type == "lyrics":
-        # Normalize to just the fields the pipeline needs — strip
-        # anything else the client may have sent (_id, etc.).
-        edit_params["segments"] = [
-            {"start": float(s["start"]), "end": float(s["end"]), "text": str(s["text"])}
-            for s in body.segments
-        ]
+        # Lyrics path keeps explicit edit_params hand-off so the worker
+        # doesn't re-query the DB for segments it already received in
+        # the API call.
+        edit_params["segments"] = normalized_segments
     if body.edit_type == "background" and body.background_hint and body.background_hint.strip():
         # Operator's free-form description of what they want the new
         # background to convey. Forwarded to Gemini's user_content as a
@@ -4698,6 +4956,7 @@ async def request_edit(
             edit_type=body.edit_type,
             edit_params=edit_params,
             plan=current_user.get("plan", "100"),
+            tenant_id=current_user.get("tenant_id", ""),
         )
     except Exception as exc:
         # Enqueue failed (Redis down, unexpected RQ error). Roll back the DB
@@ -5041,6 +5300,15 @@ async def retry_job(
     # que hizo 3 edits y falló queda permanentemente bloqueado de
     # re-editar tras el retry.
     job.edit_count = 0
+    # Resetear el reloj del reaper. Sin esto, un job creado hace 12 h
+    # que el usuario reintenta ahora cae inmediatamente en find_stalled_renders
+    # (last_progress_at viejo) o find_stuck_jobs (created_at viejo) y la
+    # próxima pasada del reaper lo mata otra vez. Incidente 2026-05-15:
+    # /retry programático restauró 4 omg jobs a `processing`, el reaper
+    # los killió 5 min después porque created_at era de 13:45 (>100 min).
+    # NOW() sobre last_progress_at es la fuente de verdad nueva — find_stuck_jobs
+    # ahora hace coalesce(last_progress_at, created_at) en ese mismo PR.
+    job.last_progress_at = datetime.now(timezone.utc)
 
     db.add(AuditLog(
         user_id=current_user["id"],
@@ -5064,6 +5332,7 @@ async def retry_job(
         artist=job.artist,
         style=job.style or "oscuro",
         plan=current_user.get("plan", "100"),
+        tenant_id=current_user.get("tenant_id", ""),
         delivery_profile=job.delivery_profile or "youtube",
         input_r2_key=job.input_r2_key,
         song_title=job.song_title or "",
@@ -5261,6 +5530,7 @@ async def create_variant(
         artist=parent.artist,
         style=new_style,
         plan=plan,
+        tenant_id=current_user.get("tenant_id", ""),
         **pipeline_kwargs,
     )
 
@@ -5408,8 +5678,15 @@ _DELIVERY_FILE_TYPES: dict[str, dict[str, str]] = {
 # we even create the Delivery row — no point publishing a partial entry.
 _DEFAULT_DELIVERY_FILE_TYPES = ["umg_master", "video", "umg_short", "short", "thumbnail"]
 _DELIVERY_URL_EXPIRY_S = 7 * 24 * 3600  # R2 max
-_DELIVERY_LIST_CACHE: dict = {"signed_at": 0.0, "payload": None}
-_DELIVERY_LIST_CACHE_TTL_S = 60
+# No in-process cache for the deliveries listing. Railway runs the app
+# with multiple uvicorn workers (Dockerfile: --workers 2), so a per-
+# process cache silently desynced after a POST/DELETE: the writer
+# invalidated its own cache, the next read landed on another worker
+# whose cache was still warm with the pre-publish snapshot, and the
+# operator saw "everything OK" while the portal listing was stale for
+# up to 60 s. The listing query is cheap (single filter + order_by),
+# the only meaningful cost is the per-file head_object calls — those
+# happen on every render anyway since they validate file availability.
 
 
 def _r2_key_for_delivery(tenant: str, job_id: str, file_type: str) -> str:
@@ -5538,7 +5815,6 @@ async def admin_create_delivery_from_job(
     db.commit()
     db.refresh(delivery)
 
-    _invalidate_delivery_list_cache()
     return {
         "ok": True,
         "delivery_id": delivery.id,
@@ -5570,11 +5846,6 @@ def _compute_default_delivery_label(db: Session, artist: str, song_title: str | 
     return f"Opción {existing_count + 1}"
 
 
-def _invalidate_delivery_list_cache() -> None:
-    _DELIVERY_LIST_CACHE["payload"] = None
-    _DELIVERY_LIST_CACHE["signed_at"] = 0.0
-
-
 @app.delete("/admin/deliveries/{delivery_id}")
 async def admin_delete_delivery(
     delivery_id: int,
@@ -5604,7 +5875,6 @@ def _soft_delete_delivery(db: Session, delivery_id: int, actor_user_id: int | No
         },
     ))
     db.commit()
-    _invalidate_delivery_list_cache()
     return {"ok": True}
 
 
@@ -5651,18 +5921,14 @@ async def portal_get_items(
 ):
     """Return the portal listing in the shape the frontend expects.
 
-    Cached 60 s in process memory. The cache key is global (not per-token)
-    because the listing itself doesn't vary by caller — auth is just a
-    gate. Mutations (POST/DELETE) bust the cache so a publish/delete is
-    visible immediately."""
+    Queries the DB fresh on every call. Previous in-process cache broke
+    under Railway's multi-worker setup — see the module-level note next
+    to _DELIVERY_URL_EXPIRY_S."""
     _verify_portal_token(x_portal_token)
     import time
+    from concurrent.futures import ThreadPoolExecutor
 
     now = time.time()
-    cached = _DELIVERY_LIST_CACHE
-    if cached["payload"] is not None and now - cached["signed_at"] < _DELIVERY_LIST_CACHE_TTL_S:
-        return cached["payload"]
-
     deliveries = (
         db.query(Delivery)
         .filter(Delivery.removed_at.is_(None))
@@ -5670,12 +5936,50 @@ async def portal_get_items(
         .all()
     )
 
+    # Resolve every (delivery, file) pair's R2 size in parallel BEFORE
+    # building the response. Sequential head_object calls were the root
+    # cause of Vercel 502s on the portal: 5 files × ~30 deliveries × 200ms
+    # blew past the 30s rewrite timeout. A bounded thread pool brings the
+    # whole batch down to a couple of seconds. Per-call timeout is short
+    # so a single hung R2 request can't poison the listing — failed
+    # head_objects fall through to size=None / available=False, same as
+    # the old per-iteration except.
+    head_jobs: list[tuple[int, str, str]] = []  # (delivery_idx, file_type, r2_key)
+    for di, d in enumerate(deliveries):
+        for ft in (d.file_types or []):
+            if ft not in _DELIVERY_FILE_TYPES:
+                continue
+            r2_key = _r2_key_for_delivery(d.tenant_snapshot, d.job_id, ft)
+            head_jobs.append((di, ft, r2_key))
+
+    size_map: dict[tuple[int, str], int | None] = {}
+
+    def _head_size(job: tuple[int, str, str]) -> tuple[tuple[int, str], int | None]:
+        di, ft, r2_key = job
+        try:
+            client = storage._get_client()
+            if client is None:
+                return (di, ft), None
+            head = client.head_object(Bucket=storage.R2_BUCKET, Key=r2_key)
+            return (di, ft), head.get("ContentLength")
+        except Exception:
+            return (di, ft), None
+
+    if head_jobs:
+        # Cap concurrency so we don't open hundreds of R2 sockets at once
+        # on a portal with many active deliveries. 16 workers is a good
+        # tradeoff: handles ~80 head calls/sec with R2's typical 200ms
+        # latency, well under any reasonable portal cardinality.
+        with ThreadPoolExecutor(max_workers=16) as pool:
+            for k, v in pool.map(_head_size, head_jobs):
+                size_map[k] = v
+
     # Group by (artist, song). Within each group, versions stay in
     # added_at order (oldest first), matching how items.json reads.
     songs: dict[tuple[str, str], dict] = {}
     file_type_labels = {ft: info["label"] for ft, info in _DELIVERY_FILE_TYPES.items()}
 
-    for d in deliveries:
+    for di, d in enumerate(deliveries):
         key = (d.artist_snapshot, d.song_title_snapshot)
         bucket = songs.setdefault(key, {"artist": d.artist_snapshot, "song": d.song_title_snapshot, "versions": []})
         files = []
@@ -5692,17 +5996,7 @@ async def portal_get_items(
                     expiry_seconds=_DELIVERY_URL_EXPIRY_S,
                     download_filename=dl_name,
                 )
-                size_bytes = None
-                try:
-                    # Best-effort size for the UI. If R2 is offline we
-                    # still want to return the listing (link will 404
-                    # at click time, less bad than a full portal outage).
-                    client = storage._get_client()
-                    if client is not None:
-                        head = client.head_object(Bucket=storage.R2_BUCKET, Key=r2_key)
-                        size_bytes = head.get("ContentLength")
-                except Exception:
-                    size_bytes = None
+                size_bytes = size_map.get((di, ft))
                 available = url is not None and size_bytes is not None
             except Exception:
                 url = None
@@ -5729,15 +6023,12 @@ async def portal_get_items(
             "short_preview_url": short_preview_url,
         })
 
-    payload = {
+    return {
         "songs": list(songs.values()),
         "file_type_labels": file_type_labels,
         "expires_at_ts": now + _DELIVERY_URL_EXPIRY_S,
         "generated_at": datetime.now(timezone.utc).isoformat(),
     }
-    _DELIVERY_LIST_CACHE["payload"] = payload
-    _DELIVERY_LIST_CACHE["signed_at"] = now
-    return payload
 
 
 def _fmt_size_mb(size_bytes: int | None) -> str:

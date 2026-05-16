@@ -600,3 +600,60 @@ def test_transcribed_pending_sweep_skips_other_statuses():
     finally:
         _cleanup(db)
         db.close()
+
+
+# ---------------------------------------------------------------------------
+# RQ cancellation: reaper must remove the RQ entry when it kills a row.
+# Without this, the next worker boot resurrects the job and burns 20 min
+# re-processing a row already marked `error`. Pinning the call site so a
+# future refactor that drops cancel_rq_job from the reap path fails CI.
+# ---------------------------------------------------------------------------
+
+
+def test_reap_stuck_job_cancels_rq_entry(monkeypatch):
+    """When the reaper kills a stuck job, it must also delete the RQ
+    entry so RQ's Retry / cleanup_ghosts path can't resurrect it."""
+    import queue_jobs
+    calls: list[str] = []
+    monkeypatch.setattr(queue_jobs, "cancel_rq_job",
+                        lambda jid: calls.append(jid) or True)
+    db = SessionLocal()
+    try:
+        _cleanup(db)
+        jid = _seed(db, status="processing", age_minutes=110)
+        reap_all_stuck(threshold_min=100)
+        assert jid in calls, (
+            f"cancel_rq_job should have been called with {jid!r}, "
+            f"got calls={calls!r}"
+        )
+    finally:
+        _cleanup(db)
+        db.close()
+
+
+def test_revert_abandoned_edit_cancels_rq_entry(monkeypatch):
+    """Edit revert path also cancels the RQ entry — without this, a
+    worker that comes back to life after a Railway redeploy would
+    overwrite the user's existing pending_review video bytes on R2."""
+    import queue_jobs
+    from reaper import revert_abandoned_edit
+    calls: list[str] = []
+    monkeypatch.setattr(queue_jobs, "cancel_rq_job",
+                        lambda jid: calls.append(jid) or True)
+    db = SessionLocal()
+    try:
+        _cleanup(db)
+        jid = _seed(
+            db, status="editing", age_minutes=60,
+            editing_started_minutes_ago=45, edit_count=2,
+        )
+        row = db.query(Job).filter(Job.job_id == jid).first()
+        revert_abandoned_edit(db, row)
+        db.commit()
+        assert jid in calls, (
+            f"cancel_rq_job should have been called with {jid!r} on edit revert, "
+            f"got calls={calls!r}"
+        )
+    finally:
+        _cleanup(db)
+        db.close()

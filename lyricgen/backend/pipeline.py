@@ -107,6 +107,70 @@ def _upload_deliverables_to_r2(job_id: str, job_dir: str, files: dict) -> dict:
     return out
 
 
+def _write_edit_audit(action: str, detail: dict) -> None:
+    """Insert an audit_log row from the worker context.
+
+    main.py:request_edit writes job.edit_request when the operator hits
+    /edit; this helper closes the loop with job.edit_completed (success)
+    or job.edit_failed (raised exception). user_id is left NULL because
+    the worker has no request user — the original requester is already
+    captured on the job.edit_request row. Best-effort: a failure here
+    must never mask the real error from the pipeline.
+    """
+    try:
+        from database import SessionLocal, AuditLog
+        _db = SessionLocal()
+        try:
+            _db.add(AuditLog(user_id=None, action=action, detail=detail))
+            _db.commit()
+        finally:
+            _db.close()
+    except Exception as e:
+        print(f"[EDIT] audit log write failed ({action}): {e}")
+
+
+def _snapshot_previous_deliverables(
+    prior_s3_keys: dict | None,
+    version_n: int,
+) -> dict | None:
+    """Server-side-copy each deliverable in `prior_s3_keys` to `{key}.v{N}`
+    so the about-to-overwrite re-render preserves the prior cut.
+
+    Called from run_edit_pipeline right before _upload_deliverables_to_r2.
+    Returns a dict suitable to append to job.previous_versions:
+        {"version": N, "archived_at": iso, "keys": {file_type: archived_key}}
+    or None if there's nothing to archive (no prior keys / storage off).
+
+    Tolerant of partial failures: a copy that fails is logged and skipped,
+    not raised — the re-render must still succeed and overwrite the
+    survivor; losing a rollback path for one file type is better than
+    aborting the whole edit.
+    """
+    if not prior_s3_keys or not isinstance(prior_s3_keys, dict):
+        return None
+    if not storage.is_enabled():
+        return None
+    from datetime import datetime, timezone
+    archived: dict = {}
+    for file_type, src_key in prior_s3_keys.items():
+        if not src_key or not isinstance(src_key, str):
+            continue
+        dst_key = f"{src_key}.v{version_n}"
+        try:
+            ok = storage.copy_object(src_key, dst_key)
+            if ok:
+                archived[file_type] = dst_key
+        except Exception as e:
+            print(f"[EDIT] snapshot copy failed for {file_type} ({src_key}): {e}")
+    if not archived:
+        return None
+    return {
+        "version": version_n,
+        "archived_at": datetime.now(timezone.utc).isoformat(),
+        "keys": archived,
+    }
+
+
 def _ffprobe_duration(path: str) -> float | None:
     """Return media duration in seconds, or None if ffprobe fails."""
     import subprocess
@@ -209,6 +273,17 @@ def _cleanup_local_intermediates(job_dir: str) -> None:
                     pass
     except OSError:
         pass
+
+
+# Auto-trim "hanging text" used to live here — applied a text-length
+# cap to segment ends so LRCLib's "end pinned to next line" convention
+# didn't leave text on screen during instrumental fills. Removed
+# 2026-05-14 because it ran at /transcribe time and silently modified
+# segments BEFORE the operator opened the editor, leading to confusing
+# "my edits didn't save" reports. The same V2 formula still exists in
+# the frontend (LyricsEditor.jsx) where the operator can apply it
+# per-segment or bulk via explicit ✂ buttons — that's the only way
+# the trim is allowed to run now.
 
 
 def _get_persisted_segments(job_id: str) -> list[dict] | None:
@@ -1079,7 +1154,8 @@ def _compress_for_whisper(input_path: str) -> str:
 
 def _transcribe_via_openai_api(mp3_path: str, language: str | None = None,
                                 lyrics_hint: str | None = None,
-                                job_id: str | None = None) -> list[dict]:
+                                job_id: str | None = None,
+                                return_words: bool = False) -> list[dict]:
     """Transcribe by calling OpenAI's Whisper API. Returns the same segments
     structure as the local Whisper path. Used in production where loading
     the local model would consume too much worker RAM (~3 GB) and risks OOM.
@@ -1125,10 +1201,11 @@ def _transcribe_via_openai_api(mp3_path: str, language: str | None = None,
         prompt_text = ("Letras de canción:" if (language or "").startswith("es")
                        else "Song lyrics:")
 
+    granularities = ["word", "segment"] if return_words else ["segment"]
     kwargs = {
         "model": "whisper-1",
         "response_format": "verbose_json",
-        "timestamp_granularities": ["segment"],
+        "timestamp_granularities": granularities,
         "prompt": prompt_text,
         # temperature=0 gives the most confident output; we lower the
         # default 0.0 ladder so it doesn't sample alternative
@@ -1290,11 +1367,41 @@ def _transcribe_via_openai_api(mp3_path: str, language: str | None = None,
             pass
 
     raw_segments = response.segments or []
+    raw_words = (getattr(response, "words", None) or []) if return_words else []
     import re as _re
+
+    # Word granularity returns a flat top-level word list, not per-segment.
+    # Walk both lists in parallel to bucket each word into the segment
+    # whose [start, end) covers its start time. Cursor is monotonic so
+    # this is O(W + S).
+    word_cursor = 0
+
+    def _words_for_segment(seg) -> list[dict]:
+        nonlocal word_cursor
+        if not raw_words:
+            return []
+        s_start = float(seg.start)
+        s_end = float(seg.end)
+        bucket: list[dict] = []
+        while word_cursor < len(raw_words):
+            w = raw_words[word_cursor]
+            w_start = float(getattr(w, "start", 0.0))
+            if w_start >= s_end:
+                break
+            word_cursor += 1
+            if w_start < s_start:
+                continue
+            bucket.append({
+                "word": (getattr(w, "word", "") or "").strip(),
+                "start": w_start,
+                "end": float(getattr(w, "end", w_start)),
+            })
+        return bucket
 
     segments: list[dict] = []
     for seg in raw_segments:
         text = (seg.text or "").strip()
+        seg_words = _words_for_segment(seg) if return_words else []
         if not text or len(text) < 3:
             continue
         # Same filters as local path so behavior matches.
@@ -1313,11 +1420,14 @@ def _transcribe_via_openai_api(mp3_path: str, language: str | None = None,
         if (seg.no_speech_prob or 0) > 0.92:
             print(f"[WHISPER-API] Filtered very-low-confidence: {text[:60]}")
             continue
-        segments.append({
+        out_seg = {
             "start": float(seg.start),
             "end": float(seg.end),
             "text": text,
-        })
+        }
+        if return_words:
+            out_seg["words"] = seg_words
+        segments.append(out_seg)
 
     # Whisper hallucinates loops in two distinct shapes:
     #   1. SAME LINE REPEATED across consecutive segments — easy: dedupe
@@ -1449,7 +1559,8 @@ def _transcribe_via_openai_api(mp3_path: str, language: str | None = None,
 
 def transcribe(mp3_path: str, language: str = None,
                lyrics_hint: str | None = None,
-               job_id: str | None = None) -> list[dict]:
+               job_id: str | None = None,
+               return_words: bool = False) -> list[dict]:
     """Transcribe an audio file to lyric segments.
 
     Backend selection:
@@ -1470,7 +1581,7 @@ def transcribe(mp3_path: str, language: str = None,
     if has_key:
         return _transcribe_via_openai_api(
             mp3_path, language=language, lyrics_hint=lyrics_hint,
-            job_id=job_id,
+            job_id=job_id, return_words=return_words,
         )
 
     # --- local Whisper path ---
@@ -1515,7 +1626,15 @@ def transcribe(mp3_path: str, language: str = None,
         else:
             start = seg["start"]
             end = seg["end"]
-        segments.append({"start": start, "end": end, "text": text})
+        out_seg = {"start": start, "end": end, "text": text}
+        if return_words and words:
+            out_seg["words"] = [
+                {"word": (w.get("word") or "").strip(),
+                 "start": float(w.get("start", start)),
+                 "end": float(w.get("end", end))}
+                for w in words if (w.get("word") or "").strip()
+            ]
+        segments.append(out_seg)
 
     # Safety net: retry if first segment starts very late
     if segments and segments[0]["start"] > 30:
@@ -1529,9 +1648,17 @@ def transcribe(mp3_path: str, language: str = None,
                 continue
             words = seg.get("words", [])
             if words:
-                segments2.append({"start": words[0]["start"], "end": words[-1]["end"], "text": text})
+                out_seg = {"start": words[0]["start"], "end": words[-1]["end"], "text": text}
             else:
-                segments2.append({"start": seg["start"], "end": seg["end"], "text": text})
+                out_seg = {"start": seg["start"], "end": seg["end"], "text": text}
+            if return_words and words:
+                out_seg["words"] = [
+                    {"word": (w.get("word") or "").strip(),
+                     "start": float(w.get("start", out_seg["start"])),
+                     "end": float(w.get("end", out_seg["end"]))}
+                    for w in words if (w.get("word") or "").strip()
+                ]
+            segments2.append(out_seg)
         if segments2 and segments2[0]["start"] < segments[0]["start"]:
             segments = segments2
 
@@ -1555,11 +1682,19 @@ def transcribe(mp3_path: str, language: str = None,
                         continue
                     words = seg.get("words", [])
                     if words:
-                        segments3.append({"start": words[0]["start"],
-                                          "end": words[-1]["end"], "text": text})
+                        out_seg = {"start": words[0]["start"],
+                                   "end": words[-1]["end"], "text": text}
                     else:
-                        segments3.append({"start": seg["start"],
-                                          "end": seg["end"], "text": text})
+                        out_seg = {"start": seg["start"],
+                                   "end": seg["end"], "text": text}
+                    if return_words and words:
+                        out_seg["words"] = [
+                            {"word": (w.get("word") or "").strip(),
+                             "start": float(w.get("start", out_seg["start"])),
+                             "end": float(w.get("end", out_seg["end"]))}
+                            for w in words if (w.get("word") or "").strip()
+                        ]
+                    segments3.append(out_seg)
                 if len(segments3) > len(segments):
                     print(f"[WHISPER] large-v3 produced {len(segments3)} "
                           f"segments (turbo: {len(segments)}); using large-v3")
@@ -3073,7 +3208,7 @@ def _get_genai_client():
     return _genai_client
 
 # Combinatorial prompt system — elements combine to create unique prompts.
-# 22 scenes x 12 palettes x 10 cameras x 8 conditions = 21,120 combinations
+# 21 scenes x 12 palettes x 10 cameras x 8 conditions = 20,160 combinations
 _BG_SCENES = [
     "calm ocean waves on a sandy beach",
     "northern lights aurora over a mountain lake",
@@ -3094,7 +3229,6 @@ _BG_SCENES = [
     "stars and milky way rotating over a landscape",
     "tropical waterfall cascading into a lagoon",
     "wildflowers swaying in a meadow breeze",
-    "icebergs floating in arctic blue water",
     "hot air balloon shadows over green countryside",
     "lightning illuminating storm clouds from within",
 ]
@@ -3143,10 +3277,14 @@ _USED_PROMPTS_FILE = os.path.join(ASSETS_DIR, ".used_prompts.json")
 
 _GENRE_SCENE_GUIDE = {
     "rock": (
-        "Urban industrial streets, neon-lit alleyways, gritty rain on asphalt, "
-        "smoke rising past dim streetlamps, electric storms over a dark city, "
-        "abandoned warehouse interiors with shafts of light, distorted blurred "
-        "headlights, raw concrete textures."
+        "High-energy dramatic scenes — concert stage lights cutting through "
+        "smoke and laser beams (no people), stormy desert highway at dusk, "
+        "mountain peaks during a lightning storm, vintage analog amplifiers "
+        "and electric guitars in close-up (no hands), empty arena tunnels "
+        "with shafts of light, raw weather over open plains, dramatic "
+        "chiaroscuro on raw concrete or asphalt textures. Vary the setting "
+        "per song — alleyways and narrow streets are ONE option among many, "
+        "NOT the default."
     ),
     "pop": (
         "Vibrant colorful neon lights, disco reflections, glittering city "
@@ -3309,6 +3447,88 @@ def _normalize_concept(c: str) -> str:
     return ""
 
 
+def _parse_gemini_bg_response(text: str) -> dict | None:
+    """Parse Gemini's background-generation response into {style, prompt}.
+
+    Handles three failure modes observed in prod:
+      1. Bare JSON: `{"style":"video","prompt":"..."}` — happy path.
+      2. Markdown-wrapped: ```json\\n{...}\\n``` — common with newer Gemini
+         models that prefer fenced output.
+      3. Truncated: `{"style":"video","prompt":"... mid-sentence` — when
+         max_output_tokens is hit. The original parser failed here because
+         `re.search(r'\\{.*?\\}')` requires a closing brace; without one,
+         it returns None and the whole pipeline falls to the combinatorial
+         random scene picker, ignoring concept/lyrics/hint.
+
+    Returns the parsed dict on success, None if the response is so
+    malformed that nothing usable can be extracted. The caller falls back
+    to the combinatorial random only on None.
+    """
+    import re
+
+    if not text:
+        return None
+
+    # Strip markdown code fences if present. Handles both ```json...``` and
+    # bare ``` blocks. We only need to remove the fence markers; the JSON
+    # body survives intact.
+    cleaned = text.strip()
+    if cleaned.startswith("```"):
+        # Drop the opening fence (with optional language tag) and any
+        # closing fence. Be defensive about partial fences (truncation).
+        cleaned = re.sub(r"^```[a-zA-Z]*\s*\n?", "", cleaned)
+        cleaned = re.sub(r"\n?```\s*$", "", cleaned)
+        cleaned = cleaned.strip()
+
+    # Stage 1: greedy match for the largest possible {...} block. Greedy
+    # is intentional — the non-greedy version stops at the first inner `}`
+    # which breaks on prompts containing JSON-encoded objects. The body of
+    # `prompt` is a plain string, so a greedy match to the LAST `}` works.
+    match = re.search(r"\{.*\}", cleaned, re.DOTALL)
+    if match:
+        try:
+            data = json.loads(match.group())
+            # Accept either complete shape or partial with at least prompt.
+            if isinstance(data, dict) and ("prompt" in data or "style" in data):
+                return data
+        except json.JSONDecodeError:
+            pass
+
+    # Stage 2: the JSON is malformed (truncated, unescaped, etc.). Try to
+    # recover the prompt field directly with a regex. We accept any quoted
+    # string after `"prompt":` even if the closing quote and brace are
+    # missing — better to render something coherent than fall to random.
+    # Pattern: "prompt": "<content>" where <content> is everything up to
+    # the next unescaped quote OR end of input. The `(?:\\.|[^"\\])*`
+    # matches escaped chars (\", \\, \n) and plain non-quote chars.
+    prompt_match = re.search(
+        r'"prompt"\s*:\s*"((?:\\.|[^"\\])*)',
+        cleaned, re.DOTALL,
+    )
+    if prompt_match:
+        prompt_value = prompt_match.group(1)
+        # Decode common JSON escapes manually since we may not have a
+        # closing quote. Only handle the cheap ones; if Gemini emitted
+        # exotic unicode escapes the prompt will still be usable.
+        prompt_value = (prompt_value
+                        .replace('\\"', '"')
+                        .replace("\\n", " ")
+                        .replace("\\\\", "\\")
+                        .strip())
+        # Only return if we recovered something substantive (≥15 chars
+        # matches the existing length gate downstream).
+        if len(prompt_value) >= 15:
+            # Extract style too if it survived; default to "video".
+            style_match = re.search(r'"style"\s*:\s*"(\w+)"', cleaned)
+            style = style_match.group(1) if style_match else "video"
+            print(f"[BG] Recovered prompt from truncated JSON "
+                  f"(raw_len={len(text)}, prompt_len={len(prompt_value)})")
+            return {"style": style, "prompt": prompt_value}
+
+    # Nothing recoverable.
+    return None
+
+
 def _analyze_lyrics_for_background(lyrics_text: str, artist: str, job_id: str = None,
                                     song_title: str = "", genre: str = "",
                                     concept: str = "",
@@ -3346,7 +3566,12 @@ def _analyze_lyrics_for_background(lyrics_text: str, artist: str, job_id: str = 
         "specific texture or material detail. Be precise and cinematic — avoid vague "
         "adjectives like \"beautiful\" or \"amazing\".\n"
         "- Pick a DIFFERENT specific scene each time (don't repeat across songs)\n"
-        "- Never include people, faces, hands, or readable text in the scene"
+        "- Never include people, faces, hands, or readable text in the scene\n"
+        "- When a concept and lyrics are both present, the LYRICS dictate the "
+        "subject of the scene and the CONCEPT dictates its visual styling "
+        "(palette, texture, atmosphere, register). Concept never replaces or "
+        "contradicts the literal subject of the lyrics unless match_lyrics is "
+        "explicitly disabled."
     )
     # 3 contrastive examples (rock/urban, romantic ballad, acoustic) + an
     # explicit "do not copy verbatim" disclaimer. Replaces the prior
@@ -3360,8 +3585,8 @@ def _analyze_lyrics_for_background(lyrics_text: str, artist: str, job_id: str = 
 Output JSON shape — do NOT copy any of these example scenes verbatim;
 they show only the format and the breadth of valid visual registers:
 
-Example for rock / urban / gritty track:
-{"style":"video","prompt":"Slow tracking shot through neon-lit rain-slicked streets, deep blue and red reflections, smoke rising past streetlamps, gritty cinematic 4k"}
+Example for rock / energetic / dramatic track:
+{"style":"video","prompt":"Slow drone over a stormy desert highway at dusk, lightning fracturing distant clouds, asphalt reflecting the dying light, vintage road sign blurred in the foreground, dramatic and raw, cinematic 4k"}
 
 Example for romantic ballad / love song:
 {"style":"video","prompt":"Slow drift through a sunlit room at golden hour, warm light streaming through gauze curtains, soft focus on a glass catching the light, dust motes floating in the warm beam, intimate and calm, cinematic 4k"}
@@ -3390,27 +3615,45 @@ explicitly. When in doubt, prefer warm/natural over urban/industrial."""
                       f"{normalized_genre.upper()}.") if normalized_genre else ""
 
         if match_lyrics:
-            # "Inspirado en la letra": concept sets the visual register,
-            # lyrics theme infuses the specific execution within it.
+            # "Inspirado en la letra" + concept: LYRICS anchor the scene's
+            # subject; the concept controls the visual styling (palette,
+            # texture, atmosphere, register). Inverted from the prior
+            # "concept binding" model because the lyrics are the product's
+            # unique asset — no other generative video tool has them. When
+            # the operator opts in to "Inspirado en la letra" they want
+            # the song's literal imagery to drive the scene, with the
+            # concept selector acting as the aesthetic filter. Strict
+            # concept-only mode lives in the `else` branch below
+            # (match_lyrics=False) for the cases where the operator wants
+            # to suppress the literal subject (covers, instrumentals,
+            # ironic juxtaposition).
             system_prompt = f"""{_EXAMPLE}
 
-The operator has chosen the visual register: {normalized_concept.upper()}.
-The scene MUST stay within this concept's visual vocabulary:
+The operator has chosen the visual STYLING register: {normalized_concept.upper()}.
+The concept's vocabulary controls palette, texture, atmosphere, and aesthetic register:
 {concept_guide}{genre_hint}
 
-STEP 0 — Read the lyrics and identify the SOUL of the song: its core theme, emotion, or story (e.g., football passion, longing for home, celebration, heartbreak, nature, freedom).
+STEP 0 — Read the lyrics and identify the PRIMARY VISUAL SUBJECT: the concrete setting, object, or action the song is literally about (e.g., a campfire in a forest, the ocean at night, a football match, a road trip, rain on glass, friends sharing warmth, a long goodbye at a station).
 
-STEP 1 — Build a scene that:
-- Is firmly within the {normalized_concept.upper()} visual vocabulary (non-negotiable)
-- Expresses the song's theme through specific choices of color, shape, motion, and composition
-- Examples:
-  · ABSTRACTO + football → dynamic circular forms in green/white with kinetic energy
-  · COSMICO + heartbreak → cold distant nebula, muted purples, slow lonely drift
-  · NATURALEZA + summer joy → golden sun-drenched meadow, warm swaying grass, long shadows
+STEP 1 — Build a scene where:
+- The SUBJECT comes from the lyrics' literal or strongly figurative imagery
+- The STYLING (palette, texture, atmosphere, mood) comes from the {normalized_concept.upper()} visual register
+- The two are fused, not stacked: the lyrics' subject is rendered through the concept's aesthetic
+
+Examples:
+  · Lyrics: campfire with friends in a forest + concept ABSTRACTO → organic flowing shapes of orange and green light, fire-like kinetic energy radiating outward, abstract bark and ember textures
+  · Lyrics: football match + concept COSMICO → goalpost silhouettes against nebula colors, kinetic energy in deep blue and purple, stars suggesting a crowd
+  · Lyrics: heartbreak + concept TROPICAL → empty beach at dusk, palms swaying but no people, melancholic warm light, abandoned beach chair
+  · Lyrics: night drive + concept MINIMALISTA → single road line receding to vanishing point, two color planes (deep blue + warm tail-light glow), negative space dominant
+  · Lyrics: longing for home + concept INDUSTRIAL → distant lit window viewed through factory pipework, warm interior glow contrasting with cold steel textures
+  · Lyrics: celebration + concept VINTAGE → confetti and streamers rendered in Super 8 grain, sepia tones, faded warmth
+
+If the lyrics are purely abstract or emotional with no concrete visual subject, fall back to the concept's own scene vocabulary as the scene itself.
 
 Hard rules:
 {_PROMPT_RULES}
-- The concept vocabulary is the hard boundary — never exit it{movement_extra_line}"""
+- The lyrics control WHAT the scene shows; the concept controls HOW it looks
+- Concept styling must be visible and recognizable in palette, texture, and mood — it is not optional, it is the aesthetic layer over the subject{movement_extra_line}"""
         else:
             # Strict concept mode: operator's visual choice, no lyrics influence.
             system_prompt = f"""{_EXAMPLE}
@@ -3468,7 +3711,7 @@ STEP 0 — Read the lyrics and identify the PRIMARY VISUAL SUBJECT: the concrete
 STEP 1 — Choose the scene:
 - If the lyrics have a CLEAR visual subject → build the scene around that subject. Then classify genre (rock/pop/ballad/latin/reggaeton/hiphop/electronic/indie/folk/metal) to determine the COLOR PALETTE, LIGHTING, and ATMOSPHERE only — not the scene itself.
 - If the lyrics are abstract or purely emotional with no specific visual subject → classify genre, then pick from the genre's vocabulary:
-  - rock     → urban industrial streets, neon alleyways, gritty rain, electric storms, abandoned warehouses
+  - rock     → varied dramatic settings: concert stage smoke, stormy highways, mountain storms, vintage amps in close-up, empty arena tunnels, raw plains (alleys allowed but NOT the default)
   - pop      → vibrant neon, disco reflections, geometric light patterns, glossy gradient skies
   - ballad   → soft sunset, calm ocean, drifting clouds, warm golden light, candlelight
   - latin    → tropical beaches, palm trees, vibrant flowers, festive lanterns, sunlit caribbean water
@@ -3495,7 +3738,7 @@ Step 1: Classify the song's genre using the artist, title, and lyrics. Pick ONE 
   rock, pop, ballad, latin, reggaeton, hiphop, electronic, indie, folk, metal
 
 Step 2: Pick a scene from the matching genre's visual vocabulary:
-- rock     → urban industrial streets, neon alleyways, gritty rain, electric storms, abandoned warehouses
+- rock     → varied dramatic settings: concert stage smoke, stormy highways, mountain storms, vintage amps in close-up, empty arena tunnels, raw plains (alleys allowed but NOT the default)
 - pop      → vibrant neon, disco reflections, geometric light patterns, glossy gradient skies
 - ballad   → soft sunset, calm ocean, drifting clouds, warm golden light, candlelight
 - latin    → tropical beaches, palm trees, vibrant flowers, festive lanterns, sunlit caribbean water
@@ -3516,7 +3759,12 @@ Hard rules:
         if movement_rule:
             system_prompt = system_prompt + "\n- " + movement_rule
 
-    lyrics_sample = lyrics_text[:600] if lyrics_text else ""
+    # Expanded from 600 → 1800 so canciones largas (3-4 min) llegan completas
+    # a Gemini. Antes el truncado a 600 chars cortaba al medio del verso 2 y
+    # Gemini no veía el chorus → fallback al genre vocab (callejón). UMG
+    # 2026-05-14: rock arg con letras claras igual rendía callejones porque
+    # el sample no llegaba al subject visual real.
+    lyrics_sample = lyrics_text[:1800] if lyrics_text else ""
     # Data minimization (UMG Guideline 14): optionally anonymize artist name
     _send_artist = os.environ.get("SEND_ARTIST_TO_AI", "true").lower() == "true"
     artist_label = artist if _send_artist else "the artist"
@@ -3563,32 +3811,96 @@ Hard rules:
             config=genai.types.GenerateContentConfig(
                 system_instruction=system_prompt,
                 temperature=0.8,
-                max_output_tokens=500,
-                thinking_config=genai.types.ThinkingConfig(thinking_budget=0),
+                # max_output_tokens=1500 (was 500): the concept+match_lyrics=True
+                # branch in #152 expanded the system_prompt with 6 worked examples
+                # and lyrics-anchor instructions. Gemini's output got more verbose
+                # to match the richer prompt and started truncating at 500 tokens
+                # — observed in prod 2026-05-15 on jobs 7e89f00cd130 ("Lunes Por
+                # La Madrugada") and 7fd94fb30fc1 ("Me late"): JSON cut at
+                # `"prompt": "...then a ge` (mid-word), parse failed, fallback
+                # combinatorial fired 100% of jobs and pinned random scenes like
+                # "northern lights aurora over a mountain lake" regardless of
+                # concept. 1500 covers a 120-word prompt + JSON envelope + any
+                # preamble verbosity Gemini adds, with ~3× headroom. Cost impact
+                # marginal (~$0.0001 extra per call at worst case).
+                max_output_tokens=1500,
+                # thinking_budget=512: Gemini hace chain-of-thought corto
+                # para extraer el visual subject de las letras antes de
+                # commitearse a una escena. Sin esto (=0), saltaba el
+                # STEP 0 del system prompt y caía al genre fallback
+                # (UMG 2026-05-14: 80% rock → callejón porque Gemini
+                # nunca leía las letras como subject visual). +$0.0002/call.
+                thinking_config=genai.types.ThinkingConfig(thinking_budget=512),
             ),
         )
         text = response.text.strip()
-        print(f"[BG] Gemini raw: {text[:300]}")
+        # Log full text length and a longer preview so future parse-failure
+        # incidents have enough evidence. Previously truncated to 300 chars
+        # which hid the actual truncation point during the 2026-05-15 incident
+        # (couldn't tell from logs alone whether Gemini hit max_output_tokens
+        # or returned malformed JSON).
+        print(f"[BG] Gemini raw ({len(text)} chars): {text[:800]}")
 
-        # Parse JSON from response (handles ```json blocks, multiline JSON)
-        import re
-        json_match = re.search(r'\{.*?\}', text, re.DOTALL)
-        if json_match:
-            try:
-                data = json.loads(json_match.group())
-                style = data.get("style", "video")
-                prompt = data.get("prompt", "")
-                if style not in ("video", "photo", "illustration"):
-                    style = "video"
-                if prompt and len(prompt) > 15:
-                    print(f"[BG] Gemini chose: style={style}, prompt={prompt[:80]}...")
-                    if recorder:
-                        recorder.finish(response_summary=text[:500])
-                    return {"style": style, "prompt": prompt}
-            except json.JSONDecodeError:
-                pass
+        # Parse Gemini's response. The model usually returns one of:
+        #   {"style":"...","prompt":"..."}                     ← bare JSON
+        #   ```json\n{"style":"...","prompt":"..."}\n```       ← markdown-wrapped
+        #   <preamble>\n{...}                                  ← chatty preamble
+        #   {"style":"...","prompt":"... <TRUNCATED>            ← cut off by
+        #                                                        max_output_tokens
+        #
+        # The original regex `\{.*?\}` (non-greedy) only handled the first two,
+        # and failed catastrophically on the truncation case: no closing `}`
+        # meant no match, no match meant fallback to the combinatorial random
+        # scene picker which ignores concept/lyrics/hint entirely. Prod 2026-
+        # 05-15 incident showed this firing on 100% of jobs after #152
+        # expanded the system_prompt; a richer prompt → more verbose output
+        # → hitting the 500-token cap mid-property.
+        #
+        # New strategy: three-stage parser.
+        #   1. Try strict JSON via greedy match (handles full + markdown-wrapped)
+        #   2. If that fails, regex-extract the "prompt" field value directly
+        #      so we recover even when the JSON closing brace is missing
+        #   3. Only then fall back to the combinatorial random
+        parsed = _parse_gemini_bg_response(text)
+        if parsed is not None:
+            style = parsed.get("style", "video")
+            prompt = parsed.get("prompt", "")
+            if style not in ("video", "photo", "illustration"):
+                style = "video"
+            if prompt and len(prompt) > 15:
+                print(f"[BG] Gemini chose: style={style}, prompt={prompt[:80]}...")
+                # Alley-bias telemetry: si Gemini igual eligió callejón
+                # cuando el operador NO pidió urbano, dejá rastro en
+                # logs para auditar post-deploy. Detecta el caso real
+                # del incidente UMG 2026-05-14.
+                _alley_keywords = ("alley", "callejón", "callejon",
+                                   "narrow street", "back street",
+                                   "back-street", "rain-slicked street")
+                if (any(k in prompt.lower() for k in _alley_keywords)
+                        and normalized_concept != "urbano"):
+                    print(
+                        f"[BG][⚠ ALLEY-BIAS DETECTED] "
+                        f"genre={normalized_genre or 'auto'} "
+                        f"concept={normalized_concept or 'none'} "
+                        f"match_lyrics={match_lyrics} job={job_id}"
+                    )
+                if recorder:
+                    recorder.finish(response_summary=text[:500])
+                return {"style": style, "prompt": prompt}
 
-        print("[BG] Failed to parse Gemini JSON, using combinatorial fallback")
+        # finish_reason on Gemini response indicates whether the generation
+        # was cut by MAX_TOKENS, SAFETY, RECITATION, or completed naturally.
+        # Best-effort introspect; never raise from the log line.
+        finish_reason = "unknown"
+        try:
+            if hasattr(response, "candidates") and response.candidates:
+                fr = getattr(response.candidates[0], "finish_reason", None)
+                if fr is not None:
+                    finish_reason = str(fr)
+        except Exception:
+            pass
+        print(f"[BG] Failed to parse Gemini JSON, using combinatorial fallback. "
+              f"raw_len={len(text)} finish_reason={finish_reason}")
         if recorder:
             recorder.finish(response_summary=f"parse_failed: {text[:200]}")
         return {"style": "video", "prompt": None}
@@ -3700,7 +4012,8 @@ def _veo_cache_key(prompt: str, model: str, params: dict) -> str:
 def _generate_veo_video(prompt: str, output_path: str, job_id: str = None,
                         cache_namespace: str = "",
                         image_path: str | None = None,
-                        movement_style: str = "") -> str:
+                        movement_style: str = "",
+                        normalized_concept: str = "") -> str:
     """Generate a video clip with Google Veo 3 via direct Vertex AI REST API.
 
     We bypass google-genai SDK for Veo specifically because its internal auth
@@ -3729,6 +4042,17 @@ def _generate_veo_video(prompt: str, output_path: str, job_id: str = None,
     import requests as _req
     global _last_veo_request
 
+    # Bias-buster: cuando el operador NO eligió concept=urbano explícito,
+    # prohibimos callejón/alley como subject. UMG 2026-05-14: con genre=rock
+    # y concept vacío, Gemini elegía alley ~80% del tiempo aún con guard-
+    # rails en el system prompt. El negative en safe_prompt es la última
+    # red de seguridad antes de Veo. Si el operador SÍ pidió urbano, no
+    # bloqueamos (es su decisión consciente).
+    no_alley = "" if normalized_concept == "urbano" else (
+        "Avoid generic narrow alleyway, dark alley, callejón, and neon-lit "
+        "back-street as the primary subject unless the lyrics demand it. "
+    )
+
     if movement_style == "animado":
         # Cartoon / 2D illustration aesthetic — keep all safety clauses
         # except the "no CGI / no animation" pair, which would directly
@@ -3737,6 +4061,7 @@ def _generate_veo_video(prompt: str, output_path: str, job_id: str = None,
         safe_prompt = (
             f"{prompt}. Stylised 2D animated illustration, flat shapes, "
             "deliberate cartoon-like motion. "
+            f"{no_alley}"
             "No text, no words, no letters, no signs, no billboards, no posters, "
             "no banners, no graffiti, no shop windows, no street signs, no neon "
             "signs, no logos, no trademarks, no brand symbols, no people, "
@@ -3745,6 +4070,7 @@ def _generate_veo_video(prompt: str, output_path: str, job_id: str = None,
     else:
         safe_prompt = (
             f"{prompt}. Photorealistic, filmed with cinema camera, real footage. "
+            f"{no_alley}"
             "No text, no words, no letters, no signs, no billboards, no posters, "
             "no banners, no graffiti, no shop windows, no street signs, no neon "
             "signs, no logos, no trademarks, no brand symbols, no people, "
@@ -4258,6 +4584,7 @@ def _ensure_background(style_hint: str, job_dir: str, lyrics_text: str = None,
                 cache_namespace=f"{artist}|{song_title}",
                 image_path=image_to_video_path,
                 movement_style=movement_style,
+                normalized_concept=_normalize_concept(concept),
             )
             # Semantic relevance check — always score, but cap retries at one
             # to bound cost (+$0.80 worst case). quality_retry_used gates the
@@ -4268,10 +4595,17 @@ def _ensure_background(style_hint: str, job_dir: str, lyrics_text: str = None,
             if score < 7 and not quality_retry_used:
                 quality_retry_used = True
                 print(f"[BG] Score {score} < 7 — generating new prompt and retrying VEO")
+                # Propagate background_hint into the quality retry. Without it,
+                # Gemini regenerates from lyrics/genre alone and the operator's
+                # explicit guidance is silently dropped — the same input that
+                # produced a low-score first attempt is more likely to drift to
+                # something unrelated (Enanitos Verdes "Amigos" 2026-05-15:
+                # hint "fogón con bosque" → retry picked an iceberg scene).
                 result = _get_unique_prompt(
                     lyrics_text, artist, job_id=job_id, song_title=song_title,
                     genre=genre, concept=concept, movement_style=movement_style,
                     match_lyrics=match_lyrics,
+                    background_hint=background_hint,
                 )
                 prompt = result["prompt"]
                 continue
@@ -4843,6 +5177,16 @@ def _make_text_clip(
     _FADE_DURATIONS = {"fade": 0.15, "fade_slow": 0.30}
     fade_dur = _FADE_DURATIONS.get(lyric_transition, 0.0)
     fade_dur = min(fade_dur, seg_duration / 3)
+    # Compensate for fade-in perception. The text starts at seg_start with
+    # opacity=0 and ramps linearly to 100%. Humans perceive "the text
+    # appeared" around the ~50% opacity mark — so without compensation the
+    # operator's anchored timestamp shows up perceptually fade_dur/2 LATE.
+    # Subtracting half the fade from the start time aligns the perceptual
+    # midpoint with the anchor, which is what the Sync Mode operator
+    # actually targeted with their Space tap. Cuts == 0 → no compensation.
+    fade_perceptual_offset = fade_dur / 2.0
+    adjusted_start = max(0.0, seg_start - fade_perceptual_offset)
+    adjusted_end = seg_end  # End is unaffected; only the visual onset shifts.
 
     def _try_text_clip(txt, fsize, fnt, color, **kwargs):
         try:
@@ -4864,7 +5208,7 @@ def _make_text_clip(
         shadow = shadow.set_position(lambda t, _p=shadow_pos: _p(t))
     else:
         shadow = shadow.set_position((base_x + shadow_offset, base_y + shadow_offset))
-    shadow = shadow.set_start(seg_start).set_end(seg_end)
+    shadow = shadow.set_start(adjusted_start).set_end(adjusted_end)
 
     layers = []
 
@@ -4878,7 +5222,7 @@ def _make_text_clip(
             shadow2 = shadow2.set_position(lambda t, _p=shadow2_pos: _p(t))
         else:
             shadow2 = shadow2.set_position((base_x - shadow_offset, base_y - shadow_offset))
-        shadow2 = shadow2.set_start(seg_start).set_end(seg_end)
+        shadow2 = shadow2.set_start(adjusted_start).set_end(adjusted_end)
         if fade_dur > 0:
             shadow2 = shadow2.crossfadein(fade_dur).crossfadeout(fade_dur)
         layers.append(shadow2)
@@ -4894,7 +5238,7 @@ def _make_text_clip(
         txt = txt.set_position(lambda t, _p=txt_pos: _p(t))
     else:
         txt = txt.set_position("center")
-    txt = txt.set_start(seg_start).set_end(seg_end)
+    txt = txt.set_start(adjusted_start).set_end(adjusted_end)
 
     if fade_dur > 0:
         shadow = shadow.crossfadein(fade_dur).crossfadeout(fade_dur)
@@ -5943,8 +6287,10 @@ def run_edit_pipeline(
     After completion the job returns to "pending_review" so the reviewer
     can approve, reject, or request another edit (up to _MAX_EDITS total).
     """
+    import time as _time
     from database import SessionLocal, Job as JobModel
 
+    started_at = _time.monotonic()
     db = SessionLocal()
     try:
         job_row = db.query(JobModel).filter(JobModel.job_id == job_id).first()
@@ -5974,6 +6320,13 @@ def run_edit_pipeline(
         tenant_id = job_row.tenant_id
         bg_r2_key_cached = job_row.bg_r2_key_cached
         input_r2_key = job_row.input_r2_key
+        # Snapshot inputs: edit_count was already incremented by the /edit
+        # handler before enqueuing, so it's the "version we're about to
+        # produce". Archived .vN keys use this number so v1 is the file
+        # that existed at the moment of the 1st edit, v2 at the 2nd, etc.
+        prior_s3_keys = dict(job_row.s3_keys) if job_row.s3_keys else None
+        version_n = int(job_row.edit_count or 0)
+        prior_versions = list(job_row.previous_versions or [])
     finally:
         db.close()
 
@@ -6111,6 +6464,19 @@ def run_edit_pipeline(
             audio_dur = _ffprobe_duration(mp3_path)
         _verify_deliverables(job_dir, files, audio_dur)
 
+        # Archive previous deliverables to {key}.vN before the upload
+        # overwrites them. Non-fatal — if storage.copy_object errors out
+        # for some keys we still want the new render to land. The
+        # archived metadata (or None) goes into job.previous_versions so
+        # an operator can find the rollback target without scraping R2.
+        snapshot_entry = _snapshot_previous_deliverables(prior_s3_keys, version_n)
+        if snapshot_entry:
+            snapshot_entry["edit_type"] = edit_type
+            update_job(
+                job_id,
+                previous_versions=prior_versions + [snapshot_entry],
+            )
+
         s3_keys = _upload_deliverables_to_r2(job_id, job_dir, files)
         if s3_keys:
             update_job(job_id, s3_keys=s3_keys)
@@ -6132,7 +6498,33 @@ def run_edit_pipeline(
         update_job(job_id, status="pending_review", progress=100, files=files)
         print(f"[EDIT] job={job_id} edit_type={edit_type} → pending_review")
 
+        # Audit log: completion. The corresponding job.edit_request entry
+        # was written by main.py at request time; this closes the loop
+        # with duration + archived version so UMG can trace every change.
+        _write_edit_audit(
+            action="job.edit_completed",
+            detail={
+                "job_id": job_id,
+                "edit_type": edit_type,
+                "edit_count": version_n,
+                "duration_seconds": round(_time.monotonic() - started_at, 2),
+                "archived_version": snapshot_entry["version"] if snapshot_entry else None,
+                "segments_count": len(segments) if segments else 0,
+                "files_updated": sorted(list(s3_keys.keys())) if s3_keys else [],
+            },
+        )
+
     except Exception as exc:
         print(f"[EDIT] job={job_id} FAILED: {exc}")
         update_job(job_id, status="error", error=f"Edit failed: {exc}")
+        _write_edit_audit(
+            action="job.edit_failed",
+            detail={
+                "job_id": job_id,
+                "edit_type": edit_type,
+                "edit_count": version_n,
+                "duration_seconds": round(_time.monotonic() - started_at, 2),
+                "error": str(exc),
+            },
+        )
         raise

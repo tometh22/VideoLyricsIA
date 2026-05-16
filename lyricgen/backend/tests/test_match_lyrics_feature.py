@@ -114,10 +114,21 @@ class TestPromptBranches(unittest.TestCase):
         self.assertGreaterEqual(count, 2,
             "At least 2 prompt blocks (genre+True, auto+True) must have STEP 0")
 
-    # concept+True path has "SOUL"
-    def test_concept_true_has_soul(self):
-        self.assertIn("SOUL", self.src,
-            "concept+match_lyrics=True prompt must reference SOUL of the song")
+    # concept+True path anchors on the lyrics' visual subject.
+    # Renamed from `test_concept_true_has_soul` (2026-05-15): the older
+    # branch used a "SOUL of the song" framing while keeping the concept
+    # as a hard boundary. The branch now anchors the scene on the
+    # lyrics' literal visual subject and demotes concept to a styling
+    # layer (palette/texture/atmosphere). The pin moved with it.
+    def test_concept_true_anchors_on_lyrics_subject(self):
+        self.assertIn("PRIMARY VISUAL SUBJECT", self.src,
+            "concept+match_lyrics=True prompt must instruct Gemini to "
+            "identify the PRIMARY VISUAL SUBJECT from the lyrics — that "
+            "phrase is the anchor of the new lyrics-first hierarchy.")
+        self.assertIn("lyrics control WHAT the scene shows", self.src,
+            "concept+match_lyrics=True prompt must keep the WHAT/HOW "
+            "separator so the lyrics-first priority survives future "
+            "prompt edits.")
 
     # concept+False path has "binding"
     def test_concept_false_has_binding(self):
