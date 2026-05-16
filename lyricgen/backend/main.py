@@ -6131,3 +6131,167 @@ def _fmt_size_mb(size_bytes: int | None) -> str:
     if mb >= 1024:
         return f"{mb / 1024:.1f} GB"
     return f"{mb:.0f} MB"
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# Admin endpoints for change requests (operator side)
+#
+# UMG submits change requests via the portal (POST /api/deliveries/{id}
+# /change-request). They land in delivery_change_requests pending. The
+# operator reviews them here. Two actions: resolve (with optional note)
+# and reopen (undo a wrong resolve). Both write AuditLog entries so the
+# trail of who-did-what survives.
+# ─────────────────────────────────────────────────────────────────────────
+
+@app.get("/admin/change-requests")
+async def admin_list_change_requests(
+    status: str = "pending",
+    limit: int = 200,
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """List change requests for the operator UI. Admin only.
+
+    status: "pending" (default), "resolved", or "all".
+    Returns request + delivery context (artist/song/label/frame/job_id)
+    plus resolved_by username so the admin sees who acted on each one.
+    """
+    if current_user.get("role") != "admin":
+        raise HTTPException(status_code=403, detail="Admin only")
+    if status not in ("pending", "resolved", "all"):
+        raise HTTPException(status_code=400, detail="status must be pending|resolved|all")
+    if limit < 1 or limit > 1000:
+        limit = 200
+
+    q = db.query(DeliveryChangeRequest)
+    if status == "pending":
+        q = q.filter(DeliveryChangeRequest.resolved_at.is_(None))
+    elif status == "resolved":
+        q = q.filter(DeliveryChangeRequest.resolved_at.isnot(None))
+    crs = (
+        q.order_by(DeliveryChangeRequest.submitted_at.desc())
+        .limit(limit)
+        .all()
+    )
+
+    # Bulk-fetch deliveries + resolver usernames in one shot each (no N+1).
+    delivery_ids = list({cr.delivery_id for cr in crs})
+    user_ids = list({cr.resolved_by_user_id for cr in crs if cr.resolved_by_user_id})
+    deliveries_by_id = {
+        d.id: d
+        for d in (db.query(Delivery).filter(Delivery.id.in_(delivery_ids)).all() if delivery_ids else [])
+    }
+    users_by_id = {
+        u.id: u
+        for u in (db.query(User).filter(User.id.in_(user_ids)).all() if user_ids else [])
+    }
+
+    items = []
+    for cr in crs:
+        d = deliveries_by_id.get(cr.delivery_id)
+        resolver = users_by_id.get(cr.resolved_by_user_id) if cr.resolved_by_user_id else None
+        items.append({
+            "id": cr.id,
+            "comment": cr.comment,
+            "submitted_at": cr.submitted_at.isoformat() if cr.submitted_at else None,
+            "resolved_at": cr.resolved_at.isoformat() if cr.resolved_at else None,
+            "resolution_note": cr.resolution_note,
+            "resolved_by": resolver.username if resolver else None,
+            "delivery": (
+                {
+                    "id": d.id,
+                    "artist": d.artist_snapshot,
+                    "song": d.song_title_snapshot,
+                    "label": d.label,
+                    "frame_size": d.frame_size_snapshot,
+                    "job_id": d.job_id,
+                    "tenant": d.tenant_snapshot,
+                    "removed_at": d.removed_at.isoformat() if d.removed_at else None,
+                }
+                if d
+                else None
+            ),
+        })
+
+    # Totals are cheap and the admin UI shows them as headline counters.
+    pending_count = (
+        db.query(DeliveryChangeRequest)
+        .filter(DeliveryChangeRequest.resolved_at.is_(None))
+        .count()
+    )
+    resolved_count = (
+        db.query(DeliveryChangeRequest)
+        .filter(DeliveryChangeRequest.resolved_at.isnot(None))
+        .count()
+    )
+
+    return {
+        "items": items,
+        "pending_count": pending_count,
+        "resolved_count": resolved_count,
+    }
+
+
+@app.post("/admin/change-requests/{cr_id}/resolve")
+async def admin_resolve_change_request(
+    cr_id: int,
+    body: dict | None = None,
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Mark a change request resolved. Optional resolution_note (<=2000 chars)
+    so the operator can leave a one-liner explaining what was done."""
+    if current_user.get("role") != "admin":
+        raise HTTPException(status_code=403, detail="Admin only")
+    cr = db.query(DeliveryChangeRequest).filter(DeliveryChangeRequest.id == cr_id).first()
+    if not cr:
+        raise HTTPException(status_code=404, detail="Change request not found")
+    if cr.resolved_at is not None:
+        # Idempotent — return current state instead of erroring, so a
+        # double-click in the UI doesn't surface a scary error.
+        return {"ok": True, "already_resolved": True}
+    note = ((body or {}).get("resolution_note") or "").strip() if isinstance(body, dict) else ""
+    if len(note) > 2000:
+        raise HTTPException(status_code=400, detail="resolution_note too long (max 2000)")
+    cr.resolved_at = datetime.now(timezone.utc)
+    cr.resolved_by_user_id = current_user["id"]
+    cr.resolution_note = note or None
+    db.add(AuditLog(
+        user_id=current_user["id"],
+        action="delivery.change_request.resolve",
+        detail={
+            "change_request_id": cr_id,
+            "delivery_id": cr.delivery_id,
+            "note_preview": note[:200] if note else None,
+        },
+    ))
+    db.commit()
+    return {"ok": True, "resolved_at": cr.resolved_at.isoformat()}
+
+
+@app.post("/admin/change-requests/{cr_id}/reopen")
+async def admin_reopen_change_request(
+    cr_id: int,
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Undo a resolution. The original submission stays — only the
+    resolved_at/resolved_by/resolution_note get cleared. Audit log
+    records who reopened it."""
+    if current_user.get("role") != "admin":
+        raise HTTPException(status_code=403, detail="Admin only")
+    cr = db.query(DeliveryChangeRequest).filter(DeliveryChangeRequest.id == cr_id).first()
+    if not cr:
+        raise HTTPException(status_code=404, detail="Change request not found")
+    if cr.resolved_at is None:
+        return {"ok": True, "already_pending": True}
+    cr.resolved_at = None
+    cr.resolved_by_user_id = None
+    cr.resolution_note = None
+    db.add(AuditLog(
+        user_id=current_user["id"],
+        action="delivery.change_request.reopen",
+        detail={"change_request_id": cr_id, "delivery_id": cr.delivery_id},
+    ))
+    db.commit()
+    return {"ok": True}
