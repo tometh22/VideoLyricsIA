@@ -4503,6 +4503,24 @@ class EditJobRequest(BaseModel):
     # operator override. Max 300 chars to keep Gemini input cheap and
     # bounded; longer hints rarely add signal and inflate prompt cost.
     background_hint: str | None = Field(default=None, max_length=300)
+    # Background generation mode. Only meaningful when edit_type=="background".
+    #
+    #   "veo"    → Google Veo 3.1 text-to-video. Cinematic, ~$0.50/gen,
+    #              60-180s wall clock, but prone to inserting human faces
+    #              that fail UMG content validation (incident 2026-05-15
+    #              "Lunes Por La Madrugada").
+    #   "imagen" → Imagen-4 text-to-image + local Ken Burns animation.
+    #              ~$0.03/gen, 5-15s wall clock, controllable composition,
+    #              no face-validation failures. Lower visual ambition
+    #              than Veo (zoom/pan vs real camera moves) but reliable.
+    #
+    # Default unset (None) → backend treats as "veo" for backward compat.
+    # Frontend EditRequestPanel exposes a segmented toggle near the
+    # background_hint field.
+    background_mode: str | None = Field(
+        default=None,
+        pattern="^(veo|imagen)$",
+    )
     # Explicit ack that the caller understands re-syncing lyrics on a job
     # already published to YouTube will update R2 but NOT replace the
     # YouTube video file (the YouTube API doesn't allow file replacement,
@@ -4923,6 +4941,12 @@ async def request_edit(
         # high-priority override block so it pisa los defaults that
         # produced the rejected background.
         edit_params["background_hint"] = body.background_hint.strip()
+    if body.edit_type == "background" and body.background_mode in ("veo", "imagen"):
+        # Operator picked the generation mode (Veo cinematic video vs
+        # Imagen-4 still + Ken Burns animation). Pydantic already
+        # validated the enum via pattern; we just forward through
+        # edit_params to run_edit_pipeline → _ensure_background.
+        edit_params["background_mode"] = body.background_mode
 
     new_edit_count = current_edit_count + 1
 
