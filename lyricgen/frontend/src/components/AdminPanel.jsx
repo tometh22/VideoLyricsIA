@@ -160,6 +160,45 @@ export default function AdminPanel({ onBack }) {
       setCrResolvingId(null);
     }
   };
+  // Operator records an out-of-band approval (UMG approved by email/WhatsApp
+  // and we don't want to wait for them to click in the portal). The backend
+  // stores the admin's username in approved_by_label so the audit trail
+  // distinguishes this from portal-driven approvals.
+  const approveDeliveryAdmin = async (deliveryId) => {
+    if (!window.confirm("Marcar esta entrega como APROBADA por UMG (registro manual)?")) return;
+    try {
+      const res = await fetch(`${API}/admin/deliveries/${deliveryId}/approve`, {
+        method: "POST",
+        headers: authHeaders(),
+      });
+      if (!res.ok) {
+        const data = await res.json().catch(() => ({}));
+        throw new Error(data.detail || `Error ${res.status}`);
+      }
+      await loadChangeRequests();
+    } catch (err) {
+      flashError(`No pude aprobar la entrega: ${err.message || err}`);
+    }
+  };
+  // Soft-delete a delivery from the admin panel. Used when UMG wants the
+  // video pulled and we don't want to wait for them to do it via portal.
+  // R2 files stay; only removed_at gets set.
+  const deleteDeliveryAdmin = async (deliveryId) => {
+    if (!window.confirm("BORRAR esta entrega del portal?\n\nEl archivo en R2 se conserva — solo se oculta del listado. Reversible vía DB si hay error.")) return;
+    try {
+      const res = await fetch(`${API}/admin/deliveries/${deliveryId}`, {
+        method: "DELETE",
+        headers: authHeaders(),
+      });
+      if (!res.ok) {
+        const data = await res.json().catch(() => ({}));
+        throw new Error(data.detail || `Error ${res.status}`);
+      }
+      await loadChangeRequests();
+    } catch (err) {
+      flashError(`No pude borrar la entrega: ${err.message || err}`);
+    }
+  };
 
   useEffect(() => {
     loadStats();
@@ -1001,6 +1040,24 @@ export default function AdminPanel({ onBack }) {
                             <span className="text-red-300">· entrega eliminada</span>
                           )}
                         </div>
+                        {/* Delivery-level approval state. Surfaces what UMG did
+                            to the underlying delivery itself (not the change
+                            request) so the operator sees the full picture at a
+                            glance. Three states: approved / pending / removed. */}
+                        <div className="mt-1.5 flex items-center gap-2 flex-wrap text-[11px]">
+                          {d?.approved_at ? (
+                            <span className="text-emerald-300 inline-flex items-center gap-1">
+                              <span className="font-bold">✓</span>
+                              Entrega aprobada
+                              {d.approved_by_label && <> por <b className="text-emerald-200">{d.approved_by_label}</b></>}
+                              {" "}el {new Date(d.approved_at).toLocaleString("es-AR", { dateStyle: "short", timeStyle: "short" })}
+                            </span>
+                          ) : d?.removed_at ? (
+                            <span className="text-red-300">✗ Entrega rechazada/eliminada</span>
+                          ) : (
+                            <span className="text-gray-500">○ Entrega pendiente de aprobación UMG</span>
+                          )}
+                        </div>
                       </div>
                       <span
                         className={`text-[10px] font-bold uppercase px-2 py-1 rounded-full shrink-0 ${
@@ -1022,6 +1079,31 @@ export default function AdminPanel({ onBack }) {
                     <p className="text-[11px] text-gray-500 mt-2">
                       UMG envió este pedido el {submitted}
                     </p>
+
+                    {/* Delivery-level admin actions. Distinct from the
+                        change-request resolve flow below — these act on the
+                        underlying delivery (approve / soft-delete) regardless
+                        of how the change request itself is handled. */}
+                    {d && !d.removed_at && (
+                      <div className="mt-2 flex items-center gap-2 flex-wrap">
+                        {!d.approved_at && (
+                          <button
+                            onClick={() => approveDeliveryAdmin(d.id)}
+                            className="text-[10px] font-medium px-2.5 py-1 rounded-md bg-emerald-500/10 text-emerald-300 hover:bg-emerald-500/20 transition"
+                            title="Registrar que UMG aprobó esta entrega (por mail/WhatsApp)"
+                          >
+                            ✓ Aprobar entrega
+                          </button>
+                        )}
+                        <button
+                          onClick={() => deleteDeliveryAdmin(d.id)}
+                          className="text-[10px] font-medium px-2.5 py-1 rounded-md bg-red-500/10 text-red-300 hover:bg-red-500/20 transition"
+                          title="Soft-delete: oculta del portal, conserva los archivos en R2"
+                        >
+                          ✗ Borrar entrega del portal
+                        </button>
+                      </div>
+                    )}
 
                     {/* Resolution section */}
                     {isResolved ? (

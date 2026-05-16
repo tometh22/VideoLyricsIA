@@ -5930,6 +5930,132 @@ async def portal_delete_delivery(
     return _soft_delete_delivery(db, delivery_id, actor_user_id=None)
 
 
+@app.post("/api/deliveries/{delivery_id}/approve")
+async def portal_approve_delivery(
+    delivery_id: int,
+    x_portal_token: str | None = Header(default=None, alias="X-Portal-Token"),
+    db: Session = Depends(get_db),
+):
+    """UMG approves a delivery from the portal. Sets approved_at + a
+    fixed actor label ("UMG (portal)") so the operator side can tell
+    portal-driven approvals apart from operator-driven ones. Idempotent.
+
+    Approve does NOT remove the row — rejected/removed is a separate
+    state via DELETE /api/deliveries/{id}.
+    """
+    _verify_portal_token(x_portal_token)
+    delivery = (
+        db.query(Delivery)
+        .filter(Delivery.id == delivery_id)
+        .filter(Delivery.removed_at.is_(None))
+        .first()
+    )
+    if not delivery:
+        raise HTTPException(status_code=404, detail="Delivery no encontrada.")
+    if delivery.approved_at is not None:
+        return {
+            "ok": True,
+            "already_approved": True,
+            "approved_at": delivery.approved_at.isoformat(),
+            "approved_by_label": delivery.approved_by_label,
+        }
+    delivery.approved_at = datetime.now(timezone.utc)
+    delivery.approved_by_label = "UMG (portal)"
+    db.add(AuditLog(
+        user_id=None,
+        action="delivery.approve.portal",
+        detail={
+            "delivery_id": delivery_id,
+            "job_id": delivery.job_id,
+            "artist": delivery.artist_snapshot,
+            "song": delivery.song_title_snapshot,
+        },
+    ))
+    db.commit()
+    return {
+        "ok": True,
+        "approved_at": delivery.approved_at.isoformat(),
+        "approved_by_label": delivery.approved_by_label,
+    }
+
+
+@app.post("/api/deliveries/{delivery_id}/un-approve")
+async def portal_unapprove_delivery(
+    delivery_id: int,
+    x_portal_token: str | None = Header(default=None, alias="X-Portal-Token"),
+    db: Session = Depends(get_db),
+):
+    """Undo an accidental Aprobar click. Resets approved_at + label to NULL.
+    Audit logs the reversal so the trail survives."""
+    _verify_portal_token(x_portal_token)
+    delivery = (
+        db.query(Delivery)
+        .filter(Delivery.id == delivery_id)
+        .filter(Delivery.removed_at.is_(None))
+        .first()
+    )
+    if not delivery:
+        raise HTTPException(status_code=404, detail="Delivery no encontrada.")
+    if delivery.approved_at is None:
+        return {"ok": True, "already_pending": True}
+    delivery.approved_at = None
+    delivery.approved_by_label = None
+    db.add(AuditLog(
+        user_id=None,
+        action="delivery.unapprove.portal",
+        detail={"delivery_id": delivery_id, "job_id": delivery.job_id},
+    ))
+    db.commit()
+    return {"ok": True}
+
+
+@app.post("/admin/deliveries/{delivery_id}/approve")
+async def admin_approve_delivery(
+    delivery_id: int,
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Operator marks a delivery as approved on UMG's behalf (e.g. UMG
+    approved by email/WhatsApp and the operator records it). Stores the
+    admin username in approved_by_label so the audit trail distinguishes
+    this path from the portal-driven one."""
+    if current_user.get("role") != "admin":
+        raise HTTPException(status_code=403, detail="Admin only")
+    delivery = (
+        db.query(Delivery)
+        .filter(Delivery.id == delivery_id)
+        .filter(Delivery.removed_at.is_(None))
+        .first()
+    )
+    if not delivery:
+        raise HTTPException(status_code=404, detail="Delivery not found")
+    if delivery.approved_at is not None:
+        return {
+            "ok": True,
+            "already_approved": True,
+            "approved_at": delivery.approved_at.isoformat(),
+            "approved_by_label": delivery.approved_by_label,
+        }
+    delivery.approved_at = datetime.now(timezone.utc)
+    delivery.approved_by_label = current_user.get("username") or f"admin#{current_user['id']}"
+    db.add(AuditLog(
+        user_id=current_user["id"],
+        action="delivery.approve.admin",
+        detail={
+            "delivery_id": delivery_id,
+            "job_id": delivery.job_id,
+            "artist": delivery.artist_snapshot,
+            "song": delivery.song_title_snapshot,
+        },
+    ))
+    db.commit()
+    return {
+        "ok": True,
+        "approved_at": delivery.approved_at.isoformat(),
+        "approved_by_label": delivery.approved_by_label,
+    }
+
+
 @app.post("/api/deliveries/{delivery_id}/change-request")
 async def portal_submit_change_request(
     delivery_id: int,
@@ -6138,6 +6264,8 @@ async def portal_get_items(
             "pending_change_requests": sum(
                 1 for cr in change_requests if cr.get("resolved_at") is None
             ),
+            "approved_at": d.approved_at.isoformat() if d.approved_at else None,
+            "approved_by_label": d.approved_by_label,
         })
 
     return {
@@ -6231,6 +6359,8 @@ async def admin_list_change_requests(
                     "job_id": d.job_id,
                     "tenant": d.tenant_snapshot,
                     "removed_at": d.removed_at.isoformat() if d.removed_at else None,
+                    "approved_at": d.approved_at.isoformat() if d.approved_at else None,
+                    "approved_by_label": d.approved_by_label,
                 }
                 if d
                 else None
