@@ -93,6 +93,11 @@ export default function EditRequestPanel({
   // that case and the pipeline falls back to Gemini's lyrics-only
   // analysis with the debiased system prompt + 3 contrastive examples).
   const [backgroundHint, setBackgroundHint] = useState("");
+  // Generation mode for the background regen. "veo" (default) = Veo 3.1
+  // cinematic video; "imagen" = Imagen-4 still + local Ken Burns animation.
+  // Operator picks via the segmented toggle inside the background panel.
+  // Default "veo" preserves the prior behavior of every edit pre-2026-05-16.
+  const [backgroundMode, setBackgroundMode] = useState("veo");
   // Latest segments from the nested LyricsEditor (updated synchronously
   // on every edit via `onEditedChange`). Held in a ref so buildPayload
   // can read it without re-renders. Used to include the operator's
@@ -190,6 +195,12 @@ export default function EditRequestPanel({
       const p = { edit_type: "background" };
       const hint = (backgroundHint || "").trim();
       if (hint) p.background_hint = hint;
+      // Send mode explicitly only when non-default so older backends
+      // that don't know the field still accept the payload. After PR
+      // ships, dropping the check is safe but adds zero value.
+      if (backgroundMode && backgroundMode !== "veo") {
+        p.background_mode = backgroundMode;
+      }
       if (latestEditedSegments.current && latestEditedSegments.current.length > 0) {
         p.segments = latestEditedSegments.current;
       }
@@ -736,8 +747,63 @@ export default function EditRequestPanel({
               {t("edit.background_confirm_title") || "Confirmá regenerar el fondo"}
             </p>
             <p className="text-[11px] text-ink-secondary leading-relaxed">
-              {t("edit.background_confirm_desc") || "Genera un fondo nuevo con Veo manteniendo las lyrics y los tiempos. Cuesta ~US$0.90 (Veo) y tarda ~10-15 min. La tipografía actual se mantiene."}
+              {backgroundMode === "imagen"
+                ? (t("edit.background_confirm_desc_imagen") ||
+                    "Genera un fondo nuevo con Imagen-4 (foto + zoom suave) manteniendo las lyrics y los tiempos. Cuesta ~US$0.03 y tarda ~30 segundos. Sin riesgo de caras humanas en el fondo. La tipografía actual se mantiene.")
+                : (t("edit.background_confirm_desc") ||
+                    "Genera un fondo nuevo con Veo (video cinematográfico) manteniendo las lyrics y los tiempos. Cuesta ~US$0.90 y tarda ~10-15 min. La tipografía actual se mantiene.")}
             </p>
+          </div>
+
+          {/* Segmented toggle for generation mode. Veo (default) gives
+              cinematic camera moves; Imagen gives a controllable still
+              + Ken Burns animation — cheaper, faster, no face-validation
+              failures. Added 2026-05-16 after operator asked "qué pasa
+              si en vez de video quiero foto + parallax". */}
+          <div className="rounded-xl bg-surface-2/40 ring-1 ring-white/[0.05] p-1 flex gap-1">
+            <button
+              type="button"
+              onClick={() => setBackgroundMode("veo")}
+              disabled={submitting}
+              className={`flex-1 px-3 py-2 rounded-lg text-[11px] font-medium transition-colors flex flex-col items-center gap-0.5 ${
+                backgroundMode === "veo"
+                  ? "bg-brand/20 text-brand-light ring-1 ring-brand/30"
+                  : "text-ink-secondary hover:text-white hover:bg-white/[0.04]"
+              }`}
+            >
+              <span className="flex items-center gap-1.5">
+                <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
+                  <rect x="2" y="6" width="14" height="12" rx="2" />
+                  <path d="M16 10l5-3v10l-5-3z" />
+                </svg>
+                {t("edit.bg_mode_veo") || "Video cinematográfico"}
+              </span>
+              <span className="text-[9px] opacity-70">
+                {t("edit.bg_mode_veo_hint") || "Veo · ~15 min · cámaras y motion"}
+              </span>
+            </button>
+            <button
+              type="button"
+              onClick={() => setBackgroundMode("imagen")}
+              disabled={submitting}
+              className={`flex-1 px-3 py-2 rounded-lg text-[11px] font-medium transition-colors flex flex-col items-center gap-0.5 ${
+                backgroundMode === "imagen"
+                  ? "bg-brand/20 text-brand-light ring-1 ring-brand/30"
+                  : "text-ink-secondary hover:text-white hover:bg-white/[0.04]"
+              }`}
+            >
+              <span className="flex items-center gap-1.5">
+                <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
+                  <rect x="3" y="3" width="18" height="18" rx="2" />
+                  <circle cx="8.5" cy="8.5" r="1.5" />
+                  <path d="M21 15l-5-5L5 21" />
+                </svg>
+                {t("edit.bg_mode_imagen") || "Foto animada"}
+              </span>
+              <span className="text-[9px] opacity-70">
+                {t("edit.bg_mode_imagen_hint") || "Imagen-4 · ~30s · zoom suave"}
+              </span>
+            </button>
           </div>
 
           <BackgroundHintField
