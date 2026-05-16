@@ -3235,7 +3235,7 @@ async def _run_transcription_for_job(
                 # the song lines into the spoken-intro region — that would
                 # show 3 lyric lines at 0:00 even though the song hasn't
                 # started yet (the bug the operator reported).
-                hallucinated, reason = _detect_hallucination(segments, user_dur)
+                hallucinated, reason = _detect_hallucination(segments, user_dur, language=lang)
                 if hallucinated and user_dur:
                     anchors = _align_whisper_to_plain(segments, plain)
                     recovered = _synthesize_segments_from_plain(
@@ -3356,7 +3356,7 @@ async def _run_transcription_for_job(
         # same "good prefix + bad body" pattern.
         if reference:
             user_dur = await asyncio.to_thread(_audio_duration, tmp_path)
-            hallucinated, reason = _detect_hallucination(segments, user_dur)
+            hallucinated, reason = _detect_hallucination(segments, user_dur, language=lang)
             if hallucinated and user_dur:
                 merged = _fill_gaps_with_reference(
                     segments, reference, user_dur,
