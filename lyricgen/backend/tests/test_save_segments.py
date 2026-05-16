@@ -187,3 +187,88 @@ def test_save_segments_requires_auth(client):
         json={"segments": []},
     )
     assert res.status_code in (401, 403)
+
+
+# ---------------------------------------------------------------------------
+# Incident 2026-05-15: operator inside /edit modal on a pending_review job
+# typed a lyric correction ("de la amor" → "del amor"). The LyricsEditor's
+# autosave called /save-segments which 409'd because the status gate only
+# accepted transcribed_pending. The correction lived in component state
+# only and got dropped on the next background re-render. These tests pin
+# the expanded gate so a future regression on this would fail CI.
+# ---------------------------------------------------------------------------
+
+
+def test_save_segments_accepts_pending_review(client):
+    """/edit modal autosave needs pending_review to work. Without it,
+    text edits made inside the modal silently fail to persist."""
+    _, token, user_id, tenant_id = _make_user(client)
+    job_id = _seed_transcribed_pending(user_id, tenant_id, status="pending_review")
+
+    res = client.post(
+        f"/jobs/{job_id}/save-segments",
+        json={"segments": [
+            {"start": 0.0, "end": 2.0, "text": "una enfermera del amor"},
+        ]},
+        headers=auth(token),
+    )
+    assert res.status_code == 200, res.text
+    body = res.json()
+    assert body["ok"] is True
+    assert body["count"] == 1
+
+    # Verify persistence: row should now have the corrected text.
+    from database import SessionLocal, Job
+    s = SessionLocal()
+    try:
+        row = s.query(Job).filter(Job.job_id == job_id).first()
+        assert row.segments_json == [
+            {"start": 0.0, "end": 2.0, "text": "una enfermera del amor"},
+        ]
+    finally:
+        s.close()
+
+
+def test_save_segments_accepts_editing(client):
+    """Transient `editing` state during an in-flight /edit run also
+    accepts autosave — keeps the editor's local state in sync with DB
+    in case the operator opens a 2nd tab while the worker is rendering."""
+    _, token, user_id, tenant_id = _make_user(client)
+    job_id = _seed_transcribed_pending(user_id, tenant_id, status="editing")
+
+    res = client.post(
+        f"/jobs/{job_id}/save-segments",
+        json={"segments": [{"start": 0.0, "end": 1.0, "text": "ok"}]},
+        headers=auth(token),
+    )
+    assert res.status_code == 200, res.text
+
+
+def test_save_segments_accepts_rejected(client):
+    """Post-rejection lyric fixes work the same as post-approval ones."""
+    _, token, user_id, tenant_id = _make_user(client)
+    job_id = _seed_transcribed_pending(user_id, tenant_id, status="rejected")
+
+    res = client.post(
+        f"/jobs/{job_id}/save-segments",
+        json={"segments": [{"start": 0.0, "end": 1.0, "text": "fix"}]},
+        headers=auth(token),
+    )
+    assert res.status_code == 200, res.text
+
+
+def test_save_segments_still_rejects_terminal_or_pre_upload(client):
+    """The gate is expanded, not removed. `done`, `error`, `awaiting_upload`,
+    `processing`, `queued` still 409 because their write paths live
+    elsewhere (the renderer, /retry, /upload-uploaded, /generate)."""
+    _, token, user_id, tenant_id = _make_user(client)
+    for blocked_status in ("done", "error", "queued", "processing", "awaiting_upload"):
+        job_id = _seed_transcribed_pending(user_id, tenant_id, status=blocked_status)
+        res = client.post(
+            f"/jobs/{job_id}/save-segments",
+            json={"segments": [{"start": 0.0, "end": 1.0, "text": "x"}]},
+            headers=auth(token),
+        )
+        assert res.status_code == 409, (
+            f"status={blocked_status!r} should still 409, got {res.status_code}"
+        )

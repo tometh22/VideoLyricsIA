@@ -388,6 +388,50 @@ def enqueue_prores_prewarm(job_id: str, file_type: str) -> str | None:
     return rq_job.id
 
 
+def edit_failure_callback(job, connection, type_, value, traceback) -> None:
+    """RQ on_failure hook for run_edit_pipeline.
+
+    Fires when a worker dies mid-edit without the pipeline's own except
+    handler running (SIGKILL / hard Railway redeploy). Without this, the
+    DB row stays stuck at status='editing' for up to 30 min until the
+    reaper catches it — the user sees an indefinite spinner with no error.
+
+    Same best-effort contract as pipeline_failure_callback: swallows
+    exceptions so RQ's own failure bookkeeping still completes.
+    """
+    try:
+        from database import Job as JobModel, SessionLocal
+        edit_id = getattr(job, "id", None) or ""
+        # RQ job id is "edit:{job_id}"; strip the prefix to get our job_id.
+        rq_job_id = edit_id[len("edit:"):] if edit_id.startswith("edit:") else edit_id
+        if not rq_job_id:
+            return
+        is_abandoned = "AbandonedJobError" in (type_.__name__ if type_ else "")
+        if is_abandoned:
+            err_msg = (
+                "El servidor se reinició mientras aplicábamos los cambios. "
+                "El video anterior sigue disponible: podés volver a pedir el edit."
+            )
+        else:
+            tb_msg = str(value)[:400] if value else (type_.__name__ if type_ else "error")
+            err_msg = f"Edit falló: {tb_msg}"
+        db = SessionLocal()
+        try:
+            row = db.query(JobModel).filter(JobModel.job_id == rq_job_id).first()
+            if row is None:
+                return
+            if row.status == "editing":
+                row.status = "error"
+                row.error = err_msg
+                from datetime import datetime, timezone
+                row.completed_at = datetime.now(timezone.utc)
+                db.commit()
+        finally:
+            db.close()
+    except Exception as e:
+        logger.warning("edit_failure_callback failed: %s", e)
+
+
 def enqueue_edit(
     job_id: str,
     edit_type: str,
@@ -411,6 +455,18 @@ def enqueue_edit(
     q = _pick_queue(plan, tenant_id=tenant_id)
     if q is not None:
         from pipeline import run_edit_pipeline
+        edit_rq_id = f"edit:{job_id}"
+        # Clear any stale RQ job with this ID from a previous failed/completed
+        # edit. The 7-day failure_ttl keeps failed jobs in Redis long after
+        # they're dead. Without this cleanup, re-enqueue after a worker death
+        # silently dedupes (RQ returns/reuses the old failed job) and the DB
+        # row stays stuck at status="editing"/progress=0 indefinitely.
+        try:
+            from rq.job import Job as RQJob
+            stale = RQJob.fetch(edit_rq_id, connection=q.connection)
+            stale.delete()
+        except Exception:
+            pass  # no stale job, or Redis hiccup — proceed normally
         rq_job = q.enqueue(
             run_edit_pipeline,
             args=(job_id, edit_type, edit_params),
@@ -419,7 +475,8 @@ def enqueue_edit(
             job_timeout=3600,
             result_ttl=RESULT_TTL,
             failure_ttl=FAILURE_TTL,
-            job_id=f"edit:{job_id}",  # deterministic — double-click deduped
+            job_id=edit_rq_id,
+            on_failure=edit_failure_callback,
         )
         return rq_job.id
 

@@ -4488,8 +4488,12 @@ class EditJobRequest(BaseModel):
     text_case: str | None = Field(default=None, max_length=16)
     lyric_transition: str | None = Field(default=None, max_length=16)
     text_motion: str | None = Field(default=None, max_length=16)
-    # Required when edit_type=="lyrics". Each segment must have start
-    # (s), end (s), text (str). Anything else is ignored.
+    # Required when edit_type=="lyrics". For edit_type=="background" or
+    # "typography", segments is OPTIONAL — if the operator made text
+    # corrections inside the modal's LyricsEditor that autosave hasn't
+    # flushed yet, send them here and the API will persist them to
+    # segments_json before enqueueing. Each segment must have start (s),
+    # end (s), text (str); anything else is ignored.
     segments: list[dict] | None = Field(default=None)
     # Optional free-form hint for edit_type=="background". The operator
     # types what they want the new background to convey ("paisaje cálido
@@ -4653,8 +4657,9 @@ async def save_segments(
     current_user: dict = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
-    """Persist user-edited segments while the wizard is still in the
-    editing phase (status=transcribed_pending). Two reasons this exists:
+    """Persist user-edited segments while the LyricsEditor is mounted.
+
+    Three reasons this exists:
 
     1. The reaper's staleness anchor (last_user_activity_at) gets bumped
        every save, so a 90-min batch-edit session doesn't get reaped at
@@ -4664,6 +4669,14 @@ async def save_segments(
     2. Cross-tab / refresh recovery: if the wizard tab dies mid-batch,
        we can rehydrate the editor from segments_json on the server
        instead of relying on browser sessionStorage (which is per-tab).
+    3. Post-approval lyrics fixes: the same LyricsEditor is reused inside
+       the /edit modal on pending_review jobs. The operator typing a
+       correction (e.g. "de la amor" → "del amor") needs that change
+       persisted before any subsequent re-render reads `segments_json`.
+
+    Allowed statuses are the ones where the LyricsEditor is operationally
+    mounted. Other statuses (done, error, processing, queued, awaiting_upload)
+    have their own write paths.
 
     Validates ownership the same way as /generate's reuse path.
     """
@@ -4675,13 +4688,23 @@ async def save_segments(
             or job.tenant_id != current_user["tenant_id"]):
         raise HTTPException(status_code=404, detail="Job not found.")
 
-    # Only allow saving while the user is genuinely in the editing window.
-    # Other statuses have their own write paths (/edit for pending_review,
-    # /generate for the final commit).
-    if job.status != "transcribed_pending":
+    # Wizard (transcribed_pending) is the original use case; pending_review
+    # / rejected enable the post-approval /edit modal's autosave so text
+    # corrections persist even if the operator never clicks "Apply lyrics"
+    # explicitly. `editing` covers the transient state during a /edit run.
+    # Incident 2026-05-15: Bersuit's "enfermera del amor" lyric reverted
+    # to "de la amor" on 3 of 4 occurrences after a background re-render
+    # because autosave 409'd against pending_review here.
+    _SAVE_SEGMENTS_ALLOWED = (
+        "transcribed_pending", "pending_review", "rejected", "editing",
+    )
+    if job.status not in _SAVE_SEGMENTS_ALLOWED:
         raise HTTPException(
             status_code=409,
-            detail=f"save-segments requires status=transcribed_pending (current: {job.status})",
+            detail=(
+                f"save-segments requires status in {_SAVE_SEGMENTS_ALLOWED} "
+                f"(current: {job.status})"
+            ),
         )
 
     segs = body.segments or []
@@ -4817,15 +4840,29 @@ async def request_edit(
             ),
         )
 
-    # Lyrics edit specifically needs the new segments array on the body.
-    # typography/background still need segments_json on the row.
-    if body.edit_type == "lyrics":
-        if not body.segments or len(body.segments) == 0:
-            raise HTTPException(
-                status_code=400,
-                detail="Lyrics edit requires 'segments' in the request body (non-empty list).",
-            )
-        # Validate shape: every segment must have start, end, text.
+    # Segments handling. Two cases:
+    #
+    #   - edit_type=lyrics: caller MUST send segments (it's the whole point
+    #     of the edit), and we forward them via edit_params so the worker
+    #     can use them as the explicit override without a DB roundtrip.
+    #
+    #   - edit_type=background / typography: caller MAY send segments. If
+    #     they do (operator was editing text inside the modal alongside
+    #     other changes), we persist them to segments_json BEFORE the
+    #     enqueue so `run_edit_pipeline`'s `else: segments = job.segments_json`
+    #     branch (pipeline.py:6309) reads the corrected text. Incident
+    #     2026-05-15: Bersuit lyric "de la amor" → "del amor" was silently
+    #     dropped on every background re-render because /edit only persisted
+    #     segments for the lyrics path. Operator's edits lived in the
+    #     LyricsEditor's local state and never reached the worker.
+    #
+    # Either way, shape validation runs once if segments are present.
+    if body.edit_type == "lyrics" and (not body.segments or len(body.segments) == 0):
+        raise HTTPException(
+            status_code=400,
+            detail="Lyrics edit requires 'segments' in the request body (non-empty list).",
+        )
+    if body.segments and len(body.segments) > 0:
         for i, seg in enumerate(body.segments):
             if not isinstance(seg, dict):
                 raise HTTPException(status_code=400, detail=f"segments[{i}] must be an object")
@@ -4843,11 +4880,25 @@ async def request_edit(
                     status_code=400,
                     detail=f"segments[{i}] start/end must be numbers",
                 )
-    elif not job.segments_json:
+    elif body.edit_type != "lyrics" and not job.segments_json:
         raise HTTPException(
             status_code=400,
             detail="Job has no persisted transcription. Cannot re-render.",
         )
+
+    # Normalize segments once (used both for persistence and the lyrics
+    # edit_params payload).
+    normalized_segments = None
+    if body.segments and len(body.segments) > 0:
+        normalized_segments = [
+            {"start": float(s["start"]), "end": float(s["end"]), "text": str(s["text"])}
+            for s in body.segments
+        ]
+        # Persist immediately so any subsequent reader (worker, /status
+        # poll, the operator opening another tab) sees the corrected text.
+        # The /edit handler is the right place for this — it's already
+        # mutating the row a few lines below.
+        job.segments_json = normalized_segments
 
     edit_params: dict = {}
     if body.font is not None:
@@ -4861,12 +4912,10 @@ async def request_edit(
     if body.text_motion is not None:
         edit_params["text_motion"] = body.text_motion
     if body.edit_type == "lyrics":
-        # Normalize to just the fields the pipeline needs — strip
-        # anything else the client may have sent (_id, etc.).
-        edit_params["segments"] = [
-            {"start": float(s["start"]), "end": float(s["end"]), "text": str(s["text"])}
-            for s in body.segments
-        ]
+        # Lyrics path keeps explicit edit_params hand-off so the worker
+        # doesn't re-query the DB for segments it already received in
+        # the API call.
+        edit_params["segments"] = normalized_segments
     if body.edit_type == "background" and body.background_hint and body.background_hint.strip():
         # Operator's free-form description of what they want the new
         # background to convey. Forwarded to Gemini's user_content as a
@@ -4901,13 +4950,28 @@ async def request_edit(
     ))
     db.commit()
 
-    enqueue_edit(
-        job_id=job_id,
-        edit_type=body.edit_type,
-        edit_params=edit_params,
-        plan=current_user.get("plan", "100"),
-        tenant_id=current_user.get("tenant_id", ""),
-    )
+    try:
+        enqueue_edit(
+            job_id=job_id,
+            edit_type=body.edit_type,
+            edit_params=edit_params,
+            plan=current_user.get("plan", "100"),
+            tenant_id=current_user.get("tenant_id", ""),
+        )
+    except Exception as exc:
+        # Enqueue failed (Redis down, unexpected RQ error). Roll back the DB
+        # to pending_review so the user can retry without waiting for the reaper.
+        logger.error("enqueue_edit failed for %s: %s", job_id, exc)
+        job.status = "pending_review"
+        job.edit_count = current_edit_count
+        job.editing_started_at = None
+        job.progress = 100
+        job.current_step = "thumbnail"
+        db.commit()
+        raise HTTPException(
+            status_code=503,
+            detail="Cola de trabajos no disponible. Intentá de nuevo en unos segundos.",
+        )
 
     return {
         "ok": True,
@@ -5862,6 +5926,7 @@ async def portal_get_items(
     to _DELIVERY_URL_EXPIRY_S."""
     _verify_portal_token(x_portal_token)
     import time
+    from concurrent.futures import ThreadPoolExecutor
 
     now = time.time()
     deliveries = (
@@ -5871,12 +5936,50 @@ async def portal_get_items(
         .all()
     )
 
+    # Resolve every (delivery, file) pair's R2 size in parallel BEFORE
+    # building the response. Sequential head_object calls were the root
+    # cause of Vercel 502s on the portal: 5 files × ~30 deliveries × 200ms
+    # blew past the 30s rewrite timeout. A bounded thread pool brings the
+    # whole batch down to a couple of seconds. Per-call timeout is short
+    # so a single hung R2 request can't poison the listing — failed
+    # head_objects fall through to size=None / available=False, same as
+    # the old per-iteration except.
+    head_jobs: list[tuple[int, str, str]] = []  # (delivery_idx, file_type, r2_key)
+    for di, d in enumerate(deliveries):
+        for ft in (d.file_types or []):
+            if ft not in _DELIVERY_FILE_TYPES:
+                continue
+            r2_key = _r2_key_for_delivery(d.tenant_snapshot, d.job_id, ft)
+            head_jobs.append((di, ft, r2_key))
+
+    size_map: dict[tuple[int, str], int | None] = {}
+
+    def _head_size(job: tuple[int, str, str]) -> tuple[tuple[int, str], int | None]:
+        di, ft, r2_key = job
+        try:
+            client = storage._get_client()
+            if client is None:
+                return (di, ft), None
+            head = client.head_object(Bucket=storage.R2_BUCKET, Key=r2_key)
+            return (di, ft), head.get("ContentLength")
+        except Exception:
+            return (di, ft), None
+
+    if head_jobs:
+        # Cap concurrency so we don't open hundreds of R2 sockets at once
+        # on a portal with many active deliveries. 16 workers is a good
+        # tradeoff: handles ~80 head calls/sec with R2's typical 200ms
+        # latency, well under any reasonable portal cardinality.
+        with ThreadPoolExecutor(max_workers=16) as pool:
+            for k, v in pool.map(_head_size, head_jobs):
+                size_map[k] = v
+
     # Group by (artist, song). Within each group, versions stay in
     # added_at order (oldest first), matching how items.json reads.
     songs: dict[tuple[str, str], dict] = {}
     file_type_labels = {ft: info["label"] for ft, info in _DELIVERY_FILE_TYPES.items()}
 
-    for d in deliveries:
+    for di, d in enumerate(deliveries):
         key = (d.artist_snapshot, d.song_title_snapshot)
         bucket = songs.setdefault(key, {"artist": d.artist_snapshot, "song": d.song_title_snapshot, "versions": []})
         files = []
@@ -5893,17 +5996,7 @@ async def portal_get_items(
                     expiry_seconds=_DELIVERY_URL_EXPIRY_S,
                     download_filename=dl_name,
                 )
-                size_bytes = None
-                try:
-                    # Best-effort size for the UI. If R2 is offline we
-                    # still want to return the listing (link will 404
-                    # at click time, less bad than a full portal outage).
-                    client = storage._get_client()
-                    if client is not None:
-                        head = client.head_object(Bucket=storage.R2_BUCKET, Key=r2_key)
-                        size_bytes = head.get("ContentLength")
-                except Exception:
-                    size_bytes = None
+                size_bytes = size_map.get((di, ft))
                 available = url is not None and size_bytes is not None
             except Exception:
                 url = None
