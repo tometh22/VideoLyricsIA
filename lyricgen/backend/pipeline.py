@@ -3553,7 +3553,8 @@ def _analyze_lyrics_for_background(lyrics_text: str, artist: str, job_id: str = 
                                     concept: str = "",
                                     movement_style: str = "",
                                     match_lyrics: bool = True,
-                                    background_hint: str | None = None) -> dict:
+                                    background_hint: str | None = None,
+                                    for_provider: str = "veo") -> dict:
     """Use Gemini to analyze lyrics and choose visual style + prompt.
 
     match_lyrics=True  ("Inspirado en la letra"): lyrics anchor or infuse the scene.
@@ -3561,6 +3562,13 @@ def _analyze_lyrics_for_background(lyrics_text: str, artist: str, job_id: str = 
     background_hint: optional free-form text from the operator (set by /edit)
       describing what they want the new background to convey. Overrides
       Gemini's default interpretation when present.
+    for_provider: "veo" (default) or "imagen". Adjusts the system prompt
+      addendum so Gemini emits the right kind of prompt:
+        - veo  → keep camera-movement / motion descriptors (text-to-video)
+        - imagen → strip motion words, emphasize composition + lighting
+          (text-to-image; motion words confuse Imagen-4 into frozen-action
+          renders that look broken when the local Ken Burns animation
+          overlays them).
 
     Returns dict with:
       - style: "video" | "photo" | "illustration"
@@ -3812,6 +3820,27 @@ Hard rules:
         f"Lyrics (may be incomplete or noisy):\n"
         f"{lyrics_sample or '[transcription failed; rely on artist + title + declared metadata]'}"
     )
+    # Provider-specific addendum. When generating for Imagen-4 (still
+    # image + local Ken Burns animation), strip the motion vocabulary
+    # that Veo expects — text-to-image models render motion words as
+    # frozen-mid-action poses (a "running figure" becomes a static
+    # crouched silhouette), which then jitters weirdly under the local
+    # zoom/pan animation. Composition + lighting + atmosphere only.
+    if for_provider == "imagen":
+        system_prompt = system_prompt + (
+            "\n\n## PROVIDER OVERRIDE — Imagen-4 (text-to-image)\n"
+            "The output is a STILL IMAGE that will be animated locally "
+            "with a subtle zoom/pan. Optimize for COMPOSITION not motion:\n"
+            "- REMOVE all camera-movement words (no \"drone\", \"tracking\", "
+            "\"pull-back\", \"slow drift\", \"orbit\", \"pan\", \"dolly\").\n"
+            "- REPLACE with composition descriptors (\"centered composition\", "
+            "\"wide vista\", \"low-angle\", \"symmetrical framing\", "
+            "\"rule-of-thirds\").\n"
+            "- EMPHASIZE lighting direction, atmosphere, color palette, "
+            "and material textures.\n"
+            "- The output `style` field MUST be \"photo\" (not \"video\")."
+        )
+
     full_prompt = f"system:{system_prompt}\nuser:{user_content}"
 
     recorder = record_ai_call(
@@ -3934,8 +3963,25 @@ Hard rules:
 def _get_unique_prompt(lyrics_text: str = None, artist: str = "", job_id: str = None,
                        song_title: str = "", genre: str = "", concept: str = "",
                        movement_style: str = "", match_lyrics: bool = True,
-                       background_hint: str | None = None) -> dict:
+                       background_hint: str | None = None,
+                       for_provider: str = "veo") -> dict:
     """Get a unique style+prompt combination. Returns {style, prompt}.
+
+    `for_provider` ("veo" default | "imagen") nudges the prompt towards
+    the strengths of the target generator:
+      - "veo": prompts include camera movement, action verbs, motion
+        descriptors (Veo 3.1 is a text-to-video model — these enrich
+        the output).
+      - "imagen": prompts focus on composition, lighting, atmosphere
+        with NO motion descriptors (Imagen-4 is a text-to-image model
+        — motion words confuse it and produce frozen-frame-of-action
+        renders that read poorly with the local Ken Burns animation
+        applied afterward).
+
+    For the combinatorial fallback (no Gemini), we just swap the camera
+    descriptor for a static composition word when generating for Imagen.
+    For the Gemini path, we pass `for_provider` through so the analysis
+    function can adjust its system prompt accordingly.
 
     Note: the local _USED_PROMPTS_FILE only sees this worker's previous
     prompts — Railway containers have ephemeral disk, so dedup across
@@ -3957,6 +4003,7 @@ def _get_unique_prompt(lyrics_text: str = None, artist: str = "", job_id: str = 
             lyrics_text or "", artist, job_id=job_id, song_title=song_title,
             genre=genre, concept=concept, movement_style=movement_style,
             match_lyrics=match_lyrics, background_hint=background_hint,
+            for_provider=for_provider,
         )
         if result["prompt"] and result["prompt"] not in used:
             used.append(result["prompt"])
@@ -3967,13 +4014,25 @@ def _get_unique_prompt(lyrics_text: str = None, artist: str = "", job_id: str = 
                 pass
             return result
 
-    # Fallback: combinatorial video prompt
+    # Fallback: combinatorial prompt. For Imagen, drop the camera move
+    # descriptor (it adds motion words like "tracking shot" that confuse
+    # a still-image generator) and substitute a composition descriptor.
+    composition_terms = (
+        "centered composition", "wide vista", "low-angle composition",
+        "rule-of-thirds composition", "symmetrical framing", "dramatic perspective",
+    )
     for _ in range(50):
         scene = random.choice(_BG_SCENES)
         palette = random.choice(_BG_PALETTES)
-        camera = random.choice(_BG_CAMERAS)
         condition = random.choice(_BG_CONDITIONS)
-        prompt = f"{camera} of {scene}, {palette}, {condition}, 4k, photorealistic"
+        if for_provider == "imagen":
+            composition = random.choice(composition_terms)
+            prompt = f"{composition} of {scene}, {palette}, {condition}, 4k, photorealistic"
+            style = "image"
+        else:
+            camera = random.choice(_BG_CAMERAS)
+            prompt = f"{camera} of {scene}, {palette}, {condition}, 4k, photorealistic"
+            style = "video"
         if prompt not in used:
             used.append(prompt)
             try:
@@ -3981,8 +4040,14 @@ def _get_unique_prompt(lyrics_text: str = None, artist: str = "", job_id: str = 
                     json.dump(used, f)
             except OSError:
                 pass
-            return {"style": "video", "prompt": prompt}
+            return {"style": style, "prompt": prompt}
 
+    # Final fallback after 50 attempts — accept duplicate.
+    if for_provider == "imagen":
+        return {
+            "style": "image",
+            "prompt": f"{random.choice(composition_terms)} of {random.choice(_BG_SCENES)}, {random.choice(_BG_PALETTES)}, {random.choice(_BG_CONDITIONS)}, 4k, photorealistic",
+        }
     return {
         "style": "video",
         "prompt": f"{random.choice(_BG_CAMERAS)} of {random.choice(_BG_SCENES)}, {random.choice(_BG_PALETTES)}, {random.choice(_BG_CONDITIONS)}, 4k, photorealistic",
@@ -4568,12 +4633,22 @@ def _ensure_background(style_hint: str, job_dir: str, lyrics_text: str = None,
                        movement_style: str = "",
                        image_to_video_path: str | None = None,
                        match_lyrics: bool = True,
-                       background_hint: str | None = None) -> str:
+                       background_hint: str | None = None,
+                       bg_mode: str = "veo") -> str:
     """Generate background using AI. Gemini picks the best style for the song.
 
     background_hint: optional free-form operator description, set via /edit
     when the user clicks "Regenerar fondo" and types what they want. Flows
     into Gemini's user_content as a [OPERATOR OVERRIDE] block.
+
+    bg_mode: "veo" (default — cinematic text-to-video, Google Veo 3.1) or
+    "imagen" (Imagen-4 text-to-image + Ken Burns animation locally). Imagen
+    mode is ~30x faster, ~17x cheaper, and avoids the face-validation
+    failures that Veo hits on certain prompts (incident 2026-05-15: Veo
+    inserted an identifiable face into "Lunes Por La Madrugada" bg). It
+    trades cinematic camera movement for a simpler zoom/pan over a still.
+    Operator picks via the /edit modal segmented toggle when they regen
+    the background; default stays "veo" so the existing flow is unchanged.
 
     Returns path to .mp4 (video style) or .jpg/.png (photo/illustration style).
     """
@@ -4584,6 +4659,28 @@ def _ensure_background(style_hint: str, job_dir: str, lyrics_text: str = None,
             all_videos.extend(f for f in files if f.lower().endswith(".mp4"))
     if all_videos:
         return None
+
+    # Imagen-4 + Ken Burns branch. Cabled 2026-05-16 — _generate_imagen_image
+    # has existed in the codebase as dead code since the original architecture
+    # but was never wired into the dispatch. This is the wire.
+    if bg_mode == "imagen":
+        result = _get_unique_prompt(
+            lyrics_text, artist, job_id=job_id, song_title=song_title, genre=genre,
+            concept=concept, movement_style=movement_style, match_lyrics=match_lyrics,
+            background_hint=background_hint,
+            for_provider="imagen",
+        )
+        prompt = result["prompt"]
+        image_path = os.path.join(job_dir, "bg_imagen.jpg")
+        bg_path = os.path.join(job_dir, "bg_generated.mp4")
+        # Imagen-4 has its own internal rate-limit retry (5 attempts with
+        # 60s backoff). Any other exception bubbles up to the caller's
+        # try/except which falls back to the gradient.
+        _generate_imagen_image(prompt, image_path, job_id=job_id)
+        # Ken Burns produces a 60s sample that downstream palindrome-loops
+        # to match the audio duration. Same contract as the Veo path.
+        _ken_burns_image_to_mp4(image_path, bg_path)
+        return bg_path
 
     # Generate video background with Veo 3 (always video, no images)
     result = _get_unique_prompt(
@@ -4648,6 +4745,51 @@ def _ensure_background(style_hint: str, job_dir: str, lyrics_text: str = None,
     gradient.write_videofile(fallback_path, fps=24, logger=None)
     gradient.close()
     return fallback_path
+
+
+def _ken_burns_image_to_mp4(
+    image_path: str,
+    output_path: str,
+    sample_duration: float = 60.0,
+    spec: RenderSpec | None = None,
+) -> str:
+    """Render a Ken Burns animation over a still image as a standalone MP4.
+
+    Wraps `_ken_burns_clip` (which returns a moviepy VideoClip object) into
+    a file-on-disk that matches the contract `_ensure_background` returns
+    to its callers. Used by the Imagen-mode background path: Imagen-4
+    generates a still photo, this function turns it into a short looped-
+    able MP4 sample, and the rest of the pipeline (background palindrome
+    loop, R2 cache via bg_r2_key_cached for subsequent typography/lyrics
+    edits) treats it identically to a Veo output.
+
+    `sample_duration` defaults to 60s — same ballpark as a Veo clip after
+    palindrome looping. Downstream `_loop_palindrome_to_match_audio`
+    extends it to match the full audio. Going much shorter would expose
+    the Ken Burns cycle reset; longer doubles file size with no visible
+    gain since palindrome reverses anyway.
+
+    Returns the output path (same as the input arg) so callers can
+    use it in expressions.
+    """
+    if spec is None:
+        spec = RenderSpec.youtube_default()
+    clip = _ken_burns_clip(image_path, sample_duration, spec=spec)
+    try:
+        clip.write_videofile(
+            output_path,
+            fps=spec.fps,
+            codec="libx264",
+            audio=False,
+            logger=None,
+            preset="medium",
+            ffmpeg_params=["-pix_fmt", "yuv420p"],  # broad player compat
+        )
+    finally:
+        clip.close()
+    size_mb = os.path.getsize(output_path) / (1024 * 1024)
+    print(f"[BG] Ken Burns MP4 rendered: {sample_duration:.0f}s, {size_mb:.1f} MB")
+    return output_path
 
 
 def _ken_burns_clip(image_path: str, duration: float, spec: RenderSpec | None = None):
@@ -6363,6 +6505,11 @@ def run_edit_pipeline(
     # user typed in the "Aclarar tipo de fondo" textarea). None if absent;
     # propagates only into the `background` branch below.
     background_hint = edit_params.get("background_hint") or None
+    # Operator-chosen generation mode for background regen: "veo" (Veo 3.1
+    # cinematic video) or "imagen" (Imagen-4 still + Ken Burns animation).
+    # Defaults to "veo" when unset for backward compatibility — pre-2026-05-16
+    # edits never carried this field. Validated upstream by Pydantic enum.
+    background_mode = edit_params.get("background_mode") or "veo"
 
     job_dir = os.path.join(OUTPUTS_DIR, job_id)
     os.makedirs(job_dir, exist_ok=True)
@@ -6409,6 +6556,7 @@ def run_edit_pipeline(
                 song_title=song_title, genre=genre, concept=concept,
                 movement_style=movement_style,
                 background_hint=background_hint,
+                bg_mode=background_mode,
             )
             update_job(job_id, progress=35)
             # Re-cache the new background so future typography edits work.
