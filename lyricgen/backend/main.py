@@ -3235,7 +3235,7 @@ async def _run_transcription_for_job(
                 # the song lines into the spoken-intro region — that would
                 # show 3 lyric lines at 0:00 even though the song hasn't
                 # started yet (the bug the operator reported).
-                hallucinated, reason = _detect_hallucination(segments, user_dur)
+                hallucinated, reason = _detect_hallucination(segments, user_dur, language=lang)
                 if hallucinated and user_dur:
                     anchors = _align_whisper_to_plain(segments, plain)
                     recovered = _synthesize_segments_from_plain(
@@ -3356,7 +3356,7 @@ async def _run_transcription_for_job(
         # same "good prefix + bad body" pattern.
         if reference:
             user_dur = await asyncio.to_thread(_audio_duration, tmp_path)
-            hallucinated, reason = _detect_hallucination(segments, user_dur)
+            hallucinated, reason = _detect_hallucination(segments, user_dur, language=lang)
             if hallucinated and user_dur:
                 merged = _fill_gaps_with_reference(
                     segments, reference, user_dur,
@@ -5690,11 +5690,23 @@ _DELIVERY_URL_EXPIRY_S = 7 * 24 * 3600  # R2 max
 
 
 def _r2_key_for_delivery(tenant: str, job_id: str, file_type: str) -> str:
-    """Reproduce the convention `{tenant}/{job_id}/{filename}` used by
-    the legacy gen_page.py. Keeping the same shape so the backfill works
-    without touching R2."""
+    """Build the R2 key for a delivery file.
+
+    Must use storage._safe_filename on each segment because the writer
+    side does the same: tenants stored as email addresses
+    (tomas@epical.digital) get written under tomas_epical.digital/...
+    in R2 — `@` and other non-[A-Za-z0-9._-] chars become underscores.
+    Without sanitisation here, the portal builds the unsanitised key,
+    head_object returns NoSuchKey, and the operator sees
+    "SIN PREVIEW" + dash file sizes on the listing even though the
+    files exist in R2 under the correct (sanitised) path.
+    """
     info = _DELIVERY_FILE_TYPES[file_type]
-    return f"{tenant}/{job_id}/{info['filename']}"
+    return (
+        f"{storage._safe_filename(tenant)}"
+        f"/{storage._safe_filename(job_id)}"
+        f"/{storage._safe_filename(info['filename'])}"
+    )
 
 
 def _delivery_safe_filename(artist: str, song: str) -> str:

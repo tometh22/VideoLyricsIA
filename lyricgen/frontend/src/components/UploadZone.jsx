@@ -277,11 +277,17 @@ export default function UploadZone({
     } catch { return ""; }
   };
 
+  // Idiomas soportados. Spanish primero porque ~95% del catálogo target
+  // (Universal Music Argentina) es en español; cualquier auto-detect que
+  // se confunda termina disparando coverage_warning y timing sintetizado.
+  // El default del entry.language al cargar un archivo es "es" (ver más
+  // abajo en parseFilename); "auto" sigue disponible como opt-out
+  // explícito para canciones en otros idiomas.
   const LANGUAGES = [
-    { code: "", label: t("lang.auto") },
     { code: "es", label: t("lang.es") },
     { code: "en", label: t("lang.en") },
     { code: "pt", label: t("lang.pt") },
+    { code: "", label: t("lang.auto") },
     { code: "fr", label: t("lang.fr") },
     { code: "it", label: t("lang.it") },
     { code: "de", label: t("lang.de") },
@@ -424,7 +430,13 @@ export default function UploadZone({
           file: f,
           artist,
           songTitle: song,
-          language: "",
+          // Default 'es' instead of '' (auto-detect). Auto was producing
+          // ~50% language-misdetection on Spanish catalogue (audited
+          // 2026-05-15 across 4 sample tracks: 2 misdetected as javanese
+          // and italian respectively, ending in the synthesizer path with
+          // bad timestamps). Operator can still flip to 'auto' if they
+          // upload a non-Spanish song.
+          language: "es",
           ...batchDefaultsRef.current,
         };
       });
@@ -933,20 +945,23 @@ export default function UploadZone({
                   {t("upload.song_title_hint") || "Si lo dejás vacío, lo inferimos del nombre del archivo"}
                 </p>
               )}
-              {/* Language pills */}
-              <div className="flex items-center gap-1.5">
-                <span className="text-[11px] text-gray-600 mr-1">{t("lang.auto")}</span>
-                {LANGUAGES.filter((l) => l.code).map((l) => (
+              {/* Language pills. Default 'es' is highlighted on file
+                  load — operator can click another to override, or
+                  click 'auto' to let Whisper detect (not recommended
+                  for Spanish catalogue: ~50% misdetection rate). */}
+              <div className="flex items-center gap-1.5 flex-wrap">
+                <span className="text-[11px] text-gray-600 mr-1">{t("upload.lang_label") || "Idioma:"}</span>
+                {LANGUAGES.map((l) => (
                   <button
-                    key={l.code}
+                    key={l.code || "auto"}
                     type="button"
-                    onClick={() => updateField(i, "language", entry.language === l.code ? "" : l.code)}
+                    onClick={() => updateField(i, "language", l.code)}
                     className={`text-[11px] font-bold px-2 py-1 rounded-md transition-all uppercase
                       ${entry.language === l.code
                         ? "bg-brand/20 text-brand"
                         : "text-gray-600 hover:text-gray-400 hover:bg-white/[0.03]"
                       }`}
-                  >{l.code}</button>
+                  >{l.code || (t("lang.auto") || "auto")}</button>
                 ))}
               </div>
 
