@@ -507,6 +507,16 @@ class Delivery(Base):
     # an accidental delete from the portal would otherwise be unrecoverable.
     removed_at = Column(DateTime(timezone=True), nullable=True, index=True)
     removed_by_user_id = Column(Integer, ForeignKey("users.id"), nullable=True)
+    # UMG approval state. Three states:
+    #   approved_at IS NULL                              → pendiente
+    #   approved_at IS NOT NULL, removed_at IS NULL      → aprobada
+    #   removed_at IS NOT NULL (any approved_at)         → rechazada (= soft-deleted)
+    # approved_by_label carries either "UMG (portal)" when the portal user
+    # clicked Aprobar, or the operator username when the admin marked it
+    # approved on UMG's behalf. We don't store a user_id for the portal
+    # path because the portal has no per-user identity.
+    approved_at = Column(DateTime(timezone=True), nullable=True)
+    approved_by_label = Column(String(120), nullable=True)
 
     def to_dict(self):
         return {
@@ -520,6 +530,8 @@ class Delivery(Base):
             "frame_size": self.frame_size_snapshot,
             "added_at": self.added_at.isoformat() if self.added_at else None,
             "removed_at": self.removed_at.isoformat() if self.removed_at else None,
+            "approved_at": self.approved_at.isoformat() if self.approved_at else None,
+            "approved_by_label": self.approved_by_label,
         }
 
 
@@ -872,6 +884,11 @@ def _migrate_user_columns():
         # run_edit_pipeline before _upload_deliverables_to_r2 so an operator
         # can roll back a bad re-sync — the {key}.vN object stays in R2.
         "ALTER TABLE jobs ADD COLUMN IF NOT EXISTS previous_versions JSONB",
+        # Deliveries portal approval state (UMG signs off per video). NULL =
+        # pending. Set together via the portal /approve endpoint or the
+        # admin /approve endpoint; never set independently.
+        "ALTER TABLE deliveries ADD COLUMN IF NOT EXISTS approved_at TIMESTAMPTZ",
+        "ALTER TABLE deliveries ADD COLUMN IF NOT EXISTS approved_by_label VARCHAR(120)",
     ]
     # Each statement gets its own transaction. In Postgres, a failed statement
     # inside a transaction puts it in aborted state — subsequent execute()
