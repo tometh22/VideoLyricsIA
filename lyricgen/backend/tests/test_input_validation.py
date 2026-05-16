@@ -52,9 +52,11 @@ def test_approve_notes_oversized(client, admin_token, db):
     job_id = uuid.uuid4().hex[:12]
     job = JobModel(
         job_id=job_id,
+        user_id=1,
         tenant_id="default",
         artist="Test",
         song_title="x",
+        filename="test.mp3",
         status="pending_review",
         delivery_profile="youtube",
     )
@@ -77,9 +79,11 @@ def test_approve_notes_default_when_omitted(client, admin_token, db):
     job_id = uuid.uuid4().hex[:12]
     job = JobModel(
         job_id=job_id,
+        user_id=1,
         tenant_id="default",
         artist="Test",
         song_title="x",
+        filename="test.mp3",
         status="pending_review",
         delivery_profile="youtube",
     )
@@ -104,9 +108,11 @@ def test_edit_font_oversized(client, admin_token, db):
     job_id = uuid.uuid4().hex[:12]
     job = JobModel(
         job_id=job_id,
+        user_id=1,
         tenant_id="default",
         artist="Test",
         song_title="x",
+        filename="test.mp3",
         status="pending_review",
         delivery_profile="youtube",
         bg_r2_key_cached="fake/key.mp4",
@@ -133,9 +139,11 @@ def test_enable_prores_frame_size_oversized(client, admin_token, db, monkeypatch
     job_id = uuid.uuid4().hex[:12]
     job = JobModel(
         job_id=job_id,
+        user_id=1,
         tenant_id="default",
         artist="Test",
         song_title="x",
+        filename="test.mp3",
         status="done",
         delivery_profile="youtube",
         progress=100,
@@ -156,13 +164,13 @@ def test_enable_prores_frame_size_oversized(client, admin_token, db, monkeypatch
 
 
 def test_upload_artist_oversized(client, user_token):
-    """Form artist > 200 chars → 422. /upload usa Form, no BaseModel."""
+    """Form artist > 255 chars → 422. /upload usa Form, no BaseModel."""
     fake_mp3 = b"ID3\x04\x00\x00\x00\x00\x00\x00" + b"\xff\xfb\x90\x00" * 64
     res = client.post(
         "/upload",
         headers={"Authorization": f"Bearer {user_token}"},
         files={"file": ("test.mp3", fake_mp3, "audio/mpeg")},
-        data={"artist": "x" * 201},
+        data={"artist": "x" * 256},
     )
     assert res.status_code == 422
 

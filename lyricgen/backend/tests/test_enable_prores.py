@@ -23,9 +23,11 @@ def _create_done_youtube_job(db, tenant_id="default", umg_spec=None):
     job_id = uuid.uuid4().hex[:12]
     job = JobModel(
         job_id=job_id,
+        user_id=1,
         tenant_id=tenant_id,
         artist="Test Artist",
         song_title="Test Song",
+        filename="test.mp3",
         status="done",
         delivery_profile="youtube",
         umg_spec=umg_spec,
@@ -47,7 +49,7 @@ def test_enable_prores_requires_prores_access(monkeypatch, client, user_token, d
         f"/enable-prores/{job_id}",
         headers={"Authorization": f"Bearer {user_token}"},
         json={
-            "umg_frame_size": "1920x1080",
+            "umg_frame_size": "HD",
             "umg_fps": "29.97",
             "umg_prores_profile": "3",
         },
@@ -66,7 +68,7 @@ def test_enable_prores_404_for_other_tenant(monkeypatch, client, admin_token, db
         f"/enable-prores/{job_id}",
         headers={"Authorization": f"Bearer {admin_token}"},
         json={
-            "umg_frame_size": "1920x1080",
+            "umg_frame_size": "HD",
             "umg_fps": "29.97",
             "umg_prores_profile": "3",
         },
@@ -83,9 +85,11 @@ def test_enable_prores_400_when_job_not_done(monkeypatch, client, admin_token, d
     # Job en processing, NO en done
     job = JobModel(
         job_id=job_id,
+        user_id=1,
         tenant_id="default",  # admin default tenant
         artist="A",
         song_title="S",
+        filename="test.mp3",
         status="processing",
         delivery_profile="youtube",
         progress=50,
@@ -97,7 +101,7 @@ def test_enable_prores_400_when_job_not_done(monkeypatch, client, admin_token, d
         f"/enable-prores/{job_id}",
         headers={"Authorization": f"Bearer {admin_token}"},
         json={
-            "umg_frame_size": "1920x1080",
+            "umg_frame_size": "HD",
             "umg_fps": "29.97",
             "umg_prores_profile": "3",
         },
@@ -135,7 +139,7 @@ def test_enable_prores_happy_path_persists_umg_spec(monkeypatch, client, admin_t
         f"/enable-prores/{job_id}",
         headers={"Authorization": f"Bearer {admin_token}"},
         json={
-            "umg_frame_size": "1920x1080",
+            "umg_frame_size": "HD",
             "umg_fps": "29.97",
             "umg_prores_profile": "3",
         },
@@ -144,7 +148,7 @@ def test_enable_prores_happy_path_persists_umg_spec(monkeypatch, client, admin_t
     body = res.json()
     assert body["ok"] is True
     assert body["job_id"] == job_id
-    assert body["umg_spec"]["frame_size"] == "1920x1080"
+    assert body["umg_spec"]["frame_size"] == "HD"
     assert body["umg_spec"]["fps"] == pytest.approx(29.97)
     assert body["umg_spec"]["prores_profile"] == 3
     # `enqueued` puede ser [] si Redis no está disponible en CI — no es
@@ -156,7 +160,7 @@ def test_enable_prores_happy_path_persists_umg_spec(monkeypatch, client, admin_t
     fresh = db.query(JobModel).filter(JobModel.job_id == job_id).first()
     assert fresh is not None
     assert fresh.umg_spec is not None
-    assert fresh.umg_spec["frame_size"] == "1920x1080"
+    assert fresh.umg_spec["frame_size"] == "HD"
     # delivery_profile NO debe cambiar — mantenemos el dato histórico.
     assert fresh.delivery_profile == "youtube"
 
@@ -177,7 +181,7 @@ def test_enable_prores_idempotent_overwrites_umg_spec(monkeypatch, client, admin
         f"/enable-prores/{job_id}",
         headers={"Authorization": f"Bearer {admin_token}"},
         json={
-            "umg_frame_size": "1920x1080",
+            "umg_frame_size": "HD",
             "umg_fps": "29.97",
             "umg_prores_profile": "3",
         },
@@ -185,6 +189,6 @@ def test_enable_prores_idempotent_overwrites_umg_spec(monkeypatch, client, admin
     assert res.status_code == 200
     db.expire_all()
     fresh = db.query(JobModel).filter(JobModel.job_id == job_id).first()
-    assert fresh.umg_spec["frame_size"] == "1920x1080"
+    assert fresh.umg_spec["frame_size"] == "HD"
     assert fresh.umg_spec["fps"] == pytest.approx(29.97)
     assert fresh.umg_spec["prores_profile"] == 3

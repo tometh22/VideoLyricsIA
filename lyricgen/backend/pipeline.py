@@ -6,6 +6,8 @@ import os
 import math
 import random
 import re
+import logging
+logger = logging.getLogger("genly.pipeline")
 import subprocess
 import tempfile
 import traceback
@@ -101,9 +103,9 @@ def _upload_deliverables_to_r2(job_id: str, job_dir: str, files: dict) -> dict:
                 try:
                     os.unlink(local)
                 except OSError as e:
-                    print(f"[R2] Could not remove local {local}: {e}")
+                    logger.error("[R2] Could not remove local %s: %s", local, e)
         except Exception as e:
-            print(f"[R2] Upload failed for {key_name}: {e}")
+            logger.error("[R2] Upload failed for %s: %s", key_name, e)
     return out
 
 
@@ -126,7 +128,7 @@ def _write_edit_audit(action: str, detail: dict) -> None:
         finally:
             _db.close()
     except Exception as e:
-        print(f"[EDIT] audit log write failed ({action}): {e}")
+        logger.error("[EDIT] audit log write failed (%s): %s", action, e)
 
 
 def _snapshot_previous_deliverables(
@@ -161,7 +163,7 @@ def _snapshot_previous_deliverables(
             if ok:
                 archived[file_type] = dst_key
         except Exception as e:
-            print(f"[EDIT] snapshot copy failed for {file_type} ({src_key}): {e}")
+            logger.error("[EDIT] snapshot copy failed for %s (%s): %s", file_type, src_key, e)
     if not archived:
         return None
     return {
@@ -247,8 +249,8 @@ def _verify_deliverables(job_dir: str, files: dict, audio_duration: float) -> No
                     f"audio {expected_dur:.1f}s by > 2s"
                 )
 
-    print(f"[VERIFY] all {len(files)} deliverables passed sanity checks "
-          f"(umg_master, if requested, is generated lazily at download)")
+    logger.info("[VERIFY] all %s deliverables passed sanity checks "
+                "(umg_master, if requested, is generated lazily at download)", len(files))
 
 
 def _cleanup_local_intermediates(job_dir: str) -> None:
@@ -307,7 +309,7 @@ def _get_persisted_segments(job_id: str) -> list[dict] | None:
                 return None
             return segs
     except Exception as e:  # pragma: no cover
-        print(f"[PIPELINE] _get_persisted_segments({job_id}) failed: {e}")
+        logger.error("[PIPELINE] _get_persisted_segments(%s) failed: %s", job_id, e)
         return None
 
 
@@ -334,7 +336,7 @@ def _best_effort_lyrics_hint(artist: str, song_title: str) -> str | None:
                 artist, song_title, job_id=None, db=db,
             )
     except Exception as e:  # pragma: no cover
-        print(f"[PIPELINE] lyrics_hint fetch failed: {e}")
+        logger.error("[PIPELINE] lyrics_hint fetch failed: %s", e)
         return None
 
 
@@ -470,9 +472,9 @@ def run_pipeline(job_id: str, mp3_path: str, artist: str, style: str,
         # seed and produce a brand-new clip derived from it.
         background_path = variation_seed_image
         animate_image = True
-        print(f"[BG] variation: seeded Veo image-to-video from frame of "
-              f"{os.path.basename(variation_source_path)} (parent asset "
-              f"id={variation_parent_asset_id})")
+        logger.info("[BG] variation: seeded Veo image-to-video from frame of "
+                    "%s (parent asset id=%s)",
+                    os.path.basename(variation_source_path), variation_parent_asset_id)
 
     wants_youtube = delivery_profile in ("youtube", "both")
     wants_umg = delivery_profile in ("umg", "both")
@@ -496,7 +498,7 @@ def run_pipeline(job_id: str, mp3_path: str, artist: str, style: str,
         _persist_segments = True
         if segments_override:
             segments = segments_override
-            print(f"[WHISPER] Using {len(segments)} caller-supplied segments")
+            logger.info("[WHISPER] Using %s caller-supplied segments", len(segments))
         else:
             # Re-fetch the job row in case the caller (retry) didn't
             # pass us segments but the row has them from a previous
@@ -506,8 +508,8 @@ def run_pipeline(job_id: str, mp3_path: str, artist: str, style: str,
             if persisted:
                 segments = persisted
                 _persist_segments = False  # don't rewrite identical data
-                print(f"[WHISPER] Reusing {len(segments)} persisted segments "
-                      f"(skip Whisper — preserves user corrections)")
+                logger.info("[WHISPER] Reusing %s persisted segments "
+                            "(skip Whisper — preserves user corrections)", len(segments))
             else:
                 lyrics_hint = _best_effort_lyrics_hint(artist, song_title)
                 segments = transcribe(
@@ -547,7 +549,7 @@ def run_pipeline(job_id: str, mp3_path: str, artist: str, style: str,
                 output_artifact=background_path,
             )
             bg_image_path = background_path
-            print(f"[BG] Using human-provided background: {background_path}")
+            logger.info("[BG] Using human-provided background: %s", background_path)
         else:
             lyrics_text = " ".join(seg["text"] for seg in segments)
             # Prefer the structured title the operator set on the job; fall
@@ -568,8 +570,8 @@ def run_pipeline(job_id: str, mp3_path: str, artist: str, style: str,
                          "(Official Music Video)", "(En Vivo)", "(Live)", "(Lyrics)"]:
                 _song_title = _song_title.replace(_sfx, "").strip()
             if _animate_user_image:
-                print(f"[BG] image-to-video: animating user-supplied "
-                      f"{os.path.basename(background_path)} via Veo")
+                logger.info("[BG] image-to-video: animating user-supplied %s via Veo",
+                            os.path.basename(background_path))
             bg_image_path = _ensure_background(
                 style, job_dir,
                 lyrics_text=lyrics_text, artist=artist, job_id=job_id,
@@ -583,8 +585,8 @@ def run_pipeline(job_id: str, mp3_path: str, artist: str, style: str,
             # or non-existent path) AND the operator wanted to animate their
             # image, fall back to using the still image with Ken Burns.
             if _animate_user_image and (not bg_image_path or not os.path.exists(bg_image_path)):
-                print(f"[BG] image-to-video failed, falling back to Ken Burns "
-                      f"on {background_path}")
+                logger.warning("[BG] image-to-video failed, falling back to Ken Burns on %s",
+                               background_path)
                 bg_image_path = background_path
         update_job(job_id, progress=40)
 
@@ -618,9 +620,9 @@ def run_pipeline(job_id: str, mp3_path: str, artist: str, style: str,
                     )
                     if _bg_cache_key:
                         update_job(job_id, bg_r2_key_cached=_bg_cache_key)
-                        print(f"[EDIT] Cached background to R2: {_bg_cache_key}")
+                        logger.info("[EDIT] Cached background to R2: %s", _bg_cache_key)
                 except Exception as _e:
-                    print(f"[EDIT] Warning: background cache upload failed: {_e}")
+                    logger.warning("[EDIT] Warning: background cache upload failed: %s", _e)
 
         files = {}
         # When the operator picked an explicit font id, resolve it to a
@@ -628,7 +630,7 @@ def run_pipeline(job_id: str, mp3_path: str, artist: str, style: str,
         # truthy `font` argument as-is and only random-picks when None.
         chosen_font = _resolve_font(font)
         if chosen_font:
-            print(f"[FONT] Operator-selected: {os.path.basename(chosen_font)}")
+            logger.info("[FONT] Operator-selected: %s", os.path.basename(chosen_font))
         bg_source = bg_image_path
 
         # Step 1b — Pre-render content validation (UMG Guideline 15).
@@ -656,7 +658,7 @@ def run_pipeline(job_id: str, mp3_path: str, artist: str, style: str,
                         status="validation_failed",
                         error=f"Content policy violation detected: {pre_validation['issues']}",
                     )
-                    print(f"[VALIDATION] FAILED for job {job_id}: {pre_validation['issues']}")
+                    logger.warning("[VALIDATION] FAILED for job %s: %s", job_id, pre_validation['issues'])
                     return
             else:
                 clean_bg, rejection_log = _select_validated_background(job_id)
@@ -669,7 +671,7 @@ def run_pipeline(job_id: str, mp3_path: str, artist: str, style: str,
                             f"Rejections: {rejection_log}"
                         ),
                     )
-                    print(f"[VALIDATION] FAILED for job {job_id}: no clean bg after retries")
+                    logger.warning("[VALIDATION] FAILED for job %s: no clean bg after retries", job_id)
                     return
                 bg_image_path = clean_bg
                 update_job(job_id, validation_result={
@@ -774,11 +776,8 @@ def run_pipeline(job_id: str, mp3_path: str, artist: str, style: str,
             _normalized = _require_review_raw.strip().strip('"').strip("'").lower()
             _require_review = _normalized in ("true", "1", "yes", "y", "on")
         final_status = "pending_review" if _require_review else "done"
-        print(
-            f"[PIPELINE] job={job_id} REQUIRE_REVIEW="
-            f"{_require_review_raw!r} -> require_review={_require_review} "
-            f"final_status={final_status}"
-        )
+        logger.info("[PIPELINE] job=%s REQUIRE_REVIEW=%r -> require_review=%s final_status=%s",
+                    job_id, _require_review_raw, _require_review, final_status)
 
         update_job(job_id, status=final_status, progress=100, files=files)
 
@@ -812,7 +811,7 @@ def run_pipeline(job_id: str, mp3_path: str, artist: str, style: str,
             finally:
                 _ndb.close()
         except Exception as _email_err:
-            print(f"[PIPELINE] job completion email skipped: {_email_err}")
+            logger.warning("[PIPELINE] job completion email skipped: %s", _email_err)
 
         # G4: pre-warm the ProRes deliverables in a background worker
         # job. When UMG eventually clicks "Master ProRes" the .mov is
@@ -825,7 +824,7 @@ def run_pipeline(job_id: str, mp3_path: str, artist: str, style: str,
                 enqueue_prores_prewarm(job_id, "umg_master")
                 enqueue_prores_prewarm(job_id, "umg_short")
             except Exception as e:  # pragma: no cover
-                print(f"[PIPELINE] prores prewarm enqueue skipped: {e}")
+                logger.warning("[PIPELINE] prores prewarm enqueue skipped: %s", e)
     except Exception as exc:
         traceback.print_exc()
         update_job(job_id, status="error", error=str(exc))
@@ -955,9 +954,8 @@ def _filter_whisper_hallucinations(segments: list[dict]) -> tuple[list[dict], in
         if _is_whisper_hallucination(text):
             continue
         if _is_single_word_loop(text):
-            print(f"[WHISPER] dropping single-word loop "
-                  f"({(float(s.get('end',0)) - float(s.get('start',0))):.1f}s): "
-                  f"{text[:60]!r}")
+            logger.info("[WHISPER] dropping single-word loop (%.1fs): %r",
+                        float(s.get('end', 0)) - float(s.get('start', 0)), text[:60])
             continue
         out.append(s)
     return out, len(segments) - len(out)
@@ -1090,7 +1088,7 @@ def _get_whisper_model(name: str = "turbo"):
         _WHISPER_LOCK = _t.Lock()
     with _WHISPER_LOCK:
         if name not in _WHISPER_MODELS:
-            print(f"[WHISPER] Loading model '{name}' (one-time)")
+            logger.info("[WHISPER] Loading model '%s' (one-time)", name)
             _WHISPER_MODELS[name] = whisper.load_model(name)
     return _WHISPER_MODELS[name]
 
@@ -1147,8 +1145,8 @@ def _compress_for_whisper(input_path: str) -> str:
             f"an empty/missing output at {out!r}"
         )
     new_sz = os.path.getsize(out)
-    print(f"[WHISPER-API] compressed {sz/1e6:.1f} MB → "
-          f"{new_sz/1e6:.1f} MB for API limit")
+    logger.info("[WHISPER-API] compressed %.1f MB -> %.1f MB for API limit",
+                sz / 1e6, new_sz / 1e6)
     return out
 
 
@@ -1185,7 +1183,7 @@ def _transcribe_via_openai_api(mp3_path: str, language: str | None = None,
     from openai import OpenAI
 
     client = OpenAI()  # picks up OPENAI_API_KEY from env
-    print(f"[WHISPER-API] transcribing {os.path.basename(mp3_path)} via OpenAI (whisper-1)")
+    logger.info("[WHISPER-API] transcribing %s via OpenAI (whisper-1)", os.path.basename(mp3_path))
 
     # Build the initial prompt. When the caller has reference lyrics
     # (typically from lrclib plain), we ship the first ~200 tokens of
@@ -1195,8 +1193,8 @@ def _transcribe_via_openai_api(mp3_path: str, language: str | None = None,
         # ~200 tokens ≈ 800 chars for Spanish/English. Whisper truncates
         # silently if longer; this just keeps logs cleaner.
         prompt_text = lyrics_hint.strip()[:800]
-        print(f"[WHISPER-API] initial_prompt primed with "
-              f"{len(prompt_text)} chars from reference lyrics")
+        logger.info("[WHISPER-API] initial_prompt primed with %s chars from reference lyrics",
+                    len(prompt_text))
     else:
         prompt_text = ("Letras de canción:" if (language or "").startswith("es")
                        else "Song lyrics:")
@@ -1260,7 +1258,7 @@ def _transcribe_via_openai_api(mp3_path: str, language: str | None = None,
                     kwargs["file"] = f
                     response = client.audio.transcriptions.create(**kwargs)
                 if attempt > 0:
-                    print(f"[WHISPER-API] succeeded on attempt {attempt + 1}/{_MAX_RETRIES}")
+                    logger.info("[WHISPER-API] succeeded on attempt %s/%s", attempt + 1, _MAX_RETRIES)
                 break
             except Exception as exc:
                 last_exc = exc
@@ -1281,10 +1279,11 @@ def _transcribe_via_openai_api(mp3_path: str, language: str | None = None,
                     msg_lower = str(exc).lower()
                     is_quota_exhaustion = any(k in msg_lower for k in quota_keywords)
                     if is_quota_exhaustion:
-                        print(
-                            f"[WHISPER-API][⚠ INSUFFICIENT_QUOTA] OpenAI rejected with "
-                            f"quota/billing error: {exc!s}; NOT retrying. "
-                            f"Recargá créditos en https://platform.openai.com/settings/organization/billing"
+                        logger.error(
+                            "[WHISPER-API][INSUFFICIENT_QUOTA] OpenAI rejected with "
+                            "quota/billing error: %s; NOT retrying. "
+                            "Recarga creditos en https://platform.openai.com/settings/organization/billing",
+                            exc,
                         )
                         # Bail immediately — no retry helps a quota issue.
                         break
@@ -1294,10 +1293,10 @@ def _transcribe_via_openai_api(mp3_path: str, language: str | None = None,
                         # 2^attempt + jitter: 1-2s, 2-3s, 4-5s, 8-9s, 16-17s
                         sleep_s = (2 ** attempt) + random.uniform(0, 1)
                         kind = "rate-limit" if isinstance(exc, RateLimitError) else "connection"
-                        print(
-                            f"[WHISPER-API] transient {kind} error on attempt "
-                            f"{attempt + 1}/{_MAX_RETRIES}: {exc!s}; "
-                            f"sleeping {sleep_s:.1f}s then retrying"
+                        logger.warning(
+                            "[WHISPER-API] transient %s error on attempt %s/%s: %s; "
+                            "sleeping %.1fs then retrying",
+                            kind, attempt + 1, _MAX_RETRIES, exc, sleep_s,
                         )
                         _time_retry.sleep(sleep_s)
                         continue
@@ -1406,10 +1405,10 @@ def _transcribe_via_openai_api(mp3_path: str, language: str | None = None,
             continue
         # Same filters as local path so behavior matches.
         if _re.search(r'[一-鿿぀-ゟ゠-ヿ가-힯]', text):
-            print(f"[WHISPER-API] Filtered non-latin: {text[:60]}")
+            logger.info("[WHISPER-API] Filtered non-latin: %s", text[:60])
             continue
         if any(spam in text.lower() for spam in _SPAM_PATTERNS):
-            print(f"[WHISPER-API] Filtered spam: {text[:60]}")
+            logger.info("[WHISPER-API] Filtered spam: %s", text[:60])
             continue
         # Only drop segments that Whisper is VERY sure aren't speech. The
         # previous 0.7 threshold was tossing legitimate lyric lines on
@@ -1418,7 +1417,7 @@ def _transcribe_via_openai_api(mp3_path: str, language: str | None = None,
         # operator can prune obvious non-lyrics in the editor; better to
         # surface borderline content than to silently drop it.
         if (seg.no_speech_prob or 0) > 0.92:
-            print(f"[WHISPER-API] Filtered very-low-confidence: {text[:60]}")
+            logger.info("[WHISPER-API] Filtered very-low-confidence: %s", text[:60])
             continue
         out_seg = {
             "start": float(seg.start),
@@ -1495,7 +1494,7 @@ def _transcribe_via_openai_api(mp3_path: str, language: str | None = None,
             }
         cleaned.append(seg)
     if intra_truncated:
-        print(f"[WHISPER-API] Truncated intra-segment loops in {intra_truncated} segment(s)")
+        logger.info("[WHISPER-API] Truncated intra-segment loops in %s segment(s)", intra_truncated)
     segments = cleaned
 
     # Collapse consecutive-identical-text segments into a single segment
@@ -1532,8 +1531,8 @@ def _transcribe_via_openai_api(mp3_path: str, language: str | None = None,
     for s in merged:
         s.pop("_collapsed", None)
     if collapsed_total:
-        print(f"[WHISPER-API] Merged {collapsed_total} consecutive duplicate "
-              f"segments into {collapsed_groups} chant/loop spans")
+        logger.info("[WHISPER-API] Merged %s consecutive duplicate segments into %s chant/loop spans",
+                    collapsed_total, collapsed_groups)
     segments = merged
 
     GAP = 0.05
@@ -1551,9 +1550,9 @@ def _transcribe_via_openai_api(mp3_path: str, language: str | None = None,
     # legitimate verses.
     segments, _dropped_loops = _filter_whisper_hallucinations(segments)
     if _dropped_loops:
-        print(f"[WHISPER-API] filtered {_dropped_loops} hallucination/loop segment(s)")
+        logger.info("[WHISPER-API] filtered %s hallucination/loop segment(s)", _dropped_loops)
 
-    print(f"[WHISPER-API] {len(segments)} segments")
+    logger.info("[WHISPER-API] %s segments", len(segments))
     return segments
 
 
@@ -1577,7 +1576,7 @@ def transcribe(mp3_path: str, language: str = None,
     Whisper path ignores it (could be added later via `initial_prompt=`).
     """
     has_key = bool(os.environ.get("OPENAI_API_KEY", "").strip())
-    print(f"[transcribe] OPENAI_API_KEY={'set' if has_key else 'EMPTY'}")
+    logger.info("[transcribe] OPENAI_API_KEY=%s", 'set' if has_key else 'EMPTY')
     if has_key:
         return _transcribe_via_openai_api(
             mp3_path, language=language, lyrics_hint=lyrics_hint,
@@ -1596,7 +1595,7 @@ def transcribe(mp3_path: str, language: str = None,
     )
     if language:
         kwargs["language"] = language
-        print(f"[WHISPER] Forced language: {language}")
+        logger.info("[WHISPER] Forced language: %s", language)
 
     result = model.transcribe(audio_path, **kwargs)
 
@@ -1609,15 +1608,16 @@ def transcribe(mp3_path: str, language: str = None,
             continue
         # Filter non-latin characters (Demucs artifacts like "Lil怎麼樣")
         if _re.search(r'[\u4e00-\u9fff\u3040-\u309f\u30a0-\u30ff\uac00-\ud7af]', text):
-            print(f"[WHISPER] Filtered non-latin artifact: {text[:60]}")
+            logger.info("[WHISPER] Filtered non-latin artifact: %s", text[:60])
             continue
         # Filter spam/non-lyrics
         if any(spam in text.lower() for spam in _SPAM_PATTERNS):
-            print(f"[WHISPER] Filtered spam: {text[:60]}")
+            logger.info("[WHISPER] Filtered spam: %s", text[:60])
             continue
         # Filter high no_speech_prob segments (likely hallucinations)
         if seg.get("no_speech_prob", 0) > 0.7:
-            print(f"[WHISPER] Filtered low-confidence (no_speech={seg['no_speech_prob']:.2f}): {text[:60]}")
+            logger.info("[WHISPER] Filtered low-confidence (no_speech=%.2f): %s",
+                        seg['no_speech_prob'], text[:60])
             continue
         words = seg.get("words", [])
         if words:
@@ -1638,7 +1638,7 @@ def transcribe(mp3_path: str, language: str = None,
 
     # Safety net: retry if first segment starts very late
     if segments and segments[0]["start"] > 30:
-        print(f"[WHISPER] WARNING: first seg at {segments[0]['start']:.1f}s, retrying")
+        logger.warning("[WHISPER] WARNING: first seg at %.1fs, retrying", segments[0]['start'])
         kwargs2 = dict(kwargs, initial_prompt="Song lyrics transcription:", no_speech_threshold=0.4)
         result2 = model.transcribe(mp3_path, **kwargs2)
         segments2 = []
@@ -1668,8 +1668,8 @@ def transcribe(mp3_path: str, language: str = None,
     # machines that cannot hold both models at once.
     if os.environ.get("WHISPER_FALLBACK_ENABLED", "1") != "0":
         if len(segments) < 5:
-            print(f"[WHISPER] Only {len(segments)} segments with turbo; "
-                  f"falling back to large-v3")
+            logger.info("[WHISPER] Only %s segments with turbo; falling back to large-v3",
+                        len(segments))
             try:
                 large = _get_whisper_model("large-v3")
                 result3 = large.transcribe(audio_path, **kwargs)
@@ -1696,14 +1696,14 @@ def transcribe(mp3_path: str, language: str = None,
                         ]
                     segments3.append(out_seg)
                 if len(segments3) > len(segments):
-                    print(f"[WHISPER] large-v3 produced {len(segments3)} "
-                          f"segments (turbo: {len(segments)}); using large-v3")
+                    logger.info("[WHISPER] large-v3 produced %s segments (turbo: %s); using large-v3",
+                                len(segments3), len(segments))
                     segments = segments3
             except Exception as e:
-                print(f"[WHISPER] large-v3 fallback failed: {e}; keeping turbo")
+                logger.warning("[WHISPER] large-v3 fallback failed: %s; keeping turbo", e)
 
     for i, seg in enumerate(segments[:5]):
-        print(f"[WHISPER] seg {i}: {seg['start']:.2f}–{seg['end']:.2f}  {seg['text'][:60]}")
+        logger.info("[WHISPER] seg %s: %.2f-%.2f  %s", i, seg['start'], seg['end'], seg['text'][:60])
 
     GAP = 0.05
     for i in range(len(segments) - 1):
@@ -1713,7 +1713,7 @@ def transcribe(mp3_path: str, language: str = None,
     # Same outro-loop filter as the API path — see notes there.
     segments, _dropped_loops = _filter_whisper_hallucinations(segments)
     if _dropped_loops:
-        print(f"[WHISPER] filtered {_dropped_loops} hallucination/loop segment(s)")
+        logger.info("[WHISPER] filtered %s hallucination/loop segment(s)", _dropped_loops)
 
     return segments
 
@@ -1804,12 +1804,13 @@ def _fetch_lrclib(artist: str, song: str, db=None) -> dict | None:
             if row and row.lyrics:
                 cached = _json.loads(row.lyrics)
                 if cached.get("plain") or cached.get("synced"):
-                    print(f"[LYRICS] lrclib cache hit {cache_key} "
-                          f"({len((cached.get('plain') or ''))} plain chars, "
-                          f"synced={'yes' if cached.get('synced') else 'no'})")
+                    logger.info("[LYRICS] lrclib cache hit %s (%s plain chars, synced=%s)",
+                                cache_key,
+                                len((cached.get('plain') or '')),
+                                'yes' if cached.get('synced') else 'no')
                     return cached
         except Exception as e:
-            print(f"[LYRICS] lrclib cache read failed: {e}")
+            logger.error("[LYRICS] lrclib cache read failed: %s", e)
     # Two attempts: lrclib reads can spike >10s under load. Total budget
     # is ~25s in the worst case, well within the user-perceived bound
     # for /transcribe (Whisper is the long pole anyway).
@@ -1827,21 +1828,21 @@ def _fetch_lrclib(artist: str, song: str, db=None) -> dict | None:
         except Exception as e:  # transient network / timeout
             last_err = e
             if attempt == 0:
-                print(f"[LYRICS] lrclib attempt 1 failed ({e.__class__.__name__}: "
-                      f"{str(e)[:80]}); retrying once")
+                logger.warning("[LYRICS] lrclib attempt 1 failed (%s: %s); retrying once",
+                               e.__class__.__name__, str(e)[:80])
                 continue
-            print(f"[LYRICS] lrclib fetch failed after retry: {e}")
+            logger.error("[LYRICS] lrclib fetch failed after retry: %s", e)
             return None
     if r is None:
         result = None
     elif r.status_code != 200:
-        print(f"[LYRICS] lrclib /get {r.status_code} for {artist!r} - {song!r}")
+        logger.warning("[LYRICS] lrclib /get %s for %r - %r", r.status_code, artist, song)
         result = None
     else:
         try:
             result = _parse_lrclib_record(r.json())
         except Exception as e:
-            print(f"[LYRICS] lrclib /get parse failed: {e}")
+            logger.error("[LYRICS] lrclib /get parse failed: %s", e)
             result = None
 
     # Fallback: si /api/get no devolvió un record útil (404, transient,
@@ -1856,14 +1857,14 @@ def _fetch_lrclib(artist: str, song: str, db=None) -> dict | None:
         if candidates:
             best = _pick_best_lrclib_candidate(candidates, artist, song)
             if best is not None:
-                print(f"[LYRICS] lrclib /get failed but /search rescued "
-                      f"candidate id={best.get('id')} "
-                      f"({best.get('artistName')!r} - {best.get('trackName')!r}, "
-                      f"synced={'yes' if best.get('syncedLyrics') else 'no'})")
+                logger.info("[LYRICS] lrclib /get failed but /search rescued candidate id=%s "
+                            "(%r - %r, synced=%s)",
+                            best.get('id'), best.get('artistName'), best.get('trackName'),
+                            'yes' if best.get('syncedLyrics') else 'no')
                 try:
                     result = _parse_lrclib_record(best)
                 except Exception as e:
-                    print(f"[LYRICS] lrclib /search parse failed: {e}")
+                    logger.error("[LYRICS] lrclib /search parse failed: %s", e)
                     result = None
 
     if result is None:
@@ -1889,10 +1890,9 @@ def _fetch_lrclib(artist: str, song: str, db=None) -> dict | None:
                     fetched_by_model="lrclib",
                 ))
             db.commit()
-            print(f"[LYRICS] lrclib cached {cache_key} "
-                  f"({len(payload)} bytes)")
+            logger.info("[LYRICS] lrclib cached %s (%s bytes)", cache_key, len(payload))
         except Exception as e:
-            print(f"[LYRICS] lrclib cache write failed: {e}")
+            logger.error("[LYRICS] lrclib cache write failed: %s", e)
     return result
 
 
@@ -1925,8 +1925,8 @@ def _parse_lrclib_record(data: dict) -> dict | None:
                 derived.append(stripped)
         if derived:
             plain = "\n".join(derived)
-            print(f"[LYRICS] lrclib derived plain from synced "
-                  f"({len(plain)} chars, {len(derived)} lines)")
+            logger.info("[LYRICS] lrclib derived plain from synced (%s chars, %s lines)",
+                        len(plain), len(derived))
     return {
         "plain": plain,
         "synced": synced,
@@ -1956,14 +1956,14 @@ def _try_lrclib_search(artist: str, song: str) -> list:
             headers={"User-Agent": "GenLyAI/1.0 (+https://app.genly.pro)"},
         )
         if r.status_code != 200:
-            print(f"[LYRICS] lrclib /search {r.status_code} for q={q!r}")
+            logger.warning("[LYRICS] lrclib /search %s for q=%r", r.status_code, q)
             return []
         data = r.json()
         if not isinstance(data, list):
             return []
         return data
     except Exception as e:
-        print(f"[LYRICS] lrclib /search failed: {e}")
+        logger.error("[LYRICS] lrclib /search failed: %s", e)
         return []
 
 
@@ -2485,7 +2485,7 @@ def _detect_speech_regions(audio_path: str,
                 merged.append((start, end))
         return merged
     except Exception as e:
-        print(f"[VAD] _detect_speech_regions failed ({e}); skipping VAD")
+        logger.warning("[VAD] _detect_speech_regions failed (%s); skipping VAD", e)
         return []
 
 
@@ -2563,8 +2563,8 @@ def _fill_gaps_with_reference(whisper_segments: list[dict],
     if audio_path:
         speech_regions = _detect_speech_regions(audio_path)
         if speech_regions:
-            print(f"[VAD] {len(speech_regions)} speech regions detected; "
-                  f"reference will be distributed inside them")
+            logger.info("[VAD] %s speech regions detected; reference will be distributed inside them",
+                        len(speech_regions))
     if not speech_regions:
         speech_regions = [(0.0, float(audio_duration))]
 
@@ -2723,7 +2723,7 @@ def _slice_audio_window(input_path: str, output_path: str,
         )
         return os.path.exists(output_path) and os.path.getsize(output_path) > 0
     except (_sp.CalledProcessError, _sp.TimeoutExpired, FileNotFoundError, OSError) as e:
-        print(f"[LYRICS] _slice_audio_window failed: {e}")
+        logger.warning("[LYRICS] _slice_audio_window failed: %s", e)
         return False
 
 
@@ -2763,7 +2763,7 @@ def _whisper_quick_text(mp3_path: str, job_id: str | None = None) -> str:
                 pass
         return (r or "").strip()
     except Exception as e:
-        print(f"[LYRICS] _whisper_quick_text failed: {e}")
+        logger.warning("[LYRICS] _whisper_quick_text failed: %s", e)
         return ""
 
 
@@ -2833,7 +2833,7 @@ def _slice_audio_prefix(input_path: str, output_path: str, seconds: float) -> bo
         )
         return os.path.exists(output_path) and os.path.getsize(output_path) > 0
     except (_sp.CalledProcessError, _sp.TimeoutExpired, FileNotFoundError, OSError) as e:
-        print(f"[LYRICS] _slice_audio_prefix failed: {e}")
+        logger.warning("[LYRICS] _slice_audio_prefix failed: %s", e)
         return False
 
 
@@ -2866,8 +2866,7 @@ def _sanitize_gemini_lyrics(text):
         # sources keep returning these chars — over time, this surfaces
         # which lyric sites are dirty and whether the sanitizer needs
         # to grow (e.g. another scraping artifact appears).
-        print(f"[lyrics_sanitize] stripped {stripped} char(s) (§/¶) "
-              f"from Gemini response")
+        logger.warning("[lyrics_sanitize] stripped %s char(s) (S/P) from Gemini response", stripped)
     return cleaned
 
 
@@ -2905,13 +2904,13 @@ def _fetch_lyrics_via_gemini_search(
                 LyricsCache.cache_key == cache_key
             ).first()
             if row and row.lyrics:
-                print(f"[LYRICS] cache hit {cache_key} ({len(row.lyrics)} chars)")
+                logger.info("[LYRICS] cache hit %s (%s chars)", cache_key, len(row.lyrics))
                 # Sanitize on read so existing poisoned rows (cached
                 # before this fix shipped) still return clean text to
                 # downstream callers without requiring a DB cleanup.
                 return _sanitize_gemini_lyrics(row.lyrics)
         except Exception as e:
-            print(f"[LYRICS] cache read failed: {e}")
+            logger.error("[LYRICS] cache read failed: %s", e)
 
     # Build Gemini call.
     from google import genai
@@ -2981,7 +2980,7 @@ def _fetch_lyrics_via_gemini_search(
 
         # Gemini blocks copyrighted recitation aggressively. Degrade silently.
         if "RECITATION" in finish_str or "SAFETY" in finish_str:
-            print(f"[LYRICS] gemini blocked: finish_reason={finish_str}")
+            logger.warning("[LYRICS] gemini blocked: finish_reason=%s", finish_str)
             if recorder:
                 recorder.finish(response_summary=f"blocked={finish_str}")
             return None
@@ -3008,7 +3007,7 @@ def _fetch_lyrics_via_gemini_search(
                 source_titles.append(title)
 
         if not source_urls:
-            print("[LYRICS] no grounding sources — refusing to trust ungrounded text")
+            logger.warning("[LYRICS] no grounding sources — refusing to trust ungrounded text")
             if recorder:
                 recorder.finish(response_summary="no_grounding_sources")
             return None
@@ -3021,8 +3020,8 @@ def _fetch_lyrics_via_gemini_search(
                 on_lyric_site = True
                 break
         if not on_lyric_site:
-            print(f"[LYRICS] grounding off lyric-domain allow-list (soft warn): "
-                  f"{source_urls[:2]}")
+            logger.warning("[LYRICS] grounding off lyric-domain allow-list (soft warn): %s",
+                           source_urls[:2])
 
         # Lyrics-shape validation.
         lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
@@ -3052,9 +3051,8 @@ def _fetch_lyrics_via_gemini_search(
         # sin hint en vez de Whisper sesgado con merged-text.
         avg_chars_per_line = sum(len(l) for l in lines) / len(lines)
         if avg_chars_per_line > 50.0:
-            print(f"[LYRICS] gemini output looks merged "
-                  f"(avg {avg_chars_per_line:.1f} chars/line over "
-                  f"{len(lines)} lines) — rejecting")
+            logger.warning("[LYRICS] gemini output looks merged (avg %.1f chars/line over %s lines) — rejecting",
+                           avg_chars_per_line, len(lines))
             if recorder:
                 recorder.finish(
                     response_summary=f"rejected_merged_lines="
@@ -3090,7 +3088,7 @@ def _fetch_lyrics_via_gemini_search(
                     db.commit()
                 # If row already exists (race), keep existing — first writer wins.
             except Exception as e:
-                print(f"[LYRICS] cache write failed: {e}")
+                logger.error("[LYRICS] cache write failed: %s", e)
                 try:
                     db.rollback()
                 except Exception:
@@ -3116,12 +3114,12 @@ def _fetch_lyrics_via_gemini_search(
                 output_artifact=f"lyrics_cache:{cache_key}",
             )
 
-        print(f"[LYRICS] gemini fetched {len(text)} chars / {len(lines)} lines / "
-              f"{len(source_urls)} sources for {artist!r} - {song!r}")
+        logger.info("[LYRICS] gemini fetched %s chars / %s lines / %s sources for %r - %r",
+                    len(text), len(lines), len(source_urls), artist, song)
         return text
 
     except Exception as e:
-        print(f"[LYRICS] gemini search failed: {e}")
+        logger.error("[LYRICS] gemini search failed: %s", e)
         if recorder:
             try:
                 recorder.finish(response_summary=f"error: {str(e)[:200]}")
@@ -3183,10 +3181,10 @@ def _get_genai_client():
         from google.oauth2 import service_account
 
         creds_path = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS", "").strip()
-        print(f"[VERTEX] google-genai version: {genai.__version__}")
-        print(f"[VERTEX] project={_VERTEX_PROJECT} location={_VERTEX_LOCATION}")
-        print(f"[VERTEX] credentials path: {creds_path}")
-        print(f"[VERTEX] credentials exists: {os.path.exists(creds_path)}")
+        logger.info("[VERTEX] google-genai version: %s", genai.__version__)
+        logger.info("[VERTEX] project=%s location=%s", _VERTEX_PROJECT, _VERTEX_LOCATION)
+        logger.info("[VERTEX] credentials path: %s", creds_path)
+        logger.info("[VERTEX] credentials exists: %s", os.path.exists(creds_path))
 
         client_kwargs = dict(
             vertexai=True,
@@ -3210,18 +3208,17 @@ def _get_genai_client():
                 from google.auth.transport.requests import Request as _AuthReq
                 try:
                     credentials.refresh(_AuthReq())
-                    print(f"[VERTEX] token refresh OK; valid={credentials.valid} "
-                          f"expiry={credentials.expiry}")
+                    logger.info("[VERTEX] token refresh OK; valid=%s expiry=%s",
+                                credentials.valid, credentials.expiry)
                 except Exception as refresh_err:
-                    print(f"[VERTEX] token refresh FAILED: {refresh_err}")
+                    logger.error("[VERTEX] token refresh FAILED: %s", refresh_err)
 
                 client_kwargs["credentials"] = credentials
-                print(f"[VERTEX] using explicit service account credentials "
-                      f"({credentials.service_account_email}, "
-                      f"quota_project={_VERTEX_PROJECT})")
+                logger.info("[VERTEX] using explicit service account credentials (%s, quota_project=%s)",
+                            credentials.service_account_email, _VERTEX_PROJECT)
             except Exception as e:
-                print(f"[VERTEX] failed to load explicit credentials ({e}); "
-                      f"falling back to ADC discovery")
+                logger.warning("[VERTEX] failed to load explicit credentials (%s); "
+                               "falling back to ADC discovery", e)
 
         _genai_client = genai.Client(**client_kwargs)
     return _genai_client
@@ -3540,8 +3537,8 @@ def _parse_gemini_bg_response(text: str) -> dict | None:
             # Extract style too if it survived; default to "video".
             style_match = re.search(r'"style"\s*:\s*"(\w+)"', cleaned)
             style = style_match.group(1) if style_match else "video"
-            print(f"[BG] Recovered prompt from truncated JSON "
-                  f"(raw_len={len(text)}, prompt_len={len(prompt_value)})")
+            logger.info("[BG] Recovered prompt from truncated JSON (raw_len=%s, prompt_len=%s)",
+                        len(text), len(prompt_value))
             return {"style": style, "prompt": prompt_value}
 
     # Nothing recoverable.
@@ -3858,7 +3855,7 @@ Hard rules:
         # which hid the actual truncation point during the 2026-05-15 incident
         # (couldn't tell from logs alone whether Gemini hit max_output_tokens
         # or returned malformed JSON).
-        print(f"[BG] Gemini raw ({len(text)} chars): {text[:800]}")
+        logger.info("[BG] Gemini raw (%s chars): %s", len(text), text[:800])
 
         # Parse Gemini's response. The model usually returns one of:
         #   {"style":"...","prompt":"..."}                     ← bare JSON
@@ -3887,7 +3884,7 @@ Hard rules:
             if style not in ("video", "photo", "illustration"):
                 style = "video"
             if prompt and len(prompt) > 15:
-                print(f"[BG] Gemini chose: style={style}, prompt={prompt[:80]}...")
+                logger.info("[BG] Gemini chose: style=%s, prompt=%s...", style, prompt[:80])
                 # Alley-bias telemetry: si Gemini igual eligió callejón
                 # cuando el operador NO pidió urbano, dejá rastro en
                 # logs para auditar post-deploy. Detecta el caso real
@@ -3897,11 +3894,10 @@ Hard rules:
                                    "back-street", "rain-slicked street")
                 if (any(k in prompt.lower() for k in _alley_keywords)
                         and normalized_concept != "urbano"):
-                    print(
-                        f"[BG][⚠ ALLEY-BIAS DETECTED] "
-                        f"genre={normalized_genre or 'auto'} "
-                        f"concept={normalized_concept or 'none'} "
-                        f"match_lyrics={match_lyrics} job={job_id}"
+                    logger.warning(
+                        "[BG][ALLEY-BIAS DETECTED] genre=%s concept=%s match_lyrics=%s job=%s",
+                        normalized_genre or 'auto', normalized_concept or 'none',
+                        match_lyrics, job_id,
                     )
                 if recorder:
                     recorder.finish(response_summary=text[:500])
@@ -3918,14 +3914,14 @@ Hard rules:
                     finish_reason = str(fr)
         except Exception:
             pass
-        print(f"[BG] Failed to parse Gemini JSON, using combinatorial fallback. "
-              f"raw_len={len(text)} finish_reason={finish_reason}")
+        logger.warning("[BG] Failed to parse Gemini JSON, using combinatorial fallback. "
+                       "raw_len=%s finish_reason=%s", len(text), finish_reason)
         if recorder:
             recorder.finish(response_summary=f"parse_failed: {text[:200]}")
         return {"style": "video", "prompt": None}
 
     except Exception as e:
-        print(f"[BG] Gemini analysis failed: {e}, using video fallback")
+        logger.error("[BG] Gemini analysis failed: %s, using video fallback", e)
         if recorder:
             recorder.finish(response_summary=f"error: {str(e)[:200]}")
         return {"style": "video", "prompt": None}
@@ -4139,7 +4135,7 @@ def _generate_veo_video(prompt: str, output_path: str, job_id: str = None,
     if _storage.is_enabled() and _storage.object_exists(cache_object_key):
         if _storage.download_object(cache_object_key, output_path):
             size_mb = os.path.getsize(output_path) / 1024 / 1024
-            print(f"[BG] Veo cache HIT ({cache_key_hash}): {size_mb:.1f} MB — skipped paid generation")
+            logger.info("[BG] Veo cache HIT (%s): %.1f MB - skipped paid generation", cache_key_hash, size_mb)
             if recorder:
                 recorder.finish(
                     response_summary=f"cache_hit: {size_mb:.1f}MB key={cache_key_hash}",
@@ -4150,7 +4146,7 @@ def _generate_veo_video(prompt: str, output_path: str, job_id: str = None,
     elapsed = _time.time() - _last_veo_request
     if elapsed < _VEO_COOLDOWN and _last_veo_request > 0:
         wait = _VEO_COOLDOWN - elapsed
-        print(f"[BG] Cooldown: waiting {wait:.0f}s before next Veo request...")
+        logger.info("[BG] Cooldown: waiting %.0fs before next Veo request...", wait)
         _time.sleep(wait)
 
     base_url = (
@@ -4176,11 +4172,11 @@ def _generate_veo_video(prompt: str, output_path: str, job_id: str = None,
                 "bytesBase64Encoded": _b64.b64encode(img_bytes).decode("ascii"),
                 "mimeType": mime,
             }
-            print(f"[BG] image-to-video Veo call with user image "
-                  f"({len(img_bytes)} bytes, {mime})")
+            logger.info("[BG] image-to-video Veo call with user image (%s bytes, %s)",
+                        len(img_bytes), mime)
         except OSError as e:
-            print(f"[BG] failed to read image_path {image_path}: {e}; "
-                  f"falling back to text-to-video")
+            logger.warning("[BG] failed to read image_path %s: %s; falling back to text-to-video",
+                           image_path, e)
 
     request_body = {
         "instances": [instance],
@@ -4206,7 +4202,7 @@ def _generate_veo_video(prompt: str, output_path: str, job_id: str = None,
 
     for attempt in range(MAX_ATTEMPTS):
         try:
-            print(f"[BG] Veo 3: generating video (attempt {attempt + 1}/{MAX_ATTEMPTS})...")
+            logger.info("[BG] Veo 3: generating video (attempt %s/%s)...", attempt + 1, MAX_ATTEMPTS)
             token = _veo_access_token()
             r = _req.post(
                 submit_url,
@@ -4228,7 +4224,8 @@ def _generate_veo_video(prompt: str, output_path: str, job_id: str = None,
                 # quota recovers naturally.
                 base = min(MAX_BACKOFF_S, 30 * (2 ** attempt))
                 wait = base * random.uniform(0.8, 1.2)
-                print(f"[BG] Rate limited (HTTP {r.status_code}), waiting {wait:.1f}s before retry...")
+                logger.warning("[BG] Rate limited (HTTP %s), waiting %.1fs before retry...",
+                               r.status_code, wait)
                 _time.sleep(wait)
                 continue
             if not r.ok:
@@ -4247,7 +4244,7 @@ def _generate_veo_video(prompt: str, output_path: str, job_id: str = None,
             raise
         except Exception as e:
             last_error = f"network/transient: {e}"
-            print(f"[BG] Veo 3 attempt {attempt + 1} request error: {e}")
+            logger.error("[BG] Veo 3 attempt %s request error: %s", attempt + 1, e)
             base = min(MAX_BACKOFF_S, 15 * (2 ** attempt))
             wait = base * random.uniform(0.8, 1.2)
             _time.sleep(wait)
@@ -4267,7 +4264,7 @@ def _generate_veo_video(prompt: str, output_path: str, job_id: str = None,
         raise RuntimeError(f"Veo 3 submission failed after {MAX_ATTEMPTS} retries: {reason}")
 
     _last_veo_request = _time.time()
-    print(f"[BG] Veo 3 operation: {operation_name}")
+    logger.info("[BG] Veo 3 operation: %s", operation_name)
 
     # Poll the operation. The REST endpoint mirrors the model URL prefix.
     poll_url = (
@@ -4295,7 +4292,7 @@ def _generate_veo_video(prompt: str, output_path: str, job_id: str = None,
             timeout=30,
         )
         if not r.ok:
-            print(f"[BG] poll HTTP {r.status_code}: {r.text[:200]}; retrying...")
+            logger.warning("[BG] poll HTTP %s: %s; retrying...", r.status_code, r.text[:200])
             continue
         op_payload = r.json()
         if op_payload.get("done"):
@@ -4346,7 +4343,7 @@ def _generate_veo_video(prompt: str, output_path: str, job_id: str = None,
         raise RuntimeError(f"Veo video has no uri or bytes: {video_entry}")
 
     size_mb = os.path.getsize(output_path) / 1024 / 1024
-    print(f"[BG] Veo 3 video saved: {size_mb:.1f} MB (raw)")
+    logger.info("[BG] Veo 3 video saved: %.1f MB (raw)", size_mb)
 
     # Apply subtle gaussian blur. Veo Fast outputs are slightly softer than
     # standard; a small blur normalises that softness, hides minor artefacts,
@@ -4367,9 +4364,9 @@ def _generate_veo_video(prompt: str, output_path: str, job_id: str = None,
         )
         os.replace(blurred, output_path)
         size_mb = os.path.getsize(output_path) / 1024 / 1024
-        print(f"[BG] Blur applied (sigma={blur_sigma}): {size_mb:.1f} MB")
+        logger.info("[BG] Blur applied (sigma=%s): %.1f MB", blur_sigma, size_mb)
     except Exception as e:
-        print(f"[BG] Blur skipped (non-fatal): {e}")
+        logger.warning("[BG] Blur skipped (non-fatal): %s", e)
         if os.path.exists(blurred):
             try:
                 os.unlink(blurred)
@@ -4379,9 +4376,9 @@ def _generate_veo_video(prompt: str, output_path: str, job_id: str = None,
     if _storage.is_enabled():
         try:
             _storage.upload_file(output_path, cache_object_key)
-            print(f"[BG] Veo cache STORED: {cache_object_key}")
+            logger.info("[BG] Veo cache STORED: %s", cache_object_key)
         except Exception as e:
-            print(f"[BG] Veo cache upload failed (non-fatal): {e}")
+            logger.warning("[BG] Veo cache upload failed (non-fatal): %s", e)
 
     if recorder:
         recorder.finish(
@@ -4423,7 +4420,7 @@ def _generate_imagen_image(prompt: str, output_path: str, max_retries: int = 5,
 
     for attempt in range(max_retries):
         try:
-            print(f"[BG] {chosen_model}: generating image (attempt {attempt + 1})...")
+            logger.info("[BG] %s: generating image (attempt %s)...", chosen_model, attempt + 1)
             response = client.models.generate_images(
                 model=chosen_model,
                 prompt=safe_prompt,
@@ -4436,7 +4433,7 @@ def _generate_imagen_image(prompt: str, output_path: str, max_retries: int = 5,
         except ClientError as e:
             if "429" in str(e) or "RESOURCE_EXHAUSTED" in str(e):
                 wait = 60 * (attempt + 1)
-                print(f"[BG] Rate limited, waiting {wait}s before retry...")
+                logger.warning("[BG] Rate limited, waiting %ss before retry...", wait)
                 _time.sleep(wait)
             else:
                 if recorder:
@@ -4454,7 +4451,7 @@ def _generate_imagen_image(prompt: str, output_path: str, max_retries: int = 5,
         f.write(img_bytes)
 
     size_kb = os.path.getsize(output_path) / 1024
-    print(f"[BG] Imagen 4 saved: {size_kb:.0f} KB")
+    logger.info("[BG] Imagen 4 saved: %.0f KB", size_kb)
     if recorder:
         recorder.finish(
             response_summary=f"image_generated: {size_kb:.0f}KB",
@@ -4551,7 +4548,7 @@ def _score_video_relevance(video_path: str, prompt: str) -> int:
         score = int(m.group()) if m else 5
         return max(1, min(10, score))
     except Exception as e:
-        print(f"[BG] Relevance score error (fail-open): {e}")
+        logger.warning("[BG] Relevance score error (fail-open): %s", e)
         return 8
     finally:
         if tmp_frame:
@@ -4610,10 +4607,10 @@ def _ensure_background(style_hint: str, job_dir: str, lyrics_text: str = None,
             # re-generation decision, not the scoring itself, so the retry's
             # result is also evaluated before we accept and return it.
             score = _score_video_relevance(bg_path, prompt)
-            print(f"[BG] Relevance score: {score}/10 for prompt: {prompt[:60]}...")
+            logger.info("[BG] Relevance score: %s/10 for prompt: %s...", score, prompt[:60])
             if score < 7 and not quality_retry_used:
                 quality_retry_used = True
-                print(f"[BG] Score {score} < 7 — generating new prompt and retrying VEO")
+                logger.info("[BG] Score %s < 7 — generating new prompt and retrying VEO", score)
                 # Propagate background_hint into the quality retry. Without it,
                 # Gemini regenerates from lyrics/genre alone and the operator's
                 # explicit guidance is silently dropped — the same input that
@@ -4629,20 +4626,20 @@ def _ensure_background(style_hint: str, job_dir: str, lyrics_text: str = None,
                 prompt = result["prompt"]
                 continue
             if score < 7:
-                print(f"[BG] Score {score} < 7 after retry — accepting best available result")
+                logger.warning("[BG] Score %s < 7 after retry — accepting best available result", score)
             return bg_path
         except Exception as e:
-            print(f"[BG] Veo 3 attempt {attempt + 1}/3 failed: {e}")
+            logger.error("[BG] Veo 3 attempt %s/3 failed: %s", attempt + 1, e)
             if attempt < 2:
                 wait = 30 * (attempt + 1)
-                print(f"[BG] Waiting {wait}s before retry...")
+                logger.info("[BG] Waiting %ss before retry...", wait)
                 _time_bg.sleep(wait)
 
     # All Veo attempts failed — render a gradient as fallback.
     # We do NOT fall back to a library asset: UMG and other rights-sensitive
     # tenants need clear provenance of every visual element, and a stock asset
     # silently substituted into an AI-mode job would break that contract.
-    print("[BG] Veo 3 unavailable, falling back to gradient background")
+    logger.warning("[BG] Veo 3 unavailable, falling back to gradient background")
     fallback_path = os.path.join(job_dir, "bg_gradient_fallback.mp4")
     gradient = _make_gradient_clip(30.0, style_hint)
     gradient.write_videofile(fallback_path, fps=24, logger=None)
@@ -4740,7 +4737,7 @@ def _find_background_video(exclude: list[str] | None = None) -> str | None:
     # to re-pick a background that already failed validation this job).
     available = [v for v in all_videos if v not in used and v not in exclude]
     if not available:
-        print(f"[BG] All {len(all_videos)} backgrounds used, resetting cycle")
+        logger.info("[BG] All %s backgrounds used, resetting cycle", len(all_videos))
         used = []
         available = [v for v in all_videos if v not in exclude]
     if not available:
@@ -4756,7 +4753,8 @@ def _find_background_video(exclude: list[str] | None = None) -> str | None:
     except OSError:
         pass
 
-    print(f"[BG] Selected: {os.path.basename(pick)} ({len(all_videos) - len(available)} of {len(all_videos)} used)")
+    logger.info("[BG] Selected: %s (%s of %s used)",
+                os.path.basename(pick), len(all_videos) - len(available), len(all_videos))
     return pick
 
 
@@ -4782,15 +4780,11 @@ def _select_validated_background(job_id: str, max_attempts: int = 3) -> tuple[st
         )
         result = validate_fn(candidate, job_id=job_id)
         if result.get("passed"):
-            print(
-                f"[VALIDATION] bg accepted on attempt {attempt}: "
-                f"{os.path.basename(candidate)}"
-            )
+            logger.info("[VALIDATION] bg accepted on attempt %s: %s",
+                        attempt, os.path.basename(candidate))
             return candidate, issues
-        print(
-            f"[VALIDATION] bg rejected on attempt {attempt} "
-            f"({os.path.basename(candidate)}): {result.get('issues')}"
-        )
+        logger.warning("[VALIDATION] bg rejected on attempt %s (%s): %s",
+                       attempt, os.path.basename(candidate), result.get('issues'))
         for it in result.get("issues") or []:
             issues.append({"attempt": attempt, "bg": os.path.basename(candidate), **it})
         rejected.append(candidate)
@@ -4889,8 +4883,8 @@ def _prerender_looped_bg(bg_path: str, duration: float, job_dir: str,
     if result.returncode != 0:
         # Fall back to the simple loop if the palindrome filter graph fails
         # (e.g. clip too short or memory-constrained machines).
-        print(f"[BG] Palindrome loop failed, falling back to stream_loop: "
-              f"{result.stderr[-200:]}")
+        logger.warning("[BG] Palindrome loop failed, falling back to stream_loop: %s",
+                       result.stderr[-200:])
         cmd_fallback = [
             "ffmpeg", "-y",
             "-stream_loop", "-1",
@@ -4910,7 +4904,7 @@ def _prerender_looped_bg(bg_path: str, duration: float, job_dir: str,
             raise RuntimeError(f"ffmpeg loop failed: {result.stderr[-300:]}")
 
     size_mb = os.path.getsize(out_path) / 1024 / 1024
-    print(f"[BG] Pre-rendered palindrome loop: {duration:.0f}s, {size_mb:.1f} MB")
+    logger.info("[BG] Pre-rendered palindrome loop: %.0fs, %.1f MB", duration, size_mb)
     return out_path
 
 
@@ -5433,18 +5427,18 @@ def _transcode_to_prores(input_path: str, mov_path: str,
     ]
 
     if pure_recode:
-        print(f"[PRORES] pure-recode {os.path.basename(input_path)} → "
-              f"{os.path.basename(mov_path)} ({spec.width}×{spec.height} @ "
-              f"{spec.fps_str}, profile {spec.prores_profile}) — "
-              f"source dims+fps match target, no scale/fps filter.")
+        logger.info("[PRORES] pure-recode %s -> %s (%sx%s @ %s, profile %s) — "
+                    "source dims+fps match target, no scale/fps filter.",
+                    os.path.basename(input_path), os.path.basename(mov_path),
+                    spec.width, spec.height, spec.fps_str, spec.prores_profile)
     else:
-        src_desc = f"{src[0]}×{src[1]}@{src[2]}" if src else "unknown"
-        print(f"[PRORES] LEGACY scale+fps {os.path.basename(input_path)} "
-              f"({src_desc}) → {os.path.basename(mov_path)} "
-              f"({spec.width}×{spec.height} @ {spec.fps_str}, "
-              f"profile {spec.prores_profile}). "
-              f"WARNING: source mismatch may produce frame-rate-"
-              f"conversion artifacts that fail UMG manual QC.")
+        src_desc = "%sx%s@%s" % (src[0], src[1], src[2]) if src else "unknown"
+        logger.warning("[PRORES] LEGACY scale+fps %s (%s) -> %s (%sx%s @ %s, profile %s). "
+                       "WARNING: source mismatch may produce frame-rate-"
+                       "conversion artifacts that fail UMG manual QC.",
+                       os.path.basename(input_path), src_desc,
+                       os.path.basename(mov_path),
+                       spec.width, spec.height, spec.fps_str, spec.prores_profile)
     result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout_sec)
     if result.returncode != 0:
         # Best-effort cleanup of a partial file before raising.
@@ -5470,19 +5464,19 @@ def _transcode_to_prores(input_path: str, mov_path: str,
              "-of", "default=noprint_wrappers=1", mov_path],
             capture_output=True, text=True, timeout=30,
         )
-        print("[PRORES] ffprobe stream fields:")
+        logger.info("[PRORES] ffprobe stream fields:")
         for line in (_probe.stdout or "").strip().splitlines():
-            print(f"  {line}")
+            logger.info("  %s", line)
     except Exception as _e:  # pragma: no cover
-        print(f"[PRORES] ffprobe diagnostic failed: {_e}")
+        logger.warning("[PRORES] ffprobe diagnostic failed: %s", _e)
 
     errors = _validate_umg_master(mov_path, spec)
     if errors:
-        # Print errors before deleting so the worker logs surface
+        # Log errors before deleting so the worker logs surface
         # what ffprobe reported vs. what we expected — the diagnostic
         # ffprobe dump above gives the actual values; this line gives
         # the validator's interpretation.
-        print(f"[PRORES] validation failed: {errors}")
+        logger.error("[PRORES] validation failed: %s", errors)
         try:
             os.unlink(mov_path)
         except OSError:
@@ -5492,7 +5486,7 @@ def _transcode_to_prores(input_path: str, mov_path: str,
         )
 
     size_mb = os.path.getsize(mov_path) / 1024 / 1024
-    print(f"[PRORES] master ready: {size_mb:.1f} MB")
+    logger.info("[PRORES] master ready: %.1f MB", size_mb)
 
 
 def _validate_umg_master(path: str, spec: RenderSpec) -> list[str]:
@@ -5676,7 +5670,7 @@ def generate_lyric_video(
                 font = random.choice(_FONT_POOL)
         else:
             font = "Arial"
-    print(f"[FONT] Selected: {os.path.basename(font)}")
+    logger.info("[FONT] Selected: %s", os.path.basename(font))
 
     # Drop empty / whitespace-only segments BEFORE clamping so the
     # neighbor indices used for overlap clamp are correct. Operator
@@ -5688,7 +5682,7 @@ def generate_lyric_video(
         segments = [s for s in segments if (s.get("text") or "").strip()]
         dropped = before - len(segments)
         if dropped:
-            print(f"[RENDER] dropped {dropped} blank segment(s) before render")
+            logger.info("[RENDER] dropped %s blank segment(s) before render", dropped)
 
     # Defensive normalization — clamp each segment's end to the next
     # segment's start (with a 50ms gap) so two subtitles can never
@@ -5838,9 +5832,9 @@ def generate_lyric_video(
                 position_x_center = False     # left-anchored
                 base_opacity_artist = 0.92
                 base_opacity_song = 0.80
-                print(
-                    f"[TITLE] first lyric at {first_lyric_start:.2f}s — "
-                    f"using lower-left badge (intro too short for centred card)"
+                logger.info(
+                    "[TITLE] first lyric at %.2fs — using lower-left badge (intro too short for centred card)",
+                    first_lyric_start,
                 )
 
             title_card_clips = []
@@ -5895,7 +5889,7 @@ def generate_lyric_video(
                     text_layers.append(clip)
                     y_cursor += ch + 8
         except Exception as e:
-            print(f"[TITLE] title card failed ({e}); continuing")
+            logger.warning("[TITLE] title card failed (%s); continuing", e)
 
     for seg in segments:
         layers = _make_text_clip(
@@ -6032,7 +6026,7 @@ def _find_chorus_start(segments: list[dict], window_sec: int = 30) -> float:
 
     # Clamp to valid range
     best_start = max(0, min(best_start, total_duration - window_sec))
-    print(f"[SHORT] Chorus detected at {best_start:.1f}s (score={best_score})")
+    logger.info("[SHORT] Chorus detected at %.1fs (score=%s)", best_start, best_score)
     return best_start
 
 
@@ -6422,7 +6416,7 @@ def run_edit_pipeline(
                     if new_bg_key:
                         update_job(job_id, bg_r2_key_cached=new_bg_key)
                 except Exception as _e:
-                    print(f"[EDIT] Warning: re-cache of new background failed: {_e}")
+                    logger.warning("[EDIT] Warning: re-cache of new background failed: %s", _e)
         else:
             raise ValueError(f"Unknown edit_type {edit_type!r}")
 
@@ -6431,7 +6425,7 @@ def run_edit_pipeline(
         # ----------------------------------------------------------------
         chosen_font = _resolve_font(font_id)
         if chosen_font:
-            print(f"[EDIT] Operator font: {os.path.basename(chosen_font)}")
+            logger.info("[EDIT] Operator font: %s", os.path.basename(chosen_font))
 
         # ----------------------------------------------------------------
         # Re-render video
@@ -6515,7 +6509,7 @@ def run_edit_pipeline(
 
         # Back to pending_review — the reviewer decides what to do next.
         update_job(job_id, status="pending_review", progress=100, files=files)
-        print(f"[EDIT] job={job_id} edit_type={edit_type} → pending_review")
+        logger.info("[EDIT] job=%s edit_type=%s -> pending_review", job_id, edit_type)
 
         # Audit log: completion. The corresponding job.edit_request entry
         # was written by main.py at request time; this closes the loop
@@ -6534,7 +6528,7 @@ def run_edit_pipeline(
         )
 
     except Exception as exc:
-        print(f"[EDIT] job={job_id} FAILED: {exc}")
+        logger.error("[EDIT] job=%s FAILED: %s", job_id, exc, exc_info=True)
         update_job(job_id, status="error", error=f"Edit failed: {exc}")
         _write_edit_audit(
             action="job.edit_failed",

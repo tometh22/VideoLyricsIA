@@ -471,12 +471,9 @@ def create_token(user: User) -> str:
 def decode_token(token: str) -> dict:
     """Decode and validate a JWT token."""
     try:
+        # jwt.decode() validates the `exp` claim automatically and raises
+        # JWTError if expired — no manual time check needed.
         payload = jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGORITHM])
-        if payload.get("exp", 0) < time.time():
-            raise HTTPException(
-                status_code=status.HTTP_401_UNAUTHORIZED,
-                detail="Token expired",
-            )
         return payload
     except JWTError:
         raise HTTPException(

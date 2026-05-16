@@ -826,10 +826,13 @@ def init_db():
 
 
 def _migrate_user_columns():
-    """Add columns to the `users` table if they're missing. Postgres
-    supports `ADD COLUMN IF NOT EXISTS` natively (>= 9.6); SQLite has it
-    since 3.35. Wrapped in try/except per dialect quirk so a transient
-    failure here never aborts the whole init."""
+    """Add columns to the `users` table if they're missing.
+    Only runs on PostgreSQL — `create_all()` already creates the full
+    schema from scratch in SQLite (test) environments, so there are no
+    missing columns to patch. The `IF NOT EXISTS` / `JSONB` / `TIMESTAMPTZ`
+    syntax used here is PostgreSQL-specific anyway."""
+    if engine.dialect.name != "postgresql":
+        return
     from sqlalchemy import text
     column_adds = [
         "ALTER TABLE users ADD COLUMN IF NOT EXISTS allow_overage BOOLEAN DEFAULT FALSE NOT NULL",
@@ -881,7 +884,8 @@ def _migrate_user_columns():
     for sql in column_adds:
         try:
             with engine.begin() as conn:
-                conn.execute(text("SET LOCAL lock_timeout = '3s'"))
+                if engine.dialect.name == "postgresql":
+                    conn.execute(text("SET LOCAL lock_timeout = '3s'"))
                 conn.execute(text(sql))
         except Exception as e:  # pragma: no cover — dialect-specific
             print(f"[init_db] migrate skipped: {sql} → {e}")
@@ -909,7 +913,10 @@ def _migrate_user_columns():
 def _widen_column_to_text(table: str, column: str) -> None:
     """Run ALTER COLUMN TYPE TEXT only if the column is not already text.
     Skipping avoids an ACCESS EXCLUSIVE lock that would block during a
-    rolling deploy where the previous replica is still accepting requests."""
+    rolling deploy where the previous replica is still accepting requests.
+    No-op on non-PostgreSQL backends (SQLite uses dynamic typing)."""
+    if engine.dialect.name != "postgresql":
+        return
     from sqlalchemy import text
     try:
         with engine.connect() as conn:

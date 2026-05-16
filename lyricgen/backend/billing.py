@@ -19,6 +19,17 @@ from database import User, Invoice, get_db
 
 logger = logging.getLogger("genly.billing")
 
+
+def _send_email_async(fn, **kwargs):
+    """Spawn a daemon thread to send an email; log failures instead of
+    swallowing them silently."""
+    def _target():
+        try:
+            fn(**kwargs)
+        except Exception as exc:
+            logger.error("billing email send failed (%s): %s", fn.__name__, exc, exc_info=True)
+    threading.Thread(target=_target, daemon=True).start()
+
 # --- Stripe config ---
 stripe.api_key = os.environ.get("STRIPE_SECRET_KEY", "")
 STRIPE_WEBHOOK_SECRET = os.environ.get("STRIPE_WEBHOOK_SECRET", "")
@@ -80,27 +91,34 @@ async def create_checkout_session(
 
     customer_id = get_or_create_stripe_customer(db, user)
 
-    session = stripe.checkout.Session.create(
-        customer=customer_id,
-        payment_method_types=["card"],
-        line_items=[{
-            "price": plan["stripe_price_id"],
-            "quantity": 1,
-        }],
-        mode="subscription",
-        success_url=f"{FRONTEND_URL}/?billing=success&session_id={{CHECKOUT_SESSION_ID}}",
-        cancel_url=f"{FRONTEND_URL}/?billing=cancelled",
-        metadata={
-            "user_id": str(user.id),
-            "plan_id": body.plan_id,
-        },
-        subscription_data={
-            "metadata": {
+    try:
+        session = stripe.checkout.Session.create(
+            customer=customer_id,
+            payment_method_types=["card"],
+            line_items=[{
+                "price": plan["stripe_price_id"],
+                "quantity": 1,
+            }],
+            mode="subscription",
+            success_url=f"{FRONTEND_URL}/?billing=success&session_id={{CHECKOUT_SESSION_ID}}",
+            cancel_url=f"{FRONTEND_URL}/?billing=cancelled",
+            metadata={
                 "user_id": str(user.id),
                 "plan_id": body.plan_id,
             },
-        },
-    )
+            subscription_data={
+                "metadata": {
+                    "user_id": str(user.id),
+                    "plan_id": body.plan_id,
+                },
+            },
+        )
+    except stripe.error.StripeError as exc:
+        logger.error("Stripe checkout session creation failed for user %s: %s", user.id, exc)
+        raise HTTPException(
+            status_code=502,
+            detail="No se pudo crear la sesión de pago. Intentá de nuevo en unos segundos.",
+        )
 
     return {"checkout_url": session.url, "session_id": session.id}
 
@@ -229,10 +247,12 @@ async def stripe_webhook(request: Request, db: Session = Depends(get_db)):
     payload = await request.body()
     sig_header = request.headers.get("stripe-signature", "")
 
-    if not STRIPE_WEBHOOK_SECRET:
+    if not STRIPE_WEBHOOK_SECRET.strip():
         # Without a signing secret the only safe thing to do is refuse the
         # request. Falling through to json.loads(payload) lets anyone forge
-        # checkout/subscription events.
+        # checkout/subscription events. An empty string is treated the same
+        # as a missing value — a misconfigured empty env var must not bypass
+        # signature verification.
         if _REQUIRE_WEBHOOK_SIGNATURE:
             logger.error("Refusing webhook: STRIPE_WEBHOOK_SECRET is not configured")
             raise HTTPException(status_code=503, detail="Webhook signing not configured")
@@ -292,6 +312,12 @@ def _handle_checkout_completed(db: Session, data: dict):
     user.stripe_subscription_id = subscription_id
     if plan_id in PLANS:
         user.plan_id = plan_id
+    else:
+        logger.warning(
+            "checkout.session.completed: unrecognised plan_id=%r for customer=%s; "
+            "subscription_id persisted but plan NOT updated",
+            plan_id, customer_id,
+        )
     db.commit()
     logger.info(f"User {user.username} subscribed to plan {plan_id}")
 
@@ -305,6 +331,12 @@ def _handle_subscription_updated(db: Session, data: dict):
     plan_id = data.get("metadata", {}).get("plan_id")
     if plan_id and plan_id in PLANS:
         user.plan_id = plan_id
+    elif plan_id:
+        logger.warning(
+            "customer.subscription.updated: unrecognised plan_id=%r for customer=%s; "
+            "plan NOT updated",
+            plan_id, customer_id,
+        )
 
     user.stripe_subscription_id = data.get("id")
     db.commit()
@@ -369,17 +401,14 @@ def _handle_invoice_paid(db: Session, data: dict):
         amount_paid = data.get("amount_paid", 0) / 100
         currency = data.get("currency", "usd")
         invoice_url = data.get("hosted_invoice_url", "")
-        threading.Thread(
-            target=emails.send_invoice_paid,
-            kwargs={
-                "email": user.email,
-                "username": user.username,
-                "amount": amount_paid,
-                "currency": currency,
-                "invoice_url": invoice_url,
-            },
-            daemon=True,
-        ).start()
+        _send_email_async(
+            emails.send_invoice_paid,
+            email=user.email,
+            username=user.username,
+            amount=amount_paid,
+            currency=currency,
+            invoice_url=invoice_url,
+        )
 
 
 def _handle_invoice_failed(db: Session, data: dict):
@@ -408,13 +437,10 @@ def _handle_invoice_failed(db: Session, data: dict):
     if user.email:
         amount_due = data.get("amount_due", 0) / 100
         currency = data.get("currency", "usd")
-        threading.Thread(
-            target=emails.send_payment_failed,
-            kwargs={
-                "email": user.email,
-                "username": user.username,
-                "amount": amount_due,
-                "currency": currency,
-            },
-            daemon=True,
-        ).start()
+        _send_email_async(
+            emails.send_payment_failed,
+            email=user.email,
+            username=user.username,
+            amount=amount_due,
+            currency=currency,
+        )

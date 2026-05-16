@@ -15,9 +15,11 @@ def _create_error_job(db, edit_count: int = 3, tenant_id: str = "default"):
     job_id = uuid.uuid4().hex[:12]
     job = JobModel(
         job_id=job_id,
+        user_id=1,
         tenant_id=tenant_id,
         artist="Test",
         song_title="Retry Test",
+        filename="test.mp3",
         status="error",
         delivery_profile="youtube",
         progress=42,

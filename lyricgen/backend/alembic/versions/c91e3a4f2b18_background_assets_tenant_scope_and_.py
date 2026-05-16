@@ -56,13 +56,14 @@ def upgrade() -> None:
         ["owner_tenant_id"],
         unique=False,
     )
-    op.create_foreign_key(
-        "fk_background_assets_parent_asset_id",
-        "background_assets",
-        "background_assets",
-        ["parent_asset_id"],
-        ["id"],
-    )
+    if op.get_context().dialect.name == "postgresql":
+        op.create_foreign_key(
+            "fk_background_assets_parent_asset_id",
+            "background_assets",
+            "background_assets",
+            ["parent_asset_id"],
+            ["id"],
+        )
 
     # Reassign existing assets to UMG. The tenant_id used here must match
     # the tenant_id of the UMG user when it gets created. Override via
@@ -112,11 +113,12 @@ def downgrade() -> None:
     op.drop_index("ix_asset_usage_asset_id", table_name="asset_usage")
     op.drop_table("asset_usage")
 
-    op.drop_constraint(
-        "fk_background_assets_parent_asset_id",
-        "background_assets",
-        type_="foreignkey",
-    )
+    if op.get_context().dialect.name == "postgresql":
+        op.drop_constraint(
+            "fk_background_assets_parent_asset_id",
+            "background_assets",
+            type_="foreignkey",
+        )
     op.drop_index(
         "ix_background_assets_owner_tenant_id",
         table_name="background_assets",

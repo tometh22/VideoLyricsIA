@@ -101,7 +101,7 @@ def test_me(client, user_token):
 
 def test_me_no_auth(client):
     res = client.get("/auth/me")
-    assert res.status_code == 403
+    assert res.status_code == 401
 
 
 def test_me_bad_token(client):

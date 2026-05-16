@@ -118,9 +118,11 @@ def _create_done_job(db, tenant_id="default", umg_spec=None) -> str:
     job_id = uuid.uuid4().hex[:12]
     job = JobModel(
         job_id=job_id,
+        user_id=1,
         tenant_id=tenant_id,
         artist="Test",
         song_title="Drive Test",
+        filename="test.mp3",
         status="done",
         delivery_profile="youtube" if umg_spec is None else "umg",
         umg_spec=umg_spec,
@@ -133,6 +135,9 @@ def _create_done_job(db, tenant_id="default", umg_spec=None) -> str:
 
 def test_deliver_requires_drive_connected(client, admin_token, db):
     """Sin user_drive_tokens row, endpoint devuelve 412."""
+    me = client.get("/auth/me", headers={"Authorization": f"Bearer {admin_token}"}).json()
+    db.query(UserDriveTokens).filter(UserDriveTokens.user_id == me["id"]).delete()
+    db.commit()
     job_id = _create_done_job(db)
     res = client.post(
         f"/jobs/{job_id}/deliver-to-drive",
@@ -144,8 +149,12 @@ def test_deliver_requires_drive_connected(client, admin_token, db):
 
 
 def _connect_drive_for(db, client, token: str):
-    """Helper: pone una row user_drive_tokens para el user actual."""
+    """Helper: pone una row user_drive_tokens para el user actual.
+    Borra cualquier row previa para ese user (test isolation: la columna
+    user_id tiene UNIQUE constraint y los tests comparten la misma DB)."""
     me = client.get("/auth/me", headers={"Authorization": f"Bearer {token}"}).json()
+    db.query(UserDriveTokens).filter(UserDriveTokens.user_id == me["id"]).delete()
+    db.flush()
     db.add(UserDriveTokens(
         user_id=me["id"],
         encrypted_refresh_token=encrypt_token("1//fake-refresh"),
@@ -171,8 +180,8 @@ def test_deliver_rejects_non_done_job(client, admin_token, db):
     """Job en processing/error/etc no puede exportarse."""
     job_id = uuid.uuid4().hex[:12]
     job = JobModel(
-        job_id=job_id, tenant_id="default", artist="A", song_title="x",
-        status="processing", delivery_profile="youtube",
+        job_id=job_id, user_id=1, tenant_id="default", artist="A", song_title="x",
+        filename="test.mp3", status="processing", delivery_profile="youtube",
     )
     db.add(job)
     db.commit()
@@ -258,12 +267,22 @@ def test_get_transfer_returns_404_when_missing(client, admin_token):
     assert res.status_code == 404
 
 
-def test_get_transfer_returns_404_for_other_user(client, admin_token, user_token, db):
-    """Tenant isolation: user_token no puede ver transfer de admin."""
+def test_get_transfer_returns_404_for_other_user(client, admin_token, user_token, db, monkeypatch):
+    """Tenant isolation: user_token no puede ver transfer de admin.
+    Habilitamos drive para el user para que pase el has_drive_access guard
+    y lleguemos al check de tenant isolation (user_id filter → 404)."""
+    import auth as auth_module
     me_admin = client.get("/auth/me", headers={"Authorization": f"Bearer {admin_token}"}).json()
+    me_user = client.get("/auth/me", headers={"Authorization": f"Bearer {user_token}"}).json()
+    # Habilitar drive para el tenant del user para pasar el primer guard
+    monkeypatch.setattr(auth_module, "DRIVE_ENABLED_TENANTS", {me_user["tenant_id"].lower()})
+
     job_id = _create_done_job(db)
+    transfer_id = f"iso_{me_admin['id']}_12"
+    db.query(DriveTransfer).filter(DriveTransfer.id == transfer_id).delete()
+    db.flush()
     transfer = DriveTransfer(
-        id="someid12345",
+        id=transfer_id,
         user_id=me_admin["id"],
         job_id=job_id,
         file_type="video",
@@ -276,6 +295,7 @@ def test_get_transfer_returns_404_for_other_user(client, admin_token, user_token
         f"/drive/transfers/{transfer.id}",
         headers={"Authorization": f"Bearer {user_token}"},
     )
+    # Transfer pertenece al admin — user con drive habilitado recibe 404
     assert res.status_code == 404
 
 

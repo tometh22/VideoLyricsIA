@@ -2,10 +2,34 @@
 
 import os
 import sys
+import types
 import pytest
 
 # Ensure backend modules are importable
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+
+# moviepy 1.0.3 requires legacy setuptools build machinery that is not
+# available in CI / dev containers. Stub the module tree so that
+# pipeline.py can be imported without a compiled moviepy wheel.
+# Must happen before any `from main import ...` triggers pipeline.py.
+def _stub_moviepy():
+    _mp = types.ModuleType("moviepy")
+    _mp_cfg = types.ModuleType("moviepy.config")
+    _mp_cfg.change_settings = lambda settings: None
+    _mp_ed = types.ModuleType("moviepy.editor")
+    for _cls_name in (
+        "AudioFileClip", "ColorClip", "CompositeVideoClip",
+        "TextClip", "VideoClip", "VideoFileClip", "concatenate_videoclips",
+    ):
+        setattr(_mp_ed, _cls_name, type(_cls_name, (), {
+            "__init__": lambda self, *a, **kw: None,
+        }))
+    sys.modules.setdefault("moviepy", _mp)
+    sys.modules.setdefault("moviepy.config", _mp_cfg)
+    sys.modules.setdefault("moviepy.editor", _mp_ed)
+
+if "moviepy" not in sys.modules:
+    _stub_moviepy()
 
 # main.py defaults ENVIRONMENT to "production", which then refuses to
 # import without an explicit CORS_ORIGINS list (security guard against
@@ -83,6 +107,12 @@ def admin_token(client):
         "password": "testadmin123",
     })
     return res.json()["token"]
+
+
+@pytest.fixture
+def admin_user_id(client, admin_token):
+    """Return the numeric DB id of the admin user."""
+    return client.get("/auth/me", headers={"Authorization": f"Bearer {admin_token}"}).json()["id"]
 
 
 @pytest.fixture

@@ -185,7 +185,7 @@ def test_enqueue_pipeline_attaches_retry_metadata():
     # out the pipeline import so RQ can serialize the job without
     # trying to actually pull in the heavy pipeline module.
     original_pick = queue_jobs._pick_queue
-    queue_jobs._pick_queue = lambda plan: q
+    queue_jobs._pick_queue = lambda plan, **kwargs: q
     try:
         # Stub run_pipeline with a no-op to avoid importing the real one.
         import pipeline
