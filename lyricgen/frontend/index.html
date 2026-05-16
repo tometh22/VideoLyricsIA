@@ -3,6 +3,19 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <!-- Defense-in-depth cache-busting. Vercel ya emite Cache-Control:
+         no-cache, no-store, must-revalidate para este HTML (ver
+         vercel.json), pero algunos browsers honran solo a medias el
+         header HTTP cuando el documento viene de una rewrite. Estos
+         meta tags duplican la intención al nivel del documento.
+         CRÍTICO: si los browsers cachean este HTML, siguen apuntando al
+         hash de JS viejo después de un deploy y el user ve UI rota
+         hasta hacer hard-refresh. Bug observado el 2026-05-13 con un
+         user que veía un index-CV152LX6.js cacheado mientras el server
+         servía index-KHXUzRn0.js. -->
+    <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate" />
+    <meta http-equiv="Pragma" content="no-cache" />
+    <meta http-equiv="Expires" content="0" />
     <title>GenLy</title>
     <!-- §10 Logo implementation — single source of truth. The favicon
          uses the G mark only (per the brand kit rules); the navbar /
