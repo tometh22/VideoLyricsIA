@@ -166,6 +166,18 @@ FILE_TYPE_TO_DRIVE_NAME = {
 }
 
 
+import re as _re
+_SAFE_JOB_ID_RE = _re.compile(r"^[a-zA-Z0-9_-]+$")
+
+# Maximum wall-clock time to wait for rclone to finish a transfer.
+# A 16 GB ProRes master at typical 20 Mbps upload averages ~110 min;
+# 4 h gives headroom for retries and slow connections without blocking
+# a worker slot forever on a hung/deadlocked process.
+RCLONE_TRANSFER_TIMEOUT_SECONDS = int(
+    __import__("os").environ.get("RCLONE_TRANSFER_TIMEOUT_SECONDS", 14400)  # 4 h
+)
+
+
 def upload_via_rclone(
     transfer_id: str,
     user_id: int,
@@ -200,6 +212,10 @@ def upload_via_rclone(
 
     if file_type not in FILE_TYPE_TO_DRIVE_NAME:
         raise DriveUploadError(f"file_type inválido: {file_type!r}")
+    if not _SAFE_JOB_ID_RE.match(job_id):
+        raise DriveUploadError(
+            f"job_id contiene caracteres no permitidos: {job_id!r}"
+        )
 
     db = SessionLocal()
     try:
@@ -324,7 +340,15 @@ def upload_via_rclone(
                         "percent": percent,
                     })
 
-        proc.wait()
+        try:
+            proc.wait(timeout=RCLONE_TRANSFER_TIMEOUT_SECONDS)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait()
+            raise DriveUploadError(
+                f"rclone timed out after {RCLONE_TRANSFER_TIMEOUT_SECONDS}s "
+                f"for transfer={transfer_id} job={job_id} file_type={file_type}"
+            )
         if proc.returncode != 0:
             raise DriveUploadError(
                 f"rclone exit code {proc.returncode}. "

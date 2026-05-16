@@ -2822,7 +2822,7 @@ async def transcribe_endpoint(
         except Exception as e:
             # Best-effort. Same-replica fallback still works via local disk;
             # the cross-replica failure mode is the user re-doing the upload.
-            print(f"[TRANSCRIBE] R2 upload failed for {job_id}: {e}")
+            logger.error("[TRANSCRIBE] R2 upload failed for %s: %s", job_id, e)
 
     # Per-request scratch dir for intermediate slices (intro/body cuts).
     # The main audio file lives under job_dir and stays around until
@@ -2876,8 +2876,7 @@ async def _run_transcription_for_job(
                      "- River Plate", "- Luna Park", "- En Vivo"]:
             song_hint = song_hint.replace(sfx, "").strip()
         if not artist_hint:
-            print(f"[LYRICS] no artist supplied for {filename!r} — "
-                  f"Gemini fetch will be skipped, falling through to lyrics.ovh")
+            logger.warning("[LYRICS] no artist supplied for %r — Gemini fetch will be skipped, falling through to lyrics.ovh", filename)
 
         # Fast-path: lrclib.net often has synced (LRC) lyrics for popular
         # songs — when that's the case we skip Whisper entirely. Whisper
@@ -2949,22 +2948,16 @@ async def _run_transcription_for_job(
                                     s for s in wsegs if s["end"] <= diff + 0.5
                                 ]
                             except Exception as e:
-                                print(f"[LYRICS] intro Whisper failed: {e}")
+                                logger.error("[LYRICS] intro Whisper failed: %s", e, exc_info=True)
                             finally:
                                 try:
                                     os.unlink(intro_path)
                                 except OSError:
                                     pass
-                        print(f"[LYRICS] lrclib duration mismatch "
-                              f"(user={user_dur:.1f}s, lrclib={lrc_dur:.1f}s) "
-                              f"— +{offset:.2f}s offset on song; intro Whisper "
-                              f"produced {len(hybrid_intro_segs)} segments")
+                        logger.info("[LYRICS] lrclib duration mismatch (user=%.1fs, lrclib=%.1fs) — +%.2fs offset on song; intro Whisper produced %s segments", user_dur, lrc_dur, offset, len(hybrid_intro_segs))
                     else:
                         use_synced = False
-                        print(f"[LYRICS] lrclib duration mismatch "
-                              f"(user={user_dur:.1f}s, lrclib={lrc_dur:.1f}s, "
-                              f"diff={diff:+.1f}s) — too risky to auto-align, "
-                              f"falling back to Whisper")
+                        logger.warning("[LYRICS] lrclib duration mismatch (user=%.1fs, lrclib=%.1fs, diff=%+.1fs) — too risky to auto-align, falling back to Whisper", user_dur, lrc_dur, diff)
                 if use_synced:
                     song_segs = _lrc_to_segments(
                         synced, lrc_dur, time_offset=offset,
@@ -2991,21 +2984,14 @@ async def _run_transcription_for_job(
                             )
                             if confidence is not None:
                                 if confidence < 0.4:
-                                    print(f"[LYRICS] alignment verification FAILED "
-                                          f"(confidence={confidence:.2f} at "
-                                          f"t={verify_seg['start']:.1f}s for "
-                                          f"{verify_seg['text'][:40]!r}) — "
-                                          f"falling back to Whisper+plain")
+                                    logger.warning("[LYRICS] alignment verification FAILED (confidence=%.2f at t=%.1fs for %r) — falling back to Whisper+plain", confidence, verify_seg['start'], verify_seg['text'][:40])
                                     use_synced = False
                                 else:
-                                    print(f"[LYRICS] alignment verified "
-                                          f"(confidence={confidence:.2f})")
+                                    logger.info("[LYRICS] alignment verified (confidence=%.2f)", confidence)
                             elif diff > 60.0:
                                 # High-diff offsets are riskier — if we can't
                                 # even verify, don't gamble; fall back.
-                                print(f"[LYRICS] alignment verification "
-                                      f"unavailable for high-diff offset "
-                                      f"({diff:.1f}s) — falling back")
+                                logger.warning("[LYRICS] alignment verification unavailable for high-diff offset (%.1fs) — falling back", diff)
                                 use_synced = False
                     if use_synced and song_segs and len(song_segs) >= 8:
                         from pipeline import (
@@ -3016,8 +3002,7 @@ async def _run_transcription_for_job(
                             hybrid_intro_segs, song_segs,
                         )
                         if _dup:
-                            print(f"[LYRICS] discarded {_dup} intro seg(s) as "
-                                  f"song-line hallucinations")
+                            logger.info("[LYRICS] discarded %s intro seg(s) as song-line hallucinations", _dup)
                         # Only apply the gap-based first-line correction
                         # when we don't have an intro Whisper pass to
                         # cover the pre-vocal region — otherwise the
@@ -3028,16 +3013,9 @@ async def _run_transcription_for_job(
                                 song_segs, audio_duration=user_dur,
                             )
                             if _moved is not None:
-                                print(f"[LYRICS] lrclib line 1 was anchored "
-                                      f"at 0s with a long gap to line 2; "
-                                      f"shifted to {_moved:.2f}s based on "
-                                      f"median cadence")
+                                logger.info("[LYRICS] lrclib line 1 was anchored at 0s with a long gap to line 2; shifted to %.2fs based on median cadence", _moved)
                         combined = hybrid_intro_segs + song_segs
-                        print(f"[LYRICS] lrclib synced hit — "
-                              f"{len(combined)} segments "
-                              f"({len(hybrid_intro_segs)} intro + "
-                              f"{len(song_segs)} song), skipping main Whisper "
-                              f"for {artist_hint!r} - {song_hint!r}")
+                        logger.info("[LYRICS] lrclib synced hit — %s segments (%s intro + %s song), skipping main Whisper for %r - %r", len(combined), len(hybrid_intro_segs), len(song_segs), artist_hint, song_hint)
                         return {
                             "job_id": job_id,
                             "segments": combined,
@@ -3049,9 +3027,7 @@ async def _run_transcription_for_job(
             # grounded search step entirely (lrclib already gave us a clean
             # source).
             if plain:
-                print(f"[LYRICS] lrclib plain hit ({len(plain)} chars) — "
-                      f"running Whisper for timestamps (lyrics_hint primed), "
-                      f"skipping Gemini")
+                logger.info("[LYRICS] lrclib plain hit (%s chars) — running Whisper for timestamps (lyrics_hint primed), skipping Gemini", len(plain))
 
                 # Pre-Whisper intro trim. The "Video Oficial" cuts of many
                 # tracks add 30-90s of dialogue / extra music at the start
@@ -3090,9 +3066,7 @@ async def _run_transcription_for_job(
                     if sliced:
                         transcribe_path = candidate
                         trimmed_path = candidate
-                        print(f"[LYRICS] trimmed {intro_offset:.1f}s intro "
-                              f"before Whisper "
-                              f"(user={user_dur:.1f}s, lrclib={lrc_dur:.1f}s)")
+                        logger.info("[LYRICS] trimmed %.1fs intro before Whisper (user=%.1fs, lrclib=%.1fs)", intro_offset, user_dur, lrc_dur)
                     else:
                         intro_offset = 0.0  # slice failed — fall through
 
@@ -3126,11 +3100,9 @@ async def _run_transcription_for_job(
                                 s for s in intro_segs_raw
                                 if s["end"] <= intro_offset + 0.5
                             ]
-                            print(f"[LYRICS] intro Whisper produced "
-                                  f"{len(intro_segments)} segment(s) for "
-                                  f"the {intro_offset:.0f}s dialogue prefix")
+                            logger.info("[LYRICS] intro Whisper produced %s segment(s) for the %.0fs dialogue prefix", len(intro_segments), intro_offset)
                         except Exception as e:
-                            print(f"[LYRICS] intro Whisper failed: {e}")
+                            logger.error("[LYRICS] intro Whisper failed: %s", e, exc_info=True)
                         finally:
                             try:
                                 os.unlink(intro_path)
@@ -3206,10 +3178,7 @@ async def _run_transcription_for_job(
                             if plain_lines_count else 0.0
                         )
                         if coverage >= 0.5 and len(aligned) >= 8:
-                            print(f"[LYRICS] aligner: {len(aligned)}/"
-                                  f"{plain_lines_count} LRCLib lines aligned "
-                                  f"({coverage*100:.0f}% coverage) — "
-                                  f"replacing Whisper segmentation")
+                            logger.info("[LYRICS] aligner: %s/%s LRCLib lines aligned (%.0f%% coverage) — replacing Whisper segmentation", len(aligned), plain_lines_count, coverage * 100)
                             segments = [
                                 {"start": a["start"],
                                  "end": a["end"],
@@ -3217,16 +3186,11 @@ async def _run_transcription_for_job(
                                 for a in aligned
                             ]
                         else:
-                            print(f"[LYRICS] aligner: low coverage "
-                                  f"({len(aligned)}/{plain_lines_count} = "
-                                  f"{coverage*100:.0f}%) — keeping raw "
-                                  f"Whisper segments and falling through to "
-                                  f"hallucination recovery")
+                            logger.warning("[LYRICS] aligner: low coverage (%s/%s = %.0f%%) — keeping raw Whisper segments and falling through to hallucination recovery", len(aligned), plain_lines_count, coverage * 100)
                     except Exception as e:
                         # Opt-in and conservative: any aligner failure
                         # must NOT break the existing pipeline.
-                        print(f"[LYRICS] aligner error: {e!r} — keeping "
-                              f"raw Whisper segments")
+                        logger.error("[LYRICS] aligner error: %r — keeping raw Whisper segments", e, exc_info=True)
 
                 # Auto-recover: when Whisper still hallucinates after the
                 # trim (instrumental-passage mega-segments, synonym loops,
@@ -3249,17 +3213,9 @@ async def _run_transcription_for_job(
                             intro_segments, recovered,
                         )
                         if _dup:
-                            print(f"[LYRICS] discarded {_dup} intro seg(s) "
-                                  f"as song-line hallucinations (recovery)")
+                            logger.info("[LYRICS] discarded %s intro seg(s) as song-line hallucinations (recovery)", _dup)
                         combined = intro_segments + recovered
-                        print(f"[LYRICS] hallucination detected ({reason}) "
-                              f"— auto-recovered with {len(recovered)} "
-                              f"lines from lrclib plain "
-                              f"({len(anchors)} time anchors, "
-                              f"start={intro_offset:.1f}s, "
-                              f"dur={user_dur:.1f}s) "
-                              f"+ {len(intro_segments)} intro-Whisper "
-                              f"segment(s)")
+                        logger.warning("[LYRICS] hallucination detected (%s) — auto-recovered with %s lines from lrclib plain (%s time anchors, start=%.1fs, dur=%.1fs) + %s intro-Whisper segment(s)", reason, len(recovered), len(anchors), intro_offset, user_dur, len(intro_segments))
                         return {
                             "job_id": job_id,
                             "segments": combined,
@@ -3274,13 +3230,12 @@ async def _run_transcription_for_job(
                     intro_segments, segments,
                 )
                 if _dup:
-                    print(f"[LYRICS] discarded {_dup} intro seg(s) as "
-                          f"song-line hallucinations")
+                    logger.info("[LYRICS] discarded %s intro seg(s) as song-line hallucinations", _dup)
                 combined = intro_segments + segments
                 from pipeline import _filter_whisper_hallucinations
                 combined, _dropped = _filter_whisper_hallucinations(combined)
                 if _dropped:
-                    print(f"[TRANSCRIBE] dropped {_dropped} Whisper hallucination phrase(s)")
+                    logger.warning("[TRANSCRIBE] dropped %s Whisper hallucination phrase(s)", _dropped)
                 return {"job_id": job_id, "segments": combined, "reference_lyrics": plain}
 
         # Kick off Gemini-grounded lyrics fetch in parallel with Whisper.
@@ -3316,10 +3271,10 @@ async def _run_transcription_for_job(
         except asyncio.TimeoutError:
             # Gemini still pending — let it finish in the background and
             # cache the result for the next request. Don't block the user.
-            print("[LYRICS] gemini fetch slower than Whisper+2s — moving on")
+            logger.warning("[LYRICS] gemini fetch slower than Whisper+2s — moving on")
             reference = ""
         except Exception as e:
-            print(f"[LYRICS] gemini task failed: {e}")
+            logger.error("[LYRICS] gemini task failed: %s", e, exc_info=True)
             reference = ""
 
         # Final fallback: lyrics.ovh (free, no auth, thin catalogue but
@@ -3370,12 +3325,7 @@ async def _run_transcription_for_job(
                         if (s.get("text") or "") not in
                            [r.strip() for r in (reference or "").splitlines() if r.strip()]
                     )
-                    print(f"[LYRICS] hallucination detected on fallback "
-                          f"path ({reason}) — gap-fill produced "
-                          f"{len(merged)} segments from {src} "
-                          f"(~{plausible_count} kept-Whisper, "
-                          f"{len(merged) - plausible_count} synthesized, "
-                          f"dur={user_dur:.1f}s)")
+                    logger.warning("[LYRICS] hallucination detected on fallback path (%s) — gap-fill produced %s segments from %s (~%s kept-Whisper, %s synthesized, dur=%.1fs)", reason, len(merged), src, plausible_count, len(merged) - plausible_count, user_dur)
                     return {
                         "job_id": job_id,
                         "segments": merged,
@@ -3387,7 +3337,7 @@ async def _run_transcription_for_job(
         from pipeline import _filter_whisper_hallucinations
         segments, _dropped = _filter_whisper_hallucinations(segments)
         if _dropped:
-            print(f"[TRANSCRIBE] dropped {_dropped} Whisper hallucination phrase(s)")
+            logger.warning("[TRANSCRIBE] dropped %s Whisper hallucination phrase(s)", _dropped)
         return {"job_id": job_id, "segments": segments, "reference_lyrics": reference}
     finally:
         # tmp_dir holds intermediate slices (intro/body cuts) only — the
@@ -3972,7 +3922,7 @@ async def download_all_zip(
             else:
                 local = os.path.join(OUTPUTS_DIR, job_id, filename)
             if not os.path.exists(local):
-                print(f"[ZIP] missing source for {ftype}: {local}")
+                logger.warning("[ZIP] missing source for %s: %s", ftype, local)
                 continue
             on_disk.append((local, filename))
 

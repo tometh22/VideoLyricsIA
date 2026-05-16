@@ -9,9 +9,12 @@ model-load cost, and installs SIGTERM/SIGINT handlers so an in-flight job
 finishes cleanly when the container is recycled.
 """
 
+import logging
 import os
 import signal
 import sys
+
+logger = logging.getLogger("genly.worker")
 
 from credentials_bootstrap import bootstrap_vertex_credentials
 bootstrap_vertex_credentials()
@@ -20,7 +23,7 @@ bootstrap_vertex_credentials()
 def main():
     redis_url = os.environ.get("REDIS_URL", "").strip()
     if not redis_url:
-        print("[WORKER] REDIS_URL is required; aborting")
+        logger.critical("[WORKER] REDIS_URL is required; aborting")
         sys.exit(1)
 
     from redis import Redis
@@ -32,14 +35,14 @@ def main():
     # increases worker RAM and starts the container into immediate OOM
     # territory on small instances.
     if os.environ.get("OPENAI_API_KEY", "").strip():
-        print("[WORKER] OPENAI_API_KEY set; skipping local Whisper preload")
+        logger.info("[WORKER] OPENAI_API_KEY set; skipping local Whisper preload")
     else:
         try:
             from pipeline import _get_whisper_model
             _get_whisper_model("turbo")
-            print("[WORKER] Whisper model preloaded")
+            logger.info("[WORKER] Whisper model preloaded")
         except Exception as e:
-            print(f"[WORKER] Whisper preload failed ({e}); will load on first job")
+            logger.warning("[WORKER] Whisper preload failed (%s); will load on first job", e)
 
     conn = Redis.from_url(redis_url)
     # Enterprise queue first so premium tenants get priority.
@@ -47,7 +50,7 @@ def main():
     worker = Worker(queues, connection=conn)
 
     def _graceful(signum, _frame):
-        print(f"[WORKER] Received signal {signum}; requesting stop after current job")
+        logger.info("[WORKER] Received signal %s; requesting stop after current job", signum)
         worker.request_stop(signum, _frame)
 
     signal.signal(signal.SIGTERM, _graceful)
@@ -73,7 +76,7 @@ def main():
     except ValueError:
         max_jobs = 10
 
-    print(f"[WORKER] Listening on: enterprise, default | max_jobs={max_jobs}")
+    logger.info("[WORKER] Listening on: enterprise, default | max_jobs=%s", max_jobs)
     worker.work(with_scheduler=False, max_jobs=max_jobs)
 
 
