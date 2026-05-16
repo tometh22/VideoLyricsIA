@@ -1039,66 +1039,113 @@ export default function LyricsEditor({
         </div>
       )}
 
-      {/* Auto-split banner. Solo aparece cuando detectamos ≥1 segment
-          que matchea contra 2 lineas consecutivas de la referencia.
-          Es la acción primaria sugerida cuando la pipeline cayó al
-          recovery path o cualquier output mergeó 2 lyric lines en 1. */}
-      {!disableAutoSplit && mergeableSegments.length > 0 && (
-        <div className="mb-4 rounded-2xl ring-1 ring-amber-500/30 bg-amber-500/[0.08] px-4 py-3 flex items-start gap-3">
-          <svg className="w-5 h-5 text-amber-400 flex-shrink-0 mt-0.5" fill="none" stroke="currentColor" strokeWidth="1.8" viewBox="0 0 24 24">
-            <path d="M12 9v3.75m9-.75a9 9 0 11-18 0 9 9 0 0118 0zm-9 3.75h.008v.008H12v-.008z" strokeLinecap="round" strokeLinejoin="round" />
-          </svg>
-          <div className="flex-1 min-w-0">
-            <p className="text-xs font-medium text-white">
-              {(t("editor.auto_split_title") || "Detectamos {n} segments con 2 líneas mergeadas")
-                .replace("{n}", mergeableSegments.length)}
-            </p>
-            <p className="text-[11px] text-ink-secondary mt-0.5 leading-relaxed">
-              {t("editor.auto_split_desc") ||
-                "Podemos auto-dividirlos usando tu letra de referencia para que cada línea tenga su propio timestamp."}
-            </p>
-          </div>
-          <button
-            type="button"
-            onClick={autoSplitAllFromReference}
-            className="shrink-0 px-3 py-1.5 rounded-md text-xs font-medium text-white bg-amber-500/80 hover:bg-amber-500 ring-1 ring-amber-400/30 transition-colors"
-          >
-            {(t("editor.auto_split_button") || "Auto-dividir {n}")
-              .replace("{n}", mergeableSegments.length)}
-          </button>
-        </div>
-      )}
+      {/* ─── Auto-fix actions consolidated panel ───────────────────────
+          Combines three independent system-detected fixes (auto-split,
+          ortographic suggestions, hanging-text trim) into one accent-
+          color panel so the operator sees ONE action instead of three
+          competing amber banners stacked vertically.
 
-      {(hasSuggestions || editHistory.length > 0) && (
-        <div className="flex items-center justify-between mb-4 gap-3">
-          <p className="text-xs text-gray-500 truncate">
-            {hasSuggestions
-              ? `${pendingSuggestions} ${t("editor.suggestions")}.`
-              : ""}
-          </p>
-          <div className="flex items-center gap-2 shrink-0">
-            {editHistory.length > 0 && (
-              <button onClick={undoEdit}
-                title={t("editor.undo_hint") || "Cmd/Ctrl+Z"}
-                className="text-xs font-medium text-gray-400 hover:text-white transition-colors flex items-center gap-1 px-3 py-1.5 rounded-lg bg-white/[0.04] hover:bg-white/[0.08] ring-1 ring-white/[0.06]">
-                <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
-                  <path d="M3 7v6h6M3 13a9 9 0 109-9" strokeLinecap="round" strokeLinejoin="round" />
+          Incident 2026-05-16: with three separate banners + a "N
+          sugerencias" line, the operator reported "demasiados mensajes
+          poco jerarquizados" — couldn't tell what to do first or
+          whether the counters were related. Consolidating into a
+          single accent panel signals "system can fix N things for
+          you" instead of three competing alerts.
+
+          Color choice: accent (green) instead of amber. Amber screams
+          "warning"; the fixes are positive automations the system
+          already prepared, not problems the operator caused.
+
+          The panel also absorbs the standalone "Aplicar todas" /
+          "Deshacer" row that was below the auto-split banner. */}
+      {(() => {
+        const splitAvailable = !disableAutoSplit && mergeableSegments.length > 0;
+        const trimAvailable = longSegCount > 0;
+        const hasAutoFix = splitAvailable || hasSuggestions || trimAvailable;
+        const hasUndo = editHistory.length > 0;
+        if (!hasAutoFix && !hasUndo) return null;
+        const fixCount = (splitAvailable ? 1 : 0) + (hasSuggestions ? 1 : 0) + (trimAvailable ? 1 : 0);
+        const applyAllFixes = () => {
+          // Order matters: split first (changes segment count), then
+          // suggestions (per-segment text), then trim (per-segment end).
+          // Each individual handler calls pushEditHistory() so Cmd-Z
+          // unwinds them step by step.
+          if (splitAvailable) autoSplitAllFromReference();
+          if (hasSuggestions) applyAllSuggestions();
+          if (trimAvailable) trimAllLongSegs();
+        };
+        return (
+          <div className="mb-4 rounded-2xl ring-1 ring-accent/25 bg-accent/[0.05] px-4 py-3.5">
+            {hasAutoFix && (
+              <div className="flex items-start gap-3">
+                <svg className="w-5 h-5 text-accent flex-shrink-0 mt-0.5" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
+                  <polyline points="20 6 9 17 4 12" strokeLinecap="round" strokeLinejoin="round" />
                 </svg>
-                {t("editor.undo") || "Deshacer"}
-              </button>
+                <div className="flex-1 min-w-0">
+                  <p className="text-xs font-medium text-white">
+                    {fixCount === 1
+                      ? (t("editor.autofix_title_singular") || "1 corrección automática disponible")
+                      : (t("editor.autofix_title_plural") || "{n} correcciones automáticas disponibles").replace("{n}", fixCount)}
+                  </p>
+                  <ul className="mt-1.5 space-y-1">
+                    {splitAvailable && (
+                      <li className="text-[11px] text-ink-secondary flex items-center gap-2">
+                        <span className="text-gray-600 font-mono text-[10px]">└</span>
+                        {(t("editor.autofix_split") || "Auto-dividir {n} líneas mergeadas").replace("{n}", mergeableSegments.length)}
+                      </li>
+                    )}
+                    {hasSuggestions && (
+                      <li className="text-[11px] text-ink-secondary flex items-center gap-2">
+                        <span className="text-gray-600 font-mono text-[10px]">└</span>
+                        {(t("editor.autofix_suggestions") || "Aplicar {n} sugerencias ortográficas").replace("{n}", pendingSuggestions)}
+                      </li>
+                    )}
+                    {trimAvailable && (
+                      <li className="text-[11px] text-ink-secondary flex items-center gap-2">
+                        <span className="text-gray-600 font-mono text-[10px]">└</span>
+                        {(t("editor.autofix_trim") || "Recortar {n} líneas con texto colgado").replace("{n}", longSegCount)}
+                      </li>
+                    )}
+                  </ul>
+                </div>
+              </div>
             )}
-            {hasSuggestions && (
-              <button onClick={applyAllSuggestions}
-                className="text-xs font-medium text-accent hover:text-accent/80 transition-colors flex items-center gap-1 px-3 py-1.5 rounded-lg bg-accent/5 hover:bg-accent/10">
-                <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" strokeWidth="2.5" viewBox="0 0 24 24"><polyline points="20 6 9 17 4 12"/></svg>
-                {t("editor.apply_all")}
-              </button>
-            )}
+            <div className={`flex items-center gap-2 ${hasAutoFix ? "mt-3 pl-8" : ""}`}>
+              {hasAutoFix && (
+                <button
+                  type="button"
+                  onClick={applyAllFixes}
+                  className="px-3 py-1.5 rounded-md text-xs font-medium text-white bg-accent hover:bg-accent/90 transition-colors"
+                >
+                  {fixCount === 1
+                    ? (t("editor.autofix_apply_one") || "Aplicar")
+                    : (t("editor.autofix_apply_all") || "Aplicar todas las correcciones")}
+                </button>
+              )}
+              {hasUndo && (
+                <button
+                  onClick={undoEdit}
+                  title={t("editor.undo_hint") || "Cmd/Ctrl+Z"}
+                  className="text-xs font-medium text-gray-400 hover:text-white transition-colors flex items-center gap-1 px-3 py-1.5 rounded-lg bg-white/[0.04] hover:bg-white/[0.08] ring-1 ring-white/[0.06]"
+                >
+                  <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
+                    <path d="M3 7v6h6M3 13a9 9 0 109-9" strokeLinecap="round" strokeLinejoin="round" />
+                  </svg>
+                  {t("editor.undo") || "Deshacer"}
+                </button>
+              )}
+            </div>
           </div>
-        </div>
-      )}
+        );
+      })()}
 
-      {/* ─── Audio control bar — sticky-ish above the lyrics list ─── */}
+      {/* ─── Audio control bar — sticky-ish above the lyrics list ───
+          The "Activar modo Sync" entry used to live as its own banner
+          below this player (2026-05-16 removed). Sync is a tool for
+          adjusting timing, not an alert — putting it inline with the
+          play controls groups it with what it modifies (the timeline)
+          AND frees the primary purple CTA so "Aprobar y generar" in
+          the parent header has no visual competitor. */}
       {audioUrl && (
         <div className="mb-4 flex items-center gap-3 px-3 py-2.5 rounded-card bg-surface-2/60 ring-1 ring-white/[0.05]" data-tour="editor-playbar">
           <button
@@ -1133,35 +1180,24 @@ export default function LyricsEditor({
           <span className="text-xs text-gray-500 tabular-nums shrink-0 w-10">
             {formatTime(duration)}
           </span>
+          {!syncMode && (
+            <button
+              data-tour="editor-sync-entry"
+              onClick={enterSyncMode}
+              title={t("editor.sync_cta_hint") || "Activá modo Sync y apretá Espacio cuando arranque cada línea"}
+              className="shrink-0 text-[11px] font-medium px-2.5 py-1 rounded-md bg-brand/10 text-brand-light
+                ring-1 ring-brand/20 hover:bg-brand/20 hover:ring-brand/30 transition-colors flex items-center gap-1.5"
+            >
+              <svg className="w-3 h-3" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
+                <circle cx="12" cy="12" r="9" />
+                <path d="M12 7v5l3 2" strokeLinecap="round" />
+              </svg>
+              {t("editor.sync_enter_compact") || "Modo Sync"}
+            </button>
+          )}
           <span className="hidden sm:inline text-[10px] text-gray-600 ml-1 shrink-0">
             <kbd className="px-1.5 py-0.5 rounded bg-surface-3/60 ring-1 ring-white/[0.05]">space</kbd>
           </span>
-        </div>
-      )}
-
-      {/* ─── Tap-to-sync entry / active panel ────────────────────── */}
-      {audioUrl && !syncMode && (
-        <div className="mb-3 px-3 py-2.5 rounded-card bg-surface-2/40 ring-1 ring-white/[0.04] flex items-center gap-3">
-          <svg className="w-4 h-4 text-ink-secondary shrink-0" fill="none" stroke="currentColor" strokeWidth="1.8" viewBox="0 0 24 24">
-            <circle cx="12" cy="12" r="9" />
-            <path d="M12 7v5l3 2" strokeLinecap="round" />
-          </svg>
-          <div className="flex-1 min-w-0">
-            <p className="text-[12px] text-white font-medium leading-tight">
-              {t("editor.sync_cta_title") || "¿Necesitás ajustar los tiempos?"}
-            </p>
-            <p className="text-[10px] text-gray-500 leading-tight mt-0.5">
-              {t("editor.sync_cta_hint") || "Activá modo Sync y apretá Espacio cuando arranque cada línea"}
-            </p>
-          </div>
-          <button
-            data-tour="editor-sync-entry"
-            onClick={enterSyncMode}
-            className="shrink-0 text-[11px] font-medium px-3 py-1.5 rounded-lg bg-brand/15 text-brand-light
-              ring-1 ring-brand/30 hover:bg-brand/25 transition-colors"
-          >
-            {t("editor.sync_enter") || "Activar modo Sync"}
-          </button>
         </div>
       )}
 
@@ -1321,24 +1357,26 @@ export default function LyricsEditor({
                 }),
               );
             };
+            // Stripe variant (2026-05-16): demoted from full amber fill
+            // to a left-border accent + small text. The cause requires
+            // operator decision but isn't a critical alert — it's one
+            // suggestion among others. Reducing the visual weight stops
+            // it from competing with the consolidated auto-fix panel
+            // above.
             return (
-              <div className="mb-3 px-3 py-2.5 rounded-card bg-amber-500/[0.07] ring-1 ring-amber-500/25 flex items-center gap-3 animate-fade-in">
-                <svg className="w-4 h-4 text-amber-400 shrink-0" fill="none" stroke="currentColor" strokeWidth="1.8" viewBox="0 0 24 24">
-                  <circle cx="12" cy="12" r="10" />
-                  <path d="M12 8v4M12 16h.01" strokeLinecap="round" />
-                </svg>
-                <p className="text-xs text-ink-secondary flex-1">
+              <div className="mb-2 pl-3 pr-3 py-1.5 border-l-2 border-amber-500/60 flex items-center gap-2 animate-fade-in">
+                <p className="text-[11px] text-ink-secondary flex-1 leading-relaxed">
                   {t("editor.first_line_misaligned") ||
                     "La primera línea parece estar en 0:00 pero la canción arranca más tarde."}{" "}
                   <span className="text-gray-500">
                     {t("editor.first_line_misaligned_hint") || "¿Moverla a"}{" "}
-                    <span className="font-mono text-amber-300">{formatTimestamp(suggested)}</span>?
+                    <span className="font-mono text-amber-300/90">{formatTimestamp(suggested)}</span>?
                   </span>
                 </p>
                 <button
                   onClick={fixFirstOnly}
-                  className="shrink-0 text-[11px] font-medium px-3 py-1.5 rounded-lg bg-amber-500/15 text-amber-300
-                    ring-1 ring-amber-500/30 hover:bg-amber-500/25 transition-colors"
+                  className="shrink-0 text-[10px] font-medium px-2 py-0.5 rounded text-amber-300 hover:text-amber-200
+                    hover:bg-amber-500/10 transition-colors"
                 >
                   {t("editor.first_line_fix") || "Mover sólo línea 1"}
                 </button>
@@ -1355,32 +1393,13 @@ export default function LyricsEditor({
           off" case. Whisper's per-segment timestamps can drift by 200-
           800 ms (codec lag, intro silence, etc.); rather than nudging
           every line manually, the operator shifts the entire timeline.
-          Collapsed by default — opens when user clicks the toggle.   */}
-      <div className="mb-3">
-        {/* Bulk trim banner — only when there are long lines that would
-            benefit. Each click is one undo-able operation. Useful when
-            re-editing an old job that pre-dates the auto-trim feature. */}
-        {longSegCount > 0 && (
-          <button
-            onClick={trimAllLongSegs}
-            className="w-full mb-2 flex items-center justify-between px-3 py-2 rounded-card bg-amber-500/[0.08] ring-1 ring-amber-500/25 hover:ring-amber-500/40 text-xs text-amber-200 hover:text-amber-100 transition-colors"
-            title="Aplica el cap dinámico (V2) a las líneas marcadas. Cada línea se acorta a su duración estimada de voz."
-          >
-            <span className="flex items-center gap-2">
-              <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
-                <circle cx="6" cy="6" r="3" />
-                <circle cx="6" cy="18" r="3" />
-                <path d="M20 4L8.12 15.88M14.47 14.48L20 20M8.12 8.12L12 12" />
-              </svg>
-              {(t("editor.trim_all_long_label") ||
-                "Recortar {n} líneas con texto colgado").replace("{n}", longSegCount)}
-            </span>
-            <span className="text-[10px] text-amber-300/70">
-              {t("editor.trim_all_long_hint") || "voz termina antes que el silencio"}
-            </span>
-          </button>
-        )}
+          Collapsed by default — opens when user clicks the toggle.
 
+          The bulk-trim button that used to live in this wrapper was
+          moved (2026-05-16) into the consolidated auto-fix panel near
+          the top of the editor so the operator sees ONE "system can
+          fix N things" action instead of a standalone amber alert. */}
+      <div className="mb-3">
         <button
           onClick={() => setShiftPanelOpen((v) => !v)}
           className="w-full flex items-center justify-between px-3 py-2 rounded-card bg-surface-2/40 ring-1 ring-white/[0.04] hover:ring-white/[0.08] text-xs text-gray-300 hover:text-white transition-colors"
@@ -1389,7 +1408,7 @@ export default function LyricsEditor({
             <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
               <path d="M8 7h12M8 12h12M8 17h12M4 7h.01M4 12h.01M4 17h.01" />
             </svg>
-            {t("editor.shift_panel_title") || "Mover toda la canción"}
+            {t("editor.shift_panel_title") || "Ajustes avanzados de timing"}
           </span>
           <svg
             className={`w-3.5 h-3.5 transition-transform ${shiftPanelOpen ? "rotate-180" : ""}`}
