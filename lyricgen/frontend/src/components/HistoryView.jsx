@@ -1,7 +1,6 @@
 import { useState, useMemo, useEffect } from "react";
 import { useI18n } from "../i18n";
 import { useMediaUrl } from "../mediaUrl";
-import ProResBadge from "./ProResBadge";
 
 const API = import.meta.env.VITE_API_URL || "";
 
@@ -190,11 +189,14 @@ function VideoCard({ job, onSelect, onDelete, selected, onToggleSelect, t }) {
       <div className="px-3.5 py-3">
         <div className="flex items-start gap-2 min-w-0">
           <p className="text-[13px] font-medium text-white truncate flex-1 min-w-0">{songName || "Sin nombre"}</p>
-          <ProResBadge
-            deliveryProfile={job.delivery_profile}
-            proresReady={job.prores_ready}
-            jobStatus={job.status}
-          />
+          {/* ProResBadge intentionally NOT rendered here — it competes
+              with StatusBadge ("Listo") on the thumbnail and reads as a
+              contradictory status to the operator ("Listo" + "Generando
+              ProRes…" at the same time = confusing). The ProRes prewarm
+              is operational (caching for fast UMG download), not user-
+              actionable from the list view. JobDetail surfaces ProRes
+              state next to the download buttons, which is where it's
+              relevant (the next click depends on it). */}
         </div>
         <p className="text-[11px] text-gray-500 truncate mt-0.5">
           {artistName}
