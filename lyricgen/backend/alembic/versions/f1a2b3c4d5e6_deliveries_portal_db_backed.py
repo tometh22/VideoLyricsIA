@@ -32,7 +32,6 @@ from typing import Sequence, Union
 
 import sqlalchemy as sa
 from alembic import op
-from sqlalchemy.dialects.postgresql import JSONB
 
 
 revision: str = "f1a2b3c4d5e6"
@@ -89,7 +88,7 @@ def upgrade() -> None:
         sa.Column("id", sa.Integer(), primary_key=True, autoincrement=True),
         sa.Column("job_id", sa.String(length=12), nullable=False),
         sa.Column("label", sa.String(length=120), nullable=False, server_default="Renderizado"),
-        sa.Column("file_types", JSONB(), nullable=False),
+        sa.Column("file_types", sa.JSON(), nullable=False),
         sa.Column("artist_snapshot", sa.String(length=255), nullable=False),
         sa.Column("song_title_snapshot", sa.String(length=500), nullable=False),
         sa.Column("tenant_snapshot", sa.String(length=100), nullable=False),
@@ -149,7 +148,7 @@ def upgrade() -> None:
                     artist_snapshot, song_title_snapshot, tenant_snapshot,
                     frame_size_snapshot, added_by_user_id, added_at
                 ) VALUES (
-                    :job_id, :label, CAST(:file_types AS JSONB),
+                    :job_id, :label, :file_types,
                     :artist_snapshot, :song_title_snapshot, :tenant_snapshot,
                     :frame_size_snapshot, :added_by_user_id, :added_at
                 )
