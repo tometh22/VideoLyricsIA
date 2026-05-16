@@ -523,6 +523,46 @@ class Delivery(Base):
         }
 
 
+class DeliveryChangeRequest(Base):
+    # Free-form change requests UMG (or any portal user) leaves on a
+    # specific delivery version. UI affordance: "Solicitar cambios"
+    # button on the song detail modal opens a textarea; submit lands here.
+    # The operator picks them up in the GenLy admin, acts on them
+    # (re-render, edit lyrics, etc.), and marks them resolved.
+    __tablename__ = "delivery_change_requests"
+    __table_args__ = (
+        Index("ix_dcr_pending", "resolved_at", "submitted_at"),
+    )
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    delivery_id = Column(
+        Integer, ForeignKey("deliveries.id"), nullable=False, index=True,
+    )
+    # Free text. Capped at 5000 chars by the endpoint (not the column)
+    # so we can relax the limit later without a migration.
+    comment = Column(Text, nullable=False)
+    submitted_at = Column(
+        DateTime(timezone=True), default=utcnow, nullable=False,
+    )
+    # Set when the operator marks the request handled (re-rendered,
+    # edited, dismissed). Null = still pending.
+    resolved_at = Column(DateTime(timezone=True), nullable=True)
+    resolved_by_user_id = Column(
+        Integer, ForeignKey("users.id"), nullable=True,
+    )
+    resolution_note = Column(Text, nullable=True)
+
+    def to_dict(self):
+        return {
+            "id": self.id,
+            "delivery_id": self.delivery_id,
+            "comment": self.comment,
+            "submitted_at": self.submitted_at.isoformat() if self.submitted_at else None,
+            "resolved_at": self.resolved_at.isoformat() if self.resolved_at else None,
+            "resolution_note": self.resolution_note,
+        }
+
+
 class Invoice(Base):
     __tablename__ = "invoices"
 

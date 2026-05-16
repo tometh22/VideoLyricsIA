@@ -71,7 +71,8 @@ from datetime import datetime, timedelta, timezone
 
 from database import (
     Job, User, UserSettings, AuditLog, APIKey, get_db, init_db,
-    BackgroundAsset, AssetUsage, Delivery, scoped_db, pool_stats,
+    BackgroundAsset, AssetUsage, Delivery, DeliveryChangeRequest,
+    scoped_db, pool_stats,
 )
 from jobs import bulk_delete_jobs, create_job, delete_job, get_job, get_all_jobs, update_job
 from observability import init_sentry, init_logging, health_snapshot
@@ -5905,6 +5906,60 @@ async def portal_delete_delivery(
     return _soft_delete_delivery(db, delivery_id, actor_user_id=None)
 
 
+@app.post("/api/deliveries/{delivery_id}/change-request")
+async def portal_submit_change_request(
+    delivery_id: int,
+    body: dict,
+    x_portal_token: str | None = Header(default=None, alias="X-Portal-Token"),
+    db: Session = Depends(get_db),
+):
+    """Portal user (UMG) submits a free-form comment asking for changes
+    on a specific delivery. Operator picks it up in the GenLy admin.
+
+    Body: {"comment": "<text>"}.
+
+    Auth via X-Portal-Token (same shared password as the rest of /api).
+    """
+    _verify_portal_token(x_portal_token)
+    comment = (body.get("comment") or "").strip() if isinstance(body, dict) else ""
+    if not comment:
+        raise HTTPException(status_code=400, detail="El comentario no puede estar vacío.")
+    # Cap at 5000 chars — generous for paragraph-style feedback but
+    # stops a runaway client from filling the table with megabytes.
+    if len(comment) > 5000:
+        raise HTTPException(
+            status_code=400,
+            detail="El comentario es demasiado largo (máximo 5000 caracteres).",
+        )
+    delivery = (
+        db.query(Delivery)
+        .filter(Delivery.id == delivery_id)
+        .filter(Delivery.removed_at.is_(None))
+        .first()
+    )
+    if not delivery:
+        raise HTTPException(status_code=404, detail="Delivery no encontrada.")
+    cr = DeliveryChangeRequest(
+        delivery_id=delivery_id,
+        comment=comment,
+    )
+    db.add(cr)
+    db.add(AuditLog(
+        user_id=None,
+        action="delivery.change_request.create",
+        detail={
+            "delivery_id": delivery_id,
+            "job_id": delivery.job_id,
+            "artist": delivery.artist_snapshot,
+            "song": delivery.song_title_snapshot,
+            "comment_preview": comment[:200],
+        },
+    ))
+    db.commit()
+    db.refresh(cr)
+    return {"ok": True, "id": cr.id, "submitted_at": cr.submitted_at.isoformat()}
+
+
 @app.get("/api/deliveries/meta")
 async def portal_get_meta(
     x_portal_token: str | None = Header(default=None, alias="X-Portal-Token"),
@@ -5986,6 +6041,27 @@ async def portal_get_items(
             for k, v in pool.map(_head_size, head_jobs):
                 size_map[k] = v
 
+    # Bulk-fetch change requests for all visible deliveries in one query
+    # (avoid N+1). Group into {delivery_id: [requests]} so the per-version
+    # loop below can attach them without another DB round-trip.
+    cr_map: dict[int, list[dict]] = {}
+    if deliveries:
+        delivery_ids = [d.id for d in deliveries]
+        crs = (
+            db.query(DeliveryChangeRequest)
+            .filter(DeliveryChangeRequest.delivery_id.in_(delivery_ids))
+            .order_by(DeliveryChangeRequest.submitted_at.desc())
+            .all()
+        )
+        for cr in crs:
+            cr_map.setdefault(cr.delivery_id, []).append({
+                "id": cr.id,
+                "comment": cr.comment,
+                "submitted_at": cr.submitted_at.isoformat() if cr.submitted_at else None,
+                "resolved_at": cr.resolved_at.isoformat() if cr.resolved_at else None,
+                "resolution_note": cr.resolution_note,
+            })
+
     # Group by (artist, song). Within each group, versions stay in
     # added_at order (oldest first), matching how items.json reads.
     songs: dict[tuple[str, str], dict] = {}
@@ -6025,6 +6101,7 @@ async def portal_get_items(
                 preview_url = storage.generate_signed_url(r2_key, expiry_seconds=_DELIVERY_URL_EXPIRY_S)
             elif ft == "short" and url is not None:
                 short_preview_url = storage.generate_signed_url(r2_key, expiry_seconds=_DELIVERY_URL_EXPIRY_S)
+        change_requests = cr_map.get(d.id, [])
         bucket["versions"].append({
             "delivery_id": d.id,
             "job_id": d.job_id,
@@ -6033,6 +6110,10 @@ async def portal_get_items(
             "files": files,
             "preview_url": preview_url,
             "short_preview_url": short_preview_url,
+            "change_requests": change_requests,
+            "pending_change_requests": sum(
+                1 for cr in change_requests if cr.get("resolved_at") is None
+            ),
         })
 
     return {
