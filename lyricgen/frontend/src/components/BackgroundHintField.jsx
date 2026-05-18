@@ -13,13 +13,20 @@ import { useI18n } from "../i18n";
  *   value      — string (controlled)
  *   onChange   — fn(newValue)
  *   disabled   — boolean
- *   maxLength  — opcional, default 300 (mismo que EditJobRequest backend)
+ *   maxLength  — opcional, default 2000 (mismo que EditJobRequest backend).
+ *                Bump 300→2000 (2026-05-18): los modelos de imagen/video
+ *                rinden mejor con prompts detallados que permitan negaciones
+ *                redundantes ("no cars, no traffic, no people, no vehicles…")
+ *                y especificación granular de cámara y atmósfera. 300 chars
+ *                obligaba al operador a sacrificar negaciones que son críticas
+ *                para evitar bias del modelo (Veo mete autos sin que se los
+ *                pidas si no negás explícito varias veces).
  */
 export default function BackgroundHintField({
   value,
   onChange,
   disabled = false,
-  maxLength = 300,
+  maxLength = 2000,
 }) {
   const { t } = useI18n();
   return (
