@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import { useI18n } from "../i18n";
 import BackgroundHintField from "./BackgroundHintField";
+import ContentValidationToggle from "./ContentValidationToggle";
 
 const API = import.meta.env.VITE_API_URL || "";
 
@@ -33,6 +34,10 @@ export default function VariantCreateModal({ job, onClose, onCreated }) {
   const initialConcept = job?.render_params?.concept || "";
   const [backgroundHint, setBackgroundHint] = useState("");
   const [concept, setConcept] = useState(initialConcept);
+  // Operator override of content_validator (UMG Guideline 15). Same flag
+  // as EditRequestPanel — default OFF, opt-in for concepts that require
+  // content the validator normally rejects (e.g. hands as subject).
+  const [bypassContentValidation, setBypassContentValidation] = useState(false);
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState(null);
   // Guard sincrónico contra doble click (mismo patrón que EditRequestPanel
@@ -56,6 +61,11 @@ export default function VariantCreateModal({ job, onClose, onCreated }) {
     const conceptTrimmed = concept.trim();
     if (conceptTrimmed && conceptTrimmed !== initialConcept.trim()) {
       payload.concept = conceptTrimmed;
+    }
+    // Bypass flag: send only when ON. The Pydantic default is false so
+    // omitting matches the default behavior on older backends.
+    if (bypassContentValidation) {
+      payload.bypass_content_validation = true;
     }
 
     try {
@@ -141,6 +151,12 @@ export default function VariantCreateModal({ job, onClose, onCreated }) {
             {concept.length}/2000
           </p>
         </div>
+
+        <ContentValidationToggle
+          value={bypassContentValidation}
+          onChange={setBypassContentValidation}
+          disabled={submitting}
+        />
 
         <div className="p-3 rounded-xl bg-accent/[0.06] ring-1 ring-accent/25">
           <p className="text-xs text-white font-medium mb-1">
