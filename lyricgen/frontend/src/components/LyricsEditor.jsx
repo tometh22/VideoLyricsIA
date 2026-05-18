@@ -942,11 +942,43 @@ export default function LyricsEditor({
   // missing lyrics into the text input, then tap-syncs it.
   const addBlankLine = () => {
     setEdited((prev) => {
+      // Insert the new line at the audio playhead — that's where the
+      // operator is listening when they realise something's missing
+      // (typical case: a chorus repetition the pipeline collapsed,
+      // or a verse Whisper skipped). The previous behaviour pinned
+      // every new line to `last.end + 0.5`, so click "Agregar línea"
+      // at 1:23 of a song and the row appeared at the END of the
+      // editor with the wrong timestamp. SPACE then clamped it to
+      // an already-wrong neighbour bound.
+      //
+      // Fallback when currentTime is 0 (audio not playing yet) or out
+      // of the song's range: drop the new line after the last existing
+      // one, same as before. That way the wizard's first "add line"
+      // on a fresh job (before pressing play) doesn't land at 0:00
+      // pegado al primer segment.
+      // Note: we do NOT subtract AUDIO_LATENCY_COMPENSATION_S here.
+      // tapAnchor compensates because the operator is reacting to
+      // *heard* audio while the playhead has decoded ~80 ms ahead. But
+      // "Add line at playhead" is an explicit click — they want the
+      // segment to start where the cursor is, not 80 ms before.
+      const playhead = currentTime > 0 ? Math.max(0, currentTime) : 0;
       const last = prev[prev.length - 1];
-      const baseStart = last ? Math.min(duration || last.end + 2, last.end + 0.5) : 0;
-      const baseEnd = Math.min(duration || baseStart + 3, baseStart + 3);
+      const lastEnd = last ? last.end : 0;
+      const baseStart = playhead > 0
+        ? Math.min(playhead, duration ? duration - 0.5 : playhead)
+        : Math.min(duration || lastEnd + 2, lastEnd + 0.5);
+      const segDur = 3;
+      const baseEnd = Math.min(
+        duration || baseStart + segDur,
+        baseStart + segDur,
+      );
       const nextId = prev.reduce((m, s) => Math.max(m, s._id), -1) + 1;
-      return [...prev, { _id: nextId, start: baseStart, end: baseEnd, text: "" }];
+      const inserted = { _id: nextId, start: baseStart, end: baseEnd, text: "" };
+      // Keep `edited` sorted by start so syncCursor / neighbour clamp /
+      // /save-segments autosave all see a monotonic timeline. The
+      // backend also sorts (#184) but doing it here keeps the UI's
+      // immediate render consistent without waiting for a round-trip.
+      return [...prev, inserted].sort((a, b) => a.start - b.start);
     });
   };
 
