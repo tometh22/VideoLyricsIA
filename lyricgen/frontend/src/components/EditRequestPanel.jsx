@@ -158,25 +158,47 @@ export default function EditRequestPanel({
   // Map raw backend HTTPException details to friendly Spanish copy. If
   // the backend message doesn't match a known prefix we fall through to
   // the original `data.detail` so nothing gets swallowed silently.
+  //
+  // CRITICAL: this function MUST always return a string (or null). React
+  // crashes with "Objects are not valid as a React child" (error #31)
+  // when the returned value is rendered as `{error}` in JSX. Pydantic v2
+  // returns `detail` as an array of {type, loc, msg, input} objects on
+  // 422 — the prior version returned `raw` unchanged for non-strings,
+  // which bombed the whole edit panel into the error boundary screen
+  // (incident 2026-05-18, prod outage after #192 bump to 2000 chars).
   const translateBackendError = (raw) => {
-    if (typeof raw !== "string") return raw;
-    if (raw.startsWith("No cached background available")) {
+    if (raw == null) return null;
+    // Coerce any backend shape to a single user-facing string first.
+    let str;
+    if (typeof raw === "string") {
+      str = raw;
+    } else if (Array.isArray(raw)) {
+      // Pydantic v2 422 shape — surface the msg(s) joined.
+      str = raw
+        .map((e) => (e && typeof e === "object" && e.msg) ? e.msg : String(e))
+        .join("; ");
+    } else if (typeof raw === "object") {
+      str = raw.msg || raw.detail || JSON.stringify(raw);
+    } else {
+      str = String(raw);
+    }
+    if (str.startsWith("No cached background available")) {
       return t("edit.error_no_bg_cache") ||
         "Este video no tiene un fondo cacheado para reusar. Regenerá el fondo primero (cuesta ~US$0.90).";
     }
-    if (raw.startsWith("Job must be in pending_review")) {
+    if (str.startsWith("Job must be in pending_review")) {
       return t("edit.error_wrong_status") ||
         "Esta regeneración ya está en marcha o el video pasó a otro estado.";
     }
-    if (raw.startsWith("Maximum edit limit")) {
+    if (str.startsWith("Maximum edit limit")) {
       return t("edit.error_limit_reached") ||
         "Alcanzaste el límite de 3 regeneraciones para este video.";
     }
-    if (raw.startsWith("Lyrics edit requires") || raw.startsWith("Job has no persisted")) {
+    if (str.startsWith("Lyrics edit requires") || str.startsWith("Job has no persisted")) {
       return t("edit.error_no_segments") ||
         "Este video no tiene letras guardadas para editar. Subí la canción de nuevo.";
     }
-    return raw;
+    return str;
   };
 
   // Only send the fields the operator actually changed — the backend
