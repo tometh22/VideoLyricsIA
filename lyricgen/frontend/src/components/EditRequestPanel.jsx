@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import { useI18n } from "../i18n";
 import BackgroundHintField from "./BackgroundHintField";
+import ContentValidationToggle from "./ContentValidationToggle";
 import LyricsEditor from "./LyricsEditor";
 
 const API = import.meta.env.VITE_API_URL || "";
@@ -98,6 +99,13 @@ export default function EditRequestPanel({
   // Operator picks via the segmented toggle inside the background panel.
   // Default "veo" preserves the prior behavior of every edit pre-2026-05-16.
   const [backgroundMode, setBackgroundMode] = useState("veo");
+  // Operator override of content_validator (UMG Guideline 15). Default
+  // false = run validator. When true, the worker skips _validate_fn
+  // entirely and renders even if the AI generated hands/faces/logos as
+  // subject. Used for concepts where the flagged content IS the song's
+  // visual identity (rock guitarist hands, etc.). Operator owns the
+  // downstream UMG-rejection risk; we log the bypass in validation_result.
+  const [bypassContentValidation, setBypassContentValidation] = useState(false);
   // Latest segments from the nested LyricsEditor (updated synchronously
   // on every edit via `onEditedChange`). Held in a ref so buildPayload
   // can read it without re-renders. Used to include the operator's
@@ -222,6 +230,12 @@ export default function EditRequestPanel({
       // ships, dropping the check is safe but adds zero value.
       if (backgroundMode && backgroundMode !== "veo") {
         p.background_mode = backgroundMode;
+      }
+      // Forward bypass flag ONLY when ON (default is false on the backend
+      // Pydantic side, so omitting it is identical to sending false but
+      // shorter and friendlier to older API versions during a deploy window).
+      if (bypassContentValidation) {
+        p.bypass_content_validation = true;
       }
       if (latestEditedSegments.current && latestEditedSegments.current.length > 0) {
         p.segments = latestEditedSegments.current;
@@ -831,6 +845,12 @@ export default function EditRequestPanel({
           <BackgroundHintField
             value={backgroundHint}
             onChange={setBackgroundHint}
+            disabled={submitting}
+          />
+
+          <ContentValidationToggle
+            value={bypassContentValidation}
+            onChange={setBypassContentValidation}
             disabled={submitting}
           />
 
