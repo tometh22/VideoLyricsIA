@@ -218,6 +218,25 @@ export default function LyricsEditor({
   );
   const [isDirty, setIsDirty] = useState(false);
 
+  // Re-seed `edited` whenever the parent hands us a different `segments`
+  // reference. The initial useState above only runs once on mount —
+  // without this effect, a parent that re-uses the same editor across
+  // jobs (e.g. JobDetail's /edit modal swapping between two jobs in
+  // the same session, or a forced refresh that re-fetches segments_json
+  // after autosave landed) keeps showing the stale first-mount array.
+  // Compared by reference, not deep-equal: the parent owns the array
+  // identity, so a new prop reference = "you should reset". This is the
+  // standard "controlled-vs-uncontrolled" reset pattern used by inputs
+  // that need to track a parent's source of truth across remounts.
+  // Bug B7 from 2026-05-18 audit.
+  const prevSegmentsRef = useRef(segments);
+  useEffect(() => {
+    if (prevSegmentsRef.current === segments) return;
+    prevSegmentsRef.current = segments;
+    setEdited(segments.map((s, i) => ({ ...s, _id: i })));
+    setIsDirty(false);
+  }, [segments]);
+
   // Warn browser on tab-close / external navigation when there are unsaved edits.
   // disableBeforeUnload skips this for the post-approval modal — closing
   // the modal already IS the explicit "discard" gesture, a native confirm
