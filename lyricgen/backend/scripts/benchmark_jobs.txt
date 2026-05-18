@@ -1,0 +1,15 @@
+# One job_id per line. Lines starting with `#` are ignored.
+#
+# These should be jobs in PROD that the operator approved or hand-corrected
+# to the point where job.segments_json is the "truth" for that song.
+# Both text and timing should match what UMG was happy to ship.
+#
+# How to populate:
+#   1. Go to prod admin, find 5-10 jobs you trust as ground-truth.
+#   2. Copy each job_id (12-char hex) into a line below.
+#   3. Run: python scripts/build_benchmark_dataset.py
+#
+# Example:
+# 05a6607348ff
+# 31a26d4a7955
+# 2a61cb272f68

@@ -1,0 +1,8 @@
+# Dev-only Python deps. Production never imports these.
+#
+# Install with:
+#     pip install -r requirements-dev.txt
+#
+# Currently used by:
+#     scripts/score_benchmark.py — WER computation against ground truth
+jiwer>=3.0

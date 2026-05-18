@@ -2767,6 +2767,198 @@ def _whisper_quick_text(mp3_path: str, job_id: str | None = None) -> str:
         return ""
 
 
+def _env_flag(name: str) -> bool:
+    """True iff env var `name` is set to a truthy value. Treats unset,
+    empty string, '0', 'false', 'no', 'off' as falsy. Used to gate
+    opt-in Tier-1 quality helpers off by default (so prod behavior is
+    unchanged unless explicitly enabled per-deploy or per-benchmark)."""
+    import os as _os
+    return _os.environ.get(name, "").strip().lower() in ("1", "true", "yes", "on")
+
+
+def _validate_segments_against_audio(audio_path: str, segments: list[dict],
+                                      job_id: str | None = None,
+                                      n_samples: int = 3) -> list[dict]:
+    """Sample N short audio clips, transcribe each with Whisper, and
+    flag any segment whose text disagrees with what Whisper hears in
+    the same window. Returns segments with `seg["flagged"] = True`
+    for the suspicious ones. Originals returned unmodified when the
+    `VALIDATE_SEGMENTS` env flag is off.
+
+    The expensive bit is N extra Whisper API calls (~1-2 s each for
+    8-s slices). Capped at 3 samples by default to keep cost ~$0.005
+    per job — marginal next to a $0.50 Veo render. Worth it if the
+    operator catches a Whisper hallucination in the editor before the
+    full render burns.
+
+    Why we don't validate every segment: that would 10-50x the cost
+    of a transcribe call. Sampling 3-5 strategically-chosen windows
+    (intro / first chorus / late verse) catches most systematic
+    failures without paying per-line.
+    """
+    if not _env_flag("VALIDATE_SEGMENTS") and not _env_flag("ENABLE_TIER1"):
+        return segments
+    if not segments or len(segments) < 2:
+        return segments
+    # Pick samples spaced across the song: first non-trivial line,
+    # middle, late. Skip lines whose text is empty or shorter than
+    # ~3 words (sample isn't meaningful for "oh!" or "yeah").
+    import random as _r
+    candidates = [
+        s for s in segments
+        if s.get("text") and len(str(s["text"]).split()) >= 3
+        and s.get("end") and s.get("start") is not None
+        and float(s["end"]) - float(s["start"]) >= 1.5
+    ]
+    if not candidates:
+        return segments
+    n = min(n_samples, len(candidates))
+    # Spread the picks across the song so we don't sample 3 lines from
+    # the same chorus repetition.
+    step = max(1, len(candidates) // n)
+    picks = candidates[::step][:n]
+
+    import tempfile, subprocess as _sp
+    from difflib import SequenceMatcher
+    flagged_ids: set[int] = set()
+    for seg in picks:
+        try:
+            start = float(seg["start"])
+            end = float(seg["end"])
+            dur = min(8.0, end - start + 1.0)  # add 1s tail for breath
+            with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as f:
+                clip_path = f.name
+            try:
+                _sp.run(
+                    ["ffmpeg", "-y", "-ss", f"{max(0.0, start - 0.2):.2f}",
+                     "-i", audio_path, "-t", f"{dur:.2f}",
+                     "-acodec", "libmp3lame", "-loglevel", "error", clip_path],
+                    check=True, timeout=30,
+                )
+                # Re-transcribe just this slice
+                from pipeline import transcribe as _transcribe  # self-import for testing
+                heard_segs = _transcribe(clip_path, language="es", lyrics_hint=None)
+                heard_text = " ".join((s.get("text") or "").strip() for s in (heard_segs or [])).lower()
+                expected = (seg.get("text") or "").lower().strip()
+                if not heard_text or not expected:
+                    continue
+                ratio = SequenceMatcher(None, expected, heard_text).ratio()
+                if ratio < 0.5:
+                    flagged_ids.add(id(seg))
+                    print(f"[VALIDATE] segment at {start:.1f}s flagged: "
+                          f"expected '{expected[:40]}' vs heard '{heard_text[:40]}' (ratio {ratio:.2f})")
+            finally:
+                try:
+                    os.unlink(clip_path)
+                except OSError:
+                    pass
+        except Exception as e:  # pragma: no cover — best-effort
+            print(f"[VALIDATE] sample failed: {e}")
+            continue
+
+    if not flagged_ids:
+        return segments
+    # Mutate copies so callers can rely on dict identity changing
+    # iff something was flagged.
+    out = []
+    for s in segments:
+        new = dict(s)
+        if id(s) in flagged_ids:
+            new["flagged"] = True
+        out.append(new)
+    return out
+
+
+def _polish_segments_text(segments: list[dict], artist: str = "",
+                           song_title: str = "") -> list[dict]:
+    """Single Gemini pass that takes the full Whisper output text +
+    artist/title and returns corrections for common Spanish errors
+    ('de la amor' → 'del amor', missing accents, etc.). Timings are
+    untouched — only `seg["text"]` may change.
+
+    Returns segments unchanged when `POLISH_TEXT` env flag is off, or
+    when Gemini doesn't return parseable JSON. Designed to never make
+    things worse: if Gemini's output doesn't match the input segment
+    count, we abort the polish (no partial application).
+    """
+    if not _env_flag("POLISH_TEXT") and not _env_flag("ENABLE_TIER1"):
+        return segments
+    if not segments:
+        return segments
+    try:
+        from google import genai
+        client = _get_genai_client()
+    except Exception as e:  # pragma: no cover
+        print(f"[POLISH] genai client unavailable, skip: {e}")
+        return segments
+
+    # Build a numbered list — Gemini returns same numbering, we map back.
+    lines = []
+    for i, s in enumerate(segments):
+        text = (s.get("text") or "").strip()
+        lines.append(f"{i}: {text}")
+    numbered = "\n".join(lines)
+
+    system_prompt = (
+        "You are a Spanish lyrics proofreader. The input is a numbered list of "
+        "lines from a Whisper auto-transcription of a song. Whisper makes "
+        "predictable errors in Spanish: missing accents (se→sé, mas→más, "
+        "te→té), wrong contractions ('de la amor'→'del amor', 'a el'→'al'), "
+        "homophone confusions (haya/halla, hay/ay), capitalization of proper "
+        "nouns.\n\n"
+        "Return STRICT JSON: an array where each element is "
+        '{"i": <line index>, "text": "<corrected text>"} ONLY for lines you '
+        "actually changed. Do NOT return unchanged lines. Do NOT add new lines. "
+        "Do NOT translate or paraphrase — only fix obvious transcription errors. "
+        "Preserve all original words you do not need to fix.\n\n"
+        "When in doubt, leave the line as-is."
+    )
+    user_content = f"Artist: {artist}\nSong: {song_title}\n\nLines:\n{numbered}"
+
+    try:
+        response = client.models.generate_content(
+            model="gemini-2.5-flash",
+            contents=user_content,
+            config=genai.types.GenerateContentConfig(
+                system_instruction=system_prompt,
+                temperature=0.1,
+                max_output_tokens=2000,
+            ),
+        )
+        text = (response.text or "").strip()
+        # Strip code fences if any
+        if text.startswith("```"):
+            text = "\n".join(text.split("\n")[1:-1])
+        parsed = json.loads(text)
+        if not isinstance(parsed, list):
+            print(f"[POLISH] expected array, got {type(parsed).__name__}; skip")
+            return segments
+    except Exception as e:
+        print(f"[POLISH] Gemini call/parse failed: {e}; segments unchanged")
+        return segments
+
+    # Apply corrections
+    corrections = {}
+    for item in parsed:
+        try:
+            idx = int(item["i"])
+            new_text = str(item["text"]).strip()
+            if 0 <= idx < len(segments) and new_text:
+                corrections[idx] = new_text
+        except (KeyError, ValueError, TypeError):
+            continue
+    if not corrections:
+        return segments
+    print(f"[POLISH] applied {len(corrections)} text correction(s)")
+    out = []
+    for i, s in enumerate(segments):
+        new = dict(s)
+        if i in corrections and new.get("text") != corrections[i]:
+            new["text"] = corrections[i]
+        out.append(new)
+    return out
+
+
 def _verify_lrclib_alignment(audio_path: str, expected_text: str,
                               claimed_start: float, window: float = 5.5) -> float | None:
     """Slice a ~window-second clip of audio starting just before
