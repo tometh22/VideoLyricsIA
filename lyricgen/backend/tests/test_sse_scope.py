@@ -33,9 +33,11 @@ def test_sse_emits_unauthorized_when_tenant_changes(client, user_token, db):
     job_id = uuid.uuid4().hex[:12]
     job = JobModel(
         job_id=job_id,
+        user_id=1,
         tenant_id=original_tenant,
         artist="Test",
         song_title="SSE Scope",
+        filename="test.mp3",
         status="processing",  # no-terminal — stream entra al poll loop
         delivery_profile="youtube",
         progress=20,

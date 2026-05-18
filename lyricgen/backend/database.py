@@ -507,6 +507,12 @@ class Delivery(Base):
     # an accidental delete from the portal would otherwise be unrecoverable.
     removed_at = Column(DateTime(timezone=True), nullable=True, index=True)
     removed_by_user_id = Column(Integer, ForeignKey("users.id"), nullable=True)
+    # Portal-side approval (set by UMG via the "Aprobar" button).
+    # approved_by_label is free-form because the portal authenticates via
+    # a shared password, not per-user — we record "UMG" by default and
+    # leave room for per-user portal logins to write usernames here later.
+    approved_at = Column(DateTime(timezone=True), nullable=True, index=True)
+    approved_by_label = Column(String(120), nullable=True)
 
     def to_dict(self):
         return {
@@ -520,6 +526,8 @@ class Delivery(Base):
             "frame_size": self.frame_size_snapshot,
             "added_at": self.added_at.isoformat() if self.added_at else None,
             "removed_at": self.removed_at.isoformat() if self.removed_at else None,
+            "approved_at": self.approved_at.isoformat() if self.approved_at else None,
+            "approved_by_label": self.approved_by_label,
         }
 
 
@@ -826,10 +834,13 @@ def init_db():
 
 
 def _migrate_user_columns():
-    """Add columns to the `users` table if they're missing. Postgres
-    supports `ADD COLUMN IF NOT EXISTS` natively (>= 9.6); SQLite has it
-    since 3.35. Wrapped in try/except per dialect quirk so a transient
-    failure here never aborts the whole init."""
+    """Add columns to the `users` table if they're missing.
+    Only runs on PostgreSQL — `create_all()` already creates the full
+    schema from scratch in SQLite (test) environments, so there are no
+    missing columns to patch. The `IF NOT EXISTS` / `JSONB` / `TIMESTAMPTZ`
+    syntax used here is PostgreSQL-specific anyway."""
+    if engine.dialect.name != "postgresql":
+        return
     from sqlalchemy import text
     column_adds = [
         "ALTER TABLE users ADD COLUMN IF NOT EXISTS allow_overage BOOLEAN DEFAULT FALSE NOT NULL",
@@ -872,6 +883,15 @@ def _migrate_user_columns():
         # run_edit_pipeline before _upload_deliverables_to_r2 so an operator
         # can roll back a bad re-sync — the {key}.vN object stays in R2.
         "ALTER TABLE jobs ADD COLUMN IF NOT EXISTS previous_versions JSONB",
+        # Portal-side approval state. Added 2026-05-18 to back the
+        # `POST /api/deliveries/{id}/approve` endpoint that the portal v3
+        # frontend was already calling against a 404 (the endpoint was
+        # missing from the backend, UMG saw "No se pudo aprobar: Not
+        # Found"). Two columns: approved_at (timestamp) and
+        # approved_by_label (free-form, defaults to "UMG").
+        "ALTER TABLE deliveries ADD COLUMN IF NOT EXISTS approved_at TIMESTAMPTZ",
+        "CREATE INDEX IF NOT EXISTS ix_deliveries_approved_at ON deliveries(approved_at)",
+        "ALTER TABLE deliveries ADD COLUMN IF NOT EXISTS approved_by_label VARCHAR(120)",
     ]
     # Each statement gets its own transaction. In Postgres, a failed statement
     # inside a transaction puts it in aborted state — subsequent execute()
@@ -881,7 +901,8 @@ def _migrate_user_columns():
     for sql in column_adds:
         try:
             with engine.begin() as conn:
-                conn.execute(text("SET LOCAL lock_timeout = '3s'"))
+                if engine.dialect.name == "postgresql":
+                    conn.execute(text("SET LOCAL lock_timeout = '3s'"))
                 conn.execute(text(sql))
         except Exception as e:  # pragma: no cover — dialect-specific
             print(f"[init_db] migrate skipped: {sql} → {e}")
@@ -909,7 +930,10 @@ def _migrate_user_columns():
 def _widen_column_to_text(table: str, column: str) -> None:
     """Run ALTER COLUMN TYPE TEXT only if the column is not already text.
     Skipping avoids an ACCESS EXCLUSIVE lock that would block during a
-    rolling deploy where the previous replica is still accepting requests."""
+    rolling deploy where the previous replica is still accepting requests.
+    No-op on non-PostgreSQL backends (SQLite uses dynamic typing)."""
+    if engine.dialect.name != "postgresql":
+        return
     from sqlalchemy import text
     try:
         with engine.connect() as conn:

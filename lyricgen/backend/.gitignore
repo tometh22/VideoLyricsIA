@@ -1,0 +1,7 @@
+.vercel
+.env*.local
+
+# Lyrics-quality benchmark dataset (downloaded audio + per-job outputs)
+# — too big for git, regenerated locally from prod DB via
+# scripts/build_benchmark_dataset.py
+benchmark/

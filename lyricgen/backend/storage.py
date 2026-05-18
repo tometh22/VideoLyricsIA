@@ -10,9 +10,12 @@ typically set S3_* env vars instead — those are accepted as fallbacks so
 the same compose file works for both R2 and any S3-compatible backend.
 """
 
+import logging
 import os
 import re
 from typing import Optional
+
+logger = logging.getLogger("genly.storage")
 
 
 def _env(*names: str) -> str:
@@ -81,9 +84,76 @@ def _get_client():
             retries={"max_attempts": 5, "mode": "adaptive"},
             connect_timeout=30,
             read_timeout=120,
+            # The deliveries portal listing fan-outs HEAD calls across a
+            # ThreadPoolExecutor(max_workers=16) (main.py portal_get_items).
+            # boto3's default urllib3 pool is 10 connections per host, so
+            # 16 workers caused "Connection pool is full, discarding
+            # connection" spam in production logs and stalled requests
+            # while urllib3 churned. 32 gives headroom for that fan-out
+            # plus the parallel multipart upload thread pool (20 workers
+            # per _transfer_config) without thrashing.
+            max_pool_connections=32,
         ),
     )
     return _client
+
+
+# Separate boto3 client dedicated to /health probes. Has its OWN urllib3
+# pool (2 connections) and aggressive timeouts so a probe can:
+#   1. Detect the main client's pool saturation — when the main pool is
+#      stuck, a probe on the shared client would also hang. This isolated
+#      client's HEAD completes (or fails fast) regardless.
+#   2. Fail in ≤3 s instead of the 30 s default — Railway's healthcheck
+#      probe times out at 5 s, so any check on the hot path must be well
+#      under that.
+_health_client = None
+
+
+def _get_health_client():
+    global _health_client
+    if _health_client is not None:
+        return _health_client
+    if not is_enabled():
+        return None
+    import boto3
+    from botocore.config import Config
+    _health_client = boto3.client(
+        "s3",
+        endpoint_url=R2_ENDPOINT_URL,
+        aws_access_key_id=R2_ACCESS_KEY_ID,
+        aws_secret_access_key=R2_SECRET_ACCESS_KEY,
+        config=Config(
+            signature_version="s3v4",
+            retries={"max_attempts": 0},  # /health must fail fast, not retry
+            connect_timeout=2,
+            read_timeout=3,
+            max_pool_connections=2,
+        ),
+    )
+    return _health_client
+
+
+def probe_r2() -> tuple[bool, int, str | None]:
+    """Live R2 reachability check for /health.
+
+    Does a head_bucket against R2_BUCKET via the isolated _health_client.
+    Returns (ok, elapsed_ms, error_msg). Total wall-clock is bounded by
+    connect_timeout + read_timeout (~5 s worst case).
+
+    Used by observability.health_snapshot to flag the API as degraded
+    when R2 is unreachable or slow (>1.5 s round-trip = pool churn or
+    network issue), even when nothing has crashed yet.
+    """
+    client = _get_health_client()
+    if client is None:
+        return False, 0, "not_configured"
+    import time as _time
+    t0 = _time.monotonic()
+    try:
+        client.head_bucket(Bucket=R2_BUCKET)
+        return True, int((_time.monotonic() - t0) * 1000), None
+    except Exception as e:
+        return False, int((_time.monotonic() - t0) * 1000), str(e)[:120]
 
 
 def _transfer_config():
@@ -151,7 +221,7 @@ def upload_master(local_path: str, tenant_id: str, job_id: str, filename: str) -
         ExtraArgs=extra, Config=_transfer_config(),
     )
     size_mb = os.path.getsize(local_path) / 1024 / 1024
-    print(f"[R2] Uploaded {key} ({size_mb:.1f} MB)")
+    logger.info("[R2] Uploaded %s (%.1f MB)", key, size_mb)
     return key
 
 
@@ -170,20 +240,33 @@ def upload_input(local_path: str, tenant_id: str, job_id: str, filename: str) ->
         Config=_transfer_config(),
     )
     size_mb = os.path.getsize(local_path) / 1024 / 1024
-    print(f"[R2] Uploaded input {key} ({size_mb:.1f} MB)")
+    logger.info("[R2] Uploaded input %s (%.1f MB)", key, size_mb)
     return key
 
 
 def object_exists(key: str) -> bool:
-    """Check whether an object exists at the given key. False on R2 disabled
-    or any error (treated as cache miss)."""
+    """Check whether an object exists at the given key.
+
+    Returns False when R2 is disabled or the object is not found (404).
+    For any other error (403, network timeout, credential failure) it logs
+    an error and returns False — callers treat a missing object as a cache
+    miss, so we degrade gracefully instead of propagating transient errors.
+    """
     client = _get_client()
     if client is None:
         return False
     try:
         client.head_object(Bucket=R2_BUCKET, Key=key)
         return True
-    except Exception:
+    except Exception as exc:
+        # boto3 / botocore raises ClientError for all HTTP-level errors.
+        # 404 / NoSuchKey → object absent (expected). Anything else (403,
+        # network timeout, credential failure) is a real problem we should
+        # surface in logs rather than silently treating as "not found".
+        code = (getattr(exc, "response", {}) or {}).get("Error", {}).get("Code", "")
+        if code in ("404", "NoSuchKey"):
+            return False
+        logger.error("object_exists check failed for key=%r: %s", key, exc)
         return False
 
 
@@ -212,10 +295,10 @@ def download_object(key: str, dest_path: str) -> bool:
     try:
         client.download_file(R2_BUCKET, key, dest_path)
         size_mb = os.path.getsize(dest_path) / 1024 / 1024
-        print(f"[R2] Downloaded {key} -> {dest_path} ({size_mb:.1f} MB)")
+        logger.info("[R2] Downloaded %s -> %s (%.1f MB)", key, dest_path, size_mb)
         return True
     except Exception as e:
-        print(f"[R2] Download failed for {key}: {e}")
+        logger.error("[R2] Download failed for %s: %s", key, e)
         return False
 
 
@@ -475,12 +558,19 @@ def multipart_complete(
     if client is None:
         return None
     sorted_parts = sorted(parts, key=lambda p: int(p["PartNumber"]))
-    client.complete_multipart_upload(
-        Bucket=R2_BUCKET,
-        Key=key,
-        UploadId=upload_id,
-        MultipartUpload={"Parts": sorted_parts},
-    )
+    try:
+        client.complete_multipart_upload(
+            Bucket=R2_BUCKET,
+            Key=key,
+            UploadId=upload_id,
+            MultipartUpload={"Parts": sorted_parts},
+        )
+    except Exception as exc:
+        logger.error(
+            "multipart_complete failed key=%r upload_id=%r: %s",
+            key, upload_id, exc, exc_info=True,
+        )
+        return None
     return key
 
 
@@ -497,7 +587,7 @@ def multipart_abort(key: str, upload_id: str) -> bool:
         )
         return True
     except Exception as e:
-        print(f"[R2] multipart_abort {key} {upload_id} failed: {e}")
+        logger.error("[R2] multipart_abort %s %s failed: %s", key, upload_id, e)
         return False
 
 
@@ -645,7 +735,11 @@ def delete_object(key: str) -> None:
     client = _get_client()
     if client is None:
         return
-    client.delete_object(Bucket=R2_BUCKET, Key=key)
+    try:
+        client.delete_object(Bucket=R2_BUCKET, Key=key)
+    except Exception as exc:
+        logger.error("delete_object failed for key=%r: %s", key, exc, exc_info=True)
+        raise
 
 
 def copy_object(src_key: str, dst_key: str) -> bool:
@@ -670,7 +764,7 @@ def copy_object(src_key: str, dst_key: str) -> bool:
         Key=dst_key,
         CopySource={"Bucket": R2_BUCKET, "Key": src_key},
     )
-    print(f"[R2] Copied {src_key} -> {dst_key}")
+    logger.info("[R2] Copied %s -> %s", src_key, dst_key)
     return True
 
 

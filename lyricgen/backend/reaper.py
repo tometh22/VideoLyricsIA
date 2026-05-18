@@ -396,13 +396,20 @@ def _delete_abandoned_transcribed(db: Session, job: Job) -> None:
             _sh.rmtree(local_dir, ignore_errors=True)
     except Exception as e:  # pragma: no cover
         logger.debug(f"reaper: local dir cleanup failed for {job_id}: {e}")
+    # Cancel any stale RQ entry (best-effort, consistent with the other
+    # cleanup paths in this file).
+    try:
+        from queue_jobs import cancel_rq_job
+        cancel_rq_job(job_id)
+    except Exception as e:  # pragma: no cover
+        logger.debug("reaper: cancel_rq_job failed for %s: %s", job_id, e)
     # R2 object (best-effort; failure is fine — orphan stays for next sweep).
     if job.input_r2_key:
         try:
             import storage as _storage
             _storage.delete_object(job.input_r2_key)
         except Exception as e:  # pragma: no cover
-            logger.debug(f"reaper: R2 delete failed for {job_id}: {e}")
+            logger.debug("reaper: R2 delete failed for %s: %s", job_id, e)
     db.delete(job)
 
 
@@ -659,14 +666,20 @@ def _reap_all_stuck_inner(threshold_min: int) -> int:
         if abandoned or abandoned_uploads or abandoned_edits:
             db.commit()
             if abandoned:
-                print(f"[REAPER] cleaned up {len(abandoned)} abandoned "
-                      f"transcribed_pending job(s)")
+                logger.info(
+                    "[REAPER] cleaned up %d abandoned transcribed_pending job(s)",
+                    len(abandoned),
+                )
             if abandoned_uploads:
-                print(f"[REAPER] cleaned up {len(abandoned_uploads)} abandoned "
-                      f"awaiting_upload job(s)")
+                logger.info(
+                    "[REAPER] cleaned up %d abandoned awaiting_upload job(s)",
+                    len(abandoned_uploads),
+                )
             if abandoned_edits:
-                print(f"[REAPER] reverted {len(abandoned_edits)} abandoned "
-                      f"edit job(s) back to pending_review")
+                logger.info(
+                    "[REAPER] reverted %d abandoned edit job(s) back to pending_review",
+                    len(abandoned_edits),
+                )
         if not stuck and not orphans and not stalled:
             return 0
         for job in stuck:

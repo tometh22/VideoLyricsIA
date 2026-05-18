@@ -87,7 +87,7 @@ def _init_redis():
         _queue_enterprise = Queue("enterprise", connection=_redis)
         return _redis, _queue_default, _queue_enterprise
     except Exception as e:
-        print(f"[QUEUE] Redis init failed ({e}); falling back to threads")
+        logger.warning("[QUEUE] Redis init failed (%s); falling back to threads", e)
         return None, None, None
 
 

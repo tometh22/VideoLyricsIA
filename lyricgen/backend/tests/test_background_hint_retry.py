@@ -28,10 +28,10 @@ def test_quality_retry_propagates_background_hint():
     """
     src = inspect.getsource(pipeline._ensure_background)
 
-    # Find the retry block. The marker is the print statement that
+    # Find the retry block. The marker is the log statement that
     # announces the retry; everything between that and the `continue` is
     # the retry call.
-    retry_marker = "Score {score} < 7 — generating new prompt and retrying VEO"
+    retry_marker = "Score %s < 7 — generating new prompt and retrying VEO"
     retry_idx = src.find(retry_marker)
     assert retry_idx >= 0, (
         "Could not find the quality-retry block in _ensure_background. "

@@ -983,10 +983,18 @@ function LyricsEditModal({
                   console.warn("[EditRequestPanel] autosave failed", e);
                 }
               }}
-              // Synchronous mirror of the editor's current segments,
-              // captured into a ref so buildPayload can include them
-              // in /edit POSTs without racing the 3 s autosave debounce.
-              onEditedChange={(segs) => { latestEditedSegments.current = segs; }}
+              // Note: NO onEditedChange wired here. The ref it would
+              // mirror into (latestEditedSegments) is scoped to the
+              // EditRequestPanel component above, not to this
+              // LyricsEditModal. Referencing it here throws
+              // "Can't find variable: latestEditedSegments" the moment
+              // the operator opens the modal (incident 2026-05-17:
+              // prod admin couldn't open /edit lyrics at all). The
+              // ref isn't needed here anyway — LyricsEditModal submits
+              // via the explicit `onApprove(segments)` callback which
+              // receives the latest segments synchronously from the
+              // editor at click time; there is no race window like the
+              // 3 s autosave debounce path the ref was built for.
               submitLabel={
                 submitting
                   ? (t("edit.submitting") || "Aplicando...")

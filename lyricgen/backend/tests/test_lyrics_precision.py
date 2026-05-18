@@ -249,7 +249,7 @@ def test_edit_lyrics_accepted_on_terminal_video_states(
 
     captured = {}
 
-    def _stub_enqueue_edit(job_id, edit_type, edit_params, plan="100"):
+    def _stub_enqueue_edit(job_id, edit_type, edit_params, plan="100", **kwargs):
         captured.update({"job_id": job_id, "edit_type": edit_type, "edit_params": edit_params})
 
     monkeypatch.setattr("main.enqueue_edit", _stub_enqueue_edit)
@@ -369,7 +369,7 @@ def test_edit_lyrics_does_not_break_existing_typography_path(client, user_token,
 
     captured = {}
 
-    def _stub_enqueue_edit(job_id, edit_type, edit_params, plan="100"):
+    def _stub_enqueue_edit(job_id, edit_type, edit_params, plan="100", **kwargs):
         captured.update({"job_id": job_id, "edit_type": edit_type, "edit_params": edit_params})
 
     monkeypatch.setattr("main.enqueue_edit", _stub_enqueue_edit)
