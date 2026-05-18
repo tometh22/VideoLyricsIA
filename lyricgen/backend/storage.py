@@ -84,6 +84,15 @@ def _get_client():
             retries={"max_attempts": 5, "mode": "adaptive"},
             connect_timeout=30,
             read_timeout=120,
+            # The deliveries portal listing fan-outs HEAD calls across a
+            # ThreadPoolExecutor(max_workers=16) (main.py portal_get_items).
+            # boto3's default urllib3 pool is 10 connections per host, so
+            # 16 workers caused "Connection pool is full, discarding
+            # connection" spam in production logs and stalled requests
+            # while urllib3 churned. 32 gives headroom for that fan-out
+            # plus the parallel multipart upload thread pool (20 workers
+            # per _transfer_config) without thrashing.
+            max_pool_connections=32,
         ),
     )
     return _client
