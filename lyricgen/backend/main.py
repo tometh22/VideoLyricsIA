@@ -5934,6 +5934,96 @@ async def portal_submit_change_request(
     return {"ok": True, "id": cr.id, "submitted_at": cr.submitted_at.isoformat()}
 
 
+@app.post("/api/deliveries/{delivery_id}/approve")
+async def portal_approve_delivery(
+    delivery_id: int,
+    x_portal_token: str | None = Header(default=None, alias="X-Portal-Token"),
+    db: Session = Depends(get_db),
+):
+    """Portal user (UMG) approves a delivery via the "Aprobar" button.
+
+    Idempotent — a second click on an already-approved row returns the
+    existing timestamp instead of erroring. approved_by_label defaults
+    to "UMG" because the portal authenticates via a shared password
+    (no per-user identity); future portals with individual logins can
+    plumb the user identifier through here.
+
+    Auth: shared portal token (same envelope as the rest of /api).
+    """
+    _verify_portal_token(x_portal_token)
+    delivery = (
+        db.query(Delivery)
+        .filter(Delivery.id == delivery_id)
+        .filter(Delivery.removed_at.is_(None))
+        .first()
+    )
+    if not delivery:
+        raise HTTPException(status_code=404, detail="Delivery no encontrada.")
+    if delivery.approved_at is not None:
+        return {
+            "ok": True,
+            "already_approved": True,
+            "approved_at": delivery.approved_at.isoformat(),
+            "approved_by_label": delivery.approved_by_label,
+        }
+    delivery.approved_at = datetime.now(timezone.utc)
+    delivery.approved_by_label = "UMG"
+    db.add(AuditLog(
+        user_id=None,
+        action="delivery.approve",
+        detail={
+            "delivery_id": delivery_id,
+            "job_id": delivery.job_id,
+            "artist": delivery.artist_snapshot,
+            "song": delivery.song_title_snapshot,
+            "label": delivery.label,
+        },
+    ))
+    db.commit()
+    return {
+        "ok": True,
+        "approved_at": delivery.approved_at.isoformat(),
+        "approved_by_label": delivery.approved_by_label,
+    }
+
+
+@app.post("/api/deliveries/{delivery_id}/un-approve")
+async def portal_unapprove_delivery(
+    delivery_id: int,
+    x_portal_token: str | None = Header(default=None, alias="X-Portal-Token"),
+    db: Session = Depends(get_db),
+):
+    """Portal user undoes a previous approval. Clears approved_at and
+    approved_by_label so the row goes back to pending state on the
+    portal listing. Idempotent — calling on an unapproved row is a no-op.
+    """
+    _verify_portal_token(x_portal_token)
+    delivery = (
+        db.query(Delivery)
+        .filter(Delivery.id == delivery_id)
+        .filter(Delivery.removed_at.is_(None))
+        .first()
+    )
+    if not delivery:
+        raise HTTPException(status_code=404, detail="Delivery no encontrada.")
+    if delivery.approved_at is None:
+        return {"ok": True, "already_pending": True}
+    delivery.approved_at = None
+    delivery.approved_by_label = None
+    db.add(AuditLog(
+        user_id=None,
+        action="delivery.un_approve",
+        detail={
+            "delivery_id": delivery_id,
+            "job_id": delivery.job_id,
+            "artist": delivery.artist_snapshot,
+            "song": delivery.song_title_snapshot,
+        },
+    ))
+    db.commit()
+    return {"ok": True}
+
+
 @app.get("/api/deliveries/meta")
 async def portal_get_meta(
     x_portal_token: str | None = Header(default=None, alias="X-Portal-Token"),
@@ -6088,6 +6178,11 @@ async def portal_get_items(
             "pending_change_requests": sum(
                 1 for cr in change_requests if cr.get("resolved_at") is None
             ),
+            # Portal-side approval state. The portal hides Aprobar/
+            # Rechazar when approved_at is set and shows a green pill
+            # + "deshacer" link instead.
+            "approved_at": d.approved_at.isoformat() if d.approved_at else None,
+            "approved_by_label": d.approved_by_label,
         })
 
     return {
