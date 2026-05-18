@@ -157,6 +157,16 @@ app.add_middleware(SlowAPIMiddleware)
 # Local dev is permitted to fall back to wildcard *without* credentials.
 _cors_env = os.environ.get("CORS_ORIGINS", "").strip()
 _ALLOWED_ORIGINS = [o.strip() for o in _cors_env.split(",") if o.strip()]
+# Vercel git-branch deploys mint a new origin per branch (e.g.
+# https://genly-git-staging-tometh22s-projects.vercel.app, and the
+# same shape for every fix/foo branch). Maintaining an exact-match
+# allowlist for those is a moving target — every new branch breaks
+# staging until someone remembers to update CORS_ORIGINS. The regex
+# below is read from CORS_ORIGIN_REGEX and forwarded to Starlette's
+# CORSMiddleware as `allow_origin_regex`, so any origin that matches
+# the pattern is admitted in addition to the exact allowlist.
+# Empty (or unset) keeps the legacy exact-only behaviour.
+_cors_regex = os.environ.get("CORS_ORIGIN_REGEX", "").strip() or None
 
 if not _ALLOWED_ORIGINS and ENVIRONMENT == "production":
     # Railway-only safety net: if CORS_ORIGINS was not copied to the service,
@@ -180,11 +190,13 @@ if not _ALLOWED_ORIGINS and ENVIRONMENT == "production":
         )
         break
 
-if not _ALLOWED_ORIGINS:
+if not _ALLOWED_ORIGINS and not _cors_regex:
     if ENVIRONMENT == "production":
         raise RuntimeError(
-            "CORS_ORIGINS must be set explicitly in production. Set CORS_ORIGINS "
-            "or FRONTEND_URL/APP_URL/RAILWAY_PUBLIC_DOMAIN for safe fallback."
+            "CORS_ORIGINS or CORS_ORIGIN_REGEX must be set explicitly in "
+            "production. Set CORS_ORIGINS (exact allowlist) or "
+            "CORS_ORIGIN_REGEX (pattern), or FRONTEND_URL/APP_URL/"
+            "RAILWAY_PUBLIC_DOMAIN for safe fallback."
         )
     # Dev: wildcard origins, but DROP credentials so we don't accidentally
     # ship the same combo to production via env-var typo.
@@ -196,13 +208,16 @@ if not _ALLOWED_ORIGINS:
         allow_headers=["*"],
     )
 else:
-    app.add_middleware(
-        CORSMiddleware,
-        allow_origins=_ALLOWED_ORIGINS,
-        allow_credentials=True,
-        allow_methods=["*"],
-        allow_headers=["*"],
-    )
+    cors_kwargs = {
+        "allow_origins": _ALLOWED_ORIGINS,
+        "allow_credentials": True,
+        "allow_methods": ["*"],
+        "allow_headers": ["*"],
+    }
+    if _cors_regex:
+        cors_kwargs["allow_origin_regex"] = _cors_regex
+        logger.info("CORS regex enabled: %s", _cors_regex)
+    app.add_middleware(CORSMiddleware, **cors_kwargs)
 
 # --- Transient DB error retry middleware ---
 # Postgres on Railway occasionally drops idle pool connections in ways
@@ -4692,6 +4707,17 @@ async def save_segments(
                     status_code=400,
                     detail=f"segments[{i}] missing required key {k!r}",
                 )
+
+    # Sort by start ascending so downstream consumers (renderer, sync-mode
+    # neighbor clamp, lookup-by-cronological-position) can assume a
+    # monotonic timeline. The frontend editor can submit out-of-order
+    # arrays — e.g. when the operator clicks "Agregar línea" mid-song,
+    # the new line gets appended to the end of the React state array
+    # even though its `start` belongs in the middle. Without this sort,
+    # the next reload of the editor showed a jumbled list and the sync
+    # cursor / clamp logic referenced the wrong neighbors. Origin: Una
+    # Vez Más — Viejas Locas (agus.cafisi, 2026-05-18).
+    segs = sorted(segs, key=lambda s: float(s.get("start", 0) or 0))
 
     job.segments_json = segs
     touch_user_activity(db, job)

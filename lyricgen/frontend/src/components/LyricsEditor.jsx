@@ -218,6 +218,25 @@ export default function LyricsEditor({
   );
   const [isDirty, setIsDirty] = useState(false);
 
+  // Re-seed `edited` whenever the parent hands us a different `segments`
+  // reference. The initial useState above only runs once on mount —
+  // without this effect, a parent that re-uses the same editor across
+  // jobs (e.g. JobDetail's /edit modal swapping between two jobs in
+  // the same session, or a forced refresh that re-fetches segments_json
+  // after autosave landed) keeps showing the stale first-mount array.
+  // Compared by reference, not deep-equal: the parent owns the array
+  // identity, so a new prop reference = "you should reset". This is the
+  // standard "controlled-vs-uncontrolled" reset pattern used by inputs
+  // that need to track a parent's source of truth across remounts.
+  // Bug B7 from 2026-05-18 audit.
+  const prevSegmentsRef = useRef(segments);
+  useEffect(() => {
+    if (prevSegmentsRef.current === segments) return;
+    prevSegmentsRef.current = segments;
+    setEdited(segments.map((s, i) => ({ ...s, _id: i })));
+    setIsDirty(false);
+  }, [segments]);
+
   // Warn browser on tab-close / external navigation when there are unsaved edits.
   // disableBeforeUnload skips this for the post-approval modal — closing
   // the modal already IS the explicit "discard" gesture, a native confirm
@@ -257,21 +276,14 @@ export default function LyricsEditor({
     onEditedChange(cleaned);
   }, [edited, onEditedChange]);
 
-  // Debounced autosave to backend: every 3s after the last edit, persist
-  // the current segments to /jobs/{id}/save-segments. This bumps the
-  // reaper's last_user_activity_at anchor so long edit sessions don't get
-  // barre at the 30-min TTL (incident 2026-05-14 — Agus batch-edited 5
-  // lyrics for 90 min and all 5 jobs got reaped before "Crear videos").
-  // No-op when the parent didn't wire the callback (e.g. unit tests).
-  useEffect(() => {
-    if (!onPersistSegments || !transcribeJobId) return undefined;
-    if (!Array.isArray(edited) || edited.length === 0) return undefined;
-    const tid = setTimeout(() => {
-      const cleaned = edited.map(({ _id, ...rest }) => rest);
-      onPersistSegments(transcribeJobId, cleaned);
-    }, 3000);
-    return () => clearTimeout(tid);
-  }, [edited, transcribeJobId, onPersistSegments]);
+  // NOTE: a second debounced-autosave useEffect lived here, copy-pasted
+  // identically to the one above (line ~238). Removed 2026-05-18 —
+  // the duplicate (a) did not respect `disableAutosave`, and (b) raced
+  // its partner on every `edited` change, firing two POSTs in parallel
+  // every 3 s. If two edits landed inside the same debounce window the
+  // second response could overwrite the first with a stale payload.
+  // Agus reported edits not persisting after SPACE anchors; the race
+  // was the likely culprit. Keep the single autosave above.
 
   // ─── Audio sync ─────────────────────────────────────────────────────
   // Blob URL lifecycle must live in useEffect, not useMemo. useMemo is
@@ -478,17 +490,23 @@ export default function LyricsEditor({
     // AUDIO_LATENCY_COMPENSATION_S comment above.
     const rawStart = Math.max(0, currentTime - AUDIO_LATENCY_COMPENSATION_S);
 
-    // Clamp to neighbors so the timeline can't go non-monotonic. If the
-    // operator presses Space too late (after the next line has started)
-    // or too early (before the previous one ended), pin to the safe edge
-    // instead of producing overlapping segments that render as a flicker.
-    const prevSeg = syncCursor > 0 ? edited[syncCursor - 1] : null;
-    const nextSeg = syncCursor + 1 < edited.length ? edited[syncCursor + 1] : null;
-    const lowerBound = prevSeg ? prevSeg.end + MIN_GAP_S : 0;
-    const upperBound = nextSeg
-      ? nextSeg.start - MIN_GAP_S
-      : (duration && duration > 0 ? duration : Infinity);
-    const newStart = Math.max(lowerBound, Math.min(rawStart, upperBound));
+    // Honor the operator's intent: anchor at currentTime regardless of
+    // where this line currently sits in the array. The previous version
+    // clamped to `prevSeg.end + MIN_GAP_S` (where prevSeg was the line
+    // at array position syncCursor-1). For the typical "fill in missing
+    // chorus repetition" workflow — add line at end of array, then
+    // SPACE-anchor it to mid-song — that clamp pinned the new line at
+    // the END of the song instead of where the operator wanted it.
+    // (Una Vez Más — Viejas Locas, agus.cafisi 2026-05-18, bug B4.)
+    //
+    // Trade-off: timeline can momentarily be non-monotonic between
+    // tapAnchor and the post-mutation sort below. Render iterates
+    // `edited` (which gets sorted right after this setEdited), so the
+    // operator sees the line move to its new chronological slot.
+    // syncCursor advances by _id, not array index, so the next SPACE
+    // press lands on the line that was visually next BEFORE the move.
+    const upperBound = duration && duration > 0 ? duration : Infinity;
+    const newStart = Math.max(0, Math.min(rawStart, upperBound));
 
     const delta = newStart - target.start;
 
@@ -526,8 +544,17 @@ export default function LyricsEditor({
         delta,
       },
     ]);
-    setEdited((prev) =>
-      prev.map((s, i) => {
+    // Compute next-chronological-line identity BEFORE we mutate, so we
+    // can advance syncCursor to the same line the operator was about
+    // to anchor next, even if the mutation re-sorts the array. Falls
+    // back to "stay on the current line if it ended up last" — sync
+    // mode auto-exits at array end.
+    const nextLineId = (syncCursor + 1 < edited.length)
+      ? edited[syncCursor + 1]._id
+      : null;
+
+    setEdited((prev) => {
+      const mutated = prev.map((s, i) => {
         if (s._id === target._id) {
           const segDur = Math.max(0.5, s.end - s.start);
           let newEnd = newStart + segDur;
@@ -547,13 +574,34 @@ export default function LyricsEditor({
           return { ...s, start: shifted, end: newEnd };
         }
         return s;
-      }),
-    );
-    // Advance to the next line; auto-exit when past the last one.
-    if (syncCursor + 1 >= edited.length) {
+      });
+      // Sort by start so the array — and thus syncCursor's positional
+      // index, the render order, and the next neighbour lookup — all
+      // stay consistent with the new chronological reality.
+      return mutated.sort((a, b) => a.start - b.start);
+    });
+
+    // Advance to the line that was visually next BEFORE the mutation.
+    // Located by _id so the sort can't drift us onto the wrong line.
+    // If that line no longer exists (shouldn't happen for tapAnchor)
+    // or there was no "next", exit sync mode.
+    if (nextLineId == null) {
       setSyncMode(false);
     } else {
-      setSyncCursor(syncCursor + 1);
+      // We don't know the post-sort position until the next render, so
+      // schedule the cursor move in a microtask after setEdited applies.
+      // React batches this with the setEdited update — same render.
+      queueMicrotask(() => {
+        setEdited((current) => {
+          const newPos = current.findIndex((s) => s._id === nextLineId);
+          if (newPos >= 0) {
+            setSyncCursor(newPos);
+          } else {
+            setSyncMode(false);
+          }
+          return current; // no mutation, just reading
+        });
+      });
     }
   }, [syncMode, syncCursor, edited, currentTime, duration, syncCascade]);
 
@@ -930,11 +978,43 @@ export default function LyricsEditor({
   // missing lyrics into the text input, then tap-syncs it.
   const addBlankLine = () => {
     setEdited((prev) => {
+      // Insert the new line at the audio playhead — that's where the
+      // operator is listening when they realise something's missing
+      // (typical case: a chorus repetition the pipeline collapsed,
+      // or a verse Whisper skipped). The previous behaviour pinned
+      // every new line to `last.end + 0.5`, so click "Agregar línea"
+      // at 1:23 of a song and the row appeared at the END of the
+      // editor with the wrong timestamp. SPACE then clamped it to
+      // an already-wrong neighbour bound.
+      //
+      // Fallback when currentTime is 0 (audio not playing yet) or out
+      // of the song's range: drop the new line after the last existing
+      // one, same as before. That way the wizard's first "add line"
+      // on a fresh job (before pressing play) doesn't land at 0:00
+      // pegado al primer segment.
+      // Note: we do NOT subtract AUDIO_LATENCY_COMPENSATION_S here.
+      // tapAnchor compensates because the operator is reacting to
+      // *heard* audio while the playhead has decoded ~80 ms ahead. But
+      // "Add line at playhead" is an explicit click — they want the
+      // segment to start where the cursor is, not 80 ms before.
+      const playhead = currentTime > 0 ? Math.max(0, currentTime) : 0;
       const last = prev[prev.length - 1];
-      const baseStart = last ? Math.min(duration || last.end + 2, last.end + 0.5) : 0;
-      const baseEnd = Math.min(duration || baseStart + 3, baseStart + 3);
+      const lastEnd = last ? last.end : 0;
+      const baseStart = playhead > 0
+        ? Math.min(playhead, duration ? duration - 0.5 : playhead)
+        : Math.min(duration || lastEnd + 2, lastEnd + 0.5);
+      const segDur = 3;
+      const baseEnd = Math.min(
+        duration || baseStart + segDur,
+        baseStart + segDur,
+      );
       const nextId = prev.reduce((m, s) => Math.max(m, s._id), -1) + 1;
-      return [...prev, { _id: nextId, start: baseStart, end: baseEnd, text: "" }];
+      const inserted = { _id: nextId, start: baseStart, end: baseEnd, text: "" };
+      // Keep `edited` sorted by start so syncCursor / neighbour clamp /
+      // /save-segments autosave all see a monotonic timeline. The
+      // backend also sorts (#184) but doing it here keeps the UI's
+      // immediate render consistent without waiting for a round-trip.
+      return [...prev, inserted].sort((a, b) => a.start - b.start);
     });
   };
 
