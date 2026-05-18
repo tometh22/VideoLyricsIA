@@ -66,7 +66,19 @@ export default function VariantCreateModal({ job, onClose, onCreated }) {
       });
       if (!res.ok) {
         const body = await res.json().catch(() => ({}));
-        throw new Error(body.detail || `Error ${res.status}`);
+        // Pydantic v2 422 returns `detail` as an array of error objects
+        // ([{type, loc, msg, input}, ...]). String-coercing that array
+        // gives "[object Object]" — render the msg(s) instead. Other
+        // shapes (string, plain object, missing) fall through.
+        let detail = body.detail;
+        if (Array.isArray(detail)) {
+          detail = detail
+            .map((e) => (e && typeof e === "object" && e.msg) ? e.msg : String(e))
+            .join("; ");
+        } else if (detail && typeof detail === "object") {
+          detail = detail.msg || JSON.stringify(detail);
+        }
+        throw new Error(detail || `Error ${res.status}`);
       }
       const data = await res.json();
       if (mountedRef.current) {
