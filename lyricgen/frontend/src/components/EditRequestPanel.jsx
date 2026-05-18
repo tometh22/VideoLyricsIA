@@ -966,8 +966,16 @@ function LyricsEditModal({
               // on any subsequent background re-render).
               transcribeJobId={job.job_id}
               onPersistSegments={async (jobId, segs) => {
+                // Surface non-OK responses (e.g. 409 when the job's
+                // status falls outside the save-segments whitelist —
+                // status=done after approval is a common trap that
+                // silently dropped edits before this fix, 2026-05-18).
+                // We don't block the operator's UI on a transient
+                // network blip, but we DO let them know if the server
+                // rejected the save so they don't refresh and lose
+                // their work thinking it persisted.
                 try {
-                  await fetch(`${API}/jobs/${jobId}/save-segments`, {
+                  const resp = await fetch(`${API}/jobs/${jobId}/save-segments`, {
                     method: "POST",
                     headers: {
                       "Content-Type": "application/json",
@@ -975,12 +983,39 @@ function LyricsEditModal({
                     },
                     body: JSON.stringify({ segments: segs }),
                   });
+                  if (!resp.ok) {
+                    let detail = `HTTP ${resp.status}`;
+                    try {
+                      const body = await resp.json();
+                      if (body && body.detail) detail = body.detail;
+                    } catch (_) { /* body wasn't JSON */ }
+                    // eslint-disable-next-line no-console
+                    console.error("[EditRequestPanel] autosave rejected:", detail);
+                    // One alert per session-failure-mode so we don't
+                    // spam every 3 s while the failure persists.
+                    if (window.__genlyAutosaveAlerted !== detail) {
+                      window.__genlyAutosaveAlerted = detail;
+                      window.alert(
+                        `Tus correcciones no se están guardando.\n\n` +
+                        `Motivo: ${detail}\n\n` +
+                        `Probá reabrir el job. Si el problema persiste, ` +
+                        `contactá al equipo de GenLy AI.`,
+                      );
+                    }
+                  } else {
+                    // Reset the alert sentinel on the first success
+                    // after a failure, so a later failure re-alerts.
+                    if (window.__genlyAutosaveAlerted) {
+                      window.__genlyAutosaveAlerted = null;
+                    }
+                  }
                 } catch (e) {
-                  // Best-effort autosave; if it fails the operator can
-                  // still click "Apply lyrics" to commit segments via
-                  // the explicit /edit?edit_type=lyrics path.
+                  // Network error / fetch threw. Don't alert on the
+                  // first one (could be a transient blip while saving
+                  // — the next 3 s tick retries). Log so the operator
+                  // can see it in DevTools if they go looking.
                   // eslint-disable-next-line no-console
-                  console.warn("[EditRequestPanel] autosave failed", e);
+                  console.warn("[EditRequestPanel] autosave network error", e);
                 }
               }}
               // Note: NO onEditedChange wired here. The ref it would

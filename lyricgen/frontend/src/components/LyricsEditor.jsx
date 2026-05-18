@@ -257,21 +257,14 @@ export default function LyricsEditor({
     onEditedChange(cleaned);
   }, [edited, onEditedChange]);
 
-  // Debounced autosave to backend: every 3s after the last edit, persist
-  // the current segments to /jobs/{id}/save-segments. This bumps the
-  // reaper's last_user_activity_at anchor so long edit sessions don't get
-  // barre at the 30-min TTL (incident 2026-05-14 — Agus batch-edited 5
-  // lyrics for 90 min and all 5 jobs got reaped before "Crear videos").
-  // No-op when the parent didn't wire the callback (e.g. unit tests).
-  useEffect(() => {
-    if (!onPersistSegments || !transcribeJobId) return undefined;
-    if (!Array.isArray(edited) || edited.length === 0) return undefined;
-    const tid = setTimeout(() => {
-      const cleaned = edited.map(({ _id, ...rest }) => rest);
-      onPersistSegments(transcribeJobId, cleaned);
-    }, 3000);
-    return () => clearTimeout(tid);
-  }, [edited, transcribeJobId, onPersistSegments]);
+  // NOTE: a second debounced-autosave useEffect lived here, copy-pasted
+  // identically to the one above (line ~238). Removed 2026-05-18 —
+  // the duplicate (a) did not respect `disableAutosave`, and (b) raced
+  // its partner on every `edited` change, firing two POSTs in parallel
+  // every 3 s. If two edits landed inside the same debounce window the
+  // second response could overwrite the first with a stale payload.
+  // Agus reported edits not persisting after SPACE anchors; the race
+  // was the likely culprit. Keep the single autosave above.
 
   // ─── Audio sync ─────────────────────────────────────────────────────
   // Blob URL lifecycle must live in useEffect, not useMemo. useMemo is
