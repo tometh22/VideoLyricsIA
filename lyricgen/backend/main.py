@@ -4471,6 +4471,17 @@ class EditJobRequest(BaseModel):
     # spec granular de cámara. 300 obligaba a sacrificar negaciones que
     # son críticas para evitar bias del modelo. Costo Gemini marginal.
     background_hint: str | None = Field(default=None, max_length=2000)
+    # Operator-controlled bypass of content_validator (UMG Guideline 15
+    # check). Default False = run validator, fail the job if AI generated
+    # face/hands/logos as subject. True = skip validator entirely.
+    #
+    # Use case: operator explicit intent that the scene REQUIRES the
+    # flagged content (e.g. "rock guitarist hands strumming" — the song's
+    # visual identity IS hands). They accept the downstream UMG-review
+    # rejection risk knowingly. Frontend ContentValidationToggle exposes
+    # this with a warning state when ON. Worker logs the bypass in
+    # validation_result so admin/audit can see who chose to override.
+    bypass_content_validation: bool = Field(default=False)
     # Background generation mode. Only meaningful when edit_type=="background".
     #
     #   "veo"    → Google Veo 3.1 text-to-video. Cinematic, ~$0.50/gen,
@@ -4926,6 +4937,13 @@ async def request_edit(
         # validated the enum via pattern; we just forward through
         # edit_params to run_edit_pipeline → _ensure_background.
         edit_params["background_mode"] = body.background_mode
+    if body.edit_type == "background" and body.bypass_content_validation:
+        # Forward only when explicitly True; the pipeline's default behavior
+        # (run validator) is correct when this is missing/False. Centralising
+        # the truthy check here means downstream code reads `render_params
+        # .get("bypass_content_validation")` and never has to distinguish
+        # "field missing" from "operator chose False".
+        edit_params["bypass_content_validation"] = True
 
     new_edit_count = current_edit_count + 1
 
@@ -5376,6 +5394,9 @@ class VariantJobRequest(BaseModel):
     # va al user_content de Gemini con header [OPERATOR OVERRIDE].
     # 2000 chars (bumped 2026-05-18, ver EditJobRequest para rationale).
     background_hint: str | None = Field(default=None, max_length=2000)
+    # Espejo del flag de EditJobRequest — operator override del content
+    # validator (UMG Guideline 15). Misma semántica, ver EditJobRequest.
+    bypass_content_validation: bool = Field(default=False)
     # Override del concept del padre. 2000 chars igual que /generate.
     # Alimenta _get_unique_prompt() junto con genre/style/lyrics.
     concept: str | None = Field(default=None, max_length=2000)
@@ -5460,6 +5481,8 @@ async def create_variant(
         new_render_params["background_hint"] = body.background_hint
     if body.concept is not None:
         new_render_params["concept"] = body.concept
+    if body.bypass_content_validation:
+        new_render_params["bypass_content_validation"] = True
 
     # Style: override o herencia.
     new_style = body.style if body.style is not None else (parent.style or "oscuro")
