@@ -4450,9 +4450,12 @@ class EditJobRequest(BaseModel):
     # types what they want the new background to convey ("paisaje cálido
     # al atardecer", "abstracto con ondas de luz suave", etc.) and the
     # pipeline forwards it to Gemini's system prompt as an explicit
-    # operator override. Max 300 chars to keep Gemini input cheap and
-    # bounded; longer hints rarely add signal and inflate prompt cost.
-    background_hint: str | None = Field(default=None, max_length=300)
+    # operator override. Bump 300→2000 (2026-05-18): los modelos de
+    # imagen/video rinden mejor con prompts detallados que permitan
+    # negaciones redundantes ("no cars, no traffic, no people…") y
+    # spec granular de cámara. 300 obligaba a sacrificar negaciones que
+    # son críticas para evitar bias del modelo. Costo Gemini marginal.
+    background_hint: str | None = Field(default=None, max_length=2000)
     # Background generation mode. Only meaningful when edit_type=="background".
     #
     #   "veo"    → Google Veo 3.1 text-to-video. Cinematic, ~$0.50/gen,
@@ -5345,7 +5348,8 @@ class VariantJobRequest(BaseModel):
     """
     # Mismo formato y max_length que EditJobRequest.background_hint —
     # va al user_content de Gemini con header [OPERATOR OVERRIDE].
-    background_hint: str | None = Field(default=None, max_length=300)
+    # 2000 chars (bumped 2026-05-18, ver EditJobRequest para rationale).
+    background_hint: str | None = Field(default=None, max_length=2000)
     # Override del concept del padre. 2000 chars igual que /generate.
     # Alimenta _get_unique_prompt() junto con genre/style/lyrics.
     concept: str | None = Field(default=None, max_length=2000)
