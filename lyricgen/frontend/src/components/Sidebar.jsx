@@ -1,35 +1,47 @@
+import { Link } from "react-router-dom";
 import { useI18n } from "../i18n";
 import BrandLockup from "./BrandLockup";
 import { IS_PRODUCTION, APP_ENV } from "../env";
+
+// Each nav item carries its router path. The plain-left-click handler
+// in the <Link> below calls onNav(id) (which fires the wizard-leaving
+// confirm in App.handleNav) and preventDefault; modifier-click and
+// right-click fall through so the browser handles them natively →
+// "Open in new tab" / Cmd+Click work as users expect.
+const ITEMS_BASE = (t) => [
+  {
+    id: "dashboard", label: t("nav.dashboard"), path: "/dashboard",
+    icon: <svg className="w-5 h-5" fill="none" stroke="currentColor" strokeWidth="1.5" viewBox="0 0 24 24"><rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/></svg>,
+  },
+  {
+    id: "new", label: t("nav.new_batch"), path: "/new",
+    icon: <svg className="w-5 h-5" fill="none" stroke="currentColor" strokeWidth="1.5" viewBox="0 0 24 24"><path d="M12 5v14M5 12h14" strokeLinecap="round"/></svg>,
+  },
+  {
+    id: "history", label: t("nav.history"), path: "/videos",
+    icon: <svg className="w-5 h-5" fill="none" stroke="currentColor" strokeWidth="1.5" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg>,
+  },
+  {
+    id: "settings", label: t("nav.settings"), path: "/account",
+    icon: <svg className="w-5 h-5" fill="none" stroke="currentColor" strokeWidth="1.5" viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 00.33 1.82l.06.06a2 2 0 010 2.83 2 2 0 01-2.83 0l-.06-.06a1.65 1.65 0 00-1.82-.33 1.65 1.65 0 00-1 1.51V21a2 2 0 01-2 2 2 2 0 01-2-2v-.09A1.65 1.65 0 009 19.4a1.65 1.65 0 00-1.82.33l-.06.06a2 2 0 01-2.83 0 2 2 0 010-2.83l.06-.06A1.65 1.65 0 004.68 15a1.65 1.65 0 00-1.51-1H3a2 2 0 01-2-2 2 2 0 012-2h.09A1.65 1.65 0 004.6 9a1.65 1.65 0 00-.33-1.82l-.06-.06a2 2 0 010-2.83 2 2 0 012.83 0l.06.06A1.65 1.65 0 009 4.68a1.65 1.65 0 001-1.51V3a2 2 0 012-2 2 2 0 012 2v.09a1.65 1.65 0 001 1.51 1.65 1.65 0 001.82-.33l.06-.06a2 2 0 012.83 0 2 2 0 010 2.83l-.06.06A1.65 1.65 0 0019.4 9a1.65 1.65 0 001.51 1H21a2 2 0 012 2 2 2 0 01-2 2h-.09a1.65 1.65 0 00-1.51 1z"/></svg>,
+  },
+];
+
+// True for plain left-click — the only case where we suppress the
+// browser's default link behaviour and route through onNav.
+function _isPlainLeftClick(e) {
+  return e.button === 0 && !e.metaKey && !e.ctrlKey && !e.shiftKey && !e.altKey;
+}
 
 export default function Sidebar({ onNav, activeView, open, onToggle, user, onLogout }) {
   const { t } = useI18n();
 
   if (!open) return null;
 
-  const items = [
-    {
-      id: "dashboard", label: t("nav.dashboard"),
-      icon: <svg className="w-5 h-5" fill="none" stroke="currentColor" strokeWidth="1.5" viewBox="0 0 24 24"><rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/></svg>,
-    },
-    {
-      id: "new", label: t("nav.new_batch"),
-      icon: <svg className="w-5 h-5" fill="none" stroke="currentColor" strokeWidth="1.5" viewBox="0 0 24 24"><path d="M12 5v14M5 12h14" strokeLinecap="round"/></svg>,
-    },
-    {
-      id: "history", label: t("nav.history"),
-      icon: <svg className="w-5 h-5" fill="none" stroke="currentColor" strokeWidth="1.5" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg>,
-    },
-    {
-      id: "settings", label: t("nav.settings"),
-      icon: <svg className="w-5 h-5" fill="none" stroke="currentColor" strokeWidth="1.5" viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 00.33 1.82l.06.06a2 2 0 010 2.83 2 2 0 01-2.83 0l-.06-.06a1.65 1.65 0 00-1.82-.33 1.65 1.65 0 00-1 1.51V21a2 2 0 01-2 2 2 2 0 01-2-2v-.09A1.65 1.65 0 009 19.4a1.65 1.65 0 00-1.82.33l-.06.06a2 2 0 01-2.83 0 2 2 0 010-2.83l.06-.06A1.65 1.65 0 004.68 15a1.65 1.65 0 00-1.51-1H3a2 2 0 01-2-2 2 2 0 012-2h.09A1.65 1.65 0 004.6 9a1.65 1.65 0 00-.33-1.82l-.06-.06a2 2 0 010-2.83 2 2 0 012.83 0l.06.06A1.65 1.65 0 009 4.68a1.65 1.65 0 001-1.51V3a2 2 0 012-2 2 2 0 012 2v.09a1.65 1.65 0 001 1.51 1.65 1.65 0 001.82-.33l.06-.06a2 2 0 012.83 0 2 2 0 010 2.83l-.06.06A1.65 1.65 0 0019.4 9a1.65 1.65 0 001.51 1H21a2 2 0 012 2 2 2 0 01-2 2h-.09a1.65 1.65 0 00-1.51 1z"/></svg>,
-    },
-  ];
-
-  // Admin link for admin users
+  const items = ITEMS_BASE(t);
   if (user?.role === "admin") {
     items.push({
-      id: "admin", label: "Admin",
+      id: "admin", label: "Admin", path: "/admin",
       icon: <svg className="w-5 h-5" fill="none" stroke="currentColor" strokeWidth="1.5" viewBox="0 0 24 24"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z" strokeLinecap="round" strokeLinejoin="round"/></svg>,
     });
   }
@@ -39,10 +51,25 @@ export default function Sidebar({ onNav, activeView, open, onToggle, user, onLog
 
       {/* Logo — full lockup per brand kit §10 (navbar uses full lockup,
           favicon uses mark-only). The "Pro" pill lives outside the
-          locked-up artwork so the brand SVG geometry is preserved. */}
+          locked-up artwork so the brand SVG geometry is preserved.
+          Wrapped in <Link> so right-click → "open in new tab" works
+          and middle-click opens a new tab natively. Plain left-click
+          is routed through onNav("dashboard") to preserve the
+          wizard-leaving confirm logic in App.handleNav. */}
       <div className="flex items-center justify-between px-5 py-5 border-b border-white/[0.04]">
         <div className="flex items-center gap-2.5">
-          <BrandLockup size="md" />
+          <Link
+            to="/dashboard"
+            onClick={(e) => {
+              if (!_isPlainLeftClick(e)) return;
+              e.preventDefault();
+              onNav("dashboard");
+            }}
+            aria-label="Ir al dashboard"
+            className="flex items-center"
+          >
+            <BrandLockup size="md" />
+          </Link>
           {IS_PRODUCTION ? (
             <span className="text-[8px] font-medium text-brand bg-brand/10 px-1.5 py-0.5 rounded-full uppercase tracking-widest">Pro</span>
           ) : (
@@ -61,12 +88,20 @@ export default function Sidebar({ onNav, activeView, open, onToggle, user, onLog
         </button>
       </div>
 
-      {/* Nav items */}
+      {/* Nav items — rendered as <Link> (= <a href>) so right-click /
+          Cmd+Click / middle-click open a new tab natively. Plain
+          left-click prevents the default navigation and calls onNav
+          so the App's wizard-leaving confirm fires. */}
       <nav className="flex-1 py-4 px-3" data-tour="sidebar-nav">
         {items.map((item) => (
-          <button
+          <Link
             key={item.id}
-            onClick={() => onNav(item.id)}
+            to={item.path}
+            onClick={(e) => {
+              if (!_isPlainLeftClick(e)) return;
+              e.preventDefault();
+              onNav(item.id);
+            }}
             className={`w-full flex items-center gap-3 px-4 py-3 rounded-xl mb-1 text-sm font-medium transition-all duration-200
               ${activeView === item.id
                 ? "bg-brand/10 text-white"
@@ -75,22 +110,29 @@ export default function Sidebar({ onNav, activeView, open, onToggle, user, onLog
           >
             <span className={activeView === item.id ? "text-brand" : "text-gray-500"}>{item.icon}</span>
             {item.label}
-          </button>
+          </Link>
         ))}
       </nav>
 
       {/* Plan badge */}
       {user && (
         <div className="px-5 py-3 border-t border-white/[0.04]">
-          <button onClick={() => onNav("settings")}
-            className="w-full flex items-center gap-2 px-3 py-2 rounded-xl bg-brand/5 hover:bg-brand/10 transition-all">
+          <Link
+            to="/account"
+            onClick={(e) => {
+              if (!_isPlainLeftClick(e)) return;
+              e.preventDefault();
+              onNav("settings");
+            }}
+            className="w-full flex items-center gap-2 px-3 py-2 rounded-xl bg-brand/5 hover:bg-brand/10 transition-all"
+          >
             <span className="text-[10px] font-bold text-brand uppercase tracking-wider">
               Plan {user.plan || "free"}
             </span>
             <svg className="w-3 h-3 text-gray-500 ml-auto" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
               <path d="M9 5l7 7-7 7" strokeLinecap="round" strokeLinejoin="round"/>
             </svg>
-          </button>
+          </Link>
         </div>
       )}
 
