@@ -79,6 +79,68 @@ describe("LyricsEditor — prop sync (B7)", () => {
   });
 });
 
+describe("LyricsEditor — sync mode anchor across positions (B4)", () => {
+  // BUG: tapAnchor (SPACE in sync mode) reads neighbours from edited[
+  // syncCursor - 1] and edited[syncCursor + 1] and clamps newStart to
+  // `prevSeg.end + MIN_GAP_S`. When the operator is anchoring a line
+  // chronologically EARLIER than its array-position previous neighbour
+  // — typical in the Una Vez Más outro: a chorus repetition was added
+  // at the end, but its true start belongs before existing segments —
+  // the clamp pins it at `prevSeg.end + 0.05 s`, far from where the
+  // operator pressed SPACE. From the operator's view "nothing
+  // happens".
+  //
+  // Expected: tapAnchor honors `currentTime` regardless of the current
+  // position of the segment in the array. The array re-sorts after the
+  // mutation so the line moves to its new chronological slot.
+  it("anchors the target segment to currentTime even when it would re-order the array", async () => {
+    const props = baseProps({
+      // 3 segments in order at 10/20/30 s, and a 4th appended at the
+      // end with start=40 s. Operator wants to move that 4th line to
+      // BEFORE the others by anchoring at currentTime=5 s.
+      segments: [
+        { start: 10.0, end: 12.0, text: "alpha" },
+        { start: 20.0, end: 22.0, text: "beta" },
+        { start: 30.0, end: 32.0, text: "gamma" },
+        { start: 40.0, end: 42.0, text: "delta — should land at 5 s" },
+      ],
+      audioFile: new Blob(["audio-bytes"], { type: "audio/mpeg" }),
+    });
+    const { container } = render(<LyricsEditor {...props} />);
+
+    // Audio at 5 s — before the first existing segment.
+    _setAudioCurrentTime(container, 5.0);
+
+    // Activate sync mode on the 4th row ("delta"). The ◉ button sits
+    // on hover, but in jsdom there's no hover state — we click it
+    // directly via the title attribute (set in LyricsEditor.jsx
+    // L1621).
+    const dotButtons = container.querySelectorAll(
+      'button[title*="Activar Sync"]'
+    );
+    // The 4th row's ◉ — index 3 (0-based) since the rows are in array
+    // order and there are 4 segments.
+    await userEvent.click(dotButtons[3]);
+
+    // Press SPACE to anchor.
+    fireEvent.keyDown(window, { code: "Space" });
+
+    // The "delta" segment must now read its new chronological time
+    // (~5 s, with 80 ms latency compensation). The display formats
+    // start as "M:SS.t", so 5 s ≈ "0:04.9" (5.00 - 0.08 = 4.92, rounded
+    // to one decimal).
+    expect(screen.getByDisplayValue(/delta/i)).toBeInTheDocument();
+    // The timestamp display of the "delta" row should show ~0:04.9
+    // (within the row containing the "delta" text).
+    const deltaInput = screen.getByDisplayValue(/delta/i);
+    const deltaRow = deltaInput.closest("div[class*='group']") || deltaInput.closest("div");
+    expect(deltaRow).toBeTruthy();
+    // The timestamp shows the row's start; find the small monospace
+    // span near the row that displays "0:04.x".
+    expect(deltaRow.textContent).toMatch(/0:04\.\d/);
+  });
+});
+
 describe("LyricsEditor — addBlankLine (B3)", () => {
   // BUG: addBlankLine appends a new entry to the end of the array
   // with start = last.end + 0.5 (regardless of where the audio

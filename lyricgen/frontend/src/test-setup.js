@@ -23,6 +23,13 @@ if (typeof window !== "undefined" && typeof HTMLMediaElement !== "undefined") {
   HTMLMediaElement.prototype.load = () => {};
 }
 
+// scrollIntoView — jsdom doesn't implement it. The editor calls it
+// from the sync-mode auto-scroll effect on every line change. Noop
+// stub is enough for tests; no test should depend on layout.
+if (typeof window !== "undefined" && typeof Element !== "undefined") {
+  Element.prototype.scrollIntoView = Element.prototype.scrollIntoView || function () {};
+}
+
 // matchMedia stub — react-joyride and a few responsive helpers check
 // it on mount.
 if (typeof window !== "undefined" && !window.matchMedia) {

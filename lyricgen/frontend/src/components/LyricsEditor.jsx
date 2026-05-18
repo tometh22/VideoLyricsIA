@@ -490,17 +490,23 @@ export default function LyricsEditor({
     // AUDIO_LATENCY_COMPENSATION_S comment above.
     const rawStart = Math.max(0, currentTime - AUDIO_LATENCY_COMPENSATION_S);
 
-    // Clamp to neighbors so the timeline can't go non-monotonic. If the
-    // operator presses Space too late (after the next line has started)
-    // or too early (before the previous one ended), pin to the safe edge
-    // instead of producing overlapping segments that render as a flicker.
-    const prevSeg = syncCursor > 0 ? edited[syncCursor - 1] : null;
-    const nextSeg = syncCursor + 1 < edited.length ? edited[syncCursor + 1] : null;
-    const lowerBound = prevSeg ? prevSeg.end + MIN_GAP_S : 0;
-    const upperBound = nextSeg
-      ? nextSeg.start - MIN_GAP_S
-      : (duration && duration > 0 ? duration : Infinity);
-    const newStart = Math.max(lowerBound, Math.min(rawStart, upperBound));
+    // Honor the operator's intent: anchor at currentTime regardless of
+    // where this line currently sits in the array. The previous version
+    // clamped to `prevSeg.end + MIN_GAP_S` (where prevSeg was the line
+    // at array position syncCursor-1). For the typical "fill in missing
+    // chorus repetition" workflow — add line at end of array, then
+    // SPACE-anchor it to mid-song — that clamp pinned the new line at
+    // the END of the song instead of where the operator wanted it.
+    // (Una Vez Más — Viejas Locas, agus.cafisi 2026-05-18, bug B4.)
+    //
+    // Trade-off: timeline can momentarily be non-monotonic between
+    // tapAnchor and the post-mutation sort below. Render iterates
+    // `edited` (which gets sorted right after this setEdited), so the
+    // operator sees the line move to its new chronological slot.
+    // syncCursor advances by _id, not array index, so the next SPACE
+    // press lands on the line that was visually next BEFORE the move.
+    const upperBound = duration && duration > 0 ? duration : Infinity;
+    const newStart = Math.max(0, Math.min(rawStart, upperBound));
 
     const delta = newStart - target.start;
 
@@ -538,8 +544,17 @@ export default function LyricsEditor({
         delta,
       },
     ]);
-    setEdited((prev) =>
-      prev.map((s, i) => {
+    // Compute next-chronological-line identity BEFORE we mutate, so we
+    // can advance syncCursor to the same line the operator was about
+    // to anchor next, even if the mutation re-sorts the array. Falls
+    // back to "stay on the current line if it ended up last" — sync
+    // mode auto-exits at array end.
+    const nextLineId = (syncCursor + 1 < edited.length)
+      ? edited[syncCursor + 1]._id
+      : null;
+
+    setEdited((prev) => {
+      const mutated = prev.map((s, i) => {
         if (s._id === target._id) {
           const segDur = Math.max(0.5, s.end - s.start);
           let newEnd = newStart + segDur;
@@ -559,13 +574,34 @@ export default function LyricsEditor({
           return { ...s, start: shifted, end: newEnd };
         }
         return s;
-      }),
-    );
-    // Advance to the next line; auto-exit when past the last one.
-    if (syncCursor + 1 >= edited.length) {
+      });
+      // Sort by start so the array — and thus syncCursor's positional
+      // index, the render order, and the next neighbour lookup — all
+      // stay consistent with the new chronological reality.
+      return mutated.sort((a, b) => a.start - b.start);
+    });
+
+    // Advance to the line that was visually next BEFORE the mutation.
+    // Located by _id so the sort can't drift us onto the wrong line.
+    // If that line no longer exists (shouldn't happen for tapAnchor)
+    // or there was no "next", exit sync mode.
+    if (nextLineId == null) {
       setSyncMode(false);
     } else {
-      setSyncCursor(syncCursor + 1);
+      // We don't know the post-sort position until the next render, so
+      // schedule the cursor move in a microtask after setEdited applies.
+      // React batches this with the setEdited update — same render.
+      queueMicrotask(() => {
+        setEdited((current) => {
+          const newPos = current.findIndex((s) => s._id === nextLineId);
+          if (newPos >= 0) {
+            setSyncCursor(newPos);
+          } else {
+            setSyncMode(false);
+          }
+          return current; // no mutation, just reading
+        });
+      });
     }
   }, [syncMode, syncCursor, edited, currentTime, duration, syncCascade]);
 
