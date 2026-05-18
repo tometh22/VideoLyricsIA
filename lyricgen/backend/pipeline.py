@@ -937,6 +937,90 @@ def _is_single_word_loop(text: str, min_repeats: int = 8) -> bool:
     return top_count / len(tokens) >= 0.9 and top_count >= min_repeats
 
 
+def _collapse_consecutive_duplicates(
+    segments: list[dict], *, with_counts: bool = False,
+):
+    """Collapse streaks of consecutive identical-text segments into
+    one — but only when the streak looks like a Whisper hallucination
+    loop, not a legitimate repeated chorus.
+
+    Bug B1 from the 2026-05-18 audit (Una Vez Más — Viejas Locas):
+    the previous version always collapsed any consecutive duplicate
+    streak. That was correct for Whisper's "¡Karol!" hallucination
+    (174 false repetitions) but destroyed the song's outro fadeout
+    chorus, which legitimately repeats 4–6 times.
+
+    Heuristic (conservative on the "keep separately" side):
+
+      - streak length ≤ CHORUS_MAX_REPS (6) AND text length >
+        CHORUS_MIN_TEXT_LEN (4)  →  keep all segments separate
+        (legit chorus pattern: a few repetitions of a normal line)
+
+      - streak length > CHORUS_MAX_REPS  →  collapse
+        (a chorus rarely repeats more than 6 times in a row; many
+        more is the Karol-style loop signature)
+
+      - text length ≤ CHORUS_MIN_TEXT_LEN (e.g. "no", "oh") AND
+        streak length ≥ 4  →  collapse
+        (single-word/very-short repeated phrases are the classic
+        Whisper outro filler; collapse to a chant span)
+
+      - otherwise → keep all separate (default conservative bias)
+
+    Text comparison is case-insensitive and whitespace-trimmed —
+    Whisper occasionally varies capitalisation across consecutive
+    segments ("¡Karol!" / "¡KAROL!"), and a chorus shouldn't get
+    accidentally preserved because of that.
+
+    Returns the collapsed segments. When `with_counts=True`, returns
+    `(segments, collapsed_groups, collapsed_total)` so callers can log
+    how many merges happened.
+    """
+    CHORUS_MAX_REPS = 6
+    CHORUS_MIN_TEXT_LEN = 4
+
+    if not segments:
+        return ([], 0, 0) if with_counts else []
+
+    def _norm(text: str) -> str:
+        return (text or "").lower().strip()
+
+    # First pass: group consecutive identical-text streaks.
+    streaks: list[list[dict]] = []
+    for seg in segments:
+        if streaks and _norm(streaks[-1][-1]["text"]) == _norm(seg["text"]):
+            streaks[-1].append(seg)
+        else:
+            streaks.append([seg])
+
+    # Second pass: apply heuristic per streak.
+    out: list[dict] = []
+    collapsed_groups = 0
+    collapsed_total = 0
+    for streak in streaks:
+        if len(streak) == 1:
+            out.append({**streak[0]})
+            continue
+        text = _norm(streak[0]["text"])
+        should_collapse = (
+            len(streak) > CHORUS_MAX_REPS
+            or (len(text) <= CHORUS_MIN_TEXT_LEN and len(streak) >= 4)
+        )
+        if should_collapse:
+            merged = {**streak[0]}
+            merged["end"] = max(s["end"] for s in streak)
+            out.append(merged)
+            collapsed_groups += 1
+            collapsed_total += len(streak) - 1
+        else:
+            for s in streak:
+                out.append({**s})
+
+    if with_counts:
+        return out, collapsed_groups, collapsed_total
+    return out
+
+
 def _filter_whisper_hallucinations(segments: list[dict]) -> tuple[list[dict], int]:
     """Drop segments whose text is a known Whisper hallucination phrase
     OR a single-word loop (e.g. "oh, oh, oh, …" outro fills). The
@@ -1497,43 +1581,16 @@ def _transcribe_via_openai_api(mp3_path: str, language: str | None = None,
         logger.info("[WHISPER-API] Truncated intra-segment loops in %s segment(s)", intra_truncated)
     segments = cleaned
 
-    # Collapse consecutive-identical-text segments into a single segment
-    # spanning the whole streak. This handles two cases the same way:
-    #
-    #  - Whisper hallucination loop ("¡Karol!" 174 times): the original
-    #    code DROPPED segments past the 2nd, leaving a 17 s hole in the
-    #    video. The chant audio is still in the audio track, but the
-    #    subtitle disappears mid-chant — looks broken.
-    #  - Real audience chant or repeated ad-lib in a live cut (Karol G
-    #    "Si Antes Te Hubiera Conocido (Official Video)" has the audience
-    #    chanting "¡Karol!" for ~17 s during the bridge): same shape, but
-    #    here the chant IS legit content the operator may want to keep.
-    #
-    # Either way: the right output is a single subtitle covering the
-    # whole chant, not 174 micro-segments and not silence. The operator
-    # decides in the editor whether to keep or drop.
-    merged: list[dict] = []
-    collapsed_groups = 0
-    collapsed_total = 0
-    for seg in segments:
-        key = seg["text"].lower().strip()
-        if merged and merged[-1]["text"].lower().strip() == key:
-            # Extend the previous segment's end to cover this duplicate.
-            if seg["end"] > merged[-1]["end"]:
-                merged[-1]["end"] = seg["end"]
-            collapsed_total += 1
-            # First merge in a streak counts as a new collapsed group.
-            if not merged[-1].get("_collapsed"):
-                merged[-1]["_collapsed"] = True
-                collapsed_groups += 1
-        else:
-            merged.append({**seg})
-    for s in merged:
-        s.pop("_collapsed", None)
+    # Collapse consecutive-identical-text segments, but only when the
+    # streak looks like a Whisper hallucination loop — not a legitimate
+    # repeated chorus. See _collapse_consecutive_duplicates' docstring
+    # for the heuristic.
+    segments, collapsed_groups, collapsed_total = (
+        _collapse_consecutive_duplicates(segments, with_counts=True)
+    )
     if collapsed_total:
         logger.info("[WHISPER-API] Merged %s consecutive duplicate segments into %s chant/loop spans",
                     collapsed_total, collapsed_groups)
-    segments = merged
 
     GAP = 0.05
     for i in range(len(segments) - 1):
@@ -1867,6 +1924,64 @@ def _fetch_lrclib(artist: str, song: str, db=None) -> dict | None:
                     logger.error("[LYRICS] lrclib /search parse failed: %s", e)
                     result = None
 
+    # ─── Coverage boost (opt-in via LRCLIB_COVERAGE_BOOST=1) ─────────
+    # Dos mejoras opt-in para subir el hit-rate global de lrclib:
+    #
+    # 1. Upgrade plain→synced: si /get devolvió un record con plain pero
+    #    sin synced, otro upload del mismo song puede tener synced.
+    #    Pickeamos el mejor synced candidate de /search y reemplazamos.
+    #    Motivo: lrclib es contributor-driven; mismo song aparece varias
+    #    veces con cobertura distinta.
+    #
+    # 2. Variant-retry: si todo lo de arriba falló (result is None),
+    #    probamos /search con variaciones del query (accent-fold,
+    #    strip parens/Live/Remix, primer-token del artist). El picker
+    #    sigue scoreando contra el (artist, song) original, así un mal
+    #    variant no nos hace pickear un match débil.
+    if _env_flag("LRCLIB_COVERAGE_BOOST"):
+        # (1) Upgrade plain→synced
+        if result is not None and not result.get("synced"):
+            candidates = _try_lrclib_search(artist, song)
+            synced_candidates = [c for c in (candidates or []) if c.get("syncedLyrics")]
+            if synced_candidates:
+                upgrade = _pick_best_lrclib_candidate(synced_candidates, artist, song)
+                if upgrade is not None:
+                    try:
+                        upgraded = _parse_lrclib_record(upgrade)
+                    except Exception as e:
+                        logger.error("[LYRICS] lrclib synced-upgrade parse failed: %s", e)
+                        upgraded = None
+                    if upgraded and upgraded.get("synced"):
+                        logger.info(
+                            "[LYRICS] lrclib /get returned plain-only; "
+                            "/search upgraded to synced (id=%s)",
+                            upgrade.get("id"))
+                        result = upgraded
+
+        # (2) Variant-retry cuando todo lo anterior dio None
+        if result is None:
+            for v_artist, v_song in _lrclib_query_variants(artist, song):
+                v_candidates = _try_lrclib_search(v_artist, v_song)
+                if not v_candidates:
+                    continue
+                # Score against ORIGINAL artist/song para evitar
+                # aceptar matches débiles que la variante haya inflado
+                best_v = _pick_best_lrclib_candidate(v_candidates, artist, song)
+                if best_v is None:
+                    continue
+                try:
+                    parsed_v = _parse_lrclib_record(best_v)
+                except Exception as e:
+                    logger.error("[LYRICS] lrclib variant /search parse failed: %s", e)
+                    continue
+                if parsed_v:
+                    logger.info(
+                        "[LYRICS] lrclib variant-retry hit (%r,%r) → id=%s synced=%s",
+                        v_artist, v_song, best_v.get("id"),
+                        "yes" if best_v.get("syncedLyrics") else "no")
+                    result = parsed_v
+                    break
+
     if result is None:
         return None
 
@@ -1934,6 +2049,88 @@ def _parse_lrclib_record(data: dict) -> dict | None:
     }
 
 
+def _strip_accents(s: str) -> str:
+    """Quitar diacríticos (NFKD + filter combining). Para matching más
+    laxo entre 'Babasónicos' y 'Babasonicos', 'Mil Horas' y 'mil horas',
+    etc. No toca la ñ (es una letra, no un diacrítico)."""
+    import unicodedata as _u
+    if not s:
+        return s
+    out = []
+    for c in _u.normalize("NFKD", s):
+        if _u.combining(c):
+            continue
+        out.append(c)
+    return "".join(out)
+
+
+def _strip_song_noise(title: str) -> str:
+    """Quitar paréntesis, corchetes, 'feat. X', '(Live)', '(Remix)',
+    '- Remastered 2009', etc. del título de la canción para mejorar el
+    match contra registros base de lrclib.
+
+    Ejemplos:
+      'Aunque a nadie ya le importe (Remix)' → 'Aunque a nadie ya le importe'
+      'Un Pacto Live In Buenos Aires 2001'   → 'Un Pacto'
+      'Despacito (feat. Daddy Yankee)'       → 'Despacito'
+      'Bohemian Rhapsody - Remastered 2011'  → 'Bohemian Rhapsody'
+    """
+    import re as _re
+    if not title:
+        return title
+    s = title
+    # paréntesis y corchetes con contenido
+    s = _re.sub(r"\s*[\(\[][^)\]]*[\)\]]\s*", " ", s)
+    # ' - <suffix>' al final (remastered, live, etc.)
+    s = _re.sub(r"\s+-\s+.+$", "", s)
+    # ' feat. X' / 'ft. X' / 'with X'
+    s = _re.sub(r"\s+(?:feat\.?|ft\.?|with)\s+.+$", "", s, flags=_re.I)
+    # palabras de variante al final sin guión: live, remix, acoustic, demo, edit, version, mix
+    s = _re.sub(r"\s+(?:live|remix|acoustic|demo|edit|version|mix|remastered|en\s+vivo)\b.*$", "", s, flags=_re.I)
+    # años sueltos al final (e.g. "Pacto 2001")
+    s = _re.sub(r"\s+(?:19|20)\d{2}\s*$", "", s)
+    # whitespace dedupe
+    s = _re.sub(r"\s{2,}", " ", s).strip()
+    return s or title  # nunca devolver string vacío
+
+
+def _lrclib_query_variants(artist: str, song: str):
+    """Yield (artist, song) variations to try cuando el exact-match falla.
+    Orden: más-probable-a-mejor primero. Dedupe contra (artist, song)
+    original y entre variantes."""
+    seen = set()
+    base_artist = (artist or "").strip()
+    base_song = (song or "").strip()
+
+    def _emit(a: str, s: str):
+        if not a or not s:
+            return None
+        key = (a.strip().lower(), s.strip().lower())
+        if key in seen:
+            return None
+        seen.add(key)
+        return (a.strip(), s.strip())
+
+    # Variant 1: song con noise stripped
+    clean_song = _strip_song_noise(base_song)
+    v = _emit(base_artist, clean_song)
+    if v: yield v
+
+    # Variant 2: accent-fold both (común: lrclib normaliza unicode)
+    v = _emit(_strip_accents(base_artist), _strip_accents(clean_song))
+    if v: yield v
+
+    # Variant 3: artist como primer token (e.g. "Bersuit" en lugar de "Bersuit Vergarabat"),
+    # cuando el artist tiene más de 1 palabra
+    parts = base_artist.split()
+    if len(parts) > 1:
+        v = _emit(parts[0], clean_song)
+        if v: yield v
+        # también con accent-fold
+        v = _emit(_strip_accents(parts[0]), _strip_accents(clean_song))
+        if v: yield v
+
+
 def _try_lrclib_search(artist: str, song: str) -> list:
     """GET /api/search?q=<artist> <song>. Endpoint fuzzy de lrclib.net
     que devuelve hasta N candidates (cada uno con el mismo shape que
@@ -1985,8 +2182,14 @@ def _pick_best_lrclib_candidate(candidates: list, artist: str,
     if not candidates:
         return None
 
+    # Under LRCLIB_COVERAGE_BOOST=1, fold diacritics así "Babasonicos"
+    # matchea "Babasónicos" exactamente y no sólo por substring. Sin el
+    # flag, comportamiento idéntico al original (sólo .lower().strip()).
+    _fold = _env_flag("LRCLIB_COVERAGE_BOOST")
+
     def _norm(s: str) -> str:
-        return (s or "").lower().strip()
+        base = (s or "").lower().strip()
+        return _strip_accents(base) if _fold else base
 
     artist_n = _norm(artist)
     song_n = _norm(song)
