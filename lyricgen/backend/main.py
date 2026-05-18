@@ -4690,6 +4690,17 @@ async def save_segments(
                     detail=f"segments[{i}] missing required key {k!r}",
                 )
 
+    # Sort by start ascending so downstream consumers (renderer, sync-mode
+    # neighbor clamp, lookup-by-cronological-position) can assume a
+    # monotonic timeline. The frontend editor can submit out-of-order
+    # arrays — e.g. when the operator clicks "Agregar línea" mid-song,
+    # the new line gets appended to the end of the React state array
+    # even though its `start` belongs in the middle. Without this sort,
+    # the next reload of the editor showed a jumbled list and the sync
+    # cursor / clamp logic referenced the wrong neighbors. Origin: Una
+    # Vez Más — Viejas Locas (agus.cafisi, 2026-05-18).
+    segs = sorted(segs, key=lambda s: float(s.get("start", 0) or 0))
+
     job.segments_json = segs
     touch_user_activity(db, job)
     db.commit()

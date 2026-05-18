@@ -272,3 +272,53 @@ def test_save_segments_still_rejects_terminal_or_pre_upload(client):
         assert res.status_code == 409, (
             f"status={blocked_status!r} should still 409, got {res.status_code}"
         )
+
+
+def test_save_segments_persists_in_chronological_order(client):
+    """The frontend editor can submit segments out of chronological order
+    (e.g. when the operator clicks "Agregar línea" — the new line is
+    appended to the end of the React state array, even when the operator
+    is anchoring it to mid-song with SPACE). If the backend stores the
+    array verbatim, the next reload feeds the editor a non-monotonic
+    array and downstream consumers (renderer, sync mode neighbor clamp)
+    misbehave.
+
+    Bug origin: Una Vez Más — Viejas Locas (agus.cafisi, 2026-05-18).
+    Operator added missing chorus repetitions at the end of the editor,
+    autosave flushed them out-of-order, subsequent re-open looked broken.
+
+    Contract: the backend SORTS by `start` ascending before persisting.
+    Operators get a deterministic order regardless of the frontend's
+    accidental ordering, and downstream code can assume monotonic
+    timelines without re-sorting per call."""
+    _, token, user_id, tenant_id = _make_user(client)
+    job_id = _seed_transcribed_pending(user_id, tenant_id)
+
+    # Submit deliberately out of order: the third line lives at the
+    # earliest start time, mimicking the addBlankLine-then-anchor flow.
+    out_of_order = [
+        {"start": 50.0, "end": 52.5, "text": "Una vez más"},
+        {"start": 20.0, "end": 22.0, "text": "primera estrofa"},
+        {"start": 30.0, "end": 32.5, "text": "segunda estrofa"},
+    ]
+    res = client.post(
+        f"/jobs/{job_id}/save-segments",
+        json={"segments": out_of_order},
+        headers=auth(token),
+    )
+    assert res.status_code == 200, res.text
+
+    from database import Job, SessionLocal
+    s = SessionLocal()
+    try:
+        row = s.query(Job).filter(Job.job_id == job_id).first()
+        starts = [seg["start"] for seg in row.segments_json]
+        assert starts == sorted(starts), (
+            f"segments must be stored in chronological order, got {starts}"
+        )
+        # Texts re-aligned with their starts.
+        assert row.segments_json[0]["text"] == "primera estrofa"
+        assert row.segments_json[1]["text"] == "segunda estrofa"
+        assert row.segments_json[2]["text"] == "Una vez más"
+    finally:
+        s.close()
