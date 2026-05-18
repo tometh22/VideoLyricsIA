@@ -35,10 +35,58 @@ def init_sentry():
             integrations=[FastApiIntegration()],
         )
         print("[OBS] Sentry initialized")
+        # Forward urllib3 connection-pool warnings to Sentry as
+        # explicit events. Sentry's default logging integration only
+        # captures ERROR+ — but "Connection pool is full, discarding
+        # connection" is a WARNING that, in practice, signals an
+        # imminent prod outage (the May 17 incident: pool exhaustion
+        # cascaded to /health timeout in ~10 minutes). Catching it
+        # here means the operator sees the alert as soon as the
+        # SECOND occurrence within the rate-limit window, before any
+        # user hits a timeout.
+        _install_pool_warning_alert()
     except ImportError:
         print("[OBS] sentry-sdk not installed; skipping")
     except Exception as e:
         print(f"[OBS] Sentry init failed: {e}")
+
+
+class _PoolWarningSentryFilter(logging.Filter):
+    """Logging filter that mirrors selected WARNING records into Sentry
+    as events. Filter returns True so the record continues to its
+    normal handlers (stdout JSON), it only adds a side-effect."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        if record.levelno < logging.WARNING:
+            return True
+        msg = record.getMessage()
+        # Only the patterns we've confirmed are operational alerts.
+        # Adding more triggers here without thought would spam Sentry.
+        if "Connection pool is full" in msg or "connection pool full" in msg.lower():
+            try:
+                import sentry_sdk
+                sentry_sdk.capture_message(
+                    f"[pool-saturation] {record.name}: {msg}",
+                    level="warning",
+                )
+            except Exception:
+                pass
+        return True
+
+
+def _install_pool_warning_alert() -> None:
+    """Attach the filter to urllib3.connectionpool. Idempotent — safe to
+    call multiple times (filter dedup is by class identity, but we
+    guard with a sentinel to keep logs clean)."""
+    target = logging.getLogger("urllib3.connectionpool")
+    if any(isinstance(f, _PoolWarningSentryFilter) for f in target.filters):
+        return
+    target.addFilter(_PoolWarningSentryFilter())
+    # urllib3 logger defaults to WARNING; ensure we're not below that
+    # by accident (some apps set urllib3 to ERROR to silence noise —
+    # that would silence our alert too).
+    if target.level > logging.WARNING or target.level == logging.NOTSET:
+        target.setLevel(logging.WARNING)
 
 
 class _JsonFormatter(logging.Formatter):
@@ -219,14 +267,25 @@ def health_snapshot() -> dict:
         else:
             _degrade("redis_error")
 
-    # R2 / S3 — `warmup()` force-initializes the boto3 client so the
-    # first user request after a deploy doesn't pay the cold-start cost
-    # (the boto3 model loader is ~500-1500 ms on a fresh process). Pure
-    # CPU, no network — safe to run on the hot path.
+    # R2 / S3 — two checks:
+    #   1. warmup(): pure CPU, force-loads boto3 model so the first user
+    #      request after deploy doesn't pay the 500-1500 ms cold start.
+    #   2. probe_r2(): live HEAD via an isolated client (own pool, 2 s
+    #      connect / 3 s read). Catches actual R2 outages AND main-pool
+    #      saturation that warmup() can't see. Marks degraded if RTT
+    #      > 1500 ms (typical R2 head_bucket is 80-200 ms; >1.5 s means
+    #      pool churn, retries, or geo-distance issue worth alerting on).
     try:
         import storage
         if storage.is_enabled():
             snap["r2"] = "ready" if storage.warmup() else "configured"
+            ok, ms, err = storage.probe_r2()
+            snap["r2_probe_ms"] = ms
+            if not ok:
+                snap["r2_probe_error"] = err
+                _degrade("r2_probe_failed")
+            elif ms > 1500:
+                _degrade(f"r2_slow_{ms}ms")
         else:
             snap["r2"] = "not_configured"
     except Exception:

@@ -98,6 +98,64 @@ def _get_client():
     return _client
 
 
+# Separate boto3 client dedicated to /health probes. Has its OWN urllib3
+# pool (2 connections) and aggressive timeouts so a probe can:
+#   1. Detect the main client's pool saturation — when the main pool is
+#      stuck, a probe on the shared client would also hang. This isolated
+#      client's HEAD completes (or fails fast) regardless.
+#   2. Fail in ≤3 s instead of the 30 s default — Railway's healthcheck
+#      probe times out at 5 s, so any check on the hot path must be well
+#      under that.
+_health_client = None
+
+
+def _get_health_client():
+    global _health_client
+    if _health_client is not None:
+        return _health_client
+    if not is_enabled():
+        return None
+    import boto3
+    from botocore.config import Config
+    _health_client = boto3.client(
+        "s3",
+        endpoint_url=R2_ENDPOINT_URL,
+        aws_access_key_id=R2_ACCESS_KEY_ID,
+        aws_secret_access_key=R2_SECRET_ACCESS_KEY,
+        config=Config(
+            signature_version="s3v4",
+            retries={"max_attempts": 0},  # /health must fail fast, not retry
+            connect_timeout=2,
+            read_timeout=3,
+            max_pool_connections=2,
+        ),
+    )
+    return _health_client
+
+
+def probe_r2() -> tuple[bool, int, str | None]:
+    """Live R2 reachability check for /health.
+
+    Does a head_bucket against R2_BUCKET via the isolated _health_client.
+    Returns (ok, elapsed_ms, error_msg). Total wall-clock is bounded by
+    connect_timeout + read_timeout (~5 s worst case).
+
+    Used by observability.health_snapshot to flag the API as degraded
+    when R2 is unreachable or slow (>1.5 s round-trip = pool churn or
+    network issue), even when nothing has crashed yet.
+    """
+    client = _get_health_client()
+    if client is None:
+        return False, 0, "not_configured"
+    import time as _time
+    t0 = _time.monotonic()
+    try:
+        client.head_bucket(Bucket=R2_BUCKET)
+        return True, int((_time.monotonic() - t0) * 1000), None
+    except Exception as e:
+        return False, int((_time.monotonic() - t0) * 1000), str(e)[:120]
+
+
 def _transfer_config():
     """Tuned multipart settings for multi-GB ProRes masters. boto3 defaults
     (8 MB chunks, 10 threads) made our 4.5 GB UMG masters take 25+ min;
