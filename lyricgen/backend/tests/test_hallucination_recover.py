@@ -14,6 +14,7 @@ from unittest.mock import patch, MagicMock
 
 from pipeline import (
     _align_whisper_to_plain,
+    _collapse_consecutive_duplicates,
     _detect_hallucination,
     _fetch_lrclib,
     _fill_gaps_with_reference,
@@ -560,6 +561,110 @@ def test_fill_gaps_clamps_start_to_audio_duration():
     # interleave (in this shape they don't, but assert the invariant).
     starts = [s["start"] for s in out]
     assert starts == sorted(starts)
+
+
+# ─── _collapse_consecutive_duplicates ─────────────────────────────────────
+# Bug B1 from the 2026-05-18 audit (agus.cafisi / Una Vez Más — Viejas
+# Locas): the original code collapsed ALL consecutive duplicate-text
+# segments into a single span, which was correct for Whisper's "¡Karol!"
+# hallucination loops (174 false repetitions) but destroyed legitimate
+# chorus repetitions ("Una vez más, una vez más, una vez más..." in the
+# outro fadeout). The fix needs to keep both: detect the hallucination
+# pattern (very many reps and/or very short text) and collapse, but
+# leave a normal chorus pattern (a handful of repetitions of a normal-
+# length line) untouched so the operator sees N entries in the editor.
+
+def test_collapse_preserves_legitimate_chorus_repetitions():
+    """A chorus that repeats 4 times in the outro must remain 4 segments
+    so the renderer shows the line appearing 4 times — once per audio
+    repetition — rather than one long subtitle pinned to the screen
+    while the singer chants. The Una Vez Más outro is the canonical
+    case: 'una vez más' (11 chars) × 4 repetitions at ~2s spacing."""
+    segs = [
+        {"start": 180.0, "end": 182.0, "text": "una vez más"},
+        {"start": 182.5, "end": 184.5, "text": "una vez más"},
+        {"start": 185.0, "end": 187.0, "text": "una vez más"},
+        {"start": 187.5, "end": 189.5, "text": "una vez más"},
+    ]
+    out = _collapse_consecutive_duplicates(segs)
+    assert len(out) == 4, (
+        f"chorus repetitions must stay separate, got {len(out)} segments"
+    )
+    # Timestamps preserved exactly.
+    assert [(s["start"], s["end"]) for s in out] == [
+        (180.0, 182.0), (182.5, 184.5), (185.0, 187.0), (187.5, 189.5),
+    ]
+
+
+def test_collapse_kills_karol_hallucination_loop():
+    """Whisper's known failure mode: an instrumental passage triggers
+    the model to emit the same short word 100+ times in a row. The
+    'Karol G — Si Antes Te Hubiera Conocido' case (2026-04) had 174
+    consecutive '¡Karol!' segments where the actual audio was the
+    audience chanting that name. Output must collapse to a single
+    span covering the whole chant window — letting 174 micro-segments
+    through breaks the renderer's per-line transitions."""
+    segs = [
+        {"start": 60 + i * 0.1, "end": 60 + i * 0.1 + 0.3, "text": "¡Karol!"}
+        for i in range(12)
+    ]
+    out = _collapse_consecutive_duplicates(segs)
+    assert len(out) == 1, (
+        f"Karol hallucination must collapse to 1 segment, got {len(out)}"
+    )
+    # End of the merged span covers the entire streak (last seg's end).
+    assert out[0]["start"] == segs[0]["start"]
+    assert out[0]["end"] == segs[-1]["end"]
+
+
+def test_collapse_leaves_non_duplicate_segments_untouched():
+    """Sanity: distinct text segments shouldn't merge regardless of
+    length or proximity."""
+    segs = [
+        {"start": 0.0, "end": 2.0, "text": "primera línea"},
+        {"start": 2.5, "end": 4.5, "text": "segunda línea"},
+        {"start": 5.0, "end": 7.0, "text": "tercera línea"},
+    ]
+    out = _collapse_consecutive_duplicates(segs)
+    assert len(out) == 3
+    assert [s["text"] for s in out] == ["primera línea", "segunda línea", "tercera línea"]
+
+
+def test_collapse_handles_mixed_chorus_and_hallucination():
+    """A normal chorus burst (2 repetitions of a long line) followed
+    later by a hallucination burst (12 repetitions of a short word)
+    should leave the chorus intact AND collapse the hallucination."""
+    segs = [
+        {"start": 10.0, "end": 12.0, "text": "esto es el estribillo"},
+        {"start": 12.5, "end": 14.5, "text": "esto es el estribillo"},
+        {"start": 30.0, "end": 32.0, "text": "verso distinto"},
+    ] + [
+        {"start": 60 + i * 0.1, "end": 60 + i * 0.1 + 0.2, "text": "no"}
+        for i in range(15)
+    ]
+    out = _collapse_consecutive_duplicates(segs)
+    # Chorus kept as 2, verse kept as 1, hallucination collapsed to 1.
+    assert len(out) == 4, [s["text"] for s in out]
+    assert [s["text"] for s in out[:3]] == [
+        "esto es el estribillo", "esto es el estribillo", "verso distinto",
+    ]
+    assert out[3]["text"] == "no"
+
+
+def test_collapse_normalizes_text_when_comparing():
+    """Whisper sometimes emits the same line with different
+    capitalisation or stray whitespace across consecutive segments
+    (Karol G captures had a real example: '¡KAROL!' alternating with
+    '¡Karol!'). The collapse / preservation heuristic must compare
+    normalised text so it doesn't accidentally keep a hallucination
+    just because Whisper varied the case."""
+    segs = [
+        {"start": 60 + i * 0.1, "end": 60 + i * 0.1 + 0.3,
+         "text": "¡Karol!" if i % 2 == 0 else "¡KAROL!  "}
+        for i in range(12)
+    ]
+    out = _collapse_consecutive_duplicates(segs)
+    assert len(out) == 1
 
 
 def test_fetch_lrclib_strips_complex_lrc_timestamps():
