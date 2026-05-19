@@ -19,6 +19,7 @@ import BatchProgress from "./components/BatchProgress";
 import JobDetail from "./components/JobDetail";
 import Settings from "./components/Settings";
 import AdminPanel from "./components/AdminPanel";
+import { useAlert } from "./components/AlertProvider";
 
 const API = import.meta.env.VITE_API_URL || "";
 
@@ -350,6 +351,7 @@ function JobDetailRoute({ fetchHistory }) {
 export default function App() {
   const { t } = useI18n();
   const navigate = useNavigate();
+  const { alert } = useAlert();
 
   const [token, setToken] = useState(getToken());
   const [user, setUser] = useState(getUser());
@@ -1261,13 +1263,21 @@ export default function App() {
       const res = await authFetch(`${API}/jobs/${jobId}`, { method: "DELETE" });
       if (!res.ok) {
         const data = await res.json().catch(() => ({}));
-        alert(data.detail || "No se pudo eliminar el video.");
+        alert({
+          title: "No se pudo eliminar el video",
+          description: data.detail || "Probá de nuevo en un momento.",
+          tone: "error",
+        });
         return;
       }
       // Optimistically drop from local list so the row disappears immediately.
       setHistory((prev) => prev.filter((j) => j.job_id !== jobId));
     } catch {
-      alert("Error de red al eliminar.");
+      alert({
+        title: "No se pudo eliminar el video",
+        description: "Hubo un problema de red. Revisá tu conexión y probá de nuevo.",
+        tone: "error",
+      });
     }
   };
 
@@ -1281,7 +1291,11 @@ export default function App() {
       });
       if (!res.ok) {
         const data = await res.json().catch(() => ({}));
-        alert(data.detail || "No se pudieron eliminar.");
+        alert({
+          title: "No se pudieron eliminar los videos",
+          description: data.detail || "Probá de nuevo en un momento.",
+          tone: "error",
+        });
         return;
       }
       const data = await res.json().catch(() => ({ deleted: [], skipped: {} }));
@@ -1289,10 +1303,18 @@ export default function App() {
       setHistory((prev) => prev.filter((j) => !deletedSet.has(j.job_id)));
       const skippedCount = Object.keys(data.skipped || {}).length;
       if (skippedCount > 0) {
-        alert(`${data.deleted.length} eliminados, ${skippedCount} omitidos (protegidos o no encontrados).`);
+        alert({
+          title: `${data.deleted.length} videos eliminados`,
+          description: `${skippedCount} no se pudieron eliminar (estaban protegidos o ya no existían).`,
+          tone: "warning",
+        });
       }
     } catch {
-      alert("Error de red al eliminar.");
+      alert({
+        title: "No se pudieron eliminar los videos",
+        description: "Hubo un problema de red. Revisá tu conexión y probá de nuevo.",
+        tone: "error",
+      });
     }
   };
 

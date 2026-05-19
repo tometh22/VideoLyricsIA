@@ -3,6 +3,7 @@ import { useI18n } from "../i18n";
 import BackgroundHintField from "./BackgroundHintField";
 import ContentValidationToggle, { isUmgTenant } from "./ContentValidationToggle";
 import LyricsEditor from "./LyricsEditor";
+import { useAlert } from "./AlertProvider";
 
 function _readTenant() {
   try {
@@ -87,6 +88,7 @@ export default function EditRequestPanel({
   const allowsLyrics = allowedModes.includes("lyrics");
   const allowsBackground = allowedModes.includes("background");
   const { t } = useI18n();
+  const { alert } = useAlert();
   const editCount = job.edit_count ?? 0;
   const editsRemaining = job.edits_remaining ?? Math.max(0, 3 - editCount);
   const initialParams = job.render_params || {};
@@ -1090,12 +1092,12 @@ function LyricsEditModal({
                     // spam every 3 s while the failure persists.
                     if (window.__genlyAutosaveAlerted !== detail) {
                       window.__genlyAutosaveAlerted = detail;
-                      window.alert(
-                        `Tus correcciones no se están guardando.\n\n` +
-                        `Motivo: ${detail}\n\n` +
-                        `Probá reabrir el job. Si el problema persiste, ` +
-                        `contactá al equipo de GenLy AI.`,
-                      );
+                      alert({
+                        title: "No pudimos guardar tus cambios",
+                        description:
+                          "Recargá la página y volvé a editar. Si el problema persiste, contactanos.",
+                        tone: "error",
+                      });
                     }
                   } else {
                     // Reset the alert sentinel on the first success
