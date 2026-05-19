@@ -41,7 +41,24 @@ function authHeaders() {
 export default function VariantCreateModal({ job, onClose, onCreated }) {
   const { t } = useI18n();
   const initialConcept = job?.render_params?.concept || "";
-  const [backgroundHint, setBackgroundHint] = useState("");
+  // Pre-fill background_hint with the last prompt the operator tried for
+  // a variant of THIS parent. Use case: the previous variant failed
+  // validation_failed (e.g. "rock guitarist hands" blocked by Guideline
+  // 15). Operator closes the modal, comes back to "Crear variante",
+  // expects to see their work; previously we reset to "". Now we read
+  // localStorage keyed by parent_job_id.
+  //
+  // Saved on every submit attempt (even before fetch resolves) so the
+  // prompt survives a fail. Cleared after success.
+  const _hintCacheKey = `genly_variant_hint_${job?.job_id || ""}`;
+  const _initialHint = (() => {
+    try {
+      return localStorage.getItem(_hintCacheKey) || "";
+    } catch {
+      return "";
+    }
+  })();
+  const [backgroundHint, setBackgroundHint] = useState(_initialHint);
   const [concept, setConcept] = useState(initialConcept);
   // Tenant-aware content-validation choice. See EditRequestPanel for
   // the full rationale. value=true means "run validator"; default per
@@ -67,6 +84,19 @@ export default function VariantCreateModal({ job, onClose, onCreated }) {
     const payload = {};
     const hint = backgroundHint.trim();
     if (hint) payload.background_hint = hint;
+    // Stash the hint as the operator submits so it survives a failed
+    // variant (validation_failed, server restart, network blip). Cleared
+    // after success in the .ok branch below. We persist BEFORE the
+    // fetch so even a network error can't lose the work.
+    try {
+      if (hint) {
+        localStorage.setItem(_hintCacheKey, hint);
+      } else {
+        localStorage.removeItem(_hintCacheKey);
+      }
+    } catch {
+      // localStorage disabled (private window, quota, etc.) — non-fatal.
+    }
     // concept: solo lo mandamos si el operador lo cambió. Si dejó el
     // del padre tal cual, no lo mandamos — el backend hereda.
     const conceptTrimmed = concept.trim();
@@ -103,6 +133,13 @@ export default function VariantCreateModal({ job, onClose, onCreated }) {
         throw new Error(detail || `Error ${res.status}`);
       }
       const data = await res.json();
+      // Variant enqueued successfully — clear the cached prompt so the
+      // next "Crear variante" opens fresh. We don't wait for the variant
+      // to actually finish rendering; queueing is success enough for UX
+      // purposes (operator already committed to this prompt).
+      try {
+        localStorage.removeItem(_hintCacheKey);
+      } catch { /* ignore */ }
       if (mountedRef.current) {
         onCreated?.(data.job_id);
       }
