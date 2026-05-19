@@ -166,15 +166,58 @@ def touch_user_activity(db: Session, job: Job) -> None:
     job.last_user_activity_at = datetime.now(timezone.utc)
 
 
-def _delete_r2_objects(job: Job) -> None:
-    """Best-effort delete all R2 objects tied to a job.
+def _delete_r2_objects(db: Session, job: Job) -> None:
+    """Best-effort delete R2 objects tied to a job.
 
-    Called before the DB row is removed so we still have the keys.
+    Output keys (s3_keys: video, short, thumbnail, umg_master, umg_short)
+    are per-job and always safe to delete with the row.
+
+    input_r2_key is SHARED across the parent job and every variant/edit
+    spawned from it (see main.py:create_variant — variants copy the
+    parent's input_r2_key to skip re-upload). Deleting it when a sibling
+    still references the same audio breaks every "Reintentar sin
+    re-subir" the operator might click on those other jobs, with the
+    cryptic "Could not download source audio from R2" message. The
+    2026-05-19 agus.cafisi incident on staging — operator deleted one
+    failed variant of "Una Vez Más", and the next retry of a sibling
+    variant 404'd on R2.
+
+    The fix: count how many OTHER live jobs share the same
+    input_r2_key, and skip the R2 delete if any do. The audio gets
+    garbage-collected when the last referencing job is deleted. The
+    `cleanup_old_inputs` script (retention 30 d) is the long-stop for
+    keys whose last-reference deletion was somehow missed.
+
+    Called before the DB row is removed so the reference check counts
+    the row we're about to delete as the one self-excluded by job_id.
     Errors are swallowed — R2 cleanup must never block the DB delete.
     """
     keys: list[str] = []
     if job.input_r2_key:
-        keys.append(job.input_r2_key)
+        try:
+            others = (
+                db.query(Job)
+                .filter(Job.input_r2_key == job.input_r2_key)
+                .filter(Job.job_id != job.job_id)
+                .count()
+            )
+        except Exception as exc:
+            # Conservative: if we can't count siblings, KEEP the audio.
+            # cleanup_old_inputs will reclaim it eventually if truly
+            # orphaned. Losing the audio is much worse than leaving an
+            # orphan in R2 for 30 days.
+            _logger.warning(
+                "Could not count siblings for %s; skipping input_r2_key delete: %s",
+                job.job_id, exc,
+            )
+            others = 1
+        if others == 0:
+            keys.append(job.input_r2_key)
+        else:
+            _logger.info(
+                "Skipping R2 input delete for %s — %d sibling job(s) still reference %s",
+                job.job_id, others, job.input_r2_key,
+            )
     s3 = job.s3_keys or {}
     if isinstance(s3, dict):
         keys.extend(v for v in s3.values() if isinstance(v, str) and v)
@@ -222,7 +265,7 @@ def delete_job(db: Session, job_id: str, tenant_id: str) -> tuple[bool, str]:
         return False, "not_found"
     if job.status not in _DELETABLE_STATUSES:
         return False, f"protected_status:{job.status}"
-    _delete_r2_objects(job)
+    _delete_r2_objects(db, job)
     db.query(AIProvenance).filter(AIProvenance.job_id == job_id).delete(synchronize_session=False)
     db.delete(job)
     db.commit()
@@ -271,9 +314,15 @@ def bulk_delete_jobs(db: Session, job_ids: list[str], tenant_id: str) -> dict:
         db.commit()
         deleted = deletable_ids
 
-        # Best-effort R2 cleanup after successful DB commit.
+        # Best-effort R2 cleanup after successful DB commit. The bulk
+        # DELETE above has already removed every job_id in `r2_rows`
+        # from the DB, so the sibling-count inside _delete_r2_objects
+        # only sees siblings OUTSIDE this bulk batch. That's the right
+        # behavior: if the operator nuked every variant of an audio in
+        # one click, the audio gets reclaimed; if any sibling was left
+        # behind, it stays protected.
         for r in r2_rows:
-            _delete_r2_objects(r)
+            _delete_r2_objects(db, r)
 
     return {"deleted": deleted, "skipped": skipped}
 
