@@ -4696,8 +4696,19 @@ async def save_segments(
     # Incident 2026-05-15: Bersuit's "enfermera del amor" lyric reverted
     # to "de la amor" on 3 of 4 occurrences after a background re-render
     # because autosave 409'd against pending_review here.
+    #
+    # `done` added 2026-05-19: JobDetail presents a LyricsEditor on done
+    # jobs (see EditRequestPanel allowedModes for done/rejected), so the
+    # operator can fix typos on already-shipped videos. Autosave needs to
+    # write through to segments_json before the operator clicks
+    # "Re-renderizar" — without this, every keystroke 409'd and the
+    # corrections were lost. The endpoint only writes segments_json + bumps
+    # last_user_activity_at; it never mutates status, so allowing it on
+    # done has no pipeline-state side effects. The actual re-render still
+    # goes through POST /edit with edit_type="lyrics" which transitions
+    # the job to editing.
     _SAVE_SEGMENTS_ALLOWED = (
-        "transcribed_pending", "pending_review", "rejected", "editing",
+        "transcribed_pending", "pending_review", "rejected", "editing", "done",
     )
     if job.status not in _SAVE_SEGMENTS_ALLOWED:
         raise HTTPException(
