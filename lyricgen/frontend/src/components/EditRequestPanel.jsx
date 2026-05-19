@@ -262,12 +262,14 @@ export default function EditRequestPanel({
       if (backgroundMode && backgroundMode !== "veo") {
         p.background_mode = backgroundMode;
       }
-      // Translate the operator's boolean choice into the right backend
-      // flag for their tenant. Sending only the flag that "departs from
-      // default" keeps payloads minimal and friendly to older backends.
-      if (_isUmg && !validationEnabled) {
+      // Always send one of the two flags based purely on operator intent.
+      // The tenant-conditional version silently dropped BOTH flags when
+      // frontend tenant detection failed (stale localStorage, old login)
+      // and the backend defaulted to UMG-validate. See VariantCreateModal
+      // for the full incident (2026-05-19).
+      if (!validationEnabled) {
         p.bypass_content_validation = true;
-      } else if (!_isUmg && validationEnabled) {
+      } else {
         p.force_content_validation = true;
       }
       if (latestEditedSegments.current && latestEditedSegments.current.length > 0) {
