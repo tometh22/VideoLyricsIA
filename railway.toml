@@ -69,6 +69,35 @@ restartPolicyMaxRetries = 5
 
 [services.api.deploy]
 healthcheckPath = "/health"
+# Zero-downtime deploys. Railway Pro's OVERLAP behavior boots the new
+# replica, waits for healthcheck to pass, and only THEN kills the old.
+# With numReplicas=1 the failure mode is: a healthcheck race during
+# deploy still produces a 1-3 s 502 window when Railway swaps which
+# pod the edge proxy points at. With numReplicas=2, deploys are truly
+# rolling (one replica updated at a time) and there's always a healthy
+# replica behind the edge proxy.
+#
+# Why not just bump healthcheck-grace and stay at 1 replica:
+#   - We tried that; it reduces but doesn't eliminate the 502 window.
+#   - 1 replica = no redundancy if a single pod OOMs or hits an
+#     uncaught exception during a request (Sentry-logged but client-
+#     visible).
+#   - UMG signed 2026-05-19 — SLA expectation is now "no perceptible
+#     downtime on normal deploys".
+#
+# DB connection math (must stay below max_connections=100):
+#   Pre-bump:  1 replica × 4 uvicorn workers × (pool 6 + overflow 4) = 40 conns
+#   Post-bump: 2 replicas × 2 uvicorn workers × 10 = 40 conns (unchanged)
+# Worker service contributes 7 × 10 = 70 conns; admin/migrations reserve
+# ~5. Total stays ~115 — slightly over the default 100 but Railway PG on
+# Pro tier supports up to 500. Verify max_connections in Railway PG
+# settings before merging (psql: SHOW max_connections;).
+#
+# The uvicorn workers reduction lives in the Dockerfile CMD, not here:
+# Railway has no per-service ENTRYPOINT override. See lyricgen/Dockerfile
+# line 63: --workers 2.
+numReplicas = 2
+
 # Cold-start budget. The API does a lot on boot:
 #   • sentry init                            (~1-2 s)
 #   • SQLAlchemy engine + first PG connect  (3-15 s, Railway PG cold)
