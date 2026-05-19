@@ -63,36 +63,40 @@ export default function ContentValidationToggle({
     typeof initialOpen === "boolean" ? initialOpen : isDeparting
   );
 
-  // Per-tenant copy.
+  // Per-tenant copy. V3 framing: state the question, then both options as
+  // explicit "Sí / No" answers tied to "apto para UMG" vs "fondo libre"
+  // so the operator sees the tradeoff in plain language. The default
+  // (recommended) and alt sides swap per tenant, but the wording for each
+  // side stays the same — only its position changes.
   const copy = isUmg
     ? {
-        sectionLabel: t("validation.section_label") || "Verificación de contenido",
-        defaultLabel: t("validation.umg_default_label") || "Activa",
+        sectionLabel: t("validation.section_label") || "¿Restringir el contenido del fondo?",
+        defaultLabel: t("validation.umg_default_label") || "Sí — apto para UMG",
         defaultRecommended: t("validation.umg_recommended") || "recomendado · default",
         defaultDesc:
           t("validation.umg_default_desc") ||
-          "Bloquea fondos con caras / manos / logos detectables antes del render. Lo que UMG normalmente rechazaría.",
-        altLabel: t("validation.umg_alt_label") || "Asumir el riesgo",
+          "Sin caras, sin manos, sin logos detectables.",
+        altLabel: t("validation.umg_alt_label") || "No — fondo libre",
         altDesc:
           t("validation.umg_alt_desc") ||
-          "El render sale aunque la AI genere caras / manos / logos. UMG puede rechazar el video después — vos asumís esa decisión.",
-        badge: t("validation.umg_badge") || "RIESGO ASUMIDO",
-        // amber when departing
+          "Cualquier escena. Riesgo de rechazo por UMG.",
+        badge: t("validation.umg_badge") || "FONDO LIBRE",
+        // amber when departing (operator is opting OUT of the safer default)
         departingTone: "amber",
       }
     : {
-        sectionLabel: t("validation.section_label") || "Verificación de contenido",
-        defaultLabel: t("validation.nonumg_default_label") || "Sin verificación",
+        sectionLabel: t("validation.section_label") || "¿Restringir el contenido del fondo?",
+        defaultLabel: t("validation.nonumg_default_label") || "No — fondo libre",
         defaultRecommended: t("validation.nonumg_default_recommended") || "default",
         defaultDesc:
           t("validation.nonumg_default_desc") ||
-          "El render sale como pediste, sin chequeos automáticos de contenido.",
-        altLabel: t("validation.nonumg_alt_label") || "Activar verificación",
+          "Cualquier escena, sin restricciones.",
+        altLabel: t("validation.nonumg_alt_label") || "Sí — apto para UMG",
         altDesc:
           t("validation.nonumg_alt_desc") ||
-          "Bloquea fondos con caras / manos / logos detectables antes del render (las reglas UMG). Útil si vas a entregarle a un sello.",
-        badge: t("validation.nonumg_badge") || "VERIFICACIÓN ACTIVA",
-        // brand color when departing (validating is "extra care", not "risk")
+          "Sin caras, sin manos, sin logos detectables. Útil si vas a entregar a un sello.",
+        badge: t("validation.nonumg_badge") || "APTO UMG",
+        // brand color when departing (operator is opting INTO the stricter mode)
         departingTone: "brand",
       };
 
