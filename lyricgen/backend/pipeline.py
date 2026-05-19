@@ -580,6 +580,7 @@ def run_pipeline(job_id: str, mp3_path: str, artist: str, style: str,
                 image_to_video_path=(background_path if _animate_user_image else None),
                 match_lyrics=match_lyrics,
                 background_hint=background_hint,
+                allow_people=_compute_allow_people(job_id),
             )
             # Image-to-video fallback: if Veo failed to produce an MP4 (None
             # or non-existent path) AND the operator wanted to animate their
@@ -660,7 +661,8 @@ def run_pipeline(job_id: str, mp3_path: str, artist: str, style: str,
             #
             # Both flags are safe to send regardless of tenant: each only
             # has effect when it pushes against its tenant's default.
-            UMG_TENANTS = {"umg", "omg"}
+            # UMG_TENANTS lives at module scope so _compute_allow_people()
+            # and this block share the same source of truth.
             _tenant_id = None
             _bypass_validation = False
             _force_validation = False
@@ -3044,6 +3046,53 @@ def _env_flag(name: str) -> bool:
     return _os.environ.get(name, "").strip().lower() in ("1", "true", "yes", "on")
 
 
+# Tenants whose contract requires the UMG Guideline 15 content filter
+# (no faces / hands / logos in backgrounds). All other tenants render
+# freely by default and can opt in via force_content_validation. Mirror
+# of frontend ContentValidationToggle.UMG_TENANTS — keep in sync.
+UMG_TENANTS = {"umg", "omg"}
+
+
+def _compute_allow_people(job_id: str | None) -> bool:
+    """Should the AI be allowed to render people in the bg for this job?
+
+    Returns True when the content_validator would be SKIPPED for the job
+    (per tenant default + operator override). False when validator would
+    run. Drives the `allow_people` flag threaded into
+    `_analyze_lyrics_for_background`, `_generate_veo_video`, and
+    `_generate_imagen_image` so the no-people clauses in those system
+    prompts get dropped consistently with the post-gen check.
+
+    Pre-fix the toggle "Asumir el riesgo / fondo libre" only relaxed the
+    post-gen validator; the pre-gen prompt sanitization still stripped
+    people. The operator's prompt "woman lies upside down on armchair"
+    rendered an empty armchair (incident 2026-05-19). This helper closes
+    that gap.
+
+    Safe to call with `job_id=None` — returns False (conservative).
+    """
+    if not job_id:
+        return False
+    try:
+        from database import SessionLocal as _SL, Job as _Job
+        with _SL() as _db:
+            row = _db.query(_Job).filter(_Job.job_id == job_id).first()
+            if not row:
+                return False
+            tenant = row.tenant_id or ""
+            rp = row.render_params if isinstance(row.render_params, dict) else {}
+            bypass = bool(rp.get("bypass_content_validation"))
+            force = bool(rp.get("force_content_validation"))
+            is_umg = tenant in UMG_TENANTS
+            # Allow people when validator would NOT run. Same boolean
+            # algebra as Step 1b — but inverted (allow_people = NOT validate).
+            should_validate = (is_umg and not bypass) or (not is_umg and force)
+            return not should_validate
+    except Exception as e:
+        logger.warning("[BG] _compute_allow_people fallback to False for job %s: %s", job_id, e)
+        return False
+
+
 def _validate_segments_against_audio(audio_path: str, segments: list[dict],
                                       job_id: str | None = None,
                                       n_samples: int = 3) -> list[dict]:
@@ -4011,7 +4060,8 @@ def _analyze_lyrics_for_background(lyrics_text: str, artist: str, job_id: str = 
                                     movement_style: str = "",
                                     match_lyrics: bool = True,
                                     background_hint: str | None = None,
-                                    for_provider: str = "veo") -> dict:
+                                    for_provider: str = "veo",
+                                    allow_people: bool = False) -> dict:
     """Use Gemini to analyze lyrics and choose visual style + prompt.
 
     match_lyrics=True  ("Inspirado en la letra"): lyrics anchor or infuse the scene.
@@ -4042,6 +4092,19 @@ def _analyze_lyrics_for_background(lyrics_text: str, artist: str, job_id: str = 
     movement_rule = _MOVEMENT_STYLE_RULES.get(normalized_movement, "")
     movement_extra_line = f"\n- {movement_rule}" if movement_rule else ""
 
+    # The "no people" line is gated by `allow_people`. When the operator
+    # opted into "fondo libre" (bypass_content_validation=True) OR the
+    # tenant is non-UMG and didn't force validation, this restriction is
+    # lifted at PROMPT level — Gemini will let people / faces / hands
+    # through. The Veo safe_prompt suffix is gated by the same flag (see
+    # `_generate_veo_video`). Pre-fix the toggle promised "fondo libre"
+    # but the AI silently stripped people regardless — incident 2026-05-19
+    # where art-rock prompt "woman lies upside down on armchair" rendered
+    # an empty armchair.
+    _people_rule = (
+        "" if allow_people
+        else "- Never include people, faces, hands, or readable text in the scene\n"
+    )
     _PROMPT_RULES = (
         "- \"style\" must always be \"video\"\n"
         "- \"prompt\" is 80-120 words. Describe: (1) specific scene subject and setting "
@@ -4050,7 +4113,7 @@ def _analyze_lyrics_for_background(lyrics_text: str, artist: str, job_id: str = 
         "specific texture or material detail. Be precise and cinematic — avoid vague "
         "adjectives like \"beautiful\" or \"amazing\".\n"
         "- Pick a DIFFERENT specific scene each time (don't repeat across songs)\n"
-        "- Never include people, faces, hands, or readable text in the scene\n"
+        f"{_people_rule}"
         "- When a concept and lyrics are both present, the LYRICS dictate the "
         "subject of the scene and the CONCEPT dictates its visual styling "
         "(palette, texture, atmosphere, register). Concept never replaces or "
@@ -4213,7 +4276,7 @@ Hard rules:
 - Pick a DIFFERENT specific scene each time (don't repeat across songs)
 - If lyrics reference a sport (football, basketball, etc.) → use field/pitch/arena/equipment, NOT cars or generic cityscapes
 - Do NOT default to "calm ocean at sunset" unless the song is genuinely BALLAD
-- Never include people, faces, hands, or readable text in the scene"""
+""" + ("" if allow_people else "- Never include people, faces, hands, or readable text in the scene")
         else:
             # Strict auto mode: classify genre, pick vocabulary, no lyrics.
             system_prompt = f"""{_EXAMPLE}
@@ -4239,7 +4302,7 @@ Hard rules:
 - "style" must always be "video"
 - Pick a DIFFERENT specific scene each time (don't repeat across songs)
 - Do NOT default to "calm ocean at sunset" unless the song is genuinely BALLAD
-- Never include people, faces, hands, or readable text in the scene"""
+""" + ("" if allow_people else "- Never include people, faces, hands, or readable text in the scene")
         if movement_rule:
             system_prompt = system_prompt + "\n- " + movement_rule
 
@@ -4420,7 +4483,8 @@ def _get_unique_prompt(lyrics_text: str = None, artist: str = "", job_id: str = 
                        song_title: str = "", genre: str = "", concept: str = "",
                        movement_style: str = "", match_lyrics: bool = True,
                        background_hint: str | None = None,
-                       for_provider: str = "veo") -> dict:
+                       for_provider: str = "veo",
+                       allow_people: bool = False) -> dict:
     """Get a unique style+prompt combination. Returns {style, prompt}.
 
     `for_provider` ("veo" default | "imagen") nudges the prompt towards
@@ -4460,6 +4524,7 @@ def _get_unique_prompt(lyrics_text: str = None, artist: str = "", job_id: str = 
             genre=genre, concept=concept, movement_style=movement_style,
             match_lyrics=match_lyrics, background_hint=background_hint,
             for_provider=for_provider,
+            allow_people=allow_people,
         )
         if result["prompt"] and result["prompt"] not in used:
             used.append(result["prompt"])
@@ -4553,7 +4618,8 @@ def _generate_veo_video(prompt: str, output_path: str, job_id: str = None,
                         cache_namespace: str = "",
                         image_path: str | None = None,
                         movement_style: str = "",
-                        normalized_concept: str = "") -> str:
+                        normalized_concept: str = "",
+                        allow_people: bool = False) -> str:
     """Generate a video clip with Google Veo 3 via direct Vertex AI REST API.
 
     We bypass google-genai SDK for Veo specifically because its internal auth
@@ -4593,19 +4659,26 @@ def _generate_veo_video(prompt: str, output_path: str, job_id: str = None,
         "back-street as the primary subject unless the lyrics demand it. "
     )
 
+    # When `allow_people` is True the operator opted into "fondo libre"
+    # for an UMG tenant, OR the tenant is non-UMG (their default). Drop
+    # the "no people / no faces / no hands" clauses so Veo can render
+    # subjects the operator's prompt requests (woman in armchair, hands
+    # playing guitar, etc.). The logo / brand / readable-text negatives
+    # stay regardless because those are legal/IP concerns separate from
+    # the people question.
+    _people_clause = "" if allow_people else " no people, no faces, no hands,"
     if movement_style == "animado":
         # Cartoon / 2D illustration aesthetic — keep all safety clauses
         # except the "no CGI / no animation" pair, which would directly
-        # contradict the requested look. Other prohibitions (no text, no
-        # people, no logos, etc.) stay in place.
+        # contradict the requested look.
         safe_prompt = (
             f"{prompt}. Stylised 2D animated illustration, flat shapes, "
             "deliberate cartoon-like motion. "
             f"{no_alley}"
             "No text, no words, no letters, no signs, no billboards, no posters, "
             "no banners, no graffiti, no shop windows, no street signs, no neon "
-            "signs, no logos, no trademarks, no brand symbols, no people, "
-            "no faces, no hands."
+            f"signs, no logos, no trademarks, no brand symbols,{_people_clause}"
+            " no extra animation noise."
         )
     else:
         safe_prompt = (
@@ -4613,8 +4686,8 @@ def _generate_veo_video(prompt: str, output_path: str, job_id: str = None,
             f"{no_alley}"
             "No text, no words, no letters, no signs, no billboards, no posters, "
             "no banners, no graffiti, no shop windows, no street signs, no neon "
-            "signs, no logos, no trademarks, no brand symbols, no people, "
-            "no faces, no hands, no CGI, no animation."
+            f"signs, no logos, no trademarks, no brand symbols,{_people_clause}"
+            " no CGI, no animation."
         )
 
     # veo-3.1-fast at $0.10/s (no audio) is 75% cheaper than the standard
@@ -4914,12 +4987,17 @@ def _generate_veo_video(prompt: str, output_path: str, job_id: str = None,
 
 
 def _generate_imagen_image(prompt: str, output_path: str, max_retries: int = 5,
-                            job_id: str = None, model: str | None = None) -> str:
+                            job_id: str = None, model: str | None = None,
+                            allow_people: bool = False) -> str:
     """Generate an image with Google Imagen 4. Auto-retries on rate limit.
 
     `model` lets the caller override the default. Library generation can
     pass `imagen-4.0-ultra-generate-001` for marquee-quality stills;
     runtime job rendering keeps the standard tier for cost reasons.
+
+    `allow_people`: when True, the safe-prompt suffix drops the
+    "no people / no faces / no hands" clauses so Imagen can render
+    subjects the operator's prompt requested. Logo/text negatives stay.
     """
     from google import genai
     from google.genai.errors import ClientError
@@ -4932,7 +5010,8 @@ def _generate_imagen_image(prompt: str, output_path: str, max_retries: int = 5,
                     or os.environ.get("IMAGEN_MODEL")
                     or "imagen-4.0-generate-001").strip()
 
-    safe_prompt = f"{prompt}. No text, no words, no letters, no people, no faces, no hands."
+    _people_suffix = "" if allow_people else " no people, no faces, no hands,"
+    safe_prompt = f"{prompt}. No text, no words, no letters,{_people_suffix} no logos, no readable signage."
 
     recorder = record_ai_call(
         job_id=job_id or "unknown",
@@ -5091,7 +5170,8 @@ def _ensure_background(style_hint: str, job_dir: str, lyrics_text: str = None,
                        image_to_video_path: str | None = None,
                        match_lyrics: bool = True,
                        background_hint: str | None = None,
-                       bg_mode: str = "veo") -> str:
+                       bg_mode: str = "veo",
+                       allow_people: bool = False) -> str:
     """Generate background using AI. Gemini picks the best style for the song.
 
     background_hint: optional free-form operator description, set via /edit
@@ -5126,6 +5206,7 @@ def _ensure_background(style_hint: str, job_dir: str, lyrics_text: str = None,
             concept=concept, movement_style=movement_style, match_lyrics=match_lyrics,
             background_hint=background_hint,
             for_provider="imagen",
+            allow_people=allow_people,
         )
         prompt = result["prompt"]
         image_path = os.path.join(job_dir, "bg_imagen.jpg")
@@ -5133,7 +5214,7 @@ def _ensure_background(style_hint: str, job_dir: str, lyrics_text: str = None,
         # Imagen-4 has its own internal rate-limit retry (5 attempts with
         # 60s backoff). Any other exception bubbles up to the caller's
         # try/except which falls back to the gradient.
-        _generate_imagen_image(prompt, image_path, job_id=job_id)
+        _generate_imagen_image(prompt, image_path, job_id=job_id, allow_people=allow_people)
         # Ken Burns produces a 60s sample that downstream palindrome-loops
         # to match the audio duration. Same contract as the Veo path.
         _ken_burns_image_to_mp4(image_path, bg_path)
@@ -5144,6 +5225,7 @@ def _ensure_background(style_hint: str, job_dir: str, lyrics_text: str = None,
         lyrics_text, artist, job_id=job_id, song_title=song_title, genre=genre,
         concept=concept, movement_style=movement_style, match_lyrics=match_lyrics,
         background_hint=background_hint,
+        allow_people=allow_people,
     )
     prompt = result["prompt"]
 
@@ -5158,6 +5240,7 @@ def _ensure_background(style_hint: str, job_dir: str, lyrics_text: str = None,
                 image_path=image_to_video_path,
                 movement_style=movement_style,
                 normalized_concept=_normalize_concept(concept),
+                allow_people=allow_people,
             )
             # Semantic relevance check — always score, but cap retries at one
             # to bound cost (+$0.80 worst case). quality_retry_used gates the
@@ -5179,6 +5262,7 @@ def _ensure_background(style_hint: str, job_dir: str, lyrics_text: str = None,
                     genre=genre, concept=concept, movement_style=movement_style,
                     match_lyrics=match_lyrics,
                     background_hint=background_hint,
+                    allow_people=allow_people,
                 )
                 prompt = result["prompt"]
                 continue
@@ -7011,6 +7095,7 @@ def run_edit_pipeline(
                 movement_style=movement_style,
                 background_hint=background_hint,
                 bg_mode=background_mode,
+                allow_people=_compute_allow_people(job_id),
             )
             update_job(job_id, progress=35)
             # Re-cache the new background so future typography edits work.
