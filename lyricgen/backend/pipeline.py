@@ -643,7 +643,44 @@ def run_pipeline(job_id: str, mp3_path: str, artist: str, style: str,
         #     the first one that passes (up to 3 attempts).
         if wants_youtube:
             update_job(job_id, current_step="validation", progress=38)
-            if bg_image_path:
+
+            # Operator-controlled bypass: when the operator explicitly
+            # opts in via render_params.bypass_content_validation, skip
+            # the validator entirely. Used when the visual concept *is*
+            # something the validator would flag (e.g. rock guitarist
+            # hands strumming — hands as subject violates Guideline 15
+            # by default, but the song's identity depends on showing
+            # them). Operator accepts the downstream UMG-review rejection
+            # risk; we just log + persist an audit marker.
+            _bypass_validation = False
+            try:
+                from database import SessionLocal as _SL, Job as _Job
+                with _SL() as _db:
+                    _row = _db.query(_Job).filter(_Job.job_id == job_id).first()
+                    if _row and isinstance(_row.render_params, dict):
+                        _bypass_validation = bool(
+                            _row.render_params.get("bypass_content_validation")
+                        )
+            except Exception as e:
+                logger.warning("[VALIDATION] could not read bypass flag, defaulting to OFF: %s", e)
+                _bypass_validation = False
+
+            if _bypass_validation:
+                from datetime import datetime as _dt
+                logger.warning(
+                    "[VALIDATION] BYPASSED by operator for job %s "
+                    "(render_params.bypass_content_validation=True). "
+                    "Downstream UMG review may still reject.",
+                    job_id,
+                )
+                update_job(job_id, validation_result={
+                    "passed": True,
+                    "issues": [],
+                    "bypassed": True,
+                    "bypassed_at": _dt.utcnow().isoformat() + "Z",
+                    "bypassed_reason": "operator_override_via_render_params",
+                })
+            elif bg_image_path:
                 from content_validator import validate_video, validate_image
                 ext = os.path.splitext(bg_image_path)[1].lower()
                 _validate_fn = (
