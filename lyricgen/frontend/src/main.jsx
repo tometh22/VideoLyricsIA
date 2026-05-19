@@ -4,6 +4,7 @@ import { BrowserRouter } from "react-router-dom";
 import { I18nProvider } from "./i18n";
 import App from "./App";
 import GlobalErrorBoundary from "./components/GlobalErrorBoundary";
+import { AlertProvider } from "./components/AlertProvider";
 import "./index.css";
 
 ReactDOM.createRoot(document.getElementById("root")).render(
@@ -11,7 +12,9 @@ ReactDOM.createRoot(document.getElementById("root")).render(
     <GlobalErrorBoundary>
       <BrowserRouter>
         <I18nProvider>
-          <App />
+          <AlertProvider>
+            <App />
+          </AlertProvider>
         </I18nProvider>
       </BrowserRouter>
     </GlobalErrorBoundary>
