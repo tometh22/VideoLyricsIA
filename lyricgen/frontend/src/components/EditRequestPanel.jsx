@@ -126,6 +126,15 @@ export default function EditRequestPanel({
   // untouched so we don't accidentally overwrite segments_json with a
   // mirror of itself on a no-op edit.
   const latestEditedSegments = useRef(null);
+  // Snapshot of the segments array as last persisted by /save-segments.
+  // We pass THIS (instead of the parent's job.segments_json) to the
+  // LyricsEditModal so reopen-after-edit shows what was saved, not the
+  // stale array the parent still holds. JobDetail's /status polling does
+  // not return segments_json (intentional — too heavy), so without this
+  // local mirror, close → reopen surfaces pre-edit text and the next
+  // autosave overwrites the just-saved version with the stale one.
+  // Bug found in 2026-05-19 QA pass. Reset when job changes (below).
+  const [lastSavedSegments, setLastSavedSegments] = useState(null);
   const [form, setForm] = useState({
     font:             initialParams.font             ?? "",
     font_scale:       initialParams.font_scale       ?? 1.0,
@@ -158,6 +167,15 @@ export default function EditRequestPanel({
   // ways. Track mount state and skip leftover setState calls.
   const mountedRef = useRef(true);
   useEffect(() => () => { mountedRef.current = false; }, []);
+
+  // Reset the local saved-segments mirror when the panel is reused across
+  // a different job (JobDetail keeps EditRequestPanel mounted while you
+  // navigate within the SPA). Without this, opening job B's editor would
+  // show job A's last-saved snapshot — worse than the stale-prop bug we
+  // are fixing.
+  useEffect(() => {
+    setLastSavedSegments(null);
+  }, [job.job_id]);
 
   const limitReached = editsRemaining <= 0;
   // Typography reuses the cached bg from R2 to skip Veo. Without a
@@ -923,6 +941,12 @@ export default function EditRequestPanel({
         audioError={lyricsAudioError}
         error={error}
         job={job}
+        segments={lastSavedSegments || job.segments_json}
+        onSavedSegments={(segs) => {
+          // Spread to a fresh array so LyricsEditor's B7
+          // reference-change useEffect re-syncs on next mount.
+          if (mountedRef.current) setLastSavedSegments(segs.slice());
+        }}
         onClose={() => { setMode(null); setError(null); }}
         audioUrl={lyricsAudioUrl}
         onApprove={submitLyricsWithSegments}
@@ -943,8 +967,8 @@ export default function EditRequestPanel({
  * behavior — editHistory, syncMode, etc are reset).
  */
 function LyricsEditModal({
-  open, audioError, error, job, onClose, audioUrl, onApprove,
-  submitting, initialParams, t,
+  open, audioError, error, job, segments, onSavedSegments,
+  onClose, audioUrl, onApprove, submitting, initialParams, t,
 }) {
   // Lock the underlying body scroll while the modal is open. Without
   // this, scrolling on the modal's segment list bleeds through to the
@@ -956,16 +980,31 @@ function LyricsEditModal({
     return () => { document.body.style.overflow = prev; };
   }, [open]);
 
-  // Close on Escape — standard modal behavior.
+  // Close on Escape — standard modal behavior. defaultPrevented check:
+  // LyricsEditor binds its own window-level Escape handler that exits
+  // sync mode (and calls preventDefault). React attaches child effects
+  // before parent effects, so the child's listener runs first. Without
+  // this guard, hitting Escape while in sync mode tore down the whole
+  // modal — the operator lost their editing context just trying to
+  // leave a sub-mode. Bug found in 2026-05-19 QA pass.
   useEffect(() => {
     if (!open) return;
-    const onKey = (e) => { if (e.key === "Escape") onClose(); };
+    const onKey = (e) => {
+      if (e.key !== "Escape") return;
+      if (e.defaultPrevented) return;
+      onClose();
+    };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
   }, [open, onClose]);
 
   if (!open) return null;
-  const noSegments = !Array.isArray(job.segments_json) || job.segments_json.length === 0;
+  // Prefer the local mirror from EditRequestPanel (post-autosave) over
+  // job.segments_json, which lags because /status polling intentionally
+  // omits the heavy field. Falling back to job is correct for the very
+  // first open (before any save lands).
+  const effectiveSegments = Array.isArray(segments) ? segments : job.segments_json;
+  const noSegments = !Array.isArray(effectiveSegments) || effectiveSegments.length === 0;
 
   return (
     <div className="fixed inset-0 z-[60] bg-surface overflow-y-auto">
@@ -999,7 +1038,7 @@ function LyricsEditModal({
             </div>
           ) : (
             <LyricsEditor
-              segments={job.segments_json}
+              segments={effectiveSegments}
               filename={job.filename || job.artist || "lyrics"}
               audioFile={null}
               audioUrl={audioUrl}
@@ -1063,6 +1102,12 @@ function LyricsEditModal({
                     // after a failure, so a later failure re-alerts.
                     if (window.__genlyAutosaveAlerted) {
                       window.__genlyAutosaveAlerted = null;
+                    }
+                    // Bubble the saved segments up to EditRequestPanel
+                    // so its local mirror replaces the parent's stale
+                    // job.segments_json on the next modal reopen.
+                    if (typeof onSavedSegments === "function") {
+                      onSavedSegments(segs);
                     }
                   }
                 } catch (e) {
