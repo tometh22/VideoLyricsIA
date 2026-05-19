@@ -297,9 +297,14 @@ export default function JobDetail({ job, onBack, onJobUpdate }) {
       const wantFrameOverride = fs && fs !== job.umg_spec?.frame_size;
       const bodyPayload = {};
       if (wantFrameOverride) bodyPayload.frame_size = fs;
-      if (_retryIsUmg && !retryValidationEnabled) {
+      // Always send one of the two flags based on operator intent.
+      // The tenant-conditional version silently dropped BOTH flags when
+      // frontend tenant detection failed (stale localStorage, old login)
+      // and the backend defaulted to UMG-validate. See VariantCreateModal
+      // comment for the full incident write-up (2026-05-19).
+      if (!retryValidationEnabled) {
         bodyPayload.bypass_content_validation = true;
-      } else if (!_retryIsUmg && retryValidationEnabled) {
+      } else {
         bodyPayload.force_content_validation = true;
       }
       const fetchOpts = {
@@ -997,15 +1002,19 @@ export default function JobDetail({ job, onBack, onJobUpdate }) {
             </p>
           </div>
           {/* Operator override toggle: only relevant on validation_failed,
-              so we mount it here (not at the top-level of JobDetail). The
-              retry call forwards the boolean as either bypass or force
-              flag depending on the operator's tenant default. */}
+              so we mount it here (not at the top-level of JobDetail).
+              `initialOpen` is forced true because the validator ALREADY
+              rejected this job — collapsing the toggle here hides the
+              one action that actually unblocks the operator. Caso real
+              2026-05-19: operator hit Reintentar without expanding,
+              flag never sent, same validation failed again. */}
           <div className="mb-3">
             <ContentValidationToggle
               value={retryValidationEnabled}
               onChange={setRetryValidationEnabled}
               tenantId={_retryTenantId}
               disabled={retrying}
+              initialOpen={true}
             />
           </div>
           <div className="flex gap-2">
@@ -1017,7 +1026,11 @@ export default function JobDetail({ job, onBack, onJobUpdate }) {
               {retrying ? (
                 <><div className="inline-block w-3 h-3 border-2 border-white border-t-transparent rounded-full animate-spin mr-1.5" />Reintentando…</>
               ) : (
-                t("detail.retry") || "Reintentar sin re-subir"
+                _retryIsUmg && !retryValidationEnabled
+                  ? (t("detail.retry_bypass") || "Reintentar (fondo libre)")
+                  : !_retryIsUmg && retryValidationEnabled
+                    ? (t("detail.retry_force") || "Reintentar (con verificación)")
+                    : (t("detail.retry") || "Reintentar sin re-subir")
               )}
             </button>
             <button onClick={() => onBack && onBack()} className="btn-secondary text-xs h-9 px-4">

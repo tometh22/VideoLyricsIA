@@ -103,10 +103,23 @@ export default function VariantCreateModal({ job, onClose, onCreated }) {
     if (conceptTrimmed && conceptTrimmed !== initialConcept.trim()) {
       payload.concept = conceptTrimmed;
     }
-    // Translate validation choice → tenant-appropriate backend flag.
-    if (_isUmg && !validationEnabled) {
+    // Translate validation choice → backend flag. Send the flag based
+    // purely on the operator's intent (validationEnabled), NOT on the
+    // frontend's tenant detection. If `_readTenant()` returns null/stale
+    // (e.g. localStorage was wiped, old login pre-tenant-schema), the
+    // tenant-conditional version silently dropped BOTH flags and the
+    // backend defaulted to UMG-validate. Real incident 2026-05-19:
+    // operator picked "fondo libre", job validated and failed anyway.
+    //
+    // Backend gating (pipeline.py): bypass=True forces SKIP, force=True
+    // forces VALIDATE — regardless of tenant. So sending the flag
+    // unconditionally is correct: it always matches operator intent and
+    // only "departs" from default when the operator's choice differs
+    // from their tenant's default. The flag is idempotent when it
+    // confirms the default.
+    if (!validationEnabled) {
       payload.bypass_content_validation = true;
-    } else if (!_isUmg && validationEnabled) {
+    } else {
       payload.force_content_validation = true;
     }
 

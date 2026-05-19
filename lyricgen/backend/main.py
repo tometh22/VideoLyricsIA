@@ -5792,9 +5792,17 @@ async def create_variant(
             "concept_overridden": body.concept is not None,
             "style_overridden": body.style is not None,
             "variant_owns_input": variant_owns_input,
+            "bypass_content_validation": bool(body.bypass_content_validation),
+            "force_content_validation": bool(body.force_content_validation),
+            "tenant_id": current_user.get("tenant_id"),
         },
     ))
     db.commit()
+    logger.info(
+        "[VARIANT] created job=%s parent=%s tenant=%s bypass=%s force=%s",
+        new_job_id, parent.job_id, current_user.get("tenant_id"),
+        bool(body.bypass_content_validation), bool(body.force_content_validation),
+    )
 
     # Encolar con segments_override para saltar Whisper. Mismo kwargs
     # shape que /retry, más concept/background_hint si vinieron.
