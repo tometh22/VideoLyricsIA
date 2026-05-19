@@ -166,6 +166,38 @@ def touch_user_activity(db: Session, job: Job) -> None:
     job.last_user_activity_at = datetime.now(timezone.utc)
 
 
+def input_audio_is_shared(db: Session, job: Job) -> bool:
+    """Return True iff at least one OTHER job in the DB references
+    `job.input_r2_key`. Used as a guard before deleting an input audio
+    file in R2 — variants and edit-side jobs may share the parent's
+    audio key (the upload is done once, then forked).
+
+    Conservative on DB error: returns True (treat as shared, skip delete).
+    Losing audio is worse than leaving an orphan in R2 — the
+    `cleanup_old_inputs` script (30 d retention) is the long-stop.
+
+    Exposed at module level so the reaper paths (reaper.py) can reuse
+    the exact same guard as `_delete_r2_objects` below, instead of
+    duplicating the sibling-count logic and drifting.
+    """
+    if not job.input_r2_key:
+        return False
+    try:
+        others = (
+            db.query(Job)
+            .filter(Job.input_r2_key == job.input_r2_key)
+            .filter(Job.job_id != job.job_id)
+            .count()
+        )
+        return others > 0
+    except Exception as exc:
+        _logger.warning(
+            "Could not count siblings for %s; treating as shared (skip delete): %s",
+            job.job_id, exc,
+        )
+        return True
+
+
 def _delete_r2_objects(db: Session, job: Job) -> None:
     """Best-effort delete R2 objects tied to a job.
 
@@ -194,29 +226,12 @@ def _delete_r2_objects(db: Session, job: Job) -> None:
     """
     keys: list[str] = []
     if job.input_r2_key:
-        try:
-            others = (
-                db.query(Job)
-                .filter(Job.input_r2_key == job.input_r2_key)
-                .filter(Job.job_id != job.job_id)
-                .count()
-            )
-        except Exception as exc:
-            # Conservative: if we can't count siblings, KEEP the audio.
-            # cleanup_old_inputs will reclaim it eventually if truly
-            # orphaned. Losing the audio is much worse than leaving an
-            # orphan in R2 for 30 days.
-            _logger.warning(
-                "Could not count siblings for %s; skipping input_r2_key delete: %s",
-                job.job_id, exc,
-            )
-            others = 1
-        if others == 0:
+        if not input_audio_is_shared(db, job):
             keys.append(job.input_r2_key)
         else:
             _logger.info(
-                "Skipping R2 input delete for %s — %d sibling job(s) still reference %s",
-                job.job_id, others, job.input_r2_key,
+                "Skipping R2 input delete for %s — sibling job(s) still reference %s",
+                job.job_id, job.input_r2_key,
             )
     s3 = job.s3_keys or {}
     if isinstance(s3, dict):
