@@ -5,6 +5,7 @@ import { JobDetailTour } from "./OnboardingTour";
 import ProResBadge from "./ProResBadge";
 import EditRequestPanel from "./EditRequestPanel";
 import ContentValidationToggle, { isUmgTenant } from "./ContentValidationToggle";
+import { useAlert } from "./AlertProvider";
 import EnableProResModal from "./EnableProResModal";
 import DriveTransferModal from "./DriveTransferModal";
 import VariantCreateModal from "./VariantCreateModal";
@@ -179,6 +180,7 @@ function ProvenanceTab({ jobId, t }) {
 
 export default function JobDetail({ job, onBack, onJobUpdate }) {
   const { t } = useI18n();
+  const { alert } = useAlert();
   const [activeTab, setActiveTab] = useState("video");
   const [uploading, setUploading] = useState(false);
   const [youtubeResult, setYoutubeResult] = useState(job.youtube || null);
@@ -223,17 +225,29 @@ export default function JobDetail({ job, onBack, onJobUpdate }) {
         // approved yet. 403 = caller isn't admin (shouldn't happen here
         // since the button is hidden, but defensive). Surface the message
         // straight from the backend so the operator knows what to fix.
-        alert(body.detail || "No se pudo enviar a UMG.");
+        alert({
+          title: "No se pudo enviar a UMG",
+          description: body.detail || "Probá de nuevo en un momento.",
+          tone: "error",
+        });
         return;
       }
       const result = await resp.json();
       setIsInUmgPortal(true);
       const label = result.label || "";
       const verbed = result.replaced ? "actualizado" : "publicado";
-      alert(`Video ${verbed} en umg.genly.pro como "${label}".`);
+      alert({
+        title: `Video ${verbed} en umg.genly.pro`,
+        description: label ? `Aparece como "${label}".` : undefined,
+        tone: "success",
+      });
     } catch (err) {
       console.error("Send to UMG failed:", err);
-      alert("Error de red al enviar a UMG.");
+      alert({
+        title: "No se pudo enviar a UMG",
+        description: "Hubo un problema de red. Revisá tu conexión y probá de nuevo.",
+        tone: "error",
+      });
     } finally {
       setSendingUmg(false);
     }
@@ -303,10 +317,18 @@ export default function JobDetail({ job, onBack, onJobUpdate }) {
         onBack?.();
       } else {
         const body = await res.json().catch(() => ({}));
-        alert(body.detail || "No se pudo reintentar el video.");
+        alert({
+          title: "No se pudo reintentar el video",
+          description: body.detail || "Probá de nuevo en un momento.",
+          tone: "error",
+        });
       }
     } catch {
-      alert("Error de red al reintentar.");
+      alert({
+        title: "No se pudo reintentar el video",
+        description: "Hubo un problema de red. Revisá tu conexión y probá de nuevo.",
+        tone: "error",
+      });
     }
     setRetrying(false);
   };
@@ -648,7 +670,11 @@ export default function JobDetail({ job, onBack, onJobUpdate }) {
         const reason = err.detail || err.message || "error";
         message = t("detail.prores_failed", { reason });
       }
-      alert(message);
+      alert({
+        title: "No se pudo descargar el archivo ProRes",
+        description: message,
+        tone: "error",
+      });
     } finally {
       setProResHint(null);
     }
