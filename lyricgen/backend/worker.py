@@ -20,11 +20,53 @@ from credentials_bootstrap import bootstrap_vertex_credentials
 bootstrap_vertex_credentials()
 
 
+def _warn_if_shutdown_grace_too_short() -> None:
+    """Loud startup warning when Railway's SIGTERM→SIGKILL grace is too
+    short to let RQ drain an in-flight render. Without a 20-min grace,
+    every redeploy of the Worker service kills any render mid-flight —
+    operators see "El servidor se reinició mientras generábamos el
+    video" and have to manually retry. See railway.toml comment for the
+    incident chain (2026-05-15 first surface, 2026-05-19 re-surfaced when
+    two back-to-back PR merges killed the same UMG render twice).
+
+    This is a runtime warning, not a hard failure: workers must still
+    start in environments without Railway (local dev, CI) where the
+    var is meaningless. Operators reading Railway logs will see the
+    WARNING line and know to set the dashboard variable.
+    """
+    raw = os.environ.get("RAILWAY_SHUTDOWN_TIMEOUT_SECONDS", "").strip()
+    # Only nag when we look like we're running on Railway (the platform
+    # injects RAILWAY_ENVIRONMENT). On local dev there is no SIGTERM
+    # dance to worry about.
+    if not os.environ.get("RAILWAY_ENVIRONMENT", "").strip():
+        return
+    try:
+        grace_s = int(raw) if raw else 0
+    except ValueError:
+        grace_s = 0
+    # 20 min = the value documented in railway.toml as required for UMG-grade
+    # renders. Anything shorter and a SIGKILL will land mid-encode.
+    REQUIRED_GRACE_S = 1200
+    if grace_s < REQUIRED_GRACE_S:
+        logger.warning(
+            "[WORKER] RAILWAY_SHUTDOWN_TIMEOUT_SECONDS=%r is below the %ds "
+            "needed to drain UMG renders cleanly. Every redeploy of the "
+            "Worker service will SIGKILL the in-flight render and surface "
+            "\"servidor se reinició\" to operators. Fix: Railway dashboard "
+            "→ Worker service → Variables → set "
+            "RAILWAY_SHUTDOWN_TIMEOUT_SECONDS=1200. (Cannot be set via "
+            "railway.toml.) See railway.toml comment for full context.",
+            raw or "<unset>", REQUIRED_GRACE_S,
+        )
+
+
 def main():
     redis_url = os.environ.get("REDIS_URL", "").strip()
     if not redis_url:
         logger.critical("[WORKER] REDIS_URL is required; aborting")
         sys.exit(1)
+
+    _warn_if_shutdown_grace_too_short()
 
     from redis import Redis
     from rq import Queue, Worker
