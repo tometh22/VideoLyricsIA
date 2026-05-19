@@ -686,6 +686,7 @@ const translations = {
     "validation.nonumg_alt_label": "Sí — sin personas ni marcas",
     "validation.nonumg_alt_desc": "Bloquea caras, manos y logos detectables en el fondo. Útil para entrega a clientes con restricciones de imagen.",
     "validation.nonumg_badge": "MODO RESTRINGIDO",
+    "validation.people_quality_warning": "Veo a veces genera personas con artefactos (caras deformadas, manos con dedos extras). Probá un render antes de aprobar — si vas a entregar a un cliente, revisá el resultado.",
     "edit.youtube_drift_confirm": "Este video ya está publicado en YouTube. La re-sincronización actualizará el archivo en la plataforma pero NO reemplazará el video en YouTube (la API de YouTube no permite reemplazar archivos, solo metadata).\n\n¿Continuar igual?",
     "edit.lyrics_resync_submit": "Re-renderizar con letras y tiempos corregidos",
     "edit.lyrics_audio_unavailable": "El audio fuente no está disponible para este job — solo podrás editar texto sin escuchar playback.",
