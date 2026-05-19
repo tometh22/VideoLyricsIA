@@ -4744,6 +4744,73 @@ async def save_segments(
     # Vez Más — Viejas Locas (agus.cafisi, 2026-05-18).
     segs = sorted(segs, key=lambda s: float(s.get("start", 0) or 0))
 
+    # Audit log of what changed between prev and new — only when non-empty.
+    # Motivation: operator (Tomas, 2026-05-19) reported "lines change places"
+    # in autosync, and we had ZERO way to reconstruct what happened (only
+    # the final sorted segments_json was persisted). This block writes a
+    # compact diff per save so future complaints are diagnosable.
+    # Capped to keep payload small (20 changed entries max with `truncated`
+    # flag if exceeded).
+    try:
+        from database import AuditLog
+        prev_segs = job.segments_json if isinstance(job.segments_json, list) else []
+        # Build id-keyed maps so we can diff by stable _id (frontend assigns
+        # one) — fall back to positional index for legacy rows missing _id.
+        def _key(s, idx):
+            return s.get("_id") if isinstance(s, dict) and "_id" in s else f"idx_{idx}"
+        prev_by_key = { _key(s, i): (i, s) for i, s in enumerate(prev_segs) }
+        new_by_key  = { _key(s, i): (i, s) for i, s in enumerate(segs) }
+        changed = []
+        reorder = []
+        for k, (new_idx, ns) in new_by_key.items():
+            prev = prev_by_key.get(k)
+            if prev is None:
+                continue
+            prev_idx, ps = prev
+            # Field-level diff on the three meaningful values.
+            ps_start = float(ps.get("start") or 0)
+            ns_start = float(ns.get("start") or 0)
+            ps_end = float(ps.get("end") or 0)
+            ns_end = float(ns.get("end") or 0)
+            ps_text = (ps.get("text") or "").strip()
+            ns_text = (ns.get("text") or "").strip()
+            if (abs(ps_start - ns_start) > 0.05 or abs(ps_end - ns_end) > 0.05
+                    or ps_text != ns_text):
+                changed.append({
+                    "id": k,
+                    "prev_start": round(ps_start, 3),
+                    "new_start": round(ns_start, 3),
+                    "prev_end": round(ps_end, 3),
+                    "new_end": round(ns_end, 3),
+                    "prev_text": ps_text[:120],
+                    "new_text": ns_text[:120],
+                })
+            if prev_idx != new_idx:
+                reorder.append({"id": k, "from_idx": prev_idx, "to_idx": new_idx})
+
+        if changed or reorder:
+            truncated = False
+            if len(changed) > 20:
+                changed = changed[:20]
+                truncated = True
+            if len(reorder) > 30:
+                reorder = reorder[:30]
+                truncated = True
+            db.add(AuditLog(
+                user_id=current_user["id"],
+                action="lyrics.segments_diff",
+                detail={
+                    "job_id": job_id,
+                    "n_lines": len(segs),
+                    "changed": changed,
+                    "reorder": reorder,
+                    "truncated": truncated,
+                },
+            ))
+    except Exception as e:
+        # Audit logging is best-effort — never break the save flow.
+        logger.warning("[save-segments] audit log failed: %s", e)
+
     job.segments_json = segs
     touch_user_activity(db, job)
     db.commit()
