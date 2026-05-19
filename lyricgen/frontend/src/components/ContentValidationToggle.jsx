@@ -208,6 +208,18 @@ export default function ContentValidationToggle({
               </p>
             </div>
           </label>
+
+          {/* Warning when "people allowed" is selected. value=false here
+              means "no restriction" → AI is free to generate faces / hands.
+              Veo's quality on people is uneven (deformed hands, weird
+              eyes). Surface that honestly so the operator knows what
+              they're committing to. */}
+          {effectiveValue === false && (
+            <p className="text-[10px] text-ink-tertiary leading-relaxed px-1 pt-1 border-t border-white/[0.05]">
+              ⚠ {t("validation.people_quality_warning") ||
+                  "Veo a veces genera personas con artefactos (caras deformadas, manos con dedos extras). Probá un render antes de aprobar — si vas a entregar a un cliente, revisá el resultado."}
+            </p>
+          )}
         </div>
       )}
     </div>
