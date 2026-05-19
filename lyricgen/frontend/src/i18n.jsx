@@ -691,6 +691,7 @@ const translations = {
     "edit.lyrics_resync_submit": "Re-renderizar con letras y tiempos corregidos",
     "edit.lyrics_audio_unavailable": "El audio fuente no está disponible para este job — solo podrás editar texto sin escuchar playback.",
     "editor.trim_line": "Recortar al final natural (cuando la voz termina y empieza un fill)",
+    "editor.undo_anchor_hint": "Deshacer este anchor",
     "editor.trim_all_long_label": "Recortar {n} líneas con texto colgado",
     "editor.trim_all_long_hint": "voz termina antes que el silencio",
     "detail.create_variant": "Crear variante",

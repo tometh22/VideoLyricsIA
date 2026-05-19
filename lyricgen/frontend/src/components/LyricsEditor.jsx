@@ -1,6 +1,7 @@
 import { useState, useMemo, useRef, useEffect, useCallback } from "react";
 import { useI18n } from "../i18n";
 import { EditorTour } from "./OnboardingTour";
+import { useToast } from "./ToastProvider";
 
 // Mismo flag que UploadZone/EditRequestPanel — oculta el label de motion
 // en el strip de metadata mientras la feature de animación está pausada.
@@ -329,6 +330,14 @@ export default function LyricsEditor({
   // offset arbitrarily — listening + tapping is ground truth.
   const [syncMode, setSyncMode] = useState(false);
   const [syncCursor, setSyncCursor] = useState(0);
+  // Set of segment _ids that were anchored in the last 10s — used to
+  // render a "recently moved" ring + per-row undo button so the operator
+  // can see what just moved (the chronological re-sort can be visually
+  // confusing, see tapAnchor comments). Each id is auto-removed by a
+  // 10s setTimeout scheduled at anchor time.
+  const [highlightedIds, setHighlightedIds] = useState(() => new Set());
+  // Toast for per-anchor confirmation feedback.
+  const { toast } = useToast();
   // Global timing offset panel — UX entry point for "the whole song is
   // shifted by N ms" cases. Different from Sync Mode (which anchors a
   // line + propagates) and the "intro is too long" banner (which only
@@ -578,8 +587,56 @@ export default function LyricsEditor({
       // Sort by start so the array — and thus syncCursor's positional
       // index, the render order, and the next neighbour lookup — all
       // stay consistent with the new chronological reality.
-      return mutated.sort((a, b) => a.start - b.start);
+      const sorted = mutated.sort((a, b) => a.start - b.start);
+
+      // Diagnostic trace: when the focused row's new chronological
+      // position differs from its prior position by more than 2 slots,
+      // log a structured event so a curious operator with DevTools open
+      // can see what just happened. Helped diagnose the 2026-05-19
+      // "lines change places" complaint where the reorder was correct
+      // but the visual jump was confusing.
+      const prevIdx = prev.findIndex((s) => s._id === target._id);
+      const newIdx = sorted.findIndex((s) => s._id === target._id);
+      if (Math.abs(newIdx - prevIdx) > 2) {
+        // eslint-disable-next-line no-console
+        console.info("[sync] Anchor caused multi-position reorder", {
+          line_id: target._id,
+          prev_start: target.start,
+          new_start: newStart,
+          prev_idx: prevIdx,
+          new_idx: newIdx,
+          jumps: newIdx - prevIdx,
+        });
+      }
+      return sorted;
     });
+
+    // Per-anchor toast: short visual confirmation of "what I just did",
+    // dismissed after 2s. Format mirrors the row timestamp display so
+    // the operator can mentally match. The toast lives in
+    // ToastProvider — fire-and-forget.
+    toast({
+      message: `Anclada · ${formatTimestamp(target.start)} → ${formatTimestamp(newStart)}`,
+      tone: Math.abs(delta) > 5 ? "warning" : "info",
+    });
+
+    // Highlight the row for 10s so the eye finds the moved line + we
+    // can render a per-row undo button while the ring is up. Cleanup
+    // timer removes the id after 10s — if a new anchor fires on the
+    // same id, the timer chain restarts (we don't bother dedupe-ing).
+    setHighlightedIds((prev) => {
+      const next = new Set(prev);
+      next.add(target._id);
+      return next;
+    });
+    setTimeout(() => {
+      setHighlightedIds((prev) => {
+        if (!prev.has(target._id)) return prev;
+        const next = new Set(prev);
+        next.delete(target._id);
+        return next;
+      });
+    }, 10000);
 
     // Advance to the line that was visually next BEFORE the mutation.
     // Located by _id so the sort can't drift us onto the wrong line.
@@ -634,7 +691,52 @@ export default function LyricsEditor({
         }),
       );
       setSyncCursor(last.cursor);
+      // Clear the highlight for the undone row — its anchor was reverted,
+      // so the "recently moved" indicator is misleading.
+      setHighlightedIds((hl) => {
+        if (!hl.has(last.id)) return hl;
+        const next = new Set(hl);
+        next.delete(last.id);
+        return next;
+      });
       return prev.slice(0, -1);
+    });
+  }, []);
+
+  // Per-row undo: revert the MOST RECENT anchor that touched this _id.
+  // Different from undoLastAnchor (which is strictly LIFO regardless of
+  // which line). Lets the operator click ↻ on row X to undo only that
+  // anchor, even if several others happened on different lines after.
+  const undoAnchorFor = useCallback((id) => {
+    setSyncHistory((prev) => {
+      const lastIdx = (() => {
+        for (let i = prev.length - 1; i >= 0; i--) {
+          if (prev[i].id === id) return i;
+        }
+        return -1;
+      })();
+      if (lastIdx < 0) return prev;
+      const entry = prev[lastIdx];
+      const futureMap = new Map((entry.future || []).map((f) => [f.id, f]));
+      setEdited((segs) =>
+        segs
+          .map((s) => {
+            if (s._id === entry.id) return { ...s, start: entry.prevStart, end: entry.prevEnd };
+            const f = futureMap.get(s._id);
+            if (f) return { ...s, start: f.prevStart, end: f.prevEnd };
+            return s;
+          })
+          .sort((a, b) => a.start - b.start),
+      );
+      setHighlightedIds((hl) => {
+        if (!hl.has(id)) return hl;
+        const next = new Set(hl);
+        next.delete(id);
+        return next;
+      });
+      // Splice out the reverted entry — preserves any later entries on
+      // other lines so undoLastAnchor (Z key) keeps a sensible stack.
+      return prev.filter((_, i) => i !== lastIdx);
     });
   }, []);
 
@@ -1603,6 +1705,10 @@ export default function LyricsEditor({
             const isActive = seg._id === activeId;
             const isArmed = syncMode && idx === syncCursor;
             const isAnchored = syncMode && idx < syncCursor;
+            // Recently anchored: ring highlights the row + per-row undo
+            // button appears next to the timestamp. Auto-clears 10s after
+            // the anchor (timer in tapAnchor's setHighlightedIds).
+            const wasRecentlyAnchored = highlightedIds.has(seg._id);
 
             return (
               <div
@@ -1612,6 +1718,7 @@ export default function LyricsEditor({
                 className={`group rounded-xl transition-all
                   ${isArmed ? "bg-brand/[0.18] ring-2 ring-brand shadow-glow scale-[1.01]" : ""}
                   ${!isArmed && isActive ? "bg-brand/[0.07] ring-1 ring-brand/25" : ""}
+                  ${!isArmed && !isActive && wasRecentlyAnchored ? "bg-brand/[0.05] ring-1 ring-brand/40" : ""}
                   ${isAnchored ? "opacity-60" : ""}`}
               >
                 <div className="flex items-start gap-2 p-1">
@@ -1631,15 +1738,36 @@ export default function LyricsEditor({
                         text-brand-light"
                     />
                   ) : (
-                    <button
-                      onClick={() => seekTo(Math.max(0, seg.start), true)}
-                      onDoubleClick={() => startEditTimestamp(seg)}
-                      title={t("editor.timestamp_hint") || "Click: ir al tiempo · Doble click: editar"}
-                      className={`text-[11px] font-mono pt-2.5 w-14 shrink-0 text-right transition-colors
-                        ${isActive ? "text-brand-light" : "text-gray-600 hover:text-brand-light"}`}
-                    >
-                      {formatTimestamp(seg.start)}
-                    </button>
+                    <div className="flex items-center gap-1 shrink-0">
+                      <button
+                        onClick={() => seekTo(Math.max(0, seg.start), true)}
+                        onDoubleClick={() => startEditTimestamp(seg)}
+                        title={t("editor.timestamp_hint") || "Click: ir al tiempo · Doble click: editar"}
+                        className={`text-[11px] font-mono pt-2.5 w-14 text-right transition-colors
+                          ${isActive ? "text-brand-light" : wasRecentlyAnchored ? "text-brand-light" : "text-gray-600 hover:text-brand-light"}`}
+                      >
+                        {formatTimestamp(seg.start)}
+                      </button>
+                      {wasRecentlyAnchored && (
+                        <button
+                          type="button"
+                          onClick={() => undoAnchorFor(seg._id)}
+                          title={t("editor.undo_anchor_hint") || "Deshacer este anchor"}
+                          className="mt-2 w-5 h-5 rounded-md text-[10px] text-ink-tertiary
+                            hover:text-brand-light hover:bg-brand/10 transition-colors
+                            flex items-center justify-center"
+                          aria-label="Deshacer anchor"
+                        >
+                          {/* Counter-clockwise undo arrow */}
+                          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor"
+                               strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round"
+                               className="w-3 h-3">
+                            <path d="M3 7v6h6" />
+                            <path d="M3 13a9 9 0 1 0 3-7" />
+                          </svg>
+                        </button>
+                      )}
+                    </div>
                   )}
                   <div className="flex-1 min-w-0">
                     <input
