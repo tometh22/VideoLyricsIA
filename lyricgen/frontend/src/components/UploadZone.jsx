@@ -1357,7 +1357,7 @@ export default function UploadZone({
                         {backgroundMode === "variation" && (
                           <p className="mt-2 text-[10.5px] text-ink-secondary/80 leading-snug">
                             {t("upload.bg_variation_help") ||
-                              "Veo usará un frame de este video como referencia visual y generará un clip nuevo derivado del original."}
+                              "Se usará un frame de este video como referencia visual y se generará un clip nuevo derivado del original."}
                           </p>
                         )}
                       </div>
@@ -1429,7 +1429,7 @@ export default function UploadZone({
                           {t("upload.animate_image_label") || "Animar con AI"}
                         </p>
                         <p className="text-[11px] text-gray-500">
-                          {t("upload.animate_image_hint") || "Veo anima tu imagen en lugar de usar zoom/pan"}
+                          {t("upload.animate_image_hint") || "El video cinemático anima tu imagen en lugar de usar zoom/pan"}
                         </p>
                       </div>
                     </label>

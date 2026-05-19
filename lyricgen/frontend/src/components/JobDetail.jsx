@@ -449,7 +449,7 @@ export default function JobDetail({ job, onBack, onJobUpdate }) {
               </p>
               <p className="text-xs text-ink-secondary mt-0.5">
                 {job.current_step === "background"
-                  ? (t("edit.in_progress_bg") || "Generando nuevo fondo con Veo · mantiene lyrics y tiempos · ~10-15 min")
+                  ? (t("edit.in_progress_bg") || "Generando nuevo video cinemático · mantiene lyrics y tiempos · ~10-15 min")
                   : (t("edit.in_progress_typo") || "Re-renderizando con la tipografía nueva · usa el fondo cacheado · ~5-10 min")}
               </p>
               <div className="mt-3 h-1.5 rounded-full bg-surface-3/60 overflow-hidden">
