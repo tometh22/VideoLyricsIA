@@ -221,3 +221,32 @@ def test_enqueue_pipeline_attaches_retry_metadata():
                 pipeline.run_pipeline = original_run
     finally:
         queue_jobs._pick_queue = original_pick
+
+
+def test_pipeline_retry_defaults_survive_railway_redeploy_window():
+    """Pin PIPELINE_RETRY_MAX / INTERVAL defaults to values that survive
+    a tight back-to-back Railway redeploy window.
+
+    Incident 2026-05-19: agus.cafisi's Una Vez Más job died twice in a
+    row because two PRs merged within 20 minutes of each other and
+    PIPELINE_RETRY_MAX was 1. With max=1, a single redeploy during the
+    retry window exhausts retries; pipeline_failure_callback then
+    surfaces the "Reintentar sin re-subir" button to the operator.
+
+    Defaults bumped to max=3, interval=60s as defense-in-depth: even
+    when the operator forgets RAILWAY_SHUTDOWN_TIMEOUT_SECONDS=1200
+    on a new Worker service (the real fix), three deploys in a row
+    would have to land within ~3 minutes to still drop the render.
+    This test fails loud if a future change weakens those defaults.
+    """
+    import queue_jobs
+    assert queue_jobs.PIPELINE_RETRY_MAX >= 3, (
+        f"PIPELINE_RETRY_MAX={queue_jobs.PIPELINE_RETRY_MAX} is too low; "
+        "back-to-back Railway redeploys will exhaust retries and surface "
+        "'servidor se reinició' to operators."
+    )
+    assert queue_jobs.PIPELINE_RETRY_INTERVAL_S >= 60, (
+        f"PIPELINE_RETRY_INTERVAL_S={queue_jobs.PIPELINE_RETRY_INTERVAL_S} "
+        "is too tight; the second retry can fire inside the same Railway "
+        "redeploy window. 60s gives the new worker pod time to come up."
+    )

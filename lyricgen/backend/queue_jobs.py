@@ -24,13 +24,25 @@ JOB_TIMEOUT = int(os.environ.get("JOB_TIMEOUT_SECONDS", "2700"))  # 45 min (YouT
 # RQ auto-retry on worker death (Railway redeploy, OOM, hard signal).
 # RQ moves orphaned jobs from StartedJobRegistry to FailedJobRegistry
 # via cleanup_ghosts() on the next worker boot, raising AbandonedJobError.
-# Retry handles that path. 1 retry is enough — if both attempts die, the
-# infrastructure is unhealthy and the failure_callback marks the row as
-# error with a retry-button hint instead of looping forever.
-PIPELINE_RETRY_MAX = int(os.environ.get("PIPELINE_RETRY_MAX", "1"))
-# Backoff between attempt 1 → attempt 2. 30 s gives the new worker pod
-# time to come up after a Railway redeploy before we re-claim the job.
-PIPELINE_RETRY_INTERVAL_S = int(os.environ.get("PIPELINE_RETRY_INTERVAL_S", "30"))
+# Retry handles that path.
+#
+# Bumped from 1 → 3 on 2026-05-19 after the agus.cafisi Una Vez Más
+# incident where two back-to-back PR merges to staging killed the same
+# render twice — max=1 means a SINGLE deploy during the retry window
+# turns the job permanent-failed. With max=3 the job survives up to
+# three consecutive redeploys before the failure callback gives up and
+# surfaces the user-facing "Reintentar" button. The real fix is setting
+# RAILWAY_SHUTDOWN_TIMEOUT_SECONDS=1200 on the Worker service (per
+# railway.toml note) so SIGTERM has 20 min to drain in-flight renders,
+# but the retry bump is the cheap belt-and-suspenders for cases where
+# SIGKILL still hits (very long render, or env var forgotten on a new
+# environment).
+PIPELINE_RETRY_MAX = int(os.environ.get("PIPELINE_RETRY_MAX", "3"))
+# Backoff between attempts. 60 s gives the new worker pod time to come
+# up after a Railway redeploy AND for any quick second redeploy to
+# settle before we re-claim — 30 s was just barely enough for one
+# deploy, and got hit by the second deploy of a tight PR-merge window.
+PIPELINE_RETRY_INTERVAL_S = int(os.environ.get("PIPELINE_RETRY_INTERVAL_S", "60"))
 # UMG / both renders chain MP4 + ProRes + Short + Thumb + Veo retries.
 # A 7-min track with a fresh Veo gen + 2-3 retry rounds + ProRes encode
 # + 1.5GB R2 multipart upload can creep past 45min. Give it 90min.
