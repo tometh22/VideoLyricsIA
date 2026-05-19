@@ -5401,6 +5401,9 @@ async def retry_job(
     # inservible para forensics ("¿en qué estado estaba el job cuando
     # el operador apretó retry?" → siempre 'processing').
     _previous_status = job.status
+    # Same reasoning for job.error — read it before the reset so the
+    # bg-preservation logic downstream can introspect the failure cause.
+    _previous_error = job.error or ""
 
     # Reset job to initial processing state before re-enqueueing.
     job.status = "processing"
@@ -5449,6 +5452,33 @@ async def retry_job(
     # explicitly here makes the intent visible at the call site and
     # keeps the retry path symmetrical with the /generate path.
     segments_override = job.segments_json if job.segments_json else None
+
+    # Preserve the previously-approved background across retries.
+    # Without this the pipeline regenerates a fresh Veo, which silently
+    # discards an operator-approved aesthetic just because some downstream
+    # step (lyrics edit, render compositor, R2 upload) blew up.
+    # Incident 2026-05-19, Amanda Pujó "Ser Anti" (default tenant, no
+    # background_hint): operator approved a bg, ran a lyrics edit, the
+    # edit died mid-pipeline (worker SIGTERM during deploy storm), /retry
+    # kicked off a full re-render → Gemini picked an entirely different
+    # scene since there was no hint to anchor on. Operator called it
+    # "me cambió todo".
+    #
+    # Guard: skip bg-reuse when the validator was the cause of the
+    # original failure — re-using a bg that previously failed Guideline
+    # 15 would just fail again. For every other error class (worker
+    # death, R2 timeout, post-bg pipeline failure) the cached bg is the
+    # right asset to reuse.
+    preserved_bg_r2_key = None
+    _err_lower = _previous_error.lower()
+    _bg_was_blamed = (
+        "content policy" in _err_lower
+        or "guideline 15" in _err_lower
+        or _previous_status == "validation_failed"
+    )
+    if job.bg_r2_key_cached and not _bg_was_blamed:
+        preserved_bg_r2_key = job.bg_r2_key_cached
+
     enqueue_pipeline(
         job_id=job_id,
         mp3_path=None,
@@ -5461,6 +5491,7 @@ async def retry_job(
         song_title=job.song_title or "",
         umg_spec=umg_spec,
         segments_override=segments_override,
+        bg_r2_key=preserved_bg_r2_key,
     )
 
     return {
@@ -5468,6 +5499,7 @@ async def retry_job(
         "status": "processing",
         "job_id": job_id,
         "preserved_lyrics": segments_override is not None,
+        "preserved_background": preserved_bg_r2_key is not None,
     }
 
 
