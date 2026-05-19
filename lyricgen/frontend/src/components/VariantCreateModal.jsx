@@ -1,7 +1,16 @@
 import { useEffect, useRef, useState } from "react";
 import { useI18n } from "../i18n";
 import BackgroundHintField from "./BackgroundHintField";
-import ContentValidationToggle from "./ContentValidationToggle";
+import ContentValidationToggle, { isUmgTenant } from "./ContentValidationToggle";
+
+function _readTenant() {
+  try {
+    const u = JSON.parse(localStorage.getItem("genly_user") || "null");
+    return u?.tenant_id || null;
+  } catch {
+    return null;
+  }
+}
 
 const API = import.meta.env.VITE_API_URL || "";
 
@@ -34,10 +43,12 @@ export default function VariantCreateModal({ job, onClose, onCreated }) {
   const initialConcept = job?.render_params?.concept || "";
   const [backgroundHint, setBackgroundHint] = useState("");
   const [concept, setConcept] = useState(initialConcept);
-  // Operator override of content_validator (UMG Guideline 15). Same flag
-  // as EditRequestPanel — default OFF, opt-in for concepts that require
-  // content the validator normally rejects (e.g. hands as subject).
-  const [bypassContentValidation, setBypassContentValidation] = useState(false);
+  // Tenant-aware content-validation choice. See EditRequestPanel for
+  // the full rationale. value=true means "run validator"; default per
+  // tenant (UMG validates, others skip).
+  const _tenantId = _readTenant();
+  const _isUmg = isUmgTenant(_tenantId);
+  const [validationEnabled, setValidationEnabled] = useState(_isUmg);
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState(null);
   // Guard sincrónico contra doble click (mismo patrón que EditRequestPanel
@@ -62,10 +73,11 @@ export default function VariantCreateModal({ job, onClose, onCreated }) {
     if (conceptTrimmed && conceptTrimmed !== initialConcept.trim()) {
       payload.concept = conceptTrimmed;
     }
-    // Bypass flag: send only when ON. The Pydantic default is false so
-    // omitting matches the default behavior on older backends.
-    if (bypassContentValidation) {
+    // Translate validation choice → tenant-appropriate backend flag.
+    if (_isUmg && !validationEnabled) {
       payload.bypass_content_validation = true;
+    } else if (!_isUmg && validationEnabled) {
+      payload.force_content_validation = true;
     }
 
     try {
@@ -153,8 +165,9 @@ export default function VariantCreateModal({ job, onClose, onCreated }) {
         </div>
 
         <ContentValidationToggle
-          value={bypassContentValidation}
-          onChange={setBypassContentValidation}
+          value={validationEnabled}
+          onChange={setValidationEnabled}
+          tenantId={_tenantId}
           disabled={submitting}
         />
 
