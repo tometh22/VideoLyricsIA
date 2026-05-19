@@ -403,11 +403,24 @@ def _delete_abandoned_transcribed(db: Session, job: Job) -> None:
         cancel_rq_job(job_id)
     except Exception as e:  # pragma: no cover
         logger.debug("reaper: cancel_rq_job failed for %s: %s", job_id, e)
-    # R2 object (best-effort; failure is fine — orphan stays for next sweep).
+    # R2 object — only delete when no sibling job references the same
+    # input audio. Variants and edit-side jobs share input_r2_key with
+    # the parent; if the reaper kills this row while a sibling is alive,
+    # the surviving sibling's next /retry or /edit 404s on R2. Same
+    # guard as jobs._delete_r2_objects (incident 2026-05-19, Amanda
+    # Pujó "Ser Anti"). Best-effort — failure leaves orphan for the
+    # next cleanup_old_inputs sweep.
     if job.input_r2_key:
         try:
-            import storage as _storage
-            _storage.delete_object(job.input_r2_key)
+            from jobs import input_audio_is_shared
+            if not input_audio_is_shared(db, job):
+                import storage as _storage
+                _storage.delete_object(job.input_r2_key)
+            else:
+                logger.info(
+                    "reaper: keeping R2 input for %s — sibling job(s) still reference %s",
+                    job_id, job.input_r2_key,
+                )
         except Exception as e:  # pragma: no cover
             logger.debug("reaper: R2 delete failed for %s: %s", job_id, e)
     db.delete(job)
@@ -427,10 +440,25 @@ def _delete_abandoned_upload(db: Session, job: Job) -> None:
     try:
         import storage as _storage
         if job.multipart_upload_id and job.input_r2_key:
+            # Multipart abort releases the in-flight parts only. There's
+            # no shared-key concern here — multipart uploads are per-job
+            # by design (the upload_id is unique to this row).
             _storage.multipart_abort(job.input_r2_key, job.multipart_upload_id)
         elif job.input_r2_key:
+            # Same shared-key guard as _reap_stuck_job. An
+            # awaiting_upload row with a shared input_r2_key shouldn't
+            # exist by design (variants don't go through awaiting_upload
+            # state) but the guard is cheap and protects against any
+            # future code path that might fork before upload finishes.
             try:
-                _storage.delete_object(job.input_r2_key)
+                from jobs import input_audio_is_shared
+                if not input_audio_is_shared(db, job):
+                    _storage.delete_object(job.input_r2_key)
+                else:
+                    logger.info(
+                        "reaper: keeping abandoned-upload input — sibling refs %s",
+                        job.input_r2_key,
+                    )
             except Exception:
                 pass
     except Exception as e:  # pragma: no cover
