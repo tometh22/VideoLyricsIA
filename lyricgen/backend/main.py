@@ -4472,16 +4472,19 @@ class EditJobRequest(BaseModel):
     # son críticas para evitar bias del modelo. Costo Gemini marginal.
     background_hint: str | None = Field(default=None, max_length=2000)
     # Operator-controlled bypass of content_validator (UMG Guideline 15
-    # check). Default False = run validator, fail the job if AI generated
-    # face/hands/logos as subject. True = skip validator entirely.
+    # check). Default False = follow tenant default. True = skip validator
+    # entirely (only has effect on UMG tenants — non-UMG already skip by
+    # default).
     #
-    # Use case: operator explicit intent that the scene REQUIRES the
-    # flagged content (e.g. "rock guitarist hands strumming" — the song's
-    # visual identity IS hands). They accept the downstream UMG-review
-    # rejection risk knowingly. Frontend ContentValidationToggle exposes
-    # this with a warning state when ON. Worker logs the bypass in
-    # validation_result so admin/audit can see who chose to override.
+    # Use case: UMG operator wants to ship a video where the flagged
+    # content IS the song's visual identity (rock guitarist hands).
+    # They accept the downstream UMG-review rejection risk knowingly.
     bypass_content_validation: bool = Field(default=False)
+    # Inverse of bypass for non-UMG tenants. Default False = follow tenant
+    # default (skip validator for non-UMG). True = force validator to run
+    # even though the tenant doesn't require it. For operators of non-UMG
+    # tenants who *want* the conservative behavior anyway.
+    force_content_validation: bool = Field(default=False)
     # Background generation mode. Only meaningful when edit_type=="background".
     #
     #   "veo"    → Google Veo 3.1 text-to-video. Cinematic, ~$0.50/gen,
@@ -4938,12 +4941,13 @@ async def request_edit(
         # edit_params to run_edit_pipeline → _ensure_background.
         edit_params["background_mode"] = body.background_mode
     if body.edit_type == "background" and body.bypass_content_validation:
-        # Forward only when explicitly True; the pipeline's default behavior
-        # (run validator) is correct when this is missing/False. Centralising
-        # the truthy check here means downstream code reads `render_params
-        # .get("bypass_content_validation")` and never has to distinguish
+        # Forward only when explicitly True; pipeline's tenant-gated
+        # default is correct when missing/False. Storing this lets the
+        # worker read render_params.get(...) and never has to distinguish
         # "field missing" from "operator chose False".
         edit_params["bypass_content_validation"] = True
+    if body.edit_type == "background" and body.force_content_validation:
+        edit_params["force_content_validation"] = True
 
     new_edit_count = current_edit_count + 1
 
@@ -5243,6 +5247,7 @@ class RetryJobRequest(BaseModel):
     # validator (e.g. "rock guitarist hands as subject"), and the
     # operator wants to retry without recreating the variant manually.
     bypass_content_validation: bool = Field(default=False)
+    force_content_validation: bool = Field(default=False)
 
 
 @app.post("/retry/{job_id}")
@@ -5301,13 +5306,15 @@ async def retry_job(
             new_spec["frame_size"] = body.frame_size
             job.umg_spec = new_spec
 
-    # Operator opt-in: skip content_validator on this retry. Patches
-    # render_params so the worker's Step 1b reads the bypass flag.
-    # When False/missing, render_params is untouched and the validator
-    # runs as before — same semantics as /edit and /variant.
-    if body and body.bypass_content_validation:
+    # Operator opt-in flags forwarded to render_params before re-enqueue.
+    # When False/missing, render_params is untouched and tenant-gated
+    # defaults in pipeline.Step 1b apply.
+    if body and (body.bypass_content_validation or body.force_content_validation):
         _rp = dict(job.render_params or {})
-        _rp["bypass_content_validation"] = True
+        if body.bypass_content_validation:
+            _rp["bypass_content_validation"] = True
+        if body.force_content_validation:
+            _rp["force_content_validation"] = True
         job.render_params = _rp
 
     # Capturar status PREVIO antes de mutar. Sin esto el AuditLog
@@ -5413,6 +5420,7 @@ class VariantJobRequest(BaseModel):
     # Espejo del flag de EditJobRequest — operator override del content
     # validator (UMG Guideline 15). Misma semántica, ver EditJobRequest.
     bypass_content_validation: bool = Field(default=False)
+    force_content_validation: bool = Field(default=False)
     # Override del concept del padre. 2000 chars igual que /generate.
     # Alimenta _get_unique_prompt() junto con genre/style/lyrics.
     concept: str | None = Field(default=None, max_length=2000)
@@ -5499,6 +5507,8 @@ async def create_variant(
         new_render_params["concept"] = body.concept
     if body.bypass_content_validation:
         new_render_params["bypass_content_validation"] = True
+    if body.force_content_validation:
+        new_render_params["force_content_validation"] = True
 
     # Style: override o herencia.
     new_style = body.style if body.style is not None else (parent.style or "oscuro")
