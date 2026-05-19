@@ -5540,6 +5540,23 @@ async def retry_job(
     if job.bg_r2_key_cached and not _bg_was_blamed:
         preserved_bg_r2_key = job.bg_r2_key_cached
 
+    # Forward render_params to the worker. Without this, /retry stripped
+    # background_hint / concept / typography settings and the worker ran
+    # a default pipeline — Gemini picked an unrelated scene instead of
+    # the operator's prompt. Real incident 2026-05-19: operator's
+    # "rock guitarist hands" variant failed validation, they hit Reintentar
+    # (fondo libre), and the regen produced an old man in a rainy alley
+    # because the prompt was lost between create-time and retry-time.
+    # Mirrors the /variant endpoint pattern (see line 5814 region).
+    _retry_render_params = job.render_params or {}
+    retry_pipeline_kwargs = {}
+    for k in ("font", "font_scale", "text_case", "lyric_transition",
+              "text_motion", "text_contrast", "movement_style",
+              "animate_image", "genre", "match_lyrics",
+              "background_hint", "concept"):
+        if k in _retry_render_params and _retry_render_params[k] not in (None, ""):
+            retry_pipeline_kwargs[k] = _retry_render_params[k]
+
     enqueue_pipeline(
         job_id=job_id,
         mp3_path=None,
@@ -5553,6 +5570,7 @@ async def retry_job(
         umg_spec=umg_spec,
         segments_override=segments_override,
         bg_r2_key=preserved_bg_r2_key,
+        **retry_pipeline_kwargs,
     )
 
     return {
