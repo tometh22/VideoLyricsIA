@@ -91,11 +91,13 @@ export default function ContentValidationToggle({
         defaultDesc:
           t("validation.nonumg_default_desc") ||
           "Cualquier escena, sin restricciones.",
-        altLabel: t("validation.nonumg_alt_label") || "Sí — apto para UMG",
+        // Non-UMG operators don't know what UMG is. Describe the behavior
+        // in concrete terms instead of namedropping the vendor's rule set.
+        altLabel: t("validation.nonumg_alt_label") || "Sí — sin personas ni marcas",
         altDesc:
           t("validation.nonumg_alt_desc") ||
-          "Sin caras, sin manos, sin logos detectables. Útil si vas a entregar a un sello.",
-        badge: t("validation.nonumg_badge") || "APTO UMG",
+          "Bloquea caras, manos y logos detectables en el fondo. Útil para entrega a clientes con restricciones de imagen.",
+        badge: t("validation.nonumg_badge") || "MODO RESTRINGIDO",
         // brand color when departing (operator is opting INTO the stricter mode)
         departingTone: "brand",
       };
