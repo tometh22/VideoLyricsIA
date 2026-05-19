@@ -4,6 +4,7 @@ import { getDownloadUrl, useMediaUrl } from "../mediaUrl";
 import { JobDetailTour } from "./OnboardingTour";
 import ProResBadge from "./ProResBadge";
 import EditRequestPanel from "./EditRequestPanel";
+import ContentValidationToggle from "./ContentValidationToggle";
 import EnableProResModal from "./EnableProResModal";
 import DriveTransferModal from "./DriveTransferModal";
 import VariantCreateModal from "./VariantCreateModal";
@@ -244,6 +245,10 @@ export default function JobDetail({ job, onBack, onJobUpdate }) {
   const [retryFrameSize, setRetryFrameSize] = useState(
     job.umg_spec?.frame_size || null
   );
+  // Operator override for content_validator on retry. Default OFF; only
+  // surfaced on validation_failed jobs (handleRetry forwards it to
+  // POST /retry body where the backend patches render_params).
+  const [retryBypassValidation, setRetryBypassValidation] = useState(false);
   const showRetrySpecSelector =
     (job.delivery_profile === "umg" || job.delivery_profile === "both") &&
     job.umg_spec != null;
@@ -262,14 +267,20 @@ export default function JobDetail({ job, onBack, onJobUpdate }) {
       // If the caller (or the dropdown) gave us a frame_size that
       // differs from what's currently on the job, pass it in the body.
       // Otherwise call /retry plain — backend keeps the existing spec.
+      // Also forward bypass_content_validation when the operator opted in
+      // (only meaningful on validation_failed jobs; the field is safe to
+      // send always, the backend just no-ops it for other statuses).
       const fs = overrideFrameSize ?? retryFrameSize;
-      const wantOverride = fs && fs !== job.umg_spec?.frame_size;
+      const wantFrameOverride = fs && fs !== job.umg_spec?.frame_size;
+      const bodyPayload = {};
+      if (wantFrameOverride) bodyPayload.frame_size = fs;
+      if (retryBypassValidation) bodyPayload.bypass_content_validation = true;
       const fetchOpts = {
         method: "POST",
         headers: { ...authHeaders(), "Content-Type": "application/json" },
       };
-      if (wantOverride) {
-        fetchOpts.body = JSON.stringify({ frame_size: fs });
+      if (Object.keys(bodyPayload).length > 0) {
+        fetchOpts.body = JSON.stringify(bodyPayload);
       }
       const res = await fetch(`${API}/retry/${job.job_id}`, fetchOpts);
       if (res.ok) {
@@ -945,6 +956,17 @@ export default function JobDetail({ job, onBack, onJobUpdate }) {
             <p className="text-[11px] text-accent">
               {t("detail.validation_no_quota") || "Este video NO consume tu cuota mensual — solo los aprobados cuentan."}
             </p>
+          </div>
+          {/* Operator override toggle: only relevant on validation_failed,
+              so we mount it here (not at the top-level of JobDetail). The
+              retry call forwards the flag; backend patches render_params
+              before re-enqueuing so the worker's Step 1b skips validation. */}
+          <div className="mb-3">
+            <ContentValidationToggle
+              value={retryBypassValidation}
+              onChange={setRetryBypassValidation}
+              disabled={retrying}
+            />
           </div>
           <div className="flex gap-2">
             <button

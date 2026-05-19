@@ -5236,6 +5236,13 @@ class RetryJobRequest(BaseModel):
     operators can downgrade a 4K render that OOMed the worker to HD on
     retry, without re-uploading the audio."""
     frame_size: str | None = Field(default=None, max_length=16)
+    # When True, set render_params["bypass_content_validation"]=True
+    # before re-enqueuing so the worker skips _validate_fn. Same semantics
+    # as EditJobRequest/VariantJobRequest. Use case: a job died in
+    # validation_failed because the prompt intentionally triggered the
+    # validator (e.g. "rock guitarist hands as subject"), and the
+    # operator wants to retry without recreating the variant manually.
+    bypass_content_validation: bool = Field(default=False)
 
 
 @app.post("/retry/{job_id}")
@@ -5293,6 +5300,15 @@ async def retry_job(
             new_spec = dict(job.umg_spec)
             new_spec["frame_size"] = body.frame_size
             job.umg_spec = new_spec
+
+    # Operator opt-in: skip content_validator on this retry. Patches
+    # render_params so the worker's Step 1b reads the bypass flag.
+    # When False/missing, render_params is untouched and the validator
+    # runs as before — same semantics as /edit and /variant.
+    if body and body.bypass_content_validation:
+        _rp = dict(job.render_params or {})
+        _rp["bypass_content_validation"] = True
+        job.render_params = _rp
 
     # Capturar status PREVIO antes de mutar. Sin esto el AuditLog
     # registraba siempre "processing" como previous_status (la línea de
