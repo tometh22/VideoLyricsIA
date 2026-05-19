@@ -604,7 +604,7 @@ export default function EditRequestPanel({
               </span>
             </div>
             <p className="text-[11px] text-ink-secondary">
-              {t("edit.background_cost") || "~10-15 min · ~US$0.90 · nuevo Veo manteniendo lyrics"}
+              {t("edit.background_cost") || "~10-15 min · ~US$0.90 · nuevo video cinemático manteniendo lyrics"}
             </p>
           </button>
           )}
@@ -816,9 +816,9 @@ export default function EditRequestPanel({
             <p className="text-[11px] text-ink-secondary leading-relaxed">
               {backgroundMode === "imagen"
                 ? (t("edit.background_confirm_desc_imagen") ||
-                    "Genera un fondo nuevo con Imagen-4 (foto + zoom suave) manteniendo las lyrics y los tiempos. Cuesta ~US$0.03 y tarda ~30 segundos. Sin riesgo de caras humanas en el fondo. La tipografía actual se mantiene.")
+                    "Genera un fondo nuevo de foto animada con zoom suave manteniendo las lyrics y los tiempos. Cuesta ~US$0.03 y tarda ~30 segundos. Sin riesgo de caras humanas en el fondo. La tipografía actual se mantiene.")
                 : (t("edit.background_confirm_desc") ||
-                    "Genera un fondo nuevo con Veo (video cinematográfico) manteniendo las lyrics y los tiempos. Cuesta ~US$0.90 y tarda ~10-15 min. La tipografía actual se mantiene.")}
+                    "Genera un fondo nuevo de video cinemático manteniendo las lyrics y los tiempos. Cuesta ~US$0.90 y tarda ~10-15 min. La tipografía actual se mantiene.")}
             </p>
           </div>
 
@@ -846,7 +846,7 @@ export default function EditRequestPanel({
                 {t("edit.bg_mode_veo") || "Video cinematográfico"}
               </span>
               <span className="text-[9px] opacity-70">
-                {t("edit.bg_mode_veo_hint") || "Veo · ~15 min · cámaras y motion"}
+                {t("edit.bg_mode_veo_hint") || "~15 min · cámaras y motion"}
               </span>
             </button>
             <button
@@ -868,7 +868,7 @@ export default function EditRequestPanel({
                 {t("edit.bg_mode_imagen") || "Foto animada"}
               </span>
               <span className="text-[9px] opacity-70">
-                {t("edit.bg_mode_imagen_hint") || "Imagen-4 · ~30s · zoom suave"}
+                {t("edit.bg_mode_imagen_hint") || "~30s · zoom suave"}
               </span>
             </button>
           </div>

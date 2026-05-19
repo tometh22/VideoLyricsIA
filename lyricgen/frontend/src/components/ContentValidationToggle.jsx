@@ -217,7 +217,7 @@ export default function ContentValidationToggle({
           {effectiveValue === false && (
             <p className="text-[10px] text-ink-tertiary leading-relaxed px-1 pt-1 border-t border-white/[0.05]">
               ⚠ {t("validation.people_quality_warning") ||
-                  "Veo a veces genera personas con artefactos (caras deformadas, manos con dedos extras). Probá un render antes de aprobar — si vas a entregar a un cliente, revisá el resultado."}
+                  "El modelo a veces genera personas con artefactos (caras deformadas, manos con dedos extras). Probá un render antes de aprobar — si vas a entregar a un cliente, revisá el resultado."}
             </p>
           )}
         </div>
