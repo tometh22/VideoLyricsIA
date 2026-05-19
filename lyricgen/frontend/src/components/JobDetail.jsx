@@ -4,7 +4,7 @@ import { getDownloadUrl, useMediaUrl } from "../mediaUrl";
 import { JobDetailTour } from "./OnboardingTour";
 import ProResBadge from "./ProResBadge";
 import EditRequestPanel from "./EditRequestPanel";
-import ContentValidationToggle from "./ContentValidationToggle";
+import ContentValidationToggle, { isUmgTenant } from "./ContentValidationToggle";
 import EnableProResModal from "./EnableProResModal";
 import DriveTransferModal from "./DriveTransferModal";
 import VariantCreateModal from "./VariantCreateModal";
@@ -245,10 +245,13 @@ export default function JobDetail({ job, onBack, onJobUpdate }) {
   const [retryFrameSize, setRetryFrameSize] = useState(
     job.umg_spec?.frame_size || null
   );
-  // Operator override for content_validator on retry. Default OFF; only
-  // surfaced on validation_failed jobs (handleRetry forwards it to
-  // POST /retry body where the backend patches render_params).
-  const [retryBypassValidation, setRetryBypassValidation] = useState(false);
+  // Tenant-aware content-validation choice for retry. Boolean: true =
+  // run validator on retry, false = skip. Default per tenant. Mapped to
+  // bypass/force in the POST /retry body. See ContentValidationToggle.jsx
+  // for full rationale.
+  const _retryTenantId = currentUser?.tenant_id || null;
+  const _retryIsUmg = isUmgTenant(_retryTenantId);
+  const [retryValidationEnabled, setRetryValidationEnabled] = useState(_retryIsUmg);
   const showRetrySpecSelector =
     (job.delivery_profile === "umg" || job.delivery_profile === "both") &&
     job.umg_spec != null;
@@ -275,13 +278,16 @@ export default function JobDetail({ job, onBack, onJobUpdate }) {
       // If the caller (or the dropdown) gave us a frame_size that
       // differs from what's currently on the job, pass it in the body.
       // Otherwise call /retry plain — backend keeps the existing spec.
-      // Also forward bypass_content_validation when the operator opted in
-      // (only meaningful on validation_failed jobs; the field is safe to
-      // send always, the backend just no-ops it for other statuses).
+      // Tenant-aware validation flag: translate the toggle's boolean to
+      // bypass (UMG departing default) or force (non-UMG departing default).
       const wantFrameOverride = fs && fs !== job.umg_spec?.frame_size;
       const bodyPayload = {};
       if (wantFrameOverride) bodyPayload.frame_size = fs;
-      if (retryBypassValidation) bodyPayload.bypass_content_validation = true;
+      if (_retryIsUmg && !retryValidationEnabled) {
+        bodyPayload.bypass_content_validation = true;
+      } else if (!_retryIsUmg && retryValidationEnabled) {
+        bodyPayload.force_content_validation = true;
+      }
       const fetchOpts = {
         method: "POST",
         headers: { ...authHeaders(), "Content-Type": "application/json" },
@@ -966,12 +972,13 @@ export default function JobDetail({ job, onBack, onJobUpdate }) {
           </div>
           {/* Operator override toggle: only relevant on validation_failed,
               so we mount it here (not at the top-level of JobDetail). The
-              retry call forwards the flag; backend patches render_params
-              before re-enqueuing so the worker's Step 1b skips validation. */}
+              retry call forwards the boolean as either bypass or force
+              flag depending on the operator's tenant default. */}
           <div className="mb-3">
             <ContentValidationToggle
-              value={retryBypassValidation}
-              onChange={setRetryBypassValidation}
+              value={retryValidationEnabled}
+              onChange={setRetryValidationEnabled}
+              tenantId={_retryTenantId}
               disabled={retrying}
             />
           </div>
