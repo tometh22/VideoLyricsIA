@@ -1,46 +1,129 @@
 import { useState } from "react";
 import { useI18n } from "../i18n";
 
+// Hardcoded list. Mirror of backend pipeline.py UMG_TENANTS — if you
+// add a B2B partner here, update the backend constant too. Single source
+// of truth is the backend (which actually enforces the gate); this
+// frontend list only controls UI copy + default toggle position.
+const UMG_TENANTS = new Set(["umg", "omg"]);
+
+function isUmgTenant(tenantId) {
+  return UMG_TENANTS.has(String(tenantId || "").toLowerCase());
+}
+
 /**
- * Operator-facing toggle for `bypass_content_validation` flag.
- * Used in EditRequestPanel + VariantCreateModal (background regen mode).
+ * Operator-facing toggle for content validation behavior. The wire
+ * representation is a boolean: `value=true` means "validation runs",
+ * `value=false` means "validation skipped". The parent component is
+ * responsible for translating that boolean into the right backend flag
+ * for the tenant:
  *
- * Two states with radio semantics:
- *   - ACTIVE (default, recommended)  → backend runs content_validator.
- *     Veo/Imagen outputs with face/hands/logos as subject get rejected
- *     BEFORE the expensive render, sparing CPU and avoiding downstream
- *     UMG rejection.
- *   - BYPASS (operator opts in)      → validator is skipped entirely.
- *     For concepts where the flagged content IS the song's identity
- *     (rock guitarist hands, neon city street with figures, etc.).
- *     UMG can still reject downstream — operator owns that decision.
+ *   UMG tenant (default behavior: validate):
+ *     - value=true  → no payload field (matches tenant default)
+ *     - value=false → send `bypass_content_validation: true`
  *
- * Wrapped in a collapsible disclosure so it's hidden by default and
- * doesn't clutter the main "regenerate background" flow.
+ *   Non-UMG tenant (default behavior: skip):
+ *     - value=true  → send `force_content_validation: true`
+ *     - value=false → no payload field (matches tenant default)
+ *
+ * UI copy differs per tenant so each operator sees their choice framed
+ * in the way that matches the default they're departing from:
+ *
+ *   UMG:     "Activa (default)" vs "Asumir el riesgo" (amber warning)
+ *   non-UMG: "Sin verificación (default)" vs "Activar verificación"
  *
  * Props:
- *   value      — boolean. true = bypass ON. false (default) = validator ON.
+ *   value      — boolean. true = validate, false = skip.
  *   onChange   — fn(newValue: boolean)
- *   disabled   — boolean (true while a request is in flight)
+ *   tenantId   — string | undefined. Determines copy + default state.
+ *                Falls back to UMG semantics if missing (safer default).
+ *   disabled   — boolean
+ *   initialOpen — optional override; defaults to expanded when the
+ *                operator's choice differs from the tenant default
+ *                (so the warning/info is always visible at glance).
  */
 export default function ContentValidationToggle({
-  value = false,
+  value,
   onChange,
+  tenantId,
   disabled = false,
+  initialOpen,
 }) {
   const { t } = useI18n();
-  // Start expanded ONLY when the operator already chose bypass — that
-  // way the warning state is always visible. Default collapsed (saves
-  // vertical space and matches "recommended default" intent).
-  const [expanded, setExpanded] = useState(Boolean(value));
+  const isUmg = isUmgTenant(tenantId);
+  // Tenant default for `value`. The parent should initialize state to
+  // this; if it didn't (value is undefined), treat as the default.
+  const tenantDefault = isUmg; // UMG defaults to validate=true
+  const effectiveValue = typeof value === "boolean" ? value : tenantDefault;
+  // Operator is "departing from default" when their choice doesn't match
+  // the tenant default. That's when we want the amber warning visible.
+  const isDeparting = effectiveValue !== tenantDefault;
 
-  const isBypass = Boolean(value);
+  const [expanded, setExpanded] = useState(
+    typeof initialOpen === "boolean" ? initialOpen : isDeparting
+  );
+
+  // Per-tenant copy.
+  const copy = isUmg
+    ? {
+        sectionLabel: t("validation.section_label") || "Verificación de contenido",
+        defaultLabel: t("validation.umg_default_label") || "Activa",
+        defaultRecommended: t("validation.umg_recommended") || "recomendado · default",
+        defaultDesc:
+          t("validation.umg_default_desc") ||
+          "Bloquea fondos con caras / manos / logos detectables antes del render. Lo que UMG normalmente rechazaría.",
+        altLabel: t("validation.umg_alt_label") || "Asumir el riesgo",
+        altDesc:
+          t("validation.umg_alt_desc") ||
+          "El render sale aunque la AI genere caras / manos / logos. UMG puede rechazar el video después — vos asumís esa decisión.",
+        badge: t("validation.umg_badge") || "RIESGO ASUMIDO",
+        // amber when departing
+        departingTone: "amber",
+      }
+    : {
+        sectionLabel: t("validation.section_label") || "Verificación de contenido",
+        defaultLabel: t("validation.nonumg_default_label") || "Sin verificación",
+        defaultRecommended: t("validation.nonumg_default_recommended") || "default",
+        defaultDesc:
+          t("validation.nonumg_default_desc") ||
+          "El render sale como pediste, sin chequeos automáticos de contenido.",
+        altLabel: t("validation.nonumg_alt_label") || "Activar verificación",
+        altDesc:
+          t("validation.nonumg_alt_desc") ||
+          "Bloquea fondos con caras / manos / logos detectables antes del render (las reglas UMG). Útil si vas a entregarle a un sello.",
+        badge: t("validation.nonumg_badge") || "VERIFICACIÓN ACTIVA",
+        // brand color when departing (validating is "extra care", not "risk")
+        departingTone: "brand",
+      };
+
+  // Tone-driven classes (amber for UMG-bypass, brand for non-UMG-enable).
+  const departingRingClass =
+    copy.departingTone === "amber"
+      ? "ring-amber-500/40 bg-amber-500/[0.04]"
+      : "ring-brand/40 bg-brand/[0.04]";
+  const departingBadgeClass =
+    copy.departingTone === "amber"
+      ? "bg-amber-500/15 text-amber-300 ring-amber-500/30"
+      : "bg-brand/15 text-brand-light ring-brand/30";
+  const departingOptionClass =
+    copy.departingTone === "amber"
+      ? "ring-amber-500/50 bg-amber-500/[0.08]"
+      : "ring-brand/50 bg-brand/[0.08]";
+  const departingRadioAccent =
+    copy.departingTone === "amber" ? "accent-amber-500" : "accent-brand";
+
+  // Map to the two radio buttons. "default" radio corresponds to the
+  // tenant's default behavior; "alt" is the departure.
+  const defaultRadioValue = tenantDefault; // boolean for `value` when this radio is selected
+  const altRadioValue = !tenantDefault;
+  const defaultSelected = effectiveValue === defaultRadioValue;
+  const altSelected = effectiveValue === altRadioValue;
 
   return (
     <div className={
       "rounded-md ring-1 transition-colors " +
-      (isBypass
-        ? "ring-amber-500/40 bg-amber-500/[0.04]"
+      (isDeparting
+        ? departingRingClass
         : "ring-white/[0.06] bg-surface-3/40")
     }>
       <button
@@ -50,10 +133,13 @@ export default function ContentValidationToggle({
         className="w-full flex items-center justify-between px-3 py-2 text-[11px] text-ink-secondary tracking-wide disabled:opacity-50"
       >
         <span className="flex items-center gap-2">
-          <span>{t("validation.section_label") || "Verificación de contenido"}</span>
-          {isBypass && (
-            <span className="text-[10px] px-1.5 py-0.5 rounded bg-amber-500/15 text-amber-300 ring-1 ring-amber-500/30 font-mono">
-              {t("validation.bypass_badge") || "RIESGO ASUMIDO"}
+          <span>{copy.sectionLabel}</span>
+          {isDeparting && (
+            <span className={
+              "text-[10px] px-1.5 py-0.5 rounded ring-1 font-mono " +
+              departingBadgeClass
+            }>
+              {copy.badge}
             </span>
           )}
         </span>
@@ -62,57 +148,57 @@ export default function ContentValidationToggle({
 
       {expanded && (
         <div className="px-3 pb-3 space-y-2">
+          {/* Default (tenant-matching) option */}
           <label
             className={
               "flex items-start gap-2 cursor-pointer p-2 rounded ring-1 transition-colors " +
-              (!isBypass
+              (defaultSelected
                 ? "ring-brand/40 bg-brand/[0.06]"
                 : "ring-white/[0.04] hover:ring-white/[0.10]")
             }
           >
             <input
               type="radio"
-              checked={!isBypass}
-              onChange={() => onChange?.(false)}
+              checked={defaultSelected}
+              onChange={() => onChange?.(defaultRadioValue)}
               disabled={disabled}
               className="mt-0.5 accent-brand"
             />
             <div className="flex-1">
               <div className="text-xs text-white font-medium">
-                {t("validation.active_label") || "Activa"}{" "}
+                {copy.defaultLabel}{" "}
                 <span className="text-[10px] text-ink-tertiary font-normal">
-                  ({t("validation.recommended") || "recomendado · default"})
+                  ({copy.defaultRecommended})
                 </span>
               </div>
               <p className="text-[10px] text-ink-tertiary mt-0.5 leading-relaxed">
-                {t("validation.active_desc") ||
-                  "Bloquea fondos con caras / manos / logos detectables antes del render. Lo que UMG normalmente rechazaría."}
+                {copy.defaultDesc}
               </p>
             </div>
           </label>
 
+          {/* Alt (departure) option */}
           <label
             className={
               "flex items-start gap-2 cursor-pointer p-2 rounded ring-1 transition-colors " +
-              (isBypass
-                ? "ring-amber-500/50 bg-amber-500/[0.08]"
+              (altSelected
+                ? departingOptionClass
                 : "ring-white/[0.04] hover:ring-white/[0.10]")
             }
           >
             <input
               type="radio"
-              checked={isBypass}
-              onChange={() => onChange?.(true)}
+              checked={altSelected}
+              onChange={() => onChange?.(altRadioValue)}
               disabled={disabled}
-              className="mt-0.5 accent-amber-500"
+              className={"mt-0.5 " + departingRadioAccent}
             />
             <div className="flex-1">
               <div className="text-xs text-white font-medium">
-                {t("validation.bypass_label") || "Asumir el riesgo"}
+                {copy.altLabel}
               </div>
               <p className="text-[10px] text-ink-tertiary mt-0.5 leading-relaxed">
-                {t("validation.bypass_desc") ||
-                  "El render sale aunque la AI genere caras / manos / logos. UMG puede rechazar el video después — vos asumís esa decisión."}
+                {copy.altDesc}
               </p>
             </div>
           </label>
@@ -121,3 +207,7 @@ export default function ContentValidationToggle({
     </div>
   );
 }
+
+// Re-exported helpers so parents can share the same tenant logic
+// without duplicating the hardcoded list.
+export { isUmgTenant, UMG_TENANTS };

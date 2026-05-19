@@ -1,8 +1,17 @@
 import { useEffect, useRef, useState } from "react";
 import { useI18n } from "../i18n";
 import BackgroundHintField from "./BackgroundHintField";
-import ContentValidationToggle from "./ContentValidationToggle";
+import ContentValidationToggle, { isUmgTenant } from "./ContentValidationToggle";
 import LyricsEditor from "./LyricsEditor";
+
+function _readTenant() {
+  try {
+    const u = JSON.parse(localStorage.getItem("genly_user") || "null");
+    return u?.tenant_id || null;
+  } catch {
+    return null;
+  }
+}
 
 const API = import.meta.env.VITE_API_URL || "";
 
@@ -99,13 +108,15 @@ export default function EditRequestPanel({
   // Operator picks via the segmented toggle inside the background panel.
   // Default "veo" preserves the prior behavior of every edit pre-2026-05-16.
   const [backgroundMode, setBackgroundMode] = useState("veo");
-  // Operator override of content_validator (UMG Guideline 15). Default
-  // false = run validator. When true, the worker skips _validate_fn
-  // entirely and renders even if the AI generated hands/faces/logos as
-  // subject. Used for concepts where the flagged content IS the song's
-  // visual identity (rock guitarist hands, etc.). Operator owns the
-  // downstream UMG-rejection risk; we log the bypass in validation_result.
-  const [bypassContentValidation, setBypassContentValidation] = useState(false);
+  // Tenant-aware content-validation toggle. Boolean semantics:
+  // value=true  → operator wants validator to run
+  // value=false → operator wants validator skipped
+  // Default per tenant: UMG tenants validate, others skip.
+  // Mapped to bypass_content_validation OR force_content_validation in
+  // the payload depending on which direction departs from tenant default.
+  const _tenantId = _readTenant();
+  const _isUmg = isUmgTenant(_tenantId);
+  const [validationEnabled, setValidationEnabled] = useState(_isUmg);
   // Latest segments from the nested LyricsEditor (updated synchronously
   // on every edit via `onEditedChange`). Held in a ref so buildPayload
   // can read it without re-renders. Used to include the operator's
@@ -231,11 +242,13 @@ export default function EditRequestPanel({
       if (backgroundMode && backgroundMode !== "veo") {
         p.background_mode = backgroundMode;
       }
-      // Forward bypass flag ONLY when ON (default is false on the backend
-      // Pydantic side, so omitting it is identical to sending false but
-      // shorter and friendlier to older API versions during a deploy window).
-      if (bypassContentValidation) {
+      // Translate the operator's boolean choice into the right backend
+      // flag for their tenant. Sending only the flag that "departs from
+      // default" keeps payloads minimal and friendly to older backends.
+      if (_isUmg && !validationEnabled) {
         p.bypass_content_validation = true;
+      } else if (!_isUmg && validationEnabled) {
+        p.force_content_validation = true;
       }
       if (latestEditedSegments.current && latestEditedSegments.current.length > 0) {
         p.segments = latestEditedSegments.current;
@@ -849,8 +862,9 @@ export default function EditRequestPanel({
           />
 
           <ContentValidationToggle
-            value={bypassContentValidation}
-            onChange={setBypassContentValidation}
+            value={validationEnabled}
+            onChange={setValidationEnabled}
+            tenantId={_tenantId}
             disabled={submitting}
           />
 
