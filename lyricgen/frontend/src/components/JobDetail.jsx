@@ -264,13 +264,20 @@ export default function JobDetail({ job, onBack, onJobUpdate }) {
     if (retrying) return;
     setRetrying(true);
     try {
+      // Guard: callers like `onClick={handleRetry}` pass a React
+      // SyntheticEvent as the first arg. Treating that as a frame_size
+      // poisons bodyPayload, JSON.stringify hits circular refs, the
+      // fetch never fires, and the catch surfaces "Error de red al
+      // reintentar" with NO request visible in DevTools Network (the
+      // bug that hid this for weeks). Only accept strings.
+      const fs = (typeof overrideFrameSize === "string" ? overrideFrameSize : null)
+        ?? retryFrameSize;
       // If the caller (or the dropdown) gave us a frame_size that
       // differs from what's currently on the job, pass it in the body.
       // Otherwise call /retry plain — backend keeps the existing spec.
       // Also forward bypass_content_validation when the operator opted in
       // (only meaningful on validation_failed jobs; the field is safe to
       // send always, the backend just no-ops it for other statuses).
-      const fs = overrideFrameSize ?? retryFrameSize;
       const wantFrameOverride = fs && fs !== job.umg_spec?.frame_size;
       const bodyPayload = {};
       if (wantFrameOverride) bodyPayload.frame_size = fs;
