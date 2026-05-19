@@ -30,6 +30,32 @@ if (typeof window !== "undefined" && typeof Element !== "undefined") {
   Element.prototype.scrollIntoView = Element.prototype.scrollIntoView || function () {};
 }
 
+// localStorage / sessionStorage — jsdom blocks both for opaque origins
+// (about:blank), throwing SecurityError on first access. Several
+// components touch them on mount (auth token, tenant detection, plan
+// reads), so we replace with in-memory stubs. defineProperty with
+// configurable:true overrides jsdom's getter that would otherwise
+// throw on every access.
+if (typeof window !== "undefined") {
+  const _mk = () => {
+    let store = {};
+    return {
+      getItem: (k) => (k in store ? store[k] : null),
+      setItem: (k, v) => { store[k] = String(v); },
+      removeItem: (k) => { delete store[k]; },
+      clear: () => { store = {}; },
+      key: (i) => Object.keys(store)[i] ?? null,
+      get length() { return Object.keys(store).length; },
+    };
+  };
+  Object.defineProperty(window, "localStorage", {
+    value: _mk(), writable: true, configurable: true,
+  });
+  Object.defineProperty(window, "sessionStorage", {
+    value: _mk(), writable: true, configurable: true,
+  });
+}
+
 // matchMedia stub — react-joyride and a few responsive helpers check
 // it on mount.
 if (typeof window !== "undefined" && !window.matchMedia) {
