@@ -5029,6 +5029,34 @@ async def request_edit(
 
     new_edit_count = current_edit_count + 1
 
+    # Pre-flight check that the source audio is still in R2. Every edit
+    # type (background/typography/lyrics) downloads the original WAV
+    # before re-rendering. If the audio is gone (sibling variant was
+    # deleted and reclaimed the shared key, or cleanup_old_inputs ran),
+    # the worker would crash 30 s into the edit with "Could not download
+    # source audio from R2" and the operator would see "El video falló"
+    # with no actionable hint. Fail fast here with a clear re-upload
+    # instruction instead. 2026-05-19 agus.cafisi / Una Vez Más incident.
+    if job.input_r2_key:
+        try:
+            import storage as _storage
+            if _storage.is_enabled() and not _storage.object_exists(job.input_r2_key):
+                raise HTTPException(
+                    status_code=422,
+                    detail=(
+                        "El audio original ya no está en storage. "
+                        "Probablemente fue limpiado o un job hermano lo borró. "
+                        "Subí el MP3 de nuevo para regenerar el video."
+                    ),
+                )
+        except HTTPException:
+            raise
+        except Exception as _exc:
+            logger.warning(
+                "[EDIT] R2 pre-check failed for %s key=%r — proceeding anyway: %s",
+                job_id, job.input_r2_key, _exc,
+            )
+
     # Flip to editing immediately so the UI can show progress.
     job.status = "editing"
     job.edit_count = new_edit_count
@@ -5368,6 +5396,39 @@ async def retry_job(
             status_code=422,
             detail="Source audio no longer available — please upload the file again.",
         )
+    # Pre-flight check that the R2 object actually exists. The DB column
+    # records the key the upload landed at, but the object can be gone
+    # later if a sibling job (parent or another variant) was deleted and
+    # the input_r2_key reference-counting (jobs._delete_r2_objects) is
+    # incorrect, or if cleanup_old_inputs reclaimed it. Without this
+    # check the retry succeeds, the worker picks up the job, and a 6-min
+    # render crashes loudly on "Could not download source audio from R2"
+    # — the operator sees "Edit failed" with no actionable hint.
+    # 2026-05-19 incident: agus.cafisi hit this twice in a row on staging.
+    # Skipped silently when R2 is disabled (dev/test environments where
+    # storage.is_enabled() is False — object_exists always returns False
+    # there and would false-trigger this gate).
+    try:
+        import storage as _storage
+        if _storage.is_enabled() and not _storage.object_exists(job.input_r2_key):
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    "El audio original ya no está en storage. "
+                    "Probablemente fue limpiado o un job hermano lo borró. "
+                    "Subí el MP3 de nuevo para regenerar el video."
+                ),
+            )
+    except HTTPException:
+        raise
+    except Exception as _exc:
+        # Storage probe error (network, credentials). Conservative
+        # default: let the retry proceed — the worker will fail loud if
+        # the file is actually missing, and the operator can still try.
+        logger.warning(
+            "[RETRY] R2 pre-check failed for %s key=%r — proceeding anyway: %s",
+            job_id, job.input_r2_key, _exc,
+        )
 
     # Apply optional frame_size override BEFORE we capture umg_spec for
     # the enqueue below. Validates against the same allow-list the
@@ -5588,6 +5649,28 @@ async def create_variant(
             status_code=422,
             detail="Audio del job padre ya no está disponible en storage — "
                    "no se puede crear variante.",
+        )
+    # Verify the R2 object actually still exists (not just the DB column).
+    # Variants copy the parent's input_r2_key — a stale parent column
+    # would point the variant at a ghost file and the worker would crash
+    # on download. Same pre-check as /retry and /edit. Skipped silently
+    # when R2 is disabled (dev/test).
+    try:
+        import storage as _storage
+        if _storage.is_enabled() and not _storage.object_exists(parent.input_r2_key):
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    "El audio del job padre ya no está en storage — "
+                    "no se puede crear variante. Subí el MP3 de nuevo."
+                ),
+            )
+    except HTTPException:
+        raise
+    except Exception as _exc:
+        logger.warning(
+            "[VARIANT] R2 pre-check failed for parent=%s key=%r — proceeding anyway: %s",
+            parent_job_id, parent.input_r2_key, _exc,
         )
 
     # Plan capacity check — misma lógica que /generate. Variante cuenta
