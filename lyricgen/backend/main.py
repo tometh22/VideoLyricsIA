@@ -5710,6 +5710,58 @@ async def create_variant(
     # control fino sobre segments_json + parent_job_id + render_params
     # mergeados, y create_job no acepta esos params.
     new_job_id = uuid.uuid4().hex[:12]
+
+    # Variant gets its own copy of the input audio in R2 — server-side
+    # CopyObject, no bytes round-trip through us. This makes each variant
+    # self-contained: deleting the parent (or any sibling) no longer
+    # breaks the lineage.
+    #
+    # Before this PR variants inherited `parent.input_r2_key` literally.
+    # PR #220 already prevents the cascade-delete via a sibling-count
+    # check in jobs._delete_r2_objects, but copying the audio is the
+    # belt-and-suspenders: if anything else ever deletes the parent's
+    # raw key (R2 lifecycle policy, manual ops, future regression),
+    # this variant still has its own copy.
+    #
+    # Storage cost: ~30-80 MB per variant WAV/MP3. Marginal vs the
+    # ~$0.90 Veo cost per variant. Tradeoff worth the safety.
+    #
+    # Fallback semantics: if copy fails for any reason (R2 disabled,
+    # transient error, source missing despite the pre-check above), we
+    # fall back to sharing parent.input_r2_key — same as pre-fix behavior.
+    # The audit log records which mode was used so admin can spot the
+    # silently-degraded case.
+    variant_input_r2_key = parent.input_r2_key
+    variant_owns_input = False
+    try:
+        import os as _os_mod
+        import storage as _storage_mod
+        src_key = parent.input_r2_key
+        src_filename = _os_mod.path.basename(src_key) if src_key else ""
+        if src_key and src_filename and _storage_mod.is_enabled():
+            candidate_dst = _storage_mod._input_object_key(
+                current_user["tenant_id"], new_job_id, src_filename
+            )
+            if _storage_mod.copy_object(src_key, candidate_dst):
+                variant_input_r2_key = candidate_dst
+                variant_owns_input = True
+                logger.info(
+                    "[VARIANT] Audio copied: %s -> %s (parent=%s, new_job=%s)",
+                    src_key, candidate_dst, parent.job_id, new_job_id,
+                )
+            else:
+                logger.warning(
+                    "[VARIANT] Audio copy returned False, falling back to shared key: %s",
+                    src_key,
+                )
+    except Exception as _exc:
+        # Copy is best-effort. If it explodes, the variant still works —
+        # just shares its input with the parent (pre-#220 behavior).
+        logger.warning(
+            "[VARIANT] copy_object failed for parent=%s src=%r, falling back to shared key: %s",
+            parent.job_id, parent.input_r2_key, _exc,
+        )
+
     new_job = JobModel(
         job_id=new_job_id,
         user_id=current_user["id"],
@@ -5723,7 +5775,7 @@ async def create_variant(
         status="processing",
         current_step="background",  # salta Whisper
         progress=0,
-        input_r2_key=parent.input_r2_key,
+        input_r2_key=variant_input_r2_key,
         segments_json=parent.segments_json,
         render_params=new_render_params,
         edit_count=0,
@@ -5739,6 +5791,7 @@ async def create_variant(
             "background_hint": body.background_hint,
             "concept_overridden": body.concept is not None,
             "style_overridden": body.style is not None,
+            "variant_owns_input": variant_owns_input,
         },
     ))
     db.commit()
@@ -5747,7 +5800,10 @@ async def create_variant(
     # shape que /retry, más concept/background_hint si vinieron.
     pipeline_kwargs = {
         "delivery_profile": parent.delivery_profile or "youtube",
-        "input_r2_key": parent.input_r2_key,
+        # Use the variant's own input key (post-copy) when available, so
+        # the worker downloads the variant-owned WAV, not the parent's
+        # shared one. Falls back to parent's key if copy_object failed.
+        "input_r2_key": variant_input_r2_key,
         "song_title": parent.song_title or "",
         "umg_spec": parent.umg_spec or {},
         "segments_override": parent.segments_json,
