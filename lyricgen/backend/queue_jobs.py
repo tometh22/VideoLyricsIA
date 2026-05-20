@@ -84,22 +84,40 @@ _queue_enterprise = None
 
 def _init_redis():
     """Lazy-init Redis + RQ queues. Returns (redis, default_q, enterprise_q) or
-    (None, None, None) if Redis is not configured or unreachable."""
+    (None, None, None) if Redis is not configured or unreachable.
+
+    Self-healing: the cached connection is re-validated with a cheap ping
+    on every call. If it has gone dead (Redis restart, transient network
+    blip), the cache is reset and we reconnect — so the queue recovers on
+    the next enqueue WITHOUT a worker/API pod restart. Before this, a
+    cached-but-dead connection meant every enqueue 500'd until someone
+    manually bounced the pods. Socket timeouts are bounded so a network
+    partition fails fast instead of hanging the request/healthcheck.
+    """
     global _redis, _queue_default, _queue_enterprise
     if _queue_default is not None:
-        return _redis, _queue_default, _queue_enterprise
+        try:
+            _redis.ping()
+            return _redis, _queue_default, _queue_enterprise
+        except Exception as e:
+            logger.warning("[QUEUE] cached Redis connection dead (%s); reconnecting", e)
+            _redis = _queue_default = _queue_enterprise = None
     if not REDIS_URL:
         return None, None, None
     try:
         from redis import Redis
         from rq import Queue
-        _redis = Redis.from_url(REDIS_URL)
+        _redis = Redis.from_url(
+            REDIS_URL, socket_connect_timeout=5, socket_timeout=5,
+            health_check_interval=30,
+        )
         _redis.ping()
         _queue_default = Queue("default", connection=_redis)
         _queue_enterprise = Queue("enterprise", connection=_redis)
         return _redis, _queue_default, _queue_enterprise
     except Exception as e:
         logger.warning("[QUEUE] Redis init failed (%s); falling back to threads", e)
+        _redis = _queue_default = _queue_enterprise = None
         return None, None, None
 
 

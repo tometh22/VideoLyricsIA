@@ -3476,19 +3476,47 @@ def _fetch_lyrics_via_gemini_search(
     ) if job_id else None
 
     try:
+        import time as _time_retry
         client = _get_genai_client()
         search_tool = types.Tool(google_search=types.GoogleSearch())
-        response = client.models.generate_content(
-            model="gemini-2.5-flash",
-            contents=user_content,
-            config=types.GenerateContentConfig(
-                system_instruction=system_prompt,
-                tools=[search_tool],
-                temperature=0.1,
-                max_output_tokens=2000,
-                thinking_config=types.ThinkingConfig(thinking_budget=0),
-            ),
+        _gen_config = types.GenerateContentConfig(
+            system_instruction=system_prompt,
+            tools=[search_tool],
+            temperature=0.1,
+            max_output_tokens=2000,
+            thinking_config=types.ThinkingConfig(thinking_budget=0),
         )
+        # Retry ONLY the network call on transient errors (timeouts, 5xx,
+        # 429, connection resets). Deterministic outcomes — RECITATION/SAFETY
+        # blocks and LYRICS_NOT_FOUND — are handled below and never retried.
+        # Before this, a single transient hiccup during the ~10-15s fetch
+        # silently degraded transcription (fell back to lrclib / raw Whisper).
+        _GEMINI_MAX_RETRIES = int(os.environ.get("GEMINI_LYRICS_MAX_RETRIES", "3"))
+        response = None
+        for _attempt in range(_GEMINI_MAX_RETRIES):
+            try:
+                response = client.models.generate_content(
+                    model="gemini-2.5-flash",
+                    contents=user_content,
+                    config=_gen_config,
+                )
+                break
+            except Exception as _ge:
+                _msg = str(_ge).lower()
+                _transient = any(k in _msg for k in (
+                    "timeout", "timed out", "deadline", "temporarily",
+                    "unavailable", "connection", "reset", "503", "502",
+                    "500", "429",
+                ))
+                if _attempt < _GEMINI_MAX_RETRIES - 1 and _transient:
+                    _wait = (2 ** _attempt) + random.uniform(0, 0.5)
+                    logger.warning(
+                        "[LYRICS] gemini transient error (%s); retry %d/%d in %.1fs",
+                        _ge, _attempt + 1, _GEMINI_MAX_RETRIES, _wait,
+                    )
+                    _time_retry.sleep(_wait)
+                    continue
+                raise  # non-transient or retries exhausted → outer except handles it
 
         text = ""
         try:
