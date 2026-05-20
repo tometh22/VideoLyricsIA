@@ -44,11 +44,9 @@ export default function Landing({ onStart, onLogin, isLoggedIn = false }) {
   ];
 
   const PLANS = [
-    { name: "Free", videos: "5", price: "0", perVideo: "0", popular: false, free: true },
-    { name: "100", videos: "100", price: "900", perVideo: "9.00", popular: false },
-    { name: "250", videos: "250", price: "2,000", perVideo: "8.00", popular: true },
-    { name: "500", videos: "500", price: "3,500", perVideo: "7.00", popular: false },
-    { name: "1,000", videos: "1,000", price: "6,000", perVideo: "6.00", popular: false },
+    { kind: "free", name: t("landing.plan_free"), desc: t("landing.plan_free_desc"), price: "0" },
+    { kind: "indie", name: t("landing.plan_indie"), desc: t("landing.plan_indie_desc"), price: t("landing.plan_indie_price"), popular: true },
+    { kind: "label", name: t("landing.plan_label"), desc: t("landing.plan_label_desc"), price: t("landing.plan_label_price"), contact: true },
   ];
 
   const FAQS = [
@@ -123,10 +121,15 @@ export default function Landing({ onStart, onLogin, isLoggedIn = false }) {
             <p className="text-gray-400 text-lg max-w-lg leading-relaxed mb-8 animate-fade-in">
               {t("landing.hero_sub")}
             </p>
-            <button onClick={onStart} className="btn-primary text-lg py-4 px-10 animate-fade-in">
-              {t("landing.cta")}
-              <svg className="inline-block ml-2 w-5 h-5" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24" strokeLinecap="round" strokeLinejoin="round"><path d="M5 12h14M12 5l7 7-7 7" /></svg>
-            </button>
+            <div className="flex flex-col sm:flex-row gap-3 animate-fade-in">
+              <button onClick={onStart} className="btn-primary text-lg py-4 px-10">
+                {t("landing.cta")}
+                <svg className="inline-block ml-2 w-5 h-5" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24" strokeLinecap="round" strokeLinejoin="round"><path d="M5 12h14M12 5l7 7-7 7" /></svg>
+              </button>
+              <a href="mailto:tomas@epical.digital?subject=GenLy%20AI%20%E2%80%94%20Demo%20para%20sello" className="btn-secondary text-lg py-4 px-8 inline-flex items-center justify-center">
+                {t("landing.cta_demo")}
+              </a>
+            </div>
           </div>
 
           {/* Real video mockup */}
@@ -218,16 +221,53 @@ export default function Landing({ onStart, onLogin, isLoggedIn = false }) {
         <p className="text-gray-500 text-center mb-16 max-w-md mx-auto">{t("landing.outputs_sub")}</p>
         <div className="grid grid-cols-1 sm:grid-cols-3 gap-6">
           {[
-            { title: "Lyric Video", res: "1920 x 1080", desc: "Full HD", gradient: "from-brand/30 to-brand-dark/30", aspect: "aspect-video" },
-            { title: "YouTube Short", res: "1080 x 1920", desc: "Vertical 30s", gradient: "from-pink-500/20 to-rose-600/30", aspect: "aspect-[9/16] max-h-52" },
-            { title: "Thumbnail", res: "1280 x 720", desc: "1280x720", gradient: "from-amber-500/20 to-orange-600/30", aspect: "aspect-video" },
+            { title: "Lyric Video", res: "1920 x 1080", desc: "Full HD", gradient: "from-brand/30 to-brand-dark/30", aspect: "aspect-video", img: "/samples/sample-reef.png" },
+            { title: "YouTube Short", res: "1080 x 1920", desc: "Vertical 30s", gradient: "from-pink-500/20 to-rose-600/30", aspect: "aspect-[9/16] max-h-52", img: null },
+            { title: "Thumbnail", res: "1280 x 720", desc: "1280x720", gradient: "from-amber-500/20 to-orange-600/30", aspect: "aspect-video", img: "/samples/sample-forest.png" },
           ].map((item) => (
             <div key={item.title} className="glass rounded-3xl p-5 text-center glass-hover">
-              <div className={`rounded-2xl bg-gradient-to-br ${item.gradient} ${item.aspect} mx-auto mb-4 flex items-center justify-center`}>
-                <p className="text-xs font-bold text-white/60">{item.res}</p>
+              <div className={`rounded-2xl overflow-hidden bg-gradient-to-br ${item.gradient} ${item.aspect} mx-auto mb-4 flex items-center justify-center`}>
+                {item.img ? (
+                  <img src={item.img} alt={item.title} className="w-full h-full object-cover" />
+                ) : (
+                  <p className="text-xs font-bold text-white/60">{item.res}</p>
+                )}
               </div>
               <h3 className="font-semibold mb-1">{item.title}</h3>
               <p className="text-xs text-gray-500">{item.desc}</p>
+            </div>
+          ))}
+        </div>
+      </section>
+
+      {/* Why GenLy — differentiation */}
+      <section className="relative z-10 py-20 px-6 max-w-5xl mx-auto">
+        <h2 className="text-3xl font-bold text-center mb-4">{t("landing.why_title")}</h2>
+        <p className="text-gray-500 text-center mb-14 max-w-md mx-auto">{t("landing.why_sub")}</p>
+        <div className="grid grid-cols-1 sm:grid-cols-2 gap-5">
+          {[
+            { t: t("landing.why1_t"), d: t("landing.why1_d") },
+            { t: t("landing.why2_t"), d: t("landing.why2_d") },
+            { t: t("landing.why3_t"), d: t("landing.why3_d") },
+            { t: t("landing.why4_t"), d: t("landing.why4_d") },
+          ].map((item) => (
+            <div key={item.t} className="glass rounded-card p-6 flex gap-4 items-start glass-hover">
+              <div className="w-9 h-9 shrink-0 rounded-lg bg-brand/15 flex items-center justify-center text-brand">
+                <svg className="w-5 h-5" fill="none" stroke="currentColor" strokeWidth="2.5" viewBox="0 0 24 24" strokeLinecap="round" strokeLinejoin="round"><path d="M20 6L9 17l-5-5" /></svg>
+              </div>
+              <div>
+                <h3 className="font-semibold mb-1.5">{item.t}</h3>
+                <p className="text-sm text-gray-400 leading-relaxed">{item.d}</p>
+              </div>
+            </div>
+          ))}
+        </div>
+        {/* Trust strip */}
+        <div className="flex flex-wrap justify-center gap-x-8 gap-y-3 mt-12 pt-8 border-t border-white/[0.04]">
+          {[t("landing.trust_sla"), t("landing.trust_owned"), t("landing.trust_isolation"), t("landing.trust_noroyalty")].map((label) => (
+            <div key={label} className="flex items-center gap-2 text-xs text-gray-400">
+              <svg className="w-4 h-4 text-accent" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24" strokeLinecap="round" strokeLinejoin="round"><path d="M9 12l2 2 4-4" /><circle cx="12" cy="12" r="10" /></svg>
+              {label}
             </div>
           ))}
         </div>
@@ -251,30 +291,36 @@ export default function Landing({ onStart, onLogin, isLoggedIn = false }) {
       {/* Pricing */}
       <section id="pricing" className="relative z-10 py-24 px-6 max-w-5xl mx-auto scroll-mt-20">
         <h2 className="text-3xl font-bold text-center mb-4">{t("landing.pricing")}</h2>
-        <p className="text-gray-500 text-center mb-16 max-w-md mx-auto">{t("landing.pricing_sub")}</p>
-        <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-5 gap-4">
+        <p className="text-gray-500 text-center mb-4 max-w-md mx-auto">{t("landing.pricing_sub")}</p>
+        <p className="text-center text-sm text-accent font-medium mb-12 max-w-xl mx-auto">{t("landing.pricing_scale")}</p>
+        <div className="grid grid-cols-1 md:grid-cols-3 gap-5 max-w-4xl mx-auto">
           {PLANS.map((plan) => (
-            <div key={plan.name} className={`glass rounded-3xl p-6 text-center relative ${plan.popular ? "border-brand/30 shadow-glow" : ""}`}>
+            <div key={plan.kind} className={`glass rounded-3xl p-7 text-center relative flex flex-col ${plan.popular ? "border-brand/30 shadow-glow" : ""}`}>
               {plan.popular && <div className="absolute -top-3 left-1/2 -translate-x-1/2 px-3 py-0.5 rounded-full bg-brand text-[10px] font-bold uppercase tracking-wider">{t("landing.popular")}</div>}
-              <p className="text-sm text-gray-400 mb-1">{plan.videos} {t("landing.videos_month")}</p>
-              <p className="text-3xl font-bold my-3">
-                {plan.free ? (
+              <h3 className="text-base font-semibold mb-2">{plan.name}</h3>
+              <p className="text-3xl font-bold my-2">
+                {plan.kind === "free" ? (
                   <span className="text-accent">Free</span>
+                ) : plan.contact ? (
+                  <span className="text-2xl">{plan.price}</span>
                 ) : (
-                  <><span className="text-lg text-gray-500">USD</span> {plan.price}</>
+                  <>{plan.price}<span className="text-sm text-gray-500"> / {t("landing.per_video")}</span></>
                 )}
               </p>
-              <p className="text-xs text-gray-500 mb-5">
-                {plan.free ? t("landing.free_trial") || "Start for free" : `$${plan.perVideo} ${t("landing.per_video")}`}
-              </p>
-              <button onClick={onLogin || onStart} className={`w-full py-2.5 rounded-xl text-sm font-medium transition-all ${plan.popular ? "btn-primary" : plan.free ? "btn-primary !from-accent !to-accent" : "btn-secondary"}`}>
-                {plan.free ? (t("login.register_submit") || "Sign up") : t("nav.start")}
-              </button>
+              <p className="text-xs text-gray-400 leading-relaxed mb-6 flex-1">{plan.desc}</p>
+              {plan.contact ? (
+                <a href="mailto:tomas@epical.digital?subject=GenLy%20AI%20%E2%80%94%20Volumen%2FSello" className="btn-secondary w-full py-2.5 rounded-xl text-sm font-medium inline-flex items-center justify-center">
+                  {t("landing.plan_contact_cta")}
+                </a>
+              ) : (
+                <button onClick={onLogin || onStart} className={`w-full py-2.5 rounded-xl text-sm font-medium transition-all ${plan.popular ? "btn-primary" : "btn-primary !from-accent !to-accent"}`}>
+                  {plan.kind === "free" ? (t("login.register_submit") || "Sign up") : t("nav.start")}
+                </button>
+              )}
             </div>
           ))}
         </div>
-        <p className="text-center text-xs text-gray-500 mt-6">{t("landing.overage")}</p>
-        <p className="text-center text-xs text-gray-600 mt-2">{t("landing.yt_addon")}</p>
+        <p className="text-center text-xs text-gray-600 mt-8">{t("landing.yt_addon")}</p>
       </section>
 
       {/* FAQ */}
