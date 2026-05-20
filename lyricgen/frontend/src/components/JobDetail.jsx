@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef } from "react";
+import { useState, useEffect, useRef, useCallback } from "react";
 import { useI18n } from "../i18n";
 import { getDownloadUrl, useMediaUrl } from "../mediaUrl";
 import { JobDetailTour } from "./OnboardingTour";
@@ -350,6 +350,24 @@ export default function JobDetail({ job, onBack, onJobUpdate }) {
   const previewMediaType = activeTab === "thumbnail" ? "thumbnail" : activeTab;
   const previewSrc = useMediaUrl(job.job_id, previewMediaType, "preview");
   const downloadHref = useMediaUrl(job.job_id, previewMediaType, "download");
+
+  // Auto-retry the <video> load. A just-finished job flips to
+  // pending_review the instant the DB row updates, but the MP4 can lag a
+  // beat landing in R2. The <video> loads once, fails, and (without this)
+  // shows a crossed-out play button until the operator manually switches
+  // tabs and back — which remounts the element and reloads. We reproduce
+  // that remount automatically on error, with backoff to let R2 settle.
+  const [videoReloadKey, setVideoReloadKey] = useState(0);
+  const videoRetriesRef = useRef(0);
+  // Fresh retry budget whenever the source or tab changes (new media).
+  useEffect(() => { videoRetriesRef.current = 0; }, [previewSrc, activeTab]);
+  const handleVideoError = useCallback(() => {
+    if (videoRetriesRef.current < 4) {
+      videoRetriesRef.current += 1;
+      const delay = 1500 * videoRetriesRef.current; // 1.5s, 3s, 4.5s, 6s
+      setTimeout(() => setVideoReloadKey((k) => k + 1), delay);
+    }
+  }, []);
 
   const canPreview = job.status === "done" || job.status === "pending_review";
   const canDownload = job.status === "done";
@@ -1119,9 +1137,10 @@ export default function JobDetail({ job, onBack, onJobUpdate }) {
             ) : (
               previewSrc ? (
                 <video
-                  key={activeTab}
+                  key={`${activeTab}-${videoReloadKey}`}
                   src={previewSrc}
                   controls
+                  onError={handleVideoError}
                   className={`w-full bg-black/40 ${
                     activeTab === "short" ? "max-h-[600px] mx-auto" : "max-h-[500px]"
                   }`}
