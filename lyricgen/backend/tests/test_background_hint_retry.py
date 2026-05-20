@@ -76,3 +76,33 @@ def test_first_attempt_passes_background_hint():
         "First call to _get_unique_prompt must pass background_hint. "
         f"Block was:\n{first_call_block}"
     )
+
+
+def test_pipeline_merges_render_params_preserving_hint():
+    """Regression: run_pipeline must MERGE render_params, not replace.
+
+    Incident 2026-05-20: Amanda Pujó "Ser Anti". /variant and /edit store
+    background_hint into render_params before the worker runs. The worker's
+    render_params persistence used update_job(render_params={...}) with a
+    dict that omitted background_hint, and update_job does a plain setattr
+    (full replace) — so the hint was wiped after the first render and was
+    gone on any later reaper-recovery retry. Gemini then reverted to its
+    default alley cliché.
+
+    Pin the fix by inspecting run_pipeline's source: it must read the
+    existing render_params and merge, and conditionally persist
+    background_hint.
+    """
+    src = inspect.getsource(pipeline.run_pipeline)
+
+    # Must NOT replace wholesale with a literal dict that drops the hint.
+    assert "_merged_rp" in src, (
+        "run_pipeline must build a merged render_params dict, not replace it"
+    )
+    assert ".update(_new_rp)" in src, (
+        "run_pipeline must merge the new fields over existing render_params"
+    )
+    # Must conditionally carry background_hint into the persisted params.
+    assert 'if background_hint:' in src and '_new_rp["background_hint"] = background_hint' in src, (
+        "run_pipeline must persist background_hint into render_params when present"
+    )
