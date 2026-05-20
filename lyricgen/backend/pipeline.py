@@ -6393,6 +6393,14 @@ def _apply_display_timing(
     floored to a >=0.3s readable window. The min() makes overlap (ceiling
     wins) and gap (hold wins) one expression. The last line holds past its
     final word, capped at `duration`. Returns a new list; input untouched.
+
+    LOCKED lines (`seg["locked"] is True`) — the operator set this line's end
+    by hand in the visual Timings editor. We must NOT auto-extend it: their
+    chosen `end` is the intent. We still apply the NO-OVERLAP clamp for
+    safety (a manual end can't be allowed to overrun the next line), but skip
+    the hold-until-next extension. Untouched lines (no `locked`) keep the
+    default karaoke hold. `locked` is preserved in the output so it round-
+    trips through update_job(segments_json=...).
     """
     if not segments:
         return segments
@@ -6401,8 +6409,13 @@ def _apply_display_timing(
     cleaned = []
     for i, seg in enumerate(sorted_segs):
         base_end = seg["end"]
-        if i + 1 < n:
-            ceiling = sorted_segs[i + 1]["start"] - gap_s
+        locked = bool(seg.get("locked"))
+        ceiling = (sorted_segs[i + 1]["start"] - gap_s) if i + 1 < n else duration
+        if locked:
+            # Respect the operator's manual end; only enforce no-overlap.
+            new_end = min(base_end, ceiling)
+            new_end = max(new_end, seg["start"] + 0.3)
+        elif i + 1 < n:
             new_end = min(base_end + max_hold_s, ceiling)
             new_end = max(new_end, seg["start"] + 0.3)
         else:

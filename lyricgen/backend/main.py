@@ -5023,7 +5023,17 @@ async def request_edit(
     normalized_segments = None
     if body.segments and len(body.segments) > 0:
         normalized_segments = [
-            {"start": float(s["start"]), "end": float(s["end"]), "text": str(s["text"])}
+            {
+                "start": float(s["start"]),
+                "end": float(s["end"]),
+                "text": str(s["text"]),
+                # Preserve the manual-timing lock set in the visual Timings
+                # editor. Without this, a lyrics re-render strips `locked`
+                # and pipeline._apply_display_timing re-applies hold-until-next,
+                # clobbering the operator's hand-set end. Only carry it when
+                # truthy so untouched lines stay clean.
+                **({"locked": True} if s.get("locked") else {}),
+            }
             for s in body.segments
         ]
         # Persist immediately so any subsequent reader (worker, /status
