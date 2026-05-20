@@ -19,6 +19,49 @@ restart, platform-side maintenance — orphans the job:
 This page documents the four layers that turn that incident into a
 non-event.
 
+## Layer 0 — Zero-downtime deploys (railway.toml + Dockerfile)
+
+Above all the recovery layers below, the cheapest "outage" to defend
+against is the one we cause ourselves every time we push. Each `git
+push origin staging` historically produced a 1-3 s window where the
+edge proxy swapped from the old pod to the new pod, and any request
+that landed in that window returned 502 or "Failed to fetch" client-
+side.
+
+**Configuration as of 2026-05-19:**
+
+- `[services.api.deploy] numReplicas = 2` in `railway.toml`. Two
+  replicas behind the edge proxy means Railway can update one at a
+  time: while replica A reboots into the new image, replica B keeps
+  serving. No client-visible window.
+- Uvicorn `--workers 2` per replica (down from 4) — keeps total DB
+  connection footprint at 2×2×10 = 40, same as before the bump.
+- `healthcheckPath = /health` + `healthcheckTimeout = 90` — Railway
+  Pro waits for the new replica to pass `/health` before killing the
+  old one (overlap window). Without this, the kill happens regardless
+  of whether the new pod is actually serving.
+
+**What this does NOT cover:**
+
+- Worker is still single-replica-class daemon (RQ workers, not HTTP).
+  Worker deploys still SIGTERM in-flight jobs; Layers 1-4 below
+  handle the recovery.
+- Railway platform-side outages (the edge proxy itself going down,
+  region eqdc4a degraded, etc) bypass all of this. For those, the
+  defenses are external: public status page (`status.genly.pro`,
+  monitored by BetterStack), proactive client comms (see
+  `docs/CLIENT_COMMS_OUTAGE.md`), and the multi-region roadmap below.
+
+**Verification (after the next deploy):**
+
+1. Watch the api logs in two terminals during a push: should see two
+   `Application startup complete` events, separated by ~30-60 s, with
+   no gap of zero healthy replicas.
+2. From a third terminal: `while true; do curl -s -o /dev/null -w
+   "%{http_code} " https://genly-ai.up.railway.app/health; sleep 0.5;
+   done` during the deploy. Expected: all 200s. Anything 5xx during
+   the deploy means OVERLAP isn't actually engaging.
+
 ## Layer 1 — Graceful shutdown (worker.py)
 
 RQ's `Worker.request_stop()` handler is installed in `worker.py` for
