@@ -997,6 +997,14 @@ export default function AdminPanel({ onBack }) {
                               <span>{d.tenant}</span>
                             </>
                           )}
+                          {(d?.owner_email || d?.owner_username) && (
+                            <>
+                              <span>·</span>
+                              <span title="Usuario que generó el video">
+                                por <span className="text-gray-300">{d.owner_email || d.owner_username}</span>
+                              </span>
+                            </>
+                          )}
                           {d?.removed_at && (
                             <span className="text-red-300">· entrega eliminada</span>
                           )}
@@ -1012,6 +1020,35 @@ export default function AdminPanel({ onBack }) {
                         {isResolved ? "✓ Resuelto" : "⏳ Pendiente"}
                       </span>
                     </div>
+
+                    {/* Preview: thumbnail still, click opens the video in a
+                        new tab. Lets the operator see what they're correcting
+                        without opening the job in a separate screen. */}
+                    {d?.thumbnail_url && (
+                      <a
+                        href={d.video_url || d.thumbnail_url}
+                        target="_blank"
+                        rel="noopener noreferrer"
+                        className="block relative mb-3 rounded-lg overflow-hidden ring-1 ring-white/[0.06] group"
+                        title={d.video_url ? "Abrir video en pestaña nueva" : "Abrir imagen"}
+                      >
+                        <img
+                          src={d.thumbnail_url}
+                          alt="Preview del video"
+                          loading="lazy"
+                          className="w-full max-h-[220px] object-contain bg-black/40"
+                        />
+                        {d.video_url && (
+                          <span className="absolute inset-0 flex items-center justify-center">
+                            <span className="w-12 h-12 rounded-full bg-black/50 ring-1 ring-white/30 flex items-center justify-center group-hover:bg-black/70 transition-colors">
+                              <svg className="w-5 h-5 text-white ml-0.5" viewBox="0 0 24 24" fill="currentColor">
+                                <path d="M8 5v14l11-7z" />
+                              </svg>
+                            </span>
+                          </span>
+                        )}
+                      </a>
+                    )}
 
                     {/* Comment */}
                     <div className="rounded-lg bg-surface-3/30 ring-1 ring-white/[0.04] p-3 text-sm leading-relaxed whitespace-pre-wrap">
