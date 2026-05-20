@@ -222,6 +222,11 @@ export default function LyricsEditor({
   // List vs visual timeline. Default "list" so the existing operator flow is
   // untouched; the timeline is opt-in via the toolbar toggle.
   const [viewMode, setViewMode] = useState("list"); // "list" | "timeline"
+  // Autosave confidence for the timeline view. saveStatus drives the
+  // "Guardando…/Guardado ✓" chip; flushCounter triggers an immediate save
+  // on a timeline drag (instead of waiting for the 3 s debounce).
+  const [saveStatus, setSaveStatus] = useState("idle"); // idle|saving|saved
+  const [flushCounter, setFlushCounter] = useState(0);
   // Snapshot of the timings as first handed to us — the baseline for the
   // timeline's "Resetear timings". Seeded on mount + re-seeded whenever the
   // parent swaps the `segments` prop (see the reset effect below).
@@ -275,6 +280,32 @@ export default function LyricsEditor({
     }, 3000);
     return () => clearTimeout(tid);
   }, [edited, transcribeJobId, onPersistSegments, disableAutosave]);
+
+  // Flush-save on a timeline drag (no 3 s wait) + drive the "Guardado ✓"
+  // chip. Runs only when flushCounter bumps. By the time this effect fires,
+  // setEdited from the same handler has already applied, so `edited` is the
+  // post-drag value. Idempotent vs the debounced autosave above.
+  useEffect(() => {
+    if (flushCounter === 0) return undefined;
+    if (disableAutosave || !onPersistSegments || !transcribeJobId) return undefined;
+    let cancelled = false;
+    setSaveStatus("saving");
+    const cleaned = edited.map(({ _id, ...rest }) => rest);
+    Promise.resolve(onPersistSegments(transcribeJobId, cleaned))
+      .then(() => { if (!cancelled) setSaveStatus("saved"); })
+      .catch(() => { if (!cancelled) setSaveStatus("idle"); });
+    return () => { cancelled = true; };
+    // Only react to the flush trigger — `edited` is intentionally read fresh
+    // but NOT a dep (we don't want every keystroke to flush).
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [flushCounter]);
+
+  // Auto-clear the "Guardado ✓" chip a couple seconds after it shows.
+  useEffect(() => {
+    if (saveStatus !== "saved") return undefined;
+    const id = setTimeout(() => setSaveStatus("idle"), 2000);
+    return () => clearTimeout(id);
+  }, [saveStatus]);
 
   // Synchronous per-edit callback: fires on every `edited` change with no
   // debounce, so the parent can hold the latest segments in a ref and
@@ -423,6 +454,10 @@ export default function LyricsEditor({
       next.delete(id);
       return next;
     }), 10000);
+    // Flush-save immediately (don't wait for the 3 s autosave debounce) so
+    // the operator sees "Guardado" right after dropping a block — the
+    // flush effect below reads the just-updated `edited` and persists.
+    setFlushCounter((c) => c + 1);
   }, []);
 
   // Restore every line's timing to the original snapshot + drop all `locked`
@@ -1420,14 +1455,27 @@ export default function LyricsEditor({
           <div className="hidden md:inline-flex shrink-0 rounded-md ring-1 ring-white/[0.08] overflow-hidden text-[11px] font-medium">
             <button
               onClick={() => setViewMode("list")}
-              className={`px-2.5 py-1 transition-colors ${viewMode === "list" ? "bg-brand/20 text-brand-light" : "text-ink-secondary hover:text-white"}`}
+              className={`px-2.5 py-1 flex items-center gap-1.5 transition-colors ${viewMode === "list" ? "bg-brand/20 text-brand-light" : "text-ink-secondary hover:text-white"}`}
             >
+              <svg className="w-3 h-3" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
+                <line x1="8" y1="6" x2="21" y2="6" strokeLinecap="round" />
+                <line x1="8" y1="12" x2="21" y2="12" strokeLinecap="round" />
+                <line x1="8" y1="18" x2="21" y2="18" strokeLinecap="round" />
+                <circle cx="3.5" cy="6" r="1" fill="currentColor" stroke="none" />
+                <circle cx="3.5" cy="12" r="1" fill="currentColor" stroke="none" />
+                <circle cx="3.5" cy="18" r="1" fill="currentColor" stroke="none" />
+              </svg>
               Lista
             </button>
             <button
               onClick={() => setViewMode("timeline")}
-              className={`px-2.5 py-1 transition-colors ${viewMode === "timeline" ? "bg-brand/20 text-brand-light" : "text-ink-secondary hover:text-white"}`}
+              className={`px-2.5 py-1 flex items-center gap-1.5 transition-colors ${viewMode === "timeline" ? "bg-brand/20 text-brand-light" : "text-ink-secondary hover:text-white"}`}
             >
+              <svg className="w-3 h-3" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
+                <rect x="3" y="7" width="8" height="4" rx="1" />
+                <rect x="13" y="13" width="7" height="4" rx="1" />
+                <line x1="3" y1="3" x2="3" y2="21" strokeLinecap="round" opacity="0.5" />
+              </svg>
               Línea de tiempo
             </button>
           </div>
@@ -1768,6 +1816,8 @@ export default function LyricsEditor({
             segments={edited}
             duration={duration}
             currentTime={currentTime}
+            isPlaying={isPlaying}
+            saveStatus={saveStatus}
             activeId={activeId}
             focusedSegId={focusedSegId}
             highlightedIds={highlightedIds}
