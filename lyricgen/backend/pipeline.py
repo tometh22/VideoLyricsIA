@@ -6757,7 +6757,7 @@ def generate_lyric_video(
             codec=spec.codec,
             audio_codec=spec.audio_codec,
             ffmpeg_params=ffmpeg_params,
-            threads=4,
+            threads=8,  # ProRes (prores_ks): preset no aplica; threads sí
             logger=None,
         )
         audio.close()
@@ -6792,12 +6792,18 @@ def generate_lyric_video(
         return out_path, font, bg_source
 
     out_path = os.path.join(job_dir, "lyric_video.mp4")
+    # preset="veryfast" + threads=8: ~2.5-3x más rápido que el "medium"
+    # default de moviepy en el encode x264. Seguro para el deliverable
+    # YouTube/H264 (YouTube re-encoda en upload, así que el preset de la
+    # fuente no afecta la calidad final; el master ProRes de UMG es un
+    # path separado, intacto). Acelera la mitad-encode de cada re-render.
     video.write_videofile(
         out_path,
         fps=spec.fps,
         codec=spec.codec,
         audio_codec=spec.audio_codec,
-        threads=4,
+        threads=8,
+        preset="veryfast",
         logger=None,
     )
     audio.close()
@@ -6975,7 +6981,8 @@ def generate_short(
         fps=fps,
         codec="libx264",
         audio_codec="aac",
-        threads=4,
+        threads=8,
+        preset="veryfast",
         logger=None,
     )
     audio.close()
