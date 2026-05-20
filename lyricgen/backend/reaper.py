@@ -111,8 +111,26 @@ _STALLED_RENDER_THRESHOLD_MIN = int(os.environ.get(
     "REAPER_STALLED_RENDER_THRESHOLD_MIN", "20",
 ))
 
-# Owner inbox for the digest email. Override via env in Railway.
-_OWNER_EMAIL = os.environ.get("OWNER_EMAIL", "tomas@epical.digital")
+# Ops inbox for the reaper digest. This is an INTERNAL operations alert
+# (technical: "OOM, hung ffmpeg, Veo 429-storm") — it must NOT default to
+# a real person's customer-facing address. Until 2026-05-20 it defaulted
+# to tomas@epical.digital, which doubles as a test USER account, so the
+# technical digest kept landing in a customer-shaped inbox.
+#
+# Resolution order:
+#   1. OWNER_EMAIL  — explicit override for this digest specifically
+#   2. ALERT_EMAIL  — the existing ops-alert convention (preflight smoke
+#                     tests use the same var; see scripts/preflight/)
+#   3. ops@genly.pro — internal default on our own domain, no PII
+#
+# Set OWNER_EMAIL (or ALERT_EMAIL) in Railway to wherever ops actually
+# reads alerts. If ops@genly.pro has no mailbox, add a forwarding rule
+# in the genly.pro domain so the digest reaches someone.
+_OWNER_EMAIL = (
+    os.environ.get("OWNER_EMAIL")
+    or os.environ.get("ALERT_EMAIL")
+    or "ops@genly.pro"
+)
 
 
 def find_stuck_jobs(db: Session, threshold_min: int = _DEFAULT_THRESHOLD_MIN) -> list[Job]:
@@ -590,7 +608,7 @@ def _email_owner(reaped: list[Job]) -> None:
         """)
         _send_email(
             _OWNER_EMAIL,
-            f"[GenLy] {len(reaped)} stuck job(s) reaped",
+            f"[GenLy OPS · interno] {len(reaped)} stuck job(s) reaped",
             body,
         )
     except Exception as e:  # pragma: no cover
