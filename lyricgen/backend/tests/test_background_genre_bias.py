@@ -173,3 +173,57 @@ def test_gemini_call_uses_thinking_and_wider_lyrics_window():
         "thinking_budget should be 512 (cheap chain-of-thought for "
         "visual-subject extraction)"
     )
+
+
+def test_looks_like_alley_detects_cliche_keywords():
+    """The detector backing the corrective re-roll. Must fire on the
+    full vocabulary of the noir-urban-alley cliché (EN + ES) and stay
+    quiet on legitimately different scenes."""
+    alley_prompts = [
+        "Slow dolly down a rain-slicked narrow alley at night",
+        "Cámara avanza por un callejón con grafitis",
+        "Wet pavement reflecting neon, fire escape overhead",
+        "Industrial corridor with graffiti walls",
+        "A back-street lined with dumpsters",
+    ]
+    for p in alley_prompts:
+        assert pipeline._looks_like_alley(p), f"should flag alley: {p!r}"
+
+    clean_prompts = [
+        "Slow aerial pull-back over a misty mountain valley at dawn",
+        "Underwater light rays through turquoise ocean",
+        "Aurora borealis over a frozen lake",
+        "Warm cathedral interior with golden light shafts",
+        "",
+        None,
+    ]
+    for p in clean_prompts:
+        assert not pipeline._looks_like_alley(p), f"should NOT flag: {p!r}"
+
+
+def test_analyze_lyrics_rerolls_on_alley_bias():
+    """When Gemini returns an alley AND the operator gave no hint /
+    didn't ask for 'urbano', the analyzer must re-roll ONCE with the
+    anti-alley addendum instead of just logging the bias (the old
+    behavior that shipped 3 alley renders for Amanda Pujó 2026-05-20).
+
+    Source-inspection — running it would need the full Vertex client."""
+    src = inspect.getsource(pipeline._analyze_lyrics_for_background)
+
+    # The re-roll must be gated to the genuinely-unwanted case.
+    assert "_reroll_eligible" in src, "re-roll must be gated by eligibility"
+    assert "not background_hint" in src and 'normalized_concept != "urbano"' in src, (
+        "re-roll eligibility must require no background_hint AND concept != urbano"
+    )
+    # It must actually loop and re-roll, not just log.
+    assert "_ANTI_ALLEY_ADDENDUM" in src, (
+        "re-roll must append the hard-negative addendum on attempt > 1"
+    )
+    assert "_looks_like_alley(prompt)" in src, (
+        "must check the parsed prompt with _looks_like_alley to trigger re-roll"
+    )
+    assert "continue" in src, "alley detection on a non-final attempt must re-roll"
+    # The addendum itself must forbid the cliché vocabulary.
+    addendum = pipeline._ANTI_ALLEY_ADDENDUM.lower()
+    for forbidden in ("alley", "graffiti", "wet pavement", "fire escape"):
+        assert forbidden in addendum, f"addendum should forbid {forbidden!r}"

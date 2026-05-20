@@ -3972,6 +3972,55 @@ def _normalize_concept(c: str) -> str:
     return ""
 
 
+# Keywords that mark the overused "noir urban alley" cliché. Gemini has a
+# strong prior: melancholic Spanish-language rock lyrics → rain-slicked
+# graffiti alley at night. The system prompt instructs against it but the
+# model ignores the instruction ~consistently, so we DETECT the output and
+# corrective-re-roll instead of just steering with words. Shared by the
+# detector and the re-roll guard in _analyze_lyrics_for_background.
+_ALLEY_BIAS_KEYWORDS = (
+    "alley", "callejón", "callejon", "alleyway",
+    "narrow street", "back street", "back-street",
+    "rain-slicked street", "rain slicked street", "wet pavement",
+    "graffiti", "fire escape", "industrial corridor",
+)
+
+
+def _looks_like_alley(prompt: str) -> bool:
+    """True if the prompt reads like the noir-urban-alley cliché.
+
+    Uses word-boundary matching, NOT substring: a plain `"alley" in p`
+    check false-positives on "valley" (mountain valley — a GOOD
+    non-urban scene we must NOT re-roll). Caught by
+    test_looks_like_alley_detects_cliche_keywords.
+    """
+    if not prompt:
+        return False
+    p = prompt.lower()
+    return any(re.search(rf"\b{re.escape(k)}\b", p) for k in _ALLEY_BIAS_KEYWORDS)
+
+
+# Hard-negative addendum appended to the Gemini system prompt on the
+# corrective re-roll. Worded as a firm prohibition + a menu of concrete
+# alternatives so the model has somewhere to go instead of the alley.
+_ANTI_ALLEY_ADDENDUM = (
+    "\n\n## HARD NEGATIVE — the previous attempt failed\n"
+    "A previous attempt for this exact song wrongly defaulted to an "
+    "urban alley / rain-slicked street / graffiti wall / fire escape / "
+    "industrial corridor. That is the overused cliché we are explicitly "
+    "rejecting. For THIS attempt you MUST choose a completely different "
+    "category. Pick ONE and commit:\n"
+    "  - natural landscape (forest, mountains, desert, fields, coastline)\n"
+    "  - water / ocean (waves, underwater light, rain on a lake)\n"
+    "  - cosmic / celestial (stars, nebula, aurora, planets)\n"
+    "  - abstract / geometric (flowing color, light refraction, particles)\n"
+    "  - interior space (warm room, cathedral light, empty theatre)\n"
+    "  - weather / sky (storm clouds, golden hour, fog over hills)\n"
+    "Absolutely NO alleys, streets, graffiti, urban night, wet pavement, "
+    "fire escapes, or industrial corridors of any kind."
+)
+
+
 def _parse_gemini_bg_response(text: str) -> dict | None:
     """Parse Gemini's background-generation response into {style, prompt}.
 
@@ -4373,94 +4422,87 @@ Hard rules:
     ) if job_id else None
 
     try:
-        response = client.models.generate_content(
-            model="gemini-2.5-flash",
-            contents=user_content,
-            config=genai.types.GenerateContentConfig(
-                system_instruction=system_prompt,
-                temperature=0.8,
-                # max_output_tokens=1500 (was 500): the concept+match_lyrics=True
-                # branch in #152 expanded the system_prompt with 6 worked examples
-                # and lyrics-anchor instructions. Gemini's output got more verbose
-                # to match the richer prompt and started truncating at 500 tokens
-                # — observed in prod 2026-05-15 on jobs 7e89f00cd130 ("Lunes Por
-                # La Madrugada") and 7fd94fb30fc1 ("Me late"): JSON cut at
-                # `"prompt": "...then a ge` (mid-word), parse failed, fallback
-                # combinatorial fired 100% of jobs and pinned random scenes like
-                # "northern lights aurora over a mountain lake" regardless of
-                # concept. 1500 covers a 120-word prompt + JSON envelope + any
-                # preamble verbosity Gemini adds, with ~3× headroom. Cost impact
-                # marginal (~$0.0001 extra per call at worst case).
-                max_output_tokens=1500,
-                # thinking_budget=512: Gemini hace chain-of-thought corto
-                # para extraer el visual subject de las letras antes de
-                # commitearse a una escena. Sin esto (=0), saltaba el
-                # STEP 0 del system prompt y caía al genre fallback
-                # (UMG 2026-05-14: 80% rock → callejón porque Gemini
-                # nunca leía las letras como subject visual). +$0.0002/call.
-                thinking_config=genai.types.ThinkingConfig(thinking_budget=512),
-            ),
-        )
-        text = response.text.strip()
-        # Log full text length and a longer preview so future parse-failure
-        # incidents have enough evidence. Previously truncated to 300 chars
-        # which hid the actual truncation point during the 2026-05-15 incident
-        # (couldn't tell from logs alone whether Gemini hit max_output_tokens
-        # or returned malformed JSON).
-        logger.info("[BG] Gemini raw (%s chars): %s", len(text), text[:800])
-
-        # Parse Gemini's response. The model usually returns one of:
-        #   {"style":"...","prompt":"..."}                     ← bare JSON
-        #   ```json\n{"style":"...","prompt":"..."}\n```       ← markdown-wrapped
-        #   <preamble>\n{...}                                  ← chatty preamble
-        #   {"style":"...","prompt":"... <TRUNCATED>            ← cut off by
-        #                                                        max_output_tokens
+        # Corrective re-roll for the noir-urban-alley cliché. The system
+        # prompt already instructs against alleys, but Gemini ignores that
+        # word-level steer with high frequency on melancholic Spanish rock
+        # (UMG 2026-05-14, Amanda Pujó "Ser Anti" 2026-05-20: 3 separate
+        # renders all landed on rain-slicked graffiti alleys). So instead of
+        # only logging the bias (the prior behavior), we DETECT an alley
+        # result and re-roll ONCE with a hard-negative addendum + higher
+        # temperature to escape the prior.
         #
-        # The original regex `\{.*?\}` (non-greedy) only handled the first two,
-        # and failed catastrophically on the truncation case: no closing `}`
-        # meant no match, no match meant fallback to the combinatorial random
-        # scene picker which ignores concept/lyrics/hint entirely. Prod 2026-
-        # 05-15 incident showed this firing on 100% of jobs after #152
-        # expanded the system_prompt; a richer prompt → more verbose output
-        # → hitting the 500-token cap mid-property.
-        #
-        # New strategy: three-stage parser.
-        #   1. Try strict JSON via greedy match (handles full + markdown-wrapped)
-        #   2. If that fails, regex-extract the "prompt" field value directly
-        #      so we recover even when the JSON closing brace is missing
-        #   3. Only then fall back to the combinatorial random
-        parsed = _parse_gemini_bg_response(text)
-        if parsed is not None:
-            style = parsed.get("style", "video")
-            prompt = parsed.get("prompt", "")
-            if style not in ("video", "photo", "illustration"):
-                style = "video"
-            if prompt and len(prompt) > 15:
-                logger.info("[BG] Gemini chose: style=%s, prompt=%s...", style, prompt[:80])
-                # Alley-bias telemetry: si Gemini igual eligió callejón
-                # cuando el operador NO pidió urbano, dejá rastro en
-                # logs para auditar post-deploy. Detecta el caso real
-                # del incidente UMG 2026-05-14.
-                _alley_keywords = ("alley", "callejón", "callejon",
-                                   "narrow street", "back street",
-                                   "back-street", "rain-slicked street")
-                if (any(k in prompt.lower() for k in _alley_keywords)
-                        and normalized_concept != "urbano"):
-                    logger.warning(
-                        "[BG][ALLEY-BIAS DETECTED] genre=%s concept=%s match_lyrics=%s job=%s",
-                        normalized_genre or 'auto', normalized_concept or 'none',
-                        match_lyrics, job_id,
-                    )
-                if recorder:
-                    recorder.finish(response_summary=text[:500])
-                return {"style": style, "prompt": prompt}
+        # Re-roll is gated to the case where it's actually unwanted: the
+        # operator gave no background_hint AND didn't explicitly ask for
+        # the "urbano" concept. An explicit alley request must be honored.
+        _reroll_eligible = (not background_hint and normalized_concept != "urbano")
+        _max_attempts = 2 if _reroll_eligible else 1
+        text = ""
+        response = None
+        for _attempt in range(1, _max_attempts + 1):
+            _sys_instr = system_prompt
+            _temp = 0.8
+            if _attempt > 1:
+                # Hard-negative + a menu of alternatives, and widen the
+                # sampling distribution so the model leaves the alley basin.
+                _sys_instr = system_prompt + _ANTI_ALLEY_ADDENDUM
+                _temp = 1.0
+            response = client.models.generate_content(
+                model="gemini-2.5-flash",
+                contents=user_content,
+                config=genai.types.GenerateContentConfig(
+                    system_instruction=_sys_instr,
+                    temperature=_temp,
+                    # max_output_tokens=1500 (was 500): the concept+match_lyrics=True
+                    # branch in #152 expanded the system_prompt with 6 worked examples
+                    # and lyrics-anchor instructions. Gemini's output got more verbose
+                    # and started truncating at 500 tokens (prod 2026-05-15), parse
+                    # failed, combinatorial fallback fired 100% of jobs. 1500 covers a
+                    # 120-word prompt + JSON envelope + preamble, ~3× headroom.
+                    max_output_tokens=1500,
+                    # thinking_budget=512: short chain-of-thought to extract the
+                    # visual subject from lyrics before committing to a scene.
+                    # Without it Gemini skipped STEP 0 and fell to the genre
+                    # fallback (UMG 2026-05-14: 80% rock → callejón).
+                    thinking_config=genai.types.ThinkingConfig(thinking_budget=512),
+                ),
+            )
+            text = response.text.strip()
+            logger.info("[BG] Gemini raw attempt %s/%s (%s chars): %s",
+                        _attempt, _max_attempts, len(text), text[:800])
 
-        # finish_reason on Gemini response indicates whether the generation
-        # was cut by MAX_TOKENS, SAFETY, RECITATION, or completed naturally.
-        # Best-effort introspect; never raise from the log line.
+            # Parse Gemini's response (three-stage parser handles bare JSON,
+            # markdown-wrapped, and truncated-mid-property — see
+            # _parse_gemini_bg_response).
+            parsed = _parse_gemini_bg_response(text)
+            if parsed is not None:
+                style = parsed.get("style", "video")
+                prompt = parsed.get("prompt", "")
+                if style not in ("video", "photo", "illustration"):
+                    style = "video"
+                if prompt and len(prompt) > 15:
+                    if _looks_like_alley(prompt) and _reroll_eligible:
+                        if _attempt < _max_attempts:
+                            logger.warning(
+                                "[BG][ALLEY-BIAS] attempt %s chose alley; re-rolling "
+                                "with hard-negative. genre=%s job=%s",
+                                _attempt, normalized_genre or 'auto', job_id,
+                            )
+                            continue  # re-roll with the anti-alley addendum
+                        logger.warning(
+                            "[BG][ALLEY-BIAS PERSISTENT] re-roll still chose alley; "
+                            "accepting to avoid an infinite loop. job=%s", job_id,
+                        )
+                    logger.info("[BG] Gemini chose: style=%s, prompt=%s...", style, prompt[:80])
+                    if recorder:
+                        recorder.finish(response_summary=f"attempt={_attempt} " + text[:480])
+                    return {"style": style, "prompt": prompt}
+            # Parse failed this attempt. If attempts remain, the loop retries
+            # (a re-roll often parses cleanly); otherwise fall through.
+
+        # All attempts exhausted without a usable parse.
         finish_reason = "unknown"
         try:
-            if hasattr(response, "candidates") and response.candidates:
+            if response is not None and getattr(response, "candidates", None):
                 fr = getattr(response.candidates[0], "finish_reason", None)
                 if fr is not None:
                     finish_reason = str(fr)
