@@ -149,54 +149,37 @@ export default function Landing({ onStart, onLogin, isLoggedIn = false }) {
 
       {/* Hero */}
       <section className="relative z-10 pt-16 pb-8 px-6 max-w-6xl mx-auto">
-        <div className="grid grid-cols-1 lg:grid-cols-2 gap-12 items-center">
-          <div>
-            <div className="inline-block px-4 py-1.5 rounded-full glass text-xs text-gray-400 mb-6 animate-fade-in">
-              {t("landing.badge")}
-            </div>
-            <h1 className="text-5xl sm:text-6xl font-extrabold tracking-tight mb-6 leading-[1.1] animate-fade-in">
-              <span className="bg-gradient-to-r from-white via-white to-gray-400 bg-clip-text text-transparent">{t("landing.hero1")}</span><br />
-              <span className="bg-gradient-to-r from-brand to-brand-light bg-clip-text text-transparent">{t("landing.hero2")}</span><br />
-              <span className="bg-gradient-to-r from-white via-white to-gray-400 bg-clip-text text-transparent">{t("landing.hero3")}</span>
-            </h1>
-            <p className="text-gray-400 text-lg max-w-lg leading-relaxed mb-8 animate-fade-in">
-              {t("landing.hero_sub")}
-            </p>
-            <div className="flex flex-col sm:flex-row gap-3 animate-fade-in">
-              <button onClick={onStart} className="btn-primary text-lg py-4 px-10">
-                {t("landing.cta")}
-                <svg className="inline-block ml-2 w-5 h-5" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24" strokeLinecap="round" strokeLinejoin="round"><path d="M5 12h14M12 5l7 7-7 7" /></svg>
-              </button>
-              <a href="#contact" className="btn-secondary text-lg py-4 px-8 inline-flex items-center justify-center">
-                {t("landing.cta_demo")}
-              </a>
-            </div>
+        <div className="text-center max-w-4xl mx-auto">
+          <div className="inline-block px-4 py-1.5 rounded-full glass text-xs text-gray-400 mb-6 animate-fade-in">
+            {t("landing.badge")}
           </div>
+          <h1 className="text-5xl sm:text-6xl font-extrabold tracking-tight mb-6 leading-[1.05] animate-fade-in">
+            <span className="bg-gradient-to-r from-white via-white to-gray-300 bg-clip-text text-transparent">{t("landing.hero1")} </span>
+            <span className="bg-gradient-to-r from-brand-light to-accent bg-clip-text text-transparent">{t("landing.hero2")}</span>
+          </h1>
+          <p className="text-gray-400 text-lg max-w-2xl mx-auto leading-relaxed mb-7 animate-fade-in">
+            {t("landing.hero_sub")}
+          </p>
+          <div className="flex flex-col sm:flex-row gap-3 justify-center animate-fade-in">
+            <button onClick={onStart} className="btn-primary text-lg py-4 px-10">
+              {t("landing.cta")}
+              <svg className="inline-block ml-2 w-5 h-5" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24" strokeLinecap="round" strokeLinejoin="round"><path d="M5 12h14M12 5l7 7-7 7" /></svg>
+            </button>
+            <a href="#contact" className="btn-secondary text-lg py-4 px-8 inline-flex items-center justify-center">
+              {t("landing.cta_demo")}
+            </a>
+          </div>
+          <p className="text-xs text-gray-500 mt-5 animate-fade-in">{t("landing.hero_trust")}</p>
 
-          {/* Real video mockup */}
-          <div className="relative animate-slide-up hidden lg:block">
+          {/* Showcase — real lyric video (already has its own lyrics) */}
+          <div className="relative mt-12 max-w-3xl mx-auto animate-slide-up">
             <div className="glass rounded-3xl p-3 shadow-glow-lg">
               <div className="rounded-2xl overflow-hidden aspect-video relative bg-black">
-                <video autoPlay muted loop playsInline className="w-full h-full object-cover" src="/demo.mp4" />
-                <div className="absolute bottom-3 left-3 right-3 flex items-center gap-2 bg-black/30 backdrop-blur-sm rounded-lg px-3 py-1.5">
-                  <svg className="w-3.5 h-3.5 text-white/70" fill="currentColor" viewBox="0 0 24 24"><path d="M6 19h4V5H6v14zm8-14v14h4V5h-4z"/></svg>
-                  <div className="h-1 flex-1 bg-white/20 rounded-full overflow-hidden"><div className="h-full w-1/2 bg-brand rounded-full"/></div>
-                  <span className="text-[10px] text-white/50">HD</span>
+                <video autoPlay muted loop playsInline className="w-full h-full object-cover" src="/samples/ex1.mp4" />
+                <div className="absolute top-3 left-3 flex items-center gap-1.5 bg-black/55 backdrop-blur-sm rounded-full px-3 py-1.5">
+                  <svg className="w-3 h-3 text-white/80" fill="currentColor" viewBox="0 0 24 24"><path d="M8 5v14l11-7z"/></svg>
+                  <span className="text-[10px] font-semibold text-white/80">Generado con GenLy</span>
                 </div>
-              </div>
-            </div>
-            {/* Floating Short */}
-            <div className="absolute -bottom-6 -left-8 glass rounded-card p-2 shadow-glow w-28 animate-pulse-slow">
-              <div className="rounded-xl bg-gradient-to-b from-pink-500/20 to-brand/20 aspect-[9/16] flex items-center justify-center">
-                <p className="text-[8px] font-bold text-white/70 uppercase">YouTube Short</p>
-              </div>
-            </div>
-            {/* Floating YouTube badge */}
-            <div className="absolute -top-4 -right-6 glass rounded-card px-4 py-3 shadow-glow flex items-center gap-2">
-              <svg className="w-5 h-5 text-red-500" fill="currentColor" viewBox="0 0 24 24"><path d="M22.54 6.42a2.78 2.78 0 00-1.94-2C18.88 4 12 4 12 4s-6.88 0-8.6.46a2.78 2.78 0 00-1.94 2A29 29 0 001 11.75a29 29 0 00.46 5.33A2.78 2.78 0 003.4 19.13C5.12 19.56 12 19.56 12 19.56s6.88 0 8.6-.46a2.78 2.78 0 001.94-2A29 29 0 0023 11.75a29 29 0 00-.46-5.33z"/><polygon points="9.75 15.02 15.5 11.75 9.75 8.48 9.75 15.02" fill="white"/></svg>
-              <div>
-                <p className="text-[9px] font-bold text-white/80">{t("feat.youtube").split(" ").slice(0, 2).join(" ")}</p>
-                <p className="text-[7px] text-white/40">SEO</p>
               </div>
             </div>
           </div>
