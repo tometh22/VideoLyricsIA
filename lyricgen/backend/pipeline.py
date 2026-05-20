@@ -591,9 +591,20 @@ def run_pipeline(job_id: str, mp3_path: str, artist: str, style: str,
                 bg_image_path = background_path
         update_job(job_id, progress=40)
 
-        # Persist render params so edit re-renders can override individual
-        # fields without losing the rest of the original settings.
-        update_job(job_id, render_params={
+        # Persist render params so edit/variant re-renders + reaper-recovery
+        # retries can override individual fields without losing the rest.
+        #
+        # CRITICAL: MERGE over the existing render_params, do NOT replace the
+        # column wholesale. /variant and /edit write background_hint into
+        # render_params BEFORE the worker runs; an earlier version of this
+        # block did update_job(render_params={...}) with a dict that omitted
+        # background_hint, and update_job does a plain setattr (replace) — so
+        # the operator's hint was wiped after the very first render and
+        # vanished on every later retry. That is the Amanda Pujó "Ser Anti"
+        # alley regression (2026-05-20): the hint rendered once, the job was
+        # reaped during the Railway outage, and the retry had no hint left to
+        # forward so Gemini reverted to its default alley cliché.
+        _new_rp = {
             "font": font,
             "text_case": text_case,
             "font_scale": font_scale,
@@ -603,7 +614,22 @@ def run_pipeline(job_id: str, mp3_path: str, artist: str, style: str,
             "genre": genre,
             "concept": concept,
             "movement_style": movement_style,
-        })
+        }
+        # Only persist background_hint when this run actually received one —
+        # otherwise a hint-less typography edit would null out a hint a prior
+        # background edit had stored.
+        if background_hint:
+            _new_rp["background_hint"] = background_hint
+        try:
+            from database import SessionLocal as _SL_rp, Job as _Job_rp
+            with _SL_rp() as _db_rp:
+                _row_rp = _db_rp.query(_Job_rp).filter(_Job_rp.job_id == job_id).first()
+                _merged_rp = dict(_row_rp.render_params) if (_row_rp and isinstance(_row_rp.render_params, dict)) else {}
+        except Exception as _rp_exc:
+            logger.warning("[BG] could not read existing render_params for merge: %s", _rp_exc)
+            _merged_rp = {}
+        _merged_rp.update(_new_rp)
+        update_job(job_id, render_params=_merged_rp)
 
         # Cache AI-generated background to R2 so a typography-only edit
         # can re-use it without another Veo call ($0.80 saved per edit).
