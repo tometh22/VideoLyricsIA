@@ -5824,6 +5824,38 @@ def _resolve_font(font_id: str) -> str | None:
     return None
 
 
+def _smart_lower(text: str) -> str:
+    """Lowercase for the 'lower' aesthetic, but keep proper nouns the
+    operator deliberately capitalized mid-line (e.g. "Guinea").
+
+    The 'lower' style is an all-lowercase look. A blind ``text.lower()``
+    also flattens proper nouns, so a line typed "quizás llegue a Guinea"
+    rendered as "...a guinea". Rule: the FIRST word of the line is always
+    lowercased (sentence-initial capitals are grammar, not intent, and the
+    lowercase aesthetic wants the line to start soft). Every later word is
+    left exactly as the operator typed it — words with no uppercase are
+    already lowercase (no-op), words the operator capitalized are
+    preserved. Original whitespace is kept so layout-sensitive renders
+    don't collapse double spaces.
+
+    Origin: agus.cafisi / Babasónicos — "Guinea" rendered as "guinea"
+    under text_case='lower', 2026-05-20.
+    """
+    import re as _re
+    seen_word = False
+    out = []
+    for tok in _re.split(r"(\s+)", text):
+        if not tok or tok.isspace():
+            out.append(tok)
+            continue
+        if not seen_word:
+            out.append(tok.lower())  # first word: lowercase for the aesthetic
+            seen_word = True
+        else:
+            out.append(tok)  # interior: keep operator's casing as typed
+    return "".join(out)
+
+
 def _apply_case(text: str, case: str) -> str:
     """Apply text-case transformation matching the user's choice."""
     if case == "upper":
@@ -5831,7 +5863,7 @@ def _apply_case(text: str, case: str) -> str:
     if case == "title":
         return text.title()
     if case == "lower":
-        return text.lower()
+        return _smart_lower(text)
     return text  # "original" — keep as transcribed
 
 
@@ -6393,6 +6425,14 @@ def _apply_display_timing(
     floored to a >=0.3s readable window. The min() makes overlap (ceiling
     wins) and gap (hold wins) one expression. The last line holds past its
     final word, capped at `duration`. Returns a new list; input untouched.
+
+    LOCKED lines (`seg["locked"] is True`) — the operator set this line's end
+    by hand in the visual Timings editor. We must NOT auto-extend it: their
+    chosen `end` is the intent. We still apply the NO-OVERLAP clamp for
+    safety (a manual end can't be allowed to overrun the next line), but skip
+    the hold-until-next extension. Untouched lines (no `locked`) keep the
+    default karaoke hold. `locked` is preserved in the output so it round-
+    trips through update_job(segments_json=...).
     """
     if not segments:
         return segments
@@ -6401,8 +6441,13 @@ def _apply_display_timing(
     cleaned = []
     for i, seg in enumerate(sorted_segs):
         base_end = seg["end"]
-        if i + 1 < n:
-            ceiling = sorted_segs[i + 1]["start"] - gap_s
+        locked = bool(seg.get("locked"))
+        ceiling = (sorted_segs[i + 1]["start"] - gap_s) if i + 1 < n else duration
+        if locked:
+            # Respect the operator's manual end; only enforce no-overlap.
+            new_end = min(base_end, ceiling)
+            new_end = max(new_end, seg["start"] + 0.3)
+        elif i + 1 < n:
             new_end = min(base_end + max_hold_s, ceiling)
             new_end = max(new_end, seg["start"] + 0.3)
         else:

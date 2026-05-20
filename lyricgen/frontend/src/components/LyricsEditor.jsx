@@ -2,6 +2,7 @@ import { useState, useMemo, useRef, useEffect, useCallback } from "react";
 import { useI18n } from "../i18n";
 import { EditorTour } from "./OnboardingTour";
 import { useToast } from "./ToastProvider";
+import LyricsTimeline from "./LyricsTimeline";
 
 // Mismo flag que UploadZone/EditRequestPanel — oculta el label de motion
 // en el strip de metadata mientras la feature de animación está pausada.
@@ -218,6 +219,13 @@ export default function LyricsEditor({
     segments.map((s, i) => ({ ...s, _id: i }))
   );
   const [isDirty, setIsDirty] = useState(false);
+  // List vs visual timeline. Default "list" so the existing operator flow is
+  // untouched; the timeline is opt-in via the toolbar toggle.
+  const [viewMode, setViewMode] = useState("list"); // "list" | "timeline"
+  // Snapshot of the timings as first handed to us — the baseline for the
+  // timeline's "Resetear timings". Seeded on mount + re-seeded whenever the
+  // parent swaps the `segments` prop (see the reset effect below).
+  const originalSegmentsRef = useRef(segments.map((s, i) => ({ ...s, _id: i })));
 
   // Re-seed `edited` whenever the parent hands us a different `segments`
   // reference. The initial useState above only runs once on mount —
@@ -234,7 +242,9 @@ export default function LyricsEditor({
   useEffect(() => {
     if (prevSegmentsRef.current === segments) return;
     prevSegmentsRef.current = segments;
-    setEdited(segments.map((s, i) => ({ ...s, _id: i })));
+    const seeded = segments.map((s, i) => ({ ...s, _id: i }));
+    setEdited(seeded);
+    originalSegmentsRef.current = seeded;
     setIsDirty(false);
   }, [segments]);
 
@@ -391,6 +401,47 @@ export default function LyricsEditor({
       setEdited(snapshot);
       return prev.slice(0, -1);
     });
+  }, []);
+
+  // ─── Visual timeline (Timings view) handlers ────────────────────────
+  // A drag commits here. We stamp `locked: true` so the render
+  // (pipeline._apply_display_timing) respects this manual end instead of
+  // auto-extending it (hold-until-next). The undo snapshot is pushed by the
+  // timeline on pointerdown (onDragStart), so this only mutates `edited`.
+  const handleTimelineTimingChange = useCallback((id, newStart, newEnd) => {
+    setIsDirty(true);
+    setEdited((prev) => prev.map((s) =>
+      s._id === id ? { ...s, start: newStart, end: newEnd, locked: true } : s
+    ));
+    setHighlightedIds((prev) => {
+      const next = new Set(prev);
+      next.add(id);
+      return next;
+    });
+    setTimeout(() => setHighlightedIds((prev) => {
+      const next = new Set(prev);
+      next.delete(id);
+      return next;
+    }), 10000);
+  }, []);
+
+  // Restore every line's timing to the original snapshot + drop all `locked`
+  // flags, so the render goes back to auto hold-until-next.
+  const resetTimings = useCallback(() => {
+    pushEditHistory();
+    const byId = new Map((originalSegmentsRef.current || []).map((s) => [s._id, s]));
+    setEdited((prev) => prev.map((s) => {
+      const o = byId.get(s._id);
+      if (!o) return s;
+      // eslint-disable-next-line no-unused-vars
+      const { locked, ...rest } = s;
+      return { ...rest, start: o.start, end: o.end };
+    }));
+    toast({ message: "Timings restaurados al original", tone: "info" });
+  }, [pushEditHistory, toast]);
+
+  const focusSegment = useCallback((id) => {
+    setFocusedSegId(id);
   }, []);
 
   const startEditTimestamp = (seg) => {
@@ -1362,6 +1413,24 @@ export default function LyricsEditor({
           <span className="text-xs text-gray-500 tabular-nums shrink-0 w-10">
             {formatTime(duration)}
           </span>
+          {/* Lista | Línea de tiempo — the timeline is a VIEW of the same
+              editor (shared state), default Lista so the existing flow is
+              untouched. Desktop feature: hidden on narrow screens where the
+              fine drag is impractical. */}
+          <div className="hidden md:inline-flex shrink-0 rounded-md ring-1 ring-white/[0.08] overflow-hidden text-[11px] font-medium">
+            <button
+              onClick={() => setViewMode("list")}
+              className={`px-2.5 py-1 transition-colors ${viewMode === "list" ? "bg-brand/20 text-brand-light" : "text-ink-secondary hover:text-white"}`}
+            >
+              Lista
+            </button>
+            <button
+              onClick={() => setViewMode("timeline")}
+              className={`px-2.5 py-1 transition-colors ${viewMode === "timeline" ? "bg-brand/20 text-brand-light" : "text-ink-secondary hover:text-white"}`}
+            >
+              Línea de tiempo
+            </button>
+          </div>
           {!syncMode && (
             <button
               data-tour="editor-sync-entry"
@@ -1692,11 +1761,33 @@ export default function LyricsEditor({
         )}
       </div>
 
+      {/* ─── Visual timeline (Timings view) ───────────────────────── */}
+      {viewMode === "timeline" && audioUrl && (
+        <div className="mb-4">
+          <LyricsTimeline
+            segments={edited}
+            duration={duration}
+            currentTime={currentTime}
+            activeId={activeId}
+            focusedSegId={focusedSegId}
+            highlightedIds={highlightedIds}
+            gapS={MIN_GAP_S}
+            onSeek={(s) => seekTo(s, false)}
+            onDragStart={pushEditHistory}
+            onTimingChange={handleTimelineTimingChange}
+            onFocus={focusSegment}
+            onReset={resetTimings}
+          />
+        </div>
+      )}
+
       {/* ─── Lyrics list ──────────────────────────────────────────── */}
-      <p className="text-[11px] text-gray-600 mb-2 px-1">
-        {t("editor.list_hint") || "Click en un tiempo para reproducir desde ahí · doble click para editarlo"}
-      </p>
-      <div className="relative">
+      {viewMode === "list" && (
+        <p className="text-[11px] text-gray-600 mb-2 px-1">
+          {t("editor.list_hint") || "Click en un tiempo para reproducir desde ahí · doble click para editarlo"}
+        </p>
+      )}
+      <div className={`relative ${viewMode === "timeline" ? "hidden" : ""}`}>
         <div className="absolute bottom-0 left-0 right-0 h-12 bg-gradient-to-t from-surface to-transparent pointer-events-none z-10 rounded-b-2xl" />
         <div ref={listRef} className="space-y-1 max-h-[55vh] overflow-y-auto pr-1 pb-8">
           {edited.map((seg, idx) => {

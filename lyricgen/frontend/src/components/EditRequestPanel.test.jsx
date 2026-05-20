@@ -18,6 +18,13 @@ vi.mock("../i18n", () => ({
   useI18n: () => ({ t: (_key, fallback) => fallback }),
 }));
 
+// EditRequestPanel calls useAlert() (themed error modals). Tests render it
+// without the app-root <AlertProvider>, so stub the hook.
+vi.mock("./AlertProvider", () => ({
+  useAlert: () => ({ alert: () => {} }),
+  AlertProvider: ({ children }) => children,
+}));
+
 // ContentValidationToggle pulls in extra deps we don't need here; the
 // "lyrics" mode path doesn't render it. Stubbing it just in case it
 // shows up via the typography path the panel still renders.

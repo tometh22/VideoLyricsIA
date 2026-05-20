@@ -145,11 +145,14 @@ def test_save_segments_rejects_unknown_job(client):
 
 
 def test_save_segments_rejects_wrong_status(client):
-    """Status gate: only transcribed_pending accepts /save-segments.
-    pending_review uses /edit, done is terminal, etc."""
+    """Status gate: only statuses in _SAVE_SEGMENTS_ALLOWED accept
+    /save-segments. `queued` is NOT one (its write path is the renderer /
+    queue) so it must 409. NOTE: `done` IS allowed since the 2026-05-20
+    hotfix (operators fix lyric typos on a delivered video) — see
+    test_save_segments_accepts_done."""
     _, token, user_id, tenant_id = _make_user(client)
-    # Seed as "done" — terminal state, /save-segments must refuse.
-    job_id = _seed_transcribed_pending(user_id, tenant_id, status="done")
+    # Seed a genuinely-blocked status — `queued` is mid-pipeline.
+    job_id = _seed_transcribed_pending(user_id, tenant_id, status="queued")
 
     res = client.post(
         f"/jobs/{job_id}/save-segments",
@@ -158,6 +161,20 @@ def test_save_segments_rejects_wrong_status(client):
     )
     assert res.status_code == 409
     assert "transcribed_pending" in res.json()["detail"]
+
+
+def test_save_segments_accepts_done(client):
+    """`done` is an ALLOWED status (2026-05-20 hotfix): operators fix lyric
+    typos on an already-delivered video without re-uploading. Locks the
+    behavior so it can't silently regress."""
+    _, token, user_id, tenant_id = _make_user(client)
+    job_id = _seed_transcribed_pending(user_id, tenant_id, status="done")
+    res = client.post(
+        f"/jobs/{job_id}/save-segments",
+        json={"segments": [{"start": 0, "end": 1, "text": "x"}]},
+        headers=auth(token),
+    )
+    assert res.status_code == 200, res.text
 
 
 def test_save_segments_validates_shape(client):
@@ -258,11 +275,13 @@ def test_save_segments_accepts_rejected(client):
 
 
 def test_save_segments_still_rejects_terminal_or_pre_upload(client):
-    """The gate is expanded, not removed. `done`, `error`, `awaiting_upload`,
+    """The gate is expanded, not removed. `error`, `awaiting_upload`,
     `processing`, `queued` still 409 because their write paths live
-    elsewhere (the renderer, /retry, /upload-uploaded, /generate)."""
+    elsewhere (the renderer, /retry, /upload-uploaded, /generate).
+    `done` is intentionally NOT in this list — it became allowed in the
+    2026-05-20 hotfix (see test_save_segments_accepts_done)."""
     _, token, user_id, tenant_id = _make_user(client)
-    for blocked_status in ("done", "error", "queued", "processing", "awaiting_upload"):
+    for blocked_status in ("error", "queued", "processing", "awaiting_upload"):
         job_id = _seed_transcribed_pending(user_id, tenant_id, status=blocked_status)
         res = client.post(
             f"/jobs/{job_id}/save-segments",
