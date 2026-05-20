@@ -5011,7 +5011,21 @@ async def request_edit(
         # background to convey. Forwarded to Gemini's user_content as a
         # high-priority override block so it pisa los defaults that
         # produced the rejected background.
-        edit_params["background_hint"] = body.background_hint.strip()
+        _hint = body.background_hint.strip()
+        edit_params["background_hint"] = _hint
+        # ALSO persist the hint into the DURABLE render_params, not only
+        # the transient edit_params that the worker consumes for this one
+        # render. Without this, the operator's prompt lives for exactly one
+        # render: if the job is later reaped (Railway restart / OOM) and a
+        # /retry recovers it, /retry forwards job.render_params (PR #229)
+        # but the hint was never stored there — so Gemini re-chooses freely
+        # and the operator's direction silently vanishes. Real loss: Amanda
+        # Pujó "Ser Anti" 2026-05-20 reverted to the alley cliché after a
+        # reaped background edit retried without the hint. /variant already
+        # persists its hint to render_params; this brings /edit in line.
+        _rp = dict(job.render_params or {})
+        _rp["background_hint"] = _hint
+        job.render_params = _rp
     if body.edit_type == "background" and body.background_mode in ("veo", "imagen"):
         # Operator picked the generation mode (Veo cinematic video vs
         # Imagen-4 still + Ken Burns animation). Pydantic already
