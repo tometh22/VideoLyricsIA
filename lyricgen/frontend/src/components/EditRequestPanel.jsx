@@ -152,6 +152,11 @@ export default function EditRequestPanel({
   });
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState(null);
+  // When a lyrics re-render is requested but the editor's segments match the
+  // persisted segments_json exactly, we don't hard-error: the rendered video
+  // can still be stale (lyrics fixed out-of-band, prior render failed). Hold
+  // the attempted segments here so the modal can offer "re-render anyway".
+  const [staleSegments, setStaleSegments] = useState(null);
   // Synchronous guard against double-click. `submitting` is async (React
   // schedules the re-render after the click handler returns) so a rapid
   // second click can fire its handler before the disabled flag flips.
@@ -373,7 +378,7 @@ export default function EditRequestPanel({
   // directly (no internal draft state). Validates non-empty, short-
   // circuits the "nothing actually changed" case, fires POST + 409
   // retry, and notifies the parent on success.
-  const submitLyricsWithSegments = async (segments) => {
+  const submitLyricsWithSegments = async (segments, force = false) => {
     if (submitLockRef.current || limitReached) return;
     submitLockRef.current = true;
     if (!Array.isArray(segments) || segments.length === 0) {
@@ -399,15 +404,19 @@ export default function EditRequestPanel({
         Math.abs((s.start ?? 0) - payload.segments[i].start) < 0.001 &&
         Math.abs((s.end ?? 0) - payload.segments[i].end) < 0.001
       );
-    if (unchanged) {
-      if (mountedRef.current) {
-        setError(t("edit.no_changes") || "No cambiaste ninguna opción — no hay nada que re-renderizar.");
-      }
+    if (unchanged && !force) {
+      // Not a dead end: the rendered video can be stale relative to
+      // segments_json (lyrics corrected out-of-band, or a prior render
+      // failed). Surface an explicit "re-render anyway" escape instead of a
+      // hard error that traps the operator with a correct-looking editor and
+      // an outdated video.
+      if (mountedRef.current) setStaleSegments(segments);
       submitLockRef.current = false;
       return;
     }
     if (mountedRef.current) setSubmitting(true);
     if (mountedRef.current) setError(null);
+    if (mountedRef.current) setStaleSegments(null);
     let succeeded = false;
     try {
       const { ok, status, data, cancelled } = await postEditWithRetry(payload);
@@ -944,6 +953,8 @@ export default function EditRequestPanel({
         open={mode === "lyrics"}
         audioError={lyricsAudioError}
         error={error}
+        staleRerender={!!staleSegments}
+        onForceRerender={() => submitLyricsWithSegments(staleSegments, true)}
         job={job}
         segments={lastSavedSegments || job.segments_json}
         onSavedSegments={(segs) => {
@@ -951,7 +962,7 @@ export default function EditRequestPanel({
           // reference-change useEffect re-syncs on next mount.
           if (mountedRef.current) setLastSavedSegments(segs.slice());
         }}
-        onClose={() => { setMode(null); setError(null); }}
+        onClose={() => { setMode(null); setError(null); setStaleSegments(null); }}
         audioUrl={lyricsAudioUrl}
         onApprove={submitLyricsWithSegments}
         submitting={submitting}
@@ -971,9 +982,19 @@ export default function EditRequestPanel({
  * behavior — editHistory, syncMode, etc are reset).
  */
 function LyricsEditModal({
-  open, audioError, error, job, segments, onSavedSegments,
-  onClose, audioUrl, onApprove, submitting, initialParams, t,
+  open, audioError, error, staleRerender, onForceRerender, job, segments,
+  onSavedSegments, onClose, audioUrl, onApprove, submitting, initialParams, t,
 }) {
+  // Scroll the modal back to the top whenever a banner appears, so the
+  // error / stale-rerender notice is never stranded above the fold while the
+  // operator is scrolled down the (long) segment list. Without this the
+  // message renders at the top, out of view, and looks "cut off".
+  const scrollRef = useRef(null);
+  useEffect(() => {
+    if ((error || audioError || staleRerender) && typeof scrollRef.current?.scrollTo === "function") {
+      scrollRef.current.scrollTo({ top: 0, behavior: "smooth" });
+    }
+  }, [error, audioError, staleRerender]);
   // Lock the underlying body scroll while the modal is open. Without
   // this, scrolling on the modal's segment list bleeds through to the
   // JobDetail page underneath on macOS/Safari, which felt broken.
@@ -1011,7 +1032,7 @@ function LyricsEditModal({
   const noSegments = !Array.isArray(effectiveSegments) || effectiveSegments.length === 0;
 
   return (
-    <div className="fixed inset-0 z-[60] bg-surface overflow-y-auto">
+    <div ref={scrollRef} className="fixed inset-0 z-[60] bg-surface overflow-y-auto">
       <div className="min-h-screen px-4 py-8 sm:px-8">
         <div className="max-w-3xl mx-auto">
           {audioError && (
@@ -1022,6 +1043,23 @@ function LyricsEditModal({
           {error && (
             <div className="mb-4 rounded-2xl ring-1 ring-red-500/30 bg-red-500/[0.08] px-4 py-3">
               <p className="text-xs text-red-300">{error}</p>
+            </div>
+          )}
+          {staleRerender && (
+            <div className="mb-4 rounded-2xl ring-1 ring-amber-500/30 bg-amber-500/[0.08] px-4 py-3
+              flex flex-col sm:flex-row sm:items-center gap-2">
+              <p className="text-xs text-amber-200 flex-1">
+                {t("edit.stale_rerender_prompt") ||
+                  "Las letras ya están guardadas y no detectamos cambios nuevos. Si el video todavía muestra la versión vieja, podés re-renderizarlo igual."}
+              </p>
+              <button
+                type="button"
+                onClick={onForceRerender}
+                disabled={submitting}
+                className="btn-primary h-9 px-4 text-xs whitespace-nowrap disabled:opacity-50"
+              >
+                {t("edit.stale_rerender_button") || "Re-renderizar igual"}
+              </button>
             </div>
           )}
         </div>

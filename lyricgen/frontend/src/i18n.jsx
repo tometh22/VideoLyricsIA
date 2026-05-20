@@ -763,6 +763,8 @@ const translations = {
     "edit.cancel": "Cancelar",
     "edit.submitting": "Enviando...",
     "edit.no_changes": "No cambiaste ninguna opción — no hay nada que re-renderizar.",
+    "edit.stale_rerender_prompt": "Las letras ya están guardadas y no detectamos cambios nuevos. Si el video todavía muestra la versión vieja, podés re-renderizarlo igual.",
+    "edit.stale_rerender_button": "Re-renderizar igual",
     "edit.typography_needs_bg": "Este video no tiene fondo cacheado. Regenerá el fondo primero para poder cambiar la tipografía.",
     "edit.error_no_bg_cache": "Este video no tiene un fondo cacheado para reusar. Regenerá el fondo primero (cuesta ~US$0.90).",
     "edit.error_wrong_status": "Esta regeneración ya está en marcha o el video pasó a otro estado.",
