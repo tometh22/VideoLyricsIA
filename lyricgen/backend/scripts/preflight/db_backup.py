@@ -94,7 +94,35 @@ def main() -> int:
             return 2
 
         size_mb = os.path.getsize(dump_path) / (1024 * 1024)
-        print(f"[backup] dump size: {size_mb:.1f} MB — uploading to s3://{bucket}/{key}")
+        print(f"[backup] dump size: {size_mb:.2f} MB")
+
+        # Self-verify the dump is real, not an empty shell. A backup you've
+        # never inspected is a hope. `pg_restore --list` enumerates the
+        # archive's TOC: every table/sequence/index plus a "TABLE DATA"
+        # entry per table that actually has rows. We assert there's at least
+        # one TABLE DATA entry, and log the count + the tables with data so
+        # the run output is auditable.
+        try:
+            listing = subprocess.run(
+                ["pg_restore", "--list", dump_path],
+                check=True, capture_output=True, text=True, timeout=120,
+            ).stdout
+            data_entries = [ln for ln in listing.splitlines() if "TABLE DATA" in ln]
+            print(f"[backup] verify: {len(data_entries)} tables with data in the dump")
+            for ln in data_entries[:40]:
+                # e.g. "1234; 0 0 TABLE DATA public jobs genly"
+                parts = ln.split("TABLE DATA", 1)[1].split()
+                print(f"[backup]   - {parts[1] if len(parts) > 1 else parts[0]}")
+            if not data_entries:
+                print("[backup] FATAL: dump has ZERO tables with data — refusing "
+                      "to upload an empty backup", file=sys.stderr)
+                return 1
+        except Exception as e:
+            print(f"[backup] FATAL: could not verify dump with pg_restore --list: "
+                  f"{type(e).__name__}: {e}", file=sys.stderr)
+            return 1
+
+        print(f"[backup] uploading to s3://{bucket}/{key}")
 
         client = _r2_client()
         client.upload_file(dump_path, bucket, key)
