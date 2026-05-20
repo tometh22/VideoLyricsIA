@@ -376,11 +376,19 @@ def _age_minutes(job: Job) -> float:
 
 
 def _reason_for(job: Job) -> str:
-    age = _age_minutes(job)
+    # Customer-facing — shown verbatim in the UI error banner. Keep it
+    # friendly and actionable; NO internal jargon ("Worker", "container
+    # restart", "timeout o crash"). The age-based sweep is the catch-all
+    # detector so the true cause is genuinely unknown — "problema
+    # temporal del servidor" is the honest customer summary. The CTA
+    # matches the button actually rendered ("Reintentar sin re-subir"),
+    # which has its own R2 pre-check that surfaces a re-upload prompt
+    # only if the audio is genuinely gone. Sibling messages
+    # (_reason_for_orphan, _reason_for_stalled) use the same tone.
     return (
-        f"Worker abandonó el job tras {age:.0f} min sin progreso "
-        f"(probable container restart, timeout o crash). "
-        f"Re-uploadeá el archivo para reintentar."
+        "El video se interrumpió por un problema temporal del servidor "
+        "y no llegó a completarse. Tu archivo sigue guardado: apretá "
+        "\"Reintentar sin re-subir\" para volver a procesarlo."
     )
 
 
