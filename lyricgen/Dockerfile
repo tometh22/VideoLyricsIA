@@ -60,4 +60,11 @@ EXPOSE 8000
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
     CMD python -c "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')" || exit 1
 
-CMD ["sh", "-c", "uvicorn main:app --host 0.0.0.0 --port ${PORT:-8000} --workers 4 --app-dir /app/backend"]
+# Uvicorn workers per replica. Reduced from 4 → 2 when we moved to
+# numReplicas=2 in railway.toml (2026-05-19, post-UMG-signing). Keeps
+# the per-service DB connection budget at 2×2×10 = 40 (unchanged),
+# while letting Railway do truly rolling deploys with always-warm
+# capacity. To scale capacity further, prefer bumping numReplicas in
+# railway.toml over bumping workers here — replicas give failure
+# isolation, workers within a replica share fate.
+CMD ["sh", "-c", "uvicorn main:app --host 0.0.0.0 --port ${PORT:-8000} --workers ${UVICORN_WORKERS:-2} --app-dir /app/backend"]
