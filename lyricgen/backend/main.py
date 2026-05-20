@@ -3687,6 +3687,10 @@ async def status(
     if job is None:
         raise HTTPException(status_code=404, detail="Job not found.")
     edit_count = job.get("edit_count") or 0
+    # Admins are exempt from the per-job edit cap. The frontend reads
+    # edit_limit_exempt to skip the limit-reached panel and show "sin
+    # límite" instead of a remaining count.
+    _is_admin = current_user.get("role") == "admin"
     return {
         "job_id": job["job_id"],
         "status": job["status"],
@@ -3712,6 +3716,7 @@ async def status(
         # edit applied (or the initial render) so the UI can preload them.
         "edit_count": edit_count,
         "edits_remaining": max(0, _MAX_EDITS - edit_count),
+        "edit_limit_exempt": _is_admin,
         "render_params": job.get("render_params"),
         # EditRequestPanel reads these to drive the lyrics-edit and
         # typography-edit UIs. segments_json hydrates the inline lyrics
@@ -4954,7 +4959,11 @@ async def request_edit(
         )
 
     current_edit_count = job.edit_count or 0
-    if current_edit_count >= _MAX_EDITS:
+    # Admins are exempt from the per-job edit cap (operators QA'ing a
+    # render may need more than _MAX_EDITS passes). Regular users still
+    # hit the limit and must approve/reject.
+    _is_admin = current_user.get("role") == "admin"
+    if not _is_admin and current_edit_count >= _MAX_EDITS:
         raise HTTPException(
             status_code=400,
             detail=f"Maximum edit limit ({_MAX_EDITS}) reached. Please approve or reject.",
@@ -5176,7 +5185,8 @@ async def request_edit(
         "job_id": job_id,
         "edit_type": body.edit_type,
         "edit_count": new_edit_count,
-        "edits_remaining": _MAX_EDITS - new_edit_count,
+        "edits_remaining": max(0, _MAX_EDITS - new_edit_count),
+        "edit_limit_exempt": _is_admin,
     }
 
 

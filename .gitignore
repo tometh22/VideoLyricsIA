@@ -23,3 +23,4 @@ lyricgen/backend/.pytest_cache/
 # stress / load tests; runtime artifact, not source.
 dump.rdb
 *.rdb
+.gstack/

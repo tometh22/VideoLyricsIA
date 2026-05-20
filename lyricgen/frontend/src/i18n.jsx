@@ -703,6 +703,7 @@ const translations = {
     "edit.panel_desc": "Cambiá tipografía o regenerá el fondo sin volver a transcribir.",
     "edit.remaining_one": "1 ed. restante",
     "edit.remaining_many": "ed. restantes",
+    "edit.no_limit": "sin límite",
     "edit.typography_title": "Cambiar tipografía",
     "edit.typography_cost": "~5-10 min · sin costo extra · reutiliza el fondo actual",
     "edit.typography_submit": "Pedir re-render con estos cambios",

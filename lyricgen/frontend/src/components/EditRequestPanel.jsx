@@ -91,6 +91,9 @@ export default function EditRequestPanel({
   const { alert } = useAlert();
   const editCount = job.edit_count ?? 0;
   const editsRemaining = job.edits_remaining ?? Math.max(0, 3 - editCount);
+  // Admins have no edit cap (backend bypasses it); the panel shows
+  // "sin límite" and never gates on editsRemaining.
+  const editLimitExempt = job.edit_limit_exempt ?? false;
   const initialParams = job.render_params || {};
 
   const [mode, setMode] = useState(null); // null | "typography" | "background" | "lyrics"
@@ -184,7 +187,7 @@ export default function EditRequestPanel({
     setLastSavedSegments(null);
   }, [job.job_id]);
 
-  const limitReached = editsRemaining <= 0;
+  const limitReached = !editLimitExempt && editsRemaining <= 0;
   // Typography reuses the cached bg from R2 to skip Veo. Without a
   // cached key the backend rejects the edit. Disable the button up-front
   // instead of letting the user fill the form and getting a raw English
@@ -533,7 +536,9 @@ export default function EditRequestPanel({
           </p>
         </div>
         <span className="text-[11px] font-mono text-ink-secondary px-2 py-1 rounded-md bg-surface-3/60 ring-1 ring-white/[0.04] shrink-0">
-          {editsRemaining === 1
+          {editLimitExempt
+            ? (t("edit.no_limit") || "sin límite")
+            : editsRemaining === 1
             ? (t("edit.remaining_one") || "1 ed. restante")
             : `${editsRemaining} ${t("edit.remaining_many") || "ed. restantes"}`}
         </span>

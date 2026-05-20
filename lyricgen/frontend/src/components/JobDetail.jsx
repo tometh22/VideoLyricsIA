@@ -461,6 +461,7 @@ export default function JobDetail({ job, onBack, onJobUpdate }) {
         status: "editing",
         edit_count: resp?.edit_count ?? (job.edit_count || 0) + 1,
         edits_remaining: resp?.edits_remaining ?? Math.max(0, (job.edits_remaining ?? 3) - 1),
+        edit_limit_exempt: resp?.edit_limit_exempt ?? job.edit_limit_exempt ?? false,
         current_step: resp?.edit_type === "background" ? "background" : "video",
         progress: 0,
       });
