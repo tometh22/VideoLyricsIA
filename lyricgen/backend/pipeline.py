@@ -5824,6 +5824,38 @@ def _resolve_font(font_id: str) -> str | None:
     return None
 
 
+def _smart_lower(text: str) -> str:
+    """Lowercase for the 'lower' aesthetic, but keep proper nouns the
+    operator deliberately capitalized mid-line (e.g. "Guinea").
+
+    The 'lower' style is an all-lowercase look. A blind ``text.lower()``
+    also flattens proper nouns, so a line typed "quizás llegue a Guinea"
+    rendered as "...a guinea". Rule: the FIRST word of the line is always
+    lowercased (sentence-initial capitals are grammar, not intent, and the
+    lowercase aesthetic wants the line to start soft). Every later word is
+    left exactly as the operator typed it — words with no uppercase are
+    already lowercase (no-op), words the operator capitalized are
+    preserved. Original whitespace is kept so layout-sensitive renders
+    don't collapse double spaces.
+
+    Origin: agus.cafisi / Babasónicos — "Guinea" rendered as "guinea"
+    under text_case='lower', 2026-05-20.
+    """
+    import re as _re
+    seen_word = False
+    out = []
+    for tok in _re.split(r"(\s+)", text):
+        if not tok or tok.isspace():
+            out.append(tok)
+            continue
+        if not seen_word:
+            out.append(tok.lower())  # first word: lowercase for the aesthetic
+            seen_word = True
+        else:
+            out.append(tok)  # interior: keep operator's casing as typed
+    return "".join(out)
+
+
 def _apply_case(text: str, case: str) -> str:
     """Apply text-case transformation matching the user's choice."""
     if case == "upper":
@@ -5831,7 +5863,7 @@ def _apply_case(text: str, case: str) -> str:
     if case == "title":
         return text.title()
     if case == "lower":
-        return text.lower()
+        return _smart_lower(text)
     return text  # "original" — keep as transcribed
 
 
