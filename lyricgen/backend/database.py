@@ -817,6 +817,23 @@ class LyricsCache(Base):
     fetched_by_model = Column(String(64), nullable=True)
 
 
+class SalesLead(Base):
+    """Public sales/contact form submissions from the landing page.
+    Captured by the unauthenticated POST /api/leads endpoint and also
+    emailed to the sales inbox. Created by create_all() on boot — no
+    Alembic migration needed (mirrors how new tables land here)."""
+    __tablename__ = "sales_leads"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    name = Column(String(255), nullable=False)
+    company = Column(String(255), nullable=True)
+    email = Column(String(255), nullable=False, index=True)
+    volume = Column(String(100), nullable=True)
+    message = Column(Text, nullable=True)
+    ip_address = Column(String(45), nullable=True)
+    created_at = Column(DateTime(timezone=True), default=utcnow, index=True)
+
+
 # ---------------------------------------------------------------------------
 # Init
 # ---------------------------------------------------------------------------

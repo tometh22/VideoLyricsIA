@@ -1,28 +1,48 @@
+import { useState } from "react";
 import { useI18n } from "../i18n";
 import BrandLockup from "./BrandLockup";
+
+const API = import.meta.env.VITE_API_URL || "";
 
 export default function Landing({ onStart, onLogin, isLoggedIn = false }) {
   const { t, lang, setLang } = useI18n();
 
-  // Lead form → prefilled mailto (no backend dependency yet; upgrade to /api/leads later)
-  const handleSalesSubmit = (e) => {
+  // Lead form → POST /api/leads. Falls back to a prefilled mailto if the API fails.
+  const [formState, setFormState] = useState("idle"); // idle | loading | sent | error
+  const handleSalesSubmit = async (e) => {
     e.preventDefault();
     const f = e.target;
-    const name = f.name.value.trim();
-    const company = f.company.value.trim();
-    const email = f.email.value.trim();
-    const volume = f.volume.value;
-    const message = f.message.value.trim();
-    const subject = `GenLy AI — Consulta de ventas${company ? ` (${company})` : ""}`;
-    const body = [
-      `Nombre: ${name}`,
-      `Sello/empresa: ${company}`,
-      `Email: ${email}`,
-      `Volumen estimado: ${volume}`,
-      "",
-      message,
-    ].join("\n");
-    window.location.href = `mailto:tomas@epical.digital?subject=${encodeURIComponent(subject)}&body=${encodeURIComponent(body)}`;
+    const payload = {
+      name: f.name.value.trim(),
+      company: f.company.value.trim(),
+      email: f.email.value.trim(),
+      volume: f.volume.value,
+      message: f.message.value.trim(),
+    };
+    setFormState("loading");
+    try {
+      const res = await fetch(`${API}/api/leads`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload),
+      });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      setFormState("sent");
+      f.reset();
+    } catch {
+      setFormState("error");
+      // Fallback: open a prefilled email so the lead is never lost.
+      const subject = `GenLy AI — Consulta de ventas${payload.company ? ` (${payload.company})` : ""}`;
+      const body = [
+        `Nombre: ${payload.name}`,
+        `Sello/empresa: ${payload.company}`,
+        `Email: ${payload.email}`,
+        `Volumen estimado: ${payload.volume}`,
+        "",
+        payload.message,
+      ].join("\n");
+      window.location.href = `mailto:tomas@epical.digital?subject=${encodeURIComponent(subject)}&body=${encodeURIComponent(body)}`;
+    }
   };
 
   const FEATURES = [
@@ -423,7 +443,15 @@ export default function Landing({ onStart, onLogin, isLoggedIn = false }) {
             </select>
           </div>
           <textarea name="message" rows="3" placeholder={t("landing.form_message")} className="w-full bg-surface-1/60 border border-white/10 rounded-xl px-4 py-3 text-sm text-white placeholder-gray-500 focus:outline-none focus:border-brand/50 resize-none" />
-          <button type="submit" className="btn-primary w-full py-3">{t("landing.form_submit")}</button>
+          <button type="submit" disabled={formState === "loading" || formState === "sent"} className="btn-primary w-full py-3 disabled:opacity-60">
+            {formState === "loading" ? t("landing.form_sending") : t("landing.form_submit")}
+          </button>
+          {formState === "sent" && (
+            <p className="text-center text-sm text-accent font-medium pt-1">{t("landing.form_sent")}</p>
+          )}
+          {formState === "error" && (
+            <p className="text-center text-sm text-red-400 pt-1">{t("landing.form_error")}</p>
+          )}
         </form>
         {/* TODO(ventas): cuando exista backend, postear a /api/leads en vez de mailto.
             Drop-in de prueba social real (logos/testimonios de sellos) iría arriba de este form. */}

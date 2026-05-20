@@ -72,7 +72,7 @@ from datetime import datetime, timedelta, timezone
 from database import (
     Job, User, UserSettings, AuditLog, APIKey, get_db, init_db,
     BackgroundAsset, AssetUsage, Delivery, DeliveryChangeRequest,
-    scoped_db, pool_stats,
+    SalesLead, scoped_db, pool_stats,
 )
 from jobs import bulk_delete_jobs, create_job, delete_job, get_job, get_all_jobs, update_job
 from observability import init_sentry, init_logging, health_snapshot
@@ -744,6 +744,15 @@ class CreateAPIKeyRequest(BaseModel):
     name: str = Field(..., max_length=100)  # DB column VARCHAR(100)
 
 
+class CreateLeadRequest(BaseModel):
+    # Public landing form. max_length aligned with sales_leads columns.
+    name: str = Field(..., max_length=255)
+    email: str = Field(..., max_length=255)
+    company: str = Field(default="", max_length=255)
+    volume: str = Field(default="", max_length=100)
+    message: str = Field(default="", max_length=5000)
+
+
 @app.post("/auth/login")
 @limiter.limit("10/minute")
 async def login(body: LoginRequest, request: Request, db: Session = Depends(get_db)):
@@ -773,6 +782,39 @@ async def login(body: LoginRequest, request: Request, db: Session = Depends(get_
             "features": {"prores_export": has_prores_access(user)},
         },
     }
+
+
+@app.post("/api/leads")
+@limiter.limit("5/minute")
+async def create_lead(body: CreateLeadRequest, request: Request, db: Session = Depends(get_db)):
+    """Public sales/contact lead capture from the landing form (no auth).
+
+    Persists the lead and emails the sales inbox asynchronously. Returns
+    200 even if the email fails — the DB row is the source of truth.
+    """
+    name = body.name.strip()
+    email = body.email.strip()
+    if not name or "@" not in email:
+        raise HTTPException(status_code=400, detail="Name and a valid email are required")
+
+    lead = SalesLead(
+        name=name,
+        email=email,
+        company=(body.company or "").strip() or None,
+        volume=(body.volume or "").strip() or None,
+        message=(body.message or "").strip() or None,
+        ip_address=request.client.host if request.client else None,
+    )
+    db.add(lead)
+    db.commit()
+
+    threading.Thread(
+        target=emails.send_lead_notification,
+        args=(name, lead.company or "", email, lead.volume or "", lead.message or ""),
+        daemon=True,
+    ).start()
+
+    return {"ok": True}
 
 
 @app.post("/auth/register")
