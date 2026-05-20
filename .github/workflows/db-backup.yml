@@ -1,0 +1,54 @@
+name: DB backup to R2
+
+# Off-Railway Postgres backup every 6h, stored in Cloudflare R2. Layered
+# ON TOP OF Railway's native daily/weekly/monthly volume backups:
+#   - lower RPO (~6h vs 24h)
+#   - lives outside Railway (survives a Railway-wide outage)
+#   - portable logical dump (restorable to any Postgres, incl. future GCP)
+# See lyricgen/backend/scripts/preflight/db_backup.py for restore steps.
+
+on:
+  schedule:
+    - cron: '0 */6 * * *'   # 00:00, 06:00, 12:00, 18:00 UTC
+  workflow_dispatch: {}      # manual run from the Actions tab
+
+permissions:
+  contents: read
+
+concurrency:
+  group: db-backup
+  cancel-in-progress: false   # never interrupt an in-flight backup
+
+jobs:
+  backup:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      # pg_dump must be >= the server major version (Railway runs Postgres 18).
+      # Ubuntu's default postgresql-client is older, so pull v18 from PGDG.
+      - name: Install postgresql-client 18
+        run: |
+          sudo sh -c 'echo "deb https://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main" > /etc/apt/sources.list.d/pgdg.list'
+          curl -fsSL https://www.postgresql.org/media/keys/ACCC4CF8.asc | sudo gpg --dearmor -o /etc/apt/trusted.gpg.d/pgdg.gpg
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq postgresql-client-18
+          pg_dump --version
+
+      - name: Install boto3
+        run: pip install --quiet boto3==1.35.49
+
+      - name: Dump + upload to R2
+        working-directory: lyricgen/backend
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          R2_ENDPOINT_URL: ${{ secrets.R2_ENDPOINT_URL }}
+          R2_BUCKET: ${{ secrets.R2_BUCKET }}
+        run: python -m scripts.preflight.db_backup
