@@ -174,12 +174,42 @@ function estimateWrappedLines(text, fontCss, sizePx, maxWidthPx) {
   }
 }
 
+// Mirror of the backend pipeline._smart_lower(): for the all-lowercase
+// aesthetic we lowercase only the FIRST word of the line (sentence-initial
+// capital is grammar, not intent) and keep every later word exactly as the
+// operator typed it, so proper nouns like "Guinea" survive. Must stay in
+// sync with pipeline.py:_smart_lower so the editor preview matches the
+// rendered video (otherwise the editor shows "guinea" but the render shows
+// "Guinea"). Origin: agus.cafisi / Babasónicos 2026-05-20.
+export function smartLower(text) {
+  let seenWord = false;
+  return (text || "")
+    .split(/(\s+)/)
+    .map((tok) => {
+      if (!tok || /^\s+$/.test(tok)) return tok;
+      if (!seenWord) {
+        seenWord = true;
+        return tok.toLowerCase();
+      }
+      return tok; // interior word: keep operator's casing as typed
+    })
+    .join("");
+}
+
 // Apply the same case transform as the backend _apply_case().
 function applyCase(text, textCase) {
   if (textCase === "upper") return text.toUpperCase();
   if (textCase === "title") return text.replace(/\b\w/g, (c) => c.toUpperCase());
-  if (textCase === "lower") return text.toLowerCase();
+  if (textCase === "lower") return smartLower(text);
   return text;
+}
+
+// Normalize a lyric line for repeat-detection: trim ends and collapse
+// internal whitespace runs. Case- and accent-SENSITIVE on purpose, so we
+// only ever group lines the operator typed identically and never touch a
+// line they meant to be different.
+export function normalizeLineForMatch(text) {
+  return (text || "").trim().replace(/\s+/g, " ");
 }
 
 export default function LyricsEditor({
@@ -364,6 +394,13 @@ export default function LyricsEditor({
   // Single-click on a timestamp seeks; double-click switches to edit.
   const [editingId, setEditingId] = useState(null);
   const [editValue, setEditValue] = useState("");
+  // Repeat-line propagation. `textEditStart` snapshots {id, text} when the
+  // operator focuses a line's text input, so on blur we can compare against
+  // the pre-edit text and find other lines that were identical to it.
+  // `propagationPrompt` holds {id, newText, matchIds, prevText} while we ask
+  // "apply this change to the N other identical lines?".
+  const [textEditStart, setTextEditStart] = useState(null);
+  const [propagationPrompt, setPropagationPrompt] = useState(null);
 
   // Tap-to-sync mode — operator hits Space (or button) while audio
   // plays to anchor each line at the current playback time. Solves
@@ -1006,6 +1043,48 @@ export default function LyricsEditor({
     pushEditHistory();
     setEdited((prev) => prev.map((seg) => (seg._id === id ? { ...seg, text } : seg)));
   };
+
+  // Called on blur of a line's text input. If the operator changed a line
+  // that was identical to other lines (a repeated chorus), offer to apply
+  // the same new text to those other occurrences. Match is against the
+  // PRE-edit text (textEditStart), so lines the operator already diverged by
+  // hand never match and are never touched. Newly-typed text is compared
+  // exact (trim + collapsed whitespace), case/accent sensitive.
+  const handleTextBlur = (id, newText) => {
+    const start = textEditStart;
+    setTextEditStart(null);
+    if (!start || start.id !== id) return;
+    const prevNorm = normalizeLineForMatch(start.text);
+    const newNorm = normalizeLineForMatch(newText);
+    // Only prompt when the text actually changed and the pre-edit line had
+    // real content (don't propagate blanks).
+    if (!prevNorm || prevNorm === newNorm) return;
+    const matchIds = edited
+      .filter((s) => s._id !== id && normalizeLineForMatch(s.text) === prevNorm)
+      .map((s) => s._id);
+    if (matchIds.length > 0) {
+      setPropagationPrompt({ id, newText, matchIds, prevText: start.text });
+    }
+  };
+
+  const applyPropagation = () => {
+    if (!propagationPrompt) return;
+    const { newText, matchIds } = propagationPrompt;
+    pushEditHistory();
+    const idset = new Set(matchIds);
+    setEdited((prev) => prev.map((s) => (idset.has(s._id) ? { ...s, text: newText } : s)));
+    setPropagationPrompt(null);
+    // Flush-save immediately so the propagated lines persist without waiting
+    // for the 3 s autosave debounce.
+    setFlushCounter((c) => c + 1);
+    toast({
+      message: (t("editor.repeat_applied") || "Cambio aplicado a {n} líneas repetidas")
+        .replace("{n}", matchIds.length),
+      tone: "info",
+    });
+  };
+
+  const dismissPropagation = () => setPropagationPrompt(null);
 
   const applySuggestion = (id) => {
     const suggestion = suggestionsById[id];
@@ -1915,11 +1994,42 @@ export default function LyricsEditor({
                       type="text"
                       value={seg.text}
                       onChange={(e) => updateText(seg._id, e.target.value)}
-                      onFocus={() => { seekTo(seg.start, false); setFocusedSegId(seg._id); }}
+                      onFocus={() => {
+                        seekTo(seg.start, false);
+                        setFocusedSegId(seg._id);
+                        setTextEditStart({ id: seg._id, text: seg.text });
+                      }}
+                      onBlur={(e) => handleTextBlur(seg._id, e.target.value)}
                       className={`w-full px-3 py-2 rounded-xl bg-surface-1 border text-sm text-white
                         focus:border-brand/40 focus:outline-none hover:border-white/[0.08] transition-all
                         ${suggestion && !isApplied ? "border-amber-500/20" : "border-white/[0.04]"}`}
                     />
+                    {propagationPrompt && propagationPrompt.id === seg._id && (
+                      <div className="flex items-center gap-2 mt-1.5 px-3 py-2 rounded-xl
+                        bg-brand/10 ring-1 ring-brand/30 text-xs text-white">
+                        <span className="flex-1">
+                          {(t("editor.repeat_prompt") || "Esta línea se repite en otras {n}. ¿Aplicar el cambio a todas?")
+                            .replace("{n}", propagationPrompt.matchIds.length)}
+                        </span>
+                        <button
+                          type="button"
+                          onMouseDown={(e) => e.preventDefault()}
+                          onClick={applyPropagation}
+                          className="px-2.5 py-1 rounded-lg bg-brand text-white font-medium hover:bg-brand/80 transition-colors whitespace-nowrap"
+                        >
+                          {(t("editor.repeat_apply_all") || "Aplicar a todas ({n})")
+                            .replace("{n}", propagationPrompt.matchIds.length)}
+                        </button>
+                        <button
+                          type="button"
+                          onMouseDown={(e) => e.preventDefault()}
+                          onClick={dismissPropagation}
+                          className="px-2.5 py-1 rounded-lg bg-surface-2 text-white/70 hover:text-white transition-colors whitespace-nowrap"
+                        >
+                          {t("editor.repeat_only_this") || "Solo esta"}
+                        </button>
+                      </div>
+                    )}
                     {/* Wrap indicator + split action */}
                     {(() => {
                       if (!(seg.text || "").trim()) return null;
