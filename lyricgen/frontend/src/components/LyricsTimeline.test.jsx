@@ -75,6 +75,24 @@ it("dragging commits a new timing via onTimingChange + pushes one undo snapshot"
   expect(props.onFocus).not.toHaveBeenCalled();
 });
 
+it("zoom + makes blocks wider (px/s geometry)", () => {
+  setup();
+  const block = () => screen.getByText("segunda línea").closest("div[title]");
+  const widthBefore = parseFloat(block().style.width);
+  fireEvent.click(screen.getByLabelText("Acercar"));
+  const widthAfter = parseFloat(block().style.width);
+  expect(widthAfter).toBeGreaterThan(widthBefore);
+});
+
+it("shows the save-status chip", () => {
+  cleanup();
+  setup({ saveStatus: "saving" });
+  expect(screen.getByText("Guardando…")).toBeInTheDocument();
+  cleanup();
+  setup({ saveStatus: "saved" });
+  expect(screen.getByText("Guardado")).toBeInTheDocument();
+});
+
 it("locked / dragged block does not crash without setPointerCapture (jsdom)", () => {
   // jsdom elements lack setPointerCapture; the component must tolerate it.
   const props = setup({ segments: [{ _id: 0, start: 0, end: 2, text: "x", locked: true }] });
