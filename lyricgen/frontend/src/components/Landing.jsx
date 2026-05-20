@@ -4,6 +4,27 @@ import BrandLockup from "./BrandLockup";
 export default function Landing({ onStart, onLogin, isLoggedIn = false }) {
   const { t, lang, setLang } = useI18n();
 
+  // Lead form → prefilled mailto (no backend dependency yet; upgrade to /api/leads later)
+  const handleSalesSubmit = (e) => {
+    e.preventDefault();
+    const f = e.target;
+    const name = f.name.value.trim();
+    const company = f.company.value.trim();
+    const email = f.email.value.trim();
+    const volume = f.volume.value;
+    const message = f.message.value.trim();
+    const subject = `GenLy AI — Consulta de ventas${company ? ` (${company})` : ""}`;
+    const body = [
+      `Nombre: ${name}`,
+      `Sello/empresa: ${company}`,
+      `Email: ${email}`,
+      `Volumen estimado: ${volume}`,
+      "",
+      message,
+    ].join("\n");
+    window.location.href = `mailto:tomas@epical.digital?subject=${encodeURIComponent(subject)}&body=${encodeURIComponent(body)}`;
+  };
+
   const FEATURES = [
     {
       title: t("feat.lyrics"),
@@ -126,7 +147,7 @@ export default function Landing({ onStart, onLogin, isLoggedIn = false }) {
                 {t("landing.cta")}
                 <svg className="inline-block ml-2 w-5 h-5" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24" strokeLinecap="round" strokeLinejoin="round"><path d="M5 12h14M12 5l7 7-7 7" /></svg>
               </button>
-              <a href="mailto:tomas@epical.digital?subject=GenLy%20AI%20%E2%80%94%20Demo%20para%20sello" className="btn-secondary text-lg py-4 px-8 inline-flex items-center justify-center">
+              <a href="#contact" className="btn-secondary text-lg py-4 px-8 inline-flex items-center justify-center">
                 {t("landing.cta_demo")}
               </a>
             </div>
@@ -240,6 +261,21 @@ export default function Landing({ onStart, onLogin, isLoggedIn = false }) {
         </div>
       </section>
 
+      {/* Examples — real generated clips */}
+      <section className="relative z-10 py-20 px-6 max-w-5xl mx-auto">
+        <h2 className="text-3xl font-bold text-center mb-4">{t("landing.examples_title")}</h2>
+        <p className="text-gray-500 text-center mb-12 max-w-md mx-auto">{t("landing.examples_sub")}</p>
+        <div className="grid grid-cols-1 sm:grid-cols-3 gap-5">
+          {["/samples/ex1.mp4", "/samples/ex2.mp4", "/samples/ex3.mp4"].map((src) => (
+            <div key={src} className="glass rounded-2xl p-2 glass-hover">
+              <div className="rounded-xl overflow-hidden aspect-video bg-black">
+                <video autoPlay muted loop playsInline className="w-full h-full object-cover" src={src} />
+              </div>
+            </div>
+          ))}
+        </div>
+      </section>
+
       {/* Why GenLy — differentiation */}
       <section className="relative z-10 py-20 px-6 max-w-5xl mx-auto">
         <h2 className="text-3xl font-bold text-center mb-4">{t("landing.why_title")}</h2>
@@ -288,6 +324,22 @@ export default function Landing({ onStart, onLogin, isLoggedIn = false }) {
         </div>
       </section>
 
+      {/* Ownership / rights — the closer */}
+      <section className="relative z-10 py-16 px-6 max-w-4xl mx-auto">
+        <div className="glass rounded-3xl p-10 border border-accent/20 shadow-glow text-center">
+          <h2 className="text-2xl sm:text-3xl font-bold mb-3">{t("landing.own_title")}</h2>
+          <p className="text-gray-400 mb-8 max-w-lg mx-auto">{t("landing.own_sub")}</p>
+          <div className="space-y-4 max-w-2xl mx-auto text-left">
+            {[t("landing.own1"), t("landing.own2"), t("landing.own3")].map((line) => (
+              <div key={line} className="flex gap-3 items-start">
+                <svg className="w-5 h-5 shrink-0 text-accent mt-0.5" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24" strokeLinecap="round" strokeLinejoin="round"><path d="M9 12l2 2 4-4" /><circle cx="12" cy="12" r="10" /></svg>
+                <p className="text-sm text-gray-300 leading-relaxed">{line}</p>
+              </div>
+            ))}
+          </div>
+        </div>
+      </section>
+
       {/* Pricing */}
       <section id="pricing" className="relative z-10 py-24 px-6 max-w-5xl mx-auto scroll-mt-20">
         <h2 className="text-3xl font-bold text-center mb-4">{t("landing.pricing")}</h2>
@@ -309,7 +361,7 @@ export default function Landing({ onStart, onLogin, isLoggedIn = false }) {
               </p>
               <p className="text-xs text-gray-400 leading-relaxed mb-6 flex-1">{plan.desc}</p>
               {plan.contact ? (
-                <a href="mailto:tomas@epical.digital?subject=GenLy%20AI%20%E2%80%94%20Volumen%2FSello" className="btn-secondary w-full py-2.5 rounded-xl text-sm font-medium inline-flex items-center justify-center">
+                <a href="#contact" className="btn-secondary w-full py-2.5 rounded-xl text-sm font-medium inline-flex items-center justify-center">
                   {t("landing.plan_contact_cta")}
                 </a>
               ) : (
@@ -349,6 +401,32 @@ export default function Landing({ onStart, onLogin, isLoggedIn = false }) {
             <svg className="inline-block ml-2 w-5 h-5" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24" strokeLinecap="round" strokeLinejoin="round"><path d="M5 12h14M12 5l7 7-7 7" /></svg>
           </button>
         </div>
+      </section>
+
+      {/* Contact / sales lead form */}
+      <section id="contact" className="relative z-10 py-24 px-6 max-w-2xl mx-auto scroll-mt-20">
+        <h2 className="text-3xl font-bold text-center mb-3">{t("landing.contact_title")}</h2>
+        <p className="text-gray-400 text-center mb-4">{t("landing.contact_sub")}</p>
+        <p className="text-center text-sm text-accent font-medium mb-10 max-w-lg mx-auto">{t("landing.contact_magnet")}</p>
+        <form onSubmit={handleSalesSubmit} className="glass rounded-3xl p-8 space-y-4">
+          <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+            <input name="name" required placeholder={t("landing.form_name")} className="bg-surface-1/60 border border-white/10 rounded-xl px-4 py-3 text-sm text-white placeholder-gray-500 focus:outline-none focus:border-brand/50" />
+            <input name="company" placeholder={t("landing.form_company")} className="bg-surface-1/60 border border-white/10 rounded-xl px-4 py-3 text-sm text-white placeholder-gray-500 focus:outline-none focus:border-brand/50" />
+          </div>
+          <input name="email" type="email" required placeholder={t("landing.form_email")} className="w-full bg-surface-1/60 border border-white/10 rounded-xl px-4 py-3 text-sm text-white placeholder-gray-500 focus:outline-none focus:border-brand/50" />
+          <div>
+            <label className="block text-xs text-gray-500 mb-2">{t("landing.form_volume_label")}</label>
+            <select name="volume" defaultValue={t("landing.form_volume_opt1")} className="w-full bg-surface-1/60 border border-white/10 rounded-xl px-4 py-3 text-sm text-white focus:outline-none focus:border-brand/50">
+              <option>{t("landing.form_volume_opt1")}</option>
+              <option>{t("landing.form_volume_opt2")}</option>
+              <option>{t("landing.form_volume_opt3")}</option>
+            </select>
+          </div>
+          <textarea name="message" rows="3" placeholder={t("landing.form_message")} className="w-full bg-surface-1/60 border border-white/10 rounded-xl px-4 py-3 text-sm text-white placeholder-gray-500 focus:outline-none focus:border-brand/50 resize-none" />
+          <button type="submit" className="btn-primary w-full py-3">{t("landing.form_submit")}</button>
+        </form>
+        {/* TODO(ventas): cuando exista backend, postear a /api/leads en vez de mailto.
+            Drop-in de prueba social real (logos/testimonios de sellos) iría arriba de este form. */}
       </section>
 
       {/* Footer */}
