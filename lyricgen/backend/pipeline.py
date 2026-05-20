@@ -6368,6 +6368,51 @@ def _validate_umg_master(path: str, spec: RenderSpec) -> list[str]:
     return errors
 
 
+def _apply_display_timing(
+    segments: list[dict],
+    duration: float,
+    max_hold_s: float = 4.0,
+    gap_s: float = 0.05,
+) -> list[dict]:
+    """Set each lyric line's on-screen window. Two goals, one pass:
+
+    1. HOLD-UNTIL-NEXT — Whisper/sync set `end` at the last clearly-decoded
+       word, which on long sung lines lands BEFORE the vocal finishes
+       (sustains, melisma), so the text vanished mid-phrase. UMG flagged
+       this on "Costumbres argentinas" 2026-05-19 ("las lyrics se van antes
+       de que se terminen de pronunciar"). We extend each line's display end
+       toward the NEXT line's start (karaoke behaviour), capped at
+       `max_hold_s` so a long instrumental break doesn't leave a line
+       lingering the whole time.
+
+    2. NO-OVERLAP — two subtitles must never render at once. Operator sync
+       edits / batch replays can leave end > next.start; the ceiling
+       (next.start - gap_s) enforces the upper bound.
+
+    Both reduce to: end = min(base_end + max_hold_s, next.start - gap_s),
+    floored to a >=0.3s readable window. The min() makes overlap (ceiling
+    wins) and gap (hold wins) one expression. The last line holds past its
+    final word, capped at `duration`. Returns a new list; input untouched.
+    """
+    if not segments:
+        return segments
+    sorted_segs = sorted(segments, key=lambda s: s["start"])
+    n = len(sorted_segs)
+    cleaned = []
+    for i, seg in enumerate(sorted_segs):
+        base_end = seg["end"]
+        if i + 1 < n:
+            ceiling = sorted_segs[i + 1]["start"] - gap_s
+            new_end = min(base_end + max_hold_s, ceiling)
+            new_end = max(new_end, seg["start"] + 0.3)
+        else:
+            new_end = min(base_end + max_hold_s, duration)
+        if new_end > duration:
+            new_end = duration
+        cleaned.append({**seg, "end": new_end})
+    return cleaned
+
+
 def generate_lyric_video(
     mp3_path: str,
     segments: list[dict],
@@ -6438,25 +6483,10 @@ def generate_lyric_video(
         if dropped:
             logger.info("[RENDER] dropped %s blank segment(s) before render", dropped)
 
-    # Defensive normalization — clamp each segment's end to the next
-    # segment's start (with a 50ms gap) so two subtitles can never
-    # render simultaneously. Operator-edited timestamps from sync mode
-    # can leave end > next.start when lines were anchored closer than
-    # the original duration. Frontend also clamps but we re-clamp here
-    # in case other callers (batch CLI, API replays) bypass it.
+    # Display-timing normalization (hold-until-next + no-overlap). See
+    # _apply_display_timing for the full rationale + the UMG incident.
     if segments:
-        sorted_segs = sorted(segments, key=lambda s: s["start"])
-        cleaned = []
-        for i, seg in enumerate(sorted_segs):
-            new_end = seg["end"]
-            if i + 1 < len(sorted_segs):
-                next_start = sorted_segs[i + 1]["start"]
-                if new_end > next_start - 0.05:
-                    new_end = max(seg["start"] + 0.3, next_start - 0.05)
-            if new_end > duration:
-                new_end = duration
-            cleaned.append({**seg, "end": new_end})
-        segments = cleaned
+        segments = _apply_display_timing(segments, duration)
 
     # Build text clips — each segment gets its own shadow + text
     text_layers = []
