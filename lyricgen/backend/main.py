@@ -6665,10 +6665,48 @@ async def admin_list_change_requests(
         for u in (db.query(User).filter(User.id.in_(user_ids)).all() if user_ids else [])
     }
 
+    # Bulk-fetch the underlying jobs (NO tenant scope — this is an admin-only
+    # endpoint, so the operator legitimately sees every tenant's job here)
+    # plus their owners, so each card can show a preview + who generated the
+    # video. Without these, the operator has to open each job in a separate
+    # tab to know what they're correcting and whom to ask. Requested
+    # 2026-05-20.
+    from database import Job as _JobModel
+    job_ids = list({d.job_id for d in deliveries_by_id.values() if d and d.job_id})
+    jobs_by_jobid = {
+        j.job_id: j
+        for j in (db.query(_JobModel).filter(_JobModel.job_id.in_(job_ids)).all() if job_ids else [])
+    }
+    owner_ids = list({j.user_id for j in jobs_by_jobid.values() if j and j.user_id})
+    owners_by_id = {
+        u.id: u
+        for u in (db.query(User).filter(User.id.in_(owner_ids)).all() if owner_ids else [])
+    }
+
+    # Short-lived signed R2 URLs for the in-card preview. Generated here
+    # (admin context) rather than via the per-tenant /media-token flow,
+    # which would 404 for the admin on another tenant's job. thumbnail for
+    # the still, video for click-to-play. Best-effort: missing keys / R2
+    # disabled just yield None and the card renders without a preview.
+    import storage as _storage
+
+    def _signed(job, file_type: str) -> str | None:
+        try:
+            if not (job and _storage.is_enabled()):
+                return None
+            key = (job.s3_keys or {}).get(file_type)
+            if not key:
+                return None
+            return _storage.generate_signed_url(key, expiry_seconds=3600)
+        except Exception:
+            return None
+
     items = []
     for cr in crs:
         d = deliveries_by_id.get(cr.delivery_id)
         resolver = users_by_id.get(cr.resolved_by_user_id) if cr.resolved_by_user_id else None
+        job = jobs_by_jobid.get(d.job_id) if d and d.job_id else None
+        owner = owners_by_id.get(job.user_id) if job and job.user_id else None
         items.append({
             "id": cr.id,
             "comment": cr.comment,
@@ -6686,6 +6724,15 @@ async def admin_list_change_requests(
                     "job_id": d.job_id,
                     "tenant": d.tenant_snapshot,
                     "removed_at": d.removed_at.isoformat() if d.removed_at else None,
+                    # Who generated the video — so the operator knows whom to
+                    # ask when correcting. Falls back gracefully if the job
+                    # or owner was deleted.
+                    "owner_username": owner.username if owner else None,
+                    "owner_email": owner.email if owner else None,
+                    # In-card preview (signed, ~1h). thumbnail = still,
+                    # video = click-to-play.
+                    "thumbnail_url": _signed(job, "thumbnail"),
+                    "video_url": _signed(job, "video"),
                 }
                 if d
                 else None
