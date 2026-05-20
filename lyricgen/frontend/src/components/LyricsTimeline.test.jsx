@@ -48,40 +48,41 @@ it("Reset button calls onReset", () => {
   expect(props.onReset).toHaveBeenCalledTimes(1);
 });
 
-it("a click (no movement) focuses + seeks, does NOT edit timing", () => {
+it("a click (no movement) focuses + seeks to the clicked point, no edit", () => {
   const props = setup();
   const block = screen.getByText("segunda línea").closest("div[title]");
-  fireEvent.pointerDown(block, { clientX: 100, pointerId: 1 });
-  fireEvent.pointerUp(block, { clientX: 100, pointerId: 1 });
+  // Vertical: clientY → time. jsdom rect.top is 0, so time = clientY/pxPerSec.
+  fireEvent.pointerDown(block, { clientY: 100, pointerId: 1 });
+  fireEvent.pointerUp(block, { clientY: 100, pointerId: 1 });
   expect(props.onFocus).toHaveBeenCalledWith(1);
-  expect(props.onSeek).toHaveBeenCalledWith(10); // segment start
+  expect(props.onSeek).toHaveBeenCalledTimes(1);
+  expect(props.onSeek.mock.calls[0][0]).toBeCloseTo(100 / 40, 2); // ZOOM_DEFAULT=40
   expect(props.onTimingChange).not.toHaveBeenCalled();
 });
 
 it("dragging commits a new timing via onTimingChange + pushes one undo snapshot", () => {
   const props = setup();
   const block = screen.getByText("segunda línea").closest("div[title]");
-  // Drag the block body well past the click slop (delta >> 4px).
-  fireEvent.pointerDown(block, { clientX: 100, pointerId: 1 });
-  fireEvent.pointerMove(block, { clientX: 160, pointerId: 1 }); // +60px = +2s @30px/s
-  fireEvent.pointerUp(block, { clientX: 160, pointerId: 1 });
+  // Vertical drag: drag DOWN (later in time) past the click slop.
+  fireEvent.pointerDown(block, { clientY: 100, pointerId: 1 });
+  fireEvent.pointerMove(block, { clientY: 160, pointerId: 1 }); // +60px = +1.5s @40px/s
+  fireEvent.pointerUp(block, { clientY: 160, pointerId: 1 });
   expect(props.onDragStart).toHaveBeenCalledTimes(1);
   expect(props.onTimingChange).toHaveBeenCalledTimes(1);
   const [id, newStart, newEnd] = props.onTimingChange.mock.calls[0];
   expect(id).toBe(1);
   expect(newStart).toBeGreaterThan(10); // moved later
   expect(newEnd).toBeGreaterThan(11);
-  // click handlers must NOT also fire on a real drag
   expect(props.onFocus).not.toHaveBeenCalled();
 });
 
-it("zoom + makes blocks wider (px/s geometry)", () => {
+it("zoom + makes blocks taller (vertical px/s geometry)", () => {
   setup();
   const block = () => screen.getByText("segunda línea").closest("div[title]");
-  const widthBefore = parseFloat(block().style.width);
+  const hBefore = parseFloat(block().style.height);
   fireEvent.click(screen.getByLabelText("Acercar"));
-  const widthAfter = parseFloat(block().style.width);
-  expect(widthAfter).toBeGreaterThan(widthBefore);
+  const hAfter = parseFloat(block().style.height);
+  expect(hAfter).toBeGreaterThan(hBefore);
 });
 
 it("shows the save-status chip", () => {
@@ -98,8 +99,8 @@ it("locked / dragged block does not crash without setPointerCapture (jsdom)", ()
   const props = setup({ segments: [{ _id: 0, start: 0, end: 2, text: "x", locked: true }] });
   const block = screen.getByText("x").closest("div[title]");
   expect(() => {
-    fireEvent.pointerDown(block, { clientX: 50, pointerId: 1 });
-    fireEvent.pointerUp(block, { clientX: 50, pointerId: 1 });
+    fireEvent.pointerDown(block, { clientY: 50, pointerId: 1 });
+    fireEvent.pointerUp(block, { clientY: 50, pointerId: 1 });
   }).not.toThrow();
   expect(props.onFocus).toHaveBeenCalledWith(0);
 });
