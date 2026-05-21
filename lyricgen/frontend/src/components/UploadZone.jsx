@@ -243,6 +243,19 @@ export default function UploadZone({
   // Sample lyric for the live preview: first file's title, else a placeholder.
   const _previewLyric = (files[0]?.songTitle || files[0]?.title || "").trim();
 
+  // ── Studio Console stepper ─────────────────────────────────────────────
+  // 4 steps revealed one at a time (variant A): the left rail navigates,
+  // the center stage holds the live preview, the right panel shows only the
+  // active step's controls. Step 1 (Subí) gates advancing on the artist name.
+  const WIZARD_STEPS = [
+    { id: 1, label: t("upload.step_upload") || "Subí" },
+    { id: 2, label: t("upload.step_mode") || "Modo" },
+    { id: 3, label: t("upload.step_motion") || "Movimiento" },
+    { id: 4, label: t("upload.step_deliver") || "Entregá" },
+  ];
+  const [wizardStep, setWizardStep] = useState(1);
+  const goStep = (n) => setWizardStep(Math.max(1, Math.min(WIZARD_STEPS.length, n)));
+
   // Set of track indices with the inline "Personalizar" drawer open.
   const [expandedPersonalize, setExpandedPersonalize] = useState(() => new Set());
   const togglePersonalize = (idx) => {
@@ -689,6 +702,13 @@ export default function UploadZone({
             {t("upload.movement_gallery_desc") || "Cómo se anima el fondo del video · no afecta los colores"}
           </p>
         </div>
+        <style>{`
+          @keyframes gal-sm { to { transform: translate(2%,1.4%) scale(1.06); } }
+          @keyframes gal-lg { to { transform: translate(-9%,5%) scale(1.22); } }
+          @keyframes gal-par { to { transform: translate(-5%,0) scale(1.12); } }
+          @keyframes gal-parsun { to { transform: translate(16px,-7px); } }
+          @keyframes gal-anim { to { background-position: 40px 0; } }
+        `}</style>
         <div className="grid grid-cols-2 sm:grid-cols-4 gap-2">
           {MOVEMENT_STYLES.filter((m) => m.sample).map((m) => {
             const active = batchDefaults.movementStyle === m.code;
@@ -704,12 +724,39 @@ export default function UploadZone({
                     : "border-white/[0.06] hover:border-white/[0.20] hover:scale-[1.02]"
                   }`}
               >
-                <div className="aspect-video bg-black/30 relative">
-                  <video
-                    src={m.sample}
-                    className="w-full h-full object-cover pointer-events-none"
-                    muted autoPlay loop playsInline
+                <div className="aspect-video bg-black relative overflow-hidden">
+                  {/* CSS motion demo: SAME base scene, the movement applied per
+                      card so the card communicates the MOVEMENT (not a random
+                      scene). estatico=still, sutil/estandar=drift, parallax=
+                      layered, animado=2D shapes. */}
+                  <div
+                    className="absolute inset-[-24%]"
+                    style={{
+                      background: m.code === "animado"
+                        ? "repeating-linear-gradient(45deg,#6D4AFF 0 14px,#14C8A8 14px 28px)"
+                        : "linear-gradient(135deg,#3a1d6e 0%,#0e3b46 58%,#7a3a12 100%)",
+                      animation: {
+                        estatico: "none",
+                        sutil: "gal-sm 6s ease-in-out infinite alternate",
+                        estandar: "gal-lg 5s ease-in-out infinite alternate",
+                        "foto-parallax": "gal-par 5s ease-in-out infinite alternate",
+                        animado: "gal-anim 1.6s linear infinite",
+                      }[m.code] || "none",
+                    }}
                   />
+                  {m.code !== "animado" && (
+                    <div
+                      className="absolute rounded-full"
+                      style={{
+                        width: "42%", height: "42%", left: "28%", top: "16%",
+                        background: "radial-gradient(circle,rgba(255,210,140,.85),transparent 70%)",
+                        animation: m.code === "foto-parallax" ? "gal-parsun 5s ease-in-out infinite alternate" : "none",
+                      }}
+                    />
+                  )}
+                  {m.code === "estatico" && (
+                    <span className="absolute right-1.5 bottom-1.5 text-[8px] px-1.5 py-0.5 rounded bg-black/55 text-gray-300">{t("upload.movement_static_tag") || "fijo"}</span>
+                  )}
                   {active && (
                     <div className="absolute top-1.5 right-1.5 w-5 h-5 rounded-full bg-brand flex items-center justify-center shadow">
                       <svg className="w-3 h-3 text-white" fill="none" stroke="currentColor" strokeWidth="3" viewBox="0 0 24 24">
@@ -1499,172 +1546,198 @@ export default function UploadZone({
   return (
     <div className="w-full max-w-6xl mx-auto pb-28">
       <UploadTour user={user} />
-      <div className="flex flex-col md:grid md:grid-cols-[minmax(0,1fr)_400px] lg:grid-cols-[minmax(0,1fr)_440px] gap-6 items-start">
+      {files.length === 0 ? (
+        /* Pre-upload — just the drop zone, centered and prominent */
+        <div className="max-w-2xl mx-auto">{_dropZone}</div>
+      ) : (
+      <div className="flex flex-col lg:grid lg:grid-cols-[152px_minmax(0,1fr)_minmax(360px,400px)] gap-5 items-start">
 
-        {/* LEFT COLUMN (stage) — drop zone + live preview + file list */}
-        <div className="space-y-4 min-w-0">
-          {_dropZone}
-          {/* Studio Console stage: live preview of the lyric over the chosen
-              mood + camera movement. Updates as the operator changes palette
-              or movement — see the result before spending a Veo credit. */}
-          {files.length > 0 && bgMode === "auto" && (
-            <div className="md:sticky md:top-4 space-y-2">
-              <WizardLivePreview
-                style={style}
-                movementStyle={batchDefaults.movementStyle}
-                mode={sceneMode}
-                lyric={_previewLyric}
-              />
-              <p className="text-[10px] text-gray-600 px-1">
-                {t("upload.preview_disclaimer") || "Aproximación del mood y el movimiento. El fondo final lo genera la IA."}
-              </p>
+        {/* LEFT — step rail (vertical on desktop, horizontal pills on mobile) */}
+        <nav className="flex lg:flex-col gap-1.5 lg:gap-1 overflow-x-auto lg:overflow-visible lg:sticky lg:top-4 w-full lg:w-auto order-first">
+          {WIZARD_STEPS.map((s) => {
+            const active = wizardStep === s.id;
+            const done = wizardStep > s.id;
+            return (
+              <button
+                key={s.id}
+                type="button"
+                onClick={() => goStep(s.id)}
+                className={`flex items-center gap-2.5 px-3 py-2.5 rounded-xl text-[12.5px] font-medium whitespace-nowrap transition-all text-left shrink-0 ${
+                  active ? "bg-brand/[0.12] text-white ring-1 ring-brand/35"
+                         : "text-gray-400 hover:text-white hover:bg-white/[0.04]"
+                }`}
+              >
+                <span className={`w-6 h-6 rounded-full grid place-items-center text-[11px] font-bold shrink-0 ${
+                  active ? "bg-brand text-white" : done ? "bg-accent/20 text-accent" : "bg-surface-3 text-gray-400"
+                }`}>{done ? "✓" : s.id}</span>
+                {s.label}
+              </button>
+            );
+          })}
+        </nav>
+
+        {/* CENTER — stage: live preview of the result */}
+        <div className="lg:sticky lg:top-4 space-y-2 min-w-0 w-full">
+          {bgMode === "auto" ? (
+            <WizardLivePreview
+              style={style}
+              movementStyle={batchDefaults.movementStyle}
+              mode={sceneMode}
+              lyric={_previewLyric}
+            />
+          ) : (
+            <div className="aspect-video rounded-2xl ring-1 ring-white/[0.08] bg-surface-2/50 grid place-items-center text-gray-500 text-[13px]">
+              {bgMode === "library" ? (t("upload.bg_library") || "Fondo de biblioteca") : (t("upload.bg_custom_tab") || "Fondo subido")}
             </div>
           )}
-          {_filesBlock}
+          <p className="text-[10px] text-gray-600 px-1">
+            {_previewLyric
+              ? `${t("upload.preview_editing") || "Editando"}: ${_previewLyric}${files.length > 1 ? ` · +${files.length - 1}` : ""}`
+              : (t("upload.preview_disclaimer") || "Aproximación del mood y el movimiento. El fondo final lo genera la IA.")}
+          </p>
         </div>
 
-        {/* RIGHT COLUMN — batch settings, sticky on md+ */}
-        {files.length > 0 && (
-          <div className="md:sticky md:top-4 md:self-start space-y-4">
-
-            {/* Batch scope badge */}
-            {files.length > 1 && (
-              <div className="flex items-center gap-1.5 px-1">
-                <span className="inline-flex items-center gap-1.5 text-[10px] text-gray-500 uppercase tracking-[0.16em]">
-                  <svg className="w-3 h-3 shrink-0" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
-                    <path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/>
-                    <path d="M23 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/>
-                  </svg>
-                  Aplica a los {files.length} tracks
-                </span>
-              </div>
-            )}
-
-            {/* STEP 1 — Background source (IA Auto / Biblioteca / Subir) */}
-            <div className="flex items-center gap-2 px-1 pt-1">
-              <span className="w-5 h-5 rounded-full bg-brand text-white text-[11px] font-bold grid place-items-center shrink-0">1</span>
-              <span className="text-[11px] uppercase tracking-[0.16em] text-gray-400 font-medium">{t("upload.step_source") || "Fuente del fondo"}</span>
+        {/* RIGHT — active step controls only (revealed one step at a time) */}
+        <div className="space-y-4 min-w-0 w-full">
+          {files.length > 1 && (
+            <div className="flex items-center gap-1.5 px-1">
+              <span className="inline-flex items-center gap-1.5 text-[10px] text-gray-500 uppercase tracking-[0.16em]">
+                <svg className="w-3 h-3 shrink-0" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
+                  <path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/>
+                  <path d="M23 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/>
+                </svg>
+                Aplica a los {files.length} tracks
+              </span>
             </div>
-            {_bgBlock}
+          )}
 
-            {/* STEP 2 — MODE (the 3 modes) + contextual mood/prompt.
-                Only when the source is IA Auto. The 3 cards map onto existing
-                state: auto→match_lyrics off, lyrics→match_lyrics on,
-                prompt→background_hint (+ bgVerbatim). Replaces the old loose
-                inspired-toggle + prompt-textarea with one clear decision. */}
-            {bgMode === "auto" && (
-              <>
-                <div className="flex items-center gap-2 px-1 pt-2">
-                  <span className="w-5 h-5 rounded-full bg-brand text-white text-[11px] font-bold grid place-items-center shrink-0">2</span>
-                  <span className="text-[11px] uppercase tracking-[0.16em] text-gray-400 font-medium">{t("upload.step_mode") || "Elegí el modo"}</span>
-                </div>
-                <div className="grid grid-cols-1 gap-2">
-                  {[
-                    { code: "auto",   icon: "✨", label: t("upload.mode_auto") || "Auto",                                 desc: t("upload.mode_auto_desc") || "La IA elige la escena por el género y el mood." },
-                    { code: "lyrics", icon: "🎤", label: t("upload.inspired_by_lyrics_label") || "Inspirado en la letra", desc: t("upload.mode_lyrics_desc") || "El fondo nace de lo que dice la canción.", badge: t("upload.mode_edge") || "ÚNICO" },
-                    { code: "prompt", icon: "✍️", label: t("upload.bg_prompt_label_short") || "Mi prompt",                desc: t("upload.mode_prompt_desc") || "Vos describís el fondo, con opción usar tal cual." },
-                  ].map((m) => {
-                    const sel = sceneMode === m.code;
-                    return (
-                      <button
-                        key={m.code}
-                        type="button"
-                        onClick={() => selectSceneMode(m.code)}
-                        className={`text-left rounded-card px-4 py-3 flex items-start gap-3 border transition-all duration-200 ${
-                          sel ? "border-transparent ring-1 ring-brand/50 bg-brand/[0.08] shadow-glow"
-                              : "border-white/[0.06] bg-surface-2/40 hover:border-white/[0.18]"
-                        }`}
-                      >
-                        <span className={`w-9 h-9 rounded-xl grid place-items-center text-[17px] shrink-0 ${sel ? "bg-brand" : "bg-surface-3"}`}>{m.icon}</span>
-                        <span className="min-w-0">
-                          <span className="flex items-center gap-2">
-                            <span className={`text-[13px] font-semibold ${sel ? "text-white" : "text-gray-200"}`}>{m.label}</span>
-                            {m.badge && <span className="text-[8px] font-bold tracking-[0.04em] px-1.5 py-0.5 rounded bg-accent/15 text-accent">{m.badge}</span>}
-                          </span>
-                          <span className="block text-[11px] text-gray-500 mt-0.5 leading-snug">{m.desc}</span>
-                        </span>
-                      </button>
-                    );
-                  })}
-                </div>
+          {/* STEP 1 — Subí: manage files + per-track metadata */}
+          {wizardStep === 1 && (
+            <>
+              {_dropZone}
+              {_filesBlock}
+            </>
+          )}
 
-                {/* Contextual: prompt textarea (prompt mode) OR mood palette (auto/lyrics) */}
-                {sceneMode === "prompt" ? (
-                  <div className="rounded-card bg-surface-2/40 ring-1 ring-white/[0.04] px-4 py-3">
-                    <p className="text-[11px] text-gray-600 mb-2">
-                      {t("upload.bg_prompt_hint") || "Describí el fondo que querés. Manda sobre el género/concepto y la letra."}
-                    </p>
-                    <textarea
-                      value={batchDefaults.backgroundHint || ""}
-                      onChange={(e) => updateBatchDefault("backgroundHint", e.target.value.slice(0, 2000))}
-                      rows={3}
-                      maxLength={2000}
-                      placeholder={t("upload.bg_prompt_placeholder") || "Ej: mansión surreal de noche, pileta vacía, cámara fija, sólo se mueve el reflejo del agua…"}
-                      className="w-full text-[12px] rounded-lg bg-surface-1 border border-white/[0.08] focus:border-brand/50 px-3 py-2 text-gray-200 placeholder:text-gray-600 resize-y outline-none"
-                    />
-                    <label className="mt-2 flex items-center gap-2.5 cursor-pointer">
-                      <input
-                        type="checkbox"
-                        checked={!!batchDefaults.bgVerbatim}
-                        onChange={(e) => updateBatchDefault("bgVerbatim", e.target.checked)}
-                        className="peer sr-only"
-                      />
-                      <div className="relative w-9 h-5 rounded-full bg-surface-3 peer-checked:bg-brand transition-colors duration-200 shrink-0">
-                        <div className="absolute top-0.5 left-0.5 w-4 h-4 rounded-full bg-white shadow transition-transform duration-200 peer-checked:translate-x-4" />
-                      </div>
-                      <span className="text-[11px] text-gray-400">
-                        {t("upload.bg_verbatim_label") || "Usar mi prompt tal cual (sin reescritura de IA)"}
-                      </span>
-                    </label>
-                  </div>
-                ) : onStyleChange && (
-                  <div className="rounded-card bg-surface-2/40 ring-1 ring-white/[0.04] px-4 py-3">
-                    <p className="text-[10px] uppercase tracking-[0.18em] text-gray-500">{t("upload.style_label")}</p>
-                    <p className="text-[11px] text-gray-600 mb-2 mt-0.5">
-                      {t("upload.style_desc") || "Paleta de colores del fondo IA y del gradiente animado"}
-                    </p>
-                    <div className="grid grid-cols-2 gap-2">
-                      {STYLES.map((s) => (
+          {/* STEP 2 — Modo: source + the 3 modes + contextual mood/prompt */}
+          {wizardStep === 2 && (
+            <>
+              {_bgBlock}
+              {bgMode === "auto" && (
+                <>
+                  <div className="grid grid-cols-1 gap-2">
+                    {[
+                      { code: "auto",   icon: "✨", label: t("upload.mode_auto") || "Auto",                                 desc: t("upload.mode_auto_desc") || "La IA elige la escena por el género y el mood." },
+                      { code: "lyrics", icon: "🎤", label: t("upload.inspired_by_lyrics_label") || "Inspirado en la letra", desc: t("upload.mode_lyrics_desc") || "El fondo nace de lo que dice la canción.", badge: t("upload.mode_edge") || "ÚNICO" },
+                      { code: "prompt", icon: "✍️", label: t("upload.bg_prompt_label_short") || "Mi prompt",                desc: t("upload.mode_prompt_desc") || "Vos describís el fondo, con opción usar tal cual." },
+                    ].map((m) => {
+                      const sel = sceneMode === m.code;
+                      return (
                         <button
-                          key={s.code}
+                          key={m.code}
                           type="button"
-                          onClick={() => onStyleChange(s.code)}
-                          className={`flex flex-col items-center gap-2 px-2 py-2.5 rounded-xl border text-[11px] font-medium transition-all duration-200
-                            ${style === s.code
-                              ? "border-brand/50 text-white ring-1 ring-brand/40 scale-[1.02]"
-                              : "border-white/[0.06] text-gray-400 hover:border-white/[0.16] hover:text-white"
-                            }`}
+                          onClick={() => selectSceneMode(m.code)}
+                          className={`text-left rounded-card px-4 py-3 flex items-start gap-3 border transition-all duration-200 ${
+                            sel ? "border-transparent ring-1 ring-brand/50 bg-brand/[0.08] shadow-glow"
+                                : "border-white/[0.06] bg-surface-2/40 hover:border-white/[0.18]"
+                          }`}
                         >
-                          <span
-                            className={`w-full h-7 rounded-lg block ring-1 transition-all duration-200 ${
-                              style === s.code ? "ring-brand/50 shadow-[0_0_12px_2px_rgba(139,92,246,0.3)]" : "ring-white/[0.06]"
-                            }`}
-                            style={{ background: s.swatch }}
-                          />
-                          <span className="leading-tight text-center">
-                            <span className="block font-semibold">{t(s.labelKey)}</span>
-                            <span className="block text-[10px] text-gray-500">{t(s.subKey)}</span>
+                          <span className={`w-9 h-9 rounded-xl grid place-items-center text-[17px] shrink-0 ${sel ? "bg-brand" : "bg-surface-3"}`}>{m.icon}</span>
+                          <span className="min-w-0">
+                            <span className="flex items-center gap-2">
+                              <span className={`text-[13px] font-semibold ${sel ? "text-white" : "text-gray-200"}`}>{m.label}</span>
+                              {m.badge && <span className="text-[8px] font-bold tracking-[0.04em] px-1.5 py-0.5 rounded bg-accent/15 text-accent">{m.badge}</span>}
+                            </span>
+                            <span className="block text-[11px] text-gray-500 mt-0.5 leading-snug">{m.desc}</span>
                           </span>
                         </button>
-                      ))}
-                    </div>
+                      );
+                    })}
                   </div>
-                )}
-              </>
-            )}
 
-            {/* STEP 3 — Movement + metadata (movement gallery + genre/concept) */}
-            <div className="flex items-center gap-2 px-1 pt-2">
-              <span className="w-5 h-5 rounded-full bg-brand text-white text-[11px] font-bold grid place-items-center shrink-0">3</span>
-              <span className="text-[11px] uppercase tracking-[0.16em] text-gray-400 font-medium">{t("upload.step_motion") || "Movimiento"}</span>
-            </div>
-            {_batchSettingsBlock}
+                  {sceneMode === "prompt" ? (
+                    <div className="rounded-card bg-surface-2/40 ring-1 ring-white/[0.04] px-4 py-3">
+                      <p className="text-[11px] text-gray-600 mb-2">
+                        {t("upload.bg_prompt_hint") || "Describí el fondo que querés. Manda sobre el género/concepto y la letra."}
+                      </p>
+                      <textarea
+                        value={batchDefaults.backgroundHint || ""}
+                        onChange={(e) => updateBatchDefault("backgroundHint", e.target.value.slice(0, 2000))}
+                        rows={3}
+                        maxLength={2000}
+                        placeholder={t("upload.bg_prompt_placeholder") || "Ej: mansión surreal de noche, pileta vacía, cámara fija, sólo se mueve el reflejo del agua…"}
+                        className="w-full text-[12px] rounded-lg bg-surface-1 border border-white/[0.08] focus:border-brand/50 px-3 py-2 text-gray-200 placeholder:text-gray-600 resize-y outline-none"
+                      />
+                      <label className="mt-2 flex items-center gap-2.5 cursor-pointer">
+                        <input
+                          type="checkbox"
+                          checked={!!batchDefaults.bgVerbatim}
+                          onChange={(e) => updateBatchDefault("bgVerbatim", e.target.checked)}
+                          className="peer sr-only"
+                        />
+                        <div className="relative w-9 h-5 rounded-full bg-surface-3 peer-checked:bg-brand transition-colors duration-200 shrink-0">
+                          <div className="absolute top-0.5 left-0.5 w-4 h-4 rounded-full bg-white shadow transition-transform duration-200 peer-checked:translate-x-4" />
+                        </div>
+                        <span className="text-[11px] text-gray-400">
+                          {t("upload.bg_verbatim_label") || "Usar mi prompt tal cual (sin reescritura de IA)"}
+                        </span>
+                      </label>
+                    </div>
+                  ) : onStyleChange && (
+                    <div className="rounded-card bg-surface-2/40 ring-1 ring-white/[0.04] px-4 py-3">
+                      <p className="text-[10px] uppercase tracking-[0.18em] text-gray-500">{t("upload.style_label")}</p>
+                      <p className="text-[11px] text-gray-600 mb-2 mt-0.5">
+                        {t("upload.style_desc") || "Paleta de colores del fondo IA y del gradiente animado"}
+                      </p>
+                      <div className="grid grid-cols-2 gap-2">
+                        {STYLES.map((s) => (
+                          <button
+                            key={s.code}
+                            type="button"
+                            onClick={() => onStyleChange(s.code)}
+                            className={`flex flex-col items-center gap-2 px-2 py-2.5 rounded-xl border text-[11px] font-medium transition-all duration-200
+                              ${style === s.code
+                                ? "border-brand/50 text-white ring-1 ring-brand/40 scale-[1.02]"
+                                : "border-white/[0.06] text-gray-400 hover:border-white/[0.16] hover:text-white"
+                              }`}
+                          >
+                            <span
+                              className={`w-full h-7 rounded-lg block ring-1 transition-all duration-200 ${
+                                style === s.code ? "ring-brand/50 shadow-[0_0_12px_2px_rgba(139,92,246,0.3)]" : "ring-white/[0.06]"
+                              }`}
+                              style={{ background: s.swatch }}
+                            />
+                            <span className="leading-tight text-center">
+                              <span className="block font-semibold">{t(s.labelKey)}</span>
+                              <span className="block text-[10px] text-gray-500">{t(s.subKey)}</span>
+                            </span>
+                          </button>
+                        ))}
+                      </div>
+                    </div>
+                  )}
+                </>
+              )}
+            </>
+          )}
 
-            {/* STEP 4 — Delivery (ProRes gated) */}
-            {user?.features?.prores_export && _deliveryBlock}
-          </div>
-        )}
+          {/* STEP 3 — Movimiento + metadata */}
+          {wizardStep === 3 && _batchSettingsBlock}
+
+          {/* STEP 4 — Entregá: delivery + final recap */}
+          {wizardStep === 4 && (
+            <>
+              {user?.features?.prores_export && _deliveryBlock}
+              <div className="rounded-card bg-surface-2/40 ring-1 ring-white/[0.04] px-4 py-3">
+                <p className="text-[10px] uppercase tracking-[0.18em] text-gray-500 mb-1">{t("upload.step_deliver") || "Entregá"}</p>
+                <p className="text-[13px] text-gray-200">{summary}</p>
+                <p className="text-[11px] text-gray-600 mt-1">{t("upload.deliver_hint") || "Revisá los lyrics para ajustar el tiempo, o generá directo."}</p>
+              </div>
+            </>
+          )}
+        </div>
       </div>
+      )}
 
       {/* Sticky bottom CTA bar */}
       {files.length > 0 && (
@@ -1672,10 +1745,10 @@ export default function UploadZone({
           className={`fixed bottom-0 left-0 right-0 z-30 bg-surface-1/85 backdrop-blur-xl border-t border-white/[0.06] px-4 md:px-8 py-4 transition-all duration-300 ${sidebarOpen ? "md:left-64" : "md:left-0"}`}
           data-tour="upload-cta-bar"
         >
-          <div className="max-w-5xl mx-auto flex flex-wrap items-center gap-3">
+          <div className="max-w-6xl mx-auto flex flex-wrap items-center gap-3">
             <div className="flex-1 min-w-0">
               <p className="text-[10px] uppercase tracking-[0.18em] text-gray-500">
-                {files.length > 1 ? (t("upload.batch_summary") || "Lote") : (t("upload.single_settings_title") || "Ajustes del video")}
+                {t("upload.step")} {wizardStep}/{WIZARD_STEPS.length} · {WIZARD_STEPS[wizardStep - 1]?.label}
               </p>
               <p className="text-sm text-white truncate mt-0.5">{summary}</p>
               {!allHaveArtist && (
@@ -1684,26 +1757,51 @@ export default function UploadZone({
                 </p>
               )}
             </div>
-            {onGenerateDirect && (
+
+            {wizardStep > 1 && (
               <button
-                onClick={onGenerateDirect}
-                disabled={!allHaveArtist}
-                className="btn-secondary text-xs h-11 px-4 disabled:opacity-40 disabled:cursor-not-allowed"
+                onClick={() => goStep(wizardStep - 1)}
+                className="btn-secondary text-xs h-11 px-4"
               >
-                {t("upload.generate_direct") || "Generar directo"}
+                {t("upload.back") || "Atrás"}
               </button>
             )}
-            {onStartReview && (
+
+            {wizardStep < WIZARD_STEPS.length ? (
               <button
-                onClick={onStartReview}
-                disabled={!allHaveArtist}
+                onClick={() => goStep(wizardStep + 1)}
+                disabled={wizardStep === 1 && !allHaveArtist}
                 className="btn-primary h-11 px-6 disabled:opacity-40 disabled:cursor-not-allowed"
               >
-                {t("upload.review_lyrics") || "Revisar lyrics"}
+                {t("upload.continue") || "Continuar"}
                 <svg className="inline-block ml-1.5 w-4 h-4 -mt-0.5" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
                   <path d="M5 12h14M12 5l7 7-7 7" />
                 </svg>
               </button>
+            ) : (
+              <>
+                {onGenerateDirect && (
+                  <button
+                    onClick={onGenerateDirect}
+                    disabled={!allHaveArtist}
+                    className="btn-secondary text-xs h-11 px-4 disabled:opacity-40 disabled:cursor-not-allowed"
+                  >
+                    {t("upload.generate_direct") || "Generar directo"}
+                  </button>
+                )}
+                {onStartReview && (
+                  <button
+                    onClick={onStartReview}
+                    disabled={!allHaveArtist}
+                    className="btn-primary h-11 px-6 disabled:opacity-40 disabled:cursor-not-allowed"
+                  >
+                    {t("upload.review_lyrics") || "Revisar lyrics"}
+                    <svg className="inline-block ml-1.5 w-4 h-4 -mt-0.5" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
+                      <path d="M5 12h14M12 5l7 7-7 7" />
+                    </svg>
+                  </button>
+                )}
+              </>
             )}
           </div>
         </div>
