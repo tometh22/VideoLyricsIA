@@ -10,6 +10,11 @@ import { uploadFileToR2 } from "./r2Upload";
 import * as wizardPersistence from "./wizardPersistence";
 import LoginPage from "./components/LoginPage";
 import Landing from "./components/Landing";
+import MarketingLayout from "./components/marketing/MarketingLayout";
+import Artists from "./components/marketing/Artists";
+import Labels from "./components/marketing/Labels";
+import Pricing from "./components/marketing/Pricing";
+import News from "./components/marketing/News";
 import Sidebar from "./components/Sidebar";
 import Dashboard from "./components/Dashboard";
 import HistoryView from "./components/HistoryView";
@@ -1584,18 +1589,17 @@ export default function App() {
       <RootEffects setUser={setUser} setResetToken={setResetToken} setBillingSuccess={setBillingSuccess} />
       {billingSuccess && <BillingSuccessToast onDismiss={() => setBillingSuccess(false)} />}
       <Routes>
-        <Route
-          path="/"
-          element={
-            token
-              ? <Navigate to="/dashboard" replace />
-              : <Landing
-                  onStart={() => navigate("/login")}
-                  onLogin={() => navigate("/login")}
-                  isLoggedIn={false}
-                />
-          }
-        />
+        {/* Public marketing site — shared layout (announcement bar, nav, footer) */}
+        <Route element={<MarketingLayout />}>
+          <Route
+            path="/"
+            element={token ? <Navigate to="/dashboard" replace /> : <Landing />}
+          />
+          <Route path="/artistas" element={<Artists />} />
+          <Route path="/sellos" element={<Labels />} />
+          <Route path="/precios" element={<Pricing />} />
+          <Route path="/novedades" element={<News />} />
+        </Route>
         <Route
           path="/login"
           element={

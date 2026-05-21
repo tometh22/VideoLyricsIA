@@ -1,23 +1,18 @@
-import { useState, useEffect } from "react";
+import { useState } from "react";
+import { Link, useNavigate } from "react-router-dom";
 import { useI18n } from "../i18n";
-import BrandLockup from "./BrandLockup";
 import SocialProofWall from "./SocialProofWall";
 import Testimonials from "./Testimonials";
 
 const API = import.meta.env.VITE_API_URL || "";
 
-export default function Landing({ onStart, onLogin, isLoggedIn = false }) {
-  const { t, lang, setLang } = useI18n();
-
-  // Nav is transparent over the fullscreen video hero, then solidifies once
-  // the user scrolls past the fold so it stays legible over content.
-  const [scrolled, setScrolled] = useState(false);
-  useEffect(() => {
-    const onScroll = () => setScrolled(window.scrollY > 40);
-    onScroll();
-    window.addEventListener("scroll", onScroll, { passive: true });
-    return () => window.removeEventListener("scroll", onScroll);
-  }, []);
+// Home page. Rendered inside MarketingLayout — the nav, announcement bar and
+// footer live in the layout, not here. Navigation actions route to /login.
+export default function Landing() {
+  const { t } = useI18n();
+  const navigate = useNavigate();
+  const onStart = () => navigate("/login");
+  const onLogin = () => navigate("/login");
 
   // Lead form → POST /api/leads. Falls back to a prefilled mailto if the API fails.
   const [formState, setFormState] = useState("idle"); // idle | loading | sent | error
@@ -116,53 +111,7 @@ export default function Landing({ onStart, onLogin, isLoggedIn = false }) {
   ];
 
   return (
-    <div className="min-h-screen bg-surface relative overflow-hidden">
-      <div className="fixed inset-0 pointer-events-none">
-        <div className="absolute top-[-20%] left-[10%] w-[700px] h-[700px] bg-brand/[0.05] rounded-full blur-[150px]" />
-        <div className="absolute bottom-[-10%] right-[5%] w-[500px] h-[500px] bg-brand-light/[0.04] rounded-full blur-[120px]" />
-        <div className="absolute top-[40%] right-[20%] w-[300px] h-[300px] bg-accent/[0.03] rounded-full blur-[100px]" />
-      </div>
-
-      {/* Nav — transparent over the hero video, solidifies on scroll */}
-      <nav className={`fixed top-0 inset-x-0 z-40 transition-all duration-300
-        ${scrolled ? "bg-surface/85 backdrop-blur-xl border-b border-white/[0.06]" : "bg-gradient-to-b from-black/50 to-transparent border-b border-transparent"}`}>
-        <div className="flex items-center justify-between px-8 py-4 max-w-6xl mx-auto">
-          {/* §10 — full lockup in navbar / footer / auth screens.
-              Brand SVG geometry is the single source of truth. */}
-          <BrandLockup size="md" />
-          <div className="hidden md:flex items-center gap-6">
-            <a href="#features" className="text-xs text-gray-300 hover:text-white transition-colors">{t("landing.features")}</a>
-            <a href="#pricing" className="text-xs text-gray-300 hover:text-white transition-colors">{t("landing.pricing")}</a>
-            <a href="#faq" className="text-xs text-gray-300 hover:text-white transition-colors">FAQ</a>
-
-            {/* Language switcher */}
-            <div className="flex items-center gap-1 ml-2">
-              {["es", "en", "pt"].map((code) => (
-                <button
-                  key={code}
-                  onClick={() => setLang(code)}
-                  className={`text-[10px] font-bold px-2 py-1 rounded-md transition-all uppercase
-                    ${lang === code ? "text-white bg-white/10" : "text-gray-400 hover:text-white"}`}
-                >
-                  {code}
-                </button>
-              ))}
-            </div>
-
-            {isLoggedIn ? (
-              <button onClick={onStart} className="btn-primary text-xs py-2 px-5">{t("nav.dashboard")}</button>
-            ) : (
-              <div className="flex items-center gap-2">
-                <button onClick={onLogin} className="text-xs text-gray-300 hover:text-white transition-colors">
-                  {t("login.title")}
-                </button>
-                <button onClick={onLogin} className="btn-primary text-xs py-2 px-5">{t("nav.start")}</button>
-              </div>
-            )}
-          </div>
-          <button onClick={isLoggedIn ? onStart : onLogin} className="md:hidden btn-primary text-xs py-2 px-5">{t("nav.start")}</button>
-        </div>
-      </nav>
+    <>
 
       {/* Hero — kinetic lyric typography over a neon stage. The words animate
           in like a lyric video; minimal chrome; one strong CTA. */}
@@ -229,6 +178,25 @@ export default function Landing({ onStart, onLogin, isLoggedIn = false }) {
               <p className="text-4xl font-bold bg-gradient-to-r from-white to-gray-400 bg-clip-text text-transparent">{s.value}</p>
               <p className="text-xs text-gray-500 mt-1">{s.label}</p>
             </div>
+          ))}
+        </div>
+      </section>
+
+      {/* Audience routing — send artists and labels to their own page */}
+      <section className="relative z-10 py-16 px-6 max-w-5xl mx-auto">
+        <div className="grid sm:grid-cols-2 gap-5">
+          {[
+            { to: "/artistas", t: t("home.aud_artists_t"), d: t("home.aud_artists_d") },
+            { to: "/sellos", t: t("home.aud_labels_t"), d: t("home.aud_labels_d") },
+          ].map((a) => (
+            <Link key={a.to} to={a.to} className="glass rounded-3xl p-8 glass-hover group flex flex-col">
+              <h3 className="text-xl font-bold mb-2">{a.t}</h3>
+              <p className="text-sm text-gray-400 leading-relaxed flex-1">{a.d}</p>
+              <span className="mt-4 inline-flex items-center gap-1.5 text-sm font-medium text-brand-light group-hover:gap-2.5 transition-all">
+                {t("home.aud_cta")}
+                <svg className="w-4 h-4" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24" strokeLinecap="round" strokeLinejoin="round"><path d="M5 12h14M12 5l7 7-7 7" /></svg>
+              </span>
+            </Link>
           ))}
         </div>
       </section>
@@ -569,48 +537,6 @@ export default function Landing({ onStart, onLogin, isLoggedIn = false }) {
             Drop-in de prueba social real (logos/testimonios de sellos) iría arriba de este form. */}
       </section>
 
-      {/* Footer */}
-      <footer className="relative z-10 border-t border-white/[0.06] pt-14 pb-8 px-8">
-        <div className="max-w-6xl mx-auto grid grid-cols-2 sm:grid-cols-4 gap-8">
-          <div className="col-span-2 sm:col-span-1">
-            <BrandLockup size="md" />
-            <p className="text-xs text-gray-600 mt-3 leading-relaxed max-w-[14rem]">{t("footer.tagline")}</p>
-          </div>
-          <div>
-            <p className="text-xs font-semibold text-gray-300 uppercase tracking-wider mb-3">{t("footer.col_product")}</p>
-            <ul className="space-y-2 text-sm text-gray-500">
-              <li><a href="#features" className="hover:text-white transition-colors">{t("landing.features")}</a></li>
-              <li><a href="#pricing" className="hover:text-white transition-colors">{t("landing.pricing")}</a></li>
-              <li><a href="#examples" className="hover:text-white transition-colors">{t("landing.examples_title")}</a></li>
-              <li><a href="#faq" className="hover:text-white transition-colors">FAQ</a></li>
-            </ul>
-          </div>
-          <div>
-            <p className="text-xs font-semibold text-gray-300 uppercase tracking-wider mb-3">{t("footer.col_company")}</p>
-            <ul className="space-y-2 text-sm text-gray-500">
-              <li><a href="#contact" className="hover:text-white transition-colors">{t("footer.contact")}</a></li>
-              <li><a href="mailto:tomas@epical.digital" className="hover:text-white transition-colors">tomas@epical.digital</a></li>
-            </ul>
-          </div>
-          <div>
-            <p className="text-xs font-semibold text-gray-300 uppercase tracking-wider mb-3">{t("footer.col_legal")}</p>
-            <ul className="space-y-2 text-sm text-gray-500">
-              <li><a href="#faq" className="hover:text-white transition-colors">{t("footer.rights")}</a></li>
-            </ul>
-          </div>
-        </div>
-        <div className="max-w-6xl mx-auto mt-12 pt-6 border-t border-white/[0.04] flex flex-col sm:flex-row items-center justify-between gap-3">
-          <p className="text-xs text-gray-600">© {new Date().getFullYear()} {t("landing.footer")}</p>
-          <div className="flex items-center gap-1">
-            {["es", "en", "pt"].map((code) => (
-              <button key={code} onClick={() => setLang(code)}
-                className={`text-[10px] font-bold px-2 py-1 rounded-md transition-all uppercase ${lang === code ? "text-white bg-white/10" : "text-gray-600 hover:text-gray-400"}`}>
-                {code}
-              </button>
-            ))}
-          </div>
-        </div>
-      </footer>
-    </div>
+    </>
   );
 }
