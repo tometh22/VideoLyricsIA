@@ -1158,23 +1158,6 @@ export default function LyricsEditor({
   const estimateVoiceEndDuration = (text) =>
     Math.max(TRIM_FLOOR_S, (text || "").length * TRIM_PER_CHAR_S + TRIM_MARGIN_S);
 
-  /** Cap a single segment's `end` to the estimated voice-end of its text.
-   * Used by the per-row ✂ button — operator marks one hanging line at a
-   * time. ONLY modifies the `end` of the matched segment; no other
-   * segment is touched, and `start` is preserved. */
-  const trimSeg = (id) => {
-    pushEditHistory();
-    setEdited((prev) =>
-      prev.map((seg) => {
-        if (seg._id !== id) return seg;
-        const dur = seg.end - seg.start;
-        const cap = estimateVoiceEndDuration(seg.text);
-        if (dur <= cap) return seg;  // already short enough
-        return { ...seg, end: seg.start + cap };
-      }),
-    );
-  };
-
   /** Bulk: trim every segment whose duration exceeds the cap. Each
    * segment is trimmed independently — only its own `end` is modified
    * based on its own text length and start. No cross-segment effect. */
@@ -2161,33 +2144,9 @@ export default function LyricsEditor({
                         <path d="M5 15V5a1 1 0 011-1h10" />
                       </svg>
                     </button>
-                    {/* ✂ Trim line: caps `end` to estimated voice-end so the
-                        text doesn't stay pinned through a fill / outro. Only
-                        renders when the current duration exceeds the cap.
-
-                        Unlike the other row actions (duplicate, split, delete)
-                        which are hover-only, this button is **always visible**
-                        on hanging lines because it doubles as an INDICATOR —
-                        when the operator opens the editor on a song with 12
-                        hanging lines, all 12 ✂ icons are visible at once so
-                        the operator can scan and decide per-line without
-                        hovering each row. Faded baseline opacity so it doesn't
-                        compete visually with the lyric text; goes full opacity
-                        on hover when the operator is targeting it. */}
-                    {(seg.end - seg.start) > estimateVoiceEndDuration(seg.text) && (
-                      <button onClick={() => trimSeg(seg._id)}
-                        className="w-8 h-8 rounded-lg opacity-60 hover:opacity-100
-                          hover:bg-amber-500/15 flex items-center justify-center text-amber-500/80
-                          hover:text-amber-400 transition-all"
-                        title={t("editor.trim_line") ||
-                          "Recortar al final natural (cuando la voz termina y empieza un fill)"}>
-                        <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
-                          <circle cx="6" cy="6" r="3" />
-                          <circle cx="6" cy="18" r="3" />
-                          <path d="M20 4L8.12 15.88M14.47 14.48L20 20M8.12 8.12L12 12" />
-                        </svg>
-                      </button>
-                    )}
+                    {/* Per-row ✂ trim removed: redundant with the bulk
+                        "Recortar N líneas con texto colgado · Aplicar" auto-fix
+                        at the top, and timing is now handled in the timeline. */}
                     <button onClick={() => deleteSeg(seg._id)}
                       className="w-8 h-8 rounded-lg opacity-0 group-hover:opacity-100
                         hover:bg-red-500/10 flex items-center justify-center text-gray-600

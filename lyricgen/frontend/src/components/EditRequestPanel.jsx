@@ -106,6 +106,9 @@ export default function EditRequestPanel({
   // Audio peak envelope for the timeline waveform. Best-effort: null →
   // timeline renders without a waveform.
   const [lyricsWaveform, setLyricsWaveform] = useState(null);
+  // Signed URL of the cached background video for the live preview.
+  // Best-effort: null → preview uses a style gradient.
+  const [lyricsBgUrl, setLyricsBgUrl] = useState(null);
   // Operator-typed background hint for edit_type="background". Empty
   // string when the operator hasn't typed anything (we send no field in
   // that case and the pipeline falls back to Gemini's lyrics-only
@@ -323,12 +326,20 @@ export default function EditRequestPanel({
     setLyricsAudioError(null);
     setLyricsAudioUrl(null);
     setLyricsWaveform(null);
+    setLyricsBgUrl(null);
     // Waveform for the timeline — best-effort, never blocks the editor.
     (async () => {
       try {
         const r = await fetch(`${API}/jobs/${job.job_id}/waveform`, { headers: authHeaders() });
         if (!cancelled && r.ok) setLyricsWaveform(await r.json());
       } catch { /* timeline just renders without a waveform */ }
+    })();
+    // Cached background for the live preview — best-effort.
+    (async () => {
+      try {
+        const r = await fetch(`${API}/jobs/${job.job_id}/background-url`, { headers: authHeaders() });
+        if (!cancelled && r.ok) setLyricsBgUrl((await r.json()).url);
+      } catch { /* preview falls back to a gradient */ }
     })();
     (async () => {
       try {
@@ -981,6 +992,7 @@ export default function EditRequestPanel({
         onClose={() => { setMode(null); setError(null); setStaleSegments(null); }}
         audioUrl={lyricsAudioUrl}
         waveform={lyricsWaveform}
+        previewBgUrl={lyricsBgUrl}
         onApprove={submitLyricsWithSegments}
         submitting={submitting}
         initialParams={initialParams}
@@ -1000,7 +1012,7 @@ export default function EditRequestPanel({
  */
 function LyricsEditModal({
   open, audioError, error, staleRerender, onForceRerender, job, segments,
-  onSavedSegments, onClose, audioUrl, waveform, onApprove, submitting, initialParams, t,
+  onSavedSegments, onClose, audioUrl, waveform, previewBgUrl, onApprove, submitting, initialParams, t,
 }) {
   // Scroll the modal back to the top whenever a banner appears, so the
   // error / stale-rerender notice is never stranded above the fold while the
@@ -1102,6 +1114,7 @@ function LyricsEditModal({
               audioFile={null}
               audioUrl={audioUrl}
               waveform={waveform}
+              previewBgUrl={previewBgUrl}
               referenceLyrics=""
               onApprove={onApprove}
               onBack={onClose}

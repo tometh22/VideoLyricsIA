@@ -12,7 +12,7 @@
  * what the render pipeline already produces. Edits commit through the parent
  * (onLayoutChange → setEdited) — this component owns no persistence.
  */
-import { useCallback, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 // Base font size as a fraction of frame WIDTH at scale=1. ~85px / 1920px in
 // the render → keeps the preview proportional to the real output.
@@ -43,10 +43,23 @@ export default function LyricVideoPreview({
   onSelect,               // (id) => void — bidirectional selection w/ list/timeline
   onLayoutChange,         // (id, {pos, scale, rot}) => void — commit
   onDragStart,            // () => void — push one undo snapshot
+  showSafeArea = true,    // broadcast-safe guide
 }) {
   const frameRef = useRef(null);
+  const bgVideoRef = useRef(null);
   const dragRef = useRef(null);  // {mode, id, ...origin}
   const [live, setLive] = useState(null); // {id, pos, scale, rot} during drag
+
+  // Keep the background frame in step with the audio scrub. The bg video is
+  // a short seamless loop, so map the audio time into it via modulo. Guarded
+  // for jsdom (no video impl) and NaN duration before metadata loads.
+  useEffect(() => {
+    const v = bgVideoRef.current;
+    if (!v || !backgroundUrl) return;
+    const dur = v.duration;
+    if (!dur || !isFinite(dur)) return;
+    try { v.currentTime = currentTime % dur; } catch { /* not seekable yet */ }
+  }, [currentTime, backgroundUrl]);
 
   // The line on screen = the one whose [start,end] contains currentTime.
   const activeSeg = useMemo(() => {
@@ -141,14 +154,43 @@ export default function LyricVideoPreview({
     >
       {backgroundUrl && (
         <video
-          ref={videoRef}
+          ref={(el) => { bgVideoRef.current = el; if (videoRef) videoRef.current = el; }}
           src={backgroundUrl}
-          muted playsInline
+          muted playsInline preload="auto"
           className="absolute inset-0 w-full h-full object-cover"
         />
       )}
       <div className="absolute inset-0 pointer-events-none"
         style={{ background: "radial-gradient(130% 80% at 50% 120%,transparent,rgba(0,0,0,.5))" }} />
+
+      {/* Broadcast-safe area guide (keeps text off the edges). */}
+      {showSafeArea && (
+        <div className="absolute pointer-events-none rounded"
+          style={{ inset: "5%", border: "1px dashed rgba(255,255,255,.12)" }} />
+      )}
+
+      {/* Readouts + reset for the selected line. */}
+      {activeSeg && l && (
+        <div className="absolute top-2 right-2 flex items-center gap-1.5 z-10">
+          <span className="rounded-md bg-black/55 backdrop-blur-sm ring-1 ring-white/10 px-2 py-1 text-[10px] text-white/80 tabular-nums">
+            {Math.round(l.scale * 100)}% · {Math.round(l.rot)}°
+          </span>
+          {(l.scale !== 1 || l.rot !== 0 || l.pos.x !== DEFAULT_POS.x || l.pos.y !== DEFAULT_POS.y) && (
+            <button
+              type="button"
+              className="rounded-md bg-black/55 backdrop-blur-sm ring-1 ring-white/10 px-2 py-1 text-[10px] text-white/80 hover:text-white hover:ring-white/25"
+              onClick={(e) => {
+                e.stopPropagation();
+                onDragStart?.();
+                onLayoutChange?.(activeSeg._id, { pos: DEFAULT_POS, scale: 1, rot: 0 });
+              }}
+              title="Volver esta línea al centro, tamaño y orientación por defecto"
+            >
+              ↺ Resetear
+            </button>
+          )}
+        </div>
+      )}
 
       {activeSeg && l && (
         <div
