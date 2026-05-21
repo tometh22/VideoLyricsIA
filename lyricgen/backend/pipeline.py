@@ -7092,8 +7092,11 @@ def generate_lyric_video(
 
             if has_long_intro:
                 # ----- CENTRED FULL CARD (long intro) -----
-                artist_size = max(30, int(round(62 * scale)))
-                title_size = max(24, int(round(46 * scale)))
+                # Hero sizes: artist bigger than the 85px lyric tier, song
+                # secondary. Mirrors ass_render.title_card_lines. Bumped 2026-05
+                # (old 62/46 read smaller than the lyrics).
+                artist_size = max(30, int(round(100 * scale)))
+                title_size = max(24, int(round(62 * scale)))
                 card_width = int(round(spec.width * 0.80))
                 stroke_w = max(1, int(round(1.6 * scale)))
                 title_end = min(first_lyric_start - 0.2, START_T + 8.0)

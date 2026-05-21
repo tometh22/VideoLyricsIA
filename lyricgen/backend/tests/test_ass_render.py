@@ -267,8 +267,8 @@ def test_title_card_long_intro_centred_card():
     assert artist.font_name == "Montserrat ExtraBold"
     assert song.text == "De Música Ligera" and song.bold is False
     assert song.font_name == "Oswald"
-    # Sizes mirror moviepy tiers at scale 1.0.
-    assert artist.fontsize == 62 and song.fontsize == 46
+    # Hero sizes mirror moviepy tiers at scale 1.0 (artist > 85px lyric tier).
+    assert artist.fontsize == 100 and song.fontsize == 62
     # Visible 0.3s → min(first_lyric-0.2, 8.3) = 4.8s.
     assert artist.start_s == 0.3 and abs(artist.end_s - 4.8) < 1e-9
     # Per-line opacity mapped to \1a alpha.

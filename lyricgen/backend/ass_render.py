@@ -235,8 +235,11 @@ def title_card_lines(
     has_long_intro = first_lyric_start > START_T + 0.5
 
     if has_long_intro:
-        artist_size = max(30, int(round(62 * text_scale)))
-        title_size = max(24, int(round(46 * text_scale)))
+        # Hero title card: artist is the prominent line (bigger than the 85px
+        # lyric tier), song title secondary. Bumped 2026-05 — the old 62/46
+        # read smaller than the lyrics, which felt wrong for the intro moment.
+        artist_size = max(30, int(round(100 * text_scale)))
+        title_size = max(24, int(round(62 * text_scale)))
         title_end = min(first_lyric_start - 0.2, START_T + 8.0)
         clip_dur = max(0.1, title_end - START_T)
         fade_in = min(0.4, max(0.1, clip_dur * 0.25))
