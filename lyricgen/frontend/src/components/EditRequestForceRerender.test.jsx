@@ -78,7 +78,7 @@ const editPosted = (calls) =>
   calls.some((c) => c.url.includes("/edit/") && (c.opts?.method || "").toUpperCase() === "POST");
 
 async function openModal(user) {
-  await user.click(screen.getByRole("button", { name: /Corregir letras/i }));
+  await user.click(screen.getByRole("button", { name: /Editar letras y estilo/i }));
   await waitFor(() => expect(screen.getByTestId("mock-editor")).toBeInTheDocument());
 }
 

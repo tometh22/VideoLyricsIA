@@ -386,7 +386,7 @@ export default function JobDetail({ job, onBack, onJobUpdate }) {
   //   - rejected       → lyrics only (recovery path instead of re-upload)
   const canEditLyrics = isPendingReview || isDone || isRejected;
   const editPanelAllowedModes = isPendingReview
-    ? ["typography", "lyrics", "background"]
+    ? ["lyrics", "background"]
     : ["lyrics"];
 
   // While the worker is re-rendering an edit request, poll /status every
