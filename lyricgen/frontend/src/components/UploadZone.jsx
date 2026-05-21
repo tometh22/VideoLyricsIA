@@ -1496,8 +1496,10 @@ export default function UploadZone({
               </div>
             )}
 
-            {/* 1. Visual style */}
-            {onStyleChange && (
+            {/* 1. Visual style — IA-only knob (paleta del fondo generado).
+                Solo aparece cuando la fuente es IA Auto; con Biblioteca/Subir
+                no aplica, así no se mezcla con el resto. */}
+            {onStyleChange && bgMode === "auto" && (
               <div className="rounded-card bg-surface-2/40 ring-1 ring-white/[0.04] px-4 py-3">
                 <p className="text-[10px] uppercase tracking-[0.18em] text-gray-500">{t("upload.style_label")}</p>
                 <p className="text-[11px] text-gray-600 mb-2 mt-0.5">
@@ -1539,7 +1541,7 @@ export default function UploadZone({
                 Surfaced here because UMG (2026-05-14) saw ~80% of rock
                 tracks rendered as alleys — operator now has a visible
                 lever and can audit which mode produced each video. */}
-            {onInspiredByLyricsChange && (
+            {onInspiredByLyricsChange && bgMode === "auto" && (
               <label className="rounded-card bg-surface-2/40 ring-1 ring-white/[0.04] px-4 py-3 flex items-center gap-3 cursor-pointer hover:ring-white/[0.08] transition-colors">
                 <input
                   type="checkbox"
