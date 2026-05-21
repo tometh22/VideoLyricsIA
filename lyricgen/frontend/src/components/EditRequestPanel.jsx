@@ -318,9 +318,10 @@ export default function EditRequestPanel({
       // background to a locked one.
       p.movement_style = movementStyle;
       // Verbatim only applies to Veo + a non-empty hint; never with Imagen.
-      if (bgVerbatim && hint && backgroundMode !== "imagen") {
-        p.bg_verbatim = true;
-      }
+      // ALWAYS send the boolean so unchecking the toggle clears a
+      // previously-persisted True on the backend (symmetric with the backend
+      // which always overwrites bg_verbatim for background edits).
+      p.bg_verbatim = !!(bgVerbatim && hint && backgroundMode !== "imagen");
       // Always send one of the two flags based purely on operator intent.
       // The tenant-conditional version silently dropped BOTH flags when
       // frontend tenant detection failed (stale localStorage, old login)

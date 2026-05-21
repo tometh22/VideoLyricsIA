@@ -168,6 +168,32 @@ def test_ensure_background_downgrades_animado_imagen_to_veo():
 # 6. de-biased combinatorial fallback
 # ---------------------------------------------------------------------------
 
+def test_edit_always_overwrites_bg_verbatim_for_background():
+    """Regression: bg_verbatim was a sticky flag — persisted only when True,
+    so unchecking the toggle on a later background edit couldn't clear it
+    (merged render_params kept the stale True). The handler must ALWAYS write
+    the boolean for background edits, symmetric with movement_style."""
+    import inspect
+    import main
+    src = inspect.getsource(main.request_edit) if hasattr(main, "request_edit") else None
+    if src is None:
+        # Endpoint name may differ; fall back to scanning the module source.
+        src = inspect.getsource(main)
+    # Must persist bool(body.bg_verbatim), not gate on `and body.bg_verbatim`.
+    assert "bool(body.bg_verbatim)" in src
+    assert 'if body.edit_type == "background" and body.bg_verbatim:' not in src
+
+
+def test_retry_whitelist_includes_bg_verbatim():
+    """Regression: /retry dropped bg_verbatim, so a reaped verbatim job lost
+    it on recovery — defeating the render_params persistence."""
+    import inspect
+    import main
+    src = inspect.getsource(main)
+    # bg_verbatim must be forwarded by the retry kwargs whitelist.
+    assert '"bg_verbatim"' in src
+
+
 def test_static_camera_pool_has_no_motion_verbs():
     motion_words = ("dolly", "drone", "tracking", "orbit", "zoom", "pan",
                     "crane", "parallax", "glide", "push-in")

@@ -5271,13 +5271,17 @@ async def request_edit(
         _rp_mv = dict(job.render_params or {})
         _rp_mv["movement_style"] = _mv
         job.render_params = _rp_mv
-    if body.edit_type == "background" and body.bg_verbatim:
+    if body.edit_type == "background":
         # "Usar mi prompt tal cual" — send background_hint straight to Veo.
-        # Only forwarded when True; persisted durably so a reaped retry and
-        # the next edit both honour it.
-        edit_params["bg_verbatim"] = True
+        # ALWAYS write the boolean (not only when True) so unchecking the
+        # toggle on a later background edit clears a previously-persisted
+        # True. Symmetric with movement_style above. The frontend always
+        # sends bg_verbatim for background edits. Persisted durably so a
+        # reaped /retry (whitelist includes bg_verbatim) honours it too.
+        _bv = bool(body.bg_verbatim)
+        edit_params["bg_verbatim"] = _bv
         _rp_v = dict(job.render_params or {})
-        _rp_v["bg_verbatim"] = True
+        _rp_v["bg_verbatim"] = _bv
         job.render_params = _rp_v
     if body.edit_type == "background" and body.bypass_content_validation:
         # Forward only when explicitly True; pipeline's tenant-gated
@@ -5815,7 +5819,7 @@ async def retry_job(
     for k in ("font", "font_scale", "text_case", "lyric_transition",
               "text_motion", "text_contrast", "movement_style",
               "animate_image", "genre", "match_lyrics",
-              "background_hint", "concept"):
+              "background_hint", "concept", "bg_verbatim"):
         if k in _retry_render_params and _retry_render_params[k] not in (None, ""):
             retry_pipeline_kwargs[k] = _retry_render_params[k]
 
@@ -6101,7 +6105,7 @@ async def create_variant(
     # run_pipeline acepta. concept también va por kwarg.
     for k in ("font", "font_scale", "text_case", "lyric_transition",
               "text_motion", "text_contrast", "movement_style",
-              "animate_image", "genre", "match_lyrics"):
+              "animate_image", "genre", "match_lyrics", "bg_verbatim"):
         if k in new_render_params:
             pipeline_kwargs[k] = new_render_params[k]
     if body.concept is not None:
