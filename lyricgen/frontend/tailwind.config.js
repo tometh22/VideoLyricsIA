@@ -91,8 +91,23 @@ export default {
         "gradient-x": "gradient-x 6s ease infinite",
         "slide-up":   "slide-up 0.5s ease-out",
         "fade-in":    "fade-in 0.6s ease-out",
+        "drift":      "drift 16s ease-in-out infinite",
+        "eq":         "eq 1s ease-in-out infinite",
+        "word-in":    "word-in 0.6s ease-out both",
       },
       keyframes: {
+        "drift": {
+          "0%, 100%": { transform: "translate(0, 0)" },
+          "50%":      { transform: "translate(40px, -30px)" },
+        },
+        "eq": {
+          "0%, 100%": { height: "6px" },
+          "50%":      { height: "22px" },
+        },
+        "word-in": {
+          "0%":   { opacity: 0, transform: "translateY(18px)" },
+          "100%": { opacity: 1, transform: "translateY(0)" },
+        },
         "gradient-x": {
           "0%, 100%": { backgroundPosition: "0% 50%" },
           "50%":      { backgroundPosition: "100% 50%" },

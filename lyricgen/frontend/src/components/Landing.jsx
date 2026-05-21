@@ -1,11 +1,23 @@
-import { useState } from "react";
+import { useState, useEffect } from "react";
 import { useI18n } from "../i18n";
 import BrandLockup from "./BrandLockup";
+import SocialProofWall from "./SocialProofWall";
+import Testimonials from "./Testimonials";
 
 const API = import.meta.env.VITE_API_URL || "";
 
 export default function Landing({ onStart, onLogin, isLoggedIn = false }) {
   const { t, lang, setLang } = useI18n();
+
+  // Nav is transparent over the fullscreen video hero, then solidifies once
+  // the user scrolls past the fold so it stays legible over content.
+  const [scrolled, setScrolled] = useState(false);
+  useEffect(() => {
+    const onScroll = () => setScrolled(window.scrollY > 40);
+    onScroll();
+    window.addEventListener("scroll", onScroll, { passive: true });
+    return () => window.removeEventListener("scroll", onScroll);
+  }, []);
 
   // Lead form → POST /api/leads. Falls back to a prefilled mailto if the API fails.
   const [formState, setFormState] = useState("idle"); // idle | loading | sent | error
@@ -97,6 +109,10 @@ export default function Landing({ onStart, onLogin, isLoggedIn = false }) {
     { q: t("faq.q4"), a: t("faq.a4") },
     { q: t("faq.q5"), a: t("faq.a5") },
     { q: t("faq.q6"), a: t("faq.a6") },
+    { q: t("faq.q7"), a: t("faq.a7") },
+    { q: t("faq.q8"), a: t("faq.a8") },
+    { q: t("faq.q9"), a: t("faq.a9") },
+    { q: t("faq.q10"), a: t("faq.a10") },
   ];
 
   return (
@@ -107,16 +123,17 @@ export default function Landing({ onStart, onLogin, isLoggedIn = false }) {
         <div className="absolute top-[40%] right-[20%] w-[300px] h-[300px] bg-accent/[0.03] rounded-full blur-[100px]" />
       </div>
 
-      {/* Sticky Nav */}
-      <nav className="sticky top-0 z-30 bg-surface/80 backdrop-blur-xl border-b border-white/[0.04]">
+      {/* Nav — transparent over the hero video, solidifies on scroll */}
+      <nav className={`fixed top-0 inset-x-0 z-40 transition-all duration-300
+        ${scrolled ? "bg-surface/85 backdrop-blur-xl border-b border-white/[0.06]" : "bg-gradient-to-b from-black/50 to-transparent border-b border-transparent"}`}>
         <div className="flex items-center justify-between px-8 py-4 max-w-6xl mx-auto">
           {/* §10 — full lockup in navbar / footer / auth screens.
               Brand SVG geometry is the single source of truth. */}
           <BrandLockup size="md" />
           <div className="hidden md:flex items-center gap-6">
-            <a href="#features" className="text-xs text-gray-400 hover:text-white transition-colors">{t("landing.features")}</a>
-            <a href="#pricing" className="text-xs text-gray-400 hover:text-white transition-colors">{t("landing.pricing")}</a>
-            <a href="#faq" className="text-xs text-gray-400 hover:text-white transition-colors">FAQ</a>
+            <a href="#features" className="text-xs text-gray-300 hover:text-white transition-colors">{t("landing.features")}</a>
+            <a href="#pricing" className="text-xs text-gray-300 hover:text-white transition-colors">{t("landing.pricing")}</a>
+            <a href="#faq" className="text-xs text-gray-300 hover:text-white transition-colors">FAQ</a>
 
             {/* Language switcher */}
             <div className="flex items-center gap-1 ml-2">
@@ -125,7 +142,7 @@ export default function Landing({ onStart, onLogin, isLoggedIn = false }) {
                   key={code}
                   onClick={() => setLang(code)}
                   className={`text-[10px] font-bold px-2 py-1 rounded-md transition-all uppercase
-                    ${lang === code ? "text-white bg-white/10" : "text-gray-600 hover:text-gray-400"}`}
+                    ${lang === code ? "text-white bg-white/10" : "text-gray-400 hover:text-white"}`}
                 >
                   {code}
                 </button>
@@ -136,7 +153,7 @@ export default function Landing({ onStart, onLogin, isLoggedIn = false }) {
               <button onClick={onStart} className="btn-primary text-xs py-2 px-5">{t("nav.dashboard")}</button>
             ) : (
               <div className="flex items-center gap-2">
-                <button onClick={onLogin} className="text-xs text-gray-400 hover:text-white transition-colors">
+                <button onClick={onLogin} className="text-xs text-gray-300 hover:text-white transition-colors">
                   {t("login.title")}
                 </button>
                 <button onClick={onLogin} className="btn-primary text-xs py-2 px-5">{t("nav.start")}</button>
@@ -147,54 +164,69 @@ export default function Landing({ onStart, onLogin, isLoggedIn = false }) {
         </div>
       </nav>
 
-      {/* Hero */}
-      <section className="relative z-10 pt-16 pb-8 px-6 max-w-6xl mx-auto">
-        <div className="text-center max-w-4xl mx-auto">
-          <div className="inline-block px-4 py-1.5 rounded-full glass text-xs text-gray-400 mb-6 animate-fade-in">
-            {t("landing.badge")}
+      {/* Hero — kinetic lyric typography over a neon stage. The words animate
+          in like a lyric video; minimal chrome; one strong CTA. */}
+      <section className="relative min-h-screen w-full overflow-hidden flex flex-col">
+        {/* Neon stage: drifting glows + faint grid */}
+        <div className="absolute inset-0 overflow-hidden pointer-events-none">
+          <div className="absolute -top-[20%] -left-[10%] w-[60vw] h-[60vw] rounded-full bg-brand/40 blur-[130px] animate-drift" />
+          <div className="absolute -bottom-[15%] -right-[8%] w-[48vw] h-[48vw] rounded-full bg-accent/30 blur-[130px] animate-drift" style={{ animationDirection: "reverse", animationDuration: "20s" }} />
+          <div className="absolute inset-0" style={{ background: "radial-gradient(ellipse at 50% 38%, rgba(109,74,255,.16), transparent 60%)" }} />
+          <div className="absolute inset-0 opacity-[0.05]" style={{ backgroundImage: "linear-gradient(#fff 1px,transparent 1px),linear-gradient(90deg,#fff 1px,transparent 1px)", backgroundSize: "64px 64px" }} />
+        </div>
+
+        <div className="relative z-20 flex-1 flex flex-col items-center justify-center text-center px-6 pt-24 pb-16">
+          {/* Equalizer + now-playing cue */}
+          <div className="flex items-center gap-1.5 mb-8 h-6 animate-fade-in">
+            {[0, 0.2, 0.4, 0.1, 0.3].map((d, i) => (
+              <span key={i} className="w-[3px] rounded-full bg-accent animate-eq" style={{ animationDelay: `${d}s`, height: "6px" }} />
+            ))}
+            <span className="ml-3 text-[11px] uppercase tracking-[0.25em] text-white/40">{t("landing.badge")}</span>
           </div>
-          <h1 className="text-5xl sm:text-6xl font-extrabold tracking-tight mb-6 leading-[1.05] animate-fade-in">
-            <span className="bg-gradient-to-r from-white via-white to-gray-300 bg-clip-text text-transparent">{t("landing.hero1")} </span>
-            <span className="bg-gradient-to-r from-brand-light to-accent bg-clip-text text-transparent">{t("landing.hero2")}</span>
+
+          {/* Giant kinetic claim — words fade in one by one */}
+          <h1 className="font-extrabold tracking-tight leading-[0.95] text-[clamp(2.6rem,8vw,6rem)] max-w-5xl">
+            <span className="block text-white animate-word-in" style={{ animationDelay: "0.1s" }}>{t("landing.hero1")}</span>
+            <span className="block bg-gradient-to-r from-brand-light to-accent bg-clip-text text-transparent animate-word-in" style={{ animationDelay: "0.45s" }}>{t("landing.hero2")}</span>
           </h1>
-          <p className="text-gray-400 text-lg max-w-2xl mx-auto leading-relaxed mb-7 animate-fade-in">
+
+          <p className="text-white/60 text-lg sm:text-xl max-w-2xl mx-auto leading-relaxed mt-8 mb-9 animate-slide-up">
             {t("landing.hero_sub")}
           </p>
-          <div className="flex flex-col sm:flex-row gap-3 justify-center animate-fade-in">
-            <button onClick={onStart} className="btn-primary text-lg py-4 px-10">
+
+          <div className="flex flex-col sm:flex-row gap-3 justify-center items-center animate-slide-up">
+            <button onClick={onStart} className="px-9 py-4 rounded-full bg-white text-black font-bold text-lg hover:scale-[1.03] transition-transform shadow-glow-lg">
               {t("landing.cta")}
-              <svg className="inline-block ml-2 w-5 h-5" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24" strokeLinecap="round" strokeLinejoin="round"><path d="M5 12h14M12 5l7 7-7 7" /></svg>
+              <svg className="inline-block ml-2 w-5 h-5" fill="none" stroke="currentColor" strokeWidth="2.5" viewBox="0 0 24 24" strokeLinecap="round" strokeLinejoin="round"><path d="M5 12h14M12 5l7 7-7 7" /></svg>
             </button>
-            <a href="#contact" className="btn-secondary text-lg py-4 px-8 inline-flex items-center justify-center">
+            <a href="#examples" className="px-7 py-4 rounded-full border border-white/20 text-white/80 text-lg hover:bg-white/5 transition-colors inline-flex items-center justify-center">
               {t("landing.cta_demo")}
             </a>
           </div>
-          <p className="text-xs text-gray-500 mt-5 animate-fade-in">{t("landing.hero_trust")}</p>
 
-          {/* Showcase — real lyric video (already has its own lyrics) */}
-          <div className="relative mt-12 max-w-3xl mx-auto animate-slide-up">
-            <div className="glass rounded-3xl p-3 shadow-glow-lg">
-              <div className="rounded-2xl overflow-hidden aspect-video relative bg-black">
-                <video autoPlay muted loop playsInline className="w-full h-full object-cover" src="/samples/ex1.mp4" />
-                <div className="absolute top-3 left-3 flex items-center gap-1.5 bg-black/55 backdrop-blur-sm rounded-full px-3 py-1.5">
-                  <svg className="w-3 h-3 text-white/80" fill="currentColor" viewBox="0 0 24 24"><path d="M8 5v14l11-7z"/></svg>
-                  <span className="text-[10px] font-semibold text-white/80">Generado con GenLy</span>
-                </div>
-              </div>
-            </div>
-          </div>
+          <span className="mt-7 inline-flex items-center gap-1.5 text-[11px] text-white/50 bg-black/30 backdrop-blur-sm px-3 py-1.5 rounded-full animate-fade-in">
+            <svg className="w-3 h-3 text-accent" fill="currentColor" viewBox="0 0 24 24"><path d="M8 5v14l11-7z"/></svg>
+            {t("landing.hero_trust")}
+          </span>
         </div>
 
-        {/* Stats */}
-        <div className="flex justify-center gap-16 mt-20 pt-12 border-t border-white/[0.04]">
+        {/* Scroll cue */}
+        <div className="relative z-20 pb-6 flex justify-center text-white/30 animate-bounce">
+          <svg className="w-5 h-5" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24" strokeLinecap="round" strokeLinejoin="round"><path d="M12 5v14M5 12l7 7 7-7" /></svg>
+        </div>
+      </section>
+
+      {/* Stats — full-bleed band */}
+      <section className="relative z-10 border-y border-white/[0.06] bg-white/[0.015]">
+        <div className="grid grid-cols-2 sm:grid-cols-4 max-w-6xl mx-auto sm:divide-x divide-white/[0.06]">
           {[
             { value: "< 5 min", label: t("landing.per_video") },
             { value: "3", label: t("landing.outputs") },
             { value: "100%", label: t("landing.commercial") },
             { value: "6+", label: t("landing.languages") },
           ].map((s) => (
-            <div key={s.label} className="text-center">
-              <p className="text-3xl font-bold bg-gradient-to-r from-white to-gray-400 bg-clip-text text-transparent">{s.value}</p>
+            <div key={s.label} className="text-center py-10 px-4">
+              <p className="text-4xl font-bold bg-gradient-to-r from-white to-gray-400 bg-clip-text text-transparent">{s.value}</p>
               <p className="text-xs text-gray-500 mt-1">{s.label}</p>
             </div>
           ))}
@@ -222,6 +254,9 @@ export default function Landing({ onStart, onLogin, isLoggedIn = false }) {
           </div>
         </div>
       </section>
+
+      {/* Customer logos — null until real logos are provided */}
+      <SocialProofWall title="Confían en GenLy" />
 
       {/* How it works */}
       <section className="relative z-10 py-24 px-6 max-w-5xl mx-auto">
@@ -265,7 +300,7 @@ export default function Landing({ onStart, onLogin, isLoggedIn = false }) {
       </section>
 
       {/* Examples — real generated clips */}
-      <section className="relative z-10 py-20 px-6 max-w-5xl mx-auto">
+      <section id="examples" className="relative z-10 py-20 px-6 max-w-5xl mx-auto scroll-mt-20">
         <h2 className="text-3xl font-bold text-center mb-4">{t("landing.examples_title")}</h2>
         <p className="text-gray-500 text-center mb-12 max-w-md mx-auto">{t("landing.examples_sub")}</p>
         <div className="grid grid-cols-1 sm:grid-cols-3 gap-5">
@@ -312,6 +347,78 @@ export default function Landing({ onStart, onLogin, isLoggedIn = false }) {
         </div>
       </section>
 
+      {/* Comparison — GenLy vs studio vs self-serve tools */}
+      <section className="relative z-10 py-20 px-6 max-w-4xl mx-auto">
+        <h2 className="text-3xl font-bold text-center mb-4">{t("cmp.title")}</h2>
+        <p className="text-gray-500 text-center mb-12 max-w-md mx-auto">{t("cmp.sub")}</p>
+        <div className="glass rounded-3xl overflow-hidden text-sm">
+          <div className="grid grid-cols-[1.4fr_1fr_1fr_1fr] text-center border-b border-white/[0.06]">
+            <div className="p-4" />
+            <div className="p-4 font-bold text-brand-light bg-brand/10">{t("cmp.genly")}</div>
+            <div className="p-4 text-xs text-gray-400">{t("cmp.studio")}</div>
+            <div className="p-4 text-xs text-gray-400">{t("cmp.tools")}</div>
+          </div>
+          {[
+            { l: t("cmp.r_price"), g: t("cmp.r_price_g"), s: t("cmp.r_price_s"), o: t("cmp.r_price_t") },
+            { l: t("cmp.r_time"), g: t("cmp.r_time_g"), s: t("cmp.r_time_s"), o: t("cmp.r_time_t") },
+            { l: t("cmp.r_bg"), g: "yes", s: "no", o: "partial" },
+            { l: t("cmp.r_rights"), g: "yes", s: "no", o: "partial" },
+            { l: t("cmp.r_prores"), g: "yes", s: "yes", o: "no" },
+            { l: t("cmp.r_batch"), g: "yes", s: "no", o: "no" },
+            { l: t("cmp.r_langs"), g: "yes", s: "partial", o: "partial" },
+          ].map((row, i) => {
+            const cell = (v) =>
+              v === "yes" ? <span className="text-accent font-bold">✓</span>
+              : v === "no" ? <span className="text-gray-600">–</span>
+              : v === "partial" ? <span className="text-gray-500">{t("cmp.partial")}</span>
+              : <span>{v}</span>;
+            return (
+              <div key={i} className="grid grid-cols-[1.4fr_1fr_1fr_1fr] text-center items-center border-b border-white/[0.04] last:border-0">
+                <div className="p-4 text-left text-gray-300">{row.l}</div>
+                <div className="p-4 bg-brand/[0.06] font-medium text-white">{cell(row.g)}</div>
+                <div className="p-4 text-gray-500">{cell(row.s)}</div>
+                <div className="p-4 text-gray-500">{cell(row.o)}</div>
+              </div>
+            );
+          })}
+        </div>
+      </section>
+
+      {/* For labels — enterprise block */}
+      <section className="relative z-10 py-16 px-6 max-w-5xl mx-auto">
+        <div className="glass rounded-3xl p-8 sm:p-10 border border-brand/20 shadow-glow">
+          <div className="text-center mb-10">
+            <span className="text-[11px] uppercase tracking-[0.25em] text-brand-light">{t("landing.plan_label")}</span>
+            <h2 className="text-2xl sm:text-3xl font-bold mt-2 mb-3">{t("labels.title")}</h2>
+            <p className="text-gray-400 max-w-lg mx-auto">{t("labels.sub")}</p>
+          </div>
+          <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-5">
+            {[
+              { t: t("labels.f1_t"), d: t("labels.f1_d") },
+              { t: t("labels.f2_t"), d: t("labels.f2_d") },
+              { t: t("labels.f3_t"), d: t("labels.f3_d") },
+              { t: t("labels.f4_t"), d: t("labels.f4_d") },
+              { t: t("labels.f5_t"), d: t("labels.f5_d") },
+              { t: t("labels.f6_t"), d: t("labels.f6_d") },
+            ].map((f) => (
+              <div key={f.t} className="flex gap-3 items-start">
+                <svg className="w-5 h-5 shrink-0 text-accent mt-0.5" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24" strokeLinecap="round" strokeLinejoin="round"><path d="M9 12l2 2 4-4" /><circle cx="12" cy="12" r="10" /></svg>
+                <div>
+                  <h3 className="font-semibold mb-1 text-sm">{f.t}</h3>
+                  <p className="text-xs text-gray-400 leading-relaxed">{f.d}</p>
+                </div>
+              </div>
+            ))}
+          </div>
+          <div className="text-center mt-10">
+            <a href="#contact" className="btn-primary py-3 px-8 inline-flex items-center justify-center">
+              {t("labels.cta")}
+              <svg className="inline-block ml-2 w-4 h-4" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24" strokeLinecap="round" strokeLinejoin="round"><path d="M5 12h14M12 5l7 7-7 7" /></svg>
+            </a>
+          </div>
+        </div>
+      </section>
+
       {/* Features */}
       <section id="features" className="relative z-10 py-20 px-6 max-w-5xl mx-auto scroll-mt-20">
         <h2 className="text-3xl font-bold text-center mb-4">{t("landing.features")}</h2>
@@ -327,6 +434,9 @@ export default function Landing({ onStart, onLogin, isLoggedIn = false }) {
         </div>
       </section>
 
+      {/* Testimonials — null until real quotes are provided */}
+      <Testimonials title="Lo que dicen los artistas" />
+
       {/* Ownership / rights — the closer */}
       <section className="relative z-10 py-16 px-6 max-w-4xl mx-auto">
         <div className="glass rounded-3xl p-10 border border-accent/20 shadow-glow text-center">
@@ -340,6 +450,25 @@ export default function Landing({ onStart, onLogin, isLoggedIn = false }) {
               </div>
             ))}
           </div>
+        </div>
+      </section>
+
+      {/* Novedades — "alive" signal: real shipped capabilities */}
+      <section className="relative z-10 py-20 px-6 max-w-5xl mx-auto">
+        <h2 className="text-3xl font-bold text-center mb-4">{t("news.title")}</h2>
+        <p className="text-gray-500 text-center mb-12 max-w-md mx-auto">{t("news.sub")}</p>
+        <div className="grid grid-cols-1 sm:grid-cols-3 gap-5">
+          {[
+            { t: t("news.1_t"), d: t("news.1_d") },
+            { t: t("news.2_t"), d: t("news.2_d") },
+            { t: t("news.3_t"), d: t("news.3_d") },
+          ].map((n) => (
+            <div key={n.t} className="glass rounded-card p-6 glass-hover">
+              <span className="inline-block px-2 py-0.5 rounded-full bg-accent/15 text-accent text-[10px] font-bold uppercase tracking-wider mb-3">Nuevo</span>
+              <h3 className="font-semibold mb-1.5">{n.t}</h3>
+              <p className="text-sm text-gray-400 leading-relaxed">{n.d}</p>
+            </div>
+          ))}
         </div>
       </section>
 
@@ -441,8 +570,46 @@ export default function Landing({ onStart, onLogin, isLoggedIn = false }) {
       </section>
 
       {/* Footer */}
-      <footer className="relative z-10 border-t border-white/[0.04] py-8 px-8 text-center">
-        <p className="text-xs text-gray-600">{t("landing.footer")}</p>
+      <footer className="relative z-10 border-t border-white/[0.06] pt-14 pb-8 px-8">
+        <div className="max-w-6xl mx-auto grid grid-cols-2 sm:grid-cols-4 gap-8">
+          <div className="col-span-2 sm:col-span-1">
+            <BrandLockup size="md" />
+            <p className="text-xs text-gray-600 mt-3 leading-relaxed max-w-[14rem]">{t("footer.tagline")}</p>
+          </div>
+          <div>
+            <p className="text-xs font-semibold text-gray-300 uppercase tracking-wider mb-3">{t("footer.col_product")}</p>
+            <ul className="space-y-2 text-sm text-gray-500">
+              <li><a href="#features" className="hover:text-white transition-colors">{t("landing.features")}</a></li>
+              <li><a href="#pricing" className="hover:text-white transition-colors">{t("landing.pricing")}</a></li>
+              <li><a href="#examples" className="hover:text-white transition-colors">{t("landing.examples_title")}</a></li>
+              <li><a href="#faq" className="hover:text-white transition-colors">FAQ</a></li>
+            </ul>
+          </div>
+          <div>
+            <p className="text-xs font-semibold text-gray-300 uppercase tracking-wider mb-3">{t("footer.col_company")}</p>
+            <ul className="space-y-2 text-sm text-gray-500">
+              <li><a href="#contact" className="hover:text-white transition-colors">{t("footer.contact")}</a></li>
+              <li><a href="mailto:tomas@epical.digital" className="hover:text-white transition-colors">tomas@epical.digital</a></li>
+            </ul>
+          </div>
+          <div>
+            <p className="text-xs font-semibold text-gray-300 uppercase tracking-wider mb-3">{t("footer.col_legal")}</p>
+            <ul className="space-y-2 text-sm text-gray-500">
+              <li><a href="#faq" className="hover:text-white transition-colors">{t("footer.rights")}</a></li>
+            </ul>
+          </div>
+        </div>
+        <div className="max-w-6xl mx-auto mt-12 pt-6 border-t border-white/[0.04] flex flex-col sm:flex-row items-center justify-between gap-3">
+          <p className="text-xs text-gray-600">© {new Date().getFullYear()} {t("landing.footer")}</p>
+          <div className="flex items-center gap-1">
+            {["es", "en", "pt"].map((code) => (
+              <button key={code} onClick={() => setLang(code)}
+                className={`text-[10px] font-bold px-2 py-1 rounded-md transition-all uppercase ${lang === code ? "text-white bg-white/10" : "text-gray-600 hover:text-gray-400"}`}>
+                {code}
+              </button>
+            ))}
+          </div>
+        </div>
       </footer>
     </div>
   );
