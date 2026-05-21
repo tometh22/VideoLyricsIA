@@ -362,7 +362,9 @@ export default function App() {
     umg_fps: 24,
     umg_prores_profile: 3,
   });
-  const [style, setStyle] = useState("oscuro");
+  const [style, setStyle] = useState("auto");
+  // Custom palette (hex/names, comma-sep) used when style === "custom".
+  const [customColors, setCustomColors] = useState("");
 
   const [reviewQueue, setReviewQueue] = useState([]);
   const [currentReview, setCurrentReview] = useState(null);
@@ -993,6 +995,7 @@ export default function App() {
         formData.append("artist", jobList[i].artist);
         if (jobList[i].songTitle) formData.append("song_title", jobList[i].songTitle);
         formData.append("style", style);
+        if (style === "custom" && customColors.trim()) formData.append("custom_colors", customColors.trim());
         if (jobList[i].language) formData.append("language", jobList[i].language);
         if (jobList[i].genre) formData.append("genre", jobList[i].genre);
         if (jobList[i].font) formData.append("font", jobList[i].font);
@@ -1114,6 +1117,7 @@ export default function App() {
         generateBody.append("artist", jobList[i].artist);
         if (jobList[i].songTitle) generateBody.append("song_title", jobList[i].songTitle);
         generateBody.append("style", style);
+        if (style === "custom" && customColors.trim()) generateBody.append("custom_colors", customColors.trim());
         generateBody.append("segments_json", "[]");
         generateBody.append("delivery_profile", delivery.delivery_profile);
         if (delivery.delivery_profile !== "youtube") {
@@ -1408,6 +1412,8 @@ export default function App() {
         onDeliveryChange={setDelivery}
         style={style}
         onStyleChange={setStyle}
+        customColors={customColors}
+        onCustomColorsChange={setCustomColors}
         backgroundFile={backgroundFile}
         onBackgroundFile={setBackgroundFile}
         backgroundId={backgroundId}

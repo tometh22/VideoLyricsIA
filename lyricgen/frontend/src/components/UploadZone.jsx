@@ -120,8 +120,10 @@ export default function UploadZone({
   onFiles,
   delivery,
   onDeliveryChange,
-  style = "oscuro",
+  style = "auto",
   onStyleChange,
+  customColors = "",
+  onCustomColorsChange,
   backgroundFile,
   onBackgroundFile,
   backgroundId,
@@ -1564,6 +1566,7 @@ export default function UploadZone({
           {bgMode === "auto" ? (
             <WizardLivePreview
               style={style}
+              customColors={customColors}
               movementStyle={batchDefaults.movementStyle}
               mode={sceneMode}
               lyric={_previewLyric}
@@ -1671,8 +1674,25 @@ export default function UploadZone({
                     <div className="rounded-card bg-surface-2/40 ring-1 ring-white/[0.04] px-4 py-3">
                       <p className="text-[10px] uppercase tracking-[0.18em] text-gray-500">{t("upload.style_label")}</p>
                       <p className="text-[11px] text-gray-600 mb-2 mt-0.5">
-                        {t("upload.style_desc") || "Paleta de colores del fondo IA y del gradiente animado"}
+                        {t("upload.style_desc") || "Cómo se colorea el fondo IA"}
                       </p>
+
+                      {/* Auto — default, the AI picks colors from the song */}
+                      <button
+                        type="button"
+                        onClick={() => onStyleChange("auto")}
+                        className={`w-full flex items-center gap-3 px-3 py-2.5 rounded-xl border text-left transition-all duration-200 mb-2 ${
+                          style === "auto" ? "border-transparent ring-1 ring-brand/50 bg-brand/[0.08]" : "border-white/[0.06] hover:border-white/[0.16]"
+                        }`}
+                      >
+                        <span className="w-8 h-8 rounded-lg shrink-0" style={{ background: "conic-gradient(from 180deg,#6D4AFF,#14C8A8,#b45a14,#6D4AFF)" }} />
+                        <span>
+                          <span className={`block text-[12px] font-semibold ${style === "auto" ? "text-white" : "text-gray-200"}`}>{t("upload.style_auto") || "Auto"}</span>
+                          <span className="block text-[10px] text-gray-500">{t("upload.style_auto_desc") || "La IA elige los colores según la canción"}</span>
+                        </span>
+                      </button>
+
+                      {/* 4 presets */}
                       <div className="grid grid-cols-2 gap-2">
                         {STYLES.map((s) => (
                           <button
@@ -1698,6 +1718,37 @@ export default function UploadZone({
                           </button>
                         ))}
                       </div>
+
+                      {/* Personalizado — pick your own colors */}
+                      <button
+                        type="button"
+                        onClick={() => onStyleChange("custom")}
+                        className={`w-full flex items-center gap-3 px-3 py-2.5 rounded-xl border text-left transition-all duration-200 mt-2 ${
+                          style === "custom" ? "border-transparent ring-1 ring-brand/50 bg-brand/[0.08]" : "border-white/[0.06] hover:border-white/[0.16]"
+                        }`}
+                      >
+                        <span className="w-8 h-8 rounded-lg shrink-0 grid place-items-center text-[15px] bg-surface-3">🎨</span>
+                        <span>
+                          <span className={`block text-[12px] font-semibold ${style === "custom" ? "text-white" : "text-gray-200"}`}>{t("upload.style_custom") || "Personalizado"}</span>
+                          <span className="block text-[10px] text-gray-500">{t("upload.style_custom_desc") || "Elegí tus colores (marca, artista…)"}</span>
+                        </span>
+                      </button>
+                      {style === "custom" && onCustomColorsChange && (() => {
+                        const parts = (customColors || "").split(",").map((x) => x.trim()).filter(Boolean);
+                        const c1 = parts[0] && /^#[0-9a-fA-F]{6}$/.test(parts[0]) ? parts[0] : "#6D4AFF";
+                        const c2 = parts[1] && /^#[0-9a-fA-F]{6}$/.test(parts[1]) ? parts[1] : "#14C8A8";
+                        return (
+                          <div className="mt-2 flex items-center gap-3 px-1">
+                            <label className="flex items-center gap-1.5 text-[11px] text-gray-400 cursor-pointer">
+                              <input type="color" value={c1} onChange={(e) => onCustomColorsChange(`${e.target.value}, ${c2}`)} className="w-7 h-7 rounded cursor-pointer bg-transparent border-0 p-0" />
+                            </label>
+                            <label className="flex items-center gap-1.5 text-[11px] text-gray-400 cursor-pointer">
+                              <input type="color" value={c2} onChange={(e) => onCustomColorsChange(`${c1}, ${e.target.value}`)} className="w-7 h-7 rounded cursor-pointer bg-transparent border-0 p-0" />
+                            </label>
+                            <span className="text-[10px] text-gray-600">{t("upload.style_custom_hint") || "2 colores dominantes para el fondo"}</span>
+                          </div>
+                        );
+                      })()}
                     </div>
                   )}
                 </>

@@ -372,7 +372,11 @@ def run_pipeline(job_id: str, mp3_path: str, artist: str, style: str,
                  # del operador va DIRECTO a Veo sin que Gemini lo reescriba
                  # ("usar mi prompt tal cual"). Default False = comportamiento
                  # actual (Gemini refina el hint como [OPERATOR OVERRIDE]).
-                 bg_verbatim: bool = False):
+                 bg_verbatim: bool = False,
+                 # custom_colors: paleta personalizada (hex/nombres, coma-sep)
+                 # cuando style=="custom". Va al prompt de Veo como COLOR
+                 # DIRECTION + al gradiente fallback.
+                 custom_colors: str = ""):
     """Run the full pipeline for a job. Called synchronously.
 
     delivery_profile:
@@ -586,6 +590,7 @@ def run_pipeline(job_id: str, mp3_path: str, artist: str, style: str,
                 match_lyrics=match_lyrics,
                 background_hint=background_hint,
                 bg_verbatim=bg_verbatim,
+                custom_colors=custom_colors,
                 allow_people=_compute_allow_people(job_id),
             )
             # Image-to-video fallback: if Veo failed to produce an MP4 (None
@@ -632,6 +637,8 @@ def run_pipeline(job_id: str, mp3_path: str, artist: str, style: str,
             _new_rp["background_hint"] = background_hint
         if bg_verbatim:
             _new_rp["bg_verbatim"] = True
+        if custom_colors:
+            _new_rp["custom_colors"] = custom_colors
         try:
             from database import SessionLocal as _SL_rp, Job as _Job_rp
             with _SL_rp() as _db_rp:
@@ -3971,6 +3978,34 @@ _MOVEMENT_STYLE_RULES = {
 }
 
 
+# Color-grading hints injected into the Gemini prompt so the operator's
+# palette choice ACTUALLY steers the generated background's colors (until now
+# `style` only tinted the gradient fallback, never the Veo output). "auto" /
+# "" → no constraint (the scene's natural colors). Keys mirror the frontend
+# STYLES codes.
+_PALETTE_COLOR_HINTS = {
+    "oscuro":  "deep purples, magenta, midnight blue and black — dramatic, moody color grading",
+    "neon":    "an electric neon palette — magenta, cyan and violet, high-saturation glow",
+    "minimal": "a neutral, understated palette — soft grays, off-whites and gentle pastels",
+    "calido":  "warm earthy tones — amber, orange, terracotta and golden light",
+}
+
+
+def _color_directive(style: str, custom_colors: str) -> str:
+    """Build the COLOR DIRECTION line for the Gemini prompt from the operator's
+    palette choice. custom_colors (hex or names, comma-separated) wins; then a
+    preset hint; "auto"/empty → no directive (scene-natural colors)."""
+    cc = (custom_colors or "").strip()
+    if cc:
+        return (f"COLOR DIRECTION (important): grade the entire scene around these "
+                f"dominant colors: {cc}. Lighting, atmosphere and key surfaces must "
+                f"read in this palette.")
+    hint = _PALETTE_COLOR_HINTS.get((style or "").strip().lower())
+    if hint:
+        return f"COLOR DIRECTION: lean the color palette toward {hint}."
+    return ""
+
+
 def _normalize_movement_style(s: str) -> str:
     """Map free-text or UI selection to a key in _MOVEMENT_STYLE_RULES.
     Returns "" for empty / unknown — caller treats that as Auto."""
@@ -4162,6 +4197,8 @@ def _analyze_lyrics_for_background(lyrics_text: str, artist: str, job_id: str = 
                                     match_lyrics: bool = True,
                                     background_hint: str | None = None,
                                     for_provider: str = "veo",
+                                    style: str = "",
+                                    custom_colors: str = "",
                                     allow_people: bool = False) -> dict:
     """Use Gemini to analyze lyrics and choose visual style + prompt.
 
@@ -4514,6 +4551,12 @@ Hard rules:
             "- The output `style` field MUST be \"photo\" (not \"video\")."
         )
 
+    # Operator color choice → real steer on the generated colors (not just the
+    # gradient fallback). "auto"/empty adds nothing (scene-natural colors).
+    _color_line = _color_directive(style, custom_colors)
+    if _color_line:
+        system_prompt = system_prompt + "\n\n" + _color_line
+
     full_prompt = f"system:{system_prompt}\nuser:{user_content}"
 
     recorder = record_ai_call(
@@ -4631,6 +4674,7 @@ def _get_unique_prompt(lyrics_text: str = None, artist: str = "", job_id: str = 
                        background_hint: str | None = None,
                        for_provider: str = "veo",
                        bg_verbatim: bool = False,
+                       palette_style: str = "", custom_colors: str = "",
                        allow_people: bool = False) -> dict:
     """Get a unique style+prompt combination. Returns {style, prompt}.
 
@@ -4689,6 +4733,7 @@ def _get_unique_prompt(lyrics_text: str = None, artist: str = "", job_id: str = 
             genre=genre, concept=concept, movement_style=movement_style,
             match_lyrics=match_lyrics, background_hint=background_hint,
             for_provider=for_provider,
+            style=palette_style, custom_colors=custom_colors,
             allow_people=allow_people,
         )
         if result["prompt"] and result["prompt"] not in used:
@@ -5376,6 +5421,7 @@ def _ensure_background(style_hint: str, job_dir: str, lyrics_text: str = None,
                        background_hint: str | None = None,
                        bg_mode: str = "veo",
                        bg_verbatim: bool = False,
+                       custom_colors: str = "",
                        allow_people: bool = False) -> str:
     """Generate background using AI. Gemini picks the best style for the song.
 
@@ -5420,6 +5466,7 @@ def _ensure_background(style_hint: str, job_dir: str, lyrics_text: str = None,
             background_hint=background_hint,
             for_provider="imagen",
             bg_verbatim=bg_verbatim,
+            palette_style=style_hint, custom_colors=custom_colors,
             allow_people=allow_people,
         )
         prompt = result["prompt"]
@@ -5442,6 +5489,7 @@ def _ensure_background(style_hint: str, job_dir: str, lyrics_text: str = None,
         concept=concept, movement_style=movement_style, match_lyrics=match_lyrics,
         background_hint=background_hint,
         bg_verbatim=bg_verbatim,
+        palette_style=style_hint, custom_colors=custom_colors,
         allow_people=allow_people,
     )
     prompt = result["prompt"]
@@ -5486,6 +5534,7 @@ def _ensure_background(style_hint: str, job_dir: str, lyrics_text: str = None,
                     match_lyrics=match_lyrics,
                     background_hint=background_hint,
                     bg_verbatim=bg_verbatim,
+                    palette_style=style_hint, custom_colors=custom_colors,
                     allow_people=allow_people,
                 )
                 prompt = result["prompt"]

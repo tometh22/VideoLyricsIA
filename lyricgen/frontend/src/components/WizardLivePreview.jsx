@@ -29,10 +29,21 @@ const MOVE_ANIM = {
   animado:        "wlp-anim 1.8s linear infinite",
 };
 
-export default function WizardLivePreview({ style = "oscuro", movementStyle = "", mode = "lyrics", lyric }) {
+export default function WizardLivePreview({ style = "auto", customColors = "", movementStyle = "", mode = "lyrics", lyric }) {
   const { t } = useI18n();
   const isAnimado = movementStyle === "animado";
   const isMinimal = style === "minimal";
+  // Resolve the background gradient: a preset, the custom colors, or a
+  // pleasant default for "auto" (the AI will pick the real colors).
+  let bgGradient = PALETTE_BG[style] || PALETTE_BG.oscuro;
+  if (style === "custom") {
+    const parts = (customColors || "").split(",").map((x) => x.trim()).filter(Boolean);
+    const c1 = parts[0] || "#6D4AFF";
+    const c2 = parts[1] || "#14C8A8";
+    bgGradient = `radial-gradient(120% 90% at 65% 20%, ${c1} 0%, ${c2} 60%, #06040f 100%)`;
+  } else if (style === "auto" || !PALETTE_BG[style]) {
+    bgGradient = "radial-gradient(120% 90% at 68% 18%, #3a1d6e 0%, #1a1140 45%, #06040f 100%)";
+  }
   const sample = (lyric || "").trim() || (t("upload.preview_sample") || "tu letra, en pantalla");
   const moveLabel = {
     "": t("upload.movement_auto") || "Auto",
@@ -65,7 +76,7 @@ export default function WizardLivePreview({ style = "oscuro", movementStyle = ""
           inset: "-18%",
           background: isAnimado
             ? "repeating-linear-gradient(45deg,#6D4AFF 0 18px,#14C8A8 18px 36px)"
-            : (PALETTE_BG[style] || PALETTE_BG.oscuro),
+            : bgGradient,
           animation: MOVE_ANIM[movementStyle] ?? MOVE_ANIM[""],
           willChange: "transform",
         }}

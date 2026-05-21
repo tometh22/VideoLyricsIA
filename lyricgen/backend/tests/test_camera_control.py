@@ -194,6 +194,30 @@ def test_retry_whitelist_includes_bg_verbatim():
     assert '"bg_verbatim"' in src
 
 
+def test_color_directive_auto_imposes_nothing():
+    """Auto / empty palette must NOT constrain colors (scene-natural)."""
+    assert pipeline._color_directive("auto", "") == ""
+    assert pipeline._color_directive("", "") == ""
+
+
+def test_color_directive_preset_and_custom():
+    # Preset → mood hint.
+    d = pipeline._color_directive("oscuro", "")
+    assert "COLOR DIRECTION" in d and "purple" in d.lower()
+    # Custom colors win over preset and are passed through verbatim.
+    d2 = pipeline._color_directive("oscuro", "#ff3366, teal")
+    assert "#ff3366, teal" in d2 and "dominant colors" in d2.lower()
+
+
+def test_color_threads_into_analyze_signature():
+    import inspect
+    sig = inspect.signature(pipeline._analyze_lyrics_for_background)
+    assert "style" in sig.parameters and "custom_colors" in sig.parameters
+    # And the Gemini prompt builder actually appends the directive.
+    src = inspect.getsource(pipeline._analyze_lyrics_for_background)
+    assert "_color_directive(" in src
+
+
 def test_static_camera_pool_has_no_motion_verbs():
     motion_words = ("dolly", "drone", "tracking", "orbit", "zoom", "pan",
                     "crane", "parallax", "glide", "push-in")

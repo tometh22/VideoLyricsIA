@@ -2654,6 +2654,7 @@ async def upload(
     match_lyrics: bool = Form(True),
     background_hint: str = Form("", max_length=2000),
     bg_verbatim: bool = Form(False),
+    custom_colors: str = Form("", max_length=200),
     current_user: dict = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
@@ -2808,6 +2809,7 @@ async def upload(
         match_lyrics=match_lyrics,
         background_hint=(background_hint.strip() or None),
         bg_verbatim=bg_verbatim,
+        custom_colors=(custom_colors.strip() or ""),
     )
 
     return {"job_id": job_id, "status": initial_status}
@@ -3517,6 +3519,7 @@ async def generate_with_segments(
     match_lyrics: bool = Form(True),
     background_hint: str = Form("", max_length=2000),
     bg_verbatim: bool = Form(False),
+    custom_colors: str = Form("", max_length=200),
     current_user: dict = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
@@ -3735,6 +3738,7 @@ async def generate_with_segments(
         match_lyrics=match_lyrics,
         background_hint=(background_hint.strip() or None),
         bg_verbatim=bg_verbatim,
+        custom_colors=(custom_colors.strip() or ""),
     )
 
     return {"job_id": job_id, "status": initial_status}
