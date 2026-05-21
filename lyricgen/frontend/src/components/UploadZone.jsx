@@ -725,37 +725,32 @@ export default function UploadZone({
                   }`}
               >
                 <div className="aspect-video bg-black relative overflow-hidden">
-                  {/* CSS motion demo: SAME base scene, the movement applied per
-                      card so the card communicates the MOVEMENT (not a random
-                      scene). estatico=still, sutil/estandar=drift, parallax=
-                      layered, animado=2D shapes. */}
-                  <div
-                    className="absolute inset-[-24%]"
-                    style={{
-                      background: m.code === "animado"
-                        ? "repeating-linear-gradient(45deg,#6D4AFF 0 14px,#14C8A8 14px 28px)"
-                        : "linear-gradient(135deg,#3a1d6e 0%,#0e3b46 58%,#7a3a12 100%)",
-                      animation: {
-                        estatico: "none",
-                        sutil: "gal-sm 6s ease-in-out infinite alternate",
-                        estandar: "gal-lg 5s ease-in-out infinite alternate",
-                        "foto-parallax": "gal-par 5s ease-in-out infinite alternate",
-                        animado: "gal-anim 1.6s linear infinite",
-                      }[m.code] || "none",
-                    }}
-                  />
-                  {m.code !== "animado" && (
+                  {/* REAL scene (same base photo in every card) with the actual
+                      movement applied so the card communicates the MOVEMENT, not
+                      a random scene. estatico=still, sutil/estandar=zoom-drift,
+                      parallax=slow push, animado=stylised 2D illustration. */}
+                  {m.code === "animado" ? (
                     <div
-                      className="absolute rounded-full"
+                      className="absolute inset-[-24%]"
+                      style={{ background: "repeating-linear-gradient(45deg,#6D4AFF 0 14px,#14C8A8 14px 28px)", animation: "gal-anim 1.6s linear infinite" }}
+                    />
+                  ) : (
+                    <div
+                      className="absolute inset-[-24%] bg-cover bg-center"
                       style={{
-                        width: "42%", height: "42%", left: "28%", top: "16%",
-                        background: "radial-gradient(circle,rgba(255,210,140,.85),transparent 70%)",
-                        animation: m.code === "foto-parallax" ? "gal-parsun 5s ease-in-out infinite alternate" : "none",
+                        backgroundImage: "url(/movement_samples/scene-base.jpg)",
+                        animation: {
+                          estatico: "none",
+                          sutil: "gal-sm 6s ease-in-out infinite alternate",
+                          estandar: "gal-lg 5s ease-in-out infinite alternate",
+                          "foto-parallax": "gal-par 5s ease-in-out infinite alternate",
+                        }[m.code] || "none",
                       }}
                     />
                   )}
+                  <div className="absolute inset-0 bg-gradient-to-t from-black/40 to-transparent" />
                   {m.code === "estatico" && (
-                    <span className="absolute right-1.5 bottom-1.5 text-[8px] px-1.5 py-0.5 rounded bg-black/55 text-gray-300">{t("upload.movement_static_tag") || "fijo"}</span>
+                    <span className="absolute right-1.5 bottom-1.5 text-[8px] px-1.5 py-0.5 rounded bg-black/60 text-gray-200">fijo</span>
                   )}
                   {active && (
                     <div className="absolute top-1.5 right-1.5 w-5 h-5 rounded-full bg-brand flex items-center justify-center shadow">
@@ -767,7 +762,7 @@ export default function UploadZone({
                 </div>
                 <div className="px-2 py-1.5 bg-surface-1">
                   <p className={`text-[11px] truncate ${active ? "text-white font-medium" : "text-gray-300"}`}>
-                    {m.label}
+                    {m.label.replace(/\s*\(.*\)\s*/, "")}
                   </p>
                 </div>
               </button>
@@ -1544,13 +1539,13 @@ export default function UploadZone({
   const summary = summaryParts.join(" · ");
 
   return (
-    <div className="w-full max-w-6xl mx-auto pb-28">
+    <div className="w-full px-2 md:px-6 pb-28">
       <UploadTour user={user} />
       {files.length === 0 ? (
         /* Pre-upload — just the drop zone, centered and prominent */
         <div className="max-w-2xl mx-auto">{_dropZone}</div>
       ) : (
-      <div className="flex flex-col lg:grid lg:grid-cols-[152px_minmax(0,1fr)_minmax(360px,400px)] gap-5 items-start">
+      <div className="flex flex-col lg:grid lg:grid-cols-[190px_minmax(0,1fr)_minmax(400px,460px)] gap-6 items-start">
 
         {/* LEFT — step rail (vertical on desktop, horizontal pills on mobile) */}
         <nav className="flex lg:flex-col gap-1.5 lg:gap-1 overflow-x-auto lg:overflow-visible lg:sticky lg:top-4 w-full lg:w-auto order-first">
@@ -1745,7 +1740,7 @@ export default function UploadZone({
           className={`fixed bottom-0 left-0 right-0 z-30 bg-surface-1/85 backdrop-blur-xl border-t border-white/[0.06] px-4 md:px-8 py-4 transition-all duration-300 ${sidebarOpen ? "md:left-64" : "md:left-0"}`}
           data-tour="upload-cta-bar"
         >
-          <div className="max-w-6xl mx-auto flex flex-wrap items-center gap-3">
+          <div className="w-full flex flex-wrap items-center gap-3">
             <div className="flex-1 min-w-0">
               <p className="text-[10px] uppercase tracking-[0.18em] text-gray-500">
                 {t("upload.step")} {wizardStep}/{WIZARD_STEPS.length} · {WIZARD_STEPS[wizardStep - 1]?.label}

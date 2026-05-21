@@ -95,21 +95,15 @@ export default function WizardLivePreview({ style = "oscuro", movementStyle = ""
         </div>
       </div>
 
-      {/* status chips */}
-      <div className="absolute top-3 left-3 flex items-center gap-2">
-        <span className="text-[10px] md:text-[11px] px-2.5 py-1 rounded-lg bg-black/55 backdrop-blur-md ring-1 ring-white/[0.08] text-gray-200">
-          {t("upload.preview_live") || "Vista previa en vivo"}
-        </span>
-        {modeLabel && (
-          <span className="text-[10px] md:text-[11px] px-2.5 py-1 rounded-lg bg-black/55 backdrop-blur-md ring-1 ring-white/[0.08] text-brand-light">
-            {modeLabel}
-          </span>
-        )}
+      {/* live indicator (clearly a status, not a button) */}
+      <div className="absolute top-4 left-4 flex items-center gap-1.5 text-[10px] uppercase tracking-[0.18em] font-medium" style={{ color: isMinimal ? "rgba(0,0,0,.6)" : "rgba(255,255,255,.72)" }}>
+        <span className="w-1.5 h-1.5 rounded-full animate-pulse" style={{ background: "#14C8A8" }} />
+        {t("upload.preview_live") || "Preview"}
       </div>
-      <div className="absolute bottom-3 right-3">
-        <span className="text-[10px] px-2 py-1 rounded-md bg-black/55 backdrop-blur-md ring-1 ring-white/[0.08] text-gray-300">
-          {(t("upload.preview_motion") || "Movimiento")}: {moveLabel}
-        </span>
+      {/* info caption — plain text, not pills */}
+      <div className="absolute bottom-3.5 left-5 right-5 flex items-center justify-between text-[11px] font-medium" style={{ color: isMinimal ? "rgba(0,0,0,.55)" : "rgba(255,255,255,.6)", textShadow: isMinimal ? "none" : "0 1px 8px rgba(0,0,0,.5)" }}>
+        <span className="truncate">{modeLabel}</span>
+        <span className="shrink-0 ml-3">{(t("upload.preview_motion") || "Movimiento")}: {moveLabel}</span>
       </div>
     </div>
   );
