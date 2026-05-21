@@ -109,6 +109,8 @@ export default function EditRequestPanel({
   // Signed URL of the cached background video for the live preview.
   // Best-effort: null → preview uses a style gradient.
   const [lyricsBgUrl, setLyricsBgUrl] = useState(null);
+  // Font chosen live in the editor's preview switcher (null = unchanged).
+  const [lyricsFont, setLyricsFont] = useState(null);
   // Operator-typed background hint for edit_type="background". Empty
   // string when the operator hasn't typed anything (we send no field in
   // that case and the pipeline falls back to Gemini's lyrics-only
@@ -415,15 +417,34 @@ export default function EditRequestPanel({
     }
     const payload = {
       edit_type: "lyrics",
+      // Preserve manual timing locks AND per-line layout (pos/scale/rot)
+      // set in the timeline/preview — stripping them here would silently
+      // discard the operator's layout on re-render.
       segments: segments.map((s) => ({
         start: Number(s.start) || 0,
         end: Number(s.end) || 0,
         text: String(s.text || ""),
+        ...(s.locked ? { locked: true } : {}),
+        ...(s.pos && typeof s.pos.x === "number" ? { pos: { x: s.pos.x, y: s.pos.y } } : {}),
+        ...(typeof s.scale === "number" && s.scale !== 1 ? { scale: s.scale } : {}),
+        ...(typeof s.rot === "number" && s.rot !== 0 ? { rot: s.rot } : {}),
       })),
+      // Font picked live in the preview switcher (omit when unchanged).
+      ...(lyricsFont != null ? { font: lyricsFont } : {}),
     };
     // No-change short-circuit: same exact array as the persisted one.
+    // A live font change OR any per-line layout change (pos/scale/rot) also
+    // counts as a real change so it doesn't fall into the stale-rerender path.
     const original = Array.isArray(job.segments_json) ? job.segments_json : [];
-    const unchanged = original.length === payload.segments.length &&
+    const layoutChanged = original.length === payload.segments.length &&
+      original.some((s, i) => {
+        const p = payload.segments[i];
+        const o = s.pos || {}, np = p.pos || {};
+        return (o.x ?? null) !== (np.x ?? null) || (o.y ?? null) !== (np.y ?? null)
+          || (s.scale ?? 1) !== (p.scale ?? 1) || (s.rot ?? 0) !== (p.rot ?? 0);
+      });
+    const unchanged = lyricsFont == null && !layoutChanged &&
+      original.length === payload.segments.length &&
       original.every((s, i) =>
         s.text === payload.segments[i].text &&
         Math.abs((s.start ?? 0) - payload.segments[i].start) < 0.001 &&
@@ -993,6 +1014,7 @@ export default function EditRequestPanel({
         audioUrl={lyricsAudioUrl}
         waveform={lyricsWaveform}
         previewBgUrl={lyricsBgUrl}
+        onFontChange={(code) => setLyricsFont(code)}
         onApprove={submitLyricsWithSegments}
         submitting={submitting}
         initialParams={initialParams}
@@ -1012,7 +1034,7 @@ export default function EditRequestPanel({
  */
 function LyricsEditModal({
   open, audioError, error, staleRerender, onForceRerender, job, segments,
-  onSavedSegments, onClose, audioUrl, waveform, previewBgUrl, onApprove, submitting, initialParams, t,
+  onSavedSegments, onClose, audioUrl, waveform, previewBgUrl, onFontChange, onApprove, submitting, initialParams, t,
 }) {
   // Scroll the modal back to the top whenever a banner appears, so the
   // error / stale-rerender notice is never stranded above the fold while the
@@ -1115,6 +1137,7 @@ function LyricsEditModal({
               audioUrl={audioUrl}
               waveform={waveform}
               previewBgUrl={previewBgUrl}
+              onFontChange={onFontChange}
               referenceLyrics=""
               onApprove={onApprove}
               onBack={onClose}

@@ -5,6 +5,22 @@ import { useToast } from "./ToastProvider";
 import LyricsTimeline from "./LyricsTimeline";
 import LyricVideoPreview from "./LyricVideoPreview";
 
+// Font options for the live in-preview switcher. Codes match the render
+// pipeline / EditRequestPanel; css families are all loaded in index.html so
+// the preview renders the real typeface. "" = Auto (pipeline picks).
+const EDITOR_FONTS = [
+  { code: "", label: "Auto", css: "'Montserrat', sans-serif" },
+  { code: "anton", label: "Anton", css: "'Anton', sans-serif" },
+  { code: "bebas-neue", label: "Bebas Neue", css: "'Bebas Neue', sans-serif" },
+  { code: "oswald-bold", label: "Oswald", css: "'Oswald', sans-serif" },
+  { code: "montserrat-bold", label: "Montserrat", css: "'Montserrat', sans-serif" },
+  { code: "poppins-bold", label: "Poppins", css: "'Poppins', sans-serif" },
+  { code: "outfit-bold", label: "Outfit", css: "'Outfit', sans-serif" },
+  { code: "roboto-bold", label: "Roboto", css: "'Roboto', sans-serif" },
+  { code: "jost-bold", label: "Jost", css: "'Jost', sans-serif" },
+];
+const FONT_CSS_BY_CODE = Object.fromEntries(EDITOR_FONTS.map((f) => [f.code, f.css]));
+
 // Mismo flag que UploadZone/EditRequestPanel — oculta el label de motion
 // en el strip de metadata mientras la feature de animación está pausada.
 const SHOW_MOTION_PICKER = false;
@@ -257,6 +273,9 @@ export default function LyricsEditor({
   // above it. 0 in the modal (fixed overlay, no app chrome); the wizard
   // passes the app header height so the editor's CTA isn't cut off.
   stickyHeaderTop = 0,
+  // Called when the operator picks a font in the live preview switcher.
+  // Parent threads it into the render (render_params.font / edit_params).
+  onFontChange = null,
 }) {
   const { t } = useI18n();
   const [edited, setEdited] = useState(() =>
@@ -270,6 +289,9 @@ export default function LyricsEditor({
   // look across the song); "line" scopes the next edit to the selected line
   // only (for the odd tilted/repositioned line).
   const [layoutScope, setLayoutScope] = useState("all"); // "all" | "line"
+  // Live font selection (preview re-renders instantly; emitted to parent
+  // for the actual render). Seeded from the job's current font.
+  const [selectedFont, setSelectedFont] = useState(font || "");
   // Autosave confidence for the timeline view. saveStatus drives the
   // "Guardando…/Guardado ✓" chip; flushCounter triggers an immediate save
   // on a timeline drag (instead of waiting for the 3 s debounce).
@@ -1363,32 +1385,36 @@ export default function LyricsEditor({
         />
       )}
 
-      <div
-        className="sticky z-30 py-3 mb-4 bg-surface/90 backdrop-blur-md border-b border-white/[0.06] flex flex-wrap items-center justify-between gap-3"
-        style={{ top: stickyHeaderTop }}
-      >
-        <div className="flex items-center gap-3">
-          <button onClick={onBack}
-            className="w-9 h-9 rounded-xl bg-surface-2/40 ring-1 ring-white/[0.04] hover:ring-white/[0.08] hover:text-white flex items-center justify-center text-gray-400 transition-colors">
-            <svg className="w-4 h-4" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
-              <path d="M19 12H5M12 19l-7-7 7-7" />
-            </svg>
-          </button>
-          <div>
-            <h2 className="text-lg font-bold tracking-tight">{t("editor.title")}</h2>
-            <p className="text-sm text-ink-secondary">
-              {name}
-              {batchProgress && <span className="ml-2 text-brand-light text-xs">({batchProgress})</span>}
-            </p>
-          </div>
-        </div>
-        <button onClick={handleApprove} className="btn-primary text-sm h-11 px-5">
-          {submitLabel || (isBatch ? t("editor.approve_next") : t("editor.approve_generate"))}
-          <svg className="inline-block ml-1.5 w-4 h-4" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
-            <path d="M5 12h14M12 5l7 7-7 7" />
+      {/* Header: back + title (non-sticky). The primary CTA is a FIXED
+          floating button (below) so it can never be hidden behind the
+          app's own sticky top bar — the recurring "botón cortado". */}
+      <div className="py-3 mb-4 flex items-center gap-3">
+        <button onClick={onBack}
+          className="w-9 h-9 rounded-xl bg-surface-2/40 ring-1 ring-white/[0.04] hover:ring-white/[0.08] hover:text-white flex items-center justify-center text-gray-400 transition-colors shrink-0">
+          <svg className="w-4 h-4" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
+            <path d="M19 12H5M12 19l-7-7 7-7" />
           </svg>
         </button>
+        <div className="min-w-0">
+          <h2 className="text-lg font-bold tracking-tight">{t("editor.title")}</h2>
+          <p className="text-sm text-ink-secondary truncate">
+            {name}
+            {batchProgress && <span className="ml-2 text-brand-light text-xs">({batchProgress})</span>}
+          </p>
+        </div>
       </div>
+
+      {/* Fixed floating primary CTA — always reachable, never cut. */}
+      <button
+        onClick={handleApprove}
+        data-tour="editor-approve-floating"
+        className="fixed bottom-6 right-6 z-50 inline-flex items-center gap-1.5 btn-primary text-sm h-12 px-6 shadow-2xl shadow-brand/30"
+      >
+        {submitLabel || (isBatch ? t("editor.approve_next") : t("editor.approve_generate"))}
+        <svg className="w-4 h-4" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
+          <path d="M5 12h14M12 5l7 7-7 7" />
+        </svg>
+      </button>
 
       {coverageWarning && (
         <div className="mb-4 rounded-2xl ring-1 ring-accent/25 bg-accent/[0.06] px-4 py-3 flex items-start gap-3">
@@ -1918,6 +1944,22 @@ export default function LyricsEditor({
           {/* Preview + apply-scope toggle (sticky so it stays in view
               while the timeline column scrolls internally). */}
           <div className="space-y-2 lg:sticky lg:top-2">
+            {/* Live font switcher — preview re-renders in the chosen
+                typeface instantly; applied to the render on re-render. */}
+            <div className="flex items-center gap-2 px-1">
+              <span className="text-[11px] text-ink-tertiary shrink-0">Tipografía</span>
+              <select
+                value={selectedFont}
+                onChange={(e) => { setSelectedFont(e.target.value); onFontChange?.(e.target.value); }}
+                className="flex-1 bg-surface-2 ring-1 ring-white/[0.08] rounded-md px-2 py-1.5 text-xs text-white focus:ring-brand outline-none cursor-pointer"
+                style={{ fontFamily: FONT_CSS_BY_CODE[selectedFont] }}
+                title="Probar otra tipografía — se ve en el preview al instante"
+              >
+                {EDITOR_FONTS.map((f) => (
+                  <option key={f.code} value={f.code} style={{ fontFamily: f.css }}>{f.label}</option>
+                ))}
+              </select>
+            </div>
             <div className="flex items-center justify-between px-1 gap-2 flex-wrap">
               <span className="text-[11px] text-ink-tertiary">Mover · escalar · rotar aplica a</span>
               <div className="inline-flex rounded-md ring-1 ring-white/[0.08] overflow-hidden text-[11px] font-semibold">
@@ -1936,7 +1978,7 @@ export default function LyricsEditor({
               currentTime={currentTime}
               backgroundUrl={previewBgUrl || null}
               backgroundStyle={backgroundStyle || "default"}
-              font={font || undefined}
+              font={FONT_CSS_BY_CODE[selectedFont] || undefined}
               onSelect={(id) => {
                 focusSegment(id);
                 const seg = edited.find((s) => s._id === id);
