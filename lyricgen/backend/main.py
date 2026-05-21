@@ -3418,15 +3418,23 @@ async def _run_transcription_for_job(
                     ref_lines = sum(
                         1 for ln in reference.splitlines() if ln.strip()
                     )
-                    aligned = align_lrclib_to_whisper(reference, segments)
-                    coverage = (
-                        len(aligned) / ref_lines if ref_lines else 0.0
+                    # keep_unmatched: insert the lines Whisper missed in
+                    # place (interpolated timing + review flag) so the
+                    # operator nudges/deletes instead of re-typing.
+                    aligned = align_lrclib_to_whisper(
+                        reference, segments,
+                        keep_unmatched=True, total_duration=user_dur,
                     )
-                    if coverage >= 0.5 and len(aligned) >= 8:
-                        logger.info("[LYRICS] aligner (gemini): %s/%s lines aligned (%.0f%% coverage) — replacing Whisper segmentation", len(aligned), ref_lines, coverage * 100)
+                    # Coverage is judged on CONFIDENT matches only (lines
+                    # without the review flag), not the interpolated ones.
+                    matched = sum(1 for s in aligned if not s.get("review"))
+                    review = len(aligned) - matched
+                    coverage = matched / ref_lines if ref_lines else 0.0
+                    if coverage >= 0.5 and matched >= 8:
+                        logger.info("[LYRICS] aligner (gemini): %s/%s lines matched (%.0f%% coverage), %s inserted for review — replacing Whisper segmentation", matched, ref_lines, coverage * 100, review)
                         segments = aligned
                     else:
-                        logger.warning("[LYRICS] aligner (gemini): low coverage (%s/%s = %.0f%%) — keeping raw Whisper, trying hallucination recovery", len(aligned), ref_lines, coverage * 100)
+                        logger.warning("[LYRICS] aligner (gemini): low coverage (%s/%s = %.0f%%) — keeping raw Whisper, trying hallucination recovery", matched, ref_lines, coverage * 100)
                 except Exception as e:
                     # Opt-in and conservative: any aligner failure must NOT
                     # break the existing pipeline.
