@@ -58,6 +58,96 @@ class AssLine:
     fade_out_ms: int = 0
 
 
+# --- Style tiers (single source of truth, mirrored by pipeline) ---------
+#
+# These mirror the legacy sizing/fade logic in pipeline._make_text_clip
+# exactly. Keeping them here (pure, testable) lets BOTH the moviepy path
+# and the ASS path compute identical values, so swapping engines never
+# shifts the look. pipeline._make_text_clip is refactored to call these.
+
+_FADE_DURATIONS_S = {"fade": 0.15, "fade_slow": 0.30}
+
+
+def lyric_fontsize(text_len: int, scale: float, font_scale: float = 1.0) -> int:
+    """Font size for a lyric line, by character count (legacy tiers).
+
+    Mirrors _make_text_clip: >80 chars → 55, >50 → 70, else 85 (each
+    multiplied by spec.text_scale), then the user's font_scale (clamped
+    0.6-1.5), floored at 18px."""
+    font_scale = max(0.6, min(1.5, float(font_scale or 1.0)))
+    if text_len > 80:
+        base = 55
+    elif text_len > 50:
+        base = 70
+    else:
+        base = 85
+    base_fontsize = int(round(base * scale))
+    return max(18, int(round(base_fontsize * font_scale)))
+
+
+def fade_seconds(lyric_transition: str, seg_duration: float) -> float:
+    """Fade in/out duration in seconds, capped at 1/3 of the segment so
+    short lines don't fully dissolve. Cuts → 0."""
+    fade = _FADE_DURATIONS_S.get(lyric_transition, 0.0)
+    return min(fade, max(0.0, seg_duration) / 3)
+
+
+def perceptual_start(seg_start: float, fade_dur: float) -> float:
+    """Shift the visual onset earlier by half the fade so the perceived
+    'appear' moment (~50% opacity) lands on the operator's anchored
+    timestamp. Mirrors _make_text_clip's fade_perceptual_offset."""
+    return max(0.0, seg_start - fade_dur / 2.0)
+
+
+def _clean_display_text(text: str, case_fn) -> str:
+    """Apply the case transform + the same sanitisation _make_text_clip
+    does before handing text to the renderer (NFC normalise, drop chars
+    that break the text engine). Returns "" for blank lines so the
+    caller can skip them."""
+    import unicodedata
+    cased = case_fn(text) if case_fn else text
+    out = unicodedata.normalize("NFC", cased)
+    out = out.replace("@", "").replace("`", "'").replace("\x00", "")
+    return out if out.strip() else ""
+
+
+def segments_to_lines(
+    segments: list[dict],
+    *,
+    text_scale: float,
+    font_scale: float = 1.0,
+    lyric_transition: str = "cut",
+    case_fn=None,
+) -> list[AssLine]:
+    """Convert segments_json into ASS lines with parity to the moviepy
+    path: same case/sanitise, same fontsize tiers (by cleaned-text
+    length), same fade durations + perceptual onset offset.
+
+    case_fn: optional callable applied to each line's raw text (pipeline
+    passes _apply_case; tests pass None for identity)."""
+    lines: list[AssLine] = []
+    for seg in segments:
+        raw = seg.get("text", "")
+        display = _clean_display_text(raw, case_fn)
+        if not display:
+            continue
+        seg_start = float(seg.get("start", 0.0))
+        seg_end = float(seg.get("end", 0.0))
+        seg_dur = max(0.1, seg_end - seg_start)
+        fontsize = lyric_fontsize(len(display), text_scale, font_scale)
+        fade_dur = fade_seconds(lyric_transition, seg_dur)
+        fade_ms = int(round(fade_dur * 1000))
+        lines.append(AssLine(
+            text=display,
+            start_s=perceptual_start(seg_start, fade_dur),
+            end_s=seg_end,
+            fontsize=fontsize,
+            fade_in_ms=fade_ms,
+            fade_out_ms=fade_ms,
+        ))
+    return lines
+
+
 def _ass_time(seconds: float) -> str:
     """Format seconds as ASS H:MM:SS.cs (centiseconds)."""
     if seconds < 0:

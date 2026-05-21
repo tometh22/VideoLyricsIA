@@ -2,7 +2,60 @@
 lyric-render path. Pure formatter, no moviepy/ImageMagick, so this runs
 on any Python without the heavy render deps."""
 
-from ass_render import AssLine, build_ass, _ass_time, _ass_escape
+from ass_render import (
+    AssLine, build_ass, _ass_time, _ass_escape,
+    lyric_fontsize, fade_seconds, perceptual_start,
+    segments_to_lines,
+)
+
+
+def test_segments_to_lines_parity_basics():
+    segs = [
+        {"start": 2.0, "end": 5.0, "text": "Hola mundo"},
+        {"start": 6.0, "end": 6.05, "text": "   "},           # blank → skipped
+        {"start": 10.0, "end": 14.0, "text": "línea con @ y `"},
+    ]
+    lines = segments_to_lines(segs, text_scale=1.0, lyric_transition="fade")
+    assert len(lines) == 2  # blank skipped
+    # @ stripped, ` → '
+    assert lines[1].text == "línea con  y '"
+    # fade=0.15s → 150ms, start shifted earlier by half (0.075s)
+    assert lines[0].fade_in_ms == 150
+    assert abs(lines[0].start_s - (2.0 - 0.075)) < 1e-9
+    assert lines[0].end_s == 5.0
+
+
+def test_segments_to_lines_applies_case_fn_then_sizes_by_length():
+    segs = [{"start": 0.0, "end": 3.0, "text": "abc"}]
+    lines = segments_to_lines(
+        segs, text_scale=1.0, case_fn=str.upper, lyric_transition="cut",
+    )
+    assert lines[0].text == "ABC"
+    assert lines[0].fontsize == 85   # short line tier
+    assert lines[0].fade_in_ms == 0  # cut → no fade
+
+
+def test_lyric_fontsize_tiers_mirror_legacy():
+    # scale=1.0 → tiers 85/70/55, floored at 18.
+    assert lyric_fontsize(10, 1.0) == 85
+    assert lyric_fontsize(60, 1.0) == 70   # >50
+    assert lyric_fontsize(90, 1.0) == 55   # >80
+    # font_scale clamps to [0.6, 1.5].
+    assert lyric_fontsize(10, 1.0, font_scale=2.0) == int(round(85 * 1.5))
+    assert lyric_fontsize(10, 1.0, font_scale=0.1) == max(18, int(round(85 * 0.6)))
+    # scale applies before font_scale.
+    assert lyric_fontsize(10, 2.0) == 170
+
+
+def test_fade_seconds_and_perceptual_offset():
+    assert fade_seconds("cut", 10) == 0.0
+    assert fade_seconds("fade", 10) == 0.15
+    assert fade_seconds("fade_slow", 10) == 0.30
+    # capped at seg/3 for short lines (float, compare with tolerance)
+    assert abs(fade_seconds("fade_slow", 0.6) - 0.2) < 1e-9
+    # perceptual start shifts earlier by half the fade, clamped at 0
+    assert perceptual_start(5.0, 0.30) == 4.85
+    assert perceptual_start(0.05, 0.30) == 0.0
 
 
 def test_ass_time_formats_centiseconds():
