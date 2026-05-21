@@ -184,8 +184,10 @@ export default function UploadZone({
     genre: "", concept: "", movementStyle: "", font: "",
     textCase: "upper", fontScale: "1.0", lyricTransition: "cut", textMotion: "none", textContrast: "medium",
     // Escena axis: optional free-text prompt ("Mi prompt"). When non-empty it
-    // overrides genre/concept/lyrics; bgVerbatim sends it to Veo unchanged.
-    backgroundHint: "", bgVerbatim: false,
+    // overrides genre/concept/lyrics. bgVerbatim TRUE by default = use the
+    // operator's text as-is (people expect their prompt used, not rewritten);
+    // the "Mejorar con IA" toggle opts INTO a Gemini rewrite (bgVerbatim=false).
+    backgroundHint: "", bgVerbatim: true,
   };
   const loadStoredBatchDefaults = () => {
     try {
@@ -725,30 +727,16 @@ export default function UploadZone({
                   }`}
               >
                 <div className="aspect-video bg-black relative overflow-hidden">
-                  {/* REAL scene (same base photo in every card) with the actual
-                      movement applied so the card communicates the MOVEMENT, not
-                      a random scene. estatico=still, sutil/estandar=zoom-drift,
-                      parallax=slow push, animado=stylised 2D illustration. */}
-                  {m.code === "animado" ? (
-                    <div
-                      className="absolute inset-[-24%]"
-                      style={{ background: "repeating-linear-gradient(45deg,#6D4AFF 0 14px,#14C8A8 14px 28px)", animation: "gal-anim 1.6s linear infinite" }}
-                    />
-                  ) : (
-                    <div
-                      className="absolute inset-[-24%] bg-cover bg-center"
-                      style={{
-                        backgroundImage: "url(/movement_samples/scene-base.jpg)",
-                        animation: {
-                          estatico: "none",
-                          sutil: "gal-sm 6s ease-in-out infinite alternate",
-                          estandar: "gal-lg 5s ease-in-out infinite alternate",
-                          "foto-parallax": "gal-par 5s ease-in-out infinite alternate",
-                        }[m.code] || "none",
-                      }}
-                    />
-                  )}
-                  <div className="absolute inset-0 bg-gradient-to-t from-black/40 to-transparent" />
+                  {/* REAL clips: same base scene rendered with each actual
+                      camera movement (ffmpeg), so the card shows the MOVEMENT,
+                      not a random scene. estatico=held, sutil/estandar=zoom,
+                      parallax=pan, animado=stylised. */}
+                  <video
+                    src={m.sample}
+                    className="w-full h-full object-cover pointer-events-none"
+                    muted autoPlay loop playsInline
+                  />
+                  <div className="absolute inset-0 bg-gradient-to-t from-black/40 to-transparent pointer-events-none" />
                   {m.code === "estatico" && (
                     <span className="absolute right-1.5 bottom-1.5 text-[8px] px-1.5 py-0.5 rounded bg-black/60 text-gray-200">fijo</span>
                   )}
@@ -1249,7 +1237,7 @@ export default function UploadZone({
           {/* Mode selector */}
           <div className="flex gap-1 p-1 glass rounded-xl w-fit mb-3" data-tour="upload-bg-tabs">
             {[
-              { id: "auto", label: t("upload.bg_auto") || "IA Auto" },
+              { id: "auto", label: t("upload.bg_auto") || "Generar con IA" },
               { id: "library", label: t("upload.bg_library") || "Library" },
               { id: "custom", label: t("upload.bg_custom_tab") || "Upload" },
             ].map((m) => (
@@ -1534,7 +1522,7 @@ export default function UploadZone({
   } else if (bgMode === "custom" && backgroundFile) {
     summaryParts.push(backgroundFile.name.length > 28 ? backgroundFile.name.slice(0, 28) + "…" : backgroundFile.name);
   } else {
-    summaryParts.push(t("upload.bg_auto") || "IA Auto");
+    summaryParts.push(t("upload.bg_auto") || "Generar con IA");
   }
   const summary = summaryParts.join(" · ");
 
@@ -1666,15 +1654,16 @@ export default function UploadZone({
                       <label className="mt-2 flex items-center gap-2.5 cursor-pointer">
                         <input
                           type="checkbox"
-                          checked={!!batchDefaults.bgVerbatim}
-                          onChange={(e) => updateBatchDefault("bgVerbatim", e.target.checked)}
+                          checked={!batchDefaults.bgVerbatim}
+                          onChange={(e) => updateBatchDefault("bgVerbatim", !e.target.checked)}
                           className="peer sr-only"
                         />
                         <div className="relative w-9 h-5 rounded-full bg-surface-3 peer-checked:bg-brand transition-colors duration-200 shrink-0">
                           <div className="absolute top-0.5 left-0.5 w-4 h-4 rounded-full bg-white shadow transition-transform duration-200 peer-checked:translate-x-4" />
                         </div>
                         <span className="text-[11px] text-gray-400">
-                          {t("upload.bg_verbatim_label") || "Usar mi prompt tal cual (sin reescritura de IA)"}
+                          {t("upload.bg_enhance_label") || "✨ Mejorar mi prompt con IA"}
+                          <span className="block text-[10px] text-gray-600">{t("upload.bg_enhance_hint") || "Por defecto usamos tu texto tal cual."}</span>
                         </span>
                       </label>
                     </div>

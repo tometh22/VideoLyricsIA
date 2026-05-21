@@ -181,6 +181,8 @@ const translations = {
     "upload.bg_prompt_hint": "Describí el fondo que querés. Si lo completás, manda sobre el género/concepto y la letra.",
     "upload.bg_prompt_placeholder": "Ej: mansión surreal de noche, pileta vacía, cámara fija, sólo se mueve el reflejo del agua…",
     "upload.bg_verbatim_label": "Usar mi prompt tal cual (sin reescritura de IA)",
+    "upload.bg_enhance_label": "✨ Mejorar mi prompt con IA",
+    "upload.bg_enhance_hint": "Por defecto usamos tu texto tal cual.",
     "upload.bg_prompt_label_short": "Mi prompt",
     "upload.step_source": "Fuente del fondo",
     "upload.step_mode": "Modo",
@@ -436,7 +438,7 @@ const translations = {
 
     // Upload - custom background
     "upload.bg_label": "Fondo",
-    "upload.bg_auto": "IA Auto",
+    "upload.bg_auto": "Generar con IA",
     "upload.bg_library": "Biblioteca",
     "upload.bg_custom_tab": "Subir",
     "upload.bg_selected": "Seleccionado",
@@ -448,7 +450,7 @@ const translations = {
     "upload.batch_summary": "Lote",
     "common.change": "Cambiar",
     "common.collapse": "Cerrar",
-    "upload.bg_auto_desc": "La IA generara un fondo unico basado en el mood y las letras de la cancion.",
+    "upload.bg_auto_desc": "Elegí abajo cómo la IA arma la escena.",
     "upload.bg_library_empty": "No hay fondos pre-aprobados disponibles. Contacta al admin para subir algunos.",
     "upload.bg_library_error": "Error al cargar la biblioteca.",
     "upload.retry": "Reintentar",
@@ -1288,7 +1290,7 @@ const translations = {
     "detail.validation_issues": "Content policy issues detected",
 
     "upload.bg_label": "Background",
-    "upload.bg_auto": "AI Auto",
+    "upload.bg_auto": "Generate with AI",
     "upload.bg_library": "Library",
     "upload.bg_custom_tab": "Upload",
     "upload.bg_selected": "Selected",
