@@ -78,6 +78,28 @@ export default function Landing() {
         </div>
       </section>
 
+      {/* Formats — what you get, visual cards (Rotor-style) */}
+      <section className="relative z-10 max-w-6xl mx-auto px-6 py-24">
+        <h2 className="text-3xl sm:text-4xl font-extrabold text-center mb-3">{t("home.formats_title")}</h2>
+        <p className="text-gray-500 text-center mb-12 max-w-md mx-auto">{t("home.formats_sub")}</p>
+        <div className="grid grid-cols-2 lg:grid-cols-4 gap-5">
+          {[
+            { title: "Lyric Video", desc: "1920×1080 · Full HD", img: "/samples/sample-reef.png", aspect: "aspect-video" },
+            { title: "YouTube Short", desc: "1080×1920 · Vertical", img: "/samples/sample-forest.png", aspect: "aspect-[3/4]" },
+            { title: "Thumbnail", desc: "1280×720", img: "/samples/sample-forest.png", aspect: "aspect-video" },
+            { title: t("home.fmt_prores_t"), desc: t("home.fmt_prores_d"), img: null, aspect: "aspect-video" },
+          ].map((f) => (
+            <div key={f.title} className="glass rounded-2xl p-3 glass-hover">
+              <div className={`rounded-xl overflow-hidden ${f.aspect} bg-gradient-to-br from-brand/25 to-accent/15 mb-3 flex items-center justify-center`}>
+                {f.img ? <img src={f.img} alt={f.title} className="w-full h-full object-cover" /> : <span className="text-sm font-bold text-white/70">ProRes</span>}
+              </div>
+              <h3 className="font-semibold text-sm">{f.title}</h3>
+              <p className="text-xs text-gray-500">{f.desc}</p>
+            </div>
+          ))}
+        </div>
+      </section>
+
       {/* Showcase — big lyric video in action, text left / video right */}
       <section id="showcase" className="relative z-10 scroll-mt-24 border-b border-white/[0.06] bg-gradient-to-b from-brand/[0.06] to-transparent">
         <div className="max-w-6xl mx-auto px-6 py-24 grid lg:grid-cols-2 gap-12 items-center">
@@ -118,6 +140,28 @@ export default function Landing() {
               </div>
             </div>
           ))}
+        </div>
+      </section>
+
+      {/* How it works — "just add your music" (Rotor-style) */}
+      <section className="relative z-10 border-y border-white/[0.06] bg-white/[0.015]">
+        <div className="max-w-6xl mx-auto px-6 py-24">
+          <h2 className="text-3xl sm:text-4xl font-extrabold text-center mb-3">{t("home.how_title")}</h2>
+          <p className="text-gray-500 text-center mb-16 max-w-md mx-auto">{t("home.how_sub")}</p>
+          <div className="grid sm:grid-cols-3 gap-10">
+            {[
+              { n: "01", t: t("landing.step1"), d: t("landing.step1_desc") },
+              { n: "02", t: t("landing.step2"), d: t("landing.step2_desc") },
+              { n: "03", t: t("landing.step3"), d: t("landing.step3_desc") },
+            ].map((s, i) => (
+              <div key={s.n} className="relative text-center">
+                <div className="text-6xl font-extrabold text-brand/15 mb-4">{s.n}</div>
+                <h3 className="text-lg font-bold mb-2">{s.t}</h3>
+                <p className="text-sm text-gray-400 leading-relaxed">{s.d}</p>
+                {i < 2 && <div className="hidden sm:block absolute top-8 -right-5 text-gray-700"><svg className="w-5 h-5" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24"><path d="M5 12h14M12 5l7 7-7 7" strokeLinecap="round" strokeLinejoin="round"/></svg></div>}
+              </div>
+            ))}
+          </div>
         </div>
       </section>
 
