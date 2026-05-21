@@ -27,6 +27,7 @@ function setup(overrides = {}) {
     onSeek: vi.fn(),
     onDragStart: vi.fn(),
     onTimingChange: vi.fn(),
+    onTextChange: vi.fn(),
     onFocus: vi.fn(),
     onReset: vi.fn(),
     ...overrides,
@@ -74,6 +75,26 @@ it("dragging commits a new timing via onTimingChange + pushes one undo snapshot"
   expect(newStart).toBeGreaterThan(10); // moved later
   expect(newEnd).toBeGreaterThan(11);
   expect(props.onFocus).not.toHaveBeenCalled();
+});
+
+it("double-click on a line's text edits it inline and commits via onTextChange (no view switch)", () => {
+  const props = setup();
+  const span = screen.getByText("segunda línea");
+  fireEvent.doubleClick(span);
+  const input = screen.getByDisplayValue("segunda línea");
+  fireEvent.change(input, { target: { value: "segunda línea corregida" } });
+  fireEvent.keyDown(input, { key: "Enter" });
+  expect(props.onTextChange).toHaveBeenCalledWith(1, "segunda línea corregida");
+});
+
+it("Escape cancels an inline text edit without committing", () => {
+  const props = setup();
+  fireEvent.doubleClick(screen.getByText("segunda línea"));
+  const input = screen.getByDisplayValue("segunda línea");
+  fireEvent.change(input, { target: { value: "descartar" } });
+  fireEvent.keyDown(input, { key: "Escape" });
+  expect(props.onTextChange).not.toHaveBeenCalled();
+  expect(screen.getByText("segunda línea")).toBeInTheDocument();
 });
 
 it("zoom + makes blocks taller (vertical px/s geometry)", () => {

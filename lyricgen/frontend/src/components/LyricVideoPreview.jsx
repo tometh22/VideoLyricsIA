@@ -47,6 +47,10 @@ const CONTRAST_STYLES = {
   strong: { WebkitTextStroke: "1.5px #000", textShadow: "0 0 6px rgba(0,0,0,1), -1px -1px 0 #000, 1px 1px 0 #000, 0 2px 0 #000" },
 };
 
+// Fade duration per transition (seconds), mirroring ass_render.fade_seconds.
+// cut = hard in/out; capped to dur/3 so short lines never fade the whole time.
+const FADE_SECONDS = { cut: 0, fade: 0.15, fade_slow: 0.3 };
+
 export default function LyricVideoPreview({
   segments,           // [{_id, start, end, text, pos?, scale?, rot?}]
   currentTime,
@@ -55,6 +59,7 @@ export default function LyricVideoPreview({
   font,                   // css font-family for parity with render (optional)
   textCase = "upper",     // upper | lower | title | original — applied to displayed text
   textContrast = "medium",// subtle | medium | strong — outline/shadow strength
+  transition = "cut",     // cut | fade | fade_slow — previewed as opacity ramp
   videoRef = null,        // optional shared <video> ref for bg sync
   onSelect,               // (id) => void — bidirectional selection w/ list/timeline
   onLayoutChange,         // (id, {pos, scale, rot}) => void — commit
@@ -159,6 +164,19 @@ export default function LyricVideoPreview({
   const l = activeSeg ? layoutOf(activeSeg) : null;
   const fsPx = l ? `${BASE_FS_FRAC * 100 * l.scale}cqw` : undefined;
 
+  // Fade-in/out opacity so the chosen transition is visible while scrubbing
+  // the active line. Ramps 0→1 over the first `fd` seconds and 1→0 over the
+  // last `fd`; full opacity in the middle. cut → always 1 (no change).
+  const textOpacity = useMemo(() => {
+    if (!activeSeg) return 1;
+    const base = FADE_SECONDS[transition] ?? 0;
+    if (base <= 0) return 1;
+    const fd = Math.min(base, (activeSeg.end - activeSeg.start) / 3);
+    if (fd <= 0) return 1;
+    const ramp = Math.min((currentTime - activeSeg.start) / fd, (activeSeg.end - currentTime) / fd, 1);
+    return clamp(ramp, 0, 1);
+  }, [activeSeg, transition, currentTime]);
+
   return (
     <div
       ref={frameRef}
@@ -229,6 +247,7 @@ export default function LyricVideoPreview({
               fontSize: fsPx,
               fontFamily: font || undefined,
               lineHeight: 1.1,
+              opacity: textOpacity,
               ...(CONTRAST_STYLES[textContrast] || CONTRAST_STYLES.medium),
             }}
           >

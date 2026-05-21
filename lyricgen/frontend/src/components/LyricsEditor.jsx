@@ -2046,6 +2046,7 @@ export default function LyricsEditor({
               font={FONT_CSS_BY_CODE[selectedFont] || undefined}
               textCase={selectedCase}
               textContrast={selectedContrast}
+              transition={selectedTransition}
               onSelect={(id) => {
                 focusSegment(id);
                 const seg = edited.find((s) => s._id === id);
@@ -2069,6 +2070,7 @@ export default function LyricsEditor({
             onSeek={(s) => seekTo(s, false)}
             onDragStart={pushEditHistory}
             onTimingChange={handleTimelineTimingChange}
+            onTextChange={updateText}
             onFocus={focusSegment}
             onReset={resetTimings}
           />

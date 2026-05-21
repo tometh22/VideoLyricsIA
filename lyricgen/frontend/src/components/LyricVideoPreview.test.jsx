@@ -68,6 +68,23 @@ it("uses an existing layout override (rot) on the active line", () => {
   expect(wrap.style.transform).toContain("rotate(-8deg)");
 });
 
+it("with fade, the active line ramps opacity at its start; full opacity mid-line", () => {
+  // seg _id:1 is 5..10. fade dur = 0.15s. Just after start → partial opacity.
+  setup({ transition: "fade", currentTime: 5.05 });
+  const fadingIn = parseFloat(screen.getByText("segunda línea").style.opacity);
+  expect(fadingIn).toBeGreaterThan(0);
+  expect(fadingIn).toBeLessThan(1);
+  cleanup();
+  // Mid-line → full opacity.
+  setup({ transition: "fade", currentTime: 7 });
+  expect(parseFloat(screen.getByText("segunda línea").style.opacity)).toBe(1);
+});
+
+it("with cut, the active line is always full opacity (no fade)", () => {
+  setup({ transition: "cut", currentTime: 5.02 });
+  expect(parseFloat(screen.getByText("segunda línea").style.opacity)).toBe(1);
+});
+
 it("renders a <video> when backgroundUrl is set, gradient otherwise", () => {
   const { container, rerender } = setup({ backgroundUrl: null });
   expect(container.querySelector("video")).not.toBeInTheDocument();

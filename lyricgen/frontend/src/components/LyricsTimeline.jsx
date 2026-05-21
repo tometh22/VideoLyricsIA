@@ -58,6 +58,7 @@ export default function LyricsTimeline({
   onSeek,              // (seconds) => void
   onDragStart,         // () => void  — push one undo snapshot before a drag commits
   onTimingChange,      // (id, newStart, newEnd) => void — commit; parent sets locked
+  onTextChange,        // (id, text) => void — inline text fix without leaving timeline
   onFocus,             // (id) => void
   onReset,             // () => void
 }) {
@@ -68,7 +69,19 @@ export default function LyricsTimeline({
   const [preview, setPreview] = useState(null); // {id, start, end} | null
   const dragRef = useRef(null); // {id, mode, originY, origStart, origEnd, moved}
   const [pxPerSec, setPxPerSec] = useState(ZOOM_DEFAULT);
+  const [editingTextId, setEditingTextId] = useState(null); // line whose text is being fixed inline
+  const [draftText, setDraftText] = useState("");
   const lastUserScrollRef = useRef(0);
+
+  const beginTextEdit = useCallback((seg) => {
+    setEditingTextId(seg._id);
+    setDraftText(seg.text || "");
+  }, []);
+  const commitTextEdit = useCallback((id) => {
+    setEditingTextId((cur) => (cur === id ? null : cur));
+    onTextChange?.(id, draftText);
+  }, [draftText, onTextChange]);
+  const cancelTextEdit = useCallback(() => setEditingTextId(null), []);
   const markUserScroll = useCallback(() => { lastUserScrollRef.current = Date.now(); }, []);
 
   const total = Math.max(duration || 0, ...segments.map((s) => s.end), 1);
@@ -384,7 +397,32 @@ export default function LyricsTimeline({
                     floating in the middle of a tall held block. */}
                 <div className="px-3 flex items-start gap-2" style={{ touchAction: "none", paddingTop: EDGE_PX + 4 }}>
                   <span className="text-[9px] text-ink-tertiary tabular-nums shrink-0 mt-px">{fmt(start)}</span>
-                  <span className="text-white/90 line-clamp-2">{seg.text}</span>
+                  {editingTextId === seg._id ? (
+                    <input
+                      type="text"
+                      autoFocus
+                      value={draftText}
+                      onChange={(ev) => setDraftText(ev.target.value)}
+                      onPointerDown={(ev) => ev.stopPropagation()}
+                      onClick={(ev) => ev.stopPropagation()}
+                      onBlur={() => commitTextEdit(seg._id)}
+                      onKeyDown={(ev) => {
+                        if (ev.key === "Enter") { ev.preventDefault(); commitTextEdit(seg._id); }
+                        else if (ev.key === "Escape") { ev.preventDefault(); cancelTextEdit(); }
+                      }}
+                      className="flex-1 min-w-0 bg-surface-1 border border-brand/50 focus:border-brand
+                        outline-none rounded px-1 py-0.5 text-[12px] text-white"
+                    />
+                  ) : (
+                    <span
+                      className="text-white/90 line-clamp-2 cursor-text"
+                      onPointerDown={(ev) => ev.stopPropagation()}
+                      onDoubleClick={(ev) => { ev.stopPropagation(); beginTextEdit(seg); }}
+                      title="Doble-click para corregir el texto"
+                    >
+                      {seg.text}
+                    </span>
+                  )}
                 </div>
               </div>
             );
@@ -404,6 +442,7 @@ export default function LyricsTimeline({
         <span><span className="text-ink-secondary">↕ bordes</span> ajustan entra/sale</span>
         <span><span className="text-ink-secondary">cuerpo</span> mueve la línea</span>
         <span><span className="text-ink-secondary">click</span> salta a ese punto</span>
+        <span><span className="text-ink-secondary">doble-click</span> corrige el texto</span>
         <span className="text-ink-tertiary/70">lo que ajustás queda fijo</span>
       </p>
     </div>
