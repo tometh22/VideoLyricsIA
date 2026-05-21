@@ -183,6 +183,40 @@ def test_build_ass_skips_empty_and_inverted_lines():
     assert "válida" in dialogues[0]
 
 
+def test_build_ass_emits_pos_and_rotation_overrides():
+    lines = [
+        AssLine(text="torcida", start_s=1.0, end_s=3.0, fontsize=85,
+                pos=(0.25, 0.75), rot=-8),
+    ]
+    out = build_ass(width=1920, height=1080, font_name="Anton",
+                    base_fontsize=85, outline=2, shadow=3, lines=lines)
+    d = [l for l in out.splitlines() if l.startswith("Dialogue:")][0]
+    # pos fraction → pixels, anchored center (\an5)
+    assert "\\an5\\pos(480,810)" in d   # 0.25*1920=480, 0.75*1080=810
+    # CSS clockwise -8 → ASS counter-clockwise +8
+    assert "\\frz8" in d
+
+
+def test_build_ass_no_layout_override_when_absent():
+    lines = [AssLine(text="centrada", start_s=0.0, end_s=2.0, fontsize=85)]
+    out = build_ass(width=1920, height=1080, font_name="Anton",
+                    base_fontsize=85, outline=2, shadow=3, lines=lines)
+    d = [l for l in out.splitlines() if l.startswith("Dialogue:")][0]
+    assert "\\pos(" not in d and "\\frz" not in d  # uses style default (centered)
+
+
+def test_segments_to_lines_reads_pos_scale_rot():
+    segs = [{
+        "start": 1.0, "end": 4.0, "text": "abc",
+        "pos": {"x": 0.3, "y": 0.6}, "scale": 1.5, "rot": -10,
+    }]
+    lines = segments_to_lines(segs, text_scale=1.0, lyric_transition="cut")
+    ln = lines[0]
+    assert ln.pos == (0.3, 0.6)
+    assert ln.rot == -10
+    assert ln.fontsize == int(round(85 * 1.5))  # short-line tier 85 × scale
+
+
 def test_build_ass_text_with_braces_does_not_break_override_block():
     lines = [AssLine(text="texto {raro}", start_s=0.0, end_s=2.0, fontsize=85)]
     out = build_ass(

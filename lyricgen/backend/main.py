@@ -5128,6 +5128,19 @@ async def request_edit(
                 # clobbering the operator's hand-set end. Only carry it when
                 # truthy so untouched lines stay clean.
                 **({"locked": True} if s.get("locked") else {}),
+                # Preserve per-line layout overrides set in the live preview
+                # (position / size / rotation). Same reason as `locked`: a
+                # re-render must not strip the operator's layout. Only carried
+                # when set to a non-default value so untouched lines stay clean.
+                **({"pos": {"x": float(s["pos"]["x"]), "y": float(s["pos"]["y"])}}
+                   if isinstance(s.get("pos"), dict)
+                   and "x" in s["pos"] and "y" in s["pos"] else {}),
+                **({"scale": float(s["scale"])}
+                   if isinstance(s.get("scale"), (int, float))
+                   and float(s["scale"]) != 1.0 else {}),
+                **({"rot": float(s["rot"])}
+                   if isinstance(s.get("rot"), (int, float))
+                   and float(s["rot"]) != 0.0 else {}),
             }
             for s in body.segments
         ]

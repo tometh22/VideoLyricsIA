@@ -49,13 +49,20 @@ class AssLine:
     start_s / end_s already include any perceptual fade offset the
     caller wants (we do not re-derive it here — parity logic lives in
     pipeline). text is the final display string (case transform already
-    applied)."""
+    applied).
+
+    Layout overrides (None/0 → centered default):
+      pos: (x, y) as 0..1 fractions of the frame for the line's CENTER.
+      rot: degrees CLOCKWISE (preview/CSS convention). ASS \\frz is
+           counter-clockwise-positive, so build_ass emits -rot."""
     text: str
     start_s: float
     end_s: float
     fontsize: int
     fade_in_ms: int = 0
     fade_out_ms: int = 0
+    pos: tuple | None = None
+    rot: float = 0.0
 
 
 # --- Style tiers (single source of truth, mirrored by pipeline) ---------
@@ -175,6 +182,16 @@ def segments_to_lines(
         seg_end = float(seg.get("end", 0.0))
         seg_dur = max(0.1, seg_end - seg_start)
         fontsize = lyric_fontsize(len(display), text_scale, font_scale)
+        # Per-line layout overrides (operator-set in the preview).
+        scale = seg.get("scale")
+        if isinstance(scale, (int, float)) and scale > 0:
+            fontsize = max(8, int(round(fontsize * scale)))
+        pos = None
+        _p = seg.get("pos")
+        if isinstance(_p, dict) and "x" in _p and "y" in _p:
+            pos = (float(_p["x"]), float(_p["y"]))
+        rot = seg.get("rot")
+        rot = float(rot) if isinstance(rot, (int, float)) else 0.0
         fade_dur = fade_seconds(lyric_transition, seg_dur)
         fade_ms = int(round(fade_dur * 1000))
         lines.append(AssLine(
@@ -184,6 +201,8 @@ def segments_to_lines(
             fontsize=fontsize,
             fade_in_ms=fade_ms,
             fade_out_ms=fade_ms,
+            pos=pos,
+            rot=rot,
         ))
     return lines
 
@@ -293,6 +312,15 @@ def build_ass(
         if ln.end_s <= ln.start_s:
             continue
         overrides = f"\\fs{int(ln.fontsize)}"
+        if ln.pos is not None:
+            # \an5 anchors the line by its CENTER at \pos (matches the
+            # preview's translate(-50%,-50%) + the frac→px mapping).
+            px = int(round(ln.pos[0] * width))
+            py = int(round(ln.pos[1] * height))
+            overrides += f"\\an5\\pos({px},{py})"
+        if ln.rot:
+            # CSS clockwise → ASS \frz is counter-clockwise-positive.
+            overrides += f"\\frz{_fmt_num(-ln.rot)}"
         if ln.fade_in_ms > 0 or ln.fade_out_ms > 0:
             overrides += f"\\fad({int(ln.fade_in_ms)},{int(ln.fade_out_ms)})"
         text = "{" + overrides + "}" + _ass_escape(ln.text)
