@@ -4688,6 +4688,34 @@ async def get_source_audio_url(
     return {"url": url, "expires_in": 3600}
 
 
+@app.get("/jobs/{job_id}/background-url")
+async def get_background_url(
+    job_id: str,
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Signed URL to the cached background video (bg_r2_key_cached) so the
+    editor's live preview can show lyrics over the REAL background. 404
+    when there's no cached background yet (e.g. a job that never rendered),
+    in which case the preview falls back to a style-tinted gradient.
+    Owner / same-tenant only, same model as /source-audio-url."""
+    from database import Job as JobModel
+    job = (
+        db.query(JobModel)
+        .filter(JobModel.job_id == job_id)
+        .filter(JobModel.tenant_id == current_user["tenant_id"])
+        .first()
+    )
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+    if not job.bg_r2_key_cached:
+        raise HTTPException(status_code=404, detail="No cached background for this job.")
+    url = storage.generate_signed_url(job.bg_r2_key_cached, expiry_seconds=3600)
+    if not url:
+        raise HTTPException(status_code=503, detail="Object storage is unavailable.")
+    return {"url": url, "expires_in": 3600}
+
+
 # NOTE: sync `def` on purpose — librosa.load is CPU/IO-blocking, so FastAPI
 # runs this in its threadpool instead of blocking the event loop. An async
 # def here would freeze every other request during the (multi-second) first
@@ -6614,25 +6642,56 @@ async def portal_get_items(
 
     size_map: dict[tuple[int, str], int | None] = {}
 
-    def _head_size(job: tuple[int, str, str]) -> tuple[tuple[int, str], int | None]:
+    # File sizes are immutable once rendered, so HEAD'ing R2 for every file
+    # on every page load is pure waste — and it was the reliability bug:
+    # 5 files × N deliveries × R2 latency spikes past Vercel's 30s rewrite
+    # timeout when R2 is slow → "no se pudo cargar" on the live portal.
+    # Cache sizes in Redis (shared across the API replicas) so each object
+    # is HEAD'd at most once. 30-day TTL so a re-rendered file self-heals.
+    _rcache = None
+    try:
+        from queue_jobs import _init_redis
+        _rcache, _, _ = _init_redis()
+    except Exception:
+        _rcache = None
+
+    uncached: list[tuple[int, str, str]] = []
+    for di, ft, r2_key in head_jobs:
+        cached = None
+        if _rcache is not None:
+            try:
+                raw = _rcache.get("dlsize:" + r2_key)
+                if raw is not None:
+                    cached = int(raw)
+            except Exception:
+                cached = None
+        if cached is not None:
+            size_map[(di, ft)] = cached
+        else:
+            uncached.append((di, ft, r2_key))
+
+    def _head_size(job: tuple[int, str, str]) -> tuple[tuple[int, str], str, int | None]:
         di, ft, r2_key = job
         try:
             client = storage._get_client()
             if client is None:
-                return (di, ft), None
+                return (di, ft), r2_key, None
             head = client.head_object(Bucket=storage.R2_BUCKET, Key=r2_key)
-            return (di, ft), head.get("ContentLength")
+            return (di, ft), r2_key, head.get("ContentLength")
         except Exception:
-            return (di, ft), None
+            return (di, ft), r2_key, None
 
-    if head_jobs:
-        # Cap concurrency so we don't open hundreds of R2 sockets at once
-        # on a portal with many active deliveries. 16 workers is a good
-        # tradeoff: handles ~80 head calls/sec with R2's typical 200ms
-        # latency, well under any reasonable portal cardinality.
+    if uncached:
+        # Only HEAD the files we haven't cached yet. 16-way concurrency cap
+        # so we don't open hundreds of R2 sockets at once.
         with ThreadPoolExecutor(max_workers=16) as pool:
-            for k, v in pool.map(_head_size, head_jobs):
+            for k, r2_key, v in pool.map(_head_size, uncached):
                 size_map[k] = v
+                if v is not None and _rcache is not None:
+                    try:
+                        _rcache.setex("dlsize:" + r2_key, 2592000, int(v))
+                    except Exception:
+                        pass
 
     # Bulk-fetch change requests for all visible deliveries in one query
     # (avoid N+1). Group into {delivery_id: [requests]} so the per-version
