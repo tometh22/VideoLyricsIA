@@ -6106,11 +6106,25 @@ async def admin_create_delivery_from_job(
     # Validate all 5 files exist in R2. If even one is missing we refuse
     # to create the Delivery — a half-empty portal entry is worse than
     # asking the operator to wait for the render to finish.
+    # One HEAD per file: validates existence AND captures the byte size so
+    # we persist it on the Delivery row. The portal listing then reads sizes
+    # from the DB instead of HEAD'ing R2 on every page load (no cold-cache
+    # penalty for the first visitor).
     missing = []
+    file_sizes: dict[str, int] = {}
+    _r2c = storage._get_client()
     for ft in _DEFAULT_DELIVERY_FILE_TYPES:
         key = _r2_key_for_delivery(job.tenant_id, job.job_id, ft)
-        if not storage.object_exists(key):
+        sz = None
+        if _r2c is not None:
+            try:
+                sz = _r2c.head_object(Bucket=storage.R2_BUCKET, Key=key).get("ContentLength")
+            except Exception:
+                sz = None
+        if sz is None:
             missing.append(ft)
+        else:
+            file_sizes[ft] = int(sz)
     if missing:
         raise HTTPException(
             status_code=409,
@@ -6137,6 +6151,7 @@ async def admin_create_delivery_from_job(
     if existing:
         existing.label = label
         existing.file_types = _DEFAULT_DELIVERY_FILE_TYPES
+        existing.file_sizes = file_sizes
         existing.added_by_user_id = current_user["id"]
         existing.added_at = datetime.now(timezone.utc)
         # Refresh snapshot in case the artist/title was corrected on the
@@ -6152,6 +6167,7 @@ async def admin_create_delivery_from_job(
             job_id=job_id,
             label=label,
             file_types=_DEFAULT_DELIVERY_FILE_TYPES,
+            file_sizes=file_sizes,
             artist_snapshot=job.artist,
             song_title_snapshot=job.song_title or "",
             tenant_snapshot=job.tenant_id,
@@ -6468,6 +6484,14 @@ async def portal_get_items(
 
     uncached: list[tuple[int, str, str]] = []
     for di, ft, r2_key in head_jobs:
+        # Prefer the size persisted on the Delivery row at publish time:
+        # zero R2 calls, instant for the first visitor. Rows published
+        # before this feature (file_sizes NULL) fall back to the Redis-
+        # cached HEAD below, so nothing breaks during the transition.
+        stored_sizes = deliveries[di].file_sizes or {}
+        if stored_sizes.get(ft) is not None:
+            size_map[(di, ft)] = int(stored_sizes[ft])
+            continue
         cached = None
         if _rcache is not None:
             try:
