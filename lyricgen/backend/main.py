@@ -2652,6 +2652,8 @@ async def upload(
     text_motion: str = Form("none", max_length=16),
     text_contrast: str = Form("medium", max_length=16),
     match_lyrics: bool = Form(True),
+    background_hint: str = Form("", max_length=2000),
+    bg_verbatim: bool = Form(False),
     current_user: dict = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
@@ -2804,6 +2806,8 @@ async def upload(
         text_motion=text_motion if text_motion in ("none", "subtle", "float") else "none",
         text_contrast=text_contrast if text_contrast in ("subtle", "medium", "strong") else "medium",
         match_lyrics=match_lyrics,
+        background_hint=(background_hint.strip() or None),
+        bg_verbatim=bg_verbatim,
     )
 
     return {"job_id": job_id, "status": initial_status}
@@ -3457,6 +3461,8 @@ async def generate_with_segments(
     text_motion: str = Form("none", max_length=16),
     text_contrast: str = Form("medium", max_length=16),
     match_lyrics: bool = Form(True),
+    background_hint: str = Form("", max_length=2000),
+    bg_verbatim: bool = Form(False),
     current_user: dict = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
@@ -3673,6 +3679,8 @@ async def generate_with_segments(
         text_motion=text_motion if text_motion in ("none", "subtle", "float") else "none",
         text_contrast=text_contrast if text_contrast in ("subtle", "medium", "strong") else "medium",
         match_lyrics=match_lyrics,
+        background_hint=(background_hint.strip() or None),
+        bg_verbatim=bg_verbatim,
     )
 
     return {"job_id": job_id, "status": initial_status}
@@ -4570,6 +4578,17 @@ class EditJobRequest(BaseModel):
         default=None,
         pattern="^(veo|imagen)$",
     )
+    # Camera/motion register for edit_type=="background". Lets the operator
+    # change how the new background moves (incl. "estatico" = locked camera)
+    # without typing prose — closes the gap where movement was only
+    # selectable in the wizard, never at edit time. None → inherit the
+    # job's persisted movement_style. Validated as free-text; normalized
+    # downstream by _normalize_movement_style.
+    movement_style: str | None = Field(default=None, max_length=64)
+    # "Usar mi prompt tal cual": when True (and background_hint is set),
+    # the hint goes straight to Veo without Gemini's rewrite. Only
+    # meaningful for edit_type=="background".
+    bg_verbatim: bool = Field(default=False)
     # Explicit ack that the caller understands re-syncing lyrics on a job
     # already published to YouTube will update R2 but NOT replace the
     # YouTube video file (the YouTube API doesn't allow file replacement,
@@ -5242,6 +5261,24 @@ async def request_edit(
         # validated the enum via pattern; we just forward through
         # edit_params to run_edit_pipeline → _ensure_background.
         edit_params["background_mode"] = body.background_mode
+    if body.edit_type == "background" and body.movement_style is not None:
+        # Camera/motion register chosen in the editor (incl. "estatico").
+        # Forward for this render AND persist to durable render_params — same
+        # reaped-retry durability rationale as background_hint above, and so
+        # a subsequent "Regenerar fondo" pre-fills the operator's last choice.
+        _mv = (body.movement_style or "").strip()
+        edit_params["movement_style"] = _mv
+        _rp_mv = dict(job.render_params or {})
+        _rp_mv["movement_style"] = _mv
+        job.render_params = _rp_mv
+    if body.edit_type == "background" and body.bg_verbatim:
+        # "Usar mi prompt tal cual" — send background_hint straight to Veo.
+        # Only forwarded when True; persisted durably so a reaped retry and
+        # the next edit both honour it.
+        edit_params["bg_verbatim"] = True
+        _rp_v = dict(job.render_params or {})
+        _rp_v["bg_verbatim"] = True
+        job.render_params = _rp_v
     if body.edit_type == "background" and body.bypass_content_validation:
         # Forward only when explicitly True; pipeline's tenant-gated
         # default is correct when missing/False. Storing this lets the

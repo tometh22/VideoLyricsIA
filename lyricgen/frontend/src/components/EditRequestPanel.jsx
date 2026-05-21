@@ -120,6 +120,24 @@ export default function EditRequestPanel({
   // Operator picks via the segmented toggle inside the background panel.
   // Default "veo" preserves the prior behavior of every edit pre-2026-05-16.
   const [backgroundMode, setBackgroundMode] = useState("veo");
+  // Camera/motion register for the background regen (incl. "estatico" =
+  // locked camera). Pre-filled from the job's persisted choice so the editor
+  // reflects what the wizard picked — the upload→edit flow shouldn't forget
+  // the operator's decision. "" = Auto (system varies per song).
+  const [movementStyle, setMovementStyle] = useState(initialParams.movement_style ?? "");
+  // "Usar mi prompt tal cual" — bypass Gemini's rewrite, send the hint
+  // straight to Veo. Pre-filled from render_params; only meaningful in
+  // Veo mode (Imagen renders a still, no verbatim camera negatives).
+  const [bgVerbatim, setBgVerbatim] = useState(!!initialParams.bg_verbatim);
+  // Movement options mirror the wizard's MOVEMENT_STYLES (kept in sync).
+  const MOVEMENT_OPTIONS = [
+    { code: "",              label: t("upload.movement_auto") || "Auto" },
+    { code: "estatico",      label: t("upload.movement_estatico") || "Estático (cámara fija)" },
+    { code: "sutil",         label: t("upload.movement_sutil") || "Sutil" },
+    { code: "estandar",      label: t("upload.movement_estandar") || "Estándar" },
+    { code: "foto-parallax", label: t("upload.movement_foto_parallax") || "Foto + parallax" },
+    { code: "animado",       label: t("upload.movement_animado") || "Animado" },
+  ];
   // Tenant-aware content-validation toggle. Boolean semantics:
   // value=true  → operator wants validator to run
   // value=false → operator wants validator skipped
@@ -294,6 +312,14 @@ export default function EditRequestPanel({
       // ships, dropping the check is safe but adds zero value.
       if (backgroundMode && backgroundMode !== "veo") {
         p.background_mode = backgroundMode;
+      }
+      // Camera/motion register. Always send (incl. "" = Auto) so the editor
+      // can override a previously-persisted register, e.g. switch a drifting
+      // background to a locked one.
+      p.movement_style = movementStyle;
+      // Verbatim only applies to Veo + a non-empty hint; never with Imagen.
+      if (bgVerbatim && hint && backgroundMode !== "imagen") {
+        p.bg_verbatim = true;
       }
       // Always send one of the two flags based purely on operator intent.
       // The tenant-conditional version silently dropped BOTH flags when
@@ -960,11 +986,57 @@ export default function EditRequestPanel({
             </button>
           </div>
 
+          {/* Camera/motion register — lets the operator change how the new
+              background moves (incl. Estático = locked camera) without prose.
+              Closes the gap where movement was only selectable in the wizard. */}
+          <div>
+            <p className="text-[10px] uppercase tracking-[0.18em] text-ink-secondary mb-1.5">
+              {t("edit.movement_label") || "Movimiento de cámara"}
+            </p>
+            <div className="flex flex-wrap gap-1.5">
+              {MOVEMENT_OPTIONS.map((m) => (
+                <button
+                  key={m.code || "auto"}
+                  type="button"
+                  disabled={submitting}
+                  onClick={() => setMovementStyle(m.code)}
+                  className={`px-2.5 py-1.5 rounded-lg text-[11px] font-medium transition-colors ${
+                    movementStyle === m.code
+                      ? "bg-brand/20 text-brand-light ring-1 ring-brand/30"
+                      : "text-ink-secondary hover:text-white hover:bg-white/[0.04]"
+                  }`}
+                >
+                  {m.label}
+                </button>
+              ))}
+            </div>
+          </div>
+
           <BackgroundHintField
             value={backgroundHint}
             onChange={setBackgroundHint}
             disabled={submitting}
           />
+
+          {/* Verbatim toggle — only when there's a hint and we're in Veo mode.
+              Imagen renders a still, so verbatim camera control is moot there. */}
+          {(backgroundHint || "").trim() && backgroundMode !== "imagen" && (
+            <label className="flex items-center gap-2.5 cursor-pointer px-1">
+              <input
+                type="checkbox"
+                checked={!!bgVerbatim}
+                onChange={(e) => setBgVerbatim(e.target.checked)}
+                disabled={submitting}
+                className="peer sr-only"
+              />
+              <div className="relative w-9 h-5 rounded-full bg-surface-3 peer-checked:bg-brand transition-colors duration-200 shrink-0">
+                <div className="absolute top-0.5 left-0.5 w-4 h-4 rounded-full bg-white shadow transition-transform duration-200 peer-checked:translate-x-4" />
+              </div>
+              <span className="text-[11px] text-ink-secondary">
+                {t("edit.bg_verbatim_label") || "Usar mi prompt tal cual (sin reescritura de IA)"}
+              </span>
+            </label>
+          )}
 
           <ContentValidationToggle
             value={validationEnabled}

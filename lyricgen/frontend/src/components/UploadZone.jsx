@@ -182,6 +182,9 @@ export default function UploadZone({
   const HARDCODED_BATCH_DEFAULTS = {
     genre: "", concept: "", movementStyle: "", font: "",
     textCase: "upper", fontScale: "1.0", lyricTransition: "cut", textMotion: "none", textContrast: "medium",
+    // Escena axis: optional free-text prompt ("Mi prompt"). When non-empty it
+    // overrides genre/concept/lyrics; bgVerbatim sends it to Veo unchanged.
+    backgroundHint: "", bgVerbatim: false,
   };
   const loadStoredBatchDefaults = () => {
     try {
@@ -334,6 +337,7 @@ export default function UploadZone({
   // deploy — Tomi swaps real ones in before UMG sees the feature.
   const MOVEMENT_STYLES = [
     { code: "",              label: t("upload.movement_auto") || "Auto",                         sample: null },
+    { code: "estatico",      label: t("upload.movement_estatico") || "Estático (cámara fija)",   sample: "/movement_samples/estatico.mp4" },
     { code: "sutil",         label: t("upload.movement_sutil") || "Sutil (mínimo movimiento)",   sample: "/movement_samples/sutil.mp4" },
     { code: "estandar",      label: t("upload.movement_estandar") || "Estándar (cinematográfico)", sample: "/movement_samples/estandar.mp4" },
     { code: "foto-parallax", label: t("upload.movement_foto_parallax") || "Foto + parallax",     sample: "/movement_samples/foto-parallax.mp4" },
@@ -1559,6 +1563,49 @@ export default function UploadZone({
                   </p>
                 </div>
               </label>
+            )}
+
+            {/* 1.6 "Mi prompt" — describe the background in words.
+                Escena axis, third source (Auto género / Inspirado en letra /
+                Mi prompt). When non-empty it overrides genre/concept/lyrics.
+                The "tal cual" toggle skips Gemini's rewrite and sends the
+                text straight to Veo — the power-user path. Previously this
+                field only existed in the editor (post-generation); surfacing
+                it here closes the upload→edit gap so a user can describe
+                their video from the start. */}
+            {bgMode === "auto" && (
+              <div className="rounded-card bg-surface-2/40 ring-1 ring-white/[0.04] px-4 py-3">
+                <p className="text-[10px] uppercase tracking-[0.18em] text-gray-500">
+                  {t("upload.bg_prompt_label") || "Mi prompt (opcional)"}
+                </p>
+                <p className="text-[11px] text-gray-600 mt-0.5 mb-2">
+                  {t("upload.bg_prompt_hint") || "Describí el fondo que querés. Si lo completás, manda sobre el género/concepto y la letra."}
+                </p>
+                <textarea
+                  value={batchDefaults.backgroundHint || ""}
+                  onChange={(e) => updateBatchDefault("backgroundHint", e.target.value.slice(0, 2000))}
+                  rows={3}
+                  maxLength={2000}
+                  placeholder={t("upload.bg_prompt_placeholder") || "Ej: mansión surreal de noche, pileta vacía, cámara fija, sólo se mueve el reflejo del agua…"}
+                  className="w-full text-[12px] rounded-lg bg-surface-1 border border-white/[0.08] focus:border-brand/50 px-3 py-2 text-gray-200 placeholder:text-gray-600 resize-y outline-none"
+                />
+                {(batchDefaults.backgroundHint || "").trim() && (
+                  <label className="mt-2 flex items-center gap-2.5 cursor-pointer">
+                    <input
+                      type="checkbox"
+                      checked={!!batchDefaults.bgVerbatim}
+                      onChange={(e) => updateBatchDefault("bgVerbatim", e.target.checked)}
+                      className="peer sr-only"
+                    />
+                    <div className="relative w-9 h-5 rounded-full bg-surface-3 peer-checked:bg-brand transition-colors duration-200 shrink-0">
+                      <div className="absolute top-0.5 left-0.5 w-4 h-4 rounded-full bg-white shadow transition-transform duration-200 peer-checked:translate-x-4" />
+                    </div>
+                    <span className="text-[11px] text-gray-400">
+                      {t("upload.bg_verbatim_label") || "Usar mi prompt tal cual (sin reescritura de IA)"}
+                    </span>
+                  </label>
+                )}
+              </div>
             )}
 
             {/* 2. Background selector */}
