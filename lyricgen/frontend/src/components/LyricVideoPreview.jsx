@@ -61,11 +61,14 @@ export default function LyricVideoPreview({
     try { v.currentTime = currentTime % dur; } catch { /* not seekable yet */ }
   }, [currentTime, backgroundUrl]);
 
-  // The line on screen = the one whose [start,end] contains currentTime.
+  // The line on screen = the one whose [start,end] contains currentTime —
+  // exactly what the rendered video shows now and what the timeline marks.
+  // In a gap / instrumental intro there is NO active line → blank stage
+  // (matches the video + the timeline). We deliberately do NOT fall back to
+  // the upcoming line: that showed text the timeline didn't mark and the
+  // video wouldn't show, which read as a bug.
   const activeSeg = useMemo(() => {
-    return segments.find((s) => currentTime >= s.start && currentTime < s.end)
-      || segments.find((s) => s.start > currentTime)  // upcoming, so the stage isn't blank
-      || null;
+    return segments.find((s) => currentTime >= s.start && currentTime < s.end) || null;
   }, [segments, currentTime]);
 
   const layoutOf = useCallback((seg) => {
