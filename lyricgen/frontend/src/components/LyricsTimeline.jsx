@@ -209,13 +209,18 @@ export default function LyricsTimeline({
   // first lyric so the operator doesn't open to a wall of empty time.
   useEffect(() => {
     if (didAutoScrollRef.current) return;
-    const sc = scrollRef.current;
-    if (!sc || !segments.length) return;
+    if (!segments.length) return;
     const firstStart = Math.min(...segments.map((s) => s.start));
-    if (firstStart > INTRO_SKIP_S) {
-      sc.scrollTop = Math.max(0, firstStart * pxPerSec - 28);
-    }
-    didAutoScrollRef.current = true;
+    if (firstStart <= INTRO_SKIP_S) { didAutoScrollRef.current = true; return; }
+    // rAF: set scrollTop AFTER the lane has its full laid-out height,
+    // otherwise the browser clamps scrollTop to 0 (the bug that left the
+    // view stuck at 0:00 on top of the instrumental intro).
+    const raf = requestAnimationFrame(() => {
+      const sc = scrollRef.current;
+      if (sc) sc.scrollTop = Math.max(0, firstStart * pxPerSec - 28);
+      didAutoScrollRef.current = true;
+    });
+    return () => cancelAnimationFrame(raf);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [segments]);
 
@@ -342,8 +347,8 @@ export default function LyricsTimeline({
                 key={seg._id}
                 className={[
                   "absolute rounded-md overflow-hidden text-[12px] leading-tight ring-1 transition-colors",
-                  isActive ? "bg-brand/30" : "bg-surface-3/50",
-                  isLocked ? "ring-brand/60" : "ring-white/[0.08]",
+                  isActive ? "bg-brand/25" : "bg-surface-3/25",
+                  isLocked ? "ring-brand/60" : "ring-white/[0.07]",
                   isFocused ? "outline outline-1 outline-brand-light" : "",
                   isHi ? "ring-2 ring-accent" : "",
                 ].join(" ")}
@@ -375,8 +380,10 @@ export default function LyricsTimeline({
                 >
                   <div className="w-7 h-[3px] rounded-full bg-white/40 group-hover/hb:bg-white/90 transition-colors" />
                 </div>
-                <div className="px-3 h-full flex items-center gap-2" style={{ touchAction: "none" }}>
-                  <span className="text-[9px] text-ink-tertiary tabular-nums shrink-0">{fmt(start)}</span>
+                {/* Text anchored to the TOP (where the line enters), not
+                    floating in the middle of a tall held block. */}
+                <div className="px-3 flex items-start gap-2" style={{ touchAction: "none", paddingTop: EDGE_PX + 4 }}>
+                  <span className="text-[9px] text-ink-tertiary tabular-nums shrink-0 mt-px">{fmt(start)}</span>
                   <span className="text-white/90 line-clamp-2">{seg.text}</span>
                 </div>
               </div>
