@@ -13,9 +13,9 @@ export default function Artists() {
     { t: t("feat.youtube"), d: t("feat.youtube_desc") },
   ];
   const outputs = [
-    { title: "Lyric Video", res: "1920 x 1080", desc: "Full HD", gradient: "from-brand/30 to-brand-dark/30", aspect: "aspect-video", img: "/samples/sample-reef.png" },
-    { title: "YouTube Short", res: "1080 x 1920", desc: "Vertical 30s", gradient: "from-pink-500/20 to-rose-600/30", aspect: "aspect-[9/16] max-h-52", img: null },
-    { title: "Thumbnail", res: "1280 x 720", desc: "1280x720", gradient: "from-amber-500/20 to-orange-600/30", aspect: "aspect-video", img: "/samples/sample-forest.png" },
+    { title: "Lyric Video", res: "1920 × 1080", desc: "Full HD", gradient: "from-brand/30 to-brand-dark/30", aspect: "aspect-video", img: null },
+    { title: "YouTube Short", res: "1080 × 1920", desc: "Vertical 30s", gradient: "from-pink-500/20 to-rose-600/30", aspect: "aspect-[9/16] max-h-52", img: null },
+    { title: "Thumbnail", res: "1280 × 720", desc: "Portada", gradient: "from-amber-500/20 to-orange-600/30", aspect: "aspect-video", img: null },
   ];
 
   return (

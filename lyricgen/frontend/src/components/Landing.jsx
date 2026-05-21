@@ -84,17 +84,17 @@ export default function Landing() {
         <p className="text-gray-500 text-center mb-12 max-w-md mx-auto">{t("home.formats_sub")}</p>
         <div className="grid grid-cols-2 lg:grid-cols-4 gap-5">
           {[
-            { title: "Lyric Video", desc: "1920×1080 · Full HD", img: "/samples/sample-reef.png", aspect: "aspect-video" },
-            { title: "YouTube Short", desc: "1080×1920 · Vertical", img: "/samples/sample-forest.png", aspect: "aspect-[3/4]" },
-            { title: "Thumbnail", desc: "1280×720", img: "/samples/sample-forest.png", aspect: "aspect-video" },
-            { title: t("home.fmt_prores_t"), desc: t("home.fmt_prores_d"), img: null, aspect: "aspect-video" },
+            { title: "Lyric Video", desc: "1920×1080 · Full HD", shape: "aspect-video", tag: "16:9" },
+            { title: "YouTube Short", desc: "1080×1920 · Vertical", shape: "aspect-[9/16] max-h-44", tag: "9:16" },
+            { title: "Thumbnail", desc: "1280×720 · Portada", shape: "aspect-video", tag: "JPG" },
+            { title: t("home.fmt_prores_t"), desc: t("home.fmt_prores_d"), shape: "aspect-video", tag: "ProRes" },
           ].map((f) => (
-            <div key={f.title} className="glass rounded-2xl p-3 glass-hover">
-              <div className={`rounded-xl overflow-hidden ${f.aspect} bg-gradient-to-br from-brand/25 to-accent/15 mb-3 flex items-center justify-center`}>
-                {f.img ? <img src={f.img} alt={f.title} className="w-full h-full object-cover" /> : <span className="text-sm font-bold text-white/70">ProRes</span>}
+            <div key={f.title} className="glass rounded-2xl p-5 glass-hover flex flex-col items-center text-center">
+              <div className={`w-full ${f.shape} rounded-lg bg-gradient-to-br from-brand/30 to-accent/15 ring-1 ring-white/10 mb-4 flex items-center justify-center`}>
+                <span className="text-xs font-bold text-white/60 tracking-wider">{f.tag}</span>
               </div>
               <h3 className="font-semibold text-sm">{f.title}</h3>
-              <p className="text-xs text-gray-500">{f.desc}</p>
+              <p className="text-xs text-gray-500 mt-1">{f.desc}</p>
             </div>
           ))}
         </div>
@@ -132,8 +132,8 @@ export default function Landing() {
       <section className="relative z-10 max-w-6xl mx-auto px-6 py-24">
         <h2 className="text-3xl font-bold mb-3">{t("home.gallery_title")}</h2>
         <p className="text-gray-500 mb-10 max-w-md">{t("landing.examples_sub")}</p>
-        <div className="grid grid-cols-1 sm:grid-cols-3 gap-6">
-          {["/samples/ex2.mp4", "/samples/ex3.mp4", "/samples/ex1.mp4"].map((src) => (
+        <div className="grid grid-cols-1 sm:grid-cols-2 gap-6">
+          {["/samples/ex2.mp4", "/samples/ex3.mp4"].map((src) => (
             <div key={src} className="glass rounded-2xl p-2 glass-hover">
               <div className="rounded-xl overflow-hidden aspect-video bg-black">
                 <video autoPlay muted loop playsInline className="w-full h-full object-cover" src={src} />
@@ -207,16 +207,14 @@ export default function Landing() {
 
       {/* Why GenLy — image left / differentiators right, full-bleed band */}
       <section className="relative z-10 border-y border-white/[0.06] bg-white/[0.015]">
-        <div className="max-w-6xl mx-auto px-6 py-24 grid lg:grid-cols-2 gap-12 items-center">
-          <div className="relative order-2 lg:order-1">
-            <div className="absolute -inset-4 bg-accent/15 blur-3xl rounded-full pointer-events-none" />
-            <img src="/samples/sample-reef.png" alt="" className="relative rounded-3xl w-full object-cover shadow-glow-lg" />
-          </div>
-          <div className="order-1 lg:order-2">
+        <div className="max-w-6xl mx-auto px-6 py-24 grid lg:grid-cols-2 gap-12 lg:gap-16 lg:items-start">
+          <div className="lg:sticky lg:top-28">
             <span className="text-[11px] uppercase tracking-[0.25em] text-brand-light">{t("home.why_label")}</span>
-            <h2 className="text-3xl sm:text-4xl font-extrabold tracking-tight mt-3 mb-3 leading-[1.05]">{t("landing.why_title")}</h2>
-            <p className="text-gray-400 text-lg mb-8">{t("landing.why_sub")}</p>
-            <div className="space-y-5">
+            <h2 className="text-3xl sm:text-4xl font-extrabold tracking-tight mt-3 mb-4 leading-[1.05]">{t("landing.why_title")}</h2>
+            <p className="text-gray-400 text-lg leading-relaxed">{t("landing.why_sub")}</p>
+          </div>
+          <div>
+            <div className="space-y-6">
               {[
                 { t: t("landing.why1_t"), d: t("landing.why1_d") },
                 { t: t("landing.why2_t"), d: t("landing.why2_d") },
