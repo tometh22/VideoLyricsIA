@@ -377,12 +377,12 @@ export default function UploadZone({
   // NOTE: those MP4s are LIBRARY PLACEHOLDERS shipped with the first
   // deploy — Tomi swaps real ones in before UMG sees the feature.
   const MOVEMENT_STYLES = [
-    { code: "",              label: t("upload.movement_auto") || "Auto",                         sample: null },
-    { code: "estatico",      label: t("upload.movement_estatico") || "Estático (cámara fija)",   sample: "/movement_samples/estatico.mp4" },
-    { code: "sutil",         label: t("upload.movement_sutil") || "Sutil (mínimo movimiento)",   sample: "/movement_samples/sutil.mp4" },
-    { code: "estandar",      label: t("upload.movement_estandar") || "Estándar (cinematográfico)", sample: "/movement_samples/estandar.mp4" },
-    { code: "foto-parallax", label: t("upload.movement_foto_parallax") || "Foto + parallax",     sample: "/movement_samples/foto-parallax.mp4" },
-    { code: "animado",       label: t("upload.movement_animado") || "Animado (ilustración)",     sample: "/movement_samples/animado.mp4" },
+    { code: "",              label: t("upload.movement_auto") || "Auto",                         sample: null,                              desc: t("upload.movement_auto_desc") || "La IA decide el movimiento según la canción." },
+    { code: "estatico",      label: t("upload.movement_estatico") || "Estático (cámara fija)",   sample: "/movement_samples/estatico.mp4",  desc: t("upload.movement_estatico_desc") || "Cámara fija. Solo se mueve lo que pasa dentro de la escena." },
+    { code: "sutil",         label: t("upload.movement_sutil") || "Sutil (mínimo movimiento)",   sample: "/movement_samples/sutil.mp4",     desc: t("upload.movement_sutil_desc") || "Movimiento mínimo, casi imperceptible. Calmo." },
+    { code: "estandar",      label: t("upload.movement_estandar") || "Estándar (cinematográfico)", sample: "/movement_samples/estandar.mp4", desc: t("upload.movement_estandar_desc") || "Movimiento de cámara cinematográfico (zoom/drift)." },
+    { code: "foto-parallax", label: t("upload.movement_foto_parallax") || "Foto + parallax",     sample: "/movement_samples/foto-parallax.mp4", desc: t("upload.movement_parallax_desc") || "Foto con sensación de profundidad (paneo lento)." },
+    { code: "animado",       label: t("upload.movement_animado") || "Animado (ilustración)",     sample: "/movement_samples/animado.mp4",   desc: t("upload.movement_animado_desc") || "Ilustración 2D estilizada, no fotorrealista." },
   ];
 
   // Visual concept for the AI background. Operator-controlled; when set
@@ -689,6 +689,14 @@ export default function UploadZone({
           : (t("upload.single_settings_title") || "Ajustes del video")}
       </p>
 
+      {bgMode !== "auto" && (
+        <div className="mb-3 rounded-lg bg-surface-1/60 ring-1 ring-white/[0.05] px-3 py-2 text-[11px] text-gray-400">
+          {bgMode === "library"
+            ? (t("upload.settings_library_note") || "Usás un fondo de Biblioteca — el movimiento y la escena los define ese clip. El género solo ajusta detalles.")
+            : (t("upload.settings_custom_note") || "Usás un fondo subido por vos — el movimiento y la escena los define tu archivo.")}
+        </div>
+      )}
+
       {/* Movement gallery — click a card to apply to all tracks */}
       <div className="mb-4">
         <div className="mb-2">
@@ -703,7 +711,7 @@ export default function UploadZone({
             )}
           </div>
           <p className="text-[10px] text-gray-600 mt-0.5">
-            {t("upload.movement_gallery_desc") || "Cómo se anima el fondo del video · no afecta los colores"}
+            {t("upload.movement_gallery_desc") || "Cómo se anima el fondo · misma escena de muestra para comparar el movimiento (no es tu fondo final)"}
           </p>
         </div>
         <style>{`
@@ -721,7 +729,8 @@ export default function UploadZone({
                 key={m.code}
                 type="button"
                 onClick={() => updateBatchDefault("movementStyle", m.code)}
-                aria-label={`${t("upload.movement_apply_all") || "Aplicar a todas"}: ${m.label}`}
+                aria-label={`${m.label}: ${m.desc}`}
+                title={m.desc}
                 className={`text-left rounded-xl overflow-hidden border transition-all duration-200 cursor-pointer
                   ${active
                     ? "border-brand/60 shadow-glow ring-1 ring-brand/40"
@@ -754,6 +763,7 @@ export default function UploadZone({
                   <p className={`text-[11px] truncate ${active ? "text-white font-medium" : "text-gray-300"}`}>
                     {m.label.replace(/\s*\(.*\)\s*/, "")}
                   </p>
+                  <p className="text-[9px] text-gray-500 leading-tight line-clamp-2 mt-0.5">{m.desc}</p>
                 </div>
               </button>
             );
@@ -761,28 +771,37 @@ export default function UploadZone({
         </div>
       </div>
 
-      {/* Genre + Concept — only meaningful in AI Auto mode */}
+      {/* Scene metadata (genre + concept) — only when generating with AI.
+          Explained inline so it's clear what they DO and how they impact. */}
       {bgMode === "auto" && (
-        <div className="flex flex-wrap gap-3 mb-4">
-          <div className="flex items-center gap-2">
-            <span className="text-[11px] text-gray-600 shrink-0">{t("upload.genre_label") || "Género:"}</span>
-            <Listbox
-              value={batchDefaults.genre}
-              onChange={(v) => updateBatchDefault("genre", v)}
-              options={GENRES}
-              className="w-44"
-              ariaLabel={t("upload.genre_label") || "Género"}
-            />
-          </div>
-          <div className="flex items-center gap-2">
-            <span className="text-[11px] text-gray-600 shrink-0">{t("upload.concept_label") || "Concepto:"}</span>
-            <Listbox
-              value={batchDefaults.concept}
-              onChange={(v) => updateBatchDefault("concept", v)}
-              options={CONCEPTS}
-              className="w-44"
-              ariaLabel={t("upload.concept_label") || "Concepto"}
-            />
+        <div className="mb-4 pt-3 border-t border-white/[0.05]">
+          <p className="text-[11px] text-gray-400 font-medium">{t("upload.scene_meta_title") || "Escena"}</p>
+          <p className="text-[10px] text-gray-600 mt-0.5 mb-2">
+            {sceneMode === "prompt"
+              ? (t("upload.scene_meta_prompt_note") || "Tu prompt define la escena — género y concepto quedan como ayuda secundaria.")
+              : (t("upload.scene_meta_desc") || "Género ajusta la paleta y la atmósfera · Concepto define el tipo de escena (ciudad, naturaleza, abstracto…).")}
+          </p>
+          <div className={`flex flex-wrap gap-3 ${sceneMode === "prompt" ? "opacity-50" : ""}`}>
+            <div className="flex items-center gap-2">
+              <span className="text-[11px] text-gray-600 shrink-0" title={t("upload.genre_help") || "El estilo musical. Ajusta paleta, iluminación y atmósfera del fondo."}>{t("upload.genre_label") || "Género:"}</span>
+              <Listbox
+                value={batchDefaults.genre}
+                onChange={(v) => updateBatchDefault("genre", v)}
+                options={GENRES}
+                className="w-44"
+                ariaLabel={t("upload.genre_label") || "Género"}
+              />
+            </div>
+            <div className="flex items-center gap-2">
+              <span className="text-[11px] text-gray-600 shrink-0" title={t("upload.concept_help") || "El tipo de escena visual: ciudad, naturaleza, abstracto, cósmico, etc."}>{t("upload.concept_label") || "Concepto:"}</span>
+              <Listbox
+                value={batchDefaults.concept}
+                onChange={(v) => updateBatchDefault("concept", v)}
+                options={CONCEPTS}
+                className="w-44"
+                ariaLabel={t("upload.concept_label") || "Concepto"}
+              />
+            </div>
           </div>
         </div>
       )}
