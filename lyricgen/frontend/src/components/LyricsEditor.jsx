@@ -1415,6 +1415,10 @@ export default function LyricsEditor({
           The panel also absorbs the standalone "Aplicar todas" /
           "Deshacer" row that was below the auto-split banner. */}
       {(() => {
+        // Auto-fix is text/structure correction — a Lista-view concern.
+        // Hide it in the timeline workspace so that view stays focused on
+        // the preview + timeline (less vertical clutter above the fold).
+        if (viewMode === "timeline") return null;
         const splitAvailable = !disableAutoSplit && mergeableSegments.length > 0;
         const trimAvailable = longSegCount > 0;
         const hasAutoFix = splitAvailable || hasSuggestions || trimAvailable;
@@ -1786,7 +1790,7 @@ export default function LyricsEditor({
           moved (2026-05-16) into the consolidated auto-fix panel near
           the top of the editor so the operator sees ONE "system can
           fix N things" action instead of a standalone amber alert. */}
-      <div className="mb-3">
+      <div className={`mb-3 ${viewMode === "timeline" ? "hidden" : ""}`}>
         <button
           onClick={() => setShiftPanelOpen((v) => !v)}
           className="w-full flex items-center justify-between px-3 py-2 rounded-card bg-surface-2/40 ring-1 ring-white/[0.04] hover:ring-white/[0.08] text-xs text-gray-300 hover:text-white transition-colors"
