@@ -52,9 +52,18 @@ class AssLine:
     applied).
 
     Layout overrides (None/0 → centered default):
-      pos: (x, y) as 0..1 fractions of the frame for the line's CENTER.
+      pos: (x, y) as 0..1 fractions of the frame for the line's anchor
+           (the anchor corner is set by `alignment`; default \\an5 = center).
       rot: degrees CLOCKWISE (preview/CSS convention). ASS \\frz is
-           counter-clockwise-positive, so build_ass emits -rot."""
+           counter-clockwise-positive, so build_ass emits -rot.
+
+    Per-line style overrides (used by the title card, which mixes fonts,
+    weights and alignment with the centered lyric lines):
+      font_name: libass family to switch to via \\fn (must be in fontsdir).
+      bold: True/False to force weight via \\b1/\\b0 (None → inherit style).
+      alignment: numpad \\an override (e.g. 4 = left-middle for the badge).
+      primary_alpha: fill transparency 0..255 (0 = opaque) → \\1a, mirrors
+           the moviepy title card's per-line base opacity."""
     text: str
     start_s: float
     end_s: float
@@ -63,6 +72,10 @@ class AssLine:
     fade_out_ms: int = 0
     pos: tuple | None = None
     rot: float = 0.0
+    font_name: str | None = None
+    bold: bool | None = None
+    alignment: int | None = None
+    primary_alpha: int = 0
 
 
 # --- Style tiers (single source of truth, mirrored by pipeline) ---------
@@ -144,6 +157,135 @@ def single_font_dir(font_path: str) -> str:
     d = tempfile.mkdtemp(prefix="ass_fonts_")
     shutil.copy2(font_path, os.path.join(d, os.path.basename(font_path)))
     return d
+
+
+def multi_font_dir(font_paths: list[str]) -> str:
+    """Like single_font_dir but for several fonts (the lyric font + the
+    title-card artist font). libass discovers all of them by family name,
+    so a Dialogue line can \\fn-switch between them. Duplicate basenames
+    are de-duped (same file copied once). Caller owns cleanup."""
+    import os
+    import shutil
+    import tempfile
+    d = tempfile.mkdtemp(prefix="ass_fonts_")
+    seen: set[str] = set()
+    for p in font_paths:
+        if not p:
+            continue
+        name = os.path.basename(p)
+        if name in seen or not os.path.exists(p):
+            continue
+        shutil.copy2(p, os.path.join(d, name))
+        seen.add(name)
+    return d
+
+
+def _opacity_to_alpha(opacity: float) -> int:
+    """ASS \\1a is transparency: 0 opaque, 255 fully transparent — the
+    inverse of moviepy's 0..1 opacity. round((1-op)*255), clamped."""
+    return max(0, min(255, int(round((1.0 - float(opacity)) * 255))))
+
+
+def title_card_lines(
+    artist: str,
+    song: str,
+    first_lyric_start: float,
+    *,
+    width: int,
+    height: int,
+    text_scale: float,
+    lyric_font_family: str,
+    artist_font_family: str,
+) -> list[AssLine]:
+    """Build the artist/song title-card overlay as ASS lines, mirroring the
+    moviepy title card (pipeline.generate_lyric_video) so the look matches
+    when the libass fast path renders it.
+
+    Two layouts, picked by how much instrumental intro precedes the first
+    sung line (same 0.8 s threshold as moviepy):
+      - LONG intro: centred card, artist in ExtraBold over the song title,
+        fades in/out, visible 0.3 s → min(first_lyric-0.2, 8.0 s).
+      - SHORT intro: compact lower-left badge, visible 0.3 s → 6.3 s.
+
+    Sizes/timings/fades mirror pipeline.py:6744-6842. Line heights are
+    approximated as fontsize*1.2 for vertical stacking (libass has no
+    measure step); the moviepy card isn't pixel-locked either, so this
+    stays visually faithful.
+    """
+    artist_u = (artist or "").strip().upper()
+    song_d = (song or "").strip()
+    if not artist_u and not song_d:
+        return []
+
+    START_T = 0.3
+    has_long_intro = first_lyric_start > START_T + 0.5
+
+    if has_long_intro:
+        artist_size = max(30, int(round(62 * text_scale)))
+        title_size = max(24, int(round(46 * text_scale)))
+        title_end = min(first_lyric_start - 0.2, START_T + 8.0)
+        clip_dur = max(0.1, title_end - START_T)
+        fade_in = min(0.4, max(0.1, clip_dur * 0.25))
+        fade_out = min(0.7, max(0.1, clip_dur * 0.35))
+        alignment = 5            # centred
+        op_artist, op_song = 0.97, 0.85
+    else:
+        artist_size = max(20, int(round(36 * text_scale)))
+        title_size = max(16, int(round(28 * text_scale)))
+        title_end = START_T + 6.0
+        clip_dur = title_end - START_T
+        fade_in, fade_out = 0.4, 0.8
+        alignment = 4            # left-middle (lower-left badge)
+        op_artist, op_song = 0.92, 0.80
+
+    # Stack the present lines and compute each one's vertical CENTER as a
+    # fraction of the frame. Approximate line height = 1.2 * fontsize, with
+    # the same 8 px gap moviepy uses between artist and title.
+    stack: list[tuple[str, int, str, bool, float]] = []  # text, size, font, bold, opacity
+    if artist_u:
+        stack.append((artist_u, artist_size, artist_font_family, True, op_artist))
+    if song_d:
+        stack.append((song_d, title_size, lyric_font_family, False, op_song))
+    if not stack:
+        return []
+
+    line_hs = [1.2 * size for _, size, _, _, _ in stack]
+    gap = 8.0
+    total_h = sum(line_hs) + gap * (len(stack) - 1)
+
+    if alignment == 5:
+        top = (height - total_h) / 2.0
+    else:
+        # bottom-anchored badge: 8% bottom safe-area margin
+        bottom_margin = height * 0.08
+        top = height - bottom_margin - total_h
+
+    if alignment == 5:
+        x_frac = 0.5
+    else:
+        x_frac = (width * 0.06) / width  # 6% left margin
+
+    lines: list[AssLine] = []
+    cursor = top
+    fade_in_ms = int(round(fade_in * 1000))
+    fade_out_ms = int(round(fade_out * 1000))
+    for (txt, size, fam, bold, opacity), lh in zip(stack, line_hs):
+        center_y = cursor + lh / 2.0
+        lines.append(AssLine(
+            text=txt,
+            start_s=START_T,
+            end_s=title_end,
+            fontsize=size,
+            fade_in_ms=fade_in_ms,
+            fade_out_ms=fade_out_ms,
+            pos=(x_frac, center_y / height),
+            font_name=fam,
+            bold=bold,
+            alignment=alignment,
+            primary_alpha=_opacity_to_alpha(opacity),
+        ))
+        cursor += lh + gap
+    return lines
 
 
 def _clean_display_text(text: str, case_fn) -> str:
@@ -312,12 +454,23 @@ def build_ass(
         if ln.end_s <= ln.start_s:
             continue
         overrides = f"\\fs{int(ln.fontsize)}"
+        if ln.font_name:
+            overrides += f"\\fn{ln.font_name}"
+        if ln.bold is not None:
+            overrides += "\\b1" if ln.bold else "\\b0"
         if ln.pos is not None:
-            # \an5 anchors the line by its CENTER at \pos (matches the
-            # preview's translate(-50%,-50%) + the frac→px mapping).
+            # The line is anchored by `alignment` (numpad) at \pos. Default
+            # \an5 anchors by CENTER (matches the preview's
+            # translate(-50%,-50%) + the frac→px mapping); the title card
+            # overrides to e.g. \an4 for the left-aligned badge.
+            an = ln.alignment if ln.alignment else 5
             px = int(round(ln.pos[0] * width))
             py = int(round(ln.pos[1] * height))
-            overrides += f"\\an5\\pos({px},{py})"
+            overrides += f"\\an{int(an)}\\pos({px},{py})"
+        elif ln.alignment:
+            overrides += f"\\an{int(ln.alignment)}"
+        if ln.primary_alpha:
+            overrides += f"\\1a&H{int(ln.primary_alpha):02X}&"
         if ln.rot:
             # CSS clockwise → ASS \frz is counter-clockwise-positive.
             overrides += f"\\frz{_fmt_num(-ln.rot)}"
