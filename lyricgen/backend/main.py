@@ -2581,9 +2581,13 @@ async def transcribe_uploaded(
         job_row.status = "transcribed_pending"
         job_row.current_step = "editing"
         db.commit()
+        # Release the pooled connection BEFORE the ~15-20 s transcription so
+        # it doesn't starve /usage and /jobs (dashboard freeze). The function
+        # opens its own short-lived session for the only DB touch it needs.
+        db.close()
 
         return await _run_transcription_for_job(
-            request, db, current_user, job_id, audio_path,
+            request, current_user, job_id, audio_path,
             language=body.language, artist=body.artist, title=body.title,
         )
     finally:
@@ -2884,21 +2888,32 @@ async def transcribe_endpoint(
     # Per-request scratch dir for intermediate slices (intro/body cuts).
     # The main audio file lives under job_dir and stays around until
     # /generate enqueues it (or the reaper cleans it up).
+    # Release the pooled connection before the long transcription (pool
+    # starvation fix) — the function opens its own short-lived session.
+    db.close()
     return await _run_transcription_for_job(
-        request, db, current_user, job_id, audio_path,
+        request, current_user, job_id, audio_path,
         language=language, artist=artist, title=title,
         filename=file.filename,
     )
 
 
 async def _run_transcription_for_job(
-    request, db, current_user, job_id: str, audio_path: str,
+    request, current_user, job_id: str, audio_path: str,
     *, language: str = "", artist: str = "", title: str = "",
     filename: str = "",
 ):
     """Shared transcription pipeline: lrclib synced/plain → Whisper →
     hallucination recovery → segments. Used by both /transcribe (legacy
     multipart upload) and /transcribe-uploaded (presigned-R2 path).
+
+    NOTE (pool starvation fix, 2026-05-21): this runs ~15-20 s of Whisper +
+    Vertex work. It must NOT hold a pooled DB connection across that span —
+    the per-process pool is only ~10 slots (Railway 100-conn cap / ~8
+    procs), so a held connection here starves /usage and /jobs and freezes
+    the dashboard. The only DB touch is the lrclib cache lookup below, which
+    is wrapped in a short-lived scoped_db() block. Callers release their
+    request session (db.close()) before calling this.
 
     Returns the standard `{job_id, segments, reference_lyrics, ...}`
     dict. Cleans up its own scratch dir but never touches `audio_path`
@@ -2959,7 +2974,11 @@ async def _run_transcription_for_job(
             _detect_hallucination, _synthesize_segments_from_plain,
             _align_whisper_to_plain, _fill_gaps_with_reference,
         )
-        lrc = await asyncio.to_thread(_fetch_lrclib, artist_hint, song_hint, db)
+        # Short-lived DB session JUST for the lrclib cache lookup, released
+        # immediately so the connection is free during the long Whisper /
+        # Vertex work below (see the pool-starvation note in the docstring).
+        with scoped_db() as _lrc_db:
+            lrc = await asyncio.to_thread(_fetch_lrclib, artist_hint, song_hint, _lrc_db)
         if lrc:
             synced = lrc.get("synced")
             plain = lrc.get("plain") or ""
