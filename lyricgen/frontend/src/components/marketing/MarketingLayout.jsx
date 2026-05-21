@@ -1,3 +1,4 @@
+import { useState } from "react";
 import { Link, NavLink, Outlet, useNavigate } from "react-router-dom";
 import { useI18n } from "../../i18n";
 import BrandLockup from "../BrandLockup";
@@ -9,6 +10,7 @@ import BrandLockup from "../BrandLockup";
 export default function MarketingLayout() {
   const { t, lang, setLang } = useI18n();
   const navigate = useNavigate();
+  const [open, setOpen] = useState(false);
   const goLogin = () => navigate("/login");
 
   const linkCls = ({ isActive }) =>
@@ -84,8 +86,36 @@ export default function MarketingLayout() {
             <button onClick={goLogin} className="btn-primary text-xs py-2 px-5">{t("nav.start")}</button>
           </div>
 
-          <button onClick={goLogin} className="md:hidden btn-primary text-xs py-2 px-5">{t("nav.start")}</button>
+          {/* Mobile menu toggle */}
+          <button onClick={() => setOpen((v) => !v)} className="md:hidden p-2 -mr-2 text-white" aria-label="Menú">
+            {open
+              ? <svg className="w-6 h-6" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24"><path d="M6 18L18 6M6 6l12 12" strokeLinecap="round"/></svg>
+              : <svg className="w-6 h-6" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24"><path d="M4 6h16M4 12h16M4 18h16" strokeLinecap="round"/></svg>}
+          </button>
         </div>
+
+        {/* Mobile panel */}
+        {open && (
+          <div className="md:hidden border-t border-white/[0.06] bg-surface/95 backdrop-blur-xl px-6 py-4 space-y-1">
+            {[
+              { to: "/artistas", label: t("nav.for_artists") },
+              { to: "/sellos", label: t("nav.for_labels") },
+              { to: "/precios", label: t("landing.pricing") },
+              { to: "/novedades", label: t("news.title") },
+            ].map((l) => (
+              <Link key={l.to} to={l.to} onClick={() => setOpen(false)} className="block py-2.5 text-sm text-gray-200 hover:text-white">{l.label}</Link>
+            ))}
+            <div className="flex items-center gap-2 pt-3 border-t border-white/[0.06] mt-2">
+              {["es", "en", "pt"].map((code) => (
+                <button key={code} onClick={() => setLang(code)}
+                  className={`text-[10px] font-bold px-2 py-1 rounded-md uppercase ${lang === code ? "text-white bg-white/10" : "text-gray-500"}`}>
+                  {code}
+                </button>
+              ))}
+              <button onClick={() => { setOpen(false); goLogin(); }} className="ml-auto btn-primary text-xs py-2 px-5">{t("nav.start")}</button>
+            </div>
+          </div>
+        )}
       </nav>
 
       {/* Page content */}
