@@ -5,13 +5,15 @@
 const GRAIN =
   "url(\"data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='120' height='120'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.85' numOctaves='3' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)'/%3E%3C/svg%3E\")";
 
-export default function LyricDemoTile({ line, scene, glow, delay = "0s", className = "" }) {
+export default function LyricDemoTile({ line, img, scene, glow, delay = "0s", className = "" }) {
   return (
     <div className={`relative rounded-2xl overflow-hidden aspect-video group ${className}`}>
-      {/* atmospheric scene */}
-      <div className="absolute inset-0" style={{ background: scene }} />
+      {/* real AI-generated cinematic background (Imagen) — falls back to a CSS scene */}
+      {img
+        ? <img src={img} alt="" className="absolute inset-0 w-full h-full object-cover" />
+        : <div className="absolute inset-0" style={{ background: scene }} />}
       {/* drifting light */}
-      <div className="absolute -inset-1/3 opacity-70 animate-drift" style={{ background: glow, animationDelay: delay }} />
+      {glow && <div className="absolute -inset-1/3 opacity-50 animate-drift" style={{ background: glow, animationDelay: delay }} />}
       {/* film grain */}
       <div className="absolute inset-0 opacity-[0.13] mix-blend-overlay pointer-events-none" style={{ backgroundImage: GRAIN, backgroundSize: "180px 180px" }} />
       {/* vignette */}

@@ -135,14 +135,14 @@ export default function Landing() {
         <p className="text-gray-500 text-center mb-12 max-w-lg mx-auto">{t("home.looks_sub")}</p>
         <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-5">
           {[
-            { line: "bajo las luces de la ciudad", scene: "radial-gradient(at 25% 25%, rgba(124,92,255,.55), transparent 55%), radial-gradient(at 80% 80%, rgba(34,211,238,.45), transparent 55%), linear-gradient(135deg,#0b0a1f,#150b2e)", glow: "radial-gradient(circle at 60% 40%, rgba(255,255,255,.14), transparent 60%)" },
-            { line: "y bailamos hasta el amanecer", scene: "radial-gradient(at 30% 30%, rgba(255,77,141,.5), transparent 55%), radial-gradient(at 75% 75%, rgba(255,150,60,.5), transparent 55%), linear-gradient(135deg,#1a0a12,#2a1410)", glow: "radial-gradient(circle at 40% 50%, rgba(255,210,160,.16), transparent 60%)" },
-            { line: "perdidos en el mismo mar", scene: "radial-gradient(at 25% 75%, rgba(20,184,166,.5), transparent 55%), radial-gradient(at 75% 25%, rgba(59,130,246,.5), transparent 55%), linear-gradient(135deg,#06121f,#0a1e2e)", glow: "radial-gradient(circle at 55% 45%, rgba(180,230,255,.14), transparent 60%)" },
-            { line: "el fuego que no se apaga", scene: "radial-gradient(at 30% 70%, rgba(225,29,72,.5), transparent 55%), radial-gradient(at 70% 30%, rgba(124,58,237,.5), transparent 55%), linear-gradient(135deg,#160610,#1c0b2a)", glow: "radial-gradient(circle at 45% 55%, rgba(255,180,160,.14), transparent 60%)" },
-            { line: "hoy te lo canto sin miedo", scene: "radial-gradient(at 25% 30%, rgba(132,204,22,.45), transparent 55%), radial-gradient(at 75% 70%, rgba(20,184,166,.45), transparent 55%), linear-gradient(135deg,#0a140a,#0b1e1a)", glow: "radial-gradient(circle at 60% 50%, rgba(220,255,200,.13), transparent 60%)" },
-            { line: "tu nombre en cada estribillo", scene: "radial-gradient(at 30% 30%, rgba(234,179,8,.45), transparent 55%), radial-gradient(at 70% 75%, rgba(124,58,237,.55), transparent 55%), linear-gradient(135deg,#16120a,#1a0b2a)", glow: "radial-gradient(circle at 50% 45%, rgba(255,235,180,.15), transparent 60%)" },
+            { line: "bajo las luces de la ciudad", img: "/samples/looks/look-ciudad.png" },
+            { line: "y bailamos hasta el amanecer", img: "/samples/looks/look-amanecer.png" },
+            { line: "perdidos en el mismo mar", img: "/samples/looks/look-mar.png" },
+            { line: "el fuego que no se apaga", img: "/samples/looks/look-fuego.png" },
+            { line: "hoy te lo canto sin miedo", img: "/samples/looks/look-bosque.png" },
+            { line: "tu nombre en cada estribillo", img: "/samples/looks/look-dorado.png" },
           ].map((s, i) => (
-            <LyricDemoTile key={s.line} line={s.line} scene={s.scene} glow={s.glow} delay={`${(i % 3) * 0.4}s`} className="glass-hover" />
+            <LyricDemoTile key={s.line} line={s.line} img={s.img} delay={`${(i % 3) * 0.4}s`} className="glass-hover" />
           ))}
         </div>
       </section>
