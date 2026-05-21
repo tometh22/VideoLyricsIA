@@ -2987,6 +2987,27 @@ async def _run_transcription_for_job(
             synced = lrc.get("synced")
             plain = lrc.get("plain") or ""
             lrc_dur = lrc.get("duration")
+
+            # Forced alignment (preferred when enabled): align the KNOWN
+            # lyrics to THIS audio at ±50ms instead of trusting lrclib's
+            # community timestamps (often drifted / missing lines — the
+            # Intoxicados case) or Whisper's loose timing. Falls back to
+            # the existing synced/Whisper logic on any failure.
+            import forced_align
+            if forced_align.is_enabled():
+                fa_text = plain or forced_align.lrc_to_plain_text(synced)
+                if fa_text:
+                    fa_segs = await asyncio.to_thread(
+                        forced_align.forced_align_lyrics, tmp_path, fa_text,
+                    )
+                    if fa_segs:
+                        logger.info("[LYRICS] forced alignment used (%s lines, lrclib text) for %r - %r", len(fa_segs), artist_hint, song_hint)
+                        return {
+                            "job_id": job_id,
+                            "segments": fa_segs,
+                            "reference_lyrics": fa_text,
+                            "recovery_source": "forced_align",
+                        }
             if synced:
                 user_dur = await asyncio.to_thread(_audio_duration, tmp_path)
                 offset = 0.0
@@ -3403,6 +3424,23 @@ async def _run_transcription_for_job(
         # same "good prefix + bad body" pattern.
         if reference:
             user_dur = await asyncio.to_thread(_audio_duration, tmp_path)
+
+            # Forced alignment (preferred when enabled): align the Gemini/
+            # lyrics.ovh reference to THIS audio at ±50ms. Falls back to the
+            # Whisper-word aligner / gap-fill below on any failure.
+            import forced_align
+            if forced_align.is_enabled():
+                fa_segs = await asyncio.to_thread(
+                    forced_align.forced_align_lyrics, tmp_path, reference,
+                )
+                if fa_segs:
+                    logger.info("[LYRICS] forced alignment used (%s lines, gemini text)", len(fa_segs))
+                    return {
+                        "job_id": job_id,
+                        "segments": fa_segs,
+                        "reference_lyrics": reference,
+                        "recovery_source": "forced_align",
+                    }
 
             # Plain-lyrics aligner on the Gemini/lyrics.ovh reference —
             # mirrors the lrclib-hit path. Whisper merges/splits lines by
