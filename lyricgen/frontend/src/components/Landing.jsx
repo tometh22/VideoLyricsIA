@@ -4,10 +4,10 @@ import SocialProofWall from "./SocialProofWall";
 import Testimonials from "./Testimonials";
 import LyricDemoTile from "./marketing/LyricDemoTile";
 
-// Home page — a tight, wide, image-forward funnel. Rendered inside
-// MarketingLayout (nav + announcement bar + footer live there). Deep content
-// lives on the sub-pages. Sections alternate full-bleed bands + big visuals to
-// fill the viewport (no narrow column floating in black).
+// Home page — world-class hybrid: DARK cinematic zones (hero, looks, styles,
+// CTA) where the media must pop, and a LIGHT professional zone (stats, formats,
+// how-it-works) for clean, legible, trustworthy content (Musixmatch-style).
+// Rendered inside MarketingLayout (nav + announcement bar + footer).
 export default function Landing() {
   const { t } = useI18n();
   const navigate = useNavigate();
@@ -15,7 +15,7 @@ export default function Landing() {
 
   return (
     <>
-      {/* Hero — kinetic lyric typography over a neon stage. */}
+      {/* ===== DARK: Hero — kinetic lyric typography over a neon stage ===== */}
       <section className="relative min-h-screen w-full overflow-hidden flex flex-col">
         <div className="absolute inset-0 overflow-hidden pointer-events-none">
           <div className="absolute -top-[20%] -left-[10%] w-[60vw] h-[60vw] rounded-full bg-brand/40 blur-[130px] animate-drift" />
@@ -23,7 +23,6 @@ export default function Landing() {
           <div className="absolute inset-0" style={{ background: "radial-gradient(ellipse at 50% 38%, rgba(109,74,255,.16), transparent 60%)" }} />
           <div className="absolute inset-0 opacity-[0.05]" style={{ backgroundImage: "linear-gradient(#fff 1px,transparent 1px),linear-gradient(90deg,#fff 1px,transparent 1px)", backgroundSize: "64px 64px" }} />
         </div>
-
         <div className="relative z-20 flex-1 flex flex-col items-center justify-center text-center px-6 pt-24 pb-16">
           <div className="flex items-center gap-1.5 mb-8 h-6 animate-fade-in">
             {[0, 0.2, 0.4, 0.1, 0.3].map((d, i) => (
@@ -31,78 +30,110 @@ export default function Landing() {
             ))}
             <span className="ml-3 text-[11px] uppercase tracking-[0.25em] text-white/40">{t("landing.badge")}</span>
           </div>
-
           <h1 className="font-extrabold tracking-tight leading-[0.95] text-[clamp(2.6rem,8vw,6rem)] max-w-5xl">
             <span className="block text-white animate-word-in" style={{ animationDelay: "0.1s" }}>{t("landing.hero1")}</span>
             <span className="block bg-gradient-to-r from-brand-light to-accent bg-clip-text text-transparent animate-word-in" style={{ animationDelay: "0.45s" }}>{t("landing.hero2")}</span>
           </h1>
-
-          <p className="text-white/60 text-lg sm:text-xl max-w-2xl mx-auto leading-relaxed mt-8 mb-9 animate-slide-up">
-            {t("landing.hero_sub")}
-          </p>
-
+          <p className="text-white/60 text-lg sm:text-xl max-w-2xl mx-auto leading-relaxed mt-8 mb-9 animate-slide-up">{t("landing.hero_sub")}</p>
           <div className="flex flex-col sm:flex-row gap-3 justify-center items-center animate-slide-up">
             <button onClick={onStart} className="px-9 py-4 rounded-full bg-white text-black font-bold text-lg hover:scale-[1.03] transition-transform shadow-glow-lg">
               {t("landing.cta")}
               <svg className="inline-block ml-2 w-5 h-5" fill="none" stroke="currentColor" strokeWidth="2.5" viewBox="0 0 24 24" strokeLinecap="round" strokeLinejoin="round"><path d="M5 12h14M12 5l7 7-7 7" /></svg>
             </button>
-            <a href="#showcase" className="px-7 py-4 rounded-full border border-white/20 text-white/80 text-lg hover:bg-white/5 transition-colors inline-flex items-center justify-center">
-              {t("landing.cta_demo")}
-            </a>
+            <a href="#looks" className="px-7 py-4 rounded-full border border-white/20 text-white/80 text-lg hover:bg-white/5 transition-colors inline-flex items-center justify-center">{t("landing.cta_demo")}</a>
           </div>
-
           <span className="mt-7 inline-flex items-center gap-1.5 text-[11px] text-white/50 bg-black/30 backdrop-blur-sm px-3 py-1.5 rounded-full animate-fade-in">
             <svg className="w-3 h-3 text-accent" fill="currentColor" viewBox="0 0 24 24"><path d="M8 5v14l11-7z"/></svg>
             {t("landing.hero_trust")}
           </span>
         </div>
-
         <div className="relative z-20 pb-6 flex justify-center text-white/30 animate-bounce">
           <svg className="w-5 h-5" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24" strokeLinecap="round" strokeLinejoin="round"><path d="M12 5v14M5 12l7 7 7-7" /></svg>
         </div>
       </section>
 
-      {/* Stats — full-bleed band */}
-      <section className="relative z-10 border-y border-white/[0.06] bg-white/[0.015]">
-        <div className="grid grid-cols-2 sm:grid-cols-4 max-w-6xl mx-auto sm:divide-x divide-white/[0.06]">
-          {[
-            { value: "< 5 min", label: t("landing.per_video") },
-            { value: "3", label: t("landing.outputs") },
-            { value: "100%", label: t("landing.commercial") },
-            { value: "6+", label: t("landing.languages") },
-          ].map((s) => (
-            <div key={s.label} className="text-center py-10 px-4">
-              <p className="text-4xl font-bold bg-gradient-to-r from-white to-gray-400 bg-clip-text text-transparent">{s.value}</p>
-              <p className="text-xs text-gray-500 mt-1">{s.label}</p>
-            </div>
-          ))}
-        </div>
-      </section>
-
-      {/* Formats — what you get, visual cards (Rotor-style) */}
-      <section className="relative z-10 max-w-6xl mx-auto px-6 py-24">
-        <h2 className="text-3xl sm:text-4xl font-extrabold text-center mb-3">{t("home.formats_title")}</h2>
-        <p className="text-gray-500 text-center mb-12 max-w-md mx-auto">{t("home.formats_sub")}</p>
-        <div className="grid grid-cols-2 lg:grid-cols-4 gap-5">
-          {[
-            { title: "Lyric Video", desc: "1920×1080 · Full HD", shape: "aspect-video", tag: "16:9" },
-            { title: "YouTube Short", desc: "1080×1920 · Vertical", shape: "aspect-[9/16] max-h-44", tag: "9:16" },
-            { title: "Thumbnail", desc: "1280×720 · Portada", shape: "aspect-video", tag: "JPG" },
-            { title: t("home.fmt_prores_t"), desc: t("home.fmt_prores_d"), shape: "aspect-video", tag: "ProRes" },
-          ].map((f) => (
-            <div key={f.title} className="glass rounded-2xl p-5 glass-hover flex flex-col items-center text-center">
-              <div className={`w-full ${f.shape} rounded-lg bg-gradient-to-br from-brand/30 to-accent/15 ring-1 ring-white/10 mb-4 flex items-center justify-center`}>
-                <span className="text-xs font-bold text-white/60 tracking-wider">{f.tag}</span>
+      {/* ===== LIGHT ZONE: clean, professional (Musixmatch-style) ===== */}
+      <div className="relative z-10 bg-white text-gray-900">
+        {/* Stats */}
+        <section className="border-b border-gray-200">
+          <div className="grid grid-cols-2 sm:grid-cols-4 max-w-6xl mx-auto sm:divide-x divide-gray-200">
+            {[
+              { value: "< 5 min", label: t("landing.per_video") },
+              { value: "3", label: t("landing.outputs") },
+              { value: "100%", label: t("landing.commercial") },
+              { value: "6+", label: t("landing.languages") },
+            ].map((s) => (
+              <div key={s.label} className="text-center py-10 px-4">
+                <p className="text-4xl font-extrabold text-gray-900">{s.value}</p>
+                <p className="text-xs text-gray-500 mt-1">{s.label}</p>
               </div>
-              <h3 className="font-semibold text-sm">{f.title}</h3>
-              <p className="text-xs text-gray-500 mt-1">{f.desc}</p>
-            </div>
-          ))}
-        </div>
-      </section>
+            ))}
+          </div>
+        </section>
 
-      {/* Showcase — big lyric video in action, text left / video right */}
-      <section id="showcase" className="relative z-10 scroll-mt-24 border-b border-white/[0.06] bg-gradient-to-b from-brand/[0.06] to-transparent">
+        {/* Formats */}
+        <section className="max-w-6xl mx-auto px-6 py-24">
+          <h2 className="text-3xl sm:text-4xl font-extrabold text-center mb-3">{t("home.formats_title")}</h2>
+          <p className="text-gray-500 text-center mb-12 max-w-md mx-auto">{t("home.formats_sub")}</p>
+          <div className="grid grid-cols-2 lg:grid-cols-4 gap-5">
+            {[
+              { title: "Lyric Video", desc: "1920×1080 · Full HD", shape: "aspect-video", tag: "16:9" },
+              { title: "YouTube Short", desc: "1080×1920 · Vertical", shape: "aspect-[9/16] max-h-44", tag: "9:16" },
+              { title: "Thumbnail", desc: "1280×720 · Portada", shape: "aspect-video", tag: "JPG" },
+              { title: t("home.fmt_prores_t"), desc: t("home.fmt_prores_d"), shape: "aspect-video", tag: "ProRes" },
+            ].map((f) => (
+              <div key={f.title} className="rounded-2xl p-5 bg-gray-50 ring-1 ring-gray-200 hover:ring-brand/30 hover:shadow-md transition flex flex-col items-center text-center">
+                <div className={`w-full ${f.shape} rounded-lg bg-gradient-to-br from-brand to-accent mb-4 flex items-center justify-center`}>
+                  <span className="text-xs font-bold text-white/90 tracking-wider">{f.tag}</span>
+                </div>
+                <h3 className="font-semibold text-sm text-gray-900">{f.title}</h3>
+                <p className="text-xs text-gray-500 mt-1">{f.desc}</p>
+              </div>
+            ))}
+          </div>
+        </section>
+
+        {/* How it works */}
+        <section className="border-t border-gray-200 bg-gray-50">
+          <div className="max-w-6xl mx-auto px-6 py-24">
+            <h2 className="text-3xl sm:text-4xl font-extrabold text-center mb-3">{t("home.how_title")}</h2>
+            <p className="text-gray-500 text-center mb-12 max-w-md mx-auto">{t("home.how_sub")}</p>
+            <div className="flex flex-col sm:flex-row items-center justify-center gap-4 mb-16">
+              <div className="bg-white ring-1 ring-gray-200 rounded-2xl px-6 py-5 flex items-center gap-3 w-full sm:w-auto justify-center shadow-sm">
+                <svg className="w-5 h-5 text-gray-700" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24" strokeLinecap="round" strokeLinejoin="round"><path d="M9 18V5l12-2v13" /><circle cx="6" cy="18" r="3" /><circle cx="18" cy="16" r="3" /></svg>
+                <span className="text-sm font-medium">{t("home.eq_in")}</span>
+              </div>
+              <svg className="w-5 h-5 text-brand rotate-90 sm:rotate-0 shrink-0" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24" strokeLinecap="round" strokeLinejoin="round"><path d="M5 12h14M12 5l7 7-7 7" /></svg>
+              <div className="rounded-2xl px-6 py-5 bg-gradient-to-r from-brand to-accent text-white flex items-center gap-3 w-full sm:w-auto justify-center shadow-md">
+                <svg className="w-5 h-5" fill="currentColor" viewBox="0 0 24 24"><path d="M11.5 2l1.6 5.3L18.5 9l-5.4 1.7L11.5 16l-1.6-5.3L4.5 9l5.4-1.7z"/></svg>
+                <span className="text-sm font-semibold">{t("home.eq_proc")}</span>
+              </div>
+              <svg className="w-5 h-5 text-brand rotate-90 sm:rotate-0 shrink-0" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24" strokeLinecap="round" strokeLinejoin="round"><path d="M5 12h14M12 5l7 7-7 7" /></svg>
+              <div className="bg-white ring-1 ring-gray-200 rounded-2xl px-6 py-5 flex items-center gap-3 w-full sm:w-auto justify-center shadow-sm">
+                <svg className="w-5 h-5 text-brand" fill="currentColor" viewBox="0 0 24 24"><path d="M8 5v14l11-7z" /></svg>
+                <span className="text-sm font-medium">{t("home.eq_out")}</span>
+              </div>
+            </div>
+            <div className="grid sm:grid-cols-3 gap-10">
+              {[
+                { n: "01", t: t("landing.step1"), d: t("landing.step1_desc") },
+                { n: "02", t: t("landing.step2"), d: t("landing.step2_desc") },
+                { n: "03", t: t("landing.step3"), d: t("landing.step3_desc") },
+              ].map((s) => (
+                <div key={s.n} className="text-center">
+                  <div className="text-6xl font-extrabold text-brand/15 mb-4">{s.n}</div>
+                  <h3 className="text-lg font-bold mb-2 text-gray-900">{s.t}</h3>
+                  <p className="text-sm text-gray-500 leading-relaxed">{s.d}</p>
+                </div>
+              ))}
+            </div>
+          </div>
+        </section>
+      </div>
+
+      {/* ===== DARK CINEMATIC ZONE ===== */}
+      {/* Showcase — big lyric video in action */}
+      <section className="relative z-10 border-y border-white/[0.06] bg-gradient-to-b from-brand/[0.06] to-transparent">
         <div className="max-w-6xl mx-auto px-6 py-24 grid lg:grid-cols-2 gap-12 items-center">
           <div>
             <span className="text-[11px] uppercase tracking-[0.25em] text-brand-light">{t("home.show_label")}</span>
@@ -129,8 +160,8 @@ export default function Landing() {
         </div>
       </section>
 
-      {/* Looks gallery — stylized lyric-video aesthetic (CSS mockups, on-brand) */}
-      <section className="relative z-10 max-w-6xl mx-auto px-6 py-24">
+      {/* Looks gallery — real Imagen cinematic backgrounds + kinetic lyric text */}
+      <section id="looks" className="relative z-10 max-w-6xl mx-auto px-6 py-24 scroll-mt-24">
         <h2 className="text-3xl sm:text-4xl font-extrabold text-center mb-3">{t("home.looks_title")}</h2>
         <p className="text-gray-500 text-center mb-12 max-w-lg mx-auto">{t("home.looks_sub")}</p>
         <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-5">
@@ -147,101 +178,58 @@ export default function Landing() {
         </div>
       </section>
 
-      {/* Movement styles — variety showcase (Rotor "styles/filters") with real assets */}
-      <section className="relative z-10 max-w-6xl mx-auto px-6 py-24">
-        <h2 className="text-3xl sm:text-4xl font-extrabold text-center mb-3">{t("home.styles_title")}</h2>
-        <p className="text-gray-500 text-center mb-12 max-w-lg mx-auto">{t("home.styles_sub")}</p>
-        <div className="grid grid-cols-2 lg:grid-cols-4 gap-5">
-          {[
-            { src: "/movement_samples/sutil.mp4", label: t("home.style_sutil") },
-            { src: "/movement_samples/estandar.mp4", label: t("home.style_estandar") },
-            { src: "/movement_samples/foto-parallax.mp4", label: t("home.style_parallax") },
-            { src: "/movement_samples/animado.mp4", label: t("home.style_animado") },
-          ].map((s) => (
-            <div key={s.src} className="glass rounded-2xl p-2 glass-hover">
-              <div className="rounded-xl overflow-hidden aspect-video bg-black relative">
-                <video autoPlay muted loop playsInline className="w-full h-full object-cover" src={s.src} />
-                <span className="absolute bottom-2 left-2 text-[11px] font-semibold text-white bg-black/55 backdrop-blur-sm px-2 py-1 rounded-full">{s.label}</span>
-              </div>
-            </div>
-          ))}
-        </div>
-      </section>
-
-      {/* How it works — "just add your music" (Rotor-style) */}
+      {/* Movement styles — real assets */}
       <section className="relative z-10 border-y border-white/[0.06] bg-white/[0.015]">
         <div className="max-w-6xl mx-auto px-6 py-24">
-          <h2 className="text-3xl sm:text-4xl font-extrabold text-center mb-3">{t("home.how_title")}</h2>
-          <p className="text-gray-500 text-center mb-12 max-w-md mx-auto">{t("home.how_sub")}</p>
-
-          {/* Visual input → output equation (Rotor-style) */}
-          <div className="flex flex-col sm:flex-row items-center justify-center gap-4 mb-16">
-            <div className="glass rounded-2xl px-6 py-5 flex items-center gap-3 w-full sm:w-auto justify-center">
-              <svg className="w-5 h-5 text-white/70" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24" strokeLinecap="round" strokeLinejoin="round"><path d="M9 18V5l12-2v13" /><circle cx="6" cy="18" r="3" /><circle cx="18" cy="16" r="3" /></svg>
-              <span className="text-sm font-medium">{t("home.eq_in")}</span>
-            </div>
-            <svg className="w-5 h-5 text-brand-light rotate-90 sm:rotate-0 shrink-0" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24" strokeLinecap="round" strokeLinejoin="round"><path d="M5 12h14M12 5l7 7-7 7" /></svg>
-            <div className="rounded-2xl px-6 py-5 bg-gradient-to-r from-brand/30 to-accent/20 ring-1 ring-brand/30 flex items-center gap-3 w-full sm:w-auto justify-center">
-              <svg className="w-5 h-5 text-accent" fill="currentColor" viewBox="0 0 24 24"><path d="M11.5 2l1.6 5.3L18.5 9l-5.4 1.7L11.5 16l-1.6-5.3L4.5 9l5.4-1.7z"/></svg>
-              <span className="text-sm font-semibold">{t("home.eq_proc")}</span>
-            </div>
-            <svg className="w-5 h-5 text-brand-light rotate-90 sm:rotate-0 shrink-0" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24" strokeLinecap="round" strokeLinejoin="round"><path d="M5 12h14M12 5l7 7-7 7" /></svg>
-            <div className="glass rounded-2xl px-6 py-5 flex items-center gap-3 w-full sm:w-auto justify-center">
-              <svg className="w-5 h-5 text-accent" fill="currentColor" viewBox="0 0 24 24"><path d="M8 5v14l11-7z" /></svg>
-              <span className="text-sm font-medium">{t("home.eq_out")}</span>
-            </div>
-          </div>
-
-          <div className="grid sm:grid-cols-3 gap-10">
+          <h2 className="text-3xl sm:text-4xl font-extrabold text-center mb-3">{t("home.styles_title")}</h2>
+          <p className="text-gray-500 text-center mb-12 max-w-lg mx-auto">{t("home.styles_sub")}</p>
+          <div className="grid grid-cols-2 lg:grid-cols-4 gap-5">
             {[
-              { n: "01", t: t("landing.step1"), d: t("landing.step1_desc") },
-              { n: "02", t: t("landing.step2"), d: t("landing.step2_desc") },
-              { n: "03", t: t("landing.step3"), d: t("landing.step3_desc") },
-            ].map((s, i) => (
-              <div key={s.n} className="relative text-center">
-                <div className="text-6xl font-extrabold text-brand/15 mb-4">{s.n}</div>
-                <h3 className="text-lg font-bold mb-2">{s.t}</h3>
-                <p className="text-sm text-gray-400 leading-relaxed">{s.d}</p>
-                {i < 2 && <div className="hidden sm:block absolute top-8 -right-5 text-gray-700"><svg className="w-5 h-5" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24"><path d="M5 12h14M12 5l7 7-7 7" strokeLinecap="round" strokeLinejoin="round"/></svg></div>}
+              { src: "/movement_samples/sutil.mp4", label: t("home.style_sutil") },
+              { src: "/movement_samples/estandar.mp4", label: t("home.style_estandar") },
+              { src: "/movement_samples/foto-parallax.mp4", label: t("home.style_parallax") },
+              { src: "/movement_samples/animado.mp4", label: t("home.style_animado") },
+            ].map((s) => (
+              <div key={s.src} className="glass rounded-2xl p-2 glass-hover">
+                <div className="rounded-xl overflow-hidden aspect-video bg-black relative">
+                  <video autoPlay muted loop playsInline className="w-full h-full object-cover" src={s.src} />
+                  <span className="absolute bottom-2 left-2 text-[11px] font-semibold text-white bg-black/55 backdrop-blur-sm px-2 py-1 rounded-full">{s.label}</span>
+                </div>
               </div>
             ))}
           </div>
         </div>
       </section>
 
-      {/* Why GenLy — image left / differentiators right, full-bleed band */}
-      <section className="relative z-10 border-y border-white/[0.06] bg-white/[0.015]">
-        <div className="max-w-6xl mx-auto px-6 py-24 grid lg:grid-cols-2 gap-12 lg:gap-16 lg:items-start">
-          <div className="lg:sticky lg:top-28">
-            <span className="text-[11px] uppercase tracking-[0.25em] text-brand-light">{t("home.why_label")}</span>
-            <h2 className="text-3xl sm:text-4xl font-extrabold tracking-tight mt-3 mb-4 leading-[1.05]">{t("landing.why_title")}</h2>
-            <p className="text-gray-400 text-lg leading-relaxed">{t("landing.why_sub")}</p>
-          </div>
-          <div>
-            <div className="space-y-6">
-              {[
-                { t: t("landing.why1_t"), d: t("landing.why1_d") },
-                { t: t("landing.why2_t"), d: t("landing.why2_d") },
-                { t: t("landing.why3_t"), d: t("landing.why3_d") },
-                { t: t("landing.why4_t"), d: t("landing.why4_d") },
-              ].map((item) => (
-                <div key={item.t} className="flex gap-4 items-start">
-                  <div className="w-9 h-9 shrink-0 rounded-lg bg-brand/15 flex items-center justify-center text-brand">
-                    <svg className="w-5 h-5" fill="none" stroke="currentColor" strokeWidth="2.5" viewBox="0 0 24 24" strokeLinecap="round" strokeLinejoin="round"><path d="M20 6L9 17l-5-5" /></svg>
-                  </div>
-                  <div>
-                    <h3 className="font-semibold mb-1">{item.t}</h3>
-                    <p className="text-sm text-gray-400 leading-relaxed">{item.d}</p>
-                  </div>
-                </div>
-              ))}
+      {/* Why GenLy — text 2-col */}
+      <section className="relative z-10 max-w-6xl mx-auto px-6 py-24 grid lg:grid-cols-2 gap-12 lg:gap-16 lg:items-start">
+        <div className="lg:sticky lg:top-28">
+          <span className="text-[11px] uppercase tracking-[0.25em] text-brand-light">{t("home.why_label")}</span>
+          <h2 className="text-3xl sm:text-4xl font-extrabold tracking-tight mt-3 mb-4 leading-[1.05]">{t("landing.why_title")}</h2>
+          <p className="text-gray-400 text-lg leading-relaxed">{t("landing.why_sub")}</p>
+        </div>
+        <div className="space-y-6">
+          {[
+            { t: t("landing.why1_t"), d: t("landing.why1_d") },
+            { t: t("landing.why2_t"), d: t("landing.why2_d") },
+            { t: t("landing.why3_t"), d: t("landing.why3_d") },
+            { t: t("landing.why4_t"), d: t("landing.why4_d") },
+          ].map((item) => (
+            <div key={item.t} className="flex gap-4 items-start">
+              <div className="w-9 h-9 shrink-0 rounded-lg bg-brand/15 flex items-center justify-center text-brand">
+                <svg className="w-5 h-5" fill="none" stroke="currentColor" strokeWidth="2.5" viewBox="0 0 24 24" strokeLinecap="round" strokeLinejoin="round"><path d="M20 6L9 17l-5-5" /></svg>
+              </div>
+              <div>
+                <h3 className="font-semibold mb-1">{item.t}</h3>
+                <p className="text-sm text-gray-400 leading-relaxed">{item.d}</p>
+              </div>
             </div>
-          </div>
+          ))}
         </div>
       </section>
 
-      {/* Audience routing — wide cards */}
-      <section className="relative z-10 max-w-6xl mx-auto px-6 py-24">
+      {/* Audience routing */}
+      <section className="relative z-10 max-w-6xl mx-auto px-6 py-12">
         <div className="grid sm:grid-cols-2 gap-6">
           {[
             { to: "/artistas", t: t("home.aud_artists_t"), d: t("home.aud_artists_d") },
@@ -259,8 +247,8 @@ export default function Landing() {
         </div>
       </section>
 
-      {/* Partners — full-bleed strip */}
-      <section className="relative z-10 border-y border-white/[0.06] bg-white/[0.015] py-12">
+      {/* Partners */}
+      <section className="relative z-10 border-y border-white/[0.06] bg-white/[0.015] py-12 mt-12">
         <div className="max-w-4xl mx-auto px-6 text-center">
           <p className="text-xs text-gray-600 uppercase tracking-widest mb-7">{t("landing.integrated")}</p>
           <div className="flex flex-wrap justify-center items-center gap-x-12 gap-y-5 opacity-50">
@@ -280,11 +268,10 @@ export default function Landing() {
         </div>
       </section>
 
-      {/* Social proof slots — null until real assets exist */}
       <SocialProofWall title="Confían en GenLy" />
       <Testimonials title="Lo que dicen los artistas" />
 
-      {/* Final CTA — full-bleed gradient band */}
+      {/* Final CTA */}
       <section className="relative z-10 border-t border-white/[0.06] bg-gradient-to-b from-brand/[0.08] to-transparent py-28 px-6 text-center">
         <h2 className="text-4xl sm:text-5xl font-extrabold tracking-tight mb-4">{t("landing.ready")}</h2>
         <p className="text-gray-400 text-lg mb-9 max-w-md mx-auto">{t("landing.ready_sub")}</p>
