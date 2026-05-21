@@ -704,7 +704,7 @@ const translations = {
     "news.2_d": "Corregís el estribillo una vez y se aplica a todas sus repeticiones.",
     "news.3_t": "Masters ProRes + 6 idiomas",
     "news.3_d": "Entregables broadcast y transcripción en 6 idiomas, listos para distribuir.",
-    "footer.tagline": "Lyric videos de nivel profesional, generados con IA.",
+    "footer.tagline": "Lyric videos (videos de letras) de nivel profesional, generados con IA.",
     "footer.col_product": "Producto",
     "footer.col_company": "Empresa",
     "footer.col_legal": "Legal",
