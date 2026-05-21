@@ -3337,7 +3337,18 @@ async def _run_transcription_for_job(
             _bg_fetch_lyrics, artist_hint, song_hint,
         ))
 
-        segments = await loop.run_in_executor(None, transcribe, tmp_path, lang)
+        # When the plain-lyrics aligner is enabled, request word-level
+        # timestamps so we can re-bucket Whisper's output against the
+        # Gemini/lyrics.ovh reference's line structure (aligner pass below).
+        # Same flag the lrclib-hit path uses. Default off.
+        aligner_enabled = (
+            os.environ.get("LRCLIB_PLAIN_ALIGNER_ENABLED", "0")
+            .strip().lower() in ("1", "true", "yes", "on", "y", "t")
+        )
+        segments = await loop.run_in_executor(
+            None,
+            lambda: transcribe(tmp_path, lang, return_words=aligner_enabled),
+        )
 
         # Wait up to 2s after Whisper finishes for Gemini to complete.
         reference = ""
@@ -3388,6 +3399,35 @@ async def _run_transcription_for_job(
         # same "good prefix + bad body" pattern.
         if reference:
             user_dur = await asyncio.to_thread(_audio_duration, tmp_path)
+
+            # Plain-lyrics aligner on the Gemini/lyrics.ovh reference —
+            # mirrors the lrclib-hit path. Whisper merges/splits lines by
+            # audio pauses, which on live recordings (crowd, reverb)
+            # collapses ~50 sung lines into ~19 long segments. The aligner
+            # keeps the reference's curated line boundaries and pulls timing
+            # from the first/last Whisper word in each matched span. Behind
+            # LRCLIB_PLAIN_ALIGNER_ENABLED; replaces only when coverage is
+            # high enough, else falls through to the gap-fill recovery.
+            if aligner_enabled:
+                try:
+                    from lrclib_aligner import align_lrclib_to_whisper
+                    ref_lines = sum(
+                        1 for ln in reference.splitlines() if ln.strip()
+                    )
+                    aligned = align_lrclib_to_whisper(reference, segments)
+                    coverage = (
+                        len(aligned) / ref_lines if ref_lines else 0.0
+                    )
+                    if coverage >= 0.5 and len(aligned) >= 8:
+                        logger.info("[LYRICS] aligner (gemini): %s/%s lines aligned (%.0f%% coverage) — replacing Whisper segmentation", len(aligned), ref_lines, coverage * 100)
+                        segments = aligned
+                    else:
+                        logger.warning("[LYRICS] aligner (gemini): low coverage (%s/%s = %.0f%%) — keeping raw Whisper, trying hallucination recovery", len(aligned), ref_lines, coverage * 100)
+                except Exception as e:
+                    # Opt-in and conservative: any aligner failure must NOT
+                    # break the existing pipeline.
+                    logger.error("[LYRICS] aligner (gemini) error: %r — keeping raw Whisper segments", e, exc_info=True)
+
             hallucinated, reason = _detect_hallucination(segments, user_dur, language=lang)
             if hallucinated and user_dur:
                 merged = _fill_gaps_with_reference(
@@ -3414,6 +3454,20 @@ async def _run_transcription_for_job(
         segments, _dropped = _filter_whisper_hallucinations(segments)
         if _dropped:
             logger.warning("[TRANSCRIBE] dropped %s Whisper hallucination phrase(s)", _dropped)
+        # Safety net: with the aligner flag on but no usable reference (or
+        # low coverage), split over-long Whisper segments by their word
+        # timestamps so live/instrumental mega-lines don't reach the editor.
+        # No-op on already-aligned segments (they carry no `words`).
+        if aligner_enabled:
+            from lrclib_aligner import split_long_segments_by_words
+            _before = len(segments)
+            segments = split_long_segments_by_words(segments)
+            if len(segments) != _before:
+                logger.info("[LYRICS] length-split: %s → %s segments", _before, len(segments))
+        # Strip per-word arrays before persisting — only present when the
+        # aligner requested word timestamps but didn't consume them (low
+        # coverage); keeps segments_json lean.
+        segments = [{k: v for k, v in s.items() if k != "words"} for s in segments]
         return {"job_id": job_id, "segments": segments, "reference_lyrics": reference}
     finally:
         # tmp_dir holds intermediate slices (intro/body cuts) only — the
