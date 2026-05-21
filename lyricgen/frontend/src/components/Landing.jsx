@@ -143,11 +143,51 @@ export default function Landing() {
         </div>
       </section>
 
+      {/* Movement styles — variety showcase (Rotor "styles/filters") with real assets */}
+      <section className="relative z-10 max-w-6xl mx-auto px-6 py-24">
+        <h2 className="text-3xl sm:text-4xl font-extrabold text-center mb-3">{t("home.styles_title")}</h2>
+        <p className="text-gray-500 text-center mb-12 max-w-lg mx-auto">{t("home.styles_sub")}</p>
+        <div className="grid grid-cols-2 lg:grid-cols-4 gap-5">
+          {[
+            { src: "/movement_samples/sutil.mp4", label: t("home.style_sutil") },
+            { src: "/movement_samples/estandar.mp4", label: t("home.style_estandar") },
+            { src: "/movement_samples/foto-parallax.mp4", label: t("home.style_parallax") },
+            { src: "/movement_samples/animado.mp4", label: t("home.style_animado") },
+          ].map((s) => (
+            <div key={s.src} className="glass rounded-2xl p-2 glass-hover">
+              <div className="rounded-xl overflow-hidden aspect-video bg-black relative">
+                <video autoPlay muted loop playsInline className="w-full h-full object-cover" src={s.src} />
+                <span className="absolute bottom-2 left-2 text-[11px] font-semibold text-white bg-black/55 backdrop-blur-sm px-2 py-1 rounded-full">{s.label}</span>
+              </div>
+            </div>
+          ))}
+        </div>
+      </section>
+
       {/* How it works — "just add your music" (Rotor-style) */}
       <section className="relative z-10 border-y border-white/[0.06] bg-white/[0.015]">
         <div className="max-w-6xl mx-auto px-6 py-24">
           <h2 className="text-3xl sm:text-4xl font-extrabold text-center mb-3">{t("home.how_title")}</h2>
-          <p className="text-gray-500 text-center mb-16 max-w-md mx-auto">{t("home.how_sub")}</p>
+          <p className="text-gray-500 text-center mb-12 max-w-md mx-auto">{t("home.how_sub")}</p>
+
+          {/* Visual input → output equation (Rotor-style) */}
+          <div className="flex flex-col sm:flex-row items-center justify-center gap-4 mb-16">
+            <div className="glass rounded-2xl px-6 py-5 flex items-center gap-3 w-full sm:w-auto justify-center">
+              <svg className="w-5 h-5 text-white/70" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24" strokeLinecap="round" strokeLinejoin="round"><path d="M9 18V5l12-2v13" /><circle cx="6" cy="18" r="3" /><circle cx="18" cy="16" r="3" /></svg>
+              <span className="text-sm font-medium">{t("home.eq_in")}</span>
+            </div>
+            <svg className="w-5 h-5 text-brand-light rotate-90 sm:rotate-0 shrink-0" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24" strokeLinecap="round" strokeLinejoin="round"><path d="M5 12h14M12 5l7 7-7 7" /></svg>
+            <div className="rounded-2xl px-6 py-5 bg-gradient-to-r from-brand/30 to-accent/20 ring-1 ring-brand/30 flex items-center gap-3 w-full sm:w-auto justify-center">
+              <svg className="w-5 h-5 text-accent" fill="currentColor" viewBox="0 0 24 24"><path d="M11.5 2l1.6 5.3L18.5 9l-5.4 1.7L11.5 16l-1.6-5.3L4.5 9l5.4-1.7z"/></svg>
+              <span className="text-sm font-semibold">{t("home.eq_proc")}</span>
+            </div>
+            <svg className="w-5 h-5 text-brand-light rotate-90 sm:rotate-0 shrink-0" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24" strokeLinecap="round" strokeLinejoin="round"><path d="M5 12h14M12 5l7 7-7 7" /></svg>
+            <div className="glass rounded-2xl px-6 py-5 flex items-center gap-3 w-full sm:w-auto justify-center">
+              <svg className="w-5 h-5 text-accent" fill="currentColor" viewBox="0 0 24 24"><path d="M8 5v14l11-7z" /></svg>
+              <span className="text-sm font-medium">{t("home.eq_out")}</span>
+            </div>
+          </div>
+
           <div className="grid sm:grid-cols-3 gap-10">
             {[
               { n: "01", t: t("landing.step1"), d: t("landing.step1_desc") },
