@@ -5952,18 +5952,19 @@ def _make_text_clip(
     # font_scale is the user-chosen size multiplier (default 1.0 = unchanged)
     font_scale = max(0.6, min(1.5, float(font_scale or 1.0)))
 
+    import ass_render as _ass
     text_len = len(display_text)
+    # text_width (caption wrap) stays tier-based here; fontsize comes from
+    # the shared tier helper so the moviepy and ASS paths size lines
+    # identically (single source of truth in ass_render).
     if text_len > 80:
-        base_fontsize = int(round(55 * scale))
         text_width = int(round(1700 * scale))
     elif text_len > 50:
-        base_fontsize = int(round(70 * scale))
         text_width = int(round(1650 * scale))
     else:
-        base_fontsize = int(round(85 * scale))
         text_width = int(round(1500 * scale))
 
-    fontsize = max(18, int(round(base_fontsize * font_scale)))
+    fontsize = _ass.lyric_fontsize(text_len, scale, font_scale)
 
     shadow_offset = max(1, int(round(3 * scale)))
     fallback_font = os.path.join(_FONTS_DIR, "Montserrat-Bold.ttf")
@@ -5972,19 +5973,14 @@ def _make_text_clip(
 
     seg_duration = max(0.1, seg_end - seg_start)
 
-    # Fade duration — capped at 1/3 of segment so short clips don't break
-    _FADE_DURATIONS = {"fade": 0.15, "fade_slow": 0.30}
-    fade_dur = _FADE_DURATIONS.get(lyric_transition, 0.0)
-    fade_dur = min(fade_dur, seg_duration / 3)
-    # Compensate for fade-in perception. The text starts at seg_start with
-    # opacity=0 and ramps linearly to 100%. Humans perceive "the text
-    # appeared" around the ~50% opacity mark — so without compensation the
-    # operator's anchored timestamp shows up perceptually fade_dur/2 LATE.
-    # Subtracting half the fade from the start time aligns the perceptual
-    # midpoint with the anchor, which is what the Sync Mode operator
-    # actually targeted with their Space tap. Cuts == 0 → no compensation.
-    fade_perceptual_offset = fade_dur / 2.0
-    adjusted_start = max(0.0, seg_start - fade_perceptual_offset)
+    # Fade + perceptual onset offset come from the shared tier helpers
+    # (ass_render) so both render paths agree. The offset shifts the visual
+    # onset earlier by half the fade: text ramps 0→100% opacity, humans
+    # perceive "it appeared" at ~50%, so without this the operator's
+    # anchored timestamp (Sync Mode Space tap) reads fade_dur/2 LATE. Cuts
+    # → fade 0 → no shift. Fade is capped at seg/3 inside fade_seconds.
+    fade_dur = _ass.fade_seconds(lyric_transition, seg_duration)
+    adjusted_start = _ass.perceptual_start(seg_start, fade_dur)
     adjusted_end = seg_end  # End is unaffected; only the visual onset shifts.
 
     def _try_text_clip(txt, fsize, fnt, color, **kwargs):
@@ -6458,6 +6454,113 @@ def _apply_display_timing(
     return cleaned
 
 
+def _ffmpeg_filter_escape(path: str) -> str:
+    """Escape a path for use inside an ffmpeg filtergraph option value
+    (the subtitles= fontsdir argument). Backslashes and colons are the
+    ones that bite on POSIX paths."""
+    return path.replace("\\", "\\\\").replace(":", "\\:")
+
+
+def _render_lyrics_ass(
+    bg_video_path: str,
+    mp3_path: str,
+    segments: list[dict],
+    job_dir: str,
+    duration: float,
+    *,
+    spec: "RenderSpec",
+    font_path: str,
+    text_case: str = "upper",
+    font_scale: float = 1.0,
+    lyric_transition: str = "cut",
+    text_contrast: str = "medium",
+) -> str:
+    """Fast lyric render: burn the lyrics with libass in a single ffmpeg
+    pass over the (ffmpeg-looped) background — no moviepy frame loop.
+
+    Phase 1 scope: video backgrounds + H.264 (YouTube) only. Image
+    (Ken Burns) backgrounds, the UMG ProRes master, and text_motion drift
+    still go through the moviepy path; the caller gates on that before
+    calling here. ~10-30x faster than the moviepy composite for the case
+    it covers.
+
+    Parity with _make_text_clip is enforced by reusing ass_render's
+    fontsize/fade/offset tiers and the same _apply_case + outline/shadow
+    derivation (stroke = contrast.stroke_mult * scale, shadow = 3*scale).
+    """
+    import ass_render as _ass
+
+    scale = spec.text_scale
+    contrast = _CONTRAST_SETTINGS.get(text_contrast, _CONTRAST_SETTINGS["medium"])
+    outline = max(1.0, contrast["stroke_mult"] * scale)
+    shadow = max(1, int(round(3 * scale)))
+
+    # 1) Background → looped file at the target dims (ffmpeg, C-level).
+    bg_looped = _prerender_looped_bg(
+        bg_video_path, duration, job_dir,
+        target_w=spec.width, target_h=spec.height,
+        out_name="bg_looped_ass.mp4",
+    )
+
+    # 2) Font: resolve family + weight, isolate in a single-font dir so
+    #    libass can't mis-match across the pool.
+    family, bold = _ass.font_family(font_path)
+    font_dir = _ass.single_font_dir(font_path)
+
+    # 3) Segments → ASS lines (same case/sanitise/sizing as moviepy).
+    lines = _ass.segments_to_lines(
+        segments,
+        text_scale=scale,
+        font_scale=font_scale,
+        lyric_transition=lyric_transition,
+        case_fn=lambda t: _apply_case(t, text_case),
+    )
+    base_fs = _ass.lyric_fontsize(40, scale, font_scale)
+    ass_doc = _ass.build_ass(
+        width=spec.width, height=spec.height,
+        font_name=family, base_fontsize=base_fs,
+        outline=outline, shadow=shadow, lines=lines, bold=bold,
+    )
+    ass_path = os.path.join(job_dir, "lyrics.ass")
+    with open(ass_path, "w", encoding="utf-8") as f:
+        f.write(ass_doc)
+
+    # 4) Single ffmpeg pass: burn ASS + mux audio. We run with cwd=job_dir
+    #    so the subtitles file is referenced by basename (avoids the
+    #    notorious filtergraph path escaping); fontsdir is absolute+escaped.
+    out_path = os.path.join(job_dir, "lyric_video.mp4")
+    vf = f"subtitles=lyrics.ass:fontsdir={_ffmpeg_filter_escape(font_dir)}"
+    cmd = [
+        "ffmpeg", "-y", "-loglevel", "error",
+        "-i", os.path.abspath(bg_looped),
+        "-i", os.path.abspath(mp3_path),
+        "-vf", vf,
+        "-map", "0:v", "-map", "1:a",
+        "-c:v", "libx264", "-preset", "veryfast", "-crf", "20",
+        "-pix_fmt", "yuv420p",
+        "-c:a", "aac", "-b:a", "320k",
+        "-r", str(spec.fps),
+        "-shortest",
+        os.path.basename(out_path),
+    ]
+    try:
+        result = subprocess.run(
+            cmd, cwd=job_dir, capture_output=True, text=True, timeout=900,
+        )
+        if result.returncode != 0:
+            raise RuntimeError(
+                f"ass render ffmpeg failed: {result.stderr[-500:]}"
+            )
+    finally:
+        import shutil
+        shutil.rmtree(font_dir, ignore_errors=True)
+
+    size_mb = os.path.getsize(out_path) / (1024 * 1024)
+    logger.info("[ASS] lyric video rendered: %.0fs, %.1f MB (libass fast path)",
+                duration, size_mb)
+    return out_path
+
+
 def generate_lyric_video(
     mp3_path: str,
     segments: list[dict],
@@ -6496,11 +6599,6 @@ def generate_lyric_video(
     if not bg_source:
         raise RuntimeError("No background available. Check Veo 3 API or add videos to assets/backgrounds/")
 
-    if bg_source.lower().endswith((".jpg", ".jpeg", ".png")):
-        bg = _ken_burns_clip(bg_source, duration, spec=spec)
-    else:
-        bg = _get_background_clip_from_path(bg_source, style, duration, job_dir, spec=spec)
-
     # Pick a font for this job (or reuse the caller-provided one).
     # For UMG profile, the choice is deterministic (derived from job_dir hash)
     # so retries of the same job produce the same font — UMG QC and editorial
@@ -6532,6 +6630,31 @@ def generate_lyric_video(
     # _apply_display_timing for the full rationale + the UMG incident.
     if segments:
         segments = _apply_display_timing(segments, duration)
+
+    # Fast path: libass single-pass render (engine=ass). Phase 1 covers
+    # video bg + H.264 (YouTube), no text drift. Image/Ken Burns bg, the
+    # UMG ProRes master, and text_motion≠none all fall through to moviepy.
+    # NOTE: phase 1 does not render the title card (artist/song) — that's
+    # a known gap to close before flipping the flag on for prod.
+    _engine = os.environ.get("LYRIC_RENDER_ENGINE", "moviepy").lower()
+    _bg_is_video = not bg_source.lower().endswith((".jpg", ".jpeg", ".png"))
+    if (_engine == "ass" and _bg_is_video and spec.profile != "umg"
+            and text_motion == "none"):
+        logger.info("[ASS] libass fast path (engine=ass, profile=%s)", spec.profile)
+        out = _render_lyrics_ass(
+            bg_source, mp3_path, segments, job_dir, duration,
+            spec=spec, font_path=font, text_case=text_case,
+            font_scale=font_scale, lyric_transition=lyric_transition,
+            text_contrast=text_contrast,
+        )
+        audio.close()
+        return out, font, bg_source
+
+    # --- moviepy composite path (default) ---
+    if bg_source.lower().endswith((".jpg", ".jpeg", ".png")):
+        bg = _ken_burns_clip(bg_source, duration, spec=spec)
+    else:
+        bg = _get_background_clip_from_path(bg_source, style, duration, job_dir, spec=spec)
 
     # Build text clips — each segment gets its own shadow + text
     text_layers = []

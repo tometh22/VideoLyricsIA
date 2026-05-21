@@ -99,6 +99,46 @@ def perceptual_start(seg_start: float, fade_dur: float) -> float:
     return max(0.0, seg_start - fade_dur / 2.0)
 
 
+def font_family(font_path: str) -> tuple[str, bool]:
+    """Resolve a .ttf path to its libass-matchable (family_name, is_bold).
+
+    libass matches fonts by family NAME + weight, not by file path — so
+    the moviepy path (which hands ImageMagick the file directly) and the
+    ASS path must agree on the family name or libass silently falls back
+    to a default font (visible parity break).
+
+    We read the font's own name table via Pillow (already a dependency).
+    is_bold is derived from the file's actual style/family string (not
+    forced) so libass requests the weight the file really is: e.g.
+    Oswald-Bold → ("Oswald", True); Anton-Regular → ("Anton", False),
+    which avoids libass synthesising fake-bold on a display face that is
+    already heavy by design.
+
+    Pair this with a single-font fontsdir (see single_font_dir) so libass
+    has exactly one candidate and can't mis-match across the pool.
+    """
+    from PIL import ImageFont
+    f = ImageFont.truetype(font_path, size=16)
+    family, style = f.getname()
+    blob = f"{family} {style}".lower()
+    is_bold = any(w in blob for w in ("bold", "black", "heavy"))
+    return family, is_bold
+
+
+def single_font_dir(font_path: str) -> str:
+    """Copy one font into a fresh temp dir and return it, so the ffmpeg
+    `subtitles` filter can point `fontsdir` at a directory with exactly
+    one font — removing any family-matching ambiguity in libass.
+
+    Caller owns cleanup of the returned dir."""
+    import os
+    import shutil
+    import tempfile
+    d = tempfile.mkdtemp(prefix="ass_fonts_")
+    shutil.copy2(font_path, os.path.join(d, os.path.basename(font_path)))
+    return d
+
+
 def _clean_display_text(text: str, case_fn) -> str:
     """Apply the case transform + the same sanitisation _make_text_clip
     does before handing text to the renderer (NFC normalise, drop chars
@@ -189,6 +229,7 @@ def build_ass(
     lines: list[AssLine],
     margin_v: int = 0,
     alignment: int = 5,
+    bold: bool = True,
 ) -> str:
     """Build a complete ASS document for the lyric overlay.
 
@@ -209,13 +250,14 @@ def build_ass(
     style = (
         "Style: Lyric,{font},{fs},"
         "&H00FFFFFF,&H000000FF,&H00000000,&H80000000,"  # primary, secondary, outline, back(shadow, 50% alpha)
-        "-1,0,0,0,"          # bold=-1 (true), italic, underline, strikeout
+        "{bold},0,0,0,"      # bold (-1 true / 0 false), italic, underline, strikeout
         "100,100,0,0,"       # scaleX, scaleY, spacing, angle
         "1,{bord},{shad},"   # BorderStyle=1, Outline, Shadow
         "{align},20,20,{mv},1"  # alignment, marginL, marginR, marginV, encoding
     ).format(
         font=font_name,
         fs=base_fontsize,
+        bold=-1 if bold else 0,
         bord=_fmt_num(outline),
         shad=_fmt_num(shadow),
         align=alignment,

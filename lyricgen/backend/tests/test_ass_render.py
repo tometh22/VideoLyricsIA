@@ -2,11 +2,69 @@
 lyric-render path. Pure formatter, no moviepy/ImageMagick, so this runs
 on any Python without the heavy render deps."""
 
+import os
+
+import pytest
+
 from ass_render import (
     AssLine, build_ass, _ass_time, _ass_escape,
     lyric_fontsize, fade_seconds, perceptual_start,
-    segments_to_lines,
+    segments_to_lines, font_family, single_font_dir,
 )
+
+_FONTS_DIR = os.path.join(os.path.dirname(__file__), "..", "fonts")
+
+
+def _font(name):
+    return os.path.join(_FONTS_DIR, name)
+
+
+def _have_pil():
+    try:
+        import PIL  # noqa: F401
+        return True
+    except Exception:
+        return False
+
+
+pil = pytest.mark.skipif(not _have_pil(), reason="Pillow not installed in this interpreter")
+
+
+@pil
+def test_font_family_resolves_name_and_weight_from_real_fonts():
+    fam, bold = font_family(_font("Oswald-Bold.ttf"))
+    assert "oswald" in fam.lower()
+    assert bold is True
+    fam2, bold2 = font_family(_font("Anton-Regular.ttf"))
+    assert "anton" in fam2.lower()
+    assert bold2 is False  # Regular display face — no synthetic bold
+
+
+def test_single_font_dir_has_exactly_one_font():
+    # Uses a font file if present; otherwise writes a dummy to test the
+    # mechanics (copy into an isolated dir).
+    src = _font("Oswald-Bold.ttf")
+    if not os.path.isfile(src):
+        pytest.skip("font asset not present")
+    d = single_font_dir(src)
+    try:
+        files = os.listdir(d)
+        assert files == ["Oswald-Bold.ttf"]
+    finally:
+        import shutil
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def test_build_ass_bold_flag_toggles_style():
+    out_bold = build_ass(width=1920, height=1080, font_name="Anton",
+                         base_fontsize=85, outline=2, shadow=3, lines=[], bold=True)
+    out_reg = build_ass(width=1920, height=1080, font_name="Anton",
+                        base_fontsize=85, outline=2, shadow=3, lines=[], bold=False)
+    # Style line: bold field is -1 (true) vs 0 (false).
+    bold_style = [l for l in out_bold.splitlines() if l.startswith("Style: Lyric")][0]
+    reg_style = [l for l in out_reg.splitlines() if l.startswith("Style: Lyric")][0]
+    assert ",-1,0,0,0," in bold_style
+    assert ",0,0,0,0," in reg_style
 
 
 def test_segments_to_lines_parity_basics():
