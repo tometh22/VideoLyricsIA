@@ -1385,7 +1385,7 @@ export default function App() {
     : null;
 
   const newBatchScreen = (
-    <div className="w-full max-w-4xl mx-auto animate-fade-in">
+    <div className="w-full max-w-[1700px] mx-auto animate-fade-in">
       <div className="flex items-center gap-3 mb-8">
         <button onClick={() => navigate("/dashboard")}
           className="w-9 h-9 rounded-xl glass flex items-center justify-center text-gray-400 hover:text-white transition-colors">

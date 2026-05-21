@@ -49,7 +49,7 @@ export default function WizardLivePreview({ style = "oscuro", movementStyle = ""
   }[mode] || "";
 
   return (
-    <div className="relative w-full aspect-video rounded-2xl overflow-hidden ring-1 ring-white/[0.08] shadow-[0_24px_70px_-24px_#000] bg-black select-none">
+    <div className="relative w-full aspect-video rounded-2xl overflow-hidden ring-1 ring-white/[0.08] shadow-[0_24px_70px_-24px_#000] bg-black select-none" style={{ containerType: "inline-size" }}>
       <style>{`
         @keyframes wlp-sutil { to { transform: translate(2%,1.4%) scale(1.05); } }
         @keyframes wlp-estandar { to { transform: translate(-8%,4%) scale(1.2); } }
@@ -89,7 +89,7 @@ export default function WizardLivePreview({ style = "oscuro", movementStyle = ""
       <div className="absolute inset-x-0 bottom-[20%] px-[8%] text-center">
         <div
           className={`font-extrabold tracking-[-0.03em] leading-[1.02] ${isMinimal ? "text-gray-900" : "text-white"}`}
-          style={{ fontSize: "clamp(20px,4.4vw,46px)", textShadow: isMinimal ? "0 1px 12px rgba(255,255,255,.4)" : "0 4px 30px rgba(0,0,0,.6)" }}
+          style={{ fontSize: "clamp(18px,7.5cqw,68px)", textShadow: isMinimal ? "0 1px 12px rgba(255,255,255,.4)" : "0 4px 30px rgba(0,0,0,.6)" }}
         >
           {sample}
         </div>
