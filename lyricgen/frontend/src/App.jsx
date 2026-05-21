@@ -757,6 +757,7 @@ export default function App() {
       songTitle: (f.songTitle || "").trim(),
       language: f.language, genre: f.genre || "", font: f.font || "",
       concept: f.concept || "", movementStyle: f.movementStyle || "",
+      backgroundHint: f.backgroundHint || "", bgVerbatim: !!f.bgVerbatim,
       status: "queued", current_step: null,
       progress: 0, job_id: null, error: null,
     }));
@@ -780,6 +781,7 @@ export default function App() {
         songTitle: entry.songTitle || "",
         genre: entry.genre || "", font: entry.font || "",
         concept: entry.concept || "", movementStyle: entry.movementStyle || "",
+        backgroundHint: entry.backgroundHint || "", bgVerbatim: !!entry.bgVerbatim,
         textCase: entry.textCase || "upper",
         fontScale: entry.fontScale || "1.0",
         lyricTransition: entry.lyricTransition || "cut",
@@ -858,6 +860,7 @@ export default function App() {
         songTitle: entry.songTitle || "",
         genre: entry.genre || "", font: entry.font || "",
         concept: entry.concept || "", movementStyle: entry.movementStyle || "",
+        backgroundHint: entry.backgroundHint || "", bgVerbatim: !!entry.bgVerbatim,
         textCase: entry.textCase || "upper",
         fontScale: entry.fontScale || "1.0",
         lyricTransition: entry.lyricTransition || "cut",
@@ -919,6 +922,7 @@ export default function App() {
       songTitle: r.songTitle || "",
       genre: r.genre || "", font: r.font || "", concept: r.concept || "",
       movementStyle: r.movementStyle || "",
+      backgroundHint: r.backgroundHint || "", bgVerbatim: !!r.bgVerbatim,
       textCase: r.textCase || "upper",
       fontScale: r.fontScale || "1.0",
       lyricTransition: r.lyricTransition || "cut",
@@ -954,6 +958,7 @@ export default function App() {
       songTitle: (a.songTitle || "").trim(),
       language: a.language, genre: a.genre || "", font: a.font || "",
       concept: a.concept || "", movementStyle: a.movementStyle || "",
+      backgroundHint: a.backgroundHint || "", bgVerbatim: !!a.bgVerbatim,
       textCase: a.textCase || "upper",
       fontScale: a.fontScale || "1.0",
       lyricTransition: a.lyricTransition || "cut",
@@ -993,6 +998,10 @@ export default function App() {
         if (jobList[i].font) formData.append("font", jobList[i].font);
         if (jobList[i].concept) formData.append("concept", jobList[i].concept);
         if (jobList[i].movementStyle) formData.append("movement_style", jobList[i].movementStyle);
+        if ((jobList[i].backgroundHint || "").trim()) {
+          formData.append("background_hint", jobList[i].backgroundHint.trim());
+          if (jobList[i].bgVerbatim) formData.append("bg_verbatim", "true");
+        }
         formData.append("text_case", jobList[i].textCase || "upper");
         formData.append("font_scale", String(jobList[i].fontScale || "1.0"));
         formData.append("lyric_transition", jobList[i].lyricTransition || "cut");
@@ -1117,6 +1126,10 @@ export default function App() {
         if (jobList[i].font) generateBody.append("font", jobList[i].font);
         if (jobList[i].concept) generateBody.append("concept", jobList[i].concept);
         if (jobList[i].movementStyle) generateBody.append("movement_style", jobList[i].movementStyle);
+        if ((jobList[i].backgroundHint || "").trim()) {
+          generateBody.append("background_hint", jobList[i].backgroundHint.trim());
+          if (jobList[i].bgVerbatim) generateBody.append("bg_verbatim", "true");
+        }
         generateBody.append("text_case", jobList[i].textCase || "upper");
         generateBody.append("font_scale", String(jobList[i].fontScale || "1.0"));
         generateBody.append("lyric_transition", jobList[i].lyricTransition || "cut");

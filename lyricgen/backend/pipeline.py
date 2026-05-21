@@ -367,7 +367,12 @@ def run_pipeline(job_id: str, mp3_path: str, artist: str, style: str,
                  # genre + lyrics. Cuando viene set, _ensure_background
                  # lo inyecta como [OPERATOR OVERRIDE] en el user_content
                  # de Gemini, misma mecánica que /edit (PR #116).
-                 background_hint: str | None = None):
+                 background_hint: str | None = None,
+                 # bg_verbatim: cuando es True y hay background_hint, el texto
+                 # del operador va DIRECTO a Veo sin que Gemini lo reescriba
+                 # ("usar mi prompt tal cual"). Default False = comportamiento
+                 # actual (Gemini refina el hint como [OPERATOR OVERRIDE]).
+                 bg_verbatim: bool = False):
     """Run the full pipeline for a job. Called synchronously.
 
     delivery_profile:
@@ -580,6 +585,7 @@ def run_pipeline(job_id: str, mp3_path: str, artist: str, style: str,
                 image_to_video_path=(background_path if _animate_user_image else None),
                 match_lyrics=match_lyrics,
                 background_hint=background_hint,
+                bg_verbatim=bg_verbatim,
                 allow_people=_compute_allow_people(job_id),
             )
             # Image-to-video fallback: if Veo failed to produce an MP4 (None
@@ -614,12 +620,18 @@ def run_pipeline(job_id: str, mp3_path: str, artist: str, style: str,
             "genre": genre,
             "concept": concept,
             "movement_style": movement_style,
+            # Persist the scene-source choice so the editor's "Regenerar fondo"
+            # can pre-fill the same Escena/Movimiento the operator picked in the
+            # wizard — the upload→edit flow must not forget decisions.
+            "match_lyrics": match_lyrics,
         }
-        # Only persist background_hint when this run actually received one —
-        # otherwise a hint-less typography edit would null out a hint a prior
-        # background edit had stored.
+        # Only persist background_hint / bg_verbatim when this run actually
+        # received them — otherwise a hint-less typography edit would null out
+        # values a prior background edit had stored (merge-not-replace).
         if background_hint:
             _new_rp["background_hint"] = background_hint
+        if bg_verbatim:
+            _new_rp["bg_verbatim"] = True
         try:
             from database import SessionLocal as _SL_rp, Job as _Job_rp
             with _SL_rp() as _db_rp:
@@ -3799,18 +3811,28 @@ _BG_PALETTES = [
     "icy blue and white",
 ]
 
-_BG_CAMERAS = [
+# Camera registers for the combinatorial fallback (used only when Gemini
+# fails to return a usable prompt). Split into MOTION and STATIC so the
+# fallback can honour movement intent instead of always reintroducing a
+# camera move (the old list was 10/10 motion → every fallback drifted).
+_BG_CAMERAS_MOTION = [
     "slow aerial drone flyover",
     "smooth dolly forward movement",
     "gentle sideways tracking shot",
     "slow upward crane shot",
-    "steady wide angle static shot with subtle movement",
     "slow orbit around the scene",
     "smooth descending aerial shot",
     "gentle push-in zoom",
     "slow parallax movement",
     "steady first-person glide forward",
 ]
+_BG_CAMERAS_STATIC = [
+    "locked static wide shot on a tripod, no camera movement",
+    "fixed tripod composition, the camera does not move",
+    "held static frame, motion only within the scene",
+]
+# Back-compat alias: anything still reading _BG_CAMERAS gets the full pool.
+_BG_CAMERAS = _BG_CAMERAS_MOTION + _BG_CAMERAS_STATIC
 
 _BG_CONDITIONS = [
     "cinematic depth of field",
@@ -3941,6 +3963,7 @@ _CONCEPT_SCENE_GUIDE = {
 # right "feel" per song. The genre + concept selectors decide WHAT the
 # scene is; this decides HOW it moves.
 _MOVEMENT_STYLE_RULES = {
+    "estatico":      "Camera: LOCKED STATIC TRIPOD. The camera does NOT move at all — no pan, no tilt, no zoom, no dolly, no push-in, no drift, no orbit, no crane, no handheld, no parallax. A single fixed frame held for the whole shot, like a photograph on a tripod. ALL motion lives WITHIN the scene only (water ripples, fire, drifting clouds, smoke, flickering light, swaying foliage, floating particles). The frame edges never move.",
     "sutil":         "Movement: minimal and ambient — gentle sway, slow drift, breathing motion. Subjects barely move. Easy to loop seamlessly.",
     "estandar":      "",  # no extra rule; the existing prompt template controls motion
     "foto-parallax": "Aesthetic: photographic still with subtle parallax — composition feels like a single photo, motion is restricted to slow camera moves, depth-of-field shifts, and lighting passes. No moving subjects.",
@@ -3955,6 +3978,9 @@ def _normalize_movement_style(s: str) -> str:
         return ""
     s = s.strip().lower()
     aliases = {
+        "static": "estatico", "estatica": "estatico", "estática": "estatico",
+        "fija": "estatico", "fixed": "estatico", "tripod": "estatico",
+        "locked": "estatico", "still": "estatico", "camara-fija": "estatico",
         "subtle": "sutil", "minimal": "sutil", "minimo": "sutil",
         "standard": "estandar", "default": "estandar",
         "photo": "foto-parallax", "parallax": "foto-parallax",
@@ -4167,6 +4193,31 @@ def _analyze_lyrics_for_background(lyrics_text: str, artist: str, job_id: str = 
     movement_rule = _MOVEMENT_STYLE_RULES.get(normalized_movement, "")
     movement_extra_line = f"\n- {movement_rule}" if movement_rule else ""
 
+    # Camera-motion de-bias. Two flags drive how clause (2) and the few-shot
+    # examples talk about the camera:
+    #   _static       — operator picked "Estático / cámara fija": the prompt
+    #                   must describe a LOCKED frame and NEVER a camera move.
+    #   _auto_movement — operator left movement on Auto: instead of forcing a
+    #                   cinematic drift on every song (the old monotony bug),
+    #                   Gemini CHOOSES the register from the song's energy.
+    # For an explicit non-static register (sutil/estandar/foto-parallax/
+    # animado) the existing movement_rule steers it, so clause (2) keeps its
+    # original "exact camera movement" wording.
+    _static = normalized_movement == "estatico"
+    _auto_movement = normalized_movement == ""
+    if _static:
+        _clause2 = ("(2) framing only — wide/medium/close and angle — the camera "
+                    "is LOCKED and STATIC, explicitly NO camera movement of any kind; "
+                    "all motion lives WITHIN the scene")
+    elif _auto_movement:
+        _clause2 = ("(2) the camera register that matches the song's energy — a "
+                    "LOCKED STATIC frame for intimate/calm songs, SUBTLE minimal "
+                    "motion for most, active camera movement ONLY for genuinely "
+                    "high-energy tracks; do NOT default to a constant cinematic "
+                    "drift — and the framing")
+    else:
+        _clause2 = "(2) exact camera movement and framing"
+
     # The "no people" line is gated by `allow_people`. When the operator
     # opted into "fondo libre" (bypass_content_validation=True) OR the
     # tenant is non-UMG and didn't force validation, this restriction is
@@ -4183,7 +4234,7 @@ def _analyze_lyrics_for_background(lyrics_text: str, artist: str, job_id: str = 
     _PROMPT_RULES = (
         "- \"style\" must always be \"video\"\n"
         "- \"prompt\" is 80-120 words. Describe: (1) specific scene subject and setting "
-        "in detail, (2) exact camera movement and framing, (3) color palette and dominant "
+        f"in detail, {_clause2}, (3) color palette and dominant "
         "tones, (4) lighting type and direction, (5) atmosphere, mood, and at least one "
         "specific texture or material detail. Be precise and cinematic — avoid vague "
         "adjectives like \"beautiful\" or \"amazing\".\n"
@@ -4195,26 +4246,53 @@ def _analyze_lyrics_for_background(lyrics_text: str, artist: str, job_id: str = 
         "contradicts the literal subject of the lyrics unless match_lyrics is "
         "explicitly disabled."
     )
-    # 3 contrastive examples (rock/urban, romantic ballad, acoustic) + an
-    # explicit "do not copy verbatim" disclaimer. Replaces the prior
-    # single example which biased Gemini toward "neon-lit rain-slicked
-    # streets" output whenever concept/genre came empty (prompt-bleed
-    # observed in prod 2026-05-12 on Rata Blanca "Mujer Amante" — a
-    # ballad that got rendered as an industrial alley). Plus a hard guard
-    # rail for ballads / love songs at the bottom.
-    _BASE_INSTRUCTIONS = """Respond ONLY with a JSON object, no other text.
+    # Contrastive few-shot examples + a "do not copy verbatim" disclaimer.
+    # The example SET is chosen by movement intent so the camera language the
+    # model imitates matches what the operator asked for:
+    #   _static       → all three examples hold a locked frame (motion in-scene)
+    #   _auto_movement → one static + one subtle + one motion, so Gemini sees
+    #                    the full range and varies per song instead of always
+    #                    drifting (the monotony bug)
+    #   explicit reg. → the original motion examples; movement_rule steers
+    # Replaces the prior single example which biased Gemini toward "neon-lit
+    # rain-slicked streets" whenever concept/genre came empty (prompt-bleed on
+    # Rata Blanca "Mujer Amante", 2026-05-12). Genre-tone guard rail shared.
+    if _static:
+        _EXAMPLES_BLOCK = """Example for rock / energetic / dramatic track:
+{"style":"video","prompt":"Locked static wide shot of a stormy desert highway at dusk, the camera fixed on a tripod and never moving, lightning fracturing the distant clouds, heat haze shimmering above the asphalt, a vintage road sign trembling in the wind, dust drifting across the still frame, dramatic and raw, cinematic 4k"}
 
-Output JSON shape — do NOT copy any of these example scenes verbatim;
-they show only the format and the breadth of valid visual registers:
+Example for romantic ballad / love song:
+{"style":"video","prompt":"Fixed static frame of a sunlit room at golden hour, the camera never moves, gauze curtains billowing gently, dust motes floating through the warm beam, a glass on the table catching slow glints of light, intimate and calm, cinematic 4k"}
 
-Example for rock / energetic / dramatic track:
+Example for introspective acoustic / folk track:
+{"style":"video","prompt":"Held static shot of a misty mountain valley at dawn on a locked tripod, layered blue and pink sky perfectly still, silhouetted pine trees motionless, low fog rolling slowly between them, a single bird crossing the far distance, contemplative and vast, cinematic 4k"}"""
+    elif _auto_movement:
+        _EXAMPLES_BLOCK = """Example (LOCKED STATIC camera — motion only within the scene):
+{"style":"video","prompt":"Fixed static frame of a sunlit room at golden hour, the camera never moves, gauze curtains billowing gently, dust motes drifting through the warm beam, a glass catching slow glints, intimate and calm, cinematic 4k"}
+
+Example (SUBTLE minimal motion):
+{"style":"video","prompt":"Barely-moving shot of a misty mountain valley at dawn, an almost imperceptible drift, layered blue and pink sky, low fog rolling slowly between still pine trees, contemplative and vast, cinematic 4k"}
+
+Example (ACTIVE camera movement — only when the song's energy genuinely calls for it):
+{"style":"video","prompt":"Slow drone over a stormy desert highway at dusk, lightning fracturing distant clouds, asphalt reflecting the dying light, vintage road sign blurred in the foreground, dramatic and raw, cinematic 4k"}
+
+CAMERA REGISTER (important): choose the register that matches the song — a LOCKED STATIC frame for intimate/calm/slow songs, SUBTLE minimal motion for most tracks, and ACTIVE camera movement only for genuinely high-energy songs. Do NOT default to constant cinematic drift; vary it per song. Scene motion (water, light, foliage, particles) is always allowed."""
+    else:
+        _EXAMPLES_BLOCK = """Example for rock / energetic / dramatic track:
 {"style":"video","prompt":"Slow drone over a stormy desert highway at dusk, lightning fracturing distant clouds, asphalt reflecting the dying light, vintage road sign blurred in the foreground, dramatic and raw, cinematic 4k"}
 
 Example for romantic ballad / love song:
 {"style":"video","prompt":"Slow drift through a sunlit room at golden hour, warm light streaming through gauze curtains, soft focus on a glass catching the light, dust motes floating in the warm beam, intimate and calm, cinematic 4k"}
 
 Example for introspective acoustic / folk track:
-{"style":"video","prompt":"Slow aerial pull-back over a misty mountain valley at dawn, layers of soft blue and pink sky, distant silhouettes of pine trees, gentle wind moving low fog, contemplative and vast, cinematic 4k"}
+{"style":"video","prompt":"Slow aerial pull-back over a misty mountain valley at dawn, layers of soft blue and pink sky, distant silhouettes of pine trees, gentle wind moving low fog, contemplative and vast, cinematic 4k"}"""
+
+    _BASE_INSTRUCTIONS = f"""Respond ONLY with a JSON object, no other text.
+
+Output JSON shape — do NOT copy any of these example scenes verbatim;
+they show only the format and the breadth of valid visual registers:
+
+{_EXAMPLES_BLOCK}
 
 GENRE-TONE COHERENCE (critical):
 If the lyrics or declared genre suggest a love song, romantic ballad,
@@ -4344,7 +4422,7 @@ STEP 1 — Choose the scene:
   - folk     → mountain vistas, dusty roads, wheat fields, riverside campfires
   - metal    → volcanic lava streams, dark cathedrals, stormy lightning, cracked obsidian
 
-STEP 2 — Output JSON with an 80-120 word prompt. Describe: (1) specific scene subject and setting in detail, (2) exact camera movement and framing, (3) color palette and dominant tones, (4) lighting type and direction, (5) atmosphere, mood, and at least one specific texture or material detail. Be precise and cinematic — avoid vague adjectives like "beautiful" or "amazing".
+STEP 2 — Output JSON with an 80-120 word prompt. Describe: (1) specific scene subject and setting in detail, {_clause2}, (3) color palette and dominant tones, (4) lighting type and direction, (5) atmosphere, mood, and at least one specific texture or material detail. Be precise and cinematic — avoid vague adjectives like "beautiful" or "amazing".
 
 Hard rules:
 - "style" must always be "video"
@@ -4552,6 +4630,7 @@ def _get_unique_prompt(lyrics_text: str = None, artist: str = "", job_id: str = 
                        movement_style: str = "", match_lyrics: bool = True,
                        background_hint: str | None = None,
                        for_provider: str = "veo",
+                       bg_verbatim: bool = False,
                        allow_people: bool = False) -> dict:
     """Get a unique style+prompt combination. Returns {style, prompt}.
 
@@ -4577,6 +4656,19 @@ def _get_unique_prompt(lyrics_text: str = None, artist: str = "", job_id: str = 
     includes artist+title so even a duplicated Gemini prompt produces a
     fresh background per song (see `_generate_veo_video`).
     """
+    # Verbatim mode: the operator chose "usar mi prompt tal cual". Skip the
+    # Gemini rewrite entirely and send their exact text to the generator. The
+    # safety + (when static) camera-motion negatives are still appended in
+    # _generate_veo_video, so verbatim is "respect my words" — not "no rails".
+    # This is the fix for the power-user case where a hand-written "Static
+    # tripod, no camera motion…" prompt was paraphrased away by Gemini.
+    if bg_verbatim and background_hint and background_hint.strip():
+        logger.info("[BG] verbatim mode — bypassing Gemini, using operator prompt as-is")
+        return {
+            "style": "image" if for_provider == "imagen" else "video",
+            "prompt": background_hint.strip(),
+        }
+
     used: list[str] = []
     if os.path.exists(_USED_PROMPTS_FILE):
         try:
@@ -4584,6 +4676,11 @@ def _get_unique_prompt(lyrics_text: str = None, artist: str = "", job_id: str = 
                 used = json.load(f)
         except (json.JSONDecodeError, OSError):
             used = []
+
+    # Movement-aware camera pool for the combinatorial fallback (rare — only
+    # when Gemini fails to parse). Static intent must NOT get a motion verb.
+    _norm_move = _normalize_movement_style(movement_style)
+    _camera_pool = _BG_CAMERAS_STATIC if _norm_move == "estatico" else _BG_CAMERAS
 
     # Gemini analysis
     if lyrics_text or song_title:
@@ -4619,7 +4716,7 @@ def _get_unique_prompt(lyrics_text: str = None, artist: str = "", job_id: str = 
             prompt = f"{composition} of {scene}, {palette}, {condition}, 4k, photorealistic"
             style = "image"
         else:
-            camera = random.choice(_BG_CAMERAS)
+            camera = random.choice(_camera_pool)
             prompt = f"{camera} of {scene}, {palette}, {condition}, 4k, photorealistic"
             style = "video"
         if prompt not in used:
@@ -4639,7 +4736,7 @@ def _get_unique_prompt(lyrics_text: str = None, artist: str = "", job_id: str = 
         }
     return {
         "style": "video",
-        "prompt": f"{random.choice(_BG_CAMERAS)} of {random.choice(_BG_SCENES)}, {random.choice(_BG_PALETTES)}, {random.choice(_BG_CONDITIONS)}, 4k, photorealistic",
+        "prompt": f"{random.choice(_camera_pool)} of {random.choice(_BG_SCENES)}, {random.choice(_BG_PALETTES)}, {random.choice(_BG_CONDITIONS)}, 4k, photorealistic",
     }
 
 
@@ -4687,6 +4784,7 @@ def _generate_veo_video(prompt: str, output_path: str, job_id: str = None,
                         image_path: str | None = None,
                         movement_style: str = "",
                         normalized_concept: str = "",
+                        high_fidelity: bool = False,
                         allow_people: bool = False) -> str:
     """Generate a video clip with Google Veo 3 via direct Vertex AI REST API.
 
@@ -4735,7 +4833,23 @@ def _generate_veo_video(prompt: str, output_path: str, job_id: str = None,
     # stay regardless because those are legal/IP concerns separate from
     # the people question.
     _people_clause = "" if allow_people else " no people, no faces, no hands,"
-    if movement_style == "animado":
+    # Shared IP / content negatives (text, logos, optionally people) — present
+    # in every register.
+    _base_negatives = (
+        "No text, no words, no letters, no signs, no billboards, no posters, "
+        "no banners, no graffiti, no shop windows, no street signs, no neon "
+        f"signs, no logos, no trademarks, no brand symbols,{_people_clause}"
+    )
+    # Camera-motion negatives — the LAST line of defense for static intent.
+    # Veo's payload exposes no structured camera-lock field, so these words
+    # are the only lever; they fight Veo's strong drift prior. Appended only
+    # when the operator asked for a locked frame (estatico).
+    _camera_negatives = (
+        " no camera movement, no pan, no tilt, no zoom, no dolly, no push-in, "
+        "no drift, no orbit, no crane, no handheld, no parallax."
+    )
+    _norm_move = _normalize_movement_style(movement_style)
+    if _norm_move == "animado":
         # Cartoon / 2D illustration aesthetic — keep all safety clauses
         # except the "no CGI / no animation" pair, which would directly
         # contradict the requested look.
@@ -4743,18 +4857,28 @@ def _generate_veo_video(prompt: str, output_path: str, job_id: str = None,
             f"{prompt}. Stylised 2D animated illustration, flat shapes, "
             "deliberate cartoon-like motion. "
             f"{no_alley}"
-            "No text, no words, no letters, no signs, no billboards, no posters, "
-            "no banners, no graffiti, no shop windows, no street signs, no neon "
-            f"signs, no logos, no trademarks, no brand symbols,{_people_clause}"
+            f"{_base_negatives}"
             " no extra animation noise."
+        )
+    elif _norm_move == "estatico":
+        # Locked tripod. Drop the "filmed with cinema camera" phrasing (it
+        # nudges Veo toward cinematic moves) for an explicit static framing,
+        # and append the camera-motion negatives so a static prompt actually
+        # holds the frame. Fixes the "I asked for static and it still drifted"
+        # report.
+        safe_prompt = (
+            f"{prompt}. Photorealistic, real footage, locked static tripod shot, "
+            "fixed camera, the frame does not move, motion only within the scene. "
+            f"{no_alley}"
+            f"{_base_negatives}"
+            " no CGI, no animation,"
+            f"{_camera_negatives}"
         )
     else:
         safe_prompt = (
             f"{prompt}. Photorealistic, filmed with cinema camera, real footage. "
             f"{no_alley}"
-            "No text, no words, no letters, no signs, no billboards, no posters, "
-            "no banners, no graffiti, no shop windows, no street signs, no neon "
-            f"signs, no logos, no trademarks, no brand symbols,{_people_clause}"
+            f"{_base_negatives}"
             " no CGI, no animation."
         )
 
@@ -4769,6 +4893,18 @@ def _generate_veo_video(prompt: str, output_path: str, job_id: str = None,
     # 1.0 by default — preserves more detail while still smoothing micro
     # artefacts. Tune via env var without redeploy if needed.
     model = os.environ.get("VEO_MODEL", "veo-3.1-fast-generate-001").strip()
+    # Static / verbatim renders are exactly the cases where prompt adherence
+    # matters most (the user asked for a precise, often locked-camera result).
+    # The fast model has a stronger drift prior; the standard model follows
+    # "static shot" better but costs ~4x. Route ONLY these renders to a
+    # higher-fidelity model when VEO_MODEL_STATIC is set — leaves the default
+    # untouched for everything else, and lets us A/B fast-vs-standard + measure
+    # real cost without a redeploy (see plan Phase 5).
+    _static_model = os.environ.get("VEO_MODEL_STATIC", "").strip()
+    if _static_model and (high_fidelity or _norm_move == "estatico"):
+        model = _static_model
+        logger.info("[BG] high-fidelity render → model=%s (movement=%s, verbatim=%s)",
+                    model, _norm_move or "auto", high_fidelity)
     veo_params = {
         "aspectRatio": "16:9",
         "sampleCount": 1,
@@ -5239,6 +5375,7 @@ def _ensure_background(style_hint: str, job_dir: str, lyrics_text: str = None,
                        match_lyrics: bool = True,
                        background_hint: str | None = None,
                        bg_mode: str = "veo",
+                       bg_verbatim: bool = False,
                        allow_people: bool = False) -> str:
     """Generate background using AI. Gemini picks the best style for the song.
 
@@ -5265,6 +5402,14 @@ def _ensure_background(style_hint: str, job_dir: str, lyrics_text: str = None,
     if all_videos:
         return None
 
+    _norm_move_bg = _normalize_movement_style(movement_style)
+    # Animado is a Veo-only aesthetic (the 2D-illustration safe_prompt lives in
+    # _generate_veo_video). Imagen renders stills, so an animado+imagen combo
+    # is incoherent — downgrade to Veo. (Matrix rule: Imagen × Animado → Veo.)
+    if _norm_move_bg == "animado" and bg_mode != "veo":
+        logger.info("[BG] movement=animado overrides bg_mode → veo")
+        bg_mode = "veo"
+
     # Imagen-4 + Ken Burns branch. Cabled 2026-05-16 — _generate_imagen_image
     # has existed in the codebase as dead code since the original architecture
     # but was never wired into the dispatch. This is the wire.
@@ -5274,6 +5419,7 @@ def _ensure_background(style_hint: str, job_dir: str, lyrics_text: str = None,
             concept=concept, movement_style=movement_style, match_lyrics=match_lyrics,
             background_hint=background_hint,
             for_provider="imagen",
+            bg_verbatim=bg_verbatim,
             allow_people=allow_people,
         )
         prompt = result["prompt"]
@@ -5284,8 +5430,10 @@ def _ensure_background(style_hint: str, job_dir: str, lyrics_text: str = None,
         # try/except which falls back to the gradient.
         _generate_imagen_image(prompt, image_path, job_id=job_id, allow_people=allow_people)
         # Ken Burns produces a 60s sample that downstream palindrome-loops
-        # to match the audio duration. Same contract as the Veo path.
-        _ken_burns_image_to_mp4(image_path, bg_path)
+        # to match the audio duration. Same contract as the Veo path. When the
+        # operator picked "Estático", hold the frame (no zoom/pan) so the
+        # Imagen path honours the locked-camera request too.
+        _ken_burns_image_to_mp4(image_path, bg_path, static=(_norm_move_bg == "estatico"))
         return bg_path
 
     # Generate video background with Veo 3 (always video, no images)
@@ -5293,6 +5441,7 @@ def _ensure_background(style_hint: str, job_dir: str, lyrics_text: str = None,
         lyrics_text, artist, job_id=job_id, song_title=song_title, genre=genre,
         concept=concept, movement_style=movement_style, match_lyrics=match_lyrics,
         background_hint=background_hint,
+        bg_verbatim=bg_verbatim,
         allow_people=allow_people,
     )
     prompt = result["prompt"]
@@ -5308,6 +5457,7 @@ def _ensure_background(style_hint: str, job_dir: str, lyrics_text: str = None,
                 image_path=image_to_video_path,
                 movement_style=movement_style,
                 normalized_concept=_normalize_concept(concept),
+                high_fidelity=bg_verbatim,
                 allow_people=allow_people,
             )
             # Semantic relevance check — always score, but cap retries at one
@@ -5316,7 +5466,12 @@ def _ensure_background(style_hint: str, job_dir: str, lyrics_text: str = None,
             # result is also evaluated before we accept and return it.
             score = _score_video_relevance(bg_path, prompt)
             logger.info("[BG] Relevance score: %s/10 for prompt: %s...", score, prompt[:60])
-            if score < 7 and not quality_retry_used:
+            # Verbatim: never re-roll. A re-roll re-runs _get_unique_prompt
+            # which short-circuits to the SAME verbatim text → identical
+            # safe_prompt → Veo cache HIT → same clip, wasting a scoring pass
+            # and never improving. The operator asked for their exact prompt;
+            # we accept the first result and just log the score.
+            if score < 7 and not quality_retry_used and not bg_verbatim:
                 quality_retry_used = True
                 logger.info("[BG] Score %s < 7 — generating new prompt and retrying VEO", score)
                 # Propagate background_hint into the quality retry. Without it,
@@ -5330,6 +5485,7 @@ def _ensure_background(style_hint: str, job_dir: str, lyrics_text: str = None,
                     genre=genre, concept=concept, movement_style=movement_style,
                     match_lyrics=match_lyrics,
                     background_hint=background_hint,
+                    bg_verbatim=bg_verbatim,
                     allow_people=allow_people,
                 )
                 prompt = result["prompt"]
@@ -5361,6 +5517,7 @@ def _ken_burns_image_to_mp4(
     output_path: str,
     sample_duration: float = 60.0,
     spec: RenderSpec | None = None,
+    static: bool = False,
 ) -> str:
     """Render a Ken Burns animation over a still image as a standalone MP4.
 
@@ -5383,7 +5540,7 @@ def _ken_burns_image_to_mp4(
     """
     if spec is None:
         spec = RenderSpec.youtube_default()
-    clip = _ken_burns_clip(image_path, sample_duration, spec=spec)
+    clip = _ken_burns_clip(image_path, sample_duration, spec=spec, static=static)
     try:
         clip.write_videofile(
             output_path,
@@ -5401,12 +5558,40 @@ def _ken_burns_image_to_mp4(
     return output_path
 
 
-def _ken_burns_clip(image_path: str, duration: float, spec: RenderSpec | None = None):
-    """Create an animated Ken Burns clip with periodic direction changes."""
+def _ken_burns_clip(image_path: str, duration: float, spec: RenderSpec | None = None,
+                    static: bool = False):
+    """Create an animated Ken Burns clip with periodic direction changes.
+
+    `static=True` returns a LOCKED frame instead: the image is center-cropped
+    to the target aspect ratio and held for the whole duration — no zoom, no
+    pan. Used by the Imagen background path when the operator picked
+    "Estático", where the usual Ken Burns zoom/pan would directly contradict
+    a locked-camera request.
+    """
     if spec is None:
         spec = RenderSpec.youtube_default()
     img = np.array(Image.open(image_path))
     h, w = img.shape[:2]
+
+    if static:
+        # Center-crop to target aspect ratio, then resize once. Held constant.
+        target_ar = spec.width / spec.height
+        src_ar = w / h if h else target_ar
+        if src_ar > target_ar:
+            ch = h
+            cw = int(round(h * target_ar))
+        else:
+            cw = w
+            ch = int(round(w / target_ar)) if target_ar else h
+        cw = max(1, min(cw, w))
+        ch = max(1, min(ch, h))
+        cx = (w - cw) // 2
+        cy = (h - ch) // 2
+        crop = img[cy:cy + ch, cx:cx + cw]
+        frame = np.array(
+            Image.fromarray(crop).resize((spec.width, spec.height), Image.LANCZOS)
+        )
+        return VideoClip(lambda t: frame, duration=duration).set_fps(spec.fps)
 
     # Each cycle lasts ~12 seconds, with a different random direction
     cycle_dur = 12.0
@@ -7443,6 +7628,11 @@ def run_edit_pipeline(
     # Defaults to "veo" when unset for backward compatibility — pre-2026-05-16
     # edits never carried this field. Validated upstream by Pydantic enum.
     background_mode = edit_params.get("background_mode") or "veo"
+    # "Usar mi prompt tal cual": send background_hint straight to Veo without
+    # Gemini's rewrite. Read from merged so a verbatim choice persisted at
+    # generate time survives, but it only takes effect in the background
+    # branch when a hint is actually present (see _get_unique_prompt).
+    bg_verbatim = bool(merged.get("bg_verbatim"))
 
     job_dir = os.path.join(OUTPUTS_DIR, job_id)
     os.makedirs(job_dir, exist_ok=True)
@@ -7490,6 +7680,7 @@ def run_edit_pipeline(
                 movement_style=movement_style,
                 background_hint=background_hint,
                 bg_mode=background_mode,
+                bg_verbatim=bg_verbatim,
                 allow_people=_compute_allow_people(job_id),
             )
             update_job(job_id, progress=35)
