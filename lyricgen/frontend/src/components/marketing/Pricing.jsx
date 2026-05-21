@@ -1,7 +1,8 @@
 import { useNavigate } from "react-router-dom";
 import { useI18n } from "../../i18n";
+import PageHero from "./PageHero";
 
-// Pricing page: plans + comparison table + FAQ.
+// Pricing page: cinematic hero + plans + comparison table + FAQ.
 export default function Pricing() {
   const { t } = useI18n();
   const navigate = useNavigate();
@@ -28,13 +29,14 @@ export default function Pricing() {
   const faqs = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10].map((i) => ({ q: t(`faq.q${i}`), a: t(`faq.a${i}`) }));
 
   return (
-    <div className="px-6 pt-24 pb-28 max-w-5xl mx-auto">
-      {/* Plans */}
-      <div className="text-center mb-12">
-        <h1 className="text-4xl sm:text-5xl font-extrabold tracking-tight mb-4">{t("landing.pricing")}</h1>
-        <p className="text-gray-500 max-w-md mx-auto mb-3">{t("landing.pricing_sub")}</p>
-        <p className="text-sm text-accent font-medium max-w-xl mx-auto">{t("landing.pricing_scale")}</p>
-      </div>
+    <>
+      <PageHero
+        title={t("landing.pricing")}
+        sub={t("landing.pricing_sub")}
+        bg="/samples/looks/look-vinyl.png"
+      />
+      <div className="px-6 pt-20 pb-28 max-w-5xl mx-auto">
+      <p className="text-center text-sm text-accent font-medium max-w-xl mx-auto mb-12">{t("landing.pricing_scale")}</p>
       <div className="grid grid-cols-1 md:grid-cols-3 gap-5 max-w-4xl mx-auto">
         {plans.map((plan) => (
           <div key={plan.kind} className={`glass rounded-3xl p-7 text-center relative flex flex-col ${plan.popular ? "border-brand/30 shadow-glow" : ""}`}>
@@ -96,5 +98,6 @@ export default function Pricing() {
         </div>
       </div>
     </div>
+    </>
   );
 }

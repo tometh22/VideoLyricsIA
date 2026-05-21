@@ -1,6 +1,6 @@
 import { useState } from "react";
-import { useNavigate } from "react-router-dom";
 import { useI18n } from "../../i18n";
+import PageHero from "./PageHero";
 
 const API = import.meta.env.VITE_API_URL || "";
 
@@ -8,7 +8,6 @@ const API = import.meta.env.VITE_API_URL || "";
 // and the sales lead form.
 export default function Labels() {
   const { t } = useI18n();
-  const navigate = useNavigate();
   const [formState, setFormState] = useState("idle"); // idle | loading | sent | error
 
   const handleSalesSubmit = async (e) => {
@@ -56,15 +55,17 @@ export default function Labels() {
   ];
 
   return (
-    <div className="px-6 pt-24 pb-28 max-w-5xl mx-auto">
-      {/* Header */}
-      <div className="text-center max-w-2xl mx-auto mb-14">
-        <span className="text-[11px] uppercase tracking-[0.25em] text-brand-light">{t("nav.for_labels")}</span>
-        <h1 className="text-4xl sm:text-5xl font-extrabold tracking-tight mt-3 mb-4">{t("labels.title")}</h1>
-        <p className="text-gray-400 text-lg leading-relaxed mb-8">{t("labels.sub")}</p>
-        <a href="#contact" className="btn-primary text-lg py-4 px-10 inline-flex items-center justify-center">{t("labels.cta")}</a>
-      </div>
-
+    <>
+      <PageHero
+        eyebrow={t("nav.for_labels")}
+        title={t("labels.title")}
+        sub={t("labels.sub")}
+        bg="/samples/looks/look-stage.png"
+      />
+      <div className="px-6 pb-28 pt-20 max-w-5xl mx-auto">
+        <div className="text-center mb-12">
+          <a href="#contact" className="btn-primary text-lg py-4 px-10 inline-flex items-center justify-center">{t("labels.cta")}</a>
+        </div>
       {/* Enterprise features */}
       <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-5">
         {feats.map((f) => (
@@ -120,5 +121,6 @@ export default function Labels() {
         </form>
       </div>
     </div>
+    </>
   );
 }
