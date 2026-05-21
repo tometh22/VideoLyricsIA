@@ -1497,6 +1497,9 @@ export default function App() {
             // editor would keep showing the previous song's segments
             // when handleBackInReview swaps currentReview underneath it.
             key={`${currentReview.file.name}:${currentReview.queueIdx}`}
+            // Clear the app's own sticky top bar (~72px) so the editor's
+            // sticky CTA header isn't hidden behind it in the wizard.
+            stickyHeaderTop={72}
             segments={currentReview.segments}
             filename={currentReview.file.name}
             audioFile={currentReview.file}

@@ -253,6 +253,10 @@ export default function LyricsEditor({
   previewBgUrl = null,
   // Background style name → template gradient for the wizard preview.
   backgroundStyle = "default",
+  // px offset for the sticky header so it clears any sticky app header
+  // above it. 0 in the modal (fixed overlay, no app chrome); the wizard
+  // passes the app header height so the editor's CTA isn't cut off.
+  stickyHeaderTop = 0,
 }) {
   const { t } = useI18n();
   const [edited, setEdited] = useState(() =>
@@ -1359,7 +1363,10 @@ export default function LyricsEditor({
         />
       )}
 
-      <div className="sticky top-0 z-30 py-3 mb-4 bg-surface/90 backdrop-blur-md border-b border-white/[0.06] flex flex-wrap items-center justify-between gap-3">
+      <div
+        className="sticky z-30 py-3 mb-4 bg-surface/90 backdrop-blur-md border-b border-white/[0.06] flex flex-wrap items-center justify-between gap-3"
+        style={{ top: stickyHeaderTop }}
+      >
         <div className="flex items-center gap-3">
           <button onClick={onBack}
             className="w-9 h-9 rounded-xl bg-surface-2/40 ring-1 ring-white/[0.04] hover:ring-white/[0.08] hover:text-white flex items-center justify-center text-gray-400 transition-colors">
@@ -1790,7 +1797,10 @@ export default function LyricsEditor({
           moved (2026-05-16) into the consolidated auto-fix panel near
           the top of the editor so the operator sees ONE "system can
           fix N things" action instead of a standalone amber alert. */}
-      <div className={`mb-3 ${viewMode === "timeline" ? "hidden" : ""}`}>
+      {/* "Ajustes avanzados de timing" (global shift) ocultado: el ajuste
+          fino por línea se resuelve en la timeline; el shift global casi no
+          se usa y ensuciaba el flujo. */}
+      <div className="hidden">
         <button
           onClick={() => setShiftPanelOpen((v) => !v)}
           className="w-full flex items-center justify-between px-3 py-2 rounded-card bg-surface-2/40 ring-1 ring-white/[0.04] hover:ring-white/[0.08] text-xs text-gray-300 hover:text-white transition-colors"
