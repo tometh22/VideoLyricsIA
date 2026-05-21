@@ -4688,6 +4688,92 @@ async def get_source_audio_url(
     return {"url": url, "expires_in": 3600}
 
 
+# NOTE: sync `def` on purpose — librosa.load is CPU/IO-blocking, so FastAPI
+# runs this in its threadpool instead of blocking the event loop. An async
+# def here would freeze every other request during the (multi-second) first
+# compute, which is exactly the saturation failure mode we want to avoid.
+@app.get("/jobs/{job_id}/waveform")
+def get_waveform(
+    job_id: str,
+    response: Response,
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Downsampled peak envelope of the source audio for the timeline
+    editor's waveform. Returns {"peaks": [0..1]*N, "duration": seconds}.
+
+    First call per job downloads the MP3 from R2 and computes the envelope
+    with librosa (a few seconds); the result is cached to R2 as
+    waveform/{job_id}.json so every later open is a fast object fetch.
+    Owner / same-tenant only, same model as /source-audio-url.
+    """
+    import json as _json
+    import tempfile
+    from database import Job as JobModel
+
+    job = (
+        db.query(JobModel)
+        .filter(JobModel.job_id == job_id)
+        .filter(JobModel.tenant_id == current_user["tenant_id"])
+        .first()
+    )
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+    if not job.input_r2_key:
+        raise HTTPException(
+            status_code=404, detail="Source audio is not available for this job."
+        )
+    if not storage.is_enabled():
+        raise HTTPException(status_code=503, detail="Object storage is unavailable.")
+
+    _N = 1000  # number of peak buckets the frontend draws
+    cache_key = f"waveform/{job_id}.json"
+
+    # Cache hit → return the precomputed envelope.
+    try:
+        if storage.object_exists(cache_key):
+            with tempfile.NamedTemporaryFile(suffix=".json", delete=True) as tf:
+                if storage.download_object(cache_key, tf.name):
+                    cached = _json.loads(open(tf.name, "r", encoding="utf-8").read())
+                    response.headers["Cache-Control"] = "private, max-age=86400"
+                    return cached
+    except Exception as exc:
+        logger.warning("[WAVEFORM] cache read failed for %s: %s", job_id, exc)
+
+    # Compute: download source audio, build a peak envelope.
+    with tempfile.NamedTemporaryFile(suffix=".audio", delete=True) as tf:
+        if not storage.download_object(job.input_r2_key, tf.name):
+            raise HTTPException(
+                status_code=422,
+                detail="El audio original ya no está en storage. Subí el MP3 de nuevo.",
+            )
+        try:
+            import librosa
+            import numpy as np
+            # 8 kHz mono is plenty for an amplitude envelope and keeps the
+            # load fast + memory small even for long tracks.
+            y, sr = librosa.load(tf.name, sr=8000, mono=True)
+        except Exception as exc:
+            logger.error("[WAVEFORM] librosa load failed for %s: %s", job_id, exc)
+            raise HTTPException(status_code=500, detail="No se pudo analizar el audio.")
+
+    duration = float(len(y) / sr) if sr else 0.0
+    from waveform_utils import peak_envelope
+    peaks = peak_envelope(np.abs(y), _N)
+    payload = {"peaks": peaks, "duration": round(duration, 3)}
+
+    # Cache to R2 (best-effort — a failed write just means we recompute).
+    try:
+        storage.put_object_bytes(
+            cache_key, _json.dumps(payload).encode("utf-8"), "application/json"
+        )
+    except Exception as exc:
+        logger.warning("[WAVEFORM] cache write failed for %s: %s", job_id, exc)
+
+    response.headers["Cache-Control"] = "private, max-age=86400"
+    return payload
+
+
 class SaveSegmentsRequest(BaseModel):
     # Persisted to Job.segments_json (JSONB). Same shape /generate and
     # /edit accept. 5 MB upper bound mirrors /generate's segments_json

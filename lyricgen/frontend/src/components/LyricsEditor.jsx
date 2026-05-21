@@ -243,6 +243,10 @@ export default function LyricsEditor({
   disableBeforeUnload = false,
   disableAutosave = false,
   submitLabel = null,
+  // Optional audio peak envelope for the timeline waveform, fetched by the
+  // parent (the post-render /edit modal has a job in R2; the wizard doesn't).
+  // null → timeline renders without a waveform (graceful).
+  waveform = null,
 }) {
   const { t } = useI18n();
   const [edited, setEdited] = useState(() =>
@@ -1900,6 +1904,7 @@ export default function LyricsEditor({
             activeId={activeId}
             focusedSegId={focusedSegId}
             highlightedIds={highlightedIds}
+            waveform={waveform}
             gapS={MIN_GAP_S}
             onSeek={(s) => seekTo(s, false)}
             onDragStart={pushEditHistory}

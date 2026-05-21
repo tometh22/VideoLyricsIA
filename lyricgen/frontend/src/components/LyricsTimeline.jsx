@@ -19,18 +19,23 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 
 // Zoom = px per second (vertical). Operator-adjustable so dense sections
-// spread out; lower = more of the song on screen at once.
-const ZOOM_DEFAULT = 40;
-const ZOOM_MIN = 20;
-const ZOOM_MAX = 100;
-const ZOOM_STEP = 20;
-const EDGE_PX = 12;            // height of the top/bottom grab handles
+// spread out; lower = more of the song on screen at once. Default is low
+// on purpose: at 40 px/s a 4s line was a 160px monolith and you saw ~4
+// lines of 60. At 16 px/s the same line is ~64px and ~15-20 lines fit.
+const ZOOM_DEFAULT = 16;
+const ZOOM_MIN = 8;
+const ZOOM_MAX = 60;
+const ZOOM_STEP = 8;
+const EDGE_PX = 10;            // height of the top/bottom grab handles
 const MIN_DUR_S = 0.3;         // shortest readable on-screen window
-const MIN_BLOCK_PX = 30;       // floor so short lines stay grabbable at any zoom
+const MIN_BLOCK_PX = 22;       // floor so short lines stay grabbable at any zoom
 const CLICK_SLOP_PX = 4;       // movement under this = click (focus/seek), not drag
-const GUTTER_PX = 52;          // left time-label gutter
+const LABEL_W = 38;            // left time-label column
+const WAVE_W = 30;             // waveform band width inside the gutter
+const GUTTER_PX = LABEL_W + WAVE_W; // total left gutter (labels + waveform)
 const MAX_VH = "58vh";         // viewport cap; the lane scrolls within it
 const FOLLOW_SUPPRESS_MS = 2500;
+const INTRO_SKIP_S = 3;        // auto-scroll to first lyric if intro longer than this
 
 function fmt(sec) {
   if (!isFinite(sec) || sec < 0) sec = 0;
@@ -47,6 +52,7 @@ export default function LyricsTimeline({
   activeId,
   focusedSegId,
   highlightedIds,      // Set<_id>
+  waveform = null,     // {peaks:[0..1], duration} | null — drawn in the gutter
   gapS = 0.05,
   saveStatus = "idle", // "idle" | "saving" | "saved"
   onSeek,              // (seconds) => void
@@ -57,6 +63,8 @@ export default function LyricsTimeline({
 }) {
   const laneRef = useRef(null);
   const scrollRef = useRef(null);
+  const canvasRef = useRef(null);
+  const didAutoScrollRef = useRef(false);
   const [preview, setPreview] = useState(null); // {id, start, end} | null
   const dragRef = useRef(null); // {id, mode, originY, origStart, origEnd, moved}
   const [pxPerSec, setPxPerSec] = useState(ZOOM_DEFAULT);
@@ -168,6 +176,51 @@ export default function LyricsTimeline({
     }
   }, [currentTime, isPlaying, pxPerSec]);
 
+  // Draw the waveform in the gutter (static — redraws only when the peaks
+  // or the time scale change, never per playhead tick). Guarded for jsdom,
+  // which has no canvas 2d context.
+  useEffect(() => {
+    const canvas = canvasRef.current;
+    const peaks = waveform?.peaks;
+    if (!canvas || !peaks || !peaks.length) return;
+    const ctx = canvas.getContext?.("2d");
+    if (!ctx) return;
+    const dpr = Math.min((typeof window !== "undefined" && window.devicePixelRatio) || 1, 2);
+    const w = GUTTER_PX;
+    const h = laneHeight;
+    canvas.width = Math.round(w * dpr);
+    canvas.height = Math.round(h * dpr);
+    canvas.style.width = `${w}px`;
+    canvas.style.height = `${h}px`;
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    ctx.clearRect(0, 0, w, h);
+    const N = peaks.length;
+    const cx = LABEL_W + WAVE_W / 2;
+    const band = h / N;
+    ctx.fillStyle = "rgba(139,124,246,0.30)"; // brand violet, faint
+    for (let i = 0; i < N; i++) {
+      const half = peaks[i] * (WAVE_W / 2);
+      if (half <= 0) continue;
+      ctx.fillRect(cx - half, i * band, half * 2, Math.max(1, band));
+    }
+  }, [waveform, laneHeight]);
+
+  // On first mount, skip a long instrumental intro: jump the scroll to the
+  // first lyric so the operator doesn't open to a wall of empty time.
+  useEffect(() => {
+    if (didAutoScrollRef.current) return;
+    const sc = scrollRef.current;
+    if (!sc || !segments.length) return;
+    const firstStart = Math.min(...segments.map((s) => s.start));
+    if (firstStart > INTRO_SKIP_S) {
+      sc.scrollTop = Math.max(0, firstStart * pxPerSec - 28);
+    }
+    didAutoScrollRef.current = true;
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [segments]);
+
+  const activeSeg = segments.find((s) => s._id === activeId) || null;
+
   const ticks = [];
   for (let s = 0; s <= total; s += 5) ticks.push(s);
 
@@ -239,6 +292,30 @@ export default function LyricsTimeline({
           style={{ height: laneHeight, minHeight: "100%" }}
           onClick={onLaneClick}
         >
+          {/* Waveform in the gutter (canvas, time-aligned with the lane) */}
+          {waveform?.peaks?.length ? (
+            <>
+              <canvas
+                ref={canvasRef}
+                className="absolute top-0 left-0 pointer-events-none"
+                style={{ width: GUTTER_PX, height: laneHeight }}
+                aria-hidden="true"
+              />
+              {/* active line's slice of the waveform, highlighted */}
+              {activeSeg && (
+                <div
+                  className="absolute pointer-events-none bg-brand/20"
+                  style={{
+                    left: LABEL_W,
+                    width: WAVE_W,
+                    top: activeSeg.start * pxPerSec,
+                    height: Math.max(2, (activeSeg.end - activeSeg.start) * pxPerSec),
+                  }}
+                />
+              )}
+            </>
+          ) : null}
+
           {/* Time gutter ticks (horizontal grid lines + labels) */}
           {ticks.map((s) => (
             <div key={s} className="absolute left-0 right-0 pointer-events-none" style={{ top: s * pxPerSec }}>
@@ -276,24 +353,28 @@ export default function LyricsTimeline({
                 onPointerUp={(e) => onPointerUp(e, seg)}
                 title={`${fmt(start)} → ${fmt(end)}`}
               >
-                {/* top edge handle = start */}
+                {/* top edge handle = start (when the line ENTERS) */}
                 <div
-                  className="absolute left-0 right-0 top-0 cursor-ns-resize bg-brand/40 hover:bg-brand/70"
+                  className="absolute left-0 right-0 top-0 cursor-ns-resize bg-brand/30 hover:bg-brand/70 flex items-center justify-center group/ht"
                   style={{ height: EDGE_PX, touchAction: "none" }}
                   onPointerDown={(e) => onPointerDown(e, seg, "start")}
                   onPointerMove={onPointerMove}
                   onPointerUp={(e) => onPointerUp(e, seg)}
-                  title="Arrastrá: cuándo ENTRA"
-                />
-                {/* bottom edge handle = end */}
+                  title="Arrastrá: cuándo ENTRA la línea"
+                >
+                  <div className="w-7 h-[3px] rounded-full bg-white/40 group-hover/ht:bg-white/90 transition-colors" />
+                </div>
+                {/* bottom edge handle = end (when the line LEAVES) */}
                 <div
-                  className="absolute left-0 right-0 bottom-0 cursor-ns-resize bg-brand/40 hover:bg-brand/70"
+                  className="absolute left-0 right-0 bottom-0 cursor-ns-resize bg-brand/30 hover:bg-brand/70 flex items-center justify-center group/hb"
                   style={{ height: EDGE_PX, touchAction: "none" }}
                   onPointerDown={(e) => onPointerDown(e, seg, "end")}
                   onPointerMove={onPointerMove}
                   onPointerUp={(e) => onPointerUp(e, seg)}
-                  title="Arrastrá: cuándo SALE"
-                />
+                  title="Arrastrá: cuándo SALE la línea"
+                >
+                  <div className="w-7 h-[3px] rounded-full bg-white/40 group-hover/hb:bg-white/90 transition-colors" />
+                </div>
                 <div className="px-3 h-full flex items-center gap-2" style={{ touchAction: "none" }}>
                   <span className="text-[9px] text-ink-tertiary tabular-nums shrink-0">{fmt(start)}</span>
                   <span className="text-white/90 line-clamp-2">{seg.text}</span>
@@ -312,10 +393,11 @@ export default function LyricsTimeline({
         </div>
       </div>
 
-      <p className="px-3 py-2 text-[10px] text-ink-tertiary border-t border-white/[0.05]">
-        Arrastrá el borde de abajo de una línea para ajustar cuándo SALE · el de arriba cuándo ENTRA ·
-        el cuerpo para moverla · click en cualquier punto para ir ahí. Las líneas que ajustes manualmente
-        quedan fijas (no se auto-extienden).
+      <p className="px-3 py-2 text-[10px] text-ink-tertiary border-t border-white/[0.05] flex flex-wrap items-center gap-x-3 gap-y-1">
+        <span><span className="text-ink-secondary">↕ bordes</span> ajustan entra/sale</span>
+        <span><span className="text-ink-secondary">cuerpo</span> mueve la línea</span>
+        <span><span className="text-ink-secondary">click</span> salta a ese punto</span>
+        <span className="text-ink-tertiary/70">lo que ajustás queda fijo</span>
       </p>
     </div>
   );

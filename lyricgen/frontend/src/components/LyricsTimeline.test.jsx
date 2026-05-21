@@ -56,7 +56,7 @@ it("a click (no movement) focuses + seeks to the clicked point, no edit", () => 
   fireEvent.pointerUp(block, { clientY: 100, pointerId: 1 });
   expect(props.onFocus).toHaveBeenCalledWith(1);
   expect(props.onSeek).toHaveBeenCalledTimes(1);
-  expect(props.onSeek.mock.calls[0][0]).toBeCloseTo(100 / 40, 2); // ZOOM_DEFAULT=40
+  expect(props.onSeek.mock.calls[0][0]).toBeCloseTo(100 / 16, 2); // ZOOM_DEFAULT=16
   expect(props.onTimingChange).not.toHaveBeenCalled();
 });
 
@@ -92,6 +92,49 @@ it("shows the save-status chip", () => {
   cleanup();
   setup({ saveStatus: "saved" });
   expect(screen.getByText("Guardado")).toBeInTheDocument();
+});
+
+it("renders a waveform canvas when a waveform prop is provided", () => {
+  cleanup();
+  const { container } = render(
+    <LyricsTimeline
+      segments={SEGS}
+      duration={60}
+      currentTime={5}
+      activeId={null}
+      focusedSegId={null}
+      highlightedIds={new Set()}
+      waveform={{ peaks: [0.1, 0.9, 0.4, 0.2], duration: 60 }}
+      onSeek={vi.fn()}
+      onDragStart={vi.fn()}
+      onTimingChange={vi.fn()}
+      onFocus={vi.fn()}
+      onReset={vi.fn()}
+    />
+  );
+  expect(container.querySelector("canvas")).toBeInTheDocument();
+});
+
+it("renders without a canvas (graceful) when no waveform is provided", () => {
+  cleanup();
+  const { container } = render(
+    <LyricsTimeline
+      segments={SEGS}
+      duration={60}
+      currentTime={5}
+      activeId={null}
+      focusedSegId={null}
+      highlightedIds={new Set()}
+      onSeek={vi.fn()}
+      onDragStart={vi.fn()}
+      onTimingChange={vi.fn()}
+      onFocus={vi.fn()}
+      onReset={vi.fn()}
+    />
+  );
+  // No waveform → no canvas, but the timeline (blocks) still renders.
+  expect(container.querySelector("canvas")).not.toBeInTheDocument();
+  expect(screen.getByText("primera línea")).toBeInTheDocument();
 });
 
 it("locked / dragged block does not crash without setPointerCapture (jsdom)", () => {
