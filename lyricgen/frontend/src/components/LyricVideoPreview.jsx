@@ -14,9 +14,21 @@
  */
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
-// Base font size as a fraction of frame WIDTH at scale=1. ~85px / 1920px in
-// the render → keeps the preview proportional to the real output.
-const BASE_FS_FRAC = 0.046;
+// Font fidelity: the render (ass_render.lyric_fontsize + pipeline wrap tiers)
+// sizes each line by CHARACTER COUNT and wraps it at a tier-specific width,
+// at the 1920×1080 baseline (text_scale = height/1080 = 1). The preview must
+// mirror those exact tiers so what you lay out is what renders. fontPx is the
+// render's \fs (px in the 1080-tall frame); we express both font and wrap as
+// fractions of the 1920 frame WIDTH (cqw) to match the 16:9 stage.
+const REF_W = 1920;
+const FONT_TIERS = [
+  { maxLen: 50, fontPx: 85, wrapPx: 1500 },
+  { maxLen: 80, fontPx: 70, wrapPx: 1650 },
+  { maxLen: Infinity, fontPx: 55, wrapPx: 1700 },
+];
+function fontTierFor(len) {
+  return FONT_TIERS.find((t) => len <= t.maxLen) || FONT_TIERS[FONT_TIERS.length - 1];
+}
 const DEFAULT_POS = { x: 0.5, y: 0.5 };
 const MIN_SCALE = 0.4;
 const MAX_SCALE = 2.6;
@@ -162,7 +174,12 @@ export default function LyricVideoPreview({
     : (STYLE_GRADIENTS[backgroundStyle] || STYLE_GRADIENTS.default);
 
   const l = activeSeg ? layoutOf(activeSeg) : null;
-  const fsPx = l ? `${BASE_FS_FRAC * 100 * l.scale}cqw` : undefined;
+  // Cased display text drives BOTH what we show and which size/wrap tier the
+  // render would pick — so the preview length tier matches the render's.
+  const displayText = activeSeg ? applyCase(activeSeg.text, textCase) : "";
+  const tier = fontTierFor(displayText.length);
+  const fsPx = l ? `${(tier.fontPx / REF_W) * 100 * l.scale}cqw` : undefined;
+  const wrapMaxCqw = `${(tier.wrapPx / REF_W) * 100}cqw`;
 
   // Fade-in/out opacity so the chosen transition is visible while scrubbing
   // the active line. Ramps 0→1 over the first `fd` seconds and 1→0 over the
@@ -242,16 +259,19 @@ export default function LyricVideoPreview({
           onPointerUp={(e) => onPointerUp(e, activeSeg)}
         >
           <div
-            className="whitespace-nowrap font-extrabold text-white text-center px-1"
+            className="font-extrabold text-white text-center px-1"
             style={{
               fontSize: fsPx,
               fontFamily: font || undefined,
               lineHeight: 1.1,
               opacity: textOpacity,
+              maxWidth: wrapMaxCqw,
+              whiteSpace: "normal",
+              overflowWrap: "break-word",
               ...(CONTRAST_STYLES[textContrast] || CONTRAST_STYLES.medium),
             }}
           >
-            {applyCase(activeSeg.text, textCase)}
+            {displayText}
           </div>
           {/* selection box + handles */}
           <div className="absolute -inset-2 ring-1 ring-accent rounded pointer-events-none" />

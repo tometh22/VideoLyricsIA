@@ -80,6 +80,19 @@ it("with fade, the active line ramps opacity at its start; full opacity mid-line
   expect(parseFloat(screen.getByText("segunda línea").style.opacity)).toBe(1);
 });
 
+it("sizes the line by length tier like the render: long line → smaller font than short", () => {
+  const shortLine = "corta";                                   // ≤50 → 85px tier
+  const longLine = "x".repeat(95);                              // >80 → 55px tier
+  setup({ segments: [{ _id: 0, start: 0, end: 5, text: shortLine }], currentTime: 2 });
+  const shortFs = parseFloat(screen.getByText(shortLine).style.fontSize); // cqw
+  cleanup();
+  setup({ segments: [{ _id: 0, start: 0, end: 5, text: longLine }], currentTime: 2 });
+  const longFs = parseFloat(screen.getByText(longLine).style.fontSize);
+  expect(longFs).toBeLessThan(shortFs);
+  expect(shortFs).toBeCloseTo((85 / 1920) * 100, 2);
+  expect(longFs).toBeCloseTo((55 / 1920) * 100, 2);
+});
+
 it("with cut, the active line is always full opacity (no fade)", () => {
   setup({ transition: "cut", currentTime: 5.02 });
   expect(parseFloat(screen.getByText("segunda línea").style.opacity)).toBe(1);
