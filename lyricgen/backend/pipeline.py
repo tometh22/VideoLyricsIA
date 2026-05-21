@@ -5662,6 +5662,63 @@ def _prerender_looped_bg(bg_path: str, duration: float, job_dir: str,
     return out_path
 
 
+def _prerender_kenburns_bg(image_path: str, duration: float, job_dir: str,
+                           *, spec: "RenderSpec",
+                           out_name: str = "bg_kenburns_ass.mp4") -> str:
+    """Turn a still image into a Ken Burns motion video with ffmpeg zoompan,
+    so the libass fast path (which burns onto a video) can cover image
+    backgrounds. ffmpeg-side analogue of the moviepy _ken_burns_clip: a
+    smooth continuous zoom-in instead of the moviepy per-12s random
+    direction changes — visually equivalent for a backdrop, and entirely
+    C-level so it stays fast.
+
+    We pre-upscale 2x before zoompan to damp the integer-step jitter
+    zoompan shows on stills, then scale back to the target dims.
+    """
+    out_path = os.path.join(job_dir, out_name)
+    total_frames = max(1, int(math.ceil(duration * float(spec.fps))))
+    zoom_end = 1.15
+    zoom_step = (zoom_end - 1.0) / total_frames
+    up_w, up_h = spec.width * 2, spec.height * 2
+    vf = (
+        f"scale={up_w}:{up_h}:force_original_aspect_ratio=increase,"
+        f"crop={up_w}:{up_h},"
+        f"zoompan=z='min(zoom+{zoom_step:.6f},{zoom_end})':"
+        f"d={total_frames}:x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':"
+        f"s={spec.width}x{spec.height}:fps={spec.fps_str}"
+    )
+    base = [
+        "ffmpeg", "-y", "-loglevel", "error",
+        "-i", os.path.abspath(image_path),
+        "-t", str(duration),
+    ]
+    result = subprocess.run(
+        base + ["-vf", vf, "-c:v", "libx264", "-preset", "fast", "-crf", "20",
+                "-pix_fmt", "yuv420p", "-an", out_path],
+        capture_output=True, text=True, timeout=900,
+    )
+    if result.returncode != 0:
+        # Fall back to a static (motionless) scaled background so the job
+        # still renders rather than failing on a zoompan quirk.
+        logger.warning("[BG] zoompan Ken Burns failed (%s); using static bg",
+                       result.stderr[-200:])
+        static_vf = (
+            f"scale={spec.width}:{spec.height}:force_original_aspect_ratio=increase,"
+            f"crop={spec.width}:{spec.height},fps={spec.fps_str}"
+        )
+        result = subprocess.run(
+            base + ["-vf", static_vf, "-c:v", "libx264", "-preset", "fast",
+                    "-crf", "20", "-pix_fmt", "yuv420p", "-an", out_path],
+            capture_output=True, text=True, timeout=900,
+        )
+        if result.returncode != 0:
+            raise RuntimeError(f"ken burns ffmpeg failed: {result.stderr[-300:]}")
+
+    size_mb = os.path.getsize(out_path) / 1024 / 1024
+    logger.info("[BG] Ken Burns (zoompan): %.0fs, %.1f MB", duration, size_mb)
+    return out_path
+
+
 def _attach_close_chain(target_clip, owned_clips):
     """Make `target_clip.close()` also close `owned_clips`.
 
@@ -6474,19 +6531,23 @@ def _render_lyrics_ass(
     font_scale: float = 1.0,
     lyric_transition: str = "cut",
     text_contrast: str = "medium",
+    artist: str = "",
+    song_title: str = "",
 ) -> str:
     """Fast lyric render: burn the lyrics with libass in a single ffmpeg
     pass over the (ffmpeg-looped) background — no moviepy frame loop.
 
-    Phase 1 scope: video backgrounds + H.264 (YouTube) only. Image
-    (Ken Burns) backgrounds, the UMG ProRes master, and text_motion drift
-    still go through the moviepy path; the caller gates on that before
-    calling here. ~10-30x faster than the moviepy composite for the case
-    it covers.
+    Covers video backgrounds (caller pre-renders image/Ken Burns bg to a
+    video first) and any spec whose codec ffmpeg can write directly: the
+    YouTube H.264 MP4 and the UMG intermediate master (libx264 at the UMG
+    dims/fps — the lazy ProRes transcode downstream is unchanged).
+    text_motion drift still goes through the moviepy path. ~10-30x faster
+    than the moviepy composite.
 
     Parity with _make_text_clip is enforced by reusing ass_render's
     fontsize/fade/offset tiers and the same _apply_case + outline/shadow
     derivation (stroke = contrast.stroke_mult * scale, shadow = 3*scale).
+    The artist/song title card mirrors generate_lyric_video's two layouts.
     """
     import ass_render as _ass
 
@@ -6502,18 +6563,32 @@ def _render_lyrics_ass(
         out_name="bg_looped_ass.mp4",
     )
 
-    # 2) Font: resolve family + weight, isolate in a single-font dir so
-    #    libass can't mis-match across the pool.
+    # 2) Fonts: the lyric font + the title-card artist font (ExtraBold).
+    #    Both live in one fontsdir so libass can \fn-switch between them
+    #    without mis-matching across the pool.
     family, bold = _ass.font_family(font_path)
-    font_dir = _ass.single_font_dir(font_path)
+    extrabold_font = os.path.join(_FONTS_DIR, "Montserrat-ExtraBold.ttf")
+    if not os.path.exists(extrabold_font):
+        extrabold_font = font_path  # graceful fallback
+    artist_family, _ = _ass.font_family(extrabold_font)
+    font_dir = _ass.multi_font_dir([font_path, extrabold_font])
 
-    # 3) Segments → ASS lines (same case/sanitise/sizing as moviepy).
+    # 3) Segments → ASS lines (same case/sanitise/sizing as moviepy), plus
+    #    the artist/song title card overlay (same two layouts).
     lines = _ass.segments_to_lines(
         segments,
         text_scale=scale,
         font_scale=font_scale,
         lyric_transition=lyric_transition,
         case_fn=lambda t: _apply_case(t, text_case),
+    )
+    first_lyric_start = segments[0]["start"] if segments else duration
+    lines += _ass.title_card_lines(
+        artist, song_title, first_lyric_start,
+        width=spec.width, height=spec.height,
+        text_scale=scale,
+        lyric_font_family=family,
+        artist_font_family=artist_family,
     )
     base_fs = _ass.lyric_fontsize(40, scale, font_scale)
     ass_doc = _ass.build_ass(
@@ -6528,7 +6603,24 @@ def _render_lyrics_ass(
     # 4) Single ffmpeg pass: burn ASS + mux audio. We run with cwd=job_dir
     #    so the subtitles file is referenced by basename (avoids the
     #    notorious filtergraph path escaping); fontsdir is absolute+escaped.
-    out_path = os.path.join(job_dir, "lyric_video.mp4")
+    #    Encode args are spec-driven so the YouTube MP4 and the UMG
+    #    intermediate (libx264 at UMG dims/fps) both come out right.
+    out_path = os.path.join(job_dir, f"lyric_video.{spec.container}")
+    if spec.codec == "libx264":
+        vargs = ["-c:v", "libx264", "-preset", "veryfast", "-crf", "20",
+                 "-pix_fmt", spec.pix_fmt]
+    elif spec.codec == "prores_ks":
+        vargs = ["-c:v", "prores_ks", "-profile:v", str(spec.prores_profile),
+                 "-pix_fmt", spec.pix_fmt, "-vendor", "apl0"]
+    else:
+        vargs = ["-c:v", spec.codec, "-pix_fmt", spec.pix_fmt]
+    if spec.audio_codec == "aac":
+        aargs = ["-c:a", "aac", "-b:a", "320k"]
+    elif spec.audio_codec == "pcm_s24le":
+        aargs = ["-c:a", "pcm_s24le", "-ar", "48000", "-ac", "2"]
+    else:
+        aargs = ["-c:a", spec.audio_codec]
+
     vf = f"subtitles=lyrics.ass:fontsdir={_ffmpeg_filter_escape(font_dir)}"
     cmd = [
         "ffmpeg", "-y", "-loglevel", "error",
@@ -6536,10 +6628,9 @@ def _render_lyrics_ass(
         "-i", os.path.abspath(mp3_path),
         "-vf", vf,
         "-map", "0:v", "-map", "1:a",
-        "-c:v", "libx264", "-preset", "veryfast", "-crf", "20",
-        "-pix_fmt", "yuv420p",
-        "-c:a", "aac", "-b:a", "320k",
-        "-r", str(spec.fps),
+        *vargs,
+        *aargs,
+        "-r", spec.fps_str,
         "-shortest",
         os.path.basename(out_path),
     ]
@@ -6556,9 +6647,40 @@ def _render_lyrics_ass(
         shutil.rmtree(font_dir, ignore_errors=True)
 
     size_mb = os.path.getsize(out_path) / (1024 * 1024)
-    logger.info("[ASS] lyric video rendered: %.0fs, %.1f MB (libass fast path)",
+    logger.info("[ASS] lyric video rendered: %.0fs audio, %.1f MB (libass fast path)",
                 duration, size_mb)
     return out_path
+
+
+def _resolve_title_song(song_title: str, mp3_path: str, artist: str) -> str:
+    """Resolve the song title shown on the title card. Prefers the title the
+    user set on the job; falls back to parsing the mp3 filename ("Artist -
+    Title" or "Title_Artist", stripping "(Official Video)" etc.). Then a
+    defensive scrub so legacy rows never render a literal underscore-joined
+    filename. Single source of truth shared by the moviepy and libass paths.
+    """
+    if song_title:
+        title_song = song_title
+    else:
+        raw_name = os.path.splitext(os.path.basename(mp3_path))[0]
+        title_song = raw_name
+        if " - " in raw_name:
+            title_song = raw_name.split(" - ", 1)[1]
+        elif "_" in raw_name:
+            title_song = raw_name.split("_", 1)[0]
+        for sfx in ["(Official Video)", "(Official Audio)", "(Lyric Video)",
+                     "(Official Music Video)", "(Audio)", "(Video)", "(En Vivo)",
+                     "(Live)", "(Lyrics)"]:
+            title_song = title_song.replace(sfx, "").strip()
+
+    if title_song:
+        if " - " in title_song and artist and title_song.startswith(artist):
+            title_song = title_song.split(" - ", 1)[1].strip()
+        if artist and title_song.endswith(f"_{artist}"):
+            title_song = title_song[: -(len(artist) + 1)].strip()
+        if "_" in title_song and not artist:
+            title_song = title_song.split("_", 1)[0].strip()
+    return title_song
 
 
 def generate_lyric_video(
@@ -6588,6 +6710,8 @@ def generate_lyric_video(
     """
     if spec is None:
         spec = RenderSpec.youtube_default()
+
+    import time as _time
 
     audio = AudioFileClip(mp3_path)
     duration = audio.duration
@@ -6631,24 +6755,46 @@ def generate_lyric_video(
     if segments:
         segments = _apply_display_timing(segments, duration)
 
-    # Fast path: libass single-pass render (engine=ass). Phase 1 covers
-    # video bg + H.264 (YouTube), no text drift. Image/Ken Burns bg, the
-    # UMG ProRes master, and text_motion≠none all fall through to moviepy.
-    # NOTE: phase 1 does not render the title card (artist/song) — that's
-    # a known gap to close before flipping the flag on for prod.
+    # Title shown on the card — resolved once and shared by both render
+    # paths (libass below, moviepy further down).
+    title_song = _resolve_title_song(song_title, mp3_path, artist)
+
+    # Fast path: libass single-pass render (engine=ass). Covers video bg +
+    # H.264 (YouTube) and the UMG intermediate master (profile
+    # "umg_intermediate", still libx264 → the lazy ProRes transcode is
+    # unchanged). Image/Ken Burns bg is resolved to a video first (see
+    # below). text_motion≠none still falls through to moviepy.
     _engine = os.environ.get("LYRIC_RENDER_ENGINE", "moviepy").lower()
     _bg_is_video = not bg_source.lower().endswith((".jpg", ".jpeg", ".png"))
-    if (_engine == "ass" and _bg_is_video and spec.profile != "umg"
-            and text_motion == "none"):
-        logger.info("[ASS] libass fast path (engine=ass, profile=%s)", spec.profile)
-        out = _render_lyrics_ass(
-            bg_source, mp3_path, segments, job_dir, duration,
-            spec=spec, font_path=font, text_case=text_case,
-            font_scale=font_scale, lyric_transition=lyric_transition,
-            text_contrast=text_contrast,
-        )
-        audio.close()
-        return out, font, bg_source
+    _ass_ok_profile = spec.profile in ("youtube", "umg_intermediate")
+    if _engine == "ass" and _ass_ok_profile and text_motion == "none":
+        try:
+            ass_bg = bg_source
+            if not _bg_is_video:
+                # Image background → pre-render the Ken Burns motion to a
+                # video with ffmpeg zoompan so the single-pass burn applies.
+                ass_bg = _prerender_kenburns_bg(
+                    bg_source, duration, job_dir, spec=spec,
+                )
+            logger.info("[ASS] libass fast path (engine=ass, profile=%s, bg=%s)",
+                        spec.profile, "image" if not _bg_is_video else "video")
+            _t0 = _time.monotonic()
+            out = _render_lyrics_ass(
+                ass_bg, mp3_path, segments, job_dir, duration,
+                spec=spec, font_path=font, text_case=text_case,
+                font_scale=font_scale, lyric_transition=lyric_transition,
+                text_contrast=text_contrast,
+                artist=artist, song_title=title_song,
+            )
+            logger.info("[ASS] render: %.1fs (engine=ass)", _time.monotonic() - _t0)
+            audio.close()
+            return out, font, bg_source
+        except Exception as e:
+            # Never fail the job on a fast-path error — fall through to the
+            # proven moviepy composite below.
+            logger.warning(
+                "[ASS] fast path failed (%s); falling back to moviepy", e
+            )
 
     # --- moviepy composite path (default) ---
     if bg_source.lower().endswith((".jpg", ".jpeg", ".png")):
@@ -6671,37 +6817,8 @@ def generate_lyric_video(
     # was past 3s, leaving "ARTIST/Title" stamped at top while the big
     # drop title also showed centered.
     first_lyric_start = segments[0]["start"] if segments else duration
-    # Prefer the title the user explicitly set on the job — falls back to
-    # parsing the filename only when the job didn't carry one (legacy rows
-    # or batch CLI uploads). The filename heuristic handles both
-    # "Artist - Title" and "Title_Artist" so a Suno-style export still
-    # gets a real overlay rendered.
-    if song_title:
-        title_song = song_title
-    else:
-        raw_name = os.path.splitext(os.path.basename(mp3_path))[0]
-        title_song = raw_name
-        if " - " in raw_name:
-            title_song = raw_name.split(" - ", 1)[1]
-        elif "_" in raw_name:
-            title_song = raw_name.split("_", 1)[0]
-        for sfx in ["(Official Video)", "(Official Audio)", "(Lyric Video)",
-                     "(Official Music Video)", "(Audio)", "(Video)", "(En Vivo)",
-                     "(Live)", "(Lyrics)"]:
-            title_song = title_song.replace(sfx, "").strip()
-
-    # Defensive scrub: even when the upload pipeline pre-parsed the title,
-    # legacy rows (or a manually-typed value) can still carry the raw
-    # "Title_Artist" or "Artist - Title" filename basename. Re-parse so the
-    # overlay never shows a literal underscore-joined filename like
-    # "No Tengo Ganas_Intoxicados".
-    if title_song:
-        if " - " in title_song and artist and title_song.startswith(artist):
-            title_song = title_song.split(" - ", 1)[1].strip()
-        if artist and title_song.endswith(f"_{artist}"):
-            title_song = title_song[: -(len(artist) + 1)].strip()
-        if "_" in title_song and not artist:
-            title_song = title_song.split("_", 1)[0].strip()
+    # title_song already resolved above (shared with the libass path) via
+    # _resolve_title_song.
 
     if artist or title_song:
         # Artist name renders in ExtraBold (heavier weight) to visually
@@ -6852,6 +6969,7 @@ def generate_lyric_video(
         )
         text_layers.extend(layers)
 
+    _moviepy_t0 = _time.monotonic()
     video = CompositeVideoClip([bg] + text_layers, size=(spec.width, spec.height))
     video = video.set_audio(audio).set_duration(duration)
 
@@ -6912,6 +7030,8 @@ def generate_lyric_video(
         errors = _validate_umg_master(out_path, spec)
         if errors:
             raise RuntimeError(f"UMG validation failed: {'; '.join(errors)}")
+        logger.info("[MOVIEPY] render: %.1fs (engine=moviepy, profile=%s)",
+                    _time.monotonic() - _moviepy_t0, spec.profile)
         return out_path, font, bg_source
 
     out_path = os.path.join(job_dir, "lyric_video.mp4")
@@ -6932,6 +7052,8 @@ def generate_lyric_video(
     audio.close()
     bg.close()
     video.close()
+    logger.info("[MOVIEPY] render: %.1fs (engine=moviepy, profile=%s)",
+                _time.monotonic() - _moviepy_t0, spec.profile)
     return out_path, font, bg_source
 
 
