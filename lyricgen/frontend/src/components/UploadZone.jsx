@@ -27,6 +27,12 @@ const MAX_BATCH_SIZE = 5;
 // re-mostrar el dropdown sin tocar nada más.
 const SHOW_MOTION_PICKER = false;
 
+// Typography (font / case / size / transition / contrast) is now chosen
+// LIVE in the editor + preview, where you see the real result. Hidden in
+// the upload step to remove the confusing duplication. batchDefaults still
+// supplies sensible defaults for the "Generar directo" path.
+const SHOW_UPLOAD_TYPOGRAPHY = false;
+
 const SAMPLE_LYRIC = "Como el viento que se va";
 function applyTextCase(text, c) {
   if (c === "upper") return text.toUpperCase();
@@ -721,6 +727,7 @@ export default function UploadZone({
         </div>
       )}
 
+      {SHOW_UPLOAD_TYPOGRAPHY && (<>
       {/* Font */}
       <div className="flex items-center gap-2 mb-3">
         <span className="text-[11px] text-gray-600 shrink-0">{t("upload.font_label") || "Tipografía:"}</span>
@@ -868,6 +875,7 @@ export default function UploadZone({
           ))}
         </div>
       </div>
+      </>)}
     </div>
   ) : null;
 
@@ -1014,6 +1022,7 @@ export default function UploadZone({
                       </div>
                     </>
                   )}
+                  {SHOW_UPLOAD_TYPOGRAPHY && (<>
                   <div className="flex items-center gap-2">
                     <span className="text-[11px] text-gray-600 shrink-0">{t("upload.font_label") || "Tipografía:"}</span>
                     <Listbox value={entry.font || ""} onChange={(v) => updateField(i, "font", v)} options={FONTS} className="flex-1" ariaLabel={t("upload.font_label")} />
@@ -1130,6 +1139,7 @@ export default function UploadZone({
                       ))}
                     </div>
                   </div>
+                  </>)}
                   {bgMode !== "auto" && (
                     <p className="text-[11px] text-ink-secondary pt-1">
                       {t("upload.fields_baked_into_bg") || "Concepto y movimiento están horneados en el fondo elegido."}

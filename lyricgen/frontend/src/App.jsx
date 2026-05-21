@@ -1521,6 +1521,13 @@ export default function App() {
             lyricTransition={currentReview.lyricTransition || "cut"}
             textMotion={currentReview.textMotion || "none"}
             textContrast={currentReview.textContrast || "medium"}
+            // Typography is now chosen LIVE in the editor preview (not in the
+            // upload step). Thread the operator's choices back into
+            // currentReview so handleApproveLyrics carries them to generate.
+            onFontChange={(c) => setCurrentReview((r) => (r ? { ...r, font: c } : r))}
+            onCaseChange={(c) => setCurrentReview((r) => (r ? { ...r, textCase: c } : r))}
+            onTransitionChange={(c) => setCurrentReview((r) => (r ? { ...r, lyricTransition: c } : r))}
+            onContrastChange={(c) => setCurrentReview((r) => (r ? { ...r, textContrast: c } : r))}
           />
         </div>
       );
