@@ -119,6 +119,20 @@ def perceptual_start(seg_start: float, fade_dur: float) -> float:
     return max(0.0, seg_start - fade_dur / 2.0)
 
 
+def moviepy_line_placement(line_pos, clip_w, clip_h, frame_w, frame_h, dx=0, dy=0):
+    """Top-left (x, y) so a clip of size (clip_w, clip_h) is CENTERED on the
+    per-line position, for the moviepy render path.
+
+    line_pos is (x, y) as 0..1 fractions of the frame (the line's center),
+    matching build_ass's `\\pos` mapping (px = pos.x * width). None → frame
+    center, i.e. the legacy centered behavior. dx/dy add a screen-space
+    offset (the drop-shadow displacement). Pure (no moviepy) so it's unit-
+    testable; the rotation itself stays in pipeline (moviepy clip.rotate)."""
+    cx = (line_pos[0] if line_pos else 0.5) * frame_w
+    cy = (line_pos[1] if line_pos else 0.5) * frame_h
+    return (cx - clip_w / 2 + dx, cy - clip_h / 2 + dy)
+
+
 def font_family(font_path: str) -> tuple[str, bool]:
     """Resolve a .ttf path to its libass-matchable (family_name, is_bold).
 

@@ -11,6 +11,7 @@ from ass_render import (
     lyric_fontsize, fade_seconds, perceptual_start,
     segments_to_lines, font_family, single_font_dir,
     multi_font_dir, title_card_lines, _opacity_to_alpha,
+    moviepy_line_placement,
 )
 
 _FONTS_DIR = os.path.join(os.path.dirname(__file__), "..", "fonts")
@@ -323,3 +324,27 @@ def test_build_ass_alignment_without_pos():
     d = [l for l in out.splitlines() if l.startswith("Dialogue:")][0]
     assert "\\an4" in d and "\\pos(" not in d
     assert "\\b0" in d
+
+
+# --- moviepy layout parity (the math behind _make_text_clip's per-line
+# pos override; the moviepy clip.rotate stays in pipeline, untestable here) ---
+
+def test_moviepy_placement_none_is_frame_center():
+    # No override → clip centered in the frame (legacy behavior).
+    x, y = moviepy_line_placement(None, clip_w=600, clip_h=100,
+                                  frame_w=1920, frame_h=1080)
+    assert (x + 600 / 2, y + 100 / 2) == (960, 540)
+
+
+def test_moviepy_placement_centers_on_fraction():
+    # pos is the line CENTER as 0..1 fractions (same mapping build_ass uses).
+    x, y = moviepy_line_placement((0.25, 0.75), clip_w=600, clip_h=100,
+                                  frame_w=1920, frame_h=1080)
+    assert x + 600 / 2 == 0.25 * 1920   # center_x = 480
+    assert y + 100 / 2 == 0.75 * 1080   # center_y = 810
+
+
+def test_moviepy_placement_applies_screen_offset():
+    base = moviepy_line_placement((0.5, 0.5), 600, 100, 1920, 1080)
+    off = moviepy_line_placement((0.5, 0.5), 600, 100, 1920, 1080, dx=3, dy=3)
+    assert off == (base[0] + 3, base[1] + 3)
