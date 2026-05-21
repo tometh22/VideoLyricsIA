@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from "react";
 import { useI18n } from "../i18n";
 import Listbox from "./Listbox";
 import { UploadTour } from "./OnboardingTour";
+import WizardLivePreview from "./WizardLivePreview";
 
 const API = import.meta.env.VITE_API_URL || "";
 
@@ -218,6 +219,29 @@ export default function UploadZone({
 
   const [hoverCaseBatch, setHoverCaseBatch] = useState(null);
   const [hoverCaseRow, setHoverCaseRow] = useState(null); // { idx, code }
+
+  // ── Scene MODE (Studio Console redesign) ────────────────────────────────
+  // The 3 modes map onto existing state (no new backend contract):
+  //   auto   → match_lyrics=false, no hint
+  //   lyrics → match_lyrics=true,  no hint  (our edge: scene from the lyrics)
+  //   prompt → background_hint present (+ optional bgVerbatim "usar tal cual")
+  // Derive the current mode from that state, with a local override so the
+  // operator can open "Mi prompt" before typing anything.
+  const _hint = (batchDefaults.backgroundHint || "").trim();
+  const [sceneMode, setSceneMode] = useState(_hint ? "prompt" : (inspiredByLyrics ? "lyrics" : "auto"));
+  const selectSceneMode = (m) => {
+    setSceneMode(m);
+    if (m === "auto") {
+      onInspiredByLyricsChange && onInspiredByLyricsChange(false);
+      if (_hint) updateBatchDefault("backgroundHint", "");   // stale prompt must not override
+    } else if (m === "lyrics") {
+      onInspiredByLyricsChange && onInspiredByLyricsChange(true);
+      if (_hint) updateBatchDefault("backgroundHint", "");
+    }
+    // prompt: leave inspired as-is; the textarea below drives it.
+  };
+  // Sample lyric for the live preview: first file's title, else a placeholder.
+  const _previewLyric = (files[0]?.songTitle || files[0]?.title || "").trim();
 
   // Set of track indices with the inline "Personalizar" drawer open.
   const [expandedPersonalize, setExpandedPersonalize] = useState(() => new Set());
@@ -1473,13 +1497,29 @@ export default function UploadZone({
   const summary = summaryParts.join(" · ");
 
   return (
-    <div className="w-full max-w-5xl mx-auto pb-28">
+    <div className="w-full max-w-6xl mx-auto pb-28">
       <UploadTour user={user} />
-      <div className="flex flex-col md:grid md:grid-cols-[minmax(0,1fr)_340px] lg:grid-cols-[minmax(0,1fr)_380px] gap-6 items-start">
+      <div className="flex flex-col md:grid md:grid-cols-[minmax(0,1fr)_400px] lg:grid-cols-[minmax(0,1fr)_440px] gap-6 items-start">
 
-        {/* LEFT COLUMN — drop zone + file list */}
+        {/* LEFT COLUMN (stage) — drop zone + live preview + file list */}
         <div className="space-y-4 min-w-0">
           {_dropZone}
+          {/* Studio Console stage: live preview of the lyric over the chosen
+              mood + camera movement. Updates as the operator changes palette
+              or movement — see the result before spending a Veo credit. */}
+          {files.length > 0 && bgMode === "auto" && (
+            <div className="md:sticky md:top-4 space-y-2">
+              <WizardLivePreview
+                style={style}
+                movementStyle={batchDefaults.movementStyle}
+                mode={sceneMode}
+                lyric={_previewLyric}
+              />
+              <p className="text-[10px] text-gray-600 px-1">
+                {t("upload.preview_disclaimer") || "Aproximación del mood y el movimiento. El fondo final lo genera la IA."}
+              </p>
+            </div>
+          )}
           {_filesBlock}
         </div>
 
@@ -1500,121 +1540,127 @@ export default function UploadZone({
               </div>
             )}
 
-            {/* 1. Visual style — IA-only knob (paleta del fondo generado).
-                Solo aparece cuando la fuente es IA Auto; con Biblioteca/Subir
-                no aplica, así no se mezcla con el resto. */}
-            {onStyleChange && bgMode === "auto" && (
-              <div className="rounded-card bg-surface-2/40 ring-1 ring-white/[0.04] px-4 py-3">
-                <p className="text-[10px] uppercase tracking-[0.18em] text-gray-500">{t("upload.style_label")}</p>
-                <p className="text-[11px] text-gray-600 mb-2 mt-0.5">
-                  {t("upload.style_desc") || "Paleta de colores del fondo IA y del gradiente animado"}
-                </p>
-                <div className="grid grid-cols-2 gap-2">
-                  {STYLES.map((s) => (
-                    <button
-                      key={s.code}
-                      type="button"
-                      onClick={() => onStyleChange(s.code)}
-                      className={`flex flex-col items-center gap-2 px-2 py-2.5 rounded-xl border text-[11px] font-medium transition-all duration-200
-                        ${style === s.code
-                          ? "border-brand/50 text-white ring-1 ring-brand/40 scale-[1.02]"
-                          : "border-white/[0.06] text-gray-400 hover:border-white/[0.16] hover:text-white"
-                        }`}
-                    >
-                      <span
-                        className={`w-full h-7 rounded-lg block ring-1 transition-all duration-200 ${
-                          style === s.code ? "ring-brand/50 shadow-[0_0_12px_2px_rgba(139,92,246,0.3)]" : "ring-white/[0.06]"
-                        }`}
-                        style={{ background: s.swatch }}
-                      />
-                      <span className="leading-tight text-center">
-                        <span className="block font-semibold">{t(s.labelKey)}</span>
-                        <span className="block text-[10px] text-gray-500">{t(s.subKey)}</span>
-                      </span>
-                    </button>
-                  ))}
-                </div>
-              </div>
-            )}
-
-            {/* 1.5 Inspired-by-lyrics toggle.
-                Controls match_lyrics on /generate. When ON, Gemini reads
-                the song's lyrics and builds the background around the
-                primary visual subject (sea, road, stadium...). When OFF,
-                falls back to genre/concept vocabulary only. Default ON.
-                Surfaced here because UMG (2026-05-14) saw ~80% of rock
-                tracks rendered as alleys — operator now has a visible
-                lever and can audit which mode produced each video. */}
-            {onInspiredByLyricsChange && bgMode === "auto" && (
-              <label className="rounded-card bg-surface-2/40 ring-1 ring-white/[0.04] px-4 py-3 flex items-center gap-3 cursor-pointer hover:ring-white/[0.08] transition-colors">
-                <input
-                  type="checkbox"
-                  checked={!!inspiredByLyrics}
-                  onChange={(e) => onInspiredByLyricsChange(e.target.checked)}
-                  className="peer sr-only"
-                />
-                <div className="relative w-9 h-5 rounded-full bg-surface-3 peer-checked:bg-brand transition-colors duration-200 shrink-0">
-                  <div className="absolute top-0.5 left-0.5 w-4 h-4 rounded-full bg-white shadow transition-transform duration-200 peer-checked:translate-x-4" />
-                </div>
-                <div className="flex-1 min-w-0">
-                  <p className="text-[10px] uppercase tracking-[0.18em] text-gray-500">{t("upload.inspired_by_lyrics_label") || "Inspirado en la letra"}</p>
-                  <p className="text-[11px] text-gray-600 mt-0.5">
-                    {t("upload.inspired_by_lyrics_hint") || "Cuando está activo, el fondo se construye alrededor de lo que dice la canción. Apagalo para escenas más genéricas según el género."}
-                  </p>
-                </div>
-              </label>
-            )}
-
-            {/* 1.6 "Mi prompt" — describe the background in words.
-                Escena axis, third source (Auto género / Inspirado en letra /
-                Mi prompt). When non-empty it overrides genre/concept/lyrics.
-                The "tal cual" toggle skips Gemini's rewrite and sends the
-                text straight to Veo — the power-user path. Previously this
-                field only existed in the editor (post-generation); surfacing
-                it here closes the upload→edit gap so a user can describe
-                their video from the start. */}
-            {bgMode === "auto" && (
-              <div className="rounded-card bg-surface-2/40 ring-1 ring-white/[0.04] px-4 py-3">
-                <p className="text-[10px] uppercase tracking-[0.18em] text-gray-500">
-                  {t("upload.bg_prompt_label") || "Mi prompt (opcional)"}
-                </p>
-                <p className="text-[11px] text-gray-600 mt-0.5 mb-2">
-                  {t("upload.bg_prompt_hint") || "Describí el fondo que querés. Si lo completás, manda sobre el género/concepto y la letra."}
-                </p>
-                <textarea
-                  value={batchDefaults.backgroundHint || ""}
-                  onChange={(e) => updateBatchDefault("backgroundHint", e.target.value.slice(0, 2000))}
-                  rows={3}
-                  maxLength={2000}
-                  placeholder={t("upload.bg_prompt_placeholder") || "Ej: mansión surreal de noche, pileta vacía, cámara fija, sólo se mueve el reflejo del agua…"}
-                  className="w-full text-[12px] rounded-lg bg-surface-1 border border-white/[0.08] focus:border-brand/50 px-3 py-2 text-gray-200 placeholder:text-gray-600 resize-y outline-none"
-                />
-                {(batchDefaults.backgroundHint || "").trim() && (
-                  <label className="mt-2 flex items-center gap-2.5 cursor-pointer">
-                    <input
-                      type="checkbox"
-                      checked={!!batchDefaults.bgVerbatim}
-                      onChange={(e) => updateBatchDefault("bgVerbatim", e.target.checked)}
-                      className="peer sr-only"
-                    />
-                    <div className="relative w-9 h-5 rounded-full bg-surface-3 peer-checked:bg-brand transition-colors duration-200 shrink-0">
-                      <div className="absolute top-0.5 left-0.5 w-4 h-4 rounded-full bg-white shadow transition-transform duration-200 peer-checked:translate-x-4" />
-                    </div>
-                    <span className="text-[11px] text-gray-400">
-                      {t("upload.bg_verbatim_label") || "Usar mi prompt tal cual (sin reescritura de IA)"}
-                    </span>
-                  </label>
-                )}
-              </div>
-            )}
-
-            {/* 2. Background selector */}
+            {/* STEP 1 — Background source (IA Auto / Biblioteca / Subir) */}
+            <div className="flex items-center gap-2 px-1 pt-1">
+              <span className="w-5 h-5 rounded-full bg-brand text-white text-[11px] font-bold grid place-items-center shrink-0">1</span>
+              <span className="text-[11px] uppercase tracking-[0.16em] text-gray-400 font-medium">{t("upload.step_source") || "Fuente del fondo"}</span>
+            </div>
             {_bgBlock}
 
-            {/* 3. Batch-wide controls: movement gallery + text defaults */}
+            {/* STEP 2 — MODE (the 3 modes) + contextual mood/prompt.
+                Only when the source is IA Auto. The 3 cards map onto existing
+                state: auto→match_lyrics off, lyrics→match_lyrics on,
+                prompt→background_hint (+ bgVerbatim). Replaces the old loose
+                inspired-toggle + prompt-textarea with one clear decision. */}
+            {bgMode === "auto" && (
+              <>
+                <div className="flex items-center gap-2 px-1 pt-2">
+                  <span className="w-5 h-5 rounded-full bg-brand text-white text-[11px] font-bold grid place-items-center shrink-0">2</span>
+                  <span className="text-[11px] uppercase tracking-[0.16em] text-gray-400 font-medium">{t("upload.step_mode") || "Elegí el modo"}</span>
+                </div>
+                <div className="grid grid-cols-1 gap-2">
+                  {[
+                    { code: "auto",   icon: "✨", label: t("upload.mode_auto") || "Auto",                                 desc: t("upload.mode_auto_desc") || "La IA elige la escena por el género y el mood." },
+                    { code: "lyrics", icon: "🎤", label: t("upload.inspired_by_lyrics_label") || "Inspirado en la letra", desc: t("upload.mode_lyrics_desc") || "El fondo nace de lo que dice la canción.", badge: t("upload.mode_edge") || "ÚNICO" },
+                    { code: "prompt", icon: "✍️", label: t("upload.bg_prompt_label_short") || "Mi prompt",                desc: t("upload.mode_prompt_desc") || "Vos describís el fondo, con opción usar tal cual." },
+                  ].map((m) => {
+                    const sel = sceneMode === m.code;
+                    return (
+                      <button
+                        key={m.code}
+                        type="button"
+                        onClick={() => selectSceneMode(m.code)}
+                        className={`text-left rounded-card px-4 py-3 flex items-start gap-3 border transition-all duration-200 ${
+                          sel ? "border-transparent ring-1 ring-brand/50 bg-brand/[0.08] shadow-glow"
+                              : "border-white/[0.06] bg-surface-2/40 hover:border-white/[0.18]"
+                        }`}
+                      >
+                        <span className={`w-9 h-9 rounded-xl grid place-items-center text-[17px] shrink-0 ${sel ? "bg-brand" : "bg-surface-3"}`}>{m.icon}</span>
+                        <span className="min-w-0">
+                          <span className="flex items-center gap-2">
+                            <span className={`text-[13px] font-semibold ${sel ? "text-white" : "text-gray-200"}`}>{m.label}</span>
+                            {m.badge && <span className="text-[8px] font-bold tracking-[0.04em] px-1.5 py-0.5 rounded bg-accent/15 text-accent">{m.badge}</span>}
+                          </span>
+                          <span className="block text-[11px] text-gray-500 mt-0.5 leading-snug">{m.desc}</span>
+                        </span>
+                      </button>
+                    );
+                  })}
+                </div>
+
+                {/* Contextual: prompt textarea (prompt mode) OR mood palette (auto/lyrics) */}
+                {sceneMode === "prompt" ? (
+                  <div className="rounded-card bg-surface-2/40 ring-1 ring-white/[0.04] px-4 py-3">
+                    <p className="text-[11px] text-gray-600 mb-2">
+                      {t("upload.bg_prompt_hint") || "Describí el fondo que querés. Manda sobre el género/concepto y la letra."}
+                    </p>
+                    <textarea
+                      value={batchDefaults.backgroundHint || ""}
+                      onChange={(e) => updateBatchDefault("backgroundHint", e.target.value.slice(0, 2000))}
+                      rows={3}
+                      maxLength={2000}
+                      placeholder={t("upload.bg_prompt_placeholder") || "Ej: mansión surreal de noche, pileta vacía, cámara fija, sólo se mueve el reflejo del agua…"}
+                      className="w-full text-[12px] rounded-lg bg-surface-1 border border-white/[0.08] focus:border-brand/50 px-3 py-2 text-gray-200 placeholder:text-gray-600 resize-y outline-none"
+                    />
+                    <label className="mt-2 flex items-center gap-2.5 cursor-pointer">
+                      <input
+                        type="checkbox"
+                        checked={!!batchDefaults.bgVerbatim}
+                        onChange={(e) => updateBatchDefault("bgVerbatim", e.target.checked)}
+                        className="peer sr-only"
+                      />
+                      <div className="relative w-9 h-5 rounded-full bg-surface-3 peer-checked:bg-brand transition-colors duration-200 shrink-0">
+                        <div className="absolute top-0.5 left-0.5 w-4 h-4 rounded-full bg-white shadow transition-transform duration-200 peer-checked:translate-x-4" />
+                      </div>
+                      <span className="text-[11px] text-gray-400">
+                        {t("upload.bg_verbatim_label") || "Usar mi prompt tal cual (sin reescritura de IA)"}
+                      </span>
+                    </label>
+                  </div>
+                ) : onStyleChange && (
+                  <div className="rounded-card bg-surface-2/40 ring-1 ring-white/[0.04] px-4 py-3">
+                    <p className="text-[10px] uppercase tracking-[0.18em] text-gray-500">{t("upload.style_label")}</p>
+                    <p className="text-[11px] text-gray-600 mb-2 mt-0.5">
+                      {t("upload.style_desc") || "Paleta de colores del fondo IA y del gradiente animado"}
+                    </p>
+                    <div className="grid grid-cols-2 gap-2">
+                      {STYLES.map((s) => (
+                        <button
+                          key={s.code}
+                          type="button"
+                          onClick={() => onStyleChange(s.code)}
+                          className={`flex flex-col items-center gap-2 px-2 py-2.5 rounded-xl border text-[11px] font-medium transition-all duration-200
+                            ${style === s.code
+                              ? "border-brand/50 text-white ring-1 ring-brand/40 scale-[1.02]"
+                              : "border-white/[0.06] text-gray-400 hover:border-white/[0.16] hover:text-white"
+                            }`}
+                        >
+                          <span
+                            className={`w-full h-7 rounded-lg block ring-1 transition-all duration-200 ${
+                              style === s.code ? "ring-brand/50 shadow-[0_0_12px_2px_rgba(139,92,246,0.3)]" : "ring-white/[0.06]"
+                            }`}
+                            style={{ background: s.swatch }}
+                          />
+                          <span className="leading-tight text-center">
+                            <span className="block font-semibold">{t(s.labelKey)}</span>
+                            <span className="block text-[10px] text-gray-500">{t(s.subKey)}</span>
+                          </span>
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+                )}
+              </>
+            )}
+
+            {/* STEP 3 — Movement + metadata (movement gallery + genre/concept) */}
+            <div className="flex items-center gap-2 px-1 pt-2">
+              <span className="w-5 h-5 rounded-full bg-brand text-white text-[11px] font-bold grid place-items-center shrink-0">3</span>
+              <span className="text-[11px] uppercase tracking-[0.16em] text-gray-400 font-medium">{t("upload.step_motion") || "Movimiento"}</span>
+            </div>
             {_batchSettingsBlock}
 
-            {/* 4. Delivery selector — ProRes gated */}
+            {/* STEP 4 — Delivery (ProRes gated) */}
             {user?.features?.prores_export && _deliveryBlock}
           </div>
         )}
