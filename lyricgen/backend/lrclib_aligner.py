@@ -164,6 +164,8 @@ def align_lrclib_to_whisper(
     *,
     min_ratio: float | None = None,
     max_lookahead: int | None = None,
+    keep_unmatched: bool = False,
+    total_duration: float | None = None,
 ) -> list[dict]:
     """Build segments using LRCLib's line structure + Whisper's timing.
 
@@ -179,16 +181,27 @@ def align_lrclib_to_whisper(
             output (Whisper didn't transcribe it well enough).
         max_lookahead: how many Whisper words ahead of the cursor to
             search per LRCLib line. Bounded to keep alignment O(L · W).
+        keep_unmatched: when True, lines Whisper didn't transcribe well
+            enough are NOT dropped — they're inserted in place with
+            timing interpolated between the surrounding matched lines and
+            flagged ``"review": True``. The operator nudges the timing or
+            deletes the line (e.g. a verse the live version skipped),
+            instead of re-typing lyrics we already know.
+        total_duration: song duration (s) — used to interpolate timing for
+            trailing unmatched lines (after the last matched line). Falls
+            back to the last Whisper word's end when not given.
 
     Returns:
         [{"start": float, "end": float, "text": str}, ...] one per
-        LRCLib line that found a confident match. Empty list if either
-        input is empty or no matches above threshold.
+        matched LRCLib line (default), monotonically ordered. With
+        keep_unmatched, also includes the unmatched lines with
+        interpolated timing and ``"review": True``. Empty list if either
+        input is empty.
 
     Behaviour notes:
-      - Lines that don't match well (whisper missed them, or transcribed
-        garbage) are simply skipped — they won't appear in the output.
-        This is conservative: better to drop a line than mistime it.
+      - Default (keep_unmatched=False): lines that don't match well are
+        skipped — conservative, better to drop than mistime. This keeps
+        the lrclib-hit path's existing behaviour.
       - The cursor only advances forward, so the output is monotonically
         ordered by start time, matching the original song order.
     """
@@ -214,7 +227,9 @@ def align_lrclib_to_whisper(
     if not stream:
         return []
 
-    out = []
+    # Walk every reference line, recording matched timing or a placeholder
+    # (start=None) for unmatched lines so we can interpolate them later.
+    items: list[dict] = []
     cursor = 0
     for raw_line in lrclib_plain.split("\n"):
         line = raw_line.strip()
@@ -231,18 +246,69 @@ def align_lrclib_to_whisper(
         )
         if not match:
             # Whisper didn't transcribe this line well enough to align.
-            # Skip rather than guess — the operator can add it manually
-            # in the editor if needed.
+            items.append({"text": line, "start": None, "end": None})
             continue
         s, e, _ratio = match
-        out.append({
+        items.append({
             "start": float(stream[s]["start"]),
             "end": float(stream[e - 1]["end"]),
             "text": line,
         })
         cursor = e
 
-    return out
+    if not keep_unmatched:
+        # Existing behaviour: drop unmatched lines entirely.
+        return [{"start": it["start"], "end": it["end"], "text": it["text"]}
+                for it in items if it["start"] is not None]
+
+    return _interpolate_unmatched(items, stream, total_duration)
+
+
+def _interpolate_unmatched(
+    items: list[dict], stream: list[dict], total_duration: float | None,
+) -> list[dict]:
+    """Fill timing for unmatched reference lines (start=None) by spreading
+    them evenly across the gap between the previous and next matched line,
+    flagging each ``"review": True``. Leading/trailing runs use the song
+    start / duration as the open bound."""
+    n = len(items)
+    song_start = float(stream[0]["start"]) if stream else 0.0
+    song_end = (
+        float(total_duration) if total_duration
+        else (float(stream[-1]["end"]) if stream else 0.0)
+    )
+
+    result: list[dict] = []
+    i = 0
+    while i < n:
+        it = items[i]
+        if it["start"] is not None:
+            result.append({"start": it["start"], "end": it["end"],
+                           "text": it["text"]})
+            i += 1
+            continue
+        # Run of consecutive unmatched lines [i, j).
+        j = i
+        while j < n and items[j]["start"] is None:
+            j += 1
+        prev_end = result[-1]["end"] if result else song_start
+        next_start = items[j]["start"] if j < n else song_end
+        if next_start <= prev_end:
+            next_start = prev_end + 0.5 * (j - i)  # degenerate gap → fan out
+        k = j - i
+        slot = (next_start - prev_end) / k
+        for r in range(k):
+            seg_s = prev_end + slot * r
+            seg_e = prev_end + slot * (r + 1)
+            result.append({
+                "start": round(seg_s, 2),
+                "end": round(max(seg_s + 0.1, seg_e - 0.05), 2),
+                "text": items[i + r]["text"],
+                "review": True,
+            })
+        i = j
+
+    return result
 
 
 def split_long_segments_by_words(
