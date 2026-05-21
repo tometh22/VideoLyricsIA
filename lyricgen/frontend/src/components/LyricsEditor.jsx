@@ -1359,7 +1359,7 @@ export default function LyricsEditor({
         />
       )}
 
-      <div className="flex flex-wrap items-center justify-between gap-3 mb-6">
+      <div className="sticky top-0 z-30 py-3 mb-4 bg-surface/90 backdrop-blur-md border-b border-white/[0.06] flex flex-wrap items-center justify-between gap-3">
         <div className="flex items-center gap-3">
           <button onClick={onBack}
             className="w-9 h-9 rounded-xl bg-surface-2/40 ring-1 ring-white/[0.04] hover:ring-white/[0.08] hover:text-white flex items-center justify-center text-gray-400 transition-colors">
@@ -2176,21 +2176,18 @@ export default function LyricsEditor({
         </div>
       </div>
 
-      <div className="mt-4 flex justify-between items-center gap-3">
-        <div className="flex items-center gap-2 min-w-0">
-          <span className="text-xs text-gray-600 shrink-0">
-            {edited.length} {t("editor.lines")}
+      {/* Line-count + blank-line note. The primary CTA lives in the sticky
+          header now (always reachable) — no duplicate button here. */}
+      <div className="mt-4 flex items-center gap-2 min-w-0" data-tour="editor-approve">
+        <span className="text-xs text-gray-600 shrink-0">
+          {edited.length} {t("editor.lines")}
+        </span>
+        {blankCount > 0 && (
+          <span className="text-[11px] text-amber-400 truncate">
+            · {blankCount} {blankCount === 1 ? t("editor.blank_singular") || "línea en blanco" : t("editor.blank_plural") || "líneas en blanco"} —{" "}
+            {t("editor.blanks_dropped") || "se omitirán"}
           </span>
-          {blankCount > 0 && (
-            <span className="text-[11px] text-amber-400 truncate">
-              · {blankCount} {blankCount === 1 ? t("editor.blank_singular") || "línea en blanco" : t("editor.blank_plural") || "líneas en blanco"} —{" "}
-              {t("editor.blanks_dropped") || "se omitirán"}
-            </span>
-          )}
-        </div>
-        <button onClick={handleApprove} className="btn-primary text-sm h-11 px-5 shrink-0" data-tour="editor-approve">
-          {submitLabel || (isBatch ? t("editor.approve_next") : t("editor.approve_generate"))}
-        </button>
+        )}
       </div>
 
       {/* ── 3+ line wrap warning banner ────────────────────────────── */}
