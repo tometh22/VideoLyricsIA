@@ -3,6 +3,7 @@ import { useI18n } from "../i18n";
 import BackgroundHintField from "./BackgroundHintField";
 import ContentValidationToggle, { isUmgTenant } from "./ContentValidationToggle";
 import LyricsEditor from "./LyricsEditor";
+import LyricVideoPreview from "./LyricVideoPreview";
 import { useAlert } from "./AlertProvider";
 
 function _readTenant() {
@@ -37,13 +38,6 @@ const FONTS = [
 
 const FONT_CSS_BY_CODE = FONTS.reduce((acc, f) => { acc[f.code] = f.css; return acc; }, {});
 
-function applyCaseToPreview(text, caseCode) {
-  if (caseCode === "upper") return text.toUpperCase();
-  if (caseCode === "lower") return text.toLowerCase();
-  if (caseCode === "title") return text.replace(/\b\w/g, (c) => c.toUpperCase());
-  return text;
-}
-
 const CASE_OPTS = [
   { code: "upper",    d: "MAY", label: "Todo en MAYÚSCULAS" },
   { code: "title",    d: "Aa",  label: "Primera letra de Cada Palabra" },
@@ -72,7 +66,9 @@ const MOTION_OPTS = [
 // re-mostrar el dropdown sin tocar nada más.
 const SHOW_MOTION_PICKER = false;
 
-const SCALE_STEPS = [0.8, 1.0, 1.2, 1.5, 1.8, 2.0];
+// Capped at the backend clamp (font_scale 0.6–1.5). Offering 1.8/2.0 was a
+// lie: the render silently clamped to 1.5, so the preview never matched.
+const SCALE_STEPS = [0.8, 1.0, 1.2, 1.5];
 
 export default function EditRequestPanel({
   job,
@@ -188,6 +184,24 @@ export default function EditRequestPanel({
   // ways. Track mount state and skip leftover setState calls.
   const mountedRef = useRef(true);
   useEffect(() => () => { mountedRef.current = false; }, []);
+
+  // Frozen snapshot of the segments AS RENDERED, captured when the lyrics
+  // editor OPENS. The "unchanged" guard must compare against this, NOT the
+  // live job.segments_json: the editor autosaves layout (pos/scale/rot) back
+  // to segments_json, so by the time the operator clicks Approve the persisted
+  // array already equals the payload → the guard would think "nothing changed"
+  // and force a pointless second "re-render anyway" click. Comparing against
+  // the open-time snapshot makes any in-session edit count on the FIRST submit.
+  const openSegmentsRef = useRef(null);
+  useEffect(() => {
+    if (mode === "lyrics" && openSegmentsRef.current == null) {
+      openSegmentsRef.current = Array.isArray(job.segments_json)
+        ? JSON.parse(JSON.stringify(job.segments_json))
+        : [];
+    } else if (mode == null) {
+      openSegmentsRef.current = null; // reset for the next open
+    }
+  }, [mode, job.segments_json]);
 
   // Reset the local saved-segments mirror when the panel is reused across
   // a different job (JobDetail keeps EditRequestPanel mounted while you
@@ -438,10 +452,15 @@ export default function EditRequestPanel({
       ...(lyricsTransition != null ? { lyric_transition: lyricsTransition } : {}),
       ...(lyricsContrast != null ? { text_contrast: lyricsContrast } : {}),
     };
-    // No-change short-circuit: same exact array as the persisted one.
+    // No-change short-circuit: compare against the OPEN-TIME snapshot (what
+    // the current video was rendered from), NOT the live job.segments_json —
+    // the editor autosaves layout into segments_json, which would mask the
+    // operator's edits and force a second "re-render anyway" click.
     // A live font change OR any per-line layout change (pos/scale/rot) also
     // counts as a real change so it doesn't fall into the stale-rerender path.
-    const original = Array.isArray(job.segments_json) ? job.segments_json : [];
+    const original = Array.isArray(openSegmentsRef.current)
+      ? openSegmentsRef.current
+      : (Array.isArray(job.segments_json) ? job.segments_json : []);
     const layoutChanged = original.length === payload.segments.length &&
       original.some((s, i) => {
         const p = payload.segments[i];
@@ -693,41 +712,41 @@ export default function EditRequestPanel({
               with a note so the operator knows the final font won't
               actually be Montserrat at render time. */}
           {(() => {
-            const sample = t("edit.sample_lyric") || "Como el viento que se va";
-            const previewText = applyCaseToPreview(sample, form.text_case);
-            const fontCss = FONT_CSS_BY_CODE[form.font] || FONT_CSS_BY_CODE[""];
+            // Use a REAL representative lyric line (longest is the worst case
+            // for size/wrap) so the operator sees the true tier the render
+            // will pick — not a always-short canned sample. Falls back to a
+            // sample if segments aren't available yet.
+            const segs = Array.isArray(job.segments_json) ? job.segments_json : [];
+            const realLine = segs
+              .map((s) => (s.text || "").trim())
+              .filter(Boolean)
+              .sort((a, b) => b.length - a.length)[0];
+            const sample = realLine || t("edit.sample_lyric") || "Como el viento que se va";
             const isAuto = !form.font;
-            // Preview is ~480px wide vs 1920px video, so font scales down ~4×
-            const basePx = 70;
-            const scaledPx = Math.max(14, Math.round(basePx * form.font_scale * (480 / 1920)));
+            const previewSeg = { _id: 0, start: 0, end: 600, text: sample };
             return (
               <div>
                 <label className="text-[11px] text-ink-secondary uppercase tracking-wider block mb-1">
                   {t("edit.preview_label") || "Vista previa"}
                 </label>
                 <div className="rounded-xl overflow-hidden ring-1 ring-white/[0.06]">
-                  <div
-                    className="relative w-full flex items-center justify-center bg-gradient-to-b from-gray-900 to-black"
-                    style={{ aspectRatio: "16/9", maxHeight: "140px" }}
-                  >
-                    <p
-                      style={{
-                        fontFamily: fontCss,
-                        fontSize: `${scaledPx}px`,
-                        fontWeight: 700,
-                        color: "white",
-                        opacity: isAuto ? 0.65 : 1,
-                        textShadow: "0 0 4px rgba(0,0,0,0.9), 1px 1px 3px rgba(0,0,0,0.8)",
-                        textAlign: "center",
-                        lineHeight: 1.2,
-                        padding: "0 12px",
-                        wordBreak: "break-word",
-                        margin: 0,
-                      }}
-                    >
-                      {previewText}
-                    </p>
-                  </div>
+                  {/* Same WYSIWYG preview as the editor: real cached video bg,
+                      tier-accurate size, honors font_scale + case + contrast.
+                      Read-only (no layout handles) — this panel only edits the
+                      global typography, not per-line layout. */}
+                  <LyricVideoPreview
+                    segments={[previewSeg]}
+                    currentTime={1}
+                    backgroundUrl={lyricsBgUrl || null}
+                    backgroundStyle={initialParams.style || "default"}
+                    font={isAuto ? undefined : (FONT_CSS_BY_CODE[form.font] || undefined)}
+                    textCase={form.text_case}
+                    textContrast={form.text_contrast}
+                    transition={form.lyric_transition}
+                    fontScale={form.font_scale}
+                    showSafeArea={false}
+                    editable={false}
+                  />
                   {isAuto && (
                     <div className="px-3 py-1.5 bg-amber-500/[0.08] border-t border-amber-500/20 text-[10px] text-amber-200/90">
                       {t("editor.auto_font_badge") || "Tipografía: Auto"}

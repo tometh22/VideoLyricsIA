@@ -13,22 +13,14 @@
  * (onLayoutChange → setEdited) — this component owns no persistence.
  */
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { REF_W, tierForLength, clampFontScale } from "../lib/lyricTiers";
 
 // Font fidelity: the render (ass_render.lyric_fontsize + pipeline wrap tiers)
 // sizes each line by CHARACTER COUNT and wraps it at a tier-specific width,
-// at the 1920×1080 baseline (text_scale = height/1080 = 1). The preview must
-// mirror those exact tiers so what you lay out is what renders. fontPx is the
-// render's \fs (px in the 1080-tall frame); we express both font and wrap as
-// fractions of the 1920 frame WIDTH (cqw) to match the 16:9 stage.
-const REF_W = 1920;
-const FONT_TIERS = [
-  { maxLen: 50, fontPx: 85, wrapPx: 1500 },
-  { maxLen: 80, fontPx: 70, wrapPx: 1650 },
-  { maxLen: Infinity, fontPx: 55, wrapPx: 1700 },
-];
-function fontTierFor(len) {
-  return FONT_TIERS.find((t) => len <= t.maxLen) || FONT_TIERS[FONT_TIERS.length - 1];
-}
+// at the 1920×1080 baseline (text_scale = 1). We mirror those exact tiers
+// (lib/lyricTiers — shared with the editor) so what you lay out is what
+// renders; fontPx is the render's \fs (px in the 1080-tall frame), expressed
+// as a fraction of the 1920 frame WIDTH (cqw) to match the 16:9 stage.
 const DEFAULT_POS = { x: 0.5, y: 0.5 };
 const MIN_SCALE = 0.4;
 const MAX_SCALE = 2.6;
@@ -72,11 +64,13 @@ export default function LyricVideoPreview({
   textCase = "upper",     // upper | lower | title | original — applied to displayed text
   textContrast = "medium",// subtle | medium | strong — outline/shadow strength
   transition = "cut",     // cut | fade | fade_slow — previewed as opacity ramp
+  fontScale = 1,          // global size multiplier (render clamps 0.6–1.5)
   videoRef = null,        // optional shared <video> ref for bg sync
   onSelect,               // (id) => void — bidirectional selection w/ list/timeline
   onLayoutChange,         // (id, {pos, scale, rot}) => void — commit
   onDragStart,            // () => void — push one undo snapshot
   showSafeArea = true,    // broadcast-safe guide
+  editable = true,        // false → read-only preview (no handles/selection box)
 }) {
   const frameRef = useRef(null);
   const bgVideoRef = useRef(null);
@@ -177,8 +171,10 @@ export default function LyricVideoPreview({
   // Cased display text drives BOTH what we show and which size/wrap tier the
   // render would pick — so the preview length tier matches the render's.
   const displayText = activeSeg ? applyCase(activeSeg.text, textCase) : "";
-  const tier = fontTierFor(displayText.length);
-  const fsPx = l ? `${(tier.fontPx / REF_W) * 100 * l.scale}cqw` : undefined;
+  const tier = tierForLength(displayText.length);
+  // Render size = tier × per-line scale × global font_scale (clamped like the
+  // backend), as a fraction of the 1920 frame width → cqw.
+  const fsPx = l ? `${(tier.fontPx / REF_W) * 100 * l.scale * clampFontScale(fontScale)}cqw` : undefined;
   const wrapMaxCqw = `${(tier.wrapPx / REF_W) * 100}cqw`;
 
   // Fade-in/out opacity so the chosen transition is visible while scrubbing
@@ -224,7 +220,7 @@ export default function LyricVideoPreview({
       )}
 
       {/* Readouts + reset for the selected line. */}
-      {activeSeg && l && (
+      {editable && activeSeg && l && (
         <div className="absolute top-2 right-2 flex items-center gap-1.5 z-10">
           <span className="rounded-md bg-black/55 backdrop-blur-sm ring-1 ring-white/10 px-2 py-1 text-[10px] text-white/80 tabular-nums">
             {Math.round(l.scale * 100)}% · {Math.round(l.rot)}°
@@ -248,15 +244,15 @@ export default function LyricVideoPreview({
 
       {activeSeg && l && (
         <div
-          className="absolute cursor-move"
+          className={`absolute ${editable ? "cursor-move" : "pointer-events-none"}`}
           style={{
             left: `${l.pos.x * 100}%`,
             top: `${l.pos.y * 100}%`,
             transform: `translate(-50%,-50%) rotate(${l.rot}deg)`,
             touchAction: "none",
           }}
-          onPointerDown={(e) => onPointerDown(e, activeSeg, "move")}
-          onPointerUp={(e) => onPointerUp(e, activeSeg)}
+          onPointerDown={editable ? (e) => onPointerDown(e, activeSeg, "move") : undefined}
+          onPointerUp={editable ? (e) => onPointerUp(e, activeSeg) : undefined}
         >
           <div
             className="font-extrabold text-white text-center px-1"
@@ -273,24 +269,28 @@ export default function LyricVideoPreview({
           >
             {displayText}
           </div>
-          {/* selection box + handles */}
-          <div className="absolute -inset-2 ring-1 ring-accent rounded pointer-events-none" />
-          {/* resize handle (bottom-right corner) */}
-          <span
-            className="absolute -bottom-2 -right-2 w-3 h-3 bg-white ring-1 ring-accent rounded-sm cursor-nwse-resize pointer-events-auto"
-            style={{ touchAction: "none" }}
-            onPointerDown={(e) => onPointerDown(e, activeSeg, "resize")}
-            onPointerUp={(e) => onPointerUp(e, activeSeg)}
-            title="Escalar"
-          />
-          {/* rotation handle (above) */}
-          <span
-            className="absolute left-1/2 -translate-x-1/2 -top-7 w-3.5 h-3.5 bg-accent ring-2 ring-white rounded-full cursor-grab pointer-events-auto"
-            style={{ touchAction: "none" }}
-            onPointerDown={(e) => onPointerDown(e, activeSeg, "rotate")}
-            onPointerUp={(e) => onPointerUp(e, activeSeg)}
-            title="Rotar"
-          />
+          {/* selection box + handles (edit mode only) */}
+          {editable && (
+            <>
+              <div className="absolute -inset-2 ring-1 ring-accent rounded pointer-events-none" />
+              {/* resize handle (bottom-right corner) */}
+              <span
+                className="absolute -bottom-2 -right-2 w-3 h-3 bg-white ring-1 ring-accent rounded-sm cursor-nwse-resize pointer-events-auto"
+                style={{ touchAction: "none" }}
+                onPointerDown={(e) => onPointerDown(e, activeSeg, "resize")}
+                onPointerUp={(e) => onPointerUp(e, activeSeg)}
+                title="Escalar"
+              />
+              {/* rotation handle (above) */}
+              <span
+                className="absolute left-1/2 -translate-x-1/2 -top-7 w-3.5 h-3.5 bg-accent ring-2 ring-white rounded-full cursor-grab pointer-events-auto"
+                style={{ touchAction: "none" }}
+                onPointerDown={(e) => onPointerDown(e, activeSeg, "rotate")}
+                onPointerUp={(e) => onPointerUp(e, activeSeg)}
+                title="Rotar"
+              />
+            </>
+          )}
         </div>
       )}
 

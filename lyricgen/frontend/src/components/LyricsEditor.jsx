@@ -4,6 +4,7 @@ import { EditorTour } from "./OnboardingTour";
 import { useToast } from "./ToastProvider";
 import LyricsTimeline from "./LyricsTimeline";
 import LyricVideoPreview from "./LyricVideoPreview";
+import { tierForLength } from "../lib/lyricTiers";
 
 // Font options for the live in-preview switcher. Codes match the render
 // pipeline / EditRequestPanel; css families are all loaded in index.html so
@@ -179,16 +180,12 @@ const FONT_CSS_MAP = {
   "":                "'Montserrat', sans-serif",
 };
 
-// Backend tier params (baseline 1920×1080, scale = 1.0).
-const TIERS = [
-  { maxChars: 50, sizePx: 85, maxWidthPx: 1500 },
-  { maxChars: 80, sizePx: 70, maxWidthPx: 1650 },
-  { maxChars: Infinity, sizePx: 55, maxWidthPx: 1700 },
-];
-
+// Backend tier params come from the shared source of truth (lib/lyricTiers,
+// also used by LyricVideoPreview). Adapter keeps this file's sizePx/maxWidthPx
+// naming so the existing wrap-estimation code is untouched.
 function getTier(text) {
-  const len = text.length;
-  return TIERS.find((t) => len <= t.maxChars) || TIERS[TIERS.length - 1];
+  const tier = tierForLength((text || "").length);
+  return { sizePx: tier.fontPx, maxWidthPx: tier.wrapPx };
 }
 
 // Simulate moviepy's word-wrap with canvas.measureText.
@@ -2047,6 +2044,7 @@ export default function LyricsEditor({
               textCase={selectedCase}
               textContrast={selectedContrast}
               transition={selectedTransition}
+              fontScale={fontScale}
               onSelect={(id) => {
                 focusSegment(id);
                 const seg = edited.find((s) => s._id === id);
@@ -2352,8 +2350,10 @@ export default function LyricsEditor({
         </div>
       )}
 
-      {/* ── Live preview panel ──────────────────────────────────────── */}
-      {focusedSegId !== null && (() => {
+      {/* ── Live preview panel (LIST view only — the timeline workspace
+            already shows the editable LyricVideoPreview, so this older inline
+            preview would be a second, possibly-divergent preview). ───────── */}
+      {viewMode !== "timeline" && focusedSegId !== null && (() => {
         const seg = edited.find((s) => s._id === focusedSegId);
         if (!seg || !(seg.text || "").trim()) return null;
         const displayText = applyCase(seg.text, textCase);

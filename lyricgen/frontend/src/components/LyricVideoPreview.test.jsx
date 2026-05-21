@@ -93,6 +93,28 @@ it("sizes the line by length tier like the render: long line → smaller font th
   expect(longFs).toBeCloseTo((55 / 1920) * 100, 2);
 });
 
+it("fontScale multiplies the tier size and is clamped to the backend max (1.5)", () => {
+  const seg = [{ _id: 0, start: 0, end: 5, text: "corta" }]; // ≤50 → 85px tier
+  setup({ segments: seg, currentTime: 2, fontScale: 1 });
+  const base = parseFloat(screen.getByText("corta").style.fontSize);
+  cleanup();
+  setup({ segments: seg, currentTime: 2, fontScale: 1.5 });
+  const at15 = parseFloat(screen.getByText("corta").style.fontSize);
+  cleanup();
+  setup({ segments: seg, currentTime: 2, fontScale: 2.0 }); // over the clamp
+  const at20 = parseFloat(screen.getByText("corta").style.fontSize);
+  expect(at15).toBeCloseTo(base * 1.5, 3);
+  expect(at20).toBeCloseTo(at15, 3); // clamped to 1.5, not 2.0
+});
+
+it("editable=false hides the layout handles but still renders the line", () => {
+  const { container } = setup({ editable: false });
+  expect(screen.getByText("segunda línea")).toBeInTheDocument();
+  // No resize/rotate handles, no readout chip.
+  expect(container.querySelector("[title='Escalar']")).not.toBeInTheDocument();
+  expect(container.querySelector("[title='Rotar']")).not.toBeInTheDocument();
+});
+
 it("with cut, the active line is always full opacity (no fade)", () => {
   setup({ transition: "cut", currentTime: 5.02 });
   expect(parseFloat(screen.getByText("segunda línea").style.opacity)).toBe(1);
