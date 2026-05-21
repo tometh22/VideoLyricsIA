@@ -746,6 +746,8 @@ const translations = {
     "home.eq_in": "Tu MP3",
     "home.eq_proc": "IA: letra + timing + fondo",
     "home.eq_out": "Lyric video listo",
+    "home.looks_title": "Lyric videos que paran el scroll",
+    "home.looks_sub": "Tipografía cinética sobre fondos generados por IA — un look distinto para cada canción.",
     "faq.q7": "¿Qué pasa si ContentID matchea uno de mis videos?",
     "faq.a7": "Los fondos son únicos por canción (no stock compartido), así que el video no dispara matches. El audio es tuyo y lo gestionás como dueño del contenido.",
     "faq.q8": "¿Puedo procesar 100+ canciones de mi catálogo?",
