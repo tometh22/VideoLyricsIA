@@ -262,6 +262,10 @@ export default function LyricsEditor({
   // List vs visual timeline. Default "list" so the existing operator flow is
   // untouched; the timeline is opt-in via the toolbar toggle.
   const [viewMode, setViewMode] = useState("list"); // "list" | "timeline"
+  // Layout edits in the preview apply to ALL lines by default (consistent
+  // look across the song); "line" scopes the next edit to the selected line
+  // only (for the odd tilted/repositioned line).
+  const [layoutScope, setLayoutScope] = useState("all"); // "all" | "line"
   // Autosave confidence for the timeline view. saveStatus drives the
   // "Guardando…/Guardado ✓" chip; flushCounter triggers an immediate save
   // on a timeline drag (instead of waiting for the 3 s debounce).
@@ -512,10 +516,12 @@ export default function LyricsEditor({
   const handleLayoutChange = useCallback((id, layout) => {
     setIsDirty(true);
     setEdited((prev) => prev.map((s) =>
-      s._id === id ? { ...s, pos: layout.pos, scale: layout.scale, rot: layout.rot } : s
+      (layoutScope === "all" || s._id === id)
+        ? { ...s, pos: layout.pos, scale: layout.scale, rot: layout.rot }
+        : s
     ));
     setFlushCounter((c) => c + 1);
-  }, []);
+  }, [layoutScope]);
 
   // Restore every line's timing to the original snapshot + drop all `locked`
   // flags, so the render goes back to auto hold-until-next.
@@ -1356,7 +1362,7 @@ export default function LyricsEditor({
   };
 
   return (
-    <div className="w-full max-w-3xl animate-fade-in">
+    <div className={`w-full animate-fade-in ${viewMode === "timeline" ? "max-w-6xl" : "max-w-3xl"}`}>
       {/* Hidden audio element drives playback. */}
       {audioUrl && (
         <audio
@@ -1908,29 +1914,41 @@ export default function LyricsEditor({
         )}
       </div>
 
-      {/* ─── Live editable preview (move / scale / rotate per line) ── */}
+      {/* ─── Workspace: preview + timeline side by side (no full-page
+             scroll). Stacks on small screens. ─────────────────────── */}
       {viewMode === "timeline" && audioUrl && (
-        <div className="mb-4">
-          <LyricVideoPreview
-            segments={edited}
-            currentTime={currentTime}
-            backgroundUrl={previewBgUrl || null}
-            backgroundStyle={backgroundStyle || "default"}
-            font={font || undefined}
-            onSelect={(id) => {
-              focusSegment(id);
-              const seg = edited.find((s) => s._id === id);
-              if (seg) seekTo(Math.max(0, seg.start), false);
-            }}
-            onLayoutChange={handleLayoutChange}
-            onDragStart={pushEditHistory}
-          />
-        </div>
-      )}
-
-      {/* ─── Visual timeline (Timings view) ───────────────────────── */}
-      {viewMode === "timeline" && audioUrl && (
-        <div className="mb-4">
+        <div className="grid lg:grid-cols-2 gap-4 mb-4 items-start">
+          {/* Preview + apply-scope toggle (sticky so it stays in view
+              while the timeline column scrolls internally). */}
+          <div className="space-y-2 lg:sticky lg:top-2">
+            <div className="flex items-center justify-between px-1 gap-2 flex-wrap">
+              <span className="text-[11px] text-ink-tertiary">Mover · escalar · rotar aplica a</span>
+              <div className="inline-flex rounded-md ring-1 ring-white/[0.08] overflow-hidden text-[11px] font-semibold">
+                <button type="button" onClick={() => setLayoutScope("all")}
+                  className={`px-2.5 py-1 transition-colors ${layoutScope === "all" ? "bg-brand text-white" : "text-ink-secondary hover:text-white"}`}>
+                  Todas las líneas
+                </button>
+                <button type="button" onClick={() => setLayoutScope("line")}
+                  className={`px-2.5 py-1 transition-colors ${layoutScope === "line" ? "bg-brand text-white" : "text-ink-secondary hover:text-white"}`}>
+                  Solo esta
+                </button>
+              </div>
+            </div>
+            <LyricVideoPreview
+              segments={edited}
+              currentTime={currentTime}
+              backgroundUrl={previewBgUrl || null}
+              backgroundStyle={backgroundStyle || "default"}
+              font={font || undefined}
+              onSelect={(id) => {
+                focusSegment(id);
+                const seg = edited.find((s) => s._id === id);
+                if (seg) seekTo(Math.max(0, seg.start), false);
+              }}
+              onLayoutChange={handleLayoutChange}
+              onDragStart={pushEditHistory}
+            />
+          </div>
           <LyricsTimeline
             segments={edited}
             duration={duration}
