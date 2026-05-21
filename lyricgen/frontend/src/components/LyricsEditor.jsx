@@ -21,6 +21,32 @@ const EDITOR_FONTS = [
 ];
 const FONT_CSS_BY_CODE = Object.fromEntries(EDITOR_FONTS.map((f) => [f.code, f.css]));
 
+// Typography options for the live preview controls. Codes match the render
+// pipeline (pipeline.py / ass_render / UploadZone).
+const TEXT_CASES = [
+  { code: "upper", label: "MAY" },
+  { code: "title", label: "Aa" },
+  { code: "lower", label: "min" },
+  { code: "original", label: "ori" },
+];
+const TRANSITIONS = [
+  { code: "cut", label: "Corte" },
+  { code: "fade", label: "Fade" },
+  { code: "fade_slow", label: "Lento" },
+];
+const CONTRASTS = [
+  { code: "subtle", label: "Suave" },
+  { code: "medium", label: "Medio" },
+  { code: "strong", label: "Fuerte" },
+];
+
+function applyTextCase(text, code) {
+  if (code === "upper") return (text || "").toUpperCase();
+  if (code === "lower") return (text || "").toLowerCase();
+  if (code === "title") return (text || "").replace(/\b\w/g, (c) => c.toUpperCase());
+  return text || "";
+}
+
 // Mismo flag que UploadZone/EditRequestPanel — oculta el label de motion
 // en el strip de metadata mientras la feature de animación está pausada.
 const SHOW_MOTION_PICKER = false;
@@ -276,6 +302,10 @@ export default function LyricsEditor({
   // Called when the operator picks a font in the live preview switcher.
   // Parent threads it into the render (render_params.font / edit_params).
   onFontChange = null,
+  // Same idea for the rest of the typography, set live in the preview.
+  onCaseChange = null,
+  onTransitionChange = null,
+  onContrastChange = null,
 }) {
   const { t } = useI18n();
   const [edited, setEdited] = useState(() =>
@@ -292,6 +322,9 @@ export default function LyricsEditor({
   // Live font selection (preview re-renders instantly; emitted to parent
   // for the actual render). Seeded from the job's current font.
   const [selectedFont, setSelectedFont] = useState(font || "");
+  const [selectedCase, setSelectedCase] = useState(textCase || "upper");
+  const [selectedTransition, setSelectedTransition] = useState(lyricTransition || "cut");
+  const [selectedContrast, setSelectedContrast] = useState(textContrast || "medium");
   // Autosave confidence for the timeline view. saveStatus drives the
   // "Guardando…/Guardado ✓" chip; flushCounter triggers an immediate save
   // on a timeline drag (instead of waiting for the 3 s debounce).
@@ -1960,6 +1993,38 @@ export default function LyricsEditor({
                 ))}
               </select>
             </div>
+            {/* Live text style: case + contrast + transition. Preview reflects
+                case/contrast instantly; all three apply on re-render. */}
+            <div className="flex flex-wrap items-center gap-x-3 gap-y-1.5 px-1 text-[11px]">
+              <div className="flex items-center gap-1.5">
+                <span className="text-ink-tertiary">Estilo</span>
+                <div className="inline-flex rounded-md ring-1 ring-white/[0.08] overflow-hidden font-semibold">
+                  {TEXT_CASES.map((o) => (
+                    <button key={o.code} type="button"
+                      onClick={() => { setSelectedCase(o.code); onCaseChange?.(o.code); }}
+                      className={`px-2 py-1 transition-colors ${selectedCase === o.code ? "bg-brand text-white" : "text-ink-secondary hover:text-white"}`}>{o.label}</button>
+                  ))}
+                </div>
+              </div>
+              <div className="flex items-center gap-1.5">
+                <span className="text-ink-tertiary">Contraste</span>
+                <div className="inline-flex rounded-md ring-1 ring-white/[0.08] overflow-hidden font-semibold">
+                  {CONTRASTS.map((o) => (
+                    <button key={o.code} type="button"
+                      onClick={() => { setSelectedContrast(o.code); onContrastChange?.(o.code); }}
+                      className={`px-2 py-1 transition-colors ${selectedContrast === o.code ? "bg-brand text-white" : "text-ink-secondary hover:text-white"}`}>{o.label}</button>
+                  ))}
+                </div>
+              </div>
+              <div className="flex items-center gap-1.5">
+                <span className="text-ink-tertiary">Transición</span>
+                <select value={selectedTransition}
+                  onChange={(e) => { setSelectedTransition(e.target.value); onTransitionChange?.(e.target.value); }}
+                  className="bg-surface-2 ring-1 ring-white/[0.08] rounded-md px-1.5 py-1 text-white focus:ring-brand outline-none cursor-pointer">
+                  {TRANSITIONS.map((o) => (<option key={o.code} value={o.code}>{o.label}</option>))}
+                </select>
+              </div>
+            </div>
             <div className="flex items-center justify-between px-1 gap-2 flex-wrap">
               <span className="text-[11px] text-ink-tertiary">Mover · escalar · rotar aplica a</span>
               <div className="inline-flex rounded-md ring-1 ring-white/[0.08] overflow-hidden text-[11px] font-semibold">
@@ -1979,6 +2044,8 @@ export default function LyricsEditor({
               backgroundUrl={previewBgUrl || null}
               backgroundStyle={backgroundStyle || "default"}
               font={FONT_CSS_BY_CODE[selectedFont] || undefined}
+              textCase={selectedCase}
+              textContrast={selectedContrast}
               onSelect={(id) => {
                 focusSegment(id);
                 const seg = edited.find((s) => s._id === id);

@@ -4501,6 +4501,7 @@ class EditJobRequest(BaseModel):
     text_case: str | None = Field(default=None, max_length=16)
     lyric_transition: str | None = Field(default=None, max_length=16)
     text_motion: str | None = Field(default=None, max_length=16)
+    text_contrast: str | None = Field(default=None, max_length=16)
     # Required when edit_type=="lyrics". For edit_type=="background" or
     # "typography", segments is OPTIONAL — if the operator made text
     # corrections inside the modal's LyricsEditor that autosave hasn't
@@ -5187,6 +5188,8 @@ async def request_edit(
         edit_params["text_case"] = body.text_case
     if body.lyric_transition is not None:
         edit_params["lyric_transition"] = body.lyric_transition
+    if body.text_contrast is not None:
+        edit_params["text_contrast"] = body.text_contrast
     if body.text_motion is not None:
         edit_params["text_motion"] = body.text_motion
     if body.edit_type == "lyrics":

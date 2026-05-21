@@ -18,6 +18,7 @@ function setup(overrides = {}) {
     currentTime: 6,           // inside seg _id:1
     backgroundUrl: null,
     backgroundStyle: "calido",
+    textCase: "original",     // keep text literal so queries match (default is "upper")
     onSelect: vi.fn(),
     onLayoutChange: vi.fn(),
     onDragStart: vi.fn(),

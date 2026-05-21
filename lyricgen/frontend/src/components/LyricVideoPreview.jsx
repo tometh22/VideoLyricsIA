@@ -33,12 +33,28 @@ const STYLE_GRADIENTS = {
 
 function clamp(v, lo, hi) { return Math.min(Math.max(v, lo), hi); }
 
+function applyCase(text, code) {
+  if (code === "upper") return (text || "").toUpperCase();
+  if (code === "lower") return (text || "").toLowerCase();
+  if (code === "title") return (text || "").replace(/\b\w/g, (c) => c.toUpperCase());
+  return text || "";
+}
+
+// Outline/shadow per contrast level (approximates the render look).
+const CONTRAST_STYLES = {
+  subtle: { WebkitTextStroke: "0px", textShadow: "0 1px 5px rgba(0,0,0,.55)" },
+  medium: { WebkitTextStroke: "1px rgba(0,0,0,.55)", textShadow: "0 2px 0 #000, 0 0 18px rgba(0,0,0,.6)" },
+  strong: { WebkitTextStroke: "1.5px #000", textShadow: "0 0 6px rgba(0,0,0,1), -1px -1px 0 #000, 1px 1px 0 #000, 0 2px 0 #000" },
+};
+
 export default function LyricVideoPreview({
   segments,           // [{_id, start, end, text, pos?, scale?, rot?}]
   currentTime,
   backgroundUrl = null,   // signed video URL (modal) | null (wizard → gradient)
   backgroundStyle = "default",
   font,                   // css font-family for parity with render (optional)
+  textCase = "upper",     // upper | lower | title | original — applied to displayed text
+  textContrast = "medium",// subtle | medium | strong — outline/shadow strength
   videoRef = null,        // optional shared <video> ref for bg sync
   onSelect,               // (id) => void — bidirectional selection w/ list/timeline
   onLayoutChange,         // (id, {pos, scale, rot}) => void — commit
@@ -212,12 +228,11 @@ export default function LyricVideoPreview({
             style={{
               fontSize: fsPx,
               fontFamily: font || undefined,
-              textShadow: "0 2px 0 #000, 0 0 18px rgba(0,0,0,.6)",
-              WebkitTextStroke: "1px rgba(0,0,0,.55)",
               lineHeight: 1.1,
+              ...(CONTRAST_STYLES[textContrast] || CONTRAST_STYLES.medium),
             }}
           >
-            {activeSeg.text}
+            {applyCase(activeSeg.text, textCase)}
           </div>
           {/* selection box + handles */}
           <div className="absolute -inset-2 ring-1 ring-accent rounded pointer-events-none" />
