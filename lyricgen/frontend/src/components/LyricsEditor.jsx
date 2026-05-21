@@ -3,6 +3,7 @@ import { useI18n } from "../i18n";
 import { EditorTour } from "./OnboardingTour";
 import { useToast } from "./ToastProvider";
 import LyricsTimeline from "./LyricsTimeline";
+import LyricVideoPreview from "./LyricVideoPreview";
 
 // Mismo flag que UploadZone/EditRequestPanel — oculta el label de motion
 // en el strip de metadata mientras la feature de animación está pausada.
@@ -247,6 +248,11 @@ export default function LyricsEditor({
   // parent (the post-render /edit modal has a job in R2; the wizard doesn't).
   // null → timeline renders without a waveform (graceful).
   waveform = null,
+  // Live preview: signed URL of the cached background video (post-render
+  // modal). null → preview uses a style-tinted template gradient (wizard).
+  previewBgUrl = null,
+  // Background style name → template gradient for the wizard preview.
+  backgroundStyle = "default",
 }) {
   const { t } = useI18n();
   const [edited, setEdited] = useState(() =>
@@ -498,6 +504,16 @@ export default function LyricsEditor({
     // Flush-save immediately (don't wait for the 3 s autosave debounce) so
     // the operator sees "Guardado" right after dropping a block — the
     // flush effect below reads the just-updated `edited` and persists.
+    setFlushCounter((c) => c + 1);
+  }, []);
+
+  // Per-line layout (position / size / rotation) committed from the live
+  // preview. Same flush-on-commit as the timeline so "Guardado" shows fast.
+  const handleLayoutChange = useCallback((id, layout) => {
+    setIsDirty(true);
+    setEdited((prev) => prev.map((s) =>
+      s._id === id ? { ...s, pos: layout.pos, scale: layout.scale, rot: layout.rot } : s
+    ));
     setFlushCounter((c) => c + 1);
   }, []);
 
@@ -1891,6 +1907,26 @@ export default function LyricsEditor({
           </div>
         )}
       </div>
+
+      {/* ─── Live editable preview (move / scale / rotate per line) ── */}
+      {viewMode === "timeline" && audioUrl && (
+        <div className="mb-4">
+          <LyricVideoPreview
+            segments={edited}
+            currentTime={currentTime}
+            backgroundUrl={previewBgUrl || null}
+            backgroundStyle={backgroundStyle || "default"}
+            font={font || undefined}
+            onSelect={(id) => {
+              focusSegment(id);
+              const seg = edited.find((s) => s._id === id);
+              if (seg) seekTo(Math.max(0, seg.start), false);
+            }}
+            onLayoutChange={handleLayoutChange}
+            onDragStart={pushEditHistory}
+          />
+        </div>
+      )}
 
       {/* ─── Visual timeline (Timings view) ───────────────────────── */}
       {viewMode === "timeline" && audioUrl && (
