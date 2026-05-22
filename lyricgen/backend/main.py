@@ -3751,6 +3751,20 @@ async def generate_with_segments(
     except (ValueError, TypeError):
         pass
 
+    # Remove the orphan draft the wizard sometimes leaves behind: if a
+    # sibling transcribed_pending/awaiting_upload row for the same audio was
+    # just created (re-upload-on-generate bug), delete it so the operator
+    # doesn't see a phantom "2nd job". Time-windowed so it never touches an
+    # intentional re-upload of the same song later.
+    try:
+        from jobs import supersede_sibling_drafts
+        supersede_sibling_drafts(
+            db, keep_job_id=job_id, user_id=current_user["id"],
+            tenant_id=current_user["tenant_id"], filename=existing_filename or "",
+        )
+    except Exception as e:
+        logger.warning("[DEDUP] supersede sibling drafts failed: %s", e)
+
     enqueue_pipeline(
         job_id=job_id,
         mp3_path=mp3_path,
