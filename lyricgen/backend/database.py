@@ -300,6 +300,10 @@ class Job(Base):
     current_step = Column(String(50), default="whisper")
     progress = Column(Integer, default=0)
     error = Column(Text, nullable=True)
+    # Which engine produced the lyric timing for this job: forced_align |
+    # lrclib_synced | gemini_aligner | whisper. Observability so we can
+    # answer "what timed this job?" without grepping logs that scroll.
+    timing_source = Column(String(20), nullable=True)
 
     # Delivery profile (youtube | umg)
     delivery_profile = Column(String(20), default="youtube", nullable=False)
@@ -865,6 +869,7 @@ def _migrate_user_columns():
         "ALTER TABLE jobs ADD COLUMN IF NOT EXISTS song_title VARCHAR(500)",
         "ALTER TABLE jobs ADD COLUMN IF NOT EXISTS input_r2_key VARCHAR(500)",
         "ALTER TABLE jobs ADD COLUMN IF NOT EXISTS multipart_upload_id VARCHAR(255)",
+        "ALTER TABLE jobs ADD COLUMN IF NOT EXISTS timing_source VARCHAR(20)",
         # Library exclusivity (UMG): tenant-owned and variation-parent references.
         "ALTER TABLE background_assets ADD COLUMN IF NOT EXISTS owner_tenant_id VARCHAR(100)",
         "ALTER TABLE background_assets ADD COLUMN IF NOT EXISTS parent_asset_id INTEGER REFERENCES background_assets(id)",
