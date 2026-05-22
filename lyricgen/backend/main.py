@@ -2938,10 +2938,24 @@ async def _run_transcription_for_job(
 
     tmp_dir = tempfile.mkdtemp()
     tmp_path = audio_path
+    _vocal_stem = None   # demucs output path, cleaned up in finally
 
     try:
         lang = language.strip() if language.strip() else None
         loop = asyncio.get_event_loop()
+
+        # Vocal source separation (demucs): isolate the voice so forced
+        # alignment / whisperX transcribe the LYRIC, not the band — the big
+        # lever on hard songs (incident "El Arbol"; see vocal_sep.py). Behind
+        # VOCAL_SEP_ENABLED; on failure `align_audio` falls back to the mix.
+        # The stem feeds FA / whisperX / verification ONLY — NOT the bare
+        # whisper-1 pass, which is more hallucination-prone on isolated vocals
+        # (long-form caveat, arXiv 2506.15514).
+        import vocal_sep
+        _vocal_stem = await asyncio.to_thread(vocal_sep.separate_vocals, tmp_path)
+        align_audio = _vocal_stem or tmp_path
+        if _vocal_stem:
+            logger.info("[LYRICS] isolated vocal stem — using it for alignment/whisperX/verification")
 
         # Resolve artist + title for the reference-lyrics fetch. Source order:
         #   1) explicit form fields (frontend already collects `artist` per
@@ -3006,7 +3020,7 @@ async def _run_transcription_for_job(
                 fa_text = plain or forced_align.lrc_to_plain_text(synced)
                 if fa_text:
                     fa_segs = await asyncio.to_thread(
-                        forced_align.forced_align_lyrics, tmp_path, fa_text,
+                        forced_align.forced_align_lyrics, align_audio, fa_text,
                     )
                     if fa_segs:
                         logger.info("[LYRICS] forced alignment used (%s lines, lrclib text) for %r - %r", len(fa_segs), artist_hint, song_hint)
@@ -3073,37 +3087,62 @@ async def _run_transcription_for_job(
                     song_segs = _lrc_to_segments(
                         synced, lrc_dur, time_offset=offset,
                     )
-                    # Alignment verification — when we applied an offset, we
-                    # have NO ground-truth that the offset is correct (the
-                    # extra audio could be at the end, not the start). Slice
-                    # ~5 s of the user's audio at where we claim a song line
-                    # starts, run Whisper, fuzzy-match. If the match is weak
-                    # (< 0.4), we don't trust the alignment and fall through
-                    # to plain + Whisper. Cost: 1 extra Whisper call on 5 s
-                    # of audio (~$0.0005) and ~3 s of latency.
-                    if offset > 0 and song_segs:
-                        # Verify mid-song (more robust than first line which
-                        # may be a short ad-lib like "¡Karol!")
-                        mid_idx = min(len(song_segs) - 1, len(song_segs) // 2)
-                        verify_seg = song_segs[mid_idx]
-                        # Skip verification if the chosen text is too short
-                        # to fuzzy-match reliably.
-                        if len(verify_seg["text"]) >= 10:
-                            confidence = await asyncio.to_thread(
+                    # Alignment verification by CONTENT. lrclib's community
+                    # synced timestamps are tied to a SPECIFIC master and can
+                    # be globally mis-timed even when the total duration
+                    # matches ours — so a duration-only check (offset) is not
+                    # enough. Incident "Cosas Mías" (Los Abuelos de la Nada):
+                    # lrclib placed the first line at 49.4s; the user's audio
+                    # sang it ~35s earlier; durations matched so offset=0, and
+                    # — because verification used to be gated behind
+                    # `offset > 0` — nothing checked it and we shipped a video
+                    # shifted ~35s. We now verify in ALL cases: slice ~5s of
+                    # the user's audio where we claim a line starts, run
+                    # Whisper, fuzzy-match. Probe TWO points (~1/3 and ~2/3)
+                    # because a repeated chorus can make one slice match the
+                    # wrong occurrence — we trust if EITHER matches (take the
+                    # max). Cost: 1-2 Whisper calls on ~5s of audio
+                    # (~$0.0005-0.001) and ~3-6s latency.
+                    _verify_always = os.environ.get(
+                        "LRCLIB_VERIFY_ALWAYS", "1"
+                    ).strip().lower() in ("1", "true", "yes", "on", "y", "t")
+                    _verify_threshold = float(
+                        os.environ.get("LRCLIB_VERIFY_THRESHOLD", "0.4")
+                    )
+                    if (_verify_always or offset > 0) and song_segs:
+                        # Probe ~1/3 and ~2/3 through; skip the first line
+                        # (often a short ad-lib like "¡Karol!").
+                        n = len(song_segs)
+                        probe_idxs = sorted({
+                            min(n - 1, max(0, n // 3)),
+                            min(n - 1, max(0, (2 * n) // 3)),
+                        })
+                        confidences: list[float] = []
+                        for pi in probe_idxs:
+                            verify_seg = song_segs[pi]
+                            # Skip probes whose text is too short to fuzzy-match
+                            # reliably.
+                            if len(verify_seg["text"]) < 10:
+                                continue
+                            c = await asyncio.to_thread(
                                 _verify_lrclib_alignment,
-                                tmp_path, verify_seg["text"], verify_seg["start"],
+                                align_audio, verify_seg["text"], verify_seg["start"],
                             )
-                            if confidence is not None:
-                                if confidence < 0.4:
-                                    logger.warning("[LYRICS] alignment verification FAILED (confidence=%.2f at t=%.1fs for %r) — falling back to Whisper+plain", confidence, verify_seg['start'], verify_seg['text'][:40])
-                                    use_synced = False
-                                else:
-                                    logger.info("[LYRICS] alignment verified (confidence=%.2f)", confidence)
-                            elif diff > 60.0:
-                                # High-diff offsets are riskier — if we can't
-                                # even verify, don't gamble; fall back.
-                                logger.warning("[LYRICS] alignment verification unavailable for high-diff offset (%.1fs) — falling back", diff)
+                            if c is not None:
+                                confidences.append(c)
+                        if confidences:
+                            best = max(confidences)
+                            if best < _verify_threshold:
+                                logger.warning("[LYRICS] alignment verification FAILED (best confidence=%.2f over %d probe(s), offset=%.1fs) — falling back to Whisper+plain", best, len(confidences), offset)
                                 use_synced = False
+                            else:
+                                logger.info("[LYRICS] alignment verified (best confidence=%.2f over %d probe(s), offset=%.1fs)", best, len(confidences), offset)
+                        elif offset > 60.0:
+                            # High-offset cases are riskier — if we can't even
+                            # verify, don't gamble; fall back. (offset is set
+                            # from the duration diff, so offset>60 == diff>60.)
+                            logger.warning("[LYRICS] alignment verification unavailable for high offset (%.1fs) — falling back", offset)
+                            use_synced = False
                     if use_synced and song_segs and len(song_segs) >= 8:
                         from pipeline import (
                             _filter_intro_song_overlap,
@@ -3443,7 +3482,7 @@ async def _run_transcription_for_job(
             import forced_align
             if forced_align.is_enabled():
                 fa_segs = await asyncio.to_thread(
-                    forced_align.forced_align_lyrics, tmp_path, reference,
+                    forced_align.forced_align_lyrics, align_audio, reference,
                 )
                 if fa_segs:
                     logger.info("[LYRICS] forced alignment used (%s lines, gemini text)", len(fa_segs))
@@ -3514,6 +3553,35 @@ async def _run_transcription_for_job(
                         "recovery_source": src,
                     }
 
+        # No-lyrics path — the audio is the only source of truth. Prefer
+        # whisperX (Whisper large-v2 + wav2vec2 alignment + VAD) over the
+        # whisper-1 segments above: word-level <100ms timing and far less
+        # prone to the single-mega-segment hallucination. Behind
+        # WHISPERX_ENABLED; falls back to whisper-1 on None / if the result
+        # still looks hallucinated. Returns word stamps (persisted for a
+        # future word-level editor).
+        if not reference:
+            import whisperx_transcribe
+            if whisperx_transcribe.is_enabled():
+                wx_segs = await asyncio.to_thread(
+                    whisperx_transcribe.transcribe_whisperx, align_audio, lang,
+                )
+                if wx_segs:
+                    from pipeline import _filter_whisper_hallucinations as _fwh
+                    wx_segs, _ = _fwh(wx_segs)
+                    _wx_dur = await asyncio.to_thread(_audio_duration, tmp_path)
+                    _hall, _why = _detect_hallucination(wx_segs, _wx_dur, language=lang)
+                    if not _hall and len(wx_segs) >= 2:
+                        logger.info("[LYRICS] whisperX no-lyrics path — %s segments (word-level)", len(wx_segs))
+                        from jobs import set_timing_source
+                        set_timing_source(job_id, "whisperx")
+                        return {
+                            "job_id": job_id,
+                            "segments": wx_segs,
+                            "reference_lyrics": "",
+                        }
+                    logger.warning("[LYRICS] whisperX result rejected (%s) — keeping whisper-1", _why or "thin")
+
         from pipeline import _filter_whisper_hallucinations
         segments, _dropped = _filter_whisper_hallucinations(segments)
         if _dropped:
@@ -3541,6 +3609,13 @@ async def _run_transcription_for_job(
             shutil.rmtree(tmp_dir, ignore_errors=True)
         except Exception:
             pass
+        # The demucs vocal stem is a standalone temp file (system temp dir),
+        # not under tmp_dir — remove it explicitly.
+        if _vocal_stem:
+            try:
+                os.unlink(_vocal_stem)
+            except OSError:
+                pass
 
 
 @app.post("/generate")
@@ -5344,6 +5419,11 @@ async def request_edit(
                 **({"rot": float(s["rot"])}
                    if isinstance(s.get("rot"), (int, float))
                    and float(s["rot"]) != 0.0 else {}),
+                # Preserve per-word timestamps (forced-align / whisperX) so a
+                # re-render or future word-level/karaoke editor doesn't lose
+                # them. The line-level editor ignores `words`; carried only
+                # when present so untouched line-level edits stay lean.
+                **({"words": s["words"]} if isinstance(s.get("words"), list) else {}),
             }
             for s in body.segments
         ]
