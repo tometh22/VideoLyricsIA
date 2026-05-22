@@ -166,6 +166,25 @@ def touch_user_activity(db: Session, job: Job) -> None:
     job.last_user_activity_at = datetime.now(timezone.utc)
 
 
+def set_timing_source(job_id: str, source: str) -> None:
+    """Record which engine produced a job's lyric timing (forced_align /
+    lrclib_synced / gemini_aligner / whisper) for observability. Best-effort
+    with its own short-lived session so it never holds the request
+    connection or breaks the transcription path on failure."""
+    try:
+        from database import SessionLocal
+        s = SessionLocal()
+        try:
+            j = s.query(Job).filter(Job.job_id == job_id).first()
+            if j is not None:
+                j.timing_source = source
+                s.commit()
+        finally:
+            s.close()
+    except Exception:
+        logging.getLogger("genly").debug("set_timing_source failed for %s", job_id)
+
+
 def supersede_sibling_drafts(
     db: Session, *, keep_job_id: str, user_id: int, tenant_id: str,
     filename: str, window_min: int = 20,

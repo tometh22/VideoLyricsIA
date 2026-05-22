@@ -3002,6 +3002,8 @@ async def _run_transcription_for_job(
                     )
                     if fa_segs:
                         logger.info("[LYRICS] forced alignment used (%s lines, lrclib text) for %r - %r", len(fa_segs), artist_hint, song_hint)
+                        from jobs import set_timing_source
+                        set_timing_source(job_id, "forced_align")
                         return {
                             "job_id": job_id,
                             "segments": fa_segs,
@@ -3117,6 +3119,8 @@ async def _run_transcription_for_job(
                                 logger.info("[LYRICS] lrclib line 1 was anchored at 0s with a long gap to line 2; shifted to %.2fs based on median cadence", _moved)
                         combined = hybrid_intro_segs + song_segs
                         logger.info("[LYRICS] lrclib synced hit — %s segments (%s intro + %s song), skipping main Whisper for %r - %r", len(combined), len(hybrid_intro_segs), len(song_segs), artist_hint, song_hint)
+                        from jobs import set_timing_source
+                        set_timing_source(job_id, "lrclib_synced")
                         return {
                             "job_id": job_id,
                             "segments": combined,
@@ -3435,6 +3439,8 @@ async def _run_transcription_for_job(
                 )
                 if fa_segs:
                     logger.info("[LYRICS] forced alignment used (%s lines, gemini text)", len(fa_segs))
+                    from jobs import set_timing_source
+                    set_timing_source(job_id, "forced_align")
                     return {
                         "job_id": job_id,
                         "segments": fa_segs,
