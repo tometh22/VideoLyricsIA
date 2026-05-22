@@ -36,6 +36,12 @@ export default function WizardLivePreview({ style = "auto", customColors = "", m
   // the movement-sample clip) so particles never clash with a busy scene like
   // the nebula. Without an effect, show the chosen movement's own clip.
   const baseClip = effect ? "/preview_base.mp4" : clipSrc;
+  // With an effect active the base is a FIXED calm scene, so the chosen movement
+  // is conveyed by a CSS camera transform on it (Estático=still, Cinematográfico
+  // =zoom/drift, Foto+parallax=lateral pan…) — clicking a register visibly
+  // changes the preview's motion. Without an effect the base IS the movement
+  // clip (motion already baked in), so no extra transform.
+  const baseAnim = effect ? (MOVE_ANIM[movementStyle] || "none") : "none";
   const isMinimal = style === "minimal";
   // Resolve the background gradient: a preset, the custom colors, or a
   // pleasant default for "auto" (the AI will pick the real colors).
@@ -157,6 +163,7 @@ export default function WizardLivePreview({ style = "auto", customColors = "", m
         key={baseClip}
         src={baseClip}
         className="absolute inset-0 w-full h-full object-cover"
+        style={baseAnim !== "none" ? { animation: baseAnim, willChange: "transform" } : undefined}
         autoPlay loop muted playsInline
       />
       {/* effect overlay — particles screen-blended over the footage, BELOW the
