@@ -1009,6 +1009,8 @@ export default function App() {
         formData.append("font_scale", String(jobList[i].fontScale || "1.0"));
         formData.append("lyric_transition", jobList[i].lyricTransition || "cut");
         formData.append("text_motion", jobList[i].textMotion || "none");
+        formData.append("lyrics_animation", jobList[i].lyricsAnimation || "none");
+        formData.append("line_transition", jobList[i].lineTransition || "none");
         formData.append("text_contrast", jobList[i].textContrast || "medium");
         if (animateImage && backgroundFile) formData.append("animate_image", "true");
         formData.append("match_lyrics", String(!!inspiredByLyrics));
@@ -1138,6 +1140,8 @@ export default function App() {
         generateBody.append("font_scale", String(jobList[i].fontScale || "1.0"));
         generateBody.append("lyric_transition", jobList[i].lyricTransition || "cut");
         generateBody.append("text_motion", jobList[i].textMotion || "none");
+        generateBody.append("lyrics_animation", jobList[i].lyricsAnimation || "none");
+        generateBody.append("line_transition", jobList[i].lineTransition || "none");
         generateBody.append("text_contrast", jobList[i].textContrast || "medium");
         if (animateImage && backgroundFile) generateBody.append("animate_image", "true");
         generateBody.append("match_lyrics", String(!!inspiredByLyrics));

@@ -323,3 +323,182 @@ def test_build_ass_alignment_without_pos():
     d = [l for l in out.splitlines() if l.startswith("Dialogue:")][0]
     assert "\\an4" in d and "\\pos(" not in d
     assert "\\b0" in d
+
+
+# ---------------------------------------------------------------------------
+# Lyric-animation templates (libass tags, fast path). All emit inside the
+# single ffmpeg pass — these assert the right tags per template.
+# ---------------------------------------------------------------------------
+
+from ass_render import _word_timings, _animated_word_payload  # noqa: E402
+
+
+def _dialogue(out):
+    return [l for l in out.splitlines() if l.startswith("Dialogue:")][0]
+
+
+def _ass(lines):
+    return build_ass(width=1920, height=1080, font_name="Oswald",
+                     base_fontsize=85, outline=2, shadow=3, lines=lines)
+
+
+def test_segments_to_lines_threads_animation_line_level():
+    segs = [{"text": "hola mundo", "start": 1.0, "end": 3.0}]
+    lines = segments_to_lines(segs, text_scale=1.0, animation="pop")
+    assert lines[0].animation == "pop"
+    assert lines[0].words is None  # line-level needs no word data
+
+
+def test_segments_to_lines_synthesizes_words_when_absent():
+    # The common production case: segments_json has no per-word array.
+    segs = [{"text": "uno dos tres", "start": 2.0, "end": 5.0}]
+    lines = segments_to_lines(segs, text_scale=1.0, animation="karaoke")
+    w = lines[0].words
+    assert w is not None and len(w) == 3
+    assert w[0]["start"] == pytest.approx(2.0)        # spans the line window
+    assert w[-1]["end"] == pytest.approx(5.0)
+    # monotonic, non-overlapping
+    assert w[0]["end"] <= w[1]["start"] <= w[1]["end"] <= w[2]["start"]
+
+
+def test_word_timings_uses_real_words_when_consistent():
+    raw = [{"word": "hola", "start": 1.0, "end": 1.4},
+           {"word": "mundo", "start": 1.5, "end": 2.0}]
+    w = _word_timings("hola mundo", 1.0, 2.0, raw)
+    assert [x["word"] for x in w] == ["hola", "mundo"]
+    assert w[0]["start"] == pytest.approx(1.0)
+    assert w[1]["end"] == pytest.approx(2.0)
+
+
+def test_word_timings_rejects_stale_words_and_synthesizes():
+    # Operator edited the line after Whisper → words don't match the text.
+    raw = [{"word": "viejo", "start": 1.0, "end": 1.4},
+           {"word": "texto", "start": 1.5, "end": 2.0}]
+    w = _word_timings("nuevo contenido", 1.0, 2.0, raw)
+    # Falls back to synthesis over the NEW tokens, not the stale words.
+    assert [x["word"] for x in w] == ["nuevo", "contenido"]
+
+
+def test_build_ass_pop_emits_scale_overshoot():
+    ln = AssLine(text="hola", start_s=1.0, end_s=3.0, fontsize=85,
+                 animation="pop")
+    d = _dialogue(_ass([ln]))
+    assert "\\fscx116\\fscy116" in d
+    assert d.count("\\t(") == 2          # overshoot + settle
+    assert "\\fscx100\\fscy100" in d
+
+
+def test_build_ass_glow_emits_blur_pingpong_outline_never_drops():
+    ln = AssLine(text="hola", start_s=1.0, end_s=3.0, fontsize=85,
+                 animation="glow")
+    d = _dialogue(_ass([ln]))
+    assert "\\blur2" in d and "\\blur6" in d
+    assert d.count("\\t(") == 2          # breathe in + out
+    # base outline (2) is the floor; the boost is 3.5, never below 2
+    assert "\\bord2" in d and "\\bord3.5" in d
+
+
+def test_build_ass_word_reveal_per_word_alpha_and_balanced_braces():
+    segs = [{"text": "uno dos tres", "start": 1.0, "end": 4.0}]
+    # The per-word reveal IS the entrance AND exit (words appear and leave one
+    # by one), so the line carries no \fad and each word has an enter + exit \t.
+    ln = segments_to_lines(segs, text_scale=1.0, animation="word_reveal",
+                           lyric_transition="fade")[0]
+    d = _dialogue(_ass([ln]))
+    assert d.count("\\alpha&H00&") == 3          # one reveal target per word
+    assert d.count("\\t(") == 6                    # enter + exit per word
+    # our control braces stay balanced (prefix block + 3 word blocks)
+    assert d.count("{") == d.count("}")
+    assert "\\fad(" not in d                       # per-word alpha owns enter+exit
+
+
+def test_build_ass_karaoke_emits_kf_and_color_split():
+    segs = [{"text": "uno dos", "start": 1.0, "end": 2.0}]
+    ln = segments_to_lines(segs, text_scale=1.0, animation="karaoke")[0]
+    d = _dialogue(_ass([ln]))
+    assert "\\2c&H00808080&" in d and "\\1c&H00FFFFFF&" in d  # unsung/sung
+    assert d.count("\\kf") == 2                   # one fill chunk per word
+    assert d.count("{") == d.count("}")
+
+
+def test_build_ass_word_anim_escapes_user_braces():
+    # User text with braces must be neutralized; our override braces survive.
+    segs = [{"text": "a {x} b", "start": 1.0, "end": 3.0}]
+    ln = segments_to_lines(segs, text_scale=1.0, animation="word_reveal")[0]
+    d = _dialogue(_ass([ln]))
+    assert "(x)" in d                             # user braces → parens
+    assert d.count("{") == d.count("}")           # still balanced
+
+
+def test_build_ass_none_animation_has_no_anim_tags():
+    # Regression: animation="none" must match the legacy output (no extra tags).
+    ln = AssLine(text="hola mundo", start_s=1.0, end_s=3.0, fontsize=85,
+                 animation="none", fade_in_ms=150, fade_out_ms=150)
+    d = _dialogue(_ass([ln]))
+    assert "\\t(" not in d and "\\kf" not in d
+    assert "\\fscx" not in d and "\\blur" not in d
+    assert d.endswith("hola mundo")
+    assert "\\fad(150,150)" in d
+
+
+# ---------------------------------------------------------------------------
+# Line-to-line MOTION transitions (orthogonal to animation, compose with it).
+# ---------------------------------------------------------------------------
+
+def _line(segs, **kw):
+    return segments_to_lines(segs, text_scale=1.0, **kw)[0]
+
+
+def test_build_ass_slide_up_emits_move_from_below():
+    segs = [{"text": "hola", "start": 1.0, "end": 5.0}]
+    d = _dialogue(_ass([_line(segs, transition="slide_up")]))
+    # center is (960,540) on 1920x1080; enters from below (py + offset)
+    assert "\\move(960,616,960,540,0," in d
+    assert "\\an5" in d
+
+
+def test_build_ass_slide_side_emits_horizontal_move():
+    segs = [{"text": "hola", "start": 1.0, "end": 5.0}]
+    d = _dialogue(_ass([_line(segs, transition="slide_side")]))
+    assert "\\move(" in d and ",540,960,540,0," in d   # same y, enters from left
+
+
+def test_build_ass_wipe_emits_animated_clip():
+    segs = [{"text": "hola", "start": 1.0, "end": 5.0}]
+    d = _dialogue(_ass([_line(segs, transition="wipe")]))
+    assert "\\clip(0,0,0,1080)" in d
+    assert "\\t(0," in d and "\\clip(0,0,1920,1080))" in d
+
+
+def test_build_ass_dissolve_blur_emits_blur_in_and_out():
+    segs = [{"text": "hola", "start": 1.0, "end": 5.0}]
+    d = _dialogue(_ass([_line(segs, transition="dissolve_blur")]))
+    assert "\\blur8" in d and "\\blur0" in d
+    assert d.count("\\t(") == 2          # focus-in + blur-out
+
+
+def test_word_reveal_adds_staggered_exit():
+    # Long enough line → words also fade OUT one by one (per-word exit \t).
+    segs = [{"text": "uno dos tres", "start": 1.0, "end": 6.0}]
+    d = _dialogue(_ass([_line(segs, animation="word_reveal")]))
+    # each word: enter \t(...\alpha&H00&) + exit \t(...\alpha&HFF&) = 2 per word
+    assert d.count("\\t(") == 6
+    assert d.count("\\alpha&H00&") == 3 and d.count("\\alpha&HFF&") == 6
+    # line carries NO \fad (per-word alpha owns enter+exit)
+    assert "\\fad(" not in d
+
+
+def test_transition_composes_with_animation():
+    # karaoke (colour/kf) + slide_up (\move) must both appear, no clash.
+    segs = [{"text": "uno dos", "start": 1.0, "end": 4.0}]
+    d = _dialogue(_ass([_line(segs, animation="karaoke", transition="slide_up")]))
+    assert "\\move(" in d              # transition
+    assert "\\kf" in d                 # animation
+    assert "\\2c&H00808080&" in d
+    assert d.count("{") == d.count("}")
+
+
+def test_transition_none_emits_no_motion_tags():
+    segs = [{"text": "hola", "start": 1.0, "end": 5.0}]
+    d = _dialogue(_ass([_line(segs, transition="none")]))
+    assert "\\move(" not in d and "\\clip(" not in d and "\\blur" not in d

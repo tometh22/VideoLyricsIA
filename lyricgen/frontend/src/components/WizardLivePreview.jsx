@@ -29,7 +29,7 @@ const MOVE_ANIM = {
   animado:        "wlp-anim 1.8s linear infinite",
 };
 
-export default function WizardLivePreview({ style = "auto", customColors = "", movementStyle = "", mode = "lyrics", lyric, clipSrc = "/movement_samples/estandar.mp4" }) {
+export default function WizardLivePreview({ style = "auto", customColors = "", movementStyle = "", lyricsAnimation = "none", lineTransition = "none", mode = "lyrics", lyric, clipSrc = "/movement_samples/estandar.mp4" }) {
   const { t } = useI18n();
   const isAnimado = movementStyle === "animado";
   const isMinimal = style === "minimal";
@@ -44,7 +44,9 @@ export default function WizardLivePreview({ style = "auto", customColors = "", m
   } else if (style === "auto" || !PALETTE_BG[style]) {
     bgGradient = "radial-gradient(120% 90% at 68% 18%, #3a1d6e 0%, #1a1140 45%, #06040f 100%)";
   }
-  const sample = (lyric || "").trim() || (t("upload.preview_sample") || "tu letra, en pantalla");
+  // A fixed generic phrase (3-4 words) so the preview reads the same for every
+  // song and demos the word-level animations well — not the track's own lyric.
+  const sample = t("upload.preview_sample") || "esta es tu letra";
   const moveLabel = {
     "": t("upload.movement_auto") || "Auto",
     estatico: t("upload.movement_estatico") || "Estático",
@@ -59,6 +61,52 @@ export default function WizardLivePreview({ style = "auto", customColors = "", m
     prompt: t("upload.bg_prompt_label") || "Mi prompt",
   }[mode] || "";
 
+  // Lyric-animation preview: mirrors how the chosen libass template will play.
+  // Word-level templates (karaoke/word_reveal) split the line into staggered
+  // spans; line-level (pop/glow) animate the whole line; none keeps the
+  // original entrance. Replays whenever the template or the sample changes.
+  const isWordAnim = lyricsAnimation === "karaoke" || lyricsAnimation === "word_reveal";
+  const lineAnim = {
+    pop: "wlp-pop .55s cubic-bezier(.2,1.4,.35,1) both",
+    glow: "wlp-lyric-in .7s cubic-bezier(.2,.8,.2,1) both, wlp-glow-text 2.4s 0.7s ease-in-out infinite",
+    none: "wlp-lyric-in .7s cubic-bezier(.2,.8,.2,1) both",
+  }[lyricsAnimation] || "wlp-lyric-in .7s cubic-bezier(.2,.8,.2,1) both";
+  const sampleWords = sample.split(/\s+/).filter(Boolean);
+  // Word-level templates LOOP continuously (a constant stagger keeps the words
+  // in lockstep) so the sweep/reveal is always visible — not a one-shot that
+  // finishes before the operator looks. Colours come from CSS vars so it reads
+  // on both dark and light (minimal) palettes.
+  const dim = isMinimal ? "rgba(0,0,0,.34)" : "rgba(255,255,255,.4)";
+  const lit = isMinimal ? "#0f9b83" : "#19E0BC";
+  const lyricContent = isWordAnim
+    ? sampleWords.map((w, i) => (
+        <span
+          key={i}
+          style={{
+            display: "inline-block",
+            marginRight: i < sampleWords.length - 1 ? "0.26em" : 0,
+            "--dim": dim,
+            "--lit": lit,
+            animation:
+              lyricsAnimation === "word_reveal"
+                ? `wlp-reveal-loop 3s ${i * 0.22}s infinite both`
+                : `wlp-karaoke-sweep 2.8s ${i * 0.24}s infinite both`,
+          }}
+        >
+          {w}
+        </span>
+      ))
+    : sample;
+
+  // Line transition (movement) plays on a wrapper so it composes with the
+  // inner animation. Loops continuously so it stays visible in the preview.
+  const transWrapAnim = {
+    slide_up: "wlp-trans-slideup 3.4s ease-in-out infinite",
+    slide_side: "wlp-trans-slideside 3.4s ease-in-out infinite",
+    wipe: "wlp-trans-wipe 3.4s ease-in-out infinite",
+    dissolve_blur: "wlp-trans-blur 3.4s ease-in-out infinite",
+  }[lineTransition];
+
   return (
     <div className="relative w-full aspect-video rounded-2xl overflow-hidden ring-1 ring-white/[0.08] shadow-[0_24px_70px_-24px_#000] bg-black select-none" style={{ containerType: "inline-size" }}>
       <style>{`
@@ -68,6 +116,26 @@ export default function WizardLivePreview({ style = "auto", customColors = "", m
         @keyframes wlp-anim { to { background-position: 52px 0; } }
         @keyframes wlp-glow { to { transform: translate(-34px,26px) scale(1.1); } }
         @keyframes wlp-lyric-in { from { opacity: 0; transform: translateY(14px); } to { opacity: 1; transform: translateY(0); } }
+        /* lyrics-animation templates (mirror the libass render) */
+        @keyframes wlp-pop { 0% { opacity: 0; transform: scale(1.16); } 55% { transform: scale(.96); } 80% { transform: scale(1.03); } 100% { opacity: 1; transform: scale(1); } }
+        @keyframes wlp-glow-text { 0%,100% { text-shadow: 0 6px 34px rgba(0,0,0,.7); } 50% { text-shadow: 0 0 20px rgba(20,200,168,.9), 0 6px 34px rgba(0,0,0,.7); } }
+        /* karaoke: a fill sweep passes word by word, then loops */
+        @keyframes wlp-karaoke-sweep {
+          0% { color: var(--dim); text-shadow: 0 6px 34px rgba(0,0,0,.6); }
+          18%, 78% { color: var(--lit); text-shadow: 0 0 16px rgba(25,224,188,.55), 0 6px 34px rgba(0,0,0,.6); }
+          100% { color: var(--dim); text-shadow: 0 6px 34px rgba(0,0,0,.6); }
+        }
+        /* word reveal: each word rises + fades in on its turn, then loops */
+        @keyframes wlp-reveal-loop {
+          0% { opacity: 0; transform: translateY(9px); }
+          12%, 86% { opacity: 1; transform: translateY(0); }
+          100% { opacity: 0; transform: translateY(9px); }
+        }
+        /* line transitions (movement) — loop enter/hold/exit */
+        @keyframes wlp-trans-slideup { 0% { transform: translateY(60%); opacity: 0; } 18%, 82% { transform: translateY(0); opacity: 1; } 100% { transform: translateY(-60%); opacity: 0; } }
+        @keyframes wlp-trans-slideside { 0% { transform: translateX(-70%); opacity: 0; } 18%, 82% { transform: translateX(0); opacity: 1; } 100% { transform: translateX(70%); opacity: 0; } }
+        @keyframes wlp-trans-wipe { 0% { clip-path: inset(0 100% 0 0); } 30%, 100% { clip-path: inset(0 0 0 0); } }
+        @keyframes wlp-trans-blur { 0% { filter: blur(10px); opacity: 0; } 26%, 80% { filter: blur(0); opacity: 1; } 100% { filter: blur(10px); opacity: 0; } }
       `}</style>
 
       {/* REAL Veo clip of the SELECTED movement style as the base — the
@@ -82,20 +150,23 @@ export default function WizardLivePreview({ style = "auto", customColors = "", m
       {/* palette / mood color-grade over the footage */}
       <div className="absolute inset-0 pointer-events-none" style={{ background: bgGradient, mixBlendMode: isMinimal ? "screen" : "color", opacity: isMinimal ? 0.55 : 0.55 }} />
       <div className="absolute inset-0 pointer-events-none" style={{ background: bgGradient, mixBlendMode: "soft-light", opacity: 0.4 }} />
-      {/* bottom darken for lyric legibility */}
-      <div className="absolute inset-x-0 bottom-0 h-2/3 pointer-events-none" style={{ background: "linear-gradient(to top, rgba(0,0,0,.62), transparent)" }} />
+      {/* center scrim for lyric legibility (text is centered now) */}
+      <div className="absolute inset-0 pointer-events-none" style={{ background: "radial-gradient(60% 42% at 50% 50%, rgba(0,0,0,.5), transparent 75%)" }} />
       {/* film grain + vignette */}
       <div className="absolute inset-0 pointer-events-none" style={{ background: "repeating-linear-gradient(0deg,transparent 0 2px,rgba(255,255,255,.022) 2px 3px)" }} />
       <div className="absolute inset-0 pointer-events-none" style={{ background: "radial-gradient(120% 80% at 50% 50%, transparent 55%, rgba(0,0,0,.55))" }} />
 
-      {/* lyric */}
-      <div className="absolute inset-x-0 bottom-[20%] px-[8%] text-center">
-        <div
-          key={sample}
-          className={`font-extrabold tracking-[-0.03em] leading-[1.02] ${isMinimal ? "text-gray-900" : "text-white"}`}
-          style={{ fontSize: "clamp(18px,7.5cqw,68px)", textShadow: isMinimal ? "0 1px 12px rgba(255,255,255,.4)" : "0 6px 34px rgba(0,0,0,.7)", animation: "wlp-lyric-in .7s cubic-bezier(.2,.8,.2,1) both" }}
-        >
-          {sample}
+      {/* lyric — vertically centered, mirroring the real render (\an5 center) */}
+      <div className="absolute inset-0 flex items-center justify-center px-[8%] text-center">
+        {/* transition wrapper (movement) composes with the inner animation */}
+        <div key={`${lineTransition}:${sample}`} style={{ animation: transWrapAnim }}>
+          <div
+            key={`${lyricsAnimation}:${sample}`}
+            className={`font-extrabold tracking-[-0.03em] leading-[1.02] ${isMinimal ? "text-gray-900" : "text-white"}`}
+            style={{ fontSize: "clamp(18px,7.5cqw,68px)", textShadow: isMinimal ? "0 1px 12px rgba(255,255,255,.4)" : "0 6px 34px rgba(0,0,0,.7)", animation: isWordAnim ? undefined : lineAnim }}
+          >
+            {lyricContent}
+          </div>
         </div>
       </div>
 

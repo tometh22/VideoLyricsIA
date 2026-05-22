@@ -184,7 +184,7 @@ export default function UploadZone({
   const BATCH_DEFAULTS_STORAGE_KEY = "genly:wizardBatchDefaultsV1";
   const HARDCODED_BATCH_DEFAULTS = {
     genre: "", concept: "", movementStyle: "", font: "",
-    textCase: "upper", fontScale: "1.0", lyricTransition: "cut", textMotion: "none", textContrast: "medium",
+    textCase: "upper", fontScale: "1.0", lyricTransition: "cut", textMotion: "none", lyricsAnimation: "none", lineTransition: "none", textContrast: "medium",
     // Escena axis: optional free-text prompt ("Mi prompt"). When non-empty it
     // overrides genre/concept/lyrics. bgVerbatim TRUE by default = use the
     // operator's text as-is (people expect their prompt used, not rewritten);
@@ -255,13 +255,18 @@ export default function UploadZone({
     { id: 1, label: t("upload.step_upload") || "Subí" },
     { id: 2, label: t("upload.step_mode") || "Modo" },
     { id: 3, label: t("upload.step_motion") || "Movimiento" },
-    { id: 4, label: t("upload.step_deliver") || "Entregá" },
+    { id: 4, label: t("upload.step_animation") || "Animación" },
+    { id: 5, label: t("upload.step_deliver") || "Entregá" },
   ];
   const [wizardStep, setWizardStep] = useState(1);
   const goStep = (n) => setWizardStep(Math.max(1, Math.min(WIZARD_STEPS.length, n)));
 
   // Hovering a movement option previews it in the big stage without committing.
   const [hoverMovement, setHoverMovement] = useState(null);
+  // Same for the lyrics-animation step: hover previews the template live.
+  const [hoverAnimation, setHoverAnimation] = useState(null);
+  // And for the line-transition picker (lives in the same Animación step).
+  const [hoverTransition, setHoverTransition] = useState(null);
   // Abstract motion icons — communicate the camera MOVEMENT, not a fake scene.
   // The big live preview is what actually demonstrates the motion.
   const movIcon = (code) => {
@@ -280,6 +285,52 @@ export default function UploadZone({
       default: // auto — sparkle
         return (<svg {...p}><path d="M12 4l1.4 4 4 1.4-4 1.4L12 15l-1.4-4-4-1.4 4-1.4z" /><path d="M18 14l.6 1.7 1.7.6-1.7.6L18 18.6l-.6-1.7-1.7-.6 1.7-.6z" /></svg>);
     }
+  };
+
+  // Looping mini-demo of a lyrics-animation template, shown inside each card.
+  // The big WizardLivePreview (←) shows the chosen one full-size; these just
+  // hint the motion. CSS keyframes are injected once in the Animación step.
+  const animDemo = (code) => {
+    const base = "font-extrabold tracking-tight text-white text-[15px] leading-none";
+    if (code === "karaoke") {
+      return (
+        <span className={base}>
+          {["tu", "letra"].map((w, i) => (
+            <span key={i} style={{ animation: `acard-karaoke 2.4s ${i * 0.5}s infinite`, marginRight: i === 0 ? "0.28em" : 0, display: "inline-block" }}>{w}</span>
+          ))}
+        </span>
+      );
+    }
+    if (code === "word_reveal") {
+      return (
+        <span className={base}>
+          {["tu", "letra"].map((w, i) => (
+            <span key={i} style={{ animation: `acard-word 2.6s ${i * 0.45}s infinite`, marginRight: i === 0 ? "0.28em" : 0, display: "inline-block" }}>{w}</span>
+          ))}
+        </span>
+      );
+    }
+    const anim =
+      code === "pop" ? "acard-pop 2.2s infinite" :
+      code === "glow" ? "acard-glow 2.4s ease-in-out infinite" :
+      "acard-word 2.8s infinite"; // none → simple fade loop
+    return <span className={base} style={{ animation: anim, display: "inline-block" }}>Letra</span>;
+  };
+
+  // Looping mini-demo of a line transition (movement), shown inside its card.
+  const transDemo = (code) => {
+    const base = "font-extrabold tracking-tight text-white text-[15px] leading-none";
+    const anim =
+      code === "slide_up" ? "tcard-slideup 2.4s infinite" :
+      code === "slide_side" ? "tcard-slideside 2.4s infinite" :
+      code === "wipe" ? "tcard-wipe 2.6s infinite" :
+      code === "dissolve_blur" ? "tcard-blur 2.6s infinite" :
+      "acard-word 2.8s infinite"; // none → simple fade
+    return (
+      <span className="overflow-hidden inline-block">
+        <span className={base} style={{ animation: anim, display: "inline-block" }}>Letra</span>
+      </span>
+    );
   };
 
   // Set of track indices with the inline "Personalizar" drawer open.
@@ -405,6 +456,30 @@ export default function UploadZone({
     { code: "estandar",      label: t("upload.movement_estandar") || "Estándar (cinematográfico)", sample: "/movement_samples/estandar.mp4", desc: t("upload.movement_estandar_desc") || "Movimiento de cámara cinematográfico (zoom/drift)." },
     { code: "foto-parallax", label: t("upload.movement_foto_parallax") || "Foto + parallax",     sample: "/movement_samples/foto-parallax.mp4", desc: t("upload.movement_parallax_desc") || "Foto con sensación de profundidad (paneo lento)." },
     { code: "animado",       label: t("upload.movement_animado") || "Animado (ilustración)",     sample: "/movement_samples/animado.mp4",   desc: t("upload.movement_animado_desc") || "Ilustración 2D estilizada, no fotorrealista." },
+  ];
+
+  // Lyrics-animation templates. These are rendered as libass override tags in
+  // the same single ffmpeg pass as the static text → zero impact on render
+  // speed/quality (no moviepy slow path). 🎤 = word-level: needs per-word
+  // timing, which the backend SYNTHESIZES from the line window when real word
+  // data is absent, so every template works on any song.
+  const LYRICS_ANIMATIONS = [
+    { code: "none",        emoji: "",   label: t("upload.anim_none") || "Ninguna",   desc: t("upload.anim_none_desc") || "Fade clásico por línea." },
+    { code: "karaoke",     emoji: "🎤", label: t("upload.anim_karaoke") || "Karaoke", desc: t("upload.anim_karaoke_desc") || "Las palabras se colorean al ritmo que se cantan." },
+    { code: "word_reveal", emoji: "🎤", label: t("upload.anim_reveal") || "Revelado", desc: t("upload.anim_reveal_desc") || "Cada palabra aparece justo cuando se canta." },
+    { code: "pop",         emoji: "",   label: t("upload.anim_pop") || "Pop",        desc: t("upload.anim_pop_desc") || "La línea entra con un pequeño rebote." },
+    { code: "glow",        emoji: "",   label: t("upload.anim_glow") || "Glow",      desc: t("upload.anim_glow_desc") || "Brillo suave que late. Atmosférico." },
+  ];
+
+  // Line-to-line MOTION transitions. Orthogonal to the animation (they use
+  // position/clip/blur, not scale/colour) so any combination composes. Also
+  // libass tags in the same single pass → no pipeline/speed impact.
+  const LINE_TRANSITIONS = [
+    { code: "none",          label: t("upload.trans_none") || "Corte",       desc: t("upload.trans_none_desc") || "Sin movimiento entre líneas." },
+    { code: "slide_up",      label: t("upload.trans_slide_up") || "Slide ↑", desc: t("upload.trans_slide_up_desc") || "La línea entra desde abajo subiendo." },
+    { code: "slide_side",    label: t("upload.trans_slide_side") || "Slide →", desc: t("upload.trans_slide_side_desc") || "La línea entra desde un costado." },
+    { code: "wipe",          label: t("upload.trans_wipe") || "Wipe",        desc: t("upload.trans_wipe_desc") || "Se descubre de izquierda a derecha." },
+    { code: "dissolve_blur", label: t("upload.trans_blur") || "Disolvencia", desc: t("upload.trans_blur_desc") || "Entra desenfocada y se enfoca." },
   ];
 
   // Visual concept for the AI background. Operator-controlled; when set
@@ -982,6 +1057,8 @@ export default function UploadZone({
           (entry.fontScale    || "1.0")   !== (bd.fontScale    || "1.0")   ||
           (entry.lyricTransition || "cut") !== (bd.lyricTransition || "cut") ||
           (entry.textMotion   || "none")  !== (bd.textMotion   || "none")  ||
+          (entry.lyricsAnimation || "none") !== (bd.lyricsAnimation || "none") ||
+          (entry.lineTransition || "none") !== (bd.lineTransition || "none") ||
           (entry.textContrast || "medium") !== (bd.textContrast || "medium");
 
         return (
@@ -1108,6 +1185,14 @@ export default function UploadZone({
                       <div className="flex items-center gap-2">
                         <span className="text-[11px] text-gray-600 shrink-0">{t("upload.movement_label") || "Movimiento:"}</span>
                         <Listbox value={entry.movementStyle || ""} onChange={(v) => updateField(i, "movementStyle", v)} options={MOVEMENT_STYLES} className="flex-1" ariaLabel={t("upload.movement_label")} />
+                      </div>
+                      <div className="flex items-center gap-2">
+                        <span className="text-[11px] text-gray-600 shrink-0">{t("upload.animation_label") || "Animación:"}</span>
+                        <Listbox value={entry.lyricsAnimation || "none"} onChange={(v) => updateField(i, "lyricsAnimation", v)} options={LYRICS_ANIMATIONS} className="flex-1" ariaLabel={t("upload.animation_label") || "Animación"} />
+                      </div>
+                      <div className="flex items-center gap-2">
+                        <span className="text-[11px] text-gray-600 shrink-0">{t("upload.transition_label") || "Transición:"}</span>
+                        <Listbox value={entry.lineTransition || "none"} onChange={(v) => updateField(i, "lineTransition", v)} options={LINE_TRANSITIONS} className="flex-1" ariaLabel={t("upload.transition_label") || "Transición"} />
                       </div>
                     </>
                   )}
@@ -1597,6 +1682,8 @@ export default function UploadZone({
               style={style}
               customColors={customColors}
               movementStyle={hoverMovement ?? batchDefaults.movementStyle}
+              lyricsAnimation={hoverAnimation ?? batchDefaults.lyricsAnimation}
+              lineTransition={hoverTransition ?? batchDefaults.lineTransition}
               mode={sceneMode}
               lyric={_previewLyric}
               clipSrc={(MOVEMENT_STYLES.find((m) => m.code === (hoverMovement ?? batchDefaults.movementStyle))?.sample) || "/movement_samples/estandar.mp4"}
@@ -1789,8 +1876,108 @@ export default function UploadZone({
           {/* STEP 3 — Movimiento + metadata */}
           {wizardStep === 3 && _batchSettingsBlock}
 
-          {/* STEP 4 — Entregá: delivery + final recap */}
+          {/* STEP 4 — Animación: lyrics animation template (libass, fast path) */}
           {wizardStep === 4 && (
+            <div className="rounded-card bg-surface-2/40 ring-1 ring-white/[0.04] p-4">
+              <style>{`
+                @keyframes acard-pop { 0%{transform:scale(1.18);opacity:0} 55%{transform:scale(.95)} 80%{transform:scale(1.03)} 100%{transform:scale(1);opacity:1} }
+                @keyframes acard-glow { 0%,100%{text-shadow:0 1px 6px rgba(0,0,0,.6)} 50%{text-shadow:0 0 13px rgba(20,200,168,.95),0 1px 6px rgba(0,0,0,.6)} }
+                @keyframes acard-word { 0%,12%{opacity:0;transform:translateY(5px)} 34%,100%{opacity:1;transform:translateY(0)} }
+                @keyframes acard-karaoke { 0%,8%{color:#7c7c8a} 42%,100%{color:#fff} }
+                @keyframes tcard-slideup { 0%{transform:translateY(120%);opacity:0} 22%,88%{transform:translateY(0);opacity:1} 100%{transform:translateY(-120%);opacity:0} }
+                @keyframes tcard-slideside { 0%{transform:translateX(-130%);opacity:0} 22%,88%{transform:translateX(0);opacity:1} 100%{transform:translateX(130%);opacity:0} }
+                @keyframes tcard-wipe { 0%{clip-path:inset(0 100% 0 0)} 35%,100%{clip-path:inset(0 0 0 0)} }
+                @keyframes tcard-blur { 0%{filter:blur(6px);opacity:0} 30%,80%{filter:blur(0);opacity:1} 100%{filter:blur(6px);opacity:0} }
+              `}</style>
+              <p className="text-[11px] text-gray-300 font-medium">{t("upload.step_animation") || "Animación"} de la letra</p>
+              <p className="text-[10px] text-gray-600 mt-0.5 mb-3">
+                {t("upload.anim_gallery_desc") || "Cómo aparecen las palabras sobre el video. Pasá el mouse o elegí y miralo en el preview ←"}
+              </p>
+              <div className="grid grid-cols-2 sm:grid-cols-3 gap-2">
+                {LYRICS_ANIMATIONS.map((a) => {
+                  const active = batchDefaults.lyricsAnimation === a.code;
+                  return (
+                    <button
+                      key={a.code}
+                      type="button"
+                      onClick={() => updateBatchDefault("lyricsAnimation", a.code)}
+                      onMouseEnter={() => setHoverAnimation(a.code)}
+                      onMouseLeave={() => setHoverAnimation(null)}
+                      aria-label={`${a.label}: ${a.desc}`}
+                      title={a.desc}
+                      className={`text-left rounded-xl overflow-hidden border transition-all duration-200 cursor-pointer ${
+                        active
+                          ? "border-transparent ring-1 ring-brand/50 shadow-glow"
+                          : "border-white/[0.06] hover:border-white/[0.20]"
+                      }`}
+                    >
+                      <div className="aspect-video relative overflow-hidden grid place-items-center" style={{ background: "radial-gradient(120% 100% at 50% 0,#1a1430,#0b0820)" }}>
+                        {animDemo(a.code)}
+                        {active && (
+                          <div className="absolute top-1.5 right-1.5 w-5 h-5 rounded-full bg-brand grid place-items-center shadow">
+                            <svg className="w-3 h-3 text-white" fill="none" stroke="currentColor" strokeWidth="3" viewBox="0 0 24 24"><polyline points="20 6 9 17 4 12" /></svg>
+                          </div>
+                        )}
+                      </div>
+                      <div className="px-2.5 py-2 bg-surface-1">
+                        <p className={`text-[12px] font-medium leading-tight ${active ? "text-white" : "text-gray-200"}`}>
+                          {a.emoji ? `${a.emoji} ` : ""}{a.label}
+                        </p>
+                        <p className="text-[10px] text-gray-500 leading-snug mt-0.5">{a.desc}</p>
+                      </div>
+                    </button>
+                  );
+                })}
+              </div>
+              <p className="text-[10px] text-gray-600 mt-2">
+                🎤 {t("upload.anim_word_note") || "Funcionan en toda canción — el tiempo por palabra se calcula automáticamente."}
+              </p>
+
+              {/* Transición entre líneas — eje aparte, compone con la animación */}
+              <div className="mt-4 pt-3 border-t border-white/[0.05]">
+                <p className="text-[11px] text-gray-300 font-medium">{t("upload.transition_title") || "Transición entre líneas"}</p>
+                <p className="text-[10px] text-gray-600 mt-0.5 mb-3">
+                  {t("upload.transition_desc") || "Cómo entra y sale cada línea. Se combina con la animación elegida."}
+                </p>
+                <div className="grid grid-cols-3 sm:grid-cols-5 gap-2">
+                  {LINE_TRANSITIONS.map((tr) => {
+                    const active = (batchDefaults.lineTransition || "none") === tr.code;
+                    return (
+                      <button
+                        key={tr.code}
+                        type="button"
+                        onClick={() => updateBatchDefault("lineTransition", tr.code)}
+                        onMouseEnter={() => setHoverTransition(tr.code)}
+                        onMouseLeave={() => setHoverTransition(null)}
+                        aria-label={`${tr.label}: ${tr.desc}`}
+                        title={tr.desc}
+                        className={`text-left rounded-xl overflow-hidden border transition-all duration-200 cursor-pointer ${
+                          active
+                            ? "border-transparent ring-1 ring-brand/50 shadow-glow"
+                            : "border-white/[0.06] hover:border-white/[0.20]"
+                        }`}
+                      >
+                        <div className="aspect-video relative overflow-hidden grid place-items-center" style={{ background: "radial-gradient(120% 100% at 50% 0,#1a1430,#0b0820)" }}>
+                          {transDemo(tr.code)}
+                          {active && (
+                            <div className="absolute top-1.5 right-1.5 w-4 h-4 rounded-full bg-brand grid place-items-center shadow">
+                              <svg className="w-2.5 h-2.5 text-white" fill="none" stroke="currentColor" strokeWidth="3" viewBox="0 0 24 24"><polyline points="20 6 9 17 4 12" /></svg>
+                            </div>
+                          )}
+                        </div>
+                        <div className="px-2 py-1.5 bg-surface-1">
+                          <p className={`text-[11px] font-medium leading-tight ${active ? "text-white" : "text-gray-200"}`}>{tr.label}</p>
+                        </div>
+                      </button>
+                    );
+                  })}
+                </div>
+              </div>
+            </div>
+          )}
+
+          {/* STEP 5 — Entregá: delivery + final recap */}
+          {wizardStep === 5 && (
             <>
               {user?.features?.prores_export && _deliveryBlock}
               <div className="rounded-card bg-surface-2/40 ring-1 ring-white/[0.04] px-4 py-3">
