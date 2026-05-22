@@ -1,0 +1,128 @@
+"""Effect-overlay + color-grade compositing for the single-pass lyric render.
+
+The render burns lyrics with libass in ONE ffmpeg pass (see pipeline.py
+`_render_lyrics_ass`). This module builds the video filter for that pass,
+optionally adding two layers BEFORE the subtitles burn:
+
+  1. EFFECT overlay (snow / rain / stars / bokeh / light): a pre-baked,
+     seamless, black-background RGB loop at assets/fx/<effect>.mp4 (built once
+     by scripts/gen_fx_loops.py), composited with `blend=all_mode=screen`.
+     Effects are ADDITIVE (light-emitting), so screen-blend over black needs no
+     alpha channel — plain H.264, fast to decode.
+
+     CRITICAL: the blend MUST run in RGB (`format=gbrp`). In YUV, `blend=screen`
+     operates on the chroma (U/V) planes and tints the whole frame magenta.
+     Output is converted back to yuv420p before the subtitles burn. (Verified
+     2026-05-22 — the magenta bug.)
+
+  2. GRADE (eq): a real post color grade derived from the palette, so `style`
+     finally affects the rendered pixels (until now it only nudged the prompt).
+
+Layer order in one pass:  bg → [effect screen-blend] → [grade] → subtitles.
+
+This module is intentionally a leaf (no pipeline import) so it stays unit-
+testable without moviepy/ffmpeg. The caller (pipeline) splices the returned
+filter + extra inputs into its ffmpeg command.
+"""
+import os
+
+_FX_DIR = os.path.join(os.path.dirname(__file__), "..", "assets", "fx")
+
+# Available pre-baked effect loops (must match scripts/gen_fx_loops.py).
+EFFECTS = ("snow", "rain", "stars", "bokeh", "light")
+
+# palette code → ffmpeg `eq` grade. "" / "auto" / unknown → no grade
+# (scene-natural). Mirrors the frontend STYLES codes used elsewhere.
+_GRADE = {
+    "oscuro": "eq=contrast=1.12:brightness=-0.03:saturation=1.10",
+    "neon": "eq=contrast=1.10:saturation=1.35",
+    "minimal": "eq=contrast=1.04:saturation=0.90",
+    "calido": "eq=contrast=1.06:saturation=1.14:gamma_r=1.05:gamma_b=0.96",
+}
+
+
+def effect_path(effect: str) -> str | None:
+    """Absolute path to the baked loop for `effect`, or None if unset/missing."""
+    if not effect:
+        return None
+    name = effect.strip().lower()
+    if name not in EFFECTS:
+        return None
+    p = os.path.abspath(os.path.join(_FX_DIR, f"{name}.mp4"))
+    return p if os.path.exists(p) else None
+
+
+def grade_filter(style: str, custom_colors: str = "") -> str:
+    """ffmpeg `eq` grade string for the palette, or '' for auto/none.
+
+    custom_colors grading (LUT from arbitrary hex) is deferred to a later phase;
+    for now custom palettes fall through to no post-grade (the prompt still
+    steers the generated scene's colors)."""
+    return _GRADE.get((style or "").strip().lower(), "")
+
+
+# Numpy equivalent of the `eq` presets for the moviepy render path (which can't
+# use the ffmpeg eq filter). (contrast, saturation, brightness_delta_0_255).
+# Kept alongside _GRADE so both render paths apply the SAME palette grade.
+_GRADE_NUMPY = {
+    "oscuro": (1.12, 1.10, -8.0),
+    "neon": (1.10, 1.35, 0.0),
+    "minimal": (1.04, 0.90, 0.0),
+    "calido": (1.06, 1.14, 0.0),
+}
+
+
+def grade_frame(frame, style: str):
+    """Apply the palette grade (contrast/saturation/brightness) to a float RGB
+    numpy frame, for the moviepy path. Returns the frame unchanged for auto/
+    unknown palettes. Mirrors `grade_filter`'s ffmpeg `eq` as closely as numpy
+    allows (not bit-identical, same intent)."""
+    import numpy as np
+    p = _GRADE_NUMPY.get((style or "").strip().lower())
+    if not p:
+        return frame
+    contrast, sat, bright = p
+    f = (frame - 127.5) * contrast + 127.5 + bright
+    luma = (0.299 * f[:, :, 0] + 0.587 * f[:, :, 1] + 0.114 * f[:, :, 2])
+    f = luma[:, :, None] + (f - luma[:, :, None]) * sat
+    return f
+
+
+def _escape_filter_path(p: str) -> str:
+    """Escape a path for use as an ffmpeg filter option value (subtitles/
+    fontsdir). Backslash first, then the filtergraph delimiters."""
+    return p.replace("\\", "\\\\").replace(":", "\\:").replace("'", "\\'")
+
+
+def build_video_filter(*, ass_basename: str, font_dir: str, width: int,
+                       height: int, effect: str = "", style: str = "",
+                       custom_colors: str = ""):
+    """Build the video filter for the single-pass libass render.
+
+    Returns (filter_str, use_complex, extra_inputs):
+      - No effect → ('<grade>,subtitles=…' , False, [])
+            caller uses:  -vf <filter_str> -map 0:v -map 1:a
+      - Effect    → ('<filter_complex>', True, ['-stream_loop','-1','-i',<fx>])
+            caller uses:  -filter_complex <filter_str> -map [out] -map 1:a
+
+    Input index contract: bg=0, audio=1, fx=2 (the extra_inputs are appended
+    AFTER the bg and audio inputs in the ffmpeg command).
+    """
+    subs = f"subtitles={ass_basename}:fontsdir={_escape_filter_path(font_dir)}"
+    grade = grade_filter(style, custom_colors)
+    fx = effect_path(effect)
+
+    if not fx:
+        # No effect: keep the original cheap -vf path (optionally graded).
+        vf = f"{grade},{subs}" if grade else subs
+        return vf, False, []
+
+    grade_step = f"{grade}," if grade else ""
+    fc = (
+        f"[0:v]format=gbrp[bg];"
+        f"[2:v]scale={width}:{height},setpts=PTS-STARTPTS,format=gbrp[fx];"
+        f"[bg][fx]blend=all_mode=screen:shortest=1[bl];"
+        f"[bl]{grade_step}format=yuv420p[gr];"
+        f"[gr]{subs}[out]"
+    )
+    return fc, True, ["-stream_loop", "-1", "-i", fx]

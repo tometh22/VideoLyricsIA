@@ -10,6 +10,8 @@ lyricgen/frontend/dist/
 lyricgen/nginx/ssl/*.pem
 lyricgen/nginx/ssl/*.key
 lyricgen/.env
+lyricgen/frontend/.env.local
+lyricgen/frontend/.env.*.local
 docs/pitch/node_modules/
 __pycache__/
 *.pyc

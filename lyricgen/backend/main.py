@@ -2645,15 +2645,19 @@ async def upload(
     font: str = Form("", max_length=64),
     concept: str = Form("", max_length=2000),
     movement_style: str = Form("", max_length=64),
+    effect: str = Form("", max_length=32),
     animate_image: str = Form("", max_length=8),
     text_case: str = Form("upper", max_length=16),
     font_scale: str = Form("1.0", max_length=8),
     lyric_transition: str = Form("cut", max_length=16),
     text_motion: str = Form("none", max_length=16),
+    lyrics_animation: str = Form("none", max_length=16),
+    line_transition: str = Form("none", max_length=16),
     text_contrast: str = Form("medium", max_length=16),
     match_lyrics: bool = Form(True),
     background_hint: str = Form("", max_length=2000),
     bg_verbatim: bool = Form(False),
+    custom_colors: str = Form("", max_length=200),
     current_user: dict = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
@@ -2798,16 +2802,20 @@ async def upload(
         font=font,
         concept=concept,
         movement_style=movement_style,
+        effect=effect,
         animate_image=str(animate_image).strip().lower() in ("true", "1", "yes", "on"),
         song_title=song_title,
         text_case=text_case if text_case in ("upper", "title", "lower", "original") else "upper",
         font_scale=_font_scale,
         lyric_transition=lyric_transition if lyric_transition in ("cut", "fade", "fade_slow") else "cut",
         text_motion=text_motion if text_motion in ("none", "subtle", "float") else "none",
+        lyrics_animation=lyrics_animation if lyrics_animation in ("none", "karaoke", "word_reveal", "pop", "glow") else "none",
+        line_transition=line_transition if line_transition in ("none", "slide_up", "slide_side", "wipe", "dissolve_blur") else "none",
         text_contrast=text_contrast if text_contrast in ("subtle", "medium", "strong") else "medium",
         match_lyrics=match_lyrics,
         background_hint=(background_hint.strip() or None),
         bg_verbatim=bg_verbatim,
+        custom_colors=(custom_colors.strip() or ""),
     )
 
     return {"job_id": job_id, "status": initial_status}
@@ -3560,15 +3568,19 @@ async def generate_with_segments(
     font: str = Form("", max_length=64),
     concept: str = Form("", max_length=2000),
     movement_style: str = Form("", max_length=64),
+    effect: str = Form("", max_length=32),
     animate_image: str = Form("", max_length=8),
     text_case: str = Form("upper", max_length=16),
     font_scale: str = Form("1.0", max_length=8),
     lyric_transition: str = Form("cut", max_length=16),
     text_motion: str = Form("none", max_length=16),
+    lyrics_animation: str = Form("none", max_length=16),
+    line_transition: str = Form("none", max_length=16),
     text_contrast: str = Form("medium", max_length=16),
     match_lyrics: bool = Form(True),
     background_hint: str = Form("", max_length=2000),
     bg_verbatim: bool = Form(False),
+    custom_colors: str = Form("", max_length=200),
     current_user: dict = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
@@ -3791,16 +3803,20 @@ async def generate_with_segments(
         font=font,
         concept=concept,
         movement_style=movement_style,
+        effect=effect,
         animate_image=str(animate_image).strip().lower() in ("true", "1", "yes", "on"),
         song_title=song_title,
         text_case=text_case if text_case in ("upper", "title", "lower", "original") else "upper",
         font_scale=_font_scale_gen,
         lyric_transition=lyric_transition if lyric_transition in ("cut", "fade", "fade_slow") else "cut",
         text_motion=text_motion if text_motion in ("none", "subtle", "float") else "none",
+        lyrics_animation=lyrics_animation if lyrics_animation in ("none", "karaoke", "word_reveal", "pop", "glow") else "none",
+        line_transition=line_transition if line_transition in ("none", "slide_up", "slide_side", "wipe", "dissolve_blur") else "none",
         text_contrast=text_contrast if text_contrast in ("subtle", "medium", "strong") else "medium",
         match_lyrics=match_lyrics,
         background_hint=(background_hint.strip() or None),
         bg_verbatim=bg_verbatim,
+        custom_colors=(custom_colors.strip() or ""),
     )
 
     return {"job_id": job_id, "status": initial_status}
@@ -5939,7 +5955,8 @@ async def retry_job(
     for k in ("font", "font_scale", "text_case", "lyric_transition",
               "text_motion", "text_contrast", "movement_style",
               "animate_image", "genre", "match_lyrics",
-              "background_hint", "concept", "bg_verbatim"):
+              "background_hint", "concept", "bg_verbatim",
+              "effect", "custom_colors"):
         if k in _retry_render_params and _retry_render_params[k] not in (None, ""):
             retry_pipeline_kwargs[k] = _retry_render_params[k]
 

@@ -165,6 +165,42 @@ def test_ensure_background_downgrades_animado_imagen_to_veo():
 
 
 # ---------------------------------------------------------------------------
+# 5b. Calm registers → Imagen + deterministic camera (Veo won't hold the camera
+#     still — measured 2026-05-22: it pushes in ~half the time even when told
+#     not to). estatico=static, sutil=subtle drift, foto-parallax=lateral pan.
+# ---------------------------------------------------------------------------
+
+def test_ken_burns_accepts_lateral_and_subtle_flags():
+    for fn in (pipeline._ken_burns_clip, pipeline._ken_burns_image_to_mp4):
+        params = inspect.signature(fn).parameters
+        assert "lateral" in params and "subtle" in params, fn.__name__
+
+
+def test_ensure_background_routes_calm_registers_to_imagen():
+    """estatico / sutil / foto-parallax all force the Imagen path with their own
+    deterministic Ken Burns mode — never Veo, which can't hold the camera."""
+    src = inspect.getsource(pipeline._ensure_background)
+    assert '_norm_move_bg in ("estatico", "sutil")' in src
+    assert '_norm_move_bg == "foto-parallax"' in src
+    assert 'bg_mode = "imagen"' in src
+    # Each register maps to its own Ken Burns mode in the Imagen call.
+    assert 'static=(_norm_move_bg == "estatico")' in src
+    assert 'subtle=(_norm_move_bg == "sutil")' in src
+    assert 'lateral=(_norm_move_bg == "foto-parallax")' in src
+
+
+def test_ken_burns_pan_modes_have_no_zoom():
+    """lateral and subtle are pans over a FIXED inward crop — constant scale, no
+    per-frame zoom (so the camera never advances). static stays frozen."""
+    src = inspect.getsource(pipeline._ken_burns_clip)
+    assert "make_pan_frame" in src
+    pan_block = src.split("if not static and (lateral or subtle):")[1].split("\n    if static:")[0]
+    assert "scale, amp_x, amp_y = 1.18" in pan_block  # lateral: full horizontal, fixed scale
+    assert "scale, amp_x, amp_y = 1.10" in pan_block  # subtle: low amplitude, fixed scale
+    assert "zoom_in" not in pan_block                 # no zoom animation in either
+
+
+# ---------------------------------------------------------------------------
 # 6. de-biased combinatorial fallback
 # ---------------------------------------------------------------------------
 
@@ -194,6 +230,30 @@ def test_retry_whitelist_includes_bg_verbatim():
     assert '"bg_verbatim"' in src
 
 
+def test_color_directive_auto_imposes_nothing():
+    """Auto / empty palette must NOT constrain colors (scene-natural)."""
+    assert pipeline._color_directive("auto", "") == ""
+    assert pipeline._color_directive("", "") == ""
+
+
+def test_color_directive_preset_and_custom():
+    # Preset → mood hint.
+    d = pipeline._color_directive("oscuro", "")
+    assert "COLOR DIRECTION" in d and "purple" in d.lower()
+    # Custom colors win over preset and are passed through verbatim.
+    d2 = pipeline._color_directive("oscuro", "#ff3366, teal")
+    assert "#ff3366, teal" in d2 and "dominant colors" in d2.lower()
+
+
+def test_color_threads_into_analyze_signature():
+    import inspect
+    sig = inspect.signature(pipeline._analyze_lyrics_for_background)
+    assert "style" in sig.parameters and "custom_colors" in sig.parameters
+    # And the Gemini prompt builder actually appends the directive.
+    src = inspect.getsource(pipeline._analyze_lyrics_for_background)
+    assert "_color_directive(" in src
+
+
 def test_static_camera_pool_has_no_motion_verbs():
     motion_words = ("dolly", "drone", "tracking", "orbit", "zoom", "pan",
                     "crane", "parallax", "glide", "push-in")
@@ -203,3 +263,68 @@ def test_static_camera_pool_has_no_motion_verbs():
         assert not any(w in low for w in motion_words), (
             f"static camera entry must not contain a motion verb: {cam!r}"
         )
+
+
+# ---------------------------------------------------------------------------
+# 7. forward-travel legibility cap (UMG 2026-05-21: "marean cuando lees la letra")
+# ---------------------------------------------------------------------------
+
+def test_motion_camera_pool_has_no_forward_travel():
+    """The lyrics are overlaid, so the fallback MOTION pool must never advance
+    toward the subject — only lateral / orbit / vertical / parallax moves."""
+    forward_words = ("dolly forward", "push-in", "push in", "flyover",
+                     "fly-through", "flythrough", "glide forward", "forward")
+    for cam in pipeline._BG_CAMERAS_MOTION:
+        low = cam.lower()
+        assert not any(w in low for w in forward_words), (
+            f"motion camera entry must not advance toward the subject: {cam!r}"
+        )
+
+
+def test_veo_else_branch_applies_forward_travel_cap_except_estandar():
+    """Non-static, non-cartoon renders (auto/sutil/foto-parallax) must append
+    the forward-travel negatives so overlaid lyrics stay readable; the explicit
+    'Cinematográfico' (estandar) pick is the one opt-out."""
+    src = inspect.getsource(pipeline._generate_veo_video)
+    assert "_forward_travel_negative" in src
+    for neg in ("no push-in", "no dolly forward", "no forward camera travel",
+                "first-person glide forward"):
+        assert neg in src, f"forward-travel negative missing '{neg}'"
+    # estandar opts out of the cap (operator's conscious cinematic choice).
+    assert '== "estandar"' in src and "_legibility_cap" in src
+
+
+def test_auto_clause_forbids_forward_travel():
+    """Auto register guidance must explicitly forbid forward camera travel and
+    cap active motion at a gentle lateral / orbit / parallax move."""
+    src = inspect.getsource(pipeline._analyze_lyrics_for_background)
+    low = src.lower()
+    assert "forward" in low
+    assert "push-in" in low
+    # The lateral cap wording for the active register.
+    assert "lateral" in low
+
+
+def test_verbatim_opts_out_of_debias_rails():
+    """'Mi prompt manda' (UMG 2026-05-21): when the operator wrote their own
+    prompt, the scene + camera de-bias rails (alley / forward-travel) are
+    suppressed; only the legal IP/people rails remain."""
+    sig = inspect.signature(pipeline._generate_veo_video)
+    assert "verbatim" in sig.parameters
+    assert sig.parameters["verbatim"].default is False
+    src = inspect.getsource(pipeline._generate_veo_video)
+    # Both de-bias rails honour the verbatim opt-out.
+    assert 'normalized_concept == "urbano" or verbatim' in src
+    assert '_norm_move == "estandar" or verbatim' in src
+    # Legal rails must NOT depend on verbatim (always applied).
+    assert "_base_negatives = (" in src
+
+
+def test_ensure_background_threads_true_verbatim_to_veo():
+    """verbatim must reflect a prompt actually in use (bg_verbatim AND a
+    non-empty hint) — bg_verbatim alone with no hint falls through to Gemini,
+    where the rails must still apply."""
+    src = inspect.getsource(pipeline._ensure_background)
+    assert "_is_verbatim" in src
+    assert "bg_verbatim and background_hint" in src
+    assert "verbatim=_is_verbatim" in src
