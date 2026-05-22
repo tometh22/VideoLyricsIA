@@ -61,15 +61,37 @@ def lrc_to_plain_text(synced: str | None) -> str:
     return "\n".join(out)
 
 
+def _word_dur(w: dict):
+    try:
+        d = float(w["end"]) - float(w["start"])
+        return d if d > 0 else None
+    except (TypeError, ValueError, KeyError):
+        return None
+
+
 def wordstamps_to_segments(
-    wordstamps: list[dict], lyric_lines: list[str],
+    wordstamps: list[dict], lyric_lines: list[str], *, max_tail_dur: float = 1.5,
 ) -> list[dict]:
     """Reconstruct per-line segments from the word-level timestamps + the
     original line structure: walk each line's word count through the word
-    stream; line start/end = first/last word's start/end. Pure + testable.
+    stream; line start = first word's start. Pure + testable.
+
+    De-stretch (incident: Hermanos de Sangre): the forced-align model
+    (stable-ts/whisperX) STRETCHES the last word of a line to fill the
+    instrumental gap up to the next sung line, so a 3-s line ends up held
+    on screen for 12 s. We detect a ballooned trailing word (duration far
+    above the song's median word) and cap the line's `end` to where that
+    word actually STARTED + a normal word's worth — leaving the gap as
+    silence instead of a frozen subtitle. The sung lines keep their real
+    timing.
 
     Enforces monotonic, non-overlapping segments (clamp end to next start).
     """
+    durs = sorted(d for d in (_word_dur(w) for w in wordstamps) if d is not None)
+    median = durs[len(durs) // 2] if durs else 0.3
+    stretch_thresh = max(max_tail_dur, median * 4)   # trailing word "too long"
+    normal_tail = max(median * 1.5, 0.4)             # how long a real tail holds
+
     segs: list[dict] = []
     cur = 0
     for raw in lyric_lines:
@@ -83,9 +105,13 @@ def wordstamps_to_segments(
             continue
         try:
             start = float(span[0].get("start"))
+            last_start = float(span[-1].get("start"))
             end = float(span[-1].get("end"))
         except (TypeError, ValueError):
             continue
+        # Trailing word stretched across a gap → trim it back.
+        if (end - last_start) > stretch_thresh:
+            end = last_start + normal_tail
         if end < start:
             end = start
         segs.append({"start": start, "end": end, "text": line})
