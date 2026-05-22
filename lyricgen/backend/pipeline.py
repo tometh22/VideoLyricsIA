@@ -6853,6 +6853,12 @@ def _render_lyrics_ass(
         *vargs,
         *aargs,
         "-r", spec.fps_str,
+        # Move the moov atom to the front so the browser can start playback
+        # immediately (progressive streaming). Without this the moov lands
+        # at the END of the file; on a large main video (~124 MB) the player
+        # can't reach it without downloading everything → infinite spinner.
+        # The short played only because it's small enough to fully buffer.
+        "-movflags", "+faststart",
         "-shortest",
         os.path.basename(out_path),
     ]
@@ -7284,6 +7290,10 @@ def generate_lyric_video(
         audio_codec=spec.audio_codec,
         threads=8,
         preset="veryfast",
+        # +faststart: moov atom al frente → reproducción progresiva en el
+        # navegador sin depender de range-requests (universal para archivos
+        # grandes). Mismo motivo que el path libass.
+        ffmpeg_params=["-movflags", "+faststart"],
         logger=None,
     )
     audio.close()
@@ -7465,6 +7475,7 @@ def generate_short(
         audio_codec="aac",
         threads=8,
         preset="veryfast",
+        ffmpeg_params=["-movflags", "+faststart"],
         logger=None,
     )
     audio.close()
