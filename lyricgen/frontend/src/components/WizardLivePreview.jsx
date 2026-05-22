@@ -32,6 +32,10 @@ const MOVE_ANIM = {
 export default function WizardLivePreview({ style = "auto", customColors = "", movementStyle = "", effect = "", lyricsAnimation = "none", lineTransition = "none", mode = "lyrics", lyric, clipSrc = "/movement_samples/estandar.mp4" }) {
   const { t } = useI18n();
   const isAnimado = movementStyle === "animado";
+  // With an effect active, compose it over a CALM, neutral premium scene (not
+  // the movement-sample clip) so particles never clash with a busy scene like
+  // the nebula. Without an effect, show the chosen movement's own clip.
+  const baseClip = effect ? "/preview_base.mp4" : clipSrc;
   const isMinimal = style === "minimal";
   // Resolve the background gradient: a preset, the custom colors, or a
   // pleasant default for "auto" (the AI will pick the real colors).
@@ -149,8 +153,8 @@ export default function WizardLivePreview({ style = "auto", customColors = "", m
           preview shows the actual style's example (the clip already carries
           its camera movement). The mood/palette grades it on top. */}
       <video
-        key={clipSrc}
-        src={clipSrc}
+        key={baseClip}
+        src={baseClip}
         className="absolute inset-0 w-full h-full object-cover"
         autoPlay loop muted playsInline
       />
@@ -167,11 +171,13 @@ export default function WizardLivePreview({ style = "auto", customColors = "", m
           autoPlay loop muted playsInline
         />
       ) : null}
-      {/* palette / mood color-grade over the footage */}
-      <div className="absolute inset-0 pointer-events-none" style={{ background: bgGradient, mixBlendMode: isMinimal ? "screen" : "color", opacity: isMinimal ? 0.55 : 0.55 }} />
-      <div className="absolute inset-0 pointer-events-none" style={{ background: bgGradient, mixBlendMode: "soft-light", opacity: 0.4 }} />
-      {/* center scrim for lyric legibility (text is centered now) */}
-      <div className="absolute inset-0 pointer-events-none" style={{ background: "radial-gradient(60% 42% at 50% 50%, rgba(0,0,0,.5), transparent 75%)" }} />
+      {/* palette / mood color-grade over the footage — softened: `color` blend
+          at 0.55 over busy/colourful scenes recoloured into blotches. */}
+      <div className="absolute inset-0 pointer-events-none" style={{ background: bgGradient, mixBlendMode: isMinimal ? "screen" : "color", opacity: isMinimal ? 0.5 : 0.38 }} />
+      <div className="absolute inset-0 pointer-events-none" style={{ background: bgGradient, mixBlendMode: "soft-light", opacity: 0.32 }} />
+      {/* center scrim for lyric legibility — large, soft, low-opacity so it
+          reads as a gentle dim, not a dark oval/blob behind the text. */}
+      <div className="absolute inset-0 pointer-events-none" style={{ background: "radial-gradient(85% 65% at 50% 52%, rgba(0,0,0,.34), transparent 78%)" }} />
       {/* film grain + vignette */}
       <div className="absolute inset-0 pointer-events-none" style={{ background: "repeating-linear-gradient(0deg,transparent 0 2px,rgba(255,255,255,.022) 2px 3px)" }} />
       <div className="absolute inset-0 pointer-events-none" style={{ background: "radial-gradient(120% 80% at 50% 50%, transparent 55%, rgba(0,0,0,.55))" }} />
