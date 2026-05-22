@@ -67,31 +67,28 @@ export default function WizardLivePreview({ style = "auto", customColors = "", m
         @keyframes wlp-parallax { to { transform: translate(-5%,0) scale(1.12); } }
         @keyframes wlp-anim { to { background-position: 52px 0; } }
         @keyframes wlp-glow { to { transform: translate(-34px,26px) scale(1.1); } }
+        @keyframes wlp-lyric-in { from { opacity: 0; transform: translateY(14px); } to { opacity: 1; transform: translateY(0); } }
       `}</style>
 
-      {/* moving background layer (the "camera"/scene motion) */}
+      {/* REAL cinematic footage as the base — the preview reads like a real
+          result, not a flat gradient. The camera MOVEMENT is a transform on
+          the footage; the mood/palette grades it on top. */}
       <div
         className="absolute"
         style={{
-          inset: "-18%",
-          background: isAnimado
-            ? "repeating-linear-gradient(45deg,#6D4AFF 0 18px,#14C8A8 18px 36px)"
-            : bgGradient,
+          inset: "-12%",
           animation: MOVE_ANIM[movementStyle] ?? MOVE_ANIM[""],
           willChange: "transform",
+          filter: isAnimado ? "saturate(2.6) contrast(1.3)" : "none",
         }}
-      />
-      {!isAnimado && (
-        <div
-          className="absolute rounded-full"
-          style={{
-            width: "46%", height: "46%", left: "46%", top: "14%",
-            background: "radial-gradient(circle, rgba(109,74,255,.45), transparent 62%)",
-            filter: "blur(22px)", mixBlendMode: "screen",
-            animation: movementStyle === "estatico" ? "none" : "wlp-glow 9s ease-in-out infinite alternate",
-          }}
-        />
-      )}
+      >
+        <video src="/movement_samples/preview-bg.mp4" className="w-full h-full object-cover" autoPlay loop muted playsInline />
+      </div>
+      {/* palette / mood color-grade over the footage */}
+      <div className="absolute inset-0 pointer-events-none" style={{ background: bgGradient, mixBlendMode: isMinimal ? "screen" : "color", opacity: isMinimal ? 0.55 : 0.55 }} />
+      <div className="absolute inset-0 pointer-events-none" style={{ background: bgGradient, mixBlendMode: "soft-light", opacity: 0.4 }} />
+      {/* bottom darken for lyric legibility */}
+      <div className="absolute inset-x-0 bottom-0 h-2/3 pointer-events-none" style={{ background: "linear-gradient(to top, rgba(0,0,0,.62), transparent)" }} />
       {/* film grain + vignette */}
       <div className="absolute inset-0 pointer-events-none" style={{ background: "repeating-linear-gradient(0deg,transparent 0 2px,rgba(255,255,255,.022) 2px 3px)" }} />
       <div className="absolute inset-0 pointer-events-none" style={{ background: "radial-gradient(120% 80% at 50% 50%, transparent 55%, rgba(0,0,0,.55))" }} />
@@ -99,8 +96,9 @@ export default function WizardLivePreview({ style = "auto", customColors = "", m
       {/* lyric */}
       <div className="absolute inset-x-0 bottom-[20%] px-[8%] text-center">
         <div
+          key={sample}
           className={`font-extrabold tracking-[-0.03em] leading-[1.02] ${isMinimal ? "text-gray-900" : "text-white"}`}
-          style={{ fontSize: "clamp(18px,7.5cqw,68px)", textShadow: isMinimal ? "0 1px 12px rgba(255,255,255,.4)" : "0 4px 30px rgba(0,0,0,.6)" }}
+          style={{ fontSize: "clamp(18px,7.5cqw,68px)", textShadow: isMinimal ? "0 1px 12px rgba(255,255,255,.4)" : "0 6px 34px rgba(0,0,0,.7)", animation: "wlp-lyric-in .7s cubic-bezier(.2,.8,.2,1) both" }}
         >
           {sample}
         </div>
