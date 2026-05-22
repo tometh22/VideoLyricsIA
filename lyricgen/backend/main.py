@@ -2645,6 +2645,7 @@ async def upload(
     font: str = Form("", max_length=64),
     concept: str = Form("", max_length=2000),
     movement_style: str = Form("", max_length=64),
+    effect: str = Form("", max_length=32),
     animate_image: str = Form("", max_length=8),
     text_case: str = Form("upper", max_length=16),
     font_scale: str = Form("1.0", max_length=8),
@@ -2801,6 +2802,7 @@ async def upload(
         font=font,
         concept=concept,
         movement_style=movement_style,
+        effect=effect,
         animate_image=str(animate_image).strip().lower() in ("true", "1", "yes", "on"),
         song_title=song_title,
         text_case=text_case if text_case in ("upper", "title", "lower", "original") else "upper",
@@ -3514,6 +3516,7 @@ async def generate_with_segments(
     font: str = Form("", max_length=64),
     concept: str = Form("", max_length=2000),
     movement_style: str = Form("", max_length=64),
+    effect: str = Form("", max_length=32),
     animate_image: str = Form("", max_length=8),
     text_case: str = Form("upper", max_length=16),
     font_scale: str = Form("1.0", max_length=8),
@@ -3734,6 +3737,7 @@ async def generate_with_segments(
         font=font,
         concept=concept,
         movement_style=movement_style,
+        effect=effect,
         animate_image=str(animate_image).strip().lower() in ("true", "1", "yes", "on"),
         song_title=song_title,
         text_case=text_case if text_case in ("upper", "title", "lower", "original") else "upper",
@@ -5885,7 +5889,8 @@ async def retry_job(
     for k in ("font", "font_scale", "text_case", "lyric_transition",
               "text_motion", "text_contrast", "movement_style",
               "animate_image", "genre", "match_lyrics",
-              "background_hint", "concept", "bg_verbatim"):
+              "background_hint", "concept", "bg_verbatim",
+              "effect", "custom_colors"):
         if k in _retry_render_params and _retry_render_params[k] not in (None, ""):
             retry_pipeline_kwargs[k] = _retry_render_params[k]
 

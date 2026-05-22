@@ -378,7 +378,11 @@ def run_pipeline(job_id: str, mp3_path: str, artist: str, style: str,
                  # custom_colors: paleta personalizada (hex/nombres, coma-sep)
                  # cuando style=="custom". Va al prompt de Veo como COLOR
                  # DIRECTION + al gradiente fallback.
-                 custom_colors: str = ""):
+                 custom_colors: str = "",
+                 # effect: overlay animado componible sobre cualquier fondo
+                 # (snow/rain/stars/bokeh/light). "" = ninguno. Se compone en el
+                 # render (libass filter_complex o moviepy) vía fx_compositor.
+                 effect: str = ""):
     """Run the full pipeline for a job. Called synchronously.
 
     delivery_profile:
@@ -629,6 +633,7 @@ def run_pipeline(job_id: str, mp3_path: str, artist: str, style: str,
             "genre": genre,
             "concept": concept,
             "movement_style": movement_style,
+            "effect": effect,
             # Persist the scene-source choice so the editor's "Regenerar fondo"
             # can pre-fill the same Escena/Movimiento the operator picked in the
             # wizard — the upload→edit flow must not forget decisions.
@@ -825,6 +830,7 @@ def run_pipeline(job_id: str, mp3_path: str, artist: str, style: str,
                 lyrics_animation=lyrics_animation,
                 line_transition=line_transition,
                 text_contrast=text_contrast,
+                effect=effect, custom_colors=custom_colors,
             )
             files["video_url"] = f"/download/{job_id}/video"
             update_job(job_id, progress=55)
@@ -6886,6 +6892,9 @@ def _render_lyrics_ass(
     text_contrast: str = "medium",
     artist: str = "",
     song_title: str = "",
+    effect: str = "",
+    style: str = "",
+    custom_colors: str = "",
 ) -> str:
     """Fast lyric render: burn the lyrics with libass in a single ffmpeg
     pass over the (ffmpeg-looped) background — no moviepy frame loop.
@@ -6976,13 +6985,27 @@ def _render_lyrics_ass(
     else:
         aargs = ["-c:a", spec.audio_codec]
 
-    vf = f"subtitles=lyrics.ass:fontsdir={_ffmpeg_filter_escape(font_dir)}"
+    # Optional effect overlay (screen-blended, RGB) + color grade, composed in
+    # the SAME single pass before the subtitles burn. fx_compositor returns the
+    # right filter form: a simple -vf when there's no effect (unchanged fast
+    # path), or a -filter_complex with the looped fx clip as input #2.
+    import fx_compositor as _fx
+    vfilter, _use_complex, _extra_in = _fx.build_video_filter(
+        ass_basename="lyrics.ass", font_dir=font_dir,
+        width=spec.width, height=spec.height,
+        effect=effect, style=style, custom_colors=custom_colors,
+    )
+    _filter_args = (
+        ["-filter_complex", vfilter, "-map", "[out]", "-map", "1:a"]
+        if _use_complex else
+        ["-vf", vfilter, "-map", "0:v", "-map", "1:a"]
+    )
     cmd = [
         "ffmpeg", "-y", "-loglevel", "error",
         "-i", os.path.abspath(bg_looped),
         "-i", os.path.abspath(mp3_path),
-        "-vf", vf,
-        "-map", "0:v", "-map", "1:a",
+        *_extra_in,
+        *_filter_args,
         *vargs,
         *aargs,
         "-r", spec.fps_str,
@@ -7055,6 +7078,8 @@ def generate_lyric_video(
     lyrics_animation: str = "none",
     line_transition: str = "none",
     text_contrast: str = "medium",
+    effect: str = "",
+    custom_colors: str = "",
 ) -> tuple[str, str, str | None]:
     """Generate a lyric video. Returns (video_path, font, bg_source).
 
@@ -7144,6 +7169,7 @@ def generate_lyric_video(
                 line_transition=line_transition,
                 text_contrast=text_contrast,
                 artist=artist, song_title=title_song,
+                effect=effect, style=style, custom_colors=custom_colors,
             )
             logger.info("[ASS] render: %.1fs (engine=ass)", _time.monotonic() - _t0)
             audio.close()
@@ -7328,8 +7354,27 @@ def generate_lyric_video(
         )
         text_layers.extend(layers)
 
+    # Effect overlay (snow/rain/stars/bokeh/light) — moviepy path (fallback,
+    # and the only path locally where ffmpeg lacks libass). The baked loop is
+    # RGB-on-black (additive); masking it by its own luminance makes black read
+    # as transparent (≈ the screen blend the libass path does in ffmpeg). Looped
+    # to the full duration and slotted between the background and the lyrics.
+    _fx_layers = []
+    try:
+        import fx_compositor as _fx
+        _fx_path = _fx.effect_path(effect)
+        if _fx_path:
+            from moviepy.editor import VideoFileClip as _VFC, vfx as _vfx
+            _fxc = (_cover_resize(_VFC(_fx_path), spec.width, spec.height)
+                    .fx(_vfx.loop, duration=duration)
+                    .set_duration(duration))
+            _fxc = _fxc.set_mask(_fxc.to_mask())
+            _fx_layers = [_fxc]
+    except Exception as _e:
+        logger.warning("[FX] moviepy overlay skipped (%s); continuing", _e)
+
     _moviepy_t0 = _time.monotonic()
-    video = CompositeVideoClip([bg] + text_layers, size=(spec.width, spec.height))
+    video = CompositeVideoClip([bg] + _fx_layers + text_layers, size=(spec.width, spec.height))
     video = video.set_audio(audio).set_duration(duration)
 
     if spec.profile == "umg":
@@ -7795,6 +7840,10 @@ def run_edit_pipeline(
     genre = merged.get("genre") or ""
     concept = merged.get("concept") or ""
     movement_style = merged.get("movement_style") or ""
+    # Effect overlay + custom palette persist across edits via render_params,
+    # so a re-render keeps the snow/rain/grade the operator picked at upload.
+    effect = merged.get("effect") or ""
+    custom_colors = merged.get("custom_colors") or ""
     # Per-edit operator hint for background regen (set by /edit when the
     # user typed in the "Aclarar tipo de fondo" textarea). None if absent;
     # propagates only into the `background` branch below.
@@ -7900,6 +7949,7 @@ def run_edit_pipeline(
             text_motion=text_motion,
             lyrics_animation=lyrics_animation,
             line_transition=line_transition,
+            effect=effect, custom_colors=custom_colors,
         )
         files = {"video_url": f"/download/{job_id}/video"}
         update_job(job_id, progress=55)
