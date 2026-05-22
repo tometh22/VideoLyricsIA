@@ -29,7 +29,7 @@ const MOVE_ANIM = {
   animado:        "wlp-anim 1.8s linear infinite",
 };
 
-export default function WizardLivePreview({ style = "auto", customColors = "", movementStyle = "", lyricsAnimation = "none", lineTransition = "none", mode = "lyrics", lyric, clipSrc = "/movement_samples/estandar.mp4" }) {
+export default function WizardLivePreview({ style = "auto", customColors = "", movementStyle = "", effect = "", lyricsAnimation = "none", lineTransition = "none", mode = "lyrics", lyric, clipSrc = "/movement_samples/estandar.mp4" }) {
   const { t } = useI18n();
   const isAnimado = movementStyle === "animado";
   const isMinimal = style === "minimal";
@@ -55,6 +55,13 @@ export default function WizardLivePreview({ style = "auto", customColors = "", m
     "foto-parallax": t("upload.movement_foto_parallax") || "Parallax",
     animado: t("upload.movement_animado") || "Animado",
   }[movementStyle] || (t("upload.movement_auto") || "Auto");
+  const effectLabel = {
+    snow: t("upload.effect_snow") || "Nieve",
+    rain: t("upload.effect_rain") || "Lluvia",
+    stars: t("upload.effect_stars") || "Estrellas",
+    bokeh: t("upload.effect_bokeh") || "Bokeh",
+    light: t("upload.effect_light") || "Luz",
+  }[effect] || "";
   const modeLabel = {
     auto: t("upload.mode_auto") || "Auto",
     lyrics: t("upload.inspired_by_lyrics_label") || "Inspirado en la letra",
@@ -147,6 +154,19 @@ export default function WizardLivePreview({ style = "auto", customColors = "", m
         className="absolute inset-0 w-full h-full object-cover"
         autoPlay loop muted playsInline
       />
+      {/* effect overlay — particles screen-blended over the footage, BELOW the
+          grade so the palette tints them too (mirrors the backend
+          bg→effect→grade→subs order). mix-blend-screen makes the black loop
+          background transparent, exactly like ffmpeg blend=screen. */}
+      {effect ? (
+        <video
+          key={`fx-${effect}`}
+          src={`/fx_raw/${effect}.mp4`}
+          className="absolute inset-0 w-full h-full object-cover pointer-events-none"
+          style={{ mixBlendMode: "screen" }}
+          autoPlay loop muted playsInline
+        />
+      ) : null}
       {/* palette / mood color-grade over the footage */}
       <div className="absolute inset-0 pointer-events-none" style={{ background: bgGradient, mixBlendMode: isMinimal ? "screen" : "color", opacity: isMinimal ? 0.55 : 0.55 }} />
       <div className="absolute inset-0 pointer-events-none" style={{ background: bgGradient, mixBlendMode: "soft-light", opacity: 0.4 }} />
@@ -178,7 +198,7 @@ export default function WizardLivePreview({ style = "auto", customColors = "", m
       {/* info caption — plain text, not pills */}
       <div className="absolute bottom-3.5 left-5 right-5 flex items-center justify-between text-[11px] font-medium" style={{ color: isMinimal ? "rgba(0,0,0,.55)" : "rgba(255,255,255,.6)", textShadow: isMinimal ? "none" : "0 1px 8px rgba(0,0,0,.5)" }}>
         <span className="truncate">{modeLabel}</span>
-        <span className="shrink-0 ml-3">{(t("upload.preview_motion") || "Movimiento")}: {moveLabel}</span>
+        <span className="shrink-0 ml-3">{(t("upload.preview_motion") || "Movimiento")}: {moveLabel}{effectLabel ? ` · ${t("upload.effect_label") || "Efecto"}: ${effectLabel}` : ""}</span>
       </div>
     </div>
   );

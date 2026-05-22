@@ -183,7 +183,7 @@ export default function UploadZone({
   // losing the "ROMANTICO" concept across Agus's re-uploads.
   const BATCH_DEFAULTS_STORAGE_KEY = "genly:wizardBatchDefaultsV1";
   const HARDCODED_BATCH_DEFAULTS = {
-    genre: "", concept: "", movementStyle: "", font: "",
+    genre: "", concept: "", movementStyle: "", effect: "", font: "",
     textCase: "upper", fontScale: "1.0", lyricTransition: "cut", textMotion: "none", lyricsAnimation: "none", lineTransition: "none", textContrast: "medium",
     // Escena axis: optional free-text prompt ("Mi prompt"). When non-empty it
     // overrides genre/concept/lyrics. bgVerbatim TRUE by default = use the
@@ -263,6 +263,7 @@ export default function UploadZone({
 
   // Hovering a movement option previews it in the big stage without committing.
   const [hoverMovement, setHoverMovement] = useState(null);
+  const [hoverEffect, setHoverEffect] = useState(null);
   // Same for the lyrics-animation step: hover previews the template live.
   const [hoverAnimation, setHoverAnimation] = useState(null);
   // And for the line-transition picker (lives in the same Animación step).
@@ -456,6 +457,21 @@ export default function UploadZone({
     { code: "estandar",      label: t("upload.movement_estandar") || "Estándar (cinematográfico)", sample: "/movement_samples/estandar.mp4", desc: t("upload.movement_estandar_desc") || "Movimiento de cámara cinematográfico (zoom/drift)." },
     { code: "foto-parallax", label: t("upload.movement_foto_parallax") || "Foto + parallax",     sample: "/movement_samples/foto-parallax.mp4", desc: t("upload.movement_parallax_desc") || "Foto con sensación de profundidad (paneo lento)." },
     { code: "animado",       label: t("upload.movement_animado") || "Animado (ilustración)",     sample: "/movement_samples/animado.mp4",   desc: t("upload.movement_animado_desc") || "Ilustración 2D estilizada, no fotorrealista." },
+  ];
+
+  // Effect overlay — animated particles composited OVER the background (the
+  // proven UMG pattern: foto/loop calmo + nieve/lluvia/estrellas encima). It's
+  // an ORTHOGONAL axis to "Movimiento" (which moves the camera): the effect
+  // falls on top of anything, even a still photo or a Library/uploaded clip.
+  // Backed by pre-rendered alpha-screen loops; preview clips live at
+  // /fx_samples/<code>.mp4 (effect composited over a neutral gradient).
+  const EFFECTS = [
+    { code: "",      label: t("upload.effect_none") || "Ninguno",   sample: null,                   desc: t("upload.effect_none_desc") || "Fondo limpio, sin efecto." },
+    { code: "snow",  label: t("upload.effect_snow") || "Nieve",     sample: "/fx_samples/snow.mp4",  desc: t("upload.effect_snow_desc") || "Copos cayendo. Calmo, invernal." },
+    { code: "rain",  label: t("upload.effect_rain") || "Lluvia",    sample: "/fx_samples/rain.mp4",  desc: t("upload.effect_rain_desc") || "Gotas finas sobre la escena." },
+    { code: "stars", label: t("upload.effect_stars") || "Estrellas", sample: "/fx_samples/stars.mp4", desc: t("upload.effect_stars_desc") || "Partículas que titilan. Nocturno." },
+    { code: "bokeh", label: t("upload.effect_bokeh") || "Bokeh",    sample: "/fx_samples/bokeh.mp4", desc: t("upload.effect_bokeh_desc") || "Luces desenfocadas flotando." },
+    { code: "light", label: t("upload.effect_light") || "Luz",      sample: "/fx_samples/light.mp4", desc: t("upload.effect_light_desc") || "Destellos suaves. Atardecer, glow." },
   ];
 
   // Lyrics-animation templates. These are rendered as libass override tags in
@@ -856,6 +872,66 @@ export default function UploadZone({
         </div>
       </div>
 
+      {/* Effect gallery — particles composited OVER the background. Available
+          for ANY source (IA / Biblioteca / Subido): it's an overlay, not a
+          generation choice. Orthogonal to "Movimiento" (camera). */}
+      <div className="mb-4 pt-3 border-t border-white/[0.05]">
+        <div className="mb-2">
+          <div className="flex items-baseline justify-between">
+            <p className="text-[11px] text-gray-400 font-medium">
+              {t("upload.effect_gallery_title") || "Efecto encima"}
+            </p>
+            {files.length > 1 && (
+              <p className="text-[10px] text-gray-600">
+                {t("upload.effect_gallery_hint") || "Click para aplicar a todos · personalizable por canción"}
+              </p>
+            )}
+          </div>
+          <p className="text-[10px] text-gray-600 mt-0.5">
+            {t("upload.effect_gallery_desc") || "Partículas que caen encima del fondo (nieve, lluvia, estrellas…). Es el toque del formato de UMG. Se suma a cualquier fondo, incluso de Biblioteca."}
+          </p>
+        </div>
+        <div className="grid grid-cols-3 sm:grid-cols-6 gap-2">
+          {EFFECTS.map((e) => {
+            const active = (batchDefaults.effect || "") === e.code;
+            return (
+              <button
+                key={e.code || "none"}
+                type="button"
+                onClick={() => updateBatchDefault("effect", e.code)}
+                onMouseEnter={() => setHoverEffect(e.code)}
+                onMouseLeave={() => setHoverEffect(null)}
+                aria-label={`${e.label}: ${e.desc}`}
+                title={e.desc}
+                className={`text-left rounded-xl overflow-hidden border transition-all duration-200 cursor-pointer ${
+                  active
+                    ? "border-transparent ring-1 ring-brand/50 shadow-glow"
+                    : "border-white/[0.06] hover:border-white/[0.20]"
+                }`}
+              >
+                <div className="aspect-video bg-black relative overflow-hidden">
+                  {e.sample ? (
+                    <video src={e.sample} className="w-full h-full object-cover pointer-events-none" autoPlay loop muted playsInline />
+                  ) : (
+                    <div className="w-full h-full grid place-items-center text-gray-500 text-[10px]" style={{ background: "radial-gradient(120% 100% at 50% 0,#241a40,#0b0820)" }}>
+                      {t("upload.effect_none") || "Ninguno"}
+                    </div>
+                  )}
+                  {active && (
+                    <div className="absolute top-1.5 right-1.5 w-5 h-5 rounded-full bg-brand grid place-items-center shadow">
+                      <svg className="w-3 h-3 text-white" fill="none" stroke="currentColor" strokeWidth="3" viewBox="0 0 24 24"><polyline points="20 6 9 17 4 12" /></svg>
+                    </div>
+                  )}
+                </div>
+                <div className="px-2 py-1.5 bg-surface-1">
+                  <p className={`text-[11px] font-medium leading-tight ${active ? "text-white" : "text-gray-200"}`}>{e.label}</p>
+                </div>
+              </button>
+            );
+          })}
+        </div>
+      </div>
+
       {/* Scene metadata (genre + concept) — only when generating with AI.
           Explained inline so it's clear what they DO and how they impact. */}
       {bgMode === "auto" && (
@@ -1052,6 +1128,7 @@ export default function UploadZone({
           (entry.genre        || "") !== (bd.genre        || "") ||
           (entry.concept      || "") !== (bd.concept      || "") ||
           (entry.movementStyle || "") !== (bd.movementStyle || "") ||
+          (entry.effect       || "") !== (bd.effect       || "") ||
           (entry.font         || "") !== (bd.font         || "") ||
           (entry.textCase     || "upper") !== (bd.textCase     || "upper") ||
           (entry.fontScale    || "1.0")   !== (bd.fontScale    || "1.0")   ||
@@ -1185,6 +1262,10 @@ export default function UploadZone({
                       <div className="flex items-center gap-2">
                         <span className="text-[11px] text-gray-600 shrink-0">{t("upload.movement_label") || "Movimiento:"}</span>
                         <Listbox value={entry.movementStyle || ""} onChange={(v) => updateField(i, "movementStyle", v)} options={MOVEMENT_STYLES} className="flex-1" ariaLabel={t("upload.movement_label")} />
+                      </div>
+                      <div className="flex items-center gap-2">
+                        <span className="text-[11px] text-gray-600 shrink-0">{t("upload.effect_label") || "Efecto:"}</span>
+                        <Listbox value={entry.effect || ""} onChange={(v) => updateField(i, "effect", v)} options={EFFECTS} className="flex-1" ariaLabel={t("upload.effect_label") || "Efecto"} />
                       </div>
                       <div className="flex items-center gap-2">
                         <span className="text-[11px] text-gray-600 shrink-0">{t("upload.animation_label") || "Animación:"}</span>
@@ -1682,6 +1763,7 @@ export default function UploadZone({
               style={style}
               customColors={customColors}
               movementStyle={hoverMovement ?? batchDefaults.movementStyle}
+              effect={hoverEffect ?? batchDefaults.effect}
               lyricsAnimation={hoverAnimation ?? batchDefaults.lyricsAnimation}
               lineTransition={hoverTransition ?? batchDefaults.lineTransition}
               mode={sceneMode}

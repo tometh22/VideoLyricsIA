@@ -758,7 +758,7 @@ export default function App() {
       filename: f.file.name, _file: f.file, artist: f.artist.trim(),
       songTitle: (f.songTitle || "").trim(),
       language: f.language, genre: f.genre || "", font: f.font || "",
-      concept: f.concept || "", movementStyle: f.movementStyle || "",
+      concept: f.concept || "", movementStyle: f.movementStyle || "", effect: f.effect || "",
       backgroundHint: f.backgroundHint || "", bgVerbatim: !!f.bgVerbatim,
       status: "queued", current_step: null,
       progress: 0, job_id: null, error: null,
@@ -782,7 +782,7 @@ export default function App() {
         file: entry.file, artist: entry.artist, language: entry.language,
         songTitle: entry.songTitle || "",
         genre: entry.genre || "", font: entry.font || "",
-        concept: entry.concept || "", movementStyle: entry.movementStyle || "",
+        concept: entry.concept || "", movementStyle: entry.movementStyle || "", effect: entry.effect || "",
         backgroundHint: entry.backgroundHint || "", bgVerbatim: !!entry.bgVerbatim,
         textCase: entry.textCase || "upper",
         fontScale: entry.fontScale || "1.0",
@@ -861,7 +861,7 @@ export default function App() {
         file: entry.file, artist: entry.artist, language: entry.language,
         songTitle: entry.songTitle || "",
         genre: entry.genre || "", font: entry.font || "",
-        concept: entry.concept || "", movementStyle: entry.movementStyle || "",
+        concept: entry.concept || "", movementStyle: entry.movementStyle || "", effect: entry.effect || "",
         backgroundHint: entry.backgroundHint || "", bgVerbatim: !!entry.bgVerbatim,
         textCase: entry.textCase || "upper",
         fontScale: entry.fontScale || "1.0",
@@ -923,7 +923,7 @@ export default function App() {
       file: r.file, artist: r.artist, language: r.language,
       songTitle: r.songTitle || "",
       genre: r.genre || "", font: r.font || "", concept: r.concept || "",
-      movementStyle: r.movementStyle || "",
+      movementStyle: r.movementStyle || "", effect: r.effect || "",
       backgroundHint: r.backgroundHint || "", bgVerbatim: !!r.bgVerbatim,
       textCase: r.textCase || "upper",
       fontScale: r.fontScale || "1.0",
@@ -959,7 +959,7 @@ export default function App() {
       filename: a.file.name, _file: a.file, artist: a.artist,
       songTitle: (a.songTitle || "").trim(),
       language: a.language, genre: a.genre || "", font: a.font || "",
-      concept: a.concept || "", movementStyle: a.movementStyle || "",
+      concept: a.concept || "", movementStyle: a.movementStyle || "", effect: a.effect || "",
       backgroundHint: a.backgroundHint || "", bgVerbatim: !!a.bgVerbatim,
       textCase: a.textCase || "upper",
       fontScale: a.fontScale || "1.0",
@@ -1001,6 +1001,7 @@ export default function App() {
         if (jobList[i].font) formData.append("font", jobList[i].font);
         if (jobList[i].concept) formData.append("concept", jobList[i].concept);
         if (jobList[i].movementStyle) formData.append("movement_style", jobList[i].movementStyle);
+        if (jobList[i].effect) formData.append("effect", jobList[i].effect);
         if ((jobList[i].backgroundHint || "").trim()) {
           formData.append("background_hint", jobList[i].backgroundHint.trim());
           if (jobList[i].bgVerbatim) formData.append("bg_verbatim", "true");
@@ -1132,6 +1133,7 @@ export default function App() {
         if (jobList[i].font) generateBody.append("font", jobList[i].font);
         if (jobList[i].concept) generateBody.append("concept", jobList[i].concept);
         if (jobList[i].movementStyle) generateBody.append("movement_style", jobList[i].movementStyle);
+        if (jobList[i].effect) generateBody.append("effect", jobList[i].effect);
         if ((jobList[i].backgroundHint || "").trim()) {
           generateBody.append("background_hint", jobList[i].backgroundHint.trim());
           if (jobList[i].bgVerbatim) generateBody.append("bg_verbatim", "true");
@@ -1226,7 +1228,7 @@ export default function App() {
         genre: last.genre || "",
         font: last.font || "",
         concept: last.concept || "",
-        movementStyle: last.movementStyle || "",
+        movementStyle: last.movementStyle || "", effect: last.effect || "",
         textCase: last.textCase || "upper",
         fontScale: last.fontScale || "1.0",
         lyricTransition: last.lyricTransition || "cut",
