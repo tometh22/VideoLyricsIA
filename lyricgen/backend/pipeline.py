@@ -359,6 +359,8 @@ def run_pipeline(job_id: str, mp3_path: str, artist: str, style: str,
                  font_scale: float = 1.0,
                  lyric_transition: str = "cut",
                  text_motion: str = "none",
+                 lyrics_animation: str = "none",
+                 line_transition: str = "none",
                  match_lyrics: bool = True,
                  text_contrast: str = "medium",
                  # Background_hint llega solo desde el flow de variantes
@@ -621,6 +623,8 @@ def run_pipeline(job_id: str, mp3_path: str, artist: str, style: str,
             "font_scale": font_scale,
             "lyric_transition": lyric_transition,
             "text_motion": text_motion,
+            "lyrics_animation": lyrics_animation,
+            "line_transition": line_transition,
             "style": style,
             "genre": genre,
             "concept": concept,
@@ -818,6 +822,8 @@ def run_pipeline(job_id: str, mp3_path: str, artist: str, style: str,
                 font_scale=font_scale,
                 lyric_transition=lyric_transition,
                 text_motion=text_motion,
+                lyrics_animation=lyrics_animation,
+                line_transition=line_transition,
                 text_contrast=text_contrast,
             )
             files["video_url"] = f"/download/{job_id}/video"
@@ -5486,6 +5492,24 @@ def _ensure_background(style_hint: str, job_dir: str, lyrics_text: str = None,
     if _norm_move_bg == "animado" and bg_mode != "veo":
         logger.info("[BG] movement=animado overrides bg_mode → veo")
         bg_mode = "veo"
+    # Foto + parallax is a still photo that gains depth via a slow LATERAL pan.
+    # Veo can't do clean 2.5D parallax from a text prompt (it comes out muddy),
+    # so this register always routes through Imagen-4 + the lateral Ken Burns
+    # pan — controllable, premium, and consistent demo↔output. (Matrix rule:
+    # foto-parallax → Imagen × lateral, regardless of the operator's bg_mode.)
+    elif _norm_move_bg == "foto-parallax" and bg_mode != "imagen":
+        logger.info("[BG] movement=foto-parallax overrides bg_mode → imagen (lateral pan)")
+        bg_mode = "imagen"
+    # Estático / Sutil: Veo ignores "locked / no advance" ~half the time
+    # (measured 2026-05-22) and pushes in, which made these registers feel the
+    # same and nauseating to read over. So the calm registers route through
+    # Imagen-4 + a deterministic, code-controlled camera move (static frame /
+    # gentle drift) that NEVER advances. Trade-off: a still photo (no in-scene
+    # waves/wind), accepted for guaranteed legibility. (Matrix: estatico/sutil
+    # → Imagen × static/subtle, regardless of the operator's bg_mode.)
+    elif _norm_move_bg in ("estatico", "sutil") and bg_mode != "imagen":
+        logger.info("[BG] movement=%s overrides bg_mode → imagen (controlled camera)", _norm_move_bg)
+        bg_mode = "imagen"
 
     # Imagen-4 + Ken Burns branch. Cabled 2026-05-16 — _generate_imagen_image
     # has existed in the codebase as dead code since the original architecture
@@ -5508,10 +5532,17 @@ def _ensure_background(style_hint: str, job_dir: str, lyrics_text: str = None,
         # try/except which falls back to the gradient.
         _generate_imagen_image(prompt, image_path, job_id=job_id, allow_people=allow_people)
         # Ken Burns produces a 60s sample that downstream palindrome-loops
-        # to match the audio duration. Same contract as the Veo path. When the
-        # operator picked "Estático", hold the frame (no zoom/pan) so the
-        # Imagen path honours the locked-camera request too.
-        _ken_burns_image_to_mp4(image_path, bg_path, static=(_norm_move_bg == "estatico"))
+        # to match the audio duration. Same contract as the Veo path.
+        #   - "Estático"        → hold the frame (no zoom/pan).
+        #   - "Sutil"           → barely-there gentle drift (no zoom, no forward).
+        #   - "Foto + parallax" → slow lateral pan (no zoom, no forward).
+        #   - otherwise         → the usual zoom/pan Ken Burns.
+        _ken_burns_image_to_mp4(
+            image_path, bg_path,
+            static=(_norm_move_bg == "estatico"),
+            lateral=(_norm_move_bg == "foto-parallax"),
+            subtle=(_norm_move_bg == "sutil"),
+        )
         return bg_path
 
     # True verbatim = operator's own prompt is actually in use (bg_verbatim set
@@ -5605,6 +5636,8 @@ def _ken_burns_image_to_mp4(
     sample_duration: float = 60.0,
     spec: RenderSpec | None = None,
     static: bool = False,
+    lateral: bool = False,
+    subtle: bool = False,
 ) -> str:
     """Render a Ken Burns animation over a still image as a standalone MP4.
 
@@ -5627,7 +5660,7 @@ def _ken_burns_image_to_mp4(
     """
     if spec is None:
         spec = RenderSpec.youtube_default()
-    clip = _ken_burns_clip(image_path, sample_duration, spec=spec, static=static)
+    clip = _ken_burns_clip(image_path, sample_duration, spec=spec, static=static, lateral=lateral, subtle=subtle)
     try:
         clip.write_videofile(
             output_path,
@@ -5646,7 +5679,7 @@ def _ken_burns_image_to_mp4(
 
 
 def _ken_burns_clip(image_path: str, duration: float, spec: RenderSpec | None = None,
-                    static: bool = False):
+                    static: bool = False, lateral: bool = False, subtle: bool = False):
     """Create an animated Ken Burns clip with periodic direction changes.
 
     `static=True` returns a LOCKED frame instead: the image is center-cropped
@@ -5654,11 +5687,57 @@ def _ken_burns_clip(image_path: str, duration: float, spec: RenderSpec | None = 
     pan. Used by the Imagen background path when the operator picked
     "Estático", where the usual Ken Burns zoom/pan would directly contradict
     a locked-camera request.
+
+    `lateral=True` returns a clean PARALLAX-style slide: a slow, constant
+    horizontal pan over a fixed inward crop — no zoom, no vertical drift, no
+    forward travel ("Foto + parallax").
+
+    `subtle=True` returns a barely-there ambient DRIFT: a small, slow, diagonal
+    pan of low amplitude — no zoom, no forward travel ("Sutil"). Distinct from
+    `lateral` (a clearly visible sideways travel) and `static` (frozen).
+
+    These deterministic camera moves replace Veo for the calm registers because
+    Veo ignores "locked / no advance" ~half the time (measured 2026-05-22) and
+    pushes in regardless. `static` > `lateral` > `subtle` if several are passed.
     """
     if spec is None:
         spec = RenderSpec.youtube_default()
     img = np.array(Image.open(image_path))
     h, w = img.shape[:2]
+
+    if not static and (lateral or subtle):
+        # Pan over a fixed inward crop — NO zoom (the scale is constant), so the
+        # camera never advances. `lateral` uses the full horizontal room; the
+        # `subtle` drift uses a fraction of it plus a touch of vertical, so it
+        # reads as a barely-there breath rather than a clear slide.
+        if lateral:
+            scale, amp_x, amp_y = 1.18, 1.0, 0.0
+        else:  # subtle
+            scale, amp_x, amp_y = 1.10, 0.35, 0.18
+        cw = max(1, min(int(w / scale), w))
+        ch = max(1, min(int(h / scale), h))
+        room_x = max(0, w - cw)
+        room_y = max(0, h - ch)
+        travel_x = int(room_x * amp_x)
+        travel_y = int(room_y * amp_y)
+        base_x = (w - cw) // 2 - travel_x // 2
+        base_y = (h - ch) // 2 - travel_y // 2
+        dir_x = random.choice([1, -1])
+        dir_y = random.choice([1, -1])
+
+        def make_pan_frame(t):
+            p = min(1.0, t / duration) if duration else 0.0
+            p = 0.5 - 0.5 * math.cos(p * math.pi)  # ease in/out
+            cx = base_x + int((p if dir_x == 1 else (1.0 - p)) * travel_x)
+            cy = base_y + int((p if dir_y == 1 else (1.0 - p)) * travel_y)
+            cx = max(0, min(cx, w - cw))
+            cy = max(0, min(cy, h - ch))
+            crop = img[cy:cy + ch, cx:cx + cw]
+            return np.array(
+                Image.fromarray(crop).resize((spec.width, spec.height), Image.LANCZOS)
+            )
+
+        return VideoClip(make_pan_frame, duration=duration).set_fps(spec.fps)
 
     if static:
         # Center-crop to target aspect ratio, then resize once. Held constant.
@@ -6802,6 +6881,8 @@ def _render_lyrics_ass(
     text_case: str = "upper",
     font_scale: float = 1.0,
     lyric_transition: str = "cut",
+    lyrics_animation: str = "none",
+    line_transition: str = "none",
     text_contrast: str = "medium",
     artist: str = "",
     song_title: str = "",
@@ -6852,6 +6933,8 @@ def _render_lyrics_ass(
         text_scale=scale,
         font_scale=font_scale,
         lyric_transition=lyric_transition,
+        animation=lyrics_animation,
+        transition=line_transition,
         case_fn=lambda t: _apply_case(t, text_case),
     )
     first_lyric_start = segments[0]["start"] if segments else duration
@@ -6969,6 +7052,8 @@ def generate_lyric_video(
     font_scale: float = 1.0,
     lyric_transition: str = "cut",
     text_motion: str = "none",
+    lyrics_animation: str = "none",
+    line_transition: str = "none",
     text_contrast: str = "medium",
 ) -> tuple[str, str, str | None]:
     """Generate a lyric video. Returns (video_path, font, bg_source).
@@ -7055,6 +7140,8 @@ def generate_lyric_video(
                 ass_bg, mp3_path, segments, job_dir, duration,
                 spec=spec, font_path=font, text_case=text_case,
                 font_scale=font_scale, lyric_transition=lyric_transition,
+                lyrics_animation=lyrics_animation,
+                line_transition=line_transition,
                 text_contrast=text_contrast,
                 artist=artist, song_title=title_song,
             )
@@ -7703,6 +7790,8 @@ def run_edit_pipeline(
     font_scale = float(merged.get("font_scale") or 1.0)
     lyric_transition = merged.get("lyric_transition") or "cut"
     text_motion = merged.get("text_motion") or "none"
+    lyrics_animation = merged.get("lyrics_animation") or "none"
+    line_transition = merged.get("line_transition") or "none"
     genre = merged.get("genre") or ""
     concept = merged.get("concept") or ""
     movement_style = merged.get("movement_style") or ""
@@ -7809,6 +7898,8 @@ def run_edit_pipeline(
             font_scale=font_scale,
             lyric_transition=lyric_transition,
             text_motion=text_motion,
+            lyrics_animation=lyrics_animation,
+            line_transition=line_transition,
         )
         files = {"video_url": f"/download/{job_id}/video"}
         update_job(job_id, progress=55)
