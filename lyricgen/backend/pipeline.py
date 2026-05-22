@@ -6740,6 +6740,48 @@ def _ffmpeg_filter_escape(path: str) -> str:
     return path.replace("\\", "\\\\").replace(":", "\\:")
 
 
+def _validate_rendered_mp4(path: str, expected_dur: float) -> None:
+    """Raise if the rendered MP4 isn't browser-playable. Catches the
+    malformed-but-exit-0 outputs the plain returncode check misses
+    (incident 2026-05-21: a 124 MB ASS render with the moov atom at the
+    END never started in the browser → infinite spinner). Checks: file
+    non-empty, has a video + audio stream, duration within ±3 s of the
+    audio, and the moov atom near the FRONT (faststart). On any failure
+    the caller falls back to the proven moviepy path."""
+    import json as _json
+    if not os.path.exists(path) or os.path.getsize(path) < 4096:
+        raise RuntimeError(f"rendered file missing/empty: {path}")
+    probe = subprocess.run(
+        ["ffprobe", "-v", "error", "-show_entries",
+         "stream=codec_type:format=duration", "-of", "json", path],
+        capture_output=True, text=True, timeout=60,
+    )
+    if probe.returncode != 0:
+        raise RuntimeError(f"ffprobe failed on render: {probe.stderr[-300:]}")
+    data = _json.loads(probe.stdout or "{}")
+    types = {s.get("codec_type") for s in data.get("streams", [])}
+    if "video" not in types:
+        raise RuntimeError("rendered mp4 has no video stream")
+    if "audio" not in types:
+        raise RuntimeError("rendered mp4 has no audio stream")
+    try:
+        dur = float((data.get("format") or {}).get("duration") or 0)
+    except (TypeError, ValueError):
+        dur = 0.0
+    if expected_dur and abs(dur - expected_dur) > 3.0:
+        raise RuntimeError(
+            f"rendered duration {dur:.1f}s != expected {expected_dur:.1f}s"
+        )
+    # faststart: moov must precede mdat near the front (mp4 only).
+    if path.lower().endswith(".mp4"):
+        with open(path, "rb") as f:
+            head = f.read(2_000_000)
+        moov = head.find(b"moov")
+        mdat = head.find(b"mdat")
+        if not (moov != -1 and (mdat == -1 or moov < mdat)):
+            raise RuntimeError("rendered mp4 lacks faststart (moov not at front)")
+
+
 def _render_lyrics_ass(
     bg_video_path: str,
     mp3_path: str,
@@ -6874,8 +6916,11 @@ def _render_lyrics_ass(
         import shutil
         shutil.rmtree(font_dir, ignore_errors=True)
 
+    # Validate the output is actually browser-playable; on failure the
+    # caller (generate_lyric_video) catches and falls back to moviepy.
+    _validate_rendered_mp4(out_path, duration)
     size_mb = os.path.getsize(out_path) / (1024 * 1024)
-    logger.info("[ASS] lyric video rendered: %.0fs audio, %.1f MB (libass fast path)",
+    logger.info("[ASS] lyric video rendered: %.0fs audio, %.1f MB (libass fast path, validated)",
                 duration, size_mb)
     return out_path
 

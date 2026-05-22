@@ -51,3 +51,18 @@ def test_deliverable_moviepy_writes_have_faststart():
 def test_faststart_appears_for_all_three_deliverable_paths():
     """libass pass + main moviepy + short moviepy → at least 3 faststart uses."""
     assert _src().count("+faststart") >= 3
+
+
+def test_ass_render_validates_output_before_returning():
+    """The libass pass must ffprobe-validate its output (streams, duration,
+    faststart) and let the caller fall back to moviepy on a malformed
+    exit-0 render. Guard: _render_lyrics_ass calls _validate_rendered_mp4
+    before returning, and the validator checks the moov/faststart."""
+    src = _src()
+    fn = src[src.index("def _render_lyrics_ass"):src.index("def _resolve_title_song")]
+    assert "_validate_rendered_mp4(out_path" in fn, (
+        "_render_lyrics_ass must validate its output before returning"
+    )
+    validator = src[src.index("def _validate_rendered_mp4"):src.index("def _render_lyrics_ass")]
+    assert "moov" in validator and "faststart" in validator
+    assert "no video stream" in validator and "no audio stream" in validator

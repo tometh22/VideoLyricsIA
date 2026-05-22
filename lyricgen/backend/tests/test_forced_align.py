@@ -63,6 +63,34 @@ def test_wordstamps_to_segments_skips_blank_and_missing():
     assert segs == [{"start": 1.0, "end": 2.0, "text": "linea real"}]
 
 
+def test_destretch_trims_ballooned_trailing_word():
+    """Hermanos pattern: the model stretches the last word to fill the
+    instrumental gap (line held 12 s). De-stretch caps the end back near
+    where the word actually started + a normal tail."""
+    # Median word ~0.3s; "vos" stretched 0.6 -> 12.0 (11.4s).
+    words = [
+        _w("Yo", 122.6, 122.9), _w("solo", 122.9, 123.3), _w("quiero", 123.3, 123.8),
+        _w("vagar", 123.8, 124.3), _w("con", 124.3, 124.6), _w("vos", 124.6, 134.8),
+        _w("Yo", 134.8, 135.1), _w("solo", 135.1, 135.5),  # next line words (median)
+    ]
+    segs = fa.wordstamps_to_segments(words, ["Yo solo quiero vagar con vos", "Yo solo"])
+    line14 = segs[0]
+    dur = line14["end"] - line14["start"]
+    assert dur < 3.0, f"line should be de-stretched, got {dur:.1f}s"
+    assert line14["start"] == 122.6           # sung start preserved
+    assert line14["end"] <= 134.8             # never extends past the word
+
+
+def test_destretch_leaves_normal_lines_untouched():
+    words = [
+        _w("hola", 1.0, 1.4), _w("mundo", 1.4, 2.0),
+        _w("chau", 3.0, 3.4), _w("amigo", 3.4, 4.0),
+    ]
+    segs = fa.wordstamps_to_segments(words, ["hola mundo", "chau amigo"])
+    assert segs[0] == {"start": 1.0, "end": 2.0, "text": "hola mundo"}
+    assert segs[1] == {"start": 3.0, "end": 4.0, "text": "chau amigo"}
+
+
 def test_forced_align_lyrics_returns_none_when_disabled(monkeypatch):
     monkeypatch.delenv("FORCED_ALIGNER_ENABLED", raising=False)
     assert fa.forced_align_lyrics("/tmp/x.mp3", "a\nb\nc\nd") is None
