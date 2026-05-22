@@ -3822,16 +3822,19 @@ _BG_PALETTES = [
 # fails to return a usable prompt). Split into MOTION and STATIC so the
 # fallback can honour movement intent instead of always reintroducing a
 # camera move (the old list was 10/10 motion → every fallback drifted).
+# Legibility cap (UMG 2026-05-21): the lyrics are overlaid, so forward
+# travel (dolly forward, push-in, flyover, first-person glide) makes them
+# nauseating to read — the MOTION pool is now lateral / orbit / vertical /
+# parallax only, never advancing toward the subject.
 _BG_CAMERAS_MOTION = [
-    "slow aerial drone flyover",
-    "smooth dolly forward movement",
     "gentle sideways tracking shot",
     "slow upward crane shot",
     "slow orbit around the scene",
     "smooth descending aerial shot",
-    "gentle push-in zoom",
     "slow parallax movement",
-    "steady first-person glide forward",
+    "slow lateral drift across the scene",
+    "gentle vertical crane reveal",
+    "slow arc around the subject",
 ]
 _BG_CAMERAS_STATIC = [
     "locked static wide shot on a tripod, no camera movement",
@@ -4249,9 +4252,13 @@ def _analyze_lyrics_for_background(lyrics_text: str, artist: str, job_id: str = 
     elif _auto_movement:
         _clause2 = ("(2) the camera register that matches the song's energy — a "
                     "LOCKED STATIC frame for intimate/calm songs, SUBTLE minimal "
-                    "motion for most, active camera movement ONLY for genuinely "
-                    "high-energy tracks; do NOT default to a constant cinematic "
-                    "drift — and the framing")
+                    "motion for most, and at most a GENTLE LATERAL track, slow "
+                    "orbit or parallax for genuinely high-energy tracks; NEVER a "
+                    "camera that travels FORWARD toward the subject (no push-in, "
+                    "dolly forward, fly-through or first-person glide) because the "
+                    "lyrics are overlaid and forward motion makes them nauseating "
+                    "to read; do NOT default to a constant cinematic drift — and "
+                    "the framing")
     else:
         _clause2 = "(2) exact camera movement and framing"
 
@@ -4310,10 +4317,10 @@ Example for introspective acoustic / folk track:
 Example (SUBTLE minimal motion):
 {"style":"video","prompt":"Barely-moving shot of a misty mountain valley at dawn, an almost imperceptible drift, layered blue and pink sky, low fog rolling slowly between still pine trees, contemplative and vast, cinematic 4k"}
 
-Example (ACTIVE camera movement — only when the song's energy genuinely calls for it):
-{"style":"video","prompt":"Slow drone over a stormy desert highway at dusk, lightning fracturing distant clouds, asphalt reflecting the dying light, vintage road sign blurred in the foreground, dramatic and raw, cinematic 4k"}
+Example (ACTIVE camera movement — gentle LATERAL track only, never forward, used only when the song's energy genuinely calls for it):
+{"style":"video","prompt":"Slow lateral tracking shot gliding sideways past a stormy desert ridge at dusk, lightning fracturing distant clouds, layered rock formations sliding through frame, dramatic and raw, cinematic 4k"}
 
-CAMERA REGISTER (important): choose the register that matches the song — a LOCKED STATIC frame for intimate/calm/slow songs, SUBTLE minimal motion for most tracks, and ACTIVE camera movement only for genuinely high-energy songs. Do NOT default to constant cinematic drift; vary it per song. Scene motion (water, light, foliage, particles) is always allowed."""
+CAMERA REGISTER (important): choose the register that matches the song — a LOCKED STATIC frame for intimate/calm/slow songs, SUBTLE minimal motion for most tracks, and at most a GENTLE LATERAL track / slow orbit / parallax for genuinely high-energy songs. NEVER move the camera FORWARD toward the subject (no push-in, dolly forward, fly-through, first-person glide) — the lyrics are overlaid and forward motion makes them nauseating to read. Do NOT default to constant cinematic drift; vary it per song. Scene motion (water, light, foliage, particles) is always allowed."""
     else:
         _EXAMPLES_BLOCK = """Example for rock / energetic / dramatic track:
 {"style":"video","prompt":"Slow drone over a stormy desert highway at dusk, lightning fracturing distant clouds, asphalt reflecting the dying light, vintage road sign blurred in the foreground, dramatic and raw, cinematic 4k"}
@@ -4830,7 +4837,8 @@ def _generate_veo_video(prompt: str, output_path: str, job_id: str = None,
                         movement_style: str = "",
                         normalized_concept: str = "",
                         high_fidelity: bool = False,
-                        allow_people: bool = False) -> str:
+                        allow_people: bool = False,
+                        verbatim: bool = False) -> str:
     """Generate a video clip with Google Veo 3 via direct Vertex AI REST API.
 
     We bypass google-genai SDK for Veo specifically because its internal auth
@@ -4865,7 +4873,11 @@ def _generate_veo_video(prompt: str, output_path: str, job_id: str = None,
     # rails en el system prompt. El negative en safe_prompt es la última
     # red de seguridad antes de Veo. Si el operador SÍ pidió urbano, no
     # bloqueamos (es su decisión consciente).
-    no_alley = "" if normalized_concept == "urbano" else (
+    # `verbatim`: el operador escribió su propio prompt ("Mi prompt manda",
+    # decisión UMG 2026-05-21). Sus palabras de ESCENA y CÁMARA se respetan
+    # tal cual — no le pegamos los de-bias (callejón/avance). Solo quedan los
+    # rieles legales (sin personas/caras/texto/logos) más abajo.
+    no_alley = "" if (normalized_concept == "urbano" or verbatim) else (
         "Avoid generic narrow alleyway, dark alley, callejón, and neon-lit "
         "back-street as the primary subject unless the lyrics demand it. "
     )
@@ -4892,6 +4904,19 @@ def _generate_veo_video(prompt: str, output_path: str, job_id: str = None,
     _camera_negatives = (
         " no camera movement, no pan, no tilt, no zoom, no dolly, no push-in, "
         "no drift, no orbit, no crane, no handheld, no parallax."
+    )
+    # Forward-travel negatives — legibility cap. UMG 2026-05-21: backgrounds
+    # where the camera "advances / flies" forward make the OVERLAID LYRICS
+    # nauseating to read ("marean cuando lees la letra"). Because there is
+    # ALWAYS text on top of these clips, forward translation toward the
+    # subject is never acceptable on the default path. Lateral / orbit /
+    # ambient motion stays fine. Applied to every register EXCEPT an explicit
+    # "Cinematográfico" (estandar) pick, which is the operator's conscious
+    # choice — same opt-in principle as concept=urbano above.
+    _forward_travel_negative = (
+        " no forward camera travel, no push-in, no dolly forward, no "
+        "fly-through, no first-person glide forward, no zoom toward the "
+        "subject, no drone advancing toward the camera."
     )
     _norm_move = _normalize_movement_style(movement_style)
     if _norm_move == "animado":
@@ -4920,11 +4945,17 @@ def _generate_veo_video(prompt: str, output_path: str, job_id: str = None,
             f"{_camera_negatives}"
         )
     else:
+        # Auto / sutil / foto-parallax (and any unknown register): cap forward
+        # travel so the overlaid lyrics stay readable. Two opt-outs: the
+        # explicit "Cinematográfico" pick (estandar), and verbatim mode (the
+        # operator wrote their own camera language — "mi prompt manda").
+        _legibility_cap = "" if (_norm_move == "estandar" or verbatim) else _forward_travel_negative
         safe_prompt = (
             f"{prompt}. Photorealistic, filmed with cinema camera, real footage. "
             f"{no_alley}"
             f"{_base_negatives}"
             " no CGI, no animation."
+            f"{_legibility_cap}"
         )
 
     # veo-3.1-fast at $0.10/s (no audio) is 75% cheaper than the standard
@@ -5483,6 +5514,12 @@ def _ensure_background(style_hint: str, job_dir: str, lyrics_text: str = None,
         _ken_burns_image_to_mp4(image_path, bg_path, static=(_norm_move_bg == "estatico"))
         return bg_path
 
+    # True verbatim = operator's own prompt is actually in use (bg_verbatim set
+    # AND a non-empty hint). bg_verbatim alone with no hint falls through to
+    # Gemini, so the de-bias rails must still apply there. Mirrors the
+    # short-circuit condition in _get_unique_prompt.
+    _is_verbatim = bool(bg_verbatim and background_hint and background_hint.strip())
+
     # Generate video background with Veo 3 (always video, no images)
     result = _get_unique_prompt(
         lyrics_text, artist, job_id=job_id, song_title=song_title, genre=genre,
@@ -5507,6 +5544,7 @@ def _ensure_background(style_hint: str, job_dir: str, lyrics_text: str = None,
                 normalized_concept=_normalize_concept(concept),
                 high_fidelity=bg_verbatim,
                 allow_people=allow_people,
+                verbatim=_is_verbatim,
             )
             # Semantic relevance check — always score, but cap retries at one
             # to bound cost (+$0.80 worst case). quality_retry_used gates the
