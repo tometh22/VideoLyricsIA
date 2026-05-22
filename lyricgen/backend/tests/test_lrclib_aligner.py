@@ -208,3 +208,58 @@ def test_split_passes_through_segments_without_words():
         [{"start": 1.0, "end": 2.0, "text": "sin words"}]
     )
     assert out == [{"start": 1.0, "end": 2.0, "text": "sin words"}]
+
+
+# --- keep_unmatched: insert missing lines for review ---------------------
+
+def test_keep_unmatched_inserts_missing_line_interpolated():
+    """The middle line Whisper missed is kept (not dropped), placed between
+    its neighbors with interpolated timing and review=True."""
+    plain = "primera linea\nsegunda linea\ntercera linea"
+    whisper = [
+        _make_segment("primera linea",
+                      [("primera", 1.0, 1.5), ("linea", 1.5, 2.0)]),
+        _make_segment("tercera linea",
+                      [("tercera", 10.0, 10.5), ("linea", 10.5, 11.0)]),
+    ]
+    out = align_lrclib_to_whisper(
+        plain, whisper, min_ratio=0.7, keep_unmatched=True, total_duration=12.0,
+    )
+    assert [o["text"] for o in out] == ["primera linea", "segunda linea", "tercera linea"]
+    # Matched lines carry no review flag; the missing one does.
+    assert "review" not in out[0] and "review" not in out[2]
+    assert out[1].get("review") is True
+    # Interpolated between neighbour anchors (2.0 .. 10.0).
+    assert 2.0 <= out[1]["start"] < out[1]["end"] <= 10.0
+
+
+def test_keep_unmatched_default_still_drops():
+    """Without keep_unmatched the missing line is dropped (lrclib-hit path
+    behaviour unchanged)."""
+    plain = "primera linea\nsegunda linea\ntercera linea"
+    whisper = [
+        _make_segment("primera linea",
+                      [("primera", 1.0, 1.5), ("linea", 1.5, 2.0)]),
+        _make_segment("tercera linea",
+                      [("tercera", 10.0, 10.5), ("linea", 10.5, 11.0)]),
+    ]
+    out = align_lrclib_to_whisper(plain, whisper, min_ratio=0.7)
+    assert [o["text"] for o in out] == ["primera linea", "tercera linea"]
+    assert all("review" not in o for o in out)
+
+
+def test_keep_unmatched_trailing_lines_use_duration():
+    """Unmatched lines after the last match spread up to total_duration."""
+    plain = "una\ndos\ntres"
+    whisper = [
+        _make_segment("una", [("una", 1.0, 1.5)]),
+    ]
+    out = align_lrclib_to_whisper(
+        plain, whisper, min_ratio=0.7, keep_unmatched=True, total_duration=10.0,
+    )
+    assert [o["text"] for o in out] == ["una", "dos", "tres"]
+    assert out[1]["review"] and out[2]["review"]
+    # Two trailing lines spread across (1.5 .. 10.0), in order.
+    assert out[1]["start"] >= 1.5
+    assert out[2]["start"] > out[1]["start"]
+    assert out[2]["end"] <= 10.05

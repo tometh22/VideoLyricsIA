@@ -136,6 +136,20 @@ def perceptual_start(seg_start: float, fade_dur: float) -> float:
     return max(0.0, seg_start - fade_dur / 2.0)
 
 
+def moviepy_line_placement(line_pos, clip_w, clip_h, frame_w, frame_h, dx=0, dy=0):
+    """Top-left (x, y) so a clip of size (clip_w, clip_h) is CENTERED on the
+    per-line position, for the moviepy render path.
+
+    line_pos is (x, y) as 0..1 fractions of the frame (the line's center),
+    matching build_ass's `\\pos` mapping (px = pos.x * width). None → frame
+    center, i.e. the legacy centered behavior. dx/dy add a screen-space
+    offset (the drop-shadow displacement). Pure (no moviepy) so it's unit-
+    testable; the rotation itself stays in pipeline (moviepy clip.rotate)."""
+    cx = (line_pos[0] if line_pos else 0.5) * frame_w
+    cy = (line_pos[1] if line_pos else 0.5) * frame_h
+    return (cx - clip_w / 2 + dx, cy - clip_h / 2 + dy)
+
+
 def font_family(font_path: str) -> tuple[str, bool]:
     """Resolve a .ttf path to its libass-matchable (family_name, is_bold).
 
@@ -238,8 +252,11 @@ def title_card_lines(
     has_long_intro = first_lyric_start > START_T + 0.5
 
     if has_long_intro:
-        artist_size = max(30, int(round(62 * text_scale)))
-        title_size = max(24, int(round(46 * text_scale)))
+        # Hero title card: artist is the prominent line (bigger than the 85px
+        # lyric tier), song title secondary. Bumped 2026-05 — the old 62/46
+        # read smaller than the lyrics, which felt wrong for the intro moment.
+        artist_size = max(30, int(round(100 * text_scale)))
+        title_size = max(24, int(round(62 * text_scale)))
         title_end = min(first_lyric_start - 0.2, START_T + 8.0)
         clip_dur = max(0.1, title_end - START_T)
         fade_in = min(0.4, max(0.1, clip_dur * 0.25))

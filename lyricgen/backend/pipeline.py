@@ -6348,8 +6348,17 @@ def _make_text_clip(
     lyric_transition: str = "cut",
     text_motion: str = "none",
     text_contrast: str = "medium",
+    line_pos: tuple | None = None,
+    line_scale: float = 1.0,
+    line_rot: float = 0.0,
 ):
-    """Create a clean text clip matching pro lyric video style (bold white, outline + shadow)."""
+    """Create a clean text clip matching pro lyric video style (bold white, outline + shadow).
+
+    Per-line layout overrides (line_pos/line_scale/line_rot) come from the
+    editor preview and mirror the ASS path (ass_render.segments_to_lines):
+    line_scale multiplies the tier fontsize; line_pos centers the line at a
+    0..1 fraction of the frame; line_rot tilts it (CSS-clockwise degrees). When
+    none are set the centered/text_motion behavior is byte-for-byte unchanged."""
     import unicodedata
     if spec is None:
         spec = RenderSpec.youtube_default()
@@ -6379,6 +6388,10 @@ def _make_text_clip(
         text_width = int(round(1500 * scale))
 
     fontsize = _ass.lyric_fontsize(text_len, scale, font_scale)
+    # Per-line scale override from the editor preview (parity with ASS
+    # segments_to_lines): multiply the tier fontsize, floor at 8px.
+    if line_scale and float(line_scale) > 0 and float(line_scale) != 1.0:
+        fontsize = max(8, int(round(fontsize * float(line_scale))))
 
     shadow_offset = max(1, int(round(3 * scale)))
     fallback_font = os.path.join(_FONTS_DIR, "Montserrat-Bold.ttf")
@@ -6397,6 +6410,21 @@ def _make_text_clip(
     adjusted_start = _ass.perceptual_start(seg_start, fade_dur)
     adjusted_end = seg_end  # End is unaffected; only the visual onset shifts.
 
+    # Per-line layout override (move/rotate). When present we position the
+    # line EXPLICITLY (centered on line_pos, rotated by line_rot) and ignore
+    # text_motion — the operator placed it deliberately in the editor. Absent
+    # → the centered/motion path below runs unchanged.
+    _has_layout = line_pos is not None or bool(line_rot and float(line_rot) != 0.0)
+    _mv_rot = -float(line_rot or 0.0)  # CSS clockwise → moviepy CCW-positive
+
+    def _place(clip, dx=0, dy=0):
+        # Rotate (expands the bbox) then center the rotated clip on line_pos,
+        # plus an optional screen-space offset (drop-shadow displacement).
+        if _mv_rot:
+            clip = clip.rotate(_mv_rot)
+        return clip.set_position(_ass.moviepy_line_placement(
+            line_pos, clip.w, clip.h, spec.width, spec.height, dx, dy))
+
     def _try_text_clip(txt, fsize, fnt, color, **kwargs):
         try:
             return TextClip(txt, fontsize=fsize, font=fnt, color=color,
@@ -6410,13 +6438,16 @@ def _make_text_clip(
     # Centered top-left coordinates for a clip of size (text_width, sh)
     base_x = (spec.width - text_width) // 2
     base_y = (spec.height - sh) // 2
-    shadow_pos = _text_position_func(spec, text_motion, seg_duration,
-                                     clip_x=base_x, clip_y=base_y,
-                                     shadow_offset=shadow_offset)
-    if callable(shadow_pos):
-        shadow = shadow.set_position(lambda t, _p=shadow_pos: _p(t))
+    if _has_layout:
+        shadow = _place(shadow, shadow_offset, shadow_offset)
     else:
-        shadow = shadow.set_position((base_x + shadow_offset, base_y + shadow_offset))
+        shadow_pos = _text_position_func(spec, text_motion, seg_duration,
+                                         clip_x=base_x, clip_y=base_y,
+                                         shadow_offset=shadow_offset)
+        if callable(shadow_pos):
+            shadow = shadow.set_position(lambda t, _p=shadow_pos: _p(t))
+        else:
+            shadow = shadow.set_position((base_x + shadow_offset, base_y + shadow_offset))
     shadow = shadow.set_start(adjusted_start).set_end(adjusted_end)
 
     layers = []
@@ -6424,13 +6455,16 @@ def _make_text_clip(
     # "strong" mode: add a counter-shadow at the opposite offset to widen the halo
     if contrast["extra_shadow"]:
         shadow2 = _try_text_clip(display_text, fontsize, font, "black").set_opacity(contrast["shadow_opacity"] * 0.5)
-        shadow2_pos = _text_position_func(spec, text_motion, seg_duration,
-                                          clip_x=base_x, clip_y=base_y,
-                                          shadow_offset=-shadow_offset)
-        if callable(shadow2_pos):
-            shadow2 = shadow2.set_position(lambda t, _p=shadow2_pos: _p(t))
+        if _has_layout:
+            shadow2 = _place(shadow2, -shadow_offset, -shadow_offset)
         else:
-            shadow2 = shadow2.set_position((base_x - shadow_offset, base_y - shadow_offset))
+            shadow2_pos = _text_position_func(spec, text_motion, seg_duration,
+                                              clip_x=base_x, clip_y=base_y,
+                                              shadow_offset=-shadow_offset)
+            if callable(shadow2_pos):
+                shadow2 = shadow2.set_position(lambda t, _p=shadow2_pos: _p(t))
+            else:
+                shadow2 = shadow2.set_position((base_x - shadow_offset, base_y - shadow_offset))
         shadow2 = shadow2.set_start(adjusted_start).set_end(adjusted_end)
         if fade_dur > 0:
             shadow2 = shadow2.crossfadein(fade_dur).crossfadeout(fade_dur)
@@ -6438,15 +6472,18 @@ def _make_text_clip(
 
     layers.append(shadow)
 
-    txt_pos = _text_position_func(spec, text_motion, seg_duration,
-                                  clip_x=base_x, clip_y=base_y,
-                                  shadow_offset=0)
     txt = _try_text_clip(display_text, fontsize, font, "white",
                          stroke_color="black", stroke_width=stroke_width)
-    if callable(txt_pos):
-        txt = txt.set_position(lambda t, _p=txt_pos: _p(t))
+    if _has_layout:
+        txt = _place(txt, 0, 0)
     else:
-        txt = txt.set_position("center")
+        txt_pos = _text_position_func(spec, text_motion, seg_duration,
+                                      clip_x=base_x, clip_y=base_y,
+                                      shadow_offset=0)
+        if callable(txt_pos):
+            txt = txt.set_position(lambda t, _p=txt_pos: _p(t))
+        else:
+            txt = txt.set_position("center")
     txt = txt.set_start(adjusted_start).set_end(adjusted_end)
 
     if fade_dur > 0:
@@ -6875,6 +6912,48 @@ def _ffmpeg_filter_escape(path: str) -> str:
     return path.replace("\\", "\\\\").replace(":", "\\:")
 
 
+def _validate_rendered_mp4(path: str, expected_dur: float) -> None:
+    """Raise if the rendered MP4 isn't browser-playable. Catches the
+    malformed-but-exit-0 outputs the plain returncode check misses
+    (incident 2026-05-21: a 124 MB ASS render with the moov atom at the
+    END never started in the browser → infinite spinner). Checks: file
+    non-empty, has a video + audio stream, duration within ±3 s of the
+    audio, and the moov atom near the FRONT (faststart). On any failure
+    the caller falls back to the proven moviepy path."""
+    import json as _json
+    if not os.path.exists(path) or os.path.getsize(path) < 4096:
+        raise RuntimeError(f"rendered file missing/empty: {path}")
+    probe = subprocess.run(
+        ["ffprobe", "-v", "error", "-show_entries",
+         "stream=codec_type:format=duration", "-of", "json", path],
+        capture_output=True, text=True, timeout=60,
+    )
+    if probe.returncode != 0:
+        raise RuntimeError(f"ffprobe failed on render: {probe.stderr[-300:]}")
+    data = _json.loads(probe.stdout or "{}")
+    types = {s.get("codec_type") for s in data.get("streams", [])}
+    if "video" not in types:
+        raise RuntimeError("rendered mp4 has no video stream")
+    if "audio" not in types:
+        raise RuntimeError("rendered mp4 has no audio stream")
+    try:
+        dur = float((data.get("format") or {}).get("duration") or 0)
+    except (TypeError, ValueError):
+        dur = 0.0
+    if expected_dur and abs(dur - expected_dur) > 3.0:
+        raise RuntimeError(
+            f"rendered duration {dur:.1f}s != expected {expected_dur:.1f}s"
+        )
+    # faststart: moov must precede mdat near the front (mp4 only).
+    if path.lower().endswith(".mp4"):
+        with open(path, "rb") as f:
+            head = f.read(2_000_000)
+        moov = head.find(b"moov")
+        mdat = head.find(b"mdat")
+        if not (moov != -1 and (mdat == -1 or moov < mdat)):
+            raise RuntimeError("rendered mp4 lacks faststart (moov not at front)")
+
+
 def _render_lyrics_ass(
     bg_video_path: str,
     mp3_path: str,
@@ -7009,6 +7088,12 @@ def _render_lyrics_ass(
         *vargs,
         *aargs,
         "-r", spec.fps_str,
+        # Move the moov atom to the front so the browser can start playback
+        # immediately (progressive streaming). Without this the moov lands
+        # at the END of the file; on a large main video (~124 MB) the player
+        # can't reach it without downloading everything → infinite spinner.
+        # The short played only because it's small enough to fully buffer.
+        "-movflags", "+faststart",
         "-shortest",
         os.path.basename(out_path),
     ]
@@ -7029,8 +7114,11 @@ def _render_lyrics_ass(
         import shutil
         shutil.rmtree(font_dir, ignore_errors=True)
 
+    # Validate the output is actually browser-playable; on failure the
+    # caller (generate_lyric_video) catches and falls back to moviepy.
+    _validate_rendered_mp4(out_path, duration)
     size_mb = os.path.getsize(out_path) / (1024 * 1024)
-    logger.info("[ASS] lyric video rendered: %.0fs audio, %.1f MB (libass fast path)",
+    logger.info("[ASS] lyric video rendered: %.0fs audio, %.1f MB (libass fast path, validated)",
                 duration, size_mb)
     return out_path
 
@@ -7260,8 +7348,11 @@ def generate_lyric_video(
 
             if has_long_intro:
                 # ----- CENTRED FULL CARD (long intro) -----
-                artist_size = max(30, int(round(62 * scale)))
-                title_size = max(24, int(round(46 * scale)))
+                # Hero sizes: artist bigger than the 85px lyric tier, song
+                # secondary. Mirrors ass_render.title_card_lines. Bumped 2026-05
+                # (old 62/46 read smaller than the lyrics).
+                artist_size = max(30, int(round(100 * scale)))
+                title_size = max(24, int(round(62 * scale)))
                 card_width = int(round(spec.width * 0.80))
                 stroke_w = max(1, int(round(1.6 * scale)))
                 title_end = min(first_lyric_start - 0.2, START_T + 8.0)
@@ -7351,11 +7442,23 @@ def generate_lyric_video(
             logger.warning("[TITLE] title card failed (%s); continuing", e)
 
     for seg in segments:
+        # Per-line layout overrides set in the editor preview (parity with the
+        # ASS path's segments_to_lines). Absent → centered/motion default.
+        _lp = seg.get("pos")
+        _line_pos = (
+            (float(_lp["x"]), float(_lp["y"]))
+            if isinstance(_lp, dict) and "x" in _lp and "y" in _lp else None
+        )
+        _ls = seg.get("scale")
+        _line_scale = float(_ls) if isinstance(_ls, (int, float)) and _ls > 0 else 1.0
+        _lr = seg.get("rot")
+        _line_rot = float(_lr) if isinstance(_lr, (int, float)) else 0.0
         layers = _make_text_clip(
             seg["text"], seg["start"], seg["end"], font, spec=spec,
             text_case=text_case, font_scale=font_scale,
             lyric_transition=lyric_transition, text_motion=text_motion,
             text_contrast=text_contrast,
+            line_pos=_line_pos, line_scale=_line_scale, line_rot=_line_rot,
         )
         text_layers.extend(layers)
 
@@ -7475,6 +7578,10 @@ def generate_lyric_video(
         audio_codec=spec.audio_codec,
         threads=8,
         preset="veryfast",
+        # +faststart: moov atom al frente → reproducción progresiva en el
+        # navegador sin depender de range-requests (universal para archivos
+        # grandes). Mismo motivo que el path libass.
+        ffmpeg_params=["-movflags", "+faststart"],
         logger=None,
     )
     audio.close()
@@ -7658,6 +7765,7 @@ def generate_short(
         audio_codec="aac",
         threads=8,
         preset="veryfast",
+        ffmpeg_params=["-movflags", "+faststart"],
         logger=None,
     )
     audio.close()

@@ -2995,6 +2995,29 @@ async def _run_transcription_for_job(
             synced = lrc.get("synced")
             plain = lrc.get("plain") or ""
             lrc_dur = lrc.get("duration")
+
+            # Forced alignment (preferred when enabled): align the KNOWN
+            # lyrics to THIS audio at ±50ms instead of trusting lrclib's
+            # community timestamps (often drifted / missing lines — the
+            # Intoxicados case) or Whisper's loose timing. Falls back to
+            # the existing synced/Whisper logic on any failure.
+            import forced_align
+            if forced_align.is_enabled():
+                fa_text = plain or forced_align.lrc_to_plain_text(synced)
+                if fa_text:
+                    fa_segs = await asyncio.to_thread(
+                        forced_align.forced_align_lyrics, tmp_path, fa_text,
+                    )
+                    if fa_segs:
+                        logger.info("[LYRICS] forced alignment used (%s lines, lrclib text) for %r - %r", len(fa_segs), artist_hint, song_hint)
+                        from jobs import set_timing_source
+                        set_timing_source(job_id, "forced_align")
+                        return {
+                            "job_id": job_id,
+                            "segments": fa_segs,
+                            "reference_lyrics": fa_text,
+                            "recovery_source": "forced_align",
+                        }
             if synced:
                 user_dur = await asyncio.to_thread(_audio_duration, tmp_path)
                 offset = 0.0
@@ -3104,6 +3127,8 @@ async def _run_transcription_for_job(
                                 logger.info("[LYRICS] lrclib line 1 was anchored at 0s with a long gap to line 2; shifted to %.2fs based on median cadence", _moved)
                         combined = hybrid_intro_segs + song_segs
                         logger.info("[LYRICS] lrclib synced hit — %s segments (%s intro + %s song), skipping main Whisper for %r - %r", len(combined), len(hybrid_intro_segs), len(song_segs), artist_hint, song_hint)
+                        from jobs import set_timing_source
+                        set_timing_source(job_id, "lrclib_synced")
                         return {
                             "job_id": job_id,
                             "segments": combined,
@@ -3412,6 +3437,25 @@ async def _run_transcription_for_job(
         if reference:
             user_dur = await asyncio.to_thread(_audio_duration, tmp_path)
 
+            # Forced alignment (preferred when enabled): align the Gemini/
+            # lyrics.ovh reference to THIS audio at ±50ms. Falls back to the
+            # Whisper-word aligner / gap-fill below on any failure.
+            import forced_align
+            if forced_align.is_enabled():
+                fa_segs = await asyncio.to_thread(
+                    forced_align.forced_align_lyrics, tmp_path, reference,
+                )
+                if fa_segs:
+                    logger.info("[LYRICS] forced alignment used (%s lines, gemini text)", len(fa_segs))
+                    from jobs import set_timing_source
+                    set_timing_source(job_id, "forced_align")
+                    return {
+                        "job_id": job_id,
+                        "segments": fa_segs,
+                        "reference_lyrics": reference,
+                        "recovery_source": "forced_align",
+                    }
+
             # Plain-lyrics aligner on the Gemini/lyrics.ovh reference —
             # mirrors the lrclib-hit path. Whisper merges/splits lines by
             # audio pauses, which on live recordings (crowd, reverb)
@@ -3426,15 +3470,23 @@ async def _run_transcription_for_job(
                     ref_lines = sum(
                         1 for ln in reference.splitlines() if ln.strip()
                     )
-                    aligned = align_lrclib_to_whisper(reference, segments)
-                    coverage = (
-                        len(aligned) / ref_lines if ref_lines else 0.0
+                    # keep_unmatched: insert the lines Whisper missed in
+                    # place (interpolated timing + review flag) so the
+                    # operator nudges/deletes instead of re-typing.
+                    aligned = align_lrclib_to_whisper(
+                        reference, segments,
+                        keep_unmatched=True, total_duration=user_dur,
                     )
-                    if coverage >= 0.5 and len(aligned) >= 8:
-                        logger.info("[LYRICS] aligner (gemini): %s/%s lines aligned (%.0f%% coverage) — replacing Whisper segmentation", len(aligned), ref_lines, coverage * 100)
+                    # Coverage is judged on CONFIDENT matches only (lines
+                    # without the review flag), not the interpolated ones.
+                    matched = sum(1 for s in aligned if not s.get("review"))
+                    review = len(aligned) - matched
+                    coverage = matched / ref_lines if ref_lines else 0.0
+                    if coverage >= 0.5 and matched >= 8:
+                        logger.info("[LYRICS] aligner (gemini): %s/%s lines matched (%.0f%% coverage), %s inserted for review — replacing Whisper segmentation", matched, ref_lines, coverage * 100, review)
                         segments = aligned
                     else:
-                        logger.warning("[LYRICS] aligner (gemini): low coverage (%s/%s = %.0f%%) — keeping raw Whisper, trying hallucination recovery", len(aligned), ref_lines, coverage * 100)
+                        logger.warning("[LYRICS] aligner (gemini): low coverage (%s/%s = %.0f%%) — keeping raw Whisper, trying hallucination recovery", matched, ref_lines, coverage * 100)
                 except Exception as e:
                     # Opt-in and conservative: any aligner failure must NOT
                     # break the existing pipeline.
@@ -3716,6 +3768,20 @@ async def generate_with_segments(
         _font_scale_gen = max(0.6, min(1.5, float(font_scale or "1.0")))
     except (ValueError, TypeError):
         pass
+
+    # Remove the orphan draft the wizard sometimes leaves behind: if a
+    # sibling transcribed_pending/awaiting_upload row for the same audio was
+    # just created (re-upload-on-generate bug), delete it so the operator
+    # doesn't see a phantom "2nd job". Time-windowed so it never touches an
+    # intentional re-upload of the same song later.
+    try:
+        from jobs import supersede_sibling_drafts
+        supersede_sibling_drafts(
+            db, keep_job_id=job_id, user_id=current_user["id"],
+            tenant_id=current_user["tenant_id"], filename=existing_filename or "",
+        )
+    except Exception as e:
+        logger.warning("[DEDUP] supersede sibling drafts failed: %s", e)
 
     enqueue_pipeline(
         job_id=job_id,

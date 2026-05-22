@@ -2,7 +2,7 @@
 
 import logging
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 from sqlalchemy.exc import OperationalError
@@ -164,6 +164,65 @@ def touch_user_activity(db: Session, job: Job) -> None:
     """
     from datetime import datetime, timezone
     job.last_user_activity_at = datetime.now(timezone.utc)
+
+
+def set_timing_source(job_id: str, source: str) -> None:
+    """Record which engine produced a job's lyric timing (forced_align /
+    lrclib_synced / gemini_aligner / whisper) for observability. Best-effort
+    with its own short-lived session so it never holds the request
+    connection or breaks the transcription path on failure."""
+    try:
+        from database import SessionLocal
+        s = SessionLocal()
+        try:
+            j = s.query(Job).filter(Job.job_id == job_id).first()
+            if j is not None:
+                j.timing_source = source
+                s.commit()
+        finally:
+            s.close()
+    except Exception:
+        logging.getLogger("genly").debug("set_timing_source failed for %s", job_id)
+
+
+def supersede_sibling_drafts(
+    db: Session, *, keep_job_id: str, user_id: int, tenant_id: str,
+    filename: str, window_min: int = 20,
+) -> int:
+    """Delete sibling DRAFT jobs (transcribed_pending / awaiting_upload) for
+    the same user + same filename created within `window_min`, excluding
+    `keep_job_id`.
+
+    Why: the wizard's generate flow can re-upload the audio (new job row)
+    instead of reusing the transcribe job, leaving an orphan
+    transcribed_pending row that shows up as a phantom "2nd job". This
+    removes that orphan at generate time. Time-windowed (default 20 min) so
+    it never touches an INTENTIONAL re-upload of the same song hours later.
+    Returns the number of rows deleted. Caller need not commit (we do).
+    """
+    if not filename:
+        return 0
+    cutoff = datetime.now(timezone.utc) - timedelta(minutes=window_min)
+    siblings = (
+        db.query(Job)
+        .filter(Job.user_id == user_id, Job.tenant_id == tenant_id)
+        .filter(Job.job_id != keep_job_id)
+        .filter(Job.filename == filename)
+        .filter(Job.status.in_(("transcribed_pending", "awaiting_upload")))
+        .filter(Job.created_at >= cutoff)
+        .all()
+    )
+    n = 0
+    for sib in siblings:
+        db.delete(sib)
+        n += 1
+    if n:
+        db.commit()
+        logging.getLogger("genly").info(
+            "[DEDUP] superseded %s sibling draft(s) of %s for %r",
+            n, keep_job_id, filename,
+        )
+    return n
 
 
 def input_audio_is_shared(db: Session, job: Job) -> bool:

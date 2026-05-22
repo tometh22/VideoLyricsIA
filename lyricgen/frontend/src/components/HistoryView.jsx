@@ -37,6 +37,11 @@ function StatusBadge({ status, t }) {
     pending_review:     { label: t("batch.pending_review") || "Pending",  cls: "bg-amber-500/15 text-amber-300 ring-1 ring-amber-500/30" },
     processing:         { label: t("history.processing"),                 cls: "bg-brand/15 text-brand-light ring-1 ring-brand/30" },
     queued:             { label: "En cola",                                cls: "bg-surface-3/60 text-ink-secondary ring-1 ring-white/[0.06]" },
+    // Borrador transcripto que aún no se generó (o subida en curso). NO es
+    // un render colgado — antes caía al default "Procesando" y parecía
+    // trabado. Estilo neutro (no spinner) para distinguirlo de un render.
+    transcribed_pending: { label: t("history.draft") || "Sin generar",       cls: "bg-surface-3/60 text-ink-secondary ring-1 ring-white/[0.06] border border-dashed border-white/10" },
+    awaiting_upload:    { label: t("history.uploading") || "Subiendo…",      cls: "bg-surface-3/60 text-ink-secondary ring-1 ring-white/[0.06]" },
     editing:            { label: t("history.editing") || "Re-renderizando", cls: "bg-brand/15 text-brand-light ring-1 ring-brand/30" },
     error:              { label: t("history.error"),                      cls: "bg-red-500/15 text-red-300 ring-1 ring-red-500/30" },
     validation_failed:  { label: t("batch.validation_failed") || "Failed", cls: "bg-red-500/15 text-red-300 ring-1 ring-red-500/30" },

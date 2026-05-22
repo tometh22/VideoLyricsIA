@@ -375,7 +375,7 @@ export default function LyricsEditor({
     if (!onPersistSegments || !transcribeJobId) return undefined;
     if (!Array.isArray(edited) || edited.length === 0) return undefined;
     const tid = setTimeout(() => {
-      const cleaned = edited.map(({ _id, ...rest }) => rest);
+      const cleaned = edited.map(({ _id, review, ...rest }) => rest);
       onPersistSegments(transcribeJobId, cleaned);
     }, 3000);
     return () => clearTimeout(tid);
@@ -390,7 +390,7 @@ export default function LyricsEditor({
     if (disableAutosave || !onPersistSegments || !transcribeJobId) return undefined;
     let cancelled = false;
     setSaveStatus("saving");
-    const cleaned = edited.map(({ _id, ...rest }) => rest);
+    const cleaned = edited.map(({ _id, review, ...rest }) => rest);
     Promise.resolve(onPersistSegments(transcribeJobId, cleaned))
       .then(() => { if (!cancelled) setSaveStatus("saved"); })
       .catch(() => { if (!cancelled) setSaveStatus("idle"); });
@@ -414,7 +414,7 @@ export default function LyricsEditor({
   // to fire per keystroke — a single map() over the segments array.
   useEffect(() => {
     if (!onEditedChange || !Array.isArray(edited)) return;
-    const cleaned = edited.map(({ _id, ...rest }) => rest);
+    const cleaned = edited.map(({ _id, review, ...rest }) => rest);
     onEditedChange(cleaned);
   }, [edited, onEditedChange]);
 
@@ -1350,6 +1350,30 @@ export default function LyricsEditor({
     });
   };
 
+  // Insert a blank line right AFTER the row at display index `idx`, timing
+  // interpolated into the gap to the next line. This is the "add a line in
+  // the MIDDLE of the song" affordance — the bottom "Agregar línea" button
+  // forced the operator to scroll away from where they were working.
+  const insertLineAfter = (idx) => {
+    setEdited((prev) => {
+      const cur = prev[idx];
+      const nxt = prev[idx + 1];
+      const gapStart = cur ? cur.end : (prev[0] ? prev[0].start : 0);
+      const gapEnd = nxt ? nxt.start : (duration || gapStart + 3);
+      const gap = Math.max(0, gapEnd - gapStart);
+      let s = gapStart + (gap > 0.6 ? gap / 3 : 0.1);
+      let e = s + (gap > 0.6 ? gap / 3 : 1.0);
+      if (!(e > s) || e > gapEnd) {
+        s = gapStart + 0.1;
+        e = Math.min(gapEnd > s ? gapEnd - 0.05 : s + 1.0, s + 1.0);
+        if (e <= s) e = s + 0.5;
+      }
+      const nextId = prev.reduce((m, x) => Math.max(m, x._id), -1) + 1;
+      const inserted = { _id: nextId, start: s, end: e, text: "" };
+      return [...prev, inserted].sort((a, b) => a.start - b.start);
+    });
+  };
+
   const name = filename.replace(/\.(mp3|wav)$/i, "");
   const pendingSuggestions = edited.filter((seg) => {
     const s = suggestionsById[seg._id];
@@ -2094,6 +2118,9 @@ export default function LyricsEditor({
             // button appears next to the timestamp. Auto-clears 10s after
             // the anchor (timer in tapAnchor's setHighlightedIds).
             const wasRecentlyAnchored = highlightedIds.has(seg._id);
+            // Line the aligner inserted (Whisper missed it): timing is
+            // interpolated, so flag it amber for the operator to verify.
+            const isReview = !!seg.review;
 
             return (
               <div
@@ -2104,6 +2131,7 @@ export default function LyricsEditor({
                   ${isArmed ? "bg-brand/[0.18] ring-2 ring-brand shadow-glow scale-[1.01]" : ""}
                   ${!isArmed && isActive ? "bg-brand/[0.07] ring-1 ring-brand/25" : ""}
                   ${!isArmed && !isActive && wasRecentlyAnchored ? "bg-brand/[0.05] ring-1 ring-brand/40" : ""}
+                  ${!isArmed && !isActive && !wasRecentlyAnchored && isReview ? "bg-amber-500/[0.06] ring-1 ring-amber-500/40" : ""}
                   ${isAnchored ? "opacity-60" : ""}`}
               >
                 <div className="flex items-start gap-2 p-1">
@@ -2167,8 +2195,18 @@ export default function LyricsEditor({
                       onBlur={(e) => handleTextBlur(seg._id, e.target.value)}
                       className={`w-full px-3 py-2 rounded-xl bg-surface-1 border text-sm text-white
                         focus:border-brand/40 focus:outline-none hover:border-white/[0.08] transition-all
-                        ${suggestion && !isApplied ? "border-amber-500/20" : "border-white/[0.04]"}`}
+                        ${suggestion && !isApplied ? "border-amber-500/20" : isReview ? "border-amber-500/40" : "border-white/[0.04]"}`}
                     />
+                    {isReview && (
+                      <span className="inline-flex items-center gap-1 mt-1 ml-1 px-2 py-0.5 rounded-full
+                        bg-amber-500/15 text-amber-300 text-[10px] font-medium">
+                        <svg className="w-3 h-3" fill="none" stroke="currentColor" strokeWidth="2.2" viewBox="0 0 24 24">
+                          <path d="M12 9v4M12 17h.01" />
+                          <path d="M10.3 3.9 1.8 18a2 2 0 0 0 1.7 3h17a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0z" />
+                        </svg>
+                        {t("editor.review_badge") || "revisar tiempo"}
+                      </span>
+                    )}
                     {propagationPrompt && propagationPrompt.id === seg._id && (
                       <div className="flex items-center gap-2 mt-1.5 px-3 py-2 rounded-xl
                         bg-brand/10 ring-1 ring-brand/30 text-xs text-white">
@@ -2265,6 +2303,15 @@ export default function LyricsEditor({
                       <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
                         <rect x="9" y="9" width="11" height="11" rx="1.5" />
                         <path d="M5 15V5a1 1 0 011-1h10" />
+                      </svg>
+                    </button>
+                    <button onClick={() => insertLineAfter(idx)}
+                      className="w-8 h-8 rounded-lg opacity-0 group-hover:opacity-100
+                        hover:bg-brand/10 flex items-center justify-center text-gray-600
+                        hover:text-brand-light transition-all"
+                      title={t("editor.insert_line_below") || "Insertar línea acá (en el medio de la canción)"}>
+                      <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
+                        <path d="M12 5v14M5 12h14" />
                       </svg>
                     </button>
                     {/* Per-row ✂ trim removed: redundant with the bulk
