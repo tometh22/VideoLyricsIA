@@ -260,6 +260,28 @@ export default function UploadZone({
   const [wizardStep, setWizardStep] = useState(1);
   const goStep = (n) => setWizardStep(Math.max(1, Math.min(WIZARD_STEPS.length, n)));
 
+  // Hovering a movement option previews it in the big stage without committing.
+  const [hoverMovement, setHoverMovement] = useState(null);
+  // Abstract motion icons — communicate the camera MOVEMENT, not a fake scene.
+  // The big live preview is what actually demonstrates the motion.
+  const movIcon = (code) => {
+    const p = { fill: "none", stroke: "currentColor", strokeWidth: 1.6, strokeLinecap: "round", strokeLinejoin: "round", viewBox: "0 0 24 24", className: "w-5 h-5" };
+    switch (code) {
+      case "estatico": // locked frame
+        return (<svg {...p}><rect x="5" y="7" width="14" height="10" rx="1.5" /><path d="M5 10V8.5M5 14v1.5M19 10V8.5M19 14v1.5M9 7H7.5M15 7h1.5M9 17H7.5M15 17h1.5" /></svg>);
+      case "sutil": // gentle zoom — small inward arrows
+        return (<svg {...p}><rect x="4.5" y="6.5" width="15" height="11" rx="1.5" /><path d="M10 10l-1.5-1.5M14 10l1.5-1.5M10 14l-1.5 1.5M14 14l1.5 1.5" /></svg>);
+      case "estandar": // strong push-in — bold inward arrows from corners
+        return (<svg {...p}><rect x="3.5" y="5.5" width="17" height="13" rx="1.5" /><path d="M8.5 9.5L6 7m0 0v2.2M6 7h2.2M15.5 9.5L18 7m0 0v2.2M18 7h-2.2M8.5 14.5L6 17m0 0v-2.2M6 17h2.2M15.5 14.5L18 17m0 0v-2.2M18 17h-2.2" /></svg>);
+      case "foto-parallax": // depth layers + horizontal pan
+        return (<svg {...p}><rect x="3" y="7" width="12" height="10" rx="1.5" /><rect x="9" y="9.5" width="12" height="8.5" rx="1.5" opacity="0.55" /><path d="M14 5h5m0 0l-2-2m2 2l-2 2" /></svg>);
+      case "animado": // stylised 2D shapes
+        return (<svg {...p}><circle cx="8" cy="9" r="2.4" /><path d="M14.5 6.5l3.5 5h-7z" /><rect x="9" y="14" width="6" height="4" rx="1" /></svg>);
+      default: // auto — sparkle
+        return (<svg {...p}><path d="M12 4l1.4 4 4 1.4-4 1.4L12 15l-1.4-4-4-1.4 4-1.4z" /><path d="M18 14l.6 1.7 1.7.6-1.7.6L18 18.6l-.6-1.7-1.7-.6 1.7-.6z" /></svg>);
+    }
+  };
+
   // Set of track indices with the inline "Personalizar" drawer open.
   const [expandedPersonalize, setExpandedPersonalize] = useState(() => new Set());
   const togglePersonalize = (idx) => {
@@ -711,60 +733,34 @@ export default function UploadZone({
             )}
           </div>
           <p className="text-[10px] text-gray-600 mt-0.5">
-            {t("upload.movement_gallery_desc") || "Cómo se anima el fondo · misma escena de muestra para comparar el movimiento (no es tu fondo final)"}
+            {t("upload.movement_gallery_desc") || "Cómo se mueve la cámara del fondo. Pasá el mouse o elegí y miralo en el preview ←"}
           </p>
         </div>
-        <style>{`
-          @keyframes gal-sm { to { transform: translate(2%,1.4%) scale(1.06); } }
-          @keyframes gal-lg { to { transform: translate(-9%,5%) scale(1.22); } }
-          @keyframes gal-par { to { transform: translate(-5%,0) scale(1.12); } }
-          @keyframes gal-parsun { to { transform: translate(16px,-7px); } }
-          @keyframes gal-anim { to { background-position: 40px 0; } }
-        `}</style>
-        <div className="grid grid-cols-2 sm:grid-cols-4 gap-2">
-          {MOVEMENT_STYLES.filter((m) => m.sample).map((m) => {
+        <div className="grid grid-cols-2 sm:grid-cols-3 gap-2">
+          {MOVEMENT_STYLES.map((m) => {
             const active = batchDefaults.movementStyle === m.code;
             return (
               <button
-                key={m.code}
+                key={m.code || "auto"}
                 type="button"
                 onClick={() => updateBatchDefault("movementStyle", m.code)}
+                onMouseEnter={() => setHoverMovement(m.code)}
+                onMouseLeave={() => setHoverMovement(null)}
                 aria-label={`${m.label}: ${m.desc}`}
                 title={m.desc}
-                className={`text-left rounded-xl overflow-hidden border transition-all duration-200 cursor-pointer
-                  ${active
-                    ? "border-brand/60 shadow-glow ring-1 ring-brand/40"
-                    : "border-white/[0.06] hover:border-white/[0.20] hover:scale-[1.02]"
-                  }`}
+                className={`text-left rounded-xl border px-3 py-2.5 transition-all duration-200 cursor-pointer ${
+                  active
+                    ? "border-transparent ring-1 ring-brand/50 bg-brand/[0.08] shadow-glow"
+                    : "border-white/[0.06] bg-surface-2/40 hover:border-white/[0.20]"
+                }`}
               >
-                <div className="aspect-video bg-black relative overflow-hidden">
-                  {/* REAL clips: same base scene rendered with each actual
-                      camera movement (ffmpeg), so the card shows the MOVEMENT,
-                      not a random scene. estatico=held, sutil/estandar=zoom,
-                      parallax=pan, animado=stylised. */}
-                  <video
-                    src={m.sample}
-                    className="w-full h-full object-cover pointer-events-none"
-                    muted autoPlay loop playsInline
-                  />
-                  <div className="absolute inset-0 bg-gradient-to-t from-black/40 to-transparent pointer-events-none" />
-                  {m.code === "estatico" && (
-                    <span className="absolute right-1.5 bottom-1.5 text-[8px] px-1.5 py-0.5 rounded bg-black/60 text-gray-200">fijo</span>
-                  )}
-                  {active && (
-                    <div className="absolute top-1.5 right-1.5 w-5 h-5 rounded-full bg-brand flex items-center justify-center shadow">
-                      <svg className="w-3 h-3 text-white" fill="none" stroke="currentColor" strokeWidth="3" viewBox="0 0 24 24">
-                        <polyline points="20 6 9 17 4 12" />
-                      </svg>
-                    </div>
-                  )}
-                </div>
-                <div className="px-2 py-1.5 bg-surface-1">
-                  <p className={`text-[11px] truncate ${active ? "text-white font-medium" : "text-gray-300"}`}>
-                    {m.label.replace(/\s*\(.*\)\s*/, "")}
-                  </p>
-                  <p className="text-[9px] text-gray-500 leading-tight line-clamp-2 mt-0.5">{m.desc}</p>
-                </div>
+                <span className={`inline-grid place-items-center w-8 h-8 rounded-lg mb-1.5 ${active ? "bg-brand text-white" : "bg-surface-3 text-gray-300"}`}>
+                  {movIcon(m.code)}
+                </span>
+                <p className={`text-[12px] font-medium leading-tight ${active ? "text-white" : "text-gray-200"}`}>
+                  {m.label.replace(/\s*\(.*\)\s*/, "")}
+                </p>
+                <p className="text-[10px] text-gray-500 leading-snug mt-0.5">{m.desc}</p>
               </button>
             );
           })}
@@ -1586,7 +1582,7 @@ export default function UploadZone({
             <WizardLivePreview
               style={style}
               customColors={customColors}
-              movementStyle={batchDefaults.movementStyle}
+              movementStyle={hoverMovement ?? batchDefaults.movementStyle}
               mode={sceneMode}
               lyric={_previewLyric}
             />

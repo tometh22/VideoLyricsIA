@@ -219,7 +219,7 @@ const translations = {
     "edit.movement_label": "Movimiento de cámara",
     "edit.bg_verbatim_label": "Usar mi prompt tal cual (sin reescritura de IA)",
     "upload.movement_gallery_title": "Movimiento del fondo",
-    "upload.movement_gallery_desc": "Cómo se anima el fondo del video · no afecta los colores",
+    "upload.movement_gallery_desc": "Cómo se mueve la cámara del fondo. Pasá el mouse o elegí y miralo en el preview ←",
     "upload.movement_gallery_hint": "Click para aplicar a todos · personalizable por canción",
     "upload.movement_apply_all": "Aplicar a todas",
     "upload.batch_settings_title": "Configuración del lote",
