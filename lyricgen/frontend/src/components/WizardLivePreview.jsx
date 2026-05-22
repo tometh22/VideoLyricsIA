@@ -129,12 +129,13 @@ export default function WizardLivePreview({ style = "auto", customColors = "", m
         @keyframes wlp-lyric-in { from { opacity: 0; transform: translateY(14px); } to { opacity: 1; transform: translateY(0); } }
         /* lyrics-animation templates (mirror the libass render) */
         @keyframes wlp-pop { 0% { opacity: 0; transform: scale(1.16); } 55% { transform: scale(.96); } 80% { transform: scale(1.03); } 100% { opacity: 1; transform: scale(1); } }
-        @keyframes wlp-glow-text { 0%,100% { text-shadow: 0 6px 34px rgba(0,0,0,.7); } 50% { text-shadow: 0 0 20px rgba(20,200,168,.9), 0 6px 34px rgba(0,0,0,.7); } }
+        /* outline = thin dark contour (mirrors the libass stroke), no dark halo */
+        @keyframes wlp-glow-text { 0%,100% { text-shadow: -1px -1px 0 rgba(0,0,0,.6),1px -1px 0 rgba(0,0,0,.6),-1px 1px 0 rgba(0,0,0,.6),1px 1px 0 rgba(0,0,0,.6),0 2px 10px rgba(0,0,0,.45); } 50% { text-shadow: 0 0 20px rgba(20,200,168,.9),-1px -1px 0 rgba(0,0,0,.6),1px -1px 0 rgba(0,0,0,.6),-1px 1px 0 rgba(0,0,0,.6),1px 1px 0 rgba(0,0,0,.6); } }
         /* karaoke: a fill sweep passes word by word, then loops */
         @keyframes wlp-karaoke-sweep {
-          0% { color: var(--dim); text-shadow: 0 6px 34px rgba(0,0,0,.6); }
-          18%, 78% { color: var(--lit); text-shadow: 0 0 16px rgba(25,224,188,.55), 0 6px 34px rgba(0,0,0,.6); }
-          100% { color: var(--dim); text-shadow: 0 6px 34px rgba(0,0,0,.6); }
+          0% { color: var(--dim); text-shadow: -1px -1px 0 rgba(0,0,0,.55),1px -1px 0 rgba(0,0,0,.55),-1px 1px 0 rgba(0,0,0,.55),1px 1px 0 rgba(0,0,0,.55); }
+          18%, 78% { color: var(--lit); text-shadow: 0 0 16px rgba(25,224,188,.55),-1px -1px 0 rgba(0,0,0,.55),1px -1px 0 rgba(0,0,0,.55),-1px 1px 0 rgba(0,0,0,.55),1px 1px 0 rgba(0,0,0,.55); }
+          100% { color: var(--dim); text-shadow: -1px -1px 0 rgba(0,0,0,.55),1px -1px 0 rgba(0,0,0,.55),-1px 1px 0 rgba(0,0,0,.55),1px 1px 0 rgba(0,0,0,.55); }
         }
         /* word reveal: each word rises + fades in on its turn, then loops */
         @keyframes wlp-reveal-loop {
@@ -175,9 +176,10 @@ export default function WizardLivePreview({ style = "auto", customColors = "", m
           at 0.55 over busy/colourful scenes recoloured into blotches. */}
       <div className="absolute inset-0 pointer-events-none" style={{ background: bgGradient, mixBlendMode: isMinimal ? "screen" : "color", opacity: isMinimal ? 0.5 : 0.38 }} />
       <div className="absolute inset-0 pointer-events-none" style={{ background: bgGradient, mixBlendMode: "soft-light", opacity: 0.32 }} />
-      {/* center scrim for lyric legibility — large, soft, low-opacity so it
-          reads as a gentle dim, not a dark oval/blob behind the text. */}
-      <div className="absolute inset-0 pointer-events-none" style={{ background: "radial-gradient(85% 65% at 50% 52%, rgba(0,0,0,.34), transparent 78%)" }} />
+      {/* NO center scrim — the real render (libass) gives the text an outline +
+          shadow, not a background dim. A centered dark gradient read as a "black
+          box behind the lyrics" on light scenes; legibility now comes from the
+          text outline below (see the lyric textShadow), matching the output. */}
       {/* film grain + vignette */}
       <div className="absolute inset-0 pointer-events-none" style={{ background: "repeating-linear-gradient(0deg,transparent 0 2px,rgba(255,255,255,.022) 2px 3px)" }} />
       <div className="absolute inset-0 pointer-events-none" style={{ background: "radial-gradient(120% 80% at 50% 50%, transparent 55%, rgba(0,0,0,.55))" }} />
@@ -189,7 +191,7 @@ export default function WizardLivePreview({ style = "auto", customColors = "", m
           <div
             key={`${lyricsAnimation}:${sample}`}
             className={`font-extrabold tracking-[-0.03em] leading-[1.02] ${isMinimal ? "text-gray-900" : "text-white"}`}
-            style={{ fontSize: "clamp(18px,7.5cqw,68px)", textShadow: isMinimal ? "0 1px 12px rgba(255,255,255,.4)" : "0 6px 34px rgba(0,0,0,.7)", animation: isWordAnim ? undefined : lineAnim }}
+            style={{ fontSize: "clamp(18px,7.5cqw,68px)", textShadow: isMinimal ? "0 1px 12px rgba(255,255,255,.4)" : "-1px -1px 0 rgba(0,0,0,.6), 1px -1px 0 rgba(0,0,0,.6), -1px 1px 0 rgba(0,0,0,.6), 1px 1px 0 rgba(0,0,0,.6), 0 2px 10px rgba(0,0,0,.45)", animation: isWordAnim ? undefined : lineAnim }}
           >
             {lyricContent}
           </div>
