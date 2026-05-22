@@ -7012,9 +7012,14 @@ def _render_lyrics_ass(
         "-shortest",
         os.path.basename(out_path),
     ]
+    # Effect blend + grade at 4K/ProRes (UMG) is heavier than the bare subtitles
+    # burn; give those renders a wider budget so a slow-but-fine pass doesn't hit
+    # the timeout. Plain 1080p H.264 keeps the original 900s.
+    _render_timeout = 1800 if (spec.codec == "prores_ks" or spec.width >= 3000
+                               or (effect and spec.width >= 1920)) else 900
     try:
         result = subprocess.run(
-            cmd, cwd=job_dir, capture_output=True, text=True, timeout=900,
+            cmd, cwd=job_dir, capture_output=True, text=True, timeout=_render_timeout,
         )
         if result.returncode != 0:
             raise RuntimeError(
@@ -7354,27 +7359,44 @@ def generate_lyric_video(
         )
         text_layers.extend(layers)
 
-    # Effect overlay (snow/rain/stars/bokeh/light) — moviepy path (fallback,
-    # and the only path locally where ffmpeg lacks libass). The baked loop is
-    # RGB-on-black (additive); masking it by its own luminance makes black read
-    # as transparent (≈ the screen blend the libass path does in ffmpeg). Looped
-    # to the full duration and slotted between the background and the lyrics.
-    _fx_layers = []
+    # Effect overlay + color grade — moviepy path (fallback, and the path that
+    # runs whenever ffmpeg lacks libass). Mirror the libass pipeline exactly:
+    #   bg → [effect SCREEN-blend] → [grade] → (lyrics on top).
+    # TRUE screen blend (additive: 1-(1-bg)(1-fx)) over the bright-on-black loop
+    # — never darkens, no channel bias. (The earlier luminance-mask approach did
+    # alpha-OVER, which darkened mid-tones and used only the red channel.)
+    import fx_compositor as _fx
+    import numpy as _np
+    _fx_clip = None
     try:
-        import fx_compositor as _fx
         _fx_path = _fx.effect_path(effect)
         if _fx_path:
             from moviepy.editor import VideoFileClip as _VFC, vfx as _vfx
-            _fxc = (_cover_resize(_VFC(_fx_path), spec.width, spec.height)
-                    .fx(_vfx.loop, duration=duration)
-                    .set_duration(duration))
-            _fxc = _fxc.set_mask(_fxc.to_mask())
-            _fx_layers = [_fxc]
+            _fx_clip = (_cover_resize(_VFC(_fx_path), spec.width, spec.height)
+                        .fx(_vfx.loop, duration=duration)
+                        .set_duration(duration))
     except Exception as _e:
-        logger.warning("[FX] moviepy overlay skipped (%s); continuing", _e)
+        logger.warning("[FX] moviepy effect skipped (%s); continuing", _e)
+        _fx_clip = None
+
+    _grade_style = style if _fx.grade_filter(style) else ""
+    if _fx_clip is not None or _grade_style:
+        _base_src = bg
+        _fx_src = _fx_clip
+
+        def _fx_base_frame(t):
+            b = _base_src.get_frame(t).astype(_np.float32)
+            if _fx_src is not None:
+                f = _fx_src.get_frame(t).astype(_np.float32)
+                b = 255.0 - (255.0 - b) * (255.0 - f) / 255.0  # screen
+            return _fx.grade_frame(b, _grade_style).clip(0, 255).astype("uint8")
+
+        base = VideoClip(_fx_base_frame, duration=duration).set_fps(spec.fps)
+    else:
+        base = bg
 
     _moviepy_t0 = _time.monotonic()
-    video = CompositeVideoClip([bg] + _fx_layers + text_layers, size=(spec.width, spec.height))
+    video = CompositeVideoClip([base] + text_layers, size=(spec.width, spec.height))
     video = video.set_audio(audio).set_duration(duration)
 
     if spec.profile == "umg":
@@ -7408,6 +7430,8 @@ def generate_lyric_video(
         audio.close()
         bg.close()
         video.close()
+        if _fx_clip is not None:
+            _fx_clip.close()
 
         # Post-process: stream-copy the ProRes video and re-encode audio
         # to pcm_s24le at 48 kHz. UMG requires this exact audio spec; no
@@ -7456,6 +7480,8 @@ def generate_lyric_video(
     audio.close()
     bg.close()
     video.close()
+    if _fx_clip is not None:
+        _fx_clip.close()
     logger.info("[MOVIEPY] render: %.1fs (engine=moviepy, profile=%s)",
                 _time.monotonic() - _moviepy_t0, spec.profile)
     return out_path, font, bg_source

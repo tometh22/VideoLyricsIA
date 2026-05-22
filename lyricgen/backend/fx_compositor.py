@@ -61,6 +61,33 @@ def grade_filter(style: str, custom_colors: str = "") -> str:
     return _GRADE.get((style or "").strip().lower(), "")
 
 
+# Numpy equivalent of the `eq` presets for the moviepy render path (which can't
+# use the ffmpeg eq filter). (contrast, saturation, brightness_delta_0_255).
+# Kept alongside _GRADE so both render paths apply the SAME palette grade.
+_GRADE_NUMPY = {
+    "oscuro": (1.12, 1.10, -8.0),
+    "neon": (1.10, 1.35, 0.0),
+    "minimal": (1.04, 0.90, 0.0),
+    "calido": (1.06, 1.14, 0.0),
+}
+
+
+def grade_frame(frame, style: str):
+    """Apply the palette grade (contrast/saturation/brightness) to a float RGB
+    numpy frame, for the moviepy path. Returns the frame unchanged for auto/
+    unknown palettes. Mirrors `grade_filter`'s ffmpeg `eq` as closely as numpy
+    allows (not bit-identical, same intent)."""
+    import numpy as np
+    p = _GRADE_NUMPY.get((style or "").strip().lower())
+    if not p:
+        return frame
+    contrast, sat, bright = p
+    f = (frame - 127.5) * contrast + 127.5 + bright
+    luma = (0.299 * f[:, :, 0] + 0.587 * f[:, :, 1] + 0.114 * f[:, :, 2])
+    f = luma[:, :, None] + (f - luma[:, :, None]) * sat
+    return f
+
+
 def _escape_filter_path(p: str) -> str:
     """Escape a path for use as an ffmpeg filter option value (subtitles/
     fontsdir). Backslash first, then the filtergraph delimiters."""
