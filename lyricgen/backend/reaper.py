@@ -709,31 +709,47 @@ def _reap_all_stuck_inner(threshold_min: int) -> int:
         # Reap abandoned transcribed_pending rows quietly: the user never
         # got a job started, so the failure isn't operator-visible. Just
         # delete the row and clean up the input file.
+        #
+        # Per-job try/except + commit: a single row that fails to delete
+        # (FK, storage hiccup, detached state) must NOT abort the whole
+        # sweep and silently leave EVERY abandoned row alive. Observed on
+        # staging 2026-05-22: transcribed_pending rows idle 3-6 h were
+        # never reaped while the upload sweep kept logging success — a
+        # batch failure swallowing the transcribed cleanup. Per-job
+        # isolation + a logged reason prevents the silent pile-up.
+        _n_tr = _n_up = _n_ed = 0
         for job in abandoned:
-            _delete_abandoned_transcribed(db, job)
+            try:
+                _delete_abandoned_transcribed(db, job)
+                db.commit()
+                _n_tr += 1
+            except Exception as e:
+                db.rollback()
+                logger.warning("[REAPER] reap transcribed %s failed: %s", job.job_id, e)
         for job in abandoned_uploads:
-            _delete_abandoned_upload(db, job)
+            try:
+                _delete_abandoned_upload(db, job)
+                db.commit()
+                _n_up += 1
+            except Exception as e:
+                db.rollback()
+                logger.warning("[REAPER] reap upload %s failed: %s", job.job_id, e)
         # Abandoned edits get reverted (not deleted) — the prior render
         # is still on R2 and the user wants to re-approve or re-try.
         for job in abandoned_edits:
-            revert_abandoned_edit(db, job)
-        if abandoned or abandoned_uploads or abandoned_edits:
-            db.commit()
-            if abandoned:
-                logger.info(
-                    "[REAPER] cleaned up %d abandoned transcribed_pending job(s)",
-                    len(abandoned),
-                )
-            if abandoned_uploads:
-                logger.info(
-                    "[REAPER] cleaned up %d abandoned awaiting_upload job(s)",
-                    len(abandoned_uploads),
-                )
-            if abandoned_edits:
-                logger.info(
-                    "[REAPER] reverted %d abandoned edit job(s) back to pending_review",
-                    len(abandoned_edits),
-                )
+            try:
+                revert_abandoned_edit(db, job)
+                db.commit()
+                _n_ed += 1
+            except Exception as e:
+                db.rollback()
+                logger.warning("[REAPER] revert edit %s failed: %s", job.job_id, e)
+        if _n_tr:
+            logger.info("[REAPER] cleaned up %d abandoned transcribed_pending job(s)", _n_tr)
+        if _n_up:
+            logger.info("[REAPER] cleaned up %d abandoned awaiting_upload job(s)", _n_up)
+        if _n_ed:
+            logger.info("[REAPER] reverted %d abandoned edit job(s) back to pending_review", _n_ed)
         if not stuck and not orphans and not stalled:
             return 0
         for job in stuck:
