@@ -165,6 +165,42 @@ def test_ensure_background_downgrades_animado_imagen_to_veo():
 
 
 # ---------------------------------------------------------------------------
+# 5b. Calm registers → Imagen + deterministic camera (Veo won't hold the camera
+#     still — measured 2026-05-22: it pushes in ~half the time even when told
+#     not to). estatico=static, sutil=subtle drift, foto-parallax=lateral pan.
+# ---------------------------------------------------------------------------
+
+def test_ken_burns_accepts_lateral_and_subtle_flags():
+    for fn in (pipeline._ken_burns_clip, pipeline._ken_burns_image_to_mp4):
+        params = inspect.signature(fn).parameters
+        assert "lateral" in params and "subtle" in params, fn.__name__
+
+
+def test_ensure_background_routes_calm_registers_to_imagen():
+    """estatico / sutil / foto-parallax all force the Imagen path with their own
+    deterministic Ken Burns mode — never Veo, which can't hold the camera."""
+    src = inspect.getsource(pipeline._ensure_background)
+    assert '_norm_move_bg in ("estatico", "sutil")' in src
+    assert '_norm_move_bg == "foto-parallax"' in src
+    assert 'bg_mode = "imagen"' in src
+    # Each register maps to its own Ken Burns mode in the Imagen call.
+    assert 'static=(_norm_move_bg == "estatico")' in src
+    assert 'subtle=(_norm_move_bg == "sutil")' in src
+    assert 'lateral=(_norm_move_bg == "foto-parallax")' in src
+
+
+def test_ken_burns_pan_modes_have_no_zoom():
+    """lateral and subtle are pans over a FIXED inward crop — constant scale, no
+    per-frame zoom (so the camera never advances). static stays frozen."""
+    src = inspect.getsource(pipeline._ken_burns_clip)
+    assert "make_pan_frame" in src
+    pan_block = src.split("if not static and (lateral or subtle):")[1].split("\n    if static:")[0]
+    assert "scale, amp_x, amp_y = 1.18" in pan_block  # lateral: full horizontal, fixed scale
+    assert "scale, amp_x, amp_y = 1.10" in pan_block  # subtle: low amplitude, fixed scale
+    assert "zoom_in" not in pan_block                 # no zoom animation in either
+
+
+# ---------------------------------------------------------------------------
 # 6. de-biased combinatorial fallback
 # ---------------------------------------------------------------------------
 

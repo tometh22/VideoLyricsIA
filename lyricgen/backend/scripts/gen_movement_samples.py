@@ -1,11 +1,30 @@
-"""One-off: generate 5 REAL Veo clips (one per movement style) to use as the
-wizard's movement examples. Each prompt = a distinct attractive scene + that
-movement's camera language, so the cards genuinely show the difference.
+"""One-off: generate PREMIUM demo clips (one per movement register) for the
+wizard's "Movimiento" step. These are the sales card, so they are generated
+with the real engine at its best:
 
-Run from lyricgen/backend:  ./venv/bin/python scripts/gen_movement_samples.py
+  - Veo STANDARD model (veo-3.1-generate-001), NOT the fast tier.
+  - No legibility blur (BG_BLUR_SIGMA=0) so the demos stay crisp.
+  - "Foto + parallax" is produced via Imagen-4 Ultra (a premium still) + a
+    clean LATERAL pan — the SAME engine path as the real foto-parallax render
+    (Veo can't do clean 2.5D parallax from text).
+  - MULTIPLE candidates per register for human selection — nothing is
+    auto-picked, because "premium" is a taste call.
+
+Each Veo take uses a distinct cache_namespace so the prompt-hash R2 cache does
+NOT return the same clip for every take.
+
+Usage (run from lyricgen/backend):
+  ./venv/bin/python scripts/gen_movement_samples.py                # all, 3 takes
+  ./venv/bin/python scripts/gen_movement_samples.py estatico       # subset
+  TAKES=4 ./venv/bin/python scripts/gen_movement_samples.py        # more takes
+  ./venv/bin/python scripts/gen_movement_samples.py --finalize estatico=2 animado=1
+        ^ copy + 1080p-transcode the chosen take into public/movement_samples/
+
+Candidates land in /tmp/movsamp/<code>_<n>.mp4 (review, then --finalize).
 Needs .env with VERTEX_PROJECT / VERTEX_LOCATION / GOOGLE_APPLICATION_CREDENTIALS.
 """
 import os
+import subprocess
 import sys
 
 # Load .env into os.environ BEFORE importing pipeline (it reads VERTEX_* at import).
@@ -17,82 +36,151 @@ if os.path.exists(_ENV):
             k, v = line.split("=", 1)
             os.environ.setdefault(k.strip(), v.strip().strip('"'))
 
+# Premium demo overrides — applied ONLY to this one-off generation (read at call
+# time inside pipeline, so they don't touch the runtime defaults):
+#   - Veo STANDARD for fidelity + far better "static" adherence than fast.
+#   - No legibility blur → crisp, premium-looking demos.
+os.environ["VEO_MODEL"] = os.environ.get("VEO_MODEL_DEMO", "veo-3.1-generate-001")
+os.environ["VEO_MODEL_STATIC"] = os.environ["VEO_MODEL"]
+os.environ["BG_BLUR_SIGMA"] = "0"
+
 # Run from backend dir so the relative GOOGLE_APPLICATION_CREDENTIALS resolves.
 os.chdir(os.path.join(os.path.dirname(__file__), ".."))
 sys.path.insert(0, ".")
 
 import pipeline  # noqa: E402
 
+TMP = "/tmp/movsamp"
 OUT = "../frontend/public/movement_samples"
-os.makedirs("/tmp/movsamp", exist_ok=True)
+os.makedirs(TMP, exist_ok=True)
+TAKES = int(os.environ.get("TAKES", "3"))
 
-# Premium, DIVERSE, non-biased scenes (no streets / alleys / urban-night) with
-# SMOOTH motion (UMG criticised fast/dizzying moves). Each in a different
-# register so the examples showcase variety, not the urban cliché.
-PROMPTS = {
-    "estatico": (
-        "Locked static shot, the camera does NOT move at all: no pan, no zoom, "
-        "no push-in, NO fly-through, the camera does NOT advance or travel "
-        "forward into the scene. A flat head-on view of a deep-space nebula: "
-        "vast cosmic clouds in violet, magenta and teal slowly swirling in "
-        "place, distant stars gently twinkling. Only the gas clouds and stars "
-        "shimmer; the camera frame is perfectly, absolutely still as if it were "
-        "a photograph that breathes. Serene, premium, cinematic, 4k, 16:9."
-    ),
-    "sutil": (
-        "Locked static camera on a tripod, the camera itself does NOT move at "
-        "all. A warm luxury loft interior at golden hour. ALL the motion comes "
-        "from elements INSIDE the scene, not the camera: sheer white curtains "
-        "billowing gently in the breeze by a large window, dust motes drifting "
-        "in the warm sunlight, plant leaves trembling softly. The frame is "
-        "perfectly still while life moves within it. Calm, premium, intimate. "
-        "Cinematic, photorealistic, 4k, 16:9."
-    ),
+# Keep every scene free of the urban-night cliché UMG rejected.
+_NO_URBAN = " No city streets, no alleys, no urban night scenes, no roads, no traffic."
+
+# Veo registers — the only two where the camera SHOULD move (Cinematográfico)
+# or where the look is non-photoreal (Animado). The calm registers do NOT use
+# Veo: it ignores "locked / no advance" ~half the time (measured 2026-05-22).
+VEO_PROMPTS = {
+    # Approved scene/motion — re-rendered on STANDARD for premium fidelity.
     "estandar": (
-        "Slow, smooth and elegant cinematic glide over snow-capped mountain "
-        "peaks at dawn, steady gentle forward camera movement, layered ridges "
-        "and soft drifting clouds, warm golden light. Graceful and premium — "
-        "smooth and unhurried, NOT fast, no dizzying motion. Cinematic, "
-        "photorealistic, 4k, 16:9."
+        "Slow, smooth and elegant cinematic glide over snow-capped mountain peaks "
+        "at dawn, steady gentle camera movement, layered ridges and soft drifting "
+        "clouds, warm golden light. Graceful and premium — smooth and unhurried, "
+        "NOT fast, no dizzying motion. Cinematic, photorealistic, 4k, 16:9."
     ),
-    "foto-parallax": (
-        "A single still PHOTOGRAPH brought to life with a subtle 2.5D parallax "
-        "effect: a slow gentle LATERAL camera shift (sideways only, NOT forward, "
-        "no push-in, no advance) that reveals depth between foreground pine "
-        "branches and distant layered mountain ridges at golden hour. The scene "
-        "is otherwise frozen like a real photo: NO flowing water, no moving "
-        "waves, no wind, nothing animates except the parallax depth. "
-        "Photographic, calm, premium. Cinematic, photorealistic, 4k, 16:9."
-    ),
+    # Premium 2D illustration with gentle hand-drawn motion.
     "animado": (
-        "Stylised 2D animated illustration, vivid flat colorful shapes, a dreamy "
-        "abstract composition of flowing gradients and gentle hand-drawn motion. "
-        "NOT photorealistic, artful animation look, smooth and calm. 4k, 16:9."
+        "A premium stylised 2D animated illustration: a dreamy mountain-and-sky "
+        "landscape in bold flat shapes and a rich vibrant gradient palette, gentle "
+        "hand-drawn motion — drifting clouds and softly shifting light. Elegant, "
+        "artful, NOT photorealistic, smooth and calm, hand-drawn animation look. "
+        "4k, 16:9."
     ),
 }
-# Guard rail: keep every example free of the urban-night cliché UMG rejected.
-PROMPTS = {k: v + " No city streets, no alleys, no urban night scenes, no roads, no traffic." for k, v in PROMPTS.items()}
 
-# Some examples must render through a DIFFERENT movement path than their card
-# code. "sutil" needs a truly locked camera (motion only from in-scene elements
-# like a billowing curtain), so it routes through the "estatico" render path,
-# which injects the no-pan/zoom/dolly/no-camera-movement negatives.
-RENDER_MOVE = {"sutil": "estatico"}
+# Calm registers — a premium Imagen-4 Ultra STILL + a deterministic, code-driven
+# camera move (static / subtle drift / lateral pan). 100% reliable, never
+# advances. Distinct SCENES per mode so the cards don't look alike. Prompts are
+# stills with NO motion words (motion comes from Ken Burns, not the image).
+KB_MODE = {"estatico": "static", "sutil": "subtle", "foto-parallax": "lateral"}
+IMAGEN_PROMPTS = {
+    # Estático → held frame. A serene tropical beach (distinct from the others).
+    "estatico": (
+        "A breathtaking premium photograph of a serene tropical beach at golden "
+        "hour: tall palm trees, calm turquoise sea, soft glowing sky, gentle "
+        "reflections on wet sand. Ultra-sharp, photographic, cinematic, 4k, 16:9. "
+        "A perfectly still photo, no motion."
+    ),
+    # Sutil → gentle drift. A warm interior (distinct subject + palette).
+    "sutil": (
+        "A breathtaking premium photograph of a warm luxury loft interior at "
+        "golden hour: soft sunlight pouring through tall windows, sheer curtains, "
+        "lush plants, rich wood textures, intimate and calm. Ultra-sharp, "
+        "photographic, cinematic, 4k, 16:9. A perfectly still photo, no motion."
+    ),
+    # Foto+parallax → lateral pan over layered depth (distinct mountain subject).
+    "foto-parallax": (
+        "A breathtaking premium landscape photograph at dawn: layered mountain "
+        "ridges fading into morning mist, deep foreground pine branches, "
+        "mid-ground forested slopes and distant snow peaks — a strong sense of "
+        "depth across many layers — warm golden light. Ultra-sharp, photographic, "
+        "cinematic, 4k, 16:9. A perfectly still photo, no motion."
+    ),
+}
 
-# Optionally regenerate only a subset:  python gen_movement_samples.py sutil foto-parallax
-ONLY = set(sys.argv[1:])
+VEO_PROMPTS = {k: v + _NO_URBAN for k, v in VEO_PROMPTS.items()}
+IMAGEN_PROMPTS = {k: v + _NO_URBAN for k, v in IMAGEN_PROMPTS.items()}
+ALL_CODES = list(VEO_PROMPTS) + list(IMAGEN_PROMPTS)
 
-for code, prompt in PROMPTS.items():
-    if ONLY and code not in ONLY:
-        continue
-    tmp = f"/tmp/movsamp/{code}.mp4"
-    move = RENDER_MOVE.get(code, code)
-    print(f"\n=== generating {code} (render_move={move}) ===", flush=True)
-    try:
-        pipeline._generate_veo_video(prompt, tmp, movement_style=move)
-        size = os.path.getsize(tmp) / 1024 if os.path.exists(tmp) else 0
-        print(f"OK {code}: {size:.0f} KB -> {tmp}", flush=True)
-    except Exception as e:
-        print(f"FAIL {code}: {e}", flush=True)
 
-print("\nDONE. Review /tmp/movsamp/*.mp4, then move into", OUT)
+def _veo_take(code: str, prompt: str, n: int) -> str:
+    out = f"{TMP}/{code}_{n}.mp4"
+    # Distinct namespace per take → distinct cache key → a fresh generation
+    # (Veo is non-deterministic), instead of the prompt-hash cache returning
+    # the same clip for every take.
+    pipeline._generate_veo_video(
+        prompt, out, movement_style=code, cache_namespace=f"movsamp-{code}-{n}",
+    )
+    return out
+
+
+def _imagen_take(code: str, prompt: str, n: int) -> str:
+    img = f"{TMP}/{code}_{n}.jpg"
+    out = f"{TMP}/{code}_{n}.mp4"
+    pipeline._generate_imagen_image(prompt, img, model="imagen-4.0-ultra-generate-001")
+    # 8s deterministic camera move over the still (1920x1080), per register.
+    mode = KB_MODE.get(code, "lateral")
+    pipeline._ken_burns_image_to_mp4(
+        img, out, sample_duration=8.0,
+        static=(mode == "static"), lateral=(mode == "lateral"), subtle=(mode == "subtle"),
+    )
+    return out
+
+
+def _finalize(code: str, n: int) -> None:
+    """Copy + 1080p-transcode a chosen take into public/movement_samples/."""
+    src = f"{TMP}/{code}_{n}.mp4"
+    if not os.path.exists(src):
+        print(f"SKIP {code}: {src} not found")
+        return
+    dst = f"{OUT}/{code}.mp4"
+    subprocess.run([
+        "ffmpeg", "-y", "-loglevel", "error", "-i", src,
+        "-vf", "scale='min(1920,iw)':-2",  # cap width at 1080p, keep aspect
+        "-c:v", "libx264", "-crf", "21", "-preset", "slow",
+        "-an", "-pix_fmt", "yuv420p", "-movflags", "+faststart", dst,
+    ], check=True)
+    size = os.path.getsize(dst) / 1024
+    print(f"FINALIZED {code}: {src} -> {dst} ({size:.0f} KB)")
+
+
+def main():
+    args = sys.argv[1:]
+    if args and args[0] == "--finalize":
+        for spec in args[1:]:
+            code, _, n = spec.partition("=")
+            _finalize(code, int(n or "1"))
+        return
+
+    only = set(args)
+    for code in ALL_CODES:
+        if only and code not in only:
+            continue
+        prompt = VEO_PROMPTS.get(code) or IMAGEN_PROMPTS[code]
+        is_imagen = code in IMAGEN_PROMPTS
+        for n in range(1, TAKES + 1):
+            print(f"\n=== {code} take {n}/{TAKES} ({'imagen+lateral' if is_imagen else 'veo-standard'}) ===", flush=True)
+            try:
+                out = _imagen_take(code, prompt, n) if is_imagen else _veo_take(code, prompt, n)
+                size = os.path.getsize(out) / 1024 if os.path.exists(out) else 0
+                print(f"OK {code}_{n}: {size:.0f} KB -> {out}", flush=True)
+            except Exception as e:
+                print(f"FAIL {code}_{n}: {e}", flush=True)
+
+    print(f"\nDONE. Review {TMP}/<code>_<n>.mp4, then finalize the winners, e.g.:")
+    print("  ./venv/bin/python scripts/gen_movement_samples.py --finalize estatico=2 sutil=1 ...")
+
+
+if __name__ == "__main__":
+    main()
