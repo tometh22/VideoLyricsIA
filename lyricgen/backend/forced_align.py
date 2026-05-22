@@ -25,6 +25,8 @@ from __future__ import annotations
 import logging
 import os
 import re
+import subprocess
+import tempfile
 
 logger = logging.getLogger("genly.forced_align")
 
@@ -123,6 +125,34 @@ def wordstamps_to_segments(
     return segs
 
 
+def _compress_for_upload(audio_path: str) -> tuple[str, bool]:
+    """Transcode to a small mono 128 kbps mp3 so the Replicate upload is a
+    few MB. A raw 40-60 MB WAV intermittently fails the upload with
+    `Broken pipe` (observed in prod), which made forced align silently fall
+    back. Alignment accuracy is bounded well above 128 kbps mono, so this
+    is lossless for our purpose. Returns (path, is_temp); falls back to the
+    original on any ffmpeg error."""
+    out = None
+    try:
+        fd, out = tempfile.mkstemp(suffix=".fa.mp3")
+        os.close(fd)
+        subprocess.run(
+            ["ffmpeg", "-y", "-i", audio_path, "-ac", "1", "-b:a", "128k",
+             "-loglevel", "error", out],
+            check=True, timeout=180, capture_output=True, text=True,
+        )
+        if os.path.exists(out) and os.path.getsize(out) > 0:
+            return out, True
+    except Exception as e:
+        logger.warning("[FORCED] audio compress failed (%s) — using original", e)
+    if out and os.path.exists(out):
+        try:
+            os.unlink(out)
+        except OSError:
+            pass
+    return audio_path, False
+
+
 def forced_align_lyrics(audio_path: str, lyrics_text: str) -> list[dict] | None:
     """Align `lyrics_text` to `audio_path` via the hosted forced aligner.
     Returns per-line segments or None (disabled / failure / too thin).
@@ -141,13 +171,30 @@ def forced_align_lyrics(audio_path: str, lyrics_text: str) -> list[dict] | None:
         return None
 
     transcript = "\n".join(lyric_lines)
+    upload_path, is_temp = _compress_for_upload(audio_path)
+    output = None
+    last_err = None
     try:
-        with open(audio_path, "rb") as audio:
-            output = replicate.run(
-                _MODEL, input={"audio_file": audio, "transcript": transcript},
-            )
-    except Exception as e:  # network, billing, model error, anything
-        logger.warning("[FORCED] replicate call failed (%s) — falling back", e)
+        # Retry the upload/run once: large-file uploads to Replicate can
+        # drop with Broken pipe intermittently.
+        for attempt in range(2):
+            try:
+                with open(upload_path, "rb") as audio:
+                    output = replicate.run(
+                        _MODEL, input={"audio_file": audio, "transcript": transcript},
+                    )
+                break
+            except Exception as e:  # network, billing, model error, anything
+                last_err = e
+                logger.warning("[FORCED] replicate attempt %s failed (%s)", attempt + 1, e)
+    finally:
+        if is_temp:
+            try:
+                os.unlink(upload_path)
+            except OSError:
+                pass
+    if output is None:
+        logger.warning("[FORCED] replicate failed after retries (%s) — falling back", last_err)
         return None
 
     words = (

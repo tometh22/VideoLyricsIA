@@ -91,6 +91,14 @@ def test_destretch_leaves_normal_lines_untouched():
     assert segs[1] == {"start": 3.0, "end": 4.0, "text": "chau amigo"}
 
 
+def test_compress_for_upload_falls_back_on_bad_input():
+    """ffmpeg can't transcode a nonexistent file → graceful fallback to the
+    original path (never raises, never leaves a temp behind)."""
+    path, is_temp = fa._compress_for_upload("/nonexistent/audio.wav")
+    assert path == "/nonexistent/audio.wav"
+    assert is_temp is False
+
+
 def test_forced_align_lyrics_returns_none_when_disabled(monkeypatch):
     monkeypatch.delenv("FORCED_ALIGNER_ENABLED", raising=False)
     assert fa.forced_align_lyrics("/tmp/x.mp3", "a\nb\nc\nd") is None
