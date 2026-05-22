@@ -136,7 +136,7 @@ export default function WizardLivePreview({ style = "auto", customColors = "", m
         /* lyrics-animation templates (mirror the libass render) */
         @keyframes wlp-pop { 0% { opacity: 0; transform: scale(1.16); } 55% { transform: scale(.96); } 80% { transform: scale(1.03); } 100% { opacity: 1; transform: scale(1); } }
         /* outline = thin dark contour (mirrors the libass stroke), no dark halo */
-        @keyframes wlp-glow-text { 0%,100% { text-shadow: -1px -1px 0 rgba(0,0,0,.6),1px -1px 0 rgba(0,0,0,.6),-1px 1px 0 rgba(0,0,0,.6),1px 1px 0 rgba(0,0,0,.6),0 2px 10px rgba(0,0,0,.45); } 50% { text-shadow: 0 0 20px rgba(20,200,168,.9),-1px -1px 0 rgba(0,0,0,.6),1px -1px 0 rgba(0,0,0,.6),-1px 1px 0 rgba(0,0,0,.6),1px 1px 0 rgba(0,0,0,.6); } }
+        @keyframes wlp-glow-text { 0%,100% { text-shadow: -1px -1px 0 rgba(0,0,0,.6),1px -1px 0 rgba(0,0,0,.6),-1px 1px 0 rgba(0,0,0,.6),1px 1px 0 rgba(0,0,0,.6); } 50% { text-shadow: 0 0 20px rgba(20,200,168,.9),-1px -1px 0 rgba(0,0,0,.6),1px -1px 0 rgba(0,0,0,.6),-1px 1px 0 rgba(0,0,0,.6),1px 1px 0 rgba(0,0,0,.6); } }
         /* karaoke: a fill sweep passes word by word, then loops */
         @keyframes wlp-karaoke-sweep {
           0% { color: var(--dim); text-shadow: -1px -1px 0 rgba(0,0,0,.55),1px -1px 0 rgba(0,0,0,.55),-1px 1px 0 rgba(0,0,0,.55),1px 1px 0 rgba(0,0,0,.55); }
@@ -198,7 +198,7 @@ export default function WizardLivePreview({ style = "auto", customColors = "", m
           <div
             key={`${lyricsAnimation}:${sample}`}
             className={`font-extrabold tracking-[-0.03em] leading-[1.02] ${isMinimal ? "text-gray-900" : "text-white"}`}
-            style={{ fontSize: "clamp(18px,7.5cqw,68px)", textShadow: isMinimal ? "0 1px 12px rgba(255,255,255,.4)" : "-1px -1px 0 rgba(0,0,0,.6), 1px -1px 0 rgba(0,0,0,.6), -1px 1px 0 rgba(0,0,0,.6), 1px 1px 0 rgba(0,0,0,.6), 0 2px 10px rgba(0,0,0,.45)", animation: isWordAnim ? undefined : lineAnim }}
+            style={{ fontSize: "clamp(18px,7.5cqw,68px)", textShadow: isMinimal ? "0 1px 0 rgba(255,255,255,.5)" : "-1px -1px 0 rgba(0,0,0,.6), 1px -1px 0 rgba(0,0,0,.6), -1px 1px 0 rgba(0,0,0,.6), 1px 1px 0 rgba(0,0,0,.6)", animation: isWordAnim ? undefined : lineAnim }}
           >
             {lyricContent}
           </div>
