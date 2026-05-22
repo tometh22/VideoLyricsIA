@@ -2469,6 +2469,21 @@ def _detect_hallucination(segments: list[dict],
         if dur > 15.0 and words > 40:
             return True, (f"implausible segment: {dur:.1f}s × {words} "
                           f"words — text={(s.get('text') or '')[:60]!r}")
+        # Signal 2b — sparse-and-long mega-segment. Whisper sometimes maps
+        # an entire song to ONE tiny phrase held for minutes (incident "El
+        # Arbol": a single 346s segment reading "Música de presentación")
+        # instead of transcribing. Signal 1 is OFF when we're called
+        # per-segment (audio_duration=None, as _fill_gaps_with_reference
+        # does), and Signal 2 needs >40 words, so a 3-word/346s segment slips
+        # through and gets kept — discarding the reference lyrics we already
+        # have. Real speech, even slow sung lines, runs ~0.5 words/s; a
+        # density below 0.1 w/s over a long span is acoustically impossible
+        # and means Whisper bailed. Flagging it routes the caller into the
+        # reference-lyrics recovery path (_synthesize_segments_from_plain).
+        if dur > 30.0 and words / dur < 0.1:
+            return True, (f"sparse mega-segment: {dur:.1f}s × {words} "
+                          f"words ({words / dur:.3f} w/s) — "
+                          f"text={(s.get('text') or '')[:60]!r}")
 
     # Signal 3 — fuzzy intra-loop (token-set Jaccard ≥ 0.75).
     for s in segments:

@@ -121,6 +121,41 @@ def test_detect_implausible_long_segment_returns_true():
     assert "implausible" in reason or "fuzzy" in reason or "low count" in reason
 
 
+def test_detect_sparse_mega_segment_returns_true():
+    # Incident "El Arbol": Whisper mapped the whole song to ONE 346 s segment
+    # reading "Música de presentación" (3 words) instead of transcribing.
+    # Called per-segment with audio_duration=None (as _fill_gaps_with_reference
+    # does), so Signal 1 is OFF; only 3 words so Signal 2 (>40 words) is OFF.
+    # The sparse-and-long signal must catch it: 3 words / 346 s = 0.009 w/s.
+    seg = _seg(0.0, 346.0, "Música de presentación")
+    is_hall, reason = _detect_hallucination([seg], audio_duration=None)
+    assert is_hall is True
+    assert "sparse" in reason
+
+
+def test_detect_sparse_signal_does_not_flag_normal_slow_line():
+    # A legitimately slow sung line — 30 distinct words over 60 s = 0.5 w/s,
+    # the documented floor for slow speech — must NOT trip the sparse signal.
+    # Distinct words avoid the fuzzy-loop signal; audio_duration=None isolates
+    # the per-segment signals (no count check).
+    distinct = ("uno dos tres cuatro cinco seis siete ocho nueve diez once "
+                "doce trece catorce quince dieciseis diecisiete dieciocho "
+                "diecinueve veinte sol luna mar cielo flor noche dia viento "
+                "fuego agua")
+    assert len(distinct.split()) == 30
+    seg = _seg(0.0, 60.0, distinct)
+    is_hall, _ = _detect_hallucination([seg], audio_duration=None)
+    assert is_hall is False
+
+
+def test_detect_short_sparse_segment_not_flagged():
+    # The sparse signal only applies to LONG segments (> 30 s). A short
+    # 2-word line held 8 s (0.25 w/s) is normal phrasing, not a bail-out.
+    seg = _seg(0.0, 8.0, "hola amigo")
+    is_hall, _ = _detect_hallucination([seg], audio_duration=None)
+    assert is_hall is False
+
+
 def test_detect_synonym_intra_loop_returns_true():
     # Plenty of segments + reasonable durations — the only red flag is the
     # synonym intra-loop inside one segment. Loop must contain 3+ near-

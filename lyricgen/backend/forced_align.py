@@ -71,38 +71,98 @@ def _word_dur(w: dict):
         return None
 
 
+def _norm(s: str) -> str:
+    """Lowercase + strip combining diacritics + drop non-alphanumeric — same
+    normalisation as pipeline._normalize_token, inlined to keep this module
+    network- and import-free (pure + unit-testable). Lets "podía"/"podia" and
+    "Edén,"/"eden" match when we re-anchor lyric lines to the word stream."""
+    import unicodedata as _u
+    s = _u.normalize("NFD", (s or "").lower())
+    return "".join(c for c in s if c.isalnum() and not _u.combining(c))
+
+
 def wordstamps_to_segments(
     wordstamps: list[dict], lyric_lines: list[str], *, max_tail_dur: float = 1.5,
+    max_drift: int = 8, min_anchor_score: float = 0.5, drift_abort: int = 4,
 ) -> list[dict]:
     """Reconstruct per-line segments from the word-level timestamps + the
-    original line structure: walk each line's word count through the word
-    stream; line start = first word's start. Pure + testable.
+    original line structure. Pure + testable.
 
-    De-stretch (incident: Hermanos de Sangre): the forced-align model
-    (stable-ts/whisperX) STRETCHES the last word of a line to fill the
-    instrumental gap up to the next sung line, so a 3-s line ends up held
-    on screen for 12 s. We detect a ballooned trailing word (duration far
-    above the song's median word) and cap the line's `end` to where that
-    word actually STARTED + a normal word's worth — leaving the gap as
-    silence instead of a frozen subtitle. The sung lines keep their real
-    timing.
+    RE-ANCHORING (incident "Cosas Mías" class): the model is given the lyric
+    transcript and *should* return one word stamp per transcript word in
+    order — but it tokenises differently than `str.split()` (contractions,
+    numbers, hyphens, dropped/duplicated tokens), so a naive positional walk
+    (`wordstamps[cur:cur+wc]`, `cur += wc`) accumulates DRIFT: once the count
+    diverges, every later line grabs the wrong stamps and the whole song slips
+    out of sync. Instead, for each lyric line we search a small window around
+    the running cursor for the best token-set match and re-anchor the cursor to
+    the matched span's end — so a local divergence self-corrects on the next
+    line instead of compounding. When matching collapses for several
+    consecutive lines (the alignment is unreliable) we return [] so the caller
+    falls back to its other timing paths.
+
+    De-stretch (incident: Hermanos de Sangre): the model STRETCHES the last
+    word of a line to fill the instrumental gap up to the next sung line, so a
+    3-s line ends up held 12 s. We detect a ballooned trailing word (far above
+    the song's median word) and cap the line's `end` to where that word
+    actually STARTED + a normal tail — leaving silence instead of a frozen
+    subtitle. Sung lines keep their real timing.
 
     Enforces monotonic, non-overlapping segments (clamp end to next start).
     """
+    n_words = len(wordstamps)
     durs = sorted(d for d in (_word_dur(w) for w in wordstamps) if d is not None)
     median = durs[len(durs) // 2] if durs else 0.3
     stretch_thresh = max(max_tail_dur, median * 4)   # trailing word "too long"
     normal_tail = max(median * 1.5, 0.4)             # how long a real tail holds
 
+    norm_words = [_norm(w.get("word", "")) for w in wordstamps]
+
     segs: list[dict] = []
-    cur = 0
+    cur = 0          # running cursor into the word stream
+    prev_start = -1  # first word index of the previous matched span
+    drift_streak = 0
     for raw in lyric_lines:
         line = (raw or "").strip()
         if not line:
             continue
-        wc = len(line.split())
-        span = wordstamps[cur:cur + wc]
-        cur += wc
+        line_tokens = [t for t in (_norm(x) for x in line.split()) if t]
+        wc = len(line_tokens)
+        if wc == 0 or cur >= n_words:
+            continue
+        line_set = set(line_tokens)
+
+        # Search windows of length `wc` whose start sits in
+        # [cur - small backslack .. cur + max_drift], never re-using the
+        # previous line's first word. Pick the best token-set Jaccard;
+        # ties resolve to the earliest (closest to the cursor) start.
+        lo = max(prev_start + 1, cur - 2, 0)
+        hi = min(n_words - wc, cur + max_drift)
+        best_start, best_score = -1, -1.0
+        for st in range(lo, hi + 1):
+            win_set = {t for t in norm_words[st:st + wc] if t}
+            if not win_set:
+                continue
+            inter = len(line_set & win_set)
+            union = len(line_set | win_set)
+            score = inter / union if union else 0.0
+            if score > best_score:
+                best_score, best_start = score, st
+
+        if best_start < 0 or best_score < min_anchor_score:
+            # Couldn't anchor this line — keep position (best effort) and
+            # count it toward the drift-abort budget.
+            best_start = min(cur, max(0, n_words - wc))
+            drift_streak += 1
+        else:
+            drift_streak = 0
+
+        if drift_streak >= drift_abort:
+            # Alignment has lost the plot for several lines running — bail so
+            # the caller falls back rather than ship a drifting transcript.
+            return []
+
+        span = wordstamps[best_start:best_start + wc]
         if not span:
             continue
         try:
@@ -117,6 +177,9 @@ def wordstamps_to_segments(
         if end < start:
             end = start
         segs.append({"start": start, "end": end, "text": line})
+
+        prev_start = best_start
+        cur = best_start + wc   # re-anchor the cursor past the matched span
 
     segs.sort(key=lambda s: s["start"])
     for i in range(len(segs) - 1):

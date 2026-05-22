@@ -99,6 +99,53 @@ def test_compress_for_upload_falls_back_on_bad_input():
     assert is_temp is False
 
 
+def test_wordstamps_reanchors_when_model_inserts_extra_word():
+    # The model tokenises "rocknroll" as THREE stamps (rock/n/roll) where the
+    # lyric line has it as one word. A naive positional walk would consume the
+    # wrong stamps from here on (drift). Re-anchoring must keep later lines
+    # aligned by matching their tokens forward in the stream.
+    lines = ["amo el rocknroll", "vivo de noche", "canto sin parar"]
+    words = [
+        _w("amo", 1.0, 1.3), _w("el", 1.3, 1.6),
+        _w("rock", 1.6, 1.9), _w("n", 1.9, 2.0), _w("roll", 2.0, 2.4),
+        _w("vivo", 3.0, 3.3), _w("de", 3.3, 3.5), _w("noche", 3.5, 4.0),
+        _w("canto", 5.0, 5.3), _w("sin", 5.3, 5.6), _w("parar", 5.6, 6.2),
+    ]
+    segs = fa.wordstamps_to_segments(words, lines)
+    # Despite the extra token, the LATER lines must land on their real stamps.
+    assert len(segs) == 3
+    assert segs[1]["text"] == "vivo de noche"
+    assert segs[1]["start"] == 3.0 and segs[1]["end"] == 4.0
+    assert segs[2]["text"] == "canto sin parar"
+    assert segs[2]["start"] == 5.0 and segs[2]["end"] == 6.2
+
+
+def test_wordstamps_reanchors_when_model_drops_word():
+    # The model dropped "muy" — fewer stamps than the lyric word count. The
+    # next line must still anchor on its real stamps, not slide late.
+    lines = ["hola mundo muy lindo", "adios para siempre"]
+    words = [
+        _w("hola", 1.0, 1.3), _w("mundo", 1.3, 1.7), _w("lindo", 1.7, 2.2),
+        _w("adios", 3.0, 3.4), _w("para", 3.4, 3.7), _w("siempre", 3.7, 4.3),
+    ]
+    segs = fa.wordstamps_to_segments(words, lines)
+    assert len(segs) == 2
+    assert segs[1]["text"] == "adios para siempre"
+    assert segs[1]["start"] == 3.0 and segs[1]["end"] == 4.3
+
+
+def test_wordstamps_aborts_on_sustained_drift():
+    # The word stream is unrelated noise (nothing matches the lyric lines for
+    # several consecutive lines). The detector must give up (return []) so the
+    # caller falls back, rather than emit a confidently-wrong drifting result.
+    lines = ["primera linea cantada", "segunda linea distinta",
+             "tercera estrofa nueva", "cuarta parte final",
+             "quinta y ultima aqui"]
+    words = [_w(f"ruido{i}", i, i + 0.4) for i in range(25)]
+    segs = fa.wordstamps_to_segments(words, lines)
+    assert segs == []
+
+
 def test_forced_align_lyrics_returns_none_when_disabled(monkeypatch):
     monkeypatch.delenv("FORCED_ALIGNER_ENABLED", raising=False)
     assert fa.forced_align_lyrics("/tmp/x.mp3", "a\nb\nc\nd") is None
