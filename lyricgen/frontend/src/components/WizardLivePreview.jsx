@@ -29,7 +29,7 @@ const MOVE_ANIM = {
   animado:        "wlp-anim 1.8s linear infinite",
 };
 
-export default function WizardLivePreview({ style = "auto", customColors = "", movementStyle = "", mode = "lyrics", lyric }) {
+export default function WizardLivePreview({ style = "auto", customColors = "", movementStyle = "", mode = "lyrics", lyric, clipSrc = "/movement_samples/estandar.mp4" }) {
   const { t } = useI18n();
   const isAnimado = movementStyle === "animado";
   const isMinimal = style === "minimal";
@@ -70,20 +70,15 @@ export default function WizardLivePreview({ style = "auto", customColors = "", m
         @keyframes wlp-lyric-in { from { opacity: 0; transform: translateY(14px); } to { opacity: 1; transform: translateY(0); } }
       `}</style>
 
-      {/* REAL cinematic footage as the base — the preview reads like a real
-          result, not a flat gradient. The camera MOVEMENT is a transform on
-          the footage; the mood/palette grades it on top. */}
-      <div
-        className="absolute"
-        style={{
-          inset: "-12%",
-          animation: MOVE_ANIM[movementStyle] ?? MOVE_ANIM[""],
-          willChange: "transform",
-          filter: isAnimado ? "saturate(2.6) contrast(1.3)" : "none",
-        }}
-      >
-        <video src="/movement_samples/preview-bg.mp4" className="w-full h-full object-cover" autoPlay loop muted playsInline />
-      </div>
+      {/* REAL Veo clip of the SELECTED movement style as the base — the
+          preview shows the actual style's example (the clip already carries
+          its camera movement). The mood/palette grades it on top. */}
+      <video
+        key={clipSrc}
+        src={clipSrc}
+        className="absolute inset-0 w-full h-full object-cover"
+        autoPlay loop muted playsInline
+      />
       {/* palette / mood color-grade over the footage */}
       <div className="absolute inset-0 pointer-events-none" style={{ background: bgGradient, mixBlendMode: isMinimal ? "screen" : "color", opacity: isMinimal ? 0.55 : 0.55 }} />
       <div className="absolute inset-0 pointer-events-none" style={{ background: bgGradient, mixBlendMode: "soft-light", opacity: 0.4 }} />

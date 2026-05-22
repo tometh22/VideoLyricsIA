@@ -748,19 +748,33 @@ export default function UploadZone({
                 onMouseLeave={() => setHoverMovement(null)}
                 aria-label={`${m.label}: ${m.desc}`}
                 title={m.desc}
-                className={`text-left rounded-xl border px-3 py-2.5 transition-all duration-200 cursor-pointer ${
+                className={`text-left rounded-xl overflow-hidden border transition-all duration-200 cursor-pointer ${
                   active
-                    ? "border-transparent ring-1 ring-brand/50 bg-brand/[0.08] shadow-glow"
-                    : "border-white/[0.06] bg-surface-2/40 hover:border-white/[0.20]"
+                    ? "border-transparent ring-1 ring-brand/50 shadow-glow"
+                    : "border-white/[0.06] hover:border-white/[0.20]"
                 }`}
               >
-                <span className={`inline-grid place-items-center w-8 h-8 rounded-lg mb-1.5 ${active ? "bg-brand text-white" : "bg-surface-3 text-gray-300"}`}>
-                  {movIcon(m.code)}
-                </span>
-                <p className={`text-[12px] font-medium leading-tight ${active ? "text-white" : "text-gray-200"}`}>
-                  {m.label.replace(/\s*\(.*\)\s*/, "")}
-                </p>
-                <p className="text-[10px] text-gray-500 leading-snug mt-0.5">{m.desc}</p>
+                {/* Real Veo example clip per style (Auto has no clip → icon) */}
+                <div className="aspect-video bg-black relative overflow-hidden">
+                  {m.sample ? (
+                    <video src={m.sample} className="w-full h-full object-cover pointer-events-none" autoPlay loop muted playsInline />
+                  ) : (
+                    <div className="w-full h-full grid place-items-center text-gray-400" style={{ background: "radial-gradient(120% 100% at 50% 0,#2a1d52,#0b0820)" }}>
+                      <span className="w-7 h-7">{movIcon(m.code)}</span>
+                    </div>
+                  )}
+                  {active && (
+                    <div className="absolute top-1.5 right-1.5 w-5 h-5 rounded-full bg-brand grid place-items-center shadow">
+                      <svg className="w-3 h-3 text-white" fill="none" stroke="currentColor" strokeWidth="3" viewBox="0 0 24 24"><polyline points="20 6 9 17 4 12" /></svg>
+                    </div>
+                  )}
+                </div>
+                <div className="px-2.5 py-2 bg-surface-1">
+                  <p className={`text-[12px] font-medium leading-tight ${active ? "text-white" : "text-gray-200"}`}>
+                    {m.label.replace(/\s*\(.*\)\s*/, "")}
+                  </p>
+                  <p className="text-[10px] text-gray-500 leading-snug mt-0.5">{m.desc}</p>
+                </div>
               </button>
             );
           })}
@@ -1585,6 +1599,7 @@ export default function UploadZone({
               movementStyle={hoverMovement ?? batchDefaults.movementStyle}
               mode={sceneMode}
               lyric={_previewLyric}
+              clipSrc={(MOVEMENT_STYLES.find((m) => m.code === (hoverMovement ?? batchDefaults.movementStyle))?.sample) || "/movement_samples/estandar.mp4"}
             />
           ) : (
             <div className="aspect-video rounded-2xl ring-1 ring-white/[0.08] bg-surface-2/50 grid place-items-center text-gray-500 text-[13px]">
