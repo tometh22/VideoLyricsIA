@@ -2960,6 +2960,14 @@ async def _run_transcription_for_job(
         import vocal_sep
         _stem_state = {"computed": False, "path": None}
 
+        # Rotor's "rhythm engine" — detect the song's beat grid and snap each
+        # segment.start to the nearest strong beat within ±200ms. Subtitles
+        # land on the music, not just on the voice. Behind BEAT_SNAP_ENABLED;
+        # no-op when disabled or detection fails. See beat_snap.py.
+        import beat_snap as _beat_snap
+        def _snap(segs):
+            return _beat_snap.apply(tmp_path, segs)
+
         async def _get_align_audio() -> str:
             """Return the path that alignment/transcription engines should read.
             Lazy-separates the vocal stem on first call. Falls back to the mix
@@ -3046,7 +3054,7 @@ async def _run_transcription_for_job(
                         set_timing_source(job_id, "forced_align")
                         return {
                             "job_id": job_id,
-                            "segments": fa_segs,
+                            "segments": _snap(fa_segs),
                             "reference_lyrics": fa_text,
                             "recovery_source": "forced_align",
                         }
@@ -3193,7 +3201,7 @@ async def _run_transcription_for_job(
                         set_timing_source(job_id, "lrclib_synced")
                         return {
                             "job_id": job_id,
-                            "segments": combined,
+                            "segments": _snap(combined),
                             "reference_lyrics": plain or synced,
                         }
             # No synced (or too few segments / unreliable timestamps) — but
@@ -3393,7 +3401,7 @@ async def _run_transcription_for_job(
                         logger.warning("[LYRICS] hallucination detected (%s) — auto-recovered with %s lines from lrclib plain (%s time anchors, start=%.1fs, dur=%.1fs) + %s intro-Whisper segment(s)", reason, len(recovered), len(anchors), intro_offset, user_dur, len(intro_segments))
                         return {
                             "job_id": job_id,
-                            "segments": combined,
+                            "segments": _snap(combined),
                             "reference_lyrics": plain,
                             "coverage_warning": True,
                             "recovery_source": "lrclib_plain",
@@ -3411,7 +3419,7 @@ async def _run_transcription_for_job(
                 combined, _dropped = _filter_whisper_hallucinations(combined)
                 if _dropped:
                     logger.warning("[TRANSCRIBE] dropped %s Whisper hallucination phrase(s)", _dropped)
-                return {"job_id": job_id, "segments": combined, "reference_lyrics": plain}
+                return {"job_id": job_id, "segments": _snap(combined), "reference_lyrics": plain}
 
         # Kick off Gemini-grounded lyrics fetch in parallel with Whisper.
         # The fetcher is best-effort (returns None on any failure); we wrap
@@ -3514,7 +3522,7 @@ async def _run_transcription_for_job(
                     set_timing_source(job_id, "forced_align")
                     return {
                         "job_id": job_id,
-                        "segments": fa_segs,
+                        "segments": _snap(fa_segs),
                         "reference_lyrics": reference,
                         "recovery_source": "forced_align",
                     }
@@ -3549,7 +3557,7 @@ async def _run_transcription_for_job(
                         set_timing_source(job_id, "whisperx")
                         return {
                             "job_id": job_id,
-                            "segments": wx_segs,
+                            "segments": _snap(wx_segs),
                             "reference_lyrics": "",
                         }
                     logger.warning("[LYRICS] whisperX rejected at gemini-FA fallback (%s) — falling through", _why or "thin")
@@ -3606,7 +3614,7 @@ async def _run_transcription_for_job(
                     logger.warning("[LYRICS] hallucination detected on fallback path (%s) — gap-fill produced %s segments from %s (~%s kept-Whisper, %s synthesized, dur=%.1fs)", reason, len(merged), src, plausible_count, len(merged) - plausible_count, user_dur)
                     return {
                         "job_id": job_id,
-                        "segments": merged,
+                        "segments": _snap(merged),
                         "reference_lyrics": reference,
                         "coverage_warning": True,
                         "recovery_source": src,
@@ -3637,7 +3645,7 @@ async def _run_transcription_for_job(
                         set_timing_source(job_id, "whisperx")
                         return {
                             "job_id": job_id,
-                            "segments": wx_segs,
+                            "segments": _snap(wx_segs),
                             "reference_lyrics": "",
                         }
                     logger.warning("[LYRICS] whisperX result rejected (%s) — keeping whisper-1", _why or "thin")
@@ -3660,7 +3668,7 @@ async def _run_transcription_for_job(
         # aligner requested word timestamps but didn't consume them (low
         # coverage); keeps segments_json lean.
         segments = [{k: v for k, v in s.items() if k != "words"} for s in segments]
-        return {"job_id": job_id, "segments": segments, "reference_lyrics": reference}
+        return {"job_id": job_id, "segments": _snap(segments), "reference_lyrics": reference}
     finally:
         # tmp_dir holds intermediate slices (intro/body cuts) only — the
         # main audio (audio_path) is under job_dir and must survive until
