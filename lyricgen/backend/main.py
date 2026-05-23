@@ -2807,8 +2807,10 @@ async def upload(
         song_title=song_title,
         text_case=text_case if text_case in ("upper", "title", "lower", "original") else "upper",
         font_scale=_font_scale,
-        lyric_transition=lyric_transition if lyric_transition in ("cut", "fade", "fade_slow") else "cut",
-        text_motion=text_motion if text_motion in ("none", "subtle", "float") else "none",
+        # lyric_transition + text_motion: deprecados 2026-05-23 (ver run_pipeline).
+        # Aceptamos los Form params por back-compat pero coerce a defaults.
+        lyric_transition="cut",
+        text_motion="none",
         lyrics_animation=lyrics_animation if lyrics_animation in ("none", "karaoke", "word_reveal", "pop", "glow") else "none",
         line_transition=line_transition if line_transition in ("none", "slide_up", "slide_side", "wipe", "dissolve_blur") else "none",
         text_contrast=text_contrast if text_contrast in ("subtle", "medium", "strong") else "medium",
@@ -3917,8 +3919,9 @@ async def generate_with_segments(
         song_title=song_title,
         text_case=text_case if text_case in ("upper", "title", "lower", "original") else "upper",
         font_scale=_font_scale_gen,
-        lyric_transition=lyric_transition if lyric_transition in ("cut", "fade", "fade_slow") else "cut",
-        text_motion=text_motion if text_motion in ("none", "subtle", "float") else "none",
+        # Deprecados 2026-05-23 (ver primer endpoint /upload).
+        lyric_transition="cut",
+        text_motion="none",
         lyrics_animation=lyrics_animation if lyrics_animation in ("none", "karaoke", "word_reveal", "pop", "glow") else "none",
         line_transition=line_transition if line_transition in ("none", "slide_up", "slide_side", "wipe", "dissolve_blur") else "none",
         text_contrast=text_contrast if text_contrast in ("subtle", "medium", "strong") else "medium",
@@ -4771,8 +4774,9 @@ class EditJobRequest(BaseModel):
     font: str | None = Field(default=None, max_length=64)
     font_scale: float | None = None
     text_case: str | None = Field(default=None, max_length=16)
-    lyric_transition: str | None = Field(default=None, max_length=16)
-    text_motion: str | None = Field(default=None, max_length=16)
+    # lyric_transition + text_motion deprecados 2026-05-23 — campos
+    # eliminados del modelo. Clientes viejos que sigan mandándolos en el
+    # body son ignorados por Pydantic (default: extra fields permitidos).
     text_contrast: str | None = Field(default=None, max_length=16)
     # Required when edit_type=="lyrics". For edit_type=="background" or
     # "typography", segments is OPTIONAL — if the operator made text
@@ -5482,12 +5486,9 @@ async def request_edit(
         edit_params["font_scale"] = body.font_scale
     if body.text_case is not None:
         edit_params["text_case"] = body.text_case
-    if body.lyric_transition is not None:
-        edit_params["lyric_transition"] = body.lyric_transition
     if body.text_contrast is not None:
         edit_params["text_contrast"] = body.text_contrast
-    if body.text_motion is not None:
-        edit_params["text_motion"] = body.text_motion
+    # body.lyric_transition + body.text_motion: campos eliminados 2026-05-23.
     # FX layer + lyric animations: durable visual choices, no edit_type gate
     # (the operator can change them inside any edit modal). Same pattern as
     # movement_style below: forward to edit_params for THIS render AND persist
@@ -6098,9 +6099,11 @@ async def retry_job(
     # Mirrors the /variant endpoint pattern (see line 5814 region).
     _retry_render_params = job.render_params or {}
     retry_pipeline_kwargs = {}
-    for k in ("font", "font_scale", "text_case", "lyric_transition",
-              "text_motion", "text_contrast", "movement_style",
-              "animate_image", "genre", "match_lyrics",
+    # lyric_transition + text_motion deprecados 2026-05-23 — sacados de la
+    # whitelist; si están en render_params viejos quedan como dato muerto,
+    # no se propagan al re-render.
+    for k in ("font", "font_scale", "text_case", "text_contrast",
+              "movement_style", "animate_image", "genre", "match_lyrics",
               "background_hint", "concept", "bg_verbatim",
               "effect", "custom_colors",
               # Lyric animation + line transition (libass templates from the
@@ -6392,9 +6395,10 @@ async def create_variant(
     # render_params del padre + overrides — los param de typography
     # (font, font_scale, etc) se pasan como kwargs individuales que
     # run_pipeline acepta. concept también va por kwarg.
-    for k in ("font", "font_scale", "text_case", "lyric_transition",
-              "text_motion", "text_contrast", "movement_style",
-              "animate_image", "genre", "match_lyrics", "bg_verbatim",
+    # lyric_transition + text_motion deprecados 2026-05-23 — fuera del whitelist.
+    for k in ("font", "font_scale", "text_case", "text_contrast",
+              "movement_style", "animate_image", "genre", "match_lyrics",
+              "bg_verbatim",
               # FX layer + lyric animation/transition (libass templates from
               # the wizard). Added 2026-05-22: variantes heredaban tipografía
               # y movimiento del padre pero perdían el efecto encima (nieve/
