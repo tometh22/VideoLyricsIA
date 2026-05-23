@@ -84,7 +84,16 @@ def _map_segments(output) -> list[dict]:
             except (TypeError, ValueError):
                 continue  # whisperX omits stamps for non-alignable tokens
             if wt:
-                words.append({"word": wt, "start": ws, "end": we})
+                # Preserve `score` (whisperX confidence per word, 0-1) so
+                # the editor can render low-confidence lines tinted red.
+                w_out = {"word": wt, "start": ws, "end": we}
+                try:
+                    score = w.get("score")
+                    if score is not None:
+                        w_out["score"] = float(score)
+                except (TypeError, ValueError):
+                    pass
+                words.append(w_out)
         seg = {"start": start, "end": end, "text": text}
         if words:
             seg["words"] = words

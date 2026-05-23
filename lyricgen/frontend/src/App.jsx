@@ -16,6 +16,7 @@ import HistoryView from "./components/HistoryView";
 import UploadZone from "./components/UploadZone";
 import LyricsEditor from "./components/LyricsEditor";
 import BatchProgress from "./components/BatchProgress";
+import TranscribingProgress from "./components/TranscribingProgress";
 import JobDetail from "./components/JobDetail";
 import Settings from "./components/Settings";
 import AdminPanel from "./components/AdminPanel";
@@ -922,7 +923,16 @@ export default function App() {
       // Step 2: tell the API to fetch the just-uploaded audio from R2,
       // run Whisper / lrclib, return segments. Same shape as the
       // legacy /transcribe response.
-      setTranscribeProgress({ phase: "transcribing", loaded: 0, total: 0 });
+      // Carry jobId + fileName so the TranscribingProgress component can
+      // open SSE on /events/{jobId} and render the modern stepper that
+      // reads `current_step` emitted by `_step()` in main.py.
+      setTranscribeProgress({
+        phase: "transcribing",
+        loaded: 0,
+        total: 0,
+        jobId: uploadJobId,
+        fileName: entry.file?.name || "",
+      });
       transcribeRes = await authFetchWithRetryOn503(`${API}/transcribe-uploaded`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -1589,41 +1599,44 @@ export default function App() {
       const phase = transcribeProgress?.phase;
       const loaded = transcribeProgress?.loaded || 0;
       const total = transcribeProgress?.total || 0;
-      const pct = phase === "uploading" && total > 0
-        ? Math.round((loaded / total) * 100)
-        : null;
-      const phaseLabel = (
-        phase === "uploading" ? t("transcribe.uploading") :
-        phase === "transcribing" ? t("transcribe.title") :
-        t("transcribe.title")
-      );
-      const phaseSub = (
-        phase === "uploading" && pct !== null
-          ? t("transcribe.uploading_progress", { pct })
-          : t("transcribe.subtitle")
-      );
-      return (
-        <div className="w-full max-w-md mx-auto mt-16 animate-fade-in text-center">
-          {pct !== null ? (
-            <div className="w-full max-w-xs mx-auto mb-4">
-              <div className="h-1.5 bg-surface-1 rounded-full overflow-hidden">
-                <div
-                  className="h-full rounded-full bg-gradient-to-r from-brand to-brand-light transition-all duration-300"
-                  style={{ width: `${pct}%` }}
-                />
+      // Upload progress = before the job_id exists; keep the simple bar.
+      if (phase === "uploading") {
+        const pct = total > 0 ? Math.round((loaded / total) * 100) : null;
+        return (
+          <div className="w-full max-w-md mx-auto mt-16 animate-fade-in text-center">
+            {pct !== null ? (
+              <div className="w-full max-w-xs mx-auto mb-4">
+                <div className="h-1.5 bg-surface-1 rounded-full overflow-hidden">
+                  <div
+                    className="h-full rounded-full bg-gradient-to-r from-brand to-brand-light transition-all duration-300"
+                    style={{ width: `${pct}%` }}
+                  />
+                </div>
               </div>
-            </div>
-          ) : (
-            <div className="w-12 h-12 mx-auto mb-4 border-2 border-brand border-t-transparent rounded-full animate-spin" />
-          )}
-          <h2 className="text-xl font-bold mb-2">{phaseLabel}</h2>
-          <p className="text-gray-500 text-sm">{phaseSub}</p>
-          {reviewQueue.length > 1 && (
-            <p className="text-xs text-gray-600 mt-2">
-              {t("transcribe.song")} {approvedJobs.length + 1} {t("editor.song_of")} {reviewQueue.length}
-            </p>
-          )}
-        </div>
+            ) : (
+              <div className="w-12 h-12 mx-auto mb-4 border-2 border-brand border-t-transparent rounded-full animate-spin" />
+            )}
+            <h2 className="text-xl font-bold mb-2">{t("transcribe.uploading")}</h2>
+            {pct !== null && (
+              <p className="text-gray-500 text-sm">{t("transcribe.uploading_progress", { pct })}</p>
+            )}
+          </div>
+        );
+      }
+      // Transcribing — modern stepper that reads backend current_step + progress
+      // emitted by `_step()` in main.py. SSE-driven via useJobProgress.
+      const currentJobId = transcribeProgress?.jobId;
+      const fileName = transcribeProgress?.fileName || "";
+      return (
+        <TranscribingProgress
+          jobId={currentJobId}
+          api={API}
+          token={token}
+          t={t}
+          fileName={fileName}
+          queueIndex={approvedJobs.length + 1}
+          queueTotal={reviewQueue.length}
+        />
       );
     }
     if (currentReview) {
