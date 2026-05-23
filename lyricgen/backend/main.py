@@ -3582,13 +3582,23 @@ async def _run_transcription_for_job(
                     wx_segs, _ = _fwh(wx_segs)
                     _hall, _why = _detect_hallucination(wx_segs, user_dur, language=lang)
                     if not _hall and len(wx_segs) >= 2:
-                        logger.info("[LYRICS] whisperX took over (gemini-FA fallback) — %s segments", len(wx_segs))
+                        # RECONCILIATION: whisperX gave us word-level timing
+                        # pinned to the audio; reference (Gemini/lrclib) gives
+                        # us curated text with clean line breaks. Re-bucket
+                        # whisperX words into reference lines to get TEXT
+                        # from reference + TIMING from whisperX (better than
+                        # either alone — this beats Rotor on the text side).
+                        import whisperx_reconcile
+                        _reconciled = whisperx_reconcile.reconcile(wx_segs, reference)
+                        final_segs = _reconciled if _reconciled else wx_segs
+                        _source_tag = "whisperx_reconciled" if _reconciled else "whisperx"
+                        logger.info("[LYRICS] whisperX took over (gemini-FA fallback) — %s segments [%s]", len(final_segs), _source_tag)
                         from jobs import set_timing_source
-                        set_timing_source(job_id, "whisperx")
+                        set_timing_source(job_id, _source_tag)
                         return {
                             "job_id": job_id,
-                            "segments": _snap(wx_segs),
-                            "reference_lyrics": "",
+                            "segments": _snap(final_segs),
+                            "reference_lyrics": reference if _reconciled else "",
                         }
                     logger.warning("[LYRICS] whisperX rejected at gemini-FA fallback (%s) — falling through", _why or "thin")
 
