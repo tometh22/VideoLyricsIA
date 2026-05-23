@@ -2673,40 +2673,57 @@ async def transcription_status(
     el polling para y carga el editor con los segments. Si "transcription_failed",
     muestra el error inline con botón Reintentar.
     """
-    from jobs import get_job_model
-    job_row = get_job_model(db, job_id)
-    if (not job_row
-            or job_row.user_id != current_user["id"]
-            or job_row.tenant_id != current_user["tenant_id"]):
-        raise HTTPException(status_code=404, detail="Job not found.")
+    # Try-except amplio porque slowapi/middleware tiran 500 bare en lugar de
+    # JSONResponse con detail si una excepción burbujea fuera de FastAPI.
+    # Capturamos acá para devolver siempre JSON con stack trace summary.
+    try:
+        from jobs import get_job_model
+        job_row = get_job_model(db, job_id)
+        if (not job_row
+                or job_row.user_id != current_user["id"]
+                or job_row.tenant_id != current_user["tenant_id"]):
+            raise HTTPException(status_code=404, detail="Job not found.")
 
-    status = job_row.status or ""
-    # Mapeo de status del DB a los valores que espera el frontend. El path
-    # legacy sync usa "transcribed_pending" como estado final post-transcribe;
-    # lo normalizamos a "transcribed" en la respuesta.
-    if status == "transcribed_pending":
-        status = "transcribed"
+        status = job_row.status or ""
+        # Mapeo de status del DB a los valores que espera el frontend. El path
+        # legacy sync usa "transcribed_pending" como estado final
+        # post-transcribe; lo normalizamos a "transcribed" en la respuesta.
+        if status == "transcribed_pending":
+            status = "transcribed"
 
-    payload = {
-        "job_id": job_id,
-        "status": status,
-        "segments": None,
-        "reference_lyrics": None,
-        "coverage_warning": bool(getattr(job_row, "coverage_warning", False)),
-        "recovery_source": getattr(job_row, "recovery_source", None),
-        "error": None,
-    }
-    if status == "transcribed":
-        payload["segments"] = job_row.segments_json or []
-        payload["reference_lyrics"] = job_row.reference_lyrics or ""
-    elif status == "transcription_failed":
-        # 2026-05-23 bug fix: el modelo Job usa `error` (Text), no `error_message`.
-        # Inicialmente confundí los nombres y el endpoint tiraba 500 con
-        # AttributeError. Mismo fix en transcription_worker.py:_fail.
-        payload["error"] = (getattr(job_row, "error", None) or
-                            "Error desconocido durante la transcripción.")
+        payload = {
+            "job_id": job_id,
+            "status": status,
+            "segments": None,
+            "reference_lyrics": None,
+            "coverage_warning": bool(getattr(job_row, "coverage_warning", False)),
+            "recovery_source": getattr(job_row, "recovery_source", None),
+            "error": None,
+        }
+        if status == "transcribed":
+            payload["segments"] = job_row.segments_json or []
+            # reference_lyrics no es columna del modelo Job (la transcripción
+            # vieja la devolvía inline; ahora no la persistimos). Defer a
+            # otro PR si el editor la necesita post-render. Default "" para
+            # no romper el frontend que la lee.
+            payload["reference_lyrics"] = getattr(job_row, "reference_lyrics", "") or ""
+        elif status == "transcription_failed":
+            payload["error"] = (getattr(job_row, "error", None) or
+                                "Error desconocido durante la transcripción.")
 
-    return payload
+        return payload
+    except HTTPException:
+        raise
+    except Exception as exc:
+        import traceback
+        tb = traceback.format_exc()
+        logger.exception("[TRANSCRIBE-STATUS] job_id=%s 500: %s", job_id, exc)
+        # Devolver JSON con detail en lugar de "Internal Server Error" plano
+        # para que el frontend (y este smoke script) puedan diagnosticar.
+        raise HTTPException(
+            status_code=500,
+            detail=f"{type(exc).__name__}: {str(exc)[:200]}",
+        )
 
 
 # Deprecation metadata for the legacy multipart-form endpoints. RFC 8594
