@@ -3495,6 +3495,40 @@ async def _run_transcription_for_job(
                         "recovery_source": "forced_align",
                     }
 
+            # WhisperX fallback — Rotor-grade audio-as-truth path. When
+            # forced-align failed but Gemini gave reference text, transcribe
+            # the audio directly with whisperX instead of cascading through
+            # Whisper-1 + hallucination recovery that ends in uniform 7s
+            # distribution. Incident "El Arbol De La Vida / Voy A Dejarte"
+            # (Viejas Locas): forced-align Replicate rejected the audio with
+            # `[1, 2, 0]` tensor error, Whisper-1 hallucinated "Música de
+            # presentación" 346s/3 words, recovery distributed 48 lines
+            # uniformly. WhisperX (verified live against the same audio)
+            # returns word-level segments matching Rotor's output (first
+            # vocal at 53.27s vs Rotor's 53.01s). When whisperX returns a
+            # clean result we adopt ITS text — its transcription is usually
+            # cleaner than Gemini's pre-chunked plain (different sources
+            # phrase line-breaks differently; whisperX follows the audio).
+            import whisperx_transcribe
+            if whisperx_transcribe.is_enabled():
+                wx_segs = await asyncio.to_thread(
+                    whisperx_transcribe.transcribe_whisperx, align_audio, lang,
+                )
+                if wx_segs:
+                    from pipeline import _filter_whisper_hallucinations as _fwh
+                    wx_segs, _ = _fwh(wx_segs)
+                    _hall, _why = _detect_hallucination(wx_segs, user_dur, language=lang)
+                    if not _hall and len(wx_segs) >= 2:
+                        logger.info("[LYRICS] whisperX took over (gemini-FA fallback) — %s segments", len(wx_segs))
+                        from jobs import set_timing_source
+                        set_timing_source(job_id, "whisperx")
+                        return {
+                            "job_id": job_id,
+                            "segments": wx_segs,
+                            "reference_lyrics": "",
+                        }
+                    logger.warning("[LYRICS] whisperX rejected at gemini-FA fallback (%s) — falling through", _why or "thin")
+
             # Plain-lyrics aligner on the Gemini/lyrics.ovh reference —
             # mirrors the lrclib-hit path. Whisper merges/splits lines by
             # audio pauses, which on live recordings (crowd, reverb)
