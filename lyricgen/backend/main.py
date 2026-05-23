@@ -2940,24 +2940,39 @@ async def _run_transcription_for_job(
 
     tmp_dir = tempfile.mkdtemp()
     tmp_path = audio_path
-    _vocal_stem = None   # demucs output path, cleaned up in finally
+    _vocal_stem = None   # demucs output path (lazy), cleaned up in finally
 
     try:
         lang = language.strip() if language.strip() else None
         loop = asyncio.get_event_loop()
 
-        # Vocal source separation (demucs): isolate the voice so forced
-        # alignment / whisperX transcribe the LYRIC, not the band — the big
-        # lever on hard songs (incident "El Arbol"; see vocal_sep.py). Behind
-        # VOCAL_SEP_ENABLED; on failure `align_audio` falls back to the mix.
+        # Vocal source separation (demucs) — LAZY. Previously demucs ran at the
+        # top of every job (~30-90s) regardless of which downstream engine
+        # actually needed the stem. On songs where lrclib synced verifies, no
+        # forced-align / whisperX call ever happens, so the stem was burned for
+        # nothing. The wrapper below runs demucs at most ONCE, on first request,
+        # and caches the result. If nothing calls it, demucs never runs and the
+        # job is 60-90s faster.
+        #
         # The stem feeds FA / whisperX / verification ONLY — NOT the bare
         # whisper-1 pass, which is more hallucination-prone on isolated vocals
         # (long-form caveat, arXiv 2506.15514).
         import vocal_sep
-        _vocal_stem = await asyncio.to_thread(vocal_sep.separate_vocals, tmp_path)
-        align_audio = _vocal_stem or tmp_path
-        if _vocal_stem:
-            logger.info("[LYRICS] isolated vocal stem — using it for alignment/whisperX/verification")
+        _stem_state = {"computed": False, "path": None}
+
+        async def _get_align_audio() -> str:
+            """Return the path that alignment/transcription engines should read.
+            Lazy-separates the vocal stem on first call. Falls back to the mix
+            (`tmp_path`) when vocal_sep is disabled / fails."""
+            nonlocal _vocal_stem
+            if not _stem_state["computed"]:
+                _stem_state["computed"] = True
+                stem = await asyncio.to_thread(vocal_sep.separate_vocals, tmp_path)
+                _stem_state["path"] = stem
+                _vocal_stem = stem
+                if stem:
+                    logger.info("[LYRICS] isolated vocal stem (lazy) — using for alignment/whisperX/verification")
+            return _stem_state["path"] or tmp_path
 
         # Resolve artist + title for the reference-lyrics fetch. Source order:
         #   1) explicit form fields (frontend already collects `artist` per
@@ -3021,8 +3036,9 @@ async def _run_transcription_for_job(
             if forced_align.is_enabled():
                 fa_text = plain or forced_align.lrc_to_plain_text(synced)
                 if fa_text:
+                    _aa = await _get_align_audio()
                     fa_segs = await asyncio.to_thread(
-                        forced_align.forced_align_lyrics, align_audio, fa_text,
+                        forced_align.forced_align_lyrics, _aa, fa_text,
                     )
                     if fa_segs:
                         logger.info("[LYRICS] forced alignment used (%s lines, lrclib text) for %r - %r", len(fa_segs), artist_hint, song_hint)
@@ -3120,6 +3136,11 @@ async def _run_transcription_for_job(
                             min(n - 1, max(0, (2 * n) // 3)),
                         })
                         confidences: list[float] = []
+                        # Verification reads ~5s of audio and runs Whisper-1
+                        # on it; we use the MIX (tmp_path) here so this path
+                        # never triggers the lazy demucs run. lrclib synced
+                        # that verifies → no FA / whisperX needed → no demucs
+                        # ever — biggest speedup on the happy path.
                         for pi in probe_idxs:
                             verify_seg = song_segs[pi]
                             # Skip probes whose text is too short to fuzzy-match
@@ -3128,7 +3149,7 @@ async def _run_transcription_for_job(
                                 continue
                             c = await asyncio.to_thread(
                                 _verify_lrclib_alignment,
-                                align_audio, verify_seg["text"], verify_seg["start"],
+                                tmp_path, verify_seg["text"], verify_seg["start"],
                             )
                             if c is not None:
                                 confidences.append(c)
@@ -3483,8 +3504,9 @@ async def _run_transcription_for_job(
             # Whisper-word aligner / gap-fill below on any failure.
             import forced_align
             if forced_align.is_enabled():
+                _aa = await _get_align_audio()
                 fa_segs = await asyncio.to_thread(
-                    forced_align.forced_align_lyrics, align_audio, reference,
+                    forced_align.forced_align_lyrics, _aa, reference,
                 )
                 if fa_segs:
                     logger.info("[LYRICS] forced alignment used (%s lines, gemini text)", len(fa_segs))
@@ -3513,8 +3535,9 @@ async def _run_transcription_for_job(
             # phrase line-breaks differently; whisperX follows the audio).
             import whisperx_transcribe
             if whisperx_transcribe.is_enabled():
+                _aa = await _get_align_audio()
                 wx_segs = await asyncio.to_thread(
-                    whisperx_transcribe.transcribe_whisperx, align_audio, lang,
+                    whisperx_transcribe.transcribe_whisperx, _aa, lang,
                 )
                 if wx_segs:
                     from pipeline import _filter_whisper_hallucinations as _fwh
@@ -3599,8 +3622,9 @@ async def _run_transcription_for_job(
         if not reference:
             import whisperx_transcribe
             if whisperx_transcribe.is_enabled():
+                _aa = await _get_align_audio()
                 wx_segs = await asyncio.to_thread(
-                    whisperx_transcribe.transcribe_whisperx, align_audio, lang,
+                    whisperx_transcribe.transcribe_whisperx, _aa, lang,
                 )
                 if wx_segs:
                     from pipeline import _filter_whisper_hallucinations as _fwh
