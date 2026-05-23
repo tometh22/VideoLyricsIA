@@ -2982,9 +2982,15 @@ async def _run_transcription_for_job(
         # segment.start to the nearest strong beat within ±200ms. Subtitles
         # land on the music, not just on the voice. Behind BEAT_SNAP_ENABLED;
         # no-op when disabled or detection fails. See beat_snap.py.
+        # Also tag chorus repetitions (segments with identical normalised
+        # text appearing 2+ times) with `repetition_group: N` so the editor
+        # can render "Coro #1" styling. See chorus_trim.py.
         import beat_snap as _beat_snap
+        import chorus_trim as _chorus_trim
         def _snap(segs):
-            return _beat_snap.apply(tmp_path, segs)
+            return _chorus_trim.mark_repetitions(
+                _beat_snap.apply(tmp_path, segs)
+            )
 
         async def _get_align_audio() -> str:
             """Return the path that alignment/transcription engines should read.
