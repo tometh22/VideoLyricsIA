@@ -58,8 +58,12 @@ export default function EditRequestPanel({
   // Typography chosen live in the editor's preview (null = unchanged).
   const [lyricsFont, setLyricsFont] = useState(null);
   const [lyricsCase, setLyricsCase] = useState(null);
-  const [lyricsTransition, setLyricsTransition] = useState(null);
   const [lyricsContrast, setLyricsContrast] = useState(null);
+  // 2026-05-23: lyricsAnimation + lineTransition reemplazan al legacy
+  // lyricsTransition (Corte/Fade). Se eligen en el LyricsEditor y van al
+  // backend como lyrics_animation / line_transition.
+  const [lyricsAnimation, setLyricsAnimation] = useState(null);
+  const [lineTransition, setLineTransition] = useState(null);
   // Operator-typed background hint for edit_type="background". Empty
   // string when the operator hasn't typed anything (we send no field in
   // that case and the pipeline falls back to Gemini's lyrics-only
@@ -395,8 +399,10 @@ export default function EditRequestPanel({
       // Typography picked live in the preview (omit when unchanged).
       ...(lyricsFont != null ? { font: lyricsFont } : {}),
       ...(lyricsCase != null ? { text_case: lyricsCase } : {}),
-      ...(lyricsTransition != null ? { lyric_transition: lyricsTransition } : {}),
       ...(lyricsContrast != null ? { text_contrast: lyricsContrast } : {}),
+      // Nuevos 2026-05-23 (reemplazan al legacy lyric_transition).
+      ...(lyricsAnimation != null ? { lyrics_animation: lyricsAnimation } : {}),
+      ...(lineTransition != null ? { line_transition: lineTransition } : {}),
     };
     // No-change short-circuit: compare against the OPEN-TIME snapshot (what
     // the current video was rendered from), NOT the live job.segments_json —
@@ -415,7 +421,7 @@ export default function EditRequestPanel({
           || (s.scale ?? 1) !== (p.scale ?? 1) || (s.rot ?? 0) !== (p.rot ?? 0);
       });
     const unchanged = lyricsFont == null && lyricsCase == null &&
-      lyricsTransition == null && lyricsContrast == null && !layoutChanged &&
+      lyricsContrast == null && lyricsAnimation == null && lineTransition == null && !layoutChanged &&
       original.length === payload.segments.length &&
       original.every((s, i) =>
         s.text === payload.segments[i].text &&
@@ -795,8 +801,9 @@ export default function EditRequestPanel({
         previewBgUrl={lyricsBgUrl}
         onFontChange={(code) => setLyricsFont(code)}
         onCaseChange={(c) => setLyricsCase(c)}
-        onTransitionChange={(c) => setLyricsTransition(c)}
         onContrastChange={(c) => setLyricsContrast(c)}
+        onAnimationChange={(c) => setLyricsAnimation(c)}
+        onLineTransitionChange={(c) => setLineTransition(c)}
         onApprove={submitLyricsWithSegments}
         submitting={submitting}
         initialParams={initialParams}
@@ -817,7 +824,10 @@ export default function EditRequestPanel({
 function LyricsEditModal({
   open, audioError, error, staleRerender, onForceRerender, job, segments,
   onSavedSegments, onClose, audioUrl, waveform, previewBgUrl, onFontChange,
-  onCaseChange, onTransitionChange, onContrastChange, onApprove, submitting, initialParams, t,
+  // 2026-05-23: onTransitionChange (legacy lyric_transition) eliminado;
+  // entran onAnimationChange + onLineTransitionChange.
+  onCaseChange, onContrastChange, onAnimationChange, onLineTransitionChange,
+  onApprove, submitting, initialParams, t,
 }) {
   // Scroll the modal back to the top whenever a banner appears, so the
   // error / stale-rerender notice is never stranded above the fold while the
@@ -922,8 +932,9 @@ function LyricsEditModal({
               previewBgUrl={previewBgUrl}
               onFontChange={onFontChange}
               onCaseChange={onCaseChange}
-              onTransitionChange={onTransitionChange}
               onContrastChange={onContrastChange}
+              onAnimationChange={onAnimationChange}
+              onLineTransitionChange={onLineTransitionChange}
               referenceLyrics=""
               onApprove={onApprove}
               onBack={onClose}
@@ -932,8 +943,11 @@ function LyricsEditModal({
               font={initialParams.font || ""}
               textCase={initialParams.text_case || "upper"}
               fontScale={initialParams.font_scale || 1.0}
-              lyricTransition={initialParams.lyric_transition || "cut"}
-              textMotion={initialParams.text_motion || "none"}
+              // 2026-05-23: lyricTransition (Cut/Fade) y textMotion (Sutil
+              // drift) eliminados — los reemplazan lyrics_animation +
+              // line_transition (libass, paridad con el wizard).
+              lyricsAnimation={initialParams.lyrics_animation || "none"}
+              lineTransition={initialParams.line_transition || "none"}
               disableAutoSplit
               disableBeforeUnload
               // Autosave ON inside the /edit modal: backend's

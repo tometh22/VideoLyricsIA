@@ -2807,8 +2807,10 @@ async def upload(
         song_title=song_title,
         text_case=text_case if text_case in ("upper", "title", "lower", "original") else "upper",
         font_scale=_font_scale,
-        lyric_transition=lyric_transition if lyric_transition in ("cut", "fade", "fade_slow") else "cut",
-        text_motion=text_motion if text_motion in ("none", "subtle", "float") else "none",
+        # lyric_transition + text_motion: deprecados 2026-05-23 (ver run_pipeline).
+        # Aceptamos los Form params por back-compat pero coerce a defaults.
+        lyric_transition="cut",
+        text_motion="none",
         lyrics_animation=lyrics_animation if lyrics_animation in ("none", "karaoke", "word_reveal", "pop", "glow") else "none",
         line_transition=line_transition if line_transition in ("none", "slide_up", "slide_side", "wipe", "dissolve_blur") else "none",
         text_contrast=text_contrast if text_contrast in ("subtle", "medium", "strong") else "medium",
@@ -2938,24 +2940,39 @@ async def _run_transcription_for_job(
 
     tmp_dir = tempfile.mkdtemp()
     tmp_path = audio_path
-    _vocal_stem = None   # demucs output path, cleaned up in finally
+    _vocal_stem = None   # demucs output path (lazy), cleaned up in finally
 
     try:
         lang = language.strip() if language.strip() else None
         loop = asyncio.get_event_loop()
 
-        # Vocal source separation (demucs): isolate the voice so forced
-        # alignment / whisperX transcribe the LYRIC, not the band — the big
-        # lever on hard songs (incident "El Arbol"; see vocal_sep.py). Behind
-        # VOCAL_SEP_ENABLED; on failure `align_audio` falls back to the mix.
+        # Vocal source separation (demucs) — LAZY. Previously demucs ran at the
+        # top of every job (~30-90s) regardless of which downstream engine
+        # actually needed the stem. On songs where lrclib synced verifies, no
+        # forced-align / whisperX call ever happens, so the stem was burned for
+        # nothing. The wrapper below runs demucs at most ONCE, on first request,
+        # and caches the result. If nothing calls it, demucs never runs and the
+        # job is 60-90s faster.
+        #
         # The stem feeds FA / whisperX / verification ONLY — NOT the bare
         # whisper-1 pass, which is more hallucination-prone on isolated vocals
         # (long-form caveat, arXiv 2506.15514).
         import vocal_sep
-        _vocal_stem = await asyncio.to_thread(vocal_sep.separate_vocals, tmp_path)
-        align_audio = _vocal_stem or tmp_path
-        if _vocal_stem:
-            logger.info("[LYRICS] isolated vocal stem — using it for alignment/whisperX/verification")
+        _stem_state = {"computed": False, "path": None}
+
+        async def _get_align_audio() -> str:
+            """Return the path that alignment/transcription engines should read.
+            Lazy-separates the vocal stem on first call. Falls back to the mix
+            (`tmp_path`) when vocal_sep is disabled / fails."""
+            nonlocal _vocal_stem
+            if not _stem_state["computed"]:
+                _stem_state["computed"] = True
+                stem = await asyncio.to_thread(vocal_sep.separate_vocals, tmp_path)
+                _stem_state["path"] = stem
+                _vocal_stem = stem
+                if stem:
+                    logger.info("[LYRICS] isolated vocal stem (lazy) — using for alignment/whisperX/verification")
+            return _stem_state["path"] or tmp_path
 
         # Resolve artist + title for the reference-lyrics fetch. Source order:
         #   1) explicit form fields (frontend already collects `artist` per
@@ -3019,8 +3036,9 @@ async def _run_transcription_for_job(
             if forced_align.is_enabled():
                 fa_text = plain or forced_align.lrc_to_plain_text(synced)
                 if fa_text:
+                    _aa = await _get_align_audio()
                     fa_segs = await asyncio.to_thread(
-                        forced_align.forced_align_lyrics, align_audio, fa_text,
+                        forced_align.forced_align_lyrics, _aa, fa_text,
                     )
                     if fa_segs:
                         logger.info("[LYRICS] forced alignment used (%s lines, lrclib text) for %r - %r", len(fa_segs), artist_hint, song_hint)
@@ -3118,6 +3136,11 @@ async def _run_transcription_for_job(
                             min(n - 1, max(0, (2 * n) // 3)),
                         })
                         confidences: list[float] = []
+                        # Verification reads ~5s of audio and runs Whisper-1
+                        # on it; we use the MIX (tmp_path) here so this path
+                        # never triggers the lazy demucs run. lrclib synced
+                        # that verifies → no FA / whisperX needed → no demucs
+                        # ever — biggest speedup on the happy path.
                         for pi in probe_idxs:
                             verify_seg = song_segs[pi]
                             # Skip probes whose text is too short to fuzzy-match
@@ -3126,7 +3149,7 @@ async def _run_transcription_for_job(
                                 continue
                             c = await asyncio.to_thread(
                                 _verify_lrclib_alignment,
-                                align_audio, verify_seg["text"], verify_seg["start"],
+                                tmp_path, verify_seg["text"], verify_seg["start"],
                             )
                             if c is not None:
                                 confidences.append(c)
@@ -3481,8 +3504,9 @@ async def _run_transcription_for_job(
             # Whisper-word aligner / gap-fill below on any failure.
             import forced_align
             if forced_align.is_enabled():
+                _aa = await _get_align_audio()
                 fa_segs = await asyncio.to_thread(
-                    forced_align.forced_align_lyrics, align_audio, reference,
+                    forced_align.forced_align_lyrics, _aa, reference,
                 )
                 if fa_segs:
                     logger.info("[LYRICS] forced alignment used (%s lines, gemini text)", len(fa_segs))
@@ -3511,8 +3535,9 @@ async def _run_transcription_for_job(
             # phrase line-breaks differently; whisperX follows the audio).
             import whisperx_transcribe
             if whisperx_transcribe.is_enabled():
+                _aa = await _get_align_audio()
                 wx_segs = await asyncio.to_thread(
-                    whisperx_transcribe.transcribe_whisperx, align_audio, lang,
+                    whisperx_transcribe.transcribe_whisperx, _aa, lang,
                 )
                 if wx_segs:
                     from pipeline import _filter_whisper_hallucinations as _fwh
@@ -3597,8 +3622,9 @@ async def _run_transcription_for_job(
         if not reference:
             import whisperx_transcribe
             if whisperx_transcribe.is_enabled():
+                _aa = await _get_align_audio()
                 wx_segs = await asyncio.to_thread(
-                    whisperx_transcribe.transcribe_whisperx, align_audio, lang,
+                    whisperx_transcribe.transcribe_whisperx, _aa, lang,
                 )
                 if wx_segs:
                     from pipeline import _filter_whisper_hallucinations as _fwh
@@ -3917,8 +3943,9 @@ async def generate_with_segments(
         song_title=song_title,
         text_case=text_case if text_case in ("upper", "title", "lower", "original") else "upper",
         font_scale=_font_scale_gen,
-        lyric_transition=lyric_transition if lyric_transition in ("cut", "fade", "fade_slow") else "cut",
-        text_motion=text_motion if text_motion in ("none", "subtle", "float") else "none",
+        # Deprecados 2026-05-23 (ver primer endpoint /upload).
+        lyric_transition="cut",
+        text_motion="none",
         lyrics_animation=lyrics_animation if lyrics_animation in ("none", "karaoke", "word_reveal", "pop", "glow") else "none",
         line_transition=line_transition if line_transition in ("none", "slide_up", "slide_side", "wipe", "dissolve_blur") else "none",
         text_contrast=text_contrast if text_contrast in ("subtle", "medium", "strong") else "medium",
@@ -4771,8 +4798,9 @@ class EditJobRequest(BaseModel):
     font: str | None = Field(default=None, max_length=64)
     font_scale: float | None = None
     text_case: str | None = Field(default=None, max_length=16)
-    lyric_transition: str | None = Field(default=None, max_length=16)
-    text_motion: str | None = Field(default=None, max_length=16)
+    # lyric_transition + text_motion deprecados 2026-05-23 — campos
+    # eliminados del modelo. Clientes viejos que sigan mandándolos en el
+    # body son ignorados por Pydantic (default: extra fields permitidos).
     text_contrast: str | None = Field(default=None, max_length=16)
     # Required when edit_type=="lyrics". For edit_type=="background" or
     # "typography", segments is OPTIONAL — if the operator made text
@@ -5482,12 +5510,9 @@ async def request_edit(
         edit_params["font_scale"] = body.font_scale
     if body.text_case is not None:
         edit_params["text_case"] = body.text_case
-    if body.lyric_transition is not None:
-        edit_params["lyric_transition"] = body.lyric_transition
     if body.text_contrast is not None:
         edit_params["text_contrast"] = body.text_contrast
-    if body.text_motion is not None:
-        edit_params["text_motion"] = body.text_motion
+    # body.lyric_transition + body.text_motion: campos eliminados 2026-05-23.
     # FX layer + lyric animations: durable visual choices, no edit_type gate
     # (the operator can change them inside any edit modal). Same pattern as
     # movement_style below: forward to edit_params for THIS render AND persist
@@ -6098,9 +6123,11 @@ async def retry_job(
     # Mirrors the /variant endpoint pattern (see line 5814 region).
     _retry_render_params = job.render_params or {}
     retry_pipeline_kwargs = {}
-    for k in ("font", "font_scale", "text_case", "lyric_transition",
-              "text_motion", "text_contrast", "movement_style",
-              "animate_image", "genre", "match_lyrics",
+    # lyric_transition + text_motion deprecados 2026-05-23 — sacados de la
+    # whitelist; si están en render_params viejos quedan como dato muerto,
+    # no se propagan al re-render.
+    for k in ("font", "font_scale", "text_case", "text_contrast",
+              "movement_style", "animate_image", "genre", "match_lyrics",
               "background_hint", "concept", "bg_verbatim",
               "effect", "custom_colors",
               # Lyric animation + line transition (libass templates from the
@@ -6392,9 +6419,10 @@ async def create_variant(
     # render_params del padre + overrides — los param de typography
     # (font, font_scale, etc) se pasan como kwargs individuales que
     # run_pipeline acepta. concept también va por kwarg.
-    for k in ("font", "font_scale", "text_case", "lyric_transition",
-              "text_motion", "text_contrast", "movement_style",
-              "animate_image", "genre", "match_lyrics", "bg_verbatim",
+    # lyric_transition + text_motion deprecados 2026-05-23 — fuera del whitelist.
+    for k in ("font", "font_scale", "text_case", "text_contrast",
+              "movement_style", "animate_image", "genre", "match_lyrics",
+              "bg_verbatim",
               # FX layer + lyric animation/transition (libass templates from
               # the wizard). Added 2026-05-22: variantes heredaban tipografía
               # y movimiento del padre pero perdían el efecto encima (nieve/

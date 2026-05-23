@@ -413,6 +413,25 @@ def run_pipeline(job_id: str, mp3_path: str, artist: str, style: str,
     job_dir = os.path.join(OUTPUTS_DIR, job_id)
     os.makedirs(job_dir, exist_ok=True)
 
+    # Telemetría 2026-05-23 — text_motion + lyric_transition deprecados.
+    # main.py coerce upstream a defaults, pero un job que estuviera en cola
+    # antes del deploy puede traer valores no-default; loguear UNA VEZ por
+    # job (warn) y resetear. Sirve para medir cuánta cola legacy queda.
+    if text_motion not in (None, "", "none"):
+        logger.warning(
+            "[DEPRECATED] job=%s recibió text_motion=%r — campo deprecado, "
+            "se ignora. Reemplazo: lyrics_animation (pop/glow).",
+            job_id, text_motion,
+        )
+        text_motion = "none"
+    if lyric_transition not in (None, "", "cut"):
+        logger.warning(
+            "[DEPRECATED] job=%s recibió lyric_transition=%r — campo deprecado, "
+            "se ignora. Reemplazo: line_transition (slide/wipe/dissolve_blur).",
+            job_id, lyric_transition,
+        )
+        lyric_transition = "cut"
+
     # Worker just claimed this job — flip the user-facing status from
     # "queued" (sitting in RQ) to "processing" (a worker is actively on it).
     # This makes the queue visible in the dashboard: jobs piling up in RQ
@@ -7294,12 +7313,18 @@ def generate_lyric_video(
     # Fast path: libass single-pass render (engine=ass). Covers video bg +
     # H.264 (YouTube) and the UMG intermediate master (profile
     # "umg_intermediate", still libx264 → the lazy ProRes transcode is
-    # unchanged). Image/Ken Burns bg is resolved to a video first (see
-    # below). text_motion≠none still falls through to moviepy.
+    # unchanged). Image/Ken Burns bg is resolved to a video first (see below).
+    #
+    # 2026-05-23: removida la cláusula `text_motion == "none"` del gate.
+    # text_motion quedó deprecado upstream (siempre coerce a "none" en
+    # main.py), pero la condición se sacó para que jobs en cola anteriores
+    # al deploy con text_motion legacy también pasen por ASS — antes
+    # forzaban moviepy y apagaban silenciosamente lyrics_animation +
+    # line_transition.
     _engine = os.environ.get("LYRIC_RENDER_ENGINE", "moviepy").lower()
     _bg_is_video = not bg_source.lower().endswith((".jpg", ".jpeg", ".png"))
     _ass_ok_profile = spec.profile in ("youtube", "umg_intermediate")
-    if _engine == "ass" and _ass_ok_profile and text_motion == "none":
+    if _engine == "ass" and _ass_ok_profile:
         try:
             ass_bg = bg_source
             if not _bg_is_video:
