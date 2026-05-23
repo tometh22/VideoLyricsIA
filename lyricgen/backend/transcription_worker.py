@@ -90,7 +90,7 @@ def run_transcription_job(
         finally:
             _db.close()
         if not input_r2_key:
-            return _fail(job_id, "input_r2_key missing — no se puede materializar el audio para transcribir.")
+            return _fail(job_id, "input_r2_key missing [v2-fix] — no se puede materializar el audio para transcribir.")
         os.makedirs(os.path.dirname(audio_path), exist_ok=True)
         if not storage.download_object(input_r2_key, audio_path):
             return _fail(job_id, "No pudimos leer el archivo subido. Reintentá en unos segundos.")
