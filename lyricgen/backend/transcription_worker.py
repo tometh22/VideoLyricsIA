@@ -74,14 +74,21 @@ def run_transcription_job(
         logger.warning("[TRANSCRIBE-WORKER] failed to flip status: %s", e)
 
     # 2. Si el archivo no está en disco (ej. worker en container distinto al
-    #    handler que recibió el upload), descargarlo de R2.
+    #    handler que recibió el upload), descargarlo de R2. Usamos
+    #    get_job_model con una session propia — get_job() requería un db arg
+    #    posicional y to_dict() no incluye input_r2_key (bug 2026-05-23).
     if not os.path.exists(audio_path):
-        # input_r2_key necesario — leemos del row.
+        from database import SessionLocal
+        from jobs import get_job_model
+        input_r2_key = None
+        _db = SessionLocal()
         try:
-            job = get_job(job_id)
-            input_r2_key = (job or {}).get("input_r2_key") if isinstance(job, dict) else None
-        except Exception:
-            input_r2_key = None
+            row = get_job_model(_db, job_id)
+            input_r2_key = (row.input_r2_key if row else None)
+        except Exception as e:
+            logger.warning("[TRANSCRIBE-WORKER] get_job_model failed for %s: %s", job_id, e)
+        finally:
+            _db.close()
         if not input_r2_key:
             return _fail(job_id, "input_r2_key missing — no se puede materializar el audio para transcribir.")
         os.makedirs(os.path.dirname(audio_path), exist_ok=True)
