@@ -96,8 +96,13 @@ def run_transcription_job(
             language=language, artist=artist, title=title, filename=filename,
         ))
     except Exception as e:
+        import traceback
+        tb = traceback.format_exc()
         logger.exception("[TRANSCRIBE-WORKER] job=%s failed", job_id)
-        return _fail(job_id, str(e))
+        # Persistir un sumario corto + tipo de excepción para diagnóstico
+        # vía /transcription-status sin tener que pegarse al log container.
+        err_msg = f"{type(e).__name__}: {str(e)[:200]}"
+        return _fail(job_id, err_msg, tb=tb)
 
     # 4. Persistir el resultado en el row para que /transcription-status lo
     #    devuelva al frontend. Los segments ya los persiste el handler async
@@ -109,15 +114,22 @@ def run_transcription_job(
     return result
 
 
-def _fail(job_id: str, error_msg: str) -> dict:
-    """Marca el job como transcription_failed con un mensaje para el frontend."""
+def _fail(job_id: str, error_msg: str, tb: str = "") -> dict:
+    """Marca el job como transcription_failed con un mensaje para el frontend.
+
+    El traceback se loguea (para grepear el log container) pero NO se persiste
+    en la DB (puede ser >500 chars y conviene mantener `error` corto para el
+    UI de error inline en el editor).
+    """
     from jobs import update_job
+    if tb:
+        logger.error("[TRANSCRIBE-WORKER] job=%s traceback:\n%s", job_id, tb)
     try:
         update_job(
             job_id,
             status="transcription_failed",
             current_step="error",
-            error_message=error_msg[:500],
+            error=error_msg[:500],
         )
     except Exception as e:
         logger.warning("[TRANSCRIBE-WORKER] failed to persist error for %s: %s", job_id, e)

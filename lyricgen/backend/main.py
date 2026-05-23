@@ -2609,7 +2609,7 @@ async def transcribe_uploaded(
             # Rollback el status para no dejar el job colgado en queued.
             from jobs import update_job
             update_job(job_id, status="transcription_failed",
-                       current_step="error", error_message=str(exc)[:300])
+                       current_step="error", error=str(exc)[:300])
             raise HTTPException(status_code=503, detail="Cola de transcripción no disponible. Reintentá.")
         # 202 Accepted con el job_id para polling. No incluye segments —
         # el frontend pollea /transcription-status hasta status=transcribed.
@@ -2700,7 +2700,11 @@ async def transcription_status(
         payload["segments"] = job_row.segments_json or []
         payload["reference_lyrics"] = job_row.reference_lyrics or ""
     elif status == "transcription_failed":
-        payload["error"] = job_row.error_message or "Error desconocido durante la transcripción."
+        # 2026-05-23 bug fix: el modelo Job usa `error` (Text), no `error_message`.
+        # Inicialmente confundí los nombres y el endpoint tiraba 500 con
+        # AttributeError. Mismo fix en transcription_worker.py:_fail.
+        payload["error"] = (getattr(job_row, "error", None) or
+                            "Error desconocido durante la transcripción.")
 
     return payload
 
