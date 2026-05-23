@@ -111,13 +111,29 @@ def run_transcription_job(
         err_msg = f"{type(e).__name__}: {str(e)[:200]}"
         return _fail(job_id, err_msg, tb=tb)
 
-    # 4. Persistir el resultado en el row para que /transcription-status lo
-    #    devuelva al frontend. Los segments ya los persiste el handler async
-    #    en su scoped_db() interno; acá solo flippeamos status final.
+    # 4. Persistir el resultado en el row.
+    #
+    # BUG fix 2026-05-23: en el path sync legacy /transcribe-uploaded
+    # devolvía los segments inline al frontend, que los guardaba después con
+    # /save-segments. En el path async el frontend pollea /transcription-status
+    # esperando los segments en el response. El worker DEBE persistirlos.
+    # Sin esta línea los jobs terminaban como "transcribed" con segments=null
+    # y el editor abría vacío.
     try:
-        update_job(job_id, status="transcribed", current_step="editing")
+        segments = result.get("segments") if isinstance(result, dict) else None
+        reference_lyrics = result.get("reference_lyrics", "") if isinstance(result, dict) else ""
+        update_kwargs = {"status": "transcribed", "current_step": "editing"}
+        if segments is not None:
+            update_kwargs["segments_json"] = segments
+        # reference_lyrics no tiene columna en el modelo Job (defer a otro PR
+        # si el editor lo necesita post-transcribe). Lo dejo en el log para
+        # diagnóstico mientras tanto.
+        if reference_lyrics:
+            logger.info("[TRANSCRIBE-WORKER] job=%s ref_lyrics=%d chars (no persistido aún)",
+                        job_id, len(reference_lyrics))
+        update_job(job_id, **update_kwargs)
     except Exception as e:
-        logger.warning("[TRANSCRIBE-WORKER] failed to flip status to transcribed: %s", e)
+        logger.warning("[TRANSCRIBE-WORKER] failed to persist final state: %s", e)
     return result
 
 
