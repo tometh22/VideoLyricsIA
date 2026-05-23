@@ -87,8 +87,18 @@ def main():
             logger.warning("[WORKER] Whisper preload failed (%s); will load on first job", e)
 
     conn = Redis.from_url(redis_url)
-    # Enterprise queue first so premium tenants get priority.
-    queues = [Queue("enterprise", connection=conn), Queue("default", connection=conn)]
+    # Priority order:
+    #   1. transcription — corta latencia (~15-20s), debe drenar primero para
+    #      que el usuario vea el editor rápido. Si no es prioritaria queda
+    #      detrás de un /generate (15-30 min) y arruina la UX que prometimos.
+    #   2. enterprise — premium tenants (UMG/OMG) van antes que default.
+    #   3. default — todo lo demás.
+    # Workers listen in this order; RQ pickup respects it.
+    queues = [
+        Queue("transcription", connection=conn),
+        Queue("enterprise", connection=conn),
+        Queue("default", connection=conn),
+    ]
     worker = Worker(queues, connection=conn)
 
     def _graceful(signum, _frame):

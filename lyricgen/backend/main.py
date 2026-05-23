@@ -2552,28 +2552,75 @@ async def transcribe_uploaded(
 
     _enforce_disk_capacity()
     _enforce_memory_pressure()
+
+    # Feature flag — 2026-05-23. Default ON. Flipear a "0" para rollback al
+    # path sync inline si rompe en staging. Rollout plan:
+    #   1. Merge a staging con ASYNC_TRANSCRIBE_ENABLED=1 en .env staging.
+    #   2. Smoke 1-2 días. Si todo OK, prender en prod (.env prod) + monitorear.
+    #   3. Borrar la rama legacy + el flag después de 1 semana sin incidentes.
+    _async_enabled = os.environ.get(
+        "ASYNC_TRANSCRIBE_ENABLED", "1"
+    ).strip().lower() not in ("0", "false", "no", "off")
+
+    # Materialize the audio onto local disk for Whisper / ffmpeg / etc.
+    # En el path async, esto sigue siendo necesario porque el handler valida
+    # el archivo (corrupt detection) antes de enqueue — fail-fast en el
+    # request, no en el worker (que daría error opaco al usuario via polling).
+    job_id = body.job_id
+    job_dir = os.path.join(OUTPUTS_DIR, job_id)
+    os.makedirs(job_dir, exist_ok=True)
+    audio_path = os.path.join(job_dir, job_row.filename)
+
+    if not os.path.exists(audio_path):
+        import asyncio as _asyncio
+        for _attempt in range(5):
+            if storage.download_object(job_row.input_r2_key, audio_path):
+                break
+            if _attempt < 4:
+                await _asyncio.sleep(0.5 * (2 ** _attempt))
+        else:
+            raise HTTPException(
+                status_code=502,
+                detail="No pudimos leer el archivo subido. Reintentá en unos segundos.",
+            )
+    _validate_audio_file_on_disk(job_row.filename, audio_path)
+
+    if _async_enabled:
+        # Async path — enqueue + 202 + status polling.
+        # Flippeamos status a "transcribing_queued" para que /transcription-status
+        # devuelva un estado coherente desde el momento del enqueue.
+        job_row.status = "transcribing_queued"
+        job_row.current_step = "transcribing"
+        db.commit()
+        db.close()
+        try:
+            from queue_jobs import enqueue_transcription
+            enqueue_transcription(
+                job_id,
+                audio_path,
+                language=body.language,
+                artist=body.artist,
+                title=body.title,
+                filename=job_row.filename,
+                tenant_id=current_user.get("tenant_id", ""),
+            )
+        except Exception as exc:
+            logger.exception("[TRANSCRIBE] enqueue failed for job=%s", job_id)
+            # Rollback el status para no dejar el job colgado en queued.
+            from jobs import update_job
+            update_job(job_id, status="transcription_failed",
+                       current_step="error", error_message=str(exc)[:300])
+            raise HTTPException(status_code=503, detail="Cola de transcripción no disponible. Reintentá.")
+        # 202 Accepted con el job_id para polling. No incluye segments —
+        # el frontend pollea /transcription-status hasta status=transcribed.
+        return {
+            "job_id": job_id,
+            "status": "transcribing_queued",
+        }
+
+    # Legacy sync path (fallback con ASYNC_TRANSCRIBE_ENABLED=0).
     transcription_lease = _try_acquire_transcription_slot()
     try:
-        # Materialize the audio onto local disk for Whisper / ffmpeg / etc.
-        job_id = body.job_id
-        job_dir = os.path.join(OUTPUTS_DIR, job_id)
-        os.makedirs(job_dir, exist_ok=True)
-        audio_path = os.path.join(job_dir, job_row.filename)
-
-        if not os.path.exists(audio_path):
-            import asyncio as _asyncio
-            for _attempt in range(5):
-                if storage.download_object(job_row.input_r2_key, audio_path):
-                    break
-                if _attempt < 4:
-                    await _asyncio.sleep(0.5 * (2 ** _attempt))
-            else:
-                raise HTTPException(
-                    status_code=502,
-                    detail="No pudimos leer el archivo subido. Reintentá en unos segundos.",
-                )
-        _validate_audio_file_on_disk(job_row.filename, audio_path)
-
         # Reuse the existing Whisper / lrclib machinery from the legacy
         # /transcribe handler. Keeping the implementation in one place via
         # the helper below means the lyrics-recovery / hallucination logic
@@ -2592,6 +2639,70 @@ async def transcribe_uploaded(
         )
     finally:
         _release_transcription_slot(transcription_lease)
+
+
+# ---------------------------------------------------------------------------
+# Transcription status polling — 2026-05-23
+# El frontend pollea acá tras un POST /transcribe-uploaded (async). Devuelve
+# el ciclo de vida del job: transcribing_queued → transcribing →
+# transcribed | transcription_failed. Cuando llega a transcribed, incluye
+# segments + reference_lyrics para que el editor cargue sin segundo request.
+# ---------------------------------------------------------------------------
+@app.get("/transcription-status/{job_id}")
+@limiter.limit("600/minute")  # polling holgado: 1 req/seg × ~10 archivos simultáneos
+async def transcription_status(
+    request: Request,
+    job_id: str,
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Devuelve el estado actual de una transcripción async.
+
+    Forma del response:
+      {
+        "job_id": str,
+        "status": "transcribing_queued" | "transcribing" | "transcribed" | "transcription_failed",
+        "segments": [...] | null,
+        "reference_lyrics": str | null,
+        "coverage_warning": bool,
+        "recovery_source": str | null,
+        "error": str | null
+      }
+
+    El frontend pollea con backoff (~1.5s → 5s). Cuando status == "transcribed"
+    el polling para y carga el editor con los segments. Si "transcription_failed",
+    muestra el error inline con botón Reintentar.
+    """
+    from jobs import get_job_model
+    job_row = get_job_model(db, job_id)
+    if (not job_row
+            or job_row.user_id != current_user["id"]
+            or job_row.tenant_id != current_user["tenant_id"]):
+        raise HTTPException(status_code=404, detail="Job not found.")
+
+    status = job_row.status or ""
+    # Mapeo de status del DB a los valores que espera el frontend. El path
+    # legacy sync usa "transcribed_pending" como estado final post-transcribe;
+    # lo normalizamos a "transcribed" en la respuesta.
+    if status == "transcribed_pending":
+        status = "transcribed"
+
+    payload = {
+        "job_id": job_id,
+        "status": status,
+        "segments": None,
+        "reference_lyrics": None,
+        "coverage_warning": bool(getattr(job_row, "coverage_warning", False)),
+        "recovery_source": getattr(job_row, "recovery_source", None),
+        "error": None,
+    }
+    if status == "transcribed":
+        payload["segments"] = job_row.segments_json or []
+        payload["reference_lyrics"] = job_row.reference_lyrics or ""
+    elif status == "transcription_failed":
+        payload["error"] = job_row.error_message or "Error desconocido durante la transcripción."
+
+    return payload
 
 
 # Deprecation metadata for the legacy multipart-form endpoints. RFC 8594
