@@ -39,9 +39,11 @@ def test_map_segments_basic_with_words():
     segs = wx._map_segments(out)
     assert len(segs) == 2
     assert segs[0]["text"] == "Hola mundo"
+    # Words preserve `score` (whisperX confidence per word) when present —
+    # enables confidence-highlighting in the editor.
     assert segs[0]["words"] == [
-        {"word": "Hola", "start": 0.0, "end": 1.0},
-        {"word": "mundo", "start": 1.0, "end": 2.0},
+        {"word": "Hola", "start": 0.0, "end": 1.0, "score": 0.9},
+        {"word": "mundo", "start": 1.0, "end": 2.0, "score": 0.8},
     ]
     # Empty words list → no "words" key.
     assert "words" not in segs[1]

@@ -347,6 +347,78 @@ def enqueue_pipeline(
     return f"thread:{job_id}"
 
 
+def enqueue_transcription(
+    job_id: str,
+    audio_path: str,
+    *,
+    language: str = "",
+    artist: str = "",
+    title: str = "",
+    filename: str = "",
+    tenant_id: str = "",
+) -> str:
+    """Enqueue una transcripción en la queue `transcription` (alta prioridad,
+    drenada por el mismo worker container que enterprise/default).
+
+    Devuelve el RQ job id (o 'thread:<job_id>' en el fallback dev sin Redis).
+
+    Diseño 2026-05-23: antes `/transcribe-uploaded` corría
+    `_run_transcription_for_job` inline. Ahora hace enqueue acá y devuelve
+    202+job_id. Ver transcription_worker.py para el entry point + el code path.
+
+    Tenant priority: UMG/OMG aterrizan en `transcription` igual que todos —
+    Whisper es uniformemente rápido (~15-20s), no necesita una cola premium
+    aparte. Si en el futuro la cola se acumula y un tenant grande está
+    bloqueado, mover la decisión de queue acá.
+    """
+    _, q_default, _ = _init_redis()
+    if q_default is not None:
+        # Acceso directo al Redis para crear la queue "transcription" sin
+        # cambiar la inicialización (que no la incluye por compat con workers
+        # existentes que no la conocen).
+        from rq import Queue, Retry
+        q = Queue("transcription", connection=_redis)
+        from transcription_worker import run_transcription_job
+        timeout = int(os.environ.get("TRANSCRIBE_JOB_TIMEOUT", "300"))   # 5 min hard cap
+        retry = Retry(max=2, interval=10)  # whisper hiccup → reintentar 2 veces con 10s gap
+        rq_job = q.enqueue(
+            run_transcription_job,
+            args=(job_id, audio_path),
+            kwargs={
+                "language": language, "artist": artist, "title": title,
+                "filename": filename,
+            },
+            job_timeout=timeout,
+            result_ttl=RESULT_TTL,
+            failure_ttl=FAILURE_TTL,
+            job_id=f"transcribe:{job_id}",  # prefix evita colisión con render job_id
+            retry=retry,
+        )
+        return rq_job.id
+
+    # Dev fallback (sin Redis): thread daemon, idéntico al de enqueue_pipeline.
+    if _ENVIRONMENT == "production":
+        logger.error(
+            "Refusing to enqueue transcription %s via thread fallback: Redis is "
+            "required in production but unreachable.", job_id,
+        )
+        raise RuntimeError(
+            "Transcription queue unavailable: Redis is required in production."
+        )
+    from transcription_worker import run_transcription_job
+    t = threading.Thread(
+        target=run_transcription_job,
+        args=(job_id, audio_path),
+        kwargs={
+            "language": language, "artist": artist, "title": title,
+            "filename": filename,
+        },
+        daemon=True,
+    )
+    t.start()
+    return f"thread:transcribe:{job_id}"
+
+
 def enqueue_prores_prewarm(job_id: str, file_type: str) -> str | None:
     """Schedule the ProRes transcode for `job_id` on the enterprise queue.
 

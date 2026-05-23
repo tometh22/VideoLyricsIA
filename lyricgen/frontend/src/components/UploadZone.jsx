@@ -137,6 +137,11 @@ export default function UploadZone({
   onGenerateDirect,
   user,
   sidebarOpen = true,
+  // 2026-05-23: auto-transcribe en background al drop. La función recibe los
+  // newEntries recién agregados y arranca uploads + transcripciones en
+  // segundo plano. La status map per file viene del App via filesnamekey.
+  onAutoTranscribe,
+  transcribeStatusByFile = {},
 }) {
   const { t } = useI18n();
   const inputRef = useRef();
@@ -603,6 +608,14 @@ export default function UploadZone({
           ...batchDefaultsRef.current,
         };
       });
+      // 2026-05-23: trigger auto-transcribe en el drop. Antes el upload se
+      // difería hasta "Revisar" (bloqueaba al operador ~15-20s viendo un
+      // spinner). Ahora arranca en background mientras el operador elige
+      // wizard options. Cuando llega a "Revisar" los segments están cacheados.
+      if (typeof onAutoTranscribe === "function" && newEntries.length) {
+        // Defer un microtask para que el setFiles haya commiteado el state.
+        Promise.resolve().then(() => onAutoTranscribe(newEntries));
+      }
       return [...prev, ...newEntries];
     });
   };
@@ -1102,6 +1115,27 @@ export default function UploadZone({
                     {t("batch.wav_warning_large", { sizeMB: Math.round(entry.file.size / (1024 * 1024)) })}
                   </p>
                 )}
+                {/* 2026-05-23: status badge de la transcripción en background.
+                    Refleja el estado real del job en backend (queued ▷ transcribing
+                    ▷ done | error). Si transcribeStatusByFile no tiene la key,
+                    no muestra nada (path legacy o todavía no arrancó). */}
+                {(() => {
+                  const k = `${entry.file.name}__${entry.file.lastModified}__${entry.file.size}`;
+                  const st = transcribeStatusByFile[k];
+                  if (!st) return null;
+                  const label = {
+                    uploading:    { txt: "📤 Subiendo…",       cls: "text-blue-400" },
+                    queued:       { txt: "🕓 En cola",          cls: "text-gray-400" },
+                    transcribing: { txt: "🎙 Transcribiendo…", cls: "text-brand-light" },
+                    done:         { txt: "✓ Listo para revisar", cls: "text-accent" },
+                    error:        { txt: `✗ ${st.error || "Error"}`, cls: "text-red-400" },
+                  }[st.status] || { txt: st.status, cls: "text-gray-500" };
+                  return (
+                    <p className={`text-[11px] mt-0.5 truncate ${label.cls}`}>
+                      {label.txt}
+                    </p>
+                  );
+                })()}
               </div>
               <button
                 onClick={(e) => removeFile(i, e)}

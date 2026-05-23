@@ -16,6 +16,7 @@ import HistoryView from "./components/HistoryView";
 import UploadZone from "./components/UploadZone";
 import LyricsEditor from "./components/LyricsEditor";
 import BatchProgress from "./components/BatchProgress";
+import TranscribingProgress from "./components/TranscribingProgress";
 import JobDetail from "./components/JobDetail";
 import Settings from "./components/Settings";
 import AdminPanel from "./components/AdminPanel";
@@ -356,6 +357,10 @@ export default function App() {
   const [token, setToken] = useState(getToken());
   const [user, setUser] = useState(getUser());
   const [files, setFiles] = useState([]);
+  // Ref que espeja `files` para que callbacks sin dependencias (ej.
+  // onAutoTranscribe en un setTimeout) lean el estado actual sin re-render
+  // loops. Sync con un useEffect debajo.
+  const filesRef = useRef(files);
   const [delivery, setDelivery] = useState({
     delivery_profile: "youtube",
     umg_frame_size: "HD",
@@ -707,20 +712,78 @@ export default function App() {
     });
   }, []);
 
+  // Sync filesRef con files para que callbacks asincrónicos vean el state actual.
+  useEffect(() => { filesRef.current = files; }, [files]);
+
+  // Estado per-row visible en UploadZone — { [stableKey]: "uploading" | "queued" |
+  // "transcribing" | "done" | "error" }. Stable key = file.name + file.lastModified.
+  // Sirve para mostrar el status badge en cada fila del wizard mientras la
+  // transcripción corre en background (2026-05-23 refactor).
+  const [transcribeStatusByFile, setTranscribeStatusByFile] = useState({});
+  const fileKey = (f) => `${f.name}__${f.lastModified}__${f.size}`;
+  const setRowStatus = (file, status, extra = {}) => {
+    const k = fileKey(file);
+    setTranscribeStatusByFile((prev) => ({ ...prev, [k]: { status, ...extra } }));
+  };
+
+  // Polls /transcription-status hasta que el job terminó. Devuelve los datos
+  // con segments + reference_lyrics, o null si falló. Backoff 1.5s → 5s.
+  // 2026-05-23: necesario por el nuevo backend async que devuelve 202+job_id
+  // al POST /transcribe-uploaded en vez de los segments inline.
+  const pollUntilTranscribed = useCallback(async (jobId, file) => {
+    let delay = 1500;
+    const start = Date.now();
+    const TIMEOUT_MS = 5 * 60 * 1000;   // 5 min hard cap (igual que job_timeout backend)
+    while (Date.now() - start < TIMEOUT_MS) {
+      try {
+        const res = await authFetchWithRetryOn503(
+          `${API}/transcription-status/${jobId}`,
+          { method: "GET" },
+          { maxRetries: 2 },
+        );
+        if (res.ok) {
+          const data = await res.json();
+          if (data.status === "transcribed") {
+            if (file) setRowStatus(file, "done");
+            return data;
+          }
+          if (data.status === "transcription_failed") {
+            if (file) setRowStatus(file, "error", { error: data.error });
+            return null;
+          }
+          if (file) setRowStatus(file, data.status === "transcribing_queued" ? "queued" : "transcribing");
+        }
+      } catch {
+        // Transient errors — keep polling.
+      }
+      await new Promise((r) => setTimeout(r, delay));
+      delay = Math.min(delay * 1.2, 5000);
+    }
+    if (file) setRowStatus(file, "error", { error: "Timeout esperando la transcripción." });
+    return null;
+  }, []);
+
   // Pre-upload + transcribe songs at indices fromIdx..queue.length-1 in the
-  // background while the user is actively reviewing a different song. Results
-  // land in prefetchCache.current[idx] so transcribeNext can serve them
-  // instantly instead of making the user wait for the round-trip.
+  // background while the user is actively reviewing a different song (o ahora
+  // también mientras está en la pantalla de upload eligiendo opciones).
+  // Resultados van a prefetchCache.current[idx] para que transcribeNext los
+  // sirva instant en vez de hacer al usuario esperar el round-trip.
+  //
+  // 2026-05-23: refactor a backend async. La respuesta del POST es ahora
+  // {job_id, status: "transcribing_queued"} — hay que pollear /status hasta
+  // que llegue a "transcribed" para obtener segments + reference_lyrics.
   const prefetchRemaining = useCallback(async (queue, fromIdx) => {
     for (let idx = fromIdx; idx < queue.length; idx++) {
-      // Skip if already fetched or in-flight.
       if (prefetchCache.current[idx]) continue;
       prefetchCache.current[idx] = { status: "loading" };
       const entry = queue[idx];
+      const file = entry.file;
       try {
-        const { jobId } = await uploadFileToR2(entry.file, {
+        setRowStatus(file, "uploading");
+        const { jobId } = await uploadFileToR2(file, {
           meta: { artist: entry.artist || "", title: (entry.songTitle || "").trim() },
         });
+        setRowStatus(file, "queued");
         const res = await authFetchWithRetryOn503(`${API}/transcribe-uploaded`, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
@@ -731,22 +794,60 @@ export default function App() {
             title: (entry.songTitle || "").trim(),
           }),
         }, { maxRetries: 3 });
-        if (res.ok) {
-          const data = await res.json();
+        if (!res.ok) {
+          prefetchCache.current[idx] = { status: "error" };
+          setRowStatus(file, "error");
+          continue;
+        }
+        const initial = await res.json();
+        // Backward compat: if backend returned segments inline (legacy sync
+        // path con ASYNC_TRANSCRIBE_ENABLED=0), salteamos el polling.
+        if (initial.segments) {
+          prefetchCache.current[idx] = { status: "ready", data: initial, jobId };
+          setRowStatus(file, "done");
+          continue;
+        }
+        // Async path — pollear hasta transcribed.
+        const data = await pollUntilTranscribed(initial.job_id || jobId, file);
+        if (data) {
           prefetchCache.current[idx] = { status: "ready", data, jobId };
         } else {
           prefetchCache.current[idx] = { status: "error" };
         }
       } catch {
         prefetchCache.current[idx] = { status: "error" };
+        setRowStatus(file, "error");
       }
     }
-  }, []);
+  }, [pollUntilTranscribed]);
+
+  // 2026-05-23: trigger de transcripción auto en el drop del archivo. Antes
+  // se difería hasta el click en "Revisar", bloqueando al usuario ~15-20s en
+  // un loader. Ahora arranca al instante en background mientras el operador
+  // elige movement/effect/font/paleta. Cuando llega a "Revisar", los segments
+  // están cacheados → editor abre instant.
+  const onAutoTranscribe = useCallback((newFiles) => {
+    // newFiles llega desde UploadZone.addFiles con el shape que ya conocemos.
+    // Lo agregamos a la cola de prefetch. prefetchRemaining respeta serial
+    // (1 a la vez) para no saturar el backend pool — para parallelismo
+    // estricto refactorear con semáforo en v2.
+    // Pasamos los files actuales + los nuevos para que prefetch use el
+    // índice global del array en files (no del slice nuevo).
+    setTimeout(() => {
+      // Defer 1 tick para que setFiles haya commiteado antes del prefetch.
+      const merged = filesRef.current || [];
+      const startIdx = Math.max(0, merged.length - newFiles.length);
+      prefetchRemaining(merged, startIdx);
+    }, 0);
+  }, [prefetchRemaining]);
 
   // --- Review flow ---
+  // 2026-05-23: NO limpia más el prefetchCache. Si onAutoTranscribe ya cargó
+  // transcripciones en background, las reusamos. El cache queda mapeado por
+  // índice en `files`, así que es válido siempre que `files` no haya cambiado
+  // de orden — y no lo cambiamos entre upload y review.
   const handleStartReview = async () => {
     if (!files.length || !files.every((f) => f.artist.trim())) return;
-    prefetchCache.current = {};
     setReviewQueue([...files]);
     navigate("/review");
     transcribeNext([...files], 0);
@@ -822,7 +923,16 @@ export default function App() {
       // Step 2: tell the API to fetch the just-uploaded audio from R2,
       // run Whisper / lrclib, return segments. Same shape as the
       // legacy /transcribe response.
-      setTranscribeProgress({ phase: "transcribing", loaded: 0, total: 0 });
+      // Carry jobId + fileName so the TranscribingProgress component can
+      // open SSE on /events/{jobId} and render the modern stepper that
+      // reads `current_step` emitted by `_step()` in main.py.
+      setTranscribeProgress({
+        phase: "transcribing",
+        loaded: 0,
+        total: 0,
+        jobId: uploadJobId,
+        fileName: entry.file?.name || "",
+      });
       transcribeRes = await authFetchWithRetryOn503(`${API}/transcribe-uploaded`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -852,7 +962,21 @@ export default function App() {
         setTranscribeError(reason);
         return;
       }
-      const data = await transcribeRes.json();
+      let data = await transcribeRes.json();
+      // 2026-05-23 — si el backend respondió 202 sin segments (path async),
+      // pollear /transcription-status hasta que termine. Backward compat:
+      // si vinieron segments inline (ASYNC_TRANSCRIBE_ENABLED=0), seguir.
+      if (!data.segments) {
+        setTranscribeProgress({ phase: "transcribing", loaded: 0, total: 0 });
+        const polled = await pollUntilTranscribed(data.job_id || uploadJobId, entry.file);
+        if (!polled) {
+          setTranscribing(false);
+          setTranscribeProgress(null);
+          setTranscribeError("La transcripción falló. Reintentá.");
+          return;
+        }
+        data = polled;
+      }
       setTranscribing(false);
       setTranscribeProgress(null);
       setCurrentReview({
@@ -1432,6 +1556,9 @@ export default function App() {
         onGenerateDirect={handleGenerateDirect}
         user={user}
         sidebarOpen={sidebarOpen}
+        // 2026-05-23: auto-transcribe en background al dropear.
+        onAutoTranscribe={onAutoTranscribe}
+        transcribeStatusByFile={transcribeStatusByFile}
       />
     </div>
   );
@@ -1472,41 +1599,44 @@ export default function App() {
       const phase = transcribeProgress?.phase;
       const loaded = transcribeProgress?.loaded || 0;
       const total = transcribeProgress?.total || 0;
-      const pct = phase === "uploading" && total > 0
-        ? Math.round((loaded / total) * 100)
-        : null;
-      const phaseLabel = (
-        phase === "uploading" ? t("transcribe.uploading") :
-        phase === "transcribing" ? t("transcribe.title") :
-        t("transcribe.title")
-      );
-      const phaseSub = (
-        phase === "uploading" && pct !== null
-          ? t("transcribe.uploading_progress", { pct })
-          : t("transcribe.subtitle")
-      );
-      return (
-        <div className="w-full max-w-md mx-auto mt-16 animate-fade-in text-center">
-          {pct !== null ? (
-            <div className="w-full max-w-xs mx-auto mb-4">
-              <div className="h-1.5 bg-surface-1 rounded-full overflow-hidden">
-                <div
-                  className="h-full rounded-full bg-gradient-to-r from-brand to-brand-light transition-all duration-300"
-                  style={{ width: `${pct}%` }}
-                />
+      // Upload progress = before the job_id exists; keep the simple bar.
+      if (phase === "uploading") {
+        const pct = total > 0 ? Math.round((loaded / total) * 100) : null;
+        return (
+          <div className="w-full max-w-md mx-auto mt-16 animate-fade-in text-center">
+            {pct !== null ? (
+              <div className="w-full max-w-xs mx-auto mb-4">
+                <div className="h-1.5 bg-surface-1 rounded-full overflow-hidden">
+                  <div
+                    className="h-full rounded-full bg-gradient-to-r from-brand to-brand-light transition-all duration-300"
+                    style={{ width: `${pct}%` }}
+                  />
+                </div>
               </div>
-            </div>
-          ) : (
-            <div className="w-12 h-12 mx-auto mb-4 border-2 border-brand border-t-transparent rounded-full animate-spin" />
-          )}
-          <h2 className="text-xl font-bold mb-2">{phaseLabel}</h2>
-          <p className="text-gray-500 text-sm">{phaseSub}</p>
-          {reviewQueue.length > 1 && (
-            <p className="text-xs text-gray-600 mt-2">
-              {t("transcribe.song")} {approvedJobs.length + 1} {t("editor.song_of")} {reviewQueue.length}
-            </p>
-          )}
-        </div>
+            ) : (
+              <div className="w-12 h-12 mx-auto mb-4 border-2 border-brand border-t-transparent rounded-full animate-spin" />
+            )}
+            <h2 className="text-xl font-bold mb-2">{t("transcribe.uploading")}</h2>
+            {pct !== null && (
+              <p className="text-gray-500 text-sm">{t("transcribe.uploading_progress", { pct })}</p>
+            )}
+          </div>
+        );
+      }
+      // Transcribing — modern stepper that reads backend current_step + progress
+      // emitted by `_step()` in main.py. SSE-driven via useJobProgress.
+      const currentJobId = transcribeProgress?.jobId;
+      const fileName = transcribeProgress?.fileName || "";
+      return (
+        <TranscribingProgress
+          jobId={currentJobId}
+          api={API}
+          token={token}
+          t={t}
+          fileName={fileName}
+          queueIndex={approvedJobs.length + 1}
+          queueTotal={reviewQueue.length}
+        />
       );
     }
     if (currentReview) {
