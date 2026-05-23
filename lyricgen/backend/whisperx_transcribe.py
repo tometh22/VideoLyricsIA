@@ -111,17 +111,33 @@ def _filter_ghosts(segs: list[dict]) -> list[dict]:
     return out
 
 
-def _split_long_segments(segs: list[dict], *, max_dur: float = 12.0,
-                          min_split_gap: float = 0.3) -> list[dict]:
+def _split_long_segments(segs: list[dict], *, max_dur: float | None = None,
+                          min_split_gap: float = 0.0) -> list[dict]:
     """Split segments longer than `max_dur` at the largest internal
-    word-to-word gap, recursively, so subtitles aren't 15+ second walls of
-    text. Requires per-word stamps (whisperX provides them with
-    `align_output=True`); segments without words are left untouched.
+    word-to-word gap, recursively, so subtitles aren't long walls of text.
+    Requires per-word stamps (whisperX provides them with `align_output=True`);
+    segments without words are left untouched.
 
-    The split point is the BIGGEST gap >= `min_split_gap` (a real pause).
-    No usable gap → no split. Recursion is bounded by re-checking each
-    half's duration. Pure + testable.
+    The split point is the BIGGEST gap > `min_split_gap`. When a segment is
+    longer than max_dur we split at whatever pause exists, even tiny ones —
+    Rotor lines run ~3-5s and whisperX's native segments are 8-25s, so we
+    have to be aggressive (incident "El Arbol": an 8.7s line that wasn't
+    splitting at the natural phrase boundary between "calles" and "La"
+    because min_split_gap=0.3 was too strict; the actual pause whisperX
+    measured there was ~0.15s).
+
+    Defaults are env-tunable via `WHISPERX_MAX_LINE_S` (default 6.0) and
+    `WHISPERX_MIN_SPLIT_GAP_S` (default 0.0). Pure + testable.
     """
+    if max_dur is None:
+        try:
+            max_dur = float(os.environ.get("WHISPERX_MAX_LINE_S", "6.0"))
+        except (TypeError, ValueError):
+            max_dur = 6.0
+    try:
+        min_split_gap = float(os.environ.get("WHISPERX_MIN_SPLIT_GAP_S", min_split_gap))
+    except (TypeError, ValueError):
+        pass
     if max_dur <= 0:
         return segs
 
@@ -135,17 +151,17 @@ def _split_long_segments(segs: list[dict], *, max_dur: float = 12.0,
             return [seg]
         if (end - start) <= max_dur:
             return [seg]
-        # Find biggest gap between consecutive words.
-        best_i, best_gap = -1, 0.0
+        # Long enough to require a split: find biggest gap > min_split_gap.
+        best_i, best_gap = -1, -1.0
         for i in range(len(words) - 1):
             try:
                 gap = float(words[i + 1]["start"]) - float(words[i]["end"])
             except (TypeError, ValueError, KeyError):
                 continue
-            if gap > best_gap:
+            if gap > best_gap and gap > min_split_gap:
                 best_gap, best_i = gap, i
-        if best_i < 0 or best_gap < min_split_gap:
-            return [seg]   # continuous singing, can't find a natural break
+        if best_i < 0:
+            return [seg]   # no usable gap structure (back-to-back words)
         # Split AT the gap: left = words[:best_i+1], right = words[best_i+1:]
         left_words = words[: best_i + 1]
         right_words = words[best_i + 1:]
@@ -167,6 +183,49 @@ def _split_long_segments(segs: list[dict], *, max_dur: float = 12.0,
     out: list[dict] = []
     for s in segs:
         out.extend(_split_once(s))
+    return out
+
+
+def _apply_lead_in(segs: list[dict], *, lead_ms: int | None = None) -> list[dict]:
+    """Pull each segment's start time earlier by `lead_ms` so the subtitle
+    appears slightly before the singer enters that line — the karaoke
+    "anticipation" effect. WhisperX timestamps are ±100ms accurate and
+    musicians lean a touch behind/ahead of the beat, so without lead-in the
+    line often lands a few ms after the voice (which the user perceives as
+    "delay").
+
+    Clamps so we never go below 0 or overlap the previous segment's end.
+    Per-word stamps inside `segs[i]["words"]` are NOT shifted (they stay
+    truthful to the audio; only the line's display window moves).
+
+    Default 120ms, env-tunable via `LYRIC_LEAD_IN_MS`. Pure + testable.
+    """
+    if lead_ms is None:
+        try:
+            lead_ms = int(os.environ.get("LYRIC_LEAD_IN_MS", "120"))
+        except (TypeError, ValueError):
+            lead_ms = 120
+    if lead_ms <= 0 or not segs:
+        return segs
+    lead_s = lead_ms / 1000.0
+    out: list[dict] = []
+    prev_end: float | None = None       # None until we've seen one segment
+    for s in segs:
+        try:
+            start = float(s.get("start", 0))
+        except (TypeError, ValueError):
+            out.append(s); continue
+        # Floor at prev_end+5ms (no overlap with prior) and at 0 (no negative).
+        floor = 0.0 if prev_end is None else max(0.0, prev_end + 0.005)
+        new_start = max(start - lead_s, floor)
+        new_start = min(new_start, start)   # never push later
+        new_seg = dict(s)
+        new_seg["start"] = new_start
+        out.append(new_seg)
+        try:
+            prev_end = float(s.get("end", new_start))
+        except (TypeError, ValueError):
+            prev_end = new_start
     return out
 
 
@@ -199,6 +258,7 @@ def transcribe_whisperx(audio_path: str, language: str | None = None) -> list[di
     raw_n = len(segs)
     segs = _filter_ghosts(segs)
     segs = _split_long_segments(segs)
+    segs = _apply_lead_in(segs)
     if len(segs) < 2:
         logger.warning("[WHISPERX] thin/empty result (%s raw -> %s usable) — falling back",
                        raw_n, len(segs))

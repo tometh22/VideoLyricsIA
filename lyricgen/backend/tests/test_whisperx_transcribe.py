@@ -131,11 +131,72 @@ def test_split_long_segments_at_biggest_gap():
 
 
 def test_split_long_segments_does_not_split_continuous_speech():
-    # No internal pause >= min_split_gap: leave the segment alone even if long.
-    words = [_w(f"w{i}", i * 0.3, (i + 1) * 0.3) for i in range(40)]  # ~12s, gaps ≈ 0s
+    # No internal pause > min_split_gap: leave the segment alone even if long.
+    words = [_w(f"w{i}", i * 0.3, (i + 1) * 0.3) for i in range(40)]  # ~12s, gaps = 0
     seg = {"start": 0.0, "end": 12.0, "text": "x" * 40, "words": words}
     out = wx._split_long_segments([seg], max_dur=5.0, min_split_gap=0.3)
     assert out == [seg]
+
+
+def test_split_long_segments_splits_at_small_gap_when_forced():
+    # Real El Arbol case: a 8.7s line with a ~0.15s pause at the phrase
+    # boundary "calles | La". Old default (min_split_gap=0.3) wouldn't fire;
+    # new behaviour (min_split_gap=0, max_dur=6) MUST split here so the
+    # line doesn't show as one 8.7s wall.
+    words = [
+        _w("Después", 53.0, 53.3), _w("de", 53.3, 53.4),
+        _w("tanto", 53.4, 53.7), _w("vagar", 53.7, 54.1),
+        _w("por", 54.1, 54.3), _w("las", 54.3, 54.45),
+        _w("calles", 54.45, 56.4),
+        # Only ~0.15s pause (below the old 0.3 threshold)
+        _w("La", 56.55, 56.7), _w("ciudad", 56.7, 57.1),
+        _w("te", 57.1, 57.2), _w("parece", 57.2, 57.7),
+        _w("tan", 57.7, 58.0), _w("gris", 58.0, 58.7),
+    ]
+    seg = {"start": 53.0, "end": 58.7,
+           "text": "Después de tanto vagar por las calles La ciudad te parece tan gris",
+           "words": words}
+    out = wx._split_long_segments([seg], max_dur=5.0, min_split_gap=0.0)
+    assert len(out) == 2
+    assert out[0]["text"].endswith("calles")
+    assert out[1]["text"].startswith("La")
+
+
+def test_apply_lead_in_pulls_starts_earlier():
+    # User-visible ms delay: timestamps are ±100ms behind the audible vocal.
+    # Lead-in shifts each start ~120ms earlier (anticipation), capped by the
+    # previous segment's end and by 0.
+    segs = [
+        {"start": 0.50, "end": 2.00, "text": "uno"},
+        {"start": 3.00, "end": 4.00, "text": "dos"},
+    ]
+    out = wx._apply_lead_in(segs, lead_ms=120)
+    assert abs(out[0]["start"] - 0.38) < 1e-6     # 0.50 - 0.120
+    assert abs(out[1]["start"] - 2.88) < 1e-6     # 3.00 - 0.120
+    # Ends untouched.
+    assert out[0]["end"] == 2.00 and out[1]["end"] == 4.00
+
+
+def test_apply_lead_in_does_not_overlap_previous():
+    segs = [
+        {"start": 0.50, "end": 2.50, "text": "uno"},
+        {"start": 2.55, "end": 3.50, "text": "dos"},   # only 50ms gap
+    ]
+    out = wx._apply_lead_in(segs, lead_ms=120)
+    # Second start would be 2.43 but prev_end=2.50 → clamp to 2.505
+    assert out[1]["start"] >= 2.50
+    assert out[1]["start"] <= 2.55
+
+
+def test_apply_lead_in_clamps_at_zero():
+    segs = [{"start": 0.05, "end": 1.00, "text": "x"}]
+    out = wx._apply_lead_in(segs, lead_ms=120)
+    assert out[0]["start"] == 0.0
+
+
+def test_apply_lead_in_noop_when_disabled():
+    segs = [{"start": 0.5, "end": 2.0, "text": "x"}]
+    assert wx._apply_lead_in(segs, lead_ms=0) == segs
 
 
 def test_split_long_segments_passes_through_short_or_wordless():
