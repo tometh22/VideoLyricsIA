@@ -5699,6 +5699,51 @@ def _ken_burns_image_to_mp4(
     return output_path
 
 
+def _pan_frame_subpixel(
+    img: np.ndarray, t: float, duration: float, *,
+    base_x: int, base_y: int, cw: int, ch: int,
+    travel_x: int, travel_y: int, dir_x: int, dir_y: int,
+    out_w: int, out_h: int,
+) -> np.ndarray:
+    """Subpixel-sampled pan frame at time `t`. Pure, no moviepy.
+
+    El pan lateral del fondo calmo (Imagen + Ken Burns ruteo de
+    `_ensure_background`) se veía "super cortado" porque truncábamos el
+    desplazamiento de cada frame a píxeles enteros. A 24 fps con ~1.25 px de
+    travel/frame, la mayoría de los frames consecutivos terminaban en el
+    mismo entero (stepping 0-1-1-1-2-2-2-3…). El fix: mantenemos el
+    desplazamiento como float, hacemos el crop entero con 1 px extra a
+    derecha/abajo, y aplicamos el shift fraccional vía PIL AFFINE+BILINEAR
+    antes del LANCZOS final. ~1-2 ms/frame de overhead a 1080p (despreciable
+    frente al LANCZOS posterior).
+
+    Extraído a module-level (en vez de closure dentro de `_ken_burns_clip`)
+    para que sea testable directamente sin instanciar moviepy.
+    """
+    h, w = img.shape[:2]
+    p = min(1.0, t / duration) if duration else 0.0
+    p = 0.5 - 0.5 * math.cos(p * math.pi)  # ease in/out
+    fx = (p if dir_x == 1 else (1.0 - p)) * travel_x
+    fy = (p if dir_y == 1 else (1.0 - p)) * travel_y
+    ix, iy = int(fx), int(fy)
+    sub_x, sub_y = fx - ix, fy - iy
+    # 1 px extra para el lookup BILINEAR (lee vecinos 2x2). Cuando la imagen
+    # es justo del tamaño del crop (degenerado, travel=0), leemos exacto y
+    # BILINEAR clampa al borde sin shift visible.
+    extra_x = 1 if w > cw else 0
+    extra_y = 1 if h > ch else 0
+    cx = max(0, min(base_x + ix, w - cw - extra_x))
+    cy = max(0, min(base_y + iy, h - ch - extra_y))
+    crop = img[cy:cy + ch + extra_y, cx:cx + cw + extra_x]
+    shifted = Image.fromarray(crop).transform(
+        (cw, ch),
+        Image.AFFINE,
+        (1, 0, sub_x, 0, 1, sub_y),
+        Image.BILINEAR,
+    )
+    return np.array(shifted.resize((out_w, out_h), Image.LANCZOS))
+
+
 def _ken_burns_clip(image_path: str, duration: float, spec: RenderSpec | None = None,
                     static: bool = False, lateral: bool = False, subtle: bool = False):
     """Create an animated Ken Burns clip with periodic direction changes.
@@ -5747,15 +5792,12 @@ def _ken_burns_clip(image_path: str, duration: float, spec: RenderSpec | None = 
         dir_y = random.choice([1, -1])
 
         def make_pan_frame(t):
-            p = min(1.0, t / duration) if duration else 0.0
-            p = 0.5 - 0.5 * math.cos(p * math.pi)  # ease in/out
-            cx = base_x + int((p if dir_x == 1 else (1.0 - p)) * travel_x)
-            cy = base_y + int((p if dir_y == 1 else (1.0 - p)) * travel_y)
-            cx = max(0, min(cx, w - cw))
-            cy = max(0, min(cy, h - ch))
-            crop = img[cy:cy + ch, cx:cx + cw]
-            return np.array(
-                Image.fromarray(crop).resize((spec.width, spec.height), Image.LANCZOS)
+            return _pan_frame_subpixel(
+                img, t, duration,
+                base_x=base_x, base_y=base_y, cw=cw, ch=ch,
+                travel_x=travel_x, travel_y=travel_y,
+                dir_x=dir_x, dir_y=dir_y,
+                out_w=spec.width, out_h=spec.height,
             )
 
         return VideoClip(make_pan_frame, duration=duration).set_fps(spec.fps)
