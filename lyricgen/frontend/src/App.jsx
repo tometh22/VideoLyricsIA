@@ -786,8 +786,6 @@ export default function App() {
         backgroundHint: entry.backgroundHint || "", bgVerbatim: !!entry.bgVerbatim,
         textCase: entry.textCase || "upper",
         fontScale: entry.fontScale || "1.0",
-        lyricTransition: entry.lyricTransition || "cut",
-        textMotion: entry.textMotion || "none",
         textContrast: entry.textContrast || "medium",
         segments: data.segments, referenceLyrics: data.reference_lyrics || "",
         coverageWarning: !!data.coverage_warning,
@@ -865,8 +863,6 @@ export default function App() {
         backgroundHint: entry.backgroundHint || "", bgVerbatim: !!entry.bgVerbatim,
         textCase: entry.textCase || "upper",
         fontScale: entry.fontScale || "1.0",
-        lyricTransition: entry.lyricTransition || "cut",
-        textMotion: entry.textMotion || "none",
         textContrast: entry.textContrast || "medium",
         segments: data.segments, referenceLyrics: data.reference_lyrics || "",
         coverageWarning: !!data.coverage_warning,
@@ -927,8 +923,9 @@ export default function App() {
       backgroundHint: r.backgroundHint || "", bgVerbatim: !!r.bgVerbatim,
       textCase: r.textCase || "upper",
       fontScale: r.fontScale || "1.0",
-      lyricTransition: r.lyricTransition || "cut",
-      textMotion: r.textMotion || "none",
+      // lyricTransition + textMotion: deprecados 2026-05-23.
+      lyricsAnimation: r.lyricsAnimation || "none",
+      lineTransition: r.lineTransition || "none",
       textContrast: r.textContrast || "medium",
       segments: editedSegments,
       transcribeJobId: r.transcribeJobId || null,
@@ -963,8 +960,9 @@ export default function App() {
       backgroundHint: a.backgroundHint || "", bgVerbatim: !!a.bgVerbatim,
       textCase: a.textCase || "upper",
       fontScale: a.fontScale || "1.0",
-      lyricTransition: a.lyricTransition || "cut",
-      textMotion: a.textMotion || "none",
+      // lyricTransition + textMotion: deprecados 2026-05-23.
+      lyricsAnimation: a.lyricsAnimation || "none",
+      lineTransition: a.lineTransition || "none",
       textContrast: a.textContrast || "medium",
       segments: a.segments,
       transcribeJobId: a.transcribeJobId || null,
@@ -1008,8 +1006,7 @@ export default function App() {
         }
         formData.append("text_case", jobList[i].textCase || "upper");
         formData.append("font_scale", String(jobList[i].fontScale || "1.0"));
-        formData.append("lyric_transition", jobList[i].lyricTransition || "cut");
-        formData.append("text_motion", jobList[i].textMotion || "none");
+        // lyric_transition + text_motion: deprecados 2026-05-23 (no se envían).
         formData.append("lyrics_animation", jobList[i].lyricsAnimation || "none");
         formData.append("line_transition", jobList[i].lineTransition || "none");
         formData.append("text_contrast", jobList[i].textContrast || "medium");
@@ -1140,8 +1137,7 @@ export default function App() {
         }
         generateBody.append("text_case", jobList[i].textCase || "upper");
         generateBody.append("font_scale", String(jobList[i].fontScale || "1.0"));
-        generateBody.append("lyric_transition", jobList[i].lyricTransition || "cut");
-        generateBody.append("text_motion", jobList[i].textMotion || "none");
+        // lyric_transition + text_motion: deprecados 2026-05-23 (no se envían).
         generateBody.append("lyrics_animation", jobList[i].lyricsAnimation || "none");
         generateBody.append("line_transition", jobList[i].lineTransition || "none");
         generateBody.append("text_contrast", jobList[i].textContrast || "medium");
@@ -1231,8 +1227,9 @@ export default function App() {
         movementStyle: last.movementStyle || "", effect: last.effect || "",
         textCase: last.textCase || "upper",
         fontScale: last.fontScale || "1.0",
-        lyricTransition: last.lyricTransition || "cut",
-        textMotion: last.textMotion || "none",
+        // lyricTransition + textMotion: deprecados 2026-05-23.
+        lyricsAnimation: last.lyricsAnimation || "none",
+        lineTransition: last.lineTransition || "none",
         textContrast: last.textContrast || "medium",
         segments: last.segments,
         referenceLyrics: "",
@@ -1543,16 +1540,20 @@ export default function App() {
             font={currentReview.font || ""}
             textCase={currentReview.textCase || "upper"}
             fontScale={parseFloat(currentReview.fontScale || "1.0")}
-            lyricTransition={currentReview.lyricTransition || "cut"}
-            textMotion={currentReview.textMotion || "none"}
             textContrast={currentReview.textContrast || "medium"}
+            // 2026-05-23: lyricTransition + textMotion deprecados. Ahora
+            // el editor expone lyrics_animation + line_transition (libass,
+            // paridad con el wizard).
+            lyricsAnimation={currentReview.lyricsAnimation || "none"}
+            lineTransition={currentReview.lineTransition || "none"}
             // Typography is now chosen LIVE in the editor preview (not in the
             // upload step). Thread the operator's choices back into
             // currentReview so handleApproveLyrics carries them to generate.
             onFontChange={(c) => setCurrentReview((r) => (r ? { ...r, font: c } : r))}
             onCaseChange={(c) => setCurrentReview((r) => (r ? { ...r, textCase: c } : r))}
-            onTransitionChange={(c) => setCurrentReview((r) => (r ? { ...r, lyricTransition: c } : r))}
             onContrastChange={(c) => setCurrentReview((r) => (r ? { ...r, textContrast: c } : r))}
+            onAnimationChange={(c) => setCurrentReview((r) => (r ? { ...r, lyricsAnimation: c } : r))}
+            onLineTransitionChange={(c) => setCurrentReview((r) => (r ? { ...r, lineTransition: c } : r))}
           />
         </div>
       );

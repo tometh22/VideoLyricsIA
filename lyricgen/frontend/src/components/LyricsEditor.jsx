@@ -30,15 +30,29 @@ const TEXT_CASES = [
   { code: "lower", label: "min" },
   { code: "original", label: "ori" },
 ];
-const TRANSITIONS = [
-  { code: "cut", label: "Corte" },
-  { code: "fade", label: "Fade" },
-  { code: "fade_slow", label: "Lento" },
-];
+// TRANSITIONS (Cut/Fade fade-time) quedó deprecado 2026-05-23. Las opciones
+// ricas viven en LINE_TRANSITIONS (slide/wipe/dissolve_blur) que se aplican
+// vía libass (lugar único, sin override silencioso de moviepy).
 const CONTRASTS = [
   { code: "subtle", label: "Suave" },
   { code: "medium", label: "Medio" },
   { code: "strong", label: "Fuerte" },
+];
+// Animación de letra — libass templates (mirror del wizard, ass_render.py).
+const LYRICS_ANIMATIONS = [
+  { code: "none",        label: "Ninguna" },
+  { code: "karaoke",     label: "Karaoke" },
+  { code: "word_reveal", label: "Reveal" },
+  { code: "pop",         label: "Pop" },
+  { code: "glow",        label: "Glow" },
+];
+// Transición de línea — entrada (y salida en dissolve_blur) por libass.
+const LINE_TRANSITIONS = [
+  { code: "none",          label: "Ninguna" },
+  { code: "slide_up",      label: "Sube" },
+  { code: "slide_side",    label: "Lateral" },
+  { code: "wipe",          label: "Cortina" },
+  { code: "dissolve_blur", label: "Desvanecer" },
 ];
 
 function applyTextCase(text, code) {
@@ -48,9 +62,8 @@ function applyTextCase(text, code) {
   return text || "";
 }
 
-// Mismo flag que UploadZone/EditRequestPanel — oculta el label de motion
-// en el strip de metadata mientras la feature de animación está pausada.
-const SHOW_MOTION_PICKER = false;
+// SHOW_MOTION_PICKER (legacy text_motion) eliminado 2026-05-23 —
+// reemplazado por lyrics_animation + line_transition (libass).
 
 function formatTime(seconds) {
   if (!isFinite(seconds) || seconds < 0) return "0:00";
@@ -260,9 +273,12 @@ export default function LyricsEditor({
   font = "",
   textCase = "upper",
   fontScale = 1.0,
-  lyricTransition = "cut",
-  textMotion = "none",
   textContrast = "medium",
+  // 2026-05-23: reemplazan a `lyricTransition` (Corte/Fade) y `textMotion`
+  // (Sutil drift) que quedaron deprecados — éstos cubren mejor el mismo
+  // espacio y NO apagan silenciosamente al ASS path.
+  lyricsAnimation = "none",
+  lineTransition = "none",
   transcribeJobId = null,
   onPersistSegments = null,
   // Synchronous per-edit callback (no debounce). Parent receives the
@@ -301,8 +317,11 @@ export default function LyricsEditor({
   onFontChange = null,
   // Same idea for the rest of the typography, set live in the preview.
   onCaseChange = null,
-  onTransitionChange = null,
   onContrastChange = null,
+  // 2026-05-23: callbacks de los nuevos ejes (libass). Reemplazan al
+  // onTransitionChange (que controlaba el legacy lyric_transition).
+  onAnimationChange = null,
+  onLineTransitionChange = null,
 }) {
   const { t } = useI18n();
   const [edited, setEdited] = useState(() =>
@@ -320,8 +339,10 @@ export default function LyricsEditor({
   // for the actual render). Seeded from the job's current font.
   const [selectedFont, setSelectedFont] = useState(font || "");
   const [selectedCase, setSelectedCase] = useState(textCase || "upper");
-  const [selectedTransition, setSelectedTransition] = useState(lyricTransition || "cut");
   const [selectedContrast, setSelectedContrast] = useState(textContrast || "medium");
+  // 2026-05-23: nuevos ejes (paridad con el wizard, ver header del archivo).
+  const [selectedAnimation, setSelectedAnimation] = useState(lyricsAnimation || "none");
+  const [selectedLineTransition, setSelectedLineTransition] = useState(lineTransition || "none");
   // Autosave confidence for the timeline view. saveStatus drives the
   // "Guardando…/Guardado ✓" chip; flushCounter triggers an immediate save
   // on a timeline drag (instead of waiting for the 3 s debounce).
@@ -2037,12 +2058,22 @@ export default function LyricsEditor({
                   ))}
                 </div>
               </div>
+              {/* Animación de letra (lyrics_animation) — libass templates. */}
+              <div className="flex items-center gap-1.5">
+                <span className="text-ink-tertiary">Animación</span>
+                <select value={selectedAnimation}
+                  onChange={(e) => { setSelectedAnimation(e.target.value); onAnimationChange?.(e.target.value); }}
+                  className="bg-surface-2 ring-1 ring-white/[0.08] rounded-md px-1.5 py-1 text-white focus:ring-brand outline-none cursor-pointer">
+                  {LYRICS_ANIMATIONS.map((o) => (<option key={o.code} value={o.code}>{o.label}</option>))}
+                </select>
+              </div>
+              {/* Transición de línea (line_transition) — entrada slide/wipe/blur. */}
               <div className="flex items-center gap-1.5">
                 <span className="text-ink-tertiary">Transición</span>
-                <select value={selectedTransition}
-                  onChange={(e) => { setSelectedTransition(e.target.value); onTransitionChange?.(e.target.value); }}
+                <select value={selectedLineTransition}
+                  onChange={(e) => { setSelectedLineTransition(e.target.value); onLineTransitionChange?.(e.target.value); }}
                   className="bg-surface-2 ring-1 ring-white/[0.08] rounded-md px-1.5 py-1 text-white focus:ring-brand outline-none cursor-pointer">
-                  {TRANSITIONS.map((o) => (<option key={o.code} value={o.code}>{o.label}</option>))}
+                  {LINE_TRANSITIONS.map((o) => (<option key={o.code} value={o.code}>{o.label}</option>))}
                 </select>
               </div>
             </div>
@@ -2067,7 +2098,11 @@ export default function LyricsEditor({
               font={FONT_CSS_BY_CODE[selectedFont] || undefined}
               textCase={selectedCase}
               textContrast={selectedContrast}
-              transition={selectedTransition}
+              // 2026-05-23: la prop `transition` (Corte/Fade) salió con el
+              // deprecation de lyric_transition. Cuando el preview soporte
+              // las animaciones libass nuevas se pasa por acá:
+              //   lyricsAnimation={selectedAnimation}
+              //   lineTransition={selectedLineTransition}
               fontScale={fontScale}
               onSelect={(id) => {
                 focusSegment(id);
@@ -2491,10 +2526,11 @@ export default function LyricsEditor({
               <span className={textCase === "title" ? "text-amber-400 font-medium" : ""}>
                 Caja: {textCase === "upper" ? "MAYÚSCULAS" : textCase === "title" ? "Título (cada palabra capitalizada)" : textCase === "lower" ? "minúsculas" : "Original"}
               </span>
-              <span>Transición: {lyricTransition === "cut" ? "Corte" : lyricTransition === "fade" ? "Fade" : "Fade lento"}</span>
-              {SHOW_MOTION_PICKER && (
-                <span>Movimiento: {textMotion === "none" ? "Estático" : textMotion === "subtle" ? "Sutil" : "Flotante"}</span>
-              )}
+              {/* 2026-05-23: resumen "Transición Corte/Fade" + "Movimiento
+                  Sutil" reemplazado por los ejes nuevos (lyrics_animation
+                  + line_transition). */}
+              <span>Animación: {LYRICS_ANIMATIONS.find(o => o.code === selectedAnimation)?.label || "Ninguna"}</span>
+              <span>Transición: {LINE_TRANSITIONS.find(o => o.code === selectedLineTransition)?.label || "Ninguna"}</span>
               <span>Contraste: {textContrast === "subtle" ? "Suave" : textContrast === "strong" ? "Fuerte" : "Medio"}</span>
             </div>
           </div>

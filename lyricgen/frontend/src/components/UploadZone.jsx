@@ -23,10 +23,8 @@ function tokenParam() {
 // hit a 429 on the 6th. The backend enforces this server-side regardless.
 const MAX_BATCH_SIZE = 5;
 
-// Motion picker hidden hasta que decidamos qué animación implementar.
-// Backend default queda en text_motion="none". Cambiar a true para
-// re-mostrar el dropdown sin tocar nada más.
-const SHOW_MOTION_PICKER = false;
+// SHOW_MOTION_PICKER (legacy text_motion) eliminado 2026-05-23 — campo
+// deprecado upstream; ver pipeline.py:run_pipeline.
 
 // Typography (font / case / size / transition / contrast) is now chosen
 // LIVE in the editor + preview, where you see the real result. Hidden in
@@ -184,7 +182,8 @@ export default function UploadZone({
   const BATCH_DEFAULTS_STORAGE_KEY = "genly:wizardBatchDefaultsV1";
   const HARDCODED_BATCH_DEFAULTS = {
     genre: "", concept: "", movementStyle: "", effect: "", font: "",
-    textCase: "upper", fontScale: "1.0", lyricTransition: "cut", textMotion: "none", lyricsAnimation: "none", lineTransition: "none", textContrast: "medium",
+    // lyricTransition + textMotion: deprecados 2026-05-23 (no se persisten).
+    textCase: "upper", fontScale: "1.0", lyricsAnimation: "none", lineTransition: "none", textContrast: "medium",
     // Escena axis: optional free-text prompt ("Mi prompt"). When non-empty it
     // overrides genre/concept/lyrics. bgVerbatim TRUE by default = use the
     // operator's text as-is (people expect their prompt used, not rewritten);
@@ -1037,59 +1036,9 @@ export default function UploadZone({
         </div>
       </div>
 
-      {/* Lyric transition icon buttons */}
-      <div className="flex items-center gap-2 mb-3">
-        <span className="text-[11px] text-gray-600 shrink-0">{t("upload.transition_label") || "Transición:"}</span>
-        <div className="flex gap-1">
-          {[
-            { code: "cut",       icon: "│",   label: t("upload.transition_cut")  || "Corte" },
-            { code: "fade",      icon: "⟿",  label: t("upload.transition_fade") || "Fade"  },
-            { code: "fade_slow", icon: "⟿⟿", label: t("upload.transition_slow") || "Lento" },
-          ].map((opt) => (
-            <button
-              key={opt.code}
-              type="button"
-              title={opt.label}
-              onClick={() => updateBatchDefault("lyricTransition", opt.code)}
-              className={`px-2.5 py-1 rounded-md text-[13px] transition-all
-                ${batchDefaults.lyricTransition === opt.code
-                  ? "bg-brand/20 text-brand ring-1 ring-brand/40"
-                  : "bg-surface-3/40 text-gray-500 hover:text-gray-300"
-                }`}
-            >{opt.icon}</button>
-          ))}
-        </div>
-      </div>
-
-      {/* Text motion icon buttons */}
-      {SHOW_MOTION_PICKER && (
-      <div className="flex items-center gap-2 mb-3">
-        <span className="text-[11px] text-gray-600 shrink-0">{t("upload.motion_label") || "Movimiento del texto:"}</span>
-        <div className="flex gap-1">
-          {[
-            { code: "none",   icon: "·", label: t("upload.motion_none")   || "Estático" },
-            { code: "subtle", icon: "↕", label: t("upload.motion_subtle") || "Sutil"    },
-            // "float" temporarily disabled — see pipeline.py
-            // _text_position_func: per-frame position callable kills
-            // moviepy compositing speed, long songs hit RQ 20-min
-            // timeout. Backend aliases to "subtle". Re-enable when text
-            // layer moves to ffmpeg overlay filters.
-          ].map((opt) => (
-            <button
-              key={opt.code}
-              type="button"
-              title={opt.label}
-              onClick={() => updateBatchDefault("textMotion", opt.code)}
-              className={`px-2.5 py-1 rounded-md text-[13px] transition-all
-                ${batchDefaults.textMotion === opt.code
-                  ? "bg-brand/20 text-brand ring-1 ring-brand/40"
-                  : "bg-surface-3/40 text-gray-500 hover:text-gray-300"
-                }`}
-            >{opt.icon}</button>
-          ))}
-        </div>
-      </div>
-      )}
+      {/* Lyric transition (Corte/Fade fade-time) + Text motion (Sutil drift):
+          deprecados 2026-05-23. Los reemplazan lyrics_animation +
+          line_transition (libass), elegidos en el editor post-upload. */}
 
       {/* Text contrast pills */}
       <div className="flex items-center gap-2">
@@ -1132,8 +1081,6 @@ export default function UploadZone({
           (entry.font         || "") !== (bd.font         || "") ||
           (entry.textCase     || "upper") !== (bd.textCase     || "upper") ||
           (entry.fontScale    || "1.0")   !== (bd.fontScale    || "1.0")   ||
-          (entry.lyricTransition || "cut") !== (bd.lyricTransition || "cut") ||
-          (entry.textMotion   || "none")  !== (bd.textMotion   || "none")  ||
           (entry.lyricsAnimation || "none") !== (bd.lyricsAnimation || "none") ||
           (entry.lineTransition || "none") !== (bd.lineTransition || "none") ||
           (entry.textContrast || "medium") !== (bd.textContrast || "medium");
@@ -1331,48 +1278,9 @@ export default function UploadZone({
                       ))}
                     </div>
                   </div>
-                  {/* Transition */}
-                  <div className="flex items-center gap-2">
-                    <span className="text-[11px] text-gray-600 shrink-0">{t("upload.transition_label") || "Transición:"}</span>
-                    <div className="flex gap-1">
-                      {[
-                        { code: "cut",       icon: "│",   label: t("upload.transition_cut")  || "Corte" },
-                        { code: "fade",      icon: "⟿",  label: t("upload.transition_fade") || "Fade"  },
-                        { code: "fade_slow", icon: "⟿⟿", label: t("upload.transition_slow") || "Lento" },
-                      ].map((opt) => (
-                        <button key={opt.code} type="button" title={opt.label}
-                          onClick={() => updateField(i, "lyricTransition", opt.code)}
-                          className={`px-2.5 py-1 rounded-md text-[13px] transition-all
-                            ${(entry.lyricTransition || "cut") === opt.code
-                              ? "bg-brand/20 text-brand ring-1 ring-brand/40"
-                              : "bg-surface-3/40 text-gray-500 hover:text-gray-300"
-                            }`}
-                        >{opt.icon}</button>
-                      ))}
-                    </div>
-                  </div>
-                  {/* Text motion */}
-                  {SHOW_MOTION_PICKER && (
-                  <div className="flex items-center gap-2">
-                    <span className="text-[11px] text-gray-600 shrink-0">{t("upload.motion_label") || "Movimiento del texto:"}</span>
-                    <div className="flex gap-1">
-                      {[
-                        { code: "none",   icon: "·", label: t("upload.motion_none")   || "Estático" },
-                        { code: "subtle", icon: "↕", label: t("upload.motion_subtle") || "Sutil"    },
-                        { code: "float",  icon: "∿", label: t("upload.motion_float")  || "Flotante" },
-                      ].map((opt) => (
-                        <button key={opt.code} type="button" title={opt.label}
-                          onClick={() => updateField(i, "textMotion", opt.code)}
-                          className={`px-2.5 py-1 rounded-md text-[13px] transition-all
-                            ${(entry.textMotion || "none") === opt.code
-                              ? "bg-brand/20 text-brand ring-1 ring-brand/40"
-                              : "bg-surface-3/40 text-gray-500 hover:text-gray-300"
-                            }`}
-                        >{opt.icon}</button>
-                      ))}
-                    </div>
-                  </div>
-                  )}
+                  {/* Lyric transition + Text motion legacy: deprecados
+                      2026-05-23. Los reemplazan lyrics_animation +
+                      line_transition que se eligen en el editor. */}
                   {/* Text contrast */}
                   <div className="flex items-center gap-2">
                     <span className="text-[11px] text-gray-600 shrink-0">{t("upload.contrast_label") || "Contraste:"}</span>

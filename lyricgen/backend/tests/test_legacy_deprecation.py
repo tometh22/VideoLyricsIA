@@ -30,13 +30,29 @@ import pipeline
 def test_ass_gate_does_not_consult_text_motion():
     """El gate del path ASS es libre de `text_motion`. Antes, jobs viejos con
     `render_params.text_motion = "subtle"` se rendereaban via moviepy y
-    perdían el lyrics_animation/line_transition silenciosamente."""
+    perdían el lyrics_animation/line_transition silenciosamente.
+
+    Buscamos la línea de código del gate (no comentarios) para que la
+    presencia de `text_motion == "none"` en un comentario explicativo no
+    haga falsear el test.
+    """
     src = inspect.getsource(pipeline)
-    # Buscamos la sentencia EXACTA del gate viejo. Si reaparece, el bug
-    # silencioso vuelve.
-    assert 'text_motion == "none"' not in src, (
-        "El gate del ASS engine no debe condicionarse por text_motion — el "
-        "campo está deprecado y siempre se coerce a 'none' upstream."
+    for line in src.splitlines():
+        stripped = line.lstrip()
+        if stripped.startswith("#"):  # ignorar comentarios
+            continue
+        if 'if _engine == "ass"' in line:
+            # Esta es LA línea del gate (única en el archivo).
+            assert "text_motion" not in line, (
+                f"El gate del ASS engine sigue condicionado por text_motion:"
+                f"\n  {line.strip()}\n"
+                f"Removelo — el campo está deprecado y siempre se coerce "
+                f"a 'none' upstream."
+            )
+            return
+    raise AssertionError(
+        "No encontré la línea del gate ASS (`if _engine == \"ass\" and ...`) "
+        "en pipeline.py — la heurística del test quedó obsoleta."
     )
 
 
