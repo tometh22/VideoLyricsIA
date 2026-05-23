@@ -2946,6 +2946,24 @@ async def _run_transcription_for_job(
         lang = language.strip() if language.strip() else None
         loop = asyncio.get_event_loop()
 
+        # Progress emission helper. The render pipeline already writes
+        # current_step + progress so the frontend SSE/poll can render a
+        # multi-step UI; this gives the transcription pipeline the same
+        # surface. Labels are i18n keys the frontend maps to localised
+        # step names (`transcribe.prepare`, `.lyrics_lookup`,
+        # `.isolate_vocals`, `.verify`, `.align`, `.transcribe`,
+        # `.transcribe_word`, `.recover`, `.done`). Fire-and-forget via
+        # to_thread so a slow DB write never blocks the pipeline.
+        from jobs import update_job as _update_job
+        async def _step(label: str, pct: int):
+            try:
+                await asyncio.to_thread(
+                    _update_job, job_id, current_step=label, progress=pct,
+                )
+            except Exception as e:
+                logger.warning("[PROGRESS] %s/%d failed: %s", label, pct, e)
+        await _step("transcribe.prepare", 5)
+
         # Vocal source separation (demucs) — LAZY. Previously demucs ran at the
         # top of every job (~30-90s) regardless of which downstream engine
         # actually needed the stem. On songs where lrclib synced verifies, no
@@ -2975,6 +2993,7 @@ async def _run_transcription_for_job(
             nonlocal _vocal_stem
             if not _stem_state["computed"]:
                 _stem_state["computed"] = True
+                await _step("transcribe.isolate_vocals", 25)
                 stem = await asyncio.to_thread(vocal_sep.separate_vocals, tmp_path)
                 _stem_state["path"] = stem
                 _vocal_stem = stem
@@ -3028,6 +3047,7 @@ async def _run_transcription_for_job(
         # Short-lived DB session JUST for the lrclib cache lookup, released
         # immediately so the connection is free during the long Whisper /
         # Vertex work below (see the pool-starvation note in the docstring).
+        await _step("transcribe.lyrics_lookup", 15)
         with scoped_db() as _lrc_db:
             lrc = await asyncio.to_thread(_fetch_lrclib, artist_hint, song_hint, _lrc_db)
         if lrc:
@@ -3044,6 +3064,7 @@ async def _run_transcription_for_job(
             if forced_align.is_enabled():
                 fa_text = plain or forced_align.lrc_to_plain_text(synced)
                 if fa_text:
+                    await _step("transcribe.align", 55)
                     _aa = await _get_align_audio()
                     fa_segs = await asyncio.to_thread(
                         forced_align.forced_align_lyrics, _aa, fa_text,
@@ -3300,6 +3321,7 @@ async def _run_transcription_for_job(
                     os.environ.get("LRCLIB_PLAIN_ALIGNER_ENABLED", "0")
                     .strip().lower() in ("1", "true", "yes", "on", "y", "t")
                 )
+                await _step("transcribe.transcribe", 50)
                 try:
                     segments = await loop.run_in_executor(
                         None,
@@ -3512,6 +3534,7 @@ async def _run_transcription_for_job(
             # Whisper-word aligner / gap-fill below on any failure.
             import forced_align
             if forced_align.is_enabled():
+                await _step("transcribe.align", 55)
                 _aa = await _get_align_audio()
                 fa_segs = await asyncio.to_thread(
                     forced_align.forced_align_lyrics, _aa, reference,
@@ -3543,6 +3566,7 @@ async def _run_transcription_for_job(
             # phrase line-breaks differently; whisperX follows the audio).
             import whisperx_transcribe
             if whisperx_transcribe.is_enabled():
+                await _step("transcribe.transcribe_word", 70)
                 _aa = await _get_align_audio()
                 wx_segs = await asyncio.to_thread(
                     whisperx_transcribe.transcribe_whisperx, _aa, lang,
@@ -3630,6 +3654,7 @@ async def _run_transcription_for_job(
         if not reference:
             import whisperx_transcribe
             if whisperx_transcribe.is_enabled():
+                await _step("transcribe.transcribe_word", 70)
                 _aa = await _get_align_audio()
                 wx_segs = await asyncio.to_thread(
                     whisperx_transcribe.transcribe_whisperx, _aa, lang,
