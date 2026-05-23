@@ -200,6 +200,56 @@ def test_ken_burns_pan_modes_have_no_zoom():
     assert "zoom_in" not in pan_block                 # no zoom animation in either
 
 
+def test_lateral_pan_is_subpixel_smooth():
+    """Regression — incidente 2026-05-22: el pan lateral del fondo calmo se
+    veía "super cortado" (stepping de 0-1-1-1-2-2-2-3 px/frame) porque la
+    closure truncaba `(p * travel_x)` a int. A 24 fps y ~1.25 px/frame de
+    travel, la mayoría de los frames consecutivos quedaban idénticos. El
+    fix subpixel (AFFINE BILINEAR sobre un crop con 1 px extra) preserva el
+    desplazamiento fraccional y produce frames TODOS distintos.
+
+    Test: sample 12 frames a lo largo de un pan de 2 s sobre una imagen de
+    franjas finas (cualquier shift subpixel mueve los pesos BILINEAR) y
+    verificar que ningún par consecutivo de frames es byte-igual.
+
+    Llamamos al helper `_pan_frame_subpixel` directamente — no requerimos
+    moviepy (el conftest lo stubea sin set_fps).
+    """
+    import numpy as np
+
+    w, h = 1280, 720
+    arr = np.zeros((h, w, 3), dtype=np.uint8)
+    arr[:, ::2] = 255   # bandas verticales de 1 px cada 2 px
+    # Parámetros equivalentes al path lateral (scale=1.18, amp_x=1.0).
+    scale = 1.18
+    cw = int(w / scale)
+    ch = int(h / scale)
+    travel_x = w - cw          # full horizontal room
+    travel_y = 0
+    base_x = (w - cw) // 2 - travel_x // 2
+    base_y = (h - ch) // 2
+    duration = 2.0
+    fps = 24
+    frames = []
+    for i in range(0, int(duration * fps), 2):
+        t = i / fps
+        frames.append(pipeline._pan_frame_subpixel(
+            arr, t, duration,
+            base_x=base_x, base_y=base_y, cw=cw, ch=ch,
+            travel_x=travel_x, travel_y=travel_y,
+            dir_x=1, dir_y=1,
+            out_w=1920, out_h=1080,
+        ))
+    identical = sum(
+        1 for a, b in zip(frames, frames[1:])
+        if np.array_equal(a, b)
+    )
+    assert identical == 0, (
+        f"{identical}/{len(frames)-1} pares de frames consecutivos son "
+        "byte-iguales — el pan se está cuantizando a int (stepping)."
+    )
+
+
 # ---------------------------------------------------------------------------
 # 6. de-biased combinatorial fallback
 # ---------------------------------------------------------------------------

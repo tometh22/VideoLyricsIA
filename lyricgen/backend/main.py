@@ -3495,6 +3495,40 @@ async def _run_transcription_for_job(
                         "recovery_source": "forced_align",
                     }
 
+            # WhisperX fallback — Rotor-grade audio-as-truth path. When
+            # forced-align failed but Gemini gave reference text, transcribe
+            # the audio directly with whisperX instead of cascading through
+            # Whisper-1 + hallucination recovery that ends in uniform 7s
+            # distribution. Incident "El Arbol De La Vida / Voy A Dejarte"
+            # (Viejas Locas): forced-align Replicate rejected the audio with
+            # `[1, 2, 0]` tensor error, Whisper-1 hallucinated "Música de
+            # presentación" 346s/3 words, recovery distributed 48 lines
+            # uniformly. WhisperX (verified live against the same audio)
+            # returns word-level segments matching Rotor's output (first
+            # vocal at 53.27s vs Rotor's 53.01s). When whisperX returns a
+            # clean result we adopt ITS text — its transcription is usually
+            # cleaner than Gemini's pre-chunked plain (different sources
+            # phrase line-breaks differently; whisperX follows the audio).
+            import whisperx_transcribe
+            if whisperx_transcribe.is_enabled():
+                wx_segs = await asyncio.to_thread(
+                    whisperx_transcribe.transcribe_whisperx, align_audio, lang,
+                )
+                if wx_segs:
+                    from pipeline import _filter_whisper_hallucinations as _fwh
+                    wx_segs, _ = _fwh(wx_segs)
+                    _hall, _why = _detect_hallucination(wx_segs, user_dur, language=lang)
+                    if not _hall and len(wx_segs) >= 2:
+                        logger.info("[LYRICS] whisperX took over (gemini-FA fallback) — %s segments", len(wx_segs))
+                        from jobs import set_timing_source
+                        set_timing_source(job_id, "whisperx")
+                        return {
+                            "job_id": job_id,
+                            "segments": wx_segs,
+                            "reference_lyrics": "",
+                        }
+                    logger.warning("[LYRICS] whisperX rejected at gemini-FA fallback (%s) — falling through", _why or "thin")
+
             # Plain-lyrics aligner on the Gemini/lyrics.ovh reference —
             # mirrors the lrclib-hit path. Whisper merges/splits lines by
             # audio pauses, which on live recordings (crowd, reverb)
@@ -4800,6 +4834,14 @@ class EditJobRequest(BaseModel):
     # the hint goes straight to Veo without Gemini's rewrite. Only
     # meaningful for edit_type=="background".
     bg_verbatim: bool = Field(default=False)
+    # FX layer + lyric animations chosen in the wizard. Added 2026-05-22:
+    # antes el operador no podía cambiarlos post-upload y, peor, los
+    # whitelists de /retry y /variant los descartaban silenciosamente.
+    # None → no cambia (heredan de render_params del job). Cadena vacía
+    # válida ("" = sin efecto). max_length espeja /generate (3646/3652/3653).
+    effect: str | None = Field(default=None, max_length=32)
+    lyrics_animation: str | None = Field(default=None, max_length=16)
+    line_transition: str | None = Field(default=None, max_length=16)
     # Explicit ack that the caller understands re-syncing lyrics on a job
     # already published to YouTube will update R2 but NOT replace the
     # YouTube video file (the YouTube API doesn't allow file replacement,
@@ -5446,6 +5488,30 @@ async def request_edit(
         edit_params["text_contrast"] = body.text_contrast
     if body.text_motion is not None:
         edit_params["text_motion"] = body.text_motion
+    # FX layer + lyric animations: durable visual choices, no edit_type gate
+    # (the operator can change them inside any edit modal). Same pattern as
+    # movement_style below: forward to edit_params for THIS render AND persist
+    # to render_params so retries / variantes los heredan correctamente.
+    # 2026-05-22: cerraba el bug donde lyrics_animation/line_transition no
+    # estaban en los whitelists de /retry y /variant.
+    if body.effect is not None:
+        _fx = (body.effect or "").strip()
+        edit_params["effect"] = _fx
+        _rp = dict(job.render_params or {})
+        _rp["effect"] = _fx
+        job.render_params = _rp
+    if body.lyrics_animation is not None:
+        _la = (body.lyrics_animation or "").strip() or "none"
+        edit_params["lyrics_animation"] = _la
+        _rp = dict(job.render_params or {})
+        _rp["lyrics_animation"] = _la
+        job.render_params = _rp
+    if body.line_transition is not None:
+        _lt = (body.line_transition or "").strip() or "none"
+        edit_params["line_transition"] = _lt
+        _rp = dict(job.render_params or {})
+        _rp["line_transition"] = _lt
+        job.render_params = _rp
     if body.edit_type == "lyrics":
         # Lyrics path keeps explicit edit_params hand-off so the worker
         # doesn't re-query the DB for segments it already received in
@@ -6036,7 +6102,13 @@ async def retry_job(
               "text_motion", "text_contrast", "movement_style",
               "animate_image", "genre", "match_lyrics",
               "background_hint", "concept", "bg_verbatim",
-              "effect", "custom_colors"):
+              "effect", "custom_colors",
+              # Lyric animation + line transition (libass templates from the
+              # wizard). Added 2026-05-22 along with /variant: if a job with
+              # karaoke/reveal fell to validation_failed and the operator hit
+              # Reintentar, animations silently reset to "none" because they
+              # weren't in this whitelist when the feature was wired (#357a1a5).
+              "lyrics_animation", "line_transition"):
         if k in _retry_render_params and _retry_render_params[k] not in (None, ""):
             retry_pipeline_kwargs[k] = _retry_render_params[k]
 
@@ -6322,7 +6394,16 @@ async def create_variant(
     # run_pipeline acepta. concept también va por kwarg.
     for k in ("font", "font_scale", "text_case", "lyric_transition",
               "text_motion", "text_contrast", "movement_style",
-              "animate_image", "genre", "match_lyrics", "bg_verbatim"):
+              "animate_image", "genre", "match_lyrics", "bg_verbatim",
+              # FX layer + lyric animation/transition (libass templates from
+              # the wizard). Added 2026-05-22: variantes heredaban tipografía
+              # y movimiento del padre pero perdían el efecto encima (nieve/
+              # lluvia/etc.) y las animaciones de letra (karaoke/reveal/...)
+              # porque no estaban en este whitelist cuando se cableó (#51946bf
+              # + #357a1a5). custom_colors va con effect porque su flow es el
+              # mismo (paleta opcional para el grade).
+              "effect", "custom_colors",
+              "lyrics_animation", "line_transition"):
         if k in new_render_params:
             pipeline_kwargs[k] = new_render_params[k]
     if body.concept is not None:
