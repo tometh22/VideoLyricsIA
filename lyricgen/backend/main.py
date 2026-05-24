@@ -2835,17 +2835,29 @@ async def generate_preview(
 
     # Crear un job "ghost" en la DB sólo para tracking del status; tiene
     # tenant_id del current_user. Filename placeholder porque no hay audio.
+    #
+    # HOTFIX 2026-05-24: the previous call had THREE bugs that crashed the
+    # endpoint with `TypeError: create_job() got an unexpected keyword
+    # argument 'plan'`, blocking the WHOLE upload flow because the
+    # frontend's `useBackgroundPreview` fires this in parallel with
+    # /upload-url (which then 429'd as the user retried). The bugs were:
+    #   (1) `plan=...` kwarg — doesn't exist on `create_job` (plan lives
+    #       on the User row, not the Job).
+    #   (2) `status=...` should be `initial_status=...` per signature.
+    #   (3) The first positional arg `db` was missing.
+    # Plus the value "bg_preview_queued" wasn't in `valid_states` — added
+    # alongside this fix in jobs.py.
     from jobs import create_job
     job_id = create_job(
+        db,
         artist=body.artist or "preview",
         song_title=body.song_title or "preview",
         style=body.style or "auto",
         filename=f"bgpreview_{bg_cache_key}.preview",
         user_id=current_user["id"],
         tenant_id=current_user["tenant_id"],
-        plan=current_user.get("plan", "100"),
         delivery_profile="youtube",
-        status="bg_preview_queued",
+        initial_status="bg_preview_queued",
     )
 
     try:
