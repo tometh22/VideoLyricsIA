@@ -1,0 +1,122 @@
+# Golden set for the lyric transcription QA suite (post Rotor-Killer + PR-G).
+#
+# Each song is an EXPECTED PROFILE — structural/behavioural expectations,
+# not ground-truth text. The QA analyzer compares actual pipeline output
+# against these expectations and classifies PASS / WARN / FAIL.
+#
+# When the pipeline architecture changes, bump `schema_version` and update
+# `expected.timing_source` allow-lists accordingly.
+
+schema_version: 1
+
+defaults:
+  language: es
+  expected:
+    must_have_words: true
+    max_line_dur_s: 8.0
+    # Regression guard: after PR-G WorldClass, lrclib_synced is NEVER a
+    # valid timing source. Any reappearance means the audio-as-truth
+    # principle was silently broken.
+    forbidden_timing_sources: [lrclib_synced, lrclib_synced_with_offset]
+
+songs:
+  - id: rata_blanca_mujer_amante
+    class: [quick, full]
+    path: /Users/tomi/Downloads/Mujer amante_Rata Blanca.wav
+    artist: Rata Blanca
+    title: Mujer Amante
+    language: es
+    genre_notes: "rock ballad, popular, lrclib has synced — exercises the audio-as-truth path with known reference text. Calibrated 2026-05-24 against actual: 61 lines, 376s elapsed."
+    expected:
+      lrclib_has_synced: true
+      timing_source: [forced_align, whisperx_reconciled]
+      first_vocal_s_range: [3, 25]
+      n_lines_range: [25, 75]
+      must_have_repetition_groups: true
+      max_elapsed_s: 420
+
+  - id: los_abuelos_cosas_mias
+    class: [quick, full]
+    path: /Users/tomi/Downloads/Cosas Mías - Los Abuelos De La Nada.wav
+    artist: Los Abuelos De La Nada
+    title: Cosas Mías
+    language: es
+    genre_notes: "INCIDENT CASE: original timing_source=lrclib_synced bug. PR-G eliminated that path. Must NOT regress."
+    expected:
+      lrclib_has_synced: true
+      timing_source: [forced_align, whisperx_reconciled]
+      first_vocal_s_range: [8, 55]
+      n_lines_range: [20, 55]
+      must_have_repetition_groups: true
+      max_elapsed_s: 240
+
+  - id: intoxicados_de_a_ratitos
+    class: [full]
+    path: /Users/tomi/Downloads/De A Ratitos - Intoxicados.wav
+    artist: Intoxicados
+    title: De A Ratitos
+    language: es
+    genre_notes: "rock with long intro (~30s before first vocal)"
+    expected:
+      lrclib_has_synced: true
+      timing_source: [forced_align, whisperx_reconciled]
+      first_vocal_s_range: [10, 60]
+      n_lines_range: [18, 50]
+      max_elapsed_s: 240
+
+  - id: airbag_blues_infierno_river
+    class: [quick, full]
+    path: /Users/tomi/Downloads/AIRBAG - Blues del Infierno - River Plate.mp3
+    artist: AIRBAG
+    title: Blues del Infierno
+    language: es
+    genre_notes: "live recording, crowd noise, lrclib studio version exists but duration differs"
+    expected:
+      lrclib_has_synced: true
+      timing_source: [forced_align, whisperx_reconciled, whisperx]
+      first_vocal_s_range: [10, 60]
+      n_lines_range: [15, 80]
+      max_elapsed_s: 300
+
+  - id: babasonicos_puesto_envivo
+    class: [full]
+    path: /Users/tomi/Downloads/Babasónicos - Puesto (En Vivo).mp3
+    artist: Babasónicos
+    title: Puesto
+    language: es
+    genre_notes: "live, different sonic profile vs Airbag"
+    expected:
+      timing_source: [forced_align, whisperx_reconciled, whisperx]
+      first_vocal_s_range: [5, 60]
+      n_lines_range: [15, 70]
+      max_elapsed_s: 300
+
+  - id: ariana_grande_7_rings
+    class: [full]
+    path: /Users/tomi/Downloads/Ariana Grande - 7 rings (Official Video).mp3
+    artist: Ariana Grande
+    title: 7 rings
+    language: en
+    genre_notes: "English pop — covers non-ES code path"
+    expected:
+      lrclib_has_synced: true
+      timing_source: [forced_align, whisperx_reconciled]
+      first_vocal_s_range: [0, 25]
+      n_lines_range: [20, 70]
+      must_have_repetition_groups: true
+      max_elapsed_s: 240
+
+  - id: spotdown_desciende
+    class: [quick, full]
+    path: /Users/tomi/Downloads/Desciende El Norte_spotdown.org.mp3
+    artist: Spotdown
+    title: Desciende El Norte
+    language: es
+    genre_notes: "unknown artist, NO lrclib — exercises no-lyrics whisperX-only path"
+    expected:
+      lrclib_has_synced: false
+      timing_source: [whisperx]
+      first_vocal_s_range: [0, 60]
+      n_lines_range: [8, 70]
+      must_have_repetition_groups: false
+      max_elapsed_s: 240
