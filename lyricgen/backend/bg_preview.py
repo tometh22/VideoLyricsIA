@@ -228,3 +228,80 @@ def run_bg_preview_job(job_id: str, bg_cache_key: str, params: dict) -> dict:
             "bg_cache_key": bg_cache_key,
             "error": str(e)[:300],
         }
+
+
+# ---- Capa C hardening 2026-05-24 ----
+# Cleanup + metrics agregados después del PR #279 inicial. Mantenido al
+# final del archivo para que un diff vs main sea trivial.
+
+import threading as _threading
+
+# Process-local counters. Suficientes para single-instance; en horizontal
+# scale cada API replica reporta los suyos (operator agrega manual via /admin).
+# Sin librería de metrics formal (no hay Prometheus exporter en el stack
+# hoy) — un dict + lock es lo mínimo que rinde.
+_metrics_lock = _threading.Lock()
+_metrics = {
+    "requests_total": 0,
+    "cache_hits": 0,
+    "cache_misses": 0,
+    "last_reset_ts": __import__("time").time(),
+}
+
+
+def track_request(cache_hit: bool) -> None:
+    """Bump el counter apropiado. Thread-safe. Best-effort: cualquier excepción
+    se traga porque no queremos romper /generate-preview por telemetría."""
+    try:
+        with _metrics_lock:
+            _metrics["requests_total"] += 1
+            if cache_hit:
+                _metrics["cache_hits"] += 1
+            else:
+                _metrics["cache_misses"] += 1
+    except Exception:
+        pass
+
+
+def get_metrics() -> dict:
+    """Snapshot de las métricas + cache_hit_rate. Llamado desde
+    /admin/bg-preview-metrics. Incluye estimación de cost wasted (cada miss
+    gasta $0.80-3.20 según el modelo Veo usado — usamos $1.50 como promedio
+    representative)."""
+    with _metrics_lock:
+        snap = dict(_metrics)
+    total = snap["requests_total"]
+    hit_rate = (snap["cache_hits"] / total) if total > 0 else 0.0
+    # Conservador: cada miss = $1.50 (Veo 8s típico). Hit es free desde R2.
+    wasted_cost_usd = round(snap["cache_misses"] * 1.50, 2)
+    return {
+        **snap,
+        "cache_hit_rate": round(hit_rate, 4),
+        "estimated_wasted_cost_usd": wasted_cost_usd,
+    }
+
+
+def cleanup_old_cache(retention_hours: int = 24, apply: bool = True) -> dict:
+    """Borra objetos bajo `bg_cache/` más viejos que retention_hours.
+
+    Llamado por el daemon thread `_bg_preview_cleanup_loop` cada 6h. La TTL
+    típica de un preview es la duración de la edición del operador (~30-90s)
+    + buffer; 24h cubre el caso de un batch UMG grande que queda en review
+    overnight. Más allá, los previews descartados acumulan storage en R2.
+
+    Args:
+        retention_hours: TTL. Default 24h.
+        apply: True = realmente borra; False = dry-run, devuelve qué borraría.
+
+    Returns:
+        Estructura del cleanup_old_inputs (scanned/expired/deleted/bytes_freed/sample).
+    """
+    import storage
+    # cleanup_old_inputs filtra `modified < cutoff` con cutoff=now-retention_days.
+    # Convertimos horas a días redondeando hacia abajo (min 1) — 24h = 1 día.
+    retention_days = max(1, retention_hours // 24)
+    return storage.cleanup_old_inputs(
+        retention_days=retention_days,
+        apply=apply,
+        prefix="bg_cache/",
+    )

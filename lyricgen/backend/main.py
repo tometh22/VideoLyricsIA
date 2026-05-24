@@ -419,6 +419,35 @@ def on_startup():
     threading.Thread(target=_reaper_loop, daemon=True, name="reaper").start()
     logger.info("reaper thread started (threshold=100min, every 5min)")
 
+    # bg_preview cache cleanup — Capa C 2026-05-24. Borra previews bajo
+    # `bg_cache/` con más de 24h de TTL. El cache existe para que el
+    # operator que pre-genera el fondo durante edit lo reuse al apretar
+    # "Crear video"; si no vuelve en 24h, asumimos abandono y liberamos
+    # R2 storage. Sin esto, cada operador deja N previews descartados
+    # (cambió params) acumulándose forever.
+    def _bg_preview_cleanup_loop():
+        _time.sleep(180)  # 3min después del boot
+        while True:
+            try:
+                from bg_preview import cleanup_old_cache
+                report = cleanup_old_cache(retention_hours=24, apply=True)
+                if report.get("deleted", 0) > 0:
+                    logger.info(
+                        "[BG_PREVIEW_CLEANUP] deleted %d objects (%.1f MB freed)",
+                        report["deleted"], report.get("bytes_freed", 0) / 1024 / 1024,
+                    )
+            except Exception:  # pragma: no cover
+                try:
+                    import sentry_sdk
+                    sentry_sdk.capture_exception()
+                except Exception:
+                    pass
+                _time.sleep(60)
+            _time.sleep(6 * 3600)   # 6h entre sweeps
+
+    threading.Thread(target=_bg_preview_cleanup_loop, daemon=True, name="bg_preview_cleanup").start()
+    logger.info("bg_preview cleanup thread started (TTL=24h, every 6h)")
+
     # Outputs cleanup loop. Sweeps OUTPUTS_DIR every hour to keep
     # local disk bounded — deletes jobs whose deliverables are on R2
     # and retries the upload for jobs whose R2 push failed earlier.
@@ -2773,16 +2802,30 @@ async def generate_preview(
         mismo job_id. (Race window dentro del worker está cubierta por el
         idempotency check en run_bg_preview_job.)
 
-    Plan-tier guard: NO se implementa todavía. En v2 chequear
-    `current_user["plan"]` y skip si `plan == "free"` (no compensa el cost).
+    Plan-tier guard (Capa C 2026-05-24): free-tier devuelve `skipped:true`
+    sin tocar la cola — cada preview descartado gasta $0.80-3.20 Veo y un
+    trial toquetea opciones más que un paid customer. Paid pasan normal.
     """
-    from bg_preview import compute_bg_cache_key, cache_check, cache_r2_key
+    from auth import PLANS
+    plan_id = (current_user.get("plan") or "free").strip()
+    plan_cfg = PLANS.get(plan_id, PLANS["free"])
+    if not plan_cfg.get("bg_preview_enabled", False):
+        return {
+            "skipped": True,
+            "reason": "plan_tier",
+            "message": "El pre-render del fondo está disponible en planes paid. El video se genera igual al apretar 'Crear video'.",
+        }
+
+    from bg_preview import (
+        compute_bg_cache_key, cache_check, cache_r2_key, track_request,
+    )
 
     params = body.model_dump()
     bg_cache_key = compute_bg_cache_key(params)
 
     # Fast path — cache hit.
     if cache_check(bg_cache_key):
+        track_request(cache_hit=True)
         return {
             "bg_cache_key": bg_cache_key,
             "cached": True,
@@ -2815,12 +2858,39 @@ async def generate_preview(
                    error=str(exc)[:300])
         raise HTTPException(503, detail="Cola de pre-gen no disponible.")
 
+    track_request(cache_hit=False)
     return {
         "bg_cache_key": bg_cache_key,
         "cached": False,
         "job_id": job_id,
         "status": "bg_preview_queued",
     }
+
+
+@app.get("/admin/bg-preview-metrics")
+async def admin_bg_preview_metrics(
+    current_user: dict = Depends(get_current_user),
+):
+    """Métricas del feature bg-preview — admin only.
+
+    Returns:
+        {
+          "requests_total": int,
+          "cache_hits": int,
+          "cache_misses": int,
+          "cache_hit_rate": float (0..1),
+          "estimated_wasted_cost_usd": float,
+          "last_reset_ts": float
+        }
+
+    Process-local counters: en horizontal scale cada API replica reporta los
+    suyos. Para una vista global, agregar manual (sumar requests/hits/misses
+    de todas las réplicas; hit_rate = sum_hits / sum_requests).
+    """
+    if current_user.get("role") != "admin":
+        raise HTTPException(403, detail="Admin only.")
+    from bg_preview import get_metrics
+    return get_metrics()
 
 
 @app.get("/generate-preview-status/{job_id}")

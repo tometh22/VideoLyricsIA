@@ -86,6 +86,14 @@ export function useBackgroundPreview(entry, {
         return;
       }
       const data = await res.json();
+      // Plan-tier guard del backend: free-tier no dispara pre-gen. Status
+      // queda "disabled" + bgCacheKey null. El POST /generate igual corre
+      // Veo/Imagen como siempre — solo no hay pre-warming.
+      if (data.skipped) {
+        setStatus("disabled");
+        setError(null);
+        return;
+      }
       const key = data.bg_cache_key;
       setBgCacheKey(key);
       if (onCacheKey) onCacheKey(key);

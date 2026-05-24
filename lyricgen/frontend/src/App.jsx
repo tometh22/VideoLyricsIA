@@ -1533,7 +1533,27 @@ export default function App() {
     api: API,
     authHeaders,
     onCacheKey: (key) => {
+      // Update currentReview si aún estamos editando ese file.
       setCurrentReview((r) => (r ? { ...r, bgCacheKey: key } : r));
+      // R-FRONT-2 (2026-05-24): si el operador aprobó ANTES que el preview
+      // terminara (review rápido < 30s), currentReview ya es null. El cache
+      // key se hubiera perdido y POST /generate correría Veo de vuelta.
+      // Actualizamos approvedJobs también, matcheando por filename.
+      setApprovedJobs((prev) => {
+        if (!prev || prev.length === 0) return prev;
+        const target = previewEntry?.file?.name;
+        if (!target) return prev;
+        let changed = false;
+        const next = prev.map((j) => {
+          if (j.bgCacheKey === key) return j;
+          if (j.file && j.file.name === target) {
+            changed = true;
+            return { ...j, bgCacheKey: key };
+          }
+          return j;
+        });
+        return changed ? next : prev;
+      });
     },
   });
 
