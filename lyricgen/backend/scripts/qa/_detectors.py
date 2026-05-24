@@ -35,6 +35,23 @@ def _segs(run: dict) -> list[dict]:
 
 # ─── FAIL-severity detectors ──────────────────────────────────────────────
 
+def timing_source_present(run, expected, audio_duration_s):
+    """Every successful run MUST set a `timing_source`. NULL means a Bug D
+    regression — a return path that emits segments without going through
+    `_emit_segments` (the chokepoint that calls `set_timing_source`).
+
+    Exemption: runs that crashed (`meta.error` present) are covered by
+    `pipeline_exception` already — no point double-reporting them here."""
+    if (run.get("meta") or {}).get("error"):
+        return None
+    src = run.get("source")
+    if not src:
+        return CheckResult(_name(timing_source_present), Status.FAIL,
+                           "timing_source missing (None/NULL) — Bug D regression",
+                           {"actual": src})
+    return None
+
+
 def timing_source_in_allowlist(run, expected, audio_duration_s):
     """Actual timing_source must be in expected.timing_source allow-list."""
     allow = expected.get("timing_source")
@@ -258,6 +275,7 @@ def replicate_throttle_seen(run, expected, audio_duration_s):
 # Ordered for the report: FAIL detectors first, WARNs after.
 DETECTORS: list[Detector] = [
     # FAIL
+    timing_source_present,
     timing_source_in_allowlist,
     timing_source_not_in_deny,
     mega_segment_hallucination,

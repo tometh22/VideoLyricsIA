@@ -17,7 +17,7 @@ defaults:
     # Regression guard: after PR-G WorldClass, lrclib_synced is NEVER a
     # valid timing source. Any reappearance means the audio-as-truth
     # principle was silently broken.
-    forbidden_timing_sources: [lrclib_synced, lrclib_synced_with_offset]
+    forbidden_timing_sources: [lrclib_synced, lrclib_synced_with_offset, lrclib_plain]
 
 songs:
   - id: rata_blanca_mujer_amante

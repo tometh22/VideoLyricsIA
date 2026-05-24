@@ -3128,6 +3128,51 @@ async def _run_transcription_for_job(
                 )
             )
 
+        # ─── single chokepoint for every segments-bearing return ──────
+        # `_emit_segments` is the ONE allowed exit point of this
+        # function for any return that ships segments. It guarantees:
+        #   1. `source` is in `VALID_TIMING_SOURCES` (banishes Bug D —
+        #      the four fallback paths that historically returned
+        #      `timing_source=NULL`).
+        #   2. `set_timing_source(job_id, source)` is called ALWAYS.
+        #   3. `normalize_words` runs (banishes Bug B — FA wordstamps
+        #      with score get preserved, Whisper-1 raw words get
+        #      stripped; before, the tail return stripped ALL words
+        #      unconditionally).
+        #   4. `_snap` (split → beat-snap → chorus repetitions) runs.
+        #   5. Returns the canonical dict shape.
+        #
+        # Adding a new return path? Use `return _emit_segments(...)` —
+        # the AST regression test in `test_emit_segments.py` will fail
+        # if a raw `return {"segments": ...}` slips into this function.
+        from timing_sources import VALID_TIMING_SOURCES, WHISPER_RAW
+        from transcribe_postprocess import normalize_words as _normalize_words
+        def _emit_segments(segments, source, *,
+                            reference_lyrics: str = "",
+                            recovery_source=None,
+                            coverage_warning: bool = False,
+                            extra=None):
+            if source not in VALID_TIMING_SOURCES:
+                logger.error("[EMIT] invalid timing_source=%r — forcing %r "
+                             "(job=%s)", source, WHISPER_RAW, job_id)
+                source = WHISPER_RAW
+            try:
+                from jobs import set_timing_source
+                set_timing_source(job_id, source)
+            except Exception as e:  # set_timing_source already swallows; defensive
+                logger.warning("[EMIT] set_timing_source(%s, %s) raised: %s",
+                               job_id, source, e)
+            polished = _snap(_normalize_words(segments))
+            out = {"job_id": job_id, "segments": polished,
+                   "reference_lyrics": reference_lyrics}
+            if recovery_source:
+                out["recovery_source"] = recovery_source
+            if coverage_warning:
+                out["coverage_warning"] = True
+            if extra:
+                out.update(extra)
+            return out
+
         async def _get_align_audio() -> str:
             """Return the path that alignment/transcription engines should read.
             Lazy-separates the vocal stem on first call. Falls back to the mix
@@ -3213,14 +3258,12 @@ async def _run_transcription_for_job(
                     )
                     if fa_segs:
                         logger.info("[LYRICS] forced alignment used (%s lines, lrclib text) for %r - %r", len(fa_segs), artist_hint, song_hint)
-                        from jobs import set_timing_source
-                        set_timing_source(job_id, "forced_align")
-                        return {
-                            "job_id": job_id,
-                            "segments": _snap(fa_segs),
-                            "reference_lyrics": fa_text,
-                            "recovery_source": "forced_align",
-                        }
+                        from timing_sources import FORCED_ALIGN
+                        return _emit_segments(
+                            fa_segs, FORCED_ALIGN,
+                            reference_lyrics=fa_text,
+                            recovery_source="forced_align",
+                        )
             # WORLD-CLASS audio-as-truth principle (Rotor architecture):
             # lrclib provides TEXT, never timing. Synced timestamps in lrclib are
             # community-curated and can be globally mis-aligned to a specific
@@ -3250,15 +3293,13 @@ async def _run_transcription_for_job(
                             import whisperx_reconcile
                             _reconciled = whisperx_reconcile.reconcile(wx_segs, fa_text_for_wx) if fa_text_for_wx else None
                             final_segs = _reconciled if _reconciled else wx_segs
-                            _src_tag = "whisperx_reconciled" if _reconciled else "whisperx"
+                            from timing_sources import WHISPERX_RECONCILED, WHISPERX
+                            _src_tag = WHISPERX_RECONCILED if _reconciled else WHISPERX
                             logger.info("[LYRICS] lrclib-text fallback via whisperX — %s segments [%s]", len(final_segs), _src_tag)
-                            from jobs import set_timing_source
-                            set_timing_source(job_id, _src_tag)
-                            return {
-                                "job_id": job_id,
-                                "segments": _snap(final_segs),
-                                "reference_lyrics": fa_text_for_wx if _reconciled else "",
-                            }
+                            return _emit_segments(
+                                final_segs, _src_tag,
+                                reference_lyrics=fa_text_for_wx if _reconciled else "",
+                            )
                         logger.warning("[LYRICS] lrclib-text whisperX rejected (%s) — falling through to plain+Whisper", _why or "thin")
 
             # No synced (or too few segments / unreliable timestamps) — but
@@ -3457,13 +3498,13 @@ async def _run_transcription_for_job(
                             logger.info("[LYRICS] discarded %s intro seg(s) as song-line hallucinations (recovery)", _dup)
                         combined = intro_segments + recovered
                         logger.warning("[LYRICS] hallucination detected (%s) — auto-recovered with %s lines from lrclib plain (%s time anchors, start=%.1fs, dur=%.1fs) + %s intro-Whisper segment(s)", reason, len(recovered), len(anchors), intro_offset, user_dur, len(intro_segments))
-                        return {
-                            "job_id": job_id,
-                            "segments": _snap(combined),
-                            "reference_lyrics": plain,
-                            "coverage_warning": True,
-                            "recovery_source": "lrclib_plain",
-                        }
+                        from timing_sources import WHISPER_LRCLIB_REC
+                        return _emit_segments(
+                            combined, WHISPER_LRCLIB_REC,
+                            reference_lyrics=plain,
+                            recovery_source="lrclib_plain",
+                            coverage_warning=True,
+                        )
                 # Happy path: Whisper returned plausibly-many segments.
                 # Combine intro Whisper (if any) with the body output.
                 from pipeline import _filter_intro_song_overlap
@@ -3477,7 +3518,10 @@ async def _run_transcription_for_job(
                 combined, _dropped = _filter_whisper_hallucinations(combined)
                 if _dropped:
                     logger.warning("[TRANSCRIBE] dropped %s Whisper hallucination phrase(s)", _dropped)
-                return {"job_id": job_id, "segments": _snap(combined), "reference_lyrics": plain}
+                from timing_sources import WHISPER_LRCLIB
+                return _emit_segments(
+                    combined, WHISPER_LRCLIB, reference_lyrics=plain,
+                )
 
         # Kick off Gemini-grounded lyrics fetch in parallel with Whisper.
         # The fetcher is best-effort (returns None on any failure); we wrap
@@ -3577,14 +3621,12 @@ async def _run_transcription_for_job(
                 )
                 if fa_segs:
                     logger.info("[LYRICS] forced alignment used (%s lines, gemini text)", len(fa_segs))
-                    from jobs import set_timing_source
-                    set_timing_source(job_id, "forced_align")
-                    return {
-                        "job_id": job_id,
-                        "segments": _snap(fa_segs),
-                        "reference_lyrics": reference,
-                        "recovery_source": "forced_align",
-                    }
+                    from timing_sources import FORCED_ALIGN
+                    return _emit_segments(
+                        fa_segs, FORCED_ALIGN,
+                        reference_lyrics=reference,
+                        recovery_source="forced_align",
+                    )
 
             # WhisperX fallback — Rotor-grade audio-as-truth path. When
             # forced-align failed but Gemini gave reference text, transcribe
@@ -3621,15 +3663,13 @@ async def _run_transcription_for_job(
                         import whisperx_reconcile
                         _reconciled = whisperx_reconcile.reconcile(wx_segs, reference)
                         final_segs = _reconciled if _reconciled else wx_segs
-                        _source_tag = "whisperx_reconciled" if _reconciled else "whisperx"
+                        from timing_sources import WHISPERX_RECONCILED, WHISPERX
+                        _source_tag = WHISPERX_RECONCILED if _reconciled else WHISPERX
                         logger.info("[LYRICS] whisperX took over (gemini-FA fallback) — %s segments [%s]", len(final_segs), _source_tag)
-                        from jobs import set_timing_source
-                        set_timing_source(job_id, _source_tag)
-                        return {
-                            "job_id": job_id,
-                            "segments": _snap(final_segs),
-                            "reference_lyrics": reference if _reconciled else "",
-                        }
+                        return _emit_segments(
+                            final_segs, _source_tag,
+                            reference_lyrics=reference if _reconciled else "",
+                        )
                     logger.warning("[LYRICS] whisperX rejected at gemini-FA fallback (%s) — falling through", _why or "thin")
 
             # Plain-lyrics aligner on the Gemini/lyrics.ovh reference —
@@ -3682,13 +3722,13 @@ async def _run_transcription_for_job(
                            [r.strip() for r in (reference or "").splitlines() if r.strip()]
                     )
                     logger.warning("[LYRICS] hallucination detected on fallback path (%s) — gap-fill produced %s segments from %s (~%s kept-Whisper, %s synthesized, dur=%.1fs)", reason, len(merged), src, plausible_count, len(merged) - plausible_count, user_dur)
-                    return {
-                        "job_id": job_id,
-                        "segments": _snap(merged),
-                        "reference_lyrics": reference,
-                        "coverage_warning": True,
-                        "recovery_source": src,
-                    }
+                    from timing_sources import WHISPER_GEMINI_REC
+                    return _emit_segments(
+                        merged, WHISPER_GEMINI_REC,
+                        reference_lyrics=reference,
+                        recovery_source=src,
+                        coverage_warning=True,
+                    )
 
         # No-lyrics path — the audio is the only source of truth. Prefer
         # whisperX (Whisper large-v2 + wav2vec2 alignment + VAD) over the
@@ -3712,13 +3752,10 @@ async def _run_transcription_for_job(
                     _hall, _why = _detect_hallucination(wx_segs, _wx_dur, language=lang)
                     if not _hall and len(wx_segs) >= 2:
                         logger.info("[LYRICS] whisperX no-lyrics path — %s segments (word-level)", len(wx_segs))
-                        from jobs import set_timing_source
-                        set_timing_source(job_id, "whisperx")
-                        return {
-                            "job_id": job_id,
-                            "segments": _snap(wx_segs),
-                            "reference_lyrics": "",
-                        }
+                        from timing_sources import WHISPERX
+                        return _emit_segments(
+                            wx_segs, WHISPERX, reference_lyrics="",
+                        )
                     logger.warning("[LYRICS] whisperX result rejected (%s) — keeping whisper-1", _why or "thin")
 
         from pipeline import _filter_whisper_hallucinations
@@ -3735,11 +3772,15 @@ async def _run_transcription_for_job(
             segments = split_long_segments_by_words(segments)
             if len(segments) != _before:
                 logger.info("[LYRICS] length-split: %s → %s segments", _before, len(segments))
-        # Strip per-word arrays before persisting — only present when the
-        # aligner requested word timestamps but didn't consume them (low
-        # coverage); keeps segments_json lean.
-        segments = [{k: v for k, v in s.items() if k != "words"} for s in segments]
-        return {"job_id": job_id, "segments": _snap(segments), "reference_lyrics": reference}
+        # Final fallback path: no reference, no whisperX usable. The
+        # `_emit_segments` chokepoint runs `normalize_words` which keeps
+        # any FA word-stamps (score present) and strips Whisper-1 raw
+        # words (no score) — replaces the previous unconditional strip
+        # that broke karaoke (Bug B).
+        from timing_sources import WHISPER_RAW
+        return _emit_segments(
+            segments, WHISPER_RAW, reference_lyrics=reference,
+        )
     finally:
         # tmp_dir holds intermediate slices (intro/body cuts) only — the
         # main audio (audio_path) is under job_dir and must survive until
