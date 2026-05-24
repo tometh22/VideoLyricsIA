@@ -42,6 +42,88 @@ _TRUE = ("1", "true", "yes", "on", "y", "t")
 
 _LRC_TS_RE = re.compile(r"^\s*(\[\d{1,2}:\d{2}(?:\.\d{1,3})?\]\s*)+")
 
+# Error messages from the model / SDK / API that are NOT going to get
+# better on retry. Three retries at 8s + 24s = 32 s of sleep + ~90 s per
+# upload each (Mujer Amante baseline) = 5+ minutes wasted on a guaranteed
+# failure. Match by lowercase substring against `str(exc)`.
+#
+# `Padding size should be less than the corresponding input dimension`
+# (the [1,2,1] tensor bug) is the most common deterministic crash we've
+# seen in the QA full run — Mujer Amante hit it three times in a row.
+_NON_RETRYABLE_FRAGMENTS = (
+    "padding size",
+    "argument #4",
+    "validationerror",
+    "validation error",
+    "invalid input",
+    "unsupported audio",
+    "transcript too long",
+)
+
+
+def _is_non_retryable(err: Exception) -> bool:
+    """True if `err`'s message contains a known deterministic-failure
+    fragment. Determines whether `_call_with_budget` should abort instead
+    of sleeping + retrying."""
+    msg = str(err).lower()
+    return any(f in msg for f in _NON_RETRYABLE_FRAGMENTS)
+
+
+def _call_with_budget(model: str, input_factory, *,
+                       total_budget_s: float, backoff: list):
+    """Call `replicate.run(model, input=input_factory())` with a global
+    wall-clock budget and typed-error short-circuit. Returns the model
+    output on success, or None on abort (budget exhausted, non-retryable
+    error, or all attempts failed).
+
+    `input_factory` is a zero-arg callable that returns a fresh `input`
+    dict each call — the audio file handle is consumed on each upload,
+    so we can't reuse a single dict across retries.
+
+    Budget motivation (incident 2026-05-24 QA full run): the previous
+    `for attempt in range(3): try replicate.run(...) except ...` loop
+    had NO upper bound on total wall-clock time. When Replicate was
+    degraded ("Server disconnected") each attempt's HTTP request took
+    ~90 minutes to time out, so three attempts burned ~4.5 hours per
+    job (observed: Intoxicados 16057s = 4h27min elapsed). The `total_
+    budget_s` cap aborts ASAP when the cumulative time-on-the-wire
+    exceeds 8 minutes by default — caller falls through to whisperX
+    immediately instead of holding the job for hours.
+
+    Backoff `[0, 8, 24]` keeps the previous behavior for transient
+    flakes (cureau's intermittent `[1, 2, 0]` first-attempt error). The
+    sleep is SKIPPED if it would push us past `deadline` — we'd rather
+    abort and let the caller try a different path than burn a sleep
+    quota on a doomed retry.
+    """
+    import replicate
+    import time as _t
+    deadline = _t.monotonic() + total_budget_s
+    last_err = None
+    for attempt, sleep_s in enumerate(backoff):
+        if sleep_s > 0:
+            if _t.monotonic() + sleep_s >= deadline:
+                logger.warning("[FORCED] sleep %ss would exceed budget — aborting at attempt %s",
+                               sleep_s, attempt + 1)
+                break
+            _t.sleep(sleep_s)
+        if _t.monotonic() >= deadline:
+            logger.warning("[FORCED] budget exhausted before attempt %s/%s",
+                           attempt + 1, len(backoff))
+            break
+        try:
+            return replicate.run(model, input=input_factory())
+        except Exception as e:
+            last_err = e
+            if _is_non_retryable(e):
+                logger.warning("[FORCED] non-retryable error on attempt %s (%s) — aborting",
+                               attempt + 1, e)
+                return None
+            logger.warning("[FORCED] attempt %s/%s failed (%s)",
+                           attempt + 1, len(backoff), e)
+    logger.warning("[FORCED] exhausted attempts/budget — last_err=%s", last_err)
+    return None
+
 
 def is_enabled() -> bool:
     """On only when the flag is set AND a Replicate token is present."""
@@ -248,44 +330,57 @@ def forced_align_lyrics(audio_path: str, lyrics_text: str) -> list[dict] | None:
         return None  # too short to be worth a forced-align call
 
     try:
-        import replicate
+        import replicate  # noqa: F401 — used inside `_call_with_budget`
     except ImportError:
         logger.warning("[FORCED] replicate SDK not installed — falling back")
         return None
 
+    # Pre-flight: belt-and-suspenders validation of the audio before we pay
+    # the upload + compress cost. `vocal_sep.separate_vocals` already
+    # validates its stems, but this function is ALSO called with raw user
+    # audio (no demucs in front) — a 50 ms clip uploaded by mistake would
+    # otherwise crash cureau with the [1,2,1] padding bug. The probe is
+    # cheap (ffprobe, ~30-100 ms) compared to the network round trip.
+    try:
+        from vocal_sep import validate_stem as _validate_stem
+        ok, reason = _validate_stem(audio_path)
+        if not ok:
+            logger.warning("[FORCED] audio rejected pre-flight (%s) — falling back",
+                           reason)
+            return None
+    except Exception as e:  # import error in tests / unexpected
+        logger.debug("[FORCED] pre-flight validation skipped (%s)", e)
+
     transcript = "\n".join(lyric_lines)
     upload_path, is_temp = _compress_for_upload(audio_path)
-    output = None
-    last_err = None
-    # Backoff schedule for retries. Replicate sometimes throttles with 429
-    # ("burst of 1") under load; the model itself can also flake with a
-    # transient `[1, 2, 0]` tensor error on the first attempt. Three tries
-    # with 0s / 8s / 24s sleep handles both. Long-form audio is expensive to
-    # re-upload so we cap at 3.
-    import time as _time
-    _BACKOFF_SEC = [0, 8, 24]
+
+    # Build a fresh input dict per attempt — the audio file handle is
+    # consumed on each upload, so we need to reopen it.
+    def _input_factory():
+        return {
+            "audio_file": open(upload_path, "rb"),
+            "transcript": transcript,
+            # show_probabilities returns per-word `score` (0-1) which we
+            # surface to the editor for confidence highlighting on
+            # low-certainty lines.
+            "show_probabilities": True,
+        }
+
+    # Total wall-clock budget for the whole retry sequence. Default 8 min
+    # covers worst-case observed in healthy runs (~3 min) with margin;
+    # `FORCED_ALIGN_BUDGET_S` env override lets us extend at runtime if
+    # Replicate stays degraded longer than expected.
     try:
-        for attempt in range(len(_BACKOFF_SEC)):
-            if _BACKOFF_SEC[attempt] > 0:
-                _time.sleep(_BACKOFF_SEC[attempt])
-            try:
-                with open(upload_path, "rb") as audio:
-                    output = replicate.run(
-                        _MODEL,
-                        input={
-                            "audio_file": audio,
-                            "transcript": transcript,
-                            # show_probabilities returns per-word `score` (0-1)
-                            # which we surface to the editor for confidence
-                            # highlighting on low-certainty lines.
-                            "show_probabilities": True,
-                        },
-                    )
-                break
-            except Exception as e:  # network, billing, model error, anything
-                last_err = e
-                logger.warning("[FORCED] replicate attempt %s/%s failed (%s)",
-                               attempt + 1, len(_BACKOFF_SEC), e)
+        total_budget_s = float(os.environ.get("FORCED_ALIGN_BUDGET_S", "480"))
+    except ValueError:
+        total_budget_s = 480.0
+
+    try:
+        output = _call_with_budget(
+            _MODEL, _input_factory,
+            total_budget_s=total_budget_s,
+            backoff=[0, 8, 24],
+        )
     finally:
         if is_temp:
             try:
@@ -293,8 +388,6 @@ def forced_align_lyrics(audio_path: str, lyrics_text: str) -> list[dict] | None:
             except OSError:
                 pass
     if output is None:
-        logger.warning("[FORCED] replicate failed after %s retries (%s) — falling back",
-                       len(_BACKOFF_SEC), last_err)
         return None
 
     words = (
