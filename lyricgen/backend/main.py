@@ -1813,12 +1813,36 @@ async def _run_transcription_for_job(
         #                          extended / remix versions are too risky
         #                          to auto-align)
         from pipeline import (
-            _fetch_lrclib, _lrc_to_segments, _audio_duration,
+            _fetch_lrclib, _fetch_lrclib_with_swap_retry,
+            _lrc_to_segments, _audio_duration,
             _slice_audio_prefix, _slice_audio_window, _verify_lrclib_alignment,
             _detect_hallucination, _synthesize_segments_from_plain,
             _align_whisper_to_plain, _fill_gaps_with_reference,
         )
-        lrc = await asyncio.to_thread(_fetch_lrclib, artist_hint, song_hint, db)
+        lrc, _lrc_meta = await asyncio.to_thread(
+            _fetch_lrclib_with_swap_retry, artist_hint, song_hint, db,
+        )
+        # Auto-correct inverted metadata: when the swap-retry hit, the upload
+        # had artist/title swapped (incident 2026-05-24 Viejas Locas/
+        # Legalícenla in staging — frontend parser assumes Title_Artist for
+        # underscore filenames, but most users name files Artist_Title).
+        # Persist the corrected order so the editor renders clean metadata,
+        # and update the local hints so Gemini grounding / log lines use the
+        # right values for the rest of this run.
+        if _lrc_meta.get("swapped"):
+            artist_hint = _lrc_meta["artist_used"]
+            song_hint = _lrc_meta["song_used"]
+            try:
+                from jobs import get_job_model
+                _job_row = get_job_model(db, job_id)
+                if _job_row is not None:
+                    _job_row.artist = artist_hint
+                    _job_row.song_title = song_hint
+                    db.commit()
+                    print(f"[LYRICS] auto-corrected swapped metadata for job "
+                          f"{job_id}: artist={artist_hint!r} song_title={song_hint!r}")
+            except Exception as e:
+                print(f"[LYRICS] metadata auto-correction persist failed: {e}")
         if lrc:
             synced = lrc.get("synced")
             plain = lrc.get("plain") or ""

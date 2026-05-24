@@ -1388,6 +1388,49 @@ def _fetch_lrclib(artist: str, song: str, db=None) -> dict | None:
         return None
 
 
+def _fetch_lrclib_with_swap_retry(artist: str, song: str, db=None) -> tuple:
+    """`_fetch_lrclib` con retry en orden invertido cuando el directo falla.
+
+    Devuelve `(result, meta)` donde `meta = {swapped: bool, artist_used,
+    song_used}`. El caller usa `meta["swapped"]` para persistir el orden
+    corregido en `job.artist`/`job.song_title` y que el editor muestre
+    metadata limpia al usuario.
+
+    Origin (incidente 2026-05-24): un upload llegó con `artist='Legalícenla',
+    title='Viejas Locas'` (los campos invertidos por el parser del frontend
+    que asume convención `Title_Artist` para archivos con underscore — la
+    mayoría de los usuarios nombran `Artist_Title`). lrclib falló silen-
+    ciosamente, el pipeline cayó a whisperX puro sin texto de referencia,
+    y el output fue ASR degradado con líneas partidas a mitad de frase y
+    palabras inventadas ("se cacachó", "hierbar", "Le realicen la..."
+    en lugar del estribillo "Legalícenla").
+
+    Costo: una sola llamada extra a lrclib, gated en que el directo
+    devolvió None. Despreciable contra la calidad recuperada cuando
+    la metadata viene invertida (caso real, no hipotético).
+
+    Defensa: si artist o song están vacíos, o son textualmente iguales,
+    no intenta swap (evita ruido en logs).
+    """
+    result = _fetch_lrclib(artist, song, db)
+    meta = {"swapped": False, "artist_used": artist, "song_used": song}
+    if result is not None:
+        return result, meta
+    if not artist or not song:
+        return None, meta
+    if artist.strip().lower() == song.strip().lower():
+        return None, meta
+    print(f"[LYRICS] lrclib miss for ({artist!r},{song!r}) — "
+          f"trying swapped order ({song!r},{artist!r})")
+    swap_result = _fetch_lrclib(song, artist, db)
+    if swap_result is None:
+        return None, meta
+    print(f"[LYRICS] lrclib hit on SWAPPED order — direct ({artist!r},{song!r}) "
+          f"missed, swap ({song!r},{artist!r}) succeeded. Upload metadata was "
+          f"likely inverted; auto-corrected for this job.")
+    return swap_result, {"swapped": True, "artist_used": song, "song_used": artist}
+
+
 _LRC_LINE = None  # lazy-compiled regex
 
 
