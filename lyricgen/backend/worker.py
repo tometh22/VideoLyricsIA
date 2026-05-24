@@ -91,11 +91,15 @@ def main():
     #   1. transcription — corta latencia (~15-20s), debe drenar primero para
     #      que el usuario vea el editor rápido. Si no es prioritaria queda
     #      detrás de un /generate (15-30 min) y arruina la UX que prometimos.
-    #   2. enterprise — premium tenants (UMG/OMG) van antes que default.
-    #   3. default — todo lo demás.
+    #   2. bg_preview — Capa C 2026-05-24: pre-gen del background mientras el
+    #      operador edita lyrics. Necesita correr en paralelo a transcribe pero
+    #      no debe bloquear los renders finales (default). Latencia ~60-120s.
+    #   3. enterprise — premium tenants (UMG/OMG) van antes que default.
+    #   4. default — todo lo demás.
     # Workers listen in this order; RQ pickup respects it.
     queues = [
         Queue("transcription", connection=conn),
+        Queue("bg_preview", connection=conn),
         Queue("enterprise", connection=conn),
         Queue("default", connection=conn),
     ]

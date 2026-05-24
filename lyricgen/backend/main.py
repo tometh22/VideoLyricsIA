@@ -2726,6 +2726,135 @@ async def transcription_status(
         )
 
 
+# ---------------------------------------------------------------------------
+# Background pre-generation — Capa C del wizard refactor (2026-05-24)
+# Mientras el operador edita lyrics, Veo/Imagen ya están generando el fondo.
+# Cuando llega POST /generate, la pipeline reusa el cache. Ver bg_preview.py
+# para el worker + cache key logic.
+# ---------------------------------------------------------------------------
+class _GeneratePreviewReq(BaseModel):
+    """Background params — TODOS los campos que entran al hash determinístico
+    del cache. Cualquier campo del request /generate que NO afecte el bg NO
+    va acá (audio, lyrics, font, animation, transition...)."""
+    artist: str = Field(default="", max_length=255)
+    song_title: str = Field(default="", max_length=500)
+    style: str = Field(default="auto", max_length=50)
+    movement_style: str = Field(default="", max_length=64)
+    effect: str = Field(default="", max_length=32)
+    custom_colors: str = Field(default="", max_length=200)
+    genre: str = Field(default="", max_length=64)
+    concept: str = Field(default="", max_length=2000)
+    background_hint: str = Field(default="", max_length=2000)
+    bg_verbatim: bool = False
+    background_mode: str = Field(default="veo", max_length=16)
+    animate_image: bool = False
+    match_lyrics: bool = True
+    target_duration_s: float = Field(default=30.0, ge=5, le=600)
+
+
+@app.post("/generate-preview")
+@limiter.limit("30/minute")
+async def generate_preview(
+    request: Request,
+    body: _GeneratePreviewReq,
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Pre-genera el background (Veo/Imagen) mientras el operador edita lyrics.
+
+    Comportamiento:
+      - Computa `bg_cache_key` = sha256-12 de los params normalizados.
+      - Si `bg_cache/{key}.mp4` existe en R2 → 200 OK con `cached=true`. El
+        operador ya pidió este background con esos params; reusamos.
+      - Si no existe → crea job + enqueue a la queue `bg_preview` + retorna
+        202 Accepted con `job_id` para que el frontend pollee status.
+      - Idempotente: dos requests paralelos con mismos params → primero
+        enqueue, segundo ve el cache_key + status existente y devuelve el
+        mismo job_id. (Race window dentro del worker está cubierta por el
+        idempotency check en run_bg_preview_job.)
+
+    Plan-tier guard: NO se implementa todavía. En v2 chequear
+    `current_user["plan"]` y skip si `plan == "free"` (no compensa el cost).
+    """
+    from bg_preview import compute_bg_cache_key, cache_check, cache_r2_key
+
+    params = body.model_dump()
+    bg_cache_key = compute_bg_cache_key(params)
+
+    # Fast path — cache hit.
+    if cache_check(bg_cache_key):
+        return {
+            "bg_cache_key": bg_cache_key,
+            "cached": True,
+            "r2_key": cache_r2_key(bg_cache_key),
+            "status": "bg_preview_done",
+        }
+
+    # Crear un job "ghost" en la DB sólo para tracking del status; tiene
+    # tenant_id del current_user. Filename placeholder porque no hay audio.
+    from jobs import create_job
+    job_id = create_job(
+        artist=body.artist or "preview",
+        song_title=body.song_title or "preview",
+        style=body.style or "auto",
+        filename=f"bgpreview_{bg_cache_key}.preview",
+        user_id=current_user["id"],
+        tenant_id=current_user["tenant_id"],
+        plan=current_user.get("plan", "100"),
+        delivery_profile="youtube",
+        status="bg_preview_queued",
+    )
+
+    try:
+        from queue_jobs import enqueue_bg_preview
+        enqueue_bg_preview(job_id, bg_cache_key, params)
+    except Exception as exc:
+        logger.exception("[BG_PREVIEW] enqueue failed for %s", job_id)
+        from jobs import update_job
+        update_job(job_id, status="bg_preview_failed", current_step="error",
+                   error=str(exc)[:300])
+        raise HTTPException(503, detail="Cola de pre-gen no disponible.")
+
+    return {
+        "bg_cache_key": bg_cache_key,
+        "cached": False,
+        "job_id": job_id,
+        "status": "bg_preview_queued",
+    }
+
+
+@app.get("/generate-preview-status/{job_id}")
+@limiter.limit("600/minute")
+async def generate_preview_status(
+    request: Request,
+    job_id: str,
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Polling endpoint para el frontend. Backoff típico 1.5s → 5s."""
+    try:
+        from jobs import get_job_model
+        job_row = get_job_model(db, job_id)
+        if (not job_row
+                or job_row.user_id != current_user["id"]
+                or job_row.tenant_id != current_user["tenant_id"]):
+            raise HTTPException(status_code=404, detail="Job not found.")
+        return {
+            "job_id": job_id,
+            "status": job_row.status or "",
+            "error": getattr(job_row, "error", None),
+        }
+    except HTTPException:
+        raise
+    except Exception as exc:
+        import traceback
+        logger.exception("[BG_PREVIEW_STATUS] job=%s 500: %s", job_id, exc)
+        raise HTTPException(
+            500,
+            detail=f"{type(exc).__name__}: {str(exc)[:200]}",
+        )
+
+
 # Deprecation metadata for the legacy multipart-form endpoints. RFC 8594
 # `Sunset` + RFC 9745 `Deprecation` so any tooling that monitors the API
 # (curl scripts, custom clients) gets a structured signal. Frontend now

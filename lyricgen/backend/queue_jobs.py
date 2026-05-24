@@ -419,6 +419,64 @@ def enqueue_transcription(
     return f"thread:transcribe:{job_id}"
 
 
+def enqueue_bg_preview(
+    job_id: str,
+    bg_cache_key: str,
+    params: dict,
+) -> str:
+    """Enqueue una pre-generación del background a la queue `bg_preview`.
+
+    Capa C del wizard refactor (2026-05-24): mientras el operador edita lyrics,
+    Veo/Imagen ya están generando el fondo. Cuando llega el POST /generate
+    "real", el video del background ya está cacheado en R2 y la pipeline lo
+    reusa — 0 cost extra y ~60-120s menos de wait perceptible.
+
+    Devuelve el RQ job id (o 'thread:bgpreview:<job_id>' en dev fallback sin
+    Redis). Ver bg_preview.py para el entry point del worker.
+
+    Tenant priority: por ahora todos en `bg_preview` queue (workers drenan
+    en orden FIFO). Si en el futuro UMG necesita priority, mover a
+    `enterprise_bg_preview` o similar.
+    """
+    _, q_default, _ = _init_redis()
+    if q_default is not None:
+        from rq import Queue, Retry
+        q = Queue("bg_preview", connection=_redis)
+        from bg_preview import run_bg_preview_job
+        timeout = int(os.environ.get("BG_PREVIEW_JOB_TIMEOUT", "300"))
+        # Veo es lento + hiccup-prone; 2 retries con 20s gap absorbe la
+        # mayoría de los rate-limits transitorios. Más allá de eso, el job
+        # marca status=bg_preview_failed y el frontend muestra el error.
+        retry = Retry(max=2, interval=20)
+        rq_job = q.enqueue(
+            run_bg_preview_job,
+            args=(job_id, bg_cache_key, params),
+            job_timeout=timeout,
+            result_ttl=RESULT_TTL,
+            failure_ttl=FAILURE_TTL,
+            job_id=f"bgpreview:{job_id}",
+            retry=retry,
+        )
+        return rq_job.id
+
+    if _ENVIRONMENT == "production":
+        logger.error(
+            "Refusing to enqueue bg_preview %s via thread fallback: Redis is "
+            "required in production but unreachable.", job_id,
+        )
+        raise RuntimeError(
+            "bg_preview queue unavailable: Redis is required in production."
+        )
+    from bg_preview import run_bg_preview_job
+    t = threading.Thread(
+        target=run_bg_preview_job,
+        args=(job_id, bg_cache_key, params),
+        daemon=True,
+    )
+    t.start()
+    return f"thread:bgpreview:{job_id}"
+
+
 def enqueue_prores_prewarm(job_id: str, file_type: str) -> str | None:
     """Schedule the ProRes transcode for `job_id` on the enterprise queue.
 
