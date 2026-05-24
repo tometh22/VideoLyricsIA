@@ -106,6 +106,18 @@ def run_transcription_job(
         import traceback
         tb = traceback.format_exc()
         logger.exception("[TRANSCRIBE-WORKER] job=%s failed", job_id)
+        # OBSERVABILITY (audit 2026-05-24): the orchestrator catches +
+        # re-raises, but worker process exceptions don't reach Sentry
+        # via FastAPI's auto-capture. Capture explicitly here so prod
+        # crashes are visible in the Sentry dashboard, not just stdout.
+        try:
+            import sentry_sdk
+            with sentry_sdk.push_scope() as scope:
+                scope.set_tag("job_id", job_id)
+                scope.set_tag("layer", "transcription_worker")
+                sentry_sdk.capture_exception(e)
+        except Exception:
+            pass  # never let Sentry failures break the error path
         # Persistir un sumario corto + tipo de excepción para diagnóstico
         # vía /transcription-status sin tener que pegarse al log container.
         err_msg = f"{type(e).__name__}: {str(e)[:200]}"

@@ -248,7 +248,7 @@ def transcribe_whisperx(audio_path: str, language: str | None = None) -> list[di
         return None
 
     try:
-        import replicate
+        import replicate  # noqa: F401 — used inside `call_with_budget`
     except ImportError:
         logger.warning("[WHISPERX] replicate SDK not installed — falling back")
         return None
@@ -256,11 +256,26 @@ def transcribe_whisperx(audio_path: str, language: str | None = None) -> list[di
     payload: dict = {"align_output": True}
     if language:
         payload["language"] = language
-    try:
-        with open(audio_path, "rb") as audio:
-            output = replicate.run(_MODEL, input={"audio_file": audio, **payload})
-    except Exception as e:  # network, billing, model error, anything
-        logger.warning("[WHISPERX] replicate call failed (%s) — falling back", e)
+
+    # OBSERVABILITY (audit 2026-05-24): whisperX USED to be a single
+    # `replicate.run(...)` with no budget cap. When Replicate degraded,
+    # the request could hang ~90 min before timing out — same shape as
+    # the forced_align bug fixed in PR #281 but on a different code
+    # path. Extracted to `replicate_budget.call_with_budget` so all
+    # three Replicate consumers (FA, demucs, whisperX) share the same
+    # bounded retry + typed-error short-circuit.
+    from replicate_budget import call_with_budget, _budget_for
+
+    def _input_factory():
+        return {"audio_file": open(audio_path, "rb"), **payload}
+
+    output = call_with_budget(
+        _MODEL, _input_factory,
+        total_budget_s=_budget_for("whisperx", default_s=480.0),
+        backoff=[0, 8, 24],
+        call_label="WHISPERX",
+    )
+    if output is None:
         return None
 
     segs = _map_segments(output)
