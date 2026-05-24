@@ -11,6 +11,7 @@
  * comes from telemetry medians, hard-coded here for now).
  */
 
+import { useEffect, useRef, useState } from "react";
 import useJobProgress from "../hooks/useJobProgress";
 
 // Map backend label keys → 1-based stage index (1..5). Anything 50-85% pct
@@ -79,8 +80,47 @@ export default function TranscribingProgress({
 }) {
   const { currentStep, progress } = useJobProgress(jobId, { api, token });
   const active = activeStageFromState(currentStep, progress);
-  const eta = etaSeconds(active, progress);
   const pct = Math.max(0, Math.min(100, Math.round(progress || 0)));
+
+  // INCIDENT (2026-05-24): the ETA used to display `etaSeconds(active,
+  // progress)` directly. That value is STATIC — it only changes when
+  // `progress` or `active` changes. A stuck job (backend not emitting
+  // updates) left the ETA frozen at the same number ("122s y no se
+  // mueve" was the operator's exact complaint). Two fixes:
+  //
+  // 1. Real countdown via `useState + setInterval`: decrement the
+  //    displayed ETA by 1 every second on the client. Re-syncs to
+  //    `etaSeconds(...)` whenever progress changes (so it never goes
+  //    out of sync with the real backend state for long).
+  //
+  // 2. Stuck detection: track the last time `progress` advanced. If
+  //    >= 45 s without movement, show a "Tardando más de lo normal"
+  //    hint — usually means Replicate is degraded. Operator at least
+  //    knows the system isn't lying.
+  const STUCK_AFTER_S = 45;
+  const [displayEta, setDisplayEta] = useState(() => etaSeconds(active, progress));
+  const [stuck, setStuck] = useState(false);
+  const lastProgressRef = useRef({ value: progress, t: Date.now() });
+
+  // Re-sync ETA + reset stuck timer whenever real progress moves.
+  useEffect(() => {
+    if (progress !== lastProgressRef.current.value) {
+      lastProgressRef.current = { value: progress, t: Date.now() };
+      setStuck(false);
+      setDisplayEta(etaSeconds(active, progress));
+    }
+  }, [progress, active]);
+
+  // 1-second tick: countdown the displayed ETA + flag stuck.
+  useEffect(() => {
+    if (active >= 5) return undefined;        // finalising — no countdown
+    const id = setInterval(() => {
+      setDisplayEta((prev) => Math.max(0, prev - 1));
+      const idle = (Date.now() - lastProgressRef.current.t) / 1000;
+      if (idle >= STUCK_AFTER_S) setStuck(true);
+    }, 1000);
+    return () => clearInterval(id);
+  }, [active]);
 
   return (
     <div className="w-full max-w-md mx-auto mt-12 animate-fade-in">
@@ -157,10 +197,18 @@ export default function TranscribingProgress({
         })}
       </ol>
 
-      {/* ETA */}
+      {/* ETA: client-side countdown (re-syncs on every progress move) */}
       {active < 5 && (
         <p className="text-[11px] text-gray-600 text-center mt-6">
-          {(t && t("transcribe.eta", { seconds: eta })) || `Tiempo restante: ~${eta}s`}
+          {(t && t("transcribe.eta", { seconds: displayEta })) || `Tiempo restante: ~${displayEta}s`}
+        </p>
+      )}
+      {/* Stuck hint: shown when backend hasn't moved progress for >= 45s.
+          Tells the operator the system isn't lying — Replicate is slow. */}
+      {stuck && active < 5 && (
+        <p className="text-[11px] text-amber-400/80 text-center mt-2">
+          {(t && t("transcribe.stuck")) ||
+            "Tardando más de lo normal. Esto suele ser un pico de carga en Replicate; refrescá en un minuto o cancelá y reintentá."}
         </p>
       )}
     </div>
