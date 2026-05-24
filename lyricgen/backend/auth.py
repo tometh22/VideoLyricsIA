@@ -16,23 +16,27 @@ from sqlalchemy.orm import Session
 from database import User, PasswordResetToken, EmailVerificationToken, get_db, utcnow
 
 # --- Plan definitions ---
+# bg_preview_enabled — gating del pre-render del fondo (Capa C, 2026-05-24).
+# Free OFF: cada preview descartado gasta $0.80-3.20 Veo. Para un trial que
+# toquetea opciones es bleeding puro. Paid ON: el preview ahorra 30-90s al
+# apretar "Crear video".
 PLANS = {
     "free": {"limit": 5, "price_per_video": 0, "overage_rate": 0, "monthly_price": 0,
-             "stripe_price_id": None},
+             "stripe_price_id": None, "bg_preview_enabled": False},
     "100": {"limit": 100, "price_per_video": 9.00, "overage_rate": 1.30, "monthly_price": 900,
-            "stripe_price_id": os.environ.get("STRIPE_PRICE_100")},
+            "stripe_price_id": os.environ.get("STRIPE_PRICE_100"), "bg_preview_enabled": True},
     # Plan "250": $8/video included in $2000/mo, with overage at $12/video
     # ($8 × 1.5). UMG-style B2B accounts opt into allow_overage so they
     # never get blocked at 250 — extra videos invoice out-of-band by
     # transfer.
     "250": {"limit": 250, "price_per_video": 8.00, "overage_rate": 1.50, "monthly_price": 2000,
-            "stripe_price_id": os.environ.get("STRIPE_PRICE_250")},
+            "stripe_price_id": os.environ.get("STRIPE_PRICE_250"), "bg_preview_enabled": True},
     "500": {"limit": 500, "price_per_video": 7.00, "overage_rate": 1.30, "monthly_price": 3500,
-            "stripe_price_id": os.environ.get("STRIPE_PRICE_500")},
+            "stripe_price_id": os.environ.get("STRIPE_PRICE_500"), "bg_preview_enabled": True},
     "1000": {"limit": 1000, "price_per_video": 6.00, "overage_rate": 1.30, "monthly_price": 6000,
-             "stripe_price_id": os.environ.get("STRIPE_PRICE_1000")},
+             "stripe_price_id": os.environ.get("STRIPE_PRICE_1000"), "bg_preview_enabled": True},
     "unlimited": {"limit": 999999, "price_per_video": 0, "overage_rate": 1.0, "monthly_price": 0,
-                  "stripe_price_id": None},
+                  "stripe_price_id": None, "bg_preview_enabled": True},
 }
 
 # --- Configuration (loaded from environment) ---

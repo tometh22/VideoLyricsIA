@@ -632,7 +632,7 @@ export default function EditRequestPanel({
               type="button"
               onClick={() => setBackgroundMode("veo")}
               disabled={submitting}
-              className={`flex-1 px-3 py-2 rounded-lg text-[11px] font-medium transition-colors flex flex-col items-center gap-0.5 ${
+              className={`flex-1 px-3 py-2 rounded-lg text-label transition-colors flex flex-col items-center gap-0.5 ${
                 backgroundMode === "veo"
                   ? "bg-brand/20 text-brand-light ring-1 ring-brand/30"
                   : "text-ink-secondary hover:text-white hover:bg-white/[0.04]"
@@ -653,7 +653,7 @@ export default function EditRequestPanel({
               type="button"
               onClick={() => setBackgroundMode("imagen")}
               disabled={submitting}
-              className={`flex-1 px-3 py-2 rounded-lg text-[11px] font-medium transition-colors flex flex-col items-center gap-0.5 ${
+              className={`flex-1 px-3 py-2 rounded-lg text-label transition-colors flex flex-col items-center gap-0.5 ${
                 backgroundMode === "imagen"
                   ? "bg-brand/20 text-brand-light ring-1 ring-brand/30"
                   : "text-ink-secondary hover:text-white hover:bg-white/[0.04]"
@@ -687,7 +687,7 @@ export default function EditRequestPanel({
                   type="button"
                   disabled={submitting}
                   onClick={() => setMovementStyle(m.code)}
-                  className={`px-2.5 py-1.5 rounded-lg text-[11px] font-medium transition-colors ${
+                  className={`px-2.5 py-1.5 rounded-lg text-label transition-colors ${
                     movementStyle === m.code
                       ? "bg-brand/20 text-brand-light ring-1 ring-brand/30"
                       : "text-ink-secondary hover:text-white hover:bg-white/[0.04]"

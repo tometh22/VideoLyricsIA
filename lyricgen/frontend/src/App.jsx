@@ -21,6 +21,7 @@ import JobDetail from "./components/JobDetail";
 import Settings from "./components/Settings";
 import AdminPanel from "./components/AdminPanel";
 import { useAlert } from "./components/AlertProvider";
+import { useBackgroundPreview } from "./hooks/useBackgroundPreview";
 
 const API = import.meta.env.VITE_API_URL || "";
 
@@ -376,6 +377,15 @@ export default function App() {
   const [approvedJobs, setApprovedJobs] = useState([]);
   const [transcribing, setTranscribing] = useState(false);
   const [transcribeError, setTranscribeError] = useState(null);
+  // Capa B 2026-05-24 — wizardStage es la única fuente de verdad de qué muestra
+  // el wizard. Reemplaza el `navigate("/review")` que disparaba el flash a
+  // dashboard. URL se queda en /new mientras el operador transita upload →
+  // review → ready_to_generate. La navegación a /generating sigue siendo
+  // legítima (pantalla dedicada de progreso del batch). Valores:
+  //   "upload"            → UploadZone (drop archivos + opciones).
+  //   "review"            → spinner de transcribiendo / LyricsEditor inline.
+  //   "ready_to_generate" → resumen + botón "Crear N videos".
+  const [wizardStage, setWizardStage] = useState("upload");
   // {phase: "uploading"|"transcribing", loaded, total} during the
   // upload→whisper handoff. Drives the progress bar in /review.
   const [transcribeProgress, setTranscribeProgress] = useState(null);
@@ -409,6 +419,11 @@ export default function App() {
   const [resetToken, setResetToken] = useState(null);
   const [billingSuccess, setBillingSuccess] = useState(false);
   const pollingIntervals = useRef(new Set());
+  // R-FRONT-5 (Frontend specialist 2026-05-24): isMountedRef previene
+  // setState-on-unmounted warnings + memory leaks cuando el operador
+  // navega away durante un SSE/polling en curso. Cada callback async
+  // chequea esto antes de tocar state.
+  const isMountedRef = useRef(true);
   // 2 concurrent workers: enough to keep the queue fed without spiking
   // the API with 5 simultaneous upload-url+generate calls from one user.
   const PARALLEL_WORKERS = 2;
@@ -444,8 +459,11 @@ export default function App() {
       wizardPersistence.clear();
       return;
     }
-    wizardPersistence.save({ files, approvedJobs, currentReview, reviewQueue });
-  }, [files, approvedJobs, currentReview, reviewQueue]);
+    // Capa B 2026-05-24: persist wizardStage para que un refresh durante
+    // review NO te tire de vuelta al state "upload". El snap.load() lo
+    // rehidrata en el useEffect de mount.
+    wizardPersistence.save({ files, approvedJobs, currentReview, reviewQueue, wizardStage });
+  }, [files, approvedJobs, currentReview, reviewQueue, wizardStage]);
 
   // beforeunload warning — covers closing the tab, refreshing, or
   // navigating to an external URL. LyricsEditor already has its own
@@ -486,15 +504,18 @@ export default function App() {
       setReviewQueue((snap.reviewQueue || []).map(wizardPersistence.rehydrateQueueEntry));
       setApprovedJobs((snap.approvedJobs || []).map(wizardPersistence.rehydrateQueueEntry));
       setCurrentReview(wizardPersistence.rehydrateReview(snap.currentReview));
+      // Capa B 2026-05-24: restaurar wizardStage para que /new renderice
+      // el reviewScreen content si el operador estaba mid-review al refresh.
+      // Default "upload" si el snap es viejo (sin wizardStage) o si no hay
+      // currentReview/approved (sólo files staged).
+      const resumedStage = snap.wizardStage
+        || ((snap.currentReview || (snap.approvedJobs?.length || 0) > 0) ? "review" : "upload");
+      setWizardStage(resumedStage);
       setResumableWizard(null);
-      // If we have a draft in progress → /review. If only approved jobs
-      // (came back between songs) → /review too, lets handleBackInReview
-      // pop the last one. If only files staged → /new for re-upload.
-      if (snap.currentReview || (snap.approvedJobs?.length || 0) > 0) {
-        navigate("/review");
-      } else {
-        navigate("/new");
-      }
+      // Capa B: una sola ruta destino — /new — con wizardStage indicando
+      // qué content mostrar inline. Antes navegábamos a /review cuando había
+      // currentReview/approved, ahora /new lo hace todo via wizardScreen.
+      navigate("/new");
     } finally {
       // Defer flag flip past the React commit so the persistence useEffect
       // runs once with the FULLY restored state and writes a fresh snapshot.
@@ -637,6 +658,7 @@ export default function App() {
         const cleanup = () => { es.close(); pollingIntervals.current.delete(es); };
         pollingIntervals.current.add(es);
         es.onmessage = (e) => {
+          if (!isMountedRef.current) { cleanup(); return; }
           try {
             const data = JSON.parse(e.data);
             setJobs((prev) => prev.map((j) =>
@@ -649,7 +671,7 @@ export default function App() {
             ));
             if (TERMINAL.has(data.status)) {
               cleanup();
-              fetchHistory();
+              if (isMountedRef.current) fetchHistory();
               resolve(data.status);
             }
           } catch {}
@@ -666,6 +688,12 @@ export default function App() {
       function startPolling() {
         const iv = setInterval(async () => {
           if (typeof document !== "undefined" && document.hidden) return;
+          if (!isMountedRef.current) {
+            clearInterval(iv);
+            pollingIntervals.current.delete(iv);
+            resolve("aborted");
+            return;
+          }
           if (!getToken()) {
             clearInterval(iv);
             pollingIntervals.current.delete(iv);
@@ -683,6 +711,12 @@ export default function App() {
             }
             if (!res.ok) return;
             const data = await res.json();
+            if (!isMountedRef.current) {
+              clearInterval(iv);
+              pollingIntervals.current.delete(iv);
+              resolve("aborted");
+              return;
+            }
             setJobs((prev) => prev.map((j) =>
               j.job_id === jobId
                 ? { ...j, status: data.status, current_step: data.current_step,
@@ -694,7 +728,7 @@ export default function App() {
             if (TERMINAL.has(data.status)) {
               clearInterval(iv);
               pollingIntervals.current.delete(iv);
-              fetchHistory();
+              if (isMountedRef.current) fetchHistory();
               resolve(data.status);
             }
           } catch {}
@@ -706,6 +740,10 @@ export default function App() {
   }, [fetchHistory, handleLogout]);
 
   useEffect(() => () => {
+    // R-FRONT-5: marca unmounted ANTES de cerrar handles para que
+    // cualquier callback async en flight (SSE messages bufferadas, polls
+    // ya disparados) salga temprano vía el guard sin tocar state.
+    isMountedRef.current = false;
     pollingIntervals.current.forEach((handle) => {
       if (handle && typeof handle.close === "function") handle.close();
       else clearInterval(handle);
@@ -772,8 +810,29 @@ export default function App() {
   // 2026-05-23: refactor a backend async. La respuesta del POST es ahora
   // {job_id, status: "transcribing_queued"} — hay que pollear /status hasta
   // que llegue a "transcribed" para obtener segments + reference_lyrics.
+  // R-FRONT-3 (review specialist 2026-05-24): cost-leak prevention en
+  // handleReset. Sin esto, las transcripciones encoladas en background
+  // seguían drenando Whisper + R2 cuando el operador cancelaba el batch.
+  // Conservador: solo abortamos LOOP ITERATIONS (no requests en progreso —
+  // requeriría signal en uploadFileToR2 + authFetchWithRetryOn503, que es
+  // refactor invasivo). El próximo iteration ve aborted=true y rompe.
+  const prefetchAbortRef = useRef(null);
+  if (prefetchAbortRef.current === null) {
+    prefetchAbortRef.current = new AbortController();
+  }
+
   const prefetchRemaining = useCallback(async (queue, fromIdx) => {
+    // Snapshot del controller actual al arrancar el loop. Si handleReset
+    // crea uno nuevo entremedio, esta closure sigue revisando el viejo
+    // (que YA está abortado) y rompe limpio.
+    const controller = prefetchAbortRef.current;
     for (let idx = fromIdx; idx < queue.length; idx++) {
+      if (controller && controller.signal.aborted) {
+        // handleReset disparó abort — paramos el prefetch loop. Los
+        // requests en flight se completan (sin signal) pero el siguiente
+        // iter NO arranca.
+        break;
+      }
       if (prefetchCache.current[idx]) continue;
       prefetchCache.current[idx] = { status: "loading" };
       const entry = queue[idx];
@@ -782,6 +841,9 @@ export default function App() {
         setRowStatus(file, "uploading");
         const { jobId } = await uploadFileToR2(file, {
           meta: { artist: entry.artist || "", title: (entry.songTitle || "").trim() },
+          // R-FRONT-3 end-to-end: si handleReset abort, la upload se corta
+          // en la mitad del multipart en vez de seguir hasta terminar.
+          signal: controller && controller.signal,
         });
         setRowStatus(file, "queued");
         const res = await authFetchWithRetryOn503(`${API}/transcribe-uploaded`, {
@@ -793,6 +855,7 @@ export default function App() {
             artist: entry.artist || "",
             title: (entry.songTitle || "").trim(),
           }),
+          signal: controller && controller.signal,
         }, { maxRetries: 3 });
         if (!res.ok) {
           prefetchCache.current[idx] = { status: "error" };
@@ -814,7 +877,13 @@ export default function App() {
         } else {
           prefetchCache.current[idx] = { status: "error" };
         }
-      } catch {
+      } catch (err) {
+        // R-FRONT-3 e2e: handleReset disparó abort. Salimos clean del
+        // loop sin marcar "error" (no es un fallo real — es cancelación).
+        if (err && (err.name === "AbortError" || (controller && controller.signal.aborted))) {
+          prefetchCache.current[idx] = { status: "aborted" };
+          break;
+        }
         prefetchCache.current[idx] = { status: "error" };
         setRowStatus(file, "error");
       }
@@ -848,8 +917,17 @@ export default function App() {
   // de orden — y no lo cambiamos entre upload y review.
   const handleStartReview = async () => {
     if (!files.length || !files.every((f) => f.artist.trim())) return;
+    // Capa B 2026-05-24 — antes navegábamos a /review (que disparaba un flash
+    // a dashboard por una race con el guard del fallback). Capa A lo
+    // mitigó con setTranscribing(true) sync, pero el URL change seguía
+    // sucediendo (visualmente "salta" de wizard a otra pantalla aunque
+    // el chrome sea igual). Capa B: no navegamos — wizardStage="review"
+    // hace que /new renderice el reviewScreen content INLINE. El operador
+    // ve transición continua, no jump de ruta.
     setReviewQueue([...files]);
-    navigate("/review");
+    setTranscribing(true);
+    setTranscribeError(null);
+    setWizardStage("review");
     transcribeNext([...files], 0);
   };
 
@@ -1053,6 +1131,10 @@ export default function App() {
       textContrast: r.textContrast || "medium",
       segments: editedSegments,
       transcribeJobId: r.transcribeJobId || null,
+      // Capa C 2026-05-24: bgCacheKey viene del useBackgroundPreview hook
+      // que corrió durante review. Si null = no se hizo pre-gen (free-tier
+      // o params no estables); pipeline corre Veo/Imagen como siempre.
+      bgCacheKey: r.bgCacheKey || null,
     }];
     setApprovedJobs(newApproved);
     setCurrentReview(null);
@@ -1136,6 +1218,12 @@ export default function App() {
         formData.append("text_contrast", jobList[i].textContrast || "medium");
         if (animateImage && backgroundFile) formData.append("animate_image", "true");
         formData.append("match_lyrics", String(!!inspiredByLyrics));
+        // Capa C 2026-05-24 — si el operador hizo pre-gen del background
+        // mientras editaba lyrics (POST /generate-preview), el hash del
+        // cache va acá. Backend skip Veo/Imagen si el cache hit.
+        if (jobList[i].bgCacheKey) {
+          formData.append("bg_cache_key", jobList[i].bgCacheKey);
+        }
         formData.append("segments_json", JSON.stringify(jobList[i].segments));
         formData.append("delivery_profile", delivery.delivery_profile);
         if (delivery.delivery_profile !== "youtube") {
@@ -1323,9 +1411,15 @@ export default function App() {
     pollingIntervals.current.forEach((iv) => clearInterval(iv));
     pollingIntervals.current.clear();
     prefetchCache.current = {};
+    // R-FRONT-3: abortamos el prefetch loop (el siguiente iter se rompe).
+    // Después creamos un controller fresco para el próximo batch del operador.
+    try { prefetchAbortRef.current && prefetchAbortRef.current.abort(); } catch {}
+    prefetchAbortRef.current = new AbortController();
     setFiles([]); setJobs([]); setBackgroundFile(null); setBackgroundId(null);
     setReviewQueue([]); setCurrentReview(null); setApprovedJobs([]);
     setTranscribing(false); setReadyToGenerate(false); setTranscribeError(null);
+    // Capa B 2026-05-24: el wizard descartó todo → vuelve al upload state.
+    setWizardStage("upload");
     navigate("/dashboard");
     fetchHistory();
   };
@@ -1371,11 +1465,17 @@ export default function App() {
     setReviewQueue([]);
     setTranscribing(false);
     setTranscribeError(null);
-    navigate("/new");
+    // Capa B 2026-05-24: la primer canción canceló review → vuelve al upload
+    // INLINE (no navega). El operador ve la file list de nuevo, conserva su
+    // configuración. Si quería tirar todo, usa Cancelar (handleReset).
+    setWizardStage("upload");
   };
 
   const handleGenerateBatch = () => {
     setReadyToGenerate(false);
+    // No tocamos wizardStage acá — startGenerationWithSegments navega a
+    // /generating (pantalla dedicada de progreso). El wizard queda
+    // "stale" pero handleReset lo limpia cuando el operator vuelve.
     startGenerationWithSegments(approvedJobs);
   };
 
@@ -1463,6 +1563,59 @@ export default function App() {
   };
 
   const allHaveArtist = files.length > 0 && files.every((f) => f.artist.trim());
+
+  // Capa C 2026-05-24 — dispara pre-gen del background apenas el operador
+  // entra a review (transcribiendo o editando lyrics), con debounce 2s
+  // sobre cambios de los params. Cuando termina, persiste bgCacheKey en
+  // currentReview; el handleApproveLyrics lo pasa a approvedJobs; el
+  // POST /generate lo manda como Form field.
+  // Sólo cuando hay currentReview Y artist+songTitle filled.
+  // Forwarded params usan style/customColors globales del wizard (no per-file).
+  const previewEntry = currentReview ? {
+    ...currentReview,
+    style,                   // batch-level
+    customColors,            // batch-level
+    backgroundMode: "veo",
+    animateImage: animateImage && !!backgroundFile,
+    matchLyrics: inspiredByLyrics,
+  } : null;
+  // bgPreview se invoca por side-effect (POST + polling). El status/error
+  // está en el return por si en el futuro mostramos un badge "Fondo:
+  // generando…" en el editor. Hoy se persiste sólo via onCacheKey →
+  // currentReview.bgCacheKey, y el handleApproveLyrics lo copia a
+  // approvedJobs para mandarlo al POST /generate.
+  // bgPreview alimenta:
+  //   - onCacheKey → currentReview.bgCacheKey + approvedJobs (race fix R-FRONT-2).
+  //   - bgPreview.status → chip subtle "Fondo: generando…" en LyricsEditor
+  //     (UX specialist 2026-05-24, cierra el mental-model gap de pre-gen invisible).
+  const bgPreview = useBackgroundPreview(previewEntry, {
+    enabled: !!currentReview,
+    api: API,
+    authHeaders,
+    onCacheKey: (key) => {
+      // Update currentReview si aún estamos editando ese file.
+      setCurrentReview((r) => (r ? { ...r, bgCacheKey: key } : r));
+      // R-FRONT-2 (2026-05-24): si el operador aprobó ANTES que el preview
+      // terminara (review rápido < 30s), currentReview ya es null. El cache
+      // key se hubiera perdido y POST /generate correría Veo de vuelta.
+      // Actualizamos approvedJobs también, matcheando por filename.
+      setApprovedJobs((prev) => {
+        if (!prev || prev.length === 0) return prev;
+        const target = previewEntry?.file?.name;
+        if (!target) return prev;
+        let changed = false;
+        const next = prev.map((j) => {
+          if (j.bgCacheKey === key) return j;
+          if (j.file && j.file.name === target) {
+            changed = true;
+            return { ...j, bgCacheKey: key };
+          }
+          return j;
+        });
+        return changed ? next : prev;
+      });
+    },
+  });
 
   // --- Per-route screens (kept inline so they share App-level state) ---
 
@@ -1563,7 +1716,7 @@ export default function App() {
     </div>
   );
 
-  // /review handles three sub-states: spinner while transcribing,
+  // /review handles three sub-states (transcribing spinner, LyricsEditor,
   // LyricsEditor when a song is ready to review, and the batch summary
   // before launching generation. Empty state → redirect home.
   const reviewScreen = (() => {
@@ -1684,6 +1837,10 @@ export default function App() {
             onContrastChange={(c) => setCurrentReview((r) => (r ? { ...r, textContrast: c } : r))}
             onAnimationChange={(c) => setCurrentReview((r) => (r ? { ...r, lyricsAnimation: c } : r))}
             onLineTransitionChange={(c) => setCurrentReview((r) => (r ? { ...r, lineTransition: c } : r))}
+            // UX specialist 2026-05-24: chip de status del pre-gen del
+            // fondo. Status posibles: "idle" | "queued" | "generating" |
+            // "done" | "error" | "disabled" (free-tier plan-tier guard).
+            bgStatus={bgPreview.status}
           />
         </div>
       );
@@ -1727,9 +1884,37 @@ export default function App() {
         </div>
       );
     }
-    // No batch in flight → redirect home (e.g. user refreshed during /review).
-    return <Navigate to="/dashboard" replace />;
+    // Empty state — el operador llegó a /review sin estado (deep-link, refresh
+    // sin sessionStorage, o transición rota). En vez de redirigir silencioso a
+    // dashboard (race condition reportada 2026-05-24: el redirect se disparaba
+    // por el primer render asíncrono de handleStartReview), mostramos un
+    // fallback explícito con CTA para que el operador sepa qué pasó.
+    return (
+      <div className="w-full max-w-md mx-auto animate-fade-in text-center py-16">
+        <div className="w-14 h-14 mx-auto mb-4 rounded-2xl bg-amber-500/10 flex items-center justify-center">
+          <svg className="w-7 h-7 text-amber-400" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
+            <circle cx="12" cy="12" r="10" />
+            <path d="M12 8v4M12 16h.01" strokeLinecap="round" />
+          </svg>
+        </div>
+        <h2 className="text-xl font-bold mb-2">{t("review.empty_title") || "No hay sesión activa"}</h2>
+        <p className="text-sm text-gray-500 mb-6">
+          {t("review.empty_subtitle") ||
+            "Probablemente refrescaste la página o el enlace es directo. Volvé al panel para empezar de nuevo."}
+        </p>
+        <button onClick={() => navigate("/dashboard")} className="btn-primary">
+          {t("review.empty_cta") || "Volver al panel"}
+        </button>
+      </div>
+    );
   })();
+
+  // Capa B 2026-05-24 — wizardScreen es lo que /new (y /review por compat)
+  // renderizan. Conmuta entre upload y review/ready_to_generate según
+  // wizardStage. NO hay navigate entre rutas durante el flow normal — el
+  // operador queda en /new desde drop hasta clickear "Crear video"
+  // (legítimo navigate a /generating).
+  const wizardScreen = wizardStage === "upload" ? newBatchScreen : reviewScreen;
 
   const generatingScreen = jobs.length > 0
     ? (
@@ -1822,8 +2007,12 @@ export default function App() {
               onViewHistory={() => navigate("/videos")}
             />
           } />
-          <Route path="/new" element={newBatchScreen} />
-          <Route path="/review" element={reviewScreen} />
+          {/* Capa B 2026-05-24 — /new y /review renderizan el MISMO content
+              (wizardScreen) que conmuta upload ↔ review ↔ ready_to_generate
+              vía wizardStage. /review se mantiene como ruta válida sólo para
+              compat con bookmarks viejos; URL nueva canónica es /new. */}
+          <Route path="/new" element={wizardScreen} />
+          <Route path="/review" element={wizardScreen} />
           <Route path="/generating" element={generatingScreen} />
           <Route path="/videos" element={
             <HistoryView

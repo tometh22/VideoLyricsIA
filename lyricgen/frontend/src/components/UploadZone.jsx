@@ -936,7 +936,7 @@ export default function UploadZone({
                   )}
                 </div>
                 <div className="px-2 py-1.5 bg-surface-1">
-                  <p className={`text-[11px] font-medium leading-tight ${active ? "text-white" : "text-gray-200"}`}>{e.label}</p>
+                  <p className={`text-label leading-tight ${active ? "text-white" : "text-gray-200"}`}>{e.label}</p>
                 </div>
               </button>
             );
@@ -1400,7 +1400,7 @@ export default function UploadZone({
                     onBackgroundId?.(null);
                   }
                 }}
-                className={`px-4 py-1.5 rounded-lg text-[11px] font-medium transition-all ${
+                className={`px-4 py-1.5 rounded-lg text-label transition-all ${
                   bgMode === m.id ? "bg-brand text-white" : "text-gray-400 hover:text-white"
                 }`}
               >
@@ -1467,7 +1467,7 @@ export default function UploadZone({
                           key={f.id}
                           type="button"
                           onClick={() => setLibraryFilter(f.id)}
-                          className={`flex items-center gap-2 h-8 px-3 rounded-full text-[11px] font-medium transition-all ${
+                          className={`flex items-center gap-2 h-8 px-3 rounded-full text-label transition-all ${
                             libraryFilter === f.id
                               ? "bg-brand/15 text-brand-light ring-1 ring-brand/40"
                               : "bg-surface-2/40 text-ink-secondary ring-1 ring-white/[0.04] hover:ring-white/[0.08] hover:text-white"
@@ -1528,7 +1528,7 @@ export default function UploadZone({
                               )}
                             </div>
                             <div className="px-3 py-2">
-                              <p className="text-[12px] text-white truncate">{bg.name}</p>
+                              <p className="text-caption text-white truncate">{bg.name}</p>
                             </div>
                           </button>
                         );
@@ -1551,7 +1551,7 @@ export default function UploadZone({
                               key={m.id}
                               type="button"
                               onClick={() => onBackgroundMode?.(m.id)}
-                              className={`h-8 px-3 rounded-full text-[11px] font-medium transition-all ${
+                              className={`h-8 px-3 rounded-full text-label transition-all ${
                                 backgroundMode === m.id
                                   ? "bg-brand/15 text-brand-light ring-1 ring-brand/40"
                                   : "bg-surface-2/40 text-ink-secondary ring-1 ring-white/[0.04] hover:ring-white/[0.08] hover:text-white"
@@ -1793,7 +1793,7 @@ export default function UploadZone({
                         rows={3}
                         maxLength={2000}
                         placeholder={t("upload.bg_prompt_placeholder") || "Ej: mansión surreal de noche, pileta vacía, cámara fija, sólo se mueve el reflejo del agua…"}
-                        className="w-full text-[12px] rounded-lg bg-surface-1 border border-white/[0.08] focus:border-brand/50 px-3 py-2 text-gray-200 placeholder:text-gray-600 resize-y outline-none"
+                        className="w-full text-caption rounded-lg bg-surface-1 border border-white/[0.08] focus:border-brand/50 px-3 py-2 text-gray-200 placeholder:text-gray-600 resize-y outline-none"
                       />
                       <label className="mt-2 flex items-center gap-2.5 cursor-pointer">
                         <input
@@ -1840,7 +1840,7 @@ export default function UploadZone({
                             key={s.code}
                             type="button"
                             onClick={() => onStyleChange(s.code)}
-                            className={`flex flex-col items-center gap-2 px-2 py-2.5 rounded-xl border text-[11px] font-medium transition-all duration-200
+                            className={`flex flex-col items-center gap-2 px-2 py-2.5 rounded-xl border text-label transition-all duration-200
                               ${style === s.code
                                 ? "border-brand/50 text-white ring-1 ring-brand/40 scale-[1.02]"
                                 : "border-white/[0.06] text-gray-400 hover:border-white/[0.16] hover:text-white"
@@ -1990,7 +1990,7 @@ export default function UploadZone({
                           )}
                         </div>
                         <div className="px-2 py-1.5 bg-surface-1">
-                          <p className={`text-[11px] font-medium leading-tight ${active ? "text-white" : "text-gray-200"}`}>{tr.label}</p>
+                          <p className={`text-label leading-tight ${active ? "text-white" : "text-gray-200"}`}>{tr.label}</p>
                         </div>
                       </button>
                     );

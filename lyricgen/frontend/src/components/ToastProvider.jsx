@@ -100,7 +100,7 @@ export function ToastProvider({ children }) {
           <div
             key={t.id}
             className={
-              "pointer-events-auto rounded-xl ring-1 px-3.5 py-2.5 text-[12px] " +
+              "pointer-events-auto rounded-xl ring-1 px-3.5 py-2.5 text-caption " +
               "leading-snug shadow-lg backdrop-blur-md max-w-[320px] " +
               "animate-in fade-in slide-in-from-bottom-2 duration-200 " +
               (TONE_STYLES[t.tone] || TONE_STYLES.info)
