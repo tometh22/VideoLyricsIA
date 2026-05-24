@@ -41,12 +41,42 @@ function StatusBadge({ status, t }) {
     // un render colgado — antes caía al default "Procesando" y parecía
     // trabado. Estilo neutro (no spinner) para distinguirlo de un render.
     transcribed_pending: { label: t("history.draft") || "Sin generar",       cls: "bg-surface-3/60 text-ink-secondary ring-1 ring-white/[0.06] border border-dashed border-white/10" },
+    // INCIDENT (audit 2026-05-24): historical jobs with `transcribed`,
+    // `transcribing`, `transcribing_queued` weren't in the map → all
+    // fell through to "Procesando", making 60 stale drafts look like
+    // 60 stuck renders. The "Procesando" UI also lacks a "click to
+    // continue" affordance — operator thought he had to wait for
+    // hours.
+    //
+    // `transcribed` = transcripción terminó, operador NO dió "Generar
+    // video". Es un draft listo para editar, no un render en curso.
+    // Mismo estilo que `transcribed_pending` (dashed border, neutral)
+    // pero etiqueta distinta para distinguir "subida en curso" de
+    // "ya transcripto, abre y editá".
+    transcribed:        { label: "Listo p/ editar",                        cls: "bg-surface-3/60 text-ink-secondary ring-1 ring-white/[0.06] border border-dashed border-white/10" },
+    transcribing:       { label: "Transcribiendo…",                        cls: "bg-brand/15 text-brand-light ring-1 ring-brand/30" },
+    transcribing_queued: { label: "En cola",                                cls: "bg-surface-3/60 text-ink-secondary ring-1 ring-white/[0.06]" },
+    transcription_failed: { label: t("history.error") || "Error transcribiendo", cls: "bg-red-500/15 text-red-300 ring-1 ring-red-500/30" },
     awaiting_upload:    { label: t("history.uploading") || "Subiendo…",      cls: "bg-surface-3/60 text-ink-secondary ring-1 ring-white/[0.06]" },
     editing:            { label: t("history.editing") || "Re-renderizando", cls: "bg-brand/15 text-brand-light ring-1 ring-brand/30" },
     error:              { label: t("history.error"),                      cls: "bg-red-500/15 text-red-300 ring-1 ring-red-500/30" },
     validation_failed:  { label: t("batch.validation_failed") || "Failed", cls: "bg-red-500/15 text-red-300 ring-1 ring-red-500/30" },
+    rejected:           { label: "Rechazado",                              cls: "bg-red-500/15 text-red-300 ring-1 ring-red-500/30" },
+    // bg_preview ghost jobs (Capa C feature) — no audio, no video.
+    // Should NOT appear in the user's history normally (filter elsewhere),
+    // but if one does, label honestly instead of falling through to
+    // "Procesando".
+    bg_preview_queued:  { label: "Pre-render BG",                          cls: "bg-surface-3/60 text-ink-secondary ring-1 ring-white/[0.06]" },
+    bg_preview_failed:  { label: "Pre-render falló",                       cls: "bg-red-500/15 text-red-300 ring-1 ring-red-500/30" },
   };
-  const cfg = map[status] || map.processing;
+  // Honest fallback: instead of pretending an unknown status is
+  // "Procesando", show the raw value in muted gray so the operator
+  // can report a real string back. Caught 19/60 mislabeled jobs on
+  // staging 2026-05-24.
+  const cfg = map[status] || {
+    label: status || "Desconocido",
+    cls: "bg-surface-3/40 text-ink-secondary/60 ring-1 ring-white/[0.04]",
+  };
   return (
     <span className={`inline-flex items-center px-2 py-0.5 rounded-full text-[10px] font-medium backdrop-blur-md ${cfg.cls}`}>
       {cfg.label}
@@ -215,9 +245,16 @@ function VideoCard({ job, onSelect, onDelete, selected, onToggleSelect, t }) {
 const FILTERS = [
   { id: "all",     label: "Todos",     match: () => true },
   { id: "done",    label: "Listos",    match: (j) => j.status === "done" },
-  { id: "pending", label: "Pendientes", match: (j) => j.status === "pending_review" },
-  { id: "active",  label: "En curso",  match: (j) => j.status === "processing" || j.status === "queued" || j.status === "editing" },
-  { id: "failed",  label: "Fallidos",  match: (j) => j.status === "error" || j.status === "validation_failed" },
+  // "Pendientes" now includes BOTH the broadcast-review queue
+  // (pending_review) AND drafts the operator finished transcribing but
+  // hasn't generated yet (transcribed / transcribed_pending). Pre-fix
+  // those drafts were invisible — bucketed as "Procesando" with no
+  // affordance to act on them.
+  { id: "pending", label: "Pendientes", match: (j) => j.status === "pending_review" || j.status === "transcribed" || j.status === "transcribed_pending" },
+  // "En curso" includes ACTIVE work the user can't yet act on:
+  // transcription in flight, render in flight, edits being re-rendered.
+  { id: "active",  label: "En curso",  match: (j) => j.status === "processing" || j.status === "queued" || j.status === "editing" || j.status === "transcribing" || j.status === "transcribing_queued" || j.status === "awaiting_upload" },
+  { id: "failed",  label: "Fallidos",  match: (j) => j.status === "error" || j.status === "validation_failed" || j.status === "transcription_failed" || j.status === "rejected" },
 ];
 
 export default function HistoryView({
