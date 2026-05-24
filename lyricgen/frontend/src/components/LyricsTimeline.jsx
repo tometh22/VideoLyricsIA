@@ -283,7 +283,7 @@ export default function LyricsTimeline({
           </div>
           <button
             onClick={onReset}
-            className="text-[11px] font-medium px-2.5 py-1 rounded-md text-ink-secondary
+            className="text-label px-2.5 py-1 rounded-md text-ink-secondary
               ring-1 ring-white/[0.08] hover:ring-white/20 hover:text-white transition-colors flex items-center gap-1.5"
             title="Volver los timings al estado original"
           >

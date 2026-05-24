@@ -303,6 +303,9 @@ const translations = {
 
     // Lyrics editor
     "editor.title": "Revisar lyrics",
+    "editor.bg_generating": "Generando fondo en background…",
+    "editor.bg_done": "Fondo listo",
+    "editor.bg_error": "El fondo se generará al apretar Crear video",
     "editor.suggestions": "sugerencias de corrección",
     "editor.apply_all": "Aplicar todas",
     "editor.approve_next": "Aprobar y siguiente",
@@ -1206,6 +1209,9 @@ const translations = {
     "lang.de": "Deutsch",
 
     "editor.title": "Review lyrics",
+    "editor.bg_generating": "Generating background…",
+    "editor.bg_done": "Background ready",
+    "editor.bg_error": "Background will be generated when you click Create video",
     "editor.suggestions": "correction suggestions",
     "editor.apply_all": "Apply all",
     "editor.approve_next": "Approve & next",
@@ -1942,6 +1948,9 @@ const translations = {
     "lang.de": "Deutsch",
 
     "editor.title": "Revisar lyrics",
+    "editor.bg_generating": "Gerando fundo em background…",
+    "editor.bg_done": "Fundo pronto",
+    "editor.bg_error": "O fundo será gerado ao clicar em Criar vídeo",
     "editor.suggestions": "sugestões de correção",
     "editor.apply_all": "Aplicar todas",
     "editor.approve_next": "Aprovar e próximo",

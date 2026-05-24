@@ -63,6 +63,13 @@ export default {
         body: ["19px", { lineHeight: "1.6" }],
         // Small UI: 14-15px (default 14).
         ui:   ["14px", { lineHeight: "1.45" }],
+        // UI specialist 2026-05-24: tokens semánticos para reemplazar los
+        // arbitrary `text-[10px]`/`text-[11px]`/`text-[12px]` esparcidos
+        // (172+ matches). Usar SIEMPRE estos tokens en componentes nuevos;
+        // los arbitrary se irán migrando.
+        caption: ["12px", { lineHeight: "1.4" }],
+        label:   ["11px", { lineHeight: "1.4", fontWeight: "500" }],
+        section: ["10px", { lineHeight: "1.3", fontWeight: "600", letterSpacing: "0.18em" }],
       },
       // §8 Cards — border-radius 24px → rounded-card. We add a token
       // rather than redefining `rounded-2xl` (Tailwind default = 16px)

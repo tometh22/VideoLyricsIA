@@ -351,7 +351,7 @@ export default function HistoryView({
           <div className="flex items-center gap-3 min-w-0">
             <button
               onClick={selectAllVisible}
-              className="text-[11px] font-medium text-brand hover:text-brand-light transition-colors flex items-center gap-1.5 shrink-0"
+              className="text-label text-brand hover:text-brand-light transition-colors flex items-center gap-1.5 shrink-0"
             >
               <span className={`w-4 h-4 rounded border-2 flex items-center justify-center transition-colors
                 ${allVisibleSelected ? "bg-brand border-brand" : "border-white/30 hover:border-brand/70"}`}>
@@ -381,7 +381,7 @@ export default function HistoryView({
               </button>
               <button
                 onClick={handleBulkDelete}
-                className="text-[11px] font-medium px-3 py-1.5 rounded-lg bg-red-500/15 text-red-300
+                className="text-label px-3 py-1.5 rounded-lg bg-red-500/15 text-red-300
                   ring-1 ring-red-500/30 hover:bg-red-500/25 transition-colors"
               >
                 {t("history.delete_selected") || `Eliminar ${selectedCount}`}

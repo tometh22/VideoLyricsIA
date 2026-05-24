@@ -211,7 +211,7 @@ export default function WizardLivePreview({ style = "auto", customColors = "", m
         {t("upload.preview_live") || "Preview"}
       </div>
       {/* info caption — plain text, not pills */}
-      <div className="absolute bottom-3.5 left-5 right-5 flex items-center justify-between text-[11px] font-medium" style={{ color: isMinimal ? "rgba(0,0,0,.55)" : "rgba(255,255,255,.6)", textShadow: isMinimal ? "none" : "0 1px 8px rgba(0,0,0,.5)" }}>
+      <div className="absolute bottom-3.5 left-5 right-5 flex items-center justify-between text-label" style={{ color: isMinimal ? "rgba(0,0,0,.55)" : "rgba(255,255,255,.6)", textShadow: isMinimal ? "none" : "0 1px 8px rgba(0,0,0,.5)" }}>
         <span className="truncate">{modeLabel}</span>
         <span className="shrink-0 ml-3">{(t("upload.preview_motion") || "Movimiento")}: {moveLabel}{effectLabel ? ` · ${t("upload.effect_label") || "Efecto"}: ${effectLabel}` : ""}</span>
       </div>

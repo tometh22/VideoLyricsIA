@@ -322,6 +322,10 @@ export default function LyricsEditor({
   // onTransitionChange (que controlaba el legacy lyric_transition).
   onAnimationChange = null,
   onLineTransitionChange = null,
+  // UX specialist 2026-05-24: status del pre-gen del fondo (useBackgroundPreview).
+  // Valores: "idle" | "queued" | "generating" | "done" | "error" | "disabled".
+  // null/undefined → no se renderiza el chip (modo /edit modal post-render).
+  bgStatus = null,
 }) {
   const { t } = useI18n();
   const [edited, setEdited] = useState(() =>
@@ -1487,6 +1491,41 @@ export default function LyricsEditor({
         </div>
       </div>
 
+      {/* Chip de status del pre-gen del fondo — UX 2026-05-24. Operador edita
+          lyrics, Veo/Imagen está generando en background. Sin esto el pre-gen
+          era invisible y cambiar un param descartaba un preview sin aviso. */}
+      {bgStatus && bgStatus !== "idle" && bgStatus !== "disabled" && (
+        <div className={`mb-3 inline-flex items-center gap-2 px-3 py-1.5 rounded-full text-caption
+            ${bgStatus === "done"
+              ? "bg-accent/10 text-accent-light ring-1 ring-accent/30"
+              : bgStatus === "error"
+                ? "bg-amber-500/10 text-amber-300 ring-1 ring-amber-500/30"
+                : "bg-brand/10 text-brand-light ring-1 ring-brand/30"}`}>
+          {bgStatus === "queued" || bgStatus === "generating" ? (
+            <>
+              <svg className="w-3 h-3 animate-spin" fill="none" stroke="currentColor" strokeWidth="2.5" viewBox="0 0 24 24">
+                <path d="M21 12a9 9 0 11-6.219-8.56" strokeLinecap="round" />
+              </svg>
+              <span>{t("editor.bg_generating") || "Generando fondo en background…"}</span>
+            </>
+          ) : bgStatus === "done" ? (
+            <>
+              <svg className="w-3 h-3" fill="none" stroke="currentColor" strokeWidth="3" viewBox="0 0 24 24">
+                <polyline points="20 6 9 17 4 12" strokeLinecap="round" strokeLinejoin="round" />
+              </svg>
+              <span>{t("editor.bg_done") || "Fondo listo"}</span>
+            </>
+          ) : bgStatus === "error" ? (
+            <>
+              <svg className="w-3 h-3" fill="none" stroke="currentColor" strokeWidth="2.5" viewBox="0 0 24 24">
+                <circle cx="12" cy="12" r="10" /><line x1="12" y1="8" x2="12" y2="12" /><line x1="12" y1="16" x2="12.01" y2="16" />
+              </svg>
+              <span>{t("editor.bg_error") || "El fondo se generará al apretar Crear video"}</span>
+            </>
+          ) : null}
+        </div>
+      )}
+
       {/* Fixed floating primary CTA — always reachable, never cut. */}
       <button
         onClick={handleApprove}
@@ -1660,7 +1699,7 @@ export default function LyricsEditor({
               editor (shared state), default Lista so the existing flow is
               untouched. Desktop feature: hidden on narrow screens where the
               fine drag is impractical. */}
-          <div className="hidden md:inline-flex shrink-0 rounded-md ring-1 ring-white/[0.08] overflow-hidden text-[11px] font-medium">
+          <div className="hidden md:inline-flex shrink-0 rounded-md ring-1 ring-white/[0.08] overflow-hidden text-label">
             <button
               onClick={() => setViewMode("list")}
               className={`px-2.5 py-1 flex items-center gap-1.5 transition-colors ${viewMode === "list" ? "bg-brand/20 text-brand-light" : "text-ink-secondary hover:text-white"}`}
@@ -1819,14 +1858,14 @@ export default function LyricsEditor({
               </p>
               <button
                 onClick={() => shiftAllSegments(-(first.start - 2))}
-                className="shrink-0 text-[11px] font-medium px-3 py-1.5 rounded-lg bg-brand/15 text-brand-light
+                className="shrink-0 text-label px-3 py-1.5 rounded-lg bg-brand/15 text-brand-light
                   ring-1 ring-brand/30 hover:bg-brand/25 transition-colors"
               >
                 {t("editor.intro_trim_to_2") || "Recortar a 2s"}
               </button>
               <button
                 onClick={() => shiftAllSegments(-first.start)}
-                className="shrink-0 text-[11px] font-medium px-3 py-1.5 rounded-lg bg-surface-2/60
+                className="shrink-0 text-label px-3 py-1.5 rounded-lg bg-surface-2/60
                   ring-1 ring-white/[0.06] text-gray-300 hover:bg-surface-2 hover:text-white transition-colors"
               >
                 {t("editor.intro_trim_to_0") || "Empezar en 0s"}

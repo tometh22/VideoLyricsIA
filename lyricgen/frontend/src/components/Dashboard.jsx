@@ -22,9 +22,11 @@ function timeAgo(ts) {
 }
 
 // Tiny uppercase label used to introduce sections — Linear / Vercel style.
+// `text-section` token (tailwind.config) ya incluye fontWeight 600 +
+// letter-spacing 0.18em + size 10px. Antes era arbitrary; el token lo unifica.
 function SectionLabel({ children }) {
   return (
-    <p className="text-[10px] font-medium text-gray-500 uppercase tracking-[0.18em] mb-3">
+    <p className="text-section text-gray-500 uppercase mb-3">
       {children}
     </p>
   );

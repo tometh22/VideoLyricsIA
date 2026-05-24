@@ -788,8 +788,29 @@ export default function App() {
   // 2026-05-23: refactor a backend async. La respuesta del POST es ahora
   // {job_id, status: "transcribing_queued"} — hay que pollear /status hasta
   // que llegue a "transcribed" para obtener segments + reference_lyrics.
+  // R-FRONT-3 (review specialist 2026-05-24): cost-leak prevention en
+  // handleReset. Sin esto, las transcripciones encoladas en background
+  // seguían drenando Whisper + R2 cuando el operador cancelaba el batch.
+  // Conservador: solo abortamos LOOP ITERATIONS (no requests en progreso —
+  // requeriría signal en uploadFileToR2 + authFetchWithRetryOn503, que es
+  // refactor invasivo). El próximo iteration ve aborted=true y rompe.
+  const prefetchAbortRef = useRef(null);
+  if (prefetchAbortRef.current === null) {
+    prefetchAbortRef.current = new AbortController();
+  }
+
   const prefetchRemaining = useCallback(async (queue, fromIdx) => {
+    // Snapshot del controller actual al arrancar el loop. Si handleReset
+    // crea uno nuevo entremedio, esta closure sigue revisando el viejo
+    // (que YA está abortado) y rompe limpio.
+    const controller = prefetchAbortRef.current;
     for (let idx = fromIdx; idx < queue.length; idx++) {
+      if (controller && controller.signal.aborted) {
+        // handleReset disparó abort — paramos el prefetch loop. Los
+        // requests en flight se completan (sin signal) pero el siguiente
+        // iter NO arranca.
+        break;
+      }
       if (prefetchCache.current[idx]) continue;
       prefetchCache.current[idx] = { status: "loading" };
       const entry = queue[idx];
@@ -1358,6 +1379,10 @@ export default function App() {
     pollingIntervals.current.forEach((iv) => clearInterval(iv));
     pollingIntervals.current.clear();
     prefetchCache.current = {};
+    // R-FRONT-3: abortamos el prefetch loop (el siguiente iter se rompe).
+    // Después creamos un controller fresco para el próximo batch del operador.
+    try { prefetchAbortRef.current && prefetchAbortRef.current.abort(); } catch {}
+    prefetchAbortRef.current = new AbortController();
     setFiles([]); setJobs([]); setBackgroundFile(null); setBackgroundId(null);
     setReviewQueue([]); setCurrentReview(null); setApprovedJobs([]);
     setTranscribing(false); setReadyToGenerate(false); setTranscribeError(null);
@@ -1527,7 +1552,10 @@ export default function App() {
   // generando…" en el editor. Hoy se persiste sólo via onCacheKey →
   // currentReview.bgCacheKey, y el handleApproveLyrics lo copia a
   // approvedJobs para mandarlo al POST /generate.
-  // eslint-disable-next-line no-unused-vars
+  // bgPreview alimenta:
+  //   - onCacheKey → currentReview.bgCacheKey + approvedJobs (race fix R-FRONT-2).
+  //   - bgPreview.status → chip subtle "Fondo: generando…" en LyricsEditor
+  //     (UX specialist 2026-05-24, cierra el mental-model gap de pre-gen invisible).
   const bgPreview = useBackgroundPreview(previewEntry, {
     enabled: !!currentReview,
     api: API,
@@ -1777,6 +1805,10 @@ export default function App() {
             onContrastChange={(c) => setCurrentReview((r) => (r ? { ...r, textContrast: c } : r))}
             onAnimationChange={(c) => setCurrentReview((r) => (r ? { ...r, lyricsAnimation: c } : r))}
             onLineTransitionChange={(c) => setCurrentReview((r) => (r ? { ...r, lineTransition: c } : r))}
+            // UX specialist 2026-05-24: chip de status del pre-gen del
+            // fondo. Status posibles: "idle" | "queued" | "generating" |
+            // "done" | "error" | "disabled" (free-tier plan-tier guard).
+            bgStatus={bgPreview.status}
           />
         </div>
       );
