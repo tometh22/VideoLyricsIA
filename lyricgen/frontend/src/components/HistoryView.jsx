@@ -147,7 +147,7 @@ function VideoCard({ job, onSelect, onDelete, selected, onToggleSelect, t }) {
                 flex items-center justify-center transition-all
                 ${selected
                   ? "bg-brand border-brand opacity-100"
-                  : "bg-black/50 border-white/40 hover:border-brand/70 opacity-0 group-hover:opacity-100"}`}
+                  : "bg-black/50 border-white/40 hover:border-brand/70 opacity-50 sm:opacity-0 sm:group-hover:opacity-100"}`}
               title={selected ? "Deseleccionar" : "Seleccionar para eliminar"}
               aria-label="Seleccionar"
               aria-pressed={selected}
@@ -162,7 +162,7 @@ function VideoCard({ job, onSelect, onDelete, selected, onToggleSelect, t }) {
               type="button"
               onClick={handleDelete}
               className="absolute top-2.5 left-11 w-7 h-7 rounded-lg bg-black/50 hover:bg-red-500/80 backdrop-blur-md
-                text-white/70 hover:text-white opacity-0 group-hover:opacity-100 transition-all
+                text-white/70 hover:text-white opacity-50 sm:opacity-0 sm:group-hover:opacity-100 transition-all
                 flex items-center justify-center ring-1 ring-white/10 hover:ring-red-400/50"
               title={t("history.delete") || "Eliminar"}
               aria-label="Eliminar video"
@@ -176,7 +176,7 @@ function VideoCard({ job, onSelect, onDelete, selected, onToggleSelect, t }) {
         )}
 
         {(job.status === "done" || job.status === "pending_review") && (
-          <div className="absolute inset-0 flex items-center justify-center opacity-0 group-hover:opacity-100 transition-opacity bg-black/30">
+          <div className="absolute inset-0 flex items-center justify-center opacity-30 sm:opacity-0 sm:group-hover:opacity-100 transition-opacity bg-black/30">
             <div className="w-11 h-11 rounded-full bg-white/15 backdrop-blur-md flex items-center justify-center ring-1 ring-white/20">
               <svg className="w-4 h-4 text-white ml-0.5" fill="currentColor" viewBox="0 0 24 24">
                 <path d="M8 5v14l11-7z"/>
@@ -423,7 +423,7 @@ export default function HistoryView({
           </p>
         </div>
       ) : (
-        <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-3">
+        <div className="grid grid-cols-2 lg:grid-cols-3 gap-3">
           {visible.map((job) => (
             <VideoCard
               key={job.job_id}
