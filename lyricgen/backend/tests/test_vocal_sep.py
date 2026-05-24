@@ -66,6 +66,10 @@ def test_separate_vocals_downloads_stem_via_read(monkeypatch, tmp_path):
     fake_vocals = MagicMock()
     fake_vocals.read.return_value = b"WAVDATA" * 100
     _fake_replicate(monkeypatch, run=MagicMock(return_value={"vocals": fake_vocals}))
+    # validate_stem (post-PR-279 hardening) would reject this fake 700-byte
+    # blob — bypass it so this test stays focused on the download/read path.
+    # The validator itself has its own test file (test_validate_stem.py).
+    monkeypatch.setattr(vs, "validate_stem", lambda p: (True, "ok"))
     out = vs.separate_vocals(str(src))
     assert out is not None
     assert os.path.exists(out)

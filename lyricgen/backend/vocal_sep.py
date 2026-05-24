@@ -74,6 +74,84 @@ def _pick_vocals(output) -> object | None:
     return output
 
 
+def validate_stem(path: str):
+    """Sanity-check a vocal stem before handing it downstream (forced_align,
+    whisperX). Returns `(ok, reason)`. `reason` is a short human-readable
+    label for logs/telemetry — never None.
+
+    Incident motivation (2026-05-24 Mujer Amante): demucs returned a stem
+    that ended up as tensor shape `[1, 2, 1]` (one sample on the time axis).
+    Cureau's forced-aligner crashes with
+    `Padding size should be less than the corresponding input dimension,
+    but got: padding (200, 200) at dimension 2 of input [1, 2, 1]`,
+    burns through three retries of ~90 minutes each, and finally falls back
+    to whisperX. Pre-flighting the stem with `ffprobe` (~30-100 ms) catches
+    the degenerate case BEFORE the network round-trip.
+
+    Validations:
+    - File exists and is readable.
+    - File size >= 10 KB (anything smaller cannot encode 3 s of audio).
+    - Audio stream present, duration >= 3 s (cureau needs > ~400 samples
+      for its 200-sample symmetric padding), sample_rate in the common
+      music range {8k..48k}, channels in {1, 2}.
+
+    Conservative on purpose — when a stem fails, the caller falls through
+    to the audio mix (a safe and known-working path).
+    """
+    if not path or not os.path.exists(path):
+        return False, "missing"
+    try:
+        size = os.path.getsize(path)
+    except OSError as e:
+        return False, f"stat_failed:{e}"
+    if size < 10_000:
+        return False, f"too_small:{size}B"
+
+    import subprocess
+    import json as _json
+    try:
+        out = subprocess.run(
+            ["ffprobe", "-v", "error", "-print_format", "json",
+             "-show_streams", "-show_format", path],
+            capture_output=True, text=True, timeout=10, check=True,
+        )
+        meta = _json.loads(out.stdout)
+    except Exception as e:
+        return False, f"ffprobe_failed:{e.__class__.__name__}"
+
+    streams = [s for s in (meta.get("streams") or []) if s.get("codec_type") == "audio"]
+    if not streams:
+        return False, "no_audio_stream"
+    st = streams[0]
+
+    try:
+        dur = float(
+            st.get("duration")
+            or (meta.get("format") or {}).get("duration")
+            or 0
+        )
+    except (TypeError, ValueError):
+        dur = 0.0
+    if dur < 3.0:
+        return False, f"duration_too_short:{dur:.2f}s"
+
+    try:
+        sr = int(st.get("sample_rate") or 0)
+    except (TypeError, ValueError):
+        sr = 0
+    if sr not in (8000, 11025, 16000, 22050, 24000, 32000, 44100, 48000):
+        return False, f"unusual_sample_rate:{sr}"
+
+    try:
+        ch = int(st.get("channels") or 0)
+    except (TypeError, ValueError):
+        ch = 0
+    if ch not in (1, 2):
+        return False, f"unusual_channels:{ch}"
+
+    return True, "ok"
+
+
 def _download(value, dest_path: str) -> bool:
     """Write a Replicate file output to dest_path. Handles the SDK's
     FileOutput object (`.read()`), a URL string, or an open file-like."""
@@ -134,6 +212,21 @@ def separate_vocals(audio_path: str) -> str | None:
         except OSError:
             pass
         logger.warning("[VOCALSEP] could not save vocal stem — falling back")
+        return None
+
+    # Validate the stem before publishing it to callers. A bad stem
+    # (1-sample tensor, wrong sample rate, etc.) crashes forced_align
+    # hard — pre-flight here so the caller falls through to the mix and
+    # we never burn three retries of ~90 min each on garbage input.
+    # Incident: Mujer Amante 2026-05-24 (see validate_stem docstring).
+    ok, reason = validate_stem(dest)
+    if not ok:
+        logger.warning("[VOCALSEP] stem failed validation (%s) for %s — falling back to mix",
+                       reason, os.path.basename(audio_path))
+        try:
+            os.unlink(dest)
+        except OSError:
+            pass
         return None
 
     logger.info("[VOCALSEP] isolated vocal stem for %s", os.path.basename(audio_path))
