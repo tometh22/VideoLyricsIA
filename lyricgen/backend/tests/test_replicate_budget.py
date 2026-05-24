@@ -38,6 +38,20 @@ def test_is_non_retryable_matches_validation():
     assert is_non_retryable(RuntimeError("Authentication required"))
 
 
+def test_is_non_retryable_matches_zero_sample_tensor():
+    """HOTFIX 2026-05-24: cureau crashes with `[1, 2, 0]` (zero-sample
+    audio tensor — metadata duration > 0 but no actual samples). Full
+    error from production logs:
+      'Expected 2D or 3D (batch mode) tensor with possibly 0 batch size
+       and other non-zero dimensions for input, but got: [1, 2, 0]'
+    """
+    err = RuntimeError(
+        "Expected 2D or 3D (batch mode) tensor with possibly 0 batch "
+        "size and other non-zero dimensions for input, but got: [1, 2, 0]"
+    )
+    assert is_non_retryable(err) is True
+
+
 def test_is_retryable_for_transient():
     assert is_non_retryable(
         ConnectionError("Server disconnected without sending a response.")
