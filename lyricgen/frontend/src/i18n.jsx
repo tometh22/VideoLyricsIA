@@ -584,6 +584,27 @@ const translations = {
     "detail.view_youtube": "Ver en YouTube",
     "detail.not_available": "Todavía no se puede previsualizar este video.",
     "detail.back": "Volver",
+    // PR #291: claves usadas por los branches nuevos de JobDetail
+    // (transcribed / transcribing* / awaiting_upload / transcription_failed).
+    // Build de Vercel falla si alguna clave nueva está ausente — agregadas
+    // todas acá. Solo ES por ahora; EN/PT caen al fallback inline del
+    // componente hasta que un translator las cubra.
+    "detail.transcribed_title": "Borrador listo para editar",
+    "detail.transcribed_subtitle": "La transcripción ya está lista. Revisá los lyrics y dale Generar video para terminar.",
+    "detail.transcribed_cta": "Editar lyrics y generar",
+    "detail.transcribed_pending_title": "Subida en curso",
+    "detail.transcribed_pending_subtitle": "La subida está en curso. Cuando termine, vas a poder editar los lyrics.",
+    "detail.transcribing_title": "Transcribiendo…",
+    "detail.transcribing_subtitle": "Whisper + alineación de letras a la canción. Suele tardar 2-5 minutos. Volvé en un rato.",
+    "detail.uploading_title": "Subiendo audio…",
+    "detail.uploading_subtitle": "El archivo está subiendo a nuestro storage. Si se queda mucho tiempo acá puede ser una pérdida de conexión: refrescá y reintentá.",
+    "detail.transcription_failed_title": "La transcripción falló",
+    "detail.transcription_failed_unknown": "Error desconocido durante la transcripción.",
+    "detail.transcription_failed_help": "Volvé al wizard y subí el audio de nuevo. Si el archivo es muy grande, convertilo a MP3 antes.",
+    "detail.transcription_failed_cta": "Volver al wizard",
+    // PR #292: hint cuando el stepper detecta que el job no avanza
+    // (progress no cambió por 45s).
+    "transcribe.stuck": "Tardando más de lo normal. Esto suele ser un pico de carga en Replicate; refrescá en un minuto o cancelá y reintentá.",
     "detail.generating_meta": "Generando metadata con IA...",
     "detail.upload_unlisted": "Subir como No Listado",
     "detail.upload_public": "Subir como Público",
