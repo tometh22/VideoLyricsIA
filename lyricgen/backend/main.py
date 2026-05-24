@@ -3181,7 +3181,8 @@ async def _run_transcription_for_job(
         #                          extended / remix versions are too risky
         #                          to auto-align)
         from pipeline import (
-            _fetch_lrclib, _lrc_to_segments, _audio_duration,
+            _fetch_lrclib, _fetch_lrclib_with_swap_retry,
+            _lrc_to_segments, _audio_duration,
             _slice_audio_prefix, _slice_audio_window, _verify_lrclib_alignment,
             _detect_hallucination, _synthesize_segments_from_plain,
             _align_whisper_to_plain, _fill_gaps_with_reference,
@@ -3191,7 +3192,28 @@ async def _run_transcription_for_job(
         # Vertex work below (see the pool-starvation note in the docstring).
         await _step("transcribe.lyrics_lookup", 15)
         with scoped_db() as _lrc_db:
-            lrc = await asyncio.to_thread(_fetch_lrclib, artist_hint, song_hint, _lrc_db)
+            lrc, _lrc_meta = await asyncio.to_thread(
+                _fetch_lrclib_with_swap_retry, artist_hint, song_hint, _lrc_db,
+            )
+        # Auto-correct inverted metadata: when the swap-retry hit, the upload
+        # had artist/title swapped (incident 2026-05-24 Viejas Locas /
+        # Legalícenla in staging — frontend parser assumes Title_Artist for
+        # underscore filenames, but most users name files Artist_Title).
+        # Persist the corrected order so the editor renders clean metadata,
+        # and update the local hints so Gemini grounding / log lines use the
+        # right values for the rest of this run. We use `update_job` (which
+        # owns its own short-lived session) instead of reopening scoped_db
+        # — same pool-starvation rationale as the lookup above.
+        if _lrc_meta.get("swapped"):
+            artist_hint = _lrc_meta["artist_used"]
+            song_hint = _lrc_meta["song_used"]
+            try:
+                from jobs import update_job as _update_job
+                _update_job(job_id, artist=artist_hint, song_title=song_hint)
+                logger.info("[LYRICS] auto-corrected swapped metadata for job %s: "
+                            "artist=%r song_title=%r", job_id, artist_hint, song_hint)
+            except Exception as e:
+                logger.warning("[LYRICS] metadata auto-correction persist failed: %s", e)
         if lrc:
             synced = lrc.get("synced")
             plain = lrc.get("plain") or ""
