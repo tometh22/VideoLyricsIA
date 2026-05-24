@@ -3924,6 +3924,12 @@ async def generate_with_segments(
     background_hint: str = Form("", max_length=2000),
     bg_verbatim: bool = Form(False),
     custom_colors: str = Form("", max_length=200),
+    # Capa C 2026-05-24: si el operador hizo pre-gen via /generate-preview
+    # mientras editaba lyrics, este field contiene el hash que mapea al
+    # background pre-cacheado en R2. La pipeline lo reusa antes de llamar
+    # a Veo/Imagen — ahorra ~60-180s + $0.80-3.20 de cuota. Vacío = flow
+    # tradicional sin cache.
+    bg_cache_key: str = Form("", max_length=64),
     current_user: dict = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
@@ -4161,6 +4167,10 @@ async def generate_with_segments(
         background_hint=(background_hint.strip() or None),
         bg_verbatim=bg_verbatim,
         custom_colors=(custom_colors.strip() or ""),
+        # Capa C 2026-05-24: pasa el hash del bg pre-cacheado a la pipeline.
+        # Si el cache hit, _ensure_background se skip y el job ahorra
+        # ~60-180s + $0.80-3.20 de cuota Veo. Vacío = flow tradicional.
+        bg_cache_key=(bg_cache_key.strip() or None),
     )
 
     return {"job_id": job_id, "status": initial_status}

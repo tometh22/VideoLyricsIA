@@ -382,7 +382,15 @@ def run_pipeline(job_id: str, mp3_path: str, artist: str, style: str,
                  # effect: overlay animado componible sobre cualquier fondo
                  # (snow/rain/stars/bokeh/light). "" = ninguno. Se compone en el
                  # render (libass filter_complex o moviepy) vía fx_compositor.
-                 effect: str = ""):
+                 effect: str = "",
+                 # Capa C 2026-05-24: hash determinístico (sha256-12) de los
+                 # params del background. Si está set Y `bg_cache/{key}.mp4`
+                 # existe en R2, la pipeline lo descarga ANTES de llamar a
+                 # _ensure_background — ahorra los ~60-180s de Veo/Imagen y
+                 # ~$0.80-3.20 de cuota. Ver bg_preview.py para el hash y el
+                 # path en R2. None = no chequear cache (fallback al flow
+                 # tradicional de Veo/Imagen inline).
+                 bg_cache_key: str | None = None):
     """Run the full pipeline for a job. Called synchronously.
 
     delivery_profile:
@@ -606,18 +614,43 @@ def run_pipeline(job_id: str, mp3_path: str, artist: str, style: str,
             if _animate_user_image:
                 logger.info("[BG] image-to-video: animating user-supplied %s via Veo",
                             os.path.basename(background_path))
-            bg_image_path = _ensure_background(
-                style, job_dir,
-                lyrics_text=lyrics_text, artist=artist, job_id=job_id,
-                song_title=_song_title, genre=genre, concept=concept,
-                movement_style=movement_style,
-                image_to_video_path=(background_path if _animate_user_image else None),
-                match_lyrics=match_lyrics,
-                background_hint=background_hint,
-                bg_verbatim=bg_verbatim,
-                custom_colors=custom_colors,
-                allow_people=_compute_allow_people(job_id),
-            )
+
+            # Capa C 2026-05-24 — bg_cache fast path. Si el operador hizo
+            # pre-gen (POST /generate-preview) mientras editaba lyrics, el
+            # video del fondo ya está en R2 bajo bg_cache/{key}.mp4. Lo
+            # descargamos a job_dir y skip Veo/Imagen — ~60-180s y $0.80-3.20
+            # de cuota ahorrados. Si el cache no existe (operador cambió
+            # opciones después del preview, o el preview falló, o el TTL
+            # de 24h del cache lo limpió), seguimos con el flow normal.
+            bg_image_path = None
+            if bg_cache_key and not _animate_user_image:
+                try:
+                    from bg_preview import cache_check, cache_download
+                    if cache_check(bg_cache_key):
+                        cached_path = os.path.join(job_dir, f"bg_cached_{bg_cache_key}.mp4")
+                        if cache_download(bg_cache_key, cached_path):
+                            logger.info("[BG] cache HIT key=%s — reusando %s, skip Veo/Imagen",
+                                        bg_cache_key, os.path.basename(cached_path))
+                            bg_image_path = cached_path
+                        else:
+                            logger.warning("[BG] cache_check OK pero download falló key=%s — fallback",
+                                           bg_cache_key)
+                except Exception as e:
+                    logger.warning("[BG] cache lookup error key=%s: %s — fallback", bg_cache_key, e)
+
+            if bg_image_path is None:
+                bg_image_path = _ensure_background(
+                    style, job_dir,
+                    lyrics_text=lyrics_text, artist=artist, job_id=job_id,
+                    song_title=_song_title, genre=genre, concept=concept,
+                    movement_style=movement_style,
+                    image_to_video_path=(background_path if _animate_user_image else None),
+                    match_lyrics=match_lyrics,
+                    background_hint=background_hint,
+                    bg_verbatim=bg_verbatim,
+                    custom_colors=custom_colors,
+                    allow_people=_compute_allow_people(job_id),
+                )
             # Image-to-video fallback: if Veo failed to produce an MP4 (None
             # or non-existent path) AND the operator wanted to animate their
             # image, fall back to using the still image with Ken Burns.
