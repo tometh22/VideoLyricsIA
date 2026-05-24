@@ -376,6 +376,15 @@ export default function App() {
   const [approvedJobs, setApprovedJobs] = useState([]);
   const [transcribing, setTranscribing] = useState(false);
   const [transcribeError, setTranscribeError] = useState(null);
+  // Capa B 2026-05-24 — wizardStage es la única fuente de verdad de qué muestra
+  // el wizard. Reemplaza el `navigate("/review")` que disparaba el flash a
+  // dashboard. URL se queda en /new mientras el operador transita upload →
+  // review → ready_to_generate. La navegación a /generating sigue siendo
+  // legítima (pantalla dedicada de progreso del batch). Valores:
+  //   "upload"            → UploadZone (drop archivos + opciones).
+  //   "review"            → spinner de transcribiendo / LyricsEditor inline.
+  //   "ready_to_generate" → resumen + botón "Crear N videos".
+  const [wizardStage, setWizardStage] = useState("upload");
   // {phase: "uploading"|"transcribing", loaded, total} during the
   // upload→whisper handoff. Drives the progress bar in /review.
   const [transcribeProgress, setTranscribeProgress] = useState(null);
@@ -444,8 +453,11 @@ export default function App() {
       wizardPersistence.clear();
       return;
     }
-    wizardPersistence.save({ files, approvedJobs, currentReview, reviewQueue });
-  }, [files, approvedJobs, currentReview, reviewQueue]);
+    // Capa B 2026-05-24: persist wizardStage para que un refresh durante
+    // review NO te tire de vuelta al state "upload". El snap.load() lo
+    // rehidrata en el useEffect de mount.
+    wizardPersistence.save({ files, approvedJobs, currentReview, reviewQueue, wizardStage });
+  }, [files, approvedJobs, currentReview, reviewQueue, wizardStage]);
 
   // beforeunload warning — covers closing the tab, refreshing, or
   // navigating to an external URL. LyricsEditor already has its own
@@ -486,15 +498,18 @@ export default function App() {
       setReviewQueue((snap.reviewQueue || []).map(wizardPersistence.rehydrateQueueEntry));
       setApprovedJobs((snap.approvedJobs || []).map(wizardPersistence.rehydrateQueueEntry));
       setCurrentReview(wizardPersistence.rehydrateReview(snap.currentReview));
+      // Capa B 2026-05-24: restaurar wizardStage para que /new renderice
+      // el reviewScreen content si el operador estaba mid-review al refresh.
+      // Default "upload" si el snap es viejo (sin wizardStage) o si no hay
+      // currentReview/approved (sólo files staged).
+      const resumedStage = snap.wizardStage
+        || ((snap.currentReview || (snap.approvedJobs?.length || 0) > 0) ? "review" : "upload");
+      setWizardStage(resumedStage);
       setResumableWizard(null);
-      // If we have a draft in progress → /review. If only approved jobs
-      // (came back between songs) → /review too, lets handleBackInReview
-      // pop the last one. If only files staged → /new for re-upload.
-      if (snap.currentReview || (snap.approvedJobs?.length || 0) > 0) {
-        navigate("/review");
-      } else {
-        navigate("/new");
-      }
+      // Capa B: una sola ruta destino — /new — con wizardStage indicando
+      // qué content mostrar inline. Antes navegábamos a /review cuando había
+      // currentReview/approved, ahora /new lo hace todo via wizardScreen.
+      navigate("/new");
     } finally {
       // Defer flag flip past the React commit so the persistence useEffect
       // runs once with the FULLY restored state and writes a fresh snapshot.
@@ -848,21 +863,17 @@ export default function App() {
   // de orden — y no lo cambiamos entre upload y review.
   const handleStartReview = async () => {
     if (!files.length || !files.every((f) => f.artist.trim())) return;
-    // Race fix 2026-05-24: el guard en reviewScreen (~/review render vacío
-    // → <Navigate to="/dashboard">) disparaba un flash a dashboard cuando
-    // navegábamos antes de que transcribeNext setteara estado. El primer
-    // render de /review veía transcribing=false / currentReview=null /
-    // readyToGenerate=false → entraba al fallback → redirect.
-    //
-    // Setear transcribing=true SYNCHRONOUS antes del navigate hace que el
-    // primer render ya vea estado válido (spinner de transcripción). Para
-    // el fast-path (segments cacheados por prefetch), transcribeNext
-    // lo setea de vuelta a false en ~0ms y aparece el editor directo —
-    // visualmente indistinguible del flujo viejo, sin el flash.
+    // Capa B 2026-05-24 — antes navegábamos a /review (que disparaba un flash
+    // a dashboard por una race con el guard del fallback). Capa A lo
+    // mitigó con setTranscribing(true) sync, pero el URL change seguía
+    // sucediendo (visualmente "salta" de wizard a otra pantalla aunque
+    // el chrome sea igual). Capa B: no navegamos — wizardStage="review"
+    // hace que /new renderice el reviewScreen content INLINE. El operador
+    // ve transición continua, no jump de ruta.
     setReviewQueue([...files]);
     setTranscribing(true);
     setTranscribeError(null);
-    navigate("/review");
+    setWizardStage("review");
     transcribeNext([...files], 0);
   };
 
@@ -1339,6 +1350,8 @@ export default function App() {
     setFiles([]); setJobs([]); setBackgroundFile(null); setBackgroundId(null);
     setReviewQueue([]); setCurrentReview(null); setApprovedJobs([]);
     setTranscribing(false); setReadyToGenerate(false); setTranscribeError(null);
+    // Capa B 2026-05-24: el wizard descartó todo → vuelve al upload state.
+    setWizardStage("upload");
     navigate("/dashboard");
     fetchHistory();
   };
@@ -1384,11 +1397,17 @@ export default function App() {
     setReviewQueue([]);
     setTranscribing(false);
     setTranscribeError(null);
-    navigate("/new");
+    // Capa B 2026-05-24: la primer canción canceló review → vuelve al upload
+    // INLINE (no navega). El operador ve la file list de nuevo, conserva su
+    // configuración. Si quería tirar todo, usa Cancelar (handleReset).
+    setWizardStage("upload");
   };
 
   const handleGenerateBatch = () => {
     setReadyToGenerate(false);
+    // No tocamos wizardStage acá — startGenerationWithSegments navega a
+    // /generating (pantalla dedicada de progreso). El wizard queda
+    // "stale" pero handleReset lo limpia cuando el operator vuelve.
     startGenerationWithSegments(approvedJobs);
   };
 
@@ -1576,7 +1595,7 @@ export default function App() {
     </div>
   );
 
-  // /review handles three sub-states: spinner while transcribing,
+  // /review handles three sub-states (transcribing spinner, LyricsEditor,
   // LyricsEditor when a song is ready to review, and the batch summary
   // before launching generation. Empty state → redirect home.
   const reviewScreen = (() => {
@@ -1765,6 +1784,13 @@ export default function App() {
     );
   })();
 
+  // Capa B 2026-05-24 — wizardScreen es lo que /new (y /review por compat)
+  // renderizan. Conmuta entre upload y review/ready_to_generate según
+  // wizardStage. NO hay navigate entre rutas durante el flow normal — el
+  // operador queda en /new desde drop hasta clickear "Crear video"
+  // (legítimo navigate a /generating).
+  const wizardScreen = wizardStage === "upload" ? newBatchScreen : reviewScreen;
+
   const generatingScreen = jobs.length > 0
     ? (
       <div className="flex justify-center">
@@ -1856,8 +1882,12 @@ export default function App() {
               onViewHistory={() => navigate("/videos")}
             />
           } />
-          <Route path="/new" element={newBatchScreen} />
-          <Route path="/review" element={reviewScreen} />
+          {/* Capa B 2026-05-24 — /new y /review renderizan el MISMO content
+              (wizardScreen) que conmuta upload ↔ review ↔ ready_to_generate
+              vía wizardStage. /review se mantiene como ruta válida sólo para
+              compat con bookmarks viejos; URL nueva canónica es /new. */}
+          <Route path="/new" element={wizardScreen} />
+          <Route path="/review" element={wizardScreen} />
           <Route path="/generating" element={generatingScreen} />
           <Route path="/videos" element={
             <HistoryView
