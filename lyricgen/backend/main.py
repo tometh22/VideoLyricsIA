@@ -1644,8 +1644,11 @@ def _enforce_plan_quota(db: Session, current_user: dict) -> None:
 # System default for per-tenant daily cap when User.max_videos_per_day is None.
 # Catches accidental burst usage (a UMG user looping a script, accidental retry
 # storm, etc.) before it racks up Veo bills. UMG's verbal commitment is
-# 200/month ≈ 7/day; a 50/day cap allows 7× headroom for legitimate bursts.
-DEFAULT_DAILY_CAP = 50
+# 200/month ≈ 7/day; el default histórico de 50 daba 7× headroom pero se
+# saturaba durante smoke tests (2026-05-24: tomas hit 50/50 probando el
+# wizard refactor). Bumpeado a 500 con env override y bypass explícito para
+# plan="unlimited" (los unlimited NO deberían tener cap diario).
+DEFAULT_DAILY_CAP = int(os.environ.get("DAILY_VOLUME_CAP", "500"))
 
 
 DEFAULT_MAX_CONCURRENT_JOBS = 5
@@ -1732,7 +1735,15 @@ def _enforce_tenant_backlog(db: Session, current_user: dict) -> None:
 
 def _enforce_daily_volume_cap(db: Session, current_user: dict) -> None:
     """Raise 429 if the tenant has hit its per-day video cap. UMG-readiness:
-    prevents a runaway from creating $200 of Veo in an hour."""
+    prevents a runaway from creating $200 of Veo in an hour.
+
+    Bypass: plan="unlimited" no tiene cap diario (por definición). El control
+    de costo en unlimited vive en el budget anual / billing aparte.
+    """
+    plan = (current_user.get("plan") or "").strip().lower()
+    if plan == "unlimited":
+        return
+
     tenant_id = current_user["tenant_id"]
     user_model = db.query(User).filter(User.id == current_user["id"]).first()
 
