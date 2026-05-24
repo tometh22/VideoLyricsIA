@@ -52,9 +52,14 @@ def create_job(
       - "awaiting_upload": browser is still PUTting bytes directly to
         R2 via a presigned URL. /transcribe-uploaded promotes to
         transcribed_pending once the upload completes.
+      - "bg_preview_queued": background-preview "ghost" job (Capa C feature
+        2026-05-24) — no audio, no transcription, just a tracking row so
+        the wizard can poll the pre-render status of the Veo background.
+        The worker promotes to "bg_preview_done" / "bg_preview_failed".
     """
     valid_states = (
         "processing", "queued", "transcribed_pending", "awaiting_upload",
+        "bg_preview_queued",
     )
     if initial_status not in valid_states:
         raise ValueError(f"unsupported initial_status {initial_status!r}")
