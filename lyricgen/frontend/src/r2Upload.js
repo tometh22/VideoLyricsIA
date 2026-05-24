@@ -96,6 +96,46 @@ function putToR2WithProgress(url, blob, contentType, onProgress, signal) {
   });
 }
 
+/**
+ * POST a blob to the API proxy endpoint (server-side relay to R2).
+ *
+ * Used as a fallback when a direct presigned PUT to R2 fails due to CORS
+ * misconfiguration (missing AllowedOrigins or ExposeHeaders: ["ETag"] on
+ * the bucket). The API container uploads the bytes to R2 server-side and
+ * returns JSON containing the ETag (for parts) or job metadata (for
+ * single-file uploads). Same XHR approach as putToR2WithProgress so the
+ * caller gets real upload-progress events.
+ */
+function postToProxy(url, blob, contentType, onProgress, signal) {
+  return new Promise((resolve, reject) => {
+    const xhr = new XMLHttpRequest();
+    xhr.open("POST", url, true);
+    if (contentType) xhr.setRequestHeader("Content-Type", contentType);
+    const token = localStorage.getItem("genly_token");
+    if (token) xhr.setRequestHeader("Authorization", `Bearer ${token}`);
+    if (xhr.upload && onProgress) {
+      xhr.upload.onprogress = (e) => {
+        if (e.lengthComputable) onProgress(e.loaded, e.total);
+      };
+    }
+    xhr.onload = () => {
+      if (xhr.status >= 200 && xhr.status < 300) {
+        try { resolve(JSON.parse(xhr.responseText)); }
+        catch { reject(new Error(`Proxy response parse error (HTTP ${xhr.status})`)); }
+      } else {
+        reject(new Error(`Proxy upload failed: ${xhr.status} ${xhr.statusText}`));
+      }
+    };
+    xhr.onerror = () => reject(new Error("Proxy upload network error"));
+    xhr.onabort = () => reject(Object.assign(new Error("aborted"), { aborted: true }));
+    if (signal) {
+      if (signal.aborted) { xhr.abort(); return; }
+      signal.addEventListener("abort", () => xhr.abort(), { once: true });
+    }
+    xhr.send(blob);
+  });
+}
+
 /** Backoff helper for retrying a single multipart part. */
 async function withRetry(fn, { maxAttempts = 6, baseMs = 1000 } = {}) {
   let lastErr;
@@ -115,7 +155,8 @@ async function withRetry(fn, { maxAttempts = 6, baseMs = 1000 } = {}) {
 
 /** Multipart upload. Slices the File, presigns each part, PUTs directly
  * to R2 in parallel (capped concurrency), tracks per-part progress,
- * finalizes via the backend. */
+ * finalizes via the backend. Falls back to server-side proxy when a
+ * direct PUT is blocked by R2 CORS misconfiguration. */
 async function multipartUpload({
   file,
   jobId,
@@ -132,6 +173,11 @@ async function multipartUpload({
   const parts = []; // {part_number, etag}
   // Per-part bytes uploaded so far. Aggregate sum drives the UI.
   const perPartLoaded = new Array(partCount).fill(0);
+  // Set to true when any direct PUT fails due to CORS (network error or
+  // null ETag). Once detected, all workers switch to the proxy path for
+  // the remainder of the upload so we don't waste time retrying a broken
+  // CORS config on every subsequent part.
+  let directFailed = false;
 
   const reportProgress = () => {
     if (!onProgress) return;
@@ -156,32 +202,55 @@ async function multipartUpload({
           // global counter past 100%).
           perPartLoaded[i] = 0;
           reportProgress();
-          // Presign per-part (presigns are short-TTL so we sign on each
-          // attempt rather than once up-front). Direct PUT to R2 from
-          // the browser — no API container in the data path.
-          const { url } = await apiPost("/upload-multipart-part-url", {
-            job_id: jobId, part_number: partNumber,
-          });
-          const res = await putToR2WithProgress(
-            url, blob, contentType,
-            (loaded /* total */) => {
-              perPartLoaded[i] = loaded;
-              reportProgress();
-            },
+
+          if (!directFailed) {
+            // Direct presigned PUT path (fast, no API container in data path).
+            // Presign per-part on each attempt (presigns are short-TTL).
+            const { url } = await apiPost("/upload-multipart-part-url", {
+              job_id: jobId, part_number: partNumber,
+            });
+            try {
+              const res = await putToR2WithProgress(
+                url, blob, contentType,
+                (loaded) => { perPartLoaded[i] = loaded; reportProgress(); },
+                signal,
+              );
+              if (res.etag) {
+                // ensure final byte count is reflected even if onprogress
+                // missed the very last chunk.
+                perPartLoaded[i] = blob.size;
+                reportProgress();
+                return res.etag;
+              }
+              // ETag null = R2 CORS policy missing ExposeHeaders: ["ETag"].
+              // Re-apply scripts/r2_cors.json via configure_r2_cors.sh to fix.
+              directFailed = true;
+            } catch (err) {
+              if (err.aborted) throw err;
+              if (err.message === "R2 PUT network error") {
+                // CORS preflight blocked the PUT entirely.
+                directFailed = true;
+              } else {
+                throw err; // Real upload error, not CORS — propagate to withRetry.
+              }
+            }
+          }
+
+          // Proxy fallback: API container relays part bytes to R2 server-side.
+          // No browser-to-R2 CORS involved. Slower than direct PUT because
+          // bytes transit the API container, but reliable when CORS is broken.
+          perPartLoaded[i] = 0;
+          reportProgress();
+          const proxyUrl = `${API}/upload-part-proxy?job_id=${encodeURIComponent(jobId)}&part_number=${partNumber}`;
+          const data = await postToProxy(
+            proxyUrl, blob, contentType,
+            (loaded) => { perPartLoaded[i] = loaded; reportProgress(); },
             signal,
           );
-          if (!res.etag) {
-            throw new Error(
-              `Part ${partNumber}: R2 returned no ETag — ` +
-              `likely a CORS ExposeHeaders: ["ETag"] config issue. ` +
-              `Re-apply scripts/r2_cors.json via configure_r2_cors.sh.`
-            );
-          }
-          // ensure final byte count is reflected even if onprogress
-          // missed the very last chunk.
+          if (!data?.etag) throw new Error(`Proxy part ${partNumber}: missing ETag in response`);
           perPartLoaded[i] = blob.size;
           reportProgress();
-          return res.etag;
+          return data.etag;
         });
         parts.push({ part_number: partNumber, etag });
       } catch (err) {
@@ -237,9 +306,18 @@ export async function uploadFileToR2(
 
   if (!ticket.use_multipart) {
     // Single-PUT path: one XHR.PUT direct to the presigned URL.
-    await putToR2WithProgress(
-      ticket.upload_url, file, contentType, onProgress, signal,
-    );
+    // Falls back to /upload-file-proxy when R2 CORS blocks the direct PUT.
+    try {
+      await putToR2WithProgress(
+        ticket.upload_url, file, contentType, onProgress, signal,
+      );
+    } catch (err) {
+      if (err.aborted) throw err;
+      if (err.message !== "R2 PUT network error") throw err;
+      // CORS blocked the direct PUT — relay bytes through the API container.
+      const proxyUrl = `${API}/upload-file-proxy?job_id=${encodeURIComponent(ticket.job_id)}`;
+      await postToProxy(proxyUrl, file, contentType, onProgress, signal);
+    }
     return { jobId: ticket.job_id, key: ticket.key };
   }
 
