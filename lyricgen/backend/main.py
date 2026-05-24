@@ -4067,6 +4067,32 @@ async def _run_transcription_for_job(
         return _emit_segments(
             segments, WHISPER_RAW, reference_lyrics=reference,
         )
+    except Exception as exc:
+        # OBSERVABILITY (audit 2026-05-24): the orchestrator used to be
+        # try/finally with NO except. Any uncaught exception (OOM, an
+        # unexpected dict shape from Replicate, IndexError in split-long,
+        # etc.) propagated to the caller, leaving the job in `processing`
+        # with `timing_source=NULL` and zero context in Sentry.
+        #
+        # This block captures the exception with Sentry (worker process
+        # doesn't have FastAPI's auto-capture), tags the job_id, AND
+        # re-raises so the caller's own error path still runs. The
+        # downstream caller is responsible for marking the job failed
+        # (transcription_worker._fail).
+        try:
+            import sentry_sdk
+            with sentry_sdk.push_scope() as scope:
+                scope.set_tag("job_id", job_id)
+                scope.set_tag("audio_path", os.path.basename(audio_path or ""))
+                scope.set_context("transcribe", {
+                    "language": language, "artist": artist, "title": title,
+                })
+                sentry_sdk.capture_exception(exc)
+        except Exception:
+            pass  # Sentry must never break the error path
+        logger.exception("[TRANSCRIBE] uncaught exception in _run_transcription_for_job for job=%s",
+                         job_id)
+        raise
     finally:
         # tmp_dir holds intermediate slices (intro/body cuts) only — the
         # main audio (audio_path) is under job_dir and must survive until

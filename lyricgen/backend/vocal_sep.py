@@ -198,19 +198,33 @@ def separate_vocals(audio_path: str) -> str | None:
         return None
 
     try:
-        import replicate
+        import replicate  # noqa: F401 — used inside `call_with_budget`
     except ImportError:
         logger.warning("[VOCALSEP] replicate SDK not installed — falling back")
         return None
 
-    try:
-        with open(audio_path, "rb") as audio:
-            output = replicate.run(
-                _MODEL,
-                input={"audio": audio, "stem": "vocals", "model_name": _VARIANT},
-            )
-    except Exception as e:  # network, billing, model error, anything
-        logger.warning("[VOCALSEP] replicate call failed (%s) — falling back", e)
+    # OBSERVABILITY (audit 2026-05-24): demucs USED to be a single
+    # `replicate.run(...)` with no budget. When Replicate was degraded,
+    # the HTTP request could hang ~90 minutes before timing out,
+    # blocking the worker on the very first step. Same shape as the
+    # forced_align bug PR #281 already fixed — extracted to a shared
+    # helper so all three call sites stay in sync.
+    from replicate_budget import call_with_budget, _budget_for
+
+    def _input_factory():
+        return {
+            "audio": open(audio_path, "rb"),
+            "stem": "vocals",
+            "model_name": _VARIANT,
+        }
+
+    output = call_with_budget(
+        _MODEL, _input_factory,
+        total_budget_s=_budget_for("demucs", default_s=360.0),
+        backoff=[0, 8, 24],
+        call_label="VOCALSEP",
+    )
+    if output is None:
         return None
 
     vocals = _pick_vocals(output)

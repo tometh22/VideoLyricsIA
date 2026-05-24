@@ -175,19 +175,48 @@ def set_timing_source(job_id: str, source: str) -> None:
     """Record which engine produced a job's lyric timing (forced_align /
     lrclib_synced / gemini_aligner / whisper) for observability. Best-effort
     with its own short-lived session so it never holds the request
-    connection or breaks the transcription path on failure."""
+    connection or breaks the transcription path on failure.
+
+    SECURITY/CORRECTNESS (audit 2026-05-24):
+    - **Job-missing guard**: log a WARNING if no row matches `job_id` so
+      a typo or DB inconsistency doesn't silently produce a no-op. Bug D
+      (Cosas Mías auto-recovery) showed that a missing log + missing
+      write makes orphan `timing_source=NULL` rows indistinguishable
+      from a happy job.
+    - **Terminal guard**: do NOT overwrite when the job is already in a
+      terminal state (`error`, `done`, etc.). A race with the reaper /
+      worker can leave a job tagged successful in a row that the reaper
+      already marked failed — confusing telemetry forever.
+    """
+    _logger = logging.getLogger("genly")
     try:
         from database import SessionLocal
         s = SessionLocal()
         try:
             j = s.query(Job).filter(Job.job_id == job_id).first()
-            if j is not None:
-                j.timing_source = source
-                s.commit()
+            if j is None:
+                _logger.warning(
+                    "[TIMING] set_timing_source(%s, %s): no job row — possible orphan",
+                    job_id, source,
+                )
+                return
+            # Terminal-state guard. Status values declared terminal at this
+            # layer; mirror `update_job`'s terminal set so a reaper-killed
+            # job stays consistent.
+            if getattr(j, "status", None) in ("error", "transcription_failed"):
+                _logger.warning(
+                    "[TIMING] set_timing_source(%s, %s) skipped — job is in terminal state %r",
+                    job_id, source, j.status,
+                )
+                return
+            j.timing_source = source
+            s.commit()
         finally:
             s.close()
-    except Exception:
-        logging.getLogger("genly").debug("set_timing_source failed for %s", job_id)
+    except Exception as e:
+        # Surface set-timing failures as warning, not debug — bug D
+        # taught us that silent debug is the same as no log at all.
+        _logger.warning("[TIMING] set_timing_source failed for %s: %s", job_id, e)
 
 
 def supersede_sibling_drafts(
@@ -451,7 +480,19 @@ def update_job(job_id: str, **kwargs) -> None:
 
     db = SessionLocal()
     try:
-        job = db.query(Job).filter(Job.job_id == job_id).first()
+        # CORRECTNESS (audit 2026-05-24): take a row lock so concurrent
+        # `update_job` calls serialize. Without `with_for_update()`,
+        # two callers can read the same row, modify different fields,
+        # and last-writer-wins clobbers the other's changes. Real-world
+        # impact: `_step(progress=55)` racing the swap-retry
+        # `update_job(artist=X, song_title=Y)` would lose either the
+        # progress or the corrected metadata.
+        job = (
+            db.query(Job)
+            .filter(Job.job_id == job_id)
+            .with_for_update()
+            .first()
+        )
         if not job:
             return
 
