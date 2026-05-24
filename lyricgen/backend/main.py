@@ -4140,7 +4140,10 @@ async def preview(
         job = get_job(db, job_id, **_job_scope(current_user))
         if job is None:
             raise HTTPException(status_code=404, detail="Job not found.")
-        if job["status"] not in ("done", "pending_review"):
+        # Thumbnails are generated early in the pipeline and persisted on R2
+        # across re-renders, so they can be served for any job status.
+        # Only block video/short previews for jobs that haven't finished rendering.
+        if file_type != "thumbnail" and job["status"] not in ("done", "pending_review"):
             raise HTTPException(status_code=400, detail="Job is not ready for preview.")
         s3_key = (job.get("s3_keys") or {}).get(file_type)
     # DB session closed — pool is free for /usage and friends.
