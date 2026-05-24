@@ -477,10 +477,41 @@ export default function LyricsEditor({
   const audioRef = useRef(null);
   const listRef = useRef(null);
   const rowRefs = useRef({});
+  const rafRef = useRef(null);
 
   const [isPlaying, setIsPlaying] = useState(false);
   const [currentTime, setCurrentTime] = useState(0);
   const [duration, setDuration] = useState(0);
+
+  // INCIDENT (mobile 2026-05-24): the audio element's `onTimeUpdate`
+  // event fires every ~250 ms on most browsers (sometimes slower on
+  // mobile in background tabs). Lines shorter than that — short
+  // interjections ("oh!", "yeah"), rapid-fire hip-hop / reggaetón
+  // syllables, or any sub-250ms segment from forced alignment — were
+  // SKIPPED in the preview: `currentTime` jumped from before the line's
+  // start straight past its end, and `segments.find(s => t >= s.start
+  // && t < s.end)` returned null for the whole duration.
+  //
+  // Fix: while playing, drive `currentTime` from `requestAnimationFrame`
+  // (~60 fps, 16 ms granularity). Any line ≥ 1 frame appears at least
+  // once. Stop the rAF loop on pause/end to avoid burning a CPU core.
+  // `onTimeUpdate` is still wired as a fallback for seeks and the
+  // initial idle state (before the user hits play).
+  useEffect(() => {
+    if (!isPlaying) return undefined;
+    const tick = () => {
+      const a = audioRef.current;
+      if (a && !a.paused) {
+        setCurrentTime(a.currentTime);
+      }
+      rafRef.current = requestAnimationFrame(tick);
+    };
+    rafRef.current = requestAnimationFrame(tick);
+    return () => {
+      if (rafRef.current) cancelAnimationFrame(rafRef.current);
+      rafRef.current = null;
+    };
+  }, [isPlaying]);
   const [wrapWarning, setWrapWarning] = useState(null); // {ids: [...]} for 3+ line segs
   const [focusedSegId, setFocusedSegId] = useState(null); // for preview panel
 
