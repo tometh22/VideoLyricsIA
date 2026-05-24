@@ -76,28 +76,7 @@ def _pick_vocals(output) -> object | None:
 
 def validate_stem(path: str):
     """Sanity-check a vocal stem before handing it downstream (forced_align,
-    whisperX). Returns `(ok, reason)`. `reason` is a short human-readable
-    label for logs/telemetry — never None.
-
-    Incident motivation (2026-05-24 Mujer Amante): demucs returned a stem
-    that ended up as tensor shape `[1, 2, 1]` (one sample on the time axis).
-    Cureau's forced-aligner crashes with
-    `Padding size should be less than the corresponding input dimension,
-    but got: padding (200, 200) at dimension 2 of input [1, 2, 1]`,
-    burns through three retries of ~90 minutes each, and finally falls back
-    to whisperX. Pre-flighting the stem with `ffprobe` (~30-100 ms) catches
-    the degenerate case BEFORE the network round-trip.
-
-    Validations:
-    - File exists and is readable.
-    - File size >= 10 KB (anything smaller cannot encode 3 s of audio).
-    - Audio stream present, duration >= 3 s (cureau needs > ~400 samples
-      for its 200-sample symmetric padding), sample_rate in the common
-      music range {8k..48k}, channels in {1, 2}.
-
-    Conservative on purpose — when a stem fails, the caller falls through
-    to the audio mix (a safe and known-working path).
-    """
+    whisperX). Returns `(ok, reason)`. From PR #281."""
     if not path or not os.path.exists(path):
         return False, "missing"
     try:
@@ -152,9 +131,40 @@ def validate_stem(path: str):
     return True, "ok"
 
 
+_REPLICATE_ALLOWED_HOSTS = (
+    "replicate.delivery",
+    "pbxt.replicate.delivery",
+    "tjzk.replicate.delivery",
+    "api.replicate.com",
+)
+
+
+def _is_safe_replicate_url(url: str) -> bool:
+    """Refuse URLs that aren't on the Replicate CDN. SECURITY: protects
+    against SSRF / credential-leak when a model output (or DNS/proxy
+    redirect) returns a URL pointing at internal infra. From PR #284."""
+    try:
+        from urllib.parse import urlparse
+        p = urlparse(url)
+    except Exception:
+        return False
+    if p.scheme not in ("https", "http"):
+        return False
+    host = (p.hostname or "").lower()
+    if not host:
+        return False
+    return any(host == h or host.endswith("." + h) for h in _REPLICATE_ALLOWED_HOSTS)
+
+
 def _download(value, dest_path: str) -> bool:
     """Write a Replicate file output to dest_path. Handles the SDK's
-    FileOutput object (`.read()`), a URL string, or an open file-like."""
+    FileOutput object (`.read()`), a URL string, or an open file-like.
+
+    SECURITY: when the value is a URL (not a FileOutput), validate it
+    points at the Replicate CDN before downloading. A compromised model
+    or proxy redirect to `file:///etc/passwd` or an internal-IP target
+    would otherwise be fetched and written to disk.
+    """
     try:
         # replicate>=1.0 FileOutput / any object exposing read()
         if hasattr(value, "read"):
@@ -165,6 +175,10 @@ def _download(value, dest_path: str) -> bool:
         # URL string
         url = getattr(value, "url", None) or (value if isinstance(value, str) else None)
         if url:
+            if not _is_safe_replicate_url(url):
+                logger.warning("[VOCALSEP] refusing download from non-Replicate host: %s",
+                               url[:120])
+                return False
             import urllib.request
             urllib.request.urlretrieve(url, dest_path)
             return os.path.getsize(dest_path) > 0

@@ -2115,6 +2115,37 @@ def _validate_audio_filename_only(filename: str) -> None:
         )
 
 
+def _safe_basename(filename: str) -> str:
+    """Strip any directory components from a user-supplied filename and
+    reject obvious traversal attempts. Returns the bare filename safe
+    for `os.path.join(job_dir, ...)`.
+
+    SECURITY (incident class): the original code did
+    `os.path.join(job_dir, file.filename)` directly on multipart upload
+    filenames. A request with `filename="../poc.mp3"` would write
+    outside the job dir (and could overwrite a sibling job's
+    `lyric_video.mp4` if the attacker guessed the job_id). This helper
+    fixes the four call sites in one place.
+
+    Defense in depth: also rejects null bytes and control chars (which
+    some shells / databases handle inconsistently), and caps length at
+    255 chars (POSIX NAME_MAX).
+    """
+    if not filename:
+        raise HTTPException(status_code=400, detail="Missing filename.")
+    # Strip directory parts (handles both / and \, plus repeated separators).
+    base = os.path.basename(filename.replace("\\", "/"))
+    if not base or base in (".", ".."):
+        raise HTTPException(status_code=400, detail="Invalid filename.")
+    # Reject null bytes + control chars — they survive os.path.basename
+    # but cause downstream surprises (NUL truncates strings in C libs).
+    if "\x00" in base or any(ord(c) < 32 for c in base):
+        raise HTTPException(status_code=400, detail="Invalid filename.")
+    if len(base) > 255:
+        raise HTTPException(status_code=400, detail="Filename too long.")
+    return base
+
+
 @app.post("/upload-url")
 @limiter.limit("120/minute")
 async def upload_url(
@@ -2141,6 +2172,11 @@ async def upload_url(
     machinery.
     """
     _validate_audio_filename_only(body.filename)
+    # SECURITY: sanitize the user-supplied filename BEFORE it propagates
+    # to `Job.filename` (then to `OUTPUTS_DIR/<job_id>/<filename>` on
+    # /transcribe-uploaded). A traversal like `../poc.mp3` would
+    # otherwise escape the job dir at write time.
+    body.filename = _safe_basename(body.filename)
     if body.size_bytes and body.size_bytes > MAX_UPLOAD_MB * 1024 * 1024:
         raise HTTPException(
             status_code=413,
@@ -3086,9 +3122,13 @@ async def upload(
     job_dir = os.path.join(OUTPUTS_DIR, job_id)
     os.makedirs(job_dir, exist_ok=True)
 
-    mp3_path = os.path.join(job_dir, file.filename)
+    # SECURITY: never trust the user-supplied filename for path joining —
+    # `../poc.mp3` would otherwise escape the job dir. _safe_basename
+    # strips directory components + control chars + length-caps.
+    safe_name = _safe_basename(file.filename)
+    mp3_path = os.path.join(job_dir, safe_name)
     await _stream_upload_to_disk(file, mp3_path)
-    _validate_audio_file_on_disk(file.filename, mp3_path)
+    _validate_audio_file_on_disk(safe_name, mp3_path)
 
     # Upload the input MP3 to R2 regardless of whether the job will run now
     # or wait in the queue — the worker container fetches from R2 (the API
@@ -3226,12 +3266,14 @@ async def transcribe_endpoint(
 
     job_dir = os.path.join(OUTPUTS_DIR, job_id)
     os.makedirs(job_dir, exist_ok=True)
-    audio_path = os.path.join(job_dir, file.filename)
+    # SECURITY: sanitize filename before path join (see _safe_basename).
+    safe_audio_name = _safe_basename(file.filename)
+    audio_path = os.path.join(job_dir, safe_audio_name)
     # Stream the body in 1 MiB chunks. Lossless WAVs (~30-50 MB for a
     # 3-min track) used to OOM the API container under concurrent load
     # because we buffered the full payload in RAM.
     await _stream_upload_to_disk(file, audio_path)
-    _validate_audio_file_on_disk(file.filename, audio_path)
+    _validate_audio_file_on_disk(safe_audio_name, audio_path)
 
     # Cross-replica handoff. When the API and worker run in separate
     # containers (Railway production) the file written above is invisible
@@ -5578,6 +5620,16 @@ async def save_segments(
     # Light shape check — full validation lives in /generate's pipeline.
     # We just want to reject obviously broken payloads early so the
     # autosave doesn't silently store garbage.
+    #
+    # SECURITY (incident 2026-05-24 audit): also reject non-finite floats
+    # (NaN/Infinity). Python `json` accepts them, but Postgres JSONB
+    # rejects on insert → opaque 500. Sorting NaN is undefined in Timsort
+    # so a NaN start corrupts the entire timeline order. And cap text
+    # size at 2 KB per line: anything bigger is a paste error or DoS, and
+    # libass wraps badly past that anyway.
+    import math
+    _MAX_TEXT_CHARS = 2000   # per-segment text cap
+    _MAX_END_S = 24 * 3600   # 24h ceiling — songs are seconds, not days
     for i, seg in enumerate(segs):
         if not isinstance(seg, dict):
             raise HTTPException(status_code=400, detail=f"segments[{i}] must be an object")
@@ -5587,6 +5639,32 @@ async def save_segments(
                     status_code=400,
                     detail=f"segments[{i}] missing required key {k!r}",
                 )
+        try:
+            start_f = float(seg["start"])
+            end_f = float(seg["end"])
+        except (TypeError, ValueError):
+            raise HTTPException(
+                status_code=400,
+                detail=f"segments[{i}] start/end must be numeric",
+            )
+        if not (math.isfinite(start_f) and math.isfinite(end_f)):
+            raise HTTPException(
+                status_code=400,
+                detail=f"segments[{i}] start/end must be finite (NaN/Infinity rejected)",
+            )
+        if start_f < 0 or end_f < 0 or end_f > _MAX_END_S or start_f > end_f:
+            raise HTTPException(
+                status_code=400,
+                detail=f"segments[{i}] start/end out of range (need 0 ≤ start ≤ end ≤ {_MAX_END_S}s)",
+            )
+        text = seg.get("text", "")
+        if not isinstance(text, str):
+            raise HTTPException(status_code=400, detail=f"segments[{i}].text must be a string")
+        if len(text) > _MAX_TEXT_CHARS:
+            raise HTTPException(
+                status_code=400,
+                detail=f"segments[{i}].text too long ({len(text)} chars > {_MAX_TEXT_CHARS})",
+            )
 
     # Sort by start ascending so downstream consumers (renderer, sync-mode
     # neighbor clamp, lookup-by-cronological-position) can assume a

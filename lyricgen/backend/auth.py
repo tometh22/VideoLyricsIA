@@ -289,6 +289,31 @@ def create_user(
     if not tenant_id:
         tenant_id = username.lower().replace(" ", "_")
 
+    # SECURITY (incident 2026-05-24): block users from auto-deriving a
+    # reserved tenant_id. Without this, anyone registering with
+    # `username="default"` lands in the admin tenant (`ensure_default_admin`
+    # uses `tenant_id="default"`) and inherits visibility of every admin
+    # job via the tenant_id-only `_job_scope`. Same risk for any tenant
+    # whose id is a username-shaped string ("umg", "epical", etc.).
+    _RESERVED_TENANT_IDS = {
+        "default", "admin", "system", "root", "internal",
+        "umg", "epical", "genly",
+    }
+    if tenant_id in _RESERVED_TENANT_IDS:
+        raise ValueError(
+            f"Tenant '{tenant_id}' is reserved — choose a different username "
+            f"or contact an administrator to be added to that team."
+        )
+    # Also defend against tenant_id collision with an existing tenant: if
+    # any user already owns that tenant_id, refuse (the new user would
+    # see those users' jobs).
+    existing_in_tenant = db.query(User).filter(User.tenant_id == tenant_id).first()
+    if existing_in_tenant is not None:
+        raise ValueError(
+            f"Tenant '{tenant_id}' already exists — choose a different "
+            f"username (yours would have been derived to the same tenant)."
+        )
+
     user = User(
         username=username,
         email=email,
