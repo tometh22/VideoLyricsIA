@@ -39,7 +39,7 @@ logger = logging.getLogger("genly.replicate_budget")
 # Error message fragments (lowercase substring match) that won't get
 # better on retry. Aborting on these saves 32 s of sleeps + 3 RTTs.
 NON_RETRYABLE_FRAGMENTS = (
-    "padding size",          # cureau `[1, 2, 1]` tensor crash
+    "padding size",          # cureau `[1, 2, 1]` tensor crash (PR #281)
     "argument #4",
     "validationerror",
     "validation error",
@@ -49,6 +49,20 @@ NON_RETRYABLE_FRAGMENTS = (
     "model is not currently available",  # Replicate-specific terminal
     "authentication required",
     "not authorized",
+    # HOTFIX 2026-05-24 (operator: "ETA stuck en 122s nunca avanzó"):
+    # cureau also crashes with `[1, 2, 0]` (zero-sample tensor —
+    # happens when the audio file has metadata duration > 0 but the
+    # actual sample payload is empty/silent). ffprobe-based
+    # `validate_stem` passes it because the header looks fine. Full
+    # error string:
+    #   "Expected 2D or 3D (batch mode) tensor with possibly 0 batch
+    #    size and other non-zero dimensions for input, but got: [1, 2, 0]"
+    # Retries ate ~32s of sleeps × 3 attempts before falling through.
+    # Aborting on attempt 1 cuts the wasted wallclock by ~90%.
+    "expected 2d or 3d",
+    "batch mode",
+    "got: [1, 2, 0]",
+    "non-zero dimensions",
 )
 
 

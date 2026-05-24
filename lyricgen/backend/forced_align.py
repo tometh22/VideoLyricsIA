@@ -354,6 +354,29 @@ def forced_align_lyrics(audio_path: str, lyrics_text: str) -> list[dict] | None:
     transcript = "\n".join(lyric_lines)
     upload_path, is_temp = _compress_for_upload(audio_path)
 
+    # POST-COMPRESS validation (HOTFIX 2026-05-24): the pre-flight
+    # `_validate_stem` above runs on the SOURCE audio. `_compress_for_upload`
+    # transcodes via ffmpeg → mono 128k MP3. If the source has a valid
+    # header but the body is silent/corrupt (real case observed in
+    # production: cureau crashed with `Expected 2D or 3D tensor ... got
+    # [1, 2, 0]`), the post-compress MP3 may have 0 effective samples
+    # even though the size > 0 byte gate passed.
+    # Validate the upload_path the same way before paying the network
+    # round-trip. If it fails, fall back instead of feeding zero samples
+    # to the model.
+    try:
+        from vocal_sep import validate_stem as _validate_stem
+        ok2, reason2 = _validate_stem(upload_path)
+        if not ok2:
+            logger.warning("[FORCED] post-compress audio invalid (%s) — falling back",
+                           reason2)
+            if is_temp:
+                try: os.unlink(upload_path)
+                except OSError: pass
+            return None
+    except Exception as e:
+        logger.debug("[FORCED] post-compress validation skipped (%s)", e)
+
     # Build a fresh input dict per attempt — the audio file handle is
     # consumed on each upload, so we need to reopen it.
     def _input_factory():
