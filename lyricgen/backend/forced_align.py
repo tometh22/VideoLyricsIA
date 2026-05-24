@@ -176,7 +176,27 @@ def wordstamps_to_segments(
             end = last_start + normal_tail
         if end < start:
             end = start
-        segs.append({"start": start, "end": end, "text": line})
+        # Preserve per-word stamps + score on the line so the editor can do
+        # karaoke + confidence-highlighting. Each word carries its original
+        # start/end and (if the model returned probabilities) score 0-1.
+        words_out = []
+        for w in span:
+            try:
+                w_obj = {
+                    "word": str(w.get("word", "")).strip(),
+                    "start": float(w.get("start")),
+                    "end": float(w.get("end")),
+                }
+                if w.get("score") is not None:
+                    w_obj["score"] = float(w.get("score"))
+                if w_obj["word"]:
+                    words_out.append(w_obj)
+            except (TypeError, ValueError):
+                continue
+        seg_out = {"start": start, "end": end, "text": line}
+        if words_out:
+            seg_out["words"] = words_out
+        segs.append(seg_out)
 
         prev_start = best_start
         cur = best_start + wc   # re-anchor the cursor past the matched span
@@ -237,19 +257,35 @@ def forced_align_lyrics(audio_path: str, lyrics_text: str) -> list[dict] | None:
     upload_path, is_temp = _compress_for_upload(audio_path)
     output = None
     last_err = None
+    # Backoff schedule for retries. Replicate sometimes throttles with 429
+    # ("burst of 1") under load; the model itself can also flake with a
+    # transient `[1, 2, 0]` tensor error on the first attempt. Three tries
+    # with 0s / 8s / 24s sleep handles both. Long-form audio is expensive to
+    # re-upload so we cap at 3.
+    import time as _time
+    _BACKOFF_SEC = [0, 8, 24]
     try:
-        # Retry the upload/run once: large-file uploads to Replicate can
-        # drop with Broken pipe intermittently.
-        for attempt in range(2):
+        for attempt in range(len(_BACKOFF_SEC)):
+            if _BACKOFF_SEC[attempt] > 0:
+                _time.sleep(_BACKOFF_SEC[attempt])
             try:
                 with open(upload_path, "rb") as audio:
                     output = replicate.run(
-                        _MODEL, input={"audio_file": audio, "transcript": transcript},
+                        _MODEL,
+                        input={
+                            "audio_file": audio,
+                            "transcript": transcript,
+                            # show_probabilities returns per-word `score` (0-1)
+                            # which we surface to the editor for confidence
+                            # highlighting on low-certainty lines.
+                            "show_probabilities": True,
+                        },
                     )
                 break
             except Exception as e:  # network, billing, model error, anything
                 last_err = e
-                logger.warning("[FORCED] replicate attempt %s failed (%s)", attempt + 1, e)
+                logger.warning("[FORCED] replicate attempt %s/%s failed (%s)",
+                               attempt + 1, len(_BACKOFF_SEC), e)
     finally:
         if is_temp:
             try:
@@ -257,7 +293,8 @@ def forced_align_lyrics(audio_path: str, lyrics_text: str) -> list[dict] | None:
             except OSError:
                 pass
     if output is None:
-        logger.warning("[FORCED] replicate failed after retries (%s) — falling back", last_err)
+        logger.warning("[FORCED] replicate failed after %s retries (%s) — falling back",
+                       len(_BACKOFF_SEC), last_err)
         return None
 
     words = (

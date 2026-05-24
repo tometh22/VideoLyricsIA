@@ -3110,18 +3110,22 @@ async def _run_transcription_for_job(
         import vocal_sep
         _stem_state = {"computed": False, "path": None}
 
-        # Rotor's "rhythm engine" — detect the song's beat grid and snap each
-        # segment.start to the nearest strong beat within ±200ms. Subtitles
-        # land on the music, not just on the voice. Behind BEAT_SNAP_ENABLED;
-        # no-op when disabled or detection fails. See beat_snap.py.
-        # Also tag chorus repetitions (segments with identical normalised
-        # text appearing 2+ times) with `repetition_group: N` so the editor
-        # can render "Coro #1" styling. See chorus_trim.py.
+        # Final post-processing chain applied to EVERY return path so all
+        # timing sources (forced_align / whisperx / whisperx_reconciled /
+        # whisper-1 fallback) get the same polish:
+        #   1. split_long_segments — break >6s lines at biggest word gap
+        #      (only when per-word stamps are present; no-op otherwise)
+        #   2. beat_snap — snap starts to the song's beat grid (±200ms)
+        #   3. mark_repetitions — tag chorus loops with repetition_group
+        # See whisperx_transcribe.py, beat_snap.py, chorus_trim.py.
         import beat_snap as _beat_snap
         import chorus_trim as _chorus_trim
+        from whisperx_transcribe import _split_long_segments as _split_long
         def _snap(segs):
             return _chorus_trim.mark_repetitions(
-                _beat_snap.apply(tmp_path, segs)
+                _beat_snap.apply(tmp_path,
+                    _split_long(segs)
+                )
             )
 
         async def _get_align_audio() -> str:
@@ -3217,152 +3221,46 @@ async def _run_transcription_for_job(
                             "reference_lyrics": fa_text,
                             "recovery_source": "forced_align",
                         }
-            if synced:
-                user_dur = await asyncio.to_thread(_audio_duration, tmp_path)
-                offset = 0.0
-                use_synced = True
-                hybrid_intro_segs: list[dict] = []
-                if user_dur is not None and lrc_dur:
-                    diff = user_dur - lrc_dur
-                    # diff < 0 = user audio SHORTER than lrclib studio version.
-                    # Common cases: radio edit, album cut con fade-out
-                    # diferente, intro/outro trimmed. Hasta -15s el body de
-                    # la canción es idéntico — lrclib synced timestamps
-                    # siguen siendo válidos para las líneas que caen dentro
-                    # del audio del user. _lrc_to_segments ya clampa el `end`
-                    # del último segment a `audio_duration` (línea 1739-1742
-                    # de pipeline.py), así que líneas que caigan después del
-                    # final del audio quedan con end=audio_duration sin
-                    # romper nada. Caso real que motivó esto: Mujer Amante
-                    # Rata Blanca, user_dur=365.2, lrclib=374.0, diff=-8.8.
-                    # Antes caía a Whisper innecesariamente y mergeaba 2-en-1.
-                    if -15.0 <= diff <= 3.0:
-                        offset = 0.0
-                    elif 3.0 < diff <= 120.0:
-                        offset = float(diff)
-                        # User has extra audio at the start (typical "Official
-                        # Video" cut with a dialogue intro). Slice that chunk
-                        # and run Whisper on it so the operator gets the
-                        # spoken dialogue subtitled too — they can prune in
-                        # the editor if they don't want to publish it.
-                        intro_path = os.path.join(tmp_dir, "intro.mp3")
-                        if _slice_audio_prefix(tmp_path, intro_path, diff + 1.0):
-                            try:
-                                wsegs = await loop.run_in_executor(
-                                    None, transcribe, intro_path, lang, plain,
-                                )
-                                # Keep only segments that fully sit in the
-                                # intro window — defensive, in case ffmpeg
-                                # cut on a frame boundary slightly past `diff`.
-                                hybrid_intro_segs = [
-                                    s for s in wsegs if s["end"] <= diff + 0.5
-                                ]
-                            except Exception as e:
-                                logger.error("[LYRICS] intro Whisper failed: %s", e, exc_info=True)
-                            finally:
-                                try:
-                                    os.unlink(intro_path)
-                                except OSError:
-                                    pass
-                        logger.info("[LYRICS] lrclib duration mismatch (user=%.1fs, lrclib=%.1fs) — +%.2fs offset on song; intro Whisper produced %s segments", user_dur, lrc_dur, offset, len(hybrid_intro_segs))
-                    else:
-                        use_synced = False
-                        logger.warning("[LYRICS] lrclib duration mismatch (user=%.1fs, lrclib=%.1fs, diff=%+.1fs) — too risky to auto-align, falling back to Whisper", user_dur, lrc_dur, diff)
-                if use_synced:
-                    song_segs = _lrc_to_segments(
-                        synced, lrc_dur, time_offset=offset,
+            # WORLD-CLASS audio-as-truth principle (Rotor architecture):
+            # lrclib provides TEXT, never timing. Synced timestamps in lrclib are
+            # community-curated and can be globally mis-aligned to a specific
+            # master (incident "Cosas Mías": lrclib placed the first line at
+            # 49.4s while the user's audio sang it ~35s earlier; verify at 0.54
+            # confidence was borderline-accepted by the old threshold). We
+            # ELIMINATED that path. When lrclib has text but forced-align
+            # didn't succeed above (or wasn't enabled), try whisperX next —
+            # the AUDIO decides timing, lrclib only contributes canonical
+            # text via reconcile.
+            if synced or plain:
+                import whisperx_transcribe
+                if whisperx_transcribe.is_enabled():
+                    await _step("transcribe.transcribe_word", 70)
+                    _aa = await _get_align_audio()
+                    fa_text_for_wx = plain or forced_align.lrc_to_plain_text(synced)
+                    wx_segs = await asyncio.to_thread(
+                        whisperx_transcribe.transcribe_whisperx, _aa, lang,
                     )
-                    # Alignment verification by CONTENT. lrclib's community
-                    # synced timestamps are tied to a SPECIFIC master and can
-                    # be globally mis-timed even when the total duration
-                    # matches ours — so a duration-only check (offset) is not
-                    # enough. Incident "Cosas Mías" (Los Abuelos de la Nada):
-                    # lrclib placed the first line at 49.4s; the user's audio
-                    # sang it ~35s earlier; durations matched so offset=0, and
-                    # — because verification used to be gated behind
-                    # `offset > 0` — nothing checked it and we shipped a video
-                    # shifted ~35s. We now verify in ALL cases: slice ~5s of
-                    # the user's audio where we claim a line starts, run
-                    # Whisper, fuzzy-match. Probe TWO points (~1/3 and ~2/3)
-                    # because a repeated chorus can make one slice match the
-                    # wrong occurrence — we trust if EITHER matches (take the
-                    # max). Cost: 1-2 Whisper calls on ~5s of audio
-                    # (~$0.0005-0.001) and ~3-6s latency.
-                    _verify_always = os.environ.get(
-                        "LRCLIB_VERIFY_ALWAYS", "1"
-                    ).strip().lower() in ("1", "true", "yes", "on", "y", "t")
-                    _verify_threshold = float(
-                        os.environ.get("LRCLIB_VERIFY_THRESHOLD", "0.4")
-                    )
-                    if (_verify_always or offset > 0) and song_segs:
-                        # Probe ~1/3 and ~2/3 through; skip the first line
-                        # (often a short ad-lib like "¡Karol!").
-                        n = len(song_segs)
-                        probe_idxs = sorted({
-                            min(n - 1, max(0, n // 3)),
-                            min(n - 1, max(0, (2 * n) // 3)),
-                        })
-                        confidences: list[float] = []
-                        # Verification reads ~5s of audio and runs Whisper-1
-                        # on it; we use the MIX (tmp_path) here so this path
-                        # never triggers the lazy demucs run. lrclib synced
-                        # that verifies → no FA / whisperX needed → no demucs
-                        # ever — biggest speedup on the happy path.
-                        for pi in probe_idxs:
-                            verify_seg = song_segs[pi]
-                            # Skip probes whose text is too short to fuzzy-match
-                            # reliably.
-                            if len(verify_seg["text"]) < 10:
-                                continue
-                            c = await asyncio.to_thread(
-                                _verify_lrclib_alignment,
-                                tmp_path, verify_seg["text"], verify_seg["start"],
-                            )
-                            if c is not None:
-                                confidences.append(c)
-                        if confidences:
-                            best = max(confidences)
-                            if best < _verify_threshold:
-                                logger.warning("[LYRICS] alignment verification FAILED (best confidence=%.2f over %d probe(s), offset=%.1fs) — falling back to Whisper+plain", best, len(confidences), offset)
-                                use_synced = False
-                            else:
-                                logger.info("[LYRICS] alignment verified (best confidence=%.2f over %d probe(s), offset=%.1fs)", best, len(confidences), offset)
-                        elif offset > 60.0:
-                            # High-offset cases are riskier — if we can't even
-                            # verify, don't gamble; fall back. (offset is set
-                            # from the duration diff, so offset>60 == diff>60.)
-                            logger.warning("[LYRICS] alignment verification unavailable for high offset (%.1fs) — falling back", offset)
-                            use_synced = False
-                    if use_synced and song_segs and len(song_segs) >= 8:
-                        from pipeline import (
-                            _filter_intro_song_overlap,
-                            _fix_lrc_first_line_at_zero,
-                        )
-                        hybrid_intro_segs, _dup = _filter_intro_song_overlap(
-                            hybrid_intro_segs, song_segs,
-                        )
-                        if _dup:
-                            logger.info("[LYRICS] discarded %s intro seg(s) as song-line hallucinations", _dup)
-                        # Only apply the gap-based first-line correction
-                        # when we don't have an intro Whisper pass to
-                        # cover the pre-vocal region — otherwise the
-                        # intro segments naturally sit before line 1 and
-                        # there's no anomaly to fix.
-                        if not hybrid_intro_segs:
-                            song_segs, _moved = _fix_lrc_first_line_at_zero(
-                                song_segs, audio_duration=user_dur,
-                            )
-                            if _moved is not None:
-                                logger.info("[LYRICS] lrclib line 1 was anchored at 0s with a long gap to line 2; shifted to %.2fs based on median cadence", _moved)
-                        combined = hybrid_intro_segs + song_segs
-                        logger.info("[LYRICS] lrclib synced hit — %s segments (%s intro + %s song), skipping main Whisper for %r - %r", len(combined), len(hybrid_intro_segs), len(song_segs), artist_hint, song_hint)
-                        from jobs import set_timing_source
-                        set_timing_source(job_id, "lrclib_synced")
-                        return {
-                            "job_id": job_id,
-                            "segments": _snap(combined),
-                            "reference_lyrics": plain or synced,
-                        }
+                    if wx_segs:
+                        from pipeline import _filter_whisper_hallucinations as _fwh
+                        wx_segs, _ = _fwh(wx_segs)
+                        _wx_dur = await asyncio.to_thread(_audio_duration, tmp_path)
+                        _hall, _why = _detect_hallucination(wx_segs, _wx_dur, language=lang)
+                        if not _hall and len(wx_segs) >= 2:
+                            # Reconcile: whisperX timing + lrclib canonical text
+                            import whisperx_reconcile
+                            _reconciled = whisperx_reconcile.reconcile(wx_segs, fa_text_for_wx) if fa_text_for_wx else None
+                            final_segs = _reconciled if _reconciled else wx_segs
+                            _src_tag = "whisperx_reconciled" if _reconciled else "whisperx"
+                            logger.info("[LYRICS] lrclib-text fallback via whisperX — %s segments [%s]", len(final_segs), _src_tag)
+                            from jobs import set_timing_source
+                            set_timing_source(job_id, _src_tag)
+                            return {
+                                "job_id": job_id,
+                                "segments": _snap(final_segs),
+                                "reference_lyrics": fa_text_for_wx if _reconciled else "",
+                            }
+                        logger.warning("[LYRICS] lrclib-text whisperX rejected (%s) — falling through to plain+Whisper", _why or "thin")
+
             # No synced (or too few segments / unreliable timestamps) — but
             # we still have plain text from lrclib. Use it as the reference
             # so the editor's suggestion engine fires, and skip the Gemini-
