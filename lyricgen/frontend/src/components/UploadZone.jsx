@@ -1528,7 +1528,7 @@ export default function UploadZone({
                               )}
                             </div>
                             <div className="px-3 py-2">
-                              <p className="text-[12px] text-white truncate">{bg.name}</p>
+                              <p className="text-caption text-white truncate">{bg.name}</p>
                             </div>
                           </button>
                         );
@@ -1793,7 +1793,7 @@ export default function UploadZone({
                         rows={3}
                         maxLength={2000}
                         placeholder={t("upload.bg_prompt_placeholder") || "Ej: mansión surreal de noche, pileta vacía, cámara fija, sólo se mueve el reflejo del agua…"}
-                        className="w-full text-[12px] rounded-lg bg-surface-1 border border-white/[0.08] focus:border-brand/50 px-3 py-2 text-gray-200 placeholder:text-gray-600 resize-y outline-none"
+                        className="w-full text-caption rounded-lg bg-surface-1 border border-white/[0.08] focus:border-brand/50 px-3 py-2 text-gray-200 placeholder:text-gray-600 resize-y outline-none"
                       />
                       <label className="mt-2 flex items-center gap-2.5 cursor-pointer">
                         <input

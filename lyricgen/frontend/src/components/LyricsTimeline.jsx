@@ -359,7 +359,7 @@ export default function LyricsTimeline({
               <div
                 key={seg._id}
                 className={[
-                  "absolute rounded-md overflow-hidden text-[12px] leading-tight ring-1 transition-colors",
+                  "absolute rounded-md overflow-hidden text-caption leading-tight ring-1 transition-colors",
                   isActive ? "bg-brand/25" : "bg-surface-3/25",
                   isLocked ? "ring-brand/60" : "ring-white/[0.07]",
                   isFocused ? "outline outline-1 outline-brand-light" : "",
@@ -411,7 +411,7 @@ export default function LyricsTimeline({
                         else if (ev.key === "Escape") { ev.preventDefault(); cancelTextEdit(); }
                       }}
                       className="flex-1 min-w-0 bg-surface-1 border border-brand/50 focus:border-brand
-                        outline-none rounded px-1 py-0.5 text-[12px] text-white"
+                        outline-none rounded px-1 py-0.5 text-caption text-white"
                     />
                   ) : (
                     <span

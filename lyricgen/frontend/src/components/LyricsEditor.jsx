@@ -1797,7 +1797,7 @@ export default function LyricsEditor({
             </span>
             <button
               onClick={tapAnchor}
-              className="shrink-0 h-8 px-3 rounded-lg bg-brand hover:bg-brand-light text-white text-[12px]
+              className="shrink-0 h-8 px-3 rounded-lg bg-brand hover:bg-brand-light text-white text-caption
                 font-semibold transition-colors flex items-center gap-1.5"
             >
               <svg className="w-3 h-3" fill="none" stroke="currentColor" strokeWidth="3" viewBox="0 0 24 24">
@@ -2411,7 +2411,7 @@ export default function LyricsEditor({
             onClick={addBlankLine}
             className="w-full mt-2 py-2.5 rounded-xl border border-dashed border-white/[0.08]
               hover:border-brand/40 hover:bg-brand/[0.04] text-gray-500 hover:text-brand-light
-              text-[12px] transition-all flex items-center justify-center gap-1.5"
+              text-caption transition-all flex items-center justify-center gap-1.5"
           >
             <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
               <path d="M12 5v14M5 12h14" />

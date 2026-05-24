@@ -419,6 +419,11 @@ export default function App() {
   const [resetToken, setResetToken] = useState(null);
   const [billingSuccess, setBillingSuccess] = useState(false);
   const pollingIntervals = useRef(new Set());
+  // R-FRONT-5 (Frontend specialist 2026-05-24): isMountedRef previene
+  // setState-on-unmounted warnings + memory leaks cuando el operador
+  // navega away durante un SSE/polling en curso. Cada callback async
+  // chequea esto antes de tocar state.
+  const isMountedRef = useRef(true);
   // 2 concurrent workers: enough to keep the queue fed without spiking
   // the API with 5 simultaneous upload-url+generate calls from one user.
   const PARALLEL_WORKERS = 2;
@@ -653,6 +658,7 @@ export default function App() {
         const cleanup = () => { es.close(); pollingIntervals.current.delete(es); };
         pollingIntervals.current.add(es);
         es.onmessage = (e) => {
+          if (!isMountedRef.current) { cleanup(); return; }
           try {
             const data = JSON.parse(e.data);
             setJobs((prev) => prev.map((j) =>
@@ -665,7 +671,7 @@ export default function App() {
             ));
             if (TERMINAL.has(data.status)) {
               cleanup();
-              fetchHistory();
+              if (isMountedRef.current) fetchHistory();
               resolve(data.status);
             }
           } catch {}
@@ -682,6 +688,12 @@ export default function App() {
       function startPolling() {
         const iv = setInterval(async () => {
           if (typeof document !== "undefined" && document.hidden) return;
+          if (!isMountedRef.current) {
+            clearInterval(iv);
+            pollingIntervals.current.delete(iv);
+            resolve("aborted");
+            return;
+          }
           if (!getToken()) {
             clearInterval(iv);
             pollingIntervals.current.delete(iv);
@@ -699,6 +711,12 @@ export default function App() {
             }
             if (!res.ok) return;
             const data = await res.json();
+            if (!isMountedRef.current) {
+              clearInterval(iv);
+              pollingIntervals.current.delete(iv);
+              resolve("aborted");
+              return;
+            }
             setJobs((prev) => prev.map((j) =>
               j.job_id === jobId
                 ? { ...j, status: data.status, current_step: data.current_step,
@@ -710,7 +728,7 @@ export default function App() {
             if (TERMINAL.has(data.status)) {
               clearInterval(iv);
               pollingIntervals.current.delete(iv);
-              fetchHistory();
+              if (isMountedRef.current) fetchHistory();
               resolve(data.status);
             }
           } catch {}
@@ -722,6 +740,10 @@ export default function App() {
   }, [fetchHistory, handleLogout]);
 
   useEffect(() => () => {
+    // R-FRONT-5: marca unmounted ANTES de cerrar handles para que
+    // cualquier callback async en flight (SSE messages bufferadas, polls
+    // ya disparados) salga temprano vía el guard sin tocar state.
+    isMountedRef.current = false;
     pollingIntervals.current.forEach((handle) => {
       if (handle && typeof handle.close === "function") handle.close();
       else clearInterval(handle);
@@ -819,6 +841,9 @@ export default function App() {
         setRowStatus(file, "uploading");
         const { jobId } = await uploadFileToR2(file, {
           meta: { artist: entry.artist || "", title: (entry.songTitle || "").trim() },
+          // R-FRONT-3 end-to-end: si handleReset abort, la upload se corta
+          // en la mitad del multipart en vez de seguir hasta terminar.
+          signal: controller && controller.signal,
         });
         setRowStatus(file, "queued");
         const res = await authFetchWithRetryOn503(`${API}/transcribe-uploaded`, {
@@ -830,6 +855,7 @@ export default function App() {
             artist: entry.artist || "",
             title: (entry.songTitle || "").trim(),
           }),
+          signal: controller && controller.signal,
         }, { maxRetries: 3 });
         if (!res.ok) {
           prefetchCache.current[idx] = { status: "error" };
@@ -851,7 +877,13 @@ export default function App() {
         } else {
           prefetchCache.current[idx] = { status: "error" };
         }
-      } catch {
+      } catch (err) {
+        // R-FRONT-3 e2e: handleReset disparó abort. Salimos clean del
+        // loop sin marcar "error" (no es un fallo real — es cancelación).
+        if (err && (err.name === "AbortError" || (controller && controller.signal.aborted))) {
+          prefetchCache.current[idx] = { status: "aborted" };
+          break;
+        }
         prefetchCache.current[idx] = { status: "error" };
         setRowStatus(file, "error");
       }
