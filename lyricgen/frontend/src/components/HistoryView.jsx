@@ -80,10 +80,10 @@ function VideoCard({ job, onSelect, onDelete, selected, onToggleSelect, t }) {
       artistName = fallbackName.split("_").slice(1).join("_");
     }
   }
-  // Show thumbnail for editing too — there's a prior rendered video on R2
-  // (the user is requesting a re-render OF an existing video) so the
-  // thumbnail is real, just temporarily stale.
-  const showThumb = job.status === "done" || job.status === "pending_review" || job.status === "editing";
+  // Always attempt to show the thumbnail — it's generated early in the pipeline
+  // and persisted on R2, so it may exist for any status (including re-processing
+  // jobs). The onError handler hides the image gracefully if not yet available.
+  const showThumb = true;
   const thumbSrc = useMediaUrl(showThumb ? job.job_id : "", "thumbnail", "preview");
   const canDelete = DELETABLE.has(job.status);
 
