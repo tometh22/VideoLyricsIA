@@ -74,22 +74,59 @@ export default function useJobProgress(jobId, { api, token } = {}) {
         : `${api}/events/${jobId}`;
       const es = new EventSource(url);
       esRef.current = es;
+      // INCIDENT (audit 2026-05-24): the previous fallback only fired
+      // when `es.readyState === EventSource.CLOSED`. But browsers park
+      // in CONNECTING when the server returns 500 chronic — they retry
+      // forever, never reach CLOSED, and the polling fallback never
+      // ran. UI stayed at progress=0 indefinitely.
+      //
+      // Now we treat ANY onerror burst as a signal to start polling in
+      // parallel (the polling does no harm even if SSE eventually
+      // reconnects — `apply` is idempotent and both sources read the
+      // same row). Additionally, a wall-clock timeout: if we haven't
+      // received any event within 8 seconds of opening, start polling
+      // proactively so the user always sees motion.
+      let openedAt = Date.now();
+      let receivedAny = false;
+      let pollingStarted = false;
+      const startPollingOnce = () => {
+        if (pollingStarted) return;
+        pollingStarted = true;
+        startPolling();
+      };
+      const noEventTimer = setTimeout(() => {
+        if (!receivedAny) startPollingOnce();
+      }, 8000);
       es.onmessage = (ev) => {
+        receivedAny = true;
         try { apply(JSON.parse(ev.data)); }
         catch { /* malformed event */ }
       };
       es.onerror = () => {
-        // EventSource auto-reconnects; if it keeps failing, fall back to polling.
-        if (es.readyState === EventSource.CLOSED) {
-          esRef.current = null;
-          startPolling();
+        // The error fires both on a recoverable disconnect (browser
+        // will reconnect) AND on terminal 4xx/5xx. We can't distinguish
+        // reliably across browsers — so any error after a brief grace
+        // period triggers polling. If SSE recovers, both sources run
+        // and `apply` deduplicates by overwriting with the latest data.
+        const sinceOpen = Date.now() - openedAt;
+        if (es.readyState === EventSource.CLOSED || sinceOpen > 3000) {
+          startPollingOnce();
         }
+      };
+      // Safety: if we unmount or the job closes, kill the timer too.
+      const origClose = close;
+      esRef.currentCleanup = () => {
+        try { clearTimeout(noEventTimer); } catch { /* noop */ }
       };
     } catch {
       startPolling();
     }
 
-    return close;
+    return () => {
+      // Tear down both the timer and the existing close handler.
+      try { esRef.currentCleanup?.(); } catch { /* noop */ }
+      close();
+    };
   }, [jobId, api, token]);
 
   return state;

@@ -574,22 +574,52 @@ export default function App() {
   // Proactively refresh the JWT when it has less than 1 day left, so users
   // with active sessions never hit a sudden 401 mid-session. Runs once per
   // token value (i.e. on load and whenever a fresh token is stored).
+  //
+  // INCIDENT (audit 2026-05-24): the previous code had two silent-failure
+  // modes:
+  //   (1) An already-expired token (secondsLeft < 0) bypassed the
+  //       `> 86400` early-return (negative is < 86400 → falls through
+  //       to refresh), but if `/auth/refresh` then 401'd, the bare
+  //       `.catch(() => {})` swallowed it. The user kept typing into a
+  //       dead session — every autosave 401'd silently, every "Generar"
+  //       click failed with no clear cause.
+  //   (2) Same shape on a network failure: refresh fails, no logout, no
+  //       toast, user stranded.
+  //
+  // Fix: if the token is already expired OR refresh fails (any reason),
+  // force a clean logout so the login screen renders and the user knows
+  // what to do. Network blips during refresh-while-still-valid still get
+  // a silent retry (the existing 401 interceptors handle the in-flight
+  // requests).
   useEffect(() => {
     if (!token) return;
     const exp = getTokenExp(token);
     if (!exp) return;
     const secondsLeft = exp - Math.floor(Date.now() / 1000);
-    if (secondsLeft > 86400) return; // more than 1 day left — no action needed
+    const alreadyExpired = secondsLeft <= 0;
+    if (!alreadyExpired && secondsLeft > 86400) return;
     authFetch(`${API}/auth/refresh`, { method: "POST" })
-      .then((r) => (r.ok ? r.json() : null))
+      .then((r) => (r.ok ? r.json() : Promise.reject(new Error(`refresh ${r.status}`))))
       .then((data) => {
         if (data?.token) {
           localStorage.setItem("genly_token", data.token);
           setToken(data.token);
+        } else {
+          throw new Error("refresh response missing token");
         }
       })
-      .catch(() => {});
-  }, [token]);
+      .catch((err) => {
+        if (alreadyExpired) {
+          // Hard logout — the session is unrecoverable.
+          console.warn("[auth] token expired and refresh failed — logging out:", err?.message);
+          handleLogout();
+        } else {
+          // Token still valid for now; log the failure so it shows up in
+          // devtools but don't disrupt the session.
+          console.warn("[auth] preemptive refresh failed (will retry on next mount):", err?.message);
+        }
+      });
+  }, [token, handleLogout]);
 
   // `historyError` lets the dashboard surface a "connection failed,
   // retry" state instead of silently rendering an empty list when /jobs

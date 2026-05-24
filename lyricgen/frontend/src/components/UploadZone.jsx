@@ -538,12 +538,49 @@ export default function UploadZone({
     { code: "anton",           label: "Anton",                             css: "'Anton', sans-serif",      weight: 400 },
   ];
 
-  // Two upload conventions are supported:
-  //   "Artist - Title.ext"  → artist=Artist, song=Title
-  //   "Title_Artist.ext"    → song=Title,    artist=Artist
-  // The `_` form is what Suno / YouTube exports emit, and what the
-  // operator was uploading when the title was lost end-to-end. Stripping
-  // " (Official Video)" / etc. keeps the lrclib lookup hitting.
+  // Filename → artist/title heuristic. ONE convention now: the FIRST
+  // half (left of the separator) is the ARTIST. Same rule for both ` - `
+  // and `_` separators. Noise suffixes ("Official Video", "Live", etc.)
+  // are stripped case-insensitively from the title, with or without
+  // brackets/parens.
+  //
+  // History (incident 2026-05-24): the previous code inverted the roles
+  // for the `_` separator ("Title_Artist" convention, justified as
+  // "what Suno emits"). A user uploading `Viejas Locas_Legalícenla.mp3`
+  // (the more common `Artist_Title` order — what every Mac/Windows
+  // export does when Finder strips spaces) ended up with
+  // artist="Legalícenla", title="Viejas Locas". lrclib lookup failed,
+  // the pipeline fell to whisperX-only, and the editor shipped
+  // "Le realicen la..." instead of the actual chorus "Legalícenla".
+  // PR #280 added a backend swap-retry that auto-corrects the metadata,
+  // but the frontend was still INDUCING the inversion silently. This
+  // unifies the convention so the swap-retry is the second line of
+  // defense, not the first.
+  //
+  // If the user really has a Suno-style "Title_Artist.mp3" file, they
+  // can hand-edit the inputs — the backend will detect the swap and
+  // auto-correct via PR #280. So the trade-off is asymmetric: this
+  // fix is correct for the common case, harmless (auto-corrected) for
+  // the rare Suno case.
+  const _NOISE_PATTERNS = [
+    /\s*[\(\[]\s*official\s+video\s*[\)\]]/gi,
+    /\s*[\(\[]\s*official\s+audio\s*[\)\]]/gi,
+    /\s*[\(\[]\s*official\s+music\s+video\s*[\)\]]/gi,
+    /\s*[\(\[]\s*lyric\s+video\s*[\)\]]/gi,
+    /\s*[\(\[]\s*audio\s*[\)\]]/gi,
+    /\s*[\(\[]\s*video\s*[\)\]]/gi,
+    /\s*[\(\[]\s*en\s+vivo\s*[\)\]]/gi,
+    /\s*[\(\[]\s*live\s*[\)\]]/gi,
+    /\s*[\(\[]\s*lyrics\s*[\)\]]/gi,
+    /\s*[\(\[]\s*remaster(?:ed)?(?:\s+\d{4})?\s*[\)\]]/gi,
+    /\s*-\s*official\s+video\s*$/gi,
+    /\s*-\s*live\s*$/gi,
+  ];
+  const _stripNoise = (s) => {
+    let out = s;
+    for (const pat of _NOISE_PATTERNS) out = out.replace(pat, "");
+    return out.trim();
+  };
   const parseFilename = (filename) => {
     const name = filename.replace(/\.(mp3|wav|m4a|flac|aac|ogg)$/i, "");
     let artist = "";
@@ -553,16 +590,14 @@ export default function UploadZone({
       artist = head.trim();
       song = rest.join(" - ").trim();
     } else if (name.includes("_")) {
+      // SAME convention as " - ": head is artist, rest is title.
+      // This is the fix — previously rest was artist (inverted).
       const [head, ...rest] = name.split("_");
-      song = head.trim();
-      artist = rest.join("_").trim();
+      artist = head.trim();
+      song = rest.join("_").trim();
     }
-    const noise = [
-      "(Official Video)", "(Official Audio)", "(Lyric Video)",
-      "(Official Music Video)", "(Audio)", "(Video)", "(En Vivo)",
-      "(Live)", "(Lyrics)",
-    ];
-    for (const sfx of noise) song = song.replace(sfx, "").trim();
+    song = _stripNoise(song);
+    artist = _stripNoise(artist);
     return { artist, song };
   };
 
