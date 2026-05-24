@@ -31,6 +31,12 @@ def test_lrc_to_plain_text_strips_timestamps():
     assert fa.lrc_to_plain_text(None) == ""
 
 
+def _strip_words(segs):
+    """Helper: compare timing/text fields, ignore per-word stamps (which the
+    refactor preserves for karaoke + confidence)."""
+    return [{k: v for k, v in s.items() if k != "words"} for s in segs]
+
+
 def test_wordstamps_to_segments_reconstructs_lines():
     lines = ["hola mundo", "adios amigo cruel"]
     words = [
@@ -38,10 +44,13 @@ def test_wordstamps_to_segments_reconstructs_lines():
         _w("adios", 3.0, 3.4), _w("amigo", 3.4, 3.8), _w("cruel", 3.8, 4.5),
     ]
     segs = fa.wordstamps_to_segments(words, lines)
-    assert segs == [
+    assert _strip_words(segs) == [
         {"start": 1.0, "end": 2.0, "text": "hola mundo"},
         {"start": 3.0, "end": 4.5, "text": "adios amigo cruel"},
     ]
+    # PR-G: words preserved per line for karaoke + confidence highlighting.
+    assert [w["word"] for w in segs[0]["words"]] == ["hola", "mundo"]
+    assert [w["word"] for w in segs[1]["words"]] == ["adios", "amigo", "cruel"]
 
 
 def test_wordstamps_to_segments_clamps_overlap_monotonic():
@@ -60,7 +69,7 @@ def test_wordstamps_to_segments_skips_blank_and_missing():
     lines = ["", "  ", "linea real"]
     words = [_w("linea", 1.0, 1.5), _w("real", 1.5, 2.0)]
     segs = fa.wordstamps_to_segments(words, lines)
-    assert segs == [{"start": 1.0, "end": 2.0, "text": "linea real"}]
+    assert _strip_words(segs) == [{"start": 1.0, "end": 2.0, "text": "linea real"}]
 
 
 def test_destretch_trims_ballooned_trailing_word():
@@ -87,8 +96,24 @@ def test_destretch_leaves_normal_lines_untouched():
         _w("chau", 3.0, 3.4), _w("amigo", 3.4, 4.0),
     ]
     segs = fa.wordstamps_to_segments(words, ["hola mundo", "chau amigo"])
-    assert segs[0] == {"start": 1.0, "end": 2.0, "text": "hola mundo"}
-    assert segs[1] == {"start": 3.0, "end": 4.0, "text": "chau amigo"}
+    assert _strip_words(segs) == [
+        {"start": 1.0, "end": 2.0, "text": "hola mundo"},
+        {"start": 3.0, "end": 4.0, "text": "chau amigo"},
+    ]
+
+
+def test_wordstamps_preserves_score_when_available():
+    # PR-G: when the cureau model returns per-word `score` (via the
+    # show_probabilities=True input we now pass), preserve it on each word so
+    # the editor can render low-confidence lines tinted red.
+    words = [
+        {"word": "hola", "start": 1.0, "end": 1.4, "score": 0.95},
+        {"word": "mundo", "start": 1.4, "end": 2.0, "score": 0.42},  # low!
+    ]
+    segs = fa.wordstamps_to_segments(words, ["hola mundo"])
+    assert "words" in segs[0]
+    scores = [w.get("score") for w in segs[0]["words"]]
+    assert scores == [0.95, 0.42]
 
 
 def test_compress_for_upload_falls_back_on_bad_input():
