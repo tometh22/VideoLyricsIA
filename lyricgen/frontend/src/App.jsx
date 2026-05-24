@@ -848,7 +848,20 @@ export default function App() {
   // de orden — y no lo cambiamos entre upload y review.
   const handleStartReview = async () => {
     if (!files.length || !files.every((f) => f.artist.trim())) return;
+    // Race fix 2026-05-24: el guard en reviewScreen (~/review render vacío
+    // → <Navigate to="/dashboard">) disparaba un flash a dashboard cuando
+    // navegábamos antes de que transcribeNext setteara estado. El primer
+    // render de /review veía transcribing=false / currentReview=null /
+    // readyToGenerate=false → entraba al fallback → redirect.
+    //
+    // Setear transcribing=true SYNCHRONOUS antes del navigate hace que el
+    // primer render ya vea estado válido (spinner de transcripción). Para
+    // el fast-path (segments cacheados por prefetch), transcribeNext
+    // lo setea de vuelta a false en ~0ms y aparece el editor directo —
+    // visualmente indistinguible del flujo viejo, sin el flash.
     setReviewQueue([...files]);
+    setTranscribing(true);
+    setTranscribeError(null);
     navigate("/review");
     transcribeNext([...files], 0);
   };
@@ -1727,8 +1740,29 @@ export default function App() {
         </div>
       );
     }
-    // No batch in flight → redirect home (e.g. user refreshed during /review).
-    return <Navigate to="/dashboard" replace />;
+    // Empty state — el operador llegó a /review sin estado (deep-link, refresh
+    // sin sessionStorage, o transición rota). En vez de redirigir silencioso a
+    // dashboard (race condition reportada 2026-05-24: el redirect se disparaba
+    // por el primer render asíncrono de handleStartReview), mostramos un
+    // fallback explícito con CTA para que el operador sepa qué pasó.
+    return (
+      <div className="w-full max-w-md mx-auto animate-fade-in text-center py-16">
+        <div className="w-14 h-14 mx-auto mb-4 rounded-2xl bg-amber-500/10 flex items-center justify-center">
+          <svg className="w-7 h-7 text-amber-400" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
+            <circle cx="12" cy="12" r="10" />
+            <path d="M12 8v4M12 16h.01" strokeLinecap="round" />
+          </svg>
+        </div>
+        <h2 className="text-xl font-bold mb-2">{t("review.empty_title") || "No hay sesión activa"}</h2>
+        <p className="text-sm text-gray-500 mb-6">
+          {t("review.empty_subtitle") ||
+            "Probablemente refrescaste la página o el enlace es directo. Volvé al panel para empezar de nuevo."}
+        </p>
+        <button onClick={() => navigate("/dashboard")} className="btn-primary">
+          {t("review.empty_cta") || "Volver al panel"}
+        </button>
+      </div>
+    );
   })();
 
   const generatingScreen = jobs.length > 0
