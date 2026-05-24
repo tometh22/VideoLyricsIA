@@ -21,6 +21,7 @@ import JobDetail from "./components/JobDetail";
 import Settings from "./components/Settings";
 import AdminPanel from "./components/AdminPanel";
 import { useAlert } from "./components/AlertProvider";
+import { useBackgroundPreview } from "./hooks/useBackgroundPreview";
 
 const API = import.meta.env.VITE_API_URL || "";
 
@@ -1077,6 +1078,10 @@ export default function App() {
       textContrast: r.textContrast || "medium",
       segments: editedSegments,
       transcribeJobId: r.transcribeJobId || null,
+      // Capa C 2026-05-24: bgCacheKey viene del useBackgroundPreview hook
+      // que corrió durante review. Si null = no se hizo pre-gen (free-tier
+      // o params no estables); pipeline corre Veo/Imagen como siempre.
+      bgCacheKey: r.bgCacheKey || null,
     }];
     setApprovedJobs(newApproved);
     setCurrentReview(null);
@@ -1160,6 +1165,12 @@ export default function App() {
         formData.append("text_contrast", jobList[i].textContrast || "medium");
         if (animateImage && backgroundFile) formData.append("animate_image", "true");
         formData.append("match_lyrics", String(!!inspiredByLyrics));
+        // Capa C 2026-05-24 — si el operador hizo pre-gen del background
+        // mientras editaba lyrics (POST /generate-preview), el hash del
+        // cache va acá. Backend skip Veo/Imagen si el cache hit.
+        if (jobList[i].bgCacheKey) {
+          formData.append("bg_cache_key", jobList[i].bgCacheKey);
+        }
         formData.append("segments_json", JSON.stringify(jobList[i].segments));
         formData.append("delivery_profile", delivery.delivery_profile);
         if (delivery.delivery_profile !== "youtube") {
@@ -1495,6 +1506,36 @@ export default function App() {
   };
 
   const allHaveArtist = files.length > 0 && files.every((f) => f.artist.trim());
+
+  // Capa C 2026-05-24 — dispara pre-gen del background apenas el operador
+  // entra a review (transcribiendo o editando lyrics), con debounce 2s
+  // sobre cambios de los params. Cuando termina, persiste bgCacheKey en
+  // currentReview; el handleApproveLyrics lo pasa a approvedJobs; el
+  // POST /generate lo manda como Form field.
+  // Sólo cuando hay currentReview Y artist+songTitle filled.
+  // Forwarded params usan style/customColors globales del wizard (no per-file).
+  const previewEntry = currentReview ? {
+    ...currentReview,
+    style,                   // batch-level
+    customColors,            // batch-level
+    backgroundMode: "veo",
+    animateImage: animateImage && !!backgroundFile,
+    matchLyrics: inspiredByLyrics,
+  } : null;
+  // bgPreview se invoca por side-effect (POST + polling). El status/error
+  // está en el return por si en el futuro mostramos un badge "Fondo:
+  // generando…" en el editor. Hoy se persiste sólo via onCacheKey →
+  // currentReview.bgCacheKey, y el handleApproveLyrics lo copia a
+  // approvedJobs para mandarlo al POST /generate.
+  // eslint-disable-next-line no-unused-vars
+  const bgPreview = useBackgroundPreview(previewEntry, {
+    enabled: !!currentReview,
+    api: API,
+    authHeaders,
+    onCacheKey: (key) => {
+      setCurrentReview((r) => (r ? { ...r, bgCacheKey: key } : r));
+    },
+  });
 
   // --- Per-route screens (kept inline so they share App-level state) ---
 
