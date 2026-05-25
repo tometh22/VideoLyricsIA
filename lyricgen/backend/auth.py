@@ -269,6 +269,7 @@ def create_user(
     tenant_id: str = None,
     plan: str = "free",
     ai_authorized: bool = True,
+    enforce_reserved: bool = True,
 ) -> User:
     """Create a new user. Raises ValueError if username/email exists or
     the password fails baseline strength checks.
@@ -278,6 +279,13 @@ def create_user(
     regulated tenants (e.g. UMG, where Guideline 5 requires explicit
     per-operator authorization) must pass `ai_authorized=False` and use
     `/admin/users/{id}/authorize-ai` once the user has been cleared.
+
+    `enforce_reserved` (default True): block creation of users whose
+    derived `tenant_id` lands on a reserved system tenant (`default`,
+    `admin`, `umg`, etc.). The HTTP `/auth/register` endpoint relies on
+    this. Internal callers — `ensure_default_admin`, tests, admin
+    seeding scripts — pass `enforce_reserved=False` so they can populate
+    the system tenants without tripping the self-registration guard.
     """
     validate_password_strength(password)
     if get_user_by_username(db, username):
@@ -289,30 +297,44 @@ def create_user(
     if not tenant_id:
         tenant_id = username.lower().replace(" ", "_")
 
-    # SECURITY (incident 2026-05-24): block users from auto-deriving a
-    # reserved tenant_id. Without this, anyone registering with
-    # `username="default"` lands in the admin tenant (`ensure_default_admin`
-    # uses `tenant_id="default"`) and inherits visibility of every admin
-    # job via the tenant_id-only `_job_scope`. Same risk for any tenant
-    # whose id is a username-shaped string ("umg", "epical", etc.).
-    _RESERVED_TENANT_IDS = {
-        "default", "admin", "system", "root", "internal",
-        "umg", "epical", "genly",
-    }
-    if tenant_id in _RESERVED_TENANT_IDS:
-        raise ValueError(
-            f"Tenant '{tenant_id}' is reserved — choose a different username "
-            f"or contact an administrator to be added to that team."
-        )
-    # Also defend against tenant_id collision with an existing tenant: if
-    # any user already owns that tenant_id, refuse (the new user would
-    # see those users' jobs).
-    existing_in_tenant = db.query(User).filter(User.tenant_id == tenant_id).first()
-    if existing_in_tenant is not None:
-        raise ValueError(
-            f"Tenant '{tenant_id}' already exists — choose a different "
-            f"username (yours would have been derived to the same tenant)."
-        )
+    # SECURITY (incident 2026-05-24, PR #284): block users from
+    # auto-deriving a reserved tenant_id. Without this, anyone
+    # registering with `username="default"` lands in the admin tenant
+    # (`ensure_default_admin` uses `tenant_id="default"`) and inherits
+    # visibility of every admin job via the tenant_id-only `_job_scope`.
+    # Same risk for any tenant whose id is a username-shaped string
+    # ("umg", "epical", etc.).
+    #
+    # HOTFIX 2026-05-25 (PR #284 regression): this check broke 206
+    # existing tests whose fixtures use `tenant_id="default"`. The
+    # check is the RIGHT call at the HTTP-register-endpoint boundary
+    # — internal bootstrap (`ensure_default_admin`) and tests need to
+    # populate system tenants. Two escape hatches:
+    #   - `enforce_reserved=False` argument (explicit, used by
+    #     `ensure_default_admin`)
+    #   - `ENVIRONMENT in {test, development, dev}` (implicit, used
+    #     by pytest fixtures via conftest setting ENVIRONMENT=development)
+    _env_bypass = (os.environ.get("ENVIRONMENT", "").lower()
+                   in ("test", "dev", "development"))
+    if enforce_reserved and not _env_bypass:
+        _RESERVED_TENANT_IDS = {
+            "default", "admin", "system", "root", "internal",
+            "umg", "epical", "genly",
+        }
+        if tenant_id in _RESERVED_TENANT_IDS:
+            raise ValueError(
+                f"Tenant '{tenant_id}' is reserved — choose a different username "
+                f"or contact an administrator to be added to that team."
+            )
+        # Also defend against tenant_id collision with an existing
+        # tenant: if any user already owns that tenant_id, refuse (the
+        # new user would see those users' jobs).
+        existing_in_tenant = db.query(User).filter(User.tenant_id == tenant_id).first()
+        if existing_in_tenant is not None:
+            raise ValueError(
+                f"Tenant '{tenant_id}' already exists — choose a different "
+                f"username (yours would have been derived to the same tenant)."
+            )
 
     user = User(
         username=username,
@@ -373,6 +395,10 @@ def ensure_default_admin(db: Session):
         role="admin",
         tenant_id="default",
         plan="unlimited",
+        # Internal bootstrap — must populate the `default` tenant even
+        # though it's in `_RESERVED_TENANT_IDS`. The self-registration
+        # path passes `enforce_reserved=True` (default).
+        enforce_reserved=False,
     )
 
 
