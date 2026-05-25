@@ -170,32 +170,230 @@ export default function Dashboard({ user, history, historyError, historyLoaded =
     return `${monthlyUsed} ${monthlyUsed === 1 ? "video listo" : "videos listos"} este mes`;
   })();
 
+  // 2026-05-25 — Atención drawer state. Los banners de quota+errors
+  // (antes apilados arriba compitiendo con el hero) ahora viven adentro
+  // de un drawer colapsable a la derecha del hero. Solo se expande
+  // cuando hay algo que mostrar Y el operador lo abre.
+  const [attentionOpen, setAttentionOpen] = useState(false);
+  const quotaAlert = !isUnlimited && monthlyLimit && (usage?.alert_100 || usage?.alert_80);
+  const attentionCount = (quotaAlert ? 1 : 0) + (errorsBannerVisible ? 1 : 0);
+
+  // Header dinámico — operativo, no amable. Cambia según estado del sistema.
+  // Linear/Stripe pattern: "Control room", no "Hola buenos días".
+  const heroHeadline = (() => {
+    if (history.length === 0) return "Sistema listo";
+    if (pendingReview.length > 0) return `${pendingReview.length} ${pendingReview.length === 1 ? "video espera" : "videos esperan"} tu aprobación`;
+    if (processing.length > 0) return `${processing.length} ${processing.length === 1 ? "video" : "videos"} renderizando`;
+    return "Todo al día";
+  })();
+  const heroSubline = (() => {
+    if (history.length === 0) return "Subí tu primer audio para empezar.";
+    if (pendingReview.length > 0) return "Revisá y aprobá para destrabar descargas.";
+    if (processing.length > 0) return "El sistema sigue trabajando en background.";
+    return "Cero pendientes. Subí más audio cuando quieras.";
+  })();
+
+  // El "próximo a terminar" — heurística simple: primer processing con
+  // mayor `progress`. Si no hay progress confiable, el más viejo en cola.
+  const nextToFinish = (() => {
+    if (processing.length === 0) return null;
+    const sorted = [...processing].sort((a, b) =>
+      (b.progress || 0) - (a.progress || 0)
+        || (a.created_at || 0) - (b.created_at || 0)
+    );
+    return sorted[0];
+  })();
+
   return (
-    <div className="w-full max-w-4xl animate-fade-in">
-      {/* ─── Header ─────────────────────────────────────────────────── */}
-      <div className="flex items-end justify-between mb-10">
-        <div>
-          <h1 className="text-[28px] leading-tight font-bold tracking-tight">
-            {greeting}{firstName && <span className="text-ink-secondary font-normal">, {firstName}</span>}
+    <div className="w-full max-w-5xl animate-fade-in">
+      {/* ─── Command bar simplificada (header reposicionado, search vendrá en PR-2) ─── */}
+      <div className="flex items-center justify-between mb-7">
+        <div className="min-w-0">
+          <p className="text-section text-gray-500 uppercase tracking-[0.18em]">
+            {(() => {
+              const d = new Date();
+              const fmt = new Intl.DateTimeFormat("es-AR", { weekday: "long", day: "numeric", month: "long" });
+              return fmt.format(d) + " · " + d.toLocaleTimeString("es-AR", { hour: "2-digit", minute: "2-digit" });
+            })()}
+          </p>
+          <h1 className="text-[26px] leading-tight font-bold tracking-tight mt-1 truncate">
+            {heroHeadline}
           </h1>
-          <p className="text-sm text-ink-secondary mt-1.5">{monthlySubtitle}</p>
+          <p className="text-sm text-ink-secondary mt-1">{heroSubline}</p>
         </div>
-        <button onClick={onNewBatch} className="btn-primary px-6" data-tour="dashboard-new-batch">
-          <svg className="inline-block w-4 h-4 mr-2 -mt-0.5" fill="none" stroke="currentColor" strokeWidth="2.5" viewBox="0 0 24 24">
-            <path d="M12 5v14M5 12h14" strokeLinecap="round"/>
-          </svg>
-          {t("nav.new_batch")}
-        </button>
+        <div className="flex items-center gap-2 shrink-0 ml-4">
+          {attentionCount > 0 && (
+            <button
+              type="button"
+              onClick={() => setAttentionOpen((v) => !v)}
+              aria-expanded={attentionOpen}
+              className={`flex items-center gap-1.5 px-3 h-9 rounded-lg text-xs font-medium transition-colors ring-1
+                ${attentionOpen
+                  ? "bg-amber-500/15 text-amber-200 ring-amber-500/30"
+                  : "bg-amber-500/[0.06] text-amber-300/80 ring-amber-500/20 hover:bg-amber-500/[0.10] hover:text-amber-200"
+                }`}
+            >
+              <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24"><path d="M12 9v4M12 17h.01"/><circle cx="12" cy="12" r="10"/></svg>
+              {attentionCount} {attentionCount === 1 ? "aviso" : "avisos"}
+              <svg className={`w-3 h-3 transition-transform ${attentionOpen ? "rotate-180" : ""}`} fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24"><path d="M6 9l6 6 6-6" strokeLinecap="round" strokeLinejoin="round"/></svg>
+            </button>
+          )}
+          <button onClick={onNewBatch} className="btn-primary px-5" data-tour="dashboard-new-batch">
+            <svg className="inline-block w-4 h-4 mr-1.5 -mt-0.5" fill="none" stroke="currentColor" strokeWidth="2.5" viewBox="0 0 24 24">
+              <path d="M12 5v14M5 12h14" strokeLinecap="round"/>
+            </svg>
+            {t("nav.new_batch")}
+          </button>
+        </div>
       </div>
 
-      {/* ─── Plan-quota proximity warning ─────────────────────────────
-            Three modes:
-              1. user.allow_overage + alert_100 → "you're billing extra,
-                 here's the running total" (no block).
-              2. plain user + alert_100 → "no more uploads, contact
-                 support" (hard wall — /generate returns 402).
-              3. anyone + alert_80 → "heads-up, X videos left, contact
-                 if you'll need more". */}
+      {/* ─── Hero KPI 3-up (Aprobar · Renderizando · Cuota) ───────────
+            Una sola tarjeta con divide-x — leído como una unidad horizontal
+            no como tres cards separadas. Stripe Dashboard pattern. ─── */}
+      <div className="mb-8 rounded-card bg-surface-2/40 ring-1 ring-white/[0.04] grid grid-cols-1 md:grid-cols-3 md:divide-x md:divide-white/[0.04]">
+
+        {/* COL 1: APROBAR — north star del operador */}
+        <button
+          onClick={() => pendingReview.length > 0 && onSelectJob(pendingReview[0].job_id)}
+          disabled={pendingReview.length === 0}
+          className={`text-left px-6 py-6 transition-colors ${pendingReview.length > 0 ? "hover:bg-surface-2/40 cursor-pointer" : "cursor-default"}`}
+        >
+          <p className="text-section text-gray-500 uppercase tracking-[0.18em]">Aprobar</p>
+          <div className="mt-2 flex items-baseline gap-2">
+            <span className={`text-[44px] leading-none font-bold tracking-tight tabular-nums
+              ${pendingReview.length === 0 ? "text-white/40" :
+                pendingReview.length >= 5 ? "text-red-300" :
+                "text-amber-200"}`}>
+              {pendingReview.length}
+            </span>
+            <span className="text-xs text-ink-secondary">
+              {pendingReview.length === 0 ? "todo aprobado" :
+                pendingReview.length === 1 ? "esperando review" : "esperando review"}
+            </span>
+          </div>
+          {pendingReview.length > 0 && pendingReview[0] && (
+            <p className="text-[11px] text-ink-secondary mt-3 truncate">
+              <span className="font-mono tabular-nums text-gray-400">{timeAgo(pendingReview[0].created_at)}</span>
+              {" · "}
+              {(pendingReview[0].filename || "").replace(/\.(mp3|wav)$/i, "")}
+            </p>
+          )}
+          {pendingReview.length > 0 && (
+            <p className="text-[11px] text-brand-light mt-2 flex items-center gap-1 group-hover:translate-x-0.5 transition-transform">
+              Revisar ahora
+              <svg className="w-3 h-3" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24"><path d="M9 5l7 7-7 7" strokeLinecap="round" strokeLinejoin="round"/></svg>
+            </p>
+          )}
+        </button>
+
+        {/* COL 2: RENDERIZANDO — sistema en vivo */}
+        <div className="px-6 py-6">
+          <p className="text-section text-gray-500 uppercase tracking-[0.18em]">Renderizando</p>
+          <div className="mt-2 flex items-baseline gap-2">
+            <span className={`text-[44px] leading-none font-bold tracking-tight tabular-nums
+              ${processing.length === 0 ? "text-white/40" : "text-brand-light"}`}>
+              {processing.length}
+            </span>
+            <span className="text-xs text-ink-secondary">
+              {processing.length === 0 ? "cola vacía" : processing.length === 1 ? "video en curso" : "jobs en curso"}
+            </span>
+          </div>
+          {nextToFinish ? (
+            <button
+              onClick={() => onSelectJob(nextToFinish.job_id)}
+              className="mt-3 w-full text-left flex items-center gap-2 group"
+            >
+              <span className="relative w-1.5 h-1.5 shrink-0">
+                <span className="absolute inset-0 rounded-full bg-brand animate-ping opacity-60" />
+                <span className="relative block w-1.5 h-1.5 rounded-full bg-brand" />
+              </span>
+              <span className="text-[11px] text-white truncate group-hover:text-brand-light transition-colors">
+                {(nextToFinish.filename || "").replace(/\.(mp3|wav)$/i, "")}
+              </span>
+              {nextToFinish.progress !== undefined && nextToFinish.progress > 0 && (
+                <span className="text-[10px] text-gray-500 font-mono tabular-nums shrink-0">
+                  {Math.round(nextToFinish.progress)}%
+                </span>
+              )}
+            </button>
+          ) : (
+            <p className="text-[11px] text-ink-secondary mt-3">
+              <span className="inline-block w-1.5 h-1.5 rounded-full bg-accent/40 mr-2 align-middle" />
+              Sistema OK · esperando tu próximo upload
+            </p>
+          )}
+        </div>
+
+        {/* COL 3: CUOTA — Stripe pattern (número grande + barra slim + delta) */}
+        <div className="px-6 py-6">
+          <p className="text-section text-gray-500 uppercase tracking-[0.18em]">
+            Cuota {(() => {
+              const fmt = new Intl.DateTimeFormat("es-AR", { month: "long" });
+              return fmt.format(new Date());
+            })()}
+          </p>
+          <div className="mt-2 flex items-baseline gap-2">
+            {isUnlimited ? (
+              <>
+                <span className="text-[44px] leading-none font-bold tracking-tight tabular-nums text-white">{monthlyUsed}</span>
+                <span className="text-xs text-ink-secondary">sin límite</span>
+              </>
+            ) : monthlyLimit ? (
+              <>
+                <span className={`text-[44px] leading-none font-bold tracking-tight tabular-nums ${
+                  usagePercent >= 100 ? "text-red-300" :
+                  usagePercent >= 80 ? "text-amber-200" :
+                  "text-white"
+                }`}>
+                  {monthlyUsed}
+                </span>
+                <span className="text-xs text-ink-secondary font-mono tabular-nums">/ {monthlyLimit}</span>
+                <span className={`text-xs ml-auto ${
+                  usagePercent >= 100 ? "text-red-300/80" :
+                  usagePercent >= 80 ? "text-amber-300/80" :
+                  "text-ink-secondary"
+                }`}>
+                  {Math.round(usagePercent)}%
+                </span>
+              </>
+            ) : usageError ? (
+              <button onClick={retryUsage} className="text-xs text-brand-light hover:underline underline-offset-2">
+                Reintentar carga
+              </button>
+            ) : (
+              <span className="text-xs text-ink-secondary">cargando…</span>
+            )}
+          </div>
+          {!isUnlimited && monthlyLimit && (
+            <div className="mt-3 w-full h-1 bg-surface-3/60 rounded-full overflow-hidden">
+              <div
+                className={`h-full rounded-full transition-all duration-700 ease-out ${
+                  usagePercent >= 100
+                    ? "bg-gradient-to-r from-amber-500 to-red-500"
+                    : usagePercent >= 80
+                      ? "bg-gradient-to-r from-brand to-amber-400"
+                      : "bg-gradient-to-r from-brand to-accent"
+                }`}
+                style={{ width: `${Math.max(2, Math.min(100, usagePercent))}%` }}
+              />
+            </div>
+          )}
+          {!isUnlimited && monthlyLimit && (
+            <p className="text-[11px] text-ink-secondary mt-2 font-mono tabular-nums">
+              {monthlyLimit - monthlyUsed > 0
+                ? `${monthlyLimit - monthlyUsed} restantes este mes`
+                : "Cupo agotado · contactá soporte"}
+            </p>
+          )}
+        </div>
+      </div>
+
+      {/* ─── Atención drawer — colapsable, solo se renderiza si hay avisos
+            Y el operador lo abrió. Los banners viejos vivían apilados
+            arriba compitiendo con el hero; ahora viven acá. ─── */}
+      {attentionOpen && attentionCount > 0 && (
+        <div className="mb-8 space-y-3 animate-fade-in">
+
       {!isUnlimited && monthlyLimit && (usage?.alert_100 || usage?.alert_80) && (
         (() => {
           const overageMode = usage.alert_100 && user?.allow_overage;
@@ -265,160 +463,27 @@ export default function Dashboard({ user, history, historyError, historyLoaded =
         })()
       )}
 
-      {/* ─── Pending review CTA — brand violet because it's a positive
-            "do this next", not a danger warning ───────────────────── */}
-      {pendingReview.length > 0 && (
-        <button
-          onClick={() => onSelectJob(pendingReview[0].job_id)}
-          className="w-full mb-4 flex items-center gap-4 px-5 py-4 rounded-card text-left group transition-all
-                     bg-gradient-to-r from-brand/[0.10] via-brand/[0.06] to-transparent
-                     ring-1 ring-brand/20 hover:ring-brand/40
-                     hover:from-brand/[0.14] hover:via-brand/[0.08]"
-        >
-          <div className="w-10 h-10 rounded-xl bg-brand/15 flex items-center justify-center shrink-0 ring-1 ring-brand/30">
-            <svg className="w-5 h-5 text-brand-light" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
-              <path d="M9 11l3 3L22 4M21 12v7a2 2 0 01-2 2H5a2 2 0 01-2-2V5a2 2 0 012-2h11" strokeLinecap="round" strokeLinejoin="round"/>
-            </svg>
-          </div>
-          <div className="flex-1 min-w-0">
-            <p className="text-sm font-semibold text-white">
-              {pendingReview.length === 1
-                ? "1 video esperando tu aprobación"
-                : `${pendingReview.length} videos esperando tu aprobación`}
-            </p>
-            <p className="text-xs text-ink-secondary mt-0.5">
-              Revisá la transcripción y aprobá para destrabar la descarga
-            </p>
-          </div>
-          <svg className="w-5 h-5 text-brand-light/70 group-hover:translate-x-0.5 transition-transform shrink-0" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
-            <path d="M9 5l7 7-7 7" strokeLinecap="round" strokeLinejoin="round"/>
-          </svg>
-        </button>
-      )}
-
-      {/* ─── Errors banner (rare, secondary tone, dismissible) ────── */}
-      {errorsBannerVisible && (
-        <div className="w-full mb-4 flex items-center gap-3 px-4 py-3 rounded-xl bg-red-500/[0.06] ring-1 ring-red-500/20">
-          <svg className="w-4 h-4 text-red-400 shrink-0" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
-            <circle cx="12" cy="12" r="10"/><path d="M15 9l-6 6M9 9l6 6"/>
-          </svg>
-          <p className="text-xs text-red-300 flex-1">
-            {errors.length} {errors.length === 1 ? "video falló este mes" : "videos fallaron este mes"}
-          </p>
-          <button
-            onClick={dismissErrors}
-            aria-label="Descartar"
-            className="text-red-400/60 hover:text-red-300 transition-colors p-1 -mr-1"
-          >
-            <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" strokeWidth="2.5" viewBox="0 0 24 24">
-              <path d="M18 6L6 18M6 6l12 12" strokeLinecap="round"/>
-            </svg>
-          </button>
-        </div>
-      )}
-
-      {/* ─── Plan usage — Stripe-style hero number, bar as secondary ── */}
-      <div className="rounded-card p-7 mb-10 bg-surface-2/40 ring-1 ring-white/[0.04]" data-tour="dashboard-usage">
-        <div className="flex items-end justify-between mb-5">
-          <div>
-            <SectionLabel>{t("dash.monthly_usage")}</SectionLabel>
-            <div className="flex items-baseline gap-2">
-              {isUnlimited ? (
-                <>
-                  <span className="text-4xl font-bold tracking-tight text-white">{monthlyUsed}</span>
-                  <span className="text-sm text-ink-secondary">videos · sin límite</span>
-                </>
-              ) : monthlyLimit ? (
-                <>
-                  <span className="text-4xl font-bold tracking-tight text-white">{monthlyUsed}</span>
-                  <span className="text-sm text-ink-secondary">/ {monthlyLimit}</span>
-                </>
-              ) : usageError ? (
-                <div className="flex items-center gap-3">
-                  <span className="text-sm text-amber-300">
-                    {t("dash.usage_error") || "No se pudo cargar el uso."}
-                  </span>
-                  <button
-                    type="button"
-                    onClick={retryUsage}
-                    className="text-xs font-medium text-brand hover:text-brand-light underline-offset-2 hover:underline"
-                  >
-                    {t("dash.retry") || "Reintentar"}
-                  </button>
-                </div>
-              ) : (
-                <span className="text-sm text-ink-secondary">{t("dash.loading") || "cargando…"}</span>
-              )}
-            </div>
-            {usage?.plan && !isUnlimited && (
-              <p className="text-xs text-ink-secondary mt-1.5">
-                Plan <span className="text-brand font-medium">{usage.plan}</span> · {monthlyLimit} videos/mes incluidos
+          {/* Pending review CTA + monthly usage card + En proceso section eliminados:
+              ahora viven dentro del hero 3-up arriba (cols Aprobar / Renderizando / Cuota). */}
+          {errorsBannerVisible && (
+            <div className="w-full flex items-center gap-3 px-4 py-3 rounded-xl bg-red-500/[0.06] ring-1 ring-red-500/20">
+              <svg className="w-4 h-4 text-red-400 shrink-0" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
+                <circle cx="12" cy="12" r="10"/><path d="M15 9l-6 6M9 9l6 6"/>
+              </svg>
+              <p className="text-xs text-red-300 flex-1">
+                {errors.length} {errors.length === 1 ? "video falló este mes" : "videos fallaron este mes"}
               </p>
-            )}
-          </div>
-          {!isUnlimited && monthlyLimit && (
-            <span className={`text-2xl font-bold tracking-tight ${
-              usagePercent >= 100 ? "text-red-400" :
-              usagePercent >= 80 ? "text-amber-400" :
-              "text-brand-light"
-            }`}>
-              {Math.round(usagePercent)}%
-            </span>
+              <button
+                onClick={dismissErrors}
+                aria-label="Descartar"
+                className="text-red-400/60 hover:text-red-300 transition-colors p-1 -mr-1"
+              >
+                <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" strokeWidth="2.5" viewBox="0 0 24 24">
+                  <path d="M18 6L6 18M6 6l12 12" strokeLinecap="round"/>
+                </svg>
+              </button>
+            </div>
           )}
-        </div>
-        {!isUnlimited && monthlyLimit && (
-          <div className="w-full h-2 bg-surface-3/60 rounded-full overflow-hidden">
-            <div
-              className={`h-full rounded-full transition-all duration-700 ease-out ${
-                usagePercent >= 100
-                  ? "bg-gradient-to-r from-amber-500 to-red-500"
-                  : usagePercent >= 80
-                    ? "bg-gradient-to-r from-brand to-amber-400"
-                    : "bg-gradient-to-r from-brand to-brand-light"
-              }`}
-              style={{ width: `${Math.max(2, Math.min(100, usagePercent))}%` }}
-            />
-          </div>
-        )}
-        {usage?.overage > 0 && (
-          <div className="mt-4 flex items-center gap-2.5 px-3.5 py-2.5 rounded-xl bg-amber-500/10 ring-1 ring-amber-500/20">
-            <svg className="w-4 h-4 text-amber-400 shrink-0" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
-              <path d="M12 9v4M12 17h.01"/><circle cx="12" cy="12" r="10"/>
-            </svg>
-            <span className="text-xs text-amber-200">
-              {usage.overage} excedentes × ${usage.overage_cost_per_video} = <span className="font-semibold">${usage.overage_total}</span>
-            </span>
-          </div>
-        )}
-        {usage?.plan === "free" && !isUnlimited && (
-          <div className="mt-4 flex items-center justify-between px-3.5 py-2.5 rounded-xl bg-brand/8 ring-1 ring-brand/20">
-            <span className="text-xs text-gray-300">
-              Necesitás más videos este mes?
-            </span>
-            <a
-              href="/account?tab=facturacion"
-              className="text-xs font-semibold text-brand-light hover:text-white transition-colors underline-offset-2 hover:underline"
-            >
-              Ver planes Pro →
-            </a>
-          </div>
-        )}
-      </div>
-
-      {/* ─── En proceso ahora — only when there's live work ─────── */}
-      {processing.length > 0 && (
-        <div className="mb-10">
-          <div className="flex items-center justify-between mb-3">
-            <SectionLabel>En proceso</SectionLabel>
-            <span className="text-[10px] text-gray-500 uppercase tracking-[0.18em]">
-              {processing.length} {processing.length === 1 ? "video" : "videos"}
-            </span>
-          </div>
-          <div className="rounded-card p-2 bg-surface-2/30 ring-1 ring-white/[0.03]">
-            {processing.slice(0, 5).map((job) => (
-              <ProcessingRow key={job.job_id} job={job} onSelect={onSelectJob} t={t} />
-            ))}
-          </div>
         </div>
       )}
 
