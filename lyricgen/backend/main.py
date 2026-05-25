@@ -3826,27 +3826,46 @@ async def _run_transcription_for_job(
                                 and lyrics_source == "lrclib"):
                             logger.info(
                                 "[LYRICS] FA gap_score=%.1fs > %.0fs threshold "
-                                "— trying Genius/Gemini for more complete lyrics "
+                                "— racing Genius + Gemini in parallel for more complete lyrics "
                                 "(current source=%s, %d chars)",
                                 gap_score_initial, GAP_REFETCH_THRESHOLD_S,
                                 lyrics_source, len(fa_text),
                             )
-                            better_text: str | None = None
-                            better_source: str | None = None
-                            try:
-                                import genius_fetch
-                                if genius_fetch.is_enabled():
+                            # INCIDENT 2026-05-25 (Legalícenla, job 9911c2f3ab16):
+                            # Genius returned 48 lines (vs lrclib 45) — just
+                            # +6 %, below the old +15 % threshold, so the
+                            # code declared "not worth re-running FA" AND
+                            # NEVER CALLED GEMINI (it was guarded behind
+                            # `if not better_text`). Gemini's grounded
+                            # search would have brought the intro chorus
+                            # block that both lrclib and Genius omit. Two
+                            # fixes in one block:
+                            #
+                            #   1) Race Genius + Gemini in PARALLEL — pick
+                            #      whichever returns more lines. Cost: one
+                            #      extra Gemini call (~$0.001), worth it
+                            #      vs the regression.
+                            #   2) Lower the re-run-FA threshold from +15 %
+                            #      to +5 %. The downstream gap_score check
+                            #      (must halve to adopt) already gates
+                            #      against bad alternates — the +15 % was
+                            #      double-gating and over-conservative.
+                            async def _try_genius():
+                                try:
+                                    import genius_fetch
+                                    if not genius_fetch.is_enabled():
+                                        return None
                                     with scoped_db() as _refetch_db:
                                         gt = await asyncio.to_thread(
                                             genius_fetch.fetch_genius_plain,
                                             artist_hint, song_hint, _refetch_db,
                                         )
-                                    if gt:
-                                        better_text = gt
-                                        better_source = "genius"
-                            except Exception as e:
-                                logger.warning("[LYRICS] re-fetch Genius failed: %s", e)
-                            if not better_text:
+                                    return ("genius", gt) if gt else None
+                                except Exception as e:
+                                    logger.warning("[LYRICS] re-fetch Genius failed: %s", e)
+                                    return None
+
+                            async def _try_gemini():
                                 try:
                                     from pipeline import _fetch_lyrics_via_gemini_search
                                     with scoped_db() as _refetch_db:
@@ -3854,20 +3873,49 @@ async def _run_transcription_for_job(
                                             _fetch_lyrics_via_gemini_search,
                                             artist_hint, song_hint, job_id, _refetch_db,
                                         )
-                                    if gmt:
-                                        better_text = gmt
-                                        better_source = "gemini"
+                                    return ("gemini", gmt) if gmt else None
                                 except Exception as e:
                                     logger.warning("[LYRICS] re-fetch Gemini failed: %s", e)
+                                    return None
 
-                            # Only re-run FA if the new text is meaningfully
-                            # bigger. 15% more lines is the floor that
-                            # justifies the ~75 s + ~$0.007 of a second
-                            # cureau call.
+                            genius_res, gemini_res = await asyncio.gather(
+                                _try_genius(), _try_gemini(),
+                            )
+
+                            # Score candidates by line count — more lines
+                            # = more coverage of intro/middle/outro chorus
+                            # repeats that both providers sometimes omit.
+                            # Ties go to Gemini (editorial > scraped).
+                            def _lines(t: str) -> int:
+                                return len([l for l in (t or "").splitlines() if l.strip()])
+                            candidates = [r for r in (genius_res, gemini_res) if r is not None]
+                            better_text: str | None = None
+                            better_source: str | None = None
+                            if candidates:
+                                candidates.sort(
+                                    key=lambda c: (_lines(c[1]), 1 if c[0] == "gemini" else 0),
+                                    reverse=True,
+                                )
+                                better_source, better_text = candidates[0]
+                                logger.info(
+                                    "[LYRICS] re-fetch parallel: genius=%s gemini=%s — picked %s (%d lines)",
+                                    f"{_lines(genius_res[1])}L" if genius_res else "miss",
+                                    f"{_lines(gemini_res[1])}L" if gemini_res else "miss",
+                                    better_source, _lines(better_text),
+                                )
+
+                            # Re-run FA if the new text has ≥ 5 % more
+                            # lines than lrclib (loosened from 15 %). The
+                            # gap_score halving check downstream still
+                            # gates adoption — so a marginal but
+                            # SUBSTANTIVELY-better source (Gemini bringing
+                            # the missing intro chorus block) gets
+                            # measured against gap reduction, not raw line
+                            # count.
                             if better_text:
                                 orig_lines = len([l for l in (fa_text or "").splitlines() if l.strip()])
-                                new_lines = len([l for l in better_text.splitlines() if l.strip()])
-                                if new_lines > orig_lines * 1.15:
+                                new_lines = _lines(better_text)
+                                if new_lines > orig_lines * 1.05:
                                     logger.info(
                                         "[LYRICS] re-fetch from %s found %d lines (was %d, +%.0f%%) "
                                         "— re-running FA",

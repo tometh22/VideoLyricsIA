@@ -369,6 +369,13 @@ export default function LyricsEditor({
   // that need to track a parent's source of truth across remounts.
   // Bug B7 from 2026-05-18 audit.
   const prevSegmentsRef = useRef(segments);
+  // Operator feedback 2026-05-25 (UMG): "Debería hacerlo solo, no
+  // preguntarme" — the auto-trim banner ("Recortar N líneas con texto
+  // colgado · Aplicar") was friction. Detection is reliable enough to
+  // apply silently on initial load. The ref tracks per-segments-prop
+  // application so re-seeding a new job re-triggers; routine edits
+  // (typing in a line) do NOT, because they don't change the ref.
+  const autoTrimAppliedRef = useRef(false);
   useEffect(() => {
     if (prevSegmentsRef.current === segments) return;
     prevSegmentsRef.current = segments;
@@ -376,6 +383,7 @@ export default function LyricsEditor({
     setEdited(seeded);
     originalSegmentsRef.current = seeded;
     setIsDirty(false);
+    autoTrimAppliedRef.current = false;  // new job → eligible for auto-trim
   }, [segments]);
 
   // Warn browser on tab-close / external navigation when there are unsaved edits.
@@ -1297,6 +1305,22 @@ export default function LyricsEditor({
     const dur = seg.end - seg.start;
     return dur > estimateVoiceEndDuration(seg.text);
   }).length;
+
+  // Auto-trim on initial load: if the just-loaded segments have hanging
+  // text (lrclib/genius lines that ran into instrumental outros, or
+  // duplicated chorus blocks at the end), apply the same fix the
+  // operator would have applied manually via the autofix banner. The
+  // `autoTrimAppliedRef` (declared up by the segments re-seed effect)
+  // guards against re-running on every text-edit keystroke. Cmd-Z still
+  // works because trimAllLongSegs calls pushEditHistory.
+  useEffect(() => {
+    if (autoTrimAppliedRef.current) return;
+    if (!edited || edited.length === 0) return;
+    if (longSegCount > 0) {
+      trimAllLongSegs();
+    }
+    autoTrimAppliedRef.current = true;
+  }, [edited, longSegCount]);
 
   // Compute how many visual lines a segment will occupy in the video.
   const linesForSeg = useCallback((text) => {
