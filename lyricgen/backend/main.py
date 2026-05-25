@@ -2941,6 +2941,8 @@ async def transcription_status(
             "reference_lyrics": None,
             "coverage_warning": bool(getattr(job_row, "coverage_warning", False)),
             "recovery_source": getattr(job_row, "recovery_source", None),
+            "current_step": getattr(job_row, "current_step", None),
+            "progress": getattr(job_row, "progress", None),
             "error": None,
         }
         if status == "transcribed":
@@ -3525,6 +3527,19 @@ async def _run_transcription_for_job(
                 )
             except Exception as e:
                 logger.warning("[PROGRESS] %s/%d failed: %s", label, pct, e)
+
+        def _start_ticker(label: str, pct_start: int, pct_end: int, interval_s: int = 20):
+            """Start a background task that nudges progress every interval_s while
+            a long Replicate call blocks the thread. Caller must cancel() the task."""
+            async def _ticker():
+                elapsed = 0
+                while True:
+                    await asyncio.sleep(interval_s)
+                    elapsed += interval_s
+                    frac = min(elapsed / 120.0, 0.9)
+                    await _step(label, pct_start + int(frac * (pct_end - pct_start)))
+            return asyncio.create_task(_ticker())
+
         await _step("transcribe.prepare", 5)
 
         # Vocal source separation (demucs) — LAZY. Previously demucs ran at the
@@ -3618,7 +3633,11 @@ async def _run_transcription_for_job(
             if not _stem_state["computed"]:
                 _stem_state["computed"] = True
                 await _step("transcribe.isolate_vocals", 25)
-                stem = await asyncio.to_thread(vocal_sep.separate_vocals, tmp_path)
+                _sep_ticker = _start_ticker("transcribe.isolate_vocals", 25, 54)
+                try:
+                    stem = await asyncio.to_thread(vocal_sep.separate_vocals, tmp_path)
+                finally:
+                    _sep_ticker.cancel()
                 _stem_state["path"] = stem
                 _vocal_stem = stem
                 if stem:
@@ -3849,12 +3868,15 @@ async def _run_transcription_for_job(
                     wx_warm_task = asyncio.create_task(_warm_whisperx())
 
                     fa_segs = None
+                    _fa_ticker = _start_ticker("transcribe.align", 55, 79)
                     try:
                         fa_segs = await asyncio.to_thread(
                             forced_align.forced_align_lyrics, _aa, fa_text,
                         )
                     except Exception as e:
                         logger.warning("[LYRICS] forced_align raised: %s — using warm-start whisperX", e)
+                    finally:
+                        _fa_ticker.cancel()
 
                     if fa_segs:
                         logger.info("[LYRICS] forced alignment used (%s lines, lrclib text) for %r - %r", len(fa_segs), artist_hint, song_hint)

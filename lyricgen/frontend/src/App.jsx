@@ -831,7 +831,10 @@ export default function App() {
             if (file) setRowStatus(file, "error", { error: data.error });
             return null;
           }
-          if (file) setRowStatus(file, data.status === "transcribing_queued" ? "queued" : "transcribing");
+          if (file) setRowStatus(file, data.status === "transcribing_queued" ? "queued" : "transcribing", {
+            current_step: data.current_step ?? null,
+            progress: data.progress ?? null,
+          });
         }
       } catch {
         // Transient errors — keep polling.
