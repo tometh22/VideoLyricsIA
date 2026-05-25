@@ -1346,7 +1346,18 @@ async def list_plans():
 # Protected endpoints
 # ---------------------------------------------------------------------------
 
-MAX_UPLOAD_MB = int(os.environ.get("MAX_UPLOAD_MB", "100"))
+# Default bumped 100 → 500 MB (2026-05-24): los músicos suben WAV master
+# (50-150 MB típico, hasta 300 MB para temas largos en stereo 24-bit).
+# El upload va directo browser → R2 vía presigned URL (no toca la API),
+# así que este límite es solo guardrail server-side, no afecta memoria
+# del worker FastAPI. Override vía env MAX_UPLOAD_MB.
+#
+# CUIDADO: el endpoint legacy /upload (multipart-form, deprecated) usa
+# el mismo límite. Si reactivás /upload con MAX_UPLOAD_MB=500 vas a
+# OOMear el worker — el body completo entra a memoria. Por eso el
+# /upload tiene un _drain_to_spooled que va a disk arriba de 1MB, pero
+# igual NO usar /upload para WAV grande; el flujo es presigned R2.
+MAX_UPLOAD_MB = int(os.environ.get("MAX_UPLOAD_MB", "500"))
 _MP3_MAGIC_BYTES = (b"ID3", b"\xff\xfb", b"\xff\xf3", b"\xff\xf2")
 _AUDIO_EXTENSIONS = (".mp3", ".wav")
 

@@ -1144,15 +1144,12 @@ export default function UploadZone({
               </div>
               <div className="flex-1 min-w-0">
                 <p className="text-sm text-white truncate">{entry.file.name}</p>
-                {entry.file.name.toLowerCase().endsWith(".wav") &&
-                 entry.file.size > WAV_SOFT_WARN_MB * 1024 * 1024 && (
-                  /* UX 2026-05-24: copy más cortita + sin `truncate` para que
-                     no quede "reco..." cortado. Antes era worker-dev speak,
-                     ahora es directo al grano: tamaño + qué hacer. */
-                  <p className="text-label text-amber-400/80 mt-0.5 leading-snug">
-                    {t("batch.wav_warning_large", { sizeMB: Math.round(entry.file.size / (1024 * 1024)) })}
-                  </p>
-                )}
+                {/* 2026-05-24: WAV warning ELIMINADO. Los músicos suben
+                    WAV master por calidad — sugerirles "mejor MP3" es
+                    contradictorio con el producto. El upload DEBE funcionar
+                    hasta 500MB (default subido de 100 → 500 MB en main.py
+                    vía env MAX_UPLOAD_MB). Si el archivo excede el límite,
+                    el backend devuelve 413 con detalle accionable. */}
                 {/* 2026-05-23: status badge de la transcripción en background.
                     Refleja el estado real del job en backend (queued ▷ transcribing
                     ▷ done | error). Si transcribeStatusByFile no tiene la key,
