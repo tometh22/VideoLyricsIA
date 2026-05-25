@@ -187,15 +187,73 @@ def _download(value, dest_path: str) -> bool:
     return False
 
 
+def _audio_content_hash(audio_path: str) -> str:
+    """SHA-256 of the audio file's bytes, first 16 hex chars. Used as
+    the cache key for the R2 stem cache. Sub-64-bit space is fine — we
+    only need uniqueness within a tenant's catalog (a few thousand
+    songs)."""
+    import hashlib
+    h = hashlib.sha256()
+    # Read in chunks to avoid loading a 60 MB WAV into RAM.
+    with open(audio_path, "rb") as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b""):
+            h.update(chunk)
+    return h.hexdigest()[:16]
+
+
+def _stem_cache_key(audio_path: str) -> str:
+    """R2 key for the demucs stem of this audio. Includes the demucs
+    variant so different models don't share a cache entry (changing
+    `DEMUCS_VARIANT` from `mdx_extra` to `htdemucs` cleanly forces a
+    re-separation across the catalog)."""
+    return f"stems/{_audio_content_hash(audio_path)}_{_VARIANT}.wav"
+
+
 def separate_vocals(audio_path: str) -> str | None:
     """Isolate the vocal stem of `audio_path` via demucs on Replicate.
     Returns the path to a temp stem file, or None (disabled / failure).
     Never raises — callers fall back to the mixed audio.
+
+    PR #300 R2 STEM CACHE: before paying ~60-180 s on Replicate, check
+    whether the stem for this audio already lives in R2 under
+    `stems/{content_hash}_{variant}.wav`. If yes, download to a local
+    tempfile and skip Replicate entirely. Cache misses run demucs
+    normally + upload the result for future reuse. Trade-off: R2
+    storage cost (~$0.015/GB-month; a 30 MB stem × 100 songs/month
+    active ≈ $0.045/month — negligible). Cleanup of unused stems is
+    deferred to the reaper.
     """
     if not is_enabled():
         return None
     if not audio_path or not os.path.exists(audio_path):
         return None
+
+    # R2 cache check — before paying Replicate inference cost.
+    cache_key = None
+    try:
+        import storage as _storage
+        if _storage.is_enabled():
+            cache_key = _stem_cache_key(audio_path)
+            if _storage.object_exists(cache_key):
+                fd, cached_path = tempfile.mkstemp(suffix="_vocals.wav", prefix="genly_stem_cached_")
+                os.close(fd)
+                if _storage.download_object(cache_key, cached_path):
+                    ok, reason = validate_stem(cached_path)
+                    if ok:
+                        logger.info("[VOCALSEP] cache hit %s for %s — skipping Replicate",
+                                    cache_key, os.path.basename(audio_path))
+                        return cached_path
+                    logger.warning("[VOCALSEP] cached stem failed validation (%s) — re-separating",
+                                   reason)
+                # Cache miss-ish: download failed or validation failed.
+                try:
+                    os.unlink(cached_path)
+                except OSError:
+                    pass
+    except Exception as e:
+        # Cache check failures must NEVER break the main path.
+        logger.warning("[VOCALSEP] cache check failed (%s) — proceeding with Replicate", e)
+        cache_key = None  # don't try to upload either
 
     try:
         import replicate  # noqa: F401 — used inside `call_with_budget`
@@ -256,6 +314,21 @@ def separate_vocals(audio_path: str) -> str | None:
         except OSError:
             pass
         return None
+
+    # PR #300 cache-write: upload the fresh stem to R2 under the
+    # content-hash key so the next transcription of the same audio
+    # skips Replicate entirely. Best-effort — never blocks the return.
+    if cache_key:
+        try:
+            import storage as _storage
+            if _storage.is_enabled():
+                uploaded = _storage.upload_file(dest, cache_key)
+                if uploaded:
+                    logger.info("[VOCALSEP] uploaded stem to R2 cache %s", cache_key)
+                else:
+                    logger.warning("[VOCALSEP] cache upload returned None for %s", cache_key)
+        except Exception as e:
+            logger.warning("[VOCALSEP] cache upload failed (%s) — stem still usable for this job", e)
 
     logger.info("[VOCALSEP] isolated vocal stem for %s", os.path.basename(audio_path))
     return dest
