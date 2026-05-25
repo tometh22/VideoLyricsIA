@@ -370,15 +370,16 @@ function VideoCard({ job, onSelect, onDelete, selected, onToggleSelect, t }) {
   );
 }
 
-// MiniThumbnail — 40×24 aspect-video al lado del artist. Patrón
-// Loom/Spotify lista. Reusa useMediaUrl. Fallback: placeholder gris
-// con icono música cuando el job aún no tiene thumbnail (sin generar,
-// transcribiendo, etc).
-function MiniThumbnail({ jobId, status }) {
+// MediaThumbnail — 120×70 aspect-video YouTube Studio style.
+// Antes era MiniThumbnail 40×24 pero parecía tabla de log. Operator
+// feedback 2026-05-25: "el historial parece backend, debería ser más
+// lindo, sumarle thumbnails". Aumentamos 3× el tamaño + agregamos
+// ring + overlay play sobre la card completa.
+function MediaThumbnail({ jobId, status }) {
   const src = useMediaUrl(jobId, "thumbnail", "preview");
   const isReady = status === "done" || status === "pending_review";
   return (
-    <div className="w-10 h-6 shrink-0 rounded overflow-hidden bg-surface-3/40 ring-1 ring-white/[0.04] relative">
+    <div className="w-[120px] h-[70px] shrink-0 rounded-lg overflow-hidden bg-surface-3/40 ring-1 ring-white/[0.06] relative group/thumb">
       {src && (
         <img
           src={src}
@@ -390,27 +391,31 @@ function MiniThumbnail({ jobId, status }) {
       )}
       {!src && (
         <div className="absolute inset-0 flex items-center justify-center">
-          <svg className="w-3 h-3 text-gray-600" fill="none" stroke="currentColor" strokeWidth="1.6" viewBox="0 0 24 24">
-            <path d="M9 18V5l12-2v13" strokeLinecap="round" strokeLinejoin="round" /><circle cx="6" cy="18" r="3" /><circle cx="18" cy="16" r="3" />
+          <svg className="w-5 h-5 text-gray-600" fill="none" stroke="currentColor" strokeWidth="1.4" viewBox="0 0 24 24">
+            <path d="M9 18V5l12-2v13" strokeLinecap="round" strokeLinejoin="round" />
+            <circle cx="6" cy="18" r="3" /><circle cx="18" cy="16" r="3" />
           </svg>
         </div>
       )}
       {isReady && src && (
-        <div className="absolute inset-0 flex items-center justify-center opacity-0 hover:opacity-100 bg-black/40 transition-opacity">
-          <svg className="w-3 h-3 text-white ml-0.5" fill="currentColor" viewBox="0 0 24 24">
-            <path d="M8 5v14l11-7z" />
-          </svg>
+        <div className="absolute inset-0 flex items-center justify-center opacity-0 group-hover/thumb:opacity-100 bg-black/40 transition-opacity">
+          <div className="w-7 h-7 rounded-full bg-white/15 backdrop-blur-md flex items-center justify-center ring-1 ring-white/20">
+            <svg className="w-3 h-3 text-white ml-0.5" fill="currentColor" viewBox="0 0 24 24">
+              <path d="M8 5v14l11-7z" />
+            </svg>
+          </div>
         </div>
       )}
     </div>
   );
 }
 
-// 2026-05-25 PR-3 — TableRow: 44px de alto, Linear-style. Columnas:
-// [☐ checkbox][status dot][mini thumb 40×24][artist 180px][song flex-1][status badge 110px][time tabular-nums][acción]
-// Click en cualquier celda no-action → abre JobDetail. Hover muestra el
-// botón "Abrir →" a la derecha (fade-in, PR-9 micro-interactions).
-function TableRow({ job, onSelect, onDelete, selected, onToggleSelect, t }) {
+// 2026-05-25 v2 (operator feedback): TableRow → MediaRow estilo
+// YouTube Studio. Thumb grande 120×70 a la izquierda, dos líneas de
+// texto generosas en el centro, badge + time + acción a la derecha.
+// Padding más respiratorio (~90px de altura total). Hover ring +
+// fade-in del botón acción. Click en row → JobDetail.
+function MediaRow({ job, onSelect, onDelete, selected, onToggleSelect, t }) {
   const fallbackName = (job.filename || "").replace(/\.(mp3|wav|m4a|flac|aac|ogg)$/i, "");
   let songName = (job.song_title || "").trim();
   let artistName = (job.artist || "").trim();
@@ -428,94 +433,98 @@ function TableRow({ job, onSelect, onDelete, selected, onToggleSelect, t }) {
 
   return (
     <div
-      className="group flex items-center gap-3 h-[44px] px-3 rounded-lg hover:bg-surface-2/40 transition-colors cursor-pointer ring-1 ring-transparent hover:ring-white/[0.04]"
+      className="group relative flex items-center gap-4 py-3 px-3 rounded-xl hover:bg-surface-2/50 transition-colors cursor-pointer ring-1 ring-transparent hover:ring-white/[0.06]"
       onClick={handleRowClick}
       role="button"
     >
-      {/* Checkbox — solo si DELETABLE; sino spacer para alinear */}
-      <div
-        className="w-4 shrink-0 flex items-center justify-center"
-        onClick={(e) => { e.stopPropagation(); }}
-      >
-        {canDelete ? (
-          <button
-            type="button"
-            onClick={() => onToggleSelect(job.job_id)}
-            className={`w-4 h-4 rounded border flex items-center justify-center transition-colors
-              ${selected
-                ? "bg-brand border-brand"
-                : "border-white/20 hover:border-brand/70 opacity-0 group-hover:opacity-100"}
-              ${selected ? "opacity-100" : ""}`}
-            aria-label={selected ? "Deseleccionar" : "Seleccionar"}
+      {/* Checkbox — flotante arriba-izq del thumb, solo visible on hover
+          o si seleccionado. NO interfiere con el layout cuando no se usa. */}
+      {canDelete && (
+        <button
+          type="button"
+          onClick={(e) => { e.stopPropagation(); onToggleSelect(job.job_id); }}
+          className={`absolute top-2 left-2 z-10 w-5 h-5 rounded border flex items-center justify-center backdrop-blur-md transition-all
+            ${selected
+              ? "bg-brand border-brand opacity-100"
+              : "bg-black/40 border-white/30 hover:border-brand/70 opacity-0 group-hover:opacity-100"
+            }`}
+          aria-label={selected ? "Deseleccionar" : "Seleccionar"}
+        >
+          {selected && (
+            <svg className="w-3 h-3 text-white" fill="none" stroke="currentColor" strokeWidth="3" viewBox="0 0 24 24">
+              <polyline points="20 6 9 17 4 12" />
+            </svg>
+          )}
+        </button>
+      )}
+
+      {/* Media thumbnail (operator feedback 2026-05-25: "sumarle
+          thumbnails a los videos"). 120×70 aspect-video, YouTube Studio. */}
+      <MediaThumbnail jobId={job.job_id} status={job.status} />
+
+      {/* Texto central — 2 líneas generosas */}
+      <div className="flex-1 min-w-0 flex flex-col justify-center gap-0.5">
+        <p className="text-[15px] font-semibold text-white truncate leading-tight" title={artistName}>
+          {artistName || <span className="text-gray-600 font-normal">—</span>}
+        </p>
+        <p className="text-[13px] text-ink-secondary truncate leading-tight" title={songName}>
+          {songName || <span className="text-gray-600">(sin nombre)</span>}
+        </p>
+        <div className="flex items-center gap-2 mt-1">
+          <StatusDot status={job.status} />
+          <StatusBadge status={job.status} t={t} />
+          <span
+            className="text-[11px] text-gray-500 font-mono tabular-nums"
+            title={absoluteTimeAR(job.created_at)}
           >
-            {selected && (
-              <svg className="w-2.5 h-2.5 text-white" fill="none" stroke="currentColor" strokeWidth="3" viewBox="0 0 24 24">
-                <polyline points="20 6 9 17 4 12" />
-              </svg>
-            )}
-          </button>
-        ) : null}
+            · {timeAgo(job.created_at)}
+          </span>
+        </div>
       </div>
 
-      {/* Status dot */}
-      <StatusDot status={job.status} />
-
-      {/* Mini thumbnail (operator feedback 2026-05-25: "debería tener
-          una mini vista previa como tiene la página de entregables") */}
-      <MiniThumbnail jobId={job.job_id} status={job.status} />
-
-      {/* Artist (180px) */}
-      <span
-        className="w-[180px] shrink-0 text-[13px] font-medium text-white truncate"
-        title={artistName}
+      {/* Action button derecha — contextual según status */}
+      <div
+        className="shrink-0 flex items-center justify-end"
+        onClick={(e) => e.stopPropagation()}
       >
-        {artistName || <span className="text-gray-600">—</span>}
-      </span>
-
-      {/* Song title (flex) */}
-      <span
-        className="flex-1 min-w-0 text-[13px] text-gray-300 truncate"
-        title={songName}
-      >
-        {songName || <span className="text-gray-600">(sin nombre)</span>}
-      </span>
-
-      {/* Status label compact (110px) */}
-      <span className="w-[110px] shrink-0 text-right">
-        <StatusBadge status={job.status} t={t} />
-      </span>
-
-      {/* Time relative + absolute tooltip */}
-      <span
-        className="w-[50px] shrink-0 text-right text-[11px] text-gray-500 font-mono tabular-nums"
-        title={absoluteTimeAR(job.created_at)}
-      >
-        {timeAgo(job.created_at)}
-      </span>
-
-      {/* Action button — contextual según status */}
-      <div className="w-7 shrink-0 flex items-center justify-end" onClick={(e) => e.stopPropagation()}>
         {isPending ? (
           <button
             type="button"
             onClick={handleRowClick}
-            className="text-[11px] text-brand-light hover:text-white opacity-0 group-hover:opacity-100 transition-opacity"
-            aria-label="Revisar"
+            className="flex items-center gap-1.5 px-3 h-9 rounded-lg bg-amber-500/15 ring-1 ring-amber-500/30 text-[12px] text-amber-200 hover:bg-amber-500/25 transition-colors"
           >
-            ↗
+            Revisar
+            <svg className="w-3 h-3" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
+              <path d="M9 5l7 7-7 7" strokeLinecap="round" strokeLinejoin="round" />
+            </svg>
+          </button>
+        ) : job.status === "done" ? (
+          <button
+            type="button"
+            onClick={handleRowClick}
+            className="flex items-center gap-1.5 px-3 h-9 rounded-lg bg-accent/15 ring-1 ring-accent/30 text-[12px] text-accent hover:bg-accent/25 transition-colors opacity-0 group-hover:opacity-100"
+          >
+            <svg className="w-3 h-3" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
+              <path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4" /><polyline points="7 10 12 15 17 10" /><line x1="12" y1="15" x2="12" y2="3" />
+            </svg>
+            Abrir
           </button>
         ) : isError && canDelete && onDelete ? (
           <button
             type="button"
             onClick={(e) => { e.stopPropagation(); if (confirm("¿Eliminar este job fallido?")) onDelete(job.job_id); }}
-            className="text-[11px] text-red-400/70 hover:text-red-300 opacity-0 group-hover:opacity-100 transition-opacity"
-            aria-label="Eliminar"
+            className="flex items-center gap-1.5 px-3 h-9 rounded-lg bg-white/[0.04] ring-1 ring-white/[0.06] text-[12px] text-red-400/80 hover:bg-red-500/15 hover:text-red-300 transition-colors opacity-0 group-hover:opacity-100"
           >
-            ×
+            <svg className="w-3 h-3" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
+              <path d="M3 6h18M8 6V4a2 2 0 012-2h4a2 2 0 012 2v2m3 0v14a2 2 0 01-2 2H7a2 2 0 01-2-2V6h14z" strokeLinecap="round" strokeLinejoin="round" />
+            </svg>
+            Eliminar
           </button>
         ) : (
-          <span className="text-[11px] text-gray-500 opacity-0 group-hover:opacity-100 transition-opacity">
-            →
+          <span className="text-gray-500 opacity-0 group-hover:opacity-100 transition-opacity">
+            <svg className="w-4 h-4" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
+              <path d="M9 5l7 7-7 7" strokeLinecap="round" strokeLinejoin="round" />
+            </svg>
           </span>
         )}
       </div>
@@ -684,9 +693,9 @@ export default function HistoryView({
                 ? (t("history.loading") || "Cargando…")
                 : isLoadFailed
                 ? (t("history.load_failed_subtitle") || "No pudimos cargar tu historial")
-                : history.length === 0
+                : realHistory.length === 0
                 ? "Aún no hay videos"
-                : `${history.length} ${history.length === 1 ? "video en total" : "videos en total"}`}
+                : `${realHistory.length} ${realHistory.length === 1 ? "video en total" : "videos en total"}`}
             </p>
           </div>
         </div>
@@ -912,9 +921,9 @@ export default function HistoryView({
                   {bucket.label} <span className="text-gray-600 font-mono tabular-nums normal-case">· {bucket.jobs.length}</span>
                 </p>
               </div>
-              <div className="space-y-px">
+              <div className="space-y-1">
                 {bucket.jobs.map((job) => (
-                  <TableRow
+                  <MediaRow
                     key={job.job_id}
                     job={job}
                     onSelect={onSelect}
