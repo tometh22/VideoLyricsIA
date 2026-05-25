@@ -11,7 +11,11 @@ Test them as data → data transforms without fixtures.
 from __future__ import annotations
 import pytest
 
-from transcribe_postprocess import normalize_words, dedup_collisions
+from transcribe_postprocess import (
+    normalize_words,
+    dedup_collisions,
+    filter_intro_rescue_candidates,
+)
 
 
 # ─── normalize_words (existing contract) ───────────────────────────
@@ -138,6 +142,53 @@ def test_dedup_does_not_mutate_input():
     before = [dict(s) for s in segs]
     _ = dedup_collisions(segs)
     assert segs == before
+
+
+def test_intro_rescue_picks_lines_before_fa_start():
+    """Canonical Bug A case: FA's first line is at 45 s but whisperX
+    found chorus repeats at 0:16-0:18 and 0:21-0:23. Both fit in the
+    rescue window."""
+    wx = [
+        {"start": 16.0, "end": 18.0, "text": "Legalícenla"},
+        {"start": 21.0, "end": 23.0, "text": "Oh-oh-oh"},
+        {"start": 45.5, "end": 47.0, "text": "Hubo tiempos"},  # overlaps FA, drop
+    ]
+    out = filter_intro_rescue_candidates(wx, first_main_start_s=45.4)
+    assert len(out) == 2
+    assert out[0]["text"] == "Legalícenla"
+    assert out[1]["text"] == "Oh-oh-oh"
+
+
+def test_intro_rescue_respects_buffer():
+    """A whisperX segment that ends 0.5 s before FA must NOT be rescued
+    when buffer is 1.0 s — too close, would visually overlap."""
+    wx = [{"start": 14.0, "end": 14.9, "text": "Legalícenla"}]
+    out = filter_intro_rescue_candidates(wx, first_main_start_s=15.4, buffer_s=1.0)
+    assert out == []
+    # But IS rescued with a smaller buffer.
+    out2 = filter_intro_rescue_candidates(wx, first_main_start_s=15.4, buffer_s=0.3)
+    assert len(out2) == 1
+
+
+def test_intro_rescue_handles_no_wx_segs():
+    """whisperX failed or returned nothing → empty rescue, no crash."""
+    assert filter_intro_rescue_candidates([], first_main_start_s=45.0) == []
+    assert filter_intro_rescue_candidates(None, first_main_start_s=45.0) == []
+
+
+def test_intro_rescue_handles_zero_intro_gap():
+    """If FA already starts near t=0, the rescue window is empty —
+    no candidates, no crash."""
+    wx = [{"start": 0.5, "end": 1.5, "text": "x"}]
+    out = filter_intro_rescue_candidates(wx, first_main_start_s=0.5, buffer_s=1.0)
+    assert out == []   # cutoff = -0.5 < 0
+
+
+def test_intro_rescue_does_not_mutate_input():
+    wx = [{"start": 5.0, "end": 7.0, "text": "intro"}]
+    before = [dict(s) for s in wx]
+    _ = filter_intro_rescue_candidates(wx, first_main_start_s=20.0)
+    assert wx == before
 
 
 def test_dedup_respects_custom_epsilon():
