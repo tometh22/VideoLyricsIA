@@ -138,7 +138,11 @@ def test_old_processing_job_is_reaped_with_clear_message():
         # explicitly refresh.
         db.refresh(row)
         assert row.status == "error", f"expected 'error', got {row.status!r}"
-        assert row.error and "abandonó" in row.error.lower(), (
+        # Copy fix 2026-05-25: reaper's user-facing message in reaper.py:395
+        # was rewritten ("Worker abandonó" → "El video se interrumpió por
+        # un problema temporal del servidor") but the test wasn't updated.
+        # Match against the current copy.
+        assert row.error and "se interrumpió" in row.error.lower(), (
             f"expected reaper reason in error field, got {row.error!r}"
         )
         assert row.completed_at is not None, "completed_at should be stamped"
@@ -279,13 +283,16 @@ def test_no_double_reap_when_job_is_both_old_and_orphan():
         # The exact count depends on other test data; what matters is
         # that the same row didn't get hit twice in one pass. We assert
         # the post-state is consistent and the message comes from the
-        # age path ("abandonó"), not the orphan path ("se reinició"),
+        # age path ("se interrumpió"), not the orphan path ("se reinició"),
         # since stuck is processed first and orphans are filtered.
+        # Copy fix 2026-05-25: was "abandonó"; reaper.py:395 message
+        # was rewritten to "El video se interrumpió por un problema
+        # temporal del servidor".
         assert n >= 1
         row = db.query(Job).filter(Job.job_id == jid).first()
         db.refresh(row)
         assert row.status == "error"
-        assert "abandonó" in row.error.lower(), (
+        assert "se interrumpió" in row.error.lower(), (
             f"expected age-based message for double-hit job, got {row.error!r}"
         )
     finally:
