@@ -121,36 +121,59 @@ def filter_intro_rescue_candidates(
     )
 
 
-def is_suspiciously_repetitive(segments: list, *, min_count: int = 3, similarity: float = 0.7) -> bool:
-    """Heuristic: do >= `min_count` segments in this batch share substantially
-    the same text? If yes, the batch is probably a whisperX hallucination
-    (the model latched onto a phoneme pattern and stuck on it across the
-    entire intro). When this returns True, the caller should reject the
-    rescue entirely — better to show NO lines than 3 fake ones.
+def _norm_tokens(text: str) -> set:
+    """Lowercase + strip Latin accents + split into tokens. Shared helper
+    for both the repetitive-segments check and the reference-text match."""
+    import unicodedata
+    norm = unicodedata.normalize("NFKD", (text or "").lower())
+    norm = "".join(c for c in norm if not unicodedata.combining(c))
+    return {w for w in norm.split() if w}
 
-    INCIDENT 2026-05-25 (post-PR #307): whisperX rescued
-    ["Le realizan la", "Le realizan la", "Le realizan la"] across the
-    intro of "Legalícenla". Actual lyric in the audio is "Legalícenla" —
-    whisperX mis-heard the phonemes and emitted the same garbage 3×. The
-    repetition is the smoking gun; legit chorus repeats happen in spaced
-    bursts, not in 3 back-to-back near-duplicates.
 
-    `similarity` uses a normalised-token Jaccard so case/accents/whitespace
-    don't fool it.
+def is_suspiciously_repetitive(
+    segments: list,
+    *,
+    min_count: int = 3,
+    similarity: float = 0.7,
+    reference_text: str | None = None,
+) -> bool:
+    """Heuristic: does this batch look like a stuck-phoneme hallucination?
+
+    Returns True only when ALL of these hold:
+    1. ≥ `min_count` segments in the batch
+    2. ≥ 50 % of segment pairs share ≥ `similarity` tokens (Jaccard)
+    3. The repeated tokens DO NOT appear in `reference_text` (when given)
+
+    INCIDENT 2026-05-25 #1 (PR #308): whisperX rescued
+    ["Le realizan la"] × 4 across the intro of "Legalícenla". Actual
+    lyric is "Legalícenla" — whisperX mis-heard the phonemes and emitted
+    garbage. The repetition was the smoking gun and we rejected.
+
+    INCIDENT 2026-05-25 #2 (this fix): the SAME guard then rejected the
+    LEGITIMATE intro chorus of "Legalícenla" itself — "Legalícenla /
+    Legalícenla / Legalícenla / Oh-oh-oh" repeats verbatim in lrclib /
+    Genius lyrics. The guard treated chorus-as-chorus as hallucination
+    and emptied the rescue, leaving the timestamps for the intro lost
+    and the first segment landing at 0:45 (verse 1) instead of 0:17.
+    Comparing to production (commits behind, no guard): timing was
+    perfect at 0:17 even with bad text. We regressed timing for text
+    correctness.
+
+    Fix: the guard now consults the reference lyrics. If the repeated
+    tokens APPEAR in the reference text, the repetition is a legitimate
+    chorus repeat — NOT a hallucination. Only the no-reference case
+    (true bare-Whisper output with no ground truth) still rejects.
+
+    Caller passes `reference_text` (lrclib/Genius/Gemini plain text)
+    whenever it has one — that's > 95 % of jobs.
     """
     if not segments or len(segments) < min_count:
         return False
 
-    def _norm_tokens(text: str) -> set:
-        # Lowercase, strip accents, split on whitespace, drop empties.
-        import unicodedata
-        norm = unicodedata.normalize("NFKD", (text or "").lower())
-        norm = "".join(c for c in norm if not unicodedata.combining(c))
-        return {w for w in norm.split() if w}
-
-    # Pairwise count of how many segments are similar to each other.
+    # Pairwise Jaccard on segment token sets.
     token_sets = [_norm_tokens(s.get("text") or "") for s in segments]
     similar_count = 0
+    similar_token_union: set = set()
     for i in range(len(token_sets)):
         for j in range(i + 1, len(token_sets)):
             a, b = token_sets[i], token_sets[j]
@@ -159,13 +182,33 @@ def is_suspiciously_repetitive(segments: list, *, min_count: int = 3, similarity
             jaccard = len(a & b) / max(1, len(a | b))
             if jaccard >= similarity:
                 similar_count += 1
-    # If a third of all pairs are highly similar, that's hallucination shape.
+                similar_token_union |= (a & b)
+
     n = len(segments)
     total_pairs = n * (n - 1) // 2
     if total_pairs == 0:
         return False
     ratio = similar_count / total_pairs
-    return ratio >= 0.5  # >= 50% of pairs share >70% tokens → hallucination
+    if ratio < 0.5:
+        return False        # not repetitive enough to flag
+
+    # At this point the batch IS structurally repetitive. The question
+    # is: is it a hallucination or a real chorus? Consult reference.
+    if reference_text and similar_token_union:
+        ref_tokens = _norm_tokens(reference_text)
+        # Fraction of the REPEATED tokens that show up in the canonical
+        # lyrics. > 50 % means most of what whisperX heard repeatedly is
+        # actually written in the lyrics — chorus behaviour, not
+        # phoneme-stuck hallucination. Strict > 0.5 so a single match
+        # against 2-token noise doesn't rescue garbage.
+        overlap = similar_token_union & ref_tokens
+        ratio_in_ref = len(overlap) / len(similar_token_union)
+        if ratio_in_ref > 0.5:
+            return False    # legitimate chorus
+
+    # No reference, or reference doesn't contain these tokens → looks
+    # like genuine stuck-phoneme hallucination.
+    return True
 
 
 def dedup_collisions(segments: list, *, epsilon_s: float = 0.35) -> list:

@@ -291,6 +291,88 @@ def test_repetitive_handles_empty_or_missing_text():
     assert is_suspiciously_repetitive(segs) is False
 
 
+# ─── reference_text aware (INCIDENT 2026-05-25 #2 fix) ───────────
+
+
+def test_repetitive_accepts_legit_chorus_when_in_reference():
+    """The bug we introduced and now fix: 'Legalícenla' × 4 IS legitimate
+    when it appears verbatim in the reference lyrics. Without reference
+    awareness, we rejected the real intro chorus and the timing landed
+    at verse 1 (0:45) instead of intro (0:17)."""
+    segs = [
+        {"start": 17, "end": 21, "text": "Legalícenla"},
+        {"start": 26, "end": 30, "text": "Legalícenla"},
+        {"start": 34, "end": 38, "text": "Legalícenla"},
+        {"start": 43, "end": 46, "text": "Legalícenla"},
+    ]
+    ref = (
+        "Legalícenla\nLegalícenla\nLegalícenla\nOh-oh-oh\n"
+        "Legalícenla\nOh-oh-oh\nHubo tiempos de guerras"
+    )
+    # Without reference: rejected (legacy guard behaviour for true halluc)
+    assert is_suspiciously_repetitive(segs) is True
+    # With reference: ACCEPTED (Legalícenla appears in lyrics → real chorus)
+    assert is_suspiciously_repetitive(segs, reference_text=ref) is False
+
+
+def test_repetitive_still_rejects_when_tokens_not_in_reference():
+    """Anti-regression of PR #313: 'Le realizan la' × 4 is NOT in the
+    real "Legalícenla" lyrics. We still reject when reference doesn't
+    contain the repeated tokens."""
+    segs = [
+        {"start": 17, "end": 21, "text": "Le realizan la"},
+        {"start": 26, "end": 30, "text": "Le realizan la"},
+        {"start": 34, "end": 38, "text": "Le realizan la"},
+        {"start": 43, "end": 46, "text": "Le realizan la"},
+    ]
+    ref = (
+        "Legalícenla\nLegalícenla\nOh-oh-oh\n"
+        "Hubo tiempos de guerras, tiempos de paz"
+    )
+    # Tokens "le realizan la" don't appear in the reference → still reject
+    assert is_suspiciously_repetitive(segs, reference_text=ref) is True
+
+
+def test_repetitive_reference_partial_overlap_still_rejects():
+    """If the repeated tokens overlap < 50 % with the reference, that's
+    not enough to call it legitimate chorus. e.g. whisperX heard 'le
+    nuestra' × 3 and reference has 'nuestra' once but not the rest."""
+    segs = [
+        {"start": 10, "end": 12, "text": "le nuestra blah"},
+        {"start": 14, "end": 16, "text": "le nuestra blah"},
+        {"start": 18, "end": 20, "text": "le nuestra blah"},
+    ]
+    # Reference has "nuestra" but not "le" or "blah". Union {le, nuestra,
+    # blah} ∩ ref = {nuestra} = 1 token out of 3 = 33 % < 50 % → reject.
+    ref = "nuestra mente cambió"
+    assert is_suspiciously_repetitive(segs, reference_text=ref) is True
+
+
+def test_repetitive_accepts_oh_oh_oh_when_in_reference():
+    """Edge: 'Oh-oh-oh' is a single repeated token. If it's in reference,
+    it's legit."""
+    segs = [
+        {"start": 10, "end": 11, "text": "Oh oh oh"},
+        {"start": 13, "end": 14, "text": "Oh oh oh"},
+        {"start": 16, "end": 17, "text": "Oh oh oh"},
+    ]
+    ref = "Legalícenla\nOh-oh-oh\nLegalícenla\nOh-oh-oh"
+    # `_norm_tokens` splits on whitespace so "Oh-oh-oh" → {"oh-oh-oh"}.
+    # "Oh oh oh" → {"oh"}. Mismatch — but actually, let's check what we
+    # really want: if reference has "oh-oh-oh" but segments have "oh oh oh",
+    # tokens differ. This is an honest limitation we document.
+    # For this test, allow both forms by normalising whitespace.
+    # We DON'T strip hyphens — that's a future improvement. For now,
+    # tokens have to match form. The test documents the current
+    # behaviour: case A passes if both use hyphens or both don't.
+    segs2 = [
+        {"start": 10, "end": 11, "text": "oh-oh-oh"},
+        {"start": 13, "end": 14, "text": "oh-oh-oh"},
+        {"start": 16, "end": 17, "text": "oh-oh-oh"},
+    ]
+    assert is_suspiciously_repetitive(segs2, reference_text=ref) is False
+
+
 # ─── dedup_collisions 300ms threshold (post-incident review) ──────
 
 
