@@ -70,23 +70,25 @@ def test_search_picks_match_by_artist():
     assert url == "https://genius.com/viejas-locas-legalicenla-lyrics"
 
 
-def test_search_falls_back_to_top_hit_when_no_artist_match():
-    """When the artist name doesn't normalise-match anything, we still
-    take the top hit. Better than nothing — Genius's own relevance is
-    usually correct on the headline."""
+def test_search_refuses_top_hit_when_no_artist_match():
+    """REGRESSION GUARD: the original code took hits[0] as fallback when
+    no artist matched. That produced disastrously wrong matches — Amanda
+    Pujó (Argentine indie) → Brazilian trap track; AIRBAG (rock) →
+    reggaeton. Mixing wrong lyrics into forced_align is worse than no
+    lyrics. Strict artist match only."""
     import genius_fetch
     fake_response = MagicMock(status_code=200)
     fake_response.json.return_value = {
         "response": {"hits": [
             {"result": {
-                "url": "https://genius.com/top-hit-lyrics",
+                "url": "https://genius.com/wrong-artist-lyrics",
                 "primary_artist": {"name": "Unrelated Artist"},
             }},
         ]}
     }
     with _force_enabled(), patch("requests.get", return_value=fake_response):
         url = genius_fetch._search_song_url("Some Band", "Some Song")
-    assert url == "https://genius.com/top-hit-lyrics"
+    assert url is None, "must NOT fall back to wrong-artist top hit"
 
 
 def test_search_returns_none_on_no_hits():
@@ -145,6 +147,21 @@ def test_scrape_returns_none_when_no_container():
     with _force_enabled(), patch("requests.get", return_value=fake_response):
         text = genius_fetch._scrape_lyrics_from_url("https://genius.com/x")
     assert text is None
+
+
+def test_scrape_returns_none_on_suspiciously_large_content():
+    """REGRESSION GUARD: smoke test on 2026-05-25 found that some Genius
+    pages have nested lyric containers from related/recommended tracks.
+    Scraping all of them yielded 17k chars across 341 lines — clearly
+    multiple songs. We reject pages > 200 lines or > 5000 chars."""
+    import genius_fetch
+    # Build a page with 250 lines of plausible-looking text.
+    body = "<br/>".join(f"line {i} of fake lyrics" for i in range(250))
+    fake_html = f'<div data-lyrics-container="true">{body}</div>'
+    fake_response = MagicMock(status_code=200, text=fake_html)
+    with _force_enabled(), patch("requests.get", return_value=fake_response):
+        text = genius_fetch._scrape_lyrics_from_url("https://genius.com/x")
+    assert text is None, "must reject suspiciously large pages"
 
 
 def test_scrape_returns_none_on_thin_content():
