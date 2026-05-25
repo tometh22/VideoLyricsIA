@@ -1448,16 +1448,25 @@ _KNOWN_ARTISTS_LIMIT = 1000
 def _known_artists_for_tenant(db, tenant_id: str) -> set[str]:
     """Cached lookup of distinct artist strings the tenant ya subió.
     Used by _parse_filename_artist_title to disambiguate 'X - Y' splits.
-    Returns lowercase set para comparación case-insensitive."""
+    Returns lowercase set para comparación case-insensitive.
+
+    Fix U11-hotpath: la query se ejecuta en un ThreadPoolExecutor con timeout
+    de 2 s para que, si el pool de conexiones DB está saturado (uploads grandes
+    concurrentes), el upload no quede bloqueado esperando adquirir una conexión.
+    Si la query no termina a tiempo se retorna set() vacío y el parser cae
+    a la heurística histórica (comportamiento pre-U11).
+    """
     if not tenant_id or db is None:
         return set()
     now = _u11_time.time()
     cached = _KNOWN_ARTISTS_CACHE.get(tenant_id)
     if cached and (now - cached[0]) < _KNOWN_ARTISTS_TTL_S:
         return cached[1]
-    try:
-        from database import Job
-        rows = (
+    import concurrent.futures as _cf
+    from database import Job
+
+    def _query():
+        return (
             db.query(Job.artist)
             .filter(Job.tenant_id == tenant_id)
             .filter(Job.artist.isnot(None))
@@ -1466,9 +1475,15 @@ def _known_artists_for_tenant(db, tenant_id: str) -> set[str]:
             .limit(_KNOWN_ARTISTS_LIMIT)
             .all()
         )
+
+    try:
+        with _cf.ThreadPoolExecutor(max_workers=1) as _ex:
+            rows = _ex.submit(_query).result(timeout=2.0)
         artists = {r[0].strip().lower() for r in rows if r[0] and r[0].strip()}
     except Exception:
-        artists = set()
+        # Pool saturado, timeout o cualquier error DB → fallback graceful.
+        # No cacheamos para reintentar en la próxima llamada.
+        return set()
     _KNOWN_ARTISTS_CACHE[tenant_id] = (now, artists)
     return artists
 
