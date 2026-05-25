@@ -667,6 +667,21 @@ export default function UploadZone({
     );
   };
 
+  // U11 UX (2026-05-25): el parser de filename a veces invierte artist↔title.
+  // El backend U11 lo resuelve con DB lookup de known-artists, pero el primer
+  // upload del tenant (cache vacío) cae a la heurística histórica. Botón
+  // de "intercambiar" deja al operador corregir en 1 click sin volver a
+  // tipear ambos campos.
+  const swapArtistTitle = (idx) => {
+    onFiles((prev) =>
+      prev.map((entry, i) =>
+        i === idx
+          ? { ...entry, artist: entry.songTitle || "", songTitle: entry.artist || "" }
+          : entry
+      )
+    );
+  };
+
   const removeFile = (idx, e) => {
     e.stopPropagation();
     onFiles((prev) => prev.filter((_, i) => i !== idx));
@@ -1182,36 +1197,70 @@ export default function UploadZone({
               </button>
             </div>
 
-            {/* Core fields */}
-            <div className="space-y-2">
-              <input
-                type="text"
-                value={entry.artist}
-                onChange={(e) => updateField(i, "artist", e.target.value)}
-                placeholder={t("upload.artist") + " *"}
-                required
-                className={`w-full px-3 py-1.5 rounded-lg bg-surface-1 border
-                  focus:outline-none text-sm text-white placeholder-gray-500 transition-all
-                  ${entry.artist.trim() ? "border-white/[0.06] focus:border-brand/50" : "border-amber-500/40 focus:border-amber-400"}`}
-              />
-              {!entry.artist.trim() && (
-                <p className="text-[11px] text-amber-400/80">
-                  {t("upload.artist_required") || "Nombre del artista es requerido"}
-                </p>
-              )}
-              <input
-                type="text"
-                value={entry.songTitle || ""}
-                onChange={(e) => updateField(i, "songTitle", e.target.value)}
-                placeholder={t("upload.song_title") || "Nombre de la canción"}
-                className="w-full px-3 py-1.5 rounded-lg bg-surface-1 border border-white/[0.06]
-                  focus:border-brand/50 focus:outline-none text-sm text-white placeholder-gray-500 transition-all"
-              />
-              {!(entry.songTitle || "").trim() && (
-                <p className="text-[11px] text-gray-600">
-                  {t("upload.song_title_hint") || "Si lo dejás vacío, lo inferimos del nombre del archivo"}
-                </p>
-              )}
+            {/* Core fields — U11 UX (2026-05-25):
+                 - Labels SIEMPRE visibles arriba del input para que el
+                   operador NO confunda artist vs título cuando el parser
+                   auto-completa.
+                 - Botón "↔ Intercambiar" cuando AMBOS campos están filleados
+                   (la situación típica del autocomplete) para corregir
+                   filenames invertidos ("Title - Artist") en 1 click. */}
+            <div className="space-y-2.5">
+              {/* Artist row */}
+              <div>
+                <label className="flex items-center justify-between gap-2 mb-1">
+                  <span className="text-[11px] uppercase tracking-wide font-medium text-brand/80">
+                    {t("upload.artist") || "Artista"}
+                    <span className="text-amber-400 ml-0.5">*</span>
+                  </span>
+                  {entry.artist.trim() && (entry.songTitle || "").trim() && (
+                    <button
+                      type="button"
+                      onClick={() => swapArtistTitle(i)}
+                      title={t("upload.swap_hint") || "¿Quedó al revés? Intercambia artista y título."}
+                      className="text-[10px] uppercase tracking-wide text-gray-400 hover:text-brand transition-colors flex items-center gap-1 px-1.5 py-0.5 rounded hover:bg-white/[0.04]"
+                    >
+                      <svg className="w-3 h-3" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
+                        <path strokeLinecap="round" strokeLinejoin="round" d="M7 16V4m0 0L3 8m4-4l4 4m6 0v12m0 0l4-4m-4 4l-4-4" />
+                      </svg>
+                      {t("upload.swap") || "Intercambiar"}
+                    </button>
+                  )}
+                </label>
+                <input
+                  type="text"
+                  value={entry.artist}
+                  onChange={(e) => updateField(i, "artist", e.target.value)}
+                  placeholder={t("upload.artist_placeholder") || "Ej: Viejas Locas"}
+                  required
+                  className={`w-full px-3 py-1.5 rounded-lg bg-surface-1 border
+                    focus:outline-none text-sm text-white placeholder-gray-500 transition-all
+                    ${entry.artist.trim() ? "border-white/[0.06] focus:border-brand/50" : "border-amber-500/40 focus:border-amber-400"}`}
+                />
+                {!entry.artist.trim() && (
+                  <p className="text-[11px] text-amber-400/80 mt-1">
+                    {t("upload.artist_required") || "Nombre del artista es requerido"}
+                  </p>
+                )}
+              </div>
+              {/* Title row */}
+              <div>
+                <label className="block text-[11px] uppercase tracking-wide font-medium text-gray-400 mb-1">
+                  {t("upload.song_title") || "Título de la canción"}
+                </label>
+                <input
+                  type="text"
+                  value={entry.songTitle || ""}
+                  onChange={(e) => updateField(i, "songTitle", e.target.value)}
+                  placeholder={t("upload.song_title_placeholder") || "Ej: Legalícenla"}
+                  className="w-full px-3 py-1.5 rounded-lg bg-surface-1 border border-white/[0.06]
+                    focus:border-brand/50 focus:outline-none text-sm text-white placeholder-gray-500 transition-all"
+                />
+                {!(entry.songTitle || "").trim() && (
+                  <p className="text-[11px] text-gray-600 mt-1">
+                    {t("upload.song_title_hint") || "Si lo dejás vacío, lo inferimos del nombre del archivo"}
+                  </p>
+                )}
+              </div>
               {/* Language pills. Default 'es' is highlighted on file
                   load — operator can click another to override, or
                   click 'auto' to let Whisper detect (not recommended
