@@ -598,6 +598,8 @@ const translations = {
     // todas acá. Solo ES por ahora; EN/PT caen al fallback inline del
     // componente hasta que un translator las cubra.
     //
+    // 2026-05-25 PR-3 — Historial tabla densa + search + sort.
+    "history.search_placeholder": "Buscar artista, canción o ID…",
     // 2026-05-25 — Generating hero (BatchProgress SingleGeneratingHero).
     // Mensajes rotativos del step cycling + label + ETA fallback.
     // Build CI exige que toda clave referenciada exista en ES como mínimo.

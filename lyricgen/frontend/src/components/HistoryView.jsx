@@ -1,4 +1,4 @@
-import { useState, useMemo, useEffect } from "react";
+import { useState, useMemo, useEffect, useRef } from "react";
 import { useI18n } from "../i18n";
 import { useMediaUrl } from "../mediaUrl";
 
@@ -11,6 +11,134 @@ function timeAgo(ts) {
   if (diff < 3600) return `${Math.floor(diff / 60)}m`;
   if (diff < 86400) return `${Math.floor(diff / 3600)}h`;
   return `${Math.floor(diff / 86400)}d`;
+}
+
+// Hora absoluta en zona AR para tooltips (cuando el operador necesita
+// fecha exacta para reportar a UMG: "el video del 22 mayo 14:30").
+function absoluteTimeAR(ts) {
+  if (!ts) return "";
+  const d = new Date(ts * 1000);
+  return new Intl.DateTimeFormat("es-AR", {
+    day: "2-digit", month: "short", hour: "2-digit", minute: "2-digit"
+  }).format(d);
+}
+
+// 2026-05-25 PR-3 — bucketing temporal por timezone AR (no UTC). El
+// operador piensa en bloques cronológicos ("Hoy", "Esta semana") y
+// scrolea por ahí, no por una lista plana de 200 cards. Returns lista
+// ordenada de {key, label, jobs[]} para renderizar con sticky headers.
+function bucketByDateAR(jobs) {
+  if (!jobs?.length) return [];
+  // Anclas calculadas una sola vez (no por job)
+  const now = new Date();
+  const fmtAR = new Intl.DateTimeFormat("en-CA", {
+    timeZone: "America/Argentina/Buenos_Aires",
+    year: "numeric", month: "2-digit", day: "2-digit",
+  });
+  const todayAR = fmtAR.format(now);
+  const yesterdayAR = (() => {
+    const y = new Date(now); y.setDate(y.getDate() - 1);
+    return fmtAR.format(y);
+  })();
+  const startOfWeekAR = (() => {
+    const d = new Date(now);
+    const dayIdx = d.getDay() === 0 ? 6 : d.getDay() - 1; // Lunes = inicio
+    d.setDate(d.getDate() - dayIdx);
+    return fmtAR.format(d);
+  })();
+  const fmtMonthAR = new Intl.DateTimeFormat("es-AR", {
+    timeZone: "America/Argentina/Buenos_Aires",
+    month: "long", year: "numeric",
+  });
+
+  const buckets = new Map(); // ordered insertion
+  for (const job of jobs) {
+    const ts = job.created_at;
+    if (!ts) continue;
+    const d = new Date(ts * 1000);
+    const dateAR = fmtAR.format(d);
+    let key, label;
+    if (dateAR === todayAR) { key = "0-today"; label = "Hoy"; }
+    else if (dateAR === yesterdayAR) { key = "1-yesterday"; label = "Ayer"; }
+    else if (dateAR >= startOfWeekAR) { key = "2-this-week"; label = "Esta semana"; }
+    else {
+      const monthLabel = fmtMonthAR.format(d);
+      // Mes/año como key para que jobs del mismo mes caigan al mismo
+      // bucket. Capitalize primera letra ("Mayo 2026").
+      key = "3-" + monthLabel.replace(/\s+/g, "-").toLowerCase();
+      label = monthLabel.charAt(0).toUpperCase() + monthLabel.slice(1);
+    }
+    if (!buckets.has(key)) buckets.set(key, { key, label, jobs: [] });
+    buckets.get(key).jobs.push(job);
+  }
+  // Orden: today → yesterday → this week → meses (sort desc por timestamp del primer job)
+  const out = [];
+  ["0-today", "1-yesterday", "2-this-week"].forEach((k) => {
+    if (buckets.has(k)) { out.push(buckets.get(k)); buckets.delete(k); }
+  });
+  // Resto (meses) ordenados desc por timestamp del job más reciente del bucket
+  const remaining = [...buckets.values()].sort((a, b) =>
+    (b.jobs[0]?.created_at || 0) - (a.jobs[0]?.created_at || 0)
+  );
+  return [...out, ...remaining];
+}
+
+function sortJobs(jobs, sortKey) {
+  const arr = [...(jobs || [])];
+  switch (sortKey) {
+    case "oldest":
+      return arr.sort((a, b) => (a.created_at || 0) - (b.created_at || 0));
+    case "artist_asc":
+      return arr.sort((a, b) =>
+        (a.artist || "").localeCompare(b.artist || "", "es-AR")
+      );
+    case "artist_desc":
+      return arr.sort((a, b) =>
+        (b.artist || "").localeCompare(a.artist || "", "es-AR")
+      );
+    case "newest":
+    default:
+      return arr.sort((a, b) => (b.created_at || 0) - (a.created_at || 0));
+  }
+}
+
+// Persiste preferencias del operador (view + sort) entre sesiones.
+// Linear/Notion pattern — defaults razonables, opt-in a custom.
+function useLocalStorage(key, defaultValue) {
+  const [value, setValue] = useState(() => {
+    try {
+      const v = localStorage.getItem(key);
+      return v !== null ? v : defaultValue;
+    } catch (_) { return defaultValue; }
+  });
+  useEffect(() => {
+    try { localStorage.setItem(key, value); } catch (_) {}
+  }, [key, value]);
+  return [value, setValue];
+}
+
+// Mini status indicator para la tabla densa (dot 8px + label opcional).
+// No usa el StatusBadge full porque ocupa demasiado ancho en 44px row.
+function StatusDot({ status }) {
+  const map = {
+    done:                 "bg-accent",
+    pending_review:       "bg-amber-400",
+    processing:           "bg-brand animate-pulse",
+    queued:               "bg-gray-500",
+    editing:              "bg-brand animate-pulse",
+    transcribed:          "bg-gray-400",
+    transcribed_pending:  "bg-gray-400",
+    transcribing:         "bg-brand animate-pulse",
+    transcribing_queued:  "bg-gray-500",
+    awaiting_upload:      "bg-gray-500",
+    transcription_failed: "bg-red-400",
+    error:                "bg-red-400",
+    validation_failed:    "bg-red-400",
+    rejected:             "bg-red-400",
+    bg_preview_queued:    "bg-gray-500",
+    bg_preview_failed:    "bg-red-400",
+  };
+  return <span className={`inline-block w-1.5 h-1.5 rounded-full shrink-0 ${map[status] || "bg-gray-500"}`} />;
 }
 
 function FilterPill({ active, count, onClick, children }) {
@@ -242,6 +370,120 @@ function VideoCard({ job, onSelect, onDelete, selected, onToggleSelect, t }) {
   );
 }
 
+// 2026-05-25 PR-3 — TableRow: 44px de alto, Linear-style. Columnas:
+// [☐ checkbox][status dot][artist 180px][song flex-1][status badge 110px][time tabular-nums][acción]
+// Click en cualquier celda no-action → abre JobDetail. Hover muestra el
+// botón "Abrir →" a la derecha (fade-in, PR-9 micro-interactions).
+function TableRow({ job, onSelect, onDelete, selected, onToggleSelect, t }) {
+  const fallbackName = (job.filename || "").replace(/\.(mp3|wav|m4a|flac|aac|ogg)$/i, "");
+  let songName = (job.song_title || "").trim();
+  let artistName = (job.artist || "").trim();
+  if (!songName && fallbackName.includes(" - ")) {
+    songName = fallbackName.split(" - ").slice(1).join(" - ").trim();
+    if (!artistName) artistName = fallbackName.split(" - ")[0].trim();
+  } else if (!songName) {
+    songName = fallbackName;
+  }
+  const canDelete = DELETABLE.has(job.status);
+  const isPending = job.status === "pending_review";
+  const isError = job.status === "error" || job.status === "transcription_failed";
+
+  const handleRowClick = () => onSelect?.(job.job_id, job.status);
+
+  return (
+    <div
+      className="group flex items-center gap-3 h-[44px] px-3 rounded-lg hover:bg-surface-2/40 transition-colors cursor-pointer ring-1 ring-transparent hover:ring-white/[0.04]"
+      onClick={handleRowClick}
+      role="button"
+    >
+      {/* Checkbox — solo si DELETABLE; sino spacer para alinear */}
+      <div
+        className="w-4 shrink-0 flex items-center justify-center"
+        onClick={(e) => { e.stopPropagation(); }}
+      >
+        {canDelete ? (
+          <button
+            type="button"
+            onClick={() => onToggleSelect(job.job_id)}
+            className={`w-4 h-4 rounded border flex items-center justify-center transition-colors
+              ${selected
+                ? "bg-brand border-brand"
+                : "border-white/20 hover:border-brand/70 opacity-0 group-hover:opacity-100"}
+              ${selected ? "opacity-100" : ""}`}
+            aria-label={selected ? "Deseleccionar" : "Seleccionar"}
+          >
+            {selected && (
+              <svg className="w-2.5 h-2.5 text-white" fill="none" stroke="currentColor" strokeWidth="3" viewBox="0 0 24 24">
+                <polyline points="20 6 9 17 4 12" />
+              </svg>
+            )}
+          </button>
+        ) : null}
+      </div>
+
+      {/* Status dot */}
+      <StatusDot status={job.status} />
+
+      {/* Artist (180px) */}
+      <span
+        className="w-[180px] shrink-0 text-[13px] font-medium text-white truncate"
+        title={artistName}
+      >
+        {artistName || <span className="text-gray-600">—</span>}
+      </span>
+
+      {/* Song title (flex) */}
+      <span
+        className="flex-1 min-w-0 text-[13px] text-gray-300 truncate"
+        title={songName}
+      >
+        {songName || <span className="text-gray-600">(sin nombre)</span>}
+      </span>
+
+      {/* Status label compact (110px) */}
+      <span className="w-[110px] shrink-0 text-right">
+        <StatusBadge status={job.status} t={t} />
+      </span>
+
+      {/* Time relative + absolute tooltip */}
+      <span
+        className="w-[50px] shrink-0 text-right text-[11px] text-gray-500 font-mono tabular-nums"
+        title={absoluteTimeAR(job.created_at)}
+      >
+        {timeAgo(job.created_at)}
+      </span>
+
+      {/* Action button — contextual según status */}
+      <div className="w-7 shrink-0 flex items-center justify-end" onClick={(e) => e.stopPropagation()}>
+        {isPending ? (
+          <button
+            type="button"
+            onClick={handleRowClick}
+            className="text-[11px] text-brand-light hover:text-white opacity-0 group-hover:opacity-100 transition-opacity"
+            aria-label="Revisar"
+          >
+            ↗
+          </button>
+        ) : isError && canDelete && onDelete ? (
+          <button
+            type="button"
+            onClick={(e) => { e.stopPropagation(); if (confirm("¿Eliminar este job fallido?")) onDelete(job.job_id); }}
+            className="text-[11px] text-red-400/70 hover:text-red-300 opacity-0 group-hover:opacity-100 transition-opacity"
+            aria-label="Eliminar"
+          >
+            ×
+          </button>
+        ) : (
+          <span className="text-[11px] text-gray-500 opacity-0 group-hover:opacity-100 transition-opacity">
+            →
+          </span>
+        )}
+      </div>
+    </div>
+  );
+}
+
+
 const FILTERS = [
   { id: "all",     label: "Todos",     match: () => true },
   { id: "done",    label: "Listos",    match: (j) => j.status === "done" },
@@ -270,6 +512,26 @@ export default function HistoryView({
   const { t } = useI18n();
   const [filter, setFilter] = useState("all");
   const [selectedIds, setSelectedIds] = useState(() => new Set());
+  // 2026-05-25 PR-3 — Estado nuevo: search query (inline), sort key,
+  // view toggle (table|grid). View y sort persisten en localStorage para
+  // que el operador no tenga que re-configurarlos en cada sesión.
+  const [query, setQuery] = useState("");
+  const [sortKey, setSortKey] = useLocalStorage("genly_history_sort", "newest");
+  const [view, setView] = useLocalStorage("genly_history_view", "table");
+  const [sortMenuOpen, setSortMenuOpen] = useState(false);
+  const sortMenuRef = useRef(null);
+
+  // Click-outside cierra el sort menu
+  useEffect(() => {
+    if (!sortMenuOpen) return;
+    const handler = (e) => {
+      if (sortMenuRef.current && !sortMenuRef.current.contains(e.target)) {
+        setSortMenuOpen(false);
+      }
+    };
+    document.addEventListener("mousedown", handler);
+    return () => document.removeEventListener("mousedown", handler);
+  }, [sortMenuOpen]);
 
   // Three terminal states share the "no rows" branch: still loading the
   // first fetch, fetch failed, or the tenant genuinely has zero jobs. We
@@ -287,8 +549,32 @@ export default function HistoryView({
 
   const visible = useMemo(() => {
     const f = FILTERS.find((x) => x.id === filter) || FILTERS[0];
-    return history.filter(f.match);
-  }, [history, filter]);
+    let filtered = history.filter(f.match);
+    // Search query — filtra por artist + song_title + filename (case-insensitive)
+    const q = query.trim().toLowerCase();
+    if (q) {
+      filtered = filtered.filter((j) => {
+        const a = (j.artist || "").toLowerCase();
+        const s = (j.song_title || "").toLowerCase();
+        const fn = (j.filename || "").toLowerCase();
+        return a.includes(q) || s.includes(q) || fn.includes(q);
+      });
+    }
+    return sortJobs(filtered, sortKey);
+  }, [history, filter, query, sortKey]);
+
+  // Buckets temporales — solo para vista tabla con date groups.
+  // En grid mantenemos lista plana para no quebrar el flow visual.
+  const buckets = useMemo(() => bucketByDateAR(visible), [visible]);
+
+  // Sort options (label + key) — usados por el dropdown
+  const SORT_OPTIONS = [
+    { key: "newest",        label: "Más reciente" },
+    { key: "oldest",        label: "Más antigua" },
+    { key: "artist_asc",    label: "Artista A→Z" },
+    { key: "artist_desc",   label: "Artista Z→A" },
+  ];
+  const currentSortLabel = SORT_OPTIONS.find((o) => o.key === sortKey)?.label || "Más reciente";
 
   // When the history list updates (e.g. row deleted), drop selections
   // pointing to job_ids that no longer exist.
@@ -366,7 +652,104 @@ export default function HistoryView({
         </div>
       </div>
 
-      {/* ─── Filters ─────────────────────────────────────────────── */}
+      {/* ─── Search + Sort + View Toggle (PR-3 2026-05-25) ─────────
+            Top control row: search inline a la izquierda, sort dropdown
+            y toggle tabla/grid a la derecha. Pattern Notion/Linear. */}
+      {history.length > 0 && (
+        <div className="flex items-center gap-2 mb-4">
+          {/* Search inline */}
+          <div className="flex-1 min-w-0 relative">
+            <svg className="absolute left-3 top-1/2 -translate-y-1/2 w-3.5 h-3.5 text-gray-500 pointer-events-none" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
+              <circle cx="11" cy="11" r="8" /><path d="M21 21l-4.35-4.35" strokeLinecap="round" />
+            </svg>
+            <input
+              type="text"
+              value={query}
+              onChange={(e) => setQuery(e.target.value)}
+              placeholder={t("history.search_placeholder") || "Buscar artista, canción o ID…"}
+              className="w-full h-9 pl-9 pr-9 rounded-lg bg-surface-2/40 ring-1 ring-white/[0.04] focus:ring-white/[0.12] hover:ring-white/[0.08] text-[13px] text-white placeholder:text-gray-500 outline-none transition-colors"
+              spellCheck={false}
+              autoComplete="off"
+            />
+            {query && (
+              <button
+                type="button"
+                onClick={() => setQuery("")}
+                className="absolute right-2.5 top-1/2 -translate-y-1/2 w-5 h-5 rounded-full bg-white/[0.06] hover:bg-white/[0.12] flex items-center justify-center text-gray-400 hover:text-white transition-colors"
+                aria-label="Limpiar búsqueda"
+              >
+                <svg className="w-3 h-3" fill="none" stroke="currentColor" strokeWidth="2.5" viewBox="0 0 24 24">
+                  <path d="M18 6L6 18M6 6l12 12" strokeLinecap="round" />
+                </svg>
+              </button>
+            )}
+          </div>
+
+          {/* Sort dropdown */}
+          <div className="relative" ref={sortMenuRef}>
+            <button
+              type="button"
+              onClick={() => setSortMenuOpen((v) => !v)}
+              className="flex items-center gap-1.5 h-9 px-3 rounded-lg bg-surface-2/40 ring-1 ring-white/[0.04] hover:ring-white/[0.08] text-[12px] text-gray-300 hover:text-white transition-colors"
+            >
+              <svg className="w-3 h-3" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
+                <path d="M3 6h18M6 12h12M10 18h4" strokeLinecap="round" />
+              </svg>
+              <span className="hidden sm:inline">{currentSortLabel}</span>
+              <svg className={`w-3 h-3 transition-transform ${sortMenuOpen ? "rotate-180" : ""}`} fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
+                <path d="M6 9l6 6 6-6" strokeLinecap="round" strokeLinejoin="round" />
+              </svg>
+            </button>
+            {sortMenuOpen && (
+              <div className="absolute right-0 top-full mt-1 w-44 rounded-lg bg-surface-2 ring-1 ring-white/10 shadow-xl py-1 z-20">
+                {SORT_OPTIONS.map((o) => (
+                  <button
+                    key={o.key}
+                    type="button"
+                    onClick={() => { setSortKey(o.key); setSortMenuOpen(false); }}
+                    className={`w-full text-left px-3 py-1.5 text-[12px] transition-colors flex items-center justify-between
+                      ${sortKey === o.key ? "text-brand-light bg-white/[0.04]" : "text-gray-300 hover:bg-white/[0.04] hover:text-white"}`}
+                  >
+                    {o.label}
+                    {sortKey === o.key && (
+                      <svg className="w-3 h-3" fill="none" stroke="currentColor" strokeWidth="2.5" viewBox="0 0 24 24"><polyline points="20 6 9 17 4 12" /></svg>
+                    )}
+                  </button>
+                ))}
+              </div>
+            )}
+          </div>
+
+          {/* View toggle: tabla / grid */}
+          <div className="flex items-center bg-surface-2/40 ring-1 ring-white/[0.04] rounded-lg overflow-hidden">
+            <button
+              type="button"
+              onClick={() => setView("table")}
+              className={`h-9 px-2.5 transition-colors ${view === "table" ? "bg-white/[0.08] text-white" : "text-gray-500 hover:text-gray-300"}`}
+              aria-label="Vista tabla"
+              title="Vista tabla"
+            >
+              <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
+                <path d="M3 6h18M3 12h18M3 18h18" strokeLinecap="round" />
+              </svg>
+            </button>
+            <button
+              type="button"
+              onClick={() => setView("grid")}
+              className={`h-9 px-2.5 transition-colors ${view === "grid" ? "bg-white/[0.08] text-white" : "text-gray-500 hover:text-gray-300"}`}
+              aria-label="Vista cards"
+              title="Vista cards"
+            >
+              <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
+                <rect x="3" y="3" width="7" height="7" /><rect x="14" y="3" width="7" height="7" />
+                <rect x="3" y="14" width="7" height="7" /><rect x="14" y="14" width="7" height="7" />
+              </svg>
+            </button>
+          </div>
+        </div>
+      )}
+
+      {/* ─── Filters (segmented pills) ──────────────────────────── */}
       {history.length > 0 && (
         <div className="flex flex-wrap gap-2 mb-6">
           {FILTERS.filter((f) => f.id === "all" || counts[f.id] > 0).map((f) => (
@@ -460,22 +843,75 @@ export default function HistoryView({
         </div>
       ) : visible.length === 0 ? (
         <div className="rounded-card p-14 text-center bg-surface-2/30 ring-1 ring-white/[0.04]">
-          <p className="text-sm text-ink-secondary">
-            {history.length === 0 ? t("history.empty") : "No hay videos en esta vista"}
-          </p>
+          {query.trim() ? (
+            <>
+              <p className="text-sm text-ink-secondary mb-3">
+                No encontramos videos para <span className="font-mono text-white">"{query.trim()}"</span>
+              </p>
+              <button
+                type="button"
+                onClick={() => setQuery("")}
+                className="text-xs text-brand-light hover:text-white transition-colors underline-offset-2 hover:underline"
+              >
+                Limpiar búsqueda
+              </button>
+            </>
+          ) : (
+            <p className="text-sm text-ink-secondary">
+              {history.length === 0 ? t("history.empty") : "No hay videos en esta vista"}
+            </p>
+          )}
+        </div>
+      ) : view === "table" ? (
+        /* TABLA DENSA con sticky date group headers (PR-3 2026-05-25) */
+        <div className="space-y-2">
+          {buckets.map((bucket) => (
+            <div key={bucket.key}>
+              <div className="sticky top-0 z-10 -mx-1 px-1 py-2 bg-surface/95 backdrop-blur-sm">
+                <p className="text-section text-gray-500 uppercase tracking-[0.18em]">
+                  {bucket.label} <span className="text-gray-600 font-mono tabular-nums normal-case">· {bucket.jobs.length}</span>
+                </p>
+              </div>
+              <div className="space-y-px">
+                {bucket.jobs.map((job) => (
+                  <TableRow
+                    key={job.job_id}
+                    job={job}
+                    onSelect={onSelect}
+                    onDelete={onDelete}
+                    selected={selectedIds.has(job.job_id)}
+                    onToggleSelect={toggleSelect}
+                    t={t}
+                  />
+                ))}
+              </div>
+            </div>
+          ))}
         </div>
       ) : (
-        <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-3">
-          {visible.map((job) => (
-            <VideoCard
-              key={job.job_id}
-              job={job}
-              onSelect={onSelect}
-              onDelete={onDelete}
-              selected={selectedIds.has(job.job_id)}
-              onToggleSelect={toggleSelect}
-              t={t}
-            />
+        /* VISTA GRID original con date group headers */
+        <div className="space-y-6">
+          {buckets.map((bucket) => (
+            <div key={bucket.key}>
+              <div className="mb-3">
+                <p className="text-section text-gray-500 uppercase tracking-[0.18em]">
+                  {bucket.label} <span className="text-gray-600 font-mono tabular-nums normal-case">· {bucket.jobs.length}</span>
+                </p>
+              </div>
+              <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-3">
+                {bucket.jobs.map((job) => (
+                  <VideoCard
+                    key={job.job_id}
+                    job={job}
+                    onSelect={onSelect}
+                    onDelete={onDelete}
+                    selected={selectedIds.has(job.job_id)}
+                    onToggleSelect={toggleSelect}
+                    t={t}
+                  />
+                ))}
+              </div>
+            </div>
           ))}
         </div>
       )}
