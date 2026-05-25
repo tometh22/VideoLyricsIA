@@ -4367,11 +4367,28 @@ def _analyze_lyrics_for_background(lyrics_text: str, artist: str, job_id: str = 
     # animado) the existing movement_rule steers it, so clause (2) keeps its
     # original "exact camera movement" wording.
     _static = normalized_movement == "estatico"
+    _sutil = normalized_movement == "sutil"
     _auto_movement = normalized_movement == ""
     if _static:
+        # C4 (2026-05-25): repetir LOCKED 3× para reforzar el prior cuando
+        # estatico esté ruteado a Veo (vía STATIC_SUTIL_VIA_VEO=1).
         _clause2 = ("(2) framing only — wide/medium/close and angle — the camera "
-                    "is LOCKED and STATIC, explicitly NO camera movement of any kind; "
-                    "all motion lives WITHIN the scene")
+                    "is LOCKED and STATIC, the camera is BOLTED in place, "
+                    "explicitly NO camera movement of any kind; the frame is "
+                    "FIXED; all motion lives WITHIN the scene (water, fire, "
+                    "foliage, particles, light shifts)")
+    elif _sutil:
+        # C4 (2026-05-25): branch nueva para sutil. Camera barely-breathing
+        # con motion rica IN-SCENE. Distinguible de estatico (clavada) y
+        # de estandar (camera se mueve).
+        _clause2 = ("(2) framing — wide/medium/close and angle — and a "
+                    "near-static camera that BARELY BREATHES (micro-drift "
+                    "ONLY, the lens shifts no more than 5% of the frame width "
+                    "over the whole shot); treat as a fixed photograph that "
+                    "just breathes. Rich motion lives WITHIN the scene "
+                    "(water, fire, foliage, particles, light); the camera "
+                    "itself is essentially still. NEVER push-in, NEVER zoom, "
+                    "NEVER dolly forward, NEVER orbit. Just a faint breath")
     elif _auto_movement:
         _clause2 = ("(2) the camera register that matches the song's energy — a "
                     "LOCKED STATIC frame for intimate/calm songs, SUBTLE minimal "
@@ -4398,6 +4415,27 @@ def _analyze_lyrics_for_background(lyrics_text: str, artist: str, job_id: str = 
         "" if allow_people
         else "- Never include people, faces, hands, or readable text in the scene\n"
     )
+    # A2 (2026-05-25) — Anti-cliché rule. Incidente "Legalícenla - Viejas
+    # Locas": Gemini identificó correctamente "marihuana" como sujeto
+    # literal y Imagen produjo cannabis-leaves-framing-sunset, textbook
+    # stock-photo cringe. La regla substituye METÁFORA por LITERAL cuando
+    # la letra trata temas sensibles — captura la energía sin el visual
+    # cringe. Aplica transversalmente (Veo y Imagen).
+    #
+    # A3 (2026-05-25) — Editorial-photography rule, solo gated por
+    # for_provider="imagen". Veo tiene sus propios equivalentes (lens,
+    # grain, cinematografía) en otras reglas; Imagen no.
+    _is_imagen = for_provider == "imagen"
+    _imagen_quality_line = (
+        "\n- EDITORIAL PHOTOGRAPHY AESTHETIC (required, Imagen path): Magnum / "
+        "National Geographic / Vogue, NOT stock photo. Specific lens (e.g. 35mm "
+        "f/1.4, 85mm f/1.8), natural imperfections (grain, slight focus falloff, "
+        "real-world directional lighting with shadows), ASYMMETRIC composition, "
+        "single clear subject — avoid centered 'product shot' framing and over-"
+        "saturated color clichés (no symmetric leaves-framing-sunset, no perfectly-"
+        "lined silhouettes against gradient skies, no \"AI sunset\" aesthetic)."
+        if _is_imagen else ""
+    )
     _PROMPT_RULES = (
         "- \"style\" must always be \"video\"\n"
         "- \"prompt\" is 80-120 words. Describe: (1) specific scene subject and setting "
@@ -4411,7 +4449,30 @@ def _analyze_lyrics_for_background(lyrics_text: str, artist: str, job_id: str = 
         "subject of the scene and the CONCEPT dictates its visual styling "
         "(palette, texture, atmosphere, register). Concept never replaces or "
         "contradicts the literal subject of the lyrics unless match_lyrics is "
-        "explicitly disabled."
+        "explicitly disabled.\n"
+        "- ANTI-CLICHÉ / METAPHOR-OVER-LITERAL RULE: if the lyrics' literal subject "
+        "is a SENSITIVE / POLITICAL / TABOO topic (drugs, sex, weapons, religion, "
+        "politics, suicide, alcohol abuse, gang violence), DO NOT depict the subject "
+        "literally — substitute a METAPHORICAL scene that captures the song's "
+        "EMOTIONAL ENERGY (defiance, longing, ecstasy, melancholy, rebellion, "
+        "freedom) without the on-the-nose imagery. Examples:\n"
+        "  · Drug-positive anthem → smoke / haze drifting through warm window light, "
+        "record-store dust motes, vinyl spinning under a single lamp — NOT plants, "
+        "leaves, paraphernalia, pills, or rolled paper.\n"
+        "  · Heartbreak after addiction → empty bar at dawn, single bottle on counter, "
+        "cold blue light through smoke — NOT pills, needles, or hospital rooms.\n"
+        "  · Political protest → marching shadows on wet pavement, banners viewed from "
+        "behind, kinetic dust and torchlight — NOT readable flags, slogans, "
+        "politician faces, or police uniforms.\n"
+        "  · Gang / street violence → tense empty alley after rain, broken neon "
+        "reflection in puddle, single dropped object — NOT guns, blood, masked "
+        "figures, or threatening crowds.\n"
+        "  · Sex / explicit lust → silk curtains in heat haze, candlelight on textured "
+        "wall, single tangled bedsheet — NOT bodies, beds, or anatomy.\n"
+        "  Goal: a viewer who DOESN'T know the song should feel its energy through "
+        "the scene — without instantly clocking 'this is a [drugs/protest/violence] "
+        "song'. The lyric video ACCOMPANIES the song; it does NOT narrate it."
+        + _imagen_quality_line
     )
     # Contrastive few-shot examples + a "do not copy verbatim" disclaimer.
     # The example SET is chosen by movement intent so the camera language the
@@ -4433,6 +4494,18 @@ Example for romantic ballad / love song:
 
 Example for introspective acoustic / folk track:
 {"style":"video","prompt":"Held static shot of a misty mountain valley at dawn on a locked tripod, layered blue and pink sky perfectly still, silhouetted pine trees motionless, low fog rolling slowly between them, a single bird crossing the far distance, contemplative and vast, cinematic 4k"}"""
+    elif _sutil:
+        # C4 (2026-05-25): ejemplos sutil — camera BARELY breathing, motion
+        # rica in-scene. Para que Veo no confunda con estandar (movimiento
+        # cinematográfico) ni con estatico (frame clavado).
+        _EXAMPLES_BLOCK = """Example for rock / energetic track (sutil register — camera barely breathes, motion lives in the scene):
+{"style":"video","prompt":"Near-static medium shot of an empty rock concert stage just before showtime, the camera barely breathes with imperceptible drift, smoke machines pumping thick haze across the empty platform, stage lights pulsing in red and amber sequences, a microphone stand swaying very slightly from a draft, dust drifting through the colored beams, anticipation and tension, cinematic 4k"}
+
+Example for romantic ballad (sutil register — fixed frame with breath, rich in-scene motion):
+{"style":"video","prompt":"Almost-fixed frame of a candlelit window seat at dusk, the camera barely shifts as if held by a steady hand, flames flickering in three candles, gauze curtains billowing in slow waves, golden hour light shifting subtly through translucent fabric, a wine glass catching tremulous light, intimate and warm, cinematic 4k"}
+
+Example for introspective acoustic / folk (sutil register — near-locked camera, motion in nature):
+{"style":"video","prompt":"Near-static wide shot of a misty mountain valley at dawn, the camera scarcely breathes, layers of fog rolling slowly between silhouetted pines, distant birds crossing the pink and blue sky, light shifting gradually as the sun rises behind the ridge, a single leaf drifting down through the cold air, contemplative and vast, cinematic 4k"}"""
     elif _auto_movement:
         _EXAMPLES_BLOCK = """Example (LOCKED STATIC camera — motion only within the scene):
 {"style":"video","prompt":"Fixed static frame of a sunlit room at golden hour, the camera never moves, gauze curtains billowing gently, dust motes drifting through the warm beam, a glass catching slow glints, intimate and calm, cinematic 4k"}
@@ -5054,21 +5127,65 @@ def _generate_veo_video(prompt: str, output_path: str, job_id: str = None,
             " no extra animation noise."
         )
     elif _norm_move == "estatico":
-        # Locked tripod. Drop the "filmed with cinema camera" phrasing (it
-        # nudges Veo toward cinematic moves) for an explicit static framing,
-        # and append the camera-motion negatives so a static prompt actually
-        # holds the frame. Fixes the "I asked for static and it still drifted"
-        # report.
+        # C2 (2026-05-25) — Hardening del prompt estatico. Veo ignoraba
+        # ~50% de las locked-frame requests pre-2026-05-22, motivando el
+        # routing a Imagen. Ahora endurecemos vía:
+        #   1) Repetición: las constraints aparecen 3× (al inicio, en el
+        #      medio, y al final). Veo responde a repetición.
+        #   2) Afirmativos a la par de negativos: no solo "no pan/zoom"
+        #      sino "BOLTED tripod, FIXED frame, single static shot".
+        #   3) Anti-Ken-Burns: explícitamente "no slow zoom despite
+        #      locked appearance" para evitar el "frozen frame + zoom"
+        #      que Veo aplica como compromiso cuando no puede decidir.
+        #   4) "Filmed on a security camera" — phrasing que Veo ASOCIA
+        #      con motion-locked (a diferencia de "cinema camera" que
+        #      sugiere drift).
         safe_prompt = (
-            f"{prompt}. Photorealistic, real footage, locked static tripod shot, "
-            "fixed camera, the frame does not move, motion only within the scene. "
+            f"{prompt}. "
+            # Affirmative — repeated phrasing for Veo's prior.
+            "LOCKED STATIC TRIPOD shot. The camera is BOLTED in place. "
+            "Single FIXED frame held for the entire duration. "
+            "Filmed on a security camera — NO operator, NO movement of the lens. "
+            "All motion lives WITHIN the scene only (water ripples, fire, "
+            "drifting clouds, smoke, foliage swaying, particles floating). "
+            "The frame edges NEVER shift. "
             f"{no_alley}"
             f"{_base_negatives}"
             " no CGI, no animation,"
             f"{_camera_negatives}"
+            # Anti-Ken-Burns + repetition at end.
+            " No slow zoom despite locked appearance. No subtle push-in. "
+            "No imperceptible drift. The camera is COMPLETELY STILL. "
+            "Lens position is fixed for the entire shot."
+        )
+    elif _norm_move == "sutil":
+        # C3 (2026-05-25) — Branch nueva para sutil. Antes caía en el `else`
+        # final con solo _forward_travel_negative, que Veo trataba como
+        # "cinematográfico atenuado" → forward push asumido.
+        #
+        # Sutil = cámara casi estática pero respira sutilmente. Distinguible
+        # de estatico (clavada) y de estandar (se mueve). El affirmative
+        # "near-static tripod, micro-drift only" + negativos de zoom/dolly/
+        # push-in son el lever para que Veo entregue la escena viva con
+        # micro-movimiento.
+        safe_prompt = (
+            f"{prompt}. "
+            "Near-static tripod shot. The camera barely breathes — micro-drift "
+            "ONLY — the lens shifts no more than 5% of the frame width over "
+            "the whole shot. Treat as a fixed photograph that just breathes. "
+            "Motion is rich WITHIN the scene (water, fire, foliage, "
+            "particles, light shifts), but the FRAME itself is near-still. "
+            f"{no_alley}"
+            f"{_base_negatives}"
+            " no CGI, no animation."
+            " No zoom, no dolly, no push-in, no orbit, no crane, no whip pan."
+            f"{_forward_travel_negative}"
+            # Affirmative repetition at end.
+            " The camera is essentially static — micro-drift is the ONLY "
+            "movement permitted. No cinematic camera moves."
         )
     else:
-        # Auto / sutil / foto-parallax (and any unknown register): cap forward
+        # Auto / foto-parallax (and any unknown register): cap forward
         # travel so the overlaid lyrics stay readable. Two opt-outs: the
         # explicit "Cinematográfico" pick (estandar), and verbatim mode (the
         # operator wrote their own camera language — "mi prompt manda").
@@ -5617,16 +5734,32 @@ def _ensure_background(style_hint: str, job_dir: str, lyrics_text: str = None,
     elif _norm_move_bg == "foto-parallax" and bg_mode != "imagen":
         logger.info("[BG] movement=foto-parallax overrides bg_mode → imagen (lateral pan)")
         bg_mode = "imagen"
-    # Estático / Sutil: Veo ignores "locked / no advance" ~half the time
-    # (measured 2026-05-22) and pushes in, which made these registers feel the
-    # same and nauseating to read over. So the calm registers route through
-    # Imagen-4 + a deterministic, code-controlled camera move (static frame /
-    # gentle drift) that NEVER advances. Trade-off: a still photo (no in-scene
-    # waves/wind), accepted for guaranteed legibility. (Matrix: estatico/sutil
-    # → Imagen × static/subtle, regardless of the operator's bg_mode.)
+    # Estático / Sutil: HISTÓRICAMENTE (2026-05-22) ruteados a Imagen porque
+    # Veo ignoraba "locked / no advance" ~50% del tiempo y se mandaba al
+    # frente, arruinando la legibilidad de las letras superpuestas.
+    #
+    # 2026-05-25 — El design intent original era que estatico/sutil sean
+    # escenas REALES con Veo (cámara estática + motion in-scene rica), no
+    # still photos. Foto+parallax es el único Imagen path por diseño.
+    #
+    # Gated detrás de STATIC_SUTIL_VIA_VEO env flag (default OFF en staging
+    # por seguridad — flip a "1" para alinear con el design). Cuando esté
+    # ON, estos registers usan Veo con prompt hardening reforzado (C2+C3+C4
+    # más abajo) para minimizar el riesgo de forward-push del Veo histórico.
+    #
+    # Si el flag está OFF, mantiene el comportamiento conservador 2026-05-22.
     elif _norm_move_bg in ("estatico", "sutil") and bg_mode != "imagen":
-        logger.info("[BG] movement=%s overrides bg_mode → imagen (controlled camera)", _norm_move_bg)
-        bg_mode = "imagen"
+        _static_sutil_via_veo = (
+            os.environ.get("STATIC_SUTIL_VIA_VEO", "").strip().lower()
+            in ("1", "true", "yes", "on")
+        )
+        if not _static_sutil_via_veo:
+            logger.info("[BG] movement=%s overrides bg_mode → imagen (controlled camera, STATIC_SUTIL_VIA_VEO=off)", _norm_move_bg)
+            bg_mode = "imagen"
+        else:
+            logger.info("[BG] movement=%s stays on Veo (STATIC_SUTIL_VIA_VEO=on)", _norm_move_bg)
+            # bg_mode stays "veo" — _generate_veo_video will receive the
+            # hardened safe_prompt for estatico/sutil (C2 + C3).
 
     # Imagen-4 + Ken Burns branch. Cabled 2026-05-16 — _generate_imagen_image
     # has existed in the codebase as dead code since the original architecture
@@ -5644,10 +5777,23 @@ def _ensure_background(style_hint: str, job_dir: str, lyrics_text: str = None,
         prompt = result["prompt"]
         image_path = os.path.join(job_dir, "bg_imagen.jpg")
         bg_path = os.path.join(job_dir, "bg_generated.mp4")
+        # A1 (2026-05-25) — foto-parallax es el único register que el
+        # operador eligió específicamente para path Imagen premium.
+        # Merece el modelo ultra (~$0.04 vs $0.02 estándar — despreciable
+        # comparado con los $0.80-3.20 de Veo de los otros registers).
+        # Estatico/sutil siguen con el modelo estándar (default IMAGEN_MODEL)
+        # cuando NO está activado el flag STATIC_SUTIL_VIA_VEO (Parte C).
+        _parallax_model = (
+            os.environ.get("IMAGEN_MODEL_PARALLAX",
+                           "imagen-4.0-ultra-generate-001").strip()
+            if _norm_move_bg == "foto-parallax" else None
+        )
         # Imagen-4 has its own internal rate-limit retry (5 attempts with
         # 60s backoff). Any other exception bubbles up to the caller's
         # try/except which falls back to the gradient.
-        _generate_imagen_image(prompt, image_path, job_id=job_id, allow_people=allow_people)
+        _generate_imagen_image(prompt, image_path, job_id=job_id,
+                                model=_parallax_model,
+                                allow_people=allow_people)
         # Ken Burns produces a 60s sample that downstream palindrome-loops
         # to match the audio duration. Same contract as the Veo path.
         #   - "Estático"        → hold the frame (no zoom/pan).
@@ -5872,12 +6018,29 @@ def _ken_burns_clip(image_path: str, duration: float, spec: RenderSpec | None = 
         # camera never advances. `lateral` uses the full horizontal room; the
         # `subtle` drift uses a fraction of it plus a touch of vertical, so it
         # reads as a barely-there breath rather than a clear slide.
+        #
+        # B1+B3 (2026-05-25) — En `lateral` (foto-parallax) sumamos:
+        #   - Zoom-breath sutil (scale anima entre 1.15 y 1.22 cada ~32s):
+        #     da sensación de profundidad sin advance forward. Mantiene la
+        #     UMG motion policy (pan domina, breath es respiratory).
+        #   - Back-and-forth para canciones >180s: en vez de un pan lineal
+        #     unidireccional invisible sobre 5min, hacemos ida 60% del room
+        #     en 0.55*duration + vuelta 40% en 0.45*duration. Mismo travel
+        #     total, redistribuido en ciclos visibles.
+        # B2 (easing) ya vive en `_pan_frame_subpixel` (cosine ease in/out).
+        # Para `subtle` mantenemos el comportamiento original (drift mínimo,
+        # sin breath ni back-forth — el operador de sutil pidió quietud).
         if lateral:
-            scale, amp_x, amp_y = 1.18, 1.0, 0.0
+            scale_base, scale_amp = 1.185, 0.035  # breathes 1.15..1.22
+            amp_x, amp_y = 1.0, 0.0
         else:  # subtle
-            scale, amp_x, amp_y = 1.10, 0.35, 0.18
-        cw = max(1, min(int(w / scale), w))
-        ch = max(1, min(int(h / scale), h))
+            scale_base, scale_amp = 1.10, 0.0  # no breath
+            amp_x, amp_y = 0.35, 0.18
+        # Use scale_base for crop dims (cw/ch held constant — breath happens
+        # in the FINAL resize step). Computing cw/ch per-frame would break
+        # the base_x/base_y precomputation.
+        cw = max(1, min(int(w / scale_base), w))
+        ch = max(1, min(int(h / scale_base), h))
         room_x = max(0, w - cw)
         room_y = max(0, h - ch)
         travel_x = int(room_x * amp_x)
@@ -5886,15 +6049,62 @@ def _ken_burns_clip(image_path: str, duration: float, spec: RenderSpec | None = 
         base_y = (h - ch) // 2 - travel_y // 2
         dir_x = random.choice([1, -1])
         dir_y = random.choice([1, -1])
+        # B3: back-and-forth gate. Solo para `lateral` y duration >180s.
+        _do_back_forth = lateral and duration > 180.0
 
         def make_pan_frame(t):
-            return _pan_frame_subpixel(
-                img, t, duration,
+            # B3: dos ciclos de pan (ida 60% + vuelta 40%). Time-warped
+            # `effective_t` se mapea al duration original para que
+            # `_pan_frame_subpixel` calcule la posición con su easing.
+            if _do_back_forth:
+                ida_dur = duration * 0.55
+                if t <= ida_dur:
+                    # Ida: 0 → 60% del travel sobre 0.55*duration
+                    local_p = t / ida_dur
+                    eased = 0.5 - 0.5 * math.cos(local_p * math.pi)
+                    effective_p = eased * 0.6
+                else:
+                    # Vuelta: 60% → 20% del travel sobre 0.45*duration
+                    local_p = (t - ida_dur) / max(0.001, duration - ida_dur)
+                    eased = 0.5 - 0.5 * math.cos(local_p * math.pi)
+                    effective_p = 0.6 - eased * 0.4
+                # Convertimos a `effective_t` para que _pan_frame_subpixel
+                # haga su propia interpolación basada en t/duration.
+                # Como _pan_frame_subpixel aplica ease cosine sobre p=t/duration,
+                # pre-eased aquí: pasamos un t cuyo eased equivale a effective_p.
+                # Resolvemos: 0.5-0.5*cos(p*pi) = effective_p
+                #             → cos(p*pi) = 1 - 2*effective_p
+                #             → p = acos(1 - 2*effective_p) / pi
+                p_target = math.acos(max(-1.0, min(1.0, 1.0 - 2.0 * effective_p))) / math.pi
+                effective_t = p_target * duration
+            else:
+                effective_t = t
+            frame = _pan_frame_subpixel(
+                img, effective_t, duration,
                 base_x=base_x, base_y=base_y, cw=cw, ch=ch,
                 travel_x=travel_x, travel_y=travel_y,
                 dir_x=dir_x, dir_y=dir_y,
                 out_w=spec.width, out_h=spec.height,
             )
+            # B1: zoom-breath sutil — re-resize el frame final con un scale
+            # que oscila entre (scale_base - scale_amp) y (scale_base + scale_amp).
+            # Cycle de 32s mantiene la respiración orgánica. Para `subtle`
+            # scale_amp=0 → no-op (el frame queda igual).
+            if scale_amp > 0:
+                breath_phase = (t % 32.0) / 32.0
+                breath_scale = 1.0 + (scale_amp / scale_base) * math.sin(breath_phase * 2.0 * math.pi)
+                if abs(breath_scale - 1.0) > 0.001:
+                    # Re-resize con shift centrado para no introducir wobble.
+                    fh, fw = frame.shape[:2]
+                    new_w = max(1, int(round(fw / breath_scale)))
+                    new_h = max(1, int(round(fh / breath_scale)))
+                    off_x = max(0, (fw - new_w) // 2)
+                    off_y = max(0, (fh - new_h) // 2)
+                    sub = frame[off_y:off_y + new_h, off_x:off_x + new_w]
+                    frame = np.array(
+                        Image.fromarray(sub).resize((fw, fh), Image.LANCZOS)
+                    )
+            return frame
 
         return VideoClip(make_pan_frame, duration=duration).set_fps(spec.fps)
 
