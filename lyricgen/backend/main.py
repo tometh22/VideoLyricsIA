@@ -3025,6 +3025,72 @@ async def admin_bg_preview_metrics(
     return get_metrics()
 
 
+# CV2 (audit Sprint 2 2026-05-25) — Multipart upload orphan visibility.
+@app.get("/admin/orphan-multipart-uploads")
+async def admin_list_orphan_multipart(
+    older_than_hours: int = 24,
+    current_user: dict = Depends(get_current_user),
+):
+    """Lista multipart uploads en flight más viejos que `older_than_hours`.
+
+    Browsers que crashean mid-multipart dejan parts acumulados en R2 —
+    incluso después del reaper best-effort abort, hay orphans residuales
+    (R2 transient errors, jobs sin row en DB, etc). Este endpoint da
+    visibilidad para cleanup manual.
+
+    NOTA: 24h es el threshold default; uploads activos típicos tardan
+    minutos. Anything older = abandono real.
+    """
+    if current_user.get("role") != "admin":
+        raise HTTPException(403, detail="Admin only.")
+    from storage import list_orphan_multipart_uploads
+    orphans = list_orphan_multipart_uploads(older_than_hours=older_than_hours)
+    return {
+        "older_than_hours": older_than_hours,
+        "count": len(orphans),
+        "orphans": orphans,
+    }
+
+
+@app.post("/admin/orphan-multipart-uploads/cleanup")
+async def admin_cleanup_orphan_multipart(
+    older_than_hours: int = 24,
+    apply: bool = False,
+    current_user: dict = Depends(get_current_user),
+):
+    """Aborta los multipart uploads orphans listados por GET above.
+
+    `apply=False` (default) → dry-run, retorna lo que abortaría.
+    `apply=true` → realmente aborta.
+
+    Itera el list y llama multipart_abort (con retry interno) por cada
+    orphan. Reporta éxitos / fallas.
+    """
+    if current_user.get("role") != "admin":
+        raise HTTPException(403, detail="Admin only.")
+    from storage import list_orphan_multipart_uploads, multipart_abort
+    orphans = list_orphan_multipart_uploads(older_than_hours=older_than_hours)
+    if not apply:
+        return {
+            "dry_run": True,
+            "would_abort": len(orphans),
+            "orphans": orphans,
+        }
+    aborted = 0
+    failed: list[dict] = []
+    for o in orphans:
+        if multipart_abort(o["key"], o["upload_id"]):
+            aborted += 1
+        else:
+            failed.append({"key": o["key"], "upload_id": o["upload_id"]})
+    return {
+        "dry_run": False,
+        "aborted": aborted,
+        "failed": failed,
+        "total": len(orphans),
+    }
+
+
 @app.get("/generate-preview-status/{job_id}")
 @limiter.limit("600/minute")
 async def generate_preview_status(
