@@ -92,22 +92,47 @@ def test_initial_prompt_included_when_hint_passed(fake_audio):
     assert "initial_prompt" in kwargs["input"]
     sent = kwargs["input"]["initial_prompt"]
     assert "Legalícenla" in sent
-    assert "Oh-oh-oh" in sent
-    # Length cap: at most 800 chars (~200 tokens for Spanish/English)
-    assert len(sent) <= 800
+    # Cap revised 2026-05-25 after live A/B: 120 chars >> 800. Long
+    # prompts saturate faster-whisper attention.
+    assert len(sent) <= 120
 
 
-def test_initial_prompt_truncated_for_long_lyrics(fake_audio):
-    """Whisper itself reads only the last ~224 tokens of the prompt.
-    Sending more is wasted bytes — and on a 10k-char Gemini result we'd
-    blow the Replicate input size unnecessarily. Cap is 800 chars."""
+def test_initial_prompt_capped_at_120_chars(fake_audio):
+    """EMPIRICAL (2026-05-25 live test against Replicate whisperX): a long
+    prompt (full lyrics, 800 chars) HURTS — output collapses to 2
+    distorted segments because the model parrots the prompt vocabulary
+    across all audio. The sweet spot is 2-4 seed lines, capped at 120
+    chars total. Sending more saturates attention."""
     wx = _force_enabled()
-    lyrics = "Legalícenla " * 200          # 2400+ chars
+    lyrics = ("Una linea larga que excede facilmente cien caracteres por si sola "
+              "para forzar el truncado. " * 5)
     with patch("replicate.run", _mock_replicate_run()) as m:
         wx.transcribe_whisperx(fake_audio, language="es", lyrics_hint=lyrics)
     _, kwargs = m.call_args
     sent = kwargs["input"]["initial_prompt"]
-    assert len(sent) == 800, f"expected exactly 800 chars, got {len(sent)}"
+    assert len(sent) <= 120, f"expected ≤120 chars, got {len(sent)}"
+
+
+def test_initial_prompt_extracts_first_seed_lines(fake_audio):
+    """Verify the seed extraction: takes the first 2-4 non-empty lines
+    (typically chorus / opening — densest in distinctive words), joined
+    with '. ' for whisperX's chunked attention."""
+    wx = _force_enabled()
+    lyrics = (
+        "Legalícenla\n"
+        "Legalícenla\n"
+        "Oh-oh-oh\n"
+        "Hubo tiempos de guerras, tiempos de paz\n"
+        "Hubo un tiempo en que era ilegal"
+    )
+    with patch("replicate.run", _mock_replicate_run()) as m:
+        wx.transcribe_whisperx(fake_audio, language="es", lyrics_hint=lyrics)
+    _, kwargs = m.call_args
+    sent = kwargs["input"]["initial_prompt"]
+    assert "Legalícenla" in sent
+    assert sent.startswith("Legalícenla")
+    assert ". " in sent                       # joins with ". "
+    assert len(sent) <= 120
 
 
 def test_initial_prompt_skipped_when_empty_string(fake_audio):

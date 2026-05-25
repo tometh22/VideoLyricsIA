@@ -272,15 +272,38 @@ def transcribe_whisperx(audio_path: str, language: str | None = None,
         payload["language"] = language
 
     # Lyrics-aware prompting. The Replicate whisperX model
-    # (victor-upmeet/whisperx) accepts `initial_prompt` which is then
-    # forwarded to the underlying faster-whisper. Whisper itself reads
-    # only the last ~224 tokens of the prompt, so we cap at ~800 chars
-    # (~200 tokens for Spanish/English) — sending more is wasted bytes.
+    # (victor-upmeet/whisperx) accepts `initial_prompt`, forwarded to the
+    # underlying faster-whisper.
+    #
+    # EMPIRICAL FINDING 2026-05-25 (live A/B against Legalícenla on
+    # Replicate — see scripts/scratch/test_prompt_variants.py):
+    #   - LONG prompt (full lyrics, 800 chars): HURTS. whisperX collapses
+    #     to 2 distorted segments because the model parrots prompt
+    #     vocabulary across all audio. First seg displaced by 30+ seconds.
+    #   - SHORT prompt (~22-120 chars, 2-4 seed lines): WORKS. "Legalícenla.
+    #     Oh-oh-oh." (22 chars) produced 8 well-aligned segments with
+    #     "Legalícenla" correctly recognised — vs 9 segments with the
+    #     wrong "Legalízala" without any hint.
+    #
+    # Strategy: take the first 2-4 non-empty lines of the reference
+    # (typically the chorus / opening — densest in distinctive words),
+    # joined with ". " and capped at 120 chars total. Enough vocab to
+    # bias without saturating attention.
     if lyrics_hint and lyrics_hint.strip():
-        prompt_text = lyrics_hint.strip()[:800]
+        lines = [ln.strip() for ln in lyrics_hint.splitlines() if ln.strip()]
+        seed_lines: list[str] = []
+        running_chars = 0
+        for ln in lines:
+            if running_chars + len(ln) > 120 and seed_lines:
+                break
+            seed_lines.append(ln)
+            running_chars += len(ln) + 2          # +2 for ". " joiner
+            if len(seed_lines) >= 4:
+                break
+        prompt_text = ". ".join(seed_lines)[:120]
         payload["initial_prompt"] = prompt_text
-        logger.info("[WHISPERX] initial_prompt primed with %s chars from reference lyrics",
-                    len(prompt_text))
+        logger.info("[WHISPERX] initial_prompt primed: %s chars (%s seed lines) — %r",
+                    len(prompt_text), len(seed_lines), prompt_text[:60])
 
     # OBSERVABILITY (audit 2026-05-24): whisperX USED to be a single
     # `replicate.run(...)` with no budget cap. When Replicate degraded,
