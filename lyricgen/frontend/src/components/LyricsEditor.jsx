@@ -2310,9 +2310,16 @@ export default function LyricsEditor({
                 key={seg._id}
                 ref={(el) => { rowRefs.current[seg._id] = el; }}
                 {...(idx === 0 ? { "data-tour": "editor-list-row" } : {})}
+                /* Phase A 2026-05-25: highlight prominente cuando es activo.
+                   Antes: bg-brand/[0.07] ring-1 ring-brand/25 (invisible al
+                   operador, ~7% opacity). Ahora: bg-brand/15 + left-bar
+                   border-l-4 brand + glow shadow + key con activeId
+                   dispara el pulse de la animación wlp-row-pulse al
+                   transicionar a este row. */
+                data-active={isActive && !isArmed ? "true" : "false"}
                 className={`group rounded-xl transition-all
                   ${isArmed ? "bg-brand/[0.18] ring-2 ring-brand shadow-glow scale-[1.01]" : ""}
-                  ${!isArmed && isActive ? "bg-brand/[0.07] ring-1 ring-brand/25" : ""}
+                  ${!isArmed && isActive ? "wlp-active-row bg-brand/15 border-l-4 border-brand pl-1 shadow-[0_0_24px_-8px_rgba(109,74,255,0.45)]" : "border-l-4 border-transparent"}
                   ${!isArmed && !isActive && wasRecentlyAnchored ? "bg-brand/[0.05] ring-1 ring-brand/40" : ""}
                   ${!isArmed && !isActive && !wasRecentlyAnchored && isReview ? "bg-amber-500/[0.06] ring-1 ring-amber-500/40" : ""}
                   ${isAnchored ? "opacity-60" : ""}`}
@@ -2340,8 +2347,13 @@ export default function LyricsEditor({
                         onDoubleClick={() => startEditTimestamp(seg)}
                         title={t("editor.timestamp_hint") || "Click: ir al tiempo · Doble click: editar"}
                         className={`text-[11px] font-mono pt-2.5 w-14 text-right transition-colors
-                          ${isActive ? "text-brand-light" : wasRecentlyAnchored ? "text-brand-light" : "text-gray-600 hover:text-brand-light"}`}
+                          ${isActive ? "text-brand-light font-semibold" : wasRecentlyAnchored ? "text-brand-light" : "text-gray-600 hover:text-brand-light"}`}
                       >
+                        {/* Phase A 2026-05-25: indicador ▶ visible solo en
+                            la fila activa para reforzar "esta es la que está
+                            sonando ahora". El símbolo es half-width para no
+                            empujar el timestamp ni romper la grilla. */}
+                        {isActive && <span className="text-brand-light mr-0.5" aria-hidden="true">▶</span>}
                         {formatTimestamp(seg.start)}
                       </button>
                       {wasRecentlyAnchored && (
@@ -2365,7 +2377,7 @@ export default function LyricsEditor({
                       )}
                     </div>
                   )}
-                  <div className="flex-1 min-w-0">
+                  <div className="flex-1 min-w-0 relative">
                     <input
                       type="text"
                       value={seg.text}
@@ -2376,10 +2388,64 @@ export default function LyricsEditor({
                         setTextEditStart({ id: seg._id, text: seg.text });
                       }}
                       onBlur={(e) => handleTextBlur(seg._id, e.target.value)}
-                      className={`w-full px-3 py-2 rounded-xl bg-surface-1 border text-sm text-white
+                      /* Phase A 2026-05-25: cuando es active y no focused,
+                         escondemos el texto del input (text-transparent +
+                         caret-transparent) para que el overlay de karaoke
+                         word-jump abajo sea el único texto visible. Al
+                         clickear el input para editar, focusedSegId cambia
+                         y el texto vuelve. */
+                      className={`w-full px-3 py-2 rounded-xl bg-surface-1 border text-sm
                         focus:border-brand/40 focus:outline-none hover:border-white/[0.08] transition-all
+                        ${isActive && focusedSegId !== seg._id ? "text-transparent caret-transparent selection:text-white" : "text-white"}
                         ${suggestion && !isApplied ? "border-amber-500/20" : isReview ? "border-amber-500/40" : "border-white/[0.04]"}`}
                     />
+                    {/* Phase A 2026-05-25: overlay karaoke word-jump (Apple
+                        Music style). Solo visible cuando este segment es el
+                        activo Y el operador no está editando. Las palabras
+                        se renderizan como spans con scale + glow en la
+                        palabra activa, dim en las futuras, neutral en las
+                        ya pasadas. La duración de cada palabra es
+                        uniforme (seg duration / N) — suficientemente
+                        cercano al avance real para que se sienta vivo. */}
+                    {isActive && focusedSegId !== seg._id && seg.text && (() => {
+                      const words = seg.text.split(/(\s+)/);
+                      const wordsOnly = words.filter((w) => /\S/.test(w));
+                      const N = wordsOnly.length;
+                      const duration = Math.max(0.001, seg.end - seg.start);
+                      const wDur = duration / Math.max(1, N);
+                      const elapsed = Math.max(0, currentTime - seg.start);
+                      const activeWordIdx = Math.min(N - 1, Math.max(0, Math.floor(elapsed / wDur)));
+                      let nonSpaceIdx = -1;
+                      return (
+                        <div
+                          className="absolute inset-0 px-3 py-2 text-sm pointer-events-none whitespace-pre-wrap leading-[1.4]"
+                          aria-hidden="true"
+                          style={{ fontFeatureSettings: "normal" }}
+                        >
+                          {words.map((tok, i) => {
+                            if (!/\S/.test(tok)) return <span key={i}>{tok}</span>;
+                            nonSpaceIdx += 1;
+                            const wActive = nonSpaceIdx === activeWordIdx;
+                            const wPast = nonSpaceIdx < activeWordIdx;
+                            return (
+                              <span
+                                key={i}
+                                style={{
+                                  display: "inline-block",
+                                  transform: wActive ? "scale(1.08)" : "scale(1)",
+                                  transformOrigin: "center bottom",
+                                  color: wActive ? "#b39dff" : wPast ? "rgba(255,255,255,0.92)" : "rgba(255,255,255,0.55)",
+                                  textShadow: wActive ? "0 0 14px rgba(109,74,255,0.65)" : "none",
+                                  transition: "transform 140ms cubic-bezier(.2,1.4,.35,1), color 200ms ease, text-shadow 200ms ease",
+                                }}
+                              >
+                                {tok}
+                              </span>
+                            );
+                          })}
+                        </div>
+                      );
+                    })()}
                     {isReview && (
                       <span className="inline-flex items-center gap-1 mt-1 ml-1 px-2 py-0.5 rounded-full
                         bg-amber-500/15 text-amber-300 text-[10px] font-medium">

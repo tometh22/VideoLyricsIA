@@ -181,3 +181,28 @@
   0%, 100% { transform: translateY(0px) translateX(0px); }
   50%       { transform: translateY(-6px) translateX(2px); }
 }
+
+/* LyricsEditor Phase A 2026-05-25 — pulse de transición al row activo.
+   Cuando React monta un nuevo row con data-active="true" (porque
+   activeId cambió), la animación dispara una vez: glow + leve scale
+   para llamar la atención del operador hacia "la línea que suena
+   ahora". Usamos animation con `forwards` o sin loop para que termine
+   en estado normal (el resto de los estilos de active vienen del
+   className condicional, no de este keyframe). */
+@keyframes wlp-active-row-pulse {
+  0% {
+    transform: scale(1);
+    box-shadow: 0 0 0px -8px rgba(109,74,255,0.0);
+  }
+  35% {
+    transform: scale(1.012);
+    box-shadow: 0 0 36px -6px rgba(109,74,255,0.6);
+  }
+  100% {
+    transform: scale(1);
+    box-shadow: 0 0 24px -8px rgba(109,74,255,0.45);
+  }
+}
+.wlp-active-row {
+  animation: wlp-active-row-pulse 0.55s cubic-bezier(.2,.9,.3,1.05);
+}
