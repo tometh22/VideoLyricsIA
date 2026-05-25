@@ -134,7 +134,17 @@ def run_transcription_job(
     try:
         segments = result.get("segments") if isinstance(result, dict) else None
         reference_lyrics = result.get("reference_lyrics", "") if isinstance(result, dict) else ""
-        update_kwargs = {"status": "transcribed", "current_step": "editing"}
+        # INCIDENT 2026-05-25: this used to be `status="transcribed"`
+        # — that broke `/generate` which checks for `transcribed_pending`
+        # before letting the user submit ("Job is in state 'transcribed',
+        # cannot generate."). The sync path (main.py:2715) always set
+        # `transcribed_pending`; the async worker drifted from that
+        # convention. The response of `/transcription-status` already
+        # normalises `transcribed_pending` → `transcribed` for the
+        # frontend (main.py:2778), so the editor sees `transcribed` and
+        # `/generate` sees `transcribed_pending`. Same observable
+        # behaviour as the legacy path, no frontend change needed.
+        update_kwargs = {"status": "transcribed_pending", "current_step": "editing"}
         if segments is not None:
             update_kwargs["segments_json"] = segments
         # reference_lyrics no tiene columna en el modelo Job (defer a otro PR
