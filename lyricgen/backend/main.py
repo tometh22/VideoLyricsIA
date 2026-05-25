@@ -3549,7 +3549,7 @@ async def _run_transcription_for_job(
         #
         # Genius doesn't ship timestamps — we use it ONLY for text.
         # forced_align will pin the timing against the audio as usual.
-        # If Genius also misses, fall through to Gemini (existing path)
+        # If Genius also misses, fall through to Gemini (next block)
         # and finally bare Whisper.
         #
         # We patch the lrc dict in place so downstream code (the FA path
@@ -3580,6 +3580,41 @@ async def _run_transcription_for_job(
                                     artist_hint, song_hint)
             except Exception as e:
                 logger.warning("[LYRICS] genius fallback raised: %s — continuing without it", e)
+
+        # GEMINI FALLBACK (2026-05-25, 3rd source): if both lrclib and
+        # Genius came up empty, try Gemini's grounded search as a third
+        # line of defence. Same shape as Genius — text only, no
+        # timestamps, forced_align does the timing.
+        #
+        # Why 3rd and not 2nd: Gemini is an LLM that can hallucinate
+        # entire stanzas on obscure tracks (no grounding hit → it
+        # invents). Genius's editorial DB has fewer false positives.
+        # Both are flagged behind their own kill switches so we can
+        # disable independently if either misbehaves.
+        #
+        # The existing `_fetch_lyrics_via_gemini_search` already caches
+        # to LyricsCache (same table Genius and lrclib use, separate
+        # keyspace) so subsequent fetches of the same song skip the
+        # API call.
+        if not lrc or not (lrc.get("plain") or "").strip():
+            try:
+                from pipeline import _fetch_lyrics_via_gemini_search
+                with scoped_db() as _gemini_db:
+                    gemini_text = await asyncio.to_thread(
+                        _fetch_lyrics_via_gemini_search,
+                        artist_hint, song_hint, job_id, _gemini_db,
+                    )
+                if gemini_text:
+                    logger.info("[LYRICS] gemini fallback hit for %r - %r (%d chars)",
+                                artist_hint, song_hint, len(gemini_text))
+                    if lrc is None:
+                        lrc = {}
+                    lrc["plain"] = gemini_text
+                else:
+                    logger.info("[LYRICS] gemini fallback found nothing for %r - %r",
+                                artist_hint, song_hint)
+            except Exception as e:
+                logger.warning("[LYRICS] gemini fallback raised: %s — continuing without it", e)
 
         if lrc:
             synced = lrc.get("synced")
