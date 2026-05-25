@@ -47,3 +47,50 @@ def normalize_words(segments: list) -> list:
         else:
             out.append({k: v for k, v in s.items() if k != "words"})
     return out
+
+
+def dedup_collisions(segments: list, *, epsilon_s: float = 0.10) -> list:
+    """Merge near-identical duplicates that forced_align/reconcile sometimes
+    emits when the lyrics text has repeated chorus lines ("Legalícenla /
+    Legalícenla / Oh-oh-oh"). Two segments collide when they share (a) the
+    same start within `epsilon_s` and (b) the same case-insensitive text.
+    The first occurrence wins; its end is extended to the max of the group;
+    the rest are dropped.
+
+    INCIDENT 2026-05-25: forced_align on songs whose lrclib lyrics include
+    repeated chorus lines occasionally assigned all the repetitions to a
+    single time bucket (~50-100 ms apart). The frontend was patched to show
+    these as Gantt-style overlap lanes, but the root cause is the aligner
+    emitting collisions in the first place. We dedup at the chokepoint so
+    every emit path benefits (FA, whisperX_reconciled, whisper_recover…).
+
+    DELIBERATELY does NOT merge segments that share `start` but differ in
+    `text` — those are legitimate co-occurring lines (chorus harmony, two
+    voices singing different words at once). The frontend handles those
+    correctly via stack-rendering.
+
+    Pure function. Doesn't mutate inputs. Returns a new list of new dicts.
+    """
+    if not segments or len(segments) < 2:
+        return list(segments) if segments else []
+    out: list = []
+    for s in sorted(segments, key=lambda x: float(x.get("start") or 0)):
+        if not out:
+            out.append(dict(s))
+            continue
+        prev = out[-1]
+        same_text = (
+            (s.get("text") or "").strip().lower()
+            == (prev.get("text") or "").strip().lower()
+        )
+        close_start = abs(
+            float(s.get("start") or 0) - float(prev.get("start") or 0)
+        ) < epsilon_s
+        if same_text and close_start:
+            prev["end"] = max(
+                float(prev.get("end") or 0),
+                float(s.get("end") or 0),
+            )
+            continue
+        out.append(dict(s))
+    return out
