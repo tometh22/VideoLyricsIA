@@ -87,6 +87,50 @@ export default function LyricsTimeline({
   const total = Math.max(duration || 0, ...segments.map((s) => s.end), 1);
   const laneHeight = total * pxPerSec;
 
+  // INCIDENT 2026-05-25: forced_align/reconcile sometimes emits two segments
+  // with (almost) identical `start` — typical of a chorus where lrclib has
+  // repeated identical lines ("Legalícenla / Legalícenla / Oh-oh-oh" at the
+  // top of the chorus). Before this fix every overlapping segment was
+  // rendered at `top = start * pxPerSec` with full-width, so the second one
+  // sat literally underneath the first — the operator saw ONE block and
+  // assumed the rest were missing. Worse: those "missing" lines DID exist
+  // in the segments_json (the list view showed them all), so it looked like
+  // the timeline was a buggy view of correct data.
+  //
+  // Fix: Gantt-style lane assignment. Sort segments by start. For each
+  // segment, place it in the first lane whose previous segment has already
+  // ended; if none free → open a new lane. The columns then share the
+  // available horizontal space equally so the operator sees ALL overlapping
+  // lines side by side. When there's no overlap (the common case), the
+  // single lane uses the full width — visually identical to before.
+  //
+  // 50ms epsilon: timestamps that close are functionally simultaneous from
+  // the operator's point of view (single bar of music) and should share a
+  // lane bucket. Larger gaps go in the same lane sequentially.
+  const { laneOfId, laneCount } = (() => {
+    const OVERLAP_EPSILON_S = 0.05;
+    const sorted = [...segments].sort((a, b) => a.start - b.start);
+    const laneEnds = [];                 // laneIdx → latest seg.end in that lane
+    const idToLane = new Map();
+    for (const s of sorted) {
+      let assigned = -1;
+      for (let i = 0; i < laneEnds.length; i++) {
+        if (laneEnds[i] <= s.start + OVERLAP_EPSILON_S) {
+          assigned = i;
+          break;
+        }
+      }
+      if (assigned < 0) {
+        assigned = laneEnds.length;
+        laneEnds.push(s.end);
+      } else {
+        laneEnds[assigned] = s.end;
+      }
+      idToLane.set(s._id, assigned);
+    }
+    return { laneOfId: idToLane, laneCount: Math.max(1, laneEnds.length) };
+  })();
+
   const neighbours = useCallback(
     (id) => {
       const sorted = [...segments].sort((a, b) => a.start - b.start);
@@ -355,6 +399,14 @@ export default function LyricsTimeline({
             const isFocused = seg._id === focusedSegId;
             const isLocked = !!seg.locked || !!pv;
             const isHi = highlightedIds?.has?.(seg._id);
+            // Gantt lane positioning: when there's no overlap (laneCount=1)
+            // the block takes the full width like before; when 2+ segments
+            // overlap the columns split the available space evenly so the
+            // operator sees them side by side instead of stacked invisibly.
+            const laneIdx = laneOfId.get(seg._id) ?? 0;
+            const LANE_GAP_PCT = 1;        // small horizontal breathing space
+            const laneSpan = (100 - LANE_GAP_PCT * (laneCount - 1)) / laneCount;
+            const laneLeftPct = laneIdx * (laneSpan + LANE_GAP_PCT);
             return (
               <div
                 key={seg._id}
@@ -365,7 +417,17 @@ export default function LyricsTimeline({
                   isFocused ? "outline outline-1 outline-brand-light" : "",
                   isHi ? "ring-2 ring-accent" : "",
                 ].join(" ")}
-                style={{ top, height, left: GUTTER_PX + 4, right: 8 }}
+                style={{
+                  top, height,
+                  // Lane positioning: a CSS var sets the lane area (gutter→right);
+                  // each block's left/width are percentages OF the parent's full
+                  // width, but we add a translate offset and reduce the span by
+                  // the gutter via calc. Result: laneCount=1 → block hugs the
+                  // gutter→right strip like before. laneCount>1 → blocks share
+                  // that strip evenly.
+                  left: `calc(${GUTTER_PX + 4}px + (100% - ${GUTTER_PX + 12}px) * ${laneLeftPct / 100})`,
+                  width: `calc((100% - ${GUTTER_PX + 12}px) * ${laneSpan / 100})`,
+                }}
                 onPointerDown={(e) => onPointerDown(e, seg, "move")}
                 onPointerMove={onPointerMove}
                 onPointerUp={(e) => onPointerUp(e, seg)}
