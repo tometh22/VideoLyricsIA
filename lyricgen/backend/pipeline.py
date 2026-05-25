@@ -639,6 +639,14 @@ def run_pipeline(job_id: str, mp3_path: str, artist: str, style: str,
                     logger.warning("[BG] cache lookup error key=%s: %s — fallback", bg_cache_key, e)
 
             if bg_image_path is None:
+                # Fix urgente 2026-05-25: pasar audio_duration al Ken Burns
+                # render para evitar el palindrome loop trabado en audios >60s.
+                # Best-effort: si el cómputo falla, ensure_background cae al
+                # default de 60s (comportamiento previo).
+                try:
+                    _audio_dur_for_kb = _audio_duration(mp3_path)
+                except Exception:
+                    _audio_dur_for_kb = None
                 bg_image_path = _ensure_background(
                     style, job_dir,
                     lyrics_text=lyrics_text, artist=artist, job_id=job_id,
@@ -650,6 +658,7 @@ def run_pipeline(job_id: str, mp3_path: str, artist: str, style: str,
                     bg_verbatim=bg_verbatim,
                     custom_colors=custom_colors,
                     allow_people=_compute_allow_people(job_id),
+                    audio_duration=_audio_dur_for_kb,
                 )
             # Image-to-video fallback: if Veo failed to produce an MP4 (None
             # or non-existent path) AND the operator wanted to animate their
@@ -5728,7 +5737,8 @@ def _ensure_background(style_hint: str, job_dir: str, lyrics_text: str = None,
                        bg_verbatim: bool = False,
                        custom_colors: str = "",
                        effect: str = "",
-                       allow_people: bool = False) -> str:
+                       allow_people: bool = False,
+                       audio_duration: float | None = None) -> str:
     """Generate background using AI. Gemini picks the best style for the song.
 
     background_hint: optional free-form operator description, set via /edit
@@ -5869,8 +5879,26 @@ def _ensure_background(style_hint: str, job_dir: str, lyrics_text: str = None,
         # NOTE: dejamos el parámetro static=True en _ken_burns_clip por si
         # algún caller fuera del wizard lo necesita (ej. tests, edit modal),
         # pero el wizard nunca lo activa.
+        # Fix urgente 2026-05-25 (operador UMG: 'foto que se mueve a la
+        # izquierda con movimiento todo trabado y feo'). Causa raíz: el
+        # sample de 60s se palindrome-loopea para llenar audios >60s. En
+        # un audio de 4:28 la cámara cambia de dirección CADA 60 SEGUNDOS
+        # (forward → reverse → forward...), generando el 'trabado'.
+        #
+        # Fix: cuando conocemos audio_duration y es >60s, renderizar el
+        # Ken Burns por la duración COMPLETA del audio. Sin palindrome
+        # loop = sin reversiones = pan continuo y limpio. Caro en CPU
+        # (~5min más por job) pero acceptable para UMG.
+        _kb_dur = max(60.0, float(audio_duration) if audio_duration else 60.0)
+        if audio_duration and float(audio_duration) > 60.0:
+            logger.info(
+                "[BG] Ken Burns render full audio duration %.1fs (no palindrome loop) "
+                "para evitar movimiento trabado (UMG fix 2026-05-25)",
+                _kb_dur,
+            )
         _ken_burns_image_to_mp4(
             image_path, bg_path,
+            sample_duration=_kb_dur,
             static=False,
             lateral=(_norm_move_bg == "foto-parallax"),
             subtle=(_norm_move_bg in ("estatico", "sutil")),
