@@ -3540,6 +3540,47 @@ async def _run_transcription_for_job(
                             "artist=%r song_title=%r", job_id, artist_hint, song_hint)
             except Exception as e:
                 logger.warning("[LYRICS] metadata auto-correction persist failed: %s", e)
+
+        # GENIUS FALLBACK (2026-05-25): when lrclib trae nothing OR trae
+        # only `synced` without `plain` and the synced is suspiciously
+        # short, try Genius as a second source. Genius's editorial
+        # curation produces more complete lyrics for mainstream catalogue
+        # (UMG/Sony/Warner releases) than lrclib's community uploads.
+        #
+        # Genius doesn't ship timestamps — we use it ONLY for text.
+        # forced_align will pin the timing against the audio as usual.
+        # If Genius also misses, fall through to Gemini (existing path)
+        # and finally bare Whisper.
+        #
+        # We patch the lrc dict in place so downstream code (the FA path
+        # below, the synced path, the Whisper fallback) doesn't need to
+        # know which source we used. The `recovery_source` in the final
+        # _emit_segments will record `forced_align` either way; we log
+        # the source so post-mortems can trace back.
+        if not lrc or not (lrc.get("plain") or "").strip():
+            try:
+                import genius_fetch
+                if genius_fetch.is_enabled():
+                    with scoped_db() as _genius_db:
+                        genius_text = await asyncio.to_thread(
+                            genius_fetch.fetch_genius_plain,
+                            artist_hint, song_hint, _genius_db,
+                        )
+                    if genius_text:
+                        logger.info("[LYRICS] genius fallback hit for %r - %r (%d chars)",
+                                    artist_hint, song_hint, len(genius_text))
+                        if lrc is None:
+                            lrc = {}
+                        lrc["plain"] = genius_text
+                        # synced stays None — Genius doesn't ship timestamps.
+                        # That's fine: forced_align takes plain text and the
+                        # audio, no synced needed.
+                    else:
+                        logger.info("[LYRICS] genius fallback found nothing for %r - %r",
+                                    artist_hint, song_hint)
+            except Exception as e:
+                logger.warning("[LYRICS] genius fallback raised: %s — continuing without it", e)
+
         if lrc:
             synced = lrc.get("synced")
             plain = lrc.get("plain") or ""
