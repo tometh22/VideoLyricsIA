@@ -2325,8 +2325,10 @@ export default function LyricsEditor({
           </div>
           )}
           {/* COLUMNA DERECHA — scrollea independiente. Lista o timeline
-              según viewMode. min-w-0 evita que rows muy largas rompan el grid. */}
-          <div className="min-w-0 space-y-2">
+              según viewMode. min-w-0 evita que rows muy largas rompan el grid.
+              Phase E 2026-05-25: relative + el mini-map vertical se posiciona
+              absolute a la derecha cuando hay >20 segments. */}
+          <div className="min-w-0 space-y-2 relative">
             {viewMode === "timeline" && audioUrl ? (
               <LyricsTimeline
                 segments={edited}
@@ -2353,6 +2355,51 @@ export default function LyricsEditor({
                 </p>
                 <div className="relative">
                   <div className="absolute bottom-0 left-0 right-0 h-12 bg-gradient-to-t from-surface to-transparent pointer-events-none z-10 rounded-b-2xl" />
+                  {/* Phase E 2026-05-25: mini-map vertical en el borde derecho.
+                      Cada segment se renderiza como un dot proporcional a su
+                      duración. El activo brilla. Playhead horizontal según
+                      currentTime. Click → seek a ese punto. Solo se renderiza
+                      cuando hay >20 segments (canciones cortas no lo necesitan).
+                      Sin esto, una canción de 80 líneas requiere scroll bruto
+                      para localizar dónde está el operador. */}
+                  {duration > 0 && edited.length > 20 && (
+                    <button
+                      type="button"
+                      onClick={(e) => {
+                        const rect = e.currentTarget.getBoundingClientRect();
+                        const pct = (e.clientY - rect.top) / rect.height;
+                        const seekT = Math.max(0, Math.min(duration, pct * duration));
+                        seekTo(seekT, false);
+                      }}
+                      title={t("editor.minimap_hint") || "Mini-mapa: click para saltar al tiempo"}
+                      aria-label={t("editor.minimap_hint") || "Mini-mapa"}
+                      className="absolute right-0 top-0 bottom-0 w-2 z-20 group/mini cursor-pointer"
+                      style={{ touchAction: "none" }}
+                    >
+                      {edited.map((seg) => {
+                        const top = (seg.start / duration) * 100;
+                        const height = Math.max(0.4, ((seg.end - seg.start) / duration) * 100);
+                        const isActive = seg._id === activeId;
+                        return (
+                          <span
+                            key={seg._id}
+                            className={`absolute left-0 right-0 rounded-sm pointer-events-none transition-colors ${
+                              isActive
+                                ? "bg-brand shadow-[0_0_6px_rgba(109,74,255,0.7)]"
+                                : "bg-white/10 group-hover/mini:bg-white/25"
+                            }`}
+                            style={{ top: `${top}%`, height: `${height}%` }}
+                          />
+                        );
+                      })}
+                      {duration > 0 && (
+                        <span
+                          className="absolute left-[-3px] right-[-3px] h-0.5 bg-brand-light pointer-events-none transition-[top] duration-150 ease-linear shadow-[0_0_8px_rgba(179,157,255,0.8)]"
+                          style={{ top: `${Math.min(100, Math.max(0, (currentTime / duration) * 100))}%` }}
+                        />
+                      )}
+                    </button>
+                  )}
                   {/* Phase D 2026-05-25: gap entre rows reducido de 4px (space-y-1)
                       a 2px (space-y-0.5). En canciones largas de 60+ líneas
                       esto ahorra ~120px de scroll total. Y como el Phase B
