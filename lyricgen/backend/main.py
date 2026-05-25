@@ -3649,12 +3649,47 @@ async def _run_transcription_for_job(
         async def _get_align_audio() -> str:
             """Return the path that alignment/transcription engines should read.
             Lazy-separates the vocal stem on first call. Falls back to the mix
-            (`tmp_path`) when vocal_sep is disabled / fails."""
+            (`tmp_path`) when vocal_sep is disabled / fails.
+
+            UI smoothness: previously emitted `progress=25` once and then sat
+            silent during the 60-180 s Demucs call on Replicate, so the bar
+            looked frozen. We now pass an `on_progress` callback that maps
+            Demucs' 0..1 fraction (parsed from Replicate logs / time-based
+            fallback) into the 25..48 range and schedules `_step` writes via
+            `asyncio.run_coroutine_threadsafe` so the callback (running in a
+            worker thread, not the event loop) can update job.progress
+            without blocking. We stop at 48 (not 50) so the genuine handoff
+            to the next stage produces a visible jump.
+            """
             nonlocal _vocal_stem
             if not _stem_state["computed"]:
                 _stem_state["computed"] = True
                 await _step("transcribe.isolate_vocals", 25)
-                stem = await asyncio.to_thread(vocal_sep.separate_vocals, tmp_path)
+
+                # Bridge the sync callback (called from inside the thread
+                # running call_with_budget) back into our async _step. The
+                # event loop lives on the main thread; we schedule the
+                # coroutine on it via run_coroutine_threadsafe.
+                _loop_for_progress = asyncio.get_running_loop()
+                _last_pct = {"value": 25}
+
+                def _on_demucs_progress(fraction: float) -> None:
+                    pct = 25 + int(round(max(0.0, min(1.0, fraction)) * (48 - 25)))
+                    if pct <= _last_pct["value"]:
+                        return                       # monotonic — never go backwards
+                    _last_pct["value"] = pct
+                    try:
+                        asyncio.run_coroutine_threadsafe(
+                            _step("transcribe.isolate_vocals", pct),
+                            _loop_for_progress,
+                        )
+                    except RuntimeError:
+                        # Loop is closing (request cancelled). Drop quietly.
+                        pass
+
+                stem = await asyncio.to_thread(
+                    vocal_sep.separate_vocals, tmp_path, _on_demucs_progress,
+                )
                 _stem_state["path"] = stem
                 _vocal_stem = stem
                 if stem:

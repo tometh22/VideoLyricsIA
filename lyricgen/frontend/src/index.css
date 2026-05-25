@@ -206,3 +206,41 @@
 .wlp-active-row {
   animation: wlp-active-row-pulse 0.55s cubic-bezier(.2,.9,.3,1.05);
 }
+
+/* Shimmer recorriendo la barra de transcripción cuando un paso está
+   activo. El paso "Aislando voz" (demucs en Replicate) ahora avanza
+   gradualmente gracias al poll del backend; el shimmer acompaña esa
+   sensación de "está procesando" entre tick y tick. Diagonal de
+   blanco translúcido que cruza la barra cada 1.8s.
+   Loop infinito; se desactiva con `prefers-reduced-motion`. */
+@keyframes progress-shimmer {
+  0%   { transform: translateX(-100%); }
+  100% { transform: translateX(200%); }
+}
+.progress-shimmer::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  background: linear-gradient(
+    90deg,
+    transparent 0%,
+    rgba(255, 255, 255, 0.18) 50%,
+    transparent 100%
+  );
+  animation: progress-shimmer 1.8s linear infinite;
+  pointer-events: none;
+}
+@media (prefers-reduced-motion: reduce) {
+  .progress-shimmer::after { animation: none; opacity: 0; }
+}
+
+/* Cross-fade entre sub-labels rotativos ("Procesando en GPU…",
+   "Separando instrumentos…", etc) durante un paso largo. Mantiene
+   altura fija para que el layout no salte cuando cambia el texto. */
+@keyframes sublabel-fade {
+  0%, 100% { opacity: 0; transform: translateY(2px); }
+  15%, 85% { opacity: 1; transform: translateY(0); }
+}
+.sublabel-fade {
+  animation: sublabel-fade 3.6s ease-in-out;
+}

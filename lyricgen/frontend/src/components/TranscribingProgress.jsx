@@ -130,6 +130,35 @@ export default function TranscribingProgress({
   const [stuck, setStuck] = useState(false);
   const lastProgressRef = useRef({ value: progress, t: Date.now() });
 
+  // Rotating sub-label for the "Aislando voz" stage (the long one).
+  // Demucs runs on Replicate; the backend polls and emits intermediate
+  // progress, but the bar can still spend 60-120 s in this single stage.
+  // A 4-phrase cycle keeps the screen visually alive without overclaiming
+  // step granularity ("Procesando…" → "Separando…" → "Aislando…" →
+  // "Refinando…"). Re-mounted on every change so the CSS keyframe fires
+  // its in/out fade fresh. Only active on stage 3 (other stages are fast).
+  const SUBLABEL_KEYS = [
+    "transcribe.isolate_vocals.sub1",
+    "transcribe.isolate_vocals.sub2",
+    "transcribe.isolate_vocals.sub3",
+    "transcribe.isolate_vocals.sub4",
+  ];
+  const SUBLABEL_FALLBACKS = [
+    "Procesando audio en la nube…",
+    "Separando instrumentos de la voz…",
+    "Aislando frecuencias vocales…",
+    "Refinando el stem…",
+  ];
+  const [sublabelIdx, setSublabelIdx] = useState(0);
+  useEffect(() => {
+    if (active !== 3) return undefined;
+    setSublabelIdx(0);
+    const id = setInterval(() => {
+      setSublabelIdx((i) => (i + 1) % SUBLABEL_KEYS.length);
+    }, 3600);
+    return () => clearInterval(id);
+  }, [active]);
+
   // Re-sync ETA + reset stuck timer whenever real progress moves.
   useEffect(() => {
     if (progress !== lastProgressRef.current.value) {
@@ -167,14 +196,37 @@ export default function TranscribingProgress({
         )}
       </div>
 
-      {/* Top progress bar */}
-      <div className="h-1.5 bg-surface-1 rounded-full overflow-hidden mb-1">
+      {/* Top progress bar. The shimmer overlay (active < 5) sits on top
+          of the filled portion and travels left-to-right continuously,
+          giving the bar a "live" feel between real progress ticks. The
+          width transitions over 700ms with an ease-out curve so each
+          tick from the backend (every 3s during demucs) glides instead
+          of stepping. */}
+      <div className="relative h-1.5 bg-surface-1 rounded-full overflow-hidden mb-1">
         <div
-          className="h-full rounded-full bg-gradient-to-r from-brand to-brand-light transition-all duration-500"
+          className={
+            "relative h-full rounded-full bg-gradient-to-r from-brand to-brand-light " +
+            "transition-[width] duration-700 ease-out " +
+            (active < 5 ? "progress-shimmer" : "")
+          }
           style={{ width: `${pct}%` }}
         />
       </div>
       <p className="text-[11px] text-gray-600 text-right mb-6">{pct}%</p>
+
+      {/* Rotating sub-label, only during "Aislando voz" (the long stage).
+          Fixed height so the layout never shifts when the phrase changes;
+          a CSS keyframe fades each phrase in and out over 3.6s. */}
+      {active === 3 && (
+        <div className="h-5 text-center -mt-3 mb-4">
+          <span
+            key={sublabelIdx}
+            className="sublabel-fade text-[12px] text-brand-light/80 tracking-wide"
+          >
+            {(t && t(SUBLABEL_KEYS[sublabelIdx])) || SUBLABEL_FALLBACKS[sublabelIdx]}
+          </span>
+        </div>
+      )}
 
       {/* Stages list */}
       <ol className="space-y-3">
