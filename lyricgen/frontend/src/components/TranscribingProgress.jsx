@@ -37,9 +37,13 @@ const STAGES = [
   { i: 5, key: "transcribe.steps.done",            fallback: "Finalizando" },
 ];
 
-// Rough typical durations per stage in seconds (sum ≈ 120s in good case).
-// Used purely for ETA display. Telemetry-tuned later.
-const STAGE_DURATIONS_S = [3, 4, 60, 50, 5];
+// Rough typical durations per stage in seconds (sum ≈ 200 s p50).
+// Used purely for ETA display. Telemetry-tuned 2026-05-24 from real
+// jobs — the original numbers (60/50 for stages 3/4) were optimistic
+// p50s; demucs alone hits 90-120 s in cold-start. Result was ETA
+// hitting 0 well before demucs finished and the user seeing "viene
+// muy lento". These numbers reflect the actual p50 wallclock.
+const STAGE_DURATIONS_S = [3, 8, 100, 75, 5];
 
 function activeStageFromState(currentStep, progress) {
   if (currentStep && STAGE_BY_BACKEND_LABEL[currentStep] != null) {
@@ -94,10 +98,34 @@ export default function TranscribingProgress({
   //    out of sync with the real backend state for long).
   //
   // 2. Stuck detection: track the last time `progress` advanced. If
-  //    >= 45 s without movement, show a "Tardando más de lo normal"
-  //    hint — usually means Replicate is degraded. Operator at least
-  //    knows the system isn't lying.
-  const STUCK_AFTER_S = 45;
+  //    >= threshold without movement, show a "Tardando más de lo
+  //    normal" hint — usually means Replicate is degraded.
+  //
+  // INCIDENT (2026-05-24 #2): the original `STUCK_AFTER_S = 45` was
+  // wrong for "Aislando voz" (demucs). The backend emits `progress=25`
+  // at the START of demucs, then runs 60-180 s WITHOUT emitting any
+  // intermediate progress (next `_step` jumps straight to 55%). So
+  // every run hit the 45 s threshold during demucs and showed a fake
+  // "viene muy lento" hint even when the system was healthy.
+  //
+  // Fix: per-stage threshold. The thresholds reflect the REAL p95
+  // wallclock of each stage in healthy state — anything over that
+  // means something IS wrong.
+  //
+  //   prepare       (stage 1): 30 s — ffmpeg/probe locally; should be
+  //                              quick. >30 s means I/O contention.
+  //   lyrics_lookup (stage 2): 30 s — lrclib + (optional) Gemini.
+  //                              Both have 8 s timeouts; >30 s means
+  //                              all 3 tries failed.
+  //   isolate_vocals(stage 3): 150 s — demucs typical p95 is 90-120 s
+  //                              + cache check. 150 s buffer covers
+  //                              cold-start + first retry.
+  //   align         (stage 4): 90 s — FA budget 60 s + warm whisperX
+  //                              race + lrclib lookup. >90 s suggests
+  //                              cascade or non-retryable error.
+  //   done          (stage 5): no hint (already finalising).
+  const STUCK_AFTER_BY_STAGE = [30, 30, 150, 90, 9999];
+  const STUCK_AFTER_S = STUCK_AFTER_BY_STAGE[active - 1] ?? 45;
   const [displayEta, setDisplayEta] = useState(() => etaSeconds(active, progress));
   const [stuck, setStuck] = useState(false);
   const lastProgressRef = useRef({ value: progress, t: Date.now() });
