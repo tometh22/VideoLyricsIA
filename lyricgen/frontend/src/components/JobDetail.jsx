@@ -692,10 +692,10 @@ export default function JobDetail({ job, onBack, onJobUpdate }) {
                 onChange={(e) => setRetryFrameSize(e.target.value)}
                 className="text-xs bg-surface-2/60 ring-1 ring-white/[0.08] rounded-lg px-3 py-2 text-white focus:ring-brand outline-none"
               >
-                <option value="HD">HD · 1920×1080 (más rápido, menos RAM)</option>
+                <option value="HD">HD · 1920×1080 (más rápido)</option>
                 <option value="DCI-2K">2K · 2048×1080</option>
-                <option value="UHD-4K">4K UHD · 3840×2160 (puede OOMear)</option>
-                <option value="DCI-4K">4K DCI · 4096×2160 (puede OOMear)</option>
+                <option value="UHD-4K">4K UHD · 3840×2160 (más lento)</option>
+                <option value="DCI-4K">4K DCI · 4096×2160 (más lento)</option>
               </select>
               {retryFrameSize !== (job.umg_spec?.frame_size || "HD") && (
                 <p className="text-[10px] text-amber-300/70 mt-1.5">
