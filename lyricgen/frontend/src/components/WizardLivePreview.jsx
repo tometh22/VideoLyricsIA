@@ -85,16 +85,31 @@ export default function WizardLivePreview({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [playbackTickRef]);
   const isAnimado = movementStyle === "animado";
-  // With an effect active, compose it over a CALM, neutral premium scene (not
-  // the movement-sample clip) so particles never clash with a busy scene like
-  // the nebula. Without an effect, show the chosen movement's own clip.
-  const baseClip = effect ? "/preview_base.mp4" : clipSrc;
+  // Bug fix 2026-05-25 (reportado por operador): cuando un efecto estaba
+  // activo, baseClip se forzaba a /preview_base.mp4 (escena de montañas
+  // fija), IGNORANDO la elección de movement del operador. El operador
+  // clickeaba el thumbnail de Sutil (interior room) pero el preview seguía
+  // mostrando montañas — disconnect visual entre la galería de movements
+  // y el preview central.
+  //
+  // Cambio: usar SIEMPRE el clipSrc del movement elegido. Los samples
+  // (estatico/sutil/estandar/foto-parallax) son ya escenas calmas — un
+  // overlay de nieve/lluvia no clash. El único caso problemático es
+  // 'animado' (nebula 2D) + effect partículas, donde el clash es real;
+  // ahí caemos a preview_base.mp4 para preservar la legibilidad de las
+  // partículas. Animado SIN effect mantiene su clip original.
+  const baseClip = (effect && isAnimado) ? "/preview_base.mp4" : clipSrc;
   // With an effect active the base is a FIXED calm scene, so the chosen movement
   // is conveyed by a CSS camera transform on it (Estático=still, Cinematográfico
   // =zoom/drift, Foto+parallax=lateral pan…) — clicking a register visibly
   // changes the preview's motion. Without an effect the base IS the movement
   // clip (motion already baked in), so no extra transform.
-  const baseAnim = effect ? (MOVE_ANIM[movementStyle] || "none") : "none";
+  // Si baseClip es preview_base.mp4 (escena fija calma), aplicamos CSS
+  // animation para que se note el movement style (no hay motion baked).
+  // Si baseClip es el movement clip directo, el motion ya está horneado
+  // en el video — aplicar CSS animation encima compondría. Por eso solo
+  // CSS animation cuando estamos en el fallback preview_base.
+  const baseAnim = (baseClip === "/preview_base.mp4") ? (MOVE_ANIM[movementStyle] || "none") : "none";
   const isMinimal = style === "minimal";
   // Resolve the background gradient: a preset, the custom colors, or a
   // pleasant default for "auto" (the AI will pick the real colors).

@@ -60,7 +60,24 @@ function stripQueue(queue) {
  * along the way. Throws are swallowed (Quota etc.) — the wizard still
  * works without persistence; we just lose the resume affordance.
  */
-export function save({ files, approvedJobs, currentReview, reviewQueue }) {
+export function save({
+  files,
+  approvedJobs,
+  currentReview,
+  reviewQueue,
+  // Audit fix 2026-05-25: top-level state del wizard que ANTES se perdía
+  // en refresh. CRÍTICO para UMG: delivery (delivery_profile + umg_*)
+  // cae a "youtube" silently si no se persiste → renders sin ProRes
+  // master. style/customColors/inspiredByLyrics/etc. también se pierden.
+  wizardStage,
+  style,
+  customColors,
+  delivery,
+  backgroundId,
+  backgroundMode,
+  animateImage,
+  inspiredByLyrics,
+}) {
   try {
     const payload = {
       timestamp: Date.now(),
@@ -70,6 +87,17 @@ export function save({ files, approvedJobs, currentReview, reviewQueue }) {
         ? { ...stripFile(currentReview), queue: stripQueue(currentReview.queue) }
         : null,
       reviewQueue: stripQueue(reviewQueue),
+      // Audit fix 2026-05-25: extended snapshot.
+      wizardStage: wizardStage || null,
+      topLevel: {
+        style: style || null,
+        customColors: customColors || null,
+        delivery: delivery || null,
+        backgroundId: backgroundId || null,
+        backgroundMode: backgroundMode || null,
+        animateImage: !!animateImage,
+        inspiredByLyrics: inspiredByLyrics !== false,
+      },
     };
     sessionStorage.setItem(KEY, JSON.stringify(payload));
   } catch (e) {

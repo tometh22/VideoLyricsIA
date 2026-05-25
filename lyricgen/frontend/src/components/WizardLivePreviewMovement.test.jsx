@@ -74,10 +74,12 @@ describe("WizardLivePreview — movement preview reactivity (regression 0511fa3)
       .toBe("/movement_samples/foto-parallax.mp4");
   });
 
-  it("base video src stays as preview_base.mp4 when effect is active (movement via CSS)", () => {
-    // Con effect activo, el clip base es FIJO (preview_base.mp4) y el
-    // movimiento se aplica via CSS transform. Esto es intencional —
-    // ver el comment del fix cf1a79a.
+  it("base video uses the movement clip even with effect active (fix 2026-05-25)", () => {
+    // Bug fix 2026-05-25: el código anterior forzaba preview_base.mp4
+    // siempre que había effect, lo cual desconectaba el preview del
+    // thumbnail elegido. Ahora SIEMPRE se respeta el clipSrc del
+    // movement (excepto para 'animado' que sigue cayendo a preview_base
+    // para no clashear con efectos partícula sobre la nebula).
     const { container } = render(
       <WizardLivePreview
         style="oscuro"
@@ -87,36 +89,45 @@ describe("WizardLivePreview — movement preview reactivity (regression 0511fa3)
       />,
     );
     const baseVideo = container.querySelector("video");
-    expect(baseVideo.getAttribute("src")).toBe("/preview_base.mp4");
+    expect(baseVideo.getAttribute("src")).toBe("/movement_samples/estandar.mp4");
   });
 
-  it("base video has CSS animation when effect + non-static movement", () => {
-    // Con effect activo + movimiento != estatico, la animación CSS
-    // debe estar presente para que se note el cambio.
-    const { container, rerender } = render(
+  it("falls back to preview_base.mp4 ONLY when movement is animado + effect active", () => {
+    // Animado con efecto: el motion bakeado del clip (nebula 2D) clash
+    // con las partículas del efecto → fallback a escena calma + CSS
+    // animation para que el movement se note.
+    const { container } = render(
       <WizardLivePreview
         style="oscuro"
-        movementStyle="estatico"
+        movementStyle="animado"
         effect="snow"
+        clipSrc="/movement_samples/animado.mp4"
       />,
     );
-    let baseVideo = container.querySelector("video");
-    // Estático con efecto → animation:none (la escena no se mueve).
-    const staticStyle = baseVideo.getAttribute("style") || "";
-    expect(staticStyle.includes("animation")).toBe(false);
+    const baseVideo = container.querySelector("video");
+    expect(baseVideo.getAttribute("src")).toBe("/preview_base.mp4");
+    // Y CSS animation aplicada porque preview_base no tiene motion baked.
+    const animStyle = baseVideo.getAttribute("style") || "";
+    expect(animStyle.includes("animation")).toBe(true);
+    expect(animStyle).toMatch(/wlp-anim/);
+  });
 
-    rerender(
+  it("movement clip has no CSS animation overlay (motion is baked into the clip)", () => {
+    // Cuando usamos el movement clip directo (no preview_base), la animation
+    // CSS NO debe aplicarse — el movement ya está en el video. Aplicar CSS
+    // animation encima compondría motions y se vería raro.
+    const { container } = render(
       <WizardLivePreview
         style="oscuro"
         movementStyle="estandar"
         effect="snow"
+        clipSrc="/movement_samples/estandar.mp4"
       />,
     );
-    baseVideo = container.querySelector("video");
-    // Estándar con efecto → debe tener CSS animation.
-    const cinematicStyle = baseVideo.getAttribute("style") || "";
-    expect(cinematicStyle.includes("animation")).toBe(true);
-    expect(cinematicStyle).toMatch(/wlp-estandar/);
+    const baseVideo = container.querySelector("video");
+    const animStyle = baseVideo.getAttribute("style") || "";
+    // estandar clip + effect → no CSS animation (motion baked).
+    expect(animStyle.includes("animation")).toBe(false);
   });
 
   it("changing only movementStyle (no clipSrc change) doesn't crash", () => {

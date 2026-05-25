@@ -13,6 +13,7 @@ import Landing from "./components/Landing";
 import Sidebar from "./components/Sidebar";
 import Dashboard from "./components/Dashboard";
 import HistoryView from "./components/HistoryView";
+import SearchPalette from "./components/SearchPalette";
 import UploadZone from "./components/UploadZone";
 import LyricsEditor from "./components/LyricsEditor";
 import BatchProgress from "./components/BatchProgress";
@@ -399,7 +400,19 @@ export default function App() {
       (f) => f?.file?.name === currentReview.file?.name,
     );
     if (!match) return;
-    const fields = ["font", "textCase", "fontScale", "textContrast", "lyricsAnimation", "lineTransition"];
+    // Audit fix 2026-05-25: extender los fields que sincronizan. Antes
+    // sólo cubría typography (font/case/scale/contrast/animation/transition).
+    // Si el operador volvía al paso 3 a cambiar movementStyle/effect/
+    // concept/genre/backgroundHint/bgVerbatim, esos cambios NO llegaban a
+    // currentReview → el video se generaba con la elección STALE de cuando
+    // se inició el transcribe. Crítico para UMG: si cambian movement durante
+    // review, el render usa el viejo.
+    const fields = [
+      "font", "textCase", "fontScale", "textContrast",
+      "lyricsAnimation", "lineTransition",
+      "movementStyle", "effect", "concept", "genre",
+      "backgroundHint", "bgVerbatim",
+    ];
     const drift = fields.some((k) => (match[k] ?? "") !== (currentReview[k] ?? ""));
     if (!drift) return;
     setCurrentReview((r) => {
@@ -435,6 +448,9 @@ export default function App() {
   // retry button can re-run it without losing the batch context.
   const transcribeRetryCtx = useRef(null);
   const [history, setHistory] = useState([]);
+  // 2026-05-25 PR-2 — Command palette ⌘K. Estado global así el listener
+  // de teclado funciona desde cualquier ruta (Dashboard/Historial/Editor).
+  const [searchOpen, setSearchOpen] = useState(false);
   const [backgroundFile, setBackgroundFile] = useState(null);
   const [animateImage, setAnimateImage] = useState(false);
   // match_lyrics toggle: when ON (default), Gemini reads the lyrics and
@@ -497,8 +513,19 @@ export default function App() {
     // Capa B 2026-05-24: persist wizardStage para que un refresh durante
     // review NO te tire de vuelta al state "upload". El snap.load() lo
     // rehidrata en el useEffect de mount.
-    wizardPersistence.save({ files, approvedJobs, currentReview, reviewQueue, wizardStage });
-  }, [files, approvedJobs, currentReview, reviewQueue, wizardStage]);
+    // Audit fix 2026-05-25: agregamos TODO el state top-level que faltaba
+    // (delivery → delivery_profile UMG, style/customColors/etc.) para que
+    // un refresh durante un batch UMG no caiga silently a youtube.
+    wizardPersistence.save({
+      files, approvedJobs, currentReview, reviewQueue, wizardStage,
+      style, customColors, delivery, backgroundId, backgroundMode,
+      animateImage, inspiredByLyrics,
+    });
+  }, [
+    files, approvedJobs, currentReview, reviewQueue, wizardStage,
+    style, customColors, delivery, backgroundId, backgroundMode,
+    animateImage, inspiredByLyrics,
+  ]);
 
   // beforeunload warning — covers closing the tab, refreshing, or
   // navigating to an external URL. LyricsEditor already has its own
@@ -591,6 +618,10 @@ export default function App() {
       } catch (err) {
         console.warn("[RESUME] no pude cargar el job:", err);
         resumeJobAttemptedRef.current = false;   // permitir reintento si el operador cambia URL
+        // Fallback honesto: si el resume falla (auth no lista, red, 4xx),
+        // mandar al JobDetail en vez de dejar al usuario varado en /new
+        // con el wizard vacío — que parece "crear video nuevo".
+        navigate(`/videos/${resumeJobId}`, { replace: true });
       }
     })();
     return () => { cancelled = true; };
@@ -613,6 +644,20 @@ export default function App() {
       setReviewQueue((snap.reviewQueue || []).map(wizardPersistence.rehydrateQueueEntry));
       setApprovedJobs((snap.approvedJobs || []).map(wizardPersistence.rehydrateQueueEntry));
       setCurrentReview(wizardPersistence.rehydrateReview(snap.currentReview));
+      // Audit fix 2026-05-25: restaurar state top-level (delivery / style /
+      // backgroundMode / etc.) que ANTES se perdía silently. Lo más crítico
+      // para UMG: delivery_profile/umg_frame_size/umg_fps/umg_prores_profile
+      // — sin esto un refresh durante batch UMG cae a youtube y se rendea
+      // sin ProRes master.
+      if (snap.topLevel) {
+        if (snap.topLevel.style != null) setStyle(snap.topLevel.style);
+        if (snap.topLevel.customColors != null) setCustomColors(snap.topLevel.customColors);
+        if (snap.topLevel.delivery) setDelivery(snap.topLevel.delivery);
+        if (snap.topLevel.backgroundId != null) setBackgroundId(snap.topLevel.backgroundId);
+        if (snap.topLevel.backgroundMode != null) setBackgroundMode(snap.topLevel.backgroundMode);
+        if (typeof snap.topLevel.animateImage === "boolean") setAnimateImage(snap.topLevel.animateImage);
+        if (typeof snap.topLevel.inspiredByLyrics === "boolean") setInspiredByLyrics(snap.topLevel.inspiredByLyrics);
+      }
       // Capa B 2026-05-24: restaurar wizardStage para que /new renderice
       // el reviewScreen content si el operador estaba mid-review al refresh.
       // Default "upload" si el snap es viejo (sin wizardStage) o si no hay
@@ -1128,6 +1173,13 @@ export default function App() {
         textCase: entry.textCase || "upper",
         fontScale: entry.fontScale || "1.0",
         textContrast: entry.textContrast || "medium",
+        // Audit fix 2026-05-25: ANTES estos dos fields no se inicializaban.
+        // El drift sync (App.jsx:396) los terminaba sincronizando por
+        // accidente, pero si alguien borra ese effect el flow se rompe
+        // silently y los videos UMG salen con animation='none' en vez
+        // del batchDefault del operador. Init explícito acá.
+        lyricsAnimation: entry.lyricsAnimation || "none",
+        lineTransition: entry.lineTransition || "none",
         segments: data.segments, referenceLyrics: data.reference_lyrics || "",
         coverageWarning: !!data.coverage_warning,
         recoverySource: data.recovery_source || "",
@@ -1171,6 +1223,10 @@ export default function App() {
             textCase: entry.textCase || "upper",
             fontScale: entry.fontScale || "1.0",
             textContrast: entry.textContrast || "medium",
+            // Audit fix 2026-05-25: ver comentario en setCurrentReview de
+            // arriba (~línea 1163). Init explícito de los 2 ejes libass.
+            lyricsAnimation: entry.lyricsAnimation || "none",
+            lineTransition: entry.lineTransition || "none",
             segments: data.segments, referenceLyrics: data.reference_lyrics || "",
             coverageWarning: !!data.coverage_warning,
             recoverySource: data.recovery_source || "",
@@ -1279,6 +1335,9 @@ export default function App() {
         textCase: entry.textCase || "upper",
         fontScale: entry.fontScale || "1.0",
         textContrast: entry.textContrast || "medium",
+        // Audit fix 2026-05-25: init explícito de los 2 ejes libass.
+        lyricsAnimation: entry.lyricsAnimation || "none",
+        lineTransition: entry.lineTransition || "none",
         segments: data.segments, referenceLyrics: data.reference_lyrics || "",
         coverageWarning: !!data.coverage_warning,
         recoverySource: data.recovery_source || "",
@@ -1692,7 +1751,14 @@ export default function App() {
     startGenerationWithSegments(approvedJobs);
   };
 
-  const handleSelectJob = (jobId) => {
+  const handleSelectJob = (jobId, status) => {
+    // `transcribed` = transcripción lista, el operador todavía no dio
+    // "Generar". El badge "Listo p/ editar" promete 1-click → editor;
+    // cortocircuitamos /videos/<id> y vamos directo al resume flow.
+    if (status === "transcribed") {
+      navigate(`/new?resume=${encodeURIComponent(jobId)}`);
+      return;
+    }
     navigate(`/videos/${jobId}`);
   };
 

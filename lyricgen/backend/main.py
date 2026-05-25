@@ -5291,6 +5291,13 @@ async def generate_with_segments(
         plan=current_user.get("plan", "100"),
         tenant_id=current_user.get("tenant_id", ""),
         segments_override=segments,
+        # Audit fix 2026-05-25: language se recibía como Form param
+        # (línea 5041) pero NUNCA se forwardaba al pipeline. Whisper/
+        # Gemini caían a auto-detect (~50% misdetection en catálogo
+        # hispanohablante con vocabulario mezclado). El endpoint legacy
+        # /upload sí lo pasaba; /generate-with-segments (el del wizard
+        # nuevo) lo había dropeado.
+        language=language,
         delivery_profile=delivery_profile,
         umg_spec=umg_spec,
         background_path=bg_path,
