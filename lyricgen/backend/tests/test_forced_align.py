@@ -181,3 +181,81 @@ def test_forced_align_lyrics_returns_none_for_short_lyrics(monkeypatch):
     monkeypatch.setenv("REPLICATE_API_TOKEN", "r8_x")
     # < 4 lines → skip (not worth a call), returns None without network.
     assert fa.forced_align_lyrics("/tmp/x.mp3", "una\ndos") is None
+
+
+def test_phonetic_ratio_catches_acoustic_mishears():
+    """Sanity check on the phonetic helper itself — these are the cases the
+    Legalícenla incident proved we need."""
+    # Intro chorus mishear that anchored to the wrong region in PROD.
+    assert fa._phonetic_ratio(["legalicenla"], ["lerealizanla"]) > 0.5
+    # Word-split mishear ("le galisenla" instead of "Legalícenla").
+    assert fa._phonetic_ratio(["legalicenla"], ["legalisenla"]) > 0.5
+    # Different lyric — must stay below the anchor threshold.
+    assert fa._phonetic_ratio(["legalicenla"], ["hubotiemposdeguerras"]) < 0.4
+    assert fa._phonetic_ratio(["legalicenla"], ["paramiparami"]) < 0.4
+    # Defensive: empty inputs return 0.0 instead of raising.
+    assert fa._phonetic_ratio([], ["any"]) == 0.0
+    assert fa._phonetic_ratio(["any"], []) == 0.0
+
+
+def test_wordstamps_anchors_intro_chorus_mishear_legalicenla():
+    """End-to-end regression for the Legalícenla intro:
+
+    whisperX heard the intro chorus as 'Le realizan la × 3' at 0:17/0:19/0:22
+    (correct timing, wrong text). Canonical lyrics start with 'Legalícenla × 3'.
+    With Jaccard-only scoring (pre-2026-05-25 behaviour) the anchor missed,
+    drift_streak triggered, the function returned [] and reconcile bailed —
+    leaving the editor at 'first lyric @ 0:45'.
+
+    With phonetic scoring the lines anchor to their true timestamps and the
+    canonical text replaces the mishear in the emitted segments."""
+    # Three mis-heard words from whisperX at the intro chorus timestamps,
+    # plus a verse word at 0:53 so the function has more than just the
+    # mishear region to align against.
+    words = [
+        _w("le",       17.0, 17.5),
+        _w("realizan", 17.5, 18.2),
+        _w("la",       18.2, 18.6),
+        _w("le",       19.5, 20.0),
+        _w("realizan", 20.0, 20.7),
+        _w("la",       20.7, 21.1),
+        _w("le",       22.0, 22.5),
+        _w("realizan", 22.5, 23.2),
+        _w("la",       23.2, 23.6),
+        _w("hubo",     53.2, 53.5),
+        _w("tiempos",  53.5, 54.0),
+    ]
+    lines = ["Legalícenla", "Legalícenla", "Legalícenla", "Hubo tiempos"]
+    segs = fa.wordstamps_to_segments(words, lines)
+
+    # All four lines must anchor (no drift abort, no empty result).
+    assert len(segs) == 4, f"expected 4 segments, got {len(segs)}: {segs}"
+
+    # Canonical text wins on the output (this is the whole point of reconcile).
+    assert [s["text"] for s in segs] == [
+        "Legalícenla", "Legalícenla", "Legalícenla", "Hubo tiempos",
+    ]
+
+    # Critical: first segment lands near 0:17, NOT past 0:45 (the bug shape).
+    assert 16.5 < segs[0]["start"] < 18.0, (
+        f"intro chorus must anchor to 0:17 area, got {segs[0]['start']}"
+    )
+    # Second + third chorus repeats land at their real positions.
+    assert 19.0 < segs[1]["start"] < 20.5
+    assert 21.5 < segs[2]["start"] < 23.0
+    # Verse anchors past the intro chorus.
+    assert segs[3]["start"] > 50.0
+
+
+def test_phonetic_does_not_rescue_genuinely_unrelated_text():
+    """The phonetic path must NOT match lines that don't acoustically resemble
+    the canonical. Otherwise we'd happily anchor random whisperX noise to any
+    canonical line and emit garbage timestamps with confident-looking text."""
+    words = [_w(f"ruido{i}", i, i + 0.4) for i in range(25)]
+    lines = ["primera linea cantada", "segunda linea distinta",
+             "tercera estrofa nueva", "cuarta parte final",
+             "quinta y ultima aqui"]
+    # Same expectation as test_wordstamps_aborts_on_sustained_drift —
+    # phonetic must not lower the bar so far that drift-abort stops firing
+    # on random noise.
+    assert fa.wordstamps_to_segments(words, lines) == []
