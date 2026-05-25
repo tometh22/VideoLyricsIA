@@ -65,7 +65,7 @@ function VideoCard({ job, onSelect }) {
 
   return (
     <button
-      onClick={() => onSelect(job.job_id)}
+      onClick={() => onSelect(job.job_id, job.status)}
       className="rounded-card overflow-hidden text-left group bg-surface-2/40 hover:bg-surface-2/70 ring-1 ring-white/[0.04] hover:ring-white/[0.10] transition-all"
     >
       <div className="aspect-video bg-surface-3/30 relative overflow-hidden">
@@ -103,7 +103,7 @@ function VideoCard({ job, onSelect }) {
   );
 }
 
-export default function Dashboard({ user, history, historyError, historyLoaded = true, onRetryHistory, onSelectJob, onNewBatch, onViewHistory }) {
+export default function Dashboard({ user, history, historyError, historyLoaded = true, onRetryHistory, onSelectJob, onNewBatch, onViewHistory, onOpenSearch }) {
   const { t } = useI18n();
 
   const pendingReview = history.filter((h) => h.status === "pending_review");
@@ -222,6 +222,25 @@ export default function Dashboard({ user, history, historyError, historyLoaded =
           <p className="text-sm text-ink-secondary mt-1">{heroSubline}</p>
         </div>
         <div className="flex items-center gap-2 shrink-0 ml-4">
+          {/* Search button — abre el SearchPalette (PR-2 2026-05-25).
+              Visual: input fake con placeholder + atajo ⌘K a la derecha.
+              Match patrón Linear/Vercel command bar. */}
+          {onOpenSearch && (
+            <button
+              type="button"
+              onClick={onOpenSearch}
+              className="hidden md:flex items-center gap-2 h-9 px-3 rounded-lg bg-surface-2/60 ring-1 ring-white/[0.06] hover:ring-white/[0.12] hover:bg-surface-2/80 text-gray-400 hover:text-gray-200 transition-colors text-xs"
+              aria-label="Buscar"
+            >
+              <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
+                <circle cx="11" cy="11" r="8" /><path d="M21 21l-4.35-4.35" strokeLinecap="round" />
+              </svg>
+              <span>Buscar</span>
+              <kbd className="ml-2 px-1.5 h-5 inline-flex items-center rounded text-[10px] font-mono bg-white/[0.06] ring-1 ring-white/10 text-gray-500">
+                ⌘K
+              </kbd>
+            </button>
+          )}
           {attentionCount > 0 && (
             <button
               type="button"

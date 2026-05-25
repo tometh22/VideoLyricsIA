@@ -2299,6 +2299,7 @@ export default function App() {
               historyLoaded={historyLoaded}
               onRetryHistory={fetchHistory}
               onSelectJob={handleSelectJob}
+              onOpenSearch={() => setSearchOpen(true)}
               onNewBatch={() => {
                 // Guard the "Nuevo batch" CTA — clicking it while a
                 // batch is in progress used to silently wipe everything
@@ -2362,6 +2363,35 @@ export default function App() {
         </Route>
         <Route path="*" element={<Navigate to="/" replace />} />
       </Routes>
+
+      {/* 2026-05-25 PR-2 — Command palette ⌘K. Renderizado fuera de
+          <Routes> para que sobreviva navegación entre rutas. El listener
+          de teclado global vive en el GlobalSearchKeybinding helper. */}
+      <SearchPalette
+        isOpen={searchOpen}
+        onClose={() => setSearchOpen(false)}
+        jobs={history}
+        onSelectJob={handleSelectJob}
+      />
+      <GlobalSearchKeybinding onOpen={() => setSearchOpen(true)} />
     </>
   );
+}
+
+// Listener global ⌘K / Ctrl+K para abrir el SearchPalette. Componente
+// separado para no agregar otro useEffect al gigante de App. Solo
+// monta el listener; el state vive en App.
+function GlobalSearchKeybinding({ onOpen }) {
+  useEffect(() => {
+    const handler = (e) => {
+      // ⌘K (mac) / Ctrl+K (windows/linux) — patrón Linear/Notion/Vercel
+      if ((e.metaKey || e.ctrlKey) && e.key === "k") {
+        e.preventDefault();
+        onOpen();
+      }
+    };
+    window.addEventListener("keydown", handler);
+    return () => window.removeEventListener("keydown", handler);
+  }, [onOpen]);
+  return null;
 }
