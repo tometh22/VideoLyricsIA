@@ -370,8 +370,44 @@ function VideoCard({ job, onSelect, onDelete, selected, onToggleSelect, t }) {
   );
 }
 
+// MiniThumbnail — 40×24 aspect-video al lado del artist. Patrón
+// Loom/Spotify lista. Reusa useMediaUrl. Fallback: placeholder gris
+// con icono música cuando el job aún no tiene thumbnail (sin generar,
+// transcribiendo, etc).
+function MiniThumbnail({ jobId, status }) {
+  const src = useMediaUrl(jobId, "thumbnail", "preview");
+  const isReady = status === "done" || status === "pending_review";
+  return (
+    <div className="w-10 h-6 shrink-0 rounded overflow-hidden bg-surface-3/40 ring-1 ring-white/[0.04] relative">
+      {src && (
+        <img
+          src={src}
+          alt=""
+          loading="lazy"
+          className="w-full h-full object-cover"
+          onError={(e) => { e.currentTarget.style.display = "none"; }}
+        />
+      )}
+      {!src && (
+        <div className="absolute inset-0 flex items-center justify-center">
+          <svg className="w-3 h-3 text-gray-600" fill="none" stroke="currentColor" strokeWidth="1.6" viewBox="0 0 24 24">
+            <path d="M9 18V5l12-2v13" strokeLinecap="round" strokeLinejoin="round" /><circle cx="6" cy="18" r="3" /><circle cx="18" cy="16" r="3" />
+          </svg>
+        </div>
+      )}
+      {isReady && src && (
+        <div className="absolute inset-0 flex items-center justify-center opacity-0 hover:opacity-100 bg-black/40 transition-opacity">
+          <svg className="w-3 h-3 text-white ml-0.5" fill="currentColor" viewBox="0 0 24 24">
+            <path d="M8 5v14l11-7z" />
+          </svg>
+        </div>
+      )}
+    </div>
+  );
+}
+
 // 2026-05-25 PR-3 — TableRow: 44px de alto, Linear-style. Columnas:
-// [☐ checkbox][status dot][artist 180px][song flex-1][status badge 110px][time tabular-nums][acción]
+// [☐ checkbox][status dot][mini thumb 40×24][artist 180px][song flex-1][status badge 110px][time tabular-nums][acción]
 // Click en cualquier celda no-action → abre JobDetail. Hover muestra el
 // botón "Abrir →" a la derecha (fade-in, PR-9 micro-interactions).
 function TableRow({ job, onSelect, onDelete, selected, onToggleSelect, t }) {
@@ -423,6 +459,10 @@ function TableRow({ job, onSelect, onDelete, selected, onToggleSelect, t }) {
 
       {/* Status dot */}
       <StatusDot status={job.status} />
+
+      {/* Mini thumbnail (operator feedback 2026-05-25: "debería tener
+          una mini vista previa como tiene la página de entregables") */}
+      <MiniThumbnail jobId={job.job_id} status={job.status} />
 
       {/* Artist (180px) */}
       <span
