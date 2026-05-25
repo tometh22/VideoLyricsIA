@@ -5727,6 +5727,7 @@ def _ensure_background(style_hint: str, job_dir: str, lyrics_text: str = None,
                        bg_mode: str = "veo",
                        bg_verbatim: bool = False,
                        custom_colors: str = "",
+                       effect: str = "",
                        allow_people: bool = False) -> str:
     """Generate background using AI. Gemini picks the best style for the song.
 
