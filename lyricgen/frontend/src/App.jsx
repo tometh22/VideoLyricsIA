@@ -377,6 +377,31 @@ export default function App() {
   const [approvedJobs, setApprovedJobs] = useState([]);
   const [transcribing, setTranscribing] = useState(false);
   const [transcribeError, setTranscribeError] = useState(null);
+
+  // Phase 2 (2026-05-25): sync de typography settings cuando el operador
+  // cambia font/case/animation desde el paso 4 del wizard MIENTRAS está
+  // en review (paso 6 inactivo). updateBatchDefault en UploadZone fanea
+  // a files[*] pero NO toca currentReview — sin este effect, el editor
+  // se queda con la font vieja al volver a paso 6.
+  useEffect(() => {
+    if (!currentReview) return;
+    const match = files.find(
+      (f) => f?.file?.name === currentReview.file?.name,
+    );
+    if (!match) return;
+    const fields = ["font", "textCase", "fontScale", "textContrast", "lyricsAnimation", "lineTransition"];
+    const drift = fields.some((k) => (match[k] ?? "") !== (currentReview[k] ?? ""));
+    if (!drift) return;
+    setCurrentReview((r) => {
+      if (!r) return r;
+      const next = { ...r };
+      for (const k of fields) {
+        if (match[k] !== undefined) next[k] = match[k];
+      }
+      return next;
+    });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [files, currentReview?.file?.name]);
   // Capa B 2026-05-24 — wizardStage es la única fuente de verdad de qué muestra
   // el wizard. Reemplaza el `navigate("/review")` que disparaba el flash a
   // dashboard. URL se queda en /new mientras el operador transita upload →
@@ -1816,6 +1841,16 @@ export default function App() {
         // 2026-05-23: auto-transcribe en background al dropear.
         onAutoTranscribe={onAutoTranscribe}
         transcribeStatusByFile={transcribeStatusByFile}
+        // Phase 2 (2026-05-25): el wizard ahora abarca la review (paso 6).
+        // hasReviewableContent prende cuando arranca el transcribe o existe
+        // currentReview/readyToGenerate — UploadZone avanza el stepper a 6
+        // automáticamente. renderStep6 es el contenido completo de review
+        // (mismo JSX que la pantalla separada anterior) inyectado en la
+        // columna derecha del wizard.
+        hasReviewableContent={
+          !!currentReview || transcribing || !!transcribeError || readyToGenerate
+        }
+        renderStep6={() => reviewScreen}
       />
     </div>
   );
@@ -1945,6 +1980,14 @@ export default function App() {
             // fondo. Status posibles: "idle" | "queued" | "generating" |
             // "done" | "error" | "disabled" (free-tier plan-tier guard).
             bgStatus={bgPreview.status}
+            // Phase 2 (2026-05-25): el editor se monta DENTRO del paso 6
+            // del wizard que ya tiene los controles tipográficos en el
+            // paso 4 ("Animación") y el WizardLivePreview en el centro.
+            // No duplicar la columna izquierda del editor — el operador
+            // navega al paso 4 desde el stepper si quiere cambiar font/
+            // animation/contrast. Layout colapsa a 1 columna (timeline +
+            // lista a ancho completo).
+            hideTypographyControls={true}
           />
         </div>
       );
@@ -2013,12 +2056,16 @@ export default function App() {
     );
   })();
 
-  // Capa B 2026-05-24 — wizardScreen es lo que /new (y /review por compat)
-  // renderizan. Conmuta entre upload y review/ready_to_generate según
-  // wizardStage. NO hay navigate entre rutas durante el flow normal — el
-  // operador queda en /new desde drop hasta clickear "Crear video"
-  // (legítimo navigate a /generating).
-  const wizardScreen = wizardStage === "upload" ? newBatchScreen : reviewScreen;
+  // Capa B 2026-05-24 + Phase 2 2026-05-25 — wizardScreen siempre es
+  // newBatchScreen (UploadZone). El layout de 3 columnas del wizard
+  // (stepper + WizardLivePreview + contenido) abarca ahora también la
+  // review (paso 6): el contenido de reviewScreen se inyecta como render
+  // prop en UploadZone y aparece en la columna derecha del wizard. El
+  // operador NUNCA cambia de layout durante el flow — el preview central
+  // y el stepper persisten desde el drop del audio hasta "Crear videos".
+  // wizardStage queda como flag de back-compat (sessionStorage, /review
+  // como ruta legacy) pero NO controla qué pantalla se renderiza.
+  const wizardScreen = newBatchScreen;
 
   const generatingScreen = jobs.length > 0
     ? (

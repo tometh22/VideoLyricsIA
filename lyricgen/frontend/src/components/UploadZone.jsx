@@ -142,6 +142,15 @@ export default function UploadZone({
   // segundo plano. La status map per file viene del App via filesnamekey.
   onAutoTranscribe,
   transcribeStatusByFile = {},
+  // Phase 2 (2026-05-25): render prop para el paso 6 ("Lyrics"). App.jsx
+  // sigue siendo dueño del state machine de review (transcribing,
+  // currentReview, readyToGenerate, empty state) — UploadZone solo le
+  // presta el layout de 3 columnas del wizard. Cuando hasReviewableContent
+  // se prende, el wizard avanza a step 6 automáticamente y renderiza
+  // renderStep6() en la columna derecha. WizardLivePreview persiste
+  // sticky en el centro durante todo el flow.
+  hasReviewableContent = false,
+  renderStep6 = null,
 }) {
   const { t } = useI18n();
   const inputRef = useRef();
@@ -255,23 +264,37 @@ export default function UploadZone({
   // 4 steps revealed one at a time (variant A): the left rail navigates,
   // the center stage holds the live preview, the right panel shows only the
   // active step's controls. Step 1 (Subí) gates advancing on the artist name.
-  // WIZARD_STEPS — Phase 1 (2026-05-25): paso 6 "Lyrics" agregado al
-  // stepper como indicador visual del próximo paso del flujo. Por ahora
-  // está deshabilitado (no clickeable, gris) porque la review todavía
-  // vive como pantalla separada (wizardStage="review" en App.jsx).
-  // Phase 3 lo va a convertir en un paso real del wizard, eliminando la
-  // pantalla separada de LyricsEditor.
+  // WIZARD_STEPS — Phase 1+2 (2026-05-25). Paso 6 "Lyrics" está SIEMPRE
+  // en el stepper pero su interactividad depende de hasReviewableContent
+  // (la prop que App.jsx prende cuando empieza el transcribe o hay
+  // currentReview con segments).
+  // - hasReviewableContent=false → paso 6 con border dashed gris,
+  //   cursor-not-allowed, tooltip "Disponible después de Revisar lyrics".
+  // - hasReviewableContent=true  → paso 6 clickeable; auto-advance del
+  //   wizard a step=6 vía el useEffect de abajo.
   const WIZARD_STEPS = [
     { id: 1, label: t("upload.step_upload") || "Subí" },
     { id: 2, label: t("upload.step_mode") || "Modo" },
     { id: 3, label: t("upload.step_motion") || "Movimiento" },
     { id: 4, label: t("upload.step_animation") || "Animación" },
     { id: 5, label: t("upload.step_deliver") || "Entregá" },
-    { id: 6, label: t("upload.step_lyrics") || "Lyrics", placeholder: true },
+    { id: 6, label: t("upload.step_lyrics") || "Lyrics" },
   ];
-  const _MAX_INTERACTIVE_STEP = 5; // pasos 1..5 son interactivos en upload; 6 es placeholder visual
   const [wizardStep, setWizardStep] = useState(1);
-  const goStep = (n) => setWizardStep(Math.max(1, Math.min(_MAX_INTERACTIVE_STEP, n)));
+  // Step 6 es clickeable solo cuando hay contenido de review activo.
+  // Cuando no hay, el cap es step 5 (los pasos 1-5 son siempre clickables).
+  const _maxInteractiveStep = hasReviewableContent ? 6 : 5;
+  const goStep = (n) => setWizardStep(Math.max(1, Math.min(_maxInteractiveStep, n)));
+  // Auto-advance a step 6 cuando aparece contenido de review. Y bajar a
+  // step 5 si el operador clickea "Volver" y desaparece el contenido.
+  useEffect(() => {
+    if (hasReviewableContent && wizardStep !== 6) {
+      setWizardStep(6);
+    } else if (!hasReviewableContent && wizardStep === 6) {
+      setWizardStep(5);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [hasReviewableContent]);
 
   // Hovering a movement option previews it in the big stage without committing.
   const [hoverMovement, setHoverMovement] = useState(null);
@@ -1767,36 +1790,39 @@ export default function UploadZone({
       <div className="flex flex-col lg:grid lg:grid-cols-[190px_minmax(0,1fr)_minmax(400px,460px)] gap-6 items-start">
 
         {/* LEFT — step rail (vertical on desktop, horizontal pills on mobile).
-            Phase 1: paso 6 "Lyrics" se renderiza como placeholder (disabled,
-            opacity reducida, sin ring de hover) para mostrar al operador que
-            el flujo continúa después de "Entregá" → "Revisar lyrics". */}
+            Paso 6 "Lyrics" se ve siempre; está deshabilitado hasta que
+            haya contenido reviewable (hasReviewableContent prop). Cuando
+            se activa, el useEffect de arriba auto-avanza el wizard a
+            step 6 y permite navegar libremente entre 4↔6 (operador
+            cambia font/animation en paso 4, vuelve a paso 6 a aprobar). */}
         <nav className="flex lg:flex-col gap-1.5 lg:gap-1 overflow-x-auto lg:overflow-visible lg:sticky lg:top-4 w-full lg:w-auto order-first">
           {WIZARD_STEPS.map((s) => {
-            const isPlaceholder = !!s.placeholder;
-            const active = !isPlaceholder && wizardStep === s.id;
-            const done = !isPlaceholder && wizardStep > s.id;
+            const isLyrics = s.id === 6;
+            const disabled = isLyrics && !hasReviewableContent;
+            const active = !disabled && wizardStep === s.id;
+            const done = !disabled && wizardStep > s.id;
             return (
               <button
                 key={s.id}
                 type="button"
-                onClick={() => { if (!isPlaceholder) goStep(s.id); }}
-                disabled={isPlaceholder}
-                aria-disabled={isPlaceholder}
-                title={isPlaceholder
+                onClick={() => { if (!disabled) goStep(s.id); }}
+                disabled={disabled}
+                aria-disabled={disabled}
+                title={disabled
                   ? (t("upload.step_lyrics_hint") || "Disponible después de \"Revisar lyrics\"")
                   : undefined}
                 className={`flex items-center gap-2.5 px-3 py-2.5 rounded-xl text-[12.5px] font-medium whitespace-nowrap transition-all text-left shrink-0 ${
-                  isPlaceholder
+                  disabled
                     ? "text-gray-600 cursor-not-allowed opacity-50"
                     : active ? "bg-brand/[0.12] text-white ring-1 ring-brand/35"
                              : "text-gray-400 hover:text-white hover:bg-white/[0.04]"
                 }`}
               >
                 <span className={`w-6 h-6 rounded-full grid place-items-center text-[11px] font-bold shrink-0 ${
-                  isPlaceholder ? "bg-surface-3/50 text-gray-600 border border-dashed border-gray-600/40"
-                                : active ? "bg-brand text-white"
-                                         : done ? "bg-accent/20 text-accent"
-                                                : "bg-surface-3 text-gray-400"
+                  disabled ? "bg-surface-3/50 text-gray-600 border border-dashed border-gray-600/40"
+                           : active ? "bg-brand text-white"
+                                    : done ? "bg-accent/20 text-accent"
+                                           : "bg-surface-3 text-gray-400"
                 }`}>{done ? "✓" : s.id}</span>
                 {s.label}
               </button>
@@ -2117,12 +2143,29 @@ export default function UploadZone({
               </div>
             </>
           )}
+
+          {/* STEP 6 — Lyrics (Phase 2 2026-05-25): render prop de App.jsx
+              con el contenido completo de review (transcribing / LyricsEditor /
+              readyToGenerate / empty / error). El stepper + WizardLivePreview
+              centrales persisten — el operador sigue viendo el preview con
+              los settings del paso 4 mientras edita las lyrics. */}
+          {wizardStep === 6 && (
+            <div className="min-w-0 w-full">
+              {renderStep6 ? renderStep6() : (
+                <div className="text-center py-12 text-sm text-gray-500">
+                  {t("upload.step_lyrics_hint") || "Disponible después de \"Revisar lyrics\""}
+                </div>
+              )}
+            </div>
+          )}
         </div>
       </div>
       )}
 
-      {/* Sticky bottom CTA bar */}
-      {files.length > 0 && (
+      {/* Sticky bottom CTA bar. Phase 2: oculta en paso 6 porque el contenido
+          de review (LyricsEditor / transcribing / readyToGenerate) trae sus
+          propios CTAs (Aprobar / Volver / Crear N videos). */}
+      {files.length > 0 && wizardStep !== 6 && (
         <div
           className={`fixed bottom-0 left-0 right-0 z-30 bg-surface-1/85 backdrop-blur-xl border-t border-white/[0.06] px-4 md:px-8 py-4 transition-all duration-300 ${sidebarOpen ? "md:left-64" : "md:left-0"}`}
           data-tour="upload-cta-bar"
@@ -2149,7 +2192,22 @@ export default function UploadZone({
               </button>
             )}
 
-            {wizardStep < WIZARD_STEPS.length ? (
+            {/* Phase 2 (2026-05-25): cuando el operador ya está en review
+                (hasReviewableContent=true) y vuelve a un paso anterior para
+                ajustar font/animation/movement, el CTA principal cambia a
+                "Volver a lyrics" para que pueda regresar al editor con 1
+                click, sin re-disparar onStartReview. */}
+            {hasReviewableContent && wizardStep < 6 ? (
+              <button
+                onClick={() => goStep(6)}
+                className="btn-primary h-11 px-6"
+              >
+                {t("upload.back_to_lyrics") || "Volver a lyrics"}
+                <svg className="inline-block ml-1.5 w-4 h-4 -mt-0.5" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
+                  <path d="M5 12h14M12 5l7 7-7 7" />
+                </svg>
+              </button>
+            ) : wizardStep < 5 ? (
               <button
                 onClick={() => goStep(wizardStep + 1)}
                 disabled={wizardStep === 1 && !allHaveArtist}
@@ -2160,7 +2218,7 @@ export default function UploadZone({
                   <path d="M5 12h14M12 5l7 7-7 7" />
                 </svg>
               </button>
-            ) : (
+            ) : wizardStep === 5 ? (
               <>
                 {onGenerateDirect && (
                   <button
@@ -2184,7 +2242,7 @@ export default function UploadZone({
                   </button>
                 )}
               </>
-            )}
+            ) : null}
           </div>
         </div>
       )}

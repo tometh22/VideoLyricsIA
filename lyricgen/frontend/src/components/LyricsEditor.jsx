@@ -326,6 +326,16 @@ export default function LyricsEditor({
   // Valores: "idle" | "queued" | "generating" | "done" | "error" | "disabled".
   // null/undefined → no se renderiza el chip (modo /edit modal post-render).
   bgStatus = null,
+  // Phase 2 (2026-05-25): cuando el editor se renderiza dentro del nuevo
+  // paso 6 del wizard, los controles tipográficos (font/case/contrast/
+  // animation/transition) ya están visibles en el paso 4 ("Animación")
+  // del stepper — esconder la columna izquierda y el preview interno
+  // para no duplicarlos. El preview central del wizard
+  // (WizardLivePreview) sigue mostrando los cambios live. En modo /edit
+  // (legacy) o uso standalone, el default es renderizar todo igual que
+  // siempre.
+  hideTypographyControls = false,
+  hideInternalPreview = false,
 }) {
   const { t } = useI18n();
   const [edited, setEdited] = useState(() =>
@@ -347,6 +357,19 @@ export default function LyricsEditor({
   // 2026-05-23: nuevos ejes (paridad con el wizard, ver header del archivo).
   const [selectedAnimation, setSelectedAnimation] = useState(lyricsAnimation || "none");
   const [selectedLineTransition, setSelectedLineTransition] = useState(lineTransition || "none");
+  // Phase 2 (2026-05-25): sync props → state cuando el wizard controla los
+  // typography settings desde el paso 4. Sin esto, el editor montado en paso 6
+  // se queda con el seed inicial y no refleja los cambios que el operador
+  // hace en el stepper. Solo activo en modo wizard para no romper el flow
+  // standalone donde el editor ES la fuente de verdad.
+  useEffect(() => {
+    if (!hideTypographyControls) return;
+    setSelectedFont(font || "");
+    setSelectedCase(textCase || "upper");
+    setSelectedContrast(textContrast || "medium");
+    setSelectedAnimation(lyricsAnimation || "none");
+    setSelectedLineTransition(lineTransition || "none");
+  }, [hideTypographyControls, font, textCase, textContrast, lyricsAnimation, lineTransition]);
   // Autosave confidence for the timeline view. saveStatus drives the
   // "Guardando…/Guardado ✓" chip; flushCounter triggers an immediate save
   // on a timeline drag (instead of waiting for the 3 s debounce).
@@ -2129,10 +2152,18 @@ export default function LyricsEditor({
              viewMode (timeline → grid; list → full-width). Ahora SIEMPRE
              es grid: izq sticky con controles+preview, der con lista o
              timeline según viewMode. Preview siempre visible, controles
-             siempre en el mismo lugar. */}
-      <div className="grid grid-cols-1 lg:grid-cols-2 gap-4 mb-4 items-start">
+             siempre en el mismo lugar.
+
+             Phase 2 (2026-05-25): cuando el editor se monta dentro del
+             paso 6 del wizard (hideTypographyControls=true), la columna
+             izquierda no renderiza — los controles ya están en el paso
+             4 del stepper y el preview central del wizard refleja los
+             cambios. El grid colapsa a 1 columna full-width. */}
+      <div className={`grid gap-4 mb-4 items-start ${hideTypographyControls ? "grid-cols-1" : "grid-cols-1 lg:grid-cols-2"}`}>
           {/* COLUMNA IZQUIERDA — sticky en desktop. Controles tipográficos
-              + LyricVideoPreview (editable) + scope toggle. */}
+              + LyricVideoPreview (editable) + scope toggle.
+              Phase 2: oculta si hideTypographyControls=true (modo wizard). */}
+          {!hideTypographyControls && (
           <div className="space-y-2 lg:sticky lg:top-2 lg:self-start">
             {/* Live font switcher — preview re-renders in the chosen
                 typeface instantly; applied to the render on re-render. */}
@@ -2229,6 +2260,7 @@ export default function LyricsEditor({
               onDragStart={pushEditHistory}
             />
           </div>
+          )}
           {/* COLUMNA DERECHA — scrollea independiente. Lista o timeline
               según viewMode. min-w-0 evita que rows muy largas rompan el grid. */}
           <div className="min-w-0 space-y-2">
