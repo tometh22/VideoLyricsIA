@@ -113,10 +113,17 @@ def _search_song_url(artist: str, song: str) -> str | None:
             url = result.get("url")
             if url:
                 return url
-    # Fallback: if no artist matched, take the top hit. Better than nothing —
-    # Genius's relevance scoring already weighs the artist heavily.
-    top = (hits[0].get("result") or {}).get("url")
-    return top or None
+    # INCIDENT 2026-05-25 (post-PR #309 smoke test): the original code had
+    # a "top hit fallback" here — if no artist matched, take hits[0].
+    # That produced disastrously wrong results:
+    #   - "Amanda Pujó - Ser Anti" → Jotapê (Brazilian trap, ñada que ver)
+    #   - "AIRBAG - El Plan Perfecto Vol.2" → unrelated reggaeton
+    # Mixing wrong lyrics into forced_align is WORSE than no lyrics at all
+    # because the resulting video looks confident-but-incorrect (timestamps
+    # for text that doesn't exist in the audio). Strict artist match only —
+    # better return None and fall through to Gemini.
+    logger.info("[GENIUS] no artist match in top-5 hits for %r — refusing top-hit fallback", artist)
+    return None
 
 
 def _scrape_lyrics_from_url(url: str) -> str | None:
@@ -193,6 +200,17 @@ def _scrape_lyrics_from_url(url: str) -> str | None:
     non_empty = [ln for ln in cleaned if ln]
     if len(non_empty) < 4 or len(text) < 60:
         logger.info("[GENIUS] page text too thin (%d lines / %d chars) — skip", len(non_empty), len(text))
+        return None
+    # Sanity ceiling (2026-05-25 smoke test finding): a real song has ~30-80
+    # lines and < 5000 chars of unique text. Wildly larger means the scraper
+    # picked up multiple lyric containers from the same page (genius shows
+    # related/popular tracks below the main one on some layouts), or the
+    # match was a "compilation" / "every song by artist X" aggregator page.
+    # Either way the result is unsafe — mixing several songs' text would
+    # corrupt forced_align. Reject and let Gemini try.
+    if len(non_empty) > 200 or len(text) > 5000:
+        logger.warning("[GENIUS] page text suspiciously large (%d lines / %d chars) — likely over-scrape, skip",
+                       len(non_empty), len(text))
         return None
     return text
 
