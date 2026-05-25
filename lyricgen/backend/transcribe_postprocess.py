@@ -49,58 +49,139 @@ def normalize_words(segments: list) -> list:
     return out
 
 
+def filter_rescue_candidates(
+    wx_segs: list,
+    *,
+    start_s: float,
+    end_s: float,
+    buffer_s: float = 1.0,
+) -> list:
+    """Pick the subset of whisperX segments that fit ENTIRELY inside a time
+    window [start_s + buffer, end_s - buffer]. Used to rescue lines in
+    gaps where forced-align emitted nothing (because lrclib's lyrics
+    didn't include them).
+
+    INCIDENT 2026-05-25 (Bug A of the "Legalícenla" incident): lrclib's
+    community-curated lyrics OMIT chorus repeats — both intro chorus and
+    sometimes chorus instances in the middle of the song. Forced-align
+    honours the text it gets, so wherever lrclib has a gap, the FA result
+    has a gap too. The fix uses the warm whisperX result to rescue lines
+    that wx detected in those windows. This function is the pure
+    data-transform step; the integration in main.py awaits the warm task,
+    calls this for each gap window, runs hallucination + repetition
+    filters, and merges into fa_segs.
+
+    REV 2026-05-25 (post-PR #307): originally this only filtered the INTRO
+    window [0, first_fa_start - buffer]. The body of "Legalícenla" had
+    25-second gaps where lrclib omitted entire chorus repeats — same bug,
+    different position. Generalised to any [start_s, end_s] window so we
+    can sweep every gap.
+
+    Args:
+      wx_segs: list of whisperX segment dicts with `start`/`end` keys.
+      start_s: lower bound of the rescue window. Rescued segments must
+        start AFTER this plus `buffer_s`.
+      end_s: upper bound of the rescue window. Rescued segments must end
+        BEFORE this minus `buffer_s`.
+      buffer_s: time gap (seconds) on each end so the rescued line doesn't
+        touch the FA segments bracketing the gap.
+
+    Returns:
+      A new list (subset of wx_segs) of segments that fit entirely in
+      [start_s + buffer_s, end_s - buffer_s]. Empty list if no candidates
+      or input is empty. Doesn't mutate `wx_segs`.
+    """
+    if not wx_segs:
+        return []
+    lo = start_s + buffer_s
+    hi = end_s - buffer_s
+    if hi <= lo:
+        return []
+    return [
+        dict(s) for s in wx_segs
+        if float(s.get("start") or 0) >= lo
+        and float(s.get("end") or 0) <= hi
+    ]
+
+
+# Backwards-compat wrapper: the old name only handled the intro case.
 def filter_intro_rescue_candidates(
     wx_segs: list,
     *,
     first_main_start_s: float,
     buffer_s: float = 1.0,
 ) -> list:
-    """Pick the subset of whisperX segments that fit BEFORE the first
-    forced-align segment, with a safety buffer so the rescued line doesn't
-    bleed into the FA result.
+    """DEPRECATED: kept for any callers still using the intro-only API.
+    Prefer `filter_rescue_candidates(start_s=0, end_s=first_main_start_s)`."""
+    return filter_rescue_candidates(
+        wx_segs,
+        start_s=0.0,
+        end_s=first_main_start_s,
+        buffer_s=buffer_s,
+    )
 
-    INCIDENT 2026-05-25 (Bug A of the "Legalícenla" incident): lrclib's
-    community-curated lyrics sometimes OMIT the intro chorus on songs that
-    open with the chorus before the first verse. Forced-align honours the
-    text it gets, so the first FA segment lands at the verse (~45 s) and
-    the operator sees "45s de intro instrumental" + a song that appears to
-    start with no chorus. The fix uses the warm whisperX result to rescue
-    lines that wx detected in [0, first_FA_start - buffer]. This function
-    is the pure data-transform step of that rescue; the integration in
-    main.py awaits the warm task, calls this, runs hallucination filter,
-    and prepends to fa_segs.
 
-    Args:
-      wx_segs: list of whisperX segment dicts with `start`/`end` keys.
-      first_main_start_s: the start time (seconds) of the first FA segment.
-        Rescued segments must end BEFORE this minus `buffer_s`.
-      buffer_s: time gap (seconds) between rescued segments and the first
-        FA segment, so the rescued line doesn't overlap.
+def is_suspiciously_repetitive(segments: list, *, min_count: int = 3, similarity: float = 0.7) -> bool:
+    """Heuristic: do >= `min_count` segments in this batch share substantially
+    the same text? If yes, the batch is probably a whisperX hallucination
+    (the model latched onto a phoneme pattern and stuck on it across the
+    entire intro). When this returns True, the caller should reject the
+    rescue entirely — better to show NO lines than 3 fake ones.
 
-    Returns:
-      A new list (subset of wx_segs) of segments that fit in
-      [0, first_main_start_s - buffer_s]. Empty list if no candidates
-      or input is empty. Doesn't mutate `wx_segs`.
+    INCIDENT 2026-05-25 (post-PR #307): whisperX rescued
+    ["Le realizan la", "Le realizan la", "Le realizan la"] across the
+    intro of "Legalícenla". Actual lyric in the audio is "Legalícenla" —
+    whisperX mis-heard the phonemes and emitted the same garbage 3×. The
+    repetition is the smoking gun; legit chorus repeats happen in spaced
+    bursts, not in 3 back-to-back near-duplicates.
+
+    `similarity` uses a normalised-token Jaccard so case/accents/whitespace
+    don't fool it.
     """
-    if not wx_segs:
-        return []
-    cutoff = first_main_start_s - buffer_s
-    if cutoff <= 0:
-        return []
-    return [
-        dict(s) for s in wx_segs
-        if float(s.get("end") or 0) <= cutoff
-        and float(s.get("start") or 0) >= 0
-    ]
+    if not segments or len(segments) < min_count:
+        return False
+
+    def _norm_tokens(text: str) -> set:
+        # Lowercase, strip accents, split on whitespace, drop empties.
+        import unicodedata
+        norm = unicodedata.normalize("NFKD", (text or "").lower())
+        norm = "".join(c for c in norm if not unicodedata.combining(c))
+        return {w for w in norm.split() if w}
+
+    # Pairwise count of how many segments are similar to each other.
+    token_sets = [_norm_tokens(s.get("text") or "") for s in segments]
+    similar_count = 0
+    for i in range(len(token_sets)):
+        for j in range(i + 1, len(token_sets)):
+            a, b = token_sets[i], token_sets[j]
+            if not a or not b:
+                continue
+            jaccard = len(a & b) / max(1, len(a | b))
+            if jaccard >= similarity:
+                similar_count += 1
+    # If a third of all pairs are highly similar, that's hallucination shape.
+    n = len(segments)
+    total_pairs = n * (n - 1) // 2
+    if total_pairs == 0:
+        return False
+    ratio = similar_count / total_pairs
+    return ratio >= 0.5  # >= 50% of pairs share >70% tokens → hallucination
 
 
-def dedup_collisions(segments: list, *, epsilon_s: float = 0.10) -> list:
+def dedup_collisions(segments: list, *, epsilon_s: float = 0.35) -> list:
     """Merge near-identical duplicates that forced_align/reconcile sometimes
     emits when the lyrics text has repeated chorus lines ("Legalícenla /
     Legalícenla / Oh-oh-oh"). Two segments collide when they share (a) the
-    same start within `epsilon_s` and (b) the same case-insensitive text.
-    The first occurrence wins; its end is extended to the max of the group;
-    the rest are dropped.
+    same start within `epsilon_s` (default 350 ms — increased from 100 ms
+    after the 2026-05-25 review showed duplicates at 0:45.4 / 0:45.7,
+    300 ms apart, which the old threshold missed) and (b) the same
+    case-insensitive text. The first occurrence wins; its end is extended
+    to the max of the group; the rest are dropped.
+
+    300 ms is below the minimum singing rate for a 4-syllable word like
+    "Legalícenla" (~600 ms even at allegro tempo), so two starts that close
+    with identical text cannot both be legitimate vocal events — one is
+    an aligner artefact.
 
     INCIDENT 2026-05-25: forced_align on songs whose lrclib lyrics include
     repeated chorus lines occasionally assigned all the repetitions to a
