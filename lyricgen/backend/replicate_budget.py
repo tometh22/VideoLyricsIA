@@ -30,10 +30,46 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import time as _t
-from typing import Callable, Optional
+from typing import Any, Callable, Optional
 
 logger = logging.getLogger("genly.replicate_budget")
+
+
+# Demucs/tqdm prints progress lines like "  35%|███  | 7/20" — pull the first
+# integer-percentage we find. Falls back to (done/total) ratio if no `%`
+# appears (some forks print "Processing chunk 3 of 8" without ANSI).
+_PROGRESS_RE_PCT = re.compile(r"(\d{1,3})\s*%")
+_PROGRESS_RE_FRAC = re.compile(r"\b(\d+)\s*/\s*(\d+)\b")
+
+
+def _parse_progress_from_logs(logs: str) -> Optional[float]:
+    """Best-effort extract a 0..1 fraction from a Replicate prediction's
+    streamed logs. Returns None if we can't find anything meaningful.
+
+    The model's logs are free text — Demucs (cjwbw) prints a tqdm bar that
+    looks like `35%|███   |` so we look for the LAST `%` token (newest
+    progress line). If nothing matches, try a `done/total` fraction.
+    """
+    if not logs:
+        return None
+    pct_matches = _PROGRESS_RE_PCT.findall(logs)
+    if pct_matches:
+        try:
+            pct = int(pct_matches[-1])
+            return max(0.0, min(1.0, pct / 100.0))
+        except ValueError:
+            pass
+    frac_matches = _PROGRESS_RE_FRAC.findall(logs)
+    if frac_matches:
+        try:
+            done, total = (int(x) for x in frac_matches[-1])
+            if total > 0:
+                return max(0.0, min(1.0, done / total))
+        except ValueError:
+            pass
+    return None
 
 
 # Error message fragments (lowercase substring match) that won't get
@@ -73,6 +109,89 @@ def is_non_retryable(err: Exception) -> bool:
     return any(f in msg for f in NON_RETRYABLE_FRAGMENTS)
 
 
+def _run_predict_with_progress(
+    model: str,
+    inputs: dict,
+    *,
+    deadline: float,
+    call_label: str,
+    on_progress: Callable[[float], None],
+    poll_interval_s: float = 3.0,
+    typical_runtime_s: float = 90.0,
+) -> Any:
+    """Replacement for `replicate.run()` that pollea the prediction so
+    callers can render a moving progress bar while the model runs.
+
+    Strategy for the 0..1 fraction we emit:
+      1. As soon as the prediction is created → 0.05 (signals "started").
+      2. While `status == "starting"` (Replicate cold-start) → stay at 0.05.
+      3. While `status == "processing"`:
+         - parse logs for a `%` token (Demucs uses tqdm) → use that.
+         - fall back to `elapsed / typical_runtime_s` capped at 0.92.
+      4. On `status == "succeeded"` → 1.0 (caller flips to the next stage).
+
+    Returns the raw model output (`prediction.output`), matching the shape
+    `replicate.run()` would have returned, so callers don't need to unwrap.
+
+    Raises any exception Replicate raises so the outer `call_with_budget`
+    retry machinery can decide whether to retry or short-circuit.
+    """
+    import replicate
+    # Model is `owner/name:version`; predictions.create needs the version
+    # hash, while `replicate.run` accepts both. Split here defensively.
+    version = model.split(":", 1)[1] if ":" in model else model
+    prediction = replicate.predictions.create(version=version, input=inputs)
+    start = _t.monotonic()
+    last_emitted = -1.0
+
+    def _emit(fraction: float) -> None:
+        # Throttle: only emit when fraction moves ≥1% or 5s has passed,
+        # to keep DB write rate bounded without dropping the final tick.
+        nonlocal last_emitted
+        f = max(0.0, min(1.0, fraction))
+        if last_emitted < 0 or abs(f - last_emitted) >= 0.01 or f >= 1.0:
+            try:
+                on_progress(f)
+            except Exception as e:                  # callback must NEVER kill the job
+                logger.warning("[%s] on_progress raised (%s) — continuing", call_label, e)
+            last_emitted = f
+
+    _emit(0.05)
+    while True:
+        if _t.monotonic() >= deadline:
+            try:
+                prediction.cancel()
+            except Exception:
+                pass
+            raise TimeoutError(f"{call_label} exceeded wall-clock budget")
+        _t.sleep(poll_interval_s)
+        try:
+            prediction.reload()
+        except Exception as e:
+            logger.warning("[%s] prediction.reload failed (%s) — keeping last state",
+                           call_label, e)
+            continue
+        status = getattr(prediction, "status", "") or ""
+        if status in ("succeeded",):
+            _emit(1.0)
+            return prediction.output
+        if status in ("failed", "canceled"):
+            err = getattr(prediction, "error", None) or f"prediction {status}"
+            raise RuntimeError(str(err))
+        # status in ("starting", "processing")
+        elapsed = _t.monotonic() - start
+        log_frac = _parse_progress_from_logs(getattr(prediction, "logs", "") or "")
+        if log_frac is not None:
+            _emit(max(0.05, log_frac))
+        else:
+            # Time-based fallback, asymptotes near 0.92 so we never claim
+            # "done" before the model actually says so. Shape: a slow
+            # approach to 0.92 (1 - e^{-t/typical}).
+            import math
+            approx = 0.92 * (1.0 - math.exp(-elapsed / max(1.0, typical_runtime_s)))
+            _emit(max(0.05, approx))
+
+
 def call_with_budget(
     model: str,
     input_factory: Callable[[], dict],
@@ -80,6 +199,8 @@ def call_with_budget(
     total_budget_s: float,
     backoff: list,
     call_label: str = "replicate",
+    on_progress: Optional[Callable[[float], None]] = None,
+    typical_runtime_s: float = 90.0,
 ):
     """Call `replicate.run(model, input=input_factory())` with a global
     wall-clock budget and typed-error short-circuit. Returns the model
@@ -93,6 +214,13 @@ def call_with_budget(
     `call_label` is a short identifier (`forced`, `whisperx`, `demucs`)
     used as a log prefix and a Sentry breadcrumb category. Helps trace
     which path burned the budget when reading logs.
+
+    `on_progress` (optional): callback `(fraction: float) -> None` called
+    with 0..1 as the model runs. When present, we swap `replicate.run`
+    for `predictions.create + poll`, parsing model logs to estimate
+    progress. Callers without `on_progress` keep the original
+    blocking-run path (forced_align, whisperX). Demucs uses this to
+    keep the "Aislando voz" bar moving instead of stuck at 25%.
     """
     import replicate
     deadline = _t.monotonic() + total_budget_s
@@ -119,6 +247,14 @@ def call_with_budget(
         _input = input_factory()
         _closables = [v for v in _input.values() if hasattr(v, "close") and callable(v.close)]
         try:
+            if on_progress is not None:
+                return _run_predict_with_progress(
+                    model, _input,
+                    deadline=deadline,
+                    call_label=call_label,
+                    on_progress=on_progress,
+                    typical_runtime_s=typical_runtime_s,
+                )
             return replicate.run(model, input=_input)
         except Exception as e:
             last_err = e
