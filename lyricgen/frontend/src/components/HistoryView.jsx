@@ -138,8 +138,8 @@ function VideoCard({ job, onSelect, onDelete, selected, onToggleSelect, t }) {
     <div
       role="button"
       tabIndex={0}
-      onClick={() => onSelect(job.job_id)}
-      onKeyDown={(e) => { if (e.key === "Enter" || e.key === " ") onSelect(job.job_id); }}
+      onClick={() => onSelect(job.job_id, job.status)}
+      onKeyDown={(e) => { if (e.key === "Enter" || e.key === " ") onSelect(job.job_id, job.status); }}
       className={`rounded-card overflow-hidden text-left group bg-surface-2/40 hover:bg-surface-2/70 ring-1 ring-white/[0.04] hover:ring-white/[0.10] transition-all cursor-pointer focus:outline-none focus:ring-brand/40
         ${selected ? "ring-2 ring-brand/60" : ""}`}
     >
