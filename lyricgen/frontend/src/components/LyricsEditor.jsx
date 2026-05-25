@@ -345,6 +345,10 @@ export default function LyricsEditor({
   // List vs visual timeline. Default "list" so the existing operator flow is
   // untouched; the timeline is opt-in via the toolbar toggle.
   const [viewMode, setViewMode] = useState("list"); // "list" | "timeline"
+  // Phase B 2026-05-25: el card de auto-fix antes ocupaba 120-180px arriba
+  // del editor. Reemplazado por un pill compacto 32px que expande detalle
+  // on demand. Default colapsado para minimizar el overhead vertical.
+  const [autoFixExpanded, setAutoFixExpanded] = useState(false);
   // Layout edits in the preview apply to ALL lines by default (consistent
   // look across the song); "line" scopes the next edit to the selected line
   // only (for the odd tilted/repositioned line).
@@ -1675,67 +1679,89 @@ export default function LyricsEditor({
           if (hasSuggestions) applyAllSuggestions();
           if (trimAvailable) trimAllLongSegs();
         };
+        /* Phase B 2026-05-25: pill compacto en vez del card grande.
+           - Default (autoFixExpanded=false): pill de 32px con icon ✓ +
+             "N correcciones · [Aplicar] [↺ Deshacer] [▾]". El operador
+             ve qué hay y aplica con 1 click sin desplegar.
+           - Click en ▾: expande con la lista de detalle (las 3 líneas
+             del card original). Click otra vez colapsa.
+           - Reduce el overhead vertical de 120-180px → 32px (default)
+             o 80px (expandido). */
         return (
-          <div className="mb-4 rounded-2xl ring-1 ring-accent/25 bg-accent/[0.05] px-4 py-3.5">
-            {hasAutoFix && (
-              <div className="flex items-start gap-3">
-                <svg className="w-5 h-5 text-accent flex-shrink-0 mt-0.5" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
-                  <polyline points="20 6 9 17 4 12" strokeLinecap="round" strokeLinejoin="round" />
-                </svg>
-                <div className="flex-1 min-w-0">
-                  <p className="text-xs font-medium text-white">
+          <div className="mb-3 rounded-xl ring-1 ring-accent/25 bg-accent/[0.05] px-3 py-2">
+            <div className="flex items-center gap-2 min-h-[28px]">
+              {hasAutoFix && (
+                <>
+                  <svg className="w-4 h-4 text-accent flex-shrink-0" fill="none" stroke="currentColor" strokeWidth="2.4" viewBox="0 0 24 24">
+                    <polyline points="20 6 9 17 4 12" strokeLinecap="round" strokeLinejoin="round" />
+                  </svg>
+                  <p className="text-xs font-medium text-white flex-1 min-w-0 truncate">
                     {fixCount === 1
                       ? (t("editor.autofix_title_singular") || "1 corrección automática disponible")
                       : (t("editor.autofix_title_plural") || "{n} correcciones automáticas disponibles").replace("{n}", fixCount)}
                   </p>
-                  <ul className="mt-1.5 space-y-1">
-                    {splitAvailable && (
-                      <li className="text-[11px] text-ink-secondary flex items-center gap-2">
-                        <span className="text-gray-600 font-mono text-[10px]">└</span>
-                        {(t("editor.autofix_split") || "Auto-dividir {n} líneas mergeadas").replace("{n}", mergeableSegments.length)}
-                      </li>
-                    )}
-                    {hasSuggestions && (
-                      <li className="text-[11px] text-ink-secondary flex items-center gap-2">
-                        <span className="text-gray-600 font-mono text-[10px]">└</span>
-                        {(t("editor.autofix_suggestions") || "Aplicar {n} sugerencias ortográficas").replace("{n}", pendingSuggestions)}
-                      </li>
-                    )}
-                    {trimAvailable && (
-                      <li className="text-[11px] text-ink-secondary flex items-center gap-2">
-                        <span className="text-gray-600 font-mono text-[10px]">└</span>
-                        {(t("editor.autofix_trim") || "Recortar {n} líneas con texto colgado").replace("{n}", longSegCount)}
-                      </li>
-                    )}
-                  </ul>
-                </div>
-              </div>
-            )}
-            <div className={`flex items-center gap-2 ${hasAutoFix ? "mt-3 pl-8" : ""}`}>
-              {hasAutoFix && (
-                <button
-                  type="button"
-                  onClick={applyAllFixes}
-                  className="px-3 py-1.5 rounded-md text-xs font-medium text-white bg-accent hover:bg-accent/90 transition-colors"
-                >
-                  {fixCount === 1
-                    ? (t("editor.autofix_apply_one") || "Aplicar")
-                    : (t("editor.autofix_apply_all") || "Aplicar todas las correcciones")}
-                </button>
+                  <button
+                    type="button"
+                    onClick={applyAllFixes}
+                    className="shrink-0 px-2.5 py-1 rounded-md text-[11px] font-semibold text-white bg-accent hover:bg-accent/90 transition-colors"
+                  >
+                    {fixCount === 1
+                      ? (t("editor.autofix_apply_one") || "Aplicar")
+                      : (t("editor.autofix_apply_all_short") || "Aplicar todo")}
+                  </button>
+                </>
               )}
               {hasUndo && (
                 <button
                   onClick={undoEdit}
                   title={t("editor.undo_hint") || "Cmd/Ctrl+Z"}
-                  className="text-xs font-medium text-gray-400 hover:text-white transition-colors flex items-center gap-1 px-3 py-1.5 rounded-lg bg-white/[0.04] hover:bg-white/[0.08] ring-1 ring-white/[0.06]"
+                  className="shrink-0 text-[11px] font-medium text-gray-400 hover:text-white transition-colors flex items-center gap-1 px-2 py-1 rounded-md bg-white/[0.04] hover:bg-white/[0.08] ring-1 ring-white/[0.06]"
                 >
-                  <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
+                  <svg className="w-3 h-3" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
                     <path d="M3 7v6h6M3 13a9 9 0 109-9" strokeLinecap="round" strokeLinejoin="round" />
                   </svg>
                   {t("editor.undo") || "Deshacer"}
                 </button>
               )}
+              {hasAutoFix && fixCount > 0 && (
+                <button
+                  type="button"
+                  onClick={() => setAutoFixExpanded((v) => !v)}
+                  title={autoFixExpanded ? "Ocultar detalle" : "Ver detalle"}
+                  aria-label={autoFixExpanded ? "Ocultar detalle" : "Ver detalle"}
+                  className="shrink-0 w-6 h-6 rounded-md text-gray-400 hover:text-white hover:bg-white/[0.06] transition-colors flex items-center justify-center"
+                >
+                  <svg
+                    className={`w-3 h-3 transition-transform ${autoFixExpanded ? "rotate-180" : ""}`}
+                    fill="none" stroke="currentColor" strokeWidth="2.4" viewBox="0 0 24 24"
+                  >
+                    <polyline points="6 9 12 15 18 9" strokeLinecap="round" strokeLinejoin="round" />
+                  </svg>
+                </button>
+              )}
             </div>
+            {hasAutoFix && autoFixExpanded && (
+              <ul className="mt-2 pl-6 space-y-1 animate-fade-in">
+                {splitAvailable && (
+                  <li className="text-[11px] text-ink-secondary flex items-center gap-2">
+                    <span className="text-gray-600 font-mono text-[10px]">└</span>
+                    {(t("editor.autofix_split") || "Auto-dividir {n} líneas mergeadas").replace("{n}", mergeableSegments.length)}
+                  </li>
+                )}
+                {hasSuggestions && (
+                  <li className="text-[11px] text-ink-secondary flex items-center gap-2">
+                    <span className="text-gray-600 font-mono text-[10px]">└</span>
+                    {(t("editor.autofix_suggestions") || "Aplicar {n} sugerencias ortográficas").replace("{n}", pendingSuggestions)}
+                  </li>
+                )}
+                {trimAvailable && (
+                  <li className="text-[11px] text-ink-secondary flex items-center gap-2">
+                    <span className="text-gray-600 font-mono text-[10px]">└</span>
+                    {(t("editor.autofix_trim") || "Recortar {n} líneas con texto colgado").replace("{n}", longSegCount)}
+                  </li>
+                )}
+              </ul>
+            )}
           </div>
         );
       })()}
@@ -1748,7 +1774,17 @@ export default function LyricsEditor({
           AND frees the primary purple CTA so "Aprobar y generar" in
           the parent header has no visual competitor. */}
       {audioUrl && (
-        <div className="mb-4 flex items-center gap-3 px-3 py-2.5 rounded-card bg-surface-2/60 ring-1 ring-white/[0.05]" data-tour="editor-playbar">
+        /* Phase B 2026-05-25: sticky para que el play/pause + scrub
+           siempre estén accesibles mientras el operador scrollea la
+           lista de líneas. top usa stickyHeaderTop (passed by parent)
+           para clear el header superior si lo hay. backdrop-blur +
+           bg semi-transparente para que el contenido scrolleado abajo
+           se vea sutil debajo. z-20 sobre el contenido normal del editor. */
+        <div
+          className="mb-3 sticky z-20 backdrop-blur-md bg-surface-1/85 flex items-center gap-3 px-3 py-2.5 rounded-card ring-1 ring-white/[0.05]"
+          style={{ top: stickyHeaderTop || 0 }}
+          data-tour="editor-playbar"
+        >
           <button
             onClick={togglePlay}
             className="w-10 h-10 rounded-full bg-brand hover:bg-brand-light text-white flex items-center justify-center transition-colors shrink-0"
