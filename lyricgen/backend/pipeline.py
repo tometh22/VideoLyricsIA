@@ -5795,31 +5795,31 @@ def _ensure_background(style_hint: str, job_dir: str, lyrics_text: str = None,
     elif _norm_move_bg == "foto-parallax" and bg_mode != "imagen":
         logger.info("[BG] movement=foto-parallax overrides bg_mode → imagen (lateral pan)")
         bg_mode = "imagen"
-    # Estático / Sutil: HISTÓRICAMENTE (2026-05-22) ruteados a Imagen porque
-    # Veo ignoraba "locked / no advance" ~50% del tiempo y se mandaba al
-    # frente, arruinando la legibilidad de las letras superpuestas.
+    # Estático / Sutil: el design intent (clarificado por operador UMG
+    # 2026-05-25) es que estos sean ESCENAS REALES generadas por Veo,
+    # NO fotos estáticas:
+    #   - "Estático" → Veo, cámara fija, motion in-scene (gente caminando,
+    #     olas, nubes, neblina, fuego, ambiente vivo).
+    #   - "Sutil"    → Veo, drift sutil de cámara + scene motion.
     #
-    # 2026-05-25 — El design intent original era que estatico/sutil sean
-    # escenas REALES con Veo (cámara estática + motion in-scene rica), no
-    # still photos. Foto+parallax es el único Imagen path por diseño.
+    # "Foto + parallax" es el ÚNICO path Imagen → Ken Burns por diseño.
     #
-    # Gated detrás de STATIC_SUTIL_VIA_VEO env flag (default OFF en staging
-    # por seguridad — flip a "1" para alinear con el design). Cuando esté
-    # ON, estos registers usan Veo con prompt hardening reforzado (C2+C3+C4
-    # más abajo) para minimizar el riesgo de forward-push del Veo histórico.
-    #
-    # Si el flag está OFF, mantiene el comportamiento conservador 2026-05-22.
+    # HISTÓRICAMENTE (2026-05-22) estatico/sutil iban a Imagen como
+    # workaround porque Veo ignoraba "locked camera" ~50%. El prompt
+    # hardening C2+C3+C4 reforzado en _generate_veo_video mitiga eso.
+    # Default ahora es Veo. Para volver al workaround (si Veo regresa
+    # al comportamiento histórico), setear STATIC_SUTIL_VIA_IMAGEN=1.
     elif _norm_move_bg in ("estatico", "sutil") and bg_mode != "imagen":
-        _static_sutil_via_veo = (
-            os.environ.get("STATIC_SUTIL_VIA_VEO", "").strip().lower()
+        _force_imagen_legacy = (
+            os.environ.get("STATIC_SUTIL_VIA_IMAGEN", "").strip().lower()
             in ("1", "true", "yes", "on")
         )
-        if not _static_sutil_via_veo:
-            logger.info("[BG] movement=%s overrides bg_mode → imagen (controlled camera, STATIC_SUTIL_VIA_VEO=off)", _norm_move_bg)
+        if _force_imagen_legacy:
+            logger.info("[BG] movement=%s overrides bg_mode → imagen (STATIC_SUTIL_VIA_IMAGEN=on, legacy workaround)", _norm_move_bg)
             bg_mode = "imagen"
         else:
-            logger.info("[BG] movement=%s stays on Veo (STATIC_SUTIL_VIA_VEO=on)", _norm_move_bg)
-            # bg_mode stays "veo" — _generate_veo_video will receive the
+            logger.info("[BG] movement=%s stays on Veo (design intent 2026-05-25 — scene REAL)", _norm_move_bg)
+            # bg_mode stays "veo" — _generate_veo_video receives the
             # hardened safe_prompt for estatico/sutil (C2 + C3).
 
     # Imagen-4 + Ken Burns branch. Cabled 2026-05-16 — _generate_imagen_image
@@ -5842,8 +5842,9 @@ def _ensure_background(style_hint: str, job_dir: str, lyrics_text: str = None,
         # operador eligió específicamente para path Imagen premium.
         # Merece el modelo ultra (~$0.04 vs $0.02 estándar — despreciable
         # comparado con los $0.80-3.20 de Veo de los otros registers).
-        # Estatico/sutil siguen con el modelo estándar (default IMAGEN_MODEL)
-        # cuando NO está activado el flag STATIC_SUTIL_VIA_VEO (Parte C).
+        # Estatico/sutil legacy (cuando STATIC_SUTIL_VIA_IMAGEN=1) siguen con
+        # el modelo estándar (default IMAGEN_MODEL). Default 2026-05-25 ya no
+        # llega acá — estatico/sutil ahora van por Veo.
         _parallax_model = (
             os.environ.get("IMAGEN_MODEL_PARALLAX",
                            "imagen-4.0-ultra-generate-001").strip()

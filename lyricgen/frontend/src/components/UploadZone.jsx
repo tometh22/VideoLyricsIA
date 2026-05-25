@@ -508,13 +508,19 @@ export default function UploadZone({
   // /movement_samples/<id>.mp4 (Vite serves public/ as static).
   // NOTE: those MP4s are LIBRARY PLACEHOLDERS shipped with the first
   // deploy — Tomi swaps real ones in before UMG sees the feature.
+  // 2026-05-25 (operador UMG): clarificadas las definiciones —
+  // estatico/sutil/estandar/animado son ESCENAS REALES generadas por
+  // Veo (video). Solo "foto-parallax" produce una foto estática IA con
+  // pan lateral. Cada card lleva metadata `kind` (video|image|auto) +
+  // emoji prefix (🎬 vs 🖼) en la descripción para que el operador vea
+  // de un vistazo cuál es video real vs foto IA con paneo.
   const MOVEMENT_STYLES = [
-    { code: "",              label: t("upload.movement_auto") || "Auto",                         sample: null,                              desc: t("upload.movement_auto_desc") || "La IA decide el movimiento según la canción." },
-    { code: "estatico",      label: t("upload.movement_estatico") || "Estático (cámara fija)",   sample: "/movement_samples/estatico.mp4",  desc: t("upload.movement_estatico_desc") || "Cámara fija. Solo se mueve lo que pasa dentro de la escena." },
-    { code: "sutil",         label: t("upload.movement_sutil") || "Sutil (mínimo movimiento)",   sample: "/movement_samples/sutil.mp4",     desc: t("upload.movement_sutil_desc") || "Movimiento mínimo, casi imperceptible. Calmo." },
-    { code: "estandar",      label: t("upload.movement_estandar") || "Estándar (cinematográfico)", sample: "/movement_samples/estandar.mp4", desc: t("upload.movement_estandar_desc") || "Movimiento de cámara cinematográfico (zoom/drift)." },
-    { code: "foto-parallax", label: t("upload.movement_foto_parallax") || "Foto + parallax",     sample: "/movement_samples/foto-parallax.mp4", desc: t("upload.movement_parallax_desc") || "Foto con sensación de profundidad (paneo lento)." },
-    { code: "animado",       label: t("upload.movement_animado") || "Animado (ilustración)",     sample: "/movement_samples/animado.mp4",   desc: t("upload.movement_animado_desc") || "Ilustración 2D estilizada, no fotorrealista." },
+    { code: "",              kind: "auto",  label: t("upload.movement_auto") || "Auto",                                  sample: null,                                  desc: t("upload.movement_auto_desc") || "La IA decide el movimiento según la canción." },
+    { code: "estatico",      kind: "video", label: t("upload.movement_estatico") || "Estático (escena viva)",            sample: "/movement_samples/estatico.mp4",       desc: t("upload.movement_estatico_desc") || "🎬 Escena real con cámara FIJA. Lo que se mueve son los elementos de la escena (gente, olas, nubes, neblina, fuego)." },
+    { code: "sutil",         kind: "video", label: t("upload.movement_sutil") || "Sutil (cámara apenas drift)",          sample: "/movement_samples/sutil.mp4",          desc: t("upload.movement_sutil_desc") || "🎬 Escena real con drift sutil de cámara + motion in-scene. Calmo pero vivo." },
+    { code: "estandar",      kind: "video", label: t("upload.movement_estandar") || "Estándar (cinematográfico)",        sample: "/movement_samples/estandar.mp4",       desc: t("upload.movement_estandar_desc") || "🎬 Escena real con movimiento cinematográfico de cámara (zoom/drift)." },
+    { code: "foto-parallax", kind: "image", label: t("upload.movement_foto_parallax") || "Foto + parallax",              sample: "/movement_samples/foto-parallax.mp4", desc: t("upload.movement_parallax_desc") || "🖼 FOTO estática IA + paneo lento horizontal (NO es video — es imagen con cámara que la recorre)." },
+    { code: "animado",       kind: "video", label: t("upload.movement_animado") || "Animado (ilustración)",              sample: "/movement_samples/animado.mp4",       desc: t("upload.movement_animado_desc") || "🎬 Ilustración 2D estilizada animada, no fotorrealista." },
   ];
 
   // Effect overlay — animated particles composited OVER the background (the
