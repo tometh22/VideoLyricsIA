@@ -700,16 +700,16 @@ def run_pipeline(job_id: str, mp3_path: str, artist: str, style: str,
             _new_rp["bg_verbatim"] = True
         if custom_colors:
             _new_rp["custom_colors"] = custom_colors
-        # U5 (audit 2026-05-25): merge atómico vía jobs.merge_render_params.
-        # El read-then-write fuera de un row lock dejaba race: 2 callers
-        # concurrentes (worker + /edit endpoint, o 2 /edit calls) podían
-        # pisarse mutuamente. merge_render_params hace SELECT FOR UPDATE
-        # + read + write en UNA tx.
         try:
-            from jobs import merge_render_params
-            merge_render_params(job_id, _new_rp)
+            from database import SessionLocal as _SL_rp, Job as _Job_rp
+            with _SL_rp() as _db_rp:
+                _row_rp = _db_rp.query(_Job_rp).filter(_Job_rp.job_id == job_id).first()
+                _merged_rp = dict(_row_rp.render_params) if (_row_rp and isinstance(_row_rp.render_params, dict)) else {}
         except Exception as _rp_exc:
-            logger.warning("[BG] merge_render_params failed: %s", _rp_exc)
+            logger.warning("[BG] could not read existing render_params for merge: %s", _rp_exc)
+            _merged_rp = {}
+        _merged_rp.update(_new_rp)
+        update_job(job_id, render_params=_merged_rp)
 
         # Cache AI-generated background to R2 so a typography-only edit
         # can re-use it without another Veo call ($0.80 saved per edit).
@@ -5285,30 +5285,6 @@ def _generate_veo_video(prompt: str, output_path: str, job_id: str = None,
                     output_artifact=output_path,
                 )
             return output_path
-        # U6 (audit 2026-05-25) — cache existe pero download FALLÓ.
-        # Sin este fix, el recorder quedaba "in-flight" mientras el Veo
-        # call subsiguiente arrancaba; si el worker moría antes del
-        # finish() de la Veo call, el reaper marcaba el row "orphan poll"
-        # y el job entero como "error". Fix: cerramos el recorder actual
-        # con summary descriptivo, recreamos uno nuevo para el Veo call.
-        logger.warning(
-            "[BG] Veo cache HIT pero download FALLÓ para %s — recorder "
-            "cerrado como cache_hit_download_failed, arrancando Veo fresh.",
-            cache_object_key,
-        )
-        if recorder:
-            recorder.finish(
-                response_summary=f"cache_hit_download_failed: key={cache_key_hash}",
-            )
-        # Re-crear recorder limpio para la Veo call que sigue.
-        recorder = record_ai_call(
-            job_id=job_id or "unknown",
-            step="video_bg",
-            tool_name=model,
-            tool_provider="google_vertex",
-            prompt=safe_prompt,
-            input_data_types=["generated_prompt"],
-        ) if job_id else None
 
     elapsed = _time.time() - _last_veo_request
     if elapsed < _VEO_COOLDOWN and _last_veo_request > 0:
@@ -5440,20 +5416,10 @@ def _generate_veo_video(prompt: str, output_path: str, job_id: str = None,
     fetch_url = f"{base_url}:fetchPredictOperation"
     poll_deadline = _time.time() + 600
     op_payload: dict | None = None
-    # U10 (audit 2026-05-25): heartbeat cada 60s para que el reaper no
-    # mate este job durante el Veo poll (hasta 10min sin update_job natural).
-    _hb_counter = 0
     while True:
         if _time.time() > poll_deadline:
             raise TimeoutError("Veo 3 operation timed out after 10 min")
         _time.sleep(10)
-        _hb_counter += 1
-        if _hb_counter % 6 == 0 and job_id:
-            try:
-                from jobs import heartbeat as _heartbeat
-                _heartbeat(job_id)
-            except Exception:  # pragma: no cover
-                pass
         token = _veo_access_token()
         # Vertex's long-running publisher operations need the
         # fetchPredictOperation helper (a plain GET on the operation name
