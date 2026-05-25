@@ -3695,6 +3695,74 @@ async def _run_transcription_for_job(
             plain = lrc.get("plain") or ""
             lrc_dur = lrc.get("duration")
 
+            # ────────────────────────────────────────────────────────
+            # LRCLIB SYNCED FAST-PATH (2026-05-25 velocity sprint).
+            # Cuando lrclib trae synced perfecto, el flow completo
+            # (FA + warm-start whisperX + gap-rescue) es 150-180 s
+            # desperdiciados — los timestamps del LRC son tan
+            # buenos como los que FA produciría. Verificamos con
+            # un slice corto de audio + Whisper-1 (~$0.0005 + ~3 s)
+            # que la primera línea efectivamente está en su tiempo
+            # claimed; si pasa, emitimos directo y volvemos.
+            #
+            # Behind LRCLIB_FAST_PATH env flag (default off). Encender
+            # via Railway variables después de validar con 1-2 jobs;
+            # `unset` = rollback instantáneo sin redeploy.
+            #
+            # NO se aplica cuando:
+            #   - synced está vacío (no hay timestamps)
+            #   - plain está vacío (sin reference para el editor)
+            #   - duration_diff > 60 s (versión live/extended/remix —
+            #     el offset shift es riesgoso)
+            #   - verify falló (Whisper no encontró el texto en el
+            #     audio claimed_start → synced está desincronizado
+            #     o es de una versión distinta)
+            _FAST_TRUE = ("1", "true", "yes", "on", "y", "t")
+            if (os.environ.get("LRCLIB_FAST_PATH", "0").strip().lower() in _FAST_TRUE
+                    and synced and plain):
+                try:
+                    aud_dur = await asyncio.to_thread(_audio_duration, tmp_path)
+                    dur_diff = abs((lrc_dur or 0) - (aud_dur or 0)) if (lrc_dur and aud_dur) else 999
+                    if dur_diff > 60:
+                        logger.info(
+                            "[LYRICS] fast-path skipped: duration_diff=%.1fs > 60s (live/remix version?)",
+                            dur_diff,
+                        )
+                    else:
+                        # Parse synced to find the first non-empty line
+                        # and verify against the audio at its claimed_start.
+                        candidate_segs = _lrc_to_segments(synced, audio_duration=aud_dur)
+                        first_line = next((s for s in candidate_segs if (s.get("text") or "").strip()), None)
+                        if first_line:
+                            similarity = await asyncio.to_thread(
+                                _verify_lrclib_alignment,
+                                tmp_path,
+                                first_line.get("text", ""),
+                                float(first_line.get("start", 0.0)),
+                            )
+                            if similarity is not None and similarity >= 0.4:
+                                logger.info(
+                                    "[LYRICS] lrclib synced FAST-PATH: skipping FA + whisperX "
+                                    "(verified similarity=%.2f at %.2fs, %d segments, ~150 s saved)",
+                                    similarity, float(first_line.get("start", 0.0)),
+                                    len(candidate_segs),
+                                )
+                                from timing_sources import LRCLIB_SYNCED
+                                return _emit_segments(
+                                    candidate_segs,
+                                    source=LRCLIB_SYNCED,
+                                    reference_lyrics=plain,
+                                )
+                            else:
+                                logger.info(
+                                    "[LYRICS] fast-path verify failed: similarity=%s — falling through to FA",
+                                    f"{similarity:.2f}" if similarity is not None else "None",
+                                )
+                except Exception as e:
+                    logger.warning(
+                        "[LYRICS] fast-path raised %s — falling through to FA path", e,
+                    )
+
             # Forced alignment (preferred when enabled): align the KNOWN
             # lyrics to THIS audio at ±50ms instead of trusting lrclib's
             # community timestamps (often drifted / missing lines — the
