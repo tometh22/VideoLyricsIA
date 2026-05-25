@@ -112,7 +112,7 @@ describe("LyricsEditor — repeat-line propagation", () => {
     render(<LyricsEditor {...chorusProps()} />);
     const inputs = screen.getAllByDisplayValue("Quizá fue en la mañana");
     editLine(inputs[0], "Quizás fue en la mañana, vendados");
-    fireEvent.click(screen.getByRole("button", { name: /Solo esta/i }));
+    fireEvent.click(screen.getByTestId("repeat-only-this-btn"));
     expect(screen.getByDisplayValue("Quizás fue en la mañana, vendados")).toBeInTheDocument();
     // The other two stale occurrences stay as they were.
     expect(screen.getAllByDisplayValue("Quizá fue en la mañana")).toHaveLength(2);
