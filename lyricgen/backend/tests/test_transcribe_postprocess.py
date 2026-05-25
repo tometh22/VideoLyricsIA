@@ -15,6 +15,8 @@ from transcribe_postprocess import (
     normalize_words,
     dedup_collisions,
     filter_intro_rescue_candidates,
+    filter_rescue_candidates,
+    is_suspiciously_repetitive,
 )
 
 
@@ -189,6 +191,120 @@ def test_intro_rescue_does_not_mutate_input():
     before = [dict(s) for s in wx]
     _ = filter_intro_rescue_candidates(wx, first_main_start_s=20.0)
     assert wx == before
+
+
+# ─── filter_rescue_candidates (generalised gap rescue) ───────────
+
+
+def test_gap_rescue_picks_lines_inside_body_window():
+    """Body chorus rescue: between FA seg ending at 78 and FA seg
+    starting at 103 (25 s gap), whisperX detected 3 chorus lines."""
+    wx = [
+        {"start": 80.0, "end": 82.0, "text": "Legalícenla"},
+        {"start": 84.0, "end": 86.0, "text": "Oh-oh-oh"},
+        {"start": 90.0, "end": 92.0, "text": "Legalícenla"},
+        {"start": 105.0, "end": 107.0, "text": "fuera del gap"},
+    ]
+    out = filter_rescue_candidates(wx, start_s=78.0, end_s=103.0)
+    assert len(out) == 3
+    assert all(s["text"] != "fuera del gap" for s in out)
+
+
+def test_gap_rescue_excludes_lines_that_straddle_the_window():
+    """A whisperX seg that starts inside but ends outside (or vice-versa)
+    should NOT be rescued — it spans the boundary."""
+    wx = [
+        {"start": 76.0, "end": 80.0, "text": "straddles start"},
+        {"start": 100.0, "end": 110.0, "text": "straddles end"},
+    ]
+    out = filter_rescue_candidates(wx, start_s=78.0, end_s=103.0)
+    assert out == []
+
+
+def test_gap_rescue_empty_window():
+    out = filter_rescue_candidates([{"start": 1, "end": 2, "text": "x"}],
+                                    start_s=10.0, end_s=10.5)
+    assert out == []   # buffer eats the whole window
+
+
+def test_gap_rescue_old_intro_alias_still_works():
+    """Backward-compat: filter_intro_rescue_candidates delegates to the
+    new function with start_s=0."""
+    wx = [{"start": 5.0, "end": 7.0, "text": "intro"}]
+    out = filter_intro_rescue_candidates(wx, first_main_start_s=15.0)
+    assert len(out) == 1
+
+
+# ─── is_suspiciously_repetitive (post-PR #307 quality fix) ────────
+
+
+def test_repetitive_detects_3x_same_phrase():
+    """Canonical case from 2026-05-25 incident: whisperX rescued
+    "Le realizan la" × 3 in the intro of Legalícenla. Not in the audio —
+    model hallucinated a phoneme pattern."""
+    segs = [
+        {"start": 17, "end": 21, "text": "Le realizan la"},
+        {"start": 26, "end": 30, "text": "Le realizan la"},
+        {"start": 34, "end": 38, "text": "Le realizan la"},
+    ]
+    assert is_suspiciously_repetitive(segs) is True
+
+
+def test_repetitive_is_case_and_accent_insensitive():
+    segs = [
+        {"start": 0, "end": 1, "text": "Legalícenla"},
+        {"start": 5, "end": 6, "text": "legalicenla"},
+        {"start": 10, "end": 11, "text": "LEGALÍCENLA"},
+    ]
+    assert is_suspiciously_repetitive(segs) is True
+
+
+def test_repetitive_passes_legitimate_chorus_with_different_lines():
+    """A real chorus mixes repeated lines with varied ones — that should
+    NOT be flagged. Half the pairs need to be near-identical for the guard
+    to fire."""
+    segs = [
+        {"start": 16, "end": 18, "text": "Legalícenla"},
+        {"start": 18, "end": 20, "text": "Oh-oh-oh"},
+        {"start": 20, "end": 22, "text": "Legalícenla"},
+        {"start": 22, "end": 24, "text": "Vos tenés conciencia de"},
+    ]
+    # 6 pairs total. Similar pairs: (0,2)=Legalícenla,Legalícenla → 1 similar.
+    # 1/6 < 0.5 → NOT flagged.
+    assert is_suspiciously_repetitive(segs) is False
+
+
+def test_repetitive_skips_when_too_few_segments():
+    """A single rescued line can't be flagged as repetitive — there's no
+    pattern to detect. Same with two lines."""
+    assert is_suspiciously_repetitive([{"text": "Le realizan la"}]) is False
+    assert is_suspiciously_repetitive([
+        {"text": "Le realizan la"},
+        {"text": "Le realizan la"},
+    ]) is False
+
+
+def test_repetitive_handles_empty_or_missing_text():
+    """Empty / None text segments are not "near-duplicates of nothing" —
+    skip safely without crashing."""
+    segs = [{"text": ""}, {"text": None}, {"text": "x"}]
+    assert is_suspiciously_repetitive(segs) is False
+
+
+# ─── dedup_collisions 300ms threshold (post-incident review) ──────
+
+
+def test_dedup_now_merges_300ms_apart_duplicates():
+    """The Legalícenla case had 0:45.4 / 0:45.7 duplicates (300 ms apart)
+    that the original 100 ms epsilon missed. With the new 300 ms default
+    they merge."""
+    segs = [
+        {"start": 45.4, "end": 47.0, "text": "Legalícenla"},
+        {"start": 45.7, "end": 47.2, "text": "Legalícenla"},
+    ]
+    out = dedup_collisions(segs)
+    assert len(out) == 1
+    assert out[0]["end"] == 47.2
 
 
 def test_dedup_respects_custom_epsilon():

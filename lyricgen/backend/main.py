@@ -3611,83 +3611,113 @@ async def _run_transcription_for_job(
                     if fa_segs:
                         logger.info("[LYRICS] forced alignment used (%s lines, lrclib text) for %r - %r", len(fa_segs), artist_hint, song_hint)
 
-                        # INTRO CHORUS RESCUE (2026-05-25): lrclib's
-                        # community-curated lyrics sometimes OMIT the
-                        # intro chorus when a song opens with the
-                        # chorus before the first verse (typical 80s
-                        # rock pattern — "Legalícenla / Oh-oh-oh"
-                        # repeats at 0:16 long before the verse at
-                        # 0:45). Forced-align honours the text it
-                        # gets, so the first FA segment lands at the
-                        # verse start (~45 s) and the operator sees
-                        # "45s de intro instrumental" + a song that
-                        # appears to start with no chorus.
+                        # GAP RESCUE (2026-05-25, rev 2): lrclib's community-
+                        # curated lyrics OMIT chorus repeats at both ENDS and
+                        # in the MIDDLE of songs whose chorus repeats many
+                        # times. Forced-align honours the text it gets, so
+                        # every omitted chorus block becomes a gap in the
+                        # FA output.
                         #
-                        # When that happens we have a warm whisperX
-                        # task already running. Instead of cancelling
-                        # it, we await its result and rescue any lines
-                        # it detected in [0, first_FA_start - 1 s].
-                        # Those lines get filtered for whisper
-                        # hallucinations and prepended to fa_segs. The
-                        # `_emit_segments` chokepoint then dedups
-                        # against the body chorus repeats so we don't
-                        # double-count if whisperX overshot.
+                        # Original PR #307 only rescued the INTRO. The
+                        # "Legalícenla" review on 2026-05-25 showed that
+                        # the body also had 25-s gaps between FA segments
+                        # where lrclib omitted entire chorus blocks. Same
+                        # symptom, different position. This rev sweeps
+                        # EVERY gap (intro + body) > GAP_THRESHOLD_S.
                         #
-                        # Threshold of 15 s avoids triggering on
-                        # normal songs that legitimately start with a
-                        # short instrumental (almost all of them) —
-                        # only kicks in when the gap is suspiciously
-                        # long. Buffer of 1 s prevents the rescued
-                        # line from bleeding into the first FA line.
-                        INTRO_RESCUE_THRESHOLD_S = 15.0
-                        INTRO_RESCUE_BUFFER_S = 1.0
-                        first_fa_start = min(
-                            (float(s.get("start") or float("inf")) for s in fa_segs),
-                            default=float("inf"),
+                        # For each gap we ask whisperX what it transcribed
+                        # in that window, filter for hallucinations + the
+                        # "stuck-phoneme" repetitive pattern (the canonical
+                        # "Le realizan la × 3" failure that ate the intro
+                        # of Legalícenla after PR #307 shipped), and merge
+                        # into fa_segs. `dedup_collisions` in
+                        # `_emit_segments` catches any rescued line that
+                        # happens to duplicate an FA line.
+                        GAP_THRESHOLD_S = 15.0
+                        GAP_BUFFER_S = 1.0
+                        from transcribe_postprocess import (
+                            filter_rescue_candidates,
+                            is_suspiciously_repetitive,
                         )
-                        rescued_intro: list = []
-                        if first_fa_start > INTRO_RESCUE_THRESHOLD_S:
-                            logger.info("[LYRICS] long intro detected (first FA seg @ %.1fs > %.0fs threshold) — awaiting whisperX warm-start for rescue",
-                                        first_fa_start, INTRO_RESCUE_THRESHOLD_S)
+
+                        # Always await the warm whisperX result now (we
+                        # need it to fill the gaps even when FA wins on
+                        # the lines lrclib provided).
+                        try:
+                            wx_intro_segs = await wx_warm_task
+                        except Exception as e:
+                            logger.warning("[LYRICS] gap-rescue whisperX await failed: %s", e)
+                            wx_intro_segs = None
+
+                        # Enumerate every gap > threshold. The first one
+                        # is the intro (0 → first_fa_start). The middle
+                        # ones are between consecutive FA segments. We
+                        # skip the tail gap (after the last FA seg) —
+                        # songs end with instrumental outros all the time,
+                        # rescuing there is more likely to produce
+                        # hallucinations than truth.
+                        fa_sorted = sorted(
+                            (dict(s) for s in fa_segs),
+                            key=lambda s: float(s.get("start") or 0),
+                        )
+                        gaps: list[tuple[float, float]] = []
+                        first_start = float(fa_sorted[0].get("start") or 0)
+                        if first_start > GAP_THRESHOLD_S:
+                            gaps.append((0.0, first_start))
+                        for prev_seg, next_seg in zip(fa_sorted, fa_sorted[1:]):
+                            g_start = float(prev_seg.get("end") or 0)
+                            g_end = float(next_seg.get("start") or 0)
+                            if g_end - g_start > GAP_THRESHOLD_S:
+                                gaps.append((g_start, g_end))
+
+                        rescued_total: list = []
+                        if gaps and wx_intro_segs:
                             try:
-                                wx_intro_segs = await wx_warm_task
+                                from pipeline import _filter_whisper_hallucinations
                             except Exception as e:
-                                logger.warning("[LYRICS] intro-rescue whisperX await failed: %s", e)
-                                wx_intro_segs = None
-                            if wx_intro_segs:
-                                from transcribe_postprocess import filter_intro_rescue_candidates
-                                candidate = filter_intro_rescue_candidates(
+                                logger.warning("[LYRICS] gap-rescue: could not import hallucination filter (%s)", e)
+                                _filter_whisper_hallucinations = lambda s: (s, 0)  # noqa: E731
+
+                            for g_start, g_end in gaps:
+                                cand = filter_rescue_candidates(
                                     wx_intro_segs,
-                                    first_main_start_s=first_fa_start,
-                                    buffer_s=INTRO_RESCUE_BUFFER_S,
+                                    start_s=g_start,
+                                    end_s=g_end,
+                                    buffer_s=GAP_BUFFER_S,
                                 )
-                                if candidate:
-                                    try:
-                                        from pipeline import _filter_whisper_hallucinations
-                                        candidate, _drops = _filter_whisper_hallucinations(candidate)
-                                    except Exception as e:
-                                        logger.warning("[LYRICS] intro-rescue hallucination filter failed: %s", e)
-                                if candidate:
-                                    rescued_intro = candidate
-                                    logger.info("[LYRICS] intro chorus rescue: %d line(s) from whisperX before %.1fs",
-                                                len(rescued_intro), first_fa_start - INTRO_RESCUE_BUFFER_S)
-                                else:
-                                    logger.info("[LYRICS] intro-rescue: whisperX detected no plausible lines before %.1fs",
-                                                first_fa_start - INTRO_RESCUE_BUFFER_S)
-                        else:
-                            # Normal-length intro — discard the warm whisperX task.
-                            wx_warm_task.cancel()
-                            try:
-                                await wx_warm_task
-                            except (asyncio.CancelledError, Exception):
-                                pass
+                                if not cand:
+                                    continue
+                                try:
+                                    cand, _drops = _filter_whisper_hallucinations(cand)
+                                except Exception as e:
+                                    logger.warning("[LYRICS] gap-rescue hallucination filter failed: %s", e)
+                                if cand and is_suspiciously_repetitive(cand):
+                                    logger.warning("[LYRICS] gap-rescue REJECTED for [%.1f,%.1f]: stuck-phoneme hallucination (%d lines)",
+                                                   g_start, g_end, len(cand))
+                                    continue
+                                if cand:
+                                    rescued_total.extend(cand)
+                                    logger.info("[LYRICS] gap-rescue [%.1f,%.1f]: +%d line(s)",
+                                                g_start, g_end, len(cand))
+
+                        # Sort the union by start so the editor list is
+                        # chronological. dedup_collisions in
+                        # `_emit_segments` cleans up any overlap that
+                        # slipped through.
+                        merged = sorted(
+                            rescued_total + list(fa_segs),
+                            key=lambda s: float(s.get("start") or 0),
+                        )
 
                         from timing_sources import FORCED_ALIGN
                         return _emit_segments(
-                            (rescued_intro + fa_segs) if rescued_intro else fa_segs,
+                            merged,
                             FORCED_ALIGN,
                             reference_lyrics=fa_text,
-                            recovery_source="forced_align" if not rescued_intro else "forced_align+intro_rescue",
+                            recovery_source=(
+                                "forced_align+gap_rescue" if rescued_total
+                                else "forced_align"
+                            ),
                         )
 
                     # FA failed / non-retryable / timed out. Use the
