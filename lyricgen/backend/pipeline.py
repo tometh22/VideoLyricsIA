@@ -5285,6 +5285,30 @@ def _generate_veo_video(prompt: str, output_path: str, job_id: str = None,
                     output_artifact=output_path,
                 )
             return output_path
+        # U6 (audit 2026-05-25) — cache existe pero download FALLÓ.
+        # Sin este fix, el recorder quedaba "in-flight" mientras el Veo
+        # call subsiguiente arrancaba; si el worker moría antes del
+        # finish() de la Veo call, el reaper marcaba el row "orphan poll"
+        # y el job entero como "error". Fix: cerramos el recorder actual
+        # con summary descriptivo, recreamos uno nuevo para el Veo call.
+        logger.warning(
+            "[BG] Veo cache HIT pero download FALLÓ para %s — recorder "
+            "cerrado como cache_hit_download_failed, arrancando Veo fresh.",
+            cache_object_key,
+        )
+        if recorder:
+            recorder.finish(
+                response_summary=f"cache_hit_download_failed: key={cache_key_hash}",
+            )
+        # Re-crear recorder limpio para la Veo call que sigue.
+        recorder = record_ai_call(
+            job_id=job_id or "unknown",
+            step="video_bg",
+            tool_name=model,
+            tool_provider="google_vertex",
+            prompt=safe_prompt,
+            input_data_types=["generated_prompt"],
+        ) if job_id else None
 
     elapsed = _time.time() - _last_veo_request
     if elapsed < _VEO_COOLDOWN and _last_veo_request > 0:
