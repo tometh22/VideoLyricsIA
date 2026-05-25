@@ -238,9 +238,23 @@ def _apply_lead_in(segs: list[dict], *, lead_ms: int | None = None) -> list[dict
     return out
 
 
-def transcribe_whisperx(audio_path: str, language: str | None = None) -> list[dict] | None:
+def transcribe_whisperx(audio_path: str, language: str | None = None,
+                        lyrics_hint: str | None = None) -> list[dict] | None:
     """Transcribe `audio_path` with whisperX. Returns segments with word
     stamps, or None (disabled / failure / empty). Never raises.
+
+    `lyrics_hint`: optional reference text (lrclib / Genius / Gemini plain
+    lyrics). When provided, the first ~800 chars are passed as Whisper's
+    `initial_prompt` — biases the model's vocabulary towards the actual
+    lyrics so it stops mishearing (e.g. "Legalícenla" instead of
+    "Le realizan la"). Costs nothing extra — Whisper-large-v3 already
+    accepts the prompt parameter; we just weren't using it.
+
+    INCIDENT 2026-05-25: PROD without this hint produced ["Le realizan
+    la"] × 4 in the intro of "Legalícenla" because the audio is
+    phonemically ambiguous on a heavy electric guitar mix. With the
+    lrclib plain text as prompt, the model expects "Legalícenla" and
+    locks onto the right interpretation.
     """
     if not is_enabled():
         return None
@@ -256,6 +270,17 @@ def transcribe_whisperx(audio_path: str, language: str | None = None) -> list[di
     payload: dict = {"align_output": True}
     if language:
         payload["language"] = language
+
+    # Lyrics-aware prompting. The Replicate whisperX model
+    # (victor-upmeet/whisperx) accepts `initial_prompt` which is then
+    # forwarded to the underlying faster-whisper. Whisper itself reads
+    # only the last ~224 tokens of the prompt, so we cap at ~800 chars
+    # (~200 tokens for Spanish/English) — sending more is wasted bytes.
+    if lyrics_hint and lyrics_hint.strip():
+        prompt_text = lyrics_hint.strip()[:800]
+        payload["initial_prompt"] = prompt_text
+        logger.info("[WHISPERX] initial_prompt primed with %s chars from reference lyrics",
+                    len(prompt_text))
 
     # OBSERVABILITY (audit 2026-05-24): whisperX USED to be a single
     # `replicate.run(...)` with no budget cap. When Replicate degraded,
