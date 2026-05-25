@@ -1,5 +1,6 @@
 """Email notification system for GenLy AI."""
 
+import html
 import logging
 import os
 import smtplib
@@ -139,6 +140,29 @@ def _button(url: str, text: str) -> str:
 # ---------------------------------------------------------------------------
 # Email types
 # ---------------------------------------------------------------------------
+
+def send_lead_notification(name: str, company: str, email: str, volume: str, message: str):
+    """Notify the sales inbox of a new lead from the public landing form.
+
+    On non-production the staging gate redirects/drops this like any other
+    mail; the lead is still persisted in the DB regardless.
+    """
+    to = (os.environ.get("SALES_EMAIL")
+          or os.environ.get("OWNER_EMAIL")
+          or os.environ.get("ALERT_EMAIL")
+          or "tomas@epical.digital")
+    esc = html.escape
+    msg_html = esc(message or "—").replace(chr(10), "<br>")
+    content = f"""
+    <h2 style="color:#fff;margin:0 0 16px;">Nuevo lead de ventas</h2>
+    <p><strong>Nombre:</strong> {esc(name)}</p>
+    <p><strong>Sello / empresa:</strong> {esc(company or "—")}</p>
+    <p><strong>Email:</strong> {esc(email)}</p>
+    <p><strong>Volumen estimado:</strong> {esc(volume or "—")}</p>
+    <p style="margin-top:16px;"><strong>Mensaje:</strong><br>{msg_html}</p>
+    """
+    _send_email(to, "Nuevo lead de ventas — GenLy AI", _wrap_template(content))
+
 
 def send_welcome(email: str, username: str):
     """Send welcome email after registration."""

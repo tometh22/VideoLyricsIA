@@ -72,7 +72,7 @@ from datetime import datetime, timedelta, timezone
 from database import (
     Job, User, UserSettings, AuditLog, APIKey, get_db, init_db,
     BackgroundAsset, AssetUsage, Delivery, DeliveryChangeRequest,
-    scoped_db, pool_stats,
+    SalesLead, scoped_db, pool_stats,
 )
 from jobs import bulk_delete_jobs, create_job, delete_job, get_job, get_all_jobs, update_job
 from observability import init_sentry, init_logging, health_snapshot
@@ -398,6 +398,55 @@ def on_startup():
     import time as _time
     from reaper import reap_all_stuck as _reap
 
+    # CV3 (audit 2026-05-25) — Multi-replica coordination helper.
+    # Wraps a callable in a Postgres advisory lock. Cuando hay 2+ replicas
+    # API, ambas ejecutan los daemon threads (bg_cache_cleanup, outputs_
+    # cleanup) — sin coordinación corren N veces por ciclo, generando
+    # ruido Sentry, posibles double-deletes y emails duplicados. El
+    # reaper YA tiene su propio lock interno; este helper extiende el
+    # mismo patrón a los otros loops.
+    _BG_PREVIEW_CLEANUP_LOCK_KEY = 9118364455199102
+    _OUTPUTS_CLEANUP_LOCK_KEY = 9118364455199103
+
+    def _run_with_advisory_lock(lock_key: int, work_fn, *, name: str = "") -> bool:
+        """Execute work_fn solo si conseguimos el advisory lock.
+
+        Returns True si lo ejecutó, False si otra replica ya tenía el lock
+        (skip silencioso, normal en multi-replica). En SQLite (dev local)
+        skip-loops el lock — siempre ejecuta.
+        """
+        from database import SessionLocal
+        from sqlalchemy import text
+        _db = SessionLocal()
+        try:
+            if _db.bind.dialect.name != "postgresql":
+                work_fn()
+                return True
+            got = _db.execute(
+                text("SELECT pg_try_advisory_lock(:k)"),
+                {"k": lock_key},
+            ).scalar()
+            if not got:
+                logger.debug(
+                    "[%s] another replica holds the advisory lock; skipping",
+                    name or f"lock:{lock_key}",
+                )
+                return False
+            try:
+                work_fn()
+                return True
+            finally:
+                try:
+                    _db.execute(
+                        text("SELECT pg_advisory_unlock(:k)"),
+                        {"k": lock_key},
+                    )
+                    _db.commit()
+                except Exception:  # pragma: no cover
+                    pass
+        finally:
+            _db.close()
+
     def _reaper_loop():
         # Brief delay so the very first request doesn't compete with
         # a cold-start reaper holding a DB connection.
@@ -419,6 +468,41 @@ def on_startup():
     threading.Thread(target=_reaper_loop, daemon=True, name="reaper").start()
     logger.info("reaper thread started (threshold=100min, every 5min)")
 
+    # bg_preview cache cleanup — Capa C 2026-05-24. Borra previews bajo
+    # `bg_cache/` con más de 24h de TTL. El cache existe para que el
+    # operator que pre-genera el fondo durante edit lo reuse al apretar
+    # "Crear video"; si no vuelve en 24h, asumimos abandono y liberamos
+    # R2 storage. Sin esto, cada operador deja N previews descartados
+    # (cambió params) acumulándose forever.
+    def _bg_preview_cleanup_loop():
+        _time.sleep(180)  # 3min después del boot
+        while True:
+            try:
+                def _do_cleanup():
+                    from bg_preview import cleanup_old_cache
+                    report = cleanup_old_cache(retention_hours=24, apply=True)
+                    if report.get("deleted", 0) > 0:
+                        logger.info(
+                            "[BG_PREVIEW_CLEANUP] deleted %d objects (%.1f MB freed)",
+                            report["deleted"], report.get("bytes_freed", 0) / 1024 / 1024,
+                        )
+                # CV3: gated por advisory lock — solo 1 replica corre por ciclo.
+                _run_with_advisory_lock(
+                    _BG_PREVIEW_CLEANUP_LOCK_KEY, _do_cleanup,
+                    name="bg_preview_cleanup",
+                )
+            except Exception:  # pragma: no cover
+                try:
+                    import sentry_sdk
+                    sentry_sdk.capture_exception()
+                except Exception:
+                    pass
+                _time.sleep(60)
+            _time.sleep(6 * 3600)   # 6h entre sweeps
+
+    threading.Thread(target=_bg_preview_cleanup_loop, daemon=True, name="bg_preview_cleanup").start()
+    logger.info("bg_preview cleanup thread started (TTL=24h, every 6h)")
+
     # Outputs cleanup loop. Sweeps OUTPUTS_DIR every hour to keep
     # local disk bounded — deletes jobs whose deliverables are on R2
     # and retries the upload for jobs whose R2 push failed earlier.
@@ -428,8 +512,15 @@ def on_startup():
         _time.sleep(120)  # let the API come up first
         while True:
             try:
-                from scripts.cleanup_old_outputs import cleanup as _cleanup_outputs
-                _cleanup_outputs()
+                def _do_outputs_cleanup():
+                    from scripts.cleanup_old_outputs import cleanup as _cleanup_outputs
+                    _cleanup_outputs()
+                # CV3 (audit 2026-05-25): gated por advisory lock para que
+                # con 2+ replicas API NO se borre el mismo job 2 veces.
+                _run_with_advisory_lock(
+                    _OUTPUTS_CLEANUP_LOCK_KEY, _do_outputs_cleanup,
+                    name="outputs_cleanup",
+                )
             except Exception:  # pragma: no cover
                 try:
                     import sentry_sdk
@@ -744,6 +835,15 @@ class CreateAPIKeyRequest(BaseModel):
     name: str = Field(..., max_length=100)  # DB column VARCHAR(100)
 
 
+class CreateLeadRequest(BaseModel):
+    # Public landing form. max_length aligned with sales_leads columns.
+    name: str = Field(..., max_length=255)
+    email: str = Field(..., max_length=255)
+    company: str = Field(default="", max_length=255)
+    volume: str = Field(default="", max_length=100)
+    message: str = Field(default="", max_length=5000)
+
+
 @app.post("/auth/login")
 @limiter.limit("10/minute")
 async def login(body: LoginRequest, request: Request, db: Session = Depends(get_db)):
@@ -773,6 +873,39 @@ async def login(body: LoginRequest, request: Request, db: Session = Depends(get_
             "features": {"prores_export": has_prores_access(user)},
         },
     }
+
+
+@app.post("/api/leads")
+@limiter.limit("5/minute")
+async def create_lead(body: CreateLeadRequest, request: Request, db: Session = Depends(get_db)):
+    """Public sales/contact lead capture from the landing form (no auth).
+
+    Persists the lead and emails the sales inbox asynchronously. Returns
+    200 even if the email fails — the DB row is the source of truth.
+    """
+    name = body.name.strip()
+    email = body.email.strip()
+    if not name or "@" not in email:
+        raise HTTPException(status_code=400, detail="Name and a valid email are required")
+
+    lead = SalesLead(
+        name=name,
+        email=email,
+        company=(body.company or "").strip() or None,
+        volume=(body.volume or "").strip() or None,
+        message=(body.message or "").strip() or None,
+        ip_address=request.client.host if request.client else None,
+    )
+    db.add(lead)
+    db.commit()
+
+    threading.Thread(
+        target=emails.send_lead_notification,
+        args=(name, lead.company or "", email, lead.volume or "", lead.message or ""),
+        daemon=True,
+    ).start()
+
+    return {"ok": True}
 
 
 @app.post("/auth/register")
@@ -1275,7 +1408,18 @@ async def list_plans():
 # Protected endpoints
 # ---------------------------------------------------------------------------
 
-MAX_UPLOAD_MB = int(os.environ.get("MAX_UPLOAD_MB", "100"))
+# Default bumped 100 → 500 MB (2026-05-24): los músicos suben WAV master
+# (50-150 MB típico, hasta 300 MB para temas largos en stereo 24-bit).
+# El upload va directo browser → R2 vía presigned URL (no toca la API),
+# así que este límite es solo guardrail server-side, no afecta memoria
+# del worker FastAPI. Override vía env MAX_UPLOAD_MB.
+#
+# CUIDADO: el endpoint legacy /upload (multipart-form, deprecated) usa
+# el mismo límite. Si reactivás /upload con MAX_UPLOAD_MB=500 vas a
+# OOMear el worker — el body completo entra a memoria. Por eso el
+# /upload tiene un _drain_to_spooled que va a disk arriba de 1MB, pero
+# igual NO usar /upload para WAV grande; el flujo es presigned R2.
+MAX_UPLOAD_MB = int(os.environ.get("MAX_UPLOAD_MB", "500"))
 _MP3_MAGIC_BYTES = (b"ID3", b"\xff\xfb", b"\xff\xf3", b"\xff\xf2")
 _AUDIO_EXTENSIONS = (".mp3", ".wav")
 
@@ -1573,8 +1717,11 @@ def _enforce_plan_quota(db: Session, current_user: dict) -> None:
 # System default for per-tenant daily cap when User.max_videos_per_day is None.
 # Catches accidental burst usage (a UMG user looping a script, accidental retry
 # storm, etc.) before it racks up Veo bills. UMG's verbal commitment is
-# 200/month ≈ 7/day; a 50/day cap allows 7× headroom for legitimate bursts.
-DEFAULT_DAILY_CAP = 50
+# 200/month ≈ 7/day; el default histórico de 50 daba 7× headroom pero se
+# saturaba durante smoke tests (2026-05-24: tomas hit 50/50 probando el
+# wizard refactor). Bumpeado a 500 con env override y bypass explícito para
+# plan="unlimited" (los unlimited NO deberían tener cap diario).
+DEFAULT_DAILY_CAP = int(os.environ.get("DAILY_VOLUME_CAP", "500"))
 
 
 DEFAULT_MAX_CONCURRENT_JOBS = 5
@@ -1661,7 +1808,15 @@ def _enforce_tenant_backlog(db: Session, current_user: dict) -> None:
 
 def _enforce_daily_volume_cap(db: Session, current_user: dict) -> None:
     """Raise 429 if the tenant has hit its per-day video cap. UMG-readiness:
-    prevents a runaway from creating $200 of Veo in an hour."""
+    prevents a runaway from creating $200 of Veo in an hour.
+
+    Bypass: plan="unlimited" no tiene cap diario (por definición). El control
+    de costo en unlimited vive en el budget anual / billing aparte.
+    """
+    plan = (current_user.get("plan") or "").strip().lower()
+    if plan == "unlimited":
+        return
+
     tenant_id = current_user["tenant_id"]
     user_model = db.query(User).filter(User.id == current_user["id"]).first()
 
@@ -2033,6 +2188,37 @@ def _validate_audio_filename_only(filename: str) -> None:
         )
 
 
+def _safe_basename(filename: str) -> str:
+    """Strip any directory components from a user-supplied filename and
+    reject obvious traversal attempts. Returns the bare filename safe
+    for `os.path.join(job_dir, ...)`.
+
+    SECURITY (incident class): the original code did
+    `os.path.join(job_dir, file.filename)` directly on multipart upload
+    filenames. A request with `filename="../poc.mp3"` would write
+    outside the job dir (and could overwrite a sibling job's
+    `lyric_video.mp4` if the attacker guessed the job_id). This helper
+    fixes the four call sites in one place.
+
+    Defense in depth: also rejects null bytes and control chars (which
+    some shells / databases handle inconsistently), and caps length at
+    255 chars (POSIX NAME_MAX).
+    """
+    if not filename:
+        raise HTTPException(status_code=400, detail="Missing filename.")
+    # Strip directory parts (handles both / and \, plus repeated separators).
+    base = os.path.basename(filename.replace("\\", "/"))
+    if not base or base in (".", ".."):
+        raise HTTPException(status_code=400, detail="Invalid filename.")
+    # Reject null bytes + control chars — they survive os.path.basename
+    # but cause downstream surprises (NUL truncates strings in C libs).
+    if "\x00" in base or any(ord(c) < 32 for c in base):
+        raise HTTPException(status_code=400, detail="Invalid filename.")
+    if len(base) > 255:
+        raise HTTPException(status_code=400, detail="Filename too long.")
+    return base
+
+
 @app.post("/upload-url")
 @limiter.limit("120/minute")
 async def upload_url(
@@ -2059,6 +2245,11 @@ async def upload_url(
     machinery.
     """
     _validate_audio_filename_only(body.filename)
+    # SECURITY: sanitize the user-supplied filename BEFORE it propagates
+    # to `Job.filename` (then to `OUTPUTS_DIR/<job_id>/<filename>` on
+    # /transcribe-uploaded). A traversal like `../poc.mp3` would
+    # otherwise escape the job dir at write time.
+    body.filename = _safe_basename(body.filename)
     if body.size_bytes and body.size_bytes > MAX_UPLOAD_MB * 1024 * 1024:
         raise HTTPException(
             status_code=413,
@@ -2510,28 +2701,75 @@ async def transcribe_uploaded(
 
     _enforce_disk_capacity()
     _enforce_memory_pressure()
+
+    # Feature flag — 2026-05-23. Default ON. Flipear a "0" para rollback al
+    # path sync inline si rompe en staging. Rollout plan:
+    #   1. Merge a staging con ASYNC_TRANSCRIBE_ENABLED=1 en .env staging.
+    #   2. Smoke 1-2 días. Si todo OK, prender en prod (.env prod) + monitorear.
+    #   3. Borrar la rama legacy + el flag después de 1 semana sin incidentes.
+    _async_enabled = os.environ.get(
+        "ASYNC_TRANSCRIBE_ENABLED", "1"
+    ).strip().lower() not in ("0", "false", "no", "off")
+
+    # Materialize the audio onto local disk for Whisper / ffmpeg / etc.
+    # En el path async, esto sigue siendo necesario porque el handler valida
+    # el archivo (corrupt detection) antes de enqueue — fail-fast en el
+    # request, no en el worker (que daría error opaco al usuario via polling).
+    job_id = body.job_id
+    job_dir = os.path.join(OUTPUTS_DIR, job_id)
+    os.makedirs(job_dir, exist_ok=True)
+    audio_path = os.path.join(job_dir, job_row.filename)
+
+    if not os.path.exists(audio_path):
+        import asyncio as _asyncio
+        for _attempt in range(5):
+            if storage.download_object(job_row.input_r2_key, audio_path):
+                break
+            if _attempt < 4:
+                await _asyncio.sleep(0.5 * (2 ** _attempt))
+        else:
+            raise HTTPException(
+                status_code=502,
+                detail="No pudimos leer el archivo subido. Reintentá en unos segundos.",
+            )
+    _validate_audio_file_on_disk(job_row.filename, audio_path)
+
+    if _async_enabled:
+        # Async path — enqueue + 202 + status polling.
+        # Flippeamos status a "transcribing_queued" para que /transcription-status
+        # devuelva un estado coherente desde el momento del enqueue.
+        job_row.status = "transcribing_queued"
+        job_row.current_step = "transcribing"
+        db.commit()
+        db.close()
+        try:
+            from queue_jobs import enqueue_transcription
+            enqueue_transcription(
+                job_id,
+                audio_path,
+                language=body.language,
+                artist=body.artist,
+                title=body.title,
+                filename=job_row.filename,
+                tenant_id=current_user.get("tenant_id", ""),
+            )
+        except Exception as exc:
+            logger.exception("[TRANSCRIBE] enqueue failed for job=%s", job_id)
+            # Rollback el status para no dejar el job colgado en queued.
+            from jobs import update_job
+            update_job(job_id, status="transcription_failed",
+                       current_step="error", error=str(exc)[:300])
+            raise HTTPException(status_code=503, detail="Cola de transcripción no disponible. Reintentá.")
+        # 202 Accepted con el job_id para polling. No incluye segments —
+        # el frontend pollea /transcription-status hasta status=transcribed.
+        return {
+            "job_id": job_id,
+            "status": "transcribing_queued",
+        }
+
+    # Legacy sync path (fallback con ASYNC_TRANSCRIBE_ENABLED=0).
     transcription_lease = _try_acquire_transcription_slot()
     try:
-        # Materialize the audio onto local disk for Whisper / ffmpeg / etc.
-        job_id = body.job_id
-        job_dir = os.path.join(OUTPUTS_DIR, job_id)
-        os.makedirs(job_dir, exist_ok=True)
-        audio_path = os.path.join(job_dir, job_row.filename)
-
-        if not os.path.exists(audio_path):
-            import asyncio as _asyncio
-            for _attempt in range(5):
-                if storage.download_object(job_row.input_r2_key, audio_path):
-                    break
-                if _attempt < 4:
-                    await _asyncio.sleep(0.5 * (2 ** _attempt))
-            else:
-                raise HTTPException(
-                    status_code=502,
-                    detail="No pudimos leer el archivo subido. Reintentá en unos segundos.",
-                )
-        _validate_audio_file_on_disk(job_row.filename, audio_path)
-
         # Reuse the existing Whisper / lrclib machinery from the legacy
         # /transcribe handler. Keeping the implementation in one place via
         # the helper below means the lyrics-recovery / hallucination logic
@@ -2550,6 +2788,273 @@ async def transcribe_uploaded(
         )
     finally:
         _release_transcription_slot(transcription_lease)
+
+
+# ---------------------------------------------------------------------------
+# Transcription status polling — 2026-05-23
+# El frontend pollea acá tras un POST /transcribe-uploaded (async). Devuelve
+# el ciclo de vida del job: transcribing_queued → transcribing →
+# transcribed | transcription_failed. Cuando llega a transcribed, incluye
+# segments + reference_lyrics para que el editor cargue sin segundo request.
+# ---------------------------------------------------------------------------
+@app.get("/transcription-status/{job_id}")
+@limiter.limit("600/minute")  # polling holgado: 1 req/seg × ~10 archivos simultáneos
+async def transcription_status(
+    request: Request,
+    job_id: str,
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Devuelve el estado actual de una transcripción async.
+
+    Forma del response:
+      {
+        "job_id": str,
+        "status": "transcribing_queued" | "transcribing" | "transcribed" | "transcription_failed",
+        "segments": [...] | null,
+        "reference_lyrics": str | null,
+        "coverage_warning": bool,
+        "recovery_source": str | null,
+        "error": str | null
+      }
+
+    El frontend pollea con backoff (~1.5s → 5s). Cuando status == "transcribed"
+    el polling para y carga el editor con los segments. Si "transcription_failed",
+    muestra el error inline con botón Reintentar.
+    """
+    # Try-except amplio porque slowapi/middleware tiran 500 bare en lugar de
+    # JSONResponse con detail si una excepción burbujea fuera de FastAPI.
+    # Capturamos acá para devolver siempre JSON con stack trace summary.
+    try:
+        from jobs import get_job_model
+        job_row = get_job_model(db, job_id)
+        if (not job_row
+                or job_row.user_id != current_user["id"]
+                or job_row.tenant_id != current_user["tenant_id"]):
+            raise HTTPException(status_code=404, detail="Job not found.")
+
+        status = job_row.status or ""
+        # Mapeo de status del DB a los valores que espera el frontend. El path
+        # legacy sync usa "transcribed_pending" como estado final
+        # post-transcribe; lo normalizamos a "transcribed" en la respuesta.
+        if status == "transcribed_pending":
+            status = "transcribed"
+
+        payload = {
+            "job_id": job_id,
+            "status": status,
+            "segments": None,
+            "reference_lyrics": None,
+            "coverage_warning": bool(getattr(job_row, "coverage_warning", False)),
+            "recovery_source": getattr(job_row, "recovery_source", None),
+            "error": None,
+        }
+        if status == "transcribed":
+            payload["segments"] = job_row.segments_json or []
+            # reference_lyrics no es columna del modelo Job (la transcripción
+            # vieja la devolvía inline; ahora no la persistimos). Defer a
+            # otro PR si el editor la necesita post-render. Default "" para
+            # no romper el frontend que la lee.
+            payload["reference_lyrics"] = getattr(job_row, "reference_lyrics", "") or ""
+        elif status == "transcription_failed":
+            payload["error"] = (getattr(job_row, "error", None) or
+                                "Error desconocido durante la transcripción.")
+
+        return payload
+    except HTTPException:
+        raise
+    except Exception as exc:
+        import traceback
+        tb = traceback.format_exc()
+        logger.exception("[TRANSCRIBE-STATUS] job_id=%s 500: %s", job_id, exc)
+        # Devolver JSON con detail en lugar de "Internal Server Error" plano
+        # para que el frontend (y este smoke script) puedan diagnosticar.
+        raise HTTPException(
+            status_code=500,
+            detail=f"{type(exc).__name__}: {str(exc)[:200]}",
+        )
+
+
+# ---------------------------------------------------------------------------
+# Background pre-generation — Capa C del wizard refactor (2026-05-24)
+# Mientras el operador edita lyrics, Veo/Imagen ya están generando el fondo.
+# Cuando llega POST /generate, la pipeline reusa el cache. Ver bg_preview.py
+# para el worker + cache key logic.
+# ---------------------------------------------------------------------------
+class _GeneratePreviewReq(BaseModel):
+    """Background params — TODOS los campos que entran al hash determinístico
+    del cache. Cualquier campo del request /generate que NO afecte el bg NO
+    va acá (audio, lyrics, font, animation, transition...)."""
+    artist: str = Field(default="", max_length=255)
+    song_title: str = Field(default="", max_length=500)
+    style: str = Field(default="auto", max_length=50)
+    movement_style: str = Field(default="", max_length=64)
+    effect: str = Field(default="", max_length=32)
+    custom_colors: str = Field(default="", max_length=200)
+    genre: str = Field(default="", max_length=64)
+    concept: str = Field(default="", max_length=2000)
+    background_hint: str = Field(default="", max_length=2000)
+    bg_verbatim: bool = False
+    background_mode: str = Field(default="veo", max_length=16)
+    animate_image: bool = False
+    match_lyrics: bool = True
+    target_duration_s: float = Field(default=30.0, ge=5, le=600)
+
+
+@app.post("/generate-preview")
+@limiter.limit("30/minute")
+async def generate_preview(
+    request: Request,
+    body: _GeneratePreviewReq,
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Pre-genera el background (Veo/Imagen) mientras el operador edita lyrics.
+
+    Comportamiento:
+      - Computa `bg_cache_key` = sha256-12 de los params normalizados.
+      - Si `bg_cache/{key}.mp4` existe en R2 → 200 OK con `cached=true`. El
+        operador ya pidió este background con esos params; reusamos.
+      - Si no existe → crea job + enqueue a la queue `bg_preview` + retorna
+        202 Accepted con `job_id` para que el frontend pollee status.
+      - Idempotente: dos requests paralelos con mismos params → primero
+        enqueue, segundo ve el cache_key + status existente y devuelve el
+        mismo job_id. (Race window dentro del worker está cubierta por el
+        idempotency check en run_bg_preview_job.)
+
+    Plan-tier guard (Capa C 2026-05-24): free-tier devuelve `skipped:true`
+    sin tocar la cola — cada preview descartado gasta $0.80-3.20 Veo y un
+    trial toquetea opciones más que un paid customer. Paid pasan normal.
+    """
+    from auth import PLANS
+    plan_id = (current_user.get("plan") or "free").strip()
+    plan_cfg = PLANS.get(plan_id, PLANS["free"])
+    if not plan_cfg.get("bg_preview_enabled", False):
+        return {
+            "skipped": True,
+            "reason": "plan_tier",
+            "message": "El pre-render del fondo está disponible en planes paid. El video se genera igual al apretar 'Crear video'.",
+        }
+
+    from bg_preview import (
+        compute_bg_cache_key, cache_check, cache_r2_key, track_request,
+    )
+
+    params = body.model_dump()
+    bg_cache_key = compute_bg_cache_key(params)
+
+    # Fast path — cache hit.
+    if cache_check(bg_cache_key):
+        track_request(cache_hit=True)
+        return {
+            "bg_cache_key": bg_cache_key,
+            "cached": True,
+            "r2_key": cache_r2_key(bg_cache_key),
+            "status": "bg_preview_done",
+        }
+
+    # Crear un job "ghost" en la DB sólo para tracking del status; tiene
+    # tenant_id del current_user. Filename placeholder porque no hay audio.
+    #
+    # HOTFIX 2026-05-24: the previous call had THREE bugs that crashed the
+    # endpoint with `TypeError: create_job() got an unexpected keyword
+    # argument 'plan'`, blocking the WHOLE upload flow because the
+    # frontend's `useBackgroundPreview` fires this in parallel with
+    # /upload-url (which then 429'd as the user retried). The bugs were:
+    #   (1) `plan=...` kwarg — doesn't exist on `create_job` (plan lives
+    #       on the User row, not the Job).
+    #   (2) `status=...` should be `initial_status=...` per signature.
+    #   (3) The first positional arg `db` was missing.
+    # Plus the value "bg_preview_queued" wasn't in `valid_states` — added
+    # alongside this fix in jobs.py.
+    from jobs import create_job
+    job_id = create_job(
+        db,
+        artist=body.artist or "preview",
+        song_title=body.song_title or "preview",
+        style=body.style or "auto",
+        filename=f"bgpreview_{bg_cache_key}.preview",
+        user_id=current_user["id"],
+        tenant_id=current_user["tenant_id"],
+        delivery_profile="youtube",
+        initial_status="bg_preview_queued",
+    )
+
+    try:
+        from queue_jobs import enqueue_bg_preview
+        enqueue_bg_preview(job_id, bg_cache_key, params)
+    except Exception as exc:
+        logger.exception("[BG_PREVIEW] enqueue failed for %s", job_id)
+        from jobs import update_job
+        update_job(job_id, status="bg_preview_failed", current_step="error",
+                   error=str(exc)[:300])
+        raise HTTPException(503, detail="Cola de pre-gen no disponible.")
+
+    track_request(cache_hit=False)
+    return {
+        "bg_cache_key": bg_cache_key,
+        "cached": False,
+        "job_id": job_id,
+        "status": "bg_preview_queued",
+    }
+
+
+@app.get("/admin/bg-preview-metrics")
+async def admin_bg_preview_metrics(
+    current_user: dict = Depends(get_current_user),
+):
+    """Métricas del feature bg-preview — admin only.
+
+    Returns:
+        {
+          "requests_total": int,
+          "cache_hits": int,
+          "cache_misses": int,
+          "cache_hit_rate": float (0..1),
+          "estimated_wasted_cost_usd": float,
+          "last_reset_ts": float
+        }
+
+    Process-local counters: en horizontal scale cada API replica reporta los
+    suyos. Para una vista global, agregar manual (sumar requests/hits/misses
+    de todas las réplicas; hit_rate = sum_hits / sum_requests).
+    """
+    if current_user.get("role") != "admin":
+        raise HTTPException(403, detail="Admin only.")
+    from bg_preview import get_metrics
+    return get_metrics()
+
+
+@app.get("/generate-preview-status/{job_id}")
+@limiter.limit("600/minute")
+async def generate_preview_status(
+    request: Request,
+    job_id: str,
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Polling endpoint para el frontend. Backoff típico 1.5s → 5s."""
+    try:
+        from jobs import get_job_model
+        job_row = get_job_model(db, job_id)
+        if (not job_row
+                or job_row.user_id != current_user["id"]
+                or job_row.tenant_id != current_user["tenant_id"]):
+            raise HTTPException(status_code=404, detail="Job not found.")
+        return {
+            "job_id": job_id,
+            "status": job_row.status or "",
+            "error": getattr(job_row, "error", None),
+        }
+    except HTTPException:
+        raise
+    except Exception as exc:
+        import traceback
+        logger.exception("[BG_PREVIEW_STATUS] job=%s 500: %s", job_id, exc)
+        raise HTTPException(
+            500,
+            detail=f"{type(exc).__name__}: {str(exc)[:200]}",
+        )
 
 
 # Deprecation metadata for the legacy multipart-form endpoints. RFC 8594
@@ -2603,13 +3108,19 @@ async def upload(
     font: str = Form("", max_length=64),
     concept: str = Form("", max_length=2000),
     movement_style: str = Form("", max_length=64),
+    effect: str = Form("", max_length=32),
     animate_image: str = Form("", max_length=8),
     text_case: str = Form("upper", max_length=16),
     font_scale: str = Form("1.0", max_length=8),
     lyric_transition: str = Form("cut", max_length=16),
     text_motion: str = Form("none", max_length=16),
+    lyrics_animation: str = Form("none", max_length=16),
+    line_transition: str = Form("none", max_length=16),
     text_contrast: str = Form("medium", max_length=16),
     match_lyrics: bool = Form(True),
+    background_hint: str = Form("", max_length=2000),
+    bg_verbatim: bool = Form(False),
+    custom_colors: str = Form("", max_length=200),
     current_user: dict = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
@@ -2684,9 +3195,13 @@ async def upload(
     job_dir = os.path.join(OUTPUTS_DIR, job_id)
     os.makedirs(job_dir, exist_ok=True)
 
-    mp3_path = os.path.join(job_dir, file.filename)
+    # SECURITY: never trust the user-supplied filename for path joining —
+    # `../poc.mp3` would otherwise escape the job dir. _safe_basename
+    # strips directory components + control chars + length-caps.
+    safe_name = _safe_basename(file.filename)
+    mp3_path = os.path.join(job_dir, safe_name)
     await _stream_upload_to_disk(file, mp3_path)
-    _validate_audio_file_on_disk(file.filename, mp3_path)
+    _validate_audio_file_on_disk(safe_name, mp3_path)
 
     # Upload the input MP3 to R2 regardless of whether the job will run now
     # or wait in the queue — the worker container fetches from R2 (the API
@@ -2754,14 +3269,22 @@ async def upload(
         font=font,
         concept=concept,
         movement_style=movement_style,
+        effect=effect,
         animate_image=str(animate_image).strip().lower() in ("true", "1", "yes", "on"),
         song_title=song_title,
         text_case=text_case if text_case in ("upper", "title", "lower", "original") else "upper",
         font_scale=_font_scale,
-        lyric_transition=lyric_transition if lyric_transition in ("cut", "fade", "fade_slow") else "cut",
-        text_motion=text_motion if text_motion in ("none", "subtle", "float") else "none",
+        # lyric_transition + text_motion: deprecados 2026-05-23 (ver run_pipeline).
+        # Aceptamos los Form params por back-compat pero coerce a defaults.
+        lyric_transition="cut",
+        text_motion="none",
+        lyrics_animation=lyrics_animation if lyrics_animation in ("none", "karaoke", "word_reveal", "pop", "glow") else "none",
+        line_transition=line_transition if line_transition in ("none", "slide_up", "slide_side", "wipe", "dissolve_blur") else "none",
         text_contrast=text_contrast if text_contrast in ("subtle", "medium", "strong") else "medium",
         match_lyrics=match_lyrics,
+        background_hint=(background_hint.strip() or None),
+        bg_verbatim=bg_verbatim,
+        custom_colors=(custom_colors.strip() or ""),
     )
 
     return {"job_id": job_id, "status": initial_status}
@@ -2816,12 +3339,14 @@ async def transcribe_endpoint(
 
     job_dir = os.path.join(OUTPUTS_DIR, job_id)
     os.makedirs(job_dir, exist_ok=True)
-    audio_path = os.path.join(job_dir, file.filename)
+    # SECURITY: sanitize filename before path join (see _safe_basename).
+    safe_audio_name = _safe_basename(file.filename)
+    audio_path = os.path.join(job_dir, safe_audio_name)
     # Stream the body in 1 MiB chunks. Lossless WAVs (~30-50 MB for a
     # 3-min track) used to OOM the API container under concurrent load
     # because we buffered the full payload in RAM.
     await _stream_upload_to_disk(file, audio_path)
-    _validate_audio_file_on_disk(file.filename, audio_path)
+    _validate_audio_file_on_disk(safe_audio_name, audio_path)
 
     # Cross-replica handoff. When the API and worker run in separate
     # containers (Railway production) the file written above is invisible
@@ -2884,10 +3409,127 @@ async def _run_transcription_for_job(
 
     tmp_dir = tempfile.mkdtemp()
     tmp_path = audio_path
+    _vocal_stem = None   # demucs output path (lazy), cleaned up in finally
 
     try:
         lang = language.strip() if language.strip() else None
         loop = asyncio.get_event_loop()
+
+        # Progress emission helper. The render pipeline already writes
+        # current_step + progress so the frontend SSE/poll can render a
+        # multi-step UI; this gives the transcription pipeline the same
+        # surface. Labels are i18n keys the frontend maps to localised
+        # step names (`transcribe.prepare`, `.lyrics_lookup`,
+        # `.isolate_vocals`, `.verify`, `.align`, `.transcribe`,
+        # `.transcribe_word`, `.recover`, `.done`). Fire-and-forget via
+        # to_thread so a slow DB write never blocks the pipeline.
+        from jobs import update_job as _update_job
+        async def _step(label: str, pct: int):
+            try:
+                await asyncio.to_thread(
+                    _update_job, job_id, current_step=label, progress=pct,
+                )
+            except Exception as e:
+                logger.warning("[PROGRESS] %s/%d failed: %s", label, pct, e)
+        await _step("transcribe.prepare", 5)
+
+        # Vocal source separation (demucs) — LAZY. Previously demucs ran at the
+        # top of every job (~30-90s) regardless of which downstream engine
+        # actually needed the stem. On songs where lrclib synced verifies, no
+        # forced-align / whisperX call ever happens, so the stem was burned for
+        # nothing. The wrapper below runs demucs at most ONCE, on first request,
+        # and caches the result. If nothing calls it, demucs never runs and the
+        # job is 60-90s faster.
+        #
+        # The stem feeds FA / whisperX / verification ONLY — NOT the bare
+        # whisper-1 pass, which is more hallucination-prone on isolated vocals
+        # (long-form caveat, arXiv 2506.15514).
+        import vocal_sep
+        _stem_state = {"computed": False, "path": None}
+
+        # Final post-processing chain applied to EVERY return path so all
+        # timing sources (forced_align / whisperx / whisperx_reconciled /
+        # whisper-1 fallback) get the same polish:
+        #   1. split_long_segments — break >6s lines at biggest word gap
+        #      (only when per-word stamps are present; no-op otherwise)
+        #   2. beat_snap — snap starts to the song's beat grid (±200ms)
+        #   3. mark_repetitions — tag chorus loops with repetition_group
+        # See whisperx_transcribe.py, beat_snap.py, chorus_trim.py.
+        import beat_snap as _beat_snap
+        import chorus_trim as _chorus_trim
+        from whisperx_transcribe import _split_long_segments as _split_long
+        def _snap(segs):
+            return _chorus_trim.mark_repetitions(
+                _beat_snap.apply(tmp_path,
+                    _split_long(segs)
+                )
+            )
+
+        # ─── single chokepoint for every segments-bearing return ──────
+        # `_emit_segments` is the ONE allowed exit point of this
+        # function for any return that ships segments. It guarantees:
+        #   1. `source` is in `VALID_TIMING_SOURCES` (banishes Bug D —
+        #      the four fallback paths that historically returned
+        #      `timing_source=NULL`).
+        #   2. `set_timing_source(job_id, source)` is called ALWAYS.
+        #   3. `normalize_words` runs (banishes Bug B — FA wordstamps
+        #      with score get preserved, Whisper-1 raw words get
+        #      stripped; before, the tail return stripped ALL words
+        #      unconditionally).
+        #   4. `_snap` (split → beat-snap → chorus repetitions) runs.
+        #   5. Returns the canonical dict shape.
+        #
+        # Adding a new return path? Use `return _emit_segments(...)` —
+        # the AST regression test in `test_emit_segments.py` will fail
+        # if a raw `return {"segments": ...}` slips into this function.
+        from timing_sources import VALID_TIMING_SOURCES, WHISPER_RAW
+        from transcribe_postprocess import normalize_words as _normalize_words
+        from transcribe_postprocess import dedup_collisions as _dedup_collisions
+
+        def _emit_segments(segments, source, *,
+                            reference_lyrics: str = "",
+                            recovery_source=None,
+                            coverage_warning: bool = False,
+                            extra=None):
+            if source not in VALID_TIMING_SOURCES:
+                logger.error("[EMIT] invalid timing_source=%r — forcing %r "
+                             "(job=%s)", source, WHISPER_RAW, job_id)
+                source = WHISPER_RAW
+            try:
+                from jobs import set_timing_source
+                set_timing_source(job_id, source)
+            except Exception as e:  # set_timing_source already swallows; defensive
+                logger.warning("[EMIT] set_timing_source(%s, %s) raised: %s",
+                               job_id, source, e)
+            deduped = _dedup_collisions(segments)
+            if deduped and segments and len(deduped) != len(segments):
+                logger.info("[EMIT] deduped collisions: %d → %d segments (job=%s)",
+                            len(segments), len(deduped), job_id)
+            polished = _snap(_normalize_words(deduped))
+            out = {"job_id": job_id, "segments": polished,
+                   "reference_lyrics": reference_lyrics}
+            if recovery_source:
+                out["recovery_source"] = recovery_source
+            if coverage_warning:
+                out["coverage_warning"] = True
+            if extra:
+                out.update(extra)
+            return out
+
+        async def _get_align_audio() -> str:
+            """Return the path that alignment/transcription engines should read.
+            Lazy-separates the vocal stem on first call. Falls back to the mix
+            (`tmp_path`) when vocal_sep is disabled / fails."""
+            nonlocal _vocal_stem
+            if not _stem_state["computed"]:
+                _stem_state["computed"] = True
+                await _step("transcribe.isolate_vocals", 25)
+                stem = await asyncio.to_thread(vocal_sep.separate_vocals, tmp_path)
+                _stem_state["path"] = stem
+                _vocal_stem = stem
+                if stem:
+                    logger.info("[LYRICS] isolated vocal stem (lazy) — using for alignment/whisperX/verification")
+            return _stem_state["path"] or tmp_path
 
         # Resolve artist + title for the reference-lyrics fetch. Source order:
         #   1) explicit form fields (frontend already collects `artist` per
@@ -2927,7 +3569,8 @@ async def _run_transcription_for_job(
         #                          extended / remix versions are too risky
         #                          to auto-align)
         from pipeline import (
-            _fetch_lrclib, _lrc_to_segments, _audio_duration,
+            _fetch_lrclib, _fetch_lrclib_with_swap_retry,
+            _lrc_to_segments, _audio_duration,
             _slice_audio_prefix, _slice_audio_window, _verify_lrclib_alignment,
             _detect_hallucination, _synthesize_segments_from_plain,
             _align_whisper_to_plain, _fill_gaps_with_reference,
@@ -2935,126 +3578,668 @@ async def _run_transcription_for_job(
         # Short-lived DB session JUST for the lrclib cache lookup, released
         # immediately so the connection is free during the long Whisper /
         # Vertex work below (see the pool-starvation note in the docstring).
+        await _step("transcribe.lyrics_lookup", 15)
         with scoped_db() as _lrc_db:
-            lrc = await asyncio.to_thread(_fetch_lrclib, artist_hint, song_hint, _lrc_db)
+            lrc, _lrc_meta = await asyncio.to_thread(
+                _fetch_lrclib_with_swap_retry, artist_hint, song_hint, _lrc_db,
+            )
+        # Auto-correct inverted metadata: when the swap-retry hit, the upload
+        # had artist/title swapped (incident 2026-05-24 Viejas Locas /
+        # Legalícenla in staging — frontend parser assumes Title_Artist for
+        # underscore filenames, but most users name files Artist_Title).
+        # Persist the corrected order so the editor renders clean metadata,
+        # and update the local hints so Gemini grounding / log lines use the
+        # right values for the rest of this run. We use `update_job` (which
+        # owns its own short-lived session) instead of reopening scoped_db
+        # — same pool-starvation rationale as the lookup above.
+        if _lrc_meta.get("swapped"):
+            artist_hint = _lrc_meta["artist_used"]
+            song_hint = _lrc_meta["song_used"]
+            try:
+                from jobs import update_job as _update_job
+                _update_job(job_id, artist=artist_hint, song_title=song_hint)
+                logger.info("[LYRICS] auto-corrected swapped metadata for job %s: "
+                            "artist=%r song_title=%r", job_id, artist_hint, song_hint)
+            except Exception as e:
+                logger.warning("[LYRICS] metadata auto-correction persist failed: %s", e)
+
+        # Track which source the plain text came from (for the gap-driven
+        # re-fetch logic further down). lrclib first, fallbacks only if
+        # plain is empty. The 2026-05-25 incident showed lrclib can return
+        # *incomplete* plain (the canonical Legalícenla case had lrclib's
+        # `plain` populated but missing the intro chorus); for that case
+        # we don't refire fallbacks here — we let forced_align run, see
+        # the gaps in its output, and re-fetch THEN. See the
+        # "FA gap-driven re-fetch" block below `if fa_segs:`.
+        lyrics_source: str | None = "lrclib" if (lrc and (lrc.get("plain") or "").strip()) else None
+
+        # GENIUS FALLBACK (2026-05-25): when lrclib trae nothing OR trae
+        # only `synced` without `plain` and the synced is suspiciously
+        # short, try Genius as a second source. Genius's editorial
+        # curation produces more complete lyrics for mainstream catalogue
+        # (UMG/Sony/Warner releases) than lrclib's community uploads.
+        #
+        # Genius doesn't ship timestamps — we use it ONLY for text.
+        # forced_align will pin the timing against the audio as usual.
+        # If Genius also misses, fall through to Gemini (next block)
+        # and finally bare Whisper.
+        #
+        # We patch the lrc dict in place so downstream code (the FA path
+        # below, the synced path, the Whisper fallback) doesn't need to
+        # know which source we used. The `recovery_source` in the final
+        # _emit_segments will record `forced_align` either way; we log
+        # the source so post-mortems can trace back.
+        if not lrc or not (lrc.get("plain") or "").strip():
+            try:
+                import genius_fetch
+                if genius_fetch.is_enabled():
+                    with scoped_db() as _genius_db:
+                        genius_text = await asyncio.to_thread(
+                            genius_fetch.fetch_genius_plain,
+                            artist_hint, song_hint, _genius_db,
+                        )
+                    if genius_text:
+                        logger.info("[LYRICS] genius fallback hit for %r - %r (%d chars)",
+                                    artist_hint, song_hint, len(genius_text))
+                        if lrc is None:
+                            lrc = {}
+                        lrc["plain"] = genius_text
+                        lyrics_source = "genius"
+                        # synced stays None — Genius doesn't ship timestamps.
+                        # That's fine: forced_align takes plain text and the
+                        # audio, no synced needed.
+                    else:
+                        logger.info("[LYRICS] genius fallback found nothing for %r - %r",
+                                    artist_hint, song_hint)
+            except Exception as e:
+                logger.warning("[LYRICS] genius fallback raised: %s — continuing without it", e)
+
+        # GEMINI FALLBACK (2026-05-25, 3rd source): if both lrclib and
+        # Genius came up empty, try Gemini's grounded search as a third
+        # line of defence. Same shape as Genius — text only, no
+        # timestamps, forced_align does the timing.
+        #
+        # Why 3rd and not 2nd: Gemini is an LLM that can hallucinate
+        # entire stanzas on obscure tracks (no grounding hit → it
+        # invents). Genius's editorial DB has fewer false positives.
+        # Both are flagged behind their own kill switches so we can
+        # disable independently if either misbehaves.
+        #
+        # The existing `_fetch_lyrics_via_gemini_search` already caches
+        # to LyricsCache (same table Genius and lrclib use, separate
+        # keyspace) so subsequent fetches of the same song skip the
+        # API call.
+        if not lrc or not (lrc.get("plain") or "").strip():
+            try:
+                from pipeline import _fetch_lyrics_via_gemini_search
+                with scoped_db() as _gemini_db:
+                    gemini_text = await asyncio.to_thread(
+                        _fetch_lyrics_via_gemini_search,
+                        artist_hint, song_hint, job_id, _gemini_db,
+                    )
+                if gemini_text:
+                    logger.info("[LYRICS] gemini fallback hit for %r - %r (%d chars)",
+                                artist_hint, song_hint, len(gemini_text))
+                    if lrc is None:
+                        lrc = {}
+                    lrc["plain"] = gemini_text
+                    lyrics_source = "gemini"
+                else:
+                    logger.info("[LYRICS] gemini fallback found nothing for %r - %r",
+                                artist_hint, song_hint)
+            except Exception as e:
+                logger.warning("[LYRICS] gemini fallback raised: %s — continuing without it", e)
+
         if lrc:
             synced = lrc.get("synced")
             plain = lrc.get("plain") or ""
             lrc_dur = lrc.get("duration")
-            if synced:
-                user_dur = await asyncio.to_thread(_audio_duration, tmp_path)
-                offset = 0.0
-                use_synced = True
-                hybrid_intro_segs: list[dict] = []
-                if user_dur is not None and lrc_dur:
-                    diff = user_dur - lrc_dur
-                    # diff < 0 = user audio SHORTER than lrclib studio version.
-                    # Common cases: radio edit, album cut con fade-out
-                    # diferente, intro/outro trimmed. Hasta -15s el body de
-                    # la canción es idéntico — lrclib synced timestamps
-                    # siguen siendo válidos para las líneas que caen dentro
-                    # del audio del user. _lrc_to_segments ya clampa el `end`
-                    # del último segment a `audio_duration` (línea 1739-1742
-                    # de pipeline.py), así que líneas que caigan después del
-                    # final del audio quedan con end=audio_duration sin
-                    # romper nada. Caso real que motivó esto: Mujer Amante
-                    # Rata Blanca, user_dur=365.2, lrclib=374.0, diff=-8.8.
-                    # Antes caía a Whisper innecesariamente y mergeaba 2-en-1.
-                    if -15.0 <= diff <= 3.0:
-                        offset = 0.0
-                    elif 3.0 < diff <= 120.0:
-                        offset = float(diff)
-                        # User has extra audio at the start (typical "Official
-                        # Video" cut with a dialogue intro). Slice that chunk
-                        # and run Whisper on it so the operator gets the
-                        # spoken dialogue subtitled too — they can prune in
-                        # the editor if they don't want to publish it.
-                        intro_path = os.path.join(tmp_dir, "intro.mp3")
-                        if _slice_audio_prefix(tmp_path, intro_path, diff + 1.0):
-                            try:
-                                wsegs = await loop.run_in_executor(
-                                    None, transcribe, intro_path, lang, plain,
-                                )
-                                # Keep only segments that fully sit in the
-                                # intro window — defensive, in case ffmpeg
-                                # cut on a frame boundary slightly past `diff`.
-                                hybrid_intro_segs = [
-                                    s for s in wsegs if s["end"] <= diff + 0.5
-                                ]
-                            except Exception as e:
-                                logger.error("[LYRICS] intro Whisper failed: %s", e, exc_info=True)
-                            finally:
+
+            # Forced alignment (preferred when enabled): align the KNOWN
+            # lyrics to THIS audio at ±50ms instead of trusting lrclib's
+            # community timestamps (often drifted / missing lines — the
+            # Intoxicados case) or Whisper's loose timing. Falls back to
+            # the existing synced/Whisper logic on any failure.
+            #
+            # PR #299 WARM-START (2026-05-24, rev 2026-05-25):
+            #
+            # **REV: warm-start uses whisperX, NOT Whisper-1.**
+            #
+            # The original PR #299 launched Whisper-1 in parallel to FA
+            # to cut worst-case wallclock from ~16 min to ~6 min when
+            # Replicate degraded. That worked BUT quality dropped
+            # noticeably: when FA fails (e.g. `[1, 2, 0]` bug on
+            # certain audios), Whisper-1 standalone hallucinates
+            # ("sepa que sepa que sepa", repeticiones, líneas
+            # larguísimas) because it doesn't reconcile against the
+            # lrclib canonical text.
+            #
+            # World-class fix: use **whisperX** as the warm-start.
+            # whisperX gives word-level stamps that we then re-bucket
+            # against the lrclib plain text via
+            # `whisperx_reconcile.reconcile()` — that's timing from
+            # audio + text from reference = the same audio-as-truth
+            # promise PR-G made. NOT a degraded fallback.
+            #
+            # Cost trade-off: whisperX (~75-180s, $0.005) is more
+            # expensive than Whisper-1 (~15-30s, $0.003) but produces
+            # WorldClass output. Worth the ~$0.30/mo extra for UMG-grade
+            # quality vs hallucinated text.
+            #
+            # If whisperX ALSO fails (rare — different Replicate model
+            # than cureau, less likely to flake together), the original
+            # whisper-1 fallback path below kicks in as the true
+            # last-resort.
+            import forced_align
+            import whisperx_transcribe
+            if forced_align.is_enabled():
+                fa_text = plain or forced_align.lrc_to_plain_text(synced)
+                if fa_text and plain and whisperx_transcribe.is_enabled():
+                    await _step("transcribe.align", 55)
+                    _aa = await _get_align_audio()
+
+                    # Warm-start whisperX in parallel with FA. Both go
+                    # through Replicate but use DIFFERENT models
+                    # (cureau/force-align vs victor-upmeet/whisperx),
+                    # so a model-specific outage in one doesn't usually
+                    # affect the other. We pass the SAME stem path so
+                    # both align against the isolated vocals.
+                    async def _warm_whisperx():
+                        # Pass fa_text as initial_prompt — biases whisperX
+                        # towards the canonical lyrics, kills the
+                        # "Le realizan la" → "Legalícenla" mishear.
+                        return await asyncio.to_thread(
+                            whisperx_transcribe.transcribe_whisperx, _aa, lang,
+                            fa_text,
+                        )
+                    wx_warm_task = asyncio.create_task(_warm_whisperx())
+
+                    fa_segs = None
+                    try:
+                        fa_segs = await asyncio.to_thread(
+                            forced_align.forced_align_lyrics, _aa, fa_text,
+                        )
+                    except Exception as e:
+                        logger.warning("[LYRICS] forced_align raised: %s — using warm-start whisperX", e)
+
+                    if fa_segs:
+                        logger.info("[LYRICS] forced alignment used (%s lines, lrclib text) for %r - %r", len(fa_segs), artist_hint, song_hint)
+
+                        # FA GAP-DRIVEN RE-FETCH (2026-05-25, Option C):
+                        # the user asked the right question: "if lrclib
+                        # always wins when it has SOMETHING, the trilogy
+                        # of sources only matters when lrclib is fully
+                        # empty — what about when lrclib has incomplete
+                        # text?" That's the original Legalícenla
+                        # incident: lrclib's `plain` was non-empty but
+                        # MISSED the intro chorus.
+                        #
+                        # Strategy: let lrclib win the first round. Then
+                        # measure forced_align's output. If the FA result
+                        # has > GAP_REFETCH_THRESHOLD_S of suspicious
+                        # gaps (intro late + internal gaps), try Genius
+                        # and Gemini for a MORE COMPLETE version, re-run
+                        # FA, and use whichever has fewer gaps. Pays for
+                        # the extra round-trip (+ ~$0.007 FA + 75 s)
+                        # ONLY when there's a real problem to fix.
+                        #
+                        # No-op when:
+                        #   - The lyrics_source is already a fallback
+                        #     (we already tried Genius/Gemini once and
+                        #     it didn't help — re-trying would just spin)
+                        #   - The original FA result has minimal gaps
+                        #     (lrclib was already complete enough)
+                        GAP_REFETCH_THRESHOLD_S = 30.0
+                        _gap_threshold_inner = 15.0
+                        def _gap_score(segs) -> float:
+                            """Sum of gaps > threshold + intro-late penalty.
+                            INCIDENT 2026-05-25 (post-PR #312 audit): the
+                            original only handled positive gaps. When FA
+                            emits overlapping segments (`next.start <
+                            prev.end`, an aligner artefact common with
+                            repeated chorus lines), `gap` is NEGATIVE and
+                            was silently skipped. That meant a song with
+                            lots of overlaps scored 0 — re-fetch never
+                            fired even when forced_align was clearly
+                            confused. Now we treat overlaps > 500 ms as
+                            equally suspicious as a gap of the same size:
+                            both signal "the aligner is in trouble with
+                            this lyric source"."""
+                            if not segs:
+                                return 0.0
+                            s = sorted(segs, key=lambda x: float(x.get("start") or 0))
+                            score = 0.0
+                            first = float(s[0].get("start") or 0)
+                            if first > _gap_threshold_inner:
+                                score += first
+                            for p, n in zip(s, s[1:]):
+                                gap = float(n.get("start") or 0) - float(p.get("end") or 0)
+                                if gap > _gap_threshold_inner:
+                                    score += gap
+                                elif gap < -0.5:
+                                    # Overlap > 500 ms → signal of aligner stress.
+                                    score += abs(gap)
+                            return score
+
+                        gap_score_initial = _gap_score(fa_segs)
+                        if (gap_score_initial > GAP_REFETCH_THRESHOLD_S
+                                and lyrics_source == "lrclib"):
+                            logger.info(
+                                "[LYRICS] FA gap_score=%.1fs > %.0fs threshold "
+                                "— racing Genius + Gemini in parallel for more complete lyrics "
+                                "(current source=%s, %d chars)",
+                                gap_score_initial, GAP_REFETCH_THRESHOLD_S,
+                                lyrics_source, len(fa_text),
+                            )
+                            # INCIDENT 2026-05-25 (Legalícenla, job 9911c2f3ab16):
+                            # Genius returned 48 lines (vs lrclib 45) — just
+                            # +6 %, below the old +15 % threshold, so the
+                            # code declared "not worth re-running FA" AND
+                            # NEVER CALLED GEMINI (it was guarded behind
+                            # `if not better_text`). Gemini's grounded
+                            # search would have brought the intro chorus
+                            # block that both lrclib and Genius omit. Two
+                            # fixes in one block:
+                            #
+                            #   1) Race Genius + Gemini in PARALLEL — pick
+                            #      whichever returns more lines. Cost: one
+                            #      extra Gemini call (~$0.001), worth it
+                            #      vs the regression.
+                            #   2) Lower the re-run-FA threshold from +15 %
+                            #      to +5 %. The downstream gap_score check
+                            #      (must halve to adopt) already gates
+                            #      against bad alternates — the +15 % was
+                            #      double-gating and over-conservative.
+                            async def _try_genius():
                                 try:
-                                    os.unlink(intro_path)
-                                except OSError:
-                                    pass
-                        logger.info("[LYRICS] lrclib duration mismatch (user=%.1fs, lrclib=%.1fs) — +%.2fs offset on song; intro Whisper produced %s segments", user_dur, lrc_dur, offset, len(hybrid_intro_segs))
-                    else:
-                        use_synced = False
-                        logger.warning("[LYRICS] lrclib duration mismatch (user=%.1fs, lrclib=%.1fs, diff=%+.1fs) — too risky to auto-align, falling back to Whisper", user_dur, lrc_dur, diff)
-                if use_synced:
-                    song_segs = _lrc_to_segments(
-                        synced, lrc_dur, time_offset=offset,
-                    )
-                    # Alignment verification — when we applied an offset, we
-                    # have NO ground-truth that the offset is correct (the
-                    # extra audio could be at the end, not the start). Slice
-                    # ~5 s of the user's audio at where we claim a song line
-                    # starts, run Whisper, fuzzy-match. If the match is weak
-                    # (< 0.4), we don't trust the alignment and fall through
-                    # to plain + Whisper. Cost: 1 extra Whisper call on 5 s
-                    # of audio (~$0.0005) and ~3 s of latency.
-                    if offset > 0 and song_segs:
-                        # Verify mid-song (more robust than first line which
-                        # may be a short ad-lib like "¡Karol!")
-                        mid_idx = min(len(song_segs) - 1, len(song_segs) // 2)
-                        verify_seg = song_segs[mid_idx]
-                        # Skip verification if the chosen text is too short
-                        # to fuzzy-match reliably.
-                        if len(verify_seg["text"]) >= 10:
-                            confidence = await asyncio.to_thread(
-                                _verify_lrclib_alignment,
-                                tmp_path, verify_seg["text"], verify_seg["start"],
+                                    import genius_fetch
+                                    if not genius_fetch.is_enabled():
+                                        return None
+                                    with scoped_db() as _refetch_db:
+                                        gt = await asyncio.to_thread(
+                                            genius_fetch.fetch_genius_plain,
+                                            artist_hint, song_hint, _refetch_db,
+                                        )
+                                    return ("genius", gt) if gt else None
+                                except Exception as e:
+                                    logger.warning("[LYRICS] re-fetch Genius failed: %s", e)
+                                    return None
+
+                            async def _try_gemini():
+                                try:
+                                    from pipeline import _fetch_lyrics_via_gemini_search
+                                    with scoped_db() as _refetch_db:
+                                        gmt = await asyncio.to_thread(
+                                            _fetch_lyrics_via_gemini_search,
+                                            artist_hint, song_hint, job_id, _refetch_db,
+                                        )
+                                    return ("gemini", gmt) if gmt else None
+                                except Exception as e:
+                                    logger.warning("[LYRICS] re-fetch Gemini failed: %s", e)
+                                    return None
+
+                            genius_res, gemini_res = await asyncio.gather(
+                                _try_genius(), _try_gemini(),
                             )
-                            if confidence is not None:
-                                if confidence < 0.4:
-                                    logger.warning("[LYRICS] alignment verification FAILED (confidence=%.2f at t=%.1fs for %r) — falling back to Whisper+plain", confidence, verify_seg['start'], verify_seg['text'][:40])
-                                    use_synced = False
+
+                            # Score candidates by line count — more lines
+                            # = more coverage of intro/middle/outro chorus
+                            # repeats that both providers sometimes omit.
+                            # Ties go to Gemini (editorial > scraped).
+                            def _lines(t: str) -> int:
+                                return len([l for l in (t or "").splitlines() if l.strip()])
+                            candidates = [r for r in (genius_res, gemini_res) if r is not None]
+                            better_text: str | None = None
+                            better_source: str | None = None
+                            if candidates:
+                                candidates.sort(
+                                    key=lambda c: (_lines(c[1]), 1 if c[0] == "gemini" else 0),
+                                    reverse=True,
+                                )
+                                better_source, better_text = candidates[0]
+                                logger.info(
+                                    "[LYRICS] re-fetch parallel: genius=%s gemini=%s — picked %s (%d lines)",
+                                    f"{_lines(genius_res[1])}L" if genius_res else "miss",
+                                    f"{_lines(gemini_res[1])}L" if gemini_res else "miss",
+                                    better_source, _lines(better_text),
+                                )
+
+                            # Re-run FA if the new text has ≥ 5 % more
+                            # lines than lrclib (loosened from 15 %). The
+                            # gap_score halving check downstream still
+                            # gates adoption — so a marginal but
+                            # SUBSTANTIVELY-better source (Gemini bringing
+                            # the missing intro chorus block) gets
+                            # measured against gap reduction, not raw line
+                            # count.
+                            if better_text:
+                                orig_lines = len([l for l in (fa_text or "").splitlines() if l.strip()])
+                                new_lines = _lines(better_text)
+                                if new_lines > orig_lines * 1.05:
+                                    logger.info(
+                                        "[LYRICS] re-fetch from %s found %d lines (was %d, +%.0f%%) "
+                                        "— re-running FA",
+                                        better_source, new_lines, orig_lines,
+                                        (new_lines / max(1, orig_lines) - 1) * 100,
+                                    )
+                                    try:
+                                        new_fa_segs = await asyncio.to_thread(
+                                            forced_align.forced_align_lyrics, _aa, better_text,
+                                        )
+                                    except Exception as e:
+                                        logger.warning("[LYRICS] re-fetch FA retry raised: %s", e)
+                                        new_fa_segs = None
+                                    if new_fa_segs:
+                                        new_gap_score = _gap_score(new_fa_segs)
+                                        # Accept the new FA only if it
+                                        # halves the gap_score. Marginal
+                                        # improvements aren't worth the
+                                        # risk of switching to a different
+                                        # lyrics version of the song.
+                                        if new_gap_score < gap_score_initial * 0.5:
+                                            logger.info(
+                                                "[LYRICS] re-fetch IMPROVED: gap %.1fs → %.1fs, "
+                                                "%d → %d segs — adopting %s source",
+                                                gap_score_initial, new_gap_score,
+                                                len(fa_segs), len(new_fa_segs), better_source,
+                                            )
+                                            fa_segs = new_fa_segs
+                                            fa_text = better_text
+                                            lyrics_source = f"lrclib_then_{better_source}"
+                                        else:
+                                            logger.info(
+                                                "[LYRICS] re-fetch did NOT improve: gap %.1fs → %.1fs "
+                                                "— keeping lrclib result",
+                                                gap_score_initial, new_gap_score,
+                                            )
                                 else:
-                                    logger.info("[LYRICS] alignment verified (confidence=%.2f)", confidence)
-                            elif diff > 60.0:
-                                # High-diff offsets are riskier — if we can't
-                                # even verify, don't gamble; fall back.
-                                logger.warning("[LYRICS] alignment verification unavailable for high-diff offset (%.1fs) — falling back", diff)
-                                use_synced = False
-                    if use_synced and song_segs and len(song_segs) >= 8:
-                        from pipeline import (
-                            _filter_intro_song_overlap,
-                            _fix_lrc_first_line_at_zero,
+                                    logger.info(
+                                        "[LYRICS] re-fetch %s returned similar length (%d vs %d lines) "
+                                        "— not worth re-running FA",
+                                        better_source, new_lines, orig_lines,
+                                    )
+                            else:
+                                logger.info("[LYRICS] re-fetch: no better source found, keeping lrclib")
+
+                        # GAP RESCUE (2026-05-25, rev 2): lrclib's community-
+                        # curated lyrics OMIT chorus repeats at both ENDS and
+                        # in the MIDDLE of songs whose chorus repeats many
+                        # times. Forced-align honours the text it gets, so
+                        # every omitted chorus block becomes a gap in the
+                        # FA output.
+                        #
+                        # Original PR #307 only rescued the INTRO. The
+                        # "Legalícenla" review on 2026-05-25 showed that
+                        # the body also had 25-s gaps between FA segments
+                        # where lrclib omitted entire chorus blocks. Same
+                        # symptom, different position. This rev sweeps
+                        # EVERY gap (intro + body) > GAP_THRESHOLD_S.
+                        #
+                        # For each gap we ask whisperX what it transcribed
+                        # in that window, filter for hallucinations + the
+                        # "stuck-phoneme" repetitive pattern (the canonical
+                        # "Le realizan la × 3" failure that ate the intro
+                        # of Legalícenla after PR #307 shipped), and merge
+                        # into fa_segs. `dedup_collisions` in
+                        # `_emit_segments` catches any rescued line that
+                        # happens to duplicate an FA line.
+                        GAP_THRESHOLD_S = 15.0
+                        GAP_BUFFER_S = 1.0
+                        from transcribe_postprocess import (
+                            filter_rescue_candidates,
+                            is_suspiciously_repetitive,
                         )
-                        hybrid_intro_segs, _dup = _filter_intro_song_overlap(
-                            hybrid_intro_segs, song_segs,
+
+                        # Always await the warm whisperX result now (we
+                        # need it to fill the gaps even when FA wins on
+                        # the lines lrclib provided).
+                        try:
+                            wx_intro_segs = await wx_warm_task
+                        except Exception as e:
+                            logger.warning("[LYRICS] gap-rescue whisperX await failed: %s", e)
+                            wx_intro_segs = None
+
+                        # Enumerate every gap > threshold. The first one
+                        # is the intro (0 → first_fa_start). The middle
+                        # ones are between consecutive FA segments. We
+                        # skip the tail gap (after the last FA seg) —
+                        # songs end with instrumental outros all the time,
+                        # rescuing there is more likely to produce
+                        # hallucinations than truth.
+                        fa_sorted = sorted(
+                            (dict(s) for s in fa_segs),
+                            key=lambda s: float(s.get("start") or 0),
                         )
-                        if _dup:
-                            logger.info("[LYRICS] discarded %s intro seg(s) as song-line hallucinations", _dup)
-                        # Only apply the gap-based first-line correction
-                        # when we don't have an intro Whisper pass to
-                        # cover the pre-vocal region — otherwise the
-                        # intro segments naturally sit before line 1 and
-                        # there's no anomaly to fix.
-                        if not hybrid_intro_segs:
-                            song_segs, _moved = _fix_lrc_first_line_at_zero(
-                                song_segs, audio_duration=user_dur,
+                        gaps: list[tuple[float, float]] = []
+                        first_start = float(fa_sorted[0].get("start") or 0)
+                        if first_start > GAP_THRESHOLD_S:
+                            gaps.append((0.0, first_start))
+                        for prev_seg, next_seg in zip(fa_sorted, fa_sorted[1:]):
+                            g_start = float(prev_seg.get("end") or 0)
+                            g_end = float(next_seg.get("start") or 0)
+                            if g_end - g_start > GAP_THRESHOLD_S:
+                                gaps.append((g_start, g_end))
+
+                        rescued_total: list = []
+                        if gaps and wx_intro_segs:
+                            try:
+                                from pipeline import _filter_whisper_hallucinations
+                            except Exception as e:
+                                logger.warning("[LYRICS] gap-rescue: could not import hallucination filter (%s)", e)
+                                _filter_whisper_hallucinations = lambda s: (s, 0)  # noqa: E731
+
+                            for g_start, g_end in gaps:
+                                cand = filter_rescue_candidates(
+                                    wx_intro_segs,
+                                    start_s=g_start,
+                                    end_s=g_end,
+                                    buffer_s=GAP_BUFFER_S,
+                                )
+                                if not cand:
+                                    continue
+                                try:
+                                    cand, _drops = _filter_whisper_hallucinations(cand)
+                                except Exception as e:
+                                    logger.warning("[LYRICS] gap-rescue hallucination filter failed: %s", e)
+                                # Pass `fa_text` as reference: if the
+                                # repeated tokens appear in the canonical
+                                # lyrics (e.g. "Legalícenla / Legalícenla
+                                # / Legalícenla / Oh-oh-oh" repeats
+                                # verbatim in lrclib), the repetition is
+                                # a legitimate chorus — NOT hallucination.
+                                # See `is_suspiciously_repetitive` docstring
+                                # for the INCIDENT 2026-05-25 #2 details.
+                                if cand and is_suspiciously_repetitive(cand, reference_text=fa_text):
+                                    # INCIDENT 2026-05-25 #3 (Legalícenla,
+                                    # UMG dry-run): the guard correctly
+                                    # detects "Le realizan la × 3" as
+                                    # whisperX hallucination, BUT
+                                    # discarding `cand` loses the only
+                                    # signal we had for WHERE the intro
+                                    # chorus is in time. PROD (no guard)
+                                    # emitted "Le realizan la" segments
+                                    # with correct 0:17/0:19/0:21
+                                    # timestamps — bad text, good timing.
+                                    # Staging dropped them — no text, no
+                                    # timing — and the user lost the
+                                    # whole intro chorus.
+                                    #
+                                    # HYBRID FALLBACK: if the rejected
+                                    # gap is the INTRO ([0, first_fa])
+                                    # AND the canonical lyrics start with
+                                    # text not in fa_segs (= chorus lines
+                                    # lrclib synced omitted), keep the
+                                    # whisperX TIMESTAMPS but REPLACE
+                                    # their text with the canonical
+                                    # lyrics. Best of both: PROD-grade
+                                    # timing accuracy + correct text.
+                                    is_intro_gap = (g_start <= 0.5)
+                                    rescued_hybrid = []
+                                    if is_intro_gap:
+                                        fa_texts_norm = {
+                                            (s.get("text") or "").strip().lower()
+                                            for s in fa_segs
+                                        }
+                                        plain_lines = [
+                                            l.strip()
+                                            for l in (fa_text or "").splitlines()
+                                            if l.strip()
+                                        ]
+                                        intro_text_lines: list[str] = []
+                                        for ln in plain_lines:
+                                            if ln.lower() in fa_texts_norm:
+                                                break
+                                            intro_text_lines.append(ln)
+                                        if intro_text_lines:
+                                            for c, txt in zip(cand, intro_text_lines):
+                                                rescued_hybrid.append({
+                                                    **c,
+                                                    "text": txt,
+                                                })
+                                    if rescued_hybrid:
+                                        rescued_total.extend(rescued_hybrid)
+                                        logger.info(
+                                            "[LYRICS] gap-rescue HYBRID for [%.1f,%.1f]: kept %d whisperX timestamps + canonical text (guard rejected hallucinated text, preserved timing)",
+                                            g_start, g_end, len(rescued_hybrid),
+                                        )
+                                    else:
+                                        logger.warning("[LYRICS] gap-rescue REJECTED for [%.1f,%.1f]: stuck-phoneme hallucination (%d lines, no ref match)",
+                                                       g_start, g_end, len(cand))
+                                    continue
+                                if cand:
+                                    rescued_total.extend(cand)
+                                    logger.info("[LYRICS] gap-rescue [%.1f,%.1f]: +%d line(s)",
+                                                g_start, g_end, len(cand))
+
+                        # Sort the union by start so the editor list is
+                        # chronological. dedup_collisions in
+                        # `_emit_segments` cleans up any overlap that
+                        # slipped through.
+                        merged = sorted(
+                            rescued_total + list(fa_segs),
+                            key=lambda s: float(s.get("start") or 0),
+                        )
+
+                        from timing_sources import FORCED_ALIGN
+                        return _emit_segments(
+                            merged,
+                            FORCED_ALIGN,
+                            reference_lyrics=fa_text,
+                            recovery_source=(
+                                "forced_align+gap_rescue" if rescued_total
+                                else "forced_align"
+                            ),
+                        )
+
+                    # FA failed / non-retryable / timed out. Use the
+                    # warm-start whisperX result (likely done by now —
+                    # whisperX is ~75-180s, FA budget is 480s). Reconcile
+                    # against lrclib plain text so the OUTPUT IS WORLDCLASS:
+                    # whisperX gives word-level timing pinned to the audio
+                    # + lrclib plain gives canonical text (no hallucinations).
+                    try:
+                        wx_warm_segs = await wx_warm_task
+                        if wx_warm_segs and len(wx_warm_segs) >= 2:
+                            from pipeline import _filter_whisper_hallucinations
+                            wx_warm_segs, _ = _filter_whisper_hallucinations(wx_warm_segs)
+                            # INCIDENT 2026-05-25 (post-PR #308): the
+                            # `is_suspiciously_repetitive` guard was applied
+                            # ONLY in the gap_rescue branch above. The
+                            # FA-failed → whisperX standalone path didn't
+                            # have it, so a Legalícenla retry showed
+                            # ["Le realizan la"] × 4 at the top of the
+                            # transcription. Same guard, same rationale —
+                            # apply it here too. If reconcile fails AND
+                            # raw whisperX looks like a stuck-phoneme
+                            # hallucination, refuse to emit it; the
+                            # whisper-1 fallback path below takes over.
+                            from transcribe_postprocess import is_suspiciously_repetitive
+                            if is_suspiciously_repetitive(wx_warm_segs, reference_text=fa_text):
+                                logger.warning("[LYRICS] FA failed AND warm-start whisperX is stuck on a phoneme pattern (%d near-identical lines, no ref match) — refusing to emit, falling to whisper-1",
+                                               len(wx_warm_segs))
+                            else:
+                                import whisperx_reconcile
+                                _reconciled = whisperx_reconcile.reconcile(wx_warm_segs, fa_text) if fa_text else None
+                                final_segs = _reconciled if _reconciled else wx_warm_segs
+                                _src_tag_str = "whisperx_reconciled" if _reconciled else "whisperx"
+                                logger.info("[LYRICS] FA failed — warm-start whisperX took over with %s segments [%s]",
+                                            len(final_segs), _src_tag_str)
+                                from timing_sources import WHISPERX_RECONCILED, WHISPERX
+                                return _emit_segments(
+                                    final_segs,
+                                    WHISPERX_RECONCILED if _reconciled else WHISPERX,
+                                    reference_lyrics=fa_text if _reconciled else "",
+                                )
+                    except Exception as e:
+                        logger.warning("[LYRICS] warm-start whisperX also failed: %s — falling through to whisper-1", e)
+                    # Both FA + warm whisperX failed — continue to the
+                    # whisper-1 last-resort path below.
+                elif fa_text:
+                    # `synced` without `plain` — no warm-start path, run FA solo.
+                    await _step("transcribe.align", 55)
+                    _aa = await _get_align_audio()
+                    fa_segs = await asyncio.to_thread(
+                        forced_align.forced_align_lyrics, _aa, fa_text,
+                    )
+                    if fa_segs:
+                        logger.info("[LYRICS] forced alignment used (%s lines, synced-only path) for %r - %r", len(fa_segs), artist_hint, song_hint)
+                        from timing_sources import FORCED_ALIGN
+                        return _emit_segments(
+                            fa_segs, FORCED_ALIGN,
+                            reference_lyrics=fa_text,
+                            recovery_source="forced_align",
+                        )
+            # WORLD-CLASS audio-as-truth principle (Rotor architecture):
+            # lrclib provides TEXT, never timing. Synced timestamps in lrclib are
+            # community-curated and can be globally mis-aligned to a specific
+            # master (incident "Cosas Mías": lrclib placed the first line at
+            # 49.4s while the user's audio sang it ~35s earlier; verify at 0.54
+            # confidence was borderline-accepted by the old threshold). We
+            # ELIMINATED that path. When lrclib has text but forced-align
+            # didn't succeed above (or wasn't enabled), try whisperX next —
+            # the AUDIO decides timing, lrclib only contributes canonical
+            # text via reconcile.
+            if synced or plain:
+                import whisperx_transcribe
+                if whisperx_transcribe.is_enabled():
+                    await _step("transcribe.transcribe_word", 70)
+                    _aa = await _get_align_audio()
+                    fa_text_for_wx = plain or forced_align.lrc_to_plain_text(synced)
+                    # Pass reference text as initial_prompt (anti-hallucination)
+                    wx_segs = await asyncio.to_thread(
+                        whisperx_transcribe.transcribe_whisperx, _aa, lang,
+                        fa_text_for_wx,
+                    )
+                    if wx_segs:
+                        from pipeline import _filter_whisper_hallucinations as _fwh
+                        wx_segs, _ = _fwh(wx_segs)
+                        _wx_dur = await asyncio.to_thread(_audio_duration, tmp_path)
+                        _hall, _why = _detect_hallucination(wx_segs, _wx_dur, language=lang)
+                        # Same is_suspiciously_repetitive guard as above:
+                        # whisperX standalone can latch onto a phoneme
+                        # pattern and emit the same garbage line N times.
+                        # `_detect_hallucination` catches some shapes but
+                        # not this one (the lines look plausible
+                        # individually; the bug is the repetition).
+                        from transcribe_postprocess import is_suspiciously_repetitive as _suspicious
+                        if _suspicious(wx_segs, reference_text=fa_text_for_wx):
+                            logger.warning("[LYRICS] lrclib-text whisperX path: stuck-phoneme hallucination detected (%d near-identical lines, no ref match) — falling through",
+                                           len(wx_segs))
+                        elif not _hall and len(wx_segs) >= 2:
+                            # Reconcile: whisperX timing + lrclib canonical text
+                            import whisperx_reconcile
+                            _reconciled = whisperx_reconcile.reconcile(wx_segs, fa_text_for_wx) if fa_text_for_wx else None
+                            final_segs = _reconciled if _reconciled else wx_segs
+                            from timing_sources import WHISPERX_RECONCILED, WHISPERX
+                            _src_tag = WHISPERX_RECONCILED if _reconciled else WHISPERX
+                            logger.info("[LYRICS] lrclib-text fallback via whisperX — %s segments [%s]", len(final_segs), _src_tag)
+                            return _emit_segments(
+                                final_segs, _src_tag,
+                                reference_lyrics=fa_text_for_wx if _reconciled else "",
                             )
-                            if _moved is not None:
-                                logger.info("[LYRICS] lrclib line 1 was anchored at 0s with a long gap to line 2; shifted to %.2fs based on median cadence", _moved)
-                        combined = hybrid_intro_segs + song_segs
-                        logger.info("[LYRICS] lrclib synced hit — %s segments (%s intro + %s song), skipping main Whisper for %r - %r", len(combined), len(hybrid_intro_segs), len(song_segs), artist_hint, song_hint)
-                        return {
-                            "job_id": job_id,
-                            "segments": combined,
-                            "reference_lyrics": plain or synced,
-                        }
+                        else:
+                            logger.warning("[LYRICS] lrclib-text whisperX rejected (%s) — falling through to plain+Whisper", _why or "thin")
+
             # No synced (or too few segments / unreliable timestamps) — but
             # we still have plain text from lrclib. Use it as the reference
             # so the editor's suggestion engine fires, and skip the Gemini-
@@ -3117,49 +4302,74 @@ async def _run_transcription_for_job(
                 # output so the operator sees the dialogue subtitled at
                 # 0:00–intro_offset and the song body subtitled
                 # afterwards.
-                if intro_offset > 0:
-                    intro_path = os.path.join(tmp_dir, "intro_only.mp3")
-                    if await asyncio.to_thread(
-                        _slice_audio_prefix, tmp_path, intro_path,
-                        intro_offset + 1.0,
-                    ):
-                        try:
-                            intro_segs_raw = await loop.run_in_executor(
-                                None, transcribe, intro_path, lang, plain,
-                            )
-                            # Keep only segments that fully sit in the
-                            # intro window; defensive against ffmpeg
-                            # frame-boundary slop.
-                            intro_segments = [
-                                s for s in intro_segs_raw
-                                if s["end"] <= intro_offset + 0.5
-                            ]
-                            logger.info("[LYRICS] intro Whisper produced %s segment(s) for the %.0fs dialogue prefix", len(intro_segments), intro_offset)
-                        except Exception as e:
-                            logger.error("[LYRICS] intro Whisper failed: %s", e, exc_info=True)
-                        finally:
-                            try:
-                                os.unlink(intro_path)
-                            except OSError:
-                                pass
-
-                # When LRCLIB_PLAIN_ALIGNER_ENABLED, request word-level
-                # timestamps so we can re-bucket Whisper's output against
-                # LRCLib's curated line structure (see aligner pass below).
-                # Default off — flip via env for staged rollout.
+                #
+                # PARALELIZATION (PR #298, 2026-05-24): intro Whisper and
+                # body Whisper used to run SERIALLY here — intro completed
+                # (~10-15 s) and only then body started (~30-60 s). On
+                # tracks with an intro, the user paid for the full sum.
+                # Now we launch both as `asyncio.create_task` and
+                # `asyncio.gather` them. Trade-off: 2 OpenAI Whisper-1
+                # calls concurrent on this path (only fires when
+                # lrclib-plain hit AND intro_offset > 0 — rare). Cost
+                # impact is negligible (~$0.005 extra per fire), latency
+                # reduction is ~10-15 s per affected job.
                 aligner_enabled = (
                     os.environ.get("LRCLIB_PLAIN_ALIGNER_ENABLED", "0")
                     .strip().lower() in ("1", "true", "yes", "on", "y", "t")
                 )
-                try:
-                    segments = await loop.run_in_executor(
+                await _step("transcribe.transcribe", 50)
+
+                intro_path = None
+                intro_path_to_clean = None
+                if intro_offset > 0:
+                    intro_path_candidate = os.path.join(tmp_dir, "intro_only.mp3")
+                    if await asyncio.to_thread(
+                        _slice_audio_prefix, tmp_path, intro_path_candidate,
+                        intro_offset + 1.0,
+                    ):
+                        intro_path = intro_path_candidate
+                        intro_path_to_clean = intro_path_candidate
+
+                async def _run_intro_whisper():
+                    if not intro_path:
+                        return []
+                    try:
+                        raw = await loop.run_in_executor(
+                            None, transcribe, intro_path, lang, plain,
+                        )
+                        # Keep only segments that fully sit in the intro
+                        # window; defensive against ffmpeg frame-boundary
+                        # slop.
+                        kept = [s for s in raw if s["end"] <= intro_offset + 0.5]
+                        logger.info("[LYRICS] intro Whisper produced %s segment(s) for the %.0fs dialogue prefix", len(kept), intro_offset)
+                        return kept
+                    except Exception as e:
+                        logger.error("[LYRICS] intro Whisper failed: %s", e, exc_info=True)
+                        return []
+
+                async def _run_body_whisper():
+                    return await loop.run_in_executor(
                         None,
                         lambda: transcribe(
                             transcribe_path, lang, plain,
                             return_words=aligner_enabled,
                         ),
                     )
+
+                try:
+                    # gather() preserves order: intro_segments first, body
+                    # second. exceptions surface as their respective
+                    # default fallbacks (intro→[], body→propagates).
+                    intro_segments, segments = await asyncio.gather(
+                        _run_intro_whisper(),
+                        _run_body_whisper(),
+                    )
                 finally:
+                    if intro_path_to_clean:
+                        try:
+                            os.unlink(intro_path_to_clean)
+                        except OSError:
+                            pass
                     if trimmed_path:
                         try:
                             os.unlink(trimmed_path)
@@ -3250,13 +4460,13 @@ async def _run_transcription_for_job(
                             logger.info("[LYRICS] discarded %s intro seg(s) as song-line hallucinations (recovery)", _dup)
                         combined = intro_segments + recovered
                         logger.warning("[LYRICS] hallucination detected (%s) — auto-recovered with %s lines from lrclib plain (%s time anchors, start=%.1fs, dur=%.1fs) + %s intro-Whisper segment(s)", reason, len(recovered), len(anchors), intro_offset, user_dur, len(intro_segments))
-                        return {
-                            "job_id": job_id,
-                            "segments": combined,
-                            "reference_lyrics": plain,
-                            "coverage_warning": True,
-                            "recovery_source": "lrclib_plain",
-                        }
+                        from timing_sources import WHISPER_LRCLIB_REC
+                        return _emit_segments(
+                            combined, WHISPER_LRCLIB_REC,
+                            reference_lyrics=plain,
+                            recovery_source="lrclib_plain",
+                            coverage_warning=True,
+                        )
                 # Happy path: Whisper returned plausibly-many segments.
                 # Combine intro Whisper (if any) with the body output.
                 from pipeline import _filter_intro_song_overlap
@@ -3270,7 +4480,10 @@ async def _run_transcription_for_job(
                 combined, _dropped = _filter_whisper_hallucinations(combined)
                 if _dropped:
                     logger.warning("[TRANSCRIBE] dropped %s Whisper hallucination phrase(s)", _dropped)
-                return {"job_id": job_id, "segments": combined, "reference_lyrics": plain}
+                from timing_sources import WHISPER_LRCLIB
+                return _emit_segments(
+                    combined, WHISPER_LRCLIB, reference_lyrics=plain,
+                )
 
         # Kick off Gemini-grounded lyrics fetch in parallel with Whisper.
         # The fetcher is best-effort (returns None on any failure); we wrap
@@ -3295,7 +4508,18 @@ async def _run_transcription_for_job(
             _bg_fetch_lyrics, artist_hint, song_hint,
         ))
 
-        segments = await loop.run_in_executor(None, transcribe, tmp_path, lang)
+        # When the plain-lyrics aligner is enabled, request word-level
+        # timestamps so we can re-bucket Whisper's output against the
+        # Gemini/lyrics.ovh reference's line structure (aligner pass below).
+        # Same flag the lrclib-hit path uses. Default off.
+        aligner_enabled = (
+            os.environ.get("LRCLIB_PLAIN_ALIGNER_ENABLED", "0")
+            .strip().lower() in ("1", "true", "yes", "on", "y", "t")
+        )
+        segments = await loop.run_in_executor(
+            None,
+            lambda: transcribe(tmp_path, lang, return_words=aligner_enabled),
+        )
 
         # Wait up to 2s after Whisper finishes for Gemini to complete.
         reference = ""
@@ -3346,6 +4570,116 @@ async def _run_transcription_for_job(
         # same "good prefix + bad body" pattern.
         if reference:
             user_dur = await asyncio.to_thread(_audio_duration, tmp_path)
+
+            # Forced alignment (preferred when enabled): align the Gemini/
+            # lyrics.ovh reference to THIS audio at ±50ms. Falls back to the
+            # Whisper-word aligner / gap-fill below on any failure.
+            import forced_align
+            if forced_align.is_enabled():
+                await _step("transcribe.align", 55)
+                _aa = await _get_align_audio()
+                fa_segs = await asyncio.to_thread(
+                    forced_align.forced_align_lyrics, _aa, reference,
+                )
+                if fa_segs:
+                    logger.info("[LYRICS] forced alignment used (%s lines, gemini text)", len(fa_segs))
+                    from timing_sources import FORCED_ALIGN
+                    return _emit_segments(
+                        fa_segs, FORCED_ALIGN,
+                        reference_lyrics=reference,
+                        recovery_source="forced_align",
+                    )
+
+            # WhisperX fallback — Rotor-grade audio-as-truth path. When
+            # forced-align failed but Gemini gave reference text, transcribe
+            # the audio directly with whisperX instead of cascading through
+            # Whisper-1 + hallucination recovery that ends in uniform 7s
+            # distribution. Incident "El Arbol De La Vida / Voy A Dejarte"
+            # (Viejas Locas): forced-align Replicate rejected the audio with
+            # `[1, 2, 0]` tensor error, Whisper-1 hallucinated "Música de
+            # presentación" 346s/3 words, recovery distributed 48 lines
+            # uniformly. WhisperX (verified live against the same audio)
+            # returns word-level segments matching Rotor's output (first
+            # vocal at 53.27s vs Rotor's 53.01s). When whisperX returns a
+            # clean result we adopt ITS text — its transcription is usually
+            # cleaner than Gemini's pre-chunked plain (different sources
+            # phrase line-breaks differently; whisperX follows the audio).
+            import whisperx_transcribe
+            if whisperx_transcribe.is_enabled():
+                await _step("transcribe.transcribe_word", 70)
+                _aa = await _get_align_audio()
+                # Pass `reference` (Gemini/lyrics.ovh text) as initial_prompt
+                wx_segs = await asyncio.to_thread(
+                    whisperx_transcribe.transcribe_whisperx, _aa, lang,
+                    reference,
+                )
+                if wx_segs:
+                    from pipeline import _filter_whisper_hallucinations as _fwh
+                    wx_segs, _ = _fwh(wx_segs)
+                    _hall, _why = _detect_hallucination(wx_segs, user_dur, language=lang)
+                    # 3rd whisperX path — same `is_suspiciously_repetitive`
+                    # guard as the other two. Catches the stuck-phoneme
+                    # pattern that `_detect_hallucination` misses.
+                    from transcribe_postprocess import is_suspiciously_repetitive as _suspicious
+                    if _suspicious(wx_segs, reference_text=reference):
+                        logger.warning("[LYRICS] gemini-FA whisperX fallback: stuck-phoneme hallucination detected (%d near-identical lines, no ref match) — falling through",
+                                       len(wx_segs))
+                    elif not _hall and len(wx_segs) >= 2:
+                        # RECONCILIATION: whisperX gave us word-level timing
+                        # pinned to the audio; reference (Gemini/lrclib) gives
+                        # us curated text with clean line breaks. Re-bucket
+                        # whisperX words into reference lines to get TEXT
+                        # from reference + TIMING from whisperX (better than
+                        # either alone — this beats Rotor on the text side).
+                        import whisperx_reconcile
+                        _reconciled = whisperx_reconcile.reconcile(wx_segs, reference)
+                        final_segs = _reconciled if _reconciled else wx_segs
+                        from timing_sources import WHISPERX_RECONCILED, WHISPERX
+                        _source_tag = WHISPERX_RECONCILED if _reconciled else WHISPERX
+                        logger.info("[LYRICS] whisperX took over (gemini-FA fallback) — %s segments [%s]", len(final_segs), _source_tag)
+                        return _emit_segments(
+                            final_segs, _source_tag,
+                            reference_lyrics=reference if _reconciled else "",
+                        )
+                    else:
+                        logger.warning("[LYRICS] whisperX rejected at gemini-FA fallback (%s) — falling through", _why or "thin")
+
+            # Plain-lyrics aligner on the Gemini/lyrics.ovh reference —
+            # mirrors the lrclib-hit path. Whisper merges/splits lines by
+            # audio pauses, which on live recordings (crowd, reverb)
+            # collapses ~50 sung lines into ~19 long segments. The aligner
+            # keeps the reference's curated line boundaries and pulls timing
+            # from the first/last Whisper word in each matched span. Behind
+            # LRCLIB_PLAIN_ALIGNER_ENABLED; replaces only when coverage is
+            # high enough, else falls through to the gap-fill recovery.
+            if aligner_enabled:
+                try:
+                    from lrclib_aligner import align_lrclib_to_whisper
+                    ref_lines = sum(
+                        1 for ln in reference.splitlines() if ln.strip()
+                    )
+                    # keep_unmatched: insert the lines Whisper missed in
+                    # place (interpolated timing + review flag) so the
+                    # operator nudges/deletes instead of re-typing.
+                    aligned = align_lrclib_to_whisper(
+                        reference, segments,
+                        keep_unmatched=True, total_duration=user_dur,
+                    )
+                    # Coverage is judged on CONFIDENT matches only (lines
+                    # without the review flag), not the interpolated ones.
+                    matched = sum(1 for s in aligned if not s.get("review"))
+                    review = len(aligned) - matched
+                    coverage = matched / ref_lines if ref_lines else 0.0
+                    if coverage >= 0.5 and matched >= 8:
+                        logger.info("[LYRICS] aligner (gemini): %s/%s lines matched (%.0f%% coverage), %s inserted for review — replacing Whisper segmentation", matched, ref_lines, coverage * 100, review)
+                        segments = aligned
+                    else:
+                        logger.warning("[LYRICS] aligner (gemini): low coverage (%s/%s = %.0f%%) — keeping raw Whisper, trying hallucination recovery", matched, ref_lines, coverage * 100)
+                except Exception as e:
+                    # Opt-in and conservative: any aligner failure must NOT
+                    # break the existing pipeline.
+                    logger.error("[LYRICS] aligner (gemini) error: %r — keeping raw Whisper segments", e, exc_info=True)
+
             hallucinated, reason = _detect_hallucination(segments, user_dur, language=lang)
             if hallucinated and user_dur:
                 merged = _fill_gaps_with_reference(
@@ -3360,19 +4694,91 @@ async def _run_transcription_for_job(
                            [r.strip() for r in (reference or "").splitlines() if r.strip()]
                     )
                     logger.warning("[LYRICS] hallucination detected on fallback path (%s) — gap-fill produced %s segments from %s (~%s kept-Whisper, %s synthesized, dur=%.1fs)", reason, len(merged), src, plausible_count, len(merged) - plausible_count, user_dur)
-                    return {
-                        "job_id": job_id,
-                        "segments": merged,
-                        "reference_lyrics": reference,
-                        "coverage_warning": True,
-                        "recovery_source": src,
-                    }
+                    from timing_sources import WHISPER_GEMINI_REC
+                    return _emit_segments(
+                        merged, WHISPER_GEMINI_REC,
+                        reference_lyrics=reference,
+                        recovery_source=src,
+                        coverage_warning=True,
+                    )
+
+        # No-lyrics path — the audio is the only source of truth. Prefer
+        # whisperX (Whisper large-v2 + wav2vec2 alignment + VAD) over the
+        # whisper-1 segments above: word-level <100ms timing and far less
+        # prone to the single-mega-segment hallucination. Behind
+        # WHISPERX_ENABLED; falls back to whisper-1 on None / if the result
+        # still looks hallucinated. Returns word stamps (persisted for a
+        # future word-level editor).
+        if not reference:
+            import whisperx_transcribe
+            if whisperx_transcribe.is_enabled():
+                await _step("transcribe.transcribe_word", 70)
+                _aa = await _get_align_audio()
+                wx_segs = await asyncio.to_thread(
+                    whisperx_transcribe.transcribe_whisperx, _aa, lang,
+                )
+                if wx_segs:
+                    from pipeline import _filter_whisper_hallucinations as _fwh
+                    wx_segs, _ = _fwh(wx_segs)
+                    _wx_dur = await asyncio.to_thread(_audio_duration, tmp_path)
+                    _hall, _why = _detect_hallucination(wx_segs, _wx_dur, language=lang)
+                    if not _hall and len(wx_segs) >= 2:
+                        logger.info("[LYRICS] whisperX no-lyrics path — %s segments (word-level)", len(wx_segs))
+                        from timing_sources import WHISPERX
+                        return _emit_segments(
+                            wx_segs, WHISPERX, reference_lyrics="",
+                        )
+                    logger.warning("[LYRICS] whisperX result rejected (%s) — keeping whisper-1", _why or "thin")
 
         from pipeline import _filter_whisper_hallucinations
         segments, _dropped = _filter_whisper_hallucinations(segments)
         if _dropped:
             logger.warning("[TRANSCRIBE] dropped %s Whisper hallucination phrase(s)", _dropped)
-        return {"job_id": job_id, "segments": segments, "reference_lyrics": reference}
+        # Safety net: with the aligner flag on but no usable reference (or
+        # low coverage), split over-long Whisper segments by their word
+        # timestamps so live/instrumental mega-lines don't reach the editor.
+        # No-op on already-aligned segments (they carry no `words`).
+        if aligner_enabled:
+            from lrclib_aligner import split_long_segments_by_words
+            _before = len(segments)
+            segments = split_long_segments_by_words(segments)
+            if len(segments) != _before:
+                logger.info("[LYRICS] length-split: %s → %s segments", _before, len(segments))
+        # Final fallback path: no reference, no whisperX usable. The
+        # `_emit_segments` chokepoint runs `normalize_words` which keeps
+        # any FA word-stamps (score present) and strips Whisper-1 raw
+        # words (no score) — replaces the previous unconditional strip
+        # that broke karaoke (Bug B).
+        from timing_sources import WHISPER_RAW
+        return _emit_segments(
+            segments, WHISPER_RAW, reference_lyrics=reference,
+        )
+    except Exception as exc:
+        # OBSERVABILITY (audit 2026-05-24): the orchestrator used to be
+        # try/finally with NO except. Any uncaught exception (OOM, an
+        # unexpected dict shape from Replicate, IndexError in split-long,
+        # etc.) propagated to the caller, leaving the job in `processing`
+        # with `timing_source=NULL` and zero context in Sentry.
+        #
+        # This block captures the exception with Sentry (worker process
+        # doesn't have FastAPI's auto-capture), tags the job_id, AND
+        # re-raises so the caller's own error path still runs. The
+        # downstream caller is responsible for marking the job failed
+        # (transcription_worker._fail).
+        try:
+            import sentry_sdk
+            with sentry_sdk.push_scope() as scope:
+                scope.set_tag("job_id", job_id)
+                scope.set_tag("audio_path", os.path.basename(audio_path or ""))
+                scope.set_context("transcribe", {
+                    "language": language, "artist": artist, "title": title,
+                })
+                sentry_sdk.capture_exception(exc)
+        except Exception:
+            pass  # Sentry must never break the error path
+        logger.exception("[TRANSCRIBE] uncaught exception in _run_transcription_for_job for job=%s",
+                         job_id)
+        raise
     finally:
         # tmp_dir holds intermediate slices (intro/body cuts) only — the
         # main audio (audio_path) is under job_dir and must survive until
@@ -3381,6 +4787,13 @@ async def _run_transcription_for_job(
             shutil.rmtree(tmp_dir, ignore_errors=True)
         except Exception:
             pass
+        # The demucs vocal stem is a standalone temp file (system temp dir),
+        # not under tmp_dir — remove it explicitly.
+        if _vocal_stem:
+            try:
+                os.unlink(_vocal_stem)
+            except OSError:
+                pass
 
 
 @app.post("/generate")
@@ -3408,13 +4821,25 @@ async def generate_with_segments(
     font: str = Form("", max_length=64),
     concept: str = Form("", max_length=2000),
     movement_style: str = Form("", max_length=64),
+    effect: str = Form("", max_length=32),
     animate_image: str = Form("", max_length=8),
     text_case: str = Form("upper", max_length=16),
     font_scale: str = Form("1.0", max_length=8),
     lyric_transition: str = Form("cut", max_length=16),
     text_motion: str = Form("none", max_length=16),
+    lyrics_animation: str = Form("none", max_length=16),
+    line_transition: str = Form("none", max_length=16),
     text_contrast: str = Form("medium", max_length=16),
     match_lyrics: bool = Form(True),
+    background_hint: str = Form("", max_length=2000),
+    bg_verbatim: bool = Form(False),
+    custom_colors: str = Form("", max_length=200),
+    # Capa C 2026-05-24: si el operador hizo pre-gen via /generate-preview
+    # mientras editaba lyrics, este field contiene el hash que mapea al
+    # background pre-cacheado en R2. La pipeline lo reusa antes de llamar
+    # a Veo/Imagen — ahorra ~60-180s + $0.80-3.20 de cuota. Vacío = flow
+    # tradicional sin cache.
+    bg_cache_key: str = Form("", max_length=64),
     current_user: dict = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
@@ -3446,7 +4871,13 @@ async def generate_with_segments(
                 or job_row.user_id != current_user["id"]
                 or job_row.tenant_id != current_user["tenant_id"]):
             raise HTTPException(status_code=404, detail="Job not found.")
-        if job_row.status not in ("transcribed_pending", "awaiting_upload"):
+        # State whitelist for /generate. `transcribed_pending` is what the
+        # transcription worker writes on success (post-2026-05-25 fix);
+        # `transcribed` is accepted defensively for jobs that were written
+        # by the older worker variant that drifted from the convention,
+        # and `awaiting_upload` covers the direct-generate path (no editor).
+        # See transcription_worker.py:137 for the writer side.
+        if job_row.status not in ("transcribed_pending", "transcribed", "awaiting_upload"):
             raise HTTPException(
                 status_code=409,
                 detail=f"Job is in state {job_row.status!r}, cannot generate.",
@@ -3603,6 +5034,20 @@ async def generate_with_segments(
     except (ValueError, TypeError):
         pass
 
+    # Remove the orphan draft the wizard sometimes leaves behind: if a
+    # sibling transcribed_pending/awaiting_upload row for the same audio was
+    # just created (re-upload-on-generate bug), delete it so the operator
+    # doesn't see a phantom "2nd job". Time-windowed so it never touches an
+    # intentional re-upload of the same song later.
+    try:
+        from jobs import supersede_sibling_drafts
+        supersede_sibling_drafts(
+            db, keep_job_id=job_id, user_id=current_user["id"],
+            tenant_id=current_user["tenant_id"], filename=existing_filename or "",
+        )
+    except Exception as e:
+        logger.warning("[DEDUP] supersede sibling drafts failed: %s", e)
+
     enqueue_pipeline(
         job_id=job_id,
         mp3_path=mp3_path,
@@ -3623,14 +5068,25 @@ async def generate_with_segments(
         font=font,
         concept=concept,
         movement_style=movement_style,
+        effect=effect,
         animate_image=str(animate_image).strip().lower() in ("true", "1", "yes", "on"),
         song_title=song_title,
         text_case=text_case if text_case in ("upper", "title", "lower", "original") else "upper",
         font_scale=_font_scale_gen,
-        lyric_transition=lyric_transition if lyric_transition in ("cut", "fade", "fade_slow") else "cut",
-        text_motion=text_motion if text_motion in ("none", "subtle", "float") else "none",
+        # Deprecados 2026-05-23 (ver primer endpoint /upload).
+        lyric_transition="cut",
+        text_motion="none",
+        lyrics_animation=lyrics_animation if lyrics_animation in ("none", "karaoke", "word_reveal", "pop", "glow") else "none",
+        line_transition=line_transition if line_transition in ("none", "slide_up", "slide_side", "wipe", "dissolve_blur") else "none",
         text_contrast=text_contrast if text_contrast in ("subtle", "medium", "strong") else "medium",
         match_lyrics=match_lyrics,
+        background_hint=(background_hint.strip() or None),
+        bg_verbatim=bg_verbatim,
+        custom_colors=(custom_colors.strip() or ""),
+        # Capa C 2026-05-24: pasa el hash del bg pre-cacheado a la pipeline.
+        # Si el cache hit, _ensure_background se skip y el job ahorra
+        # ~60-180s + $0.80-3.20 de cuota Veo. Vacío = flow tradicional.
+        bg_cache_key=(bg_cache_key.strip() or None),
     )
 
     return {"job_id": job_id, "status": initial_status}
@@ -3664,6 +5120,10 @@ async def status(
     if job is None:
         raise HTTPException(status_code=404, detail="Job not found.")
     edit_count = job.get("edit_count") or 0
+    # Admins are exempt from the per-job edit cap. The frontend reads
+    # edit_limit_exempt to skip the limit-reached panel and show "sin
+    # límite" instead of a remaining count.
+    _is_admin = current_user.get("role") == "admin"
     return {
         "job_id": job["job_id"],
         "status": job["status"],
@@ -3689,6 +5149,7 @@ async def status(
         # edit applied (or the initial render) so the UI can preload them.
         "edit_count": edit_count,
         "edits_remaining": max(0, _MAX_EDITS - edit_count),
+        "edit_limit_exempt": _is_admin,
         "render_params": job.get("render_params"),
         # EditRequestPanel reads these to drive the lyrics-edit and
         # typography-edit UIs. segments_json hydrates the inline lyrics
@@ -4474,8 +5935,10 @@ class EditJobRequest(BaseModel):
     font: str | None = Field(default=None, max_length=64)
     font_scale: float | None = None
     text_case: str | None = Field(default=None, max_length=16)
-    lyric_transition: str | None = Field(default=None, max_length=16)
-    text_motion: str | None = Field(default=None, max_length=16)
+    # lyric_transition + text_motion deprecados 2026-05-23 — campos
+    # eliminados del modelo. Clientes viejos que sigan mandándolos en el
+    # body son ignorados por Pydantic (default: extra fields permitidos).
+    text_contrast: str | None = Field(default=None, max_length=16)
     # Required when edit_type=="lyrics". For edit_type=="background" or
     # "typography", segments is OPTIONAL — if the operator made text
     # corrections inside the modal's LyricsEditor that autosave hasn't
@@ -4525,6 +5988,25 @@ class EditJobRequest(BaseModel):
         default=None,
         pattern="^(veo|imagen)$",
     )
+    # Camera/motion register for edit_type=="background". Lets the operator
+    # change how the new background moves (incl. "estatico" = locked camera)
+    # without typing prose — closes the gap where movement was only
+    # selectable in the wizard, never at edit time. None → inherit the
+    # job's persisted movement_style. Validated as free-text; normalized
+    # downstream by _normalize_movement_style.
+    movement_style: str | None = Field(default=None, max_length=64)
+    # "Usar mi prompt tal cual": when True (and background_hint is set),
+    # the hint goes straight to Veo without Gemini's rewrite. Only
+    # meaningful for edit_type=="background".
+    bg_verbatim: bool = Field(default=False)
+    # FX layer + lyric animations chosen in the wizard. Added 2026-05-22:
+    # antes el operador no podía cambiarlos post-upload y, peor, los
+    # whitelists de /retry y /variant los descartaban silenciosamente.
+    # None → no cambia (heredan de render_params del job). Cadena vacía
+    # válida ("" = sin efecto). max_length espeja /generate (3646/3652/3653).
+    effect: str | None = Field(default=None, max_length=32)
+    lyrics_animation: str | None = Field(default=None, max_length=16)
+    line_transition: str | None = Field(default=None, max_length=16)
     # Explicit ack that the caller understands re-syncing lyrics on a job
     # already published to YouTube will update R2 but NOT replace the
     # YouTube video file (the YouTube API doesn't allow file replacement,
@@ -4663,6 +6145,120 @@ async def get_source_audio_url(
     return {"url": url, "expires_in": 3600}
 
 
+@app.get("/jobs/{job_id}/background-url")
+async def get_background_url(
+    job_id: str,
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Signed URL to the cached background video (bg_r2_key_cached) so the
+    editor's live preview can show lyrics over the REAL background. 404
+    when there's no cached background yet (e.g. a job that never rendered),
+    in which case the preview falls back to a style-tinted gradient.
+    Owner / same-tenant only, same model as /source-audio-url."""
+    from database import Job as JobModel
+    job = (
+        db.query(JobModel)
+        .filter(JobModel.job_id == job_id)
+        .filter(JobModel.tenant_id == current_user["tenant_id"])
+        .first()
+    )
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+    if not job.bg_r2_key_cached:
+        raise HTTPException(status_code=404, detail="No cached background for this job.")
+    url = storage.generate_signed_url(job.bg_r2_key_cached, expiry_seconds=3600)
+    if not url:
+        raise HTTPException(status_code=503, detail="Object storage is unavailable.")
+    return {"url": url, "expires_in": 3600}
+
+
+# NOTE: sync `def` on purpose — librosa.load is CPU/IO-blocking, so FastAPI
+# runs this in its threadpool instead of blocking the event loop. An async
+# def here would freeze every other request during the (multi-second) first
+# compute, which is exactly the saturation failure mode we want to avoid.
+@app.get("/jobs/{job_id}/waveform")
+def get_waveform(
+    job_id: str,
+    response: Response,
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Downsampled peak envelope of the source audio for the timeline
+    editor's waveform. Returns {"peaks": [0..1]*N, "duration": seconds}.
+
+    First call per job downloads the MP3 from R2 and computes the envelope
+    with librosa (a few seconds); the result is cached to R2 as
+    waveform/{job_id}.json so every later open is a fast object fetch.
+    Owner / same-tenant only, same model as /source-audio-url.
+    """
+    import json as _json
+    import tempfile
+    from database import Job as JobModel
+
+    job = (
+        db.query(JobModel)
+        .filter(JobModel.job_id == job_id)
+        .filter(JobModel.tenant_id == current_user["tenant_id"])
+        .first()
+    )
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+    if not job.input_r2_key:
+        raise HTTPException(
+            status_code=404, detail="Source audio is not available for this job."
+        )
+    if not storage.is_enabled():
+        raise HTTPException(status_code=503, detail="Object storage is unavailable.")
+
+    _N = 1000  # number of peak buckets the frontend draws
+    cache_key = f"waveform/{job_id}.json"
+
+    # Cache hit → return the precomputed envelope.
+    try:
+        if storage.object_exists(cache_key):
+            with tempfile.NamedTemporaryFile(suffix=".json", delete=True) as tf:
+                if storage.download_object(cache_key, tf.name):
+                    cached = _json.loads(open(tf.name, "r", encoding="utf-8").read())
+                    response.headers["Cache-Control"] = "private, max-age=86400"
+                    return cached
+    except Exception as exc:
+        logger.warning("[WAVEFORM] cache read failed for %s: %s", job_id, exc)
+
+    # Compute: download source audio, build a peak envelope.
+    with tempfile.NamedTemporaryFile(suffix=".audio", delete=True) as tf:
+        if not storage.download_object(job.input_r2_key, tf.name):
+            raise HTTPException(
+                status_code=422,
+                detail="El audio original ya no está en storage. Subí el MP3 de nuevo.",
+            )
+        try:
+            import librosa
+            import numpy as np
+            # 8 kHz mono is plenty for an amplitude envelope and keeps the
+            # load fast + memory small even for long tracks.
+            y, sr = librosa.load(tf.name, sr=8000, mono=True)
+        except Exception as exc:
+            logger.error("[WAVEFORM] librosa load failed for %s: %s", job_id, exc)
+            raise HTTPException(status_code=500, detail="No se pudo analizar el audio.")
+
+    duration = float(len(y) / sr) if sr else 0.0
+    from waveform_utils import peak_envelope
+    peaks = peak_envelope(np.abs(y), _N)
+    payload = {"peaks": peaks, "duration": round(duration, 3)}
+
+    # Cache to R2 (best-effort — a failed write just means we recompute).
+    try:
+        storage.put_object_bytes(
+            cache_key, _json.dumps(payload).encode("utf-8"), "application/json"
+        )
+    except Exception as exc:
+        logger.warning("[WAVEFORM] cache write failed for %s: %s", job_id, exc)
+
+    response.headers["Cache-Control"] = "private, max-age=86400"
+    return payload
+
+
 class SaveSegmentsRequest(BaseModel):
     # Persisted to Job.segments_json (JSONB). Same shape /generate and
     # /edit accept. 5 MB upper bound mirrors /generate's segments_json
@@ -4729,8 +6325,12 @@ async def save_segments(
     # done has no pipeline-state side effects. The actual re-render still
     # goes through POST /edit with edit_type="lyrics" which transitions
     # the job to editing.
+    # `transcribed` lives in the whitelist for the same reason as
+    # /generate (see 2026-05-25 worker-state-drift fix): older async
+    # jobs were persisted with status='transcribed' literal. Newer
+    # jobs use 'transcribed_pending'. Editor must work on both.
     _SAVE_SEGMENTS_ALLOWED = (
-        "transcribed_pending", "pending_review", "rejected", "editing", "done",
+        "transcribed_pending", "transcribed", "pending_review", "rejected", "editing", "done",
     )
     if job.status not in _SAVE_SEGMENTS_ALLOWED:
         raise HTTPException(
@@ -4745,6 +6345,16 @@ async def save_segments(
     # Light shape check — full validation lives in /generate's pipeline.
     # We just want to reject obviously broken payloads early so the
     # autosave doesn't silently store garbage.
+    #
+    # SECURITY (incident 2026-05-24 audit): also reject non-finite floats
+    # (NaN/Infinity). Python `json` accepts them, but Postgres JSONB
+    # rejects on insert → opaque 500. Sorting NaN is undefined in Timsort
+    # so a NaN start corrupts the entire timeline order. And cap text
+    # size at 2 KB per line: anything bigger is a paste error or DoS, and
+    # libass wraps badly past that anyway.
+    import math
+    _MAX_TEXT_CHARS = 2000   # per-segment text cap
+    _MAX_END_S = 24 * 3600   # 24h ceiling — songs are seconds, not days
     for i, seg in enumerate(segs):
         if not isinstance(seg, dict):
             raise HTTPException(status_code=400, detail=f"segments[{i}] must be an object")
@@ -4754,6 +6364,32 @@ async def save_segments(
                     status_code=400,
                     detail=f"segments[{i}] missing required key {k!r}",
                 )
+        try:
+            start_f = float(seg["start"])
+            end_f = float(seg["end"])
+        except (TypeError, ValueError):
+            raise HTTPException(
+                status_code=400,
+                detail=f"segments[{i}] start/end must be numeric",
+            )
+        if not (math.isfinite(start_f) and math.isfinite(end_f)):
+            raise HTTPException(
+                status_code=400,
+                detail=f"segments[{i}] start/end must be finite (NaN/Infinity rejected)",
+            )
+        if start_f < 0 or end_f < 0 or end_f > _MAX_END_S or start_f > end_f:
+            raise HTTPException(
+                status_code=400,
+                detail=f"segments[{i}] start/end out of range (need 0 ≤ start ≤ end ≤ {_MAX_END_S}s)",
+            )
+        text = seg.get("text", "")
+        if not isinstance(text, str):
+            raise HTTPException(status_code=400, detail=f"segments[{i}].text must be a string")
+        if len(text) > _MAX_TEXT_CHARS:
+            raise HTTPException(
+                status_code=400,
+                detail=f"segments[{i}].text too long ({len(text)} chars > {_MAX_TEXT_CHARS})",
+            )
 
     # Sort by start ascending so downstream consumers (renderer, sync-mode
     # neighbor clamp, lookup-by-cronological-position) can assume a
@@ -4934,7 +6570,11 @@ async def request_edit(
         )
 
     current_edit_count = job.edit_count or 0
-    if current_edit_count >= _MAX_EDITS:
+    # Admins are exempt from the per-job edit cap (operators QA'ing a
+    # render may need more than _MAX_EDITS passes). Regular users still
+    # hit the limit and must approve/reject.
+    _is_admin = current_user.get("role") == "admin"
+    if not _is_admin and current_edit_count >= _MAX_EDITS:
         raise HTTPException(
             status_code=400,
             detail=f"Maximum edit limit ({_MAX_EDITS}) reached. Please approve or reject.",
@@ -5003,7 +6643,35 @@ async def request_edit(
     normalized_segments = None
     if body.segments and len(body.segments) > 0:
         normalized_segments = [
-            {"start": float(s["start"]), "end": float(s["end"]), "text": str(s["text"])}
+            {
+                "start": float(s["start"]),
+                "end": float(s["end"]),
+                "text": str(s["text"]),
+                # Preserve the manual-timing lock set in the visual Timings
+                # editor. Without this, a lyrics re-render strips `locked`
+                # and pipeline._apply_display_timing re-applies hold-until-next,
+                # clobbering the operator's hand-set end. Only carry it when
+                # truthy so untouched lines stay clean.
+                **({"locked": True} if s.get("locked") else {}),
+                # Preserve per-line layout overrides set in the live preview
+                # (position / size / rotation). Same reason as `locked`: a
+                # re-render must not strip the operator's layout. Only carried
+                # when set to a non-default value so untouched lines stay clean.
+                **({"pos": {"x": float(s["pos"]["x"]), "y": float(s["pos"]["y"])}}
+                   if isinstance(s.get("pos"), dict)
+                   and "x" in s["pos"] and "y" in s["pos"] else {}),
+                **({"scale": float(s["scale"])}
+                   if isinstance(s.get("scale"), (int, float))
+                   and float(s["scale"]) != 1.0 else {}),
+                **({"rot": float(s["rot"])}
+                   if isinstance(s.get("rot"), (int, float))
+                   and float(s["rot"]) != 0.0 else {}),
+                # Preserve per-word timestamps (forced-align / whisperX) so a
+                # re-render or future word-level/karaoke editor doesn't lose
+                # them. The line-level editor ignores `words`; carried only
+                # when present so untouched line-level edits stay lean.
+                **({"words": s["words"]} if isinstance(s.get("words"), list) else {}),
+            }
             for s in body.segments
         ]
         # Persist immediately so any subsequent reader (worker, /status
@@ -5019,10 +6687,33 @@ async def request_edit(
         edit_params["font_scale"] = body.font_scale
     if body.text_case is not None:
         edit_params["text_case"] = body.text_case
-    if body.lyric_transition is not None:
-        edit_params["lyric_transition"] = body.lyric_transition
-    if body.text_motion is not None:
-        edit_params["text_motion"] = body.text_motion
+    if body.text_contrast is not None:
+        edit_params["text_contrast"] = body.text_contrast
+    # body.lyric_transition + body.text_motion: campos eliminados 2026-05-23.
+    # FX layer + lyric animations: durable visual choices, no edit_type gate
+    # (the operator can change them inside any edit modal). Same pattern as
+    # movement_style below: forward to edit_params for THIS render AND persist
+    # to render_params so retries / variantes los heredan correctamente.
+    # 2026-05-22: cerraba el bug donde lyrics_animation/line_transition no
+    # estaban en los whitelists de /retry y /variant.
+    if body.effect is not None:
+        _fx = (body.effect or "").strip()
+        edit_params["effect"] = _fx
+        _rp = dict(job.render_params or {})
+        _rp["effect"] = _fx
+        job.render_params = _rp
+    if body.lyrics_animation is not None:
+        _la = (body.lyrics_animation or "").strip() or "none"
+        edit_params["lyrics_animation"] = _la
+        _rp = dict(job.render_params or {})
+        _rp["lyrics_animation"] = _la
+        job.render_params = _rp
+    if body.line_transition is not None:
+        _lt = (body.line_transition or "").strip() or "none"
+        edit_params["line_transition"] = _lt
+        _rp = dict(job.render_params or {})
+        _rp["line_transition"] = _lt
+        job.render_params = _rp
     if body.edit_type == "lyrics":
         # Lyrics path keeps explicit edit_params hand-off so the worker
         # doesn't re-query the DB for segments it already received in
@@ -5054,6 +6745,28 @@ async def request_edit(
         # validated the enum via pattern; we just forward through
         # edit_params to run_edit_pipeline → _ensure_background.
         edit_params["background_mode"] = body.background_mode
+    if body.edit_type == "background" and body.movement_style is not None:
+        # Camera/motion register chosen in the editor (incl. "estatico").
+        # Forward for this render AND persist to durable render_params — same
+        # reaped-retry durability rationale as background_hint above, and so
+        # a subsequent "Regenerar fondo" pre-fills the operator's last choice.
+        _mv = (body.movement_style or "").strip()
+        edit_params["movement_style"] = _mv
+        _rp_mv = dict(job.render_params or {})
+        _rp_mv["movement_style"] = _mv
+        job.render_params = _rp_mv
+    if body.edit_type == "background":
+        # "Usar mi prompt tal cual" — send background_hint straight to Veo.
+        # ALWAYS write the boolean (not only when True) so unchecking the
+        # toggle on a later background edit clears a previously-persisted
+        # True. Symmetric with movement_style above. The frontend always
+        # sends bg_verbatim for background edits. Persisted durably so a
+        # reaped /retry (whitelist includes bg_verbatim) honours it too.
+        _bv = bool(body.bg_verbatim)
+        edit_params["bg_verbatim"] = _bv
+        _rp_v = dict(job.render_params or {})
+        _rp_v["bg_verbatim"] = _bv
+        job.render_params = _rp_v
     if body.edit_type == "background" and body.bypass_content_validation:
         # Forward only when explicitly True; pipeline's tenant-gated
         # default is correct when missing/False. Storing this lets the
@@ -5146,7 +6859,8 @@ async def request_edit(
         "job_id": job_id,
         "edit_type": body.edit_type,
         "edit_count": new_edit_count,
-        "edits_remaining": _MAX_EDITS - new_edit_count,
+        "edits_remaining": max(0, _MAX_EDITS - new_edit_count),
+        "edit_limit_exempt": _is_admin,
     }
 
 
@@ -5586,10 +7300,19 @@ async def retry_job(
     # Mirrors the /variant endpoint pattern (see line 5814 region).
     _retry_render_params = job.render_params or {}
     retry_pipeline_kwargs = {}
-    for k in ("font", "font_scale", "text_case", "lyric_transition",
-              "text_motion", "text_contrast", "movement_style",
-              "animate_image", "genre", "match_lyrics",
-              "background_hint", "concept"):
+    # lyric_transition + text_motion deprecados 2026-05-23 — sacados de la
+    # whitelist; si están en render_params viejos quedan como dato muerto,
+    # no se propagan al re-render.
+    for k in ("font", "font_scale", "text_case", "text_contrast",
+              "movement_style", "animate_image", "genre", "match_lyrics",
+              "background_hint", "concept", "bg_verbatim",
+              "effect", "custom_colors",
+              # Lyric animation + line transition (libass templates from the
+              # wizard). Added 2026-05-22 along with /variant: if a job with
+              # karaoke/reveal fell to validation_failed y el operador hit
+              # Reintentar, animations silently reset to "none" porque no
+              # estaban en esta whitelist cuando se cabló la feature (#357a1a5).
+              "lyrics_animation", "line_transition"):
         if k in _retry_render_params and _retry_render_params[k] not in (None, ""):
             retry_pipeline_kwargs[k] = _retry_render_params[k]
 
@@ -5873,9 +7596,19 @@ async def create_variant(
     # render_params del padre + overrides — los param de typography
     # (font, font_scale, etc) se pasan como kwargs individuales que
     # run_pipeline acepta. concept también va por kwarg.
-    for k in ("font", "font_scale", "text_case", "lyric_transition",
-              "text_motion", "text_contrast", "movement_style",
-              "animate_image", "genre", "match_lyrics"):
+    # lyric_transition + text_motion deprecados 2026-05-23 — fuera del whitelist.
+    for k in ("font", "font_scale", "text_case", "text_contrast",
+              "movement_style", "animate_image", "genre", "match_lyrics",
+              "bg_verbatim",
+              # FX layer + lyric animation/transition (libass templates from
+              # the wizard). Added 2026-05-22: variantes heredaban tipografía
+              # y movimiento del padre pero perdían el efecto encima (nieve/
+              # lluvia/etc.) y las animaciones de letra (karaoke/reveal/...)
+              # porque no estaban en este whitelist cuando se cableó (#51946bf
+              # + #357a1a5). custom_colors va con effect porque su flow es el
+              # mismo (paleta opcional para el grade).
+              "effect", "custom_colors",
+              "lyrics_animation", "line_transition"):
         if k in new_render_params:
             pipeline_kwargs[k] = new_render_params[k]
     if body.concept is not None:

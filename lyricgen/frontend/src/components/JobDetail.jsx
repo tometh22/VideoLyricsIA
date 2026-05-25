@@ -386,7 +386,7 @@ export default function JobDetail({ job, onBack, onJobUpdate }) {
   //   - rejected       → lyrics only (recovery path instead of re-upload)
   const canEditLyrics = isPendingReview || isDone || isRejected;
   const editPanelAllowedModes = isPendingReview
-    ? ["typography", "lyrics", "background"]
+    ? ["lyrics", "background"]
     : ["lyrics"];
 
   // While the worker is re-rendering an edit request, poll /status every
@@ -461,6 +461,7 @@ export default function JobDetail({ job, onBack, onJobUpdate }) {
         status: "editing",
         edit_count: resp?.edit_count ?? (job.edit_count || 0) + 1,
         edits_remaining: resp?.edits_remaining ?? Math.max(0, (job.edits_remaining ?? 3) - 1),
+        edit_limit_exempt: resp?.edit_limit_exempt ?? job.edit_limit_exempt ?? false,
         current_step: resp?.edit_type === "background" ? "background" : "video",
         progress: 0,
       });
@@ -516,10 +517,149 @@ export default function JobDetail({ job, onBack, onJobUpdate }) {
     );
   }
 
+  // INCIDENT (2026-05-24): the original "not available" fallback was a
+  // dead-end for every status that wasn't done/pending_review/editing —
+  // including the 19 jobs currently in `transcribed` / `transcribed_pending`
+  // / `transcribing*` / `awaiting_upload`. The operator couldn't act on
+  // them at all from the history view. Now each state renders a focused
+  // panel with the actionable next step instead of "Volver".
+  const isTranscribed = job.status === "transcribed";
+  const isTranscribedPending = job.status === "transcribed_pending";
+  const isTranscribing = job.status === "transcribing" || job.status === "transcribing_queued";
+  const isAwaitingUpload = job.status === "awaiting_upload";
+  const isTranscriptionFailed = job.status === "transcription_failed";
+
+  // `transcribed` = audio + segments are in the DB, user never hit
+  // "Generar video". The right next action is to open the wizard
+  // pre-loaded for this job so they can review lyrics and ship. We
+  // redirect to /new with a query param the wizard can pick up.
+  if (isTranscribed || isTranscribedPending) {
+    const navHref = `/new?resume=${encodeURIComponent(job.job_id)}`;
+    const subtitle = isTranscribed
+      ? (t("detail.transcribed_subtitle") || "La transcripción ya está lista. Revisá los lyrics y dale Generar video para terminar.")
+      : (t("detail.transcribed_pending_subtitle") || "La subida está en curso. Cuando termine, vas a poder editar los lyrics.");
+    return (
+      <div className="w-full max-w-2xl animate-fade-in">
+        <div className="flex items-center gap-3 mb-6">
+          <button onClick={onBack} className="w-9 h-9 shrink-0 rounded-xl bg-surface-2/40 ring-1 ring-white/[0.04] hover:ring-white/[0.08] flex items-center justify-center text-gray-400 hover:text-white transition-colors">
+            <svg className="w-4 h-4" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24"><path d="M19 12H5M12 19l-7-7 7-7" /></svg>
+          </button>
+          <div>
+            <h2 className="text-xl font-bold">{name}</h2>
+            <p className="text-sm text-gray-500">{job.artist}</p>
+          </div>
+        </div>
+        <div className="rounded-card p-5 bg-surface-2/40 ring-1 ring-white/[0.06]">
+          <p className="text-sm font-semibold text-white">
+            {isTranscribed
+              ? (t("detail.transcribed_title") || "Borrador listo para editar")
+              : (t("detail.transcribed_pending_title") || "Subida en curso")}
+          </p>
+          <p className="text-xs text-ink-secondary mt-1.5 leading-relaxed">{subtitle}</p>
+          {isTranscribed && (
+            <a
+              href={navHref}
+              className="inline-flex items-center gap-2 mt-4 px-4 py-2 rounded-lg bg-brand hover:bg-brand-light text-white font-medium text-sm transition-colors"
+            >
+              {t("detail.transcribed_cta") || "Editar lyrics y generar"}
+              <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24"><path d="M5 12h14M12 5l7 7-7 7" /></svg>
+            </a>
+          )}
+        </div>
+      </div>
+    );
+  }
+
+  // `transcribing*` / `awaiting_upload` = active work, no user action
+  // possible yet. Show a focused progress panel; the dashboard poller
+  // will refresh `job` and the user will see the badge flip when ready.
+  if (isTranscribing || isAwaitingUpload) {
+    const label = isAwaitingUpload
+      ? (t("detail.uploading_title") || "Subiendo audio…")
+      : (t("detail.transcribing_title") || "Transcribiendo…");
+    const subtitle = isAwaitingUpload
+      ? (t("detail.uploading_subtitle") || "El archivo está subiendo a nuestro storage. Si se queda mucho tiempo acá puede ser una pérdida de conexión: refrescá y reintentá.")
+      : (t("detail.transcribing_subtitle") || "Whisper + alineación de letras a la canción. Suele tardar 2-5 minutos. Volvé en un rato.");
+    return (
+      <div className="w-full max-w-2xl animate-fade-in">
+        <div className="flex items-center gap-3 mb-6">
+          <button onClick={onBack} className="w-9 h-9 shrink-0 rounded-xl bg-surface-2/40 ring-1 ring-white/[0.04] hover:ring-white/[0.08] flex items-center justify-center text-gray-400 hover:text-white transition-colors">
+            <svg className="w-4 h-4" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24"><path d="M19 12H5M12 19l-7-7 7-7" /></svg>
+          </button>
+          <div>
+            <h2 className="text-xl font-bold">{name}</h2>
+            <p className="text-sm text-gray-500">{job.artist}</p>
+          </div>
+        </div>
+        <div className="rounded-card p-5 bg-brand/[0.08] ring-1 ring-brand/25">
+          <div className="flex items-start gap-3">
+            <div className="w-9 h-9 rounded-lg bg-brand/15 ring-1 ring-brand/30 flex items-center justify-center shrink-0">
+              <span className="w-4 h-4 border-2 border-brand-light border-t-transparent rounded-full animate-spin" />
+            </div>
+            <div className="flex-1 min-w-0">
+              <p className="text-sm font-semibold text-white">{label}</p>
+              <p className="text-xs text-ink-secondary mt-0.5">{subtitle}</p>
+              {typeof job.progress === "number" && job.progress > 0 && (
+                <div className="mt-3 h-1.5 rounded-full bg-surface-3/60 overflow-hidden">
+                  <div
+                    className="h-full bg-gradient-to-r from-brand to-brand-light transition-[width] duration-700 ease-out"
+                    style={{ width: `${Math.min(100, Math.max(3, job.progress))}%` }}
+                  />
+                </div>
+              )}
+              {job.current_step && (
+                <p className="text-[10px] text-gray-500 mt-1 font-mono">{job.current_step} · {job.progress || 0}%</p>
+              )}
+            </div>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  // `transcription_failed` = the transcription pipeline crashed before
+  // segments could be persisted. Surface the error + offer retry via the
+  // wizard (which re-encodes + re-uploads from the user's local file
+  // if needed).
+  if (isTranscriptionFailed) {
+    return (
+      <div className="w-full max-w-2xl animate-fade-in">
+        <div className="flex items-center gap-3 mb-6">
+          <button onClick={onBack} className="w-9 h-9 shrink-0 rounded-xl bg-surface-2/40 ring-1 ring-white/[0.04] hover:ring-white/[0.08] flex items-center justify-center text-gray-400 hover:text-white transition-colors">
+            <svg className="w-4 h-4" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24"><path d="M19 12H5M12 19l-7-7 7-7" /></svg>
+          </button>
+          <div>
+            <h2 className="text-xl font-bold">{name}</h2>
+            <p className="text-sm text-gray-500">{job.artist}</p>
+          </div>
+        </div>
+        <div className="rounded-card bg-red-500/[0.06] ring-1 ring-red-500/20 px-5 py-5">
+          <p className="text-sm font-semibold text-red-300 mb-1">
+            {t("detail.transcription_failed_title") || "La transcripción falló"}
+          </p>
+          <p className="text-xs text-red-400/70 mb-4">
+            {job.error || t("detail.transcription_failed_unknown") || "Error desconocido durante la transcripción."}
+          </p>
+          <p className="text-xs text-ink-secondary mb-4 leading-relaxed">
+            {t("detail.transcription_failed_help") || "Volvé al wizard y subí el audio de nuevo. Si el archivo es muy grande, convertilo a MP3 antes."}
+          </p>
+          <a
+            href="/new"
+            className="inline-flex items-center gap-2 px-4 py-2 rounded-lg bg-brand hover:bg-brand-light text-white font-medium text-sm transition-colors"
+          >
+            {t("detail.transcription_failed_cta") || "Volver al wizard"}
+            <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24"><path d="M5 12h14M12 5l7 7-7 7" /></svg>
+          </a>
+        </div>
+      </div>
+    );
+  }
+
   if (!canPreview && !isValidationFailed && !isError) {
     return (
       <div className="w-full max-w-2xl animate-fade-in text-center py-20">
         <p className="text-gray-400">{t("detail.not_available")}</p>
+        <p className="text-[11px] text-gray-600 mt-2">status: {job.status || "(unknown)"}</p>
         <button onClick={onBack} className="btn-secondary mt-4">{t("detail.back")}</button>
       </div>
     );
@@ -552,10 +692,10 @@ export default function JobDetail({ job, onBack, onJobUpdate }) {
                 onChange={(e) => setRetryFrameSize(e.target.value)}
                 className="text-xs bg-surface-2/60 ring-1 ring-white/[0.08] rounded-lg px-3 py-2 text-white focus:ring-brand outline-none"
               >
-                <option value="HD">HD · 1920×1080 (más rápido, menos RAM)</option>
+                <option value="HD">HD · 1920×1080 (más rápido)</option>
                 <option value="DCI-2K">2K · 2048×1080</option>
-                <option value="UHD-4K">4K UHD · 3840×2160 (puede OOMear)</option>
-                <option value="DCI-4K">4K DCI · 4096×2160 (puede OOMear)</option>
+                <option value="UHD-4K">4K UHD · 3840×2160 (más lento)</option>
+                <option value="DCI-4K">4K DCI · 4096×2160 (más lento)</option>
               </select>
               {retryFrameSize !== (job.umg_spec?.frame_size || "HD") && (
                 <p className="text-[10px] text-amber-300/70 mt-1.5">

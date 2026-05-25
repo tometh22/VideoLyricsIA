@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from "react";
 import { useI18n } from "../i18n";
 import Listbox from "./Listbox";
 import { UploadTour } from "./OnboardingTour";
+import WizardLivePreview from "./WizardLivePreview";
 
 const API = import.meta.env.VITE_API_URL || "";
 
@@ -22,10 +23,14 @@ function tokenParam() {
 // hit a 429 on the 6th. The backend enforces this server-side regardless.
 const MAX_BATCH_SIZE = 5;
 
-// Motion picker hidden hasta que decidamos qué animación implementar.
-// Backend default queda en text_motion="none". Cambiar a true para
-// re-mostrar el dropdown sin tocar nada más.
-const SHOW_MOTION_PICKER = false;
+// SHOW_MOTION_PICKER (legacy text_motion) eliminado 2026-05-23 — campo
+// deprecado upstream; ver pipeline.py:run_pipeline.
+
+// Typography (font / case / size / transition / contrast) is now chosen
+// LIVE in the editor + preview, where you see the real result. Hidden in
+// the upload step to remove the confusing duplication. batchDefaults still
+// supplies sensible defaults for the "Generar directo" path.
+const SHOW_UPLOAD_TYPOGRAPHY = false;
 
 const SAMPLE_LYRIC = "Como el viento que se va";
 function applyTextCase(text, c) {
@@ -113,8 +118,10 @@ export default function UploadZone({
   onFiles,
   delivery,
   onDeliveryChange,
-  style = "oscuro",
+  style = "auto",
   onStyleChange,
+  customColors = "",
+  onCustomColorsChange,
   backgroundFile,
   onBackgroundFile,
   backgroundId,
@@ -130,6 +137,11 @@ export default function UploadZone({
   onGenerateDirect,
   user,
   sidebarOpen = true,
+  // 2026-05-23: auto-transcribe en background al drop. La función recibe los
+  // newEntries recién agregados y arranca uploads + transcripciones en
+  // segundo plano. La status map per file viene del App via filesnamekey.
+  onAutoTranscribe,
+  transcribeStatusByFile = {},
 }) {
   const { t } = useI18n();
   const inputRef = useRef();
@@ -174,8 +186,14 @@ export default function UploadZone({
   // losing the "ROMANTICO" concept across Agus's re-uploads.
   const BATCH_DEFAULTS_STORAGE_KEY = "genly:wizardBatchDefaultsV1";
   const HARDCODED_BATCH_DEFAULTS = {
-    genre: "", concept: "", movementStyle: "", font: "",
-    textCase: "upper", fontScale: "1.0", lyricTransition: "cut", textMotion: "none", textContrast: "medium",
+    genre: "", concept: "", movementStyle: "", effect: "", font: "",
+    // lyricTransition + textMotion: deprecados 2026-05-23 (no se persisten).
+    textCase: "upper", fontScale: "1.0", lyricsAnimation: "none", lineTransition: "none", textContrast: "medium",
+    // Escena axis: optional free-text prompt ("Mi prompt"). When non-empty it
+    // overrides genre/concept/lyrics. bgVerbatim TRUE by default = use the
+    // operator's text as-is (people expect their prompt used, not rewritten);
+    // the "Mejorar con IA" toggle opts INTO a Gemini rewrite (bgVerbatim=false).
+    backgroundHint: "", bgVerbatim: true,
   };
   const loadStoredBatchDefaults = () => {
     try {
@@ -209,6 +227,116 @@ export default function UploadZone({
 
   const [hoverCaseBatch, setHoverCaseBatch] = useState(null);
   const [hoverCaseRow, setHoverCaseRow] = useState(null); // { idx, code }
+
+  // ── Scene MODE (Studio Console redesign) ────────────────────────────────
+  // The 3 modes map onto existing state (no new backend contract):
+  //   auto   → match_lyrics=false, no hint
+  //   lyrics → match_lyrics=true,  no hint  (our edge: scene from the lyrics)
+  //   prompt → background_hint present (+ optional bgVerbatim "usar tal cual")
+  // Derive the current mode from that state, with a local override so the
+  // operator can open "Mi prompt" before typing anything.
+  const _hint = (batchDefaults.backgroundHint || "").trim();
+  const [sceneMode, setSceneMode] = useState(_hint ? "prompt" : (inspiredByLyrics ? "lyrics" : "auto"));
+  const selectSceneMode = (m) => {
+    setSceneMode(m);
+    if (m === "auto") {
+      onInspiredByLyricsChange && onInspiredByLyricsChange(false);
+      if (_hint) updateBatchDefault("backgroundHint", "");   // stale prompt must not override
+    } else if (m === "lyrics") {
+      onInspiredByLyricsChange && onInspiredByLyricsChange(true);
+      if (_hint) updateBatchDefault("backgroundHint", "");
+    }
+    // prompt: leave inspired as-is; the textarea below drives it.
+  };
+  // Sample lyric for the live preview: first file's title, else a placeholder.
+  const _previewLyric = (files[0]?.songTitle || files[0]?.title || "").trim();
+
+  // ── Studio Console stepper ─────────────────────────────────────────────
+  // 4 steps revealed one at a time (variant A): the left rail navigates,
+  // the center stage holds the live preview, the right panel shows only the
+  // active step's controls. Step 1 (Subí) gates advancing on the artist name.
+  const WIZARD_STEPS = [
+    { id: 1, label: t("upload.step_upload") || "Subí" },
+    { id: 2, label: t("upload.step_mode") || "Modo" },
+    { id: 3, label: t("upload.step_motion") || "Movimiento" },
+    { id: 4, label: t("upload.step_animation") || "Animación" },
+    { id: 5, label: t("upload.step_deliver") || "Entregá" },
+  ];
+  const [wizardStep, setWizardStep] = useState(1);
+  const goStep = (n) => setWizardStep(Math.max(1, Math.min(WIZARD_STEPS.length, n)));
+
+  // Hovering a movement option previews it in the big stage without committing.
+  const [hoverMovement, setHoverMovement] = useState(null);
+  const [hoverEffect, setHoverEffect] = useState(null);
+  // Same for the lyrics-animation step: hover previews the template live.
+  const [hoverAnimation, setHoverAnimation] = useState(null);
+  // And for the line-transition picker (lives in the same Animación step).
+  const [hoverTransition, setHoverTransition] = useState(null);
+  // Abstract motion icons — communicate the camera MOVEMENT, not a fake scene.
+  // The big live preview is what actually demonstrates the motion.
+  const movIcon = (code) => {
+    const p = { fill: "none", stroke: "currentColor", strokeWidth: 1.6, strokeLinecap: "round", strokeLinejoin: "round", viewBox: "0 0 24 24", className: "w-5 h-5" };
+    switch (code) {
+      case "estatico": // locked frame
+        return (<svg {...p}><rect x="5" y="7" width="14" height="10" rx="1.5" /><path d="M5 10V8.5M5 14v1.5M19 10V8.5M19 14v1.5M9 7H7.5M15 7h1.5M9 17H7.5M15 17h1.5" /></svg>);
+      case "sutil": // gentle zoom — small inward arrows
+        return (<svg {...p}><rect x="4.5" y="6.5" width="15" height="11" rx="1.5" /><path d="M10 10l-1.5-1.5M14 10l1.5-1.5M10 14l-1.5 1.5M14 14l1.5 1.5" /></svg>);
+      case "estandar": // strong push-in — bold inward arrows from corners
+        return (<svg {...p}><rect x="3.5" y="5.5" width="17" height="13" rx="1.5" /><path d="M8.5 9.5L6 7m0 0v2.2M6 7h2.2M15.5 9.5L18 7m0 0v2.2M18 7h-2.2M8.5 14.5L6 17m0 0v-2.2M6 17h2.2M15.5 14.5L18 17m0 0v-2.2M18 17h-2.2" /></svg>);
+      case "foto-parallax": // depth layers + horizontal pan
+        return (<svg {...p}><rect x="3" y="7" width="12" height="10" rx="1.5" /><rect x="9" y="9.5" width="12" height="8.5" rx="1.5" opacity="0.55" /><path d="M14 5h5m0 0l-2-2m2 2l-2 2" /></svg>);
+      case "animado": // stylised 2D shapes
+        return (<svg {...p}><circle cx="8" cy="9" r="2.4" /><path d="M14.5 6.5l3.5 5h-7z" /><rect x="9" y="14" width="6" height="4" rx="1" /></svg>);
+      default: // auto — sparkle
+        return (<svg {...p}><path d="M12 4l1.4 4 4 1.4-4 1.4L12 15l-1.4-4-4-1.4 4-1.4z" /><path d="M18 14l.6 1.7 1.7.6-1.7.6L18 18.6l-.6-1.7-1.7-.6 1.7-.6z" /></svg>);
+    }
+  };
+
+  // Looping mini-demo of a lyrics-animation template, shown inside each card.
+  // The big WizardLivePreview (←) shows the chosen one full-size; these just
+  // hint the motion. CSS keyframes are injected once in the Animación step.
+  const animDemo = (code) => {
+    const base = "font-extrabold tracking-tight text-white text-[15px] leading-none";
+    if (code === "karaoke") {
+      return (
+        <span className={base}>
+          {["tu", "letra"].map((w, i) => (
+            <span key={i} style={{ animation: `acard-karaoke 2.4s ${i * 0.5}s infinite`, marginRight: i === 0 ? "0.28em" : 0, display: "inline-block" }}>{w}</span>
+          ))}
+        </span>
+      );
+    }
+    if (code === "word_reveal") {
+      return (
+        <span className={base}>
+          {["tu", "letra"].map((w, i) => (
+            <span key={i} style={{ animation: `acard-word 2.6s ${i * 0.45}s infinite`, marginRight: i === 0 ? "0.28em" : 0, display: "inline-block" }}>{w}</span>
+          ))}
+        </span>
+      );
+    }
+    const anim =
+      code === "pop" ? "acard-pop 2.2s infinite" :
+      code === "glow" ? "acard-glow 2.4s ease-in-out infinite" :
+      "acard-word 2.8s infinite"; // none → simple fade loop
+    return <span className={base} style={{ animation: anim, display: "inline-block" }}>Letra</span>;
+  };
+
+  // Looping mini-demo of a line transition (movement), shown inside its card.
+  const transDemo = (code) => {
+    const base = "font-extrabold tracking-tight text-white text-[15px] leading-none";
+    const anim =
+      code === "slide_up" ? "tcard-slideup 2.4s infinite" :
+      code === "slide_side" ? "tcard-slideside 2.4s infinite" :
+      code === "wipe" ? "tcard-wipe 2.6s infinite" :
+      code === "dissolve_blur" ? "tcard-blur 2.6s infinite" :
+      "acard-word 2.8s infinite"; // none → simple fade
+    return (
+      <span className="overflow-hidden inline-block">
+        <span className={base} style={{ animation: anim, display: "inline-block" }}>Letra</span>
+      </span>
+    );
+  };
 
   // Set of track indices with the inline "Personalizar" drawer open.
   const [expandedPersonalize, setExpandedPersonalize] = useState(() => new Set());
@@ -327,11 +455,51 @@ export default function UploadZone({
   // NOTE: those MP4s are LIBRARY PLACEHOLDERS shipped with the first
   // deploy — Tomi swaps real ones in before UMG sees the feature.
   const MOVEMENT_STYLES = [
-    { code: "",              label: t("upload.movement_auto") || "Auto",                         sample: null },
-    { code: "sutil",         label: t("upload.movement_sutil") || "Sutil (mínimo movimiento)",   sample: "/movement_samples/sutil.mp4" },
-    { code: "estandar",      label: t("upload.movement_estandar") || "Estándar (cinematográfico)", sample: "/movement_samples/estandar.mp4" },
-    { code: "foto-parallax", label: t("upload.movement_foto_parallax") || "Foto + parallax",     sample: "/movement_samples/foto-parallax.mp4" },
-    { code: "animado",       label: t("upload.movement_animado") || "Animado (ilustración)",     sample: "/movement_samples/animado.mp4" },
+    { code: "",              label: t("upload.movement_auto") || "Auto",                         sample: null,                              desc: t("upload.movement_auto_desc") || "La IA decide el movimiento según la canción." },
+    { code: "estatico",      label: t("upload.movement_estatico") || "Estático (cámara fija)",   sample: "/movement_samples/estatico.mp4",  desc: t("upload.movement_estatico_desc") || "Cámara fija. Solo se mueve lo que pasa dentro de la escena." },
+    { code: "sutil",         label: t("upload.movement_sutil") || "Sutil (mínimo movimiento)",   sample: "/movement_samples/sutil.mp4",     desc: t("upload.movement_sutil_desc") || "Movimiento mínimo, casi imperceptible. Calmo." },
+    { code: "estandar",      label: t("upload.movement_estandar") || "Estándar (cinematográfico)", sample: "/movement_samples/estandar.mp4", desc: t("upload.movement_estandar_desc") || "Movimiento de cámara cinematográfico (zoom/drift)." },
+    { code: "foto-parallax", label: t("upload.movement_foto_parallax") || "Foto + parallax",     sample: "/movement_samples/foto-parallax.mp4", desc: t("upload.movement_parallax_desc") || "Foto con sensación de profundidad (paneo lento)." },
+    { code: "animado",       label: t("upload.movement_animado") || "Animado (ilustración)",     sample: "/movement_samples/animado.mp4",   desc: t("upload.movement_animado_desc") || "Ilustración 2D estilizada, no fotorrealista." },
+  ];
+
+  // Effect overlay — animated particles composited OVER the background (the
+  // proven UMG pattern: foto/loop calmo + nieve/lluvia/estrellas encima). It's
+  // an ORTHOGONAL axis to "Movimiento" (which moves the camera): the effect
+  // falls on top of anything, even a still photo or a Library/uploaded clip.
+  // Backed by pre-rendered alpha-screen loops; preview clips live at
+  // /fx_samples/<code>.mp4 (effect composited over a neutral gradient).
+  const EFFECTS = [
+    { code: "",      label: t("upload.effect_none") || "Ninguno",   sample: null,                   desc: t("upload.effect_none_desc") || "Fondo limpio, sin efecto." },
+    { code: "snow",  label: t("upload.effect_snow") || "Nieve",     sample: "/fx_samples/snow.mp4",  desc: t("upload.effect_snow_desc") || "Copos cayendo. Calmo, invernal." },
+    { code: "rain",  label: t("upload.effect_rain") || "Lluvia",    sample: "/fx_samples/rain.mp4",  desc: t("upload.effect_rain_desc") || "Gotas finas sobre la escena." },
+    { code: "stars", label: t("upload.effect_stars") || "Estrellas", sample: "/fx_samples/stars.mp4", desc: t("upload.effect_stars_desc") || "Partículas que titilan. Nocturno." },
+    { code: "bokeh", label: t("upload.effect_bokeh") || "Bokeh",    sample: "/fx_samples/bokeh.mp4", desc: t("upload.effect_bokeh_desc") || "Luces desenfocadas flotando." },
+    { code: "light", label: t("upload.effect_light") || "Luz",      sample: "/fx_samples/light.mp4", desc: t("upload.effect_light_desc") || "Destellos suaves. Atardecer, glow." },
+  ];
+
+  // Lyrics-animation templates. These are rendered as libass override tags in
+  // the same single ffmpeg pass as the static text → zero impact on render
+  // speed/quality (no moviepy slow path). 🎤 = word-level: needs per-word
+  // timing, which the backend SYNTHESIZES from the line window when real word
+  // data is absent, so every template works on any song.
+  const LYRICS_ANIMATIONS = [
+    { code: "none",        emoji: "",   label: t("upload.anim_none") || "Ninguna",   desc: t("upload.anim_none_desc") || "Fade clásico por línea." },
+    { code: "karaoke",     emoji: "🎤", label: t("upload.anim_karaoke") || "Karaoke", desc: t("upload.anim_karaoke_desc") || "Las palabras se colorean al ritmo que se cantan." },
+    { code: "word_reveal", emoji: "🎤", label: t("upload.anim_reveal") || "Revelado", desc: t("upload.anim_reveal_desc") || "Cada palabra aparece justo cuando se canta." },
+    { code: "pop",         emoji: "",   label: t("upload.anim_pop") || "Pop",        desc: t("upload.anim_pop_desc") || "La línea entra con un pequeño rebote." },
+    { code: "glow",        emoji: "",   label: t("upload.anim_glow") || "Glow",      desc: t("upload.anim_glow_desc") || "Brillo suave que late. Atmosférico." },
+  ];
+
+  // Line-to-line MOTION transitions. Orthogonal to the animation (they use
+  // position/clip/blur, not scale/colour) so any combination composes. Also
+  // libass tags in the same single pass → no pipeline/speed impact.
+  const LINE_TRANSITIONS = [
+    { code: "none",          label: t("upload.trans_none") || "Corte",       desc: t("upload.trans_none_desc") || "Sin movimiento entre líneas." },
+    { code: "slide_up",      label: t("upload.trans_slide_up") || "Slide ↑", desc: t("upload.trans_slide_up_desc") || "La línea entra desde abajo subiendo." },
+    { code: "slide_side",    label: t("upload.trans_slide_side") || "Slide →", desc: t("upload.trans_slide_side_desc") || "La línea entra desde un costado." },
+    { code: "wipe",          label: t("upload.trans_wipe") || "Wipe",        desc: t("upload.trans_wipe_desc") || "Se descubre de izquierda a derecha." },
+    { code: "dissolve_blur", label: t("upload.trans_blur") || "Disolvencia", desc: t("upload.trans_blur_desc") || "Entra desenfocada y se enfoca." },
   ];
 
   // Visual concept for the AI background. Operator-controlled; when set
@@ -370,12 +538,49 @@ export default function UploadZone({
     { code: "anton",           label: "Anton",                             css: "'Anton', sans-serif",      weight: 400 },
   ];
 
-  // Two upload conventions are supported:
-  //   "Artist - Title.ext"  → artist=Artist, song=Title
-  //   "Title_Artist.ext"    → song=Title,    artist=Artist
-  // The `_` form is what Suno / YouTube exports emit, and what the
-  // operator was uploading when the title was lost end-to-end. Stripping
-  // " (Official Video)" / etc. keeps the lrclib lookup hitting.
+  // Filename → artist/title heuristic. ONE convention now: the FIRST
+  // half (left of the separator) is the ARTIST. Same rule for both ` - `
+  // and `_` separators. Noise suffixes ("Official Video", "Live", etc.)
+  // are stripped case-insensitively from the title, with or without
+  // brackets/parens.
+  //
+  // History (incident 2026-05-24): the previous code inverted the roles
+  // for the `_` separator ("Title_Artist" convention, justified as
+  // "what Suno emits"). A user uploading `Viejas Locas_Legalícenla.mp3`
+  // (the more common `Artist_Title` order — what every Mac/Windows
+  // export does when Finder strips spaces) ended up with
+  // artist="Legalícenla", title="Viejas Locas". lrclib lookup failed,
+  // the pipeline fell to whisperX-only, and the editor shipped
+  // "Le realicen la..." instead of the actual chorus "Legalícenla".
+  // PR #280 added a backend swap-retry that auto-corrects the metadata,
+  // but the frontend was still INDUCING the inversion silently. This
+  // unifies the convention so the swap-retry is the second line of
+  // defense, not the first.
+  //
+  // If the user really has a Suno-style "Title_Artist.mp3" file, they
+  // can hand-edit the inputs — the backend will detect the swap and
+  // auto-correct via PR #280. So the trade-off is asymmetric: this
+  // fix is correct for the common case, harmless (auto-corrected) for
+  // the rare Suno case.
+  const _NOISE_PATTERNS = [
+    /\s*[\(\[]\s*official\s+video\s*[\)\]]/gi,
+    /\s*[\(\[]\s*official\s+audio\s*[\)\]]/gi,
+    /\s*[\(\[]\s*official\s+music\s+video\s*[\)\]]/gi,
+    /\s*[\(\[]\s*lyric\s+video\s*[\)\]]/gi,
+    /\s*[\(\[]\s*audio\s*[\)\]]/gi,
+    /\s*[\(\[]\s*video\s*[\)\]]/gi,
+    /\s*[\(\[]\s*en\s+vivo\s*[\)\]]/gi,
+    /\s*[\(\[]\s*live\s*[\)\]]/gi,
+    /\s*[\(\[]\s*lyrics\s*[\)\]]/gi,
+    /\s*[\(\[]\s*remaster(?:ed)?(?:\s+\d{4})?\s*[\)\]]/gi,
+    /\s*-\s*official\s+video\s*$/gi,
+    /\s*-\s*live\s*$/gi,
+  ];
+  const _stripNoise = (s) => {
+    let out = s;
+    for (const pat of _NOISE_PATTERNS) out = out.replace(pat, "");
+    return out.trim();
+  };
   const parseFilename = (filename) => {
     const name = filename.replace(/\.(mp3|wav|m4a|flac|aac|ogg)$/i, "");
     let artist = "";
@@ -385,16 +590,14 @@ export default function UploadZone({
       artist = head.trim();
       song = rest.join(" - ").trim();
     } else if (name.includes("_")) {
+      // SAME convention as " - ": head is artist, rest is title.
+      // This is the fix — previously rest was artist (inverted).
       const [head, ...rest] = name.split("_");
-      song = head.trim();
-      artist = rest.join("_").trim();
+      artist = head.trim();
+      song = rest.join("_").trim();
     }
-    const noise = [
-      "(Official Video)", "(Official Audio)", "(Lyric Video)",
-      "(Official Music Video)", "(Audio)", "(Video)", "(En Vivo)",
-      "(Live)", "(Lyrics)",
-    ];
-    for (const sfx of noise) song = song.replace(sfx, "").trim();
+    song = _stripNoise(song);
+    artist = _stripNoise(artist);
     return { artist, song };
   };
 
@@ -440,6 +643,14 @@ export default function UploadZone({
           ...batchDefaultsRef.current,
         };
       });
+      // 2026-05-23: trigger auto-transcribe en el drop. Antes el upload se
+      // difería hasta "Revisar" (bloqueaba al operador ~15-20s viendo un
+      // spinner). Ahora arranca en background mientras el operador elige
+      // wizard options. Cuando llega a "Revisar" los segments están cacheados.
+      if (typeof onAutoTranscribe === "function" && newEntries.length) {
+        // Defer un microtask para que el setFiles haya commiteado el state.
+        Promise.resolve().then(() => onAutoTranscribe(newEntries));
+      }
       return [...prev, ...newEntries];
     });
   };
@@ -638,6 +849,14 @@ export default function UploadZone({
           : (t("upload.single_settings_title") || "Ajustes del video")}
       </p>
 
+      {bgMode !== "auto" && (
+        <div className="mb-3 rounded-lg bg-surface-1/60 ring-1 ring-white/[0.05] px-3 py-2 text-[11px] text-gray-400">
+          {bgMode === "library"
+            ? (t("upload.settings_library_note") || "Usás un fondo de Biblioteca — el movimiento y la escena los define ese clip. El género solo ajusta detalles.")
+            : (t("upload.settings_custom_note") || "Usás un fondo subido por vos — el movimiento y la escena los define tu archivo.")}
+        </div>
+      )}
+
       {/* Movement gallery — click a card to apply to all tracks */}
       <div className="mb-4">
         <div className="mb-2">
@@ -652,42 +871,47 @@ export default function UploadZone({
             )}
           </div>
           <p className="text-[10px] text-gray-600 mt-0.5">
-            {t("upload.movement_gallery_desc") || "Cómo se anima el fondo del video · no afecta los colores"}
+            {t("upload.movement_gallery_desc") || "Cómo se mueve la cámara del fondo. Pasá el mouse o elegí y miralo en el preview ←"}
           </p>
         </div>
-        <div className="grid grid-cols-2 sm:grid-cols-4 gap-2">
-          {MOVEMENT_STYLES.filter((m) => m.sample).map((m) => {
+        <div className="grid grid-cols-2 sm:grid-cols-3 gap-2">
+          {MOVEMENT_STYLES.map((m) => {
             const active = batchDefaults.movementStyle === m.code;
             return (
               <button
-                key={m.code}
+                key={m.code || "auto"}
                 type="button"
                 onClick={() => updateBatchDefault("movementStyle", m.code)}
-                aria-label={`${t("upload.movement_apply_all") || "Aplicar a todas"}: ${m.label}`}
-                className={`text-left rounded-xl overflow-hidden border transition-all duration-200 cursor-pointer
-                  ${active
-                    ? "border-brand/60 shadow-glow ring-1 ring-brand/40"
-                    : "border-white/[0.06] hover:border-white/[0.20] hover:scale-[1.02]"
-                  }`}
+                onMouseEnter={() => setHoverMovement(m.code)}
+                onMouseLeave={() => setHoverMovement(null)}
+                aria-label={`${m.label}: ${m.desc}`}
+                title={m.desc}
+                className={`text-left rounded-xl overflow-hidden border transition-all duration-200 cursor-pointer ${
+                  active
+                    ? "border-transparent ring-1 ring-brand/50 shadow-glow"
+                    : "border-white/[0.06] hover:border-white/[0.20]"
+                }`}
               >
-                <div className="aspect-video bg-black/30 relative">
-                  <video
-                    src={m.sample}
-                    className="w-full h-full object-cover pointer-events-none"
-                    muted autoPlay loop playsInline
-                  />
+                {/* Real Veo example clip per style (Auto has no clip → icon) */}
+                <div className="aspect-video bg-black relative overflow-hidden">
+                  {m.sample ? (
+                    <video src={m.sample} className="w-full h-full object-cover pointer-events-none" autoPlay loop muted playsInline />
+                  ) : (
+                    <div className="w-full h-full grid place-items-center text-gray-400" style={{ background: "radial-gradient(120% 100% at 50% 0,#2a1d52,#0b0820)" }}>
+                      <span className="w-7 h-7">{movIcon(m.code)}</span>
+                    </div>
+                  )}
                   {active && (
-                    <div className="absolute top-1.5 right-1.5 w-5 h-5 rounded-full bg-brand flex items-center justify-center shadow">
-                      <svg className="w-3 h-3 text-white" fill="none" stroke="currentColor" strokeWidth="3" viewBox="0 0 24 24">
-                        <polyline points="20 6 9 17 4 12" />
-                      </svg>
+                    <div className="absolute top-1.5 right-1.5 w-5 h-5 rounded-full bg-brand grid place-items-center shadow">
+                      <svg className="w-3 h-3 text-white" fill="none" stroke="currentColor" strokeWidth="3" viewBox="0 0 24 24"><polyline points="20 6 9 17 4 12" /></svg>
                     </div>
                   )}
                 </div>
-                <div className="px-2 py-1.5 bg-surface-1">
-                  <p className={`text-[11px] truncate ${active ? "text-white font-medium" : "text-gray-300"}`}>
-                    {m.label}
+                <div className="px-2.5 py-2 bg-surface-1">
+                  <p className={`text-[12px] font-medium leading-tight ${active ? "text-white" : "text-gray-200"}`}>
+                    {m.label.replace(/\s*\(.*\)\s*/, "")}
                   </p>
+                  <p className="text-[10px] text-gray-500 leading-snug mt-0.5">{m.desc}</p>
                 </div>
               </button>
             );
@@ -695,32 +919,102 @@ export default function UploadZone({
         </div>
       </div>
 
-      {/* Genre + Concept — only meaningful in AI Auto mode */}
-      {bgMode === "auto" && (
-        <div className="flex flex-wrap gap-3 mb-4">
-          <div className="flex items-center gap-2">
-            <span className="text-[11px] text-gray-600 shrink-0">{t("upload.genre_label") || "Género:"}</span>
-            <Listbox
-              value={batchDefaults.genre}
-              onChange={(v) => updateBatchDefault("genre", v)}
-              options={GENRES}
-              className="w-44"
-              ariaLabel={t("upload.genre_label") || "Género"}
-            />
+      {/* Effect gallery — particles composited OVER the background. Available
+          for ANY source (IA / Biblioteca / Subido): it's an overlay, not a
+          generation choice. Orthogonal to "Movimiento" (camera). */}
+      <div className="mb-4 pt-3 border-t border-white/[0.05]">
+        <div className="mb-2">
+          <div className="flex items-baseline justify-between">
+            <p className="text-[11px] text-gray-400 font-medium">
+              {t("upload.effect_gallery_title") || "Efecto encima"}
+            </p>
+            {files.length > 1 && (
+              <p className="text-[10px] text-gray-600">
+                {t("upload.effect_gallery_hint") || "Click para aplicar a todos · personalizable por canción"}
+              </p>
+            )}
           </div>
-          <div className="flex items-center gap-2">
-            <span className="text-[11px] text-gray-600 shrink-0">{t("upload.concept_label") || "Concepto:"}</span>
-            <Listbox
-              value={batchDefaults.concept}
-              onChange={(v) => updateBatchDefault("concept", v)}
-              options={CONCEPTS}
-              className="w-44"
-              ariaLabel={t("upload.concept_label") || "Concepto"}
-            />
+          <p className="text-[10px] text-gray-600 mt-0.5">
+            {t("upload.effect_gallery_desc") || "Partículas que caen encima del fondo (nieve, lluvia, estrellas…). Es el toque del formato de UMG. Se suma a cualquier fondo, incluso de Biblioteca."}
+          </p>
+        </div>
+        <div className="grid grid-cols-3 sm:grid-cols-6 gap-2">
+          {EFFECTS.map((e) => {
+            const active = (batchDefaults.effect || "") === e.code;
+            return (
+              <button
+                key={e.code || "none"}
+                type="button"
+                onClick={() => updateBatchDefault("effect", e.code)}
+                onMouseEnter={() => setHoverEffect(e.code)}
+                onMouseLeave={() => setHoverEffect(null)}
+                aria-label={`${e.label}: ${e.desc}`}
+                title={e.desc}
+                className={`text-left rounded-xl overflow-hidden border transition-all duration-200 cursor-pointer ${
+                  active
+                    ? "border-transparent ring-1 ring-brand/50 shadow-glow"
+                    : "border-white/[0.06] hover:border-white/[0.20]"
+                }`}
+              >
+                <div className="aspect-video bg-black relative overflow-hidden">
+                  {e.sample ? (
+                    <video src={e.sample} className="w-full h-full object-cover pointer-events-none" autoPlay loop muted playsInline />
+                  ) : (
+                    <div className="w-full h-full grid place-items-center text-gray-500 text-[10px]" style={{ background: "radial-gradient(120% 100% at 50% 0,#241a40,#0b0820)" }}>
+                      {t("upload.effect_none") || "Ninguno"}
+                    </div>
+                  )}
+                  {active && (
+                    <div className="absolute top-1.5 right-1.5 w-5 h-5 rounded-full bg-brand grid place-items-center shadow">
+                      <svg className="w-3 h-3 text-white" fill="none" stroke="currentColor" strokeWidth="3" viewBox="0 0 24 24"><polyline points="20 6 9 17 4 12" /></svg>
+                    </div>
+                  )}
+                </div>
+                <div className="px-2 py-1.5 bg-surface-1">
+                  <p className={`text-label leading-tight ${active ? "text-white" : "text-gray-200"}`}>{e.label}</p>
+                </div>
+              </button>
+            );
+          })}
+        </div>
+      </div>
+
+      {/* Scene metadata (genre + concept) — only when generating with AI.
+          Explained inline so it's clear what they DO and how they impact. */}
+      {bgMode === "auto" && (
+        <div className="mb-4 pt-3 border-t border-white/[0.05]">
+          <p className="text-[11px] text-gray-400 font-medium">{t("upload.scene_meta_title") || "Escena"}</p>
+          <p className="text-[10px] text-gray-600 mt-0.5 mb-2">
+            {sceneMode === "prompt"
+              ? (t("upload.scene_meta_prompt_note") || "Tu prompt define la escena — género y concepto quedan como ayuda secundaria.")
+              : (t("upload.scene_meta_desc") || "Género ajusta la paleta y la atmósfera · Concepto define el tipo de escena (ciudad, naturaleza, abstracto…).")}
+          </p>
+          <div className={`flex flex-wrap gap-3 ${sceneMode === "prompt" ? "opacity-50" : ""}`}>
+            <div className="flex items-center gap-2">
+              <span className="text-[11px] text-gray-600 shrink-0" title={t("upload.genre_help") || "El estilo musical. Ajusta paleta, iluminación y atmósfera del fondo."}>{t("upload.genre_label") || "Género:"}</span>
+              <Listbox
+                value={batchDefaults.genre}
+                onChange={(v) => updateBatchDefault("genre", v)}
+                options={GENRES}
+                className="w-44"
+                ariaLabel={t("upload.genre_label") || "Género"}
+              />
+            </div>
+            <div className="flex items-center gap-2">
+              <span className="text-[11px] text-gray-600 shrink-0" title={t("upload.concept_help") || "El tipo de escena visual: ciudad, naturaleza, abstracto, cósmico, etc."}>{t("upload.concept_label") || "Concepto:"}</span>
+              <Listbox
+                value={batchDefaults.concept}
+                onChange={(v) => updateBatchDefault("concept", v)}
+                options={CONCEPTS}
+                className="w-44"
+                ariaLabel={t("upload.concept_label") || "Concepto"}
+              />
+            </div>
           </div>
         </div>
       )}
 
+      {SHOW_UPLOAD_TYPOGRAPHY && (<>
       {/* Font */}
       <div className="flex items-center gap-2 mb-3">
         <span className="text-[11px] text-gray-600 shrink-0">{t("upload.font_label") || "Tipografía:"}</span>
@@ -790,59 +1084,9 @@ export default function UploadZone({
         </div>
       </div>
 
-      {/* Lyric transition icon buttons */}
-      <div className="flex items-center gap-2 mb-3">
-        <span className="text-[11px] text-gray-600 shrink-0">{t("upload.transition_label") || "Transición:"}</span>
-        <div className="flex gap-1">
-          {[
-            { code: "cut",       icon: "│",   label: t("upload.transition_cut")  || "Corte" },
-            { code: "fade",      icon: "⟿",  label: t("upload.transition_fade") || "Fade"  },
-            { code: "fade_slow", icon: "⟿⟿", label: t("upload.transition_slow") || "Lento" },
-          ].map((opt) => (
-            <button
-              key={opt.code}
-              type="button"
-              title={opt.label}
-              onClick={() => updateBatchDefault("lyricTransition", opt.code)}
-              className={`px-2.5 py-1 rounded-md text-[13px] transition-all
-                ${batchDefaults.lyricTransition === opt.code
-                  ? "bg-brand/20 text-brand ring-1 ring-brand/40"
-                  : "bg-surface-3/40 text-gray-500 hover:text-gray-300"
-                }`}
-            >{opt.icon}</button>
-          ))}
-        </div>
-      </div>
-
-      {/* Text motion icon buttons */}
-      {SHOW_MOTION_PICKER && (
-      <div className="flex items-center gap-2 mb-3">
-        <span className="text-[11px] text-gray-600 shrink-0">{t("upload.motion_label") || "Movimiento del texto:"}</span>
-        <div className="flex gap-1">
-          {[
-            { code: "none",   icon: "·", label: t("upload.motion_none")   || "Estático" },
-            { code: "subtle", icon: "↕", label: t("upload.motion_subtle") || "Sutil"    },
-            // "float" temporarily disabled — see pipeline.py
-            // _text_position_func: per-frame position callable kills
-            // moviepy compositing speed, long songs hit RQ 20-min
-            // timeout. Backend aliases to "subtle". Re-enable when text
-            // layer moves to ffmpeg overlay filters.
-          ].map((opt) => (
-            <button
-              key={opt.code}
-              type="button"
-              title={opt.label}
-              onClick={() => updateBatchDefault("textMotion", opt.code)}
-              className={`px-2.5 py-1 rounded-md text-[13px] transition-all
-                ${batchDefaults.textMotion === opt.code
-                  ? "bg-brand/20 text-brand ring-1 ring-brand/40"
-                  : "bg-surface-3/40 text-gray-500 hover:text-gray-300"
-                }`}
-            >{opt.icon}</button>
-          ))}
-        </div>
-      </div>
-      )}
+      {/* Lyric transition (Corte/Fade fade-time) + Text motion (Sutil drift):
+          deprecados 2026-05-23. Los reemplazan lyrics_animation +
+          line_transition (libass), elegidos en el editor post-upload. */}
 
       {/* Text contrast pills */}
       <div className="flex items-center gap-2">
@@ -868,6 +1112,7 @@ export default function UploadZone({
           ))}
         </div>
       </div>
+      </>)}
     </div>
   ) : null;
 
@@ -880,11 +1125,12 @@ export default function UploadZone({
           (entry.genre        || "") !== (bd.genre        || "") ||
           (entry.concept      || "") !== (bd.concept      || "") ||
           (entry.movementStyle || "") !== (bd.movementStyle || "") ||
+          (entry.effect       || "") !== (bd.effect       || "") ||
           (entry.font         || "") !== (bd.font         || "") ||
           (entry.textCase     || "upper") !== (bd.textCase     || "upper") ||
           (entry.fontScale    || "1.0")   !== (bd.fontScale    || "1.0")   ||
-          (entry.lyricTransition || "cut") !== (bd.lyricTransition || "cut") ||
-          (entry.textMotion   || "none")  !== (bd.textMotion   || "none")  ||
+          (entry.lyricsAnimation || "none") !== (bd.lyricsAnimation || "none") ||
+          (entry.lineTransition || "none") !== (bd.lineTransition || "none") ||
           (entry.textContrast || "medium") !== (bd.textContrast || "medium");
 
         return (
@@ -898,12 +1144,33 @@ export default function UploadZone({
               </div>
               <div className="flex-1 min-w-0">
                 <p className="text-sm text-white truncate">{entry.file.name}</p>
-                {entry.file.name.toLowerCase().endsWith(".wav") &&
-                 entry.file.size > WAV_SOFT_WARN_MB * 1024 * 1024 && (
-                  <p className="text-[11px] text-amber-400/80 mt-0.5 truncate">
-                    {t("batch.wav_warning_large", { sizeMB: Math.round(entry.file.size / (1024 * 1024)) })}
-                  </p>
-                )}
+                {/* 2026-05-24: WAV warning ELIMINADO. Los músicos suben
+                    WAV master por calidad — sugerirles "mejor MP3" es
+                    contradictorio con el producto. El upload DEBE funcionar
+                    hasta 500MB (default subido de 100 → 500 MB en main.py
+                    vía env MAX_UPLOAD_MB). Si el archivo excede el límite,
+                    el backend devuelve 413 con detalle accionable. */}
+                {/* 2026-05-23: status badge de la transcripción en background.
+                    Refleja el estado real del job en backend (queued ▷ transcribing
+                    ▷ done | error). Si transcribeStatusByFile no tiene la key,
+                    no muestra nada (path legacy o todavía no arrancó). */}
+                {(() => {
+                  const k = `${entry.file.name}__${entry.file.lastModified}__${entry.file.size}`;
+                  const st = transcribeStatusByFile[k];
+                  if (!st) return null;
+                  const label = {
+                    uploading:    { txt: "📤 Subiendo…",       cls: "text-blue-400" },
+                    queued:       { txt: "🕓 En cola",          cls: "text-gray-400" },
+                    transcribing: { txt: "🎙 Transcribiendo…", cls: "text-brand-light" },
+                    done:         { txt: "✓ Listo para revisar", cls: "text-accent" },
+                    error:        { txt: `✗ ${st.error || "Error"}`, cls: "text-red-400" },
+                  }[st.status] || { txt: st.status, cls: "text-gray-500" };
+                  return (
+                    <p className={`text-[11px] mt-0.5 truncate ${label.cls}`}>
+                      {label.txt}
+                    </p>
+                  );
+                })()}
               </div>
               <button
                 onClick={(e) => removeFile(i, e)}
@@ -1012,8 +1279,21 @@ export default function UploadZone({
                         <span className="text-[11px] text-gray-600 shrink-0">{t("upload.movement_label") || "Movimiento:"}</span>
                         <Listbox value={entry.movementStyle || ""} onChange={(v) => updateField(i, "movementStyle", v)} options={MOVEMENT_STYLES} className="flex-1" ariaLabel={t("upload.movement_label")} />
                       </div>
+                      <div className="flex items-center gap-2">
+                        <span className="text-[11px] text-gray-600 shrink-0">{t("upload.effect_label") || "Efecto:"}</span>
+                        <Listbox value={entry.effect || ""} onChange={(v) => updateField(i, "effect", v)} options={EFFECTS} className="flex-1" ariaLabel={t("upload.effect_label") || "Efecto"} />
+                      </div>
+                      <div className="flex items-center gap-2">
+                        <span className="text-[11px] text-gray-600 shrink-0">{t("upload.animation_label") || "Animación:"}</span>
+                        <Listbox value={entry.lyricsAnimation || "none"} onChange={(v) => updateField(i, "lyricsAnimation", v)} options={LYRICS_ANIMATIONS} className="flex-1" ariaLabel={t("upload.animation_label") || "Animación"} />
+                      </div>
+                      <div className="flex items-center gap-2">
+                        <span className="text-[11px] text-gray-600 shrink-0">{t("upload.transition_label") || "Transición:"}</span>
+                        <Listbox value={entry.lineTransition || "none"} onChange={(v) => updateField(i, "lineTransition", v)} options={LINE_TRANSITIONS} className="flex-1" ariaLabel={t("upload.transition_label") || "Transición"} />
+                      </div>
                     </>
                   )}
+                  {SHOW_UPLOAD_TYPOGRAPHY && (<>
                   <div className="flex items-center gap-2">
                     <span className="text-[11px] text-gray-600 shrink-0">{t("upload.font_label") || "Tipografía:"}</span>
                     <Listbox value={entry.font || ""} onChange={(v) => updateField(i, "font", v)} options={FONTS} className="flex-1" ariaLabel={t("upload.font_label")} />
@@ -1067,48 +1347,9 @@ export default function UploadZone({
                       ))}
                     </div>
                   </div>
-                  {/* Transition */}
-                  <div className="flex items-center gap-2">
-                    <span className="text-[11px] text-gray-600 shrink-0">{t("upload.transition_label") || "Transición:"}</span>
-                    <div className="flex gap-1">
-                      {[
-                        { code: "cut",       icon: "│",   label: t("upload.transition_cut")  || "Corte" },
-                        { code: "fade",      icon: "⟿",  label: t("upload.transition_fade") || "Fade"  },
-                        { code: "fade_slow", icon: "⟿⟿", label: t("upload.transition_slow") || "Lento" },
-                      ].map((opt) => (
-                        <button key={opt.code} type="button" title={opt.label}
-                          onClick={() => updateField(i, "lyricTransition", opt.code)}
-                          className={`px-2.5 py-1 rounded-md text-[13px] transition-all
-                            ${(entry.lyricTransition || "cut") === opt.code
-                              ? "bg-brand/20 text-brand ring-1 ring-brand/40"
-                              : "bg-surface-3/40 text-gray-500 hover:text-gray-300"
-                            }`}
-                        >{opt.icon}</button>
-                      ))}
-                    </div>
-                  </div>
-                  {/* Text motion */}
-                  {SHOW_MOTION_PICKER && (
-                  <div className="flex items-center gap-2">
-                    <span className="text-[11px] text-gray-600 shrink-0">{t("upload.motion_label") || "Movimiento del texto:"}</span>
-                    <div className="flex gap-1">
-                      {[
-                        { code: "none",   icon: "·", label: t("upload.motion_none")   || "Estático" },
-                        { code: "subtle", icon: "↕", label: t("upload.motion_subtle") || "Sutil"    },
-                        { code: "float",  icon: "∿", label: t("upload.motion_float")  || "Flotante" },
-                      ].map((opt) => (
-                        <button key={opt.code} type="button" title={opt.label}
-                          onClick={() => updateField(i, "textMotion", opt.code)}
-                          className={`px-2.5 py-1 rounded-md text-[13px] transition-all
-                            ${(entry.textMotion || "none") === opt.code
-                              ? "bg-brand/20 text-brand ring-1 ring-brand/40"
-                              : "bg-surface-3/40 text-gray-500 hover:text-gray-300"
-                            }`}
-                        >{opt.icon}</button>
-                      ))}
-                    </div>
-                  </div>
-                  )}
+                  {/* Lyric transition + Text motion legacy: deprecados
+                      2026-05-23. Los reemplazan lyrics_animation +
+                      line_transition que se eligen en el editor. */}
                   {/* Text contrast */}
                   <div className="flex items-center gap-2">
                     <span className="text-[11px] text-gray-600 shrink-0">{t("upload.contrast_label") || "Contraste:"}</span>
@@ -1130,6 +1371,7 @@ export default function UploadZone({
                       ))}
                     </div>
                   </div>
+                  </>)}
                   {bgMode !== "auto" && (
                     <p className="text-[11px] text-ink-secondary pt-1">
                       {t("upload.fields_baked_into_bg") || "Concepto y movimiento están horneados en el fondo elegido."}
@@ -1169,7 +1411,7 @@ export default function UploadZone({
           {/* Mode selector */}
           <div className="flex gap-1 p-1 glass rounded-xl w-fit mb-3" data-tour="upload-bg-tabs">
             {[
-              { id: "auto", label: t("upload.bg_auto") || "IA Auto" },
+              { id: "auto", label: t("upload.bg_auto") || "Generar con IA" },
               { id: "library", label: t("upload.bg_library") || "Library" },
               { id: "custom", label: t("upload.bg_custom_tab") || "Upload" },
             ].map((m) => (
@@ -1193,7 +1435,7 @@ export default function UploadZone({
                     onBackgroundId?.(null);
                   }
                 }}
-                className={`px-4 py-1.5 rounded-lg text-[11px] font-medium transition-all ${
+                className={`px-4 py-1.5 rounded-lg text-label transition-all ${
                   bgMode === m.id ? "bg-brand text-white" : "text-gray-400 hover:text-white"
                 }`}
               >
@@ -1260,7 +1502,7 @@ export default function UploadZone({
                           key={f.id}
                           type="button"
                           onClick={() => setLibraryFilter(f.id)}
-                          className={`flex items-center gap-2 h-8 px-3 rounded-full text-[11px] font-medium transition-all ${
+                          className={`flex items-center gap-2 h-8 px-3 rounded-full text-label transition-all ${
                             libraryFilter === f.id
                               ? "bg-brand/15 text-brand-light ring-1 ring-brand/40"
                               : "bg-surface-2/40 text-ink-secondary ring-1 ring-white/[0.04] hover:ring-white/[0.08] hover:text-white"
@@ -1321,7 +1563,7 @@ export default function UploadZone({
                               )}
                             </div>
                             <div className="px-3 py-2">
-                              <p className="text-[12px] text-white truncate">{bg.name}</p>
+                              <p className="text-caption text-white truncate">{bg.name}</p>
                             </div>
                           </button>
                         );
@@ -1344,7 +1586,7 @@ export default function UploadZone({
                               key={m.id}
                               type="button"
                               onClick={() => onBackgroundMode?.(m.id)}
-                              className={`h-8 px-3 rounded-full text-[11px] font-medium transition-all ${
+                              className={`h-8 px-3 rounded-full text-label transition-all ${
                                 backgroundMode === m.id
                                   ? "bg-brand/15 text-brand-light ring-1 ring-brand/40"
                                   : "bg-surface-2/40 text-ink-secondary ring-1 ring-white/[0.04] hover:ring-white/[0.08] hover:text-white"
@@ -1454,112 +1696,359 @@ export default function UploadZone({
   } else if (bgMode === "custom" && backgroundFile) {
     summaryParts.push(backgroundFile.name.length > 28 ? backgroundFile.name.slice(0, 28) + "…" : backgroundFile.name);
   } else {
-    summaryParts.push(t("upload.bg_auto") || "IA Auto");
+    summaryParts.push(t("upload.bg_auto") || "Generar con IA");
   }
   const summary = summaryParts.join(" · ");
 
   return (
-    <div className="w-full max-w-5xl mx-auto pb-28">
+    <div className="w-full px-2 md:px-6 pb-28">
       <UploadTour user={user} />
-      <div className="flex flex-col md:grid md:grid-cols-[minmax(0,1fr)_340px] lg:grid-cols-[minmax(0,1fr)_380px] gap-6 items-start">
+      {files.length === 0 ? (
+        /* Pre-upload — just the drop zone, centered and prominent */
+        <div className="max-w-2xl mx-auto">{_dropZone}</div>
+      ) : (
+      <div className="flex flex-col lg:grid lg:grid-cols-[190px_minmax(0,1fr)_minmax(400px,460px)] gap-6 items-start">
 
-        {/* LEFT COLUMN — drop zone + file list */}
-        <div className="space-y-4 min-w-0">
-          {_dropZone}
-          {_filesBlock}
+        {/* LEFT — step rail (vertical on desktop, horizontal pills on mobile) */}
+        <nav className="flex lg:flex-col gap-1.5 lg:gap-1 overflow-x-auto lg:overflow-visible lg:sticky lg:top-4 w-full lg:w-auto order-first">
+          {WIZARD_STEPS.map((s) => {
+            const active = wizardStep === s.id;
+            const done = wizardStep > s.id;
+            return (
+              <button
+                key={s.id}
+                type="button"
+                onClick={() => goStep(s.id)}
+                className={`flex items-center gap-2.5 px-3 py-2.5 rounded-xl text-[12.5px] font-medium whitespace-nowrap transition-all text-left shrink-0 ${
+                  active ? "bg-brand/[0.12] text-white ring-1 ring-brand/35"
+                         : "text-gray-400 hover:text-white hover:bg-white/[0.04]"
+                }`}
+              >
+                <span className={`w-6 h-6 rounded-full grid place-items-center text-[11px] font-bold shrink-0 ${
+                  active ? "bg-brand text-white" : done ? "bg-accent/20 text-accent" : "bg-surface-3 text-gray-400"
+                }`}>{done ? "✓" : s.id}</span>
+                {s.label}
+              </button>
+            );
+          })}
+        </nav>
+
+        {/* CENTER — stage: live preview of the result */}
+        <div className="lg:sticky lg:top-4 space-y-2 min-w-0 w-full">
+          {bgMode === "auto" ? (
+            <WizardLivePreview
+              style={style}
+              customColors={customColors}
+              movementStyle={hoverMovement ?? batchDefaults.movementStyle}
+              effect={hoverEffect ?? batchDefaults.effect}
+              lyricsAnimation={hoverAnimation ?? batchDefaults.lyricsAnimation}
+              lineTransition={hoverTransition ?? batchDefaults.lineTransition}
+              mode={sceneMode}
+              lyric={_previewLyric}
+              clipSrc={(MOVEMENT_STYLES.find((m) => m.code === (hoverMovement ?? batchDefaults.movementStyle))?.sample) || "/movement_samples/estandar.mp4"}
+            />
+          ) : (
+            <div className="aspect-video rounded-2xl ring-1 ring-white/[0.08] bg-surface-2/50 grid place-items-center text-gray-500 text-[13px]">
+              {bgMode === "library" ? (t("upload.bg_library") || "Fondo de biblioteca") : (t("upload.bg_custom_tab") || "Fondo subido")}
+            </div>
+          )}
+          <p className="text-[10px] text-gray-600 px-1">
+            {_previewLyric
+              ? `${t("upload.preview_editing") || "Editando"}: ${_previewLyric}${files.length > 1 ? ` · +${files.length - 1}` : ""}`
+              : (t("upload.preview_disclaimer") || "Aproximación del mood y el movimiento. El fondo final lo genera la IA.")}
+          </p>
         </div>
 
-        {/* RIGHT COLUMN — batch settings, sticky on md+ */}
-        {files.length > 0 && (
-          <div className="md:sticky md:top-4 md:self-start space-y-4">
+        {/* RIGHT — active step controls only (revealed one step at a time) */}
+        <div className="space-y-4 min-w-0 w-full">
+          {files.length > 1 && (
+            <div className="flex items-center gap-1.5 px-1">
+              <span className="inline-flex items-center gap-1.5 text-[10px] text-gray-500 uppercase tracking-[0.16em]">
+                <svg className="w-3 h-3 shrink-0" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
+                  <path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/>
+                  <path d="M23 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/>
+                </svg>
+                Aplica a los {files.length} tracks
+              </span>
+            </div>
+          )}
 
-            {/* Batch scope badge */}
-            {files.length > 1 && (
-              <div className="flex items-center gap-1.5 px-1">
-                <span className="inline-flex items-center gap-1.5 text-[10px] text-gray-500 uppercase tracking-[0.16em]">
-                  <svg className="w-3 h-3 shrink-0" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
-                    <path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/>
-                    <path d="M23 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/>
-                  </svg>
-                  Aplica a los {files.length} tracks
-                </span>
-              </div>
-            )}
+          {/* STEP 1 — Subí: manage files + per-track metadata */}
+          {wizardStep === 1 && (
+            <>
+              {_dropZone}
+              {_filesBlock}
+            </>
+          )}
 
-            {/* 1. Visual style */}
-            {onStyleChange && (
-              <div className="rounded-card bg-surface-2/40 ring-1 ring-white/[0.04] px-4 py-3">
-                <p className="text-[10px] uppercase tracking-[0.18em] text-gray-500">{t("upload.style_label")}</p>
-                <p className="text-[11px] text-gray-600 mb-2 mt-0.5">
-                  {t("upload.style_desc") || "Paleta de colores del fondo IA y del gradiente animado"}
-                </p>
-                <div className="grid grid-cols-2 gap-2">
-                  {STYLES.map((s) => (
-                    <button
-                      key={s.code}
-                      type="button"
-                      onClick={() => onStyleChange(s.code)}
-                      className={`flex flex-col items-center gap-2 px-2 py-2.5 rounded-xl border text-[11px] font-medium transition-all duration-200
-                        ${style === s.code
-                          ? "border-brand/50 text-white ring-1 ring-brand/40 scale-[1.02]"
-                          : "border-white/[0.06] text-gray-400 hover:border-white/[0.16] hover:text-white"
-                        }`}
-                    >
-                      <span
-                        className={`w-full h-7 rounded-lg block ring-1 transition-all duration-200 ${
-                          style === s.code ? "ring-brand/50 shadow-[0_0_12px_2px_rgba(139,92,246,0.3)]" : "ring-white/[0.06]"
-                        }`}
-                        style={{ background: s.swatch }}
+          {/* STEP 2 — Modo: source + the 3 modes + contextual mood/prompt */}
+          {wizardStep === 2 && (
+            <>
+              {_bgBlock}
+              {bgMode === "auto" && (
+                <>
+                  <div className="grid grid-cols-1 gap-2">
+                    {[
+                      { code: "auto",   icon: "✨", label: t("upload.mode_auto") || "Auto",                                 desc: t("upload.mode_auto_desc") || "La IA elige la escena por el género y el mood." },
+                      { code: "lyrics", icon: "🎤", label: t("upload.inspired_by_lyrics_label") || "Inspirado en la letra", desc: t("upload.mode_lyrics_desc") || "El fondo nace de lo que dice la canción.", badge: t("upload.mode_edge") || "ÚNICO" },
+                      { code: "prompt", icon: "✍️", label: t("upload.bg_prompt_label_short") || "Mi prompt",                desc: t("upload.mode_prompt_desc") || "Vos describís el fondo, con opción usar tal cual." },
+                    ].map((m) => {
+                      const sel = sceneMode === m.code;
+                      return (
+                        <button
+                          key={m.code}
+                          type="button"
+                          onClick={() => selectSceneMode(m.code)}
+                          className={`text-left rounded-card px-4 py-3 flex items-start gap-3 border transition-all duration-200 ${
+                            sel ? "border-transparent ring-1 ring-brand/50 bg-brand/[0.08] shadow-glow"
+                                : "border-white/[0.06] bg-surface-2/40 hover:border-white/[0.18]"
+                          }`}
+                        >
+                          <span className={`w-9 h-9 rounded-xl grid place-items-center text-[17px] shrink-0 ${sel ? "bg-brand" : "bg-surface-3"}`}>{m.icon}</span>
+                          <span className="min-w-0">
+                            <span className="flex items-center gap-2">
+                              <span className={`text-[13px] font-semibold ${sel ? "text-white" : "text-gray-200"}`}>{m.label}</span>
+                              {m.badge && <span className="text-[8px] font-bold tracking-[0.04em] px-1.5 py-0.5 rounded bg-accent/15 text-accent">{m.badge}</span>}
+                            </span>
+                            <span className="block text-[11px] text-gray-500 mt-0.5 leading-snug">{m.desc}</span>
+                          </span>
+                        </button>
+                      );
+                    })}
+                  </div>
+
+                  {sceneMode === "prompt" ? (
+                    <div className="rounded-card bg-surface-2/40 ring-1 ring-white/[0.04] px-4 py-3">
+                      <p className="text-[11px] text-gray-600 mb-2">
+                        {t("upload.bg_prompt_hint") || "Describí el fondo que querés. Manda sobre el género/concepto y la letra."}
+                      </p>
+                      <textarea
+                        value={batchDefaults.backgroundHint || ""}
+                        onChange={(e) => updateBatchDefault("backgroundHint", e.target.value.slice(0, 2000))}
+                        rows={3}
+                        maxLength={2000}
+                        placeholder={t("upload.bg_prompt_placeholder") || "Ej: mansión surreal de noche, pileta vacía, cámara fija, sólo se mueve el reflejo del agua…"}
+                        className="w-full text-caption rounded-lg bg-surface-1 border border-white/[0.08] focus:border-brand/50 px-3 py-2 text-gray-200 placeholder:text-gray-600 resize-y outline-none"
                       />
-                      <span className="leading-tight text-center">
-                        <span className="block font-semibold">{t(s.labelKey)}</span>
-                        <span className="block text-[10px] text-gray-500">{t(s.subKey)}</span>
-                      </span>
+                      <label className="mt-2 flex items-center gap-2.5 cursor-pointer">
+                        <input
+                          type="checkbox"
+                          checked={!batchDefaults.bgVerbatim}
+                          onChange={(e) => updateBatchDefault("bgVerbatim", !e.target.checked)}
+                          className="peer sr-only"
+                        />
+                        <div className="relative w-9 h-5 rounded-full bg-surface-3 peer-checked:bg-brand transition-colors duration-200 shrink-0">
+                          <div className="absolute top-0.5 left-0.5 w-4 h-4 rounded-full bg-white shadow transition-transform duration-200 peer-checked:translate-x-4" />
+                        </div>
+                        <span className="text-[11px] text-gray-400">
+                          {t("upload.bg_enhance_label") || "✨ Mejorar mi prompt con IA"}
+                          <span className="block text-[10px] text-gray-600">{t("upload.bg_enhance_hint") || "Por defecto usamos tu texto tal cual."}</span>
+                        </span>
+                      </label>
+                    </div>
+                  ) : onStyleChange && (
+                    <div className="rounded-card bg-surface-2/40 ring-1 ring-white/[0.04] px-4 py-3">
+                      <p className="text-[10px] uppercase tracking-[0.18em] text-gray-500">{t("upload.style_label")}</p>
+                      <p className="text-[11px] text-gray-600 mb-2 mt-0.5">
+                        {t("upload.style_desc") || "Cómo se colorea el fondo IA"}
+                      </p>
+
+                      {/* Auto — default, the AI picks colors from the song */}
+                      <button
+                        type="button"
+                        onClick={() => onStyleChange("auto")}
+                        className={`w-full flex items-center gap-3 px-3 py-2.5 rounded-xl border text-left transition-all duration-200 mb-2 ${
+                          style === "auto" ? "border-transparent ring-1 ring-brand/50 bg-brand/[0.08]" : "border-white/[0.06] hover:border-white/[0.16]"
+                        }`}
+                      >
+                        <span className="w-8 h-8 rounded-lg shrink-0" style={{ background: "conic-gradient(from 180deg,#6D4AFF,#14C8A8,#b45a14,#6D4AFF)" }} />
+                        <span>
+                          <span className={`block text-[12px] font-semibold ${style === "auto" ? "text-white" : "text-gray-200"}`}>{t("upload.style_auto") || "Auto"}</span>
+                          <span className="block text-[10px] text-gray-500">{t("upload.style_auto_desc") || "La IA elige los colores según la canción"}</span>
+                        </span>
+                      </button>
+
+                      {/* 4 presets */}
+                      <div className="grid grid-cols-2 gap-2">
+                        {STYLES.map((s) => (
+                          <button
+                            key={s.code}
+                            type="button"
+                            onClick={() => onStyleChange(s.code)}
+                            className={`flex flex-col items-center gap-2 px-2 py-2.5 rounded-xl border text-label transition-all duration-200
+                              ${style === s.code
+                                ? "border-brand/50 text-white ring-1 ring-brand/40 scale-[1.02]"
+                                : "border-white/[0.06] text-gray-400 hover:border-white/[0.16] hover:text-white"
+                              }`}
+                          >
+                            <span
+                              className={`w-full h-7 rounded-lg block ring-1 transition-all duration-200 ${
+                                style === s.code ? "ring-brand/50 shadow-[0_0_12px_2px_rgba(139,92,246,0.3)]" : "ring-white/[0.06]"
+                              }`}
+                              style={{ background: s.swatch }}
+                            />
+                            <span className="leading-tight text-center">
+                              <span className="block font-semibold">{t(s.labelKey)}</span>
+                              <span className="block text-[10px] text-gray-500">{t(s.subKey)}</span>
+                            </span>
+                          </button>
+                        ))}
+                      </div>
+
+                      {/* Personalizado — pick your own colors */}
+                      <button
+                        type="button"
+                        onClick={() => onStyleChange("custom")}
+                        className={`w-full flex items-center gap-3 px-3 py-2.5 rounded-xl border text-left transition-all duration-200 mt-2 ${
+                          style === "custom" ? "border-transparent ring-1 ring-brand/50 bg-brand/[0.08]" : "border-white/[0.06] hover:border-white/[0.16]"
+                        }`}
+                      >
+                        <span className="w-8 h-8 rounded-lg shrink-0 grid place-items-center text-[15px] bg-surface-3">🎨</span>
+                        <span>
+                          <span className={`block text-[12px] font-semibold ${style === "custom" ? "text-white" : "text-gray-200"}`}>{t("upload.style_custom") || "Personalizado"}</span>
+                          <span className="block text-[10px] text-gray-500">{t("upload.style_custom_desc") || "Elegí tus colores (marca, artista…)"}</span>
+                        </span>
+                      </button>
+                      {style === "custom" && onCustomColorsChange && (() => {
+                        const parts = (customColors || "").split(",").map((x) => x.trim()).filter(Boolean);
+                        const c1 = parts[0] && /^#[0-9a-fA-F]{6}$/.test(parts[0]) ? parts[0] : "#6D4AFF";
+                        const c2 = parts[1] && /^#[0-9a-fA-F]{6}$/.test(parts[1]) ? parts[1] : "#14C8A8";
+                        return (
+                          <div className="mt-2 flex items-center gap-3 px-1">
+                            <label className="flex items-center gap-1.5 text-[11px] text-gray-400 cursor-pointer">
+                              <input type="color" value={c1} onChange={(e) => onCustomColorsChange(`${e.target.value}, ${c2}`)} className="w-7 h-7 rounded cursor-pointer bg-transparent border-0 p-0" />
+                            </label>
+                            <label className="flex items-center gap-1.5 text-[11px] text-gray-400 cursor-pointer">
+                              <input type="color" value={c2} onChange={(e) => onCustomColorsChange(`${c1}, ${e.target.value}`)} className="w-7 h-7 rounded cursor-pointer bg-transparent border-0 p-0" />
+                            </label>
+                            <span className="text-[10px] text-gray-600">{t("upload.style_custom_hint") || "2 colores dominantes para el fondo"}</span>
+                          </div>
+                        );
+                      })()}
+                    </div>
+                  )}
+                </>
+              )}
+            </>
+          )}
+
+          {/* STEP 3 — Movimiento + metadata */}
+          {wizardStep === 3 && _batchSettingsBlock}
+
+          {/* STEP 4 — Animación: lyrics animation template (libass, fast path) */}
+          {wizardStep === 4 && (
+            <div className="rounded-card bg-surface-2/40 ring-1 ring-white/[0.04] p-4">
+              <style>{`
+                @keyframes acard-pop { 0%{transform:scale(1.18);opacity:0} 55%{transform:scale(.95)} 80%{transform:scale(1.03)} 100%{transform:scale(1);opacity:1} }
+                @keyframes acard-glow { 0%,100%{text-shadow:0 1px 6px rgba(0,0,0,.6)} 50%{text-shadow:0 0 13px rgba(20,200,168,.95),0 1px 6px rgba(0,0,0,.6)} }
+                @keyframes acard-word { 0%,12%{opacity:0;transform:translateY(5px)} 34%,100%{opacity:1;transform:translateY(0)} }
+                @keyframes acard-karaoke { 0%,8%{color:#7c7c8a} 42%,100%{color:#fff} }
+                @keyframes tcard-slideup { 0%{transform:translateY(120%);opacity:0} 22%,88%{transform:translateY(0);opacity:1} 100%{transform:translateY(-120%);opacity:0} }
+                @keyframes tcard-slideside { 0%{transform:translateX(-130%);opacity:0} 22%,88%{transform:translateX(0);opacity:1} 100%{transform:translateX(130%);opacity:0} }
+                @keyframes tcard-wipe { 0%{clip-path:inset(0 100% 0 0)} 35%,100%{clip-path:inset(0 0 0 0)} }
+                @keyframes tcard-blur { 0%{filter:blur(6px);opacity:0} 30%,80%{filter:blur(0);opacity:1} 100%{filter:blur(6px);opacity:0} }
+              `}</style>
+              <p className="text-[11px] text-gray-300 font-medium">{t("upload.step_animation") || "Animación"} de la letra</p>
+              <p className="text-[10px] text-gray-600 mt-0.5 mb-3">
+                {t("upload.anim_gallery_desc") || "Cómo aparecen las palabras sobre el video. Pasá el mouse o elegí y miralo en el preview ←"}
+              </p>
+              <div className="grid grid-cols-2 sm:grid-cols-3 gap-2">
+                {LYRICS_ANIMATIONS.map((a) => {
+                  const active = batchDefaults.lyricsAnimation === a.code;
+                  return (
+                    <button
+                      key={a.code}
+                      type="button"
+                      onClick={() => updateBatchDefault("lyricsAnimation", a.code)}
+                      onMouseEnter={() => setHoverAnimation(a.code)}
+                      onMouseLeave={() => setHoverAnimation(null)}
+                      aria-label={`${a.label}: ${a.desc}`}
+                      title={a.desc}
+                      className={`text-left rounded-xl overflow-hidden border transition-all duration-200 cursor-pointer ${
+                        active
+                          ? "border-transparent ring-1 ring-brand/50 shadow-glow"
+                          : "border-white/[0.06] hover:border-white/[0.20]"
+                      }`}
+                    >
+                      <div className="aspect-video relative overflow-hidden grid place-items-center" style={{ background: "radial-gradient(120% 100% at 50% 0,#1a1430,#0b0820)" }}>
+                        {animDemo(a.code)}
+                        {active && (
+                          <div className="absolute top-1.5 right-1.5 w-5 h-5 rounded-full bg-brand grid place-items-center shadow">
+                            <svg className="w-3 h-3 text-white" fill="none" stroke="currentColor" strokeWidth="3" viewBox="0 0 24 24"><polyline points="20 6 9 17 4 12" /></svg>
+                          </div>
+                        )}
+                      </div>
+                      <div className="px-2.5 py-2 bg-surface-1">
+                        <p className={`text-[12px] font-medium leading-tight ${active ? "text-white" : "text-gray-200"}`}>
+                          {a.emoji ? `${a.emoji} ` : ""}{a.label}
+                        </p>
+                        <p className="text-[10px] text-gray-500 leading-snug mt-0.5">{a.desc}</p>
+                      </div>
                     </button>
-                  ))}
+                  );
+                })}
+              </div>
+              <p className="text-[10px] text-gray-600 mt-2">
+                🎤 {t("upload.anim_word_note") || "Funcionan en toda canción — el tiempo por palabra se calcula automáticamente."}
+              </p>
+
+              {/* Transición entre líneas — eje aparte, compone con la animación */}
+              <div className="mt-4 pt-3 border-t border-white/[0.05]">
+                <p className="text-[11px] text-gray-300 font-medium">{t("upload.transition_title") || "Transición entre líneas"}</p>
+                <p className="text-[10px] text-gray-600 mt-0.5 mb-3">
+                  {t("upload.transition_desc") || "Cómo entra y sale cada línea. Se combina con la animación elegida."}
+                </p>
+                <div className="grid grid-cols-3 sm:grid-cols-5 gap-2">
+                  {LINE_TRANSITIONS.map((tr) => {
+                    const active = (batchDefaults.lineTransition || "none") === tr.code;
+                    return (
+                      <button
+                        key={tr.code}
+                        type="button"
+                        onClick={() => updateBatchDefault("lineTransition", tr.code)}
+                        onMouseEnter={() => setHoverTransition(tr.code)}
+                        onMouseLeave={() => setHoverTransition(null)}
+                        aria-label={`${tr.label}: ${tr.desc}`}
+                        title={tr.desc}
+                        className={`text-left rounded-xl overflow-hidden border transition-all duration-200 cursor-pointer ${
+                          active
+                            ? "border-transparent ring-1 ring-brand/50 shadow-glow"
+                            : "border-white/[0.06] hover:border-white/[0.20]"
+                        }`}
+                      >
+                        <div className="aspect-video relative overflow-hidden grid place-items-center" style={{ background: "radial-gradient(120% 100% at 50% 0,#1a1430,#0b0820)" }}>
+                          {transDemo(tr.code)}
+                          {active && (
+                            <div className="absolute top-1.5 right-1.5 w-4 h-4 rounded-full bg-brand grid place-items-center shadow">
+                              <svg className="w-2.5 h-2.5 text-white" fill="none" stroke="currentColor" strokeWidth="3" viewBox="0 0 24 24"><polyline points="20 6 9 17 4 12" /></svg>
+                            </div>
+                          )}
+                        </div>
+                        <div className="px-2 py-1.5 bg-surface-1">
+                          <p className={`text-label leading-tight ${active ? "text-white" : "text-gray-200"}`}>{tr.label}</p>
+                        </div>
+                      </button>
+                    );
+                  })}
                 </div>
               </div>
-            )}
+            </div>
+          )}
 
-            {/* 1.5 Inspired-by-lyrics toggle.
-                Controls match_lyrics on /generate. When ON, Gemini reads
-                the song's lyrics and builds the background around the
-                primary visual subject (sea, road, stadium...). When OFF,
-                falls back to genre/concept vocabulary only. Default ON.
-                Surfaced here because UMG (2026-05-14) saw ~80% of rock
-                tracks rendered as alleys — operator now has a visible
-                lever and can audit which mode produced each video. */}
-            {onInspiredByLyricsChange && (
-              <label className="rounded-card bg-surface-2/40 ring-1 ring-white/[0.04] px-4 py-3 flex items-center gap-3 cursor-pointer hover:ring-white/[0.08] transition-colors">
-                <input
-                  type="checkbox"
-                  checked={!!inspiredByLyrics}
-                  onChange={(e) => onInspiredByLyricsChange(e.target.checked)}
-                  className="peer sr-only"
-                />
-                <div className="relative w-9 h-5 rounded-full bg-surface-3 peer-checked:bg-brand transition-colors duration-200 shrink-0">
-                  <div className="absolute top-0.5 left-0.5 w-4 h-4 rounded-full bg-white shadow transition-transform duration-200 peer-checked:translate-x-4" />
-                </div>
-                <div className="flex-1 min-w-0">
-                  <p className="text-[10px] uppercase tracking-[0.18em] text-gray-500">{t("upload.inspired_by_lyrics_label") || "Inspirado en la letra"}</p>
-                  <p className="text-[11px] text-gray-600 mt-0.5">
-                    {t("upload.inspired_by_lyrics_hint") || "Cuando está activo, el fondo se construye alrededor de lo que dice la canción. Apagalo para escenas más genéricas según el género."}
-                  </p>
-                </div>
-              </label>
-            )}
-
-            {/* 2. Background selector */}
-            {_bgBlock}
-
-            {/* 3. Batch-wide controls: movement gallery + text defaults */}
-            {_batchSettingsBlock}
-
-            {/* 4. Delivery selector — ProRes gated */}
-            {user?.features?.prores_export && _deliveryBlock}
-          </div>
-        )}
+          {/* STEP 5 — Entregá: delivery + final recap */}
+          {wizardStep === 5 && (
+            <>
+              {user?.features?.prores_export && _deliveryBlock}
+              <div className="rounded-card bg-surface-2/40 ring-1 ring-white/[0.04] px-4 py-3">
+                <p className="text-[10px] uppercase tracking-[0.18em] text-gray-500 mb-1">{t("upload.step_deliver") || "Entregá"}</p>
+                <p className="text-[13px] text-gray-200">{summary}</p>
+                <p className="text-[11px] text-gray-600 mt-1">{t("upload.deliver_hint") || "Revisá los lyrics para ajustar el tiempo, o generá directo."}</p>
+              </div>
+            </>
+          )}
+        </div>
       </div>
+      )}
 
       {/* Sticky bottom CTA bar */}
       {files.length > 0 && (
@@ -1567,10 +2056,10 @@ export default function UploadZone({
           className={`fixed bottom-0 left-0 right-0 z-30 bg-surface-1/85 backdrop-blur-xl border-t border-white/[0.06] px-4 md:px-8 py-4 transition-all duration-300 ${sidebarOpen ? "md:left-64" : "md:left-0"}`}
           data-tour="upload-cta-bar"
         >
-          <div className="max-w-5xl mx-auto flex flex-wrap items-center gap-3">
+          <div className="w-full flex flex-wrap items-center gap-3">
             <div className="flex-1 min-w-0">
               <p className="text-[10px] uppercase tracking-[0.18em] text-gray-500">
-                {files.length > 1 ? (t("upload.batch_summary") || "Lote") : (t("upload.single_settings_title") || "Ajustes del video")}
+                {t("upload.step")} {wizardStep}/{WIZARD_STEPS.length} · {WIZARD_STEPS[wizardStep - 1]?.label}
               </p>
               <p className="text-sm text-white truncate mt-0.5">{summary}</p>
               {!allHaveArtist && (
@@ -1579,26 +2068,51 @@ export default function UploadZone({
                 </p>
               )}
             </div>
-            {onGenerateDirect && (
+
+            {wizardStep > 1 && (
               <button
-                onClick={onGenerateDirect}
-                disabled={!allHaveArtist}
-                className="btn-secondary text-xs h-11 px-4 disabled:opacity-40 disabled:cursor-not-allowed"
+                onClick={() => goStep(wizardStep - 1)}
+                className="btn-secondary text-xs h-11 px-4"
               >
-                {t("upload.generate_direct") || "Generar directo"}
+                {t("upload.back") || "Atrás"}
               </button>
             )}
-            {onStartReview && (
+
+            {wizardStep < WIZARD_STEPS.length ? (
               <button
-                onClick={onStartReview}
-                disabled={!allHaveArtist}
+                onClick={() => goStep(wizardStep + 1)}
+                disabled={wizardStep === 1 && !allHaveArtist}
                 className="btn-primary h-11 px-6 disabled:opacity-40 disabled:cursor-not-allowed"
               >
-                {t("upload.review_lyrics") || "Revisar lyrics"}
+                {t("upload.continue") || "Continuar"}
                 <svg className="inline-block ml-1.5 w-4 h-4 -mt-0.5" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
                   <path d="M5 12h14M12 5l7 7-7 7" />
                 </svg>
               </button>
+            ) : (
+              <>
+                {onGenerateDirect && (
+                  <button
+                    onClick={onGenerateDirect}
+                    disabled={!allHaveArtist}
+                    className="btn-secondary text-xs h-11 px-4 disabled:opacity-40 disabled:cursor-not-allowed"
+                  >
+                    {t("upload.generate_direct") || "Generar directo"}
+                  </button>
+                )}
+                {onStartReview && (
+                  <button
+                    onClick={onStartReview}
+                    disabled={!allHaveArtist}
+                    className="btn-primary h-11 px-6 disabled:opacity-40 disabled:cursor-not-allowed"
+                  >
+                    {t("upload.review_lyrics") || "Revisar lyrics"}
+                    <svg className="inline-block ml-1.5 w-4 h-4 -mt-0.5" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
+                      <path d="M5 12h14M12 5l7 7-7 7" />
+                    </svg>
+                  </button>
+                )}
+              </>
             )}
           </div>
         </div>

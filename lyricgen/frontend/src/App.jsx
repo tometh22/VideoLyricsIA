@@ -16,10 +16,12 @@ import HistoryView from "./components/HistoryView";
 import UploadZone from "./components/UploadZone";
 import LyricsEditor from "./components/LyricsEditor";
 import BatchProgress from "./components/BatchProgress";
+import TranscribingProgress from "./components/TranscribingProgress";
 import JobDetail from "./components/JobDetail";
 import Settings from "./components/Settings";
 import AdminPanel from "./components/AdminPanel";
 import { useAlert } from "./components/AlertProvider";
+import { useBackgroundPreview } from "./hooks/useBackgroundPreview";
 
 const API = import.meta.env.VITE_API_URL || "";
 
@@ -356,19 +358,34 @@ export default function App() {
   const [token, setToken] = useState(getToken());
   const [user, setUser] = useState(getUser());
   const [files, setFiles] = useState([]);
+  // Ref que espeja `files` para que callbacks sin dependencias (ej.
+  // onAutoTranscribe en un setTimeout) lean el estado actual sin re-render
+  // loops. Sync con un useEffect debajo.
+  const filesRef = useRef(files);
   const [delivery, setDelivery] = useState({
     delivery_profile: "youtube",
     umg_frame_size: "HD",
     umg_fps: 24,
     umg_prores_profile: 3,
   });
-  const [style, setStyle] = useState("oscuro");
+  const [style, setStyle] = useState("auto");
+  // Custom palette (hex/names, comma-sep) used when style === "custom".
+  const [customColors, setCustomColors] = useState("");
 
   const [reviewQueue, setReviewQueue] = useState([]);
   const [currentReview, setCurrentReview] = useState(null);
   const [approvedJobs, setApprovedJobs] = useState([]);
   const [transcribing, setTranscribing] = useState(false);
   const [transcribeError, setTranscribeError] = useState(null);
+  // Capa B 2026-05-24 — wizardStage es la única fuente de verdad de qué muestra
+  // el wizard. Reemplaza el `navigate("/review")` que disparaba el flash a
+  // dashboard. URL se queda en /new mientras el operador transita upload →
+  // review → ready_to_generate. La navegación a /generating sigue siendo
+  // legítima (pantalla dedicada de progreso del batch). Valores:
+  //   "upload"            → UploadZone (drop archivos + opciones).
+  //   "review"            → spinner de transcribiendo / LyricsEditor inline.
+  //   "ready_to_generate" → resumen + botón "Crear N videos".
+  const [wizardStage, setWizardStage] = useState("upload");
   // {phase: "uploading"|"transcribing", loaded, total} during the
   // upload→whisper handoff. Drives the progress bar in /review.
   const [transcribeProgress, setTranscribeProgress] = useState(null);
@@ -402,6 +419,11 @@ export default function App() {
   const [resetToken, setResetToken] = useState(null);
   const [billingSuccess, setBillingSuccess] = useState(false);
   const pollingIntervals = useRef(new Set());
+  // R-FRONT-5 (Frontend specialist 2026-05-24): isMountedRef previene
+  // setState-on-unmounted warnings + memory leaks cuando el operador
+  // navega away durante un SSE/polling en curso. Cada callback async
+  // chequea esto antes de tocar state.
+  const isMountedRef = useRef(true);
   // 2 concurrent workers: enough to keep the queue fed without spiking
   // the API with 5 simultaneous upload-url+generate calls from one user.
   const PARALLEL_WORKERS = 2;
@@ -437,8 +459,11 @@ export default function App() {
       wizardPersistence.clear();
       return;
     }
-    wizardPersistence.save({ files, approvedJobs, currentReview, reviewQueue });
-  }, [files, approvedJobs, currentReview, reviewQueue]);
+    // Capa B 2026-05-24: persist wizardStage para que un refresh durante
+    // review NO te tire de vuelta al state "upload". El snap.load() lo
+    // rehidrata en el useEffect de mount.
+    wizardPersistence.save({ files, approvedJobs, currentReview, reviewQueue, wizardStage });
+  }, [files, approvedJobs, currentReview, reviewQueue, wizardStage]);
 
   // beforeunload warning — covers closing the tab, refreshing, or
   // navigating to an external URL. LyricsEditor already has its own
@@ -479,15 +504,18 @@ export default function App() {
       setReviewQueue((snap.reviewQueue || []).map(wizardPersistence.rehydrateQueueEntry));
       setApprovedJobs((snap.approvedJobs || []).map(wizardPersistence.rehydrateQueueEntry));
       setCurrentReview(wizardPersistence.rehydrateReview(snap.currentReview));
+      // Capa B 2026-05-24: restaurar wizardStage para que /new renderice
+      // el reviewScreen content si el operador estaba mid-review al refresh.
+      // Default "upload" si el snap es viejo (sin wizardStage) o si no hay
+      // currentReview/approved (sólo files staged).
+      const resumedStage = snap.wizardStage
+        || ((snap.currentReview || (snap.approvedJobs?.length || 0) > 0) ? "review" : "upload");
+      setWizardStage(resumedStage);
       setResumableWizard(null);
-      // If we have a draft in progress → /review. If only approved jobs
-      // (came back between songs) → /review too, lets handleBackInReview
-      // pop the last one. If only files staged → /new for re-upload.
-      if (snap.currentReview || (snap.approvedJobs?.length || 0) > 0) {
-        navigate("/review");
-      } else {
-        navigate("/new");
-      }
+      // Capa B: una sola ruta destino — /new — con wizardStage indicando
+      // qué content mostrar inline. Antes navegábamos a /review cuando había
+      // currentReview/approved, ahora /new lo hace todo via wizardScreen.
+      navigate("/new");
     } finally {
       // Defer flag flip past the React commit so the persistence useEffect
       // runs once with the FULLY restored state and writes a fresh snapshot.
@@ -546,22 +574,52 @@ export default function App() {
   // Proactively refresh the JWT when it has less than 1 day left, so users
   // with active sessions never hit a sudden 401 mid-session. Runs once per
   // token value (i.e. on load and whenever a fresh token is stored).
+  //
+  // INCIDENT (audit 2026-05-24): the previous code had two silent-failure
+  // modes:
+  //   (1) An already-expired token (secondsLeft < 0) bypassed the
+  //       `> 86400` early-return (negative is < 86400 → falls through
+  //       to refresh), but if `/auth/refresh` then 401'd, the bare
+  //       `.catch(() => {})` swallowed it. The user kept typing into a
+  //       dead session — every autosave 401'd silently, every "Generar"
+  //       click failed with no clear cause.
+  //   (2) Same shape on a network failure: refresh fails, no logout, no
+  //       toast, user stranded.
+  //
+  // Fix: if the token is already expired OR refresh fails (any reason),
+  // force a clean logout so the login screen renders and the user knows
+  // what to do. Network blips during refresh-while-still-valid still get
+  // a silent retry (the existing 401 interceptors handle the in-flight
+  // requests).
   useEffect(() => {
     if (!token) return;
     const exp = getTokenExp(token);
     if (!exp) return;
     const secondsLeft = exp - Math.floor(Date.now() / 1000);
-    if (secondsLeft > 86400) return; // more than 1 day left — no action needed
+    const alreadyExpired = secondsLeft <= 0;
+    if (!alreadyExpired && secondsLeft > 86400) return;
     authFetch(`${API}/auth/refresh`, { method: "POST" })
-      .then((r) => (r.ok ? r.json() : null))
+      .then((r) => (r.ok ? r.json() : Promise.reject(new Error(`refresh ${r.status}`))))
       .then((data) => {
         if (data?.token) {
           localStorage.setItem("genly_token", data.token);
           setToken(data.token);
+        } else {
+          throw new Error("refresh response missing token");
         }
       })
-      .catch(() => {});
-  }, [token]);
+      .catch((err) => {
+        if (alreadyExpired) {
+          // Hard logout — the session is unrecoverable.
+          console.warn("[auth] token expired and refresh failed — logging out:", err?.message);
+          handleLogout();
+        } else {
+          // Token still valid for now; log the failure so it shows up in
+          // devtools but don't disrupt the session.
+          console.warn("[auth] preemptive refresh failed (will retry on next mount):", err?.message);
+        }
+      });
+  }, [token, handleLogout]);
 
   // `historyError` lets the dashboard surface a "connection failed,
   // retry" state instead of silently rendering an empty list when /jobs
@@ -630,6 +688,7 @@ export default function App() {
         const cleanup = () => { es.close(); pollingIntervals.current.delete(es); };
         pollingIntervals.current.add(es);
         es.onmessage = (e) => {
+          if (!isMountedRef.current) { cleanup(); return; }
           try {
             const data = JSON.parse(e.data);
             setJobs((prev) => prev.map((j) =>
@@ -642,7 +701,7 @@ export default function App() {
             ));
             if (TERMINAL.has(data.status)) {
               cleanup();
-              fetchHistory();
+              if (isMountedRef.current) fetchHistory();
               resolve(data.status);
             }
           } catch {}
@@ -659,6 +718,12 @@ export default function App() {
       function startPolling() {
         const iv = setInterval(async () => {
           if (typeof document !== "undefined" && document.hidden) return;
+          if (!isMountedRef.current) {
+            clearInterval(iv);
+            pollingIntervals.current.delete(iv);
+            resolve("aborted");
+            return;
+          }
           if (!getToken()) {
             clearInterval(iv);
             pollingIntervals.current.delete(iv);
@@ -676,6 +741,12 @@ export default function App() {
             }
             if (!res.ok) return;
             const data = await res.json();
+            if (!isMountedRef.current) {
+              clearInterval(iv);
+              pollingIntervals.current.delete(iv);
+              resolve("aborted");
+              return;
+            }
             setJobs((prev) => prev.map((j) =>
               j.job_id === jobId
                 ? { ...j, status: data.status, current_step: data.current_step,
@@ -687,7 +758,7 @@ export default function App() {
             if (TERMINAL.has(data.status)) {
               clearInterval(iv);
               pollingIntervals.current.delete(iv);
-              fetchHistory();
+              if (isMountedRef.current) fetchHistory();
               resolve(data.status);
             }
           } catch {}
@@ -699,26 +770,130 @@ export default function App() {
   }, [fetchHistory, handleLogout]);
 
   useEffect(() => () => {
+    // R-FRONT-5: marca unmounted ANTES de cerrar handles para que
+    // cualquier callback async en flight (SSE messages bufferadas, polls
+    // ya disparados) salga temprano vía el guard sin tocar state.
+    isMountedRef.current = false;
     pollingIntervals.current.forEach((handle) => {
       if (handle && typeof handle.close === "function") handle.close();
       else clearInterval(handle);
     });
   }, []);
 
+  // Sync filesRef con files para que callbacks asincrónicos vean el state actual.
+  useEffect(() => { filesRef.current = files; }, [files]);
+
+  // Estado per-row visible en UploadZone — { [stableKey]: "uploading" | "queued" |
+  // "transcribing" | "done" | "error" }. Stable key = file.name + file.lastModified.
+  // Sirve para mostrar el status badge en cada fila del wizard mientras la
+  // transcripción corre en background (2026-05-23 refactor).
+  const [transcribeStatusByFile, setTranscribeStatusByFile] = useState({});
+  const fileKey = (f) => `${f.name}__${f.lastModified}__${f.size}`;
+  const setRowStatus = (file, status, extra = {}) => {
+    const k = fileKey(file);
+    setTranscribeStatusByFile((prev) => ({ ...prev, [k]: { status, ...extra } }));
+  };
+
+  // Polls /transcription-status hasta que el job terminó. Devuelve los datos
+  // con segments + reference_lyrics, o null si falló. Backoff 1.5s → 5s.
+  // 2026-05-23: necesario por el nuevo backend async que devuelve 202+job_id
+  // al POST /transcribe-uploaded en vez de los segments inline.
+  const pollUntilTranscribed = useCallback(async (jobId, file) => {
+    let delay = 1500;
+    const start = Date.now();
+    // INCIDENT 2026-05-24: previous TIMEOUT_MS was 5 min "igual que
+    // job_timeout backend". PR #295 raised the backend RQ timeout to
+    // 30 min because the post-PR-G pipeline (demucs + FA + whisperX +
+    // fallbacks) legitimately takes 8-12 min for long WAVs. The
+    // frontend was left at 5 min — users saw "La transcripción falló"
+    // even though the backend was still processing successfully (two
+    // jobs in DB completed at progress=70 after the frontend already
+    // gave up).
+    //
+    // Bumped to 20 min — covers the legitimate worst case (~12 min)
+    // with margin, but bails well before the backend's 30 min hard
+    // cap so we still distinguish "stuck" from "legitimate slow".
+    const TIMEOUT_MS = 20 * 60 * 1000;   // 20 min — was 5 min, see above
+    while (Date.now() - start < TIMEOUT_MS) {
+      try {
+        const res = await authFetchWithRetryOn503(
+          `${API}/transcription-status/${jobId}`,
+          { method: "GET" },
+          { maxRetries: 2 },
+        );
+        if (res.ok) {
+          const data = await res.json();
+          if (data.status === "transcribed") {
+            if (file) setRowStatus(file, "done");
+            return data;
+          }
+          if (data.status === "transcription_failed") {
+            if (file) setRowStatus(file, "error", { error: data.error });
+            return null;
+          }
+          if (file) setRowStatus(file, data.status === "transcribing_queued" ? "queued" : "transcribing");
+        }
+      } catch {
+        // Transient errors — keep polling.
+      }
+      await new Promise((r) => setTimeout(r, delay));
+      delay = Math.min(delay * 1.2, 5000);
+    }
+    // 20 min sin respuesta — el backend tiene 30 min de RQ timeout, así
+    // que si llegamos acá el job casi seguro está stuck o el worker
+    // murió. Mensaje claro al usuario + job sigue procesándose en
+    // background (puede volver desde el Historial cuando termine).
+    if (file) setRowStatus(file, "error", {
+      error: "Esto está tardando más de lo esperado. Tu transcripción sigue procesándose — volvé al Historial en unos minutos para ver el resultado.",
+    });
+    return null;
+  }, []);
+
   // Pre-upload + transcribe songs at indices fromIdx..queue.length-1 in the
-  // background while the user is actively reviewing a different song. Results
-  // land in prefetchCache.current[idx] so transcribeNext can serve them
-  // instantly instead of making the user wait for the round-trip.
+  // background while the user is actively reviewing a different song (o ahora
+  // también mientras está en la pantalla de upload eligiendo opciones).
+  // Resultados van a prefetchCache.current[idx] para que transcribeNext los
+  // sirva instant en vez de hacer al usuario esperar el round-trip.
+  //
+  // 2026-05-23: refactor a backend async. La respuesta del POST es ahora
+  // {job_id, status: "transcribing_queued"} — hay que pollear /status hasta
+  // que llegue a "transcribed" para obtener segments + reference_lyrics.
+  // R-FRONT-3 (review specialist 2026-05-24): cost-leak prevention en
+  // handleReset. Sin esto, las transcripciones encoladas en background
+  // seguían drenando Whisper + R2 cuando el operador cancelaba el batch.
+  // Conservador: solo abortamos LOOP ITERATIONS (no requests en progreso —
+  // requeriría signal en uploadFileToR2 + authFetchWithRetryOn503, que es
+  // refactor invasivo). El próximo iteration ve aborted=true y rompe.
+  const prefetchAbortRef = useRef(null);
+  if (prefetchAbortRef.current === null) {
+    prefetchAbortRef.current = new AbortController();
+  }
+
   const prefetchRemaining = useCallback(async (queue, fromIdx) => {
+    // Snapshot del controller actual al arrancar el loop. Si handleReset
+    // crea uno nuevo entremedio, esta closure sigue revisando el viejo
+    // (que YA está abortado) y rompe limpio.
+    const controller = prefetchAbortRef.current;
     for (let idx = fromIdx; idx < queue.length; idx++) {
-      // Skip if already fetched or in-flight.
+      if (controller && controller.signal.aborted) {
+        // handleReset disparó abort — paramos el prefetch loop. Los
+        // requests en flight se completan (sin signal) pero el siguiente
+        // iter NO arranca.
+        break;
+      }
       if (prefetchCache.current[idx]) continue;
       prefetchCache.current[idx] = { status: "loading" };
       const entry = queue[idx];
+      const file = entry.file;
       try {
-        const { jobId } = await uploadFileToR2(entry.file, {
+        setRowStatus(file, "uploading");
+        const { jobId } = await uploadFileToR2(file, {
           meta: { artist: entry.artist || "", title: (entry.songTitle || "").trim() },
+          // R-FRONT-3 end-to-end: si handleReset abort, la upload se corta
+          // en la mitad del multipart en vez de seguir hasta terminar.
+          signal: controller && controller.signal,
         });
+        setRowStatus(file, "queued");
         const res = await authFetchWithRetryOn503(`${API}/transcribe-uploaded`, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
@@ -728,25 +903,79 @@ export default function App() {
             artist: entry.artist || "",
             title: (entry.songTitle || "").trim(),
           }),
+          signal: controller && controller.signal,
         }, { maxRetries: 3 });
-        if (res.ok) {
-          const data = await res.json();
+        if (!res.ok) {
+          prefetchCache.current[idx] = { status: "error" };
+          setRowStatus(file, "error");
+          continue;
+        }
+        const initial = await res.json();
+        // Backward compat: if backend returned segments inline (legacy sync
+        // path con ASYNC_TRANSCRIBE_ENABLED=0), salteamos el polling.
+        if (initial.segments) {
+          prefetchCache.current[idx] = { status: "ready", data: initial, jobId };
+          setRowStatus(file, "done");
+          continue;
+        }
+        // Async path — pollear hasta transcribed.
+        const data = await pollUntilTranscribed(initial.job_id || jobId, file);
+        if (data) {
           prefetchCache.current[idx] = { status: "ready", data, jobId };
         } else {
           prefetchCache.current[idx] = { status: "error" };
         }
-      } catch {
+      } catch (err) {
+        // R-FRONT-3 e2e: handleReset disparó abort. Salimos clean del
+        // loop sin marcar "error" (no es un fallo real — es cancelación).
+        if (err && (err.name === "AbortError" || (controller && controller.signal.aborted))) {
+          prefetchCache.current[idx] = { status: "aborted" };
+          break;
+        }
         prefetchCache.current[idx] = { status: "error" };
+        setRowStatus(file, "error");
       }
     }
-  }, []);
+  }, [pollUntilTranscribed]);
+
+  // 2026-05-23: trigger de transcripción auto en el drop del archivo. Antes
+  // se difería hasta el click en "Revisar", bloqueando al usuario ~15-20s en
+  // un loader. Ahora arranca al instante en background mientras el operador
+  // elige movement/effect/font/paleta. Cuando llega a "Revisar", los segments
+  // están cacheados → editor abre instant.
+  const onAutoTranscribe = useCallback((newFiles) => {
+    // newFiles llega desde UploadZone.addFiles con el shape que ya conocemos.
+    // Lo agregamos a la cola de prefetch. prefetchRemaining respeta serial
+    // (1 a la vez) para no saturar el backend pool — para parallelismo
+    // estricto refactorear con semáforo en v2.
+    // Pasamos los files actuales + los nuevos para que prefetch use el
+    // índice global del array en files (no del slice nuevo).
+    setTimeout(() => {
+      // Defer 1 tick para que setFiles haya commiteado antes del prefetch.
+      const merged = filesRef.current || [];
+      const startIdx = Math.max(0, merged.length - newFiles.length);
+      prefetchRemaining(merged, startIdx);
+    }, 0);
+  }, [prefetchRemaining]);
 
   // --- Review flow ---
+  // 2026-05-23: NO limpia más el prefetchCache. Si onAutoTranscribe ya cargó
+  // transcripciones en background, las reusamos. El cache queda mapeado por
+  // índice en `files`, así que es válido siempre que `files` no haya cambiado
+  // de orden — y no lo cambiamos entre upload y review.
   const handleStartReview = async () => {
     if (!files.length || !files.every((f) => f.artist.trim())) return;
-    prefetchCache.current = {};
+    // Capa B 2026-05-24 — antes navegábamos a /review (que disparaba un flash
+    // a dashboard por una race con el guard del fallback). Capa A lo
+    // mitigó con setTranscribing(true) sync, pero el URL change seguía
+    // sucediendo (visualmente "salta" de wizard a otra pantalla aunque
+    // el chrome sea igual). Capa B: no navegamos — wizardStage="review"
+    // hace que /new renderice el reviewScreen content INLINE. El operador
+    // ve transición continua, no jump de ruta.
     setReviewQueue([...files]);
-    navigate("/review");
+    setTranscribing(true);
+    setTranscribeError(null);
+    setWizardStage("review");
     transcribeNext([...files], 0);
   };
 
@@ -756,7 +985,8 @@ export default function App() {
       filename: f.file.name, _file: f.file, artist: f.artist.trim(),
       songTitle: (f.songTitle || "").trim(),
       language: f.language, genre: f.genre || "", font: f.font || "",
-      concept: f.concept || "", movementStyle: f.movementStyle || "",
+      concept: f.concept || "", movementStyle: f.movementStyle || "", effect: f.effect || "",
+      backgroundHint: f.backgroundHint || "", bgVerbatim: !!f.bgVerbatim,
       status: "queued", current_step: null,
       progress: 0, job_id: null, error: null,
     }));
@@ -779,11 +1009,10 @@ export default function App() {
         file: entry.file, artist: entry.artist, language: entry.language,
         songTitle: entry.songTitle || "",
         genre: entry.genre || "", font: entry.font || "",
-        concept: entry.concept || "", movementStyle: entry.movementStyle || "",
+        concept: entry.concept || "", movementStyle: entry.movementStyle || "", effect: entry.effect || "",
+        backgroundHint: entry.backgroundHint || "", bgVerbatim: !!entry.bgVerbatim,
         textCase: entry.textCase || "upper",
         fontScale: entry.fontScale || "1.0",
-        lyricTransition: entry.lyricTransition || "cut",
-        textMotion: entry.textMotion || "none",
         textContrast: entry.textContrast || "medium",
         segments: data.segments, referenceLyrics: data.reference_lyrics || "",
         coverageWarning: !!data.coverage_warning,
@@ -820,7 +1049,16 @@ export default function App() {
       // Step 2: tell the API to fetch the just-uploaded audio from R2,
       // run Whisper / lrclib, return segments. Same shape as the
       // legacy /transcribe response.
-      setTranscribeProgress({ phase: "transcribing", loaded: 0, total: 0 });
+      // Carry jobId + fileName so the TranscribingProgress component can
+      // open SSE on /events/{jobId} and render the modern stepper that
+      // reads `current_step` emitted by `_step()` in main.py.
+      setTranscribeProgress({
+        phase: "transcribing",
+        loaded: 0,
+        total: 0,
+        jobId: uploadJobId,
+        fileName: entry.file?.name || "",
+      });
       transcribeRes = await authFetchWithRetryOn503(`${API}/transcribe-uploaded`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -850,18 +1088,31 @@ export default function App() {
         setTranscribeError(reason);
         return;
       }
-      const data = await transcribeRes.json();
+      let data = await transcribeRes.json();
+      // 2026-05-23 — si el backend respondió 202 sin segments (path async),
+      // pollear /transcription-status hasta que termine. Backward compat:
+      // si vinieron segments inline (ASYNC_TRANSCRIBE_ENABLED=0), seguir.
+      if (!data.segments) {
+        setTranscribeProgress({ phase: "transcribing", loaded: 0, total: 0 });
+        const polled = await pollUntilTranscribed(data.job_id || uploadJobId, entry.file);
+        if (!polled) {
+          setTranscribing(false);
+          setTranscribeProgress(null);
+          setTranscribeError("La transcripción falló. Reintentá.");
+          return;
+        }
+        data = polled;
+      }
       setTranscribing(false);
       setTranscribeProgress(null);
       setCurrentReview({
         file: entry.file, artist: entry.artist, language: entry.language,
         songTitle: entry.songTitle || "",
         genre: entry.genre || "", font: entry.font || "",
-        concept: entry.concept || "", movementStyle: entry.movementStyle || "",
+        concept: entry.concept || "", movementStyle: entry.movementStyle || "", effect: entry.effect || "",
+        backgroundHint: entry.backgroundHint || "", bgVerbatim: !!entry.bgVerbatim,
         textCase: entry.textCase || "upper",
         fontScale: entry.fontScale || "1.0",
-        lyricTransition: entry.lyricTransition || "cut",
-        textMotion: entry.textMotion || "none",
         textContrast: entry.textContrast || "medium",
         segments: data.segments, referenceLyrics: data.reference_lyrics || "",
         coverageWarning: !!data.coverage_warning,
@@ -918,14 +1169,20 @@ export default function App() {
       file: r.file, artist: r.artist, language: r.language,
       songTitle: r.songTitle || "",
       genre: r.genre || "", font: r.font || "", concept: r.concept || "",
-      movementStyle: r.movementStyle || "",
+      movementStyle: r.movementStyle || "", effect: r.effect || "",
+      backgroundHint: r.backgroundHint || "", bgVerbatim: !!r.bgVerbatim,
       textCase: r.textCase || "upper",
       fontScale: r.fontScale || "1.0",
-      lyricTransition: r.lyricTransition || "cut",
-      textMotion: r.textMotion || "none",
+      // lyricTransition + textMotion: deprecados 2026-05-23.
+      lyricsAnimation: r.lyricsAnimation || "none",
+      lineTransition: r.lineTransition || "none",
       textContrast: r.textContrast || "medium",
       segments: editedSegments,
       transcribeJobId: r.transcribeJobId || null,
+      // Capa C 2026-05-24: bgCacheKey viene del useBackgroundPreview hook
+      // que corrió durante review. Si null = no se hizo pre-gen (free-tier
+      // o params no estables); pipeline corre Veo/Imagen como siempre.
+      bgCacheKey: r.bgCacheKey || null,
     }];
     setApprovedJobs(newApproved);
     setCurrentReview(null);
@@ -953,11 +1210,13 @@ export default function App() {
       filename: a.file.name, _file: a.file, artist: a.artist,
       songTitle: (a.songTitle || "").trim(),
       language: a.language, genre: a.genre || "", font: a.font || "",
-      concept: a.concept || "", movementStyle: a.movementStyle || "",
+      concept: a.concept || "", movementStyle: a.movementStyle || "", effect: a.effect || "",
+      backgroundHint: a.backgroundHint || "", bgVerbatim: !!a.bgVerbatim,
       textCase: a.textCase || "upper",
       fontScale: a.fontScale || "1.0",
-      lyricTransition: a.lyricTransition || "cut",
-      textMotion: a.textMotion || "none",
+      // lyricTransition + textMotion: deprecados 2026-05-23.
+      lyricsAnimation: a.lyricsAnimation || "none",
+      lineTransition: a.lineTransition || "none",
       textContrast: a.textContrast || "medium",
       segments: a.segments,
       transcribeJobId: a.transcribeJobId || null,
@@ -988,18 +1247,31 @@ export default function App() {
         formData.append("artist", jobList[i].artist);
         if (jobList[i].songTitle) formData.append("song_title", jobList[i].songTitle);
         formData.append("style", style);
+        if (style === "custom" && customColors.trim()) formData.append("custom_colors", customColors.trim());
         if (jobList[i].language) formData.append("language", jobList[i].language);
         if (jobList[i].genre) formData.append("genre", jobList[i].genre);
         if (jobList[i].font) formData.append("font", jobList[i].font);
         if (jobList[i].concept) formData.append("concept", jobList[i].concept);
         if (jobList[i].movementStyle) formData.append("movement_style", jobList[i].movementStyle);
+        if (jobList[i].effect) formData.append("effect", jobList[i].effect);
+        if ((jobList[i].backgroundHint || "").trim()) {
+          formData.append("background_hint", jobList[i].backgroundHint.trim());
+          if (jobList[i].bgVerbatim) formData.append("bg_verbatim", "true");
+        }
         formData.append("text_case", jobList[i].textCase || "upper");
         formData.append("font_scale", String(jobList[i].fontScale || "1.0"));
-        formData.append("lyric_transition", jobList[i].lyricTransition || "cut");
-        formData.append("text_motion", jobList[i].textMotion || "none");
+        // lyric_transition + text_motion: deprecados 2026-05-23 (no se envían).
+        formData.append("lyrics_animation", jobList[i].lyricsAnimation || "none");
+        formData.append("line_transition", jobList[i].lineTransition || "none");
         formData.append("text_contrast", jobList[i].textContrast || "medium");
         if (animateImage && backgroundFile) formData.append("animate_image", "true");
         formData.append("match_lyrics", String(!!inspiredByLyrics));
+        // Capa C 2026-05-24 — si el operador hizo pre-gen del background
+        // mientras editaba lyrics (POST /generate-preview), el hash del
+        // cache va acá. Backend skip Veo/Imagen si el cache hit.
+        if (jobList[i].bgCacheKey) {
+          formData.append("bg_cache_key", jobList[i].bgCacheKey);
+        }
         formData.append("segments_json", JSON.stringify(jobList[i].segments));
         formData.append("delivery_profile", delivery.delivery_profile);
         if (delivery.delivery_profile !== "youtube") {
@@ -1105,6 +1377,7 @@ export default function App() {
         generateBody.append("artist", jobList[i].artist);
         if (jobList[i].songTitle) generateBody.append("song_title", jobList[i].songTitle);
         generateBody.append("style", style);
+        if (style === "custom" && customColors.trim()) generateBody.append("custom_colors", customColors.trim());
         generateBody.append("segments_json", "[]");
         generateBody.append("delivery_profile", delivery.delivery_profile);
         if (delivery.delivery_profile !== "youtube") {
@@ -1117,10 +1390,16 @@ export default function App() {
         if (jobList[i].font) generateBody.append("font", jobList[i].font);
         if (jobList[i].concept) generateBody.append("concept", jobList[i].concept);
         if (jobList[i].movementStyle) generateBody.append("movement_style", jobList[i].movementStyle);
+        if (jobList[i].effect) generateBody.append("effect", jobList[i].effect);
+        if ((jobList[i].backgroundHint || "").trim()) {
+          generateBody.append("background_hint", jobList[i].backgroundHint.trim());
+          if (jobList[i].bgVerbatim) generateBody.append("bg_verbatim", "true");
+        }
         generateBody.append("text_case", jobList[i].textCase || "upper");
         generateBody.append("font_scale", String(jobList[i].fontScale || "1.0"));
-        generateBody.append("lyric_transition", jobList[i].lyricTransition || "cut");
-        generateBody.append("text_motion", jobList[i].textMotion || "none");
+        // lyric_transition + text_motion: deprecados 2026-05-23 (no se envían).
+        generateBody.append("lyrics_animation", jobList[i].lyricsAnimation || "none");
+        generateBody.append("line_transition", jobList[i].lineTransition || "none");
         generateBody.append("text_contrast", jobList[i].textContrast || "medium");
         if (animateImage && backgroundFile) generateBody.append("animate_image", "true");
         generateBody.append("match_lyrics", String(!!inspiredByLyrics));
@@ -1180,9 +1459,15 @@ export default function App() {
     pollingIntervals.current.forEach((iv) => clearInterval(iv));
     pollingIntervals.current.clear();
     prefetchCache.current = {};
+    // R-FRONT-3: abortamos el prefetch loop (el siguiente iter se rompe).
+    // Después creamos un controller fresco para el próximo batch del operador.
+    try { prefetchAbortRef.current && prefetchAbortRef.current.abort(); } catch {}
+    prefetchAbortRef.current = new AbortController();
     setFiles([]); setJobs([]); setBackgroundFile(null); setBackgroundId(null);
     setReviewQueue([]); setCurrentReview(null); setApprovedJobs([]);
     setTranscribing(false); setReadyToGenerate(false); setTranscribeError(null);
+    // Capa B 2026-05-24: el wizard descartó todo → vuelve al upload state.
+    setWizardStage("upload");
     navigate("/dashboard");
     fetchHistory();
   };
@@ -1205,11 +1490,12 @@ export default function App() {
         genre: last.genre || "",
         font: last.font || "",
         concept: last.concept || "",
-        movementStyle: last.movementStyle || "",
+        movementStyle: last.movementStyle || "", effect: last.effect || "",
         textCase: last.textCase || "upper",
         fontScale: last.fontScale || "1.0",
-        lyricTransition: last.lyricTransition || "cut",
-        textMotion: last.textMotion || "none",
+        // lyricTransition + textMotion: deprecados 2026-05-23.
+        lyricsAnimation: last.lyricsAnimation || "none",
+        lineTransition: last.lineTransition || "none",
         textContrast: last.textContrast || "medium",
         segments: last.segments,
         referenceLyrics: "",
@@ -1227,11 +1513,17 @@ export default function App() {
     setReviewQueue([]);
     setTranscribing(false);
     setTranscribeError(null);
-    navigate("/new");
+    // Capa B 2026-05-24: la primer canción canceló review → vuelve al upload
+    // INLINE (no navega). El operador ve la file list de nuevo, conserva su
+    // configuración. Si quería tirar todo, usa Cancelar (handleReset).
+    setWizardStage("upload");
   };
 
   const handleGenerateBatch = () => {
     setReadyToGenerate(false);
+    // No tocamos wizardStage acá — startGenerationWithSegments navega a
+    // /generating (pantalla dedicada de progreso). El wizard queda
+    // "stale" pero handleReset lo limpia cuando el operator vuelve.
     startGenerationWithSegments(approvedJobs);
   };
 
@@ -1320,6 +1612,59 @@ export default function App() {
 
   const allHaveArtist = files.length > 0 && files.every((f) => f.artist.trim());
 
+  // Capa C 2026-05-24 — dispara pre-gen del background apenas el operador
+  // entra a review (transcribiendo o editando lyrics), con debounce 2s
+  // sobre cambios de los params. Cuando termina, persiste bgCacheKey en
+  // currentReview; el handleApproveLyrics lo pasa a approvedJobs; el
+  // POST /generate lo manda como Form field.
+  // Sólo cuando hay currentReview Y artist+songTitle filled.
+  // Forwarded params usan style/customColors globales del wizard (no per-file).
+  const previewEntry = currentReview ? {
+    ...currentReview,
+    style,                   // batch-level
+    customColors,            // batch-level
+    backgroundMode: "veo",
+    animateImage: animateImage && !!backgroundFile,
+    matchLyrics: inspiredByLyrics,
+  } : null;
+  // bgPreview se invoca por side-effect (POST + polling). El status/error
+  // está en el return por si en el futuro mostramos un badge "Fondo:
+  // generando…" en el editor. Hoy se persiste sólo via onCacheKey →
+  // currentReview.bgCacheKey, y el handleApproveLyrics lo copia a
+  // approvedJobs para mandarlo al POST /generate.
+  // bgPreview alimenta:
+  //   - onCacheKey → currentReview.bgCacheKey + approvedJobs (race fix R-FRONT-2).
+  //   - bgPreview.status → chip subtle "Fondo: generando…" en LyricsEditor
+  //     (UX specialist 2026-05-24, cierra el mental-model gap de pre-gen invisible).
+  const bgPreview = useBackgroundPreview(previewEntry, {
+    enabled: !!currentReview,
+    api: API,
+    authHeaders,
+    onCacheKey: (key) => {
+      // Update currentReview si aún estamos editando ese file.
+      setCurrentReview((r) => (r ? { ...r, bgCacheKey: key } : r));
+      // R-FRONT-2 (2026-05-24): si el operador aprobó ANTES que el preview
+      // terminara (review rápido < 30s), currentReview ya es null. El cache
+      // key se hubiera perdido y POST /generate correría Veo de vuelta.
+      // Actualizamos approvedJobs también, matcheando por filename.
+      setApprovedJobs((prev) => {
+        if (!prev || prev.length === 0) return prev;
+        const target = previewEntry?.file?.name;
+        if (!target) return prev;
+        let changed = false;
+        const next = prev.map((j) => {
+          if (j.bgCacheKey === key) return j;
+          if (j.file && j.file.name === target) {
+            changed = true;
+            return { ...j, bgCacheKey: key };
+          }
+          return j;
+        });
+        return changed ? next : prev;
+      });
+    },
+  });
+
   // --- Per-route screens (kept inline so they share App-level state) ---
 
   // Resume banner shown on /new and /review when sessionStorage has a
@@ -1372,7 +1717,7 @@ export default function App() {
     : null;
 
   const newBatchScreen = (
-    <div className="w-full max-w-4xl mx-auto animate-fade-in">
+    <div className="w-full max-w-[1700px] mx-auto animate-fade-in">
       <div className="flex items-center gap-3 mb-8">
         <button onClick={() => navigate("/dashboard")}
           className="w-9 h-9 rounded-xl glass flex items-center justify-center text-gray-400 hover:text-white transition-colors">
@@ -1395,6 +1740,8 @@ export default function App() {
         onDeliveryChange={setDelivery}
         style={style}
         onStyleChange={setStyle}
+        customColors={customColors}
+        onCustomColorsChange={setCustomColors}
         backgroundFile={backgroundFile}
         onBackgroundFile={setBackgroundFile}
         backgroundId={backgroundId}
@@ -1410,11 +1757,14 @@ export default function App() {
         onGenerateDirect={handleGenerateDirect}
         user={user}
         sidebarOpen={sidebarOpen}
+        // 2026-05-23: auto-transcribe en background al dropear.
+        onAutoTranscribe={onAutoTranscribe}
+        transcribeStatusByFile={transcribeStatusByFile}
       />
     </div>
   );
 
-  // /review handles three sub-states: spinner while transcribing,
+  // /review handles three sub-states (transcribing spinner, LyricsEditor,
   // LyricsEditor when a song is ready to review, and the batch summary
   // before launching generation. Empty state → redirect home.
   const reviewScreen = (() => {
@@ -1450,41 +1800,44 @@ export default function App() {
       const phase = transcribeProgress?.phase;
       const loaded = transcribeProgress?.loaded || 0;
       const total = transcribeProgress?.total || 0;
-      const pct = phase === "uploading" && total > 0
-        ? Math.round((loaded / total) * 100)
-        : null;
-      const phaseLabel = (
-        phase === "uploading" ? t("transcribe.uploading") :
-        phase === "transcribing" ? t("transcribe.title") :
-        t("transcribe.title")
-      );
-      const phaseSub = (
-        phase === "uploading" && pct !== null
-          ? t("transcribe.uploading_progress", { pct })
-          : t("transcribe.subtitle")
-      );
-      return (
-        <div className="w-full max-w-md mx-auto mt-16 animate-fade-in text-center">
-          {pct !== null ? (
-            <div className="w-full max-w-xs mx-auto mb-4">
-              <div className="h-1.5 bg-surface-1 rounded-full overflow-hidden">
-                <div
-                  className="h-full rounded-full bg-gradient-to-r from-brand to-brand-light transition-all duration-300"
-                  style={{ width: `${pct}%` }}
-                />
+      // Upload progress = before the job_id exists; keep the simple bar.
+      if (phase === "uploading") {
+        const pct = total > 0 ? Math.round((loaded / total) * 100) : null;
+        return (
+          <div className="w-full max-w-md mx-auto mt-16 animate-fade-in text-center">
+            {pct !== null ? (
+              <div className="w-full max-w-xs mx-auto mb-4">
+                <div className="h-1.5 bg-surface-1 rounded-full overflow-hidden">
+                  <div
+                    className="h-full rounded-full bg-gradient-to-r from-brand to-brand-light transition-all duration-300"
+                    style={{ width: `${pct}%` }}
+                  />
+                </div>
               </div>
-            </div>
-          ) : (
-            <div className="w-12 h-12 mx-auto mb-4 border-2 border-brand border-t-transparent rounded-full animate-spin" />
-          )}
-          <h2 className="text-xl font-bold mb-2">{phaseLabel}</h2>
-          <p className="text-gray-500 text-sm">{phaseSub}</p>
-          {reviewQueue.length > 1 && (
-            <p className="text-xs text-gray-600 mt-2">
-              {t("transcribe.song")} {approvedJobs.length + 1} {t("editor.song_of")} {reviewQueue.length}
-            </p>
-          )}
-        </div>
+            ) : (
+              <div className="w-12 h-12 mx-auto mb-4 border-2 border-brand border-t-transparent rounded-full animate-spin" />
+            )}
+            <h2 className="text-xl font-bold mb-2">{t("transcribe.uploading")}</h2>
+            {pct !== null && (
+              <p className="text-gray-500 text-sm">{t("transcribe.uploading_progress", { pct })}</p>
+            )}
+          </div>
+        );
+      }
+      // Transcribing — modern stepper that reads backend current_step + progress
+      // emitted by `_step()` in main.py. SSE-driven via useJobProgress.
+      const currentJobId = transcribeProgress?.jobId;
+      const fileName = transcribeProgress?.fileName || "";
+      return (
+        <TranscribingProgress
+          jobId={currentJobId}
+          api={API}
+          token={token}
+          t={t}
+          fileName={fileName}
+          queueIndex={approvedJobs.length + 1}
+          queueTotal={reviewQueue.length}
+        />
       );
     }
     if (currentReview) {
@@ -1497,6 +1850,9 @@ export default function App() {
             // editor would keep showing the previous song's segments
             // when handleBackInReview swaps currentReview underneath it.
             key={`${currentReview.file.name}:${currentReview.queueIdx}`}
+            // Clear the app's own sticky top bar (~72px) so the editor's
+            // sticky CTA header isn't hidden behind it in the wizard.
+            stickyHeaderTop={72}
             segments={currentReview.segments}
             filename={currentReview.file.name}
             audioFile={currentReview.file}
@@ -1515,9 +1871,24 @@ export default function App() {
             font={currentReview.font || ""}
             textCase={currentReview.textCase || "upper"}
             fontScale={parseFloat(currentReview.fontScale || "1.0")}
-            lyricTransition={currentReview.lyricTransition || "cut"}
-            textMotion={currentReview.textMotion || "none"}
             textContrast={currentReview.textContrast || "medium"}
+            // 2026-05-23: lyricTransition + textMotion deprecados. Ahora
+            // el editor expone lyrics_animation + line_transition (libass,
+            // paridad con el wizard).
+            lyricsAnimation={currentReview.lyricsAnimation || "none"}
+            lineTransition={currentReview.lineTransition || "none"}
+            // Typography is now chosen LIVE in the editor preview (not in the
+            // upload step). Thread the operator's choices back into
+            // currentReview so handleApproveLyrics carries them to generate.
+            onFontChange={(c) => setCurrentReview((r) => (r ? { ...r, font: c } : r))}
+            onCaseChange={(c) => setCurrentReview((r) => (r ? { ...r, textCase: c } : r))}
+            onContrastChange={(c) => setCurrentReview((r) => (r ? { ...r, textContrast: c } : r))}
+            onAnimationChange={(c) => setCurrentReview((r) => (r ? { ...r, lyricsAnimation: c } : r))}
+            onLineTransitionChange={(c) => setCurrentReview((r) => (r ? { ...r, lineTransition: c } : r))}
+            // UX specialist 2026-05-24: chip de status del pre-gen del
+            // fondo. Status posibles: "idle" | "queued" | "generating" |
+            // "done" | "error" | "disabled" (free-tier plan-tier guard).
+            bgStatus={bgPreview.status}
           />
         </div>
       );
@@ -1561,9 +1932,37 @@ export default function App() {
         </div>
       );
     }
-    // No batch in flight → redirect home (e.g. user refreshed during /review).
-    return <Navigate to="/dashboard" replace />;
+    // Empty state — el operador llegó a /review sin estado (deep-link, refresh
+    // sin sessionStorage, o transición rota). En vez de redirigir silencioso a
+    // dashboard (race condition reportada 2026-05-24: el redirect se disparaba
+    // por el primer render asíncrono de handleStartReview), mostramos un
+    // fallback explícito con CTA para que el operador sepa qué pasó.
+    return (
+      <div className="w-full max-w-md mx-auto animate-fade-in text-center py-16">
+        <div className="w-14 h-14 mx-auto mb-4 rounded-2xl bg-amber-500/10 flex items-center justify-center">
+          <svg className="w-7 h-7 text-amber-400" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
+            <circle cx="12" cy="12" r="10" />
+            <path d="M12 8v4M12 16h.01" strokeLinecap="round" />
+          </svg>
+        </div>
+        <h2 className="text-xl font-bold mb-2">{t("review.empty_title") || "No hay sesión activa"}</h2>
+        <p className="text-sm text-gray-500 mb-6">
+          {t("review.empty_subtitle") ||
+            "Probablemente refrescaste la página o el enlace es directo. Volvé al panel para empezar de nuevo."}
+        </p>
+        <button onClick={() => navigate("/dashboard")} className="btn-primary">
+          {t("review.empty_cta") || "Volver al panel"}
+        </button>
+      </div>
+    );
   })();
+
+  // Capa B 2026-05-24 — wizardScreen es lo que /new (y /review por compat)
+  // renderizan. Conmuta entre upload y review/ready_to_generate según
+  // wizardStage. NO hay navigate entre rutas durante el flow normal — el
+  // operador queda en /new desde drop hasta clickear "Crear video"
+  // (legítimo navigate a /generating).
+  const wizardScreen = wizardStage === "upload" ? newBatchScreen : reviewScreen;
 
   const generatingScreen = jobs.length > 0
     ? (
@@ -1656,8 +2055,12 @@ export default function App() {
               onViewHistory={() => navigate("/videos")}
             />
           } />
-          <Route path="/new" element={newBatchScreen} />
-          <Route path="/review" element={reviewScreen} />
+          {/* Capa B 2026-05-24 — /new y /review renderizan el MISMO content
+              (wizardScreen) que conmuta upload ↔ review ↔ ready_to_generate
+              vía wizardStage. /review se mantiene como ruta válida sólo para
+              compat con bookmarks viejos; URL nueva canónica es /new. */}
+          <Route path="/new" element={wizardScreen} />
+          <Route path="/review" element={wizardScreen} />
           <Route path="/generating" element={generatingScreen} />
           <Route path="/videos" element={
             <HistoryView

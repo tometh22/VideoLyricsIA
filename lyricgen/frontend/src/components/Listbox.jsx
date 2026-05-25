@@ -149,7 +149,7 @@ export default function Listbox({
         onClick={() => !disabled && setOpen((o) => !o)}
         onKeyDown={onKeyDown}
         className={`w-full flex items-center justify-between gap-2 px-3 py-1.5
-          rounded-md bg-surface-1 border text-[12px] text-white text-left
+          rounded-md bg-surface-1 border text-caption text-white text-left
           transition-colors
           ${open ? "border-brand/50" : "border-white/[0.06] hover:border-white/[0.12]"}
           ${disabled ? "opacity-50 cursor-not-allowed" : "cursor-pointer"}
@@ -201,7 +201,7 @@ export default function Listbox({
                   onChange(opt.code);
                   setOpen(false);
                 }}
-                className={`w-full flex items-center gap-2 px-3 py-2 text-[12px] text-left
+                className={`w-full flex items-center gap-2 px-3 py-2 text-caption text-left
                   transition-colors
                   ${highlighted && !optDisabled ? "bg-white/[0.06]" : ""}
                   ${optDisabled

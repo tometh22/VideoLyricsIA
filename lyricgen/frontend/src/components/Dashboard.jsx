@@ -4,6 +4,7 @@ import { useMediaUrl } from "../mediaUrl";
 import { fetchWithTimeout } from "../fetchWithTimeout";
 import { DashboardTour } from "./OnboardingTour";
 import ProResBadge from "./ProResBadge";
+import { SkeletonVideoCard } from "./Skeleton";
 
 const API = import.meta.env.VITE_API_URL || "";
 
@@ -22,9 +23,11 @@ function timeAgo(ts) {
 }
 
 // Tiny uppercase label used to introduce sections — Linear / Vercel style.
+// `text-section` token (tailwind.config) ya incluye fontWeight 600 +
+// letter-spacing 0.18em + size 10px. Antes era arbitrary; el token lo unifica.
 function SectionLabel({ children }) {
   return (
-    <p className="text-[10px] font-medium text-gray-500 uppercase tracking-[0.18em] mb-3">
+    <p className="text-section text-gray-500 uppercase mb-3">
       {children}
     </p>
   );
@@ -448,11 +451,18 @@ export default function Dashboard({ user, history, historyError, historyLoaded =
           100 videos in their library never sees "Empezá tu primer
           lote" during the initial fetch. ─── */}
       {history.length === 0 && !historyLoaded && !historyError && (
-        <div className="rounded-card p-14 text-center bg-surface-2/30 ring-1 ring-white/[0.04]">
-          <div className="w-10 h-10 mx-auto mb-4 border-2 border-brand border-t-transparent rounded-full animate-spin" />
-          <p className="text-sm text-ink-secondary">
-            {t("history.loading") || "Cargando historial…"}
-          </p>
+        /* Skeleton screen — UI specialist 2026-05-24: reemplazó el spinner
+           genérico. El operador YA ve la estructura del Dashboard (6 cards
+           en grid) antes de que llegue /jobs; el swap no tiene reflow. */
+        <div>
+          <div className="mb-4">
+            <div className="h-3 w-32 rounded bg-surface-2/60 animate-pulse mb-3" />
+          </div>
+          <div className="grid grid-cols-2 sm:grid-cols-3 gap-3">
+            {Array.from({ length: 6 }).map((_, i) => (
+              <SkeletonVideoCard key={i} />
+            ))}
+          </div>
         </div>
       )}
       {history.length === 0 && historyError && (

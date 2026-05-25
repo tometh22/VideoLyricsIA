@@ -11,6 +11,9 @@ passlib[bcrypt]>=1.7.4,<2.0.0
 bcrypt<4.1
 openai-whisper
 openai>=1.50.0,<2.0.0
+# Forced alignment (Rotor-grade timing): aligns known lyrics to the user's
+# audio via a hosted model. See forced_align.py. Behind FORCED_ALIGNER_ENABLED.
+replicate>=1.0.0,<2.0.0
 moviepy==1.0.3
 librosa==0.10.2
 Pillow==11.1.0

@@ -754,16 +754,26 @@ def copy_object(src_key: str, dst_key: str) -> bool:
     not exist (treated as "nothing to archive"). Raises on real S3 errors so
     the caller can surface them.
     """
+    from botocore.exceptions import ClientError
     client = _get_client()
     if client is None:
         return False
     if not object_exists(src_key):
         return False
-    client.copy_object(
-        Bucket=R2_BUCKET,
-        Key=dst_key,
-        CopySource={"Bucket": R2_BUCKET, "Key": src_key},
-    )
+    src = {"Bucket": R2_BUCKET, "Key": src_key}
+    try:
+        client.copy_object(Bucket=R2_BUCKET, Key=dst_key, CopySource=src)
+    except ClientError as e:
+        code = (e.response or {}).get("Error", {}).get("Code", "")
+        # Single-operation CopyObject caps at 5 GB on S3/R2 → a multi-GB
+        # ProRes master raises EntityTooLarge (incident: UMG edit-snapshot).
+        # The managed client.copy() falls back to multipart UploadPartCopy,
+        # which has no such limit.
+        if code in ("EntityTooLarge", "InvalidRequest", "InvalidArgument"):
+            logger.info("[R2] %s exceeds single-copy limit (%s) — using multipart copy", src_key, code)
+            client.copy(CopySource=src, Bucket=R2_BUCKET, Key=dst_key)
+        else:
+            raise
     logger.info("[R2] Copied %s -> %s", src_key, dst_key)
     return True
 

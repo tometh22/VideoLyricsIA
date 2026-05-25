@@ -2,10 +2,68 @@ import { useState, useMemo, useRef, useEffect, useCallback } from "react";
 import { useI18n } from "../i18n";
 import { EditorTour } from "./OnboardingTour";
 import { useToast } from "./ToastProvider";
+import LyricsTimeline from "./LyricsTimeline";
+import LyricVideoPreview from "./LyricVideoPreview";
+import { tierForLength } from "../lib/lyricTiers";
 
-// Mismo flag que UploadZone/EditRequestPanel — oculta el label de motion
-// en el strip de metadata mientras la feature de animación está pausada.
-const SHOW_MOTION_PICKER = false;
+// Font options for the live in-preview switcher. Codes match the render
+// pipeline / EditRequestPanel; css families are all loaded in index.html so
+// the preview renders the real typeface. "" = Auto (pipeline picks).
+const EDITOR_FONTS = [
+  { code: "", label: "Auto", css: "'Montserrat', sans-serif" },
+  { code: "anton", label: "Anton", css: "'Anton', sans-serif" },
+  { code: "bebas-neue", label: "Bebas Neue", css: "'Bebas Neue', sans-serif" },
+  { code: "oswald-bold", label: "Oswald", css: "'Oswald', sans-serif" },
+  { code: "montserrat-bold", label: "Montserrat", css: "'Montserrat', sans-serif" },
+  { code: "poppins-bold", label: "Poppins", css: "'Poppins', sans-serif" },
+  { code: "outfit-bold", label: "Outfit", css: "'Outfit', sans-serif" },
+  { code: "roboto-bold", label: "Roboto", css: "'Roboto', sans-serif" },
+  { code: "jost-bold", label: "Jost", css: "'Jost', sans-serif" },
+];
+const FONT_CSS_BY_CODE = Object.fromEntries(EDITOR_FONTS.map((f) => [f.code, f.css]));
+
+// Typography options for the live preview controls. Codes match the render
+// pipeline (pipeline.py / ass_render / UploadZone).
+const TEXT_CASES = [
+  { code: "upper", label: "MAY" },
+  { code: "title", label: "Aa" },
+  { code: "lower", label: "min" },
+  { code: "original", label: "ori" },
+];
+// TRANSITIONS (Cut/Fade fade-time) quedó deprecado 2026-05-23. Las opciones
+// ricas viven en LINE_TRANSITIONS (slide/wipe/dissolve_blur) que se aplican
+// vía libass (lugar único, sin override silencioso de moviepy).
+const CONTRASTS = [
+  { code: "subtle", label: "Suave" },
+  { code: "medium", label: "Medio" },
+  { code: "strong", label: "Fuerte" },
+];
+// Animación de letra — libass templates (mirror del wizard, ass_render.py).
+const LYRICS_ANIMATIONS = [
+  { code: "none",        label: "Ninguna" },
+  { code: "karaoke",     label: "Karaoke" },
+  { code: "word_reveal", label: "Reveal" },
+  { code: "pop",         label: "Pop" },
+  { code: "glow",        label: "Glow" },
+];
+// Transición de línea — entrada (y salida en dissolve_blur) por libass.
+const LINE_TRANSITIONS = [
+  { code: "none",          label: "Ninguna" },
+  { code: "slide_up",      label: "Sube" },
+  { code: "slide_side",    label: "Lateral" },
+  { code: "wipe",          label: "Cortina" },
+  { code: "dissolve_blur", label: "Desvanecer" },
+];
+
+function applyTextCase(text, code) {
+  if (code === "upper") return (text || "").toUpperCase();
+  if (code === "lower") return (text || "").toLowerCase();
+  if (code === "title") return (text || "").replace(/\b\w/g, (c) => c.toUpperCase());
+  return text || "";
+}
+
+// SHOW_MOTION_PICKER (legacy text_motion) eliminado 2026-05-23 —
+// reemplazado por lyrics_animation + line_transition (libass).
 
 function formatTime(seconds) {
   if (!isFinite(seconds) || seconds < 0) return "0:00";
@@ -135,16 +193,12 @@ const FONT_CSS_MAP = {
   "":                "'Montserrat', sans-serif",
 };
 
-// Backend tier params (baseline 1920×1080, scale = 1.0).
-const TIERS = [
-  { maxChars: 50, sizePx: 85, maxWidthPx: 1500 },
-  { maxChars: 80, sizePx: 70, maxWidthPx: 1650 },
-  { maxChars: Infinity, sizePx: 55, maxWidthPx: 1700 },
-];
-
+// Backend tier params come from the shared source of truth (lib/lyricTiers,
+// also used by LyricVideoPreview). Adapter keeps this file's sizePx/maxWidthPx
+// naming so the existing wrap-estimation code is untouched.
 function getTier(text) {
-  const len = text.length;
-  return TIERS.find((t) => len <= t.maxChars) || TIERS[TIERS.length - 1];
+  const tier = tierForLength((text || "").length);
+  return { sizePx: tier.fontPx, maxWidthPx: tier.wrapPx };
 }
 
 // Simulate moviepy's word-wrap with canvas.measureText.
@@ -173,12 +227,42 @@ function estimateWrappedLines(text, fontCss, sizePx, maxWidthPx) {
   }
 }
 
+// Mirror of the backend pipeline._smart_lower(): for the all-lowercase
+// aesthetic we lowercase only the FIRST word of the line (sentence-initial
+// capital is grammar, not intent) and keep every later word exactly as the
+// operator typed it, so proper nouns like "Guinea" survive. Must stay in
+// sync with pipeline.py:_smart_lower so the editor preview matches the
+// rendered video (otherwise the editor shows "guinea" but the render shows
+// "Guinea"). Origin: agus.cafisi / Babasónicos 2026-05-20.
+export function smartLower(text) {
+  let seenWord = false;
+  return (text || "")
+    .split(/(\s+)/)
+    .map((tok) => {
+      if (!tok || /^\s+$/.test(tok)) return tok;
+      if (!seenWord) {
+        seenWord = true;
+        return tok.toLowerCase();
+      }
+      return tok; // interior word: keep operator's casing as typed
+    })
+    .join("");
+}
+
 // Apply the same case transform as the backend _apply_case().
 function applyCase(text, textCase) {
   if (textCase === "upper") return text.toUpperCase();
   if (textCase === "title") return text.replace(/\b\w/g, (c) => c.toUpperCase());
-  if (textCase === "lower") return text.toLowerCase();
+  if (textCase === "lower") return smartLower(text);
   return text;
+}
+
+// Normalize a lyric line for repeat-detection: trim ends and collapse
+// internal whitespace runs. Case- and accent-SENSITIVE on purpose, so we
+// only ever group lines the operator typed identically and never touch a
+// line they meant to be different.
+export function normalizeLineForMatch(text) {
+  return (text || "").trim().replace(/\s+/g, " ");
 }
 
 export default function LyricsEditor({
@@ -189,9 +273,12 @@ export default function LyricsEditor({
   font = "",
   textCase = "upper",
   fontScale = 1.0,
-  lyricTransition = "cut",
-  textMotion = "none",
   textContrast = "medium",
+  // 2026-05-23: reemplazan a `lyricTransition` (Corte/Fade) y `textMotion`
+  // (Sutil drift) que quedaron deprecados — éstos cubren mejor el mismo
+  // espacio y NO apagan silenciosamente al ASS path.
+  lyricsAnimation = "none",
+  lineTransition = "none",
   transcribeJobId = null,
   onPersistSegments = null,
   // Synchronous per-edit callback (no debounce). Parent receives the
@@ -212,12 +299,63 @@ export default function LyricsEditor({
   disableBeforeUnload = false,
   disableAutosave = false,
   submitLabel = null,
+  // Optional audio peak envelope for the timeline waveform, fetched by the
+  // parent (the post-render /edit modal has a job in R2; the wizard doesn't).
+  // null → timeline renders without a waveform (graceful).
+  waveform = null,
+  // Live preview: signed URL of the cached background video (post-render
+  // modal). null → preview uses a style-tinted template gradient (wizard).
+  previewBgUrl = null,
+  // Background style name → template gradient for the wizard preview.
+  backgroundStyle = "default",
+  // px offset for the sticky header so it clears any sticky app header
+  // above it. 0 in the modal (fixed overlay, no app chrome); the wizard
+  // passes the app header height so the editor's CTA isn't cut off.
+  stickyHeaderTop = 0,
+  // Called when the operator picks a font in the live preview switcher.
+  // Parent threads it into the render (render_params.font / edit_params).
+  onFontChange = null,
+  // Same idea for the rest of the typography, set live in the preview.
+  onCaseChange = null,
+  onContrastChange = null,
+  // 2026-05-23: callbacks de los nuevos ejes (libass). Reemplazan al
+  // onTransitionChange (que controlaba el legacy lyric_transition).
+  onAnimationChange = null,
+  onLineTransitionChange = null,
+  // UX specialist 2026-05-24: status del pre-gen del fondo (useBackgroundPreview).
+  // Valores: "idle" | "queued" | "generating" | "done" | "error" | "disabled".
+  // null/undefined → no se renderiza el chip (modo /edit modal post-render).
+  bgStatus = null,
 }) {
   const { t } = useI18n();
   const [edited, setEdited] = useState(() =>
     segments.map((s, i) => ({ ...s, _id: i }))
   );
   const [isDirty, setIsDirty] = useState(false);
+  // List vs visual timeline. Default "list" so the existing operator flow is
+  // untouched; the timeline is opt-in via the toolbar toggle.
+  const [viewMode, setViewMode] = useState("list"); // "list" | "timeline"
+  // Layout edits in the preview apply to ALL lines by default (consistent
+  // look across the song); "line" scopes the next edit to the selected line
+  // only (for the odd tilted/repositioned line).
+  const [layoutScope, setLayoutScope] = useState("all"); // "all" | "line"
+  // Live font selection (preview re-renders instantly; emitted to parent
+  // for the actual render). Seeded from the job's current font.
+  const [selectedFont, setSelectedFont] = useState(font || "");
+  const [selectedCase, setSelectedCase] = useState(textCase || "upper");
+  const [selectedContrast, setSelectedContrast] = useState(textContrast || "medium");
+  // 2026-05-23: nuevos ejes (paridad con el wizard, ver header del archivo).
+  const [selectedAnimation, setSelectedAnimation] = useState(lyricsAnimation || "none");
+  const [selectedLineTransition, setSelectedLineTransition] = useState(lineTransition || "none");
+  // Autosave confidence for the timeline view. saveStatus drives the
+  // "Guardando…/Guardado ✓" chip; flushCounter triggers an immediate save
+  // on a timeline drag (instead of waiting for the 3 s debounce).
+  const [saveStatus, setSaveStatus] = useState("idle"); // idle|saving|saved
+  const [flushCounter, setFlushCounter] = useState(0);
+  // Snapshot of the timings as first handed to us — the baseline for the
+  // timeline's "Resetear timings". Seeded on mount + re-seeded whenever the
+  // parent swaps the `segments` prop (see the reset effect below).
+  const originalSegmentsRef = useRef(segments.map((s, i) => ({ ...s, _id: i })));
 
   // Re-seed `edited` whenever the parent hands us a different `segments`
   // reference. The initial useState above only runs once on mount —
@@ -231,11 +369,21 @@ export default function LyricsEditor({
   // that need to track a parent's source of truth across remounts.
   // Bug B7 from 2026-05-18 audit.
   const prevSegmentsRef = useRef(segments);
+  // Operator feedback 2026-05-25 (UMG): "Debería hacerlo solo, no
+  // preguntarme" — the auto-trim banner ("Recortar N líneas con texto
+  // colgado · Aplicar") was friction. Detection is reliable enough to
+  // apply silently on initial load. The ref tracks per-segments-prop
+  // application so re-seeding a new job re-triggers; routine edits
+  // (typing in a line) do NOT, because they don't change the ref.
+  const autoTrimAppliedRef = useRef(false);
   useEffect(() => {
     if (prevSegmentsRef.current === segments) return;
     prevSegmentsRef.current = segments;
-    setEdited(segments.map((s, i) => ({ ...s, _id: i })));
+    const seeded = segments.map((s, i) => ({ ...s, _id: i }));
+    setEdited(seeded);
+    originalSegmentsRef.current = seeded;
     setIsDirty(false);
+    autoTrimAppliedRef.current = false;  // new job → eligible for auto-trim
   }, [segments]);
 
   // Warn browser on tab-close / external navigation when there are unsaved edits.
@@ -260,11 +408,37 @@ export default function LyricsEditor({
     if (!onPersistSegments || !transcribeJobId) return undefined;
     if (!Array.isArray(edited) || edited.length === 0) return undefined;
     const tid = setTimeout(() => {
-      const cleaned = edited.map(({ _id, ...rest }) => rest);
+      const cleaned = edited.map(({ _id, review, ...rest }) => rest);
       onPersistSegments(transcribeJobId, cleaned);
     }, 3000);
     return () => clearTimeout(tid);
   }, [edited, transcribeJobId, onPersistSegments, disableAutosave]);
+
+  // Flush-save on a timeline drag (no 3 s wait) + drive the "Guardado ✓"
+  // chip. Runs only when flushCounter bumps. By the time this effect fires,
+  // setEdited from the same handler has already applied, so `edited` is the
+  // post-drag value. Idempotent vs the debounced autosave above.
+  useEffect(() => {
+    if (flushCounter === 0) return undefined;
+    if (disableAutosave || !onPersistSegments || !transcribeJobId) return undefined;
+    let cancelled = false;
+    setSaveStatus("saving");
+    const cleaned = edited.map(({ _id, review, ...rest }) => rest);
+    Promise.resolve(onPersistSegments(transcribeJobId, cleaned))
+      .then(() => { if (!cancelled) setSaveStatus("saved"); })
+      .catch(() => { if (!cancelled) setSaveStatus("idle"); });
+    return () => { cancelled = true; };
+    // Only react to the flush trigger — `edited` is intentionally read fresh
+    // but NOT a dep (we don't want every keystroke to flush).
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [flushCounter]);
+
+  // Auto-clear the "Guardado ✓" chip a couple seconds after it shows.
+  useEffect(() => {
+    if (saveStatus !== "saved") return undefined;
+    const id = setTimeout(() => setSaveStatus("idle"), 2000);
+    return () => clearTimeout(id);
+  }, [saveStatus]);
 
   // Synchronous per-edit callback: fires on every `edited` change with no
   // debounce, so the parent can hold the latest segments in a ref and
@@ -273,7 +447,7 @@ export default function LyricsEditor({
   // to fire per keystroke — a single map() over the segments array.
   useEffect(() => {
     if (!onEditedChange || !Array.isArray(edited)) return;
-    const cleaned = edited.map(({ _id, ...rest }) => rest);
+    const cleaned = edited.map(({ _id, review, ...rest }) => rest);
     onEditedChange(cleaned);
   }, [edited, onEditedChange]);
 
@@ -311,10 +485,41 @@ export default function LyricsEditor({
   const audioRef = useRef(null);
   const listRef = useRef(null);
   const rowRefs = useRef({});
+  const rafRef = useRef(null);
 
   const [isPlaying, setIsPlaying] = useState(false);
   const [currentTime, setCurrentTime] = useState(0);
   const [duration, setDuration] = useState(0);
+
+  // INCIDENT (mobile 2026-05-24): the audio element's `onTimeUpdate`
+  // event fires every ~250 ms on most browsers (sometimes slower on
+  // mobile in background tabs). Lines shorter than that — short
+  // interjections ("oh!", "yeah"), rapid-fire hip-hop / reggaetón
+  // syllables, or any sub-250ms segment from forced alignment — were
+  // SKIPPED in the preview: `currentTime` jumped from before the line's
+  // start straight past its end, and `segments.find(s => t >= s.start
+  // && t < s.end)` returned null for the whole duration.
+  //
+  // Fix: while playing, drive `currentTime` from `requestAnimationFrame`
+  // (~60 fps, 16 ms granularity). Any line ≥ 1 frame appears at least
+  // once. Stop the rAF loop on pause/end to avoid burning a CPU core.
+  // `onTimeUpdate` is still wired as a fallback for seeks and the
+  // initial idle state (before the user hits play).
+  useEffect(() => {
+    if (!isPlaying) return undefined;
+    const tick = () => {
+      const a = audioRef.current;
+      if (a && !a.paused) {
+        setCurrentTime(a.currentTime);
+      }
+      rafRef.current = requestAnimationFrame(tick);
+    };
+    rafRef.current = requestAnimationFrame(tick);
+    return () => {
+      if (rafRef.current) cancelAnimationFrame(rafRef.current);
+      rafRef.current = null;
+    };
+  }, [isPlaying]);
   const [wrapWarning, setWrapWarning] = useState(null); // {ids: [...]} for 3+ line segs
   const [focusedSegId, setFocusedSegId] = useState(null); // for preview panel
 
@@ -323,6 +528,13 @@ export default function LyricsEditor({
   // Single-click on a timestamp seeks; double-click switches to edit.
   const [editingId, setEditingId] = useState(null);
   const [editValue, setEditValue] = useState("");
+  // Repeat-line propagation. `textEditStart` snapshots {id, text} when the
+  // operator focuses a line's text input, so on blur we can compare against
+  // the pre-edit text and find other lines that were identical to it.
+  // `propagationPrompt` holds {id, newText, matchIds, prevText} while we ask
+  // "apply this change to the N other identical lines?".
+  const [textEditStart, setTextEditStart] = useState(null);
+  const [propagationPrompt, setPropagationPrompt] = useState(null);
 
   // Tap-to-sync mode — operator hits Space (or button) while audio
   // plays to anchor each line at the current playback time. Solves
@@ -391,6 +603,63 @@ export default function LyricsEditor({
       setEdited(snapshot);
       return prev.slice(0, -1);
     });
+  }, []);
+
+  // ─── Visual timeline (Timings view) handlers ────────────────────────
+  // A drag commits here. We stamp `locked: true` so the render
+  // (pipeline._apply_display_timing) respects this manual end instead of
+  // auto-extending it (hold-until-next). The undo snapshot is pushed by the
+  // timeline on pointerdown (onDragStart), so this only mutates `edited`.
+  const handleTimelineTimingChange = useCallback((id, newStart, newEnd) => {
+    setIsDirty(true);
+    setEdited((prev) => prev.map((s) =>
+      s._id === id ? { ...s, start: newStart, end: newEnd, locked: true } : s
+    ));
+    setHighlightedIds((prev) => {
+      const next = new Set(prev);
+      next.add(id);
+      return next;
+    });
+    setTimeout(() => setHighlightedIds((prev) => {
+      const next = new Set(prev);
+      next.delete(id);
+      return next;
+    }), 10000);
+    // Flush-save immediately (don't wait for the 3 s autosave debounce) so
+    // the operator sees "Guardado" right after dropping a block — the
+    // flush effect below reads the just-updated `edited` and persists.
+    setFlushCounter((c) => c + 1);
+  }, []);
+
+  // Per-line layout (position / size / rotation) committed from the live
+  // preview. Same flush-on-commit as the timeline so "Guardado" shows fast.
+  const handleLayoutChange = useCallback((id, layout) => {
+    setIsDirty(true);
+    setEdited((prev) => prev.map((s) =>
+      (layoutScope === "all" || s._id === id)
+        ? { ...s, pos: layout.pos, scale: layout.scale, rot: layout.rot }
+        : s
+    ));
+    setFlushCounter((c) => c + 1);
+  }, [layoutScope]);
+
+  // Restore every line's timing to the original snapshot + drop all `locked`
+  // flags, so the render goes back to auto hold-until-next.
+  const resetTimings = useCallback(() => {
+    pushEditHistory();
+    const byId = new Map((originalSegmentsRef.current || []).map((s) => [s._id, s]));
+    setEdited((prev) => prev.map((s) => {
+      const o = byId.get(s._id);
+      if (!o) return s;
+      // eslint-disable-next-line no-unused-vars
+      const { locked, ...rest } = s;
+      return { ...rest, start: o.start, end: o.end };
+    }));
+    toast({ message: "Timings restaurados al original", tone: "info" });
+  }, [pushEditHistory, toast]);
+
+  const focusSegment = useCallback((id) => {
+    setFocusedSegId(id);
   }, []);
 
   const startEditTimestamp = (seg) => {
@@ -823,11 +1092,19 @@ export default function LyricsEditor({
       } else if (syncMode && e.key === "Escape") {
         e.preventDefault();
         exitSyncMode();
+      } else if ((e.metaKey || e.ctrlKey) && (e.key === "k" || e.key === "K")) {
+        // Cmd/Ctrl+K — toggle Sync mode (refactor 2026-05-23: el botón visual
+        // se compactó a ícono discreto, este shortcut es la forma rápida
+        // desde teclado). Funciona en ambos sentidos: si ya está activo, sale.
+        if (!audioUrl) return;  // no sync sin audio
+        e.preventDefault();
+        if (syncMode) exitSyncMode();
+        else enterSyncMode();
       }
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [togglePlay, syncMode, tapAnchor, undoLastAnchor, undoEdit]);
+  }, [togglePlay, syncMode, tapAnchor, undoLastAnchor, undoEdit, audioUrl, enterSyncMode, exitSyncMode]);
 
   // ─── Reference lyrics suggestions (unchanged) ───────────────────────
   const refLines = useMemo(() => {
@@ -921,6 +1198,48 @@ export default function LyricsEditor({
     setEdited((prev) => prev.map((seg) => (seg._id === id ? { ...seg, text } : seg)));
   };
 
+  // Called on blur of a line's text input. If the operator changed a line
+  // that was identical to other lines (a repeated chorus), offer to apply
+  // the same new text to those other occurrences. Match is against the
+  // PRE-edit text (textEditStart), so lines the operator already diverged by
+  // hand never match and are never touched. Newly-typed text is compared
+  // exact (trim + collapsed whitespace), case/accent sensitive.
+  const handleTextBlur = (id, newText) => {
+    const start = textEditStart;
+    setTextEditStart(null);
+    if (!start || start.id !== id) return;
+    const prevNorm = normalizeLineForMatch(start.text);
+    const newNorm = normalizeLineForMatch(newText);
+    // Only prompt when the text actually changed and the pre-edit line had
+    // real content (don't propagate blanks).
+    if (!prevNorm || prevNorm === newNorm) return;
+    const matchIds = edited
+      .filter((s) => s._id !== id && normalizeLineForMatch(s.text) === prevNorm)
+      .map((s) => s._id);
+    if (matchIds.length > 0) {
+      setPropagationPrompt({ id, newText, matchIds, prevText: start.text });
+    }
+  };
+
+  const applyPropagation = () => {
+    if (!propagationPrompt) return;
+    const { newText, matchIds } = propagationPrompt;
+    pushEditHistory();
+    const idset = new Set(matchIds);
+    setEdited((prev) => prev.map((s) => (idset.has(s._id) ? { ...s, text: newText } : s)));
+    setPropagationPrompt(null);
+    // Flush-save immediately so the propagated lines persist without waiting
+    // for the 3 s autosave debounce.
+    setFlushCounter((c) => c + 1);
+    toast({
+      message: (t("editor.repeat_applied") || "Cambio aplicado a {n} líneas repetidas")
+        .replace("{n}", matchIds.length),
+      tone: "info",
+    });
+  };
+
+  const dismissPropagation = () => setPropagationPrompt(null);
+
   const applySuggestion = (id) => {
     const suggestion = suggestionsById[id];
     if (suggestion) updateText(id, suggestion);
@@ -967,23 +1286,6 @@ export default function LyricsEditor({
   const estimateVoiceEndDuration = (text) =>
     Math.max(TRIM_FLOOR_S, (text || "").length * TRIM_PER_CHAR_S + TRIM_MARGIN_S);
 
-  /** Cap a single segment's `end` to the estimated voice-end of its text.
-   * Used by the per-row ✂ button — operator marks one hanging line at a
-   * time. ONLY modifies the `end` of the matched segment; no other
-   * segment is touched, and `start` is preserved. */
-  const trimSeg = (id) => {
-    pushEditHistory();
-    setEdited((prev) =>
-      prev.map((seg) => {
-        if (seg._id !== id) return seg;
-        const dur = seg.end - seg.start;
-        const cap = estimateVoiceEndDuration(seg.text);
-        if (dur <= cap) return seg;  // already short enough
-        return { ...seg, end: seg.start + cap };
-      }),
-    );
-  };
-
   /** Bulk: trim every segment whose duration exceeds the cap. Each
    * segment is trimmed independently — only its own `end` is modified
    * based on its own text length and start. No cross-segment effect. */
@@ -1003,6 +1305,22 @@ export default function LyricsEditor({
     const dur = seg.end - seg.start;
     return dur > estimateVoiceEndDuration(seg.text);
   }).length;
+
+  // Auto-trim on initial load: if the just-loaded segments have hanging
+  // text (lrclib/genius lines that ran into instrumental outros, or
+  // duplicated chorus blocks at the end), apply the same fix the
+  // operator would have applied manually via the autofix banner. The
+  // `autoTrimAppliedRef` (declared up by the segments re-seed effect)
+  // guards against re-running on every text-edit keystroke. Cmd-Z still
+  // works because trimAllLongSegs calls pushEditHistory.
+  useEffect(() => {
+    if (autoTrimAppliedRef.current) return;
+    if (!edited || edited.length === 0) return;
+    if (longSegCount > 0) {
+      trimAllLongSegs();
+    }
+    autoTrimAppliedRef.current = true;
+  }, [edited, longSegCount]);
 
   // Compute how many visual lines a segment will occupy in the video.
   const linesForSeg = useCallback((text) => {
@@ -1120,6 +1438,30 @@ export default function LyricsEditor({
     });
   };
 
+  // Insert a blank line right AFTER the row at display index `idx`, timing
+  // interpolated into the gap to the next line. This is the "add a line in
+  // the MIDDLE of the song" affordance — the bottom "Agregar línea" button
+  // forced the operator to scroll away from where they were working.
+  const insertLineAfter = (idx) => {
+    setEdited((prev) => {
+      const cur = prev[idx];
+      const nxt = prev[idx + 1];
+      const gapStart = cur ? cur.end : (prev[0] ? prev[0].start : 0);
+      const gapEnd = nxt ? nxt.start : (duration || gapStart + 3);
+      const gap = Math.max(0, gapEnd - gapStart);
+      let s = gapStart + (gap > 0.6 ? gap / 3 : 0.1);
+      let e = s + (gap > 0.6 ? gap / 3 : 1.0);
+      if (!(e > s) || e > gapEnd) {
+        s = gapStart + 0.1;
+        e = Math.min(gapEnd > s ? gapEnd - 0.05 : s + 1.0, s + 1.0);
+        if (e <= s) e = s + 0.5;
+      }
+      const nextId = prev.reduce((m, x) => Math.max(m, x._id), -1) + 1;
+      const inserted = { _id: nextId, start: s, end: e, text: "" };
+      return [...prev, inserted].sort((a, b) => a.start - b.start);
+    });
+  };
+
   const name = filename.replace(/\.(mp3|wav)$/i, "");
   const pendingSuggestions = edited.filter((seg) => {
     const s = suggestionsById[seg._id];
@@ -1170,8 +1512,16 @@ export default function LyricsEditor({
     seekTo(pct * duration, false);
   };
 
+  // INCIDENT 2026-05-24: the list view used `max-w-3xl` (~768 px). With
+  // the 2-col grid (preview / lines) that left the preview ~360 px wide —
+  // "TENDRÉ QUE DEJARTE..." felt cramped — and the line inputs only had
+  // ~280 px so anything longer than 30 chars visually cut off ("Nuestra
+  // relación no es pa…"). Bumped to a generous 1400 px so both columns
+  // breathe: preview ~680 px wide (≈ 2× before), lines fit ≈ 60 chars per
+  // row before scrolling. Timeline view stays at max-w-6xl (already wide
+  // enough).
   return (
-    <div className="w-full max-w-3xl animate-fade-in">
+    <div className={`w-full animate-fade-in mx-auto ${viewMode === "timeline" ? "max-w-6xl" : "max-w-[1400px]"}`}>
       {/* Hidden audio element drives playback. */}
       {audioUrl && (
         <audio
@@ -1185,29 +1535,71 @@ export default function LyricsEditor({
         />
       )}
 
-      <div className="flex flex-wrap items-center justify-between gap-3 mb-6">
-        <div className="flex items-center gap-3">
-          <button onClick={onBack}
-            className="w-9 h-9 rounded-xl bg-surface-2/40 ring-1 ring-white/[0.04] hover:ring-white/[0.08] hover:text-white flex items-center justify-center text-gray-400 transition-colors">
-            <svg className="w-4 h-4" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
-              <path d="M19 12H5M12 19l-7-7 7-7" />
-            </svg>
-          </button>
-          <div>
-            <h2 className="text-lg font-bold tracking-tight">{t("editor.title")}</h2>
-            <p className="text-sm text-ink-secondary">
-              {name}
-              {batchProgress && <span className="ml-2 text-brand-light text-xs">({batchProgress})</span>}
-            </p>
-          </div>
-        </div>
-        <button onClick={handleApprove} className="btn-primary text-sm h-11 px-5">
-          {submitLabel || (isBatch ? t("editor.approve_next") : t("editor.approve_generate"))}
-          <svg className="inline-block ml-1.5 w-4 h-4" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
-            <path d="M5 12h14M12 5l7 7-7 7" />
+      {/* Header: back + title (non-sticky). The primary CTA is a FIXED
+          floating button (below) so it can never be hidden behind the
+          app's own sticky top bar — the recurring "botón cortado". */}
+      <div className="py-3 mb-4 flex items-center gap-3">
+        <button onClick={onBack}
+          className="w-9 h-9 rounded-xl bg-surface-2/40 ring-1 ring-white/[0.04] hover:ring-white/[0.08] hover:text-white flex items-center justify-center text-gray-400 transition-colors shrink-0">
+          <svg className="w-4 h-4" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
+            <path d="M19 12H5M12 19l-7-7 7-7" />
           </svg>
         </button>
+        <div className="min-w-0">
+          <h2 className="text-lg font-bold tracking-tight">{t("editor.title")}</h2>
+          <p className="text-sm text-ink-secondary truncate">
+            {name}
+            {batchProgress && <span className="ml-2 text-brand-light text-xs">({batchProgress})</span>}
+          </p>
+        </div>
       </div>
+
+      {/* Chip de status del pre-gen del fondo — UX 2026-05-24. Operador edita
+          lyrics, Veo/Imagen está generando en background. Sin esto el pre-gen
+          era invisible y cambiar un param descartaba un preview sin aviso. */}
+      {bgStatus && bgStatus !== "idle" && bgStatus !== "disabled" && (
+        <div className={`mb-3 inline-flex items-center gap-2 px-3 py-1.5 rounded-full text-caption
+            ${bgStatus === "done"
+              ? "bg-accent/10 text-accent-light ring-1 ring-accent/30"
+              : bgStatus === "error"
+                ? "bg-amber-500/10 text-amber-300 ring-1 ring-amber-500/30"
+                : "bg-brand/10 text-brand-light ring-1 ring-brand/30"}`}>
+          {bgStatus === "queued" || bgStatus === "generating" ? (
+            <>
+              <svg className="w-3 h-3 animate-spin" fill="none" stroke="currentColor" strokeWidth="2.5" viewBox="0 0 24 24">
+                <path d="M21 12a9 9 0 11-6.219-8.56" strokeLinecap="round" />
+              </svg>
+              <span>{t("editor.bg_generating") || "Generando fondo en background…"}</span>
+            </>
+          ) : bgStatus === "done" ? (
+            <>
+              <svg className="w-3 h-3" fill="none" stroke="currentColor" strokeWidth="3" viewBox="0 0 24 24">
+                <polyline points="20 6 9 17 4 12" strokeLinecap="round" strokeLinejoin="round" />
+              </svg>
+              <span>{t("editor.bg_done") || "Fondo listo"}</span>
+            </>
+          ) : bgStatus === "error" ? (
+            <>
+              <svg className="w-3 h-3" fill="none" stroke="currentColor" strokeWidth="2.5" viewBox="0 0 24 24">
+                <circle cx="12" cy="12" r="10" /><line x1="12" y1="8" x2="12" y2="12" /><line x1="12" y1="16" x2="12.01" y2="16" />
+              </svg>
+              <span>{t("editor.bg_error") || "El fondo se generará al apretar Crear video"}</span>
+            </>
+          ) : null}
+        </div>
+      )}
+
+      {/* Fixed floating primary CTA — always reachable, never cut. */}
+      <button
+        onClick={handleApprove}
+        data-tour="editor-approve-floating"
+        className="fixed bottom-6 right-6 z-50 inline-flex items-center gap-1.5 btn-primary text-sm h-12 px-6 shadow-2xl shadow-brand/30"
+      >
+        {submitLabel || (isBatch ? t("editor.approve_next") : t("editor.approve_generate"))}
+        <svg className="w-4 h-4" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
+          <path d="M5 12h14M12 5l7 7-7 7" />
+        </svg>
+      </button>
 
       {coverageWarning && (
         <div className="mb-4 rounded-2xl ring-1 ring-accent/25 bg-accent/[0.06] px-4 py-3 flex items-start gap-3">
@@ -1241,6 +1633,10 @@ export default function LyricsEditor({
           The panel also absorbs the standalone "Aplicar todas" /
           "Deshacer" row that was below the auto-split banner. */}
       {(() => {
+        // Auto-fix is text/structure correction — a Lista-view concern.
+        // Hide it in the timeline workspace so that view stays focused on
+        // the preview + timeline (less vertical clutter above the fold).
+        if (viewMode === "timeline") return null;
         const splitAvailable = !disableAutoSplit && mergeableSegments.length > 0;
         const trimAvailable = longSegCount > 0;
         const hasAutoFix = splitAvailable || hasSuggestions || trimAvailable;
@@ -1362,24 +1758,57 @@ export default function LyricsEditor({
           <span className="text-xs text-gray-500 tabular-nums shrink-0 w-10">
             {formatTime(duration)}
           </span>
+          {/* Lista | Línea de tiempo — the timeline is a VIEW of the same
+              editor (shared state), default Lista so the existing flow is
+              untouched. Desktop feature: hidden on narrow screens where the
+              fine drag is impractical. */}
+          <div className="hidden md:inline-flex shrink-0 rounded-md ring-1 ring-white/[0.08] overflow-hidden text-label">
+            <button
+              onClick={() => setViewMode("list")}
+              className={`px-2.5 py-1 flex items-center gap-1.5 transition-colors ${viewMode === "list" ? "bg-brand/20 text-brand-light" : "text-ink-secondary hover:text-white"}`}
+            >
+              <svg className="w-3 h-3" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
+                <line x1="8" y1="6" x2="21" y2="6" strokeLinecap="round" />
+                <line x1="8" y1="12" x2="21" y2="12" strokeLinecap="round" />
+                <line x1="8" y1="18" x2="21" y2="18" strokeLinecap="round" />
+                <circle cx="3.5" cy="6" r="1" fill="currentColor" stroke="none" />
+                <circle cx="3.5" cy="12" r="1" fill="currentColor" stroke="none" />
+                <circle cx="3.5" cy="18" r="1" fill="currentColor" stroke="none" />
+              </svg>
+              Lista
+            </button>
+            <button
+              onClick={() => setViewMode("timeline")}
+              className={`px-2.5 py-1 flex items-center gap-1.5 transition-colors ${viewMode === "timeline" ? "bg-brand/20 text-brand-light" : "text-ink-secondary hover:text-white"}`}
+            >
+              <svg className="w-3 h-3" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
+                <rect x="3" y="7" width="8" height="4" rx="1" />
+                <rect x="13" y="13" width="7" height="4" rx="1" />
+                <line x1="3" y1="3" x2="3" y2="21" strokeLinecap="round" opacity="0.5" />
+              </svg>
+              Línea de tiempo
+            </button>
+          </div>
+          {/* Sync mode entry — refactor 2026-05-23: pasó de botón ruidoso
+              con texto a ícono discreto al lado del switcher. Atajo Cmd+K
+              añadido al keyboard handler. */}
           {!syncMode && (
             <button
               data-tour="editor-sync-entry"
               onClick={enterSyncMode}
-              title={t("editor.sync_cta_hint") || "Activá modo Sync y apretá Espacio cuando arranque cada línea"}
-              className="shrink-0 text-[11px] font-medium px-2.5 py-1 rounded-md bg-brand/10 text-brand-light
-                ring-1 ring-brand/20 hover:bg-brand/20 hover:ring-brand/30 transition-colors flex items-center gap-1.5"
+              title={t("editor.sync_cta_hint") || "Modo Sync — anclar timings por tap (⌘K / Ctrl+K)"}
+              aria-label={t("editor.sync_enter_compact") || "Modo Sync"}
+              className="hidden md:inline-flex shrink-0 w-8 h-8 rounded-md ring-1 ring-white/[0.08]
+                text-ink-secondary hover:text-brand-light hover:bg-brand/10 hover:ring-brand/30
+                transition-colors items-center justify-center"
             >
-              <svg className="w-3 h-3" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
+              <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
                 <circle cx="12" cy="12" r="9" />
-                <path d="M12 7v5l3 2" strokeLinecap="round" />
+                <circle cx="12" cy="12" r="4" />
+                <circle cx="12" cy="12" r="1" fill="currentColor" />
               </svg>
-              {t("editor.sync_enter_compact") || "Modo Sync"}
             </button>
           )}
-          <span className="hidden sm:inline text-[10px] text-gray-600 ml-1 shrink-0">
-            <kbd className="px-1.5 py-0.5 rounded bg-surface-3/60 ring-1 ring-white/[0.05]">space</kbd>
-          </span>
         </div>
       )}
 
@@ -1431,7 +1860,7 @@ export default function LyricsEditor({
             </span>
             <button
               onClick={tapAnchor}
-              className="shrink-0 h-8 px-3 rounded-lg bg-brand hover:bg-brand-light text-white text-[12px]
+              className="shrink-0 h-8 px-3 rounded-lg bg-brand hover:bg-brand-light text-white text-caption
                 font-semibold transition-colors flex items-center gap-1.5"
             >
               <svg className="w-3 h-3" fill="none" stroke="currentColor" strokeWidth="3" viewBox="0 0 24 24">
@@ -1492,14 +1921,14 @@ export default function LyricsEditor({
               </p>
               <button
                 onClick={() => shiftAllSegments(-(first.start - 2))}
-                className="shrink-0 text-[11px] font-medium px-3 py-1.5 rounded-lg bg-brand/15 text-brand-light
+                className="shrink-0 text-label px-3 py-1.5 rounded-lg bg-brand/15 text-brand-light
                   ring-1 ring-brand/30 hover:bg-brand/25 transition-colors"
               >
                 {t("editor.intro_trim_to_2") || "Recortar a 2s"}
               </button>
               <button
                 onClick={() => shiftAllSegments(-first.start)}
-                className="shrink-0 text-[11px] font-medium px-3 py-1.5 rounded-lg bg-surface-2/60
+                className="shrink-0 text-label px-3 py-1.5 rounded-lg bg-surface-2/60
                   ring-1 ring-white/[0.06] text-gray-300 hover:bg-surface-2 hover:text-white transition-colors"
               >
                 {t("editor.intro_trim_to_0") || "Empezar en 0s"}
@@ -1581,7 +2010,10 @@ export default function LyricsEditor({
           moved (2026-05-16) into the consolidated auto-fix panel near
           the top of the editor so the operator sees ONE "system can
           fix N things" action instead of a standalone amber alert. */}
-      <div className="mb-3">
+      {/* "Ajustes avanzados de timing" (global shift) ocultado: el ajuste
+          fino por línea se resuelve en la timeline; el shift global casi no
+          se usa y ensuciaba el flujo. */}
+      <div className="hidden">
         <button
           onClick={() => setShiftPanelOpen((v) => !v)}
           className="w-full flex items-center justify-between px-3 py-2 rounded-card bg-surface-2/40 ring-1 ring-white/[0.04] hover:ring-white/[0.08] text-xs text-gray-300 hover:text-white transition-colors"
@@ -1692,13 +2124,141 @@ export default function LyricsEditor({
         )}
       </div>
 
-      {/* ─── Lyrics list ──────────────────────────────────────────── */}
-      <p className="text-[11px] text-gray-600 mb-2 px-1">
-        {t("editor.list_hint") || "Click en un tiempo para reproducir desde ahí · doble click para editarlo"}
-      </p>
-      <div className="relative">
-        <div className="absolute bottom-0 left-0 right-0 h-12 bg-gradient-to-t from-surface to-transparent pointer-events-none z-10 rounded-b-2xl" />
-        <div ref={listRef} className="space-y-1 max-h-[55vh] overflow-y-auto pr-1 pb-8">
+      {/* ─── Workspace UNIFICADO 2-col (2026-05-23 refactor world-class) ──
+             Antes había dos workspaces enteros que se renderizaban según
+             viewMode (timeline → grid; list → full-width). Ahora SIEMPRE
+             es grid: izq sticky con controles+preview, der con lista o
+             timeline según viewMode. Preview siempre visible, controles
+             siempre en el mismo lugar. */}
+      <div className="grid grid-cols-1 lg:grid-cols-2 gap-4 mb-4 items-start">
+          {/* COLUMNA IZQUIERDA — sticky en desktop. Controles tipográficos
+              + LyricVideoPreview (editable) + scope toggle. */}
+          <div className="space-y-2 lg:sticky lg:top-2 lg:self-start">
+            {/* Live font switcher — preview re-renders in the chosen
+                typeface instantly; applied to the render on re-render. */}
+            <div className="flex items-center gap-2 px-1">
+              <span className="text-[11px] text-ink-tertiary shrink-0">Tipografía</span>
+              <select
+                value={selectedFont}
+                onChange={(e) => { setSelectedFont(e.target.value); onFontChange?.(e.target.value); }}
+                className="flex-1 bg-surface-2 ring-1 ring-white/[0.08] rounded-md px-2 py-1.5 text-xs text-white focus:ring-brand outline-none cursor-pointer"
+                style={{ fontFamily: FONT_CSS_BY_CODE[selectedFont] }}
+                title="Probar otra tipografía — se ve en el preview al instante"
+              >
+                {EDITOR_FONTS.map((f) => (
+                  <option key={f.code} value={f.code} style={{ fontFamily: f.css }}>{f.label}</option>
+                ))}
+              </select>
+            </div>
+            {/* Live text style: case + contrast + transition. Preview reflects
+                case/contrast instantly; all three apply on re-render. */}
+            <div className="flex flex-wrap items-center gap-x-3 gap-y-1.5 px-1 text-[11px]">
+              <div className="flex items-center gap-1.5">
+                <span className="text-ink-tertiary">Estilo</span>
+                <div className="inline-flex rounded-md ring-1 ring-white/[0.08] overflow-hidden font-semibold">
+                  {TEXT_CASES.map((o) => (
+                    <button key={o.code} type="button"
+                      onClick={() => { setSelectedCase(o.code); onCaseChange?.(o.code); }}
+                      className={`px-2 py-1 transition-colors ${selectedCase === o.code ? "bg-brand text-white" : "text-ink-secondary hover:text-white"}`}>{o.label}</button>
+                  ))}
+                </div>
+              </div>
+              <div className="flex items-center gap-1.5">
+                <span className="text-ink-tertiary">Contraste</span>
+                <div className="inline-flex rounded-md ring-1 ring-white/[0.08] overflow-hidden font-semibold">
+                  {CONTRASTS.map((o) => (
+                    <button key={o.code} type="button"
+                      onClick={() => { setSelectedContrast(o.code); onContrastChange?.(o.code); }}
+                      className={`px-2 py-1 transition-colors ${selectedContrast === o.code ? "bg-brand text-white" : "text-ink-secondary hover:text-white"}`}>{o.label}</button>
+                  ))}
+                </div>
+              </div>
+              {/* Animación de letra (lyrics_animation) — libass templates. */}
+              <div className="flex items-center gap-1.5">
+                <span className="text-ink-tertiary">Animación</span>
+                <select value={selectedAnimation}
+                  onChange={(e) => { setSelectedAnimation(e.target.value); onAnimationChange?.(e.target.value); }}
+                  className="bg-surface-2 ring-1 ring-white/[0.08] rounded-md px-1.5 py-1 text-white focus:ring-brand outline-none cursor-pointer">
+                  {LYRICS_ANIMATIONS.map((o) => (<option key={o.code} value={o.code}>{o.label}</option>))}
+                </select>
+              </div>
+              {/* Transición de línea (line_transition) — entrada slide/wipe/blur. */}
+              <div className="flex items-center gap-1.5">
+                <span className="text-ink-tertiary">Transición</span>
+                <select value={selectedLineTransition}
+                  onChange={(e) => { setSelectedLineTransition(e.target.value); onLineTransitionChange?.(e.target.value); }}
+                  className="bg-surface-2 ring-1 ring-white/[0.08] rounded-md px-1.5 py-1 text-white focus:ring-brand outline-none cursor-pointer">
+                  {LINE_TRANSITIONS.map((o) => (<option key={o.code} value={o.code}>{o.label}</option>))}
+                </select>
+              </div>
+            </div>
+            <div className="flex items-center justify-between px-1 gap-2 flex-wrap">
+              <span className="text-[11px] text-ink-tertiary">Mover · escalar · rotar aplica a</span>
+              <div className="inline-flex rounded-md ring-1 ring-white/[0.08] overflow-hidden text-[11px] font-semibold">
+                <button type="button" onClick={() => setLayoutScope("all")}
+                  className={`px-2.5 py-1 transition-colors ${layoutScope === "all" ? "bg-brand text-white" : "text-ink-secondary hover:text-white"}`}>
+                  Todas las líneas
+                </button>
+                <button type="button" onClick={() => setLayoutScope("line")}
+                  className={`px-2.5 py-1 transition-colors ${layoutScope === "line" ? "bg-brand text-white" : "text-ink-secondary hover:text-white"}`}>
+                  Solo esta
+                </button>
+              </div>
+            </div>
+            <LyricVideoPreview
+              t={t}
+              segments={edited}
+              currentTime={currentTime}
+              backgroundUrl={previewBgUrl || null}
+              backgroundStyle={backgroundStyle || "default"}
+              font={FONT_CSS_BY_CODE[selectedFont] || undefined}
+              textCase={selectedCase}
+              textContrast={selectedContrast}
+              // 2026-05-23: la prop `transition` (Corte/Fade) salió con el
+              // deprecation de lyric_transition. Cuando el preview soporte
+              // las animaciones libass nuevas se pasa por acá:
+              //   lyricsAnimation={selectedAnimation}
+              //   lineTransition={selectedLineTransition}
+              fontScale={fontScale}
+              onSelect={(id) => {
+                focusSegment(id);
+                const seg = edited.find((s) => s._id === id);
+                if (seg) seekTo(Math.max(0, seg.start), false);
+              }}
+              onLayoutChange={handleLayoutChange}
+              onDragStart={pushEditHistory}
+            />
+          </div>
+          {/* COLUMNA DERECHA — scrollea independiente. Lista o timeline
+              según viewMode. min-w-0 evita que rows muy largas rompan el grid. */}
+          <div className="min-w-0 space-y-2">
+            {viewMode === "timeline" && audioUrl ? (
+              <LyricsTimeline
+                segments={edited}
+                duration={duration}
+                currentTime={currentTime}
+                isPlaying={isPlaying}
+                saveStatus={saveStatus}
+                activeId={activeId}
+                focusedSegId={focusedSegId}
+                highlightedIds={highlightedIds}
+                waveform={waveform}
+                gapS={MIN_GAP_S}
+                onSeek={(s) => seekTo(s, false)}
+                onDragStart={pushEditHistory}
+                onTimingChange={handleTimelineTimingChange}
+                onTextChange={updateText}
+                onFocus={focusSegment}
+                onReset={resetTimings}
+              />
+            ) : (
+              <>
+                <p className="text-[11px] text-gray-600 mb-2 px-1">
+                  {t("editor.list_hint") || "Click en un tiempo para reproducir desde ahí · doble click para editarlo"}
+                </p>
+                <div className="relative">
+                  <div className="absolute bottom-0 left-0 right-0 h-12 bg-gradient-to-t from-surface to-transparent pointer-events-none z-10 rounded-b-2xl" />
+                  <div ref={listRef} className="space-y-1 max-h-[calc(100vh-280px)] overflow-y-auto pr-1 pb-8">
           {edited.map((seg, idx) => {
             const suggestion = suggestionsById[seg._id];
             const isApplied = suggestion && seg.text === suggestion;
@@ -1709,6 +2269,9 @@ export default function LyricsEditor({
             // button appears next to the timestamp. Auto-clears 10s after
             // the anchor (timer in tapAnchor's setHighlightedIds).
             const wasRecentlyAnchored = highlightedIds.has(seg._id);
+            // Line the aligner inserted (Whisper missed it): timing is
+            // interpolated, so flag it amber for the operator to verify.
+            const isReview = !!seg.review;
 
             return (
               <div
@@ -1719,6 +2282,7 @@ export default function LyricsEditor({
                   ${isArmed ? "bg-brand/[0.18] ring-2 ring-brand shadow-glow scale-[1.01]" : ""}
                   ${!isArmed && isActive ? "bg-brand/[0.07] ring-1 ring-brand/25" : ""}
                   ${!isArmed && !isActive && wasRecentlyAnchored ? "bg-brand/[0.05] ring-1 ring-brand/40" : ""}
+                  ${!isArmed && !isActive && !wasRecentlyAnchored && isReview ? "bg-amber-500/[0.06] ring-1 ring-amber-500/40" : ""}
                   ${isAnchored ? "opacity-60" : ""}`}
               >
                 <div className="flex items-start gap-2 p-1">
@@ -1774,11 +2338,52 @@ export default function LyricsEditor({
                       type="text"
                       value={seg.text}
                       onChange={(e) => updateText(seg._id, e.target.value)}
-                      onFocus={() => { seekTo(seg.start, false); setFocusedSegId(seg._id); }}
+                      onFocus={() => {
+                        seekTo(seg.start, false);
+                        setFocusedSegId(seg._id);
+                        setTextEditStart({ id: seg._id, text: seg.text });
+                      }}
+                      onBlur={(e) => handleTextBlur(seg._id, e.target.value)}
                       className={`w-full px-3 py-2 rounded-xl bg-surface-1 border text-sm text-white
                         focus:border-brand/40 focus:outline-none hover:border-white/[0.08] transition-all
-                        ${suggestion && !isApplied ? "border-amber-500/20" : "border-white/[0.04]"}`}
+                        ${suggestion && !isApplied ? "border-amber-500/20" : isReview ? "border-amber-500/40" : "border-white/[0.04]"}`}
                     />
+                    {isReview && (
+                      <span className="inline-flex items-center gap-1 mt-1 ml-1 px-2 py-0.5 rounded-full
+                        bg-amber-500/15 text-amber-300 text-[10px] font-medium">
+                        <svg className="w-3 h-3" fill="none" stroke="currentColor" strokeWidth="2.2" viewBox="0 0 24 24">
+                          <path d="M12 9v4M12 17h.01" />
+                          <path d="M10.3 3.9 1.8 18a2 2 0 0 0 1.7 3h17a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0z" />
+                        </svg>
+                        {t("editor.review_badge") || "revisar tiempo"}
+                      </span>
+                    )}
+                    {propagationPrompt && propagationPrompt.id === seg._id && (
+                      <div className="flex items-center gap-2 mt-1.5 px-3 py-2 rounded-xl
+                        bg-brand/10 ring-1 ring-brand/30 text-xs text-white">
+                        <span className="flex-1">
+                          {(t("editor.repeat_prompt") || "Esta línea se repite en otras {n}. ¿Aplicar el cambio a todas?")
+                            .replace("{n}", propagationPrompt.matchIds.length)}
+                        </span>
+                        <button
+                          type="button"
+                          onMouseDown={(e) => e.preventDefault()}
+                          onClick={applyPropagation}
+                          className="px-2.5 py-1 rounded-lg bg-brand text-white font-medium hover:bg-brand/80 transition-colors whitespace-nowrap"
+                        >
+                          {(t("editor.repeat_apply_all") || "Aplicar a todas ({n})")
+                            .replace("{n}", propagationPrompt.matchIds.length)}
+                        </button>
+                        <button
+                          type="button"
+                          onMouseDown={(e) => e.preventDefault()}
+                          onClick={dismissPropagation}
+                          className="px-2.5 py-1 rounded-lg bg-surface-2 text-white/70 hover:text-white transition-colors whitespace-nowrap"
+                        >
+                          {t("editor.repeat_only_this") || "Solo esta"}
+                        </button>
+                      </div>
+                    )}
                     {/* Wrap indicator + split action */}
                     {(() => {
                       if (!(seg.text || "").trim()) return null;
@@ -1827,20 +2432,8 @@ export default function LyricsEditor({
                     )}
                   </div>
                   <div className="shrink-0 flex items-center gap-0.5 mt-0.5">
-                    {!syncMode && (
-                      <button onClick={() => enterSyncModeAt(idx)}
-                        {...(idx === 0 ? { "data-tour": "editor-row-sync" } : {})}
-                        className="w-8 h-8 rounded-lg opacity-0 group-hover:opacity-100
-                          hover:bg-brand/15 flex items-center justify-center text-gray-600
-                          hover:text-brand-light transition-all"
-                        title={t("editor.sync_from_here") || "Activar Sync desde esta línea"}>
-                        <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
-                          <circle cx="12" cy="12" r="9" />
-                          <circle cx="12" cy="12" r="4" />
-                          <circle cx="12" cy="12" r="1" fill="currentColor" />
-                        </svg>
-                      </button>
-                    )}
+                    {/* Sync-entry per row ELIMINADO 2026-05-23 — único entry
+                        point pasa a ser el botón global del playbar + Cmd+K. */}
                     <button onClick={() => duplicateSeg(seg._id)}
                       className="w-8 h-8 rounded-lg opacity-0 group-hover:opacity-100
                         hover:bg-brand/10 flex items-center justify-center text-gray-600
@@ -1851,33 +2444,18 @@ export default function LyricsEditor({
                         <path d="M5 15V5a1 1 0 011-1h10" />
                       </svg>
                     </button>
-                    {/* ✂ Trim line: caps `end` to estimated voice-end so the
-                        text doesn't stay pinned through a fill / outro. Only
-                        renders when the current duration exceeds the cap.
-
-                        Unlike the other row actions (duplicate, split, delete)
-                        which are hover-only, this button is **always visible**
-                        on hanging lines because it doubles as an INDICATOR —
-                        when the operator opens the editor on a song with 12
-                        hanging lines, all 12 ✂ icons are visible at once so
-                        the operator can scan and decide per-line without
-                        hovering each row. Faded baseline opacity so it doesn't
-                        compete visually with the lyric text; goes full opacity
-                        on hover when the operator is targeting it. */}
-                    {(seg.end - seg.start) > estimateVoiceEndDuration(seg.text) && (
-                      <button onClick={() => trimSeg(seg._id)}
-                        className="w-8 h-8 rounded-lg opacity-60 hover:opacity-100
-                          hover:bg-amber-500/15 flex items-center justify-center text-amber-500/80
-                          hover:text-amber-400 transition-all"
-                        title={t("editor.trim_line") ||
-                          "Recortar al final natural (cuando la voz termina y empieza un fill)"}>
-                        <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
-                          <circle cx="6" cy="6" r="3" />
-                          <circle cx="6" cy="18" r="3" />
-                          <path d="M20 4L8.12 15.88M14.47 14.48L20 20M8.12 8.12L12 12" />
-                        </svg>
-                      </button>
-                    )}
+                    <button onClick={() => insertLineAfter(idx)}
+                      className="w-8 h-8 rounded-lg opacity-0 group-hover:opacity-100
+                        hover:bg-brand/10 flex items-center justify-center text-gray-600
+                        hover:text-brand-light transition-all"
+                      title={t("editor.insert_line_below") || "Insertar línea acá (en el medio de la canción)"}>
+                      <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
+                        <path d="M12 5v14M5 12h14" />
+                      </svg>
+                    </button>
+                    {/* Per-row ✂ trim removed: redundant with the bulk
+                        "Recortar N líneas con texto colgado · Aplicar" auto-fix
+                        at the top, and timing is now handled in the timeline. */}
                     <button onClick={() => deleteSeg(seg._id)}
                       className="w-8 h-8 rounded-lg opacity-0 group-hover:opacity-100
                         hover:bg-red-500/10 flex items-center justify-center text-gray-600
@@ -1897,31 +2475,32 @@ export default function LyricsEditor({
             onClick={addBlankLine}
             className="w-full mt-2 py-2.5 rounded-xl border border-dashed border-white/[0.08]
               hover:border-brand/40 hover:bg-brand/[0.04] text-gray-500 hover:text-brand-light
-              text-[12px] transition-all flex items-center justify-center gap-1.5"
+              text-caption transition-all flex items-center justify-center gap-1.5"
           >
             <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
               <path d="M12 5v14M5 12h14" />
             </svg>
             {t("editor.add_line") || "Agregar línea"}
           </button>
-        </div>
+                  </div>
+                </div>
+              </>
+            )}
+          </div>
       </div>
 
-      <div className="mt-4 flex justify-between items-center gap-3">
-        <div className="flex items-center gap-2 min-w-0">
-          <span className="text-xs text-gray-600 shrink-0">
-            {edited.length} {t("editor.lines")}
+      {/* Line-count + blank-line note. The primary CTA lives in the sticky
+          header now (always reachable) — no duplicate button here. */}
+      <div className="mt-4 flex items-center gap-2 min-w-0" data-tour="editor-approve">
+        <span className="text-xs text-gray-600 shrink-0">
+          {edited.length} {t("editor.lines")}
+        </span>
+        {blankCount > 0 && (
+          <span className="text-[11px] text-amber-400 truncate">
+            · {blankCount} {blankCount === 1 ? t("editor.blank_singular") || "línea en blanco" : t("editor.blank_plural") || "líneas en blanco"} —{" "}
+            {t("editor.blanks_dropped") || "se omitirán"}
           </span>
-          {blankCount > 0 && (
-            <span className="text-[11px] text-amber-400 truncate">
-              · {blankCount} {blankCount === 1 ? t("editor.blank_singular") || "línea en blanco" : t("editor.blank_plural") || "líneas en blanco"} —{" "}
-              {t("editor.blanks_dropped") || "se omitirán"}
-            </span>
-          )}
-        </div>
-        <button onClick={handleApprove} className="btn-primary text-sm h-11 px-5 shrink-0" data-tour="editor-approve">
-          {submitLabel || (isBatch ? t("editor.approve_next") : t("editor.approve_generate"))}
-        </button>
+        )}
       </div>
 
       {/* ── 3+ line wrap warning banner ────────────────────────────── */}
@@ -1961,107 +2540,10 @@ export default function LyricsEditor({
         </div>
       )}
 
-      {/* ── Live preview panel ──────────────────────────────────────── */}
-      {focusedSegId !== null && (() => {
-        const seg = edited.find((s) => s._id === focusedSegId);
-        if (!seg || !(seg.text || "").trim()) return null;
-        const displayText = applyCase(seg.text, textCase);
-        const tier = getTier(displayText);
-        // AUTO means the worker random-picks per-job from an 8-font pool
-        // at render time (pipeline.py:_FONT_POOL + random.choice). The
-        // preview can't honestly show what that pick will be, so we
-        // render with a neutral fallback (Montserrat) and dim it +
-        // surface a badge so the operator knows the final font will
-        // differ. Without this the preview looks identical for every
-        // song in a batch and the operator (rightly) thinks the worker
-        // is going to render them all the same.
-        const isAutoFont = !font;
-        const fontCss = FONT_CSS_MAP[font] || FONT_CSS_MAP[""];
-        const basePx = tier.sizePx;
-        const scaledPx = Math.round(basePx * Math.max(0.6, Math.min(1.5, fontScale)));
-        // Scale down to preview container (preview is ~480px wide → video is 1920px)
-        const previewRatio = 480 / 1920;
-        const previewFontPx = Math.max(10, Math.round(scaledPx * previewRatio));
-        const lines = estimateWrappedLines(displayText, fontCss, scaledPx, tier.maxWidthPx);
-        return (
-          <div className="mt-4 rounded-card bg-surface-2/40 ring-1 ring-white/[0.04] overflow-hidden animate-fade-in">
-            <div className="flex items-center justify-between px-4 py-2 border-b border-white/[0.04]">
-              <span className="text-[11px] text-gray-500 uppercase tracking-wider">
-                {t("editor.preview_header") || "Preview — cómo quedarán las lyrics"}
-              </span>
-              <button onClick={() => setFocusedSegId(null)} className="text-gray-600 hover:text-white text-xs transition-colors">✕</button>
-            </div>
-            {/* AUTO badge: shown only when no explicit font picked. Sits
-                above the 16:9 preview so it's the first thing the eye
-                hits before reading the rendered text. */}
-            {isAutoFont && (
-              <div className="px-4 py-2 bg-amber-500/[0.06] border-b border-amber-500/20 flex items-start gap-2">
-                <svg className="w-3.5 h-3.5 text-amber-400 shrink-0 mt-0.5" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
-                  <circle cx="12" cy="12" r="10" />
-                  <path d="M12 8h.01M11 12h1v4h1" strokeLinecap="round" strokeLinejoin="round"/>
-                </svg>
-                <p className="text-[11px] text-amber-200/90 leading-relaxed">
-                  <span className="font-semibold">{t("editor.auto_font_badge") || "Tipografía: Auto"}</span>
-                  {" · "}
-                  {t("editor.auto_font_explainer") || "el render va a elegir una de 8 fuentes al azar por canción. Esta vista previa usa Montserrat solo de referencia — el video final puede verse distinto."}
-                </p>
-              </div>
-            )}
-            {/* 16:9 preview card */}
-            <div
-              className="relative w-full flex items-center justify-center bg-gradient-to-b from-gray-900 to-black"
-              style={{ aspectRatio: "16/9", maxHeight: "180px" }}
-            >
-              <p
-                style={{
-                  fontFamily: fontCss,
-                  fontSize: `${previewFontPx}px`,
-                  fontWeight: 700,
-                  color: "white",
-                  // Dim AUTO previews so they don't read as "final look"
-                  opacity: isAutoFont ? 0.7 : 1,
-                  textShadow: textContrast === "strong"
-                    ? "0 0 8px rgba(0,0,0,1), -1px -1px 0 #000, 1px -1px 0 #000, -1px 1px 0 #000, 1px 1px 0 #000, 2px 2px 4px rgba(0,0,0,0.9)"
-                    : textContrast === "medium"
-                    ? "0 0 4px rgba(0,0,0,0.9), 1px 1px 3px rgba(0,0,0,0.8)"
-                    : "1px 1px 2px rgba(0,0,0,0.6)",
-                  WebkitTextStroke: textContrast === "strong" ? "1px black" : textContrast === "medium" ? "0.5px black" : "0px",
-                  textTransform: "none",
-                  textAlign: "center",
-                  maxWidth: `${Math.round(tier.maxWidthPx * previewRatio)}px`,
-                  lineHeight: 1.25,
-                  wordBreak: "break-word",
-                  padding: "0 12px",
-                }}
-              >
-                {displayText}
-              </p>
-              {/* line count badge overlay */}
-              <span className={`absolute bottom-2 right-3 text-[10px] font-medium px-2 py-0.5 rounded-full ${
-                lines === 1 ? "bg-accent/20 text-accent" :
-                lines === 2 ? "bg-amber-500/20 text-amber-300" :
-                "bg-red-500/20 text-red-300"
-              }`}>
-                {lines} {lines === 1 ? "línea" : "líneas"} en el video
-              </span>
-            </div>
-            <div className="px-4 py-2 flex flex-wrap gap-x-4 gap-y-1 text-[10px] text-gray-600">
-              <span className={isAutoFont ? "text-amber-400 font-medium" : ""}>
-                Fuente: {font || (t("editor.auto_font_inline") || "Auto (se elige al renderizar)")}
-              </span>
-              <span>Tamaño: {fontScale}×</span>
-              <span className={textCase === "title" ? "text-amber-400 font-medium" : ""}>
-                Caja: {textCase === "upper" ? "MAYÚSCULAS" : textCase === "title" ? "Título (cada palabra capitalizada)" : textCase === "lower" ? "minúsculas" : "Original"}
-              </span>
-              <span>Transición: {lyricTransition === "cut" ? "Corte" : lyricTransition === "fade" ? "Fade" : "Fade lento"}</span>
-              {SHOW_MOTION_PICKER && (
-                <span>Movimiento: {textMotion === "none" ? "Estático" : textMotion === "subtle" ? "Sutil" : "Flotante"}</span>
-              )}
-              <span>Contraste: {textContrast === "subtle" ? "Suave" : textContrast === "strong" ? "Fuerte" : "Medio"}</span>
-            </div>
-          </div>
-        );
-      })()}
+      {/* Inline preview list-only ELIMINADO 2026-05-23 — el refactor world-class
+          deja el LyricVideoPreview siempre visible en la columna izquierda,
+          en ambas vistas. Este bloque (que sólo aparecía en list mode cuando
+          una fila tenía foco) era redundante y a veces divergía visualmente. */}
 
       <EditorTour user={user} />
     </div>

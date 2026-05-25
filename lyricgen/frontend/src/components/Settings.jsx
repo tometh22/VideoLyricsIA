@@ -41,7 +41,7 @@ const PLAN_INFO = {
 
 function SectionLabel({ children }) {
   return (
-    <p className="text-[10px] font-medium text-gray-500 uppercase tracking-[0.18em] mb-3">
+    <p className="text-section text-gray-500 uppercase mb-3">
       {children}
     </p>
   );
@@ -556,7 +556,7 @@ export default function Settings({ onBack }) {
                       <button
                         onClick={() => handleRevokeApiKey(k.id)}
                         disabled={revokingId === k.id}
-                        className="shrink-0 text-[11px] font-medium px-3 py-1.5 rounded-lg bg-red-500/10 text-red-400 ring-1 ring-red-500/15 hover:bg-red-500/20 transition-colors disabled:opacity-40">
+                        className="shrink-0 text-label px-3 py-1.5 rounded-lg bg-red-500/10 text-red-400 ring-1 ring-red-500/15 hover:bg-red-500/20 transition-colors disabled:opacity-40">
                         {revokingId === k.id ? "…" : (t("settings.api_key_revoke") || "Revocar")}
                       </button>
                     </div>

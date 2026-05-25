@@ -152,6 +152,59 @@ def _pick_queue(plan: str, tenant_id: str = ""):
     return q_default
 
 
+def transcription_failure_callback(job, connection, type_, value, traceback) -> None:
+    """RQ on_failure hook for `run_transcription_job`. Mirrors
+    `pipeline_failure_callback` but writes the transcription-specific
+    terminal status.
+
+    INCIDENT 2026-05-24: when RQ killed the work-horse (timeout exceeded,
+    OOM, deploy SIGTERM), the Postgres row stayed in `status='transcribing'`
+    indefinitely because `transcription_worker._fail` runs INSIDE the
+    Python process — a SIGKILL skips it entirely. Operator saw 4 jobs
+    "stuck at isolate_vocals progress=25" with no error. RQ does call its
+    own `failure_callbacks` AFTER the kill, so this hook is the last
+    chance to surface a real error to the user.
+
+    Best-effort + terminal-state-aware: never clobber a real done/error.
+    """
+    try:
+        from database import Job as JobModel, SessionLocal
+        rq_job_id = getattr(job, "id", "") or ""
+        # RQ job_id has prefix `transcribe:<job_id>` (set at enqueue time).
+        if rq_job_id.startswith("transcribe:"):
+            job_id_db = rq_job_id.split(":", 1)[1]
+        else:
+            job_id_db = rq_job_id
+        if not job_id_db:
+            return
+        is_abandoned = "AbandonedJobError" in (type_.__name__ if type_ else "")
+        if is_abandoned:
+            err_msg = (
+                "El worker se reinició mientras transcribíamos y los "
+                "reintentos automáticos también fallaron. Reintentá "
+                "subiendo el archivo de nuevo."
+            )
+        else:
+            tb_msg = str(value)[:400] if value else (type_.__name__ if type_ else "error")
+            err_msg = f"La transcripción falló: {tb_msg}"
+        db = SessionLocal()
+        try:
+            row = db.query(JobModel).filter(JobModel.job_id == job_id_db).first()
+            if row is None:
+                return
+            if row.status in ("transcribing", "transcribing_queued", "awaiting_upload"):
+                row.status = "transcription_failed"
+                row.error = err_msg[:500]
+                row.current_step = "error"
+                from datetime import datetime, timezone
+                row.completed_at = datetime.now(timezone.utc)
+                db.commit()
+        finally:
+            db.close()
+    except Exception as e:  # pragma: no cover
+        logger.warning("transcription_failure_callback failed: %s", e)
+
+
 def pipeline_failure_callback(job, connection, type_, value, traceback) -> None:
     """RQ on_failure hook for run_pipeline. Fires when retries are
     exhausted (i.e. the job is permanently dead). Updates the Postgres
@@ -345,6 +398,151 @@ def enqueue_pipeline(
     )
     t.start()
     return f"thread:{job_id}"
+
+
+def enqueue_transcription(
+    job_id: str,
+    audio_path: str,
+    *,
+    language: str = "",
+    artist: str = "",
+    title: str = "",
+    filename: str = "",
+    tenant_id: str = "",
+) -> str:
+    """Enqueue una transcripción en la queue `transcription` (alta prioridad,
+    drenada por el mismo worker container que enterprise/default).
+
+    Devuelve el RQ job id (o 'thread:<job_id>' en el fallback dev sin Redis).
+
+    Diseño 2026-05-23: antes `/transcribe-uploaded` corría
+    `_run_transcription_for_job` inline. Ahora hace enqueue acá y devuelve
+    202+job_id. Ver transcription_worker.py para el entry point + el code path.
+
+    Tenant priority: UMG/OMG aterrizan en `transcription` igual que todos —
+    Whisper es uniformemente rápido (~15-20s), no necesita una cola premium
+    aparte. Si en el futuro la cola se acumula y un tenant grande está
+    bloqueado, mover la decisión de queue acá.
+    """
+    _, q_default, _ = _init_redis()
+    if q_default is not None:
+        # Acceso directo al Redis para crear la queue "transcription" sin
+        # cambiar la inicialización (que no la incluye por compat con workers
+        # existentes que no la conocen).
+        from rq import Queue, Retry
+        q = Queue("transcription", connection=_redis)
+        from transcription_worker import run_transcription_job
+        # INCIDENT 2026-05-24: previous default was 300s (5 min). The
+        # post-PR-G pipeline runs demucs (60-180s) + forced_align (75-480s
+        # budget) + whisperX (60-480s budget) + Whisper-1 fallback. Worst
+        # case ~15 min — RQ killed the work-horse at 5 min, the job stayed
+        # in `status='transcribing'` indefinitely (no finally hook on the
+        # kill signal), and the operator saw "stuck at progress=25" with
+        # no error. Bump default to 1800s (30 min) — covers the worst
+        # case with margin. Env var override stays for ops tuning.
+        timeout = int(os.environ.get("TRANSCRIBE_JOB_TIMEOUT", "1800"))
+        retry = Retry(max=2, interval=10)  # whisper hiccup → reintentar 2 veces con 10s gap
+        rq_job = q.enqueue(
+            run_transcription_job,
+            args=(job_id, audio_path),
+            kwargs={
+                "language": language, "artist": artist, "title": title,
+                "filename": filename,
+            },
+            job_timeout=timeout,
+            result_ttl=RESULT_TTL,
+            failure_ttl=FAILURE_TTL,
+            job_id=f"transcribe:{job_id}",  # prefix evita colisión con render job_id
+            retry=retry,
+            # INCIDENT 2026-05-24: when RQ killed the work-horse (timeout
+            # or OOM), `transcription_worker._fail` never ran (it lives
+            # inside the Python process). Without this callback the
+            # Postgres row stayed in `transcribing` indefinitely. Now
+            # RQ calls this AFTER the kill to mark the job
+            # `transcription_failed` so the operator sees a real error.
+            on_failure=transcription_failure_callback,
+        )
+        return rq_job.id
+
+    # Dev fallback (sin Redis): thread daemon, idéntico al de enqueue_pipeline.
+    if _ENVIRONMENT == "production":
+        logger.error(
+            "Refusing to enqueue transcription %s via thread fallback: Redis is "
+            "required in production but unreachable.", job_id,
+        )
+        raise RuntimeError(
+            "Transcription queue unavailable: Redis is required in production."
+        )
+    from transcription_worker import run_transcription_job
+    t = threading.Thread(
+        target=run_transcription_job,
+        args=(job_id, audio_path),
+        kwargs={
+            "language": language, "artist": artist, "title": title,
+            "filename": filename,
+        },
+        daemon=True,
+    )
+    t.start()
+    return f"thread:transcribe:{job_id}"
+
+
+def enqueue_bg_preview(
+    job_id: str,
+    bg_cache_key: str,
+    params: dict,
+) -> str:
+    """Enqueue una pre-generación del background a la queue `bg_preview`.
+
+    Capa C del wizard refactor (2026-05-24): mientras el operador edita lyrics,
+    Veo/Imagen ya están generando el fondo. Cuando llega el POST /generate
+    "real", el video del background ya está cacheado en R2 y la pipeline lo
+    reusa — 0 cost extra y ~60-120s menos de wait perceptible.
+
+    Devuelve el RQ job id (o 'thread:bgpreview:<job_id>' en dev fallback sin
+    Redis). Ver bg_preview.py para el entry point del worker.
+
+    Tenant priority: por ahora todos en `bg_preview` queue (workers drenan
+    en orden FIFO). Si en el futuro UMG necesita priority, mover a
+    `enterprise_bg_preview` o similar.
+    """
+    _, q_default, _ = _init_redis()
+    if q_default is not None:
+        from rq import Queue, Retry
+        q = Queue("bg_preview", connection=_redis)
+        from bg_preview import run_bg_preview_job
+        timeout = int(os.environ.get("BG_PREVIEW_JOB_TIMEOUT", "300"))
+        # Veo es lento + hiccup-prone; 2 retries con 20s gap absorbe la
+        # mayoría de los rate-limits transitorios. Más allá de eso, el job
+        # marca status=bg_preview_failed y el frontend muestra el error.
+        retry = Retry(max=2, interval=20)
+        rq_job = q.enqueue(
+            run_bg_preview_job,
+            args=(job_id, bg_cache_key, params),
+            job_timeout=timeout,
+            result_ttl=RESULT_TTL,
+            failure_ttl=FAILURE_TTL,
+            job_id=f"bgpreview:{job_id}",
+            retry=retry,
+        )
+        return rq_job.id
+
+    if _ENVIRONMENT == "production":
+        logger.error(
+            "Refusing to enqueue bg_preview %s via thread fallback: Redis is "
+            "required in production but unreachable.", job_id,
+        )
+        raise RuntimeError(
+            "bg_preview queue unavailable: Redis is required in production."
+        )
+    from bg_preview import run_bg_preview_job
+    t = threading.Thread(
+        target=run_bg_preview_job,
+        args=(job_id, bg_cache_key, params),
+        daemon=True,
+    )
+    t.start()
+    return f"thread:bgpreview:{job_id}"
 
 
 def enqueue_prores_prewarm(job_id: str, file_type: str) -> str | None:

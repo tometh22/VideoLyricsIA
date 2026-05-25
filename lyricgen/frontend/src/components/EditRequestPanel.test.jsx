@@ -18,6 +18,14 @@ vi.mock("../i18n", () => ({
   useI18n: () => ({ t: (_key, fallback) => fallback }),
 }));
 
+// EditRequestPanel calls useAlert() (themed error modals). Tests render it
+// without the app-root <AlertProvider>, so stub the hook.
+vi.mock("./AlertProvider", () => ({
+  useAlert: () => ({ alert: () => {} }),
+  AlertProvider: ({ children }) => children,
+}));
+
+
 // ContentValidationToggle pulls in extra deps we don't need here; the
 // "lyrics" mode path doesn't render it. Stubbing it just in case it
 // shows up via the typography path the panel still renders.
@@ -109,8 +117,8 @@ describe("EditRequestPanel — stale segments on modal reopen", () => {
     const job = baseJob();
     const { rerender } = render(<EditRequestPanel job={job} onEditTriggered={vi.fn()} />);
 
-    // Open the lyrics modal — click the "Corregir letras" button.
-    const openBtn = screen.getByRole("button", { name: /Corregir letras/i });
+    // Open the lyrics modal — click the "Editar letras y estilo" button.
+    const openBtn = screen.getByRole("button", { name: /Editar letras y estilo/i });
     await user.click(openBtn);
 
     // First open: editor receives the parent's prop verbatim.
@@ -144,7 +152,7 @@ describe("EditRequestPanel — stale segments on modal reopen", () => {
 
     // Reopen the modal.
     _capturedSegments = null;
-    const openBtn2 = screen.getByRole("button", { name: /Corregir letras/i });
+    const openBtn2 = screen.getByRole("button", { name: /Editar letras y estilo/i });
     await user.click(openBtn2);
 
     // The editor should now mount against the LAST-SAVED snapshot, not
@@ -173,7 +181,7 @@ describe("EditRequestPanel — stale segments on modal reopen", () => {
 
     const job = baseJob();
     render(<EditRequestPanel job={job} onEditTriggered={vi.fn()} />);
-    await user.click(screen.getByRole("button", { name: /Corregir letras/i }));
+    await user.click(screen.getByRole("button", { name: /Editar letras y estilo/i }));
     expect(screen.getByTestId("mock-editor")).toBeInTheDocument();
 
     // Simulate a child component (the real LyricsEditor in sync mode)
@@ -220,7 +228,7 @@ describe("EditRequestPanel — stale segments on modal reopen", () => {
     const { rerender } = render(<EditRequestPanel job={jobA} onEditTriggered={vi.fn()} />);
 
     // Open + simulate save on job A.
-    await user.click(screen.getByRole("button", { name: /Corregir letras/i }));
+    await user.click(screen.getByRole("button", { name: /Editar letras y estilo/i }));
     await waitFor(() => expect(_capturedOnPersist).toBeTruthy());
     await _capturedOnPersist("job-A", [{ start: 0, end: 1, text: "JOB A EDITED" }]);
     fireEvent.keyDown(window, { key: "Escape" });
@@ -233,7 +241,7 @@ describe("EditRequestPanel — stale segments on modal reopen", () => {
     rerender(<EditRequestPanel job={jobB} onEditTriggered={vi.fn()} />);
 
     _capturedSegments = null;
-    await user.click(screen.getByRole("button", { name: /Corregir letras/i }));
+    await user.click(screen.getByRole("button", { name: /Editar letras y estilo/i }));
     await waitFor(() => expect(_capturedSegments).toBeTruthy());
 
     // MUST show job B's segments — never job A's saved snapshot.

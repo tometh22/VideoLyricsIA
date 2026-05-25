@@ -2,7 +2,7 @@
 
 import logging
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 from sqlalchemy.exc import OperationalError
@@ -52,9 +52,14 @@ def create_job(
       - "awaiting_upload": browser is still PUTting bytes directly to
         R2 via a presigned URL. /transcribe-uploaded promotes to
         transcribed_pending once the upload completes.
+      - "bg_preview_queued": background-preview "ghost" job (Capa C feature
+        2026-05-24) — no audio, no transcription, just a tracking row so
+        the wizard can poll the pre-render status of the Veo background.
+        The worker promotes to "bg_preview_done" / "bg_preview_failed".
     """
     valid_states = (
         "processing", "queued", "transcribed_pending", "awaiting_upload",
+        "bg_preview_queued",
     )
     if initial_status not in valid_states:
         raise ValueError(f"unsupported initial_status {initial_status!r}")
@@ -166,12 +171,99 @@ def touch_user_activity(db: Session, job: Job) -> None:
     job.last_user_activity_at = datetime.now(timezone.utc)
 
 
+def set_timing_source(job_id: str, source: str) -> None:
+    """Record which engine produced a job's lyric timing (forced_align /
+    lrclib_synced / gemini_aligner / whisper) for observability. Best-effort
+    with its own short-lived session so it never holds the request
+    connection or breaks the transcription path on failure.
+
+    SECURITY/CORRECTNESS (audit 2026-05-24):
+    - **Job-missing guard**: log a WARNING if no row matches `job_id` so
+      a typo or DB inconsistency doesn't silently produce a no-op. Bug D
+      (Cosas Mías auto-recovery) showed that a missing log + missing
+      write makes orphan `timing_source=NULL` rows indistinguishable
+      from a happy job.
+    - **Terminal guard**: do NOT overwrite when the job is already in a
+      terminal state (`error`, `done`, etc.). A race with the reaper /
+      worker can leave a job tagged successful in a row that the reaper
+      already marked failed — confusing telemetry forever.
+    """
+    _logger = logging.getLogger("genly")
+    try:
+        from database import SessionLocal
+        s = SessionLocal()
+        try:
+            j = s.query(Job).filter(Job.job_id == job_id).first()
+            if j is None:
+                _logger.warning(
+                    "[TIMING] set_timing_source(%s, %s): no job row — possible orphan",
+                    job_id, source,
+                )
+                return
+            # Terminal-state guard. Status values declared terminal at this
+            # layer; mirror `update_job`'s terminal set so a reaper-killed
+            # job stays consistent.
+            if getattr(j, "status", None) in ("error", "transcription_failed"):
+                _logger.warning(
+                    "[TIMING] set_timing_source(%s, %s) skipped — job is in terminal state %r",
+                    job_id, source, j.status,
+                )
+                return
+            j.timing_source = source
+            s.commit()
+        finally:
+            s.close()
+    except Exception as e:
+        # Surface set-timing failures as warning, not debug — bug D
+        # taught us that silent debug is the same as no log at all.
+        _logger.warning("[TIMING] set_timing_source failed for %s: %s", job_id, e)
+
+
+def supersede_sibling_drafts(
+    db: Session, *, keep_job_id: str, user_id: int, tenant_id: str,
+    filename: str, window_min: int = 20,
+) -> int:
+    """Delete sibling DRAFT jobs (transcribed_pending / awaiting_upload) for
+    the same user + same filename created within `window_min`, excluding
+    `keep_job_id`.
+
+    Why: the wizard's generate flow can re-upload the audio (new job row)
+    instead of reusing the transcribe job, leaving an orphan
+    transcribed_pending row that shows up as a phantom "2nd job". This
+    removes that orphan at generate time. Time-windowed (default 20 min) so
+    it never touches an INTENTIONAL re-upload of the same song hours later.
+    Returns the number of rows deleted. Caller need not commit (we do).
+    """
+    if not filename:
+        return 0
+    cutoff = datetime.now(timezone.utc) - timedelta(minutes=window_min)
+    siblings = (
+        db.query(Job)
+        .filter(Job.user_id == user_id, Job.tenant_id == tenant_id)
+        .filter(Job.job_id != keep_job_id)
+        .filter(Job.filename == filename)
+        .filter(Job.status.in_(("transcribed_pending", "awaiting_upload")))
+        .filter(Job.created_at >= cutoff)
+        .all()
+    )
+    n = 0
+    for sib in siblings:
+        db.delete(sib)
+        n += 1
+    if n:
+        db.commit()
+        logging.getLogger("genly").info(
+            "[DEDUP] superseded %s sibling draft(s) of %s for %r",
+            n, keep_job_id, filename,
+        )
+    return n
+
+
 def input_audio_is_shared(db: Session, job: Job) -> bool:
     """Return True iff at least one OTHER job in the DB references
     `job.input_r2_key`. Used as a guard before deleting an input audio
     file in R2 — variants and edit-side jobs may share the parent's
     audio key (the upload is done once, then forked).
-
     Conservative on DB error: returns True (treat as shared, skip delete).
     Losing audio is worse than leaving an orphan in R2 — the
     `cleanup_old_inputs` script (30 d retention) is the long-stop.
@@ -387,7 +479,19 @@ def update_job(job_id: str, **kwargs) -> None:
 
     db = SessionLocal()
     try:
-        job = db.query(Job).filter(Job.job_id == job_id).first()
+        # CORRECTNESS (audit 2026-05-24): take a row lock so concurrent
+        # `update_job` calls serialize. Without `with_for_update()`,
+        # two callers can read the same row, modify different fields,
+        # and last-writer-wins clobbers the other's changes. Real-world
+        # impact: `_step(progress=55)` racing the swap-retry
+        # `update_job(artist=X, song_title=Y)` would lose either the
+        # progress or the corrected metadata.
+        job = (
+            db.query(Job)
+            .filter(Job.job_id == job_id)
+            .with_for_update()
+            .first()
+        )
         if not job:
             return
 
@@ -450,6 +554,44 @@ def get_all_jobs_admin(db: Session, limit: int = 500, offset: int = 0) -> list[d
         .all()
     )
     return [j.to_dict() for j in jobs]
+
+
+def merge_s3_keys(job_id: str, file_type: str, key: str) -> bool:
+    """Atomic merge de un (file_type → key) en Job.s3_keys.
+
+    Resuelve el race U1 (audit 2026-05-25): dos prewarm workers
+    (umg_master + umg_short) ambos snapshotean s3_keys=None ANTES del
+    transcode (60-300s), luego compiten al final por escribir su key.
+    El read-modify-write fuera de la misma tx + el setattr() de
+    update_job pisa el otro. Prod 2026-05-12: 8/18 jobs UMG perdieron
+    una key, reconciliados a mano por SQL.
+
+    Una sola tx con SELECT FOR UPDATE: read y write atómicos.
+    Returns True si actualizó, False si el job no existe.
+    """
+    from database import SessionLocal
+    db = SessionLocal()
+    try:
+        job = (
+            db.query(Job)
+            .filter(Job.job_id == job_id)
+            .with_for_update()
+            .first()
+        )
+        if not job:
+            return False
+        current = dict(job.s3_keys or {})
+        if current.get(file_type) == key:
+            return True
+        current[file_type] = key
+        job.s3_keys = current
+        db.commit()
+        return True
+    except Exception:
+        db.rollback()
+        raise
+    finally:
+        db.close()
 
 
 def get_jobs_stats(db: Session, tenant_id: str = None) -> dict:

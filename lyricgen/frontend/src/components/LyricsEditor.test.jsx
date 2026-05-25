@@ -22,6 +22,12 @@ vi.mock("../i18n", () => ({
 vi.mock("./OnboardingTour", () => ({
   EditorTour: () => null,
 }));
+// LyricsEditor calls useToast() (per-anchor sync feedback). Tests render it
+// without the app-root <ToastProvider>, so stub the hook.
+vi.mock("./ToastProvider", () => ({
+  useToast: () => ({ toast: () => {}, dismiss: () => {} }),
+  ToastProvider: ({ children }) => children,
+}));
 
 // Minimal happy-path props the editor expects. Tests override only the
 // fields they care about.
