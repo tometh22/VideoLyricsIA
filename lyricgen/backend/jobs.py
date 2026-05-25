@@ -556,6 +556,94 @@ def get_all_jobs_admin(db: Session, limit: int = 500, offset: int = 0) -> list[d
     return [j.to_dict() for j in jobs]
 
 
+def heartbeat(job_id: str) -> bool:
+    """U10 (audit 2026-05-25): bump Job.last_progress_at = NOW() sin
+    cambiar ningún otro campo. Ligero, atomic, idempotent.
+
+    Uso: workers en steps largos sin update_job() natural (Veo polling
+    de hasta 10min, retry loops). Le dice al reaper "estoy vivo".
+
+    Best-effort: cualquier excepción se traga (heartbeat no debe romper
+    el render).
+    """
+    from database import SessionLocal
+    db = SessionLocal()
+    try:
+        job = db.query(Job).filter(Job.job_id == job_id).first()
+        if not job:
+            return False
+        job.last_progress_at = datetime.now(timezone.utc)
+        db.commit()
+        return True
+    except Exception:
+        try:
+            db.rollback()
+        except Exception:
+            pass
+        return False
+    finally:
+        db.close()
+
+
+def merge_render_params(job_id: str, new_params: dict) -> bool:
+    """Atomic merge de `new_params` en Job.render_params (dict JSONB).
+
+    Resuelve el race U5 (audit 2026-05-25): 2 edits concurrentes al
+    mismo job (operator A toca typography, operator B toca background)
+    leen render_params al inicio del endpoint, mutan local, ambos
+    commitean. Last-writer-wins → la modificación del primero se pierde.
+
+    El mismo patrón ocurre en pipeline.py:703 (Capa C bg_preview merge)
+    si el worker corre concurrente al /edit endpoint.
+
+    Una sola tx con SELECT FOR UPDATE garantiza que el read + merge +
+    write sean atómicos respecto a otros callers. Postgres serializa
+    los waiters en el lock.
+
+    Args:
+        job_id: target job
+        new_params: dict con las keys/values a mergear en render_params.
+                    Keys con valor None NO se mergean (NO_OP — para que
+                    los callers puedan pasar dicts con keys opcionales).
+
+    Returns:
+        True si actualizó (o no-op idempotente), False si el job no existe.
+    """
+    if not new_params:
+        return True
+    from database import SessionLocal
+    db = SessionLocal()
+    try:
+        job = (
+            db.query(Job)
+            .filter(Job.job_id == job_id)
+            .with_for_update()
+            .first()
+        )
+        if not job:
+            return False
+        existing = dict(job.render_params or {})
+        changed = False
+        for k, v in new_params.items():
+            if v is None:
+                continue
+            if existing.get(k) != v:
+                existing[k] = v
+                changed = True
+        if changed:
+            job.render_params = existing
+            db.commit()
+        return True
+    except Exception:
+        try:
+            db.rollback()
+        except Exception:
+            pass
+        return False
+    finally:
+        db.close()
+
+
 def merge_s3_keys(job_id: str, file_type: str, key: str) -> bool:
     """Atomic merge de un (file_type → key) en Job.s3_keys.
 
