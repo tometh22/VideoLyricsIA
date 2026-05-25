@@ -4422,6 +4422,13 @@ def _analyze_lyrics_for_background(lyrics_text: str, artist: str, job_id: str = 
     # la letra trata temas sensibles — captura la energía sin el visual
     # cringe. Aplica transversalmente (Veo y Imagen).
     #
+    # CARVE-OUT 2026-05-25: cuando el operador escribió un background_hint
+    # explícito (modo "Mi prompt"), anti-cliché SE DESACTIVA. Razón: el
+    # hint es la voz explícita del operador; si quiere literal, debemos
+    # respetarlo (con o sin verbatim). Solo auto/inspirado-en-letra
+    # (sin hint) siguen recibiendo la regla.
+    _has_operator_hint = bool(background_hint and background_hint.strip())
+    #
     # A3 (2026-05-25) — Editorial-photography rule, solo gated por
     # for_provider="imagen". Veo tiene sus propios equivalentes (lens,
     # grain, cinematografía) en otras reglas; Imagen no.
@@ -4450,28 +4457,35 @@ def _analyze_lyrics_for_background(lyrics_text: str, artist: str, job_id: str = 
         "(palette, texture, atmosphere, register). Concept never replaces or "
         "contradicts the literal subject of the lyrics unless match_lyrics is "
         "explicitly disabled.\n"
-        "- ANTI-CLICHÉ / METAPHOR-OVER-LITERAL RULE: if the lyrics' literal subject "
-        "is a SENSITIVE / POLITICAL / TABOO topic (drugs, sex, weapons, religion, "
-        "politics, suicide, alcohol abuse, gang violence), DO NOT depict the subject "
-        "literally — substitute a METAPHORICAL scene that captures the song's "
-        "EMOTIONAL ENERGY (defiance, longing, ecstasy, melancholy, rebellion, "
-        "freedom) without the on-the-nose imagery. Examples:\n"
-        "  · Drug-positive anthem → smoke / haze drifting through warm window light, "
-        "record-store dust motes, vinyl spinning under a single lamp — NOT plants, "
-        "leaves, paraphernalia, pills, or rolled paper.\n"
-        "  · Heartbreak after addiction → empty bar at dawn, single bottle on counter, "
-        "cold blue light through smoke — NOT pills, needles, or hospital rooms.\n"
-        "  · Political protest → marching shadows on wet pavement, banners viewed from "
-        "behind, kinetic dust and torchlight — NOT readable flags, slogans, "
-        "politician faces, or police uniforms.\n"
-        "  · Gang / street violence → tense empty alley after rain, broken neon "
-        "reflection in puddle, single dropped object — NOT guns, blood, masked "
-        "figures, or threatening crowds.\n"
-        "  · Sex / explicit lust → silk curtains in heat haze, candlelight on textured "
-        "wall, single tangled bedsheet — NOT bodies, beds, or anatomy.\n"
-        "  Goal: a viewer who DOESN'T know the song should feel its energy through "
-        "the scene — without instantly clocking 'this is a [drugs/protest/violence] "
-        "song'. The lyric video ACCOMPANIES the song; it does NOT narrate it."
+        # Anti-cliché block — gated por _has_operator_hint. Cuando el operador
+        # escribió un hint (modo "Mi prompt"), su voz explícita gana y la regla
+        # se desactiva. Modos auto/inspirado-en-letra (sin hint) la reciben.
+        + (
+            ""
+            if _has_operator_hint else
+            "- ANTI-CLICHÉ / METAPHOR-OVER-LITERAL RULE: if the lyrics' literal subject "
+            "is a SENSITIVE / POLITICAL / TABOO topic (drugs, sex, weapons, religion, "
+            "politics, suicide, alcohol abuse, gang violence), DO NOT depict the subject "
+            "literally — substitute a METAPHORICAL scene that captures the song's "
+            "EMOTIONAL ENERGY (defiance, longing, ecstasy, melancholy, rebellion, "
+            "freedom) without the on-the-nose imagery. Examples:\n"
+            "  · Drug-positive anthem → smoke / haze drifting through warm window light, "
+            "record-store dust motes, vinyl spinning under a single lamp — NOT plants, "
+            "leaves, paraphernalia, pills, or rolled paper.\n"
+            "  · Heartbreak after addiction → empty bar at dawn, single bottle on counter, "
+            "cold blue light through smoke — NOT pills, needles, or hospital rooms.\n"
+            "  · Political protest → marching shadows on wet pavement, banners viewed from "
+            "behind, kinetic dust and torchlight — NOT readable flags, slogans, "
+            "politician faces, or police uniforms.\n"
+            "  · Gang / street violence → tense empty alley after rain, broken neon "
+            "reflection in puddle, single dropped object — NOT guns, blood, masked "
+            "figures, or threatening crowds.\n"
+            "  · Sex / explicit lust → silk curtains in heat haze, candlelight on textured "
+            "wall, single tangled bedsheet — NOT bodies, beds, or anatomy.\n"
+            "  Goal: a viewer who DOESN'T know the song should feel its energy through "
+            "the scene — without instantly clocking 'this is a [drugs/protest/violence] "
+            "song'. The lyric video ACCOMPANIES the song; it does NOT narrate it."
+        )
         + _imagen_quality_line
     )
     # Contrastive few-shot examples + a "do not copy verbatim" disclaimer.
