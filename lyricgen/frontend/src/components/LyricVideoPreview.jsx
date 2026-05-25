@@ -89,7 +89,7 @@ export default function LyricVideoPreview({
     try { v.currentTime = currentTime % dur; } catch { /* not seekable yet */ }
   }, [currentTime, backgroundUrl]);
 
-  // The line on screen = the one whose [start,end] contains currentTime,
+  // The lines on screen = ALL segments whose [start,end] contain currentTime,
   // PLUS a sticky-last-line fallback during short gaps so the placeholder
   // doesn't flicker between back-to-back lines.
   //
@@ -99,29 +99,46 @@ export default function LyricVideoPreview({
   // placeholder for a frame and ripping it out the next. From the user's
   // chair: the preview felt epileptic during the chorus.
   //
-  // New rule mirrors what LyricsEditor.activeId already does (`containing
-  // || lastStarted`): if currentTime is inside a segment, show it; if not,
-  // hold the last segment that already started — UNTIL either the next
-  // segment kicks in or we've drifted >TAIL_HOLD_S seconds past the last
-  // segment's end (truly empty section, e.g. instrumental break). That
-  // window is small enough to not lie during long instrumentals but big
-  // enough to bridge any gap inside a verse.
+  // INCIDENT 2026-05-25 (this rev): forced_align/reconcile emits multiple
+  // segments with nearly-identical start when the chorus has repeated lines
+  // ("Legalícenla / Legalícenla / Oh-oh-oh"). The old single-pick loop kept
+  // only the LAST match each frame — the operator saw "Oh-oh-oh" but never
+  // the "Legalícenla" alongside it, and the timeline mirror was equally
+  // confused. The fix returns ALL containing segments. Below we render them
+  // stacked (the same way two overlapping subtitle tracks would render),
+  // matching what the bake will eventually produce.
+  //
+  // Sticky-last rule mirrors what LyricsEditor.activeId already does
+  // (`containing || lastStarted`): if currentTime is inside any segment,
+  // show that group; if not, hold the last segment that already started —
+  // UNTIL either the next segment kicks in or we've drifted >TAIL_HOLD_S
+  // seconds past the last segment's end (truly empty section, e.g.
+  // instrumental break). That window is small enough to not lie during
+  // long instrumentals but big enough to bridge any gap inside a verse.
   const TAIL_HOLD_S = 1.2;
-  const activeSeg = useMemo(() => {
-    let containing = null;
+  const activeSegs = useMemo(() => {
+    const containing = [];
     let lastStarted = null;
     for (const s of segments) {
       if (currentTime >= s.start && currentTime < s.end) {
-        containing = s;
+        containing.push(s);
       }
       if (currentTime >= s.start) {
         lastStarted = s;
       }
     }
-    if (containing) return containing;
-    if (lastStarted && (currentTime - lastStarted.end) <= TAIL_HOLD_S) return lastStarted;
-    return null;
+    if (containing.length > 0) return containing;
+    if (lastStarted && (currentTime - lastStarted.end) <= TAIL_HOLD_S) {
+      return [lastStarted];
+    }
+    return [];
   }, [segments, currentTime]);
+  // The "primary" active segment — drives selection box, readouts, the
+  // size/rotation handles, and the layout commit target. When multiple
+  // lines overlap the operator can only edit one at a time, so we pick the
+  // last one in the list (= the line whose `start` is most recent, which
+  // is usually the perceptually newest one to attend to).
+  const activeSeg = activeSegs.length > 0 ? activeSegs[activeSegs.length - 1] : null;
 
   const layoutOf = useCallback((seg) => {
     if (live && seg && live.id === seg._id) return live;
@@ -195,7 +212,14 @@ export default function LyricVideoPreview({
   const l = activeSeg ? layoutOf(activeSeg) : null;
   // Cased display text drives BOTH what we show and which size/wrap tier the
   // render would pick — so the preview length tier matches the render's.
-  const displayText = activeSeg ? applyCase(activeSeg.text, textCase) : "";
+  // When multiple segments overlap (chorus repeats like "Legalícenla /
+  // Legalícenla / Oh-oh-oh"), we stack them with newlines so the operator
+  // sees every line that's currently on the audio. The layout (pos/scale/rot)
+  // and the size tier come from the primary segment — that's the only line
+  // they can adjust with the handles in this view.
+  const displayText = activeSegs.length > 0
+    ? activeSegs.map((s) => applyCase(s.text, textCase)).join("\n")
+    : "";
   const tier = tierForLength(displayText.length);
   // Render size = tier × per-line scale × global font_scale (clamped like the
   // backend), as a fraction of the 1920 frame width → cqw.
@@ -287,7 +311,9 @@ export default function LyricVideoPreview({
               lineHeight: 1.1,
               opacity: textOpacity,
               maxWidth: wrapMaxCqw,
-              whiteSpace: "normal",
+              // `pre-line` honours `\n` (used when multiple overlapping
+              // segments are stacked) but still wraps long single lines.
+              whiteSpace: "pre-line",
               overflowWrap: "break-word",
               ...(CONTRAST_STYLES[textContrast] || CONTRAST_STYLES.medium),
             }}
