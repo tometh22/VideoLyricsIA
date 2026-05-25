@@ -82,8 +82,11 @@ def test_generate_veo_video_has_static_branch_with_camera_negatives():
     for neg in ("no pan", "no tilt", "no zoom", "no dolly", "no camera movement"):
         assert neg in src, f"static safe_prompt missing negative '{neg}'"
     # And drop the motion-suggesting 'filmed with cinema camera' phrasing for
-    # static (locked tripod phrasing instead).
-    assert "locked static tripod shot" in src
+    # static (locked tripod phrasing instead). Case-insensitive — C2 hardening
+    # uppercased the phrase ('LOCKED STATIC TRIPOD shot').
+    assert "locked static tripod" in src.lower(), (
+        "static branch must use 'locked static tripod' phrasing"
+    )
 
 
 def test_generate_veo_video_accepts_high_fidelity_and_routes_model():
@@ -160,8 +163,15 @@ def test_ken_burns_clip_accepts_static_flag():
 def test_ensure_background_downgrades_animado_imagen_to_veo():
     src = inspect.getsource(pipeline._ensure_background)
     assert '_norm_move_bg == "animado"' in src
-    # Static Imagen path holds the frame.
-    assert 'static=(_norm_move_bg == "estatico")' in src
+    # UMG-style fix 2026-05-25: estatico ya NO usa static=True (frame
+    # frozen). Ahora va a subtle=True (micro-drift) — combined con effect
+    # overlay forzado para que NUNCA salga foto 100% quieta.
+    assert 'static=False' in src, (
+        "estatico path must NOT use static=True frozen frame anymore"
+    )
+    assert '_norm_move_bg in ("estatico", "sutil")' in src, (
+        "estatico + sutil both go through subtle=True path"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -178,26 +188,39 @@ def test_ken_burns_accepts_lateral_and_subtle_flags():
 
 def test_ensure_background_routes_calm_registers_to_imagen():
     """estatico / sutil / foto-parallax all force the Imagen path with their own
-    deterministic Ken Burns mode — never Veo, which can't hold the camera."""
+    deterministic Ken Burns mode — never Veo, which can't hold the camera.
+
+    UMG-style fix 2026-05-25: estatico ya NO usa static=True frozen. Ahora va
+    a subtle=True junto con sutil — el effect overlay forzado (light si no
+    eligió otro) garantiza motion visible siempre."""
     src = inspect.getsource(pipeline._ensure_background)
     assert '_norm_move_bg in ("estatico", "sutil")' in src
     assert '_norm_move_bg == "foto-parallax"' in src
     assert 'bg_mode = "imagen"' in src
-    # Each register maps to its own Ken Burns mode in the Imagen call.
-    assert 'static=(_norm_move_bg == "estatico")' in src
-    assert 'subtle=(_norm_move_bg == "sutil")' in src
+    # Estatico + sutil ambos a subtle Ken Burns (no más frozen).
+    assert 'static=False' in src, "estatico must NOT use frozen frame anymore"
+    assert 'subtle=(_norm_move_bg in ("estatico", "sutil"))' in src
     assert 'lateral=(_norm_move_bg == "foto-parallax")' in src
 
 
 def test_ken_burns_pan_modes_have_no_zoom():
-    """lateral and subtle are pans over a FIXED inward crop — constant scale, no
-    per-frame zoom (so the camera never advances). static stays frozen."""
+    """lateral and subtle are pans over a FIXED inward crop. UMG-style update
+    2026-05-25: lateral ahora suma zoom-breath sutil (scale 1.15→1.22 con
+    ciclo 32s) para dar profundidad sin advance-forward. Subtle mantiene
+    scale_amp=0 (sin breath — operator pidió quietud)."""
     src = inspect.getsource(pipeline._ken_burns_clip)
     assert "make_pan_frame" in src
     pan_block = src.split("if not static and (lateral or subtle):")[1].split("\n    if static:")[0]
-    assert "scale, amp_x, amp_y = 1.18" in pan_block  # lateral: full horizontal, fixed scale
-    assert "scale, amp_x, amp_y = 1.10" in pan_block  # subtle: low amplitude, fixed scale
-    assert "zoom_in" not in pan_block                 # no zoom animation in either
+    # B1 hardening: scale_base + scale_amp en vez de scale fijo.
+    assert "scale_base" in pan_block, "lateral must use scale_base (B1 zoom-breath)"
+    assert "amp_x, amp_y = 1.0, 0.0" in pan_block, (
+        "lateral must traverse full horizontal room (amp_x=1.0)"
+    )
+    assert "amp_x, amp_y = 0.35, 0.18" in pan_block, (
+        "subtle must use low horizontal+vertical drift amplitude"
+    )
+    # Continuous zoom-in (would advance forward) NOT allowed.
+    assert "zoom_in" not in pan_block
 
 
 def test_lateral_pan_is_subpixel_smooth():

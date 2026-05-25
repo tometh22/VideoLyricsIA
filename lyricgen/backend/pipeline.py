@@ -4381,13 +4381,22 @@ def _analyze_lyrics_for_background(lyrics_text: str, artist: str, job_id: str = 
     _sutil = normalized_movement == "sutil"
     _auto_movement = normalized_movement == ""
     if _static:
-        # C4 (2026-05-25): repetir LOCKED 3× para reforzar el prior cuando
-        # estatico esté ruteado a Veo (vía STATIC_SUTIL_VIA_VEO=1).
+        # C4 (2026-05-25) + UMG-style update: repetir LOCKED 3× para reforzar
+        # el prior cuando estatico esté ruteado a Veo. CRÍTICO: el operador
+        # NUNCA debe recibir foto 100% quieta. La escena MUST tener motion
+        # rica in-scene (al menos 3 fuentes distintas) — references UMG
+        # siempre tienen lluvia/nieve/humo/olas/nubes en movimiento.
         _clause2 = ("(2) framing only — wide/medium/close and angle — the camera "
                     "is LOCKED and STATIC, the camera is BOLTED in place, "
                     "explicitly NO camera movement of any kind; the frame is "
-                    "FIXED; all motion lives WITHIN the scene (water, fire, "
-                    "foliage, particles, light shifts)")
+                    "FIXED. CRITICAL: motion lives WITHIN the scene and MUST "
+                    "be RICH — describe AT LEAST 3 distinct motion sources, "
+                    "e.g.: drifting smoke + flickering candle + dust motes; "
+                    "or rolling waves + shifting clouds + falling petals; "
+                    "or rain on glass + neon reflection + steam rising. "
+                    "A scene with zero movement (e.g. \"empty room, no wind, "
+                    "no light shift\") is INVALID — always include moving "
+                    "elements")
     elif _sutil:
         # C4 (2026-05-25): branch nueva para sutil. Camera barely-breathing
         # con motion rica IN-SCENE. Distinguible de estatico (clavada) y
@@ -5745,6 +5754,22 @@ def _ensure_background(style_hint: str, job_dir: str, lyrics_text: str = None,
         return None
 
     _norm_move_bg = _normalize_movement_style(movement_style)
+
+    # UMG-style fix (2026-05-25): si el operador eligió "Estático" o "Sutil"
+    # SIN effect overlay, default a "light" (el más sutil de los 5). Las
+    # references UMG NUNCA tienen 100% quieto — siempre hay particles
+    # overlay o motion in-scene. Combined con subtle Ken Burns drift, esto
+    # garantiza que el video parezca vivo.
+    # Operator override: si seteó effect="" pero tildó algún otro motion
+    # (no estatico/sutil), respetamos su elección (no forzamos light).
+    if _norm_move_bg in ("estatico", "sutil") and not (effect or "").strip():
+        logger.info(
+            "[BG] movement=%s + no effect selected — defaulting effect=light "
+            "para evitar foto 100%% quieta (UMG-style guideline 2026-05-25)",
+            _norm_move_bg,
+        )
+        effect = "light"
+
     # Animado is a Veo-only aesthetic (the 2D-illustration safe_prompt lives in
     # _generate_veo_video). Imagen renders stills, so an animado+imagen combo
     # is incoherent — downgrade to Veo. (Matrix rule: Imagen × Animado → Veo.)
@@ -5825,11 +5850,29 @@ def _ensure_background(style_hint: str, job_dir: str, lyrics_text: str = None,
         #   - "Sutil"           → barely-there gentle drift (no zoom, no forward).
         #   - "Foto + parallax" → slow lateral pan (no zoom, no forward).
         #   - otherwise         → the usual zoom/pan Ken Burns.
+        # UMG-style fix (2026-05-25): el operador reportó que el path
+        # estatico → static=True (frame frozen bit-perfect) NO matchea las
+        # references UMG, donde TODO video calmo tiene al menos un source
+        # de motion: drift sutil + partículas overlay + scene motion (olas/
+        # nubes/humo). Nunca 100% quieto.
+        #
+        # Nueva regla:
+        #   - "Estático" → subtle=True (micro-drift apenas perceptible).
+        #     El operador esperaba "cámara fija, escena viva"; subtle da eso.
+        #     El effect overlay (snow/rain/stars/light) se compone encima
+        #     vía fx_compositor.build_video_filter, independiente del path.
+        #   - "Sutil"           → subtle=True (igual que antes).
+        #   - "Foto + parallax" → lateral=True (igual que antes).
+        #   - otros             → Ken Burns default (zoom/pan).
+        #
+        # NOTE: dejamos el parámetro static=True en _ken_burns_clip por si
+        # algún caller fuera del wizard lo necesita (ej. tests, edit modal),
+        # pero el wizard nunca lo activa.
         _ken_burns_image_to_mp4(
             image_path, bg_path,
-            static=(_norm_move_bg == "estatico"),
+            static=False,
             lateral=(_norm_move_bg == "foto-parallax"),
-            subtle=(_norm_move_bg == "sutil"),
+            subtle=(_norm_move_bg in ("estatico", "sutil")),
         )
         return bg_path
 
