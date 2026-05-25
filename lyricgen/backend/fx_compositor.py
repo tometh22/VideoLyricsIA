@@ -52,13 +52,61 @@ def effect_path(effect: str) -> str | None:
     return p if os.path.exists(p) else None
 
 
+def _parse_custom_colors(custom_colors: str) -> list[tuple[int, int, int]]:
+    """Parse '#RRGGBB,#RRGGBB' (o '#RGB' shorthand) → lista de tuplas RGB.
+    Robusto: ignora entradas inválidas en vez de raisear."""
+    if not custom_colors:
+        return []
+    out: list[tuple[int, int, int]] = []
+    for token in custom_colors.split(","):
+        c = token.strip().lstrip("#")
+        if len(c) == 3:
+            c = "".join(ch * 2 for ch in c)
+        if len(c) != 6:
+            continue
+        try:
+            r = int(c[0:2], 16)
+            g = int(c[2:4], 16)
+            b = int(c[4:6], 16)
+            out.append((r, g, b))
+        except ValueError:
+            continue
+    return out
+
+
+def _custom_grade_params(rgbs: list[tuple[int, int, int]]) -> tuple[float, float, float, float, float]:
+    """Deriva (contrast, sat, gamma_r, gamma_g, gamma_b) desde RGB promedio.
+    Estrategia: gamma-por-canal empuja midtones hacia el avg color del
+    operador; bump contrast + saturation fijos (custom = paleta vivid)."""
+    avg_r = sum(r for r, _, _ in rgbs) / len(rgbs)
+    avg_g = sum(g for _, g, _ in rgbs) / len(rgbs)
+    avg_b = sum(b for _, _, b in rgbs) / len(rgbs)
+
+    def gamma_for(channel: float) -> float:
+        if channel < 32.0:
+            return 1.20
+        return max(0.85, min(1.20, 128.0 / channel))
+
+    return (1.08, 1.20, gamma_for(avg_r), gamma_for(avg_g), gamma_for(avg_b))
+
+
 def grade_filter(style: str, custom_colors: str = "") -> str:
     """ffmpeg `eq` grade string for the palette, or '' for auto/none.
 
-    custom_colors grading (LUT from arbitrary hex) is deferred to a later phase;
-    for now custom palettes fall through to no post-grade (the prompt still
-    steers the generated scene's colors)."""
-    return _GRADE.get((style or "").strip().lower(), "")
+    U3 (audit 2026-05-25): custom_colors AHORA se aplica en el grade.
+    Antes era "deferred to later phase" — la fase nunca llegó. El operador
+    elegía paleta custom, Veo respetaba los colores en el prompt, pero
+    el grade final ignoraba la selección → tono inconsistente.
+    Strategy: gamma-per-channel desde RGB promedio, bump contrast + sat.
+    No LUT (overkill); eq cubre el 80% del caso con 20% del effort.
+    """
+    style_key = (style or "").strip().lower()
+    if style_key == "custom":
+        rgbs = _parse_custom_colors(custom_colors)
+        if rgbs:
+            c, s, gr, gg, gb = _custom_grade_params(rgbs)
+            return f"eq=contrast={c}:saturation={s}:gamma_r={gr:.2f}:gamma_g={gg:.2f}:gamma_b={gb:.2f}"
+    return _GRADE.get(style_key, "")
 
 
 # Numpy equivalent of the `eq` presets for the moviepy render path (which can't
@@ -72,13 +120,32 @@ _GRADE_NUMPY = {
 }
 
 
-def grade_frame(frame, style: str):
+def grade_frame(frame, style: str, custom_colors: str = ""):
     """Apply the palette grade (contrast/saturation/brightness) to a float RGB
     numpy frame, for the moviepy path. Returns the frame unchanged for auto/
     unknown palettes. Mirrors `grade_filter`'s ffmpeg `eq` as closely as numpy
-    allows (not bit-identical, same intent)."""
+    allows (not bit-identical, same intent).
+
+    U3 (audit 2026-05-25): custom_colors aplica gamma-per-channel + contrast/
+    sat bump (parity con ffmpeg path)."""
     import numpy as np
-    p = _GRADE_NUMPY.get((style or "").strip().lower())
+    style_key = (style or "").strip().lower()
+
+    if style_key == "custom":
+        rgbs = _parse_custom_colors(custom_colors)
+        if rgbs:
+            contrast, sat, gr, gg, gb = _custom_grade_params(rgbs)
+            f = (frame - 127.5) * contrast + 127.5
+            f = np.clip(f, 0.0, 255.0) / 255.0
+            f[:, :, 0] = np.power(f[:, :, 0], gr)
+            f[:, :, 1] = np.power(f[:, :, 1], gg)
+            f[:, :, 2] = np.power(f[:, :, 2], gb)
+            f = f * 255.0
+            luma = (0.299 * f[:, :, 0] + 0.587 * f[:, :, 1] + 0.114 * f[:, :, 2])
+            f = luma[:, :, None] + (f - luma[:, :, None]) * sat
+            return f
+
+    p = _GRADE_NUMPY.get(style_key)
     if not p:
         return frame
     contrast, sat, bright = p

@@ -7844,6 +7844,42 @@ def generate_lyric_video(
         except Exception as e:
             logger.warning("[TITLE] title card failed (%s); continuing", e)
 
+    # CV1 (audit 2026-05-25) — Visibility en degraded path.
+    # El moviepy fallback NO implementa los templates de lyrics_animation
+    # (karaoke/word_reveal/pop/glow) ni line_transition (slide_up/
+    # slide_side/wipe/dissolve_blur). Esos viven en ass_render.py (libass).
+    # En condiciones normales, este path NO se ejecuta (libass anda en
+    # Railway por default). Pero si llega acá CON animations seleccionadas,
+    # el video se renderiza pero las animations se ignoran silenciosamente.
+    # Acción: log WARNING + Sentry breadcrumb para que ops vea cuando este
+    # path corre con feature seleccionada. Si nunca se ve en producción
+    # tras 30 días, deprecar moviepy entirely (sprint 3+).
+    if lyrics_animation != "none" or line_transition != "none":
+        logger.warning(
+            "[MOVIEPY_DEGRADED] rendering with moviepy fallback but "
+            "lyrics_animation=%r / line_transition=%r — these libass "
+            "templates are NOT applied in moviepy path; video will render "
+            "with plain text. Investigate why libass fast path was bypassed "
+            "(check LYRIC_RENDER_ENGINE env var or earlier '[ASS] fast "
+            "path failed' log).",
+            lyrics_animation, line_transition,
+        )
+        try:
+            import sentry_sdk
+            sentry_sdk.add_breadcrumb(
+                category="render",
+                message="moviepy fallback with animation requested",
+                level="warning",
+                data={
+                    "lyrics_animation": lyrics_animation,
+                    "line_transition": line_transition,
+                    "spec_profile": getattr(spec, "profile", None),
+                    "engine_env": os.environ.get("LYRIC_RENDER_ENGINE", "ass"),
+                },
+            )
+        except Exception:  # pragma: no cover
+            pass
+
     for seg in segments:
         # Per-line layout overrides set in the editor preview (parity with the
         # ASS path's segments_to_lines). Absent → centered/motion default.
