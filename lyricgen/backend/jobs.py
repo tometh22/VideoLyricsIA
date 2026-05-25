@@ -557,6 +557,35 @@ def get_all_jobs_admin(db: Session, limit: int = 500, offset: int = 0) -> list[d
     return [j.to_dict() for j in jobs]
 
 
+def heartbeat(job_id: str) -> bool:
+    """U10 (audit 2026-05-25): bump Job.last_progress_at = NOW() sin
+    cambiar ningún otro campo. Ligero, atomic, idempotent.
+
+    Uso: workers en steps largos sin update_job() natural (Veo polling
+    de hasta 10min, retry loops). Le dice al reaper "estoy vivo".
+
+    Best-effort: cualquier excepción se traga (heartbeat no debe romper
+    el render).
+    """
+    from database import SessionLocal
+    db = SessionLocal()
+    try:
+        job = db.query(Job).filter(Job.job_id == job_id).first()
+        if not job:
+            return False
+        job.last_progress_at = datetime.now(timezone.utc)
+        db.commit()
+        return True
+    except Exception:
+        try:
+            db.rollback()
+        except Exception:
+            pass
+        return False
+    finally:
+        db.close()
+
+
 def merge_render_params(job_id: str, new_params: dict) -> bool:
     """Atomic merge de `new_params` en Job.render_params (dict JSONB).
 

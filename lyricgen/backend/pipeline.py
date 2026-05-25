@@ -5440,10 +5440,20 @@ def _generate_veo_video(prompt: str, output_path: str, job_id: str = None,
     fetch_url = f"{base_url}:fetchPredictOperation"
     poll_deadline = _time.time() + 600
     op_payload: dict | None = None
+    # U10 (audit 2026-05-25): heartbeat cada 60s para que el reaper no
+    # mate este job durante el Veo poll (hasta 10min sin update_job natural).
+    _hb_counter = 0
     while True:
         if _time.time() > poll_deadline:
             raise TimeoutError("Veo 3 operation timed out after 10 min")
         _time.sleep(10)
+        _hb_counter += 1
+        if _hb_counter % 6 == 0 and job_id:
+            try:
+                from jobs import heartbeat as _heartbeat
+                _heartbeat(job_id)
+            except Exception:  # pragma: no cover
+                pass
         token = _veo_access_token()
         # Vertex's long-running publisher operations need the
         # fetchPredictOperation helper (a plain GET on the operation name
