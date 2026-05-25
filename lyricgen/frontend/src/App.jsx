@@ -1851,6 +1851,9 @@ export default function App() {
           !!currentReview || transcribing || !!transcribeError || readyToGenerate
         }
         renderStep6={() => reviewScreen}
+        // Phase 3: pasar segments al WizardLivePreview central para que
+        // muestre una línea real de la canción que se está revisando.
+        reviewSegments={currentReview?.segments || null}
       />
     </div>
   );

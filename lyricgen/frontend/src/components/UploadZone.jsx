@@ -151,6 +151,11 @@ export default function UploadZone({
   // sticky en el centro durante todo el flow.
   hasReviewableContent = false,
   renderStep6 = null,
+  // Phase 3 (2026-05-25): segments de la canción en review. Si vienen,
+  // el WizardLivePreview central muestra una línea real de la letra en
+  // vez del título genérico — el operador ve cómo se va a ver el video
+  // con su propia letra durante toda la review.
+  reviewSegments = null,
 }) {
   const { t } = useI18n();
   const inputRef = useRef();
@@ -258,7 +263,19 @@ export default function UploadZone({
     // prompt: leave inspired as-is; the textarea below drives it.
   };
   // Sample lyric for the live preview: first file's title, else a placeholder.
-  const _previewLyric = (files[0]?.songTitle || files[0]?.title || "").trim();
+  // Phase 3 (2026-05-25): si estamos en review (reviewSegments presente),
+  // mostrar una línea real de la letra en el preview central — la primera
+  // línea no-vacía. Da contexto visual de la canción específica que el
+  // operador está editando. Sin review, fallback al título genérico.
+  const _reviewFirstLine = (() => {
+    if (!reviewSegments || !Array.isArray(reviewSegments)) return "";
+    for (const s of reviewSegments) {
+      const text = (s?.text || "").trim();
+      if (text) return text;
+    }
+    return "";
+  })();
+  const _previewLyric = _reviewFirstLine || (files[0]?.songTitle || files[0]?.title || "").trim();
 
   // ── Studio Console stepper ─────────────────────────────────────────────
   // 4 steps revealed one at a time (variant A): the left rail navigates,
