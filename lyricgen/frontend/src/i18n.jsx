@@ -207,6 +207,8 @@ const translations = {
     "upload.step_animation": "Animación",
     "upload.step_upload": "Subí",
     "upload.step_deliver": "Entregá",
+    "upload.step_lyrics": "Lyrics",
+    "upload.step_lyrics_hint": "Disponible después de \"Revisar lyrics\"",
     "upload.animation_label": "Animación:",
     "upload.anim_gallery_desc": "Cómo aparecen las palabras sobre el video. Pasá el mouse o elegí y miralo en el preview ←",
     "upload.anim_word_note": "Funcionan en toda canción — el tiempo por palabra se calcula automáticamente.",

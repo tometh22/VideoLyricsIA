@@ -255,15 +255,23 @@ export default function UploadZone({
   // 4 steps revealed one at a time (variant A): the left rail navigates,
   // the center stage holds the live preview, the right panel shows only the
   // active step's controls. Step 1 (Subí) gates advancing on the artist name.
+  // WIZARD_STEPS — Phase 1 (2026-05-25): paso 6 "Lyrics" agregado al
+  // stepper como indicador visual del próximo paso del flujo. Por ahora
+  // está deshabilitado (no clickeable, gris) porque la review todavía
+  // vive como pantalla separada (wizardStage="review" en App.jsx).
+  // Phase 3 lo va a convertir en un paso real del wizard, eliminando la
+  // pantalla separada de LyricsEditor.
   const WIZARD_STEPS = [
     { id: 1, label: t("upload.step_upload") || "Subí" },
     { id: 2, label: t("upload.step_mode") || "Modo" },
     { id: 3, label: t("upload.step_motion") || "Movimiento" },
     { id: 4, label: t("upload.step_animation") || "Animación" },
     { id: 5, label: t("upload.step_deliver") || "Entregá" },
+    { id: 6, label: t("upload.step_lyrics") || "Lyrics", placeholder: true },
   ];
+  const _MAX_INTERACTIVE_STEP = 5; // pasos 1..5 son interactivos en upload; 6 es placeholder visual
   const [wizardStep, setWizardStep] = useState(1);
-  const goStep = (n) => setWizardStep(Math.max(1, Math.min(WIZARD_STEPS.length, n)));
+  const goStep = (n) => setWizardStep(Math.max(1, Math.min(_MAX_INTERACTIVE_STEP, n)));
 
   // Hovering a movement option previews it in the big stage without committing.
   const [hoverMovement, setHoverMovement] = useState(null);
@@ -1758,23 +1766,37 @@ export default function UploadZone({
       ) : (
       <div className="flex flex-col lg:grid lg:grid-cols-[190px_minmax(0,1fr)_minmax(400px,460px)] gap-6 items-start">
 
-        {/* LEFT — step rail (vertical on desktop, horizontal pills on mobile) */}
+        {/* LEFT — step rail (vertical on desktop, horizontal pills on mobile).
+            Phase 1: paso 6 "Lyrics" se renderiza como placeholder (disabled,
+            opacity reducida, sin ring de hover) para mostrar al operador que
+            el flujo continúa después de "Entregá" → "Revisar lyrics". */}
         <nav className="flex lg:flex-col gap-1.5 lg:gap-1 overflow-x-auto lg:overflow-visible lg:sticky lg:top-4 w-full lg:w-auto order-first">
           {WIZARD_STEPS.map((s) => {
-            const active = wizardStep === s.id;
-            const done = wizardStep > s.id;
+            const isPlaceholder = !!s.placeholder;
+            const active = !isPlaceholder && wizardStep === s.id;
+            const done = !isPlaceholder && wizardStep > s.id;
             return (
               <button
                 key={s.id}
                 type="button"
-                onClick={() => goStep(s.id)}
+                onClick={() => { if (!isPlaceholder) goStep(s.id); }}
+                disabled={isPlaceholder}
+                aria-disabled={isPlaceholder}
+                title={isPlaceholder
+                  ? (t("upload.step_lyrics_hint") || "Disponible después de \"Revisar lyrics\"")
+                  : undefined}
                 className={`flex items-center gap-2.5 px-3 py-2.5 rounded-xl text-[12.5px] font-medium whitespace-nowrap transition-all text-left shrink-0 ${
-                  active ? "bg-brand/[0.12] text-white ring-1 ring-brand/35"
-                         : "text-gray-400 hover:text-white hover:bg-white/[0.04]"
+                  isPlaceholder
+                    ? "text-gray-600 cursor-not-allowed opacity-50"
+                    : active ? "bg-brand/[0.12] text-white ring-1 ring-brand/35"
+                             : "text-gray-400 hover:text-white hover:bg-white/[0.04]"
                 }`}
               >
                 <span className={`w-6 h-6 rounded-full grid place-items-center text-[11px] font-bold shrink-0 ${
-                  active ? "bg-brand text-white" : done ? "bg-accent/20 text-accent" : "bg-surface-3 text-gray-400"
+                  isPlaceholder ? "bg-surface-3/50 text-gray-600 border border-dashed border-gray-600/40"
+                                : active ? "bg-brand text-white"
+                                         : done ? "bg-accent/20 text-accent"
+                                                : "bg-surface-3 text-gray-400"
                 }`}>{done ? "✓" : s.id}</span>
                 {s.label}
               </button>
