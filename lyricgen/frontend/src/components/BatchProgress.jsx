@@ -15,6 +15,125 @@ async function triggerDownload(jobId, type) {
 }
 
 // ─── Processing list row (shown while jobs are still running) ───────────────
+// SingleGeneratingHero — 2026-05-25 operator UMG dry-run polish. Reemplaza
+// la pantalla "Generando tu video / Te avisamos cuando esté listo" con un
+// hero animado: orbs de gradient drifteando en el fondo, título de la canción
+// como protagonista, step cycling cada ~3 s ("Aislando voz / Generando
+// fondo / Sincronizando letras...") y progress bar con shimmer. Cero
+// dependencies — todo CSS + un setInterval. La animación está pensada para
+// rodar 3-6 min sin que el operador se aburra ni dude que está pasando algo.
+function SingleGeneratingHero({ jobName, artist, progressPct, etaLabel, t }) {
+  const steps = [
+    t("hero.step_isolating") || "Aislando la voz del audio",
+    t("hero.step_lyrics") || "Buscando la letra",
+    t("hero.step_align") || "Sincronizando palabras con el ritmo",
+    t("hero.step_bg") || "Generando el fondo cinematográfico",
+    t("hero.step_render") || "Componiendo el video final",
+  ];
+  const [stepIdx, setStepIdx] = useState(0);
+  useEffect(() => {
+    const id = setInterval(() => setStepIdx((i) => (i + 1) % steps.length), 3200);
+    return () => clearInterval(id);
+  }, [steps.length]);
+
+  // Fallback ETA — solo se usa cuando el backend no manda etaLabel todavía
+  // (los primeros segundos del job). Texto deliberadamente vago: el operador
+  // sabe que no es preciso pero da contexto de magnitud.
+  const eta = etaLabel || (t("hero.eta_default") || "Unos minutos…");
+
+  return (
+    <div className="relative w-full max-w-2xl mt-12 animate-fade-in">
+      {/* Animated orbs — pure CSS gradient blobs floating in slow loops.
+          Positioned absolute, blurred, z-0 so the card content stacks above. */}
+      <div className="absolute inset-0 -z-0 overflow-hidden pointer-events-none">
+        <div
+          className="absolute rounded-full opacity-60 blur-3xl"
+          style={{
+            width: 320, height: 320, top: -80, left: -60,
+            background: "radial-gradient(circle, rgba(147,51,234,0.55), transparent 70%)",
+            animation: "hero-drift-a 14s ease-in-out infinite alternate",
+          }}
+        />
+        <div
+          className="absolute rounded-full opacity-50 blur-3xl"
+          style={{
+            width: 360, height: 360, bottom: -100, right: -80,
+            background: "radial-gradient(circle, rgba(56,189,248,0.45), transparent 70%)",
+            animation: "hero-drift-b 17s ease-in-out infinite alternate",
+          }}
+        />
+        <div
+          className="absolute rounded-full opacity-40 blur-3xl"
+          style={{
+            width: 240, height: 240, top: "40%", left: "55%",
+            background: "radial-gradient(circle, rgba(244,114,182,0.4), transparent 70%)",
+            animation: "hero-drift-c 21s ease-in-out infinite alternate",
+          }}
+        />
+      </div>
+
+      {/* Keyframes inline (Tailwind no llega a las custom animations). */}
+      <style>{`
+        @keyframes hero-drift-a { 0% { transform: translate(0,0); } 100% { transform: translate(80px, 60px); } }
+        @keyframes hero-drift-b { 0% { transform: translate(0,0); } 100% { transform: translate(-70px, -80px); } }
+        @keyframes hero-drift-c { 0% { transform: translate(0,0) scale(1); } 100% { transform: translate(-40px, 30px) scale(1.15); } }
+        @keyframes hero-step-in { 0% { opacity: 0; transform: translateY(8px); } 100% { opacity: 1; transform: translateY(0); } }
+        @keyframes hero-shimmer { 0% { background-position: -200% 0; } 100% { background-position: 200% 0; } }
+        @keyframes hero-pulse { 0%, 100% { opacity: 0.5; } 50% { opacity: 1; } }
+      `}</style>
+
+      {/* Card glass effect over the orbs. */}
+      <div className="relative z-10 rounded-3xl bg-white/[0.03] ring-1 ring-white/[0.08] backdrop-blur-md px-8 py-12 text-center">
+        {/* Top label */}
+        <p className="text-[11px] tracking-[0.18em] uppercase text-white/40 mb-6">
+          {t("hero.label") || "Construyendo tu video"}
+        </p>
+
+        {/* Song name — protagonist. Falls back gracefully when name unknown. */}
+        <h1 className="text-3xl sm:text-4xl font-bold text-white mb-1 leading-tight">
+          {jobName || (t("hero.song_unknown") || "Tu canción")}
+        </h1>
+        {artist && (
+          <p className="text-sm text-white/55 mb-10">{artist}</p>
+        )}
+        {!artist && <div className="mb-10" />}
+
+        {/* Cycling step — fades in on each rotation */}
+        <div className="h-7 mb-8 flex items-center justify-center">
+          <p
+            key={stepIdx}
+            className="text-base text-white/80"
+            style={{ animation: "hero-step-in 600ms ease-out both" }}
+          >
+            <span
+              className="inline-block w-1.5 h-1.5 rounded-full bg-white/60 mr-2 align-middle"
+              style={{ animation: "hero-pulse 1.6s ease-in-out infinite" }}
+            />
+            {steps[stepIdx]}
+          </p>
+        </div>
+
+        {/* Progress bar with shimmer */}
+        <div className="relative w-full h-1.5 mx-auto bg-white/[0.06] rounded-full overflow-hidden mb-3 max-w-md">
+          <div
+            className="h-full rounded-full transition-all duration-700"
+            style={{
+              width: `${Math.max(4, progressPct)}%`,
+              background: "linear-gradient(90deg, #9333ea, #ec4899, #38bdf8)",
+              backgroundSize: "200% 100%",
+              animation: "hero-shimmer 2.4s linear infinite",
+            }}
+          />
+        </div>
+        <p className="text-xs text-white/45">
+          {eta}
+        </p>
+      </div>
+    </div>
+  );
+}
+
+
 function JobRow({ job, index, t, onSelectJob }) {
   const { filename, status, current_step, progress, job_id, error,
           queue_reason, queue_retry_in_s } = job;
@@ -528,6 +647,24 @@ export default function BatchProgress({ jobs, onReset, onSingleDone, onSelectJob
   }
 
   // ── Processing view (jobs still running) ──────────────────────────────────
+  // 2026-05-25 redesign — Operator UMG dry-run: "es feo y poco user friendly".
+  // Para el caso ISO (single song generating) reemplazamos la lista plain por
+  // un hero vibrante con orbs animados + título de la canción protagonista +
+  // step rotativo. La lista batch (N videos) mantiene el layout previo
+  // (información denser cuando son varios).
+  if (isSingle && !allDone) {
+    const heroJob = jobs[0] || {};
+    const heroName = (heroJob.song_title || (heroJob.filename || "").replace(/\.(mp3|wav)$/i, "")).trim();
+    const heroArtist = (heroJob.artist || "").trim();
+    return <SingleGeneratingHero
+      jobName={heroName}
+      artist={heroArtist}
+      progressPct={(done / total) * 100}
+      etaLabel={etaLabel}
+      t={t}
+    />;
+  }
+
   return (
     <div className="w-full max-w-xl mt-12 animate-fade-in">
       {/* Header */}
@@ -551,15 +688,11 @@ export default function BatchProgress({ jobs, onReset, onSingleDone, onSelectJob
         ) : (
           <>
             <h2 className="text-2xl font-bold mb-1">
-              {isSingle ? (t("batch.single_generating") || "Generando tu video") : t("batch.generating")}
+              {t("batch.generating")}
             </h2>
             <p className="text-gray-500 text-sm">
-              {isSingle
-                ? (t("batch.single_generating_sub") || "Te avisamos cuando esté listo")
-                : <>
-                    {done} {t("dash.monthly_of")} {total} {t("batch.completed_of")}
-                    {etaLabel && <span className="text-gray-600"> — {etaLabel}</span>}
-                  </>}
+              {done} {t("dash.monthly_of")} {total} {t("batch.completed_of")}
+              {etaLabel && <span className="text-gray-600"> — {etaLabel}</span>}
             </p>
           </>
         )}
