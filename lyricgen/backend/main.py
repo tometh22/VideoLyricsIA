@@ -3650,50 +3650,74 @@ async def _run_transcription_for_job(
                 # output so the operator sees the dialogue subtitled at
                 # 0:00–intro_offset and the song body subtitled
                 # afterwards.
-                if intro_offset > 0:
-                    intro_path = os.path.join(tmp_dir, "intro_only.mp3")
-                    if await asyncio.to_thread(
-                        _slice_audio_prefix, tmp_path, intro_path,
-                        intro_offset + 1.0,
-                    ):
-                        try:
-                            intro_segs_raw = await loop.run_in_executor(
-                                None, transcribe, intro_path, lang, plain,
-                            )
-                            # Keep only segments that fully sit in the
-                            # intro window; defensive against ffmpeg
-                            # frame-boundary slop.
-                            intro_segments = [
-                                s for s in intro_segs_raw
-                                if s["end"] <= intro_offset + 0.5
-                            ]
-                            logger.info("[LYRICS] intro Whisper produced %s segment(s) for the %.0fs dialogue prefix", len(intro_segments), intro_offset)
-                        except Exception as e:
-                            logger.error("[LYRICS] intro Whisper failed: %s", e, exc_info=True)
-                        finally:
-                            try:
-                                os.unlink(intro_path)
-                            except OSError:
-                                pass
-
-                # When LRCLIB_PLAIN_ALIGNER_ENABLED, request word-level
-                # timestamps so we can re-bucket Whisper's output against
-                # LRCLib's curated line structure (see aligner pass below).
-                # Default off — flip via env for staged rollout.
+                #
+                # PARALELIZATION (PR #298, 2026-05-24): intro Whisper and
+                # body Whisper used to run SERIALLY here — intro completed
+                # (~10-15 s) and only then body started (~30-60 s). On
+                # tracks with an intro, the user paid for the full sum.
+                # Now we launch both as `asyncio.create_task` and
+                # `asyncio.gather` them. Trade-off: 2 OpenAI Whisper-1
+                # calls concurrent on this path (only fires when
+                # lrclib-plain hit AND intro_offset > 0 — rare). Cost
+                # impact is negligible (~$0.005 extra per fire), latency
+                # reduction is ~10-15 s per affected job.
                 aligner_enabled = (
                     os.environ.get("LRCLIB_PLAIN_ALIGNER_ENABLED", "0")
                     .strip().lower() in ("1", "true", "yes", "on", "y", "t")
                 )
                 await _step("transcribe.transcribe", 50)
-                try:
-                    segments = await loop.run_in_executor(
+
+                intro_path = None
+                intro_path_to_clean = None
+                if intro_offset > 0:
+                    intro_path_candidate = os.path.join(tmp_dir, "intro_only.mp3")
+                    if await asyncio.to_thread(
+                        _slice_audio_prefix, tmp_path, intro_path_candidate,
+                        intro_offset + 1.0,
+                    ):
+                        intro_path = intro_path_candidate
+                        intro_path_to_clean = intro_path_candidate
+
+                async def _run_intro_whisper():
+                    if not intro_path:
+                        return []
+                    try:
+                        raw = await loop.run_in_executor(
+                            None, transcribe, intro_path, lang, plain,
+                        )
+                        # Keep only segments that fully sit in the intro
+                        # window; defensive against ffmpeg frame-boundary
+                        # slop.
+                        kept = [s for s in raw if s["end"] <= intro_offset + 0.5]
+                        logger.info("[LYRICS] intro Whisper produced %s segment(s) for the %.0fs dialogue prefix", len(kept), intro_offset)
+                        return kept
+                    except Exception as e:
+                        logger.error("[LYRICS] intro Whisper failed: %s", e, exc_info=True)
+                        return []
+
+                async def _run_body_whisper():
+                    return await loop.run_in_executor(
                         None,
                         lambda: transcribe(
                             transcribe_path, lang, plain,
                             return_words=aligner_enabled,
                         ),
                     )
+
+                try:
+                    # gather() preserves order: intro_segments first, body
+                    # second. exceptions surface as their respective
+                    # default fallbacks (intro→[], body→propagates).
+                    intro_segments, segments = await asyncio.gather(
+                        _run_intro_whisper(),
+                        _run_body_whisper(),
+                    )
                 finally:
+                    if intro_path_to_clean:
+                        try:
+                            os.unlink(intro_path_to_clean)
+                        except OSError:
+                            pass
                     if trimmed_path:
                         try:
                             os.unlink(trimmed_path)
