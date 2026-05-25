@@ -597,6 +597,22 @@ const translations = {
     // Build de Vercel falla si alguna clave nueva está ausente — agregadas
     // todas acá. Solo ES por ahora; EN/PT caen al fallback inline del
     // componente hasta que un translator las cubra.
+    //
+    // 2026-05-25 — Generating hero (BatchProgress SingleGeneratingHero).
+    // Mensajes rotativos del step cycling + label + ETA fallback.
+    // Build CI exige que toda clave referenciada exista en ES como mínimo.
+    "hero.label": "Construyendo tu video",
+    "hero.eta_default": "Unos minutos…",
+    "hero.song_unknown": "Tu canción",
+    "hero.step_isolating": "Aislando la voz del audio",
+    "hero.step_lyrics": "Buscando la letra",
+    "hero.step_align": "Sincronizando palabras con el ritmo",
+    "hero.step_bg": "Generando el fondo cinematográfico",
+    "hero.step_render": "Componiendo el video final",
+    // 2026-05-25 — Editor: versión corta del "Aplicar todas" cuando
+    // hay poco espacio + hint del minimapa de timeline.
+    "editor.autofix_apply_all_short": "Aplicar todas",
+    "editor.minimap_hint": "Hacé click en el minimapa para saltar a esa parte de la canción",
     "detail.transcribed_title": "Borrador listo para editar",
     "detail.transcribed_subtitle": "La transcripción ya está lista. Revisá los lyrics y dale Generar video para terminar.",
     "detail.transcribed_cta": "Editar lyrics y generar",
