@@ -3541,6 +3541,16 @@ async def _run_transcription_for_job(
             except Exception as e:
                 logger.warning("[LYRICS] metadata auto-correction persist failed: %s", e)
 
+        # Track which source the plain text came from (for the gap-driven
+        # re-fetch logic further down). lrclib first, fallbacks only if
+        # plain is empty. The 2026-05-25 incident showed lrclib can return
+        # *incomplete* plain (the canonical Legalícenla case had lrclib's
+        # `plain` populated but missing the intro chorus); for that case
+        # we don't refire fallbacks here — we let forced_align run, see
+        # the gaps in its output, and re-fetch THEN. See the
+        # "FA gap-driven re-fetch" block below `if fa_segs:`.
+        lyrics_source: str | None = "lrclib" if (lrc and (lrc.get("plain") or "").strip()) else None
+
         # GENIUS FALLBACK (2026-05-25): when lrclib trae nothing OR trae
         # only `synced` without `plain` and the synced is suspiciously
         # short, try Genius as a second source. Genius's editorial
@@ -3572,6 +3582,7 @@ async def _run_transcription_for_job(
                         if lrc is None:
                             lrc = {}
                         lrc["plain"] = genius_text
+                        lyrics_source = "genius"
                         # synced stays None — Genius doesn't ship timestamps.
                         # That's fine: forced_align takes plain text and the
                         # audio, no synced needed.
@@ -3610,6 +3621,7 @@ async def _run_transcription_for_job(
                     if lrc is None:
                         lrc = {}
                     lrc["plain"] = gemini_text
+                    lyrics_source = "gemini"
                 else:
                     logger.info("[LYRICS] gemini fallback found nothing for %r - %r",
                                 artist_hint, song_hint)
@@ -3686,6 +3698,138 @@ async def _run_transcription_for_job(
 
                     if fa_segs:
                         logger.info("[LYRICS] forced alignment used (%s lines, lrclib text) for %r - %r", len(fa_segs), artist_hint, song_hint)
+
+                        # FA GAP-DRIVEN RE-FETCH (2026-05-25, Option C):
+                        # the user asked the right question: "if lrclib
+                        # always wins when it has SOMETHING, the trilogy
+                        # of sources only matters when lrclib is fully
+                        # empty — what about when lrclib has incomplete
+                        # text?" That's the original Legalícenla
+                        # incident: lrclib's `plain` was non-empty but
+                        # MISSED the intro chorus.
+                        #
+                        # Strategy: let lrclib win the first round. Then
+                        # measure forced_align's output. If the FA result
+                        # has > GAP_REFETCH_THRESHOLD_S of suspicious
+                        # gaps (intro late + internal gaps), try Genius
+                        # and Gemini for a MORE COMPLETE version, re-run
+                        # FA, and use whichever has fewer gaps. Pays for
+                        # the extra round-trip (+ ~$0.007 FA + 75 s)
+                        # ONLY when there's a real problem to fix.
+                        #
+                        # No-op when:
+                        #   - The lyrics_source is already a fallback
+                        #     (we already tried Genius/Gemini once and
+                        #     it didn't help — re-trying would just spin)
+                        #   - The original FA result has minimal gaps
+                        #     (lrclib was already complete enough)
+                        GAP_REFETCH_THRESHOLD_S = 30.0
+                        _gap_threshold_inner = 15.0
+                        def _gap_score(segs) -> float:
+                            if not segs:
+                                return 0.0
+                            s = sorted(segs, key=lambda x: float(x.get("start") or 0))
+                            score = 0.0
+                            first = float(s[0].get("start") or 0)
+                            if first > _gap_threshold_inner:
+                                score += first
+                            for p, n in zip(s, s[1:]):
+                                gap = float(n.get("start") or 0) - float(p.get("end") or 0)
+                                if gap > _gap_threshold_inner:
+                                    score += gap
+                            return score
+
+                        gap_score_initial = _gap_score(fa_segs)
+                        if (gap_score_initial > GAP_REFETCH_THRESHOLD_S
+                                and lyrics_source == "lrclib"):
+                            logger.info(
+                                "[LYRICS] FA gap_score=%.1fs > %.0fs threshold "
+                                "— trying Genius/Gemini for more complete lyrics "
+                                "(current source=%s, %d chars)",
+                                gap_score_initial, GAP_REFETCH_THRESHOLD_S,
+                                lyrics_source, len(fa_text),
+                            )
+                            better_text: str | None = None
+                            better_source: str | None = None
+                            try:
+                                import genius_fetch
+                                if genius_fetch.is_enabled():
+                                    with scoped_db() as _refetch_db:
+                                        gt = await asyncio.to_thread(
+                                            genius_fetch.fetch_genius_plain,
+                                            artist_hint, song_hint, _refetch_db,
+                                        )
+                                    if gt:
+                                        better_text = gt
+                                        better_source = "genius"
+                            except Exception as e:
+                                logger.warning("[LYRICS] re-fetch Genius failed: %s", e)
+                            if not better_text:
+                                try:
+                                    from pipeline import _fetch_lyrics_via_gemini_search
+                                    with scoped_db() as _refetch_db:
+                                        gmt = await asyncio.to_thread(
+                                            _fetch_lyrics_via_gemini_search,
+                                            artist_hint, song_hint, job_id, _refetch_db,
+                                        )
+                                    if gmt:
+                                        better_text = gmt
+                                        better_source = "gemini"
+                                except Exception as e:
+                                    logger.warning("[LYRICS] re-fetch Gemini failed: %s", e)
+
+                            # Only re-run FA if the new text is meaningfully
+                            # bigger. 15% more lines is the floor that
+                            # justifies the ~75 s + ~$0.007 of a second
+                            # cureau call.
+                            if better_text:
+                                orig_lines = len([l for l in (fa_text or "").splitlines() if l.strip()])
+                                new_lines = len([l for l in better_text.splitlines() if l.strip()])
+                                if new_lines > orig_lines * 1.15:
+                                    logger.info(
+                                        "[LYRICS] re-fetch from %s found %d lines (was %d, +%.0f%%) "
+                                        "— re-running FA",
+                                        better_source, new_lines, orig_lines,
+                                        (new_lines / max(1, orig_lines) - 1) * 100,
+                                    )
+                                    try:
+                                        new_fa_segs = await asyncio.to_thread(
+                                            forced_align.forced_align_lyrics, _aa, better_text,
+                                        )
+                                    except Exception as e:
+                                        logger.warning("[LYRICS] re-fetch FA retry raised: %s", e)
+                                        new_fa_segs = None
+                                    if new_fa_segs:
+                                        new_gap_score = _gap_score(new_fa_segs)
+                                        # Accept the new FA only if it
+                                        # halves the gap_score. Marginal
+                                        # improvements aren't worth the
+                                        # risk of switching to a different
+                                        # lyrics version of the song.
+                                        if new_gap_score < gap_score_initial * 0.5:
+                                            logger.info(
+                                                "[LYRICS] re-fetch IMPROVED: gap %.1fs → %.1fs, "
+                                                "%d → %d segs — adopting %s source",
+                                                gap_score_initial, new_gap_score,
+                                                len(fa_segs), len(new_fa_segs), better_source,
+                                            )
+                                            fa_segs = new_fa_segs
+                                            fa_text = better_text
+                                            lyrics_source = f"lrclib_then_{better_source}"
+                                        else:
+                                            logger.info(
+                                                "[LYRICS] re-fetch did NOT improve: gap %.1fs → %.1fs "
+                                                "— keeping lrclib result",
+                                                gap_score_initial, new_gap_score,
+                                            )
+                                else:
+                                    logger.info(
+                                        "[LYRICS] re-fetch %s returned similar length (%d vs %d lines) "
+                                        "— not worth re-running FA",
+                                        better_source, new_lines, orig_lines,
+                                    )
+                            else:
+                                logger.info("[LYRICS] re-fetch: no better source found, keeping lrclib")
 
                         # GAP RESCUE (2026-05-25, rev 2): lrclib's community-
                         # curated lyrics OMIT chorus repeats at both ENDS and
