@@ -71,6 +71,7 @@ export default function LyricVideoPreview({
   onDragStart,            // () => void — push one undo snapshot
   showSafeArea = true,    // broadcast-safe guide
   editable = true,        // false → read-only preview (no handles/selection box)
+  t = null,               // optional i18n hook from useI18n() — falls back to ES copy
 }) {
   const frameRef = useRef(null);
   const bgVideoRef = useRef(null);
@@ -88,14 +89,38 @@ export default function LyricVideoPreview({
     try { v.currentTime = currentTime % dur; } catch { /* not seekable yet */ }
   }, [currentTime, backgroundUrl]);
 
-  // The line on screen = the one whose [start,end] contains currentTime —
-  // exactly what the rendered video shows now and what the timeline marks.
-  // In a gap / instrumental intro there is NO active line → blank stage
-  // (matches the video + the timeline). We deliberately do NOT fall back to
-  // the upcoming line: that showed text the timeline didn't mark and the
-  // video wouldn't show, which read as a bug.
+  // The line on screen = the one whose [start,end] contains currentTime,
+  // PLUS a sticky-last-line fallback during short gaps so the placeholder
+  // doesn't flicker between back-to-back lines.
+  //
+  // INCIDENT 2026-05-24: with songs that have lines packed tight (a 0.3 s
+  // gap between two segments is normal), the old "containing-only" logic
+  // dropped to `null` every gap, showing the "Reproducí o seleccioná…"
+  // placeholder for a frame and ripping it out the next. From the user's
+  // chair: the preview felt epileptic during the chorus.
+  //
+  // New rule mirrors what LyricsEditor.activeId already does (`containing
+  // || lastStarted`): if currentTime is inside a segment, show it; if not,
+  // hold the last segment that already started — UNTIL either the next
+  // segment kicks in or we've drifted >TAIL_HOLD_S seconds past the last
+  // segment's end (truly empty section, e.g. instrumental break). That
+  // window is small enough to not lie during long instrumentals but big
+  // enough to bridge any gap inside a verse.
+  const TAIL_HOLD_S = 1.2;
   const activeSeg = useMemo(() => {
-    return segments.find((s) => currentTime >= s.start && currentTime < s.end) || null;
+    let containing = null;
+    let lastStarted = null;
+    for (const s of segments) {
+      if (currentTime >= s.start && currentTime < s.end) {
+        containing = s;
+      }
+      if (currentTime >= s.start) {
+        lastStarted = s;
+      }
+    }
+    if (containing) return containing;
+    if (lastStarted && (currentTime - lastStarted.end) <= TAIL_HOLD_S) return lastStarted;
+    return null;
   }, [segments, currentTime]);
 
   const layoutOf = useCallback((seg) => {
@@ -295,8 +320,9 @@ export default function LyricVideoPreview({
       )}
 
       {!activeSeg && (
-        <div className="absolute inset-0 flex items-center justify-center text-ink-tertiary text-sm">
-          Reproducí o seleccioná una línea para previsualizarla
+        <div className="absolute inset-0 flex items-center justify-center text-ink-tertiary text-sm px-4 text-center">
+          {(t && t("editor.preview_empty")) ||
+            "Reproducí o seleccioná una línea para previsualizarla"}
         </div>
       )}
     </div>

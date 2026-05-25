@@ -1488,8 +1488,16 @@ export default function LyricsEditor({
     seekTo(pct * duration, false);
   };
 
+  // INCIDENT 2026-05-24: the list view used `max-w-3xl` (~768 px). With
+  // the 2-col grid (preview / lines) that left the preview ~360 px wide —
+  // "TENDRÉ QUE DEJARTE..." felt cramped — and the line inputs only had
+  // ~280 px so anything longer than 30 chars visually cut off ("Nuestra
+  // relación no es pa…"). Bumped to a generous 1400 px so both columns
+  // breathe: preview ~680 px wide (≈ 2× before), lines fit ≈ 60 chars per
+  // row before scrolling. Timeline view stays at max-w-6xl (already wide
+  // enough).
   return (
-    <div className={`w-full animate-fade-in ${viewMode === "timeline" ? "max-w-6xl" : "max-w-3xl"}`}>
+    <div className={`w-full animate-fade-in mx-auto ${viewMode === "timeline" ? "max-w-6xl" : "max-w-[1400px]"}`}>
       {/* Hidden audio element drives playback. */}
       {audioUrl && (
         <audio
@@ -2174,6 +2182,7 @@ export default function LyricsEditor({
               </div>
             </div>
             <LyricVideoPreview
+              t={t}
               segments={edited}
               currentTime={currentTime}
               backgroundUrl={previewBgUrl || null}

@@ -34,6 +34,42 @@ it("renders the line active at currentTime", () => {
   expect(screen.queryByText("primera línea")).not.toBeInTheDocument();
 });
 
+// REGRESSION GUARD 2026-05-24: between two back-to-back lines the preview
+// used to drop to `null` for the gap frame, ripping the placeholder in and
+// out. With sticky-last-line the previous line holds for up to TAIL_HOLD_S
+// seconds — placeholder stays away during normal verse pacing.
+it("holds the previous line during a sub-second gap (no placeholder flicker)", () => {
+  // segments: 0-5 "primera línea", 5.5-10 "segunda línea" — 0.5 s gap.
+  const segs = [
+    { _id: 0, start: 0, end: 5, text: "primera línea" },
+    { _id: 1, start: 5.5, end: 10, text: "segunda línea" },
+  ];
+  setup({ segments: segs, currentTime: 5.2 });   // inside the gap
+  // previous line is still on screen, NOT the placeholder
+  expect(screen.getByText("primera línea")).toBeInTheDocument();
+  expect(screen.queryByText(/Reproducí/)).not.toBeInTheDocument();
+});
+
+it("drops to the placeholder after the tail-hold window (real instrumental)", () => {
+  // Only one line at 0-2. At t=4 we're 2 s past the end → past TAIL_HOLD_S.
+  const segs = [{ _id: 0, start: 0, end: 2, text: "única" }];
+  setup({ segments: segs, currentTime: 4 });
+  expect(screen.queryByText("única")).not.toBeInTheDocument();
+  expect(screen.getByText(/Reproducí|Play|Toque/)).toBeInTheDocument();
+});
+
+it("does not show any line before the first segment starts (intro)", () => {
+  // currentTime before any segment → lastStarted is null → placeholder.
+  const segs = [
+    { _id: 0, start: 2, end: 5, text: "primera línea" },
+    { _id: 1, start: 5, end: 10, text: "segunda línea" },
+  ];
+  setup({ segments: segs, currentTime: 0.5 });   // genuine intro
+  expect(screen.queryByText("primera línea")).not.toBeInTheDocument();
+  expect(screen.queryByText("segunda línea")).not.toBeInTheDocument();
+  expect(screen.getByText(/Reproducí|Play|Toque/)).toBeInTheDocument();
+});
+
 it("a click (no movement) selects the line, does not commit a layout", () => {
   const { props } = setup();
   const text = screen.getByText("segunda línea").closest("div[class*='cursor-move']");
