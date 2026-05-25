@@ -3745,8 +3745,12 @@ async def _run_transcription_for_job(
                     # affect the other. We pass the SAME stem path so
                     # both align against the isolated vocals.
                     async def _warm_whisperx():
+                        # Pass fa_text as initial_prompt — biases whisperX
+                        # towards the canonical lyrics, kills the
+                        # "Le realizan la" → "Legalícenla" mishear.
                         return await asyncio.to_thread(
                             whisperx_transcribe.transcribe_whisperx, _aa, lang,
+                            fa_text,
                         )
                     wx_warm_task = asyncio.create_task(_warm_whisperx())
 
@@ -4100,8 +4104,10 @@ async def _run_transcription_for_job(
                     await _step("transcribe.transcribe_word", 70)
                     _aa = await _get_align_audio()
                     fa_text_for_wx = plain or forced_align.lrc_to_plain_text(synced)
+                    # Pass reference text as initial_prompt (anti-hallucination)
                     wx_segs = await asyncio.to_thread(
                         whisperx_transcribe.transcribe_whisperx, _aa, lang,
+                        fa_text_for_wx,
                     )
                     if wx_segs:
                         from pipeline import _filter_whisper_hallucinations as _fwh
@@ -4501,8 +4507,10 @@ async def _run_transcription_for_job(
             if whisperx_transcribe.is_enabled():
                 await _step("transcribe.transcribe_word", 70)
                 _aa = await _get_align_audio()
+                # Pass `reference` (Gemini/lyrics.ovh text) as initial_prompt
                 wx_segs = await asyncio.to_thread(
                     whisperx_transcribe.transcribe_whisperx, _aa, lang,
+                    reference,
                 )
                 if wx_segs:
                     from pipeline import _filter_whisper_hallucinations as _fwh
