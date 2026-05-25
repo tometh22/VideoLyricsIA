@@ -3533,17 +3533,87 @@ async def _run_transcription_for_job(
             # community timestamps (often drifted / missing lines — the
             # Intoxicados case) or Whisper's loose timing. Falls back to
             # the existing synced/Whisper logic on any failure.
+            #
+            # PR #299 WARM-START (2026-05-24): launch Whisper-1 IN PARALLEL
+            # to FA. If FA wins → cancel the warm task ($0.003 wasted).
+            # If FA fails / hits its 480s budget → the warm task is
+            # already DONE → instant fallthrough to whisper_lrclib
+            # without paying another 8 min of Replicate retries for
+            # whisperX. Cuts worst-case from ~16 min to ~6 min when
+            # Replicate is degraded.
             import forced_align
             if forced_align.is_enabled():
                 fa_text = plain or forced_align.lrc_to_plain_text(synced)
-                if fa_text:
+                if fa_text and plain:
+                    # Need `plain` for the warm-start fallback's
+                    # reference_lyrics — skip warm-start when only
+                    # synced is available (rare; FA still runs solo).
+                    await _step("transcribe.align", 55)
+                    _aa = await _get_align_audio()
+
+                    # Warm-start Whisper-1 BEFORE blocking on FA. Both
+                    # run via run_in_executor (separate threads) — they
+                    # don't contend on the same socket / connection
+                    # pool.
+                    w1_warm_task = asyncio.create_task(loop.run_in_executor(
+                        None,
+                        lambda: transcribe(tmp_path, lang, plain),
+                    ))
+
+                    fa_segs = None
+                    try:
+                        fa_segs = await asyncio.to_thread(
+                            forced_align.forced_align_lyrics, _aa, fa_text,
+                        )
+                    except Exception as e:
+                        logger.warning("[LYRICS] forced_align raised: %s — using warm-start Whisper-1", e)
+
+                    if fa_segs:
+                        logger.info("[LYRICS] forced alignment used (%s lines, lrclib text) for %r - %r", len(fa_segs), artist_hint, song_hint)
+                        # FA won — discard the warm task (await its
+                        # completion silently to avoid the 'never awaited'
+                        # asyncio warning).
+                        w1_warm_task.cancel()
+                        try:
+                            await w1_warm_task
+                        except (asyncio.CancelledError, Exception):
+                            pass
+                        from timing_sources import FORCED_ALIGN
+                        return _emit_segments(
+                            fa_segs, FORCED_ALIGN,
+                            reference_lyrics=fa_text,
+                            recovery_source="forced_align",
+                        )
+
+                    # FA failed/timed out. Use the warm-start Whisper-1
+                    # result — should be done by now (Whisper-1 ~15-30 s,
+                    # FA budget ~480 s). Skip whisperX (also Replicate,
+                    # also likely degraded if FA failed) and go straight
+                    # to the lrclib-plain rendering path.
+                    try:
+                        w1_warm_segs = await w1_warm_task
+                        if w1_warm_segs:
+                            logger.info("[LYRICS] FA failed — warm-start Whisper-1 took over with %s segments", len(w1_warm_segs))
+                            from pipeline import _filter_whisper_hallucinations
+                            w1_warm_segs, _ = _filter_whisper_hallucinations(w1_warm_segs)
+                            from timing_sources import WHISPER_LRCLIB
+                            return _emit_segments(
+                                w1_warm_segs, WHISPER_LRCLIB,
+                                reference_lyrics=plain,
+                            )
+                    except Exception as e:
+                        logger.warning("[LYRICS] warm-start Whisper-1 also failed: %s — falling through to whisperX", e)
+                    # Both warm + FA failed — continue to whisperX
+                    # fallback path below as the original last-resort.
+                elif fa_text:
+                    # `synced` without `plain` — no warm-start path, run FA solo.
                     await _step("transcribe.align", 55)
                     _aa = await _get_align_audio()
                     fa_segs = await asyncio.to_thread(
                         forced_align.forced_align_lyrics, _aa, fa_text,
                     )
                     if fa_segs:
-                        logger.info("[LYRICS] forced alignment used (%s lines, lrclib text) for %r - %r", len(fa_segs), artist_hint, song_hint)
+                        logger.info("[LYRICS] forced alignment used (%s lines, synced-only path) for %r - %r", len(fa_segs), artist_hint, song_hint)
                         from timing_sources import FORCED_ALIGN
                         return _emit_segments(
                             fa_segs, FORCED_ALIGN,
