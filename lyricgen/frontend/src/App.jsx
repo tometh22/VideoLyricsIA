@@ -893,6 +893,11 @@ export default function App() {
           // en la mitad del multipart en vez de seguir hasta terminar.
           signal: controller && controller.signal,
         });
+        // BUG FIX 2026-05-25 (job duplication): guardar el jobId del upload
+        // en el cache YA, antes del polling. Así transcribeNext (si el
+        // operador clickea "Revisar" antes de que el prefetch termine) ve
+        // el jobId y puede reusar este job en vez de crear uno nuevo.
+        prefetchCache.current[idx] = { status: "loading", jobId };
         setRowStatus(file, "queued");
         const res = await authFetchWithRetryOn503(`${API}/transcribe-uploaded`, {
           method: "POST",
@@ -1023,6 +1028,57 @@ export default function App() {
       // Kick off prefetch for all remaining songs.
       prefetchRemaining(queue, idx + 1);
       return;
+    }
+
+    // BUG FIX 2026-05-25 (job duplication): si el prefetch del auto-transcribe
+    // YA arrancó (status="loading") y todavía no terminó, NO crear un job
+    // nuevo — esperar al existente. Sin este check, el operador clickeaba
+    // "Revisar lyrics" mientras el prefetch corría → caía al slow path →
+    // segundo uploadFileToR2 → SEGUNDO job creado para el mismo audio.
+    // DB confirma: pares de jobs con MISMO filename, mismo user, ~121s
+    // apart (el tiempo típico de wizard antes de clickear Revisar).
+    if (cached?.status === "loading" && cached.jobId) {
+      setTranscribing(true);
+      setTranscribeError(null);
+      setTranscribeProgress({
+        phase: "transcribing",
+        loaded: 0,
+        total: 0,
+        jobId: cached.jobId,
+        fileName: entry.file?.name || "",
+      });
+      try {
+        const data = await pollUntilTranscribed(cached.jobId, entry.file);
+        if (data) {
+          prefetchCache.current[idx] = { status: "ready", data, jobId: cached.jobId };
+          setTranscribing(false);
+          setTranscribeProgress(null);
+          setCurrentReview({
+            file: entry.file, artist: entry.artist, language: entry.language,
+            songTitle: entry.songTitle || "",
+            genre: entry.genre || "", font: entry.font || "",
+            concept: entry.concept || "", movementStyle: entry.movementStyle || "", effect: entry.effect || "",
+            backgroundHint: entry.backgroundHint || "", bgVerbatim: !!entry.bgVerbatim,
+            textCase: entry.textCase || "upper",
+            fontScale: entry.fontScale || "1.0",
+            textContrast: entry.textContrast || "medium",
+            segments: data.segments, referenceLyrics: data.reference_lyrics || "",
+            coverageWarning: !!data.coverage_warning,
+            recoverySource: data.recovery_source || "",
+            transcribeJobId: data.job_id || cached.jobId,
+            queueIdx: idx, queue,
+          });
+          prefetchRemaining(queue, idx + 1);
+          return;
+        }
+        // pollUntilTranscribed returned null → prefetch failed. Caer al
+        // slow path (que SÍ crea un job nuevo) — operador prefiere
+        // un retry sobre "queda colgado forever".
+        prefetchCache.current[idx] = { status: "error" };
+      } catch (err) {
+        // Si el poll falló transient, igual caemos al slow path.
+        prefetchCache.current[idx] = { status: "error" };
+      }
     }
 
     // Slow path: upload + transcribe now (first song, or prefetch missed).
