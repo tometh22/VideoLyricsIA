@@ -89,18 +89,20 @@ def test_pipeline_merges_render_params_preserving_hint():
     gone on any later reaper-recovery retry. Gemini then reverted to its
     default alley cliché.
 
-    Pin the fix by inspecting run_pipeline's source: it must read the
-    existing render_params and merge, and conditionally persist
-    background_hint.
+    Audit U5 (2026-05-25): refactored to atomic merge_render_params helper
+    (SELECT FOR UPDATE + read + write en una tx). Test verifica el NUEVO
+    contrato: pipeline llama merge_render_params con _new_rp.
     """
     src = inspect.getsource(pipeline.run_pipeline)
 
-    # Must NOT replace wholesale with a literal dict that drops the hint.
-    assert "_merged_rp" in src, (
-        "run_pipeline must build a merged render_params dict, not replace it"
+    # U5: ahora se usa el helper atomic merge_render_params en vez de
+    # read-update-write fuera de un row lock.
+    assert "merge_render_params" in src, (
+        "run_pipeline must call jobs.merge_render_params() for atomic merge"
     )
-    assert ".update(_new_rp)" in src, (
-        "run_pipeline must merge the new fields over existing render_params"
+    # El dict de updates sigue llamándose _new_rp.
+    assert "_new_rp" in src, (
+        "run_pipeline must build the new fields dict (_new_rp) before merge"
     )
     # Must conditionally carry background_hint into the persisted params.
     assert 'if background_hint:' in src and '_new_rp["background_hint"] = background_hint' in src, (
