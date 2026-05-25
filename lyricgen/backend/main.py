@@ -3566,10 +3566,20 @@ async def _run_transcription_for_job(
                     # run via run_in_executor (separate threads) — they
                     # don't contend on the same socket / connection
                     # pool.
-                    w1_warm_task = asyncio.create_task(loop.run_in_executor(
+                    #
+                    # HOTFIX 2026-05-25 (PR #298 regression): the
+                    # previous code wrapped `loop.run_in_executor(...)`
+                    # in `asyncio.create_task(...)`. That raises
+                    # `TypeError: a coroutine was expected, got <Future>`
+                    # because `run_in_executor` returns a Future, not a
+                    # coroutine. The Future is already scheduled — we
+                    # just hold the reference. `.cancel()` and `await`
+                    # work identically on Futures and Tasks, so the rest
+                    # of the warm-start code is unchanged.
+                    w1_warm_task = loop.run_in_executor(
                         None,
                         lambda: transcribe(tmp_path, lang, plain),
-                    ))
+                    )
 
                     fa_segs = None
                     try:
