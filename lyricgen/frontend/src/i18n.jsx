@@ -469,7 +469,7 @@ const translations = {
     "batch.error_timeout": "La subida tardó demasiado. Probá con un MP3 (más liviano que WAV).",
     "batch.error_server_5xx": "Error del servidor (HTTP {status}). Reintentá en unos minutos.",
     "batch.error_http": "Error HTTP {status}: {detail}",
-    "batch.wav_warning_large": "Tu WAV pesa {sizeMB} MB. Las subidas grandes a veces fallan; recomendamos convertirlo a MP3.",
+    "batch.wav_warning_large": "Archivo grande ({sizeMB} MB) · Mejor MP3 para subir más rápido.",
     "batch.confirm_cancel": "Hay videos en proceso. ¿Seguro que querés cancelar?",
     // Soft-queue messages — shown in amber on the job row when an
     // upload is being held back by capacity pressure. The user
@@ -1372,7 +1372,7 @@ const translations = {
     "batch.error_timeout": "Upload took too long. Try an MP3 (much smaller than WAV).",
     "batch.error_server_5xx": "Server error (HTTP {status}). Try again in a few minutes.",
     "batch.error_http": "HTTP {status}: {detail}",
-    "batch.wav_warning_large": "Your WAV is {sizeMB} MB. Large uploads sometimes fail; we recommend converting it to MP3.",
+    "batch.wav_warning_large": "Large file ({sizeMB} MB) · MP3 uploads faster.",
     "batch.queue_team_backlog": "Waiting for a free slot on your team. We'll resume the upload automatically when one frees up.",
     "batch.queue_server_busy": "Server is busy for a moment. We'll retry automatically in a few minutes.",
     "batch.queue_rate_limit": "Uploading… retrying in a few seconds.",
@@ -2124,7 +2124,7 @@ const translations = {
     "batch.error_timeout": "O upload demorou demais. Tente um MP3 (mais leve que WAV).",
     "batch.error_server_5xx": "Erro do servidor (HTTP {status}). Tente novamente em alguns minutos.",
     "batch.error_http": "Erro HTTP {status}: {detail}",
-    "batch.wav_warning_large": "Seu WAV pesa {sizeMB} MB. Uploads grandes às vezes falham; recomendamos converter para MP3.",
+    "batch.wav_warning_large": "Arquivo grande ({sizeMB} MB) · Melhor MP3 para subir mais rápido.",
     "batch.confirm_cancel": "Há vídeos em processamento. Tem certeza que deseja cancelar?",
 
     "prov.title": "Provenance IA",

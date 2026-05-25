@@ -20,12 +20,15 @@ const PALETTE_BG = {
 };
 
 // Each movement maps to a CSS animation on the background layer. Static = none.
+// UX 2026-05-24: amplificadas para que el cambio entre movimientos sea
+// visiblemente distinto al click. Antes los deltas eran tan chicos
+// (~2%/1.4%) que el operador no notaba el cambio.
 const MOVE_ANIM = {
-  "":             "wlp-sutil 7s ease-in-out infinite alternate",
+  "":             "wlp-sutil 5s ease-in-out infinite alternate",
   estatico:       "none",
-  sutil:          "wlp-sutil 7s ease-in-out infinite alternate",
-  estandar:       "wlp-estandar 6s ease-in-out infinite alternate",
-  "foto-parallax":"wlp-parallax 6s ease-in-out infinite alternate",
+  sutil:          "wlp-sutil 5s ease-in-out infinite alternate",
+  estandar:       "wlp-estandar 4s ease-in-out infinite alternate",
+  "foto-parallax":"wlp-parallax 4.5s ease-in-out infinite alternate",
   animado:        "wlp-anim 1.8s linear infinite",
 };
 
@@ -127,10 +130,20 @@ export default function WizardLivePreview({ style = "auto", customColors = "", m
   return (
     <div className="relative w-full aspect-video rounded-2xl overflow-hidden ring-1 ring-white/[0.08] shadow-[0_24px_70px_-24px_#000] bg-black select-none" style={{ containerType: "inline-size" }}>
       <style>{`
-        @keyframes wlp-sutil { to { transform: translate(2%,1.4%) scale(1.05); } }
-        @keyframes wlp-estandar { to { transform: translate(-8%,4%) scale(1.2); } }
-        @keyframes wlp-parallax { to { transform: translate(-5%,0) scale(1.12); } }
-        @keyframes wlp-anim { to { background-position: 52px 0; } }
+        /* UX 2026-05-24: deltas más generosos para que cada movimiento se
+           note distinto sin marearse (sigue siendo overlay sobre el preview
+           base, no el render final). */
+        @keyframes wlp-sutil    { to { transform: translate(3.5%,2.4%) scale(1.08); } }
+        @keyframes wlp-estandar { to { transform: translate(-14%,7%)  scale(1.30); } }
+        @keyframes wlp-parallax { to { transform: translate(-12%,2%)  scale(1.18); } }
+        @keyframes wlp-anim     { to { background-position: 52px 0; } }
+        /* Pulse del badge cuando el operador cambia de movimiento/efecto —
+           feedback visual de "el preview SE actualizó". 0.7s, suave. */
+        @keyframes wlp-badge-pulse {
+          0%   { transform: scale(1);    box-shadow: 0 0 0 0 rgba(109, 74, 255, 0.6); }
+          50%  { transform: scale(1.06); box-shadow: 0 0 0 8px rgba(109, 74, 255, 0); }
+          100% { transform: scale(1);    box-shadow: 0 0 0 0 rgba(109, 74, 255, 0); }
+        }
         @keyframes wlp-glow { to { transform: translate(-34px,26px) scale(1.1); } }
         @keyframes wlp-lyric-in { from { opacity: 0; transform: translateY(14px); } to { opacity: 1; transform: translateY(0); } }
         /* lyrics-animation templates (mirror the libass render) */
@@ -210,10 +223,22 @@ export default function WizardLivePreview({ style = "auto", customColors = "", m
         <span className="w-1.5 h-1.5 rounded-full animate-pulse" style={{ background: "#14C8A8" }} />
         {t("upload.preview_live") || "Preview"}
       </div>
-      {/* info caption — plain text, not pills */}
+      {/* info caption — plain text, not pills. El span del movimiento usa
+          `key={moveLabel + effectLabel}` para que React lo desmonte/remonte
+          al cambiar opción → la animación de pulse vuelve a fire. Feedback
+          visual de "el preview SE actualizó". UX 2026-05-24. */}
       <div className="absolute bottom-3.5 left-5 right-5 flex items-center justify-between text-label" style={{ color: isMinimal ? "rgba(0,0,0,.55)" : "rgba(255,255,255,.6)", textShadow: isMinimal ? "none" : "0 1px 8px rgba(0,0,0,.5)" }}>
         <span className="truncate">{modeLabel}</span>
-        <span className="shrink-0 ml-3">{(t("upload.preview_motion") || "Movimiento")}: {moveLabel}{effectLabel ? ` · ${t("upload.effect_label") || "Efecto"}: ${effectLabel}` : ""}</span>
+        <span
+          key={`${moveLabel}-${effectLabel}`}
+          className="shrink-0 ml-3 px-2 py-0.5 rounded-full"
+          style={{
+            animation: "wlp-badge-pulse 0.7s cubic-bezier(.2,.8,.2,1) 1",
+            background: isMinimal ? "rgba(0,0,0,.06)" : "rgba(255,255,255,.06)",
+          }}
+        >
+          {(t("upload.preview_motion") || "Movimiento")}: {moveLabel}{effectLabel ? ` · ${t("upload.effect_label") || "Efecto"}: ${effectLabel}` : ""}
+        </span>
       </div>
     </div>
   );

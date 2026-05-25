@@ -1146,7 +1146,10 @@ export default function UploadZone({
                 <p className="text-sm text-white truncate">{entry.file.name}</p>
                 {entry.file.name.toLowerCase().endsWith(".wav") &&
                  entry.file.size > WAV_SOFT_WARN_MB * 1024 * 1024 && (
-                  <p className="text-[11px] text-amber-400/80 mt-0.5 truncate">
+                  /* UX 2026-05-24: copy más cortita + sin `truncate` para que
+                     no quede "reco..." cortado. Antes era worker-dev speak,
+                     ahora es directo al grano: tamaño + qué hacer. */
+                  <p className="text-label text-amber-400/80 mt-0.5 leading-snug">
                     {t("batch.wav_warning_large", { sizeMB: Math.round(entry.file.size / (1024 * 1024)) })}
                   </p>
                 )}
