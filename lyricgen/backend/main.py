@@ -3820,6 +3820,109 @@ async def _run_transcription_for_job(
             except Exception as e:
                 logger.warning("[LYRICS] gemini fallback raised: %s — continuing without it", e)
 
+        # ─────────────────────────────────────────────────────────────────
+        # WORLD-CLASS audio-as-truth pipeline (default 2026-05-25).
+        #
+        # whisperX provides timing (word-level acoustic anchors), the canonical
+        # lyrics (lrclib/Genius/Gemini, in that fallback order) provide text.
+        # `whisperx_reconcile.reconcile()` merges them: timing from audio,
+        # orthography from reference. With phonetic-aware anchoring (see
+        # forced_align.wordstamps_to_segments, 2026-05-25), even acoustic
+        # mishears like "Le realizan la" → "Legalícenla" anchor to the
+        # correct timestamps so the editor never shows "first lyric @ 0:45"
+        # when the song actually starts at 0:17.
+        #
+        # No forced_align. No is_suspiciously_repetitive guard. No hybrid
+        # rescue. No gap-driven re-fetch. Those scaffolds existed to detect
+        # and compensate for FA's greedy-monotonic cramming of repeated
+        # chorus lines into a single audio region — a class of bug that
+        # cannot happen when the timing source is per-word acoustic anchors.
+        #
+        # `AUDIO_AS_TRUTH=0` reverts to the legacy FA-primary pipeline
+        # below as an emergency rollback. Plan: validate on staging,
+        # delete the legacy branch once stable (~1500 lines come out).
+        # ─────────────────────────────────────────────────────────────────
+        _wc_enabled = (
+            os.environ.get("AUDIO_AS_TRUTH", "1").strip().lower()
+            in ("1", "true", "yes", "on", "y", "t")
+        )
+        if _wc_enabled:
+            import whisperx_transcribe as _wx_mod
+            if _wx_mod.is_enabled():
+                # Canonical text from whichever source brought it in.
+                _canonical = ""
+                if lrc:
+                    _plain = (lrc.get("plain") or "").strip()
+                    _synced = lrc.get("synced")
+                    if _plain:
+                        _canonical = _plain
+                    elif _synced:
+                        import forced_align as _fa_lrc
+                        _canonical = _fa_lrc.lrc_to_plain_text(_synced)
+
+                # whisperX over the vocal stem. `lyrics_hint` biases the
+                # model toward the canonical lexicon (kills the "¡Karol!"
+                # stuck-phoneme and similar mishears in well-known regions).
+                await _step("transcribe.transcribe_word", 50)
+                _aa = await _get_align_audio()
+                try:
+                    _wx_segs = await asyncio.to_thread(
+                        _wx_mod.transcribe_whisperx, _aa, lang,
+                        _canonical or None,
+                    )
+                except Exception as e:
+                    logger.warning("[WC] whisperX raised: %s — falling through to legacy", e)
+                    _wx_segs = None
+
+                if _wx_segs:
+                    # Generic hallucination filter (mega-segment, fuzzy
+                    # intra-loops, ¡Karol!×174 family). Pure structural
+                    # check on whisperX output — runs regardless of
+                    # canonical presence.
+                    from pipeline import _filter_whisper_hallucinations as _fwh
+                    _wx_segs, _dropped = _fwh(_wx_segs)
+                    if _dropped:
+                        logger.warning("[WC] dropped %d whisperX hallucination phrase(s)", _dropped)
+
+                if _wx_segs:
+                    from timing_sources import (
+                        WHISPERX_RECONCILED as _WC_WX_REC,
+                        WHISPERX as _WC_WX,
+                    )
+                    # Reconcile when we have canonical text; emit raw otherwise.
+                    if _canonical:
+                        import whisperx_reconcile as _wxr
+                        _reconciled = _wxr.reconcile(_wx_segs, _canonical)
+                        if _reconciled:
+                            logger.info("[WC] whisperX reconciled (%d/%d lines, canonical=%s) — audio-as-truth path",
+                                        len(_reconciled),
+                                        len([l for l in _canonical.splitlines() if l.strip()]),
+                                        "lrclib" if lyrics_source == "lrclib"
+                                        else (lyrics_source or "unknown"))
+                            return _emit_segments(
+                                _reconciled, _WC_WX_REC,
+                                reference_lyrics=_canonical,
+                            )
+                        # Reconcile aborted (drift on too many lines or thin
+                        # coverage). Emit whisperX raw — same behaviour as
+                        # main today, which the operator confirmed works:
+                        # real timing + mishear text that the editor can fix.
+                        logger.info("[WC] reconcile aborted — emitting whisperX raw with mishear text (operator edits)")
+                    return _emit_segments(
+                        _wx_segs, _WC_WX,
+                        reference_lyrics=_canonical,
+                    )
+                # whisperX produced nothing usable — fall through to legacy
+                # (whisper-1 last-resort path further down).
+                logger.info("[WC] whisperX returned no segments — falling through to legacy")
+            else:
+                logger.info("[WC] WHISPERX_ENABLED off — using legacy FA path")
+
+        # ─────────────────────────────────────────────────────────────────
+        # LEGACY FA-primary pipeline (below). Kept as a safety net during
+        # validation of the world-class path above. Slated for removal
+        # once the new path proves stable in prod (~1500 lines come out).
+        # ─────────────────────────────────────────────────────────────────
         if lrc:
             synced = lrc.get("synced")
             plain = lrc.get("plain") or ""

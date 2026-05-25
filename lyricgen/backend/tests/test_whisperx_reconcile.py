@@ -71,6 +71,64 @@ def test_reconcile_returns_none_on_total_drift():
     assert wr.reconcile(wx_segs, reference) is None
 
 
+def test_reconcile_recovers_legalicenla_intro_mishear():
+    """End-to-end regression for the Legalícenla incident (2026-05-25).
+
+    whisperX heard the intro chorus 'Legalícenla × 3' as 'Le realizan la × 3'
+    with timestamps at 0:17 / 0:19 / 0:22. Before the phonetic-aware anchor
+    (forced_align.wordstamps_to_segments) this scored Jaccard=0 and reconcile
+    aborted, so the editor showed first lyric @ 0:45. After the fix, reconcile
+    must replace the mishear text with canonical 'Legalícenla' AND preserve
+    the 0:17 timestamps."""
+    words = [
+        _w("Le",       17.0, 17.5),
+        _w("realizan", 17.5, 18.2),
+        _w("la",       18.2, 18.6),
+        _w("Le",       19.5, 20.0),
+        _w("realizan", 20.0, 20.7),
+        _w("la",       20.7, 21.1),
+        _w("Le",       22.0, 22.5),
+        _w("realizan", 22.5, 23.2),
+        _w("la",       23.2, 23.6),
+        _w("Hubo",     53.2, 53.5),
+        _w("tiempos",  53.5, 54.0),
+        _w("de",       54.0, 54.2),
+        _w("guerras",  54.2, 54.8),
+        _w("tiempos",  54.9, 55.4),
+        _w("de",       55.4, 55.6),
+        _w("paz",      55.6, 56.2),
+    ]
+    wx_segs = [_wx_seg(
+        17.0, 56.2,
+        "Le realizan la Le realizan la Le realizan la Hubo tiempos de guerras tiempos de paz",
+        words,
+    )]
+    canonical = (
+        "Legalícenla\n"
+        "Legalícenla\n"
+        "Legalícenla\n"
+        "Hubo tiempos de guerras, tiempos de paz"
+    )
+    out = wr.reconcile(wx_segs, canonical, min_coverage=0.5)
+    assert out is not None, "reconcile must succeed — phonetic anchor catches the mishear"
+    assert len(out) == 4
+
+    # Text comes from canonical, NOT the mishear.
+    assert [s["text"] for s in out] == [
+        "Legalícenla", "Legalícenla", "Legalícenla",
+        "Hubo tiempos de guerras, tiempos de paz",
+    ]
+
+    # Critical: intro chorus anchors near 0:17 — NOT past 0:45 (the bug shape).
+    assert 16.5 < out[0]["start"] < 18.5, (
+        f"intro chorus must land at 0:17 area, got {out[0]['start']}"
+    )
+    assert 19.0 < out[1]["start"] < 20.5
+    assert 21.5 < out[2]["start"] < 23.0
+    # Verse aligns past the chorus.
+    assert out[3]["start"] > 50.0
+
+
 def test_reconcile_passes_words_through_for_karaoke():
     # When reconciliation succeeds, per-word stamps are re-attached so the
     # frontend can still do word-level karaoke on the reconciled lines.
