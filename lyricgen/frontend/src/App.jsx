@@ -522,6 +522,80 @@ export default function App() {
     return () => window.removeEventListener("beforeunload", handler);
   }, [files, approvedJobs, currentReview, reviewQueue]);
 
+  // 2026-05-25 — Resume desde el historial. JobDetail enlaza a
+  // /new?resume=<jobId> cuando el operador clickea "Editar lyrics y
+  // generar" sobre una card en estado `transcribed`. Sin handler, el
+  // wizard caía en pantalla de upload (bug reportado durante UMG
+  // dry-run: "los Sin generar cuando abrís te devuelve a Crear el
+  // video"). Implementación: fetch del job + segments + audio URL,
+  // construir currentReview SIN File (lo seteamos `null` y pasamos
+  // `audioUrl` al LyricsEditor que ya acepta el prop), setear
+  // wizardStage="review". El approve flow ya soporta retomar via
+  // `transcribeJobId` — el backend skipea file upload y reusa R2.
+  const resumeJobAttemptedRef = useRef(false);
+  useEffect(() => {
+    const params = new URLSearchParams(location.search);
+    const resumeJobId = params.get("resume");
+    if (!resumeJobId) return;
+    if (resumeJobAttemptedRef.current) return;
+    resumeJobAttemptedRef.current = true;
+
+    let cancelled = false;
+    (async () => {
+      try {
+        const statusRes = await authFetch(`${API}/status/${resumeJobId}`);
+        if (!statusRes.ok) throw new Error(`status ${statusRes.status}`);
+        const job = await statusRes.json();
+        if (cancelled) return;
+        // El audio URL se pide a un endpoint dedicado (presigned R2 o
+        // streaming via /media-token). LyricsEditor lo carga en su
+        // <audio> sin necesitar el File en memoria.
+        let audioUrl = null;
+        try {
+          const audioRes = await authFetch(`${API}/jobs/${resumeJobId}/source-audio-url`);
+          if (audioRes.ok) {
+            const audioJson = await audioRes.json();
+            audioUrl = audioJson.url || audioJson.audio_url || null;
+          }
+        } catch (_) { /* audioUrl queda null — editor de texto funciona igual */ }
+
+        const segments = job.segments || job.segments_json || [];
+        setCurrentReview({
+          file: null,                            // no tenemos el File original
+          filename: job.filename || `${job.song_title || job.artist || "audio"}.wav`,
+          audioUrl,                              // LyricsEditor lo acepta directamente
+          artist: job.artist || "",
+          songTitle: job.song_title || "",
+          language: job.language || "es",
+          genre: job.genre || "",
+          font: job.font || "",
+          concept: job.concept || "",
+          movementStyle: job.movement_style || "",
+          effect: job.effect || "",
+          textCase: job.text_case || "upper",
+          fontScale: String(job.font_scale || "1.0"),
+          lyricsAnimation: job.lyrics_animation || "none",
+          lineTransition: job.line_transition || "none",
+          textContrast: job.text_contrast || "medium",
+          segments,
+          referenceLyrics: job.reference_lyrics || "",
+          coverageWarning: !!job.coverage_warning,
+          recoverySource: job.recovery_source || "",
+          transcribeJobId: resumeJobId,           // backend reusa R2 audio
+          queueIdx: 0,
+          queue: [{ filename: job.filename || "audio.wav" }],
+        });
+        setWizardStage("review");
+        // Limpiar el query param sin agregar a history (replace).
+        navigate("/new", { replace: true });
+      } catch (err) {
+        console.warn("[RESUME] no pude cargar el job:", err);
+        resumeJobAttemptedRef.current = false;   // permitir reintento si el operador cambia URL
+      }
+    })();
+    return () => { cancelled = true; };
+  }, [location.search, navigate]);
+
   // Imperative resume — called by the banner's "Continuar" button.
   const resumeWizard = useCallback(() => {
     const snap = wizardPersistence.load();
@@ -1958,13 +2032,19 @@ export default function App() {
             // from props.segments only on mount, so without the key the
             // editor would keep showing the previous song's segments
             // when handleBackInReview swaps currentReview underneath it.
-            key={`${currentReview.file.name}:${currentReview.queueIdx}`}
+            //
+            // 2026-05-25: tolera resume desde historial — en ese path
+            // `currentReview.file` es null (el File del upload no se
+            // restaura desde R2) y la key/filename caen al campo
+            // `filename` que el resume handler popula del job DB.
+            key={`${currentReview.file?.name || currentReview.filename || "resume"}:${currentReview.queueIdx}`}
             // Clear the app's own sticky top bar (~72px) so the editor's
             // sticky CTA header isn't hidden behind it in the wizard.
             stickyHeaderTop={72}
             segments={currentReview.segments}
-            filename={currentReview.file.name}
+            filename={currentReview.file?.name || currentReview.filename || ""}
             audioFile={currentReview.file}
+            audioUrl={currentReview.audioUrl || null}
             referenceLyrics={currentReview.referenceLyrics || ""}
             coverageWarning={currentReview.coverageWarning}
             recoverySource={currentReview.recoverySource}
