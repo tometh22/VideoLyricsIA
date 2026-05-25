@@ -4050,8 +4050,61 @@ async def _run_transcription_for_job(
                                 # See `is_suspiciously_repetitive` docstring
                                 # for the INCIDENT 2026-05-25 #2 details.
                                 if cand and is_suspiciously_repetitive(cand, reference_text=fa_text):
-                                    logger.warning("[LYRICS] gap-rescue REJECTED for [%.1f,%.1f]: stuck-phoneme hallucination (%d lines, no ref match)",
-                                                   g_start, g_end, len(cand))
+                                    # INCIDENT 2026-05-25 #3 (Legalícenla,
+                                    # UMG dry-run): the guard correctly
+                                    # detects "Le realizan la × 3" as
+                                    # whisperX hallucination, BUT
+                                    # discarding `cand` loses the only
+                                    # signal we had for WHERE the intro
+                                    # chorus is in time. PROD (no guard)
+                                    # emitted "Le realizan la" segments
+                                    # with correct 0:17/0:19/0:21
+                                    # timestamps — bad text, good timing.
+                                    # Staging dropped them — no text, no
+                                    # timing — and the user lost the
+                                    # whole intro chorus.
+                                    #
+                                    # HYBRID FALLBACK: if the rejected
+                                    # gap is the INTRO ([0, first_fa])
+                                    # AND the canonical lyrics start with
+                                    # text not in fa_segs (= chorus lines
+                                    # lrclib synced omitted), keep the
+                                    # whisperX TIMESTAMPS but REPLACE
+                                    # their text with the canonical
+                                    # lyrics. Best of both: PROD-grade
+                                    # timing accuracy + correct text.
+                                    is_intro_gap = (g_start <= 0.5)
+                                    rescued_hybrid = []
+                                    if is_intro_gap:
+                                        fa_texts_norm = {
+                                            (s.get("text") or "").strip().lower()
+                                            for s in fa_segs
+                                        }
+                                        plain_lines = [
+                                            l.strip()
+                                            for l in (fa_text or "").splitlines()
+                                            if l.strip()
+                                        ]
+                                        intro_text_lines: list[str] = []
+                                        for ln in plain_lines:
+                                            if ln.lower() in fa_texts_norm:
+                                                break
+                                            intro_text_lines.append(ln)
+                                        if intro_text_lines:
+                                            for c, txt in zip(cand, intro_text_lines):
+                                                rescued_hybrid.append({
+                                                    **c,
+                                                    "text": txt,
+                                                })
+                                    if rescued_hybrid:
+                                        rescued_total.extend(rescued_hybrid)
+                                        logger.info(
+                                            "[LYRICS] gap-rescue HYBRID for [%.1f,%.1f]: kept %d whisperX timestamps + canonical text (guard rejected hallucinated text, preserved timing)",
+                                            g_start, g_end, len(rescued_hybrid),
+                                        )
+                                    else:
+                                        logger.warning("[LYRICS] gap-rescue REJECTED for [%.1f,%.1f]: stuck-phoneme hallucination (%d lines, no ref match)",
+                                                       g_start, g_end, len(cand))
                                     continue
                                 if cand:
                                     rescued_total.extend(cand)
