@@ -6103,8 +6103,20 @@ def _ken_burns_clip(image_path: str, duration: float, spec: RenderSpec | None = 
             scale_base, scale_amp = 1.185, 0.035  # breathes 1.15..1.22
             amp_x, amp_y = 1.0, 0.0
         else:  # subtle
-            scale_base, scale_amp = 1.10, 0.0  # no breath
-            amp_x, amp_y = 0.35, 0.18
+            # Fix urgente 2026-05-25 (UMG: 'los últimos videos salieron
+            # con fotos fijas'). Las amplitudes anteriores (amp_x=0.35,
+            # amp_y=0.18, scale_amp=0.0) producían ~1px/segundo de pan
+            # sobre 60s — visualmente indistinguible de una foto fija.
+            # El operador UMG esperaba 'minimal movement' = perceptible
+            # pero calmo, NO invisible.
+            #
+            # Cambio: 2x el horizontal travel + 2x el vertical drift +
+            # breath sutil de ±1.5% del zoom para que la cámara 'respire'.
+            # Sobre 60s da ~2-3px/seg + breath cycle de ~24s — barely-
+            # there pero PERCEPTIBLE. Operador sigue percibiendo escena
+            # calma sin marcas dramáticas.
+            scale_base, scale_amp = 1.115, 0.015  # breath ~1.10..1.13
+            amp_x, amp_y = 0.65, 0.32
         # Use scale_base for crop dims (cw/ch held constant — breath happens
         # in the FINAL resize step). Computing cw/ch per-frame would break
         # the base_x/base_y precomputation.
