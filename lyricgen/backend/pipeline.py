@@ -7633,7 +7633,16 @@ def generate_lyric_video(
     # al deploy con text_motion legacy también pasen por ASS — antes
     # forzaban moviepy y apagaban silenciosamente lyrics_animation +
     # line_transition.
-    _engine = os.environ.get("LYRIC_RENDER_ENGINE", "moviepy").lower()
+    #
+    # 2026-05-25: default cambiado de "moviepy" → "ass". Razón: moviepy
+    # NO renderiza los templates de lyrics_animation (karaoke/word_reveal/
+    # pop/glow) ni line_transition (slide_up/slide_side/wipe/dissolve_blur).
+    # Solo libass los implementa. El operador reportó que sus selecciones
+    # "no salen en el video" — era esto: el default mandaba todo por
+    # moviepy, ignorando silenciosamente las animaciones. Si libass falla
+    # en runtime, el try/except (líneas ~7664+) cae a moviepy igual.
+    # Override vía env LYRIC_RENDER_ENGINE=moviepy para forzar path viejo.
+    _engine = os.environ.get("LYRIC_RENDER_ENGINE", "ass").lower()
     _bg_is_video = not bg_source.lower().endswith((".jpg", ".jpeg", ".png"))
     _ass_ok_profile = spec.profile in ("youtube", "umg_intermediate")
     if _engine == "ass" and _ass_ok_profile:
