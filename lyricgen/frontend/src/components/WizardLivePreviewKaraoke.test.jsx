@@ -21,7 +21,7 @@ afterEach(cleanup);
 // Harness: simula el flujo de App.jsx escribiendo al ref + el rAF de
 // WizardLivePreview leyéndolo. NO necesitamos LyricsEditor entero —
 // el ref es la única interfaz.
-function _Harness({ initialTick = null, refOut = null }) {
+function _Harness({ initialTick = null, refOut = null, lyricsAnimation = "none" }) {
   const ref = useRef({ activeLine: "", activeStart: 0, activeEnd: 0, currentTime: 0 });
   if (initialTick) ref.current = initialTick;
   if (refOut) refOut.current = ref;
@@ -30,6 +30,7 @@ function _Harness({ initialTick = null, refOut = null }) {
       style="oscuro"
       movementStyle="estatico"
       effect=""
+      lyricsAnimation={lyricsAnimation}
       playbackTickRef={ref}
     />
   );
@@ -101,5 +102,110 @@ describe("WizardLivePreview — Phase C karaoke driven by ref", () => {
       expect(container.textContent).toContain("segunda");
       expect(container.textContent).toContain("diferente");
     }, { timeout: 1000 });
+  });
+});
+
+// Fix 2026-05-25: Phase C antes rendeaba word-jump (color #19E0BC en la
+// palabra activa) sin importar el lyricsAnimation elegido — el operador
+// elegía pop/glow/none/word_reveal y veía karaoke. Estos tests fijan el
+// branching por lyricsAnimation para evitar regresiones.
+describe("WizardLivePreview — Phase C respects lyricsAnimation", () => {
+  // Helper: encuentra el span de una palabra específica del DOM rendeado.
+  const findWordSpan = (container, word) => {
+    return [...container.querySelectorAll("span")].find(
+      (el) => el.textContent.trim() === word && el.children.length === 0,
+    );
+  };
+
+  it("karaoke: active word gets the live highlight color (#19E0BC)", async () => {
+    const refOut = { current: null };
+    const { container } = render(
+      <_Harness refOut={refOut} lyricsAnimation="karaoke" />,
+    );
+    await act(async () => {
+      refOut.current.current = {
+        activeLine: "uno dos tres",
+        activeStart: 0,
+        activeEnd: 3,
+        // currentTime=1.5 → activeWordIdx=1 (= "dos" en una línea de 3 palabras)
+        currentTime: 1.5,
+      };
+      await new Promise((res) => setTimeout(res, 80));
+    });
+    await waitFor(() => expect(container.textContent).toContain("dos"), { timeout: 1000 });
+    const activeSpan = findWordSpan(container, "dos");
+    expect(activeSpan).toBeTruthy();
+    // Inline style.color contiene el highlight color (RGB del #19E0BC).
+    expect(activeSpan.style.color).toMatch(/(19E0BC|25,\s*224,\s*188|0f9b83|15,\s*155,\s*131)/i);
+  });
+
+  it("none: no word-jump styling — line rendered as plain text", async () => {
+    const refOut = { current: null };
+    const { container } = render(
+      <_Harness refOut={refOut} lyricsAnimation="none" />,
+    );
+    await act(async () => {
+      refOut.current.current = {
+        activeLine: "uno dos tres",
+        activeStart: 0,
+        activeEnd: 3,
+        currentTime: 1.5,
+      };
+      await new Promise((res) => setTimeout(res, 80));
+    });
+    await waitFor(() => expect(container.textContent).toContain("dos"), { timeout: 1000 });
+    // No debe haber spans per-word con color #19E0BC (eso es la regresión
+    // que estamos previniendo).
+    const allSpans = [...container.querySelectorAll("span")];
+    const hasKaraokeColor = allSpans.some((el) => /19E0BC|25,\s*224,\s*188/i.test(el.style.color || ""));
+    expect(hasKaraokeColor).toBe(false);
+  });
+
+  it("pop: line rendered plain (the line-level animation runs on the wrapper, not per word)", async () => {
+    const refOut = { current: null };
+    const { container } = render(
+      <_Harness refOut={refOut} lyricsAnimation="pop" />,
+    );
+    await act(async () => {
+      refOut.current.current = {
+        activeLine: "uno dos tres",
+        activeStart: 0,
+        activeEnd: 3,
+        currentTime: 1.5,
+      };
+      await new Promise((res) => setTimeout(res, 80));
+    });
+    await waitFor(() => expect(container.textContent).toContain("dos"), { timeout: 1000 });
+    const allSpans = [...container.querySelectorAll("span")];
+    const hasKaraokeColor = allSpans.some((el) => /19E0BC|25,\s*224,\s*188/i.test(el.style.color || ""));
+    expect(hasKaraokeColor).toBe(false);
+  });
+
+  it("word_reveal: future words have opacity 0 until they're sung", async () => {
+    const refOut = { current: null };
+    const { container } = render(
+      <_Harness refOut={refOut} lyricsAnimation="word_reveal" />,
+    );
+    await act(async () => {
+      refOut.current.current = {
+        activeLine: "uno dos tres cuatro",
+        activeStart: 0,
+        activeEnd: 4,
+        // currentTime=1.5 → activeWordIdx=1 (="dos"); "tres"/"cuatro" deben estar invisibles.
+        currentTime: 1.5,
+      };
+      await new Promise((res) => setTimeout(res, 80));
+    });
+    await waitFor(() => expect(container.textContent).toContain("tres"), { timeout: 1000 });
+    const tresSpan = findWordSpan(container, "tres");
+    const cuatroSpan = findWordSpan(container, "cuatro");
+    expect(tresSpan).toBeTruthy();
+    expect(cuatroSpan).toBeTruthy();
+    // Las palabras futuras tienen opacity 0 inline.
+    expect(tresSpan.style.opacity).toBe("0");
+    expect(cuatroSpan.style.opacity).toBe("0");
+    // La palabra activa "dos" es visible.
+    const dosSpan = findWordSpan(container, "dos");
+    expect(dosSpan.style.opacity).toBe("1");
   });
 });

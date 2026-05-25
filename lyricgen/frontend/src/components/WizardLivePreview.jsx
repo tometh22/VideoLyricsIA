@@ -172,46 +172,78 @@ export default function WizardLivePreview({
     ? livePlaybackTick
     : null;
   let lyricContent;
+  let liveLineKey = null;
   if (liveActive) {
     const segText = liveActive.activeLine;
+    liveLineKey = segText;
     const segStart = liveActive.activeStart;
     const segEnd = liveActive.activeEnd;
     const ct = liveActive.currentTime;
-    const tokens = segText.split(/(\s+)/);
-    const wordsOnly = tokens.filter((tok) => /\S/.test(tok));
-    const N = wordsOnly.length;
-    const dur = Math.max(0.001, segEnd - segStart);
-    const wDur = dur / Math.max(1, N);
-    const elapsed = Math.max(0, ct - segStart);
-    const activeWordIdx = Math.min(N - 1, Math.max(0, Math.floor(elapsed / wDur)));
-    let nonSpaceIdx = -1;
-    lyricContent = tokens.map((tok, i) => {
-      if (!/\S/.test(tok)) return <span key={i}>{tok}</span>;
-      nonSpaceIdx += 1;
-      const wActive = nonSpaceIdx === activeWordIdx;
-      const wPast = nonSpaceIdx < activeWordIdx;
-      return (
-        <span
-          key={i}
-          style={{
-            display: "inline-block",
-            transform: wActive ? "scale(1.10)" : "scale(1)",
-            transformOrigin: "center bottom",
-            color: wActive
-              ? (isMinimal ? "#0f9b83" : "#19E0BC")
-              : wPast
-                ? (isMinimal ? "rgba(0,0,0,0.85)" : "rgba(255,255,255,0.95)")
-                : (isMinimal ? "rgba(0,0,0,0.40)" : "rgba(255,255,255,0.55)"),
-            textShadow: wActive
-              ? (isMinimal ? "0 0 14px rgba(20,200,168,0.6)" : "0 0 14px rgba(25,224,188,0.7)")
-              : "none",
-            transition: "transform 140ms cubic-bezier(.2,1.4,.35,1), color 200ms ease, text-shadow 200ms ease",
-          }}
-        >
-          {tok}
-        </span>
-      );
-    });
+
+    if (lyricsAnimation === "karaoke" || lyricsAnimation === "word_reveal") {
+      // Per-word animations: tokenize the active line and compute which
+      // word is currently being sung. Karaoke colours/scales the active
+      // word; word_reveal makes words appear one-by-one as they're sung.
+      // Other lyricsAnimation values (none/pop/glow) fall through to the
+      // plain-text branch below — the line-level animation runs on the
+      // wrapper instead.
+      const tokens = segText.split(/(\s+)/);
+      const wordsOnly = tokens.filter((tok) => /\S/.test(tok));
+      const N = wordsOnly.length;
+      const dur = Math.max(0.001, segEnd - segStart);
+      const wDur = dur / Math.max(1, N);
+      const elapsed = Math.max(0, ct - segStart);
+      const activeWordIdx = Math.min(N - 1, Math.max(0, Math.floor(elapsed / wDur)));
+      let nonSpaceIdx = -1;
+      lyricContent = tokens.map((tok, i) => {
+        if (!/\S/.test(tok)) return <span key={i}>{tok}</span>;
+        nonSpaceIdx += 1;
+        const wActive = nonSpaceIdx === activeWordIdx;
+        const wPast = nonSpaceIdx < activeWordIdx;
+        if (lyricsAnimation === "word_reveal") {
+          const visible = wActive || wPast;
+          return (
+            <span
+              key={i}
+              style={{
+                display: "inline-block",
+                opacity: visible ? 1 : 0,
+                transform: visible ? "translateY(0)" : "translateY(0.4em)",
+                transition: "opacity 220ms ease, transform 320ms cubic-bezier(.2,.8,.2,1)",
+              }}
+            >
+              {tok}
+            </span>
+          );
+        }
+        return (
+          <span
+            key={i}
+            style={{
+              display: "inline-block",
+              transform: wActive ? "scale(1.10)" : "scale(1)",
+              transformOrigin: "center bottom",
+              color: wActive
+                ? (isMinimal ? "#0f9b83" : "#19E0BC")
+                : wPast
+                  ? (isMinimal ? "rgba(0,0,0,0.85)" : "rgba(255,255,255,0.95)")
+                  : (isMinimal ? "rgba(0,0,0,0.40)" : "rgba(255,255,255,0.55)"),
+              textShadow: wActive
+                ? (isMinimal ? "0 0 14px rgba(20,200,168,0.6)" : "0 0 14px rgba(25,224,188,0.7)")
+                : "none",
+              transition: "transform 140ms cubic-bezier(.2,1.4,.35,1), color 200ms ease, text-shadow 200ms ease",
+            }}
+          >
+            {tok}
+          </span>
+        );
+      });
+    } else {
+      // none / pop / glow: render the active line as plain text. The
+      // wrapper's lineAnim handles entry — replays on line change because
+      // the wrapper key includes liveLineKey.
+      lyricContent = segText;
+    }
   } else if (isWordAnim) {
     lyricContent = sampleWords.map((w, i) => (
       <span
@@ -325,7 +357,7 @@ export default function WizardLivePreview({
         {/* transition wrapper (movement) composes with the inner animation */}
         <div key={`${lineTransition}:${sample}`} style={{ animation: transWrapAnim }}>
           <div
-            key={`${lyricsAnimation}:${sample}`}
+            key={`${lyricsAnimation}:${liveLineKey ?? sample}`}
             className={`font-extrabold tracking-[-0.03em] leading-[1.02] ${isMinimal ? "text-gray-900" : "text-white"}`}
             style={{ fontSize: "clamp(18px,7.5cqw,68px)", textShadow: isMinimal ? "0 1px 0 rgba(255,255,255,.5)" : "-1px -1px 0 rgba(0,0,0,.6), 1px -1px 0 rgba(0,0,0,.6), -1px 1px 0 rgba(0,0,0,.6), 1px 1px 0 rgba(0,0,0,.6)", animation: isWordAnim ? undefined : lineAnim }}
           >
