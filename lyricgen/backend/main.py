@@ -4318,7 +4318,13 @@ async def generate_with_segments(
                 or job_row.user_id != current_user["id"]
                 or job_row.tenant_id != current_user["tenant_id"]):
             raise HTTPException(status_code=404, detail="Job not found.")
-        if job_row.status not in ("transcribed_pending", "awaiting_upload"):
+        # State whitelist for /generate. `transcribed_pending` is what the
+        # transcription worker writes on success (post-2026-05-25 fix);
+        # `transcribed` is accepted defensively for jobs that were written
+        # by the older worker variant that drifted from the convention,
+        # and `awaiting_upload` covers the direct-generate path (no editor).
+        # See transcription_worker.py:137 for the writer side.
+        if job_row.status not in ("transcribed_pending", "transcribed", "awaiting_upload"):
             raise HTTPException(
                 status_code=409,
                 detail=f"Job is in state {job_row.status!r}, cannot generate.",
@@ -5763,8 +5769,12 @@ async def save_segments(
     # done has no pipeline-state side effects. The actual re-render still
     # goes through POST /edit with edit_type="lyrics" which transitions
     # the job to editing.
+    # `transcribed` lives in the whitelist for the same reason as
+    # /generate (see 2026-05-25 worker-state-drift fix): older async
+    # jobs were persisted with status='transcribed' literal. Newer
+    # jobs use 'transcribed_pending'. Editor must work on both.
     _SAVE_SEGMENTS_ALLOWED = (
-        "transcribed_pending", "pending_review", "rejected", "editing", "done",
+        "transcribed_pending", "transcribed", "pending_review", "rejected", "editing", "done",
     )
     if job.status not in _SAVE_SEGMENTS_ALLOWED:
         raise HTTPException(
