@@ -574,91 +574,21 @@ def multipart_complete(
     return key
 
 
-def multipart_abort(key: str, upload_id: str, max_retries: int = 3) -> bool:
-    """Abort an in-flight multipart upload.
-
-    CV2 (audit 2026-05-25): retry con backoff exponencial. Antes era
-    best-effort de un solo intento — si R2 tenía un hiccup transient,
-    el orphan quedaba para siempre en el bucket (R2 charges for storage
-    of incomplete parts hasta el TTL del bucket, típicamente 7 días).
-
-    A escala 2000 vids/mes con 5% abandonment rate → ~3-4 orphans/día
-    × 500MB avg = ~2GB/día waste. La retry mata el 95% de transients.
-
-    Para orphans que sobreviven los retries: el endpoint
-    /admin/orphan-multipart-uploads los lista y permite cleanup manual.
-
-    Returns True si abort fue exitoso, False otherwise.
-    """
-    import time as _time
+def multipart_abort(key: str, upload_id: str) -> bool:
+    """Abort an in-flight multipart upload. Best-effort — returns False
+    if R2 is disabled or the abort fails (the orphan still costs R2
+    storage; the periodic abort sweep cleans it up)."""
     client = _get_client()
     if client is None:
         return False
-    for attempt in range(max_retries):
-        try:
-            client.abort_multipart_upload(
-                Bucket=R2_BUCKET, Key=key, UploadId=upload_id,
-            )
-            if attempt > 0:
-                logger.info(
-                    "[R2] multipart_abort %s succeeded on retry %d",
-                    key, attempt + 1,
-                )
-            return True
-        except Exception as e:
-            # NoSuchUpload = ya fue abortada por otra pasada / completed.
-            # Tratado como success (idempotent — el upload_id ya no existe).
-            if "NoSuchUpload" in str(e) or "Not Found" in str(e):
-                return True
-            if attempt == max_retries - 1:
-                logger.error(
-                    "[R2] multipart_abort %s %s failed after %d retries: %s",
-                    key, upload_id, max_retries, e,
-                )
-                return False
-            wait = 2 ** attempt  # 1s, 2s, 4s
-            logger.warning(
-                "[R2] multipart_abort %s attempt %d failed (%s); retry in %ds",
-                key, attempt + 1, e, wait,
-            )
-            _time.sleep(wait)
-    return False
-
-
-def list_orphan_multipart_uploads(older_than_hours: int = 24) -> list[dict]:
-    """CV2 (audit 2026-05-25): lista multipart uploads en flight con más
-    de `older_than_hours` horas — orphans probables (browser cerrado,
-    job reaped, sin abort exitoso).
-
-    Used by /admin/orphan-multipart-uploads para visibility + cleanup
-    manual. Returns lista de dicts con {key, upload_id, initiated, age_hours}.
-
-    NO abortea automáticamente — solo lista. Caller decide qué borrar.
-    Para cleanup automático cron, ver _delete_abandoned_upload en reaper.py.
-    """
-    from datetime import datetime, timedelta, timezone
-    client = _get_client()
-    if client is None:
-        return []
     try:
-        cutoff = datetime.now(timezone.utc) - timedelta(hours=older_than_hours)
-        out: list[dict] = []
-        paginator = client.get_paginator("list_multipart_uploads")
-        for page in paginator.paginate(Bucket=R2_BUCKET):
-            for u in page.get("Uploads", []) or []:
-                initiated = u.get("Initiated")
-                if initiated and initiated < cutoff:
-                    age_h = (datetime.now(timezone.utc) - initiated).total_seconds() / 3600
-                    out.append({
-                        "key": u["Key"],
-                        "upload_id": u["UploadId"],
-                        "initiated": initiated.isoformat(),
-                        "age_hours": round(age_h, 1),
-                    })
-        return out
+        client.abort_multipart_upload(
+            Bucket=R2_BUCKET, Key=key, UploadId=upload_id,
+        )
+        return True
     except Exception as e:
-        logger.error("[R2] list_orphan_multipart_uploads failed: %s", e)
-        return []
+        logger.error("[R2] multipart_abort %s %s failed: %s", key, upload_id, e)
+        return False
 
 
 def _active_input_keys() -> set[str]:

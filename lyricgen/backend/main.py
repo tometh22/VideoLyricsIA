@@ -1430,78 +1430,17 @@ _TITLE_NOISE_SUFFIXES = (
 )
 
 
-# U11 (audit Sprint 2+ 2026-05-25): known-artists cache para resolver
-# ambigüedad del " - " split. La convención "Artist - Title" del código
-# original asumía un orden, pero ~50% de los downloads reales son
-# "Title - Artist" (export de YouTube/Spotify). Sin contexto DB, el
-# parser elegía mal.
-#
-# Cache TTL: 5min. Reset implícito si el proceso reinicia. Per-tenant
-# para no leak entre clientes. Mantenemos el cache chico (top N por
-# tenant) para que el lookup sea O(N) sin pegar la DB cada vez.
-import time as _u11_time
-_KNOWN_ARTISTS_CACHE: dict[str, tuple[float, set[str]]] = {}
-_KNOWN_ARTISTS_TTL_S = 300  # 5 min
-_KNOWN_ARTISTS_LIMIT = 1000
+def _parse_filename_artist_title(filename: str) -> tuple[str, str]:
+    """Best-effort artist/title extraction from a bare filename. Handles two
+    naming conventions the operator commonly uploads under:
 
+      "Artist - Title.ext"   → ("Artist", "Title")
+      "Title_Artist.ext"     → ("Artist", "Title")   ← Suno/YouTube export form
 
-def _known_artists_for_tenant(db, tenant_id: str) -> set[str]:
-    """Cached lookup of distinct artist strings the tenant ya subió.
-    Used by _parse_filename_artist_title to disambiguate 'X - Y' splits.
-    Returns lowercase set para comparación case-insensitive."""
-    if not tenant_id or db is None:
-        return set()
-    now = _u11_time.time()
-    cached = _KNOWN_ARTISTS_CACHE.get(tenant_id)
-    if cached and (now - cached[0]) < _KNOWN_ARTISTS_TTL_S:
-        return cached[1]
-    try:
-        from database import Job
-        rows = (
-            db.query(Job.artist)
-            .filter(Job.tenant_id == tenant_id)
-            .filter(Job.artist.isnot(None))
-            .filter(Job.artist != "")
-            .distinct()
-            .limit(_KNOWN_ARTISTS_LIMIT)
-            .all()
-        )
-        artists = {r[0].strip().lower() for r in rows if r[0] and r[0].strip()}
-    except Exception:
-        artists = set()
-    _KNOWN_ARTISTS_CACHE[tenant_id] = (now, artists)
-    return artists
-
-
-# Track-number prefix patterns: "01 ", "01-", "01.", "1. ", "01-Title" etc.
-# NO incluye underscore en el class (choca con convención Title_Artist).
-import re as _u11_re
-_TRACK_NUMBER_PREFIX = _u11_re.compile(r"^\s*\d{1,3}[\s\-.]+")
-
-
-def _parse_filename_artist_title(
-    filename: str,
-    *,
-    db=None,
-    tenant_id: str = "",
-) -> tuple[str, str]:
-    """Best-effort artist/title extraction from a bare filename.
-
-    U11 fix (audit 2026-05-25): el código histórico asumía que " - " split
-    significaba "Artist - Title" pero ~50% de los downloads del operador
-    son "Title - Artist" (YouTube / Spotify export convention). Cuando se
-    pasa `db` + `tenant_id`, consultamos los artists conocidos del tenant
-    para elegir el orden correcto. Sin DB, fallback a la heurística histórica.
-
-    Convenciones soportadas:
-      "Artist - Title.ext"  → ("Artist", "Title")   ← convención A (default)
-      "Title - Artist.ext"  → ("Artist", "Title")   ← convención B (con DB lookup)
-      "Title_Artist.ext"    → ("Artist", "Title")   ← YouTube/Suno export
-      "05 Title.ext"        → ("", "Title")         ← track-number prefix stripped
-      "05 - Artist - Title" → handled del mismo modo
-
-    Falls back to ("", basename) cuando no hay separator. El operator UI
-    siempre permite corregir antes de generar.
+    Falls back to ("", basename) when neither separator is present so the
+    caller can decide whether to insist on a manual entry. Studio-version
+    suffixes like "(Official Video)" are stripped from the title in either
+    case so the lrclib lookup matches.
     """
     if not filename:
         return "", ""
@@ -1510,33 +1449,15 @@ def _parse_filename_artist_title(
         if base.lower().endswith(ext):
             base = base[: -len(ext)]
             break
-    # U11: strip leading track number (e.g. "05 Intuicion M" → "Intuicion M").
-    base = _TRACK_NUMBER_PREFIX.sub("", base).strip()
-
     artist, title = "", base.strip()
     if " - " in base:
         head, _, tail = base.partition(" - ")
-        head, tail = head.strip(), tail.strip()
-        # U11: si tenemos contexto DB, decidir qué lado es el artist
-        # consultando known-artists del tenant. Si UNO matchea, ese es
-        # el artist. Si AMBOS o NINGUNO matchean → fallback al default
-        # histórico (head=artist).
-        known = _known_artists_for_tenant(db, tenant_id) if tenant_id else set()
-        head_known = head.lower() in known
-        tail_known = tail.lower() in known
-        if tail_known and not head_known:
-            # "Title - Artist" pattern (operator already used this artist).
-            artist, title = tail, head
-        else:
-            # Default: "Artist - Title" (head=artist) OR ambiguous.
-            artist, title = head, tail
+        artist, title = head.strip(), tail.strip()
     elif "_" in base:
         head, _, tail = base.partition("_")
         title, artist = head.strip(), tail.strip()
     for sfx in _TITLE_NOISE_SUFFIXES:
         title = title.replace(sfx, "").strip()
-    # U11: strip "(1)", "(2)" copy suffixes from title (e.g. "Ser Anti (1)" → "Ser Anti").
-    title = _u11_re.sub(r"\s*\(\d+\)\s*$", "", title).strip()
     return artist, title
 
 
@@ -2353,7 +2274,7 @@ async def upload_url(
 
     artist_form = (body.artist or "").strip()
     title_form = (body.title or "").strip()
-    parsed_artist, parsed_title = _parse_filename_artist_title(body.filename, db=db, tenant_id=current_user.get("tenant_id", ""))
+    parsed_artist, parsed_title = _parse_filename_artist_title(body.filename)
     job_artist = artist_form or parsed_artist or "Unknown"
     job_song_title = title_form or parsed_title
 
@@ -3104,72 +3025,6 @@ async def admin_bg_preview_metrics(
     return get_metrics()
 
 
-# CV2 (audit Sprint 2 2026-05-25) — Multipart upload orphan visibility.
-@app.get("/admin/orphan-multipart-uploads")
-async def admin_list_orphan_multipart(
-    older_than_hours: int = 24,
-    current_user: dict = Depends(get_current_user),
-):
-    """Lista multipart uploads en flight más viejos que `older_than_hours`.
-
-    Browsers que crashean mid-multipart dejan parts acumulados en R2 —
-    incluso después del reaper best-effort abort, hay orphans residuales
-    (R2 transient errors, jobs sin row en DB, etc). Este endpoint da
-    visibilidad para cleanup manual.
-
-    NOTA: 24h es el threshold default; uploads activos típicos tardan
-    minutos. Anything older = abandono real.
-    """
-    if current_user.get("role") != "admin":
-        raise HTTPException(403, detail="Admin only.")
-    from storage import list_orphan_multipart_uploads
-    orphans = list_orphan_multipart_uploads(older_than_hours=older_than_hours)
-    return {
-        "older_than_hours": older_than_hours,
-        "count": len(orphans),
-        "orphans": orphans,
-    }
-
-
-@app.post("/admin/orphan-multipart-uploads/cleanup")
-async def admin_cleanup_orphan_multipart(
-    older_than_hours: int = 24,
-    apply: bool = False,
-    current_user: dict = Depends(get_current_user),
-):
-    """Aborta los multipart uploads orphans listados por GET above.
-
-    `apply=False` (default) → dry-run, retorna lo que abortaría.
-    `apply=true` → realmente aborta.
-
-    Itera el list y llama multipart_abort (con retry interno) por cada
-    orphan. Reporta éxitos / fallas.
-    """
-    if current_user.get("role") != "admin":
-        raise HTTPException(403, detail="Admin only.")
-    from storage import list_orphan_multipart_uploads, multipart_abort
-    orphans = list_orphan_multipart_uploads(older_than_hours=older_than_hours)
-    if not apply:
-        return {
-            "dry_run": True,
-            "would_abort": len(orphans),
-            "orphans": orphans,
-        }
-    aborted = 0
-    failed: list[dict] = []
-    for o in orphans:
-        if multipart_abort(o["key"], o["upload_id"]):
-            aborted += 1
-        else:
-            failed.append({"key": o["key"], "upload_id": o["upload_id"]})
-    return {
-        "dry_run": False,
-        "aborted": aborted,
-        "failed": failed,
-        "total": len(orphans),
-    }
-
-
 @app.get("/generate-preview-status/{job_id}")
 @limiter.limit("600/minute")
 async def generate_preview_status(
@@ -3295,7 +3150,7 @@ async def upload(
     artist = (artist or "").strip()
     song_title = (song_title or "").strip()
     if not artist or not song_title:
-        parsed_artist, parsed_title = _parse_filename_artist_title(file.filename or "", db=db, tenant_id=current_user.get("tenant_id", ""))
+        parsed_artist, parsed_title = _parse_filename_artist_title(file.filename or "")
         if not artist:
             artist = parsed_artist
         if not song_title:
@@ -3466,7 +3321,7 @@ async def transcribe_endpoint(
 
     artist_form = (artist or "").strip()
     title_form = (title or "").strip()
-    parsed_artist, parsed_title = _parse_filename_artist_title(file.filename or "", db=db, tenant_id=current_user.get("tenant_id", ""))
+    parsed_artist, parsed_title = _parse_filename_artist_title(file.filename or "")
     job_artist = artist_form or parsed_artist or "Unknown"
     job_song_title = title_form or parsed_title
 
@@ -4915,34 +4770,6 @@ async def generate_with_segments(
                 or job_row.user_id != current_user["id"]
                 or job_row.tenant_id != current_user["tenant_id"]):
             raise HTTPException(status_code=404, detail="Job not found.")
-        # U2 (audit 2026-05-25) — Idempotency on retry.
-        # Si el browser hace POST /generate, network drop, retry → el
-        # segundo POST llega CON el mismo job_id. Si el primero ya
-        # transicionó a queued/processing/done, retornamos 200 con el
-        # mismo job_id en vez de 409. Esto cierra la brecha de
-        # double-charge UMG (auditoría de breach risk).
-        if job_row.status in ("queued", "processing"):
-            logger.info(
-                "[IDEMPOTENT_GENERATE] job %s ya está en status=%s; "
-                "retorno 200 idempotent (retry detectado).",
-                job_id, job_row.status,
-            )
-            return {
-                "job_id": job_id,
-                "status": job_row.status,
-                "idempotent_replay": True,
-            }
-        if job_row.status in ("done", "pending_review"):
-            logger.info(
-                "[IDEMPOTENT_GENERATE] job %s ya está en status=%s; "
-                "retorno 200 idempotent (retry post-completion).",
-                job_id, job_row.status,
-            )
-            return {
-                "job_id": job_id,
-                "status": job_row.status,
-                "idempotent_replay": True,
-            }
         # State whitelist for /generate. `transcribed_pending` is what the
         # transcription worker writes on success (post-2026-05-25 fix);
         # `transcribed` is accepted defensively for jobs that were written
@@ -4984,7 +4811,7 @@ async def generate_with_segments(
     artist = (artist or "").strip()
     song_title = (song_title or "").strip()
     if not artist or not song_title:
-        parsed_artist, parsed_title = _parse_filename_artist_title(existing_filename or "", db=db, tenant_id=current_user.get("tenant_id", ""))
+        parsed_artist, parsed_title = _parse_filename_artist_title(existing_filename or "")
         if not artist:
             artist = parsed_artist
         if not song_title:

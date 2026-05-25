@@ -81,14 +81,9 @@ def test_generate_veo_video_has_static_branch_with_camera_negatives():
     # The static branch must append explicit camera-motion negatives.
     for neg in ("no pan", "no tilt", "no zoom", "no dolly", "no camera movement"):
         assert neg in src, f"static safe_prompt missing negative '{neg}'"
-    # Audit C2 (2026-05-25): hardening del static prompt — phrasing
-    # cambió a 'LOCKED STATIC TRIPOD shot' (mayúscula, repeated 3×
-    # para fight Veo's drift prior). Case-insensitive match.
-    assert "locked static tripod" in src.lower(), (
-        "static branch must explicitly call out 'locked static tripod' "
-        "phrasing (was 'locked static tripod shot', is now "
-        "'LOCKED STATIC TRIPOD shot' post-C2 hardening)"
-    )
+    # And drop the motion-suggesting 'filmed with cinema camera' phrasing for
+    # static (locked tripod phrasing instead).
+    assert "locked static tripod shot" in src
 
 
 def test_generate_veo_video_accepts_high_fidelity_and_routes_model():
@@ -196,39 +191,13 @@ def test_ensure_background_routes_calm_registers_to_imagen():
 
 def test_ken_burns_pan_modes_have_no_zoom():
     """lateral and subtle are pans over a FIXED inward crop — constant scale, no
-    per-frame zoom (so the camera never advances). static stays frozen.
-
-    Audit B1 (2026-05-25): el lateral mode ahora suma zoom-BREATH sutil
-    (scale anima entre 1.15 y 1.22 con ciclo 32s) — no es 'advance forward',
-    es respiración pulmonar que da sensación de profundidad sin romper la
-    UMG motion policy. El subtle mode sigue 100% sin breath (scale_amp=0).
-
-    Pin la implementación: 'scale_base' debe ser el promedio, 'scale_amp'
-    no-cero para lateral y cero para subtle. NO 'zoom_in' (continuous
-    push-in que sí marearía).
-    """
+    per-frame zoom (so the camera never advances). static stays frozen."""
     src = inspect.getsource(pipeline._ken_burns_clip)
     assert "make_pan_frame" in src
     pan_block = src.split("if not static and (lateral or subtle):")[1].split("\n    if static:")[0]
-    # B1 hardening: scale_base + scale_amp en vez de scale fijo.
-    assert "scale_base" in pan_block, (
-        "lateral pan must use scale_base (B1 zoom-breath base)"
-    )
-    # Lateral: amp_x=1.0 (full horizontal), breath habilitada via scale_amp>0.
-    assert "amp_x, amp_y = 1.0, 0.0" in pan_block, (
-        "lateral must traverse full horizontal room (amp_x=1.0)"
-    )
-    # Subtle: amp_x=0.35 (low), NO breath (scale_amp=0).
-    assert "amp_x, amp_y = 0.35, 0.18" in pan_block, (
-        "subtle must use low horizontal+vertical drift amplitude"
-    )
-    # subtle line: 'scale_base, scale_amp = 1.10, 0.0' — verifica el 0.0
-    # explícito en el tuple assignment del else (subtle) branch.
-    assert "scale_base, scale_amp = 1.10, 0.0" in pan_block, (
-        "subtle must have scale_amp=0.0 (no breath — operator pidió quietud)"
-    )
-    # Continuous zoom-in (would advance forward) NOT allowed.
-    assert "zoom_in" not in pan_block
+    assert "scale, amp_x, amp_y = 1.18" in pan_block  # lateral: full horizontal, fixed scale
+    assert "scale, amp_x, amp_y = 1.10" in pan_block  # subtle: low amplitude, fixed scale
+    assert "zoom_in" not in pan_block                 # no zoom animation in either
 
 
 def test_lateral_pan_is_subpixel_smooth():

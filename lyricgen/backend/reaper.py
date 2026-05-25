@@ -58,12 +58,7 @@ logger = logging.getLogger("genly.reaper")
 _REAPED_STATUS = "error"
 
 # How old a job needs to be before we consider it dead.
-# U10 (audit 2026-05-25): bumped 100→180 (3h). UMG ProRes en pico real
-# tarda 30-90min; margen de 10min era thin. 3h cubre el peor caso
-# (4K@60 con retries Veo) sin abrir ventana de reap-too-late razonable.
-# El worker emite heartbeat explícito en Veo polling (pipeline.py
-# heartbeat()) así el threshold solo importa para SIGKILL real.
-_DEFAULT_THRESHOLD_MIN = int(os.environ.get("REAPER_THRESHOLD_MIN", "180"))
+_DEFAULT_THRESHOLD_MIN = int(os.environ.get("REAPER_THRESHOLD_MIN", "100"))
 
 # Fast-lane threshold for jobs whose latest ai_provenance row is still
 # in-flight (duration_ms NULL). Veo polling, Whisper, Gemini etc. all

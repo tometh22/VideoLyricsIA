@@ -237,107 +237,47 @@ def run_bg_preview_job(job_id: str, bg_cache_key: str, params: dict) -> dict:
 import threading as _threading
 
 # Process-local counters. Suficientes para single-instance; en horizontal
-# CV4 (audit 2026-05-25): counters movidos de in-memory dict → Redis INCR.
-# Con 2+ API replicas (railway.toml numReplicas=2) los counters in-memory
-# eran per-replica → /admin/bg-preview-metrics retornaba números fragmentados
-# (la replica que respondía). Redis INCR es atomic + cluster-aware →
-# numbers agregados consistentes entre todas las replicas.
-#
-# Si Redis no está disponible (dev local sin REDIS_URL): fallback a counters
-# in-memory para no romper el dev loop. Best-effort: cualquier excepción
-# en track_request() o get_metrics() NO debe romper /generate-preview.
-
-# In-memory fallback solo cuando Redis no esté disponible.
-_inmem_lock = _threading.Lock()
-_inmem_metrics = {
+# scale cada API replica reporta los suyos (operator agrega manual via /admin).
+# Sin librería de metrics formal (no hay Prometheus exporter en el stack
+# hoy) — un dict + lock es lo mínimo que rinde.
+_metrics_lock = _threading.Lock()
+_metrics = {
     "requests_total": 0,
     "cache_hits": 0,
     "cache_misses": 0,
+    "last_reset_ts": __import__("time").time(),
 }
-_LAST_RESET_TS = __import__("time").time()
-
-# Redis keys — todos prefijados con "bg_preview:" para no chocar con
-# otros counters de la app (los de queue_jobs usan el suyo).
-_REDIS_KEY_REQUESTS = "bg_preview:requests_total"
-_REDIS_KEY_HITS = "bg_preview:cache_hits"
-_REDIS_KEY_MISSES = "bg_preview:cache_misses"
-
-
-def _redis_client():
-    """Acquire Redis. None si no está configurado o falla. Imports lazy
-    para no pegar Redis en module import (workers que no usan metrics)."""
-    try:
-        import os as _os
-        url = _os.environ.get("REDIS_URL", "").strip()
-        if not url:
-            return None
-        from redis import Redis
-        client = Redis.from_url(url, socket_connect_timeout=2, socket_timeout=2)
-        client.ping()
-        return client
-    except Exception:
-        return None
 
 
 def track_request(cache_hit: bool) -> None:
-    """Bump el counter apropiado. Best-effort: cualquier excepción se traga.
-
-    CV4: Redis INCR primero (cluster-wide); fallback a in-memory si
-    Redis no está disponible.
-    """
+    """Bump el counter apropiado. Thread-safe. Best-effort: cualquier excepción
+    se traga porque no queremos romper /generate-preview por telemetría."""
     try:
-        r = _redis_client()
-        if r is not None:
-            try:
-                r.incr(_REDIS_KEY_REQUESTS)
-                r.incr(_REDIS_KEY_HITS if cache_hit else _REDIS_KEY_MISSES)
-                return
-            except Exception:
-                pass  # fall through to in-memory
-        # Fallback: in-memory (dev sin Redis, o Redis caído).
-        with _inmem_lock:
-            _inmem_metrics["requests_total"] += 1
+        with _metrics_lock:
+            _metrics["requests_total"] += 1
             if cache_hit:
-                _inmem_metrics["cache_hits"] += 1
+                _metrics["cache_hits"] += 1
             else:
-                _inmem_metrics["cache_misses"] += 1
+                _metrics["cache_misses"] += 1
     except Exception:
         pass
 
 
 def get_metrics() -> dict:
-    """Snapshot de las métricas + cache_hit_rate.
-
-    CV4: lee de Redis (cluster-wide). Si Redis falla, lee de in-memory
-    (que solo tiene este proceso, pero no rompe el endpoint).
-    """
-    r = _redis_client()
-    if r is not None:
-        try:
-            total = int(r.get(_REDIS_KEY_REQUESTS) or 0)
-            hits = int(r.get(_REDIS_KEY_HITS) or 0)
-            misses = int(r.get(_REDIS_KEY_MISSES) or 0)
-            source = "redis"
-        except Exception:
-            r = None  # fall through
-    if r is None:
-        with _inmem_lock:
-            total = _inmem_metrics["requests_total"]
-            hits = _inmem_metrics["cache_hits"]
-            misses = _inmem_metrics["cache_misses"]
-        source = "inmem_fallback"
-
-    hit_rate = (hits / total) if total > 0 else 0.0
+    """Snapshot de las métricas + cache_hit_rate. Llamado desde
+    /admin/bg-preview-metrics. Incluye estimación de cost wasted (cada miss
+    gasta $0.80-3.20 según el modelo Veo usado — usamos $1.50 como promedio
+    representative)."""
+    with _metrics_lock:
+        snap = dict(_metrics)
+    total = snap["requests_total"]
+    hit_rate = (snap["cache_hits"] / total) if total > 0 else 0.0
     # Conservador: cada miss = $1.50 (Veo 8s típico). Hit es free desde R2.
-    wasted_cost_usd = round(misses * 1.50, 2)
+    wasted_cost_usd = round(snap["cache_misses"] * 1.50, 2)
     return {
-        "requests_total": total,
-        "cache_hits": hits,
-        "cache_misses": misses,
+        **snap,
         "cache_hit_rate": round(hit_rate, 4),
         "estimated_wasted_cost_usd": wasted_cost_usd,
-        "last_reset_ts": _LAST_RESET_TS,
-        "source": source,
     }
 
 

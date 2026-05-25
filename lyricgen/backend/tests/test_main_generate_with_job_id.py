@@ -177,16 +177,9 @@ def test_generate_with_job_id_rejects_other_users_jobs(client, monkeypatch):
     assert res.status_code == 404
 
 
-def test_generate_with_job_id_idempotent_replay_for_already_promoted(client, monkeypatch):
-    """U2 (audit 2026-05-25) — idempotency on retry.
-
-    Antes: si /generate ya flipped el job a queued, un retry retornaba 409
-    (frontend mostraba error pero el render seguía corriendo → UX rota).
-
-    Ahora: retorna 200 con el mismo job_id + idempotent_replay=True. El
-    operador ve que el render sigue en curso, no se duplica el enqueue.
-    Cierra el riesgo de double-charge UMG en retries por network drop.
-    """
+def test_generate_with_job_id_rejects_already_promoted_jobs(client, monkeypatch):
+    """Once /generate has flipped a row to queued, a duplicate /generate
+    for the same job_id must 409 instead of double-enqueueing."""
     username, token = _make_user(client)
 
     from database import SessionLocal, User
@@ -212,102 +205,7 @@ def test_generate_with_job_id_idempotent_replay_for_already_promoted(client, mon
 
     monkeypatch.setattr(
         "main.enqueue_pipeline",
-        lambda **kw: pytest.fail("must not double-enqueue on idempotent retry"),
-    )
-
-    res = client.post(
-        "/generate",
-        data={
-            "job_id": job_id,
-            "artist": "Intoxicados",
-            "segments_json": "[]",
-            "delivery_profile": "youtube",
-        },
-        headers=auth(token),
-    )
-    # U2: 200 idempotent en vez de 409.
-    assert res.status_code == 200, f"expected 200 idempotent, got {res.status_code}: {res.text}"
-    body = res.json()
-    assert body["job_id"] == job_id
-    assert body["status"] == "queued"
-    assert body["idempotent_replay"] is True
-
-
-def test_generate_with_job_id_idempotent_replay_for_done(client, monkeypatch):
-    """U2: retry post-completion también es idempotent (status=done)."""
-    username, token = _make_user(client)
-
-    from database import SessionLocal, User
-    from jobs import get_job_model
-
-    s = SessionLocal()
-    try:
-        u = s.query(User).filter(User.username == username).first()
-        user_id, tenant_id = u.id, u.tenant_id
-    finally:
-        s.close()
-
-    job_id = _seed_transcribed_pending(user_id, tenant_id)
-
-    s = SessionLocal()
-    try:
-        row = get_job_model(s, job_id)
-        row.status = "done"
-        s.commit()
-    finally:
-        s.close()
-
-    monkeypatch.setattr(
-        "main.enqueue_pipeline",
-        lambda **kw: pytest.fail("must not enqueue on done-job retry"),
-    )
-
-    res = client.post(
-        "/generate",
-        data={
-            "job_id": job_id,
-            "artist": "Intoxicados",
-            "segments_json": "[]",
-            "delivery_profile": "youtube",
-        },
-        headers=auth(token),
-    )
-    assert res.status_code == 200
-    body = res.json()
-    assert body["job_id"] == job_id
-    assert body["status"] == "done"
-    assert body["idempotent_replay"] is True
-
-
-def test_generate_with_job_id_rejects_unrecoverable_states(client, monkeypatch):
-    """Estados que NO son recovery legítimos siguen siendo 409:
-    'error', 'rejected', 'validation_failed' indican que el operador
-    debe usar otro path (retry, /edit, etc.)."""
-    username, token = _make_user(client)
-
-    from database import SessionLocal, User
-    from jobs import get_job_model
-
-    s = SessionLocal()
-    try:
-        u = s.query(User).filter(User.username == username).first()
-        user_id, tenant_id = u.id, u.tenant_id
-    finally:
-        s.close()
-
-    job_id = _seed_transcribed_pending(user_id, tenant_id)
-
-    s = SessionLocal()
-    try:
-        row = get_job_model(s, job_id)
-        row.status = "error"
-        s.commit()
-    finally:
-        s.close()
-
-    monkeypatch.setattr(
-        "main.enqueue_pipeline",
-        lambda **kw: pytest.fail("must not enqueue for error state"),
+        lambda **kw: pytest.fail("must not double-enqueue"),
     )
 
     res = client.post(
