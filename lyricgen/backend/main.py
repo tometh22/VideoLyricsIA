@@ -3545,41 +3545,54 @@ async def _run_transcription_for_job(
             # Intoxicados case) or Whisper's loose timing. Falls back to
             # the existing synced/Whisper logic on any failure.
             #
-            # PR #299 WARM-START (2026-05-24): launch Whisper-1 IN PARALLEL
-            # to FA. If FA wins → cancel the warm task ($0.003 wasted).
-            # If FA fails / hits its 480s budget → the warm task is
-            # already DONE → instant fallthrough to whisper_lrclib
-            # without paying another 8 min of Replicate retries for
-            # whisperX. Cuts worst-case from ~16 min to ~6 min when
-            # Replicate is degraded.
+            # PR #299 WARM-START (2026-05-24, rev 2026-05-25):
+            #
+            # **REV: warm-start uses whisperX, NOT Whisper-1.**
+            #
+            # The original PR #299 launched Whisper-1 in parallel to FA
+            # to cut worst-case wallclock from ~16 min to ~6 min when
+            # Replicate degraded. That worked BUT quality dropped
+            # noticeably: when FA fails (e.g. `[1, 2, 0]` bug on
+            # certain audios), Whisper-1 standalone hallucinates
+            # ("sepa que sepa que sepa", repeticiones, líneas
+            # larguísimas) because it doesn't reconcile against the
+            # lrclib canonical text.
+            #
+            # World-class fix: use **whisperX** as the warm-start.
+            # whisperX gives word-level stamps that we then re-bucket
+            # against the lrclib plain text via
+            # `whisperx_reconcile.reconcile()` — that's timing from
+            # audio + text from reference = the same audio-as-truth
+            # promise PR-G made. NOT a degraded fallback.
+            #
+            # Cost trade-off: whisperX (~75-180s, $0.005) is more
+            # expensive than Whisper-1 (~15-30s, $0.003) but produces
+            # WorldClass output. Worth the ~$0.30/mo extra for UMG-grade
+            # quality vs hallucinated text.
+            #
+            # If whisperX ALSO fails (rare — different Replicate model
+            # than cureau, less likely to flake together), the original
+            # whisper-1 fallback path below kicks in as the true
+            # last-resort.
             import forced_align
+            import whisperx_transcribe
             if forced_align.is_enabled():
                 fa_text = plain or forced_align.lrc_to_plain_text(synced)
-                if fa_text and plain:
-                    # Need `plain` for the warm-start fallback's
-                    # reference_lyrics — skip warm-start when only
-                    # synced is available (rare; FA still runs solo).
+                if fa_text and plain and whisperx_transcribe.is_enabled():
                     await _step("transcribe.align", 55)
                     _aa = await _get_align_audio()
 
-                    # Warm-start Whisper-1 BEFORE blocking on FA. Both
-                    # run via run_in_executor (separate threads) — they
-                    # don't contend on the same socket / connection
-                    # pool.
-                    #
-                    # HOTFIX 2026-05-25 (PR #298 regression): the
-                    # previous code wrapped `loop.run_in_executor(...)`
-                    # in `asyncio.create_task(...)`. That raises
-                    # `TypeError: a coroutine was expected, got <Future>`
-                    # because `run_in_executor` returns a Future, not a
-                    # coroutine. The Future is already scheduled — we
-                    # just hold the reference. `.cancel()` and `await`
-                    # work identically on Futures and Tasks, so the rest
-                    # of the warm-start code is unchanged.
-                    w1_warm_task = loop.run_in_executor(
-                        None,
-                        lambda: transcribe(tmp_path, lang, plain),
-                    )
+                    # Warm-start whisperX in parallel with FA. Both go
+                    # through Replicate but use DIFFERENT models
+                    # (cureau/force-align vs victor-upmeet/whisperx),
+                    # so a model-specific outage in one doesn't usually
+                    # affect the other. We pass the SAME stem path so
+                    # both align against the isolated vocals.
+                    async def _warm_whisperx():
+                        return await asyncio.to_thread(
+                            whisperx_transcribe.transcribe_whisperx, _aa, lang,
+                        )
+                    wx_warm_task = asyncio.create_task(_warm_whisperx())
 
                     fa_segs = None
                     try:
@@ -3587,16 +3600,14 @@ async def _run_transcription_for_job(
                             forced_align.forced_align_lyrics, _aa, fa_text,
                         )
                     except Exception as e:
-                        logger.warning("[LYRICS] forced_align raised: %s — using warm-start Whisper-1", e)
+                        logger.warning("[LYRICS] forced_align raised: %s — using warm-start whisperX", e)
 
                     if fa_segs:
                         logger.info("[LYRICS] forced alignment used (%s lines, lrclib text) for %r - %r", len(fa_segs), artist_hint, song_hint)
-                        # FA won — discard the warm task (await its
-                        # completion silently to avoid the 'never awaited'
-                        # asyncio warning).
-                        w1_warm_task.cancel()
+                        # FA won — discard the warm whisperX task.
+                        wx_warm_task.cancel()
                         try:
-                            await w1_warm_task
+                            await wx_warm_task
                         except (asyncio.CancelledError, Exception):
                             pass
                         from timing_sources import FORCED_ALIGN
@@ -3606,26 +3617,33 @@ async def _run_transcription_for_job(
                             recovery_source="forced_align",
                         )
 
-                    # FA failed/timed out. Use the warm-start Whisper-1
-                    # result — should be done by now (Whisper-1 ~15-30 s,
-                    # FA budget ~480 s). Skip whisperX (also Replicate,
-                    # also likely degraded if FA failed) and go straight
-                    # to the lrclib-plain rendering path.
+                    # FA failed / non-retryable / timed out. Use the
+                    # warm-start whisperX result (likely done by now —
+                    # whisperX is ~75-180s, FA budget is 480s). Reconcile
+                    # against lrclib plain text so the OUTPUT IS WORLDCLASS:
+                    # whisperX gives word-level timing pinned to the audio
+                    # + lrclib plain gives canonical text (no hallucinations).
                     try:
-                        w1_warm_segs = await w1_warm_task
-                        if w1_warm_segs:
-                            logger.info("[LYRICS] FA failed — warm-start Whisper-1 took over with %s segments", len(w1_warm_segs))
+                        wx_warm_segs = await wx_warm_task
+                        if wx_warm_segs and len(wx_warm_segs) >= 2:
                             from pipeline import _filter_whisper_hallucinations
-                            w1_warm_segs, _ = _filter_whisper_hallucinations(w1_warm_segs)
-                            from timing_sources import WHISPER_LRCLIB
+                            wx_warm_segs, _ = _filter_whisper_hallucinations(wx_warm_segs)
+                            import whisperx_reconcile
+                            _reconciled = whisperx_reconcile.reconcile(wx_warm_segs, fa_text) if fa_text else None
+                            final_segs = _reconciled if _reconciled else wx_warm_segs
+                            _src_tag_str = "whisperx_reconciled" if _reconciled else "whisperx"
+                            logger.info("[LYRICS] FA failed — warm-start whisperX took over with %s segments [%s]",
+                                        len(final_segs), _src_tag_str)
+                            from timing_sources import WHISPERX_RECONCILED, WHISPERX
                             return _emit_segments(
-                                w1_warm_segs, WHISPER_LRCLIB,
-                                reference_lyrics=plain,
+                                final_segs,
+                                WHISPERX_RECONCILED if _reconciled else WHISPERX,
+                                reference_lyrics=fa_text if _reconciled else "",
                             )
                     except Exception as e:
-                        logger.warning("[LYRICS] warm-start Whisper-1 also failed: %s — falling through to whisperX", e)
-                    # Both warm + FA failed — continue to whisperX
-                    # fallback path below as the original last-resort.
+                        logger.warning("[LYRICS] warm-start whisperX also failed: %s — falling through to whisper-1", e)
+                    # Both FA + warm whisperX failed — continue to the
+                    # whisper-1 last-resort path below.
                 elif fa_text:
                     # `synced` without `plain` — no warm-start path, run FA solo.
                     await _step("transcribe.align", 55)
