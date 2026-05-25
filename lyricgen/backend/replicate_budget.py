@@ -108,8 +108,18 @@ def call_with_budget(
             logger.warning("[%s] budget exhausted before attempt %s/%s",
                            call_label, attempt + 1, len(backoff))
             break
+        # File-handle hygiene (2026-05-25 audit): `input_factory()` returns
+        # a dict whose values often include `open(audio_path, "rb")` file
+        # handles. Replicate's SDK uploads from them but doesn't guarantee
+        # to close them when done — and on retry/exception they leak
+        # entirely. With concurrent jobs that exhausted the worker's file
+        # descriptor limit ("Too many open files" outages). We collect any
+        # value that implements `.close()` and close them in `finally`
+        # after the call, win or lose.
+        _input = input_factory()
+        _closables = [v for v in _input.values() if hasattr(v, "close") and callable(v.close)]
         try:
-            return replicate.run(model, input=input_factory())
+            return replicate.run(model, input=_input)
         except Exception as e:
             last_err = e
             if is_non_retryable(e):
@@ -118,6 +128,12 @@ def call_with_budget(
                 return None
             logger.warning("[%s] attempt %s/%s failed (%s)",
                            call_label, attempt + 1, len(backoff), e)
+        finally:
+            for _h in _closables:
+                try:
+                    _h.close()
+                except Exception:                # already closed / read-only buffer / etc.
+                    pass
     logger.warning("[%s] exhausted attempts/budget — last_err=%s", call_label, last_err)
     return None
 

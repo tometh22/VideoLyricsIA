@@ -3726,6 +3726,19 @@ async def _run_transcription_for_job(
                         GAP_REFETCH_THRESHOLD_S = 30.0
                         _gap_threshold_inner = 15.0
                         def _gap_score(segs) -> float:
+                            """Sum of gaps > threshold + intro-late penalty.
+                            INCIDENT 2026-05-25 (post-PR #312 audit): the
+                            original only handled positive gaps. When FA
+                            emits overlapping segments (`next.start <
+                            prev.end`, an aligner artefact common with
+                            repeated chorus lines), `gap` is NEGATIVE and
+                            was silently skipped. That meant a song with
+                            lots of overlaps scored 0 — re-fetch never
+                            fired even when forced_align was clearly
+                            confused. Now we treat overlaps > 500 ms as
+                            equally suspicious as a gap of the same size:
+                            both signal "the aligner is in trouble with
+                            this lyric source"."""
                             if not segs:
                                 return 0.0
                             s = sorted(segs, key=lambda x: float(x.get("start") or 0))
@@ -3737,6 +3750,9 @@ async def _run_transcription_for_job(
                                 gap = float(n.get("start") or 0) - float(p.get("end") or 0)
                                 if gap > _gap_threshold_inner:
                                     score += gap
+                                elif gap < -0.5:
+                                    # Overlap > 500 ms → signal of aligner stress.
+                                    score += abs(gap)
                             return score
 
                         gap_score_initial = _gap_score(fa_segs)
@@ -3951,18 +3967,34 @@ async def _run_transcription_for_job(
                         if wx_warm_segs and len(wx_warm_segs) >= 2:
                             from pipeline import _filter_whisper_hallucinations
                             wx_warm_segs, _ = _filter_whisper_hallucinations(wx_warm_segs)
-                            import whisperx_reconcile
-                            _reconciled = whisperx_reconcile.reconcile(wx_warm_segs, fa_text) if fa_text else None
-                            final_segs = _reconciled if _reconciled else wx_warm_segs
-                            _src_tag_str = "whisperx_reconciled" if _reconciled else "whisperx"
-                            logger.info("[LYRICS] FA failed — warm-start whisperX took over with %s segments [%s]",
-                                        len(final_segs), _src_tag_str)
-                            from timing_sources import WHISPERX_RECONCILED, WHISPERX
-                            return _emit_segments(
-                                final_segs,
-                                WHISPERX_RECONCILED if _reconciled else WHISPERX,
-                                reference_lyrics=fa_text if _reconciled else "",
-                            )
+                            # INCIDENT 2026-05-25 (post-PR #308): the
+                            # `is_suspiciously_repetitive` guard was applied
+                            # ONLY in the gap_rescue branch above. The
+                            # FA-failed → whisperX standalone path didn't
+                            # have it, so a Legalícenla retry showed
+                            # ["Le realizan la"] × 4 at the top of the
+                            # transcription. Same guard, same rationale —
+                            # apply it here too. If reconcile fails AND
+                            # raw whisperX looks like a stuck-phoneme
+                            # hallucination, refuse to emit it; the
+                            # whisper-1 fallback path below takes over.
+                            from transcribe_postprocess import is_suspiciously_repetitive
+                            if is_suspiciously_repetitive(wx_warm_segs):
+                                logger.warning("[LYRICS] FA failed AND warm-start whisperX is stuck on a phoneme pattern (%d near-identical lines) — refusing to emit, falling to whisper-1",
+                                               len(wx_warm_segs))
+                            else:
+                                import whisperx_reconcile
+                                _reconciled = whisperx_reconcile.reconcile(wx_warm_segs, fa_text) if fa_text else None
+                                final_segs = _reconciled if _reconciled else wx_warm_segs
+                                _src_tag_str = "whisperx_reconciled" if _reconciled else "whisperx"
+                                logger.info("[LYRICS] FA failed — warm-start whisperX took over with %s segments [%s]",
+                                            len(final_segs), _src_tag_str)
+                                from timing_sources import WHISPERX_RECONCILED, WHISPERX
+                                return _emit_segments(
+                                    final_segs,
+                                    WHISPERX_RECONCILED if _reconciled else WHISPERX,
+                                    reference_lyrics=fa_text if _reconciled else "",
+                                )
                     except Exception as e:
                         logger.warning("[LYRICS] warm-start whisperX also failed: %s — falling through to whisper-1", e)
                     # Both FA + warm whisperX failed — continue to the
@@ -4006,7 +4038,17 @@ async def _run_transcription_for_job(
                         wx_segs, _ = _fwh(wx_segs)
                         _wx_dur = await asyncio.to_thread(_audio_duration, tmp_path)
                         _hall, _why = _detect_hallucination(wx_segs, _wx_dur, language=lang)
-                        if not _hall and len(wx_segs) >= 2:
+                        # Same is_suspiciously_repetitive guard as above:
+                        # whisperX standalone can latch onto a phoneme
+                        # pattern and emit the same garbage line N times.
+                        # `_detect_hallucination` catches some shapes but
+                        # not this one (the lines look plausible
+                        # individually; the bug is the repetition).
+                        from transcribe_postprocess import is_suspiciously_repetitive as _suspicious
+                        if _suspicious(wx_segs):
+                            logger.warning("[LYRICS] lrclib-text whisperX path: stuck-phoneme hallucination detected (%d near-identical lines) — falling through",
+                                           len(wx_segs))
+                        elif not _hall and len(wx_segs) >= 2:
                             # Reconcile: whisperX timing + lrclib canonical text
                             import whisperx_reconcile
                             _reconciled = whisperx_reconcile.reconcile(wx_segs, fa_text_for_wx) if fa_text_for_wx else None
@@ -4018,7 +4060,8 @@ async def _run_transcription_for_job(
                                 final_segs, _src_tag,
                                 reference_lyrics=fa_text_for_wx if _reconciled else "",
                             )
-                        logger.warning("[LYRICS] lrclib-text whisperX rejected (%s) — falling through to plain+Whisper", _why or "thin")
+                        else:
+                            logger.warning("[LYRICS] lrclib-text whisperX rejected (%s) — falling through to plain+Whisper", _why or "thin")
 
             # No synced (or too few segments / unreliable timestamps) — but
             # we still have plain text from lrclib. Use it as the reference
@@ -4395,7 +4438,14 @@ async def _run_transcription_for_job(
                     from pipeline import _filter_whisper_hallucinations as _fwh
                     wx_segs, _ = _fwh(wx_segs)
                     _hall, _why = _detect_hallucination(wx_segs, user_dur, language=lang)
-                    if not _hall and len(wx_segs) >= 2:
+                    # 3rd whisperX path — same `is_suspiciously_repetitive`
+                    # guard as the other two. Catches the stuck-phoneme
+                    # pattern that `_detect_hallucination` misses.
+                    from transcribe_postprocess import is_suspiciously_repetitive as _suspicious
+                    if _suspicious(wx_segs):
+                        logger.warning("[LYRICS] gemini-FA whisperX fallback: stuck-phoneme hallucination detected (%d near-identical lines) — falling through",
+                                       len(wx_segs))
+                    elif not _hall and len(wx_segs) >= 2:
                         # RECONCILIATION: whisperX gave us word-level timing
                         # pinned to the audio; reference (Gemini/lrclib) gives
                         # us curated text with clean line breaks. Re-bucket
@@ -4412,7 +4462,8 @@ async def _run_transcription_for_job(
                             final_segs, _source_tag,
                             reference_lyrics=reference if _reconciled else "",
                         )
-                    logger.warning("[LYRICS] whisperX rejected at gemini-FA fallback (%s) — falling through", _why or "thin")
+                    else:
+                        logger.warning("[LYRICS] whisperX rejected at gemini-FA fallback (%s) — falling through", _why or "thin")
 
             # Plain-lyrics aligner on the Gemini/lyrics.ovh reference —
             # mirrors the lrclib-hit path. Whisper merges/splits lines by
