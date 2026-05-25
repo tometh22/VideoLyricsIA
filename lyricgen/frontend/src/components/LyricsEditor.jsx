@@ -2326,7 +2326,12 @@ export default function LyricsEditor({
                 </p>
                 <div className="relative">
                   <div className="absolute bottom-0 left-0 right-0 h-12 bg-gradient-to-t from-surface to-transparent pointer-events-none z-10 rounded-b-2xl" />
-                  <div ref={listRef} className="space-y-1 max-h-[calc(100vh-280px)] overflow-y-auto pr-1 pb-8">
+                  {/* Phase D 2026-05-25: gap entre rows reducido de 4px (space-y-1)
+                      a 2px (space-y-0.5). En canciones largas de 60+ líneas
+                      esto ahorra ~120px de scroll total. Y como el Phase B
+                      compactó el header (auto-fix pill 32px), max-h ahora
+                      puede crecer (100vh-200 vs 100vh-280 antes). */}
+                  <div ref={listRef} className="space-y-0.5 max-h-[calc(100vh-200px)] overflow-y-auto pr-1 pb-8">
           {edited.map((seg, idx) => {
             const suggestion = suggestionsById[seg._id];
             const isApplied = suggestion && seg.text === suggestion;
