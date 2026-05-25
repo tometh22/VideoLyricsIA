@@ -3422,6 +3422,8 @@ async def _run_transcription_for_job(
         # if a raw `return {"segments": ...}` slips into this function.
         from timing_sources import VALID_TIMING_SOURCES, WHISPER_RAW
         from transcribe_postprocess import normalize_words as _normalize_words
+        from transcribe_postprocess import dedup_collisions as _dedup_collisions
+
         def _emit_segments(segments, source, *,
                             reference_lyrics: str = "",
                             recovery_source=None,
@@ -3437,7 +3439,11 @@ async def _run_transcription_for_job(
             except Exception as e:  # set_timing_source already swallows; defensive
                 logger.warning("[EMIT] set_timing_source(%s, %s) raised: %s",
                                job_id, source, e)
-            polished = _snap(_normalize_words(segments))
+            deduped = _dedup_collisions(segments)
+            if deduped and segments and len(deduped) != len(segments):
+                logger.info("[EMIT] deduped collisions: %d → %d segments (job=%s)",
+                            len(segments), len(deduped), job_id)
+            polished = _snap(_normalize_words(deduped))
             out = {"job_id": job_id, "segments": polished,
                    "reference_lyrics": reference_lyrics}
             if recovery_source:
