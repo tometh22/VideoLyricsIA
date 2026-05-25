@@ -378,6 +378,16 @@ export default function App() {
   const [transcribing, setTranscribing] = useState(false);
   const [transcribeError, setTranscribeError] = useState(null);
 
+  // Phase C 2026-05-25: ref-based playback tick para que el WizardLivePreview
+  // central pueda renderizar la línea activa con word-jump real (sincronizado
+  // al audio) SIN causar re-renders del tree de UploadZone a 60fps. El ref
+  // se actualiza desde el rAF loop de LyricsEditor; WizardLivePreview lo
+  // lee con su propio rAF.
+  const playbackTickRef = useRef({ activeLine: "", activeStart: 0, activeEnd: 0, currentTime: 0 });
+  const handlePlaybackTick = useCallback((line, start, end, time) => {
+    playbackTickRef.current = { activeLine: line, activeStart: start, activeEnd: end, currentTime: time };
+  }, []);
+
   // Phase 2 (2026-05-25): sync de typography settings cuando el operador
   // cambia font/case/animation desde el paso 4 del wizard MIENTRAS está
   // en review (paso 6 inactivo). updateBatchDefault en UploadZone fanea
@@ -1854,6 +1864,11 @@ export default function App() {
         // Phase 3: pasar segments al WizardLivePreview central para que
         // muestre una línea real de la canción que se está revisando.
         reviewSegments={currentReview?.segments || null}
+        // Phase C 2026-05-25: ref-based tick para que el WizardLivePreview
+        // central renderice la línea ACTIVA (no la primera) con word-jump
+        // sincronizado al audio. Sin re-renders en App.jsx — el preview lee
+        // el ref con su propio rAF loop.
+        playbackTickRef={playbackTickRef}
       />
     </div>
   );
@@ -1991,6 +2006,10 @@ export default function App() {
             // animation/contrast. Layout colapsa a 1 columna (timeline +
             // lista a ancho completo).
             hideTypographyControls={true}
+            // Phase C 2026-05-25: callback que sincroniza el preview central
+            // con la línea que está sonando ahora. Actualiza un ref para no
+            // disparar re-renders a 60fps.
+            onPlaybackTick={handlePlaybackTick}
           />
         </div>
       );

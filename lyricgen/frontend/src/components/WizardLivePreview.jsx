@@ -1,3 +1,4 @@
+import { useEffect, useRef, useState } from "react";
 import { useI18n } from "../i18n";
 
 // Studio Console live preview. Shows a sample lyric line over the selected
@@ -32,8 +33,57 @@ const MOVE_ANIM = {
   animado:        "wlp-anim 1.8s linear infinite",
 };
 
-export default function WizardLivePreview({ style = "auto", customColors = "", movementStyle = "", effect = "", lyricsAnimation = "none", lineTransition = "none", mode = "lyrics", lyric, clipSrc = "/movement_samples/estandar.mp4" }) {
+export default function WizardLivePreview({
+  style = "auto",
+  customColors = "",
+  movementStyle = "",
+  effect = "",
+  lyricsAnimation = "none",
+  lineTransition = "none",
+  mode = "lyrics",
+  lyric,
+  clipSrc = "/movement_samples/estandar.mp4",
+  // Phase C 2026-05-25: ref que recibe playback tick desde LyricsEditor.
+  // Cuando el operador clickea play en el editor (paso 6), el ref publica
+  // {activeLine, activeStart, activeEnd, currentTime} a 60fps. Lo leemos
+  // con nuestro propio rAF para renderizar word-jump real sincronizado al
+  // audio, sin disparar re-renders en App.jsx/UploadZone.
+  playbackTickRef = null,
+}) {
   const { t } = useI18n();
+  // Phase C: estado local del tick. Inicializa vacío; el rAF interno lo
+  // actualiza periodicamente desde playbackTickRef. setState dispara
+  // re-render del preview, NO de los componentes padres (gracias al ref).
+  const [livePlaybackTick, setLivePlaybackTick] = useState(null);
+  const lastTickRef = useRef({ activeLine: "", currentTime: -1 });
+  useEffect(() => {
+    if (!playbackTickRef) return undefined;
+    let raf = 0;
+    const loop = () => {
+      const tick = playbackTickRef.current;
+      if (tick && tick.activeLine) {
+        // Solo dispara setState si cambió la línea activa o el currentTime
+        // se movió >40ms (suficiente para word-jump perceptible, ~25Hz).
+        // Sin este guard, setState a 60fps haría thrashing.
+        const last = lastTickRef.current;
+        if (
+          tick.activeLine !== last.activeLine ||
+          Math.abs(tick.currentTime - last.currentTime) > 0.04
+        ) {
+          lastTickRef.current = { activeLine: tick.activeLine, currentTime: tick.currentTime };
+          setLivePlaybackTick({ ...tick });
+        }
+      } else if (livePlaybackTick !== null) {
+        // El operador pausó/paró el audio — limpiar para volver al loop sample.
+        lastTickRef.current = { activeLine: "", currentTime: -1 };
+        setLivePlaybackTick(null);
+      }
+      raf = requestAnimationFrame(loop);
+    };
+    raf = requestAnimationFrame(loop);
+    return () => cancelAnimationFrame(raf);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [playbackTickRef]);
   const isAnimado = movementStyle === "animado";
   // With an effect active, compose it over a CALM, neutral premium scene (not
   // the movement-sample clip) so particles never clash with a busy scene like
@@ -98,25 +148,76 @@ export default function WizardLivePreview({ style = "auto", customColors = "", m
   // on both dark and light (minimal) palettes.
   const dim = isMinimal ? "rgba(0,0,0,.34)" : "rgba(255,255,255,.4)";
   const lit = isMinimal ? "#0f9b83" : "#19E0BC";
-  const lyricContent = isWordAnim
-    ? sampleWords.map((w, i) => (
+  // Phase C 2026-05-25: cuando hay un livePlaybackTick activo (audio
+  // reproduciendo en el editor), el preview muestra la línea REAL con
+  // word-jump driven por currentTime — mismo style que el list view del
+  // editor para mantener coherencia visual. Sin tick, fallback al loop
+  // sample del modo legacy.
+  const liveActive = livePlaybackTick && livePlaybackTick.activeLine
+    ? livePlaybackTick
+    : null;
+  let lyricContent;
+  if (liveActive) {
+    const segText = liveActive.activeLine;
+    const segStart = liveActive.activeStart;
+    const segEnd = liveActive.activeEnd;
+    const ct = liveActive.currentTime;
+    const tokens = segText.split(/(\s+)/);
+    const wordsOnly = tokens.filter((tok) => /\S/.test(tok));
+    const N = wordsOnly.length;
+    const dur = Math.max(0.001, segEnd - segStart);
+    const wDur = dur / Math.max(1, N);
+    const elapsed = Math.max(0, ct - segStart);
+    const activeWordIdx = Math.min(N - 1, Math.max(0, Math.floor(elapsed / wDur)));
+    let nonSpaceIdx = -1;
+    lyricContent = tokens.map((tok, i) => {
+      if (!/\S/.test(tok)) return <span key={i}>{tok}</span>;
+      nonSpaceIdx += 1;
+      const wActive = nonSpaceIdx === activeWordIdx;
+      const wPast = nonSpaceIdx < activeWordIdx;
+      return (
         <span
           key={i}
           style={{
             display: "inline-block",
-            marginRight: i < sampleWords.length - 1 ? "0.26em" : 0,
-            "--dim": dim,
-            "--lit": lit,
-            animation:
-              lyricsAnimation === "word_reveal"
-                ? `wlp-reveal-loop 3s ${i * 0.22}s infinite both`
-                : `wlp-karaoke-sweep 2.8s ${i * 0.24}s infinite both`,
+            transform: wActive ? "scale(1.10)" : "scale(1)",
+            transformOrigin: "center bottom",
+            color: wActive
+              ? (isMinimal ? "#0f9b83" : "#19E0BC")
+              : wPast
+                ? (isMinimal ? "rgba(0,0,0,0.85)" : "rgba(255,255,255,0.95)")
+                : (isMinimal ? "rgba(0,0,0,0.40)" : "rgba(255,255,255,0.55)"),
+            textShadow: wActive
+              ? (isMinimal ? "0 0 14px rgba(20,200,168,0.6)" : "0 0 14px rgba(25,224,188,0.7)")
+              : "none",
+            transition: "transform 140ms cubic-bezier(.2,1.4,.35,1), color 200ms ease, text-shadow 200ms ease",
           }}
         >
-          {w}
+          {tok}
         </span>
-      ))
-    : sample;
+      );
+    });
+  } else if (isWordAnim) {
+    lyricContent = sampleWords.map((w, i) => (
+      <span
+        key={i}
+        style={{
+          display: "inline-block",
+          marginRight: i < sampleWords.length - 1 ? "0.26em" : 0,
+          "--dim": dim,
+          "--lit": lit,
+          animation:
+            lyricsAnimation === "word_reveal"
+              ? `wlp-reveal-loop 3s ${i * 0.22}s infinite both`
+              : `wlp-karaoke-sweep 2.8s ${i * 0.24}s infinite both`,
+        }}
+      >
+        {w}
+      </span>
+    ));
+  } else {
+    lyricContent = sample;
+  }
 
   // Line transition (movement) plays on a wrapper so it composes with the
   // inner animation. Loops continuously so it stays visible in the preview.

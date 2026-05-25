@@ -336,6 +336,14 @@ export default function LyricsEditor({
   // siempre.
   hideTypographyControls = false,
   hideInternalPreview = false,
+  // Phase C 2026-05-25: callback que publica el tick de playback hacia
+  // el padre (App.jsx). El padre típicamente escribe en un ref para
+  // que el WizardLivePreview central pueda leerlo sin pasar por
+  // setState (evita re-renders a 60fps del tree de UploadZone).
+  // Firma: (activeLineText, activeStart, activeEnd, currentTime).
+  // Se llama dentro del rAF loop existente (60fps). El consumer es
+  // responsable de throttle si necesario.
+  onPlaybackTick = null,
 }) {
   const { t } = useI18n();
   const [edited, setEdited] = useState(() =>
@@ -537,7 +545,25 @@ export default function LyricsEditor({
     const tick = () => {
       const a = audioRef.current;
       if (a && !a.paused) {
-        setCurrentTime(a.currentTime);
+        const ct = a.currentTime;
+        setCurrentTime(ct);
+        // Phase C 2026-05-25: publish playback tick al padre. Buscar el
+        // segment activo aquí (no usar activeId del scope porque cambia
+        // con setState async). Si el padre pasó onPlaybackTick, le
+        // notificamos el segmento activo + currentTime para que el
+        // WizardLivePreview central pueda hacer word-jump real.
+        if (onPlaybackTick) {
+          let active = null;
+          for (const s of edited) {
+            if (ct >= s.start && ct < s.end) { active = s; break; }
+            if (ct >= s.start) active = s;
+          }
+          if (active) {
+            onPlaybackTick(active.text || "", active.start, active.end, ct);
+          } else {
+            onPlaybackTick("", 0, 0, ct);
+          }
+        }
       }
       rafRef.current = requestAnimationFrame(tick);
     };
@@ -546,7 +572,8 @@ export default function LyricsEditor({
       if (rafRef.current) cancelAnimationFrame(rafRef.current);
       rafRef.current = null;
     };
-  }, [isPlaying]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [isPlaying, edited, onPlaybackTick]);
   const [wrapWarning, setWrapWarning] = useState(null); // {ids: [...]} for 3+ line segs
   const [focusedSegId, setFocusedSegId] = useState(null); // for preview panel
 

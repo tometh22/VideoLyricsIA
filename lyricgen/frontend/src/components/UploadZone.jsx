@@ -156,6 +156,12 @@ export default function UploadZone({
   // vez del título genérico — el operador ve cómo se va a ver el video
   // con su propia letra durante toda la review.
   reviewSegments = null,
+  // Phase C 2026-05-25: ref que apunta a {activeLine, activeStart, activeEnd,
+  // currentTime}. Cuando el operador clickea play en LyricsEditor (paso 6),
+  // el ref se actualiza a 60fps con la línea que está sonando. El
+  // WizardLivePreview lo lee con su propio rAF para renderizar word-jump
+  // sincronizado al audio real, sin causar re-renders de UploadZone.
+  playbackTickRef = null,
 }) {
   const { t } = useI18n();
   const inputRef = useRef();
@@ -1860,6 +1866,12 @@ export default function UploadZone({
               mode={sceneMode}
               lyric={_previewLyric}
               clipSrc={(MOVEMENT_STYLES.find((m) => m.code === (hoverMovement ?? batchDefaults.movementStyle))?.sample) || "/movement_samples/estandar.mp4"}
+              /* Phase C 2026-05-25: el ref de playback tick permite al
+                 preview leer la línea activa + currentTime para hacer
+                 word-jump real cuando el operador está reproduciendo el
+                 audio en la review (step 6). Sin el ref, el preview cae
+                 al modo legacy (lyric loop con `_previewLyric`). */
+              playbackTickRef={playbackTickRef}
             />
           ) : (
             <div className="aspect-video rounded-2xl ring-1 ring-white/[0.08] bg-surface-2/50 grid place-items-center text-gray-500 text-[13px]">
