@@ -700,16 +700,16 @@ def run_pipeline(job_id: str, mp3_path: str, artist: str, style: str,
             _new_rp["bg_verbatim"] = True
         if custom_colors:
             _new_rp["custom_colors"] = custom_colors
+        # U5 (audit 2026-05-25): merge atómico vía jobs.merge_render_params.
+        # El read-then-write fuera de un row lock dejaba race: 2 callers
+        # concurrentes (worker + /edit endpoint, o 2 /edit calls) podían
+        # pisarse mutuamente. merge_render_params hace SELECT FOR UPDATE
+        # + read + write en UNA tx.
         try:
-            from database import SessionLocal as _SL_rp, Job as _Job_rp
-            with _SL_rp() as _db_rp:
-                _row_rp = _db_rp.query(_Job_rp).filter(_Job_rp.job_id == job_id).first()
-                _merged_rp = dict(_row_rp.render_params) if (_row_rp and isinstance(_row_rp.render_params, dict)) else {}
+            from jobs import merge_render_params
+            merge_render_params(job_id, _new_rp)
         except Exception as _rp_exc:
-            logger.warning("[BG] could not read existing render_params for merge: %s", _rp_exc)
-            _merged_rp = {}
-        _merged_rp.update(_new_rp)
-        update_job(job_id, render_params=_merged_rp)
+            logger.warning("[BG] merge_render_params failed: %s", _rp_exc)
 
         # Cache AI-generated background to R2 so a typography-only edit
         # can re-use it without another Veo call ($0.80 saved per edit).
