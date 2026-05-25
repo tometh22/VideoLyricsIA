@@ -44,6 +44,86 @@ def is_enabled() -> bool:
     return flag and bool(os.environ.get("REPLICATE_API_TOKEN", "").strip())
 
 
+# ──────────────────────────────────────────────────────────────────────
+# Cache helpers (2026-05-25). Content-addressable, on-disk DB. Same
+# audio + same language + same lyrics_hint → same whisperX output, so
+# cache hits return instantly instead of paying ~$0.005 + 75-180 s per
+# Replicate inference.
+# ──────────────────────────────────────────────────────────────────────
+
+def _compute_cache_key(audio_path: str, language: str | None, lyrics_hint: str | None):
+    """Return (cache_key, audio_hash, lyrics_hint_hash) — or (None, None, None)
+    on read error (cache effectively disabled for this call).
+
+    audio_hash is sha256 of the file bytes (first 16 hex chars; chunked
+    1 MB reads to avoid loading a 60 MB WAV into RAM). lyrics_hint_hash
+    is sha1 of the (trimmed) hint or "" if no hint. Both contribute to
+    cache_key because each changes the output deterministically.
+    """
+    import hashlib
+    try:
+        h = hashlib.sha256()
+        with open(audio_path, "rb") as f:
+            for chunk in iter(lambda: f.read(1024 * 1024), b""):
+                h.update(chunk)
+        audio_hash = h.hexdigest()[:16]
+    except Exception:
+        return (None, None, None)
+    hint = (lyrics_hint or "").strip()
+    hint_hash = hashlib.sha1(hint.encode("utf-8")).hexdigest()[:16] if hint else ""
+    lang = (language or "").lower()
+    key = f"wx:{audio_hash}:{lang}:{hint_hash}"
+    return (key, audio_hash, hint_hash)
+
+
+def _cache_lookup(cache_key: str) -> list[dict] | None:
+    """Return cached segments for `cache_key`, or None on miss / error.
+    Errors are swallowed — cache is best-effort, the path falls through
+    to the live Replicate call."""
+    try:
+        from database import TranscriptionCache, SessionLocal
+        import json
+        db = SessionLocal()
+        try:
+            row = db.query(TranscriptionCache).filter(
+                TranscriptionCache.cache_key == cache_key
+            ).first()
+            if not row:
+                return None
+            return json.loads(row.segments)
+        finally:
+            db.close()
+    except Exception as e:
+        logger.warning("[WHISPERX] cache lookup failed (%s); will run live", e)
+        return None
+
+
+def _cache_write(cache_key: str, audio_hash: str, lyrics_hint_hash: str,
+                 language: str | None, segments: list[dict]) -> None:
+    """Persist `segments` under `cache_key`. Swallows all errors — a
+    failed write must not break the request that just succeeded."""
+    try:
+        from database import TranscriptionCache, SessionLocal
+        from sqlalchemy.dialects.postgresql import insert as pg_insert
+        import json
+        db = SessionLocal()
+        try:
+            row = TranscriptionCache(
+                cache_key=cache_key,
+                audio_hash=audio_hash,
+                engine="whisperx",
+                language=(language or "")[:8] or None,
+                lyrics_hint_hash=lyrics_hint_hash or None,
+                segments=json.dumps(segments),
+            )
+            db.merge(row)   # idempotent upsert (cache_key is PK)
+            db.commit()
+        finally:
+            db.close()
+    except Exception as e:
+        logger.warning("[WHISPERX] cache write failed (%s); ignoring", e)
+
+
 def _map_segments(output) -> list[dict]:
     """Map whisperX output to our segment shape. Pure + testable.
 
@@ -267,6 +347,21 @@ def transcribe_whisperx(audio_path: str, language: str | None = None,
         logger.warning("[WHISPERX] replicate SDK not installed — falling back")
         return None
 
+    # 2026-05-25 — Content-addressable cache. Same audio + same language
+    # + same lyrics_hint = same whisperX output deterministically. Ahorra
+    # ~$0.005 + 75-180 s en cualquier re-corrida (operador re-subiendo,
+    # job retry, regenera tras edit). Cache miss corre normal + write.
+    # Errores en cache son swallowed — el path original sigue intacto.
+    cache_key, audio_hash, hint_hash = _compute_cache_key(audio_path, language, lyrics_hint)
+    if cache_key:
+        cached_segs = _cache_lookup(cache_key)
+        if cached_segs is not None:
+            logger.info(
+                "[WHISPERX] cache hit audio_hash=%s (%d segs, $0 + 0 s vs ~75-180 s + $0.005)",
+                audio_hash, len(cached_segs),
+            )
+            return cached_segs
+
     payload: dict = {"align_output": True}
     if language:
         payload["language"] = language
@@ -336,4 +431,9 @@ def transcribe_whisperx(audio_path: str, language: str | None = None,
                        raw_n, len(segs))
         return None
     logger.info("[WHISPERX] transcribed %s segments (%s raw, after ghost-filter + split)", len(segs), raw_n)
+
+    # Persist result for future identical calls. Errors silenced inside.
+    if cache_key:
+        _cache_write(cache_key, audio_hash, hint_hash, language, segs)
+
     return segs

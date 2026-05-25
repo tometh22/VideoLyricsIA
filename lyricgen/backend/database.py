@@ -821,6 +821,35 @@ class LyricsCache(Base):
     fetched_by_model = Column(String(64), nullable=True)
 
 
+class TranscriptionCache(Base):
+    """Cache de outputs de inferencia ASR (whisperX en Replicate) keyed
+    por audio content hash + engine + language + lyrics_hint hash.
+
+    Motivación 2026-05-25 (UMG dry-run): el operador re-subió el mismo
+    archivo 2x durante diagnóstico y cada vez whisperX corrió 75-180s
+    sin razón. Mismo audio + misma config → mismo output determinístico.
+    Cachear evita la 2da llamada a Replicate (~$0.005 + 75-180s).
+
+    Diseño:
+    - `cache_key` encode las variables que afectan el output: audio
+      content hash + engine + language + lyrics_hint hash (porque el
+      initial_prompt cambia la transcripción).
+    - `segments` guarda el JSON de output del modelo (sin tocar) —
+      caller hace json.loads.
+    - Sin TTL hard (reaper barre después por age si crece la tabla;
+      por ahora un cache hit ahorra ~$0.005 + 75 s, valor positivo).
+    """
+    __tablename__ = "transcription_cache"
+
+    cache_key = Column(String(64), primary_key=True)
+    audio_hash = Column(String(32), nullable=False, index=True)
+    engine = Column(String(20), nullable=False)           # "whisperx" | "fa" (futuro)
+    language = Column(String(8), nullable=True)
+    lyrics_hint_hash = Column(String(16), nullable=True)
+    segments = Column(Text, nullable=False)               # JSON serializado
+    created_at = Column(DateTime(timezone=True), default=utcnow, index=True)
+
+
 class SalesLead(Base):
     """Public sales/contact form submissions from the landing page.
     Captured by the unauthenticated POST /api/leads endpoint and also
