@@ -22,13 +22,6 @@ from __future__ import annotations
 # or Gemini reference passed through cureau forced aligner).
 FORCED_ALIGN = "forced_align"
 
-# lrclib synced as-is. The community-curated LRC has per-line timestamps
-# that, when `_verify_lrclib_alignment` confirms the first line matches
-# the audio (~5.5 s slice + Whisper-quick check), are accurate enough
-# to skip forced_align + whisperX entirely. ~75-180 s saved per job.
-# Behind `LRCLIB_FAST_PATH=1` env flag (2026-05-25 velocity sprint).
-LRCLIB_SYNCED = "lrclib_synced"
-
 # whisperX word-level timing + canonical reference text from lrclib/Gemini.
 # The reconcile step re-buckets whisperX words into the reference's line
 # structure, giving timing-from-audio with orthography-from-reference.
@@ -63,7 +56,6 @@ WHISPER_RAW = "whisper_raw"
 
 VALID_TIMING_SOURCES = frozenset({
     FORCED_ALIGN,
-    LRCLIB_SYNCED,
     WHISPERX_RECONCILED,
     WHISPERX,
     WHISPER_LRCLIB,

@@ -41,9 +41,16 @@ def _force_enabled():
 
 @pytest.fixture
 def fake_audio():
-    """A real temp file so the `os.path.exists` guard passes."""
+    """A real temp file so the `os.path.exists` guard passes.
+
+    NOTE: writes RANDOM bytes (not a fixed RIFF stub) so every call
+    produces a different content hash. PR-3 (whisperX cache 2026-05-25)
+    keys by audio content sha256 — without unique bytes, two tests
+    sharing the same fake audio would short-circuit on cache hit and
+    `replicate.run` mock would never be invoked, breaking call_args
+    assertions."""
     f = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
-    f.write(b"RIFF$\x00\x00\x00WAVEfmt ")     # minimal header, not real audio
+    f.write(b"RIFF$\x00\x00\x00WAVEfmt " + os.urandom(64))
     f.close()
     yield f.name
     try:
@@ -135,18 +142,30 @@ def test_initial_prompt_extracts_first_seed_lines(fake_audio):
     assert len(sent) <= 120
 
 
-def test_initial_prompt_skipped_when_empty_string(fake_audio):
+def test_initial_prompt_skipped_when_empty_string(tmp_path):
     """Empty / whitespace-only hint should NOT leak an empty initial_prompt
     into the payload (would tell whisperX 'expect nothing', which biases
-    AGAINST any reasonable transcription)."""
+    AGAINST any reasonable transcription).
+
+    NOTE: needs two DISTINCT audio files because PR-3 (whisperX cache
+    2026-05-25) keys by content sha256 + lang + hint_hash. Both calls
+    here have the same hint_hash (empty string after .strip()), so
+    reusing the same audio would cache-hit the 2nd call and break the
+    mock assertion.
+    """
     wx = _force_enabled()
+    audio_a = tmp_path / "a.wav"
+    audio_a.write_bytes(b"RIFF$\x00\x00\x00WAVEfmt " + os.urandom(64))
+    audio_b = tmp_path / "b.wav"
+    audio_b.write_bytes(b"RIFF$\x00\x00\x00WAVEfmt " + os.urandom(64))
+
     with patch("replicate.run", _mock_replicate_run()) as m:
-        wx.transcribe_whisperx(fake_audio, language="es", lyrics_hint="")
+        wx.transcribe_whisperx(str(audio_a), language="es", lyrics_hint="")
     _, kwargs = m.call_args
     assert "initial_prompt" not in kwargs["input"]
 
     with patch("replicate.run", _mock_replicate_run()) as m:
-        wx.transcribe_whisperx(fake_audio, language="es", lyrics_hint="   \n  ")
+        wx.transcribe_whisperx(str(audio_b), language="es", lyrics_hint="   \n  ")
     _, kwargs = m.call_args
     assert "initial_prompt" not in kwargs["input"]
 
