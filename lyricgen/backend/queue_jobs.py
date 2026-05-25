@@ -71,11 +71,59 @@ PRORES_PREWARM_MAX_QUEUE_DEPTH = int(
     os.environ.get("PRORES_PREWARM_MAX_QUEUE_DEPTH", "15")
 )
 
-# Counter exposed via /health so operators can see when prewarm is
-# being throttled. Process-local — fine for single-instance, ok-ish for
-# horizontal scale (each instance reports its own count).
-prewarm_skipped_total = 0
+# CV4 (audit 2026-05-25): counters movidos a Redis (cluster-wide).
+# Antes eran process-local — con 2+ replicas API cada una reportaba la
+# suya; el /health endpoint mostraba inconsistencias. Redis INCR es
+# atomic + visible para todas las replicas.
+# Fallback a counters in-process si Redis no está disponible (dev local).
+prewarm_skipped_total = 0   # legacy — kept para back-compat en logs
 prewarm_enqueued_total = 0
+_PREWARM_REDIS_KEY_SKIPPED = "queue_jobs:prewarm_skipped_total"
+_PREWARM_REDIS_KEY_ENQUEUED = "queue_jobs:prewarm_enqueued_total"
+
+
+def _bump_prewarm_counter(skipped: bool) -> None:
+    """CV4 helper: bump Redis counter; fallback a process-local si Redis falla.
+    Best-effort — exceptions get swallowed (no romper enqueue).
+    """
+    global prewarm_skipped_total, prewarm_enqueued_total
+    try:
+        r, _, _ = _init_redis()
+        if r is not None:
+            try:
+                r.incr(_PREWARM_REDIS_KEY_SKIPPED if skipped else _PREWARM_REDIS_KEY_ENQUEUED)
+                return
+            except Exception:
+                pass  # fall through
+    except Exception:
+        pass
+    # Fallback in-process.
+    if skipped:
+        prewarm_skipped_total += 1
+    else:
+        prewarm_enqueued_total += 1
+
+
+def get_prewarm_counters() -> dict:
+    """Snapshot de los counters cluster-wide (Redis) o in-process fallback."""
+    try:
+        r, _, _ = _init_redis()
+        if r is not None:
+            try:
+                return {
+                    "skipped": int(r.get(_PREWARM_REDIS_KEY_SKIPPED) or 0),
+                    "enqueued": int(r.get(_PREWARM_REDIS_KEY_ENQUEUED) or 0),
+                    "source": "redis",
+                }
+            except Exception:
+                pass
+    except Exception:
+        pass
+    return {
+        "skipped": prewarm_skipped_total,
+        "enqueued": prewarm_enqueued_total,
+        "source": "inmem_fallback",
+    }
 
 _redis = None
 _queue_default = None
@@ -577,7 +625,7 @@ def enqueue_prores_prewarm(job_id: str, file_type: str) -> str | None:
     except Exception:
         depth = 0
     if depth > PRORES_PREWARM_MAX_QUEUE_DEPTH:
-        prewarm_skipped_total += 1
+        _bump_prewarm_counter(skipped=True)  # CV4: Redis or in-process fallback
         logger.warning(
             "[PRORES] prewarm: queue depth %d > %d; skipping prewarm for %s/%s "
             "(lazy /download will handle it on first click)",
@@ -594,7 +642,7 @@ def enqueue_prores_prewarm(job_id: str, file_type: str) -> str | None:
         # no-op (RQ dedupes by job_id within a queue).
         job_id=f"prewarm:{job_id}:{file_type}",
     )
-    prewarm_enqueued_total += 1
+    _bump_prewarm_counter(skipped=False)  # CV4
     return rq_job.id
 
 
