@@ -130,6 +130,10 @@ async function multipartUpload({
   // de Cloudflare ni contra el cap del browser (HTTP/1.1 conexión
   // máxima ~6 per host; HTTP/2 conn. multiplex es ilimitado en práctica).
   concurrency = 8,
+  // 2026-05-25 batch presign: si el server respondió init con
+  // `presigned_parts: [{part_number, url}]`, los usamos en lugar de
+  // hacer 1 round-trip por chunk. null/undefined = fallback per-part.
+  presignedParts = null,
   onProgress,
   signal,
 }) {
@@ -138,6 +142,15 @@ async function multipartUpload({
   const parts = []; // {part_number, etag}
   // Per-part bytes uploaded so far. Aggregate sum drives the UI.
   const perPartLoaded = new Array(partCount).fill(0);
+  // Lookup table {1: "url", 2: "url", ...} para acceso O(1) por part_number
+  const presignedMap = {};
+  if (Array.isArray(presignedParts)) {
+    for (const p of presignedParts) {
+      if (p && typeof p.part_number === "number" && typeof p.url === "string") {
+        presignedMap[p.part_number] = p.url;
+      }
+    }
+  }
 
   const reportProgress = () => {
     if (!onProgress) return;
@@ -165,12 +178,19 @@ async function multipartUpload({
         let attemptLoaded = 0;
         const etag = await withRetry(async () => {
           attemptLoaded = 0;
-          // Presign per-part (presigns are short-TTL so we sign on each
-          // attempt rather than once up-front). Direct PUT to R2 from
-          // the browser — no API container in the data path.
-          const { url } = await apiPost("/upload-multipart-part-url", {
-            job_id: jobId, part_number: partNumber,
-          });
+          // Presigned URL: prefer batched init response on first attempt
+          // (no round-trip). Retries always fetch fresh per-part —
+          // batched URLs share the same TTL, so if one expired during
+          // the retry-backoff sleeps the rest probably did too.
+          let url = presignedMap[partNumber];
+          if (url) {
+            delete presignedMap[partNumber];  // consume — next retry per-part
+          } else {
+            const resp = await apiPost("/upload-multipart-part-url", {
+              job_id: jobId, part_number: partNumber,
+            });
+            url = resp.url;
+          }
           const res = await putToR2WithProgress(
             url, blob, contentType,
             (loaded /* total */) => {
@@ -257,11 +277,17 @@ export async function uploadFileToR2(
     return { jobId: ticket.job_id, key: ticket.key };
   }
 
-  // Multipart path.
+  // Multipart path. Compute expected chunk count up front and send it
+  // to /upload-multipart-init so the backend can presign all parts in
+  // a single round-trip — saves N×RTT (typical AR ~100 ms × 7 chunks
+  // = 700 ms wallclock overhead removed).
+  const effectivePartSize = ticket.part_size || (8 * 1024 * 1024);
+  const expectedParts = Math.ceil(file.size / effectivePartSize);
   const init = await apiPost("/upload-multipart-init", {
     job_id: ticket.job_id,
     filename: file.name,
     content_type: contentType,
+    expected_parts: expectedParts,
   });
 
   return multipartUpload({
@@ -269,8 +295,9 @@ export async function uploadFileToR2(
     jobId: ticket.job_id,
     uploadId: init.upload_id,
     key: init.key,
-    partSize: init.part_size || ticket.part_size,
+    partSize: init.part_size || effectivePartSize,
     contentType,
+    presignedParts: init.presigned_parts || null,
     onProgress,
     signal,
   });

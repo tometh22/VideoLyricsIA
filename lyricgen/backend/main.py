@@ -1430,17 +1430,75 @@ _TITLE_NOISE_SUFFIXES = (
 )
 
 
-def _parse_filename_artist_title(filename: str) -> tuple[str, str]:
-    """Best-effort artist/title extraction from a bare filename. Handles two
-    naming conventions the operator commonly uploads under:
+# U11 (audit Sprint 2+ 2026-05-25, re-applied 2026-05-25 post-c6efbf4 revert):
+# known-artists cache para resolver ambigüedad del " - " split. La convención
+# "Artist - Title" del código original asumía un orden, pero ~50% de los
+# downloads reales son "Title - Artist" (export de YouTube/Spotify). Sin
+# contexto DB, el parser elegía mal → metadata invertida a lrclib + Genius
+# → lookups fallaban → fallback a Whisper-only sin synced lyrics.
+import time as _u11_time
+_KNOWN_ARTISTS_CACHE: dict[str, tuple[float, set[str]]] = {}
+_KNOWN_ARTISTS_TTL_S = 300  # 5 min
+_KNOWN_ARTISTS_LIMIT = 1000
 
-      "Artist - Title.ext"   → ("Artist", "Title")
-      "Title_Artist.ext"     → ("Artist", "Title")   ← Suno/YouTube export form
 
-    Falls back to ("", basename) when neither separator is present so the
-    caller can decide whether to insist on a manual entry. Studio-version
-    suffixes like "(Official Video)" are stripped from the title in either
-    case so the lrclib lookup matches.
+def _known_artists_for_tenant(db, tenant_id: str) -> set[str]:
+    """Cached lookup of distinct artist strings the tenant ya subió.
+    Used by _parse_filename_artist_title to disambiguate 'X - Y' splits.
+    Returns lowercase set para comparación case-insensitive."""
+    if not tenant_id or db is None:
+        return set()
+    now = _u11_time.time()
+    cached = _KNOWN_ARTISTS_CACHE.get(tenant_id)
+    if cached and (now - cached[0]) < _KNOWN_ARTISTS_TTL_S:
+        return cached[1]
+    try:
+        from database import Job
+        rows = (
+            db.query(Job.artist)
+            .filter(Job.tenant_id == tenant_id)
+            .filter(Job.artist.isnot(None))
+            .filter(Job.artist != "")
+            .distinct()
+            .limit(_KNOWN_ARTISTS_LIMIT)
+            .all()
+        )
+        artists = {r[0].strip().lower() for r in rows if r[0] and r[0].strip()}
+    except Exception:
+        artists = set()
+    _KNOWN_ARTISTS_CACHE[tenant_id] = (now, artists)
+    return artists
+
+
+# Track-number prefix patterns: "01 ", "01-", "01.", "1. ", "01-Title" etc.
+# NO incluye underscore en el class (choca con convención Title_Artist).
+import re as _u11_re
+_TRACK_NUMBER_PREFIX = _u11_re.compile(r"^\s*\d{1,3}[\s\-.]+")
+
+
+def _parse_filename_artist_title(
+    filename: str,
+    *,
+    db=None,
+    tenant_id: str = "",
+) -> tuple[str, str]:
+    """Best-effort artist/title extraction from a bare filename.
+
+    U11 fix (audit 2026-05-25): el código histórico asumía que " - " split
+    significaba "Artist - Title" pero ~50% de los downloads del operador
+    son "Title - Artist" (YouTube / Spotify export convention). Cuando se
+    pasa `db` + `tenant_id`, consultamos los artists conocidos del tenant
+    para elegir el orden correcto. Sin DB, fallback a la heurística histórica.
+
+    Convenciones soportadas:
+      "Artist - Title.ext"  → ("Artist", "Title")   ← convención A (default)
+      "Title - Artist.ext"  → ("Artist", "Title")   ← convención B (con DB lookup)
+      "Title_Artist.ext"    → ("Artist", "Title")   ← YouTube/Suno export
+      "05 Title.ext"        → ("", "Title")         ← track-number prefix stripped
+      "05 - Artist - Title" → handled del mismo modo
+
+    Falls back to ("", basename) cuando no hay separator. El operator UI
+    siempre permite corregir antes de generar.
     """
     if not filename:
         return "", ""
@@ -1449,15 +1507,33 @@ def _parse_filename_artist_title(filename: str) -> tuple[str, str]:
         if base.lower().endswith(ext):
             base = base[: -len(ext)]
             break
+    # U11: strip leading track number (e.g. "05 Intuicion M" → "Intuicion M").
+    base = _TRACK_NUMBER_PREFIX.sub("", base).strip()
+
     artist, title = "", base.strip()
     if " - " in base:
         head, _, tail = base.partition(" - ")
-        artist, title = head.strip(), tail.strip()
+        head, tail = head.strip(), tail.strip()
+        # U11: si tenemos contexto DB, decidir qué lado es el artist
+        # consultando known-artists del tenant. Si UNO matchea, ese es
+        # el artist. Si AMBOS o NINGUNO matchean → fallback al default
+        # histórico (head=artist).
+        known = _known_artists_for_tenant(db, tenant_id) if tenant_id else set()
+        head_known = head.lower() in known
+        tail_known = tail.lower() in known
+        if tail_known and not head_known:
+            # "Title - Artist" pattern (operator already used this artist).
+            artist, title = tail, head
+        else:
+            # Default: "Artist - Title" (head=artist) OR ambiguous.
+            artist, title = head, tail
     elif "_" in base:
         head, _, tail = base.partition("_")
         title, artist = head.strip(), tail.strip()
     for sfx in _TITLE_NOISE_SUFFIXES:
         title = title.replace(sfx, "").strip()
+    # U11: strip "(1)", "(2)" copy suffixes from title (e.g. "Ser Anti (1)" → "Ser Anti").
+    title = _u11_re.sub(r"\s*\(\d+\)\s*$", "", title).strip()
     return artist, title
 
 
@@ -2274,7 +2350,9 @@ async def upload_url(
 
     artist_form = (body.artist or "").strip()
     title_form = (body.title or "").strip()
-    parsed_artist, parsed_title = _parse_filename_artist_title(body.filename)
+    parsed_artist, parsed_title = _parse_filename_artist_title(
+        body.filename, db=db, tenant_id=current_user.get("tenant_id", "")
+    )
     job_artist = artist_form or parsed_artist or "Unknown"
     job_song_title = title_form or parsed_title
 
@@ -2338,6 +2416,13 @@ class _MultipartInitReq(BaseModel):
     job_id: str = Field(..., max_length=12)            # DB Job.job_id = VARCHAR(12)
     filename: str = Field(..., max_length=500)
     content_type: str = Field(default="", max_length=200)
+    # 2026-05-25 velocity sprint: si el cliente conoce upfront cuántos
+    # chunks va a subir (ceil(file_size / part_size)), lo manda acá y
+    # el server presigna TODOS los chunks en una sola respuesta. Ahorra
+    # 1 round-trip por chunk (~80-120 ms RTT × N chunks). Backwards
+    # compat: default 0 = comportamiento previo (cliente sigue llamando
+    # /upload-multipart-part-url por chunk).
+    expected_parts: int = Field(default=0, ge=0, le=10_000)
 
 
 @app.post("/upload-multipart-init")
@@ -2350,7 +2435,14 @@ async def upload_multipart_init(
 ):
     """Begin a multipart upload for a job that was created via /upload-url
     with use_multipart=true. Returns the upload_id and key the browser
-    needs to start signing parts."""
+    needs to start signing parts.
+
+    Si el body trae `expected_parts > 0`, el response incluye también
+    `presigned_parts: [{part_number, url}]` con todos los chunks
+    pre-firmados — el cliente puede saltarse las llamadas individuales
+    a /upload-multipart-part-url. Backwards-compatible: sin
+    expected_parts el response es idéntico al previo.
+    """
     _validate_audio_filename_only(body.filename)
     from jobs import get_job_model
     job_row = get_job_model(db, body.job_id)
@@ -2367,12 +2459,19 @@ async def upload_multipart_init(
         # Idempotent: return the existing upload_id so a flaky frontend
         # retry doesn't create two parallel multipart uploads (which would
         # leave one orphaned in R2 storage).
-        return {
+        resp = {
             "upload_id": job_row.multipart_upload_id,
             "key": job_row.input_r2_key,
             "part_size": _MULTIPART_PART_SIZE_BYTES,
             "presign_ttl_s": _PRESIGN_PUT_TTL_S,
         }
+        if body.expected_parts > 0:
+            resp["presigned_parts"] = _batch_presign_parts(
+                job_row.input_r2_key,
+                job_row.multipart_upload_id,
+                body.expected_parts,
+            )
+        return resp
     if not storage.is_enabled():
         raise HTTPException(status_code=503, detail="Object storage not configured.")
     init = storage.multipart_init(
@@ -2393,12 +2492,39 @@ async def upload_multipart_init(
     job_row.input_r2_key = init["key"]
     job_row.multipart_upload_id = init["upload_id"]
     db.commit()
-    return {
+    resp = {
         "upload_id": init["upload_id"],
         "key": init["key"],
         "part_size": _MULTIPART_PART_SIZE_BYTES,
         "presign_ttl_s": _PRESIGN_PUT_TTL_S,
     }
+    if body.expected_parts > 0:
+        resp["presigned_parts"] = _batch_presign_parts(
+            init["key"], init["upload_id"], body.expected_parts,
+        )
+    return resp
+
+
+def _batch_presign_parts(key: str, upload_id: str, expected_parts: int) -> list:
+    """Presign N parts in a single batch. Each entry is
+    `{"part_number": int, "url": str}`. Skipped on per-part failure
+    (returns the entries that succeeded). The frontend falls back to
+    /upload-multipart-part-url for any missing entries.
+
+    Errores individuales no se logean LOUD para no spammear — el path
+    de fallback per-part les sirve al cliente.
+    """
+    out = []
+    for part_number in range(1, expected_parts + 1):
+        try:
+            url = storage.multipart_presign_part(
+                key, upload_id, part_number, expiry_seconds=_PRESIGN_PUT_TTL_S,
+            )
+            if url:
+                out.append({"part_number": part_number, "url": url})
+        except Exception:
+            pass
+    return out
 
 
 class _MultipartPartReq(BaseModel):
@@ -3150,7 +3276,9 @@ async def upload(
     artist = (artist or "").strip()
     song_title = (song_title or "").strip()
     if not artist or not song_title:
-        parsed_artist, parsed_title = _parse_filename_artist_title(file.filename or "")
+        parsed_artist, parsed_title = _parse_filename_artist_title(
+            file.filename or "", db=db, tenant_id=current_user.get("tenant_id", "")
+        )
         if not artist:
             artist = parsed_artist
         if not song_title:
@@ -3321,7 +3449,9 @@ async def transcribe_endpoint(
 
     artist_form = (artist or "").strip()
     title_form = (title or "").strip()
-    parsed_artist, parsed_title = _parse_filename_artist_title(file.filename or "")
+    parsed_artist, parsed_title = _parse_filename_artist_title(
+        file.filename or "", db=db, tenant_id=current_user.get("tenant_id", "")
+    )
     job_artist = artist_form or parsed_artist or "Unknown"
     job_song_title = title_form or parsed_title
 
@@ -4980,7 +5110,9 @@ async def generate_with_segments(
     artist = (artist or "").strip()
     song_title = (song_title or "").strip()
     if not artist or not song_title:
-        parsed_artist, parsed_title = _parse_filename_artist_title(existing_filename or "")
+        parsed_artist, parsed_title = _parse_filename_artist_title(
+            existing_filename or "", db=db, tenant_id=current_user.get("tenant_id", "")
+        )
         if not artist:
             artist = parsed_artist
         if not song_title:
