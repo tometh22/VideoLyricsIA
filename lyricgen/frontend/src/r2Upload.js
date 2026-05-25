@@ -123,7 +123,13 @@ async function multipartUpload({
   key,
   partSize,
   contentType,
-  concurrency = 4,
+  // 2026-05-25: Concurrencia 4→8. En conexiones argentinas estables
+  // (Fibertel/Claro ~10-30 Mbps upload) los 4 anteriores saturaban ~25 %
+  // del bandwidth porque cada socket TCP tarda ~RTT en crecer su window.
+  // 8 workers paralelos saturan ~50 % sin pegar contra el TCP slow-start
+  // de Cloudflare ni contra el cap del browser (HTTP/1.1 conexión
+  // máxima ~6 per host; HTTP/2 conn. multiplex es ilimitado en práctica).
+  concurrency = 8,
   onProgress,
   signal,
 }) {
@@ -150,12 +156,15 @@ async function multipartUpload({
       const end = Math.min(start + partSize, totalSize);
       const blob = file.slice(start, end);
       try {
+        // Per-attempt scratch so retries don't push the global counter
+        // past 100%, but the COMMITTED `perPartLoaded[i]` stays at its
+        // highest seen value — the bar never visually regresses
+        // (operator UX fix 2026-05-25; the previous code reset to 0 on
+        // each retry and the bar would jump backward, suggesting
+        // failure when the upload was actually mid-retry).
+        let attemptLoaded = 0;
         const etag = await withRetry(async () => {
-          // Reset the part's progress on retry so the UI doesn't
-          // double-count (otherwise a retry from byte 0 would push the
-          // global counter past 100%).
-          perPartLoaded[i] = 0;
-          reportProgress();
+          attemptLoaded = 0;
           // Presign per-part (presigns are short-TTL so we sign on each
           // attempt rather than once up-front). Direct PUT to R2 from
           // the browser — no API container in the data path.
@@ -165,8 +174,13 @@ async function multipartUpload({
           const res = await putToR2WithProgress(
             url, blob, contentType,
             (loaded /* total */) => {
-              perPartLoaded[i] = loaded;
-              reportProgress();
+              attemptLoaded = loaded;
+              // Only advance the visible counter — never decrease it
+              // (so retries from byte 0 don't make the bar regress).
+              if (loaded > perPartLoaded[i]) {
+                perPartLoaded[i] = loaded;
+                reportProgress();
+              }
             },
             signal,
           );
