@@ -3610,17 +3610,84 @@ async def _run_transcription_for_job(
 
                     if fa_segs:
                         logger.info("[LYRICS] forced alignment used (%s lines, lrclib text) for %r - %r", len(fa_segs), artist_hint, song_hint)
-                        # FA won — discard the warm whisperX task.
-                        wx_warm_task.cancel()
-                        try:
-                            await wx_warm_task
-                        except (asyncio.CancelledError, Exception):
-                            pass
+
+                        # INTRO CHORUS RESCUE (2026-05-25): lrclib's
+                        # community-curated lyrics sometimes OMIT the
+                        # intro chorus when a song opens with the
+                        # chorus before the first verse (typical 80s
+                        # rock pattern — "Legalícenla / Oh-oh-oh"
+                        # repeats at 0:16 long before the verse at
+                        # 0:45). Forced-align honours the text it
+                        # gets, so the first FA segment lands at the
+                        # verse start (~45 s) and the operator sees
+                        # "45s de intro instrumental" + a song that
+                        # appears to start with no chorus.
+                        #
+                        # When that happens we have a warm whisperX
+                        # task already running. Instead of cancelling
+                        # it, we await its result and rescue any lines
+                        # it detected in [0, first_FA_start - 1 s].
+                        # Those lines get filtered for whisper
+                        # hallucinations and prepended to fa_segs. The
+                        # `_emit_segments` chokepoint then dedups
+                        # against the body chorus repeats so we don't
+                        # double-count if whisperX overshot.
+                        #
+                        # Threshold of 15 s avoids triggering on
+                        # normal songs that legitimately start with a
+                        # short instrumental (almost all of them) —
+                        # only kicks in when the gap is suspiciously
+                        # long. Buffer of 1 s prevents the rescued
+                        # line from bleeding into the first FA line.
+                        INTRO_RESCUE_THRESHOLD_S = 15.0
+                        INTRO_RESCUE_BUFFER_S = 1.0
+                        first_fa_start = min(
+                            (float(s.get("start") or float("inf")) for s in fa_segs),
+                            default=float("inf"),
+                        )
+                        rescued_intro: list = []
+                        if first_fa_start > INTRO_RESCUE_THRESHOLD_S:
+                            logger.info("[LYRICS] long intro detected (first FA seg @ %.1fs > %.0fs threshold) — awaiting whisperX warm-start for rescue",
+                                        first_fa_start, INTRO_RESCUE_THRESHOLD_S)
+                            try:
+                                wx_intro_segs = await wx_warm_task
+                            except Exception as e:
+                                logger.warning("[LYRICS] intro-rescue whisperX await failed: %s", e)
+                                wx_intro_segs = None
+                            if wx_intro_segs:
+                                from transcribe_postprocess import filter_intro_rescue_candidates
+                                candidate = filter_intro_rescue_candidates(
+                                    wx_intro_segs,
+                                    first_main_start_s=first_fa_start,
+                                    buffer_s=INTRO_RESCUE_BUFFER_S,
+                                )
+                                if candidate:
+                                    try:
+                                        from pipeline import _filter_whisper_hallucinations
+                                        candidate, _drops = _filter_whisper_hallucinations(candidate)
+                                    except Exception as e:
+                                        logger.warning("[LYRICS] intro-rescue hallucination filter failed: %s", e)
+                                if candidate:
+                                    rescued_intro = candidate
+                                    logger.info("[LYRICS] intro chorus rescue: %d line(s) from whisperX before %.1fs",
+                                                len(rescued_intro), first_fa_start - INTRO_RESCUE_BUFFER_S)
+                                else:
+                                    logger.info("[LYRICS] intro-rescue: whisperX detected no plausible lines before %.1fs",
+                                                first_fa_start - INTRO_RESCUE_BUFFER_S)
+                        else:
+                            # Normal-length intro — discard the warm whisperX task.
+                            wx_warm_task.cancel()
+                            try:
+                                await wx_warm_task
+                            except (asyncio.CancelledError, Exception):
+                                pass
+
                         from timing_sources import FORCED_ALIGN
                         return _emit_segments(
-                            fa_segs, FORCED_ALIGN,
+                            (rescued_intro + fa_segs) if rescued_intro else fa_segs,
+                            FORCED_ALIGN,
                             reference_lyrics=fa_text,
-                            recovery_source="forced_align",
+                            recovery_source="forced_align" if not rescued_intro else "forced_align+intro_rescue",
                         )
 
                     # FA failed / non-retryable / timed out. Use the

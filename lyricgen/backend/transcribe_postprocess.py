@@ -49,6 +49,51 @@ def normalize_words(segments: list) -> list:
     return out
 
 
+def filter_intro_rescue_candidates(
+    wx_segs: list,
+    *,
+    first_main_start_s: float,
+    buffer_s: float = 1.0,
+) -> list:
+    """Pick the subset of whisperX segments that fit BEFORE the first
+    forced-align segment, with a safety buffer so the rescued line doesn't
+    bleed into the FA result.
+
+    INCIDENT 2026-05-25 (Bug A of the "Legalícenla" incident): lrclib's
+    community-curated lyrics sometimes OMIT the intro chorus on songs that
+    open with the chorus before the first verse. Forced-align honours the
+    text it gets, so the first FA segment lands at the verse (~45 s) and
+    the operator sees "45s de intro instrumental" + a song that appears to
+    start with no chorus. The fix uses the warm whisperX result to rescue
+    lines that wx detected in [0, first_FA_start - buffer]. This function
+    is the pure data-transform step of that rescue; the integration in
+    main.py awaits the warm task, calls this, runs hallucination filter,
+    and prepends to fa_segs.
+
+    Args:
+      wx_segs: list of whisperX segment dicts with `start`/`end` keys.
+      first_main_start_s: the start time (seconds) of the first FA segment.
+        Rescued segments must end BEFORE this minus `buffer_s`.
+      buffer_s: time gap (seconds) between rescued segments and the first
+        FA segment, so the rescued line doesn't overlap.
+
+    Returns:
+      A new list (subset of wx_segs) of segments that fit in
+      [0, first_main_start_s - buffer_s]. Empty list if no candidates
+      or input is empty. Doesn't mutate `wx_segs`.
+    """
+    if not wx_segs:
+        return []
+    cutoff = first_main_start_s - buffer_s
+    if cutoff <= 0:
+        return []
+    return [
+        dict(s) for s in wx_segs
+        if float(s.get("end") or 0) <= cutoff
+        and float(s.get("start") or 0) >= 0
+    ]
+
+
 def dedup_collisions(segments: list, *, epsilon_s: float = 0.10) -> list:
     """Merge near-identical duplicates that forced_align/reconcile sometimes
     emits when the lyrics text has repeated chorus lines ("Legalícenla /
