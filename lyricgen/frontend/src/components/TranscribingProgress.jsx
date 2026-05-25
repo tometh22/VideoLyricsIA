@@ -208,7 +208,7 @@ export default function TranscribingProgress({
       {stuck && active < 5 && (
         <p className="text-[11px] text-amber-400/80 text-center mt-2">
           {(t && t("transcribe.stuck")) ||
-            "Tardando más de lo normal. Esto suele ser un pico de carga en Replicate; refrescá en un minuto o cancelá y reintentá."}
+            "Esto está tomando más tiempo de lo normal. Nuestro motor de transcripción está procesando muchas canciones — refrescá en un minuto o cancelá y reintentá."}
         </p>
       )}
     </div>

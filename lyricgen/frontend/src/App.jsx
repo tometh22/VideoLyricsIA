@@ -801,7 +801,19 @@ export default function App() {
   const pollUntilTranscribed = useCallback(async (jobId, file) => {
     let delay = 1500;
     const start = Date.now();
-    const TIMEOUT_MS = 5 * 60 * 1000;   // 5 min hard cap (igual que job_timeout backend)
+    // INCIDENT 2026-05-24: previous TIMEOUT_MS was 5 min "igual que
+    // job_timeout backend". PR #295 raised the backend RQ timeout to
+    // 30 min because the post-PR-G pipeline (demucs + FA + whisperX +
+    // fallbacks) legitimately takes 8-12 min for long WAVs. The
+    // frontend was left at 5 min — users saw "La transcripción falló"
+    // even though the backend was still processing successfully (two
+    // jobs in DB completed at progress=70 after the frontend already
+    // gave up).
+    //
+    // Bumped to 20 min — covers the legitimate worst case (~12 min)
+    // with margin, but bails well before the backend's 30 min hard
+    // cap so we still distinguish "stuck" from "legitimate slow".
+    const TIMEOUT_MS = 20 * 60 * 1000;   // 20 min — was 5 min, see above
     while (Date.now() - start < TIMEOUT_MS) {
       try {
         const res = await authFetchWithRetryOn503(
@@ -827,7 +839,13 @@ export default function App() {
       await new Promise((r) => setTimeout(r, delay));
       delay = Math.min(delay * 1.2, 5000);
     }
-    if (file) setRowStatus(file, "error", { error: "Timeout esperando la transcripción." });
+    // 20 min sin respuesta — el backend tiene 30 min de RQ timeout, así
+    // que si llegamos acá el job casi seguro está stuck o el worker
+    // murió. Mensaje claro al usuario + job sigue procesándose en
+    // background (puede volver desde el Historial cuando termine).
+    if (file) setRowStatus(file, "error", {
+      error: "Esto está tardando más de lo esperado. Tu transcripción sigue procesándose — volvé al Historial en unos minutos para ver el resultado.",
+    });
     return null;
   }, []);
 
