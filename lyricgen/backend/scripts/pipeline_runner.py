@@ -177,6 +177,159 @@ def _finalize(segs, source, meta, audio_path, artist, song_title, log, t0):
     }
 
 
+_DB_STUBS_INSTALLED = False
+
+
+def _install_db_stubs():
+    """Stub out DB-touching helpers so `_run_transcription_for_job` can run
+    outside FastAPI without a real Postgres connection. Idempotent; safe to
+    call repeatedly. Used by `transcribe_local_via_main` and the QA suite.
+
+    Stubs (matching the helpers actually invoked by the cascade):
+      - `database.SessionLocal()` → FakeSession (no-op everything, query→None)
+      - `main.scoped_db()` → contextmanager that yields None
+      - `jobs.set_timing_source()` → records into module-level last_telemetry
+      - `jobs.update_job()` → records into module-level last_telemetry
+    """
+    global _DB_STUBS_INSTALLED, _LAST_TELEMETRY
+    if _DB_STUBS_INSTALLED:
+        return
+    # Force a DSN that creates the engine lazily (never connects).
+    os.environ.setdefault("DATABASE_URL", "postgresql://x@localhost:1/x")
+
+    import database  # noqa: E402
+    class _Q:
+        def filter(self, *a, **kw): return self
+        def filter_by(self, *a, **kw): return self
+        def first(self): return None
+        def all(self): return []
+        def one_or_none(self): return None
+        def order_by(self, *a, **kw): return self
+        def limit(self, *a, **kw): return self
+    class _FakeSession:
+        def query(self, *a, **kw): return _Q()
+        def add(self, *a, **kw): pass
+        def merge(self, *a, **kw): pass
+        def commit(self): pass
+        def rollback(self): pass
+        def close(self): pass
+        def flush(self): pass
+        def execute(self, *a, **kw): return _Q()
+        def expire_all(self): pass
+        def __enter__(self): return self
+        def __exit__(self, *a): pass
+    database.SessionLocal = lambda: _FakeSession()
+
+    from contextlib import contextmanager
+    @contextmanager
+    def _stub_scoped_db():
+        yield None
+    import main as _main
+    _main.scoped_db = _stub_scoped_db
+
+    import jobs
+    def _stub_set_timing(job_id, src):
+        _LAST_TELEMETRY["timing_source"] = src
+        _LAST_TELEMETRY["set_timing_source_calls"].append((job_id, src))
+    def _stub_update_job(job_id, **kwargs):
+        _LAST_TELEMETRY["update_job_calls"].append((job_id, dict(kwargs)))
+        cs = kwargs.get("current_step")
+        if cs is not None:
+            _LAST_TELEMETRY["steps"].append((cs, kwargs.get("progress")))
+    jobs.set_timing_source = _stub_set_timing
+    jobs.update_job = _stub_update_job
+
+    _DB_STUBS_INSTALLED = True
+
+
+# Captures telemetry from the most recent `transcribe_local_via_main` call.
+# Reset at the start of each call; safe in single-threaded serial execution.
+_LAST_TELEMETRY: dict = {}
+
+
+def transcribe_local_via_main(
+    audio_path: str,
+    artist: str = "",
+    title: str = "",
+    language: str | None = "es",
+    job_id: str = "qa-local",
+) -> dict:
+    """Run the FULL post-PR-G cascade in `main._run_transcription_for_job`
+    against a local audio file. DB is stubbed. Returns:
+
+        {
+          segments, source, recovery_source, reference_lyrics,
+          meta: {audio_path, audio_duration_s, artist, title},
+          telemetry: {
+            timing_source, steps, set_timing_source_calls,
+            update_job_calls, elapsed_seconds,
+          },
+        }
+
+    This is the entry point used by the QA suite (`scripts/qa/`). It tests
+    the FULL audio-as-truth flow (FA → whisperX → reconcile → recovery)
+    rather than the legacy lrclib_synced fast-path that `transcribe_local`
+    above reproduces.
+    """
+    import asyncio
+    global _LAST_TELEMETRY
+    _LAST_TELEMETRY = {
+        "timing_source": None,
+        "steps": [],
+        "set_timing_source_calls": [],
+        "update_job_calls": [],
+        "elapsed_seconds": None,
+    }
+    _install_db_stubs()
+    import main as _main
+
+    t0 = time.time()
+    try:
+        result = asyncio.run(_main._run_transcription_for_job(
+            request=None,
+            current_user={"id": 2, "tenant_id": "qa@local"},
+            job_id=job_id,
+            audio_path=audio_path,
+            language=language or "",
+            artist=artist,
+            title=title,
+            filename=os.path.basename(audio_path),
+        ))
+    except Exception as e:
+        elapsed = time.time() - t0
+        return {
+            "segments": [],
+            "source": None,
+            "recovery_source": None,
+            "reference_lyrics": "",
+            "meta": {
+                "audio_path": audio_path,
+                "artist": artist, "title": title,
+                "error": repr(e),
+            },
+            "telemetry": {**_LAST_TELEMETRY, "elapsed_seconds": elapsed},
+        }
+    elapsed = time.time() - t0
+    _LAST_TELEMETRY["elapsed_seconds"] = elapsed
+    audio_dur = None
+    try:
+        audio_dur = _audio_duration(audio_path)
+    except Exception:
+        pass
+    return {
+        "segments": result.get("segments") or [],
+        "source": _LAST_TELEMETRY.get("timing_source"),
+        "recovery_source": result.get("recovery_source"),
+        "reference_lyrics": result.get("reference_lyrics") or "",
+        "meta": {
+            "audio_path": audio_path,
+            "artist": artist, "title": title,
+            "audio_duration_s": audio_dur,
+        },
+        "telemetry": dict(_LAST_TELEMETRY),
+    }
+
+
 if __name__ == "__main__":
     # Quick CLI smoke test
     import argparse
@@ -185,7 +338,13 @@ if __name__ == "__main__":
     p.add_argument("--artist", default="")
     p.add_argument("--title", default="")
     p.add_argument("--lang", default="es")
+    p.add_argument("--via-main", action="store_true",
+                   help="Use the new post-PR-G cascade (transcribe_local_via_main) "
+                        "instead of the legacy transcribe_local.")
     args = p.parse_args()
-    result = transcribe_local(args.audio_path, args.artist, args.title, args.lang)
+    if args.via_main:
+        result = transcribe_local_via_main(args.audio_path, args.artist, args.title, args.lang)
+    else:
+        result = transcribe_local(args.audio_path, args.artist, args.title, args.lang)
     import json
     print(json.dumps(result, indent=2, ensure_ascii=False, default=str))

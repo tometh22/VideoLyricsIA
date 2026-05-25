@@ -59,7 +59,7 @@ function TourTooltip({
         )}
 
         {/* Content */}
-        <div className="text-[12px] leading-relaxed text-[#A0A3B1]">
+        <div className="text-caption leading-relaxed text-[#A0A3B1]">
           {step.content}
         </div>
 

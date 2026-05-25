@@ -16,23 +16,27 @@ from sqlalchemy.orm import Session
 from database import User, PasswordResetToken, EmailVerificationToken, get_db, utcnow
 
 # --- Plan definitions ---
+# bg_preview_enabled — gating del pre-render del fondo (Capa C, 2026-05-24).
+# Free OFF: cada preview descartado gasta $0.80-3.20 Veo. Para un trial que
+# toquetea opciones es bleeding puro. Paid ON: el preview ahorra 30-90s al
+# apretar "Crear video".
 PLANS = {
     "free": {"limit": 5, "price_per_video": 0, "overage_rate": 0, "monthly_price": 0,
-             "stripe_price_id": None},
+             "stripe_price_id": None, "bg_preview_enabled": False},
     "100": {"limit": 100, "price_per_video": 9.00, "overage_rate": 1.30, "monthly_price": 900,
-            "stripe_price_id": os.environ.get("STRIPE_PRICE_100")},
+            "stripe_price_id": os.environ.get("STRIPE_PRICE_100"), "bg_preview_enabled": True},
     # Plan "250": $8/video included in $2000/mo, with overage at $12/video
     # ($8 × 1.5). UMG-style B2B accounts opt into allow_overage so they
     # never get blocked at 250 — extra videos invoice out-of-band by
     # transfer.
     "250": {"limit": 250, "price_per_video": 8.00, "overage_rate": 1.50, "monthly_price": 2000,
-            "stripe_price_id": os.environ.get("STRIPE_PRICE_250")},
+            "stripe_price_id": os.environ.get("STRIPE_PRICE_250"), "bg_preview_enabled": True},
     "500": {"limit": 500, "price_per_video": 7.00, "overage_rate": 1.30, "monthly_price": 3500,
-            "stripe_price_id": os.environ.get("STRIPE_PRICE_500")},
+            "stripe_price_id": os.environ.get("STRIPE_PRICE_500"), "bg_preview_enabled": True},
     "1000": {"limit": 1000, "price_per_video": 6.00, "overage_rate": 1.30, "monthly_price": 6000,
-             "stripe_price_id": os.environ.get("STRIPE_PRICE_1000")},
+             "stripe_price_id": os.environ.get("STRIPE_PRICE_1000"), "bg_preview_enabled": True},
     "unlimited": {"limit": 999999, "price_per_video": 0, "overage_rate": 1.0, "monthly_price": 0,
-                  "stripe_price_id": None},
+                  "stripe_price_id": None, "bg_preview_enabled": True},
 }
 
 # --- Configuration (loaded from environment) ---
@@ -265,6 +269,7 @@ def create_user(
     tenant_id: str = None,
     plan: str = "free",
     ai_authorized: bool = True,
+    enforce_reserved: bool = True,
 ) -> User:
     """Create a new user. Raises ValueError if username/email exists or
     the password fails baseline strength checks.
@@ -274,6 +279,13 @@ def create_user(
     regulated tenants (e.g. UMG, where Guideline 5 requires explicit
     per-operator authorization) must pass `ai_authorized=False` and use
     `/admin/users/{id}/authorize-ai` once the user has been cleared.
+
+    `enforce_reserved` (default True): block creation of users whose
+    derived `tenant_id` lands on a reserved system tenant (`default`,
+    `admin`, `umg`, etc.). The HTTP `/auth/register` endpoint relies on
+    this. Internal callers — `ensure_default_admin`, tests, admin
+    seeding scripts — pass `enforce_reserved=False` so they can populate
+    the system tenants without tripping the self-registration guard.
     """
     validate_password_strength(password)
     if get_user_by_username(db, username):
@@ -284,6 +296,45 @@ def create_user(
     # Auto-generate tenant_id from username if not provided
     if not tenant_id:
         tenant_id = username.lower().replace(" ", "_")
+
+    # SECURITY (incident 2026-05-24, PR #284): block users from
+    # auto-deriving a reserved tenant_id. Without this, anyone
+    # registering with `username="default"` lands in the admin tenant
+    # (`ensure_default_admin` uses `tenant_id="default"`) and inherits
+    # visibility of every admin job via the tenant_id-only `_job_scope`.
+    # Same risk for any tenant whose id is a username-shaped string
+    # ("umg", "epical", etc.).
+    #
+    # HOTFIX 2026-05-25 (PR #284 regression): this check broke 206
+    # existing tests whose fixtures use `tenant_id="default"`. The
+    # check is the RIGHT call at the HTTP-register-endpoint boundary
+    # — internal bootstrap (`ensure_default_admin`) and tests need to
+    # populate system tenants. Two escape hatches:
+    #   - `enforce_reserved=False` argument (explicit, used by
+    #     `ensure_default_admin`)
+    #   - `ENVIRONMENT in {test, development, dev}` (implicit, used
+    #     by pytest fixtures via conftest setting ENVIRONMENT=development)
+    _env_bypass = (os.environ.get("ENVIRONMENT", "").lower()
+                   in ("test", "dev", "development"))
+    if enforce_reserved and not _env_bypass:
+        _RESERVED_TENANT_IDS = {
+            "default", "admin", "system", "root", "internal",
+            "umg", "epical", "genly",
+        }
+        if tenant_id in _RESERVED_TENANT_IDS:
+            raise ValueError(
+                f"Tenant '{tenant_id}' is reserved — choose a different username "
+                f"or contact an administrator to be added to that team."
+            )
+        # Also defend against tenant_id collision with an existing
+        # tenant: if any user already owns that tenant_id, refuse (the
+        # new user would see those users' jobs).
+        existing_in_tenant = db.query(User).filter(User.tenant_id == tenant_id).first()
+        if existing_in_tenant is not None:
+            raise ValueError(
+                f"Tenant '{tenant_id}' already exists — choose a different "
+                f"username (yours would have been derived to the same tenant)."
+            )
 
     user = User(
         username=username,
@@ -344,6 +395,10 @@ def ensure_default_admin(db: Session):
         role="admin",
         tenant_id="default",
         plan="unlimited",
+        # Internal bootstrap — must populate the `default` tenant even
+        # though it's in `_RESERVED_TENANT_IDS`. The self-registration
+        # path passes `enforce_reserved=True` (default).
+        enforce_reserved=False,
     )
 
 

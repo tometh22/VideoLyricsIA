@@ -359,6 +359,8 @@ def run_pipeline(job_id: str, mp3_path: str, artist: str, style: str,
                  font_scale: float = 1.0,
                  lyric_transition: str = "cut",
                  text_motion: str = "none",
+                 lyrics_animation: str = "none",
+                 line_transition: str = "none",
                  match_lyrics: bool = True,
                  text_contrast: str = "medium",
                  # Background_hint llega solo desde el flow de variantes
@@ -367,7 +369,28 @@ def run_pipeline(job_id: str, mp3_path: str, artist: str, style: str,
                  # genre + lyrics. Cuando viene set, _ensure_background
                  # lo inyecta como [OPERATOR OVERRIDE] en el user_content
                  # de Gemini, misma mecánica que /edit (PR #116).
-                 background_hint: str | None = None):
+                 background_hint: str | None = None,
+                 # bg_verbatim: cuando es True y hay background_hint, el texto
+                 # del operador va DIRECTO a Veo sin que Gemini lo reescriba
+                 # ("usar mi prompt tal cual"). Default False = comportamiento
+                 # actual (Gemini refina el hint como [OPERATOR OVERRIDE]).
+                 bg_verbatim: bool = False,
+                 # custom_colors: paleta personalizada (hex/nombres, coma-sep)
+                 # cuando style=="custom". Va al prompt de Veo como COLOR
+                 # DIRECTION + al gradiente fallback.
+                 custom_colors: str = "",
+                 # effect: overlay animado componible sobre cualquier fondo
+                 # (snow/rain/stars/bokeh/light). "" = ninguno. Se compone en el
+                 # render (libass filter_complex o moviepy) vía fx_compositor.
+                 effect: str = "",
+                 # Capa C 2026-05-24: hash determinístico (sha256-12) de los
+                 # params del background. Si está set Y `bg_cache/{key}.mp4`
+                 # existe en R2, la pipeline lo descarga ANTES de llamar a
+                 # _ensure_background — ahorra los ~60-180s de Veo/Imagen y
+                 # ~$0.80-3.20 de cuota. Ver bg_preview.py para el hash y el
+                 # path en R2. None = no chequear cache (fallback al flow
+                 # tradicional de Veo/Imagen inline).
+                 bg_cache_key: str | None = None):
     """Run the full pipeline for a job. Called synchronously.
 
     delivery_profile:
@@ -397,6 +420,25 @@ def run_pipeline(job_id: str, mp3_path: str, artist: str, style: str,
     """
     job_dir = os.path.join(OUTPUTS_DIR, job_id)
     os.makedirs(job_dir, exist_ok=True)
+
+    # Telemetría 2026-05-23 — text_motion + lyric_transition deprecados.
+    # main.py coerce upstream a defaults, pero un job que estuviera en cola
+    # antes del deploy puede traer valores no-default; loguear UNA VEZ por
+    # job (warn) y resetear. Sirve para medir cuánta cola legacy queda.
+    if text_motion not in (None, "", "none"):
+        logger.warning(
+            "[DEPRECATED] job=%s recibió text_motion=%r — campo deprecado, "
+            "se ignora. Reemplazo: lyrics_animation (pop/glow).",
+            job_id, text_motion,
+        )
+        text_motion = "none"
+    if lyric_transition not in (None, "", "cut"):
+        logger.warning(
+            "[DEPRECATED] job=%s recibió lyric_transition=%r — campo deprecado, "
+            "se ignora. Reemplazo: line_transition (slide/wipe/dissolve_blur).",
+            job_id, lyric_transition,
+        )
+        lyric_transition = "cut"
 
     # Worker just claimed this job — flip the user-facing status from
     # "queued" (sitting in RQ) to "processing" (a worker is actively on it).
@@ -572,16 +614,43 @@ def run_pipeline(job_id: str, mp3_path: str, artist: str, style: str,
             if _animate_user_image:
                 logger.info("[BG] image-to-video: animating user-supplied %s via Veo",
                             os.path.basename(background_path))
-            bg_image_path = _ensure_background(
-                style, job_dir,
-                lyrics_text=lyrics_text, artist=artist, job_id=job_id,
-                song_title=_song_title, genre=genre, concept=concept,
-                movement_style=movement_style,
-                image_to_video_path=(background_path if _animate_user_image else None),
-                match_lyrics=match_lyrics,
-                background_hint=background_hint,
-                allow_people=_compute_allow_people(job_id),
-            )
+
+            # Capa C 2026-05-24 — bg_cache fast path. Si el operador hizo
+            # pre-gen (POST /generate-preview) mientras editaba lyrics, el
+            # video del fondo ya está en R2 bajo bg_cache/{key}.mp4. Lo
+            # descargamos a job_dir y skip Veo/Imagen — ~60-180s y $0.80-3.20
+            # de cuota ahorrados. Si el cache no existe (operador cambió
+            # opciones después del preview, o el preview falló, o el TTL
+            # de 24h del cache lo limpió), seguimos con el flow normal.
+            bg_image_path = None
+            if bg_cache_key and not _animate_user_image:
+                try:
+                    from bg_preview import cache_check, cache_download
+                    if cache_check(bg_cache_key):
+                        cached_path = os.path.join(job_dir, f"bg_cached_{bg_cache_key}.mp4")
+                        if cache_download(bg_cache_key, cached_path):
+                            logger.info("[BG] cache HIT key=%s — reusando %s, skip Veo/Imagen",
+                                        bg_cache_key, os.path.basename(cached_path))
+                            bg_image_path = cached_path
+                        else:
+                            logger.warning("[BG] cache_check OK pero download falló key=%s — fallback",
+                                           bg_cache_key)
+                except Exception as e:
+                    logger.warning("[BG] cache lookup error key=%s: %s — fallback", bg_cache_key, e)
+
+            if bg_image_path is None:
+                bg_image_path = _ensure_background(
+                    style, job_dir,
+                    lyrics_text=lyrics_text, artist=artist, job_id=job_id,
+                    song_title=_song_title, genre=genre, concept=concept,
+                    movement_style=movement_style,
+                    image_to_video_path=(background_path if _animate_user_image else None),
+                    match_lyrics=match_lyrics,
+                    background_hint=background_hint,
+                    bg_verbatim=bg_verbatim,
+                    custom_colors=custom_colors,
+                    allow_people=_compute_allow_people(job_id),
+                )
             # Image-to-video fallback: if Veo failed to produce an MP4 (None
             # or non-existent path) AND the operator wanted to animate their
             # image, fall back to using the still image with Ken Burns.
@@ -610,16 +679,24 @@ def run_pipeline(job_id: str, mp3_path: str, artist: str, style: str,
             "font_scale": font_scale,
             "lyric_transition": lyric_transition,
             "text_motion": text_motion,
+            "lyrics_animation": lyrics_animation,
+            "line_transition": line_transition,
             "style": style,
             "genre": genre,
             "concept": concept,
             "movement_style": movement_style,
+            "effect": effect,
+            "match_lyrics": match_lyrics,
         }
-        # Only persist background_hint when this run actually received one —
-        # otherwise a hint-less typography edit would null out a hint a prior
-        # background edit had stored.
+        # Only persist background_hint / bg_verbatim when this run actually
+        # received them — otherwise a hint-less typography edit would null out
+        # values a prior background edit had stored (merge-not-replace).
         if background_hint:
             _new_rp["background_hint"] = background_hint
+        if bg_verbatim:
+            _new_rp["bg_verbatim"] = True
+        if custom_colors:
+            _new_rp["custom_colors"] = custom_colors
         try:
             from database import SessionLocal as _SL_rp, Job as _Job_rp
             with _SL_rp() as _db_rp:
@@ -799,7 +876,10 @@ def run_pipeline(job_id: str, mp3_path: str, artist: str, style: str,
                 font_scale=font_scale,
                 lyric_transition=lyric_transition,
                 text_motion=text_motion,
+                lyrics_animation=lyrics_animation,
+                line_transition=line_transition,
                 text_contrast=text_contrast,
+                effect=effect, custom_colors=custom_colors,
             )
             files["video_url"] = f"/download/{job_id}/video"
             update_job(job_id, progress=55)
@@ -2316,6 +2396,50 @@ def _pick_best_lrclib_candidate(candidates: list, artist: str,
     return None
 
 
+def _fetch_lrclib_with_swap_retry(artist: str, song: str, db=None) -> tuple:
+    """`_fetch_lrclib` con retry en orden invertido cuando el directo falla.
+
+    Devuelve `(result, meta)` donde `meta = {swapped: bool, artist_used,
+    song_used}`. El caller usa `meta["swapped"]` para persistir el orden
+    corregido en `job.artist`/`job.song_title` y que el editor muestre
+    metadata limpia al usuario.
+
+    Origin (incidente 2026-05-24): un upload llegó con `artist='Legalícenla',
+    title='Viejas Locas'` (los campos invertidos por el parser del frontend
+    que asume convención `Title_Artist` para archivos con underscore — la
+    mayoría de los usuarios nombran `Artist_Title`). lrclib falló silen-
+    ciosamente, el pipeline cayó a whisperX puro sin texto de referencia,
+    y el output fue ASR degradado con líneas partidas a mitad de frase y
+    palabras inventadas ("se cacachó", "hierbar", "Le realicen la..."
+    en lugar del estribillo "Legalícenla").
+
+    Costo: una sola llamada extra a lrclib, gated en que el directo
+    devolvió None. Despreciable contra la calidad recuperada cuando
+    la metadata viene invertida (caso real, no hipotético).
+
+    Defensa: si artist o song están vacíos, o son textualmente iguales,
+    no intenta swap (evita ruido en logs).
+    """
+    result = _fetch_lrclib(artist, song, db)
+    meta = {"swapped": False, "artist_used": artist, "song_used": song}
+    if result is not None:
+        return result, meta
+    if not artist or not song:
+        return None, meta
+    if artist.strip().lower() == song.strip().lower():
+        return None, meta
+    logger.info("[LYRICS] lrclib miss for (%r,%r) — trying swapped order (%r,%r)",
+                artist, song, song, artist)
+    swap_result = _fetch_lrclib(song, artist, db)
+    if swap_result is None:
+        return None, meta
+    logger.warning(
+        "[LYRICS] lrclib hit on SWAPPED order — direct (%r,%r) missed, swap (%r,%r) "
+        "succeeded. Upload metadata was likely inverted; auto-corrected for this job.",
+        artist, song, song, artist)
+    return swap_result, {"swapped": True, "artist_used": song, "song_used": artist}
+
+
 _LRC_LINE = None  # lazy-compiled regex
 
 
@@ -2438,6 +2562,21 @@ def _detect_hallucination(segments: list[dict],
         if dur > 15.0 and words > 40:
             return True, (f"implausible segment: {dur:.1f}s × {words} "
                           f"words — text={(s.get('text') or '')[:60]!r}")
+        # Signal 2b — sparse-and-long mega-segment. Whisper sometimes maps
+        # an entire song to ONE tiny phrase held for minutes (incident "El
+        # Arbol": a single 346s segment reading "Música de presentación")
+        # instead of transcribing. Signal 1 is OFF when we're called
+        # per-segment (audio_duration=None, as _fill_gaps_with_reference
+        # does), and Signal 2 needs >40 words, so a 3-word/346s segment slips
+        # through and gets kept — discarding the reference lyrics we already
+        # have. Real speech, even slow sung lines, runs ~0.5 words/s; a
+        # density below 0.1 w/s over a long span is acoustically impossible
+        # and means Whisper bailed. Flagging it routes the caller into the
+        # reference-lyrics recovery path (_synthesize_segments_from_plain).
+        if dur > 30.0 and words / dur < 0.1:
+            return True, (f"sparse mega-segment: {dur:.1f}s × {words} "
+                          f"words ({words / dur:.3f} w/s) — "
+                          f"text={(s.get('text') or '')[:60]!r}")
 
     # Signal 3 — fuzzy intra-loop (token-set Jaccard ≥ 0.75).
     for s in segments:
@@ -3475,10 +3614,18 @@ def _fetch_lyrics_via_gemini_search(
         input_data_types=["artist_name", "song_title"],
     ) if job_id else None
 
-    try:
+    # INCIDENT 2026-05-25 audit (Crítico #3): `client.models.generate_content`
+    # was called without a timeout. If Vertex is degraded, the call could
+    # block indefinitely → asyncio.to_thread holds the worker thread →
+    # with 10 concurrent workers, all 10 stuck on Gemini → service deadlock.
+    # We wrap the call in `concurrent.futures.ThreadPoolExecutor` with a
+    # hard 30 s timeout. Lyrics-fetch is best-effort; if Vertex is slow we
+    # rather fall through to bare Whisper than freeze the worker.
+    import concurrent.futures as _cf
+    def _gemini_call():
         client = _get_genai_client()
         search_tool = types.Tool(google_search=types.GoogleSearch())
-        response = client.models.generate_content(
+        return client.models.generate_content(
             model="gemini-2.5-flash",
             contents=user_content,
             config=types.GenerateContentConfig(
@@ -3489,6 +3636,9 @@ def _fetch_lyrics_via_gemini_search(
                 thinking_config=types.ThinkingConfig(thinking_budget=0),
             ),
         )
+    try:
+        with _cf.ThreadPoolExecutor(max_workers=1) as _ex:
+            response = _ex.submit(_gemini_call).result(timeout=30.0)
 
         text = ""
         try:
@@ -3799,18 +3949,31 @@ _BG_PALETTES = [
     "icy blue and white",
 ]
 
-_BG_CAMERAS = [
-    "slow aerial drone flyover",
-    "smooth dolly forward movement",
+# Camera registers for the combinatorial fallback (used only when Gemini
+# fails to return a usable prompt). Split into MOTION and STATIC so the
+# fallback can honour movement intent instead of always reintroducing a
+# camera move (the old list was 10/10 motion → every fallback drifted).
+# Legibility cap (UMG 2026-05-21): the lyrics are overlaid, so forward
+# travel (dolly forward, push-in, flyover, first-person glide) makes them
+# nauseating to read — the MOTION pool is now lateral / orbit / vertical /
+# parallax only, never advancing toward the subject.
+_BG_CAMERAS_MOTION = [
     "gentle sideways tracking shot",
     "slow upward crane shot",
-    "steady wide angle static shot with subtle movement",
     "slow orbit around the scene",
     "smooth descending aerial shot",
-    "gentle push-in zoom",
     "slow parallax movement",
-    "steady first-person glide forward",
+    "slow lateral drift across the scene",
+    "gentle vertical crane reveal",
+    "slow arc around the subject",
 ]
+_BG_CAMERAS_STATIC = [
+    "locked static wide shot on a tripod, no camera movement",
+    "fixed tripod composition, the camera does not move",
+    "held static frame, motion only within the scene",
+]
+# Back-compat alias: anything still reading _BG_CAMERAS gets the full pool.
+_BG_CAMERAS = _BG_CAMERAS_MOTION + _BG_CAMERAS_STATIC
 
 _BG_CONDITIONS = [
     "cinematic depth of field",
@@ -3941,11 +4104,40 @@ _CONCEPT_SCENE_GUIDE = {
 # right "feel" per song. The genre + concept selectors decide WHAT the
 # scene is; this decides HOW it moves.
 _MOVEMENT_STYLE_RULES = {
+    "estatico":      "Camera: LOCKED STATIC TRIPOD. The camera does NOT move at all — no pan, no tilt, no zoom, no dolly, no push-in, no drift, no orbit, no crane, no handheld, no parallax. A single fixed frame held for the whole shot, like a photograph on a tripod. ALL motion lives WITHIN the scene only (water ripples, fire, drifting clouds, smoke, flickering light, swaying foliage, floating particles). The frame edges never move.",
     "sutil":         "Movement: minimal and ambient — gentle sway, slow drift, breathing motion. Subjects barely move. Easy to loop seamlessly.",
     "estandar":      "",  # no extra rule; the existing prompt template controls motion
     "foto-parallax": "Aesthetic: photographic still with subtle parallax — composition feels like a single photo, motion is restricted to slow camera moves, depth-of-field shifts, and lighting passes. No moving subjects.",
     "animado":       "Aesthetic: stylised 2D animated illustration — flat shapes, deliberate cartoon-like motion. NOT photorealistic.",
 }
+
+
+# Color-grading hints injected into the Gemini prompt so the operator's
+# palette choice ACTUALLY steers the generated background's colors (until now
+# `style` only tinted the gradient fallback, never the Veo output). "auto" /
+# "" → no constraint (the scene's natural colors). Keys mirror the frontend
+# STYLES codes.
+_PALETTE_COLOR_HINTS = {
+    "oscuro":  "deep purples, magenta, midnight blue and black — dramatic, moody color grading",
+    "neon":    "an electric neon palette — magenta, cyan and violet, high-saturation glow",
+    "minimal": "a neutral, understated palette — soft grays, off-whites and gentle pastels",
+    "calido":  "warm earthy tones — amber, orange, terracotta and golden light",
+}
+
+
+def _color_directive(style: str, custom_colors: str) -> str:
+    """Build the COLOR DIRECTION line for the Gemini prompt from the operator's
+    palette choice. custom_colors (hex or names, comma-separated) wins; then a
+    preset hint; "auto"/empty → no directive (scene-natural colors)."""
+    cc = (custom_colors or "").strip()
+    if cc:
+        return (f"COLOR DIRECTION (important): grade the entire scene around these "
+                f"dominant colors: {cc}. Lighting, atmosphere and key surfaces must "
+                f"read in this palette.")
+    hint = _PALETTE_COLOR_HINTS.get((style or "").strip().lower())
+    if hint:
+        return f"COLOR DIRECTION: lean the color palette toward {hint}."
+    return ""
 
 
 def _normalize_movement_style(s: str) -> str:
@@ -3955,6 +4147,9 @@ def _normalize_movement_style(s: str) -> str:
         return ""
     s = s.strip().lower()
     aliases = {
+        "static": "estatico", "estatica": "estatico", "estática": "estatico",
+        "fija": "estatico", "fixed": "estatico", "tripod": "estatico",
+        "locked": "estatico", "still": "estatico", "camara-fija": "estatico",
         "subtle": "sutil", "minimal": "sutil", "minimo": "sutil",
         "standard": "estandar", "default": "estandar",
         "photo": "foto-parallax", "parallax": "foto-parallax",
@@ -4136,6 +4331,8 @@ def _analyze_lyrics_for_background(lyrics_text: str, artist: str, job_id: str = 
                                     match_lyrics: bool = True,
                                     background_hint: str | None = None,
                                     for_provider: str = "veo",
+                                    style: str = "",
+                                    custom_colors: str = "",
                                     allow_people: bool = False) -> dict:
     """Use Gemini to analyze lyrics and choose visual style + prompt.
 
@@ -4167,6 +4364,61 @@ def _analyze_lyrics_for_background(lyrics_text: str, artist: str, job_id: str = 
     movement_rule = _MOVEMENT_STYLE_RULES.get(normalized_movement, "")
     movement_extra_line = f"\n- {movement_rule}" if movement_rule else ""
 
+    # Camera-motion de-bias. Two flags drive how clause (2) and the few-shot
+    # examples talk about the camera:
+    #   _static       — operator picked "Estático / cámara fija": the prompt
+    #                   must describe a LOCKED frame and NEVER a camera move.
+    #   _auto_movement — operator left movement on Auto: instead of forcing a
+    #                   cinematic drift on every song (the old monotony bug),
+    #                   Gemini CHOOSES the register from the song's energy.
+    # For an explicit non-static register (sutil/estandar/foto-parallax/
+    # animado) the existing movement_rule steers it, so clause (2) keeps its
+    # original "exact camera movement" wording.
+    _static = normalized_movement == "estatico"
+    _sutil = normalized_movement == "sutil"
+    _auto_movement = normalized_movement == ""
+    if _static:
+        # C4 (2026-05-25) + UMG-style update: repetir LOCKED 3× para reforzar
+        # el prior cuando estatico esté ruteado a Veo. CRÍTICO: el operador
+        # NUNCA debe recibir foto 100% quieta. La escena MUST tener motion
+        # rica in-scene (al menos 3 fuentes distintas) — references UMG
+        # siempre tienen lluvia/nieve/humo/olas/nubes en movimiento.
+        _clause2 = ("(2) framing only — wide/medium/close and angle — the camera "
+                    "is LOCKED and STATIC, the camera is BOLTED in place, "
+                    "explicitly NO camera movement of any kind; the frame is "
+                    "FIXED. CRITICAL: motion lives WITHIN the scene and MUST "
+                    "be RICH — describe AT LEAST 3 distinct motion sources, "
+                    "e.g.: drifting smoke + flickering candle + dust motes; "
+                    "or rolling waves + shifting clouds + falling petals; "
+                    "or rain on glass + neon reflection + steam rising. "
+                    "A scene with zero movement (e.g. \"empty room, no wind, "
+                    "no light shift\") is INVALID — always include moving "
+                    "elements")
+    elif _sutil:
+        # C4 (2026-05-25): branch nueva para sutil. Camera barely-breathing
+        # con motion rica IN-SCENE. Distinguible de estatico (clavada) y
+        # de estandar (camera se mueve).
+        _clause2 = ("(2) framing — wide/medium/close and angle — and a "
+                    "near-static camera that BARELY BREATHES (micro-drift "
+                    "ONLY, the lens shifts no more than 5% of the frame width "
+                    "over the whole shot); treat as a fixed photograph that "
+                    "just breathes. Rich motion lives WITHIN the scene "
+                    "(water, fire, foliage, particles, light); the camera "
+                    "itself is essentially still. NEVER push-in, NEVER zoom, "
+                    "NEVER dolly forward, NEVER orbit. Just a faint breath")
+    elif _auto_movement:
+        _clause2 = ("(2) the camera register that matches the song's energy — a "
+                    "LOCKED STATIC frame for intimate/calm songs, SUBTLE minimal "
+                    "motion for most, and at most a GENTLE LATERAL track, slow "
+                    "orbit or parallax for genuinely high-energy tracks; NEVER a "
+                    "camera that travels FORWARD toward the subject (no push-in, "
+                    "dolly forward, fly-through or first-person glide) because the "
+                    "lyrics are overlaid and forward motion makes them nauseating "
+                    "to read; do NOT default to a constant cinematic drift — and "
+                    "the framing")
+    else:
+        _clause2 = "(2) exact camera movement and framing"
+
     # The "no people" line is gated by `allow_people`. When the operator
     # opted into "fondo libre" (bypass_content_validation=True) OR the
     # tenant is non-UMG and didn't force validation, this restriction is
@@ -4180,10 +4432,38 @@ def _analyze_lyrics_for_background(lyrics_text: str, artist: str, job_id: str = 
         "" if allow_people
         else "- Never include people, faces, hands, or readable text in the scene\n"
     )
+    # A2 (2026-05-25) — Anti-cliché rule. Incidente "Legalícenla - Viejas
+    # Locas": Gemini identificó correctamente "marihuana" como sujeto
+    # literal y Imagen produjo cannabis-leaves-framing-sunset, textbook
+    # stock-photo cringe. La regla substituye METÁFORA por LITERAL cuando
+    # la letra trata temas sensibles — captura la energía sin el visual
+    # cringe. Aplica transversalmente (Veo y Imagen).
+    #
+    # CARVE-OUT 2026-05-25: cuando el operador escribió un background_hint
+    # explícito (modo "Mi prompt"), anti-cliché SE DESACTIVA. Razón: el
+    # hint es la voz explícita del operador; si quiere literal, debemos
+    # respetarlo (con o sin verbatim). Solo auto/inspirado-en-letra
+    # (sin hint) siguen recibiendo la regla.
+    _has_operator_hint = bool(background_hint and background_hint.strip())
+    #
+    # A3 (2026-05-25) — Editorial-photography rule, solo gated por
+    # for_provider="imagen". Veo tiene sus propios equivalentes (lens,
+    # grain, cinematografía) en otras reglas; Imagen no.
+    _is_imagen = for_provider == "imagen"
+    _imagen_quality_line = (
+        "\n- EDITORIAL PHOTOGRAPHY AESTHETIC (required, Imagen path): Magnum / "
+        "National Geographic / Vogue, NOT stock photo. Specific lens (e.g. 35mm "
+        "f/1.4, 85mm f/1.8), natural imperfections (grain, slight focus falloff, "
+        "real-world directional lighting with shadows), ASYMMETRIC composition, "
+        "single clear subject — avoid centered 'product shot' framing and over-"
+        "saturated color clichés (no symmetric leaves-framing-sunset, no perfectly-"
+        "lined silhouettes against gradient skies, no \"AI sunset\" aesthetic)."
+        if _is_imagen else ""
+    )
     _PROMPT_RULES = (
         "- \"style\" must always be \"video\"\n"
         "- \"prompt\" is 80-120 words. Describe: (1) specific scene subject and setting "
-        "in detail, (2) exact camera movement and framing, (3) color palette and dominant "
+        f"in detail, {_clause2}, (3) color palette and dominant "
         "tones, (4) lighting type and direction, (5) atmosphere, mood, and at least one "
         "specific texture or material detail. Be precise and cinematic — avoid vague "
         "adjectives like \"beautiful\" or \"amazing\".\n"
@@ -4193,28 +4473,97 @@ def _analyze_lyrics_for_background(lyrics_text: str, artist: str, job_id: str = 
         "subject of the scene and the CONCEPT dictates its visual styling "
         "(palette, texture, atmosphere, register). Concept never replaces or "
         "contradicts the literal subject of the lyrics unless match_lyrics is "
-        "explicitly disabled."
+        "explicitly disabled.\n"
+        # Anti-cliché block — gated por _has_operator_hint. Cuando el operador
+        # escribió un hint (modo "Mi prompt"), su voz explícita gana y la regla
+        # se desactiva. Modos auto/inspirado-en-letra (sin hint) la reciben.
+        + (
+            ""
+            if _has_operator_hint else
+            "- ANTI-CLICHÉ / METAPHOR-OVER-LITERAL RULE: if the lyrics' literal subject "
+            "is a SENSITIVE / POLITICAL / TABOO topic (drugs, sex, weapons, religion, "
+            "politics, suicide, alcohol abuse, gang violence), DO NOT depict the subject "
+            "literally — substitute a METAPHORICAL scene that captures the song's "
+            "EMOTIONAL ENERGY (defiance, longing, ecstasy, melancholy, rebellion, "
+            "freedom) without the on-the-nose imagery. Examples:\n"
+            "  · Drug-positive anthem → smoke / haze drifting through warm window light, "
+            "record-store dust motes, vinyl spinning under a single lamp — NOT plants, "
+            "leaves, paraphernalia, pills, or rolled paper.\n"
+            "  · Heartbreak after addiction → empty bar at dawn, single bottle on counter, "
+            "cold blue light through smoke — NOT pills, needles, or hospital rooms.\n"
+            "  · Political protest → marching shadows on wet pavement, banners viewed from "
+            "behind, kinetic dust and torchlight — NOT readable flags, slogans, "
+            "politician faces, or police uniforms.\n"
+            "  · Gang / street violence → tense empty alley after rain, broken neon "
+            "reflection in puddle, single dropped object — NOT guns, blood, masked "
+            "figures, or threatening crowds.\n"
+            "  · Sex / explicit lust → silk curtains in heat haze, candlelight on textured "
+            "wall, single tangled bedsheet — NOT bodies, beds, or anatomy.\n"
+            "  Goal: a viewer who DOESN'T know the song should feel its energy through "
+            "the scene — without instantly clocking 'this is a [drugs/protest/violence] "
+            "song'. The lyric video ACCOMPANIES the song; it does NOT narrate it."
+        )
+        + _imagen_quality_line
     )
-    # 3 contrastive examples (rock/urban, romantic ballad, acoustic) + an
-    # explicit "do not copy verbatim" disclaimer. Replaces the prior
-    # single example which biased Gemini toward "neon-lit rain-slicked
-    # streets" output whenever concept/genre came empty (prompt-bleed
-    # observed in prod 2026-05-12 on Rata Blanca "Mujer Amante" — a
-    # ballad that got rendered as an industrial alley). Plus a hard guard
-    # rail for ballads / love songs at the bottom.
-    _BASE_INSTRUCTIONS = """Respond ONLY with a JSON object, no other text.
+    # Contrastive few-shot examples + a "do not copy verbatim" disclaimer.
+    # The example SET is chosen by movement intent so the camera language the
+    # model imitates matches what the operator asked for:
+    #   _static       → all three examples hold a locked frame (motion in-scene)
+    #   _auto_movement → one static + one subtle + one motion, so Gemini sees
+    #                    the full range and varies per song instead of always
+    #                    drifting (the monotony bug)
+    #   explicit reg. → the original motion examples; movement_rule steers
+    # Replaces the prior single example which biased Gemini toward "neon-lit
+    # rain-slicked streets" whenever concept/genre came empty (prompt-bleed on
+    # Rata Blanca "Mujer Amante", 2026-05-12). Genre-tone guard rail shared.
+    if _static:
+        _EXAMPLES_BLOCK = """Example for rock / energetic / dramatic track:
+{"style":"video","prompt":"Locked static wide shot of a stormy desert highway at dusk, the camera fixed on a tripod and never moving, lightning fracturing the distant clouds, heat haze shimmering above the asphalt, a vintage road sign trembling in the wind, dust drifting across the still frame, dramatic and raw, cinematic 4k"}
 
-Output JSON shape — do NOT copy any of these example scenes verbatim;
-they show only the format and the breadth of valid visual registers:
+Example for romantic ballad / love song:
+{"style":"video","prompt":"Fixed static frame of a sunlit room at golden hour, the camera never moves, gauze curtains billowing gently, dust motes floating through the warm beam, a glass on the table catching slow glints of light, intimate and calm, cinematic 4k"}
 
-Example for rock / energetic / dramatic track:
+Example for introspective acoustic / folk track:
+{"style":"video","prompt":"Held static shot of a misty mountain valley at dawn on a locked tripod, layered blue and pink sky perfectly still, silhouetted pine trees motionless, low fog rolling slowly between them, a single bird crossing the far distance, contemplative and vast, cinematic 4k"}"""
+    elif _sutil:
+        # C4 (2026-05-25): ejemplos sutil — camera BARELY breathing, motion
+        # rica in-scene. Para que Veo no confunda con estandar (movimiento
+        # cinematográfico) ni con estatico (frame clavado).
+        _EXAMPLES_BLOCK = """Example for rock / energetic track (sutil register — camera barely breathes, motion lives in the scene):
+{"style":"video","prompt":"Near-static medium shot of an empty rock concert stage just before showtime, the camera barely breathes with imperceptible drift, smoke machines pumping thick haze across the empty platform, stage lights pulsing in red and amber sequences, a microphone stand swaying very slightly from a draft, dust drifting through the colored beams, anticipation and tension, cinematic 4k"}
+
+Example for romantic ballad (sutil register — fixed frame with breath, rich in-scene motion):
+{"style":"video","prompt":"Almost-fixed frame of a candlelit window seat at dusk, the camera barely shifts as if held by a steady hand, flames flickering in three candles, gauze curtains billowing in slow waves, golden hour light shifting subtly through translucent fabric, a wine glass catching tremulous light, intimate and warm, cinematic 4k"}
+
+Example for introspective acoustic / folk (sutil register — near-locked camera, motion in nature):
+{"style":"video","prompt":"Near-static wide shot of a misty mountain valley at dawn, the camera scarcely breathes, layers of fog rolling slowly between silhouetted pines, distant birds crossing the pink and blue sky, light shifting gradually as the sun rises behind the ridge, a single leaf drifting down through the cold air, contemplative and vast, cinematic 4k"}"""
+    elif _auto_movement:
+        _EXAMPLES_BLOCK = """Example (LOCKED STATIC camera — motion only within the scene):
+{"style":"video","prompt":"Fixed static frame of a sunlit room at golden hour, the camera never moves, gauze curtains billowing gently, dust motes drifting through the warm beam, a glass catching slow glints, intimate and calm, cinematic 4k"}
+
+Example (SUBTLE minimal motion):
+{"style":"video","prompt":"Barely-moving shot of a misty mountain valley at dawn, an almost imperceptible drift, layered blue and pink sky, low fog rolling slowly between still pine trees, contemplative and vast, cinematic 4k"}
+
+Example (ACTIVE camera movement — gentle LATERAL track only, never forward, used only when the song's energy genuinely calls for it):
+{"style":"video","prompt":"Slow lateral tracking shot gliding sideways past a stormy desert ridge at dusk, lightning fracturing distant clouds, layered rock formations sliding through frame, dramatic and raw, cinematic 4k"}
+
+CAMERA REGISTER (important): choose the register that matches the song — a LOCKED STATIC frame for intimate/calm/slow songs, SUBTLE minimal motion for most tracks, and at most a GENTLE LATERAL track / slow orbit / parallax for genuinely high-energy songs. NEVER move the camera FORWARD toward the subject (no push-in, dolly forward, fly-through, first-person glide) — the lyrics are overlaid and forward motion makes them nauseating to read. Do NOT default to constant cinematic drift; vary it per song. Scene motion (water, light, foliage, particles) is always allowed."""
+    else:
+        _EXAMPLES_BLOCK = """Example for rock / energetic / dramatic track:
 {"style":"video","prompt":"Slow drone over a stormy desert highway at dusk, lightning fracturing distant clouds, asphalt reflecting the dying light, vintage road sign blurred in the foreground, dramatic and raw, cinematic 4k"}
 
 Example for romantic ballad / love song:
 {"style":"video","prompt":"Slow drift through a sunlit room at golden hour, warm light streaming through gauze curtains, soft focus on a glass catching the light, dust motes floating in the warm beam, intimate and calm, cinematic 4k"}
 
 Example for introspective acoustic / folk track:
-{"style":"video","prompt":"Slow aerial pull-back over a misty mountain valley at dawn, layers of soft blue and pink sky, distant silhouettes of pine trees, gentle wind moving low fog, contemplative and vast, cinematic 4k"}
+{"style":"video","prompt":"Slow aerial pull-back over a misty mountain valley at dawn, layers of soft blue and pink sky, distant silhouettes of pine trees, gentle wind moving low fog, contemplative and vast, cinematic 4k"}"""
+
+    _BASE_INSTRUCTIONS = f"""Respond ONLY with a JSON object, no other text.
+
+Output JSON shape — do NOT copy any of these example scenes verbatim;
+they show only the format and the breadth of valid visual registers:
+
+{_EXAMPLES_BLOCK}
 
 GENRE-TONE COHERENCE (critical):
 If the lyrics or declared genre suggest a love song, romantic ballad,
@@ -4344,7 +4693,7 @@ STEP 1 — Choose the scene:
   - folk     → mountain vistas, dusty roads, wheat fields, riverside campfires
   - metal    → volcanic lava streams, dark cathedrals, stormy lightning, cracked obsidian
 
-STEP 2 — Output JSON with an 80-120 word prompt. Describe: (1) specific scene subject and setting in detail, (2) exact camera movement and framing, (3) color palette and dominant tones, (4) lighting type and direction, (5) atmosphere, mood, and at least one specific texture or material detail. Be precise and cinematic — avoid vague adjectives like "beautiful" or "amazing".
+STEP 2 — Output JSON with an 80-120 word prompt. Describe: (1) specific scene subject and setting in detail, {_clause2}, (3) color palette and dominant tones, (4) lighting type and direction, (5) atmosphere, mood, and at least one specific texture or material detail. Be precise and cinematic — avoid vague adjectives like "beautiful" or "amazing".
 
 Hard rules:
 - "style" must always be "video"
@@ -4435,6 +4784,12 @@ Hard rules:
             "and material textures.\n"
             "- The output `style` field MUST be \"photo\" (not \"video\")."
         )
+
+    # Operator color choice → real steer on the generated colors (not just the
+    # gradient fallback). "auto"/empty adds nothing (scene-natural colors).
+    _color_line = _color_directive(style, custom_colors)
+    if _color_line:
+        system_prompt = system_prompt + "\n\n" + _color_line
 
     full_prompt = f"system:{system_prompt}\nuser:{user_content}"
 
@@ -4552,6 +4907,8 @@ def _get_unique_prompt(lyrics_text: str = None, artist: str = "", job_id: str = 
                        movement_style: str = "", match_lyrics: bool = True,
                        background_hint: str | None = None,
                        for_provider: str = "veo",
+                       bg_verbatim: bool = False,
+                       palette_style: str = "", custom_colors: str = "",
                        allow_people: bool = False) -> dict:
     """Get a unique style+prompt combination. Returns {style, prompt}.
 
@@ -4577,6 +4934,19 @@ def _get_unique_prompt(lyrics_text: str = None, artist: str = "", job_id: str = 
     includes artist+title so even a duplicated Gemini prompt produces a
     fresh background per song (see `_generate_veo_video`).
     """
+    # Verbatim mode: the operator chose "usar mi prompt tal cual". Skip the
+    # Gemini rewrite entirely and send their exact text to the generator. The
+    # safety + (when static) camera-motion negatives are still appended in
+    # _generate_veo_video, so verbatim is "respect my words" — not "no rails".
+    # This is the fix for the power-user case where a hand-written "Static
+    # tripod, no camera motion…" prompt was paraphrased away by Gemini.
+    if bg_verbatim and background_hint and background_hint.strip():
+        logger.info("[BG] verbatim mode — bypassing Gemini, using operator prompt as-is")
+        return {
+            "style": "image" if for_provider == "imagen" else "video",
+            "prompt": background_hint.strip(),
+        }
+
     used: list[str] = []
     if os.path.exists(_USED_PROMPTS_FILE):
         try:
@@ -4585,6 +4955,11 @@ def _get_unique_prompt(lyrics_text: str = None, artist: str = "", job_id: str = 
         except (json.JSONDecodeError, OSError):
             used = []
 
+    # Movement-aware camera pool for the combinatorial fallback (rare — only
+    # when Gemini fails to parse). Static intent must NOT get a motion verb.
+    _norm_move = _normalize_movement_style(movement_style)
+    _camera_pool = _BG_CAMERAS_STATIC if _norm_move == "estatico" else _BG_CAMERAS
+
     # Gemini analysis
     if lyrics_text or song_title:
         result = _analyze_lyrics_for_background(
@@ -4592,6 +4967,7 @@ def _get_unique_prompt(lyrics_text: str = None, artist: str = "", job_id: str = 
             genre=genre, concept=concept, movement_style=movement_style,
             match_lyrics=match_lyrics, background_hint=background_hint,
             for_provider=for_provider,
+            style=palette_style, custom_colors=custom_colors,
             allow_people=allow_people,
         )
         if result["prompt"] and result["prompt"] not in used:
@@ -4619,7 +4995,7 @@ def _get_unique_prompt(lyrics_text: str = None, artist: str = "", job_id: str = 
             prompt = f"{composition} of {scene}, {palette}, {condition}, 4k, photorealistic"
             style = "image"
         else:
-            camera = random.choice(_BG_CAMERAS)
+            camera = random.choice(_camera_pool)
             prompt = f"{camera} of {scene}, {palette}, {condition}, 4k, photorealistic"
             style = "video"
         if prompt not in used:
@@ -4639,7 +5015,7 @@ def _get_unique_prompt(lyrics_text: str = None, artist: str = "", job_id: str = 
         }
     return {
         "style": "video",
-        "prompt": f"{random.choice(_BG_CAMERAS)} of {random.choice(_BG_SCENES)}, {random.choice(_BG_PALETTES)}, {random.choice(_BG_CONDITIONS)}, 4k, photorealistic",
+        "prompt": f"{random.choice(_camera_pool)} of {random.choice(_BG_SCENES)}, {random.choice(_BG_PALETTES)}, {random.choice(_BG_CONDITIONS)}, 4k, photorealistic",
     }
 
 
@@ -4687,7 +5063,9 @@ def _generate_veo_video(prompt: str, output_path: str, job_id: str = None,
                         image_path: str | None = None,
                         movement_style: str = "",
                         normalized_concept: str = "",
-                        allow_people: bool = False) -> str:
+                        high_fidelity: bool = False,
+                        allow_people: bool = False,
+                        verbatim: bool = False) -> str:
     """Generate a video clip with Google Veo 3 via direct Vertex AI REST API.
 
     We bypass google-genai SDK for Veo specifically because its internal auth
@@ -4722,7 +5100,11 @@ def _generate_veo_video(prompt: str, output_path: str, job_id: str = None,
     # rails en el system prompt. El negative en safe_prompt es la última
     # red de seguridad antes de Veo. Si el operador SÍ pidió urbano, no
     # bloqueamos (es su decisión consciente).
-    no_alley = "" if normalized_concept == "urbano" else (
+    # `verbatim`: el operador escribió su propio prompt ("Mi prompt manda",
+    # decisión UMG 2026-05-21). Sus palabras de ESCENA y CÁMARA se respetan
+    # tal cual — no le pegamos los de-bias (callejón/avance). Solo quedan los
+    # rieles legales (sin personas/caras/texto/logos) más abajo.
+    no_alley = "" if (normalized_concept == "urbano" or verbatim) else (
         "Avoid generic narrow alleyway, dark alley, callejón, and neon-lit "
         "back-street as the primary subject unless the lyrics demand it. "
     )
@@ -4735,7 +5117,36 @@ def _generate_veo_video(prompt: str, output_path: str, job_id: str = None,
     # stay regardless because those are legal/IP concerns separate from
     # the people question.
     _people_clause = "" if allow_people else " no people, no faces, no hands,"
-    if movement_style == "animado":
+    # Shared IP / content negatives (text, logos, optionally people) — present
+    # in every register.
+    _base_negatives = (
+        "No text, no words, no letters, no signs, no billboards, no posters, "
+        "no banners, no graffiti, no shop windows, no street signs, no neon "
+        f"signs, no logos, no trademarks, no brand symbols,{_people_clause}"
+    )
+    # Camera-motion negatives — the LAST line of defense for static intent.
+    # Veo's payload exposes no structured camera-lock field, so these words
+    # are the only lever; they fight Veo's strong drift prior. Appended only
+    # when the operator asked for a locked frame (estatico).
+    _camera_negatives = (
+        " no camera movement, no pan, no tilt, no zoom, no dolly, no push-in, "
+        "no drift, no orbit, no crane, no handheld, no parallax."
+    )
+    # Forward-travel negatives — legibility cap. UMG 2026-05-21: backgrounds
+    # where the camera "advances / flies" forward make the OVERLAID LYRICS
+    # nauseating to read ("marean cuando lees la letra"). Because there is
+    # ALWAYS text on top of these clips, forward translation toward the
+    # subject is never acceptable on the default path. Lateral / orbit /
+    # ambient motion stays fine. Applied to every register EXCEPT an explicit
+    # "Cinematográfico" (estandar) pick, which is the operator's conscious
+    # choice — same opt-in principle as concept=urbano above.
+    _forward_travel_negative = (
+        " no forward camera travel, no push-in, no dolly forward, no "
+        "fly-through, no first-person glide forward, no zoom toward the "
+        "subject, no drone advancing toward the camera."
+    )
+    _norm_move = _normalize_movement_style(movement_style)
+    if _norm_move == "animado":
         # Cartoon / 2D illustration aesthetic — keep all safety clauses
         # except the "no CGI / no animation" pair, which would directly
         # contradict the requested look.
@@ -4743,19 +5154,79 @@ def _generate_veo_video(prompt: str, output_path: str, job_id: str = None,
             f"{prompt}. Stylised 2D animated illustration, flat shapes, "
             "deliberate cartoon-like motion. "
             f"{no_alley}"
-            "No text, no words, no letters, no signs, no billboards, no posters, "
-            "no banners, no graffiti, no shop windows, no street signs, no neon "
-            f"signs, no logos, no trademarks, no brand symbols,{_people_clause}"
+            f"{_base_negatives}"
             " no extra animation noise."
         )
+    elif _norm_move == "estatico":
+        # C2 (2026-05-25) — Hardening del prompt estatico. Veo ignoraba
+        # ~50% de las locked-frame requests pre-2026-05-22, motivando el
+        # routing a Imagen. Ahora endurecemos vía:
+        #   1) Repetición: las constraints aparecen 3× (al inicio, en el
+        #      medio, y al final). Veo responde a repetición.
+        #   2) Afirmativos a la par de negativos: no solo "no pan/zoom"
+        #      sino "BOLTED tripod, FIXED frame, single static shot".
+        #   3) Anti-Ken-Burns: explícitamente "no slow zoom despite
+        #      locked appearance" para evitar el "frozen frame + zoom"
+        #      que Veo aplica como compromiso cuando no puede decidir.
+        #   4) "Filmed on a security camera" — phrasing que Veo ASOCIA
+        #      con motion-locked (a diferencia de "cinema camera" que
+        #      sugiere drift).
+        safe_prompt = (
+            f"{prompt}. "
+            # Affirmative — repeated phrasing for Veo's prior.
+            "LOCKED STATIC TRIPOD shot. The camera is BOLTED in place. "
+            "Single FIXED frame held for the entire duration. "
+            "Filmed on a security camera — NO operator, NO movement of the lens. "
+            "All motion lives WITHIN the scene only (water ripples, fire, "
+            "drifting clouds, smoke, foliage swaying, particles floating). "
+            "The frame edges NEVER shift. "
+            f"{no_alley}"
+            f"{_base_negatives}"
+            " no CGI, no animation,"
+            f"{_camera_negatives}"
+            # Anti-Ken-Burns + repetition at end.
+            " No slow zoom despite locked appearance. No subtle push-in. "
+            "No imperceptible drift. The camera is COMPLETELY STILL. "
+            "Lens position is fixed for the entire shot."
+        )
+    elif _norm_move == "sutil":
+        # C3 (2026-05-25) — Branch nueva para sutil. Antes caía en el `else`
+        # final con solo _forward_travel_negative, que Veo trataba como
+        # "cinematográfico atenuado" → forward push asumido.
+        #
+        # Sutil = cámara casi estática pero respira sutilmente. Distinguible
+        # de estatico (clavada) y de estandar (se mueve). El affirmative
+        # "near-static tripod, micro-drift only" + negativos de zoom/dolly/
+        # push-in son el lever para que Veo entregue la escena viva con
+        # micro-movimiento.
+        safe_prompt = (
+            f"{prompt}. "
+            "Near-static tripod shot. The camera barely breathes — micro-drift "
+            "ONLY — the lens shifts no more than 5% of the frame width over "
+            "the whole shot. Treat as a fixed photograph that just breathes. "
+            "Motion is rich WITHIN the scene (water, fire, foliage, "
+            "particles, light shifts), but the FRAME itself is near-still. "
+            f"{no_alley}"
+            f"{_base_negatives}"
+            " no CGI, no animation."
+            " No zoom, no dolly, no push-in, no orbit, no crane, no whip pan."
+            f"{_forward_travel_negative}"
+            # Affirmative repetition at end.
+            " The camera is essentially static — micro-drift is the ONLY "
+            "movement permitted. No cinematic camera moves."
+        )
     else:
+        # Auto / foto-parallax (and any unknown register): cap forward
+        # travel so the overlaid lyrics stay readable. Two opt-outs: the
+        # explicit "Cinematográfico" pick (estandar), and verbatim mode (the
+        # operator wrote their own camera language — "mi prompt manda").
+        _legibility_cap = "" if (_norm_move == "estandar" or verbatim) else _forward_travel_negative
         safe_prompt = (
             f"{prompt}. Photorealistic, filmed with cinema camera, real footage. "
             f"{no_alley}"
-            "No text, no words, no letters, no signs, no billboards, no posters, "
-            "no banners, no graffiti, no shop windows, no street signs, no neon "
-            f"signs, no logos, no trademarks, no brand symbols,{_people_clause}"
+            f"{_base_negatives}"
             " no CGI, no animation."
+            f"{_legibility_cap}"
         )
 
     # veo-3.1-fast at $0.10/s (no audio) is 75% cheaper than the standard
@@ -4769,6 +5240,18 @@ def _generate_veo_video(prompt: str, output_path: str, job_id: str = None,
     # 1.0 by default — preserves more detail while still smoothing micro
     # artefacts. Tune via env var without redeploy if needed.
     model = os.environ.get("VEO_MODEL", "veo-3.1-fast-generate-001").strip()
+    # Static / verbatim renders are exactly the cases where prompt adherence
+    # matters most (the user asked for a precise, often locked-camera result).
+    # The fast model has a stronger drift prior; the standard model follows
+    # "static shot" better but costs ~4x. Route ONLY these renders to a
+    # higher-fidelity model when VEO_MODEL_STATIC is set — leaves the default
+    # untouched for everything else, and lets us A/B fast-vs-standard + measure
+    # real cost without a redeploy (see plan Phase 5).
+    _static_model = os.environ.get("VEO_MODEL_STATIC", "").strip()
+    if _static_model and (high_fidelity or _norm_move == "estatico"):
+        model = _static_model
+        logger.info("[BG] high-fidelity render → model=%s (movement=%s, verbatim=%s)",
+                    model, _norm_move or "auto", high_fidelity)
     veo_params = {
         "aspectRatio": "16:9",
         "sampleCount": 1,
@@ -5239,6 +5722,8 @@ def _ensure_background(style_hint: str, job_dir: str, lyrics_text: str = None,
                        match_lyrics: bool = True,
                        background_hint: str | None = None,
                        bg_mode: str = "veo",
+                       bg_verbatim: bool = False,
+                       custom_colors: str = "",
                        allow_people: bool = False) -> str:
     """Generate background using AI. Gemini picks the best style for the song.
 
@@ -5265,6 +5750,64 @@ def _ensure_background(style_hint: str, job_dir: str, lyrics_text: str = None,
     if all_videos:
         return None
 
+    _norm_move_bg = _normalize_movement_style(movement_style)
+
+    # UMG-style fix (2026-05-25): si el operador eligió "Estático" o "Sutil"
+    # SIN effect overlay, default a "light" (el más sutil de los 5). Las
+    # references UMG NUNCA tienen 100% quieto — siempre hay particles
+    # overlay o motion in-scene. Combined con subtle Ken Burns drift, esto
+    # garantiza que el video parezca vivo.
+    # Operator override: si seteó effect="" pero tildó algún otro motion
+    # (no estatico/sutil), respetamos su elección (no forzamos light).
+    if _norm_move_bg in ("estatico", "sutil") and not (effect or "").strip():
+        logger.info(
+            "[BG] movement=%s + no effect selected — defaulting effect=light "
+            "para evitar foto 100%% quieta (UMG-style guideline 2026-05-25)",
+            _norm_move_bg,
+        )
+        effect = "light"
+
+    # Animado is a Veo-only aesthetic (the 2D-illustration safe_prompt lives in
+    # _generate_veo_video). Imagen renders stills, so an animado+imagen combo
+    # is incoherent — downgrade to Veo. (Matrix rule: Imagen × Animado → Veo.)
+    if _norm_move_bg == "animado" and bg_mode != "veo":
+        logger.info("[BG] movement=animado overrides bg_mode → veo")
+        bg_mode = "veo"
+    # Foto + parallax is a still photo that gains depth via a slow LATERAL pan.
+    # Veo can't do clean 2.5D parallax from a text prompt (it comes out muddy),
+    # so this register always routes through Imagen-4 + the lateral Ken Burns
+    # pan — controllable, premium, and consistent demo↔output. (Matrix rule:
+    # foto-parallax → Imagen × lateral, regardless of the operator's bg_mode.)
+    elif _norm_move_bg == "foto-parallax" and bg_mode != "imagen":
+        logger.info("[BG] movement=foto-parallax overrides bg_mode → imagen (lateral pan)")
+        bg_mode = "imagen"
+    # Estático / Sutil: HISTÓRICAMENTE (2026-05-22) ruteados a Imagen porque
+    # Veo ignoraba "locked / no advance" ~50% del tiempo y se mandaba al
+    # frente, arruinando la legibilidad de las letras superpuestas.
+    #
+    # 2026-05-25 — El design intent original era que estatico/sutil sean
+    # escenas REALES con Veo (cámara estática + motion in-scene rica), no
+    # still photos. Foto+parallax es el único Imagen path por diseño.
+    #
+    # Gated detrás de STATIC_SUTIL_VIA_VEO env flag (default OFF en staging
+    # por seguridad — flip a "1" para alinear con el design). Cuando esté
+    # ON, estos registers usan Veo con prompt hardening reforzado (C2+C3+C4
+    # más abajo) para minimizar el riesgo de forward-push del Veo histórico.
+    #
+    # Si el flag está OFF, mantiene el comportamiento conservador 2026-05-22.
+    elif _norm_move_bg in ("estatico", "sutil") and bg_mode != "imagen":
+        _static_sutil_via_veo = (
+            os.environ.get("STATIC_SUTIL_VIA_VEO", "").strip().lower()
+            in ("1", "true", "yes", "on")
+        )
+        if not _static_sutil_via_veo:
+            logger.info("[BG] movement=%s overrides bg_mode → imagen (controlled camera, STATIC_SUTIL_VIA_VEO=off)", _norm_move_bg)
+            bg_mode = "imagen"
+        else:
+            logger.info("[BG] movement=%s stays on Veo (STATIC_SUTIL_VIA_VEO=on)", _norm_move_bg)
+            # bg_mode stays "veo" — _generate_veo_video will receive the
+            # hardened safe_prompt for estatico/sutil (C2 + C3).
+
     # Imagen-4 + Ken Burns branch. Cabled 2026-05-16 — _generate_imagen_image
     # has existed in the codebase as dead code since the original architecture
     # but was never wired into the dispatch. This is the wire.
@@ -5274,25 +5817,75 @@ def _ensure_background(style_hint: str, job_dir: str, lyrics_text: str = None,
             concept=concept, movement_style=movement_style, match_lyrics=match_lyrics,
             background_hint=background_hint,
             for_provider="imagen",
+            bg_verbatim=bg_verbatim,
+            palette_style=style_hint, custom_colors=custom_colors,
             allow_people=allow_people,
         )
         prompt = result["prompt"]
         image_path = os.path.join(job_dir, "bg_imagen.jpg")
         bg_path = os.path.join(job_dir, "bg_generated.mp4")
+        # A1 (2026-05-25) — foto-parallax es el único register que el
+        # operador eligió específicamente para path Imagen premium.
+        # Merece el modelo ultra (~$0.04 vs $0.02 estándar — despreciable
+        # comparado con los $0.80-3.20 de Veo de los otros registers).
+        # Estatico/sutil siguen con el modelo estándar (default IMAGEN_MODEL)
+        # cuando NO está activado el flag STATIC_SUTIL_VIA_VEO (Parte C).
+        _parallax_model = (
+            os.environ.get("IMAGEN_MODEL_PARALLAX",
+                           "imagen-4.0-ultra-generate-001").strip()
+            if _norm_move_bg == "foto-parallax" else None
+        )
         # Imagen-4 has its own internal rate-limit retry (5 attempts with
         # 60s backoff). Any other exception bubbles up to the caller's
         # try/except which falls back to the gradient.
-        _generate_imagen_image(prompt, image_path, job_id=job_id, allow_people=allow_people)
+        _generate_imagen_image(prompt, image_path, job_id=job_id,
+                                model=_parallax_model,
+                                allow_people=allow_people)
         # Ken Burns produces a 60s sample that downstream palindrome-loops
         # to match the audio duration. Same contract as the Veo path.
-        _ken_burns_image_to_mp4(image_path, bg_path)
+        #   - "Estático"        → hold the frame (no zoom/pan).
+        #   - "Sutil"           → barely-there gentle drift (no zoom, no forward).
+        #   - "Foto + parallax" → slow lateral pan (no zoom, no forward).
+        #   - otherwise         → the usual zoom/pan Ken Burns.
+        # UMG-style fix (2026-05-25): el operador reportó que el path
+        # estatico → static=True (frame frozen bit-perfect) NO matchea las
+        # references UMG, donde TODO video calmo tiene al menos un source
+        # de motion: drift sutil + partículas overlay + scene motion (olas/
+        # nubes/humo). Nunca 100% quieto.
+        #
+        # Nueva regla:
+        #   - "Estático" → subtle=True (micro-drift apenas perceptible).
+        #     El operador esperaba "cámara fija, escena viva"; subtle da eso.
+        #     El effect overlay (snow/rain/stars/light) se compone encima
+        #     vía fx_compositor.build_video_filter, independiente del path.
+        #   - "Sutil"           → subtle=True (igual que antes).
+        #   - "Foto + parallax" → lateral=True (igual que antes).
+        #   - otros             → Ken Burns default (zoom/pan).
+        #
+        # NOTE: dejamos el parámetro static=True en _ken_burns_clip por si
+        # algún caller fuera del wizard lo necesita (ej. tests, edit modal),
+        # pero el wizard nunca lo activa.
+        _ken_burns_image_to_mp4(
+            image_path, bg_path,
+            static=False,
+            lateral=(_norm_move_bg == "foto-parallax"),
+            subtle=(_norm_move_bg in ("estatico", "sutil")),
+        )
         return bg_path
+
+    # True verbatim = operator's own prompt is actually in use (bg_verbatim set
+    # AND a non-empty hint). bg_verbatim alone with no hint falls through to
+    # Gemini, so the de-bias rails must still apply there. Mirrors the
+    # short-circuit condition in _get_unique_prompt.
+    _is_verbatim = bool(bg_verbatim and background_hint and background_hint.strip())
 
     # Generate video background with Veo 3 (always video, no images)
     result = _get_unique_prompt(
         lyrics_text, artist, job_id=job_id, song_title=song_title, genre=genre,
         concept=concept, movement_style=movement_style, match_lyrics=match_lyrics,
         background_hint=background_hint,
+        bg_verbatim=bg_verbatim,
+        palette_style=style_hint, custom_colors=custom_colors,
         allow_people=allow_people,
     )
     prompt = result["prompt"]
@@ -5308,7 +5901,9 @@ def _ensure_background(style_hint: str, job_dir: str, lyrics_text: str = None,
                 image_path=image_to_video_path,
                 movement_style=movement_style,
                 normalized_concept=_normalize_concept(concept),
+                high_fidelity=bg_verbatim,
                 allow_people=allow_people,
+                verbatim=_is_verbatim,
             )
             # Semantic relevance check — always score, but cap retries at one
             # to bound cost (+$0.80 worst case). quality_retry_used gates the
@@ -5316,7 +5911,12 @@ def _ensure_background(style_hint: str, job_dir: str, lyrics_text: str = None,
             # result is also evaluated before we accept and return it.
             score = _score_video_relevance(bg_path, prompt)
             logger.info("[BG] Relevance score: %s/10 for prompt: %s...", score, prompt[:60])
-            if score < 7 and not quality_retry_used:
+            # Verbatim: never re-roll. A re-roll re-runs _get_unique_prompt
+            # which short-circuits to the SAME verbatim text → identical
+            # safe_prompt → Veo cache HIT → same clip, wasting a scoring pass
+            # and never improving. The operator asked for their exact prompt;
+            # we accept the first result and just log the score.
+            if score < 7 and not quality_retry_used and not bg_verbatim:
                 quality_retry_used = True
                 logger.info("[BG] Score %s < 7 — generating new prompt and retrying VEO", score)
                 # Propagate background_hint into the quality retry. Without it,
@@ -5330,6 +5930,8 @@ def _ensure_background(style_hint: str, job_dir: str, lyrics_text: str = None,
                     genre=genre, concept=concept, movement_style=movement_style,
                     match_lyrics=match_lyrics,
                     background_hint=background_hint,
+                    bg_verbatim=bg_verbatim,
+                    palette_style=style_hint, custom_colors=custom_colors,
                     allow_people=allow_people,
                 )
                 prompt = result["prompt"]
@@ -5361,6 +5963,9 @@ def _ken_burns_image_to_mp4(
     output_path: str,
     sample_duration: float = 60.0,
     spec: RenderSpec | None = None,
+    static: bool = False,
+    lateral: bool = False,
+    subtle: bool = False,
 ) -> str:
     """Render a Ken Burns animation over a still image as a standalone MP4.
 
@@ -5383,7 +5988,7 @@ def _ken_burns_image_to_mp4(
     """
     if spec is None:
         spec = RenderSpec.youtube_default()
-    clip = _ken_burns_clip(image_path, sample_duration, spec=spec)
+    clip = _ken_burns_clip(image_path, sample_duration, spec=spec, static=static, lateral=lateral, subtle=subtle)
     try:
         clip.write_videofile(
             output_path,
@@ -5401,12 +6006,192 @@ def _ken_burns_image_to_mp4(
     return output_path
 
 
-def _ken_burns_clip(image_path: str, duration: float, spec: RenderSpec | None = None):
-    """Create an animated Ken Burns clip with periodic direction changes."""
+def _pan_frame_subpixel(
+    img: np.ndarray, t: float, duration: float, *,
+    base_x: int, base_y: int, cw: int, ch: int,
+    travel_x: int, travel_y: int, dir_x: int, dir_y: int,
+    out_w: int, out_h: int,
+) -> np.ndarray:
+    """Subpixel-sampled pan frame at time `t`. Pure, no moviepy.
+
+    El pan lateral del fondo calmo (Imagen + Ken Burns ruteo de
+    `_ensure_background`) se veía "super cortado" porque truncábamos el
+    desplazamiento de cada frame a píxeles enteros. A 24 fps con ~1.25 px de
+    travel/frame, la mayoría de los frames consecutivos terminaban en el
+    mismo entero (stepping 0-1-1-1-2-2-2-3…). El fix: mantenemos el
+    desplazamiento como float, hacemos el crop entero con 1 px extra a
+    derecha/abajo, y aplicamos el shift fraccional vía PIL AFFINE+BILINEAR
+    antes del LANCZOS final. ~1-2 ms/frame de overhead a 1080p (despreciable
+    frente al LANCZOS posterior).
+
+    Extraído a module-level (en vez de closure dentro de `_ken_burns_clip`)
+    para que sea testable directamente sin instanciar moviepy.
+    """
+    h, w = img.shape[:2]
+    p = min(1.0, t / duration) if duration else 0.0
+    p = 0.5 - 0.5 * math.cos(p * math.pi)  # ease in/out
+    fx = (p if dir_x == 1 else (1.0 - p)) * travel_x
+    fy = (p if dir_y == 1 else (1.0 - p)) * travel_y
+    ix, iy = int(fx), int(fy)
+    sub_x, sub_y = fx - ix, fy - iy
+    # 1 px extra para el lookup BILINEAR (lee vecinos 2x2). Cuando la imagen
+    # es justo del tamaño del crop (degenerado, travel=0), leemos exacto y
+    # BILINEAR clampa al borde sin shift visible.
+    extra_x = 1 if w > cw else 0
+    extra_y = 1 if h > ch else 0
+    cx = max(0, min(base_x + ix, w - cw - extra_x))
+    cy = max(0, min(base_y + iy, h - ch - extra_y))
+    crop = img[cy:cy + ch + extra_y, cx:cx + cw + extra_x]
+    shifted = Image.fromarray(crop).transform(
+        (cw, ch),
+        Image.AFFINE,
+        (1, 0, sub_x, 0, 1, sub_y),
+        Image.BILINEAR,
+    )
+    return np.array(shifted.resize((out_w, out_h), Image.LANCZOS))
+
+
+def _ken_burns_clip(image_path: str, duration: float, spec: RenderSpec | None = None,
+                    static: bool = False, lateral: bool = False, subtle: bool = False):
+    """Create an animated Ken Burns clip with periodic direction changes.
+
+    `static=True` returns a LOCKED frame instead: the image is center-cropped
+    to the target aspect ratio and held for the whole duration — no zoom, no
+    pan. Used by the Imagen background path when the operator picked
+    "Estático", where the usual Ken Burns zoom/pan would directly contradict
+    a locked-camera request.
+
+    `lateral=True` returns a clean PARALLAX-style slide: a slow, constant
+    horizontal pan over a fixed inward crop — no zoom, no vertical drift, no
+    forward travel ("Foto + parallax").
+
+    `subtle=True` returns a barely-there ambient DRIFT: a small, slow, diagonal
+    pan of low amplitude — no zoom, no forward travel ("Sutil"). Distinct from
+    `lateral` (a clearly visible sideways travel) and `static` (frozen).
+
+    These deterministic camera moves replace Veo for the calm registers because
+    Veo ignores "locked / no advance" ~half the time (measured 2026-05-22) and
+    pushes in regardless. `static` > `lateral` > `subtle` if several are passed.
+    """
     if spec is None:
         spec = RenderSpec.youtube_default()
     img = np.array(Image.open(image_path))
     h, w = img.shape[:2]
+
+    if not static and (lateral or subtle):
+        # Pan over a fixed inward crop — NO zoom (the scale is constant), so the
+        # camera never advances. `lateral` uses the full horizontal room; the
+        # `subtle` drift uses a fraction of it plus a touch of vertical, so it
+        # reads as a barely-there breath rather than a clear slide.
+        #
+        # B1+B3 (2026-05-25) — En `lateral` (foto-parallax) sumamos:
+        #   - Zoom-breath sutil (scale anima entre 1.15 y 1.22 cada ~32s):
+        #     da sensación de profundidad sin advance forward. Mantiene la
+        #     UMG motion policy (pan domina, breath es respiratory).
+        #   - Back-and-forth para canciones >180s: en vez de un pan lineal
+        #     unidireccional invisible sobre 5min, hacemos ida 60% del room
+        #     en 0.55*duration + vuelta 40% en 0.45*duration. Mismo travel
+        #     total, redistribuido en ciclos visibles.
+        # B2 (easing) ya vive en `_pan_frame_subpixel` (cosine ease in/out).
+        # Para `subtle` mantenemos el comportamiento original (drift mínimo,
+        # sin breath ni back-forth — el operador de sutil pidió quietud).
+        if lateral:
+            scale_base, scale_amp = 1.185, 0.035  # breathes 1.15..1.22
+            amp_x, amp_y = 1.0, 0.0
+        else:  # subtle
+            scale_base, scale_amp = 1.10, 0.0  # no breath
+            amp_x, amp_y = 0.35, 0.18
+        # Use scale_base for crop dims (cw/ch held constant — breath happens
+        # in the FINAL resize step). Computing cw/ch per-frame would break
+        # the base_x/base_y precomputation.
+        cw = max(1, min(int(w / scale_base), w))
+        ch = max(1, min(int(h / scale_base), h))
+        room_x = max(0, w - cw)
+        room_y = max(0, h - ch)
+        travel_x = int(room_x * amp_x)
+        travel_y = int(room_y * amp_y)
+        base_x = (w - cw) // 2 - travel_x // 2
+        base_y = (h - ch) // 2 - travel_y // 2
+        dir_x = random.choice([1, -1])
+        dir_y = random.choice([1, -1])
+        # B3: back-and-forth gate. Solo para `lateral` y duration >180s.
+        _do_back_forth = lateral and duration > 180.0
+
+        def make_pan_frame(t):
+            # B3: dos ciclos de pan (ida 60% + vuelta 40%). Time-warped
+            # `effective_t` se mapea al duration original para que
+            # `_pan_frame_subpixel` calcule la posición con su easing.
+            if _do_back_forth:
+                ida_dur = duration * 0.55
+                if t <= ida_dur:
+                    # Ida: 0 → 60% del travel sobre 0.55*duration
+                    local_p = t / ida_dur
+                    eased = 0.5 - 0.5 * math.cos(local_p * math.pi)
+                    effective_p = eased * 0.6
+                else:
+                    # Vuelta: 60% → 20% del travel sobre 0.45*duration
+                    local_p = (t - ida_dur) / max(0.001, duration - ida_dur)
+                    eased = 0.5 - 0.5 * math.cos(local_p * math.pi)
+                    effective_p = 0.6 - eased * 0.4
+                # Convertimos a `effective_t` para que _pan_frame_subpixel
+                # haga su propia interpolación basada en t/duration.
+                # Como _pan_frame_subpixel aplica ease cosine sobre p=t/duration,
+                # pre-eased aquí: pasamos un t cuyo eased equivale a effective_p.
+                # Resolvemos: 0.5-0.5*cos(p*pi) = effective_p
+                #             → cos(p*pi) = 1 - 2*effective_p
+                #             → p = acos(1 - 2*effective_p) / pi
+                p_target = math.acos(max(-1.0, min(1.0, 1.0 - 2.0 * effective_p))) / math.pi
+                effective_t = p_target * duration
+            else:
+                effective_t = t
+            frame = _pan_frame_subpixel(
+                img, effective_t, duration,
+                base_x=base_x, base_y=base_y, cw=cw, ch=ch,
+                travel_x=travel_x, travel_y=travel_y,
+                dir_x=dir_x, dir_y=dir_y,
+                out_w=spec.width, out_h=spec.height,
+            )
+            # B1: zoom-breath sutil — re-resize el frame final con un scale
+            # que oscila entre (scale_base - scale_amp) y (scale_base + scale_amp).
+            # Cycle de 32s mantiene la respiración orgánica. Para `subtle`
+            # scale_amp=0 → no-op (el frame queda igual).
+            if scale_amp > 0:
+                breath_phase = (t % 32.0) / 32.0
+                breath_scale = 1.0 + (scale_amp / scale_base) * math.sin(breath_phase * 2.0 * math.pi)
+                if abs(breath_scale - 1.0) > 0.001:
+                    # Re-resize con shift centrado para no introducir wobble.
+                    fh, fw = frame.shape[:2]
+                    new_w = max(1, int(round(fw / breath_scale)))
+                    new_h = max(1, int(round(fh / breath_scale)))
+                    off_x = max(0, (fw - new_w) // 2)
+                    off_y = max(0, (fh - new_h) // 2)
+                    sub = frame[off_y:off_y + new_h, off_x:off_x + new_w]
+                    frame = np.array(
+                        Image.fromarray(sub).resize((fw, fh), Image.LANCZOS)
+                    )
+            return frame
+
+        return VideoClip(make_pan_frame, duration=duration).set_fps(spec.fps)
+
+    if static:
+        # Center-crop to target aspect ratio, then resize once. Held constant.
+        target_ar = spec.width / spec.height
+        src_ar = w / h if h else target_ar
+        if src_ar > target_ar:
+            ch = h
+            cw = int(round(h * target_ar))
+        else:
+            cw = w
+            ch = int(round(w / target_ar)) if target_ar else h
+        cw = max(1, min(cw, w))
+        ch = max(1, min(ch, h))
+        cx = (w - cw) // 2
+        cy = (h - ch) // 2
+        crop = img[cy:cy + ch, cx:cx + cw]
+        frame = np.array(
+            Image.fromarray(crop).resize((spec.width, spec.height), Image.LANCZOS)
+        )
+        return VideoClip(lambda t: frame, duration=duration).set_fps(spec.fps)
 
     # Each cycle lasts ~12 seconds, with a different random direction
     cycle_dur = 12.0
@@ -5662,6 +6447,63 @@ def _prerender_looped_bg(bg_path: str, duration: float, job_dir: str,
     return out_path
 
 
+def _prerender_kenburns_bg(image_path: str, duration: float, job_dir: str,
+                           *, spec: "RenderSpec",
+                           out_name: str = "bg_kenburns_ass.mp4") -> str:
+    """Turn a still image into a Ken Burns motion video with ffmpeg zoompan,
+    so the libass fast path (which burns onto a video) can cover image
+    backgrounds. ffmpeg-side analogue of the moviepy _ken_burns_clip: a
+    smooth continuous zoom-in instead of the moviepy per-12s random
+    direction changes — visually equivalent for a backdrop, and entirely
+    C-level so it stays fast.
+
+    We pre-upscale 2x before zoompan to damp the integer-step jitter
+    zoompan shows on stills, then scale back to the target dims.
+    """
+    out_path = os.path.join(job_dir, out_name)
+    total_frames = max(1, int(math.ceil(duration * float(spec.fps))))
+    zoom_end = 1.15
+    zoom_step = (zoom_end - 1.0) / total_frames
+    up_w, up_h = spec.width * 2, spec.height * 2
+    vf = (
+        f"scale={up_w}:{up_h}:force_original_aspect_ratio=increase,"
+        f"crop={up_w}:{up_h},"
+        f"zoompan=z='min(zoom+{zoom_step:.6f},{zoom_end})':"
+        f"d={total_frames}:x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':"
+        f"s={spec.width}x{spec.height}:fps={spec.fps_str}"
+    )
+    base = [
+        "ffmpeg", "-y", "-loglevel", "error",
+        "-i", os.path.abspath(image_path),
+        "-t", str(duration),
+    ]
+    result = subprocess.run(
+        base + ["-vf", vf, "-c:v", "libx264", "-preset", "fast", "-crf", "20",
+                "-pix_fmt", "yuv420p", "-an", out_path],
+        capture_output=True, text=True, timeout=900,
+    )
+    if result.returncode != 0:
+        # Fall back to a static (motionless) scaled background so the job
+        # still renders rather than failing on a zoompan quirk.
+        logger.warning("[BG] zoompan Ken Burns failed (%s); using static bg",
+                       result.stderr[-200:])
+        static_vf = (
+            f"scale={spec.width}:{spec.height}:force_original_aspect_ratio=increase,"
+            f"crop={spec.width}:{spec.height},fps={spec.fps_str}"
+        )
+        result = subprocess.run(
+            base + ["-vf", static_vf, "-c:v", "libx264", "-preset", "fast",
+                    "-crf", "20", "-pix_fmt", "yuv420p", "-an", out_path],
+            capture_output=True, text=True, timeout=900,
+        )
+        if result.returncode != 0:
+            raise RuntimeError(f"ken burns ffmpeg failed: {result.stderr[-300:]}")
+
+    size_mb = os.path.getsize(out_path) / 1024 / 1024
+    logger.info("[BG] Ken Burns (zoompan): %.0fs, %.1f MB", duration, size_mb)
+    return out_path
+
+
 def _attach_close_chain(target_clip, owned_clips):
     """Make `target_clip.close()` also close `owned_clips`.
 
@@ -5824,6 +6666,38 @@ def _resolve_font(font_id: str) -> str | None:
     return None
 
 
+def _smart_lower(text: str) -> str:
+    """Lowercase for the 'lower' aesthetic, but keep proper nouns the
+    operator deliberately capitalized mid-line (e.g. "Guinea").
+
+    The 'lower' style is an all-lowercase look. A blind ``text.lower()``
+    also flattens proper nouns, so a line typed "quizás llegue a Guinea"
+    rendered as "...a guinea". Rule: the FIRST word of the line is always
+    lowercased (sentence-initial capitals are grammar, not intent, and the
+    lowercase aesthetic wants the line to start soft). Every later word is
+    left exactly as the operator typed it — words with no uppercase are
+    already lowercase (no-op), words the operator capitalized are
+    preserved. Original whitespace is kept so layout-sensitive renders
+    don't collapse double spaces.
+
+    Origin: agus.cafisi / Babasónicos — "Guinea" rendered as "guinea"
+    under text_case='lower', 2026-05-20.
+    """
+    import re as _re
+    seen_word = False
+    out = []
+    for tok in _re.split(r"(\s+)", text):
+        if not tok or tok.isspace():
+            out.append(tok)
+            continue
+        if not seen_word:
+            out.append(tok.lower())  # first word: lowercase for the aesthetic
+            seen_word = True
+        else:
+            out.append(tok)  # interior: keep operator's casing as typed
+    return "".join(out)
+
+
 def _apply_case(text: str, case: str) -> str:
     """Apply text-case transformation matching the user's choice."""
     if case == "upper":
@@ -5831,7 +6705,7 @@ def _apply_case(text: str, case: str) -> str:
     if case == "title":
         return text.title()
     if case == "lower":
-        return text.lower()
+        return _smart_lower(text)
     return text  # "original" — keep as transcribed
 
 
@@ -5902,8 +6776,17 @@ def _make_text_clip(
     lyric_transition: str = "cut",
     text_motion: str = "none",
     text_contrast: str = "medium",
+    line_pos: tuple | None = None,
+    line_scale: float = 1.0,
+    line_rot: float = 0.0,
 ):
-    """Create a clean text clip matching pro lyric video style (bold white, outline + shadow)."""
+    """Create a clean text clip matching pro lyric video style (bold white, outline + shadow).
+
+    Per-line layout overrides (line_pos/line_scale/line_rot) come from the
+    editor preview and mirror the ASS path (ass_render.segments_to_lines):
+    line_scale multiplies the tier fontsize; line_pos centers the line at a
+    0..1 fraction of the frame; line_rot tilts it (CSS-clockwise degrees). When
+    none are set the centered/text_motion behavior is byte-for-byte unchanged."""
     import unicodedata
     if spec is None:
         spec = RenderSpec.youtube_default()
@@ -5920,18 +6803,23 @@ def _make_text_clip(
     # font_scale is the user-chosen size multiplier (default 1.0 = unchanged)
     font_scale = max(0.6, min(1.5, float(font_scale or 1.0)))
 
+    import ass_render as _ass
     text_len = len(display_text)
+    # text_width (caption wrap) stays tier-based here; fontsize comes from
+    # the shared tier helper so the moviepy and ASS paths size lines
+    # identically (single source of truth in ass_render).
     if text_len > 80:
-        base_fontsize = int(round(55 * scale))
         text_width = int(round(1700 * scale))
     elif text_len > 50:
-        base_fontsize = int(round(70 * scale))
         text_width = int(round(1650 * scale))
     else:
-        base_fontsize = int(round(85 * scale))
         text_width = int(round(1500 * scale))
 
-    fontsize = max(18, int(round(base_fontsize * font_scale)))
+    fontsize = _ass.lyric_fontsize(text_len, scale, font_scale)
+    # Per-line scale override from the editor preview (parity with ASS
+    # segments_to_lines): multiply the tier fontsize, floor at 8px.
+    if line_scale and float(line_scale) > 0 and float(line_scale) != 1.0:
+        fontsize = max(8, int(round(fontsize * float(line_scale))))
 
     shadow_offset = max(1, int(round(3 * scale)))
     fallback_font = os.path.join(_FONTS_DIR, "Montserrat-Bold.ttf")
@@ -5940,20 +6828,30 @@ def _make_text_clip(
 
     seg_duration = max(0.1, seg_end - seg_start)
 
-    # Fade duration — capped at 1/3 of segment so short clips don't break
-    _FADE_DURATIONS = {"fade": 0.15, "fade_slow": 0.30}
-    fade_dur = _FADE_DURATIONS.get(lyric_transition, 0.0)
-    fade_dur = min(fade_dur, seg_duration / 3)
-    # Compensate for fade-in perception. The text starts at seg_start with
-    # opacity=0 and ramps linearly to 100%. Humans perceive "the text
-    # appeared" around the ~50% opacity mark — so without compensation the
-    # operator's anchored timestamp shows up perceptually fade_dur/2 LATE.
-    # Subtracting half the fade from the start time aligns the perceptual
-    # midpoint with the anchor, which is what the Sync Mode operator
-    # actually targeted with their Space tap. Cuts == 0 → no compensation.
-    fade_perceptual_offset = fade_dur / 2.0
-    adjusted_start = max(0.0, seg_start - fade_perceptual_offset)
+    # Fade + perceptual onset offset come from the shared tier helpers
+    # (ass_render) so both render paths agree. The offset shifts the visual
+    # onset earlier by half the fade: text ramps 0→100% opacity, humans
+    # perceive "it appeared" at ~50%, so without this the operator's
+    # anchored timestamp (Sync Mode Space tap) reads fade_dur/2 LATE. Cuts
+    # → fade 0 → no shift. Fade is capped at seg/3 inside fade_seconds.
+    fade_dur = _ass.fade_seconds(lyric_transition, seg_duration)
+    adjusted_start = _ass.perceptual_start(seg_start, fade_dur)
     adjusted_end = seg_end  # End is unaffected; only the visual onset shifts.
+
+    # Per-line layout override (move/rotate). When present we position the
+    # line EXPLICITLY (centered on line_pos, rotated by line_rot) and ignore
+    # text_motion — the operator placed it deliberately in the editor. Absent
+    # → the centered/motion path below runs unchanged.
+    _has_layout = line_pos is not None or bool(line_rot and float(line_rot) != 0.0)
+    _mv_rot = -float(line_rot or 0.0)  # CSS clockwise → moviepy CCW-positive
+
+    def _place(clip, dx=0, dy=0):
+        # Rotate (expands the bbox) then center the rotated clip on line_pos,
+        # plus an optional screen-space offset (drop-shadow displacement).
+        if _mv_rot:
+            clip = clip.rotate(_mv_rot)
+        return clip.set_position(_ass.moviepy_line_placement(
+            line_pos, clip.w, clip.h, spec.width, spec.height, dx, dy))
 
     def _try_text_clip(txt, fsize, fnt, color, **kwargs):
         try:
@@ -5968,13 +6866,16 @@ def _make_text_clip(
     # Centered top-left coordinates for a clip of size (text_width, sh)
     base_x = (spec.width - text_width) // 2
     base_y = (spec.height - sh) // 2
-    shadow_pos = _text_position_func(spec, text_motion, seg_duration,
-                                     clip_x=base_x, clip_y=base_y,
-                                     shadow_offset=shadow_offset)
-    if callable(shadow_pos):
-        shadow = shadow.set_position(lambda t, _p=shadow_pos: _p(t))
+    if _has_layout:
+        shadow = _place(shadow, shadow_offset, shadow_offset)
     else:
-        shadow = shadow.set_position((base_x + shadow_offset, base_y + shadow_offset))
+        shadow_pos = _text_position_func(spec, text_motion, seg_duration,
+                                         clip_x=base_x, clip_y=base_y,
+                                         shadow_offset=shadow_offset)
+        if callable(shadow_pos):
+            shadow = shadow.set_position(lambda t, _p=shadow_pos: _p(t))
+        else:
+            shadow = shadow.set_position((base_x + shadow_offset, base_y + shadow_offset))
     shadow = shadow.set_start(adjusted_start).set_end(adjusted_end)
 
     layers = []
@@ -5982,13 +6883,16 @@ def _make_text_clip(
     # "strong" mode: add a counter-shadow at the opposite offset to widen the halo
     if contrast["extra_shadow"]:
         shadow2 = _try_text_clip(display_text, fontsize, font, "black").set_opacity(contrast["shadow_opacity"] * 0.5)
-        shadow2_pos = _text_position_func(spec, text_motion, seg_duration,
-                                          clip_x=base_x, clip_y=base_y,
-                                          shadow_offset=-shadow_offset)
-        if callable(shadow2_pos):
-            shadow2 = shadow2.set_position(lambda t, _p=shadow2_pos: _p(t))
+        if _has_layout:
+            shadow2 = _place(shadow2, -shadow_offset, -shadow_offset)
         else:
-            shadow2 = shadow2.set_position((base_x - shadow_offset, base_y - shadow_offset))
+            shadow2_pos = _text_position_func(spec, text_motion, seg_duration,
+                                              clip_x=base_x, clip_y=base_y,
+                                              shadow_offset=-shadow_offset)
+            if callable(shadow2_pos):
+                shadow2 = shadow2.set_position(lambda t, _p=shadow2_pos: _p(t))
+            else:
+                shadow2 = shadow2.set_position((base_x - shadow_offset, base_y - shadow_offset))
         shadow2 = shadow2.set_start(adjusted_start).set_end(adjusted_end)
         if fade_dur > 0:
             shadow2 = shadow2.crossfadein(fade_dur).crossfadeout(fade_dur)
@@ -5996,15 +6900,18 @@ def _make_text_clip(
 
     layers.append(shadow)
 
-    txt_pos = _text_position_func(spec, text_motion, seg_duration,
-                                  clip_x=base_x, clip_y=base_y,
-                                  shadow_offset=0)
     txt = _try_text_clip(display_text, fontsize, font, "white",
                          stroke_color="black", stroke_width=stroke_width)
-    if callable(txt_pos):
-        txt = txt.set_position(lambda t, _p=txt_pos: _p(t))
+    if _has_layout:
+        txt = _place(txt, 0, 0)
     else:
-        txt = txt.set_position("center")
+        txt_pos = _text_position_func(spec, text_motion, seg_duration,
+                                      clip_x=base_x, clip_y=base_y,
+                                      shadow_offset=0)
+        if callable(txt_pos):
+            txt = txt.set_position(lambda t, _p=txt_pos: _p(t))
+        else:
+            txt = txt.set_position("center")
     txt = txt.set_start(adjusted_start).set_end(adjusted_end)
 
     if fade_dur > 0:
@@ -6368,6 +7275,313 @@ def _validate_umg_master(path: str, spec: RenderSpec) -> list[str]:
     return errors
 
 
+def _apply_display_timing(
+    segments: list[dict],
+    duration: float,
+    max_hold_s: float = 4.0,
+    gap_s: float = 0.05,
+) -> list[dict]:
+    """Set each lyric line's on-screen window. Two goals, one pass:
+
+    1. HOLD-UNTIL-NEXT — Whisper/sync set `end` at the last clearly-decoded
+       word, which on long sung lines lands BEFORE the vocal finishes
+       (sustains, melisma), so the text vanished mid-phrase. UMG flagged
+       this on "Costumbres argentinas" 2026-05-19 ("las lyrics se van antes
+       de que se terminen de pronunciar"). We extend each line's display end
+       toward the NEXT line's start (karaoke behaviour), capped at
+       `max_hold_s` so a long instrumental break doesn't leave a line
+       lingering the whole time.
+
+    2. NO-OVERLAP — two subtitles must never render at once. Operator sync
+       edits / batch replays can leave end > next.start; the ceiling
+       (next.start - gap_s) enforces the upper bound.
+
+    Both reduce to: end = min(base_end + max_hold_s, next.start - gap_s),
+    floored to a >=0.3s readable window. The min() makes overlap (ceiling
+    wins) and gap (hold wins) one expression. The last line holds past its
+    final word, capped at `duration`. Returns a new list; input untouched.
+
+    LOCKED lines (`seg["locked"] is True`) — the operator set this line's end
+    by hand in the visual Timings editor. We must NOT auto-extend it: their
+    chosen `end` is the intent. We still apply the NO-OVERLAP clamp for
+    safety (a manual end can't be allowed to overrun the next line), but skip
+    the hold-until-next extension. Untouched lines (no `locked`) keep the
+    default karaoke hold. `locked` is preserved in the output so it round-
+    trips through update_job(segments_json=...).
+    """
+    if not segments:
+        return segments
+    sorted_segs = sorted(segments, key=lambda s: s["start"])
+    n = len(sorted_segs)
+    cleaned = []
+    for i, seg in enumerate(sorted_segs):
+        base_end = seg["end"]
+        locked = bool(seg.get("locked"))
+        ceiling = (sorted_segs[i + 1]["start"] - gap_s) if i + 1 < n else duration
+        if locked:
+            # Respect the operator's manual end; only enforce no-overlap.
+            new_end = min(base_end, ceiling)
+            new_end = max(new_end, seg["start"] + 0.3)
+        elif i + 1 < n:
+            new_end = min(base_end + max_hold_s, ceiling)
+            new_end = max(new_end, seg["start"] + 0.3)
+        else:
+            new_end = min(base_end + max_hold_s, duration)
+        if new_end > duration:
+            new_end = duration
+        cleaned.append({**seg, "end": new_end})
+    return cleaned
+
+
+def _ffmpeg_filter_escape(path: str) -> str:
+    """Escape a path for use inside an ffmpeg filtergraph option value
+    (the subtitles= fontsdir argument). Backslashes and colons are the
+    ones that bite on POSIX paths."""
+    return path.replace("\\", "\\\\").replace(":", "\\:")
+
+
+def _validate_rendered_mp4(path: str, expected_dur: float) -> None:
+    """Raise if the rendered MP4 isn't browser-playable. Catches the
+    malformed-but-exit-0 outputs the plain returncode check misses
+    (incident 2026-05-21: a 124 MB ASS render with the moov atom at the
+    END never started in the browser → infinite spinner). Checks: file
+    non-empty, has a video + audio stream, duration within ±3 s of the
+    audio, and the moov atom near the FRONT (faststart). On any failure
+    the caller falls back to the proven moviepy path."""
+    import json as _json
+    if not os.path.exists(path) or os.path.getsize(path) < 4096:
+        raise RuntimeError(f"rendered file missing/empty: {path}")
+    probe = subprocess.run(
+        ["ffprobe", "-v", "error", "-show_entries",
+         "stream=codec_type:format=duration", "-of", "json", path],
+        capture_output=True, text=True, timeout=60,
+    )
+    if probe.returncode != 0:
+        raise RuntimeError(f"ffprobe failed on render: {probe.stderr[-300:]}")
+    data = _json.loads(probe.stdout or "{}")
+    types = {s.get("codec_type") for s in data.get("streams", [])}
+    if "video" not in types:
+        raise RuntimeError("rendered mp4 has no video stream")
+    if "audio" not in types:
+        raise RuntimeError("rendered mp4 has no audio stream")
+    try:
+        dur = float((data.get("format") or {}).get("duration") or 0)
+    except (TypeError, ValueError):
+        dur = 0.0
+    if expected_dur and abs(dur - expected_dur) > 3.0:
+        raise RuntimeError(
+            f"rendered duration {dur:.1f}s != expected {expected_dur:.1f}s"
+        )
+    # faststart: moov must precede mdat near the front (mp4 only).
+    if path.lower().endswith(".mp4"):
+        with open(path, "rb") as f:
+            head = f.read(2_000_000)
+        moov = head.find(b"moov")
+        mdat = head.find(b"mdat")
+        if not (moov != -1 and (mdat == -1 or moov < mdat)):
+            raise RuntimeError("rendered mp4 lacks faststart (moov not at front)")
+
+
+def _render_lyrics_ass(
+    bg_video_path: str,
+    mp3_path: str,
+    segments: list[dict],
+    job_dir: str,
+    duration: float,
+    *,
+    spec: "RenderSpec",
+    font_path: str,
+    text_case: str = "upper",
+    font_scale: float = 1.0,
+    lyric_transition: str = "cut",
+    lyrics_animation: str = "none",
+    line_transition: str = "none",
+    text_contrast: str = "medium",
+    artist: str = "",
+    song_title: str = "",
+    effect: str = "",
+    style: str = "",
+    custom_colors: str = "",
+) -> str:
+    """Fast lyric render: burn the lyrics with libass in a single ffmpeg
+    pass over the (ffmpeg-looped) background — no moviepy frame loop.
+
+    Covers video backgrounds (caller pre-renders image/Ken Burns bg to a
+    video first) and any spec whose codec ffmpeg can write directly: the
+    YouTube H.264 MP4 and the UMG intermediate master (libx264 at the UMG
+    dims/fps — the lazy ProRes transcode downstream is unchanged).
+    text_motion drift still goes through the moviepy path. ~10-30x faster
+    than the moviepy composite.
+
+    Parity with _make_text_clip is enforced by reusing ass_render's
+    fontsize/fade/offset tiers and the same _apply_case + outline/shadow
+    derivation (stroke = contrast.stroke_mult * scale, shadow = 3*scale).
+    The artist/song title card mirrors generate_lyric_video's two layouts.
+    """
+    import ass_render as _ass
+
+    scale = spec.text_scale
+    contrast = _CONTRAST_SETTINGS.get(text_contrast, _CONTRAST_SETTINGS["medium"])
+    outline = max(1.0, contrast["stroke_mult"] * scale)
+    shadow = max(1, int(round(3 * scale)))
+
+    # 1) Background → looped file at the target dims (ffmpeg, C-level).
+    bg_looped = _prerender_looped_bg(
+        bg_video_path, duration, job_dir,
+        target_w=spec.width, target_h=spec.height,
+        out_name="bg_looped_ass.mp4",
+    )
+
+    # 2) Fonts: the lyric font + the title-card artist font (ExtraBold).
+    #    Both live in one fontsdir so libass can \fn-switch between them
+    #    without mis-matching across the pool.
+    family, bold = _ass.font_family(font_path)
+    extrabold_font = os.path.join(_FONTS_DIR, "Montserrat-ExtraBold.ttf")
+    if not os.path.exists(extrabold_font):
+        extrabold_font = font_path  # graceful fallback
+    artist_family, _ = _ass.font_family(extrabold_font)
+    font_dir = _ass.multi_font_dir([font_path, extrabold_font])
+
+    # 3) Segments → ASS lines (same case/sanitise/sizing as moviepy), plus
+    #    the artist/song title card overlay (same two layouts).
+    lines = _ass.segments_to_lines(
+        segments,
+        text_scale=scale,
+        font_scale=font_scale,
+        lyric_transition=lyric_transition,
+        animation=lyrics_animation,
+        transition=line_transition,
+        case_fn=lambda t: _apply_case(t, text_case),
+    )
+    first_lyric_start = segments[0]["start"] if segments else duration
+    lines += _ass.title_card_lines(
+        artist, song_title, first_lyric_start,
+        width=spec.width, height=spec.height,
+        text_scale=scale,
+        lyric_font_family=family,
+        artist_font_family=artist_family,
+    )
+    base_fs = _ass.lyric_fontsize(40, scale, font_scale)
+    ass_doc = _ass.build_ass(
+        width=spec.width, height=spec.height,
+        font_name=family, base_fontsize=base_fs,
+        outline=outline, shadow=shadow, lines=lines, bold=bold,
+    )
+    ass_path = os.path.join(job_dir, "lyrics.ass")
+    with open(ass_path, "w", encoding="utf-8") as f:
+        f.write(ass_doc)
+
+    # 4) Single ffmpeg pass: burn ASS + mux audio. We run with cwd=job_dir
+    #    so the subtitles file is referenced by basename (avoids the
+    #    notorious filtergraph path escaping); fontsdir is absolute+escaped.
+    #    Encode args are spec-driven so the YouTube MP4 and the UMG
+    #    intermediate (libx264 at UMG dims/fps) both come out right.
+    out_path = os.path.join(job_dir, f"lyric_video.{spec.container}")
+    if spec.codec == "libx264":
+        vargs = ["-c:v", "libx264", "-preset", "veryfast", "-crf", "20",
+                 "-pix_fmt", spec.pix_fmt]
+    elif spec.codec == "prores_ks":
+        vargs = ["-c:v", "prores_ks", "-profile:v", str(spec.prores_profile),
+                 "-pix_fmt", spec.pix_fmt, "-vendor", "apl0"]
+    else:
+        vargs = ["-c:v", spec.codec, "-pix_fmt", spec.pix_fmt]
+    if spec.audio_codec == "aac":
+        aargs = ["-c:a", "aac", "-b:a", "320k"]
+    elif spec.audio_codec == "pcm_s24le":
+        aargs = ["-c:a", "pcm_s24le", "-ar", "48000", "-ac", "2"]
+    else:
+        aargs = ["-c:a", spec.audio_codec]
+
+    # Optional effect overlay (screen-blended, RGB) + color grade, composed in
+    # the SAME single pass before the subtitles burn. fx_compositor returns the
+    # right filter form: a simple -vf when there's no effect (unchanged fast
+    # path), or a -filter_complex with the looped fx clip as input #2.
+    import fx_compositor as _fx
+    vfilter, _use_complex, _extra_in = _fx.build_video_filter(
+        ass_basename="lyrics.ass", font_dir=font_dir,
+        width=spec.width, height=spec.height,
+        effect=effect, style=style, custom_colors=custom_colors,
+    )
+    _filter_args = (
+        ["-filter_complex", vfilter, "-map", "[out]", "-map", "1:a"]
+        if _use_complex else
+        ["-vf", vfilter, "-map", "0:v", "-map", "1:a"]
+    )
+    cmd = [
+        "ffmpeg", "-y", "-loglevel", "error",
+        "-i", os.path.abspath(bg_looped),
+        "-i", os.path.abspath(mp3_path),
+        *_extra_in,
+        *_filter_args,
+        *vargs,
+        *aargs,
+        "-r", spec.fps_str,
+        # Move the moov atom to the front so the browser can start playback
+        # immediately (progressive streaming). Without this the moov lands
+        # at the END of the file; on a large main video (~124 MB) the player
+        # can't reach it without downloading everything → infinite spinner.
+        # The short played only because it's small enough to fully buffer.
+        "-movflags", "+faststart",
+        "-shortest",
+        os.path.basename(out_path),
+    ]
+    # Effect blend + grade at 4K/ProRes (UMG) is heavier than the bare subtitles
+    # burn; give those renders a wider budget so a slow-but-fine pass doesn't hit
+    # the timeout. Plain 1080p H.264 keeps the original 900s.
+    _render_timeout = 1800 if (spec.codec == "prores_ks" or spec.width >= 3000
+                               or (effect and spec.width >= 1920)) else 900
+    try:
+        result = subprocess.run(
+            cmd, cwd=job_dir, capture_output=True, text=True, timeout=_render_timeout,
+        )
+        if result.returncode != 0:
+            raise RuntimeError(
+                f"ass render ffmpeg failed: {result.stderr[-500:]}"
+            )
+    finally:
+        import shutil
+        shutil.rmtree(font_dir, ignore_errors=True)
+
+    # Validate the output is actually browser-playable; on failure the
+    # caller (generate_lyric_video) catches and falls back to moviepy.
+    _validate_rendered_mp4(out_path, duration)
+    size_mb = os.path.getsize(out_path) / (1024 * 1024)
+    logger.info("[ASS] lyric video rendered: %.0fs audio, %.1f MB (libass fast path, validated)",
+                duration, size_mb)
+    return out_path
+
+
+def _resolve_title_song(song_title: str, mp3_path: str, artist: str) -> str:
+    """Resolve the song title shown on the title card. Prefers the title the
+    user set on the job; falls back to parsing the mp3 filename ("Artist -
+    Title" or "Title_Artist", stripping "(Official Video)" etc.). Then a
+    defensive scrub so legacy rows never render a literal underscore-joined
+    filename. Single source of truth shared by the moviepy and libass paths.
+    """
+    if song_title:
+        title_song = song_title
+    else:
+        raw_name = os.path.splitext(os.path.basename(mp3_path))[0]
+        title_song = raw_name
+        if " - " in raw_name:
+            title_song = raw_name.split(" - ", 1)[1]
+        elif "_" in raw_name:
+            title_song = raw_name.split("_", 1)[0]
+        for sfx in ["(Official Video)", "(Official Audio)", "(Lyric Video)",
+                     "(Official Music Video)", "(Audio)", "(Video)", "(En Vivo)",
+                     "(Live)", "(Lyrics)"]:
+            title_song = title_song.replace(sfx, "").strip()
+
+    if title_song:
+        if " - " in title_song and artist and title_song.startswith(artist):
+            title_song = title_song.split(" - ", 1)[1].strip()
+        if artist and title_song.endswith(f"_{artist}"):
+            title_song = title_song[: -(len(artist) + 1)].strip()
+        if "_" in title_song and not artist:
+            title_song = title_song.split("_", 1)[0].strip()
+    return title_song
+
+
 def generate_lyric_video(
     mp3_path: str,
     segments: list[dict],
@@ -6382,7 +7596,11 @@ def generate_lyric_video(
     font_scale: float = 1.0,
     lyric_transition: str = "cut",
     text_motion: str = "none",
+    lyrics_animation: str = "none",
+    line_transition: str = "none",
     text_contrast: str = "medium",
+    effect: str = "",
+    custom_colors: str = "",
 ) -> tuple[str, str, str | None]:
     """Generate a lyric video. Returns (video_path, font, bg_source).
 
@@ -6396,6 +7614,8 @@ def generate_lyric_video(
     if spec is None:
         spec = RenderSpec.youtube_default()
 
+    import time as _time
+
     audio = AudioFileClip(mp3_path)
     duration = audio.duration
 
@@ -6405,11 +7625,6 @@ def generate_lyric_video(
         bg_source = _find_background_video()
     if not bg_source:
         raise RuntimeError("No background available. Check Veo 3 API or add videos to assets/backgrounds/")
-
-    if bg_source.lower().endswith((".jpg", ".jpeg", ".png")):
-        bg = _ken_burns_clip(bg_source, duration, spec=spec)
-    else:
-        bg = _get_background_clip_from_path(bg_source, style, duration, job_dir, spec=spec)
 
     # Pick a font for this job (or reuse the caller-provided one).
     # For UMG profile, the choice is deterministic (derived from job_dir hash)
@@ -6438,25 +7653,75 @@ def generate_lyric_video(
         if dropped:
             logger.info("[RENDER] dropped %s blank segment(s) before render", dropped)
 
-    # Defensive normalization — clamp each segment's end to the next
-    # segment's start (with a 50ms gap) so two subtitles can never
-    # render simultaneously. Operator-edited timestamps from sync mode
-    # can leave end > next.start when lines were anchored closer than
-    # the original duration. Frontend also clamps but we re-clamp here
-    # in case other callers (batch CLI, API replays) bypass it.
+    # Display-timing normalization (hold-until-next + no-overlap). See
+    # _apply_display_timing for the full rationale + the UMG incident.
     if segments:
-        sorted_segs = sorted(segments, key=lambda s: s["start"])
-        cleaned = []
-        for i, seg in enumerate(sorted_segs):
-            new_end = seg["end"]
-            if i + 1 < len(sorted_segs):
-                next_start = sorted_segs[i + 1]["start"]
-                if new_end > next_start - 0.05:
-                    new_end = max(seg["start"] + 0.3, next_start - 0.05)
-            if new_end > duration:
-                new_end = duration
-            cleaned.append({**seg, "end": new_end})
-        segments = cleaned
+        segments = _apply_display_timing(segments, duration)
+
+    # Title shown on the card — resolved once and shared by both render
+    # paths (libass below, moviepy further down).
+    title_song = _resolve_title_song(song_title, mp3_path, artist)
+
+    # Fast path: libass single-pass render (engine=ass). Covers video bg +
+    # H.264 (YouTube) and the UMG intermediate master (profile
+    # "umg_intermediate", still libx264 → the lazy ProRes transcode is
+    # unchanged). Image/Ken Burns bg is resolved to a video first (see below).
+    #
+    # 2026-05-23: removida la cláusula `text_motion == "none"` del gate.
+    # text_motion quedó deprecado upstream (siempre coerce a "none" en
+    # main.py), pero la condición se sacó para que jobs en cola anteriores
+    # al deploy con text_motion legacy también pasen por ASS — antes
+    # forzaban moviepy y apagaban silenciosamente lyrics_animation +
+    # line_transition.
+    #
+    # 2026-05-25: default cambiado de "moviepy" → "ass". Razón: moviepy
+    # NO renderiza los templates de lyrics_animation (karaoke/word_reveal/
+    # pop/glow) ni line_transition (slide_up/slide_side/wipe/dissolve_blur).
+    # Solo libass los implementa. El operador reportó que sus selecciones
+    # "no salen en el video" — era esto: el default mandaba todo por
+    # moviepy, ignorando silenciosamente las animaciones. Si libass falla
+    # en runtime, el try/except (líneas ~7664+) cae a moviepy igual.
+    # Override vía env LYRIC_RENDER_ENGINE=moviepy para forzar path viejo.
+    _engine = os.environ.get("LYRIC_RENDER_ENGINE", "ass").lower()
+    _bg_is_video = not bg_source.lower().endswith((".jpg", ".jpeg", ".png"))
+    _ass_ok_profile = spec.profile in ("youtube", "umg_intermediate")
+    if _engine == "ass" and _ass_ok_profile:
+        try:
+            ass_bg = bg_source
+            if not _bg_is_video:
+                # Image background → pre-render the Ken Burns motion to a
+                # video with ffmpeg zoompan so the single-pass burn applies.
+                ass_bg = _prerender_kenburns_bg(
+                    bg_source, duration, job_dir, spec=spec,
+                )
+            logger.info("[ASS] libass fast path (engine=ass, profile=%s, bg=%s)",
+                        spec.profile, "image" if not _bg_is_video else "video")
+            _t0 = _time.monotonic()
+            out = _render_lyrics_ass(
+                ass_bg, mp3_path, segments, job_dir, duration,
+                spec=spec, font_path=font, text_case=text_case,
+                font_scale=font_scale, lyric_transition=lyric_transition,
+                lyrics_animation=lyrics_animation,
+                line_transition=line_transition,
+                text_contrast=text_contrast,
+                artist=artist, song_title=title_song,
+                effect=effect, style=style, custom_colors=custom_colors,
+            )
+            logger.info("[ASS] render: %.1fs (engine=ass)", _time.monotonic() - _t0)
+            audio.close()
+            return out, font, bg_source
+        except Exception as e:
+            # Never fail the job on a fast-path error — fall through to the
+            # proven moviepy composite below.
+            logger.warning(
+                "[ASS] fast path failed (%s); falling back to moviepy", e
+            )
+
+    # --- moviepy composite path (default) ---
+    if bg_source.lower().endswith((".jpg", ".jpeg", ".png")):
+        bg = _ken_burns_clip(bg_source, duration, spec=spec)
+    else:
+        bg = _get_background_clip_from_path(bg_source, style, duration, job_dir, spec=spec)
 
     # Build text clips — each segment gets its own shadow + text
     text_layers = []
@@ -6473,37 +7738,8 @@ def generate_lyric_video(
     # was past 3s, leaving "ARTIST/Title" stamped at top while the big
     # drop title also showed centered.
     first_lyric_start = segments[0]["start"] if segments else duration
-    # Prefer the title the user explicitly set on the job — falls back to
-    # parsing the filename only when the job didn't carry one (legacy rows
-    # or batch CLI uploads). The filename heuristic handles both
-    # "Artist - Title" and "Title_Artist" so a Suno-style export still
-    # gets a real overlay rendered.
-    if song_title:
-        title_song = song_title
-    else:
-        raw_name = os.path.splitext(os.path.basename(mp3_path))[0]
-        title_song = raw_name
-        if " - " in raw_name:
-            title_song = raw_name.split(" - ", 1)[1]
-        elif "_" in raw_name:
-            title_song = raw_name.split("_", 1)[0]
-        for sfx in ["(Official Video)", "(Official Audio)", "(Lyric Video)",
-                     "(Official Music Video)", "(Audio)", "(Video)", "(En Vivo)",
-                     "(Live)", "(Lyrics)"]:
-            title_song = title_song.replace(sfx, "").strip()
-
-    # Defensive scrub: even when the upload pipeline pre-parsed the title,
-    # legacy rows (or a manually-typed value) can still carry the raw
-    # "Title_Artist" or "Artist - Title" filename basename. Re-parse so the
-    # overlay never shows a literal underscore-joined filename like
-    # "No Tengo Ganas_Intoxicados".
-    if title_song:
-        if " - " in title_song and artist and title_song.startswith(artist):
-            title_song = title_song.split(" - ", 1)[1].strip()
-        if artist and title_song.endswith(f"_{artist}"):
-            title_song = title_song[: -(len(artist) + 1)].strip()
-        if "_" in title_song and not artist:
-            title_song = title_song.split("_", 1)[0].strip()
+    # title_song already resolved above (shared with the libass path) via
+    # _resolve_title_song.
 
     if artist or title_song:
         # Artist name renders in ExtraBold (heavier weight) to visually
@@ -6555,8 +7791,11 @@ def generate_lyric_video(
 
             if has_long_intro:
                 # ----- CENTRED FULL CARD (long intro) -----
-                artist_size = max(30, int(round(62 * scale)))
-                title_size = max(24, int(round(46 * scale)))
+                # Hero sizes: artist bigger than the 85px lyric tier, song
+                # secondary. Mirrors ass_render.title_card_lines. Bumped 2026-05
+                # (old 62/46 read smaller than the lyrics).
+                artist_size = max(30, int(round(100 * scale)))
+                title_size = max(24, int(round(62 * scale)))
                 card_width = int(round(spec.width * 0.80))
                 stroke_w = max(1, int(round(1.6 * scale)))
                 title_end = min(first_lyric_start - 0.2, START_T + 8.0)
@@ -6645,16 +7884,101 @@ def generate_lyric_video(
         except Exception as e:
             logger.warning("[TITLE] title card failed (%s); continuing", e)
 
+    # CV1 (audit 2026-05-25) — Visibility en degraded path.
+    # El moviepy fallback NO implementa los templates de lyrics_animation
+    # (karaoke/word_reveal/pop/glow) ni line_transition (slide_up/
+    # slide_side/wipe/dissolve_blur). Esos viven en ass_render.py (libass).
+    # En condiciones normales, este path NO se ejecuta (libass anda en
+    # Railway por default). Pero si llega acá CON animations seleccionadas,
+    # el video se renderiza pero las animations se ignoran silenciosamente.
+    # Acción: log WARNING + Sentry breadcrumb para que ops vea cuando este
+    # path corre con feature seleccionada. Si nunca se ve en producción
+    # tras 30 días, deprecar moviepy entirely (sprint 3+).
+    if lyrics_animation != "none" or line_transition != "none":
+        logger.warning(
+            "[MOVIEPY_DEGRADED] rendering with moviepy fallback but "
+            "lyrics_animation=%r / line_transition=%r — these libass "
+            "templates are NOT applied in moviepy path; video will render "
+            "with plain text. Investigate why libass fast path was bypassed "
+            "(check LYRIC_RENDER_ENGINE env var or earlier '[ASS] fast "
+            "path failed' log).",
+            lyrics_animation, line_transition,
+        )
+        try:
+            import sentry_sdk
+            sentry_sdk.add_breadcrumb(
+                category="render",
+                message="moviepy fallback with animation requested",
+                level="warning",
+                data={
+                    "lyrics_animation": lyrics_animation,
+                    "line_transition": line_transition,
+                    "spec_profile": getattr(spec, "profile", None),
+                    "engine_env": os.environ.get("LYRIC_RENDER_ENGINE", "ass"),
+                },
+            )
+        except Exception:  # pragma: no cover
+            pass
+
     for seg in segments:
+        # Per-line layout overrides set in the editor preview (parity with the
+        # ASS path's segments_to_lines). Absent → centered/motion default.
+        _lp = seg.get("pos")
+        _line_pos = (
+            (float(_lp["x"]), float(_lp["y"]))
+            if isinstance(_lp, dict) and "x" in _lp and "y" in _lp else None
+        )
+        _ls = seg.get("scale")
+        _line_scale = float(_ls) if isinstance(_ls, (int, float)) and _ls > 0 else 1.0
+        _lr = seg.get("rot")
+        _line_rot = float(_lr) if isinstance(_lr, (int, float)) else 0.0
         layers = _make_text_clip(
             seg["text"], seg["start"], seg["end"], font, spec=spec,
             text_case=text_case, font_scale=font_scale,
             lyric_transition=lyric_transition, text_motion=text_motion,
             text_contrast=text_contrast,
+            line_pos=_line_pos, line_scale=_line_scale, line_rot=_line_rot,
         )
         text_layers.extend(layers)
 
-    video = CompositeVideoClip([bg] + text_layers, size=(spec.width, spec.height))
+    # Effect overlay + color grade — moviepy path (fallback, and the path that
+    # runs whenever ffmpeg lacks libass). Mirror the libass pipeline exactly:
+    #   bg → [effect SCREEN-blend] → [grade] → (lyrics on top).
+    # TRUE screen blend (additive: 1-(1-bg)(1-fx)) over the bright-on-black loop
+    # — never darkens, no channel bias. (The earlier luminance-mask approach did
+    # alpha-OVER, which darkened mid-tones and used only the red channel.)
+    import fx_compositor as _fx
+    import numpy as _np
+    _fx_clip = None
+    try:
+        _fx_path = _fx.effect_path(effect)
+        if _fx_path:
+            from moviepy.editor import VideoFileClip as _VFC, vfx as _vfx
+            _fx_clip = (_cover_resize(_VFC(_fx_path), spec.width, spec.height)
+                        .fx(_vfx.loop, duration=duration)
+                        .set_duration(duration))
+    except Exception as _e:
+        logger.warning("[FX] moviepy effect skipped (%s); continuing", _e)
+        _fx_clip = None
+
+    _grade_style = style if _fx.grade_filter(style) else ""
+    if _fx_clip is not None or _grade_style:
+        _base_src = bg
+        _fx_src = _fx_clip
+
+        def _fx_base_frame(t):
+            b = _base_src.get_frame(t).astype(_np.float32)
+            if _fx_src is not None:
+                f = _fx_src.get_frame(t).astype(_np.float32)
+                b = 255.0 - (255.0 - b) * (255.0 - f) / 255.0  # screen
+            return _fx.grade_frame(b, _grade_style).clip(0, 255).astype("uint8")
+
+        base = VideoClip(_fx_base_frame, duration=duration).set_fps(spec.fps)
+    else:
+        base = bg
+
+    _moviepy_t0 = _time.monotonic()
+    video = CompositeVideoClip([base] + text_layers, size=(spec.width, spec.height))
     video = video.set_audio(audio).set_duration(duration)
 
     if spec.profile == "umg":
@@ -6682,12 +8006,14 @@ def generate_lyric_video(
             codec=spec.codec,
             audio_codec=spec.audio_codec,
             ffmpeg_params=ffmpeg_params,
-            threads=4,
+            threads=8,  # ProRes (prores_ks): preset no aplica; threads sí
             logger=None,
         )
         audio.close()
         bg.close()
         video.close()
+        if _fx_clip is not None:
+            _fx_clip.close()
 
         # Post-process: stream-copy the ProRes video and re-encode audio
         # to pcm_s24le at 48 kHz. UMG requires this exact audio spec; no
@@ -6714,20 +8040,36 @@ def generate_lyric_video(
         errors = _validate_umg_master(out_path, spec)
         if errors:
             raise RuntimeError(f"UMG validation failed: {'; '.join(errors)}")
+        logger.info("[MOVIEPY] render: %.1fs (engine=moviepy, profile=%s)",
+                    _time.monotonic() - _moviepy_t0, spec.profile)
         return out_path, font, bg_source
 
     out_path = os.path.join(job_dir, "lyric_video.mp4")
+    # preset="veryfast" + threads=8: ~2.5-3x más rápido que el "medium"
+    # default de moviepy en el encode x264. Seguro para el deliverable
+    # YouTube/H264 (YouTube re-encoda en upload, así que el preset de la
+    # fuente no afecta la calidad final; el master ProRes de UMG es un
+    # path separado, intacto). Acelera la mitad-encode de cada re-render.
     video.write_videofile(
         out_path,
         fps=spec.fps,
         codec=spec.codec,
         audio_codec=spec.audio_codec,
-        threads=4,
+        threads=8,
+        preset="veryfast",
+        # +faststart: moov atom al frente → reproducción progresiva en el
+        # navegador sin depender de range-requests (universal para archivos
+        # grandes). Mismo motivo que el path libass.
+        ffmpeg_params=["-movflags", "+faststart"],
         logger=None,
     )
     audio.close()
     bg.close()
     video.close()
+    if _fx_clip is not None:
+        _fx_clip.close()
+    logger.info("[MOVIEPY] render: %.1fs (engine=moviepy, profile=%s)",
+                _time.monotonic() - _moviepy_t0, spec.profile)
     return out_path, font, bg_source
 
 
@@ -6900,7 +8242,9 @@ def generate_short(
         fps=fps,
         codec="libx264",
         audio_codec="aac",
-        threads=4,
+        threads=8,
+        preset="veryfast",
+        ffmpeg_params=["-movflags", "+faststart"],
         logger=None,
     )
     audio.close()
@@ -7104,9 +8448,15 @@ def run_edit_pipeline(
     font_scale = float(merged.get("font_scale") or 1.0)
     lyric_transition = merged.get("lyric_transition") or "cut"
     text_motion = merged.get("text_motion") or "none"
+    lyrics_animation = merged.get("lyrics_animation") or "none"
+    line_transition = merged.get("line_transition") or "none"
     genre = merged.get("genre") or ""
     concept = merged.get("concept") or ""
     movement_style = merged.get("movement_style") or ""
+    # Effect overlay + custom palette persist across edits via render_params,
+    # so a re-render keeps the snow/rain/grade the operator picked at upload.
+    effect = merged.get("effect") or ""
+    custom_colors = merged.get("custom_colors") or ""
     # Per-edit operator hint for background regen (set by /edit when the
     # user typed in the "Aclarar tipo de fondo" textarea). None if absent;
     # propagates only into the `background` branch below.
@@ -7116,6 +8466,11 @@ def run_edit_pipeline(
     # Defaults to "veo" when unset for backward compatibility — pre-2026-05-16
     # edits never carried this field. Validated upstream by Pydantic enum.
     background_mode = edit_params.get("background_mode") or "veo"
+    # "Usar mi prompt tal cual": send background_hint straight to Veo without
+    # Gemini's rewrite. Read from merged so a verbatim choice persisted at
+    # generate time survives, but it only takes effect in the background
+    # branch when a hint is actually present (see _get_unique_prompt).
+    bg_verbatim = bool(merged.get("bg_verbatim"))
 
     job_dir = os.path.join(OUTPUTS_DIR, job_id)
     os.makedirs(job_dir, exist_ok=True)
@@ -7163,6 +8518,7 @@ def run_edit_pipeline(
                 movement_style=movement_style,
                 background_hint=background_hint,
                 bg_mode=background_mode,
+                bg_verbatim=bg_verbatim,
                 allow_people=_compute_allow_people(job_id),
             )
             update_job(job_id, progress=35)
@@ -7204,6 +8560,9 @@ def run_edit_pipeline(
             font_scale=font_scale,
             lyric_transition=lyric_transition,
             text_motion=text_motion,
+            lyrics_animation=lyrics_animation,
+            line_transition=line_transition,
+            effect=effect, custom_colors=custom_colors,
         )
         files = {"video_url": f"/download/{job_id}/video"}
         update_job(job_id, progress=55)

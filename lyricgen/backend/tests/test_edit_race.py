@@ -28,13 +28,23 @@ from database import Job as JobModel
 
 
 @pytest.mark.postgres
-def test_concurrent_edits_respect_max_edits_limit(client, admin_token, db):
-    """5 requests POST /edit concurrentes; solo _MAX_EDITS=3 deben
-    ganar. Los otros 2 deben recibir 400 con 'Maximum edit limit'.
-    Verifica que el lock with_for_update() serializa el
-    read-validate-write de edit_count.
+def test_concurrent_edits_respect_max_edits_limit(client, user_token, db):
+    """5 requests POST /edit concurrentes (usuario NO-admin); solo
+    _MAX_EDITS=3 deben ganar. Los otros 2 deben recibir 400 con
+    'Maximum edit limit'. Verifica que el lock with_for_update()
+    serializa el read-validate-write de edit_count.
+
+    Usa user_token (no admin): el límite solo aplica a no-admins —
+    los admins son exentos (ver test_admin_exempt_from_edit_limit).
     """
     from pipeline import _MAX_EDITS
+
+    # El job debe vivir en el tenant del usuario para que /edit lo
+    # encuentre (filtra por current_user["tenant_id"]).
+    me = client.get(
+        "/auth/me", headers={"Authorization": f"Bearer {user_token}"}
+    ).json()
+    tenant_id = me["tenant_id"]
 
     # Setup: job en pending_review listo para edits. bg_r2_key_cached
     # y segments_json no None para que pase los checks de
@@ -42,7 +52,7 @@ def test_concurrent_edits_respect_max_edits_limit(client, admin_token, db):
     job_id = uuid.uuid4().hex[:12]
     job = JobModel(
         job_id=job_id,
-        tenant_id="default",  # admin default tenant
+        tenant_id=tenant_id,
         artist="Test",
         song_title="Race Test",
         status="pending_review",
@@ -66,7 +76,7 @@ def test_concurrent_edits_respect_max_edits_limit(client, admin_token, db):
         start_gate.wait(timeout=5.0)
         res = client.post(
             f"/edit/{job_id}",
-            headers={"Authorization": f"Bearer {admin_token}"},
+            headers={"Authorization": f"Bearer {user_token}"},
             json={
                 "edit_type": "typography",
                 "font": "Arial",
@@ -102,3 +112,76 @@ def test_concurrent_edits_respect_max_edits_limit(client, admin_token, db):
         f"edit_count en DB es {fresh.edit_count}, esperado {_MAX_EDITS}. "
         f"El race se coló — múltiples requests pasaron el check < _MAX_EDITS."
     )
+
+
+def test_admin_exempt_from_edit_limit(client, admin_token, db, monkeypatch):
+    """Un admin puede editar más allá de _MAX_EDITS. Arrancamos el job
+    YA en el límite (edit_count = _MAX_EDITS) y verificamos que el
+    siguiente /edit pasa (200) en vez de 400 'Maximum edit limit'.
+    """
+    from pipeline import _MAX_EDITS
+
+    # enqueue_edit sin Redis real en CI: no-op capturador.
+    import main
+    monkeypatch.setattr(main, "enqueue_edit", lambda **kwargs: "test:noop")
+
+    me = client.get(
+        "/auth/me", headers={"Authorization": f"Bearer {admin_token}"}
+    ).json()
+    assert me["role"] == "admin"
+
+    job_id = uuid.uuid4().hex[:12]
+    job = JobModel(
+        job_id=job_id,
+        tenant_id=me["tenant_id"],
+        artist="Test",
+        song_title="Admin Exempt",
+        status="pending_review",
+        delivery_profile="youtube",
+        progress=100,
+        bg_r2_key_cached="fake/key.mp4",
+        segments_json=[{"start": 0.0, "end": 1.0, "text": "test"}],
+        edit_count=_MAX_EDITS,  # ya en el límite
+    )
+    db.add(job)
+    db.commit()
+
+    res = client.post(
+        f"/edit/{job_id}",
+        headers={"Authorization": f"Bearer {admin_token}"},
+        json={"edit_type": "typography", "font": "Arial"},
+    )
+    assert res.status_code == 200, (
+        f"admin debería poder editar más allá de _MAX_EDITS, "
+        f"got {res.status_code}: {res.text}"
+    )
+    body = res.json()
+    assert body.get("edit_limit_exempt") is True
+    assert body["edit_count"] == _MAX_EDITS + 1
+
+
+def test_status_reports_edit_limit_exempt_for_admin(client, admin_token, db):
+    """GET /status devuelve edit_limit_exempt=True para admin (la UI lo
+    usa para mostrar 'sin límite' y no bloquear el panel de edición)."""
+    job_id = uuid.uuid4().hex[:12]
+    me = client.get(
+        "/auth/me", headers={"Authorization": f"Bearer {admin_token}"}
+    ).json()
+    job = JobModel(
+        job_id=job_id,
+        tenant_id=me["tenant_id"],
+        artist="Test",
+        song_title="Exempt Status",
+        status="pending_review",
+        delivery_profile="youtube",
+        progress=100,
+        edit_count=3,
+    )
+    db.add(job)
+    db.commit()
+
+    res = client.get(
+        f"/status/{job_id}", headers={"Authorization": f"Bearer {admin_token}"}
+    )
+    assert res.status_code == 200, res.text
+    assert res.json().get("edit_limit_exempt") is True

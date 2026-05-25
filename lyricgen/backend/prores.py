@@ -158,30 +158,18 @@ def ensure_prores_exists(
                     file_path, tenant_id, job_id, FILE_MAP_PRORES[file_type],
                 )
                 if key:
-                    # Re-read s3_keys FRESH from the DB before merging.
-                    # The `job` dict was snapshot in prewarm_prores BEFORE
-                    # the 60-300 s transcode; if the OTHER ProRes prewarm
-                    # (umg_master vs umg_short — both are enqueued together
-                    # in main.py:enable_prores_for_job) finished while ours
-                    # was running, it already wrote its key to s3_keys.
-                    # Using the stale snapshot here would overwrite that
-                    # key — the file stays in R2 but the row reports it as
-                    # missing, and the app shows "Generando ProRes..."
-                    # forever. Confirmed in prod 2026-05-12: 8 of 18 done-
-                    # UMG jobs had a phantom-missing key (reconciled in a
-                    # one-off SQL script).
-                    from jobs import get_job_model
-                    from database import SessionLocal
-                    _db = SessionLocal()
-                    try:
-                        _fresh = get_job_model(_db, job_id)
-                        current_keys = dict(
-                            (_fresh.s3_keys if _fresh else None) or {}
-                        )
-                    finally:
-                        _db.close()
-                    current_keys[file_type] = key
-                    update_job(job_id, s3_keys=current_keys)
+                    # U1 fix (audit 2026-05-25): merge atómico vía
+                    # `jobs.merge_s3_keys` — SELECT FOR UPDATE + read +
+                    # write en una sola tx. El path anterior (read en tx
+                    # A, write en tx B) tenía una race window entre los
+                    # dos prewarm workers (umg_master + umg_short) que
+                    # corrieron en paralelo: ambos snapshotean s3_keys={}
+                    # antes del transcode de 60-300s, y al final el
+                    # segundo en escribir pisa la key del primero. Prod
+                    # 2026-05-12: 8/18 jobs UMG perdieron una key,
+                    # reconciliado a mano por SQL.
+                    from jobs import merge_s3_keys
+                    merge_s3_keys(job_id, file_type, key)
         except Exception as e:  # pragma: no cover
             logger.warning("[PRORES] R2 upload skipped: %s", e)
 

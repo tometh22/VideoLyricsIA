@@ -128,6 +128,37 @@ healthcheckTimeout = 90
 # viene de SIGTERM handler (worker.py:_graceful drain in-flight) + RQ
 # Retry en queue_jobs.py (auto-recover si el worker muere mid-job).
 
+# --- Watch paths: NO redeployar el Worker en cambios solo-frontend ---
+#
+# PROBLEMA (2026-05-20): sin watchPatterns, Railway redeploya el Worker
+# en CADA push, incluso PRs que tocan solo el frontend (LyricsTimeline.jsx,
+# LyricsEditor.jsx). Cada redeploy SIGTERM-ea al Worker y, si entran varios
+# deploys seguidos (ráfaga de merges), mata el render en vuelo a mitad de
+# camino. Ese día murió el re-render de "Costumbres argentinas" 2 veces a
+# 90% por ~5 deploys frontend-only en 1h. RQ Retry lo recuperó, pero es
+# evitable de raíz.
+#
+# El Worker es un daemon RQ: NO sirve el frontend (eso lo hace la API, que
+# bundlea frontend/dist y se deja redeployar libre — tiene deploy rolling
+# con numReplicas=2 y no mata renders). El Worker solo necesita redeployar
+# cuando cambia código de backend o el build.
+#
+# Paths relativos al REPO ROOT (railway.toml vive en repo root y Railway
+# lo honra como source of truth → la base es repo root, no lyricgen/).
+#
+# VERIFICAR tras el primer deploy con esto activo:
+#   1. Un push que toca SOLO lyricgen/frontend/** → el Worker NO redeploya.
+#   2. Un push que toca lyricgen/backend/** → el Worker SÍ redeploya.
+# Si el Worker dejara de redeployar en cambios de backend, la base de los
+# paths está mal (revisar Root Directory del servicio en el dashboard) —
+# corregir antes de seguir mergeando backend.
+[services.Worker.build]
+watchPatterns = [
+    "lyricgen/backend/**",
+    "lyricgen/Dockerfile",
+    "railway.toml",
+]
+
 [services.Worker.deploy]
 restartPolicyType = "ON_FAILURE"
 restartPolicyMaxRetries = 10

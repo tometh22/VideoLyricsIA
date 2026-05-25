@@ -105,15 +105,29 @@
   .input-field {
     @apply w-full px-5 py-4 rounded-button
       bg-surface-1 border border-white/[0.06]
-      focus:border-brand/50 focus:ring-2 focus:ring-brand/20 focus:outline-none
+      focus:border-brand focus:ring-2 focus:ring-brand/50 focus:outline-none
       text-ink-primary placeholder-ink-secondary/60;
     transition: all var(--motion-duration) var(--motion-ease);
     box-shadow: inset 0 2px 4px rgba(0, 0, 0, 0.2);
   }
+  /* Focus state — UI specialist 2026-05-24: bumped from ring-brand/20 (6%
+     visible sobre #12121A) a ring-brand/50 + box-shadow @0.3. WCAG AA pass
+     en dark mode + keyboard nav visible. */
   .input-field:focus {
     box-shadow:
       inset 0 2px 4px rgba(0, 0, 0, 0.2),
-      0 0 0 3px rgba(109, 74, 255, 0.1);
+      0 0 0 3px rgba(109, 74, 255, 0.3);
+  }
+
+  /* Keyboard focus indicator global — botones, links, controles que no
+     declaran su propio focus. Sin esto la nav con Tab es invisible.
+     `:focus-visible` solo aparece en keyboard, NO en click — los users de
+     mouse no ven ring. */
+  button:focus-visible,
+  a:focus-visible,
+  [role="button"]:focus-visible,
+  [tabindex]:focus-visible {
+    @apply outline-none ring-2 ring-brand/50 ring-offset-2 ring-offset-surface;
   }
 
   /* Stat card retains its existing visual treatment but inherits the

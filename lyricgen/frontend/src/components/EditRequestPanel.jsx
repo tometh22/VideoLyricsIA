@@ -21,59 +21,6 @@ function authHeaders() {
   return token ? { Authorization: `Bearer ${token}` } : {};
 }
 
-// Same font list the operator chose during upload — keeps the cached
-// background usable (we only render new typography over the existing video).
-const FONTS = [
-  { code: "",                label: "Auto",                      css: "'Montserrat', sans-serif" },
-  { code: "jost-bold",       label: "Jost (estilo Futura)",      css: "'Jost', sans-serif" },
-  { code: "montserrat-bold", label: "Montserrat",                css: "'Montserrat', sans-serif" },
-  { code: "poppins-bold",    label: "Poppins",                   css: "'Poppins', sans-serif" },
-  { code: "outfit-bold",     label: "Outfit (estilo Gilroy)",    css: "'Outfit', sans-serif" },
-  { code: "roboto-bold",     label: "Roboto",                    css: "'Roboto', sans-serif" },
-  { code: "bebas-neue",      label: "Bebas Neue",                css: "'Bebas Neue', sans-serif" },
-  { code: "oswald-bold",     label: "Oswald",                    css: "'Oswald', sans-serif" },
-  { code: "anton",           label: "Anton",                     css: "'Anton', sans-serif" },
-];
-
-const FONT_CSS_BY_CODE = FONTS.reduce((acc, f) => { acc[f.code] = f.css; return acc; }, {});
-
-function applyCaseToPreview(text, caseCode) {
-  if (caseCode === "upper") return text.toUpperCase();
-  if (caseCode === "lower") return text.toLowerCase();
-  if (caseCode === "title") return text.replace(/\b\w/g, (c) => c.toUpperCase());
-  return text;
-}
-
-const CASE_OPTS = [
-  { code: "upper",    d: "MAY", label: "Todo en MAYÚSCULAS" },
-  { code: "title",    d: "Aa",  label: "Primera letra de Cada Palabra" },
-  { code: "lower",    d: "min", label: "todo en minúsculas" },
-  { code: "original", d: "ori", label: "Sin cambios" },
-];
-
-const TRANSITION_OPTS = [
-  { code: "cut",  label: "Corte (instantáneo)" },
-  { code: "fade", label: "Fade" },
-  { code: "slow", label: "Fade lento" },
-];
-
-const MOTION_OPTS = [
-  { code: "none",   label: "Estático" },
-  { code: "subtle", label: "Movimiento sutil" },
-  // "float" temporarily hidden — per-frame position callable in moviepy
-  // (pipeline.py:_text_position_func) blocks compositing optimizations,
-  // making long songs hit the 20-min RQ timeout. Backend aliases any
-  // float requests to "subtle" for safety. Will re-enable once we
-  // refactor the text layer to ffmpeg overlay filters.
-];
-
-// Motion picker hidden hasta decidir qué animación implementar.
-// Backend default queda en text_motion="none". Cambiar a true para
-// re-mostrar el dropdown sin tocar nada más.
-const SHOW_MOTION_PICKER = false;
-
-const SCALE_STEPS = [0.8, 1.0, 1.2, 1.5, 1.8, 2.0];
-
 export default function EditRequestPanel({
   job,
   onEditTriggered,
@@ -82,15 +29,17 @@ export default function EditRequestPanel({
   // a job is in done/rejected, JobDetail narrows this to ["lyrics"] so
   // the user can fix typos but can't trigger fresh Veo regens or
   // typography re-renders on already-approved/rejected videos.
-  allowedModes = ["typography", "lyrics", "background"],
+  allowedModes = ["lyrics", "background"],
 }) {
-  const allowsTypography = allowedModes.includes("typography");
   const allowsLyrics = allowedModes.includes("lyrics");
   const allowsBackground = allowedModes.includes("background");
   const { t } = useI18n();
   const { alert } = useAlert();
   const editCount = job.edit_count ?? 0;
   const editsRemaining = job.edits_remaining ?? Math.max(0, 3 - editCount);
+  // Admins have no edit cap (backend bypasses it); the panel shows
+  // "sin límite" and never gates on editsRemaining.
+  const editLimitExempt = job.edit_limit_exempt ?? false;
   const initialParams = job.render_params || {};
 
   const [mode, setMode] = useState(null); // null | "typography" | "background" | "lyrics"
@@ -100,6 +49,21 @@ export default function EditRequestPanel({
   // responds; we surface the error inline if R2 has lost the input.
   const [lyricsAudioUrl, setLyricsAudioUrl] = useState(null);
   const [lyricsAudioError, setLyricsAudioError] = useState(null);
+  // Audio peak envelope for the timeline waveform. Best-effort: null →
+  // timeline renders without a waveform.
+  const [lyricsWaveform, setLyricsWaveform] = useState(null);
+  // Signed URL of the cached background video for the live preview.
+  // Best-effort: null → preview uses a style gradient.
+  const [lyricsBgUrl, setLyricsBgUrl] = useState(null);
+  // Typography chosen live in the editor's preview (null = unchanged).
+  const [lyricsFont, setLyricsFont] = useState(null);
+  const [lyricsCase, setLyricsCase] = useState(null);
+  const [lyricsContrast, setLyricsContrast] = useState(null);
+  // 2026-05-23: lyricsAnimation + lineTransition reemplazan al legacy
+  // lyricsTransition (Corte/Fade). Se eligen en el LyricsEditor y van al
+  // backend como lyrics_animation / line_transition.
+  const [lyricsAnimation, setLyricsAnimation] = useState(null);
+  const [lineTransition, setLineTransition] = useState(null);
   // Operator-typed background hint for edit_type="background". Empty
   // string when the operator hasn't typed anything (we send no field in
   // that case and the pipeline falls back to Gemini's lyrics-only
@@ -110,6 +74,24 @@ export default function EditRequestPanel({
   // Operator picks via the segmented toggle inside the background panel.
   // Default "veo" preserves the prior behavior of every edit pre-2026-05-16.
   const [backgroundMode, setBackgroundMode] = useState("veo");
+  // Camera/motion register for the background regen (incl. "estatico" =
+  // locked camera). Pre-filled from the job's persisted choice so the editor
+  // reflects what the wizard picked — the upload→edit flow shouldn't forget
+  // the operator's decision. "" = Auto (system varies per song).
+  const [movementStyle, setMovementStyle] = useState(initialParams.movement_style ?? "");
+  // "Usar mi prompt tal cual" — bypass Gemini's rewrite, send the hint
+  // straight to Veo. Pre-filled from render_params; only meaningful in
+  // Veo mode (Imagen renders a still, no verbatim camera negatives).
+  const [bgVerbatim, setBgVerbatim] = useState(!!initialParams.bg_verbatim);
+  // Movement options mirror the wizard's MOVEMENT_STYLES (kept in sync).
+  const MOVEMENT_OPTIONS = [
+    { code: "",              label: t("upload.movement_auto") || "Auto" },
+    { code: "estatico",      label: t("upload.movement_estatico") || "Estático (cámara fija)" },
+    { code: "sutil",         label: t("upload.movement_sutil") || "Sutil" },
+    { code: "estandar",      label: t("upload.movement_estandar") || "Estándar" },
+    { code: "foto-parallax", label: t("upload.movement_foto_parallax") || "Foto + parallax" },
+    { code: "animado",       label: t("upload.movement_animado") || "Animado" },
+  ];
   // Tenant-aware content-validation toggle. Boolean semantics:
   // value=true  → operator wants validator to run
   // value=false → operator wants validator skipped
@@ -137,21 +119,13 @@ export default function EditRequestPanel({
   // autosave overwrites the just-saved version with the stale one.
   // Bug found in 2026-05-19 QA pass. Reset when job changes (below).
   const [lastSavedSegments, setLastSavedSegments] = useState(null);
-  const [form, setForm] = useState({
-    font:             initialParams.font             ?? "",
-    font_scale:       initialParams.font_scale       ?? 1.0,
-    text_case:        initialParams.text_case        ?? "upper",
-    lyric_transition: initialParams.lyric_transition ?? "cut",
-    // Si el picker está oculto, forzamos "none" en lugar de heredar de
-    // initialParams. Sin esto, un job viejo que se renderizó con
-    // text_motion="subtle" mantendría motion al ser re-editado, y volvería
-    // a pegar contra el timeout de moviepy. Con SHOW_MOTION_PICKER=false
-    // el diff calcula form="none" vs initial="subtle" → manda
-    // text_motion:"none" al backend → re-render rápido y estable.
-    text_motion:      SHOW_MOTION_PICKER ? (initialParams.text_motion ?? "none") : "none",
-  });
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState(null);
+  // When a lyrics re-render is requested but the editor's segments match the
+  // persisted segments_json exactly, we don't hard-error: the rendered video
+  // can still be stale (lyrics fixed out-of-band, prior render failed). Hold
+  // the attempted segments here so the modal can offer "re-render anyway".
+  const [staleSegments, setStaleSegments] = useState(null);
   // Synchronous guard against double-click. `submitting` is async (React
   // schedules the re-render after the click handler returns) so a rapid
   // second click can fire its handler before the disabled flag flips.
@@ -170,6 +144,24 @@ export default function EditRequestPanel({
   const mountedRef = useRef(true);
   useEffect(() => () => { mountedRef.current = false; }, []);
 
+  // Frozen snapshot of the segments AS RENDERED, captured when the lyrics
+  // editor OPENS. The "unchanged" guard must compare against this, NOT the
+  // live job.segments_json: the editor autosaves layout (pos/scale/rot) back
+  // to segments_json, so by the time the operator clicks Approve the persisted
+  // array already equals the payload → the guard would think "nothing changed"
+  // and force a pointless second "re-render anyway" click. Comparing against
+  // the open-time snapshot makes any in-session edit count on the FIRST submit.
+  const openSegmentsRef = useRef(null);
+  useEffect(() => {
+    if (mode === "lyrics" && openSegmentsRef.current == null) {
+      openSegmentsRef.current = Array.isArray(job.segments_json)
+        ? JSON.parse(JSON.stringify(job.segments_json))
+        : [];
+    } else if (mode == null) {
+      openSegmentsRef.current = null; // reset for the next open
+    }
+  }, [mode, job.segments_json]);
+
   // Reset the local saved-segments mirror when the panel is reused across
   // a different job (JobDetail keeps EditRequestPanel mounted while you
   // navigate within the SPA). Without this, opening job B's editor would
@@ -179,12 +171,7 @@ export default function EditRequestPanel({
     setLastSavedSegments(null);
   }, [job.job_id]);
 
-  const limitReached = editsRemaining <= 0;
-  // Typography reuses the cached bg from R2 to skip Veo. Without a
-  // cached key the backend rejects the edit. Disable the button up-front
-  // instead of letting the user fill the form and getting a raw English
-  // 400 in the face.
-  const typographyAvailable = Boolean(job.bg_r2_key_cached);
+  const limitReached = !editLimitExempt && editsRemaining <= 0;
 
   // Clear stale error banners when the job transitions into "editing" —
   // means the regen actually kicked off, so a previous failure message
@@ -251,41 +238,37 @@ export default function EditRequestPanel({
   // text regardless of edit_type. Incident 2026-05-15: Bersuit lyric
   // "de la amor" → "del amor" was silently dropped on background
   // re-renders because of this race.
-  const buildPayload = (type) => {
-    if (type === "background") {
-      const p = { edit_type: "background" };
-      const hint = (backgroundHint || "").trim();
-      if (hint) p.background_hint = hint;
-      // Send mode explicitly only when non-default so older backends
-      // that don't know the field still accept the payload. After PR
-      // ships, dropping the check is safe but adds zero value.
-      if (backgroundMode && backgroundMode !== "veo") {
-        p.background_mode = backgroundMode;
-      }
-      // Always send one of the two flags based purely on operator intent.
-      // The tenant-conditional version silently dropped BOTH flags when
-      // frontend tenant detection failed (stale localStorage, old login)
-      // and the backend defaulted to UMG-validate. See VariantCreateModal
-      // for the full incident (2026-05-19).
-      if (!validationEnabled) {
-        p.bypass_content_validation = true;
-      } else {
-        p.force_content_validation = true;
-      }
-      if (latestEditedSegments.current && latestEditedSegments.current.length > 0) {
-        p.segments = latestEditedSegments.current;
-      }
-      return p;
+  // Only the background regen builds via this function now. Typography +
+  // lyrics live in the editor (edit_type="lyrics" via submitLyricsWithSegments,
+  // which gets segments from the modal LyricsEditor's onApprove callback).
+  const buildPayload = () => {
+    const p = { edit_type: "background" };
+    const hint = (backgroundHint || "").trim();
+    if (hint) p.background_hint = hint;
+    // Send mode explicitly only when non-default so older backends
+    // that don't know the field still accept the payload.
+    if (backgroundMode && backgroundMode !== "veo") {
+      p.background_mode = backgroundMode;
     }
-    // edit_type === "lyrics" no longer builds via this function — it's
-    // owned by submitLyricsWithSegments() which receives segments from
-    // the modal LyricsEditor's onApprove callback.
-    const p = { edit_type: "typography" };
-    if (form.font             !== (initialParams.font             ?? "")) p.font = form.font;
-    if (form.font_scale       !== (initialParams.font_scale       ?? 1.0)) p.font_scale = form.font_scale;
-    if (form.text_case        !== (initialParams.text_case        ?? "upper")) p.text_case = form.text_case;
-    if (form.lyric_transition !== (initialParams.lyric_transition ?? "cut")) p.lyric_transition = form.lyric_transition;
-    if (form.text_motion      !== (initialParams.text_motion      ?? "none")) p.text_motion = form.text_motion;
+    // Camera/motion register. Always send (incl. "" = Auto) so the editor
+    // can override a previously-persisted register, e.g. switch a drifting
+    // background to a locked one.
+    p.movement_style = movementStyle;
+    // Verbatim only applies to Veo + a non-empty hint; never with Imagen.
+    // ALWAYS send the boolean so unchecking the toggle clears a
+    // previously-persisted True on the backend (symmetric with the backend
+    // which always overwrites bg_verbatim for background edits).
+    p.bg_verbatim = !!(bgVerbatim && hint && backgroundMode !== "imagen");
+    // Always send one of the two flags based purely on operator intent.
+    // The tenant-conditional version silently dropped BOTH flags when
+    // frontend tenant detection failed (stale localStorage, old login)
+    // and the backend defaulted to UMG-validate. See VariantCreateModal
+    // for the full incident (2026-05-19).
+    if (!validationEnabled) {
+      p.bypass_content_validation = true;
+    } else {
+      p.force_content_validation = true;
+    }
     if (latestEditedSegments.current && latestEditedSegments.current.length > 0) {
       p.segments = latestEditedSegments.current;
     }
@@ -311,6 +294,22 @@ export default function EditRequestPanel({
     let cancelled = false;
     setLyricsAudioError(null);
     setLyricsAudioUrl(null);
+    setLyricsWaveform(null);
+    setLyricsBgUrl(null);
+    // Waveform for the timeline — best-effort, never blocks the editor.
+    (async () => {
+      try {
+        const r = await fetch(`${API}/jobs/${job.job_id}/waveform`, { headers: authHeaders() });
+        if (!cancelled && r.ok) setLyricsWaveform(await r.json());
+      } catch { /* timeline just renders without a waveform */ }
+    })();
+    // Cached background for the live preview — best-effort.
+    (async () => {
+      try {
+        const r = await fetch(`${API}/jobs/${job.job_id}/background-url`, { headers: authHeaders() });
+        if (!cancelled && r.ok) setLyricsBgUrl((await r.json()).url);
+      } catch { /* preview falls back to a gradient */ }
+    })();
     (async () => {
       try {
         const res = await fetch(`${API}/jobs/${job.job_id}/source-audio-url`, {
@@ -373,7 +372,7 @@ export default function EditRequestPanel({
   // directly (no internal draft state). Validates non-empty, short-
   // circuits the "nothing actually changed" case, fires POST + 409
   // retry, and notifies the parent on success.
-  const submitLyricsWithSegments = async (segments) => {
+  const submitLyricsWithSegments = async (segments, force = false) => {
     if (submitLockRef.current || limitReached) return;
     submitLockRef.current = true;
     if (!Array.isArray(segments) || segments.length === 0) {
@@ -385,29 +384,63 @@ export default function EditRequestPanel({
     }
     const payload = {
       edit_type: "lyrics",
+      // Preserve manual timing locks AND per-line layout (pos/scale/rot)
+      // set in the timeline/preview — stripping them here would silently
+      // discard the operator's layout on re-render.
       segments: segments.map((s) => ({
         start: Number(s.start) || 0,
         end: Number(s.end) || 0,
         text: String(s.text || ""),
+        ...(s.locked ? { locked: true } : {}),
+        ...(s.pos && typeof s.pos.x === "number" ? { pos: { x: s.pos.x, y: s.pos.y } } : {}),
+        ...(typeof s.scale === "number" && s.scale !== 1 ? { scale: s.scale } : {}),
+        ...(typeof s.rot === "number" && s.rot !== 0 ? { rot: s.rot } : {}),
       })),
+      // Typography picked live in the preview (omit when unchanged).
+      ...(lyricsFont != null ? { font: lyricsFont } : {}),
+      ...(lyricsCase != null ? { text_case: lyricsCase } : {}),
+      ...(lyricsContrast != null ? { text_contrast: lyricsContrast } : {}),
+      // Nuevos 2026-05-23 (reemplazan al legacy lyric_transition).
+      ...(lyricsAnimation != null ? { lyrics_animation: lyricsAnimation } : {}),
+      ...(lineTransition != null ? { line_transition: lineTransition } : {}),
     };
-    // No-change short-circuit: same exact array as the persisted one.
-    const original = Array.isArray(job.segments_json) ? job.segments_json : [];
-    const unchanged = original.length === payload.segments.length &&
+    // No-change short-circuit: compare against the OPEN-TIME snapshot (what
+    // the current video was rendered from), NOT the live job.segments_json —
+    // the editor autosaves layout into segments_json, which would mask the
+    // operator's edits and force a second "re-render anyway" click.
+    // A live font change OR any per-line layout change (pos/scale/rot) also
+    // counts as a real change so it doesn't fall into the stale-rerender path.
+    const original = Array.isArray(openSegmentsRef.current)
+      ? openSegmentsRef.current
+      : (Array.isArray(job.segments_json) ? job.segments_json : []);
+    const layoutChanged = original.length === payload.segments.length &&
+      original.some((s, i) => {
+        const p = payload.segments[i];
+        const o = s.pos || {}, np = p.pos || {};
+        return (o.x ?? null) !== (np.x ?? null) || (o.y ?? null) !== (np.y ?? null)
+          || (s.scale ?? 1) !== (p.scale ?? 1) || (s.rot ?? 0) !== (p.rot ?? 0);
+      });
+    const unchanged = lyricsFont == null && lyricsCase == null &&
+      lyricsContrast == null && lyricsAnimation == null && lineTransition == null && !layoutChanged &&
+      original.length === payload.segments.length &&
       original.every((s, i) =>
         s.text === payload.segments[i].text &&
         Math.abs((s.start ?? 0) - payload.segments[i].start) < 0.001 &&
         Math.abs((s.end ?? 0) - payload.segments[i].end) < 0.001
       );
-    if (unchanged) {
-      if (mountedRef.current) {
-        setError(t("edit.no_changes") || "No cambiaste ninguna opción — no hay nada que re-renderizar.");
-      }
+    if (unchanged && !force) {
+      // Not a dead end: the rendered video can be stale relative to
+      // segments_json (lyrics corrected out-of-band, or a prior render
+      // failed). Surface an explicit "re-render anyway" escape instead of a
+      // hard error that traps the operator with a correct-looking editor and
+      // an outdated video.
+      if (mountedRef.current) setStaleSegments(segments);
       submitLockRef.current = false;
       return;
     }
     if (mountedRef.current) setSubmitting(true);
     if (mountedRef.current) setError(null);
+    if (mountedRef.current) setStaleSegments(null);
     let succeeded = false;
     try {
       const { ok, status, data, cancelled } = await postEditWithRetry(payload);
@@ -434,23 +467,11 @@ export default function EditRequestPanel({
     }
   };
 
-  const submit = async (type) => {
+  const submit = async () => {
     if (submitLockRef.current || limitReached) return;
     submitLockRef.current = true;
 
-    // Defensive: catch the "user clicked submit without changing
-    // anything" case BEFORE hitting the API. Otherwise the backend
-    // happily re-renders with identical params, the user waits ~5min
-    // for the same video, and burns one of their 3 edits.
-    const payload = buildPayload(type);
-    if (type === "typography" && Object.keys(payload).length === 1) {
-      if (mountedRef.current) {
-        setError(t("edit.no_changes") || "No cambiaste ninguna opción — no hay nada que re-renderizar.");
-      }
-      submitLockRef.current = false;
-      return;
-    }
-
+    const payload = buildPayload();
     if (mountedRef.current) setSubmitting(true);
     if (mountedRef.current) setError(null);
     let succeeded = false;
@@ -524,7 +545,9 @@ export default function EditRequestPanel({
           </p>
         </div>
         <span className="text-[11px] font-mono text-ink-secondary px-2 py-1 rounded-md bg-surface-3/60 ring-1 ring-white/[0.04] shrink-0">
-          {editsRemaining === 1
+          {editLimitExempt
+            ? (t("edit.no_limit") || "sin límite")
+            : editsRemaining === 1
             ? (t("edit.remaining_one") || "1 ed. restante")
             : `${editsRemaining} ${t("edit.remaining_many") || "ed. restantes"}`}
         </span>
@@ -536,42 +559,6 @@ export default function EditRequestPanel({
           allowedModes.length === 2 ? "sm:grid-cols-2" :
           "sm:grid-cols-3"
         }`}>
-          {allowsTypography && typographyAvailable && (
-          <button
-            type="button"
-            onClick={() => setMode("typography")}
-            className="text-left p-4 rounded-xl bg-surface-3/40 hover:bg-surface-3/60 ring-1 ring-white/[0.04] hover:ring-brand/30 transition-all"
-          >
-            <div className="flex items-center gap-2 mb-1">
-              <svg className="w-4 h-4 text-brand-light" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
-                <path d="M4 7V4h16v3M9 20h6M12 4v16" strokeLinecap="round" />
-              </svg>
-              <span className="text-sm font-medium text-white">
-                {t("edit.typography_title") || "Cambiar tipografía"}
-              </span>
-            </div>
-            <p className="text-[11px] text-ink-secondary">
-              {t("edit.typography_cost") || "~5-10 min · sin costo extra · reutiliza el fondo actual"}
-            </p>
-          </button>
-          )}
-          {allowsTypography && !typographyAvailable && (
-          <div className="text-left p-4 rounded-xl bg-surface-3/20 ring-1 ring-white/[0.03] opacity-60 cursor-not-allowed">
-            <div className="flex items-center gap-2 mb-1">
-              <svg className="w-4 h-4 text-ink-secondary" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
-                <path d="M4 7V4h16v3M9 20h6M12 4v16" strokeLinecap="round" />
-              </svg>
-              <span className="text-sm font-medium text-ink-secondary">
-                {t("edit.typography_title") || "Cambiar tipografía"}
-              </span>
-            </div>
-            <p className="text-[11px] text-amber-300/80">
-              {t("edit.typography_needs_bg") ||
-                "Este video no tiene fondo cacheado. Regenerá el fondo primero para poder cambiar la tipografía."}
-            </p>
-          </div>
-          )}
-
           {allowsLyrics && (
           <button
             type="button"
@@ -583,11 +570,11 @@ export default function EditRequestPanel({
                 <path d="M9 19V6l12-2v13M9 19a2 2 0 11-4 0 2 2 0 014 0zM21 17a2 2 0 11-4 0 2 2 0 014 0z" strokeLinecap="round" />
               </svg>
               <span className="text-sm font-medium text-white">
-                {t("edit.lyrics_title") || "Corregir letras"}
+                {t("edit.lyrics_title") || "Editar letras y estilo"}
               </span>
             </div>
             <p className="text-[11px] text-ink-secondary">
-              {t("edit.lyrics_cost") || "~5-10 min · sin costo extra · cambiá palabras o frases mal transcriptas"}
+              {t("edit.lyrics_cost") || "~5-10 min · sin costo extra · letra, tipografía, tamaño y posición — en vivo sobre el video"}
             </p>
           </button>
           )}
@@ -620,197 +607,6 @@ export default function EditRequestPanel({
           open. See the {mode === "lyrics" && ...} block below the
           background section. */}
 
-      {mode === "typography" && (
-        <div className="space-y-3 animate-fade-in">
-          {/* Live preview — renders the sample lyric with the controls
-              the operator is touching so they can see the result before
-              firing the ~5min re-render. The 16:9 frame is the same
-              aspect the worker outputs. AUTO falls back to Montserrat
-              with a note so the operator knows the final font won't
-              actually be Montserrat at render time. */}
-          {(() => {
-            const sample = t("edit.sample_lyric") || "Como el viento que se va";
-            const previewText = applyCaseToPreview(sample, form.text_case);
-            const fontCss = FONT_CSS_BY_CODE[form.font] || FONT_CSS_BY_CODE[""];
-            const isAuto = !form.font;
-            // Preview is ~480px wide vs 1920px video, so font scales down ~4×
-            const basePx = 70;
-            const scaledPx = Math.max(14, Math.round(basePx * form.font_scale * (480 / 1920)));
-            return (
-              <div>
-                <label className="text-[11px] text-ink-secondary uppercase tracking-wider block mb-1">
-                  {t("edit.preview_label") || "Vista previa"}
-                </label>
-                <div className="rounded-xl overflow-hidden ring-1 ring-white/[0.06]">
-                  <div
-                    className="relative w-full flex items-center justify-center bg-gradient-to-b from-gray-900 to-black"
-                    style={{ aspectRatio: "16/9", maxHeight: "140px" }}
-                  >
-                    <p
-                      style={{
-                        fontFamily: fontCss,
-                        fontSize: `${scaledPx}px`,
-                        fontWeight: 700,
-                        color: "white",
-                        opacity: isAuto ? 0.65 : 1,
-                        textShadow: "0 0 4px rgba(0,0,0,0.9), 1px 1px 3px rgba(0,0,0,0.8)",
-                        textAlign: "center",
-                        lineHeight: 1.2,
-                        padding: "0 12px",
-                        wordBreak: "break-word",
-                        margin: 0,
-                      }}
-                    >
-                      {previewText}
-                    </p>
-                  </div>
-                  {isAuto && (
-                    <div className="px-3 py-1.5 bg-amber-500/[0.08] border-t border-amber-500/20 text-[10px] text-amber-200/90">
-                      {t("editor.auto_font_badge") || "Tipografía: Auto"}
-                      {" · "}
-                      {t("editor.auto_font_explainer") || "el render va a elegir una de 8 fuentes al azar."}
-                    </div>
-                  )}
-                </div>
-              </div>
-            );
-          })()}
-
-          {/* Font */}
-          <div>
-            <label className="text-[11px] text-ink-secondary uppercase tracking-wider block mb-1">
-              {t("upload.font_label") || "Fuente"}
-            </label>
-            <select
-              value={form.font}
-              onChange={(e) => setForm({ ...form, font: e.target.value })}
-              className="input-field text-sm w-full"
-            >
-              {FONTS.map((f) => (
-                <option key={f.code} value={f.code}>{f.label}</option>
-              ))}
-            </select>
-          </div>
-
-          {/* Font scale */}
-          <div>
-            <label className="text-[11px] text-ink-secondary uppercase tracking-wider block mb-1">
-              {t("upload.font_scale_label") || "Tamaño"} · <span className="font-mono text-white">{form.font_scale.toFixed(1)}×</span>
-            </label>
-            <div className="flex gap-1">
-              {SCALE_STEPS.map((s) => (
-                <button
-                  key={s}
-                  type="button"
-                  onClick={() => setForm({ ...form, font_scale: s })}
-                  className={`flex-1 py-2 rounded-md text-[11px] font-mono font-bold transition-all
-                    ${form.font_scale === s
-                      ? "bg-brand/20 text-brand ring-1 ring-brand/40"
-                      : "bg-surface-3/40 text-gray-500 hover:text-gray-300"
-                    }`}
-                >{s.toFixed(1)}×</button>
-              ))}
-            </div>
-          </div>
-
-          {/* Case */}
-          <div>
-            <label className="text-[11px] text-ink-secondary uppercase tracking-wider block mb-1">
-              {t("upload.text_case_label") || "Caja"}
-            </label>
-            <div className="flex gap-1">
-              {CASE_OPTS.map((o) => (
-                <button
-                  key={o.code}
-                  type="button"
-                  title={o.label}
-                  onClick={() => setForm({ ...form, text_case: o.code })}
-                  className={`flex-1 py-2 rounded-md text-[11px] font-mono font-bold transition-all
-                    ${form.text_case === o.code
-                      ? "bg-brand/20 text-brand ring-1 ring-brand/40"
-                      : "bg-surface-3/40 text-gray-500 hover:text-gray-300"
-                    }`}
-                >{o.d}</button>
-              ))}
-            </div>
-          </div>
-
-          {/* Transition */}
-          <div>
-            <label className="text-[11px] text-ink-secondary uppercase tracking-wider block mb-1">
-              {t("upload.transition_label") || "Transición entre líneas"}
-            </label>
-            <div className="flex gap-1">
-              {TRANSITION_OPTS.map((o) => (
-                <button
-                  key={o.code}
-                  type="button"
-                  onClick={() => setForm({ ...form, lyric_transition: o.code })}
-                  className={`flex-1 py-2 rounded-md text-[11px] font-medium transition-all
-                    ${form.lyric_transition === o.code
-                      ? "bg-brand/20 text-brand ring-1 ring-brand/40"
-                      : "bg-surface-3/40 text-gray-500 hover:text-gray-300"
-                    }`}
-                >{o.label}</button>
-              ))}
-            </div>
-          </div>
-
-          {/* Motion */}
-          {SHOW_MOTION_PICKER && (
-          <div>
-            <label className="text-[11px] text-ink-secondary uppercase tracking-wider block mb-1">
-              {t("upload.motion_label") || "Movimiento del texto"}
-            </label>
-            <div className="flex gap-1">
-              {MOTION_OPTS.map((o) => (
-                <button
-                  key={o.code}
-                  type="button"
-                  onClick={() => setForm({ ...form, text_motion: o.code })}
-                  className={`flex-1 py-2 rounded-md text-[11px] font-medium transition-all
-                    ${form.text_motion === o.code
-                      ? "bg-brand/20 text-brand ring-1 ring-brand/40"
-                      : "bg-surface-3/40 text-gray-500 hover:text-gray-300"
-                    }`}
-                >{o.label}</button>
-              ))}
-            </div>
-          </div>
-          )}
-
-          {error && (
-            <div className="text-xs text-red-300 px-3 py-2 rounded-md bg-red-500/10 ring-1 ring-red-500/30">
-              {error}
-            </div>
-          )}
-
-          <div className="flex gap-2 pt-1">
-            <button
-              type="button"
-              onClick={() => { setMode(null); setError(null); }}
-              disabled={submitting}
-              className="btn-secondary h-10 px-4 text-xs disabled:opacity-50"
-            >
-              {t("edit.cancel") || "Cancelar"}
-            </button>
-            <button
-              type="button"
-              onClick={() => submit("typography")}
-              disabled={submitting}
-              className="flex-1 btn-primary h-10 px-4 text-xs disabled:opacity-50"
-            >
-              {submitting ? (
-                <span className="inline-flex items-center gap-2">
-                  <span className="w-3 h-3 border-2 border-white border-t-transparent rounded-full animate-spin" />
-                  {t("edit.submitting") || "Enviando..."}
-                </span>
-              ) : (t("edit.typography_submit") || "Pedir re-render con estos cambios")}
-            </button>
-          </div>
-        </div>
-      )}
-
       {mode === "background" && (
         <div className="space-y-3 animate-fade-in">
           <div className="p-3 rounded-xl bg-accent/[0.06] ring-1 ring-accent/25">
@@ -836,7 +632,7 @@ export default function EditRequestPanel({
               type="button"
               onClick={() => setBackgroundMode("veo")}
               disabled={submitting}
-              className={`flex-1 px-3 py-2 rounded-lg text-[11px] font-medium transition-colors flex flex-col items-center gap-0.5 ${
+              className={`flex-1 px-3 py-2 rounded-lg text-label transition-colors flex flex-col items-center gap-0.5 ${
                 backgroundMode === "veo"
                   ? "bg-brand/20 text-brand-light ring-1 ring-brand/30"
                   : "text-ink-secondary hover:text-white hover:bg-white/[0.04]"
@@ -857,7 +653,7 @@ export default function EditRequestPanel({
               type="button"
               onClick={() => setBackgroundMode("imagen")}
               disabled={submitting}
-              className={`flex-1 px-3 py-2 rounded-lg text-[11px] font-medium transition-colors flex flex-col items-center gap-0.5 ${
+              className={`flex-1 px-3 py-2 rounded-lg text-label transition-colors flex flex-col items-center gap-0.5 ${
                 backgroundMode === "imagen"
                   ? "bg-brand/20 text-brand-light ring-1 ring-brand/30"
                   : "text-ink-secondary hover:text-white hover:bg-white/[0.04]"
@@ -877,11 +673,57 @@ export default function EditRequestPanel({
             </button>
           </div>
 
+          {/* Camera/motion register — lets the operator change how the new
+              background moves (incl. Estático = locked camera) without prose.
+              Closes the gap where movement was only selectable in the wizard. */}
+          <div>
+            <p className="text-[10px] uppercase tracking-[0.18em] text-ink-secondary mb-1.5">
+              {t("edit.movement_label") || "Movimiento de cámara"}
+            </p>
+            <div className="flex flex-wrap gap-1.5">
+              {MOVEMENT_OPTIONS.map((m) => (
+                <button
+                  key={m.code || "auto"}
+                  type="button"
+                  disabled={submitting}
+                  onClick={() => setMovementStyle(m.code)}
+                  className={`px-2.5 py-1.5 rounded-lg text-label transition-colors ${
+                    movementStyle === m.code
+                      ? "bg-brand/20 text-brand-light ring-1 ring-brand/30"
+                      : "text-ink-secondary hover:text-white hover:bg-white/[0.04]"
+                  }`}
+                >
+                  {m.label}
+                </button>
+              ))}
+            </div>
+          </div>
+
           <BackgroundHintField
             value={backgroundHint}
             onChange={setBackgroundHint}
             disabled={submitting}
           />
+
+          {/* Verbatim toggle — only when there's a hint and we're in Veo mode.
+              Imagen renders a still, so verbatim camera control is moot there. */}
+          {(backgroundHint || "").trim() && backgroundMode !== "imagen" && (
+            <label className="flex items-center gap-2.5 cursor-pointer px-1">
+              <input
+                type="checkbox"
+                checked={!!bgVerbatim}
+                onChange={(e) => setBgVerbatim(e.target.checked)}
+                disabled={submitting}
+                className="peer sr-only"
+              />
+              <div className="relative w-9 h-5 rounded-full bg-surface-3 peer-checked:bg-brand transition-colors duration-200 shrink-0">
+                <div className="absolute top-0.5 left-0.5 w-4 h-4 rounded-full bg-white shadow transition-transform duration-200 peer-checked:translate-x-4" />
+              </div>
+              <span className="text-[11px] text-ink-secondary">
+                {t("edit.bg_verbatim_label") || "Usar mi prompt tal cual (sin reescritura de IA)"}
+              </span>
+            </label>
+          )}
 
           <ContentValidationToggle
             value={validationEnabled}
@@ -908,7 +750,7 @@ export default function EditRequestPanel({
             </button>
             <button
               type="button"
-              onClick={() => submit("background")}
+              onClick={() => submit()}
               disabled={submitting}
               className="flex-1 btn-primary h-10 px-4 text-xs disabled:opacity-50 !bg-accent hover:!bg-accent/90"
             >
@@ -944,6 +786,8 @@ export default function EditRequestPanel({
         open={mode === "lyrics"}
         audioError={lyricsAudioError}
         error={error}
+        staleRerender={!!staleSegments}
+        onForceRerender={() => submitLyricsWithSegments(staleSegments, true)}
         job={job}
         segments={lastSavedSegments || job.segments_json}
         onSavedSegments={(segs) => {
@@ -951,8 +795,15 @@ export default function EditRequestPanel({
           // reference-change useEffect re-syncs on next mount.
           if (mountedRef.current) setLastSavedSegments(segs.slice());
         }}
-        onClose={() => { setMode(null); setError(null); }}
+        onClose={() => { setMode(null); setError(null); setStaleSegments(null); }}
         audioUrl={lyricsAudioUrl}
+        waveform={lyricsWaveform}
+        previewBgUrl={lyricsBgUrl}
+        onFontChange={(code) => setLyricsFont(code)}
+        onCaseChange={(c) => setLyricsCase(c)}
+        onContrastChange={(c) => setLyricsContrast(c)}
+        onAnimationChange={(c) => setLyricsAnimation(c)}
+        onLineTransitionChange={(c) => setLineTransition(c)}
         onApprove={submitLyricsWithSegments}
         submitting={submitting}
         initialParams={initialParams}
@@ -971,9 +822,23 @@ export default function EditRequestPanel({
  * behavior — editHistory, syncMode, etc are reset).
  */
 function LyricsEditModal({
-  open, audioError, error, job, segments, onSavedSegments,
-  onClose, audioUrl, onApprove, submitting, initialParams, t,
+  open, audioError, error, staleRerender, onForceRerender, job, segments,
+  onSavedSegments, onClose, audioUrl, waveform, previewBgUrl, onFontChange,
+  // 2026-05-23: onTransitionChange (legacy lyric_transition) eliminado;
+  // entran onAnimationChange + onLineTransitionChange.
+  onCaseChange, onContrastChange, onAnimationChange, onLineTransitionChange,
+  onApprove, submitting, initialParams, t,
 }) {
+  // Scroll the modal back to the top whenever a banner appears, so the
+  // error / stale-rerender notice is never stranded above the fold while the
+  // operator is scrolled down the (long) segment list. Without this the
+  // message renders at the top, out of view, and looks "cut off".
+  const scrollRef = useRef(null);
+  useEffect(() => {
+    if ((error || audioError || staleRerender) && typeof scrollRef.current?.scrollTo === "function") {
+      scrollRef.current.scrollTo({ top: 0, behavior: "smooth" });
+    }
+  }, [error, audioError, staleRerender]);
   // Lock the underlying body scroll while the modal is open. Without
   // this, scrolling on the modal's segment list bleeds through to the
   // JobDetail page underneath on macOS/Safari, which felt broken.
@@ -1011,7 +876,7 @@ function LyricsEditModal({
   const noSegments = !Array.isArray(effectiveSegments) || effectiveSegments.length === 0;
 
   return (
-    <div className="fixed inset-0 z-[60] bg-surface overflow-y-auto">
+    <div ref={scrollRef} className="fixed inset-0 z-[60] bg-surface overflow-y-auto">
       <div className="min-h-screen px-4 py-8 sm:px-8">
         <div className="max-w-3xl mx-auto">
           {audioError && (
@@ -1022,6 +887,23 @@ function LyricsEditModal({
           {error && (
             <div className="mb-4 rounded-2xl ring-1 ring-red-500/30 bg-red-500/[0.08] px-4 py-3">
               <p className="text-xs text-red-300">{error}</p>
+            </div>
+          )}
+          {staleRerender && (
+            <div className="mb-4 rounded-2xl ring-1 ring-amber-500/30 bg-amber-500/[0.08] px-4 py-3
+              flex flex-col sm:flex-row sm:items-center gap-2">
+              <p className="text-xs text-amber-200 flex-1">
+                {t("edit.stale_rerender_prompt") ||
+                  "Las letras ya están guardadas y no detectamos cambios nuevos. Si el video todavía muestra la versión vieja, podés re-renderizarlo igual."}
+              </p>
+              <button
+                type="button"
+                onClick={onForceRerender}
+                disabled={submitting}
+                className="btn-primary h-9 px-4 text-xs whitespace-nowrap disabled:opacity-50"
+              >
+                {t("edit.stale_rerender_button") || "Re-renderizar igual"}
+              </button>
             </div>
           )}
         </div>
@@ -1046,6 +928,13 @@ function LyricsEditModal({
               filename={job.filename || job.artist || "lyrics"}
               audioFile={null}
               audioUrl={audioUrl}
+              waveform={waveform}
+              previewBgUrl={previewBgUrl}
+              onFontChange={onFontChange}
+              onCaseChange={onCaseChange}
+              onContrastChange={onContrastChange}
+              onAnimationChange={onAnimationChange}
+              onLineTransitionChange={onLineTransitionChange}
               referenceLyrics=""
               onApprove={onApprove}
               onBack={onClose}
@@ -1054,8 +943,11 @@ function LyricsEditModal({
               font={initialParams.font || ""}
               textCase={initialParams.text_case || "upper"}
               fontScale={initialParams.font_scale || 1.0}
-              lyricTransition={initialParams.lyric_transition || "cut"}
-              textMotion={initialParams.text_motion || "none"}
+              // 2026-05-23: lyricTransition (Cut/Fade) y textMotion (Sutil
+              // drift) eliminados — los reemplazan lyrics_animation +
+              // line_transition (libass, paridad con el wizard).
+              lyricsAnimation={initialParams.lyrics_animation || "none"}
+              lineTransition={initialParams.line_transition || "none"}
               disableAutoSplit
               disableBeforeUnload
               // Autosave ON inside the /edit modal: backend's
