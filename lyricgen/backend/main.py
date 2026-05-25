@@ -4770,6 +4770,34 @@ async def generate_with_segments(
                 or job_row.user_id != current_user["id"]
                 or job_row.tenant_id != current_user["tenant_id"]):
             raise HTTPException(status_code=404, detail="Job not found.")
+        # U2 (audit 2026-05-25) — Idempotency on retry.
+        # Si el browser hace POST /generate, network drop, retry → el
+        # segundo POST llega CON el mismo job_id. Si el primero ya
+        # transicionó a queued/processing/done, retornamos 200 con el
+        # mismo job_id en vez de 409. Esto cierra la brecha de
+        # double-charge UMG (auditoría de breach risk).
+        if job_row.status in ("queued", "processing"):
+            logger.info(
+                "[IDEMPOTENT_GENERATE] job %s ya está en status=%s; "
+                "retorno 200 idempotent (retry detectado).",
+                job_id, job_row.status,
+            )
+            return {
+                "job_id": job_id,
+                "status": job_row.status,
+                "idempotent_replay": True,
+            }
+        if job_row.status in ("done", "pending_review"):
+            logger.info(
+                "[IDEMPOTENT_GENERATE] job %s ya está en status=%s; "
+                "retorno 200 idempotent (retry post-completion).",
+                job_id, job_row.status,
+            )
+            return {
+                "job_id": job_id,
+                "status": job_row.status,
+                "idempotent_replay": True,
+            }
         # State whitelist for /generate. `transcribed_pending` is what the
         # transcription worker writes on success (post-2026-05-25 fix);
         # `transcribed` is accepted defensively for jobs that were written
