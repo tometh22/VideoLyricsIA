@@ -3617,10 +3617,18 @@ def _fetch_lyrics_via_gemini_search(
         input_data_types=["artist_name", "song_title"],
     ) if job_id else None
 
-    try:
+    # INCIDENT 2026-05-25 audit (Crítico #3): `client.models.generate_content`
+    # was called without a timeout. If Vertex is degraded, the call could
+    # block indefinitely → asyncio.to_thread holds the worker thread →
+    # with 10 concurrent workers, all 10 stuck on Gemini → service deadlock.
+    # We wrap the call in `concurrent.futures.ThreadPoolExecutor` with a
+    # hard 30 s timeout. Lyrics-fetch is best-effort; if Vertex is slow we
+    # rather fall through to bare Whisper than freeze the worker.
+    import concurrent.futures as _cf
+    def _gemini_call():
         client = _get_genai_client()
         search_tool = types.Tool(google_search=types.GoogleSearch())
-        response = client.models.generate_content(
+        return client.models.generate_content(
             model="gemini-2.5-flash",
             contents=user_content,
             config=types.GenerateContentConfig(
@@ -3631,6 +3639,9 @@ def _fetch_lyrics_via_gemini_search(
                 thinking_config=types.ThinkingConfig(thinking_budget=0),
             ),
         )
+    try:
+        with _cf.ThreadPoolExecutor(max_workers=1) as _ex:
+            response = _ex.submit(_gemini_call).result(timeout=30.0)
 
         text = ""
         try:
