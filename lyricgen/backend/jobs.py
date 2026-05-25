@@ -557,6 +557,44 @@ def get_all_jobs_admin(db: Session, limit: int = 500, offset: int = 0) -> list[d
     return [j.to_dict() for j in jobs]
 
 
+def merge_s3_keys(job_id: str, file_type: str, key: str) -> bool:
+    """Atomic merge de un (file_type → key) en Job.s3_keys.
+
+    Resuelve el race U1 (audit 2026-05-25): dos prewarm workers
+    (umg_master + umg_short) ambos snapshotean s3_keys=None ANTES del
+    transcode (60-300s), luego compiten al final por escribir su key.
+    El read-modify-write fuera de la misma tx + el setattr() de
+    update_job pisa el otro. Prod 2026-05-12: 8/18 jobs UMG perdieron
+    una key, reconciliados a mano por SQL.
+
+    Una sola tx con SELECT FOR UPDATE: read y write atómicos.
+    Returns True si actualizó, False si el job no existe.
+    """
+    from database import SessionLocal
+    db = SessionLocal()
+    try:
+        job = (
+            db.query(Job)
+            .filter(Job.job_id == job_id)
+            .with_for_update()
+            .first()
+        )
+        if not job:
+            return False
+        current = dict(job.s3_keys or {})
+        if current.get(file_type) == key:
+            return True
+        current[file_type] = key
+        job.s3_keys = current
+        db.commit()
+        return True
+    except Exception:
+        db.rollback()
+        raise
+    finally:
+        db.close()
+
+
 def get_jobs_stats(db: Session, tenant_id: str = None) -> dict:
     """Get aggregate stats. If tenant_id is None, returns global stats."""
     query = db.query(Job)

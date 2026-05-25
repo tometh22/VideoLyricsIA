@@ -154,7 +154,13 @@ def find_stuck_jobs(db: Session, threshold_min: int = _DEFAULT_THRESHOLD_MIN) ->
     anchor = func.coalesce(Job.last_progress_at, Job.created_at)
     return (
         db.query(Job)
-        .filter(Job.status.in_(["processing", "queued"]))
+        # U7 (audit 2026-05-25): bg_preview_queued agregado al filter.
+        # Capa C 2026-05-24 introdujo este estado para "ghost jobs" de
+        # pre-generación del background. Si el operador cierra el browser
+        # sin completar el wizard, el job queda colgado forever (R2
+        # cache_key persistente). Threshold de 100min es generoso para
+        # un preview que tarda 30-60s normalmente.
+        .filter(Job.status.in_(["processing", "queued", "bg_preview_queued"]))
         .filter(anchor < cutoff)
         .order_by(anchor.asc())
         .all()

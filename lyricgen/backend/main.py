@@ -398,6 +398,55 @@ def on_startup():
     import time as _time
     from reaper import reap_all_stuck as _reap
 
+    # CV3 (audit 2026-05-25) — Multi-replica coordination helper.
+    # Wraps a callable in a Postgres advisory lock. Cuando hay 2+ replicas
+    # API, ambas ejecutan los daemon threads (bg_cache_cleanup, outputs_
+    # cleanup) — sin coordinación corren N veces por ciclo, generando
+    # ruido Sentry, posibles double-deletes y emails duplicados. El
+    # reaper YA tiene su propio lock interno; este helper extiende el
+    # mismo patrón a los otros loops.
+    _BG_PREVIEW_CLEANUP_LOCK_KEY = 9118364455199102
+    _OUTPUTS_CLEANUP_LOCK_KEY = 9118364455199103
+
+    def _run_with_advisory_lock(lock_key: int, work_fn, *, name: str = "") -> bool:
+        """Execute work_fn solo si conseguimos el advisory lock.
+
+        Returns True si lo ejecutó, False si otra replica ya tenía el lock
+        (skip silencioso, normal en multi-replica). En SQLite (dev local)
+        skip-loops el lock — siempre ejecuta.
+        """
+        from database import SessionLocal
+        from sqlalchemy import text
+        _db = SessionLocal()
+        try:
+            if _db.bind.dialect.name != "postgresql":
+                work_fn()
+                return True
+            got = _db.execute(
+                text("SELECT pg_try_advisory_lock(:k)"),
+                {"k": lock_key},
+            ).scalar()
+            if not got:
+                logger.debug(
+                    "[%s] another replica holds the advisory lock; skipping",
+                    name or f"lock:{lock_key}",
+                )
+                return False
+            try:
+                work_fn()
+                return True
+            finally:
+                try:
+                    _db.execute(
+                        text("SELECT pg_advisory_unlock(:k)"),
+                        {"k": lock_key},
+                    )
+                    _db.commit()
+                except Exception:  # pragma: no cover
+                    pass
+        finally:
+            _db.close()
+
     def _reaper_loop():
         # Brief delay so the very first request doesn't compete with
         # a cold-start reaper holding a DB connection.
@@ -429,13 +478,19 @@ def on_startup():
         _time.sleep(180)  # 3min después del boot
         while True:
             try:
-                from bg_preview import cleanup_old_cache
-                report = cleanup_old_cache(retention_hours=24, apply=True)
-                if report.get("deleted", 0) > 0:
-                    logger.info(
-                        "[BG_PREVIEW_CLEANUP] deleted %d objects (%.1f MB freed)",
-                        report["deleted"], report.get("bytes_freed", 0) / 1024 / 1024,
-                    )
+                def _do_cleanup():
+                    from bg_preview import cleanup_old_cache
+                    report = cleanup_old_cache(retention_hours=24, apply=True)
+                    if report.get("deleted", 0) > 0:
+                        logger.info(
+                            "[BG_PREVIEW_CLEANUP] deleted %d objects (%.1f MB freed)",
+                            report["deleted"], report.get("bytes_freed", 0) / 1024 / 1024,
+                        )
+                # CV3: gated por advisory lock — solo 1 replica corre por ciclo.
+                _run_with_advisory_lock(
+                    _BG_PREVIEW_CLEANUP_LOCK_KEY, _do_cleanup,
+                    name="bg_preview_cleanup",
+                )
             except Exception:  # pragma: no cover
                 try:
                     import sentry_sdk
@@ -457,8 +512,15 @@ def on_startup():
         _time.sleep(120)  # let the API come up first
         while True:
             try:
-                from scripts.cleanup_old_outputs import cleanup as _cleanup_outputs
-                _cleanup_outputs()
+                def _do_outputs_cleanup():
+                    from scripts.cleanup_old_outputs import cleanup as _cleanup_outputs
+                    _cleanup_outputs()
+                # CV3 (audit 2026-05-25): gated por advisory lock para que
+                # con 2+ replicas API NO se borre el mismo job 2 veces.
+                _run_with_advisory_lock(
+                    _OUTPUTS_CLEANUP_LOCK_KEY, _do_outputs_cleanup,
+                    name="outputs_cleanup",
+                )
             except Exception:  # pragma: no cover
                 try:
                     import sentry_sdk
@@ -3927,8 +3989,16 @@ async def _run_transcription_for_job(
                                     cand, _drops = _filter_whisper_hallucinations(cand)
                                 except Exception as e:
                                     logger.warning("[LYRICS] gap-rescue hallucination filter failed: %s", e)
-                                if cand and is_suspiciously_repetitive(cand):
-                                    logger.warning("[LYRICS] gap-rescue REJECTED for [%.1f,%.1f]: stuck-phoneme hallucination (%d lines)",
+                                # Pass `fa_text` as reference: if the
+                                # repeated tokens appear in the canonical
+                                # lyrics (e.g. "Legalícenla / Legalícenla
+                                # / Legalícenla / Oh-oh-oh" repeats
+                                # verbatim in lrclib), the repetition is
+                                # a legitimate chorus — NOT hallucination.
+                                # See `is_suspiciously_repetitive` docstring
+                                # for the INCIDENT 2026-05-25 #2 details.
+                                if cand and is_suspiciously_repetitive(cand, reference_text=fa_text):
+                                    logger.warning("[LYRICS] gap-rescue REJECTED for [%.1f,%.1f]: stuck-phoneme hallucination (%d lines, no ref match)",
                                                    g_start, g_end, len(cand))
                                     continue
                                 if cand:
@@ -3979,8 +4049,8 @@ async def _run_transcription_for_job(
                             # hallucination, refuse to emit it; the
                             # whisper-1 fallback path below takes over.
                             from transcribe_postprocess import is_suspiciously_repetitive
-                            if is_suspiciously_repetitive(wx_warm_segs):
-                                logger.warning("[LYRICS] FA failed AND warm-start whisperX is stuck on a phoneme pattern (%d near-identical lines) — refusing to emit, falling to whisper-1",
+                            if is_suspiciously_repetitive(wx_warm_segs, reference_text=fa_text):
+                                logger.warning("[LYRICS] FA failed AND warm-start whisperX is stuck on a phoneme pattern (%d near-identical lines, no ref match) — refusing to emit, falling to whisper-1",
                                                len(wx_warm_segs))
                             else:
                                 import whisperx_reconcile
@@ -4045,8 +4115,8 @@ async def _run_transcription_for_job(
                         # not this one (the lines look plausible
                         # individually; the bug is the repetition).
                         from transcribe_postprocess import is_suspiciously_repetitive as _suspicious
-                        if _suspicious(wx_segs):
-                            logger.warning("[LYRICS] lrclib-text whisperX path: stuck-phoneme hallucination detected (%d near-identical lines) — falling through",
+                        if _suspicious(wx_segs, reference_text=fa_text_for_wx):
+                            logger.warning("[LYRICS] lrclib-text whisperX path: stuck-phoneme hallucination detected (%d near-identical lines, no ref match) — falling through",
                                            len(wx_segs))
                         elif not _hall and len(wx_segs) >= 2:
                             # Reconcile: whisperX timing + lrclib canonical text
@@ -4442,8 +4512,8 @@ async def _run_transcription_for_job(
                     # guard as the other two. Catches the stuck-phoneme
                     # pattern that `_detect_hallucination` misses.
                     from transcribe_postprocess import is_suspiciously_repetitive as _suspicious
-                    if _suspicious(wx_segs):
-                        logger.warning("[LYRICS] gemini-FA whisperX fallback: stuck-phoneme hallucination detected (%d near-identical lines) — falling through",
+                    if _suspicious(wx_segs, reference_text=reference):
+                        logger.warning("[LYRICS] gemini-FA whisperX fallback: stuck-phoneme hallucination detected (%d near-identical lines, no ref match) — falling through",
                                        len(wx_segs))
                     elif not _hall and len(wx_segs) >= 2:
                         # RECONCILIATION: whisperX gave us word-level timing
