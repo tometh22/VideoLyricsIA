@@ -24,11 +24,14 @@ import os
 import subprocess
 import tempfile
 import time
+from collections import deque
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
 import requests
+
+from subprocess_utils import close_popen_streams
 
 logger = logging.getLogger("genly.drive_uploader")
 
@@ -318,11 +321,18 @@ def upload_via_rclone(
 
         bytes_transferred = 0
         bytes_total = 0
+        # Ring buffer of the last N rclone log lines. When rclone exits
+        # with rc!=0 we surface this tail in DriveUploadError so the
+        # operator (and Sentry) can see why instead of just "exit code 7,
+        # ver logs del worker" — the latter required SSH into the
+        # Railway log stream during the 2026-04-12 UMG delivery stall.
+        recent_lines: "deque[str]" = deque(maxlen=50)
 
         for line in proc.stdout:
             line = line.strip()
             if not line:
                 continue
+            recent_lines.append(line)
             # rclone JSON log: {"level":"info","msg":"Transferred: ...","stats":{...}}
             try:
                 entry = json.loads(line)
@@ -340,6 +350,12 @@ def upload_via_rclone(
                         "percent": percent,
                     })
 
+        # Close stdout explicitly before wait(). The for-loop above
+        # drained the pipe to EOF, but the file object stays open until
+        # GC; closing it now eliminates the rare race where the child
+        # blocks on a write to a buffer Python hasn't drained.
+        close_popen_streams(proc)
+
         try:
             proc.wait(timeout=RCLONE_TRANSFER_TIMEOUT_SECONDS)
         except subprocess.TimeoutExpired:
@@ -350,9 +366,10 @@ def upload_via_rclone(
                 f"for transfer={transfer_id} job={job_id} file_type={file_type}"
             )
         if proc.returncode != 0:
+            tail = " | ".join(recent_lines) if recent_lines else "<no log output captured>"
             raise DriveUploadError(
-                f"rclone exit code {proc.returncode}. "
-                f"Ver logs del worker para detalle del stderr."
+                f"rclone exit code {proc.returncode} for transfer={transfer_id} "
+                f"job={job_id} file_type={file_type}. Last log lines: {tail[-800:]}"
             )
 
         # Resolver drive_file_id. rclone NO emite el ID en su output JSON.
