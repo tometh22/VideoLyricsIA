@@ -167,10 +167,16 @@ def transcription_failure_callback(job, connection, type_, value, traceback) -> 
     own `failure_callbacks` AFTER the kill, so this hook is the last
     chance to surface a real error to the user.
 
-    Best-effort + terminal-state-aware: never clobber a real done/error.
+    Audit 2026-05-26: routes through update_job (same reasoning as
+    pipeline_failure_callback). Note `transcription_failed` is currently
+    NOT in update_job's terminal set (_TERMINAL_STATUSES), so the
+    terminal-state guard treats this as a regular update — which is
+    fine because the only safer states than transcription_failed are
+    the truly-terminal ones (done, rejected, etc.) and update_job won't
+    flip from any of those backward thanks to its own guard.
     """
     try:
-        from database import Job as JobModel, SessionLocal
+        from jobs import update_job
         rq_job_id = getattr(job, "id", "") or ""
         # RQ job_id has prefix `transcribe:<job_id>` (set at enqueue time).
         if rq_job_id.startswith("transcribe:"):
@@ -189,20 +195,12 @@ def transcription_failure_callback(job, connection, type_, value, traceback) -> 
         else:
             tb_msg = str(value)[:400] if value else (type_.__name__ if type_ else "error")
             err_msg = f"La transcripción falló: {tb_msg}"
-        db = SessionLocal()
-        try:
-            row = db.query(JobModel).filter(JobModel.job_id == job_id_db).first()
-            if row is None:
-                return
-            if row.status in ("transcribing", "transcribing_queued", "awaiting_upload"):
-                row.status = "transcription_failed"
-                row.error = err_msg[:500]
-                row.current_step = "error"
-                from datetime import datetime, timezone
-                row.completed_at = datetime.now(timezone.utc)
-                db.commit()
-        finally:
-            db.close()
+        update_job(
+            job_id_db,
+            status="transcription_failed",
+            error=err_msg[:500],
+            current_step="error",
+        )
     except Exception as e:  # pragma: no cover
         logger.warning("transcription_failure_callback failed: %s", e)
 
@@ -218,12 +216,23 @@ def pipeline_failure_callback(job, connection, type_, value, traceback) -> None:
     AbandonedJobError means a worker died mid-render (deploy/OOM/SIGKILL),
     everything else is a real exception inside the pipeline.
 
+    Audit 2026-05-26 (systemic-jobs-pipeline): routes through
+    jobs.update_job() instead of a raw SELECT + UPDATE. update_job has
+    the FOR UPDATE row lock that prevents the same race the reaper had
+    (callback reads status=processing, worker concurrently flips to
+    status=done, callback overwrites with error → user loses a video
+    that actually completed). update_job's terminal-state guard also
+    means we no longer need the inline `if row.status in ("processing",
+    "queued")` check — passing status="error" is a terminal target,
+    which always lands, but it lands ATOMICALLY behind the row lock,
+    so the worker's "done" wins if it commits first.
+
     Best-effort: any exception in here is swallowed so RQ's own failure
     bookkeeping still completes — a noisy callback that breaks the
     failure path is worse than no callback at all.
     """
     try:
-        from database import Job as JobModel, SessionLocal
+        from jobs import update_job
         # RQ's job.id == our job_id (we map them 1:1 in enqueue_pipeline).
         rq_job_id = getattr(job, "id", None) or ""
         if not rq_job_id:
@@ -242,22 +251,12 @@ def pipeline_failure_callback(job, connection, type_, value, traceback) -> None:
             # fits the UI error box without truncation surprises.
             tb_msg = str(value)[:400] if value else (type_.__name__ if type_ else "error")
             err_msg = f"El render falló tras reintentos: {tb_msg}"
-        db = SessionLocal()
-        try:
-            row = db.query(JobModel).filter(JobModel.job_id == rq_job_id).first()
-            if row is None:
-                return
-            # Don't clobber a terminal state — if the pipeline managed to
-            # write status=done/pending_review before the worker died on
-            # a cleanup step, leave it.
-            if row.status in ("processing", "queued"):
-                row.status = "error"
-                row.error = err_msg
-                from datetime import datetime, timezone
-                row.completed_at = datetime.now(timezone.utc)
-                db.commit()
-        finally:
-            db.close()
+        # update_job's terminal-state guard means status="error" lands
+        # even if the row is currently "processing"/"queued" (target is
+        # terminal → guard always lets it through), but loses cleanly
+        # to a concurrent "done" because both contend on the same
+        # FOR UPDATE lock.
+        update_job(rq_job_id, status="error", error=err_msg[:500])
     except Exception as e:  # pragma: no cover
         logger.warning("pipeline_failure_callback failed: %s", e)
 
@@ -348,6 +347,30 @@ def cancel_rq_job(job_id: str) -> bool:
     return True
 
 
+def _evict_stale_rq_job(connection, rq_job_id: str) -> None:
+    """Delete any RQ Job with `rq_job_id` from Redis before re-enqueueing.
+
+    Audit 2026-05-26 (jobs-pipeline-systemic-audit). Without this, calling
+    `q.enqueue(..., job_id=X)` for an X that already exists in Redis (from
+    a previous failed/completed run) silently DEDUPES — RQ returns the
+    cached Job, ignores the new args/kwargs, and the worker either does
+    nothing (failed jobs sit in FailedJobRegistry forever) or re-runs the
+    OLD args (defeating /retry, frame_size override, preserved_bg_r2_key,
+    bypass_content_validation, etc.).
+
+    `enqueue_edit` already had this logic inline since the original UMG
+    edit-resurrection incident. Extracted here so the three queue-using
+    helpers stay consistent. Best-effort; a Redis hiccup during the fetch
+    must not block the enqueue.
+    """
+    try:
+        from rq.job import Job as RQJob
+        stale = RQJob.fetch(rq_job_id, connection=connection)
+        stale.delete()
+    except Exception:
+        pass  # no stale job, or Redis hiccup — proceed normally
+
+
 def enqueue_pipeline(
     job_id: str,
     mp3_path: str,
@@ -363,6 +386,13 @@ def enqueue_pipeline(
     if q is not None:
         from rq import Retry
         from pipeline import run_pipeline
+        # Evict any stale RQ entry with the same job_id. /retry re-uses the
+        # same job_id for the same Postgres row; without this evict, the
+        # second enqueue would silently reuse the failed first attempt's
+        # cached args (no preserved_bg_r2_key, no frame_size override, etc.)
+        # and the operator would see "Retry" do exactly nothing useful.
+        # See _evict_stale_rq_job docstring for the full reasoning.
+        _evict_stale_rq_job(q.connection, job_id)
         # RQ's enqueue() does not accept positional args together with the
         # explicit kwargs= parameter — you have to pass either bare *args/**kwargs
         # or use both args= and kwargs= explicitly. We use the explicit form
@@ -461,6 +491,11 @@ def enqueue_transcription(
         # case with margin. Env var override stays for ops tuning.
         timeout = int(os.environ.get("TRANSCRIBE_JOB_TIMEOUT", "1800"))
         retry = Retry(max=2, interval=10)  # whisper hiccup → reintentar 2 veces con 10s gap
+        # Evict stale RQ entry from a previous attempt — same reasoning as
+        # enqueue_pipeline. Without this, a transcription retry would silently
+        # re-use the failed first job and the operator's edit (filename,
+        # artist override, etc.) would be ignored. Audit 2026-05-26.
+        _evict_stale_rq_job(_redis, f"transcribe:{job_id}")
         rq_job = q.enqueue(
             run_transcription_job,
             args=(job_id, audio_path),
@@ -535,6 +570,9 @@ def enqueue_bg_preview(
         # mayoría de los rate-limits transitorios. Más allá de eso, el job
         # marca status=bg_preview_failed y el frontend muestra el error.
         retry = Retry(max=2, interval=20)
+        # Evict stale RQ entry — same reasoning as enqueue_pipeline.
+        # Audit 2026-05-26.
+        _evict_stale_rq_job(_redis, f"bgpreview:{job_id}")
         rq_job = q.enqueue(
             run_bg_preview_job,
             args=(job_id, bg_cache_key, params),
@@ -634,7 +672,7 @@ def edit_failure_callback(job, connection, type_, value, traceback) -> None:
     exceptions so RQ's own failure bookkeeping still completes.
     """
     try:
-        from database import Job as JobModel, SessionLocal
+        from jobs import update_job
         edit_id = getattr(job, "id", None) or ""
         # RQ job id is "edit:{job_id}"; strip the prefix to get our job_id.
         rq_job_id = edit_id[len("edit:"):] if edit_id.startswith("edit:") else edit_id
@@ -650,19 +688,13 @@ def edit_failure_callback(job, connection, type_, value, traceback) -> None:
         else:
             tb_msg = str(value)[:400] if value else (type_.__name__ if type_ else "error")
             err_msg = f"Edit falló: {tb_msg}"
-        db = SessionLocal()
-        try:
-            row = db.query(JobModel).filter(JobModel.job_id == rq_job_id).first()
-            if row is None:
-                return
-            if row.status == "editing":
-                row.status = "error"
-                row.error = err_msg
-                from datetime import datetime, timezone
-                row.completed_at = datetime.now(timezone.utc)
-                db.commit()
-        finally:
-            db.close()
+        # Audit 2026-05-26: route through update_job so we share the FOR
+        # UPDATE row lock with the worker (race-safe). update_job's terminal
+        # target ("error") always lands, but contends on the lock — if
+        # run_edit_pipeline managed to commit `pending_review` first, the
+        # worker wins and the user sees the edit they actually got, not
+        # a false error.
+        update_job(rq_job_id, status="error", error=err_msg[:500])
     except Exception as e:
         logger.warning("edit_failure_callback failed: %s", e)
 
@@ -697,12 +729,7 @@ def enqueue_edit(
         # they're dead. Without this cleanup, re-enqueue after a worker death
         # silently dedupes (RQ returns/reuses the old failed job) and the DB
         # row stays stuck at status="editing"/progress=0 indefinitely.
-        try:
-            from rq.job import Job as RQJob
-            stale = RQJob.fetch(edit_rq_id, connection=q.connection)
-            stale.delete()
-        except Exception:
-            pass  # no stale job, or Redis hiccup — proceed normally
+        _evict_stale_rq_job(q.connection, edit_rq_id)
         # Retry on worker-death (Railway redeploy/OOM/SIGKILL). Mismo patrón
         # que enqueue_pipeline — incidente 2026-05-26 con el job de Los
         # Abuelos (4c47a9f07383): el merge de fix(pipeline) a staging
