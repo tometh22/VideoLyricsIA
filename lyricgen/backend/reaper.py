@@ -395,31 +395,51 @@ def reap_stuck_transcription(db: Session, job: Job) -> None:
          collision with the render job sharing the same Postgres job_id;
          cancel_rq_job is called with the prefixed form.
     """
+    # Race guard (audit 2026-05-26): the row read in find_stuck_transcriptions
+    # had no lock; the worker may have finished between then and now.
+    # Re-fetch with FOR UPDATE and re-check. Without this, the reaper
+    # would clobber a successful transcribed_pending with transcription_failed
+    # and the operator would lose segments_json they could have edited.
+    locked = (
+        db.query(Job)
+        .filter(Job.job_id == job.job_id)
+        .with_for_update()
+        .first()
+    )
+    if locked is None:
+        return
+    if locked.status not in ("transcribing_queued", "transcribing"):
+        logger.info(
+            "reaper: skip transcription %s — status changed under us (was %s, now %s)",
+            job.job_id, job.status, locked.status,
+        )
+        return
+
     rq_removed = False
-    previous_status = job.status  # capture before mutation for audit
+    previous_status = locked.status  # capture before mutation for audit
     try:
         from queue_jobs import cancel_rq_job
         # enqueue_transcription uses `transcribe:<job_id>` as the RQ id
         # (queue_jobs.py:457). Cancelling the bare job_id would miss it.
-        rq_removed = cancel_rq_job(f"transcribe:{job.job_id}")
+        rq_removed = cancel_rq_job(f"transcribe:{locked.job_id}")
     except Exception as e:  # pragma: no cover
         logger.warning(
-            "cancel_rq_job (transcription) failed for %s: %s", job.job_id, e,
+            "cancel_rq_job (transcription) failed for %s: %s", locked.job_id, e,
         )
-    reason = _reason_for_transcription(job)
-    job.status = "transcription_failed"
-    job.current_step = "error"
-    job.error = reason
-    job.completed_at = datetime.now(timezone.utc)
+    reason = _reason_for_transcription(locked)
+    locked.status = "transcription_failed"
+    locked.current_step = "error"
+    locked.error = reason
+    locked.completed_at = datetime.now(timezone.utc)
     db.add(AuditLog(
         action="reaper.killed_transcription",
         detail={
-            "job_id": job.job_id,
-            "tenant_id": job.tenant_id,
-            "artist": job.artist,
-            "filename": job.filename,
+            "job_id": locked.job_id,
+            "tenant_id": locked.tenant_id,
+            "artist": locked.artist,
+            "filename": locked.filename,
             "previous_status": previous_status,
-            "age_minutes": round(_age_minutes(job), 1),
+            "age_minutes": round(_age_minutes(locked), 1),
             "reason": reason,
             "rq_removed": rq_removed,
         },
@@ -438,36 +458,69 @@ def revert_abandoned_edit(db: Session, job: Job) -> None:
     Also cancels the RQ entry so a worker restart can't resurrect the
     half-finished edit and silently overwrite the user's good video.
     """
+    # Race guard (audit 2026-05-26): re-fetch with lock and confirm the
+    # row is still in `editing` before reverting. The worker may have
+    # finished the edit successfully between the sweep and now; reverting
+    # those rows would dump the operator back to pending_review on a video
+    # that actually got the edit applied.
+    locked = (
+        db.query(Job)
+        .filter(Job.job_id == job.job_id)
+        .with_for_update()
+        .first()
+    )
+    if locked is None:
+        return
+    if locked.status != "editing":
+        logger.info(
+            "reaper: skip edit-revert %s — status changed under us (was %s, now %s)",
+            job.job_id, job.status, locked.status,
+        )
+        return
+
     try:
         from queue_jobs import cancel_rq_job
-        cancel_rq_job(job.job_id)
+        # enqueue_edit uses RQ job id `edit:<job_id>` (queue_jobs.py:694)
+        # to avoid collision with the render job sharing the same Postgres
+        # job_id. Cancelling the bare job_id would miss the RQ entry, the
+        # ScheduledJobRegistry retry timer would fire, and a fresh worker
+        # would run the half-finished edit against this row already flipped
+        # back to pending_review — exactly the regression the docstring
+        # above promises to prevent. Audit 2026-05-26.
+        cancel_rq_job(f"edit:{locked.job_id}")
     except Exception as e:  # pragma: no cover
-        logger.warning("cancel_rq_job (edit) failed for %s: %s", job.job_id, e)
-    prev_edit_count = job.edit_count or 0
+        logger.warning("cancel_rq_job (edit) failed for %s: %s", locked.job_id, e)
+    prev_edit_count = locked.edit_count or 0
     new_edit_count = max(0, prev_edit_count - 1)
+    # Capture step/progress at-revert-time so the AuditLog "previous" block
+    # shows where the edit actually died (e.g. step="video", progress=40).
+    # Pre-2026-05-26 the audit read these AFTER the mutation below and
+    # always logged "thumbnail"/100 — useless for forensics.
+    prev_current_step = locked.current_step
+    prev_progress = locked.progress
     age = 0.0
-    if job.editing_started_at:
-        started = job.editing_started_at
+    if locked.editing_started_at:
+        started = locked.editing_started_at
         if started.tzinfo is None:
             started = started.replace(tzinfo=timezone.utc)
         age = (datetime.now(timezone.utc) - started).total_seconds() / 60.0
-    job.status = "pending_review"
+    locked.status = "pending_review"
     # The pre-edit terminal state was current_step="thumbnail"/progress=100
     # for any job that made it to pending_review. Restoring those values
     # keeps the progress bar / status badge consistent with what the user
     # saw before they clicked the edit button.
-    job.current_step = "thumbnail"
-    job.progress = 100
-    job.edit_count = new_edit_count
-    job.editing_started_at = None
-    job.error = None
+    locked.current_step = "thumbnail"
+    locked.progress = 100
+    locked.edit_count = new_edit_count
+    locked.editing_started_at = None
+    locked.error = None
     db.add(AuditLog(
         action="reaper.reverted_edit",
         detail={
-            "job_id": job.job_id,
-            "tenant_id": job.tenant_id,
-            "artist": job.artist,
-            "song_title": job.song_title,
+            "job_id": locked.job_id,
+            "tenant_id": locked.tenant_id,
+            "artist": locked.artist,
+            "song_title": locked.song_title,
             "age_minutes": round(age, 1),
             "reason": (
                 "Edit request abandoned by worker (probable Railway deploy "
@@ -476,8 +529,8 @@ def revert_abandoned_edit(db: Session, job: Job) -> None:
             ),
             "previous": {
                 "status": "editing",
-                "current_step": job.current_step,
-                "progress": job.progress,
+                "current_step": prev_current_step,
+                "progress": prev_progress,
                 "edit_count": prev_edit_count,
             },
             "now": {
@@ -545,10 +598,12 @@ def _delete_abandoned_transcribed(db: Session, job: Job) -> None:
     except Exception as e:  # pragma: no cover
         logger.debug(f"reaper: local dir cleanup failed for {job_id}: {e}")
     # Cancel any stale RQ entry (best-effort, consistent with the other
-    # cleanup paths in this file).
+    # cleanup paths in this file). enqueue_transcription uses RQ job id
+    # `transcribe:<job_id>` (queue_jobs.py:474); the bare job_id form
+    # would miss it. Audit 2026-05-26.
     try:
         from queue_jobs import cancel_rq_job
-        cancel_rq_job(job_id)
+        cancel_rq_job(f"transcribe:{job_id}")
     except Exception as e:  # pragma: no cover
         logger.debug("reaper: cancel_rq_job failed for %s: %s", job_id, e)
     # R2 object — only delete when no sibling job references the same
@@ -623,8 +678,27 @@ def _delete_abandoned_upload(db: Session, job: Job) -> None:
     db.delete(job)
 
 
-def reap_stuck_job(db: Session, job: Job, reason: str) -> None:
+_REAPABLE_STATUSES = ("processing", "queued", "bg_preview_queued")
+
+
+def reap_stuck_job(db: Session, job: Job, reason: str) -> bool:
     """Flip the row to error, cancel the RQ job, and log it. Caller commits.
+
+    Returns True if the job was reaped, False if a race made the reap
+    unnecessary (worker completed between the find_* SELECT and now).
+
+    RACE GUARD (audit 2026-05-26 systemic-jobs-pipeline): the `job` passed
+    in came from a SELECT WITHOUT lock several seconds ago. Between then
+    and now, the worker may have finished successfully and flipped the
+    row to "done" / "pending_review". Without this re-fetch+recheck, the
+    next two lines (`job.status = "error"` + commit) would CLOBBER the
+    successful completion — the video sits intact in R2 but the operator
+    sees "El video se interrumpió por un problema temporal del servidor"
+    on a job that actually worked.
+
+    Pattern: re-read with FOR UPDATE so concurrent update_job calls
+    serialize behind us, then verify the row is still in a status we
+    consider reapable.
 
     Cancelling the RQ entry is critical: without it, RQ's Retry / cleanup
     path resurrects the abandoned job on the next worker boot. The worker
@@ -637,30 +711,65 @@ def reap_stuck_job(db: Session, job: Job, reason: str) -> None:
     the next worker restart, re-processed silently, and ended in the same
     `error` state. Fixing the desync here closes the loop.
     """
+    # Re-fetch with row lock to avoid the lost-completion race described
+    # above. If the row was deleted (operator force-deleted) between the
+    # sweep and now, .first() returns None — nothing to reap.
+    locked = (
+        db.query(Job)
+        .filter(Job.job_id == job.job_id)
+        .with_for_update()
+        .first()
+    )
+    if locked is None:
+        return False
+    if locked.status not in _REAPABLE_STATUSES:
+        logger.info(
+            "reaper: skip %s — status changed under us (was %s, now %s)",
+            job.job_id, job.status, locked.status,
+        )
+        return False
+
     rq_removed = False
+    # find_stuck_jobs sweeps "processing", "queued", AND "bg_preview_queued"
+    # (reaper.py:199). The first two map to RQ jobs whose id == job_id (no
+    # prefix — see enqueue_pipeline). bg_preview uses `bgpreview:<job_id>`
+    # (queue_jobs.py:544); cancelling the bare form would miss it and let
+    # the ScheduledJobRegistry resurrect the ghost. Audit 2026-05-26.
+    rq_ids_to_try = [locked.job_id]
+    if locked.status == "bg_preview_queued":
+        rq_ids_to_try = [f"bgpreview:{locked.job_id}"]
     try:
         from queue_jobs import cancel_rq_job
-        rq_removed = cancel_rq_job(job.job_id)
+        for rq_id in rq_ids_to_try:
+            if cancel_rq_job(rq_id):
+                rq_removed = True
+                break
     except Exception as e:  # pragma: no cover
-        logger.warning("cancel_rq_job failed for %s: %s", job.job_id, e)
-    job.status = _REAPED_STATUS
-    job.error = reason
-    job.completed_at = datetime.now(timezone.utc)
+        logger.warning("cancel_rq_job failed for %s: %s", locked.job_id, e)
+    previous_status = locked.status
+    locked.status = _REAPED_STATUS
+    locked.error = reason
+    locked.completed_at = datetime.now(timezone.utc)
     db.add(AuditLog(
         action="reaper.killed",
         detail={
-            "job_id": job.job_id,
-            "tenant_id": job.tenant_id,
-            "artist": job.artist,
-            "filename": job.filename,
-            "previous_status": "processing",  # by definition
-            "current_step": job.current_step,
-            "progress": job.progress,
-            "age_minutes": round(_age_minutes(job), 1),
+            "job_id": locked.job_id,
+            "tenant_id": locked.tenant_id,
+            "artist": locked.artist,
+            "filename": locked.filename,
+            # Capture the ACTUAL previous status, not the hard-coded
+            # "processing" the old code wrote. bg_preview_queued and
+            # queued get reaped by this same path; forensics needs the
+            # real source state to debug "why was this in X?" later.
+            "previous_status": previous_status,
+            "current_step": locked.current_step,
+            "progress": locked.progress,
+            "age_minutes": round(_age_minutes(locked), 1),
             "reason": reason,
             "rq_removed": rq_removed,
         },
     ))
+    return True
 
 
 def _sentry_capture(reaped: list[Job]) -> None:
@@ -897,12 +1006,14 @@ def _reap_all_stuck_inner(threshold_min: int) -> int:
             )
         if not stuck and not orphans and not stalled:
             return 0
-        for job in stuck:
-            reap_stuck_job(db, job, _reason_for(job))
-        for job in orphans:
-            reap_stuck_job(db, job, _reason_for_orphan(job))
-        for job in stalled:
-            reap_stuck_job(db, job, _reason_for_stalled(job))
+        # reap_stuck_job returns False when its in-function race guard
+        # (re-fetch + recheck status under FOR UPDATE) detects the worker
+        # already completed between the sweep SELECT and now. Filter those
+        # out so the audit log / email / Sentry only reports rows we
+        # actually mutated.
+        stuck    = [j for j in stuck    if reap_stuck_job(db, j, _reason_for(j))]
+        orphans  = [j for j in orphans  if reap_stuck_job(db, j, _reason_for_orphan(j))]
+        stalled  = [j for j in stalled  if reap_stuck_job(db, j, _reason_for_stalled(j))]
         db.commit()
         # Detach so we can pass to background helpers without keeping the
         # session open. The fields we need are already populated.
