@@ -452,11 +452,17 @@ def on_startup():
         # Brief delay so the very first request doesn't compete with
         # a cold-start reaper holding a DB connection.
         _time.sleep(60)
+        # Heartbeat: cada sweep exitoso bumpea un timestamp que
+        # /health lee. Sin esto una muerte silenciosa del thread no
+        # se detecta hasta que un operador nota jobs trabados horas
+        # después. Ver observability.py:mark_reaper_ok.
+        from observability import mark_reaper_ok as _heartbeat
         while True:
             try:
                 n = _reap()
                 if n > 0:
                     logger.warning(f"reaper killed {n} stuck job(s)")
+                _heartbeat()
             except Exception:  # pragma: no cover
                 try:
                     import sentry_sdk
