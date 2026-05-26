@@ -57,6 +57,88 @@ function _setAudioCurrentTime(container, t) {
   fireEvent.timeUpdate(audio);
 }
 
+describe("LyricsEditor — review:true banner UX (2026-05-26)", () => {
+  // Cuando synced-direct fallback (PR #365) dispara, TODAS las líneas
+  // vienen con `review: true`. Mostrar 28 badges "⚠ revisar tiempo"
+  // apilados satura visualmente. Si ≥3 segments son review, debe
+  // aparecer un banner ÚNICO arriba y los badges per-línea suprimirse.
+  // Casos con <3 review siguen mostrando badge inline (info útil sin
+  // saturar).
+  it("muestra UN banner único cuando ≥3 segments son review:true", () => {
+    const props = baseProps({
+      segments: [
+        { start: 27.7, end: 33.7, text: "Tanto tiempo te esperé sentado aquí", review: true },
+        { start: 33.7, end: 39.4, text: "Que ya el invierno me alcanzó sin gamulán", review: true },
+        { start: 39.4, end: 42.1, text: "Será por eso que hoy estamos aquí", review: true },
+        { start: 42.1, end: 45.9, text: "No hay nadie más que vos y yo", review: true },
+      ],
+    });
+    render(<LyricsEditor {...props} />);
+    // Banner único arriba
+    expect(screen.getByText(/líneas con timing aproximado/i)).toBeInTheDocument();
+    // Per-line badge "revisar tiempo" NO debe aparecer (suprimido por banner)
+    expect(screen.queryAllByText(/^revisar tiempo$/i)).toHaveLength(0);
+  });
+
+  it("NO muestra banner cuando <3 segments son review:true — fallback a badges per-línea", () => {
+    const props = baseProps({
+      segments: [
+        { start: 1.0, end: 2.0, text: "alpha", review: true },
+        { start: 2.0, end: 3.0, text: "beta", review: true },        // solo 2 review
+        { start: 3.0, end: 4.0, text: "gamma", review: false },
+      ],
+    });
+    render(<LyricsEditor {...props} />);
+    expect(screen.queryByText(/líneas con timing aproximado/i)).toBeNull();
+    // En cambio, los badges per-línea siguen apareciendo (2 review)
+    const badges = screen.getAllByText(/^revisar tiempo$/i);
+    expect(badges.length).toBe(2);
+  });
+
+  it("NO muestra banner cuando ningún segment es review", () => {
+    const props = baseProps({
+      segments: [
+        { start: 1.0, end: 2.0, text: "alpha" },
+        { start: 2.0, end: 3.0, text: "beta" },
+      ],
+    });
+    render(<LyricsEditor {...props} />);
+    expect(screen.queryByText(/líneas con timing aproximado/i)).toBeNull();
+  });
+});
+
+
+describe("LyricsEditor — scrub bar click reliability (2026-05-26)", () => {
+  // Bug: el div interno de fill tenía `transition-[width]` que peleaba
+  // contra el rAF loop de currentTime, haciendo que clicks "se pierdan"
+  // durante frames de transición. Fix: transform: scaleX + pointer-events-none.
+  it("scrub bar tiene type='button' (no submit) y handler de click", () => {
+    const props = baseProps({
+      segments: [{ start: 1.0, end: 5.0, text: "alpha" }],
+      audioUrl: "blob:http://localhost/test",
+    });
+    render(<LyricsEditor {...props} />);
+    const scrubBtn = screen.getByLabelText("Buscar");
+    expect(scrubBtn.getAttribute("type")).toBe("button");
+  });
+
+  it("el fill del scrub no captura clicks (pointer-events-none)", () => {
+    const props = baseProps({
+      segments: [{ start: 1.0, end: 5.0, text: "alpha" }],
+      audioUrl: "blob:http://localhost/test",
+    });
+    render(<LyricsEditor {...props} />);
+    const scrubBtn = screen.getByLabelText("Buscar");
+    const fill = scrubBtn.querySelector("div");
+    expect(fill).not.toBeNull();
+    // Debe tener pointer-events-none para que clicks siempre lleguen al button
+    expect(fill.className).toMatch(/pointer-events-none/);
+    // Y NO debe tener la transición CSS sobre width que peleaba contra el rAF
+    expect(fill.className).not.toMatch(/transition-\[width\]/);
+  });
+});
+
+
 describe("LyricsEditor — prop sync (B7)", () => {
   // BUG: the component initialises `edited` from `segments` only on
   // mount (useState(initial) ignores subsequent prop changes). When
