@@ -5640,7 +5640,20 @@ async def job_events(
         if job_check is None:
             raise HTTPException(status_code=404, detail="Job not found.")
 
-    TERMINAL = {"done", "pending_review", "error", "validation_failed"}
+    # SSE terminal set = canonical _TERMINAL_STATUSES (jobs.py) PLUS the
+    # quasi-terminal states the frontend treats as "stop polling" — namely
+    # pending_review (waiting on operator), transcription_failed (editor
+    # surfaces a Retry CTA, no further events expected), and
+    # bg_preview_done / bg_preview_failed (ghost jobs that never advance).
+    # Audit 2026-05-26: previous set excluded rejected, transcription_failed,
+    # bg_preview_*. SSE for those statuses polled forever → socket leak +
+    # the frontend never received the close event → operator's UI made it
+    # look like the job "disappeared".
+    TERMINAL = {
+        "done", "pending_review", "error", "rejected",
+        "validation_failed", "transcription_failed",
+        "bg_preview_done", "bg_preview_failed",
+    }
     scope = _job_scope(current_user)
     # Capturamos identidad+tenant al abrir para re-validar en cada poll.
     # Sin esto, si un admin transfiere al user entre tenants mid-stream
@@ -7100,6 +7113,12 @@ async def request_edit(
         # poll, the operator opening another tab) sees the corrected text.
         # The /edit handler is the right place for this — it's already
         # mutating the row a few lines below.
+        # Audit 2026-05-26: capture the pre-edit segments so the enqueue
+        # rollback below can restore them. Without this, if the enqueue
+        # fails (Redis down) we revert status/edit_count but leave the new
+        # segments persisted — the operator's "Reintentar edit" later sees
+        # the new lyrics applied even though the edit was never processed.
+        _pre_edit_segments = job.segments_json
         job.segments_json = normalized_segments
 
     edit_params: dict = {}
@@ -7270,6 +7289,19 @@ async def request_edit(
         job.editing_started_at = None
         job.progress = 100
         job.current_step = "thumbnail"
+        # Audit 2026-05-26: restore the pre-edit segments_json. The edit
+        # handler optimistically persists the new segments BEFORE
+        # enqueueing (so the worker reads the latest lyrics), but if the
+        # enqueue fails the worker never runs — leaving the modified
+        # lyrics persisted is a lie. The operator would re-open the editor
+        # and see edits that were never actually applied to a video.
+        try:
+            job.segments_json = _pre_edit_segments
+        except NameError:
+            # Defensive: _pre_edit_segments is only assigned when
+            # body.segments was non-empty. Non-lyrics edits (typography,
+            # background) skip that branch and don't need the rollback.
+            pass
         db.commit()
         raise HTTPException(
             status_code=503,
