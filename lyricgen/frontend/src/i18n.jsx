@@ -209,6 +209,7 @@ const translations = {
     "upload.step_deliver": "Entregá",
     "upload.step_lyrics": "Lyrics",
     "upload.step_lyrics_hint": "Disponible después de \"Revisar lyrics\"",
+    "upload.step_locked_hint": "No editable en este modo — usá \"Regenerar fondo\" desde el video.",
     "upload.back_to_lyrics": "Volver a lyrics",
     "upload.animation_label": "Animación:",
     "upload.anim_gallery_desc": "Cómo aparecen las palabras sobre el video. Pasá el mouse o elegí y miralo en el preview ←",
@@ -252,6 +253,7 @@ const translations = {
     "upload.mode_edge": "ÚNICO",
     "upload.preview_sample": "esta es tu letra",
     "upload.preview_live": "Vista previa en vivo",
+    "upload.preview_rendered": "Resultado actual",
     "upload.preview_motion": "Movimiento",
     "upload.preview_disclaimer": "Aproximación del mood y el movimiento. El fondo final lo genera la IA.",
     "edit.movement_label": "Movimiento de cámara",
@@ -607,6 +609,8 @@ const translations = {
     "detail.view_youtube": "Ver en YouTube",
     "detail.not_available": "Todavía no se puede previsualizar este video.",
     "detail.back": "Volver",
+    "detail.not_found": "No se encontró el video.",
+    "detail.load_error": "No pudimos cargar el video.",
     // PR #291: claves usadas por los branches nuevos de JobDetail
     // (transcribed / transcribing* / awaiting_upload / transcription_failed).
     // Build de Vercel falla si alguna clave nueva está ausente — agregadas
