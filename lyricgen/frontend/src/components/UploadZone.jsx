@@ -162,6 +162,11 @@ export default function UploadZone({
   // WizardLivePreview lo lee con su propio rAF para renderizar word-jump
   // sincronizado al audio real, sin causar re-renders de UploadZone.
   playbackTickRef = null,
+  // UI F5 (2026-05-26): status del pre-gen del fondo. Si !== "done"
+  // mientras estamos en paso 6, el preview muestra el badge "(muestra)"
+  // en vez del "EN VIVO" pulsante — el operador ve un fondo placeholder
+  // hasta que apruebe y genere.
+  bgStatus = null,
 }) {
   const { t } = useI18n();
   const inputRef = useRef();
@@ -1827,14 +1832,38 @@ export default function UploadZone({
         /* Pre-upload — just the drop zone, centered and prominent */
         <div className="max-w-2xl mx-auto">{_dropZone}</div>
       ) : (
-      <div className="flex flex-col lg:grid lg:grid-cols-[190px_minmax(0,1fr)_minmax(400px,460px)] gap-6 items-start">
+      /* UI F1+F2+F3 (2026-05-26): el grid se reconfigura cuando el
+         wizard llega al paso 6. En pasos 1-5 el operador está
+         configurando opciones — preview central grande tiene sentido.
+         En paso 6 está corrigiendo 60+ líneas de lyric, una actividad
+         que necesita ancho horizontal en el panel derecho. Reparto:
+
+           Pasos 1-5 (configurar):  190px sidebar + 1fr preview + 460px max derecha
+           Paso 6 (trabajar):       56px sidebar (icon-only) + 320px preview thumbnail + 1fr derecha
+
+         A 1500 px viewport en paso 6 el panel de trabajo gana +640 px
+         vs el layout original. El sidebar se reduce a iconos numerados
+         con tooltip; el preview pasa a thumbnail con compact=true
+         (oculta caption de movement/effect que ya no se está editando). */
+      (() => {
+        const isStep6 = wizardStep === 6 && hasReviewableContent;
+        const gridCols = isStep6
+          ? "lg:grid-cols-[56px_minmax(260px,320px)_minmax(0,1fr)]"
+          : "lg:grid-cols-[190px_minmax(0,1fr)_minmax(400px,460px)]";
+        return (
+        <div className={`flex flex-col lg:grid ${gridCols} gap-6 items-start`}>
 
         {/* LEFT — step rail (vertical on desktop, horizontal pills on mobile).
             Paso 6 "Lyrics" se ve siempre; está deshabilitado hasta que
             haya contenido reviewable (hasReviewableContent prop). Cuando
             se activa, el useEffect de arriba auto-avanza el wizard a
             step 6 y permite navegar libremente entre 4↔6 (operador
-            cambia font/animation en paso 4, vuelve a paso 6 a aprobar). */}
+            cambia font/animation en paso 4, vuelve a paso 6 a aprobar).
+
+            UI F2 (2026-05-26): en paso 6 las labels se ocultan (solo
+            el número en círculo queda visible). Tooltip on hover
+            mantiene la información completa. El sidebar pasa de 190 px
+            a 56 px → +134 px que ganan las otras dos columnas. */}
         <nav className="flex lg:flex-col gap-1.5 lg:gap-1 overflow-x-auto lg:overflow-visible lg:sticky lg:top-4 w-full lg:w-auto order-first">
           {WIZARD_STEPS.map((s) => {
             const isLyrics = s.id === 6;
@@ -1850,8 +1879,8 @@ export default function UploadZone({
                 aria-disabled={disabled}
                 title={disabled
                   ? (t("upload.step_lyrics_hint") || "Disponible después de \"Revisar lyrics\"")
-                  : undefined}
-                className={`flex items-center gap-2.5 px-3 py-2.5 rounded-xl text-[12.5px] font-medium whitespace-nowrap transition-all text-left shrink-0 ${
+                  : (isStep6 ? s.label : undefined)}
+                className={`flex items-center ${isStep6 ? "lg:justify-center lg:px-0" : "gap-2.5 px-3"} py-2.5 rounded-xl text-[12.5px] font-medium whitespace-nowrap transition-all text-left shrink-0 ${
                   disabled
                     ? "text-gray-600 cursor-not-allowed opacity-50"
                     : active ? "bg-brand/[0.12] text-white ring-1 ring-brand/35"
@@ -1864,13 +1893,20 @@ export default function UploadZone({
                                     : done ? "bg-accent/20 text-accent"
                                            : "bg-surface-3 text-gray-400"
                 }`}>{done ? "✓" : s.id}</span>
-                {s.label}
+                <span className={isStep6 ? "lg:hidden ml-2.5" : "ml-2.5 lg:ml-0"}>{s.label}</span>
               </button>
             );
           })}
         </nav>
 
-        {/* CENTER — stage: live preview of the result */}
+        {/* CENTER — stage: live preview of the result.
+
+            UI F3 (2026-05-26): en paso 6 el preview se monta con
+            compact=true → el componente oculta el caption inferior
+            de movement/effect (controles que ya no se están
+            editando), y el max-width del contenedor se ajusta al
+            grid column (260-320 px). Mantiene sticky para acompañar
+            el scroll del timeline en el panel derecho. */}
         <div className="lg:sticky lg:top-4 space-y-2 min-w-0 w-full">
           {bgMode === "auto" ? (
             <WizardLivePreview
@@ -1891,6 +1927,10 @@ export default function UploadZone({
                  audio en la review (step 6). Sin el ref, el preview cae
                  al modo legacy (lyric loop con `_previewLyric`). */
               playbackTickRef={playbackTickRef}
+              /* UI F3 + F5 (2026-05-26): compact en paso 6; placeholderBg
+                 mientras el pre-gen del fondo no terminó. */
+              compact={isStep6}
+              placeholderBg={isStep6 && bgStatus !== "done"}
             />
           ) : (
             <div className="aspect-video rounded-2xl ring-1 ring-white/[0.08] bg-surface-2/50 grid place-items-center text-gray-500 text-[13px]">
@@ -1899,7 +1939,7 @@ export default function UploadZone({
           )}
           <p className="text-[10px] text-gray-600 px-1">
             {_previewLyric
-              ? `${t("upload.preview_editing") || "Editando"}: ${_previewLyric}${files.length > 1 ? ` · +${files.length - 1}` : ""}`
+              ? `${t("upload.preview_editing") || "Línea actual"}: ${_previewLyric}${files.length > 1 ? ` · +${files.length - 1}` : ""}`
               : (t("upload.preview_disclaimer") || "Aproximación del mood y el movimiento. El fondo final lo genera la IA.")}
           </p>
         </div>
@@ -2251,6 +2291,8 @@ export default function UploadZone({
           )}
         </div>
       </div>
+        );
+      })()
       )}
 
       {/* Sticky bottom CTA bar. Phase 2: oculta en paso 6 porque el contenido

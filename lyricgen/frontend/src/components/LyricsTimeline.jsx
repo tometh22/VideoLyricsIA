@@ -511,10 +511,16 @@ export default function LyricsTimeline({
                     />
                   ) : (
                     <span
-                      className="text-white/90 line-clamp-2 cursor-text"
+                      className="text-white/90 line-clamp-3 cursor-text break-words"
                       onPointerDown={(ev) => ev.stopPropagation()}
                       onDoubleClick={(ev) => { ev.stopPropagation(); beginTextEdit(seg); }}
-                      title="Doble-click para corregir el texto"
+                      /* UI F14 (2026-05-26): el title= ahora incluye el texto
+                         completo (no solo el hint de doble-click). Si la
+                         card es angosta y line-clamp corta la línea, el
+                         operador puede leer todo en el hover. line-clamp
+                         subió de 2 a 3 líneas para que las líneas de
+                         canción más largas no se corten tan agresivo. */
+                      title={`${seg.text}\n\n— Doble-click para corregir`}
                     >
                       {seg.text}
                     </span>

@@ -68,6 +68,20 @@ export default function WizardLivePreview({
   // con nuestro propio rAF para renderizar word-jump real sincronizado al
   // audio, sin disparar re-renders en App.jsx/UploadZone.
   playbackTickRef = null,
+  // UI F5 (2026-05-26): cuando el componente sabe que está mostrando el
+  // fondo placeholder (no el final que va a entregar la IA), el badge
+  // cambia su lenguaje visual: "VISTA PREVIA (muestra)" con dot ámbar
+  // estático, en lugar de "VISTA PREVIA EN VIVO" con dot verde
+  // pulsante. Sin esto el badge mentía: decía "live" mientras el chip
+  // de status abajo decía "fondo es muestra".
+  placeholderBg = false,
+  // UI F1+F3 (2026-05-26): modo compact para el paso 6 — el preview
+  // pasa a thumbnail (~280-360 px). Solo afecta el sizing externo si
+  // el caller setea max-width; el componente no se auto-encoge.
+  // Mantenemos esta flag para que LyricsEditor / UploadZone puedan
+  // alterar la composición interna (ocultar el caption inferior con
+  // movement + effect, que en paso 6 ya no se está editando).
+  compact = false,
 }) {
   const { t } = useI18n();
   // Phase C: estado local del tick. Inicializa vacío; el rAF interno lo
@@ -403,28 +417,65 @@ export default function WizardLivePreview({
         </div>
       </div>
 
-      {/* live indicator (clearly a status, not a button) */}
+      {/* live indicator (clearly a status, not a button).
+
+          UI F5 (2026-05-26): cuando `placeholderBg` está set (paso 6
+          mientras el pre-gen del fondo no terminó), el badge cambia de
+          "VISTA PREVIA EN VIVO" + dot verde pulsante a "VISTA PREVIA
+          (muestra)" + dot ámbar estático. Mismo lenguaje visual que el
+          chip de status del fondo abajo — antes los dos se contradecían
+          (badge live, chip diciendo "es muestra"). */}
       <div className="absolute top-4 left-4 flex items-center gap-1.5 text-[10px] uppercase tracking-[0.18em] font-medium" style={{ color: isMinimal ? "rgba(0,0,0,.6)" : "rgba(255,255,255,.72)" }}>
-        <span className="w-1.5 h-1.5 rounded-full animate-pulse" style={{ background: "#14C8A8" }} />
-        {t("upload.preview_live") || "Preview"}
+        <span
+          className={placeholderBg ? "w-1.5 h-1.5 rounded-full" : "w-1.5 h-1.5 rounded-full animate-pulse"}
+          style={{ background: placeholderBg ? "#F59E0B" : "#14C8A8" }}
+        />
+        {placeholderBg
+          ? (t("upload.preview_sample_badge") || "Vista previa (muestra)")
+          : (t("upload.preview_live") || "Preview")}
       </div>
       {/* info caption — plain text, not pills. El span del movimiento usa
           `key={moveLabel + effectLabel}` para que React lo desmonte/remonte
           al cambiar opción → la animación de pulse vuelve a fire. Feedback
-          visual de "el preview SE actualizó". UX 2026-05-24. */}
-      <div className="absolute bottom-3.5 left-5 right-5 flex items-center justify-between text-label" style={{ color: isMinimal ? "rgba(0,0,0,.55)" : "rgba(255,255,255,.6)", textShadow: isMinimal ? "none" : "0 1px 8px rgba(0,0,0,.5)" }}>
-        <span className="truncate">{modeLabel}</span>
-        <span
-          key={`${moveLabel}-${effectLabel}`}
-          className="shrink-0 ml-3 px-2 py-0.5 rounded-full"
+          visual de "el preview SE actualizó". UX 2026-05-24.
+
+          UI F3 (2026-05-26): en compact mode (paso 6 del wizard,
+          preview a thumbnail) el operador ya no está modificando
+          movimiento/efecto — son decisiones tomadas en pasos previos.
+          Ocultar el caption ahorra altura y desclutter al thumbnail.
+
+          UI F12 (2026-05-26): doble text-shadow + backdrop-blur en el
+          background del caption suben el contraste sobre frames
+          brillantes del fondo (paredes claras del living, etc.). El
+          shadow simple original caía bajo WCAG AA en escenas claras. */}
+      {!compact && (
+        <div
+          className="absolute bottom-3.5 left-5 right-5 flex items-center justify-between text-label"
           style={{
-            animation: "wlp-badge-pulse 0.7s cubic-bezier(.2,.8,.2,1) 1",
-            background: isMinimal ? "rgba(0,0,0,.06)" : "rgba(255,255,255,.06)",
+            color: isMinimal ? "rgba(0,0,0,.7)" : "rgba(255,255,255,.85)",
+            textShadow: isMinimal
+              ? "none"
+              : "0 1px 4px rgba(0,0,0,.85), 0 0 16px rgba(0,0,0,.55)",
           }}
         >
-          {(t("upload.preview_motion") || "Movimiento")}: {moveLabel}{effectLabel ? ` · ${t("upload.effect_label") || "Efecto"}: ${effectLabel}` : ""}
-        </span>
-      </div>
+          <span
+            className="truncate px-2 py-0.5 rounded backdrop-blur-sm"
+            style={{ background: isMinimal ? "rgba(255,255,255,.4)" : "rgba(0,0,0,.4)" }}
+          >
+            {modeLabel}
+          </span>
+          <span
+            key={`${moveLabel}-${effectLabel}`}
+            className="shrink-0 ml-3 px-2 py-0.5 rounded-full backdrop-blur-sm"
+            style={{
+              animation: "wlp-badge-pulse 0.7s cubic-bezier(.2,.8,.2,1) 1",
+              background: isMinimal ? "rgba(0,0,0,.06)" : "rgba(255,255,255,.10)",
+            }}
+          >
+            {(t("upload.preview_motion") || "Movimiento")}: {moveLabel}{effectLabel ? ` · ${t("upload.effect_label") || "Efecto"}: ${effectLabel}` : ""}
+          </span>
+        </div>
+      )}
     </div>
   );
 }
