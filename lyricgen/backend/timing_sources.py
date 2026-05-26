@@ -53,11 +53,23 @@ WHISPER_GEMINI_REC = "whisper_gemini_rec"
 # raw ASR produced; this tag at least makes the degradation visible.
 WHISPER_RAW = "whisper_raw"
 
+# whisperX wordstamps + canonical text from lrclib + relative-timing
+# hint from lrclib syncedLyrics. Third fallback in the audio-as-truth
+# path (used when both reconcile and forced_align fail). lrclib_aligner
+# rebuckets whisperX words against the canonical line structure and
+# fills unmatched lines using the lrclib synced timestamps with a
+# global offset computed from matched whisperX anchors. Less precise
+# than reconcile/FA timing (~2-5s on interpolated lines) but recovers
+# cases where cureau crashes on highly-repetitive lyrics (incident
+# 2026-05-26: Sin Gamulán, Mujer Amante — see issue #357).
+WHISPERX_LRCLIB = "whisperx_lrclib"
+
 
 VALID_TIMING_SOURCES = frozenset({
     FORCED_ALIGN,
     WHISPERX_RECONCILED,
     WHISPERX,
+    WHISPERX_LRCLIB,
     WHISPER_LRCLIB,
     WHISPER_LRCLIB_REC,
     WHISPER_GEMINI_REC,

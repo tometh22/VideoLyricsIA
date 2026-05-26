@@ -3981,7 +3981,84 @@ async def _run_transcription_for_job(
                                 _fa_segs, _WC_FA,
                                 reference_lyrics=_canonical,
                             )
-                        logger.info("[WC] forced_align fallback empty/disabled — emitting whisperX raw with mishear text (operator edits)")
+                        # FA also failed. Last canonical-aware attempt
+                        # before whisperX raw: emit lrclib SYNCED
+                        # timestamps directly, anchored to whisperX's
+                        # first detected word so a global offset (e.g.
+                        # "Cosas Mías" 2026-05-22) gets normalised.
+                        #
+                        # INCIDENT 2026-05-26 (issue #357 — Sin Gamulán
+                        # / Mujer Amante): cureau crashes with
+                        # `Expected 2D or 3D tensor … got [1, 2, 0]` on
+                        # lyrics with extreme line repetition (>40%
+                        # duplicates). FA fallback can't help, and
+                        # lrclib_aligner's per-line cursor-based
+                        # matching also breaks on chorus repeats (PR
+                        # #362, reverted: ~50 s avg timing error).
+                        #
+                        # The trick: lrclib synced has the correct
+                        # RELATIVE timing for every line in song order,
+                        # so we just need ONE good audio anchor to fix
+                        # any global offset. whisperX's first detected
+                        # word + the first synced line gives us that
+                        # anchor essentially for free — empirically
+                        # within 1 s of truth on both Sin Gamulán and
+                        # Mujer Amante. Drops avg error from ~50 s
+                        # (linear interp) to <1 s.
+                        _synced_hint: str | None = (
+                            (lrc or {}).get("synced") if isinstance(lrc, dict) else None
+                        )
+                        _sync_segs: list[dict] = []
+                        if _synced_hint:
+                            try:
+                                import lrclib_aligner as _lca
+                                _pairs = _lca._parse_lrc_to_line_times(_synced_hint)
+                                # Anchor offset: whisperX first word vs first synced line.
+                                _first_wx_t: float | None = None
+                                for _s in _wx_segs:
+                                    for _w in _s.get("words") or []:
+                                        if isinstance(_w, dict) and "start" in _w:
+                                            _first_wx_t = float(_w["start"])
+                                            break
+                                    if _first_wx_t is not None:
+                                        break
+                                if _pairs and _first_wx_t is not None:
+                                    _offset = _first_wx_t - _pairs[0][0]
+                                    # Sanity: only trust offset if reasonable
+                                    # (<60 s); else assume no offset so we
+                                    # don't shift everything by garbage.
+                                    if abs(_offset) > 60:
+                                        logger.warning("[WC] synced offset out of range (%.1fs) — using 0", _offset)
+                                        _offset = 0.0
+                                    # Build segments: each line spans up
+                                    # to the next line's start − 50 ms.
+                                    for _i, (_t, _txt) in enumerate(_pairs):
+                                        _s_t = round(_t + _offset, 2)
+                                        if _i + 1 < len(_pairs):
+                                            _e_t = round(_pairs[_i + 1][0] + _offset - 0.05, 2)
+                                        else:
+                                            _e_t = round(_s_t + 3.0, 2)
+                                        if _e_t <= _s_t:
+                                            _e_t = _s_t + 0.5
+                                        _sync_segs.append({
+                                            "start": max(0.0, _s_t),
+                                            "end": max(_s_t + 0.1, _e_t),
+                                            "text": _txt,
+                                            "review": True,
+                                        })
+                                    logger.info(
+                                        "[WC] synced direct fallback: %d segs, offset=%+.2fs (first whisperX word @%.2fs vs synced @%.2fs)",
+                                        len(_sync_segs), _offset, _first_wx_t, _pairs[0][0],
+                                    )
+                            except Exception as e:
+                                logger.warning("[WC] synced direct fallback raised: %s — emitting whisperX raw", e)
+                        if _sync_segs:
+                            from timing_sources import WHISPERX_LRCLIB as _WC_WXL
+                            return _emit_segments(
+                                _sync_segs, _WC_WXL,
+                                reference_lyrics=_canonical,
+                            )
+                        logger.info("[WC] no synced hint — emitting whisperX raw with mishear text (operator edits)")
                     return _emit_segments(
                         _wx_segs, _WC_WX,
                         reference_lyrics=_canonical,
