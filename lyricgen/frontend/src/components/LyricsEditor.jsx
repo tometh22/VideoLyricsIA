@@ -1471,6 +1471,31 @@ export default function LyricsEditor({
     });
   };
 
+  // Pure helper: returns a new array with a blank line inserted RIGHT AFTER
+  // `prev[idx]`, with timing interpolated into the gap to the next line.
+  // Used by `insertLineAfter` (explicit "insert here" button) and by
+  // `addBlankLine` when the playhead falls inside an existing segment —
+  // delegating here avoids the overlap bug where the new line shared
+  // timestamps with the segment under the playhead and the timeline's lane
+  // assigner pushed it into a parallel column, squishing every other line.
+  const insertAfterInArray = (prev, idx) => {
+    const cur = prev[idx];
+    const nxt = prev[idx + 1];
+    const gapStart = cur ? cur.end : (prev[0] ? prev[0].start : 0);
+    const gapEnd = nxt ? nxt.start : (duration || gapStart + 3);
+    const gap = Math.max(0, gapEnd - gapStart);
+    let s = gapStart + (gap > 0.6 ? gap / 3 : 0.1);
+    let e = s + (gap > 0.6 ? gap / 3 : 1.0);
+    if (!(e > s) || e > gapEnd) {
+      s = gapStart + 0.1;
+      e = Math.min(gapEnd > s ? gapEnd - 0.05 : s + 1.0, s + 1.0);
+      if (e <= s) e = s + 0.5;
+    }
+    const nextId = prev.reduce((m, x) => Math.max(m, x._id), -1) + 1;
+    const inserted = { _id: nextId, start: s, end: e, text: "" };
+    return [...prev, inserted].sort((a, b) => a.start - b.start);
+  };
+
   // Append a blank line at the end of the list. Operator types the
   // missing lyrics into the text input, then tap-syncs it.
   const addBlankLine = () => {
@@ -1495,6 +1520,26 @@ export default function LyricsEditor({
       // "Add line at playhead" is an explicit click — they want the
       // segment to start where the cursor is, not 80 ms before.
       const playhead = currentTime > 0 ? Math.max(0, currentTime) : 0;
+
+      // Operator report 2026-05-26: si el playhead caía DENTRO de un
+      // segmento existente (caso clásico: pausan en medio de una línea
+      // para corregir y le dan "Agregar línea"), la nueva línea entraba
+      // con start solapado contra esa otra. Visualmente: la línea nueva
+      // aparecía "al revés" en la lista y, en la timeline, el lane
+      // assigner detectaba overlap > 50ms y abría una columna paralela,
+      // achicando todo el resto del Gantt al 50%. Fix: delegar al mismo
+      // helper de "insertar entre dos líneas" que ya calcula el timing
+      // en el gap inmediatamente posterior al segmento que contiene al
+      // playhead — sin solape, sin desfase, sin "queda al revés".
+      if (playhead > 0) {
+        const containingIdx = prev.findIndex(
+          (s) => playhead >= s.start - 0.05 && playhead < s.end + 0.05,
+        );
+        if (containingIdx !== -1) {
+          return insertAfterInArray(prev, containingIdx);
+        }
+      }
+
       const last = prev[prev.length - 1];
       const lastEnd = last ? last.end : 0;
       const baseStart = playhead > 0
@@ -1520,24 +1565,134 @@ export default function LyricsEditor({
   // the MIDDLE of the song" affordance — the bottom "Agregar línea" button
   // forced the operator to scroll away from where they were working.
   const insertLineAfter = (idx) => {
-    setEdited((prev) => {
-      const cur = prev[idx];
-      const nxt = prev[idx + 1];
-      const gapStart = cur ? cur.end : (prev[0] ? prev[0].start : 0);
-      const gapEnd = nxt ? nxt.start : (duration || gapStart + 3);
-      const gap = Math.max(0, gapEnd - gapStart);
-      let s = gapStart + (gap > 0.6 ? gap / 3 : 0.1);
-      let e = s + (gap > 0.6 ? gap / 3 : 1.0);
-      if (!(e > s) || e > gapEnd) {
-        s = gapStart + 0.1;
-        e = Math.min(gapEnd > s ? gapEnd - 0.05 : s + 1.0, s + 1.0);
-        if (e <= s) e = s + 0.5;
-      }
-      const nextId = prev.reduce((m, x) => Math.max(m, x._id), -1) + 1;
-      const inserted = { _id: nextId, start: s, end: e, text: "" };
-      return [...prev, inserted].sort((a, b) => a.start - b.start);
-    });
+    setEdited((prev) => insertAfterInArray(prev, idx));
   };
+
+  // Swap CONTENT between two lines while preserving their timestamp slots.
+  // Operator request 2026-05-26: cuando agregaban una línea y quedaba en el
+  // orden visual equivocado (caso típico: dos líneas con starts muy parecidos
+  // y el sort by-start las dejaba "al revés"), no había forma de
+  // intercambiarlas sin manualmente reescribir los timestamps de las dos.
+  //
+  // Lo que se intercambia: text, review, locked, pos, scale, rot. Es decir,
+  // todo lo que describe el CONTENIDO de la línea (qué se canta, cómo se
+  // posiciona en el video, si está pendiente de revisión).
+  // Lo que NO se toca: _id, start, end. Los slots de tiempo quedan fijos en
+  // su lugar — el invariante de "array sorted by start" se preserva, los
+  // rowRefs.current[_id] siguen apuntando a la misma fila DOM y el undo
+  // history y propagation prompts (indexados por _id) no se confunden.
+  const swapSegmentsById = useCallback((idA, idB) => {
+    if (idA === idB) return;
+    pushEditHistory();
+    setIsDirty(true);
+    setEdited((prev) => {
+      const a = prev.find((s) => s._id === idA);
+      const b = prev.find((s) => s._id === idB);
+      if (!a || !b) return prev;
+      return prev.map((s) => {
+        if (s._id === idA) {
+          return { ...s, text: b.text, review: b.review, locked: b.locked,
+                   pos: b.pos, scale: b.scale, rot: b.rot };
+        }
+        if (s._id === idB) {
+          return { ...s, text: a.text, review: a.review, locked: a.locked,
+                   pos: a.pos, scale: a.scale, rot: a.rot };
+        }
+        return s;
+      });
+    });
+    setFlushCounter((c) => c + 1);
+  }, [pushEditHistory]);
+
+  // Convenience wrapper for the ↑/↓ buttons: swap with the previous/next row
+  // in the `edited` array (which is always sorted by .start, so "previous"
+  // visually = earlier in time, "next" = later).
+  const swapWithNeighbour = useCallback((id, direction) => {
+    const i = edited.findIndex((s) => s._id === id);
+    if (i < 0) return;
+    const j = direction === "up" ? i - 1 : i + 1;
+    if (j < 0 || j >= edited.length) return;
+    swapSegmentsById(id, edited[j]._id);
+  }, [edited, swapSegmentsById]);
+
+  // Delete a segment from the timeline. Operator request 2026-05-26: estaba
+  // disponible solo en la vista lista (botón papelera por row); en la
+  // timeline no había forma de borrar — el operador tenía que volver a
+  // lista, borrar, volver a timeline.
+  const deleteSegmentById = useCallback((id) => {
+    pushEditHistory();
+    setIsDirty(true);
+    setEdited((prev) => prev.filter((s) => s._id !== id));
+    setFlushCounter((c) => c + 1);
+  }, [pushEditHistory]);
+
+  // Drag-to-swap (lista + timeline). Native pointer events: el operador
+  // arrastra el handle ⋮⋮ de una línea sobre cualquier otra → swap de
+  // contenido. Hit-test por DOM: cada row/bloque tiene `data-seg-id`.
+  // Misma mecánica que el drag de timings en LyricsTimeline, sin librería.
+  const dragSwapRef = useRef(null); // {sourceId, originX, originY, moved}
+  const [dragSwapTargetId, setDragSwapTargetId] = useState(null);
+  const [dragSwapSourceId, setDragSwapSourceId] = useState(null);
+
+  const onSwapDragStart = useCallback((e, sourceId) => {
+    e.stopPropagation();
+    e.preventDefault();
+    try { e.currentTarget.setPointerCapture?.(e.pointerId); } catch (_) {}
+    dragSwapRef.current = {
+      sourceId, originX: e.clientX, originY: e.clientY, moved: false,
+    };
+    setDragSwapSourceId(sourceId);
+  }, []);
+
+  const onSwapDragMove = useCallback((e) => {
+    const d = dragSwapRef.current;
+    if (!d) return;
+    const dx = e.clientX - d.originX;
+    const dy = e.clientY - d.originY;
+    if (!d.moved && Math.hypot(dx, dy) < 4) return;        // click-slop
+    d.moved = true;
+    // Hit-test: ¿sobre qué row/bloque está el cursor?
+    const el = document.elementFromPoint(e.clientX, e.clientY);
+    const targetEl = el?.closest?.("[data-seg-id]");
+    const rawId = targetEl?.getAttribute("data-seg-id");
+    const targetId = rawId == null ? null : Number(rawId);
+    setDragSwapTargetId(
+      targetId != null && Number.isFinite(targetId) && targetId !== d.sourceId
+        ? targetId
+        : null,
+    );
+  }, []);
+
+  const onSwapDragEnd = useCallback(() => {
+    const d = dragSwapRef.current;
+    dragSwapRef.current = null;
+    setDragSwapSourceId(null);
+    const targetId = dragSwapTargetId;
+    setDragSwapTargetId(null);
+    if (!d || !d.moved) return;
+    if (targetId != null && targetId !== d.sourceId) {
+      swapSegmentsById(d.sourceId, targetId);
+    }
+  }, [dragSwapTargetId, swapSegmentsById]);
+
+  // Window-level listeners while a swap-drag is active. Pointer capture on
+  // the source handle works for the most part, but if the operator drags fast
+  // and crosses out of the source's hitbox, capture can drop on some browsers
+  // — these fallback listeners guarantee we always see move/up events and
+  // can hit-test against whichever element is under the pointer.
+  useEffect(() => {
+    if (dragSwapSourceId == null) return undefined;
+    const move = (e) => onSwapDragMove(e);
+    const up = () => onSwapDragEnd();
+    window.addEventListener("pointermove", move);
+    window.addEventListener("pointerup", up);
+    window.addEventListener("pointercancel", up);
+    return () => {
+      window.removeEventListener("pointermove", move);
+      window.removeEventListener("pointerup", up);
+      window.removeEventListener("pointercancel", up);
+    };
+  }, [dragSwapSourceId, onSwapDragMove, onSwapDragEnd]);
 
   // Operator-friendly title: strip extension + collapse underscores/dashes
   // to em-dashes + title-case respecting Spanish/PT lowercase stop-words.
@@ -2426,6 +2581,13 @@ export default function LyricsEditor({
                 onTextChange={updateText}
                 onFocus={focusSegment}
                 onReset={resetTimings}
+                onUndo={undoEdit}
+                canUndo={editHistory.length > 0}
+                onSwap={swapSegmentsById}
+                onDelete={deleteSegmentById}
+                onSwapDragStart={onSwapDragStart}
+                dragSwapSourceId={dragSwapSourceId}
+                dragSwapTargetId={dragSwapTargetId}
               />
             ) : (
               <>
@@ -2504,6 +2666,7 @@ export default function LyricsEditor({
                 key={seg._id}
                 ref={(el) => { rowRefs.current[seg._id] = el; }}
                 {...(idx === 0 ? { "data-tour": "editor-list-row" } : {})}
+                data-seg-id={seg._id}
                 /* Phase A 2026-05-25: highlight prominente cuando es activo.
                    Antes: bg-brand/[0.07] ring-1 ring-brand/25 (invisible al
                    operador, ~7% opacity). Ahora: bg-brand/15 + left-bar
@@ -2516,9 +2679,52 @@ export default function LyricsEditor({
                   ${!isArmed && isActive ? "wlp-active-row bg-brand/15 border-l-4 border-brand pl-1 shadow-[0_0_24px_-8px_rgba(109,74,255,0.45)]" : "border-l-4 border-transparent"}
                   ${!isArmed && !isActive && wasRecentlyAnchored ? "bg-brand/[0.05] ring-1 ring-brand/40" : ""}
                   ${!isArmed && !isActive && !wasRecentlyAnchored && isReview ? "bg-amber-500/[0.06] ring-1 ring-amber-500/40" : ""}
-                  ${isAnchored ? "opacity-60" : ""}`}
+                  ${isAnchored ? "opacity-60" : ""}
+                  ${dragSwapTargetId === seg._id ? "ring-2 ring-brand-light bg-brand/10" : ""}
+                  ${dragSwapSourceId === seg._id ? "opacity-50" : ""}`}
               >
                 <div className="flex items-start gap-2 p-1">
+                  {/* Reorder controls: drag-handle ⋮⋮ para swap libre +
+                      flechitas ↑↓ para swap con vecina inmediata. Operator
+                      request 2026-05-26: a veces al agregar una línea queda
+                      en orden visual equivocado y antes no había forma de
+                      intercambiarla sin reescribir manualmente los
+                      timestamps. swapSegmentsById preserva start/end e
+                      intercambia el contenido (texto + flags + layout). */}
+                  <div className="flex flex-col items-center shrink-0 pt-1 opacity-30 group-hover:opacity-100 transition-opacity">
+                    <button
+                      type="button"
+                      onClick={() => swapWithNeighbour(seg._id, "up")}
+                      disabled={idx === 0}
+                      title="Intercambiar con la línea anterior"
+                      aria-label="Subir línea"
+                      className="w-4 h-4 rounded text-[10px] text-ink-tertiary
+                        hover:text-white hover:bg-white/[0.08] disabled:opacity-20 disabled:hover:bg-transparent
+                        flex items-center justify-center leading-none"
+                    >▲</button>
+                    <button
+                      type="button"
+                      onPointerDown={(e) => onSwapDragStart(e, seg._id)}
+                      title="Arrastrá para intercambiar con cualquier otra línea"
+                      aria-label="Arrastrar para reordenar"
+                      className="w-4 h-4 my-0.5 cursor-grab active:cursor-grabbing
+                        text-ink-tertiary hover:text-white
+                        flex items-center justify-center leading-none select-none"
+                      style={{ touchAction: "none" }}
+                    >
+                      <span className="text-[10px] tracking-tighter">⋮⋮</span>
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => swapWithNeighbour(seg._id, "down")}
+                      disabled={idx === edited.length - 1}
+                      title="Intercambiar con la línea siguiente"
+                      aria-label="Bajar línea"
+                      className="w-4 h-4 rounded text-[10px] text-ink-tertiary
+                        hover:text-white hover:bg-white/[0.08] disabled:opacity-20 disabled:hover:bg-transparent
+                        flex items-center justify-center leading-none"
+                    >▼</button>
+                  </div>
                   {editingId === seg._id ? (
                     <input
                       type="text"

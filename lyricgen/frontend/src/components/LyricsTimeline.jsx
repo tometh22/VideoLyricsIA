@@ -66,6 +66,13 @@ export default function LyricsTimeline({
   onTextChange,        // (id, text) => void — inline text fix without leaving timeline
   onFocus,             // (id) => void
   onReset,             // () => void
+  onUndo,              // () => void — undo last manual edit (mirrors Cmd+Z)
+  canUndo = false,     // boolean — show undo button only when edit history is non-empty
+  onSwap,              // (idA, idB) => void — swap content between two segments (keeps timestamps)
+  onDelete,            // (id) => void — remove a segment entirely
+  onSwapDragStart,     // (e, sourceId) => void — start a drag-to-swap from this segment's handle
+  dragSwapSourceId = null,  // _id of segment being dragged for swap (dim it)
+  dragSwapTargetId = null,  // _id of segment currently hovered as swap target (ring it)
   focusMode = false,   // 2026-05-25 — passed from LyricsEditor focus toggle
 }) {
   const laneRef = useRef(null);
@@ -359,6 +366,24 @@ export default function LyricsTimeline({
               title="Acercar" aria-label="Acercar"
             >+</button>
           </div>
+          {/* Botón Deshacer (regresión 2026-05-26): el botón vivía en el
+              panel auto-fix de LyricsEditor que se oculta entero en vista
+              timeline. El operador perdió la affordance visual del undo —
+              solo le quedaba Cmd+Z, invisible. Lo traemos a la toolbar del
+              timeline para que esté siempre a mano cuando hay historial. */}
+          {canUndo && (
+            <button
+              onClick={onUndo}
+              className="text-label px-2.5 py-1 rounded-md text-ink-secondary
+                ring-1 ring-white/[0.08] hover:ring-white/20 hover:text-white transition-colors flex items-center gap-1.5"
+              title="Deshacer última edición (Cmd/Ctrl+Z)"
+            >
+              <svg className="w-3 h-3" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
+                <path d="M3 7v6h6M3 13a9 9 0 109-9" strokeLinecap="round" strokeLinejoin="round" />
+              </svg>
+              Deshacer
+            </button>
+          )}
           <button
             onClick={onReset}
             className="text-label px-2.5 py-1 rounded-md text-ink-secondary
@@ -441,15 +466,30 @@ export default function LyricsTimeline({
             const LANE_GAP_PCT = 1;        // small horizontal breathing space
             const laneSpan = (100 - LANE_GAP_PCT * (laneCount - 1)) / laneCount;
             const laneLeftPct = laneIdx * (laneSpan + LANE_GAP_PCT);
+            // Same-lane neighbours for the ↑/↓ swap buttons. In a single-
+            // lane song this is just prev/next; in overlapping passages the
+            // swap stays inside the lane the operator is looking at.
+            const sameLaneSorted = [...segments]
+              .filter((s) => (laneOfId.get(s._id) ?? 0) === laneIdx)
+              .sort((a, b) => a.start - b.start);
+            const myLaneIdx = sameLaneSorted.findIndex((s) => s._id === seg._id);
+            const swapUpId = myLaneIdx > 0 ? sameLaneSorted[myLaneIdx - 1]._id : null;
+            const swapDownId = myLaneIdx >= 0 && myLaneIdx < sameLaneSorted.length - 1
+              ? sameLaneSorted[myLaneIdx + 1]._id : null;
+            const isSwapSource = dragSwapSourceId === seg._id;
+            const isSwapTarget = dragSwapTargetId === seg._id;
             return (
               <div
                 key={seg._id}
+                data-seg-id={seg._id}
                 className={[
-                  "absolute rounded-md overflow-hidden text-caption leading-tight ring-1 transition-colors",
+                  "absolute rounded-md overflow-hidden text-caption leading-tight ring-1 transition-colors group/blk",
                   isActive ? "bg-brand/25" : "bg-surface-3/25",
                   isLocked ? "ring-brand/60" : "ring-white/[0.07]",
                   isFocused ? "outline outline-1 outline-brand-light" : "",
                   isHi ? "ring-2 ring-accent" : "",
+                  isSwapTarget ? "ring-2 ring-brand-light bg-brand/10" : "",
+                  isSwapSource ? "opacity-50" : "",
                 ].join(" ")}
                 style={{
                   top, height,
@@ -488,6 +528,98 @@ export default function LyricsTimeline({
                   title="Arrastrá: cuándo SALE la línea"
                 >
                   <div className="w-7 h-[3px] rounded-full bg-white/40 group-hover/hb:bg-white/90 transition-colors" />
+                </div>
+                {/* Action overlay: reorder ↑↓, drag-handle ⋮⋮, edit ✎, delete ✕.
+                    Visible on hover so the bloque sigue limpio en reposo.
+                    Operator request 2026-05-26: el timeline tenía que poder
+                    editar/eliminar/reordenar sin volver a la vista lista.
+                    Los handlers stopPropagation para no disparar el body drag
+                    (que mueve timings) ni el text edit accidental. */}
+                <div
+                  className="absolute top-1 right-1 z-10 flex items-center gap-0.5
+                    opacity-0 group-hover/blk:opacity-100 focus-within:opacity-100 transition-opacity
+                    bg-surface-1/80 backdrop-blur-sm rounded ring-1 ring-white/[0.06] px-0.5 py-0.5"
+                  onPointerDown={(ev) => ev.stopPropagation()}
+                  onPointerMove={(ev) => ev.stopPropagation()}
+                  onPointerUp={(ev) => ev.stopPropagation()}
+                  onClick={(ev) => ev.stopPropagation()}
+                >
+                  <button
+                    type="button"
+                    onClick={(ev) => { ev.stopPropagation(); if (swapUpId != null) onSwap?.(seg._id, swapUpId); }}
+                    disabled={swapUpId == null}
+                    title="Intercambiar con la línea anterior"
+                    aria-label="Subir línea"
+                    className="w-4 h-4 rounded text-[9px] text-ink-tertiary
+                      hover:text-white hover:bg-white/[0.08] disabled:opacity-20 disabled:hover:bg-transparent
+                      flex items-center justify-center leading-none"
+                  >▲</button>
+                  <button
+                    type="button"
+                    onPointerDown={(ev) => { ev.stopPropagation(); onSwapDragStart?.(ev, seg._id); }}
+                    title="Arrastrá para intercambiar con cualquier otra línea"
+                    aria-label="Arrastrar para reordenar"
+                    className="w-4 h-4 cursor-grab active:cursor-grabbing
+                      text-ink-tertiary hover:text-white
+                      flex items-center justify-center leading-none select-none"
+                    style={{ touchAction: "none" }}
+                  >
+                    <span className="text-[9px] tracking-tighter">⋮⋮</span>
+                  </button>
+                  <button
+                    type="button"
+                    onClick={(ev) => { ev.stopPropagation(); if (swapDownId != null) onSwap?.(seg._id, swapDownId); }}
+                    disabled={swapDownId == null}
+                    title="Intercambiar con la línea siguiente"
+                    aria-label="Bajar línea"
+                    className="w-4 h-4 rounded text-[9px] text-ink-tertiary
+                      hover:text-white hover:bg-white/[0.08] disabled:opacity-20 disabled:hover:bg-transparent
+                      flex items-center justify-center leading-none"
+                  >▼</button>
+                  <span className="w-px h-3 bg-white/10 mx-0.5" />
+                  <button
+                    type="button"
+                    onClick={(ev) => { ev.stopPropagation(); beginTextEdit(seg); }}
+                    title="Editar texto (también doble-click)"
+                    aria-label="Editar texto"
+                    className="w-4 h-4 rounded text-[10px] text-ink-tertiary
+                      hover:text-white hover:bg-white/[0.08]
+                      flex items-center justify-center leading-none"
+                  >
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor"
+                         strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"
+                         className="w-2.5 h-2.5">
+                      <path d="M12 20h9" />
+                      <path d="M16.5 3.5a2.121 2.121 0 0 1 3 3L7 19l-4 1 1-4L16.5 3.5z" />
+                    </svg>
+                  </button>
+                  <button
+                    type="button"
+                    onClick={(ev) => {
+                      ev.stopPropagation();
+                      // Confirm before delete: una línea borrada por error es
+                      // recuperable vía undo, pero el confirm evita el "oops"
+                      // y el operador no tiene que descubrir el undo en otra
+                      // ubicación de la UI.
+                      const preview = (seg.text || "").trim().slice(0, 40) || "(línea vacía)";
+                      if (window.confirm(`¿Eliminar la línea "${preview}"?`)) {
+                        onDelete?.(seg._id);
+                      }
+                    }}
+                    title="Eliminar esta línea"
+                    aria-label="Eliminar línea"
+                    className="w-4 h-4 rounded text-[10px] text-ink-tertiary
+                      hover:text-red-300 hover:bg-red-500/10
+                      flex items-center justify-center leading-none"
+                  >
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor"
+                         strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"
+                         className="w-2.5 h-2.5">
+                      <path d="M3 6h18" />
+                      <path d="M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2" />
+                      <path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6" />
+                    </svg>
+                  </button>
                 </div>
                 {/* Text anchored to the TOP (where the line enters), not
                     floating in the middle of a tall held block. */}

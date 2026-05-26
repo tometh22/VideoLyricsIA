@@ -212,4 +212,100 @@ describe("LyricsEditor — addBlankLine (B3)", () => {
     });
     expect(seconds).toEqual([...seconds].sort((a, b) => a - b));
   });
+
+  // Regression 2026-05-26: si el playhead cae DENTRO de un segmento existente
+  // (operador pausa en medio de una línea para corregir y le da "Agregar
+  // línea"), la nueva línea no debe solapar con la línea contenedora — sino
+  // el lane assigner del timeline la pone en una columna paralela y desfasa
+  // todo el resto del Gantt al 50%. Fix: addBlankLine detecta el caso y
+  // delega a insertAfterInArray, que coloca la línea nueva en el gap
+  // inmediatamente posterior al segmento contenedor.
+  it("inserts a new line AFTER the segment under the playhead (no overlap)", async () => {
+    // Texts long enough that the editor's auto-trim doesn't shorten the
+    // segment duration (estimateVoiceEndDuration uses word count to cap
+    // duration; with 1-2 word texts a 10s span gets trimmed to ~3.5s).
+    const longText = "Esta es una línea larga con bastante texto para evitar el auto trim";
+    const props = baseProps({
+      segments: [
+        { start: 10.0, end: 16.0, text: longText },
+        { start: 25.0, end: 28.0, text: "siguiente verso del cantante popular" },
+      ],
+      audioFile: new Blob(["audio-bytes"], { type: "audio/mpeg" }),
+    });
+    const { container } = render(<LyricsEditor {...props} />);
+
+    // Playhead inside the first segment (10..16).
+    _setAudioCurrentTime(container, 13.0);
+
+    const addBtn = screen.getByRole("button", { name: /Agregar línea/i });
+    await userEvent.click(addBtn);
+
+    const rows = container.querySelectorAll("[data-seg-id]");
+    expect(rows.length).toBe(3);
+    const starts = Array.from(rows).map((row) => {
+      const tsBtn = row.querySelector("button[title*='Click']");
+      const raw = (tsBtn?.textContent || "").replace(/▶/g, "").trim();
+      const m = raw.match(/^(\d+):(\d{2})\.(\d)$/);
+      if (!m) return NaN;
+      return parseInt(m[1], 10) * 60 + parseInt(m[2], 10) + parseInt(m[3], 10) / 10;
+    });
+    expect(starts).toEqual([...starts].sort((a, b) => a - b));
+    // No hay overlap con [10..16): ninguna línea NUEVA arranca dentro de ese
+    // rango (el segmento original sí, en 10, pero no debe haber otras).
+    expect(starts.filter((s) => s > 10 && s < 16)).toEqual([]);
+    // La línea nueva quedó en el gap entre [16..25).
+    expect(starts.some((s) => s > 16 && s < 25)).toBe(true);
+  });
+});
+
+describe("LyricsEditor — swap reorder (2026-05-26)", () => {
+  // Operator request: poder intercambiar dos líneas sin reescribir los
+  // timestamps. swapSegmentsById intercambia text + flags + layout,
+  // preserva _id/start/end. Wrapper UI: dos botones ↑/▼ por row en lista.
+  it("swap with ▼ button: text moves but timestamps stay in place", async () => {
+    const props = baseProps({
+      segments: [
+        { start: 10.0, end: 12.0, text: "primera línea" },
+        { start: 20.0, end: 22.0, text: "segunda línea" },
+      ],
+    });
+    const { container } = render(<LyricsEditor {...props} />);
+
+    expect(screen.getByDisplayValue("primera línea")).toBeInTheDocument();
+    expect(screen.getByDisplayValue("segunda línea")).toBeInTheDocument();
+
+    const downButtons = container.querySelectorAll('button[aria-label="Bajar línea"]');
+    expect(downButtons.length).toBeGreaterThanOrEqual(2);
+    await userEvent.click(downButtons[0]);
+
+    expect(screen.getByDisplayValue("primera línea")).toBeInTheDocument();
+    expect(screen.getByDisplayValue("segunda línea")).toBeInTheDocument();
+
+    const rows = container.querySelectorAll("[data-seg-id]");
+    expect(rows.length).toBe(2);
+    expect(within(rows[0]).getByDisplayValue("segunda línea")).toBeInTheDocument();
+    expect(within(rows[1]).getByDisplayValue("primera línea")).toBeInTheDocument();
+  });
+
+  it("↑ disabled on first row, ▼ disabled on last row", () => {
+    const props = baseProps({
+      segments: [
+        { start: 10.0, end: 12.0, text: "uno" },
+        { start: 20.0, end: 22.0, text: "dos" },
+        { start: 30.0, end: 32.0, text: "tres" },
+      ],
+    });
+    const { container } = render(<LyricsEditor {...props} />);
+
+    const upButtons = container.querySelectorAll('button[aria-label="Subir línea"]');
+    const downButtons = container.querySelectorAll('button[aria-label="Bajar línea"]');
+    expect(upButtons.length).toBe(3);
+    expect(downButtons.length).toBe(3);
+    expect(upButtons[0]).toBeDisabled();
+    expect(upButtons[1]).not.toBeDisabled();
+    expect(upButtons[2]).not.toBeDisabled();
+    expect(downButtons[0]).not.toBeDisabled();
+    expect(downButtons[1]).not.toBeDisabled();
+    expect(downButtons[2]).toBeDisabled();
+  });
 });
