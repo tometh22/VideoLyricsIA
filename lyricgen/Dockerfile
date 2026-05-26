@@ -50,9 +50,16 @@ RUN mkdir -p /app/outputs
 # Env defaults (override in docker-compose / deployment)
 ENV PYTHONUNBUFFERED=1
 ENV PYTHONPATH=/app/backend
-ENV CORS_ORIGINS=*
+# CORS_ORIGINS intentionally NOT defaulted here. Audit 2026-05-26:
+# baking CORS_ORIGINS=* into the image was a footgun — the main.py
+# allowlist guard treats `["*"]` as a non-empty list and starts the
+# server with allow_origins=["*"] + allow_credentials=True (browsers
+# refuse credentials to "*", but the config itself is misadvertised
+# and ops who read the Dockerfile thought wildcard was fine). Set the
+# real allowlist in the deployment env (Railway dashboard etc).
 ENV DATABASE_URL=postgresql://genly:genly@postgres:5432/genly
-ENV SHOW_DOCS=true
+# SHOW_DOCS=false in prod → main.py gates docs_url/openapi_url on this.
+ENV SHOW_DOCS=false
 
 EXPOSE 8000
 
@@ -67,4 +74,11 @@ HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
 # capacity. To scale capacity further, prefer bumping numReplicas in
 # railway.toml over bumping workers here — replicas give failure
 # isolation, workers within a replica share fate.
-CMD ["sh", "-c", "uvicorn main:app --host 0.0.0.0 --port ${PORT:-8000} --workers ${UVICORN_WORKERS:-2} --app-dir /app/backend"]
+# --proxy-headers + --forwarded-allow-ips: trust X-Forwarded-For from
+# the Railway LB so request.client.host (and slowapi rate limit keys
+# and AuditLog ip_address) sees the real client IP. Without these,
+# every unauth request shares a single LB-IP rate-limit bucket and a
+# misbehaving user DoSes the whole fleet. Forwarded-allow-ips=*
+# is acceptable here because the container is only reachable via the
+# Railway proxy — direct ingress is blocked at the platform layer.
+CMD ["sh", "-c", "uvicorn main:app --host 0.0.0.0 --port ${PORT:-8000} --workers ${UVICORN_WORKERS:-2} --app-dir /app/backend --proxy-headers --forwarded-allow-ips='*'"]

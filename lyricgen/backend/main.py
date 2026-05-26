@@ -98,11 +98,21 @@ logger = logging.getLogger("genly")
 
 OUTPUTS_DIR = os.path.join(os.path.dirname(__file__), "..", "outputs")
 
+# Audit 2026-05-26: previously /docs, /redoc and /openapi.json were
+# all reachable in prod (107 endpoints visible, full admin schema
+# enumerable to anonymous probes). Auth was correctly enforced on the
+# endpoints themselves, but the schema gave free recon. Gate ALL three
+# off in production unless SHOW_DOCS explicitly opts in.
+_IS_PROD = ENVIRONMENT in ("prod", "production")
+_SHOW_DOCS_DEFAULT = "false" if _IS_PROD else "true"
+_SHOW_DOCS = os.environ.get("SHOW_DOCS", _SHOW_DOCS_DEFAULT).lower() == "true"
+
 app = FastAPI(
     title="GenLy AI API",
     version="2.0.0",
-    docs_url="/docs" if os.environ.get("SHOW_DOCS", "true").lower() == "true" else None,
-    redoc_url=None,
+    docs_url="/docs" if _SHOW_DOCS else None,
+    redoc_url="/redoc" if _SHOW_DOCS else None,
+    openapi_url="/openapi.json" if _SHOW_DOCS else None,
 )
 
 # --- Rate limiting (120 req/min default per IP via SlowAPIMiddleware) ---
@@ -216,9 +226,54 @@ else:
         "allow_headers": ["*"],
     }
     if _cors_regex:
+        # Audit 2026-05-26: an overly-permissive regex (e.g. `.*` or an
+        # unanchored `.*vercel\.app`) combined with allow_credentials=True
+        # enables a credentialed XSRF-style bypass from any origin that
+        # matches. Reject the worst offenders at boot.
+        _bad_regex = (
+            _cors_regex in (".*", ".+")
+            or _cors_regex.startswith(".*")
+            and not _cors_regex.endswith("$")
+        )
+        if _bad_regex and _IS_PROD:
+            raise RuntimeError(
+                "Refusing to start: CORS_ORIGIN_REGEX is unanchored or matches "
+                "everything (%r). Provide an explicit regex with literal dots "
+                "and a $ anchor (e.g. ^https://[a-z0-9-]+\\.genly\\.pro$)." % _cors_regex
+            )
         cors_kwargs["allow_origin_regex"] = _cors_regex
         logger.info("CORS regex enabled: %s", _cors_regex)
     app.add_middleware(CORSMiddleware, **cors_kwargs)
+
+
+# --- Security headers ---
+# Audit 2026-05-26: the API responded with ZERO defense-in-depth headers.
+# Add the standard set. Vercel-served frontend already had HSTS, but the
+# API host (api.genly.pro / *.up.railway.app) did not — an MITM on the
+# API origin had nothing pushing the browser to HTTPS-only.
+#
+# CSP intentionally left off here: it would need to coordinate with the
+# Swagger UI (when SHOW_DOCS) and OAuth callback redirects. Operator
+# can opt in via an env var later.
+@app.middleware("http")
+async def _security_headers(request: Request, call_next):
+    response = await call_next(request)
+    # Browsers cache HSTS for 1 year; includeSubDomains covers api.genly.pro
+    # AND any future subdomain. Skip on dev to allow http://localhost.
+    if _IS_PROD:
+        response.headers.setdefault(
+            "Strict-Transport-Security",
+            "max-age=31536000; includeSubDomains",
+        )
+    response.headers.setdefault("X-Content-Type-Options", "nosniff")
+    response.headers.setdefault("X-Frame-Options", "DENY")
+    response.headers.setdefault("Referrer-Policy", "strict-origin-when-cross-origin")
+    response.headers.setdefault(
+        "Permissions-Policy",
+        "geolocation=(), microphone=(), camera=()",
+    )
+    return response
+
 
 # --- Transient DB error retry middleware ---
 # Postgres on Railway occasionally drops idle pool connections in ways
