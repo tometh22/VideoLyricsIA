@@ -3243,6 +3243,15 @@ async def upload(
     lyrics_animation: str = Form("none", max_length=16),
     line_transition: str = Form("none", max_length=16),
     text_contrast: str = Form("medium", max_length=16),
+    # Lyric text colors 2026-05-25. Hex `#RRGGBB` (7 chars), invalid input
+    # normalized to "" by the call site so build_ass falls back to defaults.
+    # max_length=8 keeps the validator's hex regex authoritative while
+    # rejecting payload abuse. INCIDENT 2026-05-26: missing Form params
+    # made every POST /upload reference the unbound local `lyric_color` →
+    # NameError → 500. The endpoint is deprecated (removal 2026-08-01) but
+    # still serviced; keep parity with /generate.
+    lyric_color: str = Form("", max_length=8),
+    lyric_sung_color: str = Form("", max_length=8),
     match_lyrics: bool = Form(True),
     background_hint: str = Form("", max_length=2000),
     bg_verbatim: bool = Form(False),
@@ -5248,6 +5257,14 @@ async def generate_with_segments(
     lyrics_animation: str = Form("none", max_length=16),
     line_transition: str = Form("none", max_length=16),
     text_contrast: str = Form("medium", max_length=16),
+    # Lyric text colors 2026-05-25. Hex `#RRGGBB` (7 chars), invalid input
+    # normalized to "" by the call site so build_ass falls back to defaults.
+    # INCIDENT 2026-05-26: missing Form params here made every POST
+    # /generate reference the unbound local `lyric_color` → NameError →
+    # 500. Prod users saw "Generando…" forever because the job was never
+    # enqueued. Same root cause as /upload sibling above; same fix.
+    lyric_color: str = Form("", max_length=8),
+    lyric_sung_color: str = Form("", max_length=8),
     match_lyrics: bool = Form(True),
     background_hint: str = Form("", max_length=2000),
     bg_verbatim: bool = Form(False),
