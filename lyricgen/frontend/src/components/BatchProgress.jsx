@@ -10,9 +10,24 @@ async function triggerDownload(jobId, type) {
     const a = document.createElement("a");
     a.href = href;
     a.download = "";
+    document.body.appendChild(a);
     a.click();
-  } catch {}
+    a.remove();
+    return true;
+  } catch (err) {
+    // eslint-disable-next-line no-console
+    console.error("[download] failed", { jobId, type, err });
+    return false;
+  }
 }
+
+// Browsers throttle programmatic downloads when fired in tight succession
+// (Chrome shows a "Allow multiple downloads?" prompt only after the 2nd).
+// A short delay between clicks keeps the prompt + subsequent downloads
+// reliable. Without this, batches of >1 song silently dropped N-1 of N
+// files in the Celebration screen "Descargar todo" CTA (audit 2026-05-26).
+const DOWNLOAD_INTERVAL_MS = 350;
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 // ─── Processing list row (shown while jobs are still running) ───────────────
 // SingleGeneratingHero — 2026-05-25 operator UMG dry-run polish. Reemplaza
@@ -518,12 +533,38 @@ export default function BatchProgress({ jobs, onReset, onSingleDone, onSelectJob
     }
   }, [isSingle, jobs, onSingleDone]);
 
+  // Bug 2026-05-26: this loop awaited triggerDownload but triggerDownload
+  // resolved before .click() actually fired the OS save. Result: clicks
+  // fired ~10ms apart, Chrome blocked N-1 of N, operator got 1 file from
+  // a batch of N×3 expected. The fix: throttle to DOWNLOAD_INTERVAL_MS
+  // between each click so the multi-download prompt registers and the
+  // browser actually enqueues all of them.
+  const [downloadingAll, setDownloadingAll] = useState(false);
   const downloadAll = async () => {
-    for (const job of jobs) {
-      if (job.status !== "done" || !job.job_id) continue;
-      for (const type of ["video", "short", "thumbnail"]) {
-        await triggerDownload(job.job_id, type);
+    if (downloadingAll) return;
+    setDownloadingAll(true);
+    try {
+      const eligible = jobs.filter((j) => j.status === "done" && j.job_id);
+      let failed = 0;
+      let total = 0;
+      for (const job of eligible) {
+        for (const type of ["video", "short", "thumbnail"]) {
+          total += 1;
+          const ok = await triggerDownload(job.job_id, type);
+          if (!ok) failed += 1;
+          await sleep(DOWNLOAD_INTERVAL_MS);
+        }
       }
+      if (failed > 0) {
+        // eslint-disable-next-line no-alert
+        window.alert(
+          `Se descargaron ${total - failed} de ${total} archivos. ` +
+          `Si el navegador bloqueó las descargas múltiples, permitilo ` +
+          `desde el ícono en la barra de direcciones y reintentá.`
+        );
+      }
+    } finally {
+      setDownloadingAll(false);
     }
   };
 
