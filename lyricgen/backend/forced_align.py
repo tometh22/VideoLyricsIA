@@ -50,8 +50,20 @@ _LRC_TS_RE = re.compile(r"^\s*(\[\d{1,2}:\d{2}(?:\.\d{1,3})?\]\s*)+")
 # `Padding size should be less than the corresponding input dimension`
 # (the [1,2,1] tensor bug) is the most common deterministic crash we've
 # seen in the QA full run — Mujer Amante hit it three times in a row.
+#
+# 2026-05-26 (LIVE PROD INCIDENT, Sin Gamulán):
+# `Expected 2D or 3D (batch mode) tensor with possibly 0 batch size and
+# other non-zero dimensions for input, but got: [1, 2, 0]`
+# es otra falla determinista de cureau sobre vocal stems con cierta
+# combinación de letras altamente repetitivas. Sin el fragment match,
+# cureau reintentaba 3× × ~30s = 90+ s de espera antes de que el caller
+# (main.py:_run_transcription_for_job, audio-as-truth path) cayera al
+# synced-direct fallback (PR #365). Operador veía "0% transcribiendo
+# 120 s" en el editor. Con el fragment, FA aborta en attempt 1 (<5 s)
+# y synced-direct se dispara inmediato.
 _NON_RETRYABLE_FRAGMENTS = (
     "padding size",
+    "expected 2d or 3d",   # cureau [1, 2, 0] tensor crash — Sin Gamulán family
     "argument #4",
     "validationerror",
     "validation error",

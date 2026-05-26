@@ -247,6 +247,39 @@ def test_wordstamps_anchors_intro_chorus_mishear_legalicenla():
     assert segs[3]["start"] > 50.0
 
 
+def test_is_non_retryable_padding_size():
+    """The original [1,2,1] padding crash. Sigue siendo deterministic."""
+    err = Exception("Padding size should be less than the corresponding input dimension")
+    assert fa._is_non_retryable(err) is True
+
+
+def test_is_non_retryable_tensor_120_bug_2026_05_26():
+    """LIVE PROD INCIDENT 2026-05-26: cureau crashea con
+    `Expected 2D or 3D (batch mode) tensor ... got: [1, 2, 0]` sobre
+    Sin Gamulán y Mujer Amante. Sin este match, el caller reintentaba
+    3× (~90s) antes de fallar al synced-direct fallback. El operador
+    veía 'Transcribiendo 0% — tomando más tiempo de lo normal'. Con
+    el match, FA bail-out en attempt 1 (<5 s) y synced-direct dispara
+    inmediato."""
+    err = Exception(
+        "Expected 2D or 3D (batch mode) tensor with possibly 0 batch "
+        "size and other non-zero dimensions for input, but got: [1, 2, 0]"
+    )
+    assert fa._is_non_retryable(err) is True
+
+
+def test_is_non_retryable_real_lyric_text_not_affected():
+    """Sanity: una excepción que mencione palabras como 'expected' en
+    contexto normal no debe matchear. La regla `expected 2d or 3d` es
+    suficientemente específica."""
+    err1 = Exception("Connection timeout")
+    err2 = Exception("expected response but got 500")  # NO debe matchear
+    err3 = Exception("audio file expected MP3 format")  # NO debe matchear
+    assert fa._is_non_retryable(err1) is False
+    assert fa._is_non_retryable(err2) is False
+    assert fa._is_non_retryable(err3) is False
+
+
 def test_phonetic_does_not_rescue_genuinely_unrelated_text():
     """The phonetic path must NOT match lines that don't acoustically resemble
     the canonical. Otherwise we'd happily anchor random whisperX noise to any
