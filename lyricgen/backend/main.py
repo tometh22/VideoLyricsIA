@@ -5407,6 +5407,17 @@ async def generate_with_segments(
         job_row.umg_spec = umg_spec
         job_row.status = initial_status
         job_row.current_step = "queued"
+        # Audit 2026-05-26 (#388 wizard-duplicate-jobs): reset progress +
+        # error + last_progress_at on reuse. Without this, a double-fire
+        # of /generate on the same job_id can land here while a prior
+        # worker run had already written progress=N (e.g. 48) into the
+        # row — the operator sees "status=queued progress=48%" in admin,
+        # which is semantically impossible (queued = no worker ever
+        # touched it). Reset matches what /retry already does for the
+        # `error` → `processing` transition (main.py:7705-7711).
+        job_row.progress = 0
+        job_row.error = None
+        job_row.last_progress_at = datetime.now(timezone.utc)
         db.commit()
     else:
         job_id = create_job(
@@ -5483,11 +5494,25 @@ async def generate_with_segments(
     # just created (re-upload-on-generate bug), delete it so the operator
     # doesn't see a phantom "2nd job". Time-windowed so it never touches an
     # intentional re-upload of the same song later.
+    #
+    # Audit 2026-05-26 (#388 wizard-duplicate-jobs): sanitize the filename
+    # before the dedupe filter. `/upload-url` persists `Job.filename` via
+    # `_safe_basename` (main.py:2335 region) — strips directory components,
+    # control chars, length caps — while the direct-generate path here
+    # gets `existing_filename` from various sources that may or may not
+    # have been sanitized. Filter `Job.filename == filename` is a literal
+    # equality, so an unsanitized "Sin Gamulan/../foo.wav" vs sanitized
+    # "Sin_Gamulan_-_..." in DB silently misses every sibling draft —
+    # which is exactly how 4 jobs for the same audio ended up coexisting
+    # in prod 2026-05-26.
     try:
         from jobs import supersede_sibling_drafts
+        _dedup_filename = (
+            _safe_basename(existing_filename) if existing_filename else ""
+        )
         supersede_sibling_drafts(
             db, keep_job_id=job_id, user_id=current_user["id"],
-            tenant_id=current_user["tenant_id"], filename=existing_filename or "",
+            tenant_id=current_user["tenant_id"], filename=_dedup_filename,
         )
     except Exception as e:
         logger.warning("[DEDUP] supersede sibling drafts failed: %s", e)

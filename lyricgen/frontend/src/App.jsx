@@ -665,6 +665,18 @@ export default function App() {
   // navega away durante un SSE/polling en curso. Cada callback async
   // chequea esto antes de tocar state.
   const isMountedRef = useRef(true);
+  // Audit 2026-05-26 (#388 wizard-duplicate-jobs): lock against
+  // double-fire of the "Generar" button. Without this, a fast double-
+  // click (operator hovers Generate, clicks twice) or a React StrictMode
+  // double-invoke in dev runs startGenerationWithSegments twice for the
+  // same approvedJobs → two POST /generate against the same job_id →
+  // backend race where the second call lands while the first is still
+  // executing the worker update_job(progress=N) path, leaving the row
+  // in an inconsistent (status=queued, progress=N) state that confuses
+  // every subsequent reader. Mirror the approveLockRef pattern from
+  // JobDetail.jsx:348 — set on entry, clear on completion of the async
+  // dance kicked off by startGenerationWithSegments.
+  const generateLockRef = useRef(false);
   // 2 concurrent workers: enough to keep the queue fed without spiking
   // the API with 5 simultaneous upload-url+generate calls from one user.
   const PARALLEL_WORKERS = 2;
@@ -1987,11 +1999,26 @@ export default function App() {
   };
 
   const handleGenerateBatch = () => {
+    // Double-click guard. See generateLockRef declaration above for the
+    // race this closes. Lock released by startGenerationWithSegments
+    // when it finishes kicking off the per-job /generate POSTs (it
+    // navigates to /generating, so the second click would also try to
+    // navigate from an already-navigated page; cleaner to short-circuit
+    // here than to let two parallel POSTs collide in the API).
+    if (generateLockRef.current) {
+      return;
+    }
+    generateLockRef.current = true;
     setReadyToGenerate(false);
     // No tocamos wizardStage acá — startGenerationWithSegments navega a
     // /generating (pantalla dedicada de progreso). El wizard queda
     // "stale" pero handleReset lo limpia cuando el operator vuelve.
-    startGenerationWithSegments(approvedJobs);
+    Promise.resolve(startGenerationWithSegments(approvedJobs)).finally(() => {
+      // Release the lock after the start dance settles. Failures should
+      // also release so the operator can retry (the underlying error UI
+      // takes over the screen — the button itself is hidden by then).
+      generateLockRef.current = false;
+    });
   };
 
   const handleSelectJob = (jobId, status) => {

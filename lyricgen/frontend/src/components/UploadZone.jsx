@@ -725,41 +725,60 @@ export default function UploadZone({
     else setOversize([]);
     if (!okSize.length) return;
 
-    onFiles((prev) => {
-      const remaining = MAX_BATCH_SIZE - prev.length;
-      if (remaining <= 0) {
-        setBatchTruncated(okSize.length);
-        return prev;
-      }
-      const accepted = okSize.slice(0, remaining);
-      const dropped = okSize.length - accepted.length;
-      if (dropped > 0) setBatchTruncated(dropped);
-      const newEntries = accepted.map((f) => {
-        const { artist, song } = parseFilename(f.name);
-        return {
-          file: f,
-          artist,
-          songTitle: song,
-          // Default 'es' instead of '' (auto-detect). Auto was producing
-          // ~50% language-misdetection on Spanish catalogue (audited
-          // 2026-05-15 across 4 sample tracks: 2 misdetected as javanese
-          // and italian respectively, ending in the synthesizer path with
-          // bad timestamps). Operator can still flip to 'auto' if they
-          // upload a non-Spanish song.
-          language: "es",
-          ...batchDefaultsRef.current,
-        };
-      });
-      // 2026-05-23: trigger auto-transcribe en el drop. Antes el upload se
-      // difería hasta "Revisar" (bloqueaba al operador ~15-20s viendo un
-      // spinner). Ahora arranca en background mientras el operador elige
-      // wizard options. Cuando llega a "Revisar" los segments están cacheados.
-      if (typeof onAutoTranscribe === "function" && newEntries.length) {
-        // Defer un microtask para que el setFiles haya commiteado el state.
-        Promise.resolve().then(() => onAutoTranscribe(newEntries));
-      }
-      return [...prev, ...newEntries];
+    // Audit 2026-05-26 (#388 wizard-duplicate-jobs): compute remaining,
+    // accepted, and newEntries OUTSIDE the setState callback. Side
+    // effects that fire inside a reducer (setBatchTruncated, the
+    // onAutoTranscribe Promise.resolve dance the old code did) get
+    // double-invoked under React StrictMode (dev) and CAN double-invoke
+    // in production if React decides to abort+retry a render. The
+    // duplicate auto-transcribe call was creating two upload jobs +
+    // two transcription jobs per drop — visible in the admin as the
+    // "4 jobs for one audio" pile-up reported 2026-05-26.
+    //
+    // We can do all the math here because the parent passes `files`
+    // as a prop (line 117), so we know the current count without
+    // needing to read prev from the reducer. The reducer below becomes
+    // a pure `[...prev, ...newEntries]` — no side effects, safe to
+    // double-invoke.
+    const currentCount = Array.isArray(files) ? files.length : 0;
+    const remaining = MAX_BATCH_SIZE - currentCount;
+    if (remaining <= 0) {
+      setBatchTruncated(okSize.length);
+      return;
+    }
+    const accepted = okSize.slice(0, remaining);
+    const dropped = okSize.length - accepted.length;
+    setBatchTruncated(dropped > 0 ? dropped : 0);
+    const newEntries = accepted.map((f) => {
+      const { artist, song } = parseFilename(f.name);
+      return {
+        file: f,
+        artist,
+        songTitle: song,
+        // Default 'es' instead of '' (auto-detect). Auto was producing
+        // ~50% language-misdetection on Spanish catalogue (audited
+        // 2026-05-15 across 4 sample tracks: 2 misdetected as javanese
+        // and italian respectively, ending in the synthesizer path with
+        // bad timestamps). Operator can still flip to 'auto' if they
+        // upload a non-Spanish song.
+        language: "es",
+        ...batchDefaultsRef.current,
+      };
     });
+    if (!newEntries.length) return;
+
+    // Pure reducer — safe under StrictMode double-invoke.
+    onFiles((prev) => [...prev, ...newEntries]);
+
+    // 2026-05-23: trigger auto-transcribe en el drop. Antes el upload se
+    // difería hasta "Revisar" (bloqueaba al operador ~15-20s viendo un
+    // spinner). Ahora arranca en background mientras el operador elige
+    // wizard options. Cuando llega a "Revisar" los segments están cacheados.
+    // Now fired AFTER the setState dispatch, OUTSIDE the reducer — single
+    // call per drop regardless of StrictMode / render aborts.
+    if (typeof onAutoTranscribe === "function") {
+      onAutoTranscribe(newEntries);
+    }
   };
 
   const handleDrop = (e) => {
