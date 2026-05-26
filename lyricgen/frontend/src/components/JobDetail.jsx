@@ -1,4 +1,5 @@
 import { useState, useEffect, useRef, useCallback } from "react";
+import { useNavigate } from "react-router-dom";
 import { useI18n } from "../i18n";
 import { getDownloadUrl, useMediaUrl } from "../mediaUrl";
 import { JobDetailTour } from "./OnboardingTour";
@@ -181,6 +182,7 @@ function ProvenanceTab({ jobId, t }) {
 export default function JobDetail({ job, onBack, onJobUpdate }) {
   const { t } = useI18n();
   const { alert } = useAlert();
+  const navigate = useNavigate();
   const [activeTab, setActiveTab] = useState("video");
   const [uploading, setUploading] = useState(false);
   const [youtubeResult, setYoutubeResult] = useState(job.youtube || null);
@@ -1323,6 +1325,10 @@ export default function JobDetail({ job, onBack, onJobUpdate }) {
           job={job}
           onEditTriggered={handleEditTriggered}
           allowedModes={editPanelAllowedModes}
+          // El click "Editar lyrics" abre el Studio Console en su ruta
+          // dedicada (mismo layout 3-col que /new) en vez del modal
+          // fullscreen interno. El background mode del panel queda intacto.
+          onLyricsClick={() => navigate(`/videos/${job.job_id}/edit-lyrics`)}
         />
       )}
 
