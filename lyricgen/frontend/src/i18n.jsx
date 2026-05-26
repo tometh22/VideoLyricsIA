@@ -276,6 +276,8 @@ const translations = {
     "upload.effect_bokeh_desc": "Luces desenfocadas flotando.",
     "upload.effect_light": "Luz",
     "upload.effect_light_desc": "Destellos suaves. Atardecer, glow.",
+    "upload.effect_aurora": "Aurora",
+    "upload.effect_aurora_desc": "Líneas de luz ondulantes que cruzan el cielo. Mágico, cinematográfico.",
     "upload.batch_settings_title": "Configuración del lote",
     "upload.single_settings_title": "Ajustes del video",
     "upload.contrast_label": "Contraste:",

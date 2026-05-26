@@ -530,12 +530,17 @@ export default function UploadZone({
   // Backed by pre-rendered alpha-screen loops; preview clips live at
   // /fx_samples/<code>.mp4 (effect composited over a neutral gradient).
   const EFFECTS = [
-    { code: "",      label: t("upload.effect_none") || "Ninguno",   sample: null,                   desc: t("upload.effect_none_desc") || "Fondo limpio, sin efecto." },
-    { code: "snow",  label: t("upload.effect_snow") || "Nieve",     sample: "/fx_samples/snow.mp4",  desc: t("upload.effect_snow_desc") || "Copos cayendo. Calmo, invernal." },
-    { code: "rain",  label: t("upload.effect_rain") || "Lluvia",    sample: "/fx_samples/rain.mp4",  desc: t("upload.effect_rain_desc") || "Gotas finas sobre la escena." },
-    { code: "stars", label: t("upload.effect_stars") || "Estrellas", sample: "/fx_samples/stars.mp4", desc: t("upload.effect_stars_desc") || "Partículas que titilan. Nocturno." },
-    { code: "bokeh", label: t("upload.effect_bokeh") || "Bokeh",    sample: "/fx_samples/bokeh.mp4", desc: t("upload.effect_bokeh_desc") || "Luces desenfocadas flotando." },
-    { code: "light", label: t("upload.effect_light") || "Luz",      sample: "/fx_samples/light.mp4", desc: t("upload.effect_light_desc") || "Destellos suaves. Atardecer, glow." },
+    { code: "",       label: t("upload.effect_none") || "Ninguno",     sample: null,                     desc: t("upload.effect_none_desc") || "Fondo limpio, sin efecto." },
+    { code: "snow",   label: t("upload.effect_snow") || "Nieve",       sample: "/fx_samples/snow.mp4",   desc: t("upload.effect_snow_desc") || "Copos cayendo. Calmo, invernal." },
+    { code: "rain",   label: t("upload.effect_rain") || "Lluvia",      sample: "/fx_samples/rain.mp4",   desc: t("upload.effect_rain_desc") || "Gotas finas sobre la escena." },
+    { code: "stars",  label: t("upload.effect_stars") || "Estrellas",  sample: "/fx_samples/stars.mp4",  desc: t("upload.effect_stars_desc") || "Partículas que titilan. Nocturno." },
+    { code: "bokeh",  label: t("upload.effect_bokeh") || "Bokeh",      sample: "/fx_samples/bokeh.mp4",  desc: t("upload.effect_bokeh_desc") || "Luces desenfocadas flotando." },
+    { code: "light",  label: t("upload.effect_light") || "Luz",        sample: "/fx_samples/light.mp4",  desc: t("upload.effect_light_desc") || "Destellos suaves. Atardecer, glow." },
+    // 2026-05-25 UMG: cubre el estilo de los refs Boza / Yatra Cristina /
+    // A los cuatro vientos — líneas brillantes ondulantes sobre el fondo.
+    // Naming "Aurora" (más vendedor que "firuletes"): evocador, cinema,
+    // lee igual en es/en/pt.
+    { code: "aurora", label: t("upload.effect_aurora") || "Aurora",    sample: "/fx_samples/aurora.mp4", desc: t("upload.effect_aurora_desc") || "Líneas de luz ondulantes que cruzan el cielo. Mágico, cinematográfico." },
   ];
 
   // Lyrics-animation templates. These are rendered as libass override tags in
