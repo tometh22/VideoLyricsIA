@@ -30,7 +30,7 @@ import TranscribingProgress from "./components/TranscribingProgress";
 import JobDetail from "./components/JobDetail";
 import { useAlert } from "./components/AlertProvider";
 import { useBackgroundPreview } from "./hooks/useBackgroundPreview";
-import { useMediaUrl } from "./mediaUrl";
+import { useMediaUrl, clearMediaCache } from "./mediaUrl";
 import { submitLyricsEdit } from "./lib/lyricsEditSubmit";
 
 const API = import.meta.env.VITE_API_URL || "";
@@ -1105,6 +1105,14 @@ export default function App() {
 
   // reason="expired" → /login so the user can re-authenticate immediately.
   // reason="manual" (default) → / (landing page) for intentional logouts.
+  //
+  // Audit 2026-05-26: handleLogout previously only cleared token+user
+  // state. On a shared machine (common with UMG operators), the wizard
+  // state of User A — files, approvedJobs, currentReview, history,
+  // jobs queue, persisted wizard snapshot, library batch defaults, and
+  // media-token cache — survived logout and was visible to User B
+  // when they logged in next on the same tab. Now we wipe all
+  // session-scoped state + caches + storage keys atomically.
   const handleLogout = useCallback((reason = "manual") => {
     // Stop every active poll / SSE stream BEFORE clearing the token.
     pollingIntervals.current.forEach((handle) => {
@@ -1112,10 +1120,44 @@ export default function App() {
       else clearInterval(handle);
     });
     pollingIntervals.current.clear();
+
+    // Identity / auth.
     localStorage.removeItem("genly_token");
     localStorage.removeItem("genly_user");
+
+    // Wizard / session caches. wizardPersistence stores a TTL-bounded
+    // snapshot of an in-progress wizard; the library batch defaults
+    // remember the operator's last picked font/color/movement preset
+    // for the next batch (UploadZone.BATCH_DEFAULTS_STORAGE_KEY).
+    try { wizardPersistence.clear(); } catch { /* best effort */ }
+    try { localStorage.removeItem("genly:wizardBatchDefaultsV1"); } catch { /* */ }
+
+    // Short-lived media tokens (preview/download URLs scoped to
+    // job+filetype). Without this, User B sees /preview URLs that
+    // 401 or — worse, if the token is still inside its 5 min TTL —
+    // serve User A's content for ~5 min.
+    try { clearMediaCache(); } catch { /* */ }
+
+    // React state. Reset every collection that holds user-derived
+    // content; keep purely-UX state (sidebar, theme) alone.
     setToken(null);
     setUser(null);
+    setFiles([]);
+    setReviewQueue([]);
+    setCurrentReview(null);
+    setApprovedJobs([]);
+    setJobs([]);
+    setHistory([]);
+    setHistoryError(false);
+    setHistoryLoaded(false);
+    setTranscribeStatusByFile({});
+    setTranscribing(false);
+    setTranscribeError(null);
+    setTranscribeProgress(null);
+    setReadyToGenerate(false);
+    setSearchOpen(false);
+    setResumableWizard(null);
+
     navigate(reason === "expired" ? "/login" : "/");
   }, [navigate]);
 
