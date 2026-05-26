@@ -86,6 +86,15 @@ _TARGET_JOB_PREFIXES = [
     "bd392eb7",  # Los Abuelos de la Nada — Costumbres Argentinas (tomas@epical, 15/5 12:41pm)
     # Tercer batch (2026-05-21): variante corregida sin movimiento de cámara, enviada desde staging.
     "8044c9272ded",  # Los Abuelos de la Nada — Costumbres Argentinas (variante sin mov. de cámara)
+    # Cuarto batch (2026-05-26): 8 jobs enviados desde staging para el portal UMG.
+    "6f7e1924de51",
+    "1b7bc62828bd",
+    "b4c00eeba6f6",
+    "96256aea5c3c",
+    "4c47a9f07383",
+    "be033686daca",
+    "ec00e61c6572",
+    "3d35770f987d",
 ]
 
 # Match the file map the portal expects. Keys are file_type identifiers
