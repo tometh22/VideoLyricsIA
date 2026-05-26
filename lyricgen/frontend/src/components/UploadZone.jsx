@@ -1926,6 +1926,19 @@ export default function UploadZone({
               lineTransition={hoverTransition ?? batchDefaults.lineTransition}
               lyricColor={batchDefaults.lyricColor || "#FFFFFF"}
               lyricSungColor={batchDefaults.lyricSungColor || "#FFFFFF"}
+              /* Typography 2026-05-26: cerrar el gap entre los controles del
+                 paso 4 (font/case/size/contrast) y el preview central. Antes
+                 el comentario al lado del bloque mentía — "el preview ya
+                 escucha estos cambios live" — pero el componente no recibía
+                 los props, así que el operador veía siempre Montserrat
+                 extrabold en lowercase con contraste medium hardcoded
+                 mientras configuraba. Defaults en el componente
+                 ("/upper/1.0/medium") cubren el resto de pasos cuando
+                 batchDefaults aún no fue tocado. */
+              font={batchDefaults.font || ""}
+              textCase={batchDefaults.textCase || "upper"}
+              fontScale={batchDefaults.fontScale || "1.0"}
+              textContrast={batchDefaults.textContrast || "medium"}
               mode={sceneMode}
               lyric={_previewLyric}
               clipSrc={(MOVEMENT_STYLES.find((m) => m.code === (hoverMovement ?? batchDefaults.movementStyle))?.sample) || "/movement_samples/estandar.mp4"}
