@@ -132,8 +132,26 @@ def main():
     except ValueError:
         max_jobs = 10
 
-    logger.info("[WORKER] Listening on: enterprise, default | max_jobs=%s", max_jobs)
-    worker.work(with_scheduler=False, max_jobs=max_jobs)
+    logger.info("[WORKER] Listening on: transcription, bg_preview, enterprise, default | max_jobs=%s", max_jobs)
+    # CRITICAL (incident 2026-05-26): `with_scheduler=True` is required to
+    # process retry-scheduled jobs. Every `enqueue_*` helper uses
+    # `Retry(interval=N)` (queue_jobs.py:366/446/520) for survival across
+    # Railway worker death. RQ 1.16's `Job.retry()` (rq/job.py:1498) puts
+    # the retry into ScheduledJobRegistry at NOW+interval — and ONLY a
+    # running scheduler moves it back to the live queue when due.
+    #
+    # With `with_scheduler=False` and no external rqscheduler service, every
+    # job that hit Retry stayed stranded in ScheduledJobRegistry forever:
+    # the Postgres row froze in `transcribing` / `processing`, the on_failure
+    # callback never fired (retries weren't exhausted, just stranded), and
+    # the operator saw "En cola" / "Generando" indefinitely. Triggered by
+    # agus.cafisi (omg) reporting 3 stuck jobs at 46m/2h/2h and "varios
+    # generados en cola sin avanzar".
+    #
+    # RQScheduler uses Redis locks so only one of the 7 replicas runs the
+    # active scheduler at a time; the others stand by and take over if the
+    # holder dies. No coordination required here.
+    worker.work(with_scheduler=True, max_jobs=max_jobs)
 
 
 if __name__ == "__main__":
