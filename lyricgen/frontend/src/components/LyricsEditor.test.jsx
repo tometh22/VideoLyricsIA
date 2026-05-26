@@ -213,3 +213,65 @@ describe("LyricsEditor — addBlankLine (B3)", () => {
     expect(seconds).toEqual([...seconds].sort((a, b) => a - b));
   });
 });
+
+describe("LyricsEditor — modo enfoque body class broadcast", () => {
+  // BUG (2026-05-26): "Modo Enfoque" se construyó cuando el editor era
+  // full-width. Luego el wizard pasó a 3 columnas (UploadZone:1854),
+  // dejando al editor en una columna de ~460-1124px. El toggle seguía
+  // tweakeando `max-h` interno (~90px verticales) — pero el ancho de
+  // la columna no cambiaba, así que el "enfoque" era imperceptible.
+  //
+  // Fix: LyricsEditor emite la clase `editor-focus-mode` en
+  // document.body cuando focusMode=on. UploadZone usa una variante
+  // arbitraria de Tailwind (`[.editor-focus-mode_&]:lg:grid-cols-1`)
+  // para colapsar su grid + esconder stepper + preview central.
+  //
+  // Este test cubre el contrato: el body class se aplica al togglear
+  // y se LIMPIA al desmontar (sin cleanup, el usuario que navega de
+  // step 6 a step 4 vería el layout colapsado sin entender por qué).
+  // El comportamiento del grid en UploadZone es CSS puro (className
+  // strings) y se valida visualmente / con snapshot en otro test.
+
+  // localStorage state es persistente entre tests del mismo run.
+  // Limpiamos antes para arrancar con focusMode=OFF garantizado.
+  afterEach(() => {
+    try { localStorage.removeItem("genly_editor_focus"); } catch (_) { /* */ }
+    document.body.classList.remove("editor-focus-mode");
+  });
+
+  it("toggles the editor-focus-mode body class when the focus button is clicked", async () => {
+    // audioUrl truthy → el sticky control bar que contiene el focus
+    // toggle se monta (gated en LyricsEditor:1856 por `{audioUrl && ...}`).
+    const props = baseProps({ audioUrl: "blob:mock-audio" });
+    render(<LyricsEditor {...props} />);
+
+    // Default OFF — la clase no debe estar al montar.
+    expect(document.body.classList.contains("editor-focus-mode")).toBe(false);
+
+    // Click el botón "Modo enfoque (F)" (tooltip exacto del component).
+    const focusBtn = screen.getByTitle(/^Modo enfoque \(F\)$/i);
+    await userEvent.click(focusBtn);
+    expect(document.body.classList.contains("editor-focus-mode")).toBe(true);
+
+    // Click otra vez — apaga. El tooltip ahora dice "Salir...".
+    const exitBtn = screen.getByTitle(/^Salir de modo enfoque \(F\)$/i);
+    await userEvent.click(exitBtn);
+    expect(document.body.classList.contains("editor-focus-mode")).toBe(false);
+  });
+
+  it("removes the body class on unmount so navigating away restores normal layout", async () => {
+    const props = baseProps({ audioUrl: "blob:mock-audio" });
+    const { unmount } = render(<LyricsEditor {...props} />);
+
+    // Prendé focus mode.
+    const focusBtn = screen.getByTitle(/^Modo enfoque \(F\)$/i);
+    await userEvent.click(focusBtn);
+    expect(document.body.classList.contains("editor-focus-mode")).toBe(true);
+
+    // Operador navega a otro step / cambia de pantalla — el editor
+    // se desmonta. Sin cleanup, el body queda con la clase aplicada
+    // y UploadZone seguiría escondiendo stepper + preview.
+    unmount();
+    expect(document.body.classList.contains("editor-focus-mode")).toBe(false);
+  });
+});
