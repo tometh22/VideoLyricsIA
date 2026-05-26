@@ -221,30 +221,49 @@ SEED: list[tuple[str, str, str]] = [
 assert len(SEED) == 50, f"SEED must be exactly 50 tuples (currently {len(SEED)})"
 
 
-def already_populated(db, concept_slug: str, asset_type: str) -> bool:
-    """Idempotency guard: a row is "already there" when its tags match the
-    UMG scheme `{concept_slug},{asset_type},umg` AND it belongs to this
-    tenant. We check tenant too because the same concept_slug could exist
-    globally for another reason — the UMG row is specifically the
-    universal-music-scoped one.
+def existing_names_for_tenant(SessionFactory, owner_tenant_id: str | None) -> set[str]:
+    """Resume cache: query DB once at startup for every `UMG …` asset name
+    already present for this tenant. We skip any SEED row whose computed
+    name is in this set.
 
-    The legacy script uses tag-exact-equality (which works because its
-    schema is `{concept},{asset_type}`). Our scheme has the trailing
-    `,umg` so we use LIKE with the prefix.
+    Why by `name` (and not by `tags` like the legacy script): the name is
+    unique per (concept_slug, asset_index) — `UMG Montana nieve #4` —
+    while tags are only unique per (concept_slug, asset_type). The
+    original `already_populated()` was over-eager: one row of
+    `montana-nieve,video_cinematic,umg` would mask the OTHER 4 video
+    tuples for that concept. Resuming by name lets us recover row 17
+    (Montana nieve #4) without skipping row 18 (Montana nieve #5).
     """
-    target_prefix = f"{concept_slug},{asset_type},umg"
-    return (
-        db.query(BackgroundAsset)
-        .filter(BackgroundAsset.tags == target_prefix)
-        .filter(BackgroundAsset.is_active == True)  # noqa: E712
-        .count() > 0
-    )
+    if SessionFactory is None:
+        return set()
+    db = SessionFactory()
+    try:
+        q = (
+            db.query(BackgroundAsset.name)
+            .filter(BackgroundAsset.is_active == True)  # noqa: E712
+            .filter(BackgroundAsset.tags.like("%,umg"))
+        )
+        if owner_tenant_id is None:
+            q = q.filter(BackgroundAsset.owner_tenant_id.is_(None))
+        else:
+            q = q.filter(BackgroundAsset.owner_tenant_id == owner_tenant_id)
+        return {row[0] for row in q.all()}
+    finally:
+        db.close()
 
 
-def _try_open_db():
-    """Best-effort: open a DB session and validate connectivity in 5 s.
-    Returns the session or None. None triggers no-db mode (R2 + JSON +
-    SQL output, no Postgres writes from this runner)."""
+def _try_open_db_factory():
+    """Best-effort: validate DB connectivity in 5 s and return a *factory*
+    (SessionLocal) that produces fresh sessions per commit. Returns None
+    in no-db mode (R2 + JSON + SQL output, no Postgres writes).
+
+    Critical change vs the previous `_try_open_db` that returned ONE
+    long-lived session: a 30 min run with 5 min Veo idle windows kills
+    the Railway SSL socket. `pool_pre_ping` and `pool_recycle` only fire
+    on checkout, so a held session never benefits from them. By using a
+    fresh session per row, every commit re-checks out and pre-pings the
+    pooled conn before the INSERT.
+    """
     if not _DB_IMPORTABLE or not os.environ.get("DATABASE_URL"):
         print("[DB] no DATABASE_URL or db module not importable — no-db mode")
         return None
@@ -255,11 +274,43 @@ def _try_open_db():
         engine = create_engine(f"{url}{sep}connect_timeout=5", future=True)
         with engine.connect() as c:
             c.execute(text("SELECT 1"))
+        # Use the project's SessionLocal — it already has pool_pre_ping,
+        # pool_recycle=120, and TCP keepalives configured. With a fresh
+        # session per commit, all three actually kick in.
         from database import SessionLocal as _SL
-        return _SL()
+        return _SL
     except Exception as e:
         print(f"[DB] connect failed ({e.__class__.__name__}: {str(e)[:120]}) — no-db mode")
         return None
+
+
+def _commit_one(SessionFactory, **kwargs) -> int:
+    """Open a fresh session, insert one BackgroundAsset row, commit, close.
+    Returns the new asset_id. Retries once on `OperationalError`
+    (SSL drop) — pool_pre_ping on checkout discards the dead conn so
+    the retry hits a fresh one."""
+    from sqlalchemy.exc import OperationalError
+    last_err = None
+    for attempt in (1, 2):
+        db = SessionFactory()
+        try:
+            asset = BackgroundAsset(**kwargs)
+            db.add(asset)
+            db.commit()
+            return asset.id
+        except OperationalError as e:
+            last_err = e
+            try:
+                db.rollback()
+            except Exception:
+                pass
+            if attempt == 1:
+                print(f"[DB] commit OperationalError on attempt 1, retrying ({str(e)[:80]})")
+                continue
+            raise
+        finally:
+            db.close()
+    raise last_err  # unreachable
 
 
 def _sql_escape(s: str) -> str:
@@ -323,29 +374,33 @@ def main() -> int:
     print(f"Models: imagen={IMAGEN_MODEL}, veo={VEO_MODEL}")
     print(f"SEED: {len(SEED)} tuples")
 
-    db = _try_open_db()
-    no_db = db is None
+    SessionFactory = _try_open_db_factory()
+    no_db = SessionFactory is None
     if no_db:
         print("[MODE] no-db: will upload to R2 + write JSON + SQL for manual import")
 
     json_records: list[dict] = []
-
-    # Resume support: load any previous run's JSON so re-running only fills
-    # in the (concept_slug, asset_type) pairs that didn't make it last time.
-    # Veo's prompt-keyed cache in pipeline.py also serves already-generated
-    # clips for free — partial-failure recovery is essentially free.
     json_out_path = "/tmp/library_umg_assets.json"
-    already_done: set[tuple[str, str]] = set()
+
+    # Resume support — primary source of truth is the DB itself.
+    # We query every `UMG …` name already present for this tenant and
+    # skip the SEED rows whose computed name is in that set. The JSON
+    # file is kept as a secondary cache so a re-run without DB access
+    # (no-db mode) can still resume from the last paid generation.
+    resume_names: set[str] = existing_names_for_tenant(SessionFactory, owner_tenant_id)
+    if resume_names:
+        print(f"[RESUME] {len(resume_names)} UMG asset(s) already in DB for tenant — will skip those names")
     if os.path.exists(json_out_path):
         try:
             with open(json_out_path) as fh:
                 prev = json.load(fh)
             for r in prev:
-                already_done.add((r["concept_slug"], r["asset_type"]))
+                # Re-export prior records so the final JSON/SQL stays complete.
                 json_records.append(r)
-            print(f"[RESUME] loaded {len(prev)} prior records from {json_out_path}")
+                resume_names.add(r["name"])
+            print(f"[RESUME] also loaded {len(prev)} record(s) from {json_out_path}")
         except Exception as e:
-            print(f"[RESUME] could not load prior JSON ({e}), starting fresh")
+            print(f"[RESUME] could not load prior JSON ({e}), continuing")
 
     # Track per-concept count so we can name assets "UMG Atardecer #1, #2…"
     concept_seen: dict[str, int] = {}
@@ -358,21 +413,12 @@ def main() -> int:
             concept_seen[concept_slug] = concept_seen.get(concept_slug, 0) + 1
             asset_index = concept_seen[concept_slug]
             label = f"{idx:02d}/{len(SEED)} {concept_slug} [{asset_type}] #{asset_index}"
+            expected_name = _format_name(concept_slug, asset_index)
 
-            if (concept_slug, asset_type) in already_done:
-                # Note: this skips re-running the SAME prompt; with 50 tuples
-                # and up to 8 per concept, the JSON resume is keyed by
-                # (concept_slug, asset_type) — so the 1st-run of a (concept,
-                # type) pair completes; subsequent re-runs with same SEED skip
-                # all of that concept's tuples after the 1st JSON entry. To
-                # truly resume mid-concept, add an index to the resume key.
-                # For the current 50-asset batch a clean re-run is enough.
-                pass
-            if not no_db and already_populated(db, concept_slug, asset_type):
-                # See note above: this also catches the whole concept block.
-                # OK for now — if the operator wants to top up, manual
-                # Admin upload path is the easy escape.
-                pass
+            if expected_name in resume_names:
+                skipped += 1
+                print(f"[SKIP] {label} — name '{expected_name}' already in DB/JSON")
+                continue
 
             short_id = uuid.uuid4().hex[:12]
             ext = ".jpg" if asset_type == "image" else ".mp4"
@@ -417,7 +463,7 @@ def main() -> int:
                 continue
 
             record = {
-                "name": _format_name(concept_slug, asset_index),
+                "name": expected_name,
                 "filename": r2_key,
                 "file_type": file_type,
                 "tags": f"{concept_slug},{asset_type},umg",
@@ -425,26 +471,55 @@ def main() -> int:
                 "asset_type": asset_type,
             }
             json_records.append(record)
+            resume_names.add(expected_name)
 
             if no_db:
                 created += 1
                 size_kb = os.path.getsize(tmp_path) / 1024
                 print(f"[OK] (no-db) key={r2_key} ({size_kb:.0f} KB)")
             else:
-                asset = BackgroundAsset(
-                    name=record["name"],
-                    filename=record["filename"],
-                    file_type=record["file_type"],
-                    tags=record["tags"],
-                    uploaded_by=None,
-                    owner_tenant_id=owner_tenant_id,
-                    is_active=True,
-                )
-                db.add(asset)
-                db.commit()
+                try:
+                    asset_id = _commit_one(
+                        SessionFactory,
+                        name=record["name"],
+                        filename=record["filename"],
+                        file_type=record["file_type"],
+                        tags=record["tags"],
+                        uploaded_by=None,
+                        owner_tenant_id=owner_tenant_id,
+                        is_active=True,
+                    )
+                except Exception as e:
+                    # DB write failed even after retry. The file IS in R2
+                    # and the JSON record is in memory — flush the JSON
+                    # NOW so the operator can rescue this row manually
+                    # (via the emitted SQL) without paying for the
+                    # generation again.
+                    print(f"[FAIL] DB commit (final): {e}")
+                    try:
+                        with open(json_out_path, "w") as fh:
+                            json.dump(json_records, fh, indent=2)
+                        print(f"[CHECKPOINT] flushed {len(json_records)} record(s) → {json_out_path}")
+                    except OSError:
+                        pass
+                    failed += 1
+                    try:
+                        os.unlink(tmp_path)
+                    except OSError:
+                        pass
+                    continue
                 created += 1
                 size_kb = os.path.getsize(tmp_path) / 1024
-                print(f"[OK] asset_id={asset.id} key={r2_key} ({size_kb:.0f} KB)")
+                print(f"[OK] asset_id={asset_id} key={r2_key} ({size_kb:.0f} KB)")
+
+            # Atomic checkpoint after every successful row. If the next
+            # row's Veo poll kills the SSL again, the JSON on disk
+            # already reflects everything paid for so far — no replay.
+            try:
+                with open(json_out_path, "w") as fh:
+                    json.dump(json_records, fh, indent=2)
+            except OSError as e:
+                print(f"[WARN] checkpoint write failed: {e}")
 
             try:
                 os.unlink(tmp_path)
@@ -470,8 +545,9 @@ def main() -> int:
 
         return 0 if failed == 0 else 2
     finally:
-        if db is not None:
-            db.close()
+        # No long-lived session to close — _commit_one() opens and closes
+        # one per row. SessionFactory is just a sessionmaker.
+        pass
 
 
 if __name__ == "__main__":
