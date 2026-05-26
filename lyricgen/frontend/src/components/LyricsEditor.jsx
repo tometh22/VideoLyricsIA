@@ -1123,7 +1123,11 @@ export default function LyricsEditor({
   const seekTo = useCallback((seconds, autoplay = true) => {
     const a = audioRef.current;
     if (!a) return;
-    a.currentTime = Math.max(0, seconds);
+    const t = Math.max(0, seconds);
+    a.currentTime = t;
+    // Refleja en el mismo frame del click. Sin esto hay que esperar al
+    // próximo rAF tick (~16ms) y el playhead "se desliza" en vez de saltar.
+    setCurrentTime(t);
     if (autoplay && a.paused) a.play().catch(() => {});
   }, []);
 
