@@ -3946,10 +3946,42 @@ async def _run_transcription_for_job(
                                 reference_lyrics=_canonical,
                             )
                         # Reconcile aborted (drift on too many lines or thin
-                        # coverage). Emit whisperX raw — same behaviour as
-                        # main today, which the operator confirmed works:
-                        # real timing + mishear text that the editor can fix.
-                        logger.info("[WC] reconcile aborted — emitting whisperX raw with mishear text (operator edits)")
+                        # coverage). Try forced_align as a fallback before
+                        # falling all the way back to whisperX raw — FA has
+                        # a different anchoring strategy (greedy monotonic
+                        # alignment over the full audio against the full
+                        # canonical text) and recovers cases where whisperX
+                        # mishears confuse the word-by-word reconciler.
+                        #
+                        # INCIDENT 2026-05-26 "Viejas Locas — 638": whisperX
+                        # mishears like "780465" / "738-0465" instead of
+                        # "638" plus intra-segment duplications ("y empecé
+                        # y empecé") tripped reconcile's drift abort.
+                        # Audio-as-truth fell back to whisperX raw and the
+                        # editor saw only 8/19 canonical lines. FA on the
+                        # same audio recovered 19/19 — operator reported
+                        # "le faltan lyrics en bastantes lineas".
+                        logger.info("[WC] reconcile aborted — trying forced_align fallback before whisperX raw")
+                        _fa_segs = None
+                        try:
+                            import forced_align as _fa_fb
+                            _fa_segs = await asyncio.to_thread(
+                                _fa_fb.forced_align_lyrics, _aa, _canonical,
+                            )
+                        except Exception as e:
+                            logger.warning("[WC] forced_align fallback raised: %s — emitting whisperX raw", e)
+                        if _fa_segs:
+                            from timing_sources import FORCED_ALIGN as _WC_FA
+                            logger.info(
+                                "[WC] forced_align fallback succeeded (%d/%d lines) — emitting FA segments",
+                                len(_fa_segs),
+                                len([l for l in _canonical.splitlines() if l.strip()]),
+                            )
+                            return _emit_segments(
+                                _fa_segs, _WC_FA,
+                                reference_lyrics=_canonical,
+                            )
+                        logger.info("[WC] forced_align fallback empty/disabled — emitting whisperX raw with mishear text (operator edits)")
                     return _emit_segments(
                         _wx_segs, _WC_WX,
                         reference_lyrics=_canonical,

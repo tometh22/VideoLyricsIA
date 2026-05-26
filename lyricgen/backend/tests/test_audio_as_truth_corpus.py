@@ -190,3 +190,58 @@ def test_drift_abort_still_fires_on_random_noise():
     # Either drift abort (None) or thin coverage (None). Anything else is a
     # regression — the bar must stay high enough to reject random words.
     assert wr.reconcile(wx_segs, canonical) is None
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# 638 — Viejas Locas (UMG dry-run incident, 2026-05-26)
+# ─────────────────────────────────────────────────────────────────────────
+# whisperX over a dense rock mix produced 13 mishear-heavy segments for a
+# 19-line song: number "638" came back as "780465" / "738-0465", intra-seg
+# duplications ("y empecé y empecé"), and 3 canonical lines were skipped at
+# the intro. Reconcile correctly aborted by drift (correct behaviour — we
+# don't want to fabricate timestamps over confident-but-wrong text).
+#
+# Before the fix, that abort emitted whisperX raw with mishear text, and the
+# editor saw only 8/19 canonical lines. The fix in main.py adds a FA
+# fallback after reconcile aborts: same audio, same canonical, but FA's
+# greedy-monotonic anchoring over the full file recovered 19/19.
+#
+# This test pins the reconcile-abort behaviour. The FA fallback that runs
+# in _run_transcription_for_job after the abort is verified manually
+# against the real audio (/tmp/pipeline_638/pipeline_A_with_fix.json).
+
+def test_638_mishears_abort_reconcile():
+    # Shape of what whisperX produced on the real audio: 3 intro lines
+    # skipped, "y empecé" duplicated, "638" replaced with a fabricated
+    # phone number. Phonetic relaxation can't bridge a 4-digit number
+    # mishear, so reconcile must abort and let the FA fallback handle it.
+    words = [
+        # whisperX picked up canonical line 4 first ("pero tu apellido…"),
+        # then duplicated "y empecé".
+        _w("pero",     21.95, 22.15), _w("tu",       22.15, 22.30),
+        _w("apellido", 22.30, 22.80), _w("nunca",    22.80, 23.10),
+        _w("entendí",  23.10, 23.50), _w("bien",     23.50, 23.90),
+        _w("y",        24.00, 24.10), _w("empecé",   24.10, 24.50),
+        _w("y",        24.50, 24.60), _w("empecé",   24.60, 24.81),
+        # Body picks up the canonical line about the corazón — but with
+        # "mi amor" instead of "mía mor" and a fabricated number.
+        _w("decía",    49.61, 49.90), _w("mi",       49.90, 50.05),
+        _w("amor",     50.05, 50.40), _w("llámame",  50.40, 50.90),
+        _w("al",       50.90, 51.05), _w("780465",   51.05, 52.29),
+    ]
+    wx_segs = [_wx_seg(21.95, 52.29, " ".join(w["word"] for w in words), words)]
+    canonical = (
+        "Tenía tantas ganas de volverte a ver\n"
+        "y en mi casa me dicen que llamaste recién,\n"
+        "traté de buscar tu número en la guía\n"
+        "pero tu apellido nunca entendí bien.\n"
+        "Y empecé a pensar que tenía en un cajón\n"
+        "un viejo cuaderno que guardabas vos\n"
+        "en el anotabas todo lo que hacías\n"
+        "y vi un corazón que decía: mía mor llamame al\n"
+        "638..."
+    )
+    # Reconcile MUST return None: thin coverage (4 first canon lines missing)
+    # plus number mishear means wordstamps_to_segments can't safely anchor.
+    # The caller (main.py audio-as-truth path) then triggers the FA fallback.
+    assert wr.reconcile(wx_segs, canonical) is None

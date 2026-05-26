@@ -49,6 +49,7 @@ from PIL import Image, ImageDraw, ImageFont
 from jobs import update_job, get_job
 import storage
 from render_spec import FPS_RATIONAL, RenderSpec
+from subprocess_utils import run_checked, SubprocessExecutionError  # noqa: F401 — exported for upstream catches
 
 ASSETS_DIR = os.path.join(os.path.dirname(__file__), "..", "assets")
 OUTPUTS_DIR = os.path.join(os.path.dirname(__file__), "..", "outputs")
@@ -5702,11 +5703,15 @@ def _extract_frame_from_video(video_path: str, output_image_path: str) -> str:
         "-vf", "scale='min(1920,iw)':-2",
         output_image_path,
     ]
-    result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
-    if result.returncode != 0 or not os.path.exists(output_image_path):
-        raise RuntimeError(
-            f"ffmpeg frame extraction failed (rc={result.returncode}): {result.stderr[:300]}"
-        )
+    # output_path= catches the rc=0-but-no-file case ffmpeg occasionally
+    # produces when the input is healthy but the seek lands past the
+    # final frame — pre-fix the caller crashed on the next os.stat().
+    run_checked(
+        cmd,
+        label="ffmpeg-bg-frame",
+        timeout=60,
+        output_path=output_image_path,
+    )
     return output_image_path
 
 
@@ -6521,9 +6526,15 @@ def _prerender_looped_bg(bg_path: str, duration: float, job_dir: str,
             "-pix_fmt", "yuv420p", "-an",
             out_path,
         ]
-        result = subprocess.run(cmd_fallback, capture_output=True, text=True)
-        if result.returncode != 0:
-            raise RuntimeError(f"ffmpeg loop failed: {result.stderr[-300:]}")
+        # 900s mirrors the kenburns sibling — a stream_loop encode of a
+        # multi-minute lyric video sits comfortably under 5 min in
+        # healthy runs; double that as the cliff.
+        run_checked(
+            cmd_fallback,
+            label="ffmpeg-palindrome-fallback",
+            timeout=900,
+            output_path=out_path,
+        )
 
     size_mb = os.path.getsize(out_path) / 1024 / 1024
     logger.info("[BG] Pre-rendered palindrome loop: %.0fs, %.1f MB", duration, size_mb)
@@ -6574,13 +6585,13 @@ def _prerender_kenburns_bg(image_path: str, duration: float, job_dir: str,
             f"scale={spec.width}:{spec.height}:force_original_aspect_ratio=increase,"
             f"crop={spec.width}:{spec.height},fps={spec.fps_str}"
         )
-        result = subprocess.run(
+        run_checked(
             base + ["-vf", static_vf, "-c:v", "libx264", "-preset", "fast",
                     "-crf", "20", "-pix_fmt", "yuv420p", "-an", out_path],
-            capture_output=True, text=True, timeout=900,
+            label="ffmpeg-kenburns-fallback",
+            timeout=900,
+            output_path=out_path,
         )
-        if result.returncode != 0:
-            raise RuntimeError(f"ken burns ffmpeg failed: {result.stderr[-300:]}")
 
     size_mb = os.path.getsize(out_path) / 1024 / 1024
     logger.info("[BG] Ken Burns (zoompan): %.0fs, %.1f MB", duration, size_mb)
@@ -7183,18 +7194,17 @@ def _transcode_to_prores(input_path: str, mov_path: str,
                        os.path.basename(input_path), src_desc,
                        os.path.basename(mov_path),
                        spec.width, spec.height, spec.fps_str, spec.prores_profile)
-    result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout_sec)
-    if result.returncode != 0:
-        # Best-effort cleanup of a partial file before raising.
-        try:
-            if os.path.exists(mov_path):
-                os.unlink(mov_path)
-        except OSError:
-            pass
-        raise RuntimeError(
-            f"ffmpeg ProRes transcode failed (rc={result.returncode}): "
-            f"{result.stderr[-500:]}"
-        )
+    # ProRes UMG master — this output lands on a Drive folder UMG QCs by
+    # hand. A silent 0-byte file would be caught by _validate_umg_master
+    # below (ffprobe would choke on it), but checking here turns a
+    # confusing downstream crash into a clear "ffmpeg-prores produced
+    # empty output" in the worker log + Job.error column.
+    run_checked(
+        cmd,
+        label="ffmpeg-prores",
+        timeout=timeout_sec,
+        output_path=mov_path,
+    )
 
     # Log what ffprobe sees on the freshly-encoded master for any future
     # debugging — colorspace problems are notoriously sticky on ProRes.
@@ -7635,13 +7645,18 @@ def _render_lyrics_ass(
     _render_timeout = 1800 if (spec.codec == "prores_ks" or spec.width >= 3000
                                or (effect and spec.width >= 1920)) else 900
     try:
-        result = subprocess.run(
-            cmd, cwd=job_dir, capture_output=True, text=True, timeout=_render_timeout,
+        # libass main render — the H.264 deliverable. The downstream
+        # _validate_rendered_mp4() would already catch most failures,
+        # but checking here (rc + non-empty file) names the failure
+        # mode clearly in the worker log instead of getting a generic
+        # ffprobe "Invalid data" from the validator.
+        run_checked(
+            cmd,
+            label="ffmpeg-libass",
+            timeout=_render_timeout,
+            output_path=out_path,
+            cwd=job_dir,
         )
-        if result.returncode != 0:
-            raise RuntimeError(
-                f"ass render ffmpeg failed: {result.stderr[-500:]}"
-            )
     finally:
         import shutil
         shutil.rmtree(font_dir, ignore_errors=True)
@@ -8127,7 +8142,7 @@ def generate_lyric_video(
         # to pcm_s24le at 48 kHz. UMG requires this exact audio spec; no
         # CPU is wasted re-encoding the multi-GB ProRes stream.
         tmp_resampled = out_path + ".audio48k.mov"
-        result = subprocess.run(
+        run_checked(
             [
                 "ffmpeg", "-y", "-loglevel", "error",
                 "-i", out_path,
@@ -8137,12 +8152,10 @@ def generate_lyric_video(
                 "-ac", "2",
                 tmp_resampled,
             ],
-            capture_output=True, text=True, timeout=600,
+            label="ffmpeg-audio-resample",
+            timeout=600,
+            output_path=tmp_resampled,
         )
-        if result.returncode != 0:
-            raise RuntimeError(
-                f"audio resample to 48kHz failed: {result.stderr[-500:]}"
-            )
         os.replace(tmp_resampled, out_path)
 
         errors = _validate_umg_master(out_path, spec)

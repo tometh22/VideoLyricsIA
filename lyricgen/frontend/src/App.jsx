@@ -2019,6 +2019,12 @@ export default function App() {
         // sincronizado al audio. Sin re-renders en App.jsx — el preview lee
         // el ref con su propio rAF loop.
         playbackTickRef={playbackTickRef}
+        // UI F5 (2026-05-26): le pasamos el bgStatus al wizard para que
+        // UploadZone pueda derivar `placeholderBg` cuando montamos el
+        // preview en paso 6. "done" = fondo final listo, todo lo demás
+        // = muestra. El badge del preview cambia de "EN VIVO" a
+        // "(muestra)" en consecuencia.
+        bgStatus={bgPreview.status}
       />
     </div>
   );
