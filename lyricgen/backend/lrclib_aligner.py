@@ -158,6 +158,29 @@ def _is_hallucination(text: str) -> bool:
     return False
 
 
+_LRC_TS_RE = re.compile(r"^\[(\d+):(\d+(?:\.\d+)?)\]\s*(.*)$")
+
+
+def _parse_lrc_to_line_times(lrc: str) -> list[tuple[float, str]]:
+    """Parse a `[mm:ss.xx] text` LRC string into [(time, text), ...]. Drops
+    lines without a timestamp prefix and lines whose text is empty after
+    stripping."""
+    out: list[tuple[float, str]] = []
+    for ln in (lrc or "").splitlines():
+        m = _LRC_TS_RE.match(ln.strip())
+        if not m:
+            continue
+        text = m.group(3).strip()
+        if not text:
+            continue
+        try:
+            t = int(m.group(1)) * 60 + float(m.group(2))
+        except (TypeError, ValueError):
+            continue
+        out.append((t, text))
+    return out
+
+
 def align_lrclib_to_whisper(
     lrclib_plain: str,
     whisper_segments: list[dict],

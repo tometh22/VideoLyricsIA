@@ -531,15 +531,21 @@ export default function JobDetail({ job, onBack, onJobUpdate }) {
   const isAwaitingUpload = job.status === "awaiting_upload";
   const isTranscriptionFailed = job.status === "transcription_failed";
 
-  // `transcribed` = audio + segments are in the DB, user never hit
-  // "Generar video". The right next action is to open the wizard
-  // pre-loaded for this job so they can review lyrics and ship. We
-  // redirect to /new with a query param the wizard can pick up.
+  // `transcribed` y `transcribed_pending` = audio + segments están en la DB
+  // y el user nunca hizo /generate. La acción correcta es abrir el wizard
+  // pre-cargado (/new?resume=...) para que edite lyrics y dispare la
+  // generación. Vía `/transcribe-uploaded` queda `transcribed_pending` (path
+  // sync legacy) o el async worker setea `transcribed_pending` como estado
+  // FINAL — ver transcription_worker.py:147 y jobs.py:49-51. NO es "subida
+  // en curso"; el verdadero "subida en curso" es `awaiting_upload`, que
+  // está manejado en el bloque siguiente.
+  //
+  // Bug pre-fix (operator report 2026-05-26): `transcribed_pending` caía en
+  // este branch pero mostraba el subtitle "La subida está en curso" y NO
+  // renderizaba el CTA. El usuario veía 27 jobs "Sin generar" en el
+  // historial y al entrar no había forma de seguir — panel sin acción.
   if (isTranscribed || isTranscribedPending) {
     const navHref = `/new?resume=${encodeURIComponent(job.job_id)}`;
-    const subtitle = isTranscribed
-      ? (t("detail.transcribed_subtitle") || "La transcripción ya está lista. Revisá los lyrics y dale Generar video para terminar.")
-      : (t("detail.transcribed_pending_subtitle") || "La subida está en curso. Cuando termine, vas a poder editar los lyrics.");
     return (
       <div className="w-full max-w-2xl animate-fade-in">
         <div className="flex items-center gap-3 mb-6">
@@ -553,20 +559,18 @@ export default function JobDetail({ job, onBack, onJobUpdate }) {
         </div>
         <div className="rounded-card p-5 bg-surface-2/40 ring-1 ring-white/[0.06]">
           <p className="text-sm font-semibold text-white">
-            {isTranscribed
-              ? (t("detail.transcribed_title") || "Borrador listo para editar")
-              : (t("detail.transcribed_pending_title") || "Subida en curso")}
+            {t("detail.transcribed_title") || "Borrador listo para editar"}
           </p>
-          <p className="text-xs text-ink-secondary mt-1.5 leading-relaxed">{subtitle}</p>
-          {isTranscribed && (
-            <a
-              href={navHref}
-              className="inline-flex items-center gap-2 mt-4 px-4 py-2 rounded-lg bg-brand hover:bg-brand-light text-white font-medium text-sm transition-colors"
-            >
-              {t("detail.transcribed_cta") || "Editar lyrics y generar"}
-              <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24"><path d="M5 12h14M12 5l7 7-7 7" /></svg>
-            </a>
-          )}
+          <p className="text-xs text-ink-secondary mt-1.5 leading-relaxed">
+            {t("detail.transcribed_subtitle") || "La transcripción ya está lista. Revisá los lyrics y dale Generar video para terminar."}
+          </p>
+          <a
+            href={navHref}
+            className="inline-flex items-center gap-2 mt-4 px-4 py-2 rounded-lg bg-brand hover:bg-brand-light text-white font-medium text-sm transition-colors"
+          >
+            {t("detail.transcribed_cta") || "Editar lyrics y generar"}
+            <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24"><path d="M5 12h14M12 5l7 7-7 7" /></svg>
+          </a>
         </div>
       </div>
     );

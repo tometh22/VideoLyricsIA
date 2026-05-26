@@ -319,7 +319,7 @@ export default function UploadZone({
     { id: 1, label: t("upload.step_upload") || "Subí" },
     { id: 2, label: t("upload.step_mode") || "Modo" },
     { id: 3, label: t("upload.step_motion") || "Movimiento" },
-    { id: 4, label: t("upload.step_animation") || "Animación" },
+    { id: 4, label: t("upload.step_animation") || "Tipografía & Animación" },
     { id: 5, label: t("upload.step_deliver") || "Entregá" },
     { id: 6, label: t("upload.step_lyrics") || "Lyrics" },
   ];
@@ -1881,8 +1881,16 @@ export default function UploadZone({
         const gridCols = isStep6
           ? "lg:grid-cols-[56px_minmax(260px,320px)_minmax(0,1fr)]"
           : "lg:grid-cols-[190px_minmax(0,1fr)_minmax(400px,460px)]";
+        // 2026-05-26 — variante [.editor-focus-mode_&] colapsa este grid
+        // a 1 columna cuando el LyricsEditor prende "modo enfoque". Sin
+        // este override, el feature sólo agrandaba el max-h interno (~90px
+        // verticales) — invisible porque el operador ya tiene ~1124px de
+        // ancho en step 6. Con focus on, stepper + preview se ocultan
+        // (rules abajo) y la columna del editor toma los ~1500px de
+        // viewport. Body class emitida por LyricsEditor:367, cleanup en
+        // unmount → volver a step 4 reaparece el layout 3-col.
         return (
-        <div className={`flex flex-col lg:grid ${gridCols} gap-6 items-start`}>
+        <div className={`flex flex-col lg:grid ${gridCols} [.editor-focus-mode_&]:lg:grid-cols-1 gap-6 items-start`}>
 
         {/* LEFT — step rail (vertical on desktop, horizontal pills on mobile).
             Paso 6 "Lyrics" se ve siempre; está deshabilitado hasta que
@@ -1895,7 +1903,7 @@ export default function UploadZone({
             el número en círculo queda visible). Tooltip on hover
             mantiene la información completa. El sidebar pasa de 190 px
             a 56 px → +134 px que ganan las otras dos columnas. */}
-        <nav className="flex lg:flex-col gap-1.5 lg:gap-1 overflow-x-auto lg:overflow-visible lg:sticky lg:top-4 w-full lg:w-auto order-first">
+        <nav className="flex lg:flex-col gap-1.5 lg:gap-1 overflow-x-auto lg:overflow-visible lg:sticky lg:top-4 w-full lg:w-auto order-first [.editor-focus-mode_&]:hidden">
           {WIZARD_STEPS.map((s) => {
             const isLyrics = s.id === 6;
             const lyricsDisabled = isLyrics && !hasReviewableContent;
@@ -1942,7 +1950,7 @@ export default function UploadZone({
             editando), y el max-width del contenedor se ajusta al
             grid column (260-320 px). Mantiene sticky para acompañar
             el scroll del timeline en el panel derecho. */}
-        <div className="lg:sticky lg:top-4 space-y-2 min-w-0 w-full">
+        <div className="lg:sticky lg:top-4 space-y-2 min-w-0 w-full [.editor-focus-mode_&]:hidden">
           {bgMode === "auto" ? (
             <WizardLivePreview
               style={style}
@@ -2159,7 +2167,7 @@ export default function UploadZone({
           {/* STEP 3 — Movimiento + metadata */}
           {wizardStep === 3 && _batchSettingsBlock}
 
-          {/* STEP 4 — Animación: lyrics animation template (libass, fast path) */}
+          {/* STEP 4 — Tipografía & Animación: font/case/size/contrast + lyrics animation template (libass) */}
           {wizardStep === 4 && (
             <div className="rounded-card bg-surface-2/40 ring-1 ring-white/[0.04] p-4">
               <style>{`
@@ -2172,7 +2180,118 @@ export default function UploadZone({
                 @keyframes tcard-wipe { 0%{clip-path:inset(0 100% 0 0)} 35%,100%{clip-path:inset(0 0 0 0)} }
                 @keyframes tcard-blur { 0%{filter:blur(6px);opacity:0} 30%,80%{filter:blur(0);opacity:1} 100%{filter:blur(6px);opacity:0} }
               `}</style>
-              <p className="text-[11px] text-gray-300 font-medium">{t("upload.step_animation") || "Animación"} de la letra</p>
+
+              {/* Tipografía — UI gap fix 2026-05-26. El refactor del paso 6
+                  (commit 6c2e8a8) ocultó estos controles en LyricsEditor con
+                  hideTypographyControls=true asumiendo que vivían en el paso
+                  4, pero el bloque nunca llegó a migrarse. Sin esto el
+                  operador no tiene forma de elegir font/case/size/contrast
+                  desde el wizard. Los handlers (updateBatchDefault) y el
+                  WizardLivePreview central ya escuchan estos cambios live —
+                  solo faltaba el JSX. */}
+              <div className="mb-4 pb-3 border-b border-white/[0.05]">
+                <p className="text-[11px] text-gray-300 font-medium">{t("upload.typography_section") || "Tipografía"}</p>
+                <p className="text-[10px] text-gray-600 mt-0.5 mb-3">
+                  {t("upload.typography_desc") || "Estilo del texto sobre el video. El preview ← se actualiza al instante."}
+                </p>
+                <div className="space-y-3">
+                  {/* Font */}
+                  <div className="flex items-center gap-2">
+                    <span className="text-[11px] text-gray-600 shrink-0 w-20">{t("upload.font_label") || "Tipografía:"}</span>
+                    <Listbox
+                      value={batchDefaults.font}
+                      onChange={(v) => updateBatchDefault("font", v)}
+                      options={FONTS}
+                      className="flex-1"
+                      ariaLabel={t("upload.font_label") || "Tipografía"}
+                    />
+                  </div>
+
+                  {/* Text case pill buttons: MAY / Aa / min / ori */}
+                  <div>
+                    <div className="flex items-center gap-2">
+                      <span className="text-[11px] text-gray-600 shrink-0 w-20">{t("upload.text_case_label") || "Texto:"}</span>
+                      <div className="flex gap-1">
+                        {TEXT_CASE_OPTS.map((opt) => (
+                          <button
+                            key={opt.code}
+                            type="button"
+                            title={opt.label}
+                            onClick={() => updateBatchDefault("textCase", opt.code)}
+                            onMouseEnter={() => setHoverCaseBatch(opt.code)}
+                            onMouseLeave={() => setHoverCaseBatch(null)}
+                            className={`px-2.5 py-1 rounded-md text-[11px] font-mono font-bold transition-all
+                              ${batchDefaults.textCase === opt.code
+                                ? "bg-brand/20 text-brand ring-1 ring-brand/40"
+                                : "bg-surface-3/40 text-gray-500 hover:text-gray-300"
+                              }`}
+                          >{opt.d}</button>
+                        ))}
+                      </div>
+                    </div>
+                    {hoverCaseBatch && (
+                      <div className="mt-1.5 ml-[5.5rem] px-3 py-1.5 rounded-md bg-black/40 ring-1 ring-white/[0.06] flex items-baseline gap-2 animate-fade-in">
+                        <span className="text-[11px] font-mono text-white/80 tracking-wide">
+                          {applyTextCase(SAMPLE_LYRIC, hoverCaseBatch)}
+                        </span>
+                        <span className="text-[10px] text-gray-600">← así quedarán tus letras</span>
+                      </div>
+                    )}
+                  </div>
+
+                  {/* Font scale — 5 A's in increasing sizes */}
+                  <div className="flex items-center gap-2">
+                    <span className="text-[11px] text-gray-600 shrink-0 w-20">{t("upload.font_scale_label") || "Tamaño:"}</span>
+                    <div className="flex items-end gap-1">
+                      {[
+                        { code: "0.75", cls: "text-[9px]"  },
+                        { code: "0.9",  cls: "text-[11px]" },
+                        { code: "1.0",  cls: "text-[13px]" },
+                        { code: "1.15", cls: "text-[16px]" },
+                        { code: "1.3",  cls: "text-[19px]" },
+                      ].map((opt) => (
+                        <button
+                          key={opt.code}
+                          type="button"
+                          onClick={() => updateBatchDefault("fontScale", opt.code)}
+                          className={`w-7 h-7 flex items-center justify-center rounded-md font-bold transition-all ${opt.cls}
+                            ${batchDefaults.fontScale === opt.code
+                              ? "bg-brand/20 text-brand ring-1 ring-brand/40"
+                              : "bg-surface-3/40 text-gray-500 hover:text-gray-300"
+                            }`}
+                        >A</button>
+                      ))}
+                    </div>
+                  </div>
+
+                  {/* Text contrast pills */}
+                  <div className="flex items-center gap-2">
+                    <span className="text-[11px] text-gray-600 shrink-0 w-20">{t("upload.contrast_label") || "Contraste:"}</span>
+                    <div className="flex gap-1">
+                      {[
+                        { code: "subtle", style: { WebkitTextStroke: "0px", textShadow: "none" },         label: t("upload.contrast_subtle") || "Suave" },
+                        { code: "medium", style: { WebkitTextStroke: "0.5px black", textShadow: "0 0 3px rgba(0,0,0,0.8)" }, label: t("upload.contrast_medium") || "Medio" },
+                        { code: "strong", style: { WebkitTextStroke: "1px black",   textShadow: "0 0 6px rgba(0,0,0,1), -1px -1px 0 #000, 1px 1px 0 #000" }, label: t("upload.contrast_strong") || "Fuerte" },
+                      ].map((opt) => (
+                        <button
+                          key={opt.code}
+                          type="button"
+                          title={opt.label}
+                          onClick={() => updateBatchDefault("textContrast", opt.code)}
+                          className={`px-2 py-1 rounded-md text-[13px] font-bold text-white transition-all
+                            ${batchDefaults.textContrast === opt.code
+                              ? "bg-brand/20 ring-1 ring-brand/40"
+                              : "bg-surface-3/40 hover:bg-surface-3/60"
+                            }`}
+                          style={opt.style}
+                        >A</button>
+                      ))}
+                    </div>
+                  </div>
+                </div>
+              </div>
+
+              <p className="text-[11px] text-gray-300 font-medium">{t("upload.animation_section") || "Animación"} de la letra</p>
               <p className="text-[10px] text-gray-600 mt-0.5 mb-3">
                 {t("upload.anim_gallery_desc") || "Cómo aparecen las palabras sobre el video. Pasá el mouse o elegí y miralo en el preview ←"}
               </p>
