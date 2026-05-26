@@ -53,22 +53,11 @@ WHISPER_GEMINI_REC = "whisper_gemini_rec"
 # raw ASR produced; this tag at least makes the degradation visible.
 WHISPER_RAW = "whisper_raw"
 
-# whisperX word-stamps re-bucketed by `lrclib_aligner.align_lrclib_to_whisper`
-# with `keep_unmatched=True`. Used as a third fallback when both reconcile
-# AND forced_align fail — lrclib_aligner walks the canonical line structure
-# against whisperX wordstamps, interpolating timing for lines whisperX
-# didn't transcribe well enough. Less precise than reconcile/FA timing
-# (interpolated spans) but recovers cases where cureau crashes with the
-# `[1, 2, 0]` tensor bug on highly-repetitive lyrics (incident 2026-05-26:
-# Sin Gamulán, Mujer Amante). See [[reference-pipeline-batch-test]].
-WHISPERX_LRCLIB = "whisperx_lrclib"
-
 
 VALID_TIMING_SOURCES = frozenset({
     FORCED_ALIGN,
     WHISPERX_RECONCILED,
     WHISPERX,
-    WHISPERX_LRCLIB,
     WHISPER_LRCLIB,
     WHISPER_LRCLIB_REC,
     WHISPER_GEMINI_REC,
