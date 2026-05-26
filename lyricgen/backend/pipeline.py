@@ -361,6 +361,12 @@ def run_pipeline(job_id: str, mp3_path: str, artist: str, style: str,
                  text_motion: str = "none",
                  lyrics_animation: str = "none",
                  line_transition: str = "none",
+                 # Lyric text colors 2026-05-25. Hex #RRGGBB; cadena vacía
+                 # = blanco default. Para karaoke: lyric_color = palabra no
+                 # cantada, lyric_sung_color = palabra cantada. Para otras
+                 # animaciones: lyric_color = único color del texto.
+                 lyric_color: str = "",
+                 lyric_sung_color: str = "",
                  match_lyrics: bool = True,
                  text_contrast: str = "medium",
                  # Background_hint llega solo desde el flow de variantes
@@ -892,6 +898,7 @@ def run_pipeline(job_id: str, mp3_path: str, artist: str, style: str,
                 line_transition=line_transition,
                 text_contrast=text_contrast,
                 effect=effect, custom_colors=custom_colors,
+                lyric_color=lyric_color, lyric_sung_color=lyric_sung_color,
             )
             files["video_url"] = f"/download/{job_id}/video"
             update_job(job_id, progress=55)
@@ -7447,6 +7454,12 @@ def _render_lyrics_ass(
     effect: str = "",
     style: str = "",
     custom_colors: str = "",
+    # Lyric text colors 2026-05-25. Hex #RRGGBB; cadena vacía → blanco.
+    # Para karaoke: lyric_color = palabra no cantada, lyric_sung_color =
+    # palabra cantada. Para otras animaciones: lyric_color = único color
+    # del texto (PrimaryColour del style en ASS).
+    lyric_color: str = "",
+    lyric_sung_color: str = "",
 ) -> str:
     """Fast lyric render: burn the lyrics with libass in a single ffmpeg
     pass over the (ffmpeg-looped) background — no moviepy frame loop.
@@ -7498,6 +7511,15 @@ def _render_lyrics_ass(
         transition=line_transition,
         case_fn=lambda t: _apply_case(t, text_case),
     )
+    # Lyric color mapping para build_ass (style line + override karaoke):
+    # karaoke → primary = sung color, secondary = un-sung. Otras animaciones
+    # usan primary = lyric_color (texto único) y secondary irrelevante.
+    if lyrics_animation == "karaoke":
+        primary_for_lines = lyric_sung_color or ""
+        secondary_for_lines = lyric_color or ""
+    else:
+        primary_for_lines = lyric_color or ""
+        secondary_for_lines = ""
     first_lyric_start = segments[0]["start"] if segments else duration
     lines += _ass.title_card_lines(
         artist, song_title, first_lyric_start,
@@ -7507,10 +7529,16 @@ def _render_lyrics_ass(
         artist_font_family=artist_family,
     )
     base_fs = _ass.lyric_fontsize(40, scale, font_scale)
+    # Reusamos el mapping primary/secondary computado arriba para
+    # segments_to_lines — mismo eje semántico (karaoke usa sung como
+    # PrimaryColour). Sin esto la palabra cantada se rendea con
+    # PrimaryColour blanco aunque el operador haya elegido otro color.
     ass_doc = _ass.build_ass(
         width=spec.width, height=spec.height,
         font_name=family, base_fontsize=base_fs,
         outline=outline, shadow=shadow, lines=lines, bold=bold,
+        primary_color=primary_for_lines,
+        secondary_color=secondary_for_lines,
     )
     ass_path = os.path.join(job_dir, "lyrics.ass")
     with open(ass_path, "w", encoding="utf-8") as f:
@@ -7646,6 +7674,9 @@ def generate_lyric_video(
     text_contrast: str = "medium",
     effect: str = "",
     custom_colors: str = "",
+    # Lyric text colors 2026-05-25. Hex #RRGGBB; "" → blanco default.
+    lyric_color: str = "",
+    lyric_sung_color: str = "",
 ) -> tuple[str, str, str | None]:
     """Generate a lyric video. Returns (video_path, font, bg_source).
 
@@ -7751,6 +7782,7 @@ def generate_lyric_video(
                 text_contrast=text_contrast,
                 artist=artist, song_title=title_song,
                 effect=effect, style=style, custom_colors=custom_colors,
+                lyric_color=lyric_color, lyric_sung_color=lyric_sung_color,
             )
             logger.info("[ASS] render: %.1fs (engine=ass)", _time.monotonic() - _t0)
             audio.close()
@@ -8502,6 +8534,12 @@ def run_edit_pipeline(
     # so a re-render keeps the snow/rain/grade the operator picked at upload.
     effect = merged.get("effect") or ""
     custom_colors = merged.get("custom_colors") or ""
+    # Lyric text colors 2026-05-25. Si el operador no los seteó, fall back
+    # a "" (= blanco default en build_ass). Persisten en render_params
+    # como custom_colors → un re-render de la misma variante mantiene los
+    # colores elegidos.
+    lyric_color = merged.get("lyric_color") or ""
+    lyric_sung_color = merged.get("lyric_sung_color") or ""
     # Per-edit operator hint for background regen (set by /edit when the
     # user typed in the "Aclarar tipo de fondo" textarea). None if absent;
     # propagates only into the `background` branch below.
@@ -8608,6 +8646,7 @@ def run_edit_pipeline(
             lyrics_animation=lyrics_animation,
             line_transition=line_transition,
             effect=effect, custom_colors=custom_colors,
+            lyric_color=lyric_color, lyric_sung_color=lyric_sung_color,
         )
         files = {"video_url": f"/download/{job_id}/video"}
         update_job(job_id, progress=55)

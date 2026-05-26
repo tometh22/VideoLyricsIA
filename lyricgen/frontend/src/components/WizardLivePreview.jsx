@@ -33,6 +33,17 @@ const MOVE_ANIM = {
   animado:        "wlp-anim 1.8s linear infinite",
 };
 
+// Convert #RRGGBB → rgba(r,g,b,a). Returns null if hex is malformed —
+// caller should fall back to a theme default. Used for the un-sung
+// karaoke color which needs a softer opacity than the picked hex.
+function hexToRgba(hex, alpha) {
+  if (typeof hex !== "string" || !/^#[0-9a-fA-F]{6}$/.test(hex)) return null;
+  const r = parseInt(hex.slice(1, 3), 16);
+  const g = parseInt(hex.slice(3, 5), 16);
+  const b = parseInt(hex.slice(5, 7), 16);
+  return `rgba(${r}, ${g}, ${b}, ${alpha})`;
+}
+
 export default function WizardLivePreview({
   style = "auto",
   customColors = "",
@@ -40,6 +51,14 @@ export default function WizardLivePreview({
   effect = "",
   lyricsAnimation = "none",
   lineTransition = "none",
+  // Lyric text colors 2026-05-25:
+  // - lyricColor: color del texto (no-cantada para karaoke; texto único
+  //   para el resto de animaciones).
+  // - lyricSungColor: solo aplica a karaoke = color de la palabra cantada.
+  // Default #FFFFFF: preservar el look histórico cuando el operador no
+  // toca el picker.
+  lyricColor = "#FFFFFF",
+  lyricSungColor = "#FFFFFF",
   mode = "lyrics",
   lyric,
   clipSrc = "/movement_samples/estandar.mp4",
@@ -161,8 +180,23 @@ export default function WizardLivePreview({
   // in lockstep) so the sweep/reveal is always visible — not a one-shot that
   // finishes before the operator looks. Colours come from CSS vars so it reads
   // on both dark and light (minimal) palettes.
-  const dim = isMinimal ? "rgba(0,0,0,.34)" : "rgba(255,255,255,.4)";
-  const lit = isMinimal ? "#0f9b83" : "#19E0BC";
+  // Colors: si el operador picó algo distinto de #FFFFFF, usalo. Sino
+  // mantenemos los defaults históricos (un-sung white/grey, sung
+  // white/green). hexToRgba con alpha=0.4 dimm-ea el color un-sung del
+  // operador a un tono "fantasma" tipo el grey del libass &H00808080&.
+  const operatorPickedColor = lyricColor && lyricColor.toUpperCase() !== "#FFFFFF";
+  const operatorPickedSung = lyricSungColor && lyricSungColor.toUpperCase() !== "#FFFFFF";
+  const dim = operatorPickedColor
+    ? (hexToRgba(lyricColor, 0.4) || (isMinimal ? "rgba(0,0,0,.34)" : "rgba(255,255,255,.4)"))
+    : (isMinimal ? "rgba(0,0,0,.34)" : "rgba(255,255,255,.4)");
+  const lit = operatorPickedSung
+    ? lyricSungColor
+    : (isMinimal ? "#0f9b83" : "#19E0BC");
+  // Color del texto plain (none/pop/glow): el lyricColor directo si fue
+  // pickeado; sino el default por tema (negro en minimal, blanco en oscuro).
+  const plainTextColor = operatorPickedColor
+    ? lyricColor
+    : (isMinimal ? "#111827" /* text-gray-900 */ : "#FFFFFF");
   // Phase C 2026-05-25: cuando hay un livePlaybackTick activo (audio
   // reproduciendo en el editor), el preview muestra la línea REAL con
   // word-jump driven por currentTime — mismo style que el list view del
@@ -223,13 +257,16 @@ export default function WizardLivePreview({
               display: "inline-block",
               transform: wActive ? "scale(1.10)" : "scale(1)",
               transformOrigin: "center bottom",
+              // wActive = palabra cantada → lit (lyricSungColor cuando el
+              // operador la pickeó, sino el verde default). wPast = palabras
+              // ya cantadas (alpha alto). wFuture = aún por cantar (alpha bajo).
               color: wActive
-                ? (isMinimal ? "#0f9b83" : "#19E0BC")
+                ? lit
                 : wPast
-                  ? (isMinimal ? "rgba(0,0,0,0.85)" : "rgba(255,255,255,0.95)")
-                  : (isMinimal ? "rgba(0,0,0,0.40)" : "rgba(255,255,255,0.55)"),
+                  ? (operatorPickedColor ? (hexToRgba(lyricColor, 0.95) || (isMinimal ? "rgba(0,0,0,0.85)" : "rgba(255,255,255,0.95)")) : (isMinimal ? "rgba(0,0,0,0.85)" : "rgba(255,255,255,0.95)"))
+                  : (operatorPickedColor ? (hexToRgba(lyricColor, 0.55) || (isMinimal ? "rgba(0,0,0,0.40)" : "rgba(255,255,255,0.55)")) : (isMinimal ? "rgba(0,0,0,0.40)" : "rgba(255,255,255,0.55)")),
               textShadow: wActive
-                ? (isMinimal ? "0 0 14px rgba(20,200,168,0.6)" : "0 0 14px rgba(25,224,188,0.7)")
+                ? `0 0 14px ${hexToRgba(lit, 0.65) || "rgba(25,224,188,0.7)"}`
                 : "none",
               transition: "transform 140ms cubic-bezier(.2,1.4,.35,1), color 200ms ease, text-shadow 200ms ease",
             }}
@@ -358,8 +395,8 @@ export default function WizardLivePreview({
         <div key={`${lineTransition}:${sample}`} style={{ animation: transWrapAnim }}>
           <div
             key={`${lyricsAnimation}:${liveLineKey ?? sample}`}
-            className={`font-extrabold tracking-[-0.03em] leading-[1.02] ${isMinimal ? "text-gray-900" : "text-white"}`}
-            style={{ fontSize: "clamp(18px,7.5cqw,68px)", textShadow: isMinimal ? "0 1px 0 rgba(255,255,255,.5)" : "-1px -1px 0 rgba(0,0,0,.6), 1px -1px 0 rgba(0,0,0,.6), -1px 1px 0 rgba(0,0,0,.6), 1px 1px 0 rgba(0,0,0,.6)", animation: isWordAnim ? undefined : lineAnim }}
+            className="font-extrabold tracking-[-0.03em] leading-[1.02]"
+            style={{ color: plainTextColor, fontSize: "clamp(18px,7.5cqw,68px)", textShadow: isMinimal ? "0 1px 0 rgba(255,255,255,.5)" : "-1px -1px 0 rgba(0,0,0,.6), 1px -1px 0 rgba(0,0,0,.6), -1px 1px 0 rgba(0,0,0,.6), 1px 1px 0 rgba(0,0,0,.6)", animation: isWordAnim ? undefined : lineAnim }}
           >
             {lyricContent}
           </div>
