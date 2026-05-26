@@ -3917,9 +3917,18 @@ async def _run_transcription_for_job(
                 if _canonical:
                     try:
                         from pipeline import _gemini_cleanup_lyrics as _gcl
+                        # `_run_transcription_for_job`'s signature uses `title`,
+                        # not `song` — passing `song=song` raised NameError on
+                        # every call, the cleanup silently fell back to lrclib
+                        # raw, and the feature flag was effectively a no-op in
+                        # prod (incident 2026-05-26: every transcription log
+                        # showed "[WC] Gemini cleanup raised: name 'song' is
+                        # not defined — using lrclib raw"). _gcl's kwarg stays
+                        # `song=` because that's the public contract documented
+                        # in pipeline.py:3727; we just feed it the right local.
                         _cleaned = await asyncio.to_thread(
                             _gcl, tmp_path, _canonical,
-                            artist=artist, song=song,
+                            artist=artist, song=title,
                         )
                     except Exception as _e:
                         logger.warning("[WC] Gemini cleanup raised: %s — using lrclib raw", _e)
