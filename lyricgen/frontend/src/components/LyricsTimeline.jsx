@@ -139,11 +139,34 @@ export default function LyricsTimeline({
 
   const neighbours = useCallback(
     (id) => {
-      const sorted = [...segments].sort((a, b) => a.start - b.start);
-      const i = sorted.findIndex((s) => s._id === id);
-      return { prev: i > 0 ? sorted[i - 1] : null, next: i < sorted.length - 1 ? sorted[i + 1] : null };
+      // Operator report 2026-05-26: cuando whisperX devuelve líneas que se
+      // solapan en el tiempo (overlap > OVERLAP_EPSILON_S, ej. coros o
+      // dobles voces), el Gantt las renderiza en lanes paralelas. El
+      // pre-fix usaba el orden global por `.start` para buscar prev/next,
+      // y el clamp `lo = prev.end + gapS` / `hi = next.start - gapS`
+      // terminaba bloqueando el drag contra un segmento de OTRA lane —
+      // aunque visualmente esa lane vive al costado, no debajo. Resultado
+      // observado: end edge clampeado a `next.start - gapS` que era
+      // MENOR que `origEnd`, comiteando una "extensión" que en realidad
+      // era una contracción de 50ms. Indistinguible visualmente de un
+      // "snap back to original" — el operador soltaba y nada parecía
+      // haber cambiado.
+      //
+      // Fix: filtrar por mismo lane antes de buscar prev/next. Las lanes
+      // paralelas dejan de ser blockers. Las líneas back-to-back en el
+      // MISMO lane siguen clampeadas (regresión cubierta por test).
+      const myLane = laneOfId.get(id);
+      if (myLane === undefined) return { prev: null, next: null };
+      const sameLane = [...segments]
+        .filter((s) => laneOfId.get(s._id) === myLane)
+        .sort((a, b) => a.start - b.start);
+      const i = sameLane.findIndex((s) => s._id === id);
+      return {
+        prev: i > 0 ? sameLane[i - 1] : null,
+        next: i >= 0 && i < sameLane.length - 1 ? sameLane[i + 1] : null,
+      };
     },
-    [segments]
+    [segments, laneOfId]
   );
 
   // clientY → time. laneRef is the inner lane content (full laneHeight); its
