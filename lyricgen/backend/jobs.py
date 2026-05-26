@@ -476,15 +476,45 @@ def get_all_jobs(
 
 
 _TERMINAL_STATUSES = ("done", "error", "rejected", "validation_failed")
+# Sub-partition of terminal statuses by outcome. The pipeline writes
+# done/pending_review only after deliverables actually land in R2; once
+# that ground truth is in the row, NO failure-shaped status ever
+# downgrades it. This is the system-wide answer to the test case "callback
+# does not clobber terminal states" — any late-firing error path (RQ
+# failure callback that races a successful commit, reaper that races a
+# completing worker, edit failure that ran after the worker recovered)
+# now bounces off this guard inside update_job instead of having to
+# re-check the row in every call site.
+_SUCCESS_TERMINAL_STATUSES = ("done", "pending_review")
+_FAILURE_TARGET_STATUSES = (
+    "error", "rejected", "validation_failed", "transcription_failed",
+    "bg_preview_failed",
+)
 
 
 def update_job(job_id: str, **kwargs) -> None:
     """Update fields on an existing job. Creates its own DB session for thread safety.
 
-    A status update that targets a non-terminal state is REFUSED for jobs
-    already in a terminal state. This guards against:
-      - A stale worker thread flushing progress=55 / status="processing"
-        after a reaper marked the job error → resurrects a closed job.
+    A status update that targets a non-terminal state is IGNORED for jobs
+    already in a terminal state — but the OTHER fields in the same kwargs
+    are still applied. Pre-audit 2026-05-26 the whole call was dropped,
+    which silently lost data on the race:
+
+      T0  reaper marks status="error" (transcription took >120 min)
+      T1  worker actually finishes 30 s later and calls
+          update_job(status="transcribed_pending",
+                     segments_json=[...],
+                     current_step="editing")
+      T2  guard sees row.status="error" + target non-terminal → early return
+          → segments_json dropped → operator retries → Whisper runs again
+          from scratch, $0.006 + 15 min wasted.
+
+    Now we only strip the status key (and the dependent current_step /
+    progress when status was the trigger) and keep persisting the rest.
+
+    This guards against:
+      - A stale worker thread flushing status="processing" after a reaper
+        marked the job error → resurrects a closed job.
       - Two workers picking the same job and both calling
         update_job(status="processing") → double-processing.
 
@@ -515,13 +545,41 @@ def update_job(job_id: str, **kwargs) -> None:
         if not job:
             return
 
-        # Refuse non-terminal mutations of terminal jobs.
+        # Terminal-state guard (split form): drop only the status field
+        # (and current_step, which is the user-facing description of that
+        # status) so the rest of the payload — segments_json, files,
+        # render_params, etc. — still lands. See docstring for the lost-
+        # transcription incident this fixes.
         if (
             job.status in _TERMINAL_STATUSES
             and not target_is_terminal
             and target_status is not None
         ):
-            return
+            kwargs.pop("status", None)
+            kwargs.pop("current_step", None)
+            # Don't touch progress either — it's tied to the status flow.
+            kwargs.pop("progress", None)
+            if not kwargs:
+                return
+
+        # Success-vs-failure guard: never let a failure-shaped status
+        # downgrade a row that's already in a success-shaped terminal.
+        # Concrete race this protects: RQ pipeline_failure_callback fires
+        # 200 ms after the worker commits status="done"; without this
+        # guard, the callback's status="error" would clobber the success.
+        # The reaper has its own re-fetch-with-lock guard for the same
+        # reason; this is the analogous defense for the failure callbacks
+        # that route through update_job.
+        if (
+            target_status in _FAILURE_TARGET_STATUSES
+            and job.status in _SUCCESS_TERMINAL_STATUSES
+        ):
+            kwargs.pop("status", None)
+            kwargs.pop("error", None)
+            kwargs.pop("current_step", None)
+            kwargs.pop("completed_at", None)
+            if not kwargs:
+                return
 
         for key, value in kwargs.items():
             if key == "files":
@@ -547,8 +605,18 @@ def update_job(job_id: str, **kwargs) -> None:
         if "progress" in kwargs:
             job.last_progress_at = datetime.now(timezone.utc)
 
-        # Mark completed_at when pipeline finishes (done or pending_review)
-        if kwargs.get("status") in ("done", "pending_review") and not job.completed_at:
+        # Mark completed_at on any terminal transition (done, pending_review,
+        # error, rejected, validation_failed). Used by the frontend to show
+        # the "took X minutes" duration; also matters for forensics — without
+        # it, an error job has no end timestamp and you can't tell whether
+        # it died in 5 s or 45 min. Pre-2026-05-26 only done/pending_review
+        # set this; the reaper and pipeline_failure_callback set it inline
+        # in their direct UPDATEs, but the migration to update_job needs
+        # the helper to do it consistently.
+        if (
+            kwargs.get("status") in ("done", "pending_review", "error", "rejected", "validation_failed")
+            and not job.completed_at
+        ):
             job.completed_at = datetime.now(timezone.utc)
 
         db.commit()
