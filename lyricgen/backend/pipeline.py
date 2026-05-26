@@ -67,15 +67,44 @@ _DELIVERABLE_FILENAMES = {
 }
 
 
+# Deliverables whose absence from R2 means the user can't actually use the
+# job — if any of these fail to upload, the job has to surface an error
+# instead of pretending to be done. umg_master/umg_short are lazy-generated
+# on first /download, so their absence from R2 here is fine.
+_CRITICAL_DELIVERABLES = ("video", "short", "thumbnail")
+
+
 def _upload_deliverables_to_r2(job_id: str, job_dir: str, files: dict) -> dict:
     """Upload each produced deliverable to R2 and delete the local copy on
     success. Returns {file_type: s3_key}.
 
-    Non-fatal on upload errors — the local file stays and the job still
-    reports done. Failed uploads will be retried by a later cleanup pass.
+    Audit 2026-05-26 (systemic-jobs-pipeline) — three behaviors changed:
+
+    1. **Per-file heartbeat.** A multi-GB upload (UMG ProRes 5GB on slow
+       upstream) can run 10-20 min without emitting any update_job, while
+       the reaper's `find_stalled_renders` watchdog fires at 20 min. We
+       now `heartbeat(job_id)` before each upload so the reaper sees the
+       worker alive.
+
+    2. **Atomic merge of s3_keys.** Caller used to do
+       `update_job(s3_keys=this_dict)`, which REPLACES the JSONB column.
+       That race-loses against `prores.prewarm_prores` writing
+       `s3_keys[umg_master]=key` concurrently (incident jobs.py:670-675).
+       We now write each key via `merge_s3_keys` inside this function as
+       it succeeds — caller no longer needs to do the s3_keys update.
+
+    3. **Critical-deliverable failure raises.** Old behavior was "log and
+       continue", so the job ended up `done` with `s3_keys={}` and
+       `/download/{id}/video` returning 404. Now if a critical deliverable
+       (video / short / thumbnail) fails to upload, we raise — the
+       pipeline's outer except catches it and marks the job `error` with
+       a clear message, instead of pretending success and 404-ing later.
+       Non-critical (umg_master, umg_short) keep the old "log and skip"
+       behavior because they're lazy-regenerated on first /download.
     """
     if not storage.is_enabled():
         return {}
+    from jobs import merge_s3_keys, heartbeat
     # get_job() requires a SQLAlchemy session, but this function runs in the
     # worker context with no request-scoped session available. Create one
     # here just to look up the tenant_id, then close it. (We could pass
@@ -89,17 +118,43 @@ def _upload_deliverables_to_r2(job_id: str, job_dir: str, files: dict) -> dict:
         _db.close()
     tenant_id = (job or {}).get("tenant_id", "default")
     out: dict = {}
+    failed_critical: list[str] = []
     for file_type, _url in files.items():
-        key_name = _DELIVERABLE_FILENAMES.get(file_type.replace("_url", ""))
+        ftype_short = file_type.replace("_url", "")
+        key_name = _DELIVERABLE_FILENAMES.get(ftype_short)
         if not key_name:
             continue
         local = os.path.join(job_dir, key_name)
         if not os.path.exists(local):
+            # Missing local file is a soft failure for non-critical
+            # deliverables (e.g. UMG profile didn't request a short).
+            # For critical it means an upstream step misfired — surface
+            # it as a critical failure so the job errors out instead of
+            # advertising a 404 download.
+            if ftype_short in _CRITICAL_DELIVERABLES:
+                failed_critical.append(f"{ftype_short} (local file missing)")
             continue
+        # Heartbeat before the upload — multi-GB uploads can spend tens of
+        # minutes on the wire without any other update_job. Without this,
+        # find_stalled_renders (20 min last_progress_at threshold) reaps
+        # the job mid-upload and the operator sees "error" on a video that
+        # was actually finishing upload.
+        try:
+            heartbeat(job_id)
+        except Exception:
+            pass  # heartbeat is best-effort; never block an upload
         try:
             key = storage.upload_master(local, tenant_id, job_id, key_name)
             if key:
-                out[file_type.replace("_url", "")] = key
+                out[ftype_short] = key
+                # Atomic merge into job.s3_keys so a concurrent
+                # prores.prewarm_prores writing umg_master/umg_short
+                # doesn't get clobbered when the caller eventually
+                # snapshots files. merge_s3_keys takes FOR UPDATE.
+                try:
+                    merge_s3_keys(job_id, ftype_short, key)
+                except Exception as e:
+                    logger.warning("[R2] merge_s3_keys failed for %s: %s", ftype_short, e)
                 # Upload confirmed — delete the local copy so the disk doesn't
                 # fill up (a HD ProRes master is ~5 GB, a 240 GB NVMe fills
                 # after ~50 UMG deliveries).
@@ -107,8 +162,22 @@ def _upload_deliverables_to_r2(job_id: str, job_dir: str, files: dict) -> dict:
                     os.unlink(local)
                 except OSError as e:
                     logger.error("[R2] Could not remove local %s: %s", local, e)
+            else:
+                # upload_master returned None without raising — treat as failure.
+                logger.error("[R2] Upload returned no key for %s", key_name)
+                if ftype_short in _CRITICAL_DELIVERABLES:
+                    failed_critical.append(ftype_short)
         except Exception as e:
             logger.error("[R2] Upload failed for %s: %s", key_name, e)
+            if ftype_short in _CRITICAL_DELIVERABLES:
+                failed_critical.append(f"{ftype_short} ({type(e).__name__})")
+    if failed_critical:
+        # Bubble up so the pipeline's outer except marks the job `error`
+        # instead of leaving it `done` with a half-uploaded set of files.
+        raise RuntimeError(
+            "R2 upload failed for critical deliverables: "
+            + ", ".join(failed_critical)
+        )
     return out
 
 
@@ -174,6 +243,42 @@ def _snapshot_previous_deliverables(
         "archived_at": datetime.now(timezone.utc).isoformat(),
         "keys": archived,
     }
+
+
+def _call_with_timeout(fn, timeout_s: float, label: str = ""):
+    """Run `fn()` in a worker thread and raise `TimeoutError` if it doesn't
+    return within `timeout_s` seconds.
+
+    Audit 2026-05-26 (systemic-jobs-pipeline). The `google-genai` SDK and
+    `google-cloud-aiplatform` Vertex client both default to NO timeout on
+    `generate_content` / `generate_images`. When Vertex degrades, the call
+    hangs the worker thread indefinitely — `find_stalled_renders` (20 min
+    threshold) reaps the job mid-call and the operator sees "the render
+    just got stuck at progress=22".
+
+    Pattern previously inlined in `_fetch_lyrics_via_gemini_search`
+    (pipeline.py:4017-4041). Extracted here so every Gemini/Imagen call
+    can adopt the same defense in one line.
+
+    Note: `concurrent.futures.ThreadPoolExecutor` does NOT actually kill
+    the underlying request on timeout — the network call keeps running
+    in its thread until the SDK eventually unblocks. That's fine for our
+    case: the wrapper unblocks the WORKER (so the pipeline can fall
+    through to whatever fallback the caller has), and the orphan thread
+    dies with the worker on the next WORKER_MAX_JOBS recycle. We trade a
+    small amount of thread leakage for protection against full worker
+    deadlock.
+    """
+    import concurrent.futures as _cf
+    with _cf.ThreadPoolExecutor(max_workers=1) as _ex:
+        try:
+            return _ex.submit(fn).result(timeout=timeout_s)
+        except _cf.TimeoutError as exc:
+            tag = f"[{label}] " if label else ""
+            logger.warning("%sGenAI call exceeded %.0fs timeout — raising", tag, timeout_s)
+            raise TimeoutError(
+                f"{label or 'GenAI'} call exceeded {timeout_s:.0f}s timeout"
+            ) from exc
 
 
 def _ffprobe_duration(path: str) -> float | None:
@@ -950,9 +1055,12 @@ def run_pipeline(job_id: str, mp3_path: str, artist: str, style: str,
         _verify_deliverables(job_dir, files, audio_dur_for_verify)
 
         # Post-render upload to cloud storage. No-op if R2 env not set.
-        s3_keys = _upload_deliverables_to_r2(job_id, job_dir, files)
-        if s3_keys:
-            update_job(job_id, s3_keys=s3_keys)
+        # _upload_deliverables_to_r2 now persists each successful key
+        # atomically via merge_s3_keys (audit 2026-05-26) — caller no
+        # longer needs to do its own update_job(s3_keys=...) because that
+        # would REPLACE any concurrent prores prewarm key. Critical
+        # deliverable failures raise — caught by the outer except below.
+        _upload_deliverables_to_r2(job_id, job_dir, files)
 
         # Drop intermediate files (looped backgrounds, gradient fallbacks).
         # Deliverables are already removed above when R2 was used.
@@ -3417,14 +3525,21 @@ def _polish_segments_text(segments: list[dict], artist: str = "",
     user_content = f"Artist: {artist}\nSong: {song_title}\n\nLines:\n{numbered}"
 
     try:
-        response = client.models.generate_content(
-            model="gemini-2.5-flash",
-            contents=user_content,
-            config=genai.types.GenerateContentConfig(
-                system_instruction=system_prompt,
-                temperature=0.1,
-                max_output_tokens=2000,
+        # Audit 2026-05-26: timeout wrapper. POLISH_TEXT is flag-gated
+        # so impact is limited, but the same hang vector applies — Vertex
+        # latency degrades, worker blocks, find_orphan_polling_jobs reaps.
+        response = _call_with_timeout(
+            lambda: client.models.generate_content(
+                model="gemini-2.5-flash",
+                contents=user_content,
+                config=genai.types.GenerateContentConfig(
+                    system_instruction=system_prompt,
+                    temperature=0.1,
+                    max_output_tokens=2000,
+                ),
             ),
+            timeout_s=45.0,
+            label="POLISH",
         )
         text = (response.text or "").strip()
         # Strip code fences if any
@@ -3822,15 +3937,24 @@ def _gemini_cleanup_lyrics(audio_path: str, lrclib_plain: str,
     import time as _time
     t0 = _time.time()
     try:
-        response = client.models.generate_content(
-            model="gemini-2.5-flash",
-            contents=user_content,
-            config=genai.types.GenerateContentConfig(
-                system_instruction=system_prompt,
-                temperature=0.1,
-                max_output_tokens=8000,
-                thinking_config=genai.types.ThinkingConfig(thinking_budget=0),
+        # Audit 2026-05-26: wrap with _call_with_timeout. Without this, a
+        # Vertex hiccup hangs the worker indefinitely in the transcription
+        # step and the job stays "transcribing" until find_stuck_transcriptions
+        # reaps it 120 min later. timeout_s arg of this function was
+        # previously declared but unused (line 3729).
+        response = _call_with_timeout(
+            lambda: client.models.generate_content(
+                model="gemini-2.5-flash",
+                contents=user_content,
+                config=genai.types.GenerateContentConfig(
+                    system_instruction=system_prompt,
+                    temperature=0.1,
+                    max_output_tokens=8000,
+                    thinking_config=genai.types.ThinkingConfig(thinking_budget=0),
+                ),
             ),
+            timeout_s=float(timeout_s),
+            label="GEMINI-CLEAN",
         )
     except Exception as e:
         logger.warning("[GEMINI-CLEAN] Gemini call failed: %s — using lrclib raw", e)
@@ -5227,25 +5351,34 @@ Hard rules:
                 # sampling distribution so the model leaves the alley basin.
                 _sys_instr = system_prompt + _ANTI_ALLEY_ADDENDUM
                 _temp = 1.0
-            response = client.models.generate_content(
-                model="gemini-2.5-flash",
-                contents=user_content,
-                config=genai.types.GenerateContentConfig(
-                    system_instruction=_sys_instr,
-                    temperature=_temp,
-                    # max_output_tokens=1500 (was 500): the concept+match_lyrics=True
-                    # branch in #152 expanded the system_prompt with 6 worked examples
-                    # and lyrics-anchor instructions. Gemini's output got more verbose
-                    # and started truncating at 500 tokens (prod 2026-05-15), parse
-                    # failed, combinatorial fallback fired 100% of jobs. 1500 covers a
-                    # 120-word prompt + JSON envelope + preamble, ~3× headroom.
-                    max_output_tokens=1500,
-                    # thinking_budget=512: short chain-of-thought to extract the
-                    # visual subject from lyrics before committing to a scene.
-                    # Without it Gemini skipped STEP 0 and fell to the genre
-                    # fallback (UMG 2026-05-14: 80% rock → callejón).
-                    thinking_config=genai.types.ThinkingConfig(thinking_budget=512),
+            # Audit 2026-05-26: wrap with _call_with_timeout. This step runs
+            # on EVERY job that uses Veo/Imagen — a Vertex hang here means the
+            # whole worker pool deadlocks at progress=22, current_step=background.
+            # 60s is generous (p99 ~15s) but bounds the worst case so the
+            # caller can fall through to the genre-based fallback below.
+            response = _call_with_timeout(
+                lambda: client.models.generate_content(
+                    model="gemini-2.5-flash",
+                    contents=user_content,
+                    config=genai.types.GenerateContentConfig(
+                        system_instruction=_sys_instr,
+                        temperature=_temp,
+                        # max_output_tokens=1500 (was 500): the concept+match_lyrics=True
+                        # branch in #152 expanded the system_prompt with 6 worked examples
+                        # and lyrics-anchor instructions. Gemini's output got more verbose
+                        # and started truncating at 500 tokens (prod 2026-05-15), parse
+                        # failed, combinatorial fallback fired 100% of jobs. 1500 covers a
+                        # 120-word prompt + JSON envelope + preamble, ~3× headroom.
+                        max_output_tokens=1500,
+                        # thinking_budget=512: short chain-of-thought to extract the
+                        # visual subject from lyrics before committing to a scene.
+                        # Without it Gemini skipped STEP 0 and fell to the genre
+                        # fallback (UMG 2026-05-14: 80% rock → callejón).
+                        thinking_config=genai.types.ThinkingConfig(thinking_budget=512),
+                    ),
                 ),
+                timeout_s=60.0,
+                label="BG-ANALYZE",
             )
             text = response.text.strip()
             logger.info("[BG] Gemini raw attempt %s/%s (%s chars): %s",
@@ -6010,13 +6143,24 @@ def _generate_imagen_image(prompt: str, output_path: str, max_retries: int = 5,
     for attempt in range(max_retries):
         try:
             logger.info("[BG] %s: generating image (attempt %s)...", chosen_model, attempt + 1)
-            response = client.models.generate_images(
-                model=chosen_model,
-                prompt=safe_prompt,
-                config=genai.types.GenerateImagesConfig(
-                    number_of_images=1,
-                    aspect_ratio="16:9",
+            # Audit 2026-05-26: timeout wrapper. Imagen-4 p99 is ~12s; 90s
+            # is 7× headroom but bounds the worst case. Without this, a
+            # Vertex hang during background generation would block the
+            # worker for ages — find_orphan_polling_jobs catches it at 10
+            # min but only via AIProvenance, which Imagen records only
+            # after the call returns. Better to fail fast and let the
+            # outer retry loop reschedule.
+            response = _call_with_timeout(
+                lambda: client.models.generate_images(
+                    model=chosen_model,
+                    prompt=safe_prompt,
+                    config=genai.types.GenerateImagesConfig(
+                        number_of_images=1,
+                        aspect_ratio="16:9",
+                    ),
                 ),
+                timeout_s=90.0,
+                label="IMAGEN",
             )
             break
         except ClientError as e:
@@ -6117,24 +6261,32 @@ def _score_video_relevance(video_path: str, prompt: str) -> int:
         with open(tmp_frame, "rb") as f:
             image_bytes = f.read()
 
-        response = client.models.generate_content(
-            model="gemini-2.5-flash",
-            contents=[
-                genai.types.Part.from_bytes(data=image_bytes, mime_type="image/jpeg"),
-                (
-                    f"This is a frame from an AI-generated background video.\n"
-                    f"Intended scene: \"{prompt}\"\n\n"
-                    f"Score how well the frame matches the intended scene, 1-10.\n"
-                    f"Focus on whether the MAIN SUBJECT is correct "
-                    f"(e.g. if the scene should show a football pitch but shows cars, score 1-2).\n"
-                    f"Respond with ONLY a single integer, nothing else."
+        # Audit 2026-05-26: timeout wrapper. This call runs once per
+        # generated Veo video; a hang here adds to total render latency
+        # but is gated by the same outer except → fall-through to score=8.
+        # 30 s suffices (single-frame Vision call is fast).
+        response = _call_with_timeout(
+            lambda: client.models.generate_content(
+                model="gemini-2.5-flash",
+                contents=[
+                    genai.types.Part.from_bytes(data=image_bytes, mime_type="image/jpeg"),
+                    (
+                        f"This is a frame from an AI-generated background video.\n"
+                        f"Intended scene: \"{prompt}\"\n\n"
+                        f"Score how well the frame matches the intended scene, 1-10.\n"
+                        f"Focus on whether the MAIN SUBJECT is correct "
+                        f"(e.g. if the scene should show a football pitch but shows cars, score 1-2).\n"
+                        f"Respond with ONLY a single integer, nothing else."
+                    ),
+                ],
+                config=genai.types.GenerateContentConfig(
+                    temperature=0.0,
+                    max_output_tokens=5,
+                    thinking_config=genai.types.ThinkingConfig(thinking_budget=0),
                 ),
-            ],
-            config=genai.types.GenerateContentConfig(
-                temperature=0.0,
-                max_output_tokens=5,
-                thinking_config=genai.types.ThinkingConfig(thinking_budget=0),
             ),
+            timeout_s=30.0,
+            label="VIDEO-SCORE",
         )
         import re as _re
         m = _re.search(r'\b(10|[1-9])\b', response.text)
@@ -6889,7 +7041,22 @@ def _prerender_looped_bg(bg_path: str, duration: float, job_dir: str,
         "-an",
         out_path,
     ]
-    result = subprocess.run(cmd, capture_output=True, text=True)
+    # Audit 2026-05-26: timeout=900s. Without it, a corrupted Veo output
+    # or a filter_complex that locks the encoder (palindrome on a
+    # zero-length input has been observed) hung the worker indefinitely.
+    # The fallback branch below already uses run_checked(timeout=900);
+    # mirroring that bound here is the consistent fix. capture_output=True
+    # buffers stderr in memory so we can still report the tail on failure.
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=900)
+    except subprocess.TimeoutExpired:
+        logger.error("[BG] Palindrome loop timed out after 900s — falling back")
+        # Synthesize a "failed" result so we drop into the fallback branch
+        # without duplicating the call.
+        class _Timeout:
+            returncode = 124
+            stderr = "ffmpeg palindrome loop timed out (>900s)"
+        result = _Timeout()
     if result.returncode != 0:
         # Fall back to the simple loop if the palindrome filter graph fails
         # (e.g. clip too short or memory-constrained machines).
@@ -9126,9 +9293,14 @@ def run_edit_pipeline(
                 previous_versions=prior_versions + [snapshot_entry],
             )
 
+        # See run_pipeline's comment above the same call: per-key atomic
+        # persistence happens inside _upload_deliverables_to_r2; we no
+        # longer write s3_keys wholesale (that REPLACED concurrent prewarm
+        # keys). Critical-deliverable failures raise → outer except marks
+        # the edit `error` instead of advertising broken downloads. We still
+        # capture the return value (dict of successfully-uploaded keys)
+        # because the audit log below reports `files_updated` from it.
         s3_keys = _upload_deliverables_to_r2(job_id, job_dir, files)
-        if s3_keys:
-            update_job(job_id, s3_keys=s3_keys)
 
         _cleanup_local_intermediates(job_dir)
 

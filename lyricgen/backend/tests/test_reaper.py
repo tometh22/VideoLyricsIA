@@ -760,7 +760,16 @@ def test_stuck_transcription_cancels_rq_entry_with_prefix(monkeypatch):
 def test_revert_abandoned_edit_cancels_rq_entry(monkeypatch):
     """Edit revert path also cancels the RQ entry — without this, a
     worker that comes back to life after a Railway redeploy would
-    overwrite the user's existing pending_review video bytes on R2."""
+    overwrite the user's existing pending_review video bytes on R2.
+
+    Regression coverage for the audit-2026-05-26 fix: enqueue_edit uses
+    `edit:<job_id>` as the RQ id (queue_jobs.py:694) to avoid colliding
+    with the render job sharing the same Postgres job_id. The revert
+    path MUST cancel using the prefixed form — calling cancel_rq_job
+    with the bare job_id misses the RQ entry, the ScheduledJobRegistry
+    retry timer fires, and the half-finished edit overwrites the good
+    video. This test guards against that regression specifically.
+    """
     import queue_jobs
     from reaper import revert_abandoned_edit
     calls: list[str] = []
@@ -776,9 +785,10 @@ def test_revert_abandoned_edit_cancels_rq_entry(monkeypatch):
         row = db.query(Job).filter(Job.job_id == jid).first()
         revert_abandoned_edit(db, row)
         db.commit()
-        assert jid in calls, (
-            f"cancel_rq_job should have been called with {jid!r} on edit revert, "
-            f"got calls={calls!r}"
+        prefixed = f"edit:{jid}"
+        assert prefixed in calls, (
+            f"cancel_rq_job should be called with {prefixed!r} (with the "
+            f"`edit:` prefix that enqueue_edit uses), got calls={calls!r}"
         )
     finally:
         _cleanup(db)
