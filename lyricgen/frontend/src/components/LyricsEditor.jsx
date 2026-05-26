@@ -1610,6 +1610,18 @@ export default function LyricsEditor({
   const reviewSegCount = edited.reduce((n, s) => n + (s.review ? 1 : 0), 0);
   const showReviewBanner = reviewSegCount >= 3;
 
+  // UX 2026-05-26 (cont.): mismo problema con la warning "● ⚠ 2 líneas" + botón
+  // "Dividir" que aparece cuando el render del video va a wrappar el texto a
+  // 2 renglones. Con líneas tipo "Será por eso que hoy estamos aquí" o
+  // "No hay nadie más que vos y yo" en upper-case + bold (~28 chars), el
+  // wrap se dispara y 28 lineas seguidas con "2 líneas + Dividir" son ruido.
+  // Mismo enfoque: si ≥3 segments hit, banner único arriba + bulk action.
+  const wrap2SegIds = edited
+    .filter((s) => (s.text || "").trim() && linesForSeg(s.text) === 2)
+    .map((s) => s._id);
+  const wrap2Count = wrap2SegIds.length;
+  const showWrap2Banner = wrap2Count >= 3;
+
   const handleScrub = (e) => {
     if (!duration) return;
     const rect = e.currentTarget.getBoundingClientRect();
@@ -2022,6 +2034,40 @@ export default function LyricsEditor({
             {" — "}
             {t("editor.review_banner_hint") || "estas líneas vienen de la letra de referencia. Escuchá la canción y ajustá si alguna no entra en el momento correcto."}
           </p>
+        </div>
+      )}
+
+      {/* UX 2026-05-26: banner agregado cuando ≥ 3 segments tienen wrap a
+          2 renglones en el render del video. Mismo problema visual que el
+          review banner: 28 indicadores apilados "● ⚠ 2 líneas + Dividir"
+          saturan. Banner único + bulk action "Dividir todas". Los casos
+          3+ líneas (más urgentes) siguen mostrándose inline porque son
+          menos comunes y la acción es por línea. */}
+      {showWrap2Banner && (
+        <div className="mb-3 px-3 py-2 rounded-card bg-amber-500/[0.06] ring-1 ring-amber-500/20 flex items-start gap-2.5 animate-fade-in">
+          <svg className="w-4 h-4 text-amber-400 flex-shrink-0 mt-0.5" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
+            <path d="M12 9v4M12 17h.01" />
+            <path d="M10.3 3.9 1.8 18a2 2 0 0 0 1.7 3h17a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0z" />
+          </svg>
+          <div className="flex-1 flex items-center justify-between gap-3">
+            <p className="text-xs text-amber-100 leading-relaxed">
+              <span className="font-semibold">
+                {(t("editor.wrap2_banner_count") || "{n} líneas pasarán a 2 renglones en el video").replace("{n}", wrap2Count)}
+              </span>
+              {" — "}
+              {t("editor.wrap2_banner_hint") || "se ven OK como están, pero podés dividirlas si querés líneas más cortas en el video."}
+            </p>
+            <button
+              type="button"
+              onClick={() => {
+                pushEditHistory();
+                wrap2SegIds.forEach((id) => splitSeg(id));
+              }}
+              className="text-[11px] font-medium px-2.5 py-1 rounded-lg bg-amber-500/15 ring-1 ring-amber-500/30 text-amber-200 hover:bg-amber-500/25 transition-colors whitespace-nowrap shrink-0"
+            >
+              {t("editor.wrap2_banner_split_all") || "Dividir todas"}
+            </button>
+          </div>
         </div>
       )}
 
@@ -2738,11 +2784,16 @@ export default function LyricsEditor({
                         </button>
                       </div>
                     )}
-                    {/* Wrap indicator + split action */}
+                    {/* Wrap indicator + split action. Suprimido per-line
+                        cuando ≥3 segments tienen wrap a 2 líneas — en ese
+                        caso un banner único arriba transmite la info y
+                        ofrece bulk action. Los casos 3+ líneas (más
+                        urgentes) siempre se muestran inline. */}
                     {(() => {
                       if (!(seg.text || "").trim()) return null;
                       const lines = linesForSeg(seg.text);
                       if (lines <= 1) return null;
+                      if (lines === 2 && showWrap2Banner) return null;
                       return (
                         <div className="flex items-center gap-2 mt-1 ml-1">
                           {lines === 2 ? (
