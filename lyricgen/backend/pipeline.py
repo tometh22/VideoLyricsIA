@@ -1,5 +1,6 @@
 """Full processing pipeline: Whisper → Video → Short → Thumbnail."""
 
+import gc
 import hashlib
 import json
 import os
@@ -8739,13 +8740,18 @@ def generate_short(
     final = CompositeVideoClip([bg] + text_layers, size=(1080, 1920))
     final = final.set_audio(short_audio).set_duration(short_dur)
 
+    # 2026-05-26 OOM mitigation: workers SIGKILL'd at progress=75% on
+    # dense-chorus songs (Sin Gamulán). Force gc before x264 encode +
+    # drop threads 8→2 below to cap peak RSS.
+    gc.collect()
+
     out_path = os.path.join(job_dir, "short.mp4")
     final.write_videofile(
         out_path,
         fps=fps,
         codec="libx264",
         audio_codec="aac",
-        threads=8,
+        threads=2,
         preset="veryfast",
         ffmpeg_params=["-movflags", "+faststart"],
         logger=None,
