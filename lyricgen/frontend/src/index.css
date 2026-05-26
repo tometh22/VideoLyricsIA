@@ -181,3 +181,66 @@
   0%, 100% { transform: translateY(0px) translateX(0px); }
   50%       { transform: translateY(-6px) translateX(2px); }
 }
+
+/* LyricsEditor Phase A 2026-05-25 — pulse de transición al row activo.
+   Cuando React monta un nuevo row con data-active="true" (porque
+   activeId cambió), la animación dispara una vez: glow + leve scale
+   para llamar la atención del operador hacia "la línea que suena
+   ahora". Usamos animation con `forwards` o sin loop para que termine
+   en estado normal (el resto de los estilos de active vienen del
+   className condicional, no de este keyframe). */
+@keyframes wlp-active-row-pulse {
+  0% {
+    transform: scale(1);
+    box-shadow: 0 0 0px -8px rgba(109,74,255,0.0);
+  }
+  35% {
+    transform: scale(1.012);
+    box-shadow: 0 0 36px -6px rgba(109,74,255,0.6);
+  }
+  100% {
+    transform: scale(1);
+    box-shadow: 0 0 24px -8px rgba(109,74,255,0.45);
+  }
+}
+.wlp-active-row {
+  animation: wlp-active-row-pulse 0.55s cubic-bezier(.2,.9,.3,1.05);
+}
+
+/* Shimmer recorriendo la barra de transcripción cuando un paso está
+   activo. El paso "Aislando voz" (demucs en Replicate) ahora avanza
+   gradualmente gracias al poll del backend; el shimmer acompaña esa
+   sensación de "está procesando" entre tick y tick. Diagonal de
+   blanco translúcido que cruza la barra cada 1.8s.
+   Loop infinito; se desactiva con `prefers-reduced-motion`. */
+@keyframes progress-shimmer {
+  0%   { transform: translateX(-100%); }
+  100% { transform: translateX(200%); }
+}
+.progress-shimmer::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  background: linear-gradient(
+    90deg,
+    transparent 0%,
+    rgba(255, 255, 255, 0.18) 50%,
+    transparent 100%
+  );
+  animation: progress-shimmer 1.8s linear infinite;
+  pointer-events: none;
+}
+@media (prefers-reduced-motion: reduce) {
+  .progress-shimmer::after { animation: none; opacity: 0; }
+}
+
+/* Cross-fade entre sub-labels rotativos ("Procesando en GPU…",
+   "Separando instrumentos…", etc) durante un paso largo. Mantiene
+   altura fija para que el layout no salte cuando cambia el texto. */
+@keyframes sublabel-fade {
+  0%, 100% { opacity: 0; transform: translateY(2px); }
+  15%, 85% { opacity: 1; transform: translateY(0); }
+}
+.sublabel-fade {
+  animation: sublabel-fade 3.6s ease-in-out;
+}

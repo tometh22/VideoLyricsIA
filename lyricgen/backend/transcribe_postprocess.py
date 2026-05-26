@@ -137,7 +137,21 @@ def is_suspiciously_repetitive(
     similarity: float = 0.7,
     reference_text: str | None = None,
 ) -> bool:
-    """Heuristic: does this batch look like a stuck-phoneme hallucination?
+    """DEPRECATED (2026-05-25) — legacy FA-primary pipeline only.
+
+    The audio-as-truth pipeline (default `AUDIO_AS_TRUTH=1`) does NOT call
+    this helper. It exists to catch FA's cramming-then-reject pattern that
+    only appears when forced_align is the timing source. With whisperX as the
+    truth source + phonetic reconcile, the conditions that triggered the
+    "Le realizan la × 3 rejected, intro chorus lost" failure mode cannot
+    occur — the wordstamps carry their own acoustic anchors.
+
+    Slated for removal once the legacy FA path is deleted (see main.py
+    "LEGACY FA-primary pipeline" banner). Do NOT add new callers.
+
+    Original docstring follows:
+
+    Heuristic: does this batch look like a stuck-phoneme hallucination?
 
     Returns True only when ALL of these hold:
     1. ≥ `min_count` segments in the batch

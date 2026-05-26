@@ -142,6 +142,26 @@ export default function UploadZone({
   // segundo plano. La status map per file viene del App via filesnamekey.
   onAutoTranscribe,
   transcribeStatusByFile = {},
+  // Phase 2 (2026-05-25): render prop para el paso 6 ("Lyrics"). App.jsx
+  // sigue siendo dueño del state machine de review (transcribing,
+  // currentReview, readyToGenerate, empty state) — UploadZone solo le
+  // presta el layout de 3 columnas del wizard. Cuando hasReviewableContent
+  // se prende, el wizard avanza a step 6 automáticamente y renderiza
+  // renderStep6() en la columna derecha. WizardLivePreview persiste
+  // sticky en el centro durante todo el flow.
+  hasReviewableContent = false,
+  renderStep6 = null,
+  // Phase 3 (2026-05-25): segments de la canción en review. Si vienen,
+  // el WizardLivePreview central muestra una línea real de la letra en
+  // vez del título genérico — el operador ve cómo se va a ver el video
+  // con su propia letra durante toda la review.
+  reviewSegments = null,
+  // Phase C 2026-05-25: ref que apunta a {activeLine, activeStart, activeEnd,
+  // currentTime}. Cuando el operador clickea play en LyricsEditor (paso 6),
+  // el ref se actualiza a 60fps con la línea que está sonando. El
+  // WizardLivePreview lo lee con su propio rAF para renderizar word-jump
+  // sincronizado al audio real, sin causar re-renders de UploadZone.
+  playbackTickRef = null,
 }) {
   const { t } = useI18n();
   const inputRef = useRef();
@@ -189,6 +209,12 @@ export default function UploadZone({
     genre: "", concept: "", movementStyle: "", effect: "", font: "",
     // lyricTransition + textMotion: deprecados 2026-05-23 (no se persisten).
     textCase: "upper", fontScale: "1.0", lyricsAnimation: "none", lineTransition: "none", textContrast: "medium",
+    // Lyric color customization 2026-05-25:
+    // - lyricColor: color del texto (no-cantada para karaoke; texto único para
+    //   none/pop/glow/word_reveal).
+    // - lyricSungColor: solo aplica a karaoke = color de la palabra cantada.
+    // Default blanco para no romper jobs viejos sin estos params.
+    lyricColor: "#FFFFFF", lyricSungColor: "#FFFFFF",
     // Escena axis: optional free-text prompt ("Mi prompt"). When non-empty it
     // overrides genre/concept/lyrics. bgVerbatim TRUE by default = use the
     // operator's text as-is (people expect their prompt used, not rewritten);
@@ -249,21 +275,55 @@ export default function UploadZone({
     // prompt: leave inspired as-is; the textarea below drives it.
   };
   // Sample lyric for the live preview: first file's title, else a placeholder.
-  const _previewLyric = (files[0]?.songTitle || files[0]?.title || "").trim();
+  // Phase 3 (2026-05-25): si estamos en review (reviewSegments presente),
+  // mostrar una línea real de la letra en el preview central — la primera
+  // línea no-vacía. Da contexto visual de la canción específica que el
+  // operador está editando. Sin review, fallback al título genérico.
+  const _reviewFirstLine = (() => {
+    if (!reviewSegments || !Array.isArray(reviewSegments)) return "";
+    for (const s of reviewSegments) {
+      const text = (s?.text || "").trim();
+      if (text) return text;
+    }
+    return "";
+  })();
+  const _previewLyric = _reviewFirstLine || (files[0]?.songTitle || files[0]?.title || "").trim();
 
   // ── Studio Console stepper ─────────────────────────────────────────────
   // 4 steps revealed one at a time (variant A): the left rail navigates,
   // the center stage holds the live preview, the right panel shows only the
   // active step's controls. Step 1 (Subí) gates advancing on the artist name.
+  // WIZARD_STEPS — Phase 1+2 (2026-05-25). Paso 6 "Lyrics" está SIEMPRE
+  // en el stepper pero su interactividad depende de hasReviewableContent
+  // (la prop que App.jsx prende cuando empieza el transcribe o hay
+  // currentReview con segments).
+  // - hasReviewableContent=false → paso 6 con border dashed gris,
+  //   cursor-not-allowed, tooltip "Disponible después de Revisar lyrics".
+  // - hasReviewableContent=true  → paso 6 clickeable; auto-advance del
+  //   wizard a step=6 vía el useEffect de abajo.
   const WIZARD_STEPS = [
     { id: 1, label: t("upload.step_upload") || "Subí" },
     { id: 2, label: t("upload.step_mode") || "Modo" },
     { id: 3, label: t("upload.step_motion") || "Movimiento" },
     { id: 4, label: t("upload.step_animation") || "Animación" },
     { id: 5, label: t("upload.step_deliver") || "Entregá" },
+    { id: 6, label: t("upload.step_lyrics") || "Lyrics" },
   ];
   const [wizardStep, setWizardStep] = useState(1);
-  const goStep = (n) => setWizardStep(Math.max(1, Math.min(WIZARD_STEPS.length, n)));
+  // Step 6 es clickeable solo cuando hay contenido de review activo.
+  // Cuando no hay, el cap es step 5 (los pasos 1-5 son siempre clickables).
+  const _maxInteractiveStep = hasReviewableContent ? 6 : 5;
+  const goStep = (n) => setWizardStep(Math.max(1, Math.min(_maxInteractiveStep, n)));
+  // Auto-advance a step 6 cuando aparece contenido de review. Y bajar a
+  // step 5 si el operador clickea "Volver" y desaparece el contenido.
+  useEffect(() => {
+    if (hasReviewableContent && wizardStep !== 6) {
+      setWizardStep(6);
+    } else if (!hasReviewableContent && wizardStep === 6) {
+      setWizardStep(5);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [hasReviewableContent]);
 
   // Hovering a movement option previews it in the big stage without committing.
   const [hoverMovement, setHoverMovement] = useState(null);
@@ -454,13 +514,19 @@ export default function UploadZone({
   // /movement_samples/<id>.mp4 (Vite serves public/ as static).
   // NOTE: those MP4s are LIBRARY PLACEHOLDERS shipped with the first
   // deploy — Tomi swaps real ones in before UMG sees the feature.
+  // 2026-05-25 (operador UMG): clarificadas las definiciones —
+  // estatico/sutil/estandar/animado son ESCENAS REALES generadas por
+  // Veo (video). Solo "foto-parallax" produce una foto estática IA con
+  // pan lateral. Cada card lleva metadata `kind` (video|image|auto) +
+  // emoji prefix (🎬 vs 🖼) en la descripción para que el operador vea
+  // de un vistazo cuál es video real vs foto IA con paneo.
   const MOVEMENT_STYLES = [
-    { code: "",              label: t("upload.movement_auto") || "Auto",                         sample: null,                              desc: t("upload.movement_auto_desc") || "La IA decide el movimiento según la canción." },
-    { code: "estatico",      label: t("upload.movement_estatico") || "Estático (cámara fija)",   sample: "/movement_samples/estatico.mp4",  desc: t("upload.movement_estatico_desc") || "Cámara fija. Solo se mueve lo que pasa dentro de la escena." },
-    { code: "sutil",         label: t("upload.movement_sutil") || "Sutil (mínimo movimiento)",   sample: "/movement_samples/sutil.mp4",     desc: t("upload.movement_sutil_desc") || "Movimiento mínimo, casi imperceptible. Calmo." },
-    { code: "estandar",      label: t("upload.movement_estandar") || "Estándar (cinematográfico)", sample: "/movement_samples/estandar.mp4", desc: t("upload.movement_estandar_desc") || "Movimiento de cámara cinematográfico (zoom/drift)." },
-    { code: "foto-parallax", label: t("upload.movement_foto_parallax") || "Foto + parallax",     sample: "/movement_samples/foto-parallax.mp4", desc: t("upload.movement_parallax_desc") || "Foto con sensación de profundidad (paneo lento)." },
-    { code: "animado",       label: t("upload.movement_animado") || "Animado (ilustración)",     sample: "/movement_samples/animado.mp4",   desc: t("upload.movement_animado_desc") || "Ilustración 2D estilizada, no fotorrealista." },
+    { code: "",              kind: "auto",  label: t("upload.movement_auto") || "Auto",                                  sample: null,                                  desc: t("upload.movement_auto_desc") || "La IA decide el movimiento según la canción." },
+    { code: "estatico",      kind: "video", label: t("upload.movement_estatico") || "Estático (escena viva)",            sample: "/movement_samples/estatico.mp4",       desc: t("upload.movement_estatico_desc") || "🎬 Escena real con cámara FIJA. Lo que se mueve son los elementos de la escena (gente, olas, nubes, neblina, fuego)." },
+    { code: "sutil",         kind: "video", label: t("upload.movement_sutil") || "Sutil (cámara apenas drift)",          sample: "/movement_samples/sutil.mp4",          desc: t("upload.movement_sutil_desc") || "🎬 Escena real con drift sutil de cámara + motion in-scene. Calmo pero vivo." },
+    { code: "estandar",      kind: "video", label: t("upload.movement_estandar") || "Estándar (cinematográfico)",        sample: "/movement_samples/estandar.mp4",       desc: t("upload.movement_estandar_desc") || "🎬 Escena real con movimiento cinematográfico de cámara (zoom/drift)." },
+    { code: "foto-parallax", kind: "image", label: t("upload.movement_foto_parallax") || "Foto + parallax",              sample: "/movement_samples/foto-parallax.mp4", desc: t("upload.movement_parallax_desc") || "🖼 FOTO estática IA + paneo lento horizontal (NO es video — es imagen con cámara que la recorre)." },
+    { code: "animado",       kind: "video", label: t("upload.movement_animado") || "Animado (ilustración)",              sample: "/movement_samples/animado.mp4",       desc: t("upload.movement_animado_desc") || "🎬 Ilustración 2D estilizada animada, no fotorrealista." },
   ];
 
   // Effect overlay — animated particles composited OVER the background (the
@@ -470,12 +536,17 @@ export default function UploadZone({
   // Backed by pre-rendered alpha-screen loops; preview clips live at
   // /fx_samples/<code>.mp4 (effect composited over a neutral gradient).
   const EFFECTS = [
-    { code: "",      label: t("upload.effect_none") || "Ninguno",   sample: null,                   desc: t("upload.effect_none_desc") || "Fondo limpio, sin efecto." },
-    { code: "snow",  label: t("upload.effect_snow") || "Nieve",     sample: "/fx_samples/snow.mp4",  desc: t("upload.effect_snow_desc") || "Copos cayendo. Calmo, invernal." },
-    { code: "rain",  label: t("upload.effect_rain") || "Lluvia",    sample: "/fx_samples/rain.mp4",  desc: t("upload.effect_rain_desc") || "Gotas finas sobre la escena." },
-    { code: "stars", label: t("upload.effect_stars") || "Estrellas", sample: "/fx_samples/stars.mp4", desc: t("upload.effect_stars_desc") || "Partículas que titilan. Nocturno." },
-    { code: "bokeh", label: t("upload.effect_bokeh") || "Bokeh",    sample: "/fx_samples/bokeh.mp4", desc: t("upload.effect_bokeh_desc") || "Luces desenfocadas flotando." },
-    { code: "light", label: t("upload.effect_light") || "Luz",      sample: "/fx_samples/light.mp4", desc: t("upload.effect_light_desc") || "Destellos suaves. Atardecer, glow." },
+    { code: "",       label: t("upload.effect_none") || "Ninguno",     sample: null,                     desc: t("upload.effect_none_desc") || "Fondo limpio, sin efecto." },
+    { code: "snow",   label: t("upload.effect_snow") || "Nieve",       sample: "/fx_samples/snow.mp4",   desc: t("upload.effect_snow_desc") || "Copos cayendo. Calmo, invernal." },
+    { code: "rain",   label: t("upload.effect_rain") || "Lluvia",      sample: "/fx_samples/rain.mp4",   desc: t("upload.effect_rain_desc") || "Gotas finas sobre la escena." },
+    { code: "stars",  label: t("upload.effect_stars") || "Estrellas",  sample: "/fx_samples/stars.mp4",  desc: t("upload.effect_stars_desc") || "Partículas que titilan. Nocturno." },
+    { code: "bokeh",  label: t("upload.effect_bokeh") || "Bokeh",      sample: "/fx_samples/bokeh.mp4",  desc: t("upload.effect_bokeh_desc") || "Luces desenfocadas flotando." },
+    { code: "light",  label: t("upload.effect_light") || "Luz",        sample: "/fx_samples/light.mp4",  desc: t("upload.effect_light_desc") || "Destellos suaves. Atardecer, glow." },
+    // 2026-05-25 UMG: cubre el estilo de los refs Boza / Yatra Cristina /
+    // A los cuatro vientos — líneas brillantes ondulantes sobre el fondo.
+    // Naming "Aurora" (más vendedor que "firuletes"): evocador, cinema,
+    // lee igual en es/en/pt.
+    { code: "aurora", label: t("upload.effect_aurora") || "Aurora",    sample: "/fx_samples/aurora.mp4", desc: t("upload.effect_aurora_desc") || "Líneas de luz ondulantes que cruzan el cielo. Mágico, cinematográfico." },
   ];
 
   // Lyrics-animation templates. These are rendered as libass override tags in
@@ -664,6 +735,21 @@ export default function UploadZone({
   const updateField = (idx, field, value) => {
     onFiles((prev) =>
       prev.map((entry, i) => (i === idx ? { ...entry, [field]: value } : entry))
+    );
+  };
+
+  // U11 UX (2026-05-25): el parser de filename a veces invierte artist↔title.
+  // El backend U11 lo resuelve con DB lookup de known-artists, pero el primer
+  // upload del tenant (cache vacío) cae a la heurística histórica. Botón
+  // de "intercambiar" deja al operador corregir en 1 click sin volver a
+  // tipear ambos campos.
+  const swapArtistTitle = (idx) => {
+    onFiles((prev) =>
+      prev.map((entry, i) =>
+        i === idx
+          ? { ...entry, artist: entry.songTitle || "", songTitle: entry.artist || "" }
+          : entry
+      )
     );
   };
 
@@ -1182,36 +1268,70 @@ export default function UploadZone({
               </button>
             </div>
 
-            {/* Core fields */}
-            <div className="space-y-2">
-              <input
-                type="text"
-                value={entry.artist}
-                onChange={(e) => updateField(i, "artist", e.target.value)}
-                placeholder={t("upload.artist") + " *"}
-                required
-                className={`w-full px-3 py-1.5 rounded-lg bg-surface-1 border
-                  focus:outline-none text-sm text-white placeholder-gray-500 transition-all
-                  ${entry.artist.trim() ? "border-white/[0.06] focus:border-brand/50" : "border-amber-500/40 focus:border-amber-400"}`}
-              />
-              {!entry.artist.trim() && (
-                <p className="text-[11px] text-amber-400/80">
-                  {t("upload.artist_required") || "Nombre del artista es requerido"}
-                </p>
-              )}
-              <input
-                type="text"
-                value={entry.songTitle || ""}
-                onChange={(e) => updateField(i, "songTitle", e.target.value)}
-                placeholder={t("upload.song_title") || "Nombre de la canción"}
-                className="w-full px-3 py-1.5 rounded-lg bg-surface-1 border border-white/[0.06]
-                  focus:border-brand/50 focus:outline-none text-sm text-white placeholder-gray-500 transition-all"
-              />
-              {!(entry.songTitle || "").trim() && (
-                <p className="text-[11px] text-gray-600">
-                  {t("upload.song_title_hint") || "Si lo dejás vacío, lo inferimos del nombre del archivo"}
-                </p>
-              )}
+            {/* Core fields — U11 UX (2026-05-25):
+                 - Labels SIEMPRE visibles arriba del input para que el
+                   operador NO confunda artist vs título cuando el parser
+                   auto-completa.
+                 - Botón "↔ Intercambiar" cuando AMBOS campos están filleados
+                   (la situación típica del autocomplete) para corregir
+                   filenames invertidos ("Title - Artist") en 1 click. */}
+            <div className="space-y-2.5">
+              {/* Artist row */}
+              <div>
+                <label className="flex items-center justify-between gap-2 mb-1">
+                  <span className="text-[11px] uppercase tracking-wide font-medium text-brand/80">
+                    {t("upload.artist") || "Artista"}
+                    <span className="text-amber-400 ml-0.5">*</span>
+                  </span>
+                  {entry.artist.trim() && (entry.songTitle || "").trim() && (
+                    <button
+                      type="button"
+                      onClick={() => swapArtistTitle(i)}
+                      title={t("upload.swap_hint") || "¿Quedó al revés? Intercambia artista y título."}
+                      className="text-[10px] uppercase tracking-wide text-gray-400 hover:text-brand transition-colors flex items-center gap-1 px-1.5 py-0.5 rounded hover:bg-white/[0.04]"
+                    >
+                      <svg className="w-3 h-3" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
+                        <path strokeLinecap="round" strokeLinejoin="round" d="M7 16V4m0 0L3 8m4-4l4 4m6 0v12m0 0l4-4m-4 4l-4-4" />
+                      </svg>
+                      {t("upload.swap") || "Intercambiar"}
+                    </button>
+                  )}
+                </label>
+                <input
+                  type="text"
+                  value={entry.artist}
+                  onChange={(e) => updateField(i, "artist", e.target.value)}
+                  placeholder={t("upload.artist_placeholder") || "Ej: Viejas Locas"}
+                  required
+                  className={`w-full px-3 py-1.5 rounded-lg bg-surface-1 border
+                    focus:outline-none text-sm text-white placeholder-gray-500 transition-all
+                    ${entry.artist.trim() ? "border-white/[0.06] focus:border-brand/50" : "border-amber-500/40 focus:border-amber-400"}`}
+                />
+                {!entry.artist.trim() && (
+                  <p className="text-[11px] text-amber-400/80 mt-1">
+                    {t("upload.artist_required") || "Nombre del artista es requerido"}
+                  </p>
+                )}
+              </div>
+              {/* Title row */}
+              <div>
+                <label className="block text-[11px] uppercase tracking-wide font-medium text-gray-400 mb-1">
+                  {t("upload.song_title") || "Título de la canción"}
+                </label>
+                <input
+                  type="text"
+                  value={entry.songTitle || ""}
+                  onChange={(e) => updateField(i, "songTitle", e.target.value)}
+                  placeholder={t("upload.song_title_placeholder") || "Ej: Legalícenla"}
+                  className="w-full px-3 py-1.5 rounded-lg bg-surface-1 border border-white/[0.06]
+                    focus:border-brand/50 focus:outline-none text-sm text-white placeholder-gray-500 transition-all"
+                />
+                {!(entry.songTitle || "").trim() && (
+                  <p className="text-[11px] text-gray-600 mt-1">
+                    {t("upload.song_title_hint") || "Si lo dejás vacío, lo inferimos del nombre del archivo"}
+                  </p>
+                )}
+              </div>
               {/* Language pills. Default 'es' is highlighted on file
                   load — operator can click another to override, or
                   click 'auto' to let Whisper detect (not recommended
@@ -1709,23 +1829,40 @@ export default function UploadZone({
       ) : (
       <div className="flex flex-col lg:grid lg:grid-cols-[190px_minmax(0,1fr)_minmax(400px,460px)] gap-6 items-start">
 
-        {/* LEFT — step rail (vertical on desktop, horizontal pills on mobile) */}
+        {/* LEFT — step rail (vertical on desktop, horizontal pills on mobile).
+            Paso 6 "Lyrics" se ve siempre; está deshabilitado hasta que
+            haya contenido reviewable (hasReviewableContent prop). Cuando
+            se activa, el useEffect de arriba auto-avanza el wizard a
+            step 6 y permite navegar libremente entre 4↔6 (operador
+            cambia font/animation en paso 4, vuelve a paso 6 a aprobar). */}
         <nav className="flex lg:flex-col gap-1.5 lg:gap-1 overflow-x-auto lg:overflow-visible lg:sticky lg:top-4 w-full lg:w-auto order-first">
           {WIZARD_STEPS.map((s) => {
-            const active = wizardStep === s.id;
-            const done = wizardStep > s.id;
+            const isLyrics = s.id === 6;
+            const disabled = isLyrics && !hasReviewableContent;
+            const active = !disabled && wizardStep === s.id;
+            const done = !disabled && wizardStep > s.id;
             return (
               <button
                 key={s.id}
                 type="button"
-                onClick={() => goStep(s.id)}
+                onClick={() => { if (!disabled) goStep(s.id); }}
+                disabled={disabled}
+                aria-disabled={disabled}
+                title={disabled
+                  ? (t("upload.step_lyrics_hint") || "Disponible después de \"Revisar lyrics\"")
+                  : undefined}
                 className={`flex items-center gap-2.5 px-3 py-2.5 rounded-xl text-[12.5px] font-medium whitespace-nowrap transition-all text-left shrink-0 ${
-                  active ? "bg-brand/[0.12] text-white ring-1 ring-brand/35"
-                         : "text-gray-400 hover:text-white hover:bg-white/[0.04]"
+                  disabled
+                    ? "text-gray-600 cursor-not-allowed opacity-50"
+                    : active ? "bg-brand/[0.12] text-white ring-1 ring-brand/35"
+                             : "text-gray-400 hover:text-white hover:bg-white/[0.04]"
                 }`}
               >
                 <span className={`w-6 h-6 rounded-full grid place-items-center text-[11px] font-bold shrink-0 ${
-                  active ? "bg-brand text-white" : done ? "bg-accent/20 text-accent" : "bg-surface-3 text-gray-400"
+                  disabled ? "bg-surface-3/50 text-gray-600 border border-dashed border-gray-600/40"
+                           : active ? "bg-brand text-white"
+                                    : done ? "bg-accent/20 text-accent"
+                                           : "bg-surface-3 text-gray-400"
                 }`}>{done ? "✓" : s.id}</span>
                 {s.label}
               </button>
@@ -1743,9 +1880,17 @@ export default function UploadZone({
               effect={hoverEffect ?? batchDefaults.effect}
               lyricsAnimation={hoverAnimation ?? batchDefaults.lyricsAnimation}
               lineTransition={hoverTransition ?? batchDefaults.lineTransition}
+              lyricColor={batchDefaults.lyricColor || "#FFFFFF"}
+              lyricSungColor={batchDefaults.lyricSungColor || "#FFFFFF"}
               mode={sceneMode}
               lyric={_previewLyric}
               clipSrc={(MOVEMENT_STYLES.find((m) => m.code === (hoverMovement ?? batchDefaults.movementStyle))?.sample) || "/movement_samples/estandar.mp4"}
+              /* Phase C 2026-05-25: el ref de playback tick permite al
+                 preview leer la línea activa + currentTime para hacer
+                 word-jump real cuando el operador está reproduciendo el
+                 audio en la review (step 6). Sin el ref, el preview cae
+                 al modo legacy (lyric loop con `_previewLyric`). */
+              playbackTickRef={playbackTickRef}
             />
           ) : (
             <div className="aspect-video rounded-2xl ring-1 ring-white/[0.08] bg-surface-2/50 grid place-items-center text-gray-500 text-[13px]">
@@ -1992,6 +2137,49 @@ export default function UploadZone({
                 🎤 {t("upload.anim_word_note") || "Funcionan en toda canción — el tiempo por palabra se calcula automáticamente."}
               </p>
 
+              {/* Lyric text color — color picker(s). El segundo solo aplica a
+                  karaoke (color de la palabra cantada). Para none/pop/glow/
+                  word_reveal alcanza con un solo color para todo el texto. */}
+              <div className="mt-4 pt-3 border-t border-white/[0.05]">
+                <p className="text-[11px] text-gray-300 font-medium">{t("upload.lyric_color_title") || "Color del texto"}</p>
+                <p className="text-[10px] text-gray-600 mt-0.5 mb-2">
+                  {t("upload.lyric_color_desc") || "Color de las letras sobre el video. Por defecto blanco."}
+                </p>
+                <div className="flex items-center gap-3 flex-wrap">
+                  <label className="flex items-center gap-1.5 text-[11px] text-gray-400 cursor-pointer">
+                    <input
+                      type="color"
+                      value={batchDefaults.lyricColor || "#FFFFFF"}
+                      onChange={(e) => updateBatchDefault("lyricColor", e.target.value)}
+                      className="w-7 h-7 rounded cursor-pointer bg-transparent border-0 p-0"
+                      aria-label={t("upload.lyric_color_label") || "Color del texto"}
+                    />
+                    <span>{batchDefaults.lyricsAnimation === "karaoke" ? (t("upload.lyric_color_unsung") || "No cantada") : (t("upload.lyric_color_label") || "Texto")}</span>
+                  </label>
+                  {batchDefaults.lyricsAnimation === "karaoke" && (
+                    <label className="flex items-center gap-1.5 text-[11px] text-gray-400 cursor-pointer">
+                      <input
+                        type="color"
+                        value={batchDefaults.lyricSungColor || "#FFFFFF"}
+                        onChange={(e) => updateBatchDefault("lyricSungColor", e.target.value)}
+                        className="w-7 h-7 rounded cursor-pointer bg-transparent border-0 p-0"
+                        aria-label={t("upload.lyric_sung_color_label") || "Color palabra cantada"}
+                      />
+                      <span>{t("upload.lyric_color_sung") || "Cantada"}</span>
+                    </label>
+                  )}
+                  {(batchDefaults.lyricColor !== "#FFFFFF" || batchDefaults.lyricSungColor !== "#FFFFFF") && (
+                    <button
+                      type="button"
+                      onClick={() => { updateBatchDefault("lyricColor", "#FFFFFF"); updateBatchDefault("lyricSungColor", "#FFFFFF"); }}
+                      className="text-[10px] text-gray-500 hover:text-white underline-offset-2 hover:underline transition-colors"
+                    >
+                      {t("upload.lyric_color_reset") || "Restablecer"}
+                    </button>
+                  )}
+                </div>
+              </div>
+
               {/* Transición entre líneas — eje aparte, compone con la animación */}
               <div className="mt-4 pt-3 border-t border-white/[0.05]">
                 <p className="text-[11px] text-gray-300 font-medium">{t("upload.transition_title") || "Transición entre líneas"}</p>
@@ -2046,12 +2234,29 @@ export default function UploadZone({
               </div>
             </>
           )}
+
+          {/* STEP 6 — Lyrics (Phase 2 2026-05-25): render prop de App.jsx
+              con el contenido completo de review (transcribing / LyricsEditor /
+              readyToGenerate / empty / error). El stepper + WizardLivePreview
+              centrales persisten — el operador sigue viendo el preview con
+              los settings del paso 4 mientras edita las lyrics. */}
+          {wizardStep === 6 && (
+            <div className="min-w-0 w-full">
+              {renderStep6 ? renderStep6() : (
+                <div className="text-center py-12 text-sm text-gray-500">
+                  {t("upload.step_lyrics_hint") || "Disponible después de \"Revisar lyrics\""}
+                </div>
+              )}
+            </div>
+          )}
         </div>
       </div>
       )}
 
-      {/* Sticky bottom CTA bar */}
-      {files.length > 0 && (
+      {/* Sticky bottom CTA bar. Phase 2: oculta en paso 6 porque el contenido
+          de review (LyricsEditor / transcribing / readyToGenerate) trae sus
+          propios CTAs (Aprobar / Volver / Crear N videos). */}
+      {files.length > 0 && wizardStep !== 6 && (
         <div
           className={`fixed bottom-0 left-0 right-0 z-30 bg-surface-1/85 backdrop-blur-xl border-t border-white/[0.06] px-4 md:px-8 py-4 transition-all duration-300 ${sidebarOpen ? "md:left-64" : "md:left-0"}`}
           data-tour="upload-cta-bar"
@@ -2078,7 +2283,22 @@ export default function UploadZone({
               </button>
             )}
 
-            {wizardStep < WIZARD_STEPS.length ? (
+            {/* Phase 2 (2026-05-25): cuando el operador ya está en review
+                (hasReviewableContent=true) y vuelve a un paso anterior para
+                ajustar font/animation/movement, el CTA principal cambia a
+                "Volver a lyrics" para que pueda regresar al editor con 1
+                click, sin re-disparar onStartReview. */}
+            {hasReviewableContent && wizardStep < 6 ? (
+              <button
+                onClick={() => goStep(6)}
+                className="btn-primary h-11 px-6"
+              >
+                {t("upload.back_to_lyrics") || "Volver a lyrics"}
+                <svg className="inline-block ml-1.5 w-4 h-4 -mt-0.5" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
+                  <path d="M5 12h14M12 5l7 7-7 7" />
+                </svg>
+              </button>
+            ) : wizardStep < 5 ? (
               <button
                 onClick={() => goStep(wizardStep + 1)}
                 disabled={wizardStep === 1 && !allHaveArtist}
@@ -2089,7 +2309,7 @@ export default function UploadZone({
                   <path d="M5 12h14M12 5l7 7-7 7" />
                 </svg>
               </button>
-            ) : (
+            ) : wizardStep === 5 ? (
               <>
                 {onGenerateDirect && (
                   <button
@@ -2113,7 +2333,7 @@ export default function UploadZone({
                   </button>
                 )}
               </>
-            )}
+            ) : null}
           </div>
         </div>
       )}

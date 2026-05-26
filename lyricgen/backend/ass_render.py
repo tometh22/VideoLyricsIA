@@ -499,6 +499,38 @@ def _ass_escape(text: str) -> str:
     )
 
 
+def hex_to_ass(hex_color: str, *, fallback: str = "&H00FFFFFF") -> str:
+    """Convert a #RRGGBB hex color to ASS &HAABBGGRR& format.
+
+    ASS uses a big-endian uint32 wrapped in &H...& with byte order
+    AA (alpha, 0=opaque) BB GG RR. The leading 0x00 alpha keeps the
+    color fully opaque (the only mode the rest of the pipeline assumes).
+
+    Malformed input (missing #, wrong length, non-hex chars) returns
+    `fallback` so a stray operator value can't poison the ASS document
+    or cause libass to crash mid-render. Default fallback is opaque
+    white — matches the historical hardcoded PrimaryColour.
+
+    Examples:
+        hex_to_ass("#FF0000")  -> "&H000000FF"  (red)
+        hex_to_ass("#19E0BC")  -> "&H00BCE019"  (karaoke green)
+        hex_to_ass("")         -> "&H00FFFFFF"  (fallback)
+        hex_to_ass("nope")     -> "&H00FFFFFF"  (fallback)
+    """
+    if not isinstance(hex_color, str):
+        return fallback
+    s = hex_color.strip()
+    if not s.startswith("#") or len(s) != 7:
+        return fallback
+    try:
+        r = int(s[1:3], 16)
+        g = int(s[3:5], 16)
+        b = int(s[5:7], 16)
+    except ValueError:
+        return fallback
+    return f"&H00{b:02X}{g:02X}{r:02X}"
+
+
 def build_ass(
     *,
     width: int,
@@ -511,6 +543,13 @@ def build_ass(
     margin_v: int = 0,
     alignment: int = 5,
     bold: bool = True,
+    # Lyric text colors 2026-05-25. Hex #RRGGBB; "" → blanco default.
+    # primary_color: el color principal (palabra cantada en karaoke, texto
+    # único en none/pop/glow/word_reveal). secondary_color: solo karaoke
+    # = palabra no-cantada. Si vienen vacíos, mantenemos los defaults
+    # históricos (blanco/rojo) para no romper jobs sin estos params.
+    primary_color: str = "",
+    secondary_color: str = "",
 ) -> str:
     """Build a complete ASS document for the lyric overlay.
 
@@ -526,11 +565,17 @@ def build_ass(
     alignment     : numpad alignment; 5 = middle-center (legacy default).
     margin_v      : vertical margin in px (0 for centered \\an5).
     """
-    # White fill, black outline, black shadow. BorderStyle 1 = outline +
-    # drop shadow (not opaque box).
+    # Style colors: black outline + black shadow constant; primary +
+    # secondary se resuelven via hex_to_ass con fallback al default
+    # histórico (blanco / rojo). El override per-line de karaoke
+    # (overrides `\2c...\1c...` en _animated_word_payload) usa los mismos
+    # colores cuando vienen seteados; si vienen "", mantiene el grey
+    # hardcoded para no cambiar look de jobs sin colores.
+    primary_ass = hex_to_ass(primary_color, fallback="&H00FFFFFF")
+    secondary_ass = hex_to_ass(secondary_color, fallback="&H000000FF")
     style = (
         "Style: Lyric,{font},{fs},"
-        "&H00FFFFFF,&H000000FF,&H00000000,&H80000000,"  # primary, secondary, outline, back(shadow, 50% alpha)
+        "{primary},{secondary},&H00000000,&H80000000,"  # primary, secondary, outline, back(shadow, 50% alpha)
         "{bold},0,0,0,"      # bold (-1 true / 0 false), italic, underline, strikeout
         "100,100,0,0,"       # scaleX, scaleY, spacing, angle
         "1,{bord},{shad},"   # BorderStyle=1, Outline, Shadow
@@ -538,6 +583,8 @@ def build_ass(
     ).format(
         font=font_name,
         fs=base_fontsize,
+        primary=primary_ass,
+        secondary=secondary_ass,
         bold=-1 if bold else 0,
         bord=_fmt_num(outline),
         shad=_fmt_num(shadow),
@@ -631,9 +678,13 @@ def build_ass(
             overrides += (f"\\bord{_b}\\blur2\\t(0,700,\\blur6\\bord{_b2})"
                           f"\\t(700,1400,\\blur2\\bord{_b})")
         elif anim == "karaoke" and word_anim:
-            # Un-sung = grey (SecondaryColour), sung = white (PrimaryColour);
-            # \kf sweeps the fill. Outline stays black/full throughout.
-            overrides += "\\2c&H00808080&\\1c&H00FFFFFF&"
+            # Un-sung = SecondaryColour, sung = PrimaryColour; \kf sweeps
+            # the fill between them. Outline stays black/full throughout.
+            # Si el operador picó colores, usamos los suyos (override
+            # inline). Sino, default histórico: un-sung grey + sung white.
+            _karaoke_secondary = hex_to_ass(secondary_color, fallback="&H00808080")
+            _karaoke_primary = hex_to_ass(primary_color, fallback="&H00FFFFFF")
+            overrides += f"\\2c{_karaoke_secondary}&\\1c{_karaoke_primary}&"
         elif anim == "word_reveal" and word_anim:
             # The per-word reveal IS the entrance AND exit (words appear and
             # leave one by one), so drop BOTH line fades — they'd fight the

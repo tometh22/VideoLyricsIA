@@ -1430,15 +1430,12 @@ _TITLE_NOISE_SUFFIXES = (
 )
 
 
-# U11 (audit Sprint 2+ 2026-05-25): known-artists cache para resolver
-# ambigüedad del " - " split. La convención "Artist - Title" del código
-# original asumía un orden, pero ~50% de los downloads reales son
-# "Title - Artist" (export de YouTube/Spotify). Sin contexto DB, el
-# parser elegía mal.
-#
-# Cache TTL: 5min. Reset implícito si el proceso reinicia. Per-tenant
-# para no leak entre clientes. Mantenemos el cache chico (top N por
-# tenant) para que el lookup sea O(N) sin pegar la DB cada vez.
+# U11 (audit Sprint 2+ 2026-05-25, re-applied 2026-05-25 post-c6efbf4 revert):
+# known-artists cache para resolver ambigüedad del " - " split. La convención
+# "Artist - Title" del código original asumía un orden, pero ~50% de los
+# downloads reales son "Title - Artist" (export de YouTube/Spotify). Sin
+# contexto DB, el parser elegía mal → metadata invertida a lrclib + Genius
+# → lookups fallaban → fallback a Whisper-only sin synced lyrics.
 import time as _u11_time
 _KNOWN_ARTISTS_CACHE: dict[str, tuple[float, set[str]]] = {}
 _KNOWN_ARTISTS_TTL_S = 300  # 5 min
@@ -1448,25 +1445,16 @@ _KNOWN_ARTISTS_LIMIT = 1000
 def _known_artists_for_tenant(db, tenant_id: str) -> set[str]:
     """Cached lookup of distinct artist strings the tenant ya subió.
     Used by _parse_filename_artist_title to disambiguate 'X - Y' splits.
-    Returns lowercase set para comparación case-insensitive.
-
-    Fix U11-hotpath: la query se ejecuta en un ThreadPoolExecutor con timeout
-    de 2 s para que, si el pool de conexiones DB está saturado (uploads grandes
-    concurrentes), el upload no quede bloqueado esperando adquirir una conexión.
-    Si la query no termina a tiempo se retorna set() vacío y el parser cae
-    a la heurística histórica (comportamiento pre-U11).
-    """
+    Returns lowercase set para comparación case-insensitive."""
     if not tenant_id or db is None:
         return set()
     now = _u11_time.time()
     cached = _KNOWN_ARTISTS_CACHE.get(tenant_id)
     if cached and (now - cached[0]) < _KNOWN_ARTISTS_TTL_S:
         return cached[1]
-    import concurrent.futures as _cf
-    from database import Job
-
-    def _query():
-        return (
+    try:
+        from database import Job
+        rows = (
             db.query(Job.artist)
             .filter(Job.tenant_id == tenant_id)
             .filter(Job.artist.isnot(None))
@@ -1475,15 +1463,9 @@ def _known_artists_for_tenant(db, tenant_id: str) -> set[str]:
             .limit(_KNOWN_ARTISTS_LIMIT)
             .all()
         )
-
-    try:
-        with _cf.ThreadPoolExecutor(max_workers=1) as _ex:
-            rows = _ex.submit(_query).result(timeout=2.0)
         artists = {r[0].strip().lower() for r in rows if r[0] and r[0].strip()}
     except Exception:
-        # Pool saturado, timeout o cualquier error DB → fallback graceful.
-        # No cacheamos para reintentar en la próxima llamada.
-        return set()
+        artists = set()
     _KNOWN_ARTISTS_CACHE[tenant_id] = (now, artists)
     return artists
 
@@ -2368,7 +2350,9 @@ async def upload_url(
 
     artist_form = (body.artist or "").strip()
     title_form = (body.title or "").strip()
-    parsed_artist, parsed_title = _parse_filename_artist_title(body.filename, db=db, tenant_id=current_user.get("tenant_id", ""))
+    parsed_artist, parsed_title = _parse_filename_artist_title(
+        body.filename, db=db, tenant_id=current_user.get("tenant_id", "")
+    )
     job_artist = artist_form or parsed_artist or "Unknown"
     job_song_title = title_form or parsed_title
 
@@ -2432,6 +2416,13 @@ class _MultipartInitReq(BaseModel):
     job_id: str = Field(..., max_length=12)            # DB Job.job_id = VARCHAR(12)
     filename: str = Field(..., max_length=500)
     content_type: str = Field(default="", max_length=200)
+    # 2026-05-25 velocity sprint: si el cliente conoce upfront cuántos
+    # chunks va a subir (ceil(file_size / part_size)), lo manda acá y
+    # el server presigna TODOS los chunks en una sola respuesta. Ahorra
+    # 1 round-trip por chunk (~80-120 ms RTT × N chunks). Backwards
+    # compat: default 0 = comportamiento previo (cliente sigue llamando
+    # /upload-multipart-part-url por chunk).
+    expected_parts: int = Field(default=0, ge=0, le=10_000)
 
 
 @app.post("/upload-multipart-init")
@@ -2444,7 +2435,14 @@ async def upload_multipart_init(
 ):
     """Begin a multipart upload for a job that was created via /upload-url
     with use_multipart=true. Returns the upload_id and key the browser
-    needs to start signing parts."""
+    needs to start signing parts.
+
+    Si el body trae `expected_parts > 0`, el response incluye también
+    `presigned_parts: [{part_number, url}]` con todos los chunks
+    pre-firmados — el cliente puede saltarse las llamadas individuales
+    a /upload-multipart-part-url. Backwards-compatible: sin
+    expected_parts el response es idéntico al previo.
+    """
     _validate_audio_filename_only(body.filename)
     from jobs import get_job_model
     job_row = get_job_model(db, body.job_id)
@@ -2461,12 +2459,19 @@ async def upload_multipart_init(
         # Idempotent: return the existing upload_id so a flaky frontend
         # retry doesn't create two parallel multipart uploads (which would
         # leave one orphaned in R2 storage).
-        return {
+        resp = {
             "upload_id": job_row.multipart_upload_id,
             "key": job_row.input_r2_key,
             "part_size": _MULTIPART_PART_SIZE_BYTES,
             "presign_ttl_s": _PRESIGN_PUT_TTL_S,
         }
+        if body.expected_parts > 0:
+            resp["presigned_parts"] = _batch_presign_parts(
+                job_row.input_r2_key,
+                job_row.multipart_upload_id,
+                body.expected_parts,
+            )
+        return resp
     if not storage.is_enabled():
         raise HTTPException(status_code=503, detail="Object storage not configured.")
     init = storage.multipart_init(
@@ -2487,12 +2492,39 @@ async def upload_multipart_init(
     job_row.input_r2_key = init["key"]
     job_row.multipart_upload_id = init["upload_id"]
     db.commit()
-    return {
+    resp = {
         "upload_id": init["upload_id"],
         "key": init["key"],
         "part_size": _MULTIPART_PART_SIZE_BYTES,
         "presign_ttl_s": _PRESIGN_PUT_TTL_S,
     }
+    if body.expected_parts > 0:
+        resp["presigned_parts"] = _batch_presign_parts(
+            init["key"], init["upload_id"], body.expected_parts,
+        )
+    return resp
+
+
+def _batch_presign_parts(key: str, upload_id: str, expected_parts: int) -> list:
+    """Presign N parts in a single batch. Each entry is
+    `{"part_number": int, "url": str}`. Skipped on per-part failure
+    (returns the entries that succeeded). The frontend falls back to
+    /upload-multipart-part-url for any missing entries.
+
+    Errores individuales no se logean LOUD para no spammear — el path
+    de fallback per-part les sirve al cliente.
+    """
+    out = []
+    for part_number in range(1, expected_parts + 1):
+        try:
+            url = storage.multipart_presign_part(
+                key, upload_id, part_number, expiry_seconds=_PRESIGN_PUT_TTL_S,
+            )
+            if url:
+                out.append({"part_number": part_number, "url": url})
+        except Exception:
+            pass
+    return out
 
 
 class _MultipartPartReq(BaseModel):
@@ -2941,8 +2973,6 @@ async def transcription_status(
             "reference_lyrics": None,
             "coverage_warning": bool(getattr(job_row, "coverage_warning", False)),
             "recovery_source": getattr(job_row, "recovery_source", None),
-            "current_step": getattr(job_row, "current_step", None),
-            "progress": getattr(job_row, "progress", None),
             "error": None,
         }
         if status == "transcribed":
@@ -3246,7 +3276,9 @@ async def upload(
     artist = (artist or "").strip()
     song_title = (song_title or "").strip()
     if not artist or not song_title:
-        parsed_artist, parsed_title = _parse_filename_artist_title(file.filename or "", db=db, tenant_id=current_user.get("tenant_id", ""))
+        parsed_artist, parsed_title = _parse_filename_artist_title(
+            file.filename or "", db=db, tenant_id=current_user.get("tenant_id", "")
+        )
         if not artist:
             artist = parsed_artist
         if not song_title:
@@ -3376,6 +3408,13 @@ async def upload(
         text_motion="none",
         lyrics_animation=lyrics_animation if lyrics_animation in ("none", "karaoke", "word_reveal", "pop", "glow") else "none",
         line_transition=line_transition if line_transition in ("none", "slide_up", "slide_side", "wipe", "dissolve_blur") else "none",
+        # Lyric text colors 2026-05-25. Hex #RRGGBB validado acá; cualquier
+        # otro valor se normaliza a "" (= backend usa blanco default en
+        # build_ass). Para karaoke: lyric_color = palabra no cantada,
+        # lyric_sung_color = palabra cantada. Para otras animaciones:
+        # lyric_color = único color del texto.
+        lyric_color=(lyric_color.strip() if lyric_color and re.match(r"^#[0-9a-fA-F]{6}$", lyric_color.strip() or "") else ""),
+        lyric_sung_color=(lyric_sung_color.strip() if lyric_sung_color and re.match(r"^#[0-9a-fA-F]{6}$", lyric_sung_color.strip() or "") else ""),
         text_contrast=text_contrast if text_contrast in ("subtle", "medium", "strong") else "medium",
         match_lyrics=match_lyrics,
         background_hint=(background_hint.strip() or None),
@@ -3417,7 +3456,9 @@ async def transcribe_endpoint(
 
     artist_form = (artist or "").strip()
     title_form = (title or "").strip()
-    parsed_artist, parsed_title = _parse_filename_artist_title(file.filename or "", db=db, tenant_id=current_user.get("tenant_id", ""))
+    parsed_artist, parsed_title = _parse_filename_artist_title(
+        file.filename or "", db=db, tenant_id=current_user.get("tenant_id", "")
+    )
     job_artist = artist_form or parsed_artist or "Unknown"
     job_song_title = title_form or parsed_title
 
@@ -3527,19 +3568,6 @@ async def _run_transcription_for_job(
                 )
             except Exception as e:
                 logger.warning("[PROGRESS] %s/%d failed: %s", label, pct, e)
-
-        def _start_ticker(label: str, pct_start: int, pct_end: int, interval_s: int = 20):
-            """Start a background task that nudges progress every interval_s while
-            a long Replicate call blocks the thread. Caller must cancel() the task."""
-            async def _ticker():
-                elapsed = 0
-                while True:
-                    await asyncio.sleep(interval_s)
-                    elapsed += interval_s
-                    frac = min(elapsed / 120.0, 0.9)
-                    await _step(label, pct_start + int(frac * (pct_end - pct_start)))
-            return asyncio.create_task(_ticker())
-
         await _step("transcribe.prepare", 5)
 
         # Vocal source separation (demucs) — LAZY. Previously demucs ran at the
@@ -3628,16 +3656,47 @@ async def _run_transcription_for_job(
         async def _get_align_audio() -> str:
             """Return the path that alignment/transcription engines should read.
             Lazy-separates the vocal stem on first call. Falls back to the mix
-            (`tmp_path`) when vocal_sep is disabled / fails."""
+            (`tmp_path`) when vocal_sep is disabled / fails.
+
+            UI smoothness: previously emitted `progress=25` once and then sat
+            silent during the 60-180 s Demucs call on Replicate, so the bar
+            looked frozen. We now pass an `on_progress` callback that maps
+            Demucs' 0..1 fraction (parsed from Replicate logs / time-based
+            fallback) into the 25..48 range and schedules `_step` writes via
+            `asyncio.run_coroutine_threadsafe` so the callback (running in a
+            worker thread, not the event loop) can update job.progress
+            without blocking. We stop at 48 (not 50) so the genuine handoff
+            to the next stage produces a visible jump.
+            """
             nonlocal _vocal_stem
             if not _stem_state["computed"]:
                 _stem_state["computed"] = True
                 await _step("transcribe.isolate_vocals", 25)
-                _sep_ticker = _start_ticker("transcribe.isolate_vocals", 25, 54)
-                try:
-                    stem = await asyncio.to_thread(vocal_sep.separate_vocals, tmp_path)
-                finally:
-                    _sep_ticker.cancel()
+
+                # Bridge the sync callback (called from inside the thread
+                # running call_with_budget) back into our async _step. The
+                # event loop lives on the main thread; we schedule the
+                # coroutine on it via run_coroutine_threadsafe.
+                _loop_for_progress = asyncio.get_running_loop()
+                _last_pct = {"value": 25}
+
+                def _on_demucs_progress(fraction: float) -> None:
+                    pct = 25 + int(round(max(0.0, min(1.0, fraction)) * (48 - 25)))
+                    if pct <= _last_pct["value"]:
+                        return                       # monotonic — never go backwards
+                    _last_pct["value"] = pct
+                    try:
+                        asyncio.run_coroutine_threadsafe(
+                            _step("transcribe.isolate_vocals", pct),
+                            _loop_for_progress,
+                        )
+                    except RuntimeError:
+                        # Loop is closing (request cancelled). Drop quietly.
+                        pass
+
+                stem = await asyncio.to_thread(
+                    vocal_sep.separate_vocals, tmp_path, _on_demucs_progress,
+                )
                 _stem_state["path"] = stem
                 _vocal_stem = stem
                 if stem:
@@ -3803,6 +3862,109 @@ async def _run_transcription_for_job(
             except Exception as e:
                 logger.warning("[LYRICS] gemini fallback raised: %s — continuing without it", e)
 
+        # ─────────────────────────────────────────────────────────────────
+        # WORLD-CLASS audio-as-truth pipeline (default 2026-05-25).
+        #
+        # whisperX provides timing (word-level acoustic anchors), the canonical
+        # lyrics (lrclib/Genius/Gemini, in that fallback order) provide text.
+        # `whisperx_reconcile.reconcile()` merges them: timing from audio,
+        # orthography from reference. With phonetic-aware anchoring (see
+        # forced_align.wordstamps_to_segments, 2026-05-25), even acoustic
+        # mishears like "Le realizan la" → "Legalícenla" anchor to the
+        # correct timestamps so the editor never shows "first lyric @ 0:45"
+        # when the song actually starts at 0:17.
+        #
+        # No forced_align. No is_suspiciously_repetitive guard. No hybrid
+        # rescue. No gap-driven re-fetch. Those scaffolds existed to detect
+        # and compensate for FA's greedy-monotonic cramming of repeated
+        # chorus lines into a single audio region — a class of bug that
+        # cannot happen when the timing source is per-word acoustic anchors.
+        #
+        # `AUDIO_AS_TRUTH=0` reverts to the legacy FA-primary pipeline
+        # below as an emergency rollback. Plan: validate on staging,
+        # delete the legacy branch once stable (~1500 lines come out).
+        # ─────────────────────────────────────────────────────────────────
+        _wc_enabled = (
+            os.environ.get("AUDIO_AS_TRUTH", "1").strip().lower()
+            in ("1", "true", "yes", "on", "y", "t")
+        )
+        if _wc_enabled:
+            import whisperx_transcribe as _wx_mod
+            if _wx_mod.is_enabled():
+                # Canonical text from whichever source brought it in.
+                _canonical = ""
+                if lrc:
+                    _plain = (lrc.get("plain") or "").strip()
+                    _synced = lrc.get("synced")
+                    if _plain:
+                        _canonical = _plain
+                    elif _synced:
+                        import forced_align as _fa_lrc
+                        _canonical = _fa_lrc.lrc_to_plain_text(_synced)
+
+                # whisperX over the vocal stem. `lyrics_hint` biases the
+                # model toward the canonical lexicon (kills the "¡Karol!"
+                # stuck-phoneme and similar mishears in well-known regions).
+                await _step("transcribe.transcribe_word", 50)
+                _aa = await _get_align_audio()
+                try:
+                    _wx_segs = await asyncio.to_thread(
+                        _wx_mod.transcribe_whisperx, _aa, lang,
+                        _canonical or None,
+                    )
+                except Exception as e:
+                    logger.warning("[WC] whisperX raised: %s — falling through to legacy", e)
+                    _wx_segs = None
+
+                if _wx_segs:
+                    # Generic hallucination filter (mega-segment, fuzzy
+                    # intra-loops, ¡Karol!×174 family). Pure structural
+                    # check on whisperX output — runs regardless of
+                    # canonical presence.
+                    from pipeline import _filter_whisper_hallucinations as _fwh
+                    _wx_segs, _dropped = _fwh(_wx_segs)
+                    if _dropped:
+                        logger.warning("[WC] dropped %d whisperX hallucination phrase(s)", _dropped)
+
+                if _wx_segs:
+                    from timing_sources import (
+                        WHISPERX_RECONCILED as _WC_WX_REC,
+                        WHISPERX as _WC_WX,
+                    )
+                    # Reconcile when we have canonical text; emit raw otherwise.
+                    if _canonical:
+                        import whisperx_reconcile as _wxr
+                        _reconciled = _wxr.reconcile(_wx_segs, _canonical)
+                        if _reconciled:
+                            logger.info("[WC] whisperX reconciled (%d/%d lines, canonical=%s) — audio-as-truth path",
+                                        len(_reconciled),
+                                        len([l for l in _canonical.splitlines() if l.strip()]),
+                                        "lrclib" if lyrics_source == "lrclib"
+                                        else (lyrics_source or "unknown"))
+                            return _emit_segments(
+                                _reconciled, _WC_WX_REC,
+                                reference_lyrics=_canonical,
+                            )
+                        # Reconcile aborted (drift on too many lines or thin
+                        # coverage). Emit whisperX raw — same behaviour as
+                        # main today, which the operator confirmed works:
+                        # real timing + mishear text that the editor can fix.
+                        logger.info("[WC] reconcile aborted — emitting whisperX raw with mishear text (operator edits)")
+                    return _emit_segments(
+                        _wx_segs, _WC_WX,
+                        reference_lyrics=_canonical,
+                    )
+                # whisperX produced nothing usable — fall through to legacy
+                # (whisper-1 last-resort path further down).
+                logger.info("[WC] whisperX returned no segments — falling through to legacy")
+            else:
+                logger.info("[WC] WHISPERX_ENABLED off — using legacy FA path")
+
+        # ─────────────────────────────────────────────────────────────────
+        # LEGACY FA-primary pipeline (below). Kept as a safety net during
+        # validation of the world-class path above. Slated for removal
+        # once the new path proves stable in prod (~1500 lines come out).
+        # ─────────────────────────────────────────────────────────────────
         if lrc:
             synced = lrc.get("synced")
             plain = lrc.get("plain") or ""
@@ -3868,15 +4030,12 @@ async def _run_transcription_for_job(
                     wx_warm_task = asyncio.create_task(_warm_whisperx())
 
                     fa_segs = None
-                    _fa_ticker = _start_ticker("transcribe.align", 55, 79)
                     try:
                         fa_segs = await asyncio.to_thread(
                             forced_align.forced_align_lyrics, _aa, fa_text,
                         )
                     except Exception as e:
                         logger.warning("[LYRICS] forced_align raised: %s — using warm-start whisperX", e)
-                    finally:
-                        _fa_ticker.cancel()
 
                     if fa_segs:
                         logger.info("[LYRICS] forced alignment used (%s lines, lrclib text) for %r - %r", len(fa_segs), artist_hint, song_hint)
@@ -4987,34 +5146,6 @@ async def generate_with_segments(
                 or job_row.user_id != current_user["id"]
                 or job_row.tenant_id != current_user["tenant_id"]):
             raise HTTPException(status_code=404, detail="Job not found.")
-        # U2 (audit 2026-05-25) — Idempotency on retry.
-        # Si el browser hace POST /generate, network drop, retry → el
-        # segundo POST llega CON el mismo job_id. Si el primero ya
-        # transicionó a queued/processing/done, retornamos 200 con el
-        # mismo job_id en vez de 409. Esto cierra la brecha de
-        # double-charge UMG (auditoría de breach risk).
-        if job_row.status in ("queued", "processing"):
-            logger.info(
-                "[IDEMPOTENT_GENERATE] job %s ya está en status=%s; "
-                "retorno 200 idempotent (retry detectado).",
-                job_id, job_row.status,
-            )
-            return {
-                "job_id": job_id,
-                "status": job_row.status,
-                "idempotent_replay": True,
-            }
-        if job_row.status in ("done", "pending_review"):
-            logger.info(
-                "[IDEMPOTENT_GENERATE] job %s ya está en status=%s; "
-                "retorno 200 idempotent (retry post-completion).",
-                job_id, job_row.status,
-            )
-            return {
-                "job_id": job_id,
-                "status": job_row.status,
-                "idempotent_replay": True,
-            }
         # State whitelist for /generate. `transcribed_pending` is what the
         # transcription worker writes on success (post-2026-05-25 fix);
         # `transcribed` is accepted defensively for jobs that were written
@@ -5056,7 +5187,9 @@ async def generate_with_segments(
     artist = (artist or "").strip()
     song_title = (song_title or "").strip()
     if not artist or not song_title:
-        parsed_artist, parsed_title = _parse_filename_artist_title(existing_filename or "", db=db, tenant_id=current_user.get("tenant_id", ""))
+        parsed_artist, parsed_title = _parse_filename_artist_title(
+            existing_filename or "", db=db, tenant_id=current_user.get("tenant_id", "")
+        )
         if not artist:
             artist = parsed_artist
         if not song_title:
@@ -5200,6 +5333,13 @@ async def generate_with_segments(
         plan=current_user.get("plan", "100"),
         tenant_id=current_user.get("tenant_id", ""),
         segments_override=segments,
+        # Audit fix 2026-05-25: language se recibía como Form param
+        # (línea 5041) pero NUNCA se forwardaba al pipeline. Whisper/
+        # Gemini caían a auto-detect (~50% misdetection en catálogo
+        # hispanohablante con vocabulario mezclado). El endpoint legacy
+        # /upload sí lo pasaba; /generate-with-segments (el del wizard
+        # nuevo) lo había dropeado.
+        language=language,
         delivery_profile=delivery_profile,
         umg_spec=umg_spec,
         background_path=bg_path,
@@ -5222,6 +5362,13 @@ async def generate_with_segments(
         text_motion="none",
         lyrics_animation=lyrics_animation if lyrics_animation in ("none", "karaoke", "word_reveal", "pop", "glow") else "none",
         line_transition=line_transition if line_transition in ("none", "slide_up", "slide_side", "wipe", "dissolve_blur") else "none",
+        # Lyric text colors 2026-05-25. Hex #RRGGBB validado acá; cualquier
+        # otro valor se normaliza a "" (= backend usa blanco default en
+        # build_ass). Para karaoke: lyric_color = palabra no cantada,
+        # lyric_sung_color = palabra cantada. Para otras animaciones:
+        # lyric_color = único color del texto.
+        lyric_color=(lyric_color.strip() if lyric_color and re.match(r"^#[0-9a-fA-F]{6}$", lyric_color.strip() or "") else ""),
+        lyric_sung_color=(lyric_sung_color.strip() if lyric_sung_color and re.match(r"^#[0-9a-fA-F]{6}$", lyric_sung_color.strip() or "") else ""),
         text_contrast=text_contrast if text_contrast in ("subtle", "medium", "strong") else "medium",
         match_lyrics=match_lyrics,
         background_hint=(background_hint.strip() or None),
@@ -5745,10 +5892,7 @@ async def preview(
         job = get_job(db, job_id, **_job_scope(current_user))
         if job is None:
             raise HTTPException(status_code=404, detail="Job not found.")
-        # Thumbnails are generated early in the pipeline and persisted on R2
-        # across re-renders, so they can be served for any job status.
-        # Only block video/short previews for jobs that haven't finished rendering.
-        if file_type != "thumbnail" and job["status"] not in ("done", "pending_review"):
+        if job["status"] not in ("done", "pending_review"):
             raise HTTPException(status_code=400, detail="Job is not ready for preview.")
         s3_key = (job.get("s3_keys") or {}).get(file_type)
     # DB session closed — pool is free for /usage and friends.
@@ -7453,10 +7597,14 @@ async def retry_job(
               "effect", "custom_colors",
               # Lyric animation + line transition (libass templates from the
               # wizard). Added 2026-05-22 along with /variant: if a job with
-              # karaoke/reveal fell to validation_failed y el operador hit
-              # Reintentar, animations silently reset to "none" porque no
-              # estaban en esta whitelist cuando se cabló la feature (#357a1a5).
-              "lyrics_animation", "line_transition"):
+              # karaoke/reveal fell to validation_failed and the operator hit
+              # Reintentar, animations silently reset to "none" because they
+              # weren't in this whitelist when the feature was wired (#357a1a5).
+              "lyrics_animation", "line_transition",
+              # Lyric text colors 2026-05-25 — heredables igual que
+              # custom_colors, así los re-renders/variantes mantienen el
+              # color elegido por el operador.
+              "lyric_color", "lyric_sung_color"):
         if k in _retry_render_params and _retry_render_params[k] not in (None, ""):
             retry_pipeline_kwargs[k] = _retry_render_params[k]
 
@@ -8005,25 +8153,11 @@ async def admin_create_delivery_from_job(
     # Validate all 5 files exist in R2. If even one is missing we refuse
     # to create the Delivery — a half-empty portal entry is worse than
     # asking the operator to wait for the render to finish.
-    # One HEAD per file: validates existence AND captures the byte size so
-    # we persist it on the Delivery row. The portal listing then reads sizes
-    # from the DB instead of HEAD'ing R2 on every page load (no cold-cache
-    # penalty for the first visitor).
     missing = []
-    file_sizes: dict[str, int] = {}
-    _r2c = storage._get_client()
     for ft in _DEFAULT_DELIVERY_FILE_TYPES:
         key = _r2_key_for_delivery(job.tenant_id, job.job_id, ft)
-        sz = None
-        if _r2c is not None:
-            try:
-                sz = _r2c.head_object(Bucket=storage.R2_BUCKET, Key=key).get("ContentLength")
-            except Exception:
-                sz = None
-        if sz is None:
+        if not storage.object_exists(key):
             missing.append(ft)
-        else:
-            file_sizes[ft] = int(sz)
     if missing:
         raise HTTPException(
             status_code=409,
@@ -8050,7 +8184,6 @@ async def admin_create_delivery_from_job(
     if existing:
         existing.label = label
         existing.file_types = _DEFAULT_DELIVERY_FILE_TYPES
-        existing.file_sizes = file_sizes
         existing.added_by_user_id = current_user["id"]
         existing.added_at = datetime.now(timezone.utc)
         # Refresh snapshot in case the artist/title was corrected on the
@@ -8066,7 +8199,6 @@ async def admin_create_delivery_from_job(
             job_id=job_id,
             label=label,
             file_types=_DEFAULT_DELIVERY_FILE_TYPES,
-            file_sizes=file_sizes,
             artist_snapshot=job.artist,
             song_title_snapshot=job.song_title or "",
             tenant_snapshot=job.tenant_id,
@@ -8383,14 +8515,6 @@ async def portal_get_items(
 
     uncached: list[tuple[int, str, str]] = []
     for di, ft, r2_key in head_jobs:
-        # Prefer the size persisted on the Delivery row at publish time:
-        # zero R2 calls, instant for the first visitor. Rows published
-        # before this feature (file_sizes NULL) fall back to the Redis-
-        # cached HEAD below, so nothing breaks during the transition.
-        stored_sizes = deliveries[di].file_sizes or {}
-        if stored_sizes.get(ft) is not None:
-            size_map[(di, ft)] = int(stored_sizes[ft])
-            continue
         cached = None
         if _rcache is not None:
             try:

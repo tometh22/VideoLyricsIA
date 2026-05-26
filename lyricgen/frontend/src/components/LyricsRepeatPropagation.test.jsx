@@ -112,7 +112,20 @@ describe("LyricsEditor — repeat-line propagation", () => {
     render(<LyricsEditor {...chorusProps()} />);
     const inputs = screen.getAllByDisplayValue("Quizá fue en la mañana");
     editLine(inputs[0], "Quizás fue en la mañana, vendados");
-    fireEvent.click(screen.getByTestId("repeat-only-this-btn"));
+    // NOTE 2026-05-25: el editor tiene DOS botones con texto "Solo esta":
+    //   1. Layout scope toggle ("Todas las líneas" / "Solo esta")
+    //   2. Repeat-line propagation modal ("Aplicar a todas (N)" / "Solo esta")
+    // El test apunta al #2 — está al lado del PROMPT. Buscamos el botón
+    // dentro del contenedor que también incluye el PROMPT text para
+    // desambiguar sin acoplarnos a className internos.
+    const promptNode = screen.getByText(PROMPT);
+    // El modal está en el padre cercano (parent del prompt).
+    let container = promptNode.parentElement;
+    while (container && !within(container).queryByRole("button", { name: /Solo esta/i })) {
+      container = container.parentElement;
+    }
+    expect(container).toBeTruthy();
+    fireEvent.click(within(container).getByRole("button", { name: /Solo esta/i }));
     expect(screen.getByDisplayValue("Quizás fue en la mañana, vendados")).toBeInTheDocument();
     // The other two stale occurrences stay as they were.
     expect(screen.getAllByDisplayValue("Quizá fue en la mañana")).toHaveLength(2);

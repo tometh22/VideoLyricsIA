@@ -154,37 +154,29 @@ def run_bg_preview_job(job_id: str, bg_cache_key: str, params: dict) -> dict:
     # arrastra mucho — preferimos lazy para que el módulo bg_preview sea
     # importable en tests sin spin-up del backend entero).
     try:
-        from pipeline import _ensure_background, _audio_duration
-        # Necesitamos un duration estimado para que _ensure_background sepa
-        # cuánto background pedir. Sin audio en este path (pre-gen ANTES de
-        # transcribir o sin ref), usamos un placeholder de 30s — el rendering
-        # final con audio puede repetir el clip si dura más.
-        # NOTE: en una v2, podríamos pasar el job_id de la transcripción para
-        # leer la audio_duration real.
-        target_duration_s = float(params.get("target_duration_s", 30.0))
+        from pipeline import _ensure_background
 
         with tempfile.TemporaryDirectory() as job_dir:
-            # _ensure_background recibe many params and outputs a path to the
-            # generated bg video. Llamamos con los mismos params del request.
+            # _ensure_background returns path to generated bg video/image.
+            # FIX 2026-05-25: la signatura real NO tiene `duration`, `effect`,
+            # `animate_image`, `segments`, ni `lang` — eran kwargs que evolucionaron
+            # fuera o nunca existieron. El primer arg posicional es `style_hint`
+            # (no `style`). El effect overlay se compone en el render final
+            # (fx_compositor), no en bg-gen. Pasamos solo lo que la signatura acepta.
             bg_path = _ensure_background(
+                params.get("style", "auto"),  # style_hint (positional)
+                job_dir,                       # job_dir (positional)
                 job_id=f"bgpreview_{job_id}",
-                job_dir=job_dir,
-                duration=target_duration_s,
-                style=params.get("style", "auto"),
-                custom_colors=params.get("custom_colors", ""),
                 artist=params.get("artist", ""),
                 song_title=params.get("song_title", ""),
                 genre=params.get("genre", ""),
                 concept=params.get("concept", ""),
                 movement_style=params.get("movement_style", ""),
-                effect=params.get("effect", ""),
-                animate_image=bool(params.get("animate_image", False)),
                 match_lyrics=bool(params.get("match_lyrics", True)),
                 background_hint=params.get("background_hint"),
                 bg_verbatim=bool(params.get("bg_verbatim", False)),
                 bg_mode=params.get("background_mode", "veo"),
-                segments=None,  # no transcription yet
-                lang="es",
+                custom_colors=params.get("custom_colors", ""),
             )
 
             if not bg_path or not os.path.exists(bg_path):

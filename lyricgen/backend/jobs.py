@@ -434,6 +434,20 @@ def bulk_delete_jobs(db: Session, job_ids: list[str], tenant_id: str) -> dict:
     return {"deleted": deleted, "skipped": skipped}
 
 
+# bg_preview ghost jobs (Capa C 2026-05-24) tracking-only rows the wizard
+# polls while pre-rendering the Veo background during lyrics edit. They
+# share the jobs table with real renders for status polling, but the user
+# never asked for them as a "video" — they shadow the real job and
+# duplicate the song in Historial (e.g. "Hermanos De Sangre" appears with
+# status `bg_preview_done` next to the real one in `processing`). Filter
+# them at the user-facing read boundary. Admin paths use
+# `get_all_jobs_admin` and still see ghosts for debugging.
+_BG_PREVIEW_STATUSES = (
+    "bg_preview_queued", "bg_preview_generating",
+    "bg_preview_done", "bg_preview_failed",
+)
+
+
 def get_all_jobs(
     db: Session,
     tenant_id: str = "default",
@@ -443,8 +457,14 @@ def get_all_jobs(
     """Return all jobs for a tenant, sorted by creation time (newest first).
 
     Pass user_id for self-serve callers — see get_job() for rationale.
+
+    Excludes bg_preview ghost rows. Admin callers should use
+    `get_all_jobs_admin` if they need them.
     """
-    query = db.query(Job).filter(Job.tenant_id == tenant_id)
+    query = db.query(Job).filter(
+        Job.tenant_id == tenant_id,
+        ~Job.status.in_(_BG_PREVIEW_STATUSES),
+    )
     if user_id is not None:
         query = query.filter(Job.user_id == user_id)
     jobs = (

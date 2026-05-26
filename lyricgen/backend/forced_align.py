@@ -163,6 +163,23 @@ def _norm(s: str) -> str:
     return "".join(c for c in s if c.isalnum() and not _u.combining(c))
 
 
+def _phonetic_ratio(line_tokens: list[str], window_tokens: list[str]) -> float:
+    """SequenceMatcher ratio over the alphanumeric-only concatenation of both
+    sides. Catches acoustic mishears that Jaccard misses because the surface
+    tokens diverge (whisperX heard 'Le realizan la', canonical is 'Legalícenla'
+    — Jaccard=0, but the compact strings 'lerealizanla' vs 'legalicenla' share
+    enough characters in order to score ~0.70).
+
+    Pure + deterministic — uses stdlib `difflib.SequenceMatcher`, no extra
+    dependency. Returns 0.0 when either side is empty."""
+    from difflib import SequenceMatcher
+    a = "".join(line_tokens)
+    b = "".join(window_tokens)
+    if not a or not b:
+        return 0.0
+    return SequenceMatcher(None, a, b).ratio()
+
+
 def wordstamps_to_segments(
     wordstamps: list[dict], lyric_lines: list[str], *, max_tail_dur: float = 1.5,
     max_drift: int = 8, min_anchor_score: float = 0.5, drift_abort: int = 4,
@@ -182,6 +199,19 @@ def wordstamps_to_segments(
     line instead of compounding. When matching collapses for several
     consecutive lines (the alignment is unreliable) we return [] so the caller
     falls back to its other timing paths.
+
+    PHONETIC SCORING (incident Legalícenla intro mishear, 2026-05-25): when
+    whisperX is fed audio without lyrics_hint coverage of every section, it
+    mis-transcribes acoustically-similar regions (the intro chorus "Legalícenla"
+    came back as "Le realizan la" × 3). Plain Jaccard over surface tokens scored
+    0.0 against the canonical line and reconcile aborted by drift, dumping the
+    user at "first lyric @ 0:45" when the real first sung word is at 0:17.
+    We now score `max(jaccard_tokens, phonetic_ratio)` where the phonetic side
+    is SequenceMatcher over the alphanumeric-compact strings. "lerealizanla"
+    vs "legalicenla" → 0.696, well above min_anchor_score=0.5, so the line
+    anchors to its true acoustic location and the canonical text wins. The
+    Jaccard path stays primary for clean alignments — phonetic only rescues
+    cases where surface tokens diverge.
 
     De-stretch (incident: Hermanos de Sangre): the model STRETCHES the last
     word of a line to fill the instrumental gap up to the next sung line, so a
@@ -216,18 +246,24 @@ def wordstamps_to_segments(
 
         # Search windows of length `wc` whose start sits in
         # [cur - small backslack .. cur + max_drift], never re-using the
-        # previous line's first word. Pick the best token-set Jaccard;
-        # ties resolve to the earliest (closest to the cursor) start.
+        # previous line's first word. Pick the best score among (a) Jaccard
+        # over token sets and (b) SequenceMatcher ratio over compact
+        # alphanumeric strings. Phonetic wins on acoustic mishears that share
+        # characters in order (Legalícenla / le realizan la) where Jaccard
+        # collapses to 0. Ties resolve to the earliest start.
         lo = max(prev_start + 1, cur - 2, 0)
         hi = min(n_words - wc, cur + max_drift)
         best_start, best_score = -1, -1.0
         for st in range(lo, hi + 1):
-            win_set = {t for t in norm_words[st:st + wc] if t}
-            if not win_set:
+            win_tokens = [t for t in norm_words[st:st + wc] if t]
+            if not win_tokens:
                 continue
+            win_set = set(win_tokens)
             inter = len(line_set & win_set)
             union = len(line_set | win_set)
-            score = inter / union if union else 0.0
+            jaccard = inter / union if union else 0.0
+            phonetic = _phonetic_ratio(line_tokens, win_tokens)
+            score = max(jaccard, phonetic)
             if score > best_score:
                 best_score, best_start = score, st
 
@@ -379,9 +415,18 @@ def forced_align_lyrics(audio_path: str, lyrics_text: str) -> list[dict] | None:
 
     # Build a fresh input dict per attempt — the audio file handle is
     # consumed on each upload, so we need to reopen it.
+    # Cada llamada al factory abre un handle nuevo; los acumulamos para
+    # poder cerrarlos en el `finally` aunque Replicate falle mid-upload
+    # (timeout, cancel, exception). Sin esto el worker leakea un FD por
+    # intento × 7 réplicas × 3 retries → eventual `OSError: Too many
+    # open files`. Doble-close es no-op, así que es seguro listarlos
+    # incluso si el SDK ya los cerró por su cuenta.
+    _open_handles: list = []
     def _input_factory():
+        f = open(upload_path, "rb")
+        _open_handles.append(f)
         return {
-            "audio_file": open(upload_path, "rb"),
+            "audio_file": f,
             "transcript": transcript,
             # show_probabilities returns per-word `score` (0-1) which we
             # surface to the editor for confidence highlighting on
@@ -405,6 +450,11 @@ def forced_align_lyrics(audio_path: str, lyrics_text: str) -> list[dict] | None:
             backoff=[0, 8, 24],
         )
     finally:
+        for _h in _open_handles:
+            try:
+                _h.close()
+            except Exception:
+                pass
         if is_temp:
             try:
                 os.unlink(upload_path)

@@ -205,9 +205,14 @@ def test_ensure_background_routes_calm_registers_to_imagen():
 
 def test_ken_burns_pan_modes_have_no_zoom():
     """lateral and subtle are pans over a FIXED inward crop. UMG-style update
-    2026-05-25: lateral ahora suma zoom-breath sutil (scale 1.15→1.22 con
-    ciclo 32s) para dar profundidad sin advance-forward. Subtle mantiene
-    scale_amp=0 (sin breath — operator pidió quietud)."""
+    2026-05-25: lateral suma zoom-breath sutil (scale 1.15→1.22 con
+    ciclo 32s) para dar profundidad sin advance-forward.
+
+    Fix urgente 2026-05-25 (UMG reporte: 'los últimos videos salieron
+    con fotos fijas'): bumpear amplitudes del subtle (0.35→0.65 horizontal,
+    0.18→0.32 vertical, scale_amp 0→0.015) para que el drift sea
+    PERCEPTIBLE pero todavía calmo. El 'subtle' debe verse vivo, no
+    indistinguible de una still photo."""
     src = inspect.getsource(pipeline._ken_burns_clip)
     assert "make_pan_frame" in src
     pan_block = src.split("if not static and (lateral or subtle):")[1].split("\n    if static:")[0]
@@ -216,8 +221,10 @@ def test_ken_burns_pan_modes_have_no_zoom():
     assert "amp_x, amp_y = 1.0, 0.0" in pan_block, (
         "lateral must traverse full horizontal room (amp_x=1.0)"
     )
-    assert "amp_x, amp_y = 0.35, 0.18" in pan_block, (
-        "subtle must use low horizontal+vertical drift amplitude"
+    assert "amp_x, amp_y = 0.65, 0.32" in pan_block, (
+        "subtle must use bumped amplitudes (UMG fix 2026-05-25). Old values "
+        "(0.35, 0.18) producían foto fija percibida — bumpead a (0.65, 0.32) "
+        "para que el drift sea visible pero calmo."
     )
     # Continuous zoom-in (would advance forward) NOT allowed.
     assert "zoom_in" not in pan_block

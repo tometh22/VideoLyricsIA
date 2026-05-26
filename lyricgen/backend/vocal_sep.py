@@ -33,6 +33,7 @@ from __future__ import annotations
 import logging
 import os
 import tempfile
+from typing import Callable, Optional
 
 logger = logging.getLogger("genly.vocal_sep")
 
@@ -209,7 +210,10 @@ def _stem_cache_key(audio_path: str) -> str:
     return f"stems/{_audio_content_hash(audio_path)}_{_VARIANT}.wav"
 
 
-def separate_vocals(audio_path: str) -> str | None:
+def separate_vocals(
+    audio_path: str,
+    on_progress: Optional[Callable[[float], None]] = None,
+) -> str | None:
     """Isolate the vocal stem of `audio_path` via demucs on Replicate.
     Returns the path to a temp stem file, or None (disabled / failure).
     Never raises — callers fall back to the mixed audio.
@@ -222,6 +226,13 @@ def separate_vocals(audio_path: str) -> str | None:
     storage cost (~$0.015/GB-month; a 30 MB stem × 100 songs/month
     active ≈ $0.045/month — negligible). Cleanup of unused stems is
     deferred to the reaper.
+
+    `on_progress`: optional callback `(fraction: float) -> None` called
+    while Demucs runs on Replicate. Used by the transcription pipeline
+    to keep the "Aislando voz" progress bar advancing instead of stuck
+    at 25%. On a cache hit it's fired once with 1.0 (no Replicate call
+    happens) — the caller's UI still gets a clean transition. None
+    keeps the original behaviour (no callbacks).
     """
     if not is_enabled():
         return None
@@ -242,6 +253,13 @@ def separate_vocals(audio_path: str) -> str | None:
                     if ok:
                         logger.info("[VOCALSEP] cache hit %s for %s — skipping Replicate",
                                     cache_key, os.path.basename(audio_path))
+                        # Cache hit: emit a single 1.0 tick so the UI moves
+                        # off 25% and the next stage starts smoothly.
+                        if on_progress is not None:
+                            try:
+                                on_progress(1.0)
+                            except Exception:
+                                pass
                         return cached_path
                     logger.warning("[VOCALSEP] cached stem failed validation (%s) — re-separating",
                                    reason)
@@ -269,19 +287,39 @@ def separate_vocals(audio_path: str) -> str | None:
     # helper so all three call sites stay in sync.
     from replicate_budget import call_with_budget, _budget_for
 
+    # Cada retry del budget llama al factory de nuevo; acumulamos los
+    # handles para cerrarlos en `finally`. Sin esto el worker leakea un
+    # FD por intento cuando Replicate falla mid-upload (timeout/cancel) —
+    # mismo patrón que forced_align.py / whisperx_transcribe.py.
+    _open_handles: list = []
     def _input_factory():
+        f = open(audio_path, "rb")
+        _open_handles.append(f)
         return {
-            "audio": open(audio_path, "rb"),
+            "audio": f,
             "stem": "vocals",
             "model_name": _VARIANT,
         }
 
-    output = call_with_budget(
-        _MODEL, _input_factory,
-        total_budget_s=_budget_for("demucs", default_s=360.0),
-        backoff=[0, 8, 24],
-        call_label="VOCALSEP",
-    )
+    try:
+        output = call_with_budget(
+            _MODEL, _input_factory,
+            total_budget_s=_budget_for("demucs", default_s=360.0),
+            backoff=[0, 8, 24],
+            call_label="VOCALSEP",
+            on_progress=on_progress,
+            # p50 wallclock observed on cjwbw/demucs across the catalog. The
+            # time-based fallback uses this when the model logs don't expose
+            # a parseable % — the bar advances at the rate a real job would,
+            # never reaching 1.0 until Replicate actually says "succeeded".
+            typical_runtime_s=90.0,
+        )
+    finally:
+        for _h in _open_handles:
+            try:
+                _h.close()
+            except Exception:
+                pass
     if output is None:
         return None
 

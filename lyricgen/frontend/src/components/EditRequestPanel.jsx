@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState } from "react";
+import { createPortal } from "react-dom";
 import { useI18n } from "../i18n";
 import BackgroundHintField from "./BackgroundHintField";
 import ContentValidationToggle, { isUmgTenant } from "./ContentValidationToggle";
@@ -875,7 +876,10 @@ function LyricsEditModal({
   const effectiveSegments = Array.isArray(segments) ? segments : job.segments_json;
   const noSegments = !Array.isArray(effectiveSegments) || effectiveSegments.length === 0;
 
-  return (
+  // Bug fix 2026-05-26: createPortal escapa el stacking context de
+  // AppShell's <main> (relative z-10), donde el sidebar (z-20) quedaba
+  // encima de este modal cortando el contenido.
+  return createPortal((
     <div ref={scrollRef} className="fixed inset-0 z-[60] bg-surface overflow-y-auto">
       <div className="min-h-screen px-4 py-8 sm:px-8">
         <div className="max-w-3xl mx-auto">
@@ -1038,5 +1042,5 @@ function LyricsEditModal({
         </div>
       </div>
     </div>
-  );
+  ), document.body);
 }

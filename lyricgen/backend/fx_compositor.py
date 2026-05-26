@@ -29,7 +29,11 @@ import os
 _FX_DIR = os.path.join(os.path.dirname(__file__), "..", "assets", "fx")
 
 # Available pre-baked effect loops (must match scripts/gen_fx_loops.py).
-EFFECTS = ("snow", "rain", "stars", "bokeh", "light")
+# 2026-05-25: "aurora" agregado para cubrir el estilo UMG observado en
+# los refs Boza / Yatra Cristina / A los cuatro vientos — líneas
+# brillantes ondulantes que flotan sobre el cielo. Asset placeholder
+# basado en light.mp4 hasta que se swap el real (loop ondas + glow).
+EFFECTS = ("snow", "rain", "stars", "bokeh", "light", "aurora")
 
 # palette code → ffmpeg `eq` grade. "" / "auto" / unknown → no grade
 # (scene-natural). Mirrors the frontend STYLES codes used elsewhere.

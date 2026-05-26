@@ -11,7 +11,7 @@ from ass_render import (
     lyric_fontsize, fade_seconds, perceptual_start,
     segments_to_lines, font_family, single_font_dir,
     multi_font_dir, title_card_lines, _opacity_to_alpha,
-    moviepy_line_placement,
+    moviepy_line_placement, hex_to_ass,
 )
 
 _FONTS_DIR = os.path.join(os.path.dirname(__file__), "..", "fonts")
@@ -527,3 +527,116 @@ def test_moviepy_placement_applies_screen_offset():
     base = moviepy_line_placement((0.5, 0.5), 600, 100, 1920, 1080)
     off = moviepy_line_placement((0.5, 0.5), 600, 100, 1920, 1080, dx=3, dy=3)
     assert off == (base[0] + 3, base[1] + 3)
+
+
+# ─── Lyric text colors (PR 2026-05-25) ──────────────────────────────────
+
+def test_hex_to_ass_red():
+    """Red #FF0000 → &H000000FF (alpha=00, B=00, G=00, R=FF)."""
+    assert hex_to_ass("#FF0000") == "&H000000FF"
+
+
+def test_hex_to_ass_karaoke_green():
+    """Karaoke green #19E0BC → &H00BCE019 (alpha=00, B=BC, G=E0, R=19)."""
+    assert hex_to_ass("#19E0BC") == "&H00BCE019"
+
+
+def test_hex_to_ass_white_default():
+    """White #FFFFFF → &H00FFFFFF (preserva el default del style line)."""
+    assert hex_to_ass("#FFFFFF") == "&H00FFFFFF"
+
+
+def test_hex_to_ass_lowercase_hex_works():
+    """Hex con letras minúsculas se acepta y se normaliza a mayúsculas."""
+    assert hex_to_ass("#ff00cc") == "&H00CC00FF"
+
+
+def test_hex_to_ass_empty_falls_back():
+    """Empty string → fallback (default white) sin crashear."""
+    assert hex_to_ass("") == "&H00FFFFFF"
+    # Fallback customizable.
+    assert hex_to_ass("", fallback="&H00808080") == "&H00808080"
+
+
+def test_hex_to_ass_malformed_falls_back():
+    """Strings malformados nunca llegan a libass."""
+    for bad in ("nope", "#FFF", "#GGGGGG", "FF0000", "#fffffff", None, 123):
+        assert hex_to_ass(bad) == "&H00FFFFFF"
+
+
+def test_build_ass_uses_custom_primary_color():
+    """Cuando primary_color se setea, el PrimaryColour del style refleja
+    el hex. Bug original: build_ass hardcodeaba &H00FFFFFF (blanco)."""
+    out = build_ass(
+        width=1920, height=1080, font_name="Arial",
+        base_fontsize=40, outline=2.0, shadow=2,
+        lines=[], primary_color="#FF0000",
+    )
+    # Style line: "Style: Lyric,Arial,40,&H000000FF,..."
+    assert "&H000000FF" in out
+    # El default blanco NO debería estar en el slot de primary.
+    style_line = [l for l in out.splitlines() if l.startswith("Style: Lyric,")][0]
+    fields = style_line.split(",")
+    # Format: Name,Font,Size,Primary,Secondary,Outline,Back,...
+    assert fields[3] == "&H000000FF"
+
+
+def test_build_ass_secondary_color_for_karaoke():
+    """SecondaryColour respeta lyric_color (un-sung) cuando lo seteamos."""
+    out = build_ass(
+        width=1920, height=1080, font_name="Arial",
+        base_fontsize=40, outline=2.0, shadow=2,
+        lines=[], primary_color="#00FF00", secondary_color="#808080",
+    )
+    style_line = [l for l in out.splitlines() if l.startswith("Style: Lyric,")][0]
+    fields = style_line.split(",")
+    assert fields[3] == "&H0000FF00"  # primary = green
+    assert fields[4] == "&H00808080"  # secondary = grey
+
+
+def test_build_ass_defaults_to_white_when_no_colors_given():
+    """Backwards compat: jobs sin colores siguen rindiendo blanco (default
+    histórico del PrimaryColour libass)."""
+    out = build_ass(
+        width=1920, height=1080, font_name="Arial",
+        base_fontsize=40, outline=2.0, shadow=2,
+        lines=[],
+    )
+    style_line = [l for l in out.splitlines() if l.startswith("Style: Lyric,")][0]
+    fields = style_line.split(",")
+    assert fields[3] == "&H00FFFFFF"  # primary white
+    assert fields[4] == "&H000000FF"  # secondary default (red, was hardcoded)
+
+
+def test_build_ass_karaoke_override_uses_custom_colors():
+    """El override per-line `\\2c\\1c` que build_ass mete en cada Dialogue
+    karaoke usa los colores del operador, no los hardcoded grey/white."""
+    segments = [{"start": 0.0, "end": 2.0, "text": "hola mundo"}]
+    lines = segments_to_lines(segments, text_scale=1.0, animation="karaoke")
+    out = build_ass(
+        width=1920, height=1080, font_name="Arial",
+        base_fontsize=40, outline=2.0, shadow=2,
+        lines=lines,
+        primary_color="#00FF00",   # sung = green
+        secondary_color="#FF00FF", # un-sung = magenta
+    )
+    dialogue = [l for l in out.splitlines() if l.startswith("Dialogue:")][0]
+    # ASS BGR: #FF00FF (magenta) → &H00FF00FF; #00FF00 (green) → &H0000FF00.
+    assert "\\2c&H00FF00FF" in dialogue
+    assert "\\1c&H0000FF00" in dialogue
+
+
+def test_build_ass_karaoke_falls_back_to_grey_white_when_no_colors():
+    """Sin colores custom, el override mantiene el look histórico
+    (un-sung grey + sung white) — backwards compat con jobs viejos."""
+    segments = [{"start": 0.0, "end": 2.0, "text": "hola mundo"}]
+    lines = segments_to_lines(segments, text_scale=1.0, animation="karaoke")
+    out = build_ass(
+        width=1920, height=1080, font_name="Arial",
+        base_fontsize=40, outline=2.0, shadow=2,
+        lines=lines,
+    )
+    dialogue = [l for l in out.splitlines() if l.startswith("Dialogue:")][0]
+    assert "\\2c&H00808080" in dialogue   # grey un-sung default
+    assert "\\1c&H00FFFFFF" in dialogue   # white sung default
+

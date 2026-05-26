@@ -5,6 +5,7 @@ import { useToast } from "./ToastProvider";
 import LyricsTimeline from "./LyricsTimeline";
 import LyricVideoPreview from "./LyricVideoPreview";
 import { tierForLength } from "../lib/lyricTiers";
+import useLocalStorage from "../hooks/useLocalStorage";
 
 // Font options for the live in-preview switcher. Codes match the render
 // pipeline / EditRequestPanel; css families are all loaded in index.html so
@@ -326,6 +327,24 @@ export default function LyricsEditor({
   // Valores: "idle" | "queued" | "generating" | "done" | "error" | "disabled".
   // null/undefined → no se renderiza el chip (modo /edit modal post-render).
   bgStatus = null,
+  // Phase 2 (2026-05-25): cuando el editor se renderiza dentro del nuevo
+  // paso 6 del wizard, los controles tipográficos (font/case/contrast/
+  // animation/transition) ya están visibles en el paso 4 ("Animación")
+  // del stepper — esconder la columna izquierda y el preview interno
+  // para no duplicarlos. El preview central del wizard
+  // (WizardLivePreview) sigue mostrando los cambios live. En modo /edit
+  // (legacy) o uso standalone, el default es renderizar todo igual que
+  // siempre.
+  hideTypographyControls = false,
+  hideInternalPreview = false,
+  // Phase C 2026-05-25: callback que publica el tick de playback hacia
+  // el padre (App.jsx). El padre típicamente escribe en un ref para
+  // que el WizardLivePreview central pueda leerlo sin pasar por
+  // setState (evita re-renders a 60fps del tree de UploadZone).
+  // Firma: (activeLineText, activeStart, activeEnd, currentTime).
+  // Se llama dentro del rAF loop existente (60fps). El consumer es
+  // responsable de throttle si necesario.
+  onPlaybackTick = null,
 }) {
   const { t } = useI18n();
   const [edited, setEdited] = useState(() =>
@@ -335,6 +354,20 @@ export default function LyricsEditor({
   // List vs visual timeline. Default "list" so the existing operator flow is
   // untouched; the timeline is opt-in via the toolbar toggle.
   const [viewMode, setViewMode] = useState("list"); // "list" | "timeline"
+  // 2026-05-25 Studio Console — Modo enfoque. Toggle persistente que
+  // agranda max-h de la lista + MAX_VH del timeline. Operador con 30-50
+  // segments por video estaba scrolleando constante. localStorage usa
+  // string "1"/"0" (el hook es string-only).
+  const [focusModeRaw, setFocusModeRaw] = useLocalStorage("genly_editor_focus", "0");
+  const focusMode = focusModeRaw === "1";
+  const toggleFocusMode = useCallback(
+    () => setFocusModeRaw((v) => (v === "1" ? "0" : "1")),
+    [setFocusModeRaw],
+  );
+  // Phase B 2026-05-25: el card de auto-fix antes ocupaba 120-180px arriba
+  // del editor. Reemplazado por un pill compacto 32px que expande detalle
+  // on demand. Default colapsado para minimizar el overhead vertical.
+  const [autoFixExpanded, setAutoFixExpanded] = useState(false);
   // Layout edits in the preview apply to ALL lines by default (consistent
   // look across the song); "line" scopes the next edit to the selected line
   // only (for the odd tilted/repositioned line).
@@ -347,6 +380,19 @@ export default function LyricsEditor({
   // 2026-05-23: nuevos ejes (paridad con el wizard, ver header del archivo).
   const [selectedAnimation, setSelectedAnimation] = useState(lyricsAnimation || "none");
   const [selectedLineTransition, setSelectedLineTransition] = useState(lineTransition || "none");
+  // Phase 2 (2026-05-25): sync props → state cuando el wizard controla los
+  // typography settings desde el paso 4. Sin esto, el editor montado en paso 6
+  // se queda con el seed inicial y no refleja los cambios que el operador
+  // hace en el stepper. Solo activo en modo wizard para no romper el flow
+  // standalone donde el editor ES la fuente de verdad.
+  useEffect(() => {
+    if (!hideTypographyControls) return;
+    setSelectedFont(font || "");
+    setSelectedCase(textCase || "upper");
+    setSelectedContrast(textContrast || "medium");
+    setSelectedAnimation(lyricsAnimation || "none");
+    setSelectedLineTransition(lineTransition || "none");
+  }, [hideTypographyControls, font, textCase, textContrast, lyricsAnimation, lineTransition]);
   // Autosave confidence for the timeline view. saveStatus drives the
   // "Guardando…/Guardado ✓" chip; flushCounter triggers an immediate save
   // on a timeline drag (instead of waiting for the 3 s debounce).
@@ -510,7 +556,25 @@ export default function LyricsEditor({
     const tick = () => {
       const a = audioRef.current;
       if (a && !a.paused) {
-        setCurrentTime(a.currentTime);
+        const ct = a.currentTime;
+        setCurrentTime(ct);
+        // Phase C 2026-05-25: publish playback tick al padre. Buscar el
+        // segment activo aquí (no usar activeId del scope porque cambia
+        // con setState async). Si el padre pasó onPlaybackTick, le
+        // notificamos el segmento activo + currentTime para que el
+        // WizardLivePreview central pueda hacer word-jump real.
+        if (onPlaybackTick) {
+          let active = null;
+          for (const s of edited) {
+            if (ct >= s.start && ct < s.end) { active = s; break; }
+            if (ct >= s.start) active = s;
+          }
+          if (active) {
+            onPlaybackTick(active.text || "", active.start, active.end, ct);
+          } else {
+            onPlaybackTick("", 0, 0, ct);
+          }
+        }
       }
       rafRef.current = requestAnimationFrame(tick);
     };
@@ -519,7 +583,8 @@ export default function LyricsEditor({
       if (rafRef.current) cancelAnimationFrame(rafRef.current);
       rafRef.current = null;
     };
-  }, [isPlaying]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [isPlaying, edited, onPlaybackTick]);
   const [wrapWarning, setWrapWarning] = useState(null); // {ids: [...]} for 3+ line segs
   const [focusedSegId, setFocusedSegId] = useState(null); // for preview panel
 
@@ -1058,7 +1123,11 @@ export default function LyricsEditor({
   const seekTo = useCallback((seconds, autoplay = true) => {
     const a = audioRef.current;
     if (!a) return;
-    a.currentTime = Math.max(0, seconds);
+    const t = Math.max(0, seconds);
+    a.currentTime = t;
+    // Refleja en el mismo frame del click. Sin esto hay que esperar al
+    // próximo rAF tick (~16ms) y el playhead "se desliza" en vez de saltar.
+    setCurrentTime(t);
     if (autoplay && a.paused) a.play().catch(() => {});
   }, []);
 
@@ -1100,11 +1169,18 @@ export default function LyricsEditor({
         e.preventDefault();
         if (syncMode) exitSyncMode();
         else enterSyncMode();
+      } else if (!e.metaKey && !e.ctrlKey && !e.altKey && (e.key === "f" || e.key === "F")) {
+        // 2026-05-25 — F toggle "Modo Enfoque". Guard `editing` arriba
+        // ya nos protege de capturarlo cuando el operador está tipeando
+        // en un input/textarea (la mayoría de las veces). Sin modifier
+        // keys para que no choque con Cmd+F (buscar nativo del browser).
+        e.preventDefault();
+        toggleFocusMode();
       }
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [togglePlay, syncMode, tapAnchor, undoLastAnchor, undoEdit, audioUrl, enterSyncMode, exitSyncMode]);
+  }, [togglePlay, syncMode, tapAnchor, undoLastAnchor, undoEdit, audioUrl, enterSyncMode, exitSyncMode, toggleFocusMode]);
 
   // ─── Reference lyrics suggestions (unchanged) ───────────────────────
   const refLines = useMemo(() => {
@@ -1652,67 +1728,89 @@ export default function LyricsEditor({
           if (hasSuggestions) applyAllSuggestions();
           if (trimAvailable) trimAllLongSegs();
         };
+        /* Phase B 2026-05-25: pill compacto en vez del card grande.
+           - Default (autoFixExpanded=false): pill de 32px con icon ✓ +
+             "N correcciones · [Aplicar] [↺ Deshacer] [▾]". El operador
+             ve qué hay y aplica con 1 click sin desplegar.
+           - Click en ▾: expande con la lista de detalle (las 3 líneas
+             del card original). Click otra vez colapsa.
+           - Reduce el overhead vertical de 120-180px → 32px (default)
+             o 80px (expandido). */
         return (
-          <div className="mb-4 rounded-2xl ring-1 ring-accent/25 bg-accent/[0.05] px-4 py-3.5">
-            {hasAutoFix && (
-              <div className="flex items-start gap-3">
-                <svg className="w-5 h-5 text-accent flex-shrink-0 mt-0.5" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
-                  <polyline points="20 6 9 17 4 12" strokeLinecap="round" strokeLinejoin="round" />
-                </svg>
-                <div className="flex-1 min-w-0">
-                  <p className="text-xs font-medium text-white">
+          <div className="mb-3 rounded-xl ring-1 ring-accent/25 bg-accent/[0.05] px-3 py-2">
+            <div className="flex items-center gap-2 min-h-[28px]">
+              {hasAutoFix && (
+                <>
+                  <svg className="w-4 h-4 text-accent flex-shrink-0" fill="none" stroke="currentColor" strokeWidth="2.4" viewBox="0 0 24 24">
+                    <polyline points="20 6 9 17 4 12" strokeLinecap="round" strokeLinejoin="round" />
+                  </svg>
+                  <p className="text-xs font-medium text-white flex-1 min-w-0 truncate">
                     {fixCount === 1
                       ? (t("editor.autofix_title_singular") || "1 corrección automática disponible")
                       : (t("editor.autofix_title_plural") || "{n} correcciones automáticas disponibles").replace("{n}", fixCount)}
                   </p>
-                  <ul className="mt-1.5 space-y-1">
-                    {splitAvailable && (
-                      <li className="text-[11px] text-ink-secondary flex items-center gap-2">
-                        <span className="text-gray-600 font-mono text-[10px]">└</span>
-                        {(t("editor.autofix_split") || "Auto-dividir {n} líneas mergeadas").replace("{n}", mergeableSegments.length)}
-                      </li>
-                    )}
-                    {hasSuggestions && (
-                      <li className="text-[11px] text-ink-secondary flex items-center gap-2">
-                        <span className="text-gray-600 font-mono text-[10px]">└</span>
-                        {(t("editor.autofix_suggestions") || "Aplicar {n} sugerencias ortográficas").replace("{n}", pendingSuggestions)}
-                      </li>
-                    )}
-                    {trimAvailable && (
-                      <li className="text-[11px] text-ink-secondary flex items-center gap-2">
-                        <span className="text-gray-600 font-mono text-[10px]">└</span>
-                        {(t("editor.autofix_trim") || "Recortar {n} líneas con texto colgado").replace("{n}", longSegCount)}
-                      </li>
-                    )}
-                  </ul>
-                </div>
-              </div>
-            )}
-            <div className={`flex items-center gap-2 ${hasAutoFix ? "mt-3 pl-8" : ""}`}>
-              {hasAutoFix && (
-                <button
-                  type="button"
-                  onClick={applyAllFixes}
-                  className="px-3 py-1.5 rounded-md text-xs font-medium text-white bg-accent hover:bg-accent/90 transition-colors"
-                >
-                  {fixCount === 1
-                    ? (t("editor.autofix_apply_one") || "Aplicar")
-                    : (t("editor.autofix_apply_all") || "Aplicar todas las correcciones")}
-                </button>
+                  <button
+                    type="button"
+                    onClick={applyAllFixes}
+                    className="shrink-0 px-2.5 py-1 rounded-md text-[11px] font-semibold text-white bg-accent hover:bg-accent/90 transition-colors"
+                  >
+                    {fixCount === 1
+                      ? (t("editor.autofix_apply_one") || "Aplicar")
+                      : (t("editor.autofix_apply_all_short") || "Aplicar todo")}
+                  </button>
+                </>
               )}
               {hasUndo && (
                 <button
                   onClick={undoEdit}
                   title={t("editor.undo_hint") || "Cmd/Ctrl+Z"}
-                  className="text-xs font-medium text-gray-400 hover:text-white transition-colors flex items-center gap-1 px-3 py-1.5 rounded-lg bg-white/[0.04] hover:bg-white/[0.08] ring-1 ring-white/[0.06]"
+                  className="shrink-0 text-[11px] font-medium text-gray-400 hover:text-white transition-colors flex items-center gap-1 px-2 py-1 rounded-md bg-white/[0.04] hover:bg-white/[0.08] ring-1 ring-white/[0.06]"
                 >
-                  <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
+                  <svg className="w-3 h-3" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
                     <path d="M3 7v6h6M3 13a9 9 0 109-9" strokeLinecap="round" strokeLinejoin="round" />
                   </svg>
                   {t("editor.undo") || "Deshacer"}
                 </button>
               )}
+              {hasAutoFix && fixCount > 0 && (
+                <button
+                  type="button"
+                  onClick={() => setAutoFixExpanded((v) => !v)}
+                  title={autoFixExpanded ? "Ocultar detalle" : "Ver detalle"}
+                  aria-label={autoFixExpanded ? "Ocultar detalle" : "Ver detalle"}
+                  className="shrink-0 w-6 h-6 rounded-md text-gray-400 hover:text-white hover:bg-white/[0.06] transition-colors flex items-center justify-center"
+                >
+                  <svg
+                    className={`w-3 h-3 transition-transform ${autoFixExpanded ? "rotate-180" : ""}`}
+                    fill="none" stroke="currentColor" strokeWidth="2.4" viewBox="0 0 24 24"
+                  >
+                    <polyline points="6 9 12 15 18 9" strokeLinecap="round" strokeLinejoin="round" />
+                  </svg>
+                </button>
+              )}
             </div>
+            {hasAutoFix && autoFixExpanded && (
+              <ul className="mt-2 pl-6 space-y-1 animate-fade-in">
+                {splitAvailable && (
+                  <li className="text-[11px] text-ink-secondary flex items-center gap-2">
+                    <span className="text-gray-600 font-mono text-[10px]">└</span>
+                    {(t("editor.autofix_split") || "Auto-dividir {n} líneas mergeadas").replace("{n}", mergeableSegments.length)}
+                  </li>
+                )}
+                {hasSuggestions && (
+                  <li className="text-[11px] text-ink-secondary flex items-center gap-2">
+                    <span className="text-gray-600 font-mono text-[10px]">└</span>
+                    {(t("editor.autofix_suggestions") || "Aplicar {n} sugerencias ortográficas").replace("{n}", pendingSuggestions)}
+                  </li>
+                )}
+                {trimAvailable && (
+                  <li className="text-[11px] text-ink-secondary flex items-center gap-2">
+                    <span className="text-gray-600 font-mono text-[10px]">└</span>
+                    {(t("editor.autofix_trim") || "Recortar {n} líneas con texto colgado").replace("{n}", longSegCount)}
+                  </li>
+                )}
+              </ul>
+            )}
           </div>
         );
       })()}
@@ -1725,7 +1823,17 @@ export default function LyricsEditor({
           AND frees the primary purple CTA so "Aprobar y generar" in
           the parent header has no visual competitor. */}
       {audioUrl && (
-        <div className="mb-4 flex items-center gap-3 px-3 py-2.5 rounded-card bg-surface-2/60 ring-1 ring-white/[0.05]" data-tour="editor-playbar">
+        /* Phase B 2026-05-25: sticky para que el play/pause + scrub
+           siempre estén accesibles mientras el operador scrollea la
+           lista de líneas. top usa stickyHeaderTop (passed by parent)
+           para clear el header superior si lo hay. backdrop-blur +
+           bg semi-transparente para que el contenido scrolleado abajo
+           se vea sutil debajo. z-20 sobre el contenido normal del editor. */
+        <div
+          className="mb-3 sticky z-20 backdrop-blur-md bg-surface-1/85 flex items-center gap-3 px-3 py-2.5 rounded-card ring-1 ring-white/[0.05]"
+          style={{ top: stickyHeaderTop || 0 }}
+          data-tour="editor-playbar"
+        >
           <button
             onClick={togglePlay}
             className="w-10 h-10 rounded-full bg-brand hover:bg-brand-light text-white flex items-center justify-center transition-colors shrink-0"
@@ -1789,6 +1897,36 @@ export default function LyricsEditor({
               Línea de tiempo
             </button>
           </div>
+          {/* 2026-05-25 Studio Console — Modo Enfoque toggle.
+              Botón discreto al lado del view switcher. Esconde ruido
+              (auto-fix collapse) y agranda max-h de la lista + timeline.
+              Atajo F (global, no en inputs). */}
+          <button
+            type="button"
+            onClick={toggleFocusMode}
+            aria-pressed={focusMode}
+            title={focusMode
+              ? (t("editor.focus_exit") || "Salir de modo enfoque (F)")
+              : (t("editor.focus_enter") || "Modo enfoque (F)")
+            }
+            className={`hidden md:inline-flex shrink-0 w-8 h-8 rounded-md ring-1 transition-colors items-center justify-center
+              ${focusMode
+                ? "ring-brand/40 bg-brand/15 text-brand-light"
+                : "ring-white/[0.08] text-ink-secondary hover:text-brand-light hover:bg-brand/10 hover:ring-brand/30"}`}
+          >
+            {focusMode ? (
+              /* contract icon — flechas hacia adentro */
+              <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
+                <path d="M9 4v6H3M21 14h-6v6" strokeLinecap="round" strokeLinejoin="round" />
+                <path d="M9 10L4 5M15 14l5 5" strokeLinecap="round" strokeLinejoin="round" />
+              </svg>
+            ) : (
+              /* expand icon — flechas hacia afuera */
+              <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
+                <path d="M4 9V4h5M20 15v5h-5M4 9l5-5M20 15l-5 5" strokeLinecap="round" strokeLinejoin="round" />
+              </svg>
+            )}
+          </button>
           {/* Sync mode entry — refactor 2026-05-23: pasó de botón ruidoso
               con texto a ícono discreto al lado del switcher. Atajo Cmd+K
               añadido al keyboard handler. */}
@@ -2129,10 +2267,18 @@ export default function LyricsEditor({
              viewMode (timeline → grid; list → full-width). Ahora SIEMPRE
              es grid: izq sticky con controles+preview, der con lista o
              timeline según viewMode. Preview siempre visible, controles
-             siempre en el mismo lugar. */}
-      <div className="grid grid-cols-1 lg:grid-cols-2 gap-4 mb-4 items-start">
+             siempre en el mismo lugar.
+
+             Phase 2 (2026-05-25): cuando el editor se monta dentro del
+             paso 6 del wizard (hideTypographyControls=true), la columna
+             izquierda no renderiza — los controles ya están en el paso
+             4 del stepper y el preview central del wizard refleja los
+             cambios. El grid colapsa a 1 columna full-width. */}
+      <div className={`grid gap-4 mb-4 items-start ${hideTypographyControls ? "grid-cols-1" : "grid-cols-1 lg:grid-cols-2"}`}>
           {/* COLUMNA IZQUIERDA — sticky en desktop. Controles tipográficos
-              + LyricVideoPreview (editable) + scope toggle. */}
+              + LyricVideoPreview (editable) + scope toggle.
+              Phase 2: oculta si hideTypographyControls=true (modo wizard). */}
+          {!hideTypographyControls && (
           <div className="space-y-2 lg:sticky lg:top-2 lg:self-start">
             {/* Live font switcher — preview re-renders in the chosen
                 typeface instantly; applied to the render on re-render. */}
@@ -2229,9 +2375,12 @@ export default function LyricsEditor({
               onDragStart={pushEditHistory}
             />
           </div>
+          )}
           {/* COLUMNA DERECHA — scrollea independiente. Lista o timeline
-              según viewMode. min-w-0 evita que rows muy largas rompan el grid. */}
-          <div className="min-w-0 space-y-2">
+              según viewMode. min-w-0 evita que rows muy largas rompan el grid.
+              Phase E 2026-05-25: relative + el mini-map vertical se posiciona
+              absolute a la derecha cuando hay >20 segments. */}
+          <div className="min-w-0 space-y-2 relative">
             {viewMode === "timeline" && audioUrl ? (
               <LyricsTimeline
                 segments={edited}
@@ -2244,6 +2393,7 @@ export default function LyricsEditor({
                 highlightedIds={highlightedIds}
                 waveform={waveform}
                 gapS={MIN_GAP_S}
+                focusMode={focusMode}
                 onSeek={(s) => seekTo(s, false)}
                 onDragStart={pushEditHistory}
                 onTimingChange={handleTimelineTimingChange}
@@ -2258,7 +2408,57 @@ export default function LyricsEditor({
                 </p>
                 <div className="relative">
                   <div className="absolute bottom-0 left-0 right-0 h-12 bg-gradient-to-t from-surface to-transparent pointer-events-none z-10 rounded-b-2xl" />
-                  <div ref={listRef} className="space-y-1 max-h-[calc(100vh-280px)] overflow-y-auto pr-1 pb-8">
+                  {/* Phase E 2026-05-25: mini-map vertical en el borde derecho.
+                      Cada segment se renderiza como un dot proporcional a su
+                      duración. El activo brilla. Playhead horizontal según
+                      currentTime. Click → seek a ese punto. Solo se renderiza
+                      cuando hay >20 segments (canciones cortas no lo necesitan).
+                      Sin esto, una canción de 80 líneas requiere scroll bruto
+                      para localizar dónde está el operador. */}
+                  {duration > 0 && edited.length > 20 && (
+                    <button
+                      type="button"
+                      onClick={(e) => {
+                        const rect = e.currentTarget.getBoundingClientRect();
+                        const pct = (e.clientY - rect.top) / rect.height;
+                        const seekT = Math.max(0, Math.min(duration, pct * duration));
+                        seekTo(seekT, false);
+                      }}
+                      title={t("editor.minimap_hint") || "Mini-mapa: click para saltar al tiempo"}
+                      aria-label={t("editor.minimap_hint") || "Mini-mapa"}
+                      className="absolute right-0 top-0 bottom-0 w-2 z-20 group/mini cursor-pointer"
+                      style={{ touchAction: "none" }}
+                    >
+                      {edited.map((seg) => {
+                        const top = (seg.start / duration) * 100;
+                        const height = Math.max(0.4, ((seg.end - seg.start) / duration) * 100);
+                        const isActive = seg._id === activeId;
+                        return (
+                          <span
+                            key={seg._id}
+                            className={`absolute left-0 right-0 rounded-sm pointer-events-none transition-colors ${
+                              isActive
+                                ? "bg-brand shadow-[0_0_6px_rgba(109,74,255,0.7)]"
+                                : "bg-white/10 group-hover/mini:bg-white/25"
+                            }`}
+                            style={{ top: `${top}%`, height: `${height}%` }}
+                          />
+                        );
+                      })}
+                      {duration > 0 && (
+                        <span
+                          className="absolute left-[-3px] right-[-3px] h-0.5 bg-brand-light pointer-events-none transition-[top] duration-150 ease-linear shadow-[0_0_8px_rgba(179,157,255,0.8)]"
+                          style={{ top: `${Math.min(100, Math.max(0, (currentTime / duration) * 100))}%` }}
+                        />
+                      )}
+                    </button>
+                  )}
+                  {/* Phase D 2026-05-25: gap entre rows reducido de 4px (space-y-1)
+                      a 2px (space-y-0.5). En canciones largas de 60+ líneas
+                      esto ahorra ~120px de scroll total. Y como el Phase B
+                      compactó el header (auto-fix pill 32px), max-h ahora
+                      puede crecer (100vh-200 vs 100vh-280 antes). */}
+                  <div ref={listRef} className={`space-y-0.5 overflow-y-auto pr-1 pb-8 ${focusMode ? "max-h-[calc(100vh-110px)]" : "max-h-[calc(100vh-200px)]"}`}>
           {edited.map((seg, idx) => {
             const suggestion = suggestionsById[seg._id];
             const isApplied = suggestion && seg.text === suggestion;
@@ -2278,9 +2478,16 @@ export default function LyricsEditor({
                 key={seg._id}
                 ref={(el) => { rowRefs.current[seg._id] = el; }}
                 {...(idx === 0 ? { "data-tour": "editor-list-row" } : {})}
+                /* Phase A 2026-05-25: highlight prominente cuando es activo.
+                   Antes: bg-brand/[0.07] ring-1 ring-brand/25 (invisible al
+                   operador, ~7% opacity). Ahora: bg-brand/15 + left-bar
+                   border-l-4 brand + glow shadow + key con activeId
+                   dispara el pulse de la animación wlp-row-pulse al
+                   transicionar a este row. */
+                data-active={isActive && !isArmed ? "true" : "false"}
                 className={`group rounded-xl transition-all
                   ${isArmed ? "bg-brand/[0.18] ring-2 ring-brand shadow-glow scale-[1.01]" : ""}
-                  ${!isArmed && isActive ? "bg-brand/[0.07] ring-1 ring-brand/25" : ""}
+                  ${!isArmed && isActive ? "wlp-active-row bg-brand/15 border-l-4 border-brand pl-1 shadow-[0_0_24px_-8px_rgba(109,74,255,0.45)]" : "border-l-4 border-transparent"}
                   ${!isArmed && !isActive && wasRecentlyAnchored ? "bg-brand/[0.05] ring-1 ring-brand/40" : ""}
                   ${!isArmed && !isActive && !wasRecentlyAnchored && isReview ? "bg-amber-500/[0.06] ring-1 ring-amber-500/40" : ""}
                   ${isAnchored ? "opacity-60" : ""}`}
@@ -2318,8 +2525,13 @@ export default function LyricsEditor({
                         onDoubleClick={() => startEditTimestamp(seg)}
                         title={t("editor.timestamp_hint") || "Click: ir al tiempo · Doble click: editar"}
                         className={`text-[11px] font-mono pt-2.5 w-14 text-right transition-colors
-                          ${isActive ? "text-brand-light" : wasRecentlyAnchored ? "text-brand-light" : "text-gray-600 hover:text-brand-light"}`}
+                          ${isActive ? "text-brand-light font-semibold" : wasRecentlyAnchored ? "text-brand-light" : "text-gray-600 hover:text-brand-light"}`}
                       >
+                        {/* Phase A 2026-05-25: indicador ▶ visible solo en
+                            la fila activa para reforzar "esta es la que está
+                            sonando ahora". El símbolo es half-width para no
+                            empujar el timestamp ni romper la grilla. */}
+                        {isActive && <span className="text-brand-light mr-0.5" aria-hidden="true">▶</span>}
                         {formatTimestamp(seg.start)}
                       </button>
                       {wasRecentlyAnchored && (
@@ -2343,7 +2555,7 @@ export default function LyricsEditor({
                       )}
                     </div>
                   )}
-                  <div className="flex-1 min-w-0">
+                  <div className="flex-1 min-w-0 relative">
                     <input
                       type="text"
                       value={seg.text}
@@ -2354,10 +2566,64 @@ export default function LyricsEditor({
                         setTextEditStart({ id: seg._id, text: seg.text });
                       }}
                       onBlur={(e) => handleTextBlur(seg._id, e.target.value)}
-                      className={`w-full px-3 py-2 rounded-xl bg-surface-1 border text-sm text-white
+                      /* Phase A 2026-05-25: cuando es active y no focused,
+                         escondemos el texto del input (text-transparent +
+                         caret-transparent) para que el overlay de karaoke
+                         word-jump abajo sea el único texto visible. Al
+                         clickear el input para editar, focusedSegId cambia
+                         y el texto vuelve. */
+                      className={`w-full px-3 py-2 rounded-xl bg-surface-1 border text-sm
                         focus:border-brand/40 focus:outline-none hover:border-white/[0.08] transition-all
+                        ${isActive && focusedSegId !== seg._id ? "text-transparent caret-transparent selection:text-white" : "text-white"}
                         ${suggestion && !isApplied ? "border-amber-500/20" : isReview ? "border-amber-500/40" : "border-white/[0.04]"}`}
                     />
+                    {/* Phase A 2026-05-25: overlay karaoke word-jump (Apple
+                        Music style). Solo visible cuando este segment es el
+                        activo Y el operador no está editando. Las palabras
+                        se renderizan como spans con scale + glow en la
+                        palabra activa, dim en las futuras, neutral en las
+                        ya pasadas. La duración de cada palabra es
+                        uniforme (seg duration / N) — suficientemente
+                        cercano al avance real para que se sienta vivo. */}
+                    {isActive && focusedSegId !== seg._id && seg.text && (() => {
+                      const words = seg.text.split(/(\s+)/);
+                      const wordsOnly = words.filter((w) => /\S/.test(w));
+                      const N = wordsOnly.length;
+                      const duration = Math.max(0.001, seg.end - seg.start);
+                      const wDur = duration / Math.max(1, N);
+                      const elapsed = Math.max(0, currentTime - seg.start);
+                      const activeWordIdx = Math.min(N - 1, Math.max(0, Math.floor(elapsed / wDur)));
+                      let nonSpaceIdx = -1;
+                      return (
+                        <div
+                          className="absolute inset-0 px-3 py-2 text-sm pointer-events-none whitespace-pre-wrap leading-[1.4]"
+                          aria-hidden="true"
+                          style={{ fontFeatureSettings: "normal" }}
+                        >
+                          {words.map((tok, i) => {
+                            if (!/\S/.test(tok)) return <span key={i}>{tok}</span>;
+                            nonSpaceIdx += 1;
+                            const wActive = nonSpaceIdx === activeWordIdx;
+                            const wPast = nonSpaceIdx < activeWordIdx;
+                            return (
+                              <span
+                                key={i}
+                                style={{
+                                  display: "inline-block",
+                                  transform: wActive ? "scale(1.08)" : "scale(1)",
+                                  transformOrigin: "center bottom",
+                                  color: wActive ? "#b39dff" : wPast ? "rgba(255,255,255,0.92)" : "rgba(255,255,255,0.55)",
+                                  textShadow: wActive ? "0 0 14px rgba(109,74,255,0.65)" : "none",
+                                  transition: "transform 140ms cubic-bezier(.2,1.4,.35,1), color 200ms ease, text-shadow 200ms ease",
+                                }}
+                              >
+                                {tok}
+                              </span>
+                            );
+                          })}
+                        </div>
+                      );
+                    })()}
                     {isReview && (
                       <span className="inline-flex items-center gap-1 mt-1 ml-1 px-2 py-0.5 rounded-full
                         bg-amber-500/15 text-amber-300 text-[10px] font-medium">

@@ -361,6 +361,12 @@ def run_pipeline(job_id: str, mp3_path: str, artist: str, style: str,
                  text_motion: str = "none",
                  lyrics_animation: str = "none",
                  line_transition: str = "none",
+                 # Lyric text colors 2026-05-25. Hex #RRGGBB; cadena vacía
+                 # = blanco default. Para karaoke: lyric_color = palabra no
+                 # cantada, lyric_sung_color = palabra cantada. Para otras
+                 # animaciones: lyric_color = único color del texto.
+                 lyric_color: str = "",
+                 lyric_sung_color: str = "",
                  match_lyrics: bool = True,
                  text_contrast: str = "medium",
                  # Background_hint llega solo desde el flow de variantes
@@ -639,6 +645,14 @@ def run_pipeline(job_id: str, mp3_path: str, artist: str, style: str,
                     logger.warning("[BG] cache lookup error key=%s: %s — fallback", bg_cache_key, e)
 
             if bg_image_path is None:
+                # Fix urgente 2026-05-25: pasar audio_duration al Ken Burns
+                # render para evitar el palindrome loop trabado en audios >60s.
+                # Best-effort: si el cómputo falla, ensure_background cae al
+                # default de 60s (comportamiento previo).
+                try:
+                    _audio_dur_for_kb = _audio_duration(mp3_path)
+                except Exception:
+                    _audio_dur_for_kb = None
                 bg_image_path = _ensure_background(
                     style, job_dir,
                     lyrics_text=lyrics_text, artist=artist, job_id=job_id,
@@ -650,6 +664,7 @@ def run_pipeline(job_id: str, mp3_path: str, artist: str, style: str,
                     bg_verbatim=bg_verbatim,
                     custom_colors=custom_colors,
                     allow_people=_compute_allow_people(job_id),
+                    audio_duration=_audio_dur_for_kb,
                 )
             # Image-to-video fallback: if Veo failed to produce an MP4 (None
             # or non-existent path) AND the operator wanted to animate their
@@ -880,6 +895,7 @@ def run_pipeline(job_id: str, mp3_path: str, artist: str, style: str,
                 line_transition=line_transition,
                 text_contrast=text_contrast,
                 effect=effect, custom_colors=custom_colors,
+                lyric_color=lyric_color, lyric_sung_color=lyric_sung_color,
             )
             files["video_url"] = f"/download/{job_id}/video"
             update_job(job_id, progress=55)
@@ -5758,7 +5774,9 @@ def _ensure_background(style_hint: str, job_dir: str, lyrics_text: str = None,
                        bg_mode: str = "veo",
                        bg_verbatim: bool = False,
                        custom_colors: str = "",
-                       allow_people: bool = False) -> str:
+                       effect: str = "",
+                       allow_people: bool = False,
+                       audio_duration: float | None = None) -> str:
     """Generate background using AI. Gemini picks the best style for the song.
 
     background_hint: optional free-form operator description, set via /edit
@@ -5815,31 +5833,31 @@ def _ensure_background(style_hint: str, job_dir: str, lyrics_text: str = None,
     elif _norm_move_bg == "foto-parallax" and bg_mode != "imagen":
         logger.info("[BG] movement=foto-parallax overrides bg_mode → imagen (lateral pan)")
         bg_mode = "imagen"
-    # Estático / Sutil: HISTÓRICAMENTE (2026-05-22) ruteados a Imagen porque
-    # Veo ignoraba "locked / no advance" ~50% del tiempo y se mandaba al
-    # frente, arruinando la legibilidad de las letras superpuestas.
+    # Estático / Sutil: el design intent (clarificado por operador UMG
+    # 2026-05-25) es que estos sean ESCENAS REALES generadas por Veo,
+    # NO fotos estáticas:
+    #   - "Estático" → Veo, cámara fija, motion in-scene (gente caminando,
+    #     olas, nubes, neblina, fuego, ambiente vivo).
+    #   - "Sutil"    → Veo, drift sutil de cámara + scene motion.
     #
-    # 2026-05-25 — El design intent original era que estatico/sutil sean
-    # escenas REALES con Veo (cámara estática + motion in-scene rica), no
-    # still photos. Foto+parallax es el único Imagen path por diseño.
+    # "Foto + parallax" es el ÚNICO path Imagen → Ken Burns por diseño.
     #
-    # Gated detrás de STATIC_SUTIL_VIA_VEO env flag (default OFF en staging
-    # por seguridad — flip a "1" para alinear con el design). Cuando esté
-    # ON, estos registers usan Veo con prompt hardening reforzado (C2+C3+C4
-    # más abajo) para minimizar el riesgo de forward-push del Veo histórico.
-    #
-    # Si el flag está OFF, mantiene el comportamiento conservador 2026-05-22.
+    # HISTÓRICAMENTE (2026-05-22) estatico/sutil iban a Imagen como
+    # workaround porque Veo ignoraba "locked camera" ~50%. El prompt
+    # hardening C2+C3+C4 reforzado en _generate_veo_video mitiga eso.
+    # Default ahora es Veo. Para volver al workaround (si Veo regresa
+    # al comportamiento histórico), setear STATIC_SUTIL_VIA_IMAGEN=1.
     elif _norm_move_bg in ("estatico", "sutil") and bg_mode != "imagen":
-        _static_sutil_via_veo = (
-            os.environ.get("STATIC_SUTIL_VIA_VEO", "").strip().lower()
+        _force_imagen_legacy = (
+            os.environ.get("STATIC_SUTIL_VIA_IMAGEN", "").strip().lower()
             in ("1", "true", "yes", "on")
         )
-        if not _static_sutil_via_veo:
-            logger.info("[BG] movement=%s overrides bg_mode → imagen (controlled camera, STATIC_SUTIL_VIA_VEO=off)", _norm_move_bg)
+        if _force_imagen_legacy:
+            logger.info("[BG] movement=%s overrides bg_mode → imagen (STATIC_SUTIL_VIA_IMAGEN=on, legacy workaround)", _norm_move_bg)
             bg_mode = "imagen"
         else:
-            logger.info("[BG] movement=%s stays on Veo (STATIC_SUTIL_VIA_VEO=on)", _norm_move_bg)
-            # bg_mode stays "veo" — _generate_veo_video will receive the
+            logger.info("[BG] movement=%s stays on Veo (design intent 2026-05-25 — scene REAL)", _norm_move_bg)
+            # bg_mode stays "veo" — _generate_veo_video receives the
             # hardened safe_prompt for estatico/sutil (C2 + C3).
 
     # Imagen-4 + Ken Burns branch. Cabled 2026-05-16 — _generate_imagen_image
@@ -5862,8 +5880,9 @@ def _ensure_background(style_hint: str, job_dir: str, lyrics_text: str = None,
         # operador eligió específicamente para path Imagen premium.
         # Merece el modelo ultra (~$0.04 vs $0.02 estándar — despreciable
         # comparado con los $0.80-3.20 de Veo de los otros registers).
-        # Estatico/sutil siguen con el modelo estándar (default IMAGEN_MODEL)
-        # cuando NO está activado el flag STATIC_SUTIL_VIA_VEO (Parte C).
+        # Estatico/sutil legacy (cuando STATIC_SUTIL_VIA_IMAGEN=1) siguen con
+        # el modelo estándar (default IMAGEN_MODEL). Default 2026-05-25 ya no
+        # llega acá — estatico/sutil ahora van por Veo.
         _parallax_model = (
             os.environ.get("IMAGEN_MODEL_PARALLAX",
                            "imagen-4.0-ultra-generate-001").strip()
@@ -5899,8 +5918,26 @@ def _ensure_background(style_hint: str, job_dir: str, lyrics_text: str = None,
         # NOTE: dejamos el parámetro static=True en _ken_burns_clip por si
         # algún caller fuera del wizard lo necesita (ej. tests, edit modal),
         # pero el wizard nunca lo activa.
+        # Fix urgente 2026-05-25 (operador UMG: 'foto que se mueve a la
+        # izquierda con movimiento todo trabado y feo'). Causa raíz: el
+        # sample de 60s se palindrome-loopea para llenar audios >60s. En
+        # un audio de 4:28 la cámara cambia de dirección CADA 60 SEGUNDOS
+        # (forward → reverse → forward...), generando el 'trabado'.
+        #
+        # Fix: cuando conocemos audio_duration y es >60s, renderizar el
+        # Ken Burns por la duración COMPLETA del audio. Sin palindrome
+        # loop = sin reversiones = pan continuo y limpio. Caro en CPU
+        # (~5min más por job) pero acceptable para UMG.
+        _kb_dur = max(60.0, float(audio_duration) if audio_duration else 60.0)
+        if audio_duration and float(audio_duration) > 60.0:
+            logger.info(
+                "[BG] Ken Burns render full audio duration %.1fs (no palindrome loop) "
+                "para evitar movimiento trabado (UMG fix 2026-05-25)",
+                _kb_dur,
+            )
         _ken_burns_image_to_mp4(
             image_path, bg_path,
+            sample_duration=_kb_dur,
             static=False,
             lateral=(_norm_move_bg == "foto-parallax"),
             subtle=(_norm_move_bg in ("estatico", "sutil")),
@@ -6133,8 +6170,20 @@ def _ken_burns_clip(image_path: str, duration: float, spec: RenderSpec | None = 
             scale_base, scale_amp = 1.185, 0.035  # breathes 1.15..1.22
             amp_x, amp_y = 1.0, 0.0
         else:  # subtle
-            scale_base, scale_amp = 1.10, 0.0  # no breath
-            amp_x, amp_y = 0.35, 0.18
+            # Fix urgente 2026-05-25 (UMG: 'los últimos videos salieron
+            # con fotos fijas'). Las amplitudes anteriores (amp_x=0.35,
+            # amp_y=0.18, scale_amp=0.0) producían ~1px/segundo de pan
+            # sobre 60s — visualmente indistinguible de una foto fija.
+            # El operador UMG esperaba 'minimal movement' = perceptible
+            # pero calmo, NO invisible.
+            #
+            # Cambio: 2x el horizontal travel + 2x el vertical drift +
+            # breath sutil de ±1.5% del zoom para que la cámara 'respire'.
+            # Sobre 60s da ~2-3px/seg + breath cycle de ~24s — barely-
+            # there pero PERCEPTIBLE. Operador sigue percibiendo escena
+            # calma sin marcas dramáticas.
+            scale_base, scale_amp = 1.115, 0.015  # breath ~1.10..1.13
+            amp_x, amp_y = 0.65, 0.32
         # Use scale_base for crop dims (cw/ch held constant — breath happens
         # in the FINAL resize step). Computing cw/ch per-frame would break
         # the base_x/base_y precomputation.
@@ -7436,6 +7485,12 @@ def _render_lyrics_ass(
     effect: str = "",
     style: str = "",
     custom_colors: str = "",
+    # Lyric text colors 2026-05-25. Hex #RRGGBB; cadena vacía → blanco.
+    # Para karaoke: lyric_color = palabra no cantada, lyric_sung_color =
+    # palabra cantada. Para otras animaciones: lyric_color = único color
+    # del texto (PrimaryColour del style en ASS).
+    lyric_color: str = "",
+    lyric_sung_color: str = "",
 ) -> str:
     """Fast lyric render: burn the lyrics with libass in a single ffmpeg
     pass over the (ffmpeg-looped) background — no moviepy frame loop.
@@ -7487,6 +7542,15 @@ def _render_lyrics_ass(
         transition=line_transition,
         case_fn=lambda t: _apply_case(t, text_case),
     )
+    # Lyric color mapping para build_ass (style line + override karaoke):
+    # karaoke → primary = sung color, secondary = un-sung. Otras animaciones
+    # usan primary = lyric_color (texto único) y secondary irrelevante.
+    if lyrics_animation == "karaoke":
+        primary_for_lines = lyric_sung_color or ""
+        secondary_for_lines = lyric_color or ""
+    else:
+        primary_for_lines = lyric_color or ""
+        secondary_for_lines = ""
     first_lyric_start = segments[0]["start"] if segments else duration
     lines += _ass.title_card_lines(
         artist, song_title, first_lyric_start,
@@ -7496,10 +7560,16 @@ def _render_lyrics_ass(
         artist_font_family=artist_family,
     )
     base_fs = _ass.lyric_fontsize(40, scale, font_scale)
+    # Reusamos el mapping primary/secondary computado arriba para
+    # segments_to_lines — mismo eje semántico (karaoke usa sung como
+    # PrimaryColour). Sin esto la palabra cantada se rendea con
+    # PrimaryColour blanco aunque el operador haya elegido otro color.
     ass_doc = _ass.build_ass(
         width=spec.width, height=spec.height,
         font_name=family, base_fontsize=base_fs,
         outline=outline, shadow=shadow, lines=lines, bold=bold,
+        primary_color=primary_for_lines,
+        secondary_color=secondary_for_lines,
     )
     ass_path = os.path.join(job_dir, "lyrics.ass")
     with open(ass_path, "w", encoding="utf-8") as f:
@@ -7635,6 +7705,9 @@ def generate_lyric_video(
     text_contrast: str = "medium",
     effect: str = "",
     custom_colors: str = "",
+    # Lyric text colors 2026-05-25. Hex #RRGGBB; "" → blanco default.
+    lyric_color: str = "",
+    lyric_sung_color: str = "",
 ) -> tuple[str, str, str | None]:
     """Generate a lyric video. Returns (video_path, font, bg_source).
 
@@ -7740,6 +7813,7 @@ def generate_lyric_video(
                 text_contrast=text_contrast,
                 artist=artist, song_title=title_song,
                 effect=effect, style=style, custom_colors=custom_colors,
+                lyric_color=lyric_color, lyric_sung_color=lyric_sung_color,
             )
             logger.info("[ASS] render: %.1fs (engine=ass)", _time.monotonic() - _t0)
             audio.close()
@@ -8491,6 +8565,12 @@ def run_edit_pipeline(
     # so a re-render keeps the snow/rain/grade the operator picked at upload.
     effect = merged.get("effect") or ""
     custom_colors = merged.get("custom_colors") or ""
+    # Lyric text colors 2026-05-25. Si el operador no los seteó, fall back
+    # a "" (= blanco default en build_ass). Persisten en render_params
+    # como custom_colors → un re-render de la misma variante mantiene los
+    # colores elegidos.
+    lyric_color = merged.get("lyric_color") or ""
+    lyric_sung_color = merged.get("lyric_sung_color") or ""
     # Per-edit operator hint for background regen (set by /edit when the
     # user typed in the "Aclarar tipo de fondo" textarea). None if absent;
     # propagates only into the `background` branch below.
@@ -8597,6 +8677,7 @@ def run_edit_pipeline(
             lyrics_animation=lyrics_animation,
             line_transition=line_transition,
             effect=effect, custom_colors=custom_colors,
+            lyric_color=lyric_color, lyric_sung_color=lyric_sung_color,
         )
         files = {"video_url": f"/download/{job_id}/video"}
         update_job(job_id, progress=55)

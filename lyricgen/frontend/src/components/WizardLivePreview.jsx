@@ -1,3 +1,4 @@
+import { useEffect, useRef, useState } from "react";
 import { useI18n } from "../i18n";
 
 // Studio Console live preview. Shows a sample lyric line over the selected
@@ -32,19 +33,102 @@ const MOVE_ANIM = {
   animado:        "wlp-anim 1.8s linear infinite",
 };
 
-export default function WizardLivePreview({ style = "auto", customColors = "", movementStyle = "", effect = "", lyricsAnimation = "none", lineTransition = "none", mode = "lyrics", lyric, clipSrc = "/movement_samples/estandar.mp4" }) {
+// Convert #RRGGBB → rgba(r,g,b,a). Returns null if hex is malformed —
+// caller should fall back to a theme default. Used for the un-sung
+// karaoke color which needs a softer opacity than the picked hex.
+function hexToRgba(hex, alpha) {
+  if (typeof hex !== "string" || !/^#[0-9a-fA-F]{6}$/.test(hex)) return null;
+  const r = parseInt(hex.slice(1, 3), 16);
+  const g = parseInt(hex.slice(3, 5), 16);
+  const b = parseInt(hex.slice(5, 7), 16);
+  return `rgba(${r}, ${g}, ${b}, ${alpha})`;
+}
+
+export default function WizardLivePreview({
+  style = "auto",
+  customColors = "",
+  movementStyle = "",
+  effect = "",
+  lyricsAnimation = "none",
+  lineTransition = "none",
+  // Lyric text colors 2026-05-25:
+  // - lyricColor: color del texto (no-cantada para karaoke; texto único
+  //   para el resto de animaciones).
+  // - lyricSungColor: solo aplica a karaoke = color de la palabra cantada.
+  // Default #FFFFFF: preservar el look histórico cuando el operador no
+  // toca el picker.
+  lyricColor = "#FFFFFF",
+  lyricSungColor = "#FFFFFF",
+  mode = "lyrics",
+  lyric,
+  clipSrc = "/movement_samples/estandar.mp4",
+  // Phase C 2026-05-25: ref que recibe playback tick desde LyricsEditor.
+  // Cuando el operador clickea play en el editor (paso 6), el ref publica
+  // {activeLine, activeStart, activeEnd, currentTime} a 60fps. Lo leemos
+  // con nuestro propio rAF para renderizar word-jump real sincronizado al
+  // audio, sin disparar re-renders en App.jsx/UploadZone.
+  playbackTickRef = null,
+}) {
   const { t } = useI18n();
+  // Phase C: estado local del tick. Inicializa vacío; el rAF interno lo
+  // actualiza periodicamente desde playbackTickRef. setState dispara
+  // re-render del preview, NO de los componentes padres (gracias al ref).
+  const [livePlaybackTick, setLivePlaybackTick] = useState(null);
+  const lastTickRef = useRef({ activeLine: "", currentTime: -1 });
+  useEffect(() => {
+    if (!playbackTickRef) return undefined;
+    let raf = 0;
+    const loop = () => {
+      const tick = playbackTickRef.current;
+      if (tick && tick.activeLine) {
+        // Solo dispara setState si cambió la línea activa o el currentTime
+        // se movió >40ms (suficiente para word-jump perceptible, ~25Hz).
+        // Sin este guard, setState a 60fps haría thrashing.
+        const last = lastTickRef.current;
+        if (
+          tick.activeLine !== last.activeLine ||
+          Math.abs(tick.currentTime - last.currentTime) > 0.04
+        ) {
+          lastTickRef.current = { activeLine: tick.activeLine, currentTime: tick.currentTime };
+          setLivePlaybackTick({ ...tick });
+        }
+      } else if (livePlaybackTick !== null) {
+        // El operador pausó/paró el audio — limpiar para volver al loop sample.
+        lastTickRef.current = { activeLine: "", currentTime: -1 };
+        setLivePlaybackTick(null);
+      }
+      raf = requestAnimationFrame(loop);
+    };
+    raf = requestAnimationFrame(loop);
+    return () => cancelAnimationFrame(raf);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [playbackTickRef]);
   const isAnimado = movementStyle === "animado";
-  // With an effect active, compose it over a CALM, neutral premium scene (not
-  // the movement-sample clip) so particles never clash with a busy scene like
-  // the nebula. Without an effect, show the chosen movement's own clip.
-  const baseClip = effect ? "/preview_base.mp4" : clipSrc;
+  // Bug fix 2026-05-25 (reportado por operador): cuando un efecto estaba
+  // activo, baseClip se forzaba a /preview_base.mp4 (escena de montañas
+  // fija), IGNORANDO la elección de movement del operador. El operador
+  // clickeaba el thumbnail de Sutil (interior room) pero el preview seguía
+  // mostrando montañas — disconnect visual entre la galería de movements
+  // y el preview central.
+  //
+  // Cambio: usar SIEMPRE el clipSrc del movement elegido. Los samples
+  // (estatico/sutil/estandar/foto-parallax) son ya escenas calmas — un
+  // overlay de nieve/lluvia no clash. El único caso problemático es
+  // 'animado' (nebula 2D) + effect partículas, donde el clash es real;
+  // ahí caemos a preview_base.mp4 para preservar la legibilidad de las
+  // partículas. Animado SIN effect mantiene su clip original.
+  const baseClip = (effect && isAnimado) ? "/preview_base.mp4" : clipSrc;
   // With an effect active the base is a FIXED calm scene, so the chosen movement
   // is conveyed by a CSS camera transform on it (Estático=still, Cinematográfico
   // =zoom/drift, Foto+parallax=lateral pan…) — clicking a register visibly
   // changes the preview's motion. Without an effect the base IS the movement
   // clip (motion already baked in), so no extra transform.
-  const baseAnim = effect ? (MOVE_ANIM[movementStyle] || "none") : "none";
+  // Si baseClip es preview_base.mp4 (escena fija calma), aplicamos CSS
+  // animation para que se note el movement style (no hay motion baked).
+  // Si baseClip es el movement clip directo, el motion ya está horneado
+  // en el video — aplicar CSS animation encima compondría. Por eso solo
+  // CSS animation cuando estamos en el fallback preview_base.
+  const baseAnim = (baseClip === "/preview_base.mp4") ? (MOVE_ANIM[movementStyle] || "none") : "none";
   const isMinimal = style === "minimal";
   // Resolve the background gradient: a preset, the custom colors, or a
   // pleasant default for "auto" (the AI will pick the real colors).
@@ -96,27 +180,128 @@ export default function WizardLivePreview({ style = "auto", customColors = "", m
   // in lockstep) so the sweep/reveal is always visible — not a one-shot that
   // finishes before the operator looks. Colours come from CSS vars so it reads
   // on both dark and light (minimal) palettes.
-  const dim = isMinimal ? "rgba(0,0,0,.34)" : "rgba(255,255,255,.4)";
-  const lit = isMinimal ? "#0f9b83" : "#19E0BC";
-  const lyricContent = isWordAnim
-    ? sampleWords.map((w, i) => (
-        <span
-          key={i}
-          style={{
-            display: "inline-block",
-            marginRight: i < sampleWords.length - 1 ? "0.26em" : 0,
-            "--dim": dim,
-            "--lit": lit,
-            animation:
-              lyricsAnimation === "word_reveal"
-                ? `wlp-reveal-loop 3s ${i * 0.22}s infinite both`
-                : `wlp-karaoke-sweep 2.8s ${i * 0.24}s infinite both`,
-          }}
-        >
-          {w}
-        </span>
-      ))
-    : sample;
+  // Colors: si el operador picó algo distinto de #FFFFFF, usalo. Sino
+  // mantenemos los defaults históricos (un-sung white/grey, sung
+  // white/green). hexToRgba con alpha=0.4 dimm-ea el color un-sung del
+  // operador a un tono "fantasma" tipo el grey del libass &H00808080&.
+  const operatorPickedColor = lyricColor && lyricColor.toUpperCase() !== "#FFFFFF";
+  const operatorPickedSung = lyricSungColor && lyricSungColor.toUpperCase() !== "#FFFFFF";
+  const dim = operatorPickedColor
+    ? (hexToRgba(lyricColor, 0.4) || (isMinimal ? "rgba(0,0,0,.34)" : "rgba(255,255,255,.4)"))
+    : (isMinimal ? "rgba(0,0,0,.34)" : "rgba(255,255,255,.4)");
+  const lit = operatorPickedSung
+    ? lyricSungColor
+    : (isMinimal ? "#0f9b83" : "#19E0BC");
+  // Color del texto plain (none/pop/glow): el lyricColor directo si fue
+  // pickeado; sino el default por tema (negro en minimal, blanco en oscuro).
+  const plainTextColor = operatorPickedColor
+    ? lyricColor
+    : (isMinimal ? "#111827" /* text-gray-900 */ : "#FFFFFF");
+  // Phase C 2026-05-25: cuando hay un livePlaybackTick activo (audio
+  // reproduciendo en el editor), el preview muestra la línea REAL con
+  // word-jump driven por currentTime — mismo style que el list view del
+  // editor para mantener coherencia visual. Sin tick, fallback al loop
+  // sample del modo legacy.
+  const liveActive = livePlaybackTick && livePlaybackTick.activeLine
+    ? livePlaybackTick
+    : null;
+  let lyricContent;
+  let liveLineKey = null;
+  if (liveActive) {
+    const segText = liveActive.activeLine;
+    liveLineKey = segText;
+    const segStart = liveActive.activeStart;
+    const segEnd = liveActive.activeEnd;
+    const ct = liveActive.currentTime;
+
+    if (lyricsAnimation === "karaoke" || lyricsAnimation === "word_reveal") {
+      // Per-word animations: tokenize the active line and compute which
+      // word is currently being sung. Karaoke colours/scales the active
+      // word; word_reveal makes words appear one-by-one as they're sung.
+      // Other lyricsAnimation values (none/pop/glow) fall through to the
+      // plain-text branch below — the line-level animation runs on the
+      // wrapper instead.
+      const tokens = segText.split(/(\s+)/);
+      const wordsOnly = tokens.filter((tok) => /\S/.test(tok));
+      const N = wordsOnly.length;
+      const dur = Math.max(0.001, segEnd - segStart);
+      const wDur = dur / Math.max(1, N);
+      const elapsed = Math.max(0, ct - segStart);
+      const activeWordIdx = Math.min(N - 1, Math.max(0, Math.floor(elapsed / wDur)));
+      let nonSpaceIdx = -1;
+      lyricContent = tokens.map((tok, i) => {
+        if (!/\S/.test(tok)) return <span key={i}>{tok}</span>;
+        nonSpaceIdx += 1;
+        const wActive = nonSpaceIdx === activeWordIdx;
+        const wPast = nonSpaceIdx < activeWordIdx;
+        if (lyricsAnimation === "word_reveal") {
+          const visible = wActive || wPast;
+          return (
+            <span
+              key={i}
+              style={{
+                display: "inline-block",
+                opacity: visible ? 1 : 0,
+                transform: visible ? "translateY(0)" : "translateY(0.4em)",
+                transition: "opacity 220ms ease, transform 320ms cubic-bezier(.2,.8,.2,1)",
+              }}
+            >
+              {tok}
+            </span>
+          );
+        }
+        return (
+          <span
+            key={i}
+            style={{
+              display: "inline-block",
+              transform: wActive ? "scale(1.10)" : "scale(1)",
+              transformOrigin: "center bottom",
+              // wActive = palabra cantada → lit (lyricSungColor cuando el
+              // operador la pickeó, sino el verde default). wPast = palabras
+              // ya cantadas (alpha alto). wFuture = aún por cantar (alpha bajo).
+              color: wActive
+                ? lit
+                : wPast
+                  ? (operatorPickedColor ? (hexToRgba(lyricColor, 0.95) || (isMinimal ? "rgba(0,0,0,0.85)" : "rgba(255,255,255,0.95)")) : (isMinimal ? "rgba(0,0,0,0.85)" : "rgba(255,255,255,0.95)"))
+                  : (operatorPickedColor ? (hexToRgba(lyricColor, 0.55) || (isMinimal ? "rgba(0,0,0,0.40)" : "rgba(255,255,255,0.55)")) : (isMinimal ? "rgba(0,0,0,0.40)" : "rgba(255,255,255,0.55)")),
+              textShadow: wActive
+                ? `0 0 14px ${hexToRgba(lit, 0.65) || "rgba(25,224,188,0.7)"}`
+                : "none",
+              transition: "transform 140ms cubic-bezier(.2,1.4,.35,1), color 200ms ease, text-shadow 200ms ease",
+            }}
+          >
+            {tok}
+          </span>
+        );
+      });
+    } else {
+      // none / pop / glow: render the active line as plain text. The
+      // wrapper's lineAnim handles entry — replays on line change because
+      // the wrapper key includes liveLineKey.
+      lyricContent = segText;
+    }
+  } else if (isWordAnim) {
+    lyricContent = sampleWords.map((w, i) => (
+      <span
+        key={i}
+        style={{
+          display: "inline-block",
+          marginRight: i < sampleWords.length - 1 ? "0.26em" : 0,
+          "--dim": dim,
+          "--lit": lit,
+          animation:
+            lyricsAnimation === "word_reveal"
+              ? `wlp-reveal-loop 3s ${i * 0.22}s infinite both`
+              : `wlp-karaoke-sweep 2.8s ${i * 0.24}s infinite both`,
+        }}
+      >
+        {w}
+      </span>
+    ));
+  } else {
+    lyricContent = sample;
+  }
 
   // Line transition (movement) plays on a wrapper so it composes with the
   // inner animation. Loops continuously so it stays visible in the preview.
@@ -209,9 +394,9 @@ export default function WizardLivePreview({ style = "auto", customColors = "", m
         {/* transition wrapper (movement) composes with the inner animation */}
         <div key={`${lineTransition}:${sample}`} style={{ animation: transWrapAnim }}>
           <div
-            key={`${lyricsAnimation}:${sample}`}
-            className={`font-extrabold tracking-[-0.03em] leading-[1.02] ${isMinimal ? "text-gray-900" : "text-white"}`}
-            style={{ fontSize: "clamp(18px,7.5cqw,68px)", textShadow: isMinimal ? "0 1px 0 rgba(255,255,255,.5)" : "-1px -1px 0 rgba(0,0,0,.6), 1px -1px 0 rgba(0,0,0,.6), -1px 1px 0 rgba(0,0,0,.6), 1px 1px 0 rgba(0,0,0,.6)", animation: isWordAnim ? undefined : lineAnim }}
+            key={`${lyricsAnimation}:${liveLineKey ?? sample}`}
+            className="font-extrabold tracking-[-0.03em] leading-[1.02]"
+            style={{ color: plainTextColor, fontSize: "clamp(18px,7.5cqw,68px)", textShadow: isMinimal ? "0 1px 0 rgba(255,255,255,.5)" : "-1px -1px 0 rgba(0,0,0,.6), 1px -1px 0 rgba(0,0,0,.6), -1px 1px 0 rgba(0,0,0,.6), 1px 1px 0 rgba(0,0,0,.6)", animation: isWordAnim ? undefined : lineAnim }}
           >
             {lyricContent}
           </div>

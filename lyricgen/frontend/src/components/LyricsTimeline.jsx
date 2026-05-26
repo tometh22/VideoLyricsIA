@@ -33,7 +33,8 @@ const CLICK_SLOP_PX = 4;       // movement under this = click (focus/seek), not 
 const LABEL_W = 38;            // left time-label column
 const WAVE_W = 30;             // waveform band width inside the gutter
 const GUTTER_PX = LABEL_W + WAVE_W; // total left gutter (labels + waveform)
-const MAX_VH = "58vh";         // viewport cap; the lane scrolls within it
+const MAX_VH_NORMAL = "58vh";   // viewport cap default; the lane scrolls within it
+const MAX_VH_FOCUS = "85vh";    // 2026-05-25 — modo enfoque del editor agranda la lane
 const FOLLOW_SUPPRESS_MS = 2500;
 const INTRO_SKIP_S = 3;        // auto-scroll to first lyric if intro longer than this
 
@@ -61,6 +62,7 @@ export default function LyricsTimeline({
   onTextChange,        // (id, text) => void — inline text fix without leaving timeline
   onFocus,             // (id) => void
   onReset,             // () => void
+  focusMode = false,   // 2026-05-25 — passed from LyricsEditor focus toggle
 }) {
   const laneRef = useRef(null);
   const scrollRef = useRef(null);
@@ -344,7 +346,7 @@ export default function LyricsTimeline({
       <div
         ref={scrollRef}
         className="overflow-y-auto overflow-x-hidden"
-        style={{ maxHeight: MAX_VH }}
+        style={{ maxHeight: focusMode ? MAX_VH_FOCUS : MAX_VH_NORMAL }}
         onPointerMove={onPointerMove}
         onScroll={markUserScroll}
       >
@@ -491,9 +493,14 @@ export default function LyricsTimeline({
           })}
 
           {/* Playhead (horizontal) */}
+          {/* No CSS transition: rAF en LyricsEditor empuja currentTime ~16ms.
+              Una transición aquí pelearía contra el rAF y deja el playhead
+              ~100ms detrás del audio (además del click que "se desliza" en
+              vez de saltar). Usamos translateY para que el movimiento sea
+              composited y no dispare reflow en la lista de segmentos. */}
           <div
-            className="absolute left-0 right-0 h-0.5 bg-brand pointer-events-none z-10 transition-[top] duration-100 ease-linear"
-            style={{ top: currentTime * pxPerSec }}
+            className="absolute left-0 right-0 top-0 h-0.5 bg-brand pointer-events-none z-10 will-change-transform"
+            style={{ transform: `translateY(${currentTime * pxPerSec}px)` }}
           >
             <div className="w-2 h-2 rounded-full bg-brand -mt-[3px] ml-0.5" />
           </div>
