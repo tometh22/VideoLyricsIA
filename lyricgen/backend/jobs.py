@@ -476,6 +476,20 @@ def get_all_jobs(
 
 
 _TERMINAL_STATUSES = ("done", "error", "rejected", "validation_failed")
+# Sub-partition of terminal statuses by outcome. The pipeline writes
+# done/pending_review only after deliverables actually land in R2; once
+# that ground truth is in the row, NO failure-shaped status ever
+# downgrades it. This is the system-wide answer to the test case "callback
+# does not clobber terminal states" — any late-firing error path (RQ
+# failure callback that races a successful commit, reaper that races a
+# completing worker, edit failure that ran after the worker recovered)
+# now bounces off this guard inside update_job instead of having to
+# re-check the row in every call site.
+_SUCCESS_TERMINAL_STATUSES = ("done", "pending_review")
+_FAILURE_TARGET_STATUSES = (
+    "error", "rejected", "validation_failed", "transcription_failed",
+    "bg_preview_failed",
+)
 
 
 def update_job(job_id: str, **kwargs) -> None:
@@ -545,6 +559,25 @@ def update_job(job_id: str, **kwargs) -> None:
             kwargs.pop("current_step", None)
             # Don't touch progress either — it's tied to the status flow.
             kwargs.pop("progress", None)
+            if not kwargs:
+                return
+
+        # Success-vs-failure guard: never let a failure-shaped status
+        # downgrade a row that's already in a success-shaped terminal.
+        # Concrete race this protects: RQ pipeline_failure_callback fires
+        # 200 ms after the worker commits status="done"; without this
+        # guard, the callback's status="error" would clobber the success.
+        # The reaper has its own re-fetch-with-lock guard for the same
+        # reason; this is the analogous defense for the failure callbacks
+        # that route through update_job.
+        if (
+            target_status in _FAILURE_TARGET_STATUSES
+            and job.status in _SUCCESS_TERMINAL_STATUSES
+        ):
+            kwargs.pop("status", None)
+            kwargs.pop("error", None)
+            kwargs.pop("current_step", None)
+            kwargs.pop("completed_at", None)
             if not kwargs:
                 return
 
