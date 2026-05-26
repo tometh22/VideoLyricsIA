@@ -415,9 +415,18 @@ def forced_align_lyrics(audio_path: str, lyrics_text: str) -> list[dict] | None:
 
     # Build a fresh input dict per attempt — the audio file handle is
     # consumed on each upload, so we need to reopen it.
+    # Cada llamada al factory abre un handle nuevo; los acumulamos para
+    # poder cerrarlos en el `finally` aunque Replicate falle mid-upload
+    # (timeout, cancel, exception). Sin esto el worker leakea un FD por
+    # intento × 7 réplicas × 3 retries → eventual `OSError: Too many
+    # open files`. Doble-close es no-op, así que es seguro listarlos
+    # incluso si el SDK ya los cerró por su cuenta.
+    _open_handles: list = []
     def _input_factory():
+        f = open(upload_path, "rb")
+        _open_handles.append(f)
         return {
-            "audio_file": open(upload_path, "rb"),
+            "audio_file": f,
             "transcript": transcript,
             # show_probabilities returns per-word `score` (0-1) which we
             # surface to the editor for confidence highlighting on
@@ -441,6 +450,11 @@ def forced_align_lyrics(audio_path: str, lyrics_text: str) -> list[dict] | None:
             backoff=[0, 8, 24],
         )
     finally:
+        for _h in _open_handles:
+            try:
+                _h.close()
+            except Exception:
+                pass
         if is_temp:
             try:
                 os.unlink(upload_path)

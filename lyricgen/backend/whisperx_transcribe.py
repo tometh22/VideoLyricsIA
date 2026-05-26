@@ -409,15 +409,28 @@ def transcribe_whisperx(audio_path: str, language: str | None = None,
     # bounded retry + typed-error short-circuit.
     from replicate_budget import call_with_budget, _budget_for
 
+    # FD leak fix: cada retry del budget reabre el archivo; sin tracking
+    # explícito, los handles se acumulan si Replicate falla mid-upload
+    # (timeout/cancel). Mismo patrón que forced_align.py / vocal_sep.py.
+    _open_handles: list = []
     def _input_factory():
-        return {"audio_file": open(audio_path, "rb"), **payload}
+        f = open(audio_path, "rb")
+        _open_handles.append(f)
+        return {"audio_file": f, **payload}
 
-    output = call_with_budget(
-        _MODEL, _input_factory,
-        total_budget_s=_budget_for("whisperx", default_s=480.0),
-        backoff=[0, 8, 24],
-        call_label="WHISPERX",
-    )
+    try:
+        output = call_with_budget(
+            _MODEL, _input_factory,
+            total_budget_s=_budget_for("whisperx", default_s=480.0),
+            backoff=[0, 8, 24],
+            call_label="WHISPERX",
+        )
+    finally:
+        for _h in _open_handles:
+            try:
+                _h.close()
+            except Exception:
+                pass
     if output is None:
         return None
 
