@@ -29,7 +29,11 @@ const ZOOM_STEP = 8;
 const EDGE_PX = 10;            // height of the top/bottom grab handles
 const MIN_DUR_S = 0.3;         // shortest readable on-screen window
 const MIN_BLOCK_PX = 22;       // floor so short lines stay grabbable at any zoom
-const CLICK_SLOP_PX = 4;       // movement under this = click (focus/seek), not drag
+// 2026-05-25 — click-vs-drag threshold ahora se mide en TIEMPO, no
+// pixels. A zoom=8 px/s, 4px hardcoded = 500 ms de tolerancia (mucho —
+// clicks cortos disparaban drags accidentales). A zoom=60 px/s, 4px =
+// 67 ms (ok). 50 ms es invariante al zoom: clickSlopPx = 50ms * pxPerSec.
+const CLICK_SLOP_TIME_S = 0.05;
 const LABEL_W = 38;            // left time-label column
 const WAVE_W = 30;             // waveform band width inside the gutter
 const GUTTER_PX = LABEL_W + WAVE_W; // total left gutter (labels + waveform)
@@ -155,9 +159,16 @@ export default function LyricsTimeline({
       e.stopPropagation();
       e.currentTarget.setPointerCapture?.(e.pointerId);
       onDragStart?.();
+      // FIX 2 (2026-05-25): snapshot pxPerSec al inicio del drag. Si el
+      // operador clickea zoom +/- mid-drag, el live pxPerSec cambia y el
+      // delta (deltaPx / pxPerSec) queda mal escalado → el segmento
+      // saltaba a una posición incorrecta. El snapshot garantiza que
+      // los pixels que el operador movió siempre se traducen al mismo
+      // tiempo, incluso si el zoom cambia entre frames.
       dragRef.current = {
         id: seg._id, mode, originY: e.clientY,
         origStart: seg.start, origEnd: seg.end, moved: false,
+        origPxPerSec: pxPerSec,
       };
       setPreview({ id: seg._id, start: seg.start, end: seg.end });
     },
@@ -169,8 +180,16 @@ export default function LyricsTimeline({
       const d = dragRef.current;
       if (!d) return;
       const deltaPx = e.clientY - d.originY;
-      if (Math.abs(deltaPx) > CLICK_SLOP_PX) d.moved = true;
-      const delta = deltaPx / pxPerSec;
+      // FIX 4 (2026-05-25): click-slop threshold zoom-invariant. A
+      // CLICK_SLOP_TIME_S * pxPerSec ms. Antes era 4px hardcoded — a
+      // zoom=8 px/s eso son 500 ms de "dead zone" que disparaba drags
+      // accidentales en clicks cortos. 50 ms se siente igual en
+      // cualquier zoom level.
+      const clickSlop = CLICK_SLOP_TIME_S * (d.origPxPerSec || pxPerSec);
+      if (Math.abs(deltaPx) > clickSlop) d.moved = true;
+      // FIX 2 (2026-05-25): usar origPxPerSec del snapshot, NO el live
+      // pxPerSec — sino un zoom mid-drag re-escala el delta.
+      const delta = deltaPx / (d.origPxPerSec || pxPerSec);
       const { prev, next } = neighbours(d.id);
       const lo = prev ? prev.end + gapS : 0;
       const hi = next ? next.start - gapS : total;
@@ -222,8 +241,16 @@ export default function LyricsTimeline({
   // Auto-follow the playhead vertically — only while playing AND when the
   // operator hasn't scrolled/clicked in the last FOLLOW_SUPPRESS_MS, so
   // manual navigation (e.g. back to 0:40) isn't yanked away.
+  //
+  // FIX 1 (2026-05-25, operator drag report): NUNCA scrollee si hay un
+  // drag activo. El smooth scroll cambia scrollRef.scrollTop durante la
+  // transición (16-250ms), lo que cambia `rect.top` de getBoundingClientRect
+  // que clientYToTime() usa para convertir pointer → tiempo. Resultado:
+  // el segmento arrastrado se commiteaba con un valor incorrecto porque
+  // el viewport se movía mientras el operador soltaba.
   useEffect(() => {
     if (!isPlaying) return;
+    if (dragRef.current) return;          // FIX 1: no follow durante drag
     if (Date.now() - lastUserScrollRef.current < FOLLOW_SUPPRESS_MS) return;
     const sc = scrollRef.current;
     if (!sc || typeof sc.scrollTo !== "function") return;
@@ -275,6 +302,11 @@ export default function LyricsTimeline({
     // otherwise the browser clamps scrollTop to 0 (the bug that left the
     // view stuck at 0:00 on top of the instrumental intro).
     const raf = requestAnimationFrame(() => {
+      // FIX 3 (2026-05-25): no auto-scroll si hay drag activo. Edge
+      // case: el operador empieza a arrastrar el mismo frame que el
+      // intro-skip programó su rAF — el scroll cambia mid-drag y
+      // rompe el clientYToTime() calc.
+      if (dragRef.current) return;
       const sc = scrollRef.current;
       if (sc) sc.scrollTop = Math.max(0, firstStart * pxPerSec - 28);
       didAutoScrollRef.current = true;
