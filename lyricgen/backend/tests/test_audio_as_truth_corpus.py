@@ -193,6 +193,48 @@ def test_drift_abort_still_fires_on_random_noise():
 
 
 # ─────────────────────────────────────────────────────────────────────────
+# Sin Gamulán / Mujer Amante — synced-direct fallback (2026-05-26, issue #357)
+# ─────────────────────────────────────────────────────────────────────────
+# Both songs hit `[1, 2, 0]` cureau crash on FA AND the per-line aligner
+# mis-anchors the chorus repeats (PR #362 reverted: ~50s avg error). The
+# new approach in main.py: when reconcile + FA both fail and we have lrclib
+# synced lyrics, parse them directly and emit with offset computed from
+# whisperX's first detected word. Pins the `_parse_lrc_to_line_times`
+# helper main.py imports.
+
+def test_parse_lrc_synced_basic():
+    """LRC `[mm:ss.xx] text` format parsing. Discards bad lines without
+    crashing."""
+    import lrclib_aligner
+    sample = (
+        "[00:21.93] Tenía tantas ganas de volverte a ver\n"
+        "[00:24.52] y en mi casa me dicen que llamaste recién\n"
+        "[al:Bla Bla]\n"                       # metadata, no timestamp → drop
+        "[00:30.51] pero tu apellido nunca entendí bien\n"
+        "[01:49.75] Agarré el teléfono\n"
+        "[02:53.00]    \n"                     # empty text → drop
+    )
+    pairs = lrclib_aligner._parse_lrc_to_line_times(sample)
+    assert len(pairs) == 4
+    assert pairs[0] == (21.93, "Tenía tantas ganas de volverte a ver")
+    assert pairs[2][0] == 30.51
+    # mm:ss correctly converted past the 1-min mark
+    assert pairs[3][0] == 109.75
+
+
+def test_parse_lrc_synced_handles_malformed():
+    """Empty / None input returns empty list, no exception."""
+    import lrclib_aligner
+    assert lrclib_aligner._parse_lrc_to_line_times("") == []
+    assert lrclib_aligner._parse_lrc_to_line_times(None) == []
+    # Garbage timestamps are skipped, not crash
+    bad = "[xx:yy] something\n[00:99.99] valid line\nrandom text"
+    pairs = lrclib_aligner._parse_lrc_to_line_times(bad)
+    assert len(pairs) == 1
+    assert pairs[0] == (99.99, "valid line")
+
+
+# ─────────────────────────────────────────────────────────────────────────
 # 638 — Viejas Locas (UMG dry-run incident, 2026-05-26)
 # ─────────────────────────────────────────────────────────────────────────
 # whisperX over a dense rock mix produced 13 mishear-heavy segments for a
