@@ -2269,6 +2269,12 @@ export default function App() {
         // simulación de karaoke.
         lockedSteps={currentReview?.editingJobId ? [1, 2, 3, 5] : []}
         renderedVideoUrl={editingRenderedVideoUrl || null}
+        // UI F5 (2026-05-26): le pasamos el bgStatus al wizard para que
+        // UploadZone pueda derivar `placeholderBg` cuando montamos el
+        // preview en paso 6. "done" = fondo final listo, todo lo demás
+        // = muestra. El badge del preview cambia de "EN VIVO" a
+        // "(muestra)" en consecuencia.
+        bgStatus={bgPreview.status}
       />
     </div>
   );

@@ -5,6 +5,7 @@ import { useToast } from "./ToastProvider";
 import LyricsTimeline from "./LyricsTimeline";
 import LyricVideoPreview from "./LyricVideoPreview";
 import { tierForLength } from "../lib/lyricTiers";
+import { prettifySongTitle } from "../lib/prettifySongTitle";
 import useLocalStorage from "../hooks/useLocalStorage";
 
 // Font options for the live in-preview switcher. Codes match the render
@@ -1538,7 +1539,12 @@ export default function LyricsEditor({
     });
   };
 
-  const name = filename.replace(/\.(mp3|wav)$/i, "");
+  // Operator-friendly title: strip extension + collapse underscores/dashes
+  // to em-dashes + title-case respecting Spanish/PT lowercase stop-words.
+  // Pre-fix the header showed the raw filename ("El Arbol De La Vida _ Voy
+  // A Dejarte - Viejas Locas"); now it reads "El Arbol de la Vida — Voy a
+  // Dejarte — Viejas Locas". See lib/prettifySongTitle.js. (UI F7.)
+  const name = prettifySongTitle(filename);
   const pendingSuggestions = edited.filter((seg) => {
     const s = suggestionsById[seg._id];
     return s && s !== seg.text;
@@ -1597,7 +1603,11 @@ export default function LyricsEditor({
   // row before scrolling. Timeline view stays at max-w-6xl (already wide
   // enough).
   return (
-    <div className={`w-full animate-fade-in mx-auto ${viewMode === "timeline" ? "max-w-6xl" : "max-w-[1400px]"}`}>
+    // UI F10 (2026-05-26): pb-28 (7 rem ≈ 112 px) garantiza safe-area
+    // bajo el botón flotante "Aprobar y generar" (h-12 = 48 px + bottom-6
+    // = 24 px + sombra). Sin esto la última card del timeline o de la
+    // lista quedaba tapada cuando el operador scrolleaba hasta el final.
+    <div className={`w-full animate-fade-in mx-auto pb-28 ${viewMode === "timeline" ? "max-w-6xl" : "max-w-[1400px]"}`}>
       {/* Hidden audio element drives playback. */}
       {audioUrl && (
         <audio
@@ -1632,14 +1642,21 @@ export default function LyricsEditor({
 
       {/* Chip de status del pre-gen del fondo — UX 2026-05-24. Operador edita
           lyrics, Veo/Imagen está generando en background. Sin esto el pre-gen
-          era invisible y cambiar un param descartaba un preview sin aviso. */}
+          era invisible y cambiar un param descartaba un preview sin aviso.
+
+          Branch "error": el pre-gen falló pero NO es una falla que el operador
+          deba accionar — el sistema reintenta cuando aprueta "Aprobar y
+          generar". Antes el chip estaba en amber + ícono `!` que leía como
+          warning y la copy decía "se generará..." en tono positivo: lenguaje
+          visual contradiciendo el copy. Ahora es brand-color + ícono `i`
+          (info), copy alineado con el CTA real ("apruebes y generes" matchea
+          "Aprobar y generar"). El amber queda reservado para errores que SÍ
+          requieren acción del operador. (UI review 2026-05-26, F4.) */}
       {bgStatus && bgStatus !== "idle" && bgStatus !== "disabled" && (
         <div className={`mb-3 inline-flex items-center gap-2 px-3 py-1.5 rounded-full text-caption
             ${bgStatus === "done"
               ? "bg-accent/10 text-accent-light ring-1 ring-accent/30"
-              : bgStatus === "error"
-                ? "bg-amber-500/10 text-amber-300 ring-1 ring-amber-500/30"
-                : "bg-brand/10 text-brand-light ring-1 ring-brand/30"}`}>
+              : "bg-brand/10 text-brand-light ring-1 ring-brand/30"}`}>
           {bgStatus === "queued" || bgStatus === "generating" ? (
             <>
               <svg className="w-3 h-3 animate-spin" fill="none" stroke="currentColor" strokeWidth="2.5" viewBox="0 0 24 24">
@@ -1657,9 +1674,9 @@ export default function LyricsEditor({
           ) : bgStatus === "error" ? (
             <>
               <svg className="w-3 h-3" fill="none" stroke="currentColor" strokeWidth="2.5" viewBox="0 0 24 24">
-                <circle cx="12" cy="12" r="10" /><line x1="12" y1="8" x2="12" y2="12" /><line x1="12" y1="16" x2="12.01" y2="16" />
+                <circle cx="12" cy="12" r="10" /><line x1="12" y1="8" x2="12" y2="12" /><line x1="12" y1="16" x2="12" y2="11" />
               </svg>
-              <span>{t("editor.bg_error") || "El fondo se generará al apretar Crear video"}</span>
+              <span>{t("editor.bg_preview_placeholder") || t("editor.bg_error") || "Vas a ver el fondo final cuando apruebes y generes. El preview de ahora es una muestra."}</span>
             </>
           ) : null}
         </div>
@@ -1871,8 +1888,14 @@ export default function LyricsEditor({
               untouched. Desktop feature: hidden on narrow screens where the
               fine drag is impractical. */}
           <div className="hidden md:inline-flex shrink-0 rounded-md ring-1 ring-white/[0.08] overflow-hidden text-label">
+            {/* UI F9 (2026-05-26): tooltips diferenciando qué vista es
+                mejor para cada tarea. Antes el toggle presentaba ambas
+                vistas como equivalentes — pero corregir TEXTO es más
+                eficiente en Lista (input ancho por línea), y revisar
+                TIMING es mejor en Línea de tiempo (drag visual). */}
             <button
               onClick={() => setViewMode("list")}
+              title="Mejor para corregir el texto: cada línea en una fila ancha con input directo."
               className={`px-2.5 py-1 flex items-center gap-1.5 transition-colors ${viewMode === "list" ? "bg-brand/20 text-brand-light" : "text-ink-secondary hover:text-white"}`}
             >
               <svg className="w-3 h-3" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
@@ -1887,6 +1910,7 @@ export default function LyricsEditor({
             </button>
             <button
               onClick={() => setViewMode("timeline")}
+              title="Mejor para revisar el timing: cada línea en su posición temporal, arrastrable."
               className={`px-2.5 py-1 flex items-center gap-1.5 transition-colors ${viewMode === "timeline" ? "bg-brand/20 text-brand-light" : "text-ink-secondary hover:text-white"}`}
             >
               <svg className="w-3 h-3" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
@@ -2059,6 +2083,7 @@ export default function LyricsEditor({
               </p>
               <button
                 onClick={() => shiftAllSegments(-(first.start - 2))}
+                title={`Mover todas las líneas hacia atrás ${(first.start - 2).toFixed(1)}s — el primer lyric arrancará a los 2 s.`}
                 className="shrink-0 text-label px-3 py-1.5 rounded-lg bg-brand/15 text-brand-light
                   ring-1 ring-brand/30 hover:bg-brand/25 transition-colors"
               >
@@ -2066,6 +2091,7 @@ export default function LyricsEditor({
               </button>
               <button
                 onClick={() => shiftAllSegments(-first.start)}
+                title={`Mover todas las líneas hacia atrás ${first.start.toFixed(1)}s — el primer lyric arrancará al segundo 0.`}
                 className="shrink-0 text-label px-3 py-1.5 rounded-lg bg-surface-2/60
                   ring-1 ring-white/[0.06] text-gray-300 hover:bg-surface-2 hover:text-white transition-colors"
               >
