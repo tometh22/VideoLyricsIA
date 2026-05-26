@@ -603,10 +603,15 @@ def enqueue_prores_prewarm(job_id: str, file_type: str) -> str | None:
 def edit_failure_callback(job, connection, type_, value, traceback) -> None:
     """RQ on_failure hook for run_edit_pipeline.
 
-    Fires when a worker dies mid-edit without the pipeline's own except
-    handler running (SIGKILL / hard Railway redeploy). Without this, the
-    DB row stays stuck at status='editing' for up to 30 min until the
-    reaper catches it — the user sees an indefinite spinner with no error.
+    Fires when retries are EXHAUSTED (PIPELINE_RETRY_MAX consecutive
+    worker deaths) or on a real exception inside the pipeline. With
+    Retry configured in enqueue_edit (2026-05-26), a single worker
+    death no longer surfaces an error — RQ re-enqueues automatically
+    and a fresh worker picks the job up after the backoff interval.
+
+    Without this callback, the DB row stays stuck at status='editing'
+    for up to 30 min until the reaper catches it — the user sees an
+    indefinite spinner with no error.
 
     Same best-effort contract as pipeline_failure_callback: swallows
     exceptions so RQ's own failure bookkeeping still completes.
@@ -621,8 +626,9 @@ def edit_failure_callback(job, connection, type_, value, traceback) -> None:
         is_abandoned = "AbandonedJobError" in (type_.__name__ if type_ else "")
         if is_abandoned:
             err_msg = (
-                "El servidor se reinició mientras aplicábamos los cambios. "
-                "El video anterior sigue disponible: podés volver a pedir el edit."
+                "El servidor se reinició mientras aplicábamos los cambios y "
+                "los reintentos automáticos también fallaron. El video "
+                "anterior sigue disponible: podés volver a pedir el edit."
             )
         else:
             tb_msg = str(value)[:400] if value else (type_.__name__ if type_ else "error")
@@ -666,6 +672,7 @@ def enqueue_edit(
     """
     q = _pick_queue(plan, tenant_id=tenant_id)
     if q is not None:
+        from rq import Retry
         from pipeline import run_edit_pipeline
         edit_rq_id = f"edit:{job_id}"
         # Clear any stale RQ job with this ID from a previous failed/completed
@@ -679,6 +686,17 @@ def enqueue_edit(
             stale.delete()
         except Exception:
             pass  # no stale job, or Redis hiccup — proceed normally
+        # Retry on worker-death (Railway redeploy/OOM/SIGKILL). Mismo patrón
+        # que enqueue_pipeline — incidente 2026-05-26 con el job de Los
+        # Abuelos (4c47a9f07383): el merge de fix(pipeline) a staging
+        # disparó un redeploy del Worker mientras el edit estaba mid-render,
+        # AbandonedJobError, edit_failure_callback flipea status="error" y
+        # el operador queda con "El servidor se reinició mientras
+        # aplicábamos los cambios" sin retry automático. Con Retry, RQ re-
+        # encola el job y un worker fresco lo retoma a los 60s; run_edit_
+        # pipeline es safe re-runnable (lee state de DB cada vez, Veo está
+        # cacheado por hash de prompt, libass/R2 sobreescribe).
+        retry = Retry(max=PIPELINE_RETRY_MAX, interval=PIPELINE_RETRY_INTERVAL_S)
         rq_job = q.enqueue(
             run_edit_pipeline,
             args=(job_id, edit_type, edit_params),
@@ -688,6 +706,7 @@ def enqueue_edit(
             result_ttl=RESULT_TTL,
             failure_ttl=FAILURE_TTL,
             job_id=edit_rq_id,
+            retry=retry,
             on_failure=edit_failure_callback,
         )
         return rq_job.id
