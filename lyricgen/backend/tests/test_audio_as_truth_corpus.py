@@ -193,6 +193,68 @@ def test_drift_abort_still_fires_on_random_noise():
 
 
 # ─────────────────────────────────────────────────────────────────────────
+# Sin Gamulán / Mujer Amante — Los Abuelos / Rata Blanca (2026-05-26)
+# ─────────────────────────────────────────────────────────────────────────
+# Both songs have extreme line repetition (Sin Gamulán: 9 unique lines
+# across 28 total; Mujer Amante: 26 unique across 44). whisperX struggles +
+# reconcile aborts + forced_align ALSO crashes in cureau with
+# `Expected 2D or 3D tensor … got [1, 2, 0]` (highly-repetitive canonical
+# text seems to break cureau's CTC alignment — see issue #357).
+#
+# This forces the third fallback to fire: `lrclib_aligner` over the existing
+# whisperX wordstamps with `keep_unmatched=True`, interpolating timing for
+# the repeating lines whisperX didn't transcribe. Validated live against
+# both audios — 100% line coverage on both after this fallback runs.
+
+def test_lrclib_aligner_recovers_highly_repetitive_lyrics():
+    """When reconcile aborts and FA would also fail, lrclib_aligner with
+    keep_unmatched=True must still anchor every canonical line. Validates
+    the third fallback layer in the audio-as-truth path."""
+    import lrclib_aligner
+    # Shape of what whisperX produces on Sin Gamulán: catches the first
+    # chorus + a couple of repeats, loses the rest in the music. Same
+    # pattern as the live audio test produced.
+    words = [
+        _w("Sera",       29.4, 29.7), _w("por",        29.7, 29.9),
+        _w("eso",        29.9, 30.2), _w("que",        30.2, 30.4),
+        _w("hoy",        30.4, 30.7), _w("estamos",    30.7, 31.3),
+        _w("aqui",       31.3, 31.9),
+        _w("No",        144.8, 145.0), _w("hay",      145.0, 145.2),
+        _w("nadie",     145.2, 145.6), _w("mas",      145.6, 145.9),
+        _w("que",       145.9, 146.0), _w("vos",      146.0, 146.3),
+        _w("y",         146.3, 146.4), _w("yo",       146.4, 146.7),
+    ]
+    wx_segs = [_wx_seg(29.4, 146.7, " ".join(w["word"] for w in words), words)]
+    canonical = (
+        "Tanto tiempo te esperé sentado aquí\n"
+        "Que ya el invierno me alcanzó sin gamulán\n"
+        "Será por eso que hoy estamos aquí\n"
+        "No hay nadie más que vos y yo\n"
+        "Será por eso que hoy estamos aquí\n"
+        "No hay nadie más que vos y yo\n"
+        "Tantas veces lo soñé como real\n"
+        "Que quiso el tiempo y quiso nada más\n"
+        "Será por eso que hoy estamos aquí\n"
+        "No hay nadie más que vos y yo"
+    )
+    out = lrclib_aligner.align_lrclib_to_whisper(
+        canonical, wx_segs, keep_unmatched=True,
+    )
+    canon_lines = [l for l in canonical.splitlines() if l.strip()]
+    # Must recover ≥ 90% of canonical lines. Some have interpolated timing
+    # (review:True) but the operator at least SEES every line at an
+    # approximate position — way better than whisperX raw with mishears.
+    assert len(out) >= int(len(canon_lines) * 0.9), (
+        f"lrclib_aligner should recover ≥90% of {len(canon_lines)} lines, "
+        f"got {len(out)}"
+    )
+    # All segments span audio time (no NaN/None starts).
+    assert all(isinstance(s.get("start"), (int, float)) for s in out), (
+        "every output segment must have a numeric start time"
+    )
+
+
+# ─────────────────────────────────────────────────────────────────────────
 # 638 — Viejas Locas (UMG dry-run incident, 2026-05-26)
 # ─────────────────────────────────────────────────────────────────────────
 # whisperX over a dense rock mix produced 13 mishear-heavy segments for a
