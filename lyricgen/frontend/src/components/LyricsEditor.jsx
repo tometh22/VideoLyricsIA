@@ -5,6 +5,7 @@ import { useToast } from "./ToastProvider";
 import LyricsTimeline from "./LyricsTimeline";
 import LyricVideoPreview from "./LyricVideoPreview";
 import { tierForLength } from "../lib/lyricTiers";
+import useLocalStorage from "../hooks/useLocalStorage";
 
 // Font options for the live in-preview switcher. Codes match the render
 // pipeline / EditRequestPanel; css families are all loaded in index.html so
@@ -353,6 +354,16 @@ export default function LyricsEditor({
   // List vs visual timeline. Default "list" so the existing operator flow is
   // untouched; the timeline is opt-in via the toolbar toggle.
   const [viewMode, setViewMode] = useState("list"); // "list" | "timeline"
+  // 2026-05-25 Studio Console — Modo enfoque. Toggle persistente que
+  // agranda max-h de la lista + MAX_VH del timeline. Operador con 30-50
+  // segments por video estaba scrolleando constante. localStorage usa
+  // string "1"/"0" (el hook es string-only).
+  const [focusModeRaw, setFocusModeRaw] = useLocalStorage("genly_editor_focus", "0");
+  const focusMode = focusModeRaw === "1";
+  const toggleFocusMode = useCallback(
+    () => setFocusModeRaw((v) => (v === "1" ? "0" : "1")),
+    [setFocusModeRaw],
+  );
   // Phase B 2026-05-25: el card de auto-fix antes ocupaba 120-180px arriba
   // del editor. Reemplazado por un pill compacto 32px que expande detalle
   // on demand. Default colapsado para minimizar el overhead vertical.
@@ -1154,11 +1165,18 @@ export default function LyricsEditor({
         e.preventDefault();
         if (syncMode) exitSyncMode();
         else enterSyncMode();
+      } else if (!e.metaKey && !e.ctrlKey && !e.altKey && (e.key === "f" || e.key === "F")) {
+        // 2026-05-25 — F toggle "Modo Enfoque". Guard `editing` arriba
+        // ya nos protege de capturarlo cuando el operador está tipeando
+        // en un input/textarea (la mayoría de las veces). Sin modifier
+        // keys para que no choque con Cmd+F (buscar nativo del browser).
+        e.preventDefault();
+        toggleFocusMode();
       }
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [togglePlay, syncMode, tapAnchor, undoLastAnchor, undoEdit, audioUrl, enterSyncMode, exitSyncMode]);
+  }, [togglePlay, syncMode, tapAnchor, undoLastAnchor, undoEdit, audioUrl, enterSyncMode, exitSyncMode, toggleFocusMode]);
 
   // ─── Reference lyrics suggestions (unchanged) ───────────────────────
   const refLines = useMemo(() => {
@@ -1875,6 +1893,36 @@ export default function LyricsEditor({
               Línea de tiempo
             </button>
           </div>
+          {/* 2026-05-25 Studio Console — Modo Enfoque toggle.
+              Botón discreto al lado del view switcher. Esconde ruido
+              (auto-fix collapse) y agranda max-h de la lista + timeline.
+              Atajo F (global, no en inputs). */}
+          <button
+            type="button"
+            onClick={toggleFocusMode}
+            aria-pressed={focusMode}
+            title={focusMode
+              ? (t("editor.focus_exit") || "Salir de modo enfoque (F)")
+              : (t("editor.focus_enter") || "Modo enfoque (F)")
+            }
+            className={`hidden md:inline-flex shrink-0 w-8 h-8 rounded-md ring-1 transition-colors items-center justify-center
+              ${focusMode
+                ? "ring-brand/40 bg-brand/15 text-brand-light"
+                : "ring-white/[0.08] text-ink-secondary hover:text-brand-light hover:bg-brand/10 hover:ring-brand/30"}`}
+          >
+            {focusMode ? (
+              /* contract icon — flechas hacia adentro */
+              <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
+                <path d="M9 4v6H3M21 14h-6v6" strokeLinecap="round" strokeLinejoin="round" />
+                <path d="M9 10L4 5M15 14l5 5" strokeLinecap="round" strokeLinejoin="round" />
+              </svg>
+            ) : (
+              /* expand icon — flechas hacia afuera */
+              <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
+                <path d="M4 9V4h5M20 15v5h-5M4 9l5-5M20 15l-5 5" strokeLinecap="round" strokeLinejoin="round" />
+              </svg>
+            )}
+          </button>
           {/* Sync mode entry — refactor 2026-05-23: pasó de botón ruidoso
               con texto a ícono discreto al lado del switcher. Atajo Cmd+K
               añadido al keyboard handler. */}
@@ -2341,6 +2389,7 @@ export default function LyricsEditor({
                 highlightedIds={highlightedIds}
                 waveform={waveform}
                 gapS={MIN_GAP_S}
+                focusMode={focusMode}
                 onSeek={(s) => seekTo(s, false)}
                 onDragStart={pushEditHistory}
                 onTimingChange={handleTimelineTimingChange}
@@ -2405,7 +2454,7 @@ export default function LyricsEditor({
                       esto ahorra ~120px de scroll total. Y como el Phase B
                       compactó el header (auto-fix pill 32px), max-h ahora
                       puede crecer (100vh-200 vs 100vh-280 antes). */}
-                  <div ref={listRef} className="space-y-0.5 max-h-[calc(100vh-200px)] overflow-y-auto pr-1 pb-8">
+                  <div ref={listRef} className={`space-y-0.5 overflow-y-auto pr-1 pb-8 ${focusMode ? "max-h-[calc(100vh-110px)]" : "max-h-[calc(100vh-200px)]"}`}>
           {edited.map((seg, idx) => {
             const suggestion = suggestionsById[seg._id];
             const isApplied = suggestion && seg.text === suggestion;

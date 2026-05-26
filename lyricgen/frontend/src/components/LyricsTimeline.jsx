@@ -33,7 +33,8 @@ const CLICK_SLOP_PX = 4;       // movement under this = click (focus/seek), not 
 const LABEL_W = 38;            // left time-label column
 const WAVE_W = 30;             // waveform band width inside the gutter
 const GUTTER_PX = LABEL_W + WAVE_W; // total left gutter (labels + waveform)
-const MAX_VH = "58vh";         // viewport cap; the lane scrolls within it
+const MAX_VH_NORMAL = "58vh";   // viewport cap default; the lane scrolls within it
+const MAX_VH_FOCUS = "85vh";    // 2026-05-25 — modo enfoque del editor agranda la lane
 const FOLLOW_SUPPRESS_MS = 2500;
 const INTRO_SKIP_S = 3;        // auto-scroll to first lyric if intro longer than this
 
@@ -61,6 +62,7 @@ export default function LyricsTimeline({
   onTextChange,        // (id, text) => void — inline text fix without leaving timeline
   onFocus,             // (id) => void
   onReset,             // () => void
+  focusMode = false,   // 2026-05-25 — passed from LyricsEditor focus toggle
 }) {
   const laneRef = useRef(null);
   const scrollRef = useRef(null);
@@ -344,7 +346,7 @@ export default function LyricsTimeline({
       <div
         ref={scrollRef}
         className="overflow-y-auto overflow-x-hidden"
-        style={{ maxHeight: MAX_VH }}
+        style={{ maxHeight: focusMode ? MAX_VH_FOCUS : MAX_VH_NORMAL }}
         onPointerMove={onPointerMove}
         onScroll={markUserScroll}
       >
