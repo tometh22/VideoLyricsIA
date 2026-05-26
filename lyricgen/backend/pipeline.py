@@ -10,6 +10,7 @@ import logging
 logger = logging.getLogger("genly.pipeline")
 import subprocess
 import tempfile
+import threading
 import traceback
 
 from dotenv import load_dotenv
