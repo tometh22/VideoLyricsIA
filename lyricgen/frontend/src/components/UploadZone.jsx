@@ -162,6 +162,15 @@ export default function UploadZone({
   // WizardLivePreview lo lee con su propio rAF para renderizar word-jump
   // sincronizado al audio real, sin causar re-renders de UploadZone.
   playbackTickRef = null,
+  // Post-render edit mode (App.jsx EditLyricsRoute):
+  // - lockedSteps: IDs de pasos no navegables (típicamente [1,2,3,5] en
+  //   modo edición de un job ya renderizado — esos cambios requieren
+  //   regenerar fondo y los cubre el modo "background" de EditRequestPanel).
+  //   Los pasos lockeados se ven greyed y el botón hace bail-out.
+  // - renderedVideoUrl: MP4 ya renderizado del job; cuando viene se
+  //   forwardea al WizardLivePreview que muta a modo "Resultado actual".
+  lockedSteps = [],
+  renderedVideoUrl = null,
   // UI F5 (2026-05-26): status del pre-gen del fondo. Si !== "done"
   // mientras estamos en paso 6, el preview muestra el badge "(muestra)"
   // en vez del "EN VIVO" pulsante — el operador ve un fondo placeholder
@@ -314,11 +323,33 @@ export default function UploadZone({
     { id: 5, label: t("upload.step_deliver") || "Entregá" },
     { id: 6, label: t("upload.step_lyrics") || "Lyrics" },
   ];
-  const [wizardStep, setWizardStep] = useState(1);
+  // En modo post-render edit (lockedSteps no vacío + content reviewable
+  // pre-seeded) arrancamos directo en step 6 para que el operador no vea
+  // un flash del paso 1 mientras el useEffect de auto-advance se acomoda.
+  const [wizardStep, setWizardStep] = useState(() => {
+    if (hasReviewableContent && Array.isArray(lockedSteps) && lockedSteps.length > 0) return 6;
+    return 1;
+  });
   // Step 6 es clickeable solo cuando hay contenido de review activo.
   // Cuando no hay, el cap es step 5 (los pasos 1-5 son siempre clickables).
   const _maxInteractiveStep = hasReviewableContent ? 6 : 5;
-  const goStep = (n) => setWizardStep(Math.max(1, Math.min(_maxInteractiveStep, n)));
+  // lockedSteps (post-render edit): IDs no navegables. goStep bail-outs y
+  // los helpers prev/next saltean los locked para que la sticky bar muestre
+  // el siguiente paso navegable real, no uno que el operador no puede usar.
+  const _lockedSet = new Set(lockedSteps);
+  const _findPrevUnlocked = (n) => {
+    for (let i = n - 1; i >= 1; i--) if (!_lockedSet.has(i)) return i;
+    return null;
+  };
+  const _findNextUnlocked = (n) => {
+    for (let i = n + 1; i <= _maxInteractiveStep; i++) if (!_lockedSet.has(i)) return i;
+    return null;
+  };
+  const goStep = (n) => {
+    const clamped = Math.max(1, Math.min(_maxInteractiveStep, n));
+    if (_lockedSet.has(clamped)) return;
+    setWizardStep(clamped);
+  };
   // Auto-advance a step 6 cuando aparece contenido de review. Y bajar a
   // step 5 si el operador clickea "Volver" y desaparece el contenido.
   useEffect(() => {
@@ -1867,7 +1898,9 @@ export default function UploadZone({
         <nav className="flex lg:flex-col gap-1.5 lg:gap-1 overflow-x-auto lg:overflow-visible lg:sticky lg:top-4 w-full lg:w-auto order-first">
           {WIZARD_STEPS.map((s) => {
             const isLyrics = s.id === 6;
-            const disabled = isLyrics && !hasReviewableContent;
+            const lyricsDisabled = isLyrics && !hasReviewableContent;
+            const locked = _lockedSet.has(s.id);
+            const disabled = lyricsDisabled || locked;
             const active = !disabled && wizardStep === s.id;
             const done = !disabled && wizardStep > s.id;
             return (
@@ -1877,9 +1910,11 @@ export default function UploadZone({
                 onClick={() => { if (!disabled) goStep(s.id); }}
                 disabled={disabled}
                 aria-disabled={disabled}
-                title={disabled
-                  ? (t("upload.step_lyrics_hint") || "Disponible después de \"Revisar lyrics\"")
-                  : (isStep6 ? s.label : undefined)}
+                title={locked
+                  ? (t("upload.step_locked_hint") || "No editable en este modo — usá \"Regenerar fondo\" desde el video.")
+                  : lyricsDisabled
+                    ? (t("upload.step_lyrics_hint") || "Disponible después de \"Revisar lyrics\"")
+                    : (isStep6 ? s.label : undefined)}
                 className={`flex items-center ${isStep6 ? "lg:justify-center lg:px-0" : "gap-2.5 px-3"} py-2.5 rounded-xl text-[12.5px] font-medium whitespace-nowrap transition-all text-left shrink-0 ${
                   disabled
                     ? "text-gray-600 cursor-not-allowed opacity-50"
@@ -1927,6 +1962,10 @@ export default function UploadZone({
                  audio en la review (step 6). Sin el ref, el preview cae
                  al modo legacy (lyric loop con `_previewLyric`). */
               playbackTickRef={playbackTickRef}
+              /* Post-render edit: MP4 ya renderizado del job. Cuando viene,
+                 el preview muta a "Resultado actual" y todos los overlays
+                 (palette/grade/karaoke sim) se cortocircuitan. */
+              renderedVideoUrl={renderedVideoUrl}
               /* UI F3 + F5 (2026-05-26): compact en paso 6; placeholderBg
                  mientras el pre-gen del fondo no terminó. */
               compact={isStep6}
@@ -2316,14 +2355,22 @@ export default function UploadZone({
               )}
             </div>
 
-            {wizardStep > 1 && (
-              <button
-                onClick={() => goStep(wizardStep - 1)}
-                className="btn-secondary text-xs h-11 px-4"
-              >
-                {t("upload.back") || "Atrás"}
-              </button>
-            )}
+            {(() => {
+              // Locked-aware "Atrás": en modo post-render edit (lockedSteps
+              // no vacío) los pasos anteriores pueden estar todos lockeados
+              // → escondé el botón en vez de mandar al operador a un paso
+              // que no puede usar.
+              const prev = _findPrevUnlocked(wizardStep);
+              if (prev == null) return null;
+              return (
+                <button
+                  onClick={() => goStep(prev)}
+                  className="btn-secondary text-xs h-11 px-4"
+                >
+                  {t("upload.back") || "Atrás"}
+                </button>
+              );
+            })()}
 
             {/* Phase 2 (2026-05-25): cuando el operador ya está en review
                 (hasReviewableContent=true) y vuelve a un paso anterior para
@@ -2341,16 +2388,25 @@ export default function UploadZone({
                 </svg>
               </button>
             ) : wizardStep < 5 ? (
-              <button
-                onClick={() => goStep(wizardStep + 1)}
-                disabled={wizardStep === 1 && !allHaveArtist}
-                className="btn-primary h-11 px-6 disabled:opacity-40 disabled:cursor-not-allowed"
-              >
-                {t("upload.continue") || "Continuar"}
-                <svg className="inline-block ml-1.5 w-4 h-4 -mt-0.5" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
-                  <path d="M5 12h14M12 5l7 7-7 7" />
-                </svg>
-              </button>
+              (() => {
+                // Locked-aware "Continuar". Si el próximo paso está
+                // lockeado, saltea al siguiente navegable. Si no hay más
+                // pasos navegables, no mostramos botón.
+                const next = _findNextUnlocked(wizardStep);
+                if (next == null || next > 5) return null;
+                return (
+                  <button
+                    onClick={() => goStep(next)}
+                    disabled={wizardStep === 1 && !allHaveArtist}
+                    className="btn-primary h-11 px-6 disabled:opacity-40 disabled:cursor-not-allowed"
+                  >
+                    {t("upload.continue") || "Continuar"}
+                    <svg className="inline-block ml-1.5 w-4 h-4 -mt-0.5" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
+                      <path d="M5 12h14M12 5l7 7-7 7" />
+                    </svg>
+                  </button>
+                );
+              })()
             ) : wizardStep === 5 ? (
               <>
                 {onGenerateDirect && (

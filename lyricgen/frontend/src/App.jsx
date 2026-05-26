@@ -23,6 +23,8 @@ import Settings from "./components/Settings";
 import AdminPanel from "./components/AdminPanel";
 import { useAlert } from "./components/AlertProvider";
 import { useBackgroundPreview } from "./hooks/useBackgroundPreview";
+import { useMediaUrl } from "./mediaUrl";
+import { submitLyricsEdit } from "./lib/lyricsEditSubmit";
 
 const API = import.meta.env.VITE_API_URL || "";
 
@@ -349,6 +351,193 @@ function JobDetailRoute({ fetchHistory }) {
       />
     </div>
   );
+}
+
+// Deep-link adapter for /videos/:id/edit-lyrics. Bootstrappea
+// currentReview con los datos del job (segments, render_params, URLs
+// firmadas de audio/waveform/background) y renderiza el mismo
+// wizardScreen del flow nuevo — el operador edita lyrics post-render
+// dentro del Studio Console en vez de un modal separado con UX distinta.
+// Pasos 1, 2, 3, 5 quedan lockeados desde App (vía currentReview.
+// editingJobId) y el preview central muestra el MP4 ya renderizado.
+function EditLyricsRoute({ setCurrentReview, wizardScreen, t }) {
+  const { id } = useParams();
+  const navigate = useNavigate();
+  // status: "loading" | "ready" | "no_segments" | "not_editable" |
+  //         "not_found" | "error". Loading hasta que tanto el job como
+  // las URLs firmadas aterricen; ready hace montar el wizardScreen.
+  const [state, setState] = useState({ status: "loading" });
+
+  useEffect(() => {
+    let alive = true;
+    setState({ status: "loading" });
+
+    // Re-hidrate from snapshot when refreshing mid-edit: el operador
+    // ya tenía edits in-flight, el snapshot persistido por wizardPersistence
+    // los preserva. Las URLs firmadas (audio/bg) sí re-fetchean porque
+    // expiran (~5min).
+    const snap = wizardPersistence.load();
+    const reusableSnap =
+      snap?.currentReview?.editingJobId === id &&
+      Array.isArray(snap.currentReview.segments) &&
+      snap.currentReview.segments.length > 0;
+
+    (async () => {
+      try {
+        const [statusRes, audioRes, waveformRes, bgRes] = await Promise.all([
+          authFetch(`${API}/status/${id}`),
+          authFetch(`${API}/jobs/${id}/source-audio-url`),
+          authFetch(`${API}/jobs/${id}/waveform`),
+          authFetch(`${API}/jobs/${id}/background-url`),
+        ]);
+        if (!alive) return;
+
+        if (statusRes.status === 404) { setState({ status: "not_found" }); return; }
+        if (!statusRes.ok) { setState({ status: "error" }); return; }
+        const job = await statusRes.json();
+
+        // Solo pending_review/done/rejected son editables (mismo gating
+        // que canEditLyrics en JobDetail). Editing/queued/processing →
+        // bail-out con redirect: no tiene sentido abrir el editor sobre
+        // un render en curso.
+        const editable =
+          job.status === "pending_review" ||
+          job.status === "done" ||
+          job.status === "rejected";
+        if (!editable) { setState({ status: "not_editable", jobStatus: job.status }); return; }
+
+        // Sin segments_json no hay nada que editar — mismo banner amber
+        // que mostraba el modal anterior, sin redirect silencioso.
+        if (!Array.isArray(job.segments_json) || job.segments_json.length === 0) {
+          setState({ status: "no_segments" });
+          return;
+        }
+
+        const audioData = audioRes.ok ? await audioRes.json() : null;
+        const waveformData = waveformRes.ok ? await waveformRes.json() : null;
+        const bgData = bgRes.ok ? await bgRes.json() : null;
+        const params = job.render_params || {};
+
+        // Reuso del snapshot: si el operador refrescó con edits in-flight,
+        // los segments del snapshot ganan sobre job.segments_json (que es
+        // lo último que el autosave guardó pero podría no incluir el
+        // último cambio uncommitted). La baseline para "unchanged" sigue
+        // siendo lo que el job tiene RENDERIZADO (job.segments_json).
+        const segmentsFromSnap = reusableSnap ? snap.currentReview.segments : job.segments_json;
+
+        setCurrentReview({
+          editingJobId: id,
+          segments: segmentsFromSnap,
+          openSnapshotSegments: JSON.parse(JSON.stringify(job.segments_json)),
+          filename: job.filename || job.artist || "lyrics",
+          file: null,
+          audioUrl: audioData?.url || null,
+          waveform: waveformData || null,
+          bgUrl: bgData?.url || null,
+          font: (reusableSnap && snap.currentReview.font) || params.font || "",
+          textCase: (reusableSnap && snap.currentReview.textCase) || params.text_case || "upper",
+          textContrast: (reusableSnap && snap.currentReview.textContrast) || params.text_contrast || "medium",
+          fontScale: String((reusableSnap && snap.currentReview.fontScale) || params.font_scale || "1.0"),
+          lyricsAnimation: (reusableSnap && snap.currentReview.lyricsAnimation) || params.lyrics_animation || "none",
+          lineTransition: (reusableSnap && snap.currentReview.lineTransition) || params.line_transition || "none",
+          // Empty queue: this isn't a batch, it's a one-off edit.
+          queue: [],
+          queueIdx: 0,
+          transcribeJobId: null,
+          referenceLyrics: "",
+        });
+        setState({ status: "ready" });
+      } catch (e) {
+        if (alive) setState({ status: "error" });
+      }
+    })();
+
+    return () => { alive = false; };
+    // setCurrentReview is stable via useState; only re-bootstrap on id change.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [id]);
+
+  // Cleanup en unmount: si el operador navega lejos sin aprobar (back-button,
+  // sidebar, etc.), borrar el editingJobId del currentReview para que un
+  // siguiente /new arranque limpio y no resuma sobre el edit a medias. Los
+  // edits no se pierden — el autosave del LyricsEditor los persiste a
+  // /save-segments cada 3s, y la próxima visita a /edit-lyrics los re-fetchea.
+  useEffect(() => {
+    return () => {
+      setCurrentReview((r) => (r?.editingJobId ? null : r));
+      wizardPersistence.clear();
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  if (state.status === "loading") {
+    return <div className="w-12 h-12 mx-auto mt-16 border-2 border-brand border-t-transparent rounded-full animate-spin" />;
+  }
+  if (state.status === "not_found") {
+    return (
+      <div className="text-center mt-16">
+        <p className="text-gray-500 mb-4">{t("detail.not_found") || "No se encontró el video."}</p>
+        <button onClick={() => navigate("/dashboard")} className="btn-secondary">
+          {t("detail.back") || "Volver"}
+        </button>
+      </div>
+    );
+  }
+  if (state.status === "not_editable") {
+    return (
+      <div className="text-center mt-16 max-w-md mx-auto px-4">
+        <div className="w-14 h-14 mx-auto mb-4 rounded-2xl bg-amber-500/10 flex items-center justify-center">
+          <svg className="w-7 h-7 text-amber-400" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
+            <circle cx="12" cy="12" r="10" />
+            <path d="M12 8v4M12 16h.01" strokeLinecap="round" />
+          </svg>
+        </div>
+        <h2 className="text-xl font-bold mb-2">
+          {t("edit.not_editable_title") || "No se puede editar ahora"}
+        </h2>
+        <p className="text-sm text-gray-500 mb-6">
+          {t("edit.not_editable_subtitle") ||
+            `Este video está en estado "${state.jobStatus}". Esperá a que termine el render o que pase a revisión.`}
+        </p>
+        <button onClick={() => navigate(`/videos/${id}`)} className="btn-secondary">
+          {t("detail.back") || "Volver al video"}
+        </button>
+      </div>
+    );
+  }
+  if (state.status === "no_segments") {
+    return (
+      <div className="text-center mt-16 max-w-md mx-auto px-4">
+        <div className="w-14 h-14 mx-auto mb-4 rounded-2xl bg-amber-500/10 flex items-center justify-center">
+          <svg className="w-7 h-7 text-amber-400" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
+            <circle cx="12" cy="12" r="10" />
+            <path d="M12 8v4M12 16h.01" strokeLinecap="round" />
+          </svg>
+        </div>
+        <h2 className="text-xl font-bold mb-2">
+          {t("edit.lyrics_no_segments_title") || "Este video no tiene letras guardadas"}
+        </h2>
+        <p className="text-sm text-gray-500 mb-6">
+          {t("edit.lyrics_no_segments") ||
+            "Este job no tiene letras guardadas. Esto pasa con jobs muy viejos. Subí la canción de nuevo para editar letras."}
+        </p>
+        <button onClick={() => navigate(`/videos/${id}`)} className="btn-secondary">
+          {t("detail.back") || "Volver al video"}
+        </button>
+      </div>
+    );
+  }
+  if (state.status === "error") {
+    return (
+      <div className="text-center mt-16">
+        <p className="text-gray-500 mb-4">{t("detail.load_error") || "No pudimos cargar el video."}</p>
+        <button onClick={() => navigate(`/videos/${id}`)} className="btn-secondary">
+          {t("detail.back") || "Volver"}
+        </button>
+      </div>
+    );
+  }
+  return wizardScreen;
 }
 
 export default function App() {
@@ -1393,8 +1582,52 @@ export default function App() {
     }
   }, []);
 
-  const handleApproveLyrics = (editedSegments) => {
+  const handleApproveLyrics = async (editedSegments) => {
     const r = currentReview;
+    if (!r) return;
+
+    // Post-render edit branch: currentReview.editingJobId está set →
+    // estamos editando lyrics de un job ya renderizado desde la ruta
+    // /videos/:id/edit-lyrics. En vez de pushear al batch queue, postear
+    // al endpoint /edit/:id con edit_type=lyrics y navegar de vuelta al
+    // JobDetail (donde el polling de status retoma).
+    if (r.editingJobId) {
+      const result = await submitLyricsEdit({
+        jobId: r.editingJobId,
+        segments: editedSegments,
+        baselineSegments: r.openSnapshotSegments || r.segments,
+        font: r.font,
+        textCase: r.textCase,
+        textContrast: r.textContrast,
+        lyricsAnimation: r.lyricsAnimation,
+        lineTransition: r.lineTransition,
+        t,
+      });
+      if (result.cancelled) return;
+      if (result.unchanged) {
+        alert({
+          title: t("edit.stale_rerender_title") || "No detectamos cambios nuevos",
+          description: t("edit.stale_rerender_prompt") ||
+            "Las letras ya están guardadas y no detectamos cambios nuevos. Si el video todavía muestra la versión vieja, podés re-renderizarlo igual desde el video.",
+          tone: "warning",
+        });
+        return;
+      }
+      if (result.error) {
+        alert({
+          title: t("edit.error_title") || "No pudimos aplicar el edit",
+          description: result.error,
+          tone: "error",
+        });
+        return;
+      }
+      const editedJobId = r.editingJobId;
+      setCurrentReview(null);
+      wizardPersistence.clear();
+      navigate(`/videos/${editedJobId}`, { replace: true });
+      return;
+    }
+
     const newApproved = [...approvedJobs, {
       file: r.file, artist: r.artist, language: r.language,
       songTitle: r.songTitle || "",
@@ -1908,6 +2141,15 @@ export default function App() {
 
   // --- Per-route screens (kept inline so they share App-level state) ---
 
+  // Post-render edit: cuando currentReview.editingJobId está set, fetch
+  // la URL firmada del MP4 ya renderizado para que el WizardLivePreview
+  // central lo muestre. useMediaUrl maneja el caché + refresh del token
+  // (5min ttl, refresh ~30s antes de expirar). El hook devuelve "" antes
+  // de la primera respuesta — el preview cae a su modo legacy hasta que
+  // la URL aterriza.
+  const _editingJobId = currentReview?.editingJobId || null;
+  const editingRenderedVideoUrl = useMediaUrl(_editingJobId, "video", "preview");
+
   // Resume banner shown on /new and /review when sessionStorage has a
   // pending batch from a prior visit. Lets the operator restore their
   // approved-jobs + current-review (segments included) or drop the
@@ -2019,6 +2261,14 @@ export default function App() {
         // sincronizado al audio. Sin re-renders en App.jsx — el preview lee
         // el ref con su propio rAF loop.
         playbackTickRef={playbackTickRef}
+        // Post-render edit (EditLyricsRoute): cuando currentReview viene
+        // con editingJobId, el wizard cambia a modo "editar job existente":
+        // pasos 1, 2, 3, 5 lockeados (esos cambios requieren regenerar
+        // fondo y los cubre el modo "background" de EditRequestPanel), el
+        // preview central muestra el MP4 ya renderizado en vez de la
+        // simulación de karaoke.
+        lockedSteps={currentReview?.editingJobId ? [1, 2, 3, 5] : []}
+        renderedVideoUrl={editingRenderedVideoUrl || null}
         // UI F5 (2026-05-26): le pasamos el bgStatus al wizard para que
         // UploadZone pueda derivar `placeholderBg` cuando montamos el
         // preview en paso 6. "done" = fondo final listo, todo lo demás
@@ -2132,7 +2382,10 @@ export default function App() {
             recoverySource={currentReview.recoverySource}
             onApprove={handleApproveLyrics}
             onBack={handleBackInReview}
-            transcribeJobId={currentReview.transcribeJobId || null}
+            // Post-render edit: cuando editingJobId está set, el autosave
+            // de /save-segments va al job real (no al transcribeJob, que
+            // en este flow es null). Orden importante: editingJobId gana.
+            transcribeJobId={currentReview.editingJobId || currentReview.transcribeJobId || null}
             onPersistSegments={persistSegmentsToBackend}
             isBatch={currentReview.queue.length > 1}
             batchProgress={currentReview.queue.length > 1
@@ -2363,6 +2616,21 @@ export default function App() {
             />
           } />
           <Route path="/videos/:id" element={<JobDetailRoute fetchHistory={fetchHistory} />} />
+          {/* Post-render edit: monta el mismo Studio Console que /new,
+              pre-seeded con los segments/render_params del job. Stepper
+              con pasos 1, 2, 3, 5 lockeados (esos cambios requieren
+              regenerar fondo y los cubre el modo "background" de
+              EditRequestPanel); pasos 4 (typography) y 6 (lyrics)
+              editables. Centro muestra MP4 ya renderizado. Aprobar
+              dispara /edit/:id con edit_type=lyrics y navega de vuelta
+              a /videos/:id. */}
+          <Route path="/videos/:id/edit-lyrics" element={
+            <EditLyricsRoute
+              setCurrentReview={setCurrentReview}
+              wizardScreen={wizardScreen}
+              t={t}
+            />
+          } />
           {/* Legacy redirects from earlier route names so any cached
               link, browser-history entry, or sidebar tour state still
               lands in the right place. */}
