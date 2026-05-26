@@ -104,6 +104,36 @@ _EDIT_ABANDON_THRESHOLD_MIN = int(os.environ.get(
     "REAPER_EDIT_ABANDON_THRESHOLD_MIN", "30",
 ))
 
+# Stuck-transcription threshold. RQ kills the transcription_worker at
+# TRANSCRIBE_JOB_TIMEOUT=1800s (30 min) per attempt; Retry(max=2, interval=10)
+# allows 2 additional attempts, so a healthy lifetime in transcribing
+# states maxes out around ~90 min worst case. 120 min gives ~33% margin.
+#
+# Why a dedicated sweep instead of folding into find_stuck_jobs:
+#   - find_stuck_jobs uses _DEFAULT_THRESHOLD_MIN=180 (3h) to accommodate
+#     UMG ProRes renders; that ceiling is way too generous for Whisper
+#     (worst case ~30 min per attempt). A transcription stuck 2h is
+#     definitely a zombie, not slow.
+#   - find_stuck_jobs reaps to status="error" (the generic render-failed
+#     state). The transcription pipeline has its own terminal status
+#     `transcription_failed` which the editor uses to show "Reintentar"
+#     with the right CTA — different button than the post-render retry.
+#
+# Why this matters operationally:
+#   - The transcription pipeline registers on_failure=transcription_failure_callback
+#     (queue_jobs.py:465) which is supposed to flip the row to
+#     transcription_failed when retries are exhausted. But the callback
+#     never fires when RQ Retry schedules a deferred retry that the
+#     scheduler never executes (worker.py had `with_scheduler=False` until
+#     2026-05-26 — fixed in the same PR introducing this sweep). The row
+#     stays in `transcribing` / `transcribing_queued` indefinitely.
+#   - Even with the scheduler fix, this sweep is the belt-and-suspenders
+#     for any future regression that strands a transcription (Whisper
+#     hangs without crashing, DB write fails after status flip, etc.).
+_TRANSCRIPTION_STUCK_THRESHOLD_MIN = int(os.environ.get(
+    "REAPER_TRANSCRIPTION_STUCK_THRESHOLD_MIN", "120",
+))
+
 # Stalled-render threshold. Catches jobs in `processing` whose progress
 # hasn't moved in N minutes — the gap between find_orphan_polling_jobs
 # (which fires on stale in-flight AI calls) and find_stuck_jobs (which
@@ -314,6 +344,86 @@ def find_abandoned_edits(
         .order_by(Job.editing_started_at.asc())
         .all()
     )
+
+
+def find_stuck_transcriptions(
+    db: Session,
+    threshold_min: int = _TRANSCRIPTION_STUCK_THRESHOLD_MIN,
+) -> list[Job]:
+    """Return jobs in `transcribing_queued` / `transcribing` older than
+    threshold. These are NOT covered by find_stuck_jobs (which only sweeps
+    processing/queued/bg_preview_queued) — see threshold docstring for the
+    full rationale.
+
+    Staleness anchor is coalesce(last_progress_at, created_at): worker calls
+    update_job(status="transcribing", current_step="transcribing") at the
+    start of `run_transcription_job`, which ticks last_progress_at via the
+    update_job pipeline. A healthy in-flight transcription bumps it; a
+    worker that never picked up the job (or died before the status flip)
+    has NULL → falls back to created_at."""
+    cutoff = datetime.now(timezone.utc) - timedelta(minutes=threshold_min)
+    anchor = func.coalesce(Job.last_progress_at, Job.created_at)
+    return (
+        db.query(Job)
+        .filter(Job.status.in_(["transcribing_queued", "transcribing"]))
+        .filter(anchor < cutoff)
+        .order_by(anchor.asc())
+        .all()
+    )
+
+
+def _reason_for_transcription(job: Job) -> str:
+    """Customer-facing message for a reaped stuck transcription. The
+    `transcription_failed` UI surfaces a "Reintentar" CTA that re-runs the
+    transcribe step against the audio still sitting on R2 — no re-upload
+    needed. Same tone as _reason_for_orphan."""
+    return (
+        "La transcripción se interrumpió por un problema temporal del "
+        "servidor. Tu archivo sigue guardado: apretá \"Reintentar\" para "
+        "volver a transcribir."
+    )
+
+
+def reap_stuck_transcription(db: Session, job: Job) -> None:
+    """Flip a stuck transcription to `transcription_failed` and cancel its
+    RQ entry. Caller commits.
+
+    Different reaping path from `reap_stuck_job` because:
+      1. Status target is `transcription_failed` (editor's "Reintentar" CTA),
+         not the generic `error` (post-render retry).
+      2. Transcription RQ ids are prefixed `transcribe:<job_id>` to avoid
+         collision with the render job sharing the same Postgres job_id;
+         cancel_rq_job is called with the prefixed form.
+    """
+    rq_removed = False
+    previous_status = job.status  # capture before mutation for audit
+    try:
+        from queue_jobs import cancel_rq_job
+        # enqueue_transcription uses `transcribe:<job_id>` as the RQ id
+        # (queue_jobs.py:457). Cancelling the bare job_id would miss it.
+        rq_removed = cancel_rq_job(f"transcribe:{job.job_id}")
+    except Exception as e:  # pragma: no cover
+        logger.warning(
+            "cancel_rq_job (transcription) failed for %s: %s", job.job_id, e,
+        )
+    reason = _reason_for_transcription(job)
+    job.status = "transcription_failed"
+    job.current_step = "error"
+    job.error = reason
+    job.completed_at = datetime.now(timezone.utc)
+    db.add(AuditLog(
+        action="reaper.killed_transcription",
+        detail={
+            "job_id": job.job_id,
+            "tenant_id": job.tenant_id,
+            "artist": job.artist,
+            "filename": job.filename,
+            "previous_status": previous_status,
+            "age_minutes": round(_age_minutes(job), 1),
+            "reason": reason,
+            "rq_removed": rq_removed,
+        },
+    ))
 
 
 def revert_abandoned_edit(db: Session, job: Job) -> None:
@@ -718,6 +828,7 @@ def _reap_all_stuck_inner(threshold_min: int) -> int:
         abandoned = find_abandoned_transcribed(db)
         abandoned_uploads = find_abandoned_uploads(db)
         abandoned_edits = find_abandoned_edits(db)
+        stuck_transcriptions = find_stuck_transcriptions(db)
         # Reap abandoned transcribed_pending rows quietly: the user never
         # got a job started, so the failure isn't operator-visible. Just
         # delete the row and clean up the input file.
@@ -756,12 +867,34 @@ def _reap_all_stuck_inner(threshold_min: int) -> int:
             except Exception as e:
                 db.rollback()
                 logger.warning("[REAPER] revert edit %s failed: %s", job.job_id, e)
+        # Stuck transcriptions get flipped to transcription_failed so the
+        # editor's "Reintentar" CTA surfaces; the audio sits on R2 untouched
+        # so the retry skips the upload entirely. Same per-job isolation
+        # as the other transcribed/upload/edit sweeps — a single FK or
+        # detached-state hiccup must not stop the whole pass.
+        _n_tx = 0
+        for job in stuck_transcriptions:
+            try:
+                reap_stuck_transcription(db, job)
+                db.commit()
+                _n_tx += 1
+            except Exception as e:
+                db.rollback()
+                logger.warning(
+                    "[REAPER] reap transcription %s failed: %s",
+                    job.job_id, e,
+                )
         if _n_tr:
             logger.info("[REAPER] cleaned up %d abandoned transcribed_pending job(s)", _n_tr)
         if _n_up:
             logger.info("[REAPER] cleaned up %d abandoned awaiting_upload job(s)", _n_up)
         if _n_ed:
             logger.info("[REAPER] reverted %d abandoned edit job(s) back to pending_review", _n_ed)
+        if _n_tx:
+            logger.warning(
+                "[REAPER] flipped %d stuck transcription(s) to transcription_failed",
+                _n_tx,
+            )
         if not stuck and not orphans and not stalled:
             return 0
         for job in stuck:

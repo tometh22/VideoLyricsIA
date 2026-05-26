@@ -305,11 +305,28 @@ def cancel_rq_job(job_id: str) -> bool:
         logger.warning("RQ fetch failed for %s: %s", job_id, e)
         return False
     try:
+        from rq import Queue as _Q
         from rq.registry import (
             StartedJobRegistry, FailedJobRegistry,
             DeferredJobRegistry, ScheduledJobRegistry,
         )
-        for q in (q_default, q_enterprise):
+        # Build the full set of queues a job could be in. _init_redis only
+        # exposes default + enterprise (legacy), but transcription jobs use
+        # the `transcription` queue (queue_jobs.py:435) and bg_preview jobs
+        # use `bg_preview` (queue_jobs.py:514). Before this fix, the reaper
+        # would mark a transcription row as transcription_failed in Postgres
+        # but the RQ entry stayed alive in the `transcription` queue's
+        # ScheduledJobRegistry — RQScheduler would later move it back to
+        # `transcription`, the worker would re-process a row already in a
+        # terminal state, and jobs.update_job's terminal-state guard would
+        # silently discard the result (incident 2026-05-26).
+        all_queues = [q_default, q_enterprise]
+        for extra_name in ("transcription", "bg_preview"):
+            try:
+                all_queues.append(_Q(extra_name, connection=r))
+            except Exception:
+                pass
+        for q in all_queues:
             if q is None:
                 continue
             try:

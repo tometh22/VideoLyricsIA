@@ -19,6 +19,7 @@ from reaper import (
     find_orphan_polling_jobs,
     find_stalled_renders,
     find_stuck_jobs,
+    find_stuck_transcriptions,
     reap_all_stuck,
 )
 
@@ -631,6 +632,124 @@ def test_reap_stuck_job_cancels_rq_entry(monkeypatch):
         reap_all_stuck(threshold_min=100)
         assert jid in calls, (
             f"cancel_rq_job should have been called with {jid!r}, "
+            f"got calls={calls!r}"
+        )
+    finally:
+        _cleanup(db)
+        db.close()
+
+
+# ---------------------------------------------------------------------------
+# Stuck transcriptions (transcribing_queued / transcribing) — incident
+# 2026-05-26. Before this sweep, jobs whose RQ Retry got stranded in
+# ScheduledJobRegistry (worker had `with_scheduler=False`) sat in the
+# transcribing states forever — find_stuck_jobs only sweeps processing/
+# queued/bg_preview_queued, and transcription_failure_callback never fires
+# while RQ thinks retries are pending. agus.cafisi (omg) reported 3 stuck
+# jobs at 46m/2h/2h that this sweep would have caught at 120 min.
+# ---------------------------------------------------------------------------
+
+
+def test_fresh_transcribing_queued_is_left_alone():
+    """A 30-min-old transcribing_queued job is healthy queue lag, not stuck."""
+    db = SessionLocal()
+    try:
+        _cleanup(db)
+        jid = _seed(db, status="transcribing_queued", age_minutes=30)
+        stuck = find_stuck_transcriptions(db, threshold_min=120)
+        assert all(j.job_id != jid for j in stuck), (
+            "30-min-old transcribing_queued must not be reaped at threshold=120"
+        )
+    finally:
+        _cleanup(db)
+        db.close()
+
+
+def test_old_transcribing_queued_is_reaped_with_retry_cta():
+    """A 130-min transcribing_queued row → transcription_failed with the
+    'Reintentar' message the editor's CTA matches. The audio still on R2
+    means the retry skips re-upload."""
+    db = SessionLocal()
+    try:
+        _cleanup(db)
+        jid = _seed(db, status="transcribing_queued", age_minutes=130)
+        reap_all_stuck(threshold_min=180)  # high render-side threshold
+        row = db.query(Job).filter(Job.job_id == jid).first()
+        db.refresh(row)
+        assert row.status == "transcription_failed", (
+            f"expected 'transcription_failed', got {row.status!r}"
+        )
+        assert row.error and "transcripción se interrumpió" in row.error.lower(), (
+            f"expected transcription-specific reason, got {row.error!r}"
+        )
+        assert row.completed_at is not None, "completed_at should be stamped"
+    finally:
+        _cleanup(db)
+        db.close()
+
+
+def test_old_transcribing_in_flight_is_reaped():
+    """`transcribing` (worker already picked up + flipped status) is also
+    swept — without this, a worker that flipped status then died before
+    finishing leaves the row stuck in `transcribing` indefinitely."""
+    db = SessionLocal()
+    try:
+        _cleanup(db)
+        jid = _seed(db, status="transcribing", age_minutes=130,
+                    last_progress_minutes_ago=125)
+        reap_all_stuck(threshold_min=180)
+        row = db.query(Job).filter(Job.job_id == jid).first()
+        db.refresh(row)
+        assert row.status == "transcription_failed", (
+            f"expected 'transcription_failed', got {row.status!r}"
+        )
+    finally:
+        _cleanup(db)
+        db.close()
+
+
+def test_stuck_transcription_sweep_skips_terminal_statuses():
+    """Don't touch transcription_failed (already terminal) or done/error
+    (different terminal states from past pipelines)."""
+    db = SessionLocal()
+    try:
+        _cleanup(db)
+        jids = [
+            _seed(db, status="transcription_failed", age_minutes=130),
+            _seed(db, status="done", age_minutes=130),
+            _seed(db, status="error", age_minutes=130),
+            _seed(db, status="transcribed_pending", age_minutes=130,
+                  last_user_activity_minutes_ago=10),
+        ]
+        stuck = find_stuck_transcriptions(db, threshold_min=120)
+        stuck_ids = {j.job_id for j in stuck}
+        for jid in jids:
+            assert jid not in stuck_ids, (
+                f"sweep should not touch {jid!r}, got {stuck_ids!r}"
+            )
+    finally:
+        _cleanup(db)
+        db.close()
+
+
+def test_stuck_transcription_cancels_rq_entry_with_prefix(monkeypatch):
+    """The RQ entry for a transcription uses the `transcribe:<job_id>`
+    prefix (queue_jobs.py:457). The reaper must cancel the prefixed form,
+    not the bare job_id — otherwise the RQ side stays alive and RQScheduler
+    can move a stranded retry back to the queue, resurrecting a row that
+    is now in a terminal state."""
+    import queue_jobs
+    calls: list[str] = []
+    monkeypatch.setattr(queue_jobs, "cancel_rq_job",
+                        lambda jid: calls.append(jid) or True)
+    db = SessionLocal()
+    try:
+        _cleanup(db)
+        jid = _seed(db, status="transcribing_queued", age_minutes=130)
+        reap_all_stuck(threshold_min=180)
+        prefixed = f"transcribe:{jid}"
+        assert prefixed in calls, (
+            f"cancel_rq_job should be called with {prefixed!r}, "
             f"got calls={calls!r}"
         )
     finally:
