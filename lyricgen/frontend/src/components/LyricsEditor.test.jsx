@@ -114,22 +114,42 @@ describe("LyricsEditor — sync mode anchor across positions (B4)", () => {
     });
     const { container } = render(<LyricsEditor {...props} />);
 
-    // Audio at 5 s — before the first existing segment.
+    // Refactor 2026-05-23: el UI per-fila de "Activar Sync" se compactó
+    // a un botón global (LyricsEditor.jsx:1881). El único entry point a
+    // un syncCursor != 0 es secuencial — Space anchora la línea actual
+    // y avanza al siguiente _id. Reescribimos el test para walk-through
+    // los rows en orden, mirroring el uso real del operador.
+
+    // audioUrl se setea via useEffect (createObjectURL del audioFile).
+    // El Ctrl+K handler bail-ea si !audioUrl, así que esperamos a que
+    // el effect haya corrido + el <audio> esté en el DOM antes de
+    // disparar el keydown. Sin esto, en suite full el test corre
+    // bajo timing diferente y Ctrl+K no entra a sync mode.
+    await new Promise((res) => setTimeout(res, 0));
+    if (!container.querySelector("audio")) {
+      throw new Error("audio element not mounted after first tick — useEffect didn't run");
+    }
+
+    // Enter sync mode con Cmd/Ctrl+K (no depende de visibilidad del
+    // botón en jsdom: la entry tiene class `hidden md:inline-flex` y
+    // queda display:none por defecto).
+    fireEvent.keyDown(window, { key: "k", ctrlKey: true });
+
+    // Walk cursor de alpha (idx 0) → beta → gamma → delta anchorando
+    // cada una en su propio start (no-op delta). Cada Space avanza el
+    // syncCursor al siguiente _id post-sort vía queueMicrotask, así que
+    // damos un tick antes del siguiente.
+    for (const t of [10.0, 20.0, 30.0]) {
+      _setAudioCurrentTime(container, t);
+      await new Promise((res) => setTimeout(res, 0));
+      fireEvent.keyDown(window, { code: "Space" });
+    }
+    await new Promise((res) => setTimeout(res, 0));
+
+    // Cursor ahora apunta a delta. Audio a 5 s, antes de los otros 3.
     _setAudioCurrentTime(container, 5.0);
-
-    // Activate sync mode on the 4th row ("delta"). The ◉ button sits
-    // on hover, but in jsdom there's no hover state — we click it
-    // directly via the title attribute (set in LyricsEditor.jsx
-    // L1621).
-    const dotButtons = container.querySelectorAll(
-      'button[title*="Activar Sync"]'
-    );
-    // The 4th row's ◉ — index 3 (0-based) since the rows are in array
-    // order and there are 4 segments.
-    await userEvent.click(dotButtons[3]);
-
-    // Press SPACE to anchor.
     fireEvent.keyDown(window, { code: "Space" });
+    await new Promise((res) => setTimeout(res, 0));
 
     // The "delta" segment must now read its new chronological time
     // (~5 s, with 80 ms latency compensation). The display formats

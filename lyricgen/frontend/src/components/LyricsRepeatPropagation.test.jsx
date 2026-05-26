@@ -112,7 +112,13 @@ describe("LyricsEditor — repeat-line propagation", () => {
     render(<LyricsEditor {...chorusProps()} />);
     const inputs = screen.getAllByDisplayValue("Quizá fue en la mañana");
     editLine(inputs[0], "Quizás fue en la mañana, vendados");
-    fireEvent.click(screen.getByRole("button", { name: /Solo esta/i }));
+    // Two buttons named "Solo esta" coexist: this one (dismissPropagation
+    // del repeat prompt) and a layoutScope toggle below the lyrics editor.
+    // Scope the query to the propagation prompt by anchoring on its unique
+    // sibling "Aplicar a todas (N)" button.
+    const applyBtn = screen.getByRole("button", { name: /Aplicar a todas/i });
+    const dismissBtn = within(applyBtn.parentElement).getByRole("button", { name: /Solo esta/i });
+    fireEvent.click(dismissBtn);
     expect(screen.getByDisplayValue("Quizás fue en la mañana, vendados")).toBeInTheDocument();
     // The other two stale occurrences stay as they were.
     expect(screen.getAllByDisplayValue("Quizá fue en la mañana")).toHaveLength(2);
