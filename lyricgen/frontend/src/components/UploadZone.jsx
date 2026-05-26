@@ -209,6 +209,12 @@ export default function UploadZone({
     genre: "", concept: "", movementStyle: "", effect: "", font: "",
     // lyricTransition + textMotion: deprecados 2026-05-23 (no se persisten).
     textCase: "upper", fontScale: "1.0", lyricsAnimation: "none", lineTransition: "none", textContrast: "medium",
+    // Lyric color customization 2026-05-25:
+    // - lyricColor: color del texto (no-cantada para karaoke; texto único para
+    //   none/pop/glow/word_reveal).
+    // - lyricSungColor: solo aplica a karaoke = color de la palabra cantada.
+    // Default blanco para no romper jobs viejos sin estos params.
+    lyricColor: "#FFFFFF", lyricSungColor: "#FFFFFF",
     // Escena axis: optional free-text prompt ("Mi prompt"). When non-empty it
     // overrides genre/concept/lyrics. bgVerbatim TRUE by default = use the
     // operator's text as-is (people expect their prompt used, not rewritten);
@@ -1874,6 +1880,8 @@ export default function UploadZone({
               effect={hoverEffect ?? batchDefaults.effect}
               lyricsAnimation={hoverAnimation ?? batchDefaults.lyricsAnimation}
               lineTransition={hoverTransition ?? batchDefaults.lineTransition}
+              lyricColor={batchDefaults.lyricColor || "#FFFFFF"}
+              lyricSungColor={batchDefaults.lyricSungColor || "#FFFFFF"}
               mode={sceneMode}
               lyric={_previewLyric}
               clipSrc={(MOVEMENT_STYLES.find((m) => m.code === (hoverMovement ?? batchDefaults.movementStyle))?.sample) || "/movement_samples/estandar.mp4"}
@@ -2128,6 +2136,49 @@ export default function UploadZone({
               <p className="text-[10px] text-gray-600 mt-2">
                 🎤 {t("upload.anim_word_note") || "Funcionan en toda canción — el tiempo por palabra se calcula automáticamente."}
               </p>
+
+              {/* Lyric text color — color picker(s). El segundo solo aplica a
+                  karaoke (color de la palabra cantada). Para none/pop/glow/
+                  word_reveal alcanza con un solo color para todo el texto. */}
+              <div className="mt-4 pt-3 border-t border-white/[0.05]">
+                <p className="text-[11px] text-gray-300 font-medium">{t("upload.lyric_color_title") || "Color del texto"}</p>
+                <p className="text-[10px] text-gray-600 mt-0.5 mb-2">
+                  {t("upload.lyric_color_desc") || "Color de las letras sobre el video. Por defecto blanco."}
+                </p>
+                <div className="flex items-center gap-3 flex-wrap">
+                  <label className="flex items-center gap-1.5 text-[11px] text-gray-400 cursor-pointer">
+                    <input
+                      type="color"
+                      value={batchDefaults.lyricColor || "#FFFFFF"}
+                      onChange={(e) => updateBatchDefault("lyricColor", e.target.value)}
+                      className="w-7 h-7 rounded cursor-pointer bg-transparent border-0 p-0"
+                      aria-label={t("upload.lyric_color_label") || "Color del texto"}
+                    />
+                    <span>{batchDefaults.lyricsAnimation === "karaoke" ? (t("upload.lyric_color_unsung") || "No cantada") : (t("upload.lyric_color_label") || "Texto")}</span>
+                  </label>
+                  {batchDefaults.lyricsAnimation === "karaoke" && (
+                    <label className="flex items-center gap-1.5 text-[11px] text-gray-400 cursor-pointer">
+                      <input
+                        type="color"
+                        value={batchDefaults.lyricSungColor || "#FFFFFF"}
+                        onChange={(e) => updateBatchDefault("lyricSungColor", e.target.value)}
+                        className="w-7 h-7 rounded cursor-pointer bg-transparent border-0 p-0"
+                        aria-label={t("upload.lyric_sung_color_label") || "Color palabra cantada"}
+                      />
+                      <span>{t("upload.lyric_color_sung") || "Cantada"}</span>
+                    </label>
+                  )}
+                  {(batchDefaults.lyricColor !== "#FFFFFF" || batchDefaults.lyricSungColor !== "#FFFFFF") && (
+                    <button
+                      type="button"
+                      onClick={() => { updateBatchDefault("lyricColor", "#FFFFFF"); updateBatchDefault("lyricSungColor", "#FFFFFF"); }}
+                      className="text-[10px] text-gray-500 hover:text-white underline-offset-2 hover:underline transition-colors"
+                    >
+                      {t("upload.lyric_color_reset") || "Restablecer"}
+                    </button>
+                  )}
+                </div>
+              </div>
 
               {/* Transición entre líneas — eje aparte, compone con la animación */}
               <div className="mt-4 pt-3 border-t border-white/[0.05]">

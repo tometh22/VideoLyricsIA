@@ -551,6 +551,15 @@ const translations = {
     "upload.style_custom": "Personalizado",
     "upload.style_custom_desc": "Elegí tus colores (marca, artista…)",
     "upload.style_custom_hint": "2 colores dominantes para el fondo",
+    // Lyric text color pickers en Step 4 (Animación). El segundo solo
+    // aparece cuando lyricsAnimation === "karaoke".
+    "upload.lyric_color_title": "Color del texto",
+    "upload.lyric_color_desc": "Color de las letras sobre el video. Por defecto blanco.",
+    "upload.lyric_color_label": "Texto",
+    "upload.lyric_color_unsung": "No cantada",
+    "upload.lyric_color_sung": "Cantada",
+    "upload.lyric_sung_color_label": "Color palabra cantada",
+    "upload.lyric_color_reset": "Restablecer",
     "upload.style_dark": "Oscuro",
     "upload.style_dark_sub": "Dramático · rock, balada, urbano",
     "upload.style_neon": "Neón",

@@ -1123,7 +1123,11 @@ export default function LyricsEditor({
   const seekTo = useCallback((seconds, autoplay = true) => {
     const a = audioRef.current;
     if (!a) return;
-    a.currentTime = Math.max(0, seconds);
+    const t = Math.max(0, seconds);
+    a.currentTime = t;
+    // Refleja en el mismo frame del click. Sin esto hay que esperar al
+    // próximo rAF tick (~16ms) y el playhead "se desliza" en vez de saltar.
+    setCurrentTime(t);
     if (autoplay && a.paused) a.play().catch(() => {});
   }, []);
 
@@ -2506,6 +2510,16 @@ export default function LyricsEditor({
                     />
                   ) : (
                     <div className="flex items-center gap-1 shrink-0">
+                      {/* sr-only hook so tests can enter sync mode at a specific row
+                          without requiring hover state (jsdom has no hover). */}
+                      <button
+                        type="button"
+                        data-testid={`sync-dot-${idx}`}
+                        title="Activar Sync desde esta línea"
+                        onClick={() => enterSyncModeAt(idx)}
+                        className="sr-only"
+                        aria-label="Activar Sync desde esta línea"
+                      />
                       <button
                         onClick={() => seekTo(Math.max(0, seg.start), true)}
                         onDoubleClick={() => startEditTimestamp(seg)}
@@ -2638,6 +2652,7 @@ export default function LyricsEditor({
                         </button>
                         <button
                           type="button"
+                          data-testid="repeat-only-this-btn"
                           onMouseDown={(e) => e.preventDefault()}
                           onClick={dismissPropagation}
                           className="px-2.5 py-1 rounded-lg bg-surface-2 text-white/70 hover:text-white transition-colors whitespace-nowrap"

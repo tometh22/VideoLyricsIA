@@ -77,7 +77,7 @@ function VideoCard({ job, onSelect }) {
             onError={(e) => { e.target.style.display = "none"; }}
           />
         )}
-        <div className="absolute inset-0 flex items-center justify-center opacity-0 group-hover:opacity-100 transition-opacity bg-black/30">
+        <div className="absolute inset-0 flex items-center justify-center opacity-30 sm:opacity-0 sm:group-hover:opacity-100 transition-opacity bg-black/30">
           <div className="w-10 h-10 rounded-full bg-white/15 backdrop-blur-md flex items-center justify-center ring-1 ring-white/20">
             <svg className="w-4 h-4 text-white ml-0.5" fill="currentColor" viewBox="0 0 24 24">
               <path d="M8 5v14l11-7z"/>

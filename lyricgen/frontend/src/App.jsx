@@ -410,6 +410,7 @@ export default function App() {
     const fields = [
       "font", "textCase", "fontScale", "textContrast",
       "lyricsAnimation", "lineTransition",
+      "lyricColor", "lyricSungColor",
       "movementStyle", "effect", "concept", "genre",
       "backgroundHint", "bgVerbatim",
     ];
@@ -603,6 +604,8 @@ export default function App() {
           fontScale: String(job.font_scale || "1.0"),
           lyricsAnimation: job.lyrics_animation || "none",
           lineTransition: job.line_transition || "none",
+          lyricColor: job.lyric_color || "#FFFFFF",
+          lyricSungColor: job.lyric_sung_color || "#FFFFFF",
           textContrast: job.text_contrast || "medium",
           segments,
           referenceLyrics: job.reference_lyrics || "",
@@ -985,7 +988,10 @@ export default function App() {
             if (file) setRowStatus(file, "error", { error: data.error });
             return null;
           }
-          if (file) setRowStatus(file, data.status === "transcribing_queued" ? "queued" : "transcribing");
+          if (file) setRowStatus(file, data.status === "transcribing_queued" ? "queued" : "transcribing", {
+            current_step: data.current_step ?? null,
+            progress: data.progress ?? null,
+          });
         }
       } catch {
         // Transient errors — keep polling.
@@ -1487,6 +1493,8 @@ export default function App() {
         // lyric_transition + text_motion: deprecados 2026-05-23 (no se envían).
         formData.append("lyrics_animation", jobList[i].lyricsAnimation || "none");
         formData.append("line_transition", jobList[i].lineTransition || "none");
+        formData.append("lyric_color", jobList[i].lyricColor || "#FFFFFF");
+        formData.append("lyric_sung_color", jobList[i].lyricSungColor || "#FFFFFF");
         formData.append("text_contrast", jobList[i].textContrast || "medium");
         if (animateImage && backgroundFile) formData.append("animate_image", "true");
         formData.append("match_lyrics", String(!!inspiredByLyrics));
@@ -1624,6 +1632,8 @@ export default function App() {
         // lyric_transition + text_motion: deprecados 2026-05-23 (no se envían).
         generateBody.append("lyrics_animation", jobList[i].lyricsAnimation || "none");
         generateBody.append("line_transition", jobList[i].lineTransition || "none");
+        generateBody.append("lyric_color", jobList[i].lyricColor || "#FFFFFF");
+        generateBody.append("lyric_sung_color", jobList[i].lyricSungColor || "#FFFFFF");
         generateBody.append("text_contrast", jobList[i].textContrast || "medium");
         if (animateImage && backgroundFile) generateBody.append("animate_image", "true");
         generateBody.append("match_lyrics", String(!!inspiredByLyrics));

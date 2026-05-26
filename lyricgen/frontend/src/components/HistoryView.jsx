@@ -272,25 +272,31 @@ function VideoCard({ job, onSelect, onDelete, selected, onToggleSelect, t }) {
         ${selected ? "ring-2 ring-brand/60" : ""}`}
     >
       <div className="aspect-video bg-surface-3/30 relative overflow-hidden">
-        {showThumb && thumbSrc && (
-          <img
-            src={thumbSrc}
-            alt=""
-            className="w-full h-full object-cover group-hover:scale-[1.04] transition-transform duration-500"
-            onError={(e) => { e.target.style.display = "none"; }}
-          />
-        )}
-        {(job.status === "processing" || job.status === "queued" || job.status === "editing") && (
-          <div className="absolute inset-0 flex items-center justify-center">
-            <div className="w-7 h-7 border-2 border-brand border-t-transparent rounded-full animate-spin" />
-          </div>
-        )}
-        {(job.status === "error" || job.status === "validation_failed") && (
+        {showThumb && thumbSrc ? (
+          <>
+            <img
+              src={thumbSrc}
+              alt=""
+              className="w-full h-full object-cover group-hover:scale-[1.04] transition-transform duration-500"
+              onError={(e) => { e.target.style.display = "none"; }}
+            />
+            {/* Re-render in progress sobre el thumb stale (status=editing) */}
+            {job.status === "editing" && (
+              <div className="absolute inset-0 flex items-center justify-center bg-black/30 backdrop-blur-[1px]">
+                <div className="w-7 h-7 border-2 border-brand border-t-transparent rounded-full animate-spin" />
+              </div>
+            )}
+          </>
+        ) : (job.status === "error" || job.status === "validation_failed") ? (
           <div className="absolute inset-0 flex items-center justify-center bg-red-500/[0.04]">
             <svg className="w-7 h-7 text-red-400/60" fill="none" stroke="currentColor" strokeWidth="1.5" viewBox="0 0 24 24">
               <circle cx="12" cy="12" r="10"/><path d="M15 9l-6 6M9 9l6 6"/>
             </svg>
           </div>
+        ) : (
+          // Placeholder bonito (aurora + equalizer) — antes era un spinner
+          // pelado sobre bg-surface-3/30 vacío. Mismo componente que MediaRow.
+          <ProcessingThumbnail status={job.status} />
         )}
 
         <div className="absolute top-2.5 right-2.5">
@@ -370,17 +376,92 @@ function VideoCard({ job, onSelect, onDelete, selected, onToggleSelect, t }) {
   );
 }
 
+// ProcessingThumbnail — aurora + equalizer placeholder para jobs sin
+// frame renderizado todavía. Operator feedback 2026-05-25: "las preview
+// en historial no tienen miniatura (las que están procesando), creemos
+// una linda para esas". Tres tiers visuales según status:
+//   active  → processing / editing / transcribing   (brand violet, bars rápidas + shine)
+//   waiting → queued / *_queued / awaiting_upload   (gris suave, bars lentas)
+//   draft   → transcribed / transcribed_pending     (nota musical estática)
+// Renderiza absoluto sobre el parent → funciona en 120×70 y aspect-video.
+// Keyframes inline (mismo patrón que BatchProgress/WizardLivePreview).
+function ProcessingThumbnail({ status }) {
+  const isActive  = status === "processing" || status === "editing" || status === "transcribing";
+  const isWaiting = status === "queued" || status === "transcribing_queued" || status === "awaiting_upload";
+  const isStatic  = !isActive && !isWaiting;
+  const barColor  = isActive ? "bg-brand-light" : isWaiting ? "bg-white/40" : "bg-white/20";
+  const period    = isActive ? 850 : 1500;
+  const peaks     = [40, 70, 100, 60, 35];
+  return (
+    <>
+      <div className={`absolute inset-0 bg-gradient-to-br ${
+        isActive  ? "from-brand/25 via-brand/[0.06] to-accent/10"
+        : isWaiting ? "from-brand/[0.10] via-transparent to-white/[0.02]"
+        : "from-white/[0.04] via-transparent to-white/[0.02]"
+      }`} />
+      <div className={`absolute -top-5 -left-5 w-16 h-16 rounded-full blur-2xl ${
+        isActive ? "bg-brand/30" : isWaiting ? "bg-brand/15" : "bg-white/[0.04]"
+      }`} />
+      <div className={`absolute -bottom-5 -right-5 w-14 h-14 rounded-full blur-2xl ${
+        isActive ? "bg-accent/20" : "bg-white/[0.03]"
+      }`} />
+      {isActive && (
+        <div
+          className="pointer-events-none absolute inset-y-0 -left-1/4 w-1/3 bg-gradient-to-r from-transparent via-white/10 to-transparent"
+          style={{ animation: "hist-thumb-shine 3.2s ease-in-out infinite" }}
+        />
+      )}
+      <div className="absolute inset-0 flex items-center justify-center">
+        {isStatic ? (
+          <svg className="w-5 h-5 text-white/30" fill="none" stroke="currentColor" strokeWidth="1.4" viewBox="0 0 24 24">
+            <path d="M9 18V5l12-2v13" strokeLinecap="round" strokeLinejoin="round" />
+            <circle cx="6" cy="18" r="3" /><circle cx="18" cy="16" r="3" />
+          </svg>
+        ) : (
+          <div className="flex items-end gap-[3px] h-7">
+            {peaks.map((peak, i) => (
+              <span
+                key={i}
+                className={`block w-[3px] rounded-full ${barColor}`}
+                style={{
+                  height: `${peak}%`,
+                  transformOrigin: "bottom",
+                  animation: `hist-eq-bounce ${period}ms ease-in-out ${i * 110}ms infinite`,
+                }}
+              />
+            ))}
+          </div>
+        )}
+      </div>
+      <style>{`
+        @keyframes hist-eq-bounce {
+          0%, 100% { transform: scaleY(0.2); opacity: 0.55; }
+          50%      { transform: scaleY(1);   opacity: 1; }
+        }
+        @keyframes hist-thumb-shine {
+          0%   { transform: translateX(-160%) skewX(-12deg); }
+          100% { transform: translateX(260%)  skewX(-12deg); }
+        }
+      `}</style>
+    </>
+  );
+}
+
 // MediaThumbnail — 120×70 aspect-video YouTube Studio style.
 // Antes era MiniThumbnail 40×24 pero parecía tabla de log. Operator
 // feedback 2026-05-25: "el historial parece backend, debería ser más
 // lindo, sumarle thumbnails". Aumentamos 3× el tamaño + agregamos
 // ring + overlay play sobre la card completa.
 function MediaThumbnail({ jobId, status }) {
-  const src = useMediaUrl(jobId, "thumbnail", "preview");
+  // Solo pedir el thumbnail real para statuses que pueden tenerlo en R2.
+  // Para los demás (processing/queued/etc), saltearse el /media-token
+  // request y dibujar el ProcessingThumbnail directamente.
+  const hasMedia = status === "done" || status === "pending_review" || status === "editing";
+  const src = useMediaUrl(hasMedia ? jobId : "", "thumbnail", "preview");
   const isReady = status === "done" || status === "pending_review";
   return (
     <div className="w-[120px] h-[70px] shrink-0 rounded-lg overflow-hidden bg-surface-3/40 ring-1 ring-white/[0.06] relative group/thumb">
-      {src && (
+      {hasMedia && src ? (
         <img
           src={src}
           alt=""
@@ -388,14 +469,8 @@ function MediaThumbnail({ jobId, status }) {
           className="w-full h-full object-cover"
           onError={(e) => { e.currentTarget.style.display = "none"; }}
         />
-      )}
-      {!src && (
-        <div className="absolute inset-0 flex items-center justify-center">
-          <svg className="w-5 h-5 text-gray-600" fill="none" stroke="currentColor" strokeWidth="1.4" viewBox="0 0 24 24">
-            <path d="M9 18V5l12-2v13" strokeLinecap="round" strokeLinejoin="round" />
-            <circle cx="6" cy="18" r="3" /><circle cx="18" cy="16" r="3" />
-          </svg>
-        </div>
+      ) : (
+        <ProcessingThumbnail status={status} />
       )}
       {isReady && src && (
         <div className="absolute inset-0 flex items-center justify-center opacity-0 group-hover/thumb:opacity-100 bg-black/40 transition-opacity">

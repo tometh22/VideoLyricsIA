@@ -525,23 +525,23 @@ export default function LyricsTimeline({
           })}
 
           {/* Playhead (horizontal).
-              FIX 2026-05-25: el `transition-[top] duration-100` que tenía
-              antes causaba 2 bugs reportados por el operador:
-                1) "no baja al ritmo normal de la canción" — el audio
-                   emite timeupdate cada ~250 ms; la transition de 100 ms
-                   ANIMA entre cada tick, sumando lag visible vs lo que
-                   se escucha.
+              FIX 2026-05-25 (operator feedback): el `transition-[top]
+              duration-100` que tenía antes causaba 2 bugs reportados:
+                1) "no baja al ritmo normal de la canción" — la
+                   transition de 100 ms peleaba contra el rAF que
+                   LyricsEditor usa para empujar currentTime a 60 fps,
+                   dejando el playhead ~100ms detrás del audio.
                 2) "click en un tiempo, la línea sube lentamente" — al
-                   hacer seek, currentTime salta (ej. 30→10s) y la
-                   transition ANIMA suavemente el cambio en lugar de
-                   saltar instant.
-              Solución: cero transition. El playhead se mueve frame a
-              frame cuando el audio actualiza (250 ms ticks naturales),
-              y salta instantáneamente en seeks. Stepped pero accurate
-              es mejor que smooth pero confuso. */}
+                   hacer seek (jump de 30s → 10s), la transition
+                   ANIMABA suavemente el viaje en vez de saltar.
+              Solución doble:
+                - Cero transition: salta instant en seeks, sigue
+                  fielmente el rAF en playback.
+                - translateY en vez de top: movimiento composited en
+                  GPU, no dispara reflow en la lista de segmentos. */}
           <div
-            className="absolute left-0 right-0 h-0.5 bg-brand pointer-events-none z-10"
-            style={{ top: currentTime * pxPerSec }}
+            className="absolute left-0 right-0 top-0 h-0.5 bg-brand pointer-events-none z-10 will-change-transform"
+            style={{ transform: `translateY(${currentTime * pxPerSec}px)` }}
           >
             <div className="w-2 h-2 rounded-full bg-brand -mt-[3px] ml-0.5" />
           </div>

@@ -3408,6 +3408,13 @@ async def upload(
         text_motion="none",
         lyrics_animation=lyrics_animation if lyrics_animation in ("none", "karaoke", "word_reveal", "pop", "glow") else "none",
         line_transition=line_transition if line_transition in ("none", "slide_up", "slide_side", "wipe", "dissolve_blur") else "none",
+        # Lyric text colors 2026-05-25. Hex #RRGGBB validado acá; cualquier
+        # otro valor se normaliza a "" (= backend usa blanco default en
+        # build_ass). Para karaoke: lyric_color = palabra no cantada,
+        # lyric_sung_color = palabra cantada. Para otras animaciones:
+        # lyric_color = único color del texto.
+        lyric_color=(lyric_color.strip() if lyric_color and re.match(r"^#[0-9a-fA-F]{6}$", lyric_color.strip() or "") else ""),
+        lyric_sung_color=(lyric_sung_color.strip() if lyric_sung_color and re.match(r"^#[0-9a-fA-F]{6}$", lyric_sung_color.strip() or "") else ""),
         text_contrast=text_contrast if text_contrast in ("subtle", "medium", "strong") else "medium",
         match_lyrics=match_lyrics,
         background_hint=(background_hint.strip() or None),
@@ -5355,6 +5362,13 @@ async def generate_with_segments(
         text_motion="none",
         lyrics_animation=lyrics_animation if lyrics_animation in ("none", "karaoke", "word_reveal", "pop", "glow") else "none",
         line_transition=line_transition if line_transition in ("none", "slide_up", "slide_side", "wipe", "dissolve_blur") else "none",
+        # Lyric text colors 2026-05-25. Hex #RRGGBB validado acá; cualquier
+        # otro valor se normaliza a "" (= backend usa blanco default en
+        # build_ass). Para karaoke: lyric_color = palabra no cantada,
+        # lyric_sung_color = palabra cantada. Para otras animaciones:
+        # lyric_color = único color del texto.
+        lyric_color=(lyric_color.strip() if lyric_color and re.match(r"^#[0-9a-fA-F]{6}$", lyric_color.strip() or "") else ""),
+        lyric_sung_color=(lyric_sung_color.strip() if lyric_sung_color and re.match(r"^#[0-9a-fA-F]{6}$", lyric_sung_color.strip() or "") else ""),
         text_contrast=text_contrast if text_contrast in ("subtle", "medium", "strong") else "medium",
         match_lyrics=match_lyrics,
         background_hint=(background_hint.strip() or None),
@@ -7586,7 +7600,11 @@ async def retry_job(
               # karaoke/reveal fell to validation_failed and the operator hit
               # Reintentar, animations silently reset to "none" because they
               # weren't in this whitelist when the feature was wired (#357a1a5).
-              "lyrics_animation", "line_transition"):
+              "lyrics_animation", "line_transition",
+              # Lyric text colors 2026-05-25 — heredables igual que
+              # custom_colors, así los re-renders/variantes mantienen el
+              # color elegido por el operador.
+              "lyric_color", "lyric_sung_color"):
         if k in _retry_render_params and _retry_render_params[k] not in (None, ""):
             retry_pipeline_kwargs[k] = _retry_render_params[k]
 

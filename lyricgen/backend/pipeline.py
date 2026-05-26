@@ -49,6 +49,7 @@ from PIL import Image, ImageDraw, ImageFont
 from jobs import update_job, get_job
 import storage
 from render_spec import FPS_RATIONAL, RenderSpec
+from subprocess_utils import run_checked, SubprocessExecutionError  # noqa: F401 — exported for upstream catches
 
 ASSETS_DIR = os.path.join(os.path.dirname(__file__), "..", "assets")
 OUTPUTS_DIR = os.path.join(os.path.dirname(__file__), "..", "outputs")
@@ -361,6 +362,12 @@ def run_pipeline(job_id: str, mp3_path: str, artist: str, style: str,
                  text_motion: str = "none",
                  lyrics_animation: str = "none",
                  line_transition: str = "none",
+                 # Lyric text colors 2026-05-25. Hex #RRGGBB; cadena vacía
+                 # = blanco default. Para karaoke: lyric_color = palabra no
+                 # cantada, lyric_sung_color = palabra cantada. Para otras
+                 # animaciones: lyric_color = único color del texto.
+                 lyric_color: str = "",
+                 lyric_sung_color: str = "",
                  match_lyrics: bool = True,
                  text_contrast: str = "medium",
                  # Background_hint llega solo desde el flow de variantes
@@ -695,9 +702,6 @@ def run_pipeline(job_id: str, mp3_path: str, artist: str, style: str,
             "concept": concept,
             "movement_style": movement_style,
             "effect": effect,
-            # Persist the scene-source choice so the editor's "Regenerar fondo"
-            # can pre-fill the same Escena/Movimiento the operator picked in the
-            # wizard — the upload→edit flow must not forget decisions.
             "match_lyrics": match_lyrics,
         }
         # Only persist background_hint / bg_verbatim when this run actually
@@ -709,16 +713,16 @@ def run_pipeline(job_id: str, mp3_path: str, artist: str, style: str,
             _new_rp["bg_verbatim"] = True
         if custom_colors:
             _new_rp["custom_colors"] = custom_colors
+        # U5 (audit 2026-05-25): merge atómico vía jobs.merge_render_params.
+        # El read-then-write fuera de un row lock dejaba race: 2 callers
+        # concurrentes (worker + /edit endpoint, o 2 /edit calls) podían
+        # pisarse mutuamente. merge_render_params hace SELECT FOR UPDATE
+        # + read + write en UNA tx.
         try:
-            from database import SessionLocal as _SL_rp, Job as _Job_rp
-            with _SL_rp() as _db_rp:
-                _row_rp = _db_rp.query(_Job_rp).filter(_Job_rp.job_id == job_id).first()
-                _merged_rp = dict(_row_rp.render_params) if (_row_rp and isinstance(_row_rp.render_params, dict)) else {}
+            from jobs import merge_render_params
+            merge_render_params(job_id, _new_rp)
         except Exception as _rp_exc:
-            logger.warning("[BG] could not read existing render_params for merge: %s", _rp_exc)
-            _merged_rp = {}
-        _merged_rp.update(_new_rp)
-        update_job(job_id, render_params=_merged_rp)
+            logger.warning("[BG] merge_render_params failed: %s", _rp_exc)
 
         # Cache AI-generated background to R2 so a typography-only edit
         # can re-use it without another Veo call ($0.80 saved per edit).
@@ -892,6 +896,7 @@ def run_pipeline(job_id: str, mp3_path: str, artist: str, style: str,
                 line_transition=line_transition,
                 text_contrast=text_contrast,
                 effect=effect, custom_colors=custom_colors,
+                lyric_color=lyric_color, lyric_sung_color=lyric_sung_color,
             )
             files["video_url"] = f"/download/{job_id}/video"
             update_job(job_id, progress=55)
@@ -5303,6 +5308,30 @@ def _generate_veo_video(prompt: str, output_path: str, job_id: str = None,
                     output_artifact=output_path,
                 )
             return output_path
+        # U6 (audit 2026-05-25) — cache existe pero download FALLÓ.
+        # Sin este fix, el recorder quedaba "in-flight" mientras el Veo
+        # call subsiguiente arrancaba; si el worker moría antes del
+        # finish() de la Veo call, el reaper marcaba el row "orphan poll"
+        # y el job entero como "error". Fix: cerramos el recorder actual
+        # con summary descriptivo, recreamos uno nuevo para el Veo call.
+        logger.warning(
+            "[BG] Veo cache HIT pero download FALLÓ para %s — recorder "
+            "cerrado como cache_hit_download_failed, arrancando Veo fresh.",
+            cache_object_key,
+        )
+        if recorder:
+            recorder.finish(
+                response_summary=f"cache_hit_download_failed: key={cache_key_hash}",
+            )
+        # Re-crear recorder limpio para la Veo call que sigue.
+        recorder = record_ai_call(
+            job_id=job_id or "unknown",
+            step="video_bg",
+            tool_name=model,
+            tool_provider="google_vertex",
+            prompt=safe_prompt,
+            input_data_types=["generated_prompt"],
+        ) if job_id else None
 
     elapsed = _time.time() - _last_veo_request
     if elapsed < _VEO_COOLDOWN and _last_veo_request > 0:
@@ -5434,10 +5463,20 @@ def _generate_veo_video(prompt: str, output_path: str, job_id: str = None,
     fetch_url = f"{base_url}:fetchPredictOperation"
     poll_deadline = _time.time() + 600
     op_payload: dict | None = None
+    # U10 (audit 2026-05-25): heartbeat cada 60s para que el reaper no
+    # mate este job durante el Veo poll (hasta 10min sin update_job natural).
+    _hb_counter = 0
     while True:
         if _time.time() > poll_deadline:
             raise TimeoutError("Veo 3 operation timed out after 10 min")
         _time.sleep(10)
+        _hb_counter += 1
+        if _hb_counter % 6 == 0 and job_id:
+            try:
+                from jobs import heartbeat as _heartbeat
+                _heartbeat(job_id)
+            except Exception:  # pragma: no cover
+                pass
         token = _veo_access_token()
         # Vertex's long-running publisher operations need the
         # fetchPredictOperation helper (a plain GET on the operation name
@@ -5664,11 +5703,15 @@ def _extract_frame_from_video(video_path: str, output_image_path: str) -> str:
         "-vf", "scale='min(1920,iw)':-2",
         output_image_path,
     ]
-    result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
-    if result.returncode != 0 or not os.path.exists(output_image_path):
-        raise RuntimeError(
-            f"ffmpeg frame extraction failed (rc={result.returncode}): {result.stderr[:300]}"
-        )
+    # output_path= catches the rc=0-but-no-file case ffmpeg occasionally
+    # produces when the input is healthy but the seek lands past the
+    # final frame — pre-fix the caller crashed on the next os.stat().
+    run_checked(
+        cmd,
+        label="ffmpeg-bg-frame",
+        timeout=60,
+        output_path=output_image_path,
+    )
     return output_image_path
 
 
@@ -6483,9 +6526,15 @@ def _prerender_looped_bg(bg_path: str, duration: float, job_dir: str,
             "-pix_fmt", "yuv420p", "-an",
             out_path,
         ]
-        result = subprocess.run(cmd_fallback, capture_output=True, text=True)
-        if result.returncode != 0:
-            raise RuntimeError(f"ffmpeg loop failed: {result.stderr[-300:]}")
+        # 900s mirrors the kenburns sibling — a stream_loop encode of a
+        # multi-minute lyric video sits comfortably under 5 min in
+        # healthy runs; double that as the cliff.
+        run_checked(
+            cmd_fallback,
+            label="ffmpeg-palindrome-fallback",
+            timeout=900,
+            output_path=out_path,
+        )
 
     size_mb = os.path.getsize(out_path) / 1024 / 1024
     logger.info("[BG] Pre-rendered palindrome loop: %.0fs, %.1f MB", duration, size_mb)
@@ -6536,13 +6585,13 @@ def _prerender_kenburns_bg(image_path: str, duration: float, job_dir: str,
             f"scale={spec.width}:{spec.height}:force_original_aspect_ratio=increase,"
             f"crop={spec.width}:{spec.height},fps={spec.fps_str}"
         )
-        result = subprocess.run(
+        run_checked(
             base + ["-vf", static_vf, "-c:v", "libx264", "-preset", "fast",
                     "-crf", "20", "-pix_fmt", "yuv420p", "-an", out_path],
-            capture_output=True, text=True, timeout=900,
+            label="ffmpeg-kenburns-fallback",
+            timeout=900,
+            output_path=out_path,
         )
-        if result.returncode != 0:
-            raise RuntimeError(f"ken burns ffmpeg failed: {result.stderr[-300:]}")
 
     size_mb = os.path.getsize(out_path) / 1024 / 1024
     logger.info("[BG] Ken Burns (zoompan): %.0fs, %.1f MB", duration, size_mb)
@@ -7145,18 +7194,17 @@ def _transcode_to_prores(input_path: str, mov_path: str,
                        os.path.basename(input_path), src_desc,
                        os.path.basename(mov_path),
                        spec.width, spec.height, spec.fps_str, spec.prores_profile)
-    result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout_sec)
-    if result.returncode != 0:
-        # Best-effort cleanup of a partial file before raising.
-        try:
-            if os.path.exists(mov_path):
-                os.unlink(mov_path)
-        except OSError:
-            pass
-        raise RuntimeError(
-            f"ffmpeg ProRes transcode failed (rc={result.returncode}): "
-            f"{result.stderr[-500:]}"
-        )
+    # ProRes UMG master — this output lands on a Drive folder UMG QCs by
+    # hand. A silent 0-byte file would be caught by _validate_umg_master
+    # below (ffprobe would choke on it), but checking here turns a
+    # confusing downstream crash into a clear "ffmpeg-prores produced
+    # empty output" in the worker log + Job.error column.
+    run_checked(
+        cmd,
+        label="ffmpeg-prores",
+        timeout=timeout_sec,
+        output_path=mov_path,
+    )
 
     # Log what ffprobe sees on the freshly-encoded master for any future
     # debugging — colorspace problems are notoriously sticky on ProRes.
@@ -7447,6 +7495,12 @@ def _render_lyrics_ass(
     effect: str = "",
     style: str = "",
     custom_colors: str = "",
+    # Lyric text colors 2026-05-25. Hex #RRGGBB; cadena vacía → blanco.
+    # Para karaoke: lyric_color = palabra no cantada, lyric_sung_color =
+    # palabra cantada. Para otras animaciones: lyric_color = único color
+    # del texto (PrimaryColour del style en ASS).
+    lyric_color: str = "",
+    lyric_sung_color: str = "",
 ) -> str:
     """Fast lyric render: burn the lyrics with libass in a single ffmpeg
     pass over the (ffmpeg-looped) background — no moviepy frame loop.
@@ -7498,6 +7552,15 @@ def _render_lyrics_ass(
         transition=line_transition,
         case_fn=lambda t: _apply_case(t, text_case),
     )
+    # Lyric color mapping para build_ass (style line + override karaoke):
+    # karaoke → primary = sung color, secondary = un-sung. Otras animaciones
+    # usan primary = lyric_color (texto único) y secondary irrelevante.
+    if lyrics_animation == "karaoke":
+        primary_for_lines = lyric_sung_color or ""
+        secondary_for_lines = lyric_color or ""
+    else:
+        primary_for_lines = lyric_color or ""
+        secondary_for_lines = ""
     first_lyric_start = segments[0]["start"] if segments else duration
     lines += _ass.title_card_lines(
         artist, song_title, first_lyric_start,
@@ -7507,10 +7570,16 @@ def _render_lyrics_ass(
         artist_font_family=artist_family,
     )
     base_fs = _ass.lyric_fontsize(40, scale, font_scale)
+    # Reusamos el mapping primary/secondary computado arriba para
+    # segments_to_lines — mismo eje semántico (karaoke usa sung como
+    # PrimaryColour). Sin esto la palabra cantada se rendea con
+    # PrimaryColour blanco aunque el operador haya elegido otro color.
     ass_doc = _ass.build_ass(
         width=spec.width, height=spec.height,
         font_name=family, base_fontsize=base_fs,
         outline=outline, shadow=shadow, lines=lines, bold=bold,
+        primary_color=primary_for_lines,
+        secondary_color=secondary_for_lines,
     )
     ass_path = os.path.join(job_dir, "lyrics.ass")
     with open(ass_path, "w", encoding="utf-8") as f:
@@ -7576,13 +7645,18 @@ def _render_lyrics_ass(
     _render_timeout = 1800 if (spec.codec == "prores_ks" or spec.width >= 3000
                                or (effect and spec.width >= 1920)) else 900
     try:
-        result = subprocess.run(
-            cmd, cwd=job_dir, capture_output=True, text=True, timeout=_render_timeout,
+        # libass main render — the H.264 deliverable. The downstream
+        # _validate_rendered_mp4() would already catch most failures,
+        # but checking here (rc + non-empty file) names the failure
+        # mode clearly in the worker log instead of getting a generic
+        # ffprobe "Invalid data" from the validator.
+        run_checked(
+            cmd,
+            label="ffmpeg-libass",
+            timeout=_render_timeout,
+            output_path=out_path,
+            cwd=job_dir,
         )
-        if result.returncode != 0:
-            raise RuntimeError(
-                f"ass render ffmpeg failed: {result.stderr[-500:]}"
-            )
     finally:
         import shutil
         shutil.rmtree(font_dir, ignore_errors=True)
@@ -7646,6 +7720,9 @@ def generate_lyric_video(
     text_contrast: str = "medium",
     effect: str = "",
     custom_colors: str = "",
+    # Lyric text colors 2026-05-25. Hex #RRGGBB; "" → blanco default.
+    lyric_color: str = "",
+    lyric_sung_color: str = "",
 ) -> tuple[str, str, str | None]:
     """Generate a lyric video. Returns (video_path, font, bg_source).
 
@@ -7751,6 +7828,7 @@ def generate_lyric_video(
                 text_contrast=text_contrast,
                 artist=artist, song_title=title_song,
                 effect=effect, style=style, custom_colors=custom_colors,
+                lyric_color=lyric_color, lyric_sung_color=lyric_sung_color,
             )
             logger.info("[ASS] render: %.1fs (engine=ass)", _time.monotonic() - _t0)
             audio.close()
@@ -8064,7 +8142,7 @@ def generate_lyric_video(
         # to pcm_s24le at 48 kHz. UMG requires this exact audio spec; no
         # CPU is wasted re-encoding the multi-GB ProRes stream.
         tmp_resampled = out_path + ".audio48k.mov"
-        result = subprocess.run(
+        run_checked(
             [
                 "ffmpeg", "-y", "-loglevel", "error",
                 "-i", out_path,
@@ -8074,12 +8152,10 @@ def generate_lyric_video(
                 "-ac", "2",
                 tmp_resampled,
             ],
-            capture_output=True, text=True, timeout=600,
+            label="ffmpeg-audio-resample",
+            timeout=600,
+            output_path=tmp_resampled,
         )
-        if result.returncode != 0:
-            raise RuntimeError(
-                f"audio resample to 48kHz failed: {result.stderr[-500:]}"
-            )
         os.replace(tmp_resampled, out_path)
 
         errors = _validate_umg_master(out_path, spec)
@@ -8502,6 +8578,12 @@ def run_edit_pipeline(
     # so a re-render keeps the snow/rain/grade the operator picked at upload.
     effect = merged.get("effect") or ""
     custom_colors = merged.get("custom_colors") or ""
+    # Lyric text colors 2026-05-25. Si el operador no los seteó, fall back
+    # a "" (= blanco default en build_ass). Persisten en render_params
+    # como custom_colors → un re-render de la misma variante mantiene los
+    # colores elegidos.
+    lyric_color = merged.get("lyric_color") or ""
+    lyric_sung_color = merged.get("lyric_sung_color") or ""
     # Per-edit operator hint for background regen (set by /edit when the
     # user typed in the "Aclarar tipo de fondo" textarea). None if absent;
     # propagates only into the `background` branch below.
@@ -8608,6 +8690,7 @@ def run_edit_pipeline(
             lyrics_animation=lyrics_animation,
             line_transition=line_transition,
             effect=effect, custom_colors=custom_colors,
+            lyric_color=lyric_color, lyric_sung_color=lyric_sung_color,
         )
         files = {"video_url": f"/download/{job_id}/video"}
         update_job(job_id, progress=55)
