@@ -365,6 +365,20 @@ export default function LyricsEditor({
     () => setFocusModeRaw((v) => (v === "1" ? "0" : "1")),
     [setFocusModeRaw],
   );
+  // 2026-05-26 — fix #357 follow-up. Cuando el editor se mueve dentro del
+  // wizard de 3 columnas (UploadZone:1861), el max-h interno apenas crece
+  // ~90px adentro de una columna capada a 460px de ancho — el "enfoque" era
+  // imperceptible. Ahora emitimos una clase global en <body> para que
+  // UploadZone pueda colapsar el grid a 1-col y esconder stepper + preview
+  // central via variantes arbitrarias de Tailwind. Lifting el state hacia
+  // UploadZone vía render prop era más invasivo (reviewScreen es una IIFE
+  // que recrearía en cada toggle); body class es 1-way data flow simple y
+  // se limpia solo en unmount cuando el operador navega a otro paso.
+  useEffect(() => {
+    if (typeof document === "undefined") return undefined;
+    document.body.classList.toggle("editor-focus-mode", focusMode);
+    return () => document.body.classList.remove("editor-focus-mode");
+  }, [focusMode]);
   // Phase B 2026-05-25: el card de auto-fix antes ocupaba 120-180px arriba
   // del editor. Reemplazado por un pill compacto 32px que expande detalle
   // on demand. Default colapsado para minimizar el overhead vertical.

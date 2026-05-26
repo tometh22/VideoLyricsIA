@@ -1850,8 +1850,16 @@ export default function UploadZone({
         const gridCols = isStep6
           ? "lg:grid-cols-[56px_minmax(260px,320px)_minmax(0,1fr)]"
           : "lg:grid-cols-[190px_minmax(0,1fr)_minmax(400px,460px)]";
+        // 2026-05-26 — variante [.editor-focus-mode_&] colapsa este grid
+        // a 1 columna cuando el LyricsEditor prende "modo enfoque". Sin
+        // este override, el feature sólo agrandaba el max-h interno (~90px
+        // verticales) — invisible porque el operador ya tiene ~1124px de
+        // ancho en step 6. Con focus on, stepper + preview se ocultan
+        // (rules abajo) y la columna del editor toma los ~1500px de
+        // viewport. Body class emitida por LyricsEditor:367, cleanup en
+        // unmount → volver a step 4 reaparece el layout 3-col.
         return (
-        <div className={`flex flex-col lg:grid ${gridCols} gap-6 items-start`}>
+        <div className={`flex flex-col lg:grid ${gridCols} [.editor-focus-mode_&]:lg:grid-cols-1 gap-6 items-start`}>
 
         {/* LEFT — step rail (vertical on desktop, horizontal pills on mobile).
             Paso 6 "Lyrics" se ve siempre; está deshabilitado hasta que
@@ -1864,7 +1872,7 @@ export default function UploadZone({
             el número en círculo queda visible). Tooltip on hover
             mantiene la información completa. El sidebar pasa de 190 px
             a 56 px → +134 px que ganan las otras dos columnas. */}
-        <nav className="flex lg:flex-col gap-1.5 lg:gap-1 overflow-x-auto lg:overflow-visible lg:sticky lg:top-4 w-full lg:w-auto order-first">
+        <nav className="flex lg:flex-col gap-1.5 lg:gap-1 overflow-x-auto lg:overflow-visible lg:sticky lg:top-4 w-full lg:w-auto order-first [.editor-focus-mode_&]:hidden">
           {WIZARD_STEPS.map((s) => {
             const isLyrics = s.id === 6;
             const disabled = isLyrics && !hasReviewableContent;
@@ -1907,7 +1915,7 @@ export default function UploadZone({
             editando), y el max-width del contenedor se ajusta al
             grid column (260-320 px). Mantiene sticky para acompañar
             el scroll del timeline en el panel derecho. */}
-        <div className="lg:sticky lg:top-4 space-y-2 min-w-0 w-full">
+        <div className="lg:sticky lg:top-4 space-y-2 min-w-0 w-full [.editor-focus-mode_&]:hidden">
           {bgMode === "auto" ? (
             <WizardLivePreview
               style={style}
