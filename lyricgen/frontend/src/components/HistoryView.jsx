@@ -590,15 +590,29 @@ export default function HistoryView({
   const isInitialLoading = !historyLoaded && !historyError;
   const isLoadFailed = historyError && history.length === 0;
 
+  // GHOST jobs — bg_preview_* son ghost jobs del feature Capa C
+  // (pre-render del fondo mientras editás lyrics). El comentario en
+  // jobs.py:55 dice "Should NOT appear in the user's history normally
+  // (filter elsewhere)". Filtramos acá hasta que el backend los
+  // excluya en /jobs. 2026-05-25 operator feedback.
+  const GHOST_STATUSES = useMemo(
+    () => new Set(["bg_preview_queued", "bg_preview_done", "bg_preview_failed"]),
+    [],
+  );
+  const realHistory = useMemo(
+    () => history.filter((j) => !GHOST_STATUSES.has(j.status)),
+    [history, GHOST_STATUSES],
+  );
+
   const counts = useMemo(() => {
     const c = {};
-    for (const f of FILTERS) c[f.id] = history.filter(f.match).length;
+    for (const f of FILTERS) c[f.id] = realHistory.filter(f.match).length;
     return c;
-  }, [history]);
+  }, [realHistory]);
 
   const visible = useMemo(() => {
     const f = FILTERS.find((x) => x.id === filter) || FILTERS[0];
-    let filtered = history.filter(f.match);
+    let filtered = realHistory.filter(f.match);
     // Search query — filtra por artist + song_title + filename (case-insensitive)
     const q = query.trim().toLowerCase();
     if (q) {
