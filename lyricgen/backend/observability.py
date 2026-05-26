@@ -20,21 +20,43 @@ ENV = (os.environ.get("ENVIRONMENT")
 LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO").upper()
 
 
-def init_sentry():
+def init_sentry(integrations=None):
+    """Initialize Sentry once. Idempotent if called twice (sentry-sdk's
+    own init() is itself idempotent, but we still log a warning).
+
+    Audit 2026-05-26: previously main.py had its own inline sentry_sdk.init
+    that ran BEFORE this one (so this overwrote it, dropping the release
+    tag and the SENTRY_TRACES_RATE env override). The inline init is now
+    removed and this function honors both env vars.
+
+    `integrations` lets callers extend the default set — e.g. worker.py
+    boots the RQ integration in addition to the FastAPI one.
+    """
     if not SENTRY_DSN:
         return
     try:
         import sentry_sdk
         from sentry_sdk.integrations.fastapi import FastApiIntegration
+        default_integrations = [FastApiIntegration()]
+        if integrations:
+            default_integrations.extend(integrations)
+        try:
+            traces_rate = float(os.environ.get("SENTRY_TRACES_RATE", "0.1"))
+        except (TypeError, ValueError):
+            traces_rate = 0.1
+        release = (os.environ.get("SENTRY_RELEASE")
+                   or os.environ.get("RAILWAY_GIT_COMMIT_SHA")
+                   or "genly@2.0.0")
         sentry_sdk.init(
             dsn=SENTRY_DSN,
-            environment=ENV,
-            traces_sample_rate=0.1,
+            environment=os.environ.get("SENTRY_ENV") or ENV,
+            release=release,
+            traces_sample_rate=traces_rate,
             profiles_sample_rate=0.0,
             send_default_pii=False,
-            integrations=[FastApiIntegration()],
+            integrations=default_integrations,
         )
-        print("[OBS] Sentry initialized")
+        print(f"[OBS] Sentry initialized (env={ENV}, release={release}, traces={traces_rate})")
         # Forward urllib3 connection-pool warnings to Sentry as
         # explicit events. Sentry's default logging integration only
         # captures ERROR+ — but "Connection pool is full, discarding

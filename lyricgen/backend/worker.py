@@ -14,10 +14,23 @@ import os
 import signal
 import sys
 
-logger = logging.getLogger("genly.worker")
-
 from credentials_bootstrap import bootstrap_vertex_credentials
 bootstrap_vertex_credentials()
+
+# Audit 2026-05-26: the API process initialized Sentry + structured logging
+# but worker.py did neither. Render failures, NameError regressions, OOMs
+# in run_pipeline — none of them reported to Sentry. Operators only saw
+# them via Railway log search. The 2026-05-26 NameError outage took 17 h
+# to find for exactly this reason. Init both before anything else runs.
+from observability import init_logging, init_sentry
+init_logging()
+try:
+    from sentry_sdk.integrations.rq import RqIntegration
+    init_sentry(integrations=[RqIntegration()])
+except ImportError:
+    init_sentry()
+
+logger = logging.getLogger("genly.worker")
 
 
 def _warn_if_shutdown_grace_too_short() -> None:

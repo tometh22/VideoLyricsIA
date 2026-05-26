@@ -21,17 +21,11 @@ bootstrap_vertex_credentials()
 # mail to a real customer's inbox.
 ENVIRONMENT = os.environ.get("ENVIRONMENT", "production").lower().strip() or "production"
 
-# --- Sentry (must init before FastAPI) ---
-_SENTRY_DSN = os.environ.get("SENTRY_DSN", "")
-if _SENTRY_DSN:
-    import sentry_sdk
-    sentry_sdk.init(
-        dsn=_SENTRY_DSN,
-        traces_sample_rate=float(os.environ.get("SENTRY_TRACES_RATE", "0.1")),
-        # SENTRY_ENV overrides ENVIRONMENT only if explicitly set (back-compat).
-        environment=os.environ.get("SENTRY_ENV") or ENVIRONMENT,
-        release=os.environ.get("SENTRY_RELEASE", "genly@2.0.0"),
-    )
+# Audit 2026-05-26: removed the inline sentry_sdk.init() that used to live
+# here. It double-initialized against observability.init_sentry() (called
+# below), and whichever ran SECOND won — silently dropping the release
+# tag and the SENTRY_TRACES_RATE env override. observability.init_sentry
+# now honors both env vars itself, so there's a single source of truth.
 
 from fastapi import FastAPI, File, Form, Header, Query, UploadFile, HTTPException, Depends, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
