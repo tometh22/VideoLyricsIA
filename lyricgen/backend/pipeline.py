@@ -9290,8 +9290,10 @@ def run_edit_pipeline(
         # persistence happens inside _upload_deliverables_to_r2; we no
         # longer write s3_keys wholesale (that REPLACED concurrent prewarm
         # keys). Critical-deliverable failures raise → outer except marks
-        # the edit `error` instead of advertising broken downloads.
-        _upload_deliverables_to_r2(job_id, job_dir, files)
+        # the edit `error` instead of advertising broken downloads. We still
+        # capture the return value (dict of successfully-uploaded keys)
+        # because the audit log below reports `files_updated` from it.
+        s3_keys = _upload_deliverables_to_r2(job_id, job_dir, files)
 
         _cleanup_local_intermediates(job_dir)
 
