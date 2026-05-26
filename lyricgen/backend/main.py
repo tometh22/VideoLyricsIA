@@ -3981,7 +3981,50 @@ async def _run_transcription_for_job(
                                 _fa_segs, _WC_FA,
                                 reference_lyrics=_canonical,
                             )
-                        logger.info("[WC] forced_align fallback empty/disabled — emitting whisperX raw with mishear text (operator edits)")
+                        # FA fallback also failed. Last canonical-aware
+                        # attempt before whisperX raw: `lrclib_aligner`
+                        # walks the canonical line structure against the
+                        # whisperX wordstamps we already have, interpolating
+                        # timing for lines whisperX didn't transcribe well.
+                        # No extra Replicate cost — pure data-in/data-out.
+                        #
+                        # INCIDENT 2026-05-26 (Sin Gamulán / Mujer Amante):
+                        # both songs have extreme line repetition (Sin
+                        # Gamulán: 9 unique lines repeating across 28
+                        # total; Mujer Amante: 26/44 unique = 41% dupes).
+                        # Cureau crashes with `Expected 2D or 3D tensor
+                        # ... got [1, 2, 0]` on these repetitive lyrics,
+                        # so FA fallback can't help. lrclib_aligner with
+                        # keep_unmatched=True recovered both to 100% line
+                        # coverage (interpolated timing on lines whisperX
+                        # didn't catch — operator nudges from there).
+                        logger.info("[WC] FA fallback failed — trying lrclib_aligner against whisperX wordstamps")
+                        _lc_segs: list[dict] = []
+                        try:
+                            import lrclib_aligner as _lca
+                            _lc_segs = _lca.align_lrclib_to_whisper(
+                                _canonical, _wx_segs,
+                                keep_unmatched=True,
+                            ) or []
+                        except Exception as e:
+                            logger.warning("[WC] lrclib_aligner raised: %s — emitting whisperX raw", e)
+                        # Coverage gate: only adopt if the aligner gave
+                        # us at least 90% of the canonical lines (with
+                        # keep_unmatched=True it should match exactly).
+                        # Bail out and fall through to raw on thin/empty
+                        # result so we don't ship a worse output than raw.
+                        _n_canon = len([l for l in _canonical.splitlines() if l.strip()])
+                        if _lc_segs and len(_lc_segs) >= max(1, int(_n_canon * 0.9)):
+                            from timing_sources import WHISPERX_LRCLIB as _WC_WXL
+                            logger.info(
+                                "[WC] lrclib_aligner fallback succeeded (%d/%d lines) — emitting interpolated segments",
+                                len(_lc_segs), _n_canon,
+                            )
+                            return _emit_segments(
+                                _lc_segs, _WC_WXL,
+                                reference_lyrics=_canonical,
+                            )
+                        logger.info("[WC] lrclib_aligner thin/empty (%d segs) — emitting whisperX raw with mishear text (operator edits)", len(_lc_segs))
                     return _emit_segments(
                         _wx_segs, _WC_WX,
                         reference_lyrics=_canonical,
