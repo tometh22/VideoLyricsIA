@@ -287,25 +287,39 @@ def separate_vocals(
     # helper so all three call sites stay in sync.
     from replicate_budget import call_with_budget, _budget_for
 
+    # Cada retry del budget llama al factory de nuevo; acumulamos los
+    # handles para cerrarlos en `finally`. Sin esto el worker leakea un
+    # FD por intento cuando Replicate falla mid-upload (timeout/cancel) —
+    # mismo patrón que forced_align.py / whisperx_transcribe.py.
+    _open_handles: list = []
     def _input_factory():
+        f = open(audio_path, "rb")
+        _open_handles.append(f)
         return {
-            "audio": open(audio_path, "rb"),
+            "audio": f,
             "stem": "vocals",
             "model_name": _VARIANT,
         }
 
-    output = call_with_budget(
-        _MODEL, _input_factory,
-        total_budget_s=_budget_for("demucs", default_s=360.0),
-        backoff=[0, 8, 24],
-        call_label="VOCALSEP",
-        on_progress=on_progress,
-        # p50 wallclock observed on cjwbw/demucs across the catalog. The
-        # time-based fallback uses this when the model logs don't expose
-        # a parseable % — the bar advances at the rate a real job would,
-        # never reaching 1.0 until Replicate actually says "succeeded".
-        typical_runtime_s=90.0,
-    )
+    try:
+        output = call_with_budget(
+            _MODEL, _input_factory,
+            total_budget_s=_budget_for("demucs", default_s=360.0),
+            backoff=[0, 8, 24],
+            call_label="VOCALSEP",
+            on_progress=on_progress,
+            # p50 wallclock observed on cjwbw/demucs across the catalog. The
+            # time-based fallback uses this when the model logs don't expose
+            # a parseable % — the bar advances at the rate a real job would,
+            # never reaching 1.0 until Replicate actually says "succeeded".
+            typical_runtime_s=90.0,
+        )
+    finally:
+        for _h in _open_handles:
+            try:
+                _h.close()
+            except Exception:
+                pass
     if output is None:
         return None
 
