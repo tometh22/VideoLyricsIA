@@ -3528,6 +3528,216 @@ def _slice_audio_prefix(input_path: str, output_path: str, seconds: float) -> bo
         return False
 
 
+def _gemini_cleanup_cache_key(audio_path: str, lrclib_plain: str):
+    """Content-addressable cache key for Gemini lyrics cleanup. Same
+    audio + same lrclib hint = same cleaned output (deterministic with
+    temperature=0.1). Mirrors `whisperx_transcribe._compute_cache_key`."""
+    import hashlib
+    try:
+        h = hashlib.sha256()
+        with open(audio_path, "rb") as f:
+            for chunk in iter(lambda: f.read(1024 * 1024), b""):
+                h.update(chunk)
+        audio_hash = h.hexdigest()[:16]
+    except Exception:
+        return (None, None, None)
+    hint = (lrclib_plain or "").strip()
+    hint_hash = hashlib.sha1(hint.encode("utf-8")).hexdigest()[:16] if hint else ""
+    key = f"gem-clean:{audio_hash}:{hint_hash}"
+    return (key, audio_hash, hint_hash)
+
+
+def _gemini_cleanup_cache_lookup(cache_key: str) -> str | None:
+    """Return cached cleaned text for `cache_key`, or None on miss."""
+    try:
+        from database import TranscriptionCache, SessionLocal
+        import json as _json
+        db = SessionLocal()
+        try:
+            row = db.query(TranscriptionCache).filter(
+                TranscriptionCache.cache_key == cache_key
+            ).first()
+            if not row:
+                return None
+            payload = _json.loads(row.segments)
+            return payload.get("cleaned") if isinstance(payload, dict) else None
+        finally:
+            db.close()
+    except Exception as e:
+        logger.warning("[GEMINI-CLEAN] cache lookup failed (%s); will run live", e)
+        return None
+
+
+def _gemini_cleanup_cache_write(cache_key: str, audio_hash: str,
+                                 hint_hash: str, cleaned: str) -> None:
+    """Persist `cleaned` text under `cache_key`. Best-effort."""
+    try:
+        from database import TranscriptionCache, SessionLocal
+        import json as _json
+        db = SessionLocal()
+        try:
+            row = TranscriptionCache(
+                cache_key=cache_key,
+                audio_hash=audio_hash,
+                engine="gemini_cleanup",
+                language=None,
+                lyrics_hint_hash=hint_hash or None,
+                segments=_json.dumps({"cleaned": cleaned}),
+            )
+            db.merge(row)
+            db.commit()
+        finally:
+            db.close()
+    except Exception as e:
+        logger.warning("[GEMINI-CLEAN] cache write failed (%s); ignoring", e)
+
+
+def _gemini_cleanup_lyrics(audio_path: str, lrclib_plain: str,
+                            *, artist: str = "", song: str = "",
+                            timeout_s: int = 90) -> str | None:
+    """Send the audio + lrclib plain lyrics to Gemini 2.5 Flash and return
+    the proofread text. Used when lrclib has the canonical text but it has
+    the predictable defects of community transcriptions:
+      - Missing accents (mi, se, mas → mí, sé, más).
+      - Spelling errors (querete → quererte, tenes → tienes when
+        Castilian, kept as tenés when voseo).
+      - Wrong repetition counts in chorus (3 "para mí" when there are 4).
+      - Misheard words (lrclib transcribers can fall for the same
+        homophone trap as Whisper).
+
+    INCIDENT 2026-05-26: black-box test of Rotor Videos' Transcribe & Sync
+    revealed they use LyricFind's licensed catalog (post-acquisition
+    Dec-2023) which has these defects fixed. We use community lrclib;
+    this helper closes the gap without the licensing cost.
+
+    Gated behind `GEMINI_LYRICS_CLEANUP_ENABLED=1`. Returns None on:
+      - feature flag off
+      - missing audio / lrclib text
+      - genai client unavailable
+      - Gemini error or rejection (safety filter)
+    Caller falls back to the un-cleaned lrclib text.
+
+    Cost: ~$0.01 per 6-minute song (Gemini 2.5 Flash with thinking=0,
+    audio counts as ~1700 tokens/min input). Latency ~15 s.
+
+    Content-addressable cache: same audio + same lrclib hint → cache hit
+    (no Gemini call). Multi-retry pipelines pay the cost once.
+    """
+    if not _env_flag("GEMINI_LYRICS_CLEANUP_ENABLED"):
+        return None
+    if not audio_path or not os.path.exists(audio_path):
+        return None
+    plain = (lrclib_plain or "").strip()
+    if not plain:
+        return None
+
+    cache_key, audio_hash, hint_hash = _gemini_cleanup_cache_key(audio_path, plain)
+    if cache_key:
+        cached = _gemini_cleanup_cache_lookup(cache_key)
+        if cached:
+            logger.info("[GEMINI-CLEAN] cache hit audio_hash=%s (skipped live call)", audio_hash)
+            return cached
+
+    try:
+        from google import genai
+        client = _get_genai_client()
+    except Exception as e:
+        logger.warning("[GEMINI-CLEAN] genai client unavailable: %s", e)
+        return None
+
+    system_prompt = (
+        "You are a Spanish-language lyrics proofreader.\n"
+        "Input: (1) full audio recording of a song, (2) a community "
+        "transcription with errors.\n\n"
+        "CRITICAL: Return the FULL corrected lyrics for the ENTIRE song. "
+        "The input may have 50-100+ lines — your output must cover ALL "
+        "of them. Do not stop early. Do not summarize. Do not skip the "
+        "second half.\n\n"
+        "Fix:\n"
+        "- Missing accents (mi→mí, se→sé, mas→más when applicable).\n"
+        "- Misspellings (querete→quererte, etc.).\n"
+        "- Wrong word counts in repeated lines (if chorus is 'X, X, X, "
+        "X' 4 times in the audio, write 4).\n"
+        "- Misheard words you can verify against the audio.\n\n"
+        "KEEP the same line-break style as the input. Do not merge or "
+        "split lines unless the audio clearly disagrees.\n\n"
+        "Return ONLY the corrected lyrics, one line per row. "
+        "No preamble, no markdown, no commentary."
+    )
+
+    try:
+        with open(audio_path, "rb") as f:
+            audio_bytes = f.read()
+    except OSError as e:
+        logger.warning("[GEMINI-CLEAN] could not read audio (%s); skip", e)
+        return None
+
+    # mime-type from extension; Gemini accepts wav/mp3/flac/etc.
+    ext = os.path.splitext(audio_path)[1].lower().lstrip(".")
+    mime = {"wav": "audio/wav", "mp3": "audio/mpeg", "flac": "audio/flac",
+            "ogg": "audio/ogg", "m4a": "audio/mp4"}.get(ext, "audio/wav")
+
+    user_content = [
+        genai.types.Part.from_bytes(data=audio_bytes, mime_type=mime),
+        genai.types.Part.from_text(
+            text=f"Artist: {artist}\nSong: {song}\n\n"
+                 f"Transcription to verify and fix:\n\n{plain}"
+        ),
+    ]
+
+    import time as _time
+    t0 = _time.time()
+    try:
+        response = client.models.generate_content(
+            model="gemini-2.5-flash",
+            contents=user_content,
+            config=genai.types.GenerateContentConfig(
+                system_instruction=system_prompt,
+                temperature=0.1,
+                max_output_tokens=8000,
+                thinking_config=genai.types.ThinkingConfig(thinking_budget=0),
+            ),
+        )
+    except Exception as e:
+        logger.warning("[GEMINI-CLEAN] Gemini call failed: %s — using lrclib raw", e)
+        return None
+
+    elapsed = _time.time() - t0
+    cleaned = (response.text or "").strip()
+    if not cleaned:
+        # Could be safety filter rejection (explicit content) or empty
+        # response. Fall back to raw text. Try to surface the reason.
+        try:
+            finish = response.candidates[0].finish_reason
+        except Exception:
+            finish = "unknown"
+        logger.info("[GEMINI-CLEAN] empty response (finish=%s, %.1fs) — using lrclib raw", finish, elapsed)
+        return None
+
+    # Sanity check: output must have at least 50% as many lines as input
+    # and at most 200% (chorus expansions OK, but not 10x explosion).
+    out_lines = [l for l in cleaned.splitlines() if l.strip()]
+    in_lines = [l for l in plain.splitlines() if l.strip()]
+    ratio = len(out_lines) / max(1, len(in_lines))
+    if ratio < 0.5 or ratio > 2.5:
+        logger.warning(
+            "[GEMINI-CLEAN] suspicious line-count ratio %.2f (in=%d → out=%d), "
+            "%.1fs — using lrclib raw to be safe",
+            ratio, len(in_lines), len(out_lines), elapsed,
+        )
+        return None
+
+    logger.info(
+        "[GEMINI-CLEAN] cleaned %d → %d lines in %.1fs (audio_hash=%s)",
+        len(in_lines), len(out_lines), elapsed, audio_hash,
+    )
+
+    if cache_key:
+        _gemini_cleanup_cache_write(cache_key, audio_hash, hint_hash, cleaned)
+
+    return cleaned
+
+
 def _sanitize_gemini_lyrics(text):
     """Strip section/pilcrow markers that some Spanish lyrics sites use
     as estrofa separators (Letras.com, AZLyrics, etc.). These are HTML

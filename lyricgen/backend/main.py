@@ -3902,6 +3902,31 @@ async def _run_transcription_for_job(
                         import forced_align as _fa_lrc
                         _canonical = _fa_lrc.lrc_to_plain_text(_synced)
 
+                # Gemini lyrics cleanup (2026-05-26): lrclib has the
+                # canonical text but with predictable defects (missing
+                # accents, misspellings, wrong chorus repetition counts).
+                # Black-box test of Rotor Videos confirmed they use
+                # LyricFind's licensed catalog post-acquisition (Dec
+                # 2023) which doesn't have these defects. This call
+                # closes the gap without licensing cost — Gemini 2.5
+                # Flash listens to the audio + the lrclib text and
+                # returns corrected lyrics. Gated behind
+                # GEMINI_LYRICS_CLEANUP_ENABLED, off by default. Cost:
+                # ~$0.01/song. Cache content-addressable; second call
+                # on the same audio is free.
+                if _canonical:
+                    try:
+                        from pipeline import _gemini_cleanup_lyrics as _gcl
+                        _cleaned = await asyncio.to_thread(
+                            _gcl, tmp_path, _canonical,
+                            artist=artist, song=song,
+                        )
+                    except Exception as _e:
+                        logger.warning("[WC] Gemini cleanup raised: %s — using lrclib raw", _e)
+                        _cleaned = None
+                    if _cleaned:
+                        _canonical = _cleaned
+
                 # whisperX over the vocal stem. `lyrics_hint` biases the
                 # model toward the canonical lexicon (kills the "¡Karol!"
                 # stuck-phoneme and similar mishears in well-known regions).
