@@ -475,7 +475,22 @@ def get_all_jobs(
     return [j.to_list_dict() for j in jobs]
 
 
-_TERMINAL_STATUSES = ("done", "error", "rejected", "validation_failed")
+# Terminal statuses — any row in one of these is "final" from a state-machine
+# POV; the guard in update_job() drops non-terminal status writes against
+# them. Audit 2026-05-26: pending_review / transcription_failed / bg_preview_*
+# were missing, opening late-worker resurrection races (reaper marks
+# transcription_failed → straggler worker writes status="transcribing" →
+# row resurrected silently). Same hole for pending_review → processing.
+_TERMINAL_STATUSES = (
+    "done",
+    "pending_review",
+    "error",
+    "rejected",
+    "validation_failed",
+    "transcription_failed",
+    "bg_preview_done",
+    "bg_preview_failed",
+)
 # Sub-partition of terminal statuses by outcome. The pipeline writes
 # done/pending_review only after deliverables actually land in R2; once
 # that ground truth is in the row, NO failure-shaped status ever

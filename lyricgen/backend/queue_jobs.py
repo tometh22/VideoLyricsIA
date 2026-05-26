@@ -168,12 +168,12 @@ def transcription_failure_callback(job, connection, type_, value, traceback) -> 
     chance to surface a real error to the user.
 
     Audit 2026-05-26: routes through update_job (same reasoning as
-    pipeline_failure_callback). Note `transcription_failed` is currently
-    NOT in update_job's terminal set (_TERMINAL_STATUSES), so the
-    terminal-state guard treats this as a regular update — which is
-    fine because the only safer states than transcription_failed are
-    the truly-terminal ones (done, rejected, etc.) and update_job won't
-    flip from any of those backward thanks to its own guard.
+    pipeline_failure_callback). After the second-pass audit on the same
+    day `transcription_failed` was added to _TERMINAL_STATUSES, so a
+    late straggler worker calling update_job(status="transcribing", ...)
+    against a row this callback already failed is dropped by the
+    terminal-state guard — closes the reaper-vs-worker resurrection
+    race that previously could flip a failed row back to in-flight.
     """
     try:
         from jobs import update_job
