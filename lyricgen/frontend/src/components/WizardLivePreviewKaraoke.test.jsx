@@ -32,6 +32,12 @@ function _Harness({ initialTick = null, refOut = null, lyricsAnimation = "none" 
       effect=""
       lyricsAnimation={lyricsAnimation}
       playbackTickRef={ref}
+      // 2026-05-26: el default productivo (textCase=upper) upper-casearía
+      // los samples ("ESTA ES TU LETRA", "TRES"…) y rompería los asserts
+      // que buscan texto en su forma original. Estos tests cubren la
+      // lógica de karaoke/word-anim, no el case rendering — forzamos
+      // "original" para mantener el espíritu del test.
+      textCase="original"
     />
   );
 }

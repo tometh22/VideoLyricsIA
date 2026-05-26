@@ -241,6 +241,8 @@ const translations = {
     "upload.trans_blur": "Disolvencia",
     "upload.trans_blur_desc": "Entra desenfocada y se enfoca.",
     "editor.review_badge": "revisar tiempo",
+    "editor.review_banner_count": "{n} líneas con timing aproximado",
+    "editor.review_banner_hint": "estas líneas vienen de la letra de referencia. Escuchá la canción y ajustá si alguna no entra en el momento correcto.",
     "editor.insert_line_below": "Insertar línea acá (en el medio de la canción)",
     "history.draft": "Sin generar",
     "history.uploading": "Subiendo…",

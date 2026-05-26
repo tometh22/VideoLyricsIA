@@ -33,6 +33,45 @@ const MOVE_ANIM = {
   animado:        "wlp-anim 1.8s linear infinite",
 };
 
+// Typography mirrors the render pipeline / EditRequestPanel codes — same
+// table as UploadZone.FONTS and LyricsEditor.EDITOR_FONTS. The CSS family
+// is what the preview applies live; the weight matches each face's
+// intended display weight (Anton/Bebas are 400-only display fonts, the
+// rest are 700-bold). "" = Auto → leave the wrapper's Tailwind defaults
+// (Montserrat-ish via font-extrabold) untouched so the historical look
+// stays put when the operator hasn't picked anything. 2026-05-26.
+const FONT_BY_CODE = {
+  "":                { css: undefined,                weight: undefined },
+  "jost-bold":       { css: "'Jost', sans-serif",       weight: 700 },
+  "montserrat-bold": { css: "'Montserrat', sans-serif", weight: 700 },
+  "poppins-bold":    { css: "'Poppins', sans-serif",    weight: 700 },
+  "outfit-bold":     { css: "'Outfit', sans-serif",     weight: 700 },
+  "roboto-bold":     { css: "'Roboto', sans-serif",     weight: 700 },
+  "bebas-neue":      { css: "'Bebas Neue', sans-serif", weight: 400 },
+  "oswald-bold":     { css: "'Oswald', sans-serif",     weight: 700 },
+  "anton":           { css: "'Anton', sans-serif",      weight: 400 },
+};
+
+// Mirrors UploadZone.applyTextCase and LyricsEditor.applyCase so the
+// preview reads exactly like the eventual libass render (which the
+// pipeline upper-cases by default).
+function applyCase(text, c) {
+  if (!text) return text;
+  if (c === "upper") return text.toUpperCase();
+  if (c === "title") return text.replace(/\b\w/g, (ch) => ch.toUpperCase());
+  if (c === "lower") return text.toLowerCase();
+  return text;
+}
+
+// Outline + shadow strength per contrast code. Same shape as
+// LyricVideoPreview.CONTRAST_STYLES (paso 6) so the wizard preview
+// reads consistent with what the operator will see in the editor.
+const CONTRAST_STYLES = {
+  subtle: { WebkitTextStroke: "0px",                 textShadow: "0 1px 5px rgba(0,0,0,.55)" },
+  medium: { WebkitTextStroke: "1px rgba(0,0,0,.55)", textShadow: "0 2px 0 #000, 0 0 18px rgba(0,0,0,.6)" },
+  strong: { WebkitTextStroke: "1.5px #000",          textShadow: "0 0 6px rgba(0,0,0,1), -1px -1px 0 #000, 1px 1px 0 #000, 0 2px 0 #000" },
+};
+
 // Convert #RRGGBB → rgba(r,g,b,a). Returns null if hex is malformed —
 // caller should fall back to a theme default. Used for the un-sung
 // karaoke color which needs a softer opacity than the picked hex.
@@ -59,6 +98,17 @@ export default function WizardLivePreview({
   // toca el picker.
   lyricColor = "#FFFFFF",
   lyricSungColor = "#FFFFFF",
+  // Typography 2026-05-26: estos 4 props llegan de batchDefaults en
+  // UploadZone (step 4 del wizard). Sin ellos el preview se quedaba
+  // mostrando el look default (Montserrat extrabold, UPPER hardcoded en
+  // libass pero NO acá, sin contrast/scale) mientras el operador
+  // configuraba font/case/size/contrast — disconnect total entre lo
+  // elegido y lo que se veía. "" / defaults mantienen el look histórico
+  // cuando el operador no toca nada.
+  font = "",
+  textCase = "upper",
+  fontScale = "1.0",
+  textContrast = "medium",
   mode = "lyrics",
   lyric,
   clipSrc = "/movement_samples/estandar.mp4",
@@ -164,7 +214,19 @@ export default function WizardLivePreview({
   }
   // A fixed generic phrase (3-4 words) so the preview reads the same for every
   // song and demos the word-level animations well — not the track's own lyric.
-  const sample = t("upload.preview_sample") || "esta es tu letra";
+  // textCase 2026-05-26: aplicamos el case del operador al sample para que
+  // "MAY/Aa/min/ori" se note ANTES de tener letras reales — antes el
+  // sample salía siempre lowercase ignorando el pick.
+  const sample = applyCase(t("upload.preview_sample") || "esta es tu letra", textCase);
+  // Typography resolved values:
+  // - fontInfo: { css, weight } o defaults Auto (no override).
+  // - scaleN: clamp 0.6–1.5 (mismo rango que LyricVideoPreview).
+  // - baseFontSize: el clamp(18px,7.5cqw,68px) histórico, escalado por scaleN.
+  // - contrastStyle: outline + shadow del CONTRAST_STYLES.
+  const fontInfo = FONT_BY_CODE[font] || FONT_BY_CODE[""];
+  const scaleN = Math.max(0.6, Math.min(1.5, parseFloat(fontScale) || 1));
+  const baseFontSize = `clamp(${Math.round(18 * scaleN)}px, ${(7.5 * scaleN).toFixed(2)}cqw, ${Math.round(68 * scaleN)}px)`;
+  const contrastStyle = CONTRAST_STYLES[textContrast] || CONTRAST_STYLES.medium;
   const moveLabel = {
     "": t("upload.movement_auto") || "Auto",
     estatico: t("upload.movement_estatico") || "Estático",
@@ -229,7 +291,10 @@ export default function WizardLivePreview({
   let lyricContent;
   let liveLineKey = null;
   if (liveActive) {
-    const segText = liveActive.activeLine;
+    // textCase aplicado a la línea real reproducida (mismo treatment que
+    // el sample fallback): el operador eligió "MAY" → el preview lo
+    // muestra en MAY también, no en el case original del lyric.
+    const segText = applyCase(liveActive.activeLine, textCase);
     liveLineKey = segText;
     const segStart = liveActive.activeStart;
     const segEnd = liveActive.activeEnd;
@@ -440,7 +505,26 @@ export default function WizardLivePreview({
           <div
             key={`${lyricsAnimation}:${liveLineKey ?? sample}`}
             className="font-extrabold tracking-[-0.03em] leading-[1.02]"
-            style={{ color: plainTextColor, fontSize: "clamp(18px,7.5cqw,68px)", textShadow: isMinimal ? "0 1px 0 rgba(255,255,255,.5)" : "-1px -1px 0 rgba(0,0,0,.6), 1px -1px 0 rgba(0,0,0,.6), -1px 1px 0 rgba(0,0,0,.6), 1px 1px 0 rgba(0,0,0,.6)", animation: isWordAnim ? undefined : lineAnim }}
+            style={{
+              color: plainTextColor,
+              fontSize: baseFontSize,
+              // Typography props 2026-05-26: cuando font !== "" overrideamos
+              // family + weight (inline gana al `font-extrabold` Tailwind);
+              // si es "" (Auto), undefined deja la cascada intacta para
+              // preservar el look histórico Montserrat-ish.
+              fontFamily: fontInfo.css,
+              fontWeight: fontInfo.weight,
+              WebkitTextStroke: contrastStyle.WebkitTextStroke,
+              // Paleta minimal (fondo claro): el contrastStyle.textShadow
+              // (sombras oscuras) sirve igual o mejor que el highlight
+              // blanco histórico para legibilidad — pero cuando el operador
+              // pidió "subtle" en minimal preservamos el highlight blanco
+              // original para no introducir un halo oscuro inesperado.
+              textShadow: (isMinimal && textContrast === "subtle")
+                ? "0 1px 0 rgba(255,255,255,.5)"
+                : contrastStyle.textShadow,
+              animation: isWordAnim ? undefined : lineAnim,
+            }}
           >
             {lyricContent}
           </div>

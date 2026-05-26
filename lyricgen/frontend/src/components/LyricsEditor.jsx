@@ -1601,6 +1601,15 @@ export default function LyricsEditor({
 
   const progressPct = duration > 0 ? (currentTime / duration) * 100 : 0;
 
+  // UX 2026-05-26: cuando synced-direct fallback (PR #365) dispara, TODAS
+  // las líneas vienen con `review: true`. Marcar cada una individualmente
+  // con badge "⚠ revisar tiempo" satura visualmente (28 badges apilados).
+  // Heurística: si ≥3 líneas son review, mostramos un BANNER único arriba
+  // y suprimimos los badges per-línea (el banner ya transmite la info).
+  // Si <3 son review, el badge per-línea queda — es info útil sin saturar.
+  const reviewSegCount = edited.reduce((n, s) => n + (s.review ? 1 : 0), 0);
+  const showReviewBanner = reviewSegCount >= 3;
+
   const handleScrub = (e) => {
     if (!duration) return;
     const rect = e.currentTarget.getBoundingClientRect();
@@ -1885,13 +1894,20 @@ export default function LyricsEditor({
             {formatTime(currentTime)}
           </span>
           <button
+            type="button"
             onClick={handleScrub}
             className="flex-1 h-1.5 bg-surface-3/60 rounded-full overflow-hidden cursor-pointer relative"
             aria-label="Buscar"
           >
+            {/* `pointer-events-none` para que clicks siempre atraviesen al
+                botón parent (sin esto, el div fill podía absorberlos durante
+                el frame de transición). `transform: scaleX()` en vez de
+                width animado: composited en GPU, no dispara reflow ni pelea
+                contra el rAF loop que actualiza `currentTime` cada ~16 ms.
+                Mismo pattern que el playhead fix de PR #348. */}
             <div
-              className="h-full bg-gradient-to-r from-brand to-brand-light transition-[width] duration-100 ease-linear"
-              style={{ width: `${Math.min(100, Math.max(0, progressPct))}%` }}
+              className="h-full bg-gradient-to-r from-brand to-brand-light pointer-events-none origin-left"
+              style={{ transform: `scaleX(${Math.min(1, Math.max(0, progressPct / 100))})` , width: "100%" }}
             />
           </button>
           <span className="text-xs text-gray-500 tabular-nums shrink-0 w-10">
@@ -1985,6 +2001,27 @@ export default function LyricsEditor({
               </svg>
             </button>
           )}
+        </div>
+      )}
+
+      {/* UX 2026-05-26: banner agregado cuando ≥ 3 segments tienen `review:
+          true` (típicamente porque synced-direct fallback de PR #365 emitió
+          todas las líneas con timing aproximado de lrclib synced + offset).
+          Reemplaza los 28 badges per-línea — un solo cartel transmite la
+          misma info sin saturar visualmente. */}
+      {showReviewBanner && (
+        <div className="mb-3 px-3 py-2 rounded-card bg-amber-500/[0.08] ring-1 ring-amber-500/30 flex items-start gap-2.5 animate-fade-in">
+          <svg className="w-4 h-4 text-amber-400 flex-shrink-0 mt-0.5" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
+            <path d="M12 9v4M12 17h.01" />
+            <path d="M10.3 3.9 1.8 18a2 2 0 0 0 1.7 3h17a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0z" />
+          </svg>
+          <p className="text-xs text-amber-100 leading-relaxed">
+            <span className="font-semibold">
+              {(t("editor.review_banner_count") || "{n} líneas con timing aproximado").replace("{n}", reviewSegCount)}
+            </span>
+            {" — "}
+            {t("editor.review_banner_hint") || "estas líneas vienen de la letra de referencia. Escuchá la canción y ajustá si alguna no entra en el momento correcto."}
+          </p>
         </div>
       )}
 
@@ -2664,7 +2701,7 @@ export default function LyricsEditor({
                         </div>
                       );
                     })()}
-                    {isReview && (
+                    {isReview && !showReviewBanner && (
                       <span className="inline-flex items-center gap-1 mt-1 ml-1 px-2 py-0.5 rounded-full
                         bg-amber-500/15 text-amber-300 text-[10px] font-medium">
                         <svg className="w-3 h-3" fill="none" stroke="currentColor" strokeWidth="2.2" viewBox="0 0 24 24">
