@@ -524,12 +524,21 @@ export default function LyricsTimeline({
             );
           })}
 
-          {/* Playhead (horizontal) */}
-          {/* No CSS transition: rAF en LyricsEditor empuja currentTime ~16ms.
-              Una transición aquí pelearía contra el rAF y deja el playhead
-              ~100ms detrás del audio (además del click que "se desliza" en
-              vez de saltar). Usamos translateY para que el movimiento sea
-              composited y no dispare reflow en la lista de segmentos. */}
+          {/* Playhead (horizontal).
+              FIX 2026-05-25 (operator feedback): el `transition-[top]
+              duration-100` que tenía antes causaba 2 bugs reportados:
+                1) "no baja al ritmo normal de la canción" — la
+                   transition de 100 ms peleaba contra el rAF que
+                   LyricsEditor usa para empujar currentTime a 60 fps,
+                   dejando el playhead ~100ms detrás del audio.
+                2) "click en un tiempo, la línea sube lentamente" — al
+                   hacer seek (jump de 30s → 10s), la transition
+                   ANIMABA suavemente el viaje en vez de saltar.
+              Solución doble:
+                - Cero transition: salta instant en seeks, sigue
+                  fielmente el rAF en playback.
+                - translateY en vez de top: movimiento composited en
+                  GPU, no dispara reflow en la lista de segmentos. */}
           <div
             className="absolute left-0 right-0 top-0 h-0.5 bg-brand pointer-events-none z-10 will-change-transform"
             style={{ transform: `translateY(${currentTime * pxPerSec}px)` }}
