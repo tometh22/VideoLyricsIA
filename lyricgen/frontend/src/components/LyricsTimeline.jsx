@@ -524,9 +524,23 @@ export default function LyricsTimeline({
             );
           })}
 
-          {/* Playhead (horizontal) */}
+          {/* Playhead (horizontal).
+              FIX 2026-05-25: el `transition-[top] duration-100` que tenía
+              antes causaba 2 bugs reportados por el operador:
+                1) "no baja al ritmo normal de la canción" — el audio
+                   emite timeupdate cada ~250 ms; la transition de 100 ms
+                   ANIMA entre cada tick, sumando lag visible vs lo que
+                   se escucha.
+                2) "click en un tiempo, la línea sube lentamente" — al
+                   hacer seek, currentTime salta (ej. 30→10s) y la
+                   transition ANIMA suavemente el cambio en lugar de
+                   saltar instant.
+              Solución: cero transition. El playhead se mueve frame a
+              frame cuando el audio actualiza (250 ms ticks naturales),
+              y salta instantáneamente en seeks. Stepped pero accurate
+              es mejor que smooth pero confuso. */}
           <div
-            className="absolute left-0 right-0 h-0.5 bg-brand pointer-events-none z-10 transition-[top] duration-100 ease-linear"
+            className="absolute left-0 right-0 h-0.5 bg-brand pointer-events-none z-10"
             style={{ top: currentTime * pxPerSec }}
           >
             <div className="w-2 h-2 rounded-full bg-brand -mt-[3px] ml-0.5" />
