@@ -25,6 +25,7 @@ vi.mock("./AlertProvider", () => ({
   AlertProvider: ({ children }) => children,
 }));
 
+
 // ContentValidationToggle pulls in extra deps we don't need here; the
 // "lyrics" mode path doesn't render it. Stubbing it just in case it
 // shows up via the typography path the panel still renders.

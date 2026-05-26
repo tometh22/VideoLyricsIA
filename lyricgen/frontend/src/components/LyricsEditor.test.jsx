@@ -132,9 +132,9 @@ describe("LyricsEditor — sync mode anchor across positions (B4)", () => {
     // directly via the title attribute (set in LyricsEditor.jsx
     // L1621).
     const dotButtons = container.querySelectorAll(
-      'button[title*="Activar Sync"]'
+      '[data-testid^="sync-dot-"]'
     );
-    // The 4th row's ◉ — index 3 (0-based) since the rows are in array
+    // The 4th row's hook — index 3 (0-based) since the rows are in array
     // order and there are 4 segments.
     await userEvent.click(dotButtons[3]);
 

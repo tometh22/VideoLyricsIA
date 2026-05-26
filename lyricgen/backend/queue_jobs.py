@@ -93,7 +93,9 @@ def _init_redis():
     try:
         from redis import Redis
         from rq import Queue
-        _redis = Redis.from_url(REDIS_URL)
+        # Fix U11-hotpath: añadir timeouts para que un Redis lento o
+        # inaccesible no bloquee el proceso en el primer connect/ping.
+        _redis = Redis.from_url(REDIS_URL, socket_connect_timeout=2, socket_timeout=5)
         _redis.ping()
         _queue_default = Queue("default", connection=_redis)
         _queue_enterprise = Queue("enterprise", connection=_redis)

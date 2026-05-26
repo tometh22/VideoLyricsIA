@@ -497,6 +497,13 @@ class Delivery(Base):
     # short, thumbnail). Stored as a list so future deliveries with a
     # different mix (e.g. master-only) don't need a schema change.
     file_types = Column(JSONB, nullable=False)
+    # Byte size per file type, captured at publish time (the publish step
+    # already HEADs R2 to validate the files exist). The portal listing
+    # reads these instead of HEAD'ing R2 on every page load — so it's
+    # instant for the first visitor, no cold-cache penalty. Shape:
+    # {"video": 12345, "umg_master": 678, ...}. Null on pre-existing rows
+    # (the listing falls back to a Redis-cached HEAD for those).
+    file_sizes = Column(JSONB, nullable=True)
     # Snapshot of song metadata at publish time. Job rows can be soft-
     # deleted later or have their artist/title corrected; the portal
     # should keep showing whatever was approved at the moment of publish.
@@ -940,6 +947,7 @@ def _migrate_user_columns():
         # missing from the backend, UMG saw "No se pudo aprobar: Not
         # Found"). Two columns: approved_at (timestamp) and
         # approved_by_label (free-form, defaults to "UMG").
+        "ALTER TABLE deliveries ADD COLUMN IF NOT EXISTS file_sizes JSONB",
         "ALTER TABLE deliveries ADD COLUMN IF NOT EXISTS approved_at TIMESTAMPTZ",
         "CREATE INDEX IF NOT EXISTS ix_deliveries_approved_at ON deliveries(approved_at)",
         "ALTER TABLE deliveries ADD COLUMN IF NOT EXISTS approved_by_label VARCHAR(120)",
