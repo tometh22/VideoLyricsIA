@@ -290,11 +290,38 @@ def _find_user_by_customer(db: Session, customer_id: str) -> Optional[User]:
     return db.query(User).filter(User.stripe_customer_id == customer_id).first()
 
 
+def _plan_id_for_price(price_id: Optional[str]) -> Optional[str]:
+    """Reverse lookup PLANS by stripe_price_id. None if not found.
+
+    Audit 2026-05-26: webhook handlers used to trust metadata.plan_id
+    written by the customer-facing checkout. A customer with portal
+    access could edit metadata in some Stripe configurations and forge
+    a free downgrade to a paid plan. Deriving the plan from the
+    actively-billed price closes that gap — Stripe is authoritative for
+    what was actually charged.
+    """
+    if not price_id:
+        return None
+    for pid, plan in PLANS.items():
+        if plan.get("stripe_price_id") == price_id:
+            return pid
+    return None
+
+
+def _plan_id_from_subscription_items(data: dict) -> Optional[str]:
+    """Subscription webhook payload nests items as items.data[].price.id."""
+    items = (data.get("items") or {}).get("data") or []
+    for item in items:
+        price = item.get("price") or {}
+        pid = _plan_id_for_price(price.get("id"))
+        if pid:
+            return pid
+    return None
+
+
 def _handle_checkout_completed(db: Session, data: dict):
     customer_id = data.get("customer")
     subscription_id = data.get("subscription")
-    metadata = data.get("metadata", {})
-    plan_id = metadata.get("plan_id", "100")
 
     # Only resolve via stripe_customer_id. metadata.user_id was a fallback
     # path that let a forged event rebind any user's billing identity.
@@ -309,14 +336,49 @@ def _handle_checkout_completed(db: Session, data: dict):
         )
         return
 
+    # Audit 2026-05-26: previously we granted premium on any
+    # checkout.session.completed regardless of whether the payment
+    # actually cleared. With 3D Secure the session can complete but
+    # leave the subscription in `incomplete` until SCA finishes (or
+    # fails). The session payload carries payment_status — only `paid`
+    # is unambiguous; `no_payment_required` is also acceptable for free-
+    # trial flows we may add later.
+    payment_status = (data.get("payment_status") or "").lower()
+    if payment_status not in ("paid", "no_payment_required"):
+        logger.warning(
+            "checkout.session.completed: payment_status=%r for customer=%s — "
+            "NOT granting plan access; awaiting invoice.paid event",
+            payment_status, customer_id,
+        )
+        # Still persist the subscription_id so future events can resolve.
+        user.stripe_subscription_id = subscription_id
+        db.commit()
+        return
+
+    # Derive plan from the line items if expanded; fall back to metadata
+    # only for back-compat (older webhooks). Metadata is no longer
+    # authoritative.
+    plan_id = None
+    line_items = (data.get("line_items") or {}).get("data") or []
+    for item in line_items:
+        price = item.get("price") or {}
+        plan_id = _plan_id_for_price(price.get("id"))
+        if plan_id:
+            break
+    if not plan_id:
+        metadata = data.get("metadata") or {}
+        meta_plan = metadata.get("plan_id")
+        if meta_plan in PLANS:
+            plan_id = meta_plan
+
     user.stripe_subscription_id = subscription_id
-    if plan_id in PLANS:
+    if plan_id:
         user.plan_id = plan_id
     else:
         logger.warning(
-            "checkout.session.completed: unrecognised plan_id=%r for customer=%s; "
+            "checkout.session.completed: could not resolve plan for customer=%s; "
             "subscription_id persisted but plan NOT updated",
-            plan_id, customer_id,
+            customer_id,
         )
     db.commit()
     logger.info(f"User {user.username} subscribed to plan {plan_id}")
@@ -328,14 +390,39 @@ def _handle_subscription_updated(db: Session, data: dict):
     if not user:
         return
 
-    plan_id = data.get("metadata", {}).get("plan_id")
-    if plan_id and plan_id in PLANS:
-        user.plan_id = plan_id
+    # Audit 2026-05-26: derive plan from active price (Stripe is the
+    # source of truth for what's billed), NOT metadata.plan_id (which
+    # the customer could forge via portal metadata edit in some
+    # configurations). Fall back to metadata for back-compat ONLY when
+    # no price resolves.
+    plan_id = _plan_id_from_subscription_items(data)
+    if not plan_id:
+        meta_plan = (data.get("metadata") or {}).get("plan_id")
+        if meta_plan in PLANS:
+            plan_id = meta_plan
+            logger.info(
+                "customer.subscription.updated: no item price matched, "
+                "fell back to metadata.plan_id=%r for customer=%s",
+                meta_plan, customer_id,
+            )
+
+    # Respect Stripe subscription state — if status is incomplete /
+    # past_due / unpaid we hold off on the plan change. A still-failing
+    # 3DS subscription should NOT keep granting premium.
+    sub_status = (data.get("status") or "").lower()
+    if sub_status in ("incomplete", "incomplete_expired", "unpaid"):
+        logger.warning(
+            "customer.subscription.updated: status=%s for customer=%s; "
+            "plan NOT updated (await invoice.paid)",
+            sub_status, customer_id,
+        )
     elif plan_id:
+        user.plan_id = plan_id
+    elif (data.get("metadata") or {}).get("plan_id"):
         logger.warning(
             "customer.subscription.updated: unrecognised plan_id=%r for customer=%s; "
             "plan NOT updated",
-            plan_id, customer_id,
+            data.get("metadata", {}).get("plan_id"), customer_id,
         )
 
     user.stripe_subscription_id = data.get("id")
@@ -366,7 +453,27 @@ def _handle_invoice_paid(db: Session, data: dict):
     stripe_inv_id = data.get("id")
     existing = db.query(Invoice).filter(Invoice.stripe_invoice_id == stripe_inv_id).first()
     if existing:
+        # Audit 2026-05-26: previously this only flipped status to "paid"
+        # and ignored every other field. A failed → refunded → re-paid
+        # cycle would leave amount_cents at the original amount even if
+        # the customer ultimately paid less (proration / discount /
+        # different currency). Update the financial fields too so reports
+        # match Stripe.
         existing.status = "paid"
+        if data.get("amount_paid") is not None:
+            existing.amount_cents = data["amount_paid"]
+        if data.get("currency"):
+            existing.currency = data["currency"]
+        if data.get("hosted_invoice_url"):
+            existing.invoice_url = data["hosted_invoice_url"]
+        if data.get("invoice_pdf"):
+            existing.invoice_pdf = data["invoice_pdf"]
+        period_start = data.get("period_start")
+        period_end = data.get("period_end")
+        if period_start:
+            existing.period_start = datetime.fromtimestamp(period_start, tz=timezone.utc)
+        if period_end:
+            existing.period_end = datetime.fromtimestamp(period_end, tz=timezone.utc)
         db.commit()
         return
 
