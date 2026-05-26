@@ -3528,6 +3528,138 @@ def _slice_audio_prefix(input_path: str, output_path: str, seconds: float) -> bo
         return False
 
 
+# ─────────────────────────────────────────────────────────────────────
+# Defense helpers for `_gemini_cleanup_lyrics`. Pure functions so unit
+# tests can exercise every failure-mode without mocking the SDK.
+#
+# The base function already rejects: empty response, line-count ratio
+# outside [0.5, 2.5], Gemini exceptions, missing creds. These 4 helpers
+# add protection against more subtle Gemini misbehaviour:
+#  1. Refusal / meta-commentary returned as if it were lyrics
+#  2. Preamble like "Sure, here are the corrected lyrics:" before content
+#  3. Silent translation to English (when input was Spanish)
+#  4. Hallucination — text that's lyrics-shaped but doesn't match input
+# ─────────────────────────────────────────────────────────────────────
+
+# Match common refusal openings in EN / ES. Lowercased substring check
+# so we don't have to enumerate every phrasing.
+_GEMINI_REFUSAL_MARKERS = (
+    "i cannot",
+    "i can't",
+    "i am unable",
+    "i'm unable",
+    "i'm sorry",
+    "i am sorry",
+    "as an ai",
+    "as a language model",
+    "no puedo proporcionar",
+    "no puedo transcribir",
+    "no puedo ayudar",
+    "lo siento, no puedo",
+    "no es posible",
+    "i don't have access",
+    "i'm not able to",
+    "i must decline",
+)
+
+
+def _gemini_cleanup_is_refusal(text: str) -> bool:
+    """True if the (already-stripped) text looks like a Gemini refusal
+    or meta-explanation rather than corrected lyrics. Lowercases and
+    looks for opener fragments in the first 240 chars — refusals always
+    state themselves up front."""
+    if not text:
+        return True
+    head = text[:240].lower()
+    return any(m in head for m in _GEMINI_REFUSAL_MARKERS)
+
+
+# Preamble lines Gemini sometimes prefixes when it doesn't follow the
+# "no markdown / no preamble" instruction. Drop these so the cleaned
+# text is just the lyrics. Conservative: only strip the FIRST line
+# and only when it matches one of these openers.
+_GEMINI_PREAMBLE_OPENERS = (
+    "sure,", "sure ", "here are", "here is", "here you go",
+    "aqui esta", "aqui estan", "aquí está", "aquí están",
+    "las letras corregidas",
+    "la letra corregida",
+    "okay,", "ok,", "claro,",
+    "corrected lyrics",
+)
+
+
+def _gemini_cleanup_strip_preamble(text: str) -> str:
+    """If the first non-empty line is a recognised preamble (e.g.
+    'Sure, here are the corrected lyrics:'), drop it. Idempotent —
+    safe to call multiple times. Cleaned lyrics never start with these
+    English openers, so the false-positive risk is minimal."""
+    if not text:
+        return text
+    lines = text.splitlines()
+    # Skip leading blank lines.
+    i = 0
+    while i < len(lines) and not lines[i].strip():
+        i += 1
+    if i >= len(lines):
+        return text
+    first = lines[i].strip().lower().rstrip(":.")
+    for opener in _GEMINI_PREAMBLE_OPENERS:
+        if first.startswith(opener):
+            return "\n".join(lines[i + 1:]).lstrip()
+    return text
+
+
+# Spanish orthography markers — chars that strongly indicate the text is
+# Spanish (or at least romance-language with proper accents). When the
+# input has these and the output doesn't, Gemini likely translated.
+_SPANISH_MARKERS = "ñÑáéíóúÁÉÍÓÚüÜ¿¡"
+
+
+def _gemini_cleanup_language_intact(cleaned: str, plain: str) -> bool:
+    """If `plain` had Spanish-specific chars at density D_in, `cleaned`
+    must have at least D_in × 0.5 (allowing for some normalisation).
+    Catches the case where Gemini translates to English silently.
+
+    True (intact) when:
+      - input has no Spanish markers (we can't measure → trust the
+        line-count gate and word-overlap gate to catch issues), OR
+      - cleaned has at least half the marker density of input.
+    """
+    def density(s: str) -> float:
+        if not s:
+            return 0.0
+        markers = sum(1 for c in s if c in _SPANISH_MARKERS)
+        return markers / max(1, len(s))
+    d_in = density(plain)
+    if d_in < 0.001:
+        return True
+    d_out = density(cleaned)
+    return d_out >= d_in * 0.5
+
+
+def _gemini_cleanup_word_overlap(cleaned: str, plain: str) -> float:
+    """Jaccard overlap of normalised word sets (lowercase, accents
+    stripped, punctuation dropped). Returns 0..1. Hallucinations score
+    low because Gemini invented new vocabulary that doesn't appear in
+    lrclib. Stop-words excluded so a song with "el / la / que" doesn't
+    fake a high score."""
+    import unicodedata
+    def words(s: str) -> set[str]:
+        s = unicodedata.normalize("NFKD", s or "")
+        s = "".join(c for c in s if not unicodedata.combining(c))
+        tokens = re.findall(r"[a-z0-9]+", s.lower())
+        # Strip very common Spanish stop-words so a "el la que de" overlap
+        # doesn't fake a positive score on otherwise-unrelated text.
+        stop = {"el","la","los","las","de","del","y","o","a","en","que",
+                "se","un","una","es","con","por","para","no","si",
+                "the","a","an","and","or","of","to","in","is","it","you"}
+        return {t for t in tokens if t not in stop and len(t) >= 2}
+    a, b = words(plain), words(cleaned)
+    if not a or not b:
+        return 0.0
+    return len(a & b) / len(a | b)
+
+
 def _gemini_cleanup_cache_key(audio_path: str, lrclib_plain: str):
     """Content-addressable cache key for Gemini lyrics cleanup. Same
     audio + same lrclib hint = same cleaned output (deterministic with
@@ -3714,8 +3846,22 @@ def _gemini_cleanup_lyrics(audio_path: str, lrclib_plain: str,
         logger.info("[GEMINI-CLEAN] empty response (finish=%s, %.1fs) — using lrclib raw", finish, elapsed)
         return None
 
-    # Sanity check: output must have at least 50% as many lines as input
-    # and at most 200% (chorus expansions OK, but not 10x explosion).
+    # Strip any "Sure, here are the corrected lyrics:" preamble Gemini
+    # sometimes prefixes despite the system prompt. Conservative: only
+    # the first line and only when it matches a known opener.
+    cleaned = _gemini_cleanup_strip_preamble(cleaned)
+
+    # Defense 1: refusal / meta-commentary returned as if it were lyrics.
+    if _gemini_cleanup_is_refusal(cleaned):
+        logger.warning(
+            "[GEMINI-CLEAN] refusal-like output detected (%.1fs) — using lrclib raw",
+            elapsed,
+        )
+        return None
+
+    # Defense 2 (line count): output must have at least 50% as many
+    # lines as input and at most 250% (chorus expansions OK, but not
+    # 10x explosion).
     out_lines = [l for l in cleaned.splitlines() if l.strip()]
     in_lines = [l for l in plain.splitlines() if l.strip()]
     ratio = len(out_lines) / max(1, len(in_lines))
@@ -3727,9 +3873,34 @@ def _gemini_cleanup_lyrics(audio_path: str, lrclib_plain: str,
         )
         return None
 
+    # Defense 3: language drift. If lrclib was Spanish (had ñ/á/é/...),
+    # the cleaned text must preserve that marker density. Catches the
+    # case where Gemini translates to English without telling us.
+    if not _gemini_cleanup_language_intact(cleaned, plain):
+        logger.warning(
+            "[GEMINI-CLEAN] Spanish marker density dropped vs input (%.1fs) — "
+            "likely translation, using lrclib raw",
+            elapsed,
+        )
+        return None
+
+    # Defense 4: hallucination floor. ≥ 50% Jaccard overlap of
+    # content words (stopwords excluded) between input and output.
+    # Lower than that means Gemini invented vocabulary the song
+    # doesn't have. Accent/typo fixes preserve the words themselves,
+    # so the floor is generous.
+    overlap = _gemini_cleanup_word_overlap(cleaned, plain)
+    if overlap < 0.5:
+        logger.warning(
+            "[GEMINI-CLEAN] low word overlap %.2f vs input (%.1fs) — "
+            "likely hallucination, using lrclib raw",
+            overlap, elapsed,
+        )
+        return None
+
     logger.info(
-        "[GEMINI-CLEAN] cleaned %d → %d lines in %.1fs (audio_hash=%s)",
-        len(in_lines), len(out_lines), elapsed, audio_hash,
+        "[GEMINI-CLEAN] cleaned %d → %d lines, overlap=%.2f in %.1fs (audio_hash=%s)",
+        len(in_lines), len(out_lines), overlap, elapsed, audio_hash,
     )
 
     if cache_key:

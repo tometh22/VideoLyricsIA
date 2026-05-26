@@ -135,11 +135,28 @@ def test_rejects_when_output_too_long(tiny_audio, monkeypatch):
 
 
 def test_accepts_modest_expansion(tiny_audio, monkeypatch):
-    """A chorus that lrclib counted 3× but the audio actually has 5×
-    is a legitimate 1.5x expansion — must pass the sanity gate."""
+    """The Arbol case: lrclib has the chorus 8× but the song actually
+    has 12× — a legitimate 1.5x expansion. Must pass every defense."""
     monkeypatch.setenv("GEMINI_LYRICS_CLEANUP_ENABLED", "1")
-    plain = "\n".join(f"line {i}" for i in range(10))
-    cleaned = "\n".join(f"line {i}" for i in range(15))  # 1.5x — within bounds
+    plain = (
+        "Después de tanto vagar por las calles\n"
+        "La ciudad te parece tan gris\n"
+        "Árbol de la vida dame hoy\n"
+        "Dame hoy tu fruta divina\n"
+        "Árbol de la vida dame hoy\n"
+        "Dame hoy tu fruta divina\n"
+        "Árbol de la vida dame hoy\n"
+        "Dame hoy tu fruta divina"
+    )  # 8 lines, real Spanish lyrics with accents
+    # Cleaned: same content + 4 more chorus repeats (1.5x). Same
+    # vocabulary, just more repetition — overlap stays ~1.0.
+    cleaned = plain + "\n".join([
+        "",
+        "Árbol de la vida dame hoy",
+        "Dame hoy tu fruta divina",
+        "Árbol de la vida dame hoy",
+        "Dame hoy tu fruta divina",
+    ])
     _patch_genai_with(monkeypatch, _FakeResponse(cleaned))
 
     # Disable cache write to avoid touching the DB in tests
@@ -173,6 +190,171 @@ def test_gemini_empty_response_returns_none(tiny_audio, monkeypatch):
 
     out = pipeline._gemini_cleanup_lyrics(tiny_audio, "a\nb\nc\nd")
     assert out is None
+
+
+# ─── Defense 1: refusal detection ───────────────────────────────────
+
+def test_is_refusal_english():
+    """Common Gemini refusal openers in English."""
+    assert pipeline._gemini_cleanup_is_refusal(
+        "I cannot provide the lyrics due to copyright concerns."
+    )
+    assert pipeline._gemini_cleanup_is_refusal(
+        "As an AI language model, I am unable to transcribe..."
+    )
+    assert pipeline._gemini_cleanup_is_refusal("I'm sorry, I can't help with that.")
+
+
+def test_is_refusal_spanish():
+    """Spanish-localised refusals — Gemini sometimes responds in the
+    requested language even when refusing."""
+    assert pipeline._gemini_cleanup_is_refusal(
+        "Lo siento, no puedo proporcionar las letras de esta canción."
+    )
+    assert pipeline._gemini_cleanup_is_refusal("No puedo ayudar con esa solicitud.")
+
+
+def test_not_a_refusal_when_lyrics_use_similar_words():
+    """A song lyric that happens to contain 'no puedo' early on is NOT
+    a refusal — the marker check requires opener context, not just the
+    phrase anywhere. Our markers like 'no puedo proporcionar' include
+    'proporcionar' to avoid this false positive."""
+    not_refusals = [
+        "Después de tanto vagar por las calles",
+        "No puedo dormir, no puedo comer",        # real lyric
+        "Yo no puedo más, te dejo",                # another real lyric
+        "Para mí, para mí, para mí",
+    ]
+    for text in not_refusals:
+        assert not pipeline._gemini_cleanup_is_refusal(text), \
+            f"False positive on real lyric: {text!r}"
+
+
+def test_refusal_in_function_returns_none(tiny_audio, monkeypatch):
+    """End-to-end: Gemini returns a refusal that passes line-count gate
+    (it's short but >50% of a short input). Defense 1 must catch it."""
+    monkeypatch.setenv("GEMINI_LYRICS_CLEANUP_ENABLED", "1")
+    plain = "a\nb\nc"   # 3 lines
+    refusal = "I cannot provide lyrics for copyrighted material.\nPlease consult..."
+    _patch_genai_with(monkeypatch, _FakeResponse(refusal))
+    monkeypatch.setattr(pipeline, "_gemini_cleanup_cache_write", lambda *a, **k: None)
+    monkeypatch.setattr(pipeline, "_gemini_cleanup_cache_lookup", lambda *a, **k: None)
+    assert pipeline._gemini_cleanup_lyrics(tiny_audio, plain) is None
+
+
+# ─── Defense 2: preamble strip ──────────────────────────────────────
+
+def test_strip_preamble_sure_here():
+    """The most common Gemini preamble — strip the first line."""
+    inp = "Sure, here are the corrected lyrics:\nDespués de tanto\nLa ciudad gris"
+    out = pipeline._gemini_cleanup_strip_preamble(inp)
+    assert out.startswith("Después")
+    assert "Sure" not in out
+
+
+def test_strip_preamble_spanish_variant():
+    inp = "Aquí están las letras corregidas:\nDespués de tanto\nLa ciudad gris"
+    out = pipeline._gemini_cleanup_strip_preamble(inp)
+    assert out.startswith("Después")
+
+
+def test_strip_preamble_preserves_lyrics_starting_with_words():
+    """A real first line that happens to start with a common word
+    must NOT be stripped. Only recognised preamble openers go."""
+    inp = "Hace tiempo que no te veo\nDespués de tanto vagar"
+    out = pipeline._gemini_cleanup_strip_preamble(inp)
+    assert out == inp                                  # unchanged
+    assert out.startswith("Hace tiempo")
+
+
+def test_strip_preamble_handles_leading_blanks():
+    """Preamble can come after blank lines (Gemini formatting quirk)."""
+    inp = "\n\nSure, here are the lyrics:\nLetra primera línea\nSegunda línea"
+    out = pipeline._gemini_cleanup_strip_preamble(inp)
+    assert out.startswith("Letra")
+
+
+def test_strip_preamble_idempotent():
+    """Calling twice produces the same result as calling once."""
+    inp = "Sure, here are the lyrics:\nLetra A\nLetra B"
+    once = pipeline._gemini_cleanup_strip_preamble(inp)
+    twice = pipeline._gemini_cleanup_strip_preamble(once)
+    assert once == twice
+
+
+# ─── Defense 3: language drift detection ────────────────────────────
+
+def test_language_intact_when_both_spanish():
+    plain = "Después de tanto vagar por las calles\nLa ciudad te parece tan gris"
+    cleaned = "Después de tanto vagar por las calles\nLa ciudad te parece tan gris"
+    assert pipeline._gemini_cleanup_language_intact(cleaned, plain)
+
+
+def test_language_drift_when_translated_to_english():
+    """The killer case: lrclib is Spanish, Gemini translated to English."""
+    plain = "Después de tanto vagar por las calles\nLa ciudad te parece tan gris\nMejor hacerse un viaje al campo"
+    translated = "After so much wandering through the streets\nThe city looks so grey to you\nBetter to take a trip to the country"
+    assert not pipeline._gemini_cleanup_language_intact(translated, plain)
+
+
+def test_language_intact_when_input_has_no_markers():
+    """If input had no ñ/á/é/... (rare for Spanish but valid for some
+    languages), we can't measure drift — return True and trust the
+    other defenses."""
+    plain = "no markers here\njust ascii"
+    cleaned = "totally different\nbut also ascii"
+    assert pipeline._gemini_cleanup_language_intact(cleaned, plain)
+
+
+# ─── Defense 4: word overlap (hallucination floor) ──────────────────
+
+def test_word_overlap_high_when_only_accents_fixed():
+    """The happy case: Gemini added accents but kept all words. Overlap
+    should be ~1.0 because normalisation strips accents anyway."""
+    plain = "Para mi, para mi, para mi\nNo me gusta verte"
+    cleaned = "Para mí, para mí, para mí\nNo me gusta verte"
+    assert pipeline._gemini_cleanup_word_overlap(cleaned, plain) >= 0.9
+
+
+def test_word_overlap_low_when_hallucinated():
+    """Gemini invented totally different words — must score very low."""
+    plain = "Después de tanto vagar por las calles\nLa ciudad gris"
+    fake = "Mañana cantaré una nueva canción\nSobre el desierto rojo"
+    overlap = pipeline._gemini_cleanup_word_overlap(fake, plain)
+    assert overlap < 0.5
+
+
+def test_hallucination_in_function_returns_none(tiny_audio, monkeypatch):
+    """End-to-end: Gemini returns lyrics-shaped but-unrelated text.
+    Line count passes, language intact, but word overlap is too low."""
+    monkeypatch.setenv("GEMINI_LYRICS_CLEANUP_ENABLED", "1")
+    plain = ("Después de tanto vagar por las calles\n"
+             "La ciudad te parece tan gris\n"
+             "Mejor hacerse un viaje al campo\n"
+             "Y sentirse libre para poder sentir")
+    fake = ("Mañana cantaré una nueva canción\n"
+            "Sobre el desierto rojo del olvido\n"
+            "Donde la luna pinta sus colores\n"
+            "Y yo recuerdo los días felices")
+    _patch_genai_with(monkeypatch, _FakeResponse(fake))
+    monkeypatch.setattr(pipeline, "_gemini_cleanup_cache_write", lambda *a, **k: None)
+    monkeypatch.setattr(pipeline, "_gemini_cleanup_cache_lookup", lambda *a, **k: None)
+    assert pipeline._gemini_cleanup_lyrics(tiny_audio, plain) is None
+
+
+def test_translation_in_function_returns_none(tiny_audio, monkeypatch):
+    """End-to-end: Gemini silently translated lrclib to English. Output
+    passes line count + overlap-low-ish but language drift defense
+    catches it (no Spanish markers)."""
+    monkeypatch.setenv("GEMINI_LYRICS_CLEANUP_ENABLED", "1")
+    plain = ("Después de tanto vagar por las calles\n"
+             "La ciudad te parece tan gris")
+    translated = ("After so much wandering through the streets\n"
+                  "The city looks so grey to you")
+    _patch_genai_with(monkeypatch, _FakeResponse(translated))
+    monkeypatch.setattr(pipeline, "_gemini_cleanup_cache_write", lambda *a, **k: None)
+    monkeypatch.setattr(pipeline, "_gemini_cleanup_cache_lookup", lambda *a, **k: None)
+    assert pipeline._gemini_cleanup_lyrics(tiny_audio, plain) is None
 
 
 def test_client_unavailable_returns_none(tiny_audio, monkeypatch):
