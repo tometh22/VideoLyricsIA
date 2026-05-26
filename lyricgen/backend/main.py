@@ -1665,27 +1665,36 @@ async def _stream_upload_to_disk(file, dest_path: str, *, max_mb: int = None) ->
     limit = max_mb * 1024 * 1024
     size = 0
     lease = _try_acquire_upload_slot()
-    f = open(dest_path, "wb")
+    # Audit 2026-05-26: previously `f = open(dest_path, "wb")` ran BEFORE
+    # the try/finally that releases the lease. An open() that raised
+    # (ENOSPC, EPERM, EISDIR via a hostile filename, or any FS error)
+    # would leak the Redis lease until its 600 s TTL expired —
+    # under load this caused 503s "Upload capacity full" even when
+    # the actual semaphore had headroom. Now the lease release is in
+    # the outer finally so every failure path frees it.
     try:
-        while True:
-            chunk = await file.read(_UPLOAD_CHUNK_SIZE)
-            if not chunk:
-                break
-            size += len(chunk)
-            if size > limit:
+        f = open(dest_path, "wb")
+        try:
+            while True:
+                chunk = await file.read(_UPLOAD_CHUNK_SIZE)
+                if not chunk:
+                    break
+                size += len(chunk)
+                if size > limit:
+                    f.close()
+                    try:
+                        os.unlink(dest_path)
+                    except OSError:
+                        pass
+                    raise HTTPException(
+                        status_code=413,
+                        detail=f"File too large (>{max_mb} MB).",
+                    )
+                f.write(chunk)
+        finally:
+            if not f.closed:
                 f.close()
-                try:
-                    os.unlink(dest_path)
-                except OSError:
-                    pass
-                raise HTTPException(
-                    status_code=413,
-                    detail=f"File too large (>{max_mb} MB).",
-                )
-            f.write(chunk)
     finally:
-        if not f.closed:
-            f.close()
         _release_upload_slot(lease)
     return size
 
@@ -5885,16 +5894,26 @@ async def job_events(
     _initial_user_id = current_user["id"]
     _initial_tenant_id = current_user.get("tenant_id")
 
+    # Audit 2026-05-26: cap the SSE stream at 2 h and emit a keep-alive
+    # comment every 15 s. Two problems closed by this:
+    #   (a) A job stuck in queued/processing with no progress changes
+    #       generated NO bytes, so idle proxies (Cloudflare 100 s,
+    #       Railway ~5 min) closed the socket. The server generator
+    #       didn't notice until the NEXT yield raised BrokenPipeError —
+    #       could be many minutes later — burning a DB connection per
+    #       2 s tick the whole time.
+    #   (b) An open dashboard tab on a job that never terminated kept
+    #       the stream alive indefinitely. With a hard 2 h cap the
+    #       client reconnects (EventSource auto-retries) — at which
+    #       point we re-auth and re-validate.
+    _SSE_MAX_DURATION_S = 2 * 60 * 60
+    _SSE_HEARTBEAT_S = 15
+
     async def event_generator():
         last_sig = None
-        # Merge de dos fixes:
-        #   - PR #97: scoped_db() per tick para evitar pool starvation.
-        #   - PR #95: re-validar tenant del user en cada tick (cierra el
-        #     window donde admin transfiere user entre tenants mid-stream).
-        # Ambas queries (User refresh + job fetch) ocurren dentro de la
-        # misma sesión corta del context manager → 1 connection por tick,
-        # ~2 SELECTs, devuelta al pool en milisegundos.
         unauthorized = False
+        started = time.monotonic()
+        last_beat = started
         while True:
             with scoped_db() as db_tick:
                 fresh_user = db_tick.query(User).filter(User.id == _initial_user_id).first()
@@ -5909,8 +5928,10 @@ async def job_events(
             if job is None:
                 break
             sig = (job["status"], job["current_step"], job["progress"])
+            now = time.monotonic()
             if sig != last_sig:
                 last_sig = sig
+                last_beat = now
                 payload = {
                     "job_id": job["job_id"],
                     "status": job["status"],
@@ -5921,7 +5942,16 @@ async def job_events(
                     "completed_at": job.get("completed_at"),
                 }
                 yield f"data: {json.dumps(payload)}\n\n"
+            elif now - last_beat >= _SSE_HEARTBEAT_S:
+                # SSE comment line — clients ignore it, but it keeps
+                # intermediate proxies from idle-closing the connection.
+                last_beat = now
+                yield ": keep-alive\n\n"
             if job["status"] in TERMINAL:
+                break
+            if now - started >= _SSE_MAX_DURATION_S:
+                # Tell client to reconnect (EventSource will auto-retry).
+                yield f"event: timeout\ndata: {json.dumps({'reason': 'sse_max_duration'})}\n\n"
                 break
             await asyncio.sleep(2)
 

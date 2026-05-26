@@ -146,18 +146,36 @@ def _upload_deliverables_to_r2(job_id: str, job_dir: str, files: dict) -> dict:
         try:
             key = storage.upload_master(local, tenant_id, job_id, key_name)
             if key:
-                out[ftype_short] = key
                 # Atomic merge into job.s3_keys so a concurrent
                 # prores.prewarm_prores writing umg_master/umg_short
                 # doesn't get clobbered when the caller eventually
                 # snapshots files. merge_s3_keys takes FOR UPDATE.
+                #
+                # Audit 2026-05-26: previously this exception was only
+                # warning-logged; the file was uploaded to R2 but the
+                # DB row never recorded the key, so /retry would re-upload
+                # the same blob (extra R2 PUT cost, extra wait), and the
+                # download endpoint would 404. For CRITICAL deliverables
+                # we now bubble the merge failure as a critical failure
+                # so the job errors instead of advertising a phantom
+                # success.
                 try:
                     merge_s3_keys(job_id, ftype_short, key)
+                    out[ftype_short] = key
                 except Exception as e:
-                    logger.warning("[R2] merge_s3_keys failed for %s: %s", ftype_short, e)
-                # Upload confirmed — delete the local copy so the disk doesn't
-                # fill up (a HD ProRes master is ~5 GB, a 240 GB NVMe fills
-                # after ~50 UMG deliveries).
+                    logger.error(
+                        "[R2] merge_s3_keys failed for %s: %s (key=%s)",
+                        ftype_short, e, key,
+                    )
+                    if ftype_short in _CRITICAL_DELIVERABLES:
+                        failed_critical.append(
+                            f"{ftype_short} (merge_s3_keys: {type(e).__name__})"
+                        )
+                        # Don't unlink local file — caller may retry.
+                        continue
+                # Upload + DB merge confirmed — delete the local copy so the
+                # disk doesn't fill up (a HD ProRes master is ~5 GB, a 240 GB
+                # NVMe fills after ~50 UMG deliveries).
                 try:
                     os.unlink(local)
                 except OSError as e:
@@ -7819,7 +7837,16 @@ def _validate_umg_master(path: str, spec: RenderSpec) -> list[str]:
         "-show_streams", "-show_format",
         path,
     ]
-    result = subprocess.run(cmd, capture_output=True, text=True)
+    # Audit 2026-05-26: previously no timeout. A wedged ffprobe (corrupt
+    # .mov, NFS hang, kernel I/O block) pinned the worker indefinitely;
+    # find_stalled_renders reaped at 20 min but the underlying process
+    # kept the file open. 60 s is generous for a HD ProRes header probe
+    # (typical 50-200 ms) and short enough that reaper-vs-worker doesn't
+    # race.
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+    except subprocess.TimeoutExpired:
+        return ["ffprobe timed out after 60s — file may be corrupt or storage hung"]
     if result.returncode != 0:
         return [f"ffprobe failed: {result.stderr[-200:]}"]
 
