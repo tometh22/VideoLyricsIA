@@ -3986,7 +3986,60 @@ async def _run_transcription_for_job(
                         # editor saw only 8/19 canonical lines. FA on the
                         # same audio recovered 19/19 — operator reported
                         # "le faltan lyrics en bastantes lineas".
-                        # First — when cleanup expanded the canonical beyond
+                        # First (world-class) — Whisper-1 word-level
+                        # alignment against the cleaned canonical. Whisper
+                        # hears every word, returns ±0.5 s timestamps; DP
+                        # picks the best mapping from each cleaned token
+                        # to a Whisper word; each line's start = first
+                        # matched token's Whisper time. Empirically
+                        # 27/27 lines anchored on "638" with avg Δ 2.6 s
+                        # vs lrclib synced ground truth (probe 2026-05-26).
+                        # Linear interpolation between lrclib synced
+                        # anchors (cleanup_anchored, below) only kicks in
+                        # if this returns None — acoustic anchors strictly
+                        # dominate lexical anchors + interpolation. Cost
+                        # ~$0.018/song. Gated on cleanup-expanded
+                        # canonical AND OPENAI_API_KEY available.
+                        _canonical_lines = [
+                            ln.strip() for ln in (_canonical or "").splitlines()
+                            if ln.strip()
+                        ]
+                        if (
+                            _cleaned
+                            and _canonical_lines
+                            and os.environ.get("OPENAI_API_KEY")
+                        ):
+                            try:
+                                from lyrics_whisper_align import (
+                                    whisper_word_align as _wwa,
+                                )
+                                _wa_segs = await asyncio.to_thread(
+                                    _wwa, tmp_path, _canonical_lines,
+                                    language=lang or "es",
+                                    job_id=job_id,
+                                )
+                                if _wa_segs:
+                                    from timing_sources import (
+                                        WHISPER_ALIGN as _WC_WA,
+                                    )
+                                    logger.info(
+                                        "[WC] whisper-align path: %d segs "
+                                        "(cleaned=%d) — acoustic alignment "
+                                        "via Whisper-1 word timestamps",
+                                        len(_wa_segs), len(_canonical_lines),
+                                    )
+                                    return _emit_segments(
+                                        _wa_segs, _WC_WA,
+                                        reference_lyrics=_canonical,
+                                    )
+                            except Exception as _e_wa:
+                                logger.warning(
+                                    "[WC] whisper-align path raised: %s — "
+                                    "falling through to cleanup_anchored",
+                                    _e_wa,
+                                )
+
+                        # Second — when cleanup expanded the canonical beyond
                         # what lrclib synced has, try the cleanup-anchored
                         # path BEFORE forced_align. Rationale: FA's
                         # `wordstamps_to_segments` clamps unmatchable extra
@@ -4003,10 +4056,6 @@ async def _run_transcription_for_job(
                         _synced_for_anchor: str | None = (
                             (lrc or {}).get("synced") if isinstance(lrc, dict) else None
                         )
-                        _canonical_lines = [
-                            ln.strip() for ln in (_canonical or "").splitlines()
-                            if ln.strip()
-                        ]
                         if (
                             _cleaned  # cleanup ran and produced output
                             and _synced_for_anchor

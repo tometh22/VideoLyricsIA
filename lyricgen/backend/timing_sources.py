@@ -78,6 +78,21 @@ WHISPERX_LRCLIB = "whisperx_lrclib"
 # `/Users/tomi/.claude/plans/image-24-la-letra-robust-moonbeam.md`.
 CLEANUP_ANCHORED = "cleanup_anchored"
 
+# Whisper-1 word-level timestamps + DP alignment against the cleanup-
+# expanded canonical. World-class acoustic alignment: Whisper hears
+# every word with ±0.5 s precision, and the DP finds the best one-to-
+# one assignment between cleaned tokens and Whisper words. Each
+# cleaned line's start = first matched token's Whisper start time.
+# Activated as the FIRST fallback after `whisperx_reconcile` aborts
+# (preferred over cureau forced_align and cleanup_anchored
+# interpolation because acoustic anchors beat lexical anchors + linear
+# interpolation). Probe 2026-05-26 on "638": 27/27 lines anchored,
+# avg Δ 2.6 s vs lrclib synced ground truth, max Δ 5.6 s. Gemini-as-
+# aligner alternative gave 0/27 anchored with avg Δ 25.7 s.
+# Cost ~$0.018/song. Gated on OPENAI_API_KEY availability.
+# See `lyrics_whisper_align.py`.
+WHISPER_ALIGN = "whisper_align"
+
 
 VALID_TIMING_SOURCES = frozenset({
     FORCED_ALIGN,
@@ -85,6 +100,7 @@ VALID_TIMING_SOURCES = frozenset({
     WHISPERX,
     WHISPERX_LRCLIB,
     CLEANUP_ANCHORED,
+    WHISPER_ALIGN,
     WHISPER_LRCLIB,
     WHISPER_LRCLIB_REC,
     WHISPER_GEMINI_REC,
