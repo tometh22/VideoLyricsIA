@@ -118,6 +118,13 @@ export default function WizardLivePreview({
   // con nuestro propio rAF para renderizar word-jump real sincronizado al
   // audio, sin disparar re-renders en App.jsx/UploadZone.
   playbackTickRef = null,
+  // Post-render edit mode: MP4 ya renderizado del job que el operador está
+  // editando. Cuando viene set, el preview muta a "video del resultado
+  // actual" — sin simulación de karaoke, sin overlays de palette/effect/
+  // grade (todo eso ya está horneado en el MP4). Sirve de referencia
+  // visual del estado actual mientras el operador edita lyrics/typography
+  // en la columna derecha del wizard.
+  renderedVideoUrl = null,
   // UI F5 (2026-05-26): cuando el componente sabe que está mostrando el
   // fondo placeholder (no el final que va a entregar la IA), el badge
   // cambia su lenguaje visual: "VISTA PREVIA (muestra)" con dot ámbar
@@ -390,6 +397,29 @@ export default function WizardLivePreview({
     wipe: "wlp-trans-wipe 3.4s ease-in-out infinite",
     dissolve_blur: "wlp-trans-blur 3.4s ease-in-out infinite",
   }[lineTransition];
+
+  // Post-render edit: short-circuit a un MP4 puro sin overlays — el MP4
+  // ya trae palette/effect/grade/lyrics horneados, cualquier overlay sería
+  // doble exposición. El badge cambia a "Resultado actual" para que el
+  // operador entienda qué está mirando.
+  if (renderedVideoUrl) {
+    return (
+      <div className="relative w-full aspect-video rounded-2xl overflow-hidden ring-1 ring-white/[0.08] shadow-[0_24px_70px_-24px_#000] bg-black select-none">
+        <video
+          key={renderedVideoUrl}
+          src={renderedVideoUrl}
+          className="absolute inset-0 w-full h-full object-contain bg-black"
+          controls
+          playsInline
+          preload="metadata"
+        />
+        <div className="absolute top-4 left-4 flex items-center gap-1.5 text-[10px] uppercase tracking-[0.18em] font-medium pointer-events-none" style={{ color: "rgba(255,255,255,.72)" }}>
+          <span className="w-1.5 h-1.5 rounded-full" style={{ background: "#14C8A8" }} />
+          {t("upload.preview_rendered") || "Resultado actual"}
+        </div>
+      </div>
+    );
+  }
 
   return (
     <div className="relative w-full aspect-video rounded-2xl overflow-hidden ring-1 ring-white/[0.08] shadow-[0_24px_70px_-24px_#000] bg-black select-none" style={{ containerType: "inline-size" }}>

@@ -1,5 +1,6 @@
 """Full processing pipeline: Whisper → Video → Short → Thumbnail."""
 
+import gc
 import hashlib
 import json
 import os
@@ -10,6 +11,7 @@ import logging
 logger = logging.getLogger("genly.pipeline")
 import subprocess
 import tempfile
+import threading
 import traceback
 
 from dotenv import load_dotenv
@@ -1123,6 +1125,40 @@ def run_pipeline(job_id: str, mp3_path: str, artist: str, style: str,
                 enqueue_prores_prewarm(job_id, "umg_short")
             except Exception as e:  # pragma: no cover
                 logger.warning("[PIPELINE] prores prewarm enqueue skipped: %s", e)
+
+        # PR feat/waveform-precompute 2026-05-27: pre-compute the timeline
+        # waveform now, while the worker still has the input MP3 in
+        # context, so the FIRST time the operator opens the editor on this
+        # job (post-approval lyrics fix) /jobs/:id/waveform is a cache
+        # hit (~200ms instead of the 5-30s cold-cache cost from
+        # downloading the MP3 + running librosa.load). Best-effort —
+        # never fail the main render because the waveform precompute
+        # had a hiccup, the on-demand endpoint will recompute on first
+        # operator request as a fallback.
+        if final_status in ("done", "pending_review"):
+            try:
+                # Resolve input_r2_key from the row (the local `mp3_path`
+                # used during render is ephemeral; the helper downloads
+                # the canonical R2 copy). Cheap session, closed immediately.
+                from database import SessionLocal
+                from jobs import get_job_model
+                from waveform_compute import compute_and_cache_waveform
+                _db = SessionLocal()
+                try:
+                    _row = get_job_model(_db, job_id)
+                    _input_key = _row.input_r2_key if _row else None
+                finally:
+                    _db.close()
+                if _input_key:
+                    payload = compute_and_cache_waveform(job_id, _input_key)
+                    if payload is None:
+                        logger.warning(
+                            "[WAVEFORM] precompute returned None for %s — operator's "
+                            "first open will recompute on-demand",
+                            job_id,
+                        )
+            except Exception as e:  # pragma: no cover
+                logger.warning("[WAVEFORM] precompute skipped for %s: %s", job_id, e)
     except Exception as exc:
         traceback.print_exc()
         update_job(job_id, status="error", error=str(exc))
@@ -8936,13 +8972,18 @@ def generate_short(
     final = CompositeVideoClip([bg] + text_layers, size=(1080, 1920))
     final = final.set_audio(short_audio).set_duration(short_dur)
 
+    # 2026-05-26 OOM mitigation: workers SIGKILL'd at progress=75% on
+    # dense-chorus songs (Sin Gamulán). Force gc before x264 encode +
+    # drop threads 8→2 below to cap peak RSS.
+    gc.collect()
+
     out_path = os.path.join(job_dir, "short.mp4")
     final.write_videofile(
         out_path,
         fps=fps,
         codec="libx264",
         audio_codec="aac",
-        threads=8,
+        threads=2,
         preset="veryfast",
         ffmpeg_params=["-movflags", "+faststart"],
         logger=None,
@@ -9094,6 +9135,14 @@ def run_edit_pipeline(
             video/short/thumbnail.  Cost: ~$0. After success, the new
             segments overwrite segments_json so subsequent edits see
             the corrected version.
+        "metadata"   — PR C 2026-05-26. Keep cached background AND
+            segments. The /edit handler already wrote the corrected
+            artist/song_title to the DB row before enqueueing, so
+            `artist` and `song_title` read on line 9107-9108 below pick
+            up the new values automatically. The re-render produces a
+            new title card via libass with the corrected text. Same
+            cost/timing as typography (~$0, ~5 min). Does NOT consume
+            an edit slot — see main.py:request_edit for the rationale.
 
     After completion the job returns to "pending_review" so the reviewer
     can approve, reject, or request another edit (up to _MAX_EDITS total).
@@ -9197,10 +9246,12 @@ def run_edit_pipeline(
         # ----------------------------------------------------------------
         # Resolve background
         # ----------------------------------------------------------------
-        if edit_type in ("typography", "lyrics"):
-            # Both reuse the cached background — only the foreground layer
-            # (text overlays) changes. Lyrics edit ALSO swaps the segments,
-            # but that already happened at function entry above.
+        if edit_type in ("typography", "lyrics", "metadata"):
+            # All three reuse the cached background — only the foreground
+            # layer changes. Lyrics edit ALSO swaps the segments, and
+            # metadata edit re-renders the title card with the corrected
+            # artist/song_title (already persisted by the /edit handler
+            # before this worker spawned — see main.py:request_edit).
             update_job(job_id, status="editing", current_step="video", progress=35)
             bg_image_path = os.path.join(job_dir, "bg_cached_edit.mp4")
             if not os.path.exists(bg_image_path):

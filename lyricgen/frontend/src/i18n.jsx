@@ -1,6 +1,9 @@
 import { createContext, useContext, useState, useCallback } from "react";
 
-const translations = {
+// Exported so unit tests can pin specific copy without mounting the
+// full I18nProvider tree. The runtime context still consumes this same
+// dictionary via I18nProvider below — exporting is read-only.
+export const translations = {
   es: {
     // Login
     "login.title": "Iniciar sesión",
@@ -212,6 +215,7 @@ const translations = {
     "upload.step_deliver": "Entregá",
     "upload.step_lyrics": "Lyrics",
     "upload.step_lyrics_hint": "Disponible después de \"Revisar lyrics\"",
+    "upload.step_locked_hint": "No editable en este modo — usá \"Regenerar fondo\" desde el video.",
     "upload.back_to_lyrics": "Volver a lyrics",
     "upload.animation_label": "Animación:",
     "upload.anim_gallery_desc": "Cómo aparecen las palabras sobre el video. Pasá el mouse o elegí y miralo en el preview ←",
@@ -242,6 +246,9 @@ const translations = {
     "editor.review_badge": "revisar tiempo",
     "editor.review_banner_count": "{n} líneas con timing aproximado",
     "editor.review_banner_hint": "estas líneas vienen de la letra de referencia. Escuchá la canción y ajustá si alguna no entra en el momento correcto.",
+    "editor.wrap2_banner_count": "{n} líneas pasarán a 2 renglones en el video",
+    "editor.wrap2_banner_hint": "se ven OK como están, pero podés dividirlas si querés líneas más cortas en el video.",
+    "editor.wrap2_banner_split_all": "Dividir todas",
     "editor.insert_line_below": "Insertar línea acá (en el medio de la canción)",
     "history.draft": "Sin generar",
     "history.uploading": "Subiendo…",
@@ -257,6 +264,7 @@ const translations = {
     "upload.mode_edge": "ÚNICO",
     "upload.preview_sample": "esta es tu letra",
     "upload.preview_live": "Vista previa en vivo",
+    "upload.preview_rendered": "Resultado actual",
     "upload.preview_sample_badge": "Vista previa (muestra)",
     "upload.preview_motion": "Movimiento",
     "upload.preview_disclaimer": "Aproximación del mood y el movimiento. El fondo final lo genera la IA.",
@@ -614,6 +622,8 @@ const translations = {
     "detail.view_youtube": "Ver en YouTube",
     "detail.not_available": "Todavía no se puede previsualizar este video.",
     "detail.back": "Volver",
+    "detail.not_found": "No se encontró el video.",
+    "detail.load_error": "No pudimos cargar el video.",
     // PR #291: claves usadas por los branches nuevos de JobDetail
     // (transcribed / transcribing* / awaiting_upload / transcription_failed).
     // Build de Vercel falla si alguna clave nueva está ausente — agregadas
@@ -653,9 +663,9 @@ const translations = {
     // hay poco espacio + hint del minimapa de timeline.
     "editor.autofix_apply_all_short": "Aplicar todas",
     "editor.minimap_hint": "Hacé click en el minimapa para saltar a esa parte de la canción",
-    "detail.transcribed_title": "Borrador listo para editar",
-    "detail.transcribed_subtitle": "La transcripción ya está lista. Revisá los lyrics y dale Generar video para terminar.",
-    "detail.transcribed_cta": "Editar lyrics y generar",
+    "detail.transcribed_title": "Este video todavía no se generó",
+    "detail.transcribed_subtitle": "La transcripción está lista pero nunca se disparó la generación. Continuá el wizard para revisar lyrics, elegir estilo y generar el video.",
+    "detail.transcribed_cta": "Continuar wizard y generar video",
     "detail.transcribed_pending_title": "Subida en curso",
     "detail.transcribed_pending_subtitle": "La subida está en curso. Cuando termine, vas a poder editar los lyrics.",
     "detail.transcribing_title": "Transcribiendo…",
@@ -944,6 +954,17 @@ const translations = {
     "edit.youtube_drift_confirm": "Este video ya está publicado en YouTube. La re-sincronización actualizará el archivo en la plataforma pero NO reemplazará el video en YouTube (la API de YouTube no permite reemplazar archivos, solo metadata).\n\n¿Continuar igual?",
     "edit.lyrics_resync_submit": "Re-renderizar con letras y tiempos corregidos",
     "edit.lyrics_audio_unavailable": "El audio fuente no está disponible para este job — solo podrás editar texto sin escuchar playback.",
+    // PR C 2026-05-26 (feat/edit-metadata): editar artist/song_title in-place
+    // desde el header del JobDetail para corregir typos sin re-subir.
+    "metadata.edit": "Editar",
+    "metadata.edit_song_title": "Editar título de la canción",
+    "metadata.edit_artist": "Editar artista",
+    "metadata.save": "Guardar",
+    "metadata.saving": "Guardando…",
+    "metadata.cancel": "Cancelar",
+    "metadata.empty_error": "No puede estar vacío",
+    "metadata.too_long": "Máximo {n} caracteres",
+    "metadata.network_error": "Error de red, intentá de nuevo",
     "editor.trim_line": "Recortar al final natural (cuando la voz termina y empieza un fill)",
     "editor.undo_anchor_hint": "Deshacer este anchor",
     "editor.trim_all_long_label": "Recortar {n} líneas con texto colgado",
@@ -1551,9 +1572,9 @@ const translations = {
     "detail.not_available": "This video is not ready to preview yet.",
     "detail.back": "Back",
     // PR #297: full EN coverage of the 14 keys PR #294 added in ES only.
-    "detail.transcribed_title": "Draft ready to edit",
-    "detail.transcribed_subtitle": "Your transcription is ready. Review the lyrics and hit Generate video to finish.",
-    "detail.transcribed_cta": "Edit lyrics and generate",
+    "detail.transcribed_title": "This video hasn't been generated yet",
+    "detail.transcribed_subtitle": "The transcription is ready but generation was never triggered. Continue the wizard to review lyrics, pick a style and generate the video.",
+    "detail.transcribed_cta": "Continue wizard and generate video",
     "detail.transcribed_pending_title": "Upload in progress",
     "detail.transcribed_pending_subtitle": "The upload is in progress. Once it completes, you'll be able to edit the lyrics.",
     "detail.transcribing_title": "Transcribing…",
@@ -2298,9 +2319,9 @@ const translations = {
     "detail.view_youtube": "Ver no YouTube",
     "detail.not_available": "Este vídeo ainda não está pronto para preview.",
     // PR #297: cobertura PT das 14 chaves que PR #294 deixou só em ES.
-    "detail.transcribed_title": "Rascunho pronto para editar",
-    "detail.transcribed_subtitle": "Sua transcrição está pronta. Revise as letras e clique em Gerar vídeo para finalizar.",
-    "detail.transcribed_cta": "Editar letras e gerar",
+    "detail.transcribed_title": "Este vídeo ainda não foi gerado",
+    "detail.transcribed_subtitle": "A transcrição está pronta mas a geração nunca foi disparada. Continue o wizard para revisar as letras, escolher o estilo e gerar o vídeo.",
+    "detail.transcribed_cta": "Continuar wizard e gerar vídeo",
     "detail.transcribed_pending_title": "Upload em andamento",
     "detail.transcribed_pending_subtitle": "O upload está em andamento. Quando terminar, você poderá editar as letras.",
     "detail.transcribing_title": "Transcrevendo…",
