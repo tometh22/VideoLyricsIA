@@ -544,6 +544,14 @@ export default function App() {
   const { t } = useI18n();
   const navigate = useNavigate();
   const { alert } = useAlert();
+  // Audit 2026-05-26: the App body previously referenced a bare `location`
+  // identifier which resolved to `window.location` via JS global lookup.
+  // It "worked" only because window.location has .search/.pathname — but
+  // useEffect deps on `location.search` never re-fire when navigate() updates
+  // the URL via History API (React doesn't re-render on window.location).
+  // The /new?resume=... flow is fragile against that. Use useLocation() so
+  // React subscribes to URL changes correctly.
+  const location = useLocation();
 
   const [token, setToken] = useState(getToken());
   const [user, setUser] = useState(getUser());
@@ -708,6 +716,17 @@ export default function App() {
       currentReview !== null ||
       reviewQueue.length > 0;
     if (!anyState) {
+      // Audit 2026-05-26: while the resume banner is offering an unfinished
+      // batch (resumableWizard non-null, "Tenés un batch sin terminar"),
+      // the wizard state is still empty (user hasn't clicked Continuar
+      // yet). Without this guard, that empty state hits the `!anyState`
+      // branch on the SAME render the banner is rendering, and we wipe
+      // the snapshot we're about to offer. Banner then shows but Continuar
+      // has nothing to restore. Hold off until the banner is dismissed
+      // — at that point resumableWizard is null again (the user either
+      // accepted, which transitioned state to non-empty by then, or
+      // rejected and explicitly cleared via the discard button).
+      if (resumableWizard) return;
       // Fresh wizard / cleared explicitly → blow away the snapshot too.
       wizardPersistence.clear();
       return;
@@ -727,6 +746,7 @@ export default function App() {
     files, approvedJobs, currentReview, reviewQueue, wizardStage,
     style, customColors, delivery, backgroundId, backgroundMode,
     animateImage, inspiredByLyrics,
+    resumableWizard,
   ]);
 
   // beforeunload warning — covers closing the tab, refreshing, or
