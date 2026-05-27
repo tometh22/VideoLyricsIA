@@ -5862,6 +5862,26 @@ async def job_events(
             sig = (job["status"], job["current_step"], job["progress"])
             if sig != last_sig:
                 last_sig = sig
+                # ETA / step-text enrichment (audit 2026-05-27 "638"
+                # operator: bar froze at 22%, "~8 min restantes" never
+                # changed). step_eta computes a dynamic ETA from the
+                # current_step + progress; the frontend reads `eta_s`
+                # and `step_text_es` directly so it stops cycling
+                # through hardcoded step labels.
+                _eta_s = None
+                _step_text = None
+                try:
+                    from step_eta import compute_eta_s, STEP_USER_TEXT_ES
+                    _eta_s = compute_eta_s(job["current_step"], job["progress"])
+                    if job["current_step"]:
+                        _step_text = STEP_USER_TEXT_ES.get(
+                            job["current_step"].strip().lower()
+                            if isinstance(job["current_step"], str) else None
+                        )
+                except Exception:  # pragma: no cover
+                    # ETA is best-effort. If step_eta breaks, the
+                    # frontend falls back to its old hardcoded text.
+                    pass
                 payload = {
                     "job_id": job["job_id"],
                     "status": job["status"],
@@ -5870,6 +5890,8 @@ async def job_events(
                     "error": job.get("error"),
                     "created_at": job.get("created_at"),
                     "completed_at": job.get("completed_at"),
+                    "eta_s": _eta_s,
+                    "step_text_es": _step_text,
                 }
                 yield f"data: {json.dumps(payload)}\n\n"
             if job["status"] in TERMINAL:
