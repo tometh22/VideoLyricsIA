@@ -6873,11 +6873,21 @@ async def get_source_audio_url(
         # 503 — if a rendered MP4 exists we can still serve the editor.
 
     # 2-3. Fallback to rendered MP4(s). Browsers play <audio src=".mp4">.
+    #
+    # HOTFIX F8 2026-05-27 (audit): probe each candidate with HEAD before
+    # presigning. presign is a local operation that doesn't verify the
+    # object exists — without this guard, a job whose video MP4 was
+    # also purged (e.g., bulk-deleted output, very old job) would receive
+    # a signed URL that 404s on fetch. The MP4 fallback's whole point is
+    # to provide a working audio source; serving a dead URL defeats it
+    # and the 4. final "re-upload" branch never fires.
     s3_keys = job.s3_keys or {}
     if isinstance(s3_keys, dict):
         for source_type in ("video", "short"):
             r2_key = s3_keys.get(source_type)
             if not r2_key:
+                continue
+            if not storage.object_exists(r2_key):
                 continue
             url = storage.generate_signed_url(r2_key, expiry_seconds=3600)
             if url:
@@ -6988,6 +6998,22 @@ async def restore_audio(
         job_id, job.tenant_id, target_key, size_bytes / 1024 / 1024,
         current_user.get("id"),
     )
+
+    # HOTFIX F4 2026-05-27 (audit): write an AuditLog row for forensics.
+    # Restore writes both the DB (input_r2_key when previously NULL) AND
+    # the R2 object — higher impact than a title typo. UMG compliance
+    # requires a trail. Same pattern as admin.cleanup_inputs / job.edit_request.
+    db.add(AuditLog(
+        user_id=current_user["id"],
+        action="job.restore_audio",
+        detail={
+            "job_id": job_id,
+            "key": target_key,
+            "size_mb": round(size_bytes / 1024 / 1024, 2),
+            "filename": audio.filename,
+        },
+    ))
+    db.commit()
 
     return {
         "job_id": job_id,
@@ -7640,6 +7666,16 @@ async def request_edit(
         # queries, the values must already be the corrected ones.
         # edit_params carries them too as a belt-and-suspenders for the
         # AuditLog detail (operator sees what was sent).
+        #
+        # HOTFIX F1 2026-05-27 (audit): the pre-edit capture for rollback
+        # MUST happen BEFORE the optimistic in-memory mutation below.
+        # The previous version captured `_pre_edit_artist = job.artist`
+        # AFTER the assignments, which left _pre_edit_artist holding the
+        # NEW value — making the rollback in the enqueue-failure branch
+        # a no-op that silently confirmed unsaved edits to the operator.
+        _pre_edit_artist = job.artist
+        _pre_edit_song_title = job.song_title
+
         new_artist = body.artist.strip() if body.artist is not None else None
         new_title = body.song_title.strip() if body.song_title is not None else None
         if new_artist:
@@ -7710,13 +7746,10 @@ async def request_edit(
             "metadata_only": _metadata_only,
         },
     ))
-    # PR C 2026-05-26: capture pre-edit metadata BEFORE the commit so the
-    # enqueue-failure rollback below can restore them. The handler
-    # optimistically wrote `job.artist`/`job.song_title` already (above)
-    # so the worker sees the new values; if the enqueue fails, restore.
-    if body.edit_type == "metadata":
-        _pre_edit_artist = job.artist
-        _pre_edit_song_title = job.song_title
+    # HOTFIX F1 2026-05-27 (audit): the pre-edit capture moved UP to
+    # before the in-memory mutation (search "_pre_edit_artist =" above).
+    # The old capture here was a no-op because it read AFTER the
+    # job.artist assignment.
     db.commit()
 
     try:
