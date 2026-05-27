@@ -6849,7 +6849,17 @@ async def get_source_audio_url(
         raise HTTPException(status_code=404, detail="Job not found")
 
     # 1. Try the original audio first (best quality, no render artifacts).
-    if job.input_r2_key:
+    #
+    # HOTFIX 2026-05-27: presign is unconditional (it just signs a URL
+    # without HEAD-ing the object), so a row whose input_r2_key points
+    # at a deleted R2 file was previously returning a 404'd URL — the
+    # editor opened mudo and the MP4 fallback never triggered. We now
+    # HEAD-probe before serving so a dead key falls through to the MP4
+    # branch correctly. ~50-200 ms cost per editor load is acceptable
+    # (one-shot per session) and is exactly the diagnostic agus.cafisi
+    # needed for his 26 jobs with set-but-DEAD input_r2_key (lifecycle
+    # GC after 30 d retention purged the originals).
+    if job.input_r2_key and storage.object_exists(job.input_r2_key):
         url = storage.generate_signed_url(job.input_r2_key, expiry_seconds=3600)
         if url:
             return {
@@ -6858,10 +6868,9 @@ async def get_source_audio_url(
                 "source": "input",
                 "fallback": False,
             }
-        # Storage was flaky for the input key — fall through to render
-        # fallback rather than 503. If a rendered MP4 exists we can still
-        # serve the editor; signed URLs are 1h-lived so next request
-        # retries the input naturally.
+        # Storage signed-URL helper returned None (storage disabled mid-
+        # request, etc.). Fall through to render fallback rather than
+        # 503 — if a rendered MP4 exists we can still serve the editor.
 
     # 2-3. Fallback to rendered MP4(s). Browsers play <audio src=".mp4">.
     s3_keys = job.s3_keys or {}
