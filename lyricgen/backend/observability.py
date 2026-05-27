@@ -294,7 +294,15 @@ def health_snapshot() -> dict:
             try:
                 from rq import Queue, Worker
                 queues = {}
-                for qname in ("enterprise", "default"):
+                # Audit 2026-05-26: previously only enterprise + default
+                # were tracked. transcription and bg_preview are real
+                # queues (worker.py:100-105 listens on them first) and
+                # users wait synchronously on the editor for transcription
+                # to drain. A pile-up there was invisible to /health and
+                # uptime — the 2026-05-26 stuck-transcription incident
+                # (3 jobs at 46m/2h/2h) wouldn't have shown in queue_depth
+                # at all. Include all 4 real queues now.
+                for qname in ("transcription", "bg_preview", "enterprise", "default"):
                     try:
                         queues[qname] = Queue(qname, connection=r).count
                     except Exception:

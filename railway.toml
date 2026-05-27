@@ -67,6 +67,29 @@ restartPolicyMaxRetries = 5
 # escribís en mayúscula o con otro casing, Railway ignora silenciosamente
 # el override y el servicio cae al [deploy] default sin healthcheck.
 
+# --- API watchPatterns ---
+#
+# Audit 2026-05-26: sin watchPatterns, la API redeploya en cualquier push
+# (incluso docs/*.md o cambios al README). Cada redeploy abre un 1-3 s
+# 502 window porque healthcheckTimeout=90 + healthchecks tardan
+# 25-45 s en pasar tras cold start (init_db + SQLAlchemy warm). Un PR
+# docs-only NO debe causar ese blip. Filtramos a lo que realmente
+# afecta el runtime del API.
+#
+# Igual que el Worker: paths relativos al REPO ROOT.
+#
+# VERIFICAR tras activar:
+#   1. Push docs-only → API NO redeploya.
+#   2. Push lyricgen/backend/** → API SÍ redeploya.
+#   3. Push lyricgen/frontend/** → API SÍ redeploya (sirve dist/).
+[services.api.build]
+watchPatterns = [
+    "lyricgen/backend/**",
+    "lyricgen/frontend/**",
+    "lyricgen/Dockerfile",
+    "railway.toml",
+]
+
 [services.api.deploy]
 healthcheckPath = "/health"
 # Zero-downtime deploys. Railway Pro's OVERLAP behavior boots the new

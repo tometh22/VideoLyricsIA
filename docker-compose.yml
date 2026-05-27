@@ -38,7 +38,11 @@ services:
       - VERTEX_PROJECT=${VERTEX_PROJECT}
       - VERTEX_LOCATION=${VERTEX_LOCATION:-us-central1}
       - GOOGLE_APPLICATION_CREDENTIALS=/secrets/vertex_credentials.json
-      - GENIUS_TOKEN=${GENIUS_TOKEN:-}
+      # Audit 2026-05-26: env var name must match what genius_fetch.py
+      # actually reads (GENIUS_API_TOKEN, not GENIUS_TOKEN). Previous
+      # name silently no-op'd — Genius lookups always fell through to
+      # the alt path.
+      - GENIUS_API_TOKEN=${GENIUS_API_TOKEN:-${GENIUS_TOKEN:-}}
       - MAX_UPLOAD_MB=${MAX_UPLOAD_MB:-50}
     volumes:
       - ./secrets:/secrets:ro
@@ -73,7 +77,11 @@ services:
       - VERTEX_PROJECT=${VERTEX_PROJECT}
       - VERTEX_LOCATION=${VERTEX_LOCATION:-us-central1}
       - GOOGLE_APPLICATION_CREDENTIALS=/secrets/vertex_credentials.json
-      - GENIUS_TOKEN=${GENIUS_TOKEN:-}
+      # Audit 2026-05-26: env var name must match what genius_fetch.py
+      # actually reads (GENIUS_API_TOKEN, not GENIUS_TOKEN). Previous
+      # name silently no-op'd — Genius lookups always fell through to
+      # the alt path.
+      - GENIUS_API_TOKEN=${GENIUS_API_TOKEN:-${GENIUS_TOKEN:-}}
       - WHISPER_FALLBACK_ENABLED=${WHISPER_FALLBACK_ENABLED:-1}
     volumes:
       - ./secrets:/secrets:ro
