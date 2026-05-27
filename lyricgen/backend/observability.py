@@ -133,6 +133,49 @@ def _within_startup_grace() -> bool:
     return (time.monotonic() - _PROCESS_START_TS) < STARTUP_GRACE_S
 
 
+# ─── Reaper heartbeat ──────────────────────────────────────────────────
+# El daemon thread del reaper (main.py:_reaper_loop) sweep cada 5 min.
+# Si muere silenciosamente (excepción raíz, OOM, deadlock, etc.) los
+# jobs trabados se acumulan indefinidamente y nadie se entera. Este
+# heartbeat captura el último tick exitoso del reaper para que health
+# pueda detectar el silencio.
+#
+# Flujo:
+#   - reaper_loop llama mark_reaper_ok() después de cada `_reap()` que
+#     no haya tirado excepción.
+#   - health_snapshot() compara `now - _REAPER_LAST_OK_TS` contra umbral.
+#   - Si supera 2 × intervalo configurado (default 10 min vs 5 min de
+#     loop) → degraded "reaper_stalled".
+#
+# Por qué `time.monotonic()` y no datetime: monotonic no es afectado por
+# adjusts del reloj del sistema. La métrica es "tiempo desde el último
+# tick", no "wall clock", así que monotonic es lo correcto.
+_REAPER_LAST_OK_TS: float | None = None
+# Umbral cuando el reaper se considera "stalled". 2× el intervalo del
+# loop (300s) + margen de 100s = 700s. Configurable por env si el
+# operador quiere tolerar más latencia (e.g., en staging con tráfico bajo).
+REAPER_STALLED_AFTER_S = int(os.environ.get("HEALTH_REAPER_STALLED_AFTER_S", "700"))
+
+
+def mark_reaper_ok() -> None:
+    """Reaper loop llama esto después de cada sweep exitoso.
+
+    Idempotente, thread-safe (asignación atómica de float en CPython).
+    No-op si se llama desde fuera del reaper — el thread name es la
+    única identificación pero no la chequeamos para no perder
+    flexibilidad (los tests también lo usan)."""
+    global _REAPER_LAST_OK_TS
+    _REAPER_LAST_OK_TS = time.monotonic()
+
+
+def reaper_seconds_since_last_ok() -> float | None:
+    """None si el reaper nunca tickeó (proceso recién arrancó); float
+    en segundos si ya tickeó al menos una vez."""
+    if _REAPER_LAST_OK_TS is None:
+        return None
+    return time.monotonic() - _REAPER_LAST_OK_TS
+
+
 def health_snapshot() -> dict:
     """Lightweight report of runtime health.
 
@@ -304,6 +347,32 @@ def health_snapshot() -> dict:
         }
     except Exception:
         pass
+
+    # Reaper heartbeat — daemon thread, dies with the container, NO retry.
+    # Sin un heartbeat observable, una muerte silenciosa del thread se
+    # traduce en jobs trabados sin alerta. Si el último tick fue hace más
+    # de REAPER_STALLED_AFTER_S, degraded "reaper_stalled".
+    #
+    # None (NULL) durante el primer minuto (cold start hace sleep(60)
+    # antes del primer sweep) — no degradar ahí para no falso-alertar.
+    secs = reaper_seconds_since_last_ok()
+    if secs is None:
+        # Tolerar 5 min de cold-start (sleep 60s + primer sweep ~30s +
+        # margen). Después de eso, si no tickeó es porque el thread no
+        # arrancó o murió antes del primer sweep.
+        cold_start_grace_s = 300
+        if (time.monotonic() - _PROCESS_START_TS) > cold_start_grace_s:
+            snap["reaper"] = "never_ticked"
+            _degrade("reaper_never_ticked")
+        else:
+            snap["reaper"] = "cold_start"
+    else:
+        snap["reaper"] = {
+            "seconds_since_last_ok": round(secs, 1),
+            "stalled_threshold_s": REAPER_STALLED_AFTER_S,
+        }
+        if secs > REAPER_STALLED_AFTER_S:
+            _degrade(f"reaper_stalled_{int(secs)}s")
 
     # External API keys — presence only (doesn't probe the API). A 1-RTT
     # probe per service would burn quota and add latency to every uptime

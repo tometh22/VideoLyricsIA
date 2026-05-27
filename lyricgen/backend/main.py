@@ -4,6 +4,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 import shutil
 import threading
 import time
@@ -451,11 +452,17 @@ def on_startup():
         # Brief delay so the very first request doesn't compete with
         # a cold-start reaper holding a DB connection.
         _time.sleep(60)
+        # Heartbeat: cada sweep exitoso bumpea un timestamp que
+        # /health lee. Sin esto una muerte silenciosa del thread no
+        # se detecta hasta que un operador nota jobs trabados horas
+        # después. Ver observability.py:mark_reaper_ok.
+        from observability import mark_reaper_ok as _heartbeat
         while True:
             try:
                 n = _reap()
                 if n > 0:
                     logger.warning(f"reaper killed {n} stuck job(s)")
+                _heartbeat()
             except Exception:  # pragma: no cover
                 try:
                     import sentry_sdk
@@ -3243,6 +3250,15 @@ async def upload(
     lyrics_animation: str = Form("none", max_length=16),
     line_transition: str = Form("none", max_length=16),
     text_contrast: str = Form("medium", max_length=16),
+    # Lyric text colors 2026-05-25. Hex `#RRGGBB` (7 chars), invalid input
+    # normalized to "" by the call site so build_ass falls back to defaults.
+    # max_length=8 keeps the validator's hex regex authoritative while
+    # rejecting payload abuse. INCIDENT 2026-05-26: missing Form params
+    # made every POST /upload reference the unbound local `lyric_color` →
+    # NameError → 500. The endpoint is deprecated (removal 2026-08-01) but
+    # still serviced; keep parity with /generate.
+    lyric_color: str = Form("", max_length=8),
+    lyric_sung_color: str = Form("", max_length=8),
     match_lyrics: bool = Form(True),
     background_hint: str = Form("", max_length=2000),
     bg_verbatim: bool = Form(False),
@@ -3917,9 +3933,18 @@ async def _run_transcription_for_job(
                 if _canonical:
                     try:
                         from pipeline import _gemini_cleanup_lyrics as _gcl
+                        # `_run_transcription_for_job`'s signature uses `title`,
+                        # not `song` — passing `song=song` raised NameError on
+                        # every call, the cleanup silently fell back to lrclib
+                        # raw, and the feature flag was effectively a no-op in
+                        # prod (incident 2026-05-26: every transcription log
+                        # showed "[WC] Gemini cleanup raised: name 'song' is
+                        # not defined — using lrclib raw"). _gcl's kwarg stays
+                        # `song=` because that's the public contract documented
+                        # in pipeline.py:3727; we just feed it the right local.
                         _cleaned = await asyncio.to_thread(
                             _gcl, tmp_path, _canonical,
-                            artist=artist, song=song,
+                            artist=artist, song=title,
                         )
                     except Exception as _e:
                         logger.warning("[WC] Gemini cleanup raised: %s — using lrclib raw", _e)
@@ -5354,6 +5379,14 @@ async def generate_with_segments(
     lyrics_animation: str = Form("none", max_length=16),
     line_transition: str = Form("none", max_length=16),
     text_contrast: str = Form("medium", max_length=16),
+    # Lyric text colors 2026-05-25. Hex `#RRGGBB` (7 chars), invalid input
+    # normalized to "" by the call site so build_ass falls back to defaults.
+    # INCIDENT 2026-05-26: missing Form params here made every POST
+    # /generate reference the unbound local `lyric_color` → NameError →
+    # 500. Prod users saw "Generando…" forever because the job was never
+    # enqueued. Same root cause as /upload sibling above; same fix.
+    lyric_color: str = Form("", max_length=8),
+    lyric_sung_color: str = Form("", max_length=8),
     match_lyrics: bool = Form(True),
     background_hint: str = Form("", max_length=2000),
     bg_verbatim: bool = Form(False),
@@ -5489,6 +5522,17 @@ async def generate_with_segments(
         job_row.umg_spec = umg_spec
         job_row.status = initial_status
         job_row.current_step = "queued"
+        # Audit 2026-05-26 (#388 wizard-duplicate-jobs): reset progress +
+        # error + last_progress_at on reuse. Without this, a double-fire
+        # of /generate on the same job_id can land here while a prior
+        # worker run had already written progress=N (e.g. 48) into the
+        # row — the operator sees "status=queued progress=48%" in admin,
+        # which is semantically impossible (queued = no worker ever
+        # touched it). Reset matches what /retry already does for the
+        # `error` → `processing` transition (main.py:7705-7711).
+        job_row.progress = 0
+        job_row.error = None
+        job_row.last_progress_at = datetime.now(timezone.utc)
         db.commit()
     else:
         job_id = create_job(
@@ -5565,11 +5609,25 @@ async def generate_with_segments(
     # just created (re-upload-on-generate bug), delete it so the operator
     # doesn't see a phantom "2nd job". Time-windowed so it never touches an
     # intentional re-upload of the same song later.
+    #
+    # Audit 2026-05-26 (#388 wizard-duplicate-jobs): sanitize the filename
+    # before the dedupe filter. `/upload-url` persists `Job.filename` via
+    # `_safe_basename` (main.py:2335 region) — strips directory components,
+    # control chars, length caps — while the direct-generate path here
+    # gets `existing_filename` from various sources that may or may not
+    # have been sanitized. Filter `Job.filename == filename` is a literal
+    # equality, so an unsanitized "Sin Gamulan/../foo.wav" vs sanitized
+    # "Sin_Gamulan_-_..." in DB silently misses every sibling draft —
+    # which is exactly how 4 jobs for the same audio ended up coexisting
+    # in prod 2026-05-26.
     try:
         from jobs import supersede_sibling_drafts
+        _dedup_filename = (
+            _safe_basename(existing_filename) if existing_filename else ""
+        )
         supersede_sibling_drafts(
             db, keep_job_id=job_id, user_id=current_user["id"],
-            tenant_id=current_user["tenant_id"], filename=existing_filename or "",
+            tenant_id=current_user["tenant_id"], filename=_dedup_filename,
         )
     except Exception as e:
         logger.warning("[DEDUP] supersede sibling drafts failed: %s", e)
@@ -6585,6 +6643,13 @@ class EditJobRequest(BaseModel):
     # only metadata). Defaults to False so the API fails closed with a
     # 409 — the frontend prompts the operator, who has to opt in.
     allow_youtube_drift: bool = False
+    # PR C 2026-05-26 (feat/edit-metadata): operator can fix a typo in
+    # the title card (artist / song_title) without re-uploading. Only
+    # used when edit_type=="metadata". max_length matches the DB columns
+    # exactly: Job.artist VARCHAR(255), Job.song_title VARCHAR(500).
+    # Both nullable — caller may send one, the other, or both.
+    artist: str | None = Field(default=None, max_length=255)
+    song_title: str | None = Field(default=None, max_length=500)
 
 
 class EnableProResRequest(BaseModel):
@@ -6762,11 +6827,14 @@ def get_waveform(
     First call per job downloads the MP3 from R2 and computes the envelope
     with librosa (a few seconds); the result is cached to R2 as
     waveform/{job_id}.json so every later open is a fast object fetch.
-    Owner / same-tenant only, same model as /source-audio-url.
+    PR feat/waveform-precompute 2026-05-27: the render pipeline now
+    pre-computes the envelope when the job flips to done/pending_review,
+    so the first operator-facing call to this endpoint is almost always
+    a cache hit (~200ms instead of 5-30s cold-cache cost).
+    Owner / same-tenant only, same auth model as /source-audio-url.
     """
-    import json as _json
-    import tempfile
     from database import Job as JobModel
+    from waveform_compute import compute_and_cache_waveform
 
     job = (
         db.query(JobModel)
@@ -6783,49 +6851,19 @@ def get_waveform(
     if not storage.is_enabled():
         raise HTTPException(status_code=503, detail="Object storage is unavailable.")
 
-    _N = 1000  # number of peak buckets the frontend draws
-    cache_key = f"waveform/{job_id}.json"
-
-    # Cache hit → return the precomputed envelope.
-    try:
-        if storage.object_exists(cache_key):
-            with tempfile.NamedTemporaryFile(suffix=".json", delete=True) as tf:
-                if storage.download_object(cache_key, tf.name):
-                    cached = _json.loads(open(tf.name, "r", encoding="utf-8").read())
-                    response.headers["Cache-Control"] = "private, max-age=86400"
-                    return cached
-    except Exception as exc:
-        logger.warning("[WAVEFORM] cache read failed for %s: %s", job_id, exc)
-
-    # Compute: download source audio, build a peak envelope.
-    with tempfile.NamedTemporaryFile(suffix=".audio", delete=True) as tf:
-        if not storage.download_object(job.input_r2_key, tf.name):
-            raise HTTPException(
-                status_code=422,
-                detail="El audio original ya no está en storage. Subí el MP3 de nuevo.",
-            )
-        try:
-            import librosa
-            import numpy as np
-            # 8 kHz mono is plenty for an amplitude envelope and keeps the
-            # load fast + memory small even for long tracks.
-            y, sr = librosa.load(tf.name, sr=8000, mono=True)
-        except Exception as exc:
-            logger.error("[WAVEFORM] librosa load failed for %s: %s", job_id, exc)
-            raise HTTPException(status_code=500, detail="No se pudo analizar el audio.")
-
-    duration = float(len(y) / sr) if sr else 0.0
-    from waveform_utils import peak_envelope
-    peaks = peak_envelope(np.abs(y), _N)
-    payload = {"peaks": peaks, "duration": round(duration, 3)}
-
-    # Cache to R2 (best-effort — a failed write just means we recompute).
-    try:
-        storage.put_object_bytes(
-            cache_key, _json.dumps(payload).encode("utf-8"), "application/json"
+    # Delegate cache + compute + cache-write to the shared helper. Pipeline
+    # uses the same function post-render so the cache key + payload shape
+    # stay in sync across both call paths.
+    payload = compute_and_cache_waveform(job.job_id, job.input_r2_key)
+    if payload is None:
+        # Distinguish the two failure modes the helper bundles together so
+        # the frontend can show a useful message. We re-check the source
+        # presence (the helper returned None if the audio could not be
+        # downloaded) and surface the same 422 the operator was used to.
+        raise HTTPException(
+            status_code=422,
+            detail="El audio original ya no está en storage. Subí el MP3 de nuevo.",
         )
-    except Exception as exc:
-        logger.warning("[WAVEFORM] cache write failed for %s: %s", job_id, exc)
 
     response.headers["Cache-Control"] = "private, max-age=86400"
     return payload
@@ -7089,34 +7127,52 @@ async def request_edit(
     )
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
-    valid_edit_types = ("typography", "background", "lyrics")
+    valid_edit_types = ("typography", "background", "lyrics", "metadata")
     if body.edit_type not in valid_edit_types:
         raise HTTPException(
             status_code=400,
             detail=f"edit_type must be one of {valid_edit_types}",
         )
 
-    # Status gate. Lyrics edit accepts a wider set of terminal-ish states
-    # so users can fix typos/timing on videos that already finished
-    # rendering (done, in approval queue, or even rejected) without
-    # having to re-upload the MP3. typography/background stay strict —
-    # they're billed as "edits in the review loop" and only make sense
-    # while the reviewer is still deciding.
-    if body.edit_type == "lyrics":
+    # Status gate. Lyrics and metadata edits accept a wider set of
+    # terminal-ish states so users can fix typos/timing on videos that
+    # already finished rendering (done, in approval queue, or even
+    # rejected) without having to re-upload the MP3. typography/background
+    # stay strict — they're billed as "edits in the review loop" and only
+    # make sense while the reviewer is still deciding.
+    if body.edit_type in ("lyrics", "metadata"):
         allowed = ("done", "pending_review", "rejected")
         if job.status not in allowed:
             raise HTTPException(
                 status_code=400,
                 detail=(
-                    f"Lyrics edit requires the job to be done, pending_review, "
-                    f"or rejected (current: {job.status})"
+                    f"{body.edit_type.capitalize()} edit requires the job to be done, "
+                    f"pending_review, or rejected (current: {job.status})"
                 ),
             )
+        # PR C 2026-05-26: metadata-specific validation. The handler must
+        # have at least one of artist/song_title set AND non-empty after
+        # trim; otherwise the re-render does nothing visible to the user.
+        if body.edit_type == "metadata":
+            new_artist = body.artist.strip() if body.artist is not None else None
+            new_title = body.song_title.strip() if body.song_title is not None else None
+            if new_artist is None and new_title is None:
+                raise HTTPException(
+                    status_code=400,
+                    detail="metadata edit requires at least one of 'artist' or 'song_title'",
+                )
+            if (new_artist is not None and not new_artist) or (
+                new_title is not None and not new_title
+            ):
+                raise HTTPException(
+                    status_code=400,
+                    detail="metadata fields must be non-empty after trimming whitespace",
+                )
         # YouTube API does not allow replacing an uploaded video's file
-        # (only metadata). Re-syncing lyrics on a published job would
-        # update R2 silently while YouTube continued serving the old
-        # out-of-sync cut. Fail closed; the frontend prompts the operator
-        # and retries with allow_youtube_drift=true if they confirm.
+        # (only metadata). Re-syncing lyrics OR re-rendering the title
+        # card on a published job would update R2 silently while YouTube
+        # continued serving the old cut. Fail closed; the frontend
+        # prompts the operator and retries with allow_youtube_drift=true.
         if job.youtube_data and not body.allow_youtube_drift:
             yt_url = (
                 job.youtube_data.get("url")
@@ -7127,10 +7183,10 @@ async def request_edit(
                 detail={
                     "code": "youtube_already_published",
                     "message": (
-                        "Job already published to YouTube. Lyrics re-sync "
-                        "will update the file in our platform but NOT "
-                        "replace the YouTube video. Pass "
-                        "allow_youtube_drift=true to proceed anyway."
+                        f"Job already published to YouTube. {body.edit_type.capitalize()} "
+                        f"edit will update the file in our platform but NOT "
+                        f"replace the YouTube video. Pass "
+                        f"allow_youtube_drift=true to proceed anyway."
                     ),
                     "youtube_url": yt_url,
                 },
@@ -7145,17 +7201,25 @@ async def request_edit(
     # Admins are exempt from the per-job edit cap (operators QA'ing a
     # render may need more than _MAX_EDITS passes). Regular users still
     # hit the limit and must approve/reject.
+    #
+    # PR C 2026-05-26: metadata edits do NOT consume an edit slot. A typo
+    # in the operator's own metadata is not the same as an aesthetic
+    # iteration over the video — penalizing one of the 3 limited edits
+    # for "fix the tilde" would frustrate operators who already spent
+    # their slots on typography/background/lyrics. AuditLog still records
+    # the metadata edit for traceability (`metadata_only=True`).
     _is_admin = current_user.get("role") == "admin"
-    if not _is_admin and current_edit_count >= _MAX_EDITS:
+    _metadata_only = body.edit_type == "metadata"
+    if not _is_admin and not _metadata_only and current_edit_count >= _MAX_EDITS:
         raise HTTPException(
             status_code=400,
             detail=f"Maximum edit limit ({_MAX_EDITS}) reached. Please approve or reject.",
         )
 
-    # Both typography and lyrics reuse the cached background. Without
+    # Typography, lyrics, and metadata reuse the cached background. Without
     # bg_r2_key_cached set, the worker can't avoid re-running Veo —
     # which defeats the point of these fast-path edits.
-    if body.edit_type in ("typography", "lyrics") and not job.bg_r2_key_cached:
+    if body.edit_type in ("typography", "lyrics", "metadata") and not job.bg_r2_key_cached:
         raise HTTPException(
             status_code=400,
             detail=(
@@ -7353,8 +7417,27 @@ async def request_edit(
         edit_params["bypass_content_validation"] = True
     if body.edit_type == "background" and body.force_content_validation:
         edit_params["force_content_validation"] = True
+    if body.edit_type == "metadata":
+        # PR C 2026-05-26 (feat/edit-metadata): persist the corrected
+        # artist/song_title onto the DB row BEFORE the worker spawns.
+        # `run_edit_pipeline` reads `job_row.artist` / `job_row.song_title`
+        # on its own DB session (pipeline.py:9101-9102) — by the time it
+        # queries, the values must already be the corrected ones.
+        # edit_params carries them too as a belt-and-suspenders for the
+        # AuditLog detail (operator sees what was sent).
+        new_artist = body.artist.strip() if body.artist is not None else None
+        new_title = body.song_title.strip() if body.song_title is not None else None
+        if new_artist:
+            job.artist = new_artist
+            edit_params["artist"] = new_artist
+        if new_title:
+            job.song_title = new_title
+            edit_params["song_title"] = new_title
 
-    new_edit_count = current_edit_count + 1
+    # PR C 2026-05-26: metadata edits do NOT bump edit_count (see
+    # rationale at the edit-cap gate above). All other types still
+    # consume a slot.
+    new_edit_count = current_edit_count if _metadata_only else current_edit_count + 1
 
     # Pre-flight check that the source audio is still in R2. Every edit
     # type (background/typography/lyrics) downloads the original WAV
@@ -7405,8 +7488,20 @@ async def request_edit(
             "edit_type": body.edit_type,
             "edit_params": edit_params,
             "edit_count": new_edit_count,
+            # PR C 2026-05-26: flag that distinguishes metadata-only
+            # edits from regular ones in the audit trail. UMG compliance
+            # cares about every artist/title mutation; this lets ops
+            # filter the log without parsing edit_params.
+            "metadata_only": _metadata_only,
         },
     ))
+    # PR C 2026-05-26: capture pre-edit metadata BEFORE the commit so the
+    # enqueue-failure rollback below can restore them. The handler
+    # optimistically wrote `job.artist`/`job.song_title` already (above)
+    # so the worker sees the new values; if the enqueue fails, restore.
+    if body.edit_type == "metadata":
+        _pre_edit_artist = job.artist
+        _pre_edit_song_title = job.song_title
     db.commit()
 
     try:
@@ -7438,6 +7533,15 @@ async def request_edit(
             # Defensive: _pre_edit_segments is only assigned when
             # body.segments was non-empty. Non-lyrics edits (typography,
             # background) skip that branch and don't need the rollback.
+            pass
+        # PR C 2026-05-26: same rollback for metadata. If the enqueue
+        # never landed, the visible artist/song_title in JobDetail would
+        # lie — operator clicks "Guardar título", error, but UI still
+        # shows the new title. Restore the original.
+        try:
+            job.artist = _pre_edit_artist
+            job.song_title = _pre_edit_song_title
+        except NameError:
             pass
         db.commit()
         raise HTTPException(

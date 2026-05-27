@@ -90,3 +90,53 @@ def test_supersede_only_same_user():
         assert "otheruser" in _ids(db)
     finally:
         _cleanup(db); db.close()
+
+
+def test_supersede_misses_when_filename_unsanitized_vs_sibling_sanitized():
+    """Regression for the 2026-05-26 4-jobs-for-one-audio incident.
+
+    `/upload-url` persists `Job.filename` via `_safe_basename` (strips
+    directory components, control chars, length-caps). The
+    direct-generate path (no upstream /upload-url) used to pass
+    `existing_filename` straight into supersede_sibling_drafts WITHOUT
+    sanitizing it first. A browser that sent ` ` vs `_` in the filename,
+    or a path-prefixed name, would silently miss the dedupe because
+    `Job.filename == filename` is a literal equality.
+
+    This test pins the contract: the CALLER of supersede must pass a
+    filename in the same shape as what `_safe_basename` would have
+    produced. We don't import _safe_basename here (it lives in main.py
+    which pulls FastAPI/etc.); we just simulate the divergence with
+    spaces-vs-underscores, which is the most common real-world case.
+    """
+    db = SessionLocal()
+    try:
+        _cleanup(db)
+        # Sibling row was persisted with the sanitized form (spaces → _).
+        _seed(db, job_id="keep_san",
+              status="queued", filename="Sin_Gamulan_-_Los_Abuelos.wav", age_min=1)
+        _seed(db, job_id="orphan_san",
+              status="transcribed_pending", filename="Sin_Gamulan_-_Los_Abuelos.wav", age_min=2)
+        # Caller passes the SANITIZED form → matches → orphan deleted.
+        n = supersede_sibling_drafts(
+            db, keep_job_id="keep_san", user_id=1, tenant_id=_T,
+            filename="Sin_Gamulan_-_Los_Abuelos.wav",
+        )
+        assert n == 1, "sanitized-on-both-sides should match"
+        assert _ids(db) == {"keep_san"}
+
+        # Reset and prove the negative: unsanitized caller misses.
+        _cleanup(db)
+        _seed(db, job_id="keep_un",
+              status="queued", filename="Sin_Gamulan_-_Los_Abuelos.wav", age_min=1)
+        _seed(db, job_id="orphan_un",
+              status="transcribed_pending", filename="Sin_Gamulan_-_Los_Abuelos.wav", age_min=2)
+        # Caller passes raw browser filename (spaces) → misses.
+        n = supersede_sibling_drafts(
+            db, keep_job_id="keep_un", user_id=1, tenant_id=_T,
+            filename="Sin Gamulan - Los Abuelos.wav",
+        )
+        assert n == 0, "unsanitized caller form does NOT match — that's the bug"
+        assert "orphan_un" in _ids(db)
+    finally:
+        _cleanup(db); db.close()
