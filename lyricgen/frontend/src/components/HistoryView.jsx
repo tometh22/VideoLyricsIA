@@ -1,6 +1,6 @@
-import { useState, useMemo, useEffect, useRef } from "react";
+import { useState, useMemo, useEffect, useRef, memo } from "react";
 import { useI18n } from "../i18n";
-import { useMediaUrl } from "../mediaUrl";
+import { useLazyMediaUrl } from "../mediaUrl";
 
 const API = import.meta.env.VITE_API_URL || "";
 
@@ -220,7 +220,7 @@ const DELETABLE = new Set([
   "editing", "transcribed_pending",
 ]);
 
-function VideoCard({ job, onSelect, onDelete, selected, onToggleSelect, t }) {
+function VideoCardImpl({ job, onSelect, onDelete, selected, onToggleSelect, t }) {
   // Prefer the structured fields the operator filled in / the backend
   // backfilled from the filename. Fall back to the legacy filename split
   // only for jobs that pre-date the song_title column.
@@ -247,7 +247,16 @@ function VideoCard({ job, onSelect, onDelete, selected, onToggleSelect, t }) {
   // (the user is requesting a re-render OF an existing video) so the
   // thumbnail is real, just temporarily stale.
   const showThumb = job.status === "done" || job.status === "pending_review" || job.status === "editing";
-  const thumbSrc = useMediaUrl(showThumb ? job.job_id : "", "thumbnail", "preview");
+  // 2026-05-27 Phase-3 audit: lazy mode — only fetches the /media-token
+  // once the card enters the viewport (200 px rootMargin so the
+  // thumbnail usually finishes loading before the user actually sees
+  // the card). For a 200-job history the operator who only scrolls to
+  // card 20 saves 180 network round-trips.
+  const { url: thumbSrc, ref: cardRef } = useLazyMediaUrl(
+    showThumb ? job.job_id : "",
+    "thumbnail",
+    "preview",
+  );
   const canDelete = DELETABLE.has(job.status);
 
   const handleDelete = (e) => {
@@ -264,6 +273,7 @@ function VideoCard({ job, onSelect, onDelete, selected, onToggleSelect, t }) {
 
   return (
     <div
+      ref={cardRef}
       role="button"
       tabIndex={0}
       onClick={() => onSelect(job.job_id, job.status)}
@@ -376,6 +386,20 @@ function VideoCard({ job, onSelect, onDelete, selected, onToggleSelect, t }) {
   );
 }
 
+// 2026-05-27 Phase-3 audit: VideoCard is rendered N times in HistoryView
+// (one per job, up to 200). Without memoization every history mutation
+// (one card status changing) re-renders ALL of them — wasting time
+// re-running the song/artist parsing + producing a flicker on the
+// virtualized lists. Memo with a custom comparator that ignores the
+// onSelect/onDelete/onToggleSelect callbacks (which are stable closures
+// in HistoryView's body) keeps re-renders to the cards that actually
+// changed.
+const VideoCard = memo(VideoCardImpl, (prev, next) => (
+  prev.job === next.job &&
+  prev.selected === next.selected &&
+  prev.t === next.t
+));
+
 // ProcessingThumbnail — aurora + equalizer placeholder para jobs sin
 // frame renderizado todavía. Operator feedback 2026-05-25: "las preview
 // en historial no tienen miniatura (las que están procesando), creemos
@@ -457,10 +481,17 @@ function MediaThumbnail({ jobId, status }) {
   // Para los demás (processing/queued/etc), saltearse el /media-token
   // request y dibujar el ProcessingThumbnail directamente.
   const hasMedia = status === "done" || status === "pending_review" || status === "editing";
-  const src = useMediaUrl(hasMedia ? jobId : "", "thumbnail", "preview");
+  // 2026-05-27 Phase-3 audit: lazy mode — token only fetched when the
+  // thumbnail container intersects the viewport. The ref attaches to
+  // the outer 120×70 wrapper.
+  const { url: src, ref: thumbRef } = useLazyMediaUrl(
+    hasMedia ? jobId : "",
+    "thumbnail",
+    "preview",
+  );
   const isReady = status === "done" || status === "pending_review";
   return (
-    <div className="w-[120px] h-[70px] shrink-0 rounded-lg overflow-hidden bg-surface-3/40 ring-1 ring-white/[0.06] relative group/thumb">
+    <div ref={thumbRef} className="w-[120px] h-[70px] shrink-0 rounded-lg overflow-hidden bg-surface-3/40 ring-1 ring-white/[0.06] relative group/thumb">
       {hasMedia && src ? (
         <img
           src={src}
@@ -490,7 +521,7 @@ function MediaThumbnail({ jobId, status }) {
 // texto generosas en el centro, badge + time + acción a la derecha.
 // Padding más respiratorio (~90px de altura total). Hover ring +
 // fade-in del botón acción. Click en row → JobDetail.
-function MediaRow({ job, onSelect, onDelete, selected, onToggleSelect, t }) {
+function MediaRowImpl({ job, onSelect, onDelete, selected, onToggleSelect, t }) {
   const fallbackName = (job.filename || "").replace(/\.(mp3|wav|m4a|flac|aac|ogg)$/i, "");
   let songName = (job.song_title || "").trim();
   let artistName = (job.artist || "").trim();
@@ -606,6 +637,15 @@ function MediaRow({ job, onSelect, onDelete, selected, onToggleSelect, t }) {
     </div>
   );
 }
+
+// Same memoization rationale as VideoCard above — MediaRow is rendered
+// up to 200× in table view, and per-row updates shouldn't fan out to
+// the entire bucket.
+const MediaRow = memo(MediaRowImpl, (prev, next) => (
+  prev.job === next.job &&
+  prev.selected === next.selected &&
+  prev.t === next.t
+));
 
 
 const FILTERS = [
