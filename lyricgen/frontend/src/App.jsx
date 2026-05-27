@@ -322,6 +322,24 @@ function AppShell({ user, sidebarOpen, setSidebarOpen, onLogout }) {
                 <span className="text-xs text-gray-500">{user.username}</span>
               </div>
             )}
+            {/* Topbar logout (audit F P0-4 2026-05-27): always reachable, even
+                when the sidebar is collapsed on mobile or when `user` is null
+                in a transient half-state. The sidebar already has a logout
+                inside its `{user && ...}` block; this one is a defense-in-
+                depth fallback so the operator is never locked in.
+                Icon mirrors Sidebar.jsx:159-161 for visual consistency. */}
+            {onLogout && (
+              <button
+                onClick={onLogout}
+                title={t("nav.logout") || "Cerrar sesión"}
+                aria-label={t("nav.logout") || "Cerrar sesión"}
+                className="text-gray-500 hover:text-red-400 transition-colors p-1.5 rounded-lg hover:bg-white/[0.04]"
+              >
+                <svg className="w-4 h-4" fill="none" stroke="currentColor" strokeWidth="1.5" viewBox="0 0 24 24">
+                  <path d="M17 16l4-4m0 0l-4-4m4 4H7m6 4v1a3 3 0 01-3 3H6a3 3 0 01-3-3V7a3 3 0 013-3h4a3 3 0 013 3v1" strokeLinecap="round" strokeLinejoin="round"/>
+                </svg>
+              </button>
+            )}
           </div>
         </header>
 
