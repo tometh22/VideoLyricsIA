@@ -625,17 +625,30 @@ const translations = {
     "editor.focus_exit": "Salir de modo enfoque (F)",
     // 2026-05-25 PR-3 — Historial tabla densa + search + sort.
     "history.search_placeholder": "Buscar artista, canción o ID…",
-    // 2026-05-25 — Generating hero (BatchProgress SingleGeneratingHero).
-    // Mensajes rotativos del step cycling + label + ETA fallback.
-    // Build CI exige que toda clave referenciada exista en ES como mínimo.
+    // 2026-05-27 — Generating hero (BatchProgress SingleGeneratingHero).
+    // Honest per-step progress. The component reads `current_step` /
+    // `step_text_es` / `eta_s` from the SSE payload and maps to these
+    // strings. NO MORE cycling through irrelevant steps. See
+    // `step_eta.py` (backend) for the source of truth on step names
+    // and typical durations.
     "hero.label": "Construyendo tu video",
-    "hero.eta_default": "Unos minutos…",
     "hero.song_unknown": "Tu canción",
-    "hero.step_isolating": "Aislando la voz del audio",
-    "hero.step_lyrics": "Buscando la letra",
-    "hero.step_align": "Sincronizando palabras con el ritmo",
+    // ETA formatting (matches `step_eta.format_eta_es`).
+    "hero.eta_default": "Unos minutos…",
+    "hero.eta_almost_done": "Casi listo…",
+    "hero.eta_seconds": "seg restantes",
+    "hero.eta_minutes": "min restantes",
+    // Per-step user-facing text. `step_text_es` from the backend wins
+    // when present; these are the fallback for old worker versions or
+    // unknown steps. The "step_default" is the generic catch-all.
+    "hero.step_default": "Procesando…",
+    "hero.step_starting": "Preparando…",
     "hero.step_bg": "Generando el fondo cinematográfico",
-    "hero.step_render": "Componiendo el video final",
+    "hero.step_validation": "Validando contenido",
+    "hero.step_video": "Armando el video",
+    "hero.step_short": "Generando el Short",
+    "hero.step_thumbnail": "Creando la miniatura",
+    "hero.step_upload": "Guardando en tu galería",
     // 2026-05-25 — Editor: versión corta del "Aplicar todas" cuando
     // hay poco espacio + hint del minimapa de timeline.
     "editor.autofix_apply_all_short": "Aplicar todas",
