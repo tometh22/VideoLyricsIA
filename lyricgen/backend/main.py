@@ -25,9 +25,34 @@ ENVIRONMENT = os.environ.get("ENVIRONMENT", "production").lower().strip() or "pr
 _SENTRY_DSN = os.environ.get("SENTRY_DSN", "")
 if _SENTRY_DSN:
     import sentry_sdk
+    # 2026-05-27 Wave-0 observability audit (UMG perf complaint): the
+    # pre-fix init had NO integrations beyond the default — FastAPI
+    # routes weren't auto-traced and SQLAlchemy queries weren't
+    # captured as spans, so the Sentry Performance dashboard had no
+    # visibility into which endpoint or query was actually slow on
+    # prod. With the three integrations below every request lands as
+    # a transaction named by its route template, with child spans for
+    # each DB query — making the next perf audit data-driven instead
+    # of speculative.
+    from sentry_sdk.integrations.fastapi import FastApiIntegration
+    from sentry_sdk.integrations.starlette import StarletteIntegration
+    from sentry_sdk.integrations.sqlalchemy import SqlalchemyIntegration
     sentry_sdk.init(
         dsn=_SENTRY_DSN,
         traces_sample_rate=float(os.environ.get("SENTRY_TRACES_RATE", "0.1")),
+        # profiles_sample_rate off by default (0.0). Flip to 0.05-0.1
+        # temporarily when investigating CPU hotspots — profiling adds
+        # measurable overhead to each sampled request.
+        profiles_sample_rate=float(os.environ.get("SENTRY_PROFILES_RATE", "0.0")),
+        # send_default_pii=False keeps email/IP out of Sentry events
+        # (UMG-grade compliance). When debugging specific operators we
+        # call sentry_sdk.set_user explicitly to attach just tenant_id.
+        send_default_pii=False,
+        integrations=[
+            FastApiIntegration(transaction_style="endpoint"),
+            StarletteIntegration(transaction_style="endpoint"),
+            SqlalchemyIntegration(),
+        ],
         # SENTRY_ENV overrides ENVIRONMENT only if explicitly set (back-compat).
         environment=os.environ.get("SENTRY_ENV") or ENVIRONMENT,
         release=os.environ.get("SENTRY_RELEASE", "genly@2.0.0"),
@@ -370,6 +395,32 @@ async def _disconnect_receive():
 
 
 app.add_middleware(DbTransientRetryMiddleware)
+
+
+# --- Server-Timing header middleware ---
+# 2026-05-27 Wave-0 observability audit: every response now carries
+# `X-Response-Time: <ms>` so frontend RUM / DevTools Network panel can
+# attribute round-trip latency between "server thought" vs "network in
+# transit" vs "browser parse". Adding this is cheap (sub-millisecond
+# per request) and unblocks debugging slow endpoints WITHOUT needing
+# Sentry tracing access for every operator.
+#
+# The standard `Server-Timing` header would also work (and shows up in
+# Chrome DevTools natively under Network → Timing → "Server"), but
+# X-Response-Time is what existing dashboards (Datadog, Grafana) often
+# parse out of the box. We emit BOTH so either consumer wins.
+@app.middleware("http")
+async def add_response_time_header(request: Request, call_next):
+    import time as _t
+    _start = _t.perf_counter()
+    response = await call_next(request)
+    elapsed_ms = (_t.perf_counter() - _start) * 1000.0
+    # Round to 1 decimal so the header doesn't churn on every request
+    # (helps caches that key on response headers — irrelevant here but
+    # cheap to keep stable).
+    response.headers["X-Response-Time"] = f"{elapsed_ms:.1f}ms"
+    response.headers["Server-Timing"] = f"app;dur={elapsed_ms:.1f}"
+    return response
 
 
 # --- Include routers ---
@@ -2877,12 +2928,20 @@ async def transcribe_uploaded(
         db.close()
         try:
             from queue_jobs import enqueue_transcription
+            # HOTFIX 2026-05-27: use the Job row as the single source of
+            # truth for artist/title. Previously we accepted body.artist /
+            # body.title from the request, which let the frontend send
+            # different metadata than what /upload-url committed to the
+            # row — opening a path where two transcription jobs ended up
+            # in queue with swapped metadata (agus.cafisi incident 16:42).
+            # Any client-side correction must now go through PATCH
+            # /jobs/{id} BEFORE calling /transcribe-uploaded.
             enqueue_transcription(
                 job_id,
                 audio_path,
                 language=body.language,
-                artist=body.artist,
-                title=body.title,
+                artist=job_row.artist or "",
+                title=job_row.song_title or "",
                 filename=job_row.filename,
                 tenant_id=current_user.get("tenant_id", ""),
             )
@@ -2915,9 +2974,15 @@ async def transcribe_uploaded(
         # opens its own short-lived session for the only DB touch it needs.
         db.close()
 
+        # HOTFIX 2026-05-27: same source-of-truth fix as the async path —
+        # use job_row.artist / job_row.song_title (committed at /upload-url
+        # time), NOT body.artist / body.title which can diverge from the
+        # row and create ghost jobs.
         return await _run_transcription_for_job(
             request, current_user, job_id, audio_path,
-            language=body.language, artist=body.artist, title=body.title,
+            language=body.language,
+            artist=job_row.artist or "",
+            title=job_row.song_title or "",
         )
     finally:
         _release_transcription_slot(transcription_lease)

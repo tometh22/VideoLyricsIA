@@ -154,6 +154,27 @@ def test_no_tenant_id_skips_db_lookup():
     assert t == "Y"
 
 
+def test_agus_cafisi_underscore_with_double_spaces():
+    """Regression test — hotfix 2026-05-27.
+
+    User agus.cafisi uploaded `Un Pacto Live In Buenos Aires  2001_Bersuit
+    Vergarabat.wav` (note double space before 2001 — Bersuit album
+    naming). Two transcription jobs got created (one with artist/title
+    swapped) because the FRONTEND's parseFilename used the opposite
+    underscore convention than the backend. This test locks the backend
+    convention so a future refactor doesn't drift.
+
+    Frontend regression covered separately by
+    `lyricgen/frontend/src/components/UploadZoneParser.test.jsx`.
+    """
+    a, t = _parse_filename_artist_title(
+        "Un Pacto Live In Buenos Aires  2001_Bersuit Vergarabat.wav"
+    )
+    assert a == "Bersuit Vergarabat", f"expected artist='Bersuit Vergarabat', got {a!r}"
+    assert t == "Un Pacto Live In Buenos Aires  2001", \
+        f"expected title='Un Pacto Live In Buenos Aires  2001', got {t!r}"
+
+
 def test_legalicenla_real_world_case():
     """Caso concreto del audit 2026-05-25: el operador previamente subió
     'Una Vez Mas' que parseaba bien (underscore Rata Blanca-style) →
