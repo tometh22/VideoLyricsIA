@@ -598,6 +598,12 @@ export const translations = {
     "history.videos": "videos",
     "history.empty": "No hay videos en el historial",
     "history.loading": "Cargando historial…",
+    // 2026-05-27 — Slow-load fallback in HistoryView. Shown when the
+    // initial /jobs fetch has been spinning > 15 s. Audit "UMG perf
+    // complaint": the operator stared at a generic spinner thinking
+    // the page was dead; now they see skeleton cards + a clear hint
+    // that we know it's slow plus a manual retry button.
+    "history.loading_slow": "El servidor está demorando más de lo normal. Probá recargar.",
     "history.load_failed_subtitle": "No pudimos cargar tu historial",
     "history.done": "Listo",
     "history.error": "Error",

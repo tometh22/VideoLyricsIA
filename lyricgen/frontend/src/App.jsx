@@ -360,7 +360,7 @@ function JobDetailRoute({ fetchHistory }) {
 // dentro del Studio Console en vez de un modal separado con UX distinta.
 // Pasos 1, 2, 3, 5 quedan lockeados desde App (vía currentReview.
 // editingJobId) y el preview central muestra el MP4 ya renderizado.
-function EditLyricsRoute({ setCurrentReview, wizardScreen, t }) {
+function EditLyricsRoute({ setCurrentReview, setWizardStage, wizardScreen, t }) {
   const { id } = useParams();
   const navigate = useNavigate();
   // status: "loading" | "ready" | "no_segments" | "not_editable" |
@@ -426,7 +426,7 @@ function EditLyricsRoute({ setCurrentReview, wizardScreen, t }) {
       let job;
       try {
         job = await statusRes.json();
-      } catch {
+      } catch (jerr) {
         if (alive) setState({ status: "error" });
         return;
       }
@@ -438,7 +438,10 @@ function EditLyricsRoute({ setCurrentReview, wizardScreen, t }) {
         job.status === "pending_review" ||
         job.status === "done" ||
         job.status === "rejected";
-      if (!editable) { setState({ status: "not_editable", jobStatus: job.status }); return; }
+      if (!editable) {
+        setState({ status: "not_editable", jobStatus: job.status });
+        return;
+      }
 
       // Sin segments_json no hay nada que editar — mismo banner amber
       // que mostraba el modal anterior, sin redirect silencioso.
@@ -479,6 +482,15 @@ function EditLyricsRoute({ setCurrentReview, wizardScreen, t }) {
         transcribeJobId: null,
         referenceLyrics: "",
       });
+      // CRITICAL FIX 2026-05-27 (fix/edit-lyrics-set-wizard-stage): el
+      // wizardScreen lee wizardStage para decidir qué renderear (upload
+      // = UploadZone "Crear videos"; review = panel con LyricsEditor).
+      // Sin esta llamada, currentReview.editingJobId queda set pero
+      // wizardStage permanece en "upload" → el operador ve "Crear videos"
+      // en vez del editor. Bug reproducido en multi-browser/multi-user;
+      // logs [WIZARD-RENDER] del PR #406 confirmaron wizardStage=upload
+      // post setCurrentReview.
+      setWizardStage("review");
       setState({ status: "ready" });
 
       // Fase B — enhancements: fire-and-forget. Each fetch has a 15 s cap
@@ -520,13 +532,42 @@ function EditLyricsRoute({ setCurrentReview, wizardScreen, t }) {
   // siguiente /new arranque limpio y no resuma sobre el edit a medias. Los
   // edits no se pierden — el autosave del LyricsEditor los persiste a
   // /save-segments cada 3s, y la próxima visita a /edit-lyrics los re-fetchea.
+  //
+  // RACE GUARD 2026-05-27 (fix/edit-lyrics-bootstrap-race): bug reportado en
+  // prod donde /edit-lyrics renderea "Crear videos" en lugar del editor.
+  // Hipótesis: en React 18 con StrictMode + concurrent rendering, el cleanup
+  // del useEffect con `[]` deps puede correr en momentos inesperados (e.g.
+  // entre el setCurrentReview de Phase A y el siguiente render) y deja
+  // currentReview=null. Resultado: wizardScreen renderea UploadZone con
+  // hasReviewableContent=false, mostrando paso 1 ("Crear videos").
+  //
+  // Fix: deps `[id]` para que el cleanup capture el `myId` actual y SOLO
+  // limpie si el currentReview todavía refleja ESE id específico — evita
+  // clobber si por algún ciclo el setCurrentReview ya cambió a otro
+  // editingJobId. También evita el caso de "navigate /edit-lyrics/X →
+  // /edit-lyrics/Y" donde el cleanup con id viejo no debe tocar el
+  // currentReview con id nuevo.
   useEffect(() => {
+    const myId = id;
     return () => {
-      setCurrentReview((r) => (r?.editingJobId ? null : r));
-      wizardPersistence.clear();
+      let didClear = false;
+      setCurrentReview((r) => {
+        if (!r) return r;
+        if (r.editingJobId !== myId) return r;
+        didClear = true;
+        return null;
+      });
+      // Solo resetear wizardStage si efectivamente limpiamos NUESTRO
+      // currentReview. Si el cleanup corre tarde y el currentReview ya
+      // refleja otro id (operador navegó a otro /edit-lyrics), no tocar
+      // el wizardStage de la sesión nueva.
+      if (didClear) {
+        setWizardStage("upload");
+        wizardPersistence.clear();
+      }
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
+  }, [id]);
 
   if (state.status === "loading") {
     return <div className="w-12 h-12 mx-auto mt-16 border-2 border-brand border-t-transparent rounded-full animate-spin" />;
@@ -2735,6 +2776,7 @@ export default function App() {
           <Route path="/videos/:id/edit-lyrics" element={
             <EditLyricsRoute
               setCurrentReview={setCurrentReview}
+              setWizardStage={setWizardStage}
               wizardScreen={wizardScreen}
               t={t}
             />

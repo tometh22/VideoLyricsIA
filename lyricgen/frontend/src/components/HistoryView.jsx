@@ -665,6 +665,25 @@ export default function HistoryView({
   const isInitialLoading = !historyLoaded && !historyError;
   const isLoadFailed = historyError && history.length === 0;
 
+  // Track how long the initial load has been spinning. After 15 s we
+  // swap the skeleton's footer copy to acknowledge the slowness ("el
+  // servidor está demorando…") + a manual reload button — saves the
+  // operator from staring at a placeholder grid wondering if the page
+  // is dead. Audit 2026-05-27 (UMG perf complaint).
+  const [loadingElapsedSec, setLoadingElapsedSec] = useState(0);
+  useEffect(() => {
+    if (!isInitialLoading) {
+      setLoadingElapsedSec(0);
+      return;
+    }
+    const start = Date.now();
+    const iv = setInterval(() => {
+      setLoadingElapsedSec(Math.floor((Date.now() - start) / 1000));
+    }, 1000);
+    return () => clearInterval(iv);
+  }, [isInitialLoading]);
+  const showSlowHint = loadingElapsedSec >= 15;
+
   // GHOST jobs — bg_preview_* son ghost jobs del feature Capa C
   // (pre-render del fondo mientras editás lyrics). El comentario en
   // jobs.py:55 dice "Should NOT appear in the user's history normally
@@ -954,11 +973,46 @@ export default function HistoryView({
           The error branch must beat the empty branch so a slow /jobs
           never silently masquerades as "you have no videos". */}
       {isInitialLoading ? (
-        <div className="rounded-card p-14 text-center bg-surface-2/30 ring-1 ring-white/[0.04]">
-          <div className="w-10 h-10 mx-auto mb-4 border-2 border-brand border-t-transparent rounded-full animate-spin" />
-          <p className="text-sm text-ink-secondary">
-            {t("history.loading") || "Cargando historial…"}
-          </p>
+        /* Skeleton — UI matches the actual layout (table vs grid) so the
+           swap to real rows is shape-stable. After 15 s the footer
+           gains a "tomando más de lo normal" hint + Reintentar button
+           so the operator knows we're not dead. Audit 2026-05-27. */
+        <div>
+          {view === "table" ? (
+            <div className="space-y-1.5">
+              {Array.from({ length: 8 }).map((_, i) => (
+                <div
+                  key={i}
+                  className="h-16 rounded-card bg-surface-2/40 ring-1 ring-white/[0.03] animate-pulse"
+                />
+              ))}
+            </div>
+          ) : (
+            <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-3">
+              {Array.from({ length: 6 }).map((_, i) => (
+                <div
+                  key={i}
+                  className="aspect-video rounded-card bg-surface-2/40 ring-1 ring-white/[0.03] animate-pulse"
+                />
+              ))}
+            </div>
+          )}
+          {showSlowHint && (
+            <div className="mt-6 rounded-card p-5 text-center bg-amber-500/[0.04] ring-1 ring-amber-500/15">
+              <p className="text-sm text-ink-secondary mb-3">
+                {t("history.loading_slow") ||
+                  "El servidor está demorando más de lo normal. Probá recargar."}
+              </p>
+              {onRetryHistory && (
+                <button
+                  onClick={onRetryHistory}
+                  className="text-xs text-brand-light hover:text-white transition-colors underline-offset-2 hover:underline"
+                >
+                  {t("dash.retry") || "Reintentar"}
+                </button>
+              )}
+            </div>
+          )}
         </div>
       ) : isLoadFailed ? (
         <div className="rounded-card p-10 text-center bg-amber-500/[0.06] ring-1 ring-amber-500/25">
