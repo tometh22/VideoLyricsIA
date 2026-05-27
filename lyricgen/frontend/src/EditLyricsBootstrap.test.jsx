@@ -40,7 +40,7 @@ import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 // this needs to change too; the contract being pinned is "Phase A mounts
 // regardless of enhancement latency".
 // ---------------------------------------------------------------------------
-function makeBootstrap({ authFetchWithTimeout, setState, setCurrentReview, API = "https://api.test" }) {
+function makeBootstrap({ authFetchWithTimeout, setState, setCurrentReview, setWizardStage = () => {}, API = "https://api.test" }) {
   return async function bootstrap(id, { aliveRef, reusableSnap = false, snap = null } = {}) {
     const alive = () => (aliveRef ? aliveRef.alive : true);
     setState({ status: "loading" });
@@ -87,6 +87,11 @@ function makeBootstrap({ authFetchWithTimeout, setState, setCurrentReview, API =
       bgUrl: null,
       font: params.font || "",
     });
+    // The wizardScreen reads wizardStage to decide what to render. Without
+    // this call, currentReview.editingJobId is set but the wizard stays in
+    // "upload" stage and shows UploadZone ("Crear videos") instead of the
+    // editor. Bug reproduced 2026-05-27, fixed in fix/edit-lyrics-set-wizard-stage.
+    setWizardStage("review");
     setState({ status: "ready" });
 
     // Phase B — fire-and-forget.
@@ -233,6 +238,37 @@ describe("EditLyricsRoute bootstrap — Phase A mounts before Phase B", () => {
     await bootstrap("abc123");
     expect(setState).toHaveBeenCalledWith({ status: "no_segments" });
     expect(setCurrentReview).not.toHaveBeenCalled();
+  });
+
+  it("Phase A success: calls setWizardStage('review') so wizardScreen renders the editor", async () => {
+    // REGRESSION 2026-05-27 (fix/edit-lyrics-set-wizard-stage): bug en prod
+    // donde EditLyricsRoute seteaba currentReview.editingJobId pero nunca
+    // le decía al wizardStage de App.jsx que pasara de "upload" a "review".
+    // Resultado: el wizardScreen seguía rendereando UploadZone ("Crear
+    // videos"). Pin del contrato: Phase A success DEBE llamar
+    // setWizardStage("review") para que el editor se monte.
+    const setWizardStage = vi.fn();
+    authFetchWithTimeout = vi.fn((url) => {
+      if (url.includes("/status/")) return ok(VALID_JOB);
+      return ok({});
+    });
+    const bootstrap = makeBootstrap({ authFetchWithTimeout, setState, setCurrentReview, setWizardStage });
+    await bootstrap("abc123");
+    expect(setWizardStage).toHaveBeenCalledWith("review");
+    // Debe llamarse ANTES de setState(ready) para que el wizardScreen vea
+    // el stage nuevo en el render que dispara setState(ready).
+    const stageCallOrder = setWizardStage.mock.invocationCallOrder[0];
+    const readyCall = setState.mock.calls.findIndex(([s]) => s && s.status === "ready");
+    const readyCallOrder = setState.mock.invocationCallOrder[readyCall];
+    expect(stageCallOrder).toBeLessThan(readyCallOrder);
+  });
+
+  it("not_editable: does NOT call setWizardStage (stays in 'upload')", async () => {
+    const setWizardStage = vi.fn();
+    authFetchWithTimeout = vi.fn(() => ok({ status: "transcribing", segments_json: [] }));
+    const bootstrap = makeBootstrap({ authFetchWithTimeout, setState, setCurrentReview, setWizardStage });
+    await bootstrap("abc123");
+    expect(setWizardStage).not.toHaveBeenCalled();
   });
 
   it("race guard: enhancement that lands after navigating to other id is a no-op", async () => {

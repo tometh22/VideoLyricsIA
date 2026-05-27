@@ -370,7 +370,11 @@ function JobDetailRoute({ fetchHistory }) {
     );
   }
   if (!job) {
-    return <div className="w-12 h-12 mx-auto mt-16 border-2 border-brand border-t-transparent rounded-full animate-spin" />;
+    return (
+      <div className="flex items-center justify-center min-h-[50vh]">
+        <div className="w-12 h-12 border-2 border-brand border-t-transparent rounded-full animate-spin" />
+      </div>
+    );
   }
   return (
     <div className="flex justify-center">
@@ -610,7 +614,11 @@ function EditLyricsRoute({ setCurrentReview, setWizardStage, wizardScreen, t }) 
   }, [id]);
 
   if (state.status === "loading") {
-    return <div className="w-12 h-12 mx-auto mt-16 border-2 border-brand border-t-transparent rounded-full animate-spin" />;
+    return (
+      <div className="flex items-center justify-center min-h-[50vh]">
+        <div className="w-12 h-12 border-2 border-brand border-t-transparent rounded-full animate-spin" />
+      </div>
+    );
   }
   if (state.status === "not_found") {
     return (
@@ -1059,6 +1067,41 @@ export default function App() {
     setToken(newToken);
     setUser(newUser);
   };
+
+  // Self-heal: if we have a valid token but the user object is missing
+  // (genly_user got cleared, localStorage got partially purged across
+  // tabs, an old build saved only the token, etc.), the UI ends up in
+  // a broken half-state where the sidebar's `{user && ...}` blocks
+  // don't render — meaning no plan badge, no username, and NO logout
+  // button. This left agus.cafisi stranded 2026-05-27: he could
+  // operate the app but couldn't log out.
+  //
+  // Recovery: ask /auth/me for the canonical user record, save it
+  // back to localStorage, and unblock the UI. If /auth/me returns
+  // 401 the token is also dead, so we drop into the regular logout
+  // path. Runs once per page load.
+  const authMeRefetchedRef = useRef(false);
+  useEffect(() => {
+    if (!token || user || authMeRefetchedRef.current) return;
+    authMeRefetchedRef.current = true;
+    authFetch(`${API}/auth/me`)
+      .then((r) => {
+        if (r.status === 401) {
+          handleLogout("expired");
+          return null;
+        }
+        if (!r.ok) return null;
+        return r.json();
+      })
+      .then((data) => {
+        if (data && data.username) {
+          localStorage.setItem("genly_user", JSON.stringify(data));
+          setUser(data);
+        }
+      })
+      .catch(() => { /* swallow; next page load will retry */ });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [token, user]);
 
   // reason="expired" → /login so the user can re-authenticate immediately.
   // reason="manual" (default) → / (landing page) for intentional logouts.

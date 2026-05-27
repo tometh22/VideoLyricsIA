@@ -1,16 +1,22 @@
 /**
  * Regression test for the `parseFilename` heuristic in UploadZone.jsx.
  *
- * Incident 2026-05-24 (Viejas Locas / Legalícenla): the previous parser
- * inverted artist/title roles between the ` - ` and `_` separators. A
- * file named `Viejas Locas_Legalícenla.mp3` (the common `Artist_Title`
- * convention) produced artist="Legalícenla", title="Viejas Locas". The
- * lrclib lookup failed and the pipeline degraded to whisperX-only,
- * shipping "Le realicen la..." instead of the actual chorus.
+ * HOTFIX 2026-05-27: PR #286 was wrong. It unified BOTH separators to
+ * `head=artist`, but the backend's `_parse_filename_artist_title`
+ * (lyricgen/backend/main.py:1537-1539 + docstring at 1500-1508)
+ * documents and implements DIFFERENT conventions per separator:
+ *   - " - " → "Artist - Title"   (head=artist)
+ *   - "_"   → "Title_Artist"     (head=title, tail=artist)  ← YouTube/Suno
  *
- * PR #286 unified the convention: head is ALWAYS the artist, regardless
- * of separator. Backend swap-retry (PR #280) remains as a second line
- * of defense for hand-edited cases.
+ * The frontend's incorrect unification meant /upload-url got the
+ * frontend's wrong (artist, title) and committed them to the Job row,
+ * while a second job got created later with the backend's correct parse
+ * — resulting in two competing jobs for one audio, and the UI showing
+ * "subiendo" forever because the frontend didn't know which to follow.
+ * Surfaced 2026-05-27 16:42 by user agus.cafisi with file
+ * `Un Pacto Live In Buenos Aires  2001_Bersuit Vergarabat.wav`.
+ *
+ * This file now locks in the CORRECT convention matching the backend.
  *
  * This is a behavioural test against the COPIED implementation —
  * UploadZone.jsx itself is a big component that we don't want to mount
@@ -50,9 +56,10 @@ const parseFilename = (filename) => {
     artist = head.trim();
     song = rest.join(" - ").trim();
   } else if (name.includes("_")) {
+    // YouTube / Suno convention: "Title_Artist". head=title, tail=artist.
     const [head, ...rest] = name.split("_");
-    artist = head.trim();
-    song = rest.join("_").trim();
+    song = head.trim();
+    artist = rest.join("_").trim();
   }
   song = _stripNoise(song);
   artist = _stripNoise(artist);
@@ -61,13 +68,25 @@ const parseFilename = (filename) => {
 
 
 describe("parseFilename", () => {
-  it("Bug regression: `Artist_Title.mp3` no longer inverts roles", () => {
-    // The exact filename pattern that caused the original incident.
-    // Before PR #286: artist='Legalícenla', song='Viejas Locas'.
-    // After PR #286: artist='Viejas Locas', song='Legalícenla'.
+  it("Underscore convention: `Title_Artist.ext` matches backend", () => {
+    // YouTube/Suno export convention — tail is the artist.
+    // Backend: lyricgen/backend/main.py:1537-1539 (docstring 1500-1508).
     expect(parseFilename("Viejas Locas_Legalícenla.mp3")).toEqual({
-      artist: "Viejas Locas",
-      song: "Legalícenla",
+      artist: "Legalícenla",
+      song: "Viejas Locas",
+    });
+  });
+
+  it("Regression: agus.cafisi incident filename (2026-05-27 16:42)", () => {
+    // Exact filename that triggered the dual-job creation incident.
+    // Before hotfix: frontend parsed artist="Un Pacto..." (wrong) and
+    // backend parsed artist="Bersuit Vergarabat" (right), creating two
+    // competing jobs for the same audio.
+    expect(parseFilename(
+      "Un Pacto Live In Buenos Aires  2001_Bersuit Vergarabat.wav"
+    )).toEqual({
+      artist: "Bersuit Vergarabat",
+      song: "Un Pacto Live In Buenos Aires  2001",
     });
   });
 

@@ -1022,7 +1022,7 @@ export default function HistoryView({
         /* Skeleton — UI matches the actual layout (table vs grid) so the
            swap to real rows is shape-stable. After 15 s the footer
            gains a "tomando más de lo normal" hint + Reintentar button
-           so the operator knows we're not dead. Audit 2026-05-27. */
+           so the operator knows we're not dead. From staging PR #411. */
         <div>
           {view === "table" ? (
             <div className="space-y-1.5">
