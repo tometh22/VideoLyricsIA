@@ -954,8 +954,8 @@ export default function HistoryView({
           The error branch must beat the empty branch so a slow /jobs
           never silently masquerades as "you have no videos". */}
       {isInitialLoading ? (
-        <div className="rounded-card p-14 text-center bg-surface-2/30 ring-1 ring-white/[0.04]">
-          <div className="w-10 h-10 mx-auto mb-4 border-2 border-brand border-t-transparent rounded-full animate-spin" />
+        <div className="flex flex-col items-center justify-center min-h-[50vh] text-center">
+          <div className="w-10 h-10 mb-4 border-2 border-brand border-t-transparent rounded-full animate-spin" />
           <p className="text-sm text-ink-secondary">
             {t("history.loading") || "Cargando historial…"}
           </p>

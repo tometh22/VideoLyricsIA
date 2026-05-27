@@ -330,7 +330,11 @@ function JobDetailRoute({ fetchHistory }) {
     );
   }
   if (!job) {
-    return <div className="w-12 h-12 mx-auto mt-16 border-2 border-brand border-t-transparent rounded-full animate-spin" />;
+    return (
+      <div className="flex items-center justify-center min-h-[50vh]">
+        <div className="w-12 h-12 border-2 border-brand border-t-transparent rounded-full animate-spin" />
+      </div>
+    );
   }
   return (
     <div className="flex justify-center">
@@ -471,7 +475,11 @@ function EditLyricsRoute({ setCurrentReview, wizardScreen, t }) {
   }, []);
 
   if (state.status === "loading") {
-    return <div className="w-12 h-12 mx-auto mt-16 border-2 border-brand border-t-transparent rounded-full animate-spin" />;
+    return (
+      <div className="flex items-center justify-center min-h-[50vh]">
+        <div className="w-12 h-12 border-2 border-brand border-t-transparent rounded-full animate-spin" />
+      </div>
+    );
   }
   if (state.status === "not_found") {
     return (
