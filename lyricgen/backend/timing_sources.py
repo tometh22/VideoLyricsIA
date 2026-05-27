@@ -64,12 +64,27 @@ WHISPER_RAW = "whisper_raw"
 # 2026-05-26: Sin Gamulán, Mujer Amante — see issue #357).
 WHISPERX_LRCLIB = "whisperx_lrclib"
 
+# Cleanup-anchored: lrclib synced timestamps used as anchors for cleaned
+# canonical (the Gemini-expanded version). Activates only when cleanup
+# added lines beyond what lrclib synced has, and only when reconcile
+# aborted. Matched lines preserve lrclib synced times exactly; new
+# lines (cleanup-added repetitions, missing puentes, outro coros)
+# interpolate linearly between adjacent matched anchors. Used INSTEAD
+# of forced_align fallback for cleanup-expanded canonicals because FA's
+# `wordstamps_to_segments` clamps unmatchable extra lines to the end of
+# the word stream, producing pile-up (incident 2026-05-26 "638"
+# operator report: 5+ lines stuck at 1:15.5). See
+# `lyrics_cleanup_alignment.py` and the dev plan at
+# `/Users/tomi/.claude/plans/image-24-la-letra-robust-moonbeam.md`.
+CLEANUP_ANCHORED = "cleanup_anchored"
+
 
 VALID_TIMING_SOURCES = frozenset({
     FORCED_ALIGN,
     WHISPERX_RECONCILED,
     WHISPERX,
     WHISPERX_LRCLIB,
+    CLEANUP_ANCHORED,
     WHISPER_LRCLIB,
     WHISPER_LRCLIB_REC,
     WHISPER_GEMINI_REC,
