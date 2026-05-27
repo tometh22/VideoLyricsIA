@@ -1583,12 +1583,35 @@ export default function App() {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ segments }),
       });
-      if (!res.ok && res.status !== 404) {
-        // 404 means the job was already reaped — nothing to save against.
-        // We log it as a soft warning; the user will see the real error
-        // when they click "Crear videos" and /generate returns 404.
-        console.warn("[autosave] /save-segments failed", res.status);
+      if (!res.ok) {
+        if (res.status !== 404) {
+          // 404 means the job was already reaped — nothing to save against.
+          // We log it as a soft warning; the user will see the real error
+          // when they click "Crear videos" and /generate returns 404.
+          console.warn("[autosave] /save-segments failed", res.status);
+        }
+        return;  // backend rechazó: no pisar el state local con datos asumidos
       }
+      // Bug-fix 2026-05-26 (PR A timeline-drag-persists): tras POST exitoso,
+      // propagar los segments recién persistidos a currentReview. Sin esto,
+      // cualquier re-render del padre que pase un array nuevo de segments
+      // (rehydrate desde sessionStorage, drift-sync de typography, polling)
+      // dispara el useEffect de prop-sync en LyricsEditor.jsx:440-448 que
+      // reescribe `edited` con datos viejos. Los drags del timeline (que ya
+      // viven en backend) "vuelven a su lugar" visualmente. Reportado por
+      // operador con un caso reproducible en producción.
+      //
+      // El backend retorna { ok, job_id, saved_at, count } (no eco de
+      // segments), así que usamos el array que enviamos como source of truth.
+      // Match contra ambos paths: wizard pre-render usa transcribeJobId,
+      // editor post-render (EditLyricsRoute) usa editingJobId.
+      setCurrentReview((prev) => {
+        if (!prev) return prev;
+        const matchesWizard = prev.transcribeJobId === jobId;
+        const matchesEditor = prev.editingJobId === jobId;
+        if (!matchesWizard && !matchesEditor) return prev;
+        return { ...prev, segments };
+      });
     } catch (err) {
       console.warn("[autosave] /save-segments network error", err);
     }
