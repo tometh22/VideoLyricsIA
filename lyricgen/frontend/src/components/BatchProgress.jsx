@@ -15,31 +15,59 @@ async function triggerDownload(jobId, type) {
 }
 
 // ─── Processing list row (shown while jobs are still running) ───────────────
-// SingleGeneratingHero — 2026-05-25 operator UMG dry-run polish. Reemplaza
-// la pantalla "Generando tu video / Te avisamos cuando esté listo" con un
-// hero animado: orbs de gradient drifteando en el fondo, título de la canción
-// como protagonista, step cycling cada ~3 s ("Aislando voz / Generando
-// fondo / Sincronizando letras...") y progress bar con shimmer. Cero
-// dependencies — todo CSS + un setInterval. La animación está pensada para
-// rodar 3-6 min sin que el operador se aburra ni dude que está pasando algo.
-function SingleGeneratingHero({ jobName, artist, progressPct, etaLabel, t }) {
-  const steps = [
-    t("hero.step_isolating") || "Aislando la voz del audio",
-    t("hero.step_lyrics") || "Buscando la letra",
-    t("hero.step_align") || "Sincronizando palabras con el ritmo",
-    t("hero.step_bg") || "Generando el fondo cinematográfico",
-    t("hero.step_render") || "Componiendo el video final",
-  ];
-  const [stepIdx, setStepIdx] = useState(0);
-  useEffect(() => {
-    const id = setInterval(() => setStepIdx((i) => (i + 1) % steps.length), 3200);
-    return () => clearInterval(id);
-  }, [steps.length]);
+// SingleGeneratingHero — 2026-05-27 honest-progress rewrite. Operator
+// complaint 2026-05-26: the previous version cycled through ALL pipeline
+// steps every 3.2 s, so the user saw "Transcribiendo lyrics" loop into
+// view long after they had finished editing the lyrics — looked broken /
+// confused. AND the ETA was hardcoded to "~8 min restantes" via the
+// `BatchProgress` fallback (no completed jobs to average from for
+// single-song generates), so it never updated.
+//
+// New contract: this component is PURELY DECLARATIVE. It receives the
+// current step name + step text + ETA + progress from props (sourced
+// from the SSE payload via `step_eta.compute_eta_s` in the backend).
+// No setInterval, no cycling. The text changes when the worker actually
+// transitions, the bar advances when the worker actually advances,
+// the ETA refreshes when the backend recomputes.
+function SingleGeneratingHero({
+  jobName,
+  artist,
+  progressPct,
+  currentStep,
+  stepTextEs,
+  etaS,
+  t,
+}) {
+  // Map worker step → operator-facing text. The backend already includes
+  // `step_text_es` in the SSE payload, so the common path is just `stepTextEs`.
+  // We keep this i18n fallback for older worker versions / unexpected
+  // step names — minimum surface area.
+  const STEP_TEXT_FALLBACK = {
+    starting: t("hero.step_starting") || "Preparando…",
+    whisper: t("hero.step_starting") || "Preparando…",
+    background: t("hero.step_bg") || "Generando el fondo cinematográfico",
+    validation: t("hero.step_validation") || "Validando contenido",
+    video: t("hero.step_video") || "Armando el video",
+    short: t("hero.step_short") || "Generando el Short",
+    thumbnail: t("hero.step_thumbnail") || "Creando la miniatura",
+    upload: t("hero.step_upload") || "Guardando en tu galería",
+  };
+  const stepText =
+    stepTextEs ||
+    (currentStep && STEP_TEXT_FALLBACK[currentStep.toLowerCase()]) ||
+    (t("hero.step_default") || "Procesando…");
 
-  // Fallback ETA — solo se usa cuando el backend no manda etaLabel todavía
-  // (los primeros segundos del job). Texto deliberadamente vago: el operador
-  // sabe que no es preciso pero da contexto de magnitud.
-  const eta = etaLabel || (t("hero.eta_default") || "Unos minutos…");
+  // ETA formatter — matches `step_eta.format_eta_es` exactly. The backend
+  // sends seconds; we render Spanish phrase here so the JS layer doesn't
+  // have to learn the rounding rules.
+  const formatEta = (s) => {
+    if (s == null) return null;
+    if (s <= 0) return t("hero.eta_almost_done") || "Casi listo…";
+    if (s < 90) return `~${s} ${t("hero.eta_seconds") || "seg restantes"}`;
+    const minutes = Math.floor((s + 30) / 60);
+    return `~${minutes} ${t("hero.eta_minutes") || "min restantes"}`;
+  };
+  const eta = formatEta(etaS) || (t("hero.eta_default") || "Unos minutos…");
 
   return (
     <div className="relative w-full max-w-2xl mt-12 animate-fade-in">
@@ -98,10 +126,14 @@ function SingleGeneratingHero({ jobName, artist, progressPct, etaLabel, t }) {
         )}
         {!artist && <div className="mb-10" />}
 
-        {/* Cycling step — fades in on each rotation */}
+        {/* Current step — text changes only when the worker actually
+            transitions (sourced from SSE). The `key={stepText}` makes
+            React re-mount the <p> on transition so the fade-in animation
+            replays as a subtle visual confirmation that something
+            changed. */}
         <div className="h-7 mb-8 flex items-center justify-center">
           <p
-            key={stepIdx}
+            key={stepText}
             className="text-base text-white/80"
             style={{ animation: "hero-step-in 600ms ease-out both" }}
           >
@@ -109,7 +141,7 @@ function SingleGeneratingHero({ jobName, artist, progressPct, etaLabel, t }) {
               className="inline-block w-1.5 h-1.5 rounded-full bg-white/60 mr-2 align-middle"
               style={{ animation: "hero-pulse 1.6s ease-in-out infinite" }}
             />
-            {steps[stepIdx]}
+            {stepText}
           </p>
         </div>
 
@@ -656,11 +688,20 @@ export default function BatchProgress({ jobs, onReset, onSingleDone, onSelectJob
     const heroJob = jobs[0] || {};
     const heroName = (heroJob.song_title || (heroJob.filename || "").replace(/\.(mp3|wav)$/i, "")).trim();
     const heroArtist = (heroJob.artist || "").trim();
+    // Use the job's REAL per-step progress (0-100) from the SSE payload,
+    // NOT the batch-level (done/total) which only ever reads 0% or 100%
+    // for single-song generates. Falls back to 5% so the bar isn't a
+    // dead sliver before the first SSE event arrives.
+    const heroProgress = typeof heroJob.progress === "number"
+      ? Math.max(5, heroJob.progress)
+      : 5;
     return <SingleGeneratingHero
       jobName={heroName}
       artist={heroArtist}
-      progressPct={(done / total) * 100}
-      etaLabel={etaLabel}
+      progressPct={heroProgress}
+      currentStep={heroJob.current_step}
+      stepTextEs={heroJob.step_text_es}
+      etaS={typeof heroJob.eta_s === "number" ? heroJob.eta_s : null}
       t={t}
     />;
   }

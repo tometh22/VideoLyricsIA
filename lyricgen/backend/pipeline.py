@@ -5990,17 +5990,40 @@ def _generate_veo_video(prompt: str, output_path: str, job_id: str = None,
     # U10 (audit 2026-05-25): heartbeat cada 60s para que el reaper no
     # mate este job durante el Veo poll (hasta 10min sin update_job natural).
     _hb_counter = 0
+    # Sub-progress crawl during Veo (audit 2026-05-27 "638" operator):
+    # Without this, the bar froze at progress=22 for the entire 60-180s
+    # Veo poll and the user thought the system was stuck. We tick
+    # progress=22→38 in lockstep with elapsed seconds — caps at 38 so
+    # the next caller (`update_job(progress=40)` after `_ensure_background()`
+    # returns) doesn't have to overwrite a decrement. See `step_eta.py`
+    # for the progress range (22..40 for "background" step).
+    _veo_started_at = _time.time()
+    _last_progress_written = 22
     while True:
         if _time.time() > poll_deadline:
             raise TimeoutError("Veo 3 operation timed out after 10 min")
         _time.sleep(10)
         _hb_counter += 1
-        if _hb_counter % 6 == 0 and job_id:
-            try:
-                from jobs import heartbeat as _heartbeat
-                _heartbeat(job_id)
-            except Exception:  # pragma: no cover
-                pass
+        if job_id:
+            # Crawl progress: +1% per 10s elapsed, capped at 38 so we leave
+            # the 39→40 transition for `_ensure_background()`'s caller.
+            _elapsed = _time.time() - _veo_started_at
+            _sub_progress = min(38, 22 + int(_elapsed / 10))
+            if _sub_progress > _last_progress_written:
+                try:
+                    from jobs import update_job as _uj
+                    _uj(job_id, progress=_sub_progress)
+                    _last_progress_written = _sub_progress
+                except Exception:  # pragma: no cover
+                    pass  # liveness is best-effort; never block Veo on it.
+            elif _hb_counter % 6 == 0:
+                # No new progress tick (already at cap 38) — keep the
+                # heartbeat for the reaper.
+                try:
+                    from jobs import heartbeat as _heartbeat
+                    _heartbeat(job_id)
+                except Exception:  # pragma: no cover
+                    pass
         token = _veo_access_token()
         # Vertex's long-running publisher operations need the
         # fetchPredictOperation helper (a plain GET on the operation name
