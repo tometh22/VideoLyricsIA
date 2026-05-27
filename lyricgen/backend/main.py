@@ -6898,6 +6898,105 @@ async def get_source_audio_url(
     )
 
 
+@app.post("/jobs/{job_id}/restore-audio")
+@limiter.limit("20/minute")
+async def restore_audio(
+    request: Request,
+    job_id: str,
+    audio: UploadFile = File(...),
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Re-upload the original WAV/MP3 for a job whose `input_r2_key`
+    points to an object that's no longer in R2 (lifecycle GC, manual
+    cleanup, or some other deletion path).
+
+    Use case: the 2026-05-27 cleanup audit found 26 of agus.cafisi's jobs
+    with `input_r2_key` set in DB but the R2 object gone. The MP4
+    fallback (#418) lets the editor function for lyric correction, but
+    re-rendering needs the original WAV. This endpoint accepts the file
+    from the owner's local copy and writes it back to the canonical R2
+    path (matching the existing `input_r2_key` so no DB key migration
+    is needed).
+
+    Validations:
+      - Owner or same-tenant only (existing auth model).
+      - Filename + magic-bytes check via `_validate_audio_filename_only`
+        + `_validate_audio_file_on_disk`.
+      - Plan disk quota (`_enforce_disk_capacity`).
+      - Max file size (`MAX_UPLOAD_MB`).
+
+    Returns the canonical key + size on success.
+    """
+    from database import Job as JobModel
+    job = (
+        db.query(JobModel)
+        .filter(JobModel.job_id == job_id)
+        .filter(JobModel.tenant_id == current_user["tenant_id"])
+        .first()
+    )
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+
+    if not audio.filename:
+        raise HTTPException(status_code=400, detail="Missing filename.")
+    _validate_audio_filename_only(audio.filename)
+
+    # Determine the target R2 key. If input_r2_key is set, reuse it
+    # (this is the common case — the DB row already points where we
+    # want to upload, we just need R2 to actually have the object).
+    # If NULL (rare), derive the canonical path so future probes find it.
+    safe_basename = _safe_basename(audio.filename)
+    if job.input_r2_key:
+        target_key = job.input_r2_key
+    else:
+        target_key = storage._input_object_key(
+            job.tenant_id, job_id, job.filename or safe_basename,
+        )
+
+    _enforce_disk_capacity()
+
+    # Stream to a temp file with size + magic-bytes validation.
+    import tempfile
+    fd, temp_path = tempfile.mkstemp(prefix=f"restore_{job_id}_", suffix=".bin")
+    os.close(fd)
+    try:
+        size_bytes = await _stream_upload_to_disk(audio, temp_path)
+        _validate_audio_file_on_disk(audio.filename, temp_path)
+
+        # Upload to R2 at the target key. We use upload_file (arbitrary
+        # key) instead of upload_input (which would re-derive the path)
+        # so we keep the EXISTING DB key happy and don't churn it.
+        uploaded = storage.upload_file(temp_path, target_key)
+        if not uploaded:
+            raise HTTPException(status_code=503, detail="R2 unavailable.")
+    finally:
+        try:
+            os.unlink(temp_path)
+        except OSError:
+            pass
+
+    # If input_r2_key was NULL before, persist the canonical path now so
+    # future reads find the file via the standard `/source-audio-url`
+    # path without going through the MP4 fallback.
+    if not job.input_r2_key:
+        job.input_r2_key = target_key
+        db.commit()
+
+    logger.info(
+        "[RESTORE-AUDIO] job_id=%s tenant=%s key=%s size_mb=%.1f restored_by_user=%s",
+        job_id, job.tenant_id, target_key, size_bytes / 1024 / 1024,
+        current_user.get("id"),
+    )
+
+    return {
+        "job_id": job_id,
+        "key": target_key,
+        "size_mb": round(size_bytes / 1024 / 1024, 2),
+        "restored": True,
+    }
+
+
 @app.get("/jobs/{job_id}/background-url")
 async def get_background_url(
     job_id: str,
