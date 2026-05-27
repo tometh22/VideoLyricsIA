@@ -36,6 +36,189 @@ const MEDIA_TABS = [
   { key: "thumbnail", label: "Thumbnail", desc: "1280x720" },
 ];
 
+/**
+ * PR C 2026-05-26 (feat/edit-metadata).
+ *
+ * Click-to-edit field for `artist` / `song_title`. Operator clicks a tiny
+ * pencil icon next to the value → input replaces the display → Guardar
+ * triggers POST /edit with edit_type="metadata" → backend persists +
+ * re-renders the title card.
+ *
+ * NO consume edit_count — metadata fixes (typo, missing tilde) are
+ * decoupled from the 3-edit cap that bounds aesthetic iterations.
+ *
+ * Used only when `enabled` (= job in done/pending_review/rejected and
+ * not currently editing). `field` is the camelCase frontend name
+ * ("artist" | "songTitle"); backend key is derived.
+ *
+ * On YouTube-published jobs the first save attempt returns 409 with
+ * code "youtube_already_published". The component surfaces a confirm
+ * dialog and re-fires with allow_youtube_drift=true if accepted.
+ */
+function EditableMetadataField({
+  field,                // "artist" | "songTitle"
+  value,                // current text shown when not editing
+  jobId,
+  enabled,              // false → render as plain text without pencil
+  className = "",       // styling for the display text (inherits header)
+  ariaLabel,            // for screen readers + tests
+  maxLength,            // 255 for artist, 500 for songTitle
+  onEditTriggered,      // callback after successful POST (flips UI to editing)
+  t,
+}) {
+  const [editing, setEditing] = useState(false);
+  const [draft, setDraft] = useState(value ?? "");
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState(null);
+  const inputRef = useRef(null);
+
+  // Sync draft if the prop changes while we're NOT editing (e.g. polling
+  // returns the new value after the worker finished).
+  useEffect(() => {
+    if (!editing) setDraft(value ?? "");
+  }, [value, editing]);
+
+  // Auto-focus when entering edit mode.
+  useEffect(() => {
+    if (editing && inputRef.current) {
+      inputRef.current.focus();
+      inputRef.current.select();
+    }
+  }, [editing]);
+
+  if (!enabled) {
+    return <span className={className}>{value}</span>;
+  }
+
+  const cancel = () => {
+    setDraft(value ?? "");
+    setError(null);
+    setEditing(false);
+  };
+
+  const submit = async (allowYoutubeDrift = false) => {
+    const trimmed = (draft || "").trim();
+    if (!trimmed) {
+      setError(t("metadata.empty_error") || "No puede estar vacío");
+      return;
+    }
+    if (trimmed === (value || "").trim()) {
+      // No change — just exit edit mode without round-tripping.
+      cancel();
+      return;
+    }
+    if (trimmed.length > maxLength) {
+      setError(
+        (t("metadata.too_long") || "Máximo {n} caracteres").replace("{n}", maxLength)
+      );
+      return;
+    }
+    setSaving(true);
+    setError(null);
+    try {
+      const backendKey = field === "artist" ? "artist" : "song_title";
+      const body = {
+        edit_type: "metadata",
+        [backendKey]: trimmed,
+      };
+      if (allowYoutubeDrift) body.allow_youtube_drift = true;
+      const res = await fetch(`${API}/edit/${jobId}`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", ...authHeaders() },
+        body: JSON.stringify(body),
+      });
+      if (res.status === 409) {
+        const detail = (await res.json()).detail || {};
+        if (detail.code === "youtube_already_published") {
+          // Same UX as the lyrics flow's YouTube drift confirm.
+          if (window.confirm(
+            t("edit.youtube_drift_confirm") ||
+            "Este video ya fue subido a YouTube. El cambio se guardará en la plataforma pero NO va a reemplazar el archivo en YouTube. ¿Continuar?"
+          )) {
+            await submit(true);
+          }
+          setSaving(false);
+          return;
+        }
+      }
+      if (!res.ok) {
+        let msg = `Error ${res.status}`;
+        try {
+          const j = await res.json();
+          if (j.detail) msg = typeof j.detail === "string" ? j.detail : msg;
+        } catch { /* leave msg */ }
+        setError(msg);
+        setSaving(false);
+        return;
+      }
+      const resp = await res.json();
+      setSaving(false);
+      setEditing(false);
+      if (onEditTriggered) onEditTriggered(resp);
+    } catch (err) {
+      setError(t("metadata.network_error") || "Error de red");
+      setSaving(false);
+    }
+  };
+
+  if (!editing) {
+    return (
+      <span className={`inline-flex items-center gap-1.5 group ${className}`}>
+        <span>{value}</span>
+        <button
+          type="button"
+          aria-label={ariaLabel || t("metadata.edit") || "Editar"}
+          onClick={() => setEditing(true)}
+          className="opacity-0 group-hover:opacity-100 transition-opacity text-ink-secondary hover:text-white"
+          title={t("metadata.edit") || "Editar"}
+        >
+          <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
+            <path d="M11 4H4a2 2 0 00-2 2v14a2 2 0 002 2h14a2 2 0 002-2v-7M18.5 2.5a2.121 2.121 0 113 3L12 15l-4 1 1-4 9.5-9.5z" strokeLinecap="round" strokeLinejoin="round" />
+          </svg>
+        </button>
+      </span>
+    );
+  }
+
+  return (
+    <span className="inline-flex items-center gap-2 flex-wrap">
+      <input
+        ref={inputRef}
+        type="text"
+        value={draft}
+        onChange={(e) => setDraft(e.target.value)}
+        onKeyDown={(e) => {
+          if (e.key === "Enter") { e.preventDefault(); submit(false); }
+          if (e.key === "Escape") { e.preventDefault(); cancel(); }
+        }}
+        maxLength={maxLength}
+        disabled={saving}
+        aria-label={ariaLabel || t("metadata.edit") || "Editar"}
+        className="px-2 py-1 rounded-md bg-surface-3 ring-1 ring-white/[0.10] focus:ring-brand text-white text-sm font-normal min-w-[200px]"
+      />
+      <button
+        type="button"
+        onClick={() => submit(false)}
+        disabled={saving}
+        className="px-2.5 py-1 rounded-md bg-brand hover:bg-brand-light text-white text-xs font-medium disabled:opacity-50"
+      >
+        {saving ? (t("metadata.saving") || "Guardando…") : (t("metadata.save") || "Guardar")}
+      </button>
+      <button
+        type="button"
+        onClick={cancel}
+        disabled={saving}
+        className="px-2.5 py-1 rounded-md bg-surface-3/40 hover:bg-surface-3/60 text-ink-secondary hover:text-white text-xs font-medium"
+      >
+        {t("metadata.cancel") || "Cancelar"}
+      </button>
+      {error && (
+        <span className="text-xs text-red-400 ml-1" role="alert">{error}</span>
+      )}
+    </span>
+  );
+}
+
 // Broadcast master tab — added conditionally only when the job's
 // delivery_profile is "umg" or "both". ProRes 422 HQ in a .mov, not
 // previewable in browser, so the tab shows a download-only panel.
@@ -1002,7 +1185,32 @@ export default function JobDetail({ job, onBack, onJobUpdate }) {
           </button>
           <div className="min-w-0">
             <div className="flex items-center gap-2 flex-wrap">
-              <h2 className="text-xl font-bold tracking-tight truncate">{name}</h2>
+              {/* PR C 2026-05-26: song title editable when done / pending /
+                  rejected so the operator can fix a typo (missing tilde,
+                  swapped word) without re-uploading. Renders as plain
+                  <h2> text in any other state — the input would be
+                  cosmetic noise during transcribing / editing / errored
+                  jobs. Display falls back to filename (without .mp3) when
+                  job.song_title is missing; the editor only seeds with
+                  song_title (not the filename derivation) so saving
+                  doesn't accidentally persist "Sin Gamulan - Los Abuelos
+                  De La Nada" as the title. */}
+              {(isDone || isPendingReview || isRejected) ? (
+                <h2 className="text-xl font-bold tracking-tight truncate">
+                  <EditableMetadataField
+                    field="songTitle"
+                    value={job.song_title || name}
+                    jobId={job.job_id}
+                    enabled
+                    maxLength={500}
+                    ariaLabel={t("metadata.edit_song_title") || "Editar título de la canción"}
+                    onEditTriggered={handleEditTriggered}
+                    t={t}
+                  />
+                </h2>
+              ) : (
+                <h2 className="text-xl font-bold tracking-tight truncate">{name}</h2>
+              )}
               {isPendingReview && (
                 <span
                   data-tour="jobdetail-status-badge"
@@ -1041,7 +1249,22 @@ export default function JobDetail({ job, onBack, onJobUpdate }) {
                 </button>
               )}
             </div>
-            <p className="text-sm text-ink-secondary mt-0.5 truncate">{job.artist}</p>
+            <p className="text-sm text-ink-secondary mt-0.5 truncate">
+              {(isDone || isPendingReview || isRejected) ? (
+                <EditableMetadataField
+                  field="artist"
+                  value={job.artist}
+                  jobId={job.job_id}
+                  enabled
+                  maxLength={255}
+                  ariaLabel={t("metadata.edit_artist") || "Editar artista"}
+                  onEditTriggered={handleEditTriggered}
+                  t={t}
+                />
+              ) : (
+                job.artist
+              )}
+            </p>
           </div>
         </div>
         <div className="flex flex-wrap gap-2">
