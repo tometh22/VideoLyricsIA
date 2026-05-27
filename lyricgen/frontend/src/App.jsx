@@ -520,13 +520,33 @@ function EditLyricsRoute({ setCurrentReview, wizardScreen, t }) {
   // siguiente /new arranque limpio y no resuma sobre el edit a medias. Los
   // edits no se pierden — el autosave del LyricsEditor los persiste a
   // /save-segments cada 3s, y la próxima visita a /edit-lyrics los re-fetchea.
+  //
+  // RACE GUARD 2026-05-27 (fix/edit-lyrics-bootstrap-race): bug reportado en
+  // prod donde /edit-lyrics renderea "Crear videos" en lugar del editor.
+  // Hipótesis: en React 18 con StrictMode + concurrent rendering, el cleanup
+  // del useEffect con `[]` deps puede correr en momentos inesperados (e.g.
+  // entre el setCurrentReview de Phase A y el siguiente render) y deja
+  // currentReview=null. Resultado: wizardScreen renderea UploadZone con
+  // hasReviewableContent=false, mostrando paso 1 ("Crear videos").
+  //
+  // Fix: deps `[id]` para que el cleanup capture el `myId` actual y SOLO
+  // limpie si el currentReview todavía refleja ESE id específico — evita
+  // clobber si por algún ciclo el setCurrentReview ya cambió a otro
+  // editingJobId. También evita el caso de "navigate /edit-lyrics/X →
+  // /edit-lyrics/Y" donde el cleanup con id viejo no debe tocar el
+  // currentReview con id nuevo.
   useEffect(() => {
+    const myId = id;
     return () => {
-      setCurrentReview((r) => (r?.editingJobId ? null : r));
+      setCurrentReview((r) => {
+        if (!r) return r;
+        if (r.editingJobId !== myId) return r;  // no es nuestro, no tocar
+        return null;
+      });
       wizardPersistence.clear();
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
+  }, [id]);
 
   if (state.status === "loading") {
     return <div className="w-12 h-12 mx-auto mt-16 border-2 border-brand border-t-transparent rounded-full animate-spin" />;
