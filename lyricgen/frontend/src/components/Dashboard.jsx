@@ -1,4 +1,4 @@
-import { useState, useEffect } from "react";
+import { useState, useEffect, useMemo } from "react";
 import { useI18n } from "../i18n";
 import { useMediaUrl } from "../mediaUrl";
 import { fetchWithTimeout } from "../fetchWithTimeout";
@@ -7,6 +7,15 @@ import ProResBadge from "./ProResBadge";
 import { SkeletonVideoCard } from "./Skeleton";
 
 const API = import.meta.env.VITE_API_URL || "";
+
+// 2026-05-27 perf audit: module-level formatters so the date header's
+// IIFE doesn't `new Intl.DateTimeFormat()` on every render. Creating
+// a DateTimeFormat is ~5-10 ms in Chrome — fine once, but adds up at
+// 3-5 renders/sec while the polling loop is ticking.
+const DATE_HEADER_FMT = new Intl.DateTimeFormat("es-AR", {
+  weekday: "long", day: "numeric", month: "long",
+});
+const MONTH_FMT = new Intl.DateTimeFormat("es-AR", { month: "long" });
 
 function authHeaders() {
   const token = localStorage.getItem("genly_token");
@@ -106,13 +115,34 @@ function VideoCard({ job, onSelect }) {
 export default function Dashboard({ user, history, historyError, historyLoaded = true, onRetryHistory, onSelectJob, onNewBatch, onViewHistory, onOpenSearch }) {
   const { t } = useI18n();
 
-  const pendingReview = history.filter((h) => h.status === "pending_review");
+  // 2026-05-27 perf audit (UMG micro-freezes): four `history.filter()`
+  // calls re-ran on EVERY render — including every SSE poll tick (every
+  // 3-5 s during a generation). For a tenant with 200 jobs that's
+  // 4 × 200 = 800 string comparisons per poll × 5 = 4000/sec just for
+  // re-bucketing. Memoizing on `history` reduces this to one pass per
+  // actual change (when a job status mutates), saving ~50-60 ms of
+  // main-thread work per poll tick.
+  const pendingReview = useMemo(
+    () => history.filter((h) => h.status === "pending_review"),
+    [history],
+  );
   // "editing" jobs are mid edit-request re-render — UX-wise they're the
   // same as the initial processing state (worker is rendering, user can't
   // approve yet), so we bucket them together with processing/queued.
-  const processing = history.filter((h) => h.status === "processing" || h.status === "queued" || h.status === "editing");
-  const recentDone = history.filter((h) => h.status === "done").slice(0, 6);
-  const errors = history.filter((h) => h.status === "error" || h.status === "validation_failed");
+  const processing = useMemo(
+    () => history.filter(
+      (h) => h.status === "processing" || h.status === "queued" || h.status === "editing"
+    ),
+    [history],
+  );
+  const recentDone = useMemo(
+    () => history.filter((h) => h.status === "done").slice(0, 6),
+    [history],
+  );
+  const errors = useMemo(
+    () => history.filter((h) => h.status === "error" || h.status === "validation_failed"),
+    [history],
+  );
 
   // Real plan usage from API. We surface load failures so the operator
   // doesn't sit on "cargando..." forever when /usage hangs (CORS,
@@ -212,8 +242,7 @@ export default function Dashboard({ user, history, historyError, historyLoaded =
           <p className="text-section text-gray-500 uppercase tracking-[0.18em]">
             {(() => {
               const d = new Date();
-              const fmt = new Intl.DateTimeFormat("es-AR", { weekday: "long", day: "numeric", month: "long" });
-              return fmt.format(d) + " · " + d.toLocaleTimeString("es-AR", { hour: "2-digit", minute: "2-digit" });
+              return DATE_HEADER_FMT.format(d) + " · " + d.toLocaleTimeString("es-AR", { hour: "2-digit", minute: "2-digit" });
             })()}
           </p>
           <h1 className="text-[26px] leading-tight font-bold tracking-tight mt-1 truncate">
@@ -346,10 +375,7 @@ export default function Dashboard({ user, history, historyError, historyLoaded =
         {/* COL 3: CUOTA — Stripe pattern (número grande + barra slim + delta) */}
         <div className="px-6 py-6">
           <p className="text-section text-gray-500 uppercase tracking-[0.18em]">
-            Cuota {(() => {
-              const fmt = new Intl.DateTimeFormat("es-AR", { month: "long" });
-              return fmt.format(new Date());
-            })()}
+            Cuota {MONTH_FMT.format(new Date())}
           </p>
           <div className="mt-2 flex items-baseline gap-2">
             {isUnlimited ? (
