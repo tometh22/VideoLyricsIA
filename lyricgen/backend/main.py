@@ -3986,6 +3986,72 @@ async def _run_transcription_for_job(
                         # editor saw only 8/19 canonical lines. FA on the
                         # same audio recovered 19/19 — operator reported
                         # "le faltan lyrics en bastantes lineas".
+                        # First — when cleanup expanded the canonical beyond
+                        # what lrclib synced has, try the cleanup-anchored
+                        # path BEFORE forced_align. Rationale: FA's
+                        # `wordstamps_to_segments` clamps unmatchable extra
+                        # lines to the end of the word stream, producing
+                        # pile-up at a single timestamp (incident 2026-05-26
+                        # "638" operator report: 5 lines stuck at 1:15.5).
+                        # The cleanup-anchored path preserves lrclib synced
+                        # timestamps for matched lines and linearly
+                        # interpolates new lines between adjacent anchors,
+                        # avoiding the pile-up. Gated tightly: only when
+                        # cleanup actually expanded the canonical AND synced
+                        # is available. See
+                        # `/Users/tomi/.claude/plans/image-24-la-letra-robust-moonbeam.md`.
+                        _synced_for_anchor: str | None = (
+                            (lrc or {}).get("synced") if isinstance(lrc, dict) else None
+                        )
+                        _canonical_lines = [
+                            ln.strip() for ln in (_canonical or "").splitlines()
+                            if ln.strip()
+                        ]
+                        if (
+                            _cleaned  # cleanup ran and produced output
+                            and _synced_for_anchor
+                            and len(_canonical_lines) > 0
+                        ):
+                            try:
+                                import lrclib_aligner as _lca_ca
+                                _ca_pairs = _lca_ca._parse_lrc_to_line_times(_synced_for_anchor)
+                                if (
+                                    _ca_pairs
+                                    and len(_canonical_lines) > len(_ca_pairs)
+                                ):
+                                    from lyrics_cleanup_alignment import (
+                                        align_cleaned_against_synced as _ca_align,
+                                    )
+                                    from pipeline import _audio_duration as _ca_dur
+                                    _ca_audio_dur = _ca_dur(tmp_path)
+                                    if _ca_audio_dur and _ca_audio_dur > 0:
+                                        _ca_segs = _ca_align(
+                                            _canonical_lines, _ca_pairs, _ca_audio_dur,
+                                        )
+                                        if _ca_segs:
+                                            from timing_sources import (
+                                                CLEANUP_ANCHORED as _WC_CA,
+                                            )
+                                            logger.info(
+                                                "[WC] cleanup-anchored path: %d segs "
+                                                "(cleaned=%d, synced=%d, audio=%.1fs) "
+                                                "— skipping FA pile-up",
+                                                len(_ca_segs),
+                                                len(_canonical_lines),
+                                                len(_ca_pairs),
+                                                _ca_audio_dur,
+                                            )
+                                            return _emit_segments(
+                                                _ca_segs, _WC_CA,
+                                                reference_lyrics=_canonical,
+                                            )
+                            except Exception as _e_ca:
+                                logger.warning(
+                                    "[WC] cleanup-anchored path raised: %s — "
+                                    "falling through to forced_align",
+                                    _e_ca,
+                                )
+
                         logger.info("[WC] reconcile aborted — trying forced_align fallback before whisperX raw")
                         _fa_segs = None
                         try:
