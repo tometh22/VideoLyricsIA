@@ -938,6 +938,17 @@ const translations = {
     "edit.youtube_drift_confirm": "Este video ya está publicado en YouTube. La re-sincronización actualizará el archivo en la plataforma pero NO reemplazará el video en YouTube (la API de YouTube no permite reemplazar archivos, solo metadata).\n\n¿Continuar igual?",
     "edit.lyrics_resync_submit": "Re-renderizar con letras y tiempos corregidos",
     "edit.lyrics_audio_unavailable": "El audio fuente no está disponible para este job — solo podrás editar texto sin escuchar playback.",
+    // PR C 2026-05-26 (feat/edit-metadata): editar artist/song_title in-place
+    // desde el header del JobDetail para corregir typos sin re-subir.
+    "metadata.edit": "Editar",
+    "metadata.edit_song_title": "Editar título de la canción",
+    "metadata.edit_artist": "Editar artista",
+    "metadata.save": "Guardar",
+    "metadata.saving": "Guardando…",
+    "metadata.cancel": "Cancelar",
+    "metadata.empty_error": "No puede estar vacío",
+    "metadata.too_long": "Máximo {n} caracteres",
+    "metadata.network_error": "Error de red, intentá de nuevo",
     "editor.trim_line": "Recortar al final natural (cuando la voz termina y empieza un fill)",
     "editor.undo_anchor_hint": "Deshacer este anchor",
     "editor.trim_all_long_label": "Recortar {n} líneas con texto colgado",

@@ -9077,6 +9077,14 @@ def run_edit_pipeline(
             video/short/thumbnail.  Cost: ~$0. After success, the new
             segments overwrite segments_json so subsequent edits see
             the corrected version.
+        "metadata"   — PR C 2026-05-26. Keep cached background AND
+            segments. The /edit handler already wrote the corrected
+            artist/song_title to the DB row before enqueueing, so
+            `artist` and `song_title` read on line 9107-9108 below pick
+            up the new values automatically. The re-render produces a
+            new title card via libass with the corrected text. Same
+            cost/timing as typography (~$0, ~5 min). Does NOT consume
+            an edit slot — see main.py:request_edit for the rationale.
 
     After completion the job returns to "pending_review" so the reviewer
     can approve, reject, or request another edit (up to _MAX_EDITS total).
@@ -9180,10 +9188,12 @@ def run_edit_pipeline(
         # ----------------------------------------------------------------
         # Resolve background
         # ----------------------------------------------------------------
-        if edit_type in ("typography", "lyrics"):
-            # Both reuse the cached background — only the foreground layer
-            # (text overlays) changes. Lyrics edit ALSO swaps the segments,
-            # but that already happened at function entry above.
+        if edit_type in ("typography", "lyrics", "metadata"):
+            # All three reuse the cached background — only the foreground
+            # layer changes. Lyrics edit ALSO swaps the segments, and
+            # metadata edit re-renders the title card with the corrected
+            # artist/song_title (already persisted by the /edit handler
+            # before this worker spawned — see main.py:request_edit).
             update_job(job_id, status="editing", current_step="video", progress=35)
             bg_image_path = os.path.join(job_dir, "bg_cached_edit.mp4")
             if not os.path.exists(bg_image_path):

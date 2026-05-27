@@ -6506,6 +6506,13 @@ class EditJobRequest(BaseModel):
     # only metadata). Defaults to False so the API fails closed with a
     # 409 — the frontend prompts the operator, who has to opt in.
     allow_youtube_drift: bool = False
+    # PR C 2026-05-26 (feat/edit-metadata): operator can fix a typo in
+    # the title card (artist / song_title) without re-uploading. Only
+    # used when edit_type=="metadata". max_length matches the DB columns
+    # exactly: Job.artist VARCHAR(255), Job.song_title VARCHAR(500).
+    # Both nullable — caller may send one, the other, or both.
+    artist: str | None = Field(default=None, max_length=255)
+    song_title: str | None = Field(default=None, max_length=500)
 
 
 class EnableProResRequest(BaseModel):
@@ -7010,34 +7017,52 @@ async def request_edit(
     )
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
-    valid_edit_types = ("typography", "background", "lyrics")
+    valid_edit_types = ("typography", "background", "lyrics", "metadata")
     if body.edit_type not in valid_edit_types:
         raise HTTPException(
             status_code=400,
             detail=f"edit_type must be one of {valid_edit_types}",
         )
 
-    # Status gate. Lyrics edit accepts a wider set of terminal-ish states
-    # so users can fix typos/timing on videos that already finished
-    # rendering (done, in approval queue, or even rejected) without
-    # having to re-upload the MP3. typography/background stay strict —
-    # they're billed as "edits in the review loop" and only make sense
-    # while the reviewer is still deciding.
-    if body.edit_type == "lyrics":
+    # Status gate. Lyrics and metadata edits accept a wider set of
+    # terminal-ish states so users can fix typos/timing on videos that
+    # already finished rendering (done, in approval queue, or even
+    # rejected) without having to re-upload the MP3. typography/background
+    # stay strict — they're billed as "edits in the review loop" and only
+    # make sense while the reviewer is still deciding.
+    if body.edit_type in ("lyrics", "metadata"):
         allowed = ("done", "pending_review", "rejected")
         if job.status not in allowed:
             raise HTTPException(
                 status_code=400,
                 detail=(
-                    f"Lyrics edit requires the job to be done, pending_review, "
-                    f"or rejected (current: {job.status})"
+                    f"{body.edit_type.capitalize()} edit requires the job to be done, "
+                    f"pending_review, or rejected (current: {job.status})"
                 ),
             )
+        # PR C 2026-05-26: metadata-specific validation. The handler must
+        # have at least one of artist/song_title set AND non-empty after
+        # trim; otherwise the re-render does nothing visible to the user.
+        if body.edit_type == "metadata":
+            new_artist = body.artist.strip() if body.artist is not None else None
+            new_title = body.song_title.strip() if body.song_title is not None else None
+            if new_artist is None and new_title is None:
+                raise HTTPException(
+                    status_code=400,
+                    detail="metadata edit requires at least one of 'artist' or 'song_title'",
+                )
+            if (new_artist is not None and not new_artist) or (
+                new_title is not None and not new_title
+            ):
+                raise HTTPException(
+                    status_code=400,
+                    detail="metadata fields must be non-empty after trimming whitespace",
+                )
         # YouTube API does not allow replacing an uploaded video's file
-        # (only metadata). Re-syncing lyrics on a published job would
-        # update R2 silently while YouTube continued serving the old
-        # out-of-sync cut. Fail closed; the frontend prompts the operator
-        # and retries with allow_youtube_drift=true if they confirm.
+        # (only metadata). Re-syncing lyrics OR re-rendering the title
+        # card on a published job would update R2 silently while YouTube
+        # continued serving the old cut. Fail closed; the frontend
+        # prompts the operator and retries with allow_youtube_drift=true.
         if job.youtube_data and not body.allow_youtube_drift:
             yt_url = (
                 job.youtube_data.get("url")
@@ -7048,10 +7073,10 @@ async def request_edit(
                 detail={
                     "code": "youtube_already_published",
                     "message": (
-                        "Job already published to YouTube. Lyrics re-sync "
-                        "will update the file in our platform but NOT "
-                        "replace the YouTube video. Pass "
-                        "allow_youtube_drift=true to proceed anyway."
+                        f"Job already published to YouTube. {body.edit_type.capitalize()} "
+                        f"edit will update the file in our platform but NOT "
+                        f"replace the YouTube video. Pass "
+                        f"allow_youtube_drift=true to proceed anyway."
                     ),
                     "youtube_url": yt_url,
                 },
@@ -7066,17 +7091,25 @@ async def request_edit(
     # Admins are exempt from the per-job edit cap (operators QA'ing a
     # render may need more than _MAX_EDITS passes). Regular users still
     # hit the limit and must approve/reject.
+    #
+    # PR C 2026-05-26: metadata edits do NOT consume an edit slot. A typo
+    # in the operator's own metadata is not the same as an aesthetic
+    # iteration over the video — penalizing one of the 3 limited edits
+    # for "fix the tilde" would frustrate operators who already spent
+    # their slots on typography/background/lyrics. AuditLog still records
+    # the metadata edit for traceability (`metadata_only=True`).
     _is_admin = current_user.get("role") == "admin"
-    if not _is_admin and current_edit_count >= _MAX_EDITS:
+    _metadata_only = body.edit_type == "metadata"
+    if not _is_admin and not _metadata_only and current_edit_count >= _MAX_EDITS:
         raise HTTPException(
             status_code=400,
             detail=f"Maximum edit limit ({_MAX_EDITS}) reached. Please approve or reject.",
         )
 
-    # Both typography and lyrics reuse the cached background. Without
+    # Typography, lyrics, and metadata reuse the cached background. Without
     # bg_r2_key_cached set, the worker can't avoid re-running Veo —
     # which defeats the point of these fast-path edits.
-    if body.edit_type in ("typography", "lyrics") and not job.bg_r2_key_cached:
+    if body.edit_type in ("typography", "lyrics", "metadata") and not job.bg_r2_key_cached:
         raise HTTPException(
             status_code=400,
             detail=(
@@ -7274,8 +7307,27 @@ async def request_edit(
         edit_params["bypass_content_validation"] = True
     if body.edit_type == "background" and body.force_content_validation:
         edit_params["force_content_validation"] = True
+    if body.edit_type == "metadata":
+        # PR C 2026-05-26 (feat/edit-metadata): persist the corrected
+        # artist/song_title onto the DB row BEFORE the worker spawns.
+        # `run_edit_pipeline` reads `job_row.artist` / `job_row.song_title`
+        # on its own DB session (pipeline.py:9101-9102) — by the time it
+        # queries, the values must already be the corrected ones.
+        # edit_params carries them too as a belt-and-suspenders for the
+        # AuditLog detail (operator sees what was sent).
+        new_artist = body.artist.strip() if body.artist is not None else None
+        new_title = body.song_title.strip() if body.song_title is not None else None
+        if new_artist:
+            job.artist = new_artist
+            edit_params["artist"] = new_artist
+        if new_title:
+            job.song_title = new_title
+            edit_params["song_title"] = new_title
 
-    new_edit_count = current_edit_count + 1
+    # PR C 2026-05-26: metadata edits do NOT bump edit_count (see
+    # rationale at the edit-cap gate above). All other types still
+    # consume a slot.
+    new_edit_count = current_edit_count if _metadata_only else current_edit_count + 1
 
     # Pre-flight check that the source audio is still in R2. Every edit
     # type (background/typography/lyrics) downloads the original WAV
@@ -7326,8 +7378,20 @@ async def request_edit(
             "edit_type": body.edit_type,
             "edit_params": edit_params,
             "edit_count": new_edit_count,
+            # PR C 2026-05-26: flag that distinguishes metadata-only
+            # edits from regular ones in the audit trail. UMG compliance
+            # cares about every artist/title mutation; this lets ops
+            # filter the log without parsing edit_params.
+            "metadata_only": _metadata_only,
         },
     ))
+    # PR C 2026-05-26: capture pre-edit metadata BEFORE the commit so the
+    # enqueue-failure rollback below can restore them. The handler
+    # optimistically wrote `job.artist`/`job.song_title` already (above)
+    # so the worker sees the new values; if the enqueue fails, restore.
+    if body.edit_type == "metadata":
+        _pre_edit_artist = job.artist
+        _pre_edit_song_title = job.song_title
     db.commit()
 
     try:
@@ -7359,6 +7423,15 @@ async def request_edit(
             # Defensive: _pre_edit_segments is only assigned when
             # body.segments was non-empty. Non-lyrics edits (typography,
             # background) skip that branch and don't need the rollback.
+            pass
+        # PR C 2026-05-26: same rollback for metadata. If the enqueue
+        # never landed, the visible artist/song_title in JobDetail would
+        # lie — operator clicks "Guardar título", error, but UI still
+        # shows the new title. Restore the original.
+        try:
+            job.artist = _pre_edit_artist
+            job.song_title = _pre_edit_song_title
+        except NameError:
             pass
         db.commit()
         raise HTTPException(
