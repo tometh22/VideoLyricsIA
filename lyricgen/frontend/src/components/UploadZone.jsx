@@ -717,11 +717,22 @@ export default function UploadZone({
       artist = head.trim();
       song = rest.join(" - ").trim();
     } else if (name.includes("_")) {
-      // SAME convention as " - ": head is artist, rest is title.
-      // This is the fix — previously rest was artist (inverted).
+      // YouTube / Suno export convention: "Title_Artist.ext" (head=title,
+      // tail=artist). The backend implements this same convention in
+      // main.py:1537-1539 with the docstring at main.py:1500-1508
+      // documenting it as intentional.
+      //
+      // HOTFIX 2026-05-27: previously this branch used `head=artist`,
+      // contradicting the backend. Every file with `_` separator created
+      // 2 jobs with swapped metadata — one from /upload-url with the
+      // frontend's (wrong) parse, one from /transcribe-uploaded with
+      // the backend's (right) parse — and the dedupe didn't pesca them
+      // because filenames were identical but artist/title differed.
+      // Incident: agus.cafisi 16:42 UTC, file
+      // `Un Pacto Live In Buenos Aires  2001_Bersuit Vergarabat.wav`.
       const [head, ...rest] = name.split("_");
-      artist = head.trim();
-      song = rest.join("_").trim();
+      song = head.trim();
+      artist = rest.join("_").trim();
     }
     song = _stripNoise(song);
     artist = _stripNoise(artist);

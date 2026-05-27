@@ -25,9 +25,34 @@ ENVIRONMENT = os.environ.get("ENVIRONMENT", "production").lower().strip() or "pr
 _SENTRY_DSN = os.environ.get("SENTRY_DSN", "")
 if _SENTRY_DSN:
     import sentry_sdk
+    # 2026-05-27 Wave-0 observability audit (UMG perf complaint): the
+    # pre-fix init had NO integrations beyond the default — FastAPI
+    # routes weren't auto-traced and SQLAlchemy queries weren't
+    # captured as spans, so the Sentry Performance dashboard had no
+    # visibility into which endpoint or query was actually slow on
+    # prod. With the three integrations below every request lands as
+    # a transaction named by its route template, with child spans for
+    # each DB query — making the next perf audit data-driven instead
+    # of speculative.
+    from sentry_sdk.integrations.fastapi import FastApiIntegration
+    from sentry_sdk.integrations.starlette import StarletteIntegration
+    from sentry_sdk.integrations.sqlalchemy import SqlalchemyIntegration
     sentry_sdk.init(
         dsn=_SENTRY_DSN,
         traces_sample_rate=float(os.environ.get("SENTRY_TRACES_RATE", "0.1")),
+        # profiles_sample_rate off by default (0.0). Flip to 0.05-0.1
+        # temporarily when investigating CPU hotspots — profiling adds
+        # measurable overhead to each sampled request.
+        profiles_sample_rate=float(os.environ.get("SENTRY_PROFILES_RATE", "0.0")),
+        # send_default_pii=False keeps email/IP out of Sentry events
+        # (UMG-grade compliance). When debugging specific operators we
+        # call sentry_sdk.set_user explicitly to attach just tenant_id.
+        send_default_pii=False,
+        integrations=[
+            FastApiIntegration(transaction_style="endpoint"),
+            StarletteIntegration(transaction_style="endpoint"),
+            SqlalchemyIntegration(),
+        ],
         # SENTRY_ENV overrides ENVIRONMENT only if explicitly set (back-compat).
         environment=os.environ.get("SENTRY_ENV") or ENVIRONMENT,
         release=os.environ.get("SENTRY_RELEASE", "genly@2.0.0"),
@@ -370,6 +395,32 @@ async def _disconnect_receive():
 
 
 app.add_middleware(DbTransientRetryMiddleware)
+
+
+# --- Server-Timing header middleware ---
+# 2026-05-27 Wave-0 observability audit: every response now carries
+# `X-Response-Time: <ms>` so frontend RUM / DevTools Network panel can
+# attribute round-trip latency between "server thought" vs "network in
+# transit" vs "browser parse". Adding this is cheap (sub-millisecond
+# per request) and unblocks debugging slow endpoints WITHOUT needing
+# Sentry tracing access for every operator.
+#
+# The standard `Server-Timing` header would also work (and shows up in
+# Chrome DevTools natively under Network → Timing → "Server"), but
+# X-Response-Time is what existing dashboards (Datadog, Grafana) often
+# parse out of the box. We emit BOTH so either consumer wins.
+@app.middleware("http")
+async def add_response_time_header(request: Request, call_next):
+    import time as _t
+    _start = _t.perf_counter()
+    response = await call_next(request)
+    elapsed_ms = (_t.perf_counter() - _start) * 1000.0
+    # Round to 1 decimal so the header doesn't churn on every request
+    # (helps caches that key on response headers — irrelevant here but
+    # cheap to keep stable).
+    response.headers["X-Response-Time"] = f"{elapsed_ms:.1f}ms"
+    response.headers["Server-Timing"] = f"app;dur={elapsed_ms:.1f}"
+    return response
 
 
 # --- Include routers ---
@@ -2877,12 +2928,20 @@ async def transcribe_uploaded(
         db.close()
         try:
             from queue_jobs import enqueue_transcription
+            # HOTFIX 2026-05-27: use the Job row as the single source of
+            # truth for artist/title. Previously we accepted body.artist /
+            # body.title from the request, which let the frontend send
+            # different metadata than what /upload-url committed to the
+            # row — opening a path where two transcription jobs ended up
+            # in queue with swapped metadata (agus.cafisi incident 16:42).
+            # Any client-side correction must now go through PATCH
+            # /jobs/{id} BEFORE calling /transcribe-uploaded.
             enqueue_transcription(
                 job_id,
                 audio_path,
                 language=body.language,
-                artist=body.artist,
-                title=body.title,
+                artist=job_row.artist or "",
+                title=job_row.song_title or "",
                 filename=job_row.filename,
                 tenant_id=current_user.get("tenant_id", ""),
             )
@@ -2915,9 +2974,15 @@ async def transcribe_uploaded(
         # opens its own short-lived session for the only DB touch it needs.
         db.close()
 
+        # HOTFIX 2026-05-27: same source-of-truth fix as the async path —
+        # use job_row.artist / job_row.song_title (committed at /upload-url
+        # time), NOT body.artist / body.title which can diverge from the
+        # row and create ghost jobs.
         return await _run_transcription_for_job(
             request, current_user, job_id, audio_path,
-            language=body.language, artist=body.artist, title=body.title,
+            language=body.language,
+            artist=job_row.artist or "",
+            title=job_row.song_title or "",
         )
     finally:
         _release_transcription_slot(transcription_lease)
@@ -6746,18 +6811,32 @@ async def get_source_audio_url(
     current_user: dict = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
-    """Pre-signed URL to the original MP3 uploaded by the user.
+    """Pre-signed URL to the audio for the post-approval lyrics editor.
 
-    Powers the post-approval lyrics editor: when an operator opens the
-    full LyricsEditor on a done/rejected job to fix sync, the <audio>
-    element needs to stream the source so the operator can hear what
-    they're aligning to. Returning a signed URL (instead of proxying
+    Powers the LyricsEditor's <audio> element: when an operator opens
+    an existing job to fix sync, the audio plays so the operator can
+    align segments to it. Returning a signed URL (instead of proxying
     bytes through uvicorn) keeps the API container free during long
     editor sessions.
 
+    Resolution order:
+      1. `input_r2_key` (original uploaded MP3/WAV) — best quality.
+      2. `s3_keys["video"]` (rendered HD MP4) — fallback when the
+         original is gone (lifecycle GC, very old job, or one of the
+         duplicate-job-bug casualties). Browsers play the audio track
+         out of an <audio src="...mp4"> just fine, no client change
+         needed. The response sets `source="video"` + `fallback=true`
+         so the UI can show a "playing audio from rendered video" badge.
+      3. `s3_keys["short"]` (vertical/short MP4) — second fallback.
+      4. Nothing exists → 404 with a re-upload message.
+
+    HOTFIX FASE 2 — 2026-05-27: previously this only checked
+    input_r2_key, so jobs whose original was lost (the duplicate-job
+    cascade and the lifecycle-GC purge) became un-editable forever.
+    Now agus.cafisi (and any operator with stale jobs) can keep
+    correcting lyrics using the rendered video's audio track.
+
     Owner / same-tenant only — same auth model as /download/<job>/<file>.
-    Returns 404 if the job has no input_r2_key (very old jobs uploaded
-    before R2-first flow, or jobs whose input was purged by lifecycle).
     """
     from database import Job as JobModel
     job = (
@@ -6768,18 +6847,154 @@ async def get_source_audio_url(
     )
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
+
+    # 1. Try the original audio first (best quality, no render artifacts).
+    #
+    # HOTFIX 2026-05-27: presign is unconditional (it just signs a URL
+    # without HEAD-ing the object), so a row whose input_r2_key points
+    # at a deleted R2 file was previously returning a 404'd URL — the
+    # editor opened mudo and the MP4 fallback never triggered. We now
+    # HEAD-probe before serving so a dead key falls through to the MP4
+    # branch correctly. ~50-200 ms cost per editor load is acceptable
+    # (one-shot per session) and is exactly the diagnostic agus.cafisi
+    # needed for his 26 jobs with set-but-DEAD input_r2_key (lifecycle
+    # GC after 30 d retention purged the originals).
+    if job.input_r2_key and storage.object_exists(job.input_r2_key):
+        url = storage.generate_signed_url(job.input_r2_key, expiry_seconds=3600)
+        if url:
+            return {
+                "url": url,
+                "expires_in": 3600,
+                "source": "input",
+                "fallback": False,
+            }
+        # Storage signed-URL helper returned None (storage disabled mid-
+        # request, etc.). Fall through to render fallback rather than
+        # 503 — if a rendered MP4 exists we can still serve the editor.
+
+    # 2-3. Fallback to rendered MP4(s). Browsers play <audio src=".mp4">.
+    s3_keys = job.s3_keys or {}
+    if isinstance(s3_keys, dict):
+        for source_type in ("video", "short"):
+            r2_key = s3_keys.get(source_type)
+            if not r2_key:
+                continue
+            url = storage.generate_signed_url(r2_key, expiry_seconds=3600)
+            if url:
+                return {
+                    "url": url,
+                    "expires_in": 3600,
+                    "source": source_type,
+                    "fallback": True,
+                }
+
+    # 4. Neither original nor any rendered MP4 — operator must re-upload.
+    raise HTTPException(
+        status_code=404,
+        detail=(
+            "Source audio is not available for this job. "
+            "Re-upload the audio file to keep editing the lyrics."
+        ),
+    )
+
+
+@app.post("/jobs/{job_id}/restore-audio")
+@limiter.limit("20/minute")
+async def restore_audio(
+    request: Request,
+    job_id: str,
+    audio: UploadFile = File(...),
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Re-upload the original WAV/MP3 for a job whose `input_r2_key`
+    points to an object that's no longer in R2 (lifecycle GC, manual
+    cleanup, or some other deletion path).
+
+    Use case: the 2026-05-27 cleanup audit found 26 of agus.cafisi's jobs
+    with `input_r2_key` set in DB but the R2 object gone. The MP4
+    fallback (#418) lets the editor function for lyric correction, but
+    re-rendering needs the original WAV. This endpoint accepts the file
+    from the owner's local copy and writes it back to the canonical R2
+    path (matching the existing `input_r2_key` so no DB key migration
+    is needed).
+
+    Validations:
+      - Owner or same-tenant only (existing auth model).
+      - Filename + magic-bytes check via `_validate_audio_filename_only`
+        + `_validate_audio_file_on_disk`.
+      - Plan disk quota (`_enforce_disk_capacity`).
+      - Max file size (`MAX_UPLOAD_MB`).
+
+    Returns the canonical key + size on success.
+    """
+    from database import Job as JobModel
+    job = (
+        db.query(JobModel)
+        .filter(JobModel.job_id == job_id)
+        .filter(JobModel.tenant_id == current_user["tenant_id"])
+        .first()
+    )
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+
+    if not audio.filename:
+        raise HTTPException(status_code=400, detail="Missing filename.")
+    _validate_audio_filename_only(audio.filename)
+
+    # Determine the target R2 key. If input_r2_key is set, reuse it
+    # (this is the common case — the DB row already points where we
+    # want to upload, we just need R2 to actually have the object).
+    # If NULL (rare), derive the canonical path so future probes find it.
+    safe_basename = _safe_basename(audio.filename)
+    if job.input_r2_key:
+        target_key = job.input_r2_key
+    else:
+        target_key = storage._input_object_key(
+            job.tenant_id, job_id, job.filename or safe_basename,
+        )
+
+    _enforce_disk_capacity()
+
+    # Stream to a temp file with size + magic-bytes validation.
+    import tempfile
+    fd, temp_path = tempfile.mkstemp(prefix=f"restore_{job_id}_", suffix=".bin")
+    os.close(fd)
+    try:
+        size_bytes = await _stream_upload_to_disk(audio, temp_path)
+        _validate_audio_file_on_disk(audio.filename, temp_path)
+
+        # Upload to R2 at the target key. We use upload_file (arbitrary
+        # key) instead of upload_input (which would re-derive the path)
+        # so we keep the EXISTING DB key happy and don't churn it.
+        uploaded = storage.upload_file(temp_path, target_key)
+        if not uploaded:
+            raise HTTPException(status_code=503, detail="R2 unavailable.")
+    finally:
+        try:
+            os.unlink(temp_path)
+        except OSError:
+            pass
+
+    # If input_r2_key was NULL before, persist the canonical path now so
+    # future reads find the file via the standard `/source-audio-url`
+    # path without going through the MP4 fallback.
     if not job.input_r2_key:
-        raise HTTPException(
-            status_code=404,
-            detail="Source audio is not available for this job.",
-        )
-    url = storage.generate_signed_url(job.input_r2_key, expiry_seconds=3600)
-    if not url:
-        raise HTTPException(
-            status_code=503,
-            detail="Object storage is unavailable.",
-        )
-    return {"url": url, "expires_in": 3600}
+        job.input_r2_key = target_key
+        db.commit()
+
+    logger.info(
+        "[RESTORE-AUDIO] job_id=%s tenant=%s key=%s size_mb=%.1f restored_by_user=%s",
+        job_id, job.tenant_id, target_key, size_bytes / 1024 / 1024,
+        current_user.get("id"),
+    )
+
+    return {
+        "job_id": job_id,
+        "key": target_key,
+        "size_mb": round(size_bytes / 1024 / 1024, 2),
+        "restored": True,
+    }
 
 
 @app.get("/jobs/{job_id}/background-url")
