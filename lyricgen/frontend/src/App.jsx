@@ -1,4 +1,4 @@
-import { useState, useRef, useCallback, useEffect } from "react";
+import { useState, useRef, useCallback, useEffect, lazy, Suspense } from "react";
 import {
   Routes, Route, Navigate, Outlet,
   useNavigate, useLocation, useParams,
@@ -15,18 +15,58 @@ import Dashboard from "./components/Dashboard";
 import HistoryView from "./components/HistoryView";
 import SearchPalette from "./components/SearchPalette";
 import UploadZone from "./components/UploadZone";
-import LyricsEditor from "./components/LyricsEditor";
+// 2026-05-27 Phase-2 audit: LyricsEditor (~85 KB), AdminPanel (~50 KB)
+// and Settings (~30 KB) lazy-load so the main bundle drops below
+// 500 KB on the first paint. The editor in particular is only entered
+// after the operator decides to review/edit a song — saving its bytes
+// from the cold start shaves seconds on slow networks. JobDetail stays
+// eager because /videos/:id is a high-frequency landing route and the
+// extra chunk fetch would add a perceived "delay" on every video open.
+const LyricsEditor = lazy(() => import("./components/LyricsEditor"));
+const AdminPanel = lazy(() => import("./components/AdminPanel"));
+const Settings = lazy(() => import("./components/Settings"));
 import BatchProgress from "./components/BatchProgress";
 import TranscribingProgress from "./components/TranscribingProgress";
 import JobDetail from "./components/JobDetail";
-import Settings from "./components/Settings";
-import AdminPanel from "./components/AdminPanel";
 import { useAlert } from "./components/AlertProvider";
 import { useBackgroundPreview } from "./hooks/useBackgroundPreview";
 import { useMediaUrl } from "./mediaUrl";
 import { submitLyricsEdit } from "./lib/lyricsEditSubmit";
 
 const API = import.meta.env.VITE_API_URL || "";
+
+// 2026-05-27 Phase-2 — fallbacks shown for the brief window between
+// "user navigated to a lazy route" and "the chunk has been parsed".
+// Pure CSS, no fetches; mirrors the surrounding glass aesthetic so the
+// swap to the real component doesn't reflow the viewport.
+function RouteSuspenseFallback() {
+  return (
+    <div className="w-full max-w-3xl mx-auto px-4 py-12">
+      <div className="h-8 w-48 rounded bg-surface-2/60 animate-pulse mb-6" />
+      <div className="space-y-3">
+        {Array.from({ length: 5 }).map((_, i) => (
+          <div key={i} className="h-12 rounded-card bg-surface-2/40 ring-1 ring-white/[0.03] animate-pulse" />
+        ))}
+      </div>
+    </div>
+  );
+}
+
+function EditorSuspenseFallback() {
+  // Editor wraps in a 980 px column; keep the placeholder the same
+  // width so the wizard layout doesn't shift when the chunk lands.
+  return (
+    <div className="w-full max-w-[980px] mx-auto px-4 py-6">
+      <div className="h-10 w-64 rounded bg-surface-2/60 animate-pulse mb-4" />
+      <div className="h-20 rounded-card bg-surface-2/40 ring-1 ring-white/[0.03] animate-pulse mb-3" />
+      <div className="space-y-2">
+        {Array.from({ length: 8 }).map((_, i) => (
+          <div key={i} className="h-10 rounded-card bg-surface-2/40 ring-1 ring-white/[0.03] animate-pulse" />
+        ))}
+      </div>
+    </div>
+  );
+}
 
 // --- Auth helpers ---
 function getTokenExp(token) {
@@ -816,6 +856,7 @@ export default function App() {
       reviewQueue.length > 0;
     if (!anyState) {
       // Fresh wizard / cleared explicitly → blow away the snapshot too.
+      // Clear is rare (logout / discard); leave it sync.
       wizardPersistence.clear();
       return;
     }
@@ -825,11 +866,30 @@ export default function App() {
     // Audit fix 2026-05-25: agregamos TODO el state top-level que faltaba
     // (delivery → delivery_profile UMG, style/customColors/etc.) para que
     // un refresh durante un batch UMG no caiga silently a youtube.
-    wizardPersistence.save({
+    //
+    // 2026-05-27 perf audit (UMG micro-freezes): `wizardPersistence.save()`
+    // wraps a synchronous `localStorage.setItem(JSON.stringify(...))`
+    // that blocks the main thread for ~5-20 ms on a typical snapshot.
+    // This effect re-runs on 12 different dep changes, many of which
+    // fire during the poll loop. Defer to `requestIdleCallback` (with
+    // setTimeout fallback) so the save happens during idle frames
+    // instead of blocking renders. We also cancel any pending write
+    // when the effect re-runs to coalesce rapid mutations.
+    const snapshot = {
       files, approvedJobs, currentReview, reviewQueue, wizardStage,
       style, customColors, delivery, backgroundId, backgroundMode,
       animateImage, inspiredByLyrics,
+    };
+    const schedule = typeof requestIdleCallback !== "undefined"
+      ? (cb) => requestIdleCallback(cb, { timeout: 1500 })
+      : (cb) => setTimeout(cb, 0);
+    const cancel = typeof cancelIdleCallback !== "undefined"
+      ? (id) => cancelIdleCallback(id)
+      : (id) => clearTimeout(id);
+    const id = schedule(() => {
+      try { wizardPersistence.save(snapshot); } catch (_) {}
     });
+    return () => cancel(id);
   }, [
     files, approvedJobs, currentReview, reviewQueue, wizardStage,
     style, customColors, delivery, backgroundId, backgroundMode,
@@ -2550,6 +2610,7 @@ export default function App() {
     if (currentReview) {
       return (
         <div className="flex justify-center">
+          <Suspense fallback={<EditorSuspenseFallback />}>
           <LyricsEditor
             // key forces a fresh mount when stepping forward/backward
             // through the batch — LyricsEditor seeds its `edited` state
@@ -2618,6 +2679,7 @@ export default function App() {
             // disparar re-renders a 60fps.
             onPlaybackTick={handlePlaybackTick}
           />
+          </Suspense>
         </div>
       );
     }
@@ -2831,10 +2893,18 @@ export default function App() {
           <Route path="/v/:id" element={<LegacyVideoRedirect />} />
           <Route path="/staff" element={<Navigate to="/admin" replace />} />
           <Route path="/settings" element={<Navigate to="/account" replace />} />
-          <Route path="/account" element={<Settings onBack={() => navigate("/dashboard")} />} />
+          <Route path="/account" element={
+            <Suspense fallback={<RouteSuspenseFallback />}>
+              <Settings onBack={() => navigate("/dashboard")} />
+            </Suspense>
+          } />
           <Route path="/admin" element={
             user?.role === "admin"
-              ? <AdminPanel onBack={() => navigate("/dashboard")} />
+              ? (
+                <Suspense fallback={<RouteSuspenseFallback />}>
+                  <AdminPanel onBack={() => navigate("/dashboard")} />
+                </Suspense>
+              )
               : <Navigate to="/dashboard" replace />
           } />
         </Route>
