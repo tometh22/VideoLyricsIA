@@ -1898,8 +1898,13 @@ export default function UploadZone({
   return (
     <div className="w-full px-2 md:px-6 pb-28">
       <UploadTour user={user} />
-      {files.length === 0 ? (
-        /* Pre-upload — just the drop zone, centered and prominent */
+      {/* Pre-upload short-circuit: drop zone-only layout aplica solo cuando
+          NO hay contenido reviewable Y NO estamos en edit-mode. Sin estas
+          dos condiciones extra, /edit-lyrics (lockedSteps no vacío) y
+          /review post-transcribe (donde `files` legítimamente puede estar
+          vacío) caían acá y se veía "Crear videos" en vez del editor.
+          Bug 2026-05-27, fix UploadZone-shortcircuit. */}
+      {files.length === 0 && !hasReviewableContent && !_editMode ? (
         <div className="max-w-2xl mx-auto">{_dropZone}</div>
       ) : (
       /* UI F1+F2+F3 (2026-05-26): el grid se reconfigura cuando el
