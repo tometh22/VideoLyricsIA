@@ -368,3 +368,98 @@ def test_cannot_create_variant_of_other_tenant_job(client, db, monkeypatch):
     )
     # 404 — no leakeamos info de que el job existe en otro tenant
     assert r.status_code == 404
+
+
+# ─── R2 copy_object guarantee (fix/audio-lost-variant-cleanup) ──────
+
+def test_variant_aborts_with_503_when_copy_object_returns_false(client, user_token, db, monkeypatch):
+    """REGRESSION 2026-05-27 (audio perdido). Pre-fix: if storage.copy_object
+    returned False (transient R2 error), the variant was created anyway with
+    input_r2_key pointing at the parent's key. Later cleanup_old_inputs
+    deleted the parent's WAV while the variant still referenced it → 404
+    on /waveform, /source-audio-url. Fix: abort with 503 instead of falling
+    through with a shared key. Operator retries; R2 usually recovers."""
+    me = _decode_user(client, user_token)
+    parent_id = _seed_done_job(
+        db, owner_id=me["id"], tenant_id=me["tenant_id"],
+        segments_json=[{"start": 0.0, "end": 1.0, "text": "x"}],
+        input_r2_key="inputs/abc/track.wav",
+    )
+
+    # Force R2 to be "enabled" + copy_object to silently fail.
+    monkeypatch.setattr("storage.is_enabled", lambda: True)
+    monkeypatch.setattr("storage.copy_object", lambda src, dst: False)
+    # Don't reach enqueue — abort should happen before.
+    enqueue_called = {"hit": False}
+    monkeypatch.setattr(
+        "main.enqueue_pipeline",
+        lambda **kw: enqueue_called.update({"hit": True}) or "fake_rq_id",
+    )
+
+    r = client.post(
+        f"/jobs/{parent_id}/variant", json={},
+        headers={"Authorization": f"Bearer {user_token}"},
+    )
+    assert r.status_code == 503, r.text
+    # No DB row should have been committed.
+    db.expire_all()
+    siblings = db.query(Job).filter(Job.parent_job_id == parent_id).all()
+    assert siblings == []
+    # And we never enqueued.
+    assert enqueue_called["hit"] is False
+
+
+def test_variant_aborts_with_503_when_copy_object_raises(client, user_token, db, monkeypatch):
+    """Same as above but copy_object throws instead of returning False
+    (network blip, IAM revoke, etc.). Must also abort, not fall through."""
+    me = _decode_user(client, user_token)
+    parent_id = _seed_done_job(
+        db, owner_id=me["id"], tenant_id=me["tenant_id"],
+        segments_json=[{"start": 0.0, "end": 1.0, "text": "x"}],
+        input_r2_key="inputs/abc/track.wav",
+    )
+
+    def boom(src, dst):
+        raise RuntimeError("R2 SDK exploded")
+
+    monkeypatch.setattr("storage.is_enabled", lambda: True)
+    monkeypatch.setattr("storage.copy_object", boom)
+    monkeypatch.setattr("main.enqueue_pipeline", lambda **kw: "fake")
+
+    r = client.post(
+        f"/jobs/{parent_id}/variant", json={},
+        headers={"Authorization": f"Bearer {user_token}"},
+    )
+    assert r.status_code == 503
+    db.expire_all()
+    assert db.query(Job).filter(Job.parent_job_id == parent_id).all() == []
+
+
+def test_variant_owns_independent_input_when_copy_succeeds(client, user_token, db, monkeypatch):
+    """Happy path with R2 enabled: variant's input_r2_key MUST NOT equal
+    parent's. The variant has its own copy under inputs/{tenant}/{new_id}/."""
+    me = _decode_user(client, user_token)
+    parent_key = "inputs/some-tenant/abc123def456/track.wav"
+    parent_id = _seed_done_job(
+        db, owner_id=me["id"], tenant_id=me["tenant_id"],
+        segments_json=[{"start": 0.0, "end": 1.0, "text": "x"}],
+        input_r2_key=parent_key,
+    )
+
+    # is_enabled=True + copy_object returns True (success).
+    monkeypatch.setattr("storage.is_enabled", lambda: True)
+    monkeypatch.setattr("storage.copy_object", lambda src, dst: True)
+    monkeypatch.setattr("main.enqueue_pipeline", lambda **kw: "fake")
+
+    r = client.post(
+        f"/jobs/{parent_id}/variant", json={},
+        headers={"Authorization": f"Bearer {user_token}"},
+    )
+    assert r.status_code == 200, r.text
+    new_id = r.json()["job_id"]
+
+    db.expire_all()
+    new_job = db.query(Job).filter(Job.job_id == new_id).first()
+    # The variant's key is under its OWN job_id, not the parent's.
+    assert new_job.input_r2_key != parent_key
+    assert f"/{new_id}/" in new_job.input_r2_key

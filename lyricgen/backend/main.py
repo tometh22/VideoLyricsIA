@@ -8188,26 +8188,26 @@ async def create_variant(
     new_job_id = uuid.uuid4().hex[:12]
 
     # Variant gets its own copy of the input audio in R2 — server-side
-    # CopyObject, no bytes round-trip through us. This makes each variant
-    # self-contained: deleting the parent (or any sibling) no longer
-    # breaks the lineage.
+    # CopyObject, no bytes round-trip through us. Each variant must be
+    # self-contained: deleting the parent (or any sibling) MUST NOT
+    # break the lineage, and the cleanup cron MUST NOT delete shared audio
+    # behind a live variant.
     #
-    # Before this PR variants inherited `parent.input_r2_key` literally.
-    # PR #220 already prevents the cascade-delete via a sibling-count
-    # check in jobs._delete_r2_objects, but copying the audio is the
-    # belt-and-suspenders: if anything else ever deletes the parent's
-    # raw key (R2 lifecycle policy, manual ops, future regression),
-    # this variant still has its own copy.
+    # CRITICAL FIX 2026-05-27 (fix/audio-lost-variant-cleanup): pre-fix
+    # this block fell back to `variant_input_r2_key = parent.input_r2_key`
+    # when copy_object failed (transient R2 error, network blip). That
+    # broke the self-containment guarantee: storage._active_input_keys
+    # derived its protect-list from {job_id} only — it never read the
+    # row's literal input_r2_key — so when the parent reached terminal
+    # state + 30 days, the cleanup cron deleted its WAV while the variant
+    # was still pointing at it. Result: variant got 404 on /waveform,
+    # /source-audio-url, and any subsequent edit (audio "perdido").
+    # storage.py is also patched in this PR to consult input_r2_key, but
+    # eliminating the silent fallback removes the root cause altogether.
     #
     # Storage cost: ~30-80 MB per variant WAV/MP3. Marginal vs the
     # ~$0.90 Veo cost per variant. Tradeoff worth the safety.
-    #
-    # Fallback semantics: if copy fails for any reason (R2 disabled,
-    # transient error, source missing despite the pre-check above), we
-    # fall back to sharing parent.input_r2_key — same as pre-fix behavior.
-    # The audit log records which mode was used so admin can spot the
-    # silently-degraded case.
-    variant_input_r2_key = parent.input_r2_key
+    variant_input_r2_key = parent.input_r2_key  # default for the dev/no-R2 path
     variant_owns_input = False
     try:
         import os as _os_mod
@@ -8226,16 +8226,28 @@ async def create_variant(
                     src_key, candidate_dst, parent.job_id, new_job_id,
                 )
             else:
-                logger.warning(
-                    "[VARIANT] Audio copy returned False, falling back to shared key: %s",
-                    src_key,
+                # Hard fail. Do NOT fall through with the parent's key —
+                # see comment above. Operator retries, R2 usually recovers.
+                logger.error(
+                    "[VARIANT] copy_object returned False for parent=%s src=%r — aborting variant creation",
+                    parent.job_id, src_key,
                 )
+                raise HTTPException(
+                    status_code=503,
+                    detail="No pudimos preparar el audio de la variante. Reintentá en unos segundos.",
+                )
+    except HTTPException:
+        raise  # bubble up the 503 from the explicit else branch above
     except Exception as _exc:
-        # Copy is best-effort. If it explodes, the variant still works —
-        # just shares its input with the parent (pre-#220 behavior).
-        logger.warning(
-            "[VARIANT] copy_object failed for parent=%s src=%r, falling back to shared key: %s",
+        # Same rationale: even a thrown copy_object means we cannot
+        # safely create a self-contained variant. Abort.
+        logger.error(
+            "[VARIANT] copy_object threw for parent=%s src=%r: %s — aborting variant creation",
             parent.job_id, parent.input_r2_key, _exc,
+        )
+        raise HTTPException(
+            status_code=503,
+            detail="No pudimos preparar el audio de la variante. Reintentá en unos segundos.",
         )
 
     new_job = JobModel(

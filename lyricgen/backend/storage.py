@@ -591,23 +591,34 @@ def multipart_abort(key: str, upload_id: str) -> bool:
         return False
 
 
-def _active_input_keys() -> set[str]:
-    """Return the set of object keys that belong to a non-terminal job.
+def _active_input_keys() -> tuple[set[str], set[str]]:
+    """Return (protected_prefixes, protected_exact_keys) for cleanup.
 
-    Cleanup must NOT touch these — a job that has been queued for >30 days
-    after an outage still has its input MP3 referenced from the DB, and
-    deleting it from R2 makes the job unrunnable when the worker finally
-    picks it up.
+    Cleanup must NOT touch keys belonging to jobs that are still in flight,
+    even if their LastModified is older than retention:
 
-    Empty set is returned when the DB is unreachable; the caller treats
-    that as "no protected keys" and skips deletion entirely (see below).
+      - `protected_prefixes`: derived from job_id (canonical case — the
+        worker writes the input under `inputs/{tenant}/{job_id}/`).
+        Caller uses startswith() to also catch siblings under the same
+        prefix (waveform peaks, etc.).
+      - `protected_exact_keys`: the literal `job.input_r2_key` the row
+        references. This catches the case where a job inherits another
+        job's key — happens with variants created via /jobs/{id}/variant
+        when `storage.copy_object` fails and the row is left pointing
+        at the parent's key. Before this PR (2026-05-27) the cleanup
+        protect-list never consulted `input_r2_key` at all, so the
+        parent's audio got GC'd while live variants still pointed at it.
+
+    Empty sets on DB hiccup; caller treats that as "no protected keys"
+    and skips deletion entirely.
     """
     try:
         from database import Job, SessionLocal
     except Exception:
-        return set()
+        return set(), set()
 
-    keys: set[str] = set()
+    prefixes: set[str] = set()
+    exact_keys: set[str] = set()
     try:
         db = SessionLocal()
         try:
@@ -624,17 +635,21 @@ def _active_input_keys() -> set[str]:
                 .all()
             )
             for j in non_terminal:
-                # Whatever the original upload filename was, the worker
-                # writes inputs under inputs/{tenant}/{job_id}/. Match the
-                # prefix rather than the exact key to handle filename
-                # rewrites at upload time.
-                keys.add(f"inputs/{_safe_filename(j.tenant_id)}/{_safe_filename(j.job_id)}/")
+                # Canonical: prefix derived from job_id catches all siblings
+                # under inputs/{tenant}/{job_id}/ regardless of the filename
+                # the worker chose at upload time.
+                prefixes.add(f"inputs/{_safe_filename(j.tenant_id)}/{_safe_filename(j.job_id)}/")
+                # Defensive: the literal key the row references. Covers
+                # variants that share their parent's input_r2_key (variant
+                # endpoint fallback when copy_object failed pre-fix).
+                if j.input_r2_key:
+                    exact_keys.add(j.input_r2_key)
         finally:
             db.close()
     except Exception:
         # DB hiccup — return what we have; caller may decide to abort.
         pass
-    return keys
+    return prefixes, exact_keys
 
 
 def cleanup_old_inputs(retention_days: int = 30, apply: bool = False, prefix: str = "inputs/") -> dict:
@@ -671,7 +686,11 @@ def cleanup_old_inputs(retention_days: int = 30, apply: bool = False, prefix: st
     # Build a protect-list of input keys belonging to jobs that are still
     # queued/processing/pending_review. We skip these even if their
     # LastModified is past the retention window.
-    protected_prefixes = _active_input_keys()
+    #
+    # Two layers: prefixes (canonical, inputs/{tenant}/{job_id}/) AND
+    # exact_keys (whatever job.input_r2_key literally points at, in case
+    # a variant shares the parent's key — see _active_input_keys docstring).
+    protected_prefixes, protected_exact_keys = _active_input_keys()
     skipped_active = 0
 
     scanned = 0
@@ -684,7 +703,7 @@ def cleanup_old_inputs(retention_days: int = 30, apply: bool = False, prefix: st
             modified = obj["LastModified"]
             if modified < cutoff:
                 key = obj["Key"]
-                if any(key.startswith(p) for p in protected_prefixes):
+                if key in protected_exact_keys or any(key.startswith(p) for p in protected_prefixes):
                     skipped_active += 1
                     continue
                 expired.append((key, obj["Size"], modified))
