@@ -1125,6 +1125,40 @@ def run_pipeline(job_id: str, mp3_path: str, artist: str, style: str,
                 enqueue_prores_prewarm(job_id, "umg_short")
             except Exception as e:  # pragma: no cover
                 logger.warning("[PIPELINE] prores prewarm enqueue skipped: %s", e)
+
+        # PR feat/waveform-precompute 2026-05-27: pre-compute the timeline
+        # waveform now, while the worker still has the input MP3 in
+        # context, so the FIRST time the operator opens the editor on this
+        # job (post-approval lyrics fix) /jobs/:id/waveform is a cache
+        # hit (~200ms instead of the 5-30s cold-cache cost from
+        # downloading the MP3 + running librosa.load). Best-effort —
+        # never fail the main render because the waveform precompute
+        # had a hiccup, the on-demand endpoint will recompute on first
+        # operator request as a fallback.
+        if final_status in ("done", "pending_review"):
+            try:
+                # Resolve input_r2_key from the row (the local `mp3_path`
+                # used during render is ephemeral; the helper downloads
+                # the canonical R2 copy). Cheap session, closed immediately.
+                from database import SessionLocal
+                from jobs import get_job_model
+                from waveform_compute import compute_and_cache_waveform
+                _db = SessionLocal()
+                try:
+                    _row = get_job_model(_db, job_id)
+                    _input_key = _row.input_r2_key if _row else None
+                finally:
+                    _db.close()
+                if _input_key:
+                    payload = compute_and_cache_waveform(job_id, _input_key)
+                    if payload is None:
+                        logger.warning(
+                            "[WAVEFORM] precompute returned None for %s — operator's "
+                            "first open will recompute on-demand",
+                            job_id,
+                        )
+            except Exception as e:  # pragma: no cover
+                logger.warning("[WAVEFORM] precompute skipped for %s: %s", job_id, e)
     except Exception as exc:
         traceback.print_exc()
         update_job(job_id, status="error", error=str(exc))
