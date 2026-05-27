@@ -1,6 +1,9 @@
 import { createContext, useContext, useState, useCallback } from "react";
 
-const translations = {
+// Exported so unit tests can pin specific copy without mounting the
+// full I18nProvider tree. The runtime context still consumes this same
+// dictionary via I18nProvider below — exporting is read-only.
+export const translations = {
   es: {
     // Login
     "login.title": "Iniciar sesión",
@@ -647,9 +650,9 @@ const translations = {
     // hay poco espacio + hint del minimapa de timeline.
     "editor.autofix_apply_all_short": "Aplicar todas",
     "editor.minimap_hint": "Hacé click en el minimapa para saltar a esa parte de la canción",
-    "detail.transcribed_title": "Borrador listo para editar",
-    "detail.transcribed_subtitle": "La transcripción ya está lista. Revisá los lyrics y dale Generar video para terminar.",
-    "detail.transcribed_cta": "Editar lyrics y generar",
+    "detail.transcribed_title": "Este video todavía no se generó",
+    "detail.transcribed_subtitle": "La transcripción está lista pero nunca se disparó la generación. Continuá el wizard para revisar lyrics, elegir estilo y generar el video.",
+    "detail.transcribed_cta": "Continuar wizard y generar video",
     "detail.transcribed_pending_title": "Subida en curso",
     "detail.transcribed_pending_subtitle": "La subida está en curso. Cuando termine, vas a poder editar los lyrics.",
     "detail.transcribing_title": "Transcribiendo…",
@@ -1545,9 +1548,9 @@ const translations = {
     "detail.not_available": "This video is not ready to preview yet.",
     "detail.back": "Back",
     // PR #297: full EN coverage of the 14 keys PR #294 added in ES only.
-    "detail.transcribed_title": "Draft ready to edit",
-    "detail.transcribed_subtitle": "Your transcription is ready. Review the lyrics and hit Generate video to finish.",
-    "detail.transcribed_cta": "Edit lyrics and generate",
+    "detail.transcribed_title": "This video hasn't been generated yet",
+    "detail.transcribed_subtitle": "The transcription is ready but generation was never triggered. Continue the wizard to review lyrics, pick a style and generate the video.",
+    "detail.transcribed_cta": "Continue wizard and generate video",
     "detail.transcribed_pending_title": "Upload in progress",
     "detail.transcribed_pending_subtitle": "The upload is in progress. Once it completes, you'll be able to edit the lyrics.",
     "detail.transcribing_title": "Transcribing…",
@@ -2292,9 +2295,9 @@ const translations = {
     "detail.view_youtube": "Ver no YouTube",
     "detail.not_available": "Este vídeo ainda não está pronto para preview.",
     // PR #297: cobertura PT das 14 chaves que PR #294 deixou só em ES.
-    "detail.transcribed_title": "Rascunho pronto para editar",
-    "detail.transcribed_subtitle": "Sua transcrição está pronta. Revise as letras e clique em Gerar vídeo para finalizar.",
-    "detail.transcribed_cta": "Editar letras e gerar",
+    "detail.transcribed_title": "Este vídeo ainda não foi gerado",
+    "detail.transcribed_subtitle": "A transcrição está pronta mas a geração nunca foi disparada. Continue o wizard para revisar as letras, escolher o estilo e gerar o vídeo.",
+    "detail.transcribed_cta": "Continuar wizard e gerar vídeo",
     "detail.transcribed_pending_title": "Upload em andamento",
     "detail.transcribed_pending_subtitle": "O upload está em andamento. Quando terminar, você poderá editar as letras.",
     "detail.transcribing_title": "Transcrevendo…",
