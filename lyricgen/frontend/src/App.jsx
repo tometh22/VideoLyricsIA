@@ -372,6 +372,14 @@ function EditLyricsRoute({ setCurrentReview, wizardScreen, t }) {
     let alive = true;
     setState({ status: "loading" });
 
+    // TEMP DIAGNOSTIC LOGGING 2026-05-27 (chore/edit-lyrics-debug-logging):
+    // operador reportó "/edit-lyrics renderea Crear videos" en multi-browser
+    // y multi-user. Mi PR #405 (defensive guards) no resolvió en su navegador
+    // → hipótesis del cleanup race era incorrecta. Estos logs nos dicen
+    // exactamente en qué punto del bootstrap se rompe. REMOVER tras zanjar.
+    // eslint-disable-next-line no-console
+    console.log("[EDIT-LYRICS-BOOT] mount id=", id);
+
     // Re-hidrate from snapshot when refreshing mid-edit: el operador
     // ya tenía edits in-flight, el snapshot persistido por wizardPersistence
     // los preserva. Las URLs firmadas (audio/bg) sí re-fetchean porque
@@ -381,6 +389,8 @@ function EditLyricsRoute({ setCurrentReview, wizardScreen, t }) {
       snap?.currentReview?.editingJobId === id &&
       Array.isArray(snap.currentReview.segments) &&
       snap.currentReview.segments.length > 0;
+    // eslint-disable-next-line no-console
+    console.log("[EDIT-LYRICS-BOOT] reusableSnap=", reusableSnap, "snap=", snap?.currentReview?.editingJobId);
 
     (async () => {
       // Two-phase bootstrap (PR fix/edit-lyrics-fast-mount, 2026-05-27).
@@ -409,10 +419,14 @@ function EditLyricsRoute({ setCurrentReview, wizardScreen, t }) {
       //     desde el primer ms.
 
       // Fase A — /status: critical path, blocking.
+      // eslint-disable-next-line no-console
+      console.log("[EDIT-LYRICS-BOOT] Phase A start /status id=", id);
       let statusRes;
       try {
         statusRes = await authFetchWithTimeout(`${API}/status/${id}`, {}, 10_000);
       } catch (e) {
+        // eslint-disable-next-line no-console
+        console.log("[EDIT-LYRICS-BOOT] Phase A /status THREW", e?.name, e?.message);
         // TimeoutError o network error. /status es rápido en condiciones
         // normales (~50ms); un timeout de 10s implica DB stuck u otra
         // patología seria — fall back a state="error" con botón "Volver".
@@ -420,16 +434,24 @@ function EditLyricsRoute({ setCurrentReview, wizardScreen, t }) {
         return;
       }
       if (!alive) return;
+      // eslint-disable-next-line no-console
+      console.log("[EDIT-LYRICS-BOOT] /status responded HTTP", statusRes.status, "ok=", statusRes.ok);
       if (statusRes.status === 404) { setState({ status: "not_found" }); return; }
       if (!statusRes.ok) { setState({ status: "error" }); return; }
 
       let job;
       try {
         job = await statusRes.json();
-      } catch {
+      } catch (jerr) {
+        // eslint-disable-next-line no-console
+        console.log("[EDIT-LYRICS-BOOT] json parse threw", jerr?.message);
         if (alive) setState({ status: "error" });
         return;
       }
+      // eslint-disable-next-line no-console
+      console.log("[EDIT-LYRICS-BOOT] job parsed: status=", job?.status,
+        "segments_json_len=", Array.isArray(job?.segments_json) ? job.segments_json.length : "(not array)",
+        "filename=", job?.filename);
 
       // Solo pending_review/done/rejected son editables (mismo gating
       // que canEditLyrics en JobDetail). Editing/queued/processing →
@@ -438,11 +460,18 @@ function EditLyricsRoute({ setCurrentReview, wizardScreen, t }) {
         job.status === "pending_review" ||
         job.status === "done" ||
         job.status === "rejected";
-      if (!editable) { setState({ status: "not_editable", jobStatus: job.status }); return; }
+      if (!editable) {
+        // eslint-disable-next-line no-console
+        console.log("[EDIT-LYRICS-BOOT] NOT EDITABLE — status=", job.status);
+        setState({ status: "not_editable", jobStatus: job.status });
+        return;
+      }
 
       // Sin segments_json no hay nada que editar — mismo banner amber
       // que mostraba el modal anterior, sin redirect silencioso.
       if (!Array.isArray(job.segments_json) || job.segments_json.length === 0) {
+        // eslint-disable-next-line no-console
+        console.log("[EDIT-LYRICS-BOOT] NO SEGMENTS — segments_json=", job.segments_json);
         setState({ status: "no_segments" });
         return;
       }
@@ -458,6 +487,8 @@ function EditLyricsRoute({ setCurrentReview, wizardScreen, t }) {
       // Mount the editor NOW with audio/waveform/bg as null. The LyricsEditor
       // handles these as optional — timeline renders without waveform fill,
       // preview without bg image. Operator can edit text/timing immediately.
+      // eslint-disable-next-line no-console
+      console.log("[EDIT-LYRICS-BOOT] Phase A success — calling setCurrentReview + setState(ready) for id=", id);
       setCurrentReview({
         editingJobId: id,
         segments: segmentsFromSnap,
@@ -538,9 +569,17 @@ function EditLyricsRoute({ setCurrentReview, wizardScreen, t }) {
   useEffect(() => {
     const myId = id;
     return () => {
+      // eslint-disable-next-line no-console
+      console.log("[EDIT-LYRICS-BOOT] cleanup useEffect[id] firing for myId=", myId);
       setCurrentReview((r) => {
         if (!r) return r;
-        if (r.editingJobId !== myId) return r;  // no es nuestro, no tocar
+        if (r.editingJobId !== myId) {
+          // eslint-disable-next-line no-console
+          console.log("[EDIT-LYRICS-BOOT] cleanup SKIP — r.editingJobId=", r.editingJobId, "!= myId=", myId);
+          return r;  // no es nuestro, no tocar
+        }
+        // eslint-disable-next-line no-console
+        console.log("[EDIT-LYRICS-BOOT] cleanup CLEARING currentReview (editingJobId match)");
         return null;
       });
       wizardPersistence.clear();
@@ -615,6 +654,8 @@ function EditLyricsRoute({ setCurrentReview, wizardScreen, t }) {
       </div>
     );
   }
+  // eslint-disable-next-line no-console
+  console.log("[EDIT-LYRICS-BOOT] render with state.status=", state.status, "→ wizardScreen");
   return wizardScreen;
 }
 
@@ -2327,6 +2368,15 @@ export default function App() {
       })()
     : null;
 
+  // TEMP DIAGNOSTIC 2026-05-27: log cada render del wizard con el currentReview
+  // actual. Combined con los logs de EditLyricsRoute identifica el render
+  // donde wizardScreen se renderea CON currentReview vacío (= bug).
+  // eslint-disable-next-line no-console
+  console.log("[WIZARD-RENDER] currentReview.editingJobId=",
+    currentReview?.editingJobId,
+    "wizardStage=", wizardStage,
+    "files.length=", files.length,
+    "approvedJobs.length=", approvedJobs.length);
   const newBatchScreen = (
     <div className="w-full max-w-[1700px] mx-auto animate-fade-in">
       <div className="flex items-center gap-3 mb-8">
