@@ -326,13 +326,25 @@ export default function UploadZone({
   // En modo post-render edit (lockedSteps no vacío + content reviewable
   // pre-seeded) arrancamos directo en step 6 para que el operador no vea
   // un flash del paso 1 mientras el useEffect de auto-advance se acomoda.
+  //
+  // RACE GUARD 2026-05-27 (fix/edit-lyrics-bootstrap-race): en prod un bug
+  // ponía esto en step 1 ("Crear videos") cuando el operador abría
+  // /videos/X/edit-lyrics y currentReview se reseteaba a null por race.
+  // Con lockedSteps.length>0 sabemos que el padre ya intentó montarnos en
+  // modo post-render edit; el currentReview puede llegar después (Phase B
+  // del bootstrap), pero el step 6 ya es el correcto desde el initial
+  // mount. NO REQUIERE hasReviewableContent. Para wizard nuevo (no edit),
+  // lockedSteps es [] así que sigue arrancando en step 1.
   const [wizardStep, setWizardStep] = useState(() => {
-    if (hasReviewableContent && Array.isArray(lockedSteps) && lockedSteps.length > 0) return 6;
+    if (Array.isArray(lockedSteps) && lockedSteps.length > 0) return 6;
     return 1;
   });
-  // Step 6 es clickeable solo cuando hay contenido de review activo.
-  // Cuando no hay, el cap es step 5 (los pasos 1-5 son siempre clickables).
-  const _maxInteractiveStep = hasReviewableContent ? 6 : 5;
+  // Step 6 es clickeable cuando hay contenido de review activo O cuando
+  // estamos en modo post-render edit (lockedSteps set). Cuando no hay,
+  // el cap es step 5 (los pasos 1-5 son siempre clickables).
+  const _maxInteractiveStep =
+    (hasReviewableContent || (Array.isArray(lockedSteps) && lockedSteps.length > 0))
+      ? 6 : 5;
   // lockedSteps (post-render edit): IDs no navegables. goStep bail-outs y
   // los helpers prev/next saltean los locked para que la sticky bar muestre
   // el siguiente paso navegable real, no uno que el operador no puede usar.
@@ -350,16 +362,24 @@ export default function UploadZone({
     if (_lockedSet.has(clamped)) return;
     setWizardStep(clamped);
   };
-  // Auto-advance a step 6 cuando aparece contenido de review. Y bajar a
-  // step 5 si el operador clickea "Volver" y desaparece el contenido.
+  // Auto-advance a step 6 cuando aparece contenido de review O cuando
+  // lockedSteps indica modo post-render edit. Y bajar a step 5 si el
+  // operador clickea "Volver" y desaparece TODO el contexto de review.
+  //
+  // RACE GUARD 2026-05-27: agregamos lockedSteps al check porque en el
+  // bug reportado, currentReview tarda en llegar (Phase B del bootstrap
+  // de EditLyricsRoute) pero lockedSteps ya viene set desde el primer
+  // render. Sin esta defensa, hay una ventana donde el editor monta en
+  // step 1 ("Crear videos") visible al operador.
+  const _editMode = Array.isArray(lockedSteps) && lockedSteps.length > 0;
   useEffect(() => {
-    if (hasReviewableContent && wizardStep !== 6) {
+    if ((hasReviewableContent || _editMode) && wizardStep !== 6) {
       setWizardStep(6);
-    } else if (!hasReviewableContent && wizardStep === 6) {
+    } else if (!hasReviewableContent && !_editMode && wizardStep === 6) {
       setWizardStep(5);
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [hasReviewableContent]);
+  }, [hasReviewableContent, _editMode]);
 
   // Hovering a movement option previews it in the big stage without committing.
   const [hoverMovement, setHoverMovement] = useState(null);
