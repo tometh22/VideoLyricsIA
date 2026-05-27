@@ -119,12 +119,17 @@ def main() -> int:
         # /jobs might wrap in {jobs: [...]}; handle both shapes.
         all_jobs = all_jobs.get("jobs") if isinstance(all_jobs, dict) else []
 
-    jobs_tenant = [
-        j for j in all_jobs
-        if j.get("tenant_id") == args.tenant
-        or args.tenant in (j.get("user", {}) or {}).get("username", "")
-    ][:args.limit]
-    print(f"Fetched {len(jobs_tenant)} job(s) for tenant={args.tenant}")
+    # The /jobs endpoint is ALREADY tenant-scoped server-side via
+    # _job_scope(current_user) — it returns only the caller's own
+    # tenant's jobs. So we don't need a client-side tenant filter (and
+    # the response doesn't include tenant_id per-row, which made the
+    # old client-side filter drop every job to 0). Just use what we got.
+    # The --tenant arg stays as a documentation / sanity-check parameter:
+    # if the token belongs to a different tenant, the operator gets back
+    # the wrong jobs and would notice immediately in the dry-run output.
+    jobs_tenant = all_jobs[:args.limit]
+    print(f"Fetched {len(jobs_tenant)} job(s) for the token's tenant "
+          f"(expected --tenant {args.tenant})")
     print()
 
     # 3. Per job: decide what to do.
