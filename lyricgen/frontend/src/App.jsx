@@ -848,6 +848,7 @@ export default function App() {
       reviewQueue.length > 0;
     if (!anyState) {
       // Fresh wizard / cleared explicitly → blow away the snapshot too.
+      // Clear is rare (logout / discard); leave it sync.
       wizardPersistence.clear();
       return;
     }
@@ -857,11 +858,30 @@ export default function App() {
     // Audit fix 2026-05-25: agregamos TODO el state top-level que faltaba
     // (delivery → delivery_profile UMG, style/customColors/etc.) para que
     // un refresh durante un batch UMG no caiga silently a youtube.
-    wizardPersistence.save({
+    //
+    // 2026-05-27 perf audit (UMG micro-freezes): `wizardPersistence.save()`
+    // wraps a synchronous `localStorage.setItem(JSON.stringify(...))`
+    // that blocks the main thread for ~5-20 ms on a typical snapshot.
+    // This effect re-runs on 12 different dep changes, many of which
+    // fire during the poll loop. Defer to `requestIdleCallback` (with
+    // setTimeout fallback) so the save happens during idle frames
+    // instead of blocking renders. We also cancel any pending write
+    // when the effect re-runs to coalesce rapid mutations.
+    const snapshot = {
       files, approvedJobs, currentReview, reviewQueue, wizardStage,
       style, customColors, delivery, backgroundId, backgroundMode,
       animateImage, inspiredByLyrics,
+    };
+    const schedule = typeof requestIdleCallback !== "undefined"
+      ? (cb) => requestIdleCallback(cb, { timeout: 1500 })
+      : (cb) => setTimeout(cb, 0);
+    const cancel = typeof cancelIdleCallback !== "undefined"
+      ? (id) => cancelIdleCallback(id)
+      : (id) => clearTimeout(id);
+    const id = schedule(() => {
+      try { wizardPersistence.save(snapshot); } catch (_) {}
     });
+    return () => cancel(id);
   }, [
     files, approvedJobs, currentReview, reviewQueue, wizardStage,
     style, customColors, delivery, backgroundId, backgroundMode,
