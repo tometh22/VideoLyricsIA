@@ -620,6 +620,17 @@ def _active_input_keys() -> set[str]:
                     # the upload-edit-generate flow. The reaper handles
                     # short-TTL cleanup separately.
                     "awaiting_upload", "transcribed_pending",
+                    # HOTFIX 2026-05-27: protect 'done' too. UMG workflows
+                    # leave a job at 'done' for weeks/months while operators
+                    # re-edit lyrics, request re-renders, or wait for label
+                    # approval — those edits all NEED the original audio.
+                    # Without this protection, cleanup_old_inputs (or any
+                    # equivalent sweep) would purge the input at 30 d and
+                    # the job becomes effectively un-rerenderable.
+                    # Surfaced 2026-05-27: 26 of agus.cafisi's done jobs
+                    # had their inputs purged between days 9-16 by some
+                    # path that escaped the protected list.
+                    "done",
                 )))
                 .all()
             )
@@ -703,6 +714,27 @@ def cleanup_old_inputs(retention_days: int = 30, apply: bool = False, prefix: st
     deleted = 0
     errors: list[dict] = []
     if apply and expired:
+        # AUDIT TRAIL 2026-05-27: emit a loud WARNING listing every key
+        # we're about to delete. Critical for forensics after the
+        # agus.cafisi incident (26 inputs vanished, no audit trail to
+        # tell us which sweep did it). One log line per key keeps grep
+        # friendly even when the batch is 1000+.
+        import sys as _sys
+        try:
+            caller_frame = _sys._getframe(1)
+            caller = f"{caller_frame.f_code.co_filename.split('/')[-1]}:{caller_frame.f_lineno}"
+        except Exception:
+            caller = "<unknown>"
+        logger.warning(
+            "[R2-BULK-DELETE] cleanup_old_inputs about to delete %d keys "
+            "(retention_days=%d, prefix=%r, caller=%s)",
+            len(expired), retention_days, prefix, caller,
+        )
+        for k, sz, mod in expired:
+            logger.warning(
+                "[R2-BULK-DELETE-KEY] key=%r size_mb=%.1f age_days=%d retention_days=%d",
+                k, sz / 1024 / 1024, (now - mod).days, retention_days,
+            )
         for i in range(0, len(expired), 1000):
             batch = expired[i:i + 1000]
             resp = client.delete_objects(
@@ -735,6 +767,23 @@ def delete_object(key: str) -> None:
     client = _get_client()
     if client is None:
         return
+    # AUDIT TRAIL 2026-05-27: log EVERY delete with WARNING level + caller
+    # frame so any future "where did my audio go?" investigation can
+    # grep the logs. Triggered after the agus.cafisi incident where 26
+    # input audios were deleted from R2 between days 9-16 by some path
+    # we couldn't trace from existing logs. The caller frame helps
+    # identify which code path called us (jobs, reaper, cleanup, etc).
+    if key.startswith("inputs/"):
+        import sys as _sys
+        try:
+            caller_frame = _sys._getframe(1)
+            caller = f"{caller_frame.f_code.co_filename.split('/')[-1]}:{caller_frame.f_lineno}"
+        except Exception:
+            caller = "<unknown>"
+        logger.warning(
+            "[R2-DELETE] input key=%r called_from=%s", key, caller,
+            extra={"event": "r2_input_deleted", "key": key, "caller": caller},
+        )
     try:
         client.delete_object(Bucket=R2_BUCKET, Key=key)
     except Exception as exc:
