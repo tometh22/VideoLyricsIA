@@ -383,73 +383,131 @@ function EditLyricsRoute({ setCurrentReview, wizardScreen, t }) {
       snap.currentReview.segments.length > 0;
 
     (async () => {
+      // Two-phase bootstrap (PR fix/edit-lyrics-fast-mount, 2026-05-27).
+      //
+      // Pre-fix: 4 fetches en paralelo bloqueantes (Promise.all). El editor
+      // no monta hasta que TODOS responden, y `/jobs/:id/waveform` puede
+      // tardar 5-30s en cold cache (librosa.load + R2 download). Operador
+      // reportó "no me deja corregir lyrics" cuando en realidad estaba
+      // esperando 30-60s viendo un spinner sin layout.
+      //
+      // Pre-fix también sin timeout en NINGÚN fetch: si /waveform se cuelga
+      // (libosa OOM, threadpool agotado), el spinner es literalmente
+      // perpetuo. Ahora cada fetch tiene cap propio vía authFetchWithTimeout.
+      //
+      // Estrategia post-fix:
+      //   Fase A (crítica, bloqueante): solo /status — Postgres query
+      //     rápido. Define si el job es editable y tiene segments. Sin
+      //     /status no hay UI posible (necesitamos saber el shape del job).
+      //   Fase B (enhancement, fire-and-forget): /source-audio-url,
+      //     /waveform, /background-url corren en paralelo SIN bloquear
+      //     el mount del editor. El editor monta inmediato con
+      //     audio/waveform/bg = null; cada fetch que resuelve patchea el
+      //     campo correspondiente en currentReview. LyricsEditor maneja
+      //     los nulls graciosamente (timeline sin waveform pintada,
+      //     preview sin bg), así que la edición de texto/timing funciona
+      //     desde el primer ms.
+
+      // Fase A — /status: critical path, blocking.
+      let statusRes;
       try {
-        const [statusRes, audioRes, waveformRes, bgRes] = await Promise.all([
-          authFetch(`${API}/status/${id}`),
-          authFetch(`${API}/jobs/${id}/source-audio-url`),
-          authFetch(`${API}/jobs/${id}/waveform`),
-          authFetch(`${API}/jobs/${id}/background-url`),
-        ]);
-        if (!alive) return;
-
-        if (statusRes.status === 404) { setState({ status: "not_found" }); return; }
-        if (!statusRes.ok) { setState({ status: "error" }); return; }
-        const job = await statusRes.json();
-
-        // Solo pending_review/done/rejected son editables (mismo gating
-        // que canEditLyrics en JobDetail). Editing/queued/processing →
-        // bail-out con redirect: no tiene sentido abrir el editor sobre
-        // un render en curso.
-        const editable =
-          job.status === "pending_review" ||
-          job.status === "done" ||
-          job.status === "rejected";
-        if (!editable) { setState({ status: "not_editable", jobStatus: job.status }); return; }
-
-        // Sin segments_json no hay nada que editar — mismo banner amber
-        // que mostraba el modal anterior, sin redirect silencioso.
-        if (!Array.isArray(job.segments_json) || job.segments_json.length === 0) {
-          setState({ status: "no_segments" });
-          return;
-        }
-
-        const audioData = audioRes.ok ? await audioRes.json() : null;
-        const waveformData = waveformRes.ok ? await waveformRes.json() : null;
-        const bgData = bgRes.ok ? await bgRes.json() : null;
-        const params = job.render_params || {};
-
-        // Reuso del snapshot: si el operador refrescó con edits in-flight,
-        // los segments del snapshot ganan sobre job.segments_json (que es
-        // lo último que el autosave guardó pero podría no incluir el
-        // último cambio uncommitted). La baseline para "unchanged" sigue
-        // siendo lo que el job tiene RENDERIZADO (job.segments_json).
-        const segmentsFromSnap = reusableSnap ? snap.currentReview.segments : job.segments_json;
-
-        setCurrentReview({
-          editingJobId: id,
-          segments: segmentsFromSnap,
-          openSnapshotSegments: JSON.parse(JSON.stringify(job.segments_json)),
-          filename: job.filename || job.artist || "lyrics",
-          file: null,
-          audioUrl: audioData?.url || null,
-          waveform: waveformData || null,
-          bgUrl: bgData?.url || null,
-          font: (reusableSnap && snap.currentReview.font) || params.font || "",
-          textCase: (reusableSnap && snap.currentReview.textCase) || params.text_case || "upper",
-          textContrast: (reusableSnap && snap.currentReview.textContrast) || params.text_contrast || "medium",
-          fontScale: String((reusableSnap && snap.currentReview.fontScale) || params.font_scale || "1.0"),
-          lyricsAnimation: (reusableSnap && snap.currentReview.lyricsAnimation) || params.lyrics_animation || "none",
-          lineTransition: (reusableSnap && snap.currentReview.lineTransition) || params.line_transition || "none",
-          // Empty queue: this isn't a batch, it's a one-off edit.
-          queue: [],
-          queueIdx: 0,
-          transcribeJobId: null,
-          referenceLyrics: "",
-        });
-        setState({ status: "ready" });
+        statusRes = await authFetchWithTimeout(`${API}/status/${id}`, {}, 10_000);
       } catch (e) {
+        // TimeoutError o network error. /status es rápido en condiciones
+        // normales (~50ms); un timeout de 10s implica DB stuck u otra
+        // patología seria — fall back a state="error" con botón "Volver".
         if (alive) setState({ status: "error" });
+        return;
       }
+      if (!alive) return;
+      if (statusRes.status === 404) { setState({ status: "not_found" }); return; }
+      if (!statusRes.ok) { setState({ status: "error" }); return; }
+
+      let job;
+      try {
+        job = await statusRes.json();
+      } catch {
+        if (alive) setState({ status: "error" });
+        return;
+      }
+
+      // Solo pending_review/done/rejected son editables (mismo gating
+      // que canEditLyrics en JobDetail). Editing/queued/processing →
+      // bail-out: no tiene sentido abrir el editor sobre un render en curso.
+      const editable =
+        job.status === "pending_review" ||
+        job.status === "done" ||
+        job.status === "rejected";
+      if (!editable) { setState({ status: "not_editable", jobStatus: job.status }); return; }
+
+      // Sin segments_json no hay nada que editar — mismo banner amber
+      // que mostraba el modal anterior, sin redirect silencioso.
+      if (!Array.isArray(job.segments_json) || job.segments_json.length === 0) {
+        setState({ status: "no_segments" });
+        return;
+      }
+
+      const params = job.render_params || {};
+      // Reuso del snapshot: si el operador refrescó con edits in-flight,
+      // los segments del snapshot ganan sobre job.segments_json (que es
+      // lo último que el autosave guardó pero podría no incluir el
+      // último cambio uncommitted). La baseline para "unchanged" sigue
+      // siendo lo que el job tiene RENDERIZADO (job.segments_json).
+      const segmentsFromSnap = reusableSnap ? snap.currentReview.segments : job.segments_json;
+
+      // Mount the editor NOW with audio/waveform/bg as null. The LyricsEditor
+      // handles these as optional — timeline renders without waveform fill,
+      // preview without bg image. Operator can edit text/timing immediately.
+      setCurrentReview({
+        editingJobId: id,
+        segments: segmentsFromSnap,
+        openSnapshotSegments: JSON.parse(JSON.stringify(job.segments_json)),
+        filename: job.filename || job.artist || "lyrics",
+        file: null,
+        audioUrl: null,           // populated by Phase B
+        waveform: null,           // populated by Phase B
+        bgUrl: null,              // populated by Phase B
+        font: (reusableSnap && snap.currentReview.font) || params.font || "",
+        textCase: (reusableSnap && snap.currentReview.textCase) || params.text_case || "upper",
+        textContrast: (reusableSnap && snap.currentReview.textContrast) || params.text_contrast || "medium",
+        fontScale: String((reusableSnap && snap.currentReview.fontScale) || params.font_scale || "1.0"),
+        lyricsAnimation: (reusableSnap && snap.currentReview.lyricsAnimation) || params.lyrics_animation || "none",
+        lineTransition: (reusableSnap && snap.currentReview.lineTransition) || params.line_transition || "none",
+        // Empty queue: this isn't a batch, it's a one-off edit.
+        queue: [],
+        queueIdx: 0,
+        transcribeJobId: null,
+        referenceLyrics: "",
+      });
+      setState({ status: "ready" });
+
+      // Fase B — enhancements: fire-and-forget. Each fetch has a 15 s cap
+      // (timeout); on success it patches the corresponding field into
+      // currentReview, on failure / timeout it silently leaves the field
+      // null and the editor keeps working in its degraded-visual mode.
+      //
+      // The setCurrentReview guard (editingJobId === id) prevents writes
+      // racing against an operator who navigated to a different job before
+      // the slow fetch landed.
+      const enhanceField = async (url, key, extractor) => {
+        try {
+          const res = await authFetchWithTimeout(url, {}, 15_000);
+          if (!alive || !res.ok) return;
+          const data = await res.json();
+          if (!alive) return;
+          const value = extractor(data);
+          setCurrentReview((prev) => {
+            if (!prev || prev.editingJobId !== id) return prev;
+            return { ...prev, [key]: value };
+          });
+        } catch {
+          // Timeout / network — silent fail, editor sigue funcional sin
+          // este enhancement.
+        }
+      };
+      enhanceField(`${API}/jobs/${id}/source-audio-url`, "audioUrl", (d) => d?.url || null);
+      enhanceField(`${API}/jobs/${id}/waveform`, "waveform", (d) => d);
+      enhanceField(`${API}/jobs/${id}/background-url`, "bgUrl", (d) => d?.url || null);
     })();
 
     return () => { alive = false; };
