@@ -770,7 +770,7 @@ async def delete_background(
 
 @router.post("/cleanup-inputs")
 async def cleanup_inputs(
-    retention_days: int = Query(30, ge=1, le=365),
+    retention_days: int = Query(365, ge=1, le=3650),
     apply: bool = Query(False),
     admin: dict = Depends(require_admin),
     db: Session = Depends(get_db),
@@ -779,10 +779,52 @@ async def cleanup_inputs(
     window. Inputs live under the `inputs/` prefix; deliverables and
     caches are not touched.
 
-    Default is dry-run (apply=false) so the admin sees what would be
-    deleted before doing it. Pass apply=true to actually delete.
+    HARDENED 2026-05-27 after the agus.cafisi incident (26 input audios
+    lost to this exact endpoint between 5/11 and 5/18, no audit trail at
+    the time). Three changes:
+      1. `apply=true` requires the env var ALLOW_INPUT_CLEANUP=true.
+         Default state is "the endpoint is disabled in delete mode" —
+         accidental clicks now return 503 instead of nuking audios.
+         If you ever need it, set the var in Railway dashboard, run
+         the endpoint, then UNSET the var to relock.
+      2. Default retention bumped 30 → 365 d. Storing 50 MB audios on
+         R2 costs ~$0.0075/audio/year — keeping them indefinitely is
+         orders of magnitude cheaper than recovering ONE lost UMG
+         project. Max raised to 10 years for flexibility.
+      3. Sentry capture_message fires on apply=true so the operator
+         sees the action in observability even if they ignore the
+         audit log.
+
+    Default is still dry-run (apply=false) — gives the admin a preview
+    of what WOULD be deleted before flipping the lock.
     """
+    import os
     import storage
+
+    if apply:
+        if os.environ.get("ALLOW_INPUT_CLEANUP", "").strip().lower() != "true":
+            raise HTTPException(
+                status_code=503,
+                detail=(
+                    "Input cleanup is disabled by default. To enable: set "
+                    "env var ALLOW_INPUT_CLEANUP=true in Railway dashboard, "
+                    "deploy, run this endpoint, then UNSET the var immediately "
+                    "to relock. See the 2026-05-27 agus.cafisi incident."
+                ),
+            )
+        # Sentry breadcrumb for delete-mode invocations. Even with the
+        # env-var guard, we want this action to scream in observability
+        # so a future repeat of the incident is visible within seconds.
+        try:
+            import sentry_sdk
+            sentry_sdk.capture_message(
+                f"[ADMIN-CLEANUP-INPUTS] user_id={admin['id']} "
+                f"retention_days={retention_days} prefix=inputs/",
+                level="warning",
+            )
+        except Exception:
+            pass
+
     report = storage.cleanup_old_inputs(
         retention_days=retention_days,
         apply=apply,

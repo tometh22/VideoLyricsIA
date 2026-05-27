@@ -624,13 +624,18 @@ def _active_input_keys() -> set[str]:
                     # leave a job at 'done' for weeks/months while operators
                     # re-edit lyrics, request re-renders, or wait for label
                     # approval — those edits all NEED the original audio.
-                    # Without this protection, cleanup_old_inputs (or any
-                    # equivalent sweep) would purge the input at 30 d and
-                    # the job becomes effectively un-rerenderable.
-                    # Surfaced 2026-05-27: 26 of agus.cafisi's done jobs
-                    # had their inputs purged between days 9-16 by some
-                    # path that escaped the protected list.
+                    # Surfaced after 26 of agus.cafisi's done jobs had
+                    # their inputs purged between days 9-16 by this exact
+                    # cleanup path.
                     "done",
+                    # PHASE 2 (same day 2026-05-27): protect error / failed
+                    # statuses too. The operator may retry these jobs at
+                    # any time — losing the input means a failed render
+                    # becomes a re-upload-or-give-up.
+                    "error",
+                    "validation_failed",
+                    "transcription_failed",
+                    "rejected",
                 )))
                 .all()
             )
@@ -648,7 +653,7 @@ def _active_input_keys() -> set[str]:
     return keys
 
 
-def cleanup_old_inputs(retention_days: int = 30, apply: bool = False, prefix: str = "inputs/") -> dict:
+def cleanup_old_inputs(retention_days: int = 365, apply: bool = False, prefix: str = "inputs/") -> dict:
     """Delete objects under `prefix` whose LastModified is older than
     retention_days. Returns a structured report:
 
@@ -735,6 +740,20 @@ def cleanup_old_inputs(retention_days: int = 30, apply: bool = False, prefix: st
                 "[R2-BULK-DELETE-KEY] key=%r size_mb=%.1f age_days=%d retention_days=%d",
                 k, sz / 1024 / 1024, (now - mod).days, retention_days,
             )
+        # SENTRY ALERT 2026-05-27: bulk delete is the SCARY path that
+        # caused the agus.cafisi incident. Fire a high-visibility Sentry
+        # event with the count + caller so the operator sees it whether
+        # or not they check Railway logs. A delete is rare; multiple in
+        # a day means something is wrong.
+        try:
+            import sentry_sdk
+            sentry_sdk.capture_message(
+                f"[R2-BULK-DELETE] cleanup_old_inputs deleting {len(expired)} inputs "
+                f"(retention={retention_days}d, caller={caller}, prefix={prefix})",
+                level="error",  # bulk delete is operationally significant
+            )
+        except Exception:
+            pass
         for i in range(0, len(expired), 1000):
             batch = expired[i:i + 1000]
             resp = client.delete_objects(
@@ -784,6 +803,20 @@ def delete_object(key: str) -> None:
             "[R2-DELETE] input key=%r called_from=%s", key, caller,
             extra={"event": "r2_input_deleted", "key": key, "caller": caller},
         )
+        # SENTRY ALERT 2026-05-27: also fire a Sentry message so the
+        # operator gets a notification (email / Slack / wherever Sentry
+        # is wired) the moment ANY input audio is deleted. Cheap signal
+        # — these deletes should be rare, and a flood here means the
+        # incident is recurring. Idempotent: if sentry_sdk isn't init
+        # or the DSN isn't set, it's a no-op.
+        try:
+            import sentry_sdk
+            sentry_sdk.capture_message(
+                f"[R2-DELETE-INPUT] {key} from {caller}",
+                level="warning",
+            )
+        except Exception:
+            pass
     try:
         client.delete_object(Bucket=R2_BUCKET, Key=key)
     except Exception as exc:
