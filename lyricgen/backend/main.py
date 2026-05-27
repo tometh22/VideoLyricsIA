@@ -6811,18 +6811,32 @@ async def get_source_audio_url(
     current_user: dict = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
-    """Pre-signed URL to the original MP3 uploaded by the user.
+    """Pre-signed URL to the audio for the post-approval lyrics editor.
 
-    Powers the post-approval lyrics editor: when an operator opens the
-    full LyricsEditor on a done/rejected job to fix sync, the <audio>
-    element needs to stream the source so the operator can hear what
-    they're aligning to. Returning a signed URL (instead of proxying
+    Powers the LyricsEditor's <audio> element: when an operator opens
+    an existing job to fix sync, the audio plays so the operator can
+    align segments to it. Returning a signed URL (instead of proxying
     bytes through uvicorn) keeps the API container free during long
     editor sessions.
 
+    Resolution order:
+      1. `input_r2_key` (original uploaded MP3/WAV) — best quality.
+      2. `s3_keys["video"]` (rendered HD MP4) — fallback when the
+         original is gone (lifecycle GC, very old job, or one of the
+         duplicate-job-bug casualties). Browsers play the audio track
+         out of an <audio src="...mp4"> just fine, no client change
+         needed. The response sets `source="video"` + `fallback=true`
+         so the UI can show a "playing audio from rendered video" badge.
+      3. `s3_keys["short"]` (vertical/short MP4) — second fallback.
+      4. Nothing exists → 404 with a re-upload message.
+
+    HOTFIX FASE 2 — 2026-05-27: previously this only checked
+    input_r2_key, so jobs whose original was lost (the duplicate-job
+    cascade and the lifecycle-GC purge) became un-editable forever.
+    Now agus.cafisi (and any operator with stale jobs) can keep
+    correcting lyrics using the rendered video's audio track.
+
     Owner / same-tenant only — same auth model as /download/<job>/<file>.
-    Returns 404 if the job has no input_r2_key (very old jobs uploaded
-    before R2-first flow, or jobs whose input was purged by lifecycle).
     """
     from database import Job as JobModel
     job = (
@@ -6833,18 +6847,46 @@ async def get_source_audio_url(
     )
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
-    if not job.input_r2_key:
-        raise HTTPException(
-            status_code=404,
-            detail="Source audio is not available for this job.",
-        )
-    url = storage.generate_signed_url(job.input_r2_key, expiry_seconds=3600)
-    if not url:
-        raise HTTPException(
-            status_code=503,
-            detail="Object storage is unavailable.",
-        )
-    return {"url": url, "expires_in": 3600}
+
+    # 1. Try the original audio first (best quality, no render artifacts).
+    if job.input_r2_key:
+        url = storage.generate_signed_url(job.input_r2_key, expiry_seconds=3600)
+        if url:
+            return {
+                "url": url,
+                "expires_in": 3600,
+                "source": "input",
+                "fallback": False,
+            }
+        # Storage was flaky for the input key — fall through to render
+        # fallback rather than 503. If a rendered MP4 exists we can still
+        # serve the editor; signed URLs are 1h-lived so next request
+        # retries the input naturally.
+
+    # 2-3. Fallback to rendered MP4(s). Browsers play <audio src=".mp4">.
+    s3_keys = job.s3_keys or {}
+    if isinstance(s3_keys, dict):
+        for source_type in ("video", "short"):
+            r2_key = s3_keys.get(source_type)
+            if not r2_key:
+                continue
+            url = storage.generate_signed_url(r2_key, expiry_seconds=3600)
+            if url:
+                return {
+                    "url": url,
+                    "expires_in": 3600,
+                    "source": source_type,
+                    "fallback": True,
+                }
+
+    # 4. Neither original nor any rendered MP4 — operator must re-upload.
+    raise HTTPException(
+        status_code=404,
+        detail=(
+            "Source audio is not available for this job. "
+            "Re-upload the audio file to keep editing the lyrics."
+        ),
+    )
 
 
 @app.get("/jobs/{job_id}/background-url")
