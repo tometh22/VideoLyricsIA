@@ -919,6 +919,15 @@ export default function App() {
   // JobDetail.jsx:348 — set on entry, clear on completion of the async
   // dance kicked off by startGenerationWithSegments.
   const generateLockRef = useRef(false);
+  // QA fix 2026-05-28: guard contra doble-click en "Aprobar y generar"
+  // dentro del edit-wizard. El submit consolida todos los cambios en UN
+  // único POST /edit. Sin este lock, un doble-click rápido dispara dos
+  // POSTs paralelos — el primero gana el row lock del backend y flippea
+  // status a "editing", el segundo trip el status gate con un 400 muy
+  // confuso. setCurrentReview(null) recién se ejecuta después del POST
+  // exitoso, así que React-state-based guards no atrapan el caso. Ref
+  // sincrónico (set ANTES del primer await) lo cierra.
+  const editSubmitLockRef = useRef(false);
   // 2 concurrent workers: enough to keep the queue fed without spiking
   // the API with 5 simultaneous upload-url+generate calls from one user.
   const PARALLEL_WORKERS = 2;
@@ -1984,117 +1993,160 @@ export default function App() {
 
     // Edit-wizard mode (PR feat/edit-wizard-mode, 2026-05-27):
     // diff cualquier campo editable del wizard contra el baseline congelado
-    // en EditLyricsRoute y firea uno o más POST /edit en orden estable
-    // (metadata → typography → lyrics → background). Cada bucket que cambió
-    // = 1 re-render. El backend lee el row CURRENT al iniciar cada edit,
-    // así que los cambios anteriores ya están persistidos cuando arranca
-    // el siguiente.
+    // en EditLyricsRoute y firea UN ÚNICO POST /edit consolidando todos los
+    // cambios.
     //
-    // Pre-fix: la branch usaba submitLyricsEdit (solo edit_type=lyrics)
-    // — no había forma de corregir un typo en el title card sin pasar por
-    // /jobs/X (pencil icon, que también desapareció post-redesign).
+    // QA fix 2026-05-28 (status conflict): la versión anterior posteaba N
+    // veces (uno por bucket). La primera POST flippea el job a status=
+    // editing — la segunda POST en la secuencia trip el status gate del
+    // backend ("Lyrics edit requires the job to be done, pending_review,
+    // or rejected (current: editing)"). Reproducible cuando el operador
+    // cambia más de un tipo de campo en una sesión. Ahora consolidamos:
+    // un único POST con el edit_type de mayor prioridad y TODOS los campos
+    // editados como propiedades. Backend aplica los campos ungated
+    // (font/text_case/effect/lyrics_animation/line_transition + segments
+    // si vienen) en cualquier edit_type. artist/song_title también
+    // ungated en backend post-fix 2026-05-28.
     if (r.editMode || r.editingJobId) {
       const editedJobId = r.editingJobId;
 
-      // Snapshot del estado actual del wizard. editedSegments viene del
-      // LyricsEditor con el último drag aplicado — gana sobre r.segments
-      // por si el autosave todavía no lo persistió.
-      const current = {
-        artist: r.artist,
-        songTitle: r.songTitle,
-        font: r.font,
-        fontScale: r.fontScale,
-        textCase: r.textCase,
-        textContrast: r.textContrast,
-        lyricsAnimation: r.lyricsAnimation,
-        lineTransition: r.lineTransition,
-        effect: r.effect,
-        backgroundHint: r.backgroundHint,
-        bgVerbatim: r.bgVerbatim,
-        backgroundMode: r.backgroundMode,
-        movementStyle: r.movementStyle,
-        segments: editedSegments,
-      };
+      // Double-click guard: si el operador hace doble-click en "Aprobar y
+      // generar" mientras la primera POST está in-flight, sin esto dos
+      // POSTs paralelos hitten al backend simultáneamente — la primera
+      // gana el row lock, la segunda ve status=editing y 400.
+      if (editSubmitLockRef.current) return;
+      editSubmitLockRef.current = true;
 
-      const diff = computeFieldDiff(r.baseline, current);
-      const payloads = buildEditPayloads(diff);
+      try {
+        // Snapshot del estado actual del wizard. editedSegments viene del
+        // LyricsEditor con el último drag aplicado — gana sobre r.segments
+        // por si el autosave todavía no lo persistió.
+        const current = {
+          artist: r.artist,
+          songTitle: r.songTitle,
+          font: r.font,
+          fontScale: r.fontScale,
+          textCase: r.textCase,
+          textContrast: r.textContrast,
+          lyricsAnimation: r.lyricsAnimation,
+          lineTransition: r.lineTransition,
+          effect: r.effect,
+          backgroundHint: r.backgroundHint,
+          bgVerbatim: r.bgVerbatim,
+          backgroundMode: r.backgroundMode,
+          movementStyle: r.movementStyle,
+          segments: editedSegments,
+        };
 
-      if (payloads.length === 0) {
-        alert({
-          title: t("edit.no_changes_title") || "No cambiaste nada",
-          description: t("edit.no_changes_subtitle") ||
-            "No detectamos diferencias contra el video actual. Modificá algún campo y volvé a intentar.",
-          tone: "warning",
-        });
-        return;
-      }
+        const diff = computeFieldDiff(r.baseline, current);
+        const presentBuckets = Object.keys(diff);
 
-      // POST sequentially. Each POST has a 5-min wall-clock since the
-      // backend just enqueues and returns 202 quickly; sequential keeps
-      // the audit log ordered and avoids racing edit_count increments.
-      let lastErr = null;
-      let lastStatus = null;
-      let lastData = null;
-      for (const payload of payloads) {
-        try {
+        if (presentBuckets.length === 0) {
+          alert({
+            title: t("edit.no_changes_title") || "No cambiaste nada",
+            description: t("edit.no_changes_subtitle") ||
+              "No detectamos diferencias contra el video actual. Modificá algún campo y volvé a intentar.",
+            tone: "warning",
+          });
+          return;
+        }
+
+        // Pick edit_type by priority — el más complejo de los presentes.
+        // background regen Veo (paid), lyrics re-renderiza con nuevos
+        // segments, metadata sólo title card, typography el último.
+        const PRIORITY = ["background", "lyrics", "metadata", "typography"];
+        let chosenType = PRIORITY.find((k) => diff[k]);
+
+        // Backend gates: typography y background solo aceptan jobs en
+        // pending_review (main.py:7444). Para done/rejected:
+        //   - bg standalone: backend rechaza. Surface error claro.
+        //   - typography standalone: piggyback en una lyrics edit usando
+        //     los segments actuales (font/case/etc son ungated, se
+        //     aplican en cualquier edit_type).
+        const isPendingReview = r.jobStatus === "pending_review";
+        if (!isPendingReview) {
+          if (chosenType === "background" && presentBuckets.length === 1) {
+            alert({
+              title: t("edit.bg_locked_done_title") || "No se puede regenerar el fondo",
+              description: t("edit.bg_locked_done_desc") ||
+                "El fondo de un video ya aprobado no se puede regenerar — para cambiarlo, generá un video nuevo.",
+              tone: "warning",
+            });
+            return;
+          }
+          if (chosenType === "background") {
+            // bg + otra cosa: bajar a la siguiente prioridad permitida.
+            chosenType = PRIORITY.slice(1).find((k) => diff[k] && k !== "background");
+          }
+          if (chosenType === "typography") {
+            // Convertir a lyrics edit. Necesita segments — usar el snapshot
+            // actual (editedSegments) aunque no haya cambiado, para que el
+            // backend acepte el payload.
+            chosenType = "lyrics";
+            const normalized = (editedSegments || []).map((s) => ({
+              start: Number(s.start) || 0,
+              end: Number(s.end) || 0,
+              text: String(s.text || ""),
+              ...(s.locked ? { locked: true } : {}),
+              ...(s.pos && typeof s.pos.x === "number" ? { pos: { x: s.pos.x, y: s.pos.y } } : {}),
+              ...(typeof s.scale === "number" && s.scale !== 1 ? { scale: s.scale } : {}),
+              ...(typeof s.rot === "number" && s.rot !== 0 ? { rot: s.rot } : {}),
+            }));
+            diff.lyrics = diff.lyrics || { segments: normalized };
+          }
+        }
+
+        // Construir UN único payload con todos los campos cambiados.
+        // Backend aplica los ungated en cualquier edit_type; los gated
+        // (background_*, segments para lyrics) sólo se aplican si el
+        // edit_type matchea.
+        const payload = { edit_type: chosenType };
+        if (diff.metadata) Object.assign(payload, diff.metadata);
+        if (diff.typography) Object.assign(payload, diff.typography);
+        if (diff.lyrics) Object.assign(payload, diff.lyrics);
+        if (diff.background) Object.assign(payload, diff.background);
+
+        const doPost = async (body) => {
           const res = await authFetch(`${API}/edit/${editedJobId}`, {
             method: "POST",
             headers: { "Content-Type": "application/json" },
-            body: JSON.stringify(payload),
+            body: JSON.stringify(body),
           });
           let data = {};
           try { data = await res.json(); } catch { /* empty body */ }
-          // YouTube already-published gate (409): reuse the prompt the
-          // lyrics flow already shipped. If the operator declines, abort
-          // the whole sequence — half-applied edits are worse than none.
-          if (res.status === 409 && data?.detail?.code === "youtube_already_published") {
-            const url = data.detail.youtube_url;
-            const msg = (t("edit.youtube_drift_confirm") ||
-              "Este video ya está publicado en YouTube. La re-sincronización actualizará el archivo en la plataforma pero NO reemplazará el video en YouTube (la API de YouTube no permite reemplazar archivos, solo metadata).\n\n¿Continuar igual?")
-              + (url ? `\n\nYouTube: ${url}` : "");
-            if (!window.confirm(msg)) return;
-            const retryRes = await authFetch(`${API}/edit/${editedJobId}`, {
-              method: "POST",
-              headers: { "Content-Type": "application/json" },
-              body: JSON.stringify({ ...payload, allow_youtube_drift: true }),
-            });
-            let retryData = {};
-            try { retryData = await retryRes.json(); } catch { /* empty body */ }
-            if (!retryRes.ok) {
-              lastErr = translateBackendError(retryData?.detail, t) || `Error ${retryRes.status}`;
-              lastStatus = retryRes.status;
-              lastData = retryData;
-              break;
-            }
-            continue;
-          }
-          if (!res.ok) {
-            lastErr = translateBackendError(data?.detail, t) || `Error ${res.status}`;
-            lastStatus = res.status;
-            lastData = data;
-            break;
-          }
-        } catch (err) {
-          lastErr = (err && err.message) || String(err);
-          break;
+          return { res, data };
+        };
+
+        let { res, data } = await doPost(payload);
+
+        // YouTube already-published 409 retry.
+        if (res.status === 409 && data?.detail?.code === "youtube_already_published") {
+          const url = data.detail.youtube_url;
+          const msg = (t("edit.youtube_drift_confirm") ||
+            "Este video ya está publicado en YouTube. La re-sincronización actualizará el archivo en la plataforma pero NO reemplazará el video en YouTube (la API de YouTube no permite reemplazar archivos, solo metadata).\n\n¿Continuar igual?")
+            + (url ? `\n\nYouTube: ${url}` : "");
+          if (!window.confirm(msg)) return;
+          ({ res, data } = await doPost({ ...payload, allow_youtube_drift: true }));
         }
-      }
 
-      if (lastErr) {
-        alert({
-          title: t("edit.error_title") || "No pudimos aplicar el edit",
-          description: lastErr,
-          tone: "error",
-        });
-        // Log enough to debug from Sentry without leaking the user's text.
-        console.warn("[edit-wizard] /edit failed", { status: lastStatus, detail: lastData });
+        if (!res.ok) {
+          const friendly = translateBackendError(data?.detail, t) || `Error ${res.status}`;
+          alert({
+            title: t("edit.error_title") || "No pudimos aplicar el edit",
+            description: friendly,
+            tone: "error",
+          });
+          console.warn("[edit-wizard] /edit failed", { status: res.status, detail: data });
+          return;
+        }
+
+        setCurrentReview(null);
+        wizardPersistence.clear();
+        navigate(`/videos/${editedJobId}`, { replace: true });
         return;
+      } finally {
+        editSubmitLockRef.current = false;
       }
-
-      setCurrentReview(null);
-      wizardPersistence.clear();
-      navigate(`/videos/${editedJobId}`, { replace: true });
-      return;
     }
 
     const newApproved = [...approvedJobs, {
