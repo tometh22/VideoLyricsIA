@@ -30,7 +30,7 @@ import TranscribingProgress from "./components/TranscribingProgress";
 import JobDetail from "./components/JobDetail";
 import { useAlert } from "./components/AlertProvider";
 import { useBackgroundPreview } from "./hooks/useBackgroundPreview";
-import { useMediaUrl } from "./mediaUrl";
+import { useMediaUrl, clearMediaCache } from "./mediaUrl";
 import { submitLyricsEdit } from "./lib/lyricsEditSubmit";
 
 const API = import.meta.env.VITE_API_URL || "";
@@ -321,6 +321,24 @@ function AppShell({ user, sidebarOpen, setSidebarOpen, onLogout }) {
                 </div>
                 <span className="text-xs text-gray-500">{user.username}</span>
               </div>
+            )}
+            {/* Topbar logout (audit F P0-4 2026-05-27): always reachable, even
+                when the sidebar is collapsed on mobile or when `user` is null
+                in a transient half-state. The sidebar already has a logout
+                inside its `{user && ...}` block; this one is a defense-in-
+                depth fallback so the operator is never locked in.
+                Icon mirrors Sidebar.jsx:159-161 for visual consistency. */}
+            {onLogout && (
+              <button
+                onClick={onLogout}
+                title={t("nav.logout") || "Cerrar sesión"}
+                aria-label={t("nav.logout") || "Cerrar sesión"}
+                className="text-gray-500 hover:text-red-400 transition-colors p-1.5 rounded-lg hover:bg-white/[0.04]"
+              >
+                <svg className="w-4 h-4" fill="none" stroke="currentColor" strokeWidth="1.5" viewBox="0 0 24 24">
+                  <path d="M17 16l4-4m0 0l-4-4m4 4H7m6 4v1a3 3 0 01-3 3H6a3 3 0 01-3-3V7a3 3 0 013-3h4a3 3 0 013 3v1" strokeLinecap="round" strokeLinejoin="round"/>
+                </svg>
+              </button>
             )}
           </div>
         </header>
@@ -691,6 +709,14 @@ export default function App() {
   const { t } = useI18n();
   const navigate = useNavigate();
   const { alert } = useAlert();
+  // Audit 2026-05-26: the App body previously referenced a bare `location`
+  // identifier which resolved to `window.location` via JS global lookup.
+  // It "worked" only because window.location has .search/.pathname — but
+  // useEffect deps on `location.search` never re-fire when navigate() updates
+  // the URL via History API (React doesn't re-render on window.location).
+  // The /new?resume=... flow is fragile against that. Use useLocation() so
+  // React subscribes to URL changes correctly.
+  const location = useLocation();
 
   const [token, setToken] = useState(getToken());
   const [user, setUser] = useState(getUser());
@@ -855,6 +881,17 @@ export default function App() {
       currentReview !== null ||
       reviewQueue.length > 0;
     if (!anyState) {
+      // Audit 2026-05-26: while the resume banner is offering an unfinished
+      // batch (resumableWizard non-null, "Tenés un batch sin terminar"),
+      // the wizard state is still empty (user hasn't clicked Continuar
+      // yet). Without this guard, that empty state hits the `!anyState`
+      // branch on the SAME render the banner is rendering, and we wipe
+      // the snapshot we're about to offer. Banner then shows but Continuar
+      // has nothing to restore. Hold off until the banner is dismissed
+      // — at that point resumableWizard is null again (the user either
+      // accepted, which transitioned state to non-empty by then, or
+      // rejected and explicitly cleared via the discard button).
+      if (resumableWizard) return;
       // Fresh wizard / cleared explicitly → blow away the snapshot too.
       // Clear is rare (logout / discard); leave it sync.
       wizardPersistence.clear();
@@ -894,6 +931,7 @@ export default function App() {
     files, approvedJobs, currentReview, reviewQueue, wizardStage,
     style, customColors, delivery, backgroundId, backgroundMode,
     animateImage, inspiredByLyrics,
+    resumableWizard,
   ]);
 
   // beforeunload warning — covers closing the tab, refreshing, or
@@ -1105,6 +1143,14 @@ export default function App() {
 
   // reason="expired" → /login so the user can re-authenticate immediately.
   // reason="manual" (default) → / (landing page) for intentional logouts.
+  //
+  // Audit 2026-05-26: handleLogout previously only cleared token+user
+  // state. On a shared machine (common with UMG operators), the wizard
+  // state of User A — files, approvedJobs, currentReview, history,
+  // jobs queue, persisted wizard snapshot, library batch defaults, and
+  // media-token cache — survived logout and was visible to User B
+  // when they logged in next on the same tab. Now we wipe all
+  // session-scoped state + caches + storage keys atomically.
   const handleLogout = useCallback((reason = "manual") => {
     // Stop every active poll / SSE stream BEFORE clearing the token.
     pollingIntervals.current.forEach((handle) => {
@@ -1112,10 +1158,44 @@ export default function App() {
       else clearInterval(handle);
     });
     pollingIntervals.current.clear();
+
+    // Identity / auth.
     localStorage.removeItem("genly_token");
     localStorage.removeItem("genly_user");
+
+    // Wizard / session caches. wizardPersistence stores a TTL-bounded
+    // snapshot of an in-progress wizard; the library batch defaults
+    // remember the operator's last picked font/color/movement preset
+    // for the next batch (UploadZone.BATCH_DEFAULTS_STORAGE_KEY).
+    try { wizardPersistence.clear(); } catch { /* best effort */ }
+    try { localStorage.removeItem("genly:wizardBatchDefaultsV1"); } catch { /* */ }
+
+    // Short-lived media tokens (preview/download URLs scoped to
+    // job+filetype). Without this, User B sees /preview URLs that
+    // 401 or — worse, if the token is still inside its 5 min TTL —
+    // serve User A's content for ~5 min.
+    try { clearMediaCache(); } catch { /* */ }
+
+    // React state. Reset every collection that holds user-derived
+    // content; keep purely-UX state (sidebar, theme) alone.
     setToken(null);
     setUser(null);
+    setFiles([]);
+    setReviewQueue([]);
+    setCurrentReview(null);
+    setApprovedJobs([]);
+    setJobs([]);
+    setHistory([]);
+    setHistoryError(false);
+    setHistoryLoaded(false);
+    setTranscribeStatusByFile({});
+    setTranscribing(false);
+    setTranscribeError(null);
+    setTranscribeProgress(null);
+    setReadyToGenerate(false);
+    setSearchOpen(false);
+    setResumableWizard(null);
+
     navigate(reason === "expired" ? "/login" : "/");
   }, [navigate]);
 

@@ -23,7 +23,15 @@
  */
 import { useEffect, useRef, useState, useCallback } from "react";
 
-const DEBOUNCE_MS = 2000;
+// Audit 2026-05-26 cost-leak fix: 2 s was too aggressive for an operator
+// "exploring options" — every micro-adjustment past 2 s of inactivity
+// fired a Veo/Imagen pre-gen at $0.80–$3.20/job. A typical 5-param
+// review pass burned $5–$30 in wasted previews. 10 s captures the
+// "I've settled on what I want" pause without significantly hurting
+// the preview cache-hit rate at "Crear video" click time. Callers can
+// override via the `debounceMs` option if a faster cycle is needed
+// (e.g. automated tests).
+const DEFAULT_DEBOUNCE_MS = 10000;
 const POLL_INTERVAL_INITIAL_MS = 1500;
 const POLL_INTERVAL_MAX_MS = 5000;
 const POLL_TIMEOUT_MS = 5 * 60 * 1000;  // 5 min hard cap
@@ -61,6 +69,7 @@ export function useBackgroundPreview(entry, {
   api = "",
   authHeaders = () => ({}),
   onCacheKey = null,
+  debounceMs = DEFAULT_DEBOUNCE_MS,
 } = {}) {
   const [bgCacheKey, setBgCacheKey] = useState(null);
   const [status, setStatus] = useState("idle");  // idle | queued | generating | done | error
@@ -166,7 +175,7 @@ export function useBackgroundPreview(entry, {
 
     debounceRef.current = setTimeout(() => {
       startPreview(params);
-    }, DEBOUNCE_MS);
+    }, debounceMs);
 
     return () => {
       if (debounceRef.current) clearTimeout(debounceRef.current);
