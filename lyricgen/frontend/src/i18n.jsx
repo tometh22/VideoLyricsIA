@@ -930,6 +930,8 @@ export const translations = {
     "edit.wizard_cost": "~5-10 min · sin costo extra · título, artista, letra, tipografía y timing — todo desde el wizard",
     "edit.no_changes_title": "No cambiaste nada",
     "edit.no_changes_subtitle": "No detectamos diferencias contra el video actual. Modificá algún campo y volvé a intentar.",
+    "editor.locked_structural": "No editable post-render — generá un video nuevo para cambiar paleta.",
+    "editor.locked_short": "No editable",
     "editor.editing_banner_label": "Editando este video",
     "editor.editing_banner_hint": "Los cambios acá vuelven al mismo wizard que creó el video. Lo que no toques queda igual.",
     "editor.editing_wizard_title": "Editar y re-renderizar",
