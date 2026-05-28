@@ -310,3 +310,61 @@ def test_typography_audit_log_metadata_only_false(client, admin_token, db, monke
         .first()
     )
     assert log.detail.get("metadata_only") is False
+
+
+def test_metadata_rollback_restores_original_values_on_enqueue_failure(
+    client, admin_token, db, monkeypatch,
+):
+    """REGRESSION F1 audit 2026-05-27:
+
+    Previously the handler captured _pre_edit_artist = job.artist AFTER
+    mutating job.artist = new_artist (lines 7635-7720). The rollback in
+    the enqueue-failure branch then restored the NEW value, not the
+    original. UI showed "Guardado" but no actual save happened — silent
+    data corruption.
+
+    This test reproduces the failure mode: monkey-patch enqueue_edit to
+    raise, POST a metadata edit, and assert the DB still has the original
+    artist/song_title.
+    """
+    import main
+
+    user_id, tenant_id = _admin_identity(db)
+    ORIGINAL_ARTIST = "Sin Gamulan"
+    ORIGINAL_TITLE = "Los Abuelos De La Nada"
+    job_id = _create_pending_review_job(
+        db, tenant_id, user_id,
+        artist=ORIGINAL_ARTIST, song_title=ORIGINAL_TITLE,
+    )
+
+    # Force enqueue_edit to raise — simulates Redis down.
+    def _broken_enqueue(**kwargs):
+        raise RuntimeError("Redis connection refused (simulated)")
+    monkeypatch.setattr(main, "enqueue_edit", _broken_enqueue)
+
+    res = client.post(
+        f"/edit/{job_id}",
+        headers={"Authorization": f"Bearer {admin_token}"},
+        json={
+            "edit_type": "metadata",
+            "artist": "Should NOT persist",
+            "song_title": "Should NOT persist either",
+        },
+    )
+    # Endpoint must signal failure to the client (503 with retry hint).
+    assert res.status_code == 503, res.text
+
+    # Crucially: the DB row must hold the ORIGINAL values, not the
+    # rejected ones. Before the fix this assertion would fail.
+    db.expire_all()
+    job_after = db.query(JobModel).filter(JobModel.job_id == job_id).first()
+    assert job_after.artist == ORIGINAL_ARTIST, (
+        f"Rollback regression: artist should still be {ORIGINAL_ARTIST!r}, "
+        f"got {job_after.artist!r}"
+    )
+    assert job_after.song_title == ORIGINAL_TITLE, (
+        f"Rollback regression: song_title should still be {ORIGINAL_TITLE!r}, "
+        f"got {job_after.song_title!r}"
+    )
+    # And status should be back to pending_review (rollback also fixes it).
+    assert job_after.status == "pending_review"

@@ -126,10 +126,18 @@ def main() -> int:
 
     db = SessionLocal()
     try:
-        # Hunt jobs that LOOK broken: input_r2_key NULL.
-        # We DO NOT pre-filter on dead keys (would require R2 probes per
-        # job upfront — let _maybe_relink probe lazily).
-        q = db.query(Job).filter(Job.input_r2_key.is_(None))
+        # HOTFIX F2 2026-05-27 (audit): the original query filtered by
+        # `Job.input_r2_key.is_(None)`, which excluded the SET-but-DEAD
+        # case — i.e., rows where input_r2_key points at an R2 path
+        # that's been purged. That's the exact population this script
+        # was built to recover (agus.cafisi's 26 jobs from the May 27
+        # incident). _maybe_relink already has the per-row logic to
+        # distinguish NULL / alive / DEAD via storage.object_exists
+        # (see Case A vs Case B in the function). Pull all rows, let
+        # the function classify lazily. The HEAD probe per row costs
+        # ~50-200 ms but only runs while inspecting — the apply-mode
+        # mutation only fires for the recoverable subset.
+        q = db.query(Job)
         if args.tenant:
             q = q.filter(Job.tenant_id == args.tenant)
         if args.user is not None:
@@ -139,7 +147,7 @@ def main() -> int:
             q = q.limit(args.limit)
 
         rows = q.all()
-        print(f"Inspecting {len(rows)} job(s) with input_r2_key=NULL"
+        print(f"Inspecting {len(rows)} job(s)"
               f"{f' for tenant={args.tenant}' if args.tenant else ''}"
               f"{f' for user_id={args.user}' if args.user is not None else ''}.")
         print(f"Mode: {'APPLY (will mutate)' if args.apply else 'dry-run (no changes)'}\n")
