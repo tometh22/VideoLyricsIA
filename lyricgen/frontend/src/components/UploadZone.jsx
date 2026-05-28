@@ -1972,16 +1972,15 @@ export default function UploadZone({
          (oculta caption de movement/effect que ya no se está editando). */
       (() => {
         const isStep6 = wizardStep === 6 && hasReviewableContent;
-        // QA fix 2026-05-28 (UX, polish): operador reportó que en step 6
-        // el stepper sólo mostraba números (1-6) y no se entendía qué era
-        // cada paso. La compactación a 56 px sacrificaba discoverability
-        // por espacio. Subimos a 168 px (alcanza para las labels más
-        // largas como "Tipografía & Animación") y bajamos el preview a
-        // 380-520 px y el panel derecho conserva el 1fr. La pérdida de
-        // ~140 px del preview es marginal vs. el gran win de saber qué
-        // estás clickeando. Otros pasos siguen con 190 px (no cambian).
+        // QA fix 2026-05-28 (UX, polish, 2nd pass): el operador reportó
+        // que con 168 px el label "Tipografía & Animación" se clippeaba
+        // contra el borde del column (overflow-hidden del scroll
+        // context). Subimos a 200 px — cubre cómodamente todos los
+        // labels en es/en/pt incluso con el icono numérico + padding.
+        // El preview baja a 360-500 px (≈40 px menos) lo cual sigue
+        // bien usable para el operador.
         const gridCols = isStep6
-          ? "lg:grid-cols-[168px_minmax(380px,520px)_minmax(0,1fr)]"
+          ? "lg:grid-cols-[200px_minmax(360px,500px)_minmax(0,1fr)]"
           : "lg:grid-cols-[190px_minmax(0,1fr)_minmax(400px,460px)]";
         // 2026-05-26 — variante [.editor-focus-mode_&] colapsa este grid
         // a 1 columna cuando el LyricsEditor prende "modo enfoque". Sin
