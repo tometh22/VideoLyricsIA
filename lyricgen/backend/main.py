@@ -5795,6 +5795,15 @@ async def status(
         "files": job["files"],
         "error": job.get("error"),
         "artist": job.get("artist"),
+        # song_title + style: needed by the post-render edit-wizard
+        # (App.jsx EditLyricsRoute) to pre-fill all wizard fields off
+        # /status alone. Without these, the edit-wizard can't show the
+        # operator the current title/palette to fix a typo or compare.
+        # JobDetail also reads song_title — pre-fix, `job.song_title`
+        # was always undefined so the field silently fell back to the
+        # filename derivation.
+        "song_title": job.get("song_title"),
+        "style": job.get("style"),
         "filename": job.get("filename"),
         "created_at": job.get("created_at"),
         # Frontend uses delivery_profile to decide whether to show the

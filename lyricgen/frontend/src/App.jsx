@@ -31,7 +31,8 @@ import JobDetail from "./components/JobDetail";
 import { useAlert } from "./components/AlertProvider";
 import { useBackgroundPreview } from "./hooks/useBackgroundPreview";
 import { useMediaUrl, clearMediaCache } from "./mediaUrl";
-import { submitLyricsEdit } from "./lib/lyricsEditSubmit";
+import { translateBackendError } from "./lib/lyricsEditSubmit";
+import { computeFieldDiff, buildEditPayloads } from "./lib/editWizardDiff";
 
 const API = import.meta.env.VITE_API_URL || "";
 
@@ -520,11 +521,84 @@ function EditLyricsRoute({ setCurrentReview, setWizardStage, wizardScreen, t }) 
       // siendo lo que el job tiene RENDERIZADO (job.segments_json).
       const segmentsFromSnap = reusableSnap ? snap.currentReview.segments : job.segments_json;
 
+      // Edit-wizard mode (PR feat/edit-wizard-mode, 2026-05-27):
+      // pre-llenamos TODOS los campos editables del wizard desde la row del
+      // Job para que el operador pueda corregir cualquier cosa post-render
+      // (no solo lyrics). La baseline congela el snapshot a la entrada del
+      // edit; el submit calcula el diff contra la baseline y emite N POSTs
+      // /edit (uno por edit_type: metadata / typography / lyrics / background).
+      //
+      // Resilience: si el snap tiene fields editados in-flight (el operador
+      // refrescó mid-edit), esos ganan. Si no, los valores actuales del job.
+      const snapR = reusableSnap ? snap.currentReview : null;
+      const pickSnapOr = (snapKey, fallback) =>
+        (snapR && snapR[snapKey] != null && snapR[snapKey] !== "")
+          ? snapR[snapKey]
+          : fallback;
+
+      const initialFields = {
+        artist: pickSnapOr("artist", job.artist || ""),
+        songTitle: pickSnapOr("songTitle", job.song_title || ""),
+        font: pickSnapOr("font", params.font || ""),
+        textCase: pickSnapOr("textCase", params.text_case || "upper"),
+        textContrast: pickSnapOr("textContrast", params.text_contrast || "medium"),
+        fontScale: String(pickSnapOr("fontScale", params.font_scale || "1.0")),
+        lyricsAnimation: pickSnapOr("lyricsAnimation", params.lyrics_animation || "none"),
+        lineTransition: pickSnapOr("lineTransition", params.line_transition || "none"),
+        lyricColor: pickSnapOr("lyricColor", params.lyric_color || "#FFFFFF"),
+        lyricSungColor: pickSnapOr("lyricSungColor", params.lyric_sung_color || "#FFFFFF"),
+        movementStyle: pickSnapOr("movementStyle", params.movement_style || ""),
+        effect: pickSnapOr("effect", params.effect || ""),
+        backgroundHint: pickSnapOr("backgroundHint", params.background_hint || ""),
+        bgVerbatim: snapR?.bgVerbatim != null ? !!snapR.bgVerbatim : !!params.bg_verbatim,
+        backgroundMode: pickSnapOr("backgroundMode", params.background_mode || ""),
+      };
+
+      // Baseline: snapshot inmutable de cómo está RENDERIZADO el video
+      // ahora — el diff del submit compara contra esto, NO contra el snap
+      // del autosave. Si el operador edita y vuelve atrás un campo al valor
+      // original, el diff lo descarta (no manda al backend, no cuesta un
+      // re-render por nada).
+      const baseline = {
+        artist: job.artist || "",
+        songTitle: job.song_title || "",
+        font: params.font || "",
+        textCase: params.text_case || "upper",
+        textContrast: params.text_contrast || "medium",
+        fontScale: String(params.font_scale || "1.0"),
+        lyricsAnimation: params.lyrics_animation || "none",
+        lineTransition: params.line_transition || "none",
+        lyricColor: params.lyric_color || "#FFFFFF",
+        lyricSungColor: params.lyric_sung_color || "#FFFFFF",
+        movementStyle: params.movement_style || "",
+        effect: params.effect || "",
+        backgroundHint: params.background_hint || "",
+        bgVerbatim: !!params.bg_verbatim,
+        backgroundMode: params.background_mode || "",
+        segments: JSON.parse(JSON.stringify(job.segments_json || [])),
+      };
+
       // Mount the editor NOW with audio/waveform/bg as null. The LyricsEditor
       // handles these as optional — timeline renders without waveform fill,
       // preview without bg image. Operator can edit text/timing immediately.
       setCurrentReview({
         editingJobId: id,
+        // editMode + baseline son la API del flow edit-wizard. App.jsx los
+        // lee en handleApproveLyrics para emitir POSTs /edit con el diff
+        // contra baseline. UploadZone los lee para mostrar UIs de edición
+        // de metadata y desbloquear los pasos editables.
+        editMode: true,
+        baseline,
+        // jobStatus drives which edit_types are valid: typography +
+        // background are pending_review-only at the backend (see
+        // main.py:7444). The wizard surface reads this to keep the
+        // dialog honest about what will actually re-render.
+        jobStatus: job.status,
+        // Read-only context — solo display, no editable post-render.
+        deliveryProfile: job.delivery_profile || "youtube",
+        style: job.style || "",
+        // job.song_title puede llegar null para jobs viejos sin metadata
+        // explícito; filename queda como fallback display sólo.
         segments: segmentsFromSnap,
         openSnapshotSegments: JSON.parse(JSON.stringify(job.segments_json)),
         filename: job.filename || job.artist || "lyrics",
@@ -532,12 +606,7 @@ function EditLyricsRoute({ setCurrentReview, setWizardStage, wizardScreen, t }) 
         audioUrl: null,           // populated by Phase B
         waveform: null,           // populated by Phase B
         bgUrl: null,              // populated by Phase B
-        font: (reusableSnap && snap.currentReview.font) || params.font || "",
-        textCase: (reusableSnap && snap.currentReview.textCase) || params.text_case || "upper",
-        textContrast: (reusableSnap && snap.currentReview.textContrast) || params.text_contrast || "medium",
-        fontScale: String((reusableSnap && snap.currentReview.fontScale) || params.font_scale || "1.0"),
-        lyricsAnimation: (reusableSnap && snap.currentReview.lyricsAnimation) || params.lyrics_animation || "none",
-        lineTransition: (reusableSnap && snap.currentReview.lineTransition) || params.line_transition || "none",
+        ...initialFields,
         // Empty queue: this isn't a batch, it's a one-off edit.
         queue: [],
         queueIdx: 0,
@@ -1903,42 +1972,115 @@ export default function App() {
     const r = currentReview;
     if (!r) return;
 
-    // Post-render edit branch: currentReview.editingJobId está set →
-    // estamos editando lyrics de un job ya renderizado desde la ruta
-    // /videos/:id/edit-lyrics. En vez de pushear al batch queue, postear
-    // al endpoint /edit/:id con edit_type=lyrics y navegar de vuelta al
-    // JobDetail (donde el polling de status retoma).
-    if (r.editingJobId) {
-      const result = await submitLyricsEdit({
-        jobId: r.editingJobId,
-        segments: editedSegments,
-        baselineSegments: r.openSnapshotSegments || r.segments,
+    // Edit-wizard mode (PR feat/edit-wizard-mode, 2026-05-27):
+    // diff cualquier campo editable del wizard contra el baseline congelado
+    // en EditLyricsRoute y firea uno o más POST /edit en orden estable
+    // (metadata → typography → lyrics → background). Cada bucket que cambió
+    // = 1 re-render. El backend lee el row CURRENT al iniciar cada edit,
+    // así que los cambios anteriores ya están persistidos cuando arranca
+    // el siguiente.
+    //
+    // Pre-fix: la branch usaba submitLyricsEdit (solo edit_type=lyrics)
+    // — no había forma de corregir un typo en el title card sin pasar por
+    // /jobs/X (pencil icon, que también desapareció post-redesign).
+    if (r.editMode || r.editingJobId) {
+      const editedJobId = r.editingJobId;
+
+      // Snapshot del estado actual del wizard. editedSegments viene del
+      // LyricsEditor con el último drag aplicado — gana sobre r.segments
+      // por si el autosave todavía no lo persistió.
+      const current = {
+        artist: r.artist,
+        songTitle: r.songTitle,
         font: r.font,
+        fontScale: r.fontScale,
         textCase: r.textCase,
         textContrast: r.textContrast,
         lyricsAnimation: r.lyricsAnimation,
         lineTransition: r.lineTransition,
-        t,
-      });
-      if (result.cancelled) return;
-      if (result.unchanged) {
+        effect: r.effect,
+        backgroundHint: r.backgroundHint,
+        bgVerbatim: r.bgVerbatim,
+        backgroundMode: r.backgroundMode,
+        movementStyle: r.movementStyle,
+        segments: editedSegments,
+      };
+
+      const diff = computeFieldDiff(r.baseline, current);
+      const payloads = buildEditPayloads(diff);
+
+      if (payloads.length === 0) {
         alert({
-          title: t("edit.stale_rerender_title") || "No detectamos cambios nuevos",
-          description: t("edit.stale_rerender_prompt") ||
-            "Las letras ya están guardadas y no detectamos cambios nuevos. Si el video todavía muestra la versión vieja, podés re-renderizarlo igual desde el video.",
+          title: t("edit.no_changes_title") || "No cambiaste nada",
+          description: t("edit.no_changes_subtitle") ||
+            "No detectamos diferencias contra el video actual. Modificá algún campo y volvé a intentar.",
           tone: "warning",
         });
         return;
       }
-      if (result.error) {
+
+      // POST sequentially. Each POST has a 5-min wall-clock since the
+      // backend just enqueues and returns 202 quickly; sequential keeps
+      // the audit log ordered and avoids racing edit_count increments.
+      let lastErr = null;
+      let lastStatus = null;
+      let lastData = null;
+      for (const payload of payloads) {
+        try {
+          const res = await authFetch(`${API}/edit/${editedJobId}`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(payload),
+          });
+          let data = {};
+          try { data = await res.json(); } catch { /* empty body */ }
+          // YouTube already-published gate (409): reuse the prompt the
+          // lyrics flow already shipped. If the operator declines, abort
+          // the whole sequence — half-applied edits are worse than none.
+          if (res.status === 409 && data?.detail?.code === "youtube_already_published") {
+            const url = data.detail.youtube_url;
+            const msg = (t("edit.youtube_drift_confirm") ||
+              "Este video ya está publicado en YouTube. La re-sincronización actualizará el archivo en la plataforma pero NO reemplazará el video en YouTube (la API de YouTube no permite reemplazar archivos, solo metadata).\n\n¿Continuar igual?")
+              + (url ? `\n\nYouTube: ${url}` : "");
+            if (!window.confirm(msg)) return;
+            const retryRes = await authFetch(`${API}/edit/${editedJobId}`, {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ ...payload, allow_youtube_drift: true }),
+            });
+            let retryData = {};
+            try { retryData = await retryRes.json(); } catch { /* empty body */ }
+            if (!retryRes.ok) {
+              lastErr = translateBackendError(retryData?.detail, t) || `Error ${retryRes.status}`;
+              lastStatus = retryRes.status;
+              lastData = retryData;
+              break;
+            }
+            continue;
+          }
+          if (!res.ok) {
+            lastErr = translateBackendError(data?.detail, t) || `Error ${res.status}`;
+            lastStatus = res.status;
+            lastData = data;
+            break;
+          }
+        } catch (err) {
+          lastErr = (err && err.message) || String(err);
+          break;
+        }
+      }
+
+      if (lastErr) {
         alert({
           title: t("edit.error_title") || "No pudimos aplicar el edit",
-          description: result.error,
+          description: lastErr,
           tone: "error",
         });
+        // Log enough to debug from Sentry without leaking the user's text.
+        console.warn("[edit-wizard] /edit failed", { status: lastStatus, detail: lastData });
         return;
       }
-      const editedJobId = r.editingJobId;
+
       setCurrentReview(null);
       wizardPersistence.clear();
       navigate(`/videos/${editedJobId}`, { replace: true });
@@ -2531,6 +2673,60 @@ export default function App() {
       })()
     : null;
 
+  // Edit-mode metadata banner (PR feat/edit-wizard-mode, 2026-05-27):
+  // when EditLyricsRoute mounted us in edit mode, show artist+song_title
+  // inputs at the top of the wizard so the operator can fix a typo in the
+  // title card without leaving the editor. Writes to currentReview so the
+  // diff in handleApproveLyrics picks them up via the metadata bucket.
+  // Hidden on regular new-job flow (currentReview?.editMode === undefined).
+  const editingHeaderBanner = currentReview?.editMode ? (
+    <div className="rounded-card bg-brand/[0.06] ring-1 ring-brand/30 px-5 py-4 mb-6 animate-fade-in">
+      <div className="flex items-center gap-2 mb-3">
+        <svg className="w-4 h-4 text-brand-light" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
+          <path d="M11 4H4a2 2 0 00-2 2v14a2 2 0 002 2h14a2 2 0 002-2v-7" strokeLinecap="round" strokeLinejoin="round" />
+          <path d="M18.5 2.5a2.121 2.121 0 013 3L12 15l-4 1 1-4 9.5-9.5z" strokeLinecap="round" strokeLinejoin="round" />
+        </svg>
+        <p className="text-[11px] uppercase tracking-[0.18em] text-brand-light">
+          {t("editor.editing_banner_label") || "Editando este video"}
+        </p>
+      </div>
+      <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+        <div>
+          <label className="block text-[10px] uppercase tracking-wider text-gray-500 mb-1">
+            {t("upload.artist") || "Artista"}
+          </label>
+          <input
+            type="text"
+            value={currentReview.artist || ""}
+            onChange={(e) => setCurrentReview((r) => (r ? { ...r, artist: e.target.value } : r))}
+            placeholder={t("upload.artist_placeholder") || "Ej: Viejas Locas"}
+            maxLength={255}
+            className="w-full rounded-lg bg-surface-1 border border-white/[0.08] focus:border-brand/50 px-3 py-2 text-sm text-gray-100 placeholder:text-gray-600 outline-none"
+            aria-label={t("editor.editing_artist") || "Editar artista"}
+          />
+        </div>
+        <div>
+          <label className="block text-[10px] uppercase tracking-wider text-gray-500 mb-1">
+            {t("upload.song_title") || "Título de la canción"}
+          </label>
+          <input
+            type="text"
+            value={currentReview.songTitle || ""}
+            onChange={(e) => setCurrentReview((r) => (r ? { ...r, songTitle: e.target.value } : r))}
+            placeholder={t("upload.song_title_placeholder") || "Ej: Legalícenla"}
+            maxLength={500}
+            className="w-full rounded-lg bg-surface-1 border border-white/[0.08] focus:border-brand/50 px-3 py-2 text-sm text-gray-100 placeholder:text-gray-600 outline-none"
+            aria-label={t("editor.editing_title") || "Editar título"}
+          />
+        </div>
+      </div>
+      <p className="mt-2 text-[10px] text-gray-500">
+        {t("editor.editing_banner_hint") ||
+          "Cambios acá generan un re-render del title card sin tocar el resto del video."}
+      </p>
+    </div>
+  ) : null;
+
   const newBatchScreen = (
     <div className="w-full max-w-[1700px] mx-auto animate-fade-in">
       <div className="flex items-center gap-3 mb-8">
@@ -2541,10 +2737,21 @@ export default function App() {
           </svg>
         </button>
         <div>
-          <h1 className="text-2xl font-bold">{t("upload.new_batch")}</h1>
-          <p className="text-sm text-gray-500">{t("upload.new_batch_sub")}</p>
+          <h1 className="text-2xl font-bold">
+            {currentReview?.editMode
+              ? (t("editor.editing_wizard_title") || "Editar y re-renderizar")
+              : t("upload.new_batch")}
+          </h1>
+          <p className="text-sm text-gray-500">
+            {currentReview?.editMode
+              ? (t("editor.editing_wizard_sub") ||
+                  "Corregí cualquier campo y re-renderizá. Lo que no cambies queda igual.")
+              : t("upload.new_batch_sub")}
+          </p>
         </div>
       </div>
+
+      {editingHeaderBanner}
 
       {resumeBanner}
 

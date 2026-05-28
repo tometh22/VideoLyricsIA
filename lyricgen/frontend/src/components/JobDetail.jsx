@@ -37,24 +37,16 @@ const MEDIA_TABS = [
 ];
 
 /**
- * PR C 2026-05-26 (feat/edit-metadata).
- *
- * Click-to-edit field for `artist` / `song_title`. Operator clicks a tiny
- * pencil icon next to the value → input replaces the display → Guardar
- * triggers POST /edit with edit_type="metadata" → backend persists +
- * re-renders the title card.
- *
- * NO consume edit_count — metadata fixes (typo, missing tilde) are
- * decoupled from the 3-edit cap that bounds aesthetic iterations.
- *
- * Used only when `enabled` (= job in done/pending_review/rejected and
- * not currently editing). `field` is the camelCase frontend name
- * ("artist" | "songTitle"); backend key is derived.
- *
- * On YouTube-published jobs the first save attempt returns 409 with
- * code "youtube_already_published". The component surfaces a confirm
- * dialog and re-fires with allow_youtube_drift=true if accepted.
+ * @deprecated PR feat/edit-wizard-mode 2026-05-27. Metadata editing
+ * moved into the edit-wizard at /videos/:id/edit-lyrics (top banner with
+ * artist + song_title inputs). The pencil affordance was removed because
+ * operators kept asking "where do I correct the title?" — fragmenting
+ * editing across N icons defeated the wizard's purpose. The function
+ * stays here unreferenced so a future rollback can re-mount it without
+ * a git revert. handleEditTriggered still serves EditRequestPanel's
+ * background-regen flow.
  */
+// eslint-disable-next-line no-unused-vars
 function EditableMetadataField({
   field,                // "artist" | "songTitle"
   value,                // current text shown when not editing
@@ -1185,32 +1177,15 @@ export default function JobDetail({ job, onBack, onJobUpdate }) {
           </button>
           <div className="min-w-0">
             <div className="flex items-center gap-2 flex-wrap">
-              {/* PR C 2026-05-26: song title editable when done / pending /
-                  rejected so the operator can fix a typo (missing tilde,
-                  swapped word) without re-uploading. Renders as plain
-                  <h2> text in any other state — the input would be
-                  cosmetic noise during transcribing / editing / errored
-                  jobs. Display falls back to filename (without .mp3) when
-                  job.song_title is missing; the editor only seeds with
-                  song_title (not the filename derivation) so saving
-                  doesn't accidentally persist "Sin Gamulan - Los Abuelos
-                  De La Nada" as the title. */}
-              {(isDone || isPendingReview || isRejected) ? (
-                <h2 className="text-xl font-bold tracking-tight truncate">
-                  <EditableMetadataField
-                    field="songTitle"
-                    value={job.song_title || name}
-                    jobId={job.job_id}
-                    enabled
-                    maxLength={500}
-                    ariaLabel={t("metadata.edit_song_title") || "Editar título de la canción"}
-                    onEditTriggered={handleEditTriggered}
-                    t={t}
-                  />
-                </h2>
-              ) : (
-                <h2 className="text-xl font-bold tracking-tight truncate">{name}</h2>
-              )}
+              {/* PR feat/edit-wizard-mode 2026-05-27: pencil icons removed.
+                  Metadata editing now lives in the edit-wizard at
+                  /videos/:id/edit-lyrics — one surface for every editable
+                  wizard field instead of N fragmented pencils. The
+                  fallback to `name` (filename minus .mp3) covers legacy
+                  jobs without a persisted song_title. */}
+              <h2 className="text-xl font-bold tracking-tight truncate">
+                {job.song_title || name}
+              </h2>
               {isPendingReview && (
                 <span
                   data-tour="jobdetail-status-badge"
@@ -1250,20 +1225,7 @@ export default function JobDetail({ job, onBack, onJobUpdate }) {
               )}
             </div>
             <p className="text-sm text-ink-secondary mt-0.5 truncate">
-              {(isDone || isPendingReview || isRejected) ? (
-                <EditableMetadataField
-                  field="artist"
-                  value={job.artist}
-                  jobId={job.job_id}
-                  enabled
-                  maxLength={255}
-                  ariaLabel={t("metadata.edit_artist") || "Editar artista"}
-                  onEditTriggered={handleEditTriggered}
-                  t={t}
-                />
-              ) : (
-                job.artist
-              )}
+              {job.artist}
             </p>
           </div>
         </div>
