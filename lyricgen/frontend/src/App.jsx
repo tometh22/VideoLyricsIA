@@ -1518,6 +1518,22 @@ export default function App() {
           cleanup();
           startPolling();
         };
+        // QA fix 2026-05-28 (audit P0 #73): backend emite un evento
+        // `unauthorized` named cuando detecta token expirado o tenant
+        // cambiado mid-stream. EventSource trata estos como un canal
+        // separado de `data` — sin addEventListener específico, los
+        // eventos named se ignoran silenciosamente y el SSE queda
+        // abierto colgado. Acá los capturamos, cerramos la conexión
+        // y caemos a polling autenticado — el siguiente authFetch
+        // pegará 401 y dispara el logout flow (clearToken + redirect
+        // a login).
+        es.addEventListener("unauthorized", (e) => {
+          let reason = "expired";
+          try { reason = JSON.parse(e.data || "{}").reason || reason; } catch {}
+          console.warn(`[SSE] unauthorized event from backend (${reason}) — falling back to polling`);
+          cleanup();
+          startPolling();
+        });
         return;
       }
 

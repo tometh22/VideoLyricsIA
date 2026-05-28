@@ -5920,16 +5920,39 @@ async def job_events(
         # misma sesión corta del context manager → 1 connection por tick,
         # ~2 SELECTs, devuelta al pool en milisegundos.
         unauthorized = False
+        unauthorized_reason = "tenant_changed"
         while True:
-            with scoped_db() as db_tick:
-                fresh_user = db_tick.query(User).filter(User.id == _initial_user_id).first()
-                if not fresh_user or fresh_user.tenant_id != _initial_tenant_id:
-                    unauthorized = True
-                    job = None
-                else:
-                    job = get_job(db_tick, job_id, **scope)
+            # QA fix 2026-05-28 (audit P0 #73): re-validar JWT en cada
+            # tick. Pre-fix el token solo se decodeaba al abrir el SSE;
+            # un render de 90 min sobrevivía a la expiración del token
+            # sin avisar al cliente → UI frozen en "processing" silente.
+            # Ahora decodificamos en cada tick; si expiró, emit
+            # unauthorized para que el frontend caiga a polling auth'd
+            # (donde el 401 dispara el logout flow normal).
+            try:
+                from auth import decode_token as _decode
+                _decode(token)
+            except HTTPException:
+                unauthorized = True
+                unauthorized_reason = "token_expired"
+                job = None
+            except Exception:
+                # decode_token sólo levanta HTTPException; cualquier otro
+                # error de JWT lib lo tratamos como token inválido también.
+                unauthorized = True
+                unauthorized_reason = "token_invalid"
+                job = None
+            if not unauthorized:
+                with scoped_db() as db_tick:
+                    fresh_user = db_tick.query(User).filter(User.id == _initial_user_id).first()
+                    if not fresh_user or fresh_user.tenant_id != _initial_tenant_id:
+                        unauthorized = True
+                        unauthorized_reason = "tenant_changed"
+                        job = None
+                    else:
+                        job = get_job(db_tick, job_id, **scope)
             if unauthorized:
-                yield f"event: unauthorized\ndata: {json.dumps({'reason': 'tenant_changed'})}\n\n"
+                yield f"event: unauthorized\ndata: {json.dumps({'reason': unauthorized_reason})}\n\n"
                 break
             if job is None:
                 break
