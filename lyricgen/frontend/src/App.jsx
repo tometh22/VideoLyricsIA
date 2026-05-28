@@ -31,7 +31,8 @@ import JobDetail from "./components/JobDetail";
 import { useAlert } from "./components/AlertProvider";
 import { useBackgroundPreview } from "./hooks/useBackgroundPreview";
 import { useMediaUrl, clearMediaCache } from "./mediaUrl";
-import { submitLyricsEdit } from "./lib/lyricsEditSubmit";
+import { translateBackendError } from "./lib/lyricsEditSubmit";
+import { computeFieldDiff, buildEditPayloads } from "./lib/editWizardDiff";
 
 const API = import.meta.env.VITE_API_URL || "";
 
@@ -1966,42 +1967,115 @@ export default function App() {
     const r = currentReview;
     if (!r) return;
 
-    // Post-render edit branch: currentReview.editingJobId está set →
-    // estamos editando lyrics de un job ya renderizado desde la ruta
-    // /videos/:id/edit-lyrics. En vez de pushear al batch queue, postear
-    // al endpoint /edit/:id con edit_type=lyrics y navegar de vuelta al
-    // JobDetail (donde el polling de status retoma).
-    if (r.editingJobId) {
-      const result = await submitLyricsEdit({
-        jobId: r.editingJobId,
-        segments: editedSegments,
-        baselineSegments: r.openSnapshotSegments || r.segments,
+    // Edit-wizard mode (PR feat/edit-wizard-mode, 2026-05-27):
+    // diff cualquier campo editable del wizard contra el baseline congelado
+    // en EditLyricsRoute y firea uno o más POST /edit en orden estable
+    // (metadata → typography → lyrics → background). Cada bucket que cambió
+    // = 1 re-render. El backend lee el row CURRENT al iniciar cada edit,
+    // así que los cambios anteriores ya están persistidos cuando arranca
+    // el siguiente.
+    //
+    // Pre-fix: la branch usaba submitLyricsEdit (solo edit_type=lyrics)
+    // — no había forma de corregir un typo en el title card sin pasar por
+    // /jobs/X (pencil icon, que también desapareció post-redesign).
+    if (r.editMode || r.editingJobId) {
+      const editedJobId = r.editingJobId;
+
+      // Snapshot del estado actual del wizard. editedSegments viene del
+      // LyricsEditor con el último drag aplicado — gana sobre r.segments
+      // por si el autosave todavía no lo persistió.
+      const current = {
+        artist: r.artist,
+        songTitle: r.songTitle,
         font: r.font,
+        fontScale: r.fontScale,
         textCase: r.textCase,
         textContrast: r.textContrast,
         lyricsAnimation: r.lyricsAnimation,
         lineTransition: r.lineTransition,
-        t,
-      });
-      if (result.cancelled) return;
-      if (result.unchanged) {
+        effect: r.effect,
+        backgroundHint: r.backgroundHint,
+        bgVerbatim: r.bgVerbatim,
+        backgroundMode: r.backgroundMode,
+        movementStyle: r.movementStyle,
+        segments: editedSegments,
+      };
+
+      const diff = computeFieldDiff(r.baseline, current);
+      const payloads = buildEditPayloads(diff);
+
+      if (payloads.length === 0) {
         alert({
-          title: t("edit.stale_rerender_title") || "No detectamos cambios nuevos",
-          description: t("edit.stale_rerender_prompt") ||
-            "Las letras ya están guardadas y no detectamos cambios nuevos. Si el video todavía muestra la versión vieja, podés re-renderizarlo igual desde el video.",
+          title: t("edit.no_changes_title") || "No cambiaste nada",
+          description: t("edit.no_changes_subtitle") ||
+            "No detectamos diferencias contra el video actual. Modificá algún campo y volvé a intentar.",
           tone: "warning",
         });
         return;
       }
-      if (result.error) {
+
+      // POST sequentially. Each POST has a 5-min wall-clock since the
+      // backend just enqueues and returns 202 quickly; sequential keeps
+      // the audit log ordered and avoids racing edit_count increments.
+      let lastErr = null;
+      let lastStatus = null;
+      let lastData = null;
+      for (const payload of payloads) {
+        try {
+          const res = await authFetch(`${API}/edit/${editedJobId}`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(payload),
+          });
+          let data = {};
+          try { data = await res.json(); } catch { /* empty body */ }
+          // YouTube already-published gate (409): reuse the prompt the
+          // lyrics flow already shipped. If the operator declines, abort
+          // the whole sequence — half-applied edits are worse than none.
+          if (res.status === 409 && data?.detail?.code === "youtube_already_published") {
+            const url = data.detail.youtube_url;
+            const msg = (t("edit.youtube_drift_confirm") ||
+              "Este video ya está publicado en YouTube. La re-sincronización actualizará el archivo en la plataforma pero NO reemplazará el video en YouTube (la API de YouTube no permite reemplazar archivos, solo metadata).\n\n¿Continuar igual?")
+              + (url ? `\n\nYouTube: ${url}` : "");
+            if (!window.confirm(msg)) return;
+            const retryRes = await authFetch(`${API}/edit/${editedJobId}`, {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ ...payload, allow_youtube_drift: true }),
+            });
+            let retryData = {};
+            try { retryData = await retryRes.json(); } catch { /* empty body */ }
+            if (!retryRes.ok) {
+              lastErr = translateBackendError(retryData?.detail, t) || `Error ${retryRes.status}`;
+              lastStatus = retryRes.status;
+              lastData = retryData;
+              break;
+            }
+            continue;
+          }
+          if (!res.ok) {
+            lastErr = translateBackendError(data?.detail, t) || `Error ${res.status}`;
+            lastStatus = res.status;
+            lastData = data;
+            break;
+          }
+        } catch (err) {
+          lastErr = (err && err.message) || String(err);
+          break;
+        }
+      }
+
+      if (lastErr) {
         alert({
           title: t("edit.error_title") || "No pudimos aplicar el edit",
-          description: result.error,
+          description: lastErr,
           tone: "error",
         });
+        // Log enough to debug from Sentry without leaking the user's text.
+        console.warn("[edit-wizard] /edit failed", { status: lastStatus, detail: lastData });
         return;
       }
-      const editedJobId = r.editingJobId;
+
       setCurrentReview(null);
       wizardPersistence.clear();
       navigate(`/videos/${editedJobId}`, { replace: true });
