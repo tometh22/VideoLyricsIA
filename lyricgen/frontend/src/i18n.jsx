@@ -402,6 +402,8 @@ export const translations = {
     // Transcribing
     "transcribe.title": "Transcribiendo lyrics",
     "transcribe.subtitle": "Analizando audio...",
+    "transcribe.failed_retry": "No pudimos transcribir esta canción. Probá reintentar, o si el problema persiste vení al historial en unos minutos — el job sigue procesándose en segundo plano.",
+    "transcribe.go_to_dashboard": "Ver mi historial",
     "transcribe.uploading": "Subiendo audio",
     "transcribe.uploading_progress": "Subiendo a almacenamiento ({pct}%)",
     "transcribe.song": "Canción",
@@ -946,6 +948,8 @@ export const translations = {
     "edit.error_title": "No pudimos aplicar el edit",
     "edit.not_editable_title": "No se puede editar ahora",
     "edit.not_editable_subtitle": "Este video está en un estado en el que no se puede editar. Esperá a que termine el render o que pase a revisión.",
+    "edit.editing_in_progress_title": "El video se está re-renderizando",
+    "edit.editing_in_progress_subtitle": "Estamos aplicando los cambios del edit anterior. Volveremos a abrir el editor automáticamente cuando termine.",
     "edit.stale_rerender_title": "No detectamos cambios nuevos",
     "edit.background_title": "Regenerar fondo",
     "edit.background_cost": "~10-15 min · ~US$0.90 · nuevo video cinemático manteniendo lyrics",

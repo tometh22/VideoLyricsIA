@@ -23,9 +23,21 @@ import { describe, it, expect, beforeEach, vi } from "vitest";
 // Inline mirror of App.jsx's persistSegmentsToBackend. Keep this in sync
 // with the production callback — if the contract changes there, this
 // test should fail loudly and force the maintainer to think.
+//
+// 2026-05-28 (audit P0 #74): contract widened — function now returns
+// { ok, reason, status? } so callers (LyricsEditor's saveStatus state
+// machine) can branch on outcome instead of treating every void return
+// as success. Mirror updated to match. Return values:
+//   - { ok: false, reason: "no-data" } when jobId/segments invalid
+//   - { ok: false, reason: "job-gone", status: 404 } on 404
+//   - { ok: false, reason: `http-${n}`, status: n } on other 4xx/5xx
+//   - { ok: false, reason: "network", error: string } on fetch reject
+//   - { ok: true } on 2xx success
 function makePersistSegmentsToBackend({ authFetch, setCurrentReview, API = "https://api.test" }) {
   return async function persistSegmentsToBackend(jobId, segments) {
-    if (!jobId || !Array.isArray(segments) || segments.length === 0) return;
+    if (!jobId || !Array.isArray(segments) || segments.length === 0) {
+      return { ok: false, reason: "no-data" };
+    }
     try {
       const res = await authFetch(`${API}/jobs/${jobId}/save-segments`, {
         method: "POST",
@@ -36,7 +48,11 @@ function makePersistSegmentsToBackend({ authFetch, setCurrentReview, API = "http
         if (res.status !== 404) {
           console.warn("[autosave] /save-segments failed", res.status);
         }
-        return;
+        return {
+          ok: false,
+          reason: res.status === 404 ? "job-gone" : `http-${res.status}`,
+          status: res.status,
+        };
       }
       setCurrentReview((prev) => {
         if (!prev) return prev;
@@ -45,8 +61,10 @@ function makePersistSegmentsToBackend({ authFetch, setCurrentReview, API = "http
         if (!matchesWizard && !matchesEditor) return prev;
         return { ...prev, segments };
       });
+      return { ok: true };
     } catch (err) {
       console.warn("[autosave] /save-segments network error", err);
+      return { ok: false, reason: "network", error: String(err) };
     }
   };
 }
@@ -147,5 +165,50 @@ describe("persistSegmentsToBackend — round-trip to currentReview", () => {
 
     expect(authFetch).not.toHaveBeenCalled();
     expect(setCurrentReview).not.toHaveBeenCalled();
+  });
+
+  // QA fix 2026-05-28 (audit P0 #74): explicit return-contract tests so
+  // a regression where someone deletes the `{ ok }` return value to
+  // "simplify" fails loudly. The whole error-feedback chain in
+  // LyricsEditor depends on this object existing.
+
+  it("returns { ok: true } on 2xx success", async () => {
+    authFetch.mockResolvedValue({ ok: true, status: 200 });
+    const persist = makePersistSegmentsToBackend({ authFetch, setCurrentReview });
+    const result = await persist("abc123", SEGMENTS);
+    expect(result).toEqual({ ok: true });
+  });
+
+  it("returns { ok: false, reason: 'job-gone', status: 404 } on 404", async () => {
+    authFetch.mockResolvedValue({ ok: false, status: 404 });
+    const persist = makePersistSegmentsToBackend({ authFetch, setCurrentReview });
+    const result = await persist("abc123", SEGMENTS);
+    expect(result).toEqual({ ok: false, reason: "job-gone", status: 404 });
+  });
+
+  it("returns { ok: false, reason: 'http-500', status: 500 } on 5xx", async () => {
+    authFetch.mockResolvedValue({ ok: false, status: 500 });
+    const persist = makePersistSegmentsToBackend({ authFetch, setCurrentReview });
+    const result = await persist("abc123", SEGMENTS);
+    expect(result).toEqual({ ok: false, reason: "http-500", status: 500 });
+  });
+
+  it("returns { ok: false, reason: 'network' } when fetch rejects", async () => {
+    authFetch.mockRejectedValue(new Error("ECONNRESET"));
+    const persist = makePersistSegmentsToBackend({ authFetch, setCurrentReview });
+    const result = await persist("abc123", SEGMENTS);
+    expect(result.ok).toBe(false);
+    expect(result.reason).toBe("network");
+    expect(result.error).toContain("ECONNRESET");
+  });
+
+  it("returns { ok: false, reason: 'no-data' } on invalid input", async () => {
+    const persist = makePersistSegmentsToBackend({ authFetch, setCurrentReview });
+    const r1 = await persist("", SEGMENTS);
+    const r2 = await persist("abc", []);
+    const r3 = await persist(null, SEGMENTS);
+    expect(r1).toEqual({ ok: false, reason: "no-data" });
+    expect(r2).toEqual({ ok: false, reason: "no-data" });
+    expect(r3).toEqual({ ok: false, reason: "no-data" });
   });
 });
