@@ -6,6 +6,7 @@ import LyricsTimeline from "./LyricsTimeline";
 import LyricVideoPreview from "./LyricVideoPreview";
 import { tierForLength } from "../lib/lyricTiers";
 import { prettifySongTitle } from "../lib/prettifySongTitle";
+import { segmentsValuesEqual } from "../lib/segmentsValuesEqual";
 import useLocalStorage from "../hooks/useLocalStorage";
 
 // Font options for the live in-preview switcher. Codes match the render
@@ -439,6 +440,26 @@ export default function LyricsEditor({
   const autoTrimAppliedRef = useRef(false);
   useEffect(() => {
     if (prevSegmentsRef.current === segments) return;
+    // QA fix 2026-05-27 (drag-resize regression): the autosave POST
+    // roundtrip (App.jsx::persistSegmentsToBackend) calls
+    // setCurrentReview({...prev, segments: cleaned}) after a successful
+    // /save-segments. That hands LyricsEditor a NEW segments array
+    // reference holding the SAME values the operator just dragged.
+    // Pre-fix this useEffect saw the new ref and reseeded `edited` —
+    // re-assigning _ids by index, dropping `locked`/`pos`/`scale`/`rot`
+    // that the local handler had just applied, and under React's render
+    // batching also dropping an in-flight second drag in same tick.
+    // Net effect: operator drags an edge, releases, the edge snaps back
+    // to where it was before. We bump the ref so we don't re-check on
+    // every render, but skip the destructive reseed.
+    if (segmentsValuesEqual(prevSegmentsRef.current, segments)) {
+      // [drag-persist] diagnostic — remove after staging confirms.
+      console.warn("[drag-persist] prop-sync skipping reseed (values equal)");
+      prevSegmentsRef.current = segments;
+      return;
+    }
+    // [drag-persist] diagnostic — remove after staging confirms.
+    console.warn("[drag-persist] prop-sync RESEEDING", { count: segments.length });
     prevSegmentsRef.current = segments;
     const seeded = segments.map((s, i) => ({ ...s, _id: i }));
     setEdited(seeded);
@@ -485,6 +506,12 @@ export default function LyricsEditor({
     let cancelled = false;
     setSaveStatus("saving");
     const cleaned = edited.map(({ _id, review, ...rest }) => rest);
+    // [drag-persist] diagnostic — remove after staging confirms the fix.
+    console.warn("[drag-persist] flush firing", {
+      transcribeJobId,
+      flushCounter,
+      count: cleaned.length,
+    });
     Promise.resolve(onPersistSegments(transcribeJobId, cleaned))
       .then(() => { if (!cancelled) setSaveStatus("saved"); })
       .catch(() => { if (!cancelled) setSaveStatus("idle"); });
@@ -691,6 +718,12 @@ export default function LyricsEditor({
   // auto-extending it (hold-until-next). The undo snapshot is pushed by the
   // timeline on pointerdown (onDragStart), so this only mutates `edited`.
   const handleTimelineTimingChange = useCallback((id, newStart, newEnd) => {
+    // [drag-persist] diagnostic — remove after staging confirms the fix.
+    console.warn("[drag-persist] drag end", {
+      id,
+      newStart: Math.round(newStart * 1000) / 1000,
+      newEnd: Math.round(newEnd * 1000) / 1000,
+    });
     setIsDirty(true);
     setEdited((prev) => prev.map((s) =>
       s._id === id ? { ...s, start: newStart, end: newEnd, locked: true } : s

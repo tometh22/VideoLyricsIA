@@ -1928,6 +1928,15 @@ export default function App() {
   // commit still happens at POST /generate.
   const persistSegmentsToBackend = useCallback(async (jobId, segments) => {
     if (!jobId || !Array.isArray(segments) || segments.length === 0) return;
+    // [drag-persist] diagnostic logging — remove after staging confirms
+    // the value-equality fix in LyricsEditor's prop-sync resolves the
+    // regression. Captures the full autosave roundtrip so we can correlate
+    // a "snap back to original" with the exact sequence the user saw.
+    const _sample = segments.slice(0, 2).map((s) => ({
+      start: Math.round((s.start || 0) * 1000) / 1000,
+      end: Math.round((s.end || 0) * 1000) / 1000,
+    }));
+    console.warn("[drag-persist] POST", { jobId, count: segments.length, sample: _sample });
     try {
       const res = await authFetch(`${API}/jobs/${jobId}/save-segments`, {
         method: "POST",
@@ -1956,6 +1965,7 @@ export default function App() {
       // segments), así que usamos el array que enviamos como source of truth.
       // Match contra ambos paths: wizard pre-render usa transcribeJobId,
       // editor post-render (EditLyricsRoute) usa editingJobId.
+      console.warn("[drag-persist] POST 200, propagating to currentReview", { jobId });
       setCurrentReview((prev) => {
         if (!prev) return prev;
         const matchesWizard = prev.transcribeJobId === jobId;
@@ -2585,7 +2595,13 @@ export default function App() {
   //   - bgPreview.status → chip subtle "Fondo: generando…" en LyricsEditor
   //     (UX specialist 2026-05-24, cierra el mental-model gap de pre-gen invisible).
   const bgPreview = useBackgroundPreview(previewEntry, {
-    enabled: !!currentReview,
+    // QA fix 2026-05-27: en edit mode el job ya tiene bg_r2_key_cached
+    // poblado; pre-generar otra vez muestra el chip "Generando fondo en
+    // background…" sobre un fondo que ya existe (ruido visual + costo
+    // Gemini gratuito). Si el operador clickea "Editar y re-renderizar"
+    // con cambio de background, ese flow dispara su propio re-render
+    // via /edit/{id} con edit_type=background — no necesita el preview.
+    enabled: !!currentReview && !currentReview.editMode,
     api: API,
     authHeaders,
     onCacheKey: (key) => {
@@ -2800,13 +2816,31 @@ export default function App() {
         // sincronizado al audio. Sin re-renders en App.jsx — el preview lee
         // el ref con su propio rAF loop.
         playbackTickRef={playbackTickRef}
-        // Post-render edit (EditLyricsRoute): cuando currentReview viene
-        // con editingJobId, el wizard cambia a modo "editar job existente":
-        // pasos 1, 2, 3, 5 lockeados (esos cambios requieren regenerar
-        // fondo y los cubre el modo "background" de EditRequestPanel), el
-        // preview central muestra el MP4 ya renderizado en vez de la
-        // simulación de karaoke.
-        lockedSteps={currentReview?.editingJobId ? [1, 2, 3, 5] : []}
+        // Post-render edit (EditLyricsRoute): el wizard se monta sobre un
+        // job ya renderizado. QA fix 2026-05-27: bajamos los locks de
+        // [1, 2, 3, 5] a [1, 5] — solo file upload (paso 1) y delivery
+        // profile (paso 5) son verdaderamente structural (audio fijo, no
+        // se puede cambiar formato sin regenerar todo). Pasos 2 (Modo) y
+        // 3 (Movimiento) ahora son navegables: el operador puede editar
+        // background_hint, bg_verbatim, scene mode, movement_style y
+        // effect. El style picker (paleta) dentro de step 2 queda
+        // lockeado a nivel control via `editMode` + overlay — no a nivel
+        // step, así el resto de step 2 sí es interactivo.
+        lockedSteps={currentReview?.editMode ? [1, 5] : []}
+        editMode={!!currentReview?.editMode}
+        // QA fix 2026-05-27: en edit mode los controles del wizard
+        // (step 2 background_hint/bg_verbatim, step 3 movement/effect,
+        // step 4 typography) escriben a batchDefaults + files via
+        // updateBatchDefault. Como files=[] en edit mode, el fan-out es
+        // no-op y los cambios no llegan al diff de handleApproveLyrics.
+        // Este callback los forward a currentReview con el mismo nombre
+        // de field (batchDefaults y currentReview usan camelCase con las
+        // mismas keys: backgroundHint, bgVerbatim, movementStyle,
+        // effect, font, textCase, fontScale, textContrast,
+        // lyricsAnimation, lineTransition, lyricColor, lyricSungColor).
+        onEditFieldChange={(field, value) =>
+          setCurrentReview((r) => (r ? { ...r, [field]: value } : r))
+        }
         renderedVideoUrl={editingRenderedVideoUrl || null}
         // UI F5 (2026-05-26): le pasamos el bgStatus al wizard para que
         // UploadZone pueda derivar `placeholderBg` cuando montamos el
