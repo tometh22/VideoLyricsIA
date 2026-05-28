@@ -60,6 +60,7 @@ if _SENTRY_DSN:
 
 from fastapi import FastAPI, File, Form, Header, Query, UploadFile, HTTPException, Depends, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.responses import FileResponse, JSONResponse, RedirectResponse, StreamingResponse
 from pydantic import BaseModel, Field
 from slowapi import Limiter, _rate_limit_exceeded_handler
@@ -175,6 +176,22 @@ limiter = Limiter(
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 app.add_middleware(SlowAPIMiddleware)
+
+# Response compression. FastAPI doesn't enable this by default — a known
+# papercut. Without it, large JSON responses (e.g. /jobs with segments,
+# /admin/jobs) ship uncompressed on every request, which is wire-size
+# brutal over mobile / patchy connections (the UMG operator complained
+# about the dashboard being "lento" on a 4G hotspot).
+#
+# minimum_size=500: skip compressing tiny responses (auth tokens, 404s,
+# health pings) where the gzip header overhead is bigger than the
+# saving. compresslevel=5: balance between ratio (~60-70% reduction on
+# JSON) and CPU. Levels >6 give diminishing returns for ~2x CPU.
+#
+# Browsers send `Accept-Encoding: gzip` automatically since the late
+# 90s, so this is invisible to clients. Vercel already does the same
+# (Brotli) for the frontend; this brings api.genly.pro to parity.
+app.add_middleware(GZipMiddleware, minimum_size=500, compresslevel=5)
 
 # --- CORS: comma-separated list, e.g. "https://app.example.com,https://admin.example.com"
 # In production we refuse to start with no allowed origins — wildcard +
