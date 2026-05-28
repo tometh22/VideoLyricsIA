@@ -2095,18 +2095,18 @@ export default function UploadZone({
                  el preview muta a "Resultado actual" y todos los overlays
                  (palette/grade/karaoke sim) se cortocircuitan.
 
-                 QA fix 2026-05-28 (UX): operador reportaba que cambiar
-                 cosas en steps 2/3/4 (Modo/Movimiento/Tipografía) no se
-                 reflejaba en el preview central. Causa: en edit mode
-                 renderedVideoUrl siempre venía set → cortocircuito
-                 instantáneo → operator no veía sus cambios. Ahora SOLO
-                 mostramos el MP4 cuando el operador está en step 6
-                 (necesita el video como referencia para sincronizar
-                 lyrics con el audio). En pasos 2/3/4, dropear el MP4 y
-                 dejar que la live preview renderice — refleja
-                 movimiento, fondo (incl. biblioteca), tipografía, color
-                 + el drag-resize de timings del PR #436. */
-              renderedVideoUrl={isStep6 ? renderedVideoUrl : null}
+                 QA fix 2026-05-28 (UX, second pass): operador reportó que
+                 en step 6 quedaban DOS reproductores (el MP4 con sus
+                 controles + el audio bar del LyricsEditor) sin sincronizar
+                 — confuso. Y la live preview con karaoke reflejaba mejor
+                 el flow del editor (la línea activa se ilumina al pasar
+                 el audio via playbackTickRef). Ahora droppeamos el MP4 en
+                 TODO el edit-wizard: la live preview corre en todos los
+                 pasos (incluido step 6), reflejando movement/fondo/
+                 tipografía/color + drag-resize, y su karaoke sigue el
+                 audio del LyricsEditor. Si el operador quiere ver el
+                 video resultante actual, lo ve en JobDetail. */
+              renderedVideoUrl={null}
               /* UI F3 + F5 (2026-05-26): compact en paso 6; placeholderBg
                  mientras el pre-gen del fondo no terminó. */
               compact={isStep6}
