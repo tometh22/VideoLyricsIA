@@ -6,6 +6,7 @@ import LyricsTimeline from "./LyricsTimeline";
 import LyricVideoPreview from "./LyricVideoPreview";
 import { tierForLength } from "../lib/lyricTiers";
 import { prettifySongTitle } from "../lib/prettifySongTitle";
+import { segmentsValuesEqual } from "../lib/segmentsValuesEqual";
 import useLocalStorage from "../hooks/useLocalStorage";
 
 // Font options for the live in-preview switcher. Codes match the render
@@ -439,6 +440,22 @@ export default function LyricsEditor({
   const autoTrimAppliedRef = useRef(false);
   useEffect(() => {
     if (prevSegmentsRef.current === segments) return;
+    // QA fix 2026-05-27 (drag-resize regression): the autosave POST
+    // roundtrip (App.jsx::persistSegmentsToBackend) calls
+    // setCurrentReview({...prev, segments: cleaned}) after a successful
+    // /save-segments. That hands LyricsEditor a NEW segments array
+    // reference holding the SAME values the operator just dragged.
+    // Pre-fix this useEffect saw the new ref and reseeded `edited` —
+    // re-assigning _ids by index, dropping `locked`/`pos`/`scale`/`rot`
+    // that the local handler had just applied, and under React's render
+    // batching also dropping an in-flight second drag in same tick.
+    // Net effect: operator drags an edge, releases, the edge snaps back
+    // to where it was before. We bump the ref so we don't re-check on
+    // every render, but skip the destructive reseed.
+    if (segmentsValuesEqual(prevSegmentsRef.current, segments)) {
+      prevSegmentsRef.current = segments;
+      return;
+    }
     prevSegmentsRef.current = segments;
     const seeded = segments.map((s, i) => ({ ...s, _id: i }));
     setEdited(seeded);
