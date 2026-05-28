@@ -229,10 +229,26 @@ async function multipartUpload({
   await Promise.all(Array.from({ length: workerCount }, () => worker()));
 
   if (firstError) {
-    // Best-effort abort so R2 doesn't keep the orphan parts around.
+    // QA fix 2026-05-28 (audit P0 #76): abort retry. Pre-fix el abort
+    // era best-effort con try/catch{} silente — si la primera POST
+    // fallaba (red caída justo cuando la subida ya falló), las
+    // partes quedaban huérfanas en R2 forever (costo storage +
+    // posible truncation por cleanup policies). Ahora intentamos con
+    // backoff exponencial 4 veces (1s, 2s, 4s, 8s) y si todo falla
+    // logueamos un warning estructurado para que el server-side
+    // sweeper (PR siguiente) los limpie. El throw del firstError sigue
+    // ocurriendo así que el caller se entera del upload fail.
     try {
-      await apiPost("/upload-multipart-abort", { job_id: jobId });
-    } catch {}
+      await withRetry(
+        () => apiPost("/upload-multipart-abort", { job_id: jobId }),
+        { maxAttempts: 4, baseMs: 1000 }
+      );
+    } catch (abortErr) {
+      console.warn(
+        "[r2Upload] multipart abort failed after retries — orphan parts in R2",
+        { jobId, abortErr: String(abortErr) }
+      );
+    }
     throw firstError;
   }
 
