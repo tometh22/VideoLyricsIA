@@ -397,7 +397,18 @@ export default function LyricsTimeline({
         </div>
       </div>
 
-      {/* Scrollable timeline (vertical) */}
+      {/* Scrollable timeline (vertical).
+          QA fix 2026-05-28: el auto-scroll del timeline usa
+          scrollRef.scrollTop directo (línea 334 / 281) para mover el
+          lane cuando la línea activa cambia, así que el scrollRef
+          NECESITA seguir siendo un overflow-y-auto container (no
+          podemos hacerlo overflow-visible bajo el nuevo wizard layout).
+          Dejamos el maxHeight inline tal cual — el timeline mantiene su
+          scroll INTERNO con su auto-scroll a la línea activa, y el
+          wizard OUTER scroll (UploadZone right column) cubre el resto
+          (header del timeline, controles arriba). Nested scroll
+          aceptable: el inner se activa con mouse-wheel sobre el lane,
+          el outer con wheel sobre el header. */}
       <div
         ref={scrollRef}
         className="overflow-y-auto overflow-x-hidden"

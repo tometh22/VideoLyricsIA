@@ -6,6 +6,7 @@ import LyricsTimeline from "./LyricsTimeline";
 import LyricVideoPreview from "./LyricVideoPreview";
 import { tierForLength } from "../lib/lyricTiers";
 import { prettifySongTitle } from "../lib/prettifySongTitle";
+import { segmentsValuesEqual } from "../lib/segmentsValuesEqual";
 import useLocalStorage from "../hooks/useLocalStorage";
 
 // Font options for the live in-preview switcher. Codes match the render
@@ -439,12 +440,43 @@ export default function LyricsEditor({
   const autoTrimAppliedRef = useRef(false);
   useEffect(() => {
     if (prevSegmentsRef.current === segments) return;
+    // QA fix 2026-05-27 (drag-resize regression): the autosave POST
+    // roundtrip (App.jsx::persistSegmentsToBackend) calls
+    // setCurrentReview({...prev, segments: cleaned}) after a successful
+    // /save-segments. That hands LyricsEditor a NEW segments array
+    // reference holding the SAME values the operator just dragged.
+    // Pre-fix this useEffect saw the new ref and reseeded `edited` —
+    // re-assigning _ids by index, dropping `locked`/`pos`/`scale`/`rot`
+    // that the local handler had just applied, and under React's render
+    // batching also dropping an in-flight second drag in same tick.
+    // Net effect: operator drags an edge, releases, the edge snaps back
+    // to where it was before. We bump the ref so we don't re-check on
+    // every render, but skip the destructive reseed.
+    if (segmentsValuesEqual(prevSegmentsRef.current, segments)) {
+      // [drag-persist] diagnostic — remove after staging confirms.
+      console.warn("[drag-persist] prop-sync skipping reseed (values equal)");
+      prevSegmentsRef.current = segments;
+      return;
+    }
+    // [drag-persist] diagnostic — remove after staging confirms.
+    console.warn("[drag-persist] prop-sync RESEEDING", { count: segments.length });
     prevSegmentsRef.current = segments;
     const seeded = segments.map((s, i) => ({ ...s, _id: i }));
     setEdited(seeded);
     originalSegmentsRef.current = seeded;
     setIsDirty(false);
-    autoTrimAppliedRef.current = false;  // new job → eligible for auto-trim
+    // Audit fix 2026-05-27 (drag-resize regression part 2): NO resetear
+    // autoTrimAppliedRef acá. Antes hacíamos `current = false` con la
+    // lógica "new job → eligible for auto-trim", PERO esta useEffect
+    // también dispara en el roundtrip del autosave (drag → POST →
+    // setCurrentReview → reseed). Si el operador acababa de extender un
+    // segmento más allá de su `estimateVoiceEndDuration` cap, autoTrim
+    // (useEffect en línea ~1440) ve `current=false` + `longSegCount>0`
+    // y dispara `trimAllLongSegs()` que recorta el end de vuelta al cap.
+    // Visualmente: drag se "revierte". Para el caso real de cargar un
+    // job distinto, el padre cambia la `key` del LyricsEditor (filename
+    // + queueIdx) → remount → useState inicializa `current=false` de
+    // nuevo. No hace falta el reset acá.
   }, [segments]);
 
   // Warn browser on tab-close / external navigation when there are unsaved edits.
@@ -485,6 +517,12 @@ export default function LyricsEditor({
     let cancelled = false;
     setSaveStatus("saving");
     const cleaned = edited.map(({ _id, review, ...rest }) => rest);
+    // [drag-persist] diagnostic — remove after staging confirms the fix.
+    console.warn("[drag-persist] flush firing", {
+      transcribeJobId,
+      flushCounter,
+      count: cleaned.length,
+    });
     Promise.resolve(onPersistSegments(transcribeJobId, cleaned))
       .then(() => { if (!cancelled) setSaveStatus("saved"); })
       .catch(() => { if (!cancelled) setSaveStatus("idle"); });
@@ -691,6 +729,12 @@ export default function LyricsEditor({
   // auto-extending it (hold-until-next). The undo snapshot is pushed by the
   // timeline on pointerdown (onDragStart), so this only mutates `edited`.
   const handleTimelineTimingChange = useCallback((id, newStart, newEnd) => {
+    // [drag-persist] diagnostic — remove after staging confirms the fix.
+    console.warn("[drag-persist] drag end", {
+      id,
+      newStart: Math.round(newStart * 1000) / 1000,
+      newEnd: Math.round(newEnd * 1000) / 1000,
+    });
     setIsDirty(true);
     setEdited((prev) => prev.map((s) =>
       s._id === id ? { ...s, start: newStart, end: newEnd, locked: true } : s
@@ -2581,7 +2625,19 @@ export default function LyricsEditor({
                       esto ahorra ~120px de scroll total. Y como el Phase B
                       compactó el header (auto-fix pill 32px), max-h ahora
                       puede crecer (100vh-200 vs 100vh-280 antes). */}
-                  <div ref={listRef} className={`space-y-0.5 overflow-y-auto pr-1 pb-8 ${focusMode ? "max-h-[calc(100vh-110px)]" : "max-h-[calc(100vh-200px)]"}`}>
+                  {/* QA fix 2026-05-28: el max-h vh-based servía cuando el
+                      editor scrolleaba ADENTRO de su panel y el page-scroll
+                      cubría todo. Con el nuevo wizard layout (PR
+                      fix/wizard-scroll-viewport), el scroll context del
+                      panel derecho vive en UploadZone (~línea 2147,
+                      lg:overflow-y-auto h-full). Si dejamos el max-h acá
+                      sobre lg, el operador ve DOBLE scroll: el inner cap
+                      (acá) PLUS el outer (UploadZone). Resultado: scrollear
+                      al final del inner deja contenido del outer abajo,
+                      pero el mouse-wheel no transfiere → scroll trapped.
+                      Mobile mantiene el cap original (no hay outer
+                      overflow ahí, el page scroll cubre todo). */}
+                  <div ref={listRef} className={`space-y-0.5 overflow-y-auto pr-1 pb-8 ${focusMode ? "max-h-[calc(100vh-110px)]" : "max-h-[calc(100vh-200px)]"} lg:max-h-none lg:overflow-visible`}>
           {edited.map((seg, idx) => {
             const suggestion = suggestionsById[seg._id];
             const isApplied = suggestion && seg.text === suggestion;

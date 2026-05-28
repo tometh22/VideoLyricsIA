@@ -333,11 +333,12 @@ export default function EditRequestPanel({
                 <path d="M9 19V6l12-2v13M9 19a2 2 0 11-4 0 2 2 0 014 0zM21 17a2 2 0 11-4 0 2 2 0 014 0z" strokeLinecap="round" />
               </svg>
               <span className="text-sm font-medium text-white">
-                {t("edit.lyrics_title") || "Editar letras y estilo"}
+                {t("edit.wizard_title") || "Editar y re-renderizar"}
               </span>
             </div>
             <p className="text-[11px] text-ink-secondary">
-              {t("edit.lyrics_cost") || "~5-10 min · sin costo extra · letra, tipografía, tamaño y posición — en vivo sobre el video"}
+              {t("edit.wizard_cost") ||
+                "~5-10 min · sin costo extra · título, artista, letra, tipografía, timing — todo desde el wizard"}
             </p>
           </button>
           )}

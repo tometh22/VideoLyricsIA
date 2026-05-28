@@ -176,6 +176,20 @@ export default function UploadZone({
   // en vez del "EN VIVO" pulsante — el operador ve un fondo placeholder
   // hasta que apruebe y genere.
   bgStatus = null,
+  // QA fix 2026-05-27 (edit-wizard mode): cuando el operador entra al
+  // wizard via /videos/:id/edit-lyrics, ciertos campos structural
+  // (paleta, custom_colors) no pueden cambiarse post-render aunque su
+  // step (Modo / step 2) sea navegable. `editMode` controla locks por
+  // field — el wizard sigue mostrando el control para que el operador
+  // VEA el valor actual, pero con overlay + tooltip "no editable".
+  editMode = false,
+  // Callback opcional para wizard en edit mode: cuando un control de
+  // step 2/3/4 escribe a batchDefaults (el path normal new-job), también
+  // forward el cambio a currentReview vía este callback. Sin esto, los
+  // cambios de background_hint/movement/effect no llegan al diff de
+  // submitEdit porque batchDefaults sólo fan-out a files[] y en edit
+  // mode files=[].
+  onEditFieldChange = null,
 }) {
   const { t } = useI18n();
   const inputRef = useRef();
@@ -263,6 +277,14 @@ export default function UploadZone({
       return next;
     });
     onFiles((prev) => prev.map((f) => ({ ...f, [field]: value })));
+    // QA fix 2026-05-27: en edit mode files=[] así que el fan-out de
+    // arriba es no-op. Sin esto, los cambios de background_hint /
+    // movement / effect / typography que el operador hace en steps 2-4
+    // nunca llegan a currentReview, y submitEdit (handleApproveLyrics)
+    // los pierde al computar el diff. App.jsx mapea field→currentReview.
+    if (editMode && onEditFieldChange) {
+      onEditFieldChange(field, value);
+    }
   };
 
   const [hoverCaseBatch, setHoverCaseBatch] = useState(null);
@@ -1013,7 +1035,15 @@ export default function UploadZone({
       </div>
   );
 
-  const _batchSettingsBlock = files.length > 0 ? (
+  // QA fix 2026-05-28: en edit mode files=[] (no se sube nada nuevo, el
+  // job ya tiene su audio), pero el operador SÍ necesita ver los
+  // controls de movement/effect en step 3 para corregir esos campos.
+  // El gate original `files.length > 0` ocultaba todo el panel en edit
+  // mode → step 3 quedaba vacío. Ahora abrimos también para editMode.
+  // Los sub-bloques internos siguen con sus propios checks
+  // (`files.length > 1` para acciones de batch) — esos correctamente
+  // se ocultan si no hay archivos.
+  const _batchSettingsBlock = (files.length > 0 || editMode) ? (
     <div className="mt-3 glass rounded-card px-4 py-4">
       <p className="text-[10px] uppercase tracking-[0.18em] text-gray-500 mb-3">
         {files.length > 1
@@ -1907,7 +1937,16 @@ export default function UploadZone({
   const summary = summaryParts.join(" · ");
 
   return (
-    <div className="w-full px-2 md:px-6 pb-28">
+    // QA fix 2026-05-28 (UX, scroll architecture): en lg+ el wrapper
+    // ahora ocupa exactamente el alto que le da el padre (lg:flex-1 +
+    // lg:min-h-0 + lg:overflow-hidden viniendo de App.jsx::newBatchScreen).
+    // Adentro, el grid es flex-col (flex-1) para que la grid de 3
+    // columnas tome todo el alto disponible y la columna RIGHT pueda
+    // hacer su propio overflow-y-auto sin tener que pelearse con el
+    // page-scroll. pb-28 (clear del CTA flotante "Aprobar y generar") se
+    // mantiene solo en mobile — en desktop el CTA es fixed bottom-0 con
+    // su propio espacio. Mobile (<lg) no se toca: pb-28 + page-scroll.
+    <div className="w-full px-2 md:px-6 pb-28 lg:pb-0 lg:h-full lg:overflow-hidden lg:flex lg:flex-col">
       <UploadTour user={user} />
       {/* Pre-upload short-circuit: drop zone-only layout aplica solo cuando
           NO hay contenido reviewable Y NO estamos en edit-mode. Sin estas
@@ -1933,8 +1972,16 @@ export default function UploadZone({
          (oculta caption de movement/effect que ya no se está editando). */
       (() => {
         const isStep6 = wizardStep === 6 && hasReviewableContent;
+        // QA fix 2026-05-28 (UX, polish): operador reportó que en step 6
+        // el stepper sólo mostraba números (1-6) y no se entendía qué era
+        // cada paso. La compactación a 56 px sacrificaba discoverability
+        // por espacio. Subimos a 168 px (alcanza para las labels más
+        // largas como "Tipografía & Animación") y bajamos el preview a
+        // 380-520 px y el panel derecho conserva el 1fr. La pérdida de
+        // ~140 px del preview es marginal vs. el gran win de saber qué
+        // estás clickeando. Otros pasos siguen con 190 px (no cambian).
         const gridCols = isStep6
-          ? "lg:grid-cols-[56px_minmax(260px,320px)_minmax(0,1fr)]"
+          ? "lg:grid-cols-[168px_minmax(380px,520px)_minmax(0,1fr)]"
           : "lg:grid-cols-[190px_minmax(0,1fr)_minmax(400px,460px)]";
         // 2026-05-26 — variante [.editor-focus-mode_&] colapsa este grid
         // a 1 columna cuando el LyricsEditor prende "modo enfoque". Sin
@@ -1945,7 +1992,14 @@ export default function UploadZone({
         // viewport. Body class emitida por LyricsEditor:367, cleanup en
         // unmount → volver a step 4 reaparece el layout 3-col.
         return (
-        <div className={`flex flex-col lg:grid ${gridCols} [.editor-focus-mode_&]:lg:grid-cols-1 gap-6 items-start`}>
+        // QA fix 2026-05-28: grid pasa a llenar el alto del padre y a ser
+        // su propio scroll context en lg+. items-start mantiene la
+        // alineación al top de las columnas (necesario para que el
+        // sticky-top-4 del stepper y preview siga funcionando). lg:flex-1
+        // lg:min-h-0 deja la grid ocupar el espacio que el flex-col
+        // exterior le da. lg:overflow-hidden previene que la grid haga
+        // overflow al body — el scroll vive en la columna RIGHT.
+        <div className={`flex flex-col lg:grid ${gridCols} [.editor-focus-mode_&]:lg:grid-cols-1 gap-6 items-start lg:items-stretch lg:h-full lg:min-h-0 lg:overflow-hidden lg:flex-1`}>
 
         {/* LEFT — step rail (vertical on desktop, horizontal pills on mobile).
             Paso 6 "Lyrics" se ve siempre; está deshabilitado hasta que
@@ -1954,10 +2008,10 @@ export default function UploadZone({
             step 6 y permite navegar libremente entre 4↔6 (operador
             cambia font/animation en paso 4, vuelve a paso 6 a aprobar).
 
-            UI F2 (2026-05-26): en paso 6 las labels se ocultan (solo
-            el número en círculo queda visible). Tooltip on hover
-            mantiene la información completa. El sidebar pasa de 190 px
-            a 56 px → +134 px que ganan las otras dos columnas. */}
+            QA fix 2026-05-28 (UX): la versión anterior ocultaba labels en
+            step 6 para ganar espacio. Operador reportó que no se entendía
+            qué era cada paso. Volvemos a mostrar labels SIEMPRE — el
+            grid arriba se ajustó a 168 px de sidebar para acomodarlas. */}
         <nav className="flex lg:flex-col gap-1.5 lg:gap-1 overflow-x-auto lg:overflow-visible lg:sticky lg:top-4 w-full lg:w-auto order-first [.editor-focus-mode_&]:hidden">
           {WIZARD_STEPS.map((s) => {
             const isLyrics = s.id === 6;
@@ -1978,7 +2032,7 @@ export default function UploadZone({
                   : lyricsDisabled
                     ? (t("upload.step_lyrics_hint") || "Disponible después de \"Revisar lyrics\"")
                     : (isStep6 ? s.label : undefined)}
-                className={`flex items-center ${isStep6 ? "lg:justify-center lg:px-0" : "gap-2.5 px-3"} py-2.5 rounded-xl text-[12.5px] font-medium whitespace-nowrap transition-all text-left shrink-0 ${
+                className={`flex items-center gap-2.5 px-3 py-2.5 rounded-xl text-[12.5px] font-medium whitespace-nowrap transition-all text-left shrink-0 ${
                   disabled
                     ? "text-gray-600 cursor-not-allowed opacity-50"
                     : active ? "bg-brand/[0.12] text-white ring-1 ring-brand/35"
@@ -1991,7 +2045,7 @@ export default function UploadZone({
                                     : done ? "bg-accent/20 text-accent"
                                            : "bg-surface-3 text-gray-400"
                 }`}>{done ? "✓" : s.id}</span>
-                <span className={isStep6 ? "lg:hidden ml-2.5" : "ml-2.5 lg:ml-0"}>{s.label}</span>
+                <span className="ml-0">{s.label}</span>
               </button>
             );
           })}
@@ -2006,7 +2060,17 @@ export default function UploadZone({
             grid column (260-320 px). Mantiene sticky para acompañar
             el scroll del timeline en el panel derecho. */}
         <div className="lg:sticky lg:top-4 space-y-2 min-w-0 w-full [.editor-focus-mode_&]:hidden">
-          {bgMode === "auto" ? (
+          {/* QA fix 2026-05-28 (bug #3): pre-fix mostraba el preview SOLO en
+              bgMode==="auto". Cuando el operador seleccionaba un fondo de
+              biblioteca el preview desaparecía y se reemplazaba por un
+              placeholder estático "Fondo de biblioteca" — visualmente
+              parece un bug porque el operador pierde la visualización del
+              karaoke + movimiento + tipografía sobre el ASSET ELEGIDO. El
+              componente WizardLivePreview no tiene dependencia hard del
+              modo, sólo necesita los props de animation/typography/color.
+              Habilitar para library (no para custom porque hasta que el
+              archivo cargue no hay nada que mostrar). */}
+          {(bgMode === "auto" || bgMode === "library") ? (
             <WizardLivePreview
               style={style}
               customColors={customColors}
@@ -2016,6 +2080,28 @@ export default function UploadZone({
               lineTransition={hoverTransition ?? batchDefaults.lineTransition}
               lyricColor={batchDefaults.lyricColor || "#FFFFFF"}
               lyricSungColor={batchDefaults.lyricSungColor || "#FFFFFF"}
+              /* QA fix 2026-05-28: cuando el operador selecciona un fondo
+                 de biblioteca en step 2, la BASE del preview es ese
+                 asset (en vez del clip del movement). Para assets .mp4
+                 (file_type "mp4") va como <video>; para imágenes
+                 (jpg/png) se renderiza como <img> via la prop nueva
+                 clipIsVideo. Hasta el follow-up, el operador veía negro
+                 cuando elegía un asset image porque el <video> element
+                 fallaba a cargar la imagen. */
+              clipSrc={(() => {
+                if (bgMode === "library" && backgroundId) {
+                  return `${API}/backgrounds/${backgroundId}/preview?${tokenParam()}`;
+                }
+                return (MOVEMENT_STYLES.find((m) => m.code === (hoverMovement ?? batchDefaults.movementStyle))?.sample) || "/movement_samples/estandar.mp4";
+              })()}
+              clipIsVideo={(() => {
+                if (bgMode === "library" && backgroundId) {
+                  const sel = libraryBgs.find((b) => b.id === backgroundId);
+                  return sel?.file_type === "mp4";
+                }
+                // Movement samples siempre son MP4; default true.
+                return true;
+              })()}
               /* Typography 2026-05-26: cerrar el gap entre los controles del
                  paso 4 (font/case/size/contrast) y el preview central. Antes
                  el comentario al lado del bloque mentía — "el preview ya
@@ -2031,7 +2117,6 @@ export default function UploadZone({
               textContrast={batchDefaults.textContrast || "medium"}
               mode={sceneMode}
               lyric={_previewLyric}
-              clipSrc={(MOVEMENT_STYLES.find((m) => m.code === (hoverMovement ?? batchDefaults.movementStyle))?.sample) || "/movement_samples/estandar.mp4"}
               /* Phase C 2026-05-25: el ref de playback tick permite al
                  preview leer la línea activa + currentTime para hacer
                  word-jump real cuando el operador está reproduciendo el
@@ -2040,16 +2125,31 @@ export default function UploadZone({
               playbackTickRef={playbackTickRef}
               /* Post-render edit: MP4 ya renderizado del job. Cuando viene,
                  el preview muta a "Resultado actual" y todos los overlays
-                 (palette/grade/karaoke sim) se cortocircuitan. */
-              renderedVideoUrl={renderedVideoUrl}
+                 (palette/grade/karaoke sim) se cortocircuitan.
+
+                 QA fix 2026-05-28 (UX, second pass): operador reportó que
+                 en step 6 quedaban DOS reproductores (el MP4 con sus
+                 controles + el audio bar del LyricsEditor) sin sincronizar
+                 — confuso. Y la live preview con karaoke reflejaba mejor
+                 el flow del editor (la línea activa se ilumina al pasar
+                 el audio via playbackTickRef). Ahora droppeamos el MP4 en
+                 TODO el edit-wizard: la live preview corre en todos los
+                 pasos (incluido step 6), reflejando movement/fondo/
+                 tipografía/color + drag-resize, y su karaoke sigue el
+                 audio del LyricsEditor. Si el operador quiere ver el
+                 video resultante actual, lo ve en JobDetail. */
+              renderedVideoUrl={null}
               /* UI F3 + F5 (2026-05-26): compact en paso 6; placeholderBg
                  mientras el pre-gen del fondo no terminó. */
               compact={isStep6}
               placeholderBg={isStep6 && bgStatus !== "done"}
             />
           ) : (
+            // Custom file: hasta que el archivo cargue no podemos mostrar
+            // nada útil — placeholder por ahora. Cuando se procese el File,
+            // un follow-up puede mostrarlo como background overlay.
             <div className="aspect-video rounded-2xl ring-1 ring-white/[0.08] bg-surface-2/50 grid place-items-center text-gray-500 text-[13px]">
-              {bgMode === "library" ? (t("upload.bg_library") || "Fondo de biblioteca") : (t("upload.bg_custom_tab") || "Fondo subido")}
+              {t("upload.bg_custom_tab") || "Fondo subido"}
             </div>
           )}
           <p className="text-[10px] text-gray-600 px-1">
@@ -2059,8 +2159,16 @@ export default function UploadZone({
           </p>
         </div>
 
-        {/* RIGHT — active step controls only (revealed one step at a time) */}
-        <div className="space-y-4 min-w-0 w-full">
+        {/* RIGHT — active step controls only (revealed one step at a time).
+            QA fix 2026-05-28: en lg+ este es el único scroll context del
+            wizard. h-full toma el alto que el grid le asigna; overflow-y-
+            auto deja que el operador scrollee la lista de lyrics (o
+            cualquier control del paso activo) sin mover el resto del
+            layout (banners + stepper + preview quedan fijos arriba).
+            min-h-0 es necesario en flex column children para que el
+            overflow funcione (sin esto el child colapsaría a su content
+            height antes de aplicar el overflow). */}
+        <div className="space-y-4 min-w-0 w-full lg:h-full lg:min-h-0 lg:overflow-y-auto">
           {files.length > 1 && (
             <div className="flex items-center gap-1.5 px-1">
               <span className="inline-flex items-center gap-1.5 text-[10px] text-gray-500 uppercase tracking-[0.16em]">
@@ -2147,7 +2255,26 @@ export default function UploadZone({
                       </label>
                     </div>
                   ) : onStyleChange && (
-                    <div className="rounded-card bg-surface-2/40 ring-1 ring-white/[0.04] px-4 py-3">
+                    <div className={`rounded-card bg-surface-2/40 ring-1 ring-white/[0.04] px-4 py-3 ${
+                      editMode ? "relative opacity-60 pointer-events-none select-none" : ""
+                    }`}>
+                      {editMode && (
+                        // QA fix 2026-05-27: step 2 ahora navegable en edit
+                        // mode (antes estaba locked entero). Pero la paleta
+                        // (style) es structural — cambiarla recolorea el
+                        // fondo IA cacheado y el backend no soporta
+                        // edit_type=palette. La cerramos a nivel control con
+                        // un overlay visible para que el operador entienda
+                        // que el dato existe pero no es editable acá.
+                        <div className="absolute top-2 right-2 flex items-center gap-1 px-2 py-0.5 rounded-md bg-surface-1 ring-1 ring-white/[0.08] text-[10px] text-gray-500 pointer-events-auto select-text">
+                          <svg className="w-3 h-3" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
+                            <path d="M12 11v4M8 11V7a4 4 0 118 0v4M5 11h14v9a1 1 0 01-1 1H6a1 1 0 01-1-1v-9z" strokeLinecap="round" strokeLinejoin="round" />
+                          </svg>
+                          <span title={t("editor.locked_structural") || "No editable post-render — generá un video nuevo para cambiar paleta."}>
+                            {t("editor.locked_short") || "No editable"}
+                          </span>
+                        </div>
+                      )}
                       <p className="text-[10px] uppercase tracking-[0.18em] text-gray-500">{t("upload.style_label")}</p>
                       <p className="text-[11px] text-gray-600 mb-2 mt-0.5">
                         {t("upload.style_desc") || "Cómo se colorea el fondo IA"}
@@ -2523,8 +2650,16 @@ export default function UploadZone({
 
       {/* Sticky bottom CTA bar. Phase 2: oculta en paso 6 porque el contenido
           de review (LyricsEditor / transcribing / readyToGenerate) trae sus
-          propios CTAs (Aprobar / Volver / Crear N videos). */}
-      {files.length > 0 && wizardStep !== 6 && (
+          propios CTAs (Aprobar / Volver / Crear N videos).
+          QA fix 2026-05-28: el gate `files.length > 0` ocultaba la barra en
+          TODOS los pasos del edit-wizard (files=[] en edit mode), dejando
+          al operador sin navegación entre pasos. Ahora también la mostramos
+          en edit mode — los botones Atrás/Continuar usan el `_findPrev/
+          NextUnlocked` que ya respeta lockedSteps, así que automáticamente
+          saltea step 1 (file, locked) y step 5 (delivery, locked). El
+          summary line muestra "MP4 1080p · Generar con IA" o similar (sin
+          file count) lo cual es informativo aunque mínimo en edit mode. */}
+      {(files.length > 0 || editMode) && wizardStep !== 6 && (
         <div
           className={`fixed bottom-0 left-0 right-0 z-30 bg-surface-1/85 backdrop-blur-xl border-t border-white/[0.06] px-4 md:px-8 py-4 transition-all duration-300 ${sidebarOpen ? "md:left-64" : "md:left-0"}`}
           data-tour="upload-cta-bar"
