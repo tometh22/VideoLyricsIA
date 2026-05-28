@@ -1261,7 +1261,13 @@ export default function UploadZone({
         )}
       </div>
 
-      {/* Font scale — 5 A's in increasing sizes */}
+      {/* Font scale — A's en tamaños crecientes.
+          QA fix 2026-05-28 (UMG report): agus reportó que un operador
+          UMG quiso letras más grandes pero el botón "1.3" era el
+          máximo del UI. El backend acepta hasta 1.5 (clamp en
+          ass_render.py:114 y pipeline.py:7513). Sumamos el 6to botón
+          para destrabar ese 17% extra de headroom que el backend ya
+          tenía pero el UI no exponía. */}
       <div className="flex items-center gap-2 mb-3">
         <span className="text-[11px] text-gray-600 shrink-0">{t("upload.font_scale_label") || "Tamaño:"}</span>
         <div className="flex items-end gap-1">
@@ -1271,6 +1277,7 @@ export default function UploadZone({
             { code: "1.0",  cls: "text-[13px]" },
             { code: "1.15", cls: "text-[16px]" },
             { code: "1.3",  cls: "text-[19px]" },
+            { code: "1.5",  cls: "text-[22px]" },
           ].map((opt) => (
             <button
               key={opt.code}
@@ -1570,7 +1577,7 @@ export default function UploadZone({
                       {[
                         { code: "0.75", cls: "text-[9px]"  }, { code: "0.9",  cls: "text-[11px]" },
                         { code: "1.0",  cls: "text-[13px]" }, { code: "1.15", cls: "text-[16px]" },
-                        { code: "1.3",  cls: "text-[19px]" },
+                        { code: "1.3",  cls: "text-[19px]" }, { code: "1.5",  cls: "text-[22px]" },
                       ].map((opt) => (
                         <button key={opt.code} type="button"
                           onClick={() => updateField(i, "fontScale", opt.code)}
@@ -2433,7 +2440,9 @@ export default function UploadZone({
                     )}
                   </div>
 
-                  {/* Font scale — 5 A's in increasing sizes */}
+                  {/* Font scale — A's en tamaños crecientes (ver fix
+                      arriba en línea ~1264: 1.5 sumado para destrabar
+                      backend max). */}
                   <div className="flex items-center gap-2">
                     <span className="text-[11px] text-gray-600 shrink-0 w-20">{t("upload.font_scale_label") || "Tamaño:"}</span>
                     <div className="flex items-end gap-1">
@@ -2443,6 +2452,7 @@ export default function UploadZone({
                         { code: "1.0",  cls: "text-[13px]" },
                         { code: "1.15", cls: "text-[16px]" },
                         { code: "1.3",  cls: "text-[19px]" },
+                        { code: "1.5",  cls: "text-[22px]" },
                       ].map((opt) => (
                         <button
                           key={opt.code}
