@@ -412,7 +412,14 @@ export default function LyricsEditor({
   // Autosave confidence for the timeline view. saveStatus drives the
   // "Guardando…/Guardado ✓" chip; flushCounter triggers an immediate save
   // on a timeline drag (instead of waiting for the 3 s debounce).
-  const [saveStatus, setSaveStatus] = useState("idle"); // idle|saving|saved
+  // QA fix 2026-05-28 (audit P0 #74): extendido con "error". Antes el
+  // debounced autosave NO actualizaba saveStatus (solo el flush-on-drag
+  // lo hacía), y errores de red caían silencioso. Operador veía
+  // "Guardado ✓" del último drag aunque el debounced autosave de un
+  // text-edit posterior haya fallado → al apretar Aprobar perdía
+  // changes. Ahora ambos autosaves actualizan saveStatus, y "error"
+  // se muestra como chip rojo con botón Reintentar.
+  const [saveStatus, setSaveStatus] = useState("idle"); // idle|saving|saved|error
   const [flushCounter, setFlushCounter] = useState(0);
   // Snapshot of the timings as first handed to us — the baseline for the
   // timeline's "Resetear timings". Seeded on mount + re-seeded whenever the
@@ -496,15 +503,37 @@ export default function LyricsEditor({
   // barre at the 30-min TTL (incident 2026-05-14 — Agus batch-edited 5
   // lyrics for 90 min and all 5 jobs got reaped before "Crear videos").
   // No-op when the parent didn't wire the callback (e.g. unit tests).
+  //
+  // QA fix 2026-05-28 (audit P0 #74): await el resultado de
+  // onPersistSegments y actualizá saveStatus. Antes el debounced fire-
+  // and-forget tragaba errores. Ahora si la red cae o el backend
+  // rechaza, saveStatus pasa a "error" y el chip rojo + bloqueo del
+  // botón Aprobar se activan.
   useEffect(() => {
     if (disableAutosave) return undefined;
     if (!onPersistSegments || !transcribeJobId) return undefined;
     if (!Array.isArray(edited) || edited.length === 0) return undefined;
-    const tid = setTimeout(() => {
+    let cancelled = false;
+    const tid = setTimeout(async () => {
+      if (cancelled) return;
+      setSaveStatus("saving");
       const cleaned = edited.map(({ _id, review, ...rest }) => rest);
-      onPersistSegments(transcribeJobId, cleaned);
+      try {
+        const result = await Promise.resolve(onPersistSegments(transcribeJobId, cleaned));
+        if (cancelled) return;
+        // El callback (App.jsx::persistSegmentsToBackend) retorna
+        // { ok, reason } post-fix #74. Para legacy callers (sin
+        // return value), result === undefined → tratamos como ok.
+        if (result && result.ok === false) {
+          setSaveStatus("error");
+        } else {
+          setSaveStatus("saved");
+        }
+      } catch {
+        if (!cancelled) setSaveStatus("error");
+      }
     }, 3000);
-    return () => clearTimeout(tid);
+    return () => { cancelled = true; clearTimeout(tid); };
   }, [edited, transcribeJobId, onPersistSegments, disableAutosave]);
 
   // Flush-save on a timeline drag (no 3 s wait) + drive the "Guardado ✓"
@@ -524,8 +553,13 @@ export default function LyricsEditor({
       count: cleaned.length,
     });
     Promise.resolve(onPersistSegments(transcribeJobId, cleaned))
-      .then(() => { if (!cancelled) setSaveStatus("saved"); })
-      .catch(() => { if (!cancelled) setSaveStatus("idle"); });
+      .then((result) => {
+        if (cancelled) return;
+        // QA fix audit P0 #74: distinguir error en lugar de idle silencioso.
+        if (result && result.ok === false) setSaveStatus("error");
+        else setSaveStatus("saved");
+      })
+      .catch(() => { if (!cancelled) setSaveStatus("error"); });
     return () => { cancelled = true; };
     // Only react to the flush trigger — `edited` is intentionally read fresh
     // but NOT a dep (we don't want every keystroke to flush).
@@ -1627,6 +1661,17 @@ export default function LyricsEditor({
   };
 
   const handleApprove = () => {
+    // QA fix 2026-05-28 (audit P0 #74): bloquear si el último autosave
+    // falló — el backend tiene segments STALE, aprobar mandaría a
+    // re-renderizar con datos viejos sin que el operador se entere.
+    // El chip rojo "Sin guardar — revisá tu conexión" ya marca el
+    // estado, este alert es la confirmación interactiva.
+    if (saveStatus === "error") {
+      const proceed = window.confirm(
+        "Tu última edición no se guardó (problema de red). Si aprobás ahora se re-renderiza con la última versión guardada en el servidor, no con tus cambios pendientes. ¿Aprobar igual?"
+      );
+      if (!proceed) return;
+    }
     // Check for 3+ line segments before submitting — show a warning banner
     // so the operator can auto-split them rather than discover the issue
     // after waiting for the full video render.
@@ -1910,6 +1955,39 @@ export default function LyricsEditor({
           </div>
         );
       })()}
+
+      {/* QA fix 2026-05-28 (audit P0 #74): banner persistente del estado
+          autosave. En LIST view no había feedback visible cuando una
+          edición de texto fallaba — operador veía "Guardado" del último
+          drag del timeline y asumía que todo estaba ok, pero el último
+          keystroke de texto había fallado silente. Banner rojo encima
+          del audio bar lo hace imposible de perder.
+          (Timeline view ya tiene el chip embedded en su header,
+          LyricsTimeline.jsx:354+) */}
+      {saveStatus === "error" && (
+        <div className="mb-3 rounded-card bg-red-500/10 ring-1 ring-red-500/30 px-4 py-3 flex items-center gap-3 animate-fade-in">
+          <svg className="w-4 h-4 text-red-400 shrink-0" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
+            <path d="M12 9v3.75m9-.75a9 9 0 11-18 0 9 9 0 0118 0zM12 15.75h.01" strokeLinecap="round" strokeLinejoin="round" />
+          </svg>
+          <div className="flex-1 min-w-0">
+            <p className="text-[12px] text-red-300 font-medium">
+              No pudimos guardar tu última edición
+            </p>
+            <p className="text-[10px] text-red-300/70 mt-0.5">
+              Probablemente perdiste conexión. Volvemos a intentar
+              automáticamente cuando edites algo más.
+            </p>
+          </div>
+          <button
+            type="button"
+            onClick={() => setEdited((p) => [...p])}
+            className="text-[11px] text-red-200 hover:text-white bg-red-500/20 hover:bg-red-500/30 rounded-lg px-3 py-1.5 transition-colors shrink-0"
+            title="Forzar reintento de guardado"
+          >
+            Reintentar
+          </button>
+        </div>
+      )}
 
       {/* ─── Audio control bar — sticky-ish above the lyrics list ───
           The "Activar modo Sync" entry used to live as its own banner

@@ -418,6 +418,101 @@ function JobDetailRoute({ fetchHistory }) {
 
 // Deep-link adapter for /videos/:id/edit-lyrics. Bootstrappea
 // currentReview con los datos del job (segments, render_params, URLs
+// QA fix 2026-05-28 (audit P0 #75): panel reutilizable cuando el job
+// no es editable. Para `status=editing` (re-renderizando un edit
+// anterior), pollea /status cada 5s y muestra progress + estado.
+// Cuando el job vuelve a editable (done/pending_review/rejected),
+// recarga la ruta para que el editor monte solo. Para otros estados
+// no-editable (queued, processing, error), muestra el mensaje estático
+// de antes con un botón "Volver al video".
+function EditingNotEditablePanel({ jobId, jobStatus, isRendering, onBack, t }) {
+  const [polledStatus, setPolledStatus] = useState(jobStatus);
+  const [polledProgress, setPolledProgress] = useState(null);
+  const [polledStep, setPolledStep] = useState(null);
+
+  useEffect(() => {
+    if (!isRendering) return undefined;
+    let cancelled = false;
+    const tick = async () => {
+      try {
+        const res = await authFetch(`${API}/status/${jobId}`, {});
+        if (!res.ok || cancelled) return;
+        const data = await res.json();
+        if (cancelled) return;
+        const newStatus = data.status;
+        setPolledStatus(newStatus);
+        if (typeof data.progress === "number") setPolledProgress(data.progress);
+        if (typeof data.current_step === "string") setPolledStep(data.current_step);
+        // Transition a un estado editable → recargá la página para que
+        // EditLyricsRoute corra su bootstrap de nuevo y monte el editor.
+        const editable = ["done", "pending_review", "rejected"].includes(newStatus);
+        if (editable) {
+          window.location.reload();
+        }
+      } catch {
+        // Silent — siguiente tick reintenta.
+      }
+    };
+    const iv = setInterval(tick, 5000);
+    tick(); // primero tick inmediato
+    return () => { cancelled = true; clearInterval(iv); };
+  }, [jobId, isRendering]);
+
+  if (isRendering) {
+    const pct = Math.max(3, Math.min(100, polledProgress || 0));
+    return (
+      <div className="text-center mt-16 max-w-md mx-auto px-4">
+        <div className="w-14 h-14 mx-auto mb-4 rounded-2xl bg-brand/10 ring-1 ring-brand/30 flex items-center justify-center">
+          <span className="w-6 h-6 border-2 border-brand-light border-t-transparent rounded-full animate-spin" />
+        </div>
+        <h2 className="text-xl font-bold mb-2">
+          {t("edit.editing_in_progress_title") || "El video se está re-renderizando"}
+        </h2>
+        <p className="text-sm text-gray-500 mb-4">
+          {t("edit.editing_in_progress_subtitle") ||
+            "Estamos aplicando los cambios del edit anterior. Volveremos a abrir el editor automáticamente cuando termine."}
+        </p>
+        <div className="mt-3 h-1.5 rounded-full bg-surface-3/60 overflow-hidden max-w-xs mx-auto">
+          <div
+            className="h-full bg-gradient-to-r from-brand to-brand-light transition-[width] duration-700 ease-out"
+            style={{ width: `${pct}%` }}
+          />
+        </div>
+        <p className="text-[10px] text-gray-500 mt-2 font-mono">
+          {polledStep || "video"} · {polledProgress || 0}%
+        </p>
+        <button onClick={onBack} className="btn-secondary mt-6">
+          {t("detail.back") || "Volver al video"}
+        </button>
+      </div>
+    );
+  }
+
+  // Other non-editable states: queued / processing / error / etc. No
+  // hace falta polling porque para estos estados no tiene mucho sentido
+  // esperar — el operador volvería al video y desde ahí ve el estado real.
+  return (
+    <div className="text-center mt-16 max-w-md mx-auto px-4">
+      <div className="w-14 h-14 mx-auto mb-4 rounded-2xl bg-amber-500/10 flex items-center justify-center">
+        <svg className="w-7 h-7 text-amber-400" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
+          <circle cx="12" cy="12" r="10" />
+          <path d="M12 8v4M12 16h.01" strokeLinecap="round" />
+        </svg>
+      </div>
+      <h2 className="text-xl font-bold mb-2">
+        {t("edit.not_editable_title") || "No se puede editar ahora"}
+      </h2>
+      <p className="text-sm text-gray-500 mb-6">
+        {t("edit.not_editable_subtitle") ||
+          `Este video está en estado "${polledStatus}". Esperá a que termine el render o que pase a revisión.`}
+      </p>
+      <button onClick={onBack} className="btn-secondary">
+        {t("detail.back") || "Volver al video"}
+      </button>
+    </div>
+  );
+}
+
 // firmadas de audio/waveform/background) y renderiza el mismo
 // wizardScreen del flow nuevo — el operador edita lyrics post-render
 // dentro del Studio Console en vez de un modal separado con UX distinta.
@@ -718,25 +813,19 @@ function EditLyricsRoute({ setCurrentReview, setWizardStage, wizardScreen, t }) 
     );
   }
   if (state.status === "not_editable") {
+    // QA fix 2026-05-28 (audit P0 #75): cuando el job está en
+    // status=editing (re-renderizando), el operador no debería tener
+    // que refrescar manualmente. Pollea /status cada 5s y recarga
+    // cuando el job vuelve a editable.
+    const isRendering = state.jobStatus === "editing";
     return (
-      <div className="text-center mt-16 max-w-md mx-auto px-4">
-        <div className="w-14 h-14 mx-auto mb-4 rounded-2xl bg-amber-500/10 flex items-center justify-center">
-          <svg className="w-7 h-7 text-amber-400" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
-            <circle cx="12" cy="12" r="10" />
-            <path d="M12 8v4M12 16h.01" strokeLinecap="round" />
-          </svg>
-        </div>
-        <h2 className="text-xl font-bold mb-2">
-          {t("edit.not_editable_title") || "No se puede editar ahora"}
-        </h2>
-        <p className="text-sm text-gray-500 mb-6">
-          {t("edit.not_editable_subtitle") ||
-            `Este video está en estado "${state.jobStatus}". Esperá a que termine el render o que pase a revisión.`}
-        </p>
-        <button onClick={() => navigate(`/videos/${id}`)} className="btn-secondary">
-          {t("detail.back") || "Volver al video"}
-        </button>
-      </div>
+      <EditingNotEditablePanel
+        jobId={id}
+        jobStatus={state.jobStatus}
+        isRendering={isRendering}
+        onBack={() => navigate(`/videos/${id}`)}
+        t={t}
+      />
     );
   }
   if (state.status === "no_segments") {
@@ -1935,8 +2024,18 @@ export default function App() {
   //      sessionStorage, so if the tab dies we don't lose corrections.
   // Errors are swallowed: this is a best-effort autosave, the real
   // commit still happens at POST /generate.
+  // QA fix 2026-05-28 (audit P0 #74): retornar { ok, reason } en lugar
+  // de void/swallow silente. Operadores reportaban "guardé y cuando
+  // aprobé se perdieron los cambios" — la red caía mid-autosave, el
+  // catch se tragaba el error, el operador no se enteraba y al
+  // apretar Aprobar el último estado conocido del backend era el
+  // anterior al cambio. Ahora el caller (LyricsEditor) usa el
+  // resultado para mover saveStatus a "error" y mostrar un banner +
+  // bloquear el botón Aprobar.
   const persistSegmentsToBackend = useCallback(async (jobId, segments) => {
-    if (!jobId || !Array.isArray(segments) || segments.length === 0) return;
+    if (!jobId || !Array.isArray(segments) || segments.length === 0) {
+      return { ok: false, reason: "no-data" };
+    }
     // [drag-persist] diagnostic logging — remove after staging confirms
     // the value-equality fix in LyricsEditor's prop-sync resolves the
     // regression. Captures the full autosave roundtrip so we can correlate
@@ -1959,7 +2058,12 @@ export default function App() {
           // when they click "Crear videos" and /generate returns 404.
           console.warn("[autosave] /save-segments failed", res.status);
         }
-        return;  // backend rechazó: no pisar el state local con datos asumidos
+        // QA fix audit P0 #74: bubble error to caller for saveStatus chip.
+        return {
+          ok: false,
+          reason: res.status === 404 ? "job-gone" : `http-${res.status}`,
+          status: res.status,
+        };
       }
       // Bug-fix 2026-05-26 (PR A timeline-drag-persists): tras POST exitoso,
       // propagar los segments recién persistidos a currentReview. Sin esto,
@@ -1982,8 +2086,11 @@ export default function App() {
         if (!matchesWizard && !matchesEditor) return prev;
         return { ...prev, segments };
       });
+      return { ok: true };
     } catch (err) {
       console.warn("[autosave] /save-segments network error", err);
+      // QA fix audit P0 #74: bubble network error to caller.
+      return { ok: false, reason: "network", error: String(err) };
     }
   }, []);
 
