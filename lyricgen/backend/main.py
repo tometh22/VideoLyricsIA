@@ -2426,6 +2426,24 @@ async def upload_url(
         song_title=job_song_title,
     )
 
+    # 2026-05-28 dedup gap (audit on Don Electrón_Intoxicados duplicate):
+    # PR #388 closed the /generate direct-create path but the modern flow
+    # is /upload-url → R2 → /transcribe-uploaded, and /upload-url had no
+    # supersede. A double-fire (browser retry, dropzone double-event,
+    # operator re-drop without UI feedback) lands two awaiting_upload
+    # rows; each follows its own pipeline and the operator ends up with
+    # two transcribed_pending duplicates in admin. Mirror the dedup
+    # pattern from /generate (main.py ~5688): filename is already
+    # `_safe_basename`-canonicalized at line 2387.
+    try:
+        from jobs import supersede_sibling_drafts
+        supersede_sibling_drafts(
+            db, keep_job_id=job_id, user_id=current_user["id"],
+            tenant_id=current_user["tenant_id"], filename=body.filename,
+        )
+    except Exception as e:
+        logger.warning("[DEDUP] supersede sibling drafts failed: %s", e)
+
     use_multipart = (
         body.size_bytes > 0 and body.size_bytes >= _MULTIPART_THRESHOLD_BYTES
     )
@@ -3393,21 +3411,34 @@ async def upload(
         raise HTTPException(status_code=429, detail="Free plan limit reached. Upgrade to continue.")
 
     tenant_id = current_user["tenant_id"]
+    # SECURITY + DEDUP: sanitize filename BEFORE create_job so the row's
+    # canonical name matches what `supersede_sibling_drafts` will filter
+    # on. PR #388 bug #2: filename equality is literal, so unsanitized
+    # vs sanitized forms silently miss every sibling. _safe_basename
+    # strips directory components + control chars + length-caps.
+    safe_name = _safe_basename(file.filename)
     job_id = create_job(
         db,
-        artist=artist, style=style, filename=file.filename,
+        artist=artist, style=style, filename=safe_name,
         user_id=current_user["id"], tenant_id=tenant_id,
         delivery_profile=delivery_profile, umg_spec=umg_spec,
         initial_status=initial_status,
         song_title=song_title,
     )
+    # 2026-05-28 dedup gap (audit #88): mirror the /generate pattern
+    # (main.py ~5688) for the legacy multipart /upload path. No-op when
+    # no siblings; catches double-fires.
+    try:
+        from jobs import supersede_sibling_drafts
+        supersede_sibling_drafts(
+            db, keep_job_id=job_id, user_id=current_user["id"],
+            tenant_id=tenant_id, filename=safe_name,
+        )
+    except Exception as e:
+        logger.warning("[DEDUP] supersede sibling drafts failed: %s", e)
+
     job_dir = os.path.join(OUTPUTS_DIR, job_id)
     os.makedirs(job_dir, exist_ok=True)
-
-    # SECURITY: never trust the user-supplied filename for path joining —
-    # `../poc.mp3` would otherwise escape the job dir. _safe_basename
-    # strips directory components + control chars + length-caps.
-    safe_name = _safe_basename(file.filename)
     mp3_path = os.path.join(job_dir, safe_name)
     await _stream_upload_to_disk(file, mp3_path)
     _validate_audio_file_on_disk(safe_name, mp3_path)
@@ -3543,22 +3574,34 @@ async def transcribe_endpoint(
     job_artist = artist_form or parsed_artist or "Unknown"
     job_song_title = title_form or parsed_title
 
+    # SECURITY + DEDUP (audit #90): canonicalize filename BEFORE
+    # create_job so the row's persisted name matches the form
+    # supersede_sibling_drafts will compare against (PR #388 bug #2).
+    safe_audio_name = _safe_basename(file.filename)
     job_id = create_job(
         db,
         artist=job_artist,
         style="oscuro",                    # set for real in /generate
-        filename=file.filename,
+        filename=safe_audio_name,
         user_id=current_user["id"],
         tenant_id=current_user["tenant_id"],
         delivery_profile="youtube",        # set for real in /generate
         initial_status="transcribed_pending",
         song_title=job_song_title,
     )
+    # 2026-05-28 dedup gap: mirror /generate (main.py ~5688) on the
+    # legacy /transcribe path. No-op when no siblings.
+    try:
+        from jobs import supersede_sibling_drafts
+        supersede_sibling_drafts(
+            db, keep_job_id=job_id, user_id=current_user["id"],
+            tenant_id=current_user["tenant_id"], filename=safe_audio_name,
+        )
+    except Exception as e:
+        logger.warning("[DEDUP] supersede sibling drafts failed: %s", e)
 
     job_dir = os.path.join(OUTPUTS_DIR, job_id)
     os.makedirs(job_dir, exist_ok=True)
-    # SECURITY: sanitize filename before path join (see _safe_basename).
-    safe_audio_name = _safe_basename(file.filename)
     audio_path = os.path.join(job_dir, safe_audio_name)
     # Stream the body in 1 MiB chunks. Lossless WAVs (~30-50 MB for a
     # 3-min track) used to OOM the API container under concurrent load
