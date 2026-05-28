@@ -365,6 +365,17 @@ export default function LyricsTimeline({
               Guardado
             </span>
           )}
+          {saveStatus === "error" && (
+            // QA fix 2026-05-28 (audit P0 #74): antes el autosave error
+            // caía silente — el operador no se enteraba y al apretar
+            // Aprobar perdía los cambios. Ahora chip rojo persistente.
+            <span className="text-[10px] text-red-400 flex items-center gap-1 animate-fade-in">
+              <svg className="w-3 h-3" fill="none" stroke="currentColor" strokeWidth="2.5" viewBox="0 0 24 24">
+                <path d="M12 9v3.75m9-.75a9 9 0 11-18 0 9 9 0 0118 0zM12 15.75h.01" strokeLinecap="round" strokeLinejoin="round" />
+              </svg>
+              Sin guardar — revisá tu conexión
+            </span>
+          )}
         </div>
         <div className="flex items-center gap-2">
           <div className="inline-flex items-center rounded-md ring-1 ring-white/[0.08] overflow-hidden">
