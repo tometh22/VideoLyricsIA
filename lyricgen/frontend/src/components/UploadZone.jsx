@@ -176,6 +176,20 @@ export default function UploadZone({
   // en vez del "EN VIVO" pulsante — el operador ve un fondo placeholder
   // hasta que apruebe y genere.
   bgStatus = null,
+  // QA fix 2026-05-27 (edit-wizard mode): cuando el operador entra al
+  // wizard via /videos/:id/edit-lyrics, ciertos campos structural
+  // (paleta, custom_colors) no pueden cambiarse post-render aunque su
+  // step (Modo / step 2) sea navegable. `editMode` controla locks por
+  // field — el wizard sigue mostrando el control para que el operador
+  // VEA el valor actual, pero con overlay + tooltip "no editable".
+  editMode = false,
+  // Callback opcional para wizard en edit mode: cuando un control de
+  // step 2/3/4 escribe a batchDefaults (el path normal new-job), también
+  // forward el cambio a currentReview vía este callback. Sin esto, los
+  // cambios de background_hint/movement/effect no llegan al diff de
+  // submitEdit porque batchDefaults sólo fan-out a files[] y en edit
+  // mode files=[].
+  onEditFieldChange = null,
 }) {
   const { t } = useI18n();
   const inputRef = useRef();
@@ -2147,7 +2161,26 @@ export default function UploadZone({
                       </label>
                     </div>
                   ) : onStyleChange && (
-                    <div className="rounded-card bg-surface-2/40 ring-1 ring-white/[0.04] px-4 py-3">
+                    <div className={`rounded-card bg-surface-2/40 ring-1 ring-white/[0.04] px-4 py-3 ${
+                      editMode ? "relative opacity-60 pointer-events-none select-none" : ""
+                    }`}>
+                      {editMode && (
+                        // QA fix 2026-05-27: step 2 ahora navegable en edit
+                        // mode (antes estaba locked entero). Pero la paleta
+                        // (style) es structural — cambiarla recolorea el
+                        // fondo IA cacheado y el backend no soporta
+                        // edit_type=palette. La cerramos a nivel control con
+                        // un overlay visible para que el operador entienda
+                        // que el dato existe pero no es editable acá.
+                        <div className="absolute top-2 right-2 flex items-center gap-1 px-2 py-0.5 rounded-md bg-surface-1 ring-1 ring-white/[0.08] text-[10px] text-gray-500 pointer-events-auto select-text">
+                          <svg className="w-3 h-3" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
+                            <path d="M12 11v4M8 11V7a4 4 0 118 0v4M5 11h14v9a1 1 0 01-1 1H6a1 1 0 01-1-1v-9z" strokeLinecap="round" strokeLinejoin="round" />
+                          </svg>
+                          <span title={t("editor.locked_structural") || "No editable post-render — generá un video nuevo para cambiar paleta."}>
+                            {t("editor.locked_short") || "No editable"}
+                          </span>
+                        </div>
+                      )}
                       <p className="text-[10px] uppercase tracking-[0.18em] text-gray-500">{t("upload.style_label")}</p>
                       <p className="text-[11px] text-gray-600 mb-2 mt-0.5">
                         {t("upload.style_desc") || "Cómo se colorea el fondo IA"}

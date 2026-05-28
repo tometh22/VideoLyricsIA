@@ -2806,13 +2806,18 @@ export default function App() {
         // sincronizado al audio. Sin re-renders en App.jsx — el preview lee
         // el ref con su propio rAF loop.
         playbackTickRef={playbackTickRef}
-        // Post-render edit (EditLyricsRoute): cuando currentReview viene
-        // con editingJobId, el wizard cambia a modo "editar job existente":
-        // pasos 1, 2, 3, 5 lockeados (esos cambios requieren regenerar
-        // fondo y los cubre el modo "background" de EditRequestPanel), el
-        // preview central muestra el MP4 ya renderizado en vez de la
-        // simulación de karaoke.
-        lockedSteps={currentReview?.editingJobId ? [1, 2, 3, 5] : []}
+        // Post-render edit (EditLyricsRoute): el wizard se monta sobre un
+        // job ya renderizado. QA fix 2026-05-27: bajamos los locks de
+        // [1, 2, 3, 5] a [1, 5] — solo file upload (paso 1) y delivery
+        // profile (paso 5) son verdaderamente structural (audio fijo, no
+        // se puede cambiar formato sin regenerar todo). Pasos 2 (Modo) y
+        // 3 (Movimiento) ahora son navegables: el operador puede editar
+        // background_hint, bg_verbatim, scene mode, movement_style y
+        // effect. El style picker (paleta) dentro de step 2 queda
+        // lockeado a nivel control via `editMode` + overlay — no a nivel
+        // step, así el resto de step 2 sí es interactivo.
+        lockedSteps={currentReview?.editMode ? [1, 5] : []}
+        editMode={!!currentReview?.editMode}
         renderedVideoUrl={editingRenderedVideoUrl || null}
         // UI F5 (2026-05-26): le pasamos el bgStatus al wizard para que
         // UploadZone pueda derivar `placeholderBg` cuando montamos el
