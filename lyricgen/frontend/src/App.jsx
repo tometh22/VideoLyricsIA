@@ -2585,7 +2585,13 @@ export default function App() {
   //   - bgPreview.status → chip subtle "Fondo: generando…" en LyricsEditor
   //     (UX specialist 2026-05-24, cierra el mental-model gap de pre-gen invisible).
   const bgPreview = useBackgroundPreview(previewEntry, {
-    enabled: !!currentReview,
+    // QA fix 2026-05-27: en edit mode el job ya tiene bg_r2_key_cached
+    // poblado; pre-generar otra vez muestra el chip "Generando fondo en
+    // background…" sobre un fondo que ya existe (ruido visual + costo
+    // Gemini gratuito). Si el operador clickea "Editar y re-renderizar"
+    // con cambio de background, ese flow dispara su propio re-render
+    // via /edit/{id} con edit_type=background — no necesita el preview.
+    enabled: !!currentReview && !currentReview.editMode,
     api: API,
     authHeaders,
     onCacheKey: (key) => {
