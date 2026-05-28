@@ -1955,8 +1955,15 @@ export default function UploadZone({
          (oculta caption de movement/effect que ya no se está editando). */
       (() => {
         const isStep6 = wizardStep === 6 && hasReviewableContent;
+        // QA fix 2026-05-28 (UX): operador reporta que en step 6 el
+        // preview central queda muy chico (260-320 px) — difícil seguir
+        // el video mientras edita lyrics, y como queda chico el operador
+        // pierde la conexión visual. Ampliamos a 420-560 px → +200 px
+        // que sale del panel derecho (sigue siendo ancho suficiente para
+        // editar texto + timings). En pasos 1-5 el layout original
+        // (1fr preview) era OK, no se toca.
         const gridCols = isStep6
-          ? "lg:grid-cols-[56px_minmax(260px,320px)_minmax(0,1fr)]"
+          ? "lg:grid-cols-[56px_minmax(420px,560px)_minmax(0,1fr)]"
           : "lg:grid-cols-[190px_minmax(0,1fr)_minmax(400px,460px)]";
         // 2026-05-26 — variante [.editor-focus-mode_&] colapsa este grid
         // a 1 columna cuando el LyricsEditor prende "modo enfoque". Sin
@@ -2038,6 +2045,21 @@ export default function UploadZone({
               lineTransition={hoverTransition ?? batchDefaults.lineTransition}
               lyricColor={batchDefaults.lyricColor || "#FFFFFF"}
               lyricSungColor={batchDefaults.lyricSungColor || "#FFFFFF"}
+              /* QA fix 2026-05-28 (bug #3 continuación): cuando el
+                 operador selecciona un fondo de biblioteca en step 2,
+                 hacer que la BASE del preview sea ese asset (no el
+                 clip del movement seleccionado). Así el operador VE
+                 cómo se ve la letra sobre la imagen/video que eligió.
+                 Para librarías .mp4 funciona directo en el <video>;
+                 para librarías .jpg/.png el video element fallará a
+                 cargar (negro) pero el karaoke overlay sigue visible
+                 — degradación aceptable hasta que sumamos rendering
+                 condicional <img> vs <video>. */
+              clipSrc={
+                (bgMode === "library" && backgroundId)
+                  ? `${API}/backgrounds/${backgroundId}/preview?${tokenParam()}`
+                  : ((MOVEMENT_STYLES.find((m) => m.code === (hoverMovement ?? batchDefaults.movementStyle))?.sample) || "/movement_samples/estandar.mp4")
+              }
               /* Typography 2026-05-26: cerrar el gap entre los controles del
                  paso 4 (font/case/size/contrast) y el preview central. Antes
                  el comentario al lado del bloque mentía — "el preview ya
@@ -2053,7 +2075,6 @@ export default function UploadZone({
               textContrast={batchDefaults.textContrast || "medium"}
               mode={sceneMode}
               lyric={_previewLyric}
-              clipSrc={(MOVEMENT_STYLES.find((m) => m.code === (hoverMovement ?? batchDefaults.movementStyle))?.sample) || "/movement_samples/estandar.mp4"}
               /* Phase C 2026-05-25: el ref de playback tick permite al
                  preview leer la línea activa + currentTime para hacer
                  word-jump real cuando el operador está reproduciendo el
@@ -2062,8 +2083,20 @@ export default function UploadZone({
               playbackTickRef={playbackTickRef}
               /* Post-render edit: MP4 ya renderizado del job. Cuando viene,
                  el preview muta a "Resultado actual" y todos los overlays
-                 (palette/grade/karaoke sim) se cortocircuitan. */
-              renderedVideoUrl={renderedVideoUrl}
+                 (palette/grade/karaoke sim) se cortocircuitan.
+
+                 QA fix 2026-05-28 (UX): operador reportaba que cambiar
+                 cosas en steps 2/3/4 (Modo/Movimiento/Tipografía) no se
+                 reflejaba en el preview central. Causa: en edit mode
+                 renderedVideoUrl siempre venía set → cortocircuito
+                 instantáneo → operator no veía sus cambios. Ahora SOLO
+                 mostramos el MP4 cuando el operador está en step 6
+                 (necesita el video como referencia para sincronizar
+                 lyrics con el audio). En pasos 2/3/4, dropear el MP4 y
+                 dejar que la live preview renderice — refleja
+                 movimiento, fondo (incl. biblioteca), tipografía, color
+                 + el drag-resize de timings del PR #436. */
+              renderedVideoUrl={isStep6 ? renderedVideoUrl : null}
               /* UI F3 + F5 (2026-05-26): compact en paso 6; placeholderBg
                  mientras el pre-gen del fondo no terminó. */
               compact={isStep6}
