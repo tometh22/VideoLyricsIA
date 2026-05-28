@@ -3013,6 +3013,18 @@ export default function App() {
             // en este flow es null). Orden importante: editingJobId gana.
             transcribeJobId={currentReview.editingJobId || currentReview.transcribeJobId || null}
             onPersistSegments={persistSegmentsToBackend}
+            // QA fix 2026-05-28 (bug #2): synchronous mirror del estado
+            // local del LyricsEditor a currentReview.segments para que el
+            // WizardLivePreview central (que lee `reviewSegments`) refleje
+            // los drag-resize de timings sin esperar al autosave de 3s +
+            // network roundtrip. onEditedChange ya existe (fue pensado
+            // para el modal /edit antiguo); reusar evita un callback nuevo.
+            // El prop-sync useEffect de LyricsEditor (con la guard de
+            // segmentsValuesEqual del PR #433) hace que esta propagación
+            // NO trigger un reseed — los valores son idénticos.
+            onEditedChange={(segs) =>
+              setCurrentReview((r) => (r ? { ...r, segments: segs } : r))
+            }
             isBatch={currentReview.queue.length > 1}
             batchProgress={currentReview.queue.length > 1
               ? `${currentReview.queueIdx + 1} ${t("editor.song_of")} ${currentReview.queue.length}`
