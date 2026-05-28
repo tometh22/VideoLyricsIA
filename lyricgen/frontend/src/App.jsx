@@ -520,11 +520,79 @@ function EditLyricsRoute({ setCurrentReview, setWizardStage, wizardScreen, t }) 
       // siendo lo que el job tiene RENDERIZADO (job.segments_json).
       const segmentsFromSnap = reusableSnap ? snap.currentReview.segments : job.segments_json;
 
+      // Edit-wizard mode (PR feat/edit-wizard-mode, 2026-05-27):
+      // pre-llenamos TODOS los campos editables del wizard desde la row del
+      // Job para que el operador pueda corregir cualquier cosa post-render
+      // (no solo lyrics). La baseline congela el snapshot a la entrada del
+      // edit; el submit calcula el diff contra la baseline y emite N POSTs
+      // /edit (uno por edit_type: metadata / typography / lyrics / background).
+      //
+      // Resilience: si el snap tiene fields editados in-flight (el operador
+      // refrescó mid-edit), esos ganan. Si no, los valores actuales del job.
+      const snapR = reusableSnap ? snap.currentReview : null;
+      const pickSnapOr = (snapKey, fallback) =>
+        (snapR && snapR[snapKey] != null && snapR[snapKey] !== "")
+          ? snapR[snapKey]
+          : fallback;
+
+      const initialFields = {
+        artist: pickSnapOr("artist", job.artist || ""),
+        songTitle: pickSnapOr("songTitle", job.song_title || ""),
+        font: pickSnapOr("font", params.font || ""),
+        textCase: pickSnapOr("textCase", params.text_case || "upper"),
+        textContrast: pickSnapOr("textContrast", params.text_contrast || "medium"),
+        fontScale: String(pickSnapOr("fontScale", params.font_scale || "1.0")),
+        lyricsAnimation: pickSnapOr("lyricsAnimation", params.lyrics_animation || "none"),
+        lineTransition: pickSnapOr("lineTransition", params.line_transition || "none"),
+        lyricColor: pickSnapOr("lyricColor", params.lyric_color || "#FFFFFF"),
+        lyricSungColor: pickSnapOr("lyricSungColor", params.lyric_sung_color || "#FFFFFF"),
+        movementStyle: pickSnapOr("movementStyle", params.movement_style || ""),
+        effect: pickSnapOr("effect", params.effect || ""),
+        backgroundHint: pickSnapOr("backgroundHint", params.background_hint || ""),
+        bgVerbatim: snapR?.bgVerbatim != null ? !!snapR.bgVerbatim : !!params.bg_verbatim,
+        backgroundMode: pickSnapOr("backgroundMode", params.background_mode || ""),
+      };
+
+      // Baseline: snapshot inmutable de cómo está RENDERIZADO el video
+      // ahora — el diff del submit compara contra esto, NO contra el snap
+      // del autosave. Si el operador edita y vuelve atrás un campo al valor
+      // original, el diff lo descarta (no manda al backend, no cuesta un
+      // re-render por nada).
+      const baseline = {
+        artist: job.artist || "",
+        songTitle: job.song_title || "",
+        font: params.font || "",
+        textCase: params.text_case || "upper",
+        textContrast: params.text_contrast || "medium",
+        fontScale: String(params.font_scale || "1.0"),
+        lyricsAnimation: params.lyrics_animation || "none",
+        lineTransition: params.line_transition || "none",
+        lyricColor: params.lyric_color || "#FFFFFF",
+        lyricSungColor: params.lyric_sung_color || "#FFFFFF",
+        movementStyle: params.movement_style || "",
+        effect: params.effect || "",
+        backgroundHint: params.background_hint || "",
+        bgVerbatim: !!params.bg_verbatim,
+        backgroundMode: params.background_mode || "",
+        segments: JSON.parse(JSON.stringify(job.segments_json || [])),
+      };
+
       // Mount the editor NOW with audio/waveform/bg as null. The LyricsEditor
       // handles these as optional — timeline renders without waveform fill,
       // preview without bg image. Operator can edit text/timing immediately.
       setCurrentReview({
         editingJobId: id,
+        // editMode + baseline son la API del flow edit-wizard. App.jsx los
+        // lee en handleApproveLyrics para emitir POSTs /edit con el diff
+        // contra baseline. UploadZone los lee para mostrar UIs de edición
+        // de metadata y desbloquear los pasos editables.
+        editMode: true,
+        baseline,
+        // Read-only context — solo display, no editable post-render.
+        deliveryProfile: job.delivery_profile || "youtube",
+        style: job.style || "",
+        // job.song_title puede llegar null para jobs viejos sin metadata
+        // explícito; filename queda como fallback display sólo.
         segments: segmentsFromSnap,
         openSnapshotSegments: JSON.parse(JSON.stringify(job.segments_json)),
         filename: job.filename || job.artist || "lyrics",
@@ -532,12 +600,7 @@ function EditLyricsRoute({ setCurrentReview, setWizardStage, wizardScreen, t }) 
         audioUrl: null,           // populated by Phase B
         waveform: null,           // populated by Phase B
         bgUrl: null,              // populated by Phase B
-        font: (reusableSnap && snap.currentReview.font) || params.font || "",
-        textCase: (reusableSnap && snap.currentReview.textCase) || params.text_case || "upper",
-        textContrast: (reusableSnap && snap.currentReview.textContrast) || params.text_contrast || "medium",
-        fontScale: String((reusableSnap && snap.currentReview.fontScale) || params.font_scale || "1.0"),
-        lyricsAnimation: (reusableSnap && snap.currentReview.lyricsAnimation) || params.lyrics_animation || "none",
-        lineTransition: (reusableSnap && snap.currentReview.lineTransition) || params.line_transition || "none",
+        ...initialFields,
         // Empty queue: this isn't a batch, it's a one-off edit.
         queue: [],
         queueIdx: 0,
