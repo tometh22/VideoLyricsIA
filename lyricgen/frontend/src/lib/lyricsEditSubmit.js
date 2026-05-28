@@ -89,6 +89,26 @@ export function translateBackendError(raw, t) {
     return tr("edit.error_limit_reached") ||
       "Alcanzaste el límite de 3 regeneraciones para este video.";
   }
+  // QA fix 2026-05-28: el backend tiene DOS errores 400 que empiezan con
+  // "Lyrics edit requires". Antes los mappeábamos a "no hay letras", lo
+  // cual era falso para el caso del status gate y confundía mal al
+  // operador. Diferenciamos por el sub-string específico:
+  //   1) "Lyrics edit requires 'segments' in the request body..."
+  //      → realmente faltan segments en el payload (bug del frontend o
+  //        un editor abierto sobre un job sin segments_json).
+  //   2) "Lyrics edit requires the job to be done, pending_review, or
+  //       rejected (current: editing)"
+  //      → el job está mid-render, hay que esperar.
+  // El segundo caso también lo dispara el endpoint para typography/
+  // background con "Job must be in pending_review" (ya mapeado arriba).
+  // Acá agregamos el match específico para lyrics+metadata status gate.
+  if (
+    str.includes("requires the job to be") ||
+    /\(current: editing\)/.test(str)
+  ) {
+    return tr("edit.error_already_editing") ||
+      "Este video se está re-renderizando ahora. Esperá a que termine (revisalo en la página del video) y volvé a aplicar tus cambios.";
+  }
   if (str.startsWith("Lyrics edit requires") || str.startsWith("Job has no persisted")) {
     return tr("edit.error_no_segments") ||
       "Este video no tiene letras guardadas para editar. Subí la canción de nuevo.";

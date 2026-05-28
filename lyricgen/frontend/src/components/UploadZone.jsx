@@ -2028,7 +2028,17 @@ export default function UploadZone({
             grid column (260-320 px). Mantiene sticky para acompañar
             el scroll del timeline en el panel derecho. */}
         <div className="lg:sticky lg:top-4 space-y-2 min-w-0 w-full [.editor-focus-mode_&]:hidden">
-          {bgMode === "auto" ? (
+          {/* QA fix 2026-05-28 (bug #3): pre-fix mostraba el preview SOLO en
+              bgMode==="auto". Cuando el operador seleccionaba un fondo de
+              biblioteca el preview desaparecía y se reemplazaba por un
+              placeholder estático "Fondo de biblioteca" — visualmente
+              parece un bug porque el operador pierde la visualización del
+              karaoke + movimiento + tipografía sobre el ASSET ELEGIDO. El
+              componente WizardLivePreview no tiene dependencia hard del
+              modo, sólo necesita los props de animation/typography/color.
+              Habilitar para library (no para custom porque hasta que el
+              archivo cargue no hay nada que mostrar). */}
+          {(bgMode === "auto" || bgMode === "library") ? (
             <WizardLivePreview
               style={style}
               customColors={customColors}
@@ -2070,8 +2080,11 @@ export default function UploadZone({
               placeholderBg={isStep6 && bgStatus !== "done"}
             />
           ) : (
+            // Custom file: hasta que el archivo cargue no podemos mostrar
+            // nada útil — placeholder por ahora. Cuando se procese el File,
+            // un follow-up puede mostrarlo como background overlay.
             <div className="aspect-video rounded-2xl ring-1 ring-white/[0.08] bg-surface-2/50 grid place-items-center text-gray-500 text-[13px]">
-              {bgMode === "library" ? (t("upload.bg_library") || "Fondo de biblioteca") : (t("upload.bg_custom_tab") || "Fondo subido")}
+              {t("upload.bg_custom_tab") || "Fondo subido"}
             </div>
           )}
           <p className="text-[10px] text-gray-600 px-1">
