@@ -1929,7 +1929,16 @@ export default function UploadZone({
   const summary = summaryParts.join(" · ");
 
   return (
-    <div className="w-full px-2 md:px-6 pb-28">
+    // QA fix 2026-05-28 (UX, scroll architecture): en lg+ el wrapper
+    // ahora ocupa exactamente el alto que le da el padre (lg:flex-1 +
+    // lg:min-h-0 + lg:overflow-hidden viniendo de App.jsx::newBatchScreen).
+    // Adentro, el grid es flex-col (flex-1) para que la grid de 3
+    // columnas tome todo el alto disponible y la columna RIGHT pueda
+    // hacer su propio overflow-y-auto sin tener que pelearse con el
+    // page-scroll. pb-28 (clear del CTA flotante "Aprobar y generar") se
+    // mantiene solo en mobile — en desktop el CTA es fixed bottom-0 con
+    // su propio espacio. Mobile (<lg) no se toca: pb-28 + page-scroll.
+    <div className="w-full px-2 md:px-6 pb-28 lg:pb-0 lg:h-full lg:overflow-hidden lg:flex lg:flex-col">
       <UploadTour user={user} />
       {/* Pre-upload short-circuit: drop zone-only layout aplica solo cuando
           NO hay contenido reviewable Y NO estamos en edit-mode. Sin estas
@@ -1974,7 +1983,14 @@ export default function UploadZone({
         // viewport. Body class emitida por LyricsEditor:367, cleanup en
         // unmount → volver a step 4 reaparece el layout 3-col.
         return (
-        <div className={`flex flex-col lg:grid ${gridCols} [.editor-focus-mode_&]:lg:grid-cols-1 gap-6 items-start`}>
+        // QA fix 2026-05-28: grid pasa a llenar el alto del padre y a ser
+        // su propio scroll context en lg+. items-start mantiene la
+        // alineación al top de las columnas (necesario para que el
+        // sticky-top-4 del stepper y preview siga funcionando). lg:flex-1
+        // lg:min-h-0 deja la grid ocupar el espacio que el flex-col
+        // exterior le da. lg:overflow-hidden previene que la grid haga
+        // overflow al body — el scroll vive en la columna RIGHT.
+        <div className={`flex flex-col lg:grid ${gridCols} [.editor-focus-mode_&]:lg:grid-cols-1 gap-6 items-start lg:items-stretch lg:h-full lg:min-h-0 lg:overflow-hidden lg:flex-1`}>
 
         {/* LEFT — step rail (vertical on desktop, horizontal pills on mobile).
             Paso 6 "Lyrics" se ve siempre; está deshabilitado hasta que
@@ -2127,8 +2143,16 @@ export default function UploadZone({
           </p>
         </div>
 
-        {/* RIGHT — active step controls only (revealed one step at a time) */}
-        <div className="space-y-4 min-w-0 w-full">
+        {/* RIGHT — active step controls only (revealed one step at a time).
+            QA fix 2026-05-28: en lg+ este es el único scroll context del
+            wizard. h-full toma el alto que el grid le asigna; overflow-y-
+            auto deja que el operador scrollee la lista de lyrics (o
+            cualquier control del paso activo) sin mover el resto del
+            layout (banners + stepper + preview quedan fijos arriba).
+            min-h-0 es necesario en flex column children para que el
+            overflow funcione (sin esto el child colapsaría a su content
+            height antes de aplicar el overflow). */}
+        <div className="space-y-4 min-w-0 w-full lg:h-full lg:min-h-0 lg:overflow-y-auto">
           {files.length > 1 && (
             <div className="flex items-center gap-1.5 px-1">
               <span className="inline-flex items-center gap-1.5 text-[10px] text-gray-500 uppercase tracking-[0.16em]">

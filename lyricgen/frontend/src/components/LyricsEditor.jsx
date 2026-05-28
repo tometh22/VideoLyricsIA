@@ -2625,7 +2625,19 @@ export default function LyricsEditor({
                       esto ahorra ~120px de scroll total. Y como el Phase B
                       compactó el header (auto-fix pill 32px), max-h ahora
                       puede crecer (100vh-200 vs 100vh-280 antes). */}
-                  <div ref={listRef} className={`space-y-0.5 overflow-y-auto pr-1 pb-8 ${focusMode ? "max-h-[calc(100vh-110px)]" : "max-h-[calc(100vh-200px)]"}`}>
+                  {/* QA fix 2026-05-28: el max-h vh-based servía cuando el
+                      editor scrolleaba ADENTRO de su panel y el page-scroll
+                      cubría todo. Con el nuevo wizard layout (PR
+                      fix/wizard-scroll-viewport), el scroll context del
+                      panel derecho vive en UploadZone (~línea 2147,
+                      lg:overflow-y-auto h-full). Si dejamos el max-h acá
+                      sobre lg, el operador ve DOBLE scroll: el inner cap
+                      (acá) PLUS el outer (UploadZone). Resultado: scrollear
+                      al final del inner deja contenido del outer abajo,
+                      pero el mouse-wheel no transfiere → scroll trapped.
+                      Mobile mantiene el cap original (no hay outer
+                      overflow ahí, el page scroll cubre todo). */}
+                  <div ref={listRef} className={`space-y-0.5 overflow-y-auto pr-1 pb-8 ${focusMode ? "max-h-[calc(100vh-110px)]" : "max-h-[calc(100vh-200px)]"} lg:max-h-none lg:overflow-visible`}>
           {edited.map((seg, idx) => {
             const suggestion = suggestionsById[seg._id];
             const isApplied = suggestion && seg.text === suggestion;

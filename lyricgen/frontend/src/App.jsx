@@ -2796,8 +2796,25 @@ export default function App() {
   ) : null;
 
   const newBatchScreen = (
-    <div className="w-full max-w-[1700px] mx-auto animate-fade-in">
-      <div className="flex items-center gap-3 mb-8">
+    // QA fix 2026-05-28 (UX, scroll architecture): pre-fix el page-scroll
+    // viajaba por todo el contenido (header banners + grid del wizard) y
+    // el operador, al scrollear lyrics, perdía el banner "Editando este
+    // video" + el batch banner + a veces incluso el stepper/preview. Solo
+    // habían sticky-top-4 en las dos columnas, no en los headers.
+    //
+    // Approach: en lg+ el container se ajusta a viewport-height (descontando
+    // la altura del top bar de App, ~72 px aprox). Los banners pasan a
+    // `lg:shrink-0` (toman su altura natural) y el wrapper de UploadZone
+    // toma `lg:flex-1 lg:min-h-0` para llenar el resto. Adentro, la grid
+    // del wizard se convierte en su propio scroll context — el panel
+    // derecho es el único que scrollea internamente. Mobile (<lg) mantiene
+    // el page-scroll histórico sin cambios.
+    //
+    // 100dvh evita el problema del 100vh en mobile-Safari donde el chrome
+    // shifting (URL bar) hace que 100vh sea más grande que el viewport
+    // visible; en desktop el comportamiento es idéntico.
+    <div className="w-full max-w-[1700px] mx-auto animate-fade-in lg:h-[calc(100dvh-72px)] lg:flex lg:flex-col lg:overflow-hidden">
+      <div className="flex items-center gap-3 mb-8 lg:mb-6 lg:shrink-0">
         <button onClick={() => navigate("/dashboard")}
           className="w-9 h-9 rounded-xl glass flex items-center justify-center text-gray-400 hover:text-white transition-colors">
           <svg className="w-4 h-4" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
@@ -2819,10 +2836,11 @@ export default function App() {
         </div>
       </div>
 
-      {editingHeaderBanner}
+      <div className="lg:shrink-0">{editingHeaderBanner}</div>
 
-      {resumeBanner}
+      <div className="lg:shrink-0">{resumeBanner}</div>
 
+      <div className="lg:flex-1 lg:min-h-0 lg:overflow-hidden lg:flex lg:flex-col">
       <UploadZone
         files={files}
         onFiles={setFiles}
@@ -2901,6 +2919,7 @@ export default function App() {
         // "(muestra)" en consecuencia.
         bgStatus={bgPreview.status}
       />
+      </div>
     </div>
   );
 
@@ -2996,9 +3015,19 @@ export default function App() {
             // restaura desde R2) y la key/filename caen al campo
             // `filename` que el resume handler popula del job DB.
             key={`${currentReview.file?.name || currentReview.filename || "resume"}:${currentReview.queueIdx}`}
-            // Clear the app's own sticky top bar (~72px) so the editor's
-            // sticky CTA header isn't hidden behind it in the wizard.
-            stickyHeaderTop={72}
+            // QA fix 2026-05-28 (scroll architecture): pre-fix usaba 72 para
+            // clear el top bar de App porque el editor scrolleaba con el
+            // page-scroll y el sticky-top-72 ponía el audio bar JUSTO
+            // abajo del top bar de App. Con el nuevo wizard layout
+            // viewport-bound, el editor monta dentro de la columna RIGHT
+            // de UploadZone (su propio scroll container, h-full). El top
+            // bar de App ya no afecta visualmente — el sticky del audio
+            // bar interno es relativo al scroll de la columna RIGHT, no
+            // al viewport. top=0 lo pega al top de su scroll container,
+            // que es justo abajo del banner stack del wizard. Sin cambio
+            // visual perceptible para el operador, pero conceptualmente
+            // correcto en el nuevo layout.
+            stickyHeaderTop={0}
             segments={currentReview.segments}
             filename={currentReview.file?.name || currentReview.filename || ""}
             audioFile={currentReview.file}
