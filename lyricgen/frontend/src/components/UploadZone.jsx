@@ -277,6 +277,14 @@ export default function UploadZone({
       return next;
     });
     onFiles((prev) => prev.map((f) => ({ ...f, [field]: value })));
+    // QA fix 2026-05-27: en edit mode files=[] así que el fan-out de
+    // arriba es no-op. Sin esto, los cambios de background_hint /
+    // movement / effect / typography que el operador hace en steps 2-4
+    // nunca llegan a currentReview, y submitEdit (handleApproveLyrics)
+    // los pierde al computar el diff. App.jsx mapea field→currentReview.
+    if (editMode && onEditFieldChange) {
+      onEditFieldChange(field, value);
+    }
   };
 
   const [hoverCaseBatch, setHoverCaseBatch] = useState(null);

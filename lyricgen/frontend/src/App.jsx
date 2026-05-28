@@ -2818,6 +2818,19 @@ export default function App() {
         // step, así el resto de step 2 sí es interactivo.
         lockedSteps={currentReview?.editMode ? [1, 5] : []}
         editMode={!!currentReview?.editMode}
+        // QA fix 2026-05-27: en edit mode los controles del wizard
+        // (step 2 background_hint/bg_verbatim, step 3 movement/effect,
+        // step 4 typography) escriben a batchDefaults + files via
+        // updateBatchDefault. Como files=[] en edit mode, el fan-out es
+        // no-op y los cambios no llegan al diff de handleApproveLyrics.
+        // Este callback los forward a currentReview con el mismo nombre
+        // de field (batchDefaults y currentReview usan camelCase con las
+        // mismas keys: backgroundHint, bgVerbatim, movementStyle,
+        // effect, font, textCase, fontScale, textContrast,
+        // lyricsAnimation, lineTransition, lyricColor, lyricSungColor).
+        onEditFieldChange={(field, value) =>
+          setCurrentReview((r) => (r ? { ...r, [field]: value } : r))
+        }
         renderedVideoUrl={editingRenderedVideoUrl || null}
         // UI F5 (2026-05-26): le pasamos el bgStatus al wizard para que
         // UploadZone pueda derivar `placeholderBg` cuando montamos el
