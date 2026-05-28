@@ -1035,7 +1035,15 @@ export default function UploadZone({
       </div>
   );
 
-  const _batchSettingsBlock = files.length > 0 ? (
+  // QA fix 2026-05-28: en edit mode files=[] (no se sube nada nuevo, el
+  // job ya tiene su audio), pero el operador SÍ necesita ver los
+  // controls de movement/effect en step 3 para corregir esos campos.
+  // El gate original `files.length > 0` ocultaba todo el panel en edit
+  // mode → step 3 quedaba vacío. Ahora abrimos también para editMode.
+  // Los sub-bloques internos siguen con sus propios checks
+  // (`files.length > 1` para acciones de batch) — esos correctamente
+  // se ocultan si no hay archivos.
+  const _batchSettingsBlock = (files.length > 0 || editMode) ? (
     <div className="mt-3 glass rounded-card px-4 py-4">
       <p className="text-[10px] uppercase tracking-[0.18em] text-gray-500 mb-3">
         {files.length > 1
@@ -2071,21 +2079,28 @@ export default function UploadZone({
               lineTransition={hoverTransition ?? batchDefaults.lineTransition}
               lyricColor={batchDefaults.lyricColor || "#FFFFFF"}
               lyricSungColor={batchDefaults.lyricSungColor || "#FFFFFF"}
-              /* QA fix 2026-05-28 (bug #3 continuación): cuando el
-                 operador selecciona un fondo de biblioteca en step 2,
-                 hacer que la BASE del preview sea ese asset (no el
-                 clip del movement seleccionado). Así el operador VE
-                 cómo se ve la letra sobre la imagen/video que eligió.
-                 Para librarías .mp4 funciona directo en el <video>;
-                 para librarías .jpg/.png el video element fallará a
-                 cargar (negro) pero el karaoke overlay sigue visible
-                 — degradación aceptable hasta que sumamos rendering
-                 condicional <img> vs <video>. */
-              clipSrc={
-                (bgMode === "library" && backgroundId)
-                  ? `${API}/backgrounds/${backgroundId}/preview?${tokenParam()}`
-                  : ((MOVEMENT_STYLES.find((m) => m.code === (hoverMovement ?? batchDefaults.movementStyle))?.sample) || "/movement_samples/estandar.mp4")
-              }
+              /* QA fix 2026-05-28: cuando el operador selecciona un fondo
+                 de biblioteca en step 2, la BASE del preview es ese
+                 asset (en vez del clip del movement). Para assets .mp4
+                 (file_type "mp4") va como <video>; para imágenes
+                 (jpg/png) se renderiza como <img> via la prop nueva
+                 clipIsVideo. Hasta el follow-up, el operador veía negro
+                 cuando elegía un asset image porque el <video> element
+                 fallaba a cargar la imagen. */
+              clipSrc={(() => {
+                if (bgMode === "library" && backgroundId) {
+                  return `${API}/backgrounds/${backgroundId}/preview?${tokenParam()}`;
+                }
+                return (MOVEMENT_STYLES.find((m) => m.code === (hoverMovement ?? batchDefaults.movementStyle))?.sample) || "/movement_samples/estandar.mp4";
+              })()}
+              clipIsVideo={(() => {
+                if (bgMode === "library" && backgroundId) {
+                  const sel = libraryBgs.find((b) => b.id === backgroundId);
+                  return sel?.file_type === "mp4";
+                }
+                // Movement samples siempre son MP4; default true.
+                return true;
+              })()}
               /* Typography 2026-05-26: cerrar el gap entre los controles del
                  paso 4 (font/case/size/contrast) y el preview central. Antes
                  el comentario al lado del bloque mentía — "el preview ya
@@ -2634,8 +2649,16 @@ export default function UploadZone({
 
       {/* Sticky bottom CTA bar. Phase 2: oculta en paso 6 porque el contenido
           de review (LyricsEditor / transcribing / readyToGenerate) trae sus
-          propios CTAs (Aprobar / Volver / Crear N videos). */}
-      {files.length > 0 && wizardStep !== 6 && (
+          propios CTAs (Aprobar / Volver / Crear N videos).
+          QA fix 2026-05-28: el gate `files.length > 0` ocultaba la barra en
+          TODOS los pasos del edit-wizard (files=[] en edit mode), dejando
+          al operador sin navegación entre pasos. Ahora también la mostramos
+          en edit mode — los botones Atrás/Continuar usan el `_findPrev/
+          NextUnlocked` que ya respeta lockedSteps, así que automáticamente
+          saltea step 1 (file, locked) y step 5 (delivery, locked). El
+          summary line muestra "MP4 1080p · Generar con IA" o similar (sin
+          file count) lo cual es informativo aunque mínimo en edit mode. */}
+      {(files.length > 0 || editMode) && wizardStep !== 6 && (
         <div
           className={`fixed bottom-0 left-0 right-0 z-30 bg-surface-1/85 backdrop-blur-xl border-t border-white/[0.06] px-4 md:px-8 py-4 transition-all duration-300 ${sidebarOpen ? "md:left-64" : "md:left-0"}`}
           data-tour="upload-cta-bar"

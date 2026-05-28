@@ -112,6 +112,11 @@ export default function WizardLivePreview({
   mode = "lyrics",
   lyric,
   clipSrc = "/movement_samples/estandar.mp4",
+  // QA fix 2026-05-28: cuando clipSrc apunta a un asset image (library
+  // bg .jpg/.png), el <video> element falla a cargar → negro. Esta
+  // prop manda renderizar <img> en cambio. Default true para no romper
+  // call sites existentes que pasaban solo movement samples (siempre mp4).
+  clipIsVideo = true,
   // Phase C 2026-05-25: ref que recibe playback tick desde LyricsEditor.
   // Cuando el operador clickea play en el editor (paso 6), el ref publica
   // {activeLine, activeStart, activeEnd, currentTime} a 60fps. Lo leemos
@@ -465,14 +470,28 @@ export default function WizardLivePreview({
 
       {/* REAL Veo clip of the SELECTED movement style as the base — the
           preview shows the actual style's example (the clip already carries
-          its camera movement). The mood/palette grades it on top. */}
-      <video
-        key={baseClip}
-        src={baseClip}
-        className="absolute inset-0 w-full h-full object-cover"
-        style={baseAnim !== "none" ? { animation: baseAnim, willChange: "transform" } : undefined}
-        autoPlay loop muted playsInline
-      />
+          its camera movement). The mood/palette grades it on top.
+          QA fix 2026-05-28: cuando el operador picks un library bg que es
+          .jpg/.png, clipIsVideo=false y renderizamos <img>. El movement
+          CSS animation aplica igual (transform en img también funciona). */}
+      {clipIsVideo ? (
+        <video
+          key={baseClip}
+          src={baseClip}
+          className="absolute inset-0 w-full h-full object-cover"
+          style={baseAnim !== "none" ? { animation: baseAnim, willChange: "transform" } : undefined}
+          autoPlay loop muted playsInline
+        />
+      ) : (
+        <img
+          key={baseClip}
+          src={baseClip}
+          alt=""
+          className="absolute inset-0 w-full h-full object-cover"
+          style={baseAnim !== "none" ? { animation: baseAnim, willChange: "transform" } : undefined}
+          draggable={false}
+        />
+      )}
       {/* effect overlay — particles screen-blended over the footage, BELOW the
           grade so the palette tints them too (mirrors the backend
           bg→effect→grade→subs order). mix-blend-screen makes the black loop
