@@ -1972,15 +1972,16 @@ export default function UploadZone({
          (oculta caption de movement/effect que ya no se está editando). */
       (() => {
         const isStep6 = wizardStep === 6 && hasReviewableContent;
-        // QA fix 2026-05-28 (UX): operador reporta que en step 6 el
-        // preview central queda muy chico (260-320 px) — difícil seguir
-        // el video mientras edita lyrics, y como queda chico el operador
-        // pierde la conexión visual. Ampliamos a 420-560 px → +200 px
-        // que sale del panel derecho (sigue siendo ancho suficiente para
-        // editar texto + timings). En pasos 1-5 el layout original
-        // (1fr preview) era OK, no se toca.
+        // QA fix 2026-05-28 (UX, polish): operador reportó que en step 6
+        // el stepper sólo mostraba números (1-6) y no se entendía qué era
+        // cada paso. La compactación a 56 px sacrificaba discoverability
+        // por espacio. Subimos a 168 px (alcanza para las labels más
+        // largas como "Tipografía & Animación") y bajamos el preview a
+        // 380-520 px y el panel derecho conserva el 1fr. La pérdida de
+        // ~140 px del preview es marginal vs. el gran win de saber qué
+        // estás clickeando. Otros pasos siguen con 190 px (no cambian).
         const gridCols = isStep6
-          ? "lg:grid-cols-[56px_minmax(420px,560px)_minmax(0,1fr)]"
+          ? "lg:grid-cols-[168px_minmax(380px,520px)_minmax(0,1fr)]"
           : "lg:grid-cols-[190px_minmax(0,1fr)_minmax(400px,460px)]";
         // 2026-05-26 — variante [.editor-focus-mode_&] colapsa este grid
         // a 1 columna cuando el LyricsEditor prende "modo enfoque". Sin
@@ -2007,10 +2008,10 @@ export default function UploadZone({
             step 6 y permite navegar libremente entre 4↔6 (operador
             cambia font/animation en paso 4, vuelve a paso 6 a aprobar).
 
-            UI F2 (2026-05-26): en paso 6 las labels se ocultan (solo
-            el número en círculo queda visible). Tooltip on hover
-            mantiene la información completa. El sidebar pasa de 190 px
-            a 56 px → +134 px que ganan las otras dos columnas. */}
+            QA fix 2026-05-28 (UX): la versión anterior ocultaba labels en
+            step 6 para ganar espacio. Operador reportó que no se entendía
+            qué era cada paso. Volvemos a mostrar labels SIEMPRE — el
+            grid arriba se ajustó a 168 px de sidebar para acomodarlas. */}
         <nav className="flex lg:flex-col gap-1.5 lg:gap-1 overflow-x-auto lg:overflow-visible lg:sticky lg:top-4 w-full lg:w-auto order-first [.editor-focus-mode_&]:hidden">
           {WIZARD_STEPS.map((s) => {
             const isLyrics = s.id === 6;
@@ -2031,7 +2032,7 @@ export default function UploadZone({
                   : lyricsDisabled
                     ? (t("upload.step_lyrics_hint") || "Disponible después de \"Revisar lyrics\"")
                     : (isStep6 ? s.label : undefined)}
-                className={`flex items-center ${isStep6 ? "lg:justify-center lg:px-0" : "gap-2.5 px-3"} py-2.5 rounded-xl text-[12.5px] font-medium whitespace-nowrap transition-all text-left shrink-0 ${
+                className={`flex items-center gap-2.5 px-3 py-2.5 rounded-xl text-[12.5px] font-medium whitespace-nowrap transition-all text-left shrink-0 ${
                   disabled
                     ? "text-gray-600 cursor-not-allowed opacity-50"
                     : active ? "bg-brand/[0.12] text-white ring-1 ring-brand/35"
@@ -2044,7 +2045,7 @@ export default function UploadZone({
                                     : done ? "bg-accent/20 text-accent"
                                            : "bg-surface-3 text-gray-400"
                 }`}>{done ? "✓" : s.id}</span>
-                <span className={isStep6 ? "lg:hidden ml-2.5" : "ml-2.5 lg:ml-0"}>{s.label}</span>
+                <span className="ml-0">{s.label}</span>
               </button>
             );
           })}
