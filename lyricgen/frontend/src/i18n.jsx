@@ -402,6 +402,8 @@ export const translations = {
     // Transcribing
     "transcribe.title": "Transcribiendo lyrics",
     "transcribe.subtitle": "Analizando audio...",
+    "transcribe.failed_retry": "No pudimos transcribir esta canción. Probá reintentar, o si el problema persiste vení al historial en unos minutos — el job sigue procesándose en segundo plano.",
+    "transcribe.go_to_dashboard": "Ver mi historial",
     "transcribe.uploading": "Subiendo audio",
     "transcribe.uploading_progress": "Subiendo a almacenamiento ({pct}%)",
     "transcribe.song": "Canción",

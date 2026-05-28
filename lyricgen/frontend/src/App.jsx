@@ -1989,9 +1989,25 @@ export default function App() {
         setTranscribeProgress({ phase: "transcribing", loaded: 0, total: 0 });
         const polled = await pollUntilTranscribed(data.job_id || uploadJobId, entry.file);
         if (!polled) {
+          // QA fix 2026-05-28 (audit P0 #77): pre-fix mensaje opaco +
+          // sin Retry button (transcribeRetryCtx no se seteaba). Ahora
+          // distinguimos el caso de timeout (job sigue procesándose en
+          // background — link a /dashboard) del de transcription_failed
+          // (worker reportó error — Retry funciona) Y siempre seteamos
+          // el retry context para que el botón aparezca.
           setTranscribing(false);
           setTranscribeProgress(null);
-          setTranscribeError("La transcripción falló. Reintentá.");
+          transcribeRetryCtx.current = { queue, idx };
+          // pollUntilTranscribed retorna null en dos casos:
+          // - transcription_failed (data.error tiene el detalle del worker)
+          // - timeout 20 min sin terminar (background sigue procesando)
+          // En ambos casos el job está en DB y el operador puede ir a
+          // /dashboard a esperarlo o reintentar.
+          const errMsg = (t("transcribe.failed_retry") ||
+            "No pudimos transcribir esta canción. Probá reintentar, " +
+            "o si el problema persiste vení al historial en unos minutos " +
+            "— el job sigue procesándose en segundo plano.");
+          setTranscribeError(errMsg);
           return;
         }
         data = polled;
@@ -3067,7 +3083,7 @@ export default function App() {
         <div className="w-full max-w-md mx-auto mt-8 animate-fade-in">
           <div className="rounded-xl bg-red-500/10 border border-red-500/20 px-5 py-4 text-center">
             <p className="text-sm text-red-400">{transcribeError}</p>
-            <div className="mt-3 flex items-center justify-center gap-4">
+            <div className="mt-3 flex items-center justify-center gap-4 flex-wrap">
               {transcribeRetryCtx.current && (
                 <button
                   onClick={() => {
@@ -3081,6 +3097,16 @@ export default function App() {
                   {t("upload.retry") || "Reintentar"}
                 </button>
               )}
+              {/* QA fix 2026-05-28 (audit P0 #77): cuando el job está en
+                  background procesándose (timeout del front pero backend
+                  sigue trabajando), el operador necesita un link directo
+                  al historial. */}
+              <button
+                onClick={() => { setTranscribeError(null); navigate("/dashboard"); }}
+                className="text-xs text-gray-300 hover:text-white transition-colors font-medium underline"
+              >
+                {t("transcribe.go_to_dashboard") || "Ver mi historial"}
+              </button>
               <button onClick={() => { setTranscribeError(null); navigate("/new"); }}
                 className="text-xs text-gray-400 hover:text-white transition-colors underline">
                 {t("detail.back")}
