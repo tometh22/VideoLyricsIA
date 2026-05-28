@@ -465,7 +465,18 @@ export default function LyricsEditor({
     setEdited(seeded);
     originalSegmentsRef.current = seeded;
     setIsDirty(false);
-    autoTrimAppliedRef.current = false;  // new job → eligible for auto-trim
+    // Audit fix 2026-05-27 (drag-resize regression part 2): NO resetear
+    // autoTrimAppliedRef acá. Antes hacíamos `current = false` con la
+    // lógica "new job → eligible for auto-trim", PERO esta useEffect
+    // también dispara en el roundtrip del autosave (drag → POST →
+    // setCurrentReview → reseed). Si el operador acababa de extender un
+    // segmento más allá de su `estimateVoiceEndDuration` cap, autoTrim
+    // (useEffect en línea ~1440) ve `current=false` + `longSegCount>0`
+    // y dispara `trimAllLongSegs()` que recorta el end de vuelta al cap.
+    // Visualmente: drag se "revierte". Para el caso real de cargar un
+    // job distinto, el padre cambia la `key` del LyricsEditor (filename
+    // + queueIdx) → remount → useState inicializa `current=false` de
+    // nuevo. No hace falta el reset acá.
   }, [segments]);
 
   // Warn browser on tab-close / external navigation when there are unsaved edits.
