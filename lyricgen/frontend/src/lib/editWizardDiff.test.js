@@ -1,0 +1,235 @@
+// Unit tests for computeFieldDiff + buildEditPayloads. These cover the
+// edit-wizard's "compute the minimum POST set" logic so a refactor of the
+// wizard's field map can't silently change which buckets get fired.
+//
+// Tests are pure (no DOM, no fetch mocks) — the helpers under test are
+// pure too.
+
+import { describe, expect, it } from "vitest";
+import { computeFieldDiff, buildEditPayloads } from "./editWizardDiff";
+
+const baselineFixture = () => ({
+  artist: "Cerati",
+  songTitle: "Crimen",
+  font: "jost",
+  fontScale: "1.0",
+  textCase: "upper",
+  textContrast: "medium",
+  lyricsAnimation: "none",
+  lineTransition: "none",
+  effect: "",
+  backgroundHint: "",
+  bgVerbatim: false,
+  backgroundMode: "",
+  movementStyle: "",
+  segments: [
+    { start: 0, end: 2, text: "Línea uno" },
+    { start: 2, end: 4, text: "Línea dos" },
+  ],
+});
+
+describe("computeFieldDiff", () => {
+  it("returns {} when nothing changed", () => {
+    const base = baselineFixture();
+    const cur = { ...base, segments: JSON.parse(JSON.stringify(base.segments)) };
+    expect(computeFieldDiff(base, cur)).toEqual({});
+  });
+
+  it("metadata bucket: artist only", () => {
+    const base = baselineFixture();
+    const cur = { ...base, artist: "Soda Stereo" };
+    const diff = computeFieldDiff(base, cur);
+    expect(diff).toEqual({ metadata: { artist: "Soda Stereo" } });
+  });
+
+  it("metadata bucket: song_title only (trimmed)", () => {
+    const base = baselineFixture();
+    const cur = { ...base, songTitle: "  Crímen  " };
+    const diff = computeFieldDiff(base, cur);
+    // Trim happens — the wire shape never has leading/trailing whitespace.
+    expect(diff).toEqual({ metadata: { song_title: "Crímen" } });
+  });
+
+  it("metadata bucket: both fields changed", () => {
+    const base = baselineFixture();
+    const cur = { ...base, artist: "Spinetta", songTitle: "Cementerio Club" };
+    expect(computeFieldDiff(base, cur)).toEqual({
+      metadata: { artist: "Spinetta", song_title: "Cementerio Club" },
+    });
+  });
+
+  it("typography bucket: font_scale travels as number, not string", () => {
+    const base = baselineFixture();
+    const cur = { ...base, fontScale: "1.5" };
+    const diff = computeFieldDiff(base, cur);
+    expect(diff).toEqual({ typography: { font_scale: 1.5 } });
+  });
+
+  it("typography bucket: 1.0 vs 1 does NOT trigger a diff (numeric equality)", () => {
+    const base = { ...baselineFixture(), fontScale: 1 };
+    const cur = { ...baselineFixture(), fontScale: "1.0" };
+    expect(computeFieldDiff(base, cur)).toEqual({});
+  });
+
+  it("typography bucket: multiple fields", () => {
+    const base = baselineFixture();
+    const cur = {
+      ...base,
+      font: "lobster",
+      textCase: "title",
+      lyricsAnimation: "karaoke",
+    };
+    expect(computeFieldDiff(base, cur)).toEqual({
+      typography: {
+        font: "lobster",
+        text_case: "title",
+        lyrics_animation: "karaoke",
+      },
+    });
+  });
+
+  it("lyrics bucket: text change", () => {
+    const base = baselineFixture();
+    const cur = {
+      ...base,
+      segments: [
+        { start: 0, end: 2, text: "Línea uno corregida" },
+        { start: 2, end: 4, text: "Línea dos" },
+      ],
+    };
+    const diff = computeFieldDiff(base, cur);
+    expect(diff.lyrics).toBeDefined();
+    expect(diff.lyrics.segments).toHaveLength(2);
+    expect(diff.lyrics.segments[0].text).toBe("Línea uno corregida");
+  });
+
+  it("lyrics bucket: timing change (drag-resize)", () => {
+    const base = baselineFixture();
+    const cur = {
+      ...base,
+      segments: [
+        { start: 0, end: 2.5, text: "Línea uno" }, // end moved 2 → 2.5
+        { start: 2.5, end: 4, text: "Línea dos" },
+      ],
+    };
+    const diff = computeFieldDiff(base, cur);
+    expect(diff.lyrics).toBeDefined();
+    expect(diff.lyrics.segments[0].end).toBe(2.5);
+  });
+
+  it("lyrics bucket: ignores unchanged segments", () => {
+    const base = baselineFixture();
+    const cur = {
+      ...base,
+      segments: JSON.parse(JSON.stringify(base.segments)),
+    };
+    expect(computeFieldDiff(base, cur).lyrics).toBeUndefined();
+  });
+
+  it("background bucket: hint trimmed", () => {
+    const base = baselineFixture();
+    const cur = { ...base, backgroundHint: "  paisaje urbano nocturno  " };
+    expect(computeFieldDiff(base, cur)).toEqual({
+      background: { background_hint: "paisaje urbano nocturno" },
+    });
+  });
+
+  it("background bucket: movement_style change", () => {
+    const base = baselineFixture();
+    const cur = { ...base, movementStyle: "static" };
+    expect(computeFieldDiff(base, cur)).toEqual({
+      background: { movement_style: "static" },
+    });
+  });
+
+  it("background bucket: bg_verbatim toggle", () => {
+    const base = baselineFixture();
+    const cur = { ...base, bgVerbatim: true };
+    expect(computeFieldDiff(base, cur)).toEqual({
+      background: { bg_verbatim: true },
+    });
+  });
+
+  it("background bucket: only sends background_mode when non-empty", () => {
+    const base = baselineFixture();
+    const cur1 = { ...base, backgroundMode: "" };
+    expect(computeFieldDiff(base, cur1).background).toBeUndefined();
+    const cur2 = { ...base, backgroundMode: "imagen" };
+    expect(computeFieldDiff(base, cur2)).toEqual({
+      background: { background_mode: "imagen" },
+    });
+  });
+
+  it("multiple buckets: metadata + typography + lyrics + background all changed", () => {
+    const base = baselineFixture();
+    const cur = {
+      ...base,
+      artist: "Charly García",
+      font: "lobster",
+      segments: [
+        { start: 0, end: 2, text: "Letra corregida" },
+        { start: 2, end: 4, text: "Línea dos" },
+      ],
+      backgroundHint: "paisaje urbano",
+    };
+    const diff = computeFieldDiff(base, cur);
+    expect(Object.keys(diff).sort()).toEqual([
+      "background",
+      "lyrics",
+      "metadata",
+      "typography",
+    ]);
+  });
+
+  it("returns {} when baseline or current is null/undefined", () => {
+    expect(computeFieldDiff(null, baselineFixture())).toEqual({});
+    expect(computeFieldDiff(baselineFixture(), null)).toEqual({});
+    expect(computeFieldDiff(undefined, undefined)).toEqual({});
+  });
+
+  it("empty-string vs undefined: treated as equal (no spurious diff)", () => {
+    const base = { ...baselineFixture(), effect: undefined, movementStyle: undefined };
+    const cur = { ...baselineFixture(), effect: "", movementStyle: "" };
+    expect(computeFieldDiff(base, cur)).toEqual({});
+  });
+});
+
+describe("buildEditPayloads", () => {
+  it("emits payloads in stable order: metadata → typography → lyrics → background", () => {
+    const diff = {
+      background: { background_hint: "bg" },
+      lyrics: { segments: [{ start: 0, end: 1, text: "x" }] },
+      metadata: { artist: "y" },
+      typography: { font: "z" },
+    };
+    const payloads = buildEditPayloads(diff);
+    expect(payloads.map((p) => p.edit_type)).toEqual([
+      "metadata",
+      "typography",
+      "lyrics",
+      "background",
+    ]);
+  });
+
+  it("each payload has edit_type set + bucket fields flattened", () => {
+    const diff = {
+      metadata: { artist: "Soda", song_title: "Crimen" },
+    };
+    expect(buildEditPayloads(diff)).toEqual([
+      { edit_type: "metadata", artist: "Soda", song_title: "Crimen" },
+    ]);
+  });
+
+  it("returns [] for empty diff", () => {
+    expect(buildEditPayloads({})).toEqual([]);
+  });
+
+  it("omits buckets that aren't present", () => {
+    const diff = {
+      lyrics: { segments: [{ start: 0, end: 1, text: "x" }] },
+    };
+    const payloads = buildEditPayloads(diff);
+    expect(payloads).toHaveLength(1);
+    expect(payloads[0].edit_type).toBe("lyrics");
+  });
+});
