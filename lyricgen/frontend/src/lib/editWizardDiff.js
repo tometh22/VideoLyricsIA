@@ -140,7 +140,16 @@ export function computeFieldDiff(baseline, current) {
 // at the start of each edit, so this order means later edits see earlier
 // edits' DB mutations — important when (e.g.) a metadata edit lands in
 // the audit log before a typography edit consumes an edit_count slot.
-export function buildEditPayloads(diff) {
+//
+// `opts.jobStatus` (optional): when provided, the function bundles the
+// typography fields into another payload to reduce POST count AND to
+// sidestep the backend's `pending_review` gate for typography/background
+// standalone edits. The font/text_case/contrast/lyrics_animation fields
+// are ungated server-side (they write to edit_params regardless of
+// edit_type, main.py:7576-7608), so a metadata or lyrics edit can carry
+// them piggyback in the same re-render. Saves 1 re-render slot + 1
+// status hop in the UI.
+export function buildEditPayloads(diff, opts = {}) {
   const payloads = [];
   if (diff.metadata) {
     payloads.push({ edit_type: "metadata", ...diff.metadata });
@@ -154,5 +163,40 @@ export function buildEditPayloads(diff) {
   if (diff.background) {
     payloads.push({ edit_type: "background", ...diff.background });
   }
+  return bundleTypographyIntoFirstBucket(payloads, opts);
+}
+
+// Merge the typography payload's fields into whichever non-typography
+// payload comes first in the array (metadata → lyrics → background),
+// then drop the separate typography slot. Keeps the wire-shape minimal
+// and avoids the backend's pending_review gate when the operator
+// changes typography alongside metadata (typo + font fix in one
+// re-render). Pure / no side effects on the input.
+export function bundleTypographyIntoFirstBucket(payloads, _opts = {}) {
+  const typoIdx = payloads.findIndex((p) => p.edit_type === "typography");
+  if (typoIdx < 0) return payloads;
+  const typo = payloads[typoIdx];
+  // eslint-disable-next-line no-unused-vars
+  const { edit_type, ...typoFields } = typo;
+  // Priority order: prefer bundling into metadata (cheaper, no edit_count)
+  // then lyrics (already needs segments anyway) then background (last
+  // resort — background regens Veo, so a piggyback there means the
+  // operator wanted a regen anyway).
+  const targetOrder = ["metadata", "lyrics", "background"];
+  for (const target of targetOrder) {
+    const targetIdx = payloads.findIndex((p) => p.edit_type === target);
+    if (targetIdx >= 0) {
+      // Mutate the existing object in-place? No — return a fresh array
+      // so callers don't have to clone. Spread typo fields onto a copy.
+      const merged = { ...payloads[targetIdx], ...typoFields };
+      const next = payloads.slice();
+      next[targetIdx] = merged;
+      next.splice(typoIdx, 1);
+      return next;
+    }
+  }
+  // No other bucket — typography stays standalone (backend will require
+  // pending_review status). Caller can detect this case and convert to
+  // a lyrics-with-current-segments edit if the job is done/rejected.
   return payloads;
 }

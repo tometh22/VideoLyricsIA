@@ -6,7 +6,11 @@
 // pure too.
 
 import { describe, expect, it } from "vitest";
-import { computeFieldDiff, buildEditPayloads } from "./editWizardDiff";
+import {
+  computeFieldDiff,
+  buildEditPayloads,
+  bundleTypographyIntoFirstBucket,
+} from "./editWizardDiff";
 
 const baselineFixture = () => ({
   artist: "Cerati",
@@ -195,20 +199,76 @@ describe("computeFieldDiff", () => {
 });
 
 describe("buildEditPayloads", () => {
-  it("emits payloads in stable order: metadata → typography → lyrics → background", () => {
+  it("with no typography to bundle, emits stable order: metadata → lyrics → background", () => {
     const diff = {
       background: { background_hint: "bg" },
       lyrics: { segments: [{ start: 0, end: 1, text: "x" }] },
       metadata: { artist: "y" },
-      typography: { font: "z" },
     };
     const payloads = buildEditPayloads(diff);
     expect(payloads.map((p) => p.edit_type)).toEqual([
       "metadata",
-      "typography",
       "lyrics",
       "background",
     ]);
+  });
+
+  it("bundles typography fields into the first non-typography bucket (metadata wins)", () => {
+    const diff = {
+      metadata: { artist: "Soda" },
+      typography: { font: "lobster", font_scale: 1.5 },
+      lyrics: { segments: [{ start: 0, end: 1, text: "x" }] },
+    };
+    const payloads = buildEditPayloads(diff);
+    // typography slot disappears, its fields land on metadata payload
+    expect(payloads.map((p) => p.edit_type)).toEqual(["metadata", "lyrics"]);
+    expect(payloads[0]).toEqual({
+      edit_type: "metadata",
+      artist: "Soda",
+      font: "lobster",
+      font_scale: 1.5,
+    });
+  });
+
+  it("bundles typography into lyrics when metadata is absent", () => {
+    const diff = {
+      typography: { font: "lobster" },
+      lyrics: { segments: [{ start: 0, end: 1, text: "x" }] },
+    };
+    const payloads = buildEditPayloads(diff);
+    expect(payloads.map((p) => p.edit_type)).toEqual(["lyrics"]);
+    expect(payloads[0]).toEqual({
+      edit_type: "lyrics",
+      segments: [{ start: 0, end: 1, text: "x" }],
+      font: "lobster",
+    });
+  });
+
+  it("bundles typography into background when no metadata/lyrics", () => {
+    const diff = {
+      typography: { font: "lobster" },
+      background: { background_hint: "bg" },
+    };
+    const payloads = buildEditPayloads(diff);
+    expect(payloads.map((p) => p.edit_type)).toEqual(["background"]);
+    expect(payloads[0]).toEqual({
+      edit_type: "background",
+      background_hint: "bg",
+      font: "lobster",
+    });
+  });
+
+  it("typography stays standalone when there's no other bucket to bundle into", () => {
+    const diff = {
+      typography: { font: "lobster", font_scale: 1.2 },
+    };
+    const payloads = buildEditPayloads(diff);
+    expect(payloads.map((p) => p.edit_type)).toEqual(["typography"]);
+    expect(payloads[0]).toEqual({
+      edit_type: "typography",
+      font: "lobster",
+      font_scale: 1.2,
+    });
   });
 
   it("each payload has edit_type set + bucket fields flattened", () => {
