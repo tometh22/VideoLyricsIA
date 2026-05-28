@@ -589,6 +589,11 @@ function EditLyricsRoute({ setCurrentReview, setWizardStage, wizardScreen, t }) 
         // de metadata y desbloquear los pasos editables.
         editMode: true,
         baseline,
+        // jobStatus drives which edit_types are valid: typography +
+        // background are pending_review-only at the backend (see
+        // main.py:7444). The wizard surface reads this to keep the
+        // dialog honest about what will actually re-render.
+        jobStatus: job.status,
         // Read-only context — solo display, no editable post-render.
         deliveryProfile: job.delivery_profile || "youtube",
         style: job.style || "",
@@ -2668,6 +2673,60 @@ export default function App() {
       })()
     : null;
 
+  // Edit-mode metadata banner (PR feat/edit-wizard-mode, 2026-05-27):
+  // when EditLyricsRoute mounted us in edit mode, show artist+song_title
+  // inputs at the top of the wizard so the operator can fix a typo in the
+  // title card without leaving the editor. Writes to currentReview so the
+  // diff in handleApproveLyrics picks them up via the metadata bucket.
+  // Hidden on regular new-job flow (currentReview?.editMode === undefined).
+  const editingHeaderBanner = currentReview?.editMode ? (
+    <div className="rounded-card bg-brand/[0.06] ring-1 ring-brand/30 px-5 py-4 mb-6 animate-fade-in">
+      <div className="flex items-center gap-2 mb-3">
+        <svg className="w-4 h-4 text-brand-light" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
+          <path d="M11 4H4a2 2 0 00-2 2v14a2 2 0 002 2h14a2 2 0 002-2v-7" strokeLinecap="round" strokeLinejoin="round" />
+          <path d="M18.5 2.5a2.121 2.121 0 013 3L12 15l-4 1 1-4 9.5-9.5z" strokeLinecap="round" strokeLinejoin="round" />
+        </svg>
+        <p className="text-[11px] uppercase tracking-[0.18em] text-brand-light">
+          {t("editor.editing_banner_label") || "Editando este video"}
+        </p>
+      </div>
+      <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+        <div>
+          <label className="block text-[10px] uppercase tracking-wider text-gray-500 mb-1">
+            {t("upload.artist") || "Artista"}
+          </label>
+          <input
+            type="text"
+            value={currentReview.artist || ""}
+            onChange={(e) => setCurrentReview((r) => (r ? { ...r, artist: e.target.value } : r))}
+            placeholder={t("upload.artist_placeholder") || "Ej: Viejas Locas"}
+            maxLength={255}
+            className="w-full rounded-lg bg-surface-1 border border-white/[0.08] focus:border-brand/50 px-3 py-2 text-sm text-gray-100 placeholder:text-gray-600 outline-none"
+            aria-label={t("editor.editing_artist") || "Editar artista"}
+          />
+        </div>
+        <div>
+          <label className="block text-[10px] uppercase tracking-wider text-gray-500 mb-1">
+            {t("upload.song_title") || "Título de la canción"}
+          </label>
+          <input
+            type="text"
+            value={currentReview.songTitle || ""}
+            onChange={(e) => setCurrentReview((r) => (r ? { ...r, songTitle: e.target.value } : r))}
+            placeholder={t("upload.song_title_placeholder") || "Ej: Legalícenla"}
+            maxLength={500}
+            className="w-full rounded-lg bg-surface-1 border border-white/[0.08] focus:border-brand/50 px-3 py-2 text-sm text-gray-100 placeholder:text-gray-600 outline-none"
+            aria-label={t("editor.editing_title") || "Editar título"}
+          />
+        </div>
+      </div>
+      <p className="mt-2 text-[10px] text-gray-500">
+        {t("editor.editing_banner_hint") ||
+          "Cambios acá generan un re-render del title card sin tocar el resto del video."}
+      </p>
+    </div>
+  ) : null;
+
   const newBatchScreen = (
     <div className="w-full max-w-[1700px] mx-auto animate-fade-in">
       <div className="flex items-center gap-3 mb-8">
@@ -2678,10 +2737,21 @@ export default function App() {
           </svg>
         </button>
         <div>
-          <h1 className="text-2xl font-bold">{t("upload.new_batch")}</h1>
-          <p className="text-sm text-gray-500">{t("upload.new_batch_sub")}</p>
+          <h1 className="text-2xl font-bold">
+            {currentReview?.editMode
+              ? (t("editor.editing_wizard_title") || "Editar y re-renderizar")
+              : t("upload.new_batch")}
+          </h1>
+          <p className="text-sm text-gray-500">
+            {currentReview?.editMode
+              ? (t("editor.editing_wizard_sub") ||
+                  "Corregí cualquier campo y re-renderizá. Lo que no cambies queda igual.")
+              : t("upload.new_batch_sub")}
+          </p>
         </div>
       </div>
+
+      {editingHeaderBanner}
 
       {resumeBanner}
 
