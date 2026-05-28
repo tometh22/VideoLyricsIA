@@ -3015,9 +3015,19 @@ export default function App() {
             // restaura desde R2) y la key/filename caen al campo
             // `filename` que el resume handler popula del job DB.
             key={`${currentReview.file?.name || currentReview.filename || "resume"}:${currentReview.queueIdx}`}
-            // Clear the app's own sticky top bar (~72px) so the editor's
-            // sticky CTA header isn't hidden behind it in the wizard.
-            stickyHeaderTop={72}
+            // QA fix 2026-05-28 (scroll architecture): pre-fix usaba 72 para
+            // clear el top bar de App porque el editor scrolleaba con el
+            // page-scroll y el sticky-top-72 ponía el audio bar JUSTO
+            // abajo del top bar de App. Con el nuevo wizard layout
+            // viewport-bound, el editor monta dentro de la columna RIGHT
+            // de UploadZone (su propio scroll container, h-full). El top
+            // bar de App ya no afecta visualmente — el sticky del audio
+            // bar interno es relativo al scroll de la columna RIGHT, no
+            // al viewport. top=0 lo pega al top de su scroll container,
+            // que es justo abajo del banner stack del wizard. Sin cambio
+            // visual perceptible para el operador, pero conceptualmente
+            // correcto en el nuevo layout.
+            stickyHeaderTop={0}
             segments={currentReview.segments}
             filename={currentReview.file?.name || currentReview.filename || ""}
             audioFile={currentReview.file}
