@@ -7667,32 +7667,30 @@ async def request_edit(
         edit_params["bypass_content_validation"] = True
     if body.edit_type == "background" and body.force_content_validation:
         edit_params["force_content_validation"] = True
-    if body.edit_type == "metadata":
-        # PR C 2026-05-26 (feat/edit-metadata): persist the corrected
-        # artist/song_title onto the DB row BEFORE the worker spawns.
-        # `run_edit_pipeline` reads `job_row.artist` / `job_row.song_title`
-        # on its own DB session (pipeline.py:9101-9102) — by the time it
-        # queries, the values must already be the corrected ones.
-        # edit_params carries them too as a belt-and-suspenders for the
-        # AuditLog detail (operator sees what was sent).
-        #
-        # HOTFIX F1 2026-05-27 (audit): the pre-edit capture for rollback
-        # MUST happen BEFORE the optimistic in-memory mutation below.
-        # The previous version captured `_pre_edit_artist = job.artist`
-        # AFTER the assignments, which left _pre_edit_artist holding the
-        # NEW value — making the rollback in the enqueue-failure branch
-        # a no-op that silently confirmed unsaved edits to the operator.
-        _pre_edit_artist = job.artist
-        _pre_edit_song_title = job.song_title
-
-        new_artist = body.artist.strip() if body.artist is not None else None
-        new_title = body.song_title.strip() if body.song_title is not None else None
-        if new_artist:
-            job.artist = new_artist
-            edit_params["artist"] = new_artist
-        if new_title:
-            job.song_title = new_title
-            edit_params["song_title"] = new_title
+    # QA fix 2026-05-28 (edit-wizard consolidation): artist/song_title
+    # mutations ungated across edit_types. Before this, the fields only
+    # applied on edit_type=metadata; if the frontend sent a consolidated
+    # POST (e.g. edit_type=lyrics carrying a corrected title), the title
+    # silently dropped. The frontend's edit-wizard now bundles ALL diffs
+    # into ONE POST with the highest-priority edit_type to dodge the
+    # status gate (which 400'd when the previous loop fired a second
+    # POST while job.status was still "editing"). Backend needs to apply
+    # both axes.
+    #
+    # Validation: for explicit edit_type=metadata, at least one of artist
+    # /song_title must be non-empty after trim (line ~7404 — unchanged).
+    # For other edit_types, artist/song_title are OPTIONAL — apply when
+    # set + non-empty, ignore otherwise.
+    _new_artist = body.artist.strip() if body.artist is not None else None
+    _new_title = body.song_title.strip() if body.song_title is not None else None
+    _pre_edit_artist = job.artist
+    _pre_edit_song_title = job.song_title
+    if _new_artist:
+        job.artist = _new_artist
+        edit_params["artist"] = _new_artist
+    if _new_title:
+        job.song_title = _new_title
+        edit_params["song_title"] = _new_title
 
     # PR C 2026-05-26: metadata edits do NOT bump edit_count (see
     # rationale at the edit-cap gate above). All other types still
