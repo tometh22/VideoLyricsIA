@@ -97,6 +97,13 @@ export default function Landing({ onStart, onLogin, isLoggedIn = false }) {
     { q: t("faq.q4"), a: t("faq.a4") },
     { q: t("faq.q5"), a: t("faq.a5") },
     { q: t("faq.q6"), a: t("faq.a6") },
+    // Pricing model 2026-05-29: counting unit is songs, not renders.
+    // These two FAQs anchor the change at the public-facing surface so
+    // a prospect reading the landing page sees the policy before
+    // signing up. Worded explicitly to head off the "I made 3 variants
+    // of one song, did you charge me 3x?" question.
+    { q: t("faq.q7"), a: t("faq.a7") },
+    { q: t("faq.q8"), a: t("faq.a8") },
   ];
 
   return (
