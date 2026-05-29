@@ -422,7 +422,7 @@ export default function Settings({ onBack }) {
   );
 
   return (
-    <div className="w-full max-w-2xl animate-fade-in">
+    <div className="w-full max-w-3xl mx-auto animate-fade-in">
       {/* ─── Header ───────────────────────────────────────────────── */}
       <div className="flex items-end gap-3 mb-8">
         <button onClick={onBack}

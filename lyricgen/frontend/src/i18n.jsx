@@ -1269,6 +1269,57 @@ export const translations = {
     // Tour: paso final que descubre el botón de ayuda.
     "tour.dashboard_help_title": "Cualquier duda, acá",
     "tour.dashboard_help_body": "Este botón abre el centro de ayuda con FAQs, tutoriales y troubleshooting. También se abre con la tecla ?",
+
+    // ─── Dashboard rich: Hero dropzone (empty state focal CTA) ───
+    "dash.hero.title": "Arrastrá tu MP3 para empezar",
+    "dash.hero.sub": "O cliqueá para elegir. MP3 o WAV, hasta 5 archivos a la vez, 100 MB cada uno.",
+    "dash.hero.cta": "Subir audio",
+
+    // ─── Historial empty state hero ───
+    "history.empty_title": "Tu historial está vacío",
+    "history.empty_sub": "Cuando termines un lyric video va a aparecer acá, listo para descargar o aprobar.",
+    "history.empty_cta": "Crear tu primer video",
+
+    // ─── Upload empty hint ───
+    "upload.empty_hint": "Tip: para mejor calidad, usá audio sin clipping y con voz al frente de la mezcla.",
+
+    // ─── Dashboard rich: Stepper "Cómo funciona GenLy" ───
+    "dash.stepper.title": "Tu lyric video en 4 pasos",
+    "dash.stepper.dismiss": "Ocultar",
+    "dash.stepper.s1.label": "Subir",
+    "dash.stepper.s1.sub": "audio",
+    "dash.stepper.s1.body": "Arrastrás tu MP3 o WAV. Procesamos hasta 5 archivos simultáneos, 100 MB cada uno.",
+    "dash.stepper.s1.cta": "Subir audio →",
+    "dash.stepper.s2.label": "Transcribir",
+    "dash.stepper.s2.sub": "con tecnología propia",
+    "dash.stepper.s2.body": "Motor GenLy transcribe palabra-por-palabra en 6 idiomas, con corrector automático para reducir errores.",
+    "dash.stepper.s2.cta": "Ver más →",
+    "dash.stepper.s3.label": "Sincronizar",
+    "dash.stepper.s3.sub": "timestamps",
+    "dash.stepper.s3.body": "Sync automático con corrector inteligente. Si necesitás ajustar algo, editás a mano cualquier línea desde el editor.",
+    "dash.stepper.s3.cta": "Ver más →",
+    "dash.stepper.s4.label": "Renderizar",
+    "dash.stepper.s4.sub": "el video final",
+    "dash.stepper.s4.body": "Render en 1-3 minutos. Recibís MP4 1080p, Short vertical para Reels/TikTok y Thumbnail listos para subir.",
+    "dash.stepper.s4.cta": "Crear el primero →",
+
+    // ─── Dashboard rich: FormatGallery ───
+    "dash.formats.title": "Para qué usás GenLy hoy",
+    "dash.formats.sub": "Elegí el formato del entregable",
+    "dash.formats.upgrade_cta": "Subir de plan →",
+    "dash.formats.locked_chip": "Pro / Enterprise",
+    "dash.formats.youtube.title": "MP4 1080p",
+    "dash.formats.youtube.sub": "Para YouTube, web y plataformas estándar. El formato que necesitás el 90% de las veces.",
+    "dash.formats.youtube.cta": "Crear video",
+    "dash.formats.short.title": "Short vertical",
+    "dash.formats.short.sub": "9:16 para Instagram Reels, TikTok y YouTube Shorts. Se entrega junto al MP4.",
+    "dash.formats.short.cta": "Crear short",
+    "dash.formats.prores.title": "Master ProRes",
+    "dash.formats.prores.sub": "ProRes 422 HQ para broadcast, TV y archivo master. Calidad sin compresión visible.",
+    "dash.formats.prores.cta": "Crear con master",
+    "dash.formats.thumbnail.title": "Thumbnail JPG",
+    "dash.formats.thumbnail.sub": "Cover art para miniaturas de YouTube y portadas en redes. Se entrega con cada job.",
+    "dash.formats.thumbnail.cta": "Crear video",
   },
 
   en: {
@@ -2163,6 +2214,57 @@ export const translations = {
     "help.article.editor-stuck.body": "<p>If you enter the editor and it loads forever, or lyrics don't show up:</p><ol><li><strong>Reload the page</strong> (<kbd>Cmd/Ctrl</kbd>+<kbd>R</kbd>). Most issues clear up here.</li><li><strong>Try another browser</strong>: the editor uses Web Audio API; some old browsers don't support it well.</li><li><strong>Close other heavy tabs</strong>: if your machine is low on RAM, the editor may not initialize.</li><li><strong>Check the browser console</strong> (F12): red errors there are worth a screenshot.</li></ol><p>If you're still stuck after this, open a ticket with the job ID and the browser you use.</p>",
     "tour.dashboard_help_title": "Any doubt, here",
     "tour.dashboard_help_body": "This button opens the help center with FAQs, tutorials and troubleshooting. Also opens with the ? key.",
+
+    // ─── Dashboard rich: Hero dropzone (empty state focal CTA) ───
+    "dash.hero.title": "Drop your MP3 to start",
+    "dash.hero.sub": "Or click to pick one. MP3 or WAV, up to 5 files at once, 100 MB each.",
+    "dash.hero.cta": "Upload audio",
+
+    // ─── History empty state hero ───
+    "history.empty_title": "Your history is empty",
+    "history.empty_sub": "When you finish a lyric video it will show up here, ready to download or approve.",
+    "history.empty_cta": "Create your first video",
+
+    // ─── Upload empty hint ───
+    "upload.empty_hint": "Tip: for the best quality, use audio without clipping and with the vocal up-front in the mix.",
+
+    // ─── Dashboard rich: Stepper "How GenLy works" ───
+    "dash.stepper.title": "Your lyric video in 4 steps",
+    "dash.stepper.dismiss": "Hide",
+    "dash.stepper.s1.label": "Upload",
+    "dash.stepper.s1.sub": "audio",
+    "dash.stepper.s1.body": "Drop your MP3 or WAV. We process up to 5 files simultaneously, 100 MB each.",
+    "dash.stepper.s1.cta": "Upload audio →",
+    "dash.stepper.s2.label": "Transcribe",
+    "dash.stepper.s2.sub": "with our tech",
+    "dash.stepper.s2.body": "GenLy Engine transcribes word-by-word in 6 languages, with an automatic corrector to reduce errors.",
+    "dash.stepper.s2.cta": "Learn more →",
+    "dash.stepper.s3.label": "Sync",
+    "dash.stepper.s3.sub": "timestamps",
+    "dash.stepper.s3.body": "Automatic sync with smart corrector. Tweak any line by hand from the editor if you need to.",
+    "dash.stepper.s3.cta": "Learn more →",
+    "dash.stepper.s4.label": "Render",
+    "dash.stepper.s4.sub": "the final video",
+    "dash.stepper.s4.body": "Render in 1-3 minutes. You get MP4 1080p, vertical Short for Reels/TikTok and Thumbnail ready to publish.",
+    "dash.stepper.s4.cta": "Create your first →",
+
+    // ─── Dashboard rich: FormatGallery ───
+    "dash.formats.title": "What are you using GenLy for today?",
+    "dash.formats.sub": "Pick the delivery format",
+    "dash.formats.upgrade_cta": "Upgrade plan →",
+    "dash.formats.locked_chip": "Pro / Enterprise",
+    "dash.formats.youtube.title": "MP4 1080p",
+    "dash.formats.youtube.sub": "For YouTube, web and standard platforms. The format you'll need 90% of the time.",
+    "dash.formats.youtube.cta": "Create video",
+    "dash.formats.short.title": "Vertical Short",
+    "dash.formats.short.sub": "9:16 for Instagram Reels, TikTok and YouTube Shorts. Comes with the MP4.",
+    "dash.formats.short.cta": "Create short",
+    "dash.formats.prores.title": "ProRes Master",
+    "dash.formats.prores.sub": "ProRes 422 HQ for broadcast, TV and master archive. Quality without visible compression.",
+    "dash.formats.prores.cta": "Create with master",
+    "dash.formats.thumbnail.title": "Thumbnail JPG",
+    "dash.formats.thumbnail.sub": "Cover art for YouTube thumbnails and social covers. Delivered with every job.",
+    "dash.formats.thumbnail.cta": "Create video",
   },
 
   pt: {
@@ -3040,6 +3142,57 @@ export const translations = {
     "help.article.editor-stuck.body": "<p>Se entrou no editor e fica em loading infinito, ou lyrics não aparecem:</p><ol><li><strong>Recarregue a página</strong> (<kbd>Cmd/Ctrl</kbd>+<kbd>R</kbd>). A maioria dos problemas resolve aqui.</li><li><strong>Teste outro navegador</strong>: o editor usa Web Audio API; navegadores antigos não suportam bem.</li><li><strong>Feche outras abas pesadas</strong>: se sua máquina está com pouca RAM, o editor pode não inicializar.</li><li><strong>Veja o console do navegador</strong> (F12): erros em vermelho valem um screenshot.</li></ol><p>Se ainda travado depois disso, abra um ticket com o ID do job e o navegador usado.</p>",
     "tour.dashboard_help_title": "Qualquer dúvida, aqui",
     "tour.dashboard_help_body": "Este botão abre o centro de ajuda com FAQs, tutoriais e troubleshooting. Também abre pela tecla ?",
+
+    // ─── Dashboard rich: Hero dropzone (empty state focal CTA) ───
+    "dash.hero.title": "Solte seu MP3 para começar",
+    "dash.hero.sub": "Ou clique para escolher. MP3 ou WAV, até 5 arquivos por vez, 100 MB cada.",
+    "dash.hero.cta": "Enviar áudio",
+
+    // ─── History empty state hero ───
+    "history.empty_title": "Seu histórico está vazio",
+    "history.empty_sub": "Quando terminar um lyric video vai aparecer aqui, pronto para baixar ou aprovar.",
+    "history.empty_cta": "Criar seu primeiro vídeo",
+
+    // ─── Upload empty hint ───
+    "upload.empty_hint": "Dica: para melhor qualidade, use áudio sem clipping e com vocal na frente da mix.",
+
+    // ─── Dashboard rich: Stepper "Como o GenLy funciona" ───
+    "dash.stepper.title": "Seu lyric video em 4 passos",
+    "dash.stepper.dismiss": "Ocultar",
+    "dash.stepper.s1.label": "Enviar",
+    "dash.stepper.s1.sub": "áudio",
+    "dash.stepper.s1.body": "Solte seu MP3 ou WAV. Processamos até 5 arquivos simultâneos, 100 MB cada.",
+    "dash.stepper.s1.cta": "Enviar áudio →",
+    "dash.stepper.s2.label": "Transcrever",
+    "dash.stepper.s2.sub": "com tecnologia própria",
+    "dash.stepper.s2.body": "Motor GenLy transcreve palavra-por-palavra em 6 idiomas, com corretor automático para reduzir erros.",
+    "dash.stepper.s2.cta": "Ver mais →",
+    "dash.stepper.s3.label": "Sincronizar",
+    "dash.stepper.s3.sub": "timestamps",
+    "dash.stepper.s3.body": "Sync automático com corretor inteligente. Ajuste qualquer linha à mão pelo editor se precisar.",
+    "dash.stepper.s3.cta": "Ver mais →",
+    "dash.stepper.s4.label": "Renderizar",
+    "dash.stepper.s4.sub": "o vídeo final",
+    "dash.stepper.s4.body": "Render em 1-3 minutos. Recebe MP4 1080p, Short vertical para Reels/TikTok e Thumbnail prontos para publicar.",
+    "dash.stepper.s4.cta": "Criar o primeiro →",
+
+    // ─── Dashboard rich: FormatGallery ───
+    "dash.formats.title": "Para que você usa GenLy hoje?",
+    "dash.formats.sub": "Escolha o formato de entrega",
+    "dash.formats.upgrade_cta": "Fazer upgrade →",
+    "dash.formats.locked_chip": "Pro / Enterprise",
+    "dash.formats.youtube.title": "MP4 1080p",
+    "dash.formats.youtube.sub": "Para YouTube, web e plataformas padrão. O formato que você precisa 90% das vezes.",
+    "dash.formats.youtube.cta": "Criar vídeo",
+    "dash.formats.short.title": "Short vertical",
+    "dash.formats.short.sub": "9:16 para Instagram Reels, TikTok e YouTube Shorts. Vem junto com o MP4.",
+    "dash.formats.short.cta": "Criar short",
+    "dash.formats.prores.title": "Master ProRes",
+    "dash.formats.prores.sub": "ProRes 422 HQ para broadcast, TV e arquivo master. Qualidade sem compressão visível.",
+    "dash.formats.prores.cta": "Criar com master",
+    "dash.formats.thumbnail.title": "Thumbnail JPG",
+    "dash.formats.thumbnail.sub": "Cover art para miniaturas YouTube e capas em redes. Entregue com cada job.",
+    "dash.formats.thumbnail.cta": "Criar vídeo",
   },
 };
 

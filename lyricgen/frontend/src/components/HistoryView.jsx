@@ -1,6 +1,10 @@
 import { useState, useMemo, useEffect, useRef, memo } from "react";
+import { useNavigate } from "react-router-dom";
 import { useI18n } from "../i18n";
 import { useLazyMediaUrl } from "../mediaUrl";
+// Reusing the hero dropzone styles from the Dashboard's empty state so the
+// app feels consistent when you land on an empty page (Inicio vs Historial).
+import "./DashboardRich/DashboardRich.css";
 
 const API = import.meta.env.VITE_API_URL || "";
 
@@ -680,6 +684,7 @@ export default function HistoryView({
   onBack,
 }) {
   const { t } = useI18n();
+  const navigate = useNavigate();
   const [filter, setFilter] = useState("all");
   const [selectedIds, setSelectedIds] = useState(() => new Set());
   // 2026-05-25 PR-3 — Estado nuevo: search query (inline), sort key,
@@ -830,7 +835,7 @@ export default function HistoryView({
   const selectedCount = selectedIds.size;
 
   return (
-    <div className="w-full max-w-4xl animate-fade-in">
+    <div className="w-full max-w-[1700px] mx-auto animate-fade-in">
       {/* ─── Header ─────────────────────────────────────────────── */}
       <div className="flex items-end justify-between mb-8">
         <div className="flex items-center gap-3">
@@ -1080,26 +1085,59 @@ export default function HistoryView({
           )}
         </div>
       ) : visible.length === 0 ? (
-        <div className="rounded-card p-14 text-center bg-surface-2/30 ring-1 ring-white/[0.04]">
-          {query.trim() ? (
-            <>
-              <p className="text-sm text-ink-secondary mb-3">
-                No encontramos videos para <span className="font-mono text-white">"{query.trim()}"</span>
-              </p>
-              <button
-                type="button"
-                onClick={() => setQuery("")}
-                className="text-xs text-brand-light hover:text-white transition-colors underline-offset-2 hover:underline"
-              >
-                Limpiar búsqueda
-              </button>
-            </>
-          ) : (
-            <p className="text-sm text-ink-secondary">
-              {history.length === 0 ? t("history.empty") : "No hay videos en esta vista"}
+        query.trim() ? (
+          /* Search returned no results — keep the small card, the user
+             is mid-query and a giant hero would feel jarring. */
+          <div className="rounded-card p-14 text-center bg-surface-2/30 ring-1 ring-white/[0.04] max-w-2xl mx-auto">
+            <p className="text-sm text-ink-secondary mb-3">
+              No encontramos videos para <span className="font-mono text-white">"{query.trim()}"</span>
             </p>
-          )}
-        </div>
+            <button
+              type="button"
+              onClick={() => setQuery("")}
+              className="text-xs text-brand-light hover:text-white transition-colors underline-offset-2 hover:underline"
+            >
+              Limpiar búsqueda
+            </button>
+          </div>
+        ) : history.length === 0 ? (
+          /* True empty state — first-time user lands here. Mirror the
+             hero dropzone from the Dashboard so the CTA is unmistakable.
+             UX 2026-05-29: replaced the chiquito card alineado izquierda
+             that left ~1000px of void on wide viewports. */
+          <button
+            type="button"
+            onClick={() => navigate("/new")}
+            className="dr-hero-drop w-full block group"
+            aria-label={t("history.empty_cta") || "Crear tu primer video"}
+          >
+            <div className="dr-hero-drop-inner">
+              <div className="dr-hero-drop-icon" aria-hidden="true">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round">
+                  <path d="M9 18V5l12-2v13"/><circle cx="6" cy="18" r="3"/><circle cx="18" cy="16" r="3"/>
+                </svg>
+              </div>
+              <h2 className="dr-hero-drop-title">
+                {t("history.empty_title") || "Tu historial está vacío"}
+              </h2>
+              <p className="dr-hero-drop-sub">
+                {t("history.empty_sub") || "Cuando termines un lyric video va a aparecer acá, listo para descargar o aprobar."}
+              </p>
+              <span className="dr-hero-drop-cta">
+                {t("history.empty_cta") || "Crear tu primer video"}
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5"><path d="M5 12h14M13 5l7 7-7 7" strokeLinecap="round" strokeLinejoin="round"/></svg>
+              </span>
+            </div>
+          </button>
+        ) : (
+          /* "Filter cleared this view but user has history elsewhere" —
+             midweight card centrado. */
+          <div className="rounded-card p-14 text-center bg-surface-2/30 ring-1 ring-white/[0.04] max-w-2xl mx-auto">
+            <p className="text-sm text-ink-secondary">
+              No hay videos en esta vista
+            </p>
+          </div>
+        )
       ) : view === "table" ? (
         /* TABLA DENSA con sticky date group headers (PR-3 2026-05-25) */
         <div className="space-y-2">
