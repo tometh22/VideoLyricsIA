@@ -92,7 +92,7 @@ export default function UsageBadge({ user }) {
       <div className="px-3 py-2 rounded-xl bg-surface-2/30">
         <div className={`text-[11px] font-medium ${textTone} flex items-center justify-between`}>
           <span>
-            {used} / {limit} {t("sidebar.usage.songs_this_month") || "canciones este mes"}
+            {used} / {limit} {t("sidebar.usage.this_month") || "este mes"}
           </span>
           <span className="text-[10px] opacity-70">{percent}%</span>
         </div>
