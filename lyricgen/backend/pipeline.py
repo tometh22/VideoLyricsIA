@@ -504,7 +504,16 @@ def run_pipeline(job_id: str, mp3_path: str, artist: str, style: str,
                  # ~$0.80-3.20 de cuota. Ver bg_preview.py para el hash y el
                  # path en R2. None = no chequear cache (fallback al flow
                  # tradicional de Veo/Imagen inline).
-                 bg_cache_key: str | None = None):
+                 bg_cache_key: str | None = None,
+                 # 2026-05-29 (D): background_id del BackgroundAsset elegido
+                 # por el operador, cuando vino de la librería. Se persiste
+                 # en render_params para que `run_edit_pipeline` pueda
+                 # re-resolverlo y descargar el preset de R2 sin tener
+                 # que regenerar con Veo cuando bg_r2_key_cached quede
+                 # NULL por cualquier razón (silent upload fail, jobs
+                 # previos al PR #480, etc.). None = AI-gen / uploaded /
+                 # variation, ningún preset persistido para fallback.
+                 background_id: int | None = None):
     """Run the full pipeline for a job. Called synchronously.
 
     delivery_profile:
@@ -820,6 +829,12 @@ def run_pipeline(job_id: str, mp3_path: str, artist: str, style: str,
             _new_rp["bg_verbatim"] = True
         if custom_colors:
             _new_rp["custom_colors"] = custom_colors
+        # 2026-05-29 (D): persist background_id when it came from the
+        # library so run_edit_pipeline has a fallback path if the cached
+        # bg upload fails or was never attempted. merge_render_params
+        # ignores None values so passing it unconditionally is safe.
+        if background_id is not None:
+            _new_rp["background_id"] = int(background_id)
         # U5 (audit 2026-05-25): merge atómico vía jobs.merge_render_params.
         # El read-then-write fuera de un row lock dejaba race: 2 callers
         # concurrentes (worker + /edit endpoint, o 2 /edit calls) podían
@@ -8192,6 +8207,10 @@ def _render_lyrics_ass(
         text_scale=scale,
         lyric_font_family=family,
         artist_font_family=artist_family,
+        # Real font files so long titles/artists are shrunk (then wrapped)
+        # to the safe card width instead of overflowing the frame.
+        lyric_font_path=font_path,
+        artist_font_path=extrabold_font,
     )
     base_fs = _ass.lyric_fontsize(40, scale, font_scale)
     # Reusamos el mapping primary/secondary computado arriba para
@@ -8495,8 +8514,14 @@ def generate_lyric_video(
         if not os.path.exists(extrabold_font):
             extrabold_font = font  # graceful fallback
 
-        artist_upper = artist.upper() if artist else ""
-        title_display = title_song if title_song else ""
+        # NFC-normalise so decomposed accents from macOS filenames (e.g.
+        # "Así" as 'i'+combining-acute) render attached, not as a floating
+        # mark — parity with the libass path's title_card_lines. The moviepy
+        # caption method already word-wraps within card_width, so no overflow
+        # shrink is needed on this fallback path.
+        import unicodedata as _unicodedata
+        artist_upper = _unicodedata.normalize("NFC", artist).upper() if artist else ""
+        title_display = _unicodedata.normalize("NFC", title_song) if title_song else ""
 
         # The title card MUST always appear — users (UMG, internal QA)
         # want the artist+song readable on every video. Two layouts:
@@ -9188,6 +9213,12 @@ def run_edit_pipeline(
         umg_spec = job_row.umg_spec
         tenant_id = job_row.tenant_id
         bg_r2_key_cached = job_row.bg_r2_key_cached
+        # 2026-05-29 (D): when the original render used a library preset,
+        # background_id was persisted into render_params. If the dedicated
+        # cache is missing (silent upload fail, or job rendered pre-#480),
+        # we can fall back to re-resolving the same library asset and
+        # downloading it again — cheaper than regenerating with Veo.
+        fallback_background_id = base_params.get("background_id")
         input_r2_key = job_row.input_r2_key
         # Snapshot inputs: edit_count was already incremented by the /edit
         # handler before enqueuing, so it's the "version we're about to
@@ -9264,10 +9295,60 @@ def run_edit_pipeline(
             update_job(job_id, status="editing", current_step="video", progress=35)
             bg_image_path = os.path.join(job_dir, "bg_cached_edit.mp4")
             if not os.path.exists(bg_image_path):
+                # Primary path: dedicated cached copy uploaded post-render.
                 if bg_r2_key_cached and storage.is_enabled():
                     ok = storage.download_object(bg_r2_key_cached, bg_image_path)
                     if not ok:
                         raise RuntimeError("Could not download cached background from R2")
+                # 2026-05-29 (D): library-preset fallback. The original
+                # render used a BackgroundAsset from the library and we
+                # persisted its id into render_params. Re-resolve the asset
+                # and download it. This avoids charging the operator $0.90
+                # for a Veo regen just because the cache upload silently
+                # failed or never ran (pre-#480 jobs).
+                elif fallback_background_id and storage.is_enabled():
+                    try:
+                        from database import SessionLocal as _SL, BackgroundAsset
+                        with _SL() as _db:
+                            _asset = (
+                                _db.query(BackgroundAsset)
+                                .filter(BackgroundAsset.id == int(fallback_background_id))
+                                .filter(BackgroundAsset.is_active == True)
+                                .first()
+                            )
+                        if not _asset:
+                            raise RuntimeError(
+                                f"No cached background and library asset "
+                                f"{fallback_background_id} is gone. Use "
+                                f"edit_type='background' to regenerate."
+                            )
+                        # asset.filename is the R2 key when it starts with
+                        # "library/" (set by the upload flow). Preserve the
+                        # source extension so jpg/png presets work too.
+                        _src_ext = os.path.splitext(_asset.filename)[1].lower() or ".mp4"
+                        if _src_ext != ".mp4":
+                            bg_image_path = os.path.join(job_dir, f"bg_cached_edit{_src_ext}")
+                        ok = storage.download_object(_asset.filename, bg_image_path)
+                        if not ok:
+                            raise RuntimeError(
+                                f"Library asset {fallback_background_id} found but R2 "
+                                f"download failed. Use edit_type='background' to regenerate."
+                            )
+                        logger.info(
+                            "[EDIT] bg cache missing — fell back to library asset id=%s key=%s",
+                            fallback_background_id, _asset.filename,
+                        )
+                    except RuntimeError:
+                        raise
+                    except Exception as _bg_fb_exc:
+                        # Non-RuntimeError (DB lookup blew up, etc.) — surface
+                        # as the same gate error so the operator at least sees
+                        # the bg-regen path.
+                        raise RuntimeError(
+                            f"No cached background available for {edit_type} edit "
+                            f"(fallback lookup failed: {_bg_fb_exc}). "
+                            f"Use edit_type='background' to regenerate it."
+                        )
                 else:
                     raise RuntimeError(
                         f"No cached background available for {edit_type} edit. "

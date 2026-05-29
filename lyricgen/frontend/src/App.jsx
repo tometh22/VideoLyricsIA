@@ -15,6 +15,7 @@ import Dashboard from "./components/Dashboard";
 import HistoryView from "./components/HistoryView";
 import SearchPalette from "./components/SearchPalette";
 import UploadZone from "./components/UploadZone";
+import TitleCardPreview from "./components/TitleCardPreview";
 // 2026-05-27 Phase-2 audit: LyricsEditor (~85 KB), AdminPanel (~50 KB)
 // and Settings (~30 KB) lazy-load so the main bundle drops below
 // 500 KB on the first paint. The editor in particular is only entered
@@ -3004,6 +3005,17 @@ export default function App() {
               aria-label={t("editor.editing_title") || "Editar título"}
             />
           </div>
+        </div>
+        {/* Live title-card preview: shows the operator how the intro title
+            card will look (and whether a long title/artist gets shrunk or
+            wrapped) BEFORE the ~5-10 min re-render. Updates as they type.
+            Approximate — mirrors ass_render.fit_title_text, not pixel-exact. */}
+        <div className="w-full sm:w-[320px] mt-3">
+          <TitleCardPreview
+            artist={currentReview.artist || ""}
+            song={currentReview.songTitle || ""}
+            label={t("editor.title_card_preview") || "Vista previa de la portada"}
+          />
         </div>
       </div>
     </div>

@@ -3577,6 +3577,8 @@ async def upload(
         background_path=bg_path,
         input_r2_key=input_r2_key,
         bg_r2_key=bg_r2_key,
+        # 2026-05-29 (D): persist background_id for edit-fallback (see PR #481).
+        background_id=background_id,
         variation_source_path=variation_source_path,
         variation_source_r2_key=variation_source_r2_key,
         variation_parent_asset_id=variation_parent_id,
@@ -5835,6 +5837,9 @@ async def generate_with_segments(
         background_path=bg_path,
         input_r2_key=input_r2_key,
         bg_r2_key=bg_r2_key,
+        # 2026-05-29 (D): forward background_id so the worker can persist
+        # it in render_params for edit-fallback. None when AI-gen / uploaded.
+        background_id=background_id,
         variation_source_path=variation_source_path,
         variation_source_r2_key=variation_source_r2_key,
         variation_parent_asset_id=variation_parent_id,
@@ -7610,7 +7615,16 @@ async def request_edit(
     # Typography, lyrics, and metadata reuse the cached background. Without
     # bg_r2_key_cached set, the worker can't avoid re-running Veo —
     # which defeats the point of these fast-path edits.
-    if body.edit_type in ("typography", "lyrics", "metadata") and not job.bg_r2_key_cached:
+    #
+    # 2026-05-29 (D): also accept render_params.background_id as a fallback
+    # source. The pipeline edit worker (pipeline.py:9258) knows how to
+    # re-resolve a library asset by id and download it — no Veo cost.
+    # This unblocks edits on library-bg jobs whose dedicated cache was
+    # never written (silent upload failure or pre-#480 renders).
+    _rp = job.render_params or {}
+    if body.edit_type in ("typography", "lyrics", "metadata") and not (
+        job.bg_r2_key_cached or _rp.get("background_id")
+    ):
         raise HTTPException(
             status_code=400,
             detail=(
@@ -8407,7 +8421,11 @@ async def retry_job(
               # Lyric text colors 2026-05-25 — heredables igual que
               # custom_colors, así los re-renders/variantes mantienen el
               # color elegido por el operador.
-              "lyric_color", "lyric_sung_color"):
+              "lyric_color", "lyric_sung_color",
+              # 2026-05-29 (D): background_id heredable para que retries
+              # de jobs con preset de librería re-persistan el id en
+              # render_params (idempotente — el merge ignora None).
+              "background_id"):
         if k in _retry_render_params and _retry_render_params[k] not in (None, ""):
             retry_pipeline_kwargs[k] = _retry_render_params[k]
 
@@ -8469,6 +8487,23 @@ class VariantJobRequest(BaseModel):
     concept: str | None = Field(default=None, max_length=2000)
     # Override del style preset (gradient palette + visual register).
     style: str | None = Field(default=None, max_length=50)
+    # 2026-05-29 — Variant cap policy: each plan includes 3 renders of
+    # the same song (original + 2 variants). The 4th onward costs
+    # VARIANT_OVERAGE_COST_USD passthrough (Veo background generation
+    # fee). The endpoint returns 402 with `code: variant_overage_unconfirmed`
+    # if the operator tries to create the 4th+ without setting this flag.
+    # Re-submit with `acknowledge_variant_overage: true` to proceed and
+    # accept the charge. The acknowledgement is logged via AuditLog so
+    # month-close billing surfaces the line items per tenant.
+    acknowledge_variant_overage: bool = Field(default=False)
+
+
+# Variant-overage policy constants. Module-level so tests can monkey-
+# patch them and operators can grep for the magic numbers from the FAQ
+# without spelunking through endpoint code.
+VARIANT_INCLUDED_PER_SONG = 3  # original + 2 variants free; 4th+ paid.
+VARIANT_OVERAGE_COST_USD = 0.90  # Veo cost passthrough — keep in sync
+                                  # with FAQ #7 and PLANS["250"] comment.
 
 
 @app.post("/jobs/{parent_job_id}/variant")
@@ -8559,9 +8594,106 @@ async def create_variant(
     if usage_info.get("alert_100") and not (user_model and user_model.allow_overage):
         raise HTTPException(
             status_code=402,
-            detail=f"Llegaste al límite de tu plan ({usage_info.get('limit', '?')} videos). "
+            detail=f"Llegaste al límite de tu plan ({usage_info.get('limit', '?')} canciones). "
                    f"Activá overage o subí de plan para crear más variantes.",
         )
+
+    # 2026-05-29 — Variant cap policy. Each plan includes 3 renders of the
+    # same song (original + 2 variants); the 4th onward costs
+    # VARIANT_OVERAGE_COST_USD passthrough.
+    #
+    # "Same song" identity matches get_plan_usage (auth.py): LOWER(TRIM(...))
+    # on artist + song_title. We count every existing render of the song
+    # in this tenant — including the parent — that isn't in a bg_preview /
+    # deleted-equivalent state. Renders in `error`, `validation_failed`,
+    # `pending_review`, `editing`, `queued`, `processing`, `done`,
+    # `rejected` all consume Veo at some point and therefore consume the
+    # included-variants budget.
+    #
+    # `bg_preview_*` jobs are ephemeral background-browse helpers, NOT
+    # rendered videos — they have their own cleanup thread (main.py:562)
+    # and never count toward variant cap.
+    #
+    # `transcribed_pending` is excluded because no Veo render fired yet
+    # (the operator hasn't /generate'd from the transcribe sandbox);
+    # those rows can disappear via supersede without cost.
+    from sqlalchemy import func as _sql_func
+    _song_artist = (parent.artist or "").strip().lower()
+    _song_title = (parent.song_title or "").strip().lower()
+    _RENDERED_OR_PENDING = (
+        "queued", "processing", "pending_review", "editing", "done",
+        "rejected", "error", "validation_failed",
+    )
+    existing_renders = (
+        db.query(JobModel)
+        .filter(JobModel.tenant_id == current_user["tenant_id"])
+        .filter(_sql_func.lower(_sql_func.trim(JobModel.artist)) == _song_artist)
+        .filter(
+            _sql_func.lower(
+                _sql_func.coalesce(_sql_func.trim(JobModel.song_title), "")
+            ) == _song_title
+        )
+        .filter(JobModel.status.in_(_RENDERED_OR_PENDING))
+        .count()
+    )
+    # existing_renders includes the parent (1) + every prior sibling.
+    # A would-be NEW variant is the (existing_renders + 1)-th render.
+    # If that exceeds VARIANT_INCLUDED_PER_SONG, charge overage.
+    would_be_render_n = existing_renders + 1
+    if would_be_render_n > VARIANT_INCLUDED_PER_SONG:
+        if not body.acknowledge_variant_overage:
+            # Operator hasn't acknowledged the extra charge. Return a
+            # structured 402 so the frontend can show a confirm modal
+            # with the exact cost + count, then retry with the ack flag.
+            # Status 402 (Payment Required) is the standard HTTP code
+            # for "this action costs money beyond the plan".
+            raise HTTPException(
+                status_code=402,
+                detail={
+                    "code": "variant_overage_unconfirmed",
+                    "message": (
+                        f"Esta canción ya tiene {existing_renders} versiones "
+                        f"renderizadas (incluido el original). El plan incluye "
+                        f"{VARIANT_INCLUDED_PER_SONG} versiones por canción; "
+                        f"a partir de la {VARIANT_INCLUDED_PER_SONG + 1}ª se "
+                        f"factura ${VARIANT_OVERAGE_COST_USD:.2f} adicional al "
+                        f"cierre del mes. Confirmá enviando "
+                        f"`acknowledge_variant_overage: true` para proceder."
+                    ),
+                    "existing_renders": existing_renders,
+                    "included_per_song": VARIANT_INCLUDED_PER_SONG,
+                    "cost_extra_usd": VARIANT_OVERAGE_COST_USD,
+                    "artist": parent.artist,
+                    "song_title": parent.song_title,
+                },
+            )
+        # Acknowledged. Log to AuditLog for month-close billing —
+        # tenant ops will run a SUM(cost_usd) over audit rows with
+        # action="variant.overage_charge" to invoice the extra videos.
+        # We don't write to the Invoice table directly because the
+        # billing cycle batches at month-close; storing here keeps the
+        # signal close to the operator action and decouples from the
+        # batch job timing.
+        db.add(AuditLog(
+            user_id=current_user["id"],
+            action="variant.overage_charge",
+            detail={
+                "parent_job_id": parent_job_id,
+                "tenant_id": current_user["tenant_id"],
+                "artist": parent.artist,
+                "song_title": parent.song_title,
+                "existing_renders_before_this_one": existing_renders,
+                "would_be_render_number": would_be_render_n,
+                "cost_usd": VARIANT_OVERAGE_COST_USD,
+                "policy": {
+                    "included_per_song": VARIANT_INCLUDED_PER_SONG,
+                    "overage_cost_usd": VARIANT_OVERAGE_COST_USD,
+                },
+            },
+        ))
+        # Commit the audit row eagerly so a crash between here and
+        # the job-create-flush doesn't lose the billing event.
+        db.commit()
 
     # Merge: render_params del padre + overrides del body.
     parent_render_params = dict(parent.render_params or {})
