@@ -3577,6 +3577,8 @@ async def upload(
         background_path=bg_path,
         input_r2_key=input_r2_key,
         bg_r2_key=bg_r2_key,
+        # 2026-05-29 (D): persist background_id for edit-fallback (see PR #481).
+        background_id=background_id,
         variation_source_path=variation_source_path,
         variation_source_r2_key=variation_source_r2_key,
         variation_parent_asset_id=variation_parent_id,
@@ -5835,6 +5837,9 @@ async def generate_with_segments(
         background_path=bg_path,
         input_r2_key=input_r2_key,
         bg_r2_key=bg_r2_key,
+        # 2026-05-29 (D): forward background_id so the worker can persist
+        # it in render_params for edit-fallback. None when AI-gen / uploaded.
+        background_id=background_id,
         variation_source_path=variation_source_path,
         variation_source_r2_key=variation_source_r2_key,
         variation_parent_asset_id=variation_parent_id,
@@ -7610,7 +7615,16 @@ async def request_edit(
     # Typography, lyrics, and metadata reuse the cached background. Without
     # bg_r2_key_cached set, the worker can't avoid re-running Veo —
     # which defeats the point of these fast-path edits.
-    if body.edit_type in ("typography", "lyrics", "metadata") and not job.bg_r2_key_cached:
+    #
+    # 2026-05-29 (D): also accept render_params.background_id as a fallback
+    # source. The pipeline edit worker (pipeline.py:9258) knows how to
+    # re-resolve a library asset by id and download it — no Veo cost.
+    # This unblocks edits on library-bg jobs whose dedicated cache was
+    # never written (silent upload failure or pre-#480 renders).
+    _rp = job.render_params or {}
+    if body.edit_type in ("typography", "lyrics", "metadata") and not (
+        job.bg_r2_key_cached or _rp.get("background_id")
+    ):
         raise HTTPException(
             status_code=400,
             detail=(
@@ -8407,7 +8421,11 @@ async def retry_job(
               # Lyric text colors 2026-05-25 — heredables igual que
               # custom_colors, así los re-renders/variantes mantienen el
               # color elegido por el operador.
-              "lyric_color", "lyric_sung_color"):
+              "lyric_color", "lyric_sung_color",
+              # 2026-05-29 (D): background_id heredable para que retries
+              # de jobs con preset de librería re-persistan el id en
+              # render_params (idempotente — el merge ignora None).
+              "background_id"):
         if k in _retry_render_params and _retry_render_params[k] not in (None, ""):
             retry_pipeline_kwargs[k] = _retry_render_params[k]
 
