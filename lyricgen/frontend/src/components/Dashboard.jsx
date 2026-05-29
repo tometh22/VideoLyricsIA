@@ -1,10 +1,19 @@
 import { useState, useEffect, useMemo } from "react";
+import { useNavigate } from "react-router-dom";
 import { useI18n } from "../i18n";
 import { useMediaUrl } from "../mediaUrl";
 import { fetchWithTimeout } from "../fetchWithTimeout";
 import { DashboardTour } from "./OnboardingTour";
 import ProResBadge from "./ProResBadge";
 import { SkeletonVideoCard } from "./Skeleton";
+import DashboardStepper from "./DashboardRich/Stepper";
+import FormatGallery from "./DashboardRich/FormatGallery";
+import "./DashboardRich/DashboardRich.css";
+
+// sessionStorage key the wizard reads on mount to pre-apply a delivery
+// profile / short flag picked from the FormatGallery on home. Keeps the
+// coupling loose: UploadZone consumes if present, ignores if not.
+export const FORMAT_PRESET_KEY = "genly_format_preset";
 
 const API = import.meta.env.VITE_API_URL || "";
 
@@ -114,6 +123,27 @@ function VideoCard({ job, onSelect }) {
 
 export default function Dashboard({ user, history, historyError, historyLoaded = true, onRetryHistory, onSelectJob, onNewBatch, onViewHistory, onOpenSearch }) {
   const { t } = useI18n();
+  const navigate = useNavigate();
+
+  // FormatGallery handlers.
+  // - "youtube"/"prores"/"thumbnail" cards: stash the preset in sessionStorage
+  //   so UploadZone (or whoever consumes /new next) can read it once on mount
+  //   and clear it. Then trigger the regular new-batch navigation.
+  // - "short" today is not a separate delivery profile — every job already
+  //   produces an MP4 + short bundle. We still pre-fill the preset so the
+  //   wizard can later decide to highlight short-related options.
+  // - Locked ProRes (free plan) routes to billing instead.
+  const handleSelectFormat = (fmt) => {
+    try {
+      const preset = { id: fmt.id, profile: fmt.profile, subType: fmt.subType || null };
+      sessionStorage.setItem(FORMAT_PRESET_KEY, JSON.stringify(preset));
+    } catch {}
+    if (typeof onNewBatch === "function") onNewBatch();
+    else navigate("/new");
+  };
+  const handleUpgrade = () => {
+    navigate("/account");
+  };
 
   // 2026-05-27 perf audit (UMG micro-freezes): four `history.filter()`
   // calls re-ran on EVERY render — including every SSE poll tick (every
@@ -531,6 +561,26 @@ export default function Dashboard({ user, history, historyError, historyLoaded =
           )}
         </div>
       )}
+
+      {/* ─── DashboardRich: Stepper + FormatGallery (PR #462) ─────────
+            Educan flujo + venden formatos. Stepper es dismissible
+            (localStorage). FormatGallery segmenta ProRes por plan. ─── */}
+      <DashboardStepper
+        onPrimaryAction={(stepIdx) => {
+          // Step 1 (Subir) + Step 4 (Renderizar) → arrancan upload.
+          // Steps 2/3 → no-op (decorativos por ahora; futuros enlaces al
+          // help center cuando llegue a main).
+          if (stepIdx === 0 || stepIdx === 3) {
+            if (typeof onNewBatch === "function") onNewBatch();
+            else navigate("/new");
+          }
+        }}
+      />
+      <FormatGallery
+        user={user}
+        onSelectFormat={handleSelectFormat}
+        onUpgrade={handleUpgrade}
+      />
 
       {/* ─── Tus últimos videos — visual scan, NOT a copy of History ── */}
       {recentDone.length > 0 && (
