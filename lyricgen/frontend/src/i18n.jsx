@@ -1275,6 +1275,10 @@ export const translations = {
     "dash.hero.sub": "O cliqueá para elegir. MP3 o WAV, hasta 5 archivos a la vez, 100 MB cada uno.",
     "dash.hero.cta": "Subir audio",
 
+    // ─── Dashboard rich: Empty state para usuarios veteranos (hotfix 2026-05-29) ───
+    "dash.no_recent_title": "Nada por revisar ahora",
+    "dash.no_recent_sub": "Si esperabas ver tu historial y no aparece, probá recargar la página.",
+
     // ─── Historial empty state hero ───
     "history.empty_title": "Tu historial está vacío",
     "history.empty_sub": "Cuando termines un lyric video va a aparecer acá, listo para descargar o aprobar.",
@@ -2220,6 +2224,10 @@ export const translations = {
     "dash.hero.sub": "Or click to pick one. MP3 or WAV, up to 5 files at once, 100 MB each.",
     "dash.hero.cta": "Upload audio",
 
+    // ─── Dashboard rich: Veteran-user empty state (hotfix 2026-05-29) ───
+    "dash.no_recent_title": "Nothing to review right now",
+    "dash.no_recent_sub": "If you expected to see your history and it's not here, try reloading the page.",
+
     // ─── History empty state hero ───
     "history.empty_title": "Your history is empty",
     "history.empty_sub": "When you finish a lyric video it will show up here, ready to download or approve.",
@@ -3147,6 +3155,10 @@ export const translations = {
     "dash.hero.title": "Solte seu MP3 para começar",
     "dash.hero.sub": "Ou clique para escolher. MP3 ou WAV, até 5 arquivos por vez, 100 MB cada.",
     "dash.hero.cta": "Enviar áudio",
+
+    // ─── Dashboard rich: Empty state para usuários veteranos (hotfix 2026-05-29) ───
+    "dash.no_recent_title": "Nada para revisar agora",
+    "dash.no_recent_sub": "Se esperava ver seu histórico e não aparece, tente recarregar a página.",
 
     // ─── History empty state hero ───
     "history.empty_title": "Seu histórico está vazio",
