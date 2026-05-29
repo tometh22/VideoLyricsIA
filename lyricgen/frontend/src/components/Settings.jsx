@@ -755,7 +755,7 @@ export default function Settings({ onBack }) {
                 <div>
                   <p className={`text-2xl font-bold tracking-tight ${planInfo.color}`}>{planInfo.label}</p>
                   <p className="text-xs text-ink-secondary mt-1">
-                    {planInfo.videos} {t("settings.videos_month") || "videos/mes"}
+                    {planInfo.videos} {t("settings.videos_month") || "canciones/mes"}
                   </p>
                 </div>
                 {planInfo.price > 0 && (
@@ -821,7 +821,7 @@ export default function Settings({ onBack }) {
                             : "bg-surface-2/40 ring-white/[0.04] hover:ring-white/[0.10] hover:bg-surface-2/70"
                         }`}>
                         <p className="text-xs text-ink-secondary mb-1">
-                          {p.videos} {t("settings.videos_month") || "videos/mes"}
+                          {p.videos} {t("settings.videos_month") || "canciones/mes"}
                         </p>
                         <p className="text-2xl font-bold tracking-tight text-white">
                           <span className="text-xs text-ink-secondary font-normal">$</span>
