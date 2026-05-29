@@ -249,6 +249,9 @@ export default function UploadZone({
     // operator's text as-is (people expect their prompt used, not rewritten);
     // the "Mejorar con IA" toggle opts INTO a Gemini rewrite (bgVerbatim=false).
     backgroundHint: "", bgVerbatim: true,
+    // Title card customization (Full Rotor v1). Defaults = historical look:
+    // auto layout, no size change, artist ExtraBold, song = lyric font.
+    titleTemplate: "auto", titleSize: "1.0", titleArtistFont: "", titleSongFont: "",
   };
   const loadStoredBatchDefaults = () => {
     try {
@@ -2635,6 +2638,99 @@ export default function UploadZone({
                       </button>
                     );
                   })}
+                </div>
+              </div>
+
+              {/* Portada (intro title card) — Full Rotor v1: template + size +
+                  per-element fonts. Updates the title-card preview live. */}
+              <div className="mt-4 pt-3 border-t border-white/[0.05]">
+                <p className="text-[11px] text-gray-300 font-medium">{t("upload.titlecard_section") || "Portada (intro)"}</p>
+                <p className="text-[10px] text-gray-600 mt-0.5 mb-3">
+                  {t("upload.titlecard_desc") || "Cómo aparece el artista y la canción al inicio del video."}
+                </p>
+                <div className="space-y-3">
+                  {/* Layout template */}
+                  <div className="flex items-center gap-2">
+                    <span className="text-[11px] text-gray-600 shrink-0 w-20">{t("upload.titlecard_template_label") || "Disposición:"}</span>
+                    <div className="flex flex-wrap gap-1">
+                      {[
+                        { code: "auto",        label: t("upload.titlecard_auto") || "Auto" },
+                        { code: "centered",    label: t("upload.titlecard_centered") || "Centrado" },
+                        { code: "lower_third", label: t("upload.titlecard_lower_third") || "Tercio inf." },
+                        { code: "badge",       label: t("upload.titlecard_badge") || "Badge" },
+                      ].map((opt) => (
+                        <button
+                          key={opt.code}
+                          type="button"
+                          onClick={() => updateBatchDefault("titleTemplate", opt.code)}
+                          className={`px-2.5 py-1 rounded-md text-[11px] font-medium transition-all
+                            ${(batchDefaults.titleTemplate || "auto") === opt.code
+                              ? "bg-brand/20 text-brand ring-1 ring-brand/40"
+                              : "bg-surface-3/40 text-gray-500 hover:text-gray-300"
+                            }`}
+                        >{opt.label}</button>
+                      ))}
+                    </div>
+                  </div>
+
+                  {/* Size — quick presets + fine slider */}
+                  <div className="flex items-center gap-2">
+                    <span className="text-[11px] text-gray-600 shrink-0 w-20">{t("upload.titlecard_size_label") || "Tamaño:"}</span>
+                    <div className="flex items-center gap-2 flex-1">
+                      <div className="flex items-end gap-1">
+                        {[
+                          { code: "0.75", cls: "text-[10px]" },
+                          { code: "1.0",  cls: "text-[13px]" },
+                          { code: "1.25", cls: "text-[16px]" },
+                          { code: "1.5",  cls: "text-[19px]" },
+                        ].map((opt) => (
+                          <button
+                            key={opt.code}
+                            type="button"
+                            onClick={() => updateBatchDefault("titleSize", opt.code)}
+                            className={`w-7 h-7 flex items-center justify-center rounded-md font-bold transition-all ${opt.cls}
+                              ${(batchDefaults.titleSize || "1.0") === opt.code
+                                ? "bg-brand/20 text-brand ring-1 ring-brand/40"
+                                : "bg-surface-3/40 text-gray-500 hover:text-gray-300"
+                              }`}
+                          >A</button>
+                        ))}
+                      </div>
+                      <input
+                        type="range" min="0.5" max="2" step="0.05"
+                        value={parseFloat(batchDefaults.titleSize) || 1}
+                        onChange={(e) => updateBatchDefault("titleSize", e.target.value)}
+                        className="flex-1 accent-brand"
+                        aria-label={t("upload.titlecard_size_label") || "Tamaño del título"}
+                      />
+                      <span className="text-[10px] text-gray-500 w-9 text-right tabular-nums">
+                        {(parseFloat(batchDefaults.titleSize) || 1).toFixed(2)}×
+                      </span>
+                    </div>
+                  </div>
+
+                  {/* Per-element fonts: artist + song. "Auto" = historical
+                      default (artist Montserrat ExtraBold, song = lyric font). */}
+                  <div className="flex items-center gap-2">
+                    <span className="text-[11px] text-gray-600 shrink-0 w-20">{t("upload.titlecard_artist_font") || "Font artista:"}</span>
+                    <Listbox
+                      value={batchDefaults.titleArtistFont}
+                      onChange={(v) => updateBatchDefault("titleArtistFont", v)}
+                      options={FONTS}
+                      className="flex-1"
+                      ariaLabel={t("upload.titlecard_artist_font") || "Font artista"}
+                    />
+                  </div>
+                  <div className="flex items-center gap-2">
+                    <span className="text-[11px] text-gray-600 shrink-0 w-20">{t("upload.titlecard_song_font") || "Font canción:"}</span>
+                    <Listbox
+                      value={batchDefaults.titleSongFont}
+                      onChange={(v) => updateBatchDefault("titleSongFont", v)}
+                      options={FONTS}
+                      className="flex-1"
+                      ariaLabel={t("upload.titlecard_song_font") || "Font canción"}
+                    />
+                  </div>
                 </div>
               </div>
             </div>

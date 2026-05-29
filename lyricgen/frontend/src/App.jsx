@@ -650,6 +650,11 @@ function EditLyricsRoute({ setCurrentReview, setWizardStage, wizardScreen, t }) 
         backgroundHint: pickSnapOr("backgroundHint", params.background_hint || ""),
         bgVerbatim: snapR?.bgVerbatim != null ? !!snapR.bgVerbatim : !!params.bg_verbatim,
         backgroundMode: pickSnapOr("backgroundMode", params.background_mode || ""),
+        // Title card customization (Full Rotor v1).
+        titleTemplate: pickSnapOr("titleTemplate", params.title_template || "auto"),
+        titleSize: String(pickSnapOr("titleSize", params.title_size || "1.0")),
+        titleArtistFont: pickSnapOr("titleArtistFont", params.title_artist_font || ""),
+        titleSongFont: pickSnapOr("titleSongFont", params.title_song_font || ""),
       };
 
       // Baseline: snapshot inmutable de cómo está RENDERIZADO el video
@@ -673,6 +678,11 @@ function EditLyricsRoute({ setCurrentReview, setWizardStage, wizardScreen, t }) 
         backgroundHint: params.background_hint || "",
         bgVerbatim: !!params.bg_verbatim,
         backgroundMode: params.background_mode || "",
+        // Title card customization (Full Rotor v1) — baseline for the diff.
+        titleTemplate: params.title_template || "auto",
+        titleSize: String(params.title_size || "1.0"),
+        titleArtistFont: params.title_artist_font || "",
+        titleSongFont: params.title_song_font || "",
         segments: JSON.parse(JSON.stringify(job.segments_json || [])),
       };
 
@@ -1871,6 +1881,11 @@ export default function App() {
         // del batchDefault del operador. Init explícito acá.
         lyricsAnimation: entry.lyricsAnimation || "none",
         lineTransition: entry.lineTransition || "none",
+        // Title card customization (Full Rotor v1).
+        titleTemplate: entry.titleTemplate || "auto",
+        titleSize: entry.titleSize || "1.0",
+        titleArtistFont: entry.titleArtistFont || "",
+        titleSongFont: entry.titleSongFont || "",
         segments: data.segments, referenceLyrics: data.reference_lyrics || "",
         coverageWarning: !!data.coverage_warning,
         recoverySource: data.recovery_source || "",
@@ -2045,6 +2060,11 @@ export default function App() {
         // Audit fix 2026-05-25: init explícito de los 2 ejes libass.
         lyricsAnimation: entry.lyricsAnimation || "none",
         lineTransition: entry.lineTransition || "none",
+        // Title card customization (Full Rotor v1).
+        titleTemplate: entry.titleTemplate || "auto",
+        titleSize: entry.titleSize || "1.0",
+        titleArtistFont: entry.titleArtistFont || "",
+        titleSongFont: entry.titleSongFont || "",
         segments: data.segments, referenceLyrics: data.reference_lyrics || "",
         coverageWarning: !!data.coverage_warning,
         recoverySource: data.recovery_source || "",
@@ -2405,6 +2425,11 @@ export default function App() {
       lyricsAnimation: a.lyricsAnimation || "none",
       lineTransition: a.lineTransition || "none",
       textContrast: a.textContrast || "medium",
+      // Title card customization (Full Rotor v1).
+      titleTemplate: a.titleTemplate || "auto",
+      titleSize: a.titleSize || "1.0",
+      titleArtistFont: a.titleArtistFont || "",
+      titleSongFont: a.titleSongFont || "",
       segments: a.segments,
       transcribeJobId: a.transcribeJobId || null,
       status: "queued", current_step: null, progress: 0, job_id: null, error: null,
@@ -2453,6 +2478,11 @@ export default function App() {
         formData.append("lyric_color", jobList[i].lyricColor || "#FFFFFF");
         formData.append("lyric_sung_color", jobList[i].lyricSungColor || "#FFFFFF");
         formData.append("text_contrast", jobList[i].textContrast || "medium");
+        // Title card customization (Full Rotor v1).
+        formData.append("title_template", jobList[i].titleTemplate || "auto");
+        formData.append("title_size", String(jobList[i].titleSize || "1.0"));
+        formData.append("title_artist_font", jobList[i].titleArtistFont || "");
+        formData.append("title_song_font", jobList[i].titleSongFont || "");
         if (animateImage && backgroundFile) formData.append("animate_image", "true");
         formData.append("match_lyrics", String(!!inspiredByLyrics));
         // Capa C 2026-05-24 — si el operador hizo pre-gen del background
@@ -2592,6 +2622,11 @@ export default function App() {
         generateBody.append("lyric_color", jobList[i].lyricColor || "#FFFFFF");
         generateBody.append("lyric_sung_color", jobList[i].lyricSungColor || "#FFFFFF");
         generateBody.append("text_contrast", jobList[i].textContrast || "medium");
+        // Title card customization (Full Rotor v1).
+        generateBody.append("title_template", jobList[i].titleTemplate || "auto");
+        generateBody.append("title_size", String(jobList[i].titleSize || "1.0"));
+        generateBody.append("title_artist_font", jobList[i].titleArtistFont || "");
+        generateBody.append("title_song_font", jobList[i].titleSongFont || "");
         if (animateImage && backgroundFile) generateBody.append("animate_image", "true");
         generateBody.append("match_lyrics", String(!!inspiredByLyrics));
         if (backgroundId) {
@@ -3018,7 +3053,10 @@ export default function App() {
             song={currentReview.songTitle || ""}
             font={currentReview.font || ""}
             textCase={currentReview.textCase || "upper"}
-            fontScale={currentReview.fontScale || "1.0"}
+            template={currentReview.titleTemplate || "auto"}
+            titleSize={currentReview.titleSize || "1.0"}
+            artistFont={currentReview.titleArtistFont || ""}
+            songFont={currentReview.titleSongFont || ""}
             label={t("editor.title_card_preview") || "Vista previa de la portada"}
           />
         </div>
