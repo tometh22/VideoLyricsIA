@@ -134,6 +134,8 @@ def test_admin_exempt_from_edit_limit(client, admin_token, db, monkeypatch):
     job = JobModel(
         job_id=job_id,
         tenant_id=me["tenant_id"],
+        user_id=me["id"],
+        filename="edit-race.mp3",
         artist="Test",
         song_title="Admin Exempt",
         status="pending_review",
@@ -170,6 +172,8 @@ def test_status_reports_edit_limit_exempt_for_admin(client, admin_token, db):
     job = JobModel(
         job_id=job_id,
         tenant_id=me["tenant_id"],
+        user_id=me["id"],
+        filename="edit-race.mp3",
         artist="Test",
         song_title="Exempt Status",
         status="pending_review",

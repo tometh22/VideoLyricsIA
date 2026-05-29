@@ -373,6 +373,12 @@ def test_transcribe_uploaded_promotes_status_and_calls_pipeline(
             "reference_lyrics": "",
         }
     monkeypatch.setattr(main, "_run_transcription_for_job", _fake_transcription)
+    # Force the synchronous path. ASYNC_TRANSCRIBE_ENABLED defaults to "1",
+    # which dispatches transcription to a background worker and leaves the
+    # job in transcribing_queued / transcribing (non-deterministic at query
+    # time). This test pins the sync contract: the monkeypatched
+    # _run_transcription_for_job runs inline and promotes to transcribed_pending.
+    monkeypatch.setenv("ASYNC_TRANSCRIBE_ENABLED", "0")
 
     res = client.post(
         "/transcribe-uploaded",

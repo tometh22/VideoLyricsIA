@@ -96,11 +96,12 @@ def test_pipeline_merges_render_params_preserving_hint():
     src = inspect.getsource(pipeline.run_pipeline)
 
     # Must NOT replace wholesale with a literal dict that drops the hint.
-    assert "_merged_rp" in src, (
-        "run_pipeline must build a merged render_params dict, not replace it"
-    )
-    assert ".update(_new_rp)" in src, (
-        "run_pipeline must merge the new fields over existing render_params"
+    # The merge moved to jobs.merge_render_params (U5 audit 2026-05-25):
+    # an atomic SELECT FOR UPDATE + read + merge + write, so concurrent
+    # callers (worker + /edit) can't clobber each other's fields.
+    assert "merge_render_params(job_id, _new_rp)" in src, (
+        "run_pipeline must merge render_params via the atomic "
+        "merge_render_params helper, not replace the column wholesale"
     )
     # Must conditionally carry background_hint into the persisted params.
     assert 'if background_hint:' in src and '_new_rp["background_hint"] = background_hint' in src, (

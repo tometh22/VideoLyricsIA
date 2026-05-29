@@ -49,6 +49,11 @@ def test_source_audio_url_returns_signed_url(client, admin_token, db, monkeypatc
     import storage
     monkeypatch.setattr(storage, "generate_signed_url",
                         lambda key, expiry_seconds=3600: f"https://r2.fake/{key}?sig=ok")
+    # HOTFIX F8 (2026-05-27) added an object_exists() HEAD probe before
+    # presigning, so a job whose audio was purged doesn't get a dead URL.
+    # The test object lives only in the dummy R2, so stub the probe True
+    # to exercise the happy path (in prod the real object exists).
+    monkeypatch.setattr(storage, "object_exists", lambda key: True)
     user_id, tenant_id = _admin_identity(db)
     job_id = _create_job(db, tenant_id, user_id)
 
