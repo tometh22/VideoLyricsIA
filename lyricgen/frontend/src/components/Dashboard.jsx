@@ -174,20 +174,24 @@ export default function Dashboard({ user, history, historyError, historyLoaded =
     [history],
   );
 
-  // Empty state and first-time-user gates.
-  // - isEmptyState: literally zero history, no error and not loading.
-  //   When true we swap the "Empezá tu primer lote" pequeño + KPIs en 0
-  //   por un hero dropzone full-width que es el foco visual claro.
-  // - isFirstWeekUser: same age gate as the onboarding tours (<14 días
-  //   desde signup). The Stepper se muestra solo a este grupo + a empty
-  //   state. Users veteranos no lo ven y ganan vertical space.
-  const isEmptyState = history.length === 0 && historyLoaded && !historyError;
+  // First-week user gate (matches the onboarding-tour age gate).
   const isFirstWeekUser = (() => {
     if (!user || !user.created_at) return false;
     const t = Date.parse(user.created_at);
     if (Number.isNaN(t)) return false;
     return (Date.now() - t) / 86400000 < 14;
   })();
+  // Hotfix 2026-05-29: agus.cafisi reportó ver el hero gigante "creá tu
+  // primer video" con history=[] aunque tiene historial real. Causa
+  // probable: /jobs falló silenciosamente (CORS / 5xx caché / cold start)
+  // y volvió un array vacío sin setear historyError. Para no asustar a
+  // un veterano con "todo borrado", restringimos el hero al combo
+  // user nuevo (<14 días) + 0 history + carga OK. Para users veteranos
+  // con history=[] (raro pero posible: cuenta nueva en un sello viejo,
+  // backend hiccup) mostramos el empty state pequeño tradicional que
+  // dice "Empezá tu primer lote" pero NO sustituye toda la home.
+  const isTrueEmptyState = history.length === 0 && historyLoaded && !historyError;
+  const isEmptyState = isTrueEmptyState && isFirstWeekUser;
   const showStepper = isEmptyState || isFirstWeekUser;
 
   // Real plan usage from API. We surface load failures so the operator
@@ -702,9 +706,41 @@ export default function Dashboard({ user, history, historyError, historyLoaded =
           </button>
         </div>
       )}
-      {/* Empty state pequeño deprecado 2026-05-29: el hero dropzone arriba
-          ya cumple ese rol con mucha más fuerza visual. Lo dejamos comentado
-          como referencia por si revertimos. */}
+      {/* Empty state pequeño — vuelve para users veteranos con history=[].
+          Hotfix 2026-05-29: agus.cafisi (user con historial real) reportó
+          ver el hero "creá tu primer video" tras un fetch de /jobs que
+          volvió silenciosamente vacío. El hero ahora solo aparece para
+          users <14 días; para el resto con history=[] (incluyendo el caso
+          de fallo silencioso de /jobs) mostramos este card sutil que no
+          alarma con "creá tu primer video". */}
+      {isTrueEmptyState && !isFirstWeekUser && (
+        <div className="rounded-card p-14 text-center bg-surface-2/30 ring-1 ring-white/[0.04]">
+          <div className="w-14 h-14 mx-auto mb-5 rounded-2xl bg-brand/10 ring-1 ring-brand/20 flex items-center justify-center">
+            <svg className="w-7 h-7 text-brand-light" fill="none" stroke="currentColor" strokeWidth="1.5" viewBox="0 0 24 24">
+              <path d="M9 18V5l12-2v13" strokeLinecap="round" strokeLinejoin="round"/><circle cx="6" cy="18" r="3"/><circle cx="18" cy="16" r="3"/>
+            </svg>
+          </div>
+          <h3 className="text-lg font-bold text-white mb-1.5 tracking-tight">
+            {t("dash.no_recent_title") || "Nada por revisar ahora"}
+          </h3>
+          <p className="text-sm text-ink-secondary mb-6">
+            {t("dash.no_recent_sub") || "Si esperabas ver tu historial y no aparece, probá recargar la página."}
+          </p>
+          <div className="flex items-center justify-center gap-2">
+            <button onClick={onNewBatch} className="btn-primary px-6">
+              {t("nav.new_batch")}
+            </button>
+            {onRetryHistory && (
+              <button
+                onClick={onRetryHistory}
+                className="px-5 py-3 rounded-lg text-sm text-ink-secondary hover:text-white hover:bg-surface-2/60 transition-colors"
+              >
+                {t("dash.retry") || "Reintentar"}
+              </button>
+            )}
+          </div>
+        </div>
+      )}
     </div>
   );
 }
