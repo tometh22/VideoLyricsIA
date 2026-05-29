@@ -235,7 +235,7 @@ export default function Dashboard({ user, history, historyError, historyLoaded =
   })();
 
   return (
-    <div className="w-full max-w-5xl animate-fade-in">
+    <div className="w-full max-w-[1700px] animate-fade-in">
       {/* ─── Command bar simplificada (header reposicionado, search vendrá en PR-2) ─── */}
       <div className="flex items-center justify-between mb-7">
         <div className="min-w-0">
