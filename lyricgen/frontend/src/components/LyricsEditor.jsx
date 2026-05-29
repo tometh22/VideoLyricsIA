@@ -611,6 +611,24 @@ export default function LyricsEditor({
     // no-op anyway.
     if (audioUrlProp) { setAudioUrl(audioUrlProp); return undefined; }
     if (!audioFile) { setAudioUrl(null); return undefined; }
+    // HOTFIX 2026-05-29: when a wizard session is resumed from
+    // sessionStorage (wizardPersistence), `audioFile` is a STUB object
+    // — { name, size, type, lastModified, _restoredStub: true } — not
+    // a real Blob/File. URL.createObjectURL on a non-Blob throws
+    // "Failed to execute 'createObjectURL' on 'URL': Overload
+    // resolution failed", which propagates as an unhandled promise
+    // rejection and trips the GlobalErrorBoundary ("Algo salió mal").
+    // Detect the stub and silently skip URL creation; segment editing
+    // still works, audio playback is just disabled until the operator
+    // re-uploads. Matches the documented contract in wizardPersistence
+    // header: "audio playback won't work until the operator re-uploads
+    // the file".
+    const isRealBlob =
+      typeof Blob !== "undefined" && audioFile instanceof Blob;
+    if (!isRealBlob || audioFile._restoredStub) {
+      setAudioUrl(null);
+      return undefined;
+    }
     const url = URL.createObjectURL(audioFile);
     setAudioUrl(url);
     return () => URL.revokeObjectURL(url);

@@ -1027,9 +1027,25 @@ export default function App() {
   // Snapshot of any pending batch found in sessionStorage at mount time.
   // Drives the resume banner. Cleared when the operator clicks
   // Continuar/Descartar or starts a fresh batch.
+  //
+  // HOTFIX 2026-05-29: if a snapshot exists but is no longer resumable
+  // (post-refresh, only file STUBS without real Blobs), eagerly clear it
+  // on mount. Without this the autosave would just keep overwriting
+  // sessionStorage with the same skeletal state until the operator
+  // does something fresh — and any pre-existing crash path that reads
+  // `entry.file` on a stub keeps firing on every render. The user
+  // reported "Algo salió mal" → reload → same screen, that's the loop
+  // this prevents. Compatible with the previous resume behaviour:
+  // if files ARE replayable (i.e. user navigated within the SPA without
+  // a refresh), the snapshot still resumes normally.
   const [resumableWizard, setResumableWizard] = useState(() => {
     const snap = wizardPersistence.load();
-    return wizardPersistence.hasResumableContent(snap) ? snap : null;
+    if (!snap) return null;
+    if (wizardPersistence.hasResumableContent(snap)) return snap;
+    // Skeletal snapshot. Wipe it so the autosave doesn't immediately
+    // re-persist and so future renders don't see ghost state.
+    try { wizardPersistence.clear(); } catch { /* noop */ }
+    return null;
   });
   // Skip persistence saves while we're actively restoring state — otherwise
   // the useEffect below fires on every setX call from the restore and
@@ -3277,7 +3293,7 @@ export default function App() {
             {approvedJobs.map((job, i) => (
               <div key={i} className="flex items-center gap-3 glass rounded-xl px-4 py-2.5">
                 <div className="w-2 h-2 rounded-full bg-accent shrink-0" />
-                <span className="text-sm text-white truncate flex-1">{job.file.name.replace(/\.mp3$/i, "")}</span>
+                <span className="text-sm text-white truncate flex-1">{((job.file && job.file.name) || "audio.mp3").replace(/\.mp3$/i, "")}</span>
                 <span className="text-xs text-gray-500">{job.segments.length} {t("editor.lines")}</span>
               </div>
             ))}
