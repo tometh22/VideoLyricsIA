@@ -174,6 +174,22 @@ export default function Dashboard({ user, history, historyError, historyLoaded =
     [history],
   );
 
+  // Empty state and first-time-user gates.
+  // - isEmptyState: literally zero history, no error and not loading.
+  //   When true we swap the "Empezá tu primer lote" pequeño + KPIs en 0
+  //   por un hero dropzone full-width que es el foco visual claro.
+  // - isFirstWeekUser: same age gate as the onboarding tours (<14 días
+  //   desde signup). The Stepper se muestra solo a este grupo + a empty
+  //   state. Users veteranos no lo ven y ganan vertical space.
+  const isEmptyState = history.length === 0 && historyLoaded && !historyError;
+  const isFirstWeekUser = (() => {
+    if (!user || !user.created_at) return false;
+    const t = Date.parse(user.created_at);
+    if (Number.isNaN(t)) return false;
+    return (Date.now() - t) / 86400000 < 14;
+  })();
+  const showStepper = isEmptyState || isFirstWeekUser;
+
   // Real plan usage from API. We surface load failures so the operator
   // doesn't sit on "cargando..." forever when /usage hangs (CORS,
   // backend cold start, transient 5xx). 10 s timeout + a retry button
@@ -327,7 +343,10 @@ export default function Dashboard({ user, history, historyError, historyLoaded =
 
       {/* ─── Hero KPI 3-up (Aprobar · Renderizando · Cuota) ───────────
             Una sola tarjeta con divide-x — leído como una unidad horizontal
-            no como tres cards separadas. Stripe Dashboard pattern. ─── */}
+            no como tres cards separadas. Stripe Dashboard pattern.
+            UX 2026-05-29: ocultas cuando todos los valores son 0 — en cuenta
+            nueva el bloque ocupaba 200px diciendo "no pasa nada". ─── */}
+      {(pendingReview.length > 0 || processing.length > 0 || monthlyUsed > 0) && (
       <div className="mb-8 rounded-card bg-surface-2/40 ring-1 ring-white/[0.04] grid grid-cols-1 md:grid-cols-3 md:divide-x md:divide-white/[0.04]">
 
         {/* COL 1: APROBAR — north star del operador */}
@@ -462,6 +481,7 @@ export default function Dashboard({ user, history, historyError, historyLoaded =
           )}
         </div>
       </div>
+      )}
 
       {/* ─── Atención drawer — colapsable, solo se renderiza si hay avisos
             Y el operador lo abrió. Los banners viejos vivían apilados
@@ -562,20 +582,54 @@ export default function Dashboard({ user, history, historyError, historyLoaded =
         </div>
       )}
 
-      {/* ─── DashboardRich: Stepper + FormatGallery (PR #462) ─────────
-            Educan flujo + venden formatos. Stepper es dismissible
-            (localStorage). FormatGallery segmenta ProRes por plan. ─── */}
-      <DashboardStepper
-        onPrimaryAction={(stepIdx) => {
-          // Step 1 (Subir) + Step 4 (Renderizar) → arrancan upload.
-          // Steps 2/3 → no-op (decorativos por ahora; futuros enlaces al
-          // help center cuando llegue a main).
-          if (stepIdx === 0 || stepIdx === 3) {
-            if (typeof onNewBatch === "function") onNewBatch();
-            else navigate("/new");
-          }
-        }}
-      />
+      {/* ─── Hero dropzone — empty state focal point.
+            UX 2026-05-29: reemplaza el "Empezá tu primer lote" chico que
+            estaba al final. Para una cuenta sin historial, esto pasa a ser
+            el protagonista visual claro (patrón Notion/Loom empty state). ─── */}
+      {isEmptyState && (
+        <button
+          type="button"
+          onClick={onNewBatch}
+          className="dr-hero-drop w-full mb-6 group"
+          aria-label={t("dash.hero.cta") || "Subir audio para empezar"}
+        >
+          <div className="dr-hero-drop-inner">
+            <div className="dr-hero-drop-icon" aria-hidden="true">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
+                <path d="M12 5v14M5 12l7-7 7 7"/>
+              </svg>
+            </div>
+            <h2 className="dr-hero-drop-title">
+              {t("dash.hero.title") || "Arrastrá tu MP3 para empezar"}
+            </h2>
+            <p className="dr-hero-drop-sub">
+              {t("dash.hero.sub") || "O cliqueá para elegir. MP3 o WAV, hasta 5 archivos a la vez, 100 MB cada uno."}
+            </p>
+            <span className="dr-hero-drop-cta">
+              {t("dash.hero.cta") || "Subir audio"}
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5"><path d="M5 12h14M13 5l7 7-7 7" strokeLinecap="round" strokeLinejoin="round"/></svg>
+            </span>
+          </div>
+        </button>
+      )}
+
+      {/* ─── DashboardRich: Stepper + FormatGallery (PR #465) ─────────
+            Educan flujo + venden formatos. UX 2026-05-29: el Stepper se
+            muestra solo a users del primer mes o en empty state. Para
+            veteranos activos no aporta y ocupa fold. ─── */}
+      {showStepper && (
+        <DashboardStepper
+          onPrimaryAction={(stepIdx) => {
+            // Step 1 (Subir) + Step 4 (Renderizar) → arrancan upload.
+            // Steps 2/3 → no-op (decorativos por ahora; futuros enlaces al
+            // help center cuando llegue a main).
+            if (stepIdx === 0 || stepIdx === 3) {
+              if (typeof onNewBatch === "function") onNewBatch();
+              else navigate("/new");
+            }
+          }}
+        />
+      )}
       <FormatGallery
         user={user}
         onSelectFormat={handleSelectFormat}
@@ -643,20 +697,9 @@ export default function Dashboard({ user, history, historyError, historyLoaded =
           </button>
         </div>
       )}
-      {history.length === 0 && historyLoaded && !historyError && (
-        <div className="rounded-card p-14 text-center bg-surface-2/30 ring-1 ring-white/[0.04]">
-          <div className="w-14 h-14 mx-auto mb-5 rounded-2xl bg-brand/10 ring-1 ring-brand/20 flex items-center justify-center">
-            <svg className="w-7 h-7 text-brand-light" fill="none" stroke="currentColor" strokeWidth="1.5" viewBox="0 0 24 24">
-              <path d="M9 18V5l12-2v13" strokeLinecap="round" strokeLinejoin="round"/><circle cx="6" cy="18" r="3"/><circle cx="18" cy="16" r="3"/>
-            </svg>
-          </div>
-          <h3 className="text-lg font-bold text-white mb-1.5 tracking-tight">Empezá tu primer lote</h3>
-          <p className="text-sm text-ink-secondary mb-6">Subí un audio (.mp3 o .wav). Generamos el lyric video automáticamente.</p>
-          <button onClick={onNewBatch} className="btn-primary px-6">
-            {t("nav.new_batch")}
-          </button>
-        </div>
-      )}
+      {/* Empty state pequeño deprecado 2026-05-29: el hero dropzone arriba
+          ya cumple ese rol con mucha más fuerza visual. Lo dejamos comentado
+          como referencia por si revertimos. */}
     </div>
   );
 }

@@ -1267,6 +1267,19 @@ export const translations = {
     "tour.dashboard_help_title": "Cualquier duda, acá",
     "tour.dashboard_help_body": "Este botón abre el centro de ayuda con FAQs, tutoriales y troubleshooting. También se abre con la tecla ?",
 
+    // ─── Dashboard rich: Hero dropzone (empty state focal CTA) ───
+    "dash.hero.title": "Arrastrá tu MP3 para empezar",
+    "dash.hero.sub": "O cliqueá para elegir. MP3 o WAV, hasta 5 archivos a la vez, 100 MB cada uno.",
+    "dash.hero.cta": "Subir audio",
+
+    // ─── Historial empty state hero ───
+    "history.empty_title": "Tu historial está vacío",
+    "history.empty_sub": "Cuando termines un lyric video va a aparecer acá, listo para descargar o aprobar.",
+    "history.empty_cta": "Crear tu primer video",
+
+    // ─── Upload empty hint ───
+    "upload.empty_hint": "Tip: para mejor calidad, usá audio sin clipping y con voz al frente de la mezcla.",
+
     // ─── Dashboard rich: Stepper "Cómo funciona GenLy" ───
     "dash.stepper.title": "Tu lyric video en 4 pasos",
     "dash.stepper.dismiss": "Ocultar",
@@ -2197,6 +2210,19 @@ export const translations = {
     "tour.dashboard_help_title": "Any doubt, here",
     "tour.dashboard_help_body": "This button opens the help center with FAQs, tutorials and troubleshooting. Also opens with the ? key.",
 
+    // ─── Dashboard rich: Hero dropzone (empty state focal CTA) ───
+    "dash.hero.title": "Drop your MP3 to start",
+    "dash.hero.sub": "Or click to pick one. MP3 or WAV, up to 5 files at once, 100 MB each.",
+    "dash.hero.cta": "Upload audio",
+
+    // ─── History empty state hero ───
+    "history.empty_title": "Your history is empty",
+    "history.empty_sub": "When you finish a lyric video it will show up here, ready to download or approve.",
+    "history.empty_cta": "Create your first video",
+
+    // ─── Upload empty hint ───
+    "upload.empty_hint": "Tip: for the best quality, use audio without clipping and with the vocal up-front in the mix.",
+
     // ─── Dashboard rich: Stepper "How GenLy works" ───
     "dash.stepper.title": "Your lyric video in 4 steps",
     "dash.stepper.dismiss": "Hide",
@@ -3109,6 +3135,19 @@ export const translations = {
     "help.article.editor-stuck.body": "<p>Se entrou no editor e fica em loading infinito, ou lyrics não aparecem:</p><ol><li><strong>Recarregue a página</strong> (<kbd>Cmd/Ctrl</kbd>+<kbd>R</kbd>). A maioria dos problemas resolve aqui.</li><li><strong>Teste outro navegador</strong>: o editor usa Web Audio API; navegadores antigos não suportam bem.</li><li><strong>Feche outras abas pesadas</strong>: se sua máquina está com pouca RAM, o editor pode não inicializar.</li><li><strong>Veja o console do navegador</strong> (F12): erros em vermelho valem um screenshot.</li></ol><p>Se ainda travado depois disso, abra um ticket com o ID do job e o navegador usado.</p>",
     "tour.dashboard_help_title": "Qualquer dúvida, aqui",
     "tour.dashboard_help_body": "Este botão abre o centro de ajuda com FAQs, tutoriais e troubleshooting. Também abre pela tecla ?",
+
+    // ─── Dashboard rich: Hero dropzone (empty state focal CTA) ───
+    "dash.hero.title": "Solte seu MP3 para começar",
+    "dash.hero.sub": "Ou clique para escolher. MP3 ou WAV, até 5 arquivos por vez, 100 MB cada.",
+    "dash.hero.cta": "Enviar áudio",
+
+    // ─── History empty state hero ───
+    "history.empty_title": "Seu histórico está vazio",
+    "history.empty_sub": "Quando terminar um lyric video vai aparecer aqui, pronto para baixar ou aprovar.",
+    "history.empty_cta": "Criar seu primeiro vídeo",
+
+    // ─── Upload empty hint ───
+    "upload.empty_hint": "Dica: para melhor qualidade, use áudio sem clipping e com vocal na frente da mix.",
 
     // ─── Dashboard rich: Stepper "Como o GenLy funciona" ───
     "dash.stepper.title": "Seu lyric video em 4 passos",
