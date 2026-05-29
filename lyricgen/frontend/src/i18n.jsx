@@ -916,6 +916,10 @@ export const translations = {
     "wizard.resume_title": "Tenés un batch sin terminar",
     "wizard.resume_continue": "Continuar",
     "wizard.resume_discard": "Descartar",
+    "wizard.session_expired_title": "Tu sesión expiró",
+    "wizard.session_expired_desc": "El audio se perdió al refrescar la pestaña. Volvé a Crear video y re-subí el archivo.",
+    "wizard.generate_failed_title": "No pudimos disparar la generación",
+    "wizard.generate_failed_desc": "Hubo un error inesperado al iniciar la generación. Recargá la página y volvé a intentar.",
 
     // Edit request panel (post-render typography / background re-render)
     "edit.panel_title": "¿Necesitás ajustes?",

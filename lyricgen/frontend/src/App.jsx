@@ -2336,19 +2336,64 @@ export default function App() {
       persistSegmentsToBackend(r.transcribeJobId, editedSegments);
     }
 
+    // HOTFIX 2026-05-29 (#473.2): wrap el switch final en try/catch.
+    // startGenerationWithSegments puede crashear si el state está corrupto
+    // (stub file post-refresh). Sin este wrapper, el error burbujea al
+    // GlobalErrorBoundary y el usuario ve "Algo salió mal" sin recovery
+    // claro — termina en /new pensando que tiene que subir todo de nuevo,
+    // pero el job en backend queda en transcribed_pending huérfano.
     const nextIdx = r.queueIdx + 1;
-    if (nextIdx < r.queue.length) {
-      transcribeNext(r.queue, nextIdx);
-    } else if (r.queue.length === 1) {
-      startGenerationWithSegments(newApproved);
-    } else {
-      setReadyToGenerate(true);
+    try {
+      if (nextIdx < r.queue.length) {
+        transcribeNext(r.queue, nextIdx);
+      } else if (r.queue.length === 1) {
+        await startGenerationWithSegments(newApproved);
+      } else {
+        setReadyToGenerate(true);
+      }
+    } catch (e) {
+      console.error("[wizard] approve→generate failed", e);
+      alert({
+        title: t("wizard.generate_failed_title") || "No pudimos disparar la generación",
+        description: t("wizard.generate_failed_desc") ||
+          "Hubo un error inesperado al iniciar la generación. Recargá la página y volvé a intentar.",
+        tone: "error",
+      });
     }
   };
 
   const startGenerationWithSegments = async (approved) => {
+    // HOTFIX 2026-05-29 (#473.2): si el operador refrescó la pestaña entre
+    // upload y "Aprobar y generar", `a.file` quedó como stub serializado
+    // (sin Blob real, sin .slice). El POST /generate necesita el audio en
+    // multipart UNLESS hay transcribeJobId (en cuyo caso el backend reusa
+    // la copia cacheada en R2). Si no se cumple ninguna, abortar con UX
+    // clara en vez de crashear al leer a.file.name.
+    const broken = approved.find(
+      (a) => !a.transcribeJobId && (!a.file || typeof a.file.slice !== "function")
+    );
+    if (broken) {
+      console.warn("[wizard] approve aborted: file is not a Blob", {
+        has_file: !!broken.file,
+        has_transcribeJobId: !!broken.transcribeJobId,
+        is_stub: !!broken.file?._restoredStub,
+      });
+      alert({
+        title: t("wizard.session_expired_title") || "Tu sesión expiró",
+        description: t("wizard.session_expired_desc") ||
+          "El audio se perdió al refrescar la pestaña. Volvé a Crear video y re-subí el archivo.",
+        tone: "warning",
+      });
+      wizardPersistence.clear();
+      setCurrentReview(null);
+      setApprovedJobs([]);
+      setReadyToGenerate(false);
+      navigate("/new", { replace: true });
+      return;
+    }
+
     const jobList = approved.map((a) => ({
-      filename: a.file.name, _file: a.file, artist: a.artist,
+      filename: (a.file && a.file.name) || "audio.mp3", _file: a.file, artist: a.artist,
       songTitle: (a.songTitle || "").trim(),
       language: a.language, genre: a.genre || "", font: a.font || "",
       concept: a.concept || "", movementStyle: a.movementStyle || "", effect: a.effect || "",
