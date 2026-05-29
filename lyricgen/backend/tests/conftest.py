@@ -29,7 +29,15 @@ def _stub_moviepy():
     sys.modules.setdefault("moviepy.editor", _mp_ed)
 
 if "moviepy" not in sys.modules:
-    _stub_moviepy()
+    # Only fall back to the stub when real moviepy is genuinely
+    # unimportable (CI without the compiled wheel). On machines where
+    # moviepy IS installed, importing it here registers the real module
+    # so render tests (umg_smoke, ass_integration, etc.) exercise the
+    # actual encode path instead of a no-op stub that silently passes.
+    try:
+        import moviepy.editor  # noqa: F401
+    except Exception:
+        _stub_moviepy()
 
 # main.py defaults ENVIRONMENT to "production", which then refuses to
 # import without an explicit CORS_ORIGINS list (security guard against
