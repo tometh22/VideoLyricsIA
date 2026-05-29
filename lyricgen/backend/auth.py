@@ -16,20 +16,6 @@ from sqlalchemy.orm import Session
 from database import User, PasswordResetToken, EmailVerificationToken, get_db, utcnow
 
 # --- Plan definitions ---
-#
-# Pricing model 2026-05-29: limits are expressed in UNIQUE SONGS per
-# month, not in video renders. A song with multiple variants
-# ("Renderizado" + "Opción 2" + "Opción 3") collapses to a single quota
-# slot — the customer ordered one song. See get_plan_usage() docstring
-# for the SQL identity. Per-variant cost passthrough (4th+ variant of
-# same song = $0.90 Veo cost) lives in /jobs/{id}/variant.
-#
-# The internal field name `price_per_video` is preserved for back-compat
-# with Stripe webhooks + existing invoices that still reference the
-# "video" noun. Semantically it's now "price per song" — the unit
-# returned in get_plan_usage()'s response carries the correct label
-# ("unit": "song") for the frontend to render.
-#
 # bg_preview_enabled — gating del pre-render del fondo (Capa C, 2026-05-24).
 # Free OFF: cada preview descartado gasta $0.80-3.20 Veo. Para un trial que
 # toquetea opciones es bleeding puro. Paid ON: el preview ahorra 30-90s al
@@ -39,11 +25,10 @@ PLANS = {
              "stripe_price_id": None, "bg_preview_enabled": False},
     "100": {"limit": 100, "price_per_video": 9.00, "overage_rate": 1.30, "monthly_price": 900,
             "stripe_price_id": os.environ.get("STRIPE_PRICE_100"), "bg_preview_enabled": True},
-    # Plan "250": $8/song included in $2000/mo, with overage at $12/song
+    # Plan "250": $8/video included in $2000/mo, with overage at $12/video
     # ($8 × 1.5). UMG-style B2B accounts opt into allow_overage so they
-    # never get blocked at 250 — extra songs invoice out-of-band by
-    # transfer. Variants beyond the 3rd of any song are billed at the
-    # $0.90 Veo cost-passthrough (see /jobs/{id}/variant).
+    # never get blocked at 250 — extra videos invoice out-of-band by
+    # transfer.
     "250": {"limit": 250, "price_per_video": 8.00, "overage_rate": 1.50, "monthly_price": 2000,
             "stripe_price_id": os.environ.get("STRIPE_PRICE_250"), "bg_preview_enabled": True},
     "500": {"limit": 500, "price_per_video": 7.00, "overage_rate": 1.30, "monthly_price": 3500,
@@ -667,67 +652,34 @@ def verify_media_token(token: str, job_id: str, file_type: str, db: Session) -> 
 def get_plan_usage(db: Session, user_id: int, tenant_id: str, plan_id: str) -> dict:
     """Get current month usage vs plan limit.
 
-    Counts unique SONGS (distinct artist + song_title tuples) approved in
-    the current month. A "song" is what the customer ordered: variants
-    of the same song (Renderizado + Opción 2 + Opción 3) collapse to a
-    single quota slot.
+    Counts only APPROVED videos in the current month. A job's "approved"
+    moment is `approved_at` — set by the /approve endpoint together with
+    the status="done" flip. Filtering on `approved_at >= month_start`
+    (instead of the prior `created_at >= month_start`) makes the
+    pricing model align with the contract operators actually pay for:
 
-    This is the customer-facing contract: "250 songs/month" is what the
-    plan literally says. Before this change the filter counted job rows
-    — which inflated the count when the operator generated alternative
-    versions of the same track. A song with 3 variants was eating 3
-    slots, even though UMG's perception is "I asked for 1 song".
+      - Iterations (re-renders via /edit + /retry, bg_preview browsing,
+        rejected drafts) do NOT consume quota.
+      - A video approved on 2026-06-02 counts against June even if its
+        underlying job row was created on 2026-05-31. Without the
+        approved_at filter the operator gets billed for the wrong month
+        when they push approvals across boundaries.
 
-    Implementation note — case normalisation:
-      Artists and titles drift in casing across uploads (`Los Abuelos
-      de la nada` vs `Los Abuelos De La Nada`). PostgreSQL's LOWER()
-      collapses these. TRIM() catches trailing whitespace from sloppy
-      filename parsers. Combined, the tuple is a stable identity for
-      "same song" regardless of the operator's typing habits.
-
-    `approved_at` (not `created_at`) sets the cycle boundary: a song
-    approved on 2026-06-02 counts against June even if the underlying
-    job row was created on 2026-05-31. Both filters are required —
-    status='done' AND approved_at >= month_start — because /reject
-    leaves approved_at populated when flipping the status; without the
-    status check, a rejected-after-approve song would slip in.
-
-    Cost guardrail (separate from quota):
-      Each additional variant beyond the 3rd of the same song is billed
-      at $0.90 cost-passthrough (the Veo background generation fee).
-      That logic lives in /jobs/{id}/variant — NOT here — because this
-      function is read-only and called from many code paths.
+    Both filters are required (status="done" AND approved_at >=
+    month_start): status alone would let a rejected-after-approve job
+    slip into the count, since /reject leaves approved_at populated
+    while flipping status away from "done".
     """
     from database import Job
-    from sqlalchemy import func
 
     now = datetime.now(timezone.utc)
     month_start = datetime(now.year, now.month, 1, tzinfo=timezone.utc)
 
-    # COUNT(DISTINCT LOWER(TRIM(artist)) || '||' || LOWER(TRIM(title)))
-    # gives unique-song count. SQL note: we materialise the identity as
-    # a single concatenated string because `func.count(distinct(a, b))`
-    # is SQLAlchemy-level row constructor and doesn't translate the
-    # same way across dialects. The '||' separator is safe — both
-    # artist and title are validated to NOT contain it before
-    # persisting (and even if they did, a collision would only matter
-    # when "X||Y" ≠ "X" + "||" + "Y" which never happens by design).
-    #
-    # COALESCE handles song_title NULL — older jobs from before the
-    # column was nullable can have NULL titles; treat them as their
-    # own song per artist (one slot per artist with NULL title).
-    song_identity = func.lower(
-        func.concat(
-            func.trim(Job.artist),
-            "||",
-            func.coalesce(func.trim(Job.song_title), ""),
-        )
-    )
-    used = db.query(func.count(func.distinct(song_identity))).filter(
+    used = db.query(Job).filter(
         Job.tenant_id == tenant_id,
         Job.status == "done",
         Job.approved_at >= month_start,
-    ).scalar() or 0
+    ).count()
 
     plan = PLANS.get(plan_id, PLANS["100"])
     limit = plan["limit"]
@@ -746,10 +698,4 @@ def get_plan_usage(db: Session, user_id: int, tenant_id: str, plan_id: str) -> d
         "percent": min(100, round((used / limit) * 100)) if limit > 0 else 0,
         "alert_80": used >= limit * 0.8,
         "alert_100": used >= limit,
-        # Unit label exposed for the frontend so /usage consumers (sidebar
-        # badge, dashboard, settings) display the right noun. Was implicit
-        # ("video") in every call site before the switch; making it
-        # explicit avoids hardcoding "video"/"canción" all over the UI
-        # and lets a future per-plan unit change without a frontend ship.
-        "unit": "song",
     }
