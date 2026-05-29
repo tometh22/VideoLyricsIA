@@ -650,7 +650,26 @@ def verify_media_token(token: str, job_id: str, file_type: str, db: Session) -> 
 # ---------------------------------------------------------------------------
 
 def get_plan_usage(db: Session, user_id: int, tenant_id: str, plan_id: str) -> dict:
-    """Get current month usage vs plan limit."""
+    """Get current month usage vs plan limit.
+
+    Counts only APPROVED videos in the current month. A job's "approved"
+    moment is `approved_at` — set by the /approve endpoint together with
+    the status="done" flip. Filtering on `approved_at >= month_start`
+    (instead of the prior `created_at >= month_start`) makes the
+    pricing model align with the contract operators actually pay for:
+
+      - Iterations (re-renders via /edit + /retry, bg_preview browsing,
+        rejected drafts) do NOT consume quota.
+      - A video approved on 2026-06-02 counts against June even if its
+        underlying job row was created on 2026-05-31. Without the
+        approved_at filter the operator gets billed for the wrong month
+        when they push approvals across boundaries.
+
+    Both filters are required (status="done" AND approved_at >=
+    month_start): status alone would let a rejected-after-approve job
+    slip into the count, since /reject leaves approved_at populated
+    while flipping status away from "done".
+    """
     from database import Job
 
     now = datetime.now(timezone.utc)
@@ -659,7 +678,7 @@ def get_plan_usage(db: Session, user_id: int, tenant_id: str, plan_id: str) -> d
     used = db.query(Job).filter(
         Job.tenant_id == tenant_id,
         Job.status == "done",
-        Job.created_at >= month_start,
+        Job.approved_at >= month_start,
     ).count()
 
     plan = PLANS.get(plan_id, PLANS["100"])

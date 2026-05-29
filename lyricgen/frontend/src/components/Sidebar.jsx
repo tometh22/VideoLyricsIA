@@ -2,6 +2,7 @@ import { Link } from "react-router-dom";
 import { useI18n } from "../i18n";
 import BrandLockup from "./BrandLockup";
 import { IS_PRODUCTION, APP_ENV } from "../env";
+import UsageBadge from "./UsageBadge";
 
 // Each nav item carries its router path. The plain-left-click handler
 // in the <Link> below calls onNav(id) (which fires the wizard-leaving
@@ -135,6 +136,11 @@ export default function Sidebar({ onNav, activeView, open, onToggle, user, onLog
           </Link>
         </div>
       )}
+
+      {/* Usage badge — shows monthly usage against plan limit. Hidden for
+          unlimited plans + when /usage hasn't loaded yet. See
+          UsageBadge for color thresholds + admin-only overage display. */}
+      <UsageBadge user={user} />
 
       {/* User & logout */}
       <div className="px-5 py-4 border-t border-white/[0.04] space-y-3">
