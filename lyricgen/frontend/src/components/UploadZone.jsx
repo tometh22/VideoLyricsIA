@@ -968,7 +968,8 @@ export default function UploadZone({
         onDragLeave={() => setDragging(false)}
         onDrop={handleDrop}
         onClick={() => inputRef.current.click()}
-        className={`group relative rounded-3xl p-8 text-center cursor-pointer transition-all duration-300
+        className={`group relative rounded-3xl text-center cursor-pointer transition-all duration-300
+          ${files.length > 0 ? "p-8" : "p-12 md:p-16"}
           ${dragging ? "bg-brand/10 border-brand shadow-glow" : files.length > 0 ? "glass" : "glass glass-hover"}
           border-2 ${dragging ? "border-brand" : files.length > 0 ? "border-white/[0.06]" : "border-dashed border-white/[0.08]"}
         `}
@@ -1022,15 +1023,15 @@ export default function UploadZone({
             )}
           </div>
         ) : (
-          <div className="py-4">
-            <div className="w-14 h-14 mx-auto mb-5 rounded-2xl bg-surface-3/80 flex items-center justify-center group-hover:bg-brand/10 transition-colors duration-300">
-              <svg className="w-7 h-7 text-gray-400 group-hover:text-brand transition-colors duration-300" fill="none" stroke="currentColor" strokeWidth="1.5" viewBox="0 0 24 24" strokeLinecap="round" strokeLinejoin="round">
+          <div className="py-6 md:py-8">
+            <div className="w-20 h-20 md:w-24 md:h-24 mx-auto mb-6 rounded-3xl bg-brand/10 ring-1 ring-brand/20 flex items-center justify-center group-hover:bg-brand/20 group-hover:ring-brand/40 transition-all duration-300">
+              <svg className="w-10 h-10 md:w-12 md:h-12 text-brand-light group-hover:text-white transition-colors duration-300" fill="none" stroke="currentColor" strokeWidth="1.5" viewBox="0 0 24 24" strokeLinecap="round" strokeLinejoin="round">
                 <path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4" /><polyline points="17 8 12 3 7 8" /><line x1="12" y1="3" x2="12" y2="15" />
               </svg>
             </div>
-            <p className="text-gray-300 font-medium mb-1">{t("upload.drag")}</p>
-            <p className="text-gray-600 text-sm">{t("upload.drag_sub")}</p>
-            <p className="text-gray-700 text-[11px] mt-2">
+            <p className="text-xl md:text-2xl font-bold text-white mb-2 tracking-tight">{t("upload.drag")}</p>
+            <p className="text-ink-secondary text-sm mb-3">{t("upload.drag_sub")}</p>
+            <p className="text-gray-700 text-[11px]">
               {t("upload.size_hint")}
             </p>
           </div>
@@ -1968,7 +1969,15 @@ export default function UploadZone({
           vacío) caían acá y se veía "Crear videos" en vez del editor.
           Bug 2026-05-27, fix UploadZone-shortcircuit. */}
       {files.length === 0 && !hasReviewableContent && !_editMode ? (
-        <div className="max-w-2xl mx-auto">{_dropZone}</div>
+        /* UX 2026-05-29: empty state centered vertically + bigger max-width
+           so the dropzone doesn't feel like a 250px island floating in the
+           viewport. Matches the visual weight of the Dashboard hero. */
+        <div className="max-w-3xl mx-auto py-8 md:py-12 flex flex-col items-center justify-center min-h-[55vh]">
+          <div className="w-full">{_dropZone}</div>
+          <p className="text-[11px] text-ink-secondary/60 mt-6 text-center max-w-md">
+            {t("upload.empty_hint") || "Tip: para mejor calidad, usá audio sin clipping y con voz al frente de la mezcla."}
+          </p>
+        </div>
       ) : (
       /* UI F1+F2+F3 (2026-05-26): el grid se reconfigura cuando el
          wizard llega al paso 6. En pasos 1-5 el operador está
