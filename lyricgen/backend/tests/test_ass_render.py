@@ -11,7 +11,7 @@ from ass_render import (
     lyric_fontsize, fade_seconds, perceptual_start,
     segments_to_lines, font_family, single_font_dir,
     multi_font_dir, title_card_lines, _opacity_to_alpha,
-    moviepy_line_placement, hex_to_ass,
+    moviepy_line_placement, hex_to_ass, fit_title_text,
 )
 
 _FONTS_DIR = os.path.join(os.path.dirname(__file__), "..", "fonts")
@@ -297,6 +297,101 @@ def test_title_card_empty_returns_nothing():
     assert title_card_lines("", "", 5.0, width=1920, height=1080,
                             text_scale=1.0, lyric_font_family="X",
                             artist_font_family="Y") == []
+
+
+def test_title_card_normalises_decomposed_accents_to_nfc():
+    # macOS filenames arrive in NFD: "Así" as 'As' + 'i' + combining acute.
+    # Without normalisation libass renders the accent as a floating mark.
+    artist_nfd = "Así Es El Calor"          # 'i' + U+0301 combining acute
+    song_nfd = "Canción"                    # 'o' + U+0301
+    lines = title_card_lines(
+        artist_nfd, song_nfd, first_lyric_start=5.0,
+        width=1920, height=1080, text_scale=1.0,
+        lyric_font_family="Oswald", artist_font_family="Montserrat ExtraBold",
+    )
+    artist, song = lines
+    # Precomposed codepoints (NFC): "Í" = U+00CD, "ó" = U+00F3 — no U+0301.
+    assert artist.text == "ASÍ ES EL CALOR"
+    assert song.text == "Canción"
+    assert "́" not in artist.text and "́" not in song.text
+
+
+def test_title_card_no_fit_without_font_paths_keeps_legacy_sizes():
+    # No font paths → legacy fixed sizing, single line (parity with old look).
+    lines = title_card_lines(
+        "Soda Stereo", "Un Título Larguísimo Que Antes Se Desbordaba Sin Drama",
+        first_lyric_start=5.0, width=1920, height=1080, text_scale=1.0,
+        lyric_font_family="Oswald", artist_font_family="Montserrat ExtraBold",
+    )
+    artist, song = lines
+    assert artist.fontsize == 100 and song.fontsize == 62
+    assert "\\N" not in song.text and "\n" not in song.text
+
+
+@pil
+def test_title_card_shrinks_long_artist_with_font_path():
+    # The real overflow case (operator screenshot): a long string in the
+    # ARTIST field renders at the 100px hero size and runs off the frame.
+    long_artist = "EL ARBOL DE LA VIDA _ VOY A DEJARTE"
+    short = title_card_lines(
+        "Viejas Locas", "Voy A Dejarte", first_lyric_start=5.0,
+        width=1920, height=1080, text_scale=1.0,
+        lyric_font_family="Oswald", artist_font_family="Montserrat ExtraBold",
+        lyric_font_path=_font("Oswald-Bold.ttf"),
+        artist_font_path=_font("Montserrat-ExtraBold.ttf"),
+    )
+    long = title_card_lines(
+        long_artist, "Voy A Dejarte", first_lyric_start=5.0,
+        width=1920, height=1080, text_scale=1.0,
+        lyric_font_family="Oswald", artist_font_family="Montserrat ExtraBold",
+        lyric_font_path=_font("Oswald-Bold.ttf"),
+        artist_font_path=_font("Montserrat-ExtraBold.ttf"),
+    )
+    short_artist_size = short[0].fontsize
+    long_artist_line = long[0]
+    # The long artist must be smaller and/or wrapped vs the short one.
+    shrunk = long_artist_line.fontsize < short_artist_size
+    wrapped = "\n" in long_artist_line.text
+    assert shrunk or wrapped
+    # It must actually fit the 80% safe width at its chosen size.
+    from PIL import ImageFont
+    f = ImageFont.truetype(_font("Montserrat-ExtraBold.ttf"), long_artist_line.fontsize)
+    widest = max(f.getlength(seg) for seg in long_artist_line.text.split("\n"))
+    assert widest <= 1920 * 0.80 + 1
+
+
+@pil
+def test_title_card_short_title_unchanged_with_font_path():
+    # A short title that already fit keeps one line at the base size even
+    # when font paths enable fitting — no spurious shrink/wrap.
+    lines = title_card_lines(
+        "Soda Stereo", "De Música Ligera", first_lyric_start=5.0,
+        width=1920, height=1080, text_scale=1.0,
+        lyric_font_family="Oswald", artist_font_family="Montserrat ExtraBold",
+        lyric_font_path=_font("Oswald-Bold.ttf"),
+        artist_font_path=_font("Montserrat-ExtraBold.ttf"),
+    )
+    song = lines[1]
+    assert song.fontsize == 62 and "\n" not in song.text
+
+
+@pil
+def test_fit_title_text_shrinks_then_wraps():
+    fp = _font("Oswald-Bold.ttf")
+    # Fits as-is: returns single line at base size.
+    one, size = fit_title_text("CORTO", fp, 62, 1500, 38)
+    assert one == ["CORTO"] and size == 62
+    # Too wide even shrunk to min → wraps into 2 balanced lines.
+    lines, size2 = fit_title_text(
+        "PALABRAS MUCHAS LARGAS QUE NO ENTRAN NI ACHICANDO TODO", fp,
+        62, 400, 38, max_lines=2,
+    )
+    assert len(lines) == 2 and size2 >= 38
+
+
+def test_fit_title_text_no_font_path_is_noop():
+    lines, size = fit_title_text("CUALQUIER COSA LARGA", None, 62, 100, 38)
+    assert lines == ["CUALQUIER COSA LARGA"] and size == 62
 
 
 def test_build_ass_emits_title_card_style_overrides():
