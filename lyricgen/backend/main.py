@@ -1810,6 +1810,15 @@ def _validate_audio_file_on_disk(filename: str, path: str) -> None:
             )
 
 
+def _clamp_title_size(raw) -> float:
+    """Parse + clamp the title-card size multiplier (Full Rotor v1) to
+    0.5–2.0. Tolerates junk/empty input → 1.0 (no scaling)."""
+    try:
+        return max(0.5, min(2.0, float(raw)))
+    except (TypeError, ValueError):
+        return 1.0
+
+
 def _job_scope(current_user: dict) -> dict:
     """Return kwargs for jobs.get_job / jobs.get_all_jobs scoping reads
     to the caller's tenant.
@@ -3421,6 +3430,11 @@ async def upload(
     background_hint: str = Form("", max_length=2000),
     bg_verbatim: bool = Form(False),
     custom_colors: str = Form("", max_length=200),
+    # Title-card customization (Full Rotor v1). Defaults = historical look.
+    title_template: str = Form("auto", max_length=16),
+    title_size: str = Form("1.0", max_length=8),
+    title_artist_font: str = Form("", max_length=64),
+    title_song_font: str = Form("", max_length=64),
     current_user: dict = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
@@ -3607,6 +3621,10 @@ async def upload(
         background_hint=(background_hint.strip() or None),
         bg_verbatim=bg_verbatim,
         custom_colors=(custom_colors.strip() or ""),
+        title_template=title_template if title_template in ("auto", "centered", "lower_third", "badge") else "auto",
+        title_size=_clamp_title_size(title_size),
+        title_artist_font=(title_artist_font.strip() or ""),
+        title_song_font=(title_song_font.strip() or ""),
     )
 
     return {"job_id": job_id, "status": initial_status}
@@ -5580,6 +5598,11 @@ async def generate_with_segments(
     # a Veo/Imagen — ahorra ~60-180s + $0.80-3.20 de cuota. Vacío = flow
     # tradicional sin cache.
     bg_cache_key: str = Form("", max_length=64),
+    # Title-card customization (Full Rotor v1). Defaults = historical look.
+    title_template: str = Form("auto", max_length=16),
+    title_size: str = Form("1.0", max_length=8),
+    title_artist_font: str = Form("", max_length=64),
+    title_song_font: str = Form("", max_length=64),
     current_user: dict = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
@@ -5868,6 +5891,10 @@ async def generate_with_segments(
         # Si el cache hit, _ensure_background se skip y el job ahorra
         # ~60-180s + $0.80-3.20 de cuota Veo. Vacío = flow tradicional.
         bg_cache_key=(bg_cache_key.strip() or None),
+        title_template=title_template if title_template in ("auto", "centered", "lower_third", "badge") else "auto",
+        title_size=_clamp_title_size(title_size),
+        title_artist_font=(title_artist_font.strip() or ""),
+        title_song_font=(title_song_font.strip() or ""),
     )
 
     return {"job_id": job_id, "status": initial_status}
@@ -6865,6 +6892,14 @@ class EditJobRequest(BaseModel):
     # Both nullable — caller may send one, the other, or both.
     artist: str | None = Field(default=None, max_length=255)
     song_title: str | None = Field(default=None, max_length=500)
+    # Title-card customization (Full Rotor v1). Operator controls the intro
+    # title layout/size/fonts post-upload. None → inherit render_params.
+    # Persisted in render_params (not DB columns); ride in the typography
+    # edit bucket (fast re-render, no bg/segments touched).
+    title_template: str | None = Field(default=None, max_length=16)
+    title_size: float | None = None
+    title_artist_font: str | None = Field(default=None, max_length=64)
+    title_song_font: str | None = Field(default=None, max_length=64)
 
 
 class EnableProResRequest(BaseModel):
@@ -7722,6 +7757,35 @@ async def request_edit(
         edit_params["text_case"] = body.text_case
     if body.text_contrast is not None:
         edit_params["text_contrast"] = body.text_contrast
+    # Title-card customization (Full Rotor v1) — durable visual choices, same
+    # pattern as effect/lyrics_animation: forward to edit_params for THIS
+    # render AND persist to render_params so retries/variants inherit them.
+    if body.title_template is not None:
+        _tt = (body.title_template or "").strip() or "auto"
+        if _tt not in ("auto", "centered", "lower_third", "badge"):
+            _tt = "auto"
+        edit_params["title_template"] = _tt
+        _rp = dict(job.render_params or {})
+        _rp["title_template"] = _tt
+        job.render_params = _rp
+    if body.title_size is not None:
+        _ts = max(0.5, min(2.0, float(body.title_size)))
+        edit_params["title_size"] = _ts
+        _rp = dict(job.render_params or {})
+        _rp["title_size"] = _ts
+        job.render_params = _rp
+    if body.title_artist_font is not None:
+        _taf = (body.title_artist_font or "").strip()
+        edit_params["title_artist_font"] = _taf
+        _rp = dict(job.render_params or {})
+        _rp["title_artist_font"] = _taf
+        job.render_params = _rp
+    if body.title_song_font is not None:
+        _tsf = (body.title_song_font or "").strip()
+        edit_params["title_song_font"] = _tsf
+        _rp = dict(job.render_params or {})
+        _rp["title_song_font"] = _tsf
+        job.render_params = _rp
     # body.lyric_transition + body.text_motion: campos eliminados 2026-05-23.
     # FX layer + lyric animations: durable visual choices, no edit_type gate
     # (the operator can change them inside any edit modal). Same pattern as
@@ -8407,7 +8471,10 @@ async def retry_job(
               # Lyric text colors 2026-05-25 — heredables igual que
               # custom_colors, así los re-renders/variantes mantienen el
               # color elegido por el operador.
-              "lyric_color", "lyric_sung_color"):
+              "lyric_color", "lyric_sung_color",
+              # Title-card customization (Full Rotor v1) — heredables.
+              "title_template", "title_size",
+              "title_artist_font", "title_song_font"):
         if k in _retry_render_params and _retry_render_params[k] not in (None, ""):
             retry_pipeline_kwargs[k] = _retry_render_params[k]
 
@@ -8817,7 +8884,10 @@ async def create_variant(
               # + #357a1a5). custom_colors va con effect porque su flow es el
               # mismo (paleta opcional para el grade).
               "effect", "custom_colors",
-              "lyrics_animation", "line_transition"):
+              "lyrics_animation", "line_transition",
+              # Title-card customization (Full Rotor v1) — variantes heredan.
+              "title_template", "title_size",
+              "title_artist_font", "title_song_font"):
         if k in new_render_params:
             pipeline_kwargs[k] = new_render_params[k]
     if body.concept is not None:

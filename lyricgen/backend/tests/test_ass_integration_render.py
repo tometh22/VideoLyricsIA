@@ -133,3 +133,35 @@ def test_libass_render_title_card_long_accented(tmp_path):
     data = json.loads(probe.stdout)
     types = {s.get("codec_type") for s in data.get("streams", [])}
     assert "video" in types and "audio" in types
+
+
+def test_libass_render_title_card_template_and_size(tmp_path):
+    """Full Rotor v1 end-to-end: a forced template (lower_third) + size
+    multiplier + per-element fonts burn into a valid playable MP4 via real
+    libass. Guards the title-card customization path at the render level."""
+    job_dir = str(tmp_path)
+    bg = os.path.join(job_dir, "bg.mp4")
+    mp3 = os.path.join(job_dir, "a.mp3")
+    subprocess.run(["ffmpeg", "-y", "-loglevel", "error", "-f", "lavfi",
+                    "-i", "testsrc=size=640x360:rate=24:duration=8",
+                    "-pix_fmt", "yuv420p", bg], check=True, timeout=60)
+    subprocess.run(["ffmpeg", "-y", "-loglevel", "error", "-f", "lavfi",
+                    "-i", "sine=frequency=440:duration=8", mp3], check=True, timeout=60)
+
+    segments = [{"start": 6.0, "end": 7.5, "text": "primera linea"}]
+    out = pipeline._render_lyrics_ass(
+        bg, mp3, segments, job_dir, 8.0,
+        spec=RenderSpec.youtube_default(), font_path=_font(),
+        artist="Soda Stereo", song_title="De Música Ligera",
+        title_template="lower_third", title_size=1.4,
+        title_artist_font="oswald-bold", title_song_font="anton",
+    )
+    assert os.path.exists(out) and os.path.getsize(out) > 4096
+    probe = subprocess.run(
+        ["ffprobe", "-v", "error", "-show_entries", "stream=codec_type",
+         "-of", "json", out],
+        capture_output=True, text=True, timeout=30,
+    )
+    assert probe.returncode == 0, probe.stderr
+    types = {s.get("codec_type") for s in json.loads(probe.stdout).get("streams", [])}
+    assert "video" in types and "audio" in types

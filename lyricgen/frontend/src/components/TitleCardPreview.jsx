@@ -18,13 +18,15 @@ import { FONT_BY_CODE, applyCase } from "./fontCatalog";
  * ~5-10 min re-render. Approximate (CSS/DOM vs libass), but font-faithful.
  */
 
-// Base font sizes as a fraction of the 1920px render width, matching the
-// backend hero-card tiers (artist 100px, song 62px at 1920) and the 80% safe
-// card width. min ratio 0.62 mirrors fit_title_text's min_size.
-const ARTIST_RATIO = 100 / 1920;
-const SONG_RATIO = 62 / 1920;
-const SAFE_W_FRAC = 0.8;
-const MIN_RATIO = 0.62;
+// Per-template geometry — mirrors ass_render._TITLE_LAYOUTS so the preview
+// matches the burn. Base sizes are px-at-1920 (scaled to the box width);
+// `safe` is the card width fraction; justify/align/padB place the block.
+const PREVIEW_LAYOUTS = {
+  centered:    { artist: 100, song: 62, safe: 0.80, justify: "center",   align: "center",     textAlign: "center", padB: 0 },
+  lower_third: { artist: 64,  song: 40, safe: 0.80, justify: "flex-end", align: "center",     textAlign: "center", padB: "20%" },
+  badge:       { artist: 36,  song: 28, safe: 0.45, justify: "flex-end", align: "flex-start", textAlign: "left",   padB: "8%" },
+};
+const MIN_RATIO = 0.62;   // mirrors fit_title_text's min_size
 
 const ARTIST_FONT = "'Montserrat', system-ui, sans-serif"; // ExtraBold (800)
 
@@ -111,9 +113,13 @@ function FitLine({ text, baseSize, maxWidth, fontFamily, weight, color, opacity 
 export default function TitleCardPreview({
   artist = "",
   song = "",
-  font = "",
+  font = "",            // song font fallback (the lyric font, backward-compat)
   textCase = "upper",
-  fontScale = "1.0",
+  // Full Rotor v1 controls. Defaults reproduce the historical hero look.
+  template = "auto",
+  titleSize = 1.0,
+  artistFont = "",      // "" → Montserrat ExtraBold (backend default)
+  songFont = "",        // "" → falls back to `font` (the lyric font)
   label,
 }) {
   const boxRef = useRef(null);
@@ -138,11 +144,27 @@ export default function TitleCardPreview({
   const artistU = nfc(artist).trim().toUpperCase();
   const songD = applyCase(nfc(song).trim(), textCase);
 
-  // Song renders in the chosen lyric font (shared catalog); artist in
-  // Montserrat ExtraBold. fontScale nudges both, clamped like the backend.
-  const songFont = FONT_BY_CODE[font] || FONT_BY_CODE[""];
-  const scaleN = Math.max(0.6, Math.min(1.5, parseFloat(fontScale) || 1));
-  const maxWidth = boxW * SAFE_W_FRAC;
+  // Per-element fonts: artist → chosen font or Montserrat ExtraBold (800);
+  // song → chosen font or the lyric font (`font`). Mirrors the backend's
+  // _render_lyrics_ass resolution.
+  const artistResolved = FONT_BY_CODE[artistFont];
+  const artistFamily = artistResolved?.css || ARTIST_FONT;
+  const artistWeight = artistResolved?.weight || 800;
+  // FONT_BY_CODE[""] is a real (truthy) entry with css:undefined, so guard on
+  // the code being non-empty before using it; otherwise fall back to `font`
+  // (the lyric font), then to the catalog default.
+  const songResolved =
+    (songFont && FONT_BY_CODE[songFont]) || FONT_BY_CODE[font] || FONT_BY_CODE[""];
+  const songFamily = songResolved.css || ARTIST_FONT;
+  const songWeight = songResolved.weight || 700;
+
+  // Layout geometry mirrors ass_render._TITLE_LAYOUTS. "auto" → centered hero
+  // (the preview has no intro length, so it shows the common case). size ×
+  // titleSize, clamped 0.5–2.0 like the backend.
+  const tmpl = ["centered", "lower_third", "badge"].includes(template) ? template : "centered";
+  const L = PREVIEW_LAYOUTS[tmpl];
+  const sizeN = Math.max(0.5, Math.min(2.0, parseFloat(titleSize) || 1));
+  const maxWidth = boxW * L.safe;
 
   return (
     <div className="flex flex-col gap-1">
@@ -167,24 +189,32 @@ export default function TitleCardPreview({
               "radial-gradient(120% 80% at 50% 50%, transparent 55%, rgba(0,0,0,.5))",
           }}
         />
-        <div className="absolute inset-0 flex flex-col items-center justify-center gap-[0.4em] px-[6%] text-center">
+        <div
+          className="absolute inset-0 flex flex-col gap-[0.4em] px-[6%]"
+          style={{
+            justifyContent: L.justify,
+            alignItems: L.align,
+            textAlign: L.textAlign,
+            paddingBottom: L.padB || 0,
+          }}
+        >
           {boxW > 0 && (
             <>
               <FitLine
                 text={artistU}
-                baseSize={boxW * ARTIST_RATIO * scaleN}
+                baseSize={boxW * (L.artist / 1920) * sizeN}
                 maxWidth={maxWidth}
-                fontFamily={ARTIST_FONT}
-                weight={800}
+                fontFamily={artistFamily}
+                weight={artistWeight}
                 color="#FFFFFF"
                 opacity={0.97}
               />
               <FitLine
                 text={songD}
-                baseSize={boxW * SONG_RATIO * scaleN}
+                baseSize={boxW * (L.song / 1920) * sizeN}
                 maxWidth={maxWidth}
-                fontFamily={songFont.css || ARTIST_FONT}
-                weight={songFont.weight || 700}
+                fontFamily={songFamily}
+                weight={songWeight}
                 color="#FFFFFF"
                 opacity={0.85}
               />

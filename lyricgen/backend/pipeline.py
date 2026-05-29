@@ -504,7 +504,15 @@ def run_pipeline(job_id: str, mp3_path: str, artist: str, style: str,
                  # ~$0.80-3.20 de cuota. Ver bg_preview.py para el hash y el
                  # path en R2. None = no chequear cache (fallback al flow
                  # tradicional de Veo/Imagen inline).
-                 bg_cache_key: str | None = None):
+                 bg_cache_key: str | None = None,
+                 # Title-card customization (Full Rotor v1). Defaults reproduce
+                 # the historical look. title_size clamps 0.5-2.0; the font ids
+                 # resolve via _resolve_font ("" → ExtraBold artist / lyric song);
+                 # template ∈ auto|centered|lower_third|badge.
+                 title_template: str = "auto",
+                 title_size: float = 1.0,
+                 title_artist_font: str = "",
+                 title_song_font: str = ""):
     """Run the full pipeline for a job. Called synchronously.
 
     delivery_profile:
@@ -810,6 +818,12 @@ def run_pipeline(job_id: str, mp3_path: str, artist: str, style: str,
             "movement_style": movement_style,
             "effect": effect,
             "match_lyrics": match_lyrics,
+            # Title-card customization (Full Rotor v1). Safe defaults, always
+            # persisted so future edits/retries inherit the operator's choice.
+            "title_template": title_template,
+            "title_size": title_size,
+            "title_artist_font": title_artist_font,
+            "title_song_font": title_song_font,
         }
         # Only persist background_hint / bg_verbatim when this run actually
         # received them — otherwise a hint-less typography edit would null out
@@ -1004,6 +1018,8 @@ def run_pipeline(job_id: str, mp3_path: str, artist: str, style: str,
                 text_contrast=text_contrast,
                 effect=effect, custom_colors=custom_colors,
                 lyric_color=lyric_color, lyric_sung_color=lyric_sung_color,
+                title_template=title_template, title_size=title_size,
+                title_artist_font=title_artist_font, title_song_font=title_song_font,
             )
             files["video_url"] = f"/download/{job_id}/video"
             update_job(job_id, progress=55)
@@ -8116,6 +8132,13 @@ def _render_lyrics_ass(
     # del texto (PrimaryColour del style en ASS).
     lyric_color: str = "",
     lyric_sung_color: str = "",
+    # Title-card customization (Full Rotor v1). Defaults reproduce the
+    # historical look exactly: auto layout, no size change, artist in
+    # Montserrat ExtraBold, song in the lyric font.
+    title_template: str = "auto",
+    title_size: float = 1.0,
+    title_artist_font: str = "",
+    title_song_font: str = "",
 ) -> str:
     """Fast lyric render: burn the lyrics with libass in a single ffmpeg
     pass over the (ffmpeg-looped) background — no moviepy frame loop.
@@ -8146,15 +8169,25 @@ def _render_lyrics_ass(
         out_name="bg_looped_ass.mp4",
     )
 
-    # 2) Fonts: the lyric font + the title-card artist font (ExtraBold).
-    #    Both live in one fontsdir so libass can \fn-switch between them
+    # 2) Fonts: the lyric font + the title-card fonts. The title card can use
+    #    operator-chosen fonts per element (Full Rotor v1); defaults keep the
+    #    historical look — artist in Montserrat ExtraBold, song in the lyric
+    #    font. All live in one fontsdir so libass can \fn-switch between them
     #    without mis-matching across the pool.
     family, bold = _ass.font_family(font_path)
     extrabold_font = os.path.join(_FONTS_DIR, "Montserrat-ExtraBold.ttf")
     if not os.path.exists(extrabold_font):
         extrabold_font = font_path  # graceful fallback
+    # Per-element title fonts: resolve the chosen ids, else fall back to the
+    # historical defaults (artist = ExtraBold, song = lyric font).
+    title_artist_path = _resolve_font(title_artist_font) or extrabold_font
+    title_song_path = _resolve_font(title_song_font) or font_path
+    title_artist_family, _ = _ass.font_family(title_artist_path)
+    title_song_family, _ = _ass.font_family(title_song_path)
     artist_family, _ = _ass.font_family(extrabold_font)
-    font_dir = _ass.multi_font_dir([font_path, extrabold_font])
+    font_dir = _ass.multi_font_dir(
+        [font_path, extrabold_font, title_artist_path, title_song_path]
+    )
 
     # 3) Segments → ASS lines (same case/sanitise/sizing as moviepy), plus
     #    the artist/song title card overlay (same two layouts).
@@ -8181,12 +8214,16 @@ def _render_lyrics_ass(
         artist, song_title, first_lyric_start,
         width=spec.width, height=spec.height,
         text_scale=scale,
-        lyric_font_family=family,
-        artist_font_family=artist_family,
+        # Per-element fonts (operator-chosen, else historical defaults).
+        lyric_font_family=title_song_family,
+        artist_font_family=title_artist_family,
         # Real font files so long titles/artists are shrunk (then wrapped)
         # to the safe card width instead of overflowing the frame.
-        lyric_font_path=font_path,
-        artist_font_path=extrabold_font,
+        lyric_font_path=title_song_path,
+        artist_font_path=title_artist_path,
+        # Operator layout + size (Full Rotor v1).
+        template=title_template,
+        size_multiplier=title_size,
     )
     base_fs = _ass.lyric_fontsize(40, scale, font_scale)
     # Reusamos el mapping primary/secondary computado arriba para
@@ -8342,6 +8379,11 @@ def generate_lyric_video(
     # Lyric text colors 2026-05-25. Hex #RRGGBB; "" → blanco default.
     lyric_color: str = "",
     lyric_sung_color: str = "",
+    # Title-card customization (Full Rotor v1). Defaults = historical look.
+    title_template: str = "auto",
+    title_size: float = 1.0,
+    title_artist_font: str = "",
+    title_song_font: str = "",
 ) -> tuple[str, str, str | None]:
     """Generate a lyric video. Returns (video_path, font, bg_source).
 
@@ -8448,6 +8490,8 @@ def generate_lyric_video(
                 artist=artist, song_title=title_song,
                 effect=effect, style=style, custom_colors=custom_colors,
                 lyric_color=lyric_color, lyric_sung_color=lyric_sung_color,
+                title_template=title_template, title_size=title_size,
+                title_artist_font=title_artist_font, title_song_font=title_song_font,
             )
             logger.info("[ASS] render: %.1fs (engine=ass)", _time.monotonic() - _t0)
             audio.close()
@@ -8531,58 +8575,42 @@ def generate_lyric_video(
             scale = spec.text_scale
             START_T = 0.3            # delay before card appears
 
-            # Decide layout based on how much intro time we have. 0.8 s
-            # is the minimum window for a readable centred card; below
-            # that the user can't actually read it before the lyrics
-            # take over.
+            # Layout geometry comes from the SHARED helper (ass_render.
+            # title_card_layout) so this moviepy fallback never drifts from
+            # the libass path: same sizes, alignment, anchor, card width and
+            # opacities per template + size_multiplier. Timing (how long the
+            # card shows + fades) still follows the intro window below.
+            import ass_render as _ass
             has_long_intro = first_lyric_start > START_T + 0.5
-
+            L = _ass.title_card_layout(
+                title_template, has_long_intro, size_multiplier=title_size)
+            artist_size = max(L["floor_artist"], int(round(L["artist_base"] * scale)))
+            song_size = max(L["floor_title"], int(round(L["title_base"] * scale)))
+            card_width = int(round(spec.width * L["card_w_frac"]))
+            stroke_w = max(1, int(round((1.6 if has_long_intro else 1.2) * scale)))
+            anchor = L["anchor"]                     # center | lower_third | bottom
+            position_x_center = L["x_frac"] >= 0.5
+            base_opacity_artist = L["op_artist"]
+            base_opacity_song = L["op_song"]
+            # Per-element fonts: operator-chosen ids, else historical defaults
+            # (artist = ExtraBold, song = lyric font).
+            mvp_artist_font = _resolve_font(title_artist_font) or extrabold_font
+            mvp_song_font = _resolve_font(title_song_font) or font
             if has_long_intro:
-                # ----- CENTRED FULL CARD (long intro) -----
-                # Hero sizes: artist bigger than the 85px lyric tier, song
-                # secondary. Mirrors ass_render.title_card_lines. Bumped 2026-05
-                # (old 62/46 read smaller than the lyrics).
-                artist_size = max(30, int(round(100 * scale)))
-                title_size = max(24, int(round(62 * scale)))
-                card_width = int(round(spec.width * 0.80))
-                stroke_w = max(1, int(round(1.6 * scale)))
                 title_end = min(first_lyric_start - 0.2, START_T + 8.0)
                 clip_dur = title_end - START_T
-                # Fades scale down for short available windows so we
-                # always get at least a moment of full opacity.
                 fade_in = min(0.4, max(0.1, clip_dur * 0.25))
                 fade_out = min(0.7, max(0.1, clip_dur * 0.35))
-                position_y_center = True
-                position_x_center = True
-                base_opacity_artist = 0.97
-                base_opacity_song = 0.85
             else:
-                # ----- LOWER-LEFT BADGE (short intro fallback) -----
-                # Smaller because it sits next to the active lyric line;
-                # we never want it to compete for the user's attention,
-                # just provide identification.
-                artist_size = max(20, int(round(36 * scale)))
-                title_size = max(16, int(round(28 * scale)))
-                card_width = int(round(spec.width * 0.45))
-                stroke_w = max(1, int(round(1.2 * scale)))
                 title_end = START_T + 6.0
                 clip_dur = title_end - START_T
-                fade_in = 0.4
-                fade_out = 0.8
-                position_y_center = False     # bottom-anchored
-                position_x_center = False     # left-anchored
-                base_opacity_artist = 0.92
-                base_opacity_song = 0.80
-                logger.info(
-                    "[TITLE] first lyric at %.2fs — using lower-left badge (intro too short for centred card)",
-                    first_lyric_start,
-                )
+                fade_in, fade_out = 0.4, 0.8
 
             title_card_clips = []
 
             if artist_upper:
                 artist_clip = TextClip(
-                    artist_upper, fontsize=artist_size, font=extrabold_font,
+                    artist_upper, fontsize=artist_size, font=mvp_artist_font,
                     color="white", stroke_color="black", stroke_width=stroke_w,
                     method="caption", size=(card_width, None), align="center" if position_x_center else "West",
                 )
@@ -8590,7 +8618,7 @@ def generate_lyric_video(
 
             if title_display:
                 song_clip = TextClip(
-                    title_display, fontsize=title_size, font=font,
+                    title_display, fontsize=song_size, font=mvp_song_font,
                     color="white", stroke_color="black", stroke_width=max(1, int(round(1.2 * scale))),
                     method="caption", size=(card_width, None), align="center" if position_x_center else "West",
                 )
@@ -8599,11 +8627,12 @@ def generate_lyric_video(
             if title_card_clips:
                 total_h = sum(c.size[1] for c, _ in title_card_clips) + 8 * (len(title_card_clips) - 1)
 
-                if position_y_center:
+                if anchor == "center":
                     y_cursor = (spec.height - total_h) // 2
-                else:
-                    # Bottom margin = 8% of frame height — comfortable
-                    # safe-area for broadcast and YouTube.
+                elif anchor == "lower_third":
+                    # block centred on ~74% of frame height (broadcast lower-third)
+                    y_cursor = int(spec.height * 0.74 - total_h / 2)
+                else:  # bottom — 8% safe-area margin
                     bottom_margin = int(spec.height * 0.08)
                     y_cursor = spec.height - bottom_margin - total_h
 
@@ -9222,6 +9251,12 @@ def run_edit_pipeline(
     # colores elegidos.
     lyric_color = merged.get("lyric_color") or ""
     lyric_sung_color = merged.get("lyric_sung_color") or ""
+    # Title-card customization (Full Rotor v1). Persist across edits via
+    # render_params; defaults reproduce the historical look.
+    title_template = merged.get("title_template") or "auto"
+    title_size = float(merged.get("title_size") or 1.0)
+    title_artist_font = merged.get("title_artist_font") or ""
+    title_song_font = merged.get("title_song_font") or ""
     # Per-edit operator hint for background regen (set by /edit when the
     # user typed in the "Aclarar tipo de fondo" textarea). None if absent;
     # propagates only into the `background` branch below.
@@ -9331,6 +9366,8 @@ def run_edit_pipeline(
             line_transition=line_transition,
             effect=effect, custom_colors=custom_colors,
             lyric_color=lyric_color, lyric_sung_color=lyric_sung_color,
+            title_template=title_template, title_size=title_size,
+            title_artist_font=title_artist_font, title_song_font=title_song_font,
         )
         files = {"video_url": f"/download/{job_id}/video"}
         update_job(job_id, progress=55)
