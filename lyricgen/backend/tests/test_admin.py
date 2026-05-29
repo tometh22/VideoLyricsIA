@@ -33,6 +33,69 @@ def test_admin_create_user(client, admin_token):
     assert res.json()["plan"] == "250"
 
 
+def test_admin_create_user_in_reserved_tenant(client, admin_token):
+    """POST /admin/users must bypass the reserved-tenant guard.
+
+    `auth.create_user` defaults `enforce_reserved=True` to protect the
+    public /auth/register endpoint from a self-registered user landing
+    in a system tenant (`default`, `admin`) or squatting on a B2B name
+    (`umg`, `warner`). But the admin POST is the "admin seeding script"
+    path that the helper's own docstring says should bypass — the
+    admin is EXPLICITLY assigning the tenant.
+
+    Regression: prior to this fix, admin couldn't create UMG operators
+    because `tenant_id="umg"` got blocked by the same guard meant for
+    the public funnel. UMG onboarding 2026-05-28 hit this on the live
+    /admin/users path.
+    """
+    res = client.post("/admin/users", headers=auth(admin_token), json={
+        "username": "umg_operator_test",
+        "password": "password123",
+        "email": "op@umg-test.com",
+        "plan_id": "250",
+        "tenant_id": "umg",
+    })
+    assert res.status_code == 200, res.text
+    assert res.json()["tenant_id"] == "umg"
+
+
+def test_admin_create_multiple_users_in_same_tenant(client, admin_token):
+    """Admin must be able to place N users into a shared team tenant.
+
+    The "tenant already exists" collision check in auth.create_user
+    fires alongside the reserved-tenant guard (both inside the same
+    `if enforce_reserved` block). It protects the public funnel from
+    a user attaching themselves to a strangers tenant, but blocks the
+    intended B2B model where the admin creates a team workspace
+    (e.g. all UMG operators on tenant_id="universal_music"). This test
+    pins that admin-driven team-workspace creation works.
+    """
+    # Create the first user — claims the tenant.
+    res1 = client.post("/admin/users", headers=auth(admin_token), json={
+        "username": "umusic_op_one",
+        "password": "password123",
+        "email": "one@umusic-test.com",
+        "plan_id": "250",
+        "tenant_id": "umusic_test_team",
+    })
+    assert res1.status_code == 200, res1.text
+    assert res1.json()["tenant_id"] == "umusic_test_team"
+
+    # Create the second user — must SUCCEED, joining the same tenant.
+    res2 = client.post("/admin/users", headers=auth(admin_token), json={
+        "username": "umusic_op_two",
+        "password": "password123",
+        "email": "two@umusic-test.com",
+        "plan_id": "250",
+        "tenant_id": "umusic_test_team",
+    })
+    assert res2.status_code == 200, res2.text
+    assert res2.json()["tenant_id"] == "umusic_test_team"
+    # Different users, same tenant — they will share visibility via
+    # _job_scope in production. Confirm the IDs are distinct.
+    assert res1.json()["id"] != res2.json()["id"]
+
+
 def test_admin_update_user(client, admin_token):
     # Create user first
     create_res = client.post("/admin/users", headers=auth(admin_token), json={

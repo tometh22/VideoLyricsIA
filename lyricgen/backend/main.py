@@ -840,7 +840,21 @@ async def preview_background(
 
 @app.get("/health")
 async def health():
-    """Runtime health. No auth — used by load balancers and uptime probes.
+    """Full health snapshot — DB + Redis + R2 + queue + workers.
+
+    Kept as the legacy endpoint for backward compat (dashboards,
+    scripts, the existing daily-smoke + uptime workflows). NEW external
+    monitors should prefer the split endpoints:
+      - GET /health/live  → liveness only (cheap, no deps)
+      - GET /health/ready → full readiness (same shape as /health)
+
+    The split follows the Kubernetes liveness/readiness convention:
+    liveness answers "is the process alive?" (kill+restart if not);
+    readiness answers "should traffic be routed here?" (drain if not).
+    External monitors hitting /health every 30s with the legacy probe
+    causes 2880+ DB SELECT 1 + Redis PING + R2 HEAD calls per day per
+    monitor — usually wasted load, since liveness is what they actually
+    need. /health/live is the right target for those.
 
     Status → HTTP mapping:
       - ok, degraded, starting → 200 (LB keeps the instance in rotation)
@@ -853,6 +867,50 @@ async def health():
     container can fire before the SQLAlchemy pool seats its first
     socket, returning 503 and aborting the deploy 5/5 replicas. See
     observability.py:_within_startup_grace.
+    """
+    snap = health_snapshot()
+    if snap.get("status") == "down":
+        return JSONResponse(snap, status_code=503)
+    return snap
+
+
+@app.get("/health/live")
+async def health_live():
+    """Liveness probe — returns 200 if the Python process is responsive.
+
+    Intentionally does NOT touch DB, Redis, R2, or any external system.
+    Use this for high-frequency external monitors (BetterStack at 30s,
+    UptimeRobot at 60s) so we don't generate ~2880 DB SELECT 1 +
+    Redis PING + R2 HEAD calls per day per monitor — that's nearly all
+    wasted load, since liveness is what those monitors actually need.
+
+    A 200 here means: the FastAPI event loop is alive and serving
+    requests. It does NOT mean the app is fully functional — for that,
+    use /health/ready.
+
+    No 503 path: if the process is dying (signal received), FastAPI
+    drains in-flight requests during the lifespan shutdown handler and
+    new requests are refused at the socket level, which already gives
+    the orchestrator the "down" signal. Adding an explicit
+    shutting-down branch here would require state we don't track and
+    isn't needed for any current monitor.
+    """
+    return {"status": "alive"}
+
+
+@app.get("/health/ready")
+async def health_ready():
+    """Readiness probe — returns 200 if all dependencies are reachable.
+
+    Use this when you need to know whether the instance can actually
+    serve user traffic right now: load balancer routing decisions,
+    deploy gate ("is the new version ready to take traffic?"),
+    operational dashboards.
+
+    Same payload + semantics as /health (kept as alias for back-compat).
+    503 when a required dependency (DB, Redis in prod) is unreachable.
+    200 with status=degraded when a non-critical issue exists (low disk,
+    no live workers, etc.) but service is still usable.
     """
     snap = health_snapshot()
     if snap.get("status") == "down":

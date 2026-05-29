@@ -2,6 +2,7 @@ import { useState, useMemo, useRef, useEffect, useCallback } from "react";
 import { useI18n } from "../i18n";
 import { EditorTour } from "./OnboardingTour";
 import { useToast } from "./ToastProvider";
+import HelpTip from "./HelpCenter/HelpTip";
 import LyricsTimeline from "./LyricsTimeline";
 import LyricVideoPreview from "./LyricVideoPreview";
 import { tierForLength } from "../lib/lyricTiers";
@@ -2119,21 +2120,24 @@ export default function LyricsEditor({
               con texto a ícono discreto al lado del switcher. Atajo Cmd+K
               añadido al keyboard handler. */}
           {!syncMode && (
-            <button
-              data-tour="editor-sync-entry"
-              onClick={enterSyncMode}
-              title={t("editor.sync_cta_hint") || "Modo Sync — anclar timings por tap (⌘K / Ctrl+K)"}
-              aria-label={t("editor.sync_enter_compact") || "Modo Sync"}
-              className="hidden md:inline-flex shrink-0 w-8 h-8 rounded-md ring-1 ring-white/[0.08]
-                text-ink-secondary hover:text-brand-light hover:bg-brand/10 hover:ring-brand/30
-                transition-colors items-center justify-center"
-            >
-              <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
-                <circle cx="12" cy="12" r="9" />
-                <circle cx="12" cy="12" r="4" />
-                <circle cx="12" cy="12" r="1" fill="currentColor" />
-              </svg>
-            </button>
+            <>
+              <button
+                data-tour="editor-sync-entry"
+                onClick={enterSyncMode}
+                title={t("editor.sync_cta_hint") || "Modo Sync — anclar timings por tap (⌘K / Ctrl+K)"}
+                aria-label={t("editor.sync_enter_compact") || "Modo Sync"}
+                className="hidden md:inline-flex shrink-0 w-8 h-8 rounded-md ring-1 ring-white/[0.08]
+                  text-ink-secondary hover:text-brand-light hover:bg-brand/10 hover:ring-brand/30
+                  transition-colors items-center justify-center"
+              >
+                <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
+                  <circle cx="12" cy="12" r="9" />
+                  <circle cx="12" cy="12" r="4" />
+                  <circle cx="12" cy="12" r="1" fill="currentColor" />
+                </svg>
+              </button>
+              <HelpTip articleId="manual-sync" className="hidden md:inline-flex" />
+            </>
           )}
         </div>
       )}

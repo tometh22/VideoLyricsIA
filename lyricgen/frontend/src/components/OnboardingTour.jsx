@@ -162,9 +162,14 @@ function isReplayActive() {
 
 function shouldAutoRun(flagKey, user) {
   if (typeof window === "undefined") return false;
-  if (localStorage.getItem(flagKey) === "1") return false;
   if (!user) return false;
+  // Replay sessions bypass the done-flag check: the user explicitly asked
+  // for the tour from Settings or the Help drawer, so we honour that even
+  // if they've already seen this tour before. Important for the StrictMode
+  // dev-only unmount/remount: if we let the flag check short-circuit here,
+  // the second mount sees the flag set by the first mount and never fires.
   if (isReplayActive()) return true;
+  if (localStorage.getItem(flagKey) === "1") return false;
   return daysSince(user.created_at) < AGE_GATE_DAYS;
 }
 
@@ -176,10 +181,12 @@ function TourRunner({ flagKey, steps, user, forceRun = false, onDone }) {
 
   useEffect(() => {
     const shouldRun = forceRun || shouldAutoRun(flagKey, user);
-    if (shouldRun) {
-      // Mark as seen the moment the tour fires, not when it ends.
-      // Otherwise navigating away before finishing leaves the flag unset
-      // and the tour re-fires on every return visit.
+    // Marking the flag on auto-run prevents re-fires when the user navigates
+    // away mid-tour and comes back — but we only do it for AGE-GATED
+    // auto-runs. For replay sessions and forceRun, defer the mark to
+    // tour:end so React 18 StrictMode's mount→unmount→mount cycle doesn't
+    // swallow the tour (second mount would see flag="1" and refuse to run).
+    if (shouldRun && !forceRun && !isReplayActive()) {
       try { localStorage.setItem(flagKey, "1"); } catch {}
     }
     setRun(shouldRun);
@@ -277,6 +284,13 @@ export function DashboardTour({ user, forceRun = false, onDone }) {
       content: t("tour.dashboard_nav_body") ||
         "Desde el menú accedés a Crear, Historial y Configuración.",
       placement: "right",
+    },
+    {
+      target: '[data-tour="help-button"]',
+      title: t("tour.dashboard_help_title") || "Cualquier duda, acá",
+      content: t("tour.dashboard_help_body") ||
+        "Este botón abre el centro de ayuda con FAQs, tutoriales y troubleshooting. También se abre con la tecla ?",
+      placement: "bottom-end",
     },
   ], [t]);
   return <TourRunner flagKey={FLAGS.dashboard} steps={steps} user={user} forceRun={forceRun} onDone={onDone} />;

@@ -3,6 +3,7 @@ import { useI18n } from "../i18n";
 import Listbox from "./Listbox";
 import { UploadTour } from "./OnboardingTour";
 import WizardLivePreview from "./WizardLivePreview";
+import HelpTip from "./HelpCenter/HelpTip";
 
 const API = import.meta.env.VITE_API_URL || "";
 
@@ -889,6 +890,7 @@ export default function UploadZone({
           <div className="flex items-center gap-2 min-w-0">
             <span className="text-[10px] uppercase tracking-[0.18em] text-gray-500">
               {t("upload.delivery") || "Entrega"}
+              <HelpTip articleId="which-format" />
             </span>
             <span className="text-sm text-white truncate">
               {deliveryProfile === "youtube"
@@ -905,6 +907,7 @@ export default function UploadZone({
           <div className="flex items-center justify-between">
             <span className="text-[10px] uppercase tracking-[0.18em] text-gray-500">
               {t("upload.delivery") || "Entrega"}
+              <HelpTip articleId="which-format" />
             </span>
             <button
               type="button"
@@ -1644,7 +1647,10 @@ export default function UploadZone({
             }}
           />
 
-          <p className="text-[10px] uppercase tracking-[0.18em] text-gray-500">Fondo del video</p>
+          <p className="text-[10px] uppercase tracking-[0.18em] text-gray-500">
+            Fondo del video
+            <HelpTip articleId="backgrounds" />
+          </p>
           <p className="text-[11px] text-gray-600 mb-2 mt-0.5">
             {bgMode === "auto" ? "IA genera un fondo único por canción"
               : bgMode === "library" ? "Fondo compartido para todo el lote"

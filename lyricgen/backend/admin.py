@@ -198,6 +198,19 @@ async def create_user_admin(
     """
     from auth import create_user
     try:
+        # enforce_reserved=False because this endpoint IS the
+        # "admin seeding script" path that auth.create_user's docstring
+        # documents as needing the bypass. The reserved-tenant guard
+        # (and the sibling "tenant already exists" collision check) are
+        # there to stop self-registered users from squatting on
+        # reserved tenant names ("umg", "warner") or attaching
+        # themselves to an existing tenant via /auth/register. When the
+        # ADMIN is the one assigning the tenant — like here, when
+        # placing UMG operators into tenant_id="umusic" — both checks
+        # are unwanted: it's a deliberate team-workspace assignment.
+        # Without this, admin-managed teams can only ever have one user
+        # (whoever was created first claims the tenant; later users in
+        # the same team get rejected with "Tenant 'X' already exists").
         user = create_user(
             db,
             username=body.username,
@@ -207,6 +220,7 @@ async def create_user_admin(
             plan=body.plan_id,
             tenant_id=body.tenant_id.strip() or None,
             ai_authorized=body.ai_authorized,
+            enforce_reserved=False,
         )
         _post_create_dirty = False
         if body.allow_overage:

@@ -7,6 +7,7 @@ import ProResBadge from "./ProResBadge";
 import EditRequestPanel from "./EditRequestPanel";
 import ContentValidationToggle, { isUmgTenant } from "./ContentValidationToggle";
 import { useAlert } from "./AlertProvider";
+import HelpTip from "./HelpCenter/HelpTip";
 import EnableProResModal from "./EnableProResModal";
 import DriveTransferModal from "./DriveTransferModal";
 import VariantCreateModal from "./VariantCreateModal";
@@ -1192,6 +1193,7 @@ export default function JobDetail({ job, onBack, onJobUpdate }) {
                   className="px-2 py-0.5 rounded-full bg-amber-500/15 text-amber-300 ring-1 ring-amber-500/30 text-[10px] font-semibold uppercase tracking-wider"
                 >
                   {t("batch.pending_review") || "Pendiente"}
+                  <HelpTip articleId="approve-reject" />
                 </span>
               )}
               {isValidationFailed && (
@@ -1252,14 +1254,17 @@ export default function JobDetail({ job, onBack, onJobUpdate }) {
                   {t("detail.download_all") || "Descargar todo"}
                 </button>
                 {hasUmgMaster && (
-                  <button
-                    onClick={downloadProResMaster}
-                    className="btn-secondary text-xs h-10 px-4"
-                    data-tour="jobdetail-prores-master"
-                  >
-                    {downloadIcon}
-                    {t("detail.download_master") || "Master ProRes"}
-                  </button>
+                  <span className="inline-flex items-center">
+                    <button
+                      onClick={downloadProResMaster}
+                      className="btn-secondary text-xs h-10 px-4"
+                      data-tour="jobdetail-prores-master"
+                    >
+                      {downloadIcon}
+                      {t("detail.download_master") || "Master ProRes"}
+                    </button>
+                    <HelpTip articleId="prores-master" />
+                  </span>
                 )}
                 {hasUmgShort && (
                   <button onClick={downloadProResShort} className="btn-secondary text-xs h-10 px-4">
