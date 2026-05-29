@@ -15,6 +15,7 @@ CI / Docker (Debian ffmpeg has libass) but no-ops on a dev box without it.
 import json
 import os
 import subprocess
+import unicodedata
 
 import pytest
 
@@ -93,3 +94,42 @@ def test_libass_render_is_playable(tmp_path):
         head = f.read(2_000_000)
     moov, mdat = head.find(b"moov"), head.find(b"mdat")
     assert moov != -1 and (mdat == -1 or moov < mdat), "render lacks faststart"
+
+
+def test_libass_render_title_card_long_accented(tmp_path):
+    """The title-card path end-to-end: a LONG, NFD-accented artist over a long
+    intro forces fit_title_text to shrink (and possibly wrap with \\N) AND the
+    NFC normalisation to fire. Proves libass burns the resulting title card —
+    multi-line \\N + composed accents — into a valid, playable MP4 without
+    crashing. Guards the 2026-05 title-card fix (overflow + floating tildes)
+    at the real render level, not just the ASS-string unit level."""
+    job_dir = str(tmp_path)
+    bg = os.path.join(job_dir, "bg.mp4")
+    mp3 = os.path.join(job_dir, "a.mp3")
+    subprocess.run(["ffmpeg", "-y", "-loglevel", "error", "-f", "lavfi",
+                    "-i", "testsrc=size=640x360:rate=24:duration=8",
+                    "-pix_fmt", "yuv420p", bg], check=True, timeout=60)
+    subprocess.run(["ffmpeg", "-y", "-loglevel", "error", "-f", "lavfi",
+                    "-i", "sine=frequency=440:duration=8", mp3], check=True, timeout=60)
+
+    # first lyric at 6s → long-intro hero card (artist at the 100px tier).
+    segments = [{"start": 6.0, "end": 7.5, "text": "primera linea cantada"}]
+    # NFD (decomposed) accents, like a macOS filename: 'i'/'o' + combining acute.
+    artist_nfd = unicodedata.normalize("NFD", "Orquesta Sinfónica Münchén Filarmónica")
+    out = pipeline._render_lyrics_ass(
+        bg, mp3, segments, job_dir, 8.0,
+        spec=RenderSpec.youtube_default(), font_path=_font(),
+        artist=artist_nfd,
+        song_title="El Árbol De La Vida _ Voy A Dejarte Para Siempre Mi Amor",
+    )
+    assert os.path.exists(out) and os.path.getsize(out) > 4096
+
+    probe = subprocess.run(
+        ["ffprobe", "-v", "error", "-show_entries",
+         "stream=codec_type:format=duration", "-of", "json", out],
+        capture_output=True, text=True, timeout=30,
+    )
+    assert probe.returncode == 0, probe.stderr
+    data = json.loads(probe.stdout)
+    types = {s.get("codec_type") for s in data.get("streams", [])}
+    assert "video" in types and "audio" in types

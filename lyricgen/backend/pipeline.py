@@ -8183,6 +8183,10 @@ def _render_lyrics_ass(
         text_scale=scale,
         lyric_font_family=family,
         artist_font_family=artist_family,
+        # Real font files so long titles/artists are shrunk (then wrapped)
+        # to the safe card width instead of overflowing the frame.
+        lyric_font_path=font_path,
+        artist_font_path=extrabold_font,
     )
     base_fs = _ass.lyric_fontsize(40, scale, font_scale)
     # Reusamos el mapping primary/secondary computado arriba para
@@ -8486,8 +8490,14 @@ def generate_lyric_video(
         if not os.path.exists(extrabold_font):
             extrabold_font = font  # graceful fallback
 
-        artist_upper = artist.upper() if artist else ""
-        title_display = title_song if title_song else ""
+        # NFC-normalise so decomposed accents from macOS filenames (e.g.
+        # "Así" as 'i'+combining-acute) render attached, not as a floating
+        # mark — parity with the libass path's title_card_lines. The moviepy
+        # caption method already word-wraps within card_width, so no overflow
+        # shrink is needed on this fallback path.
+        import unicodedata as _unicodedata
+        artist_upper = _unicodedata.normalize("NFC", artist).upper() if artist else ""
+        title_display = _unicodedata.normalize("NFC", title_song) if title_song else ""
 
         # The title card MUST always appear — users (UMG, internal QA)
         # want the artist+song readable on every video. Two layouts:

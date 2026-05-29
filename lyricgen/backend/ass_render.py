@@ -217,6 +217,86 @@ def _opacity_to_alpha(opacity: float) -> int:
     return max(0, min(255, int(round((1.0 - float(opacity)) * 255))))
 
 
+def _balanced_wrap(words: list[str], width100, max_lines: int) -> list[str]:
+    """Greedily wrap `words` into up to `max_lines` lines, minimising the
+    width of the widest line. `width100` measures a string's width at the
+    reference size (100px). Only 2 lines are used in practice (the title
+    card never needs more); higher max_lines just relaxes the cap."""
+    if max_lines <= 1 or len(words) < 2:
+        return [" ".join(words)]
+    best_break, best_cost = 1, None
+    for i in range(1, len(words)):
+        left, right = " ".join(words[:i]), " ".join(words[i:])
+        cost = max(width100(left), width100(right))
+        if best_cost is None or cost < best_cost:
+            best_cost, best_break = cost, i
+    return [" ".join(words[:best_break]), " ".join(words[best_break:])]
+
+
+def fit_title_text(
+    text: str,
+    font_path: str | None,
+    base_size: int,
+    max_width: float,
+    min_size: int,
+    *,
+    max_lines: int = 2,
+) -> tuple[list[str], int]:
+    """Pick a font size and (if needed) wrap `text` so it fits `max_width`.
+
+    "Shrink, then wrap": first shrink the size from base_size toward min_size
+    to fit the whole text on ONE line; if it still doesn't fit at min_size,
+    wrap greedily into up to max_lines balanced lines and pick the largest
+    size in [min_size, base_size] whose widest wrapped line fits.
+
+    Returns (lines, fontsize). With no font_path (parity callers / tests) or
+    when PIL can't load the font, returns ([text], base_size) unchanged —
+    preserving the legacy fixed-size behaviour so nothing regresses.
+
+    Width is measured once at a 100px reference and scaled (text width grows
+    ~linearly with font size), so we never re-rasterise per candidate size.
+    """
+    text = (text or "").strip()
+    base_size = max(int(min_size), int(base_size))
+    if not text:
+        return [], base_size
+    if not font_path or max_width <= 0:
+        return [text], base_size
+    try:
+        from PIL import ImageFont
+        ref = ImageFont.truetype(font_path, 100)
+    except Exception:
+        return [text], base_size
+
+    def w100(s: str) -> float:
+        try:
+            return float(ref.getlength(s))
+        except Exception:
+            bbox = ref.getbbox(s)
+            return float(bbox[2] - bbox[0])
+
+    # 1) Largest size in [min_size, base_size] that fits on ONE line.
+    one_w = w100(text)
+    if one_w <= 0:
+        return [text], base_size
+    fit_size = int(max_width * 100.0 / one_w)
+    if fit_size >= base_size:
+        return [text], base_size
+    if fit_size >= min_size:
+        return [text], fit_size
+
+    # 2) Doesn't fit even at min_size → wrap (if there's a space to break on).
+    words = text.split()
+    if len(words) < 2:
+        return [text], min_size           # single long word: just clamp
+    wrapped = _balanced_wrap(words, w100, max_lines)
+    widest = max((w100(ln) for ln in wrapped), default=one_w)
+    size = base_size
+    if widest > 0:
+        size = max(min_size, min(base_size, int(max_width * 100.0 / widest)))
+    return wrapped, size
+
+
 def title_card_lines(
     artist: str,
     song: str,
@@ -227,6 +307,8 @@ def title_card_lines(
     text_scale: float,
     lyric_font_family: str,
     artist_font_family: str,
+    lyric_font_path: str | None = None,
+    artist_font_path: str | None = None,
 ) -> list[AssLine]:
     """Build the artist/song title-card overlay as ASS lines, mirroring the
     moviepy title card (pipeline.generate_lyric_video) so the look matches
@@ -239,12 +321,22 @@ def title_card_lines(
       - SHORT intro: compact lower-left badge, visible 0.3 s → 6.3 s.
 
     Sizes/timings/fades mirror pipeline.py:6744-6842. Line heights are
-    approximated as fontsize*1.2 for vertical stacking (libass has no
-    measure step); the moviepy card isn't pixel-locked either, so this
-    stays visually faithful.
+    approximated as fontsize*1.2 per rendered line for vertical stacking
+    (libass has no measure step); the moviepy card isn't pixel-locked either,
+    so this stays visually faithful.
+
+    Text is NFC-normalised first (the same as the lyric lines via
+    _clean_display_text) so decomposed accents from macOS filenames — e.g.
+    "Así" as 'i'+combining-acute — don't render as a detached floating mark.
+
+    When font paths are supplied, long titles/artists are shrunk (and, only
+    if they still don't fit, wrapped into 2 lines) to the card's safe width
+    instead of overflowing the frame. With no paths (parity tests) the legacy
+    fixed sizing is kept unchanged.
     """
-    artist_u = (artist or "").strip().upper()
-    song_d = (song or "").strip()
+    import unicodedata
+    artist_u = unicodedata.normalize("NFC", (artist or "").strip()).upper()
+    song_d = unicodedata.normalize("NFC", (song or "").strip())
     if not artist_u and not song_d:
         return []
 
@@ -263,6 +355,7 @@ def title_card_lines(
         fade_out = min(0.7, max(0.1, clip_dur * 0.35))
         alignment = 5            # centred
         op_artist, op_song = 0.97, 0.85
+        card_w_frac = 0.80       # centred card: 80% of frame width (matches moviepy)
     else:
         artist_size = max(20, int(round(36 * text_scale)))
         title_size = max(16, int(round(28 * text_scale)))
@@ -271,19 +364,41 @@ def title_card_lines(
         fade_in, fade_out = 0.4, 0.8
         alignment = 4            # left-middle (lower-left badge)
         op_artist, op_song = 0.92, 0.80
+        card_w_frac = 0.45       # lower-left badge: narrower (matches moviepy)
+
+    # Shrink (then wrap) each line to the card's safe width so long titles /
+    # artist names don't overflow the frame. min_size = 62% of the base tier,
+    # floored at 16px. With no font path supplied this is a no-op (returns the
+    # single line at base_size) so the parity callers/tests keep the old look.
+    max_w = width * card_w_frac
+
+    def _fit(text: str, base: int, font_path):
+        return fit_title_text(
+            text, font_path, base, max_w, max(16, int(round(base * 0.62))),
+        )
 
     # Stack the present lines and compute each one's vertical CENTER as a
-    # fraction of the frame. Approximate line height = 1.2 * fontsize, with
-    # the same 8 px gap moviepy uses between artist and title.
-    stack: list[tuple[str, int, str, bool, float]] = []  # text, size, font, bold, opacity
+    # fraction of the frame. Approximate line height = 1.2 * fontsize PER
+    # wrapped line, with the same 8 px gap moviepy uses between artist and
+    # title. Each entry carries its (possibly wrapped) text, fitted size,
+    # font, weight, opacity, and rendered line count.
+    # Wrapped lines are joined with a real newline; build_ass's _ass_escape
+    # turns "\n" into the ASS hard break "\N" (and escapes any braces). We
+    # must NOT pre-insert a literal "\N" here — _ass_escape escapes the
+    # backslash first, which would print a literal "\N" instead of breaking.
+    stack: list[tuple[str, int, str, bool, float, int]] = []
     if artist_u:
-        stack.append((artist_u, artist_size, artist_font_family, True, op_artist))
+        a_lines, a_size = _fit(artist_u, artist_size, artist_font_path)
+        stack.append(("\n".join(a_lines), a_size,
+                      artist_font_family, True, op_artist, len(a_lines)))
     if song_d:
-        stack.append((song_d, title_size, lyric_font_family, False, op_song))
+        s_lines, s_size = _fit(song_d, title_size, lyric_font_path)
+        stack.append(("\n".join(s_lines), s_size,
+                      lyric_font_family, False, op_song, len(s_lines)))
     if not stack:
         return []
 
-    line_hs = [1.2 * size for _, size, _, _, _ in stack]
+    line_hs = [1.2 * size * nlines for _, size, _, _, _, nlines in stack]
     gap = 8.0
     total_h = sum(line_hs) + gap * (len(stack) - 1)
 
@@ -303,7 +418,7 @@ def title_card_lines(
     cursor = top
     fade_in_ms = int(round(fade_in * 1000))
     fade_out_ms = int(round(fade_out * 1000))
-    for (txt, size, fam, bold, opacity), lh in zip(stack, line_hs):
+    for (txt, size, fam, bold, opacity, _nlines), lh in zip(stack, line_hs):
         center_y = cursor + lh / 2.0
         lines.append(AssLine(
             text=txt,

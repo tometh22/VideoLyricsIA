@@ -953,6 +953,7 @@ export const translations = {
     "editor.editing_wizard_sub": "Corregí cualquier campo y re-renderizá. Lo que no cambies queda igual.",
     "editor.editing_artist": "Editar artista",
     "editor.editing_title": "Editar título",
+    "editor.title_card_preview": "Vista previa de la portada",
     "edit.error_title": "No pudimos aplicar el edit",
     "edit.not_editable_title": "No se puede editar ahora",
     "edit.not_editable_subtitle": "Este video está en un estado en el que no se puede editar. Esperá a que termine el render o que pase a revisión.",
