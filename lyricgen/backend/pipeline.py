@@ -831,12 +831,21 @@ def run_pipeline(job_id: str, mp3_path: str, artist: str, style: str,
         except Exception as _rp_exc:
             logger.warning("[BG] merge_render_params failed: %s", _rp_exc)
 
-        # Cache AI-generated background to R2 so a typography-only edit
-        # can re-use it without another Veo call ($0.80 saved per edit).
-        # Only worth doing when storage is available and the background is
-        # a file we own (not a human-provided upload — those already have
-        # their own R2 key in bg_r2_key).
-        if bg_image_path and os.path.exists(bg_image_path) and not background_path:
+        # Cache the rendered background to R2 so subsequent edits
+        # (typography / lyrics / metadata) can re-use it without another
+        # Veo call ($0.80 saved per edit).
+        #
+        # HOTFIX 2026-05-29: previously this only ran when `not background_path`
+        # (= AI-generated only). Operators who uploaded their own bg or
+        # picked one from the library ended up with bg_r2_key_cached=NULL
+        # → they could not do ANY fast-path edit (the /edit endpoint hard-
+        # rejected with "No cached background available"). Reported by
+        # Agus.Cafisi in prod on job aedae037aa02: she wanted to fix a
+        # typo in the title (metadata edit) on a job that used an uploaded
+        # background — blocked with no way forward except "regenerate the
+        # bg for $0.90" which is absurd UX for a one-character typo. The
+        # cache is identical regardless of bg source, so always do it.
+        if bg_image_path and os.path.exists(bg_image_path):
             import storage as _storage
             if _storage.is_enabled():
                 try:
