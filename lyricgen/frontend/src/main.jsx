@@ -6,6 +6,7 @@ import App from "./App";
 import GlobalErrorBoundary from "./components/GlobalErrorBoundary";
 import { AlertProvider } from "./components/AlertProvider";
 import { ToastProvider } from "./components/ToastProvider";
+import { HelpProvider } from "./components/HelpCenter/HelpProvider";
 import "./index.css";
 
 // QA fix 2026-05-28: post-deploy stale-bundle reload. Cuando Vercel
@@ -43,7 +44,9 @@ ReactDOM.createRoot(document.getElementById("root")).render(
         <I18nProvider>
           <AlertProvider>
             <ToastProvider>
-              <App />
+              <HelpProvider>
+                <App />
+              </HelpProvider>
             </ToastProvider>
           </AlertProvider>
         </I18nProvider>
