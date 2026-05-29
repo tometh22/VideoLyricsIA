@@ -63,6 +63,9 @@ export const translations = {
     "nav.history": "Historial",
     "nav.settings": "Configuración",
     "nav.editor": "Editor de letras",
+    // Sidebar usage badge
+    "sidebar.usage.this_month": "este mes",
+    "sidebar.usage.overage": "excedente",
     "nav.system_ok": "Sistema operativo",
     "nav.logout": "Cerrar sesión",
     "nav.start": "Comenzar",
@@ -1322,6 +1325,8 @@ export const translations = {
     "nav.dashboard": "Home",
     "nav.new_batch": "Create videos",
     "nav.history": "History",
+    "sidebar.usage.this_month": "this month",
+    "sidebar.usage.overage": "overage",
     "nav.settings": "Settings",
     "nav.editor": "Lyrics editor",
     "nav.system_ok": "System online",
@@ -2213,6 +2218,8 @@ export const translations = {
 
     "nav.dashboard": "Início",
     "nav.new_batch": "Criar vídeos",
+    "sidebar.usage.this_month": "este mês",
+    "sidebar.usage.overage": "excedente",
     "nav.history": "Histórico",
     "nav.settings": "Configurações",
     "nav.editor": "Editor de letras",
