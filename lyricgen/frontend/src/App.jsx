@@ -8,6 +8,7 @@ import { IS_PRODUCTION, APP_ENV } from "./env";
 import { fetchWithTimeout } from "./fetchWithTimeout";
 import { uploadFileToR2 } from "./r2Upload";
 import * as wizardPersistence from "./wizardPersistence";
+import { setSentryUser } from "./observability";
 import LoginPage from "./components/LoginPage";
 import Landing from "./components/Landing";
 import Sidebar from "./components/Sidebar";
@@ -1290,6 +1291,9 @@ export default function App() {
     localStorage.setItem("genly_user", JSON.stringify(newUser));
     setToken(newToken);
     setUser(newUser);
+    // Scope Sentry events to this user (no PII — username/tenant/role
+    // only). No-op if Sentry is disabled.
+    setSentryUser(newUser);
   };
 
   // Self-heal: if we have a valid token but the user object is missing
@@ -1321,6 +1325,7 @@ export default function App() {
         if (data && data.username) {
           localStorage.setItem("genly_user", JSON.stringify(data));
           setUser(data);
+          setSentryUser(data);
         }
       })
       .catch(() => { /* swallow; next page load will retry */ });
@@ -1366,6 +1371,9 @@ export default function App() {
     // content; keep purely-UX state (sidebar, theme) alone.
     setToken(null);
     setUser(null);
+    // Clear Sentry user scope so post-logout events don't mis-attribute
+    // to the user who just left.
+    setSentryUser(null);
     setFiles([]);
     setReviewQueue([]);
     setCurrentReview(null);
