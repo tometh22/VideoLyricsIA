@@ -368,3 +368,220 @@ def test_cannot_create_variant_of_other_tenant_job(client, db, monkeypatch):
     )
     # 404 — no leakeamos info de que el job existe en otro tenant
     assert r.status_code == 404
+
+
+# ───────────────────────────────────────────────────────────────────
+# Variant cap (PR feat/variant-cap, 2026-05-29)
+# Each plan includes 3 renders of the same song (original + 2 variants).
+# The 4th onward costs $0.90 USD passthrough (Veo background generation).
+# Tests here lock that contract.
+# ───────────────────────────────────────────────────────────────────
+
+
+def _seed_done_job_for_song(db, *, owner_id, tenant_id, artist, song_title, parent_job_id=None):
+    """Same as `_seed_done_job` but lets the test pin the song identity
+    so we can build a multi-variant scenario for the same (artist, title).
+    Otherwise identical fixture shape."""
+    jid = f"var_{uuid.uuid4().hex[:6]}"
+    db.add(Job(
+        job_id=jid,
+        user_id=owner_id,
+        tenant_id=tenant_id,
+        artist=artist,
+        song_title=song_title,
+        filename="track.wav",
+        style="oscuro",
+        status="done",
+        current_step="thumbnail",
+        progress=100,
+        delivery_profile="youtube",
+        segments_json=[{"start": 0.0, "end": 1.0, "text": "x"}],
+        input_r2_key="inputs/synth/track.wav",
+        bg_r2_key_cached="backgrounds/synth/bg.mp4",
+        parent_job_id=parent_job_id,
+        created_at=datetime.now(timezone.utc),
+        completed_at=datetime.now(timezone.utc),
+    ))
+    db.commit()
+    return jid
+
+
+def test_variant_third_render_is_free(client, user_token, db, monkeypatch):
+    """The 3rd render (original + 2 variants) is the LAST included one.
+    No acknowledge_variant_overage required."""
+    me = _decode_user(client, user_token)
+    # Two existing renders of the same song (the "original" + one variant).
+    parent_id = _seed_done_job_for_song(
+        db, owner_id=me["id"], tenant_id=me["tenant_id"],
+        artist="Los Abuelos de la Nada", song_title="Cosas Mías",
+    )
+    _seed_done_job_for_song(
+        db, owner_id=me["id"], tenant_id=me["tenant_id"],
+        artist="Los Abuelos de la Nada", song_title="Cosas Mías",
+        parent_job_id=parent_id,
+    )
+
+    monkeypatch.setattr("main.enqueue_pipeline", lambda **kw: "fake")
+    r = client.post(
+        f"/jobs/{parent_id}/variant",
+        json={},
+        headers={"Authorization": f"Bearer {user_token}"},
+    )
+    # 3rd render total → still included, no extra cost, no ack required.
+    assert r.status_code == 200, r.text
+
+
+def test_variant_fourth_render_requires_acknowledgement(client, user_token, db, monkeypatch):
+    """The 4th render of the same song must be acknowledged. Without the
+    flag, the endpoint returns 402 with `variant_overage_unconfirmed` +
+    a structured body the frontend can read to show a confirm modal."""
+    me = _decode_user(client, user_token)
+    parent_id = _seed_done_job_for_song(
+        db, owner_id=me["id"], tenant_id=me["tenant_id"],
+        artist="Bersuit Vergarabat", song_title="Vuelos",
+    )
+    # Two prior variants → with the parent that's 3 renders existing,
+    # so a new variant would be the 4th.
+    _seed_done_job_for_song(
+        db, owner_id=me["id"], tenant_id=me["tenant_id"],
+        artist="Bersuit Vergarabat", song_title="Vuelos",
+        parent_job_id=parent_id,
+    )
+    _seed_done_job_for_song(
+        db, owner_id=me["id"], tenant_id=me["tenant_id"],
+        artist="Bersuit Vergarabat", song_title="Vuelos",
+        parent_job_id=parent_id,
+    )
+
+    monkeypatch.setattr("main.enqueue_pipeline", lambda **kw: "fake")
+    r = client.post(
+        f"/jobs/{parent_id}/variant",
+        json={},  # NOT acknowledged
+        headers={"Authorization": f"Bearer {user_token}"},
+    )
+    assert r.status_code == 402, r.text
+    body = r.json()
+    # FastAPI wraps `detail` around our structured payload.
+    detail = body["detail"]
+    assert detail["code"] == "variant_overage_unconfirmed"
+    assert detail["existing_renders"] == 3
+    assert detail["included_per_song"] == 3
+    assert detail["cost_extra_usd"] == 0.90
+    assert "Bersuit Vergarabat" in detail.get("artist", "")
+    assert detail.get("song_title") == "Vuelos"
+
+
+def test_variant_fourth_render_proceeds_when_acknowledged(client, user_token, db, monkeypatch):
+    """When `acknowledge_variant_overage: true`, the endpoint creates the
+    variant AND writes an AuditLog row capturing the charge."""
+    me = _decode_user(client, user_token)
+    parent_id = _seed_done_job_for_song(
+        db, owner_id=me["id"], tenant_id=me["tenant_id"],
+        artist="Intoxicados", song_title="Don Electrón",
+    )
+    _seed_done_job_for_song(
+        db, owner_id=me["id"], tenant_id=me["tenant_id"],
+        artist="Intoxicados", song_title="Don Electrón",
+        parent_job_id=parent_id,
+    )
+    _seed_done_job_for_song(
+        db, owner_id=me["id"], tenant_id=me["tenant_id"],
+        artist="Intoxicados", song_title="Don Electrón",
+        parent_job_id=parent_id,
+    )
+
+    monkeypatch.setattr("main.enqueue_pipeline", lambda **kw: "fake")
+    r = client.post(
+        f"/jobs/{parent_id}/variant",
+        json={"acknowledge_variant_overage": True},
+        headers={"Authorization": f"Bearer {user_token}"},
+    )
+    assert r.status_code == 200, r.text
+
+    # AuditLog row recorded the overage charge with the right metadata.
+    db.expire_all()
+    charge = (
+        db.query(AuditLog)
+        .filter(AuditLog.action == "variant.overage_charge")
+        .order_by(AuditLog.id.desc())
+        .first()
+    )
+    assert charge is not None
+    assert charge.detail["parent_job_id"] == parent_id
+    assert charge.detail["existing_renders_before_this_one"] == 3
+    assert charge.detail["would_be_render_number"] == 4
+    assert charge.detail["cost_usd"] == 0.90
+    assert charge.detail["artist"] == "Intoxicados"
+
+
+def test_variant_cap_is_per_song_not_per_tenant(client, user_token, db, monkeypatch):
+    """A different song in the same tenant must have its OWN counter.
+    Without this isolation, an operator who hit 3 variants on song A
+    couldn't make a single variant of song B without acknowledging an
+    overage that doesn't actually apply."""
+    me = _decode_user(client, user_token)
+    # 3 prior renders of song A — that song is at the cap.
+    parent_a = _seed_done_job_for_song(
+        db, owner_id=me["id"], tenant_id=me["tenant_id"],
+        artist="Bersuit Vergarabat", song_title="El Baile De La Gambeta",
+    )
+    _seed_done_job_for_song(
+        db, owner_id=me["id"], tenant_id=me["tenant_id"],
+        artist="Bersuit Vergarabat", song_title="El Baile De La Gambeta",
+        parent_job_id=parent_a,
+    )
+    _seed_done_job_for_song(
+        db, owner_id=me["id"], tenant_id=me["tenant_id"],
+        artist="Bersuit Vergarabat", song_title="El Baile De La Gambeta",
+        parent_job_id=parent_a,
+    )
+    # Different song — only 1 render so far. First variant should be FREE.
+    parent_b = _seed_done_job_for_song(
+        db, owner_id=me["id"], tenant_id=me["tenant_id"],
+        artist="Rata Blanca", song_title="Mujer Amante",
+    )
+
+    monkeypatch.setattr("main.enqueue_pipeline", lambda **kw: "fake")
+    r = client.post(
+        f"/jobs/{parent_b}/variant",
+        json={},  # NOT acknowledged
+        headers={"Authorization": f"Bearer {user_token}"},
+    )
+    assert r.status_code == 200, (
+        f"first variant of song B was incorrectly blocked because song A "
+        f"is at the cap (response: {r.text})"
+    )
+
+
+def test_variant_cap_case_insensitive_song_match(client, user_token, db, monkeypatch):
+    """Casing/whitespace drift in artist or title still groups variants
+    of the same song. `Cosas mías` and `COSAS MÍAS` are the same song,
+    same as in get_plan_usage."""
+    me = _decode_user(client, user_token)
+    parent_id = _seed_done_job_for_song(
+        db, owner_id=me["id"], tenant_id=me["tenant_id"],
+        artist="los abuelos de la nada", song_title="cosas mias",  # lower
+    )
+    _seed_done_job_for_song(
+        db, owner_id=me["id"], tenant_id=me["tenant_id"],
+        artist="LOS ABUELOS DE LA NADA", song_title="COSAS MIAS",  # upper
+        parent_job_id=parent_id,
+    )
+    _seed_done_job_for_song(
+        db, owner_id=me["id"], tenant_id=me["tenant_id"],
+        artist="  Los Abuelos De La Nada  ", song_title="Cosas Mias",  # mixed+padding
+        parent_job_id=parent_id,
+    )
+    # 3 existing renders (all the "same song" after case-folding).
+    # 4th must trigger the overage check.
+    monkeypatch.setattr("main.enqueue_pipeline", lambda **kw: "fake")
+    r = client.post(
+        f"/jobs/{parent_id}/variant",
+        json={},
+        headers={"Authorization": f"Bearer {user_token}"},
+    )
+    assert r.status_code == 402, (
+        f"casing drift broke variant cap dedup — 3 renders of same song "
+        f"weren't recognised as siblings (response: {r.text})"
+    )
+    assert r.json()["detail"]["code"] == "variant_overage_unconfirmed"
