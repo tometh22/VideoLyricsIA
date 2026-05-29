@@ -1,16 +1,21 @@
 import { useRef, useState, useLayoutEffect } from "react";
+import { FONT_BY_CODE, applyCase } from "./fontCatalog";
 
 /**
- * Live, approximate preview of the intro title card (artist over song) as it
+ * Live, faithful preview of the intro title card (artist over song) as it
  * will render in the lyric video. Mirrors the backend `title_card_lines`
- * layout: artist big + ExtraBold + UPPERCASE on top, song title smaller below,
- * centred, with a black outline. Most importantly it mirrors the backend's
- * "shrink, then wrap" fitting (ass_render.fit_title_text) so the operator can
- * SEE — while editing the title/artist inputs — whether a long string will be
- * shrunk or wrapped, instead of finding out only after a ~5-10 min re-render.
+ * layout AND fonts:
+ *   - artist: Montserrat ExtraBold (weight 800), UPPERCASE — hardcoded in the
+ *     backend at pipeline.py (Montserrat-ExtraBold.ttf).
+ *   - song:   the operator's chosen lyric font, resolved through the SAME
+ *     shared catalog (fontCatalog.FONT_BY_CODE) the WizardLivePreview uses, so
+ *     what the operator sees here matches what the worker burns via libass.
  *
- * It is approximate (CSS/DOM measuring, not libass) — its job is to catch the
- * "too long" case, not to be pixel-identical to the final MP4.
+ * It also mirrors the backend's "shrink, then wrap" fitting
+ * (ass_render.fit_title_text): measure the real text at the base size, shrink
+ * toward 62% to fit the safe card width, and only then wrap to two lines — so
+ * the operator can SEE whether a long title/artist shrinks or wraps BEFORE the
+ * ~5-10 min re-render. Approximate (CSS/DOM vs libass), but font-faithful.
  */
 
 // Base font sizes as a fraction of the 1920px render width, matching the
@@ -20,6 +25,8 @@ const ARTIST_RATIO = 100 / 1920;
 const SONG_RATIO = 62 / 1920;
 const SAFE_W_FRAC = 0.8;
 const MIN_RATIO = 0.62;
+
+const ARTIST_FONT = "'Montserrat', system-ui, sans-serif"; // ExtraBold (800)
 
 function nfc(s) {
   try {
@@ -35,7 +42,7 @@ function nfc(s) {
  * span gives the natural single-line width at the base size; everything else
  * is derived from that one measurement (width scales ~linearly with size).
  */
-function FitLine({ text, baseSize, maxWidth, weight, color, opacity }) {
+function FitLine({ text, baseSize, maxWidth, fontFamily, weight, color, opacity }) {
   const measureRef = useRef(null);
   const [{ size, wrap }, setFit] = useState({ size: baseSize, wrap: false });
 
@@ -53,13 +60,12 @@ function FitLine({ text, baseSize, maxWidth, weight, color, opacity }) {
       const fit = (maxWidth * baseSize) / natural;
       setFit(fit >= minSize ? { size: fit, wrap: false } : { size: minSize, wrap: true });
     }
-  }, [text, baseSize, maxWidth]);
+  }, [text, baseSize, maxWidth, fontFamily, weight]);
 
   if (!text) return null;
 
   const common = {
-    fontFamily:
-      '"Montserrat", system-ui, -apple-system, "Segoe UI", Roboto, sans-serif',
+    fontFamily,
     fontWeight: weight,
     lineHeight: 1.05,
     letterSpacing: "-0.01em",
@@ -102,7 +108,14 @@ function FitLine({ text, baseSize, maxWidth, weight, color, opacity }) {
   );
 }
 
-export default function TitleCardPreview({ artist = "", song = "", label }) {
+export default function TitleCardPreview({
+  artist = "",
+  song = "",
+  font = "",
+  textCase = "upper",
+  fontScale = "1.0",
+  label,
+}) {
   const boxRef = useRef(null);
   const [boxW, setBoxW] = useState(0);
 
@@ -119,8 +132,16 @@ export default function TitleCardPreview({ artist = "", song = "", label }) {
     return () => ro.disconnect();
   }, []);
 
+  // The backend always UPPERCASEs the artist; the song follows the operator's
+  // textCase (same as the lyric lines). NFC-normalise to match the render's
+  // accent handling (ass_render.title_card_lines).
   const artistU = nfc(artist).trim().toUpperCase();
-  const songD = nfc(song).trim();
+  const songD = applyCase(nfc(song).trim(), textCase);
+
+  // Song renders in the chosen lyric font (shared catalog); artist in
+  // Montserrat ExtraBold. fontScale nudges both, clamped like the backend.
+  const songFont = FONT_BY_CODE[font] || FONT_BY_CODE[""];
+  const scaleN = Math.max(0.6, Math.min(1.5, parseFloat(fontScale) || 1));
   const maxWidth = boxW * SAFE_W_FRAC;
 
   return (
@@ -151,17 +172,19 @@ export default function TitleCardPreview({ artist = "", song = "", label }) {
             <>
               <FitLine
                 text={artistU}
-                baseSize={boxW * ARTIST_RATIO}
+                baseSize={boxW * ARTIST_RATIO * scaleN}
                 maxWidth={maxWidth}
+                fontFamily={ARTIST_FONT}
                 weight={800}
                 color="#FFFFFF"
                 opacity={0.97}
               />
               <FitLine
                 text={songD}
-                baseSize={boxW * SONG_RATIO}
+                baseSize={boxW * SONG_RATIO * scaleN}
                 maxWidth={maxWidth}
-                weight={700}
+                fontFamily={songFont.css || ARTIST_FONT}
+                weight={songFont.weight || 700}
                 color="#FFFFFF"
                 opacity={0.85}
               />

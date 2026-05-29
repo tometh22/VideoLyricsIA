@@ -3009,11 +3009,16 @@ export default function App() {
         {/* Live title-card preview: shows the operator how the intro title
             card will look (and whether a long title/artist gets shrunk or
             wrapped) BEFORE the ~5-10 min re-render. Updates as they type.
-            Approximate — mirrors ass_render.fit_title_text, not pixel-exact. */}
+            Renders with the operator's REAL chosen font (song) + Montserrat
+            ExtraBold (artist) via the shared font catalog, so it matches what
+            libass burns. Mirrors ass_render.fit_title_text, not pixel-exact. */}
         <div className="w-full sm:w-[320px] mt-3">
           <TitleCardPreview
             artist={currentReview.artist || ""}
             song={currentReview.songTitle || ""}
+            font={currentReview.font || ""}
+            textCase={currentReview.textCase || "upper"}
+            fontScale={currentReview.fontScale || "1.0"}
             label={t("editor.title_card_preview") || "Vista previa de la portada"}
           />
         </div>
