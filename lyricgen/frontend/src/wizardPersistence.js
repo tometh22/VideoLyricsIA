@@ -133,14 +133,58 @@ export function clear() {
 /**
  * Does the snapshot have anything worth resuming? An empty object with
  * just a timestamp shouldn't trigger the banner.
+ *
+ * HOTFIX 2026-05-29: a snapshot is ONLY resumable if at least one entry
+ * has a real audio file (`File` blob) we can replay. After a refresh
+ * the blobs are gone (sessionStorage can't hold them), so the rehydrate
+ * produces stub objects with `name`/`size`/`type` but no `slice` /
+ * Blob interface. Restoring such state lands the operator on a wizard
+ * that can't play audio AND can't call `/generate` (the backend needs
+ * the audio file). Worse, multiple call sites assume `entry.file` is a
+ * real File and crash with "Cannot read properties of null (reading
+ * 'name')" or `createObjectURL` "Overload resolution failed", tripping
+ * the GlobalErrorBoundary into "Algo salió mal".
+ *
+ * The defensive contract: we only mark the snapshot resumable if there
+ * is something the operator could actually finish — at least one entry
+ * with a real File (transient survive within the same tab, e.g. after
+ * navigating to /videos and back, but NOT across a full refresh). When
+ * the snapshot is "skeletal" (only stubs + segments), we treat it as
+ * non-resumable and let the caller `clear()` it to start fresh.
+ *
+ * This is a one-way fix: a skeletal snapshot is impossible to recover
+ * because the audio bytes simply aren't there. Offering "Continuar"
+ * just routes the operator into a broken state.
  */
+function _hasReplayableAudio(entry) {
+  if (!entry || !entry.file) return false;
+  // A real File is a Blob; a rehydrated stub is a plain object with
+  // _restoredStub or no slice/Blob interface. We accept the stub iff
+  // the page hasn't been refreshed since save — `_file` (raw File)
+  // would still be on the entry then.
+  if (entry._file && typeof entry._file.slice === "function") return true;
+  if (entry.file && typeof entry.file.slice === "function") return true;
+  return false;
+}
+
 export function hasResumableContent(snapshot) {
   if (!snapshot) return false;
-  return (
+  const hasContent =
     (snapshot.approvedJobs?.length || 0) > 0 ||
     snapshot.currentReview != null ||
-    (snapshot.reviewQueue?.length || 0) > 0
-  );
+    (snapshot.reviewQueue?.length || 0) > 0;
+  if (!hasContent) return false;
+
+  // 2026-05-29 defensive: require at least one entry with a replayable
+  // File. A post-refresh snapshot has only stubs (no Blob) and is
+  // impossible to /generate from — surface that as "not resumable".
+  const allEntries = [
+    ...(snapshot.approvedJobs || []),
+    ...(snapshot.currentReview ? [snapshot.currentReview] : []),
+    ...(snapshot.reviewQueue || []),
+    ...(snapshot.files || []),
+  ];
+  return allEntries.some(_hasReplayableAudio);
 }
 
 /**

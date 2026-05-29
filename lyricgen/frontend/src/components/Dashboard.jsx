@@ -246,13 +246,8 @@ export default function Dashboard({ user, history, historyError, historyLoaded =
 
   const monthlySubtitle = (() => {
     if (history.length === 0) return "Subí tu primer audio para empezar";
-    // 2026-05-29: el contador habla en CANCIONES, no en videos —
-    // alineado con el cambio de modelo de pricing (las variantes/
-    // opciones de la misma canción no suman al cupo). Si el modelo
-    // alguna vez vuelve a contar renders, hay que rotar también este
-    // copy + UsageBadge + Settings + Landing.
-    if (monthlyUsed === 0) return "Aún no aprobaste canciones este mes";
-    return `${monthlyUsed} ${monthlyUsed === 1 ? "canción aprobada" : "canciones aprobadas"} este mes`;
+    if (monthlyUsed === 0) return "Aún no completaste videos este mes";
+    return `${monthlyUsed} ${monthlyUsed === 1 ? "video listo" : "videos listos"} este mes`;
   })();
 
   // 2026-05-25 — Atención drawer state. Los banners de quota+errors
@@ -529,7 +524,7 @@ export default function Dashboard({ user, history, historyError, historyLoaded =
                       Pasaste el plan mensual — los extras se facturan al cierre
                     </p>
                     <p className="text-xs text-ink-secondary mt-0.5">
-                      {monthlyUsed} canciones aprobadas · {usage.overage} adicionales × ${usage.overage_cost_per_video}{" "}
+                      {monthlyUsed} videos generados · {usage.overage} adicionales × ${usage.overage_cost_per_video}{" "}
                       = <span className="font-semibold text-white">${usage.overage_total}</span> a abonar este mes.
                     </p>
                   </>
@@ -539,7 +534,7 @@ export default function Dashboard({ user, history, historyError, historyLoaded =
                       Llegaste al límite mensual ({monthlyUsed}/{monthlyLimit})
                     </p>
                     <p className="text-xs text-red-300/80 mt-0.5">
-                      No vas a poder aprobar más canciones hasta el mes que viene. Si necesitás extender el cupo, escribinos a{" "}
+                      No vas a poder subir más videos hasta el mes que viene. Si necesitás extender el cupo, escribinos a{" "}
                       <a href="mailto:soporte@genly.pro" className="underline font-medium hover:text-red-200">
                         soporte@genly.pro
                       </a>.
@@ -548,11 +543,11 @@ export default function Dashboard({ user, history, historyError, historyLoaded =
                 ) : (
                   <>
                     <p className="text-sm font-semibold text-amber-200">
-                      Te quedan {monthlyLimit - monthlyUsed} canciones este mes ({monthlyUsed}/{monthlyLimit})
+                      Te quedan {monthlyLimit - monthlyUsed} videos este mes ({monthlyUsed}/{monthlyLimit})
                     </p>
                     <p className="text-xs text-amber-300/80 mt-0.5">
                       {user?.allow_overage
-                        ? `Pasado el tope, cada canción adicional cuesta $${usage.overage_cost_per_video} y se factura al cierre.`
+                        ? `Pasado el tope, cada video adicional cuesta $${usage.overage_cost_per_video} y se factura al cierre.`
                         : <>Si vas a necesitar más, contactanos antes de llegar al tope:{" "}
                             <a href="mailto:soporte@genly.pro" className="underline font-medium hover:text-amber-200">
                               soporte@genly.pro

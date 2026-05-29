@@ -1027,9 +1027,25 @@ export default function App() {
   // Snapshot of any pending batch found in sessionStorage at mount time.
   // Drives the resume banner. Cleared when the operator clicks
   // Continuar/Descartar or starts a fresh batch.
+  //
+  // HOTFIX 2026-05-29: if a snapshot exists but is no longer resumable
+  // (post-refresh, only file STUBS without real Blobs), eagerly clear it
+  // on mount. Without this the autosave would just keep overwriting
+  // sessionStorage with the same skeletal state until the operator
+  // does something fresh — and any pre-existing crash path that reads
+  // `entry.file` on a stub keeps firing on every render. The user
+  // reported "Algo salió mal" → reload → same screen, that's the loop
+  // this prevents. Compatible with the previous resume behaviour:
+  // if files ARE replayable (i.e. user navigated within the SPA without
+  // a refresh), the snapshot still resumes normally.
   const [resumableWizard, setResumableWizard] = useState(() => {
     const snap = wizardPersistence.load();
-    return wizardPersistence.hasResumableContent(snap) ? snap : null;
+    if (!snap) return null;
+    if (wizardPersistence.hasResumableContent(snap)) return snap;
+    // Skeletal snapshot. Wipe it so the autosave doesn't immediately
+    // re-persist and so future renders don't see ghost state.
+    try { wizardPersistence.clear(); } catch { /* noop */ }
+    return null;
   });
   // Skip persistence saves while we're actively restoring state — otherwise
   // the useEffect below fires on every setX call from the restore and
@@ -2320,19 +2336,64 @@ export default function App() {
       persistSegmentsToBackend(r.transcribeJobId, editedSegments);
     }
 
+    // HOTFIX 2026-05-29 (#473.2): wrap el switch final en try/catch.
+    // startGenerationWithSegments puede crashear si el state está corrupto
+    // (stub file post-refresh). Sin este wrapper, el error burbujea al
+    // GlobalErrorBoundary y el usuario ve "Algo salió mal" sin recovery
+    // claro — termina en /new pensando que tiene que subir todo de nuevo,
+    // pero el job en backend queda en transcribed_pending huérfano.
     const nextIdx = r.queueIdx + 1;
-    if (nextIdx < r.queue.length) {
-      transcribeNext(r.queue, nextIdx);
-    } else if (r.queue.length === 1) {
-      startGenerationWithSegments(newApproved);
-    } else {
-      setReadyToGenerate(true);
+    try {
+      if (nextIdx < r.queue.length) {
+        transcribeNext(r.queue, nextIdx);
+      } else if (r.queue.length === 1) {
+        await startGenerationWithSegments(newApproved);
+      } else {
+        setReadyToGenerate(true);
+      }
+    } catch (e) {
+      console.error("[wizard] approve→generate failed", e);
+      alert({
+        title: t("wizard.generate_failed_title") || "No pudimos disparar la generación",
+        description: t("wizard.generate_failed_desc") ||
+          "Hubo un error inesperado al iniciar la generación. Recargá la página y volvé a intentar.",
+        tone: "error",
+      });
     }
   };
 
   const startGenerationWithSegments = async (approved) => {
+    // HOTFIX 2026-05-29 (#473.2): si el operador refrescó la pestaña entre
+    // upload y "Aprobar y generar", `a.file` quedó como stub serializado
+    // (sin Blob real, sin .slice). El POST /generate necesita el audio en
+    // multipart UNLESS hay transcribeJobId (en cuyo caso el backend reusa
+    // la copia cacheada en R2). Si no se cumple ninguna, abortar con UX
+    // clara en vez de crashear al leer a.file.name.
+    const broken = approved.find(
+      (a) => !a.transcribeJobId && (!a.file || typeof a.file.slice !== "function")
+    );
+    if (broken) {
+      console.warn("[wizard] approve aborted: file is not a Blob", {
+        has_file: !!broken.file,
+        has_transcribeJobId: !!broken.transcribeJobId,
+        is_stub: !!broken.file?._restoredStub,
+      });
+      alert({
+        title: t("wizard.session_expired_title") || "Tu sesión expiró",
+        description: t("wizard.session_expired_desc") ||
+          "El audio se perdió al refrescar la pestaña. Volvé a Crear video y re-subí el archivo.",
+        tone: "warning",
+      });
+      wizardPersistence.clear();
+      setCurrentReview(null);
+      setApprovedJobs([]);
+      setReadyToGenerate(false);
+      navigate("/new", { replace: true });
+      return;
+    }
+
     const jobList = approved.map((a) => ({
-      filename: a.file.name, _file: a.file, artist: a.artist,
+      filename: (a.file && a.file.name) || "audio.mp3", _file: a.file, artist: a.artist,
       songTitle: (a.songTitle || "").trim(),
       language: a.language, genre: a.genre || "", font: a.font || "",
       concept: a.concept || "", movementStyle: a.movementStyle || "", effect: a.effect || "",
@@ -3277,7 +3338,7 @@ export default function App() {
             {approvedJobs.map((job, i) => (
               <div key={i} className="flex items-center gap-3 glass rounded-xl px-4 py-2.5">
                 <div className="w-2 h-2 rounded-full bg-accent shrink-0" />
-                <span className="text-sm text-white truncate flex-1">{job.file.name.replace(/\.mp3$/i, "")}</span>
+                <span className="text-sm text-white truncate flex-1">{((job.file && job.file.name) || "audio.mp3").replace(/\.mp3$/i, "")}</span>
                 <span className="text-xs text-gray-500">{job.segments.length} {t("editor.lines")}</span>
               </div>
             ))}
