@@ -101,6 +101,12 @@ export function computeFieldDiff(baseline, current) {
   if (!strEq(baseline.titleSongFont, current.titleSongFont)) {
     typoDiff.title_song_font = current.titleSongFont || "";
   }
+  // UI v1.1 (2026-05-30): manual song-title line break. "" = auto.
+  // Buckets with typography because it changes only the title-card overlay
+  // (no bg regen, no segments touched). Backend persists in render_params.
+  if (!strEq(baseline.titleSongBreak, current.titleSongBreak)) {
+    typoDiff.title_song_break = current.titleSongBreak || "";
+  }
   if (Object.keys(typoDiff).length > 0) {
     out.typography = typoDiff;
   }

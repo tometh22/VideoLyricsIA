@@ -3,6 +3,7 @@ import { useI18n } from "../i18n";
 import Listbox from "./Listbox";
 import { UploadTour } from "./OnboardingTour";
 import WizardLivePreview from "./WizardLivePreview";
+import TitleCardPreview from "./TitleCardPreview";
 import HelpTip from "./HelpCenter/HelpTip";
 
 const API = import.meta.env.VITE_API_URL || "";
@@ -252,6 +253,8 @@ export default function UploadZone({
     // Title card customization (Full Rotor v1). Defaults = historical look:
     // auto layout, no size change, artist ExtraBold, song = lyric font.
     titleTemplate: "auto", titleSize: "1.0", titleArtistFont: "", titleSongFont: "",
+    // UI v1.1 (2026-05-30): manual song-title break. "" = auto wrap.
+    titleSongBreak: "",
   };
   const loadStoredBatchDefaults = () => {
     try {
@@ -2730,6 +2733,93 @@ export default function UploadZone({
                       className="flex-1"
                       ariaLabel={t("upload.titlecard_song_font") || "Font canción"}
                     />
+                  </div>
+
+                  {/* UI v1.1 (2026-05-30): manual song-title line break.
+                      Off (default) => backend auto-shrink-then-wraps the song
+                      title (historical behaviour, no change). On => the
+                      operator types each line separately and the render
+                      respects that exact break. Persists via render_params.
+                      title_song_break = "line1\nline2". */}
+                  <div className="pt-2 border-t border-white/[0.04]">
+                    {(() => {
+                      // Parse the current value. Default "" means "auto",
+                      // shown as toggle OFF.
+                      const raw = batchDefaults.titleSongBreak || "";
+                      const enabled = raw.includes("\n");
+                      const parts = raw.split("\n");
+                      const line1 = enabled ? (parts[0] || "") : "";
+                      const line2 = enabled ? (parts[1] || "") : "";
+                      const toggleOn = () => {
+                        // When the operator turns it on, seed both lines
+                        // with empty strings — they can type or paste in.
+                        // We keep "\n" present so .includes("\n") stays
+                        // true even when both are empty.
+                        updateBatchDefault("titleSongBreak", "\n");
+                      };
+                      const toggleOff = () => {
+                        updateBatchDefault("titleSongBreak", "");
+                      };
+                      const setLine = (idx, val) => {
+                        const next = [line1, line2];
+                        next[idx] = val.replace(/\n/g, " ");  // never two breaks
+                        updateBatchDefault(
+                          "titleSongBreak",
+                          `${next[0]}\n${next[1]}`,
+                        );
+                      };
+                      return (
+                        <>
+                          <label className="flex items-center gap-2 cursor-pointer select-none">
+                            <input
+                              type="checkbox"
+                              checked={enabled}
+                              onChange={(e) => (e.target.checked ? toggleOn() : toggleOff())}
+                              className="w-3.5 h-3.5 accent-brand"
+                            />
+                            <span className="text-[11px] text-gray-300 font-medium">
+                              {t("upload.titlecard_break_label") || "Partir título en 2 líneas"}
+                            </span>
+                            <HelpTip
+                              text={
+                                t("upload.titlecard_break_help") ||
+                                "Si tu canción tiene un título largo y querés decidir vos dónde se parte (ej. 'Donde Estan' / 'Corazón'), activá esto y escribí cada línea. Si lo dejás apagado, el sistema decide automáticamente cuando no entra."
+                              }
+                            />
+                          </label>
+                          {enabled && (
+                            <div className="mt-2 space-y-1.5 pl-5">
+                              <div className="flex items-center gap-2">
+                                <span className="text-[10px] text-gray-500 shrink-0 w-14">
+                                  {t("upload.titlecard_break_line1") || "Línea 1:"}
+                                </span>
+                                <input
+                                  type="text"
+                                  value={line1}
+                                  onChange={(e) => setLine(0, e.target.value)}
+                                  className="flex-1 px-2 py-1 rounded-md bg-surface-1 border border-white/[0.06] text-[12px] text-white focus:border-brand/40 focus:outline-none"
+                                  placeholder={t("upload.titlecard_break_line1_ph") || "Primera línea"}
+                                  maxLength={140}
+                                />
+                              </div>
+                              <div className="flex items-center gap-2">
+                                <span className="text-[10px] text-gray-500 shrink-0 w-14">
+                                  {t("upload.titlecard_break_line2") || "Línea 2:"}
+                                </span>
+                                <input
+                                  type="text"
+                                  value={line2}
+                                  onChange={(e) => setLine(1, e.target.value)}
+                                  className="flex-1 px-2 py-1 rounded-md bg-surface-1 border border-white/[0.06] text-[12px] text-white focus:border-brand/40 focus:outline-none"
+                                  placeholder={t("upload.titlecard_break_line2_ph") || "Segunda línea"}
+                                  maxLength={140}
+                                />
+                              </div>
+                            </div>
+                          )}
+                        </>
+                      );
+                    })()}
                   </div>
                 </div>
               </div>

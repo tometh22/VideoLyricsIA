@@ -360,6 +360,13 @@ def title_card_lines(
     artist_font_path: str | None = None,
     template: str = "auto",
     size_multiplier: float = 1.0,
+    # UI v1.1 (2026-05-30): explicit line break for the song. When set with 2+
+    # non-empty entries, skip the auto shrink-then-wrap heuristic and use these
+    # lines as-is (each still shrunk individually by fit_title_text so a
+    # long line doesn't overflow the safe width). None or single entry =>
+    # historical behaviour preserved exactly. Threaded from the wizard's
+    # "Partir en 2 líneas" control via render_params.title_song_break.
+    song_lines: list[str] | None = None,
 ) -> list[AssLine]:
     """Build the artist/song title-card overlay as ASS lines, mirroring the
     moviepy title card (pipeline.generate_lyric_video) so the look matches
@@ -443,9 +450,35 @@ def title_card_lines(
         stack.append(("\n".join(a_lines), a_size,
                       artist_font_family, True, op_artist, len(a_lines)))
     if song_d:
-        s_lines, s_size = _fit(song_d, title_size, lyric_font_path)
-        stack.append(("\n".join(s_lines), s_size,
-                      lyric_font_family, False, op_song, len(s_lines)))
+        # Manual split (UI v1.1): when the operator provided explicit lines,
+        # bypass the auto-wrap and fit each line independently. We still call
+        # fit_title_text on each line so a too-long line shrinks instead of
+        # overflowing the safe width — the difference vs. the auto path is
+        # that we never silently re-wrap the operator's chosen break.
+        normalized_manual = (
+            [unicodedata.normalize("NFC", (s or "").strip()) for s in (song_lines or [])]
+        )
+        normalized_manual = [s for s in normalized_manual if s]
+        use_manual_split = len(normalized_manual) >= 2
+        if use_manual_split:
+            fitted_lines: list[str] = []
+            min_size = title_size
+            for line in normalized_manual:
+                lines_for_part, size_for_part = _fit(line, title_size, lyric_font_path)
+                # If a single manual line still overflows and got auto-wrapped
+                # by fit_title_text, preserve the result (it's a graceful
+                # degradation; the operator's choice was honoured up to the
+                # safe width).
+                fitted_lines.extend(lines_for_part)
+                if size_for_part < min_size:
+                    min_size = size_for_part
+            s_text = "\n".join(fitted_lines)
+            stack.append((s_text, min_size,
+                          lyric_font_family, False, op_song, len(fitted_lines)))
+        else:
+            s_lines, s_size = _fit(song_d, title_size, lyric_font_path)
+            stack.append(("\n".join(s_lines), s_size,
+                          lyric_font_family, False, op_song, len(s_lines)))
     if not stack:
         return []
 

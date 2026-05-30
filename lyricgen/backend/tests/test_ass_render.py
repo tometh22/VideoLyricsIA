@@ -317,6 +317,71 @@ def test_title_card_normalises_decomposed_accents_to_nfc():
     assert "́" not in artist.text and "́" not in song.text
 
 
+def test_title_card_manual_song_lines_respected():
+    """UI v1.1 (2026-05-30): when the operator passes song_lines explicitly,
+    title_card_lines uses those breaks verbatim (joined with the same "\\n"
+    libass break that the auto-wrap path uses) instead of auto-shrink-wrap.
+    Pinning this so a future refactor of the auto path can't silently
+    swallow the operator's chosen split — that would re-introduce the
+    Agus.Cafisi 2026-05-30 complaint (no way to put 'Donde Estan / Corazón'
+    in two specific lines)."""
+    lines = title_card_lines(
+        "Enrique Iglesias", "Donde Estan Corazón", first_lyric_start=5.0,
+        width=1920, height=1080, text_scale=1.0,
+        lyric_font_family="Oswald", artist_font_family="Montserrat ExtraBold",
+        song_lines=["Donde Estan", "Corazón"],
+    )
+    artist, song = lines
+    # The song line contains both pieces joined by the literal "\n" — the
+    # same separator the auto-wrap path uses, which build_ass turns into the
+    # libass hard break "\N".
+    assert song.text == "Donde Estan\nCorazón"
+    # The artist is untouched (only the song was split).
+    assert artist.text == "ENRIQUE IGLESIAS"
+
+
+def test_title_card_manual_song_lines_default_none_preserves_legacy():
+    """song_lines=None (default) reproduces the legacy single-line render
+    exactly. This is the no-regression guard: if anything in the
+    fitted/wrapped output changes when song_lines is unset, the change
+    leaks into every existing job."""
+    legacy = title_card_lines(
+        "Enrique Iglesias", "Donde Estan Corazón", first_lyric_start=5.0,
+        width=1920, height=1080, text_scale=1.0,
+        lyric_font_family="Oswald", artist_font_family="Montserrat ExtraBold",
+    )
+    explicit_none = title_card_lines(
+        "Enrique Iglesias", "Donde Estan Corazón", first_lyric_start=5.0,
+        width=1920, height=1080, text_scale=1.0,
+        lyric_font_family="Oswald", artist_font_family="Montserrat ExtraBold",
+        song_lines=None,
+    )
+    # Same text, sizes, alignment, fades.
+    assert [l.text for l in legacy] == [l.text for l in explicit_none]
+    assert [l.fontsize for l in legacy] == [l.fontsize for l in explicit_none]
+    assert [l.alignment for l in legacy] == [l.alignment for l in explicit_none]
+
+
+def test_title_card_manual_song_lines_single_entry_falls_back_to_auto():
+    """A song_lines list with a single entry should NOT trigger manual
+    split — it falls back to the legacy auto path (the operator probably
+    forgot to write the second line). Guards against producing a half-
+    rendered title."""
+    auto = title_card_lines(
+        "X", "Mi Tema", first_lyric_start=5.0,
+        width=1920, height=1080, text_scale=1.0,
+        lyric_font_family="Oswald", artist_font_family="Montserrat ExtraBold",
+    )
+    single = title_card_lines(
+        "X", "Mi Tema", first_lyric_start=5.0,
+        width=1920, height=1080, text_scale=1.0,
+        lyric_font_family="Oswald", artist_font_family="Montserrat ExtraBold",
+        song_lines=["Mi Tema"],
+    )
+    # Identical to the no-arg call.
+    assert [l.text for l in auto] == [l.text for l in single]
+
+
 def test_title_card_no_fit_without_font_paths_keeps_legacy_sizes():
     # No font paths → legacy fixed sizing, single line (parity with old look).
     lines = title_card_lines(

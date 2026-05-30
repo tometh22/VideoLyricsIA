@@ -655,6 +655,8 @@ function EditLyricsRoute({ setCurrentReview, setWizardStage, wizardScreen, t }) 
         titleSize: String(pickSnapOr("titleSize", params.title_size || "1.0")),
         titleArtistFont: pickSnapOr("titleArtistFont", params.title_artist_font || ""),
         titleSongFont: pickSnapOr("titleSongFont", params.title_song_font || ""),
+        // UI v1.1 (2026-05-30): manual song-title line break — "" = auto.
+        titleSongBreak: pickSnapOr("titleSongBreak", params.title_song_break || ""),
       };
 
       // Baseline: snapshot inmutable de cómo está RENDERIZADO el video
@@ -683,6 +685,8 @@ function EditLyricsRoute({ setCurrentReview, setWizardStage, wizardScreen, t }) 
         titleSize: String(params.title_size || "1.0"),
         titleArtistFont: params.title_artist_font || "",
         titleSongFont: params.title_song_font || "",
+        // UI v1.1: baseline for the manual break.
+        titleSongBreak: params.title_song_break || "",
         segments: JSON.parse(JSON.stringify(job.segments_json || [])),
       };
 
@@ -1886,6 +1890,7 @@ export default function App() {
         titleSize: entry.titleSize || "1.0",
         titleArtistFont: entry.titleArtistFont || "",
         titleSongFont: entry.titleSongFont || "",
+        titleSongBreak: entry.titleSongBreak || "",
         segments: data.segments, referenceLyrics: data.reference_lyrics || "",
         coverageWarning: !!data.coverage_warning,
         recoverySource: data.recovery_source || "",
@@ -2065,6 +2070,7 @@ export default function App() {
         titleSize: entry.titleSize || "1.0",
         titleArtistFont: entry.titleArtistFont || "",
         titleSongFont: entry.titleSongFont || "",
+        titleSongBreak: entry.titleSongBreak || "",
         segments: data.segments, referenceLyrics: data.reference_lyrics || "",
         coverageWarning: !!data.coverage_warning,
         recoverySource: data.recovery_source || "",
@@ -2430,6 +2436,7 @@ export default function App() {
       titleSize: a.titleSize || "1.0",
       titleArtistFont: a.titleArtistFont || "",
       titleSongFont: a.titleSongFont || "",
+      titleSongBreak: a.titleSongBreak || "",
       segments: a.segments,
       transcribeJobId: a.transcribeJobId || null,
       status: "queued", current_step: null, progress: 0, job_id: null, error: null,
@@ -2483,6 +2490,7 @@ export default function App() {
         formData.append("title_size", String(jobList[i].titleSize || "1.0"));
         formData.append("title_artist_font", jobList[i].titleArtistFont || "");
         formData.append("title_song_font", jobList[i].titleSongFont || "");
+        formData.append("title_song_break", jobList[i].titleSongBreak || "");
         if (animateImage && backgroundFile) formData.append("animate_image", "true");
         formData.append("match_lyrics", String(!!inspiredByLyrics));
         // Capa C 2026-05-24 — si el operador hizo pre-gen del background
@@ -2627,6 +2635,7 @@ export default function App() {
         generateBody.append("title_size", String(jobList[i].titleSize || "1.0"));
         generateBody.append("title_artist_font", jobList[i].titleArtistFont || "");
         generateBody.append("title_song_font", jobList[i].titleSongFont || "");
+        generateBody.append("title_song_break", jobList[i].titleSongBreak || "");
         if (animateImage && backgroundFile) generateBody.append("animate_image", "true");
         generateBody.append("match_lyrics", String(!!inspiredByLyrics));
         if (backgroundId) {

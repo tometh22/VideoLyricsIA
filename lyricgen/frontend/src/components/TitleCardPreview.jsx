@@ -120,6 +120,14 @@ export default function TitleCardPreview({
   titleSize = 1.0,
   artistFont = "",      // "" → Montserrat ExtraBold (backend default)
   songFont = "",        // "" → falls back to `font` (the lyric font)
+  // UI v1.1 (2026-05-30): explicit line break for the song. When the operator
+  // chose to split the title manually, songLines holds the 2 lines exactly as
+  // they will be rendered (no auto-wrap). null/undefined or single entry =>
+  // historical behaviour (FitLine shrinks the whole title and only wraps if
+  // it still overflows at the minimum size). Defaults preserve the exact
+  // previous render so no existing job is affected by this prop being
+  // threaded everywhere.
+  songLines = null,
   label,
 }) {
   const boxRef = useRef(null);
@@ -143,6 +151,15 @@ export default function TitleCardPreview({
   // accent handling (ass_render.title_card_lines).
   const artistU = nfc(artist).trim().toUpperCase();
   const songD = applyCase(nfc(song).trim(), textCase);
+
+  // Manual split (UI v1.1): when songLines is a non-empty array with 2+
+  // entries, render each line through its own FitLine so each shrinks to fit
+  // independently and the operator-chosen break is respected. A single
+  // entry falls back to the legacy single-line behaviour.
+  const manualSongLines = Array.isArray(songLines)
+    ? songLines.map((s) => applyCase(nfc(s || "").trim(), textCase)).filter(Boolean)
+    : null;
+  const useManualSplit = !!(manualSongLines && manualSongLines.length >= 2);
 
   // Per-element fonts: artist → chosen font or Montserrat ExtraBold (800);
   // song → chosen font or the lyric font (`font`). Mirrors the backend's
@@ -190,7 +207,7 @@ export default function TitleCardPreview({
           }}
         />
         <div
-          className="absolute inset-0 flex flex-col gap-[0.4em] px-[6%]"
+          className="absolute inset-0 flex flex-col gap-[0.45em] px-[6%]"
           style={{
             justifyContent: L.justify,
             alignItems: L.align,
@@ -209,18 +226,38 @@ export default function TitleCardPreview({
                 color="#FFFFFF"
                 opacity={0.97}
               />
-              <FitLine
-                text={songD}
-                baseSize={boxW * (L.song / 1920) * sizeN}
-                maxWidth={maxWidth}
-                fontFamily={songFamily}
-                weight={songWeight}
-                color="#FFFFFF"
-                opacity={0.85}
-              />
+              {useManualSplit ? (
+                <div
+                  className="flex flex-col"
+                  style={{ gap: "0.18em", alignItems: L.align, width: "100%" }}
+                >
+                  {manualSongLines.slice(0, 2).map((line, i) => (
+                    <FitLine
+                      key={i}
+                      text={line}
+                      baseSize={boxW * (L.song / 1920) * sizeN}
+                      maxWidth={maxWidth}
+                      fontFamily={songFamily}
+                      weight={songWeight}
+                      color="#FFFFFF"
+                      opacity={0.85}
+                    />
+                  ))}
+                </div>
+              ) : (
+                <FitLine
+                  text={songD}
+                  baseSize={boxW * (L.song / 1920) * sizeN}
+                  maxWidth={maxWidth}
+                  fontFamily={songFamily}
+                  weight={songWeight}
+                  color="#FFFFFF"
+                  opacity={0.85}
+                />
+              )}
             </>
           )}
-          {!artistU && !songD && (
+          {!artistU && !songD && !useManualSplit && (
             <span className="text-xs text-gray-500">—</span>
           )}
         </div>
