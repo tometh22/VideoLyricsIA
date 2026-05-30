@@ -3435,6 +3435,10 @@ async def upload(
     title_size: str = Form("1.0", max_length=8),
     title_artist_font: str = Form("", max_length=64),
     title_song_font: str = Form("", max_length=64),
+    # UI v1.1 (2026-05-30): manual song split. "" = auto wrap (default).
+    # When set, contains the 2 lines joined by "\n" — capped at 200 chars
+    # to match the song title's effective range.
+    title_song_break: str = Form("", max_length=200),
     current_user: dict = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
@@ -3625,6 +3629,8 @@ async def upload(
         title_size=_clamp_title_size(title_size),
         title_artist_font=(title_artist_font.strip() or ""),
         title_song_font=(title_song_font.strip() or ""),
+        # UI v1.1: pass-through. Empty string preserves auto-wrap.
+        title_song_break=(title_song_break or ""),
     )
 
     return {"job_id": job_id, "status": initial_status}
@@ -5603,6 +5609,10 @@ async def generate_with_segments(
     title_size: str = Form("1.0", max_length=8),
     title_artist_font: str = Form("", max_length=64),
     title_song_font: str = Form("", max_length=64),
+    # UI v1.1 (2026-05-30): manual song split. "" = auto wrap (default).
+    # When set, contains the 2 lines joined by "\n" — capped at 200 chars
+    # to match the song title's effective range.
+    title_song_break: str = Form("", max_length=200),
     current_user: dict = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
@@ -5895,6 +5905,8 @@ async def generate_with_segments(
         title_size=_clamp_title_size(title_size),
         title_artist_font=(title_artist_font.strip() or ""),
         title_song_font=(title_song_font.strip() or ""),
+        # UI v1.1: pass-through. Empty string preserves auto-wrap.
+        title_song_break=(title_song_break or ""),
     )
 
     return {"job_id": job_id, "status": initial_status}
@@ -6900,6 +6912,12 @@ class EditJobRequest(BaseModel):
     title_size: float | None = None
     title_artist_font: str | None = Field(default=None, max_length=64)
     title_song_font: str | None = Field(default=None, max_length=64)
+    # UI v1.1 (2026-05-30): manual song-title line break. "" or None =>
+    # keep auto wrap (no change vs current). When the operator chose to
+    # split the title in 2 lines, the wizard sends the lines joined by
+    # "\n". Persisted in render_params alongside the other title_* keys
+    # so retry/variant inherit the choice.
+    title_song_break: str | None = Field(default=None, max_length=200)
 
 
 class EnableProResRequest(BaseModel):
@@ -7786,6 +7804,15 @@ async def request_edit(
         _rp = dict(job.render_params or {})
         _rp["title_song_font"] = _tsf
         job.render_params = _rp
+    # UI v1.1 (2026-05-30): manual song-title line break. "" = auto wrap
+    # (legacy). When set, the operator picked the 2 lines explicitly in the
+    # wizard. Same pattern as the other title_* fields.
+    if body.title_song_break is not None:
+        _tsb = (body.title_song_break or "")
+        edit_params["title_song_break"] = _tsb
+        _rp = dict(job.render_params or {})
+        _rp["title_song_break"] = _tsb
+        job.render_params = _rp
     # body.lyric_transition + body.text_motion: campos eliminados 2026-05-23.
     # FX layer + lyric animations: durable visual choices, no edit_type gate
     # (the operator can change them inside any edit modal). Same pattern as
@@ -8474,7 +8501,10 @@ async def retry_job(
               "lyric_color", "lyric_sung_color",
               # Title-card customization (Full Rotor v1) — heredables.
               "title_template", "title_size",
-              "title_artist_font", "title_song_font"):
+              "title_artist_font", "title_song_font",
+              # UI v1.1 (2026-05-30): manual song split. Inheritable so
+              # a retry/variant respects the operator's chosen break.
+              "title_song_break"):
         if k in _retry_render_params and _retry_render_params[k] not in (None, ""):
             retry_pipeline_kwargs[k] = _retry_render_params[k]
 

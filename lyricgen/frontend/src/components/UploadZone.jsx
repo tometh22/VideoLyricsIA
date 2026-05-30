@@ -3,6 +3,7 @@ import { useI18n } from "../i18n";
 import Listbox from "./Listbox";
 import { UploadTour } from "./OnboardingTour";
 import WizardLivePreview from "./WizardLivePreview";
+import TitleCardPreview from "./TitleCardPreview";
 import HelpTip from "./HelpCenter/HelpTip";
 
 const API = import.meta.env.VITE_API_URL || "";
@@ -32,6 +33,19 @@ const MAX_BATCH_SIZE = 5;
 // the upload step to remove the confusing duplication. batchDefaults still
 // supplies sensible defaults for the "Generar directo" path.
 const SHOW_UPLOAD_TYPOGRAPHY = false;
+
+// Field sets used by the central preview auto-switch (UI v1.1, 2026-05-30):
+// touching one of these flips the preview face so the operator sees the
+// change without having to click anything. Keep in sync with the actual
+// controls inside the Portada and typography sections below.
+const TITLE_CARD_FIELDS = new Set([
+  "titleTemplate", "titleSize", "titleArtistFont", "titleSongFont",
+  "titleSongBreak",
+]);
+const LYRIC_RENDER_FIELDS = new Set([
+  "font", "textCase", "fontScale", "textContrast",
+  "lyricsAnimation", "lineTransition", "lyricColor", "lyricSungColor",
+]);
 
 const SAMPLE_LYRIC = "Como el viento que se va";
 function applyTextCase(text, c) {
@@ -191,6 +205,12 @@ export default function UploadZone({
   // submitEdit porque batchDefaults sólo fan-out a files[] y en edit
   // mode files=[].
   onEditFieldChange = null,
+  // UI v1.1 (2026-05-30): artist/song to render inside the central
+  // title-card preview. Caller (App.jsx) passes these from the
+  // currentReview when in edit mode, or from the first file when in
+  // batch mode. Empty strings render the preview's "— —" placeholder.
+  titlePreviewArtist = "",
+  titlePreviewSong = "",
 }) {
   const { t } = useI18n();
   const inputRef = useRef();
@@ -252,6 +272,8 @@ export default function UploadZone({
     // Title card customization (Full Rotor v1). Defaults = historical look:
     // auto layout, no size change, artist ExtraBold, song = lyric font.
     titleTemplate: "auto", titleSize: "1.0", titleArtistFont: "", titleSongFont: "",
+    // UI v1.1 (2026-05-30): manual song-title break. "" = auto wrap.
+    titleSongBreak: "",
   };
   const loadStoredBatchDefaults = () => {
     try {
@@ -268,6 +290,18 @@ export default function UploadZone({
   const [batchDefaults, setBatchDefaults] = useState(loadStoredBatchDefaults);
   const batchDefaultsRef = useRef(batchDefaults);
   useEffect(() => { batchDefaultsRef.current = batchDefaults; }, [batchDefaults]);
+
+  // UI v1.1 (2026-05-30): which face of the preview is showing on the
+  // central sticky slot — the lyric (default) or the title card. We
+  // auto-flip to "title" when the operator touches any control in the
+  // Portada section so the effect is immediately visible without them
+  // having to click a tab. Resets to "lyrics" when they touch a lyric/
+  // animation control again. The toggle pill above the preview lets
+  // the operator override either way.
+  const [previewFace, setPreviewFace] = useState("lyrics");
+  // Wrap updateBatchDefault below so any field that belongs to the
+  // Portada bucket flips the preview. Defined inline to capture the
+  // setter without juggling refs.
 
   const updateBatchDefault = (field, value) => {
     setBatchDefaults((prev) => {
@@ -288,6 +322,15 @@ export default function UploadZone({
     // los pierde al computar el diff. App.jsx mapea field→currentReview.
     if (editMode && onEditFieldChange) {
       onEditFieldChange(field, value);
+    }
+    // UI v1.1 (2026-05-30): when the operator touches a Portada field,
+    // flip the central preview to "title" so the change is visible
+    // immediately. When they touch a lyric / animation field, flip back
+    // to "lyrics" — that's where the karaoke + drag controls live.
+    if (TITLE_CARD_FIELDS.has(field)) {
+      setPreviewFace("title");
+    } else if (LYRIC_RENDER_FIELDS.has(field)) {
+      setPreviewFace("lyrics");
     }
   };
 
@@ -2084,17 +2127,58 @@ export default function UploadZone({
             grid column (260-320 px). Mantiene sticky para acompañar
             el scroll del timeline en el panel derecho. */}
         <div className="lg:sticky lg:top-4 space-y-2 min-w-0 w-full [.editor-focus-mode_&]:hidden">
-          {/* QA fix 2026-05-28 (bug #3): pre-fix mostraba el preview SOLO en
-              bgMode==="auto". Cuando el operador seleccionaba un fondo de
-              biblioteca el preview desaparecía y se reemplazaba por un
-              placeholder estático "Fondo de biblioteca" — visualmente
-              parece un bug porque el operador pierde la visualización del
-              karaoke + movimiento + tipografía sobre el ASSET ELEGIDO. El
-              componente WizardLivePreview no tiene dependencia hard del
-              modo, sólo necesita los props de animation/typography/color.
-              Habilitar para library (no para custom porque hasta que el
-              archivo cargue no hay nada que mostrar). */}
-          {(bgMode === "auto" || bgMode === "library") ? (
+          {/* UI v1.1 (2026-05-30): toggle pill — "Letra / Portada". The
+              central preview shows whichever face is selected; the bottom
+              fan-out of states (Lyrics editor, batch progress, ready, etc.)
+              only renders when previewFace === "lyrics" so toggling to
+              "title" doesn't accidentally hide the karaoke editor below.
+              Auto-flips when the operator touches a Portada control (see
+              updateBatchDefault below); explicit click here overrides. */}
+          <div className="flex items-center gap-1 p-0.5 rounded-lg bg-surface-2/40 ring-1 ring-white/[0.04] w-fit">
+            {[
+              { code: "lyrics", label: t("preview.face_lyrics") || "Letra" },
+              { code: "title",  label: t("preview.face_title")  || "Portada" },
+            ].map((opt) => {
+              const active = previewFace === opt.code;
+              return (
+                <button
+                  key={opt.code}
+                  type="button"
+                  onClick={() => setPreviewFace(opt.code)}
+                  className={`px-3 py-1 rounded-md text-[11px] font-medium transition-all
+                    ${active
+                      ? "bg-brand/20 text-brand ring-1 ring-brand/30"
+                      : "text-gray-500 hover:text-gray-200"
+                    }`}
+                  aria-pressed={active}
+                >
+                  {opt.label}
+                </button>
+              );
+            })}
+          </div>
+
+          {/* Title-card face: rendered in the same slot as the lyric preview
+              so the operator's eye never has to travel. Same proportions
+              (aspect-video) as WizardLivePreview, so the layout doesn't
+              jump when toggling. */}
+          {previewFace === "title" ? (
+            <TitleCardPreview
+              artist={titlePreviewArtist}
+              song={titlePreviewSong}
+              font={batchDefaults.font || ""}
+              textCase={batchDefaults.textCase || "upper"}
+              template={batchDefaults.titleTemplate || "auto"}
+              titleSize={parseFloat(batchDefaults.titleSize) || 1.0}
+              artistFont={batchDefaults.titleArtistFont || ""}
+              songFont={batchDefaults.titleSongFont || ""}
+              songLines={
+                (batchDefaults.titleSongBreak || "").includes("\n")
+                  ? batchDefaults.titleSongBreak.split("\n")
+                  : null
+              }
+            />
+          ) : (bgMode === "auto" || bgMode === "library") ? (
             <WizardLivePreview
               style={style}
               customColors={customColors}
@@ -2641,60 +2725,120 @@ export default function UploadZone({
                 </div>
               </div>
 
-              {/* Portada (intro title card) — Full Rotor v1: template + size +
-                  per-element fonts. Updates the title-card preview live. */}
-              <div className="mt-4 pt-3 border-t border-white/[0.05]">
-                <p className="text-[11px] text-gray-300 font-medium">{t("upload.titlecard_section") || "Portada (intro)"}</p>
-                <p className="text-[10px] text-gray-600 mt-0.5 mb-3">
-                  {t("upload.titlecard_desc") || "Cómo aparece el artista y la canción al inicio del video."}
-                </p>
-                <div className="space-y-3">
-                  {/* Layout template */}
-                  <div className="flex items-center gap-2">
-                    <span className="text-[11px] text-gray-600 shrink-0 w-20">{t("upload.titlecard_template_label") || "Disposición:"}</span>
-                    <div className="flex flex-wrap gap-1">
+              {/* Portada (intro title card) — Full Rotor v1.1: visual
+                  template gallery + size with live percentage + per-element
+                  fonts in a 2-column grid + manual song break.
+                  Refactored 2026-05-30 to address the operator feedback
+                  "los controles están confusos / pegados al footer". */}
+              <div className="mt-5 pt-4 border-t border-white/[0.06]">
+                <div className="flex items-center justify-between mb-3">
+                  <p className="text-caption text-gray-200 font-medium">
+                    {t("upload.titlecard_section") || "Portada del intro"}
+                  </p>
+                  <span className="text-[10px] text-gray-600">
+                    {t("upload.titlecard_desc_short") || "Primeros 3-8 segundos del video"}
+                  </span>
+                </div>
+
+                <div className="space-y-4">
+                  {/* Layout template — visual gallery. Each preset shows a
+                      mini 16:9 thumbnail with a stylised representation of
+                      where the artist + title sit so the operator picks by
+                      EYE, not by reading the label. */}
+                  <div>
+                    <p className="text-[10px] uppercase tracking-wider text-gray-500 mb-2">
+                      {t("upload.titlecard_template_label") || "Disposición"}
+                    </p>
+                    <div className="grid grid-cols-4 gap-2">
                       {[
-                        { code: "auto",        label: t("upload.titlecard_auto") || "Auto" },
-                        { code: "centered",    label: t("upload.titlecard_centered") || "Centrado" },
-                        { code: "lower_third", label: t("upload.titlecard_lower_third") || "Tercio inf." },
-                        { code: "badge",       label: t("upload.titlecard_badge") || "Badge" },
-                      ].map((opt) => (
-                        <button
-                          key={opt.code}
-                          type="button"
-                          onClick={() => updateBatchDefault("titleTemplate", opt.code)}
-                          className={`px-2.5 py-1 rounded-md text-[11px] font-medium transition-all
-                            ${(batchDefaults.titleTemplate || "auto") === opt.code
-                              ? "bg-brand/20 text-brand ring-1 ring-brand/40"
-                              : "bg-surface-3/40 text-gray-500 hover:text-gray-300"
-                            }`}
-                        >{opt.label}</button>
-                      ))}
+                        { code: "auto",        label: t("upload.titlecard_auto") || "Auto",
+                          // Auto picks centered for long intros, badge for short — the
+                          // thumbnail mirrors the "centered" default since that's the
+                          // most common Genly look.
+                          thumb: <div className="absolute inset-0 flex flex-col items-center justify-center gap-0.5">
+                            <div className="w-[80%] h-[18%] rounded-sm bg-white/40" />
+                            <div className="w-[55%] h-[14%] rounded-sm bg-white/25" />
+                          </div>
+                        },
+                        { code: "centered",    label: t("upload.titlecard_centered") || "Centro",
+                          thumb: <div className="absolute inset-0 flex flex-col items-center justify-center gap-0.5">
+                            <div className="w-[80%] h-[20%] rounded-sm bg-white/60" />
+                            <div className="w-[55%] h-[14%] rounded-sm bg-white/40" />
+                          </div>
+                        },
+                        { code: "lower_third", label: t("upload.titlecard_lower_third") || "Tercio inf.",
+                          thumb: <div className="absolute inset-0 flex flex-col items-center justify-end pb-[18%] gap-0.5">
+                            <div className="w-[70%] h-[16%] rounded-sm bg-white/60" />
+                            <div className="w-[48%] h-[12%] rounded-sm bg-white/40" />
+                          </div>
+                        },
+                        { code: "badge",       label: t("upload.titlecard_badge") || "Badge",
+                          thumb: <div className="absolute inset-0 flex flex-col items-start justify-end pl-[10%] pb-[14%] gap-0.5">
+                            <div className="w-[42%] h-[14%] rounded-sm bg-white/60" />
+                            <div className="w-[32%] h-[10%] rounded-sm bg-white/40" />
+                          </div>
+                        },
+                      ].map((opt) => {
+                        const active = (batchDefaults.titleTemplate || "auto") === opt.code;
+                        return (
+                          <button
+                            key={opt.code}
+                            type="button"
+                            onClick={() => updateBatchDefault("titleTemplate", opt.code)}
+                            className={`group flex flex-col items-center gap-1 transition-all`}
+                            title={opt.label}
+                          >
+                            <div className={`relative w-full aspect-video rounded-md overflow-hidden ring-1 transition-all
+                              ${active
+                                ? "ring-brand bg-brand/[0.08] shadow-[0_0_0_3px_rgba(124,77,255,0.12)]"
+                                : "ring-white/[0.08] bg-surface-1 hover:ring-white/[0.18] hover:bg-surface-2"
+                              }`}
+                            >
+                              {/* Subtle gradient background to read like a real video frame */}
+                              <div className="absolute inset-0 bg-gradient-to-br from-purple-900/30 via-purple-950/40 to-black/60" />
+                              {opt.thumb}
+                            </div>
+                            <span className={`text-[10px] truncate w-full text-center transition-colors
+                              ${active ? "text-brand" : "text-gray-500 group-hover:text-gray-300"}`}>
+                              {opt.label}
+                            </span>
+                          </button>
+                        );
+                      })}
                     </div>
                   </div>
 
-                  {/* Size — quick presets + fine slider */}
-                  <div className="flex items-center gap-2">
-                    <span className="text-[11px] text-gray-600 shrink-0 w-20">{t("upload.titlecard_size_label") || "Tamaño:"}</span>
-                    <div className="flex items-center gap-2 flex-1">
-                      <div className="flex items-end gap-1">
+                  {/* Size — quick presets show their relative scale via the
+                      letter size, plus a slider for fine control. The
+                      percentage on the right gives an explicit numeric
+                      anchor (1.00× = default, 1.25× = +25 %, etc.). */}
+                  <div>
+                    <p className="text-[10px] uppercase tracking-wider text-gray-500 mb-2">
+                      {t("upload.titlecard_size_label_short") || "Tamaño del texto"}
+                    </p>
+                    <div className="flex items-center gap-3">
+                      <div className="flex items-end gap-1 shrink-0">
                         {[
                           { code: "0.75", cls: "text-[10px]" },
                           { code: "1.0",  cls: "text-[13px]" },
                           { code: "1.25", cls: "text-[16px]" },
                           { code: "1.5",  cls: "text-[19px]" },
-                        ].map((opt) => (
-                          <button
-                            key={opt.code}
-                            type="button"
-                            onClick={() => updateBatchDefault("titleSize", opt.code)}
-                            className={`w-7 h-7 flex items-center justify-center rounded-md font-bold transition-all ${opt.cls}
-                              ${(batchDefaults.titleSize || "1.0") === opt.code
-                                ? "bg-brand/20 text-brand ring-1 ring-brand/40"
-                                : "bg-surface-3/40 text-gray-500 hover:text-gray-300"
-                              }`}
-                          >A</button>
-                        ))}
+                        ].map((opt) => {
+                          const active = (batchDefaults.titleSize || "1.0") === opt.code;
+                          return (
+                            <button
+                              key={opt.code}
+                              type="button"
+                              onClick={() => updateBatchDefault("titleSize", opt.code)}
+                              className={`w-8 h-8 flex items-center justify-center rounded-md font-bold transition-all ${opt.cls}
+                                ${active
+                                  ? "bg-brand/20 text-brand ring-1 ring-brand/40"
+                                  : "bg-surface-2/60 text-gray-500 hover:text-gray-300 hover:bg-surface-2"
+                                }`}
+                              aria-label={`${opt.code}×`}
+                            >A</button>
+                          );
+                        })}
                       </div>
                       <input
                         type="range" min="0.5" max="2" step="0.05"
@@ -2703,33 +2847,141 @@ export default function UploadZone({
                         className="flex-1 accent-brand"
                         aria-label={t("upload.titlecard_size_label") || "Tamaño del título"}
                       />
-                      <span className="text-[10px] text-gray-500 w-9 text-right tabular-nums">
+                      <span className="text-[11px] text-gray-400 w-12 text-right tabular-nums font-medium">
                         {(parseFloat(batchDefaults.titleSize) || 1).toFixed(2)}×
                       </span>
                     </div>
                   </div>
 
-                  {/* Per-element fonts: artist + song. "Auto" = historical
-                      default (artist Montserrat ExtraBold, song = lyric font). */}
-                  <div className="flex items-center gap-2">
-                    <span className="text-[11px] text-gray-600 shrink-0 w-20">{t("upload.titlecard_artist_font") || "Font artista:"}</span>
-                    <Listbox
-                      value={batchDefaults.titleArtistFont}
-                      onChange={(v) => updateBatchDefault("titleArtistFont", v)}
-                      options={FONTS}
-                      className="flex-1"
-                      ariaLabel={t("upload.titlecard_artist_font") || "Font artista"}
-                    />
+                  {/* Per-element fonts: artist + song side by side, 2-col
+                      grid. The Listbox below opens upward when it sits
+                      against the sticky footer (UI v1.1 flip-up). */}
+                  <div>
+                    <p className="text-[10px] uppercase tracking-wider text-gray-500 mb-2">
+                      {t("upload.titlecard_fonts_label") || "Tipografías"}
+                    </p>
+                    <div className="grid grid-cols-2 gap-2">
+                      <div className="flex flex-col gap-1">
+                        <span className="text-[10px] text-gray-500">
+                          {t("upload.titlecard_artist_font_short") || "Artista"}
+                        </span>
+                        <Listbox
+                          value={batchDefaults.titleArtistFont}
+                          onChange={(v) => updateBatchDefault("titleArtistFont", v)}
+                          options={FONTS}
+                          ariaLabel={t("upload.titlecard_artist_font") || "Font artista"}
+                        />
+                      </div>
+                      <div className="flex flex-col gap-1">
+                        <span className="text-[10px] text-gray-500">
+                          {t("upload.titlecard_song_font_short") || "Canción"}
+                        </span>
+                        <Listbox
+                          value={batchDefaults.titleSongFont}
+                          onChange={(v) => updateBatchDefault("titleSongFont", v)}
+                          options={FONTS}
+                          ariaLabel={t("upload.titlecard_song_font") || "Font canción"}
+                        />
+                      </div>
+                    </div>
                   </div>
-                  <div className="flex items-center gap-2">
-                    <span className="text-[11px] text-gray-600 shrink-0 w-20">{t("upload.titlecard_song_font") || "Font canción:"}</span>
-                    <Listbox
-                      value={batchDefaults.titleSongFont}
-                      onChange={(v) => updateBatchDefault("titleSongFont", v)}
-                      options={FONTS}
-                      className="flex-1"
-                      ariaLabel={t("upload.titlecard_song_font") || "Font canción"}
-                    />
+
+                  {/* UI v1.1 (2026-05-30): manual song-title line break.
+                      Off (default) => backend auto-shrink-then-wraps the song
+                      title (historical behaviour, no change). On => the
+                      operator types each line separately and the render
+                      respects that exact break. Persists via render_params.
+                      title_song_break = "line1\nline2". */}
+                  <div className="pt-2 border-t border-white/[0.04]">
+                    {(() => {
+                      // Parse the current value. Default "" means "auto",
+                      // shown as toggle OFF.
+                      const raw = batchDefaults.titleSongBreak || "";
+                      const enabled = raw.includes("\n");
+                      const parts = raw.split("\n");
+                      const line1 = enabled ? (parts[0] || "") : "";
+                      const line2 = enabled ? (parts[1] || "") : "";
+                      const toggleOn = () => {
+                        // When the operator turns it on, seed both lines
+                        // with empty strings — they can type or paste in.
+                        // We keep "\n" present so .includes("\n") stays
+                        // true even when both are empty.
+                        updateBatchDefault("titleSongBreak", "\n");
+                      };
+                      const toggleOff = () => {
+                        updateBatchDefault("titleSongBreak", "");
+                      };
+                      const setLine = (idx, val) => {
+                        const next = [line1, line2];
+                        next[idx] = val.replace(/\n/g, " ");  // never two breaks
+                        updateBatchDefault(
+                          "titleSongBreak",
+                          `${next[0]}\n${next[1]}`,
+                        );
+                      };
+                      return (
+                        <>
+                          <label className="flex items-center gap-2.5 cursor-pointer select-none">
+                            {/* Custom switch — matches the design system used
+                                elsewhere in the wizard (bg_enhance, etc.) so
+                                the native checkbox doesn't clash with the
+                                dark surface. */}
+                            <input
+                              type="checkbox"
+                              checked={enabled}
+                              onChange={(e) => (e.target.checked ? toggleOn() : toggleOff())}
+                              className="peer sr-only"
+                            />
+                            <div className="relative w-9 h-5 rounded-full bg-surface-3 peer-checked:bg-brand transition-colors duration-200 shrink-0">
+                              <div className="absolute top-0.5 left-0.5 w-4 h-4 rounded-full bg-white shadow transition-transform duration-200 peer-checked:translate-x-4" />
+                            </div>
+                            <span className="text-[11px] text-gray-300 font-medium flex-1">
+                              {t("upload.titlecard_break_label") || "Partir título en 2 líneas"}
+                            </span>
+                            <HelpTip
+                              text={
+                                t("upload.titlecard_break_help") ||
+                                "Si tu canción tiene un título largo y querés decidir vos dónde se parte (ej. 'Donde Estan' / 'Corazón'), activá esto y escribí cada línea. Si lo dejás apagado, el sistema decide automáticamente cuando no entra."
+                              }
+                            />
+                          </label>
+                          {enabled && (
+                            <div className="mt-2.5 space-y-2 pl-[44px]">
+                              {/* The pl-[44px] aligns the input column with
+                                  the text label of the switch (switch w-9
+                                  + gap 2.5 = ~44 px). Keeps the eyes on a
+                                  single vertical axis. */}
+                              <div className="flex items-center gap-2">
+                                <span className="text-[10px] text-gray-500 shrink-0 w-12 text-right">
+                                  {t("upload.titlecard_break_line1") || "Línea 1"}
+                                </span>
+                                <input
+                                  type="text"
+                                  value={line1}
+                                  onChange={(e) => setLine(0, e.target.value)}
+                                  className="flex-1 px-2.5 py-1.5 rounded-md bg-surface-1 border border-white/[0.08] text-[12px] text-white placeholder:text-gray-600 focus:border-brand/50 focus:outline-none transition-colors"
+                                  placeholder={t("upload.titlecard_break_line1_ph") || "Primera línea"}
+                                  maxLength={140}
+                                />
+                              </div>
+                              <div className="flex items-center gap-2">
+                                <span className="text-[10px] text-gray-500 shrink-0 w-12 text-right">
+                                  {t("upload.titlecard_break_line2") || "Línea 2"}
+                                </span>
+                                <input
+                                  type="text"
+                                  value={line2}
+                                  onChange={(e) => setLine(1, e.target.value)}
+                                  className="flex-1 px-2.5 py-1.5 rounded-md bg-surface-1 border border-white/[0.08] text-[12px] text-white placeholder:text-gray-600 focus:border-brand/50 focus:outline-none transition-colors"
+                                  placeholder={t("upload.titlecard_break_line2_ph") || "Segunda línea"}
+                                  maxLength={140}
+                                />
+                              </div>
+                            </div>
+                          )}
+                        </>
+                      );
+                    })()}
                   </div>
                 </div>
               </div>

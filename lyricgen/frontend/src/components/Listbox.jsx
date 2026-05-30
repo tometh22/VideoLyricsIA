@@ -43,7 +43,23 @@ export default function Listbox({
   // escape parent containers with overflow-y-auto / overflow-hidden, which
   // is exactly what the file-rows wrapper does (max-h-96 overflow-y-auto)
   // and what was clipping the dropdown at the row's bottom edge.
-  const [popoverPos, setPopoverPos] = useState({ top: 0, left: 0, width: 0 });
+  //
+  // 2026-05-30 (UI v1.1): when the trigger sits near the bottom of the
+  // viewport (e.g. last control of the Portada section, pressed against the
+  // sticky footer), the popover used to spill below the visible area and
+  // got clipped by the screen edge — operators reported "no veo las fonts".
+  // We now flip the popover upward (anchor by `bottom` instead of `top`)
+  // when there isn't enough space below AND there is more space above, and
+  // cap maxHeight by the available space so it never extends past the
+  // viewport. Placement = "below" reproduces the previous behaviour.
+  const [popoverPos, setPopoverPos] = useState({
+    placement: "below",
+    top: 0,
+    bottom: undefined,
+    left: 0,
+    width: 0,
+    maxHeight: 288,
+  });
   const triggerRef = useRef(null);
   const popoverRef = useRef(null);
 
@@ -65,14 +81,40 @@ export default function Listbox({
   // Recompute popover screen position from the trigger's bounding rect.
   // Called on open and on scroll/resize so the popover follows the trigger
   // when the page or any parent scrolls.
+  //
+  // Flip logic (UI v1.1): we compute the available space below and above
+  // the trigger and decide whether to anchor the popover by its top edge
+  // (open downward, classic) or by its bottom edge (open upward, when the
+  // trigger is near the bottom of the viewport). The estimated desired
+  // height is the smaller of 288 px (~max-h-72, the previous cap) and the
+  // natural list height (rows × ~38 px), so a 4-option list never reserves
+  // 288 px when only 152 are needed.
   const updatePosition = () => {
     const t = triggerRef.current;
     if (!t) return;
     const r = t.getBoundingClientRect();
+    const vh = window.innerHeight;
+    const GAP = 4;       // gap between trigger and popover
+    const MARGIN = 8;    // breathing room from viewport edges
+    const ROW_PX = 38;   // conservative per-option height (py-2 + text)
+    const MIN_HEIGHT = 120;
+
+    const spaceBelow = vh - r.bottom - GAP - MARGIN;
+    const spaceAbove = r.top - GAP - MARGIN;
+    const naturalHeight = options.length * ROW_PX + 8;
+    const desired = Math.max(MIN_HEIGHT, Math.min(288, naturalHeight));
+    // Flip when downward placement would clip AND upward gives more room.
+    const flipUp = desired > spaceBelow && spaceAbove > spaceBelow;
+    const avail = flipUp ? spaceAbove : spaceBelow;
+    const maxHeight = Math.max(MIN_HEIGHT, Math.min(desired, avail));
+
     setPopoverPos({
-      top: r.bottom + 4,         // 4 px gap below the trigger
+      placement: flipUp ? "above" : "below",
+      top: flipUp ? undefined : r.bottom + GAP,
+      bottom: flipUp ? vh - r.top + GAP : undefined,
       left: r.left,
       width: r.width,
+      maxHeight,
     });
   };
 
@@ -175,12 +217,14 @@ export default function Listbox({
           aria-label={ariaLabel}
           style={{
             position: "fixed",
-            top: popoverPos.top,
+            top: popoverPos.placement === "below" ? popoverPos.top : undefined,
+            bottom: popoverPos.placement === "above" ? popoverPos.bottom : undefined,
             left: popoverPos.left,
             width: popoverPos.width,
+            maxHeight: `${popoverPos.maxHeight}px`,
             zIndex: 1000,
           }}
-          className="max-h-72 overflow-y-auto glass rounded-xl
+          className="overflow-y-auto glass rounded-xl
                      border border-white/[0.08] shadow-xl py-1"
         >
           {options.map((opt, idx) => {

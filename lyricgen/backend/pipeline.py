@@ -512,7 +512,13 @@ def run_pipeline(job_id: str, mp3_path: str, artist: str, style: str,
                  title_template: str = "auto",
                  title_size: float = 1.0,
                  title_artist_font: str = "",
-                 title_song_font: str = ""):
+                 title_song_font: str = "",
+                 # UI v1.1 (2026-05-30): explicit line break for the song
+                 # title. Empty string = automatic shrink-then-wrap (default,
+                 # historical). When set, contains the operator-chosen line
+                 # break(s) joined with "\n" — e.g. "Donde Estan\nCorazón".
+                 # Threaded into title_card_lines via song_lines kwarg.
+                 title_song_break: str = ""):
     """Run the full pipeline for a job. Called synchronously.
 
     delivery_profile:
@@ -824,6 +830,10 @@ def run_pipeline(job_id: str, mp3_path: str, artist: str, style: str,
             "title_size": title_size,
             "title_artist_font": title_artist_font,
             "title_song_font": title_song_font,
+            # UI v1.1 (2026-05-30): manual song split. Empty string => auto
+            # (legacy). When set, the operator picked their own line break in
+            # the wizard and we persist it so retries/edits respect it.
+            "title_song_break": title_song_break,
         }
         # Only persist background_hint / bg_verbatim when this run actually
         # received them — otherwise a hint-less typography edit would null out
@@ -1031,6 +1041,7 @@ def run_pipeline(job_id: str, mp3_path: str, artist: str, style: str,
                 lyric_color=lyric_color, lyric_sung_color=lyric_sung_color,
                 title_template=title_template, title_size=title_size,
                 title_artist_font=title_artist_font, title_song_font=title_song_font,
+                title_song_break=title_song_break,
             )
             files["video_url"] = f"/download/{job_id}/video"
             update_job(job_id, progress=55)
@@ -8150,6 +8161,8 @@ def _render_lyrics_ass(
     title_size: float = 1.0,
     title_artist_font: str = "",
     title_song_font: str = "",
+    # UI v1.1 (2026-05-30): manual song-title line break. "" = auto wrap.
+    title_song_break: str = "",
 ) -> str:
     """Fast lyric render: burn the lyrics with libass in a single ffmpeg
     pass over the (ffmpeg-looped) background — no moviepy frame loop.
@@ -8235,6 +8248,12 @@ def _render_lyrics_ass(
         # Operator layout + size (Full Rotor v1).
         template=title_template,
         size_multiplier=title_size,
+        # UI v1.1 (2026-05-30): explicit line break for the song. Empty
+        # string => None (auto wrap, historical). When the operator picked
+        # their own break in the wizard, we split on the literal "\n" and
+        # title_card_lines uses those lines as-is, fitting each one
+        # individually.
+        song_lines=(title_song_break.split("\n") if title_song_break else None),
     )
     base_fs = _ass.lyric_fontsize(40, scale, font_scale)
     # Reusamos el mapping primary/secondary computado arriba para
@@ -8395,6 +8414,8 @@ def generate_lyric_video(
     title_size: float = 1.0,
     title_artist_font: str = "",
     title_song_font: str = "",
+    # UI v1.1 (2026-05-30): manual song-title line break ("" = auto wrap).
+    title_song_break: str = "",
 ) -> tuple[str, str, str | None]:
     """Generate a lyric video. Returns (video_path, font, bg_source).
 
@@ -8503,6 +8524,7 @@ def generate_lyric_video(
                 lyric_color=lyric_color, lyric_sung_color=lyric_sung_color,
                 title_template=title_template, title_size=title_size,
                 title_artist_font=title_artist_font, title_song_font=title_song_font,
+                title_song_break=title_song_break,
             )
             logger.info("[ASS] render: %.1fs (engine=ass)", _time.monotonic() - _t0)
             audio.close()
@@ -9268,6 +9290,8 @@ def run_edit_pipeline(
     title_size = float(merged.get("title_size") or 1.0)
     title_artist_font = merged.get("title_artist_font") or ""
     title_song_font = merged.get("title_song_font") or ""
+    # UI v1.1 (2026-05-30): manual song-title break. "" = auto (legacy).
+    title_song_break = merged.get("title_song_break") or ""
     # Per-edit operator hint for background regen (set by /edit when the
     # user typed in the "Aclarar tipo de fondo" textarea). None if absent;
     # propagates only into the `background` branch below.
@@ -9389,6 +9413,7 @@ def run_edit_pipeline(
             lyric_color=lyric_color, lyric_sung_color=lyric_sung_color,
             title_template=title_template, title_size=title_size,
             title_artist_font=title_artist_font, title_song_font=title_song_font,
+            title_song_break=title_song_break,
         )
         files = {"video_url": f"/download/{job_id}/video"}
         update_job(job_id, progress=55)
