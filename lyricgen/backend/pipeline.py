@@ -505,15 +505,20 @@ def run_pipeline(job_id: str, mp3_path: str, artist: str, style: str,
                  # path en R2. None = no chequear cache (fallback al flow
                  # tradicional de Veo/Imagen inline).
                  bg_cache_key: str | None = None,
-                 # 2026-05-29 (D): background_id del BackgroundAsset elegido
-                 # por el operador, cuando vino de la librería. Se persiste
-                 # en render_params para que `run_edit_pipeline` pueda
-                 # re-resolverlo y descargar el preset de R2 sin tener
-                 # que regenerar con Veo cuando bg_r2_key_cached quede
-                 # NULL por cualquier razón (silent upload fail, jobs
-                 # previos al PR #480, etc.). None = AI-gen / uploaded /
-                 # variation, ningún preset persistido para fallback.
-                 background_id: int | None = None):
+                 # Title-card customization (Full Rotor v1). Defaults reproduce
+                 # the historical look. title_size clamps 0.5-2.0; the font ids
+                 # resolve via _resolve_font ("" → ExtraBold artist / lyric song);
+                 # template ∈ auto|centered|lower_third|badge.
+                 title_template: str = "auto",
+                 title_size: float = 1.0,
+                 title_artist_font: str = "",
+                 title_song_font: str = "",
+                 # UI v1.1 (2026-05-30): explicit line break for the song
+                 # title. Empty string = automatic shrink-then-wrap (default,
+                 # historical). When set, contains the operator-chosen line
+                 # break(s) joined with "\n" — e.g. "Donde Estan\nCorazón".
+                 # Threaded into title_card_lines via song_lines kwarg.
+                 title_song_break: str = ""):
     """Run the full pipeline for a job. Called synchronously.
 
     delivery_profile:
@@ -819,6 +824,16 @@ def run_pipeline(job_id: str, mp3_path: str, artist: str, style: str,
             "movement_style": movement_style,
             "effect": effect,
             "match_lyrics": match_lyrics,
+            # Title-card customization (Full Rotor v1). Safe defaults, always
+            # persisted so future edits/retries inherit the operator's choice.
+            "title_template": title_template,
+            "title_size": title_size,
+            "title_artist_font": title_artist_font,
+            "title_song_font": title_song_font,
+            # UI v1.1 (2026-05-30): manual song split. Empty string => auto
+            # (legacy). When set, the operator picked their own line break in
+            # the wizard and we persist it so retries/edits respect it.
+            "title_song_break": title_song_break,
         }
         # Only persist background_hint / bg_verbatim when this run actually
         # received them — otherwise a hint-less typography edit would null out
@@ -829,12 +844,6 @@ def run_pipeline(job_id: str, mp3_path: str, artist: str, style: str,
             _new_rp["bg_verbatim"] = True
         if custom_colors:
             _new_rp["custom_colors"] = custom_colors
-        # 2026-05-29 (D): persist background_id when it came from the
-        # library so run_edit_pipeline has a fallback path if the cached
-        # bg upload fails or was never attempted. merge_render_params
-        # ignores None values so passing it unconditionally is safe.
-        if background_id is not None:
-            _new_rp["background_id"] = int(background_id)
         # U5 (audit 2026-05-25): merge atómico vía jobs.merge_render_params.
         # El read-then-write fuera de un row lock dejaba race: 2 callers
         # concurrentes (worker + /edit endpoint, o 2 /edit calls) podían
@@ -846,21 +855,12 @@ def run_pipeline(job_id: str, mp3_path: str, artist: str, style: str,
         except Exception as _rp_exc:
             logger.warning("[BG] merge_render_params failed: %s", _rp_exc)
 
-        # Cache the rendered background to R2 so subsequent edits
-        # (typography / lyrics / metadata) can re-use it without another
-        # Veo call ($0.80 saved per edit).
-        #
-        # HOTFIX 2026-05-29: previously this only ran when `not background_path`
-        # (= AI-generated only). Operators who uploaded their own bg or
-        # picked one from the library ended up with bg_r2_key_cached=NULL
-        # → they could not do ANY fast-path edit (the /edit endpoint hard-
-        # rejected with "No cached background available"). Reported by
-        # Agus.Cafisi in prod on job aedae037aa02: she wanted to fix a
-        # typo in the title (metadata edit) on a job that used an uploaded
-        # background — blocked with no way forward except "regenerate the
-        # bg for $0.90" which is absurd UX for a one-character typo. The
-        # cache is identical regardless of bg source, so always do it.
-        if bg_image_path and os.path.exists(bg_image_path):
+        # Cache AI-generated background to R2 so a typography-only edit
+        # can re-use it without another Veo call ($0.80 saved per edit).
+        # Only worth doing when storage is available and the background is
+        # a file we own (not a human-provided upload — those already have
+        # their own R2 key in bg_r2_key).
+        if bg_image_path and os.path.exists(bg_image_path) and not background_path:
             import storage as _storage
             if _storage.is_enabled():
                 try:
@@ -1011,6 +1011,17 @@ def run_pipeline(job_id: str, mp3_path: str, artist: str, style: str,
             if wants_umg and not umg_spec:
                 raise RuntimeError("UMG delivery requested without umg_spec")
             update_job(job_id, current_step="video", progress=40)
+            # The word-level animations (karaoke fill + word_reveal) need
+            # per-word timing to stay in sync. Derive it once via forced-align
+            # (gated to those animations; no-op/fallback otherwise) and cache it
+            # into segments_json so re-renders don't re-pay. Isolated from the
+            # transcription pipeline by design.
+            if lyrics_animation in ("karaoke", "word_reveal"):
+                import karaoke_align
+                _enriched = karaoke_align.enrich_segments_with_word_timings(segments, mp3_path)
+                if _enriched is not segments:
+                    segments = _enriched
+                    update_job(job_id, segments_json=segments)
             intermediate_spec = (
                 RenderSpec.umg_intermediate_master(umg_spec) if wants_umg
                 else None  # generate_lyric_video defaults to youtube_default
@@ -1028,6 +1039,9 @@ def run_pipeline(job_id: str, mp3_path: str, artist: str, style: str,
                 text_contrast=text_contrast,
                 effect=effect, custom_colors=custom_colors,
                 lyric_color=lyric_color, lyric_sung_color=lyric_sung_color,
+                title_template=title_template, title_size=title_size,
+                title_artist_font=title_artist_font, title_song_font=title_song_font,
+                title_song_break=title_song_break,
             )
             files["video_url"] = f"/download/{job_id}/video"
             update_job(job_id, progress=55)
@@ -8140,6 +8154,15 @@ def _render_lyrics_ass(
     # del texto (PrimaryColour del style en ASS).
     lyric_color: str = "",
     lyric_sung_color: str = "",
+    # Title-card customization (Full Rotor v1). Defaults reproduce the
+    # historical look exactly: auto layout, no size change, artist in
+    # Montserrat ExtraBold, song in the lyric font.
+    title_template: str = "auto",
+    title_size: float = 1.0,
+    title_artist_font: str = "",
+    title_song_font: str = "",
+    # UI v1.1 (2026-05-30): manual song-title line break. "" = auto wrap.
+    title_song_break: str = "",
 ) -> str:
     """Fast lyric render: burn the lyrics with libass in a single ffmpeg
     pass over the (ffmpeg-looped) background — no moviepy frame loop.
@@ -8170,15 +8193,25 @@ def _render_lyrics_ass(
         out_name="bg_looped_ass.mp4",
     )
 
-    # 2) Fonts: the lyric font + the title-card artist font (ExtraBold).
-    #    Both live in one fontsdir so libass can \fn-switch between them
+    # 2) Fonts: the lyric font + the title-card fonts. The title card can use
+    #    operator-chosen fonts per element (Full Rotor v1); defaults keep the
+    #    historical look — artist in Montserrat ExtraBold, song in the lyric
+    #    font. All live in one fontsdir so libass can \fn-switch between them
     #    without mis-matching across the pool.
     family, bold = _ass.font_family(font_path)
     extrabold_font = os.path.join(_FONTS_DIR, "Montserrat-ExtraBold.ttf")
     if not os.path.exists(extrabold_font):
         extrabold_font = font_path  # graceful fallback
+    # Per-element title fonts: resolve the chosen ids, else fall back to the
+    # historical defaults (artist = ExtraBold, song = lyric font).
+    title_artist_path = _resolve_font(title_artist_font) or extrabold_font
+    title_song_path = _resolve_font(title_song_font) or font_path
+    title_artist_family, _ = _ass.font_family(title_artist_path)
+    title_song_family, _ = _ass.font_family(title_song_path)
     artist_family, _ = _ass.font_family(extrabold_font)
-    font_dir = _ass.multi_font_dir([font_path, extrabold_font])
+    font_dir = _ass.multi_font_dir(
+        [font_path, extrabold_font, title_artist_path, title_song_path]
+    )
 
     # 3) Segments → ASS lines (same case/sanitise/sizing as moviepy), plus
     #    the artist/song title card overlay (same two layouts).
@@ -8205,12 +8238,22 @@ def _render_lyrics_ass(
         artist, song_title, first_lyric_start,
         width=spec.width, height=spec.height,
         text_scale=scale,
-        lyric_font_family=family,
-        artist_font_family=artist_family,
+        # Per-element fonts (operator-chosen, else historical defaults).
+        lyric_font_family=title_song_family,
+        artist_font_family=title_artist_family,
         # Real font files so long titles/artists are shrunk (then wrapped)
         # to the safe card width instead of overflowing the frame.
-        lyric_font_path=font_path,
-        artist_font_path=extrabold_font,
+        lyric_font_path=title_song_path,
+        artist_font_path=title_artist_path,
+        # Operator layout + size (Full Rotor v1).
+        template=title_template,
+        size_multiplier=title_size,
+        # UI v1.1 (2026-05-30): explicit line break for the song. Empty
+        # string => None (auto wrap, historical). When the operator picked
+        # their own break in the wizard, we split on the literal "\n" and
+        # title_card_lines uses those lines as-is, fitting each one
+        # individually.
+        song_lines=(title_song_break.split("\n") if title_song_break else None),
     )
     base_fs = _ass.lyric_fontsize(40, scale, font_scale)
     # Reusamos el mapping primary/secondary computado arriba para
@@ -8366,6 +8409,13 @@ def generate_lyric_video(
     # Lyric text colors 2026-05-25. Hex #RRGGBB; "" → blanco default.
     lyric_color: str = "",
     lyric_sung_color: str = "",
+    # Title-card customization (Full Rotor v1). Defaults = historical look.
+    title_template: str = "auto",
+    title_size: float = 1.0,
+    title_artist_font: str = "",
+    title_song_font: str = "",
+    # UI v1.1 (2026-05-30): manual song-title line break ("" = auto wrap).
+    title_song_break: str = "",
 ) -> tuple[str, str, str | None]:
     """Generate a lyric video. Returns (video_path, font, bg_source).
 
@@ -8472,6 +8522,9 @@ def generate_lyric_video(
                 artist=artist, song_title=title_song,
                 effect=effect, style=style, custom_colors=custom_colors,
                 lyric_color=lyric_color, lyric_sung_color=lyric_sung_color,
+                title_template=title_template, title_size=title_size,
+                title_artist_font=title_artist_font, title_song_font=title_song_font,
+                title_song_break=title_song_break,
             )
             logger.info("[ASS] render: %.1fs (engine=ass)", _time.monotonic() - _t0)
             audio.close()
@@ -8555,58 +8608,42 @@ def generate_lyric_video(
             scale = spec.text_scale
             START_T = 0.3            # delay before card appears
 
-            # Decide layout based on how much intro time we have. 0.8 s
-            # is the minimum window for a readable centred card; below
-            # that the user can't actually read it before the lyrics
-            # take over.
+            # Layout geometry comes from the SHARED helper (ass_render.
+            # title_card_layout) so this moviepy fallback never drifts from
+            # the libass path: same sizes, alignment, anchor, card width and
+            # opacities per template + size_multiplier. Timing (how long the
+            # card shows + fades) still follows the intro window below.
+            import ass_render as _ass
             has_long_intro = first_lyric_start > START_T + 0.5
-
+            L = _ass.title_card_layout(
+                title_template, has_long_intro, size_multiplier=title_size)
+            artist_size = max(L["floor_artist"], int(round(L["artist_base"] * scale)))
+            song_size = max(L["floor_title"], int(round(L["title_base"] * scale)))
+            card_width = int(round(spec.width * L["card_w_frac"]))
+            stroke_w = max(1, int(round((1.6 if has_long_intro else 1.2) * scale)))
+            anchor = L["anchor"]                     # center | lower_third | bottom
+            position_x_center = L["x_frac"] >= 0.5
+            base_opacity_artist = L["op_artist"]
+            base_opacity_song = L["op_song"]
+            # Per-element fonts: operator-chosen ids, else historical defaults
+            # (artist = ExtraBold, song = lyric font).
+            mvp_artist_font = _resolve_font(title_artist_font) or extrabold_font
+            mvp_song_font = _resolve_font(title_song_font) or font
             if has_long_intro:
-                # ----- CENTRED FULL CARD (long intro) -----
-                # Hero sizes: artist bigger than the 85px lyric tier, song
-                # secondary. Mirrors ass_render.title_card_lines. Bumped 2026-05
-                # (old 62/46 read smaller than the lyrics).
-                artist_size = max(30, int(round(100 * scale)))
-                title_size = max(24, int(round(62 * scale)))
-                card_width = int(round(spec.width * 0.80))
-                stroke_w = max(1, int(round(1.6 * scale)))
                 title_end = min(first_lyric_start - 0.2, START_T + 8.0)
                 clip_dur = title_end - START_T
-                # Fades scale down for short available windows so we
-                # always get at least a moment of full opacity.
                 fade_in = min(0.4, max(0.1, clip_dur * 0.25))
                 fade_out = min(0.7, max(0.1, clip_dur * 0.35))
-                position_y_center = True
-                position_x_center = True
-                base_opacity_artist = 0.97
-                base_opacity_song = 0.85
             else:
-                # ----- LOWER-LEFT BADGE (short intro fallback) -----
-                # Smaller because it sits next to the active lyric line;
-                # we never want it to compete for the user's attention,
-                # just provide identification.
-                artist_size = max(20, int(round(36 * scale)))
-                title_size = max(16, int(round(28 * scale)))
-                card_width = int(round(spec.width * 0.45))
-                stroke_w = max(1, int(round(1.2 * scale)))
                 title_end = START_T + 6.0
                 clip_dur = title_end - START_T
-                fade_in = 0.4
-                fade_out = 0.8
-                position_y_center = False     # bottom-anchored
-                position_x_center = False     # left-anchored
-                base_opacity_artist = 0.92
-                base_opacity_song = 0.80
-                logger.info(
-                    "[TITLE] first lyric at %.2fs — using lower-left badge (intro too short for centred card)",
-                    first_lyric_start,
-                )
+                fade_in, fade_out = 0.4, 0.8
 
             title_card_clips = []
 
             if artist_upper:
                 artist_clip = TextClip(
-                    artist_upper, fontsize=artist_size, font=extrabold_font,
+                    artist_upper, fontsize=artist_size, font=mvp_artist_font,
                     color="white", stroke_color="black", stroke_width=stroke_w,
                     method="caption", size=(card_width, None), align="center" if position_x_center else "West",
                 )
@@ -8614,7 +8651,7 @@ def generate_lyric_video(
 
             if title_display:
                 song_clip = TextClip(
-                    title_display, fontsize=title_size, font=font,
+                    title_display, fontsize=song_size, font=mvp_song_font,
                     color="white", stroke_color="black", stroke_width=max(1, int(round(1.2 * scale))),
                     method="caption", size=(card_width, None), align="center" if position_x_center else "West",
                 )
@@ -8623,11 +8660,12 @@ def generate_lyric_video(
             if title_card_clips:
                 total_h = sum(c.size[1] for c, _ in title_card_clips) + 8 * (len(title_card_clips) - 1)
 
-                if position_y_center:
+                if anchor == "center":
                     y_cursor = (spec.height - total_h) // 2
-                else:
-                    # Bottom margin = 8% of frame height — comfortable
-                    # safe-area for broadcast and YouTube.
+                elif anchor == "lower_third":
+                    # block centred on ~74% of frame height (broadcast lower-third)
+                    y_cursor = int(spec.height * 0.74 - total_h / 2)
+                else:  # bottom — 8% safe-area margin
                     bottom_margin = int(spec.height * 0.08)
                     y_cursor = spec.height - bottom_margin - total_h
 
@@ -9213,12 +9251,6 @@ def run_edit_pipeline(
         umg_spec = job_row.umg_spec
         tenant_id = job_row.tenant_id
         bg_r2_key_cached = job_row.bg_r2_key_cached
-        # 2026-05-29 (D): when the original render used a library preset,
-        # background_id was persisted into render_params. If the dedicated
-        # cache is missing (silent upload fail, or job rendered pre-#480),
-        # we can fall back to re-resolving the same library asset and
-        # downloading it again — cheaper than regenerating with Veo.
-        fallback_background_id = base_params.get("background_id")
         input_r2_key = job_row.input_r2_key
         # Snapshot inputs: edit_count was already incremented by the /edit
         # handler before enqueuing, so it's the "version we're about to
@@ -9252,6 +9284,14 @@ def run_edit_pipeline(
     # colores elegidos.
     lyric_color = merged.get("lyric_color") or ""
     lyric_sung_color = merged.get("lyric_sung_color") or ""
+    # Title-card customization (Full Rotor v1). Persist across edits via
+    # render_params; defaults reproduce the historical look.
+    title_template = merged.get("title_template") or "auto"
+    title_size = float(merged.get("title_size") or 1.0)
+    title_artist_font = merged.get("title_artist_font") or ""
+    title_song_font = merged.get("title_song_font") or ""
+    # UI v1.1 (2026-05-30): manual song-title break. "" = auto (legacy).
+    title_song_break = merged.get("title_song_break") or ""
     # Per-edit operator hint for background regen (set by /edit when the
     # user typed in the "Aclarar tipo de fondo" textarea). None if absent;
     # propagates only into the `background` branch below.
@@ -9295,60 +9335,10 @@ def run_edit_pipeline(
             update_job(job_id, status="editing", current_step="video", progress=35)
             bg_image_path = os.path.join(job_dir, "bg_cached_edit.mp4")
             if not os.path.exists(bg_image_path):
-                # Primary path: dedicated cached copy uploaded post-render.
                 if bg_r2_key_cached and storage.is_enabled():
                     ok = storage.download_object(bg_r2_key_cached, bg_image_path)
                     if not ok:
                         raise RuntimeError("Could not download cached background from R2")
-                # 2026-05-29 (D): library-preset fallback. The original
-                # render used a BackgroundAsset from the library and we
-                # persisted its id into render_params. Re-resolve the asset
-                # and download it. This avoids charging the operator $0.90
-                # for a Veo regen just because the cache upload silently
-                # failed or never ran (pre-#480 jobs).
-                elif fallback_background_id and storage.is_enabled():
-                    try:
-                        from database import SessionLocal as _SL, BackgroundAsset
-                        with _SL() as _db:
-                            _asset = (
-                                _db.query(BackgroundAsset)
-                                .filter(BackgroundAsset.id == int(fallback_background_id))
-                                .filter(BackgroundAsset.is_active == True)
-                                .first()
-                            )
-                        if not _asset:
-                            raise RuntimeError(
-                                f"No cached background and library asset "
-                                f"{fallback_background_id} is gone. Use "
-                                f"edit_type='background' to regenerate."
-                            )
-                        # asset.filename is the R2 key when it starts with
-                        # "library/" (set by the upload flow). Preserve the
-                        # source extension so jpg/png presets work too.
-                        _src_ext = os.path.splitext(_asset.filename)[1].lower() or ".mp4"
-                        if _src_ext != ".mp4":
-                            bg_image_path = os.path.join(job_dir, f"bg_cached_edit{_src_ext}")
-                        ok = storage.download_object(_asset.filename, bg_image_path)
-                        if not ok:
-                            raise RuntimeError(
-                                f"Library asset {fallback_background_id} found but R2 "
-                                f"download failed. Use edit_type='background' to regenerate."
-                            )
-                        logger.info(
-                            "[EDIT] bg cache missing — fell back to library asset id=%s key=%s",
-                            fallback_background_id, _asset.filename,
-                        )
-                    except RuntimeError:
-                        raise
-                    except Exception as _bg_fb_exc:
-                        # Non-RuntimeError (DB lookup blew up, etc.) — surface
-                        # as the same gate error so the operator at least sees
-                        # the bg-regen path.
-                        raise RuntimeError(
-                            f"No cached background available for {edit_type} edit "
-                            f"(fallback lookup failed: {_bg_fb_exc}). "
-                            f"Use edit_type='background' to regenerate it."
-                        )
                 else:
                     raise RuntimeError(
                         f"No cached background available for {edit_type} edit. "
@@ -9395,6 +9385,16 @@ def run_edit_pipeline(
         # Re-render video
         # ----------------------------------------------------------------
         update_job(job_id, current_step="video", progress=40)
+        # Word-level animation timing (forced-align, once, cached) — same
+        # gated/isolated path as run_pipeline. A re-render of an existing
+        # karaoke / word_reveal job (incl. a typography edit) thus repairs its
+        # sync and caches the result.
+        if lyrics_animation in ("karaoke", "word_reveal"):
+            import karaoke_align
+            _enriched = karaoke_align.enrich_segments_with_word_timings(segments, mp3_path)
+            if _enriched is not segments:
+                segments = _enriched
+                update_job(job_id, segments_json=segments)
         intermediate_spec = (
             RenderSpec.umg_intermediate_master(umg_spec) if wants_umg
             else None
@@ -9411,6 +9411,9 @@ def run_edit_pipeline(
             line_transition=line_transition,
             effect=effect, custom_colors=custom_colors,
             lyric_color=lyric_color, lyric_sung_color=lyric_sung_color,
+            title_template=title_template, title_size=title_size,
+            title_artist_font=title_artist_font, title_song_font=title_song_font,
+            title_song_break=title_song_break,
         )
         files = {"video_url": f"/download/{job_id}/video"}
         update_job(job_id, progress=55)

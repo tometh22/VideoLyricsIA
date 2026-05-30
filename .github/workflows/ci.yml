@@ -38,6 +38,14 @@ jobs:
           cache: "pip"
           cache-dependency-path: lyricgen/backend/requirements.txt
 
+      # ffmpeg (Debian build ships with libass → the `subtitles` filter).
+      # Without it the end-to-end render test (test_ass_integration_render.py)
+      # SKIPS, so a broken libass title-card / overlay burn could ship
+      # unnoticed — the 2026-05 title-card fix (overflow + floating accents)
+      # is only truly gated when this burns a real MP4. ~5s on a warm runner.
+      - name: Install ffmpeg (libass for the render gate)
+        run: sudo apt-get update && sudo apt-get install -y ffmpeg
+
       - name: Install dependencies
         run: |
           pip install -r requirements.txt

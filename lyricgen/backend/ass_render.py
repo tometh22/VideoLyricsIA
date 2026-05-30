@@ -297,6 +297,55 @@ def fit_title_text(
     return wrapped, size
 
 
+# Title-card layout geometry — the SINGLE source of truth shared by the
+# libass path (title_card_lines) and the moviepy fallback
+# (pipeline._moviepy_title_card), so the two engines never drift. Each
+# template maps to base sizes (pre text_scale), alignment (numpad \an),
+# vertical anchor, horizontal fraction, safe card width, and per-line
+# opacity. `auto` reproduces the historical has_long_intro behaviour
+# exactly (hero card on a long intro, lower-left badge otherwise).
+_TITLE_TEMPLATES = ("auto", "centered", "lower_third", "badge")
+
+_TITLE_LAYOUTS = {
+    # name: artist_base, title_base, floor_a, floor_t, alignment, anchor,
+    #       x_frac, card_w_frac, op_artist, op_song
+    "centered":    (100, 62, 30, 24, 5, "center",      0.5,  0.80, 0.97, 0.85),
+    "lower_third": (64,  40, 24, 18, 5, "lower_third", 0.5,  0.80, 0.97, 0.85),
+    "badge":       (36,  28, 20, 16, 4, "bottom",      0.06, 0.45, 0.92, 0.80),
+}
+
+
+def title_card_layout(template: str, has_long_intro: bool, *,
+                      size_multiplier: float = 1.0) -> dict:
+    """Resolve a title-card template to its visual geometry.
+
+    `auto` → "centered" when the song has a long instrumental intro (the
+    historical hero card), else "badge" (the lower-left identification badge).
+    Explicit templates force that layout regardless of intro length. Timing
+    (how long the card shows + fades) is NOT decided here — it stays in the
+    caller, derived from the intro window, so it's orthogonal to the visual
+    placement. size_multiplier scales the base sizes (operator control),
+    clamped 0.5–2.0. Returns a dict consumed by BOTH render paths."""
+    tmpl = template if template in _TITLE_TEMPLATES else "auto"
+    resolved = ("centered" if has_long_intro else "badge") if tmpl == "auto" else tmpl
+    (a_base, t_base, floor_a, floor_t, alignment, anchor,
+     x_frac, card_w_frac, op_artist, op_song) = _TITLE_LAYOUTS[resolved]
+    mult = max(0.5, min(2.0, float(size_multiplier or 1.0)))
+    return {
+        "resolved": resolved,
+        "artist_base": a_base * mult,
+        "title_base": t_base * mult,
+        "floor_artist": floor_a,
+        "floor_title": floor_t,
+        "alignment": alignment,
+        "anchor": anchor,            # "center" | "lower_third" | "bottom"
+        "x_frac": x_frac,
+        "card_w_frac": card_w_frac,
+        "op_artist": op_artist,
+        "op_song": op_song,
+    }
+
+
 def title_card_lines(
     artist: str,
     song: str,
@@ -309,6 +358,15 @@ def title_card_lines(
     artist_font_family: str,
     lyric_font_path: str | None = None,
     artist_font_path: str | None = None,
+    template: str = "auto",
+    size_multiplier: float = 1.0,
+    # UI v1.1 (2026-05-30): explicit line break for the song. When set with 2+
+    # non-empty entries, skip the auto shrink-then-wrap heuristic and use these
+    # lines as-is (each still shrunk individually by fit_title_text so a
+    # long line doesn't overflow the safe width). None or single entry =>
+    # historical behaviour preserved exactly. Threaded from the wizard's
+    # "Partir en 2 líneas" control via render_params.title_song_break.
+    song_lines: list[str] | None = None,
 ) -> list[AssLine]:
     """Build the artist/song title-card overlay as ASS lines, mirroring the
     moviepy title card (pipeline.generate_lyric_video) so the look matches
@@ -343,28 +401,28 @@ def title_card_lines(
     START_T = 0.3
     has_long_intro = first_lyric_start > START_T + 0.5
 
+    # Visual geometry: template (operator-chosen, default "auto") + intro
+    # length → sizes/alignment/anchor/width/opacity. Shared with the moviepy
+    # fallback via title_card_layout so the two engines stay in lockstep.
+    L = title_card_layout(template, has_long_intro, size_multiplier=size_multiplier)
+    artist_size = max(L["floor_artist"], int(round(L["artist_base"] * text_scale)))
+    title_size = max(L["floor_title"], int(round(L["title_base"] * text_scale)))
+    alignment = L["alignment"]
+    op_artist, op_song = L["op_artist"], L["op_song"]
+    card_w_frac = L["card_w_frac"]
+
+    # Timing (how long the card shows + fades) follows the intro window — it is
+    # orthogonal to the visual template, so a forced layout still respects how
+    # much instrumental room precedes the first sung line.
     if has_long_intro:
-        # Hero title card: artist is the prominent line (bigger than the 85px
-        # lyric tier), song title secondary. Bumped 2026-05 — the old 62/46
-        # read smaller than the lyrics, which felt wrong for the intro moment.
-        artist_size = max(30, int(round(100 * text_scale)))
-        title_size = max(24, int(round(62 * text_scale)))
         title_end = min(first_lyric_start - 0.2, START_T + 8.0)
         clip_dur = max(0.1, title_end - START_T)
         fade_in = min(0.4, max(0.1, clip_dur * 0.25))
         fade_out = min(0.7, max(0.1, clip_dur * 0.35))
-        alignment = 5            # centred
-        op_artist, op_song = 0.97, 0.85
-        card_w_frac = 0.80       # centred card: 80% of frame width (matches moviepy)
     else:
-        artist_size = max(20, int(round(36 * text_scale)))
-        title_size = max(16, int(round(28 * text_scale)))
         title_end = START_T + 6.0
         clip_dur = title_end - START_T
         fade_in, fade_out = 0.4, 0.8
-        alignment = 4            # left-middle (lower-left badge)
-        op_artist, op_song = 0.92, 0.80
-        card_w_frac = 0.45       # lower-left badge: narrower (matches moviepy)
 
     # Shrink (then wrap) each line to the card's safe width so long titles /
     # artist names don't overflow the frame. min_size = 62% of the base tier,
@@ -392,9 +450,35 @@ def title_card_lines(
         stack.append(("\n".join(a_lines), a_size,
                       artist_font_family, True, op_artist, len(a_lines)))
     if song_d:
-        s_lines, s_size = _fit(song_d, title_size, lyric_font_path)
-        stack.append(("\n".join(s_lines), s_size,
-                      lyric_font_family, False, op_song, len(s_lines)))
+        # Manual split (UI v1.1): when the operator provided explicit lines,
+        # bypass the auto-wrap and fit each line independently. We still call
+        # fit_title_text on each line so a too-long line shrinks instead of
+        # overflowing the safe width — the difference vs. the auto path is
+        # that we never silently re-wrap the operator's chosen break.
+        normalized_manual = (
+            [unicodedata.normalize("NFC", (s or "").strip()) for s in (song_lines or [])]
+        )
+        normalized_manual = [s for s in normalized_manual if s]
+        use_manual_split = len(normalized_manual) >= 2
+        if use_manual_split:
+            fitted_lines: list[str] = []
+            min_size = title_size
+            for line in normalized_manual:
+                lines_for_part, size_for_part = _fit(line, title_size, lyric_font_path)
+                # If a single manual line still overflows and got auto-wrapped
+                # by fit_title_text, preserve the result (it's a graceful
+                # degradation; the operator's choice was honoured up to the
+                # safe width).
+                fitted_lines.extend(lines_for_part)
+                if size_for_part < min_size:
+                    min_size = size_for_part
+            s_text = "\n".join(fitted_lines)
+            stack.append((s_text, min_size,
+                          lyric_font_family, False, op_song, len(fitted_lines)))
+        else:
+            s_lines, s_size = _fit(song_d, title_size, lyric_font_path)
+            stack.append(("\n".join(s_lines), s_size,
+                          lyric_font_family, False, op_song, len(s_lines)))
     if not stack:
         return []
 
@@ -402,17 +486,17 @@ def title_card_lines(
     gap = 8.0
     total_h = sum(line_hs) + gap * (len(stack) - 1)
 
-    if alignment == 5:
+    anchor = L["anchor"]
+    if anchor == "center":
         top = (height - total_h) / 2.0
-    else:
-        # bottom-anchored badge: 8% bottom safe-area margin
+    elif anchor == "lower_third":
+        # block centred on ~74% of the frame height (broadcast lower-third)
+        top = height * 0.74 - total_h / 2.0
+    else:  # "bottom" — 8% bottom safe-area margin (badge)
         bottom_margin = height * 0.08
         top = height - bottom_margin - total_h
 
-    if alignment == 5:
-        x_frac = 0.5
-    else:
-        x_frac = (width * 0.06) / width  # 6% left margin
+    x_frac = L["x_frac"]
 
     lines: list[AssLine] = []
     cursor = top

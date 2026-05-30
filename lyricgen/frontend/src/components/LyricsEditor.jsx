@@ -2015,7 +2015,16 @@ export default function LyricsEditor({
           play controls groups it with what it modifies (the timeline)
           AND frees the primary purple CTA so "Aprobar y generar" in
           the parent header has no visual competitor. */}
-      {audioUrl && (
+      {/* Audio bar SIEMPRE visible — incluso si audioUrl no cargó. La parte
+          de reproductor (play + scrub + timer) se condiciona internamente;
+          el resto (toggle Lista/Timeline, Modo Enfoque, Modo Sync, HelpTip)
+          tiene que estar visible siempre porque permite EDITAR TEXTO sin
+          necesidad de audio. Hotfix 2026-05-30 — antes envolver todo en
+          {audioUrl && ...} hacía que jobs con input_r2_key=null (migrados a
+          mano, GC de R2 después de 30 d, etc.) perdieran acceso al toggle
+          de vista y al editor de texto, sólo viendo una lista plana sin
+          forma de cambiar la vista. */}
+      {(
         /* Phase B 2026-05-25: sticky para que el play/pause + scrub
            siempre estén accesibles mientras el operador scrollea la
            lista de líneas. top usa stickyHeaderTop (passed by parent)
@@ -2027,6 +2036,10 @@ export default function LyricsEditor({
           style={{ top: stickyHeaderTop || 0 }}
           data-tour="editor-playbar"
         >
+          {/* Reproductor + scrub bar: solo si hay audio. Sin audio mostramos
+              un mensaje compacto avisando que el play/scrub no están y
+              dejando los controles de vista intactos a la derecha. */}
+          {audioUrl ? (<>
           <button
             onClick={togglePlay}
             className="w-10 h-10 rounded-full bg-brand hover:bg-brand-light text-white flex items-center justify-center transition-colors shrink-0"
@@ -2066,6 +2079,22 @@ export default function LyricsEditor({
           <span className="text-xs text-gray-500 tabular-nums shrink-0 w-10">
             {formatTime(duration)}
           </span>
+          </>) : (
+            /* Sin audio: ocupar el mismo espacio horizontal que el
+               reproductor para que la fila no colapse y los controles de
+               vista (a la derecha) queden en la misma posición que cuando
+               hay audio. Esto preserva la memoria muscular del operador. */
+            <div className="flex-1 flex items-center gap-2 text-[11px] text-amber-300/90">
+              <svg className="w-3.5 h-3.5 flex-shrink-0" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
+                <path d="M12 9v4M12 17h.01" />
+                <path d="M10.3 3.9 1.8 18a2 2 0 0 0 1.7 3h17a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0z" />
+              </svg>
+              <span className="truncate">
+                {t("editor.audio_unavailable") ||
+                  "Audio no disponible para reproducir — podés editar el texto igual."}
+              </span>
+            </div>
+          )}
           {/* Lista | Línea de tiempo — the timeline is a VIEW of the same
               editor (shared state), default Lista so the existing flow is
               untouched. Desktop feature: hidden on narrow screens where the

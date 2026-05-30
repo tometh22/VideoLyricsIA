@@ -12,6 +12,7 @@ from ass_render import (
     segments_to_lines, font_family, single_font_dir,
     multi_font_dir, title_card_lines, _opacity_to_alpha,
     moviepy_line_placement, hex_to_ass, fit_title_text,
+    title_card_layout,
 )
 
 _FONTS_DIR = os.path.join(os.path.dirname(__file__), "..", "fonts")
@@ -314,6 +315,71 @@ def test_title_card_normalises_decomposed_accents_to_nfc():
     assert artist.text == "ASÍ ES EL CALOR"
     assert song.text == "Canción"
     assert "́" not in artist.text and "́" not in song.text
+
+
+def test_title_card_manual_song_lines_respected():
+    """UI v1.1 (2026-05-30): when the operator passes song_lines explicitly,
+    title_card_lines uses those breaks verbatim (joined with the same "\\n"
+    libass break that the auto-wrap path uses) instead of auto-shrink-wrap.
+    Pinning this so a future refactor of the auto path can't silently
+    swallow the operator's chosen split — that would re-introduce the
+    Agus.Cafisi 2026-05-30 complaint (no way to put 'Donde Estan / Corazón'
+    in two specific lines)."""
+    lines = title_card_lines(
+        "Enrique Iglesias", "Donde Estan Corazón", first_lyric_start=5.0,
+        width=1920, height=1080, text_scale=1.0,
+        lyric_font_family="Oswald", artist_font_family="Montserrat ExtraBold",
+        song_lines=["Donde Estan", "Corazón"],
+    )
+    artist, song = lines
+    # The song line contains both pieces joined by the literal "\n" — the
+    # same separator the auto-wrap path uses, which build_ass turns into the
+    # libass hard break "\N".
+    assert song.text == "Donde Estan\nCorazón"
+    # The artist is untouched (only the song was split).
+    assert artist.text == "ENRIQUE IGLESIAS"
+
+
+def test_title_card_manual_song_lines_default_none_preserves_legacy():
+    """song_lines=None (default) reproduces the legacy single-line render
+    exactly. This is the no-regression guard: if anything in the
+    fitted/wrapped output changes when song_lines is unset, the change
+    leaks into every existing job."""
+    legacy = title_card_lines(
+        "Enrique Iglesias", "Donde Estan Corazón", first_lyric_start=5.0,
+        width=1920, height=1080, text_scale=1.0,
+        lyric_font_family="Oswald", artist_font_family="Montserrat ExtraBold",
+    )
+    explicit_none = title_card_lines(
+        "Enrique Iglesias", "Donde Estan Corazón", first_lyric_start=5.0,
+        width=1920, height=1080, text_scale=1.0,
+        lyric_font_family="Oswald", artist_font_family="Montserrat ExtraBold",
+        song_lines=None,
+    )
+    # Same text, sizes, alignment, fades.
+    assert [l.text for l in legacy] == [l.text for l in explicit_none]
+    assert [l.fontsize for l in legacy] == [l.fontsize for l in explicit_none]
+    assert [l.alignment for l in legacy] == [l.alignment for l in explicit_none]
+
+
+def test_title_card_manual_song_lines_single_entry_falls_back_to_auto():
+    """A song_lines list with a single entry should NOT trigger manual
+    split — it falls back to the legacy auto path (the operator probably
+    forgot to write the second line). Guards against producing a half-
+    rendered title."""
+    auto = title_card_lines(
+        "X", "Mi Tema", first_lyric_start=5.0,
+        width=1920, height=1080, text_scale=1.0,
+        lyric_font_family="Oswald", artist_font_family="Montserrat ExtraBold",
+    )
+    single = title_card_lines(
+        "X", "Mi Tema", first_lyric_start=5.0,
+        width=1920, height=1080, text_scale=1.0,
+        lyric_font_family="Oswald", artist_font_family="Montserrat ExtraBold",
+        song_lines=["Mi Tema"],
+    )
+    # Identical to the no-arg call.
+    assert [l.text for l in auto] == [l.text for l in single]
 
 
 def test_title_card_no_fit_without_font_paths_keeps_legacy_sizes():
@@ -734,4 +800,96 @@ def test_build_ass_karaoke_falls_back_to_grey_white_when_no_colors():
     dialogue = [l for l in out.splitlines() if l.startswith("Dialogue:")][0]
     assert "\\2c&H00808080" in dialogue   # grey un-sung default
     assert "\\1c&H00FFFFFF" in dialogue   # white sung default
+
+
+# --- Title card customization: Full Rotor v1 (templates + size) -----------
+
+def test_title_card_layout_auto_picks_by_intro():
+    # auto → centered hero on a long intro, lower-left badge otherwise.
+    hero = title_card_layout("auto", True)
+    badge = title_card_layout("auto", False)
+    assert hero["resolved"] == "centered" and hero["alignment"] == 5
+    assert hero["anchor"] == "center" and hero["artist_base"] == 100
+    assert badge["resolved"] == "badge" and badge["alignment"] == 4
+    assert badge["anchor"] == "bottom" and badge["x_frac"] < 0.5
+
+
+def test_title_card_layout_explicit_templates_force_layout():
+    # Explicit templates ignore intro length.
+    c = title_card_layout("centered", False)   # forced hero on short intro
+    assert c["resolved"] == "centered" and c["anchor"] == "center"
+    lt = title_card_layout("lower_third", True)
+    assert lt["resolved"] == "lower_third" and lt["anchor"] == "lower_third"
+    assert lt["alignment"] == 5                 # centred horizontally
+    b = title_card_layout("badge", True)        # forced badge on long intro
+    assert b["resolved"] == "badge" and b["anchor"] == "bottom"
+
+
+def test_title_card_layout_size_multiplier_scales_and_clamps():
+    base = title_card_layout("centered", True)["artist_base"]
+    big = title_card_layout("centered", True, size_multiplier=1.5)["artist_base"]
+    assert abs(big - base * 1.5) < 1e-9
+    # clamp 0.5–2.0
+    assert title_card_layout("centered", True, size_multiplier=9)["artist_base"] == base * 2.0
+    assert title_card_layout("centered", True, size_multiplier=0.1)["artist_base"] == base * 0.5
+    # unknown template → auto
+    assert title_card_layout("nonsense", True)["resolved"] == "centered"
+
+
+def test_title_card_lines_template_lower_third_anchors_low():
+    lines = title_card_lines(
+        "Soda Stereo", "De Música Ligera", first_lyric_start=5.0,
+        width=1920, height=1080, text_scale=1.0,
+        lyric_font_family="Oswald", artist_font_family="Montserrat ExtraBold",
+        template="lower_third",
+    )
+    artist, song = lines
+    # centred horizontally, block sits low (~74% height), not at vertical centre.
+    assert artist.alignment == 5 and artist.pos[0] == 0.5
+    assert artist.pos[1] > 0.6   # lower third, well below centre (0.5)
+    # lower_third tier is smaller than the 100px hero.
+    assert artist.fontsize < 100
+
+
+def test_title_card_lines_template_badge_forced_on_long_intro():
+    lines = title_card_lines(
+        "Intoxicados", "Pastillas", first_lyric_start=5.0,   # long intro
+        width=1920, height=1080, text_scale=1.0,
+        lyric_font_family="Anton", artist_font_family="Montserrat ExtraBold",
+        template="badge",
+    )
+    artist = lines[0]
+    # badge = left-anchored (\an4), 6% left margin — even though intro is long.
+    assert artist.alignment == 4 and abs(artist.pos[0] - 0.06) < 1e-9
+    assert artist.fontsize == 36   # badge artist tier at scale 1.0
+
+
+def test_title_card_lines_size_multiplier_scales_fontsize():
+    small = title_card_lines(
+        "Soda Stereo", "De Música Ligera", first_lyric_start=5.0,
+        width=1920, height=1080, text_scale=1.0,
+        lyric_font_family="Oswald", artist_font_family="M",
+        template="centered", size_multiplier=1.0,
+    )
+    big = title_card_lines(
+        "Soda Stereo", "De Música Ligera", first_lyric_start=5.0,
+        width=1920, height=1080, text_scale=1.0,
+        lyric_font_family="Oswald", artist_font_family="M",
+        template="centered", size_multiplier=1.5,
+    )
+    assert big[0].fontsize > small[0].fontsize   # artist scaled up
+    assert big[0].fontsize == 150                 # 100 * 1.5
+
+
+def test_title_card_lines_defaults_unchanged_no_regression():
+    # Defaults (template="auto", size_multiplier=1.0) reproduce the historical
+    # hero card exactly — guards against the Full Rotor refactor regressing.
+    lines = title_card_lines(
+        "Soda Stereo", "De Música Ligera", first_lyric_start=5.0,
+        width=1920, height=1080, text_scale=1.0,
+        lyric_font_family="Oswald", artist_font_family="Montserrat ExtraBold",
+    )
+    artist, song = lines
+    assert artist.fontsize == 100 and song.fontsize == 62
+    assert artist.alignment == 5 and artist.pos[0] == 0.5
 

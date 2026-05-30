@@ -8,7 +8,6 @@ import { IS_PRODUCTION, APP_ENV } from "./env";
 import { fetchWithTimeout } from "./fetchWithTimeout";
 import { uploadFileToR2 } from "./r2Upload";
 import * as wizardPersistence from "./wizardPersistence";
-import { setSentryUser } from "./observability";
 import LoginPage from "./components/LoginPage";
 import Landing from "./components/Landing";
 import Sidebar from "./components/Sidebar";
@@ -651,6 +650,13 @@ function EditLyricsRoute({ setCurrentReview, setWizardStage, wizardScreen, t }) 
         backgroundHint: pickSnapOr("backgroundHint", params.background_hint || ""),
         bgVerbatim: snapR?.bgVerbatim != null ? !!snapR.bgVerbatim : !!params.bg_verbatim,
         backgroundMode: pickSnapOr("backgroundMode", params.background_mode || ""),
+        // Title card customization (Full Rotor v1).
+        titleTemplate: pickSnapOr("titleTemplate", params.title_template || "auto"),
+        titleSize: String(pickSnapOr("titleSize", params.title_size || "1.0")),
+        titleArtistFont: pickSnapOr("titleArtistFont", params.title_artist_font || ""),
+        titleSongFont: pickSnapOr("titleSongFont", params.title_song_font || ""),
+        // UI v1.1 (2026-05-30): manual song-title line break — "" = auto.
+        titleSongBreak: pickSnapOr("titleSongBreak", params.title_song_break || ""),
       };
 
       // Baseline: snapshot inmutable de cómo está RENDERIZADO el video
@@ -674,6 +680,13 @@ function EditLyricsRoute({ setCurrentReview, setWizardStage, wizardScreen, t }) 
         backgroundHint: params.background_hint || "",
         bgVerbatim: !!params.bg_verbatim,
         backgroundMode: params.background_mode || "",
+        // Title card customization (Full Rotor v1) — baseline for the diff.
+        titleTemplate: params.title_template || "auto",
+        titleSize: String(params.title_size || "1.0"),
+        titleArtistFont: params.title_artist_font || "",
+        titleSongFont: params.title_song_font || "",
+        // UI v1.1: baseline for the manual break.
+        titleSongBreak: params.title_song_break || "",
         segments: JSON.parse(JSON.stringify(job.segments_json || [])),
       };
 
@@ -1291,9 +1304,6 @@ export default function App() {
     localStorage.setItem("genly_user", JSON.stringify(newUser));
     setToken(newToken);
     setUser(newUser);
-    // Scope Sentry events to this user (no PII — username/tenant/role
-    // only). No-op if Sentry is disabled.
-    setSentryUser(newUser);
   };
 
   // Self-heal: if we have a valid token but the user object is missing
@@ -1325,7 +1335,6 @@ export default function App() {
         if (data && data.username) {
           localStorage.setItem("genly_user", JSON.stringify(data));
           setUser(data);
-          setSentryUser(data);
         }
       })
       .catch(() => { /* swallow; next page load will retry */ });
@@ -1371,9 +1380,6 @@ export default function App() {
     // content; keep purely-UX state (sidebar, theme) alone.
     setToken(null);
     setUser(null);
-    // Clear Sentry user scope so post-logout events don't mis-attribute
-    // to the user who just left.
-    setSentryUser(null);
     setFiles([]);
     setReviewQueue([]);
     setCurrentReview(null);
@@ -1879,6 +1885,12 @@ export default function App() {
         // del batchDefault del operador. Init explícito acá.
         lyricsAnimation: entry.lyricsAnimation || "none",
         lineTransition: entry.lineTransition || "none",
+        // Title card customization (Full Rotor v1).
+        titleTemplate: entry.titleTemplate || "auto",
+        titleSize: entry.titleSize || "1.0",
+        titleArtistFont: entry.titleArtistFont || "",
+        titleSongFont: entry.titleSongFont || "",
+        titleSongBreak: entry.titleSongBreak || "",
         segments: data.segments, referenceLyrics: data.reference_lyrics || "",
         coverageWarning: !!data.coverage_warning,
         recoverySource: data.recovery_source || "",
@@ -2053,6 +2065,12 @@ export default function App() {
         // Audit fix 2026-05-25: init explícito de los 2 ejes libass.
         lyricsAnimation: entry.lyricsAnimation || "none",
         lineTransition: entry.lineTransition || "none",
+        // Title card customization (Full Rotor v1).
+        titleTemplate: entry.titleTemplate || "auto",
+        titleSize: entry.titleSize || "1.0",
+        titleArtistFont: entry.titleArtistFont || "",
+        titleSongFont: entry.titleSongFont || "",
+        titleSongBreak: entry.titleSongBreak || "",
         segments: data.segments, referenceLyrics: data.reference_lyrics || "",
         coverageWarning: !!data.coverage_warning,
         recoverySource: data.recovery_source || "",
@@ -2413,6 +2431,12 @@ export default function App() {
       lyricsAnimation: a.lyricsAnimation || "none",
       lineTransition: a.lineTransition || "none",
       textContrast: a.textContrast || "medium",
+      // Title card customization (Full Rotor v1).
+      titleTemplate: a.titleTemplate || "auto",
+      titleSize: a.titleSize || "1.0",
+      titleArtistFont: a.titleArtistFont || "",
+      titleSongFont: a.titleSongFont || "",
+      titleSongBreak: a.titleSongBreak || "",
       segments: a.segments,
       transcribeJobId: a.transcribeJobId || null,
       status: "queued", current_step: null, progress: 0, job_id: null, error: null,
@@ -2461,6 +2485,12 @@ export default function App() {
         formData.append("lyric_color", jobList[i].lyricColor || "#FFFFFF");
         formData.append("lyric_sung_color", jobList[i].lyricSungColor || "#FFFFFF");
         formData.append("text_contrast", jobList[i].textContrast || "medium");
+        // Title card customization (Full Rotor v1).
+        formData.append("title_template", jobList[i].titleTemplate || "auto");
+        formData.append("title_size", String(jobList[i].titleSize || "1.0"));
+        formData.append("title_artist_font", jobList[i].titleArtistFont || "");
+        formData.append("title_song_font", jobList[i].titleSongFont || "");
+        formData.append("title_song_break", jobList[i].titleSongBreak || "");
         if (animateImage && backgroundFile) formData.append("animate_image", "true");
         formData.append("match_lyrics", String(!!inspiredByLyrics));
         // Capa C 2026-05-24 — si el operador hizo pre-gen del background
@@ -2600,6 +2630,12 @@ export default function App() {
         generateBody.append("lyric_color", jobList[i].lyricColor || "#FFFFFF");
         generateBody.append("lyric_sung_color", jobList[i].lyricSungColor || "#FFFFFF");
         generateBody.append("text_contrast", jobList[i].textContrast || "medium");
+        // Title card customization (Full Rotor v1).
+        generateBody.append("title_template", jobList[i].titleTemplate || "auto");
+        generateBody.append("title_size", String(jobList[i].titleSize || "1.0"));
+        generateBody.append("title_artist_font", jobList[i].titleArtistFont || "");
+        generateBody.append("title_song_font", jobList[i].titleSongFont || "");
+        generateBody.append("title_song_break", jobList[i].titleSongBreak || "");
         if (animateImage && backgroundFile) generateBody.append("animate_image", "true");
         generateBody.append("match_lyrics", String(!!inspiredByLyrics));
         if (backgroundId) {
@@ -3014,17 +3050,14 @@ export default function App() {
             />
           </div>
         </div>
-        {/* Live title-card preview: shows the operator how the intro title
-            card will look (and whether a long title/artist gets shrunk or
-            wrapped) BEFORE the ~5-10 min re-render. Updates as they type.
-            Approximate — mirrors ass_render.fit_title_text, not pixel-exact. */}
-        <div className="w-full sm:w-[320px] mt-3">
-          <TitleCardPreview
-            artist={currentReview.artist || ""}
-            song={currentReview.songTitle || ""}
-            label={t("editor.title_card_preview") || "Vista previa de la portada"}
-          />
-        </div>
+        {/* UI v1.1 (2026-05-30): the live title-card preview used to live
+            here as a 320 px box next to the artist/song inputs — it looked
+            "stretched and lost" because the box was static while the editor
+            grew. We removed it: the title card is now previewed in the
+            CENTRAL sticky preview (toggle Letra / Portada inside
+            UploadZone). The artist + song inputs still feed the preview
+            because UploadZone reads them through titlePreviewArtist /
+            titlePreviewSong props plumbed below. */}
       </div>
     </div>
   ) : null;
@@ -3144,6 +3177,17 @@ export default function App() {
         // lyricsAnimation, lineTransition, lyricColor, lyricSungColor).
         onEditFieldChange={(field, value) =>
           setCurrentReview((r) => (r ? { ...r, [field]: value } : r))
+        }
+        // UI v1.1 (2026-05-30): feed the central title-card preview with the
+        // currently-active artist/song. In edit mode the canonical source is
+        // currentReview (the operator can edit them in the banner inputs
+        // above); in batch mode we pick the first file as a representative.
+        // Empty strings render the "—" placeholder in TitleCardPreview.
+        titlePreviewArtist={
+          currentReview?.artist ?? (files?.[0]?.artist || "")
+        }
+        titlePreviewSong={
+          currentReview?.songTitle ?? (files?.[0]?.songTitle || "")
         }
         renderedVideoUrl={editingRenderedVideoUrl || null}
         // UI F5 (2026-05-26): le pasamos el bgStatus al wizard para que
