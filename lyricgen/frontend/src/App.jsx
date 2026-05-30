@@ -3050,25 +3050,14 @@ export default function App() {
             />
           </div>
         </div>
-        {/* Live title-card preview: shows the operator how the intro title
-            card will look (and whether a long title/artist gets shrunk or
-            wrapped) BEFORE the ~5-10 min re-render. Updates as they type.
-            Renders with the operator's REAL chosen font (song) + Montserrat
-            ExtraBold (artist) via the shared font catalog, so it matches what
-            libass burns. Mirrors ass_render.fit_title_text, not pixel-exact. */}
-        <div className="w-full sm:w-[320px] mt-3">
-          <TitleCardPreview
-            artist={currentReview.artist || ""}
-            song={currentReview.songTitle || ""}
-            font={currentReview.font || ""}
-            textCase={currentReview.textCase || "upper"}
-            template={currentReview.titleTemplate || "auto"}
-            titleSize={currentReview.titleSize || "1.0"}
-            artistFont={currentReview.titleArtistFont || ""}
-            songFont={currentReview.titleSongFont || ""}
-            label={t("editor.title_card_preview") || "Vista previa de la portada"}
-          />
-        </div>
+        {/* UI v1.1 (2026-05-30): the live title-card preview used to live
+            here as a 320 px box next to the artist/song inputs — it looked
+            "stretched and lost" because the box was static while the editor
+            grew. We removed it: the title card is now previewed in the
+            CENTRAL sticky preview (toggle Letra / Portada inside
+            UploadZone). The artist + song inputs still feed the preview
+            because UploadZone reads them through titlePreviewArtist /
+            titlePreviewSong props plumbed below. */}
       </div>
     </div>
   ) : null;
@@ -3188,6 +3177,17 @@ export default function App() {
         // lyricsAnimation, lineTransition, lyricColor, lyricSungColor).
         onEditFieldChange={(field, value) =>
           setCurrentReview((r) => (r ? { ...r, [field]: value } : r))
+        }
+        // UI v1.1 (2026-05-30): feed the central title-card preview with the
+        // currently-active artist/song. In edit mode the canonical source is
+        // currentReview (the operator can edit them in the banner inputs
+        // above); in batch mode we pick the first file as a representative.
+        // Empty strings render the "—" placeholder in TitleCardPreview.
+        titlePreviewArtist={
+          currentReview?.artist ?? (files?.[0]?.artist || "")
+        }
+        titlePreviewSong={
+          currentReview?.songTitle ?? (files?.[0]?.songTitle || "")
         }
         renderedVideoUrl={editingRenderedVideoUrl || null}
         // UI F5 (2026-05-26): le pasamos el bgStatus al wizard para que
