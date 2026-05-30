@@ -1001,6 +1001,17 @@ def run_pipeline(job_id: str, mp3_path: str, artist: str, style: str,
             if wants_umg and not umg_spec:
                 raise RuntimeError("UMG delivery requested without umg_spec")
             update_job(job_id, current_step="video", progress=40)
+            # The word-level animations (karaoke fill + word_reveal) need
+            # per-word timing to stay in sync. Derive it once via forced-align
+            # (gated to those animations; no-op/fallback otherwise) and cache it
+            # into segments_json so re-renders don't re-pay. Isolated from the
+            # transcription pipeline by design.
+            if lyrics_animation in ("karaoke", "word_reveal"):
+                import karaoke_align
+                _enriched = karaoke_align.enrich_segments_with_word_timings(segments, mp3_path)
+                if _enriched is not segments:
+                    segments = _enriched
+                    update_job(job_id, segments_json=segments)
             intermediate_spec = (
                 RenderSpec.umg_intermediate_master(umg_spec) if wants_umg
                 else None  # generate_lyric_video defaults to youtube_default
@@ -9350,6 +9361,16 @@ def run_edit_pipeline(
         # Re-render video
         # ----------------------------------------------------------------
         update_job(job_id, current_step="video", progress=40)
+        # Word-level animation timing (forced-align, once, cached) — same
+        # gated/isolated path as run_pipeline. A re-render of an existing
+        # karaoke / word_reveal job (incl. a typography edit) thus repairs its
+        # sync and caches the result.
+        if lyrics_animation in ("karaoke", "word_reveal"):
+            import karaoke_align
+            _enriched = karaoke_align.enrich_segments_with_word_timings(segments, mp3_path)
+            if _enriched is not segments:
+                segments = _enriched
+                update_job(job_id, segments_json=segments)
         intermediate_spec = (
             RenderSpec.umg_intermediate_master(umg_spec) if wants_umg
             else None
