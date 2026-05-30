@@ -36,6 +36,30 @@ def _norm(text: str) -> str:
     return "".join(ch for ch in out if ch.isalnum())
 
 
+def _words_fit_window(words, line_start, line_end) -> bool:
+    """Gross-misalignment guard: only trust forced-align words for a line if
+    their time span actually overlaps the operator's line window. Tolerant of
+    small operator timing shifts (those still overlap heavily); rejects words
+    that aligned to a DIFFERENT part of the song (which would otherwise clamp
+    into a degenerate sweep and look worse than synthesis). Needs the FA span
+    to cover at least ~25% of the line. Returns True when timings are missing
+    (let the render-time clamp handle it)."""
+    try:
+        ls, le = float(line_start), float(line_end)
+    except (TypeError, ValueError):
+        return True
+    dur = le - ls
+    if dur <= 0:
+        return True
+    starts = [float(w["start"]) for w in words if isinstance(w, dict) and "start" in w]
+    ends = [float(w["end"]) for w in words if isinstance(w, dict) and "end" in w]
+    if not starts or not ends:
+        return True
+    fs, fe = min(starts), max(ends)
+    overlap = max(0.0, min(le, fe) - max(ls, fs))
+    return overlap >= 0.25 * dur
+
+
 def _has_valid_words(seg: dict) -> bool:
     w = seg.get("words")
     return (
@@ -93,12 +117,15 @@ def enrich_segments_with_word_timings(segments, audio_path):
                     cursor = j + 1
                     break
                 j += 1
-            if found:
+            if found and _words_fit_window(found["words"], seg.get("start"), seg.get("end")):
                 new_seg = dict(seg)
                 new_seg["words"] = found["words"]  # keep operator start/end
                 merged.append(new_seg)
                 attached += 1
             else:
+                # No match, or FA words grossly off this line's window → leave
+                # the line on synthesis (today's behaviour) rather than risk a
+                # worse, misaligned sweep.
                 merged.append(seg)
 
         if not attached:

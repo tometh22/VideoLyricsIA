@@ -97,6 +97,33 @@ def test_empty_or_no_audio_is_noop():
     assert karaoke_align.enrich_segments_with_word_timings(segs, "") is segs
 
 
+def test_sanity_guard_rejects_grossly_misaligned_words(monkeypatch):
+    # FA returns words for the right line text, but their timestamps land far
+    # outside the operator's line window (e.g. FA aligned to a different part).
+    # The guard should DROP them → that line stays on synthesis (no words).
+    segs = [{"start": 0.0, "end": 2.0, "text": "hola mundo"}]
+    fa = [{"start": 50.0, "end": 52.0, "text": "hola mundo",
+           "words": [{"word": "hola", "start": 50.0, "end": 51.0},
+                     {"word": "mundo", "start": 51.0, "end": 52.0}]}]
+    monkeypatch.setattr("forced_align.is_enabled", lambda: True)
+    monkeypatch.setattr("forced_align.forced_align_lyrics", lambda a, t: fa)
+    out = karaoke_align.enrich_segments_with_word_timings(segs, "/tmp/a.mp3")
+    assert "words" not in out[0]        # grossly off → rejected
+
+
+def test_sanity_guard_tolerates_small_operator_shift(monkeypatch):
+    # Operator nudged the line ~0.3s vs the FA span; they still overlap heavily
+    # → words ARE attached (we only reject GROSS misalignment).
+    segs = [{"start": 0.3, "end": 2.3, "text": "hola mundo"}]
+    fa = [{"start": 0.0, "end": 2.0, "text": "hola mundo",
+           "words": [{"word": "hola", "start": 0.0, "end": 1.0},
+                     {"word": "mundo", "start": 1.0, "end": 2.0}]}]
+    monkeypatch.setattr("forced_align.is_enabled", lambda: True)
+    monkeypatch.setattr("forced_align.forced_align_lyrics", lambda a, t: fa)
+    out = karaoke_align.enrich_segments_with_word_timings(segs, "/tmp/a.mp3")
+    assert out[0].get("words")          # heavy overlap → attached
+
+
 def test_repeated_lines_map_in_order(monkeypatch):
     segs = [
         {"start": 0.0, "end": 1.0, "text": "ay"},
