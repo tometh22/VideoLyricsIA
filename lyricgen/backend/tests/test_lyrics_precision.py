@@ -58,6 +58,7 @@ def _seed_job(
     input_r2_key: str = "inputs/synth/track.wav",
     umg_spec: dict | None = None,
     delivery_profile: str = "youtube",
+    render_params: dict | None = None,
 ) -> str:
     jid = f"lpr_{uuid.uuid4().hex[:6]}"
     db.add(Job(
@@ -75,6 +76,7 @@ def _seed_job(
         bg_r2_key_cached=bg_r2_key_cached,
         input_r2_key=input_r2_key,
         umg_spec=umg_spec,
+        render_params=render_params,
         created_at=datetime.now(timezone.utc),
         completed_at=datetime.now(timezone.utc),
     ))
@@ -351,6 +353,85 @@ def test_edit_lyrics_requires_bg_r2_key_cached(client, user_token, db):
         json={"edit_type": "lyrics", "segments": [{"start": 0, "end": 2, "text": "y"}]},
     )
     assert r.status_code == 400 and "background" in r.text.lower()
+    _cleanup(db)
+
+
+def test_edit_lyrics_falls_back_to_render_params_background_id(
+    client, user_token, db, monkeypatch,
+):
+    """PR #481 fallback: when bg_r2_key_cached is NULL but render_params
+    holds a background_id (the original render used a library preset),
+    the gate accepts the edit and the worker will re-resolve the asset
+    instead of demanding a $0.90 Veo regen.
+
+    Without this fallback, every job rendered before #480 — or any job
+    whose cache upload silently failed — would force the operator into
+    a paid background regen for a one-character typo. Reported via
+    Agus.Cafisi 2026-05-29 on job aedae037aa02.
+    """
+    _cleanup(db)
+    me = _decode_user(client, user_token)
+    jid = _seed_job(
+        db,
+        owner_id=me["id"],
+        tenant_id=me["tenant_id"],
+        status="pending_review",
+        segments_json=[{"start": 0.0, "end": 2.0, "text": "x"}],
+        bg_r2_key_cached=None,
+        # Library preset id persisted at render-time. The actual asset
+        # row doesn't need to exist for this gate-level test — the gate
+        # just checks for non-empty.
+        render_params={"background_id": 42},
+    )
+
+    captured = {}
+
+    def _stub_enqueue_edit(job_id, edit_type, edit_params, plan="100", **kwargs):
+        captured.update({"job_id": job_id, "edit_type": edit_type})
+
+    monkeypatch.setattr("main.enqueue_edit", _stub_enqueue_edit)
+
+    r = client.post(
+        f"/edit/{jid}",
+        headers={"Authorization": f"Bearer {user_token}", "Content-Type": "application/json"},
+        json={"edit_type": "lyrics", "segments": [{"start": 0, "end": 2, "text": "y"}]},
+    )
+    assert r.status_code == 200, r.text
+    assert captured["edit_type"] == "lyrics"
+    _cleanup(db)
+
+
+def test_edit_metadata_falls_back_to_render_params_background_id(
+    client, user_token, db, monkeypatch,
+):
+    """Same fallback for metadata edit (the exact scenario Agus hit:
+    typo in the title, bg from library, no cached copy)."""
+    _cleanup(db)
+    me = _decode_user(client, user_token)
+    jid = _seed_job(
+        db,
+        owner_id=me["id"],
+        tenant_id=me["tenant_id"],
+        status="pending_review",
+        segments_json=[{"start": 0.0, "end": 2.0, "text": "x"}],
+        bg_r2_key_cached=None,
+        render_params={"background_id": 7},
+    )
+
+    captured = {}
+
+    def _stub_enqueue_edit(job_id, edit_type, edit_params, plan="100", **kwargs):
+        captured.update({"job_id": job_id, "edit_type": edit_type})
+
+    monkeypatch.setattr("main.enqueue_edit", _stub_enqueue_edit)
+
+    r = client.post(
+        f"/edit/{jid}",
+        headers={"Authorization": f"Bearer {user_token}", "Content-Type": "application/json"},
+        json={"edit_type": "metadata", "song_title": "Title With Typo Fixed"},
+    )
+    assert r.status_code == 200, r.text
+    assert captured["edit_type"] == "metadata"
     _cleanup(db)
 
 
