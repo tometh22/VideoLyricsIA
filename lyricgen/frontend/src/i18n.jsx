@@ -232,6 +232,7 @@ export const translations = {
     "upload.titlecard_song_font_short": "Canción",
     "preview.face_lyrics": "Letra",
     "preview.face_title": "Portada",
+    "editor.audio_unavailable": "Audio no disponible para reproducir — podés editar el texto igual.",
     "upload.titlecard_break_label": "Partir título en 2 líneas",
     "upload.titlecard_break_help": "Si la canción tiene un título largo y querés decidir vos dónde se parte (ej. \"Donde Estan\" / \"Corazón\"), activá esto y escribí cada línea. Si lo dejás apagado, el sistema decide automáticamente cuando no entra en una sola línea.",
     "upload.titlecard_break_line1": "Línea 1:",
