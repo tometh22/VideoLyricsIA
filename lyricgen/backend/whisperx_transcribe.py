@@ -296,6 +296,23 @@ def _split_long_segments(segs: list[dict], *, max_dur: float | None = None,
     return out
 
 
+# 2026-05-31 — default dropped from 120 → 80 ms after Agus.Cafisi
+# reported "estribillo a destiempo" on "Nada fue un error" and "Luz
+# de día (versión cumbia)". Investigation against the live segments_json:
+#   - segment.start of all 50 segments in job 9df1132f6169 was exactly
+#     -120 ms vs words[0].start — the signature of _apply_lead_in.
+#   - 120 ms sits AT the karaoke "feel" threshold (~100 ms). Trained
+#     ears (UMG ops reviewers) perceive it as the line landing before
+#     the vocal — i.e. "destiempo".
+#   - 80 ms keeps a perceptible anticipation effect (helps the eye
+#     find the line before the singer enters) while sitting clearly
+#     below the threshold where most listeners read the offset as
+#     wrong.
+# Anyone wanting the previous behavior can set LYRIC_LEAD_IN_MS=120
+# in the Railway env without a code change.
+_DEFAULT_LEAD_MS = 80
+
+
 def _apply_lead_in(segs: list[dict], *, lead_ms: int | None = None) -> list[dict]:
     """Pull each segment's start time earlier by `lead_ms` so the subtitle
     appears slightly before the singer enters that line — the karaoke
@@ -308,13 +325,14 @@ def _apply_lead_in(segs: list[dict], *, lead_ms: int | None = None) -> list[dict
     Per-word stamps inside `segs[i]["words"]` are NOT shifted (they stay
     truthful to the audio; only the line's display window moves).
 
-    Default 120ms, env-tunable via `LYRIC_LEAD_IN_MS`. Pure + testable.
+    Default 80ms (was 120ms before 2026-05-31), env-tunable via
+    `LYRIC_LEAD_IN_MS`. Pure + testable.
     """
     if lead_ms is None:
         try:
-            lead_ms = int(os.environ.get("LYRIC_LEAD_IN_MS", "120"))
+            lead_ms = int(os.environ.get("LYRIC_LEAD_IN_MS", str(_DEFAULT_LEAD_MS)))
         except (TypeError, ValueError):
-            lead_ms = 120
+            lead_ms = _DEFAULT_LEAD_MS
     if lead_ms <= 0 or not segs:
         return segs
     lead_s = lead_ms / 1000.0
