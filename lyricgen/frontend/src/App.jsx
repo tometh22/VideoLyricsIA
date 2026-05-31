@@ -3332,7 +3332,24 @@ export default function App() {
             // `currentReview.file` es null (el File del upload no se
             // restaura desde R2) y la key/filename caen al campo
             // `filename` que el resume handler popula del job DB.
-            key={`${currentReview.file?.name || currentReview.filename || "resume"}:${currentReview.queueIdx}`}
+            //
+            // 2026-05-31 (Agus batch upload bug): the previous key was
+            // `filename:queueIdx`. In batch upload, when two songs are
+            // queued at consecutive indices and `currentReview` is
+            // swapped between them, the queueIdx changes but the
+            // filename can transiently match (early state where the new
+            // job's filename hasn't propagated yet), or the editor
+            // remounts to the wrong song if both queue entries point at
+            // the same R2 upload. Including `transcribeJobId` makes the
+            // key identity-stable per backend job — the only correct
+            // notion of "what song is this". Confirmed against the live
+            // DB: job 82a5a8ab547e ("Donde Estan Corazón",
+            // segments_json=null) was shown with the segments of job
+            // 9df1132f6169 ("Luz de día") that preceded it in the same
+            // session. With the jobId in the key, that swap forces an
+            // unmount and `edited` re-seeds from the new (empty/loading)
+            // segments instead of pinning the previous song's text.
+            key={`${currentReview.transcribeJobId || "no-job"}:${currentReview.file?.name || currentReview.filename || "resume"}:${currentReview.queueIdx}`}
             // QA fix 2026-05-28 (scroll architecture): pre-fix usaba 72 para
             // clear el top bar de App porque el editor scrolleaba con el
             // page-scroll y el sticky-top-72 ponía el audio bar JUSTO
