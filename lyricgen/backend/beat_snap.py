@@ -13,7 +13,12 @@ the voice. That's the difference between "auto-generated" and "premium".
 CONTRACT
 --------
 - Behind `BEAT_SNAP_ENABLED` (default off).
-- Snap window default 200ms via `BEAT_SNAP_WINDOW_MS`.
+- Snap window default 80ms via `BEAT_SNAP_WINDOW_MS`. (Was 200ms before
+  2026-05-31; dropped after the Agus.Cafisi report where 200ms drift
+  was audible on "Nada fue un error" / "Luz de día (cumbia)".)
+- Segments with reliable forced-align word stamps (`words[].score >= 0.5`)
+  are NOT snapped — their start is already aligned to the singer's
+  actual onset and snapping would drift it AWAY from the audio.
 - `apply(audio_path, segs)` returns segments with starts shifted to the
   closest beat within ±window, or the originals on any failure. Never raises.
 - `detect_beats` and `snap_segments` are pure and unit-testable.
@@ -53,14 +58,61 @@ def detect_beats(audio_path: str) -> tuple[float, list[float]] | None:
         return None
 
 
+# 2026-05-31 (Agus): default window dropped from 200 → 80 ms after
+# the operator reported "Nada fue un error" and "Luz de día (cumbia)"
+# showing the chorus a perceptible amount LATE vs the audio. The 200ms
+# window was producing audible drift because:
+#   - whisperx forced-align word stamps are per-millisecond reliable
+#   - snapping the segment.start away from the first word's actual time
+#     by up to 200ms creates a visible "subtitle lags the vocal" effect
+# 80ms is below the typical karaoke "feel" threshold (~100ms) while
+# still polishing the wobble from whisper-1 word-less segments.
+_DEFAULT_WINDOW_MS = 80
+
+# Threshold for "this word's stamp is trustworthy enough to skip the
+# beat snap". whisperx forced-align populates per-word `score` ∈ [0,1];
+# above 0.5 means the aligner found the audio frames that match the word,
+# so the segment.start (= words[0].start) is already correct and snapping
+# would PUSH it away from the truth.
+_RELIABLE_WORD_SCORE = 0.5
+
+
+def _has_reliable_words(segment: dict) -> bool:
+    """True if the segment carries forced-align word stamps with score.
+
+    When this is True we DO NOT snap — moving start away from the first
+    word's actual onset is a downgrade, not a polish.
+    """
+    words = segment.get("words")
+    if not words or not isinstance(words, list):
+        return False
+    for w in words:
+        if not isinstance(w, dict):
+            continue
+        try:
+            score = float(w.get("score", 0.0))
+        except (TypeError, ValueError):
+            continue
+        if score >= _RELIABLE_WORD_SCORE:
+            return True
+    return False
+
+
 def snap_segments(segs: list[dict], beats: list[float], *,
-                   window_ms: int = 200) -> list[dict]:
+                   window_ms: int = _DEFAULT_WINDOW_MS,
+                   skip_if_reliable_words: bool = True) -> list[dict]:
     """Snap each segment.start to the nearest beat within ±window_ms.
 
     Preserves monotonicity (snapped start >= prev_end + 5ms) and never
     pushes start past the segment's own end. Words inside `segs[i]["words"]`
     are NOT shifted — they stay truthful to the audio; only the display
     window's start moves. Pure + testable.
+
+    `skip_if_reliable_words` (default True) leaves segments alone when
+    they already carry forced-align word stamps with `score >= 0.5`.
+    Those stamps are ground truth for the vocal onset and beat-snapping
+    them only pushes the subtitle away from the singer's actual entry.
+    Pass False to force snapping of every segment regardless.
     """
     if not beats or not segs or window_ms <= 0:
         return segs
@@ -75,6 +127,10 @@ def snap_segments(segs: list[dict], beats: list[float], *,
             end = float(s.get("end", start))
         except (TypeError, ValueError):
             out.append(s)
+            continue
+        if skip_if_reliable_words and _has_reliable_words(s):
+            out.append(s)
+            prev_end = end
             continue
         # Nearest beat — check both neighbours.
         i = bisect.bisect_left(beats_sorted, start)
@@ -113,9 +169,9 @@ def apply(audio_path: str, segs: list[dict], *,
         return segs
     if window_ms is None:
         try:
-            window_ms = int(os.environ.get("BEAT_SNAP_WINDOW_MS", "200"))
+            window_ms = int(os.environ.get("BEAT_SNAP_WINDOW_MS", str(_DEFAULT_WINDOW_MS)))
         except (TypeError, ValueError):
-            window_ms = 200
+            window_ms = _DEFAULT_WINDOW_MS
     result = detect_beats(audio_path)
     if result is None:
         return segs
