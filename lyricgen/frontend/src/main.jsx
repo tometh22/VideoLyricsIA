@@ -8,6 +8,7 @@ import { AlertProvider } from "./components/AlertProvider";
 import { ToastProvider } from "./components/ToastProvider";
 import { HelpProvider } from "./components/HelpCenter/HelpProvider";
 import { initSentry } from "./observability";
+import { registerServiceWorker } from "./registerSW";
 import "./index.css";
 
 // Sentry init runs before React mounts so the SDK is ready to catch
@@ -43,6 +44,12 @@ window.addEventListener("vite:preloadError", (event) => {
   console.warn("[stale-bundle] vite:preloadError detected, forcing reload", event);
   window.location.reload();
 });
+
+// Service Worker: caches hashed /assets/* for offline / flaky-network
+// resilience. Prod-only, post-load registration — see registerSW.js for
+// the safety contract. The SW never caches HTML or API responses so it
+// can't serve stale builds or leak per-user data.
+registerServiceWorker();
 
 ReactDOM.createRoot(document.getElementById("root")).render(
   <React.StrictMode>
