@@ -76,10 +76,18 @@ def _compute_cache_key(audio_path: str, language: str | None, lyrics_hint: str |
     return (key, audio_hash, hint_hash)
 
 
-def _cache_lookup(cache_key: str) -> list[dict] | None:
+def _cache_lookup(cache_key: str, expected_audio_hash: str | None = None) -> list[dict] | None:
     """Return cached segments for `cache_key`, or None on miss / error.
     Errors are swallowed — cache is best-effort, the path falls through
-    to the live Replicate call."""
+    to the live Replicate call.
+
+    `expected_audio_hash` (optional): defense-in-depth audio integrity
+    check. The cache_key already starts with the audio hash, but if a
+    bug ever lets a row's `audio_hash` column drift from the key (manual
+    DB edit, schema migration mishap, future bug), the cross-check below
+    catches it and forces a live recompute. Cost is one column compare;
+    upside is "lyrics of a different song appear" never happens silently.
+    """
     try:
         from database import TranscriptionCache, SessionLocal
         import json
@@ -89,6 +97,19 @@ def _cache_lookup(cache_key: str) -> list[dict] | None:
                 TranscriptionCache.cache_key == cache_key
             ).first()
             if not row:
+                return None
+            # 2026-05-31 defense-in-depth (Agus batch upload report):
+            # if expected_audio_hash is provided, the row must match.
+            # On mismatch we treat as a miss + log so the next run still
+            # works correctly (live call repopulates the cache).
+            if (expected_audio_hash is not None
+                    and row.audio_hash is not None
+                    and row.audio_hash != expected_audio_hash):
+                logger.warning(
+                    "[WHISPERX] cache row audio_hash mismatch for key=%s "
+                    "(stored=%s expected=%s); forcing live recompute",
+                    cache_key, row.audio_hash, expected_audio_hash,
+                )
                 return None
             return json.loads(row.segments)
         finally:
@@ -354,7 +375,7 @@ def transcribe_whisperx(audio_path: str, language: str | None = None,
     # Errores en cache son swallowed — el path original sigue intacto.
     cache_key, audio_hash, hint_hash = _compute_cache_key(audio_path, language, lyrics_hint)
     if cache_key:
-        cached_segs = _cache_lookup(cache_key)
+        cached_segs = _cache_lookup(cache_key, expected_audio_hash=audio_hash)
         if cached_segs is not None:
             logger.info(
                 "[WHISPERX] cache hit audio_hash=%s (%d segs, $0 + 0 s vs ~75-180 s + $0.005)",
