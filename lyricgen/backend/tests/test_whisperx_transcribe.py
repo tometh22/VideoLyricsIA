@@ -201,6 +201,41 @@ def test_apply_lead_in_noop_when_disabled():
     assert wx._apply_lead_in(segs, lead_ms=0) == segs
 
 
+# ───── 2026-05-31 regression tests (Agus production report) ───────────
+
+
+def test_apply_lead_in_default_is_80ms_not_120(monkeypatch):
+    """Pin the new default. 120ms was at the karaoke 'feel' threshold
+    (~100ms) and trained ears (UMG ops reviewers) read it as the line
+    landing AHEAD of the vocal. 80ms keeps the anticipation while
+    sitting safely below perception. Any future bump above 100ms must
+    update this test."""
+    monkeypatch.delenv("LYRIC_LEAD_IN_MS", raising=False)
+    segs = [{"start": 0.50, "end": 2.00, "text": "uno"}]
+    out = wx._apply_lead_in(segs)   # NO lead_ms kwarg → uses default
+    # 0.50 - 0.080 = 0.42
+    assert abs(out[0]["start"] - 0.42) < 1e-6
+
+
+def test_apply_lead_in_env_override_still_works(monkeypatch):
+    """The env var is the prod escape hatch. If we ever want the old
+    120ms back without redeploying, LYRIC_LEAD_IN_MS=120 must do it."""
+    monkeypatch.setenv("LYRIC_LEAD_IN_MS", "120")
+    segs = [{"start": 0.50, "end": 2.00, "text": "uno"}]
+    out = wx._apply_lead_in(segs)
+    assert abs(out[0]["start"] - 0.38) < 1e-6   # 0.50 - 0.120
+
+
+def test_apply_lead_in_env_garbage_falls_back_to_default(monkeypatch):
+    """A bad env value must not crash the pipeline — it falls back to
+    the hardcoded default (currently 80ms)."""
+    monkeypatch.setenv("LYRIC_LEAD_IN_MS", "not_a_number")
+    segs = [{"start": 0.50, "end": 2.00, "text": "uno"}]
+    out = wx._apply_lead_in(segs)
+    # Falls back to _DEFAULT_LEAD_MS (80ms) → 0.42
+    assert abs(out[0]["start"] - 0.42) < 1e-6
+
+
 def test_split_long_segments_passes_through_short_or_wordless():
     short = {"start": 0.0, "end": 4.0, "text": "ok", "words": [_w("ok", 0.0, 4.0)]}
     no_words = {"start": 0.0, "end": 20.0, "text": "no word stamps"}
