@@ -1518,8 +1518,25 @@ async def drive_disconnect(
 
 @app.get("/usage")
 async def usage(current_user: dict = Depends(get_current_user), db: Session = Depends(get_db)):
-    """Return current plan usage with overage info."""
-    return get_plan_usage(db, current_user["id"], current_user["tenant_id"], current_user.get("plan", "100"))
+    """Return current plan usage with overage info.
+
+    2026-05-30 perf: cached in Redis with a 30 s TTL keyed by
+    tenant_id:user_id. The counter only changes when the operator
+    approves or rejects a job; both of those endpoints below call
+    `cache.invalidate(cache.usage_key(...))` so the next /usage hit
+    returns the live value without waiting for TTL expiry. Without
+    the cache this endpoint paid a fresh DB SELECT + 150 ms LATAM↔
+    Railway round-trip on EVERY mount of the sidebar usage badge.
+    """
+    from cache import get_or_set_json, usage_key
+    key = usage_key(current_user["tenant_id"], current_user["id"])
+    return get_or_set_json(
+        key,
+        ttl_s=30,
+        compute=lambda: get_plan_usage(
+            db, current_user["id"], current_user["tenant_id"], current_user.get("plan", "100"),
+        ),
+    )
 
 
 @app.get("/plans")
@@ -6967,6 +6984,16 @@ async def approve_job(
         detail={"job_id": job_id, "notes": body.notes},
     ))
     db.commit()
+
+    # 2026-05-30 perf: drop the cached /usage entry for this operator so
+    # the sidebar badge reflects the +1 immediately, not after the 30 s
+    # TTL. Failure is silent — if Redis is down the next /usage just
+    # bypasses the cache and reads the live counter.
+    try:
+        from cache import invalidate, usage_key
+        invalidate(usage_key(current_user["tenant_id"], current_user["id"]))
+    except Exception:
+        pass
 
     return {"ok": True, "status": "done", "job_id": job_id}
 
