@@ -9,10 +9,8 @@ import { fetchWithTimeout } from "./fetchWithTimeout";
 import { uploadFileToR2 } from "./r2Upload";
 import * as wizardPersistence from "./wizardPersistence";
 import LoginPage from "./components/LoginPage";
-import Landing from "./components/Landing";
 import Sidebar from "./components/Sidebar";
 import Dashboard from "./components/Dashboard";
-import HistoryView from "./components/HistoryView";
 import SearchPalette from "./components/SearchPalette";
 import UploadZone from "./components/UploadZone";
 import TitleCardPreview from "./components/TitleCardPreview";
@@ -20,15 +18,24 @@ import TitleCardPreview from "./components/TitleCardPreview";
 // and Settings (~30 KB) lazy-load so the main bundle drops below
 // 500 KB on the first paint. The editor in particular is only entered
 // after the operator decides to review/edit a song — saving its bytes
-// from the cold start shaves seconds on slow networks. JobDetail stays
-// eager because /videos/:id is a high-frequency landing route and the
-// extra chunk fetch would add a perceived "delay" on every video open.
+// from the cold start shaves seconds on slow networks.
+//
+// 2026-05-30 perf: extended the lazy set to Landing (449 lines, only
+// rendered when there's NO token — most operators land already
+// logged in and never need this code), OnboardingTour (452 lines,
+// only fires once per operator), and JobDetail (1772 lines, the
+// single heaviest non-editor component). For JobDetail we tolerate
+// a ~50-100 ms perceived delay on the FIRST /videos/:id open of
+// a session in exchange for a much faster cold start everywhere
+// else; subsequent opens are instant because the chunk is cached.
 const LyricsEditor = lazy(() => import("./components/LyricsEditor"));
 const AdminPanel = lazy(() => import("./components/AdminPanel"));
 const Settings = lazy(() => import("./components/Settings"));
+const Landing = lazy(() => import("./components/Landing"));
+const JobDetail = lazy(() => import("./components/JobDetail"));
+const HistoryView = lazy(() => import("./components/HistoryView"));
 import BatchProgress from "./components/BatchProgress";
 import TranscribingProgress from "./components/TranscribingProgress";
-import JobDetail from "./components/JobDetail";
 import { useAlert } from "./components/AlertProvider";
 import HelpButton from "./components/HelpCenter/HelpButton";
 import { useBackgroundPreview } from "./hooks/useBackgroundPreview";
@@ -400,21 +407,32 @@ function JobDetailRoute({ fetchHistory }) {
   }
   return (
     <div className="flex justify-center">
-      <JobDetail
-        job={job}
-        onBack={() => navigate("/dashboard")}
-        onJobUpdate={(updatedJob) => {
-          // fetchHistory() is the expensive call (lists every job in the
-          // tenant). It only needs to refresh on a status BOUNDARY —
-          // pending_review → editing, editing → pending_review, etc. The
-          // /status poll during editing fires every 5s with progress
-          // updates only; if we ran fetchHistory on each tick we'd hit
-          // /jobs ~150 times during a 13-min edit. Skip those.
-          const statusChanged = job?.status !== updatedJob?.status;
-          setJob(updatedJob);
-          if (statusChanged) fetchHistory();
-        }}
-      />
+      {/* 2026-05-30 perf: JobDetail is lazy-loaded. The Suspense fallback
+          matches the spinner shown when the job is still being fetched,
+          so the visual transition stays continuous. */}
+      <Suspense
+        fallback={
+          <div className="flex items-center justify-center min-h-[50vh]">
+            <div className="w-12 h-12 border-2 border-brand border-t-transparent rounded-full animate-spin" />
+          </div>
+        }
+      >
+        <JobDetail
+          job={job}
+          onBack={() => navigate("/dashboard")}
+          onJobUpdate={(updatedJob) => {
+            // fetchHistory() is the expensive call (lists every job in the
+            // tenant). It only needs to refresh on a status BOUNDARY —
+            // pending_review → editing, editing → pending_review, etc. The
+            // /status poll during editing fires every 5s with progress
+            // updates only; if we ran fetchHistory on each tick we'd hit
+            // /jobs ~150 times during a 13-min edit. Skip those.
+            const statusChanged = job?.status !== updatedJob?.status;
+            setJob(updatedJob);
+            if (statusChanged) fetchHistory();
+          }}
+        />
+      </Suspense>
     </div>
   );
 }
@@ -3496,11 +3514,19 @@ export default function App() {
           element={
             token
               ? <Navigate to="/dashboard" replace />
-              : <Landing
-                  onStart={() => navigate("/login")}
-                  onLogin={() => navigate("/login")}
-                  isLoggedIn={false}
-                />
+              : (
+                /* 2026-05-30 perf: Landing is lazy. Suspense fallback is
+                   null because the landing render itself is the page —
+                   showing a "loading…" flicker would feel worse than a
+                   blank ~80 ms while the chunk parses. */
+                <Suspense fallback={null}>
+                  <Landing
+                    onStart={() => navigate("/login")}
+                    onLogin={() => navigate("/login")}
+                    isLoggedIn={false}
+                  />
+                </Suspense>
+              )
           }
         />
         <Route
@@ -3572,16 +3598,18 @@ export default function App() {
           <Route path="/review" element={wizardScreen} />
           <Route path="/generating" element={generatingScreen} />
           <Route path="/videos" element={
-            <HistoryView
-              history={history}
-              historyError={historyError}
-              historyLoaded={historyLoaded}
-              onRetryHistory={fetchHistory}
-              onSelect={handleSelectJob}
-              onDelete={handleDeleteJob}
-              onBulkDelete={handleBulkDeleteJobs}
-              onBack={() => navigate("/dashboard")}
-            />
+            <Suspense fallback={<RouteSuspenseFallback />}>
+              <HistoryView
+                history={history}
+                historyError={historyError}
+                historyLoaded={historyLoaded}
+                onRetryHistory={fetchHistory}
+                onSelect={handleSelectJob}
+                onDelete={handleDeleteJob}
+                onBulkDelete={handleBulkDeleteJobs}
+                onBack={() => navigate("/dashboard")}
+              />
+            </Suspense>
           } />
           <Route path="/videos/:id" element={<JobDetailRoute fetchHistory={fetchHistory} />} />
           {/* Post-render edit: monta el mismo Studio Console que /new,
