@@ -82,3 +82,102 @@ def test_apply_passes_through_on_detect_failure(monkeypatch):
     # apply returns the originals unchanged. Never raises.
     out = bs.apply("/no/such/audio.wav", segs)
     assert out == segs
+
+
+# ───── 2026-05-31 regression tests (Agus report) ─────────────────────
+
+
+def test_default_window_is_80_ms_not_200():
+    """Pin the new conservative default. 80ms is below the karaoke
+    "feel" threshold (~100ms) so any future bump above 100 must be
+    accompanied by an updated test."""
+    # Construct a segment whose start is 150ms off the nearest beat —
+    # would snap under the old 200ms default, must NOT under the new 80ms.
+    beats = [0.0, 0.5, 1.0]
+    segs = [{"start": 0.35, "end": 0.95, "text": "x"}]
+    # Without explicit window_ms, the default kicks in.
+    out = bs.snap_segments(segs, beats)
+    # 0.35 is 150ms from 0.5 → outside the 80ms default → unchanged.
+    assert out[0]["start"] == 0.35
+
+
+def test_skip_when_words_have_reliable_score():
+    """Segments with forced-align word stamps (score >= 0.5) must NOT
+    be snapped — their start IS the singer's actual onset and snapping
+    would push it AWAY from the audio. This is the Agus bug: chorus
+    was being snapped 150ms late because beat_snap moved segment.start
+    away from word[0].start.
+    """
+    beats = [0.0, 0.5, 1.0]
+    segs = [{
+        "start": 0.48,    # 20ms off the beat — would snap under default 80ms
+        "end": 0.95,
+        "text": "donde estan",
+        "words": [
+            {"start": 0.48, "end": 0.60, "score": 0.92, "word": "donde"},
+            {"start": 0.62, "end": 0.85, "score": 0.88, "word": "estan"},
+        ],
+    }]
+    out = bs.snap_segments(segs, beats)
+    # The first word's actual onset is 0.48 — that's truth. Snap would
+    # move it to 0.5 (+20ms drift). With reliable words: skipped.
+    assert out[0]["start"] == 0.48
+
+
+def test_no_skip_when_word_scores_below_threshold():
+    """If all words have low confidence (whisperx returned but FA didn't
+    align reliably), the segment.start is NOT trustworthy ground truth
+    — beat snap is allowed to polish it."""
+    beats = [0.0, 0.5, 1.0]
+    segs = [{
+        "start": 0.48,
+        "end": 0.95,
+        "text": "unclear",
+        "words": [
+            {"start": 0.48, "end": 0.60, "score": 0.2, "word": "unclear"},
+        ],
+    }]
+    out = bs.snap_segments(segs, beats)
+    # Score < 0.5 → no protection → snap proceeds → 0.48 → 0.5.
+    assert out[0]["start"] == 0.5
+
+
+def test_no_skip_when_words_missing():
+    """whisper-1 fallback produces no words[] — beat_snap must still
+    work for that path (it's the whole reason beat_snap exists)."""
+    beats = [0.0, 0.5, 1.0]
+    segs = [{"start": 0.48, "end": 0.95, "text": "no words"}]   # no `words` key
+    out = bs.snap_segments(segs, beats)
+    assert out[0]["start"] == 0.5
+
+
+def test_skip_if_reliable_words_can_be_disabled():
+    """When called with skip_if_reliable_words=False, the protection
+    is bypassed. Used by tests that want to verify pure snapping math
+    without the reliability gate interfering."""
+    beats = [0.0, 0.5, 1.0]
+    segs = [{
+        "start": 0.48,
+        "end": 0.95,
+        "text": "reliable",
+        "words": [{"start": 0.48, "end": 0.60, "score": 0.99, "word": "x"}],
+    }]
+    out = bs.snap_segments(segs, beats, skip_if_reliable_words=False)
+    assert out[0]["start"] == 0.5
+
+
+def test_skip_handles_malformed_word_entries():
+    """Words[] with bad shape (string, None, missing score) must not crash —
+    the predicate falls back to "no reliable words" and snapping proceeds
+    as if the words[] wasn't there."""
+    beats = [0.0, 0.5, 1.0]
+    segs = [{
+        "start": 0.48,
+        "end": 0.95,
+        "text": "garbage",
+        "words": [None, "string", {"foo": "bar"}, {"score": "not_a_number"}],
+    }]
+    # Must not raise.
+    out = bs.snap_segments(segs, beats)
+    # No reliable word found → snap proceeds.
+    assert out[0]["start"] == 0.5
