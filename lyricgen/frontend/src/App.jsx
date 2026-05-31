@@ -1394,6 +1394,18 @@ export default function App() {
     // serve User A's content for ~5 min.
     try { clearMediaCache(); } catch { /* */ }
 
+    // 2026-05-30 perf: drop the previous operator's cached /usage
+    // payload — same logic as clearMediaCache: User B should never
+    // briefly see User A's quota counter on the same machine, even
+    // if the badge re-fetches a moment later. We can't enumerate
+    // localStorage entries safely here, so we wipe by known prefix.
+    try {
+      for (let i = localStorage.length - 1; i >= 0; i--) {
+        const k = localStorage.key(i);
+        if (k && k.startsWith("cache:usage:")) localStorage.removeItem(k);
+      }
+    } catch { /* */ }
+
     // React state. Reset every collection that holds user-derived
     // content; keep purely-UX state (sidebar, theme) alone.
     setToken(null);
