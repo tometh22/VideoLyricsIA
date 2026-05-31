@@ -1297,12 +1297,45 @@ export default function App() {
       // qué content mostrar inline. Antes navegábamos a /review cuando había
       // currentReview/approved, ahora /new lo hace todo via wizardScreen.
       navigate("/new");
+    } catch (err) {
+      // 2026-05-31 hotfix (Agus): si CUALQUIER paso del rehydrate falla
+      // (snapshot de una versión vieja del bundle, JSON corrupto, shape
+      // inválido en File stub, etc.) antes teníamos un try/finally sin
+      // catch — la excepción burbujeaba al GlobalErrorBoundary o se
+      // perdía y dejaba al usuario en `/new` con state vacío SIN alerta.
+      // Síntoma reportado: "puse para generar las lyrics y me apareció
+      // esto" + screenshot de la pantalla de upload vacía.
+      // Ahora limpiamos persistence + state + mostramos alert + redirect
+      // explícito a /new. Sentry breadcrumb para triage futuro.
+      console.error("[wizard] resume failed", err);
+      try {
+        if (typeof window !== "undefined" && window.Sentry?.captureException) {
+          window.Sentry.captureException(err, {
+            tags: { feature: "wizard-resume" },
+            extra: { snapKeys: Object.keys(snap || {}) },
+          });
+        }
+      } catch { /* Sentry path itself must not throw */ }
+      wizardPersistence.clear();
+      setCurrentReview(null);
+      setApprovedJobs([]);
+      setReviewQueue([]);
+      setFiles([]);
+      setResumableWizard(null);
+      setWizardStage("upload");
+      alert({
+        title: t("wizard.resume_failed_title") || "No pudimos retomar tu sesión",
+        description: t("wizard.resume_failed_desc") ||
+          "El estado guardado no es compatible con esta versión. Empezamos limpio.",
+        tone: "warning",
+      });
+      navigate("/new", { replace: true });
     } finally {
       // Defer flag flip past the React commit so the persistence useEffect
       // runs once with the FULLY restored state and writes a fresh snapshot.
       setTimeout(() => { restoringRef.current = false; }, 0);
     }
-  }, [navigate]);
+  }, [navigate, alert, t]);
 
   const discardResumable = useCallback(() => {
     wizardPersistence.clear();
