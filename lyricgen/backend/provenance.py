@@ -438,6 +438,34 @@ def record_ai_call(
     )
 
 
+# ai_provenance VARCHAR limits (mirror database.py). A caller passing an
+# over-long value used to crash the start-row INSERT with
+# StringDataRightTruncation — and because the insert is wrapped in a
+# best-effort try/except, the ENTIRE provenance row was then dropped
+# silently (UMG compliance gap). We now truncate to fit and log WHICH
+# field overflowed, so the audit row survives AND the offending caller is
+# identifiable instead of invisible. (Sentry "Failed to insert provenance
+# start row: value too long", 2026-06-01.)
+_PROV_MAXLEN = {"step": 50, "tool_name": 100, "tool_provider": 50, "tool_version": 100}
+
+
+def _fit_varchar(value, field: str, job_id) -> str | None:
+    """Truncate a provenance VARCHAR field to its column limit, warning on
+    overflow. None passes through unchanged."""
+    if value is None:
+        return None
+    s = str(value)
+    limit = _PROV_MAXLEN[field]
+    if len(s) > limit:
+        logger.warning(
+            "[PROVENANCE] %s=%r (%d chars) exceeds varchar(%d) for job %s — "
+            "truncating to fit (previously this dropped the whole audit row)",
+            field, s[:60] + "…", len(s), limit, job_id,
+        )
+        return s[:limit]
+    return s
+
+
 class ProvenanceRecorder:
     """Records a single AI tool invocation with timing.
 
@@ -472,14 +500,17 @@ class ProvenanceRecorder:
         # no-op so provenance bookkeeping never raises out of the worker.
         db = SessionLocal()
         try:
+            # prompt_sent is NOT NULL; coalesce None → "" so a caller that
+            # forgot the prompt still records the row instead of dropping it.
+            prompt_text = self.prompt or ""
             record = AIProvenance(
                 job_id=self.job_id,
-                step=self.step,
-                tool_name=self.tool_name,
-                tool_provider=self.tool_provider,
-                tool_version=self.tool_version,
-                prompt_sent=self.prompt,
-                prompt_hash=hashlib.sha256(self.prompt.encode()).hexdigest(),
+                step=_fit_varchar(self.step, "step", self.job_id),
+                tool_name=_fit_varchar(self.tool_name, "tool_name", self.job_id),
+                tool_provider=_fit_varchar(self.tool_provider, "tool_provider", self.job_id),
+                tool_version=_fit_varchar(self.tool_version, "tool_version", self.job_id),
+                prompt_sent=prompt_text,
+                prompt_hash=hashlib.sha256(prompt_text.encode()).hexdigest(),
                 response_summary=None,
                 input_data_types=self.input_data_types,
                 output_artifact=None,
@@ -513,7 +544,10 @@ class ProvenanceRecorder:
                 .update(
                     {
                         "response_summary": response_summary[:2000] if response_summary else None,
-                        "output_artifact": output_artifact,
+                        # output_artifact is varchar(500): long R2 keys /
+                        # paths/URLs must not crash the finish() update.
+                        "output_artifact": (str(output_artifact)[:500]
+                                            if output_artifact else None),
                         "duration_ms": duration_ms,
                     },
                     synchronize_session=False,
