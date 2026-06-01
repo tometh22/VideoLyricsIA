@@ -272,36 +272,20 @@ def _build_segments(
     if not anchored:
         return []
 
-    # ─── Fix B (2026-05-31): smarter head interpolation ─────────────────
-    # The previous heuristic was `head_t = first_t - first_ai * 1.5` —
-    # a fixed 1.5s per pre-anchor line, with no grounding in the audio.
-    # On "Donde Estan Corazón" that produced seg[0].end = 18.23 s with
-    # 36 chars of text (40 ms/char), which the operator read as the
-    # first line landing before the vocal.
+    # Interpolate head (before first anchor).
     #
-    # Better: the FIRST anchor's whisper-word index tells us where
-    # Whisper started reliably tracking. Whisper words BEFORE that
-    # index either (a) didn't match any cleaned token (filler "oh",
-    # ad-libs, mishears) or (b) ARE the head lines we couldn't
-    # confidently anchor lexically. Either way, the earliest whisper
-    # word's `start` is the audio's first vocal onset — strictly a
-    # better head_t than `first_t - first_ai*1.5`.
-    #
-    # We still clamp at >=0 and < first_t so the interpolation stays
-    # monotone. If the audio has no vocals before the first anchor
-    # (e.g. _wstart(0) >= first_t — won't happen in practice but
-    # defensive), we fall back to the old heuristic.
+    # NOTE 2026-05-31 evening: tried using `_wstart(0)` (first whisper
+    # word's onset) instead of the fixed `first_t - first_ai*1.5`. On
+    # the "Donde Estan Corazón" stem-isolated audio, the first whisper
+    # word turned out to be an intro ad-lib/breath that Whisper picked
+    # up at 8.25 s — but the actual first sung line started at 12 s.
+    # The "smarter" head heuristic shifted seg[0] 3.8 s EARLY (worse
+    # than the original 1.5 s/line constant). Reverted: the simpler
+    # heuristic is empirically the lower-error choice on real audio.
     first_ai = anchored[0]
     if first_ai > 0:
         first_t = line_start[first_ai]
-        if whisper_words:
-            audio_onset = max(0.0, _wstart(0))
-            if audio_onset < first_t - 0.05:
-                head_t = audio_onset
-            else:
-                head_t = max(0.0, first_t - first_ai * 1.5)
-        else:
-            head_t = max(0.0, first_t - first_ai * 1.5)
+        head_t = max(0.0, first_t - first_ai * 1.5)
         for i in range(first_ai):
             line_start[i] = head_t + (first_t - head_t) * i / first_ai
 
@@ -554,136 +538,19 @@ def whisper_word_align(
                 pass
 
 
-def align_lines_to_words(
-    cleaned_lines: list[str],
-    whisper_words: list[dict],
-    audio_dur: float,
-    *,
-    label: str = "ALIGN-WORDS",
-) -> list[dict] | None:
-    """Align canonical lyric lines against a pre-fetched word stream.
-
-    2026-05-31 (Donde Estan Corazón report). This is the I/O-free core
-    of `whisper_word_align` — same DP align + interpolation + build,
-    BUT the caller supplies the word stream instead of us re-calling
-    Whisper-1. The big win: when whisperX already ran and returned
-    forced-align words (±50 ms accuracy from the Replicate model), we
-    can use THOSE instead of degrading to Whisper-1's ±500 ms verbose
-    JSON when reconcile aborts and we fall to this alignment path.
-
-    Trade-off vs `whisper_word_align`:
-      - No OpenAI call → no latency, no $, no compression
-      - Same DP + interpolation + monotonicity guarantees
-      - Same Fix A/B/C from _build_segments (words[] persisted,
-        smarter head, truncation warning)
-
-    Args:
-        cleaned_lines: canonical lyric lines (one row per editor line).
-        whisper_words: pre-fetched word stream as
-            [{"word", "start", "end", "score"?}, …] in time order.
-            Words MAY come from whisperX (forced-align) or Whisper-1
-            (verbose JSON) — the function doesn't care which.
-        audio_dur: track duration in seconds (for tail interpolation).
-        label: log prefix; default "ALIGN-WORDS". Pass "WC-WX-WORDS"
-            when invoked from the whisperX fallback in main.py so the
-            log line tells operators which source produced the timings.
-
-    Returns:
-        Segments (with words[] attached by _build_segments) or None
-        when alignment fails (caller should fall back further).
-    """
-    lines = [ln.strip() for ln in (cleaned_lines or []) if ln and ln.strip()]
-    if not lines or not whisper_words or audio_dur <= 0:
-        return None
-    # Normalize words to dict form (whisperX returns dicts; Whisper-1
-    # verbose JSON returns Pydantic; tests use dicts).
-    word_dicts: list[dict] = []
-    for w in whisper_words:
-        if isinstance(w, dict):
-            wd = w
-        else:
-            wd = {
-                "word": getattr(w, "word", None),
-                "start": getattr(w, "start", None),
-                "end": getattr(w, "end", None),
-            }
-            score = getattr(w, "score", None)
-            if score is not None:
-                wd["score"] = score
-        if (wd.get("word") or "").strip() and wd.get("start") is not None:
-            word_dicts.append(wd)
-    if not word_dicts:
-        return None
-
-    cleaned_tokens = _tokens_with_line(lines)
-    if not cleaned_tokens:
-        logger.warning("[%s] cleaned tokenization empty", label)
-        return None
-
-    cleaned_to_whisper = _dp_align_tokens(cleaned_tokens, word_dicts)
-    anchored_lines = len({
-        cleaned_tokens[i][0]
-        for i, wi in enumerate(cleaned_to_whisper)
-        if wi >= 0
-    })
-    anchor_ratio = anchored_lines / len(lines)
-    logger.info(
-        "[%s] words=%d, anchored=%d/%d lines (%.0f%%)",
-        label, len(word_dicts), anchored_lines, len(lines), anchor_ratio * 100,
-    )
-    if anchor_ratio < MIN_ANCHOR_RATIO:
-        logger.warning(
-            "[%s] anchor ratio %.2f below floor %.2f — caller should fall back",
-            label, anchor_ratio, MIN_ANCHOR_RATIO,
-        )
-        return None
-
-    segments = _build_segments(
-        lines, cleaned_tokens, cleaned_to_whisper, word_dicts, audio_dur,
-    )
-    return segments or None
-
-
-def flatten_whisperx_words(wx_segs: list[dict]) -> list[dict]:
-    """Collect all per-word stamps across a list of whisperX segments
-    into a single time-ordered stream — the shape `align_lines_to_words`
-    expects.
-
-    whisperX returns `[{start, end, text, words: [...]}, …]`. We pull
-    the inner `words` and stitch them. Pre-sorted by start to defend
-    against an edge whisperX caller passing segments out of order.
-    """
-    flat: list[dict] = []
-    for seg in wx_segs or []:
-        if not isinstance(seg, dict):
-            continue
-        for w in (seg.get("words") or []):
-            if not isinstance(w, dict):
-                continue
-            try:
-                ws = float(w.get("start"))
-                we = float(w.get("end", ws))
-            except (TypeError, ValueError):
-                continue
-            text = (w.get("word") or "").strip()
-            if not text:
-                continue
-            entry = {"word": text, "start": ws, "end": we}
-            score = w.get("score")
-            if score is not None:
-                try:
-                    entry["score"] = float(score)
-                except (TypeError, ValueError):
-                    pass
-            flat.append(entry)
-    flat.sort(key=lambda w: w["start"])
-    return flat
+# NOTE 2026-05-31 evening: `align_lines_to_words` + `flatten_whisperx_words`
+# were tried as a "Fix D" — use whisperX forced-align words directly when
+# `whisperx_reconcile` aborts, skipping the Whisper-1 re-call. Local E2E
+# against the operator's "Donde Estan Corazón" stem-isolated audio showed
+# the resulting line timings to be ~250 ms WORSE on average than the
+# existing Whisper-1 path (mean |err| 642 vs 305 ms when compared against
+# ground-truth onsets the operator timed by ear). Reverted; the
+# Whisper-1 path stays as-is. The unit-test-only contracts for those two
+# helpers were also removed.
 
 
 __all__ = [
     "whisper_word_align",
-    "align_lines_to_words",
-    "flatten_whisperx_words",
     "MIN_ANCHOR_RATIO",
     "MIN_SEG_DUR_S",
     "GAP_S",

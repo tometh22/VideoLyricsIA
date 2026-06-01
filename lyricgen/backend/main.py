@@ -4258,62 +4258,6 @@ async def _run_transcription_for_job(
                             and _canonical_lines
                             and os.environ.get("OPENAI_API_KEY")
                         ):
-                            # ─── Fix D 2026-05-31 (Donde Estan Corazón) ──
-                            # FIRST try aligning the cleaned canonical
-                            # against the per-word stamps whisperX
-                            # ALREADY produced (above, _wx_segs[i].words).
-                            # Those stamps are forced-align ±50 ms;
-                            # Whisper-1's verbose JSON below is ±500 ms
-                            # and on long Spanish tracks the difference
-                            # IS visible to operators ("salió a destiempo
-                            # el chorus"). Same DP align + heuristic
-                            # interpolation as `whisper_word_align`,
-                            # different (better) source.
-                            #
-                            # Only falls through to Whisper-1 if the DP
-                            # can't anchor enough lines (e.g. whisperX
-                            # mishears trip the matcher), preserving the
-                            # 2026-05-26 "638" incident behavior where
-                            # Whisper-1 saved the day after whisperX
-                            # raw + reconcile both bombed.
-                            try:
-                                from lyrics_whisper_align import (
-                                    align_lines_to_words as _alw,
-                                    flatten_whisperx_words as _fww,
-                                )
-                                _wx_words = _fww(_wx_segs)
-                                if _wx_words:
-                                    _audio_dur = float(
-                                        _wx_words[-1].get("end")
-                                        or _wx_words[-1].get("start") or 0
-                                    )
-                                    _wa_segs = _alw(
-                                        _canonical_lines,
-                                        _wx_words,
-                                        audio_dur=_audio_dur,
-                                        label="WC-WX-WORDS",
-                                    )
-                                    if _wa_segs:
-                                        from timing_sources import (
-                                            WHISPER_ALIGN as _WC_WA,
-                                        )
-                                        logger.info(
-                                            "[WC] whisperX-words-align path: %d segs "
-                                            "(cleaned=%d) — forced-align stamps + "
-                                            "canonical text (no Whisper-1 re-call)",
-                                            len(_wa_segs), len(_canonical_lines),
-                                        )
-                                        return _emit_segments(
-                                            _wa_segs, _WC_WA,
-                                            reference_lyrics=_canonical,
-                                        )
-                            except Exception as _e_wxw:
-                                logger.warning(
-                                    "[WC] whisperX-words-align raised: %s — "
-                                    "falling through to Whisper-1",
-                                    _e_wxw,
-                                )
-
                             try:
                                 from lyrics_whisper_align import (
                                     whisper_word_align as _wwa,
