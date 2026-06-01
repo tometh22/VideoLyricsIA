@@ -4249,8 +4249,28 @@ async def _run_transcription_for_job(
                                 from lyrics_whisper_align import (
                                     whisper_word_align as _wwa,
                                 )
+                                # Stage 0 (2026-06-01): feed Whisper-1 the
+                                # ISOLATED VOCAL STEM (`_aa`) instead of the full
+                                # mix (`tmp_path`). On guitar-heavy songs the mix
+                                # makes Whisper-1 hallucinate the instrumental
+                                # outro ("Oh oh no/Yeah", "Amara org") and drift
+                                # the end timing — this is the ONLY transcription
+                                # path that read the mix (whisperX/forced_align
+                                # already use `_aa`). The stem has no guitar so it
+                                # stays clean. `_aa` already falls back to
+                                # `tmp_path` when demucs is unavailable, so this is
+                                # safe-by-design. Gated + reversible via env;
+                                # validate in staging (re-run Rata Blanca → no
+                                # "Oh oh no/Yeah", timing tightens) before prod.
+                                _wa_audio = (
+                                    _aa
+                                    if os.environ.get(
+                                        "WHISPER_ALIGN_USE_STEM", "0"
+                                    ).strip().lower() in ("1", "true", "yes", "on")
+                                    else tmp_path
+                                )
                                 _wa_segs = await asyncio.to_thread(
-                                    _wwa, tmp_path, _canonical_lines,
+                                    _wwa, _wa_audio, _canonical_lines,
                                     language=lang or "es",
                                     job_id=job_id,
                                 )
@@ -4429,11 +4449,35 @@ async def _run_transcription_for_job(
                             except Exception as e:
                                 logger.warning("[WC] synced direct fallback raised: %s — emitting whisperX raw", e)
                         if _sync_segs:
-                            from timing_sources import WHISPERX_LRCLIB as _WC_WXL
-                            return _emit_segments(
-                                _sync_segs, _WC_WXL,
-                                reference_lyrics=_canonical,
-                            )
+                            # Stage 1 (2026-06-01): duration sanity before we ship
+                            # an lrclib SYNCED timeline. The synced lyrics can
+                            # belong to a LONGER / foreign edit of the song (cumbia
+                            # "Luz de Día": synced runs to 248 s on a 169 s audio;
+                            # the "Cosas Mías" 35 s-off incident) — emitting it
+                            # overshoots the recording. `span_gate` rejects that so
+                            # we fall through to whisperX raw (THIS audio's own
+                            # word timing) instead of shipping a foreign timeline.
+                            # Gated + reversible; only the egregious-overshoot case
+                            # is rejected (a real instrumental outro still passes).
+                            _span_ok = True
+                            if os.environ.get(
+                                "SPAN_GATE_ENABLED", "0"
+                            ).strip().lower() in ("1", "true", "yes", "on"):
+                                from timing_confidence import span_gate as _span_gate
+                                _sv = _span_gate(_sync_segs, _audio_dur_for_lrc)
+                                _span_ok = _sv.ok
+                                if not _sv.ok:
+                                    logger.warning(
+                                        "[WC] span_gate rejected synced timeline "
+                                        "(%s) — falling through to whisperX raw",
+                                        _sv.reason,
+                                    )
+                            if _span_ok:
+                                from timing_sources import WHISPERX_LRCLIB as _WC_WXL
+                                return _emit_segments(
+                                    _sync_segs, _WC_WXL,
+                                    reference_lyrics=_canonical,
+                                )
                         logger.info("[WC] no synced hint — emitting whisperX raw with mishear text (operator edits)")
                     return _emit_segments(
                         _wx_segs, _WC_WX,
