@@ -21,42 +21,13 @@ bootstrap_vertex_credentials()
 # mail to a real customer's inbox.
 ENVIRONMENT = os.environ.get("ENVIRONMENT", "production").lower().strip() or "production"
 
-# --- Sentry (must init before FastAPI) ---
-_SENTRY_DSN = os.environ.get("SENTRY_DSN", "")
-if _SENTRY_DSN:
-    import sentry_sdk
-    # 2026-05-27 Wave-0 observability audit (UMG perf complaint): the
-    # pre-fix init had NO integrations beyond the default — FastAPI
-    # routes weren't auto-traced and SQLAlchemy queries weren't
-    # captured as spans, so the Sentry Performance dashboard had no
-    # visibility into which endpoint or query was actually slow on
-    # prod. With the three integrations below every request lands as
-    # a transaction named by its route template, with child spans for
-    # each DB query — making the next perf audit data-driven instead
-    # of speculative.
-    from sentry_sdk.integrations.fastapi import FastApiIntegration
-    from sentry_sdk.integrations.starlette import StarletteIntegration
-    from sentry_sdk.integrations.sqlalchemy import SqlalchemyIntegration
-    sentry_sdk.init(
-        dsn=_SENTRY_DSN,
-        traces_sample_rate=float(os.environ.get("SENTRY_TRACES_RATE", "0.1")),
-        # profiles_sample_rate off by default (0.0). Flip to 0.05-0.1
-        # temporarily when investigating CPU hotspots — profiling adds
-        # measurable overhead to each sampled request.
-        profiles_sample_rate=float(os.environ.get("SENTRY_PROFILES_RATE", "0.0")),
-        # send_default_pii=False keeps email/IP out of Sentry events
-        # (UMG-grade compliance). When debugging specific operators we
-        # call sentry_sdk.set_user explicitly to attach just tenant_id.
-        send_default_pii=False,
-        integrations=[
-            FastApiIntegration(transaction_style="endpoint"),
-            StarletteIntegration(transaction_style="endpoint"),
-            SqlalchemyIntegration(),
-        ],
-        # SENTRY_ENV overrides ENVIRONMENT only if explicitly set (back-compat).
-        environment=os.environ.get("SENTRY_ENV") or ENVIRONMENT,
-        release=os.environ.get("SENTRY_RELEASE", "genly@2.0.0"),
-    )
+# --- Sentry ---
+# 2026-06-01 UMG-launch hardening: the inline sentry_sdk.init() that used
+# to live here was being silently OVERRIDDEN by the second, lighter init
+# inside observability.init_sentry() (called below) — the SDK keeps only
+# the last init, so prod ran without release tag or SQLAlchemy tracing.
+# All Sentry config now lives in observability.init_sentry() (single
+# source of truth, shared with worker.py).
 
 from fastapi import FastAPI, File, Form, Header, Query, UploadFile, HTTPException, Depends, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
@@ -534,7 +505,14 @@ def on_startup():
             except Exception:  # pragma: no cover
                 try:
                     import sentry_sdk
-                    sentry_sdk.capture_exception()
+                    # Tag so all reaper crashes group under one Sentry
+                    # issue instead of fragmenting by exception type —
+                    # a dying reaper means stuck jobs accumulate
+                    # silently, which is an incident regardless of the
+                    # specific exception that killed the sweep.
+                    with sentry_sdk.push_scope() as _scope:
+                        _scope.set_tag("event", "reaper.loop_crash")
+                        sentry_sdk.capture_exception()
                 except Exception:
                     pass
                 _time.sleep(60)  # back off on error
@@ -6269,6 +6247,7 @@ from prores import (
 @app.get("/download/{job_id}/all")
 async def download_all_zip(
     job_id: str,
+    request: Request,
     token: str = Query(...),
 ):
     """Bundle the small deliverables (video MP4 + short + thumbnail) into a
@@ -6344,6 +6323,10 @@ async def download_all_zip(
         ).strip("_") or job_id
         zip_name = f"genly-{safe_name}.zip"
 
+        _audit_media_access(
+            current_user, job_id, "all",
+            action="job.download", source="zip_bundle", request=request,
+        )
         return StreamingResponse(
             buf,
             media_type="application/zip",
@@ -6383,10 +6366,49 @@ async def issue_media_token(
     return {"token": create_media_token(user_model, job_id, file_type)}
 
 
+def _audit_media_access(
+    current_user: dict,
+    job_id: str,
+    file_type: str,
+    *,
+    action: str,
+    source: str,
+    request: Request | None = None,
+) -> None:
+    """Write an AuditLog row for a media delivery (download / source audio).
+
+    UMG-launch hardening 2026-06-01: a record label's first compliance
+    question is "who accessed which master, when". Approve/reject/delete
+    were already audited; the actual byte-serving endpoints were not.
+
+    Uses its own short-lived session (the calling endpoints intentionally
+    release their pool slot before serving — see scoped_db() docstring),
+    and swallows every error: an audit-trail hiccup must never block a
+    delivery that the user is authorized to receive.
+    """
+    try:
+        with scoped_db() as db:
+            db.add(AuditLog(
+                user_id=current_user.get("id"),
+                action=action,
+                detail={
+                    "job_id": job_id,
+                    "tenant_id": current_user.get("tenant_id"),
+                    "file_type": file_type,
+                    "source": source,
+                },
+                ip_address=(request.client.host if request and request.client else None),
+            ))
+            db.commit()
+    except Exception as e:  # pragma: no cover
+        logger.warning("[AUDIT] media access log failed for %s/%s: %s", job_id, file_type, e)
+
+
 @app.get("/download/{job_id}/{file_type}")
 async def download(
     job_id: str,
     file_type: str,
+    request: Request,
     token: str = Query(...),
 ):
     # No Depends(get_db) — see scoped_db() docstring. /download serves
@@ -6414,6 +6436,13 @@ async def download(
             download_filename=FILE_MAP.get(file_type),
         )
         if url:
+            # Audit only on responses that actually deliver the file —
+            # the 202 ProRes-queued branches below are polled and would
+            # produce false "downloaded" entries.
+            _audit_media_access(
+                current_user, job_id, file_type,
+                action="job.download", source="r2_redirect", request=request,
+            )
             return RedirectResponse(url, status_code=302)
 
     file_path = os.path.join(OUTPUTS_DIR, job_id, FILE_MAP[file_type])
@@ -6443,6 +6472,10 @@ async def download(
                     download_filename=FILE_MAP.get(file_type),
                 )
                 if url:
+                    _audit_media_access(
+                        current_user, job_id, file_type,
+                        action="job.download", source="r2_redirect", request=request,
+                    )
                     return RedirectResponse(url, status_code=302)
             # R2 said yes but signed URL failed — fall through.
         elif readiness.state == ProResReadiness.MISCONFIGURED:
@@ -6478,6 +6511,10 @@ async def download(
 
     if not os.path.exists(file_path):
         raise HTTPException(status_code=404, detail="File not found.")
+    _audit_media_access(
+        current_user, job_id, file_type,
+        action="job.download", source="local_file", request=request,
+    )
     return FileResponse(file_path, filename=FILE_MAP[file_type], media_type="application/octet-stream")
 
 
@@ -7038,6 +7075,7 @@ async def reject_job(
 @app.get("/jobs/{job_id}/source-audio-url")
 async def get_source_audio_url(
     job_id: str,
+    request: Request,
     current_user: dict = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
@@ -7092,6 +7130,13 @@ async def get_source_audio_url(
     if job.input_r2_key and storage.object_exists(job.input_r2_key):
         url = storage.generate_signed_url(job.input_r2_key, expiry_seconds=3600)
         if url:
+            # Audit: this serves a signed URL to the ORIGINAL master the
+            # label uploaded — exactly the access a compliance review asks
+            # about. Once per editor session (endpoint is not polled).
+            _audit_media_access(
+                current_user, job_id, "source_audio",
+                action="job.source_audio_access", source="input", request=request,
+            )
             return {
                 "url": url,
                 "expires_in": 3600,
@@ -7121,6 +7166,10 @@ async def get_source_audio_url(
                 continue
             url = storage.generate_signed_url(r2_key, expiry_seconds=3600)
             if url:
+                _audit_media_access(
+                    current_user, job_id, "source_audio",
+                    action="job.source_audio_access", source=source_type, request=request,
+                )
                 return {
                     "url": url,
                     "expires_in": 3600,

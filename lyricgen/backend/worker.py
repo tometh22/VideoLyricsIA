@@ -66,6 +66,17 @@ def main():
         logger.critical("[WORKER] REDIS_URL is required; aborting")
         sys.exit(1)
 
+    # Observability MUST init before the worker loop starts. Without this,
+    # every sentry_sdk.capture_exception() in the pipeline / transcription
+    # workers and the RQ failure callbacks was a silent no-op in prod —
+    # the SDK was never initialized in this process, only in the API
+    # (found during the 2026-06-01 UMG-launch hardening audit). Both
+    # helpers are no-ops when their env vars are unset, so local dev and
+    # CI behave exactly as before.
+    from observability import init_logging, init_sentry
+    init_logging()
+    init_sentry()
+
     _warn_if_shutdown_grace_too_short()
 
     from redis import Redis
