@@ -92,16 +92,40 @@ def create_job(
 def get_job(
     db: Session,
     job_id: str,
+    *,
     tenant_id: str = None,
     user_id: int = None,
 ) -> Optional[dict]:
     """Return a job dict or None if not found.
 
-    Pass user_id (in addition to tenant_id) for self-serve callers — it
-    closes the IDOR where many self-registered users land in
-    tenant_id="default" (e.g. the admin tenant) and could otherwise see
-    each other's jobs by enumerating job_ids.
+    TENANT-ISOLATION CONTRACT (UMG-launch hardening 2026-06-01):
+
+    - `tenant_id` MUST be passed by every user-facing endpoint — it is
+      the isolation boundary between customers. The standard pattern is
+      `get_job(db, job_id, **_job_scope(current_user))` (main.py), which
+      always supplies it. Omitting it returns the job regardless of
+      which tenant owns it.
+    - `user_id` SHOULD additionally be passed for self-serve callers — it
+      closes the IDOR where many self-registered users land in
+      tenant_id="default" (e.g. the admin tenant) and could otherwise see
+      each other's jobs by enumerating job_ids.
+    - Internal/worker code that legitimately needs an unscoped row read
+      should use `get_job_model()` instead, so an unscoped get_job() call
+      always means "someone forgot the tenant filter" — we log it loudly
+      below.
+
+    Both filters are keyword-only so a future positional call can't
+    silently pass tenant_id into the wrong slot.
     """
+    if tenant_id is None and user_id is None:
+        # Not an exception — admin paths may make legitimate global
+        # lookups — but loud enough that an unscoped call added to a
+        # user-facing endpoint shows up in logs/review immediately.
+        _logger.warning(
+            "get_job(%s) called without tenant/user scope — global lookup "
+            "(use get_job_model() for intentional internal reads)",
+            job_id,
+        )
     query = db.query(Job).filter(Job.job_id == job_id)
     if tenant_id:
         query = query.filter(Job.tenant_id == tenant_id)

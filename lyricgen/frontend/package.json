@@ -8,7 +8,7 @@
     "check:i18n": "node scripts/check-i18n-keys.mjs",
     "check:fetch": "node scripts/check-fetch-error-handling.mjs",
     "check": "npm run check:i18n && npm run check:fetch",
-    "build": "npm run check:i18n && vite build",
+    "build": "npm run check:i18n && VITE_RELEASE=${VITE_RELEASE:-$VERCEL_GIT_COMMIT_SHA} vite build",
     "analyze": "npm run check:i18n && ANALYZE=1 vite build && echo '\nOpen dist/stats.html in your browser.'",
     "preview": "vite preview",
     "test": "vitest run",

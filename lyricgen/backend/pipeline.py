@@ -48,7 +48,7 @@ from moviepy.editor import (
 )
 from PIL import Image, ImageDraw, ImageFont
 
-from jobs import update_job, get_job
+from jobs import update_job, get_job_model
 import storage
 from render_spec import FPS_RATIONAL, RenderSpec
 from subprocess_utils import run_checked, SubprocessExecutionError  # noqa: F401 — exported for upstream catches
@@ -105,18 +105,19 @@ def _upload_deliverables_to_r2(job_id: str, job_dir: str, files: dict) -> dict:
     if not storage.is_enabled():
         return {}
     from jobs import merge_s3_keys, heartbeat
-    # get_job() requires a SQLAlchemy session, but this function runs in the
-    # worker context with no request-scoped session available. Create one
-    # here just to look up the tenant_id, then close it. (We could pass
-    # tenant_id in from the caller, but the call site already has the job_id
-    # and we need the cheap row read.)
+    # We need a SQLAlchemy session, but this function runs in the worker
+    # context with no request-scoped session available. Create one here
+    # just to look up the tenant_id, then close it. get_job_model (not
+    # get_job) because this is an intentional unscoped internal read —
+    # the worker owns the job regardless of tenant. See get_job()'s
+    # tenant-isolation contract.
     from database import SessionLocal
     _db = SessionLocal()
     try:
-        job = get_job(_db, job_id)
+        _row = get_job_model(_db, job_id)
+        tenant_id = (_row.tenant_id if _row is not None else None) or "default"
     finally:
         _db.close()
-    tenant_id = (job or {}).get("tenant_id", "default")
     out: dict = {}
     failed_critical: list[str] = []
     for file_type, _url in files.items():
