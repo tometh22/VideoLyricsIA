@@ -2196,10 +2196,16 @@ def _lrclib_cache_key(artist: str, song: str) -> str:
     return f"lrclib:{h.hexdigest()[:16]}"
 
 
-def _fetch_lrclib(artist: str, song: str, db=None) -> dict | None:
+def _fetch_lrclib(artist: str, song: str, db=None,
+                  audio_duration: float | None = None) -> dict | None:
     """Look up a song on lrclib.net's public API. Returns:
         {"plain": str|None, "synced": str|None, "duration": float|None}
     or None if the request failed or the song wasn't found.
+
+    `audio_duration` (optional): when provided, the /search candidate picker
+    prefers the lrclib record whose duration matches the uploaded audio,
+    so a multi-version title (radio edit / extended / cover) doesn't grab
+    the wrong-length lyrics. Default None → duration-agnostic (back-compat).
 
     lrclib.net is an open, free, no-auth lyrics database (similar shape to
     MusicBrainz for lyrics). Public API, no anti-bot, generous rate limits.
@@ -2285,7 +2291,7 @@ def _fetch_lrclib(artist: str, song: str, db=None) -> dict | None:
     if result is None:
         candidates = _try_lrclib_search(artist, song)
         if candidates:
-            best = _pick_best_lrclib_candidate(candidates, artist, song)
+            best = _pick_best_lrclib_candidate(candidates, artist, song, audio_duration)
             if best is not None:
                 logger.info("[LYRICS] lrclib /get failed but /search rescued candidate id=%s "
                             "(%r - %r, synced=%s)",
@@ -2311,13 +2317,13 @@ def _fetch_lrclib(artist: str, song: str, db=None) -> dict | None:
     #    strip parens/Live/Remix, primer-token del artist). El picker
     #    sigue scoreando contra el (artist, song) original, así un mal
     #    variant no nos hace pickear un match débil.
-    if _env_flag("LRCLIB_COVERAGE_BOOST"):
+    if _lrclib_coverage_enabled():
         # (1) Upgrade plain→synced
         if result is not None and not result.get("synced"):
             candidates = _try_lrclib_search(artist, song)
             synced_candidates = [c for c in (candidates or []) if c.get("syncedLyrics")]
             if synced_candidates:
-                upgrade = _pick_best_lrclib_candidate(synced_candidates, artist, song)
+                upgrade = _pick_best_lrclib_candidate(synced_candidates, artist, song, audio_duration)
                 if upgrade is not None:
                     try:
                         upgraded = _parse_lrclib_record(upgrade)
@@ -2339,7 +2345,7 @@ def _fetch_lrclib(artist: str, song: str, db=None) -> dict | None:
                     continue
                 # Score against ORIGINAL artist/song para evitar
                 # aceptar matches débiles que la variante haya inflado
-                best_v = _pick_best_lrclib_candidate(v_candidates, artist, song)
+                best_v = _pick_best_lrclib_candidate(v_candidates, artist, song, audio_duration)
                 if best_v is None:
                     continue
                 try:
@@ -2467,6 +2473,47 @@ def _strip_song_noise(title: str) -> str:
     return s or title  # nunca devolver string vacío
 
 
+def _lrclib_coverage_enabled() -> bool:
+    """Multi-artist split + variant-retry + diacritic-fold for lrclib search.
+
+    Default ON since 2026-06-01. Incident (job c57c32846d75): the cumbia
+    cover "Luz De Dia" credited to artist "Coti, Angela Leiva, La K´onga"
+    shipped raw whisperX (timing_source=whisperx, scattered timing, missed
+    outro) because lrclib was queried with the FULL multi-artist string and
+    found nothing — even though lrclib has the original "Coti - Luz de Día"
+    (169 s, synced) that a per-artist query hits exactly.
+
+    Kept behind an env var as a kill-switch: set LRCLIB_COVERAGE_BOOST=0
+    (or false/no/off) to revert to the old exact-match-only behavior
+    without a redeploy.
+    """
+    import os as _os
+    return _os.environ.get("LRCLIB_COVERAGE_BOOST", "1").strip().lower() not in (
+        "0", "false", "no", "off",
+    )
+
+
+def _split_multi_artist(artist: str) -> list[str]:
+    """Split a multi-artist credit into individual artists.
+
+    "Coti, Angela Leiva, La K´onga" → ["Coti", "Angela Leiva", "La K´onga"].
+    lrclib indexes most songs under a single primary artist, so collab /
+    cover credits never match the full string. Splits on commas,
+    ampersands, slashes and feat./ft./featuring (NOT bare "x" — too prone
+    to false splits inside real names). Returns [] when there's only one
+    artist (nothing to split)."""
+    import re as _re
+    parts = [
+        a.strip() for a in _re.split(
+            r"\s*(?:,|&|/|\bfeat\b\.?|\bft\b\.?|\bfeaturing\b)\s*",
+            (artist or "").strip(),
+            flags=_re.IGNORECASE,
+        )
+        if a.strip()
+    ]
+    return parts if len(parts) > 1 else []
+
+
 def _lrclib_query_variants(artist: str, song: str):
     """Yield (artist, song) variations to try cuando el exact-match falla.
     Orden: más-probable-a-mejor primero. Dedupe contra (artist, song)
@@ -2501,6 +2548,18 @@ def _lrclib_query_variants(artist: str, song: str):
         if v: yield v
         # también con accent-fold
         v = _emit(_strip_accents(parts[0]), _strip_accents(clean_song))
+        if v: yield v
+
+    # Variant 4: multi-artist credits ("Coti, Angela Leiva, La K´onga" —
+    # cumbia / collab covers). Try each individual artist (+ accent-fold)
+    # so the original single-artist record on lrclib is found. The picker
+    # still scores against the ORIGINAL (artist, song), so a per-artist
+    # query that surfaces an unrelated song is rejected. (Incident
+    # 2026-06-01, job c57c32846d75.)
+    for ind in _split_multi_artist(base_artist):
+        v = _emit(ind, clean_song)
+        if v: yield v
+        v = _emit(_strip_accents(ind), _strip_accents(clean_song))
         if v: yield v
 
 
@@ -2538,7 +2597,8 @@ def _try_lrclib_search(artist: str, song: str) -> list:
 
 
 def _pick_best_lrclib_candidate(candidates: list, artist: str,
-                                 song: str) -> dict | None:
+                                 song: str,
+                                 audio_duration: float | None = None) -> dict | None:
     """Scorea cada candidate de /api/search contra el (artist, song)
     pedido. Devuelve el de mayor score si supera el threshold 0.5,
     sino None.
@@ -2548,17 +2608,29 @@ def _pick_best_lrclib_candidate(candidates: list, artist: str,
       - Song match exacto: +0.3; substring: +0.2; else 0.
       - Bonus +0.2 si el candidate tiene syncedLyrics (preferimos
         synced sobre plain para output con timestamps exactos).
+      - Duration guard (cuando `audio_duration` está disponible): +0.25 si
+        la duración del candidate matchea el audio (±3 s), +0.05 si está
+        cerca (±30 s), −0.35 si difiere mucho. lrclib suele tener varios
+        uploads del mismo título a distinta duración (radio edit /
+        extendido / el original vs un cover); sin esto el picker elegiría
+        por orden de resultados y podría agarrar el "Luz de Día" de 261 s
+        para una cumbia de 169 s. Es preferencia, no rechazo duro: un
+        match de otra duración igual pasa el threshold si es lo único que
+        hay (mejor tener el texto correcto — reconcile usa los wordstamps
+        propios, no los timestamps de lrclib).
       - Threshold 0.5: requiere mínimo artist+song match O synced+song
         match razonable. Evita aceptar matches débiles que generarían
         output peor que el Gemini fallback existente.
+
+    `audio_duration` es opcional y default None → scoring idéntico al
+    original (back-compat con callers/tests que no lo pasan).
     """
     if not candidates:
         return None
 
-    # Under LRCLIB_COVERAGE_BOOST=1, fold diacritics así "Babasonicos"
-    # matchea "Babasónicos" exactamente y no sólo por substring. Sin el
-    # flag, comportamiento idéntico al original (sólo .lower().strip()).
-    _fold = _env_flag("LRCLIB_COVERAGE_BOOST")
+    # Diacritic-fold así "Babasonicos" matchea "Babasónicos" exactamente y
+    # no sólo por substring. Default ON (kill-switch LRCLIB_COVERAGE_BOOST=0).
+    _fold = _lrclib_coverage_enabled()
 
     def _norm(s: str) -> str:
         base = (s or "").lower().strip()
@@ -2587,7 +2659,14 @@ def _pick_best_lrclib_candidate(candidates: list, artist: str,
             else 0.0
         )
         sync_score = 0.2 if c.get("syncedLyrics") else 0.0
-        score = a_score + s_score + sync_score
+        dur_score = 0.0
+        if audio_duration and c.get("duration"):
+            try:
+                diff = abs(float(c["duration"]) - float(audio_duration))
+                dur_score = 0.25 if diff <= 3.0 else 0.05 if diff <= 30.0 else -0.35
+            except (TypeError, ValueError):
+                dur_score = 0.0
+        score = a_score + s_score + sync_score + dur_score
         if score > best_score:
             best_score = score
             best = c
@@ -2596,7 +2675,8 @@ def _pick_best_lrclib_candidate(candidates: list, artist: str,
     return None
 
 
-def _fetch_lrclib_with_swap_retry(artist: str, song: str, db=None) -> tuple:
+def _fetch_lrclib_with_swap_retry(artist: str, song: str, db=None,
+                                  audio_duration: float | None = None) -> tuple:
     """`_fetch_lrclib` con retry en orden invertido cuando el directo falla.
 
     Devuelve `(result, meta)` donde `meta = {swapped: bool, artist_used,
@@ -2620,7 +2700,7 @@ def _fetch_lrclib_with_swap_retry(artist: str, song: str, db=None) -> tuple:
     Defensa: si artist o song están vacíos, o son textualmente iguales,
     no intenta swap (evita ruido en logs).
     """
-    result = _fetch_lrclib(artist, song, db)
+    result = _fetch_lrclib(artist, song, db, audio_duration)
     meta = {"swapped": False, "artist_used": artist, "song_used": song}
     if result is not None:
         return result, meta
@@ -2630,7 +2710,7 @@ def _fetch_lrclib_with_swap_retry(artist: str, song: str, db=None) -> tuple:
         return None, meta
     logger.info("[LYRICS] lrclib miss for (%r,%r) — trying swapped order (%r,%r)",
                 artist, song, song, artist)
-    swap_result = _fetch_lrclib(song, artist, db)
+    swap_result = _fetch_lrclib(song, artist, db, audio_duration)
     if swap_result is None:
         return None, meta
     logger.warning(
