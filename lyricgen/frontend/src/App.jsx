@@ -42,6 +42,7 @@ import { useBackgroundPreview } from "./hooks/useBackgroundPreview";
 import { useMediaUrl, clearMediaCache } from "./mediaUrl";
 import { translateBackendError } from "./lib/lyricsEditSubmit";
 import { computeFieldDiff, buildEditPayloads } from "./lib/editWizardDiff";
+import { prefetchKey } from "./lib/prefetchKey";
 
 const API = import.meta.env.VITE_API_URL || "";
 
@@ -1774,7 +1775,7 @@ export default function App() {
   // Pre-upload + transcribe songs at indices fromIdx..queue.length-1 in the
   // background while the user is actively reviewing a different song (o ahora
   // también mientras está en la pantalla de upload eligiendo opciones).
-  // Resultados van a prefetchCache.current[idx] para que transcribeNext los
+  // Resultados van a prefetchCache.current[key] para que transcribeNext los
   // sirva instant en vez de hacer al usuario esperar el round-trip.
   //
   // 2026-05-23: refactor a backend async. La respuesta del POST es ahora
@@ -1803,10 +1804,14 @@ export default function App() {
         // iter NO arranca.
         break;
       }
-      if (prefetchCache.current[idx]) continue;
-      prefetchCache.current[idx] = { status: "loading" };
       const entry = queue[idx];
       const file = entry.file;
+      // Key by FILE IDENTITY, not array index — removeFile re-packs `files`,
+      // so a re-uploaded file at a freed index must NOT inherit a stale
+      // transcription (incident 2026-06-01: prev song's lyrics on new audio).
+      const key = prefetchKey(file);
+      if (prefetchCache.current[key]) continue;
+      prefetchCache.current[key] = { status: "loading" };
       try {
         setRowStatus(file, "uploading");
         const { jobId } = await uploadFileToR2(file, {
@@ -1819,7 +1824,7 @@ export default function App() {
         // en el cache YA, antes del polling. Así transcribeNext (si el
         // operador clickea "Revisar" antes de que el prefetch termine) ve
         // el jobId y puede reusar este job en vez de crear uno nuevo.
-        prefetchCache.current[idx] = { status: "loading", jobId };
+        prefetchCache.current[key] = { status: "loading", jobId };
         setRowStatus(file, "queued");
         const res = await authFetchWithRetryOn503(`${API}/transcribe-uploaded`, {
           method: "POST",
@@ -1833,7 +1838,7 @@ export default function App() {
           signal: controller && controller.signal,
         }, { maxRetries: 3 });
         if (!res.ok) {
-          prefetchCache.current[idx] = { status: "error" };
+          prefetchCache.current[key] = { status: "error" };
           setRowStatus(file, "error");
           continue;
         }
@@ -1841,25 +1846,25 @@ export default function App() {
         // Backward compat: if backend returned segments inline (legacy sync
         // path con ASYNC_TRANSCRIBE_ENABLED=0), salteamos el polling.
         if (initial.segments) {
-          prefetchCache.current[idx] = { status: "ready", data: initial, jobId };
+          prefetchCache.current[key] = { status: "ready", data: initial, jobId };
           setRowStatus(file, "done");
           continue;
         }
         // Async path — pollear hasta transcribed.
         const data = await pollUntilTranscribed(initial.job_id || jobId, file);
         if (data) {
-          prefetchCache.current[idx] = { status: "ready", data, jobId };
+          prefetchCache.current[key] = { status: "ready", data, jobId };
         } else {
-          prefetchCache.current[idx] = { status: "error" };
+          prefetchCache.current[key] = { status: "error" };
         }
       } catch (err) {
         // R-FRONT-3 e2e: handleReset disparó abort. Salimos clean del
         // loop sin marcar "error" (no es un fallo real — es cancelación).
         if (err && (err.name === "AbortError" || (controller && controller.signal.aborted))) {
-          prefetchCache.current[idx] = { status: "aborted" };
+          prefetchCache.current[key] = { status: "aborted" };
           break;
         }
-        prefetchCache.current[idx] = { status: "error" };
+        prefetchCache.current[key] = { status: "error" };
         setRowStatus(file, "error");
       }
     }
@@ -1925,9 +1930,12 @@ export default function App() {
   const transcribeNext = async (queue, idx) => {
     if (idx >= queue.length) return;
     const entry = queue[idx];
+    // Cache key is the file identity (see prefetchKey), NOT the queue index,
+    // so a removed+re-uploaded file can never serve another song's segments.
+    const key = prefetchKey(entry.file);
 
-    // Fast path: a background prefetch already finished for this index.
-    const cached = prefetchCache.current[idx];
+    // Fast path: a background prefetch already finished for this file.
+    const cached = prefetchCache.current[key];
     if (cached?.status === "ready") {
       const { data, jobId } = cached;
       setTranscribing(false);
@@ -1985,7 +1993,7 @@ export default function App() {
       try {
         const data = await pollUntilTranscribed(cached.jobId, entry.file);
         if (data) {
-          prefetchCache.current[idx] = { status: "ready", data, jobId: cached.jobId };
+          prefetchCache.current[key] = { status: "ready", data, jobId: cached.jobId };
           setTranscribing(false);
           setTranscribeProgress(null);
           setCurrentReview({
@@ -2013,10 +2021,10 @@ export default function App() {
         // pollUntilTranscribed returned null → prefetch failed. Caer al
         // slow path (que SÍ crea un job nuevo) — operador prefiere
         // un retry sobre "queda colgado forever".
-        prefetchCache.current[idx] = { status: "error" };
+        prefetchCache.current[key] = { status: "error" };
       } catch (err) {
         // Si el poll falló transient, igual caemos al slow path.
-        prefetchCache.current[idx] = { status: "error" };
+        prefetchCache.current[key] = { status: "error" };
       }
     }
 
