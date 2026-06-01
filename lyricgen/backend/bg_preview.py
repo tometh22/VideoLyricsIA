@@ -205,6 +205,18 @@ def run_bg_preview_job(job_id: str, bg_cache_key: str, params: dict) -> dict:
     except Exception as e:
         import traceback
         logger.error("[BG_PREVIEW] job=%s failed: %s\n%s", job_id, e, traceback.format_exc())
+        # Surface to Sentry with the job tag — bg_preview runs in the RQ
+        # worker, outside any FastAPI request, so without this explicit
+        # capture a Veo 429-storm or quota exhaustion is invisible.
+        # Mirrors pipeline.py's run_pipeline failure capture.
+        try:
+            import sentry_sdk
+            with sentry_sdk.push_scope() as _scope:
+                _scope.set_tag("event", "bg_preview.failed")
+                _scope.set_tag("job_id", job_id)
+                sentry_sdk.capture_exception(e)
+        except Exception:
+            pass
         try:
             update_job(
                 job_id,
