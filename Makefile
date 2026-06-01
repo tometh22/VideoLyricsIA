@@ -48,3 +48,12 @@ test-backend:
 install-hooks:
 	git config core.hooksPath .githooks
 	@echo "✓ hooks installed — 'make check' now runs on every push"
+
+# Black-box cross-tenant isolation pen-test (staging only). Needs two
+# accounts in DIFFERENT tenants (PENTEST_A_*/PENTEST_B_*) + optional A2 in
+# A's tenant. Refuses to run against prod hosts unless --force is passed.
+#   PENTEST_BASE_URL  staging API base URL (or STAGING_API_URL)
+# See docs/RUNBOOK_LAUNCH.md §1.
+.PHONY: pentest-isolation
+pentest-isolation:
+	cd $(BACKEND) && $(PY) scripts/pentest_tenant_isolation.py
