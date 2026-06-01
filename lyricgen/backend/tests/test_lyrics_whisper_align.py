@@ -380,6 +380,123 @@ def test_build_segments_no_warning_on_normal_density():
         "normal density segment must NOT warn"
 
 
+# ──────────────────────────────────────────────────────────────────────
+# Fix D (2026-05-31): align_lines_to_words — use whisperX words instead
+# of re-calling Whisper-1 when reconcile aborts.
+# ──────────────────────────────────────────────────────────────────────
+
+
+def test_align_lines_to_words_with_whisperx_words_produces_segments():
+    """Happy path: passing pre-fetched words from whisperX (with the
+    `score` field that forced-align supplies) produces segments with
+    `words[]` carried through. The whole point of this entry is to
+    AVOID re-calling Whisper-1 when the timing data already exists."""
+    from lyrics_whisper_align import align_lines_to_words
+
+    cleaned_lines = ["uno dos", "tres cuatro"]
+    # WhisperX-shaped words (note `score`, the forced-align confidence).
+    wx_words = [
+        {"word": "uno",    "start": 5.00, "end": 5.20, "score": 0.95},
+        {"word": "dos",    "start": 5.30, "end": 5.50, "score": 0.93},
+        {"word": "tres",   "start": 6.00, "end": 6.20, "score": 0.91},
+        {"word": "cuatro", "start": 6.30, "end": 6.50, "score": 0.89},
+    ]
+    segs = align_lines_to_words(cleaned_lines, wx_words, audio_dur=30.0,
+                                 label="WC-WX-WORDS")
+    assert segs is not None
+    assert len(segs) == 2
+    # words[] persisted — the editor's karaoke highlight uses these.
+    for s in segs:
+        assert len(s.get("words") or []) == 2
+
+
+def test_align_lines_to_words_returns_none_on_empty_inputs():
+    """Defensive: any empty argument returns None so the caller can
+    fall back cleanly."""
+    from lyrics_whisper_align import align_lines_to_words
+
+    assert align_lines_to_words([], [{"word": "a", "start": 0, "end": 1}], 10.0) is None
+    assert align_lines_to_words(["uno"], [], 10.0) is None
+    assert align_lines_to_words(["uno"], [{"word": "uno", "start": 0, "end": 1}], 0.0) is None
+
+
+def test_align_lines_to_words_bails_below_anchor_floor():
+    """If the cleaned lines are so different from the words that DP
+    can't anchor enough lines, return None so the caller falls back
+    to the Whisper-1 path (which has different mishearing biases)."""
+    from lyrics_whisper_align import align_lines_to_words
+
+    # Canonical mentions things the words stream doesn't have at all.
+    cleaned_lines = [
+        "completely different line one",
+        "another mismatched line two",
+        "yet another bad match three",
+    ]
+    wx_words = [
+        {"word": "hola",  "start": 0.0, "end": 0.5},
+        {"word": "mundo", "start": 0.6, "end": 1.0},
+    ]
+    segs = align_lines_to_words(cleaned_lines, wx_words, audio_dur=5.0)
+    assert segs is None
+
+
+def test_flatten_whisperx_words_pulls_per_word_stamps_in_order():
+    """flatten_whisperx_words takes whisperX's nested {segments[words]}
+    shape and produces a flat time-sorted word stream — what
+    align_lines_to_words expects."""
+    from lyrics_whisper_align import flatten_whisperx_words
+
+    wx_segs = [
+        {"start": 0.0, "end": 1.0, "text": "uno dos",
+         "words": [
+             {"word": "uno", "start": 0.10, "end": 0.30, "score": 0.95},
+             {"word": "dos", "start": 0.50, "end": 0.70, "score": 0.92},
+         ]},
+        {"start": 2.0, "end": 3.0, "text": "tres",
+         "words": [
+             {"word": "tres", "start": 2.10, "end": 2.40, "score": 0.88},
+         ]},
+    ]
+    flat = flatten_whisperx_words(wx_segs)
+    assert [w["word"] for w in flat] == ["uno", "dos", "tres"]
+    # Sorted by start ascending.
+    starts = [w["start"] for w in flat]
+    assert starts == sorted(starts)
+    # Score preserved.
+    assert flat[0]["score"] == 0.95
+
+
+def test_flatten_whisperx_words_handles_out_of_order_segments():
+    """Defense: if a caller passes segments out of order or with
+    overlapping words, the output is still time-sorted."""
+    from lyrics_whisper_align import flatten_whisperx_words
+
+    wx_segs = [
+        {"words": [{"word": "later", "start": 5.0, "end": 5.5}]},
+        {"words": [{"word": "early", "start": 1.0, "end": 1.5}]},
+    ]
+    flat = flatten_whisperx_words(wx_segs)
+    assert [w["word"] for w in flat] == ["early", "later"]
+
+
+def test_flatten_whisperx_words_skips_malformed_entries():
+    """Garbage in (None entries, missing start, empty word) is dropped
+    silently — the alignment can't use them anyway."""
+    from lyrics_whisper_align import flatten_whisperx_words
+
+    wx_segs = [
+        {"words": [
+            None,
+            "string",
+            {"word": "", "start": 1.0, "end": 1.5},        # empty text
+            {"word": "ok", "start": "garbage", "end": 2},   # bad start
+            {"word": "good", "start": 3.0, "end": 3.5, "score": 0.9},
+        ]},
+    ]
+    flat = flatten_whisperx_words(wx_segs)
+    assert [w["word"] for w in flat] == ["good"]
+
+
 import contextlib
 @contextlib.contextmanager
 def caplog_collector():

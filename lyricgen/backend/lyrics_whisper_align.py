@@ -554,8 +554,136 @@ def whisper_word_align(
                 pass
 
 
+def align_lines_to_words(
+    cleaned_lines: list[str],
+    whisper_words: list[dict],
+    audio_dur: float,
+    *,
+    label: str = "ALIGN-WORDS",
+) -> list[dict] | None:
+    """Align canonical lyric lines against a pre-fetched word stream.
+
+    2026-05-31 (Donde Estan Corazón report). This is the I/O-free core
+    of `whisper_word_align` — same DP align + interpolation + build,
+    BUT the caller supplies the word stream instead of us re-calling
+    Whisper-1. The big win: when whisperX already ran and returned
+    forced-align words (±50 ms accuracy from the Replicate model), we
+    can use THOSE instead of degrading to Whisper-1's ±500 ms verbose
+    JSON when reconcile aborts and we fall to this alignment path.
+
+    Trade-off vs `whisper_word_align`:
+      - No OpenAI call → no latency, no $, no compression
+      - Same DP + interpolation + monotonicity guarantees
+      - Same Fix A/B/C from _build_segments (words[] persisted,
+        smarter head, truncation warning)
+
+    Args:
+        cleaned_lines: canonical lyric lines (one row per editor line).
+        whisper_words: pre-fetched word stream as
+            [{"word", "start", "end", "score"?}, …] in time order.
+            Words MAY come from whisperX (forced-align) or Whisper-1
+            (verbose JSON) — the function doesn't care which.
+        audio_dur: track duration in seconds (for tail interpolation).
+        label: log prefix; default "ALIGN-WORDS". Pass "WC-WX-WORDS"
+            when invoked from the whisperX fallback in main.py so the
+            log line tells operators which source produced the timings.
+
+    Returns:
+        Segments (with words[] attached by _build_segments) or None
+        when alignment fails (caller should fall back further).
+    """
+    lines = [ln.strip() for ln in (cleaned_lines or []) if ln and ln.strip()]
+    if not lines or not whisper_words or audio_dur <= 0:
+        return None
+    # Normalize words to dict form (whisperX returns dicts; Whisper-1
+    # verbose JSON returns Pydantic; tests use dicts).
+    word_dicts: list[dict] = []
+    for w in whisper_words:
+        if isinstance(w, dict):
+            wd = w
+        else:
+            wd = {
+                "word": getattr(w, "word", None),
+                "start": getattr(w, "start", None),
+                "end": getattr(w, "end", None),
+            }
+            score = getattr(w, "score", None)
+            if score is not None:
+                wd["score"] = score
+        if (wd.get("word") or "").strip() and wd.get("start") is not None:
+            word_dicts.append(wd)
+    if not word_dicts:
+        return None
+
+    cleaned_tokens = _tokens_with_line(lines)
+    if not cleaned_tokens:
+        logger.warning("[%s] cleaned tokenization empty", label)
+        return None
+
+    cleaned_to_whisper = _dp_align_tokens(cleaned_tokens, word_dicts)
+    anchored_lines = len({
+        cleaned_tokens[i][0]
+        for i, wi in enumerate(cleaned_to_whisper)
+        if wi >= 0
+    })
+    anchor_ratio = anchored_lines / len(lines)
+    logger.info(
+        "[%s] words=%d, anchored=%d/%d lines (%.0f%%)",
+        label, len(word_dicts), anchored_lines, len(lines), anchor_ratio * 100,
+    )
+    if anchor_ratio < MIN_ANCHOR_RATIO:
+        logger.warning(
+            "[%s] anchor ratio %.2f below floor %.2f — caller should fall back",
+            label, anchor_ratio, MIN_ANCHOR_RATIO,
+        )
+        return None
+
+    segments = _build_segments(
+        lines, cleaned_tokens, cleaned_to_whisper, word_dicts, audio_dur,
+    )
+    return segments or None
+
+
+def flatten_whisperx_words(wx_segs: list[dict]) -> list[dict]:
+    """Collect all per-word stamps across a list of whisperX segments
+    into a single time-ordered stream — the shape `align_lines_to_words`
+    expects.
+
+    whisperX returns `[{start, end, text, words: [...]}, …]`. We pull
+    the inner `words` and stitch them. Pre-sorted by start to defend
+    against an edge whisperX caller passing segments out of order.
+    """
+    flat: list[dict] = []
+    for seg in wx_segs or []:
+        if not isinstance(seg, dict):
+            continue
+        for w in (seg.get("words") or []):
+            if not isinstance(w, dict):
+                continue
+            try:
+                ws = float(w.get("start"))
+                we = float(w.get("end", ws))
+            except (TypeError, ValueError):
+                continue
+            text = (w.get("word") or "").strip()
+            if not text:
+                continue
+            entry = {"word": text, "start": ws, "end": we}
+            score = w.get("score")
+            if score is not None:
+                try:
+                    entry["score"] = float(score)
+                except (TypeError, ValueError):
+                    pass
+            flat.append(entry)
+    flat.sort(key=lambda w: w["start"])
+    return flat
+
+
 __all__ = [
     "whisper_word_align",
+    "align_lines_to_words",
+    "flatten_whisperx_words",
     "MIN_ANCHOR_RATIO",
     "MIN_SEG_DUR_S",
     "GAP_S",
