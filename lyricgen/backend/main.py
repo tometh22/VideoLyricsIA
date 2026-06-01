@@ -4206,6 +4206,64 @@ async def _run_transcription_for_job(
                                 _reconciled, _WC_WX_REC,
                                 reference_lyrics=_canonical,
                             )
+                        # ── Stage 3 (2026-06-01): VAD-validated synced scaffold ──
+                        # Reconcile aborted. BEFORE the fragile fallbacks below
+                        # (whisper_align → Whisper-1 outro hallucination on
+                        # guitar solos; forced_align/Cureau → 10-line pile-up on
+                        # the post-solo verse, the operator's "se ilumina donde
+                        # no canta"), try lrclib's HUMAN karaoke timing anchored
+                        # to this recording (offset from whisperX's first sung
+                        # word) and VALIDATED against where the stem actually has
+                        # voice (energy VAD) + a duration span gate. When the
+                        # offset-corrected lines land on singing it gives clean,
+                        # well-distributed lines with NO pile-up and NO outro
+                        # hallucination (lab: Rata Blanca 47 lines). It declines
+                        # (falls through) when the synced version doesn't match
+                        # THIS recording (cumbia +73s overshoot, Soda live
+                        # arrangement). Gated + reversible.
+                        _synced_sc = (
+                            (lrc or {}).get("synced") if isinstance(lrc, dict) else None
+                        )
+                        if (
+                            os.environ.get("ANCHOR_SCAFFOLD_ENABLED", "0")
+                            .strip().lower() in ("1", "true", "yes", "on")
+                            and _synced_sc
+                        ):
+                            try:
+                                import anchor_align as _anchor
+                                import lrclib_aligner as _lca_s
+                                _sc_pairs = _lca_s._parse_lrc_to_line_times(_synced_sc)
+                                _sc_regions = _anchor.vocal_regions(_aa)
+                                _sc_segs, _sc_meta = _anchor.build_synced_scaffold(
+                                    _sc_pairs, _wx_segs, _audio_dur_for_lrc,
+                                    vocal_regions=_sc_regions,
+                                )
+                                if _sc_segs:
+                                    from timing_sources import (
+                                        SYNCED_SCAFFOLD as _WC_SS,
+                                    )
+                                    logger.info(
+                                        "[WC] synced-scaffold: %d lines, "
+                                        "offset=%+.1fs, voice=%.0f%% — human "
+                                        "karaoke timing anchored to this audio",
+                                        len(_sc_segs),
+                                        _sc_meta.get("offset", 0.0),
+                                        max(0.0, _sc_meta.get("frac_in_voice", 0.0)) * 100,
+                                    )
+                                    return _emit_segments(
+                                        _sc_segs, _WC_SS,
+                                        reference_lyrics=_canonical,
+                                    )
+                                logger.info(
+                                    "[WC] synced-scaffold declined (%s) — "
+                                    "continuing cascade",
+                                    _sc_meta.get("reason"),
+                                )
+                            except Exception as _e_sc:
+                                logger.warning(
+                                    "[WC] synced-scaffold raised: %s — "
+                                    "continuing cascade", _e_sc,
+                                )
                         # Reconcile aborted (drift on too many lines or thin
                         # coverage). Try forced_align as a fallback before
                         # falling all the way back to whisperX raw — FA has

@@ -93,6 +93,19 @@ CLEANUP_ANCHORED = "cleanup_anchored"
 # See `lyrics_whisper_align.py`.
 WHISPER_ALIGN = "whisper_align"
 
+# VAD-validated lrclib-synced scaffold (Stage 3, 2026-06-01). When reconcile
+# aborts, this runs BEFORE whisper_align/forced_align: it takes lrclib's human
+# karaoke line timing (correct order + relative timing, no hallucination, no
+# pile-up), anchors the global offset to whisperX's first sung word so it lines
+# up with THIS recording, and VALIDATES the result against where the stem
+# actually has voice (energy VAD) + a duration span gate. Only emitted when the
+# offset-corrected lines land where there is singing — otherwise it falls
+# through. Solves the guitar-solo failures that whisper_align (mix
+# hallucination) and forced_align (Cureau pile-up) produce on instrumental-heavy
+# songs. Lab-validated on 12 songs (rock/ballad/live/pop/reggaeton). See
+# `anchor_align.py`.
+SYNCED_SCAFFOLD = "synced_scaffold"
+
 
 VALID_TIMING_SOURCES = frozenset({
     FORCED_ALIGN,
@@ -101,6 +114,7 @@ VALID_TIMING_SOURCES = frozenset({
     WHISPERX_LRCLIB,
     CLEANUP_ANCHORED,
     WHISPER_ALIGN,
+    SYNCED_SCAFFOLD,
     WHISPER_LRCLIB,
     WHISPER_LRCLIB_REC,
     WHISPER_GEMINI_REC,
