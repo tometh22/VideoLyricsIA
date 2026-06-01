@@ -3969,9 +3969,18 @@ async def _run_transcription_for_job(
         # immediately so the connection is free during the long Whisper /
         # Vertex work below (see the pool-starvation note in the docstring).
         await _step("transcribe.lyrics_lookup", 15)
+        # Audio duration lets the lrclib picker prefer the version that
+        # matches THIS upload (radio edit / extended / cover) instead of
+        # grabbing a wrong-length record under the same title. Best-effort:
+        # a failed probe just falls back to duration-agnostic picking.
+        try:
+            _audio_dur_for_lrc = await asyncio.to_thread(_audio_duration, tmp_path)
+        except Exception:
+            _audio_dur_for_lrc = None
         with scoped_db() as _lrc_db:
             lrc, _lrc_meta = await asyncio.to_thread(
                 _fetch_lrclib_with_swap_retry, artist_hint, song_hint, _lrc_db,
+                _audio_dur_for_lrc,
             )
         # Auto-correct inverted metadata: when the swap-retry hit, the upload
         # had artist/title swapped (incident 2026-05-24 Viejas Locas /

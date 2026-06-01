@@ -26,7 +26,7 @@ _HIT = {"plain": "letra completa", "synced": None, "duration": 220.0}
 def _make_fetch_mock(matches: dict[tuple[str, str], dict | None]):
     """Build a side-effect function: given (artist, song), return the
     mapped result (or None for misses). Accepts any other args."""
-    def _side_effect(artist, song, db=None):
+    def _side_effect(artist, song, db=None, audio_duration=None):
         return matches.get((artist, song))
     return _side_effect
 
@@ -36,7 +36,7 @@ def test_direct_order_hits_no_swap_attempted():
     NEVER be attempted (avoid doubling the lrclib calls in the common
     case)."""
     calls: list[tuple[str, str]] = []
-    def _side_effect(artist, song, db=None):
+    def _side_effect(artist, song, db=None, audio_duration=None):
         calls.append((artist, song))
         return _HIT if (artist, song) == ("Viejas Locas", "Legalícenla") else None
     with patch.object(pipeline, "_fetch_lrclib", side_effect=_side_effect):
@@ -78,7 +78,7 @@ def test_empty_fields_skip_swap():
     """Defense: skip swap when artist or song is empty/blank. Avoids
     needless calls when the upload didn't supply both fields."""
     calls = []
-    def _side_effect(artist, song, db=None):
+    def _side_effect(artist, song, db=None, audio_duration=None):
         calls.append((artist, song))
         return None
     with patch.object(pipeline, "_fetch_lrclib", side_effect=_side_effect):
@@ -100,7 +100,7 @@ def test_identical_fields_skip_swap():
     """When artist and song are textually the same (case-insensitive),
     the swap is a no-op — skip to avoid the redundant call + log noise."""
     calls = []
-    def _side_effect(artist, song, db=None):
+    def _side_effect(artist, song, db=None, audio_duration=None):
         calls.append((artist, song))
         return None
     with patch.object(pipeline, "_fetch_lrclib", side_effect=_side_effect):
@@ -116,7 +116,7 @@ def test_db_session_is_passed_through():
     direct and swap calls must use it — otherwise the swap-hit wouldn't
     benefit from / write to the cache."""
     seen_dbs = []
-    def _side_effect(artist, song, db=None):
+    def _side_effect(artist, song, db=None, audio_duration=None):
         seen_dbs.append(db)
         return _HIT if (artist, song) == ("Viejas Locas", "Legalícenla") else None
     fake_db = object()
