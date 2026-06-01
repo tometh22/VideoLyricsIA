@@ -18,7 +18,9 @@ from pipeline import (
     _detect_hallucination,
     _fetch_lrclib,
     _fill_gaps_with_reference,
+    _filter_whisper_hallucinations,
     _has_fuzzy_intra_loop,
+    _is_whisper_hallucination,
     _synthesize_segments_from_plain,
 )
 
@@ -700,6 +702,79 @@ def test_collapse_normalizes_text_when_comparing():
     ]
     out = _collapse_consecutive_duplicates(segs)
     assert len(out) == 1
+
+
+# ----- _is_whisper_hallucination (Amara.org credits) ----------------------
+#
+# Regression: "Lamento Boliviano — Enanitos Verdes" (2026-06-01). Whisper
+# transcribed the training-data credit WITHOUT the dot ("…comunidad de
+# Amara org") during the instrumental outro at 3:41, and the old literal
+# "amara.org" needles never matched, so the line reached the operator's
+# editor and the rendered video. Matching must be punctuation-insensitive.
+
+def test_amara_credit_with_dot_is_hallucination():
+    assert _is_whisper_hallucination(
+        "Subtítulos realizados por la comunidad de Amara.org")
+
+
+def test_amara_credit_without_dot_is_hallucination():
+    # The exact Lamento Boliviano regression text.
+    assert _is_whisper_hallucination(
+        "Subtítulos realizados por la comunidad de Amara org")
+
+
+def test_amara_credit_with_dot_space_is_hallucination():
+    assert _is_whisper_hallucination(
+        "Subtítulos realizados por la comunidad de Amara. org")
+
+
+def test_amara_credit_truncated_is_hallucination():
+    # Whisper sometimes drops the site name entirely.
+    assert _is_whisper_hallucination(
+        "Subtítulos realizados por la comunidad")
+
+
+def test_amara_credit_english_variants_are_hallucinations():
+    assert _is_whisper_hallucination("Subtitled by the Amara.org community")
+    assert _is_whisper_hallucination("Subtitled by the Amara org community")
+    assert _is_whisper_hallucination("Visit www.amara.org")
+
+
+def test_real_lyrics_with_amara_verb_not_flagged():
+    # "amara" is a real Spanish word (subjunctive of amar) — bare "amara"
+    # must never be a needle, only "amara org".
+    assert not _is_whisper_hallucination("Si ella me amara otra vez")
+    assert not _is_whisper_hallucination("Como si nadie nunca amara así")
+
+
+def test_real_lyrics_with_word_music_not_flagged():
+    # Folding "[music]" → "music" would flag every lyric containing the
+    # word; the bracket patterns must stay literal.
+    assert not _is_whisper_hallucination("I love music and dancing all night")
+    assert not _is_whisper_hallucination("La música suena fuerte")
+
+
+def test_bracket_music_tags_are_hallucinations():
+    assert _is_whisper_hallucination("[music]")
+    assert _is_whisper_hallucination("[ Music ]")
+    assert _is_whisper_hallucination("♪ music ♪")
+
+
+def test_filter_drops_amara_segment_keeps_lyrics():
+    """End-to-end through _filter_whisper_hallucinations: the outro credit
+    segment is dropped, the real lyrics keep their timing."""
+    segs = [
+        _seg(213.5, 215.0, "Y yo te amaré"),
+        _seg(216.5, 219.0, "Que los viajantes se van a atrasar"),
+        _seg(221.6, 222.0,
+             "Subtítulos realizados por la comunidad de Amara org"),
+    ]
+    out, dropped = _filter_whisper_hallucinations(segs)
+    assert dropped == 1
+    assert [s["text"] for s in out] == [
+        "Y yo te amaré",
+        "Que los viajantes se van a atrasar",
+    ]
 
 
 def test_fetch_lrclib_strips_complex_lrc_timestamps():

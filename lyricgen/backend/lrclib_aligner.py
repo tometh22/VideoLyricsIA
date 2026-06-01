@@ -132,7 +132,11 @@ def _best_span_for_line(
 _HALLUCINATION_MARKERS = (
     "suscríbete", "suscribete", "subscribe",
     "gracias por ver", "thanks for watching",
-    "subtítulos", "subtitles",
+    "subtítulos", "subtitulos", "subtitles",
+    # _normalize folds "Amara.org" → "amara org", so this single marker
+    # catches both the dotted and undotted Whisper transcriptions. Do NOT
+    # add bare "amara" — it's a real Spanish word ("si me amara").
+    "amara org",
     "música", "music",  # standalone, single-word seg
     "¡gracias!", "¡suscríbete!",
 )
