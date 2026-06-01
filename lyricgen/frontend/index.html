@@ -51,6 +51,18 @@
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     <link href="https://fonts.googleapis.com/css2?family=Anton&family=Bebas+Neue&family=Jost:wght@700&family=Montserrat:wght@700;800&family=Outfit:wght@700&family=Oswald:wght@700&family=Poppins:wght@700&family=Roboto:wght@700&display=swap" rel="stylesheet">
+    <!-- 2026-05-30 perf: pre-warm the TCP/TLS connection to the backend
+         BEFORE the React bundle finishes parsing. The first real API
+         call (/auth/me, /usage, /jobs) then skips ~120-300 ms of
+         DNS + TCP + TLS handshake — the browser already has an open
+         connection waiting. Listed for prod + staging hostnames; both
+         are harmless when not in use (the connection is opened
+         optimistically and dropped if no request follows). dns-prefetch
+         is the fallback for browsers that ignore preconnect. -->
+    <link rel="preconnect" href="https://api.genly.pro" crossorigin>
+    <link rel="dns-prefetch" href="https://api.genly.pro">
+    <link rel="preconnect" href="https://api-staging-9b82.up.railway.app" crossorigin>
+    <link rel="dns-prefetch" href="https://api-staging-9b82.up.railway.app">
   </head>
   <body class="min-h-screen">
     <div id="root">

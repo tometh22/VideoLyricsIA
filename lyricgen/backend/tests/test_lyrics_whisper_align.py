@@ -231,6 +231,123 @@ def test_build_segments_min_duration_floor():
 
 
 # ──────────────────────────────────────────────────────────────────────
+# 2026-05-31 — fixes A/B/C for the Agus "Donde Estan Corazón" report.
+# ──────────────────────────────────────────────────────────────────────
+
+
+def test_build_segments_attaches_words_when_available():
+    """Fix A: segments must carry words[] sourced from whisper_words so
+    the editor's karaoke highlight has per-word timing instead of
+    linear interpolation. Pre-fix the function discarded the 300+
+    word_dicts available, leaving editor highlight wildly off when
+    seg.end was tight."""
+    cleaned_lines = ["uno dos", "tres cuatro"]
+    cleaned_tokens = [(0, "uno"), (0, "dos"), (1, "tres"), (1, "cuatro")]
+    cleaned_to_whisper = [0, 1, 2, 3]
+    whisper = [
+        {"word": "uno",    "start": 5.00, "end": 5.20},
+        {"word": "dos",    "start": 5.30, "end": 5.50},
+        {"word": "tres",   "start": 6.00, "end": 6.20},
+        {"word": "cuatro", "start": 6.30, "end": 6.50},
+    ]
+    segs = _build_segments(cleaned_lines, cleaned_tokens, cleaned_to_whisper, whisper, 30.0)
+    assert len(segs) == 2
+    # Each segment now carries its two source words.
+    for s in segs:
+        assert "words" in s and len(s["words"]) == 2
+        for w in s["words"]:
+            assert {"word", "start", "end", "score"} <= set(w.keys())
+            # Whisper-1 confidence placeholder: above beat_snap's
+            # _RELIABLE_WORD_SCORE (0.5) so beat_snap rightly skips
+            # these segments, but below typical forced-align ~0.9.
+            assert 0.5 < w["score"] < 0.9
+
+
+def test_build_segments_omits_words_when_none_overlap():
+    """Edge case for Fix A: a segment built purely from interpolation
+    (no whisper word falls in its window) gets NO `words` key. The
+    editor's fallback (linear interpolation of text) takes over."""
+    # Two lines, but whisper only has words around the second.
+    cleaned_lines = ["intro hum", "real line"]
+    cleaned_tokens = [(1, "real"), (1, "line")]
+    cleaned_to_whisper = [0, 1]
+    whisper = [
+        {"word": "real", "start": 10.0, "end": 10.3},
+        {"word": "line", "start": 10.4, "end": 10.7},
+    ]
+    segs = _build_segments(cleaned_lines, cleaned_tokens, cleaned_to_whisper, whisper, 30.0)
+    # Line 0 is interpolated from the head heuristic; no whisper word
+    # falls inside its [start, end) window → no `words` key.
+    assert "words" not in segs[0]
+    # Line 1 anchored on whisper words → both attached.
+    assert len(segs[1].get("words") or []) == 2
+
+
+def test_build_segments_warns_on_truncated_segment(caplog):
+    """Fix C: a segment whose duration-per-character is below the
+    perceptual floor (70 ms/char) logs a warning so future regressions
+    surface in Sentry breadcrumbs. The bug Agus reported on "Donde
+    Estan Corazón" job 177e8eafb473 had seg[0] at 1.45s for 36 chars
+    = 40 ms/char — below floor."""
+    import logging
+
+    cleaned_lines = ["a dónde fue el pasado que no volverá"]
+    cleaned_tokens = [(0, "donde"), (0, "fue")]
+    cleaned_to_whisper = [0, 1]
+    # Force seg dur ~= 1.5s for 36 chars → 41 ms/char (BELOW the floor).
+    whisper = [
+        {"word": "donde", "start": 16.78, "end": 16.90},
+        {"word": "fue",   "start": 17.00, "end": 17.10},
+    ]
+    with caplog.at_level(logging.WARNING):
+        _build_segments(cleaned_lines, cleaned_tokens, cleaned_to_whisper,
+                        whisper, audio_dur=18.23)
+    # The single segment's [start=16.78, end~=18.23], dur ~= 1.45s,
+    # chars=36 → ~40 ms/char → MUST warn.
+    assert any("truncated" in r.message and "ms/char" in r.message
+               for r in caplog.records)
+
+
+def test_build_segments_no_warning_on_normal_density():
+    """Normal sung delivery (100-150 ms/char) must NOT warn. Pin so a
+    future tightening of the floor doesn't accidentally flag good
+    segments."""
+    import logging
+
+    cleaned_lines = ["a dónde fue el pasado que no volverá"]   # 36 chars
+    cleaned_tokens = [(0, "dónde"), (0, "fue")]
+    cleaned_to_whisper = [0, 1]
+    # Seg dur ~= 4.5s for 36 chars → 125 ms/char (normal sung pace).
+    whisper = [
+        {"word": "dónde", "start": 16.78, "end": 16.95},
+        {"word": "fue",   "start": 17.10, "end": 17.30},
+    ]
+    with caplog_collector() as records:
+        _build_segments(cleaned_lines, cleaned_tokens, cleaned_to_whisper,
+                        whisper, audio_dur=21.28)
+    assert not any("truncated" in r for r in records), \
+        "normal density segment must NOT warn"
+
+
+import contextlib
+@contextlib.contextmanager
+def caplog_collector():
+    """Tiny helper: capture warning messages without depending on
+    pytest's caplog (some tests use plain context managers above)."""
+    import logging
+    out: list[str] = []
+    handler = logging.Handler()
+    handler.emit = lambda r: out.append(r.getMessage())
+    handler.setLevel(logging.WARNING)
+    root = logging.getLogger()
+    root.addHandler(handler)
+    try:
+        yield out
+    finally:
+        root.removeHandler(handler)
+
+
+# ──────────────────────────────────────────────────────────────────────
 # Integration smoke: token+align+build full path on synthetic data.
 # ──────────────────────────────────────────────────────────────────────
 

@@ -95,6 +95,22 @@ export default class GlobalErrorBoundary extends Component {
 
   componentDidCatch(error, info) {
     console.error("[GlobalErrorBoundary] Uncaught error:", error, info);
+    // Surface to Sentry (no-op when VITE_SENTRY_DSN is unset). React's
+    // componentStack is the most useful breadcrumb for debugging an
+    // uncaught render error — Sentry shows it as the "React" frame in
+    // the issue UI.
+    try {
+      // Lazy require to avoid hard-coupling the boundary to Sentry;
+      // observability.js handles the missing-DSN no-op cleanly.
+      import("../observability.js").then((obs) => {
+        obs.captureHandledError?.(error, {
+          source: "GlobalErrorBoundary",
+          componentStack: info?.componentStack,
+        });
+      });
+    } catch {
+      /* never let the boundary itself throw */
+    }
   }
 
   handleReset = () => {

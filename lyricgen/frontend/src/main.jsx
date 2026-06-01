@@ -7,7 +7,15 @@ import GlobalErrorBoundary from "./components/GlobalErrorBoundary";
 import { AlertProvider } from "./components/AlertProvider";
 import { ToastProvider } from "./components/ToastProvider";
 import { HelpProvider } from "./components/HelpCenter/HelpProvider";
+import { initSentry } from "./observability";
+import { registerServiceWorker } from "./registerSW";
 import "./index.css";
+
+// Sentry init runs before React mounts so the SDK is ready to catch
+// any error from the first render. No-op if VITE_SENTRY_DSN is unset
+// (dev or pre-configured deploy) — see observability.js header for
+// the DSN setup walkthrough.
+initSentry();
 
 // QA fix 2026-05-28: post-deploy stale-bundle reload. Cuando Vercel
 // publica un build nuevo, los hashes de los chunks lazy-imported cambian
@@ -36,6 +44,12 @@ window.addEventListener("vite:preloadError", (event) => {
   console.warn("[stale-bundle] vite:preloadError detected, forcing reload", event);
   window.location.reload();
 });
+
+// Service Worker: caches hashed /assets/* for offline / flaky-network
+// resilience. Prod-only, post-load registration — see registerSW.js for
+// the safety contract. The SW never caches HTML or API responses so it
+// can't serve stale builds or leak per-user data.
+registerServiceWorker();
 
 ReactDOM.createRoot(document.getElementById("root")).render(
   <React.StrictMode>

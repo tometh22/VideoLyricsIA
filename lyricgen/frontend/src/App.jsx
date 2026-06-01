@@ -9,10 +9,8 @@ import { fetchWithTimeout } from "./fetchWithTimeout";
 import { uploadFileToR2 } from "./r2Upload";
 import * as wizardPersistence from "./wizardPersistence";
 import LoginPage from "./components/LoginPage";
-import Landing from "./components/Landing";
 import Sidebar from "./components/Sidebar";
 import Dashboard from "./components/Dashboard";
-import HistoryView from "./components/HistoryView";
 import SearchPalette from "./components/SearchPalette";
 import UploadZone from "./components/UploadZone";
 import TitleCardPreview from "./components/TitleCardPreview";
@@ -20,15 +18,24 @@ import TitleCardPreview from "./components/TitleCardPreview";
 // and Settings (~30 KB) lazy-load so the main bundle drops below
 // 500 KB on the first paint. The editor in particular is only entered
 // after the operator decides to review/edit a song — saving its bytes
-// from the cold start shaves seconds on slow networks. JobDetail stays
-// eager because /videos/:id is a high-frequency landing route and the
-// extra chunk fetch would add a perceived "delay" on every video open.
+// from the cold start shaves seconds on slow networks.
+//
+// 2026-05-30 perf: extended the lazy set to Landing (449 lines, only
+// rendered when there's NO token — most operators land already
+// logged in and never need this code), OnboardingTour (452 lines,
+// only fires once per operator), and JobDetail (1772 lines, the
+// single heaviest non-editor component). For JobDetail we tolerate
+// a ~50-100 ms perceived delay on the FIRST /videos/:id open of
+// a session in exchange for a much faster cold start everywhere
+// else; subsequent opens are instant because the chunk is cached.
 const LyricsEditor = lazy(() => import("./components/LyricsEditor"));
 const AdminPanel = lazy(() => import("./components/AdminPanel"));
 const Settings = lazy(() => import("./components/Settings"));
+const Landing = lazy(() => import("./components/Landing"));
+const JobDetail = lazy(() => import("./components/JobDetail"));
+const HistoryView = lazy(() => import("./components/HistoryView"));
 import BatchProgress from "./components/BatchProgress";
 import TranscribingProgress from "./components/TranscribingProgress";
-import JobDetail from "./components/JobDetail";
 import { useAlert } from "./components/AlertProvider";
 import HelpButton from "./components/HelpCenter/HelpButton";
 import { useBackgroundPreview } from "./hooks/useBackgroundPreview";
@@ -400,21 +407,32 @@ function JobDetailRoute({ fetchHistory }) {
   }
   return (
     <div className="flex justify-center">
-      <JobDetail
-        job={job}
-        onBack={() => navigate("/dashboard")}
-        onJobUpdate={(updatedJob) => {
-          // fetchHistory() is the expensive call (lists every job in the
-          // tenant). It only needs to refresh on a status BOUNDARY —
-          // pending_review → editing, editing → pending_review, etc. The
-          // /status poll during editing fires every 5s with progress
-          // updates only; if we ran fetchHistory on each tick we'd hit
-          // /jobs ~150 times during a 13-min edit. Skip those.
-          const statusChanged = job?.status !== updatedJob?.status;
-          setJob(updatedJob);
-          if (statusChanged) fetchHistory();
-        }}
-      />
+      {/* 2026-05-30 perf: JobDetail is lazy-loaded. The Suspense fallback
+          matches the spinner shown when the job is still being fetched,
+          so the visual transition stays continuous. */}
+      <Suspense
+        fallback={
+          <div className="flex items-center justify-center min-h-[50vh]">
+            <div className="w-12 h-12 border-2 border-brand border-t-transparent rounded-full animate-spin" />
+          </div>
+        }
+      >
+        <JobDetail
+          job={job}
+          onBack={() => navigate("/dashboard")}
+          onJobUpdate={(updatedJob) => {
+            // fetchHistory() is the expensive call (lists every job in the
+            // tenant). It only needs to refresh on a status BOUNDARY —
+            // pending_review → editing, editing → pending_review, etc. The
+            // /status poll during editing fires every 5s with progress
+            // updates only; if we ran fetchHistory on each tick we'd hit
+            // /jobs ~150 times during a 13-min edit. Skip those.
+            const statusChanged = job?.status !== updatedJob?.status;
+            setJob(updatedJob);
+            if (statusChanged) fetchHistory();
+          }}
+        />
+      </Suspense>
     </div>
   );
 }
@@ -1279,12 +1297,45 @@ export default function App() {
       // qué content mostrar inline. Antes navegábamos a /review cuando había
       // currentReview/approved, ahora /new lo hace todo via wizardScreen.
       navigate("/new");
+    } catch (err) {
+      // 2026-05-31 hotfix (Agus): si CUALQUIER paso del rehydrate falla
+      // (snapshot de una versión vieja del bundle, JSON corrupto, shape
+      // inválido en File stub, etc.) antes teníamos un try/finally sin
+      // catch — la excepción burbujeaba al GlobalErrorBoundary o se
+      // perdía y dejaba al usuario en `/new` con state vacío SIN alerta.
+      // Síntoma reportado: "puse para generar las lyrics y me apareció
+      // esto" + screenshot de la pantalla de upload vacía.
+      // Ahora limpiamos persistence + state + mostramos alert + redirect
+      // explícito a /new. Sentry breadcrumb para triage futuro.
+      console.error("[wizard] resume failed", err);
+      try {
+        if (typeof window !== "undefined" && window.Sentry?.captureException) {
+          window.Sentry.captureException(err, {
+            tags: { feature: "wizard-resume" },
+            extra: { snapKeys: Object.keys(snap || {}) },
+          });
+        }
+      } catch { /* Sentry path itself must not throw */ }
+      wizardPersistence.clear();
+      setCurrentReview(null);
+      setApprovedJobs([]);
+      setReviewQueue([]);
+      setFiles([]);
+      setResumableWizard(null);
+      setWizardStage("upload");
+      alert({
+        title: t("wizard.resume_failed_title") || "No pudimos retomar tu sesión",
+        description: t("wizard.resume_failed_desc") ||
+          "El estado guardado no es compatible con esta versión. Empezamos limpio.",
+        tone: "warning",
+      });
+      navigate("/new", { replace: true });
     } finally {
       // Defer flag flip past the React commit so the persistence useEffect
       // runs once with the FULLY restored state and writes a fresh snapshot.
       setTimeout(() => { restoringRef.current = false; }, 0);
     }
-  }, [navigate]);
+  }, [navigate, alert, t]);
 
   const discardResumable = useCallback(() => {
     wizardPersistence.clear();
@@ -1375,6 +1426,18 @@ export default function App() {
     // 401 or — worse, if the token is still inside its 5 min TTL —
     // serve User A's content for ~5 min.
     try { clearMediaCache(); } catch { /* */ }
+
+    // 2026-05-30 perf: drop the previous operator's cached /usage
+    // payload — same logic as clearMediaCache: User B should never
+    // briefly see User A's quota counter on the same machine, even
+    // if the badge re-fetches a moment later. We can't enumerate
+    // localStorage entries safely here, so we wipe by known prefix.
+    try {
+      for (let i = localStorage.length - 1; i >= 0; i--) {
+        const k = localStorage.key(i);
+        if (k && k.startsWith("cache:usage:")) localStorage.removeItem(k);
+      }
+    } catch { /* */ }
 
     // React state. Reset every collection that holds user-derived
     // content; keep purely-UX state (sidebar, theme) alone.
@@ -3302,7 +3365,24 @@ export default function App() {
             // `currentReview.file` es null (el File del upload no se
             // restaura desde R2) y la key/filename caen al campo
             // `filename` que el resume handler popula del job DB.
-            key={`${currentReview.file?.name || currentReview.filename || "resume"}:${currentReview.queueIdx}`}
+            //
+            // 2026-05-31 (Agus batch upload bug): the previous key was
+            // `filename:queueIdx`. In batch upload, when two songs are
+            // queued at consecutive indices and `currentReview` is
+            // swapped between them, the queueIdx changes but the
+            // filename can transiently match (early state where the new
+            // job's filename hasn't propagated yet), or the editor
+            // remounts to the wrong song if both queue entries point at
+            // the same R2 upload. Including `transcribeJobId` makes the
+            // key identity-stable per backend job — the only correct
+            // notion of "what song is this". Confirmed against the live
+            // DB: job 82a5a8ab547e ("Donde Estan Corazón",
+            // segments_json=null) was shown with the segments of job
+            // 9df1132f6169 ("Luz de día") that preceded it in the same
+            // session. With the jobId in the key, that swap forces an
+            // unmount and `edited` re-seeds from the new (empty/loading)
+            // segments instead of pinning the previous song's text.
+            key={`${currentReview.transcribeJobId || "no-job"}:${currentReview.file?.name || currentReview.filename || "resume"}:${currentReview.queueIdx}`}
             // QA fix 2026-05-28 (scroll architecture): pre-fix usaba 72 para
             // clear el top bar de App porque el editor scrolleaba con el
             // page-scroll y el sticky-top-72 ponía el audio bar JUSTO
@@ -3484,11 +3564,19 @@ export default function App() {
           element={
             token
               ? <Navigate to="/dashboard" replace />
-              : <Landing
-                  onStart={() => navigate("/login")}
-                  onLogin={() => navigate("/login")}
-                  isLoggedIn={false}
-                />
+              : (
+                /* 2026-05-30 perf: Landing is lazy. Suspense fallback is
+                   null because the landing render itself is the page —
+                   showing a "loading…" flicker would feel worse than a
+                   blank ~80 ms while the chunk parses. */
+                <Suspense fallback={null}>
+                  <Landing
+                    onStart={() => navigate("/login")}
+                    onLogin={() => navigate("/login")}
+                    isLoggedIn={false}
+                  />
+                </Suspense>
+              )
           }
         />
         <Route
@@ -3560,16 +3648,18 @@ export default function App() {
           <Route path="/review" element={wizardScreen} />
           <Route path="/generating" element={generatingScreen} />
           <Route path="/videos" element={
-            <HistoryView
-              history={history}
-              historyError={historyError}
-              historyLoaded={historyLoaded}
-              onRetryHistory={fetchHistory}
-              onSelect={handleSelectJob}
-              onDelete={handleDeleteJob}
-              onBulkDelete={handleBulkDeleteJobs}
-              onBack={() => navigate("/dashboard")}
-            />
+            <Suspense fallback={<RouteSuspenseFallback />}>
+              <HistoryView
+                history={history}
+                historyError={historyError}
+                historyLoaded={historyLoaded}
+                onRetryHistory={fetchHistory}
+                onSelect={handleSelectJob}
+                onDelete={handleDeleteJob}
+                onBulkDelete={handleBulkDeleteJobs}
+                onBack={() => navigate("/dashboard")}
+              />
+            </Suspense>
           } />
           <Route path="/videos/:id" element={<JobDetailRoute fetchHistory={fetchHistory} />} />
           {/* Post-render edit: monta el mismo Studio Console que /new,

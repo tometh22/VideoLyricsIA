@@ -209,6 +209,24 @@ def _dp_align_tokens(
     return cleaned_to_whisper
 
 
+# 2026-05-31 (Agus "Donde Estan Corazón" report).
+#
+# Fix C constant: any segment whose duration-per-character drops below
+# this floor is logged as suspicious. Singers do 80-150 ms/char in
+# steady delivery; <70 ms/char is essentially "this line was clamped
+# tight against the next one and the end got truncated", which the
+# operator reads as "first line starts before the vocal".
+_TRUNCATED_MS_PER_CHAR_FLOOR = 70
+
+# Fix A: per-word `score` placeholder for Whisper-1 word stamps. The
+# downstream consumer that matters is `beat_snap._has_reliable_words`
+# (threshold 0.5). Whisper-1 word onsets are accurate enough that we
+# DO want beat_snap to skip these segments (snapping pulls them off
+# the singer's actual entry). 0.6 sits comfortably above the
+# threshold without overclaiming forced-align-grade confidence.
+_WHISPER1_WORD_SCORE = 0.6
+
+
 def _build_segments(
     cleaned_lines: list[str],
     cleaned_tokens: list[tuple[int, str]],
@@ -218,12 +236,31 @@ def _build_segments(
 ) -> list[dict]:
     """Per cleaned line, pick `start` from its first acoustically-matched
     token. Unanchored lines fill via linear interpolation between
-    anchored neighbours."""
+    anchored neighbours.
+
+    Each returned segment carries:
+      - start, end, text  (always)
+      - words[] from the Whisper-1 word stream that fall in [start,end)
+        (added 2026-05-31 — before this, `_build_segments` discarded
+        the 300+ word_dicts available, leaving the editor to
+        linearly-interpolate the karaoke highlight from `text`. With
+        sub-second segments that produced a noticeably wrong
+        per-word cadence.)
+    """
     n_lines = len(cleaned_lines)
 
     def _wstart(idx: int) -> float:
         w = whisper_words[idx]
         return float(w.get("start") if isinstance(w, dict) else w.start)
+
+    def _wend(idx: int) -> float:
+        w = whisper_words[idx]
+        return float(w.get("end") if isinstance(w, dict) else w.end)
+
+    def _wtext(idx: int) -> str:
+        w = whisper_words[idx]
+        raw = w.get("word") if isinstance(w, dict) else getattr(w, "word", None)
+        return (raw or "").strip()
 
     # Per line: first matched cleaned-token's whisper start.
     line_start: list[Optional[float]] = [None] * n_lines
@@ -236,6 +273,15 @@ def _build_segments(
         return []
 
     # Interpolate head (before first anchor).
+    #
+    # NOTE 2026-05-31 evening: tried using `_wstart(0)` (first whisper
+    # word's onset) instead of the fixed `first_t - first_ai*1.5`. On
+    # the "Donde Estan Corazón" stem-isolated audio, the first whisper
+    # word turned out to be an intro ad-lib/breath that Whisper picked
+    # up at 8.25 s — but the actual first sung line started at 12 s.
+    # The "smarter" head heuristic shifted seg[0] 3.8 s EARLY (worse
+    # than the original 1.5 s/line constant). Reverted: the simpler
+    # heuristic is empirically the lower-error choice on real audio.
     first_ai = anchored[0]
     if first_ai > 0:
         first_t = line_start[first_ai]
@@ -277,6 +323,58 @@ def _build_segments(
             end = max(start + MIN_SEG_DUR_S, audio_dur)
         end = min(end, audio_dur)
         segments.append({"start": start, "end": end, "text": line})
+
+    # ─── Fix A (2026-05-31): persist per-segment word stamps ────────────
+    # Bucket whisper words into each segment's [start, end] window
+    # (greedy + monotonic — whisper words are already in time order so
+    # one pass suffices). Each segment ends up with a `words` list that
+    # the editor's karaoke highlight uses for accurate per-word timing.
+    # When no words fall inside (rare: instrumental gap, segment built
+    # purely from interpolation), the key is omitted — the editor's
+    # fallback (linear interpolation of text within [start, end]) still
+    # works.
+    word_idx = 0
+    for seg in segments:
+        bucket: list[dict] = []
+        seg_start = seg["start"]
+        seg_end = seg["end"]
+        while word_idx < len(whisper_words):
+            ws = _wstart(word_idx)
+            we = _wend(word_idx)
+            # Done with this segment — peek next word, advance later.
+            if ws >= seg_end:
+                break
+            # Include if there's any overlap with [seg_start, seg_end).
+            if we > seg_start:
+                bucket.append({
+                    "word": _wtext(word_idx),
+                    "start": ws,
+                    "end": we,
+                    "score": _WHISPER1_WORD_SCORE,
+                })
+            word_idx += 1
+        if bucket:
+            seg["words"] = bucket
+
+    # ─── Fix C (2026-05-31): flag suspiciously truncated segments ───────
+    # Log warning on segments whose duration-per-character ratio is
+    # below the perceptual floor for sung delivery. Operator-visible
+    # symptom: "the first line shows before the singer enters". This
+    # logs ONE warning per offending segment so future jobs surface
+    # the same root cause in Sentry breadcrumbs.
+    for i, seg in enumerate(segments):
+        chars = len((seg.get("text") or "").strip())
+        if chars <= 0:
+            continue
+        dur = seg["end"] - seg["start"]
+        ms_per_char = (1000.0 * dur) / chars
+        if ms_per_char < _TRUNCATED_MS_PER_CHAR_FLOOR:
+            logger.warning(
+                "[WC] segment %d truncated: start=%.2fs end=%.2fs dur=%.2fs "
+                "chars=%d → %.1f ms/char (floor=%d ms/char) text=%r",
+                i, seg["start"], seg["end"], dur, chars, ms_per_char,
+                _TRUNCATED_MS_PER_CHAR_FLOOR, (seg.get("text") or "")[:60],
+            )
 
     return segments
 
@@ -438,6 +536,17 @@ def whisper_word_align(
                 os.unlink(api_path)
             except OSError:
                 pass
+
+
+# NOTE 2026-05-31 evening: `align_lines_to_words` + `flatten_whisperx_words`
+# were tried as a "Fix D" — use whisperX forced-align words directly when
+# `whisperx_reconcile` aborts, skipping the Whisper-1 re-call. Local E2E
+# against the operator's "Donde Estan Corazón" stem-isolated audio showed
+# the resulting line timings to be ~250 ms WORSE on average than the
+# existing Whisper-1 path (mean |err| 642 vs 305 ms when compared against
+# ground-truth onsets the operator timed by ear). Reverted; the
+# Whisper-1 path stays as-is. The unit-test-only contracts for those two
+# helpers were also removed.
 
 
 __all__ = [
