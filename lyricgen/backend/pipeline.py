@@ -1248,36 +1248,58 @@ _SPAM_PATTERNS = [
 # These are NOT YouTube uploader chatter (above) — they're outputs that
 # come straight from training data leakage. Tight match because we want
 # zero false positives on real lyrics.
-_WHISPER_HALLUCINATIONS = [
-    "subtitulos realizados por la comunidad de amara.org",
-    "subtitled by the amara.org community",
-    "subtitles by the amara.org community",
-    "subtitling by the amara.org community",
+#
+# Phrases here are matched PUNCTUATION-INSENSITIVELY (both sides folded
+# to lowercase ASCII words separated by single spaces). Whisper does not
+# always transcribe the dot in "Amara.org" — the Lamento Boliviano
+# regression (2026-06-01) emitted "…comunidad de Amara org", which the
+# old literal "amara.org" needles never matched. Store needles already
+# in folded form: no dots, no colons, single spaces.
+_WHISPER_HALLUCINATION_PHRASES = [
+    "subtitulos realizados por la comunidad",  # …de Amara org / Amara.org / (nothing)
+    "realizados por la comunidad de amara",
+    "subtitled by the amara org community",
+    "subtitles by the amara org community",
+    "subtitling by the amara org community",
     "transcribed by amara",
-    "amara.org",  # short form catches "Visit amara.org"
+    "amara org",  # folded "amara.org" — also catches "Visit amara.org"
     "subtitles created by",
-    "subtitles by:",
+    "subtitles by",
     "subtitulado por",
     "transcripcion por",
+]
+
+# Patterns where the punctuation IS the signal — folding them would
+# leave a bare word ("music") that appears in real lyrics. Matched
+# literally against the lowercased raw text instead.
+_WHISPER_HALLUCINATION_LITERALS = [
     "♪ music ♪",
     "[ music ]",
     "[music]",
 ]
 
 
+def _fold_for_hallucination_match(text: str) -> str:
+    """Lowercase ASCII fold + replace every non-alphanumeric run with a
+    single space. "Subtítulos … de Amara.org", "…de Amara org" and
+    "…de Amara. org" all fold to the same string."""
+    import unicodedata as _u
+    s = _u.normalize("NFD", text or "").encode("ascii", "ignore").decode("ascii").lower()
+    return " ".join(re.sub(r"[^a-z0-9]+", " ", s).split())
+
+
 def _is_whisper_hallucination(text: str) -> bool:
     """True if the segment text matches a known Whisper training-data
-    hallucination. Match is case- and accent-insensitive but does NOT
-    use loose substring matching — we compare a normalized string."""
+    hallucination. Match is case-, accent- and punctuation-insensitive
+    for word phrases; symbol patterns ("[music]") match literally."""
     if not text:
         return False
-    s = _normalize_token(text) if "_normalize_token" in globals() else text.lower().strip()
-    # Direct lower-ASCII compare for the denylist (defensive: we don't
-    # rely on _normalize_token having been hoisted yet at module load).
-    import unicodedata as _u
-    s = _u.normalize("NFD", text or "").encode("ascii", "ignore").decode("ascii").lower().strip()
-    s = " ".join(s.split())  # collapse whitespace
-    for needle in _WHISPER_HALLUCINATIONS:
+    raw = " ".join(text.lower().split())
+    for needle in _WHISPER_HALLUCINATION_LITERALS:
+        if needle in raw:
+            return True
+    s = _fold_for_hallucination_match(text)
+    for needle in _WHISPER_HALLUCINATION_PHRASES:
         if needle in s:
             return True
     return False

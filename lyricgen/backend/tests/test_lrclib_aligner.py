@@ -119,6 +119,17 @@ def test_is_hallucination_catches_known_outros():
     assert not _is_hallucination("oh oh oh")
 
 
+def test_is_hallucination_catches_amara_credit_variants():
+    # Lamento Boliviano regression (2026-06-01): Whisper wrote the Amara
+    # credit without the dot AND without the accent in "Subtitulos".
+    # _normalize folds "Amara.org" → "amara org", so one marker covers both.
+    assert _is_hallucination("Subtítulos realizados por la comunidad de Amara org")
+    assert _is_hallucination("Subtitulos realizados por la comunidad de Amara org")
+    assert _is_hallucination("Subtitulos realizados por la comunidad de Amara.org")
+    # Bare "amara" is a real Spanish word — must NOT be flagged.
+    assert not _is_hallucination("si ella me amara otra vez")
+
+
 def test_normalize_strips_punctuation_and_lowercases():
     assert _normalize("Hola, mundo!") == "hola mundo"
     assert _normalize("¡QUÉ?") == "qué"
