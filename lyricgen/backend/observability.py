@@ -20,21 +20,90 @@ ENV = (os.environ.get("ENVIRONMENT")
 LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO").upper()
 
 
+def _resolve_release() -> str:
+    """Release tag attached to every Sentry event so a spike can be
+    correlated to the exact deploy that introduced it.
+
+    Precedence:
+      1. SENTRY_RELEASE — explicit operator override.
+      2. RAILWAY_GIT_COMMIT_SHA — injected by Railway on every build,
+         so API and Worker events are tagged with the commit they run.
+      3. Static fallback so events are never untagged (matches the old
+         hard-coded value from main.py's pre-reconcile init).
+    """
+    return (os.environ.get("SENTRY_RELEASE", "").strip()
+            or os.environ.get("RAILWAY_GIT_COMMIT_SHA", "").strip()
+            or "genly@2.0.0")
+
+
 def init_sentry():
+    """Initialize Sentry for ANY GenLy process (API or RQ worker).
+
+    Single source of truth (2026-06-01 UMG-launch hardening): main.py
+    used to carry its own inline `sentry_sdk.init(...)` with the rich
+    integration list, then call this function — and because the SDK
+    keeps only the LAST init, this lighter config silently overrode the
+    good one (no release tag, no SQLAlchemy tracing). All integrations
+    now live here; main.py and worker.py just call init_sentry().
+
+    Every integration import is guarded so the function stays a no-op
+    when a dependency is missing (e.g. rq not installed in a tooling
+    venv) — per the module contract, observability must never be the
+    reason a process fails to start.
+    """
     if not SENTRY_DSN:
         return
     try:
         import sentry_sdk
-        from sentry_sdk.integrations.fastapi import FastApiIntegration
+
+        integrations = []
+        # API-side integrations: FastAPI/Starlette name every transaction
+        # by route template; SQLAlchemy adds child spans per query. See
+        # 2026-05-27 Wave-0 observability audit (UMG perf complaint).
+        try:
+            from sentry_sdk.integrations.fastapi import FastApiIntegration
+            from sentry_sdk.integrations.starlette import StarletteIntegration
+            integrations.extend([
+                FastApiIntegration(transaction_style="endpoint"),
+                StarletteIntegration(transaction_style="endpoint"),
+            ])
+        except ImportError:
+            pass
+        try:
+            from sentry_sdk.integrations.sqlalchemy import SqlalchemyIntegration
+            integrations.append(SqlalchemyIntegration())
+        except ImportError:
+            pass
+        # Worker-side integration: RQ tags every job exception with the
+        # RQ job id and captures it even when the failure path never
+        # reaches our own callbacks (SIGKILL, OOM, serialization errors).
+        # Harmless on the API process — it only activates inside an RQ
+        # worker loop.
+        try:
+            from sentry_sdk.integrations.rq import RqIntegration
+            integrations.append(RqIntegration())
+        except ImportError:
+            pass
+
         sentry_sdk.init(
             dsn=SENTRY_DSN,
-            environment=ENV,
-            traces_sample_rate=0.1,
-            profiles_sample_rate=0.0,
+            traces_sample_rate=float(os.environ.get("SENTRY_TRACES_RATE", "0.1")),
+            # profiles_sample_rate off by default (0.0). Flip to 0.05-0.1
+            # temporarily when investigating CPU hotspots — profiling adds
+            # measurable overhead to each sampled request.
+            profiles_sample_rate=float(os.environ.get("SENTRY_PROFILES_RATE", "0.0")),
+            # send_default_pii=False keeps email/IP out of Sentry events
+            # (UMG-grade compliance). When debugging specific operators we
+            # call sentry_sdk.set_user explicitly to attach just tenant_id.
             send_default_pii=False,
-            integrations=[FastApiIntegration()],
+            integrations=integrations,
+            # SENTRY_ENV overrides the resolved ENV only if explicitly set
+            # (back-compat with the pre-reconcile main.py behavior).
+            environment=os.environ.get("SENTRY_ENV") or ENV,
+            release=_resolve_release(),
         )
-        print("[OBS] Sentry initialized")
+        print(f"[OBS] Sentry initialized (release={_resolve_release()}, "
+              f"integrations={len(integrations)})")
         # Forward urllib3 connection-pool warnings to Sentry as
         # explicit events. Sentry's default logging integration only
         # captures ERROR+ — but "Connection pool is full, discarding
@@ -382,5 +451,9 @@ def health_snapshot() -> dict:
         "vertex": bool(os.environ.get("VERTEX_PROJECT", "").strip()),
         "gemini": bool(os.environ.get("GEMINI_API_KEY", "").strip())
                   or bool(os.environ.get("VERTEX_PROJECT", "").strip()),
+        # Sentry DSN presence — lets the launch preflight verify error
+        # tracking is actually configured on the deployed instance
+        # without sending a test event.
+        "sentry": bool(SENTRY_DSN),
     }
     return snap

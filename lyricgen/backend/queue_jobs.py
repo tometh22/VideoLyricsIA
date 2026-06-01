@@ -154,6 +154,50 @@ def _pick_queue(plan: str, tenant_id: str = ""):
     return q_default
 
 
+def _capture_job_failure(layer: str, job_id_db: str, type_, value) -> None:
+    """Send a tagged Sentry event for a permanently-failed RQ job.
+
+    Failure callbacks are the chokepoint where EVERY exhausted job lands
+    (worker death, OOM, real pipeline exceptions), so this is the one
+    place that guarantees a job failure reaches Sentry tagged with our
+    Postgres job_id + tenant_id — RqIntegration tags by RQ job id only,
+    which is not what operators search by during an incident.
+
+    Best-effort by contract: any exception here is swallowed so the
+    callback's real work (flipping the DB row to a terminal error state)
+    is never compromised by observability.
+    """
+    try:
+        import sentry_sdk
+        with sentry_sdk.push_scope() as scope:
+            scope.set_tag("event", f"{layer}.job_failed")
+            scope.set_tag("layer", layer)
+            scope.set_tag("job_id", job_id_db or "?")
+            # tenant_id best-effort: a failed UMG job and a failed free-tier
+            # job have very different incident severity.
+            try:
+                from database import SessionLocal, Job
+                _s = SessionLocal()
+                try:
+                    row = _s.query(Job).filter(Job.job_id == job_id_db).first()
+                    if row is not None and row.tenant_id:
+                        scope.set_tag("tenant_id", row.tenant_id)
+                finally:
+                    _s.close()
+            except Exception:
+                pass
+            if value is not None and isinstance(value, BaseException):
+                sentry_sdk.capture_exception(value)
+            else:
+                sentry_sdk.capture_message(
+                    f"[{layer}] job {job_id_db} failed: "
+                    f"{type_.__name__ if type_ else 'unknown'}",
+                    level="error",
+                )
+    except Exception:  # pragma: no cover
+        pass
+
+
 def transcription_failure_callback(job, connection, type_, value, traceback) -> None:
     """RQ on_failure hook for `run_transcription_job`. Mirrors
     `pipeline_failure_callback` but writes the transcription-specific
@@ -185,6 +229,10 @@ def transcription_failure_callback(job, connection, type_, value, traceback) -> 
             job_id_db = rq_job_id
         if not job_id_db:
             return
+        # Surface to Sentry BEFORE touching the DB — this hook also covers
+        # the SIGKILL case where transcription_worker's in-process capture
+        # never got the chance to run.
+        _capture_job_failure("transcription", job_id_db, type_, value)
         is_abandoned = "AbandonedJobError" in (type_.__name__ if type_ else "")
         if is_abandoned:
             err_msg = (
@@ -237,6 +285,9 @@ def pipeline_failure_callback(job, connection, type_, value, traceback) -> None:
         rq_job_id = getattr(job, "id", None) or ""
         if not rq_job_id:
             return
+        # Surface to Sentry tagged with job/tenant — a permanently-dead
+        # render is always incident-worthy, doubly so for a B2B tenant.
+        _capture_job_failure("render_pipeline", rq_job_id, type_, value)
         is_abandoned = "AbandonedJobError" in (type_.__name__ if type_ else "")
         if is_abandoned:
             err_msg = (
@@ -678,6 +729,8 @@ def edit_failure_callback(job, connection, type_, value, traceback) -> None:
         rq_job_id = edit_id[len("edit:"):] if edit_id.startswith("edit:") else edit_id
         if not rq_job_id:
             return
+        # Surface to Sentry tagged with job/tenant before the DB write.
+        _capture_job_failure("edit", rq_job_id, type_, value)
         is_abandoned = "AbandonedJobError" in (type_.__name__ if type_ else "")
         if is_abandoned:
             err_msg = (

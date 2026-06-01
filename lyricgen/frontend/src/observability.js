@@ -54,8 +54,11 @@ export function initSentry() {
       // incidents to the affected operator without leaking emails.
       sendDefaultPii: false,
       // Tag every event with the current release so we can correlate
-      // a spike to a specific deploy. Vercel exposes the commit SHA
-      // as VERCEL_GIT_COMMIT_SHA at build time.
+      // a spike to a specific deploy. Vercel exposes the commit SHA as
+      // VERCEL_GIT_COMMIT_SHA at build time, but Vite only inlines
+      // VITE_*-prefixed vars — the `build` script in package.json maps
+      // it into VITE_RELEASE (UMG-launch hardening 2026-06-01; before
+      // that, prod events were never release-tagged).
       release: import.meta.env?.VITE_RELEASE
         || import.meta.env?.VITE_COMMIT_SHA
         || undefined,

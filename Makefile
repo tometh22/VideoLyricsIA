@@ -49,6 +49,31 @@ install-hooks:
 	git config core.hooksPath .githooks
 	@echo "✓ hooks installed — 'make check' now runs on every push"
 
+# ---------------------------------------------------------------------------
+# UMG-launch readiness (scripts/preflight/check_launch_readiness.py)
+#
+# Read-only checks against a deployed environment. Required env:
+#   STAGING_API_URL / PROD_API_URL  base URL of the API to probe
+# Optional (checks degrade to SKIPPED without them):
+#   PREFLIGHT_USERNAME/PASSWORD  admin account (queue_healthy, presigned_expiry)
+#   UMG_USERNAMES                comma-separated launch operator usernames
+#   DATABASE_URL                 enables the per-user quota audit
+#   R2_PROBE_URL                 any presigned R2 URL (r2_not_public probe)
+#   EXPECTED_WORKERS             min live workers (default 7)
+#
+#   make preflight-staging   → run everything against staging
+#   make preflight-prod      → same checks against prod (still read-only)
+# ---------------------------------------------------------------------------
+.PHONY: preflight-staging preflight-prod
+
+preflight-staging:
+	@test -n "$$STAGING_API_URL" || { echo "✗ STAGING_API_URL not set"; exit 1; }
+	cd $(BACKEND) && $(PY) -m scripts.preflight.run --launch --api-url "$$STAGING_API_URL"
+
+preflight-prod:
+	@test -n "$$PROD_API_URL" || { echo "✗ PROD_API_URL not set"; exit 1; }
+	cd $(BACKEND) && $(PY) -m scripts.preflight.run --launch --api-url "$$PROD_API_URL"
+
 # Black-box cross-tenant isolation pen-test (staging only). Needs two
 # accounts in DIFFERENT tenants (PENTEST_A_*/PENTEST_B_*) + optional A2 in
 # A's tenant. Refuses to run against prod hosts unless --force is passed.
