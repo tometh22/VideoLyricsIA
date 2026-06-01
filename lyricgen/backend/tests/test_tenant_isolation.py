@@ -179,3 +179,61 @@ def test_two_users_same_tenant_share_jobs(client):
     assert status_y.status_code == 200, (
         "teammate in same tenant should be able to read status"
     )
+
+
+# ---------------------------------------------------------------------------
+# get_job() contract (UMG-launch hardening 2026-06-01)
+# ---------------------------------------------------------------------------
+
+def test_get_job_scope_filters_are_keyword_only():
+    """tenant_id/user_id are keyword-only so a future positional call
+    can't silently pass the tenant into the wrong slot. A positional
+    third argument must raise TypeError at call time."""
+    import pytest
+    from jobs import get_job
+
+    db = SessionLocal()
+    try:
+        with pytest.raises(TypeError):
+            get_job(db, "any_job_id", "tenant_alpha")  # positional scope → reject
+    finally:
+        db.close()
+
+
+def test_get_job_unscoped_call_logs_warning(caplog):
+    """An unscoped get_job() (no tenant_id, no user_id) is a global
+    lookup — legitimate only for admin/internal paths, which should use
+    get_job_model() instead. We don't raise (would break admin paths)
+    but we log loudly so a missing tenant filter shows up in review."""
+    import logging
+    from jobs import get_job
+
+    db = SessionLocal()
+    try:
+        with caplog.at_level(logging.WARNING, logger="genly.jobs"):
+            get_job(db, "job_that_does_not_exist")
+        warnings = [r for r in caplog.records
+                    if "without tenant/user scope" in r.getMessage()]
+        assert warnings, "unscoped get_job() must log a warning"
+    finally:
+        db.close()
+
+
+def test_get_job_scoped_call_does_not_log_warning(caplog):
+    """The standard endpoint pattern (tenant_id passed) must stay silent —
+    the warning is only for unscoped calls."""
+    import logging
+    from jobs import get_job
+
+    db = SessionLocal()
+    try:
+        user_a, _ = _make_user(db, "tenant_scoped_ok", "scoped")
+        job_a = _seed_job(db, "tenant_scoped_ok", user_a.id)
+        with caplog.at_level(logging.WARNING, logger="genly.jobs"):
+            found = get_job(db, job_a, tenant_id="tenant_scoped_ok")
+        assert found is not None
+        warnings = [r for r in caplog.records
+                    if "without tenant/user scope" in r.getMessage()]
+        assert not warnings, "scoped get_job() must not warn"
+    finally:
+        db.close()

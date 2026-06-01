@@ -793,3 +793,97 @@ def test_revert_abandoned_edit_cancels_rq_entry(monkeypatch):
     finally:
         _cleanup(db)
         db.close()
+
+
+# ---------------------------------------------------------------------------
+# Sentry visibility (UMG-launch hardening 2026-06-01)
+# ---------------------------------------------------------------------------
+
+def test_sentry_capture_emits_error_event_per_reaped_batch(monkeypatch):
+    """Every reaped batch must surface as a Sentry ERROR event tagged
+    `reaper.killed` — stuck jobs being killed silently is exactly the
+    kind of incident operators need to see live during a launch."""
+    import sys
+    import types
+    from contextlib import contextmanager
+    from reaper import _sentry_capture
+
+    captured = {"messages": [], "tags": {}}
+
+    fake = types.ModuleType("sentry_sdk")
+
+    class _Scope:
+        def set_tag(self, k, v):
+            captured["tags"][k] = v
+
+        def set_extra(self, k, v):
+            captured.setdefault("extras", {})[k] = v
+
+    @contextmanager
+    def push_scope():
+        yield _Scope()
+
+    fake.push_scope = push_scope
+    fake.capture_message = lambda msg, level="info": captured["messages"].append((msg, level))
+    fake.capture_exception = lambda *a, **kw: None
+    monkeypatch.setitem(sys.modules, "sentry_sdk", fake)
+
+    db = SessionLocal()
+    try:
+        _cleanup(db)
+        jid = _seed(db, status="processing", age_minutes=200)
+        row = db.query(Job).filter(Job.job_id == jid).first()
+        _sentry_capture([row])
+    finally:
+        _cleanup(db)
+        db.close()
+
+    assert len(captured["messages"]) == 1
+    msg, level = captured["messages"][0]
+    assert level == "error"
+    assert "1 stuck job" in msg
+    assert captured["tags"].get("event") == "reaper.killed"
+    assert "tenant_reap_test" in msg, "tenant must be visible in the alert title"
+
+
+def test_sentry_capture_never_raises_when_sdk_is_broken(monkeypatch):
+    """Best-effort contract: a broken sentry_sdk must never kill the
+    reaper sweep that calls _sentry_capture."""
+    import sys
+    import types
+    from reaper import _sentry_capture
+
+    broken = types.ModuleType("sentry_sdk")
+
+    def _boom(*a, **kw):
+        raise RuntimeError("sentry down")
+
+    broken.push_scope = _boom
+    broken.capture_message = _boom
+    broken.capture_exception = _boom
+    monkeypatch.setitem(sys.modules, "sentry_sdk", broken)
+
+    db = SessionLocal()
+    try:
+        _cleanup(db)
+        jid = _seed(db, status="processing", age_minutes=200)
+        row = db.query(Job).filter(Job.job_id == jid).first()
+        _sentry_capture([row])  # must not raise
+    finally:
+        _cleanup(db)
+        db.close()
+
+
+def test_sentry_capture_noop_on_empty_batch(monkeypatch):
+    """No reaped jobs → no Sentry noise."""
+    import sys
+    import types
+    from reaper import _sentry_capture
+
+    fake = types.ModuleType("sentry_sdk")
+    fake.capture_message = lambda *a, **kw: (_ for _ in ()).throw(
+        AssertionError("capture_message must not be called for empty batch")
+    )
+    monkeypatch.setitem(sys.modules, "sentry_sdk", fake)
+
+    _sentry_capture([])  # must not raise nor capture
