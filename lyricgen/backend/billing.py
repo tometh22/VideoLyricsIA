@@ -175,7 +175,8 @@ async def change_plan(
     # end is the Fase-2 enhancement.)
     from auth import get_plan_usage
     _usage = get_plan_usage(
-        db, user.id, current_user["tenant_id"], current_user.get("plan", "100")
+        db, user.id, current_user["tenant_id"], current_user.get("plan", "100"),
+        billing_group=current_user.get("billing_group"),
     )
     _target_limit = plan.get("limit", 0)
     if not user.allow_overage and _usage["used"] > _target_limit:

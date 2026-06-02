@@ -1634,6 +1634,7 @@ async def usage(current_user: dict = Depends(get_current_user), db: Session = De
         ttl_s=30,
         compute=lambda: get_plan_usage(
             db, current_user["id"], current_user["tenant_id"], current_user.get("plan", "100"),
+            billing_group=current_user.get("billing_group"),
         ),
     )
 
@@ -2032,7 +2033,8 @@ def _enforce_plan_quota(db: Session, current_user: dict) -> None:
     plan = current_user.get("plan", "100")
     tenant_id = current_user["tenant_id"]
     _lock_user_for_quota(db, current_user["id"])
-    usage = get_plan_usage(db, current_user["id"], tenant_id, plan)
+    usage = get_plan_usage(db, current_user["id"], tenant_id, plan,
+                           billing_group=current_user.get("billing_group"))
     if plan != "unlimited" and usage["percent"] >= 80:
         _try_send_usage_alert(db, current_user, usage)
     if usage["remaining"] <= 0 and plan != "unlimited":
@@ -3615,7 +3617,8 @@ async def upload(
             raise HTTPException(status_code=403, detail="AI tool usage not authorized. Contact admin for approval.")
 
     # Check plan limits
-    usage_info = get_plan_usage(db, current_user["id"], current_user["tenant_id"], current_user.get("plan", "100"))
+    usage_info = get_plan_usage(db, current_user["id"], current_user["tenant_id"], current_user.get("plan", "100"),
+                                billing_group=current_user.get("billing_group"))
     if usage_info["alert_100"] and current_user.get("plan") == "free":
         raise HTTPException(status_code=429, detail="Free plan limit reached. Upgrade to continue.")
 
@@ -5948,7 +5951,8 @@ async def generate_with_segments(
     umg_spec = _parse_umg_params(delivery_profile, umg_frame_size, umg_fps, umg_prores_profile, current_user=current_user)
 
     # Check plan limits
-    usage_info = get_plan_usage(db, current_user["id"], current_user["tenant_id"], current_user.get("plan", "100"))
+    usage_info = get_plan_usage(db, current_user["id"], current_user["tenant_id"], current_user.get("plan", "100"),
+                                billing_group=current_user.get("billing_group"))
     if usage_info["alert_100"] and current_user.get("plan") == "free":
         raise HTTPException(status_code=429, detail="Free plan limit reached. Upgrade to continue.")
 
@@ -8970,7 +8974,8 @@ async def create_variant(
     # Plan capacity check — misma lógica que /generate. Variante cuenta
     # como 1 video del plan.
     plan = current_user.get("plan", "100")
-    usage_info = get_plan_usage(db, current_user["id"], current_user["tenant_id"], plan)
+    usage_info = get_plan_usage(db, current_user["id"], current_user["tenant_id"], plan,
+                                billing_group=current_user.get("billing_group"))
     if usage_info["alert_100"] and plan == "free":
         raise HTTPException(
             status_code=429,

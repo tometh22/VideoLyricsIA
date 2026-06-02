@@ -581,6 +581,9 @@ async def get_current_user(
         "role": user.role,
         "tenant_id": user.tenant_id,
         "plan": user.plan_id,
+        # Cuenta de facturación compartida entre tenants (None = cuota por
+        # tenant). Lo lee _enforce_plan_quota y el endpoint /usage.
+        "billing_group": getattr(user, "billing_group", None),
         "allow_overage": getattr(user, "allow_overage", False) or False,
         "stripe_customer_id": user.stripe_customer_id,
         # Capability flags consumed by the frontend to gate UI. Keep
@@ -664,7 +667,8 @@ def verify_media_token(token: str, job_id: str, file_type: str, db: Session) -> 
 # Plan usage
 # ---------------------------------------------------------------------------
 
-def get_plan_usage(db: Session, user_id: int, tenant_id: str, plan_id: str) -> dict:
+def get_plan_usage(db: Session, user_id: int, tenant_id: str, plan_id: str,
+                   billing_group: str = None) -> dict:
     """Get current month usage vs plan limit.
 
     Counts only APPROVED videos in the current month. A job's "approved"
@@ -684,17 +688,39 @@ def get_plan_usage(db: Session, user_id: int, tenant_id: str, plan_id: str) -> d
     month_start): status alone would let a rejected-after-approve job
     slip into the count, since /reject leaves approved_at populated
     while flipping status away from "done".
+
+    Cuota compartida (billing_group): cuando el usuario pertenece a una
+    cuenta de facturación (ej. Universal Music con tenants separados para
+    Argentina y Chile), la cuota se cuenta sobre TODOS los tenants cuyos
+    usuarios estén en ese grupo — un solo pool mensual para toda la cuenta,
+    aunque los equipos no se vean los videos entre sí. Sin billing_group,
+    la cuota es por tenant (comportamiento histórico).
     """
-    from database import Job
+    from database import Job, User
 
     now = datetime.now(timezone.utc)
     month_start = datetime(now.year, now.month, 1, tzinfo=timezone.utc)
 
-    used = db.query(Job).filter(
-        Job.tenant_id == tenant_id,
-        Job.status == "done",
-        Job.approved_at >= month_start,
-    ).count()
+    if billing_group:
+        # Tenants que componen la cuenta: todos los que tengan al menos un
+        # usuario en el grupo. La cantidad de usuarios es chica (decenas),
+        # el subquery es trivial.
+        group_tenants = (
+            db.query(User.tenant_id)
+            .filter(User.billing_group == billing_group)
+            .distinct()
+        )
+        used = db.query(Job).filter(
+            Job.tenant_id.in_(group_tenants),
+            Job.status == "done",
+            Job.approved_at >= month_start,
+        ).count()
+    else:
+        used = db.query(Job).filter(
+            Job.tenant_id == tenant_id,
+            Job.status == "done",
+            Job.approved_at >= month_start,
+        ).count()
 
     plan = PLANS.get(plan_id, PLANS["100"])
     limit = plan["limit"]
