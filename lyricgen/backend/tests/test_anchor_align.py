@@ -12,6 +12,12 @@ import pytest
 from anchor_align import build_synced_scaffold, vocal_regions
 
 
+@pytest.fixture(autouse=True)
+def _enable_onset(monkeypatch):
+    """Stage 3.1 is gated OFF by default; enable it for the behavior tests."""
+    monkeypatch.setenv("ANCHOR_ONSET_ENABLED", "1")
+
+
 def _pairs(start, step, n, text="línea"):
     return [(round(start + i * step, 2), f"{text} {i}") for i in range(n)]
 
@@ -185,6 +191,19 @@ def test_fit_no_anchors_uses_first_word_offset():
     wx = _wxw([("xyz", 7.0)])   # nothing matches the canonical words
     a, b, n = _fit_alignment(pairs, wx)
     assert a == 1.0 and n == 0 and b == pytest.approx(-3.0)  # 7.0 - 10.0
+
+
+def test_flag_off_uses_legacy_first_word_offset(monkeypatch):
+    """With ANCHOR_ONSET_ENABLED off, _fit_alignment must be the #513 behavior:
+    a single global offset = first whisperX word − first synced line (no
+    vocal-onset / multi-anchor logic), so the rollout is inert until flipped."""
+    monkeypatch.setenv("ANCHOR_ONSET_ENABLED", "0")
+    pairs = [(6.4, "Uh, no, no"), (14.34, "Cuenta la historia de un mago"),
+             (50.0, "Amándose siempre"), (80.0, "Buscando la forma")]
+    wx = _wxw([("no", 7.5), ("nohabia", 14.71)])
+    a, b, n = _fit_alignment(pairs, wx)
+    assert a == 1.0 and n == 0
+    assert b == pytest.approx(7.5 - 6.4)  # first word − first line (legacy)
 
 
 def test_vocal_onset_anchor_when_whisperx_mishears():

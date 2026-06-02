@@ -39,8 +39,17 @@ CONTRACT
 from __future__ import annotations
 
 import logging
+import os
 
 logger = logging.getLogger("genly.anchor_align")
+
+_TRUE = ("1", "true", "yes", "on", "y", "t")
+
+
+def _onset_enabled() -> bool:
+    """Stage 3.1 (vocal-onset + multi-anchor offset). Default OFF so it ships
+    inert; flip ANCHOR_ONSET_ENABLED=1 in staging to validate before prod."""
+    return os.environ.get("ANCHOR_ONSET_ENABLED", "0").strip().lower() in _TRUE
 
 # Validation thresholds (tuned on the 12-song lab set; see module docstring).
 _MIN_FRAC_IN_VOICE = 0.70      # ≥70% of lines must land where the stem has voice
@@ -212,6 +221,13 @@ def _fit_alignment(pairs, wx_segs):
     well-spread matches; median offset for a few; legacy first-word offset when
     none match. a is clamped to a sane stretch range so a bad fit can't warp
     the timeline."""
+    if not _onset_enabled():
+        # Legacy (#513): single global offset anchored to whisperX's first word.
+        first_wx = _first_word_time(wx_segs)
+        if first_wx is not None and pairs:
+            b = first_wx - pairs[0][0]
+            return 1.0, (b if abs(b) <= _MAX_OFFSET_S else 0.0), 0
+        return 1.0, 0.0, 0
     import statistics
     anchors = _build_anchors(pairs, _wx_word_stream(wx_segs))
     if anchors:  # trim outliers against the median offset
