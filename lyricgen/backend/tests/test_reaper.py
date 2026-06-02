@@ -518,6 +518,32 @@ def test_stalled_sweep_only_targets_processing():
 # bumps last_user_activity_at every time the user edits, so active sessions
 # stay alive past the TTL.
 
+def test_reap_transcribed_with_provenance_does_not_crash():
+    """Regression (prod 2026-06-02): the reaper hard-deleted a transcribed_pending
+    job WITHOUT first clearing its ai_provenance rows. ai_provenance.job_id is a
+    NOT NULL FK with no ON DELETE CASCADE, so SQLAlchemy's parent-delete tried to
+    NULL the FK → IntegrityError, and the ENTIRE reap transaction aborted — the
+    reaper crashed every cycle and stuck jobs piled up (incl. the OOM-killed
+    render). Deleting a job that has provenance must now succeed and clear the
+    provenance rows first (mirrors jobs.delete_job)."""
+    from reaper import _delete_abandoned_transcribed
+    db = SessionLocal()
+    try:
+        _cleanup(db)
+        jid = _seed(db, status="transcribed_pending", age_minutes=120)
+        _seed_provenance(db, job_id=jid, age_minutes=110, duration_ms=4973,
+                         step="lyrics_reference_fetch", tool_name="gemini-2.5-flash")
+        job = db.query(Job).filter(Job.job_id == jid).first()
+        # Must NOT raise IntegrityError / NotNullViolation.
+        _delete_abandoned_transcribed(db, job)
+        db.commit()
+        assert db.query(Job).filter(Job.job_id == jid).first() is None
+        assert db.query(AIProvenance).filter(AIProvenance.job_id == jid).count() == 0
+    finally:
+        _cleanup(db)
+        db.close()
+
+
 def test_transcribed_pending_with_recent_user_activity_is_kept():
     """Old created_at but recent last_user_activity_at → active session, keep."""
     db = SessionLocal()
