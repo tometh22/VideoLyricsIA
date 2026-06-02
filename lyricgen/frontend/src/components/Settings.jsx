@@ -221,6 +221,15 @@ export default function Settings({ onBack }) {
       .catch(() => {});
   }, []);
 
+  // Deep-link support: ?tab=facturacion opens the billing tab directly. Used
+  // by the global PastDueBanner / UpgradeNudge CTAs and the lifecycle emails
+  // that link to /?view=settings&tab=facturacion.
+  useEffect(() => {
+    if (new URLSearchParams(window.location.search).get("tab") === "facturacion") {
+      setActiveSection("facturacion");
+    }
+  }, []);
+
   const [saveError, setSaveError] = useState(null);
   const handleSave = async () => {
     setSaveError(null);
