@@ -44,6 +44,10 @@ export const translations = {
 
     // Settings - billing
     "settings.billing": "Facturación",
+    "billing.past_due_title": "Tu último pago falló.",
+    "billing.past_due_body": "Actualizá tu medio de pago para no perder acceso a la generación de videos.",
+    "billing.update_payment": "Actualizar medio de pago",
+    "common.opening": "Abriendo…",
     "settings.account": "Cuenta",
     "settings.current_plan": "Plan actual",
     "settings.change_plan": "Cambiar plan",
@@ -1395,6 +1399,10 @@ export const translations = {
     "login.back_to_login": "Back to sign in",
 
     "settings.billing": "Billing",
+    "billing.past_due_title": "Your last payment failed.",
+    "billing.past_due_body": "Update your payment method to keep access to video generation.",
+    "billing.update_payment": "Update payment method",
+    "common.opening": "Opening…",
     "settings.account": "Account",
     "settings.current_plan": "Current Plan",
     "settings.change_plan": "Change Plan",
@@ -2344,6 +2352,10 @@ export const translations = {
     "login.back_to_login": "Voltar para entrar",
 
     "settings.billing": "Faturamento",
+    "billing.past_due_title": "Seu último pagamento falhou.",
+    "billing.past_due_body": "Atualize sua forma de pagamento para não perder o acesso à geração de vídeos.",
+    "billing.update_payment": "Atualizar forma de pagamento",
+    "common.opening": "Abrindo…",
     "settings.account": "Conta",
     "settings.current_plan": "Plano atual",
     "settings.change_plan": "Mudar plano",

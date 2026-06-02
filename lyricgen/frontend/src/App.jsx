@@ -251,6 +251,58 @@ function BillingSuccessToast({ onDismiss }) {
 
 // Layout shell for authenticated routes. Computes Sidebar's activeView
 // from the current pathname so Sidebar.jsx itself doesn't change.
+// Global dunning banner. Shows when Stripe has flagged the account
+// `past_due` (a charge failed and Smart Retries are in flight). The user
+// keeps access during the grace period — this is a nudge, not a wall —
+// so it's amber, not red, and the CTA drops straight into the Stripe
+// Customer Portal to update the card (no card entry in our app — PCI).
+// Recovery is automatic: once a retry succeeds, invoice.paid flips
+// billing_status back to "active" and /auth/me clears the banner.
+function PastDueBanner({ user }) {
+  const { t } = useI18n();
+  const [busy, setBusy] = useState(false);
+  if (user?.billing_status !== "past_due") return null;
+
+  const openPortal = async () => {
+    setBusy(true);
+    try {
+      const res = await authFetch(`${API}/billing/portal`, { method: "POST" });
+      const data = await res.json().catch(() => ({}));
+      if (data.portal_url) {
+        window.location.href = data.portal_url;
+        return;
+      }
+    } catch { /* fall through to the in-app billing tab */ }
+    setBusy(false);
+    window.location.assign("/account?tab=facturacion");
+  };
+
+  return (
+    <div className="relative z-10 px-4 md:px-8 pt-4">
+      <div className="flex flex-col sm:flex-row sm:items-center gap-3 px-4 py-3 rounded-card bg-amber-500/10 ring-1 ring-amber-500/30">
+        <svg className="w-5 h-5 text-amber-400 shrink-0" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
+          <path strokeLinecap="round" strokeLinejoin="round" d="M12 9v3.75m0 3.75h.008M10.34 3.94l-7.5 12.99A1.5 1.5 0 004.14 19.5h15.72a1.5 1.5 0 001.3-2.57l-7.5-12.99a1.5 1.5 0 00-2.6 0z" />
+        </svg>
+        <div className="flex-1 text-sm text-amber-100/90">
+          <span className="font-semibold text-amber-100">
+            {t("billing.past_due_title") || "Tu último pago falló."}
+          </span>{" "}
+          {t("billing.past_due_body") || "Actualizá tu medio de pago para no perder acceso a la generación de videos."}
+        </div>
+        <button
+          onClick={openPortal}
+          disabled={busy}
+          className="shrink-0 px-4 py-2 rounded-lg text-sm font-semibold bg-amber-500 text-black hover:bg-amber-400 disabled:opacity-60 transition-colors"
+        >
+          {busy
+            ? (t("common.opening") || "Abriendo…")
+            : (t("billing.update_payment") || "Actualizar medio de pago")}
+        </button>
+      </div>
+    </div>
+  );
+}
+
 function AppShell({ user, sidebarOpen, setSidebarOpen, onLogout }) {
   const { t } = useI18n();
   const navigate = useNavigate();
@@ -354,6 +406,9 @@ function AppShell({ user, sidebarOpen, setSidebarOpen, onLogout }) {
             )}
           </div>
         </header>
+
+        {/* Dunning banner — sits above content, below the top bar */}
+        <PastDueBanner user={user} />
 
         {/* Content */}
         <main className="relative z-10 px-4 md:px-8 pt-6 md:pt-8 pb-20">
@@ -1390,6 +1445,32 @@ export default function App() {
         }
       })
       .catch(() => { /* swallow; next page load will retry */ });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [token, user]);
+
+  // Freshen the cached user once per load when it IS present (the recovery
+  // effect above covers the missing case). `plan` and `billing_status` are
+  // driven server-side by Stripe webhooks, so this is what lets a user who
+  // just went past_due — or whose plan changed — see it reflected without
+  // re-login. MERGE rather than replace: /auth/me carries fewer fields than
+  // the login payload, so a blind overwrite would drop e.g. email_verified.
+  // Best-effort: a 401/network failure leaves the cached user untouched
+  // (the dedicated refresh/401 effects own session liveness).
+  const userFreshenedRef = useRef(false);
+  useEffect(() => {
+    if (!token || !user || userFreshenedRef.current) return;
+    userFreshenedRef.current = true;
+    authFetch(`${API}/auth/me`)
+      .then((r) => (r.ok ? r.json() : null))
+      .then((data) => {
+        if (!data || !data.id) return;
+        setUser((prev) => {
+          const merged = { ...(prev || {}), ...data };
+          localStorage.setItem("genly_user", JSON.stringify(merged));
+          return merged;
+        });
+      })
+      .catch(() => { /* keep cached user; retries next load */ });
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [token, user]);
 

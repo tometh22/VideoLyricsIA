@@ -243,6 +243,9 @@ async def get_subscription(
         "plan_details": PLANS.get(user.plan_id, PLANS["free"]),
         "has_subscription": bool(user.stripe_subscription_id),
         "stripe_customer_id": user.stripe_customer_id,
+        # Dunning state — lets the Facturación tab render the past-due
+        # notice inline (mirrors the global banner driven by /auth/me).
+        "billing_status": getattr(user, "billing_status", "active") or "active",
     }
 
     if user.stripe_subscription_id and stripe.api_key:
@@ -363,6 +366,19 @@ def _handle_subscription_updated(db: Session, data: dict):
             plan_id, customer_id,
         )
 
+    # Dunning state for the in-app banner. Stripe drives every transition:
+    # past_due/unpaid → show "fix your card"; active/trialing → all clear
+    # (this is also the recovery path when a Smart Retry finally succeeds).
+    # Transient/other statuses (incomplete, paused, canceled) are left
+    # untouched so we don't flap the banner on intermediate events.
+    sub_status = data.get("status")
+    if sub_status in ("past_due", "unpaid"):
+        if user.billing_status != "past_due":
+            logger.warning("User %s → past_due (subscription.%s)", user.username, sub_status)
+        user.billing_status = "past_due"
+    elif sub_status in ("active", "trialing"):
+        user.billing_status = "active"
+
     user.stripe_subscription_id = data.get("id")
     db.commit()
 
@@ -375,6 +391,9 @@ def _handle_subscription_deleted(db: Session, data: dict):
 
     user.plan_id = "free"
     user.stripe_subscription_id = None
+    # No subscription left to be past-due on — clear the dunning banner so a
+    # cancelled (or grace-period-exhausted) user lands cleanly on free.
+    user.billing_status = "active"
     db.commit()
     logger.info(f"User {user.username} subscription cancelled → free plan")
 
@@ -386,6 +405,13 @@ def _handle_invoice_paid(db: Session, data: dict):
     user = _find_user_by_customer(db, customer_id)
     if not user:
         return
+
+    # A successful charge clears any prior dunning state — set it before the
+    # duplicate short-circuit so a retried invoice.paid delivery still heals
+    # the banner. (db.commit() below persists it in both code paths.)
+    if user.billing_status != "active":
+        logger.info("User %s payment recovered → billing_status=active", user.username)
+        user.billing_status = "active"
 
     # Avoid duplicates
     stripe_inv_id = data.get("id")
@@ -441,6 +467,12 @@ def _handle_invoice_failed(db: Session, data: dict):
     user = _find_user_by_customer(db, customer_id)
     if not user:
         return
+
+    # invoice.payment_failed is the earliest, most reliable dunning signal
+    # (it fires before the subscription itself flips to past_due). Flag the
+    # user so the in-app banner shows even if the subscription.updated event
+    # is delayed or dropped.
+    user.billing_status = "past_due"
 
     stripe_inv_id = data.get("id")
     existing = db.query(Invoice).filter(Invoice.stripe_invoice_id == stripe_inv_id).first()

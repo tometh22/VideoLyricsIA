@@ -704,6 +704,31 @@ export default function Settings({ onBack }) {
         {/* ════════════════════ FACTURACIÓN ════════════════════ */}
         {activeSection === "facturacion" && (
           <>
+            {/* Dunning notice — mirrors the global banner; CTA → Stripe portal */}
+            {subscription?.billing_status === "past_due" && (
+              <AlertBanner variant="amber">
+                <div className="flex flex-col sm:flex-row sm:items-center gap-2">
+                  <div className="flex-1">
+                    <p className="text-xs font-semibold">
+                      {t("billing.past_due_title") || "Tu último pago falló."}
+                    </p>
+                    <p className="text-[11px] opacity-80 mt-0.5">
+                      {t("billing.past_due_body") || "Actualizá tu medio de pago para no perder acceso a la generación de videos."}
+                    </p>
+                  </div>
+                  <button
+                    onClick={handleManageBilling}
+                    disabled={billingLoading}
+                    className="shrink-0 px-3 py-1.5 rounded-lg text-xs font-semibold bg-amber-500 text-black hover:bg-amber-400 disabled:opacity-60 transition-colors"
+                  >
+                    {billingLoading
+                      ? (t("common.opening") || "Abriendo…")
+                      : (t("billing.update_payment") || "Actualizar medio de pago")}
+                  </button>
+                </div>
+              </AlertBanner>
+            )}
+
             {/* Usage widget */}
             {usage && (
               <Card>
