@@ -41,6 +41,21 @@ FRONTEND_URL = os.environ.get("FRONTEND_URL", "http://localhost:5173")
 # metadata.user_id).
 _REQUIRE_WEBHOOK_SIGNATURE = bool(stripe.api_key)
 
+# --- Customer Portal configuration ---
+# Prefer an explicitly pinned configuration id (set in prod via the output
+# of setup_stripe.py). When unset we lazily create-once and cache the id
+# in-process so the hosted portal always exposes the exact feature set we
+# intend (update card / invoice history / cancel-at-period-end / plan
+# switching among OUR prices) instead of Stripe's opaque dashboard default.
+STRIPE_PORTAL_CONFIG_ID = os.environ.get("STRIPE_PORTAL_CONFIG_ID", "").strip()
+PORTAL_PRIVACY_URL = os.environ.get("BILLING_PRIVACY_URL", f"{FRONTEND_URL}/privacy")
+PORTAL_TERMS_URL = os.environ.get("BILLING_TERMS_URL", f"{FRONTEND_URL}/terms")
+# Stable marker so we can find a config we previously created instead of
+# making a new one every cold start (idempotency without a DB row).
+_PORTAL_CONFIG_MARKER = "genly-portal-v1"
+_portal_config_id_cache: Optional[str] = None
+_portal_config_lock = threading.Lock()
+
 router = APIRouter(prefix="/billing", tags=["billing"])
 
 
@@ -61,6 +76,69 @@ def get_or_create_stripe_customer(db: Session, user: User) -> str:
     user.stripe_customer_id = customer.id
     db.commit()
     return customer.id
+
+
+def build_portal_configuration_params() -> dict:
+    """Explicit portal feature set. Shared by setup_stripe.py and the lazy
+    in-app ensure path so both create an identical configuration.
+
+    Plan switching is intentionally OMITTED: all upgrades/downgrades go
+    through the in-app /billing/change-plan flow, which enforces the Fase 1
+    downgrade guardrail. The hosted portal has no equivalent guardrail, so
+    offering subscription_update there would let a user downgrade below
+    their month's usage and hit a next-cycle 402. The portal owns card +
+    invoice history + cancel-at-period-end; plan changes stay in-app.
+    """
+    return {
+        "business_profile": {
+            "headline": "GenLy AI",
+            "privacy_policy_url": PORTAL_PRIVACY_URL,
+            "terms_of_service_url": PORTAL_TERMS_URL,
+        },
+        "features": {
+            "payment_method_update": {"enabled": True},
+            "invoice_history": {"enabled": True},
+            "subscription_cancel": {
+                "enabled": True,
+                "mode": "at_period_end",
+                "proration_behavior": "none",
+            },
+        },
+        "metadata": {"genly_marker": _PORTAL_CONFIG_MARKER},
+    }
+
+
+def _ensure_portal_configuration() -> Optional[str]:
+    """Return a portal Configuration id, or None to fall back to Stripe's
+    default config. Resolution order: pinned env -> in-process cache ->
+    existing config found by our marker -> create-once. Never raises — on
+    any Stripe error returns None so the caller keeps today's behaviour
+    (Session.create with no explicit configuration)."""
+    global _portal_config_id_cache
+    if STRIPE_PORTAL_CONFIG_ID:
+        return STRIPE_PORTAL_CONFIG_ID
+    if _portal_config_id_cache:
+        return _portal_config_id_cache
+    with _portal_config_lock:
+        if _portal_config_id_cache:
+            return _portal_config_id_cache
+        try:
+            existing = stripe.billing_portal.Configuration.list(limit=100)
+            for cfg in existing.auto_paging_iter():
+                meta = dict(getattr(cfg, "metadata", None) or {})
+                active = cfg["active"] if isinstance(cfg, dict) else getattr(cfg, "active", True)
+                if meta.get("genly_marker") == _PORTAL_CONFIG_MARKER and active:
+                    _portal_config_id_cache = cfg["id"] if isinstance(cfg, dict) else cfg.id
+                    return _portal_config_id_cache
+            cfg = stripe.billing_portal.Configuration.create(
+                **build_portal_configuration_params()
+            )
+            _portal_config_id_cache = cfg["id"] if isinstance(cfg, dict) else cfg.id
+            logger.info("Created Stripe portal configuration %s", _portal_config_id_cache)
+            return _portal_config_id_cache
+        except stripe.error.StripeError as exc:
+            logger.error("Could not ensure portal configuration; using default: %s", exc)
+            return None
 
 
 # ---------------------------------------------------------------------------
@@ -136,16 +214,60 @@ async def create_portal_session(
     if not user or not user.stripe_customer_id:
         raise HTTPException(status_code=400, detail="No billing account found")
 
-    session = stripe.billing_portal.Session.create(
-        customer=user.stripe_customer_id,
-        return_url=f"{FRONTEND_URL}/?view=settings",
-    )
+    # Resolve our explicit portal configuration (update card / invoices /
+    # cancel-at-period-end). When it can't be resolved we fall back to the
+    # account default by omitting the kwarg entirely — Stripe rejects an
+    # explicit configuration=None, so build the kwargs conditionally.
+    portal_config_id = _ensure_portal_configuration()
+    session_kwargs = {
+        "customer": user.stripe_customer_id,
+        "return_url": f"{FRONTEND_URL}/?view=settings",
+    }
+    if portal_config_id:
+        session_kwargs["configuration"] = portal_config_id
+
+    try:
+        session = stripe.billing_portal.Session.create(**session_kwargs)
+    except stripe.error.StripeError as exc:
+        logger.error("Stripe portal session creation failed for user %s: %s", user.id, exc)
+        raise HTTPException(
+            status_code=502,
+            detail="No se pudo abrir el portal de facturación. Intentá de nuevo en unos segundos.",
+        )
 
     return {"portal_url": session.url}
 
 
 class ChangePlanRequest(BaseModel):
     plan_id: str
+
+
+class ChangePlanPreviewRequest(BaseModel):
+    plan_id: str
+
+
+def _assert_downgrade_allowed(db: Session, user: User, target_plan_id: str,
+                              target_plan: dict, current_user: dict) -> None:
+    """Refuse a mid-cycle downgrade to a plan whose monthly limit is below what
+    the user has ALREADY approved this cycle — otherwise the next generation
+    402s the instant the webhook flips plan_id, blocking a user who paid for
+    the higher tier. Overage accounts (UMG-style) are exempt. Shared by
+    /change-plan and /change-plan/preview so the preview can never say OK while
+    the real apply 400s. Raises HTTPException(400) when blocked."""
+    from auth import get_plan_usage
+    usage = get_plan_usage(
+        db, user.id, current_user["tenant_id"], current_user.get("plan", "100")
+    )
+    target_limit = target_plan.get("limit", 0)
+    if not user.allow_overage and usage["used"] > target_limit:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"No podés cambiar al plan {target_plan_id} este mes: ya aprobaste "
+                f"{usage['used']} videos y ese plan permite {target_limit}. "
+                f"Podés hacerlo a partir de tu próxima renovación."
+            ),
+        )
 
 
 @router.post("/change-plan")
@@ -166,27 +288,10 @@ async def change_plan(
     if not user or not user.stripe_subscription_id:
         raise HTTPException(status_code=400, detail="No active subscription")
 
-    # Downgrade guardrail: refuse to drop to a plan whose monthly limit is below
-    # what the user has ALREADY approved this cycle. Without this, a mid-cycle
-    # downgrade (e.g. 1000 → 100 at 500 used) flips plan_id on the webhook and
-    # the next generation hits a 402 — the user is instantly blocked despite
-    # having paid for the higher tier. Overage accounts (UMG-style) are exempt
-    # since they can bill beyond the cap. (Scheduling the downgrade at period
-    # end is the Fase-2 enhancement.)
-    from auth import get_plan_usage
-    _usage = get_plan_usage(
-        db, user.id, current_user["tenant_id"], current_user.get("plan", "100")
-    )
-    _target_limit = plan.get("limit", 0)
-    if not user.allow_overage and _usage["used"] > _target_limit:
-        raise HTTPException(
-            status_code=400,
-            detail=(
-                f"No podés cambiar al plan {body.plan_id} este mes: ya aprobaste "
-                f"{_usage['used']} videos y ese plan permite {_target_limit}. "
-                f"Podés hacerlo a partir de tu próxima renovación."
-            ),
-        )
+    # Downgrade guardrail (shared with /change-plan/preview so the modal's
+    # preview can never say OK while this apply 400s). Refuses a mid-cycle drop
+    # below the user's already-approved count; overage accounts are exempt.
+    _assert_downgrade_allowed(db, user, body.plan_id, plan, current_user)
 
     # Get current subscription
     subscription = stripe.Subscription.retrieve(user.stripe_subscription_id)
@@ -212,6 +317,131 @@ async def change_plan(
     # Don't optimistically grant the plan — the webhook will commit it once
     # Stripe confirms. Return the request was accepted.
     return {"ok": True, "plan_pending": body.plan_id}
+
+
+@router.post("/change-plan/preview")
+async def change_plan_preview(
+    body: ChangePlanPreviewRequest,
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Preview the proration for switching to body.plan_id WITHOUT applying it,
+    so the confirmation modal can show "charged/credited $X now". Surfaces the
+    Fase-1 downgrade guardrail (same 400) so a blocked downgrade reads cleanly
+    in the modal instead of only failing at apply time."""
+    if not stripe.api_key:
+        raise HTTPException(status_code=503, detail="Billing not configured")
+
+    plan = PLANS.get(body.plan_id)
+    if not plan or not plan.get("stripe_price_id"):
+        raise HTTPException(status_code=400, detail="Invalid plan")
+
+    user = db.query(User).filter(User.id == current_user["id"]).first()
+    if not user or not user.stripe_subscription_id:
+        raise HTTPException(status_code=400, detail="No active subscription")
+    if user.plan_id == body.plan_id:
+        raise HTTPException(status_code=400, detail="Ya estás en ese plan")
+
+    # SAME guardrail as /change-plan (one helper → no drift).
+    _assert_downgrade_allowed(db, user, body.plan_id, plan, current_user)
+
+    try:
+        subscription = stripe.Subscription.retrieve(user.stripe_subscription_id)
+        current_item_id = subscription["items"]["data"][0].id
+        # Pin the proration date so the line filter below is deterministic.
+        proration_date = int(datetime.now(timezone.utc).timestamp())
+        upcoming = stripe.Invoice.upcoming(
+            customer=user.stripe_customer_id,
+            subscription=user.stripe_subscription_id,
+            subscription_items=[{
+                "id": current_item_id,
+                "price": plan["stripe_price_id"],
+            }],
+            subscription_proration_behavior="create_prorations",
+            subscription_proration_date=proration_date,
+        )
+    except stripe.error.StripeError as exc:
+        logger.error("proration preview failed for user %s: %s", user.id, exc)
+        raise HTTPException(status_code=502, detail="No se pudo calcular el prorrateo. Intentá de nuevo.")
+
+    # Sum ONLY the proration lines at our pinned date — the rest of `upcoming`
+    # is next cycle's full charge, which we must not show as "now". Positive =>
+    # charged now; negative => credited to the customer balance.
+    proration_cents = 0
+    for line in upcoming["lines"]["data"]:
+        if line.get("proration") and line.get("period", {}).get("start") == proration_date:
+            proration_cents += line.get("amount", 0)
+
+    return {
+        "plan_id": body.plan_id,
+        "currency": (upcoming.get("currency") or "usd"),
+        "proration_cents": proration_cents,
+        "amount_due_cents": upcoming.get("amount_due", 0),
+        "proration_date": proration_date,
+        "immediate": True,
+    }
+
+
+@router.post("/cancel")
+async def cancel_subscription(
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Schedule cancellation at period end (cancel_at_period_end=true). The user
+    keeps access until current_period_end; fully reversible via /reactivate.
+    plan_id is NOT touched here — the subscription.deleted webhook flips it to
+    free when the period actually ends (source of truth)."""
+    if not stripe.api_key:
+        raise HTTPException(status_code=503, detail="Billing not configured")
+    user = db.query(User).filter(User.id == current_user["id"]).first()
+    if not user or not user.stripe_subscription_id:
+        raise HTTPException(status_code=400, detail="No active subscription")
+    try:
+        sub = stripe.Subscription.modify(
+            user.stripe_subscription_id,
+            cancel_at_period_end=True,
+            idempotency_key=f"cancel:{user.id}:{user.stripe_subscription_id}",
+        )
+    except stripe.error.StripeError as exc:
+        logger.error("cancel failed for user %s: %s", user.id, exc)
+        raise HTTPException(status_code=502, detail="No se pudo programar la cancelación. Intentá de nuevo.")
+
+    period_end = getattr(sub, "current_period_end", None)
+    if user.email:
+        access_until = (
+            datetime.fromtimestamp(int(period_end), tz=timezone.utc).strftime("%d %b %Y")
+            if period_end else ""
+        )
+        _send_email_async(
+            emails.send_cancellation_scheduled,
+            email=user.email, username=user.username, access_until=access_until,
+        )
+    return {"ok": True, "cancel_at_period_end": True, "current_period_end": period_end}
+
+
+@router.post("/reactivate")
+async def reactivate_subscription(
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Undo a scheduled cancellation (cancel_at_period_end=false). No new
+    checkout — the subscription was never interrupted."""
+    if not stripe.api_key:
+        raise HTTPException(status_code=503, detail="Billing not configured")
+    user = db.query(User).filter(User.id == current_user["id"]).first()
+    if not user or not user.stripe_subscription_id:
+        raise HTTPException(status_code=400, detail="No active subscription")
+    try:
+        sub = stripe.Subscription.modify(
+            user.stripe_subscription_id,
+            cancel_at_period_end=False,
+            idempotency_key=f"reactivate:{user.id}:{user.stripe_subscription_id}",
+        )
+    except stripe.error.StripeError as exc:
+        logger.error("reactivate failed for user %s: %s", user.id, exc)
+        raise HTTPException(status_code=502, detail="No se pudo reactivar. Intentá de nuevo.")
+    return {"ok": True, "cancel_at_period_end": False,
+            "current_period_end": getattr(sub, "current_period_end", None)}
 
 
 @router.get("/invoices")
@@ -243,6 +473,9 @@ async def get_subscription(
         "plan_details": PLANS.get(user.plan_id, PLANS["free"]),
         "has_subscription": bool(user.stripe_subscription_id),
         "stripe_customer_id": user.stripe_customer_id,
+        # Dunning state — lets the Facturación tab render the past-due
+        # notice inline (mirrors the global banner driven by /auth/me).
+        "billing_status": getattr(user, "billing_status", "active") or "active",
     }
 
     if user.stripe_subscription_id and stripe.api_key:
@@ -257,6 +490,77 @@ async def get_subscription(
             pass
 
     return result
+
+
+@router.get("/payment-method")
+async def get_payment_method(
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Return the customer's DEFAULT card for read-only display.
+
+    Shape: {"payment_method": {brand,last4,exp_month,exp_year}} or
+    {"payment_method": null}. Stripe only ever returns brand/last4/exp — no
+    PAN. Degrades to null when Stripe is unconfigured, the user has no
+    customer, or no card is on file (mirrors /subscription). Card ENTRY
+    happens only in the hosted portal (PCI), never here.
+    """
+    user = db.query(User).filter(User.id == current_user["id"]).first()
+    if not stripe.api_key or not user or not user.stripe_customer_id:
+        return {"payment_method": None}
+
+    def _card_dict(card) -> Optional[dict]:
+        # `card` is a StripeObject (PaymentMethod.card or a card Source).
+        # Guard every field: an unexpanded ref comes back as a bare str id.
+        if not card or isinstance(card, str):
+            return None
+        brand = getattr(card, "brand", None)
+        last4 = getattr(card, "last4", None)
+        if not (brand and last4):
+            return None
+        return {
+            "brand": brand,
+            "last4": last4,
+            "exp_month": getattr(card, "exp_month", None),
+            "exp_year": getattr(card, "exp_year", None),
+        }
+
+    try:
+        customer = stripe.Customer.retrieve(
+            user.stripe_customer_id,
+            expand=["invoice_settings.default_payment_method", "default_source"],
+        )
+        # (1) invoice_settings.default_payment_method — the canonical default
+        inv = getattr(customer, "invoice_settings", None)
+        pm = getattr(inv, "default_payment_method", None) if inv else None
+        if pm and not isinstance(pm, str):
+            card = _card_dict(getattr(pm, "card", None))
+            if card:
+                return {"payment_method": card}
+
+        # (2) fall back to the subscription's default_payment_method
+        if user.stripe_subscription_id:
+            sub = stripe.Subscription.retrieve(
+                user.stripe_subscription_id,
+                expand=["default_payment_method"],
+            )
+            spm = getattr(sub, "default_payment_method", None)
+            if spm and not isinstance(spm, str):
+                card = _card_dict(getattr(spm, "card", None))
+                if card:
+                    return {"payment_method": card}
+
+        # (3) legacy default_source (a card Source carries brand/last4/exp inline)
+        src = getattr(customer, "default_source", None)
+        if src and not isinstance(src, str):
+            card = _card_dict(src)
+            if card:
+                return {"payment_method": card}
+    except stripe.error.StripeError as exc:
+        logger.warning("payment-method lookup failed for user %s: %s", user.id, exc)
+        return {"payment_method": None}
+
+    return {"payment_method": None}
 
 
 # ---------------------------------------------------------------------------
@@ -353,6 +657,7 @@ def _handle_subscription_updated(db: Session, data: dict):
     if not user:
         return
 
+    old_plan = user.plan_id  # snapshot BEFORE mutation for the plan-change email
     plan_id = data.get("metadata", {}).get("plan_id")
     if plan_id and plan_id in PLANS:
         user.plan_id = plan_id
@@ -363,8 +668,40 @@ def _handle_subscription_updated(db: Session, data: dict):
             plan_id, customer_id,
         )
 
+    # Dunning state for the in-app banner. Stripe drives every transition:
+    # past_due/unpaid → show "fix your card"; active/trialing → all clear
+    # (this is also the recovery path when a Smart Retry finally succeeds).
+    # Transient/other statuses (incomplete, paused, canceled) are left
+    # untouched so we don't flap the banner on intermediate events.
+    sub_status = data.get("status")
+    if sub_status in ("past_due", "unpaid"):
+        if user.billing_status != "past_due":
+            logger.warning("User %s → past_due (subscription.%s)", user.username, sub_status)
+        user.billing_status = "past_due"
+    elif sub_status in ("active", "trialing"):
+        user.billing_status = "active"
+
     user.stripe_subscription_id = data.get("id")
     db.commit()
+
+    # Plan-change confirmation: only on a real transition between two PAID
+    # plans. free → X is the initial subscribe (covered by the welcome email),
+    # so skip it here to avoid a duplicate/contradictory message.
+    if (user.email and plan_id and plan_id in PLANS
+            and plan_id != old_plan and old_plan not in (None, "free")):
+        old_limit = PLANS.get(old_plan, {}).get("limit", 0)
+        new_limit = PLANS[plan_id].get("limit", 0)
+        direction = ("upgrade" if new_limit > old_limit
+                     else "downgrade" if new_limit < old_limit else "changed")
+        _send_email_async(
+            emails.send_plan_changed,
+            email=user.email,
+            username=user.username,
+            old_plan=old_plan,
+            new_plan=plan_id,
+            new_limit=new_limit,
+            direction=direction,
+        )
 
 
 def _handle_subscription_deleted(db: Session, data: dict):
@@ -373,10 +710,34 @@ def _handle_subscription_deleted(db: Session, data: dict):
     if not user:
         return
 
+    # Capture before we mutate/lose context (for the cancellation email).
+    email = user.email
+    username = user.username
+    access_until = ""
+    period_end = data.get("current_period_end")
+    if period_end:
+        try:
+            access_until = datetime.fromtimestamp(
+                int(period_end), tz=timezone.utc
+            ).strftime("%d %b %Y")
+        except (TypeError, ValueError, OverflowError):
+            access_until = ""
+
     user.plan_id = "free"
     user.stripe_subscription_id = None
+    # No subscription left to be past-due on — clear the dunning banner so a
+    # cancelled (or grace-period-exhausted) user lands cleanly on free.
+    user.billing_status = "active"
     db.commit()
-    logger.info(f"User {user.username} subscription cancelled → free plan")
+    logger.info(f"User {username} subscription cancelled → free plan")
+
+    if email:
+        _send_email_async(
+            emails.send_subscription_cancelled,
+            email=email,
+            username=username,
+            access_until=access_until,
+        )
 
 
 def _handle_invoice_paid(db: Session, data: dict):
@@ -386,6 +747,13 @@ def _handle_invoice_paid(db: Session, data: dict):
     user = _find_user_by_customer(db, customer_id)
     if not user:
         return
+
+    # A successful charge clears any prior dunning state — set it before the
+    # duplicate short-circuit so a retried invoice.paid delivery still heals
+    # the banner. (db.commit() below persists it in both code paths.)
+    if user.billing_status != "active":
+        logger.info("User %s payment recovered → billing_status=active", user.username)
+        user.billing_status = "active"
 
     # Avoid duplicates
     stripe_inv_id = data.get("id")
@@ -435,12 +803,34 @@ def _handle_invoice_paid(db: Session, data: dict):
             invoice_url=invoice_url,
         )
 
+        # One-time subscription welcome: ONLY the first invoice of a new sub.
+        # Recurring monthly invoices have billing_reason='subscription_cycle'
+        # (and proration invoices 'subscription_update') → receipt only, never
+        # a second welcome. The duplicate-invoice short-circuit above means
+        # Stripe retries can't re-send it either.
+        if data.get("billing_reason") == "subscription_create":
+            _plan = PLANS.get(user.plan_id, {})
+            _send_email_async(
+                emails.send_subscription_welcome,
+                email=user.email,
+                username=user.username,
+                plan=user.plan_id,
+                limit=_plan.get("limit", 0),
+                monthly_price_usd=(_plan.get("monthly_price", 0) or 0),
+            )
+
 
 def _handle_invoice_failed(db: Session, data: dict):
     customer_id = data.get("customer")
     user = _find_user_by_customer(db, customer_id)
     if not user:
         return
+
+    # invoice.payment_failed is the earliest, most reliable dunning signal
+    # (it fires before the subscription itself flips to past_due). Flag the
+    # user so the in-app banner shows even if the subscription.updated event
+    # is delayed or dropped.
+    user.billing_status = "past_due"
 
     stripe_inv_id = data.get("id")
     existing = db.query(Invoice).filter(Invoice.stripe_invoice_id == stripe_inv_id).first()
