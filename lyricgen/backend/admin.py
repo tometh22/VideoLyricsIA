@@ -13,8 +13,9 @@ from pydantic import BaseModel
 from sqlalchemy import case, func
 from sqlalchemy.orm import Session
 
-from auth import get_current_user, PLANS, pwd_context, validate_password_strength
-from database import User, Job, Invoice, AuditLog, AIProvenance, AssetUsage, BackgroundAsset, get_db
+from auth import get_current_user, PLANS, pwd_context, telemetry_enabled, validate_password_strength
+from database import User, Job, Invoice, AuditLog, AIProvenance, AssetUsage, BackgroundAsset, UserSession, get_db
+from error_taxonomy import classify_error
 
 BACKGROUNDS_DIR = os.path.join(os.path.dirname(__file__), "..", "assets", "backgrounds", "library")
 os.makedirs(BACKGROUNDS_DIR, exist_ok=True)
@@ -731,15 +732,28 @@ async def admin_activity(
         last_activity_by_user[r.user_id] = r.last_job_activity
 
     # --- 2. Recent error messages (bounded), bucketed per user -----------
+    # También clasifica cada error en categoría (veo/render/upload/...):
+    # usa la columna error_category cuando el pipeline la pobló, y cae al
+    # clasificador de texto para rows históricas. El límite de 200 cubre
+    # de sobra el volumen de errores de una ventana de 90 días al volumen
+    # actual; si algún día se queda corto, la categoría sub-reporta pero
+    # nunca rompe.
     error_rows = (
-        db.query(Job.user_id, Job.job_id, Job.song_title, Job.artist, Job.error, Job.status, Job.created_at)
+        db.query(Job.user_id, Job.job_id, Job.song_title, Job.artist, Job.error,
+                 Job.error_category, Job.status, Job.created_at)
         .filter(Job.status.in_(_ACTIVITY_FAILED_STATUSES), Job.created_at >= since)
         .order_by(Job.created_at.desc())
         .limit(200)
         .all()
     )
     errors_by_user = {}
+    error_categories_by_user = {}
+    errors_by_category_global = {}
     for r in error_rows:
+        category = r.error_category or classify_error(r.error)
+        cat_bucket = error_categories_by_user.setdefault(r.user_id, {})
+        cat_bucket[category] = cat_bucket.get(category, 0) + 1
+        errors_by_category_global[category] = errors_by_category_global.get(category, 0) + 1
         bucket = errors_by_user.setdefault(r.user_id, [])
         if len(bucket) < 3:
             bucket.append({
@@ -748,6 +762,7 @@ async def admin_activity(
                 "song_title": r.song_title,
                 "status": r.status,
                 "error": (r.error or "")[:300],
+                "category": category,
                 "created_at": r.created_at.isoformat() if r.created_at else None,
             })
 
@@ -873,6 +888,59 @@ async def admin_activity(
         if prev is None or (last_audit is not None and last_audit > prev):
             last_activity_by_user[uid] = last_audit
 
+    # --- 9. Sesiones (tiempo en app + online ahora), solo con telemetría --
+    # Agregado en Python y no en SQL: el volumen es mínimo (una row por
+    # sesión, no por heartbeat) y así el cálculo de duraciones es idéntico
+    # en SQLite (tests) y Postgres (prod), sin func.extract dialect-specific.
+    sessions_by_user = {}
+    telemetry_on = telemetry_enabled()
+    if telemetry_on:
+        now = datetime.now(timezone.utc)
+        today_start = datetime(now.year, now.month, now.day, tzinfo=timezone.utc)
+        week_ago = now - timedelta(days=7)
+        online_cutoff = now - timedelta(minutes=3)
+        sess_rows = (
+            db.query(UserSession)
+            .filter(UserSession.last_seen_at >= week_ago)
+            .all()
+        )
+        for s in sess_rows:
+            # SQLite (tests) devuelve datetimes naive aunque la columna sea
+            # timezone=True; Postgres devuelve aware. Mismo guard que reaper.py.
+            started_at = s.started_at
+            last_seen_at = s.last_seen_at
+            if started_at.tzinfo is None:
+                started_at = started_at.replace(tzinfo=timezone.utc)
+            if last_seen_at.tzinfo is None:
+                last_seen_at = last_seen_at.replace(tzinfo=timezone.utc)
+            agg = sessions_by_user.setdefault(s.user_id, {
+                "online": False,
+                "last_seen_at": None,
+                "seconds_today": 0,
+                "seconds_week": 0,
+                "sessions_week": 0,
+            })
+            duration = max(0.0, (last_seen_at - started_at).total_seconds())
+            agg["sessions_week"] += 1
+            agg["seconds_week"] += int(duration)
+            if last_seen_at >= today_start:
+                # Clip de la sesión a la ventana de hoy para que una sesión
+                # que arrancó ayer no cuente sus horas de ayer como de hoy.
+                start_today = max(started_at, today_start)
+                agg["seconds_today"] += int(max(0.0, (last_seen_at - start_today).total_seconds()))
+            if last_seen_at >= online_cutoff:
+                agg["online"] = True
+            prev_seen = agg["last_seen_at"]
+            seen_iso = last_seen_at.isoformat()
+            if prev_seen is None or seen_iso > prev_seen:
+                agg["last_seen_at"] = seen_iso
+            # La sesión también cuenta como "última actividad" del usuario.
+            prev_act = last_activity_by_user.get(s.user_id)
+            if prev_act is not None and prev_act.tzinfo is None:
+                prev_act = prev_act.replace(tzinfo=timezone.utc)
+            if prev_act is None or last_seen_at > prev_act:
+                last_activity_by_user[s.user_id] = last_seen_at
+
     # --- Stitch ------------------------------------------------------------
     users = db.query(User).all()
     empty_videos = {"total": 0, "done": 0, "approved": 0, "failed": 0, "in_progress": 0}
@@ -900,6 +968,7 @@ async def admin_activity(
             "errors": {
                 "count": videos_by_user.get(u.id, empty_videos)["failed"],
                 "recent": errors_by_user.get(u.id, []),
+                "by_category": error_categories_by_user.get(u.id, {}),
             },
             "rework": rework,
             "backgrounds": {
@@ -907,6 +976,9 @@ async def admin_activity(
                 "ai_generated": ai_bg_by_user.get(u.id, 0),
             },
             "ai_cost_usd": round(ai_cost_by_user.get(u.id, 0.0), 2),
+            # None cuando la telemetría está apagada o el usuario no tuvo
+            # sesiones esta semana — el frontend lee con optional chaining.
+            "sessions": sessions_by_user.get(u.id) if telemetry_on else None,
         })
 
     # Usuarios con actividad primero (más reciente arriba); los que nunca
@@ -917,6 +989,11 @@ async def admin_activity(
         "since_days": since_days,
         "since": since.isoformat(),
         "users": result,
+        # Breakdown global de errores por categoría (para los chips del tab).
+        "errors_by_category": errors_by_category_global,
+        # Si está apagada, el frontend muestra "tracking deshabilitado" en
+        # vez de columnas de tiempo en cero.
+        "telemetry_enabled": telemetry_on,
     }
 
 

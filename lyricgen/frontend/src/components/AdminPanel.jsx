@@ -27,6 +27,28 @@ function fmtAgo(iso) {
   return fmtDate(iso);
 }
 
+// Formato compacto de duración para "tiempo en la app": 45m, 2h 14m, 0m.
+function fmtDuration(seconds) {
+  const s = Math.max(0, Number(seconds) || 0);
+  const mins = Math.round(s / 60);
+  if (mins < 60) return `${mins}m`;
+  const hours = Math.floor(mins / 60);
+  return `${hours}h ${mins % 60}m`;
+}
+
+// Labels en español para las categorías de error de error_taxonomy.py.
+// Agregar una categoría nueva en el backend = agregar el label acá.
+const ERROR_CATEGORY_LABELS = {
+  veo: "Fondo IA (Veo)",
+  render: "Render / ffmpeg",
+  upload: "Storage / R2",
+  timing: "Timing de letra",
+  validation: "Validación / política",
+  reaper: "Worker colgado",
+  timeout: "Timeout",
+  unknown: "Otro",
+};
+
 // Suma de todas las señales de retrabajo de una fila de /admin/activity.
 // Es el número que se muestra colapsado; el desglose vive en el drill-down.
 function reworkTotal(rw) {
@@ -1532,6 +1554,38 @@ export default function AdminPanel({ onBack }) {
                 />
               </div>
 
+              {/* Breakdown global de errores por categoría (error_taxonomy) */}
+              {Object.keys(activity.errors_by_category || {}).length > 0 && (
+                <div className="glass rounded-card p-4">
+                  <p className="text-[10px] text-gray-500 uppercase tracking-wider mb-2">
+                    Errores por categoría
+                  </p>
+                  <div className="flex flex-wrap gap-2">
+                    {Object.entries(activity.errors_by_category)
+                      .sort((a, b) => b[1] - a[1])
+                      .map(([cat, n]) => (
+                        <span
+                          key={cat}
+                          className="px-2.5 py-1 rounded-full bg-red-500/10 ring-1 ring-red-500/20 text-[11px] text-red-300"
+                        >
+                          {ERROR_CATEGORY_LABELS[cat] || cat}: <b>{n}</b>
+                        </span>
+                      ))}
+                  </div>
+                </div>
+              )}
+
+              {/* Aviso cuando el tracking de sesiones está apagado */}
+              {!activity.telemetry_enabled && (
+                <div className="rounded-card bg-surface-3/30 ring-1 ring-white/[0.04] px-4 py-3">
+                  <p className="text-[11px] text-gray-500">
+                    El tracking de tiempo-en-app está deshabilitado
+                    (<span className="font-mono">TELEMETRY_ENABLED</span> apagada en el server).
+                    Las columnas "Hoy" / "7 días" y el indicador de "en línea" aparecen al habilitarla.
+                  </p>
+                </div>
+              )}
+
               {/* Per-user table con drill-down expandible */}
               <div className="glass-elevated rounded-card p-5">
                 <div className="flex items-center justify-between mb-4">
@@ -1546,6 +1600,12 @@ export default function AdminPanel({ onBack }) {
                       <tr className="text-gray-500 uppercase tracking-wide text-[10px]">
                         <th className="text-left font-medium pb-2 pr-3">Usuario</th>
                         <th className="text-left font-medium pb-2 px-3">Última actividad</th>
+                        {activity.telemetry_enabled && (
+                          <>
+                            <th className="text-right font-medium pb-2 px-3">Hoy</th>
+                            <th className="text-right font-medium pb-2 px-3">7 días</th>
+                          </>
+                        )}
                         <th className="text-right font-medium pb-2 px-3">Videos</th>
                         <th className="text-right font-medium pb-2 px-3">Aprobados</th>
                         <th className="text-right font-medium pb-2 px-3">En curso</th>
@@ -1568,12 +1628,28 @@ export default function AdminPanel({ onBack }) {
                               <span className={`font-medium ${u.is_active ? "text-white" : "text-gray-500 line-through"}`}>
                                 {u.username}
                               </span>
+                              {u.sessions?.online && (
+                                <span
+                                  className="ml-1.5 inline-block w-2 h-2 rounded-full bg-emerald-400 animate-pulse"
+                                  title="En línea ahora"
+                                />
+                              )}
                               {u.role === "admin" && (
                                 <span className="ml-1.5 text-[9px] uppercase tracking-wide text-brand">admin</span>
                               )}
                               <span className="block text-[10px] text-gray-500 font-mono">{u.tenant_id}</span>
                             </td>
                             <td className="py-2 px-3 text-gray-300 whitespace-nowrap">{fmtAgo(u.last_activity)}</td>
+                            {activity.telemetry_enabled && (
+                              <>
+                                <td className="py-2 px-3 text-right tabular-nums text-gray-300">
+                                  {fmtDuration(u.sessions?.seconds_today)}
+                                </td>
+                                <td className="py-2 px-3 text-right tabular-nums text-gray-300">
+                                  {fmtDuration(u.sessions?.seconds_week)}
+                                </td>
+                              </>
+                            )}
                             <td className="py-2 px-3 text-right tabular-nums text-gray-300">
                               <span className="text-accent font-medium">{u.videos.done}</span>
                               <span className="text-gray-500"> / {u.videos.total}</span>
@@ -1595,7 +1671,7 @@ export default function AdminPanel({ onBack }) {
                           </tr>
                           {activityExpanded === u.user_id && (
                             <tr>
-                              <td colSpan={9} className="py-3 px-3 bg-surface-3/20">
+                              <td colSpan={activity.telemetry_enabled ? 11 : 9} className="py-3 px-3 bg-surface-3/20">
                                 {/* Desglose de retrabajos */}
                                 <div className="flex flex-wrap gap-2 mb-3">
                                   {[
@@ -1657,6 +1733,11 @@ export default function AdminPanel({ onBack }) {
                                           <div className="space-y-1.5">
                                             {u.errors.recent.map((e) => (
                                               <div key={e.job_id} className="text-[11px]">
+                                                {e.category && (
+                                                  <span className="mr-1.5 px-1.5 py-0.5 rounded bg-red-500/10 ring-1 ring-red-500/20 text-[10px] text-red-300">
+                                                    {ERROR_CATEGORY_LABELS[e.category] || e.category}
+                                                  </span>
+                                                )}
                                                 <span className="text-gray-400">{e.artist} — {e.song_title || e.job_id}:</span>{" "}
                                                 <span className="text-red-300 font-mono break-all">{e.error || "(sin mensaje)"}</span>
                                               </div>
@@ -1724,6 +1805,10 @@ export default function AdminPanel({ onBack }) {
                   </li>
                   <li>
                     <b>Costo IA</b> estimado con las mismas tarifas del tab Costos.
+                  </li>
+                  <li>
+                    <b>Hoy / 7 días</b> (con telemetría habilitada): tiempo real con la app abierta y visible,
+                    medido por heartbeats del navegador cada 60 s. El punto verde = activo en los últimos 3 minutos.
                   </li>
                 </ul>
               </div>

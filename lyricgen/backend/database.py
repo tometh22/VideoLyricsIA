@@ -300,6 +300,12 @@ class Job(Base):
     current_step = Column(String(50), default="whisper")
     progress = Column(Integer, default=0)
     error = Column(Text, nullable=True)
+    # Categoría del error (veo | render | upload | timing | validation |
+    # timeout | reaper | unknown). La setea error_taxonomy.classify_error()
+    # en los sinks del pipeline/reaper para que el dashboard de actividad
+    # agrupe errores sin parsear mensajes. Nullable: rows viejas se
+    # clasifican a lectura con el mismo clasificador.
+    error_category = Column(String(32), nullable=True)
     # Which engine produced the lyric timing for this job: forced_align |
     # lrclib_synced | gemini_aligner | whisper. Observability so we can
     # answer "what timed this job?" without grepping logs that scroll.
@@ -790,6 +796,45 @@ class AssetUsage(Base):
         }
 
 
+class UserSession(Base):
+    """Sesiones de uso de la app, alimentadas por POST /telemetry/heartbeat.
+
+    Backs el "tiempo en la app" y el "en línea ahora" del tab Actividad del
+    AdminPanel. El frontend manda un heartbeat por minuto mientras la
+    pestaña está visible; el endpoint extiende la sesión abierta
+    (last_seen_at) o crea una nueva cuando el gap supera los 30 min.
+    Tiempo en app = SUM(last_seen_at - started_at) por ventana.
+
+    Gateado por TELEMETRY_ENABLED (env, default off) — sin la flag el
+    endpoint no escribe y el frontend ni siquiera manda heartbeats.
+    """
+    __tablename__ = "user_sessions"
+    __table_args__ = (
+        Index("ix_user_sessions_user_started", "user_id", text("started_at DESC")),
+    )
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    # Desnormalizado para poder filtrar sesiones por tenant sin join.
+    tenant_id = Column(String(100), nullable=False, index=True)
+    started_at = Column(DateTime(timezone=True), default=utcnow, nullable=False)
+    # Backs el "online now" (last_seen < 3 min) y el sweep de retención.
+    last_seen_at = Column(DateTime(timezone=True), default=utcnow, nullable=False, index=True)
+    # Cantidad de heartbeats acumulados — distingue una sesión real de un
+    # ping suelto y sirve de sanity check (heartbeats ≈ minutos visibles).
+    heartbeats = Column(Integer, default=1, nullable=False, server_default="1")
+
+    def to_dict(self):
+        return {
+            "id": self.id,
+            "user_id": self.user_id,
+            "tenant_id": self.tenant_id,
+            "started_at": self.started_at.isoformat() if self.started_at else None,
+            "last_seen_at": self.last_seen_at.isoformat() if self.last_seen_at else None,
+            "heartbeats": self.heartbeats or 0,
+        }
+
+
 class AIProvenance(Base):
     """Records every AI tool invocation for UMG compliance and copyright audit."""
     __tablename__ = "ai_provenance"
@@ -951,6 +996,12 @@ def _migrate_user_columns():
         "ALTER TABLE deliveries ADD COLUMN IF NOT EXISTS approved_at TIMESTAMPTZ",
         "CREATE INDEX IF NOT EXISTS ix_deliveries_approved_at ON deliveries(approved_at)",
         "ALTER TABLE deliveries ADD COLUMN IF NOT EXISTS approved_by_label VARCHAR(120)",
+        # Categoría del error para el dashboard de actividad (PR telemetría).
+        # Se setea en los sinks de error del pipeline/reaper vía
+        # error_taxonomy.classify_error(). Espejo de la migración Alembic
+        # de user_sessions + error_category (mismo patrón que
+        # last_user_activity_at: la tabla nueva la crea create_all()).
+        "ALTER TABLE jobs ADD COLUMN IF NOT EXISTS error_category VARCHAR(32)",
     ]
     # Each statement gets its own transaction. In Postgres, a failed statement
     # inside a transaction puts it in aborted state — subsequent execute()

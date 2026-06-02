@@ -217,6 +217,41 @@ function RootEffects({ setUser, setResetToken, setBillingSuccess }) {
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
+
+  // --- Heartbeat de telemetría de sesiones (tiempo-en-app) ---
+  // Manda 1 ping/min a /telemetry/heartbeat mientras haya sesión iniciada
+  // y la pestaña esté visible. Alimenta el "tiempo en la app" y el "en
+  // línea ahora" del tab Actividad del AdminPanel.
+  //
+  // Best-effort por contrato: los errores se tragan (sin Sentry, sin
+  // toasts) — la telemetría jamás puede molestar al usuario. El gate real
+  // vive en el server (TELEMETRY_ENABLED); features.telemetry === false
+  // solo evita gastar requests cuando sabemos que está apagada. Si el
+  // user cacheado es viejo y no trae el campo, mandamos igual y el server
+  // responde recorded:false (inofensivo).
+  useEffect(() => {
+    const beat = () => {
+      if (typeof document !== "undefined" && document.hidden) return;
+      if (!getToken()) return;
+      const u = getUser();
+      if (u?.features && u.features.telemetry === false) return;
+      authFetch(`${API}/telemetry/heartbeat`, { method: "POST" }).catch(() => {});
+    };
+    beat(); // primer beat al montar (si la pestaña está visible)
+    const iv = setInterval(beat, 60_000);
+    // Beat inmediato al volver el foco — así "en línea" se refleja al toque
+    // y no hasta 60 s después.
+    const onVis = () => {
+      if (typeof document !== "undefined" && !document.hidden) beat();
+    };
+    document.addEventListener("visibilitychange", onVis);
+    return () => {
+      clearInterval(iv);
+      document.removeEventListener("visibilitychange", onVis);
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
   return null;
 }
 
