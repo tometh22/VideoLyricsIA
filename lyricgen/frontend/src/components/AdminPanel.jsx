@@ -51,10 +51,19 @@ const ERROR_CATEGORY_LABELS = {
 
 // Suma de todas las señales de retrabajo de una fila de /admin/activity.
 // Es el número que se muestra colapsado; el desglose vive en el drill-down.
+// corrected_jobs = videos con corrección manual de letra (jobs distintos,
+// no eventos de autosave — ver el fix del bug "1011 retrabajos").
 function reworkTotal(rw) {
   if (!rw) return 0;
   return (rw.variants || 0) + (rw.total_edits || 0) + (rw.retries || 0)
-    + (rw.manual_lyric_saves || 0) + (rw.abandoned_recreated || 0);
+    + (rw.corrected_jobs || 0) + (rw.abandoned_recreated || 0);
+}
+
+// "Sin actividad" = no creó videos ni hizo retrabajos en la ventana.
+// Las cuentas de test (whtest/billtest/pentest) y los usuarios dormidos
+// caen acá — se esconden por default para no ahogar la tabla.
+function hasActivity(u) {
+  return (u.videos?.total || 0) > 0 || reworkTotal(u.rework) > 0;
 }
 
 // Colores de status para el timeline de jobs del drill-down. Mismo
@@ -141,6 +150,10 @@ export default function AdminPanel({ onBack }) {
   // para no re-pedir al colapsar/expandir.
   const [activityExpanded, setActivityExpanded] = useState(null);
   const [activityDetail, setActivityDetail] = useState({});
+  // Filtros de la tabla: esconder usuarios sin actividad (default ON, las
+  // cuentas de test ahogan la tabla) y filtrar por tenant (ej. solo UMG).
+  const [activityHideInactive, setActivityHideInactive] = useState(true);
+  const [activityTenantFilter, setActivityTenantFilter] = useState("");
   const loadActivity = async () => {
     setActivityLoading(true);
     // Al recargar (cambio de período o de tab) el detalle cacheado queda
@@ -181,6 +194,14 @@ export default function AdminPanel({ onBack }) {
     setActivityExpanded(uid);
     if (!activityDetail[uid]) loadActivityDetail(uid);
   };
+  // Lista visible según filtros. Las cards de resumen y la tabla usan esta
+  // misma lista para que los números sean consistentes con lo que se ve.
+  const visibleActivityUsers = (activity?.users || []).filter((u) => {
+    if (activityTenantFilter && u.tenant_id !== activityTenantFilter) return false;
+    if (activityHideInactive && !hasActivity(u)) return false;
+    return true;
+  });
+  const hiddenActivityCount = (activity?.users?.length || 0) - visibleActivityUsers.length;
 
   // Inline error banner — usado por handlers que hacen mutaciones
   // (delete bg, toggle user, change plan, etc.) y necesitan informar
@@ -1493,7 +1514,7 @@ export default function AdminPanel({ onBack }) {
       {/* Costos — panel de margen del operador */}
       {tab === "activity" && (
         <div className="space-y-6">
-          {/* Period selector */}
+          {/* Period selector + filtros */}
           <div className="glass rounded-card p-4 flex items-center gap-4 flex-wrap">
             <div className="flex items-center gap-2">
               <span className="text-[11px] text-gray-500 uppercase tracking-wide">Período</span>
@@ -1511,6 +1532,31 @@ export default function AdminPanel({ onBack }) {
                 </button>
               ))}
             </div>
+            {/* Filtro por tenant — armado de los tenants presentes en la respuesta */}
+            {activity && !activity.restricted && (
+              <div className="flex items-center gap-2">
+                <span className="text-[11px] text-gray-500 uppercase tracking-wide">Tenant</span>
+                <select
+                  value={activityTenantFilter}
+                  onChange={(e) => setActivityTenantFilter(e.target.value)}
+                  className="bg-surface-3/40 ring-1 ring-white/[0.06] focus:ring-brand/40 focus:outline-none rounded-md px-2 py-1 text-xs text-white"
+                >
+                  <option value="">Todos</option>
+                  {[...new Set(activity.users.map((u) => u.tenant_id).filter(Boolean))].sort().map((t) => (
+                    <option key={t} value={t}>{t}</option>
+                  ))}
+                </select>
+              </div>
+            )}
+            <label className="flex items-center gap-1.5 text-[11px] text-gray-400 cursor-pointer select-none">
+              <input
+                type="checkbox"
+                checked={activityHideInactive}
+                onChange={(e) => setActivityHideInactive(e.target.checked)}
+                className="accent-brand"
+              />
+              Ocultar usuarios sin actividad
+            </label>
             <button
               onClick={loadActivity}
               className="ml-auto px-3 py-1 rounded-md text-xs ring-1 ring-white/[0.06] text-gray-400 hover:text-white transition-colors"
@@ -1533,23 +1579,23 @@ export default function AdminPanel({ onBack }) {
             </div>
           ) : (
             <>
-              {/* Headline cards: actividad agregada de la ventana */}
+              {/* Headline cards: actividad agregada de lo VISIBLE (respeta filtros) */}
               <div className="grid grid-cols-2 lg:grid-cols-4 gap-4">
                 <StatCard
-                  value={activity.users.filter((u) => u.videos.total > 0).length}
+                  value={visibleActivityUsers.filter((u) => u.videos.total > 0).length}
                   label={`Usuarios activos (${activity.since_days}d)`}
                 />
                 <StatCard
-                  value={activity.users.reduce((s, u) => s + u.videos.total, 0)}
+                  value={visibleActivityUsers.reduce((s, u) => s + u.videos.total, 0)}
                   label="Videos creados"
                 />
                 <StatCard
-                  value={activity.users.reduce((s, u) => s + u.errors.count, 0)}
+                  value={visibleActivityUsers.reduce((s, u) => s + u.errors.count, 0)}
                   label="Errores"
                   color="text-red-400"
                 />
                 <StatCard
-                  value={`$${activity.users.reduce((s, u) => s + u.ai_cost_usd, 0).toFixed(2)}`}
+                  value={`$${visibleActivityUsers.reduce((s, u) => s + u.ai_cost_usd, 0).toFixed(2)}`}
                   label="Costo IA"
                 />
               </div>
@@ -1591,7 +1637,9 @@ export default function AdminPanel({ onBack }) {
                 <div className="flex items-center justify-between mb-4">
                   <h3 className="text-sm font-semibold">Actividad por usuario</h3>
                   <span className="text-[11px] text-gray-500">
-                    {activity.users.length} usuarios · click en una fila para el detalle
+                    {visibleActivityUsers.length} usuarios
+                    {hiddenActivityCount > 0 && ` (${hiddenActivityCount} ocultos sin actividad)`}
+                    {" · click en una fila para el detalle"}
                   </span>
                 </div>
                 <div className="overflow-x-auto">
@@ -1616,7 +1664,14 @@ export default function AdminPanel({ onBack }) {
                       </tr>
                     </thead>
                     <tbody className="divide-y divide-white/[0.04]">
-                      {activity.users.map((u) => (
+                      {visibleActivityUsers.length === 0 && (
+                        <tr>
+                          <td colSpan={activity.telemetry_enabled ? 11 : 9} className="py-8 text-center text-gray-500 text-xs">
+                            Sin usuarios con actividad en esta ventana / filtro.
+                          </td>
+                        </tr>
+                      )}
+                      {visibleActivityUsers.map((u) => (
                         <Fragment key={u.user_id}>
                           <tr
                             onClick={() => toggleActivityRow(u.user_id)}
@@ -1681,7 +1736,7 @@ export default function AdminPanel({ onBack }) {
                                     ["Fondos regenerados", u.rework.edits_background],
                                     ["Metadata", u.rework.edits_metadata],
                                     ["Reintentos", u.rework.retries],
-                                    ["Correcciones manuales de letra", u.rework.manual_lyric_saves],
+                                    ["Videos con corrección de letra", u.rework.corrected_jobs],
                                     ["Abandonados y recreados", u.rework.abandoned_recreated],
                                   ].filter(([, n]) => n > 0).map(([label, n]) => (
                                     <span key={label} className="px-2 py-0.5 rounded-full bg-amber-500/10 ring-1 ring-amber-500/20 text-[10px] text-amber-300">
