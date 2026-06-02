@@ -29,7 +29,7 @@ import TitleCardPreview from "./components/TitleCardPreview";
 // a session in exchange for a much faster cold start everywhere
 // else; subsequent opens are instant because the chunk is cached.
 const LyricsEditor = lazy(() => import("./components/LyricsEditor"));
-const AdminPanel = lazy(() => import("./components/AdminPanel"));
+const AdminPanel = lazy(() => import("./components/admin/AdminPanel"));
 const Settings = lazy(() => import("./components/Settings"));
 const Landing = lazy(() => import("./components/Landing"));
 const JobDetail = lazy(() => import("./components/JobDetail"));
