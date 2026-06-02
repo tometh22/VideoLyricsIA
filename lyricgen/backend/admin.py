@@ -216,6 +216,11 @@ class CreateUserRequest(BaseModel):
     # transaction sets ai_authorized_at/by so the operator doesn't have
     # to follow up with a separate authorize-ai call.
     ai_authorized: bool = False
+    # Cuenta de facturación compartida entre tenants. Ej: usuarios de
+    # universal_argentina y universal_chile con billing_group
+    # "universal_music" consumen del mismo plan mensual aunque no se vean
+    # los videos entre sí. Vacío = sin grupo (cuota por tenant).
+    billing_group: str = ""
 
 
 @router.post("/users")
@@ -267,6 +272,9 @@ async def create_user_admin(
             # the admin that created the user, mirroring authorize-ai.
             user.ai_authorized_at = datetime.now(timezone.utc)
             user.ai_authorized_by = admin["id"]
+            _post_create_dirty = True
+        if body.billing_group.strip():
+            user.billing_group = body.billing_group.strip().lower()
             _post_create_dirty = True
         if _post_create_dirty:
             db.commit()
@@ -335,6 +343,13 @@ class UpdateUserRequest(BaseModel):
     # B2B / overage opt-in. True = user can keep generating past plan
     # monthly limit (extra videos invoice out-of-band).
     allow_overage: Optional[bool] = None
+    # Mover al usuario a otro workspace (tenant). Si move_jobs es True
+    # (default), sus videos se mueven con él — así no pierde su historial.
+    tenant_id: Optional[str] = None
+    move_jobs: bool = True
+    # Cuenta de facturación compartida. String vacío = sacar del grupo
+    # (volver a cuota por tenant). None = sin cambios.
+    billing_group: Optional[str] = None
 
 
 @router.patch("/users/{user_id}")
@@ -344,7 +359,7 @@ async def update_user_admin(
     admin: dict = Depends(require_admin),
     db: Session = Depends(get_db),
 ):
-    """Update a user's plan, role, or status."""
+    """Update a user's plan, role, status, workspace (tenant) or billing group."""
     user = db.query(User).filter(User.id == user_id).first()
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
@@ -373,18 +388,89 @@ async def update_user_admin(
     if body.allow_overage is not None:
         user.allow_overage = bool(body.allow_overage)
 
+    # Cambio de workspace (tenant). El admin mueve usuarios entre equipos
+    # (ej. reorganización de Universal en AR/CL). Por default los jobs del
+    # usuario se mueven con él para que conserve su historial — sin esto,
+    # sus videos quedan huérfanos en el tenant viejo (solo visibles para
+    # admins) y su Historial aparece vacío.
+    moved_jobs = 0
+    old_tenant = user.tenant_id
+    if body.tenant_id is not None and body.tenant_id.strip():
+        new_tenant = body.tenant_id.strip().lower().replace(" ", "_")
+        if new_tenant != user.tenant_id:
+            user.tenant_id = new_tenant
+            if body.move_jobs:
+                moved_jobs = (
+                    db.query(Job)
+                    .filter(Job.user_id == user.id, Job.tenant_id == old_tenant)
+                    .update({Job.tenant_id: new_tenant}, synchronize_session=False)
+                )
+
+    # Cuenta de facturación: "" = sacar del grupo, no-vacío = asignar.
+    if body.billing_group is not None:
+        group = body.billing_group.strip().lower()
+        user.billing_group = group or None
+
     db.commit()
     db.refresh(user)
 
     # Audit
+    detail = {"target_user": user_id, "changes": body.model_dump(exclude_none=True)}
+    if moved_jobs:
+        detail["moved_jobs"] = moved_jobs
+        detail["old_tenant"] = old_tenant
     db.add(AuditLog(
         user_id=admin["id"],
         action="admin.update_user",
-        detail={"target_user": user_id, "changes": body.model_dump(exclude_none=True)},
+        detail=detail,
     ))
     db.commit()
 
     return user.to_dict()
+
+
+@router.delete("/users/{user_id}")
+async def delete_user_admin(
+    user_id: int,
+    admin: dict = Depends(require_admin),
+    db: Session = Depends(get_db),
+):
+    """Soft-delete a user: deactivate + anonymise (same contract as the
+    self-service /auth/account DELETE).
+
+    Hard delete es imposible sin romper FKs (jobs, invoices, audit apuntan
+    a users.id sin CASCADE) y además borraría el rastro de auditoría. El
+    soft-delete deja la fila pero:
+      - is_active=False → no puede loguearse, no aparece en vistas activas
+      - username → deleted_{id}, email → NULL → datos personales fuera
+
+    Guards:
+      - Un admin no puede borrarse a sí mismo (lockout accidental).
+      - No se puede borrar a otro admin — primero hay que degradarlo a
+        user (PATCH role) y después borrarlo. Dos pasos a propósito.
+    """
+    user = db.query(User).filter(User.id == user_id).first()
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+    if user.id == admin["id"]:
+        raise HTTPException(status_code=400, detail="No podés borrar tu propia cuenta de admin.")
+    if user.role == "admin":
+        raise HTTPException(
+            status_code=400,
+            detail="No se puede borrar un admin. Primero degradalo a user (PATCH role) y después borralo.",
+        )
+
+    old_username = user.username
+    user.is_active = False
+    user.email = None
+    user.username = f"deleted_{user.id}"
+    db.add(AuditLog(
+        user_id=admin["id"],
+        action="admin.delete_user",
+        detail={"target_user": user_id, "old_username": old_username, "tenant_id": user.tenant_id},
+    ))
+    db.commit()
+    return {"ok": True, "user_id": user_id, "deleted": True}
 
 
 # ---------------------------------------------------------------------------

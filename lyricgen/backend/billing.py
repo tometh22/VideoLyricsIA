@@ -256,7 +256,8 @@ def _assert_downgrade_allowed(db: Session, user: User, target_plan_id: str,
     the real apply 400s. Raises HTTPException(400) when blocked."""
     from auth import get_plan_usage
     usage = get_plan_usage(
-        db, user.id, current_user["tenant_id"], current_user.get("plan", "100")
+        db, user.id, current_user["tenant_id"], current_user.get("plan", "100"),
+        billing_group=current_user.get("billing_group"),
     )
     target_limit = target_plan.get("limit", 0)
     if not user.allow_overage and usage["used"] > target_limit:
