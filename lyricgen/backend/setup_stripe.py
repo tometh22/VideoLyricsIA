@@ -96,14 +96,18 @@ def main():
     print("=" * 60)
     try:
         # Import here (after env + stripe.api_key are set) so billing's
-        # module-level Stripe/DB init resolves correctly.
-        from billing import build_portal_configuration_params
-        cfg = stripe.billing_portal.Configuration.create(
-            **build_portal_configuration_params()
-        )
-        print(f"  Portal config: {cfg.id}")
-        print("\nAdd this to your .env file:")
-        print(f"STRIPE_PORTAL_CONFIG_ID={cfg.id}")
+        # module-level Stripe/DB init resolves correctly. Reuse the same
+        # ensure path the app uses (find-by-marker → create-once) so re-running
+        # this script doesn't pile up duplicate portal configs in the account.
+        from billing import _ensure_portal_configuration
+        cfg_id = _ensure_portal_configuration()
+        if cfg_id:
+            print(f"  Portal config: {cfg_id}")
+            print("\nAdd this to your .env file:")
+            print(f"STRIPE_PORTAL_CONFIG_ID={cfg_id}")
+        else:
+            print("  WARN: could not resolve a portal configuration.")
+            print("  (The app will lazily create one on first /billing/portal call.)")
     except Exception as exc:
         print(f"  WARN: could not create portal configuration: {exc}")
         print("  (The app will lazily create one on first /billing/portal call.)")

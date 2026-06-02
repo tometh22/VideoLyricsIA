@@ -528,7 +528,7 @@ async def get_payment_method(
     try:
         customer = stripe.Customer.retrieve(
             user.stripe_customer_id,
-            expand=["invoice_settings.default_payment_method"],
+            expand=["invoice_settings.default_payment_method", "default_source"],
         )
         # (1) invoice_settings.default_payment_method — the canonical default
         inv = getattr(customer, "invoice_settings", None)

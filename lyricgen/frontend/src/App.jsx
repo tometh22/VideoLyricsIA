@@ -203,6 +203,13 @@ function RootEffects({ setUser, setResetToken, setBillingSuccess }) {
       setBillingSuccess(true);
       navigate(location.pathname, { replace: true });
     }
+    // Email CTAs (billing lifecycle, dunning) link to /?view=settings&tab=...
+    // — route them to the in-app Settings, preserving the requested tab so the
+    // Facturación deep-link lands correctly.
+    if (params.get("view") === "settings") {
+      const tab = params.get("tab");
+      navigate(tab ? `/account?tab=${tab}` : "/account", { replace: true });
+    }
     if (params.get("verify_email")) {
       fetch("/auth/verify-email", {
         method: "POST",
