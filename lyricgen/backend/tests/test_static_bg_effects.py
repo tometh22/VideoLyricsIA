@@ -115,6 +115,36 @@ def test_each_effect_asset_exists_and_composites(tmp_path, effect):
     assert comp.exists() and comp.stat().st_size > 0
 
 
+@pytest.mark.parametrize("effect", ["snow", "rain", "light"])
+def test_apply_short_effect_overlays_on_vertical_short(tmp_path, effect):
+    """The short's ffmpeg effect post-pass (_apply_short_effect) screen-blends a
+    looped fx onto a finished vertical short — this is how the short finally
+    gets the effect overlay it was missing entirely (client-visible divergence
+    from the main video). Output stays a valid 1080x1920 video."""
+    import shutil
+    from pipeline import _apply_short_effect
+
+    # A vertical 'short' (1080x1920) with a silent audio track, like moviepy writes.
+    img = tmp_path / "v.jpg"
+    _make_image(img, 1080, 1920)
+    base = tmp_path / "base.mp4"
+    subprocess.run(
+        ["ffmpeg", "-y", "-loglevel", "error", "-loop", "1", "-i", str(img),
+         "-f", "lavfi", "-i", "anullsrc=r=44100:cl=stereo", "-t", "2",
+         "-vf", "scale=1080:1920", "-c:v", "libx264", "-preset", "ultrafast",
+         "-c:a", "aac", "-shortest", str(base)],
+        check=True, capture_output=True,
+    )
+    short = tmp_path / f"short_{effect}.mp4"
+    shutil.copy(base, short)               # _apply_short_effect replaces in place
+    fx_path = fx.effect_path(effect)
+    out = _apply_short_effect(str(short), fx_path, 24, str(tmp_path))
+    assert os.path.exists(out)
+    w, h, dur = _probe(out)
+    assert (w, h) == (1080, 1920)          # stays vertical
+    assert dur > 1.5
+
+
 def test_build_video_filter_shape():
     """No effect → cheap -vf path; effect → filter_complex with a screen blend
     and the looped fx as an extra input."""
