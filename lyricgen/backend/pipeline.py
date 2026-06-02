@@ -6561,7 +6561,12 @@ def _ensure_background(style_hint: str, job_dir: str, lyrics_text: str = None,
     # garantiza que el video parezca vivo.
     # Operator override: si seteó effect="" pero tildó algún otro motion
     # (no estatico/sutil), respetamos su elección (no forzamos light).
-    if _norm_move_bg in ("estatico", "sutil") and not (effect or "").strip():
+    # Foto fija / estático / sutil SIN effect → default a "light" (el más sutil)
+    # para que el fondo nunca quede 100% muerto. La "Foto fija" (ex foto-parallax)
+    # ya no panea — la vida/movimiento la da el efecto componible (lluvia/nieve/
+    # luces/estrellas/bokeh vía fx_compositor). El operador elige el efecto en el
+    # wizard; este default sólo cubre el caso sin elección.
+    if _norm_move_bg in ("estatico", "sutil", "foto-parallax") and not (effect or "").strip():
         logger.info(
             "[BG] movement=%s + no effect selected — defaulting effect=light "
             "para evitar foto 100%% quieta (UMG-style guideline 2026-05-25)",
@@ -6650,48 +6655,23 @@ def _ensure_background(style_hint: str, job_dir: str, lyrics_text: str = None,
         #   - "Sutil"           → barely-there gentle drift (no zoom, no forward).
         #   - "Foto + parallax" → slow lateral pan (no zoom, no forward).
         #   - otherwise         → the usual zoom/pan Ken Burns.
-        # UMG-style fix (2026-05-25): el operador reportó que el path
-        # estatico → static=True (frame frozen bit-perfect) NO matchea las
-        # references UMG, donde TODO video calmo tiene al menos un source
-        # de motion: drift sutil + partículas overlay + scene motion (olas/
-        # nubes/humo). Nunca 100% quieto.
+        # Foto fija (2026-06-02): el fondo-imagen se rinde ESTÁTICO por ffmpeg
+        # (C-level, RAM acotada) en vez del Ken Burns full-duration por moviepy.
         #
-        # Nueva regla:
-        #   - "Estático" → subtle=True (micro-drift apenas perceptible).
-        #     El operador esperaba "cámara fija, escena viva"; subtle da eso.
-        #     El effect overlay (snow/rain/stars/light) se compone encima
-        #     vía fx_compositor.build_video_filter, independiente del path.
-        #   - "Sutil"           → subtle=True (igual que antes).
-        #   - "Foto + parallax" → lateral=True (igual que antes).
-        #   - otros             → Ken Burns default (zoom/pan).
+        # Causa raíz del cambio (incidente 2026-06-02, "Rata Blanca"): el render
+        # Ken Burns por la duración COMPLETA (UMG fix 2026-05-25) hacía que moviepy
+        # animara ~7.800 frames del paneo (easing + zoom-breath + back-and-forth)
+        # uno por uno en Python; en una canción de 5 min + un render ProRes pesado
+        # en paralelo, el worker se quedaba sin RAM y el kernel lo mataba (OOM /
+        # SIGKILL) en medio del render → job huérfano en "processing" para siempre.
         #
-        # NOTE: dejamos el parámetro static=True en _ken_burns_clip por si
-        # algún caller fuera del wizard lo necesita (ej. tests, edit modal),
-        # pero el wizard nunca lo activa.
-        # Fix urgente 2026-05-25 (operador UMG: 'foto que se mueve a la
-        # izquierda con movimiento todo trabado y feo'). Causa raíz: el
-        # sample de 60s se palindrome-loopea para llenar audios >60s. En
-        # un audio de 4:28 la cámara cambia de dirección CADA 60 SEGUNDOS
-        # (forward → reverse → forward...), generando el 'trabado'.
-        #
-        # Fix: cuando conocemos audio_duration y es >60s, renderizar el
-        # Ken Burns por la duración COMPLETA del audio. Sin palindrome
-        # loop = sin reversiones = pan continuo y limpio. Caro en CPU
-        # (~5min más por job) pero acceptable para UMG.
-        _kb_dur = max(60.0, float(audio_duration) if audio_duration else 60.0)
-        if audio_duration and float(audio_duration) > 60.0:
-            logger.info(
-                "[BG] Ken Burns render full audio duration %.1fs (no palindrome loop) "
-                "para evitar movimiento trabado (UMG fix 2026-05-25)",
-                _kb_dur,
-            )
-        _ken_burns_image_to_mp4(
-            image_path, bg_path,
-            sample_duration=_kb_dur,
-            static=False,
-            lateral=(_norm_move_bg == "foto-parallax"),
-            subtle=(_norm_move_bg in ("estatico", "sutil")),
-        )
+        # Decisión de producto: sacamos el paneo y dejamos FOTO FIJA. La vida/
+        # movimiento del video la da ahora el EFECTO componible (snow/rain/stars/
+        # bokeh/light), que se compone por ffmpeg overlay (fx_compositor) — barato
+        # y OOM-safe. Un loop estático de ffmpeg es imposible que OOMee, para
+        # cualquier largo de canción y cualquier opción del wizard.
+        _bg_dur = max(60.0, float(audio_duration) if audio_duration else 60.0)
+        _static_image_to_mp4(image_path, bg_path, duration=_bg_dur)
         return bg_path
 
     # True verbatim = operator's own prompt is actually in use (bg_verbatim set
@@ -6789,6 +6769,14 @@ def _ken_burns_image_to_mp4(
     subtle: bool = False,
 ) -> str:
     """Render a Ken Burns animation over a still image as a standalone MP4.
+
+    ⚠️ NO LONGER WIRED (2026-06-02). The Imagen background path used to call
+    this, but rendering the full-duration pan through moviepy animated ~7,800
+    frames one-by-one in Python and OOM-SIGKILLed the worker on long songs
+    (incident "Rata Blanca"), leaving the job stuck in "processing". The photo
+    background is now a STATIC ffmpeg render (`_static_image_to_mp4`) + a
+    composable effect overlay. DO NOT re-wire this for full-duration renders
+    without first making it ffmpeg/memory-safe. Kept for reference/tests.
 
     Wraps `_ken_burns_clip` (which returns a moviepy VideoClip object) into
     a file-on-disk that matches the contract `_ensure_background` returns
@@ -7356,6 +7344,43 @@ def _prerender_kenburns_bg(image_path: str, duration: float, job_dir: str,
     size_mb = os.path.getsize(out_path) / 1024 / 1024
     logger.info("[BG] Ken Burns (zoompan): %.0fs, %.1f MB", duration, size_mb)
     return out_path
+
+
+def _static_image_to_mp4(image_path: str, output_path: str, duration: float,
+                         *, spec: "RenderSpec | None" = None) -> str:
+    """Render a still image as a STATIC background video via ffmpeg — no motion.
+
+    Replaces the moviepy Ken Burns render for the photo background path. The
+    moviepy render animated thousands of pan frames one-by-one in Python and
+    OOM-SIGKILLed the worker on long songs (incident 2026-06-02, "Rata Blanca"),
+    leaving the job stuck in "processing". ffmpeg loops the single image at
+    C-level with bounded memory — impossible to OOM at any song length. The
+    video's life/motion now comes from the composable effect overlay
+    (fx_compositor: snow/rain/stars/bokeh/light), not a camera pan.
+
+    Same on-disk contract as the old Ken Burns output: a full-duration MP4 at
+    `output_path` that the rest of the pipeline composes lyrics + effect onto.
+    """
+    if spec is None:
+        spec = RenderSpec.youtube_default()
+    # Fill the frame (cover) at the target dims, then hold it for `duration`.
+    vf = (
+        f"scale={spec.width}:{spec.height}:force_original_aspect_ratio=increase,"
+        f"crop={spec.width}:{spec.height},fps={spec.fps_str}"
+    )
+    run_checked(
+        ["ffmpeg", "-y", "-loglevel", "error",
+         "-loop", "1", "-i", os.path.abspath(image_path),
+         "-t", str(duration),
+         "-vf", vf, "-c:v", "libx264", "-preset", "fast", "-crf", "20",
+         "-pix_fmt", "yuv420p", "-an", output_path],
+        label="ffmpeg-static-bg",
+        timeout=300,
+        output_path=output_path,
+    )
+    size_mb = os.path.getsize(output_path) / 1024 / 1024
+    logger.info("[BG] static image render: %.0fs, %.1f MB", duration, size_mb)
+    return output_path
 
 
 def _attach_close_chain(target_clip, owned_clips):
