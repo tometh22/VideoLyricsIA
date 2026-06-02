@@ -438,3 +438,22 @@ def test_admin_activity_allowlist_unset_allows_any_admin(client, admin_token, mo
     monkeypatch.delenv("SUPER_ADMIN_USERS", raising=False)
     res = client.get("/admin/activity", headers=auth(admin_token))
     assert res.status_code == 200
+
+
+def test_admin_jobs_includes_username(client, admin_token, db):
+    """El pipeline del admin muestra quién creó cada job → /admin/jobs
+    devuelve username (join con users) además del tenant."""
+    from database import Job
+    uid, username, _ = _register_activity_user(client)
+    db.add(Job(job_id="actv6a", user_id=uid, tenant_id="act-test", artist="F",
+               song_title="Pipeline", filename="f.mp3", status="processing"))
+    db.commit()
+    try:
+        res = client.get("/admin/jobs?tenant_id=act-test", headers=auth(admin_token))
+        assert res.status_code == 200
+        jobs = res.json()["jobs"]
+        row = next(j for j in jobs if j["job_id"] == "actv6a")
+        assert row["username"] == username
+        assert row["tenant_id"] == "act-test"
+    finally:
+        _cleanup_activity_seed(db, "actv6", uid)
