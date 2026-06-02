@@ -3,9 +3,11 @@
 import html
 import logging
 import os
+import re
 import smtplib
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
+from email.utils import formatdate, make_msgid, parseaddr
 from typing import Optional
 
 logger = logging.getLogger("genly.email")
@@ -54,6 +56,30 @@ def _staging_gate(to: str, subject: str) -> Optional[str]:
     return None
 
 
+def _html_to_text(html_body: str) -> str:
+    """Derive a plain-text version of an HTML email body.
+
+    Spam filters penalize HTML-only messages (no text/plain alternative),
+    so every outbound email carries both parts. This doesn't need to be
+    pretty — just a readable fallback with the links preserved.
+    """
+    text = html_body
+    # Drop non-content blocks entirely.
+    text = re.sub(r"(?is)<(head|style|script)\b.*?</\1>", "", text)
+    # Keep link targets: <a href="url">label</a> → "label: url"
+    text = re.sub(r'(?is)<a\b[^>]*href="([^"]+)"[^>]*>(.*?)</a>', r"\2: \1", text)
+    # Block-level closers and <br> become newlines.
+    text = re.sub(r"(?i)<br\s*/?>", "\n", text)
+    text = re.sub(r"(?i)</(p|h1|h2|h3|div|tr)>", "\n", text)
+    # Strip every remaining tag, then unescape entities.
+    text = re.sub(r"(?s)<[^>]+>", "", text)
+    text = html.unescape(text)
+    # Collapse whitespace: trim lines, drop runs of blank lines.
+    lines = [ln.strip() for ln in text.splitlines()]
+    text = "\n".join(ln for ln in lines if ln)
+    return text
+
+
 def _send_email(to: str, subject: str, html_body: str):
     """Send an email via SMTP. Silently fails if not configured."""
     if not _enabled:
@@ -71,6 +97,15 @@ def _send_email(to: str, subject: str, html_body: str):
     msg["Subject"] = subject
     msg["From"] = SMTP_FROM
     msg["To"] = target
+    # Date + Message-ID are required by RFC 5322; messages missing them are
+    # a classic spam signal. Message-ID uses the From domain so it aligns
+    # with the sending identity.
+    from_domain = parseaddr(SMTP_FROM)[1].partition("@")[2] or None
+    msg["Date"] = formatdate(localtime=True)
+    msg["Message-ID"] = make_msgid(domain=from_domain)
+    # text/plain first, text/html last: clients render the last part they
+    # support, and spam filters expect a plain-text alternative to exist.
+    msg.attach(MIMEText(_html_to_text(html_body), "plain"))
     msg.attach(MIMEText(html_body, "html"))
 
     try:
