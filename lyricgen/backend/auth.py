@@ -583,6 +583,11 @@ async def get_current_user(
         "plan": user.plan_id,
         "allow_overage": getattr(user, "allow_overage", False) or False,
         "stripe_customer_id": user.stripe_customer_id,
+        # Dunning state for the in-app past-due banner (Fase 1.5). Read
+        # fresh from the DB here (this dep refreshes the user row on every
+        # request), so the banner clears the moment a retry succeeds.
+        # getattr default keeps old tokens/tests safe pre-migration.
+        "billing_status": getattr(user, "billing_status", "active") or "active",
         # Capability flags consumed by the frontend to gate UI. Keep
         # the shape stable — `features.<name>: bool` — so adding new
         # gates later doesn't churn the client.

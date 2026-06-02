@@ -158,6 +158,13 @@ export default function Settings({ onBack }) {
   const [invoices, setInvoices] = useState([]);
   const [usage, setUsage] = useState(null);
   const [billingLoading, setBillingLoading] = useState(false);
+  const [paymentMethod, setPaymentMethod] = useState(null);
+  // Plan-change confirmation modal + cancel/reactivate (Fase 2 / PR4)
+  const [planModal, setPlanModal] = useState(null);          // { planId } | null
+  const [planPreview, setPlanPreview] = useState(null);      // /change-plan/preview response
+  const [planPreviewLoading, setPlanPreviewLoading] = useState(false);
+  const [planPreviewError, setPlanPreviewError] = useState(null);
+  const [cancelLoading, setCancelLoading] = useState(false);
   const [activeSection, setActiveSection] = useState("cuenta");
 
   // Change password
@@ -200,6 +207,11 @@ export default function Settings({ onBack }) {
       .then((data) => { if (Array.isArray(data)) setInvoices(data); })
       .catch(() => {});
 
+    fetch(`${API}/billing/payment-method`, { headers: authHeaders() })
+      .then((r) => r.json())
+      .then((data) => setPaymentMethod(data?.payment_method || null))
+      .catch(() => {});
+
     fetch(`${API}/usage`, { headers: authHeaders() })
       .then((r) => r.json()).then(setUsage).catch(() => {});
 
@@ -207,6 +219,15 @@ export default function Settings({ onBack }) {
       .then((r) => r.json())
       .then((data) => { if (Array.isArray(data)) setApiKeys(data); })
       .catch(() => {});
+  }, []);
+
+  // Deep-link support: ?tab=facturacion opens the billing tab directly. Used
+  // by the global PastDueBanner / UpgradeNudge CTAs and the lifecycle emails
+  // that link to /?view=settings&tab=facturacion.
+  useEffect(() => {
+    if (new URLSearchParams(window.location.search).get("tab") === "facturacion") {
+      setActiveSection("facturacion");
+    }
   }, []);
 
   const [saveError, setSaveError] = useState(null);
@@ -270,6 +291,72 @@ export default function Settings({ onBack }) {
     } catch (err) {
       setBillingError(err.message || String(err));
     } finally { setBillingLoading(false); }
+  };
+
+  const refreshSubscription = () =>
+    fetch(`${API}/billing/subscription`, { headers: authHeaders() })
+      .then((r) => r.json()).then(setSubscription).catch(() => {});
+
+  // Open the confirmation modal and fetch the proration preview. The Fase-1
+  // downgrade guardrail (400) is surfaced as planPreviewError inside the modal.
+  const openChangePlan = async (planId) => {
+    setPlanModal({ planId });
+    setPlanPreview(null);
+    setPlanPreviewError(null);
+    setPlanPreviewLoading(true);
+    try {
+      const res = await fetch(`${API}/billing/change-plan/preview`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", ...authHeaders() },
+        body: JSON.stringify({ plan_id: planId }),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(data.detail || `Error ${res.status}`);
+      setPlanPreview(data);
+    } catch (err) {
+      setPlanPreviewError(err.message || String(err));
+    } finally { setPlanPreviewLoading(false); }
+  };
+
+  const confirmChangePlan = async () => {
+    if (!planModal) return;
+    setBillingLoading(true);
+    setPlanPreviewError(null);
+    try {
+      const res = await fetch(`${API}/billing/change-plan`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", ...authHeaders() },
+        body: JSON.stringify({ plan_id: planModal.planId }),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(data.detail || `Error ${res.status}`);
+      setPlanModal(null);
+      setTimeout(refreshSubscription, 1500); // webhook is the source of truth
+    } catch (err) {
+      setPlanPreviewError(err.message || String(err));
+    } finally { setBillingLoading(false); }
+  };
+
+  const handleCancel = async () => {
+    setCancelLoading(true); setBillingError(null);
+    try {
+      const res = await fetch(`${API}/billing/cancel`, { method: "POST", headers: authHeaders() });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(data.detail || `Error ${res.status}`);
+      await refreshSubscription();
+    } catch (err) { setBillingError(err.message || String(err)); }
+    finally { setCancelLoading(false); }
+  };
+
+  const handleReactivate = async () => {
+    setCancelLoading(true); setBillingError(null);
+    try {
+      const res = await fetch(`${API}/billing/reactivate`, { method: "POST", headers: authHeaders() });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(data.detail || `Error ${res.status}`);
+      await refreshSubscription();
+    } catch (err) { setBillingError(err.message || String(err)); }
+    finally { setCancelLoading(false); }
   };
 
   const handleChangePassword = async () => {
@@ -704,6 +791,31 @@ export default function Settings({ onBack }) {
         {/* ════════════════════ FACTURACIÓN ════════════════════ */}
         {activeSection === "facturacion" && (
           <>
+            {/* Dunning notice — mirrors the global banner; CTA → Stripe portal */}
+            {subscription?.billing_status === "past_due" && (
+              <AlertBanner variant="amber">
+                <div className="flex flex-col sm:flex-row sm:items-center gap-2">
+                  <div className="flex-1">
+                    <p className="text-xs font-semibold">
+                      {t("billing.past_due_title") || "Tu último pago falló."}
+                    </p>
+                    <p className="text-[11px] opacity-80 mt-0.5">
+                      {t("billing.past_due_body") || "Actualizá tu medio de pago para no perder acceso a la generación de videos."}
+                    </p>
+                  </div>
+                  <button
+                    onClick={handleManageBilling}
+                    disabled={billingLoading}
+                    className="shrink-0 px-3 py-1.5 rounded-lg text-xs font-semibold bg-amber-500 text-black hover:bg-amber-400 disabled:opacity-60 transition-colors"
+                  >
+                    {billingLoading
+                      ? (t("common.opening") || "Abriendo…")
+                      : (t("billing.update_payment") || "Actualizar medio de pago")}
+                  </button>
+                </div>
+              </AlertBanner>
+            )}
+
             {/* Usage widget */}
             {usage && (
               <Card>
@@ -785,11 +897,48 @@ export default function Settings({ onBack }) {
                       </span>
                     </div>
                   )}
-                  {subscription.subscription.cancel_at_period_end && (
+                  {subscription.subscription.cancel_at_period_end ? (
                     <div className="mt-2 p-2.5 rounded-xl bg-amber-500/[0.06] ring-1 ring-amber-500/15">
-                      <p className="text-xs text-amber-400">{t("settings.cancel_notice") || "Se cancela al final del período"}</p>
+                      <p className="text-xs text-amber-400">
+                        {(t("billing.cancel_access_until") || "Mantenés acceso hasta el {date}").replace(
+                          "{date}", new Date(subscription.subscription.current_period_end * 1000).toLocaleDateString())}
+                      </p>
+                      <button onClick={handleReactivate} disabled={cancelLoading}
+                        className="mt-2 text-xs font-semibold text-brand-light hover:text-white disabled:opacity-50">
+                        {cancelLoading ? (t("common.opening") || "…") : (t("billing.reactivate") || "Reactivar suscripción")}
+                      </button>
                     </div>
+                  ) : (
+                    <button onClick={handleCancel} disabled={cancelLoading}
+                      className="mt-3 text-xs font-medium text-red-400/80 hover:text-red-400 disabled:opacity-50">
+                      {cancelLoading ? (t("common.opening") || "…") : (t("billing.cancel_subscription") || "Cancelar suscripción")}
+                    </button>
                   )}
+                  {billingError && <div className="mt-2"><InlineError message={billingError} /></div>}
+                </div>
+              )}
+
+              {paymentMethod && (
+                <div className="flex items-center justify-between gap-3 mt-4 pt-4 border-t border-white/[0.04]">
+                  <div className="flex items-center gap-2.5 min-w-0">
+                    <svg className="w-5 h-5 shrink-0 text-ink-secondary" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
+                      <rect x="1" y="4" width="22" height="16" rx="2" /><line x1="1" y1="10" x2="23" y2="10" />
+                    </svg>
+                    <div className="min-w-0">
+                      <p className="text-sm text-white truncate">
+                        {(paymentMethod.brand ? paymentMethod.brand.charAt(0).toUpperCase() + paymentMethod.brand.slice(1) : (t("settings.card") || "Tarjeta"))} ···· {paymentMethod.last4}
+                      </p>
+                      {paymentMethod.exp_month && paymentMethod.exp_year && (
+                        <p className="text-[11px] text-gray-600 mt-0.5">
+                          {t("settings.card_expires") || "Vence"} {String(paymentMethod.exp_month).padStart(2, "0")}/{paymentMethod.exp_year}
+                        </p>
+                      )}
+                    </div>
+                  </div>
+                  <button onClick={handleManageBilling} disabled={billingLoading}
+                    className="shrink-0 text-xs text-ink-secondary hover:text-white transition-colors px-3 py-1.5 rounded-lg ring-1 ring-white/[0.06] hover:ring-white/[0.12] bg-surface-3/30 disabled:opacity-60">
+                    {billingLoading ? (t("common.opening") || "Abriendo…") : (t("settings.update_card") || "Actualizar")}
+                  </button>
                 </div>
               )}
 
@@ -813,7 +962,13 @@ export default function Settings({ onBack }) {
                     const p = PLAN_INFO[planId];
                     const isCurrent = currentPlan === planId;
                     return (
-                      <button key={planId} onClick={() => !isCurrent && handleSubscribe(planId)}
+                      <button key={planId} onClick={() => {
+                          if (isCurrent) return;
+                          // Existing subscriber → confirm with a proration preview;
+                          // free user (no sub yet) → straight to Checkout.
+                          if (subscription?.has_subscription) openChangePlan(planId);
+                          else handleSubscribe(planId);
+                        }}
                         disabled={isCurrent || billingLoading}
                         className={`rounded-card p-4 text-left transition-all ring-1 ${
                           isCurrent
@@ -880,6 +1035,53 @@ export default function Settings({ onBack }) {
                 </div>
               )}
             </Card>
+
+            {/* Plan-change confirmation modal (proration preview + guardrail) */}
+            {planModal && (
+              <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-4 animate-fade-in"
+                onClick={() => !billingLoading && setPlanModal(null)}>
+                <div className="w-full max-w-sm rounded-card bg-surface-1 ring-1 ring-white/[0.08] p-6"
+                  onClick={(e) => e.stopPropagation()}>
+                  <SectionLabel>{t("billing.change_confirm_title") || "Confirmar cambio de plan"}</SectionLabel>
+                  <p className="text-sm text-white mb-3">
+                    {(t("billing.change_confirm_to") || "Vas a cambiar al {plan}.").replace(
+                      "{plan}", PLAN_INFO[planModal.planId]?.label || planModal.planId)}
+                  </p>
+                  {planPreviewLoading && (
+                    <p className="text-xs text-ink-secondary">{t("billing.calculating") || "Calculando prorrateo…"}</p>
+                  )}
+                  {planPreviewError && (
+                    <AlertBanner variant="red"><p className="text-xs">{planPreviewError}</p></AlertBanner>
+                  )}
+                  {planPreview && !planPreviewError && (() => {
+                    const cents = planPreview.proration_cents;
+                    const amt = Math.abs(cents) / 100;
+                    const cur = (planPreview.currency || "usd").toUpperCase();
+                    const line = cents > 0
+                      ? (t("billing.proration_charge") || "Se te cobra ${amt} {cur} ahora · efecto inmediato")
+                      : cents < 0
+                      ? (t("billing.proration_credit") || "Se te acredita ${amt} {cur} · efecto inmediato")
+                      : (t("billing.proration_none") || "Sin cargo adicional · efecto inmediato");
+                    return (
+                      <p className="text-sm text-ink-secondary">
+                        {line.replace("${amt}", amt.toFixed(2)).replace("{cur}", cur)}
+                      </p>
+                    );
+                  })()}
+                  <div className="flex gap-2 mt-5">
+                    <button onClick={() => setPlanModal(null)} disabled={billingLoading}
+                      className="btn-secondary flex-1 h-10 text-xs">
+                      {t("settings.cancel") || "Cancelar"}
+                    </button>
+                    <button onClick={confirmChangePlan}
+                      disabled={billingLoading || planPreviewLoading || !!planPreviewError}
+                      className="btn-primary flex-1 h-10 text-xs disabled:opacity-40">
+                      {billingLoading ? (t("common.opening") || "…") : (t("billing.confirm_change") || "Confirmar cambio")}
+                    </button>
+                  </div>
+                </div>
+              </div>
+            )}
           </>
         )}
 
