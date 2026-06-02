@@ -103,6 +103,18 @@ def has_drive_access(user) -> bool:
     return (tenant_id or "").lower() in DRIVE_ENABLED_TENANTS
 
 
+def telemetry_enabled() -> bool:
+    """True si la telemetría de sesiones (heartbeat de tiempo-en-app) está prendida.
+
+    Env flag TELEMETRY_ENABLED, default off (mismo patrón que los kill
+    switches del pipeline). Se lee en cada llamada — no a import-time —
+    para que los tests la monkeypatcheen y para que el endpoint
+    /telemetry/heartbeat y el feature flag del frontend compartan una
+    única fuente de verdad.
+    """
+    return os.environ.get("TELEMETRY_ENABLED", "").strip().lower() in ("1", "true", "yes", "on")
+
+
 # Anyone who knows the default secret can forge admin tokens, so running with
 # it in production is unacceptable. Fail fast at import time.
 _ENV = (
@@ -577,6 +589,9 @@ async def get_current_user(
         "features": {
             "prores_export": has_prores_access(user),
             "drive_export": has_drive_access(user),
+            # Heartbeat de sesiones: el frontend solo manda pings cuando
+            # el server lo habilita → kill-switch sin redeploy de Vercel.
+            "telemetry": telemetry_enabled(),
         },
     }
 

@@ -430,6 +430,9 @@ def reap_stuck_transcription(db: Session, job: Job) -> None:
     locked.status = "transcription_failed"
     locked.current_step = "error"
     locked.error = reason
+    # Categoría explícita: el mensaje del reaper es customer-facing (ES) y
+    # no matchea las reglas de texto del clasificador.
+    locked.error_category = "reaper"
     locked.completed_at = datetime.now(timezone.utc)
     db.add(AuditLog(
         action="reaper.killed_transcription",
@@ -749,6 +752,9 @@ def reap_stuck_job(db: Session, job: Job, reason: str) -> bool:
     previous_status = locked.status
     locked.status = _REAPED_STATUS
     locked.error = reason
+    # Categoría explícita: el mensaje del reaper es customer-facing (ES) y
+    # no matchea las reglas de texto del clasificador.
+    locked.error_category = "reaper"
     locked.completed_at = datetime.now(timezone.utc)
     db.add(AuditLog(
         action="reaper.killed",

@@ -166,6 +166,28 @@ async def change_plan(
     if not user or not user.stripe_subscription_id:
         raise HTTPException(status_code=400, detail="No active subscription")
 
+    # Downgrade guardrail: refuse to drop to a plan whose monthly limit is below
+    # what the user has ALREADY approved this cycle. Without this, a mid-cycle
+    # downgrade (e.g. 1000 → 100 at 500 used) flips plan_id on the webhook and
+    # the next generation hits a 402 — the user is instantly blocked despite
+    # having paid for the higher tier. Overage accounts (UMG-style) are exempt
+    # since they can bill beyond the cap. (Scheduling the downgrade at period
+    # end is the Fase-2 enhancement.)
+    from auth import get_plan_usage
+    _usage = get_plan_usage(
+        db, user.id, current_user["tenant_id"], current_user.get("plan", "100")
+    )
+    _target_limit = plan.get("limit", 0)
+    if not user.allow_overage and _usage["used"] > _target_limit:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"No podés cambiar al plan {body.plan_id} este mes: ya aprobaste "
+                f"{_usage['used']} videos y ese plan permite {_target_limit}. "
+                f"Podés hacerlo a partir de tu próxima renovación."
+            ),
+        )
+
     # Get current subscription
     subscription = stripe.Subscription.retrieve(user.stripe_subscription_id)
     current_item_id = subscription["items"]["data"][0].id
@@ -274,7 +296,10 @@ async def stripe_webhook(request: Request, db: Session = Depends(get_db)):
 
     if event_type == "checkout.session.completed":
         _handle_checkout_completed(db, data)
-    elif event_type == "customer.subscription.updated":
+    elif event_type in ("customer.subscription.updated", "customer.subscription.created"):
+        # `created` is a safety net: if checkout.session.completed delivery
+        # fails, the subscription's metadata.plan_id (stamped in
+        # subscription_data at checkout) still lets us bind the plan.
         _handle_subscription_updated(db, data)
     elif event_type == "customer.subscription.deleted":
         _handle_subscription_deleted(db, data)
@@ -437,10 +462,20 @@ def _handle_invoice_failed(db: Session, data: dict):
     if user.email:
         amount_due = data.get("amount_due", 0) / 100
         currency = data.get("currency", "usd")
+        # Stripe's next scheduled retry (Smart Retries) — surfacing it turns the
+        # alert into a calm dunning message ("we'll retry on X; fix your card").
+        retry_date = ""
+        next_attempt = data.get("next_payment_attempt")
+        if next_attempt:
+            from datetime import datetime, timezone
+            retry_date = datetime.fromtimestamp(
+                int(next_attempt), tz=timezone.utc
+            ).strftime("%d %b %Y")
         _send_email_async(
             emails.send_payment_failed,
             email=user.email,
             username=user.username,
             amount=amount_due,
             currency=currency,
+            retry_date=retry_date,
         )
