@@ -311,6 +311,11 @@ def test_admin_activity_rework_signals(client, admin_token, db):
     db.add(AuditLog(user_id=uid, action="job.edit_request", detail={"edit_type": "lyrics"}))
     db.add(AuditLog(user_id=uid, action="job.edit_request", detail={"edit_type": "background"}))
     db.add(AuditLog(user_id=uid, action="job.retry", detail={"job_id": "actv2c"}))
+    # Tres autosaves del editor sobre el MISMO job → cuenta como 1 job
+    # corregido, no 3 retrabajos. (Regresión del bug "1011 retrabajos" visto
+    # en staging 2026-06-02: el editor autoguarda y cada save es un evento.)
+    db.add(AuditLog(user_id=uid, action="lyrics.segments_diff", detail={"job_id": "actv2a"}))
+    db.add(AuditLog(user_id=uid, action="lyrics.segments_diff", detail={"job_id": "actv2a"}))
     db.add(AuditLog(user_id=uid, action="lyrics.segments_diff", detail={"job_id": "actv2a"}))
     db.commit()
     try:
@@ -325,7 +330,7 @@ def test_admin_activity_rework_signals(client, admin_token, db):
         assert row["rework"]["edits_background"] == 1
         assert row["rework"]["edits_typography"] == 0
         assert row["rework"]["retries"] == 1
-        assert row["rework"]["manual_lyric_saves"] == 1
+        assert row["rework"]["corrected_jobs"] == 1  # 3 autosaves, 1 solo job
         assert row["rework"]["abandoned_recreated"] == 1
     finally:
         _cleanup_activity_seed(db, "actv2", uid)
