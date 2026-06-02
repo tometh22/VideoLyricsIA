@@ -439,3 +439,81 @@ def test_subscription_deleted_sends_cancellation_email(client, user_token, db, m
         "id": "sub_c", "current_period_end": 1782000000})
     cancelled = [c for c in calls if c[0] == "send_subscription_cancelled"]
     assert cancelled and cancelled[0][1]["access_until"]
+
+
+# ── Fase 2 / PR4: cancel / reactivate / proration preview ───────────────────
+
+def test_change_plan_preview_returns_proration(client, user_token, db, monkeypatch):
+    """Sums only the proration line at our pinned date — not next cycle's full
+    charge."""
+    import billing, auth as auth_mod
+    from database import User
+    monkeypatch.setattr(billing.stripe, "api_key", "sk_test_fake")
+    monkeypatch.setitem(billing.PLANS["500"], "stripe_price_id", "price_fake_500")
+    monkeypatch.setattr(auth_mod, "get_plan_usage", lambda *a, **k: {"used": 10, "limit": 100})
+    uid = client.get("/auth/me", headers=auth(user_token)).json()["id"]
+    u = db.query(User).filter(User.id == uid).first()
+    u.plan_id = "100"; u.stripe_subscription_id = "sub_x"; u.stripe_customer_id = "cus_prev"; db.commit()
+    _item = type("I", (), {"id": "si_1"})()
+    monkeypatch.setattr(billing.stripe.Subscription, "retrieve",
+                        lambda sid: {"items": {"data": [_item]}})
+    def _upcoming(**kw):
+        pd = kw.get("subscription_proration_date")
+        return {"lines": {"data": [
+            {"proration": True, "period": {"start": pd}, "amount": 1500},
+            {"proration": False, "period": {"start": 0}, "amount": 50000},
+        ]}, "currency": "usd", "amount_due": 1500}
+    monkeypatch.setattr(billing.stripe.Invoice, "upcoming", _upcoming)
+    res = client.post("/billing/change-plan/preview", headers=auth(user_token), json={"plan_id": "500"})
+    assert res.status_code == 200, res.text
+    data = res.json()
+    assert data["proration_cents"] == 1500 and data["currency"] == "usd"
+
+
+def test_change_plan_preview_downgrade_blocked(client, user_token, db, monkeypatch):
+    """The preview surfaces the SAME Fase-1 guardrail 400 as /change-plan."""
+    import billing, auth as auth_mod
+    from database import User
+    monkeypatch.setattr(billing.stripe, "api_key", "sk_test_fake")
+    monkeypatch.setitem(billing.PLANS["100"], "stripe_price_id", "price_fake_100")
+    monkeypatch.setattr(auth_mod, "get_plan_usage", lambda *a, **k: {"used": 500, "limit": 1000})
+    uid = client.get("/auth/me", headers=auth(user_token)).json()["id"]
+    u = db.query(User).filter(User.id == uid).first()
+    u.plan_id = "1000"; u.stripe_subscription_id = "sub_y"; u.allow_overage = False; db.commit()
+    res = client.post("/billing/change-plan/preview", headers=auth(user_token), json={"plan_id": "100"})
+    assert res.status_code == 400
+    assert "este mes" in res.json()["detail"]
+
+
+def test_cancel_sets_cancel_at_period_end(client, user_token, db, monkeypatch):
+    import billing
+    from database import User
+    monkeypatch.setattr(billing.stripe, "api_key", "sk_test_fake")
+    calls = []
+    monkeypatch.setattr(billing, "_send_email_async", lambda fn, **k: calls.append(fn.__name__))
+    uid = client.get("/auth/me", headers=auth(user_token)).json()["id"]
+    u = db.query(User).filter(User.id == uid).first()
+    u.stripe_subscription_id = "sub_cxl"; db.commit()
+    captured = {}
+    def _modify(sid, **kw): captured.update(kw); return type("S", (), {"current_period_end": 1782000000})()
+    monkeypatch.setattr(billing.stripe.Subscription, "modify", _modify)
+    res = client.post("/billing/cancel", headers=auth(user_token))
+    assert res.status_code == 200, res.text
+    assert captured["cancel_at_period_end"] is True
+    assert res.json()["cancel_at_period_end"] is True
+    assert "send_cancellation_scheduled" in calls
+
+
+def test_reactivate_clears_cancel_at_period_end(client, user_token, db, monkeypatch):
+    import billing
+    from database import User
+    monkeypatch.setattr(billing.stripe, "api_key", "sk_test_fake")
+    uid = client.get("/auth/me", headers=auth(user_token)).json()["id"]
+    u = db.query(User).filter(User.id == uid).first()
+    u.stripe_subscription_id = "sub_re"; db.commit()
+    captured = {}
+    def _modify(sid, **kw): captured.update(kw); return type("S", (), {"current_period_end": 1782000000})()
+    monkeypatch.setattr(billing.stripe.Subscription, "modify", _modify)
+    res = client.post("/billing/reactivate", headers=auth(user_token))
+    assert res.status_code == 200, res.text
+    assert captured["cancel_at_period_end"] is False

@@ -242,6 +242,34 @@ class ChangePlanRequest(BaseModel):
     plan_id: str
 
 
+class ChangePlanPreviewRequest(BaseModel):
+    plan_id: str
+
+
+def _assert_downgrade_allowed(db: Session, user: User, target_plan_id: str,
+                              target_plan: dict, current_user: dict) -> None:
+    """Refuse a mid-cycle downgrade to a plan whose monthly limit is below what
+    the user has ALREADY approved this cycle — otherwise the next generation
+    402s the instant the webhook flips plan_id, blocking a user who paid for
+    the higher tier. Overage accounts (UMG-style) are exempt. Shared by
+    /change-plan and /change-plan/preview so the preview can never say OK while
+    the real apply 400s. Raises HTTPException(400) when blocked."""
+    from auth import get_plan_usage
+    usage = get_plan_usage(
+        db, user.id, current_user["tenant_id"], current_user.get("plan", "100")
+    )
+    target_limit = target_plan.get("limit", 0)
+    if not user.allow_overage and usage["used"] > target_limit:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"No podés cambiar al plan {target_plan_id} este mes: ya aprobaste "
+                f"{usage['used']} videos y ese plan permite {target_limit}. "
+                f"Podés hacerlo a partir de tu próxima renovación."
+            ),
+        )
+
+
 @router.post("/change-plan")
 async def change_plan(
     body: ChangePlanRequest,
@@ -260,27 +288,10 @@ async def change_plan(
     if not user or not user.stripe_subscription_id:
         raise HTTPException(status_code=400, detail="No active subscription")
 
-    # Downgrade guardrail: refuse to drop to a plan whose monthly limit is below
-    # what the user has ALREADY approved this cycle. Without this, a mid-cycle
-    # downgrade (e.g. 1000 → 100 at 500 used) flips plan_id on the webhook and
-    # the next generation hits a 402 — the user is instantly blocked despite
-    # having paid for the higher tier. Overage accounts (UMG-style) are exempt
-    # since they can bill beyond the cap. (Scheduling the downgrade at period
-    # end is the Fase-2 enhancement.)
-    from auth import get_plan_usage
-    _usage = get_plan_usage(
-        db, user.id, current_user["tenant_id"], current_user.get("plan", "100")
-    )
-    _target_limit = plan.get("limit", 0)
-    if not user.allow_overage and _usage["used"] > _target_limit:
-        raise HTTPException(
-            status_code=400,
-            detail=(
-                f"No podés cambiar al plan {body.plan_id} este mes: ya aprobaste "
-                f"{_usage['used']} videos y ese plan permite {_target_limit}. "
-                f"Podés hacerlo a partir de tu próxima renovación."
-            ),
-        )
+    # Downgrade guardrail (shared with /change-plan/preview so the modal's
+    # preview can never say OK while this apply 400s). Refuses a mid-cycle drop
+    # below the user's already-approved count; overage accounts are exempt.
+    _assert_downgrade_allowed(db, user, body.plan_id, plan, current_user)
 
     # Get current subscription
     subscription = stripe.Subscription.retrieve(user.stripe_subscription_id)
@@ -306,6 +317,131 @@ async def change_plan(
     # Don't optimistically grant the plan — the webhook will commit it once
     # Stripe confirms. Return the request was accepted.
     return {"ok": True, "plan_pending": body.plan_id}
+
+
+@router.post("/change-plan/preview")
+async def change_plan_preview(
+    body: ChangePlanPreviewRequest,
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Preview the proration for switching to body.plan_id WITHOUT applying it,
+    so the confirmation modal can show "charged/credited $X now". Surfaces the
+    Fase-1 downgrade guardrail (same 400) so a blocked downgrade reads cleanly
+    in the modal instead of only failing at apply time."""
+    if not stripe.api_key:
+        raise HTTPException(status_code=503, detail="Billing not configured")
+
+    plan = PLANS.get(body.plan_id)
+    if not plan or not plan.get("stripe_price_id"):
+        raise HTTPException(status_code=400, detail="Invalid plan")
+
+    user = db.query(User).filter(User.id == current_user["id"]).first()
+    if not user or not user.stripe_subscription_id:
+        raise HTTPException(status_code=400, detail="No active subscription")
+    if user.plan_id == body.plan_id:
+        raise HTTPException(status_code=400, detail="Ya estás en ese plan")
+
+    # SAME guardrail as /change-plan (one helper → no drift).
+    _assert_downgrade_allowed(db, user, body.plan_id, plan, current_user)
+
+    try:
+        subscription = stripe.Subscription.retrieve(user.stripe_subscription_id)
+        current_item_id = subscription["items"]["data"][0].id
+        # Pin the proration date so the line filter below is deterministic.
+        proration_date = int(datetime.now(timezone.utc).timestamp())
+        upcoming = stripe.Invoice.upcoming(
+            customer=user.stripe_customer_id,
+            subscription=user.stripe_subscription_id,
+            subscription_items=[{
+                "id": current_item_id,
+                "price": plan["stripe_price_id"],
+            }],
+            subscription_proration_behavior="create_prorations",
+            subscription_proration_date=proration_date,
+        )
+    except stripe.error.StripeError as exc:
+        logger.error("proration preview failed for user %s: %s", user.id, exc)
+        raise HTTPException(status_code=502, detail="No se pudo calcular el prorrateo. Intentá de nuevo.")
+
+    # Sum ONLY the proration lines at our pinned date — the rest of `upcoming`
+    # is next cycle's full charge, which we must not show as "now". Positive =>
+    # charged now; negative => credited to the customer balance.
+    proration_cents = 0
+    for line in upcoming["lines"]["data"]:
+        if line.get("proration") and line.get("period", {}).get("start") == proration_date:
+            proration_cents += line.get("amount", 0)
+
+    return {
+        "plan_id": body.plan_id,
+        "currency": (upcoming.get("currency") or "usd"),
+        "proration_cents": proration_cents,
+        "amount_due_cents": upcoming.get("amount_due", 0),
+        "proration_date": proration_date,
+        "immediate": True,
+    }
+
+
+@router.post("/cancel")
+async def cancel_subscription(
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Schedule cancellation at period end (cancel_at_period_end=true). The user
+    keeps access until current_period_end; fully reversible via /reactivate.
+    plan_id is NOT touched here — the subscription.deleted webhook flips it to
+    free when the period actually ends (source of truth)."""
+    if not stripe.api_key:
+        raise HTTPException(status_code=503, detail="Billing not configured")
+    user = db.query(User).filter(User.id == current_user["id"]).first()
+    if not user or not user.stripe_subscription_id:
+        raise HTTPException(status_code=400, detail="No active subscription")
+    try:
+        sub = stripe.Subscription.modify(
+            user.stripe_subscription_id,
+            cancel_at_period_end=True,
+            idempotency_key=f"cancel:{user.id}:{user.stripe_subscription_id}",
+        )
+    except stripe.error.StripeError as exc:
+        logger.error("cancel failed for user %s: %s", user.id, exc)
+        raise HTTPException(status_code=502, detail="No se pudo programar la cancelación. Intentá de nuevo.")
+
+    period_end = getattr(sub, "current_period_end", None)
+    if user.email:
+        access_until = (
+            datetime.fromtimestamp(int(period_end), tz=timezone.utc).strftime("%d %b %Y")
+            if period_end else ""
+        )
+        _send_email_async(
+            emails.send_cancellation_scheduled,
+            email=user.email, username=user.username, access_until=access_until,
+        )
+    return {"ok": True, "cancel_at_period_end": True, "current_period_end": period_end}
+
+
+@router.post("/reactivate")
+async def reactivate_subscription(
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Undo a scheduled cancellation (cancel_at_period_end=false). No new
+    checkout — the subscription was never interrupted."""
+    if not stripe.api_key:
+        raise HTTPException(status_code=503, detail="Billing not configured")
+    user = db.query(User).filter(User.id == current_user["id"]).first()
+    if not user or not user.stripe_subscription_id:
+        raise HTTPException(status_code=400, detail="No active subscription")
+    try:
+        sub = stripe.Subscription.modify(
+            user.stripe_subscription_id,
+            cancel_at_period_end=False,
+            idempotency_key=f"reactivate:{user.id}:{user.stripe_subscription_id}",
+        )
+    except stripe.error.StripeError as exc:
+        logger.error("reactivate failed for user %s: %s", user.id, exc)
+        raise HTTPException(status_code=502, detail="No se pudo reactivar. Intentá de nuevo.")
+    return {"ok": True, "cancel_at_period_end": False,
+            "current_period_end": getattr(sub, "current_period_end", None)}
 
 
 @router.get("/invoices")
