@@ -356,3 +356,86 @@ def test_payment_method_null_on_stripe_error(client, user_token, db, monkeypatch
     res = client.get("/billing/payment-method", headers=auth(user_token))
     assert res.status_code == 200
     assert res.json()["payment_method"] is None
+
+
+# ── Fase 2 / PR3: lifecycle emails + webhook triggers ───────────────────────
+
+def test_email_subscription_welcome_content(monkeypatch):
+    import emails
+    sent = {}
+    monkeypatch.setattr(emails, "_send_email", lambda to, subj, body: sent.update(subj=subj, body=body))
+    emails.send_subscription_welcome("u@t.com", "Agus", "250", 250, 2000)
+    assert "Welcome to Plan 250" in sent["subj"]
+    assert "250" in sent["body"] and "$2,000/mo" in sent["body"]
+
+
+def test_email_plan_changed_direction(monkeypatch):
+    import emails
+    sent = {}
+    monkeypatch.setattr(emails, "_send_email", lambda to, subj, body: sent.update(body=body))
+    emails.send_plan_changed("u@t.com", "Agus", "100", "500", 500, "upgrade")
+    assert "upgraded" in sent["body"].lower()
+    emails.send_plan_changed("u@t.com", "Agus", "500", "100", 100, "downgrade")
+    assert "credited" in sent["body"].lower()
+
+
+def test_email_cancelled_with_and_without_date(monkeypatch):
+    import emails
+    sent = {}
+    monkeypatch.setattr(emails, "_send_email", lambda to, subj, body: sent.update(body=body))
+    emails.send_subscription_cancelled("u@t.com", "Agus", access_until="30 Jun 2026")
+    assert "30 Jun 2026" in sent["body"]
+    emails.send_subscription_cancelled("u@t.com", "Agus")
+    assert "moved to the free plan" in sent["body"].lower()
+
+
+def test_invoice_paid_welcome_only_on_subscription_create(client, user_token, db, monkeypatch):
+    """First invoice (subscription_create) → welcome + receipt; recurring
+    (subscription_cycle) → receipt only, never a second welcome."""
+    import billing
+    calls = []
+    monkeypatch.setattr(billing, "_send_email_async", lambda fn, **k: calls.append(fn.__name__))
+    u = _set_customer(client, user_token, db, "cus_welcome")
+    u.plan_id = "250"; db.commit()
+    billing._handle_invoice_paid(db, {"customer": "cus_welcome", "id": "in_w1",
+        "amount_paid": 200000, "currency": "usd", "billing_reason": "subscription_create"})
+    assert "send_invoice_paid" in calls and "send_subscription_welcome" in calls
+    calls.clear()
+    billing._handle_invoice_paid(db, {"customer": "cus_welcome", "id": "in_w2",
+        "amount_paid": 200000, "currency": "usd", "billing_reason": "subscription_cycle"})
+    assert "send_invoice_paid" in calls and "send_subscription_welcome" not in calls
+
+
+def test_subscription_updated_plan_change_email(client, user_token, db, monkeypatch):
+    import billing
+    calls = []
+    monkeypatch.setattr(billing, "_send_email_async", lambda fn, **k: calls.append((fn.__name__, k)))
+    u = _set_customer(client, user_token, db, "cus_planchg")
+    u.plan_id = "100"; db.commit()
+    billing._handle_subscription_updated(db, {"customer": "cus_planchg", "id": "sub_pc",
+        "status": "active", "metadata": {"plan_id": "500"}})
+    assert any(c[0] == "send_plan_changed" and c[1]["direction"] == "upgrade" for c in calls)
+
+
+def test_subscription_updated_no_plan_email_from_free(client, user_token, db, monkeypatch):
+    """free → X is the initial subscribe (welcome owns it), not a plan change."""
+    import billing
+    calls = []
+    monkeypatch.setattr(billing, "_send_email_async", lambda fn, **k: calls.append(fn.__name__))
+    u = _set_customer(client, user_token, db, "cus_freeup")
+    u.plan_id = "free"; db.commit()
+    billing._handle_subscription_updated(db, {"customer": "cus_freeup", "id": "sub_fu",
+        "status": "active", "metadata": {"plan_id": "100"}})
+    assert "send_plan_changed" not in calls
+
+
+def test_subscription_deleted_sends_cancellation_email(client, user_token, db, monkeypatch):
+    import billing
+    calls = []
+    monkeypatch.setattr(billing, "_send_email_async", lambda fn, **k: calls.append((fn.__name__, k)))
+    u = _set_customer(client, user_token, db, "cus_cancel_em")
+    u.plan_id = "250"; u.stripe_subscription_id = "sub_c"; db.commit()
+    billing._handle_subscription_deleted(db, {"customer": "cus_cancel_em",
+        "id": "sub_c", "current_period_end": 1782000000})
+    cancelled = [c for c in calls if c[0] == "send_subscription_cancelled"]
+    assert cancelled and cancelled[0][1]["access_until"]

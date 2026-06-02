@@ -521,6 +521,7 @@ def _handle_subscription_updated(db: Session, data: dict):
     if not user:
         return
 
+    old_plan = user.plan_id  # snapshot BEFORE mutation for the plan-change email
     plan_id = data.get("metadata", {}).get("plan_id")
     if plan_id and plan_id in PLANS:
         user.plan_id = plan_id
@@ -547,6 +548,25 @@ def _handle_subscription_updated(db: Session, data: dict):
     user.stripe_subscription_id = data.get("id")
     db.commit()
 
+    # Plan-change confirmation: only on a real transition between two PAID
+    # plans. free → X is the initial subscribe (covered by the welcome email),
+    # so skip it here to avoid a duplicate/contradictory message.
+    if (user.email and plan_id and plan_id in PLANS
+            and plan_id != old_plan and old_plan not in (None, "free")):
+        old_limit = PLANS.get(old_plan, {}).get("limit", 0)
+        new_limit = PLANS[plan_id].get("limit", 0)
+        direction = ("upgrade" if new_limit > old_limit
+                     else "downgrade" if new_limit < old_limit else "changed")
+        _send_email_async(
+            emails.send_plan_changed,
+            email=user.email,
+            username=user.username,
+            old_plan=old_plan,
+            new_plan=plan_id,
+            new_limit=new_limit,
+            direction=direction,
+        )
+
 
 def _handle_subscription_deleted(db: Session, data: dict):
     customer_id = data.get("customer")
@@ -554,13 +574,34 @@ def _handle_subscription_deleted(db: Session, data: dict):
     if not user:
         return
 
+    # Capture before we mutate/lose context (for the cancellation email).
+    email = user.email
+    username = user.username
+    access_until = ""
+    period_end = data.get("current_period_end")
+    if period_end:
+        try:
+            access_until = datetime.fromtimestamp(
+                int(period_end), tz=timezone.utc
+            ).strftime("%d %b %Y")
+        except (TypeError, ValueError, OverflowError):
+            access_until = ""
+
     user.plan_id = "free"
     user.stripe_subscription_id = None
     # No subscription left to be past-due on — clear the dunning banner so a
     # cancelled (or grace-period-exhausted) user lands cleanly on free.
     user.billing_status = "active"
     db.commit()
-    logger.info(f"User {user.username} subscription cancelled → free plan")
+    logger.info(f"User {username} subscription cancelled → free plan")
+
+    if email:
+        _send_email_async(
+            emails.send_subscription_cancelled,
+            email=email,
+            username=username,
+            access_until=access_until,
+        )
 
 
 def _handle_invoice_paid(db: Session, data: dict):
@@ -625,6 +666,22 @@ def _handle_invoice_paid(db: Session, data: dict):
             currency=currency,
             invoice_url=invoice_url,
         )
+
+        # One-time subscription welcome: ONLY the first invoice of a new sub.
+        # Recurring monthly invoices have billing_reason='subscription_cycle'
+        # (and proration invoices 'subscription_update') → receipt only, never
+        # a second welcome. The duplicate-invoice short-circuit above means
+        # Stripe retries can't re-send it either.
+        if data.get("billing_reason") == "subscription_create":
+            _plan = PLANS.get(user.plan_id, {})
+            _send_email_async(
+                emails.send_subscription_welcome,
+                email=user.email,
+                username=user.username,
+                plan=user.plan_id,
+                limit=_plan.get("limit", 0),
+                monthly_price_usd=(_plan.get("monthly_price", 0) or 0),
+            )
 
 
 def _handle_invoice_failed(db: Session, data: dict):
