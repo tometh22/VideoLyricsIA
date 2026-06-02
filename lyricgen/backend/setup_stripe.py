@@ -79,11 +79,34 @@ def main():
     print("2. Add endpoint: https://your-domain.com/billing/webhook")
     print("3. Select events:")
     print("   - checkout.session.completed")
+    print("   - customer.subscription.created")
     print("   - customer.subscription.updated")
     print("   - customer.subscription.deleted")
     print("   - invoice.paid")
     print("   - invoice.payment_failed")
     print("4. Copy the webhook signing secret to STRIPE_WEBHOOK_SECRET in .env")
+    print()
+
+    # Customer Portal configuration — declare the hosted-portal feature set
+    # in code (update card / invoice history / cancel-at-period-end) so every
+    # environment gets an identical, intentional surface. Pin the printed id
+    # in prod (STRIPE_PORTAL_CONFIG_ID) so prod never does a runtime create.
+    print("=" * 60)
+    print("Creating Customer Portal configuration...")
+    print("=" * 60)
+    try:
+        # Import here (after env + stripe.api_key are set) so billing's
+        # module-level Stripe/DB init resolves correctly.
+        from billing import build_portal_configuration_params
+        cfg = stripe.billing_portal.Configuration.create(
+            **build_portal_configuration_params()
+        )
+        print(f"  Portal config: {cfg.id}")
+        print("\nAdd this to your .env file:")
+        print(f"STRIPE_PORTAL_CONFIG_ID={cfg.id}")
+    except Exception as exc:
+        print(f"  WARN: could not create portal configuration: {exc}")
+        print("  (The app will lazily create one on first /billing/portal call.)")
 
 
 if __name__ == "__main__":

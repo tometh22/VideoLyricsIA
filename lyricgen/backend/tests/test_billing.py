@@ -193,3 +193,117 @@ def test_subscription_info_exposes_billing_status(client, user_token):
     res = client.get("/billing/subscription", headers=auth(user_token))
     assert res.status_code == 200
     assert res.json()["billing_status"] == "active"
+
+
+# ── Fase 2 / PR1: explicit Stripe Customer Portal configuration ──────────────
+
+def test_portal_config_params_omits_plan_switching():
+    """Founder decision: plan changes stay in-app behind the Fase 1 guardrail,
+    so the hosted portal must NOT offer subscription_update."""
+    import billing
+    p = billing.build_portal_configuration_params()
+    f = p["features"]
+    assert "subscription_update" not in f
+    assert set(f) == {"payment_method_update", "invoice_history", "subscription_cancel"}
+    assert f["subscription_cancel"]["mode"] == "at_period_end"
+    assert f["subscription_cancel"]["proration_behavior"] == "none"
+    assert p["metadata"]["genly_marker"] == billing._PORTAL_CONFIG_MARKER
+
+
+def test_ensure_portal_config_prefers_pinned_env(monkeypatch):
+    """A pinned STRIPE_PORTAL_CONFIG_ID short-circuits — zero Stripe calls."""
+    import billing
+    monkeypatch.setattr(billing, "STRIPE_PORTAL_CONFIG_ID", "bpc_pinned")
+    monkeypatch.setattr(billing, "_portal_config_id_cache", None)
+    calls = {"n": 0}
+    def _boom(**k): calls.__setitem__("n", calls["n"] + 1); raise AssertionError("no Stripe call")
+    monkeypatch.setattr(billing.stripe.billing_portal.Configuration, "list", _boom)
+    monkeypatch.setattr(billing.stripe.billing_portal.Configuration, "create", _boom)
+    assert billing._ensure_portal_configuration() == "bpc_pinned"
+    assert calls["n"] == 0
+
+
+def test_ensure_portal_config_reuses_by_marker_and_caches(monkeypatch):
+    import billing
+    monkeypatch.setattr(billing, "STRIPE_PORTAL_CONFIG_ID", "")
+    monkeypatch.setattr(billing, "_portal_config_id_cache", None)
+
+    class _Cfg:
+        def __init__(self, id, marker, active=True):
+            self.id = id; self.metadata = {"genly_marker": marker}; self.active = active
+    class _List:
+        def auto_paging_iter(self):
+            return iter([_Cfg("bpc_other", "someone-else"),
+                         _Cfg("bpc_ours", billing._PORTAL_CONFIG_MARKER)])
+    created = {"n": 0}
+    monkeypatch.setattr(billing.stripe.billing_portal.Configuration, "list", lambda **k: _List())
+    monkeypatch.setattr(billing.stripe.billing_portal.Configuration, "create",
+                        lambda **k: created.__setitem__("n", created["n"] + 1))
+    assert billing._ensure_portal_configuration() == "bpc_ours"
+    assert created["n"] == 0
+    # cached → second call must not touch Stripe at all
+    monkeypatch.setattr(billing.stripe.billing_portal.Configuration, "list",
+                        lambda **k: (_ for _ in ()).throw(AssertionError("should be cached")))
+    assert billing._ensure_portal_configuration() == "bpc_ours"
+
+
+def test_ensure_portal_config_creates_once_when_absent(monkeypatch):
+    import billing
+    monkeypatch.setattr(billing, "STRIPE_PORTAL_CONFIG_ID", "")
+    monkeypatch.setattr(billing, "_portal_config_id_cache", None)
+
+    class _List:
+        def auto_paging_iter(self): return iter([])
+    class _New:
+        id = "bpc_new"
+    monkeypatch.setattr(billing.stripe.billing_portal.Configuration, "list", lambda **k: _List())
+    monkeypatch.setattr(billing.stripe.billing_portal.Configuration, "create", lambda **k: _New())
+    assert billing._ensure_portal_configuration() == "bpc_new"
+
+
+def test_ensure_portal_config_none_on_stripe_error(monkeypatch):
+    """A Stripe outage must NOT 500 /portal — ensure returns None so the
+    caller falls back to the account default."""
+    import billing
+    monkeypatch.setattr(billing, "STRIPE_PORTAL_CONFIG_ID", "")
+    monkeypatch.setattr(billing, "_portal_config_id_cache", None)
+    def _boom(**k): raise billing.stripe.error.StripeError("down")
+    monkeypatch.setattr(billing.stripe.billing_portal.Configuration, "list", _boom)
+    assert billing._ensure_portal_configuration() is None
+
+
+def test_portal_session_omits_configuration_when_none(client, user_token, db, monkeypatch):
+    """When ensure returns None, Session.create must NOT receive configuration=None
+    (Stripe rejects an explicit null) — the kwarg is absent entirely."""
+    import billing
+    from database import User
+    monkeypatch.setattr(billing.stripe, "api_key", "sk_test_fake")
+    monkeypatch.setattr(billing, "_ensure_portal_configuration", lambda: None)
+    uid = client.get("/auth/me", headers=auth(user_token)).json()["id"]
+    u = db.query(User).filter(User.id == uid).first()
+    u.stripe_customer_id = "cus_portal_none"; db.commit()
+    captured = {}
+    class _S: url = "https://portal.test/x"
+    monkeypatch.setattr(billing.stripe.billing_portal.Session, "create",
+                        lambda **k: captured.update(k) or _S())
+    res = client.post("/billing/portal", headers=auth(user_token))
+    assert res.status_code == 200, res.text
+    assert "configuration" not in captured
+    assert res.json()["portal_url"] == "https://portal.test/x"
+
+
+def test_portal_session_passes_configuration_when_present(client, user_token, db, monkeypatch):
+    import billing
+    from database import User
+    monkeypatch.setattr(billing.stripe, "api_key", "sk_test_fake")
+    monkeypatch.setattr(billing, "_ensure_portal_configuration", lambda: "bpc_x")
+    uid = client.get("/auth/me", headers=auth(user_token)).json()["id"]
+    u = db.query(User).filter(User.id == uid).first()
+    u.stripe_customer_id = "cus_portal_cfg"; db.commit()
+    captured = {}
+    class _S: url = "https://portal.test/y"
+    monkeypatch.setattr(billing.stripe.billing_portal.Session, "create",
+                        lambda **k: captured.update(k) or _S())
+    res = client.post("/billing/portal", headers=auth(user_token))
+    assert res.status_code == 200, res.text
+    assert captured.get("configuration") == "bpc_x"

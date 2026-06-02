@@ -41,6 +41,21 @@ FRONTEND_URL = os.environ.get("FRONTEND_URL", "http://localhost:5173")
 # metadata.user_id).
 _REQUIRE_WEBHOOK_SIGNATURE = bool(stripe.api_key)
 
+# --- Customer Portal configuration ---
+# Prefer an explicitly pinned configuration id (set in prod via the output
+# of setup_stripe.py). When unset we lazily create-once and cache the id
+# in-process so the hosted portal always exposes the exact feature set we
+# intend (update card / invoice history / cancel-at-period-end / plan
+# switching among OUR prices) instead of Stripe's opaque dashboard default.
+STRIPE_PORTAL_CONFIG_ID = os.environ.get("STRIPE_PORTAL_CONFIG_ID", "").strip()
+PORTAL_PRIVACY_URL = os.environ.get("BILLING_PRIVACY_URL", f"{FRONTEND_URL}/privacy")
+PORTAL_TERMS_URL = os.environ.get("BILLING_TERMS_URL", f"{FRONTEND_URL}/terms")
+# Stable marker so we can find a config we previously created instead of
+# making a new one every cold start (idempotency without a DB row).
+_PORTAL_CONFIG_MARKER = "genly-portal-v1"
+_portal_config_id_cache: Optional[str] = None
+_portal_config_lock = threading.Lock()
+
 router = APIRouter(prefix="/billing", tags=["billing"])
 
 
@@ -61,6 +76,69 @@ def get_or_create_stripe_customer(db: Session, user: User) -> str:
     user.stripe_customer_id = customer.id
     db.commit()
     return customer.id
+
+
+def build_portal_configuration_params() -> dict:
+    """Explicit portal feature set. Shared by setup_stripe.py and the lazy
+    in-app ensure path so both create an identical configuration.
+
+    Plan switching is intentionally OMITTED: all upgrades/downgrades go
+    through the in-app /billing/change-plan flow, which enforces the Fase 1
+    downgrade guardrail. The hosted portal has no equivalent guardrail, so
+    offering subscription_update there would let a user downgrade below
+    their month's usage and hit a next-cycle 402. The portal owns card +
+    invoice history + cancel-at-period-end; plan changes stay in-app.
+    """
+    return {
+        "business_profile": {
+            "headline": "GenLy AI",
+            "privacy_policy_url": PORTAL_PRIVACY_URL,
+            "terms_of_service_url": PORTAL_TERMS_URL,
+        },
+        "features": {
+            "payment_method_update": {"enabled": True},
+            "invoice_history": {"enabled": True},
+            "subscription_cancel": {
+                "enabled": True,
+                "mode": "at_period_end",
+                "proration_behavior": "none",
+            },
+        },
+        "metadata": {"genly_marker": _PORTAL_CONFIG_MARKER},
+    }
+
+
+def _ensure_portal_configuration() -> Optional[str]:
+    """Return a portal Configuration id, or None to fall back to Stripe's
+    default config. Resolution order: pinned env -> in-process cache ->
+    existing config found by our marker -> create-once. Never raises — on
+    any Stripe error returns None so the caller keeps today's behaviour
+    (Session.create with no explicit configuration)."""
+    global _portal_config_id_cache
+    if STRIPE_PORTAL_CONFIG_ID:
+        return STRIPE_PORTAL_CONFIG_ID
+    if _portal_config_id_cache:
+        return _portal_config_id_cache
+    with _portal_config_lock:
+        if _portal_config_id_cache:
+            return _portal_config_id_cache
+        try:
+            existing = stripe.billing_portal.Configuration.list(limit=100)
+            for cfg in existing.auto_paging_iter():
+                meta = dict(getattr(cfg, "metadata", None) or {})
+                active = cfg["active"] if isinstance(cfg, dict) else getattr(cfg, "active", True)
+                if meta.get("genly_marker") == _PORTAL_CONFIG_MARKER and active:
+                    _portal_config_id_cache = cfg["id"] if isinstance(cfg, dict) else cfg.id
+                    return _portal_config_id_cache
+            cfg = stripe.billing_portal.Configuration.create(
+                **build_portal_configuration_params()
+            )
+            _portal_config_id_cache = cfg["id"] if isinstance(cfg, dict) else cfg.id
+            logger.info("Created Stripe portal configuration %s", _portal_config_id_cache)
+            return _portal_config_id_cache
+        except stripe.error.StripeError as exc:
+            logger.error("Could not ensure portal configuration; using default: %s", exc)
+            return None
 
 
 # ---------------------------------------------------------------------------
@@ -136,10 +214,26 @@ async def create_portal_session(
     if not user or not user.stripe_customer_id:
         raise HTTPException(status_code=400, detail="No billing account found")
 
-    session = stripe.billing_portal.Session.create(
-        customer=user.stripe_customer_id,
-        return_url=f"{FRONTEND_URL}/?view=settings",
-    )
+    # Resolve our explicit portal configuration (update card / invoices /
+    # cancel-at-period-end). When it can't be resolved we fall back to the
+    # account default by omitting the kwarg entirely — Stripe rejects an
+    # explicit configuration=None, so build the kwargs conditionally.
+    portal_config_id = _ensure_portal_configuration()
+    session_kwargs = {
+        "customer": user.stripe_customer_id,
+        "return_url": f"{FRONTEND_URL}/?view=settings",
+    }
+    if portal_config_id:
+        session_kwargs["configuration"] = portal_config_id
+
+    try:
+        session = stripe.billing_portal.Session.create(**session_kwargs)
+    except stripe.error.StripeError as exc:
+        logger.error("Stripe portal session creation failed for user %s: %s", user.id, exc)
+        raise HTTPException(
+            status_code=502,
+            detail="No se pudo abrir el portal de facturación. Intentá de nuevo en unos segundos.",
+        )
 
     return {"portal_url": session.url}
 
