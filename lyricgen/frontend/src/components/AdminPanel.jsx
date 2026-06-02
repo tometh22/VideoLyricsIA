@@ -1,4 +1,4 @@
-import { useState, useEffect } from "react";
+import { Fragment, useState, useEffect } from "react";
 import { useI18n } from "../i18n";
 
 const API = import.meta.env.VITE_API_URL || "";
@@ -12,6 +12,63 @@ function fmtDate(iso) {
   if (!iso) return "—";
   return new Date(iso).toLocaleDateString("es-AR", { day: "2-digit", month: "short", year: "numeric" });
 }
+
+// Tiempo relativo compacto para la columna "última actividad" del tab
+// Actividad. Pasa a fecha absoluta cuando hace más de una semana.
+function fmtAgo(iso) {
+  if (!iso) return "—";
+  const mins = Math.floor((Date.now() - new Date(iso).getTime()) / 60000);
+  if (mins < 1) return "ahora";
+  if (mins < 60) return `hace ${mins} min`;
+  const hours = Math.floor(mins / 60);
+  if (hours < 24) return `hace ${hours} h`;
+  const days = Math.floor(hours / 24);
+  if (days <= 7) return `hace ${days} d`;
+  return fmtDate(iso);
+}
+
+// Formato compacto de duración para "tiempo en la app": 45m, 2h 14m, 0m.
+function fmtDuration(seconds) {
+  const s = Math.max(0, Number(seconds) || 0);
+  const mins = Math.round(s / 60);
+  if (mins < 60) return `${mins}m`;
+  const hours = Math.floor(mins / 60);
+  return `${hours}h ${mins % 60}m`;
+}
+
+// Labels en español para las categorías de error de error_taxonomy.py.
+// Agregar una categoría nueva en el backend = agregar el label acá.
+const ERROR_CATEGORY_LABELS = {
+  veo: "Fondo IA (Veo)",
+  render: "Render / ffmpeg",
+  upload: "Storage / R2",
+  timing: "Timing de letra",
+  validation: "Validación / política",
+  reaper: "Worker colgado",
+  timeout: "Timeout",
+  unknown: "Otro",
+};
+
+// Suma de todas las señales de retrabajo de una fila de /admin/activity.
+// Es el número que se muestra colapsado; el desglose vive en el drill-down.
+function reworkTotal(rw) {
+  if (!rw) return 0;
+  return (rw.variants || 0) + (rw.total_edits || 0) + (rw.retries || 0)
+    + (rw.manual_lyric_saves || 0) + (rw.abandoned_recreated || 0);
+}
+
+// Colores de status para el timeline de jobs del drill-down. Mismo
+// criterio que el tab Jobs: verde = listo, ámbar = esperando, rojo = mal.
+const ACTIVITY_STATUS_COLOR = {
+  done: "text-accent",
+  pending_review: "text-amber-400",
+  editing: "text-amber-400",
+  processing: "text-blue-400",
+  queued: "text-blue-400",
+  error: "text-red-400",
+  validation_failed: "text-red-400",
+  rejected: "text-red-400",
+};
 
 function StatCard({ value, label, color = "text-white" }) {
   return (
@@ -72,6 +129,57 @@ export default function AdminPanel({ onBack }) {
     } finally {
       setCostLoading(false);
     }
+  };
+
+  // Actividad por usuario — populated by GET /admin/activity. Una fila
+  // por usuario con videos / errores / rework / fondos / costo IA, y un
+  // drill-down on-demand (GET /admin/activity/{id}) al expandir la fila.
+  const [activitySinceDays, setActivitySinceDays] = useState(30);
+  const [activity, setActivity] = useState(null);
+  const [activityLoading, setActivityLoading] = useState(false);
+  // user_id expandido (null = ninguno). El detalle se cachea por user_id
+  // para no re-pedir al colapsar/expandir.
+  const [activityExpanded, setActivityExpanded] = useState(null);
+  const [activityDetail, setActivityDetail] = useState({});
+  const loadActivity = async () => {
+    setActivityLoading(true);
+    // Al recargar (cambio de período o de tab) el detalle cacheado queda
+    // stale respecto de la nueva ventana → lo descartamos.
+    setActivityDetail({});
+    setActivityExpanded(null);
+    try {
+      const res = await fetch(`${API}/admin/activity?since_days=${activitySinceDays}`, { headers: authHeaders() });
+      // 403 = admin sin permiso de super admin (SUPER_ADMIN_USERS). No es
+      // un error de red: mostramos el panel de acceso restringido.
+      if (res.status === 403) {
+        setActivity({ restricted: true, users: [], since_days: activitySinceDays });
+        return;
+      }
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      setActivity(await res.json());
+    } catch (err) {
+      flashError(`No pude cargar la actividad: ${err.message || err}`);
+    } finally {
+      setActivityLoading(false);
+    }
+  };
+  const loadActivityDetail = async (uid) => {
+    try {
+      const res = await fetch(`${API}/admin/activity/${uid}?since_days=${activitySinceDays}`, { headers: authHeaders() });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const data = await res.json();
+      setActivityDetail((d) => ({ ...d, [uid]: data }));
+    } catch (err) {
+      flashError(`No pude cargar el detalle del usuario: ${err.message || err}`);
+    }
+  };
+  const toggleActivityRow = (uid) => {
+    if (activityExpanded === uid) {
+      setActivityExpanded(null);
+      return;
+    }
+    setActivityExpanded(uid);
+    if (!activityDetail[uid]) loadActivityDetail(uid);
   };
 
   // Inline error banner — usado por handlers que hacen mutaciones
@@ -173,8 +281,9 @@ export default function AdminPanel({ onBack }) {
     if (tab === "backgrounds") loadBackgrounds();
     if (tab === "costs") loadCostDashboard();
     if (tab === "changes") loadChangeRequests();
+    if (tab === "activity") loadActivity();
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [tab, jobsTenantFilter, jobsStatusFilter, bgListFilter, costSinceDays, costRevenuePerVideo, crStatusFilter]);
+  }, [tab, jobsTenantFilter, jobsStatusFilter, bgListFilter, costSinceDays, costRevenuePerVideo, crStatusFilter, activitySinceDays]);
 
   // Auto-refresh the Jobs tab every 5s so admin sees real-time progress
   // of running renders (current_step, progress %). Pauses when the tab
@@ -408,6 +517,7 @@ export default function AdminPanel({ onBack }) {
   const tabs = [
     { id: "overview", label: "Overview" },
     { id: "users", label: "Users" },
+    { id: "activity", label: "Actividad" },
     { id: "jobs", label: "Jobs" },
     { id: "changes", label: "Cambios", badge: crPending || (stats?.deliveries?.pending_change_requests ?? 0) },
     { id: "invoices", label: "Invoices" },
@@ -1381,6 +1491,332 @@ export default function AdminPanel({ onBack }) {
       )}
 
       {/* Costos — panel de margen del operador */}
+      {tab === "activity" && (
+        <div className="space-y-6">
+          {/* Period selector */}
+          <div className="glass rounded-card p-4 flex items-center gap-4 flex-wrap">
+            <div className="flex items-center gap-2">
+              <span className="text-[11px] text-gray-500 uppercase tracking-wide">Período</span>
+              {[7, 30, 90].map((d) => (
+                <button
+                  key={d}
+                  onClick={() => setActivitySinceDays(d)}
+                  className={`px-3 py-1 rounded-md text-xs ring-1 transition-colors ${
+                    activitySinceDays === d
+                      ? "bg-brand/20 ring-brand/40 text-white"
+                      : "ring-white/[0.06] text-gray-400 hover:text-white"
+                  }`}
+                >
+                  {d}d
+                </button>
+              ))}
+            </div>
+            <button
+              onClick={loadActivity}
+              className="ml-auto px-3 py-1 rounded-md text-xs ring-1 ring-white/[0.06] text-gray-400 hover:text-white transition-colors"
+            >
+              Refrescar
+            </button>
+          </div>
+
+          {activityLoading || !activity ? (
+            <div className="flex items-center justify-center py-12">
+              <div className="w-6 h-6 border-2 border-brand border-t-transparent rounded-full animate-spin" />
+            </div>
+          ) : activity.restricted ? (
+            <div className="glass rounded-card p-8 text-center">
+              <p className="text-sm text-gray-300 font-medium mb-1">Acceso restringido</p>
+              <p className="text-[11px] text-gray-500">
+                Esta vista está limitada a los super admins de la plataforma
+                (variable SUPER_ADMIN_USERS). Pedile acceso a Tomás si la necesitás.
+              </p>
+            </div>
+          ) : (
+            <>
+              {/* Headline cards: actividad agregada de la ventana */}
+              <div className="grid grid-cols-2 lg:grid-cols-4 gap-4">
+                <StatCard
+                  value={activity.users.filter((u) => u.videos.total > 0).length}
+                  label={`Usuarios activos (${activity.since_days}d)`}
+                />
+                <StatCard
+                  value={activity.users.reduce((s, u) => s + u.videos.total, 0)}
+                  label="Videos creados"
+                />
+                <StatCard
+                  value={activity.users.reduce((s, u) => s + u.errors.count, 0)}
+                  label="Errores"
+                  color="text-red-400"
+                />
+                <StatCard
+                  value={`$${activity.users.reduce((s, u) => s + u.ai_cost_usd, 0).toFixed(2)}`}
+                  label="Costo IA"
+                />
+              </div>
+
+              {/* Breakdown global de errores por categoría (error_taxonomy) */}
+              {Object.keys(activity.errors_by_category || {}).length > 0 && (
+                <div className="glass rounded-card p-4">
+                  <p className="text-[10px] text-gray-500 uppercase tracking-wider mb-2">
+                    Errores por categoría
+                  </p>
+                  <div className="flex flex-wrap gap-2">
+                    {Object.entries(activity.errors_by_category)
+                      .sort((a, b) => b[1] - a[1])
+                      .map(([cat, n]) => (
+                        <span
+                          key={cat}
+                          className="px-2.5 py-1 rounded-full bg-red-500/10 ring-1 ring-red-500/20 text-[11px] text-red-300"
+                        >
+                          {ERROR_CATEGORY_LABELS[cat] || cat}: <b>{n}</b>
+                        </span>
+                      ))}
+                  </div>
+                </div>
+              )}
+
+              {/* Aviso cuando el tracking de sesiones está apagado */}
+              {!activity.telemetry_enabled && (
+                <div className="rounded-card bg-surface-3/30 ring-1 ring-white/[0.04] px-4 py-3">
+                  <p className="text-[11px] text-gray-500">
+                    El tracking de tiempo-en-app está deshabilitado
+                    (<span className="font-mono">TELEMETRY_ENABLED</span> apagada en el server).
+                    Las columnas "Hoy" / "7 días" y el indicador de "en línea" aparecen al habilitarla.
+                  </p>
+                </div>
+              )}
+
+              {/* Per-user table con drill-down expandible */}
+              <div className="glass-elevated rounded-card p-5">
+                <div className="flex items-center justify-between mb-4">
+                  <h3 className="text-sm font-semibold">Actividad por usuario</h3>
+                  <span className="text-[11px] text-gray-500">
+                    {activity.users.length} usuarios · click en una fila para el detalle
+                  </span>
+                </div>
+                <div className="overflow-x-auto">
+                  <table className="w-full text-[11px]">
+                    <thead>
+                      <tr className="text-gray-500 uppercase tracking-wide text-[10px]">
+                        <th className="text-left font-medium pb-2 pr-3">Usuario</th>
+                        <th className="text-left font-medium pb-2 px-3">Última actividad</th>
+                        {activity.telemetry_enabled && (
+                          <>
+                            <th className="text-right font-medium pb-2 px-3">Hoy</th>
+                            <th className="text-right font-medium pb-2 px-3">7 días</th>
+                          </>
+                        )}
+                        <th className="text-right font-medium pb-2 px-3">Videos</th>
+                        <th className="text-right font-medium pb-2 px-3">Aprobados</th>
+                        <th className="text-right font-medium pb-2 px-3">En curso</th>
+                        <th className="text-right font-medium pb-2 px-3">Errores</th>
+                        <th className="text-right font-medium pb-2 px-3">Retrabajos</th>
+                        <th className="text-right font-medium pb-2 px-3">Fondos lib/IA</th>
+                        <th className="text-right font-medium pb-2 pl-3">Costo IA</th>
+                      </tr>
+                    </thead>
+                    <tbody className="divide-y divide-white/[0.04]">
+                      {activity.users.map((u) => (
+                        <Fragment key={u.user_id}>
+                          <tr
+                            onClick={() => toggleActivityRow(u.user_id)}
+                            className={`cursor-pointer hover:bg-white/[0.02] ${
+                              activityExpanded === u.user_id ? "bg-white/[0.03]" : ""
+                            }`}
+                          >
+                            <td className="py-2 pr-3">
+                              <span className={`font-medium ${u.is_active ? "text-white" : "text-gray-500 line-through"}`}>
+                                {u.username}
+                              </span>
+                              {u.sessions?.online && (
+                                <span
+                                  className="ml-1.5 inline-block w-2 h-2 rounded-full bg-emerald-400 animate-pulse"
+                                  title="En línea ahora"
+                                />
+                              )}
+                              {u.role === "admin" && (
+                                <span className="ml-1.5 text-[9px] uppercase tracking-wide text-brand">admin</span>
+                              )}
+                              <span className="block text-[10px] text-gray-500 font-mono">{u.tenant_id}</span>
+                            </td>
+                            <td className="py-2 px-3 text-gray-300 whitespace-nowrap">{fmtAgo(u.last_activity)}</td>
+                            {activity.telemetry_enabled && (
+                              <>
+                                <td className="py-2 px-3 text-right tabular-nums text-gray-300">
+                                  {fmtDuration(u.sessions?.seconds_today)}
+                                </td>
+                                <td className="py-2 px-3 text-right tabular-nums text-gray-300">
+                                  {fmtDuration(u.sessions?.seconds_week)}
+                                </td>
+                              </>
+                            )}
+                            <td className="py-2 px-3 text-right tabular-nums text-gray-300">
+                              <span className="text-accent font-medium">{u.videos.done}</span>
+                              <span className="text-gray-500"> / {u.videos.total}</span>
+                            </td>
+                            <td className="py-2 px-3 text-right tabular-nums text-gray-300">{u.videos.approved}</td>
+                            <td className="py-2 px-3 text-right tabular-nums text-amber-400">{u.videos.in_progress}</td>
+                            <td className={`py-2 px-3 text-right tabular-nums font-medium ${u.errors.count > 0 ? "text-red-400" : "text-gray-500"}`}>
+                              {u.errors.count}
+                            </td>
+                            <td className={`py-2 px-3 text-right tabular-nums ${reworkTotal(u.rework) > 0 ? "text-amber-300" : "text-gray-500"}`}>
+                              {reworkTotal(u.rework)}
+                            </td>
+                            <td className="py-2 px-3 text-right tabular-nums text-gray-300">
+                              {u.backgrounds.library} / {u.backgrounds.ai_generated}
+                            </td>
+                            <td className="py-2 pl-3 text-right tabular-nums font-mono text-white">
+                              ${u.ai_cost_usd.toFixed(2)}
+                            </td>
+                          </tr>
+                          {activityExpanded === u.user_id && (
+                            <tr>
+                              <td colSpan={activity.telemetry_enabled ? 11 : 9} className="py-3 px-3 bg-surface-3/20">
+                                {/* Desglose de retrabajos */}
+                                <div className="flex flex-wrap gap-2 mb-3">
+                                  {[
+                                    ["Variantes", u.rework.variants],
+                                    ["Ediciones de letra", u.rework.edits_lyrics],
+                                    ["Ediciones de tipografía", u.rework.edits_typography],
+                                    ["Fondos regenerados", u.rework.edits_background],
+                                    ["Metadata", u.rework.edits_metadata],
+                                    ["Reintentos", u.rework.retries],
+                                    ["Correcciones manuales de letra", u.rework.manual_lyric_saves],
+                                    ["Abandonados y recreados", u.rework.abandoned_recreated],
+                                  ].filter(([, n]) => n > 0).map(([label, n]) => (
+                                    <span key={label} className="px-2 py-0.5 rounded-full bg-amber-500/10 ring-1 ring-amber-500/20 text-[10px] text-amber-300">
+                                      {label}: {n}
+                                    </span>
+                                  ))}
+                                  {reworkTotal(u.rework) === 0 && (
+                                    <span className="text-[10px] text-gray-500">Sin retrabajos en la ventana 👌</span>
+                                  )}
+                                </div>
+
+                                {!activityDetail[u.user_id] ? (
+                                  <div className="flex items-center gap-2 text-[11px] text-gray-500 py-2">
+                                    <div className="w-3.5 h-3.5 border-2 border-brand border-t-transparent rounded-full animate-spin" />
+                                    Cargando detalle…
+                                  </div>
+                                ) : (
+                                  <div className="grid lg:grid-cols-2 gap-4">
+                                    {/* Timeline de jobs */}
+                                    <div>
+                                      <p className="text-[10px] text-gray-500 uppercase tracking-wider mb-2">
+                                        Videos ({activityDetail[u.user_id].jobs.length})
+                                      </p>
+                                      <div className="space-y-1 max-h-64 overflow-y-auto pr-1">
+                                        {activityDetail[u.user_id].jobs.length === 0 && (
+                                          <p className="text-[11px] text-gray-500">Sin videos en la ventana.</p>
+                                        )}
+                                        {activityDetail[u.user_id].jobs.map((j) => (
+                                          <div key={j.job_id} className="flex items-start gap-2 text-[11px]">
+                                            <span className={`shrink-0 font-medium ${ACTIVITY_STATUS_COLOR[j.status] || "text-gray-400"}`}>
+                                              {j.status}
+                                            </span>
+                                            <span className="flex-1 text-gray-300 truncate">
+                                              {j.artist} — {j.song_title || "(sin título)"}
+                                              {j.parent_job_id && <span className="text-gray-500"> · variante</span>}
+                                              {j.edit_count > 0 && <span className="text-amber-400"> · {j.edit_count} ediciones</span>}
+                                            </span>
+                                            <span className="shrink-0 text-gray-500">{fmtAgo(j.created_at)}</span>
+                                          </div>
+                                        ))}
+                                      </div>
+                                    </div>
+
+                                    <div className="space-y-4">
+                                      {/* Errores recientes */}
+                                      {u.errors.recent.length > 0 && (
+                                        <div>
+                                          <p className="text-[10px] text-gray-500 uppercase tracking-wider mb-2">Errores recientes</p>
+                                          <div className="space-y-1.5">
+                                            {u.errors.recent.map((e) => (
+                                              <div key={e.job_id} className="text-[11px]">
+                                                {e.category && (
+                                                  <span className="mr-1.5 px-1.5 py-0.5 rounded bg-red-500/10 ring-1 ring-red-500/20 text-[10px] text-red-300">
+                                                    {ERROR_CATEGORY_LABELS[e.category] || e.category}
+                                                  </span>
+                                                )}
+                                                <span className="text-gray-400">{e.artist} — {e.song_title || e.job_id}:</span>{" "}
+                                                <span className="text-red-300 font-mono break-all">{e.error || "(sin mensaje)"}</span>
+                                              </div>
+                                            ))}
+                                          </div>
+                                        </div>
+                                      )}
+
+                                      {/* Descargas + eventos */}
+                                      <div>
+                                        <p className="text-[10px] text-gray-500 uppercase tracking-wider mb-2">
+                                          Descargas ({activityDetail[u.user_id].downloads.length})
+                                          {" · "}Eventos de edición ({activityDetail[u.user_id].events.length})
+                                        </p>
+                                        <div className="space-y-1 max-h-40 overflow-y-auto pr-1">
+                                          {[...activityDetail[u.user_id].downloads, ...activityDetail[u.user_id].events]
+                                            .sort((a, b) => (b.created_at || "").localeCompare(a.created_at || ""))
+                                            .slice(0, 30)
+                                            .map((ev, i) => (
+                                              <div key={i} className="flex items-center gap-2 text-[11px]">
+                                                <span className="shrink-0 font-mono text-gray-400">{ev.action}</span>
+                                                <span className="flex-1 text-gray-500 truncate">
+                                                  {ev.detail?.job_id || ""}
+                                                  {ev.detail?.edit_type ? ` · ${ev.detail.edit_type}` : ""}
+                                                  {ev.detail?.file_type ? ` · ${ev.detail.file_type}` : ""}
+                                                </span>
+                                                <span className="shrink-0 text-gray-500">{fmtAgo(ev.created_at)}</span>
+                                              </div>
+                                            ))}
+                                          {activityDetail[u.user_id].downloads.length === 0
+                                            && activityDetail[u.user_id].events.length === 0 && (
+                                            <p className="text-[11px] text-gray-500">Sin descargas ni eventos.</p>
+                                          )}
+                                        </div>
+                                      </div>
+                                    </div>
+                                  </div>
+                                )}
+                              </td>
+                            </tr>
+                          )}
+                        </Fragment>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              </div>
+
+              <div className="rounded-card bg-surface-3/30 ring-1 ring-white/[0.04] p-4 space-y-2">
+                <p className="text-[11px] text-gray-300 font-medium uppercase tracking-wide">
+                  Cómo leer estos números
+                </p>
+                <ul className="text-[10px] text-gray-500 leading-relaxed list-disc pl-4 space-y-1">
+                  <li>
+                    <b>Videos</b>: terminados / totales creados en la ventana. <b>Aprobados</b> = pasaron revisión.
+                  </li>
+                  <li>
+                    <b>Retrabajos</b> agrupa variantes, ediciones (letra / tipografía / fondo / metadata), reintentos,
+                    correcciones manuales de letra y canciones abandonadas-y-recreadas. Alto retrabajo = fricción:
+                    mirá el desglose en el drill-down para ver dónde.
+                  </li>
+                  <li>
+                    <b>Fondos lib/IA</b>: cuántos videos usaron un fondo de la librería pre-aprobada vs. cuántas
+                    generaciones de fondo con IA (Veo/Imagen) disparó el usuario.
+                  </li>
+                  <li>
+                    <b>Costo IA</b> estimado con las mismas tarifas del tab Costos.
+                  </li>
+                  <li>
+                    <b>Hoy / 7 días</b> (con telemetría habilitada): tiempo real con la app abierta y visible,
+                    medido por heartbeats del navegador cada 60 s. El punto verde = activo en los últimos 3 minutos.
+                  </li>
+                </ul>
+              </div>
+            </>
+          )}
+        </div>
+      )}
+
       {tab === "costs" && (
         <div className="space-y-6">
           {/* Period + revenue selectors */}

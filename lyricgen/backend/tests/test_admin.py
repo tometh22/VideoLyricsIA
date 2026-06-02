@@ -194,3 +194,242 @@ def test_admin_cost_per_tenant_endpoint(client, admin_token):
 def test_admin_cost_denied_for_regular_user(client, user_token):
     res = client.get("/admin/cost", headers=auth(user_token))
     assert res.status_code == 403
+
+
+# ---------------------------------------------------------------------------
+# Per-user activity observability (/admin/activity)
+# ---------------------------------------------------------------------------
+
+import uuid as _uuid
+from datetime import datetime, timedelta, timezone
+
+
+def _register_activity_user(client):
+    """Register a fresh user for activity tests; return (id, username, token)."""
+    username = f"activity_{_uuid.uuid4().hex[:6]}"
+    res = client.post("/auth/register", json={
+        "username": username,
+        "password": "testpass12345",
+        "email": f"{username}@test.com",
+    })
+    token = res.json()["token"]
+    me = client.get("/auth/me", headers=auth(token)).json()
+    return me["id"], username, token
+
+
+def _activity_row(payload, user_id):
+    """Find one user's row in the /admin/activity response."""
+    return next((u for u in payload["users"] if u["user_id"] == user_id), None)
+
+
+def _cleanup_activity_seed(db, job_prefix, user_id=None):
+    """Remove committed seed rows so aggregates don't leak across tests."""
+    from database import Job, AuditLog, AIProvenance, AssetUsage, BackgroundAsset
+    db.query(AIProvenance).filter(AIProvenance.job_id.like(f"{job_prefix}%")).delete(
+        synchronize_session=False)
+    db.query(AssetUsage).filter(AssetUsage.job_id.like(f"{job_prefix}%")).delete(
+        synchronize_session=False)
+    db.query(BackgroundAsset).filter(BackgroundAsset.name.like(f"{job_prefix}%")).delete(
+        synchronize_session=False)
+    db.query(Job).filter(Job.job_id.like(f"{job_prefix}%")).delete(synchronize_session=False)
+    if user_id is not None:
+        db.query(AuditLog).filter(AuditLog.user_id == user_id).delete(synchronize_session=False)
+    db.commit()
+
+
+def test_admin_activity_denied_for_regular_user(client, user_token):
+    res = client.get("/admin/activity", headers=auth(user_token))
+    assert res.status_code == 403
+
+
+def test_admin_activity_basic_shape(client, admin_token):
+    res = client.get("/admin/activity", headers=auth(admin_token))
+    assert res.status_code == 200
+    data = res.json()
+    assert data["since_days"] == 30
+    assert isinstance(data["users"], list)
+    # El admin de bootstrap siempre existe → la lista nunca está vacía
+    assert len(data["users"]) >= 1
+
+
+def test_admin_activity_video_aggregates(client, admin_token, db):
+    from database import Job
+    uid, _, _ = _register_activity_user(client)
+    now = datetime.now(timezone.utc)
+    jobs = [
+        Job(job_id="actv1a", user_id=uid, tenant_id="act-test", artist="A",
+            song_title="S1", filename="a.mp3", status="done",
+            approved_by=uid, approved_at=now),
+        Job(job_id="actv1b", user_id=uid, tenant_id="act-test", artist="A",
+            song_title="S2", filename="a.mp3", status="done"),
+        Job(job_id="actv1c", user_id=uid, tenant_id="act-test", artist="A",
+            song_title="S3", filename="a.mp3", status="error",
+            error="Veo 3 rate limit exceeded after 4 retries"),
+        Job(job_id="actv1d", user_id=uid, tenant_id="act-test", artist="A",
+            song_title="S4", filename="a.mp3", status="processing"),
+        # Los previews de fondo no son videos del usuario → excluidos
+        Job(job_id="actv1e", user_id=uid, tenant_id="act-test", artist="A",
+            song_title="S5", filename="a.mp3", status="bg_preview_video"),
+    ]
+    for j in jobs:
+        db.add(j)
+    db.commit()
+    try:
+        res = client.get("/admin/activity", headers=auth(admin_token))
+        assert res.status_code == 200
+        row = _activity_row(res.json(), uid)
+        assert row is not None
+        assert row["videos"]["total"] == 4  # bg_preview_* excluido
+        assert row["videos"]["done"] == 2
+        assert row["videos"]["approved"] == 1
+        assert row["videos"]["failed"] == 1
+        assert row["videos"]["in_progress"] == 1
+        assert row["errors"]["count"] == 1
+        assert row["errors"]["recent"][0]["job_id"] == "actv1c"
+        assert "Veo 3" in row["errors"]["recent"][0]["error"]
+        assert row["last_activity"] is not None
+    finally:
+        _cleanup_activity_seed(db, "actv1", uid)
+
+
+def test_admin_activity_rework_signals(client, admin_token, db):
+    from database import Job, AuditLog
+    uid, _, _ = _register_activity_user(client)
+    # Variante + re-render parcial
+    db.add(Job(job_id="actv2a", user_id=uid, tenant_id="act-test", artist="B",
+               song_title="Base", filename="b.mp3", status="done", edit_count=2))
+    db.add(Job(job_id="actv2b", user_id=uid, tenant_id="act-test", artist="B",
+               song_title="Base v2", filename="b.mp3", status="done",
+               parent_job_id="actv2a"))
+    # Abandonado y recreado: mismo artist+song_title, el primero nunca terminó
+    db.add(Job(job_id="actv2c", user_id=uid, tenant_id="act-test", artist="B",
+               song_title="Recreada", filename="b.mp3", status="error",
+               error="ffprobe failed on output"))
+    db.add(Job(job_id="actv2d", user_id=uid, tenant_id="act-test", artist="B",
+               song_title="Recreada", filename="b.mp3", status="done"))
+    # Ediciones / retries / correcciones manuales vía AuditLog
+    db.add(AuditLog(user_id=uid, action="job.edit_request", detail={"edit_type": "lyrics"}))
+    db.add(AuditLog(user_id=uid, action="job.edit_request", detail={"edit_type": "background"}))
+    db.add(AuditLog(user_id=uid, action="job.retry", detail={"job_id": "actv2c"}))
+    db.add(AuditLog(user_id=uid, action="lyrics.segments_diff", detail={"job_id": "actv2a"}))
+    db.commit()
+    try:
+        res = client.get("/admin/activity", headers=auth(admin_token))
+        assert res.status_code == 200
+        row = _activity_row(res.json(), uid)
+        assert row is not None
+        assert row["rework"]["variants"] == 1
+        assert row["rework"]["rerendered_jobs"] == 1
+        assert row["rework"]["total_edits"] == 2
+        assert row["rework"]["edits_lyrics"] == 1
+        assert row["rework"]["edits_background"] == 1
+        assert row["rework"]["edits_typography"] == 0
+        assert row["rework"]["retries"] == 1
+        assert row["rework"]["manual_lyric_saves"] == 1
+        assert row["rework"]["abandoned_recreated"] == 1
+    finally:
+        _cleanup_activity_seed(db, "actv2", uid)
+
+
+def test_admin_activity_backgrounds_split(client, admin_token, db):
+    from database import Job, AIProvenance, AssetUsage, BackgroundAsset
+    uid, _, _ = _register_activity_user(client)
+    db.add(Job(job_id="actv3a", user_id=uid, tenant_id="act-test", artist="C",
+               song_title="BG split", filename="c.mp3", status="done"))
+    asset = BackgroundAsset(name="actv3-asset", filename="library/actv3.mp4", file_type="mp4")
+    db.add(asset)
+    db.flush()
+    db.add(AssetUsage(asset_id=asset.id, user_id=uid, tenant_id="act-test",
+                      job_id="actv3a", mode="as_is"))
+    db.add(AIProvenance(job_id="actv3a", step="video_bg",
+                        tool_name="veo-3.1-generate-001",
+                        tool_provider="google_vertex", prompt_sent="bg prompt"))
+    db.commit()
+    try:
+        res = client.get("/admin/activity", headers=auth(admin_token))
+        assert res.status_code == 200
+        row = _activity_row(res.json(), uid)
+        assert row is not None
+        assert row["backgrounds"]["library"] == 1
+        assert row["backgrounds"]["ai_generated"] == 1
+        assert row["ai_cost_usd"] > 0
+    finally:
+        _cleanup_activity_seed(db, "actv3", uid)
+
+
+def test_admin_activity_since_days_filter(client, admin_token, db):
+    from database import Job
+    uid, _, _ = _register_activity_user(client)
+    old = Job(job_id="actv4a", user_id=uid, tenant_id="act-test", artist="D",
+              song_title="Vieja", filename="d.mp3", status="done")
+    old.created_at = datetime.now(timezone.utc) - timedelta(days=60)
+    db.add(old)
+    db.commit()
+    try:
+        res30 = client.get("/admin/activity?since_days=30", headers=auth(admin_token))
+        row30 = _activity_row(res30.json(), uid)
+        assert row30["videos"]["total"] == 0  # fuera de la ventana de 30 días
+
+        res90 = client.get("/admin/activity?since_days=90", headers=auth(admin_token))
+        row90 = _activity_row(res90.json(), uid)
+        assert row90["videos"]["total"] == 1  # dentro de la ventana de 90 días
+    finally:
+        _cleanup_activity_seed(db, "actv4", uid)
+
+
+def test_admin_activity_detail(client, admin_token, user_token, db):
+    from database import Job, AuditLog
+    uid, _, _ = _register_activity_user(client)
+    db.add(Job(job_id="actv5a", user_id=uid, tenant_id="act-test", artist="E",
+               song_title="Detalle", filename="e.mp3", status="done"))
+    db.add(AuditLog(user_id=uid, action="job.download",
+                    detail={"job_id": "actv5a", "file_type": "video", "source": "r2_redirect"}))
+    db.add(AuditLog(user_id=uid, action="job.edit_request",
+                    detail={"job_id": "actv5a", "edit_type": "lyrics"}))
+    db.commit()
+    try:
+        res = client.get(f"/admin/activity/{uid}", headers=auth(admin_token))
+        assert res.status_code == 200
+        data = res.json()
+        assert data["user"]["id"] == uid
+        assert len(data["jobs"]) == 1
+        assert data["jobs"][0]["job_id"] == "actv5a"
+        assert len(data["downloads"]) == 1
+        assert data["downloads"][0]["detail"]["file_type"] == "video"
+        assert len(data["events"]) == 1
+        assert data["events"][0]["action"] == "job.edit_request"
+    finally:
+        _cleanup_activity_seed(db, "actv5", uid)
+
+
+def test_admin_activity_detail_not_found(client, admin_token):
+    res = client.get("/admin/activity/99999999", headers=auth(admin_token))
+    assert res.status_code == 404
+
+
+def test_admin_activity_detail_denied_for_regular_user(client, user_token):
+    res = client.get("/admin/activity/1", headers=auth(user_token))
+    assert res.status_code == 403
+
+
+def test_admin_activity_super_admin_allowlist(client, admin_token, monkeypatch):
+    """Con SUPER_ADMIN_USERS seteado, solo los usuarios listados (por
+    username o email) acceden a la observabilidad — incluso siendo admin."""
+    # El admin de bootstrap ("admin") no está en la lista → 403
+    monkeypatch.setenv("SUPER_ADMIN_USERS", "tomas@epical.digital,agus.cafisi")
+    res = client.get("/admin/activity", headers=auth(admin_token))
+    assert res.status_code == 403
+    res = client.get("/admin/activity/1", headers=auth(admin_token))
+    assert res.status_code == 403
+
+    # Agregado por username → pasa (case-insensitive)
+    monkeypatch.setenv("SUPER_ADMIN_USERS", "tomas@epical.digital, agus.cafisi, ADMIN")
+    res = client.get("/admin/activity", headers=auth(admin_token))
+    assert res.status_code == 200
+
+
+def test_admin_activity_allowlist_unset_allows_any_admin(client, admin_token, monkeypatch):
+    """Sin SUPER_ADMIN_USERS (dev/staging/tests) alcanza con role=admin."""
+    monkeypatch.delenv("SUPER_ADMIN_USERS", raising=False)
+    res = client.get("/admin/activity", headers=auth(admin_token))
+    assert res.status_code == 200
