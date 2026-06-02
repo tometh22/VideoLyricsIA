@@ -44,6 +44,9 @@ export const translations = {
 
     // Settings - billing
     "settings.billing": "Facturación",
+    "settings.card": "Tarjeta",
+    "settings.card_expires": "Vence",
+    "settings.update_card": "Actualizar",
     "billing.past_due_title": "Tu último pago falló.",
     "billing.past_due_body": "Actualizá tu medio de pago para no perder acceso a la generación de videos.",
     "billing.update_payment": "Actualizar medio de pago",
@@ -1399,6 +1402,9 @@ export const translations = {
     "login.back_to_login": "Back to sign in",
 
     "settings.billing": "Billing",
+    "settings.card": "Card",
+    "settings.card_expires": "Expires",
+    "settings.update_card": "Update",
     "billing.past_due_title": "Your last payment failed.",
     "billing.past_due_body": "Update your payment method to keep access to video generation.",
     "billing.update_payment": "Update payment method",
@@ -2352,6 +2358,9 @@ export const translations = {
     "login.back_to_login": "Voltar para entrar",
 
     "settings.billing": "Faturamento",
+    "settings.card": "Cartão",
+    "settings.card_expires": "Vence",
+    "settings.update_card": "Atualizar",
     "billing.past_due_title": "Seu último pagamento falhou.",
     "billing.past_due_body": "Atualize sua forma de pagamento para não perder o acesso à geração de vídeos.",
     "billing.update_payment": "Atualizar forma de pagamento",

@@ -307,3 +307,52 @@ def test_portal_session_passes_configuration_when_present(client, user_token, db
     res = client.post("/billing/portal", headers=auth(user_token))
     assert res.status_code == 200, res.text
     assert captured.get("configuration") == "bpc_x"
+
+
+# ── Fase 2 / PR2: read-only default payment method ──────────────────────────
+
+def test_payment_method_null_when_stripe_unconfigured(client, user_token):
+    res = client.get("/billing/payment-method", headers=auth(user_token))
+    assert res.status_code == 200
+    assert res.json() == {"payment_method": None}
+
+
+def test_payment_method_returns_default_card(client, user_token, db, monkeypatch):
+    """Resolves the canonical default via invoice_settings and returns only
+    brand/last4/exp — never a PAN."""
+    import billing
+    from database import User
+    monkeypatch.setattr(billing.stripe, "api_key", "sk_test_fake")
+    uid = client.get("/auth/me", headers=auth(user_token)).json()["id"]
+    u = db.query(User).filter(User.id == uid).first()
+    u.stripe_customer_id = "cus_pm_card"; db.commit()
+
+    class _Card:
+        brand = "visa"; last4 = "4242"; exp_month = 8; exp_year = 2027
+    class _PM:
+        card = _Card()
+    class _Inv:
+        default_payment_method = _PM()
+    class _Cust:
+        invoice_settings = _Inv()
+        default_source = None
+    monkeypatch.setattr(billing.stripe.Customer, "retrieve", lambda *a, **k: _Cust())
+    res = client.get("/billing/payment-method", headers=auth(user_token))
+    assert res.status_code == 200
+    assert res.json()["payment_method"] == {
+        "brand": "visa", "last4": "4242", "exp_month": 8, "exp_year": 2027,
+    }
+
+
+def test_payment_method_null_on_stripe_error(client, user_token, db, monkeypatch):
+    import billing
+    from database import User
+    monkeypatch.setattr(billing.stripe, "api_key", "sk_test_fake")
+    uid = client.get("/auth/me", headers=auth(user_token)).json()["id"]
+    u = db.query(User).filter(User.id == uid).first()
+    u.stripe_customer_id = "cus_pm_err"; db.commit()
+    def _boom(*a, **k): raise billing.stripe.error.StripeError("down")
+    monkeypatch.setattr(billing.stripe.Customer, "retrieve", _boom)
+    res = client.get("/billing/payment-method", headers=auth(user_token))
+    assert res.status_code == 200
+    assert res.json()["payment_method"] is None

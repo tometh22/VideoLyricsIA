@@ -356,6 +356,77 @@ async def get_subscription(
     return result
 
 
+@router.get("/payment-method")
+async def get_payment_method(
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Return the customer's DEFAULT card for read-only display.
+
+    Shape: {"payment_method": {brand,last4,exp_month,exp_year}} or
+    {"payment_method": null}. Stripe only ever returns brand/last4/exp — no
+    PAN. Degrades to null when Stripe is unconfigured, the user has no
+    customer, or no card is on file (mirrors /subscription). Card ENTRY
+    happens only in the hosted portal (PCI), never here.
+    """
+    user = db.query(User).filter(User.id == current_user["id"]).first()
+    if not stripe.api_key or not user or not user.stripe_customer_id:
+        return {"payment_method": None}
+
+    def _card_dict(card) -> Optional[dict]:
+        # `card` is a StripeObject (PaymentMethod.card or a card Source).
+        # Guard every field: an unexpanded ref comes back as a bare str id.
+        if not card or isinstance(card, str):
+            return None
+        brand = getattr(card, "brand", None)
+        last4 = getattr(card, "last4", None)
+        if not (brand and last4):
+            return None
+        return {
+            "brand": brand,
+            "last4": last4,
+            "exp_month": getattr(card, "exp_month", None),
+            "exp_year": getattr(card, "exp_year", None),
+        }
+
+    try:
+        customer = stripe.Customer.retrieve(
+            user.stripe_customer_id,
+            expand=["invoice_settings.default_payment_method"],
+        )
+        # (1) invoice_settings.default_payment_method — the canonical default
+        inv = getattr(customer, "invoice_settings", None)
+        pm = getattr(inv, "default_payment_method", None) if inv else None
+        if pm and not isinstance(pm, str):
+            card = _card_dict(getattr(pm, "card", None))
+            if card:
+                return {"payment_method": card}
+
+        # (2) fall back to the subscription's default_payment_method
+        if user.stripe_subscription_id:
+            sub = stripe.Subscription.retrieve(
+                user.stripe_subscription_id,
+                expand=["default_payment_method"],
+            )
+            spm = getattr(sub, "default_payment_method", None)
+            if spm and not isinstance(spm, str):
+                card = _card_dict(getattr(spm, "card", None))
+                if card:
+                    return {"payment_method": card}
+
+        # (3) legacy default_source (a card Source carries brand/last4/exp inline)
+        src = getattr(customer, "default_source", None)
+        if src and not isinstance(src, str):
+            card = _card_dict(src)
+            if card:
+                return {"payment_method": card}
+    except stripe.error.StripeError as exc:
+        logger.warning("payment-method lookup failed for user %s: %s", user.id, exc)
+        return {"payment_method": None}
+
+    return {"payment_method": None}
+
+
 # ---------------------------------------------------------------------------
 # Webhook
 # ---------------------------------------------------------------------------

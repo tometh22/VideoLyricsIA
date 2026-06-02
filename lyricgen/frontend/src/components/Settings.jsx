@@ -158,6 +158,7 @@ export default function Settings({ onBack }) {
   const [invoices, setInvoices] = useState([]);
   const [usage, setUsage] = useState(null);
   const [billingLoading, setBillingLoading] = useState(false);
+  const [paymentMethod, setPaymentMethod] = useState(null);
   const [activeSection, setActiveSection] = useState("cuenta");
 
   // Change password
@@ -198,6 +199,11 @@ export default function Settings({ onBack }) {
     fetch(`${API}/billing/invoices`, { headers: authHeaders() })
       .then((r) => r.json())
       .then((data) => { if (Array.isArray(data)) setInvoices(data); })
+      .catch(() => {});
+
+    fetch(`${API}/billing/payment-method`, { headers: authHeaders() })
+      .then((r) => r.json())
+      .then((data) => setPaymentMethod(data?.payment_method || null))
       .catch(() => {});
 
     fetch(`${API}/usage`, { headers: authHeaders() })
@@ -815,6 +821,30 @@ export default function Settings({ onBack }) {
                       <p className="text-xs text-amber-400">{t("settings.cancel_notice") || "Se cancela al final del período"}</p>
                     </div>
                   )}
+                </div>
+              )}
+
+              {paymentMethod && (
+                <div className="flex items-center justify-between gap-3 mt-4 pt-4 border-t border-white/[0.04]">
+                  <div className="flex items-center gap-2.5 min-w-0">
+                    <svg className="w-5 h-5 shrink-0 text-ink-secondary" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
+                      <rect x="1" y="4" width="22" height="16" rx="2" /><line x1="1" y1="10" x2="23" y2="10" />
+                    </svg>
+                    <div className="min-w-0">
+                      <p className="text-sm text-white truncate">
+                        {(paymentMethod.brand ? paymentMethod.brand.charAt(0).toUpperCase() + paymentMethod.brand.slice(1) : (t("settings.card") || "Tarjeta"))} ···· {paymentMethod.last4}
+                      </p>
+                      {paymentMethod.exp_month && paymentMethod.exp_year && (
+                        <p className="text-[11px] text-gray-600 mt-0.5">
+                          {t("settings.card_expires") || "Vence"} {String(paymentMethod.exp_month).padStart(2, "0")}/{paymentMethod.exp_year}
+                        </p>
+                      )}
+                    </div>
+                  </div>
+                  <button onClick={handleManageBilling} disabled={billingLoading}
+                    className="shrink-0 text-xs text-ink-secondary hover:text-white transition-colors px-3 py-1.5 rounded-lg ring-1 ring-white/[0.06] hover:ring-white/[0.12] bg-surface-3/30 disabled:opacity-60">
+                    {billingLoading ? (t("common.opening") || "Abriendo…") : (t("settings.update_card") || "Actualizar")}
+                  </button>
                 </div>
               )}
 
