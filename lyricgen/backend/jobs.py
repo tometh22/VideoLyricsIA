@@ -600,6 +600,9 @@ def update_job(job_id: str, **kwargs) -> None:
         ):
             kwargs.pop("status", None)
             kwargs.pop("error", None)
+            # error_category viaja junto con error — si el error se descarta
+            # (el job ya terminó bien), la categoría también.
+            kwargs.pop("error_category", None)
             kwargs.pop("current_step", None)
             kwargs.pop("completed_at", None)
             if not kwargs:

@@ -1200,7 +1200,11 @@ def run_pipeline(job_id: str, mp3_path: str, artist: str, style: str,
                 logger.warning("[WAVEFORM] precompute skipped for %s: %s", job_id, e)
     except Exception as exc:
         traceback.print_exc()
-        update_job(job_id, status="error", error=str(exc))
+        from error_taxonomy import classify_error
+        update_job(
+            job_id, status="error", error=str(exc),
+            error_category=classify_error(str(exc)),
+        )
         # Surface render failures to Sentry. The worker runs outside
         # the FastAPI request loop so the framework's auto-capture
         # doesn't fire — without this explicit hook, ffmpeg hangs,
@@ -9608,7 +9612,11 @@ def run_edit_pipeline(
 
     except Exception as exc:
         logger.error("[EDIT] job=%s FAILED: %s", job_id, exc, exc_info=True)
-        update_job(job_id, status="error", error=f"Edit failed: {exc}")
+        from error_taxonomy import classify_error
+        update_job(
+            job_id, status="error", error=f"Edit failed: {exc}",
+            error_category=classify_error(str(exc)),
+        )
         _write_edit_audit(
             action="job.edit_failed",
             detail={

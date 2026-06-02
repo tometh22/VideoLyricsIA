@@ -62,6 +62,7 @@ from auth import (
     validate_password_strength,
     has_prores_access,
     has_drive_access,
+    telemetry_enabled,
     generate_api_key,
 )
 import storage
@@ -70,7 +71,7 @@ from datetime import datetime, timedelta, timezone
 from database import (
     Job, User, UserSettings, AuditLog, APIKey, get_db, init_db,
     BackgroundAsset, AssetUsage, Delivery, DeliveryChangeRequest,
-    SalesLead, scoped_db, pool_stats,
+    SalesLead, UserSession, scoped_db, pool_stats,
 )
 from jobs import bulk_delete_jobs, create_job, delete_job, get_job, get_all_jobs, update_job
 from observability import init_sentry, init_logging, health_snapshot
@@ -588,6 +589,54 @@ def on_startup():
     ).start()
     logger.info("outputs-cleanup thread started (every 1 h)")
 
+    # Retención de telemetría de sesiones. Las rows de user_sessions crecen
+    # ~1 por usuario por sesión (no por heartbeat), así que el volumen es
+    # mínimo — el sweep diario igual las mantiene acotadas a 90 días, que
+    # es más que suficiente ventana para el dashboard de actividad.
+    _USER_SESSIONS_CLEANUP_LOCK_KEY = 9118364455199104
+    _USER_SESSIONS_RETENTION_DAYS = 90
+
+    def _user_sessions_cleanup_loop():
+        _time.sleep(240)  # let the API come up first
+        while True:
+            try:
+                def _do_sessions_cleanup():
+                    from database import SessionLocal, UserSession as _US
+                    _db = SessionLocal()
+                    try:
+                        cutoff = datetime.now(timezone.utc) - timedelta(
+                            days=_USER_SESSIONS_RETENTION_DAYS)
+                        deleted = (
+                            _db.query(_US)
+                            .filter(_US.last_seen_at < cutoff)
+                            .delete(synchronize_session=False)
+                        )
+                        _db.commit()
+                        if deleted:
+                            logger.info(
+                                "[SESSIONS_CLEANUP] deleted %d sessions older than %dd",
+                                deleted, _USER_SESSIONS_RETENTION_DAYS,
+                            )
+                    finally:
+                        _db.close()
+                _run_with_advisory_lock(
+                    _USER_SESSIONS_CLEANUP_LOCK_KEY, _do_sessions_cleanup,
+                    name="user_sessions_cleanup",
+                )
+            except Exception:  # pragma: no cover
+                try:
+                    import sentry_sdk
+                    sentry_sdk.capture_exception()
+                except Exception:
+                    pass
+                _time.sleep(60)
+            _time.sleep(24 * 3600)  # diario
+
+    threading.Thread(
+        target=_user_sessions_cleanup_loop, daemon=True, name="user-sessions-cleanup",
+    ).start()
+    logger.info("user-sessions-cleanup thread started (TTL=90d, daily)")
+
 
 # --- Background library (public, authenticated) ---
 _BACKGROUNDS_LIB = os.path.join(os.path.dirname(__file__), "..", "assets", "backgrounds", "library")
@@ -981,7 +1030,10 @@ async def login(body: LoginRequest, request: Request, db: Session = Depends(get_
             "tenant_id": user.tenant_id,
             "plan": user.plan_id,
             "allow_overage": getattr(user, "allow_overage", False) or False,
-            "features": {"prores_export": has_prores_access(user)},
+            "features": {
+                "prores_export": has_prores_access(user),
+                "telemetry": telemetry_enabled(),
+            },
         },
     }
 
@@ -1076,7 +1128,10 @@ async def register(body: RegisterRequest, request: Request, db: Session = Depend
             "tenant_id": user.tenant_id,
             "plan": user.plan_id,
             "allow_overage": getattr(user, "allow_overage", False) or False,
-            "features": {"prores_export": has_prores_access(user)},
+            "features": {
+                "prores_export": has_prores_access(user),
+                "telemetry": telemetry_enabled(),
+            },
         },
     }
 
@@ -1148,6 +1203,72 @@ async def refresh_token(
     if not user or not user.is_active:
         raise HTTPException(status_code=401, detail="User not found or inactive")
     return {"token": create_token(user)}
+
+
+# ---------------------------------------------------------------------------
+# Telemetría de sesiones (tiempo en la app)
+# ---------------------------------------------------------------------------
+
+# Gap máximo entre heartbeats para considerar que la sesión sigue viva.
+# Más que esto (laptop cerrada, pestaña dormida) = sesión nueva, así el
+# "tiempo en app" no acumula horas fantasma.
+_SESSION_GAP = timedelta(minutes=30)
+
+
+@app.post("/telemetry/heartbeat")
+@limiter.limit("30/minute")
+async def telemetry_heartbeat(
+    request: Request,
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Heartbeat de presencia del frontend (1/min mientras la pestaña está visible).
+
+    Alimenta user_sessions, que backs el "tiempo en la app" y el "en línea
+    ahora" del tab Actividad del AdminPanel.
+
+    Contrato de resiliencia: este endpoint NUNCA devuelve 5xx — la
+    telemetría es best-effort y un hiccup acá no puede generar ruido en el
+    cliente ni en Sentry. Con TELEMETRY_ENABLED apagada responde 200 sin
+    escribir (inerte).
+    """
+    if not telemetry_enabled():
+        return {"ok": True, "recorded": False}
+
+    try:
+        now = datetime.now(timezone.utc)
+        session = (
+            db.query(UserSession)
+            .filter(UserSession.user_id == current_user["id"])
+            .order_by(UserSession.last_seen_at.desc())
+            .first()
+        )
+        last_seen = session.last_seen_at if session is not None else None
+        # SQLite (tests) devuelve datetimes naive aunque la columna sea
+        # timezone=True; Postgres devuelve aware. Mismo guard que reaper.py.
+        if last_seen is not None and last_seen.tzinfo is None:
+            last_seen = last_seen.replace(tzinfo=timezone.utc)
+        if last_seen is not None and (now - last_seen) <= _SESSION_GAP:
+            session.last_seen_at = now
+            session.heartbeats = (session.heartbeats or 1) + 1
+        else:
+            db.add(UserSession(
+                user_id=current_user["id"],
+                tenant_id=current_user.get("tenant_id") or "default",
+                started_at=now,
+                last_seen_at=now,
+                heartbeats=1,
+            ))
+        db.commit()
+        return {"ok": True, "recorded": True}
+    except Exception as e:
+        logger.warning("[TELEMETRY] heartbeat write failed for user %s: %s",
+                       current_user.get("id"), e)
+        try:
+            db.rollback()
+        except Exception:
+            pass
+        return {"ok": True, "recorded": False}
 
 
 @app.post("/auth/change-password")
@@ -1513,6 +1634,7 @@ async def usage(current_user: dict = Depends(get_current_user), db: Session = De
         ttl_s=30,
         compute=lambda: get_plan_usage(
             db, current_user["id"], current_user["tenant_id"], current_user.get("plan", "100"),
+            billing_group=current_user.get("billing_group"),
         ),
     )
 
@@ -1911,7 +2033,8 @@ def _enforce_plan_quota(db: Session, current_user: dict) -> None:
     plan = current_user.get("plan", "100")
     tenant_id = current_user["tenant_id"]
     _lock_user_for_quota(db, current_user["id"])
-    usage = get_plan_usage(db, current_user["id"], tenant_id, plan)
+    usage = get_plan_usage(db, current_user["id"], tenant_id, plan,
+                           billing_group=current_user.get("billing_group"))
     if plan != "unlimited" and usage["percent"] >= 80:
         _try_send_usage_alert(db, current_user, usage)
     if usage["remaining"] <= 0 and plan != "unlimited":
@@ -3494,7 +3617,8 @@ async def upload(
             raise HTTPException(status_code=403, detail="AI tool usage not authorized. Contact admin for approval.")
 
     # Check plan limits
-    usage_info = get_plan_usage(db, current_user["id"], current_user["tenant_id"], current_user.get("plan", "100"))
+    usage_info = get_plan_usage(db, current_user["id"], current_user["tenant_id"], current_user.get("plan", "100"),
+                                billing_group=current_user.get("billing_group"))
     if usage_info["alert_100"] and current_user.get("plan") == "free":
         raise HTTPException(status_code=429, detail="Free plan limit reached. Upgrade to continue.")
 
@@ -5827,7 +5951,8 @@ async def generate_with_segments(
     umg_spec = _parse_umg_params(delivery_profile, umg_frame_size, umg_fps, umg_prores_profile, current_user=current_user)
 
     # Check plan limits
-    usage_info = get_plan_usage(db, current_user["id"], current_user["tenant_id"], current_user.get("plan", "100"))
+    usage_info = get_plan_usage(db, current_user["id"], current_user["tenant_id"], current_user.get("plan", "100"),
+                                billing_group=current_user.get("billing_group"))
     if usage_info["alert_100"] and current_user.get("plan") == "free":
         raise HTTPException(status_code=429, detail="Free plan limit reached. Upgrade to continue.")
 
@@ -8849,7 +8974,8 @@ async def create_variant(
     # Plan capacity check — misma lógica que /generate. Variante cuenta
     # como 1 video del plan.
     plan = current_user.get("plan", "100")
-    usage_info = get_plan_usage(db, current_user["id"], current_user["tenant_id"], plan)
+    usage_info = get_plan_usage(db, current_user["id"], current_user["tenant_id"], plan,
+                                billing_group=current_user.get("billing_group"))
     if usage_info["alert_100"] and plan == "free":
         raise HTTPException(
             status_code=429,
