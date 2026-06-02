@@ -256,15 +256,26 @@ def send_invoice_paid(email: str, username: str, amount: float, currency: str, i
     _send_email(email, f"Payment received — ${amount:.2f}", _wrap_template(content))
 
 
-def send_payment_failed(email: str, username: str, amount: float, currency: str):
-    """Notify user that their payment failed and action is required."""
+def send_payment_failed(email: str, username: str, amount: float, currency: str,
+                        retry_date: str = ""):
+    """Notify user that their payment failed and action is required.
+
+    `retry_date` (optional, human-readable) is Stripe's next automatic retry —
+    showing it turns a scary "payment failed" into a calm dunning message so the
+    user knows they have time to fix their card before access is affected."""
+    retry_line = (
+        f'<p>We\'ll automatically retry the charge on <strong>{retry_date}</strong>. '
+        f'Update your payment method before then to keep your subscription active.</p>'
+        if retry_date else
+        '<p>Please update your payment method to keep your subscription active and avoid '
+        'interruptions to your video generation.</p>'
+    )
     content = f"""
     <h2 style="color:#ef4444;margin:0 0 16px;">Payment failed</h2>
     <p>Hi <strong>{username}</strong>,</p>
     <p>We were unable to process your payment of
     <strong>${amount:.2f} {currency.upper()}</strong>.</p>
-    <p>Please update your payment method to keep your subscription active and avoid
-    interruptions to your video generation.</p>
+    {retry_line}
     {_button(FRONTEND_URL + "/?view=settings&tab=facturacion", "Update Payment Method")}
     <p style="color:#888;font-size:13px;">If you have questions, reply to this email.</p>
     """
