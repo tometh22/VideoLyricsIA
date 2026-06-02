@@ -2,11 +2,31 @@
 //
 // Dueño de: la respuesta de /admin/activity (una fila por usuario), el cache
 // de detalle por usuario (drill-down on-demand), los filtros de la tabla
-// (período / tenant / ocultar inactivos) y la lista visible derivada.
-import { useState, useEffect, useCallback } from "react";
+// (período / tenant / segmento) y las listas derivadas (usuarios visibles,
+// errores recientes agregados).
+import { useState, useEffect, useCallback, useMemo } from "react";
 
-import { API, authHeaders, hasActivity } from "../../adminApi";
+import { API, authHeaders, hasActivity, reworkTotal } from "../../adminApi";
 import { useAdmin } from "../../AdminContext";
+
+// Segmentos de la tabla: vistas de un click en vez de toggles + dropdowns.
+//   active  → usuarios con actividad real (default; esconde cuentas de test)
+//   errors  → solo los que tuvieron errores (¿a quién le falló algo?)
+//   online  → conectados ahora (solo con telemetría)
+//   all     → todos, incluso sin actividad
+export const SEGMENTS = [
+  { id: "active", label: "Con actividad" },
+  { id: "errors", label: "Con errores" },
+  { id: "online", label: "En línea" },
+  { id: "all", label: "Todos" },
+];
+
+function matchesSegment(u, segment) {
+  if (segment === "all") return true;
+  if (segment === "errors") return (u.errors?.count || 0) > 0;
+  if (segment === "online") return Boolean(u.sessions?.online);
+  return hasActivity(u); // "active"
+}
 
 export default function useActividad() {
   const { flashError } = useAdmin();
@@ -21,9 +41,8 @@ export default function useActividad() {
   const [activityExpanded, setActivityExpanded] = useState(null);
   const [activityDetail, setActivityDetail] = useState({});
 
-  // Filtros de la tabla. Ocultar inactivos default ON (las cuentas de test
-  // ahogan la tabla); filtro por tenant para mirar un solo workspace (ej. UMG).
-  const [activityHideInactive, setActivityHideInactive] = useState(true);
+  // Filtros: segmento (vistas de un click) + tenant.
+  const [segment, setSegment] = useState("active");
   const [activityTenantFilter, setActivityTenantFilter] = useState("");
 
   const loadActivity = useCallback(async () => {
@@ -77,14 +96,49 @@ export default function useActividad() {
     });
   }, [activityExpanded, loadActivityDetail]);
 
-  // Lista visible según filtros. Las KPI cards y la tabla usan ESTA misma
-  // lista para que los números sean consistentes con lo que se ve.
-  const visibleUsers = (activity?.users || []).filter((u) => {
-    if (activityTenantFilter && u.tenant_id !== activityTenantFilter) return false;
-    if (activityHideInactive && !hasActivity(u)) return false;
-    return true;
-  });
-  const hiddenCount = (activity?.users?.length || 0) - visibleUsers.length;
+  // Usuarios que pasan el filtro de tenant (base para segmentos y errores).
+  const tenantUsers = useMemo(
+    () => (activity?.users || []).filter(
+      (u) => !activityTenantFilter || u.tenant_id === activityTenantFilter,
+    ),
+    [activity, activityTenantFilter],
+  );
+
+  // Conteo por segmento — para mostrar "(N)" en cada chip.
+  const segmentCounts = useMemo(() => {
+    const counts = {};
+    for (const s of SEGMENTS) {
+      counts[s.id] = tenantUsers.filter((u) => matchesSegment(u, s.id)).length;
+    }
+    return counts;
+  }, [tenantUsers]);
+
+  // Lista visible = tenant + segmento. Las KPI cards y la tabla usan ESTA
+  // misma lista para que los números sean consistentes con lo que se ve.
+  const visibleUsers = useMemo(
+    () => tenantUsers.filter((u) => matchesSegment(u, segment)),
+    [tenantUsers, segment],
+  );
+
+  // Errores recientes agregados de TODOS los usuarios del tenant (no del
+  // segmento — el panel "¿qué falló?" tiene que mostrar todo lo que falló
+  // aunque estés mirando otro segmento). Ordenados del más nuevo al más viejo.
+  const recentErrors = useMemo(() => {
+    const all = [];
+    for (const u of tenantUsers) {
+      for (const e of (u.errors?.recent || [])) {
+        all.push({ ...e, username: u.username, user_id: u.user_id, tenant_id: u.tenant_id });
+      }
+    }
+    all.sort((a, b) => (b.created_at || "").localeCompare(a.created_at || ""));
+    return all;
+  }, [tenantUsers]);
+
+  // Total de retrabajos del tenant (para el resumen del panel de problemas).
+  const totalRework = useMemo(
+    () => tenantUsers.reduce((s, u) => s + reworkTotal(u.rework), 0),
+    [tenantUsers],
+  );
 
   return {
     activity,
@@ -94,12 +148,14 @@ export default function useActividad() {
     activityExpanded,
     activityDetail,
     toggleRow,
-    activityHideInactive,
-    setActivityHideInactive,
+    segment,
+    setSegment,
+    segmentCounts,
     activityTenantFilter,
     setActivityTenantFilter,
     visibleUsers,
-    hiddenCount,
+    recentErrors,
+    totalRework,
     loadActivity,
   };
 }

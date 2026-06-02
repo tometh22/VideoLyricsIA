@@ -1,9 +1,10 @@
 // Pipeline en vivo — tabla de jobs con auto-refresh.
 //
-// Columnas: Job (id mono), Artista, Tenant, Estado (StatusBadge), Paso
-// (current_step), Progreso (barra solo mientras corre), Creado (fmtAgo).
-// El filtro de status / tenant y el toggle de auto-refresh viven arriba.
-import { fmtAgo } from "../../adminApi";
+// 4 columnas consolidadas (sin scroll horizontal): el job_id y el paso/
+// progreso viven como sub-línea de Video y Estado. Cuando un job falla,
+// el error (categoría + mensaje + cuándo) se muestra inline — no hay que
+// ir a buscarlo a otro lado.
+import { fmtAgo, ERROR_CATEGORY_LABELS } from "../../adminApi";
 import FilterBar from "../../primitives/FilterBar";
 import DataTable from "../../primitives/DataTable";
 import StatusBadge from "../../primitives/StatusBadge";
@@ -11,13 +12,13 @@ import EmptyState from "../../primitives/EmptyState";
 
 const STATUS_OPTIONS = [
   { id: "", label: "Todos" },
-  { id: "done", label: "done" },
-  { id: "pending_review", label: "pending_review" },
-  { id: "processing", label: "processing" },
-  { id: "queued", label: "queued" },
-  { id: "error", label: "error" },
-  { id: "rejected", label: "rejected" },
-  { id: "validation_failed", label: "validation_failed" },
+  { id: "processing", label: "Procesando" },
+  { id: "queued", label: "En cola" },
+  { id: "pending_review", label: "En revisión" },
+  { id: "done", label: "Listos" },
+  { id: "error", label: "Con error" },
+  { id: "validation_failed", label: "Validación falló" },
+  { id: "rejected", label: "Rechazados" },
 ];
 
 // created_at viene como epoch en segundos; fmtAgo espera ISO.
@@ -26,40 +27,70 @@ function createdToIso(createdAt) {
   return createdAt || null;
 }
 
-function ProgressBar({ job }) {
-  const running = typeof job.progress === "number" && job.status !== "done" && job.status !== "error";
-  if (!running) return <span className="text-caption text-gray-600">—</span>;
-  const pct = Math.max(2, Math.min(100, job.progress));
+const FAILED = new Set(["error", "validation_failed", "transcription_failed"]);
+
+// Estado del job: badge + (paso y barra de progreso mientras corre | error
+// con categoría y mensaje si falló).
+function JobStatus({ job }) {
+  const running = typeof job.progress === "number" && !FAILED.has(job.status) && job.status !== "done";
   return (
-    <div className="flex items-center gap-2">
-      <div className="flex-1 h-1.5 bg-surface-3/60 rounded-full overflow-hidden min-w-[60px]">
-        <div
-          className="h-full bg-gradient-to-r from-brand to-brand-light transition-all duration-brand"
-          style={{ width: `${pct}%` }}
-        />
+    <div className="min-w-0">
+      <div className="flex items-center gap-2">
+        <StatusBadge status={job.status} />
+        {running && job.current_step && (
+          <span className="text-label text-gray-500 truncate">{job.current_step}</span>
+        )}
       </div>
-      <span className="text-section text-gray-500 tabular-nums w-8 text-right">{job.progress}%</span>
+      {running && (
+        <div className="flex items-center gap-2 mt-1.5 max-w-[200px]">
+          <div className="flex-1 h-1.5 bg-surface-3/60 rounded-full overflow-hidden min-w-[60px]">
+            <div
+              className="h-full bg-gradient-to-r from-brand to-brand-light transition-all duration-brand"
+              style={{ width: `${Math.max(2, Math.min(100, job.progress))}%` }}
+            />
+          </div>
+          <span className="text-section text-gray-500 tabular-nums">{job.progress}%</span>
+        </div>
+      )}
+      {FAILED.has(job.status) && job.error && (
+        <div className="mt-1.5 flex items-start gap-1.5">
+          {job.error_category && (
+            <span className="shrink-0 px-1.5 py-0.5 rounded bg-red-500/10 ring-1 ring-red-500/20 text-label text-red-300">
+              {ERROR_CATEGORY_LABELS[job.error_category] || job.error_category}
+            </span>
+          )}
+          <span className="text-label font-mono text-red-300/90 break-words line-clamp-2">
+            {job.error}
+          </span>
+        </div>
+      )}
     </div>
   );
 }
 
 const columns = [
   {
-    key: "job",
-    header: "Job",
+    key: "video",
+    header: "Video",
     render: (j) => (
-      <span className="font-mono text-label text-gray-400">{j.job_id ? `${j.job_id.slice(0, 8)}…` : "—"}</span>
+      <div className="min-w-0">
+        <span className="block text-white truncate">
+          {j.artist || "—"}{j.song_title ? ` — ${j.song_title}` : ""}
+        </span>
+        <span className="block font-mono text-label text-gray-500">
+          {j.job_id || "—"} · {j.tenant_id || "—"}
+        </span>
+      </div>
     ),
   },
-  { key: "artist", header: "Artista", render: (j) => <span className="text-white">{j.artist || "—"}</span> },
-  { key: "tenant", header: "Tenant", render: (j) => <span className="text-gray-500">{j.tenant_id || "—"}</span> },
-  { key: "status", header: "Estado", render: (j) => <StatusBadge status={j.status} /> },
-  { key: "step", header: "Paso", render: (j) => <span className="text-gray-400">{j.current_step || "—"}</span> },
-  { key: "progress", header: "Progreso", width: "140px", render: (j) => <ProgressBar job={j} /> },
+  { key: "status", header: "Estado", render: (j) => <JobStatus job={j} /> },
   {
     key: "created",
     header: "Creado",
-    render: (j) => <span className="text-gray-500 whitespace-nowrap">{fmtAgo(createdToIso(j.created_at))}</span>,
+    align: "right",
+    render: (j) => (
+      <span className="text-gray-500 whitespace-nowrap">{fmtAgo(createdToIso(j.created_at))}</span>
+    ),
   },
 ];
 
@@ -74,6 +105,10 @@ export default function LivePipeline({
   jobsAutoRefresh,
   setJobsAutoRefresh,
 }) {
+  // Cuántos del listado actual fallaron — para que el operador no tenga que
+  // scrollear buscando rojo.
+  const failedCount = (jobs || []).filter((j) => FAILED.has(j.status)).length;
+
   return (
     <div className="space-y-4">
       <FilterBar>
@@ -89,7 +124,10 @@ export default function LivePipeline({
           placeholder="Filtrar por tenant…"
         />
         <FilterBar.Toggle checked={jobsAutoRefresh} onChange={setJobsAutoRefresh} label="Auto-refresh 5 s" />
-        <span className="text-section uppercase text-gray-500 ml-auto">{jobsTotal} jobs</span>
+        <span className="text-section uppercase text-gray-500 ml-auto whitespace-nowrap">
+          {jobsTotal} jobs
+          {failedCount > 0 && <span className="text-red-400"> · {failedCount} con error</span>}
+        </span>
       </FilterBar>
 
       <div className="glass rounded-card p-2">

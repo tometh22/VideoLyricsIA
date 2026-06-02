@@ -429,6 +429,7 @@ class Job(Base):
             },
             "s3_keys": self.s3_keys,
             "error": self.error,
+            "error_category": self.error_category,
             "youtube": self.youtube_data,
             "validation_result": self.validation_result,
             "approved_by": self.approved_by,

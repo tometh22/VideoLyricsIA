@@ -1,7 +1,14 @@
-// Vista "Actividad": una fila por usuario con videos / errores / retrabajos /
-// fondos / costo IA en la ventana elegida, y un drill-down on-demand al
-// expandir. Datos de useActividad. Es la parte más nueva del admin viejo —
-// portada con cuidado, sin perder ninguna columna ni el detalle.
+// Vista "Actividad": una fila por usuario, sin scroll horizontal.
+//
+// Diseño (iteración por feedback de Tomás 2026-06-02):
+//   - 5 columnas consolidadas (antes 11 → scroll horizontal feo): la info
+//     secundaria vive como sub-línea dentro de cada celda o en el drill-down.
+//   - Panel "¿Qué falló?" arriba de la tabla: cada error con su categoría,
+//     usuario, canción, mensaje y cuándo — sin tener que expandir filas.
+//   - Filtros como segmentos de un click (Con actividad / Con errores /
+//     En línea / Todos) en vez de toggles + dropdowns.
+import { useState } from "react";
+
 import {
   fmtAgo,
   fmtDuration,
@@ -14,7 +21,7 @@ import EmptyState from "../../primitives/EmptyState";
 import FilterBar from "../../primitives/FilterBar";
 import KpiCard from "../../primitives/KpiCard";
 import StatusBadge from "../../primitives/StatusBadge";
-import useActividad from "./useActividad";
+import useActividad, { SEGMENTS } from "./useActividad";
 
 const PERIOD_OPTIONS = [
   { id: 7, label: "7d" },
@@ -38,8 +45,81 @@ function Spinner({ className = "w-6 h-6" }) {
   return <div className={`${className} border-2 border-brand border-t-transparent rounded-full animate-spin`} />;
 }
 
-// Detalle expandible de un usuario: desglose de retrabajos + (timeline de jobs
-// | errores recientes + descargas/eventos).
+function CategoryChip({ category }) {
+  if (!category) return null;
+  return (
+    <span className="shrink-0 px-1.5 py-0.5 rounded bg-red-500/10 ring-1 ring-red-500/20 text-label text-red-300 whitespace-nowrap">
+      {ERROR_CATEGORY_LABELS[category] || category}
+    </span>
+  );
+}
+
+// Panel "¿Qué falló?" — la respuesta directa a "algo falló, por qué y cuándo"
+// sin tener que abrir el drill-down de cada usuario.
+function ProblemsPanel({ recentErrors, errorsByCategory }) {
+  const [expanded, setExpanded] = useState(true);
+  if (recentErrors.length === 0) return null;
+
+  return (
+    <div className="glass-elevated rounded-card overflow-hidden ring-1 ring-red-500/20">
+      <button
+        type="button"
+        onClick={() => setExpanded((v) => !v)}
+        className="w-full flex items-center gap-3 px-5 py-3.5 text-left hover:bg-white/[0.02] transition-colors duration-brand"
+      >
+        <span className="w-2 h-2 rounded-full bg-red-400 shrink-0" />
+        <span className="text-ui font-semibold text-white flex-1">
+          ¿Qué falló? <span className="text-red-300">({recentErrors.length} {recentErrors.length === 1 ? "error" : "errores"})</span>
+        </span>
+        {/* Resumen por categoría siempre visible en el header */}
+        <span className="hidden sm:flex items-center gap-1.5 flex-wrap justify-end">
+          {Object.entries(errorsByCategory || {})
+            .sort((a, b) => b[1] - a[1])
+            .slice(0, 4)
+            .map(([cat, n]) => (
+              <span key={cat} className="px-2 py-0.5 rounded-full bg-red-500/10 text-label text-red-300">
+                {ERROR_CATEGORY_LABELS[cat] || cat}: {n}
+              </span>
+            ))}
+        </span>
+        <svg
+          className={`w-4 h-4 text-gray-500 shrink-0 transition-transform duration-brand ${expanded ? "rotate-180" : ""}`}
+          fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24"
+        >
+          <path d="M6 9l6 6 6-6" />
+        </svg>
+      </button>
+
+      {expanded && (
+        <div className="px-5 pb-4 divide-y divide-white/[0.04]">
+          {recentErrors.slice(0, 10).map((e, i) => (
+            <div key={`${e.job_id}-${i}`} className="py-2.5 flex items-start gap-3">
+              <CategoryChip category={e.category} />
+              <div className="flex-1 min-w-0">
+                <p className="text-caption text-gray-300">
+                  <span className="font-medium text-white">{e.artist} — {e.song_title || e.job_id}</span>
+                  <span className="text-gray-500"> · {e.username}</span>
+                </p>
+                <p className="text-label font-mono text-red-300/90 break-words mt-0.5">
+                  {e.error || "(sin mensaje de error)"}
+                </p>
+              </div>
+              <span className="shrink-0 text-label text-gray-500 whitespace-nowrap">{fmtAgo(e.created_at)}</span>
+            </div>
+          ))}
+          {recentErrors.length > 10 && (
+            <p className="pt-2.5 text-label text-gray-500">
+              … y {recentErrors.length - 10} más (expandí el usuario en la tabla para verlos)
+            </p>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+// Detalle expandible de un usuario: desglose de retrabajos + fondos +
+// (timeline de jobs | errores + descargas/eventos).
 function ExpandedDetail({ user, detail }) {
   const rw = user.rework || {};
   const reworkChips = REWORK_FIELDS
@@ -48,7 +128,7 @@ function ExpandedDetail({ user, detail }) {
 
   return (
     <div>
-      {/* Desglose de retrabajos */}
+      {/* Desglose de retrabajos + fondos */}
       <div className="flex flex-wrap gap-2 mb-3">
         {reworkChips.map(([label, n]) => (
           <span key={label} className="px-2 py-0.5 rounded-full bg-amber-500/10 ring-1 ring-amber-500/20 text-label text-amber-300">
@@ -58,6 +138,9 @@ function ExpandedDetail({ user, detail }) {
         {reworkTotal(rw) === 0 && (
           <span className="text-label text-gray-500">Sin retrabajos en la ventana 👌</span>
         )}
+        <span className="px-2 py-0.5 rounded-full bg-surface-3/50 ring-1 ring-white/[0.06] text-label text-gray-400">
+          Fondos: {user.backgrounds.library} librería · {user.backgrounds.ai_generated} IA
+        </span>
       </div>
 
       {!detail ? (
@@ -91,20 +174,17 @@ function ExpandedDetail({ user, detail }) {
           </div>
 
           <div className="space-y-4">
-            {/* Errores recientes */}
+            {/* Errores recientes de ESTE usuario */}
             {user.errors.recent.length > 0 && (
               <div>
                 <p className="text-section uppercase tracking-wider text-gray-500 mb-2">Errores recientes</p>
                 <div className="space-y-1.5">
                   {user.errors.recent.map((e) => (
                     <div key={e.job_id} className="text-caption">
-                      {e.category && (
-                        <span className="mr-1.5 px-1.5 py-0.5 rounded bg-red-500/10 ring-1 ring-red-500/20 text-label text-red-300">
-                          {ERROR_CATEGORY_LABELS[e.category] || e.category}
-                        </span>
-                      )}
-                      <span className="text-gray-400">{e.artist} — {e.song_title || e.job_id}:</span>{" "}
+                      <CategoryChip category={e.category} />
+                      <span className="text-gray-400 ml-1.5">{e.artist} — {e.song_title || e.job_id}:</span>{" "}
                       <span className="text-red-300 font-mono break-all">{e.error || "(sin mensaje)"}</span>
+                      <span className="text-gray-500"> · {fmtAgo(e.created_at)}</span>
                     </div>
                   ))}
                 </div>
@@ -153,139 +233,125 @@ export default function ActividadView() {
     activityExpanded,
     activityDetail,
     toggleRow,
-    activityHideInactive,
-    setActivityHideInactive,
+    segment,
+    setSegment,
+    segmentCounts,
     activityTenantFilter,
     setActivityTenantFilter,
     visibleUsers,
-    hiddenCount,
+    recentErrors,
+    totalRework,
     loadActivity,
   } = useActividad();
 
   const telemetry = activity?.telemetry_enabled;
 
+  // Chips de tenant (solo si hay más de uno — con un solo tenant no aportan).
+  const tenants = activity && !activity.restricted
+    ? [...new Set(activity.users.map((u) => u.tenant_id).filter(Boolean))].sort()
+    : [];
   const tenantOptions = [
-    { id: "", label: "Todos" },
-    ...(activity && !activity.restricted
-      ? [...new Set(activity.users.map((u) => u.tenant_id).filter(Boolean))]
-          .sort()
-          .map((t) => ({ id: t, label: t }))
-      : []),
+    { id: "", label: "Todos los tenants" },
+    ...tenants.map((t) => ({ id: t, label: t })),
   ];
 
-  // Columnas de la tabla (las de telemetría se insertan solo si está activa).
+  // Segmentos con su conteo ("Con errores (2)"). "En línea" solo con telemetría.
+  const segmentOptions = SEGMENTS
+    .filter((s) => s.id !== "online" || telemetry)
+    .map((s) => ({ id: s.id, label: `${s.label} (${segmentCounts[s.id] ?? 0})` }));
+
+  // --- Columnas consolidadas (5, sin scroll horizontal) ---------------------
   const columns = [
     {
       key: "user",
       header: "Usuario",
       render: (u) => (
-        <div>
-          <div className="flex items-center gap-1.5 flex-wrap">
-            <span className={`font-medium ${u.is_active ? "text-white" : "text-gray-500 line-through"}`}>
+        <div className="min-w-0">
+          <div className="flex items-center gap-1.5">
+            <span className={`font-medium truncate ${u.is_active ? "text-white" : "text-gray-500 line-through"}`}>
               {u.username}
             </span>
             {u.sessions?.online && (
-              <span className="inline-block w-2 h-2 rounded-full bg-emerald-400 animate-pulse" title="En línea ahora" />
+              <span className="shrink-0 inline-block w-2 h-2 rounded-full bg-emerald-400 animate-pulse" title="En línea ahora" />
             )}
             {u.role === "admin" && (
-              <span className="text-section uppercase tracking-wide text-brand-light">admin</span>
+              <span className="shrink-0 text-section uppercase tracking-wide text-brand-light">admin</span>
             )}
           </div>
-          <span className="block text-label text-gray-500 font-mono">{u.tenant_id}</span>
+          <span className="block text-label text-gray-500 truncate">
+            <span className="font-mono">{u.tenant_id}</span>
+            <span> · {fmtAgo(u.last_activity)}</span>
+          </span>
         </div>
       ),
     },
-    {
-      key: "last",
-      header: "Última actividad",
-      render: (u) => <span className="text-gray-300 whitespace-nowrap">{fmtAgo(u.last_activity)}</span>,
-    },
     ...(telemetry
-      ? [
-          {
-            key: "today",
-            header: "Hoy",
-            align: "right",
-            render: (u) => <span className="tabular-nums text-gray-300">{fmtDuration(u.sessions?.seconds_today)}</span>,
-          },
-          {
-            key: "week",
-            header: "7 días",
-            align: "right",
-            render: (u) => <span className="tabular-nums text-gray-300">{fmtDuration(u.sessions?.seconds_week)}</span>,
-          },
-        ]
+      ? [{
+          key: "time",
+          header: "Tiempo en app",
+          render: (u) => (
+            <div className="whitespace-nowrap">
+              <span className="tabular-nums text-white">{fmtDuration(u.sessions?.seconds_today)}</span>
+              <span className="text-gray-500 text-label"> hoy</span>
+              <span className="block text-label text-gray-500 tabular-nums">
+                {fmtDuration(u.sessions?.seconds_week)} esta semana
+              </span>
+            </div>
+          ),
+        }]
       : []),
     {
       key: "videos",
       header: "Videos",
-      align: "right",
       render: (u) => (
-        <span className="tabular-nums">
-          <span className="text-accent font-medium">{u.videos.done}</span>
-          <span className="text-gray-500"> / {u.videos.total}</span>
-        </span>
+        <div className="whitespace-nowrap">
+          <span className="tabular-nums">
+            <span className="text-accent font-medium">{u.videos.done}</span>
+            <span className="text-gray-500"> / {u.videos.total} creados</span>
+          </span>
+          <span className="block text-label text-gray-500 tabular-nums">
+            {u.videos.approved} aprobados
+            {u.videos.in_progress > 0 && <span className="text-amber-400"> · {u.videos.in_progress} en curso</span>}
+          </span>
+        </div>
       ),
     },
     {
-      key: "approved",
-      header: "Aprobados",
-      align: "right",
-      render: (u) => <span className="tabular-nums text-gray-300">{u.videos.approved}</span>,
-    },
-    {
-      key: "in_progress",
-      header: "En curso",
-      align: "right",
-      render: (u) => <span className="tabular-nums text-amber-400">{u.videos.in_progress}</span>,
-    },
-    {
-      key: "errors",
-      header: "Errores",
-      align: "right",
-      render: (u) => (
-        <span className={`tabular-nums font-medium ${u.errors.count > 0 ? "text-red-400" : "text-gray-500"}`}>
-          {u.errors.count}
-        </span>
-      ),
-    },
-    {
-      key: "rework",
-      header: "Retrabajos",
-      align: "right",
-      render: (u) => (
-        <span className={`tabular-nums ${reworkTotal(u.rework) > 0 ? "text-amber-300" : "text-gray-500"}`}>
-          {reworkTotal(u.rework)}
-        </span>
-      ),
-    },
-    {
-      key: "backgrounds",
-      header: "Fondos lib/IA",
-      align: "right",
-      render: (u) => (
-        <span className="tabular-nums text-gray-300">{u.backgrounds.library} / {u.backgrounds.ai_generated}</span>
-      ),
+      key: "problems",
+      header: "Problemas",
+      render: (u) => {
+        const errors = u.errors.count;
+        const rework = reworkTotal(u.rework);
+        if (errors === 0 && rework === 0) {
+          return <span className="text-label text-gray-600">✓ sin problemas</span>;
+        }
+        return (
+          <div className="flex items-center gap-1.5 flex-wrap">
+            {errors > 0 && (
+              <span className="px-2 py-0.5 rounded-full bg-red-500/10 ring-1 ring-red-500/20 text-label text-red-300 whitespace-nowrap">
+                {errors} {errors === 1 ? "error" : "errores"}
+              </span>
+            )}
+            {rework > 0 && (
+              <span className="px-2 py-0.5 rounded-full bg-amber-500/10 ring-1 ring-amber-500/20 text-label text-amber-300 whitespace-nowrap">
+                {rework} retrabajos
+              </span>
+            )}
+          </div>
+        );
+      },
     },
     {
       key: "cost",
       header: "Costo IA",
       align: "right",
-      render: (u) => <span className="tabular-nums font-mono text-white">{fmtMoney(u.ai_cost_usd)}</span>,
+      render: (u) => <span className="tabular-nums font-mono text-white whitespace-nowrap">{fmtMoney(u.ai_cost_usd)}</span>,
     },
   ];
 
-  const refreshBtn = (
-    <button
-      onClick={loadActivity}
-      className="ml-auto px-3 py-1 rounded-md text-caption ring-1 ring-white/[0.06] text-gray-400 hover:text-white transition-colors duration-brand"
-    >
-      Refrescar
-    </button>
-  );
-
   return (
-    <div className="space-y-6">
+    <div className="space-y-5">
+      {/* Filtros: período + tenant + refresh */}
       <FilterBar>
         <FilterBar.Chips
           value={activitySinceDays}
@@ -293,7 +359,7 @@ export default function ActividadView() {
           options={PERIOD_OPTIONS}
           label="Período"
         />
-        {activity && !activity.restricted && (
+        {tenants.length > 1 && (
           <FilterBar.Select
             value={activityTenantFilter}
             onChange={setActivityTenantFilter}
@@ -301,12 +367,12 @@ export default function ActividadView() {
             label="Tenant"
           />
         )}
-        <FilterBar.Toggle
-          checked={activityHideInactive}
-          onChange={setActivityHideInactive}
-          label="Ocultar usuarios sin actividad"
-        />
-        {refreshBtn}
+        <button
+          onClick={loadActivity}
+          className="ml-auto px-3 py-1 rounded-md text-caption ring-1 ring-white/[0.06] text-gray-400 hover:text-white transition-colors duration-brand"
+        >
+          Refrescar
+        </button>
       </FilterBar>
 
       {activityLoading || !activity ? (
@@ -324,7 +390,7 @@ export default function ActividadView() {
         </div>
       ) : (
         <>
-          {/* KPIs agregados de lo VISIBLE (respeta filtros) */}
+          {/* KPIs de lo VISIBLE (respetan tenant + segmento) */}
           <div className="grid grid-cols-2 lg:grid-cols-4 gap-4">
             <KpiCard
               value={visibleUsers.filter((u) => u.videos.total > 0).length}
@@ -335,9 +401,10 @@ export default function ActividadView() {
               label="Videos creados"
             />
             <KpiCard
-              value={visibleUsers.reduce((s, u) => s + u.errors.count, 0)}
+              value={recentErrors.length}
               label="Errores"
-              tone="danger"
+              tone={recentErrors.length > 0 ? "danger" : "default"}
+              hint={totalRework > 0 ? `+ ${totalRework} retrabajos` : undefined}
             />
             <KpiCard
               value={fmtMoney(visibleUsers.reduce((s, u) => s + u.ai_cost_usd, 0))}
@@ -345,26 +412,8 @@ export default function ActividadView() {
             />
           </div>
 
-          {/* Breakdown global de errores por categoría */}
-          {Object.keys(activity.errors_by_category || {}).length > 0 && (
-            <div className="glass rounded-card p-4">
-              <p className="text-section uppercase tracking-wider text-gray-500 mb-2">
-                Errores por categoría
-              </p>
-              <div className="flex flex-wrap gap-2">
-                {Object.entries(activity.errors_by_category)
-                  .sort((a, b) => b[1] - a[1])
-                  .map(([cat, n]) => (
-                    <span
-                      key={cat}
-                      className="px-2.5 py-1 rounded-full bg-red-500/10 ring-1 ring-red-500/20 text-caption text-red-300"
-                    >
-                      {ERROR_CATEGORY_LABELS[cat] || cat}: <b>{n}</b>
-                    </span>
-                  ))}
-              </div>
-            </div>
-          )}
+          {/* ¿Qué falló? — errores con categoría, usuario, mensaje y cuándo */}
+          <ProblemsPanel recentErrors={recentErrors} errorsByCategory={activity.errors_by_category} />
 
           {/* Aviso cuando el tracking de sesiones está apagado */}
           {!telemetry && (
@@ -372,20 +421,16 @@ export default function ActividadView() {
               <p className="text-caption text-gray-500">
                 El tracking de tiempo-en-app está deshabilitado
                 (<span className="font-mono">TELEMETRY_ENABLED</span> apagada en el server).
-                Las columnas "Hoy" / "7 días" y el indicador de "en línea" aparecen al habilitarla.
+                La columna "Tiempo en app" y el indicador de "en línea" aparecen al habilitarla.
               </p>
             </div>
           )}
 
-          {/* Tabla por usuario con drill-down expandible */}
+          {/* Tabla por usuario: segmentos arriba, 5 columnas, drill-down */}
           <div className="glass-elevated rounded-card p-5">
-            <div className="flex items-center justify-between mb-4">
-              <h3 className="text-section text-white font-semibold">Actividad por usuario</h3>
-              <span className="text-caption text-gray-500">
-                {visibleUsers.length} usuarios
-                {hiddenCount > 0 && ` (${hiddenCount} ocultos sin actividad)`}
-                {" · click en una fila para el detalle"}
-              </span>
+            <div className="flex items-center justify-between gap-3 mb-4 flex-wrap">
+              <FilterBar.Chips value={segment} onChange={setSegment} options={segmentOptions} />
+              <span className="text-label text-gray-500">click en una fila para el detalle</span>
             </div>
             <DataTable
               dense
@@ -399,40 +444,42 @@ export default function ActividadView() {
               )}
               empty={
                 <EmptyState
-                  title="Sin actividad"
-                  message="No hay usuarios con actividad en esta ventana o filtro."
+                  title="Nada por acá"
+                  message={
+                    segment === "errors"
+                      ? "Ningún usuario tuvo errores en esta ventana 🎉"
+                      : segment === "online"
+                        ? "No hay nadie conectado ahora."
+                        : "No hay usuarios con actividad en esta ventana o filtro."
+                  }
                 />
               }
             />
           </div>
 
           {/* Ayuda */}
-          <div className="rounded-card bg-surface-3/30 ring-1 ring-white/[0.04] p-4 space-y-2">
-            <p className="text-caption text-gray-300 font-medium uppercase tracking-wide">
+          <details className="rounded-card bg-surface-3/30 ring-1 ring-white/[0.04] p-4">
+            <summary className="text-caption text-gray-400 cursor-pointer select-none">
               Cómo leer estos números
-            </p>
-            <ul className="text-label text-gray-500 leading-relaxed list-disc pl-4 space-y-1">
+            </summary>
+            <ul className="text-label text-gray-500 leading-relaxed list-disc pl-4 space-y-1 mt-3">
               <li>
-                <b>Videos</b>: terminados / totales creados en la ventana. <b>Aprobados</b> = pasaron revisión.
+                <b>Videos</b>: terminados / totales creados en la ventana. <b>Aprobados</b> = pasaron revisión y siguen aprobados.
               </li>
               <li>
-                <b>Retrabajos</b> agrupa variantes, ediciones (letra / tipografía / fondo / metadata), reintentos,
-                correcciones manuales de letra y canciones abandonadas-y-recreadas. Alto retrabajo = fricción:
-                mirá el desglose en el drill-down para ver dónde.
+                <b>Problemas</b>: errores (el video falló — el detalle está en el panel "¿Qué falló?") y retrabajos
+                (variantes, ediciones, reintentos, correcciones de letra, canciones recreadas — el desglose está en el drill-down).
               </li>
               <li>
-                <b>Fondos lib/IA</b>: cuántos videos usaron un fondo de la librería pre-aprobada vs. cuántas
-                generaciones de fondo con IA (Veo/Imagen) disparó el usuario.
+                <b>Tiempo en app</b> (con telemetría): tiempo real con la app abierta y visible, medido por heartbeats
+                del navegador cada 60 s. El punto verde = activo en los últimos 3 minutos.
               </li>
               <li>
-                <b>Costo IA</b> estimado con las mismas tarifas del tab Costos.
-              </li>
-              <li>
-                <b>Hoy / 7 días</b> (con telemetría habilitada): tiempo real con la app abierta y visible,
-                medido por heartbeats del navegador cada 60 s. El punto verde = activo en los últimos 3 minutos.
+                <b>Costo IA</b> estimado con las mismas tarifas de Negocio → Costos. Los fondos usados (librería vs IA)
+                están en el drill-down de cada usuario.
               </li>
             </ul>
-          </div>
+          </details>
         </>
       )}
     </div>
