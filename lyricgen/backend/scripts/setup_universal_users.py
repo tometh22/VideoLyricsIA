@@ -13,11 +13,18 @@ Estado final que produce este script (ver plan aprobado por Tomás):
     - giordano.colussa@umusic.com      (NUEVA — historial vacío)
 
   Tenant genly (plan unlimited, admins):
-    - tomas@epical.digital    (se mueve CON sus videos)
-    - agus.cafisi             (ídem)
+    - tomas@epical.digital    (NUEVA — no existía en prod; rol admin)
+    - Agus.Cafisi             (existente, username con mayúsculas — se mueve CON sus videos)
 
-  Todo el resto de usuarios (excepto la cuenta bootstrap "admin"):
+  Protegidas (no se tocan):
+    - admin           (cuenta bootstrap de emergencia)
+    - umg-archive     (archivo histórico de contenido Universal, 42 videos)
+
+  Todo el resto de usuarios activos (cuentas de test):
     - SOFT-DELETE (is_active=False, username → deleted_{id}, email → NULL)
+
+  Guard de seguridad: la limpieza JAMÁS borra cuentas con role=admin (lección
+  del primer dry-run: Agus.Cafisi iba a ser borrado por mismatch de mayúsculas).
 
 Ambos tenants de Universal comparten el pool de 250/mes vía
 billing_group="universal_music" (auth.get_plan_usage).
@@ -42,7 +49,13 @@ import secrets
 import sys
 import os
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+# Soporta dos modos: como módulo del repo (python -m scripts...) y vía un
+# archivo temporal dentro del container de prod, donde __file__ puede no
+# apuntar al repo pero el cwd ya es el backend dir.
+try:
+    sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+except NameError:
+    pass
 
 from database import SessionLocal, Job, User  # noqa: E402
 from auth import create_user  # noqa: E402
@@ -68,11 +81,19 @@ CHILE = {
 GENLY = {
     "tenant": "genly",
     "plan": "unlimited",
-    "usernames": ["tomas@epical.digital", "agus.cafisi"],
+    # Username EXACTO como existe en prod (case-sensitive).
+    "existing_usernames": ["Agus.Cafisi"],
+    # Cuentas que no existen en prod y se crean como admin.
+    "new_admins": [
+        {"username": "tomas@epical.digital", "email": "tomas@epical.digital"},
+    ],
 }
 
 # Cuentas que NUNCA se tocan ni se borran.
-PROTECTED_USERNAMES = {"admin"}
+PROTECTED_USERNAMES = {
+    "admin",        # bootstrap de emergencia
+    "umg-archive",  # archivo histórico de contenido Universal (42 videos)
+}
 
 
 def log(msg, dry):
@@ -116,6 +137,39 @@ def move_user(db, user, tenant, plan, billing_group, dry, move_jobs=True):
     db.commit()
 
 
+def create_account(db, username, email, tenant, plan, billing_group, role, dry,
+                   generated_passwords):
+    """Crea una cuenta nueva con password generada (idempotente)."""
+    existing = db.query(User).filter(User.username == username).first()
+    if existing:
+        # Ya existe (re-corrida): asegurar tenant/plan/grupo, no re-crear.
+        move_user(db, existing, tenant, plan, billing_group, dry, move_jobs=False)
+        return
+    password = secrets.token_urlsafe(12)
+    generated_passwords[username] = password
+    log(f"  CREAR {username} (tenant {tenant}, plan {plan}, "
+        f"grupo {billing_group or '—'}, rol {role})", dry)
+    if dry:
+        return
+    user = create_user(
+        db,
+        username=username,
+        password=password,
+        email=email,
+        role=role,
+        tenant_id=tenant,
+        plan=plan,
+        # UMG Guideline 5: los operadores nuevos arrancan sin autorización de
+        # IA (se habilita desde el Admin Panel). Los admins de la plataforma
+        # sí arrancan autorizados.
+        ai_authorized=(role == "admin"),
+        enforce_reserved=False,
+    )
+    if billing_group:
+        user.billing_group = billing_group
+    db.commit()
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--apply", action="store_true",
@@ -143,36 +197,12 @@ def main():
         # --- 2. Chile: crear usuarios nuevos -------------------------------
         print("\n2 · Universal Chile")
         for spec in CHILE["new_users"]:
-            existing = db.query(User).filter(User.username == spec["username"]).first()
-            if existing:
-                # Ya existe (re-corrida del script): asegurar tenant/plan/grupo.
-                move_user(db, existing, CHILE["tenant"], PLAN_UNIVERSAL, BILLING_GROUP, dry,
-                          move_jobs=False)
-                continue
-            password = secrets.token_urlsafe(12)
-            generated_passwords[spec["username"]] = password
-            log(f"  CREAR {spec['username']} (tenant {CHILE['tenant']}, plan {PLAN_UNIVERSAL}, "
-                f"grupo {BILLING_GROUP})", dry)
-            if not dry:
-                user = create_user(
-                    db,
-                    username=spec["username"],
-                    password=password,
-                    email=spec["email"],
-                    role="user",
-                    tenant_id=CHILE["tenant"],
-                    plan=PLAN_UNIVERSAL,
-                    # UMG Guideline 5: los operadores nuevos arrancan sin
-                    # autorización de IA; se habilita desde el Admin Panel.
-                    ai_authorized=False,
-                    enforce_reserved=False,
-                )
-                user.billing_group = BILLING_GROUP
-                db.commit()
+            create_account(db, spec["username"], spec["email"], CHILE["tenant"],
+                           PLAN_UNIVERSAL, BILLING_GROUP, "user", dry, generated_passwords)
 
         # --- 3. Genly: admins de la plataforma -----------------------------
         print("\n3 · Equipo Genly (admins)")
-        for username in GENLY["usernames"]:
+        for username in GENLY["existing_usernames"]:
             user = db.query(User).filter(User.username == username).first()
             if not user:
                 log(f"  ⚠️  {username}: NO EXISTE — verificar el username en prod", dry)
@@ -183,13 +213,17 @@ def main():
                     user.role = "admin"
                     db.commit()
             move_user(db, user, GENLY["tenant"], GENLY["plan"], None, dry)
+        for spec in GENLY["new_admins"]:
+            create_account(db, spec["username"], spec["email"], GENLY["tenant"],
+                           GENLY["plan"], None, "admin", dry, generated_passwords)
 
         # --- 4. Soft-delete del resto ---------------------------------------
         print("\n4 · Limpieza del resto de usuarios")
         keep = (
             set(ARGENTINA["usernames"])
             | {u["username"] for u in CHILE["new_users"]}
-            | set(GENLY["usernames"])
+            | set(GENLY["existing_usernames"])
+            | {a["username"] for a in GENLY["new_admins"]}
             | PROTECTED_USERNAMES
         )
         others = (
@@ -202,6 +236,14 @@ def main():
         if not others:
             log("  (no hay usuarios para borrar)", dry)
         for user in others:
+            # GUARD: jamás borrar admins en la limpieza automática. Si un
+            # admin quedó fuera de la lista keep es casi seguro un mismatch
+            # de username (pasó con Agus.Cafisi en el primer dry-run) — se
+            # reporta y se deja intacto.
+            if user.role == "admin":
+                log(f"  ⚠️  {user.username} es ADMIN y no está en la lista keep — "
+                    f"NO se borra (verificar manualmente)", dry)
+                continue
             n_jobs = db.query(Job).filter(Job.user_id == user.id).count()
             log(f"  SOFT-DELETE {user.username} (tenant {user.tenant_id}, role {user.role}, "
                 f"{n_jobs} videos quedan en DB para auditoría)", dry)
