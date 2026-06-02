@@ -475,19 +475,27 @@ async def list_all_jobs(
 ):
     """List all jobs across all tenants. Optional tenant_id filter so the
     admin can drill into a specific customer (e.g. UMG) and watch their
-    pipeline live."""
-    query = db.query(Job).order_by(Job.created_at.desc())
+    pipeline live.
+
+    Cada job incluye `username` (outer join con users) — el pipeline del
+    admin necesita mostrar QUIÉN creó cada video, no solo el tenant.
+    """
+    query = (
+        db.query(Job, User.username)
+        .outerjoin(User, Job.user_id == User.id)
+        .order_by(Job.created_at.desc())
+    )
     if status:
         query = query.filter(Job.status == status)
     if tenant_id:
         query = query.filter(Job.tenant_id == tenant_id)
 
     total = query.count()
-    jobs = query.offset(offset).limit(limit).all()
+    rows = query.offset(offset).limit(limit).all()
 
     return {
         "total": total,
-        "jobs": [j.to_dict() for j in jobs],
+        "jobs": [{**job.to_dict(), "username": username} for job, username in rows],
     }
 
 

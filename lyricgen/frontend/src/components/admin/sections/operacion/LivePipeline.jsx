@@ -77,8 +77,11 @@ const columns = [
         <span className="block text-white truncate">
           {j.artist || "—"}{j.song_title ? ` — ${j.song_title}` : ""}
         </span>
-        <span className="block font-mono text-label text-gray-500">
-          {j.job_id || "—"} · {j.tenant_id || "—"}
+        {/* Quién (usuario) + dónde (tenant) + qué (job id para soporte) */}
+        <span className="block text-label text-gray-500 truncate">
+          <span className="text-gray-400">{j.username || "—"}</span>
+          <span> · {j.tenant_id || "—"}</span>
+          <span className="font-mono"> · {j.job_id || "—"}</span>
         </span>
       </div>
     ),
