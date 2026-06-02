@@ -10,7 +10,7 @@ RFC 5322 Date / Message-ID headers. Pin:
     entities unescaped)
   - the staging gate still drops / redirects on non-prod
 
-The DNS half of the fix (DKIM + DMARC for genly.ai) lives in
+The DNS half of the fix (DKIM + DMARC for genly.pro) lives in
 docs/RUNBOOK_EMAIL_DELIVERABILITY.md — not testable from here.
 """
 from __future__ import annotations
@@ -61,8 +61,8 @@ def smtp_prod(monkeypatch):
     monkeypatch.setattr(emails, "_enabled", True)
     monkeypatch.setattr(emails, "ENVIRONMENT", "production")
     monkeypatch.setattr(emails, "SMTP_HOST", "smtp.example.com")
-    monkeypatch.setattr(emails, "SMTP_USER", "noreply@genly.ai")
-    monkeypatch.setattr(emails, "SMTP_FROM", "GenLy AI <noreply@genly.ai>")
+    monkeypatch.setattr(emails, "SMTP_USER", "noreply@genly.pro")
+    monkeypatch.setattr(emails, "SMTP_FROM", "GenLy AI <noreply@genly.pro>")
     monkeypatch.setattr(emails, "SMTP_USE_TLS", True)
     return FakeSMTP
 
@@ -76,7 +76,7 @@ def test_html_to_text_strips_tags_and_keeps_links():
         '<html><head><style>p {color: red}</style></head><body>'
         '<h2>Verify your email</h2>'
         '<p>Hi <strong>tom&aacute;s</strong>,</p>'
-        '<a href="https://app.genly.ai/?verify=abc">Verify Email</a>'
+        '<a href="https://app.genly.pro/?verify=abc">Verify Email</a>'
         '</body></html>'
     )
     text = emails._html_to_text(html_body)
@@ -85,7 +85,7 @@ def test_html_to_text_strips_tags_and_keeps_links():
     assert "color: red" not in text  # style block dropped
     assert "Verify your email" in text
     assert "tomás" in text  # entity unescaped
-    assert "Verify Email: https://app.genly.ai/?verify=abc" in text
+    assert "Verify Email: https://app.genly.pro/?verify=abc" in text
 
 
 def test_html_to_text_collapses_blank_lines():
@@ -118,9 +118,9 @@ def test_send_email_has_date_and_aligned_message_id(smtp_prod):
     msg = smtp_prod.sent[0]["message"]
     assert msg["Date"] is not None
     assert msg["Message-ID"] is not None
-    # Message-ID domain aligns with the From domain (genly.ai)
-    assert msg["Message-ID"].rstrip(">").endswith("genly.ai")
-    assert msg["From"] == "GenLy AI <noreply@genly.ai>"
+    # Message-ID domain aligns with the From domain (genly.pro)
+    assert msg["Message-ID"].rstrip(">").endswith("genly.pro")
+    assert msg["From"] == "GenLy AI <noreply@genly.pro>"
     assert msg["To"] == "user@example.com"
 
 
@@ -147,12 +147,12 @@ def test_staging_drops_mail_without_redirect(smtp_prod, monkeypatch):
 
 def test_staging_redirects_mail(smtp_prod, monkeypatch):
     monkeypatch.setattr(emails, "ENVIRONMENT", "staging")
-    monkeypatch.setattr(emails, "EMAIL_STAGING_REDIRECT", "qa@genly.ai")
+    monkeypatch.setattr(emails, "EMAIL_STAGING_REDIRECT", "qa@genly.pro")
     monkeypatch.setattr(emails, "EMAIL_STAGING_ALLOWLIST", set())
 
     emails._send_email("customer@example.com", "Test", "<p>hi</p>")
     assert len(smtp_prod.sent) == 1
-    assert smtp_prod.sent[0]["to"] == "qa@genly.ai"
+    assert smtp_prod.sent[0]["to"] == "qa@genly.pro"
     # Subject stamped with the environment
     assert smtp_prod.sent[0]["message"]["Subject"].startswith("[STAGING]")
 

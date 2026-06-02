@@ -17,7 +17,9 @@ SMTP_HOST = os.environ.get("SMTP_HOST", "")
 SMTP_PORT = int(os.environ.get("SMTP_PORT", "587"))
 SMTP_USER = os.environ.get("SMTP_USER", "")
 SMTP_PASSWORD = os.environ.get("SMTP_PASSWORD", "")
-SMTP_FROM = os.environ.get("SMTP_FROM", "GenLy AI <noreply@genly.ai>")
+# Default From uses genly.pro — the Google Workspace domain. (genly.ai is
+# NOT a mailbox domain; a From there fails DKIM/DMARC alignment → spam.)
+SMTP_FROM = os.environ.get("SMTP_FROM", "GenLy AI <noreply@genly.pro>")
 SMTP_USE_TLS = os.environ.get("SMTP_USE_TLS", "true").lower() == "true"
 FRONTEND_URL = os.environ.get("FRONTEND_URL", "http://localhost:5173")
 
