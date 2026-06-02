@@ -468,8 +468,8 @@ export default function UploadZone({
         return (<svg {...p}><rect x="4.5" y="6.5" width="15" height="11" rx="1.5" /><path d="M10 10l-1.5-1.5M14 10l1.5-1.5M10 14l-1.5 1.5M14 14l1.5 1.5" /></svg>);
       case "estandar": // strong push-in — bold inward arrows from corners
         return (<svg {...p}><rect x="3.5" y="5.5" width="17" height="13" rx="1.5" /><path d="M8.5 9.5L6 7m0 0v2.2M6 7h2.2M15.5 9.5L18 7m0 0v2.2M18 7h-2.2M8.5 14.5L6 17m0 0v-2.2M6 17h2.2M15.5 14.5L18 17m0 0v-2.2M18 17h-2.2" /></svg>);
-      case "foto-parallax": // depth layers + horizontal pan
-        return (<svg {...p}><rect x="3" y="7" width="12" height="10" rx="1.5" /><rect x="9" y="9.5" width="12" height="8.5" rx="1.5" opacity="0.55" /><path d="M14 5h5m0 0l-2-2m2 2l-2 2" /></svg>);
+      case "foto-parallax": // foto fija — static photo icon (no camera motion)
+        return (<svg {...p}><rect x="4" y="5" width="16" height="14" rx="1.5" /><circle cx="9" cy="10" r="1.6" /><path d="M4 16l4.5-4 3 2.5L15 11l5 5" /></svg>);
       case "animado": // stylised 2D shapes
         return (<svg {...p}><circle cx="8" cy="9" r="2.4" /><path d="M14.5 6.5l3.5 5h-7z" /><rect x="9" y="14" width="6" height="4" rx="1" /></svg>);
       default: // auto — sparkle
@@ -650,7 +650,7 @@ export default function UploadZone({
     { code: "estatico",      kind: "video", label: t("upload.movement_estatico") || "Estático (escena viva)",            sample: "/movement_samples/estatico.mp4",       desc: t("upload.movement_estatico_desc") || "🎬 Escena real con cámara FIJA. Lo que se mueve son los elementos de la escena (gente, olas, nubes, neblina, fuego)." },
     { code: "sutil",         kind: "video", label: t("upload.movement_sutil") || "Sutil (cámara apenas drift)",          sample: "/movement_samples/sutil.mp4",          desc: t("upload.movement_sutil_desc") || "🎬 Escena real con drift sutil de cámara + motion in-scene. Calmo pero vivo." },
     { code: "estandar",      kind: "video", label: t("upload.movement_estandar") || "Estándar (cinematográfico)",        sample: "/movement_samples/estandar.mp4",       desc: t("upload.movement_estandar_desc") || "🎬 Escena real con movimiento cinematográfico de cámara (zoom/drift)." },
-    { code: "foto-parallax", kind: "image", label: t("upload.movement_foto_parallax") || "Foto + parallax",              sample: "/movement_samples/foto-parallax.mp4", desc: t("upload.movement_parallax_desc") || "🖼 FOTO estática IA + paneo lento horizontal (NO es video — es imagen con cámara que la recorre)." },
+    { code: "foto-parallax", kind: "image", label: t("upload.movement_foto_parallax") || "Foto fija",                     sample: null,                                  desc: t("upload.movement_parallax_desc") || "🖼 Foto IA fija (sin movimiento de cámara). Sumale un efecto abajo —lluvia, nieve, luces— para darle vida." },
     { code: "animado",       kind: "video", label: t("upload.movement_animado") || "Animado (ilustración)",              sample: "/movement_samples/animado.mp4",       desc: t("upload.movement_animado_desc") || "🎬 Ilustración 2D estilizada animada, no fotorrealista." },
   ];
 

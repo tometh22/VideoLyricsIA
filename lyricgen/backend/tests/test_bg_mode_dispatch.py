@@ -45,13 +45,14 @@ def test_ensure_background_has_imagen_branch():
         "the still .jpg"
     )
 
-    # Ken Burns wrapper turns the still into MP4 matching downstream's
-    # palindrome-loop contract
-    assert "_ken_burns_image_to_mp4(" in src, (
-        "Imagen branch must invoke _ken_burns_image_to_mp4 to convert "
-        "the still into an MP4 — without this, the cached bg layer "
-        "(bg_r2_key_cached) breaks for subsequent typography/lyrics "
-        "edits that assume .mp4 cache files."
+    # Foto fija (2026-06-02): the still is rendered as a STATIC mp4 via ffmpeg
+    # (_static_image_to_mp4). The previous moviepy Ken Burns pan animated ~7,800
+    # frames in Python and OOM-killed the worker on long songs; the static
+    # ffmpeg loop is bounded-memory and still yields the .mp4 cache contract.
+    assert "_static_image_to_mp4(" in src, (
+        "Imagen branch must invoke _static_image_to_mp4 to convert the still "
+        "into a STATIC .mp4 (foto fija) — the moviepy Ken Burns it used before "
+        "OOM-killed the worker (incident 2026-06-02)."
     )
 
 
