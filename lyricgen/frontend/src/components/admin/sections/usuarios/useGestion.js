@@ -82,6 +82,33 @@ export default function useGestion() {
   const toggleActive = useCallback((userId, current) =>
     patchUser(userId, { is_active: !current }, "Toggle activo falló"), [patchUser]);
 
+  // Mover de workspace (tenant) y/o cuenta de facturación. moveJobs=true
+  // arrastra los videos del usuario al tenant nuevo (conserva su historial).
+  const updateWorkspace = useCallback((userId, { tenantId, billingGroup, moveJobs = true }) =>
+    patchUser(userId, {
+      ...(tenantId !== undefined ? { tenant_id: tenantId, move_jobs: moveJobs } : {}),
+      ...(billingGroup !== undefined ? { billing_group: billingGroup } : {}),
+    }, "Cambiar workspace falló"), [patchUser]);
+
+  // Soft-delete (desactiva + anonimiza). El backend rechaza borrar admins
+  // o borrarse a uno mismo.
+  const deleteUser = useCallback(async (userId) => {
+    try {
+      const res = await fetch(`${API}/admin/users/${userId}`, {
+        method: "DELETE",
+        headers: authHeaders(),
+      });
+      if (!res.ok) {
+        const data = await res.json().catch(() => ({}));
+        throw new Error(data.detail || `Error ${res.status}`);
+      }
+      loadUsers();
+    } catch (err) {
+      flashError(`Eliminar usuario falló: ${err.message || err}`);
+      loadUsers();
+    }
+  }, [loadUsers, flashError]);
+
   // AI auth usa endpoints dedicados (POST), no un PATCH del recurso.
   const toggleAI = useCallback(async (userId, currentlyAuthorized) => {
     const endpoint = currentlyAuthorized ? "revoke-ai" : "authorize-ai";
@@ -112,5 +139,7 @@ export default function useGestion() {
     toggleAI,
     toggleOverage,
     toggleActive,
+    updateWorkspace,
+    deleteUser,
   };
 }

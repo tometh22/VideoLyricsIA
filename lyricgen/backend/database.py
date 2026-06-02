@@ -210,6 +210,13 @@ class User(Base):
     role = Column(String(20), nullable=False, default="user")  # user, admin
     tenant_id = Column(String(100), nullable=False, default="default", index=True)
     plan_id = Column(String(20), nullable=False, default="100")
+    # Cuenta de facturación compartida entre tenants. Caso Universal Music:
+    # "universal_argentina" y "universal_chile" son tenants separados (no se
+    # ven los videos entre sí) pero AMBOS consumen del mismo plan de 250/mes
+    # → los usuarios de ambos tenants llevan billing_group="universal_music"
+    # y get_plan_usage() cuenta la cuota sobre todos los tenants del grupo.
+    # NULL = sin grupo (cuota por tenant, comportamiento histórico).
+    billing_group = Column(String(100), nullable=True, index=True)
     is_active = Column(Boolean, default=True)
     email_verified = Column(Boolean, default=False)
     stripe_customer_id = Column(String(255), nullable=True, unique=True)
@@ -263,6 +270,7 @@ class User(Base):
             "role": self.role,
             "tenant_id": self.tenant_id,
             "plan": self.plan_id,
+            "billing_group": self.billing_group,
             "is_active": self.is_active,
             "email_verified": self.email_verified,
             "ai_authorized": self.ai_authorized,
@@ -1013,6 +1021,11 @@ def _migrate_user_columns():
         # de user_sessions + error_category (mismo patrón que
         # last_user_activity_at: la tabla nueva la crea create_all()).
         "ALTER TABLE jobs ADD COLUMN IF NOT EXISTS error_category VARCHAR(32)",
+        # Cuenta de facturación compartida entre tenants (caso Universal
+        # Music AR + CL con un solo plan de 250/mes). Espejo de la migración
+        # Alembic de billing_group.
+        "ALTER TABLE users ADD COLUMN IF NOT EXISTS billing_group VARCHAR(100)",
+        "CREATE INDEX IF NOT EXISTS ix_users_billing_group ON users(billing_group)",
     ]
     # Each statement gets its own transaction. In Postgres, a failed statement
     # inside a transaction puts it in aborted state — subsequent execute()

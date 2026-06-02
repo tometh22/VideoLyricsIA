@@ -14,6 +14,7 @@ const EMPTY = {
   role: "user",
   allow_overage: false,
   ai_authorized: false,
+  billing_group: "",
 };
 
 const inputClass =
@@ -78,6 +79,20 @@ export default function CreateUserModal({ onCreate, onClose }) {
             <p className="text-label text-gray-500 mt-1.5">
               Mismo tenant ID = el equipo comparte historial y videos (ej. varios
               operadores de UMG en el mismo workspace). Vacío = aislado.
+            </p>
+          </div>
+          <div>
+            <input
+              type="text"
+              placeholder="Grupo de facturación (opcional)"
+              value={form.billing_group}
+              onChange={(e) => set({ billing_group: e.target.value })}
+              className={inputClass}
+            />
+            <p className="text-label text-gray-500 mt-1.5">
+              Tenants distintos con el mismo grupo comparten el plan mensual
+              (ej. universal_argentina + universal_chile facturan juntos como
+              "universal_music"). Vacío = la cuota es del tenant.
             </p>
           </div>
           <select
