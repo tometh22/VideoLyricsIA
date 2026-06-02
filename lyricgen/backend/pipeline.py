@@ -1065,6 +1065,10 @@ def run_pipeline(job_id: str, mp3_path: str, artist: str, style: str,
             generate_short(
                 mp3_path, segments, job_dir, bg_source=bg_source,
                 style=style, font=chosen_font, fps=short_fps,
+                text_case=text_case, font_scale=font_scale,
+                lyric_color=lyric_color, lyric_sung_color=lyric_sung_color,
+                text_contrast=text_contrast, effect=effect, custom_colors=custom_colors,
+                lyrics_animation=lyrics_animation, line_transition=line_transition,
             )
             files["short_url"] = f"/download/{job_id}/short"
             update_job(job_id, progress=85)
@@ -8899,7 +8903,9 @@ def generate_lyric_video(
         logger.warning("[FX] moviepy effect skipped (%s); continuing", _e)
         _fx_clip = None
 
-    _grade_style = style if _fx.grade_filter(style) else ""
+    # custom_colors must be threaded into both grade_filter() and grade_frame()
+    # or the moviepy fallback drops the operator's custom palette (2026-06-02).
+    _grade_style = style if _fx.grade_filter(style, custom_colors) else ""
     if _fx_clip is not None or _grade_style:
         _base_src = bg
         _fx_src = _fx_clip
@@ -8909,7 +8915,7 @@ def generate_lyric_video(
             if _fx_src is not None:
                 f = _fx_src.get_frame(t).astype(_np.float32)
                 b = 255.0 - (255.0 - b) * (255.0 - f) / 255.0  # screen
-            return _fx.grade_frame(b, _grade_style).clip(0, 255).astype("uint8")
+            return _fx.grade_frame(b, _grade_style, custom_colors).clip(0, 255).astype("uint8")
 
         base = VideoClip(_fx_base_frame, duration=duration).set_fps(spec.fps)
     else:
@@ -9062,26 +9068,41 @@ def _find_chorus_start(segments: list[dict], window_sec: int = 30) -> float:
     return best_start
 
 
-def _make_short_text_clip(text: str, seg_start: float, seg_end: float, font: str = "Arial"):
+def _make_short_text_clip(text: str, seg_start: float, seg_end: float, font: str = "Arial",
+                          *, text_case: str = "upper", font_scale: float = 1.0,
+                          lyric_color: str = "", text_contrast: str = "medium"):
     """Create text clips sized for vertical 1080x1920 short.
 
-    Sizes are tuned for TikTok / Reels / Shorts viewing on mobile — the
-    previous defaults (40 / 50 / 65) read too small on phones held at arm's
-    length. Bumped to 75 / 95 / 115 which fills more of the vertical
-    real-estate and matches what creators on those platforms actually use.
+    Parity with the main video (2026-06-02 fix): honors the operator's
+    text_case, font_scale, lyric_color and text_contrast instead of
+    hardcoding UPPERCASE / white / fixed sizes / fixed stroke. The previous
+    hardcoding is why a short looked typographically different from the main
+    video (client report). Sizes are tuned for TikTok / Reels / Shorts.
     """
-    display_text = text.upper()
+    # Validate the font path so a silent moviepy fallback to a system font
+    # (which WOULD render different glyphs than the main video) is at least
+    # visible in the logs.
+    if font and font not in ("Arial",) and not os.path.isfile(font):
+        logger.warning("[SHORT] font path not found, moviepy may fall back: %s", font)
+
+    display_text = _apply_case(text, text_case or "upper")
 
     text_len = len(display_text)
     if text_len > 60:
-        fontsize = 75
-        text_width = 1000
+        base_size, text_width = 75, 1000
     elif text_len > 35:
-        fontsize = 95
-        text_width = 980
+        base_size, text_width = 95, 980
     else:
-        fontsize = 115
-        text_width = 950
+        base_size, text_width = 115, 950
+    # Honor font_scale (clamped like the main path) instead of a fixed size.
+    fontsize = max(20, int(round(base_size * max(0.5, min(2.0, font_scale or 1.0)))))
+
+    # Map text_contrast to stroke width + shadow opacity (mirrors the main
+    # video's _CONTRAST_SETTINGS; medium == the previous hardcoded look).
+    ct = _CONTRAST_SETTINGS.get(text_contrast or "medium", _CONTRAST_SETTINGS["medium"])
+    stroke_width = max(1, int(round(3 * (ct["stroke_mult"] / 2.5))))
+    shadow_op = ct["shadow_opacity"]
+    fill = lyric_color or "white"
 
     shadow = TextClip(
         display_text,
@@ -9091,7 +9112,7 @@ def _make_short_text_clip(text: str, seg_start: float, seg_end: float, font: str
         method="caption",
         size=(text_width, None),
         align="center",
-    ).set_opacity(0.6)
+    ).set_opacity(shadow_op)
 
     sh = shadow.size[1]
     shadow_y = (1920 - sh) // 2 + 4
@@ -9102,15 +9123,49 @@ def _make_short_text_clip(text: str, seg_start: float, seg_end: float, font: str
         display_text,
         fontsize=fontsize,
         font=font,
-        color="white",
+        color=fill,
         stroke_color="black",
-        stroke_width=3,
+        stroke_width=stroke_width,
         method="caption",
         size=(text_width, None),
         align="center",
     ).set_position(("center", "center")).set_start(seg_start).set_end(seg_end)
 
     return [shadow, txt]
+
+
+def _apply_short_effect(short_path: str, fx_path: str, fps: float, job_dir: str) -> str:
+    """Screen-blend a looped fx overlay onto a finished short via ffmpeg.
+
+    The short is moviepy-rendered and moviepy can't screen-blend, so the
+    effect is applied as a C-level ffmpeg post-pass using the SAME pre-baked
+    fx assets the main video composites (fx_compositor). Falls back to the
+    un-effected short if ffmpeg fails."""
+    tmp = os.path.join(job_dir, "short_fx.mp4")
+    cmd = [
+        "ffmpeg", "-y", "-loglevel", "error",
+        "-i", os.path.abspath(short_path),
+        "-stream_loop", "-1", "-i", os.path.abspath(fx_path),
+        "-filter_complex",
+        "[0:v]format=gbrp[b];"
+        "[1:v]scale=1080:1920,setpts=PTS-STARTPTS,format=gbrp[f];"
+        "[b][f]blend=all_mode=screen:shortest=1,format=yuv420p[o]",
+        "-map", "[o]", "-map", "0:a?",
+        "-c:v", "libx264", "-preset", "veryfast", "-crf", "20",
+        "-c:a", "copy", "-movflags", "+faststart", "-shortest",
+        "-r", str(fps), tmp,
+    ]
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+        if r.returncode != 0:
+            logger.warning("[SHORT] effect overlay failed (%s); keeping plain short",
+                           (r.stderr or "")[-200:])
+            return short_path
+        os.replace(tmp, short_path)
+        logger.info("[SHORT] effect overlay applied")
+    except Exception as e:
+        logger.warning("[SHORT] effect overlay errored (%s); keeping plain short", e)
+    return short_path
 
 
 def generate_short(
@@ -9121,22 +9176,45 @@ def generate_short(
     style: str = "oscuro",
     font: str = "Arial",
     fps: float = 24,
+    *,
+    text_case: str = "upper",
+    font_scale: float = 1.0,
+    lyric_color: str = "",
+    lyric_sung_color: str = "",
+    text_contrast: str = "medium",
+    effect: str = "",
+    custom_colors: str = "",
+    lyrics_animation: str = "none",
+    line_transition: str = "none",
 ) -> str:
     """Generate a 1080x1920 vertical short from the chorus section.
+
+    Parity with the main video (2026-06-02 fix): the short now honors the
+    operator's typography (text_case / font_scale / lyric_color /
+    text_contrast), color grade (custom_colors), foto-fija static background,
+    line transitions, and the composable effect overlay. It was previously a
+    second, lower-fidelity renderer that hardcoded all of these, so a short
+    looked typographically + visually different from the main video (client
+    report). NOTE: per-word karaoke ANIMATION is not replicated here (the
+    short shows each line in the base color); the libass main path owns that.
 
     `fps` is propagated to the final write so the lazy ProRes short can
     do a pure recode when UMG asks for a non-24 frame rate. Stays at 24
     by default for the YouTube-only path.
     """
+    import fx_compositor as _fx
+
     audio = AudioFileClip(mp3_path)
     start_time = _find_chorus_start(segments)
     end_time = min(start_time + 30, audio.duration)
     short_dur = end_time - start_time
     short_audio = audio.subclip(start_time, end_time)
 
-    # Build vertical background from RAW source (no burned-in lyrics)
+    # Build vertical background from RAW source (no burned-in lyrics).
+    # Foto fija parity (2026-06-02): a still image is held STATIC (no Ken
+    # Burns pan), matching the main video's foto-fija background.
     if bg_source and bg_source.lower().endswith((".jpg", ".jpeg", ".png")):
-        bg_full = _ken_burns_clip(bg_source, short_dur)
+        bg_full = _ken_burns_clip(bg_source, short_dur, static=True)
         bg = _cover_resize(bg_full, 1080, 1920)
     elif bg_source and os.path.exists(bg_source):
         try:
@@ -9157,7 +9235,21 @@ def generate_short(
     else:
         bg = _cover_resize(_make_gradient_clip(short_dur, style), 1080, 1920)
 
-    # Build text clips for segments in this 30s window
+    # Color-grade the BACKGROUND (before lyrics, like the main video — so the
+    # lyrics stay ungraded). No-op when style/custom_colors yield no grade.
+    _grade_style = style if _fx.grade_filter(style, custom_colors) else ""
+    if _grade_style:
+        # grade_frame returns an UNCLIPPED float frame; moviepy fl_image needs
+        # uint8 [0,255] — clip+cast like the main moviepy fallback does.
+        bg = bg.fl_image(
+            lambda f: _fx.grade_frame(f.astype("float32"), _grade_style, custom_colors)
+            .clip(0, 255).astype("uint8")
+        )
+
+    # Build text clips for this 30s window. Honor the operator's case/scale/
+    # color/contrast (parity with the main video); apply a soft crossfade when
+    # a line transition is selected.
+    _do_fade = (line_transition or "none") not in ("none", "cut", "")
     text_layers = []
     for seg in segments:
         if seg["end"] <= start_time or seg["start"] >= end_time:
@@ -9166,7 +9258,14 @@ def generate_short(
         e = min(short_dur, seg["end"] - start_time)
         if e - s < 0.1:
             continue
-        layers = _make_short_text_clip(seg["text"], s, e, font)
+        layers = _make_short_text_clip(
+            seg["text"], s, e, font,
+            text_case=text_case, font_scale=font_scale,
+            lyric_color=lyric_color, text_contrast=text_contrast,
+        )
+        if _do_fade:
+            fd = min(0.25, (e - s) / 3.0)
+            layers = [c.crossfadein(fd).crossfadeout(fd) for c in layers]
         text_layers.extend(layers)
 
     final = CompositeVideoClip([bg] + text_layers, size=(1080, 1920))
@@ -9190,6 +9289,14 @@ def generate_short(
     )
     audio.close()
     final.close()
+
+    # Effect overlay (snow/rain/stars/bokeh/light/aurora): screen-blend the
+    # pre-baked fx loop over the short with ffmpeg — the SAME fx assets the
+    # main video composites. moviepy can't screen-blend, so it's a post-pass.
+    fx = _fx.effect_path(effect)
+    if fx:
+        out_path = _apply_short_effect(out_path, fx, fps, job_dir)
+
     return out_path
 
 
@@ -9395,6 +9502,9 @@ def run_edit_pipeline(
     font_id = merged.get("font") or ""
     text_case = merged.get("text_case") or "upper"
     font_scale = float(merged.get("font_scale") or 1.0)
+    # text_contrast was missing here → a typography/bg edit re-render dropped
+    # the operator's contrast choice on the MAIN video (2026-06-02 fix).
+    text_contrast = merged.get("text_contrast") or "medium"
     lyric_transition = merged.get("lyric_transition") or "cut"
     text_motion = merged.get("text_motion") or "none"
     lyrics_animation = merged.get("lyrics_animation") or "none"
@@ -9537,6 +9647,7 @@ def run_edit_pipeline(
             text_motion=text_motion,
             lyrics_animation=lyrics_animation,
             line_transition=line_transition,
+            text_contrast=text_contrast,
             effect=effect, custom_colors=custom_colors,
             lyric_color=lyric_color, lyric_sung_color=lyric_sung_color,
             title_template=title_template, title_size=title_size,
@@ -9559,6 +9670,10 @@ def run_edit_pipeline(
             generate_short(
                 mp3_path, segments, job_dir, bg_source=bg_source,
                 style=style, font=chosen_font, fps=short_fps,
+                text_case=text_case, font_scale=font_scale,
+                lyric_color=lyric_color, lyric_sung_color=lyric_sung_color,
+                text_contrast=text_contrast, effect=effect, custom_colors=custom_colors,
+                lyrics_animation=lyrics_animation, line_transition=line_transition,
             )
             files["short_url"] = f"/download/{job_id}/short"
             update_job(job_id, progress=85)
