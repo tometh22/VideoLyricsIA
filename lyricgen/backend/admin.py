@@ -710,7 +710,10 @@ async def admin_activity(
             Job.user_id,
             func.count(Job.id).label("total"),
             func.sum(case((Job.status == "done", 1), else_=0)).label("done"),
-            func.sum(case((Job.approved_at.isnot(None), 1), else_=0)).label("approved"),
+            # Aprobado = aprobado Y todavía en done. Un video aprobado que
+            # después volvió a edición ya no cuenta — si no, "aprobados"
+            # puede superar a "terminados" y confunde (visto en staging).
+            func.sum(case(((Job.approved_at.isnot(None)) & (Job.status == "done"), 1), else_=0)).label("approved"),
             func.sum(case((Job.status.in_(_ACTIVITY_FAILED_STATUSES), 1), else_=0)).label("failed"),
             func.sum(case((Job.status.in_(_ACTIVITY_IN_PROGRESS_STATUSES), 1), else_=0)).label("in_progress"),
             func.max(func.coalesce(Job.last_user_activity_at, Job.created_at)).label("last_job_activity"),
@@ -809,17 +812,27 @@ async def admin_activity(
             continue
         agg = audit_rework_by_user.setdefault(user_id, {
             "edits_lyrics": 0, "edits_typography": 0, "edits_background": 0,
-            "edits_metadata": 0, "retries": 0, "manual_lyric_saves": 0,
+            "edits_metadata": 0, "retries": 0, "corrected_jobs": set(),
         })
         if action == _ACTIVITY_RETRY_ACTION:
             agg["retries"] += 1
         elif action == _ACTIVITY_SEGMENTS_ACTION:
-            agg["manual_lyric_saves"] += 1
+            # Correcciones manuales de letra: contamos JOBS distintos, no
+            # eventos. El editor de letras autoguarda (un evento
+            # lyrics.segments_diff por save) → contar eventos infla el
+            # número a miles y lo vuelve inútil (bug visto en staging
+            # 2026-06-02: "Retrabajos: 1011"). La pregunta que responde
+            # esta métrica es "¿cuántos videos necesitaron corrección
+            # manual?", no "¿cuántas veces se guardó?".
+            agg["corrected_jobs"].add((detail or {}).get("job_id") or "?")
         elif action == _ACTIVITY_EDIT_ACTION:
             edit_type = ((detail or {}).get("edit_type") or "").strip()
             key = f"edits_{edit_type}"
             if key in agg:
                 agg[key] += 1
+    # set de job_ids → count para serializar a JSON
+    for agg in audit_rework_by_user.values():
+        agg["corrected_jobs"] = len(agg["corrected_jobs"])
 
     # --- 5. Abandoned-and-recreated heuristic -----------------------------
     # Mismo usuario, misma (artist, song_title), más de un job y al menos
@@ -947,7 +960,7 @@ async def admin_activity(
     empty_rework = {"variants": 0, "rerendered_jobs": 0, "total_edits": 0}
     empty_audit = {
         "edits_lyrics": 0, "edits_typography": 0, "edits_background": 0,
-        "edits_metadata": 0, "retries": 0, "manual_lyric_saves": 0,
+        "edits_metadata": 0, "retries": 0, "corrected_jobs": 0,
     }
     result = []
     for u in users:
