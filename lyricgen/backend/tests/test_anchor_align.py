@@ -122,3 +122,88 @@ def test_vocal_regions_missing_file_is_safe():
 def test_emitted_source_is_valid():
     from timing_sources import VALID_TIMING_SOURCES, SYNCED_SCAFFOLD
     assert SYNCED_SCAFFOLD in VALID_TIMING_SOURCES
+
+
+# ── anchor-based alignment (drift correction) ───────────────────────────────
+
+from anchor_align import _norm_word, _build_anchors, _fit_alignment, _wx_word_stream
+
+
+def test_norm_word_strips_accents_punct():
+    assert _norm_word("Amándose,") == "amandose"
+    assert _norm_word("¡Yeah!") == "yeah"
+    assert _norm_word("  ") == ""
+
+
+def _wxw(words):
+    """words = [(word, start)] → whisperX-shaped segs."""
+    return [{"start": 0.0, "end": 400.0,
+             "words": [{"word": w, "start": t} for w, t in words]}]
+
+
+def test_anchor_fit_corrects_local_drift():
+    """Rata Blanca scenario: synced lines are ~1.4s LATE vs the real vocal
+    (the synced version was chosen by duration, not timing). whisperX heard the
+    distinctive words at the true times → the fit pulls every line back, so
+    'Cuenta la historia' lands ~14.2s, NOT 15.6s. The faint intro 'Uh, no, no'
+    (no distinctive word) is NOT used as an anchor."""
+    pairs = [
+        (7.6, "Uh, no, no"),                                  # ad-lib: no anchor
+        (15.6, "Cuenta la historia de un mago"),              # cuenta
+        (50.0, "Amándose siempre y en todo lugar"),           # amandose
+        (120.0, "Buscando la forma de recuperar"),            # buscando
+        (260.0, "Para siempre con él se quedará"),            # quedara
+    ]
+    wx = _wxw([("cuenta", 14.2), ("historia", 14.8),
+               ("amandose", 48.6), ("buscando", 118.6), ("quedara", 258.6)])
+    segs, meta = build_synced_scaffold(pairs, wx, 325.0, vocal_regions=[(5.0, 300.0)])
+    assert segs is not None, meta
+    assert meta["align"]["anchors"] >= 3
+    cuenta = next(s for s in segs if "Cuenta la historia" in s["text"])
+    assert 13.6 <= cuenta["start"] <= 14.8, f"Cuenta at {cuenta['start']} (want ~14.2)"
+
+
+def test_build_anchors_monotonic_and_distinctive():
+    pairs = [(10.0, "Cuenta la historia"), (20.0, "que los unos con las")]
+    wx = _wxw([("cuenta", 9.0), ("historia", 9.6)])
+    anchors = _build_anchors(pairs, _wx_word_stream(wx))
+    # line 1 anchors on 'cuenta'; line 2 is all stopwords/short → no anchor
+    assert anchors == [(10.0, 9.0)]
+
+
+def test_fit_few_anchors_falls_back_to_offset():
+    """<3 anchors → median offset (a=1), no risky stretch."""
+    pairs = [(10.0, "Cuenta algo"), (20.0, "linea corta"), (30.0, "otra mas")]
+    wx = _wxw([("cuenta", 8.0)])
+    a, b, n = _fit_alignment(pairs, wx)
+    assert a == 1.0 and n == 1 and b == pytest.approx(-2.0)
+
+
+def test_fit_no_anchors_uses_first_word_offset():
+    """No distinctive matches AND no intro gap → plain first-word offset."""
+    pairs = [(10.0, "la la la"), (20.0, "na na na")]
+    wx = _wxw([("xyz", 7.0)])   # nothing matches the canonical words
+    a, b, n = _fit_alignment(pairs, wx)
+    assert a == 1.0 and n == 0 and b == pytest.approx(-3.0)  # 7.0 - 10.0
+
+
+def test_vocal_onset_anchor_when_whisperx_mishears():
+    """Rata Blanca's real failure mode: whisperX mis-hears the first verse so NO
+    distinctive word matches — but there is a clear vocal onset after the intro
+    gap. The first verse must anchor to that onset (timing, not text), so 'Cuenta'
+    lands ~14.7s (the real onset) instead of its raw synced 14.34+drift."""
+    pairs = [
+        (6.4, "Uh, no, no"),                        # intro ad-lib: no anchor word
+        (14.34, "Cuenta la historia de un mago"),   # first verse (raw synced)
+        (50.0, "Amándose siempre y en todo lugar"),
+        (80.0, "Buscando la forma de recuperar"),
+    ]
+    # whisperX: intro blip "no no no" @7.5-7.86, a >3s gap, then a MIS-HEARD verse
+    # whose words match nothing in the canonical:
+    wx = _wxw([("no", 7.5), ("no", 7.7), ("no", 7.86),
+               ("nohabia", 14.71), ("podidoo", 14.9), ("amorr", 15.5)])
+    segs, meta = build_synced_scaffold(pairs, wx, 325.0, vocal_regions=[(5.0, 300.0)])
+    assert segs is not None, meta
+    assert meta["align"]["anchors"] == 0          # no word anchors → vocal-onset path
+    cuenta = next(s for s in segs if "Cuenta" in s["text"])
+    assert 14.3 <= cuenta["start"] <= 15.1, f"Cuenta at {cuenta['start']} (want ~14.7)"

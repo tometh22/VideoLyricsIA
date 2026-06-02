@@ -130,6 +130,137 @@ def _in_voice(t: float, regions, pad: float = _VOICE_PAD_S) -> bool:
     return any(a - pad <= t <= b + pad for a, b in regions)
 
 
+# ── Anchor-based alignment (corrects local drift, not just a global offset) ──
+# A single global offset (anchored to the first sung word) fixes where the song
+# STARTS but not internal drift: the chosen lrclib version's line spacing can be
+# ~1-2s off from THIS recording (Rata Blanca: "Cuenta la historia" landed at
+# 15.6s vs the real 14.2s, because the offset was anchored to the faint intro
+# "Uh, no, no" ad-lib). We instead match DISTINCTIVE canonical words to
+# whisperX's actual word detections and fit a robust line synced_t → audio_t,
+# so every line (early and late) lands on the voice.
+
+import re as _re
+import unicodedata as _ud
+
+_STOPWORDS = frozenset({
+    "que", "los", "las", "una", "con", "por", "del", "para", "como", "este",
+    "esta", "pero", "sus", "muy", "mas", "más", "ese", "esa", "hay", "fue",
+    "son", "han", "sin", "cuando", "donde", "porque", "aunque", "todo", "toda",
+    "desde", "hasta", "entre", "sobre", "cada", "más", "ya",
+})
+_MIN_ANCHOR_LEN = 5
+_FIT_MIN_ANCHORS = 3
+_FIT_MIN_SPAN_S = 60.0
+
+
+def _norm_word(w: str) -> str:
+    w = _ud.normalize("NFKD", (w or "").lower())
+    w = "".join(c for c in w if not _ud.combining(c))
+    return _re.sub(r"[^a-z0-9ñ]", "", w)
+
+
+def _wx_word_stream(wx_segs):
+    """[(normalized_word, start_time)] from whisperX segments, in order."""
+    out = []
+    for s in wx_segs or []:
+        for w in s.get("words") or []:
+            if isinstance(w, dict) and "start" in w:
+                nw = _norm_word(w.get("word"))
+                if nw:
+                    try:
+                        out.append((nw, float(w["start"])))
+                    except (TypeError, ValueError):
+                        continue
+    return out
+
+
+def _line_first_anchor(text: str):
+    """First distinctive (rare, >=5-char, non-stopword) token of a line — a
+    reliable acoustic anchor near the line's start."""
+    for raw in (text or "").split():
+        nw = _norm_word(raw)
+        if len(nw) >= _MIN_ANCHOR_LEN and nw not in _STOPWORDS:
+            return nw
+    return None
+
+
+def _build_anchors(pairs, wx_stream):
+    """Match each line's first distinctive word to whisperX's detection of it,
+    monotonically. Returns [(synced_time, audio_time)]."""
+    from collections import defaultdict
+    idx = defaultdict(list)
+    for nw, t in wx_stream:
+        idx[nw].append(t)
+    anchors = []
+    last_audio = -1.0
+    for t_syn, text in pairs:
+        aw = _line_first_anchor(text)
+        if not aw:
+            continue
+        cand = next((tt for tt in idx.get(aw, ()) if tt > last_audio), None)
+        if cand is None:
+            continue
+        anchors.append((t_syn, cand))
+        last_audio = cand
+    return anchors
+
+
+def _fit_alignment(pairs, wx_segs):
+    """Robust map synced_t → audio_t as (a, b, n_anchors): audio ≈ a*syn + b.
+
+    Multi-anchor least-squares (drift-correcting) when there are enough
+    well-spread matches; median offset for a few; legacy first-word offset when
+    none match. a is clamped to a sane stretch range so a bad fit can't warp
+    the timeline."""
+    import statistics
+    anchors = _build_anchors(pairs, _wx_word_stream(wx_segs))
+    if anchors:  # trim outliers against the median offset
+        offs = [wt - st for st, wt in anchors]
+        med = statistics.median(offs)
+        anchors = [(st, wt) for (st, wt), o in zip(anchors, offs)
+                   if abs(o - med) <= 4.0]
+    span = (anchors[-1][0] - anchors[0][0]) if len(anchors) >= 2 else 0.0
+    if len(anchors) >= _FIT_MIN_ANCHORS and span >= _FIT_MIN_SPAN_S:
+        xs = [st for st, _ in anchors]
+        ys = [wt for _, wt in anchors]
+        n = len(xs)
+        mx, my = sum(xs) / n, sum(ys) / n
+        denom = sum((x - mx) ** 2 for x in xs)
+        a = (sum((x - mx) * (y - my) for x, y in zip(xs, ys)) / denom) if denom else 1.0
+        a = min(1.2, max(0.85, a))
+        return a, my - a * mx, len(anchors)
+    if anchors:
+        b = statistics.median(wt - st for st, wt in anchors)
+        return 1.0, (b if abs(b) <= _MAX_OFFSET_S else 0.0), len(anchors)
+    # No reliable word matches (whisperX mis-hears guitar-heavy songs — the same
+    # reason reconcile aborts). Fall back to a VOCAL-ONSET anchor: align the
+    # first sung VERSE to where the voice actually starts, using TIMING (robust)
+    # not mis-heard text. Fixes Rata Blanca ("Cuenta" 15.5s → 14.7s, the real
+    # onset) without depending on whisperX getting the words right.
+    b = _vocal_onset_offset(pairs, wx_segs)
+    return 1.0, (b if abs(b) <= _MAX_OFFSET_S else 0.0), 0
+
+
+def _vocal_onset_offset(pairs, wx_segs):
+    """Offset aligning the first VERSE line to the first sustained vocal onset.
+
+    The first whisperX word after the intro gap (>3 s, within the first 40 s) is
+    where real singing starts; the first synced line with a distinctive word is
+    the first verse (skipping any leading 'oh/uh' ad-lib). Aligning those two
+    fixes the start without trusting whisperX's (often wrong) early text. Degrades
+    to the plain first-word offset when there is no intro gap / ad-lib."""
+    stream = _wx_word_stream(wx_segs)
+    if not stream or not pairs:
+        return 0.0
+    onset = stream[0][1]
+    for i in range(1, len(stream)):
+        if stream[i][1] - stream[i - 1][1] > 3.0 and stream[i][1] < 40.0:
+            onset = stream[i][1]
+            break
+    verse_t = next((t for t, text in pairs if _line_first_anchor(text)), pairs[0][0])
+    return onset - verse_t
+
+
 def build_synced_scaffold(
     pairs,
     wx_segs,
@@ -154,21 +285,22 @@ def build_synced_scaffold(
         meta["reason"] = "too_few_synced_lines"
         return None, meta
 
-    first_wx = _first_word_time(wx_segs)
-    offset = 0.0
-    if first_wx is not None:
-        cand = first_wx - pairs[0][0]
-        offset = cand if abs(cand) <= _MAX_OFFSET_S else 0.0
-        if abs(cand) > _MAX_OFFSET_S:
-            logger.info("[ANCHOR] offset %.1fs out of range — using 0", cand)
-    meta["offset"] = offset
+    # Align the synced timeline to THIS recording. Multi-anchor linear fit when
+    # there are enough distinctive-word matches (corrects local drift); else a
+    # single global offset (median, or legacy first-word).
+    a, b, n_anchors = _fit_alignment(pairs, wx_segs)
+    meta["align"] = {"a": round(a, 4), "b": round(b, 2), "anchors": n_anchors}
+    meta["offset"] = round(b, 2)
+
+    def _map(t):
+        return a * t + b
 
     # Build segments: each line spans up to the next line's start − 50 ms.
     segs = []
     for i, (t, txt) in enumerate(pairs):
-        st = round(max(0.0, t + offset), 2)
+        st = round(max(0.0, _map(t)), 2)
         if i + 1 < len(pairs):
-            en = round(pairs[i + 1][0] + offset - 0.05, 2)
+            en = round(_map(pairs[i + 1][0]) - 0.05, 2)
         else:
             en = round(st + 3.0, 2)
         if en <= st:
