@@ -163,14 +163,10 @@ def test_ken_burns_clip_accepts_static_flag():
 def test_ensure_background_downgrades_animado_imagen_to_veo():
     src = inspect.getsource(pipeline._ensure_background)
     assert '_norm_move_bg == "animado"' in src
-    # UMG-style fix 2026-05-25: estatico ya NO usa static=True (frame
-    # frozen). Ahora va a subtle=True (micro-drift) — combined con effect
-    # overlay forzado para que NUNCA salga foto 100% quieta.
-    assert 'static=False' in src, (
-        "estatico path must NOT use static=True frozen frame anymore"
-    )
+    # The animado→veo downgrade is independent of the photo render. (Foto fija
+    # 2026-06-02: the imagen path now renders STATIC via ffmpeg, no Ken Burns.)
     assert '_norm_move_bg in ("estatico", "sutil")' in src, (
-        "estatico + sutil both go through subtle=True path"
+        "estatico + sutil routing must still exist"
     )
 
 
@@ -186,21 +182,20 @@ def test_ken_burns_accepts_lateral_and_subtle_flags():
         assert "lateral" in params and "subtle" in params, fn.__name__
 
 
-def test_ensure_background_routes_calm_registers_to_imagen():
-    """estatico / sutil / foto-parallax all force the Imagen path with their own
-    deterministic Ken Burns mode — never Veo, which can't hold the camera.
-
-    UMG-style fix 2026-05-25: estatico ya NO usa static=True frozen. Ahora va
-    a subtle=True junto con sutil — el effect overlay forzado (light si no
-    eligió otro) garantiza motion visible siempre."""
+def test_ensure_background_routes_foto_to_imagen_static():
+    """foto-parallax (a.k.a. "Foto fija") forces the Imagen path. Foto fija
+    (2026-06-02): the still is then rendered STATIC via ffmpeg — the moviepy
+    Ken Burns pan it used before OOM-killed the worker on long songs. Life/
+    motion comes from the composable effect overlay, not a camera move."""
     src = inspect.getsource(pipeline._ensure_background)
-    assert '_norm_move_bg in ("estatico", "sutil")' in src
     assert '_norm_move_bg == "foto-parallax"' in src
     assert 'bg_mode = "imagen"' in src
-    # Estatico + sutil ambos a subtle Ken Burns (no más frozen).
-    assert 'static=False' in src, "estatico must NOT use frozen frame anymore"
-    assert 'subtle=(_norm_move_bg in ("estatico", "sutil"))' in src
-    assert 'lateral=(_norm_move_bg == "foto-parallax")' in src
+    # The imagen render is now a static ffmpeg loop, NOT the moviepy Ken Burns.
+    assert "_static_image_to_mp4(" in src
+    assert "_ken_burns_image_to_mp4(" not in src, (
+        "the imagen background path must NOT call the moviepy Ken Burns render "
+        "(it animated ~7,800 frames in Python and OOM-killed the worker)"
+    )
 
 
 def test_ken_burns_pan_modes_have_no_zoom():
