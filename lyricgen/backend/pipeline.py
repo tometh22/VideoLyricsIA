@@ -8504,10 +8504,18 @@ def _render_lyrics_ass(
 
     # 3) Segments → ASS lines (same case/sanitise/sizing as moviepy), plus
     #    the artist/song title card overlay (same two layouts).
+    # Per-font visual-size normalization: libass scales \fs by the font's
+    # internal vertical metrics, so the SAME \fs renders a different cap-height
+    # per family (Poppins ~14% smaller than Montserrat → "muy chiquita").
+    # Equalize to the Montserrat reference so a size setting looks consistent
+    # across fonts. Keyed by the resolved family (works for explicit picks and
+    # the random "Auto" pool alike). See ass_render.font_size_factor.
+    font_factor = _ass.font_size_factor(family)
     lines = _ass.segments_to_lines(
         segments,
         text_scale=scale,
         font_scale=font_scale,
+        font_factor=font_factor,
         lyric_transition=lyric_transition,
         animation=lyrics_animation,
         transition=line_transition,
@@ -8544,7 +8552,7 @@ def _render_lyrics_ass(
         # individually.
         song_lines=(title_song_break.split("\n") if title_song_break else None),
     )
-    base_fs = _ass.lyric_fontsize(40, scale, font_scale)
+    base_fs = _ass.lyric_fontsize(40, scale, font_scale, font_factor=font_factor)
     # Reusamos el mapping primary/secondary computado arriba para
     # segments_to_lines — mismo eje semántico (karaoke usa sung como
     # PrimaryColour). Sin esto la palabra cantada se rendea con
