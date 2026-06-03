@@ -7545,35 +7545,100 @@ def _resolve_font(font_id: str) -> str | None:
     return None
 
 
+# Proper nouns that stay capitalized even when a whole line is title-cased.
+# Countries + common gentilicios (Spanish, single-token, accent-aware) plus a
+# few high-frequency lyric proper nouns. Used only on the "uniformly
+# title-cased" branch of _smart_lower (see below) — natural sentence-case lines
+# preserve the operator's capitals directly, so this set doesn't need every
+# name, just the common ones a title-cased lyric source would flatten.
+_PROPER_NOUNS = frozenset({
+    # países (es)
+    "afganistán", "albania", "alemania", "andorra", "angola", "argentina",
+    "argelia", "armenia", "australia", "austria", "azerbaiyán", "bangladés",
+    "barbados", "baréin", "bélgica", "belice", "benín", "bielorrusia",
+    "birmania", "bolivia", "botsuana", "brasil", "brunéi", "bulgaria",
+    "burundi", "bután", "camboya", "camerún", "canadá", "catar", "chad",
+    "chile", "china", "chipre", "colombia", "comoras", "congo", "croacia",
+    "cuba", "dinamarca", "dominica", "ecuador", "egipto", "eritrea",
+    "eslovaquia", "eslovenia", "españa", "estonia", "etiopía", "filipinas",
+    "finlandia", "francia", "gabón", "gambia", "georgia", "ghana", "granada",
+    "grecia", "guatemala", "guinea", "guyana", "haití", "honduras", "hungría",
+    "india", "indonesia", "irak", "irán", "irlanda", "islandia", "israel",
+    "italia", "jamaica", "japón", "jordania", "kazajistán", "kenia",
+    "kirguistán", "kiribati", "kuwait", "laos", "lesoto", "letonia", "líbano",
+    "liberia", "libia", "liechtenstein", "lituania", "luxemburgo",
+    "madagascar", "malasia", "malaui", "maldivas", "malí", "malta",
+    "marruecos", "mauricio", "mauritania", "méxico", "micronesia", "moldavia",
+    "mónaco", "mongolia", "montenegro", "mozambique", "namibia", "nauru",
+    "nepal", "nicaragua", "níger", "nigeria", "noruega", "omán", "pakistán",
+    "palaos", "palestina", "panamá", "paraguay", "perú", "polonia", "portugal",
+    "ruanda", "rumania", "rusia", "samoa", "senegal", "serbia", "seychelles",
+    "singapur", "siria", "somalia", "sudán", "suecia", "suiza", "surinam",
+    "tailandia", "taiwán", "tanzania", "tayikistán", "togo", "tonga", "túnez",
+    "turquía", "turkmenistán", "tuvalu", "ucrania", "uganda", "uruguay",
+    "uzbekistán", "vanuatu", "venezuela", "vietnam", "yemen", "yibuti",
+    "zambia", "zimbabue", "salvador",
+    # gentilicios frecuentes
+    "argentino", "argentina", "argentinos", "argentinas", "mexicano",
+    "mexicana", "mexicanos", "mexicanas", "español", "española", "españoles",
+    "españolas", "colombiano", "colombiana", "peruano", "peruana", "chileno",
+    "chilena", "venezolano", "venezolana", "boliviano", "cubano", "cubana",
+    "brasileño", "brasileña", "uruguayo", "paraguayo", "americano", "americana",
+    "latino", "latina", "latinos", "latinas",
+    # nombres propios de alta frecuencia en letras
+    "dios", "jesús", "cristo", "maría", "satán",
+})
+
+
 def _smart_lower(text: str) -> str:
-    """Lowercase for the 'lower' aesthetic, but keep proper nouns the
-    operator deliberately capitalized mid-line (e.g. "Guinea").
+    """Lowercase for the 'lower' aesthetic, preserving genuine proper nouns.
 
-    The 'lower' style is an all-lowercase look. A blind ``text.lower()``
-    also flattens proper nouns, so a line typed "quizás llegue a Guinea"
-    rendered as "...a guinea". Rule: the FIRST word of the line is always
-    lowercased (sentence-initial capitals are grammar, not intent, and the
-    lowercase aesthetic wants the line to start soft). Every later word is
-    left exactly as the operator typed it — words with no uppercase are
-    already lowercase (no-op), words the operator capitalized are
-    preserved. Original whitespace is kept so layout-sensitive renders
-    don't collapse double spaces.
+    Two sources of capitalization need different handling:
 
-    Origin: agus.cafisi / Babasónicos — "Guinea" rendered as "guinea"
-    under text_case='lower', 2026-05-20.
+    1. NATURAL sentence-case (e.g. a Whisper transcription, "quizás llegue a
+       Guinea"): the first word's capital is grammar, interior capitals are
+       deliberate proper nouns. → lowercase the first word, keep interior
+       casing exactly as typed. This also persists any casing the operator
+       edited by hand. (Origin: agus.cafisi / Babasónicos, 2026-05-20 —
+       "Guinea" must not become "guinea".)
+
+    2. UNIFORMLY title-cased / ALL-CAPS lines (e.g. some lyric providers, or
+       "Caminando Bajo La Lluvia"): every word capitalized means the SOURCE
+       title-cased the line, not that every word is a proper noun. A blind
+       interior-preserve would leave it fully title-cased, defeating the
+       lowercase look. → lowercase everything EXCEPT words in _PROPER_NOUNS
+       (countries / gentilicios / common names) so "Te Amo Argentina" →
+       "te amo Argentina". (matrix test 2026-06-02.)
+
+    Original whitespace is preserved so layout-sensitive renders don't collapse
+    double spaces.
     """
     import re as _re
-    seen_word = False
+
+    def _first_alpha_upper(tok: str) -> bool:
+        for ch in tok:
+            if ch.isalpha():
+                return ch.isupper()
+        return False
+
+    words = [t for t in _re.split(r"\s+", text) if any(c.isalpha() for c in t)]
+    uniformly_titled = len(words) >= 2 and all(_first_alpha_upper(w) for w in words)
+
     out = []
+    seen_word = False
     for tok in _re.split(r"(\s+)", text):
         if not tok or tok.isspace():
             out.append(tok)
             continue
-        if not seen_word:
+        if uniformly_titled:
+            # title-cased source: lowercase all but known proper nouns
+            core = tok.lower().strip(".,;:!?¡¿\"'()[]—–-…")
+            out.append(tok if core in _PROPER_NOUNS else tok.lower())
+        elif not seen_word:
             out.append(tok.lower())  # first word: lowercase for the aesthetic
             seen_word = True
         else:
-            out.append(tok)  # interior: keep operator's casing as typed
+            out.append(tok)  # interior: keep operator's casing (proper nouns)
     return "".join(out)
 
 
@@ -9104,6 +9169,28 @@ def _make_short_text_clip(text: str, seg_start: float, seg_end: float, font: str
     shadow_op = ct["shadow_opacity"]
     fill = lyric_color or "white"
 
+    # Guard against mid-word breaks (matrix test 2026-06-02: "CAMINANDO" at
+    # font_scale=1.2 UPPER overflowed the caption box and ImageMagick split it
+    # as "CAMINAND" / "O"). method="caption" only wraps at spaces, so if the
+    # single widest word is wider than the box it breaks the word itself.
+    # Probe the widest word's rendered width and shrink the font until it fits
+    # whole. Best-effort: if the probe fails (e.g. stubbed in tests), keep the
+    # computed size — the worst case is the pre-fix behaviour.
+    longest = max(display_text.split(), key=len, default="")
+    if longest:
+        try:
+            _probe = TextClip(longest, fontsize=fontsize, font=font,
+                              method="label", stroke_width=stroke_width)
+            _word_w = _probe.size[0]
+            try:
+                _probe.close()
+            except Exception:
+                pass
+            if _word_w and _word_w > text_width:
+                fontsize = max(20, int(fontsize * (text_width - 8) / _word_w))
+        except Exception as _e:
+            logger.warning("[SHORT] word-fit probe failed (%s); keeping size", _e)
+
     shadow = TextClip(
         display_text,
         fontsize=fontsize,
@@ -9142,13 +9229,21 @@ def _apply_short_effect(short_path: str, fx_path: str, fps: float, job_dir: str)
     fx assets the main video composites (fx_compositor). Falls back to the
     un-effected short if ffmpeg fails."""
     tmp = os.path.join(job_dir, "short_fx.mp4")
+    # Same per-effect pre-blend gain as the main libass path (fx_compositor),
+    # so a dim effect (stars/bokeh/snow) reads the same in the short as in the
+    # video. Derive the effect name from the asset filename. eq goes before
+    # format=gbrp (runs on the clip's native YUV).
+    import fx_compositor as _fx
+    _eff = os.path.splitext(os.path.basename(fx_path))[0]
+    _gain = _fx.fx_gain(_eff)
+    _gain_step = f"{_gain}," if _gain else ""
     cmd = [
         "ffmpeg", "-y", "-loglevel", "error",
         "-i", os.path.abspath(short_path),
         "-stream_loop", "-1", "-i", os.path.abspath(fx_path),
         "-filter_complex",
         "[0:v]format=gbrp[b];"
-        "[1:v]scale=1080:1920,setpts=PTS-STARTPTS,format=gbrp[f];"
+        f"[1:v]scale=1080:1920,setpts=PTS-STARTPTS,{_gain_step}format=gbrp[f];"
         "[b][f]blend=all_mode=screen:shortest=1,format=yuv420p[o]",
         "-map", "[o]", "-map", "0:a?",
         "-c:v", "libx264", "-preset", "veryfast", "-crf", "20",
