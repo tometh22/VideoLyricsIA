@@ -2607,24 +2607,34 @@ def _try_lrclib_search(artist: str, song: str) -> list:
     if not artist or not song:
         return []
     import requests as _req
-    try:
-        q = f"{artist} {song}".strip()
-        r = _req.get(
-            "https://lrclib.net/api/search",
-            params={"q": q},
-            timeout=8.0,
-            headers={"User-Agent": "GenLyAI/1.0 (+https://app.genly.pro)"},
-        )
-        if r.status_code != 200:
-            logger.warning("[LYRICS] lrclib /search %s for q=%r", r.status_code, q)
-            return []
-        data = r.json()
-        if not isinstance(data, list):
-            return []
-        return data
-    except Exception as e:
-        logger.error("[LYRICS] lrclib /search failed: %s", e)
-        return []
+    q = f"{artist} {song}".strip()
+    # lrclib.net hiccups (ReadTimeout/5xx) son transitorios y frecuentes.
+    # Un retry con backoff corto absorbe la mayoría sin colgar el pipeline.
+    # lrclib es best-effort (caemos a Gemini si falla), así que el log es
+    # WARNING — no ERROR — para no inundar Sentry con ruido manejado.
+    last_err = None
+    for _attempt in range(2):
+        try:
+            r = _req.get(
+                "https://lrclib.net/api/search",
+                params={"q": q},
+                timeout=8.0,
+                headers={"User-Agent": "GenLyAI/1.0 (+https://app.genly.pro)"},
+            )
+            if r.status_code != 200:
+                logger.warning("[LYRICS] lrclib /search %s for q=%r", r.status_code, q)
+                return []
+            data = r.json()
+            if not isinstance(data, list):
+                return []
+            return data
+        except Exception as e:
+            last_err = e
+            if _attempt == 0:
+                import time as _t
+                _t.sleep(1.5)
+    logger.warning("[LYRICS] lrclib /search failed (best-effort, falling back): %s", last_err)
+    return []
 
 
 def _pick_best_lrclib_candidate(candidates: list, artist: str,
@@ -6746,7 +6756,14 @@ def _ensure_background(style_hint: str, job_dir: str, lyrics_text: str = None,
     bg_path = os.path.join(job_dir, "bg_generated.mp4")
     import time as _time_bg
     quality_retry_used = False
-    for attempt in range(3):
+    # 1 retry interno (2 intentos). Antes eran 3, lo que sumado al
+    # poll_deadline de 600s de Veo podía exceder cualquier job_timeout
+    # razonable. Un solo "do-over" cubre tanto un fallo transitorio de Veo
+    # como un re-roll por calidad (score<7), y entra cómodo en los 900s de
+    # BG_PREVIEW_JOB_TIMEOUT. OJO: una falla de Veo cae al gradient fallback
+    # de abajo (no re-lanza), así que el RQ Retry(max=2) NO reintenta Veo —
+    # este loop es la única resiliencia ante hiccups transitorios de Veo.
+    for attempt in range(2):
         try:
             _generate_veo_video(
                 prompt, bg_path, job_id=job_id,
@@ -6793,9 +6810,9 @@ def _ensure_background(style_hint: str, job_dir: str, lyrics_text: str = None,
                 logger.warning("[BG] Score %s < 7 after retry — accepting best available result", score)
             return bg_path
         except Exception as e:
-            logger.error("[BG] Veo 3 attempt %s/3 failed: %s", attempt + 1, e)
-            if attempt < 2:
-                wait = 30 * (attempt + 1)
+            logger.error("[BG] Veo 3 attempt %s/2 failed: %s", attempt + 1, e)
+            if attempt < 1:
+                wait = 30
                 logger.info("[BG] Waiting %ss before retry...", wait)
                 _time_bg.sleep(wait)
 
