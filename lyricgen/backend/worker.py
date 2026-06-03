@@ -32,11 +32,29 @@ class WarmOnlyWorker(_RQWorker):
     on a high-deploy day (empirically reproduced 2026-06-03: a double-SIGTERM
     cold-killed a mid-render job, single-SIGTERM let it finish).
 
-    We refuse to escalate: every shutdown signal stays a WARM shutdown, so the
-    render always runs to completion. The hard caps remain — the job's own
-    timeout and Railway's RAILWAY_SHUTDOWN_TIMEOUT_SECONDS (1200s) SIGKILL — so
-    a genuinely hung worker still dies eventually; we just never throw away a
-    render that's making progress.
+    We refuse to escalate: every shutdown signal stays a WARM shutdown, so an
+    in-flight render keeps running across a deploy burst instead of being
+    cold-killed. The hard caps still apply, in order:
+      - the job's own job_timeout (RQ's SIGALRM death-penalty inside the forked
+        work-horse, plus monitor_work_horse killing the horse at timeout+60s), and
+      - Railway's RAILWAY_SHUTDOWN_TIMEOUT_SECONDS (1200s) SIGKILL of the container.
+    So a render with under ~20 min of work LEFT when the burst lands finishes in
+    place; one with more left is still SIGKILLed at the grace deadline — but the
+    reaper (PR #531) requeues it, so it is RECOVERED, not silently lost. The net
+    guarantee is narrow but real: a deploy burst never *silently* throws away a
+    render that's making progress (the common, sub-20-min-remaining case finishes;
+    the rare long-tail case is requeued).
+
+    Tradeoff: this also removes the operator's ability to cold-kill via a 2nd
+    SIGTERM/SIGINT. For a genuinely hung PARENT (e.g. a blocking Redis BLPOP
+    during a partition, or a stuck Whisper preload — work the horse's job_timeout
+    does NOT cap) the only backstop is Railway's 1200s SIGKILL (and the reaper).
+    On prod that's the accepted contract; locally use `kill -9` if needed.
+
+    NOTE: overrides request_force_stop on the *base* Worker only. Do NOT switch
+    this process to HerokuWorker / WorkerPool without re-auditing the SIGRTMIN
+    cold path (request_force_stop_sigrtmin, rq/worker.py:1610), which this does
+    not cover — test_override_is_live_against_rq_api would not catch that drift.
 
     (worker.py's own SIGTERM handler is also overwritten by RQ's
     `_install_signal_handlers` inside `work()`, which is why no "Received
