@@ -74,7 +74,13 @@ def has_prores_access(user) -> bool:
     if role == "admin":
         return True
     tenant_id = getattr(user, "tenant_id", None) if not isinstance(user, dict) else user.get("tenant_id")
-    return (tenant_id or "").lower() in PRORES_TENANTS
+    # Match por tenant O por billing_group: una cuenta B2B como Universal
+    # abarca varios tenants (universal_argentina, universal_chile, …) bajo
+    # un billing_group ("universal_music"). Gatear por grupo hace que TODOS
+    # los tenants de la cuenta — actuales y futuros — hereden ProRes con
+    # PRORES_TENANTS=umg,universal_music, sin agregar cada país a mano.
+    billing_group = getattr(user, "billing_group", None) if not isinstance(user, dict) else user.get("billing_group")
+    return (tenant_id or "").lower() in PRORES_TENANTS or (billing_group or "").lower() in PRORES_TENANTS
 
 
 # Tenants con acceso a la integración Google Drive ("Guardar en Drive").
@@ -101,7 +107,11 @@ def has_drive_access(user) -> bool:
     if role == "admin":
         return True
     tenant_id = getattr(user, "tenant_id", None) if not isinstance(user, dict) else user.get("tenant_id")
-    return (tenant_id or "").lower() in DRIVE_ENABLED_TENANTS
+    # Match por tenant O por billing_group — mismo criterio que ProRes, para
+    # que mover un usuario entre tenants de la misma cuenta B2B no le saque
+    # el acceso a Drive.
+    billing_group = getattr(user, "billing_group", None) if not isinstance(user, dict) else user.get("billing_group")
+    return (tenant_id or "").lower() in DRIVE_ENABLED_TENANTS or (billing_group or "").lower() in DRIVE_ENABLED_TENANTS
 
 
 def telemetry_enabled() -> bool:

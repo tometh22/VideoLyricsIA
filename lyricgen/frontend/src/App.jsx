@@ -928,23 +928,41 @@ function EditLyricsRoute({ setCurrentReview, setWizardStage, wizardScreen, t }) 
       // The setCurrentReview guard (editingJobId === id) prevents writes
       // racing against an operator who navigated to a different job before
       // the slow fetch landed.
-      const enhanceField = async (url, key, extractor) => {
-        try {
-          const res = await authFetchWithTimeout(url, {}, 15_000);
-          if (!alive || !res.ok) return;
-          const data = await res.json();
-          if (!alive) return;
-          const value = extractor(data);
-          setCurrentReview((prev) => {
-            if (!prev || prev.editingJobId !== id) return prev;
-            return { ...prev, [key]: value };
-          });
-        } catch {
-          // Timeout / network — silent fail, editor sigue funcional sin
-          // este enhancement.
+      // `retries`: the source audio is ESSENTIAL for editing TIMING — without
+      // it the timeline opens muted ("audio no disponible"). It used to be a
+      // silent fire-and-forget like waveform/bg, so a single transient 500 (a
+      // momentary DB hiccup on /source-audio-url — observed in prod on job
+      // 0d05c360895a, 2026-06-03) or timeout left the operator unable to fix
+      // timing. Retry it with backoff; waveform/bg stay best-effort.
+      const enhanceField = async (url, key, extractor, { retries = 0 } = {}) => {
+        for (let attempt = 0; attempt <= retries; attempt++) {
+          try {
+            const res = await authFetchWithTimeout(url, {}, 15_000);
+            if (!alive) return;
+            if (res.ok) {
+              const data = await res.json();
+              if (!alive) return;
+              const value = extractor(data);
+              setCurrentReview((prev) => {
+                if (!prev || prev.editingJobId !== id) return prev;
+                return { ...prev, [key]: value };
+              });
+              return;  // success
+            }
+            // non-ok (e.g. the transient-DB-retry middleware gave up with a
+            // 500) — fall through to retry if attempts remain.
+          } catch {
+            // Timeout / network — fall through to retry if attempts remain.
+          }
+          if (attempt < retries) {
+            await new Promise((r) => setTimeout(r, 400 * 2 ** attempt));  // 0.4/0.8/1.6s
+            if (!alive) return;
+          }
         }
+        // Exhausted: leave the field unset; text editing still works and the
+        // operator can reopen the editor to retry the audio fetch.
       };
-      enhanceField(`${API}/jobs/${id}/source-audio-url`, "audioUrl", (d) => d?.url || null);
+      enhanceField(`${API}/jobs/${id}/source-audio-url`, "audioUrl", (d) => d?.url || null, { retries: 3 });
       enhanceField(`${API}/jobs/${id}/waveform`, "waveform", (d) => d);
       enhanceField(`${API}/jobs/${id}/background-url`, "bgUrl", (d) => d?.url || null);
     })();
