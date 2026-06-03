@@ -1042,6 +1042,7 @@ export default function Settings({ onBack }) {
                 </div>
               )}
             </Card>
+            )}
 
             {/* Plan-change confirmation modal (proration preview + guardrail) */}
             {planModal && (
