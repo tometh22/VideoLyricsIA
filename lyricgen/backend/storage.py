@@ -592,15 +592,16 @@ def multipart_abort(key: str, upload_id: str) -> bool:
 
 
 def _active_input_keys() -> set[str]:
-    """Return the set of object keys that belong to a non-terminal job.
+    """Return the input-key prefixes of EVERY job that still has a DB row.
 
-    Cleanup must NOT touch these — a job that has been queued for >30 days
-    after an outage still has its input MP3 referenced from the DB, and
-    deleting it from R2 makes the job unrunnable when the worker finally
-    picks it up.
+    Cleanup must NOT touch these. Only an ORPHAN input — one whose job row no
+    longer exists (the job was deleted) — is safe to purge; any job with a row
+    may still need its input for a timing edit, re-render, or retry. (Changed
+    2026-06-03 from a fragile per-status allow-list, after repeated
+    "audio no disponible" reports caused by purging live jobs' inputs.)
 
-    Empty set is returned when the DB is unreachable; the caller treats
-    that as "no protected keys" and skips deletion entirely (see below).
+    Empty set is returned when the DB is unreachable; the caller treats that as
+    "no protected keys" and SKIPS deletion entirely (fail-safe).
     """
     try:
         from database import Job, SessionLocal
@@ -611,40 +612,20 @@ def _active_input_keys() -> set[str]:
     try:
         db = SessionLocal()
         try:
-            non_terminal = (
-                db.query(Job)
-                .filter(Job.status.in_((
-                    "queued", "processing", "pending_review",
-                    # Inputs of awaiting_upload / transcribed_pending jobs
-                    # must not be GC'd — the user is still in the middle of
-                    # the upload-edit-generate flow. The reaper handles
-                    # short-TTL cleanup separately.
-                    "awaiting_upload", "transcribed_pending",
-                    # HOTFIX 2026-05-27: protect 'done' too. UMG workflows
-                    # leave a job at 'done' for weeks/months while operators
-                    # re-edit lyrics, request re-renders, or wait for label
-                    # approval — those edits all NEED the original audio.
-                    # Surfaced after 26 of agus.cafisi's done jobs had
-                    # their inputs purged between days 9-16 by this exact
-                    # cleanup path.
-                    "done",
-                    # PHASE 2 (same day 2026-05-27): protect error / failed
-                    # statuses too. The operator may retry these jobs at
-                    # any time — losing the input means a failed render
-                    # becomes a re-upload-or-give-up.
-                    "error",
-                    "validation_failed",
-                    "transcription_failed",
-                    "rejected",
-                )))
-                .all()
-            )
-            for j in non_terminal:
-                # Whatever the original upload filename was, the worker
-                # writes inputs under inputs/{tenant}/{job_id}/. Match the
-                # prefix rather than the exact key to handle filename
+            # ORPHAN-ONLY (2026-06-03): protect the input of EVERY job that
+            # still has a DB row, regardless of status. The old per-status
+            # allow-list (queued/done/error/…) was fragile — any status NOT on
+            # the list let a live job's input be purged, breaking timing edits
+            # and re-renders (recurring "audio no disponible" reports from
+            # agus.cafisi). The ONLY input safe to delete is an ORPHAN — one
+            # whose job row no longer exists (the job was deleted). So protect
+            # them all; cleanup then removes only truly-orphaned objects.
+            # Select just the two columns we need (not full rows).
+            for tenant_id, job_id in db.query(Job.tenant_id, Job.job_id).all():
+                # The worker writes inputs under inputs/{tenant}/{job_id}/.
+                # Match the prefix (not the exact key) to handle filename
                 # rewrites at upload time.
-                keys.add(f"inputs/{_safe_filename(j.tenant_id)}/{_safe_filename(j.job_id)}/")
+                keys.add(f"inputs/{_safe_filename(tenant_id)}/{_safe_filename(job_id)}/")
         finally:
             db.close()
     except Exception:
