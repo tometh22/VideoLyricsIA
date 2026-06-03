@@ -669,7 +669,10 @@ export default function Settings({ onBack }) {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [activeSection]);
 
-  const showTeamTab = Boolean(team && Array.isArray(team.members) && team.members.length > 1);
+  // Mostramos "Mi equipo" SIEMPRE (descubrible), incluso si sos el único en
+  // el workspace — adentro se muestra un estado "sos el único por ahora".
+  // Esconderlo cuando estás solo confundía (parecía que la tab desaparecía).
+  const showTeamTab = true;
 
   const currentPlan = user?.plan || "free";
   const planInfo = PLAN_INFO[currentPlan] || PLAN_INFO.free;
@@ -1457,6 +1460,16 @@ export default function Settings({ onBack }) {
                 {[1, 2].map((i) => (
                   <div key={i} className="h-12 bg-surface-3/30 rounded-xl animate-pulse" />
                 ))}
+              </div>
+            ) : (team?.members || []).length <= 1 ? (
+              <div className="flex flex-col items-center text-center py-8 px-4">
+                {team?.members?.[0] && (
+                  <AvatarImg user={team.members[0]} size="w-12 h-12" textSize="text-lg" />
+                )}
+                <p className="text-sm text-white font-medium mt-3">Por ahora sos la única persona en este workspace</p>
+                <p className="text-xs text-ink-secondary mt-1 max-w-sm">
+                  Cuando se sumen más integrantes a tu cuenta van a aparecer acá y van a compartir los mismos videos del workspace.
+                </p>
               </div>
             ) : (
               <div className="space-y-0">
