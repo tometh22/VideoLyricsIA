@@ -616,7 +616,20 @@ def enqueue_bg_preview(
         from rq import Queue, Retry
         q = Queue("bg_preview", connection=_redis)
         from bg_preview import run_bg_preview_job
-        timeout = int(os.environ.get("BG_PREVIEW_JOB_TIMEOUT", "300"))
+        # job_timeout DEBE superar el poll_deadline de Veo (600s en
+        # pipeline._generate_veo_video) o RQ mata el worker a mitad de vuelo
+        # con JobTimeoutException antes de que Veo termine. 900s cubre el caso
+        # típico (Veo poll 60-180s + 1 do-over: retry transitorio o re-roll por
+        # calidad) + upload a R2. NO cubre el peor-caso de cola (429-storm +
+        # dos polls de 600s completos ≈ 1200s+): ahí el death-penalty igual
+        # dispara, pero ahora degrada a gradient limpio + lo agarra el monitor.
+        # Si ese tail aparece en prod, subir BG_PREVIEW_JOB_TIMEOUT por env
+        # hacia ~1100s (bajo el grace de 1200s de Railway) sin tocar código.
+        # El loop interno de Veo hace 1 retry (2 intentos, antes 3). Nota: las
+        # fallas de Veo caen al gradient fallback (no re-lanzan), así que el RQ
+        # Retry(max=2) de abajo NO reintenta Veo — sólo fallos de R2/infra que
+        # sí propagan. (Sentry "Veo 3 JobTimeoutException 300s")
+        timeout = int(os.environ.get("BG_PREVIEW_JOB_TIMEOUT", "900"))
         # Veo es lento + hiccup-prone; 2 retries con 20s gap absorbe la
         # mayoría de los rate-limits transitorios. Más allá de eso, el job
         # marca status=bg_preview_failed y el frontend muestra el error.
