@@ -457,3 +457,28 @@ def test_admin_jobs_includes_username(client, admin_token, db):
         assert row["tenant_id"] == "act-test"
     finally:
         _cleanup_activity_seed(db, "actv6", uid)
+
+
+def test_admin_jobs_excludes_bg_previews_by_default(client, admin_token, db):
+    """El pipeline del admin no muestra los jobs fantasma de preview de fondo
+    (artefactos del wizard) — aparecían como duplicados de cada video real."""
+    from database import Job
+    uid, _, _ = _register_activity_user(client)
+    db.add(Job(job_id="actv7a", user_id=uid, tenant_id="act-test", artist="G",
+               song_title="Real", filename="g.mp3", status="done"))
+    db.add(Job(job_id="actv7b", user_id=uid, tenant_id="act-test", artist="G",
+               song_title="Real", filename="g.mp3", status="bg_preview_done"))
+    db.commit()
+    try:
+        # Por default: solo el video real
+        res = client.get("/admin/jobs?tenant_id=act-test", headers=auth(admin_token))
+        ids = [j["job_id"] for j in res.json()["jobs"]]
+        assert "actv7a" in ids
+        assert "actv7b" not in ids
+        # Con status explícito: el preview sigue siendo accesible
+        res = client.get("/admin/jobs?tenant_id=act-test&status=bg_preview_done",
+                         headers=auth(admin_token))
+        ids = [j["job_id"] for j in res.json()["jobs"]]
+        assert ids == ["actv7b"]
+    finally:
+        _cleanup_activity_seed(db, "actv7", uid)
