@@ -107,29 +107,6 @@ function authFetch(url, opts = {}) {
   return fetch(url, { ...opts, headers });
 }
 
-// Avatar del header (topbar). Muestra la foto si el usuario subió una
-// (avatar_url) y cae a la inicial si no hay o si la imagen falla al cargar.
-// Mismo estilo rounded-lg que el placeholder original del header.
-function HeaderAvatar({ user }) {
-  const [failed, setFailed] = useState(!user?.avatar_url);
-  useEffect(() => { setFailed(!user?.avatar_url); }, [user?.avatar_url]);
-  if (failed || !user) {
-    return (
-      <div className="w-7 h-7 rounded-lg bg-gradient-to-br from-brand/20 to-brand-light/20 flex items-center justify-center border border-white/[0.06]">
-        <span className="text-[10px] font-bold text-brand uppercase">{user?.username?.charAt(0)}</span>
-      </div>
-    );
-  }
-  return (
-    <img
-      src={`${API}/auth/avatar/${user.id}`}
-      alt=""
-      className="w-7 h-7 rounded-lg object-cover border border-white/[0.06]"
-      onError={() => setFailed(true)}
-    />
-  );
-}
-
 // Translates a fetch failure (network error or HTTP error response) into a
 // localized, actionable banner string. Replaces the previous generic
 // "Error al procesar. Intentá de nuevo." that hid the real cause —
@@ -510,12 +487,10 @@ function AppShell({ user, sidebarOpen, setSidebarOpen, onLogout }) {
           </div>
           <div className="flex items-center gap-3">
             <HelpButton />
-            {user && (
-              <div className="flex items-center gap-2">
-                <HeaderAvatar user={user} />
-                <span className="text-xs text-gray-500">{user.username}</span>
-              </div>
-            )}
+            {/* El avatar + nombre vive en UN solo lugar: el bloque de perfil
+                del sidebar (patrón Slack/Linear). El topbar queda para
+                acciones contextuales (ayuda + logout), sin duplicar la
+                identidad. */}
             {/* Topbar logout (audit F P0-4 2026-05-27): always reachable, even
                 when the sidebar is collapsed on mobile or when `user` is null
                 in a transient half-state. The sidebar already has a logout
