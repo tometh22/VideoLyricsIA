@@ -43,6 +43,7 @@ from sqlalchemy.orm import Session
 from auth import (
     authenticate_user,
     create_token,
+    start_login_session,
     create_user,
     create_password_reset_token,
     create_email_verification_token,
@@ -71,7 +72,7 @@ from datetime import datetime, timedelta, timezone
 from database import (
     Job, User, UserSettings, AuditLog, APIKey, get_db, init_db,
     BackgroundAsset, AssetUsage, Delivery, DeliveryChangeRequest,
-    SalesLead, UserSession, scoped_db, pool_stats,
+    SalesLead, UserSession, LoginSession, scoped_db, pool_stats,
 )
 from jobs import bulk_delete_jobs, create_job, delete_job, get_job, get_all_jobs, update_job
 from observability import init_sentry, init_logging, health_snapshot
@@ -1011,7 +1012,7 @@ async def login(body: LoginRequest, request: Request, db: Session = Depends(get_
     user = authenticate_user(db, body.username, body.password)
     if not user:
         raise HTTPException(status_code=401, detail="Invalid credentials")
-    token = create_token(user)
+    token = start_login_session(db, user, request)
 
     # Audit
     db.add(AuditLog(
@@ -1093,7 +1094,7 @@ async def register(body: RegisterRequest, request: Request, db: Session = Depend
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
 
-    token = create_token(user)
+    token = start_login_session(db, user, request)
 
     # Send welcome email
     if user.email:
@@ -1202,7 +1203,203 @@ async def refresh_token(
     user = get_user_by_id(db, current_user["id"])
     if not user or not user.is_active:
         raise HTTPException(status_code=401, detail="User not found or inactive")
-    return {"token": create_token(user)}
+    # Reusar el jti del token actual → mismo dispositivo/sesión, sólo se
+    # extiende el exp (no crea una sesión nueva en cada refresh).
+    return {"token": create_token(user, jti=current_user.get("jti"))}
+
+
+# ---------------------------------------------------------------------------
+# Configuración → Perfil (nombre + avatar)
+# ---------------------------------------------------------------------------
+
+class UpdateProfileRequest(BaseModel):
+    full_name: str | None = None
+
+
+@app.patch("/auth/profile")
+@limiter.limit("20/minute")
+async def update_profile(
+    body: UpdateProfileRequest,
+    request: Request,
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Actualizar el perfil propio (por ahora: nombre para mostrar)."""
+    user = get_user_by_id(db, current_user["id"])
+    if not user:
+        raise HTTPException(status_code=404, detail="Usuario no encontrado")
+    if body.full_name is not None:
+        user.full_name = body.full_name.strip()[:200] or None
+    db.commit()
+    db.refresh(user)
+    return user.to_dict()
+
+
+# Avatar: máx 5 MB, jpg/png/webp, se redimensiona a 256px y se sube a R2
+# bajo avatars/. Se sirve vía GET /auth/avatar/{user_id} con signed URL.
+_AVATAR_MAX_BYTES = 5 * 1024 * 1024
+_AVATAR_MIME = {"image/jpeg": "jpg", "image/png": "png", "image/webp": "webp"}
+
+
+@app.post("/auth/avatar")
+@limiter.limit("10/minute")
+async def upload_avatar(
+    request: Request,
+    file: UploadFile = File(...),
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Subir/reemplazar el avatar propio."""
+    if file.content_type not in _AVATAR_MIME:
+        raise HTTPException(status_code=400, detail="Formato no soportado. Usá JPG, PNG o WebP.")
+    raw = await file.read()
+    if len(raw) > _AVATAR_MAX_BYTES:
+        raise HTTPException(status_code=400, detail="La imagen supera los 5 MB.")
+    # Redimensionar a 256px (cuadrado, recorte centrado) y normalizar a PNG.
+    try:
+        from PIL import Image
+        import io
+        img = Image.open(io.BytesIO(raw)).convert("RGB")
+        side = min(img.size)
+        left = (img.width - side) // 2
+        top = (img.height - side) // 2
+        img = img.crop((left, top, left + side, top + side)).resize((256, 256))
+        buf = io.BytesIO()
+        img.save(buf, format="PNG")
+        data = buf.getvalue()
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"No pude procesar la imagen: {e}")
+
+    if not storage.is_enabled():
+        raise HTTPException(status_code=503, detail="Almacenamiento no disponible.")
+    key = f"avatars/{current_user['id']}.png"
+    if not storage.put_object_bytes(key, data, content_type="image/png"):
+        raise HTTPException(status_code=502, detail="No pude guardar el avatar.")
+
+    user = get_user_by_id(db, current_user["id"])
+    user.avatar_url = key
+    db.commit()
+    db.refresh(user)
+    return {"ok": True, "avatar_url": key}
+
+
+@app.get("/auth/avatar/{user_id}")
+async def get_avatar(user_id: int):
+    """Redirige a una signed URL del avatar (mismo patrón que el preview
+    de fondos). Público por user_id — un avatar no es información sensible
+    y simplifica el render en el sidebar/admin sin pasar token en la URL."""
+    with scoped_db() as db:
+        user = db.query(User).filter(User.id == user_id).first()
+        key = user.avatar_url if user else None
+    if not key:
+        raise HTTPException(status_code=404, detail="Sin avatar")
+    if storage.is_enabled():
+        url = storage.generate_signed_url(key, expiry_seconds=3600)
+        if url:
+            return RedirectResponse(url, status_code=302)
+    raise HTTPException(status_code=404, detail="Avatar no disponible")
+
+
+# ---------------------------------------------------------------------------
+# Configuración → Dispositivos (sesiones activas + cierre remoto)
+# ---------------------------------------------------------------------------
+
+@app.get("/auth/sessions")
+@limiter.limit("30/minute")
+async def list_sessions(
+    request: Request,
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Sesiones de login del usuario (dispositivos). Marca la actual."""
+    rows = (
+        db.query(LoginSession)
+        .filter(LoginSession.user_id == current_user["id"], LoginSession.revoked_at.is_(None))
+        .order_by(LoginSession.last_seen_at.desc())
+        .limit(50)
+        .all()
+    )
+    return {"sessions": [s.to_dict(current_jti=current_user.get("jti")) for s in rows]}
+
+
+@app.post("/auth/sessions/{session_id}/revoke")
+@limiter.limit("30/minute")
+async def revoke_session(
+    session_id: int,
+    request: Request,
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Cerrar una sesión (propia). El token de ese dispositivo queda 401
+    en su próximo request."""
+    sess = (
+        db.query(LoginSession)
+        .filter(LoginSession.id == session_id, LoginSession.user_id == current_user["id"])
+        .first()
+    )
+    if not sess:
+        raise HTTPException(status_code=404, detail="Sesión no encontrada")
+    if sess.revoked_at is None:
+        sess.revoked_at = datetime.now(timezone.utc)
+        db.commit()
+    return {"ok": True, "revoked": session_id, "was_current": sess.jti == current_user.get("jti")}
+
+
+@app.post("/auth/sessions/revoke-others")
+@limiter.limit("10/minute")
+async def revoke_other_sessions(
+    request: Request,
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Cerrar todas las sesiones menos la actual."""
+    now = datetime.now(timezone.utc)
+    q = db.query(LoginSession).filter(
+        LoginSession.user_id == current_user["id"],
+        LoginSession.revoked_at.is_(None),
+    )
+    if current_user.get("jti"):
+        q = q.filter(LoginSession.jti != current_user["jti"])
+    n = q.update({LoginSession.revoked_at: now}, synchronize_session=False)
+    db.commit()
+    return {"ok": True, "revoked_count": n}
+
+
+# ---------------------------------------------------------------------------
+# Configuración → Mi equipo (solo lectura)
+# ---------------------------------------------------------------------------
+
+@app.get("/team/members")
+@limiter.limit("30/minute")
+async def team_members(
+    request: Request,
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Compañeros del mismo workspace (tenant). Solo lectura — sin
+    invitaciones. Backs Configuración → Mi equipo."""
+    members = (
+        db.query(User)
+        .filter(User.tenant_id == current_user["tenant_id"], User.is_active == True)  # noqa: E712
+        .order_by(User.username)
+        .all()
+    )
+    return {
+        "tenant_id": current_user["tenant_id"],
+        "members": [
+            {
+                "id": u.id,
+                "username": u.username,
+                "full_name": u.full_name,
+                "avatar_url": u.avatar_url,
+                "role": u.role,
+                "is_self": u.id == current_user["id"],
+            }
+            for u in members
+        ],
+    }
 
 
 # ---------------------------------------------------------------------------

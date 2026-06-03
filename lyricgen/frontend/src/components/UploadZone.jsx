@@ -650,7 +650,7 @@ export default function UploadZone({
     { code: "estatico",      kind: "video", label: t("upload.movement_estatico") || "Estático (escena viva)",            sample: "/movement_samples/estatico.mp4",       desc: t("upload.movement_estatico_desc") || "🎬 Escena real con cámara FIJA. Lo que se mueve son los elementos de la escena (gente, olas, nubes, neblina, fuego)." },
     { code: "sutil",         kind: "video", label: t("upload.movement_sutil") || "Sutil (cámara apenas drift)",          sample: "/movement_samples/sutil.mp4",          desc: t("upload.movement_sutil_desc") || "🎬 Escena real con drift sutil de cámara + motion in-scene. Calmo pero vivo." },
     { code: "estandar",      kind: "video", label: t("upload.movement_estandar") || "Estándar (cinematográfico)",        sample: "/movement_samples/estandar.mp4",       desc: t("upload.movement_estandar_desc") || "🎬 Escena real con movimiento cinematográfico de cámara (zoom/drift)." },
-    { code: "foto-parallax", kind: "image", label: t("upload.movement_foto_parallax") || "Foto fija",                     sample: null,                                  desc: t("upload.movement_parallax_desc") || "🖼 Foto IA fija (sin movimiento de cámara). Sumale un efecto abajo —lluvia, nieve, luces— para darle vida." },
+    { code: "foto-parallax", kind: "image", label: t("upload.movement_foto_parallax") || "Foto fija",                     sample: "/movement_samples/foto-fija.jpg",      desc: t("upload.movement_parallax_desc") || "Foto IA fija (sin movimiento de cámara). Sumale un efecto abajo —lluvia, nieve, luces— para darle vida." },
     { code: "animado",       kind: "video", label: t("upload.movement_animado") || "Animado (ilustración)",              sample: "/movement_samples/animado.mp4",       desc: t("upload.movement_animado_desc") || "🎬 Ilustración 2D estilizada animada, no fotorrealista." },
   ];
 
@@ -1147,7 +1147,14 @@ export default function UploadZone({
                 {/* Real Veo example clip per style (Auto has no clip → icon) */}
                 <div className="aspect-video bg-black relative overflow-hidden">
                   {m.sample ? (
-                    <video src={m.sample} className="w-full h-full object-cover pointer-events-none" autoPlay loop muted playsInline />
+                    m.kind === "image" ? (
+                      // Foto fija = STATIC photo → render an <img>, NOT a looping
+                      // <video> (showing motion on the "fixed photo" card was
+                      // self-contradictory; operator-reported).
+                      <img src={m.sample} alt="" className="w-full h-full object-cover pointer-events-none" />
+                    ) : (
+                      <video src={m.sample} className="w-full h-full object-cover pointer-events-none" autoPlay loop muted playsInline />
+                    )
                   ) : (
                     <div className="w-full h-full grid place-items-center text-gray-400" style={{ background: "radial-gradient(120% 100% at 50% 0,#2a1d52,#0b0820)" }}>
                       <span className="w-7 h-7">{movIcon(m.code)}</span>
@@ -2207,8 +2214,11 @@ export default function UploadZone({
                   const sel = libraryBgs.find((b) => b.id === backgroundId);
                   return sel?.file_type === "mp4";
                 }
-                // Movement samples siempre son MP4; default true.
-                return true;
+                // Movement samples are MP4 EXCEPT foto-fija (static .jpg);
+                // returning true for the .jpg would render it in a <video>
+                // element → black preview (the exact bug above).
+                const mv = MOVEMENT_STYLES.find((mm) => mm.code === (hoverMovement ?? batchDefaults.movementStyle));
+                return mv?.kind !== "image";
               })()}
               /* Typography 2026-05-26: cerrar el gap entre los controles del
                  paso 4 (font/case/size/contrast) y el preview central. Antes

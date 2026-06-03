@@ -4,6 +4,8 @@ import BrandLockup from "./BrandLockup";
 import { IS_PRODUCTION, APP_ENV } from "../env";
 import UsageBadge from "./UsageBadge";
 
+const API = import.meta.env.VITE_API_URL || "";
+
 // Each nav item carries its router path. The plain-left-click handler
 // in the <Link> below calls onNav(id) (which fires the wizard-leaving
 // confirm in App.handleNav) and preventDefault; modifier-click and
@@ -151,7 +153,24 @@ export default function Sidebar({ onNav, activeView, open, onToggle, user, onLog
         {user && (
           <div className="flex items-center justify-between">
             <div className="flex items-center gap-2 min-w-0">
-              <div className="w-6 h-6 rounded-lg bg-brand/20 flex items-center justify-center shrink-0">
+              {user.avatar_url ? (
+                <img
+                  src={`${API}/auth/avatar/${user.id}`}
+                  alt=""
+                  className="w-6 h-6 rounded-full object-cover shrink-0 ring-1 ring-white/[0.08]"
+                  onError={(e) => {
+                    // Si la imagen no carga (404 / token expirado) caemos al
+                    // círculo con la inicial sin romper el layout.
+                    e.currentTarget.style.display = "none";
+                    const fb = e.currentTarget.nextElementSibling;
+                    if (fb) fb.style.display = "flex";
+                  }}
+                />
+              ) : null}
+              <div
+                className="w-6 h-6 rounded-lg bg-brand/20 items-center justify-center shrink-0"
+                style={{ display: user.avatar_url ? "none" : "flex" }}
+              >
                 <span className="text-[10px] font-bold text-brand uppercase">{user.username?.charAt(0)}</span>
               </div>
               <span className="text-xs text-gray-400 truncate">{user.username}</span>
