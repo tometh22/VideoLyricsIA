@@ -591,7 +591,7 @@ def multipart_abort(key: str, upload_id: str) -> bool:
         return False
 
 
-def _active_input_keys() -> set[str]:
+def _active_input_keys() -> "set[str] | None":
     """Return the input-key prefixes of EVERY job that still has a DB row.
 
     Cleanup must NOT touch these. Only an ORPHAN input — one whose job row no
@@ -600,13 +600,18 @@ def _active_input_keys() -> set[str]:
     2026-06-03 from a fragile per-status allow-list, after repeated
     "audio no disponible" reports caused by purging live jobs' inputs.)
 
-    Empty set is returned when the DB is unreachable; the caller treats that as
-    "no protected keys" and SKIPS deletion entirely (fail-safe).
+    Returns:
+      - a set (possibly EMPTY when there are genuinely zero jobs) on success;
+      - None when the DB couldn't be read (import/query failure). The caller
+        MUST treat None as "protection unknown → ABORT", NOT as "nothing to
+        protect" — otherwise a transient DB blip mid-sweep would treat every
+        input as an orphan and purge live jobs (the agus.cafisi incident). An
+        empty set and None are deliberately distinct.
     """
     try:
         from database import Job, SessionLocal
     except Exception:
-        return set()
+        return None  # DB layer unavailable → caller must ABORT, not purge-all
 
     keys: set[str] = set()
     try:
@@ -629,8 +634,10 @@ def _active_input_keys() -> set[str]:
         finally:
             db.close()
     except Exception:
-        # DB hiccup — return what we have; caller may decide to abort.
-        pass
+        # DB hiccup mid-query — we CANNOT trust a partial/empty protect set
+        # (treating unread jobs as orphans would purge live inputs). Signal
+        # "unknown" so the caller aborts the sweep.
+        return None
     return keys
 
 
@@ -665,10 +672,21 @@ def cleanup_old_inputs(retention_days: int = 365, apply: bool = False, prefix: s
     cutoff = datetime.now(timezone.utc) - timedelta(days=retention_days)
     paginator = client.get_paginator("list_objects_v2")
 
-    # Build a protect-list of input keys belonging to jobs that are still
-    # queued/processing/pending_review. We skip these even if their
-    # LastModified is past the retention window.
+    # Build a protect-list of input keys for EVERY live job (orphan-only
+    # retention). We skip these even if past the retention window.
     protected_prefixes = _active_input_keys()
+    if protected_prefixes is None:
+        # FAIL-SAFE: the DB was unreadable, so we cannot tell which inputs
+        # belong to live jobs. Deleting now would treat every input as an
+        # orphan and purge live jobs (the agus.cafisi incident). ABORT — an
+        # empty protect-set (no jobs) is fine, but None (unknown) is not.
+        logger.error("[R2] cleanup_old_inputs ABORTED — could not read protected "
+                     "job inputs from DB (refusing to purge to avoid live-job loss)")
+        return {"error": "could not determine protected inputs (DB unreadable) — "
+                         "aborted to avoid purging live jobs",
+                "scanned": 0, "expired": 0, "deleted": 0, "bytes_freed": 0,
+                "sample": [], "errors": [], "apply": apply,
+                "retention_days": retention_days}
     skipped_active = 0
 
     scanned = 0
