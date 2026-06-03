@@ -116,5 +116,15 @@ export const INVOICE_STATUS = {
   void: { label: "Anulada", classes: "bg-gray-500/10 text-gray-400 ring-gray-500/20" },
 };
 
+// Status de los checks de compliance UMG → label + clases.
+export const COMPLIANCE_STATUS = {
+  ok: { label: "OK", classes: "bg-accent/10 text-accent ring-accent/20" },
+  confirmed: { label: "Confirmado", classes: "bg-accent/10 text-accent ring-accent/20" },
+  pending: { label: "Pendiente", classes: "bg-amber-500/10 text-amber-400 ring-amber-500/20" },
+  warning: { label: "Atención", classes: "bg-amber-500/10 text-amber-400 ring-amber-500/20" },
+  error: { label: "Error", classes: "bg-red-500/10 text-red-400 ring-red-500/20" },
+  fail: { label: "Falla", classes: "bg-red-500/10 text-red-400 ring-red-500/20" },
+};
+
 // Fallback neutral para status desconocidos.
 export const STATUS_FALLBACK = { label: null, classes: "bg-gray-500/10 text-gray-400 ring-gray-500/20" };
