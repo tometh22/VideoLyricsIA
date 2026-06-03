@@ -210,6 +210,11 @@ class User(Base):
     role = Column(String(20), nullable=False, default="user")  # user, admin
     tenant_id = Column(String(100), nullable=False, default="default", index=True)
     plan_id = Column(String(20), nullable=False, default="100")
+    # Perfil del usuario (Configuración → Perfil). full_name se muestra en
+    # vez del username cuando existe; avatar_url es la key R2 del avatar
+    # (servido vía GET /auth/avatar/{id} con signed URL).
+    full_name = Column(String(200), nullable=True)
+    avatar_url = Column(String(500), nullable=True)
     # Cuenta de facturación compartida entre tenants. Caso Universal Music:
     # "universal_argentina" y "universal_chile" son tenants separados (no se
     # ven los videos entre sí) pero AMBOS consumen del mismo plan de 250/mes
@@ -271,6 +276,8 @@ class User(Base):
             "tenant_id": self.tenant_id,
             "plan": self.plan_id,
             "billing_group": self.billing_group,
+            "full_name": self.full_name,
+            "avatar_url": self.avatar_url,
             "is_active": self.is_active,
             "email_verified": self.email_verified,
             "ai_authorized": self.ai_authorized,
@@ -854,6 +861,45 @@ class UserSession(Base):
         }
 
 
+class LoginSession(Base):
+    """Sesión de login = un dispositivo/navegador con un token activo.
+
+    Distinta de UserSession (eso es telemetría de tiempo-en-app). Esta
+    backs "Configuración → Dispositivos": ver dónde estás logueado y
+    cerrar sesión remota.
+
+    El JWT lleva un `jti` (uuid) que apunta a la fila acá. get_current_user
+    valida que la fila exista y no esté revocada → revocar = setear
+    revoked_at y ese token queda 401 en su próximo request, aunque el JWT
+    en sí siga sin expirar. Tokens viejos sin jti (emitidos antes de esta
+    feature) se aceptan sin chequeo y expiran solos.
+    """
+    __tablename__ = "login_sessions"
+    __table_args__ = (
+        Index("ix_login_sessions_user_active", "user_id", "revoked_at"),
+    )
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    jti = Column(String(64), unique=True, nullable=False, index=True)
+    ip_address = Column(String(45), nullable=True)
+    user_agent = Column(String(400), nullable=True)
+    created_at = Column(DateTime(timezone=True), default=utcnow, nullable=False)
+    last_seen_at = Column(DateTime(timezone=True), default=utcnow, nullable=False)
+    revoked_at = Column(DateTime(timezone=True), nullable=True)
+
+    def to_dict(self, current_jti=None):
+        return {
+            "id": self.id,
+            "ip_address": self.ip_address,
+            "user_agent": self.user_agent,
+            "created_at": self.created_at.isoformat() if self.created_at else None,
+            "last_seen_at": self.last_seen_at.isoformat() if self.last_seen_at else None,
+            "revoked": self.revoked_at is not None,
+            "current": current_jti is not None and self.jti == current_jti,
+        }
+
+
 class AIProvenance(Base):
     """Records every AI tool invocation for UMG compliance and copyright audit."""
     __tablename__ = "ai_provenance"
@@ -1026,6 +1072,10 @@ def _migrate_user_columns():
         # Alembic de billing_group.
         "ALTER TABLE users ADD COLUMN IF NOT EXISTS billing_group VARCHAR(100)",
         "CREATE INDEX IF NOT EXISTS ix_users_billing_group ON users(billing_group)",
+        # Perfil (Configuración → Perfil). Espejo de la migración de
+        # full_name/avatar_url. login_sessions la crea create_all().
+        "ALTER TABLE users ADD COLUMN IF NOT EXISTS full_name VARCHAR(200)",
+        "ALTER TABLE users ADD COLUMN IF NOT EXISTS avatar_url VARCHAR(500)",
     ]
     # Each statement gets its own transaction. In Postgres, a failed statement
     # inside a transaction puts it in aborted state — subsequent execute()

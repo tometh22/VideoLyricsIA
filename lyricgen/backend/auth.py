@@ -4,6 +4,7 @@ import hashlib
 import os
 import secrets
 import time
+import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
@@ -521,18 +522,49 @@ def verify_email_token(db: Session, token: str) -> Optional[User]:
 # JWT
 # ---------------------------------------------------------------------------
 
-def create_token(user: User) -> str:
-    """Create a JWT token for the given user."""
+def create_token(user: User, jti: str = None) -> str:
+    """Create a JWT token for the given user.
+
+    `jti` (JWT ID) liga el token a una fila de login_sessions para poder
+    cerrarlo remotamente. Login/registro pasan un jti nuevo (sesión nueva);
+    refresh reusa el jti del token actual (misma sesión, nuevo exp). Si no
+    se pasa, se genera uno — pero el token sólo es revocable si además
+    existe la fila de sesión (la crea start_login_session).
+    """
     payload = {
         "sub": str(user.id),
         "username": user.username,
         "role": user.role,
         "tenant_id": user.tenant_id,
         "plan": user.plan_id,
+        "jti": jti or uuid.uuid4().hex,
         "exp": time.time() + JWT_EXPIRE_MINUTES * 60,
         "iat": time.time(),
     }
     return jwt.encode(payload, JWT_SECRET, algorithm=JWT_ALGORITHM)
+
+
+def start_login_session(db: Session, user: User, request: Request = None) -> str:
+    """Crea una fila login_sessions (dispositivo) y devuelve el token JWT
+    ligado a ella vía jti. Usado por login y registro.
+
+    Best-effort sobre la fila: si la escritura de la sesión falla, igual
+    devolvemos un token válido (no bloqueamos el login por la feature de
+    dispositivos) — sólo que ese token no será revocable por sesión.
+    """
+    jti = uuid.uuid4().hex
+    try:
+        from database import LoginSession
+        ip = None
+        ua = None
+        if request is not None:
+            ip = request.client.host if request.client else None
+            ua = (request.headers.get("user-agent") or "")[:400] or None
+        db.add(LoginSession(user_id=user.id, jti=jti, ip_address=ip, user_agent=ua))
+        db.commit()
+    except Exception:
+        db.rollback()
+    return create_token(user, jti=jti)
 
 
 def decode_token(token: str) -> dict:
@@ -574,10 +606,41 @@ async def get_current_user(
     user = get_user_by_id_resilient(db, int(payload["sub"]))
     if not user or not user.is_active:
         raise HTTPException(status_code=401, detail="User not found or inactive")
+
+    # Validación de sesión (cierre remoto). Sólo para tokens con jti — los
+    # viejos sin jti se aceptan (grandfather, expiran solos). Si la sesión
+    # fue revocada → 401. Fail-open ante error de DB para no tirar abajo el
+    # auth de toda la app por un problema transitorio en esta tabla.
+    jti = payload.get("jti")
+    if jti:
+        try:
+            from database import LoginSession
+            sess = db.query(LoginSession).filter(LoginSession.jti == jti).first()
+            if sess is not None:
+                if sess.revoked_at is not None:
+                    raise HTTPException(status_code=401, detail="Sesión cerrada. Volvé a iniciar sesión.")
+                # last_seen throttled (≤ 1 write / 5 min por sesión activa).
+                now = datetime.now(timezone.utc)
+                last = sess.last_seen_at
+                if last is not None and last.tzinfo is None:
+                    last = last.replace(tzinfo=timezone.utc)
+                if last is None or (now - last).total_seconds() > 300:
+                    sess.last_seen_at = now
+                    db.commit()
+            # sess None = token con jti pero sin fila (sesión nunca registrada
+            # o tabla recién creada): se acepta, no bloqueamos.
+        except HTTPException:
+            raise
+        except Exception:
+            pass  # fail-open: error de DB no debe romper el auth global
+
     return {
         "id": user.id,
         "username": user.username,
         "email": user.email,
+        "full_name": getattr(user, "full_name", None),
+        "avatar_url": getattr(user, "avatar_url", None),
+        "jti": jti,
         "role": user.role,
         "tenant_id": user.tenant_id,
         "plan": user.plan_id,
