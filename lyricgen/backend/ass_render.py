@@ -105,12 +105,54 @@ class AssLine:
 _FADE_DURATIONS_S = {"fade": 0.15, "fade_slow": 0.30}
 
 
-def lyric_fontsize(text_len: int, scale: float, font_scale: float = 1.0) -> int:
+# Per-font visual-size normalization (2026-06-03).
+#
+# libass scales \fs by each font's INTERNAL vertical metrics (ascent/descent),
+# so the SAME \fs yields a different rendered cap-height per family. Poppins
+# renders ~14% smaller than Montserrat at an identical \fs — a UMG operator
+# reported it as "muy chiquita" (Poppins @ font_scale 1.15). These factors
+# equalize the rendered cap-height to the MONTSERRAT reference (the historical
+# default look), so a given size setting looks the same across every font.
+#
+# Measured empirically on the PROD libass build: rendered cap-height (white-
+# glyph bbox) of an all-caps line at \fs110, factor = h_montserrat / h_font.
+# To regenerate after changing a font file: render fonts/<f>.ttf via
+# build_ass + the libass `subtitles` filter at \fs110 and measure the glyph
+# height; divide Montserrat's height by the font's. (Done on staging via the
+# api service; see PR notes.) NOTE: this is libass-specific — the moviepy/
+# ImageMagick fallback renders at natural cap-height (no metric scaling), so
+# it deliberately does NOT apply this factor.
+_FONT_SIZE_NORM = {
+    "montserrat": 1.0,    # reference
+    "poppins": 1.159,     # h44 → 51 (the reported "muy chiquita" font)
+    "oswald": 0.962,      # h53 → 51
+    "anton": 0.927,       # h55 → 51
+    "jost": 0.911,        # h56 → 51
+    "roboto": 0.85,       # h60 → 51
+    "bebas neue": 0.85,   # h60 → 51
+    "outfit": 0.810,      # h63 → 51
+}
+
+
+def font_size_factor(family: str) -> float:
+    """Per-family multiplier that equalizes the libass-rendered cap-height to
+    the Montserrat reference (see _FONT_SIZE_NORM). Unknown/empty family →
+    1.0 (no change), so any future or unmeasured font is left untouched."""
+    if not family:
+        return 1.0
+    return _FONT_SIZE_NORM.get(family.strip().lower(), 1.0)
+
+
+def lyric_fontsize(
+    text_len: int, scale: float, font_scale: float = 1.0, font_factor: float = 1.0
+) -> int:
     """Font size for a lyric line, by character count (legacy tiers).
 
     Mirrors _make_text_clip: >80 chars → 55, >50 → 70, else 85 (each
     multiplied by spec.text_scale), then the user's font_scale (clamped
-    0.6-1.5), floored at 18px."""
+    0.6-1.5), then the per-font normalization (font_factor, see
+    font_size_factor — 1.0 for the moviepy path which needs no normalization),
+    floored at 18px."""
     font_scale = max(0.6, min(1.5, float(font_scale or 1.0)))
     if text_len > 80:
         base = 55
@@ -119,7 +161,7 @@ def lyric_fontsize(text_len: int, scale: float, font_scale: float = 1.0) -> int:
     else:
         base = 85
     base_fontsize = int(round(base * scale))
-    return max(18, int(round(base_fontsize * font_scale)))
+    return max(18, int(round(base_fontsize * font_scale * float(font_factor or 1.0))))
 
 
 def fade_seconds(lyric_transition: str, seg_duration: float) -> float:
@@ -614,6 +656,7 @@ def segments_to_lines(
     *,
     text_scale: float,
     font_scale: float = 1.0,
+    font_factor: float = 1.0,
     lyric_transition: str = "cut",
     animation: str = "none",
     transition: str = "none",
@@ -634,7 +677,7 @@ def segments_to_lines(
         seg_start = float(seg.get("start", 0.0))
         seg_end = float(seg.get("end", 0.0))
         seg_dur = max(0.1, seg_end - seg_start)
-        fontsize = lyric_fontsize(len(display), text_scale, font_scale)
+        fontsize = lyric_fontsize(len(display), text_scale, font_scale, font_factor)
         # Per-line layout overrides (operator-set in the preview).
         scale = seg.get("scale")
         if isinstance(scale, (int, float)) and scale > 0:
