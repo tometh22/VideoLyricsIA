@@ -89,3 +89,19 @@ def test_lower_natural_case_still_preserves_interior_caps():
 
 def test_lower_single_titlecased_word():
     assert pipeline._apply_case("Caminando", "lower") == "caminando"
+
+
+def test_lower_allcaps_proper_noun_normalized_to_title():
+    """Review fix 2026-06-03: an ALL-CAPS source must not echo a preserved
+    proper noun back in uppercase inside an otherwise-lowercase line — it is
+    normalized to Title case."""
+    assert pipeline._apply_case("TE AMO ARGENTINA", "lower") == "te amo Argentina"
+
+
+def test_lower_allcaps_proper_noun_first_word():
+    assert pipeline._apply_case("DIOS ES AMOR", "lower") == "Dios es amor"
+
+
+def test_lower_titlecased_country_stays_title_not_caps():
+    # already-Title source is unchanged by the normalization
+    assert pipeline._apply_case("Viva México", "lower") == "viva México"
