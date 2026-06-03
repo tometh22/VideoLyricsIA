@@ -561,7 +561,15 @@ export default function Settings({ onBack }) {
       persistUser({ avatar_url: data.avatar_url });
       setAvatarKey((k) => k + 1); // fuerza recarga del <img>
     } catch (err) {
-      setAvatarError(err.message || String(err));
+      // Un fallo de red (fetch rechazado) llega como TypeError con el
+      // mensaje críptico "Load failed"/"Failed to fetch" — pasa, por
+      // ejemplo, si el server está reiniciando por un deploy. Mostramos
+      // algo accionable en vez del texto crudo del navegador. Los errores
+      // con respuesta del backend (400/500) sí conservan su detail.
+      const msg = (err instanceof TypeError)
+        ? "No se pudo subir la imagen (problema de conexión). Reintentá en unos segundos."
+        : (err.message || "No se pudo subir la imagen.");
+      setAvatarError(msg);
     } finally {
       setAvatarUploading(false);
     }
