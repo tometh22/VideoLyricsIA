@@ -222,6 +222,15 @@ class User(Base):
     stripe_customer_id = Column(String(255), nullable=True, unique=True)
     stripe_subscription_id = Column(String(255), nullable=True)
 
+    # Dunning state for the in-app "payment failed" banner (Fase 1.5).
+    # "active" = in good standing; "past_due" = a charge failed and Stripe
+    # is retrying (Smart Retries) — the user keeps access during the grace
+    # period but the app nudges them to fix their card. Maintained purely
+    # by the Stripe webhooks in billing.py; "active" is the safe default so
+    # no row shows a banner until a real failure flips it.
+    billing_status = Column(String(20), nullable=False, default="active",
+                            server_default="active")
+
     # AI authorization (UMG compliance — Guideline 5)
     ai_authorized = Column(Boolean, default=False)
     ai_authorized_at = Column(DateTime(timezone=True), nullable=True)
@@ -269,6 +278,7 @@ class User(Base):
             "max_concurrent_jobs": self.max_concurrent_jobs,
             "allow_overage": self.allow_overage,
             "stripe_customer_id": self.stripe_customer_id,
+            "billing_status": self.billing_status or "active",
             "created_at": self.created_at.isoformat() if self.created_at else None,
         }
 
