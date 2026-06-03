@@ -629,6 +629,13 @@ def _delete_abandoned_transcribed(db: Session, job: Job) -> None:
                 )
         except Exception as e:  # pragma: no cover
             logger.debug("reaper: R2 delete failed for %s: %s", job_id, e)
+    # AIProvenance has a NOT NULL FK to jobs.job_id without ON DELETE CASCADE,
+    # so its rows MUST be cleared before the parent delete — otherwise Postgres
+    # raises IntegrityError and the ENTIRE reap transaction aborts, leaving this
+    # job (and every later job in the same sweep) un-reaped. Prod 2026-06-02:
+    # the reaper crashed on exactly this every cycle (`null value in column
+    # "job_id" of relation "ai_provenance"`). Mirrors jobs.delete_job (jobs.py).
+    db.query(AIProvenance).filter(AIProvenance.job_id == job_id).delete(synchronize_session=False)
     db.delete(job)
 
 
@@ -678,6 +685,11 @@ def _delete_abandoned_upload(db: Session, job: Job) -> None:
             _sh.rmtree(local_dir, ignore_errors=True)
     except Exception:
         pass
+    # Clear provenance rows before the parent delete (NOT NULL FK, no ON DELETE
+    # CASCADE) so the reap can't IntegrityError. awaiting_upload rows rarely
+    # have provenance, but the guard keeps every reaper delete path consistent
+    # with jobs.delete_job and the transcribed-reap path above.
+    db.query(AIProvenance).filter(AIProvenance.job_id == job_id).delete(synchronize_session=False)
     db.delete(job)
 
 

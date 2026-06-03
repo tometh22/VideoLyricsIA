@@ -565,7 +565,15 @@ async def list_all_jobs(
 
     Cada job incluye `username` (outer join con users) — el pipeline del
     admin necesita mostrar QUIÉN creó cada video, no solo el tenant.
+
+    Los jobs de preview de fondo (bg_preview_*) se EXCLUYEN por default:
+    son artefactos internos del wizard, no videos del usuario — en el
+    pipeline aparecían como "duplicados" de cada video real (confusión
+    reportada por el operador 2026-06-02). Para verlos: filtrar por su
+    status explícito (?status=bg_preview_done).
     """
+    from jobs import _BG_PREVIEW_STATUSES
+
     query = (
         db.query(Job, User.username)
         .outerjoin(User, Job.user_id == User.id)
@@ -573,6 +581,9 @@ async def list_all_jobs(
     )
     if status:
         query = query.filter(Job.status == status)
+    else:
+        # Sin filtro de status explícito → esconder los previews fantasma.
+        query = query.filter(~Job.status.in_(_BG_PREVIEW_STATUSES))
     if tenant_id:
         query = query.filter(Job.tenant_id == tenant_id)
 
