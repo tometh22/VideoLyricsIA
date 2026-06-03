@@ -131,6 +131,65 @@ function Toggle({ value, onChange }) {
   );
 }
 
+// Avatar con fallback a la inicial: si GET /auth/avatar/{id} 404ea (sin
+// foto subida aún o token vencido) ocultamos el <img> y mostramos el
+// círculo con la inicial. `key` fuerza recarga del <img> tras subir.
+function AvatarImg({ user, size = "w-16 h-16", textSize = "text-xl", reloadKey = 0 }) {
+  const [failed, setFailed] = useState(!user?.avatar_url);
+  useEffect(() => { setFailed(!user?.avatar_url); }, [user?.avatar_url, reloadKey]);
+  const initial = (user?.full_name || user?.username || "?").charAt(0);
+  if (failed) {
+    return (
+      <div className={`${size} rounded-full bg-brand/20 flex items-center justify-center shrink-0 ring-1 ring-white/[0.08]`}>
+        <span className={`${textSize} font-bold text-brand uppercase`}>{initial}</span>
+      </div>
+    );
+  }
+  return (
+    <img
+      key={reloadKey}
+      src={`${API}/auth/avatar/${user.id}?v=${reloadKey}`}
+      alt=""
+      className={`${size} rounded-full object-cover shrink-0 ring-1 ring-white/[0.08]`}
+      onError={() => setFailed(true)}
+    />
+  );
+}
+
+// "hace 3 minutos" — relativo simple, sin dependencias.
+function relativeTime(iso) {
+  if (!iso) return "—";
+  const then = new Date(iso).getTime();
+  if (Number.isNaN(then)) return "—";
+  const diff = Math.max(0, Date.now() - then);
+  const m = Math.floor(diff / 60000);
+  if (m < 1) return "hace instantes";
+  if (m < 60) return `hace ${m} min`;
+  const h = Math.floor(m / 60);
+  if (h < 24) return `hace ${h} h`;
+  const d = Math.floor(h / 24);
+  if (d < 30) return `hace ${d} día${d > 1 ? "s" : ""}`;
+  return new Date(iso).toLocaleDateString();
+}
+
+// User-agent → "Navegador en SO" con heurística simple.
+function parseUA(ua) {
+  if (!ua) return "Dispositivo desconocido";
+  let browser = "Navegador";
+  if (/Edg/.test(ua)) browser = "Edge";
+  else if (/Chrome/.test(ua) && !/Chromium/.test(ua)) browser = "Chrome";
+  else if (/Firefox/.test(ua)) browser = "Firefox";
+  else if (/Safari/.test(ua)) browser = "Safari";
+  let os = null;
+  if (/iPhone|iPad/.test(ua)) os = "iOS";
+  else if (/Android/.test(ua)) os = "Android";
+  else if (/Mac OS X|Macintosh/.test(ua)) os = "macOS";
+  else if (/Windows/.test(ua)) os = "Windows";
+  else if (/Linux/.test(ua)) os = "Linux";
+  if (os) return `${browser} en ${os}`;
+  return ua.length > 48 ? ua.slice(0, 48) + "…" : ua;
+}
+
 function AlertBanner({ variant, children }) {
   const styles = {
     amber: "bg-amber-500/[0.06] ring-amber-500/15 text-amber-400",
@@ -152,7 +211,7 @@ export default function Settings({ onBack }) {
   const [settings, setSettings] = useState(DEFAULT_SETTINGS);
   const [saved, setSaved] = useState(false);
   const [loading, setLoading] = useState(true);
-  const user = getUser();
+  const [user, setUser] = useState(getUser);
   // Miembros de una cuenta B2B (billing_group, ej. operadores de Universal):
   // el contrato lo maneja la plataforma directamente con el cliente — los
   // operadores NO ven precios, ni la suscripción de Stripe, ni pueden
@@ -197,6 +256,26 @@ export default function Settings({ onBack }) {
   const [keyCopied, setKeyCopied] = useState(false);
   const [revokingId, setRevokingId] = useState(null);
 
+  // Perfil
+  const [fullName, setFullName] = useState(user?.full_name || "");
+  const [savingName, setSavingName] = useState(false);
+  const [nameSaved, setNameSaved] = useState(false);
+  const [nameError, setNameError] = useState("");
+  const [avatarUploading, setAvatarUploading] = useState(false);
+  const [avatarError, setAvatarError] = useState("");
+  const [avatarKey, setAvatarKey] = useState(0); // bump → recarga el <img>
+
+  // Dispositivos (sesiones)
+  const [sessions, setSessions] = useState([]);
+  const [sessionsLoading, setSessionsLoading] = useState(false);
+  const [sessionsError, setSessionsError] = useState("");
+  const [revokingSession, setRevokingSession] = useState(null);
+  const [revokingOthers, setRevokingOthers] = useState(false);
+
+  // Mi equipo
+  const [team, setTeam] = useState(null); // {tenant_id, members:[...]}
+  const [teamLoading, setTeamLoading] = useState(false);
+
   useEffect(() => {
     fetch(`${API}/settings`, { headers: authHeaders() })
       .then((r) => r.json())
@@ -223,6 +302,13 @@ export default function Settings({ onBack }) {
     fetch(`${API}/auth/api-keys`, { headers: authHeaders() })
       .then((r) => r.json())
       .then((data) => { if (Array.isArray(data)) setApiKeys(data); })
+      .catch(() => {});
+
+    // /team/members al montar: lo necesitamos para decidir si mostrar la
+    // tab "Mi equipo" (sólo si el workspace tiene >1 miembro).
+    fetch(`${API}/team/members`, { headers: authHeaders() })
+      .then((r) => (r.ok ? r.json() : null))
+      .then((data) => { if (data && Array.isArray(data.members)) setTeam(data); })
       .catch(() => {});
   }, []);
 
@@ -499,6 +585,171 @@ export default function Settings({ onBack }) {
     } catch {}
   };
 
+  // Persiste el user actualizado en localStorage + estado en memoria, para
+  // que la sidebar (que lee genly_user) refleje el nuevo nombre/avatar.
+  const persistUser = (patch) => {
+    const next = { ...(getUser() || {}), ...patch };
+    localStorage.setItem("genly_user", JSON.stringify(next));
+    setUser(next);
+  };
+
+  const handleSaveName = async () => {
+    setNameError("");
+    setSavingName(true);
+    try {
+      const res = await fetch(`${API}/auth/profile`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json", ...authHeaders() },
+        body: JSON.stringify({ full_name: fullName }),
+      });
+      if (!res.ok) {
+        const data = await res.json().catch(() => ({}));
+        throw new Error(data.detail || `Error ${res.status}`);
+      }
+      const data = await res.json();
+      persistUser({ full_name: data.full_name, avatar_url: data.avatar_url });
+      setNameSaved(true);
+      setTimeout(() => setNameSaved(false), 3000);
+    } catch (err) {
+      setNameError(err.message || String(err));
+    } finally {
+      setSavingName(false);
+    }
+  };
+
+  const handleAvatarUpload = async (e) => {
+    const file = e.target.files?.[0];
+    e.target.value = ""; // permite re-subir el mismo archivo
+    if (!file) return;
+    setAvatarError("");
+    // Validación client-side espejo del backend (mejor UX que esperar el 400).
+    if (!["image/jpeg", "image/png", "image/webp"].includes(file.type)) {
+      setAvatarError("Formato no válido. Usá JPG, PNG o WebP.");
+      return;
+    }
+    if (file.size > 5 * 1024 * 1024) {
+      setAvatarError("La imagen supera los 5 MB.");
+      return;
+    }
+    setAvatarUploading(true);
+    try {
+      const fd = new FormData();
+      fd.append("file", file);
+      const res = await fetch(`${API}/auth/avatar`, {
+        method: "POST",
+        headers: authHeaders(),
+        body: fd,
+      });
+      if (!res.ok) {
+        const data = await res.json().catch(() => ({}));
+        throw new Error(data.detail || `Error ${res.status}`);
+      }
+      const data = await res.json();
+      persistUser({ avatar_url: data.avatar_url });
+      setAvatarKey((k) => k + 1); // fuerza recarga del <img>
+    } catch (err) {
+      setAvatarError(err.message || String(err));
+    } finally {
+      setAvatarUploading(false);
+    }
+  };
+
+  const fetchSessions = async () => {
+    setSessionsLoading(true);
+    setSessionsError("");
+    try {
+      const res = await fetch(`${API}/auth/sessions`, { headers: authHeaders() });
+      if (!res.ok) {
+        const data = await res.json().catch(() => ({}));
+        throw new Error(data.detail || `Error ${res.status}`);
+      }
+      const data = await res.json();
+      setSessions(Array.isArray(data.sessions) ? data.sessions : []);
+    } catch (err) {
+      setSessionsError(err.message || String(err));
+    } finally {
+      setSessionsLoading(false);
+    }
+  };
+
+  // Logout self-contained (Settings sólo recibe onBack, no onLogout): si la
+  // sesión revocada era la actual, limpiamos identidad como hace
+  // handleDeleteAccount y mandamos a "/". El listener de `storage` en App
+  // propaga el logout al resto de las tabs abiertas.
+  const localLogout = () => {
+    localStorage.removeItem("genly_token");
+    localStorage.removeItem("genly_user");
+    window.location.assign("/");
+  };
+
+  const handleRevokeSession = async (sid) => {
+    setRevokingSession(sid);
+    setSessionsError("");
+    try {
+      const res = await fetch(`${API}/auth/sessions/${sid}/revoke`, {
+        method: "POST",
+        headers: authHeaders(),
+      });
+      if (!res.ok) {
+        const data = await res.json().catch(() => ({}));
+        throw new Error(data.detail || `Error ${res.status}`);
+      }
+      const data = await res.json();
+      if (data.was_current) { localLogout(); return; }
+      await fetchSessions();
+    } catch (err) {
+      setSessionsError(err.message || String(err));
+    } finally {
+      setRevokingSession(null);
+    }
+  };
+
+  const handleRevokeOthers = async () => {
+    setRevokingOthers(true);
+    setSessionsError("");
+    try {
+      const res = await fetch(`${API}/auth/sessions/revoke-others`, {
+        method: "POST",
+        headers: authHeaders(),
+      });
+      if (!res.ok) {
+        const data = await res.json().catch(() => ({}));
+        throw new Error(data.detail || `Error ${res.status}`);
+      }
+      await fetchSessions();
+    } catch (err) {
+      setSessionsError(err.message || String(err));
+    } finally {
+      setRevokingOthers(false);
+    }
+  };
+
+  const fetchTeam = async () => {
+    setTeamLoading(true);
+    try {
+      const res = await fetch(`${API}/team/members`, { headers: authHeaders() });
+      if (!res.ok) {
+        const data = await res.json().catch(() => ({}));
+        throw new Error(data.detail || `Error ${res.status}`);
+      }
+      const data = await res.json();
+      setTeam(data);
+    } catch {
+      // best-effort: la tab sólo es visible si ya cargó >1 miembro al montar
+    } finally {
+      setTeamLoading(false);
+    }
+  };
+
+  // Carga perezosa al abrir cada tab.
+  useEffect(() => {
+    if (activeSection === "dispositivos") fetchSessions();
+    if (activeSection === "equipo") fetchTeam();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activeSection]);
+
+  const showTeamTab = Boolean(team && Array.isArray(team.members) && team.members.length > 1);
+
   const currentPlan = user?.plan || "free";
   const planInfo = PLAN_INFO[currentPlan] || PLAN_INFO.free;
 
@@ -532,6 +783,7 @@ export default function Settings({ onBack }) {
       {/* ─── Tabs ─────────────────────────────────────────────────── */}
       <div className="flex flex-wrap gap-2 mb-6">
         {[
+          { id: "perfil",         label: "Perfil" },
           { id: "cuenta",         label: t("settings.account") || "Cuenta" },
           { id: "facturacion",    label: t("settings.billing") || "Facturación" },
           // Integraciones por ahora sólo contiene Drive — escondemos
@@ -540,6 +792,9 @@ export default function Settings({ onBack }) {
             ? { id: "integraciones", label: t("settings.integrations_tab") || "Integraciones" }
             : null,
           { id: "youtube",        label: "YouTube" },
+          { id: "dispositivos",   label: "Dispositivos" },
+          // "Mi equipo" sólo si el workspace tiene >1 miembro.
+          showTeamTab ? { id: "equipo", label: "Mi equipo" } : null,
         ].filter(Boolean).map((s) => (
           <TabPill key={s.id} active={activeSection === s.id} onClick={() => setActiveSection(s.id)}>
             {s.label}
@@ -548,6 +803,61 @@ export default function Settings({ onBack }) {
       </div>
 
       <div className="space-y-4">
+
+        {/* ════════════════════ PERFIL ════════════════════ */}
+        {activeSection === "perfil" && (
+          <>
+            <Card>
+              <SectionLabel>Foto de perfil</SectionLabel>
+              <p className="text-xs text-ink-secondary mb-4 -mt-1">
+                Se muestra en la barra lateral y junto a tu equipo.
+              </p>
+              <div className="flex items-center gap-4">
+                <AvatarImg user={user} reloadKey={avatarKey} size="w-16 h-16" textSize="text-xl" />
+                <div>
+                  <label className={`btn-secondary text-xs h-9 px-4 inline-flex items-center cursor-pointer ${avatarUploading ? "opacity-40 pointer-events-none" : ""}`}>
+                    {avatarUploading ? "Subiendo…" : "Cambiar foto"}
+                    <input
+                      type="file"
+                      accept="image/jpeg,image/png,image/webp"
+                      className="hidden"
+                      onChange={handleAvatarUpload}
+                      disabled={avatarUploading}
+                    />
+                  </label>
+                  <p className="text-[10px] text-gray-600 mt-1.5">JPG, PNG o WebP. Máx 5 MB.</p>
+                </div>
+              </div>
+              {avatarError && <div className="mt-3"><InlineError message={avatarError} /></div>}
+            </Card>
+
+            <Card>
+              <SectionLabel>Nombre</SectionLabel>
+              <p className="text-xs text-ink-secondary mb-4 -mt-1">
+                Tu nombre visible para el resto del equipo.
+              </p>
+              <Field label="Nombre completo">
+                <input
+                  type="text"
+                  value={fullName}
+                  onChange={(e) => { setFullName(e.target.value); setNameError(""); }}
+                  className="input-field text-sm"
+                  placeholder="Tu nombre"
+                />
+              </Field>
+              {nameError && <div className="mt-3"><InlineError message={nameError} /></div>}
+              <div className="flex items-center justify-end gap-3 mt-4">
+                {nameSaved && <InlineSuccess message="Nombre actualizado" />}
+                <button
+                  onClick={handleSaveName}
+                  disabled={savingName}
+                  className="btn-primary px-5 disabled:opacity-40 disabled:cursor-not-allowed">
+                  {savingName ? "…" : "Guardar"}
+                </button>
+              </div>
+            </Card>
+          </>
+        )}
 
         {/* ════════════════════ CUENTA ════════════════════ */}
         {activeSection === "cuenta" && (
@@ -1268,6 +1578,109 @@ export default function Settings({ onBack }) {
               </button>
             </div>
           </>
+        )}
+
+        {/* ════════════════════ DISPOSITIVOS ════════════════════ */}
+        {activeSection === "dispositivos" && (
+          <Card>
+            <div className="flex items-start justify-between gap-4 mb-4">
+              <div>
+                <SectionLabel>Sesiones activas</SectionLabel>
+                <p className="text-xs text-ink-secondary -mt-1">
+                  Dispositivos donde tu cuenta tiene una sesión abierta.
+                </p>
+              </div>
+              <button
+                onClick={handleRevokeOthers}
+                disabled={revokingOthers || sessionsLoading || sessions.length <= 1}
+                className="shrink-0 text-[12px] font-medium px-4 py-2 rounded-lg bg-surface-3/40 text-ink-secondary ring-1 ring-white/[0.06] hover:text-white hover:ring-white/[0.12] transition-colors disabled:opacity-40 disabled:cursor-not-allowed">
+                {revokingOthers ? "…" : "Cerrar todas las demás"}
+              </button>
+            </div>
+
+            {sessionsError && <div className="mb-3"><InlineError message={sessionsError} /></div>}
+
+            {sessionsLoading ? (
+              <div className="space-y-2">
+                {[1, 2].map((i) => (
+                  <div key={i} className="h-14 bg-surface-3/30 rounded-xl animate-pulse" />
+                ))}
+              </div>
+            ) : sessions.length === 0 ? (
+              <p className="text-sm text-ink-secondary text-center py-4">Sin sesiones activas.</p>
+            ) : (
+              <div className="space-y-0">
+                {sessions.map((s, i) => (
+                  <div key={s.id}
+                    className={`flex items-center justify-between gap-3 py-3 ${i < sessions.length - 1 ? "border-b border-white/[0.03]" : ""}`}>
+                    <div className="min-w-0">
+                      <div className="flex items-center gap-2">
+                        <p className="text-sm text-white truncate">{parseUA(s.user_agent)}</p>
+                        {s.current && (
+                          <span className="shrink-0 text-[9px] bg-accent/15 text-accent px-2 py-0.5 rounded-full font-bold uppercase tracking-wider">
+                            Este dispositivo
+                          </span>
+                        )}
+                      </div>
+                      <p className="text-[11px] text-gray-600 mt-0.5">
+                        {s.ip_address || "IP desconocida"} · última actividad {relativeTime(s.last_seen_at || s.created_at)}
+                      </p>
+                    </div>
+                    <button
+                      onClick={() => handleRevokeSession(s.id)}
+                      disabled={revokingSession === s.id}
+                      className="shrink-0 text-label px-3 py-1.5 rounded-lg bg-red-500/10 text-red-400 ring-1 ring-red-500/15 hover:bg-red-500/20 transition-colors disabled:opacity-40">
+                      {revokingSession === s.id ? "…" : "Cerrar sesión"}
+                    </button>
+                  </div>
+                ))}
+              </div>
+            )}
+          </Card>
+        )}
+
+        {/* ════════════════════ MI EQUIPO ════════════════════ */}
+        {activeSection === "equipo" && (
+          <Card>
+            <SectionLabel>Mi equipo</SectionLabel>
+            <p className="text-xs text-ink-secondary mb-4 -mt-1">
+              Personas con acceso a este workspace ({team?.tenant_id || "—"}).
+            </p>
+            {teamLoading && !team?.members ? (
+              <div className="space-y-2">
+                {[1, 2].map((i) => (
+                  <div key={i} className="h-12 bg-surface-3/30 rounded-xl animate-pulse" />
+                ))}
+              </div>
+            ) : (
+              <div className="space-y-0">
+                {(team?.members || []).map((m, i, arr) => (
+                  <div key={m.id}
+                    className={`flex items-center gap-3 py-3 ${i < arr.length - 1 ? "border-b border-white/[0.03]" : ""}`}>
+                    <AvatarImg user={m} size="w-9 h-9" textSize="text-sm" />
+                    <div className="min-w-0 flex-1">
+                      <div className="flex items-center gap-2">
+                        <p className="text-sm text-white truncate">{m.full_name || m.username}</p>
+                        {m.is_self && (
+                          <span className="shrink-0 text-[9px] bg-brand/20 text-brand-light px-2 py-0.5 rounded-full font-bold uppercase tracking-wider">
+                            vos
+                          </span>
+                        )}
+                      </div>
+                      {m.full_name && (
+                        <p className="text-[11px] text-gray-600 mt-0.5 truncate">{m.username}</p>
+                      )}
+                    </div>
+                    {m.role === "admin" && (
+                      <span className="shrink-0 text-[10px] bg-accent/15 text-accent px-2.5 py-1 rounded-full font-medium">
+                        Admin
+                      </span>
+                    )}
+                  </div>
+                ))}
+              </div>
+            )}
+          </Card>
         )}
 
       </div>
