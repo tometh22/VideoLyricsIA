@@ -1440,7 +1440,9 @@ export default function UploadZone({
               </div>
               <button
                 onClick={(e) => removeFile(i, e)}
-                className="shrink-0 w-7 h-7 rounded-lg hover:bg-red-500/10 flex items-center justify-center text-gray-500 hover:text-red-400 transition-colors"
+                aria-label="Descartar este audio"
+                title="Descartar este audio"
+                className="shrink-0 w-7 h-7 rounded-lg hover:bg-red-500/10 flex items-center justify-center text-gray-300 hover:text-red-400 transition-colors"
               >
                 <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
                   <path d="M18 6L6 18M6 6l12 12" />
