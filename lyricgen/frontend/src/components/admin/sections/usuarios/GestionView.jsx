@@ -6,6 +6,7 @@
 // botones inline anteriores desbordaban la tabla y al envolverse hacían las
 // filas gigantes.
 import { useEffect, useRef, useState } from "react";
+import { createPortal } from "react-dom";
 
 import { fmtDate } from "../../adminApi";
 import DataTable from "../../primitives/DataTable";
@@ -25,24 +26,38 @@ const badge = (text, classes) => (
 // ejecutar una acción.
 function RowActions({ user, onWorkspace, onToggleAI, onToggleOverage, onToggleActive, onDelete }) {
   const [open, setOpen] = useState(false);
-  // Posición fija calculada al abrir: el menú escapa del overflow-x-auto de
-  // la tabla (un absolute adentro del contenedor con overflow se recorta).
+  // El menú se renderiza en un PORTAL a document.body con position:fixed.
+  // Por qué: el contenedor .glass usa backdrop-filter, y un ancestro con
+  // backdrop-filter se convierte en el containing block de cualquier
+  // descendant con position:fixed → el menú quedaba posicionado relativo
+  // a la card (fuera de la vista) en vez del viewport. El portal lo saca
+  // del árbol DOM de la card y el fixed vuelve a ser relativo al viewport.
   const [pos, setPos] = useState({ top: 0, left: 0 });
   const ref = useRef(null);
+  const menuRef = useRef(null);
 
   useEffect(() => {
     if (!open) return;
     const close = (e) => {
-      if (ref.current && !ref.current.contains(e.target)) setOpen(false);
+      // Doble check: el botón (ref) y el menú (portal, fuera del árbol del botón).
+      if (ref.current && ref.current.contains(e.target)) return;
+      if (menuRef.current && menuRef.current.contains(e.target)) return;
+      setOpen(false);
     };
     document.addEventListener("mousedown", close);
-    return () => document.removeEventListener("mousedown", close);
+    // Cerrar también al scrollear (el menú quedaría desanclado del botón).
+    const onScroll = () => setOpen(false);
+    window.addEventListener("scroll", onScroll, true);
+    return () => {
+      document.removeEventListener("mousedown", close);
+      window.removeEventListener("scroll", onScroll, true);
+    };
   }, [open]);
 
   const toggle = (e) => {
     e.stopPropagation();
     const rect = e.currentTarget.getBoundingClientRect();
-    // 224px = w-56. Alineado al borde derecho del botón.
+    // 224px = w-56. Alineado al borde derecho del botón; nunca fuera de pantalla.
     setPos({ top: rect.bottom + 4, left: Math.max(8, rect.right - 224) });
     setOpen((v) => !v);
   };
@@ -71,8 +86,9 @@ function RowActions({ user, onWorkspace, onToggleAI, onToggleOverage, onToggleAc
           <circle cx="5" cy="12" r="1.8" /><circle cx="12" cy="12" r="1.8" /><circle cx="19" cy="12" r="1.8" />
         </svg>
       </button>
-      {open && (
+      {open && createPortal(
         <div
+          ref={menuRef}
           className="fixed z-50 w-56 py-1 rounded-button bg-surface-2 ring-1 ring-white/[0.08] shadow-depth-lg"
           style={{ top: pos.top, left: pos.left }}
         >
@@ -86,7 +102,8 @@ function RowActions({ user, onWorkspace, onToggleAI, onToggleOverage, onToggleAc
               {item("Eliminar usuario…", onDelete, true)}
             </>
           )}
-        </div>
+        </div>,
+        document.body,
       )}
     </div>
   );
@@ -252,6 +269,12 @@ export default function GestionView() {
   const [showCreate, setShowCreate] = useState(false);
   const [workspaceUser, setWorkspaceUser] = useState(null);
   const [deleteTarget, setDeleteTarget] = useState(null);
+  // Las cuentas eliminadas (deleted_N) y desactivadas son ruido — ocultas
+  // por default. El toggle las muestra cuando hace falta auditar.
+  const [showInactive, setShowInactive] = useState(false);
+
+  const visibleUsers = users.filter((u) => showInactive || u.is_active);
+  const hiddenCount = users.length - visibleUsers.length;
 
   // 4 columnas — entran sin scroll horizontal en el ancho del admin.
   const columns = [
@@ -259,7 +282,7 @@ export default function GestionView() {
       key: "user",
       header: "Usuario",
       render: (u) => (
-        <div className="flex items-center gap-2.5 min-w-0">
+        <div className="flex items-center gap-2.5 min-w-0 max-w-[340px]">
           <div className="w-7 h-7 shrink-0 rounded-lg bg-brand/20 flex items-center justify-center">
             <span className="text-label font-bold text-brand-light uppercase">{u.username?.[0]}</span>
           </div>
@@ -283,7 +306,7 @@ export default function GestionView() {
       key: "workspace",
       header: "Workspace",
       render: (u) => (
-        <div className={`min-w-0 ${u.is_active ? "" : "opacity-40"}`}>
+        <div className={`min-w-0 max-w-[280px] ${u.is_active ? "" : "opacity-40"}`}>
           <span className="block font-mono text-gray-300 truncate">{u.tenant_id || "—"}</span>
           <span className="block text-label text-gray-500 truncate">
             {u.billing_group
@@ -332,9 +355,14 @@ export default function GestionView() {
     <div className="space-y-4">
       <SectionHeader
         title="Gestión de usuarios"
-        subtitle={`${usersTotal} usuarios`}
+        subtitle={`${visibleUsers.length} usuarios activos${hiddenCount > 0 ? ` · ${hiddenCount} eliminados/desactivados ocultos` : ""}`}
         right={
           <>
+            <FilterBar.Toggle
+              checked={showInactive}
+              onChange={setShowInactive}
+              label="Ver eliminados"
+            />
             <FilterBar.Search
               value={search}
               onChange={setSearch}
@@ -354,7 +382,7 @@ export default function GestionView() {
       <div className="glass rounded-card p-5">
         <DataTable
           columns={columns}
-          rows={users}
+          rows={visibleUsers}
           rowKey={(u) => u.id}
           empty={<EmptyState title="Sin usuarios" message="No hay usuarios que coincidan con la búsqueda." />}
         />
