@@ -19,6 +19,41 @@ logger = logging.getLogger("genly.worker")
 from credentials_bootstrap import bootstrap_vertex_credentials
 bootstrap_vertex_credentials()
 
+from rq import Worker as _RQWorker
+
+
+class WarmOnlyWorker(_RQWorker):
+    """RQ Worker that NEVER cold-kills an in-flight job.
+
+    Stock RQ escalates a SECOND shutdown signal to a COLD shutdown
+    (`request_force_stop` → kills the work-horse + SystemExit). That loses the
+    in-flight render whenever a burst of deploys lands a 2nd SIGTERM while we're
+    still draining the 1st deploy's render — the exact job-loss agus.cafisi saw
+    on a high-deploy day (empirically reproduced 2026-06-03: a double-SIGTERM
+    cold-killed a mid-render job, single-SIGTERM let it finish).
+
+    We refuse to escalate: every shutdown signal stays a WARM shutdown, so the
+    render always runs to completion. The hard caps remain — the job's own
+    timeout and Railway's RAILWAY_SHUTDOWN_TIMEOUT_SECONDS (1200s) SIGKILL — so
+    a genuinely hung worker still dies eventually; we just never throw away a
+    render that's making progress.
+
+    (worker.py's own SIGTERM handler is also overwritten by RQ's
+    `_install_signal_handlers` inside `work()`, which is why no "Received
+    signal" line ever appeared in the logs — this subclass is where the real
+    burst-deploy protection lives.)
+    """
+
+    def request_force_stop(self, signum, frame):  # type: ignore[override]
+        logger.warning(
+            "[WORKER] extra shutdown signal (%s) ignored — staying in WARM "
+            "shutdown so the in-flight job finishes (burst-deploy protection). "
+            "Railway's 20-min SIGKILL remains the hard cap.", signum,
+        )
+        # Intentionally do NOT escalate to cold shutdown: no kill_horse(), no
+        # SystemExit. The warm-shutdown flag set by the first signal still makes
+        # the worker exit cleanly once the current job completes.
+
 
 def _warn_if_shutdown_grace_too_short() -> None:
     """Loud startup warning when Railway's SIGTERM→SIGKILL grace is too
@@ -80,7 +115,7 @@ def main():
     _warn_if_shutdown_grace_too_short()
 
     from redis import Redis
-    from rq import Queue, Worker
+    from rq import Queue  # the worker itself is WarmOnlyWorker (module-level)
 
     # Warm the Whisper model so the first job does not pay the load cost.
     # SKIP this when OPENAI_API_KEY is set — transcription routes through the
@@ -114,10 +149,17 @@ def main():
         Queue("enterprise", connection=conn),
         Queue("default", connection=conn),
     ]
-    worker = Worker(queues, connection=conn)
+    # WarmOnlyWorker: a burst of deploys (2nd SIGTERM mid-drain) would otherwise
+    # COLD-kill the in-flight render. This subclass keeps every shutdown warm so
+    # the render finishes. See the class docstring.
+    worker = WarmOnlyWorker(queues, connection=conn)
 
+    # NOTE: this handler only covers the brief window BEFORE worker.work()
+    # runs — RQ's work() calls _install_signal_handlers() which OVERWRITES
+    # these with its own request_stop/request_force_stop. The real burst-deploy
+    # protection is WarmOnlyWorker.request_force_stop above, not this handler.
     def _graceful(signum, _frame):
-        logger.info("[WORKER] Received signal %s; requesting stop after current job", signum)
+        logger.info("[WORKER] Received signal %s (pre-work); requesting warm stop", signum)
         worker.request_stop(signum, _frame)
 
     signal.signal(signal.SIGTERM, _graceful)
