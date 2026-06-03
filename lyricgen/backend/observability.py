@@ -53,6 +53,23 @@ def init_sentry():
     """
     if not SENTRY_DSN:
         return
+    # Guard: a non-Railway host (RAILWAY_ENVIRONMENT unset) must NEVER report as
+    # a real deploy environment. Otherwise a laptop or a local test/CI run that
+    # picked up a prod SENTRY_DSN pollutes the prod Sentry feed with false alarms
+    # — exactly what happened 2026-06-03 when a local review run leaked a
+    # FileNotFoundError + a provenance FK-violation tagged "production" during the
+    # UMG launch, indistinguishable from real incidents. On Railway,
+    # RAILWAY_ENVIRONMENT is always injected, so real prod/staging deploys are
+    # unaffected. To report from a dev host into a non-prod Sentry environment,
+    # set SENTRY_ENV=local (or development) explicitly.
+    _resolved_env = (os.environ.get("SENTRY_ENV") or ENV or "").strip().lower()
+    if not os.environ.get("RAILWAY_ENVIRONMENT", "").strip() and _resolved_env in ("production", "staging"):
+        print(
+            f"[OBS] Sentry init SKIPPED: host is not Railway but environment="
+            f"{_resolved_env!r}. Refusing to report as a real deploy from a "
+            f"local/test host (set SENTRY_ENV=local to report from dev)."
+        )
+        return
     try:
         import sentry_sdk
 
