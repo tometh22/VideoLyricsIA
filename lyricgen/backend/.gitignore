@@ -5,3 +5,8 @@
 # — too big for git, regenerated locally from prod DB via
 # scripts/build_benchmark_dataset.py
 benchmark/
+
+# Local secrets — NUNCA commitear (bloqueados por push protection)
+.env.preflight
+.env.luma
+.env.replicate
