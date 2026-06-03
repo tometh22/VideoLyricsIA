@@ -26,6 +26,29 @@ def test_active_input_keys_is_orphan_only_not_status_filtered():
     assert '"queued"' not in src and '"done"' not in src
 
 
+def test_active_input_keys_returns_none_on_db_failure():
+    """CRITICAL fail-safe (review 2026-06-03): DB-unreadable must return None
+    (distinct from an empty set = 0 jobs), so the caller can ABORT instead of
+    treating every input as an orphan and purging live jobs."""
+    src = inspect.getsource(storage._active_input_keys)
+    # both failure paths (import + query) return None, not set()
+    assert src.count("return None") >= 2
+    assert "return set()" not in src
+
+
+def test_cleanup_aborts_when_protected_set_unknown():
+    """cleanup_old_inputs must REFUSE to delete when the protect-set is None
+    (DB unreadable) — otherwise a transient DB blip mid-sweep purges everything
+    (the exact agus.cafisi data-loss the fail-safe prevents)."""
+    src = inspect.getsource(storage.cleanup_old_inputs)
+    assert "if protected_prefixes is None:" in src
+    # aborts with deleted=0 before reaching the delete path
+    assert "ABORTED" in src
+    abort_idx = src.index("protected_prefixes is None")
+    delete_idx = src.index("delete_objects") if "delete_objects" in src else len(src)
+    assert abort_idx < delete_idx, "abort guard must come before any delete"
+
+
 def test_edit_pipeline_recovers_audio_from_deliverable():
     """The edit re-render must NOT hard-fail when the input is gone — it
     extracts the audio from the rendered video/short deliverable."""
