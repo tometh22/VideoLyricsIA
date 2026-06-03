@@ -56,6 +56,37 @@ def effect_path(effect: str) -> str | None:
     return p if os.path.exists(p) else None
 
 
+# Per-effect pre-blend gain. Sparse / dim effects barely register through the
+# screen-blend over busy or bright photos (matrix test 2026-06-02: stars and
+# bokeh were imperceptible, snow read as faint streaks). Lift the particles
+# before the blend, keeping the near-black background black so the screen-blend
+# doesn't haze the frame. Two shapes, validated by compositing the real assets
+# over a dark+bright test bg and measuring luma:
+#   - stars / snow are bright POINTS → `eq` contrast>1 (pivot 0.5) pushes the
+#     bright pixels brighter and the black blacker. (stars 190→232, snow
+#     224→254 brightest; dark region unchanged.)
+#   - bokeh circles are MID-tone (~0.28), which an `eq` contrast would push
+#     DOWN. A `curves` that lifts the 0.28 knee while pinning the low end keeps
+#     the black clean and brightens the circles (67→149 over the test bg).
+# rain / light already read fine → no gain. aurora is a broad diffuse glow that
+# no tested gain improved cleanly → left untouched. Applied identically in the
+# main libass path (build_video_filter) and the short post-pass
+# (_apply_short_effect) so the effect looks the same in both.
+_FX_GAIN = {
+    "stars": "eq=contrast=2.0:brightness=-0.02",
+    "snow": "eq=contrast=1.35",
+    "bokeh": "curves=all='0/0 0.1/0.04 0.28/0.62 0.55/0.9 1/1'",
+}
+
+
+def fx_gain(effect: str) -> str:
+    """ffmpeg `eq` to pre-amplify a dim effect before screen-blend, or ''.
+
+    Goes BEFORE `format=gbrp` in the fx chain (eq runs on the clip's native
+    YUV); empty string for effects that are already bright enough."""
+    return _FX_GAIN.get((effect or "").strip().lower(), "")
+
+
 def _parse_custom_colors(custom_colors: str) -> list[tuple[int, int, int]]:
     """Parse '#RRGGBB,#RRGGBB' (o '#RGB' shorthand) → lista de tuplas RGB.
     Robusto: ignora entradas inválidas en vez de raisear."""
@@ -189,9 +220,11 @@ def build_video_filter(*, ass_basename: str, font_dir: str, width: int,
         return vf, False, []
 
     grade_step = f"{grade}," if grade else ""
+    gain = fx_gain(effect)
+    gain_step = f"{gain}," if gain else ""  # before format=gbrp (eq on native YUV)
     fc = (
         f"[0:v]format=gbrp[bg];"
-        f"[2:v]scale={width}:{height},setpts=PTS-STARTPTS,format=gbrp[fx];"
+        f"[2:v]scale={width}:{height},setpts=PTS-STARTPTS,{gain_step}format=gbrp[fx];"
         f"[bg][fx]blend=all_mode=screen:shortest=1[bl];"
         f"[bl]{grade_step}format=yuv420p[gr];"
         f"[gr]{subs}[out]"

@@ -52,3 +52,40 @@ def test_lower_preserves_internal_whitespace():
 
 def test_lower_empty_string():
     assert pipeline._apply_case("", "lower") == ""
+
+
+# --- uniformly title-cased / ALL-CAPS sources (matrix test 2026-06-02) -------
+# When the SOURCE title-cases or upper-cases the whole line, the capitals are
+# formatting, not proper nouns — honour 'lower' as a true all-lowercase look
+# (except for known proper nouns, see below).
+
+def test_lower_uniformly_titlecased_becomes_all_lower():
+    assert pipeline._apply_case("Caminando Bajo La Lluvia", "lower") == "caminando bajo la lluvia"
+
+
+def test_lower_allcaps_becomes_all_lower():
+    assert pipeline._apply_case("CAMINANDO BAJO LA LLUVIA", "lower") == "caminando bajo la lluvia"
+
+
+def test_lower_titlecased_other_line():
+    assert pipeline._apply_case("Tu Voz Me Llama Desde Lejos", "lower") == "tu voz me llama desde lejos"
+
+
+def test_lower_titlecased_preserves_country():
+    """A country in an otherwise title-cased line keeps its capital."""
+    assert pipeline._apply_case("Te Amo Argentina", "lower") == "te amo Argentina"
+
+
+def test_lower_titlecased_preserves_country_with_accent():
+    assert pipeline._apply_case("Viva México", "lower") == "viva México"
+
+
+def test_lower_natural_case_still_preserves_interior_caps():
+    """A naturally sentence-cased line (Whisper) is NOT treated as a
+    title-cased source — interior proper nouns survive untouched, including
+    operator hand-capitalizations."""
+    assert pipeline._apply_case("brilla el Sol", "lower") == "brilla el Sol"
+
+
+def test_lower_single_titlecased_word():
+    assert pipeline._apply_case("Caminando", "lower") == "caminando"
