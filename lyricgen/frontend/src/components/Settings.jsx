@@ -153,6 +153,11 @@ export default function Settings({ onBack }) {
   const [saved, setSaved] = useState(false);
   const [loading, setLoading] = useState(true);
   const user = getUser();
+  // Miembros de una cuenta B2B (billing_group, ej. operadores de Universal):
+  // el contrato lo maneja la plataforma directamente con el cliente — los
+  // operadores NO ven precios, ni la suscripción de Stripe, ni pueden
+  // cambiar el plan. Solo ven su consumo (pool compartido del grupo).
+  const isB2BMember = Boolean(user?.billing_group);
 
   const [subscription, setSubscription] = useState(null);
   const [invoices, setInvoices] = useState([]);
@@ -870,7 +875,7 @@ export default function Settings({ onBack }) {
                     {planInfo.videos} {t("settings.videos_month") || "videos/mes"}
                   </p>
                 </div>
-                {planInfo.price > 0 && (
+                {planInfo.price > 0 && !isB2BMember && (
                   <p className="text-xl font-bold tracking-tight text-white">
                     <span className="text-xs text-ink-secondary font-normal">USD </span>
                     {planInfo.price.toLocaleString()}
@@ -879,7 +884,7 @@ export default function Settings({ onBack }) {
                 )}
               </div>
 
-              {subscription?.subscription && (
+              {!isB2BMember && subscription?.subscription && (
                 <div className="space-y-2 pt-4 border-t border-white/[0.04]">
                   <div className="flex justify-between text-xs">
                     <span className="text-ink-secondary">{t("settings.status") || "Estado"}</span>
@@ -942,7 +947,7 @@ export default function Settings({ onBack }) {
                 </div>
               )}
 
-              {subscription?.has_subscription && (
+              {!isB2BMember && subscription?.has_subscription && (
                 <button onClick={handleManageBilling} disabled={billingLoading}
                   className="btn-secondary mt-5 text-xs h-10 px-4">
                   {t("settings.manage_billing") || "Administrar facturación"}
@@ -951,7 +956,7 @@ export default function Settings({ onBack }) {
             </Card>
 
             {/* Change plan */}
-            {currentPlan !== "unlimited" && (
+            {!isB2BMember && currentPlan !== "unlimited" && (
               <Card>
                 <SectionLabel>{t("settings.change_plan") || "Cambiar plan"}</SectionLabel>
                 <p className="text-xs text-ink-secondary mb-5 -mt-1">
@@ -997,7 +1002,9 @@ export default function Settings({ onBack }) {
               </Card>
             )}
 
-            {/* Invoice history */}
+            {/* Invoice history — oculto para miembros B2B (sus facturas
+                las maneja la plataforma con el cliente, no Stripe) */}
+            {!isB2BMember && (
             <Card>
               <SectionLabel>{t("settings.invoice_history") || "Historial de facturas"}</SectionLabel>
               {invoices.length === 0 ? (
@@ -1035,6 +1042,7 @@ export default function Settings({ onBack }) {
                 </div>
               )}
             </Card>
+            )}
 
             {/* Plan-change confirmation modal (proration preview + guardrail) */}
             {planModal && (
