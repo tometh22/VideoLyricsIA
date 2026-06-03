@@ -786,6 +786,7 @@ def run_pipeline(job_id: str, mp3_path: str, artist: str, style: str,
                     background_hint=background_hint,
                     bg_verbatim=bg_verbatim,
                     custom_colors=custom_colors,
+                    effect=effect,
                     allow_people=_compute_allow_people(job_id),
                     audio_duration=_audio_dur_for_kb,
                 )
@@ -6595,6 +6596,12 @@ def _ensure_background(style_hint: str, job_dir: str, lyrics_text: str = None,
     # ya no panea — la vida/movimiento la da el efecto componible (lluvia/nieve/
     # luces/estrellas/bokeh vía fx_compositor). El operador elige el efecto en el
     # wizard; este default sólo cubre el caso sin elección.
+    # The operator's ACTUAL effect choice, captured BEFORE the anti-dead-frame
+    # "light" default below — used to gate background darkening so we darken for
+    # the effect the operator really picked (and no-op when they picked none),
+    # not for the forced default. (Review fix 2026-06-03: `effect` was never
+    # forwarded here, so darkening fired off the forced "light" for every still.)
+    _operator_effect = (effect or "").strip().lower()
     if _norm_move_bg in ("estatico", "sutil", "foto-parallax") and not (effect or "").strip():
         logger.info(
             "[BG] movement=%s + no effect selected — defaulting effect=light "
@@ -6657,11 +6664,17 @@ def _ensure_background(style_hint: str, job_dir: str, lyrics_text: str = None,
             palette_style=style_hint, custom_colors=custom_colors,
             allow_people=allow_people,
         )
-        # Foto fija + efectos (2026-06-03): if the operator picked a luminous
-        # particle effect, bias the still toward a dark/low-key canvas so the
-        # screen-blended particles read (per-effect gain alone loses to bright
-        # backgrounds). No-op when no effect is selected.
-        prompt = _darken_prompt_for_effect(result["prompt"], effect)
+        # Foto fija + efectos (2026-06-03; review-fixed same day): if the
+        # operator picked a luminous particle effect, bias the still toward a
+        # dark/low-key canvas so the screen-blended particles read. Gated on the
+        # operator's ACTUAL pick (_operator_effect), NOT the forced "light"
+        # default, so it no-ops when no effect was chosen. AND never applied to
+        # a verbatim operator prompt — "usá mi prompt tal cual" must not get
+        # dark grading bolted on (the imagen branch returns before the Veo
+        # path's _is_verbatim is computed, so we check it inline here).
+        _verbatim_bg = bool(bg_verbatim and background_hint and background_hint.strip())
+        prompt = (result["prompt"] if _verbatim_bg
+                  else _darken_prompt_for_effect(result["prompt"], _operator_effect))
         image_path = os.path.join(job_dir, "bg_imagen.jpg")
         bg_path = os.path.join(job_dir, "bg_generated.mp4")
         # A1 (2026-05-25) — foto-parallax es el único register que el
@@ -6703,8 +6716,14 @@ def _ensure_background(style_hint: str, job_dir: str, lyrics_text: str = None,
         # bokeh/light), que se compone por ffmpeg overlay (fx_compositor) — barato
         # y OOM-safe. Un loop estático de ffmpeg es imposible que OOMee, para
         # cualquier largo de canción y cualquier opción del wizard.
-        _bg_dur = max(60.0, float(audio_duration) if audio_duration else 60.0)
-        _static_image_to_mp4(image_path, bg_path, duration=_bg_dur)
+        # Render a SHORT static sample (60s, the original ken-burns contract);
+        # the downstream loop — _prerender_looped_bg on the libass path, or
+        # _get_background_clip_from_path on the moviepy fallback — seamlessly
+        # extends a static frame to the full song length. Rendering the full
+        # duration here was a SECOND redundant full-length encode (review
+        # 2026-06-03): wasted CPU on long songs and exposed the static encode's
+        # ffmpeg timeout. A static loop is identical at any sample length.
+        _static_image_to_mp4(image_path, bg_path, duration=60.0)
         return bg_path
 
     # True verbatim = operator's own prompt is actually in use (bg_verbatim set
@@ -7408,7 +7427,9 @@ def _static_image_to_mp4(image_path: str, output_path: str, duration: float,
          "-vf", vf, "-c:v", "libx264", "-preset", "fast", "-crf", "20",
          "-pix_fmt", "yuv420p", "-an", output_path],
         label="ffmpeg-static-bg",
-        timeout=300,
+        # 900s to match every other full-duration ffmpeg encode in this module;
+        # defensive even though the 60s static sample encodes in seconds.
+        timeout=900,
         output_path=output_path,
     )
     size_mb = os.path.getsize(output_path) / 1024 / 1024
@@ -7666,7 +7687,10 @@ def _smart_lower(text: str) -> str:
         if uniformly_titled:
             # title-cased source: lowercase all but known proper nouns
             core = tok.lower().strip(".,;:!?¡¿\"'()[]—–-…")
-            out.append(tok if core in _PROPER_NOUNS else tok.lower())
+            # Preserve proper nouns, but NORMALIZE to Title case so an ALL-CAPS
+            # source ("DIOS ES AMOR", "TE AMO ARGENTINA") doesn't echo the word
+            # back in uppercase inside an otherwise-lowercase line.
+            out.append(tok.capitalize() if core in _PROPER_NOUNS else tok.lower())
         elif not seen_word:
             out.append(tok.lower())  # first word: lowercase for the aesthetic
             seen_word = True
@@ -9722,6 +9746,7 @@ def run_edit_pipeline(
                 background_hint=background_hint,
                 bg_mode=background_mode,
                 bg_verbatim=bg_verbatim,
+                effect=effect,
                 allow_people=_compute_allow_people(job_id),
             )
             update_job(job_id, progress=35)
