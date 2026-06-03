@@ -1,7 +1,11 @@
 // Vista "Gestión de usuarios": tabla de usuarios con búsqueda, cambio de plan
-// inline y acciones (workspace / AI / overage / activar / eliminar). Datos y
-// mutaciones vienen de useGestion.
-import { useState } from "react";
+// inline y acciones. Datos y mutaciones vienen de useGestion.
+//
+// Layout (iteración 2026-06-02 por feedback de Tomás): 4 columnas que entran
+// sin scroll horizontal. Las acciones viven en un menú "⋯" por fila — los 5
+// botones inline anteriores desbordaban la tabla y al envolverse hacían las
+// filas gigantes.
+import { useEffect, useRef, useState } from "react";
 
 import { fmtDate } from "../../adminApi";
 import DataTable from "../../primitives/DataTable";
@@ -16,6 +20,77 @@ const PLANS = ["free", "100", "250", "500", "1000", "unlimited"];
 const badge = (text, classes) => (
   <span className={`text-section px-1.5 py-0.5 rounded-full font-bold uppercase ${classes}`}>{text}</span>
 );
+
+// Menú de acciones por fila (kebab "⋯"). Cierra al clickear afuera o al
+// ejecutar una acción.
+function RowActions({ user, onWorkspace, onToggleAI, onToggleOverage, onToggleActive, onDelete }) {
+  const [open, setOpen] = useState(false);
+  // Posición fija calculada al abrir: el menú escapa del overflow-x-auto de
+  // la tabla (un absolute adentro del contenedor con overflow se recorta).
+  const [pos, setPos] = useState({ top: 0, left: 0 });
+  const ref = useRef(null);
+
+  useEffect(() => {
+    if (!open) return;
+    const close = (e) => {
+      if (ref.current && !ref.current.contains(e.target)) setOpen(false);
+    };
+    document.addEventListener("mousedown", close);
+    return () => document.removeEventListener("mousedown", close);
+  }, [open]);
+
+  const toggle = (e) => {
+    e.stopPropagation();
+    const rect = e.currentTarget.getBoundingClientRect();
+    // 224px = w-56. Alineado al borde derecho del botón.
+    setPos({ top: rect.bottom + 4, left: Math.max(8, rect.right - 224) });
+    setOpen((v) => !v);
+  };
+
+  const item = (label, onClick, danger = false) => (
+    <button
+      type="button"
+      onClick={(e) => { e.stopPropagation(); setOpen(false); onClick(); }}
+      className={`block w-full text-left px-3 py-2 text-caption transition-colors duration-brand ${
+        danger ? "text-red-400 hover:bg-red-500/10" : "text-gray-300 hover:bg-white/[0.06]"
+      }`}
+    >
+      {label}
+    </button>
+  );
+
+  return (
+    <div ref={ref} className="relative inline-block">
+      <button
+        type="button"
+        onClick={toggle}
+        className="w-8 h-8 rounded-lg flex items-center justify-center text-gray-400 hover:text-white hover:bg-white/[0.06] transition-colors duration-brand"
+        title="Acciones"
+      >
+        <svg className="w-4 h-4" fill="currentColor" viewBox="0 0 24 24">
+          <circle cx="5" cy="12" r="1.8" /><circle cx="12" cy="12" r="1.8" /><circle cx="19" cy="12" r="1.8" />
+        </svg>
+      </button>
+      {open && (
+        <div
+          className="fixed z-50 w-56 py-1 rounded-button bg-surface-2 ring-1 ring-white/[0.08] shadow-depth-lg"
+          style={{ top: pos.top, left: pos.left }}
+        >
+          {item("Cambiar workspace…", onWorkspace)}
+          {item(user.ai_authorized ? "Revocar autorización de IA" : "Autorizar IA", onToggleAI)}
+          {item(user.allow_overage ? "Frenar overage" : "Permitir overage", onToggleOverage)}
+          {item(user.is_active ? "Desactivar cuenta" : "Reactivar cuenta", onToggleActive)}
+          {user.role !== "admin" && (
+            <>
+              <div className="my-1 border-t border-white/[0.06]" />
+              {item("Eliminar usuario…", onDelete, true)}
+            </>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
 
 // Modal para mover a un usuario de workspace (tenant) y/o cuenta de
 // facturación. El checkbox de "mover videos" está prendido por default —
@@ -178,25 +253,28 @@ export default function GestionView() {
   const [workspaceUser, setWorkspaceUser] = useState(null);
   const [deleteTarget, setDeleteTarget] = useState(null);
 
+  // 4 columnas — entran sin scroll horizontal en el ancho del admin.
   const columns = [
     {
       key: "user",
       header: "Usuario",
       render: (u) => (
-        <div className="flex items-start gap-2.5">
+        <div className="flex items-center gap-2.5 min-w-0">
           <div className="w-7 h-7 shrink-0 rounded-lg bg-brand/20 flex items-center justify-center">
             <span className="text-label font-bold text-brand-light uppercase">{u.username?.[0]}</span>
           </div>
           <div className="min-w-0">
             <div className="flex items-center gap-1.5 flex-wrap">
-              <span className={`font-medium ${u.is_active ? "text-white" : "text-gray-500 line-through"}`}>
+              <span className={`font-medium truncate ${u.is_active ? "text-white" : "text-gray-500 line-through"}`}>
                 {u.username}
               </span>
               {u.role === "admin" && badge("Admin", "bg-brand/20 text-brand-light")}
               {u.ai_authorized && badge("AI", "bg-accent/15 text-accent")}
-              {u.allow_overage && badge("Overage", "bg-amber-500/15 text-amber-300")}
+              {u.allow_overage && badge("Ovg", "bg-amber-500/15 text-amber-300")}
             </div>
-            <span className="block text-label text-gray-500 truncate">{u.email || "—"}</span>
+            <span className="block text-label text-gray-500 truncate">
+              {u.email && u.email !== u.username ? u.email : `creado ${fmtDate(u.created_at)}`}
+            </span>
           </div>
         </div>
       ),
@@ -205,25 +283,26 @@ export default function GestionView() {
       key: "workspace",
       header: "Workspace",
       render: (u) => (
-        <div className={u.is_active ? "" : "opacity-40"}>
-          <span className="block font-mono text-gray-300">{u.tenant_id || "—"}</span>
-          {u.billing_group && (
-            <span className="block text-label text-gray-500">
-              factura con: <span className="font-mono">{u.billing_group}</span>
-            </span>
-          )}
+        <div className={`min-w-0 ${u.is_active ? "" : "opacity-40"}`}>
+          <span className="block font-mono text-gray-300 truncate">{u.tenant_id || "—"}</span>
+          <span className="block text-label text-gray-500 truncate">
+            {u.billing_group
+              ? <>factura: <span className="font-mono">{u.billing_group}</span></>
+              : `${u.job_count || 0} videos`}
+          </span>
         </div>
       ),
     },
     {
       key: "plan",
       header: "Plan",
+      width: "110px",
       render: (u) => (
         <select
           value={u.plan}
           onClick={(e) => e.stopPropagation()}
           onChange={(e) => changePlan(u.id, e.target.value)}
-          className="bg-surface-3/40 ring-1 ring-white/[0.06] focus:ring-brand/40 focus:outline-none rounded-md px-2 py-1 text-label text-white"
+          className="bg-surface-3/40 ring-1 ring-white/[0.06] focus:ring-brand/40 focus:outline-none rounded-md px-2 py-1 text-label text-white w-full"
         >
           {PLANS.map((p) => (
             <option key={p} value={p}>{p}</option>
@@ -232,66 +311,19 @@ export default function GestionView() {
       ),
     },
     {
-      key: "jobs",
-      header: "Videos",
+      key: "actions",
+      header: "",
+      width: "48px",
       align: "right",
       render: (u) => (
-        <span className={`tabular-nums text-gray-300 ${u.is_active ? "" : "opacity-40"}`}>{u.job_count || 0}</span>
-      ),
-    },
-    {
-      key: "created",
-      header: "Creado",
-      render: (u) => (
-        <span className={`text-gray-500 ${u.is_active ? "" : "opacity-40"}`}>{fmtDate(u.created_at)}</span>
-      ),
-    },
-    {
-      key: "actions",
-      header: "Acciones",
-      render: (u) => (
-        <div className="flex gap-1 flex-wrap">
-          <button
-            onClick={() => setWorkspaceUser(u)}
-            className="text-label px-2 py-1 rounded-md font-medium text-gray-300 hover:bg-white/[0.06] transition-colors duration-brand"
-          >
-            Workspace
-          </button>
-          <button
-            onClick={() => toggleAI(u.id, u.ai_authorized)}
-            className={`text-label px-2 py-1 rounded-md font-medium transition-colors duration-brand ${
-              u.ai_authorized ? "text-amber-400 hover:bg-amber-500/10" : "text-accent hover:bg-accent/10"
-            }`}
-          >
-            {u.ai_authorized ? "Revocar IA" : "Autorizar IA"}
-          </button>
-          <button
-            onClick={() => toggleOverage(u.id, u.allow_overage)}
-            title="Permitir pasar el cap mensual con cargo por video extra"
-            className={`text-label px-2 py-1 rounded-md font-medium transition-colors duration-brand ${
-              u.allow_overage ? "text-amber-400 hover:bg-amber-500/10" : "text-gray-400 hover:bg-white/[0.04]"
-            }`}
-          >
-            {u.allow_overage ? "Frenar overage" : "Permitir overage"}
-          </button>
-          <button
-            onClick={() => toggleActive(u.id, u.is_active)}
-            className={`text-label px-2 py-1 rounded-md font-medium transition-colors duration-brand ${
-              u.is_active ? "text-amber-400 hover:bg-amber-500/10" : "text-accent hover:bg-accent/10"
-            }`}
-          >
-            {u.is_active ? "Desactivar" : "Activar"}
-          </button>
-          {/* Eliminar: solo para no-admins (el backend también lo bloquea) */}
-          {u.role !== "admin" && (
-            <button
-              onClick={() => setDeleteTarget(u)}
-              className="text-label px-2 py-1 rounded-md font-medium text-red-400 hover:bg-red-500/10 transition-colors duration-brand"
-            >
-              Eliminar
-            </button>
-          )}
-        </div>
+        <RowActions
+          user={u}
+          onWorkspace={() => setWorkspaceUser(u)}
+          onToggleAI={() => toggleAI(u.id, u.ai_authorized)}
+          onToggleOverage={() => toggleOverage(u.id, u.allow_overage)}
+          onToggleActive={() => toggleActive(u.id, u.is_active)}
+          onDelete={() => setDeleteTarget(u)}
+        />
       ),
     },
   ];
@@ -311,7 +343,7 @@ export default function GestionView() {
             />
             <button
               onClick={() => setShowCreate(true)}
-              className="px-4 py-2 rounded-button bg-brand text-white text-ui font-medium hover:bg-brand-dark transition-colors duration-brand"
+              className="px-4 py-2 rounded-button bg-brand text-white text-ui font-medium hover:bg-brand-dark transition-colors duration-brand whitespace-nowrap"
             >
               + Nuevo usuario
             </button>
