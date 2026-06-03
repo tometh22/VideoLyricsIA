@@ -9706,12 +9706,47 @@ def run_edit_pipeline(
         # ----------------------------------------------------------------
         mp3_path = os.path.join(job_dir, "source_audio.mp3")
         if not os.path.exists(mp3_path):
-            if input_r2_key and storage.is_enabled():
-                ok = storage.download_object(input_r2_key, mp3_path)
-                if not ok:
-                    raise RuntimeError("Could not download source audio from R2")
-            else:
-                raise RuntimeError("Source audio not available locally and no R2 key")
+            audio_ready = False
+            # 1) Original input MP3 (best quality).
+            if input_r2_key and storage.is_enabled() and storage.object_exists(input_r2_key):
+                if storage.download_object(input_r2_key, mp3_path):
+                    audio_ready = True
+            # 2) Fallback: extract the audio track from a rendered deliverable
+            # (video/short) when the input is missing — recovers re-renders for
+            # jobs whose input was purged before the orphan-only retention fix
+            # (the recurring "audio no disponible" incident, agus.cafisi). The
+            # deliverable's audio is the same recording, just re-encoded.
+            if not audio_ready and storage.is_enabled():
+                for _src in ("video", "short"):
+                    _vk = (prior_s3_keys or {}).get(_src)
+                    if not _vk or not storage.object_exists(_vk):
+                        continue
+                    _tmp_v = os.path.join(job_dir, "fallback_src.mp4")
+                    if not storage.download_object(_vk, _tmp_v):
+                        continue
+                    try:
+                        run_checked(
+                            ["ffmpeg", "-y", "-loglevel", "error", "-i", _tmp_v,
+                             "-vn", "-c:a", "libmp3lame", "-q:a", "4", mp3_path],
+                            label="ffmpeg-extract-audio-from-deliverable",
+                            timeout=300, output_path=mp3_path,
+                        )
+                        logger.info("[EDIT] source audio recovered from %s deliverable "
+                                    "(input missing/purged) for job %s", _src, job_id)
+                        audio_ready = True
+                        break
+                    except Exception as _e:
+                        logger.warning("[EDIT] audio extract from %s failed: %s", _src, _e)
+                    finally:
+                        try:
+                            os.remove(_tmp_v)
+                        except OSError:
+                            pass
+            if not audio_ready:
+                raise RuntimeError(
+                    "Source audio not available: input missing and no recoverable "
+                    "deliverable (video/short) for this job"
+                )
 
         # ----------------------------------------------------------------
         # Resolve background
