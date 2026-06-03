@@ -142,7 +142,7 @@ export default function Dashboard({ user, history, historyError, historyLoaded =
     else navigate("/new");
   };
   const handleUpgrade = () => {
-    navigate("/account");
+    navigate("/account?tab=facturacion");
   };
 
   // 2026-05-27 perf audit (UMG micro-freezes): four `history.filter()`
@@ -548,10 +548,10 @@ export default function Dashboard({ user, history, historyError, historyLoaded =
                     <p className="text-xs text-amber-300/80 mt-0.5">
                       {user?.allow_overage
                         ? `Pasado el tope, cada video adicional cuesta $${usage.overage_cost_per_video} y se factura al cierre.`
-                        : <>Si vas a necesitar más, contactanos antes de llegar al tope:{" "}
-                            <a href="mailto:soporte@genly.pro" className="underline font-medium hover:text-amber-200">
-                              soporte@genly.pro
-                            </a>.</>
+                        : <>{t("billing.nudge_body") || "Mejorá tu plan para no frenarte cuando llegues al tope."}{" "}
+                            <button onClick={handleUpgrade} className="underline font-medium hover:text-amber-200">
+                              {t("billing.nudge_cta") || "Mejorar plan"}
+                            </button></>
                       }
                     </p>
                   </>

@@ -2608,10 +2608,13 @@ def _try_lrclib_search(artist: str, song: str) -> list:
         return []
     import requests as _req
     q = f"{artist} {song}".strip()
-    # lrclib.net hiccups (ReadTimeout/5xx) son transitorios y frecuentes.
-    # Un retry con backoff corto absorbe la mayoría sin colgar el pipeline.
-    # lrclib es best-effort (caemos a Gemini si falla), así que el log es
-    # WARNING — no ERROR — para no inundar Sentry con ruido manejado.
+    # lrclib.net read-timeouts / connection hiccups son transitorios y
+    # frecuentes. El retry sólo cubre EXCEPCIONES de red (ReadTimeout/
+    # ConnectionError); un 5xx devuelve [] sin reintento (no suele recuperarse
+    # en 1.5s y caemos a Gemini igual). Un retry con backoff corto absorbe la
+    # mayoría de los timeouts sin colgar el pipeline. lrclib es best-effort
+    # (caemos a Gemini si falla), así que el log es WARNING — no ERROR — para
+    # no inundar Sentry con ruido manejado.
     last_err = None
     for _attempt in range(2):
         try:
@@ -6755,6 +6758,17 @@ def _ensure_background(style_hint: str, job_dir: str, lyrics_text: str = None,
 
     bg_path = os.path.join(job_dir, "bg_generated.mp4")
     import time as _time_bg
+    # RQ's job_timeout (BG_PREVIEW_JOB_TIMEOUT, 900s) fires as a SIGALRM that
+    # raises JobTimeoutException — which subclasses Exception, so the generic
+    # `except Exception` below would swallow it and mask a real timeout as a
+    # "successful" gradient job, deleting the exact telemetry we want in Sentry.
+    # Catch it specifically and re-raise so the job is marked failed + stays
+    # visible. Empty-tuple fallback keeps the clause a harmless no-op if rq
+    # isn't importable (local/CI), where the death penalty never fires anyway.
+    try:
+        from rq.timeouts import JobTimeoutException as _JobTimeoutException
+    except Exception:
+        _JobTimeoutException = ()
     quality_retry_used = False
     # 1 retry interno (2 intentos). Antes eran 3, lo que sumado al
     # poll_deadline de 600s de Veo podía exceder cualquier job_timeout
@@ -6809,6 +6823,10 @@ def _ensure_background(style_hint: str, job_dir: str, lyrics_text: str = None,
             if score < 7:
                 logger.warning("[BG] Score %s < 7 after retry — accepting best available result", score)
             return bg_path
+        except _JobTimeoutException:
+            # Real RQ death-penalty timeout — propagate (don't degrade to
+            # gradient + swallow). Keeps the JobTimeoutException visible.
+            raise
         except Exception as e:
             logger.error("[BG] Veo 3 attempt %s/2 failed: %s", attempt + 1, e)
             if attempt < 1:
