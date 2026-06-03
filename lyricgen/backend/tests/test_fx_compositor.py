@@ -81,3 +81,34 @@ def test_fontsdir_path_is_escaped():
     )
     # the ':' in the path must be backslash-escaped inside the filtergraph
     assert "fontsdir=/tmp/my fonts\\:weird[out]" in fc
+
+
+# --- per-effect pre-blend gain (matrix test 2026-06-02) ----------------------
+# Sparse/dim effects were imperceptible through the screen-blend on busy
+# photos; they get an `eq` boost BEFORE format=gbrp. rain/light stay untouched.
+
+def test_fx_gain_known_values():
+    assert fx.fx_gain("stars").startswith("eq=contrast=2.0")
+    assert fx.fx_gain("snow").startswith("eq=")
+    assert fx.fx_gain("bokeh").startswith("curves=")  # mid-tone circles → curve
+    assert fx.fx_gain("rain") == ""
+    assert fx.fx_gain("light") == ""
+    assert fx.fx_gain("") == ""
+    assert fx.fx_gain("  STARS ").startswith("eq=")  # case/space tolerant
+
+
+def test_dim_effect_inserts_gain_before_gbrp():
+    fc, _, _ = fx.build_video_filter(
+        ass_basename="l.ass", font_dir="/tmp/f",
+        width=1080, height=1920, effect="stars", style="",
+    )
+    gain = fx.fx_gain("stars")
+    assert f"setpts=PTS-STARTPTS,{gain},format=gbrp[fx]" in fc
+
+
+def test_bright_effect_has_no_gain_step():
+    fc, _, _ = fx.build_video_filter(
+        ass_basename="l.ass", font_dir="/tmp/f",
+        width=1080, height=1920, effect="rain", style="",
+    )
+    assert "setpts=PTS-STARTPTS,format=gbrp[fx]" in fc  # no eq between them
