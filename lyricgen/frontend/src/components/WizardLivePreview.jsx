@@ -501,7 +501,22 @@ export default function WizardLivePreview({
           key={`fx-${effect}`}
           src={`/fx_raw/${effect}.mp4`}
           className="absolute inset-0 w-full h-full object-cover pointer-events-none"
-          style={{ mixBlendMode: "screen" }}
+          style={{
+            mixBlendMode: "screen",
+            // Mirror the backend _FX_GAIN perceptually. The raw loops are
+            // screen-blended; mid-tone particles (esp. bokeh ~0.28 luma) wash
+            // out on bright/candle-lit scenes with no gain, so the preview
+            // showed "nothing" while the badge claimed the effect was on.
+            // Boost brightness/contrast in CSS so the preview reads like the
+            // render (bokeh hardest; bright-point effects need less).
+            filter: {
+              bokeh: "brightness(1.6) contrast(1.15)",
+              stars: "brightness(1.25) contrast(1.1)",
+              snow: "brightness(1.15)",
+              rain: "brightness(1.1)",
+              light: "brightness(1.1)",
+            }[effect] || "none",
+          }}
           autoPlay loop muted playsInline
         />
       ) : null}
@@ -605,7 +620,7 @@ export default function WizardLivePreview({
               background: isMinimal ? "rgba(0,0,0,.06)" : "rgba(255,255,255,.10)",
             }}
           >
-            {(t("upload.preview_motion") || "Movimiento")}: {moveLabel}{effectLabel ? ` · ${t("upload.effect_label") || "Efecto"}: ${effectLabel}` : ""}
+            {(t("upload.preview_motion") || "Movimiento")}: {moveLabel}{effectLabel ? ` · ${t("upload.effect_label") || "Efecto:"} ${effectLabel}` : ""}
           </span>
         </div>
       )}
