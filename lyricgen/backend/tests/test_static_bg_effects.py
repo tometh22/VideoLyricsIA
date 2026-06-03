@@ -98,14 +98,19 @@ def test_each_effect_asset_exists_and_composites(tmp_path, effect):
 
     comp = tmp_path / f"comp_{effect}.mp4"
     # The core of build_video_filter's effect branch: screen-blend the looped
-    # fx over the bg (the lyrics subtitles step is exercised separately).
+    # fx over the bg (the lyrics subtitles step is exercised separately). Pull
+    # the SAME per-effect pre-blend gain build_video_filter uses, so this also
+    # proves every gain string (incl. bokeh's `curves` with quoted points)
+    # composites under real ffmpeg.
+    gain = fx.fx_gain(effect)
+    gain_step = f"{gain}," if gain else ""
     cmd = [
         "ffmpeg", "-y", "-loglevel", "error",
         "-i", str(bg),
         "-stream_loop", "-1", "-i", p,
         "-filter_complex",
         "[0:v]format=gbrp[b];"
-        "[1:v]scale=1920:1080,setpts=PTS-STARTPTS,format=gbrp[f];"
+        f"[1:v]scale=1920:1080,setpts=PTS-STARTPTS,{gain_step}format=gbrp[f];"
         "[b][f]blend=all_mode=screen:shortest=1,format=yuv420p[o]",
         "-map", "[o]", "-t", "2", "-c:v", "libx264", "-preset", "ultrafast",
         str(comp),
