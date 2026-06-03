@@ -6517,6 +6517,31 @@ def _score_video_relevance(video_path: str, prompt: str) -> int:
                 pass
 
 
+def _darken_prompt_for_effect(prompt: str, effect: str) -> str:
+    """Bias an Imagen scene prompt toward a LOW-KEY / dark canvas when a
+    luminous particle effect (stars / bokeh / snow / light / ...) will be
+    screen-blended on top, so the particles actually read.
+
+    Matrix test 2026-06-02: the per-effect pre-blend gain (fx_compositor)
+    helps, but a bright AI background still drowns sparse effects — stars over
+    a sunlit sky vanish. This gives them a dark canvas. Phrased as a
+    grading / mood instruction (NOT "night" / "urban", which the scene guard
+    forbids as a cliché): keep the subject and setting, only grade it darker.
+    No-op for effect="" / "none" / unknown.
+    """
+    import fx_compositor as _fxc
+    if not effect or effect.strip().lower() not in _fxc.EFFECTS:
+        return prompt
+    return (
+        prompt.rstrip()
+        + " The scene will receive a luminous atmospheric particle overlay, so"
+        " render it LOW-KEY and moody: rich deep shadows, dark saturated tones,"
+        " restrained lighting, and minimal large bright or blown-out areas —"
+        " leave dark negative space for the particles to glow against. Keep the"
+        " same subject and setting; only grade it darker and moodier."
+    )
+
+
 def _ensure_background(style_hint: str, job_dir: str, lyrics_text: str = None,
                        artist: str = "", job_id: str = None,
                        song_title: str = "", genre: str = "",
@@ -6632,7 +6657,11 @@ def _ensure_background(style_hint: str, job_dir: str, lyrics_text: str = None,
             palette_style=style_hint, custom_colors=custom_colors,
             allow_people=allow_people,
         )
-        prompt = result["prompt"]
+        # Foto fija + efectos (2026-06-03): if the operator picked a luminous
+        # particle effect, bias the still toward a dark/low-key canvas so the
+        # screen-blended particles read (per-effect gain alone loses to bright
+        # backgrounds). No-op when no effect is selected.
+        prompt = _darken_prompt_for_effect(result["prompt"], effect)
         image_path = os.path.join(job_dir, "bg_imagen.jpg")
         bg_path = os.path.join(job_dir, "bg_generated.mp4")
         # A1 (2026-05-25) — foto-parallax es el único register que el
