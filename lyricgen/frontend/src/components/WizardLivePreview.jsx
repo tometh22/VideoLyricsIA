@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import { useI18n } from "../i18n";
+import { REF_W, tierForLength, fontSizeFactor } from "../lib/lyricTiers";
 
 // Studio Console live preview. Shows a sample lyric line over the selected
 // palette/mood with the selected camera movement applied as a real CSS
@@ -235,7 +236,16 @@ export default function WizardLivePreview({
   // - contrastStyle: outline + shadow del CONTRAST_STYLES.
   const fontInfo = FONT_BY_CODE[font] || FONT_BY_CODE[""];
   const scaleN = Math.max(0.6, Math.min(1.5, parseFloat(fontScale) || 1));
-  const baseFontSize = `clamp(${Math.round(18 * scaleN)}px, ${(7.5 * scaleN).toFixed(2)}cqw, ${Math.round(68 * scaleN)}px)`;
+  // WYSIWYG font size (2026-06-04): mirror the render's lyric_fontsize EXACTLY
+  // instead of a fixed 7.5cqw (which previewed ~1.5× too big and ignored line
+  // length). Render = tier-by-character-count (ass_render.lyric_fontsize) ×
+  // font_scale × per-font factor, in PlayResY=1080 → cqw = fontPx / REF_W × 100
+  // (fraction of the 1920-wide frame, matching LyricVideoPreview). Length comes
+  // from the actual displayed text — the live line if playing, else the sample.
+  const _dispText = (livePlaybackTick && livePlaybackTick.activeLine)
+    ? applyCase(livePlaybackTick.activeLine, textCase)
+    : sample;
+  const baseFontSize = `${((tierForLength(_dispText.length).fontPx / REF_W) * 100 * scaleN * fontSizeFactor(font)).toFixed(3)}cqw`;
   const contrastStyle = CONTRAST_STYLES[textContrast] || CONTRAST_STYLES.medium;
   const moveLabel = {
     "": t("upload.movement_auto") || "Auto",

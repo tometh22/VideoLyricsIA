@@ -13,7 +13,7 @@
  * (onLayoutChange → setEdited) — this component owns no persistence.
  */
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { REF_W, tierForLength, clampFontScale } from "../lib/lyricTiers";
+import { REF_W, tierForLength, clampFontScale, fontSizeFactor } from "../lib/lyricTiers";
 
 // Font fidelity: the render (ass_render.lyric_fontsize + pipeline wrap tiers)
 // sizes each line by CHARACTER COUNT and wraps it at a tier-specific width,
@@ -226,7 +226,7 @@ export default function LyricVideoPreview({
   const tier = tierForLength(displayText.length);
   // Render size = tier × per-line scale × global font_scale (clamped like the
   // backend), as a fraction of the 1920 frame width → cqw.
-  const fsPx = l ? `${(tier.fontPx / REF_W) * 100 * l.scale * clampFontScale(fontScale)}cqw` : undefined;
+  const fsPx = l ? `${(tier.fontPx / REF_W) * 100 * l.scale * clampFontScale(fontScale) * fontSizeFactor(font)}cqw` : undefined;
   const wrapMaxCqw = `${(tier.wrapPx / REF_W) * 100}cqw`;
 
   // Fade-in/out opacity so the chosen transition is visible while scrubbing
