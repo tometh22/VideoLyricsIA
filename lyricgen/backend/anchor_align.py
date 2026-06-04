@@ -54,8 +54,27 @@ def _onset_enabled() -> bool:
 # Validation thresholds (tuned on the 12-song lab set; see module docstring).
 _MIN_FRAC_IN_VOICE = 0.70      # ≥70% of lines must land where the stem has voice
 _VOICE_PAD_S = 1.2            # a line counts as "in voice" within this slack
-_MAX_OFFSET_S = 60.0         # sanity cap on the global anchor offset
+_MAX_OFFSET_S = 90.0         # sanity cap on the global anchor offset (raised
+                             # from 60: live/extended recordings legitimately
+                             # need a larger shift — Coti "Nada Fue Un Error
+                             # (en vivo)" needs ~+30s but whisperX first-word
+                             # anchored it to +75s)
 _UNDERCOVER_GAP_S = 30.0     # last line >this before last vocal ⇒ short/foreign
+# Offset refinement (2026-06-03): a single global offset anchored to whisperX's
+# first sung word can lock onto a WRONG shift that still scores high
+# frac_in_voice on a live/dense recording (whisperX misses the early vocals →
+# anchors the block too LATE). When we have a VAD signal we re-search the global
+# shift and, among the near-best-scoring offsets, keep the EARLIEST line-1 — the
+# first verse must land on the first real singing, not a later chorus. Proven on
+# Coti "Nada Fue Un Error (en vivo)": +75.5s (whisperX) scored 0.96 but the
+# correct +~30s scores 0.98; the search picks the early, higher one.
+_OFFSET_SEARCH_STEP_S = 0.5   # scan resolution
+_OFFSET_SEARCH_MARGIN = 0.01  # only override the base offset if the search beats
+                              # it by this much frac_in_voice (studio songs, where
+                              # the legacy anchor is already optimal, are untouched).
+                              # Kept small because the wrong-but-plausible live
+                              # offset can score within ~0.02 of the correct one.
+_OFFSET_NEAR_TOL = 0.03       # offsets within this of the max count as "near-best"
 
 
 def vocal_regions(
@@ -307,6 +326,31 @@ def build_synced_scaffold(
     a, b, n_anchors = _fit_alignment(pairs, wx_segs)
     meta["align"] = {"a": round(a, 4), "b": round(b, 2), "anchors": n_anchors}
     meta["offset"] = round(b, 2)
+
+    # Voice-validated offset re-search. Only for single global offsets (a≈1):
+    # the multi-anchor linear fit (a≠1) already corrects drift and must NOT be
+    # overridden. The first-word anchor can lock onto a wrong-but-high-scoring
+    # shift on live/dense recordings; re-search and keep the EARLIEST line-1
+    # among the near-best offsets. Studio songs (legacy anchor already optimal)
+    # don't clear the margin, so they're untouched.
+    if vocal_regions and abs(a - 1.0) < 1e-6 and len(vocal_regions) >= 2 and pairs:
+        def _frac_for(off):
+            return sum(1 for (t, _t) in pairs
+                       if _in_voice(max(0.0, t + off), vocal_regions)) / len(pairs)
+        base_frac = _frac_for(b)
+        scan, o = [], -_MAX_OFFSET_S
+        while o <= _MAX_OFFSET_S:
+            scan.append((round(o, 2), _frac_for(o)))
+            o += _OFFSET_SEARCH_STEP_S
+        max_frac = max(f for _o, f in scan)
+        if max_frac > base_frac + _OFFSET_SEARCH_MARGIN:
+            best = min(off for off, f in scan if f >= max_frac - _OFFSET_NEAR_TOL)
+            meta["offset_refined"] = {
+                "from": round(b, 2), "to": best,
+                "base_frac": round(base_frac, 3), "new_frac": round(_frac_for(best), 3),
+            }
+            b = best
+            meta["offset"] = round(b, 2)
 
     def _map(t):
         return a * t + b
