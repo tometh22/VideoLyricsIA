@@ -2620,12 +2620,23 @@ export default function App() {
       }
     }
 
+    // 2026-06-04 — settings-loss fix: currentReview puede no tener los picks
+    // del operador (movement/effect/bg/typo) si el sync file→review no corrió
+    // para esta canción (p.ej. los eligió después del transcribe, o subió la
+    // canción heredando batchDefaults que nunca llegaron a currentReview). El
+    // FILE entry SIEMPRE refleja los batch picks vigentes (updateBatchDefault
+    // fanea a files[*]), así que caemos a él cuando currentReview viene vacío.
+    // Bug UMG: eligió Foto fija + Bokeh pero el render salió con
+    // movement_style='' + effect='' → fondo de VIDEO en vez de foto + sin
+    // efecto. Cubre TODOS los efectos (mismo campo) y TODOS los movement styles.
+    const _fm = files.find((f) => f?.file?.name === r.file?.name) || {};
+    const _rf = (k) => r[k] || _fm[k] || "";
     const newApproved = [...approvedJobs, {
       file: r.file, artist: r.artist, language: r.language,
       songTitle: r.songTitle || "",
-      genre: r.genre || "", font: r.font || "", concept: r.concept || "",
-      movementStyle: r.movementStyle || "", effect: r.effect || "",
-      backgroundHint: r.backgroundHint || "", bgVerbatim: !!r.bgVerbatim,
+      genre: _rf("genre"), font: _rf("font"), concept: _rf("concept"),
+      movementStyle: _rf("movementStyle"), effect: _rf("effect"),
+      backgroundHint: _rf("backgroundHint"), bgVerbatim: !!r.bgVerbatim,
       textCase: r.textCase || "upper",
       fontScale: r.fontScale || "1.0",
       // lyricTransition + textMotion: deprecados 2026-05-23.
