@@ -29,7 +29,21 @@ import os
 
 logger = logging.getLogger("genly.fx_compositor")
 
-_FX_DIR = os.path.join(os.path.dirname(__file__), "..", "assets", "fx")
+# Pre-baked effect loops. They MUST ship inside this module's own package
+# (lyricgen/backend/assets/fx) so they land in the Docker build context — the
+# image is built from lyricgen/backend/ (`COPY . .`), exactly like fonts/ live
+# in backend/fonts/. The legacy repo location (lyricgen/assets/fx, a SIBLING of
+# backend/) is kept ONLY as a local-dev fallback: it sits OUTSIDE the build
+# context, so it never made it into the image and EVERY effect silently no-op'd
+# in prod until 2026-06-04. Mirror of _FONTS_DIR's candidate resolution.
+_FX_DIR_CANDIDATES = [
+    os.path.join(os.path.dirname(__file__), "assets", "fx"),        # shipped (in-image)
+    os.path.join(os.path.dirname(__file__), "..", "assets", "fx"),  # legacy repo/local
+]
+_FX_DIR = next(
+    (p for p in _FX_DIR_CANDIDATES if os.path.isdir(p)),
+    _FX_DIR_CANDIDATES[0],
+)
 
 # Available pre-baked effect loops (must match scripts/gen_fx_loops.py).
 # 2026-05-25: "aurora" agregado para cubrir el estilo UMG observado en

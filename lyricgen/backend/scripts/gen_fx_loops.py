@@ -32,7 +32,11 @@ from moviepy.editor import VideoClip
 W, H = 1920, 1080
 FPS = 24
 DUR = 8.0
-OUT = os.path.join(os.path.dirname(__file__), "..", "..", "assets", "fx")
+# Write into the backend package (lyricgen/backend/assets/fx) so the loops ship
+# inside the Docker build context — matches fx_compositor._FX_DIR. (Moved here
+# 2026-06-04 from the repo-level lyricgen/assets/fx, which was outside the
+# backend build context and never reached the image.)
+OUT = os.path.join(os.path.dirname(__file__), "..", "assets", "fx")
 
 _RNG = np.random.default_rng(7)  # deterministic across runs
 
