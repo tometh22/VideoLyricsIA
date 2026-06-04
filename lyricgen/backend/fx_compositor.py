@@ -100,10 +100,12 @@ def effect_path(effect: str) -> str | None:
 #   - bokeh circles are MID-tone (~0.28), which an `eq` contrast would push
 #     DOWN. A `curves` that lifts the 0.28 knee while pinning the low end keeps
 #     the black clean and brightens the circles (67→149 over the test bg).
-# rain / light already read fine → no gain. aurora is a broad diffuse glow that
-# no tested gain improved cleanly → left untouched. Applied identically in the
-# main libass path (build_video_filter) and the short post-pass
-# (_apply_short_effect) so the effect looks the same in both.
+#   - rain / light / aurora are dim mid-tone shapes (thin streaks / diffuse
+#     glow) that an `eq` contrast would also crush → `curves` that lift their
+#     band (see per-entry notes below). Boosted 2026-06-04 once the assets
+#     finally reached the render. Applied identically in the main libass path
+# (build_video_filter) and the short post-pass (_apply_short_effect) so the
+# effect looks the same in both.
 _FX_GAIN = {
     "stars": "eq=contrast=2.0:brightness=-0.02",
     "snow": "eq=contrast=1.35",
@@ -117,6 +119,25 @@ _FX_GAIN = {
     # washed — a screen-blend math limit, not the curve; needs a brightness-
     # adaptive blend (follow-up), but the render darkens backgrounds anyway.
     "bokeh": "curves=all='0/0 0.07/0.02 0.16/0.85 0.28/1 1/1'",
+    # 2026-06-04: rain / light / aurora boosted (operator: "boostea los 3").
+    # These previously had NO gain ("read fine"), but once the assets actually
+    # reached the render (see fx_compositor._FX_DIR fix) they were noticeably
+    # subtle vs bokeh/snow. Tuned by local compositing over a dusk bg + luma
+    # measurement, same method as bokeh:
+    #   - rain: thin bright streaks (raw YMAX ~200) but many mid-tone ones an
+    #     `eq` contrast would CRUSH (pivot 0.5 pushes <0.5 down → tested:
+    #     composite YMAX 139→129, worse). A `curves` that LIFTS the streak
+    #     band (0.3→0.65, 0.6→1) while pinning the near-black bg low brings
+    #     composite YMAX 139→229 with YAVG unchanged (bg stays dark).
+    #   - light / aurora: a broad diffuse glow capped at ~0.31 luma (raw YMAX
+    #     79). A contrast boost just dims it (all below the 0.5 pivot). A
+    #     `curves` lifting the glow band (0.2→0.55, 0.31→0.92) brightens the
+    #     glow while keeping the floor dark. NOTE: aurora.mp4 is still a
+    #     placeholder copy of light.mp4 (identical luma stats) — same gain;
+    #     a distinct aurora loop is a separate follow-up.
+    "rain": "curves=all='0/0 0.1/0.03 0.3/0.65 0.6/1 1/1'",
+    "light": "curves=all='0/0 0.06/0.015 0.2/0.55 0.31/0.92 1/1'",
+    "aurora": "curves=all='0/0 0.06/0.015 0.2/0.55 0.31/0.92 1/1'",
 }
 
 
