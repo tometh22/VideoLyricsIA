@@ -1161,6 +1161,17 @@ export default function App() {
     });
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [files, currentReview?.file?.name]);
+
+  // 2026-06-04 — stale-preview fix: limpiar el tick de playback en vivo cuando
+  // cambia la canción previsualizada (nuevo upload o cambio de review). El ref
+  // persiste mientras App está montada, así que sin este reset la última línea
+  // reproducida de la canción ANTERIOR seguía mostrándose en el preview de la
+  // nueva. Bug: terminé "Me Gustas" → subí "Nada" → el preview mostraba "será
+  // que me gustas tanto" bajo "Línea actual: Nada". El reset deja que el
+  // preview caiga al sample hasta que el operador reproduzca la nueva canción.
+  useEffect(() => {
+    playbackTickRef.current = { activeLine: "", activeStart: 0, activeEnd: 0, currentTime: 0 };
+  }, [currentReview?.file?.name, files[0]?.file?.name]);
   // Capa B 2026-05-24 — wizardStage es la única fuente de verdad de qué muestra
   // el wizard. Reemplaza el `navigate("/review")` que disparaba el flash a
   // dashboard. URL se queda en /new mientras el operador transita upload →
