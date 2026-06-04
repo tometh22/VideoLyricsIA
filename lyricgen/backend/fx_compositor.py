@@ -24,9 +24,26 @@ This module is intentionally a leaf (no pipeline import) so it stays unit-
 testable without moviepy/ffmpeg. The caller (pipeline) splices the returned
 filter + extra inputs into its ffmpeg command.
 """
+import logging
 import os
 
-_FX_DIR = os.path.join(os.path.dirname(__file__), "..", "assets", "fx")
+logger = logging.getLogger("genly.fx_compositor")
+
+# Pre-baked effect loops. They MUST ship inside this module's own package
+# (lyricgen/backend/assets/fx) so they land in the Docker build context — the
+# image is built from lyricgen/backend/ (`COPY . .`), exactly like fonts/ live
+# in backend/fonts/. The legacy repo location (lyricgen/assets/fx, a SIBLING of
+# backend/) is kept ONLY as a local-dev fallback: it sits OUTSIDE the build
+# context, so it never made it into the image and EVERY effect silently no-op'd
+# in prod until 2026-06-04. Mirror of _FONTS_DIR's candidate resolution.
+_FX_DIR_CANDIDATES = [
+    os.path.join(os.path.dirname(__file__), "assets", "fx"),        # shipped (in-image)
+    os.path.join(os.path.dirname(__file__), "..", "assets", "fx"),  # legacy repo/local
+]
+_FX_DIR = next(
+    (p for p in _FX_DIR_CANDIDATES if os.path.isdir(p)),
+    _FX_DIR_CANDIDATES[0],
+)
 
 # Available pre-baked effect loops (must match scripts/gen_fx_loops.py).
 # 2026-05-25: "aurora" agregado para cubrir el estilo UMG observado en
@@ -53,7 +70,22 @@ def effect_path(effect: str) -> str | None:
     if name not in EFFECTS:
         return None
     p = os.path.abspath(os.path.join(_FX_DIR, f"{name}.mp4"))
-    return p if os.path.exists(p) else None
+    if not os.path.exists(p):
+        # A KNOWN effect was requested but its baked overlay is absent on disk.
+        # This silently dropped EVERY effect in prod until 2026-06-04 — the
+        # Docker image didn't COPY assets/ (assets/fx lives outside backend/),
+        # so effect_path() returned None and build_video_filter took the
+        # no-effect path. The job still "succeeded" with no overlay. Log loudly
+        # so a missing / mis-deployed asset surfaces in the worker logs instead
+        # of being an invisible no-op.
+        logger.warning(
+            "[FX] effect '%s' requested but overlay asset is MISSING at %s — "
+            "the effect will be SKIPPED in this render. Verify lyricgen/assets/fx "
+            "is present in the deployed image (Dockerfile COPY assets/).",
+            name, p,
+        )
+        return None
+    return p
 
 
 # Per-effect pre-blend gain. Sparse / dim effects barely register through the
@@ -68,14 +100,44 @@ def effect_path(effect: str) -> str | None:
 #   - bokeh circles are MID-tone (~0.28), which an `eq` contrast would push
 #     DOWN. A `curves` that lifts the 0.28 knee while pinning the low end keeps
 #     the black clean and brightens the circles (67→149 over the test bg).
-# rain / light already read fine → no gain. aurora is a broad diffuse glow that
-# no tested gain improved cleanly → left untouched. Applied identically in the
-# main libass path (build_video_filter) and the short post-pass
-# (_apply_short_effect) so the effect looks the same in both.
+#   - rain / light / aurora are dim mid-tone shapes (thin streaks / diffuse
+#     glow) that an `eq` contrast would also crush → `curves` that lift their
+#     band (see per-entry notes below). Boosted 2026-06-04 once the assets
+#     finally reached the render. Applied identically in the main libass path
+# (build_video_filter) and the short post-pass (_apply_short_effect) so the
+# effect looks the same in both.
 _FX_GAIN = {
     "stars": "eq=contrast=2.0:brightness=-0.02",
     "snow": "eq=contrast=1.35",
-    "bokeh": "curves=all='0/0 0.1/0.04 0.28/0.62 0.55/0.9 1/1'",
+    # 2026-06-04: stronger lift. The bokeh loop is very dim (mean ~7% luma) so
+    # the previous mid-tone curve barely registered through the screen-blend
+    # over busy/dark photos (operator: "el bokeh no salió en el render").
+    # Local compositing test on dark/busy/light backgrounds: pushing the
+    # circles' mid-tones (0.16-0.28) to near-white (0.85-1.0) while keeping the
+    # near-black loop background black makes them POP on dark+busy (dark bg luma
+    # 27→40 vs 27→31 before) without blowing highlights. Light backgrounds stay
+    # washed — a screen-blend math limit, not the curve; needs a brightness-
+    # adaptive blend (follow-up), but the render darkens backgrounds anyway.
+    "bokeh": "curves=all='0/0 0.07/0.02 0.16/0.85 0.28/1 1/1'",
+    # 2026-06-04: rain / light / aurora boosted (operator: "boostea los 3").
+    # These previously had NO gain ("read fine"), but once the assets actually
+    # reached the render (see fx_compositor._FX_DIR fix) they were noticeably
+    # subtle vs bokeh/snow. Tuned by local compositing over a dusk bg + luma
+    # measurement, same method as bokeh:
+    #   - rain: thin bright streaks (raw YMAX ~200) but many mid-tone ones an
+    #     `eq` contrast would CRUSH (pivot 0.5 pushes <0.5 down → tested:
+    #     composite YMAX 139→129, worse). A `curves` that LIFTS the streak
+    #     band (0.3→0.65, 0.6→1) while pinning the near-black bg low brings
+    #     composite YMAX 139→229 with YAVG unchanged (bg stays dark).
+    #   - light / aurora: a broad diffuse glow capped at ~0.31 luma (raw YMAX
+    #     79). A contrast boost just dims it (all below the 0.5 pivot). A
+    #     `curves` lifting the glow band (0.2→0.55, 0.31→0.92) brightens the
+    #     glow while keeping the floor dark. NOTE: aurora.mp4 is still a
+    #     placeholder copy of light.mp4 (identical luma stats) — same gain;
+    #     a distinct aurora loop is a separate follow-up.
+    "rain": "curves=all='0/0 0.1/0.03 0.3/0.65 0.6/1 1/1'",
+    "light": "curves=all='0/0 0.06/0.015 0.2/0.55 0.31/0.92 1/1'",
+    "aurora": "curves=all='0/0 0.06/0.015 0.2/0.55 0.31/0.92 1/1'",
 }
 
 
