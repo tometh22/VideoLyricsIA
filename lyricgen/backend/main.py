@@ -4319,10 +4319,30 @@ async def _run_transcription_for_job(
                         float(_audio_dur_for_lrc), float(_lrc_dur),
                         float(_audio_dur_for_lrc) - float(_lrc_dur),
                     )
+                # Phase 2 (WHISPERX_NO_HINT_ALWAYS, default off): drop the lrclib
+                # hint for EVERY song, not just divergent lives. The hint
+                # (initial_prompt) scrambles whisperX whenever lrclib diverges from
+                # the audio — which happens on some STUDIO recordings too (lab: "Me
+                # Gustas Mucho", "De A Ratitos" started mid-song WITH the hint, clean
+                # WITHOUT it). Clean (no-hint) whisperX gives Rotor-level timing, then
+                # the reconcile step below restores lrclib's correct text over that
+                # timing ("lrclib's clean text = best of both" — whisperx_reconcile
+                # docstring), which ALSO repairs rare-word mishears for free
+                # (Legalícenla: clean wx hears "Le realicen la" → reconcile emits the
+                # canonical "Legalícenla", beating Rotor's own blind "Legaliza en la").
+                # Non-divergent songs keep going through reconcile/cascade; only the
+                # divergent-live raw emit above is gated on _live_no_hint.
+                _no_hint_always = (
+                    os.environ.get("WHISPERX_NO_HINT_ALWAYS", "0").strip().lower()
+                    in ("1", "true", "yes", "on")
+                )
+                _drop_hint = _live_no_hint or _no_hint_always
+                if _no_hint_always and not _live_no_hint:
+                    logger.info("[WC] WHISPERX_NO_HINT_ALWAYS — clean whisperX, reconcile restores canonical text")
                 try:
                     _wx_segs = await asyncio.to_thread(
                         _wx_mod.transcribe_whisperx, _aa, lang,
-                        None if _live_no_hint else (_canonical or None),
+                        None if _drop_hint else (_canonical or None),
                     )
                 except Exception as e:
                     logger.warning("[WC] whisperX raised: %s — falling through to legacy", e)
