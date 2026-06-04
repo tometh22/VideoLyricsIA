@@ -75,7 +75,16 @@ def effect_path(effect: str) -> str | None:
 _FX_GAIN = {
     "stars": "eq=contrast=2.0:brightness=-0.02",
     "snow": "eq=contrast=1.35",
-    "bokeh": "curves=all='0/0 0.1/0.04 0.28/0.62 0.55/0.9 1/1'",
+    # 2026-06-04: stronger lift. The bokeh loop is very dim (mean ~7% luma) so
+    # the previous mid-tone curve barely registered through the screen-blend
+    # over busy/dark photos (operator: "el bokeh no salió en el render").
+    # Local compositing test on dark/busy/light backgrounds: pushing the
+    # circles' mid-tones (0.16-0.28) to near-white (0.85-1.0) while keeping the
+    # near-black loop background black makes them POP on dark+busy (dark bg luma
+    # 27→40 vs 27→31 before) without blowing highlights. Light backgrounds stay
+    # washed — a screen-blend math limit, not the curve; needs a brightness-
+    # adaptive blend (follow-up), but the render darkens backgrounds anyway.
+    "bokeh": "curves=all='0/0 0.07/0.02 0.16/0.85 0.28/1 1/1'",
 }
 
 
