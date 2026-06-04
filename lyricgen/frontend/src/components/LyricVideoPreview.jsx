@@ -47,8 +47,11 @@ function applyCase(text, code) {
 // Outline/shadow per contrast level (approximates the render look).
 const CONTRAST_STYLES = {
   subtle: { WebkitTextStroke: "0px", textShadow: "0 1px 5px rgba(0,0,0,.55)" },
-  medium: { WebkitTextStroke: "1px rgba(0,0,0,.55)", textShadow: "0 2px 0 #000, 0 0 18px rgba(0,0,0,.6)" },
-  strong: { WebkitTextStroke: "1.5px #000", textShadow: "0 0 6px rgba(0,0,0,1), -1px -1px 0 #000, 1px 1px 0 #000, 0 2px 0 #000" },
+  // 2026-06-04: dropped the wide radial glow (see WizardLivePreview.CONTRAST_STYLES)
+  // — on 2-line all-caps it merged into a dark "recuadro" behind the lyrics, a
+  // preview-only artifact the libass render never showed. Crisp outline kept.
+  medium: { WebkitTextStroke: "1px rgba(0,0,0,.55)", textShadow: "0 2px 0 #000, 0 0 3px rgba(0,0,0,.5)" },
+  strong: { WebkitTextStroke: "1.5px #000", textShadow: "-1px -1px 0 #000, 1px 1px 0 #000, 0 2px 0 #000" },
 };
 
 // Fade duration per transition (seconds), mirroring ass_render.fade_seconds.

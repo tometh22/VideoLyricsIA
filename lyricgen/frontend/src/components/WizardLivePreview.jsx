@@ -68,8 +68,13 @@ function applyCase(text, c) {
 // reads consistent with what the operator will see in the editor.
 const CONTRAST_STYLES = {
   subtle: { WebkitTextStroke: "0px",                 textShadow: "0 1px 5px rgba(0,0,0,.55)" },
-  medium: { WebkitTextStroke: "1px rgba(0,0,0,.55)", textShadow: "0 2px 0 #000, 0 0 18px rgba(0,0,0,.6)" },
-  strong: { WebkitTextStroke: "1.5px #000",          textShadow: "0 0 6px rgba(0,0,0,1), -1px -1px 0 #000, 1px 1px 0 #000, 0 2px 0 #000" },
+  // 2026-06-04: dropped the wide radial glow (medium `0 0 18px`, strong `0 0 6px`
+  // full-black). On 2-line all-caps text the per-glyph glows merged into a dark
+  // cloud that read as a "recuadro" behind the lyrics — a preview-only artifact
+  // (libass uses a crisp outline + drop shadow, no wide glow, so the rendered
+  // video never showed it). Keep the crisp outline + stroke for legibility.
+  medium: { WebkitTextStroke: "1px rgba(0,0,0,.55)", textShadow: "0 2px 0 #000, 0 0 3px rgba(0,0,0,.5)" },
+  strong: { WebkitTextStroke: "1.5px #000",          textShadow: "-1px -1px 0 #000, 1px 1px 0 #000, 0 2px 0 #000" },
 };
 
 // Convert #RRGGBB → rgba(r,g,b,a). Returns null if hex is malformed —
