@@ -1161,6 +1161,17 @@ export default function App() {
     });
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [files, currentReview?.file?.name]);
+
+  // 2026-06-04 — stale-preview fix: limpiar el tick de playback en vivo cuando
+  // cambia la canción previsualizada (nuevo upload o cambio de review). El ref
+  // persiste mientras App está montada, así que sin este reset la última línea
+  // reproducida de la canción ANTERIOR seguía mostrándose en el preview de la
+  // nueva. Bug: terminé "Me Gustas" → subí "Nada" → el preview mostraba "será
+  // que me gustas tanto" bajo "Línea actual: Nada". El reset deja que el
+  // preview caiga al sample hasta que el operador reproduzca la nueva canción.
+  useEffect(() => {
+    playbackTickRef.current = { activeLine: "", activeStart: 0, activeEnd: 0, currentTime: 0 };
+  }, [currentReview?.file?.name, files[0]?.file?.name]);
   // Capa B 2026-05-24 — wizardStage es la única fuente de verdad de qué muestra
   // el wizard. Reemplaza el `navigate("/review")` que disparaba el flash a
   // dashboard. URL se queda en /new mientras el operador transita upload →
@@ -2609,12 +2620,23 @@ export default function App() {
       }
     }
 
+    // 2026-06-04 — settings-loss fix: currentReview puede no tener los picks
+    // del operador (movement/effect/bg/typo) si el sync file→review no corrió
+    // para esta canción (p.ej. los eligió después del transcribe, o subió la
+    // canción heredando batchDefaults que nunca llegaron a currentReview). El
+    // FILE entry SIEMPRE refleja los batch picks vigentes (updateBatchDefault
+    // fanea a files[*]), así que caemos a él cuando currentReview viene vacío.
+    // Bug UMG: eligió Foto fija + Bokeh pero el render salió con
+    // movement_style='' + effect='' → fondo de VIDEO en vez de foto + sin
+    // efecto. Cubre TODOS los efectos (mismo campo) y TODOS los movement styles.
+    const _fm = files.find((f) => f?.file?.name === r.file?.name) || {};
+    const _rf = (k) => r[k] || _fm[k] || "";
     const newApproved = [...approvedJobs, {
       file: r.file, artist: r.artist, language: r.language,
       songTitle: r.songTitle || "",
-      genre: r.genre || "", font: r.font || "", concept: r.concept || "",
-      movementStyle: r.movementStyle || "", effect: r.effect || "",
-      backgroundHint: r.backgroundHint || "", bgVerbatim: !!r.bgVerbatim,
+      genre: _rf("genre"), font: _rf("font"), concept: _rf("concept"),
+      movementStyle: _rf("movementStyle"), effect: _rf("effect"),
+      backgroundHint: _rf("backgroundHint"), bgVerbatim: !!r.bgVerbatim,
       textCase: r.textCase || "upper",
       fontScale: r.fontScale || "1.0",
       // lyricTransition + textMotion: deprecados 2026-05-23.
