@@ -4349,7 +4349,22 @@ async def _run_transcription_for_job(
                             (lrc or {}).get("synced") if isinstance(lrc, dict) else None
                         )
                         if (
-                            os.environ.get("ANCHOR_SCAFFOLD_ENABLED", "0")
+                            # Default ON 2026-06-03: lab-validated on a 7-song
+                            # Argentine-rock batch (Me Gustas Mucho, Una Vez Mas,
+                            # Rata Blanca, Intoxicados, …) — every one has a long
+                            # instrumental intro (13–55s) and the lrclib synced
+                            # timing matches the real vocal onset within ~1s
+                            # (frac_in_voice 82–100%). The OLD path places lyrics
+                            # during the intro → "destiempo al principio" (Agus
+                            # prod report). The scaffold anchors to the real onset.
+                            # SELF-DECLINING: build_synced_scaffold returns None
+                            # (→ caller keeps the old fallbacks) when the synced
+                            # version doesn't match THIS recording (covers/lives),
+                            # so a mismatch is a no-op, not a regression. REQUIRES
+                            # the vocal stem (VOCAL_SEP on); on the bare mix the
+                            # VAD anchors to the band, so keep VOCAL_SEP enabled.
+                            # Override with ANCHOR_SCAFFOLD_ENABLED=0 to disable.
+                            os.environ.get("ANCHOR_SCAFFOLD_ENABLED", "1")
                             .strip().lower() in ("1", "true", "yes", "on")
                             and _synced_sc
                         ):
