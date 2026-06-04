@@ -4292,10 +4292,57 @@ async def _run_transcription_for_job(
                 # stuck-phoneme and similar mishears in well-known regions).
                 await _step("transcribe.transcribe_word", 50)
                 _aa = await _get_align_audio()
+                # Divergent live/extended detection (2026-06-04, LIVE_NO_HINT_ENABLED,
+                # default off). When the upload is much longer than the lrclib record
+                # (the documented diff>60s "live / extended" case, see ~4082), the
+                # lrclib STUDIO text poisons whisperX's initial_prompt — the model
+                # parrots the prompt in studio order and scrambles the live (lab: Coti
+                # "Nada" live → offset +75s, first verse at 1:29 instead of 0:39) — AND
+                # the downstream reconcile/scaffold drift against the wrong structure.
+                # Lab (7 songs, 3 Rotor ground-truths): clean NO-hint whisperX matches
+                # Rotor's own timing (median 0.03-0.8 s); Rotor itself transcribes blind
+                # the same way. So for divergent audio: drop the hint + emit the clean
+                # transcription raw, skipping the canonical cascade. Reversible; falsy
+                # when we can't measure (missing lrclib duration) so default behavior
+                # is untouched.
+                _lrc_dur = (lrc or {}).get("duration") if isinstance(lrc, dict) else None
+                _live_no_hint = bool(
+                    os.environ.get("LIVE_NO_HINT_ENABLED", "0").strip().lower()
+                    in ("1", "true", "yes", "on")
+                    and _audio_dur_for_lrc and _lrc_dur
+                    and (float(_audio_dur_for_lrc) - float(_lrc_dur)) > 60.0
+                )
+                if _live_no_hint:
+                    logger.info(
+                        "[WC] divergent live/extended (audio %.0fs vs lrclib %.0fs, "
+                        "diff %.0fs) — clean whisperX, no hint, raw emit",
+                        float(_audio_dur_for_lrc), float(_lrc_dur),
+                        float(_audio_dur_for_lrc) - float(_lrc_dur),
+                    )
+                # Phase 2 (WHISPERX_NO_HINT_ALWAYS, default off): drop the lrclib
+                # hint for EVERY song, not just divergent lives. The hint
+                # (initial_prompt) scrambles whisperX whenever lrclib diverges from
+                # the audio — which happens on some STUDIO recordings too (lab: "Me
+                # Gustas Mucho", "De A Ratitos" started mid-song WITH the hint, clean
+                # WITHOUT it). Clean (no-hint) whisperX gives Rotor-level timing, then
+                # the reconcile step below restores lrclib's correct text over that
+                # timing ("lrclib's clean text = best of both" — whisperx_reconcile
+                # docstring), which ALSO repairs rare-word mishears for free
+                # (Legalícenla: clean wx hears "Le realicen la" → reconcile emits the
+                # canonical "Legalícenla", beating Rotor's own blind "Legaliza en la").
+                # Non-divergent songs keep going through reconcile/cascade; only the
+                # divergent-live raw emit above is gated on _live_no_hint.
+                _no_hint_always = (
+                    os.environ.get("WHISPERX_NO_HINT_ALWAYS", "0").strip().lower()
+                    in ("1", "true", "yes", "on")
+                )
+                _drop_hint = _live_no_hint or _no_hint_always
+                if _no_hint_always and not _live_no_hint:
+                    logger.info("[WC] WHISPERX_NO_HINT_ALWAYS — clean whisperX, reconcile restores canonical text")
                 try:
                     _wx_segs = await asyncio.to_thread(
                         _wx_mod.transcribe_whisperx, _aa, lang,
-                        _canonical or None,
+                        None if _drop_hint else (_canonical or None),
                     )
                 except Exception as e:
                     logger.warning("[WC] whisperX raised: %s — falling through to legacy", e)
@@ -4316,6 +4363,17 @@ async def _run_transcription_for_job(
                         WHISPERX_RECONCILED as _WC_WX_REC,
                         WHISPERX as _WC_WX,
                     )
+                    # Divergent live/extended: the clean (no-hint) transcription IS
+                    # the truth — its order/timing track the actual performance (lab:
+                    # Rotor-level). The canonical cascade below would drift it against
+                    # the studio structure, so emit raw and return.
+                    if _live_no_hint:
+                        logger.info(
+                            "[WC] divergent live — emitting clean whisperX raw "
+                            "(%d segs, Rotor-level timing)", len(_wx_segs))
+                        return _emit_segments(
+                            _wx_segs, _WC_WX, reference_lyrics=_canonical,
+                        )
                     # Reconcile when we have canonical text; emit raw otherwise.
                     if _canonical:
                         import whisperx_reconcile as _wxr
