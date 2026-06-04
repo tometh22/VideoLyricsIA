@@ -24,7 +24,10 @@ This module is intentionally a leaf (no pipeline import) so it stays unit-
 testable without moviepy/ffmpeg. The caller (pipeline) splices the returned
 filter + extra inputs into its ffmpeg command.
 """
+import logging
 import os
+
+logger = logging.getLogger("genly.fx_compositor")
 
 _FX_DIR = os.path.join(os.path.dirname(__file__), "..", "assets", "fx")
 
@@ -53,7 +56,22 @@ def effect_path(effect: str) -> str | None:
     if name not in EFFECTS:
         return None
     p = os.path.abspath(os.path.join(_FX_DIR, f"{name}.mp4"))
-    return p if os.path.exists(p) else None
+    if not os.path.exists(p):
+        # A KNOWN effect was requested but its baked overlay is absent on disk.
+        # This silently dropped EVERY effect in prod until 2026-06-04 — the
+        # Docker image didn't COPY assets/ (assets/fx lives outside backend/),
+        # so effect_path() returned None and build_video_filter took the
+        # no-effect path. The job still "succeeded" with no overlay. Log loudly
+        # so a missing / mis-deployed asset surfaces in the worker logs instead
+        # of being an invisible no-op.
+        logger.warning(
+            "[FX] effect '%s' requested but overlay asset is MISSING at %s — "
+            "the effect will be SKIPPED in this render. Verify lyricgen/assets/fx "
+            "is present in the deployed image (Dockerfile COPY assets/).",
+            name, p,
+        )
+        return None
+    return p
 
 
 # Per-effect pre-blend gain. Sparse / dim effects barely register through the
