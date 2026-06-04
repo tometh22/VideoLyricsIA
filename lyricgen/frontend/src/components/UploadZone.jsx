@@ -667,11 +667,12 @@ export default function UploadZone({
     { code: "stars",  label: t("upload.effect_stars") || "Estrellas",  sample: "/fx_samples/stars.mp4",  desc: t("upload.effect_stars_desc") || "Partículas que titilan. Nocturno." },
     { code: "bokeh",  label: t("upload.effect_bokeh") || "Bokeh",      sample: "/fx_samples/bokeh.mp4",  desc: t("upload.effect_bokeh_desc") || "Luces desenfocadas flotando." },
     { code: "light",  label: t("upload.effect_light") || "Luz",        sample: "/fx_samples/light.mp4",  desc: t("upload.effect_light_desc") || "Destellos suaves. Atardecer, glow." },
-    // 2026-05-25 UMG: cubre el estilo de los refs Boza / Yatra Cristina /
-    // A los cuatro vientos — líneas brillantes ondulantes sobre el fondo.
-    // Naming "Aurora" (más vendedor que "firuletes"): evocador, cinema,
-    // lee igual en es/en/pt.
-    { code: "aurora", label: t("upload.effect_aurora") || "Aurora",    sample: "/fx_samples/aurora.mp4", desc: t("upload.effect_aurora_desc") || "Líneas de luz ondulantes que cruzan el cielo. Mágico, cinematográfico." },
+    // 2026-06-04: "Aurora" removido del selector — su asset (assets/fx/aurora.mp4)
+    // es una COPIA de light.mp4, así que renderizaba idéntico a "Luz". El backend
+    // sigue soportando effect="aurora" (EFFECTS en fx_compositor.py) por compat,
+    // pero no lo ofrecemos hasta tener un loop de aurora propio (cortinas
+    // ondulantes verde/teal). Para re-activarlo: restaurar la entrada de abajo.
+    // { code: "aurora", label: t("upload.effect_aurora") || "Aurora", sample: "/fx_samples/aurora.mp4", desc: t("upload.effect_aurora_desc") || "Líneas de luz ondulantes que cruzan el cielo." },
   ];
 
   // Lyrics-animation templates. These are rendered as libass override tags in
