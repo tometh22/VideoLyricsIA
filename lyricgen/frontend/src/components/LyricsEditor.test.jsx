@@ -357,3 +357,65 @@ describe("LyricsEditor — modo enfoque body class broadcast", () => {
     expect(document.body.classList.contains("editor-focus-mode")).toBe(false);
   });
 });
+
+describe("LyricsEditor — Enter-to-split is word-aware (2026-06-05)", () => {
+  // Divergent-live defect: whisperX glued the next phrase's "No" onto this line.
+  // Pressing Enter before "No" must split it off AND give line 2 the REAL word
+  // time (12.5–12.9), not a character-ratio interpolation. Per-word `words`
+  // must be sliced between the halves, not duplicated.
+  const seg = {
+    start: 10.0,
+    end: 12.9,
+    text: "tengo una mala noticia No",
+    words: [
+      { word: "tengo", start: 10.0, end: 10.4 },
+      { word: "una", start: 10.4, end: 10.6 },
+      { word: "mala", start: 10.6, end: 11.0 },
+      { word: "noticia", start: 11.0, end: 11.8 },
+      { word: "No", start: 12.5, end: 12.9 },
+    ],
+  };
+
+  it("splits at the cursor with REAL word timing on both halves", () => {
+    const onEditedChange = vi.fn();
+    render(<LyricsEditor {...baseProps({ segments: [seg], onEditedChange })} />);
+    const input = screen.getByDisplayValue("tengo una mala noticia No");
+    const caret = "tengo una mala noticia ".length; // 23, right before "No"
+    input.setSelectionRange(caret, caret);
+    fireEvent.keyDown(input, { key: "Enter" });
+
+    const out = onEditedChange.mock.calls.at(-1)[0];
+    expect(out).toHaveLength(2);
+    expect(out[0].text).toBe("tengo una mala noticia");
+    expect(out[1].text).toBe("No");
+    // Line 2 gets the real word time, NOT a char-ratio interpolation:
+    expect(out[1].start).toBe(12.5);
+    expect(out[1].end).toBe(12.9);
+    expect(out[0].start).toBe(10.0);
+    expect(out[0].end).toBe(11.8);
+    // `words` sliced between halves (not duplicated):
+    expect(out[0].words).toHaveLength(4);
+    expect(out[1].words).toEqual([{ word: "No", start: 12.5, end: 12.9 }]);
+  });
+
+  it("merges a line into the previous via Backspace at line start", () => {
+    const onEditedChange = vi.fn();
+    const segs = [
+      { start: 10.0, end: 11.8, text: "tengo una mala noticia",
+        words: [{ word: "tengo", start: 10.0, end: 10.4 }, { word: "noticia", start: 11.0, end: 11.8 }] },
+      { start: 12.5, end: 12.9, text: "No",
+        words: [{ word: "No", start: 12.5, end: 12.9 }] },
+    ];
+    render(<LyricsEditor {...baseProps({ segments: segs, onEditedChange })} />);
+    const input = screen.getByDisplayValue("No");
+    input.setSelectionRange(0, 0);
+    fireEvent.keyDown(input, { key: "Backspace" });
+
+    const out = onEditedChange.mock.calls.at(-1)[0];
+    expect(out).toHaveLength(1);
+    expect(out[0].text).toBe("tengo una mala noticia No");
+    expect(out[0].start).toBe(10.0);
+    expect(out[0].end).toBe(12.9);
+    expect(out[0].words).toHaveLength(3);
+  });
+});
