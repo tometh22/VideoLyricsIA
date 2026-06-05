@@ -1035,6 +1035,13 @@ export default function App() {
     });
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [files, currentReview?.file?.name]);
+  // Stale-preview fix (2026-06-04): al cambiar de canción, reseteá la línea
+  // en-vivo para que el preview caiga al sample hasta que el operador
+  // reproduzca la nueva canción. Antes mostraba la ÚLTIMA línea activa de la
+  // canción ANTERIOR hasta el primer play (operator-reported).
+  useEffect(() => {
+    playbackTickRef.current = { activeLine: "", activeStart: 0, activeEnd: 0, currentTime: 0 };
+  }, [currentReview?.file?.name, files[0]?.file?.name]);
   // Capa B 2026-05-24 — wizardStage es la única fuente de verdad de qué muestra
   // el wizard. Reemplaza el `navigate("/review")` que disparaba el flash a
   // dashboard. URL se queda en /new mientras el operador transita upload →

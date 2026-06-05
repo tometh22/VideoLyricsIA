@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import { useI18n } from "../i18n";
+import { REF_W, tierForLength, fontSizeFactor } from "../lib/lyricTiers";
 
 // Studio Console live preview. Shows a sample lyric line over the selected
 // palette/mood with the selected camera movement applied as a real CSS
@@ -68,8 +69,13 @@ function applyCase(text, c) {
 // reads consistent with what the operator will see in the editor.
 const CONTRAST_STYLES = {
   subtle: { WebkitTextStroke: "0px",                 textShadow: "0 1px 5px rgba(0,0,0,.55)" },
-  medium: { WebkitTextStroke: "1px rgba(0,0,0,.55)", textShadow: "0 2px 0 #000, 0 0 18px rgba(0,0,0,.6)" },
-  strong: { WebkitTextStroke: "1.5px #000",          textShadow: "0 0 6px rgba(0,0,0,1), -1px -1px 0 #000, 1px 1px 0 #000, 0 2px 0 #000" },
+  // 2026-06-04: dropped the wide radial glow (medium `0 0 18px`, strong `0 0 6px`
+  // full-black). On 2-line all-caps text the per-glyph glows merged into a dark
+  // cloud that read as a "recuadro" behind the lyrics — a preview-only artifact
+  // (libass uses a crisp outline + drop shadow, no wide glow, so the rendered
+  // video never showed it). Keep the crisp outline + stroke for legibility.
+  medium: { WebkitTextStroke: "1px rgba(0,0,0,.55)", textShadow: "0 2px 0 #000, 0 0 3px rgba(0,0,0,.5)" },
+  strong: { WebkitTextStroke: "1.5px #000",          textShadow: "-1px -1px 0 #000, 1px 1px 0 #000, 0 2px 0 #000" },
 };
 
 // Convert #RRGGBB → rgba(r,g,b,a). Returns null if hex is malformed —
@@ -230,7 +236,16 @@ export default function WizardLivePreview({
   // - contrastStyle: outline + shadow del CONTRAST_STYLES.
   const fontInfo = FONT_BY_CODE[font] || FONT_BY_CODE[""];
   const scaleN = Math.max(0.6, Math.min(1.5, parseFloat(fontScale) || 1));
-  const baseFontSize = `clamp(${Math.round(18 * scaleN)}px, ${(7.5 * scaleN).toFixed(2)}cqw, ${Math.round(68 * scaleN)}px)`;
+  // WYSIWYG font size (2026-06-04): mirror the render's lyric_fontsize EXACTLY
+  // instead of a fixed 7.5cqw (which previewed ~1.5× too big and ignored line
+  // length). Render = tier-by-character-count (ass_render.lyric_fontsize) ×
+  // font_scale × per-font factor, in PlayResY=1080 → cqw = fontPx / REF_W × 100
+  // (fraction of the 1920-wide frame, matching LyricVideoPreview). Length comes
+  // from the actual displayed text — the live line if playing, else the sample.
+  const _dispText = (livePlaybackTick && livePlaybackTick.activeLine)
+    ? applyCase(livePlaybackTick.activeLine, textCase)
+    : sample;
+  const baseFontSize = `${((tierForLength(_dispText.length).fontPx / REF_W) * 100 * scaleN * fontSizeFactor(font)).toFixed(3)}cqw`;
   const contrastStyle = CONTRAST_STYLES[textContrast] || CONTRAST_STYLES.medium;
   const moveLabel = {
     "": t("upload.movement_auto") || "Auto",
@@ -501,7 +516,22 @@ export default function WizardLivePreview({
           key={`fx-${effect}`}
           src={`/fx_raw/${effect}.mp4`}
           className="absolute inset-0 w-full h-full object-cover pointer-events-none"
-          style={{ mixBlendMode: "screen" }}
+          style={{
+            mixBlendMode: "screen",
+            // Mirror the backend _FX_GAIN perceptually. The raw loops are
+            // screen-blended; mid-tone particles (esp. bokeh ~0.28 luma) wash
+            // out on bright/candle-lit scenes with no gain, so the preview
+            // showed "nothing" while the badge claimed the effect was on.
+            // Boost brightness/contrast in CSS so the preview reads like the
+            // render (bokeh hardest; bright-point effects need less).
+            filter: {
+              bokeh: "brightness(1.6) contrast(1.15)",
+              stars: "brightness(1.25) contrast(1.1)",
+              snow: "brightness(1.15)",
+              rain: "brightness(1.1)",
+              light: "brightness(1.1)",
+            }[effect] || "none",
+          }}
           autoPlay loop muted playsInline
         />
       ) : null}
@@ -605,7 +635,7 @@ export default function WizardLivePreview({
               background: isMinimal ? "rgba(0,0,0,.06)" : "rgba(255,255,255,.10)",
             }}
           >
-            {(t("upload.preview_motion") || "Movimiento")}: {moveLabel}{effectLabel ? ` · ${t("upload.effect_label") || "Efecto"}: ${effectLabel}` : ""}
+            {(t("upload.preview_motion") || "Movimiento")}: {moveLabel}{effectLabel ? ` · ${t("upload.effect_label") || "Efecto:"} ${effectLabel}` : ""}
           </span>
         </div>
       )}
