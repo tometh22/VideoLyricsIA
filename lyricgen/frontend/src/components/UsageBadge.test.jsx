@@ -76,24 +76,24 @@ describe("UsageBadge", () => {
     // The operator should still NOT see the $$ amount.
     _mockFetchOnce({
       plan: "250", used: 260, limit: 250, percent: 104,
-      alert_80: true, alert_100: true, overage_total: 12,
+      alert_80: true, alert_100: true, overage_total: 15,
     });
     render(<UsageBadge user={USER_OPERATOR} />);
     await screen.findByText(/260 \/ 250/);
     // No $$ display — the overage element is admin-only.
-    expect(screen.queryByText(/\+\$12/)).not.toBeInTheDocument();
+    expect(screen.queryByText(/\+\$15/)).not.toBeInTheDocument();
     expect(screen.queryByText(/excedente/)).not.toBeInTheDocument();
   });
 
   it("shows overage_total to admin when overage > 0", async () => {
     _mockFetchOnce({
       plan: "250", used: 260, limit: 250, percent: 104,
-      alert_80: true, alert_100: true, overage_total: 12,
+      alert_80: true, alert_100: true, overage_total: 15,
     });
     // Admin with NON-unlimited plan (so the badge renders).
     render(<UsageBadge user={{ username: "tomas", role: "admin", plan: "250" }} />);
     await screen.findByText(/260 \/ 250/);
-    expect(screen.getByText(/\+\$12/)).toBeInTheDocument();
+    expect(screen.getByText(/\+\$15/)).toBeInTheDocument();
   });
 
   it("renders nothing if /usage fetch fails (no crash, no error banner)", async () => {
