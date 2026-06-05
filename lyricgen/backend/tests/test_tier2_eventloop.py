@@ -89,9 +89,13 @@ def test_stripe_webhook_stays_async_with_sync_dispatch():
 
 
 def test_stripe_max_network_retries_configured():
+    import os
     import billing  # noqa: F401 — import configures stripe at module load
     import stripe
-    assert stripe.max_network_retries == 2, (
+    # Match whatever the module configured from the env (default 2), so the
+    # guard doesn't go red just because a CI/dev env exports a different value.
+    expected = int(os.environ.get("STRIPE_MAX_NETWORK_RETRIES", "2"))
+    assert stripe.max_network_retries == expected, (
         "Stripe max_network_retries must be set (default 2) so a transient "
         "Stripe blip retries instead of surfacing a hard failure."
     )
