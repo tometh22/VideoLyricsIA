@@ -670,7 +670,7 @@ def _apply_asset_tenant_filter(query, current_user: dict):
 
 
 @app.get("/backgrounds")
-async def list_backgrounds(
+def list_backgrounds(
     current_user: dict = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
@@ -687,7 +687,7 @@ async def list_backgrounds(
 
 
 @app.get("/backgrounds/{asset_id}/usage")
-async def background_usage(
+def background_usage(
     asset_id: int,
     current_user: dict = Depends(get_current_user),
     db: Session = Depends(get_db),
@@ -813,7 +813,7 @@ def _resolve_library_background(
 
 
 @app.get("/fonts")
-async def list_fonts(current_user: dict = Depends(get_current_user)):
+def list_fonts(current_user: dict = Depends(get_current_user)):
     """Return the catalogue of selectable typography for the lyric video.
 
     The frontend renders previews directly via the Google Fonts CDN — every
@@ -1183,14 +1183,14 @@ async def verify_email_endpoint(body: VerifyEmailRequest, request: Request, db: 
 
 
 @app.get("/auth/me")
-async def me(current_user: dict = Depends(get_current_user)):
+def me(current_user: dict = Depends(get_current_user)):
     """Return current user info."""
     return current_user
 
 
 @app.post("/auth/refresh")
 @limiter.limit("60/minute")
-async def refresh_token(
+def refresh_token(
     request: Request,
     current_user: dict = Depends(get_current_user),
     db: Session = Depends(get_db),
@@ -1414,7 +1414,7 @@ _SESSION_GAP = timedelta(minutes=30)
 
 @app.post("/telemetry/heartbeat")
 @limiter.limit("30/minute")
-async def telemetry_heartbeat(
+def telemetry_heartbeat(
     request: Request,
     current_user: dict = Depends(get_current_user),
     db: Session = Depends(get_db),
@@ -1754,7 +1754,7 @@ async def drive_callback(
 
 
 @app.get("/drive/status")
-async def drive_status(
+def drive_status(
     current_user: dict = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
@@ -1813,7 +1813,7 @@ async def drive_disconnect(
 
 
 @app.get("/usage")
-async def usage(current_user: dict = Depends(get_current_user), db: Session = Depends(get_db)):
+def usage(current_user: dict = Depends(get_current_user), db: Session = Depends(get_db)):
     """Return current plan usage with overage info.
 
     2026-05-30 perf: cached in Redis with a 30 s TTL keyed by
@@ -3414,7 +3414,7 @@ async def transcribe_uploaded(
 # ---------------------------------------------------------------------------
 @app.get("/transcription-status/{job_id}")
 @limiter.limit("600/minute")  # polling holgado: 1 req/seg × ~10 archivos simultáneos
-async def transcription_status(
+def transcription_status(
     request: Request,
     job_id: str,
     current_user: dict = Depends(get_current_user),
@@ -6414,7 +6414,7 @@ async def generate_with_segments(
 
 
 @app.get("/admin/queue")
-async def admin_queue(current_user: dict = Depends(get_current_user)):
+def admin_queue(current_user: dict = Depends(get_current_user)):
     """Return queue depth per priority. Admin only."""
     if current_user.get("role") != "admin":
         raise HTTPException(status_code=403, detail="Admin only")
@@ -6422,7 +6422,7 @@ async def admin_queue(current_user: dict = Depends(get_current_user)):
 
 
 @app.get("/delivery-profiles")
-async def get_delivery_profiles(current_user: dict = Depends(get_current_user)):
+def get_delivery_profiles(current_user: dict = Depends(get_current_user)):
     """Return the catalog of accepted UMG specs for frontend dropdowns."""
     return {
         "profiles": ["youtube", "umg", "both"],
@@ -6431,7 +6431,7 @@ async def get_delivery_profiles(current_user: dict = Depends(get_current_user)):
 
 
 @app.get("/status/{job_id}")
-async def status(
+def status(
     job_id: str,
     current_user: dict = Depends(get_current_user),
     db: Session = Depends(get_db),
@@ -6513,6 +6513,39 @@ async def status(
     }
 
 
+def _sse_tick(token, job_id, scope, initial_user_id, initial_tenant_id):
+    """Blocking per-tick work for the /events SSE stream.
+
+    Run via ``asyncio.to_thread`` from the async generator so the JWT decode +
+    2 DB queries do NOT execute on the event loop on every 2s tick of every
+    open dashboard (with N tabs that was N×(decode+2 SELECT) on the loop each
+    2s). Returns ``(job_dict_or_None, unauthorized, reason)``.
+
+    Both re-validations below are deliberate and must stay:
+      - JWT re-decode every tick (audit P0 #73): a 90-min render can outlive
+        token expiry; surface ``unauthorized`` so the client falls back to
+        authed polling where the 401 triggers the logout flow.
+      - Tenant re-check every tick (PR #95): closes the window where an admin
+        transfers the user across tenants mid-stream. Security, not optional.
+    ``scoped_db()`` releases the connection back to the pool in milliseconds.
+    """
+    from auth import decode_token as _decode
+    try:
+        _decode(token)
+    except HTTPException:
+        return None, True, "token_expired"
+    except Exception:
+        # decode_token only raises HTTPException; treat any other JWT-lib
+        # error as an invalid token too.
+        return None, True, "token_invalid"
+    with scoped_db() as db_tick:
+        fresh_user = db_tick.query(User).filter(User.id == initial_user_id).first()
+        if not fresh_user or fresh_user.tenant_id != initial_tenant_id:
+            return None, True, "tenant_changed"
+        job = get_job(db_tick, job_id, **scope)
+    return job, False, ""
+
+
 @app.get("/events/{job_id}")
 async def job_events(
     job_id: str,
@@ -6570,45 +6603,18 @@ async def job_events(
 
     async def event_generator():
         last_sig = None
-        # Merge de dos fixes:
+        # Merge de dos fixes (ahora ejecutados en threadpool vía _sse_tick para
+        # no bloquear el event loop en cada tick — ver _sse_tick):
         #   - PR #97: scoped_db() per tick para evitar pool starvation.
         #   - PR #95: re-validar tenant del user en cada tick (cierra el
         #     window donde admin transfiere user entre tenants mid-stream).
-        # Ambas queries (User refresh + job fetch) ocurren dentro de la
-        # misma sesión corta del context manager → 1 connection por tick,
-        # ~2 SELECTs, devuelta al pool en milisegundos.
-        unauthorized = False
-        unauthorized_reason = "tenant_changed"
         while True:
-            # QA fix 2026-05-28 (audit P0 #73): re-validar JWT en cada
-            # tick. Pre-fix el token solo se decodeaba al abrir el SSE;
-            # un render de 90 min sobrevivía a la expiración del token
-            # sin avisar al cliente → UI frozen en "processing" silente.
-            # Ahora decodificamos en cada tick; si expiró, emit
-            # unauthorized para que el frontend caiga a polling auth'd
-            # (donde el 401 dispara el logout flow normal).
-            try:
-                from auth import decode_token as _decode
-                _decode(token)
-            except HTTPException:
-                unauthorized = True
-                unauthorized_reason = "token_expired"
-                job = None
-            except Exception:
-                # decode_token sólo levanta HTTPException; cualquier otro
-                # error de JWT lib lo tratamos como token inválido también.
-                unauthorized = True
-                unauthorized_reason = "token_invalid"
-                job = None
-            if not unauthorized:
-                with scoped_db() as db_tick:
-                    fresh_user = db_tick.query(User).filter(User.id == _initial_user_id).first()
-                    if not fresh_user or fresh_user.tenant_id != _initial_tenant_id:
-                        unauthorized = True
-                        unauthorized_reason = "tenant_changed"
-                        job = None
-                    else:
-                        job = get_job(db_tick, job_id, **scope)
+            # JWT decode + 2 SELECTs por tick son trabajo bloqueante; los
+            # corremos off-loop con asyncio.to_thread para que N dashboards
+            # abiertos no inunden el event loop cada 2 s.
+            job, unauthorized, unauthorized_reason = await asyncio.to_thread(
+                _sse_tick, token, job_id, scope, _initial_user_id, _initial_tenant_id,
+            )
             if unauthorized:
                 yield f"event: unauthorized\ndata: {json.dumps({'reason': unauthorized_reason})}\n\n"
                 break
@@ -6661,7 +6667,7 @@ async def job_events(
 
 
 @app.get("/jobs")
-async def list_jobs(
+def list_jobs(
     current_user: dict = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
@@ -8814,7 +8820,7 @@ async def deliver_to_drive(
 
 
 @app.get("/drive/transfers/{transfer_id}")
-async def get_drive_transfer(
+def get_drive_transfer(
     transfer_id: str,
     current_user: dict = Depends(get_current_user),
     db: Session = Depends(get_db),
@@ -9537,7 +9543,7 @@ async def create_variant(
 # ---------------------------------------------------------------------------
 
 @app.get("/settings")
-async def get_settings(
+def get_settings(
     current_user: dict = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
@@ -9547,7 +9553,7 @@ async def get_settings(
 
 
 @app.post("/settings")
-async def save_settings(
+def save_settings(
     body: dict,
     current_user: dict = Depends(get_current_user),
     db: Session = Depends(get_db),

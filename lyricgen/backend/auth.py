@@ -591,7 +591,16 @@ def decode_token(token: str) -> dict:
         )
 
 
-async def get_current_user(
+# Plain `def` (not `async def`) ON PURPOSE: this dependency runs on EVERY
+# authenticated request (50+ endpoints) and does 1-2 BLOCKING SQLAlchemy
+# queries (verify_api_key / get_user_by_id_resilient) plus a sync JWT decode.
+# As `async def` it ran that blocking work directly on the uvicorn event loop,
+# serializing all traffic under load. FastAPI runs a sync dependency in its
+# threadpool, so the blocking auth no longer freezes the loop. The body has no
+# `await` and its sub-deps (security, get_db) are sync, so this is a pure
+# concurrency-model change — identical behavior. Do NOT re-add `async` unless
+# you also move the DB work off the loop.
+def get_current_user(
     request: Request,
     credentials: Optional[HTTPAuthorizationCredentials] = Depends(security),
     db: Session = Depends(get_db),
