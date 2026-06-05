@@ -4240,6 +4240,136 @@ def _gemini_cleanup_lyrics(audio_path: str, lrclib_plain: str,
     return cleaned
 
 
+def _llm_segment_words(segs: list[dict], *, audio_path: str, artist: str = "",
+                       song: str = "", timeout_s: int = 90) -> list[dict]:
+    """Re-segment a whisperX word stream into clean phrase lines via Gemini,
+    grounded in the audio. The LLM decides the LINE GROUPING + fixes orthography
+    (a language task heuristics can't do); whisperX provides the exact TIMING —
+    each line's start/end come from its words' real timestamps, never re-timed.
+
+    Why this beats both alternatives for DIVERGENT LIVES: pause/length heuristics
+    can't find grammatical phrase boundaries, and `reconcile` aborts when the
+    live diverges from lrclib's studio structure. This re-segments the live's
+    OWN words, so there is no reference template to drift against. Validated in
+    the lab on "Nada Fue Un Error (En Vivo)": output matches Rotor line-for-line.
+
+    Self-declining (returns the INPUT segs unchanged) on: flag off, too-short,
+    a segment without word timing, Gemini failure, unparseable output, low
+    coverage, or low word-overlap (hallucination guard). Never raises. Gated
+    behind LLM_SEGMENT_ENABLED (default off)."""
+    if not _env_flag("LLM_SEGMENT_ENABLED"):
+        return segs
+    W: list[dict] = []
+    for s in (segs or []):
+        ws = s.get("words")
+        if not isinstance(ws, list):
+            return segs  # no word timing → can't map lines back to time
+        for w in ws:
+            if isinstance(w, dict) and "word" in w:
+                W.append(w)
+    if len(W) < 8:
+        return segs
+
+    numbered = " ".join(f"[{i}]{(w.get('word') or '').strip()}"
+                        for i, w in enumerate(W))
+    system_prompt = (
+        "Sos un editor profesional de lyric videos en español (estilo Rotor).\n"
+        "Te doy: (1) el AUDIO de la canción (puede ser un vivo), (2) su "
+        "transcripción palabra-por-palabra (cada palabra con su índice [n]). "
+        "Agrupá las palabras en LÍNEAS de lyric video.\n\n"
+        "CÓMO CORTAR (lo más importante):\n"
+        "- UNA frase corta por línea, estilo karaoke (~4 a 9 palabras).\n"
+        "- Cortá en cada límite de frase/cláusula natural. Ej: 'Yo quería que "
+        "nos pasara' y 'Y tú, y tú lo dejaste pasar' son DOS líneas.\n"
+        "- NO juntes dos frases en una sola línea.\n\n"
+        "ORTOGRAFÍA: acentos, MAYÚSCULA al inicio de CADA línea (estilo karaoke, "
+        "aunque sea continuación de la oración), signos (¿¡ incluidos).\n"
+        "AUDIO: usalo para (a) corregir palabras mal escuchadas, (b) poner los "
+        "coros/ad-libs de fondo entre paréntesis.\n\n"
+        "REGLAS DURAS:\n"
+        "- Cubrí TODAS las palabras, en orden, cada una en EXACTAMENTE una línea.\n"
+        "- Podés corregir ortografía/mishears contra el audio, pero NO inventes "
+        "contenido ni reordenes.\n"
+        "- Formato EXACTO por línea, sin nada más: [primer_indice-ultimo_indice] <texto>\n"
+        "  Ej: [0-3] Tengo una mala noticia\n"
+        "- Sin preámbulo, markdown ni comentarios."
+    )
+    try:
+        from google import genai
+        client = _get_genai_client()
+        if client is None:
+            return segs
+        with open(audio_path, "rb") as f:
+            audio_bytes = f.read()
+        ext = os.path.splitext(audio_path)[1].lower().lstrip(".")
+        mime = {"wav": "audio/wav", "mp3": "audio/mpeg", "flac": "audio/flac",
+                "ogg": "audio/ogg", "m4a": "audio/mp4"}.get(ext, "audio/wav")
+        resp = _call_with_timeout(
+            lambda: client.models.generate_content(
+                model="gemini-2.5-flash",
+                contents=[
+                    genai.types.Part.from_bytes(data=audio_bytes, mime_type=mime),
+                    genai.types.Part.from_text(text=numbered),
+                ],
+                config=genai.types.GenerateContentConfig(
+                    system_instruction=system_prompt, temperature=0.1,
+                    max_output_tokens=8000,
+                    thinking_config=genai.types.ThinkingConfig(thinking_budget=0),
+                ),
+            ),
+            timeout_s=float(timeout_s), label="LLM-SEGMENT",
+        )
+        out = (resp.text or "").strip()
+    except Exception as e:
+        logger.warning("[LLM-SEGMENT] failed (%s); keeping whisperX segments", e)
+        return segs
+
+    parsed = []
+    for ln in out.splitlines():
+        m = re.match(r"\s*\[(\d+)\s*-\s*(\d+)\]\s*(.+)", ln)
+        if not m:
+            continue
+        i, j, txt = int(m.group(1)), int(m.group(2)), m.group(3).strip()
+        if i > j or i < 0 or j >= len(W) or not txt:
+            continue
+        parsed.append((i, j, txt))
+    if not parsed:
+        logger.warning("[LLM-SEGMENT] no parseable lines; keeping whisperX")
+        return segs
+
+    # Gate (a): the line ranges must cover ~all the words (no big drops).
+    cov = set()
+    for i, j, _ in parsed:
+        cov.update(range(i, j + 1))
+    coverage = len(cov) / max(1, len(W))
+    if coverage < 0.9:
+        logger.warning("[LLM-SEGMENT] coverage %.2f < 0.9; keeping whisperX", coverage)
+        return segs
+    # Gate (b): anti-hallucination — the LLM text must overlap the whisperX text.
+    wx_text = " ".join((w.get("word") or "") for w in W)
+    llm_text = " ".join(t for _, _, t in parsed)
+    if _gemini_cleanup_word_overlap(llm_text, wx_text) < 0.5:
+        logger.warning("[LLM-SEGMENT] word-overlap < 0.5 (hallucination guard); keeping whisperX")
+        return segs
+
+    out_segs = []
+    for i, j, txt in parsed:
+        grp = W[i:j + 1]
+        st = next((w.get("start") for w in grp
+                   if isinstance(w.get("start"), (int, float))), None)
+        en = next((w.get("end") for w in reversed(grp)
+                   if isinstance(w.get("end"), (int, float))), None)
+        if st is None or en is None:
+            continue
+        out_segs.append({"start": float(st), "end": float(en),
+                         "text": txt, "words": grp})
+    if len(out_segs) < 2:
+        return segs
+    logger.info("[LLM-SEGMENT] re-segmented %d whisperX segs → %d clean lines "
+                "(coverage %.2f)", len(segs), len(out_segs), coverage)
+    return out_segs
+
+
 def _sanitize_gemini_lyrics(text):
     """Strip section/pilcrow markers that some Spanish lyrics sites use
     as estrofa separators (Letras.com, AZLyrics, etc.). These are HTML

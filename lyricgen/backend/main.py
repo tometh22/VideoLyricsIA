@@ -4568,6 +4568,17 @@ async def _run_transcription_for_job(
                         logger.info(
                             "[WC] divergent live — emitting clean whisperX raw "
                             "(%d segs, Rotor-level timing)", len(_wx_segs))
+                        # LLM line-segmentation (LLM_SEGMENT_ENABLED, default off):
+                        # the no-hint whisperX has Rotor-level TIMING but native
+                        # VAD LINE breaks (merges/splits at the wrong words, e.g.
+                        # "noticia No"). Gemini re-groups the live's OWN words into
+                        # clean phrase lines + fixes orthography, mapped back to the
+                        # exact whisperX timing — no reference template to drift
+                        # (reconcile aborts here). Self-declining → keeps _wx_segs on
+                        # any failure. Lab on "Nada Fue Un Error (En Vivo)": matches
+                        # Rotor line-for-line, timing byte-identical.
+                        from pipeline import _llm_segment_words as _llm_seg
+                        _wx_segs = _llm_seg(_wx_segs, audio_path=_aa)
                         return _emit_segments(
                             _wx_segs, _WC_WX, reference_lyrics=_canonical,
                         )
