@@ -4574,6 +4574,48 @@ os.environ.setdefault("GOOGLE_APPLICATION_CREDENTIALS", _VERTEX_CREDENTIALS)
 _genai_client = None
 
 
+# OAuth token refresh to Google's endpoint sits INSIDE the Veo hot path:
+# _veo_access_token() is called on every Veo submit, every poll iteration,
+# and the download (pipeline ~6117/6224/6275), and _get_genai_client()
+# refreshes once at init. google-auth's default transport applies a 120s
+# per-call timeout — far too long when Railway's networking flaps: the
+# worker thread hangs on the refresh, and the Veo poll's own 600s deadline
+# only guards the poll HTTP call, NOT the token refresh that precedes it.
+# Binding the refresh to a session with a short default timeout makes a blip
+# fail fast so the pipeline can fall through to its fallback. Env-tunable.
+_OAUTH_REFRESH_TIMEOUT = float(os.environ.get("VEO_OAUTH_REFRESH_TIMEOUT", "10"))
+
+
+def _make_timeout_session(timeout: float):
+    """A requests.Session that CAPS the per-call ``timeout`` at ``timeout``.
+
+    We can't use setdefault: google-auth's transport ALWAYS passes an explicit
+    timeout (google/auth/transport/requests.py: __call__ defaults it to
+    _DEFAULT_TIMEOUT=120 and forwards it to session.request), so a setdefault
+    would be a no-op and the refresh would still hang up to 120s. Instead we
+    force-shorten to our bound while never EXTENDING a deliberately-shorter
+    explicit timeout. requests is imported lazily (matching the rest of this
+    module) to keep import cost down."""
+    import requests as _req
+
+    class _TimeoutSession(_req.Session):
+        def request(self, *args, **kwargs):
+            existing = kwargs.get("timeout")
+            if existing is None or (isinstance(existing, (int, float)) and existing > timeout):
+                kwargs["timeout"] = timeout
+            return super().request(*args, **kwargs)
+
+    return _TimeoutSession()
+
+
+def _oauth_refresh_request():
+    """google-auth transport Request whose HTTP calls carry a bounded timeout
+    (VEO_OAUTH_REFRESH_TIMEOUT) instead of the 120s transport default."""
+    from google.auth.transport.requests import Request as _AuthReq
+
+    return _AuthReq(session=_make_timeout_session(_OAUTH_REFRESH_TIMEOUT))
+
+
 def _get_genai_client():
     """Get a cached Vertex AI GenAI client.
 
@@ -4619,9 +4661,8 @@ def _get_genai_client():
 
                 # Validate the token at startup so we surface auth issues
                 # here in the worker logs instead of inside the model call.
-                from google.auth.transport.requests import Request as _AuthReq
                 try:
-                    credentials.refresh(_AuthReq())
+                    credentials.refresh(_oauth_refresh_request())
                     logger.info("[VERTEX] token refresh OK; valid=%s expiry=%s",
                                 credentials.valid, credentials.expiry)
                 except Exception as refresh_err:
@@ -5767,7 +5808,6 @@ def _veo_access_token() -> str:
     triggering invalid_scope errors on Railway despite the credentials being
     valid (Gemini works on the same token; only Veo rejects through the SDK)."""
     from google.oauth2 import service_account
-    from google.auth.transport.requests import Request
 
     creds_path = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS", "").strip()
     if not creds_path or not os.path.exists(creds_path):
@@ -5777,7 +5817,7 @@ def _veo_access_token() -> str:
         scopes=["https://www.googleapis.com/auth/cloud-platform"],
     )
     creds = creds.with_quota_project(_VERTEX_PROJECT)
-    creds.refresh(Request())
+    creds.refresh(_oauth_refresh_request())
     return creds.token
 
 
