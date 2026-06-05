@@ -4658,8 +4658,31 @@ async def _run_transcription_for_job(
                                     "[WC] synced-scaffold raised: %s — "
                                     "continuing cascade", _e_sc,
                                 )
-                        # Reconcile aborted (drift on too many lines or thin
-                        # coverage). Try forced_align as a fallback before
+                        # Reconcile aborted = this recording's structure DIVERGES
+                        # from lrclib's studio lyric (live/extended/cover). The
+                        # forced_align / whisper_align fallbacks below force the
+                        # studio LINE STRUCTURE onto it, so the live's extra content
+                        # (repeated verses, ad-libs) is dropped — operator on "Nada
+                        # Fue Un Error En Vivo": forced_align placed only the 49
+                        # studio lines over 366s and left a 2-minute hole where the
+                        # live keeps singing. Before those, try LLM line-segmentation
+                        # of whisperX's OWN words: it captures what the recording
+                        # ACTUALLY sings, with Rotor-level timing + clean phrase
+                        # lines. Self-declining (flag off / Gemini fail / gates) →
+                        # returns _wx_segs unchanged → cascade continues to FA.
+                        # Gated by LLM_SEGMENT_ENABLED. (The _live_no_hint raw path
+                        # above also runs it, for lives detected by duration.)
+                        from pipeline import _llm_segment_words as _llm_seg2
+                        _llm_segs = _llm_seg2(_wx_segs, audio_path=_aa)
+                        if _llm_segs is not _wx_segs and len(_llm_segs) >= 2:
+                            logger.info(
+                                "[WC] reconcile aborted → LLM line-segmentation of "
+                                "whisperX (%d lines) — divergent recording, FA would "
+                                "force the wrong studio structure", len(_llm_segs))
+                            return _emit_segments(
+                                _llm_segs, _WC_WX, reference_lyrics=_canonical,
+                            )
+                        # Otherwise: try forced_align as a fallback before
                         # falling all the way back to whisperX raw — FA has
                         # a different anchoring strategy (greedy monotonic
                         # alignment over the full audio against the full
