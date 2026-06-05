@@ -391,6 +391,13 @@ def health_snapshot() -> dict:
             except Exception:
                 # rq not importable in this process — non-fatal for the API
                 pass
+            # Tier 3b: surface the Veo circuit-breaker state so operators can see
+            # when renders are falling to gradient due to a Veo quota event.
+            try:
+                import veo_breaker
+                snap["veo_breaker"] = veo_breaker.state()
+            except Exception:
+                pass
         elif redis_url:
             # Configured but unreachable: queue is broken. /enqueue will
             # raise in production; surface that to the load balancer.

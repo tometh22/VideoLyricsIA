@@ -6151,6 +6151,14 @@ def _generate_veo_video(prompt: str, output_path: str, job_id: str = None,
     last_error: str | None = None
     rate_limit_hits = 0
 
+    import veo_breaker
+    # Wall-clock budget on the SUBMIT phase (separate from the 600s poll
+    # deadline). Without it a 429 storm burns the full ~5.5 min of in-slot
+    # backoff before falling to gradient. Default 240s only ever bites during a
+    # repeated-429 cascade — a healthy submit succeeds on attempt 1, untouched.
+    _submit_budget_s = float(os.environ.get("VEO_SUBMIT_BUDGET_S", "240"))
+    _submit_deadline = _time.time() + _submit_budget_s
+
     for attempt in range(MAX_ATTEMPTS):
         try:
             logger.info("[BG] Veo 3: generating video (attempt %s/%s)...", attempt + 1, MAX_ATTEMPTS)
@@ -6168,6 +6176,7 @@ def _generate_veo_video(prompt: str, output_path: str, job_id: str = None,
             if r.status_code == 429 or "RESOURCE_EXHAUSTED" in r.text:
                 rate_limit_hits += 1
                 last_error = f"HTTP {r.status_code} rate-limited"
+                veo_breaker.record_rate_limit()  # feeds the cross-worker breaker
                 # Capped exponential backoff + ±20 % jitter. Without
                 # jitter, N concurrent jobs that all hit a 429 at the
                 # same instant retry in lock-step → second wave of
@@ -6175,6 +6184,12 @@ def _generate_veo_video(prompt: str, output_path: str, job_id: str = None,
                 # quota recovers naturally.
                 base = min(MAX_BACKOFF_S, 30 * (2 ** attempt))
                 wait = base * random.uniform(0.8, 1.2)
+                # Submit budget: don't keep sleeping in-slot past the budget —
+                # bail so the job falls to gradient instead of burning the full
+                # backoff during a quota storm.
+                if _time.time() + wait > _submit_deadline:
+                    logger.warning("[BG] Veo submit budget (%.0fs) exhausted — bailing to fallback", _submit_budget_s)
+                    break
                 logger.warning("[BG] Rate limited (HTTP %s), waiting %.1fs before retry...",
                                r.status_code, wait)
                 _time.sleep(wait)
@@ -6190,6 +6205,7 @@ def _generate_veo_video(prompt: str, output_path: str, job_id: str = None,
             operation_name = payload.get("name")
             if not operation_name:
                 raise RuntimeError(f"Veo response missing 'name': {payload}")
+            veo_breaker.record_success()  # Veo accepted → close the breaker if open
             break
         except RuntimeError:
             raise
@@ -6198,6 +6214,9 @@ def _generate_veo_video(prompt: str, output_path: str, job_id: str = None,
             logger.error("[BG] Veo 3 attempt %s request error: %s", attempt + 1, e)
             base = min(MAX_BACKOFF_S, 15 * (2 ** attempt))
             wait = base * random.uniform(0.8, 1.2)
+            if _time.time() + wait > _submit_deadline:
+                logger.warning("[BG] Veo submit budget exhausted (transient) — bailing to fallback")
+                break
             _time.sleep(wait)
             continue
 
@@ -6810,6 +6829,15 @@ def _ensure_background(style_hint: str, job_dir: str, lyrics_text: str = None,
     except Exception:
         _JobTimeoutException = ()
     quality_retry_used = False
+    # Tier 3b: if the cross-worker Veo breaker is OPEN (project-wide quota
+    # event), skip Veo entirely and fall straight to the gradient fallback
+    # below — no point burning a slot on attempts that will 429. is_open() is
+    # fail-CLOSED (Redis down/disabled → False → try Veo as usual) and half-open
+    # (lets one probe through to test recovery). Checked once before the loop.
+    import veo_breaker
+    _veo_breaker_open = veo_breaker.is_open()
+    if _veo_breaker_open:
+        logger.warning("[BG] Veo breaker OPEN — short-circuiting to gradient (skipping Veo)")
     # 1 retry interno (2 intentos). Antes eran 3, lo que sumado al
     # poll_deadline de 600s de Veo podía exceder cualquier job_timeout
     # razonable. Un solo "do-over" cubre tanto un fallo transitorio de Veo
@@ -6818,6 +6846,8 @@ def _ensure_background(style_hint: str, job_dir: str, lyrics_text: str = None,
     # de abajo (no re-lanza), así que el RQ Retry(max=2) NO reintenta Veo —
     # este loop es la única resiliencia ante hiccups transitorios de Veo.
     for attempt in range(2):
+        if _veo_breaker_open:
+            break  # breaker open → skip Veo, fall through to gradient fallback
         try:
             _generate_veo_video(
                 prompt, bg_path, job_id=job_id,
