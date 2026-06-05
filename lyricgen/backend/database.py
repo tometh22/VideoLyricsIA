@@ -83,17 +83,33 @@ if DATABASE_URL.startswith("postgres://"):
 _DB_POOL_SIZE = int(os.environ.get("DB_POOL_SIZE", "6"))
 _DB_MAX_OVERFLOW = int(os.environ.get("DB_MAX_OVERFLOW", "4"))
 
-_keepalive_args: dict = {}
-if DATABASE_URL.startswith("postgresql"):
-    # TCP keepalives so PG notices a dead client in ~80s instead of
-    # Railway's 2h default. Prevents zombie idle-in-transaction sessions
-    # from a container that Railway killed during a failed deploy.
-    _keepalive_args = {
+def _build_pg_connect_args() -> dict:
+    """psycopg2 connect_args for Railway Postgres.
+
+    - TCP keepalives so PG notices a dead client in ~80s instead of
+      Railway's 2h default. Prevents zombie idle-in-transaction sessions
+      from a container that Railway killed during a failed deploy.
+    - connect_timeout bounds the libpq TCP connect. WITHOUT it the connect
+      has no upper bound, so engine.connect() — used by the /health probe
+      (observability.py:health_snapshot) and by every fresh pool checkout —
+      can hang for tens of seconds when Railway's PRIVATE NETWORKING flaps,
+      blowing past the API's healthcheckTimeout=90 and getting a healthy
+      replica pulled out of rotation right when the blip hits. 5s turns the
+      blip into a fast, catchable error instead of a hang. Env-tunable
+      (DB_CONNECT_TIMEOUT) so it can be retuned without a code change.
+    """
+    return {
         "keepalives": 1,
         "keepalives_idle": 30,
         "keepalives_interval": 10,
         "keepalives_count": 5,
+        "connect_timeout": int(os.environ.get("DB_CONNECT_TIMEOUT", "5")),
     }
+
+
+_keepalive_args: dict = {}
+if DATABASE_URL.startswith("postgresql"):
+    _keepalive_args = _build_pg_connect_args()
 
 engine = create_engine(
     DATABASE_URL,
