@@ -1552,7 +1552,10 @@ export default function LyricsEditor({
 
       const part1 = words.slice(0, splitIdx).join(" ");
       const part2 = words.slice(splitIdx).join(" ");
-      const ratio = splitIdx / words.length;
+      // Split the time window by CHARACTER ratio, not word count: long words
+      // take longer to sing, so "splitIdx/words.length" drifted the boundary
+      // off the real vocal pause. Char-ratio matches autoSplitAllFromReference.
+      const ratio = part1.length / Math.max(1, part1.length + part2.length);
       const midTime = seg.start + (seg.end - seg.start) * ratio;
       const gap = 0.05;
       const nextId1 = prev.reduce((m, s) => Math.max(m, s._id), -1) + 1;
@@ -1648,6 +1651,23 @@ export default function LyricsEditor({
       const inserted = { _id: nextId, start: s, end: e, text: "" };
       return [...prev, inserted].sort((a, b) => a.start - b.start);
     });
+  };
+
+  // Smart "Agregar línea": when the operator has a row selected/focused,
+  // insert the new line RIGHT BELOW it (gap-interpolated, sync-preserving via
+  // insertLineAfter) — that's where they expect it to land. Only fall back to
+  // the playhead/end behaviour (addBlankLine) when nothing is focused yet
+  // (fresh job, before touching any row). focusedSegId persists as the
+  // last-focused row, so clicking the bottom button doesn't lose the target.
+  const addLineSmart = () => {
+    if (focusedSegId != null) {
+      const selIdx = edited.findIndex((s) => s._id === focusedSegId);
+      if (selIdx !== -1) {
+        insertLineAfter(selIdx);
+        return;
+      }
+    }
+    addBlankLine();
   };
 
   // Operator-friendly title: strip extension + collapse underscores/dashes
@@ -2977,11 +2997,21 @@ export default function LyricsEditor({
                     {(() => {
                       if (!(seg.text || "").trim()) return null;
                       const lines = linesForSeg(seg.text);
-                      if (lines <= 1) return null;
+                      // Surface the split affordance on long SINGLE lines too: a
+                      // 1-visual-line seg can still be too long to read/karaoke
+                      // comfortably (operator-reported). ~34 chars ≈ where a
+                      // lyric line gets unwieldy.
+                      const longSingle = lines <= 1 && (seg.text || "").trim().length > 34;
+                      if (lines <= 1 && !longSingle) return null;
                       if (lines === 2 && showWrap2Banner) return null;
                       return (
                         <div className="flex items-center gap-2 mt-1 ml-1">
-                          {lines === 2 ? (
+                          {longSingle ? (
+                            <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full
+                              bg-amber-500/10 text-amber-300 ring-1 ring-amber-500/25 text-[10px] font-medium">
+                              ↔ línea larga
+                            </span>
+                          ) : lines === 2 ? (
                             <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full
                               bg-amber-500/10 text-amber-300 ring-1 ring-amber-500/25 text-[10px] font-medium">
                               <span className="relative flex h-1.5 w-1.5">
@@ -2998,6 +3028,7 @@ export default function LyricsEditor({
                           )}
                           <button
                             onClick={() => splitSeg(seg._id)}
+                            title="Divide en dos líneas conservando el sync — reparte el tiempo proporcionalmente, no hay que re-sincronizar"
                             className="text-[10px] text-brand hover:text-brand-light transition-colors
                               flex items-center gap-0.5 px-2 py-0.5 rounded-lg
                               bg-brand/5 hover:bg-brand/15 ring-1 ring-brand/20"
@@ -3062,7 +3093,7 @@ export default function LyricsEditor({
           })}
           <button
             data-tour="editor-add-line"
-            onClick={addBlankLine}
+            onClick={addLineSmart}
             className="w-full mt-2 py-2.5 rounded-xl border border-dashed border-white/[0.08]
               hover:border-brand/40 hover:bg-brand/[0.04] text-gray-500 hover:text-brand-light
               text-caption transition-all flex items-center justify-center gap-1.5"

@@ -166,7 +166,15 @@ def run_bg_preview_job(job_id: str, bg_cache_key: str, params: dict) -> dict:
             bg_path = _ensure_background(
                 params.get("style", "auto"),  # style_hint (positional)
                 job_dir,                       # job_dir (positional)
-                job_id=f"bgpreview_{job_id}",
+                # job_id REAL del job ghost (existe en `jobs`, 12 chars). Antes
+                # se pasaba f"bgpreview_{job_id}" (~22 chars), lo que rompía el
+                # INSERT de provenance: ai_provenance.job_id es VARCHAR(12) con
+                # FK a jobs.job_id → StringDataRightTruncation (Sentry "Failed to
+                # insert provenance start row") y, aun si entrara por longitud,
+                # violaría el FK. Con el id real la auditoría UMG queda bien atada
+                # al job, y el progress-crawl + heartbeat de Veo ahora
+                # actualizan/protegen el job ghost correctamente.
+                job_id=job_id,
                 artist=params.get("artist", ""),
                 song_title=params.get("song_title", ""),
                 genre=params.get("genre", ""),
