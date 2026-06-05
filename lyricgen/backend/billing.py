@@ -1,5 +1,6 @@
 """Stripe billing integration for GenLy AI."""
 
+import asyncio
 import os
 import logging
 from datetime import datetime, timezone
@@ -34,6 +35,27 @@ def _send_email_async(fn, **kwargs):
 stripe.api_key = os.environ.get("STRIPE_SECRET_KEY", "")
 STRIPE_WEBHOOK_SECRET = os.environ.get("STRIPE_WEBHOOK_SECRET", "")
 FRONTEND_URL = os.environ.get("FRONTEND_URL", "http://localhost:5173")
+
+# Stripe SDK resilience. The SDK is synchronous and its default socket timeout
+# is ~80s with 0 retries — a slow/blipping Stripe (or its CDN) would otherwise
+# pin a worker for that long. Billing handlers are now plain `def` (run in the
+# FastAPI threadpool, so they never freeze the event loop), and these two knobs
+# cap the per-call ceiling on top of that.
+#   - max_network_retries: exists across SDK majors; safe to set globally.
+#   - HTTP timeout: the http-client API differs between SDK majors (8.x exposes
+#     stripe.http_client.RequestsClient; newer majors drop that module), so we
+#     set it defensively and tolerate its absence. The threadpool offload is the
+#     real event-loop protection; this is the secondary per-call bound.
+stripe.max_network_retries = int(os.environ.get("STRIPE_MAX_NETWORK_RETRIES", "2"))
+_stripe_http_timeout = int(os.environ.get("STRIPE_HTTP_TIMEOUT", "15"))
+try:  # pragma: no cover - SDK-version dependent
+    from stripe import http_client as _stripe_http
+    stripe.default_http_client = _stripe_http.RequestsClient(timeout=_stripe_http_timeout)
+except Exception as _stripe_http_err:  # pragma: no cover
+    logger.info(
+        "Stripe HTTP timeout not configured (SDK API differs: %s); "
+        "relying on max_network_retries + threadpool offload.", _stripe_http_err,
+    )
 
 # Refuse to accept unsigned webhook payloads when billing is wired up: an
 # unverified handler lets anyone POST a forged subscription update and grant
@@ -150,7 +172,7 @@ class CheckoutRequest(BaseModel):
 
 
 @router.post("/checkout")
-async def create_checkout_session(
+def create_checkout_session(
     body: CheckoutRequest,
     current_user: dict = Depends(get_current_user),
     db: Session = Depends(get_db),
@@ -202,7 +224,7 @@ async def create_checkout_session(
 
 
 @router.post("/portal")
-async def create_portal_session(
+def create_portal_session(
     current_user: dict = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
@@ -272,7 +294,7 @@ def _assert_downgrade_allowed(db: Session, user: User, target_plan_id: str,
 
 
 @router.post("/change-plan")
-async def change_plan(
+def change_plan(
     body: ChangePlanRequest,
     current_user: dict = Depends(get_current_user),
     db: Session = Depends(get_db),
@@ -321,7 +343,7 @@ async def change_plan(
 
 
 @router.post("/change-plan/preview")
-async def change_plan_preview(
+def change_plan_preview(
     body: ChangePlanPreviewRequest,
     current_user: dict = Depends(get_current_user),
     db: Session = Depends(get_db),
@@ -384,7 +406,7 @@ async def change_plan_preview(
 
 
 @router.post("/cancel")
-async def cancel_subscription(
+def cancel_subscription(
     current_user: dict = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
@@ -421,7 +443,7 @@ async def cancel_subscription(
 
 
 @router.post("/reactivate")
-async def reactivate_subscription(
+def reactivate_subscription(
     current_user: dict = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
@@ -446,7 +468,7 @@ async def reactivate_subscription(
 
 
 @router.get("/invoices")
-async def list_invoices(
+def list_invoices(
     current_user: dict = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
@@ -462,7 +484,7 @@ async def list_invoices(
 
 
 @router.get("/subscription")
-async def get_subscription(
+def get_subscription(
     current_user: dict = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
@@ -494,7 +516,7 @@ async def get_subscription(
 
 
 @router.get("/payment-method")
-async def get_payment_method(
+def get_payment_method(
     current_user: dict = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
@@ -568,6 +590,25 @@ async def get_payment_method(
 # Webhook
 # ---------------------------------------------------------------------------
 
+def _dispatch_webhook_event(db: Session, event_type: str, data: dict) -> None:
+    """Blocking DB dispatch for a verified Stripe webhook event. Run via
+    asyncio.to_thread from stripe_webhook so the SQLAlchemy writes don't block
+    the event loop. Pure routing — no behavior change from the inline version."""
+    if event_type == "checkout.session.completed":
+        _handle_checkout_completed(db, data)
+    elif event_type in ("customer.subscription.updated", "customer.subscription.created"):
+        # `created` is a safety net: if checkout.session.completed delivery
+        # fails, the subscription's metadata.plan_id (stamped in
+        # subscription_data at checkout) still lets us bind the plan.
+        _handle_subscription_updated(db, data)
+    elif event_type == "customer.subscription.deleted":
+        _handle_subscription_deleted(db, data)
+    elif event_type == "invoice.paid":
+        _handle_invoice_paid(db, data)
+    elif event_type == "invoice.payment_failed":
+        _handle_invoice_failed(db, data)
+
+
 @router.post("/webhook")
 async def stripe_webhook(request: Request, db: Session = Depends(get_db)):
     """Handle Stripe webhook events."""
@@ -599,19 +640,12 @@ async def stripe_webhook(request: Request, db: Session = Depends(get_db)):
 
     logger.info(f"Stripe webhook: {event_type}")
 
-    if event_type == "checkout.session.completed":
-        _handle_checkout_completed(db, data)
-    elif event_type in ("customer.subscription.updated", "customer.subscription.created"):
-        # `created` is a safety net: if checkout.session.completed delivery
-        # fails, the subscription's metadata.plan_id (stamped in
-        # subscription_data at checkout) still lets us bind the plan.
-        _handle_subscription_updated(db, data)
-    elif event_type == "customer.subscription.deleted":
-        _handle_subscription_deleted(db, data)
-    elif event_type == "invoice.paid":
-        _handle_invoice_paid(db, data)
-    elif event_type == "invoice.payment_failed":
-        _handle_invoice_failed(db, data)
+    # The dispatch handlers do blocking SQLAlchemy writes. Stripe retries
+    # webhooks aggressively, so a blocked event loop here stalls ALL traffic.
+    # construct_event above is fast crypto (kept inline so its 400 mapping
+    # stays clear); the DB-heavy dispatch runs off-loop. `db` is handed off
+    # wholesale to the thread (no concurrent use), which is safe for a Session.
+    await asyncio.to_thread(_dispatch_webhook_event, db, event_type, data)
 
     return JSONResponse({"received": True})
 
