@@ -98,8 +98,26 @@ def test_oauth_timeout_session_injects_default_timeout(monkeypatch):
     assert captured.get("timeout") == 7.5
 
 
-def test_oauth_explicit_timeout_is_not_overridden(monkeypatch):
-    """setdefault must not clobber an explicit per-call timeout."""
+def test_oauth_caps_googleauth_explicit_default(monkeypatch):
+    """THE regression guard: google-auth's transport ALWAYS passes an explicit
+    timeout (its _DEFAULT_TIMEOUT=120) to session.request — a `setdefault` would
+    be a no-op and the refresh would still hang 120s. The session must CAP it to
+    our bound. This drives the real google-auth call shape (explicit timeout)."""
+    import requests
+    import pipeline
+
+    captured = {}
+    monkeypatch.setattr(
+        requests.Session, "request",
+        lambda self, *a, **kw: captured.update(kw) or type("R", (), {"status_code": 200})(),
+    )
+    session = pipeline._make_timeout_session(7.5)
+    session.get("http://example.invalid/token", timeout=120)  # what google-auth passes
+    assert captured.get("timeout") == 7.5, "must cap google-auth's 120s default to our bound"
+
+
+def test_oauth_does_not_extend_a_shorter_explicit_timeout(monkeypatch):
+    """Cap only shortens — a deliberately-shorter explicit timeout is preserved."""
     import requests
     import pipeline
 

@@ -4587,16 +4587,22 @@ _OAUTH_REFRESH_TIMEOUT = float(os.environ.get("VEO_OAUTH_REFRESH_TIMEOUT", "10")
 
 
 def _make_timeout_session(timeout: float):
-    """A requests.Session that injects a default ``timeout`` on every call.
+    """A requests.Session that CAPS the per-call ``timeout`` at ``timeout``.
 
-    google-auth's transport honors the timeout of the Session it's handed,
-    so this is how we bound the OAuth refresh HTTP call. requests is imported
-    lazily (matching the rest of this module) to keep import cost down."""
+    We can't use setdefault: google-auth's transport ALWAYS passes an explicit
+    timeout (google/auth/transport/requests.py: __call__ defaults it to
+    _DEFAULT_TIMEOUT=120 and forwards it to session.request), so a setdefault
+    would be a no-op and the refresh would still hang up to 120s. Instead we
+    force-shorten to our bound while never EXTENDING a deliberately-shorter
+    explicit timeout. requests is imported lazily (matching the rest of this
+    module) to keep import cost down."""
     import requests as _req
 
     class _TimeoutSession(_req.Session):
         def request(self, *args, **kwargs):
-            kwargs.setdefault("timeout", timeout)
+            existing = kwargs.get("timeout")
+            if existing is None or (isinstance(existing, (int, float)) and existing > timeout):
+                kwargs["timeout"] = timeout
             return super().request(*args, **kwargs)
 
     return _TimeoutSession()
