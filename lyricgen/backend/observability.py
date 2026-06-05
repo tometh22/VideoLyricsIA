@@ -358,18 +358,36 @@ def health_snapshot() -> dict:
             try:
                 from rq import Queue, Worker
                 queues = {}
-                for qname in ("enterprise", "default"):
+                for qname in ("transcription", "bg_preview", "enterprise", "default"):
                     try:
                         queues[qname] = Queue(qname, connection=r).count
                     except Exception:
                         queues[qname] = -1
                 snap["queue_depth"] = queues
                 try:
-                    snap["workers_alive"] = len(Worker.all(connection=r))
+                    workers = Worker.all(connection=r)
+                    snap["workers_alive"] = len(workers)
                 except Exception:
+                    workers = []
                     snap["workers_alive"] = -1
                 if snap.get("workers_alive") == 0:
                     _degrade("no_workers")
+                # Tier 3 segmentation guard: with a segmented fleet (ShortWorker
+                # on transcription/bg_preview + Worker on enterprise/default), a
+                # rollout mistake (e.g. setting Worker QUEUES=enterprise,default
+                # before ShortWorker exists, or ShortWorker dying) leaves a queue
+                # with NO consumer. workers_alive stays >0 (the other pool is
+                # alive) so "no_workers" never fires and short jobs pile up
+                # silently. Degrade if any queue has work but nobody listening.
+                try:
+                    listened = set()
+                    for w in workers:
+                        listened.update(w.queue_names())
+                    for qname, depth in queues.items():
+                        if isinstance(depth, int) and depth > 0 and qname not in listened:
+                            _degrade(f"queue_{qname}_no_consumer")
+                except Exception:
+                    pass
             except Exception:
                 # rq not importable in this process — non-fatal for the API
                 pass
