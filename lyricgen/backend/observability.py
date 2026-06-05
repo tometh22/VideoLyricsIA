@@ -358,7 +358,7 @@ def health_snapshot() -> dict:
             try:
                 from rq import Queue, Worker
                 queues = {}
-                for qname in ("enterprise", "default"):
+                for qname in ("transcription", "bg_preview", "enterprise", "default"):
                     try:
                         queues[qname] = Queue(qname, connection=r).count
                     except Exception:
