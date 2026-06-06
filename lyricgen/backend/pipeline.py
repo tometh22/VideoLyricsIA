@@ -271,15 +271,28 @@ def _call_with_timeout(fn, timeout_s: float, label: str = ""):
     deadlock.
     """
     import concurrent.futures as _cf
-    with _cf.ThreadPoolExecutor(max_workers=1) as _ex:
-        try:
-            return _ex.submit(fn).result(timeout=timeout_s)
-        except _cf.TimeoutError as exc:
-            tag = f"[{label}] " if label else ""
-            logger.warning("%sGenAI call exceeded %.0fs timeout — raising", tag, timeout_s)
-            raise TimeoutError(
-                f"{label or 'GenAI'} call exceeded {timeout_s:.0f}s timeout"
-            ) from exc
+    # Tier 4 (H3): do NOT use the executor as a context manager. `with ... as _ex`
+    # calls executor.shutdown(wait=True) on __exit__, which BLOCKS until the
+    # orphaned (still-hung) task finishes — re-blocking the worker on the very
+    # timeout this is meant to escape (so the docstring's "unblocks the WORKER"
+    # was previously FALSE). Manage it manually and shutdown(wait=False) so a
+    # timeout returns control immediately; the orphan dies on the next recycle.
+    _ex = _cf.ThreadPoolExecutor(max_workers=1)
+    fut = _ex.submit(fn)
+    try:
+        _res = fut.result(timeout=timeout_s)
+        _ex.shutdown(wait=False)
+        return _res
+    except _cf.TimeoutError as exc:
+        _ex.shutdown(wait=False)  # abandon the orphan — never wait on it
+        tag = f"[{label}] " if label else ""
+        logger.warning("%sGenAI call exceeded %.0fs timeout — raising (orphan abandoned)", tag, timeout_s)
+        raise TimeoutError(
+            f"{label or 'GenAI'} call exceeded {timeout_s:.0f}s timeout"
+        ) from exc
+    except Exception:
+        _ex.shutdown(wait=False)  # fn() raised — don't block on shutdown either
+        raise
 
 
 def _ffprobe_duration(path: str) -> float | None:
@@ -383,6 +396,33 @@ def _cleanup_local_intermediates(job_dir: str) -> None:
                 except OSError:
                     pass
     except OSError:
+        pass
+
+
+def _cleanup_job_dir_on_failure(job_dir: str) -> None:
+    """Remove the ENTIRE local job dir when a render FAILS (Tier 4 / C5).
+
+    Unlike _cleanup_local_intermediates (success path: keeps any leftover
+    deliverable for recovery), a failed render has no good deliverables —
+    leaving its multi-GB intermediates (bg_generated.mp4, bg_looped_*, a
+    partial lyric_video.mp4 or a ~5 GB umg_master.mov) accumulates across
+    failures until the disk fills and the NEXT render fails mid-flush (the C5
+    cascade). Removing everything is safe ONLY when the input is R2-recoverable
+    (an RQ retry re-downloads it via input_r2_key and re-renders from scratch) —
+    so the CALLER must gate this on input_r2_key being set, and fall back to
+    _cleanup_local_intermediates (which preserves the local input) when it
+    isn't. Best-effort — never raises. Kill-switch CLEANUP_FAILED_JOB_DIR=false
+    keeps the old leak-but-debuggable behaviour for incident triage.
+    """
+    if os.environ.get("CLEANUP_FAILED_JOB_DIR", "true").strip().lower() == "false":
+        return
+    if not job_dir or not os.path.isdir(job_dir):
+        return
+    try:
+        import shutil
+        shutil.rmtree(job_dir, ignore_errors=True)
+        logger.info("[PIPELINE] cleaned up failed job dir (freed disk): %s", job_dir)
+    except Exception:
         pass
 
 
@@ -1224,6 +1264,17 @@ def run_pipeline(job_id: str, mp3_path: str, artist: str, style: str,
                 sentry_sdk.capture_exception(exc)
         except Exception:
             pass
+        # Tier 4 (C5): free the disk on failure. Without this, a failed render's
+        # multi-GB intermediates pile up until the disk fills and the NEXT
+        # render fails mid-flush. When R2 is enabled the input can be re-fetched
+        # (input_r2_key), so rmtree the whole dir — an RQ retry re-downloads +
+        # re-renders. When it ISN'T, the input lives only locally inside job_dir,
+        # so preserve it (just free the heavy bg intermediates) — else the retry
+        # would fail for lack of its own input. (Adversarial-review guard.)
+        if input_r2_key:
+            _cleanup_job_dir_on_failure(job_dir)
+        else:
+            _cleanup_local_intermediates(job_dir)
 
 
 # ---------------------------------------------------------------------------
@@ -4480,7 +4531,6 @@ def _fetch_lyrics_via_gemini_search(
     # We wrap the call in `concurrent.futures.ThreadPoolExecutor` with a
     # hard 30 s timeout. Lyrics-fetch is best-effort; if Vertex is slow we
     # rather fall through to bare Whisper than freeze the worker.
-    import concurrent.futures as _cf
     def _gemini_call():
         client = _get_genai_client()
         search_tool = types.Tool(google_search=types.GoogleSearch())
@@ -4496,8 +4546,10 @@ def _fetch_lyrics_via_gemini_search(
             ),
         )
     try:
-        with _cf.ThreadPoolExecutor(max_workers=1) as _ex:
-            response = _ex.submit(_gemini_call).result(timeout=30.0)
+        # Tier 4 (H3): use the fixed _call_with_timeout (shutdown(wait=False))
+        # instead of an inline `with ThreadPoolExecutor`, whose __exit__ would
+        # re-block on the hung orphan after a timeout — defeating the timeout.
+        response = _call_with_timeout(_gemini_call, 30.0, label="gemini-lyrics-search")
 
         text = ""
         try:
@@ -8403,7 +8455,14 @@ def _validate_umg_master(path: str, spec: RenderSpec) -> list[str]:
         "-show_streams", "-show_format",
         path,
     ]
-    result = subprocess.run(cmd, capture_output=True, text=True)
+    # Tier 4 (H2): bound the probe. This is the only critical-path subprocess
+    # that was missing a timeout — ffprobe on a corrupt/truncated multi-GB
+    # ProRes (the exact post-OOM state) can block forever, hanging the
+    # /download lazy-transcode request thread or the prewarm worker.
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+    except subprocess.TimeoutExpired:
+        return ["ffprobe timed out after 30s (corrupt or truncated master?)"]
     if result.returncode != 0:
         return [f"ffprobe failed: {result.stderr[-200:]}"]
 
@@ -8804,12 +8863,21 @@ def _render_lyrics_ass(
         if _use_complex else
         ["-vf", vfilter, "-map", "0:v", "-map", "1:a"]
     )
+    # Tier 4 (H6): optional encode thread cap. Without -threads, ffmpeg grabs
+    # ALL cores; if Railway co-schedules render replicas on a shared host,
+    # concurrent renders oversubscribe CPU → each encode stretches → renders
+    # cross the reaper's stalled threshold and look "stuck". Default empty = no
+    # cap = current behaviour. Set FFMPEG_THREADS=N (e.g. cores/expected-
+    # colocated-jobs) if oversubscription is observed.
+    _ff_threads = os.environ.get("FFMPEG_THREADS", "").strip()
+    _threads_arg = ["-threads", _ff_threads] if (_ff_threads.isdigit() and int(_ff_threads) > 0) else []
     cmd = [
         "ffmpeg", "-y", "-loglevel", "error",
         "-i", os.path.abspath(bg_looped),
         "-i", os.path.abspath(mp3_path),
         *_extra_in,
         *_filter_args,
+        *_threads_arg,
         *vargs,
         *aargs,
         "-r", spec.fps_str,
@@ -10194,4 +10262,16 @@ def run_edit_pipeline(
                 "error": str(exc),
             },
         )
+        # Tier 4 (C5): free the disk on a failed EDIT too — same leak/cascade as
+        # run_pipeline. Guarded on R2-recoverability (the edit re-derives the
+        # source from input_r2_key on retry). `input_r2_key` is a local set
+        # partway through, and `job_dir` may not exist yet on a very early
+        # failure — locals().get + the helper's own isdir guard make this safe.
+        if locals().get("input_r2_key"):
+            _cleanup_job_dir_on_failure(locals().get("job_dir"))
+        else:
+            try:
+                _cleanup_local_intermediates(locals().get("job_dir") or "")
+            except Exception:
+                pass
         raise
