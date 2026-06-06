@@ -68,6 +68,15 @@ restartPolicyMaxRetries = 5
 # el override y el servicio cae al [deploy] default sin healthcheck.
 
 [services.api.deploy]
+# Pre-serve DB migration. Railway runs this AFTER build, BEFORE the new
+# image serves traffic. prod_migrate.sh = `alembic upgrade head` with
+# `set -euo pipefail`, so a failed migration ABORTS the deploy and the old
+# image keeps serving (no broken /auth/me window). Runs once per deploy,
+# inside Railway (internal DATABASE_URL resolves), with the new image's
+# migration files. Path matches the Dockerfile layout (backend → /app/backend).
+# Prod DB is alembic-managed (current head b1c2d3e4f5a6); this advances it to
+# f9a0b1c2d3e4 (adds users.billing_status, profile cols, login_sessions).
+releaseCommand = "bash /app/backend/scripts/prod_migrate.sh"
 healthcheckPath = "/health"
 # Zero-downtime deploys. Railway Pro's OVERLAP behavior boots the new
 # replica, waits for healthcheck to pass, and only THEN kills the old.
