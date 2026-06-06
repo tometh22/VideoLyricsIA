@@ -4577,8 +4577,21 @@ async def _run_transcription_for_job(
                         # (reconcile aborts here). Self-declining → keeps _wx_segs on
                         # any failure. Lab on "Nada Fue Un Error (En Vivo)": matches
                         # Rotor line-for-line, timing byte-identical.
-                        from pipeline import _llm_segment_words as _llm_seg
+                        from pipeline import (
+                            _llm_segment_words as _llm_seg,
+                            _recover_gap_lyrics as _recover_gap,
+                        )
                         _wx_segs = _llm_seg(_wx_segs, audio_path=_aa)
+                        # Gap-recovery (GAP_RECOVERY_ENABLED, default off): whisperX
+                        # drops lyrics in loud live passages, leaving multi-second
+                        # holes (lab "Nada Fue Un Error En Vivo": an 84 s hole where
+                        # the chorus keeps going + the outro). Re-transcribe a SHORT
+                        # bounded clip at each hole's first voiced run → recovers the
+                        # real line without the long-clip hallucination loop. Runs
+                        # AFTER segmentation (already-clean lines) + self-declines.
+                        _wx_segs = _recover_gap(
+                            _wx_segs, audio_path=_aa, canonical=_canonical,
+                        )
                         return _emit_segments(
                             _wx_segs, _WC_WX, reference_lyrics=_canonical,
                         )
@@ -4683,9 +4696,18 @@ async def _run_transcription_for_job(
                         # returns _wx_segs unchanged → cascade continues to FA.
                         # Gated by LLM_SEGMENT_ENABLED. (The _live_no_hint raw path
                         # above also runs it, for lives detected by duration.)
-                        from pipeline import _llm_segment_words as _llm_seg2
+                        from pipeline import (
+                            _llm_segment_words as _llm_seg2,
+                            _recover_gap_lyrics as _recover_gap2,
+                        )
                         _llm_segs = _llm_seg2(_wx_segs, audio_path=_aa)
                         if _llm_segs is not _wx_segs and len(_llm_segs) >= 2:
+                            # Same gap-recovery as the no-hint path: fill the
+                            # multi-second holes whisperX leaves in loud lives with
+                            # a short bounded re-transcription (default off).
+                            _llm_segs = _recover_gap2(
+                                _llm_segs, audio_path=_aa, canonical=_canonical,
+                            )
                             logger.info(
                                 "[WC] reconcile aborted → LLM line-segmentation of "
                                 "whisperX (%d lines) — divergent recording, FA would "

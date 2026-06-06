@@ -4421,6 +4421,241 @@ def _llm_segment_words(segs: list[dict], *, audio_path: str, artist: str = "",
     return out_segs
 
 
+def _env_float(name: str, default: float) -> float:
+    """Read env var `name` as a float, falling back to `default` on unset or
+    parse error. Used for request-time tuning knobs (no redeploy)."""
+    try:
+        v = os.environ.get(name, "").strip()
+        return float(v) if v else default
+    except (TypeError, ValueError):
+        return default
+
+
+def _word_containment(snippet: str, reference: str) -> float:
+    """Fraction of `snippet`'s content words (accents stripped, stop-words
+    dropped) that also appear in `reference`. Unlike Jaccard overlap, this does
+    NOT penalise a short snippet against a long reference — the right gate for
+    "are these few recovered words real vocabulary from this song?". A total
+    hallucination scores low; a real (even repeated) line scores high (the loop
+    case is caught separately by the repeat guard). Returns 0..1."""
+    import unicodedata
+
+    def words(s: str) -> list[str]:
+        s = unicodedata.normalize("NFKD", s or "")
+        s = "".join(c for c in s if not unicodedata.combining(c))
+        toks = re.findall(r"[a-z0-9]+", s.lower())
+        stop = {"el", "la", "los", "las", "de", "del", "y", "o", "a", "en",
+                "que", "se", "un", "una", "es", "con", "por", "para", "no", "si"}
+        return [t for t in toks if t not in stop and len(t) >= 2]
+
+    snip = words(snippet)
+    ref = set(words(reference))
+    if not snip or not ref:
+        return 0.0
+    return sum(1 for t in snip if t in ref) / len(snip)
+
+
+def _recover_gap_lyrics(segs: list[dict], *, audio_path: str, artist: str = "",
+                        song: str = "", canonical: str = "",
+                        timeout_s: int = 60) -> list[dict]:
+    """Recover lyrics whisperX DROPPED inside large gaps, by re-transcribing a
+    SHORT, BOUNDED clip at the start of each gap.
+
+    Why bounded+short (the core finding): a LONG clip makes Gemini pattern-
+    complete the chorus into a mechanical loop — lab on "Nada Fue Un Error (En
+    Vivo)": an 84 s outro clip returned "Nada fue un error / Nada de esto fue"
+    x84, a pure hallucination over what is actually screams + a held "¡papá!"
+    (which Rotor itself only LABELS as "(grito)"). The SAME audio cut to ~8 s
+    returns the real 1–2 lines, no loop. So we recover ONLY the first voiced run
+    after a gap (the part adjacent to real lyrics) and STOP at the first
+    sustained silence — we never try to fill the whole gap. Screams/instrumental
+    stay untranscribed (as today), to be labelled by the operator.
+
+    Timing for recovered lines is APPROXIMATE (distributed across the detected
+    voiced run) — gap regions have no whisperX word timing by definition. Every
+    whisperX-timed line is left byte-identical; recovered words carry
+    provenance="gap-recovery" + low score so downstream can tell them apart.
+
+    Self-declining (returns INPUT unchanged) on: flag off, short/again-less word
+    stream, no qualifying gap, stem unreadable, librosa/Gemini failure,
+    unparseable / looping / low-overlap output. Never raises. Gated behind
+    GAP_RECOVERY_ENABLED (default off)."""
+    if not _env_flag("GAP_RECOVERY_ENABLED"):
+        return segs
+    try:
+        W: list[dict] = []
+        for s in (segs or []):
+            ws = s.get("words")
+            if not isinstance(ws, list):
+                return segs  # no word timing → can't locate gaps
+            for w in ws:
+                if (isinstance(w, dict)
+                        and isinstance(w.get("start"), (int, float))
+                        and isinstance(w.get("end"), (int, float))):
+                    W.append(w)
+        if len(W) < 8 or not audio_path or not os.path.exists(audio_path):
+            return segs
+        W.sort(key=lambda w: w["start"])
+
+        GAP_MIN = _env_float("GAP_RECOVERY_MIN_GAP", 8.0)
+        CLIP_MAX = _env_float("GAP_RECOVERY_CLIP_MAX", 10.0)
+        MAX_GAPS = int(_env_float("GAP_RECOVERY_MAX_GAPS", 4))
+        MAX_LINES = int(_env_float("GAP_RECOVERY_MAX_LINES", 6))
+        MIN_OVERLAP = _env_float("GAP_RECOVERY_MIN_OVERLAP", 0.45)
+
+        import soundfile as sf
+        import io
+        from google import genai
+        client = _get_genai_client()
+        if client is None:
+            return segs
+
+        sr = 22050
+        y, _sr = librosa.load(audio_path, sr=sr, mono=True)
+        audio_end = len(y) / sr
+
+        # Gaps = silences between consecutive words PLUS a trailing gap from the
+        # last word to end-of-audio. The trailing one matters because an
+        # upstream cleaner (LLM-segment / hallucination filter) may DROP the
+        # outro shouts, so the dropped lyrics are no longer "between" two words
+        # — they sit past the last surviving word.
+        gaps = [(W[i]["end"], W[i + 1]["start"]) for i in range(len(W) - 1)
+                if W[i + 1]["start"] - W[i]["end"] >= GAP_MIN]
+        if audio_end - W[-1]["end"] >= GAP_MIN:
+            gaps.append((W[-1]["end"], audio_end))
+        if not gaps:
+            return segs
+
+        # Reference voiced loudness: median RMS of the stem's louder frames
+        # (robust to the long quiet tails). Voiced threshold = 10% of it.
+        fl = int(0.25 * sr)
+        rms_all = librosa.feature.rms(y=y, frame_length=fl, hop_length=fl)[0]
+        loud = rms_all[rms_all > np.percentile(rms_all, 60)]
+        ref = float(np.median(loud)) if loud.size else 1e-6
+        voice_th = 0.10 * max(ref, 1e-6)
+        SIL_END = 0.8  # a silence this long ends the voiced run
+
+        ref_text = canonical or " ".join((w.get("word") or "") for w in W)
+        recovered: list[dict] = []
+
+        for (gs, ge) in gaps[:MAX_GAPS]:
+            # Walk frames from the gap start; capture the FIRST voiced run,
+            # ending it at the first sustained silence (or the clip cap).
+            run_start = run_end = None
+            sil = 0
+            tt = gs
+            cap = min(ge, gs + CLIP_MAX + 2.0)
+            while tt < cap:
+                seg = y[int(tt * sr):int((tt + 0.25) * sr)]
+                rms = float(np.sqrt(np.mean(seg ** 2))) if len(seg) else 0.0
+                if rms > voice_th:
+                    if run_start is None:
+                        run_start = tt
+                    run_end = tt + 0.25
+                    sil = 0
+                elif run_start is not None:
+                    sil += 1
+                    if sil * 0.25 >= SIL_END:
+                        break
+                tt += 0.25
+            if run_start is None or run_end is None or (run_end - run_start) < 1.5:
+                continue
+            c0 = max(gs, run_start - 0.3)
+            c1 = min(c0 + CLIP_MAX, run_end + 0.3, ge)
+            if c1 - c0 < 1.5:
+                continue
+
+            clip = y[int(c0 * sr):int(c1 * sr)]
+            buf = io.BytesIO()
+            sf.write(buf, clip, sr, format="WAV")
+            sysp = (
+                "Sos un transcriptor experto de lyric videos en español, nivel "
+                "Rotor.\n"
+                f"Te doy un FRAGMENTO CORTO de audio ({c1 - c0:.0f} s) de un vivo"
+                + (f" ({artist} — {song})" if artist else "") + ".\n"
+                "Transcribí EXACTAMENTE lo que se canta en ESTE fragmento corto.\n\n"
+                "REGLAS:\n"
+                "1. SOLO lo que escuchás en estos pocos segundos — son 1 o 2 "
+                "frases. NO repitas en loop, NO completes el estribillo entero.\n"
+                "2. Si es grito/instrumental/silencio, etiquetá: "
+                "(grito)/(instrumental)/(silencio).\n"
+                "3. Una frase por línea, mayúscula al inicio.\n"
+                + (f"- Letra oficial (ortografía, NO forzar): {ref_text}\n"
+                   if canonical else "")
+                + "FORMATO por línea, sin nada más: texto"
+            )
+            try:
+                resp = _call_with_timeout(
+                    lambda: client.models.generate_content(
+                        model="gemini-2.5-flash",
+                        contents=[
+                            genai.types.Part.from_bytes(
+                                data=buf.getvalue(), mime_type="audio/wav"),
+                            genai.types.Part.from_text(
+                                text="Transcribí este fragmento corto."),
+                        ],
+                        config=genai.types.GenerateContentConfig(
+                            system_instruction=sysp, temperature=0.1,
+                            max_output_tokens=400,
+                            thinking_config=genai.types.ThinkingConfig(
+                                thinking_budget=0),
+                        ),
+                    ),
+                    timeout_s=float(timeout_s), label="GAP-RECOVER",
+                )
+                out = (resp.text or "").strip()
+            except Exception as e:
+                logger.warning("[GAP-RECOVER] Gemini failed on gap %.0f–%.0f: %s",
+                               gs, ge, e)
+                continue
+
+            lines = [re.sub(r"^\s*\[\d+(?:\.\d+)?\]\s*", "", ln).strip()
+                     for ln in out.splitlines() if ln.strip()]
+            lines = [l for l in lines if l]
+            if not lines or len(lines) > MAX_LINES:
+                continue
+            # Loop guard: any phrase repeated ≥3× is the hallucination tell.
+            if any(lines.count(x) >= 3 for x in lines):
+                logger.info("[GAP-RECOVER] loop detected in gap %.0f–%.0f; skip",
+                            gs, ge)
+                continue
+            # v1: keep only LYRIC lines (drop pure (label) / ¡shout! lines —
+            # non-lyrical labelling is a separate feature).
+            lyric = [l for l in lines if not re.match(r"^\s*[\(¡]", l)]
+            if not lyric:
+                continue
+            if _word_containment(" ".join(lyric), ref_text) < MIN_OVERLAP:
+                logger.info("[GAP-RECOVER] low containment in gap %.0f–%.0f "
+                            "(hallucination guard); skip", gs, ge)
+                continue
+
+            span = (run_end - run_start) / len(lyric)
+            for li, txt in enumerate(lyric):
+                st = run_start + li * span
+                en = run_start + (li + 1) * span
+                toks = txt.split()
+                wsp = (en - st) / max(1, len(toks))
+                words = [{"word": tok, "start": st + wi * wsp,
+                          "end": st + (wi + 1) * wsp, "score": 0.3,
+                          "provenance": "gap-recovery"}
+                         for wi, tok in enumerate(toks)]
+                recovered.append({"start": float(st), "end": float(en),
+                                  "text": txt, "words": words,
+                                  "provenance": "gap-recovery"})
+
+        if not recovered:
+            return segs
+        merged = list(segs) + recovered
+        merged.sort(key=lambda s: s.get("start", 0.0))
+        logger.info("[GAP-RECOVER] recovered %d line(s) across %d gap(s) "
+                    "(approx timing, provenance-tagged)",
+                    len(recovered), min(len(gaps), MAX_GAPS))
+        return merged
+    except Exception as e:
+        logger.warning("[GAP-RECOVER] failed (%s); keeping segments", e)
+        return segs
+
+
 def _sanitize_gemini_lyrics(text):
     """Strip section/pilcrow markers that some Spanish lyrics sites use
     as estrofa separators (Letras.com, AZLyrics, etc.). These are HTML
