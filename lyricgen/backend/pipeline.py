@@ -407,10 +407,12 @@ def _cleanup_job_dir_on_failure(job_dir: str) -> None:
     leaving its multi-GB intermediates (bg_generated.mp4, bg_looped_*, a
     partial lyric_video.mp4 or a ~5 GB umg_master.mov) accumulates across
     failures until the disk fills and the NEXT render fails mid-flush (the C5
-    cascade). An RQ retry re-downloads the input from R2 (input_r2_key, see
-    run_pipeline) and re-renders from scratch, so removing everything is safe.
-    Best-effort — never raises. Kill-switch CLEANUP_FAILED_JOB_DIR=false keeps
-    the old leak-but-debuggable behaviour for incident triage.
+    cascade). Removing everything is safe ONLY when the input is R2-recoverable
+    (an RQ retry re-downloads it via input_r2_key and re-renders from scratch) —
+    so the CALLER must gate this on input_r2_key being set, and fall back to
+    _cleanup_local_intermediates (which preserves the local input) when it
+    isn't. Best-effort — never raises. Kill-switch CLEANUP_FAILED_JOB_DIR=false
+    keeps the old leak-but-debuggable behaviour for incident triage.
     """
     if os.environ.get("CLEANUP_FAILED_JOB_DIR", "true").strip().lower() == "false":
         return
@@ -1264,8 +1266,15 @@ def run_pipeline(job_id: str, mp3_path: str, artist: str, style: str,
             pass
         # Tier 4 (C5): free the disk on failure. Without this, a failed render's
         # multi-GB intermediates pile up until the disk fills and the NEXT
-        # render fails mid-flush. Safe: an RQ retry re-downloads + re-renders.
-        _cleanup_job_dir_on_failure(job_dir)
+        # render fails mid-flush. When R2 is enabled the input can be re-fetched
+        # (input_r2_key), so rmtree the whole dir — an RQ retry re-downloads +
+        # re-renders. When it ISN'T, the input lives only locally inside job_dir,
+        # so preserve it (just free the heavy bg intermediates) — else the retry
+        # would fail for lack of its own input. (Adversarial-review guard.)
+        if input_r2_key:
+            _cleanup_job_dir_on_failure(job_dir)
+        else:
+            _cleanup_local_intermediates(job_dir)
 
 
 # ---------------------------------------------------------------------------
@@ -10253,4 +10262,16 @@ def run_edit_pipeline(
                 "error": str(exc),
             },
         )
+        # Tier 4 (C5): free the disk on a failed EDIT too — same leak/cascade as
+        # run_pipeline. Guarded on R2-recoverability (the edit re-derives the
+        # source from input_r2_key on retry). `input_r2_key` is a local set
+        # partway through, and `job_dir` may not exist yet on a very early
+        # failure — locals().get + the helper's own isdir guard make this safe.
+        if locals().get("input_r2_key"):
+            _cleanup_job_dir_on_failure(locals().get("job_dir"))
+        else:
+            try:
+                _cleanup_local_intermediates(locals().get("job_dir") or "")
+            except Exception:
+                pass
         raise
