@@ -221,11 +221,20 @@ def send_job_completed(email: str, username: str, artist: str, filename: str, jo
 def send_usage_alert(email: str, username: str, percent: int, used: int, limit: int, plan: str):
     """Send usage alert at 80% or 100%."""
     if percent >= 100:
+        # Overage price is per-plan (e.g. Plan 250 = $15/video), not a flat
+        # +30%. Render the real per-video cost from the PLANS source of truth.
+        from auth import PLANS  # local import avoids a circular dependency
+        _plan = PLANS.get(plan, {})
+        _overage = _plan.get("price_per_video", 0) * _plan.get("overage_rate", 1)
+        _overage_note = (
+            f"Additional videos are billed at <strong>${_overage:g}/video</strong>."
+            if _overage else "Additional videos will incur overage charges."
+        )
         subject = f"Plan limit reached — {used}/{limit} videos"
         heading = "You've reached your plan limit"
         message = (
             f"You've used <strong>{used}</strong> of your <strong>{limit}</strong> videos "
-            f"this month on Plan {plan}. Additional videos will incur overage charges (+30%)."
+            f"this month on Plan {plan}. {_overage_note}"
         )
     else:
         subject = f"Usage alert — {percent}% of plan used"
