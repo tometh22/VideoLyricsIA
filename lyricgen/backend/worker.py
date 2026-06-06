@@ -12,9 +12,49 @@ finishes cleanly when the container is recycled.
 import logging
 import os
 import signal
+import socket
 import sys
 
 logger = logging.getLogger("genly.worker")
+
+
+def _redis_connect_kwargs() -> dict:
+    """Connection kwargs for the worker's Redis client (resilience to a
+    Railway PRIVATE-NETWORKING blip).
+
+    The worker's main loop does a long BLOCKING ``BLPOP`` to dequeue jobs.
+    That makes the timeout story different from the enqueue side
+    (queue_jobs.py uses a short ``socket_timeout=5``, fine for its quick
+    ping/enqueue ops): a short ``socket_timeout`` here would FIRE SPURIOUSLY
+    on every idle BLPOP and break dequeuing, so we deliberately do NOT set
+    it. Instead we detect a half-dead connection during the in-flight BLPOP
+    via tuned TCP keepalive — the OS probes the peer and tears the socket
+    down in ~30-60s, so RQ reconnects in seconds instead of the worker
+    silently wedging on a dead socket until Railway SIGKILLs it ~20 min
+    later (see WarmOnlyWorker docstring on the hung-parent BLPOP case).
+
+    ``socket_connect_timeout`` only bounds the INITIAL connect, so it's safe
+    and useful. ``health_check_interval`` pings idle connections before
+    reuse. The TCP_KEEP* options are Linux-only (prod runs Linux); we guard
+    them with getattr so importing/running on macOS dev/test is a no-op
+    (falls back to OS-default keepalive timing).
+    """
+    keepalive_opts: dict = {}
+    for _opt_name, _opt_val in (
+        ("TCP_KEEPIDLE", int(os.environ.get("REDIS_TCP_KEEPIDLE", "30"))),
+        ("TCP_KEEPINTVL", int(os.environ.get("REDIS_TCP_KEEPINTVL", "10"))),
+        ("TCP_KEEPCNT", int(os.environ.get("REDIS_TCP_KEEPCNT", "3"))),
+    ):
+        _opt = getattr(socket, _opt_name, None)
+        if _opt is not None:
+            keepalive_opts[_opt] = _opt_val
+
+    return {
+        "socket_connect_timeout": int(os.environ.get("REDIS_SOCKET_CONNECT_TIMEOUT", "5")),
+        "socket_keepalive": True,
+        "socket_keepalive_options": keepalive_opts,
+        "health_check_interval": int(os.environ.get("REDIS_HEALTH_CHECK_INTERVAL", "30")),
+    }
 
 from credentials_bootstrap import bootstrap_vertex_credentials
 bootstrap_vertex_credentials()
@@ -113,6 +153,27 @@ def _warn_if_shutdown_grace_too_short() -> None:
         )
 
 
+_DEFAULT_QUEUES = "transcription,bg_preview,enterprise,default"
+
+
+def _resolve_queue_names() -> list:
+    """Queue names this worker process listens on, in priority order.
+
+    Env-driven (QUEUES, comma-separated) so the SAME image runs as a segmented
+    fleet: a small ShortWorker pool (QUEUES=transcription,bg_preview) drains the
+    always-short jobs without waiting behind 12-20 min renders, while the render
+    pool (QUEUES=enterprise,default) owns the heavy work. RQ priority alone
+    doesn't preempt — once all render workers are inside long renders, a short
+    transcription waits the full render time; a dedicated pool fixes that.
+
+    Default = all four queues = current single-pool behavior, so shipping this
+    is a zero-behavior-change until QUEUES is set per Railway service.
+    """
+    raw = os.environ.get("QUEUES", _DEFAULT_QUEUES)
+    names = [q.strip() for q in raw.split(",") if q.strip()]
+    return names or _DEFAULT_QUEUES.split(",")
+
+
 def main():
     redis_url = os.environ.get("REDIS_URL", "").strip()
     if not redis_url:
@@ -150,7 +211,7 @@ def main():
         except Exception as e:
             logger.warning("[WORKER] Whisper preload failed (%s); will load on first job", e)
 
-    conn = Redis.from_url(redis_url)
+    conn = Redis.from_url(redis_url, **_redis_connect_kwargs())
     # Priority order:
     #   1. transcription — corta latencia (~15-20s), debe drenar primero para
     #      que el usuario vea el editor rápido. Si no es prioritaria queda
@@ -160,13 +221,11 @@ def main():
     #      no debe bloquear los renders finales (default). Latencia ~60-120s.
     #   3. enterprise — premium tenants (UMG/OMG) van antes que default.
     #   4. default — todo lo demás.
-    # Workers listen in this order; RQ pickup respects it.
-    queues = [
-        Queue("transcription", connection=conn),
-        Queue("bg_preview", connection=conn),
-        Queue("enterprise", connection=conn),
-        Queue("default", connection=conn),
-    ]
+    # Workers listen in this order; RQ pickup respects it. The set is
+    # env-driven (QUEUES) so this image can run as a segmented fleet — see
+    # _resolve_queue_names(). Default = all four = current behavior.
+    queue_names = _resolve_queue_names()
+    queues = [Queue(name, connection=conn) for name in queue_names]
     # WarmOnlyWorker: a burst of deploys (2nd SIGTERM mid-drain) would otherwise
     # COLD-kill the in-flight render. This subclass keeps every shutdown warm so
     # the render finishes. See the class docstring.
@@ -203,7 +262,7 @@ def main():
     except ValueError:
         max_jobs = 10
 
-    logger.info("[WORKER] Listening on: transcription, bg_preview, enterprise, default | max_jobs=%s", max_jobs)
+    logger.info("[WORKER] Listening on: %s | max_jobs=%s", ", ".join(queue_names), max_jobs)
     # CRITICAL (incident 2026-05-26): `with_scheduler=True` is required to
     # process retry-scheduled jobs. Every `enqueue_*` helper uses
     # `Retry(interval=N)` (queue_jobs.py:366/446/520) for survival across

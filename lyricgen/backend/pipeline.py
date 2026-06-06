@@ -271,15 +271,28 @@ def _call_with_timeout(fn, timeout_s: float, label: str = ""):
     deadlock.
     """
     import concurrent.futures as _cf
-    with _cf.ThreadPoolExecutor(max_workers=1) as _ex:
-        try:
-            return _ex.submit(fn).result(timeout=timeout_s)
-        except _cf.TimeoutError as exc:
-            tag = f"[{label}] " if label else ""
-            logger.warning("%sGenAI call exceeded %.0fs timeout — raising", tag, timeout_s)
-            raise TimeoutError(
-                f"{label or 'GenAI'} call exceeded {timeout_s:.0f}s timeout"
-            ) from exc
+    # Tier 4 (H3): do NOT use the executor as a context manager. `with ... as _ex`
+    # calls executor.shutdown(wait=True) on __exit__, which BLOCKS until the
+    # orphaned (still-hung) task finishes — re-blocking the worker on the very
+    # timeout this is meant to escape (so the docstring's "unblocks the WORKER"
+    # was previously FALSE). Manage it manually and shutdown(wait=False) so a
+    # timeout returns control immediately; the orphan dies on the next recycle.
+    _ex = _cf.ThreadPoolExecutor(max_workers=1)
+    fut = _ex.submit(fn)
+    try:
+        _res = fut.result(timeout=timeout_s)
+        _ex.shutdown(wait=False)
+        return _res
+    except _cf.TimeoutError as exc:
+        _ex.shutdown(wait=False)  # abandon the orphan — never wait on it
+        tag = f"[{label}] " if label else ""
+        logger.warning("%sGenAI call exceeded %.0fs timeout — raising (orphan abandoned)", tag, timeout_s)
+        raise TimeoutError(
+            f"{label or 'GenAI'} call exceeded {timeout_s:.0f}s timeout"
+        ) from exc
+    except Exception:
+        _ex.shutdown(wait=False)  # fn() raised — don't block on shutdown either
+        raise
 
 
 def _ffprobe_duration(path: str) -> float | None:
@@ -383,6 +396,33 @@ def _cleanup_local_intermediates(job_dir: str) -> None:
                 except OSError:
                     pass
     except OSError:
+        pass
+
+
+def _cleanup_job_dir_on_failure(job_dir: str) -> None:
+    """Remove the ENTIRE local job dir when a render FAILS (Tier 4 / C5).
+
+    Unlike _cleanup_local_intermediates (success path: keeps any leftover
+    deliverable for recovery), a failed render has no good deliverables —
+    leaving its multi-GB intermediates (bg_generated.mp4, bg_looped_*, a
+    partial lyric_video.mp4 or a ~5 GB umg_master.mov) accumulates across
+    failures until the disk fills and the NEXT render fails mid-flush (the C5
+    cascade). Removing everything is safe ONLY when the input is R2-recoverable
+    (an RQ retry re-downloads it via input_r2_key and re-renders from scratch) —
+    so the CALLER must gate this on input_r2_key being set, and fall back to
+    _cleanup_local_intermediates (which preserves the local input) when it
+    isn't. Best-effort — never raises. Kill-switch CLEANUP_FAILED_JOB_DIR=false
+    keeps the old leak-but-debuggable behaviour for incident triage.
+    """
+    if os.environ.get("CLEANUP_FAILED_JOB_DIR", "true").strip().lower() == "false":
+        return
+    if not job_dir or not os.path.isdir(job_dir):
+        return
+    try:
+        import shutil
+        shutil.rmtree(job_dir, ignore_errors=True)
+        logger.info("[PIPELINE] cleaned up failed job dir (freed disk): %s", job_dir)
+    except Exception:
         pass
 
 
@@ -1224,6 +1264,17 @@ def run_pipeline(job_id: str, mp3_path: str, artist: str, style: str,
                 sentry_sdk.capture_exception(exc)
         except Exception:
             pass
+        # Tier 4 (C5): free the disk on failure. Without this, a failed render's
+        # multi-GB intermediates pile up until the disk fills and the NEXT
+        # render fails mid-flush. When R2 is enabled the input can be re-fetched
+        # (input_r2_key), so rmtree the whole dir — an RQ retry re-downloads +
+        # re-renders. When it ISN'T, the input lives only locally inside job_dir,
+        # so preserve it (just free the heavy bg intermediates) — else the retry
+        # would fail for lack of its own input. (Adversarial-review guard.)
+        if input_r2_key:
+            _cleanup_job_dir_on_failure(job_dir)
+        else:
+            _cleanup_local_intermediates(job_dir)
 
 
 # ---------------------------------------------------------------------------
@@ -2608,10 +2659,13 @@ def _try_lrclib_search(artist: str, song: str) -> list:
         return []
     import requests as _req
     q = f"{artist} {song}".strip()
-    # lrclib.net hiccups (ReadTimeout/5xx) son transitorios y frecuentes.
-    # Un retry con backoff corto absorbe la mayoría sin colgar el pipeline.
-    # lrclib es best-effort (caemos a Gemini si falla), así que el log es
-    # WARNING — no ERROR — para no inundar Sentry con ruido manejado.
+    # lrclib.net read-timeouts / connection hiccups son transitorios y
+    # frecuentes. El retry sólo cubre EXCEPCIONES de red (ReadTimeout/
+    # ConnectionError); un 5xx devuelve [] sin reintento (no suele recuperarse
+    # en 1.5s y caemos a Gemini igual). Un retry con backoff corto absorbe la
+    # mayoría de los timeouts sin colgar el pipeline. lrclib es best-effort
+    # (caemos a Gemini si falla), así que el log es WARNING — no ERROR — para
+    # no inundar Sentry con ruido manejado.
     last_err = None
     for _attempt in range(2):
         try:
@@ -4237,6 +4291,136 @@ def _gemini_cleanup_lyrics(audio_path: str, lrclib_plain: str,
     return cleaned
 
 
+def _llm_segment_words(segs: list[dict], *, audio_path: str, artist: str = "",
+                       song: str = "", timeout_s: int = 90) -> list[dict]:
+    """Re-segment a whisperX word stream into clean phrase lines via Gemini,
+    grounded in the audio. The LLM decides the LINE GROUPING + fixes orthography
+    (a language task heuristics can't do); whisperX provides the exact TIMING —
+    each line's start/end come from its words' real timestamps, never re-timed.
+
+    Why this beats both alternatives for DIVERGENT LIVES: pause/length heuristics
+    can't find grammatical phrase boundaries, and `reconcile` aborts when the
+    live diverges from lrclib's studio structure. This re-segments the live's
+    OWN words, so there is no reference template to drift against. Validated in
+    the lab on "Nada Fue Un Error (En Vivo)": output matches Rotor line-for-line.
+
+    Self-declining (returns the INPUT segs unchanged) on: flag off, too-short,
+    a segment without word timing, Gemini failure, unparseable output, low
+    coverage, or low word-overlap (hallucination guard). Never raises. Gated
+    behind LLM_SEGMENT_ENABLED (default off)."""
+    if not _env_flag("LLM_SEGMENT_ENABLED"):
+        return segs
+    W: list[dict] = []
+    for s in (segs or []):
+        ws = s.get("words")
+        if not isinstance(ws, list):
+            return segs  # no word timing → can't map lines back to time
+        for w in ws:
+            if isinstance(w, dict) and "word" in w:
+                W.append(w)
+    if len(W) < 8:
+        return segs
+
+    numbered = " ".join(f"[{i}]{(w.get('word') or '').strip()}"
+                        for i, w in enumerate(W))
+    system_prompt = (
+        "Sos un editor profesional de lyric videos en español (estilo Rotor).\n"
+        "Te doy: (1) el AUDIO de la canción (puede ser un vivo), (2) su "
+        "transcripción palabra-por-palabra (cada palabra con su índice [n]). "
+        "Agrupá las palabras en LÍNEAS de lyric video.\n\n"
+        "CÓMO CORTAR (lo más importante):\n"
+        "- UNA frase corta por línea, estilo karaoke (~4 a 9 palabras).\n"
+        "- Cortá en cada límite de frase/cláusula natural. Ej: 'Yo quería que "
+        "nos pasara' y 'Y tú, y tú lo dejaste pasar' son DOS líneas.\n"
+        "- NO juntes dos frases en una sola línea.\n\n"
+        "ORTOGRAFÍA: acentos, MAYÚSCULA al inicio de CADA línea (estilo karaoke, "
+        "aunque sea continuación de la oración), signos (¿¡ incluidos).\n"
+        "AUDIO: usalo para (a) corregir palabras mal escuchadas, (b) poner los "
+        "coros/ad-libs de fondo entre paréntesis.\n\n"
+        "REGLAS DURAS:\n"
+        "- Cubrí TODAS las palabras, en orden, cada una en EXACTAMENTE una línea.\n"
+        "- Podés corregir ortografía/mishears contra el audio, pero NO inventes "
+        "contenido ni reordenes.\n"
+        "- Formato EXACTO por línea, sin nada más: [primer_indice-ultimo_indice] <texto>\n"
+        "  Ej: [0-3] Tengo una mala noticia\n"
+        "- Sin preámbulo, markdown ni comentarios."
+    )
+    try:
+        from google import genai
+        client = _get_genai_client()
+        if client is None:
+            return segs
+        with open(audio_path, "rb") as f:
+            audio_bytes = f.read()
+        ext = os.path.splitext(audio_path)[1].lower().lstrip(".")
+        mime = {"wav": "audio/wav", "mp3": "audio/mpeg", "flac": "audio/flac",
+                "ogg": "audio/ogg", "m4a": "audio/mp4"}.get(ext, "audio/wav")
+        resp = _call_with_timeout(
+            lambda: client.models.generate_content(
+                model="gemini-2.5-flash",
+                contents=[
+                    genai.types.Part.from_bytes(data=audio_bytes, mime_type=mime),
+                    genai.types.Part.from_text(text=numbered),
+                ],
+                config=genai.types.GenerateContentConfig(
+                    system_instruction=system_prompt, temperature=0.1,
+                    max_output_tokens=8000,
+                    thinking_config=genai.types.ThinkingConfig(thinking_budget=0),
+                ),
+            ),
+            timeout_s=float(timeout_s), label="LLM-SEGMENT",
+        )
+        out = (resp.text or "").strip()
+    except Exception as e:
+        logger.warning("[LLM-SEGMENT] failed (%s); keeping whisperX segments", e)
+        return segs
+
+    parsed = []
+    for ln in out.splitlines():
+        m = re.match(r"\s*\[(\d+)\s*-\s*(\d+)\]\s*(.+)", ln)
+        if not m:
+            continue
+        i, j, txt = int(m.group(1)), int(m.group(2)), m.group(3).strip()
+        if i > j or i < 0 or j >= len(W) or not txt:
+            continue
+        parsed.append((i, j, txt))
+    if not parsed:
+        logger.warning("[LLM-SEGMENT] no parseable lines; keeping whisperX")
+        return segs
+
+    # Gate (a): the line ranges must cover ~all the words (no big drops).
+    cov = set()
+    for i, j, _ in parsed:
+        cov.update(range(i, j + 1))
+    coverage = len(cov) / max(1, len(W))
+    if coverage < 0.9:
+        logger.warning("[LLM-SEGMENT] coverage %.2f < 0.9; keeping whisperX", coverage)
+        return segs
+    # Gate (b): anti-hallucination — the LLM text must overlap the whisperX text.
+    wx_text = " ".join((w.get("word") or "") for w in W)
+    llm_text = " ".join(t for _, _, t in parsed)
+    if _gemini_cleanup_word_overlap(llm_text, wx_text) < 0.5:
+        logger.warning("[LLM-SEGMENT] word-overlap < 0.5 (hallucination guard); keeping whisperX")
+        return segs
+
+    out_segs = []
+    for i, j, txt in parsed:
+        grp = W[i:j + 1]
+        st = next((w.get("start") for w in grp
+                   if isinstance(w.get("start"), (int, float))), None)
+        en = next((w.get("end") for w in reversed(grp)
+                   if isinstance(w.get("end"), (int, float))), None)
+        if st is None or en is None:
+            continue
+        out_segs.append({"start": float(st), "end": float(en),
+                         "text": txt, "words": grp})
+    if len(out_segs) < 2:
+        return segs
+    logger.info("[LLM-SEGMENT] re-segmented %d whisperX segs → %d clean lines "
+                "(coverage %.2f)", len(segs), len(out_segs), coverage)
+    return out_segs
+
+
 def _sanitize_gemini_lyrics(text):
     """Strip section/pilcrow markers that some Spanish lyrics sites use
     as estrofa separators (Letras.com, AZLyrics, etc.). These are HTML
@@ -4347,7 +4531,6 @@ def _fetch_lyrics_via_gemini_search(
     # We wrap the call in `concurrent.futures.ThreadPoolExecutor` with a
     # hard 30 s timeout. Lyrics-fetch is best-effort; if Vertex is slow we
     # rather fall through to bare Whisper than freeze the worker.
-    import concurrent.futures as _cf
     def _gemini_call():
         client = _get_genai_client()
         search_tool = types.Tool(google_search=types.GoogleSearch())
@@ -4363,8 +4546,10 @@ def _fetch_lyrics_via_gemini_search(
             ),
         )
     try:
-        with _cf.ThreadPoolExecutor(max_workers=1) as _ex:
-            response = _ex.submit(_gemini_call).result(timeout=30.0)
+        # Tier 4 (H3): use the fixed _call_with_timeout (shutdown(wait=False))
+        # instead of an inline `with ThreadPoolExecutor`, whose __exit__ would
+        # re-block on the hung orphan after a timeout — defeating the timeout.
+        response = _call_with_timeout(_gemini_call, 30.0, label="gemini-lyrics-search")
 
         text = ""
         try:
@@ -4571,6 +4756,48 @@ os.environ.setdefault("GOOGLE_APPLICATION_CREDENTIALS", _VERTEX_CREDENTIALS)
 _genai_client = None
 
 
+# OAuth token refresh to Google's endpoint sits INSIDE the Veo hot path:
+# _veo_access_token() is called on every Veo submit, every poll iteration,
+# and the download (pipeline ~6117/6224/6275), and _get_genai_client()
+# refreshes once at init. google-auth's default transport applies a 120s
+# per-call timeout — far too long when Railway's networking flaps: the
+# worker thread hangs on the refresh, and the Veo poll's own 600s deadline
+# only guards the poll HTTP call, NOT the token refresh that precedes it.
+# Binding the refresh to a session with a short default timeout makes a blip
+# fail fast so the pipeline can fall through to its fallback. Env-tunable.
+_OAUTH_REFRESH_TIMEOUT = float(os.environ.get("VEO_OAUTH_REFRESH_TIMEOUT", "10"))
+
+
+def _make_timeout_session(timeout: float):
+    """A requests.Session that CAPS the per-call ``timeout`` at ``timeout``.
+
+    We can't use setdefault: google-auth's transport ALWAYS passes an explicit
+    timeout (google/auth/transport/requests.py: __call__ defaults it to
+    _DEFAULT_TIMEOUT=120 and forwards it to session.request), so a setdefault
+    would be a no-op and the refresh would still hang up to 120s. Instead we
+    force-shorten to our bound while never EXTENDING a deliberately-shorter
+    explicit timeout. requests is imported lazily (matching the rest of this
+    module) to keep import cost down."""
+    import requests as _req
+
+    class _TimeoutSession(_req.Session):
+        def request(self, *args, **kwargs):
+            existing = kwargs.get("timeout")
+            if existing is None or (isinstance(existing, (int, float)) and existing > timeout):
+                kwargs["timeout"] = timeout
+            return super().request(*args, **kwargs)
+
+    return _TimeoutSession()
+
+
+def _oauth_refresh_request():
+    """google-auth transport Request whose HTTP calls carry a bounded timeout
+    (VEO_OAUTH_REFRESH_TIMEOUT) instead of the 120s transport default."""
+    from google.auth.transport.requests import Request as _AuthReq
+
+    return _AuthReq(session=_make_timeout_session(_OAUTH_REFRESH_TIMEOUT))
+
+
 def _get_genai_client():
     """Get a cached Vertex AI GenAI client.
 
@@ -4616,9 +4843,8 @@ def _get_genai_client():
 
                 # Validate the token at startup so we surface auth issues
                 # here in the worker logs instead of inside the model call.
-                from google.auth.transport.requests import Request as _AuthReq
                 try:
-                    credentials.refresh(_AuthReq())
+                    credentials.refresh(_oauth_refresh_request())
                     logger.info("[VERTEX] token refresh OK; valid=%s expiry=%s",
                                 credentials.valid, credentials.expiry)
                 except Exception as refresh_err:
@@ -5764,7 +5990,6 @@ def _veo_access_token() -> str:
     triggering invalid_scope errors on Railway despite the credentials being
     valid (Gemini works on the same token; only Veo rejects through the SDK)."""
     from google.oauth2 import service_account
-    from google.auth.transport.requests import Request
 
     creds_path = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS", "").strip()
     if not creds_path or not os.path.exists(creds_path):
@@ -5774,7 +5999,7 @@ def _veo_access_token() -> str:
         scopes=["https://www.googleapis.com/auth/cloud-platform"],
     )
     creds = creds.with_quota_project(_VERTEX_PROJECT)
-    creds.refresh(Request())
+    creds.refresh(_oauth_refresh_request())
     return creds.token
 
 
@@ -6108,6 +6333,14 @@ def _generate_veo_video(prompt: str, output_path: str, job_id: str = None,
     last_error: str | None = None
     rate_limit_hits = 0
 
+    import veo_breaker
+    # Wall-clock budget on the SUBMIT phase (separate from the 600s poll
+    # deadline). Without it a 429 storm burns the full ~5.5 min of in-slot
+    # backoff before falling to gradient. Default 240s only ever bites during a
+    # repeated-429 cascade — a healthy submit succeeds on attempt 1, untouched.
+    _submit_budget_s = float(os.environ.get("VEO_SUBMIT_BUDGET_S", "240"))
+    _submit_deadline = _time.time() + _submit_budget_s
+
     for attempt in range(MAX_ATTEMPTS):
         try:
             logger.info("[BG] Veo 3: generating video (attempt %s/%s)...", attempt + 1, MAX_ATTEMPTS)
@@ -6125,6 +6358,7 @@ def _generate_veo_video(prompt: str, output_path: str, job_id: str = None,
             if r.status_code == 429 or "RESOURCE_EXHAUSTED" in r.text:
                 rate_limit_hits += 1
                 last_error = f"HTTP {r.status_code} rate-limited"
+                veo_breaker.record_rate_limit()  # feeds the cross-worker breaker
                 # Capped exponential backoff + ±20 % jitter. Without
                 # jitter, N concurrent jobs that all hit a 429 at the
                 # same instant retry in lock-step → second wave of
@@ -6132,6 +6366,12 @@ def _generate_veo_video(prompt: str, output_path: str, job_id: str = None,
                 # quota recovers naturally.
                 base = min(MAX_BACKOFF_S, 30 * (2 ** attempt))
                 wait = base * random.uniform(0.8, 1.2)
+                # Submit budget: don't keep sleeping in-slot past the budget —
+                # bail so the job falls to gradient instead of burning the full
+                # backoff during a quota storm.
+                if _time.time() + wait > _submit_deadline:
+                    logger.warning("[BG] Veo submit budget (%.0fs) exhausted — bailing to fallback", _submit_budget_s)
+                    break
                 logger.warning("[BG] Rate limited (HTTP %s), waiting %.1fs before retry...",
                                r.status_code, wait)
                 _time.sleep(wait)
@@ -6147,6 +6387,7 @@ def _generate_veo_video(prompt: str, output_path: str, job_id: str = None,
             operation_name = payload.get("name")
             if not operation_name:
                 raise RuntimeError(f"Veo response missing 'name': {payload}")
+            veo_breaker.record_success()  # Veo accepted → close the breaker if open
             break
         except RuntimeError:
             raise
@@ -6155,6 +6396,9 @@ def _generate_veo_video(prompt: str, output_path: str, job_id: str = None,
             logger.error("[BG] Veo 3 attempt %s request error: %s", attempt + 1, e)
             base = min(MAX_BACKOFF_S, 15 * (2 ** attempt))
             wait = base * random.uniform(0.8, 1.2)
+            if _time.time() + wait > _submit_deadline:
+                logger.warning("[BG] Veo submit budget exhausted (transient) — bailing to fallback")
+                break
             _time.sleep(wait)
             continue
 
@@ -6755,7 +6999,27 @@ def _ensure_background(style_hint: str, job_dir: str, lyrics_text: str = None,
 
     bg_path = os.path.join(job_dir, "bg_generated.mp4")
     import time as _time_bg
+    # RQ's job_timeout (BG_PREVIEW_JOB_TIMEOUT, 900s) fires as a SIGALRM that
+    # raises JobTimeoutException — which subclasses Exception, so the generic
+    # `except Exception` below would swallow it and mask a real timeout as a
+    # "successful" gradient job, deleting the exact telemetry we want in Sentry.
+    # Catch it specifically and re-raise so the job is marked failed + stays
+    # visible. Empty-tuple fallback keeps the clause a harmless no-op if rq
+    # isn't importable (local/CI), where the death penalty never fires anyway.
+    try:
+        from rq.timeouts import JobTimeoutException as _JobTimeoutException
+    except Exception:
+        _JobTimeoutException = ()
     quality_retry_used = False
+    # Tier 3b: if the cross-worker Veo breaker is OPEN (project-wide quota
+    # event), skip Veo entirely and fall straight to the gradient fallback
+    # below — no point burning a slot on attempts that will 429. is_open() is
+    # fail-CLOSED (Redis down/disabled → False → try Veo as usual) and half-open
+    # (lets one probe through to test recovery). Checked once before the loop.
+    import veo_breaker
+    _veo_breaker_open = veo_breaker.is_open()
+    if _veo_breaker_open:
+        logger.warning("[BG] Veo breaker OPEN — short-circuiting to gradient (skipping Veo)")
     # 1 retry interno (2 intentos). Antes eran 3, lo que sumado al
     # poll_deadline de 600s de Veo podía exceder cualquier job_timeout
     # razonable. Un solo "do-over" cubre tanto un fallo transitorio de Veo
@@ -6764,6 +7028,8 @@ def _ensure_background(style_hint: str, job_dir: str, lyrics_text: str = None,
     # de abajo (no re-lanza), así que el RQ Retry(max=2) NO reintenta Veo —
     # este loop es la única resiliencia ante hiccups transitorios de Veo.
     for attempt in range(2):
+        if _veo_breaker_open:
+            break  # breaker open → skip Veo, fall through to gradient fallback
         try:
             _generate_veo_video(
                 prompt, bg_path, job_id=job_id,
@@ -6809,6 +7075,10 @@ def _ensure_background(style_hint: str, job_dir: str, lyrics_text: str = None,
             if score < 7:
                 logger.warning("[BG] Score %s < 7 after retry — accepting best available result", score)
             return bg_path
+        except _JobTimeoutException:
+            # Real RQ death-penalty timeout — propagate (don't degrade to
+            # gradient + swallow). Keeps the JobTimeoutException visible.
+            raise
         except Exception as e:
             logger.error("[BG] Veo 3 attempt %s/2 failed: %s", attempt + 1, e)
             if attempt < 1:
@@ -8185,7 +8455,14 @@ def _validate_umg_master(path: str, spec: RenderSpec) -> list[str]:
         "-show_streams", "-show_format",
         path,
     ]
-    result = subprocess.run(cmd, capture_output=True, text=True)
+    # Tier 4 (H2): bound the probe. This is the only critical-path subprocess
+    # that was missing a timeout — ffprobe on a corrupt/truncated multi-GB
+    # ProRes (the exact post-OOM state) can block forever, hanging the
+    # /download lazy-transcode request thread or the prewarm worker.
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+    except subprocess.TimeoutExpired:
+        return ["ffprobe timed out after 30s (corrupt or truncated master?)"]
     if result.returncode != 0:
         return [f"ffprobe failed: {result.stderr[-200:]}"]
 
@@ -8586,12 +8863,21 @@ def _render_lyrics_ass(
         if _use_complex else
         ["-vf", vfilter, "-map", "0:v", "-map", "1:a"]
     )
+    # Tier 4 (H6): optional encode thread cap. Without -threads, ffmpeg grabs
+    # ALL cores; if Railway co-schedules render replicas on a shared host,
+    # concurrent renders oversubscribe CPU → each encode stretches → renders
+    # cross the reaper's stalled threshold and look "stuck". Default empty = no
+    # cap = current behaviour. Set FFMPEG_THREADS=N (e.g. cores/expected-
+    # colocated-jobs) if oversubscription is observed.
+    _ff_threads = os.environ.get("FFMPEG_THREADS", "").strip()
+    _threads_arg = ["-threads", _ff_threads] if (_ff_threads.isdigit() and int(_ff_threads) > 0) else []
     cmd = [
         "ffmpeg", "-y", "-loglevel", "error",
         "-i", os.path.abspath(bg_looped),
         "-i", os.path.abspath(mp3_path),
         *_extra_in,
         *_filter_args,
+        *_threads_arg,
         *vargs,
         *aargs,
         "-r", spec.fps_str,
@@ -9976,4 +10262,16 @@ def run_edit_pipeline(
                 "error": str(exc),
             },
         )
+        # Tier 4 (C5): free the disk on a failed EDIT too — same leak/cascade as
+        # run_pipeline. Guarded on R2-recoverability (the edit re-derives the
+        # source from input_r2_key on retry). `input_r2_key` is a local set
+        # partway through, and `job_dir` may not exist yet on a very early
+        # failure — locals().get + the helper's own isdir guard make this safe.
+        if locals().get("input_r2_key"):
+            _cleanup_job_dir_on_failure(locals().get("job_dir"))
+        else:
+            try:
+                _cleanup_local_intermediates(locals().get("job_dir") or "")
+            except Exception:
+                pass
         raise

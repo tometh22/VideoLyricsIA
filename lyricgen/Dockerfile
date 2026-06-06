@@ -41,6 +41,17 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Copy backend code
 COPY backend/ ./backend/
 
+# Copy shared assets that live OUTSIDE backend/ (lyricgen/assets/): the
+# pre-baked effect overlays (fx/*.mp4) and the background fallbacks. The
+# `COPY backend/` above misses them because assets/ is a SIBLING of backend/,
+# not inside it. Without this, fx_compositor._FX_DIR — which resolves to
+# /app/backend/../assets/fx = /app/assets/fx — does not exist in the image,
+# so effect_path() returns None and EVERY effect (bokeh / snow / rain / stars
+# / light / aurora) silently no-ops in the render (the overlay is dropped and
+# the job still "succeeds"). Fonts kept working only because they live in
+# backend/fonts/. (Root cause of "el efecto no salió en el render", 2026-06-04.)
+COPY assets/ ./assets/
+
 # Copy built frontend
 COPY --from=frontend-build /app/frontend/dist ./frontend/dist
 

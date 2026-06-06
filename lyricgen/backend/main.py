@@ -43,6 +43,7 @@ from sqlalchemy.orm import Session
 from auth import (
     authenticate_user,
     create_token,
+    start_login_session,
     create_user,
     create_password_reset_token,
     create_email_verification_token,
@@ -71,7 +72,7 @@ from datetime import datetime, timedelta, timezone
 from database import (
     Job, User, UserSettings, AuditLog, APIKey, get_db, init_db,
     BackgroundAsset, AssetUsage, Delivery, DeliveryChangeRequest,
-    SalesLead, UserSession, scoped_db, pool_stats,
+    SalesLead, UserSession, LoginSession, scoped_db, pool_stats,
 )
 from jobs import bulk_delete_jobs, create_job, delete_job, get_job, get_all_jobs, update_job
 from observability import init_sentry, init_logging, health_snapshot
@@ -669,7 +670,7 @@ def _apply_asset_tenant_filter(query, current_user: dict):
 
 
 @app.get("/backgrounds")
-async def list_backgrounds(
+def list_backgrounds(
     current_user: dict = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
@@ -686,7 +687,7 @@ async def list_backgrounds(
 
 
 @app.get("/backgrounds/{asset_id}/usage")
-async def background_usage(
+def background_usage(
     asset_id: int,
     current_user: dict = Depends(get_current_user),
     db: Session = Depends(get_db),
@@ -812,7 +813,7 @@ def _resolve_library_background(
 
 
 @app.get("/fonts")
-async def list_fonts(current_user: dict = Depends(get_current_user)):
+def list_fonts(current_user: dict = Depends(get_current_user)):
     """Return the catalogue of selectable typography for the lyric video.
 
     The frontend renders previews directly via the Google Fonts CDN — every
@@ -1011,7 +1012,7 @@ async def login(body: LoginRequest, request: Request, db: Session = Depends(get_
     user = authenticate_user(db, body.username, body.password)
     if not user:
         raise HTTPException(status_code=401, detail="Invalid credentials")
-    token = create_token(user)
+    token = start_login_session(db, user, request)
 
     # Audit
     db.add(AuditLog(
@@ -1093,7 +1094,7 @@ async def register(body: RegisterRequest, request: Request, db: Session = Depend
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
 
-    token = create_token(user)
+    token = start_login_session(db, user, request)
 
     # Send welcome email
     if user.email:
@@ -1182,14 +1183,14 @@ async def verify_email_endpoint(body: VerifyEmailRequest, request: Request, db: 
 
 
 @app.get("/auth/me")
-async def me(current_user: dict = Depends(get_current_user)):
+def me(current_user: dict = Depends(get_current_user)):
     """Return current user info."""
     return current_user
 
 
 @app.post("/auth/refresh")
 @limiter.limit("60/minute")
-async def refresh_token(
+def refresh_token(
     request: Request,
     current_user: dict = Depends(get_current_user),
     db: Session = Depends(get_db),
@@ -1202,7 +1203,203 @@ async def refresh_token(
     user = get_user_by_id(db, current_user["id"])
     if not user or not user.is_active:
         raise HTTPException(status_code=401, detail="User not found or inactive")
-    return {"token": create_token(user)}
+    # Reusar el jti del token actual → mismo dispositivo/sesión, sólo se
+    # extiende el exp (no crea una sesión nueva en cada refresh).
+    return {"token": create_token(user, jti=current_user.get("jti"))}
+
+
+# ---------------------------------------------------------------------------
+# Configuración → Perfil (nombre + avatar)
+# ---------------------------------------------------------------------------
+
+class UpdateProfileRequest(BaseModel):
+    full_name: str | None = None
+
+
+@app.patch("/auth/profile")
+@limiter.limit("20/minute")
+async def update_profile(
+    body: UpdateProfileRequest,
+    request: Request,
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Actualizar el perfil propio (por ahora: nombre para mostrar)."""
+    user = get_user_by_id(db, current_user["id"])
+    if not user:
+        raise HTTPException(status_code=404, detail="Usuario no encontrado")
+    if body.full_name is not None:
+        user.full_name = body.full_name.strip()[:200] or None
+    db.commit()
+    db.refresh(user)
+    return user.to_dict()
+
+
+# Avatar: máx 5 MB, jpg/png/webp, se redimensiona a 256px y se sube a R2
+# bajo avatars/. Se sirve vía GET /auth/avatar/{user_id} con signed URL.
+_AVATAR_MAX_BYTES = 5 * 1024 * 1024
+_AVATAR_MIME = {"image/jpeg": "jpg", "image/png": "png", "image/webp": "webp"}
+
+
+@app.post("/auth/avatar")
+@limiter.limit("10/minute")
+async def upload_avatar(
+    request: Request,
+    file: UploadFile = File(...),
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Subir/reemplazar el avatar propio."""
+    if file.content_type not in _AVATAR_MIME:
+        raise HTTPException(status_code=400, detail="Formato no soportado. Usá JPG, PNG o WebP.")
+    raw = await file.read()
+    if len(raw) > _AVATAR_MAX_BYTES:
+        raise HTTPException(status_code=400, detail="La imagen supera los 5 MB.")
+    # Redimensionar a 256px (cuadrado, recorte centrado) y normalizar a PNG.
+    try:
+        from PIL import Image
+        import io
+        img = Image.open(io.BytesIO(raw)).convert("RGB")
+        side = min(img.size)
+        left = (img.width - side) // 2
+        top = (img.height - side) // 2
+        img = img.crop((left, top, left + side, top + side)).resize((256, 256))
+        buf = io.BytesIO()
+        img.save(buf, format="PNG")
+        data = buf.getvalue()
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"No pude procesar la imagen: {e}")
+
+    if not storage.is_enabled():
+        raise HTTPException(status_code=503, detail="Almacenamiento no disponible.")
+    key = f"avatars/{current_user['id']}.png"
+    if not storage.put_object_bytes(key, data, content_type="image/png"):
+        raise HTTPException(status_code=502, detail="No pude guardar el avatar.")
+
+    user = get_user_by_id(db, current_user["id"])
+    user.avatar_url = key
+    db.commit()
+    db.refresh(user)
+    return {"ok": True, "avatar_url": key}
+
+
+@app.get("/auth/avatar/{user_id}")
+async def get_avatar(user_id: int):
+    """Redirige a una signed URL del avatar (mismo patrón que el preview
+    de fondos). Público por user_id — un avatar no es información sensible
+    y simplifica el render en el sidebar/admin sin pasar token en la URL."""
+    with scoped_db() as db:
+        user = db.query(User).filter(User.id == user_id).first()
+        key = user.avatar_url if user else None
+    if not key:
+        raise HTTPException(status_code=404, detail="Sin avatar")
+    if storage.is_enabled():
+        url = storage.generate_signed_url(key, expiry_seconds=3600)
+        if url:
+            return RedirectResponse(url, status_code=302)
+    raise HTTPException(status_code=404, detail="Avatar no disponible")
+
+
+# ---------------------------------------------------------------------------
+# Configuración → Dispositivos (sesiones activas + cierre remoto)
+# ---------------------------------------------------------------------------
+
+@app.get("/auth/sessions")
+@limiter.limit("30/minute")
+async def list_sessions(
+    request: Request,
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Sesiones de login del usuario (dispositivos). Marca la actual."""
+    rows = (
+        db.query(LoginSession)
+        .filter(LoginSession.user_id == current_user["id"], LoginSession.revoked_at.is_(None))
+        .order_by(LoginSession.last_seen_at.desc())
+        .limit(50)
+        .all()
+    )
+    return {"sessions": [s.to_dict(current_jti=current_user.get("jti")) for s in rows]}
+
+
+@app.post("/auth/sessions/{session_id}/revoke")
+@limiter.limit("30/minute")
+async def revoke_session(
+    session_id: int,
+    request: Request,
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Cerrar una sesión (propia). El token de ese dispositivo queda 401
+    en su próximo request."""
+    sess = (
+        db.query(LoginSession)
+        .filter(LoginSession.id == session_id, LoginSession.user_id == current_user["id"])
+        .first()
+    )
+    if not sess:
+        raise HTTPException(status_code=404, detail="Sesión no encontrada")
+    if sess.revoked_at is None:
+        sess.revoked_at = datetime.now(timezone.utc)
+        db.commit()
+    return {"ok": True, "revoked": session_id, "was_current": sess.jti == current_user.get("jti")}
+
+
+@app.post("/auth/sessions/revoke-others")
+@limiter.limit("10/minute")
+async def revoke_other_sessions(
+    request: Request,
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Cerrar todas las sesiones menos la actual."""
+    now = datetime.now(timezone.utc)
+    q = db.query(LoginSession).filter(
+        LoginSession.user_id == current_user["id"],
+        LoginSession.revoked_at.is_(None),
+    )
+    if current_user.get("jti"):
+        q = q.filter(LoginSession.jti != current_user["jti"])
+    n = q.update({LoginSession.revoked_at: now}, synchronize_session=False)
+    db.commit()
+    return {"ok": True, "revoked_count": n}
+
+
+# ---------------------------------------------------------------------------
+# Configuración → Mi equipo (solo lectura)
+# ---------------------------------------------------------------------------
+
+@app.get("/team/members")
+@limiter.limit("30/minute")
+async def team_members(
+    request: Request,
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Compañeros del mismo workspace (tenant). Solo lectura — sin
+    invitaciones. Backs Configuración → Mi equipo."""
+    members = (
+        db.query(User)
+        .filter(User.tenant_id == current_user["tenant_id"], User.is_active == True)  # noqa: E712
+        .order_by(User.username)
+        .all()
+    )
+    return {
+        "tenant_id": current_user["tenant_id"],
+        "members": [
+            {
+                "id": u.id,
+                "username": u.username,
+                "full_name": u.full_name,
+                "avatar_url": u.avatar_url,
+                "role": u.role,
+                "is_self": u.id == current_user["id"],
+            }
+            for u in members
+        ],
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -1217,7 +1414,7 @@ _SESSION_GAP = timedelta(minutes=30)
 
 @app.post("/telemetry/heartbeat")
 @limiter.limit("30/minute")
-async def telemetry_heartbeat(
+def telemetry_heartbeat(
     request: Request,
     current_user: dict = Depends(get_current_user),
     db: Session = Depends(get_db),
@@ -1557,7 +1754,7 @@ async def drive_callback(
 
 
 @app.get("/drive/status")
-async def drive_status(
+def drive_status(
     current_user: dict = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
@@ -1616,7 +1813,7 @@ async def drive_disconnect(
 
 
 @app.get("/usage")
-async def usage(current_user: dict = Depends(get_current_user), db: Session = Depends(get_db)):
+def usage(current_user: dict = Depends(get_current_user), db: Session = Depends(get_db)):
     """Return current plan usage with overage info.
 
     2026-05-30 perf: cached in Redis with a 30 s TTL keyed by
@@ -3217,7 +3414,7 @@ async def transcribe_uploaded(
 # ---------------------------------------------------------------------------
 @app.get("/transcription-status/{job_id}")
 @limiter.limit("600/minute")  # polling holgado: 1 req/seg × ~10 archivos simultáneos
-async def transcription_status(
+def transcription_status(
     request: Request,
     job_id: str,
     current_user: dict = Depends(get_current_user),
@@ -4371,6 +4568,17 @@ async def _run_transcription_for_job(
                         logger.info(
                             "[WC] divergent live — emitting clean whisperX raw "
                             "(%d segs, Rotor-level timing)", len(_wx_segs))
+                        # LLM line-segmentation (LLM_SEGMENT_ENABLED, default off):
+                        # the no-hint whisperX has Rotor-level TIMING but native
+                        # VAD LINE breaks (merges/splits at the wrong words, e.g.
+                        # "noticia No"). Gemini re-groups the live's OWN words into
+                        # clean phrase lines + fixes orthography, mapped back to the
+                        # exact whisperX timing — no reference template to drift
+                        # (reconcile aborts here). Self-declining → keeps _wx_segs on
+                        # any failure. Lab on "Nada Fue Un Error (En Vivo)": matches
+                        # Rotor line-for-line, timing byte-identical.
+                        from pipeline import _llm_segment_words as _llm_seg
+                        _wx_segs = _llm_seg(_wx_segs, audio_path=_aa)
                         return _emit_segments(
                             _wx_segs, _WC_WX, reference_lyrics=_canonical,
                         )
@@ -4461,8 +4669,31 @@ async def _run_transcription_for_job(
                                     "[WC] synced-scaffold raised: %s — "
                                     "continuing cascade", _e_sc,
                                 )
-                        # Reconcile aborted (drift on too many lines or thin
-                        # coverage). Try forced_align as a fallback before
+                        # Reconcile aborted = this recording's structure DIVERGES
+                        # from lrclib's studio lyric (live/extended/cover). The
+                        # forced_align / whisper_align fallbacks below force the
+                        # studio LINE STRUCTURE onto it, so the live's extra content
+                        # (repeated verses, ad-libs) is dropped — operator on "Nada
+                        # Fue Un Error En Vivo": forced_align placed only the 49
+                        # studio lines over 366s and left a 2-minute hole where the
+                        # live keeps singing. Before those, try LLM line-segmentation
+                        # of whisperX's OWN words: it captures what the recording
+                        # ACTUALLY sings, with Rotor-level timing + clean phrase
+                        # lines. Self-declining (flag off / Gemini fail / gates) →
+                        # returns _wx_segs unchanged → cascade continues to FA.
+                        # Gated by LLM_SEGMENT_ENABLED. (The _live_no_hint raw path
+                        # above also runs it, for lives detected by duration.)
+                        from pipeline import _llm_segment_words as _llm_seg2
+                        _llm_segs = _llm_seg2(_wx_segs, audio_path=_aa)
+                        if _llm_segs is not _wx_segs and len(_llm_segs) >= 2:
+                            logger.info(
+                                "[WC] reconcile aborted → LLM line-segmentation of "
+                                "whisperX (%d lines) — divergent recording, FA would "
+                                "force the wrong studio structure", len(_llm_segs))
+                            return _emit_segments(
+                                _llm_segs, _WC_WX, reference_lyrics=_canonical,
+                            )
+                        # Otherwise: try forced_align as a fallback before
                         # falling all the way back to whisperX raw — FA has
                         # a different anchoring strategy (greedy monotonic
                         # alignment over the full audio against the full
@@ -6217,7 +6448,7 @@ async def generate_with_segments(
 
 
 @app.get("/admin/queue")
-async def admin_queue(current_user: dict = Depends(get_current_user)):
+def admin_queue(current_user: dict = Depends(get_current_user)):
     """Return queue depth per priority. Admin only."""
     if current_user.get("role") != "admin":
         raise HTTPException(status_code=403, detail="Admin only")
@@ -6225,7 +6456,7 @@ async def admin_queue(current_user: dict = Depends(get_current_user)):
 
 
 @app.get("/delivery-profiles")
-async def get_delivery_profiles(current_user: dict = Depends(get_current_user)):
+def get_delivery_profiles(current_user: dict = Depends(get_current_user)):
     """Return the catalog of accepted UMG specs for frontend dropdowns."""
     return {
         "profiles": ["youtube", "umg", "both"],
@@ -6234,7 +6465,7 @@ async def get_delivery_profiles(current_user: dict = Depends(get_current_user)):
 
 
 @app.get("/status/{job_id}")
-async def status(
+def status(
     job_id: str,
     current_user: dict = Depends(get_current_user),
     db: Session = Depends(get_db),
@@ -6316,6 +6547,39 @@ async def status(
     }
 
 
+def _sse_tick(token, job_id, scope, initial_user_id, initial_tenant_id):
+    """Blocking per-tick work for the /events SSE stream.
+
+    Run via ``asyncio.to_thread`` from the async generator so the JWT decode +
+    2 DB queries do NOT execute on the event loop on every 2s tick of every
+    open dashboard (with N tabs that was N×(decode+2 SELECT) on the loop each
+    2s). Returns ``(job_dict_or_None, unauthorized, reason)``.
+
+    Both re-validations below are deliberate and must stay:
+      - JWT re-decode every tick (audit P0 #73): a 90-min render can outlive
+        token expiry; surface ``unauthorized`` so the client falls back to
+        authed polling where the 401 triggers the logout flow.
+      - Tenant re-check every tick (PR #95): closes the window where an admin
+        transfers the user across tenants mid-stream. Security, not optional.
+    ``scoped_db()`` releases the connection back to the pool in milliseconds.
+    """
+    from auth import decode_token as _decode
+    try:
+        _decode(token)
+    except HTTPException:
+        return None, True, "token_expired"
+    except Exception:
+        # decode_token only raises HTTPException; treat any other JWT-lib
+        # error as an invalid token too.
+        return None, True, "token_invalid"
+    with scoped_db() as db_tick:
+        fresh_user = db_tick.query(User).filter(User.id == initial_user_id).first()
+        if not fresh_user or fresh_user.tenant_id != initial_tenant_id:
+            return None, True, "tenant_changed"
+        job = get_job(db_tick, job_id, **scope)
+    return job, False, ""
+
+
 @app.get("/events/{job_id}")
 async def job_events(
     job_id: str,
@@ -6373,45 +6637,18 @@ async def job_events(
 
     async def event_generator():
         last_sig = None
-        # Merge de dos fixes:
+        # Merge de dos fixes (ahora ejecutados en threadpool vía _sse_tick para
+        # no bloquear el event loop en cada tick — ver _sse_tick):
         #   - PR #97: scoped_db() per tick para evitar pool starvation.
         #   - PR #95: re-validar tenant del user en cada tick (cierra el
         #     window donde admin transfiere user entre tenants mid-stream).
-        # Ambas queries (User refresh + job fetch) ocurren dentro de la
-        # misma sesión corta del context manager → 1 connection por tick,
-        # ~2 SELECTs, devuelta al pool en milisegundos.
-        unauthorized = False
-        unauthorized_reason = "tenant_changed"
         while True:
-            # QA fix 2026-05-28 (audit P0 #73): re-validar JWT en cada
-            # tick. Pre-fix el token solo se decodeaba al abrir el SSE;
-            # un render de 90 min sobrevivía a la expiración del token
-            # sin avisar al cliente → UI frozen en "processing" silente.
-            # Ahora decodificamos en cada tick; si expiró, emit
-            # unauthorized para que el frontend caiga a polling auth'd
-            # (donde el 401 dispara el logout flow normal).
-            try:
-                from auth import decode_token as _decode
-                _decode(token)
-            except HTTPException:
-                unauthorized = True
-                unauthorized_reason = "token_expired"
-                job = None
-            except Exception:
-                # decode_token sólo levanta HTTPException; cualquier otro
-                # error de JWT lib lo tratamos como token inválido también.
-                unauthorized = True
-                unauthorized_reason = "token_invalid"
-                job = None
-            if not unauthorized:
-                with scoped_db() as db_tick:
-                    fresh_user = db_tick.query(User).filter(User.id == _initial_user_id).first()
-                    if not fresh_user or fresh_user.tenant_id != _initial_tenant_id:
-                        unauthorized = True
-                        unauthorized_reason = "tenant_changed"
-                        job = None
-                    else:
-                        job = get_job(db_tick, job_id, **scope)
+            # JWT decode + 2 SELECTs por tick son trabajo bloqueante; los
+            # corremos off-loop con asyncio.to_thread para que N dashboards
+            # abiertos no inunden el event loop cada 2 s.
+            job, unauthorized, unauthorized_reason = await asyncio.to_thread(
+                _sse_tick, token, job_id, scope, _initial_user_id, _initial_tenant_id,
+            )
             if unauthorized:
                 yield f"event: unauthorized\ndata: {json.dumps({'reason': unauthorized_reason})}\n\n"
                 break
@@ -6464,7 +6701,7 @@ async def job_events(
 
 
 @app.get("/jobs")
-async def list_jobs(
+def list_jobs(
     current_user: dict = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
@@ -8617,7 +8854,7 @@ async def deliver_to_drive(
 
 
 @app.get("/drive/transfers/{transfer_id}")
-async def get_drive_transfer(
+def get_drive_transfer(
     transfer_id: str,
     current_user: dict = Depends(get_current_user),
     db: Session = Depends(get_db),
@@ -9340,7 +9577,7 @@ async def create_variant(
 # ---------------------------------------------------------------------------
 
 @app.get("/settings")
-async def get_settings(
+def get_settings(
     current_user: dict = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
@@ -9350,7 +9587,7 @@ async def get_settings(
 
 
 @app.post("/settings")
-async def save_settings(
+def save_settings(
     body: dict,
     current_user: dict = Depends(get_current_user),
     db: Session = Depends(get_db),

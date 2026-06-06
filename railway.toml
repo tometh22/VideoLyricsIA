@@ -68,6 +68,15 @@ restartPolicyMaxRetries = 5
 # el override y el servicio cae al [deploy] default sin healthcheck.
 
 [services.api.deploy]
+# Pre-serve DB migration. Railway runs this AFTER build, BEFORE the new
+# image serves traffic. prod_migrate.sh = `alembic upgrade head` with
+# `set -euo pipefail`, so a failed migration ABORTS the deploy and the old
+# image keeps serving (no broken /auth/me window). Runs once per deploy,
+# inside Railway (internal DATABASE_URL resolves), with the new image's
+# migration files. Path matches the Dockerfile layout (backend → /app/backend).
+# Prod DB is alembic-managed (current head b1c2d3e4f5a6); this advances it to
+# f9a0b1c2d3e4 (adds users.billing_status, profile cols, login_sessions).
+releaseCommand = "bash /app/backend/scripts/prod_migrate.sh"
 healthcheckPath = "/health"
 # Zero-downtime deploys. Railway Pro's OVERLAP behavior boots the new
 # replica, waits for healthcheck to pass, and only THEN kills the old.
@@ -189,3 +198,42 @@ restartPolicyMaxRetries = 10
 # the file as source of truth and the next deploy would revert a
 # dashboard-only bump back to this value.
 numReplicas = 7
+
+# --- ShortWorker service (Tier 3 segmentation) ---
+#
+# Dedicated small pool for the ALWAYS-short queues (transcription ~20s,
+# bg_preview ~60-120s). RQ priority on the render pool doesn't preempt: once
+# all render workers are inside 12-20 min renders, a short transcription waits
+# the full render time (head-of-line blocking) and the operator's editor feels
+# frozen during a batch. This pool drains the short queues independently so
+# that never happens.
+#
+# Runs the SAME image as Worker (python worker.py); the only difference is the
+# QUEUES env var, set per-service in the Railway dashboard (NOT here —
+# railway.toml can't set platform env vars):
+#   • ShortWorker:  QUEUES=transcription,bg_preview
+#   • Worker:       QUEUES=enterprise,default      (set AFTER ShortWorker is up)
+# Also set RAILWAY_SHUTDOWN_TIMEOUT_SECONDS=1200 on ShortWorker (same as Worker).
+#
+# ⚠️ CRITICAL: the service name `ShortWorker` MUST match the Railway dashboard
+# exactly (case-sensitive) or Railway silently ignores this override (same
+# footgun documented on the Worker service above).
+#
+# ROLLOUT ORDER (so short queues are never left unserved):
+#   1. Ship the code (worker.py QUEUES default=all → Worker still drains all 4).
+#   2. Create the ShortWorker service with QUEUES=transcription,bg_preview.
+#   3. ONLY THEN set Worker's QUEUES=enterprise,default.
+
+[services.ShortWorker.build]
+watchPatterns = [
+    "lyricgen/backend/**",
+    "lyricgen/Dockerfile",
+    "railway.toml",
+]
+
+[services.ShortWorker.deploy]
+restartPolicyType = "ON_FAILURE"
+restartPolicyMaxRetries = 10
+# Short jobs are light (no ProRes/Veo); 2 replicas comfortably drain
+# transcription + bg_preview even during a full UMG render batch.
+numReplicas = 2

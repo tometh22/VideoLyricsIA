@@ -265,6 +265,104 @@ def send_invoice_paid(email: str, username: str, amount: float, currency: str, i
     _send_email(email, f"Payment received — ${amount:.2f}", _wrap_template(content))
 
 
+def send_subscription_welcome(email: str, username: str, plan: str, limit: int,
+                              monthly_price_usd: float = 0, manage_url: str = ""):
+    """One-time welcome after the FIRST paid invoice of a new subscription.
+
+    Triggered from _handle_invoice_paid only when
+    billing_reason=='subscription_create', so recurring monthly invoices keep
+    producing the receipt (send_invoice_paid), never a second welcome."""
+    manage_url = manage_url or (FRONTEND_URL + "/?view=settings&tab=facturacion")
+    price_line = f"<strong>${monthly_price_usd:,.0f}/mo</strong> " if monthly_price_usd else ""
+    content = f"""
+    <h2 style="color:#fff;margin:0 0 16px;">Welcome to Plan {plan}</h2>
+    <p>Hi <strong>{username}</strong>,</p>
+    <p>Your subscription is active. You're on <strong>Plan {plan}</strong> {price_line}with
+    <strong>{limit}</strong> videos included per month.</p>
+    <ul style="color:#cfcfcf;font-size:14px;padding-left:18px;margin:8px 0 4px;">
+      <li>AI transcription + karaoke timing</li>
+      <li>HD lyric video render &amp; YouTube publish</li>
+      <li>Background library + AI backgrounds</li>
+    </ul>
+    {_button(FRONTEND_URL, "Go to Dashboard")}
+    <p style="color:#888;font-size:13px;">Manage your plan, payment method, and invoices anytime in
+    <a href="{manage_url}" style="color:#a78bfa;">Settings &rarr; Billing</a>.</p>
+    """
+    _send_email(email, f"Welcome to Plan {plan} — GenLy AI", _wrap_template(content))
+
+
+def send_plan_changed(email: str, username: str, old_plan: str, new_plan: str,
+                      new_limit: int, direction: str = "changed"):
+    """Confirm an upgrade/downgrade. `direction` in {'upgrade','downgrade',
+    'changed'} decides the heading/copy; the caller computes it from the plan
+    limits."""
+    if direction == "upgrade":
+        heading = "Your plan has been upgraded"
+        lead = (f"You're now on <strong>Plan {new_plan}</strong> with "
+                f"<strong>{new_limit}</strong> videos per month "
+                f"(up from Plan {old_plan}). The change is effective immediately and "
+                f"prorated on your next invoice.")
+    elif direction == "downgrade":
+        heading = "Your plan has been updated"
+        lead = (f"You've moved to <strong>Plan {new_plan}</strong> "
+                f"(<strong>{new_limit}</strong> videos/mo) from Plan {old_plan}. "
+                f"Any unused balance is credited on your next invoice.")
+    else:
+        heading = "Your plan has changed"
+        lead = (f"Your subscription is now on <strong>Plan {new_plan}</strong> "
+                f"(<strong>{new_limit}</strong> videos/mo).")
+    content = f"""
+    <h2 style="color:#fff;margin:0 0 16px;">{heading}</h2>
+    <p>Hi <strong>{username}</strong>,</p>
+    <p>{lead}</p>
+    {_button(FRONTEND_URL + "/?view=settings&tab=facturacion", "View Billing")}
+    <p style="color:#888;font-size:13px;">Didn't make this change? Reply to this email right away.</p>
+    """
+    _send_email(email, f"Plan updated: now on Plan {new_plan} — GenLy AI", _wrap_template(content))
+
+
+def send_subscription_cancelled(email: str, username: str,
+                                access_until: str = "", resubscribe_url: str = ""):
+    """Confirm cancellation (fired at subscription.deleted). `access_until`
+    (human-readable, optional) is the end of the paid period if Stripe
+    provides one; otherwise we omit the date line."""
+    resubscribe_url = resubscribe_url or (FRONTEND_URL + "/?view=settings")
+    access_line = (
+        f"<p>You'll keep access until <strong>{access_until}</strong>, after which your "
+        f"account moves to the free plan.</p>"
+        if access_until else
+        "<p>Your account has moved to the free plan.</p>"
+    )
+    content = f"""
+    <h2 style="color:#fff;margin:0 0 16px;">Your subscription was cancelled</h2>
+    <p>Hi <strong>{username}</strong>,</p>
+    {access_line}
+    <p>Changed your mind? You can re-subscribe to any plan at any time.</p>
+    {_button(resubscribe_url, "Reactivate Subscription")}
+    <p style="color:#888;font-size:13px;">Need a copy of past invoices? Find them in
+    <a href="{FRONTEND_URL}/?view=settings&tab=facturacion" style="color:#a78bfa;">Settings &rarr; Billing</a>.</p>
+    """
+    _send_email(email, "Subscription cancelled — GenLy AI", _wrap_template(content))
+
+
+def send_cancellation_scheduled(email: str, username: str, access_until: str = ""):
+    """Fired when a user schedules a cancellation (cancel_at_period_end) from
+    the in-app cancel CTA. Distinct from send_subscription_cancelled, which
+    fires later when the subscription actually ends."""
+    until = (f"<strong>{access_until}</strong>" if access_until else "the end of your billing period")
+    content = f"""
+    <h2 style="color:#fff;margin:0 0 16px;">Your subscription is scheduled to cancel</h2>
+    <p>Hi <strong>{username}</strong>,</p>
+    <p>Your subscription will end on {until}. You keep full access until then —
+    nothing changes before that date.</p>
+    <p>Changed your mind? You can reactivate any time before it ends and keep
+    your current plan with no interruption.</p>
+    {_button(FRONTEND_URL + "/?view=settings&tab=facturacion", "Reactivate Subscription")}
+    <p style="color:#888;font-size:13px;">If you didn't request this, reply to this email right away.</p>
+    """
+    _send_email(email, "Subscription scheduled to cancel — GenLy AI", _wrap_template(content))
+
+
 def send_payment_failed(email: str, username: str, amount: float, currency: str,
                         retry_date: str = ""):
     """Notify user that their payment failed and action is required.

@@ -83,17 +83,33 @@ if DATABASE_URL.startswith("postgres://"):
 _DB_POOL_SIZE = int(os.environ.get("DB_POOL_SIZE", "6"))
 _DB_MAX_OVERFLOW = int(os.environ.get("DB_MAX_OVERFLOW", "4"))
 
-_keepalive_args: dict = {}
-if DATABASE_URL.startswith("postgresql"):
-    # TCP keepalives so PG notices a dead client in ~80s instead of
-    # Railway's 2h default. Prevents zombie idle-in-transaction sessions
-    # from a container that Railway killed during a failed deploy.
-    _keepalive_args = {
+def _build_pg_connect_args() -> dict:
+    """psycopg2 connect_args for Railway Postgres.
+
+    - TCP keepalives so PG notices a dead client in ~80s instead of
+      Railway's 2h default. Prevents zombie idle-in-transaction sessions
+      from a container that Railway killed during a failed deploy.
+    - connect_timeout bounds the libpq TCP connect. WITHOUT it the connect
+      has no upper bound, so engine.connect() — used by the /health probe
+      (observability.py:health_snapshot) and by every fresh pool checkout —
+      can hang for tens of seconds when Railway's PRIVATE NETWORKING flaps,
+      blowing past the API's healthcheckTimeout=90 and getting a healthy
+      replica pulled out of rotation right when the blip hits. 5s turns the
+      blip into a fast, catchable error instead of a hang. Env-tunable
+      (DB_CONNECT_TIMEOUT) so it can be retuned without a code change.
+    """
+    return {
         "keepalives": 1,
         "keepalives_idle": 30,
         "keepalives_interval": 10,
         "keepalives_count": 5,
+        "connect_timeout": int(os.environ.get("DB_CONNECT_TIMEOUT", "5")),
     }
+
+
+_keepalive_args: dict = {}
+if DATABASE_URL.startswith("postgresql"):
+    _keepalive_args = _build_pg_connect_args()
 
 engine = create_engine(
     DATABASE_URL,
@@ -210,6 +226,11 @@ class User(Base):
     role = Column(String(20), nullable=False, default="user")  # user, admin
     tenant_id = Column(String(100), nullable=False, default="default", index=True)
     plan_id = Column(String(20), nullable=False, default="100")
+    # Perfil del usuario (Configuración → Perfil). full_name se muestra en
+    # vez del username cuando existe; avatar_url es la key R2 del avatar
+    # (servido vía GET /auth/avatar/{id} con signed URL).
+    full_name = Column(String(200), nullable=True)
+    avatar_url = Column(String(500), nullable=True)
     # Cuenta de facturación compartida entre tenants. Caso Universal Music:
     # "universal_argentina" y "universal_chile" son tenants separados (no se
     # ven los videos entre sí) pero AMBOS consumen del mismo plan de 250/mes
@@ -221,6 +242,15 @@ class User(Base):
     email_verified = Column(Boolean, default=False)
     stripe_customer_id = Column(String(255), nullable=True, unique=True)
     stripe_subscription_id = Column(String(255), nullable=True)
+
+    # Dunning state for the in-app "payment failed" banner (Fase 1.5).
+    # "active" = in good standing; "past_due" = a charge failed and Stripe
+    # is retrying (Smart Retries) — the user keeps access during the grace
+    # period but the app nudges them to fix their card. Maintained purely
+    # by the Stripe webhooks in billing.py; "active" is the safe default so
+    # no row shows a banner until a real failure flips it.
+    billing_status = Column(String(20), nullable=False, default="active",
+                            server_default="active")
 
     # AI authorization (UMG compliance — Guideline 5)
     ai_authorized = Column(Boolean, default=False)
@@ -262,6 +292,8 @@ class User(Base):
             "tenant_id": self.tenant_id,
             "plan": self.plan_id,
             "billing_group": self.billing_group,
+            "full_name": self.full_name,
+            "avatar_url": self.avatar_url,
             "is_active": self.is_active,
             "email_verified": self.email_verified,
             "ai_authorized": self.ai_authorized,
@@ -269,6 +301,7 @@ class User(Base):
             "max_concurrent_jobs": self.max_concurrent_jobs,
             "allow_overage": self.allow_overage,
             "stripe_customer_id": self.stripe_customer_id,
+            "billing_status": self.billing_status or "active",
             "created_at": self.created_at.isoformat() if self.created_at else None,
         }
 
@@ -844,6 +877,45 @@ class UserSession(Base):
         }
 
 
+class LoginSession(Base):
+    """Sesión de login = un dispositivo/navegador con un token activo.
+
+    Distinta de UserSession (eso es telemetría de tiempo-en-app). Esta
+    backs "Configuración → Dispositivos": ver dónde estás logueado y
+    cerrar sesión remota.
+
+    El JWT lleva un `jti` (uuid) que apunta a la fila acá. get_current_user
+    valida que la fila exista y no esté revocada → revocar = setear
+    revoked_at y ese token queda 401 en su próximo request, aunque el JWT
+    en sí siga sin expirar. Tokens viejos sin jti (emitidos antes de esta
+    feature) se aceptan sin chequeo y expiran solos.
+    """
+    __tablename__ = "login_sessions"
+    __table_args__ = (
+        Index("ix_login_sessions_user_active", "user_id", "revoked_at"),
+    )
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    jti = Column(String(64), unique=True, nullable=False, index=True)
+    ip_address = Column(String(45), nullable=True)
+    user_agent = Column(String(400), nullable=True)
+    created_at = Column(DateTime(timezone=True), default=utcnow, nullable=False)
+    last_seen_at = Column(DateTime(timezone=True), default=utcnow, nullable=False)
+    revoked_at = Column(DateTime(timezone=True), nullable=True)
+
+    def to_dict(self, current_jti=None):
+        return {
+            "id": self.id,
+            "ip_address": self.ip_address,
+            "user_agent": self.user_agent,
+            "created_at": self.created_at.isoformat() if self.created_at else None,
+            "last_seen_at": self.last_seen_at.isoformat() if self.last_seen_at else None,
+            "revoked": self.revoked_at is not None,
+            "current": current_jti is not None and self.jti == current_jti,
+        }
+
+
 class AIProvenance(Base):
     """Records every AI tool invocation for UMG compliance and copyright audit."""
     __tablename__ = "ai_provenance"
@@ -1016,6 +1088,10 @@ def _migrate_user_columns():
         # Alembic de billing_group.
         "ALTER TABLE users ADD COLUMN IF NOT EXISTS billing_group VARCHAR(100)",
         "CREATE INDEX IF NOT EXISTS ix_users_billing_group ON users(billing_group)",
+        # Perfil (Configuración → Perfil). Espejo de la migración de
+        # full_name/avatar_url. login_sessions la crea create_all().
+        "ALTER TABLE users ADD COLUMN IF NOT EXISTS full_name VARCHAR(200)",
+        "ALTER TABLE users ADD COLUMN IF NOT EXISTS avatar_url VARCHAR(500)",
     ]
     # Each statement gets its own transaction. In Postgres, a failed statement
     # inside a transaction puts it in aborted state — subsequent execute()
