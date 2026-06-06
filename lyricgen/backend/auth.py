@@ -26,11 +26,11 @@ PLANS = {
              "stripe_price_id": None, "bg_preview_enabled": False},
     "100": {"limit": 100, "price_per_video": 9.00, "overage_rate": 1.30, "monthly_price": 900,
             "stripe_price_id": os.environ.get("STRIPE_PRICE_100"), "bg_preview_enabled": True},
-    # Plan "250": $8/video included in $2000/mo, with overage at $12/video
-    # ($8 × 1.5). UMG-style B2B accounts opt into allow_overage so they
+    # Plan "250": $8/video included in $2000/mo, with overage at $15/video
+    # ($8 × 1.875). UMG-style B2B accounts opt into allow_overage so they
     # never get blocked at 250 — extra videos invoice out-of-band by
     # transfer.
-    "250": {"limit": 250, "price_per_video": 8.00, "overage_rate": 1.50, "monthly_price": 2000,
+    "250": {"limit": 250, "price_per_video": 8.00, "overage_rate": 1.875, "monthly_price": 2000,
             "stripe_price_id": os.environ.get("STRIPE_PRICE_250"), "bg_preview_enabled": True},
     "500": {"limit": 500, "price_per_video": 7.00, "overage_rate": 1.30, "monthly_price": 3500,
             "stripe_price_id": os.environ.get("STRIPE_PRICE_500"), "bg_preview_enabled": True},
