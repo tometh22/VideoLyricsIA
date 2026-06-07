@@ -3586,6 +3586,19 @@ def _env_flag(name: str) -> bool:
     return _os.environ.get(name, "").strip().lower() in ("1", "true", "yes", "on")
 
 
+def _env_flag_on_by_default(name: str) -> bool:
+    """True UNLESS env var `name` is explicitly set to a falsy value
+    ('0','false','no','off'). Use for VALIDATED quality helpers that must be ON
+    by default in prod so they cannot be silently disabled by a config/env reset
+    — while staying overridable per-deploy. History: the live-timing rescue
+    (LLM line-segmentation + gap-recovery) was gated OFF-by-default and turned ON
+    only via per-environment dashboard vars; a prod env reset flipped them off and
+    regressed every divergent live (e.g. "Nada Fue Un Error En Vivo"). Defaulting
+    ON here makes that regression unrepeatable."""
+    import os as _os
+    return _os.environ.get(name, "1").strip().lower() not in ("0", "false", "no", "off")
+
+
 # Tenants whose contract requires the UMG Guideline 15 content filter
 # (no faces / hands / logos in backgrounds). All other tenants render
 # freely by default and can opt in via force_content_validation. Mirror
@@ -4307,8 +4320,9 @@ def _llm_segment_words(segs: list[dict], *, audio_path: str, artist: str = "",
     Self-declining (returns the INPUT segs unchanged) on: flag off, too-short,
     a segment without word timing, Gemini failure, unparseable output, low
     coverage, or low word-overlap (hallucination guard). Never raises. Gated
-    behind LLM_SEGMENT_ENABLED (default off)."""
-    if not _env_flag("LLM_SEGMENT_ENABLED"):
+    behind LLM_SEGMENT_ENABLED (default ON 2026-06-07 — validated rescue for
+    divergent lives; set =0 to disable)."""
+    if not _env_flag_on_by_default("LLM_SEGMENT_ENABLED"):
         return segs
     W: list[dict] = []
     for s in (segs or []):
@@ -4479,8 +4493,9 @@ def _recover_gap_lyrics(segs: list[dict], *, audio_path: str, artist: str = "",
     Self-declining (returns INPUT unchanged) on: flag off, short/again-less word
     stream, no qualifying gap, stem unreadable, librosa/Gemini failure,
     unparseable / looping / low-overlap output. Never raises. Gated behind
-    GAP_RECOVERY_ENABLED (default off)."""
-    if not _env_flag("GAP_RECOVERY_ENABLED"):
+    GAP_RECOVERY_ENABLED (default ON 2026-06-07 — validated tail/gap rescue for
+    divergent lives; set =0 to disable)."""
+    if not _env_flag_on_by_default("GAP_RECOVERY_ENABLED"):
         return segs
     try:
         W: list[dict] = []

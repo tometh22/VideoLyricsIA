@@ -3335,6 +3335,26 @@ async def transcribe_uploaded(
             )
     _validate_audio_file_on_disk(job_row.filename, audio_path)
 
+    # 2026-06-07: artist/title fill-in for the lrclib lookup. /upload-url commits
+    # job_row.artist from (form ∨ filename-parse ∨ "Unknown"). When the user
+    # uploaded a file with no "Artist - " prefix AND hadn't typed the artist yet,
+    # the row holds "Unknown" → lrclib 404 → the live-timing rescue can't engage
+    # (the divergent-live detection LIVE_NO_HINT needs the lrclib DURATION; the
+    # synced-scaffold needs lrclib synced). Root cause of the "Nada Fue Un Error
+    # En Vivo" mistimings. Accept body.artist/title ONLY to fill an Unknown/empty
+    # row. This does NOT reopen the 2026-05-27 ghost-job incident: that was body
+    # metadata DIVERGING from a REAL row value; here we fill only when the row has
+    # no real value, so there is nothing to swap. Mutates job_row in the open
+    # session → persisted by the status commit just below.
+    _eff_artist = (job_row.artist or "").strip()
+    _eff_title = (job_row.song_title or "").strip()
+    if (not _eff_artist or _eff_artist == "Unknown") and (body.artist or "").strip():
+        _eff_artist = body.artist.strip()
+        job_row.artist = _eff_artist
+    if not _eff_title and (body.title or "").strip():
+        _eff_title = body.title.strip()
+        job_row.song_title = _eff_title
+
     if _async_enabled:
         # Async path — enqueue + 202 + status polling.
         # Flippeamos status a "transcribing_queued" para que /transcription-status
@@ -3357,8 +3377,8 @@ async def transcribe_uploaded(
                 job_id,
                 audio_path,
                 language=body.language,
-                artist=job_row.artist or "",
-                title=job_row.song_title or "",
+                artist=_eff_artist or "",
+                title=_eff_title or "",
                 filename=job_row.filename,
                 tenant_id=current_user.get("tenant_id", ""),
             )
@@ -3398,8 +3418,8 @@ async def transcribe_uploaded(
         return await _run_transcription_for_job(
             request, current_user, job_id, audio_path,
             language=body.language,
-            artist=job_row.artist or "",
-            title=job_row.song_title or "",
+            artist=_eff_artist or "",
+            title=_eff_title or "",
         )
     finally:
         _release_transcription_slot(transcription_lease)
@@ -4504,8 +4524,13 @@ async def _run_transcription_for_job(
                 # is untouched.
                 _lrc_dur = (lrc or {}).get("duration") if isinstance(lrc, dict) else None
                 _live_no_hint = bool(
-                    os.environ.get("LIVE_NO_HINT_ENABLED", "0").strip().lower()
-                    in ("1", "true", "yes", "on")
+                    # Default ON 2026-06-07 (set =0 to disable). Only fires when
+                    # the upload is >60s longer than the lrclib record (divergent
+                    # live/extended), so studio songs are untouched. Was gated OFF
+                    # + per-env dashboard var → a prod env reset regressed every
+                    # extended live; default-ON makes that unrepeatable.
+                    os.environ.get("LIVE_NO_HINT_ENABLED", "1").strip().lower()
+                    not in ("0", "false", "no", "off")
                     and _audio_dur_for_lrc and _lrc_dur
                     and (float(_audio_dur_for_lrc) - float(_lrc_dur)) > 60.0
                 )
