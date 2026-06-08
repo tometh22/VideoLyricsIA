@@ -4523,6 +4523,37 @@ async def _run_transcription_for_job(
                 # when we can't measure (missing lrclib duration) so default behavior
                 # is untouched.
                 _lrc_dur = (lrc or {}).get("duration") if isinstance(lrc, dict) else None
+
+                # ─── Rotor hybrid pipeline (ROTOR_PIPELINE_ENABLED, default
+                # OFF). Gated, self-declining, lazy-imported so the boot can't
+                # break if anything is missing. When ON, it auto-routes by the
+                # SAME divergent-live heuristic used just below (no manual
+                # toggle): divergent live → gemini-2.5-pro chunked; otherwise
+                # whisper-1 word-stamps → _llm_segment_words. Both onset-snap.
+                # If it returns None (declines) or the flag is off, the cascade
+                # below runs UNCHANGED — prod behaviour is byte-identical.
+                from pipeline import _env_flag as _rp_env_flag
+                if _rp_env_flag("ROTOR_PIPELINE_ENABLED"):
+                    try:
+                        import rotor_pipeline as _rotor
+                        _rp = await asyncio.to_thread(
+                            _rotor.run_rotor_pipeline, _aa,
+                            artist=artist, title=title, language=lang,
+                            lrc_duration=_lrc_dur, audio_duration=_audio_dur_for_lrc,
+                        )
+                    except Exception as _rp_e:
+                        logger.warning("[ROTOR] run_rotor_pipeline raised (%s) — "
+                                       "falling through to cascade", _rp_e)
+                        _rp = None
+                    if _rp:
+                        _rp_segs, _rp_source = _rp
+                        logger.info("[ROTOR] hybrid pipeline emitted %d segs via %s",
+                                    len(_rp_segs), _rp_source)
+                        return _emit_segments(
+                            _rp_segs, _rp_source, reference_lyrics=(_canonical or ""),
+                        )
+                    # _rp is None → declined; continue the existing cascade.
+
                 _live_no_hint = bool(
                     # Default ON 2026-06-07 (set =0 to disable). Only fires when
                     # the upload is >60s longer than the lrclib record (divergent

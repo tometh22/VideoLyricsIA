@@ -39,7 +39,7 @@ BACKEND = HERE.parent
 sys.path.insert(0, str(BACKEND))
 sys.path.insert(0, str(HERE))
 
-from pipeline_runner import transcribe_local, _env_truthy  # noqa: E402
+from pipeline_runner import transcribe_local, transcribe_local_via_main, _env_truthy  # noqa: E402
 
 DATASET = HERE.parent / "benchmark" / "dataset"
 
@@ -51,24 +51,37 @@ def _output_filename() -> str:
     lets the operator run with just one flag at a time if they want
     to attribute a delta to a single helper.
     """
-    if _env_truthy("ENABLE_TIER1") or _env_truthy("VALIDATE_SEGMENTS") or _env_truthy("POLISH_TEXT"):
+    if (_env_truthy("ENABLE_TIER1") or _env_truthy("VALIDATE_SEGMENTS")
+            or _env_truthy("POLISH_TEXT") or _env_truthy("ROTOR_PIPELINE_ENABLED")):
         return "improvement_output.json"
     return "baseline_output.json"
 
 
 def main() -> None:
+    import argparse
+    ap = argparse.ArgumentParser(description=__doc__)
+    ap.add_argument("--via-main", action="store_true",
+                    help="Run the FULL real cascade (main._run_transcription_for_job, DB stubbed) "
+                         "instead of the legacy fast-path. Use this to benchmark what prod actually does.")
+    ap.add_argument("--only", default="", help="only run the dataset dir with this name (slug)")
+    args = ap.parse_args()
+
     if not DATASET.exists():
         print(f"[ERR] dataset dir not found: {DATASET}", file=sys.stderr)
         print(f"      Run build_benchmark_dataset.py first.", file=sys.stderr)
         sys.exit(2)
 
     dirs = sorted(p for p in DATASET.iterdir() if p.is_dir())
+    if args.only:
+        dirs = [d for d in dirs if d.name == args.only]
     if not dirs:
         print(f"[ERR] no job dirs under {DATASET}", file=sys.stderr)
         sys.exit(2)
 
     out_name = _output_filename()
     mode_label = "TIER 1 (with improvements)" if out_name == "improvement_output.json" else "BASELINE"
+    if args.via_main:
+        mode_label += " · VIA-MAIN (real cascade)"
     print(f"Running pipeline in {mode_label} mode against {len(dirs)} job(s)")
     print(f"Output filename: {out_name}")
     print()
@@ -93,13 +106,22 @@ def main() -> None:
 
         print(f"[{d.name}] {meta.get('artist','')} - {meta.get('song_title','')}")
         try:
-            result = transcribe_local(
-                audio_path=audio_path,
-                artist=meta.get("artist", ""),
-                song_title=meta.get("song_title", ""),
-                language="es",  # benchmark dataset is Spanish
-                verbose=True,
-            )
+            if args.via_main:
+                result = transcribe_local_via_main(
+                    audio_path=audio_path,
+                    artist=meta.get("artist", ""),
+                    title=meta.get("song_title", ""),
+                    language="es",
+                    job_id=d.name,
+                )
+            else:
+                result = transcribe_local(
+                    audio_path=audio_path,
+                    artist=meta.get("artist", ""),
+                    song_title=meta.get("song_title", ""),
+                    language="es",  # benchmark dataset is Spanish
+                    verbose=True,
+                )
         except Exception as e:
             print(f"  ✗ failed: {e}")
             failed += 1
