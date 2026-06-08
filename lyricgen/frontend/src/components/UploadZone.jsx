@@ -725,6 +725,9 @@ export default function UploadZone({
 
   const FONTS = [
     { code: "",                label: t("upload.font_auto") || "Auto",     css: "" },
+    { code: "fredoka",         label: "Fredoka (redondeada)",              css: "'Fredoka', sans-serif",    weight: 600 },
+    { code: "quicksand",       label: "Quicksand (suave)",                 css: "'Quicksand', sans-serif",  weight: 700 },
+    { code: "nunito",          label: "Nunito (amigable)",                 css: "'Nunito', sans-serif",     weight: 800 },
     { code: "jost-bold",       label: "Jost (estilo Futura)",              css: "'Jost', sans-serif",       weight: 700 },
     { code: "montserrat-bold", label: "Montserrat",                        css: "'Montserrat', sans-serif", weight: 700 },
     { code: "poppins-bold",    label: "Poppins",                           css: "'Poppins', sans-serif",    weight: 700 },

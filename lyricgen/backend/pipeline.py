@@ -5410,6 +5410,12 @@ def _analyze_lyrics_for_background(lyrics_text: str, artist: str, job_id: str = 
         "single clear subject — avoid centered 'product shot' framing and over-"
         "saturated color clichés (no symmetric leaves-framing-sunset, no perfectly-"
         "lined silhouettes against gradient skies, no \"AI sunset\" aesthetic)."
+        "\n- TECHNICAL QUALITY (required): shot on a full-frame camera, RAZOR-SHARP "
+        "focus on the subject, high dynamic range with rich tonal depth and true "
+        "blacks, professional cinematic color grade, fine natural film grain, "
+        "tack-sharp micro-detail and realistic textures, photographed (NOT "
+        "illustrated/3D-rendered/CGI), no plastic or waxy surfaces, no over-"
+        "smoothing, no HDR halos, no oversharpening artifacts, no watermark."
         if _is_imagen else ""
     )
     _PROMPT_RULES = (
@@ -7834,16 +7840,17 @@ _FONTS_DIR = next(
     _FONTS_DIR_CANDIDATES[0],
 )
 _LYRIC_FONTS = [
-    # Sans-serif (clean, modern)
-    "Montserrat-Bold.ttf",
-    "Montserrat-ExtraBold.ttf",
-    "Poppins-Bold.ttf",
-    "Outfit-Bold.ttf",       # Gilroy alternative
-    "Roboto-Bold.ttf",
-    # Display (impactful, bold)
-    "BebasNeue-Regular.ttf",
-    "Oswald-Bold.ttf",
-    "Anton-Regular.ttf",
+    # AUTO-selection pool — soft, friendly, rounded faces first (operators asked
+    # for warmer, less "robotic" type). The condensed/industrial display faces
+    # (Bebas / Oswald / Anton) stay user-selectable in _FONT_CATALOGUE but are
+    # intentionally kept OUT of this random Auto pool so the default look is
+    # friendly, not mechanical.
+    "Fredoka-SemiBold.ttf",   # rounded, warm
+    "Quicksand-Bold.ttf",     # rounded geometric, soft
+    "Nunito-ExtraBold.ttf",   # rounded terminals, friendly
+    "Poppins-Bold.ttf",       # geometric but rounded
+    "Montserrat-Bold.ttf",    # neutral modern
+    "Outfit-Bold.ttf",        # clean (Gilroy-ish)
 ]
 _FONT_POOL = [
     os.path.join(_FONTS_DIR, f)
@@ -7861,6 +7868,10 @@ _FONT_POOL = [
 # substitutes (Jost / Outfit) and label the option honestly so the
 # operator knows it's a stylistic match, not the licensed face.
 _FONT_CATALOGUE = [
+    # Soft / friendly / rounded (the warm default family)
+    {"id": "fredoka",          "filename": "Fredoka-SemiBold.ttf",     "label": "Fredoka (redondeada)",      "google_family": "Fredoka",     "google_weight": 600},
+    {"id": "quicksand",        "filename": "Quicksand-Bold.ttf",       "label": "Quicksand (suave)",         "google_family": "Quicksand",   "google_weight": 700},
+    {"id": "nunito",           "filename": "Nunito-ExtraBold.ttf",     "label": "Nunito (amigable)",         "google_family": "Nunito",      "google_weight": 800},
     {"id": "jost-bold",        "filename": "Jost-Bold.ttf",            "label": "Jost (estilo Futura)",     "google_family": "Jost",        "google_weight": 700},
     {"id": "montserrat-bold",  "filename": "Montserrat-Bold.ttf",      "label": "Montserrat",                "google_family": "Montserrat",  "google_weight": 700},
     {"id": "poppins-bold",     "filename": "Poppins-Bold.ttf",         "label": "Poppins",                   "google_family": "Poppins",     "google_weight": 700},
