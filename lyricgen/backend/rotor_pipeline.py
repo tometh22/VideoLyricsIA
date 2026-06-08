@@ -535,6 +535,123 @@ def _snap(segs: list[dict], vocal_regions) -> list[dict]:
         return segs
 
 
+# ── first-line + run-on guards (deterministic, source-agnostic) ─────────
+def _word_count(seg: dict) -> int:
+    ws = seg.get("words")
+    if isinstance(ws, list) and ws:
+        return len(ws)
+    return len((seg.get("text") or "").split())
+
+
+def drop_spurious_intro(segs: list[dict], *, min_gap_s: float = 8.0,
+                        max_frag_words: int = 4) -> list[dict]:
+    """Drop a spurious early FIRST line: a short fragment isolated far before
+    the song body. whisper-1 run on the ISOLATED vocal stem occasionally
+    transcribes a faint intro shout/crowd/ad-lib (e.g. '¿Quién es?' at 0:16
+    when the verse really starts at 0:35) as the first line — it then drives a
+    wrong 'song starts at 0:16' banner and shows a colgada line. Rotor renders
+    the verse cleanly at its real onset; we match that by dropping the stray
+    fragment.
+
+    CONSERVATIVE — only fires when ALL hold, so a song that legitimately opens
+    with a short early line + a real gap is left alone:
+      • there are ≥3 lines (never empties the result),
+      • line[0] is short (≤ max_frag_words words),
+      • the gap from line[0] to line[1] is ≥ min_gap_s.
+    Never raises."""
+    try:
+        if not segs or len(segs) < 3:
+            return segs
+        s0, s1 = segs[0], segs[1]
+        gap = float(s1.get("start", 0.0)) - float(s0.get("start", 0.0))
+        if gap >= min_gap_s and _word_count(s0) <= max_frag_words:
+            logger.info("[ROTOR] dropping spurious intro fragment @%.1fs (gap %.1fs to body): %r",
+                        float(s0.get("start", 0.0)), gap, (s0.get("text") or "")[:40])
+            return segs[1:]
+        return segs
+    except Exception as e:
+        logger.warning("[ROTOR] drop_spurious_intro declined: %s", e)
+        return segs
+
+
+_CLAUSE_END_CH = ("?", "!", ".", ",", ";", ":")
+
+
+def _clean_join(words: list[dict]) -> str:
+    txt = " ".join((w.get("word") or "").strip() for w in words)
+    txt = re.sub(r"\s+([?!.,;:])", r"\1", txt)   # no space before punctuation
+    return re.sub(r"\s{2,}", " ", txt).strip()
+
+
+def split_run_on_lines(segs: list[dict], *, max_words: int = 8,
+                       max_dur_s: float = 5.5, min_chunk: int = 3) -> list[dict]:
+    """Split over-long 'run-on' lines into Rotor-length karaoke lines, breaking
+    at clause boundaries (?!.,; or a ¿/¡ opener) and re-timing each sub-line
+    from its OWN words' real timestamps.
+
+    `_llm_segment_words` (Gemini) is non-deterministic about line length: it
+    sometimes packs 3+ Rotor lines into one ('¿Quién sos? ¿Cómo sos? ¿Cuándo
+    venís? ¿Cuándo llegaste?…'). This deterministic pass guarantees short,
+    well-placed lines regardless of the LLM's mood. A line is only split when
+    it exceeds the word OR duration budget AND has enough words to split into
+    two ≥min_chunk pieces; lines without word stamps are passed through
+    untouched. Never raises."""
+    try:
+        out: list[dict] = []
+        for s in segs or []:
+            words = s.get("words")
+            dur = float(s.get("end", 0.0)) - float(s.get("start", 0.0))
+            if (not isinstance(words, list) or len(words) < 2 * min_chunk
+                    or (_word_count(s) <= max_words and dur <= max_dur_s)):
+                out.append(s)
+                continue
+            chunks = _pack_words(words, max_words=max_words, min_chunk=min_chunk)
+            if len(chunks) <= 1:
+                out.append(s)
+                continue
+            for ch in chunks:
+                out.append({"start": float(ch[0].get("start", s.get("start", 0.0))),
+                            "end": float(ch[-1].get("end", s.get("end", 0.0))),
+                            "text": _clean_join(ch), "words": ch})
+        return out
+    except Exception as e:
+        logger.warning("[ROTOR] split_run_on_lines declined: %s", e)
+        return segs
+
+
+def _pack_words(words: list[dict], *, max_words: int, min_chunk: int) -> list[list[dict]]:
+    """Greedily pack words into ≤max_words lines, cutting at the latest clause
+    boundary that keeps the line within budget (falling back to a hard cut)."""
+    breaks: set[int] = set()           # break AFTER index i
+    for i, w in enumerate(words):
+        t = (w.get("word") or "").strip()
+        if t.endswith(_CLAUSE_END_CH):
+            breaks.add(i)
+        if i > 0 and t[:1] in ("¿", "¡"):
+            breaks.add(i - 1)          # break BEFORE a clause opener
+    n = len(words)
+    lines: list[list[dict]] = []
+    start = 0
+    while start < n:
+        hi = min(n - 1, start + max_words - 1)
+        if hi >= n - 1:                # remainder fits in one line
+            lines.append(words[start:])
+            break
+        cut = None
+        for b in range(hi, start + min_chunk - 2, -1):
+            if b in breaks:
+                cut = b
+                break
+        if cut is None:
+            cut = hi                   # forced cut at the word budget
+        lines.append(words[start:cut + 1])
+        start = cut + 1
+    if len(lines) >= 2 and len(lines[-1]) < min_chunk:   # absorb tiny tail
+        lines[-2] = lines[-2] + lines[-1]
+        lines.pop()
+    return lines
+
+
 # ── public entrypoint ───────────────────────────────────────────────────
 def _is_divergent_live(lrc_duration, audio_duration) -> bool:
     """Divergent live = the upload is >60s longer than the lrclib record.
@@ -578,6 +695,7 @@ def run_rotor_pipeline(
             if not segs:
                 logger.info("[ROTOR] gemini-pro declined — falling back to old cascade")
                 return None
+            segs = split_run_on_lines(drop_spurious_intro(segs))
             segs = _snap(segs, regions)
             return (segs, ROTOR_GEMINI_PRO)
 
@@ -594,6 +712,7 @@ def run_rotor_pipeline(
             logger.warning("[ROTOR] _llm_segment_words raised: %s — using raw whisper-1", e)
         if not segs:
             return None
+        segs = split_run_on_lines(drop_spurious_intro(segs))
         segs = _snap(segs, regions)
         return (segs, ROTOR_WHISPER1)
     except Exception as e:
