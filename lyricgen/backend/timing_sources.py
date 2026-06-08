@@ -106,19 +106,6 @@ WHISPER_ALIGN = "whisper_align"
 # `anchor_align.py`.
 SYNCED_SCAFFOLD = "synced_scaffold"
 
-# ── Rotor hybrid pipeline (rotor_pipeline.py, gated ROTOR_PIPELINE_ENABLED,
-#    default OFF). Two paths, auto-routed by the existing divergent-live
-#    detection (no manual toggle):
-#   ROTOR_WHISPER1  — studio/normal songs: whisper-1 word-stamps re-segmented
-#     by pipeline._llm_segment_words, then onset-snapped to the vocal stem.
-#     Measured AOO median ~0.25s (Rotor-grade) on the R&D harness.
-#   ROTOR_GEMINI_PRO — divergent lives (audio − lrclib_dur > 60s, or lrclib
-#     absent): gemini-2.5-pro chunked-primary with forced full coverage +
-#     per-line timestamps, onset-snapped. Measured coverage ~93%,
-#     de-offset ~0.83s. Both ≤20 chars (DB VARCHAR(20) constraint).
-ROTOR_WHISPER1 = "rotor_whisper1"
-ROTOR_GEMINI_PRO = "rotor_gemini_pro"
-
 
 VALID_TIMING_SOURCES = frozenset({
     FORCED_ALIGN,
@@ -132,8 +119,6 @@ VALID_TIMING_SOURCES = frozenset({
     WHISPER_LRCLIB_REC,
     WHISPER_GEMINI_REC,
     WHISPER_RAW,
-    ROTOR_WHISPER1,
-    ROTOR_GEMINI_PRO,
 })
 
 

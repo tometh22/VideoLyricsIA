@@ -3335,26 +3335,6 @@ async def transcribe_uploaded(
             )
     _validate_audio_file_on_disk(job_row.filename, audio_path)
 
-    # 2026-06-07: artist/title fill-in for the lrclib lookup. /upload-url commits
-    # job_row.artist from (form ∨ filename-parse ∨ "Unknown"). When the user
-    # uploaded a file with no "Artist - " prefix AND hadn't typed the artist yet,
-    # the row holds "Unknown" → lrclib 404 → the live-timing rescue can't engage
-    # (the divergent-live detection LIVE_NO_HINT needs the lrclib DURATION; the
-    # synced-scaffold needs lrclib synced). Root cause of the "Nada Fue Un Error
-    # En Vivo" mistimings. Accept body.artist/title ONLY to fill an Unknown/empty
-    # row. This does NOT reopen the 2026-05-27 ghost-job incident: that was body
-    # metadata DIVERGING from a REAL row value; here we fill only when the row has
-    # no real value, so there is nothing to swap. Mutates job_row in the open
-    # session → persisted by the status commit just below.
-    _eff_artist = (job_row.artist or "").strip()
-    _eff_title = (job_row.song_title or "").strip()
-    if (not _eff_artist or _eff_artist == "Unknown") and (body.artist or "").strip():
-        _eff_artist = body.artist.strip()
-        job_row.artist = _eff_artist
-    if not _eff_title and (body.title or "").strip():
-        _eff_title = body.title.strip()
-        job_row.song_title = _eff_title
-
     if _async_enabled:
         # Async path — enqueue + 202 + status polling.
         # Flippeamos status a "transcribing_queued" para que /transcription-status
@@ -3377,8 +3357,8 @@ async def transcribe_uploaded(
                 job_id,
                 audio_path,
                 language=body.language,
-                artist=_eff_artist or "",
-                title=_eff_title or "",
+                artist=job_row.artist or "",
+                title=job_row.song_title or "",
                 filename=job_row.filename,
                 tenant_id=current_user.get("tenant_id", ""),
             )
@@ -3418,8 +3398,8 @@ async def transcribe_uploaded(
         return await _run_transcription_for_job(
             request, current_user, job_id, audio_path,
             language=body.language,
-            artist=_eff_artist or "",
-            title=_eff_title or "",
+            artist=job_row.artist or "",
+            title=job_row.song_title or "",
         )
     finally:
         _release_transcription_slot(transcription_lease)
@@ -4523,45 +4503,9 @@ async def _run_transcription_for_job(
                 # when we can't measure (missing lrclib duration) so default behavior
                 # is untouched.
                 _lrc_dur = (lrc or {}).get("duration") if isinstance(lrc, dict) else None
-
-                # ─── Rotor hybrid pipeline (ROTOR_PIPELINE_ENABLED, default
-                # OFF). Gated, self-declining, lazy-imported so the boot can't
-                # break if anything is missing. When ON, it auto-routes by the
-                # SAME divergent-live heuristic used just below (no manual
-                # toggle): divergent live → gemini-2.5-pro chunked; otherwise
-                # whisper-1 word-stamps → _llm_segment_words. Both onset-snap.
-                # If it returns None (declines) or the flag is off, the cascade
-                # below runs UNCHANGED — prod behaviour is byte-identical.
-                from pipeline import _env_flag as _rp_env_flag
-                if _rp_env_flag("ROTOR_PIPELINE_ENABLED"):
-                    try:
-                        import rotor_pipeline as _rotor
-                        _rp = await asyncio.to_thread(
-                            _rotor.run_rotor_pipeline, _aa,
-                            artist=artist, title=title, language=lang,
-                            lrc_duration=_lrc_dur, audio_duration=_audio_dur_for_lrc,
-                        )
-                    except Exception as _rp_e:
-                        logger.warning("[ROTOR] run_rotor_pipeline raised (%s) — "
-                                       "falling through to cascade", _rp_e)
-                        _rp = None
-                    if _rp:
-                        _rp_segs, _rp_source = _rp
-                        logger.info("[ROTOR] hybrid pipeline emitted %d segs via %s",
-                                    len(_rp_segs), _rp_source)
-                        return _emit_segments(
-                            _rp_segs, _rp_source, reference_lyrics=(_canonical or ""),
-                        )
-                    # _rp is None → declined; continue the existing cascade.
-
                 _live_no_hint = bool(
-                    # Default ON 2026-06-07 (set =0 to disable). Only fires when
-                    # the upload is >60s longer than the lrclib record (divergent
-                    # live/extended), so studio songs are untouched. Was gated OFF
-                    # + per-env dashboard var → a prod env reset regressed every
-                    # extended live; default-ON makes that unrepeatable.
-                    os.environ.get("LIVE_NO_HINT_ENABLED", "1").strip().lower()
-                    not in ("0", "false", "no", "off")
+                    os.environ.get("LIVE_NO_HINT_ENABLED", "0").strip().lower()
+                    in ("1", "true", "yes", "on")
                     and _audio_dur_for_lrc and _lrc_dur
                     and (float(_audio_dur_for_lrc) - float(_lrc_dur)) > 60.0
                 )
@@ -4633,21 +4577,8 @@ async def _run_transcription_for_job(
                         # (reconcile aborts here). Self-declining → keeps _wx_segs on
                         # any failure. Lab on "Nada Fue Un Error (En Vivo)": matches
                         # Rotor line-for-line, timing byte-identical.
-                        from pipeline import (
-                            _llm_segment_words as _llm_seg,
-                            _recover_gap_lyrics as _recover_gap,
-                        )
+                        from pipeline import _llm_segment_words as _llm_seg
                         _wx_segs = _llm_seg(_wx_segs, audio_path=_aa)
-                        # Gap-recovery (GAP_RECOVERY_ENABLED, default off): whisperX
-                        # drops lyrics in loud live passages, leaving multi-second
-                        # holes (lab "Nada Fue Un Error En Vivo": an 84 s hole where
-                        # the chorus keeps going + the outro). Re-transcribe a SHORT
-                        # bounded clip at each hole's first voiced run → recovers the
-                        # real line without the long-clip hallucination loop. Runs
-                        # AFTER segmentation (already-clean lines) + self-declines.
-                        _wx_segs = _recover_gap(
-                            _wx_segs, audio_path=_aa, canonical=_canonical,
-                        )
                         return _emit_segments(
                             _wx_segs, _WC_WX, reference_lyrics=_canonical,
                         )
@@ -4752,18 +4683,9 @@ async def _run_transcription_for_job(
                         # returns _wx_segs unchanged → cascade continues to FA.
                         # Gated by LLM_SEGMENT_ENABLED. (The _live_no_hint raw path
                         # above also runs it, for lives detected by duration.)
-                        from pipeline import (
-                            _llm_segment_words as _llm_seg2,
-                            _recover_gap_lyrics as _recover_gap2,
-                        )
+                        from pipeline import _llm_segment_words as _llm_seg2
                         _llm_segs = _llm_seg2(_wx_segs, audio_path=_aa)
                         if _llm_segs is not _wx_segs and len(_llm_segs) >= 2:
-                            # Same gap-recovery as the no-hint path: fill the
-                            # multi-second holes whisperX leaves in loud lives with
-                            # a short bounded re-transcription (default off).
-                            _llm_segs = _recover_gap2(
-                                _llm_segs, audio_path=_aa, canonical=_canonical,
-                            )
                             logger.info(
                                 "[WC] reconcile aborted → LLM line-segmentation of "
                                 "whisperX (%d lines) — divergent recording, FA would "
