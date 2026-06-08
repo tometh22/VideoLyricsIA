@@ -11,9 +11,6 @@
 
 export const FONT_BY_CODE = {
   "":                { css: undefined,                weight: undefined },
-  "fredoka":         { css: "'Fredoka', sans-serif",    weight: 600 },
-  "quicksand":       { css: "'Quicksand', sans-serif",  weight: 700 },
-  "nunito":          { css: "'Nunito', sans-serif",     weight: 800 },
   "jost-bold":       { css: "'Jost', sans-serif",       weight: 700 },
   "montserrat-bold": { css: "'Montserrat', sans-serif", weight: 700 },
   "poppins-bold":    { css: "'Poppins', sans-serif",    weight: 700 },
