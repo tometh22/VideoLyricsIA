@@ -117,6 +117,65 @@ def test_pack_preserves_all_words():
     assert len(flat) == len(words)
 
 
+# ── C. acoustic re-timing helpers ───────────────────────────────────────
+def test_lines_text_joins_nonempty():
+    segs = [{"text": "Una"}, {"text": "  "}, {"text": "Dos"}]
+    assert rp._lines_text(segs) == "Una\nDos"
+
+
+def test_looks_drifty_false_without_regions():
+    segs = [{"start": float(i)} for i in range(10)]
+    assert rp._looks_drifty(segs, []) is False
+    assert rp._looks_drifty(segs, None) is False
+
+
+def test_looks_drifty_false_when_onsets_on_voice():
+    # All line starts sit inside a voiced region → tight, not drifty.
+    regions = [(10.0, 14.0), (20.0, 24.0), (30.0, 34.0), (40.0, 44.0),
+               (50.0, 54.0), (60.0, 64.0)]
+    segs = [{"start": s} for s in (10.5, 20.5, 30.5, 40.5, 50.5, 60.5)]
+    assert rp._looks_drifty(segs, regions) is False
+
+
+def test_looks_drifty_true_when_onsets_off_voice():
+    # Voice only early; later starts land in instrumental gaps → drifty.
+    regions = [(10.0, 14.0), (20.0, 24.0)]
+    segs = [{"start": s} for s in (10.5, 20.5, 33.0, 38.0, 47.0, 56.0)]
+    assert rp._looks_drifty(segs, regions) is True
+
+
+def test_looks_drifty_false_for_short_output():
+    regions = [(10.0, 14.0)]
+    segs = [{"start": 30.0}, {"start": 40.0}]  # <6 lines → can't measure
+    assert rp._looks_drifty(segs, regions) is False
+
+
+# ── D. anchor_first_line_to_voice ───────────────────────────────────────
+def test_anchor_pulls_stranded_first_line_to_voice():
+    # line 1 stranded at 0.15s; singing really starts at ~39s (Nada Fue case)
+    regions = [(39.5, 42.0), (45.0, 48.0)]
+    segs = [{"start": 0.15, "end": 1.0, "text": "Tengo una mala noticia"},
+            {"start": 39.7, "end": 42.0, "text": "No fue de casualidad"},
+            {"start": 45.6, "end": 48.0, "text": "Yo quería que nos pasara"}]
+    out = rp.anchor_first_line_to_voice(segs, regions)
+    assert 39.0 <= out[0]["start"] <= 39.7, f"line 1 should snap near first voice, got {out[0]['start']}"
+    assert out[1:] == segs[1:], "other lines untouched"
+
+
+def test_anchor_leaves_legit_first_line():
+    # line 1 already on the first voiced region → untouched
+    regions = [(2.0, 5.0), (8.0, 11.0)]
+    segs = [{"start": 2.2, "end": 4.0, "text": "Arranca ya"},
+            {"start": 8.2, "end": 10.0, "text": "Segunda"},
+            {"start": 12.0, "end": 14.0, "text": "Tercera"}]
+    assert rp.anchor_first_line_to_voice(segs, regions) == segs
+
+
+def test_anchor_noop_without_regions():
+    segs = [{"start": 0.1, "end": 1.0, "text": "x"}, {"start": 40.0, "end": 42.0, "text": "y"}]
+    assert rp.anchor_first_line_to_voice(segs, []) == segs
+
+
 if __name__ == "__main__":
     import sys
     fns = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
