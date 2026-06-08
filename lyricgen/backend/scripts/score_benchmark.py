@@ -74,33 +74,56 @@ def _jaccard(a: str, b: str) -> float:
     return len(sa & sb) / len(sa | sb)
 
 
-def _aoo(ground: list[dict], output: list[dict]) -> tuple[float, float, int]:
-    """For each output segment, find best-match in ground by text and
-    compute absolute start-time offset. Returns (mean_offset, p95_offset, matched_count)."""
-    offsets: list[float] = []
+def _aoo(ground: list[dict], output: list[dict]) -> tuple[float, float, int, float]:
+    """For each output segment, find best-match in ground by text and compute
+    start-time offset. Returns (mean_abs, p95_abs, matched_count, p95_deoffset).
+
+    `p95_deoffset` subtracts the median SIGNED offset before taking |·| — it
+    isolates per-line drift from a constant global shift (e.g. Rotor's ground
+    truth starts at 39.64s; if our zero differs, abs-AOO is inflated by that
+    constant. de-offset answers "once aligned at the same zero, how tight are
+    the line onsets?")."""
+    abs_off: list[float] = []
+    signed: list[float] = []
     for out_seg in output:
         out_text = (out_seg.get("text") or "").strip()
         if not out_text:
             continue
-        best_match = None
-        best_score = 0.0
-        for gt in ground:
-            score = _jaccard(out_text, gt.get("text") or "")
-            if score > best_score:
-                best_score = score
-                best_match = gt
-        if best_match is None or best_score < 0.4:
-            continue
         try:
-            offset = abs(float(out_seg["start"]) - float(best_match["start"]))
-            offsets.append(offset)
+            out_start = float(out_seg["start"])
         except (KeyError, TypeError, ValueError):
             continue
-    if not offsets:
-        return (0.0, 0.0, 0)
-    offsets_sorted = sorted(offsets)
-    p95 = offsets_sorted[max(0, int(len(offsets_sorted) * 0.95) - 1)]
-    return (mean(offsets), p95, len(offsets))
+        # Repeated-line aware matching: among ALL ground lines whose text is a
+        # strong match (jaccard ≥ 0.6), pick the one CLOSEST IN TIME — not the
+        # globally-best-text. Choruses repeat the same line up to ~8×; picking by
+        # text alone pairs an output line with a far-away repeat → bogus 30-50s
+        # offsets. Nearest-in-time is the correct pairing for identical repeats
+        # (you can't distinguish instances otherwise) and is the standard karaoke
+        # timing eval. Falls back to best-text (≥0.4) if no strong match exists.
+        candidates = [(_jaccard(out_text, gt.get("text") or ""), gt) for gt in ground]
+        strong = [(sc, gt) for sc, gt in candidates if sc >= 0.6]
+        if strong:
+            best_match = min(strong, key=lambda t: abs(out_start - float(t[1]["start"])))[1]
+        else:
+            sc, gt = max(candidates, key=lambda t: t[0]) if candidates else (0.0, None)
+            best_match = gt if sc >= 0.4 else None
+        if best_match is None:
+            continue
+        try:
+            d = out_start - float(best_match["start"])
+            abs_off.append(abs(d))
+            signed.append(d)
+        except (KeyError, TypeError, ValueError):
+            continue
+    if not abs_off:
+        return (0.0, 0.0, 0, 0.0)
+    def _p95(xs: list[float]) -> float:
+        s = sorted(xs)
+        return s[max(0, int(len(s) * 0.95) - 1)]
+    from statistics import median
+    med = median(signed)
+    deoff = [abs(s - med) for s in signed]
+    return (mean(abs_off), _p95(abs_off), len(abs_off), _p95(deoff))
 
 
 def _composite(wer: float, aoo_mean: float) -> float:
@@ -118,22 +141,24 @@ def score_job(job_dir: Path) -> dict | None:
     out = {"job_id": job_dir.name, "ground_segments": len(ground)}
     if baseline is not None:
         b_wer = _wer(ground, baseline)
-        b_aoo_mean, b_aoo_p95, b_matched = _aoo(ground, baseline)
+        b_aoo_mean, b_aoo_p95, b_matched, b_aoo_p95_deoff = _aoo(ground, baseline)
         out["baseline"] = {
             "wer": b_wer,
             "aoo_mean_s": b_aoo_mean,
             "aoo_p95_s": b_aoo_p95,
+            "aoo_p95_deoffset_s": b_aoo_p95_deoff,
             "segments": len(baseline),
             "matched": b_matched,
             "composite": _composite(b_wer, b_aoo_mean),
         }
     if improvement is not None:
         i_wer = _wer(ground, improvement)
-        i_aoo_mean, i_aoo_p95, i_matched = _aoo(ground, improvement)
+        i_aoo_mean, i_aoo_p95, i_matched, i_aoo_p95_deoff = _aoo(ground, improvement)
         out["improvement"] = {
             "wer": i_wer,
             "aoo_mean_s": i_aoo_mean,
             "aoo_p95_s": i_aoo_p95,
+            "aoo_p95_deoffset_s": i_aoo_p95_deoff,
             "segments": len(improvement),
             "matched": i_matched,
             "composite": _composite(i_wer, i_aoo_mean),
@@ -150,8 +175,8 @@ def render_report(per_job: list[dict]) -> str:
     lines.append("")
     lines.append("## Per-job results")
     lines.append("")
-    lines.append("| Job | Source | WER baseline → tier1 | AOO mean (s) baseline → tier1 | Composite baseline → tier1 |")
-    lines.append("|---|---|---|---|---|")
+    lines.append("| Job | Source | WER b→t1 | AOO mean (s) b→t1 | AOO p95 (s) b→t1 | AOO p95 de-offset (s) b→t1 | matched/GT | Composite b→t1 |")
+    lines.append("|---|---|---|---|---|---|---|---|")
     has_improvement = False
     for r in per_job:
         b = r.get("baseline") or {}
@@ -160,8 +185,11 @@ def render_report(per_job: list[dict]) -> str:
             has_improvement = True
         wer_cell = f"{b.get('wer',float('nan')):.3f}" + (f" → {i['wer']:.3f}" if i else "")
         aoo_cell = f"{b.get('aoo_mean_s',float('nan')):.3f}" + (f" → {i['aoo_mean_s']:.3f}" if i else "")
+        p95_cell = f"{b.get('aoo_p95_s',float('nan')):.3f}" + (f" → {i['aoo_p95_s']:.3f}" if i else "")
+        deoff_cell = f"{b.get('aoo_p95_deoffset_s',float('nan')):.3f}" + (f" → {i['aoo_p95_deoffset_s']:.3f}" if i else "")
+        matched_cell = f"{b.get('matched','?')}/{r.get('ground_segments','?')}"
         comp_cell = f"{b.get('composite',float('nan')):.3f}" + (f" → {i['composite']:.3f}" if i else "")
-        lines.append(f"| `{r['job_id']}` | `{r.get('source','?')}` | {wer_cell} | {aoo_cell} | {comp_cell} |")
+        lines.append(f"| `{r['job_id']}` | `{r.get('source','?')}` | {wer_cell} | {aoo_cell} | {p95_cell} | {deoff_cell} | {matched_cell} | {comp_cell} |")
     lines.append("")
 
     # Aggregates
