@@ -57,6 +57,26 @@ _W1_HALLUCINATION = re.compile(
     r"www\.|\.com|gracias por ver|suscr[ií]b)", re.I)
 
 
+def _is_degenerate(text: str) -> bool:
+    """True if `text` is a Whisper hallucination loop — a single token/char
+    repeated (e.g. 'ñi ñi ñi …', 'la la la la', 'aaaaaa'). Whisper-1 produces
+    these on corrupt/near-silent audio (e.g. a bad re-encode). The credit/
+    translation regex (_W1_HALLUCINATION) does NOT catch them, so this guard
+    is what prevents 'ñiñiñi' garbage from ever being emitted."""
+    n = _norm(text)
+    if not n:
+        return True
+    compact = n.replace(" ", "")
+    if len(compact) >= 4 and len(set(compact)) <= 2:
+        return True  # 'ñiñiñiñi', 'aaaaaa', 'lalalala'
+    toks = n.split()
+    if len(toks) >= 4 and len(set(toks)) == 1:
+        return True  # 'la la la la', 'no no no no'
+    if len(toks) >= 8 and len(set(toks)) <= 2:
+        return True  # 'na na na na na na na na'
+    return False
+
+
 def whisper1_segments(audio_path: str, language: str | None) -> list[dict] | None:
     """whisper-1 (OpenAI) → [{start,end,text,words}].
 
@@ -71,20 +91,30 @@ def whisper1_segments(audio_path: str, language: str | None) -> list[dict] | Non
         if not os.environ.get("OPENAI_API_KEY"):
             logger.info("[ROTOR] whisper1: OPENAI_API_KEY not set — declining")
             return None
-        import librosa
-        import soundfile as sf
+        import subprocess
         from openai import OpenAI
 
         client = OpenAI()
-        y, _sr = librosa.load(audio_path, sr=16000, mono=True)
+        # Re-encode to 16kHz mono mp3 with ffmpeg (whisper-1 caps uploads at
+        # 25MB; our WAVs exceed it). We use ffmpeg — NOT soundfile — because
+        # soundfile's mp3 encoder is absent on the prod/staging container, and
+        # its ogg/opus fallback produced corrupt audio there → whisper-1
+        # hallucinated 'ñiñiñi' garbage. ffmpeg is present and used everywhere
+        # else in this app, so it re-encodes reliably across environments.
         tmp = tempfile.NamedTemporaryFile(suffix=".mp3", delete=False)
         tmp.close()
         try:
             try:
-                sf.write(tmp.name, y, 16000, format="MP3")
-            except Exception:
-                # soundfile may lack the mp3 encoder; fall back to ogg/opus
-                sf.write(tmp.name, y, 16000, format="OGG", subtype="OPUS")
+                subprocess.run(
+                    ["ffmpeg", "-y", "-loglevel", "error", "-i", audio_path,
+                     "-ac", "1", "-ar", "16000", "-b:a", "64k", tmp.name],
+                    check=True, capture_output=True, timeout=300)
+            except Exception as enc_err:
+                logger.warning("[ROTOR] whisper1: ffmpeg re-encode failed (%s) — declining", enc_err)
+                return None
+            if os.path.getsize(tmp.name) < 1024:
+                logger.warning("[ROTOR] whisper1: re-encoded file is empty/tiny — declining")
+                return None
             with open(tmp.name, "rb") as f:
                 resp = client.audio.transcriptions.create(
                     model="whisper-1", file=f,
@@ -103,7 +133,7 @@ def whisper1_segments(audio_path: str, language: str | None) -> list[dict] | Non
         raw_segs = list(getattr(resp, "segments", None) or [])
         if not raw_segs:
             txt = (getattr(resp, "text", "") or "").strip()
-            if not txt or _W1_HALLUCINATION.search(txt):
+            if not txt or _W1_HALLUCINATION.search(txt) or _is_degenerate(txt):
                 return None
             return [{"start": 0.0, "end": 0.0, "text": txt, "words": []}]
 
@@ -123,15 +153,107 @@ def whisper1_segments(audio_path: str, language: str | None) -> list[dict] | Non
         segs: list[dict] = []
         for s in raw_segs:
             text = (getattr(s, "text", "") or "").strip()
-            if not text or _W1_HALLUCINATION.search(text):
-                continue  # drop hallucination span (text + its words)
+            if not text or _W1_HALLUCINATION.search(text) or _is_degenerate(text):
+                continue  # drop hallucination / degenerate span (text + words)
             st = float(getattr(s, "start", 0.0) or 0.0)
             en = float(getattr(s, "end", st) or st)
             segs.append({"start": st, "end": en, "text": text,
                          "words": _word_dicts(st, en)})
-        return segs or None
+        if not segs:
+            return None
+        # Global degeneracy guard: if the whole transcript collapses to a
+        # repeated-token loop (per-segment guard can miss it when each segment
+        # is a different single token), decline rather than emit garbage.
+        if _is_degenerate(" ".join(s["text"] for s in segs)):
+            logger.warning("[ROTOR] whisper1: transcript is degenerate (hallucination loop) — declining")
+            return None
+        return segs
     except Exception as e:
         logger.warning("[ROTOR] whisper1_segments declined: %s", e)
+        return None
+
+
+# ── whisper-1 × clean-text reconcile  (ADDITIVE; opt-in, no gating) ─────
+def whisper1_reconcile(
+    audio_path: str,
+    clean_text: str,
+    language: str | None = None,
+    *,
+    snap: bool = True,
+    w1_segments: list[dict] | None = None,
+    min_coverage: float = 0.5,
+    max_drift: int = 40,
+    drift_abort: int = 12,
+) -> list[dict] | None:
+    """Best-of-both: whisper-1's audio-pinned WORD TIMING + a clean reference
+    TEXT (lrclib / canonical lyrics).
+
+    WHY
+    ---
+    whisper-1 nails the line ONSET (timing) but mis-hears WORDS ("jabón" vs
+    "jamón") and runs lines together. When we already hold trustworthy text
+    for the song, we keep whisper-1's word stamps but adopt the clean text's
+    spelling + line structure — driving WER toward 0 without disturbing the
+    timing that makes the rotor (whisper-1) path good.
+
+    HOW
+    ---
+      1. whisper-1 word-stamps  (`whisper1_segments`, or `w1_segments` if the
+         caller already has them — e.g. a cached verbose_json).
+      2. `whisperx_reconcile.reconcile(w1_segs, clean_text)` re-buckets those
+         word stamps into the clean text's line structure (the same hardened
+         `wordstamps_to_segments` walk with fuzzy re-anchor + drift abort) →
+         clean text + whisper-1 timing.
+      3. onset-snap line starts to the isolated vocal stem (same as the gated
+         path), unless `snap=False`.
+
+    SELF-DECLINING: returns None on missing key / no word stamps / unreliable
+    reconciliation (drift or thin coverage) so the caller can fall back to raw
+    whisper-1. Never raises. Purely additive — does not touch the gated
+    `run_rotor_pipeline` behaviour."""
+    try:
+        if w1_segments is None:
+            w1_segments = whisper1_segments(audio_path, language)
+        if not w1_segments:
+            logger.info("[ROTOR] whisper1_reconcile: no whisper-1 word stamps — declining")
+            return None
+
+        # Reuse the hardened word-stamp → known-lines walk directly (same
+        # engine `whisperx_reconcile.reconcile` uses) so we can loosen its
+        # re-anchor window: whisper-1 chunks long repeated chorus lines very
+        # differently from the canonical line structure, and the default
+        # max_drift=8 aborts on them. Larger window + drift budget lets the
+        # walk skip past a mis-chunked run and re-anchor on the next line.
+        import whisperx_reconcile
+        from forced_align import wordstamps_to_segments
+
+        words = whisperx_reconcile._flatten_words(w1_segments)
+        if len(words) < 8:
+            logger.info("[ROTOR] whisper1_reconcile: only %s word stamps — declining", len(words))
+            return None
+        lines = [ln.strip() for ln in (clean_text or "").splitlines() if ln.strip()]
+        if len(lines) < 4:
+            logger.info("[ROTOR] whisper1_reconcile: reference too short (%s lines) — declining",
+                        len(lines))
+            return None
+
+        reconciled = wordstamps_to_segments(
+            words, lines, max_drift=max_drift, drift_abort=drift_abort)
+        if not reconciled:
+            logger.info("[ROTOR] whisper1_reconcile: wordstamps_to_segments aborted (drift) — declining")
+            return None
+        coverage = len(reconciled) / max(1, len(lines))
+        if coverage < min_coverage:
+            logger.info("[ROTOR] whisper1_reconcile: thin coverage %.0f%% — declining",
+                        coverage * 100)
+            return None
+
+        if snap:
+            regions, _stem = _vocal_regions_for(audio_path)
+            reconciled = _snap(reconciled, regions)
+        return reconciled
+    except Exception as e:
+        logger.warning("[ROTOR] whisper1_reconcile declined: %s", e)
         return None
 
 
