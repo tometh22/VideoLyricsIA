@@ -693,6 +693,39 @@ def _looks_drifty(segs, regions, *, out_of_voice_frac: float = 0.35) -> bool:
         return False
 
 
+def anchor_first_line_to_voice(segs: list[dict], regions, *,
+                               min_gap_s: float = 4.0) -> list[dict]:
+    """Re-anchor a first line that the aligner stranded BEFORE the song's real
+    vocal onset. Forced-align sometimes dumps line 1 at ~0s on tracks with a
+    long instrumental intro (measured: "Nada Fue" line 1 placed at 0.15s when
+    singing starts at ~39s). The internal ≤2s onset-snap can't reach that far.
+
+    If line 1 starts ≥min_gap_s before the FIRST voiced region AND ≥min_gap_s
+    before line 2 (i.e. it's stranded, not a legit early line), pull its start
+    to the first vocal onset the VAD map already knows. Conservative + never
+    raises."""
+    try:
+        if not segs or not regions:
+            return segs
+        first_voice = float(regions[0][0])
+        s0 = float(segs[0].get("start", 0.0))
+        s1 = float(segs[1].get("start", first_voice)) if len(segs) > 1 else first_voice
+        if (first_voice - s0) >= min_gap_s and (s1 - s0) >= min_gap_s:
+            new0 = round(min(first_voice, s1 - 0.5), 3)
+            if new0 > s0:
+                logger.info("[ROTOR] re-anchoring stranded first line %.2fs → %.2fs "
+                            "(first voice @%.2fs)", s0, new0, first_voice)
+                out = dict(segs[0])
+                out["start"] = new0
+                if out.get("end") is not None and float(out["end"]) < new0:
+                    out["end"] = round(new0 + 0.5, 3)
+                return [out] + list(segs[1:])
+        return segs
+    except Exception as e:
+        logger.warning("[ROTOR] anchor_first_line declined: %s", e)
+        return segs
+
+
 def _retime_acoustic(audio_path: str, segs: list[dict], regions,
                      language: str | None):
     """Replace drifty ASR timing with ACOUSTIC (text→audio) timing while keeping
@@ -718,6 +751,7 @@ def _retime_acoustic(audio_path: str, segs: list[dict], regions,
         fa = forced_align.forced_align_lyrics_chunked(
             audio_path, text, vocal_regions=regions)
         if fa and len(fa) >= 0.7 * n:
+            fa = anchor_first_line_to_voice(fa, regions)   # fix stranded line 1
             logger.info("[ROTOR] re-timed via cureau chunked FA (%d/%d lines)", len(fa), n)
             return fa                          # already onset-snapped internally
     except Exception as e:
