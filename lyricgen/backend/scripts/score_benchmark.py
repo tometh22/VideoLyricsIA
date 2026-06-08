@@ -116,14 +116,14 @@ def _aoo(ground: list[dict], output: list[dict]) -> tuple[float, float, int, flo
         except (KeyError, TypeError, ValueError):
             continue
     if not abs_off:
-        return (0.0, 0.0, 0, 0.0)
+        return (0.0, 0.0, 0.0, 0, 0.0)
     def _p95(xs: list[float]) -> float:
         s = sorted(xs)
         return s[max(0, int(len(s) * 0.95) - 1)]
     from statistics import median
-    med = median(signed)
-    deoff = [abs(s - med) for s in signed]
-    return (mean(abs_off), _p95(abs_off), len(abs_off), _p95(deoff))
+    med_signed = median(signed)
+    deoff = [abs(s - med_signed) for s in signed]
+    return (mean(abs_off), median(abs_off), _p95(abs_off), len(abs_off), _p95(deoff))
 
 
 def _composite(wer: float, aoo_mean: float) -> float:
@@ -141,10 +141,11 @@ def score_job(job_dir: Path) -> dict | None:
     out = {"job_id": job_dir.name, "ground_segments": len(ground)}
     if baseline is not None:
         b_wer = _wer(ground, baseline)
-        b_aoo_mean, b_aoo_p95, b_matched, b_aoo_p95_deoff = _aoo(ground, baseline)
+        b_aoo_mean, b_aoo_median, b_aoo_p95, b_matched, b_aoo_p95_deoff = _aoo(ground, baseline)
         out["baseline"] = {
             "wer": b_wer,
             "aoo_mean_s": b_aoo_mean,
+            "aoo_median_s": b_aoo_median,
             "aoo_p95_s": b_aoo_p95,
             "aoo_p95_deoffset_s": b_aoo_p95_deoff,
             "segments": len(baseline),
@@ -153,10 +154,11 @@ def score_job(job_dir: Path) -> dict | None:
         }
     if improvement is not None:
         i_wer = _wer(ground, improvement)
-        i_aoo_mean, i_aoo_p95, i_matched, i_aoo_p95_deoff = _aoo(ground, improvement)
+        i_aoo_mean, i_aoo_median, i_aoo_p95, i_matched, i_aoo_p95_deoff = _aoo(ground, improvement)
         out["improvement"] = {
             "wer": i_wer,
             "aoo_mean_s": i_aoo_mean,
+            "aoo_median_s": i_aoo_median,
             "aoo_p95_s": i_aoo_p95,
             "aoo_p95_deoffset_s": i_aoo_p95_deoff,
             "segments": len(improvement),
@@ -175,21 +177,19 @@ def render_report(per_job: list[dict]) -> str:
     lines.append("")
     lines.append("## Per-job results")
     lines.append("")
-    lines.append("| Job | Source | WER b→t1 | AOO mean (s) b→t1 | AOO p95 (s) b→t1 | AOO p95 de-offset (s) b→t1 | matched/GT | Composite b→t1 |")
-    lines.append("|---|---|---|---|---|---|---|---|")
+    lines.append("| Job | Source | WER | AOO **median** (s) | AOO mean (s) | AOO p95 (s) | matched/GT |")
+    lines.append("|---|---|---|---|---|---|---|")
     has_improvement = False
     for r in per_job:
         b = r.get("baseline") or {}
         i = r.get("improvement") or {}
         if i:
             has_improvement = True
-        wer_cell = f"{b.get('wer',float('nan')):.3f}" + (f" → {i['wer']:.3f}" if i else "")
-        aoo_cell = f"{b.get('aoo_mean_s',float('nan')):.3f}" + (f" → {i['aoo_mean_s']:.3f}" if i else "")
-        p95_cell = f"{b.get('aoo_p95_s',float('nan')):.3f}" + (f" → {i['aoo_p95_s']:.3f}" if i else "")
-        deoff_cell = f"{b.get('aoo_p95_deoffset_s',float('nan')):.3f}" + (f" → {i['aoo_p95_deoffset_s']:.3f}" if i else "")
+        def cell(key):
+            return f"{b.get(key,float('nan')):.2f}" + (f" → {i[key]:.2f}" if i else "")
         matched_cell = f"{b.get('matched','?')}/{r.get('ground_segments','?')}"
-        comp_cell = f"{b.get('composite',float('nan')):.3f}" + (f" → {i['composite']:.3f}" if i else "")
-        lines.append(f"| `{r['job_id']}` | `{r.get('source','?')}` | {wer_cell} | {aoo_cell} | {p95_cell} | {deoff_cell} | {matched_cell} | {comp_cell} |")
+        lines.append(f"| `{r['job_id']}` | `{r.get('source','?')}` | {cell('wer')} | "
+                     f"**{cell('aoo_median_s')}** | {cell('aoo_mean_s')} | {cell('aoo_p95_s')} | {matched_cell} |")
     lines.append("")
 
     # Aggregates
