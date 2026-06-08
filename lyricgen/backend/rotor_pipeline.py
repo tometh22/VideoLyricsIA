@@ -652,6 +652,92 @@ def _pack_words(words: list[dict], *, max_words: int, min_chunk: int) -> list[li
     return lines
 
 
+# ── acoustic re-timing (fix whisper-1 / gemini word-timestamp DRIFT) ─────
+def _lines_text(segs) -> str:
+    """Newline-joined line text — feeds the forced aligner the exact line
+    structure we want acoustically re-timed."""
+    return "\n".join((s.get("text") or "").strip() for s in (segs or [])
+                     if (s.get("text") or "").strip())
+
+
+def _looks_drifty(segs, regions, *, out_of_voice_frac: float = 0.35) -> bool:
+    """Do the line onsets look like whisper-1's word timing DRIFTED off the
+    audio? whisper-1 stamps are DTW-interpolated (±500ms) and on some songs
+    accumulate multi-second lag the ≤2s onset-snap can't fix. A tight transcript
+    has nearly all line starts on a voiced span; a drifty one strands many in
+    instrumental gaps, worsening toward the end.
+
+    True if the fraction of starts OUTSIDE any vocal region exceeds
+    `out_of_voice_frac`, OR the last third is materially worse than the first
+    (monotonic lag growth). Needs VAD regions — returns False when absent (can't
+    measure → don't pay for re-alignment). Never raises."""
+    try:
+        if not regions or not segs or len(segs) < 6:
+            return False
+        import anchor_align
+        out = [not anchor_align._in_voice(float(s.get("start", 0.0)), regions)
+               for s in segs]
+        n = len(out)
+        frac = sum(out) / n
+        third = max(1, n // 3)
+        first = sum(out[:third]) / third
+        last = sum(out[-third:]) / third
+        drifty = frac >= out_of_voice_frac or (last - first) >= 0.30
+        if drifty:
+            logger.info("[ROTOR] drift detected (%.0f%% of onsets off-voice, "
+                        "first⅓=%.0f%% last⅓=%.0f%%) → acoustic re-time",
+                        frac * 100, first * 100, last * 100)
+        return drifty
+    except Exception as e:
+        logger.warning("[ROTOR] _looks_drifty declined: %s", e)
+        return False
+
+
+def _retime_acoustic(audio_path: str, segs: list[dict], regions,
+                     language: str | None):
+    """Replace drifty ASR timing with ACOUSTIC (text→audio) timing while keeping
+    the clean line TEXT. Cascade: cureau chunked forced-align (±50ms target,
+    crash-proof, covers dense lines whisperX drops) → whisperX-reconcile
+    (<100ms, proven in the old cascade) → None (caller keeps native timing).
+    Adopts a result only at ≥70% line coverage. Self-declining; never raises.
+    All imports lazy (module boot safety).
+
+    Opt-in: the whole acoustic re-time is gated by FORCED_ALIGNER_ENABLED so the
+    default rotor behaviour (gemini-pro + onset-snap on lives) is unchanged."""
+    if os.environ.get("FORCED_ALIGNER_ENABLED", "0").strip().lower() not in (
+            "1", "true", "yes", "on"):
+        return None
+    text = _lines_text(segs)
+    n = len([s for s in (segs or []) if (s.get("text") or "").strip()])
+    if text.count("\n") < 3 or n < 4:          # need ≥4 lines to align
+        return None
+    # 1) cureau chunked forced alignment (gated by FORCED_ALIGNER_ENABLED;
+    #    declines to None when the flag is off → falls through)
+    try:
+        import forced_align
+        fa = forced_align.forced_align_lyrics_chunked(
+            audio_path, text, vocal_regions=regions)
+        if fa and len(fa) >= 0.7 * n:
+            logger.info("[ROTOR] re-timed via cureau chunked FA (%d/%d lines)", len(fa), n)
+            return fa                          # already onset-snapped internally
+    except Exception as e:
+        logger.warning("[ROTOR] chunked FA declined: %s", e)
+    # 2) whisperX reconcile (timing from whisperX <100ms, text from our lines)
+    try:
+        import whisperx_transcribe
+        import whisperx_reconcile
+        wx = whisperx_transcribe.transcribe_whisperx(
+            audio_path, language, lyrics_hint=text[:800])
+        if wx:
+            rec = whisperx_reconcile.reconcile(wx, text)
+            if rec and len(rec) >= 0.7 * n:
+                logger.info("[ROTOR] re-timed via whisperX-reconcile (%d/%d lines)", len(rec), n)
+                return _snap(rec, regions)
+    except Exception as e:
+        logger.warning("[ROTOR] whisperX-reconcile declined: %s", e)
+    return None
+
+
 # ── public entrypoint ───────────────────────────────────────────────────
 def _is_divergent_live(lrc_duration, audio_duration) -> bool:
     """Divergent live = the upload is >60s longer than the lrclib record.
@@ -686,6 +772,17 @@ def run_rotor_pipeline(
         from timing_sources import ROTOR_GEMINI_PRO, ROTOR_WHISPER1
 
         divergent = _is_divergent_live(lrc_duration, audio_duration)
+
+        # STUDIO / normal path defers to the OLD cascade by default (see the
+        # block below). Decide this BEFORE separating the vocal stem so a
+        # deferral costs nothing extra.
+        studio_enabled = os.environ.get(
+            "ROTOR_STUDIO_ENABLED", "0").strip().lower() in ("1", "true", "yes", "on")
+        if not divergent and not studio_enabled:
+            logger.info("[ROTOR] studio/normal — deferring to old cascade "
+                        "(ROTOR_STUDIO_ENABLED off)")
+            return None
+
         regions, _stem = _vocal_regions_for(audio_path)
 
         if divergent:
@@ -696,9 +793,19 @@ def run_rotor_pipeline(
                 logger.info("[ROTOR] gemini-pro declined — falling back to old cascade")
                 return None
             segs = split_run_on_lines(drop_spurious_intro(segs))
-            segs = _snap(segs, regions)
+            # gemini line timestamps are coarse — re-time acoustically (text→audio)
+            # when forced-align is available; else snap. FA already snaps internally.
+            retimed = _retime_acoustic(audio_path, segs, regions, language)
+            segs = retimed if retimed else _snap(segs, regions)
             return (segs, ROTOR_GEMINI_PRO)
 
+        # STUDIO / normal path (only reached when ROTOR_STUDIO_ENABLED is on —
+        # see the deferral above). The OLD cascade (whisperX forced-aligned +
+        # lrclib/reference reconcile) is measured to already be near-Rotor on
+        # studio tracks AND keeps Rotor-style line grouping, whereas whisper-1's
+        # DTW-interpolated word timing drifts and over-segments here (colliding
+        # line onsets break the karaoke highlighter). Kept behind the flag for
+        # A/B only; the rotor pipeline's real win is divergent lives (above).
         logger.info("[ROTOR] routing → whisper-1 + _llm_segment_words (studio/normal)")
         segs = whisper1_segments(audio_path, language)
         if not segs:
@@ -713,7 +820,13 @@ def run_rotor_pipeline(
         if not segs:
             return None
         segs = split_run_on_lines(drop_spurious_intro(segs))
-        segs = _snap(segs, regions)
+        # whisper-1 timing drifts on some songs (DTW interpolation); when the
+        # onsets look drifty re-time acoustically, else just snap.
+        if _looks_drifty(segs, regions):
+            retimed = _retime_acoustic(audio_path, segs, regions, language)
+            segs = retimed if retimed else _snap(segs, regions)
+        else:
+            segs = _snap(segs, regions)
         return (segs, ROTOR_WHISPER1)
     except Exception as e:
         logger.warning("[ROTOR] run_rotor_pipeline declined (unexpected): %s", e)

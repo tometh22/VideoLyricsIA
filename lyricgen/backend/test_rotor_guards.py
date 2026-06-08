@@ -117,6 +117,39 @@ def test_pack_preserves_all_words():
     assert len(flat) == len(words)
 
 
+# ── C. acoustic re-timing helpers ───────────────────────────────────────
+def test_lines_text_joins_nonempty():
+    segs = [{"text": "Una"}, {"text": "  "}, {"text": "Dos"}]
+    assert rp._lines_text(segs) == "Una\nDos"
+
+
+def test_looks_drifty_false_without_regions():
+    segs = [{"start": float(i)} for i in range(10)]
+    assert rp._looks_drifty(segs, []) is False
+    assert rp._looks_drifty(segs, None) is False
+
+
+def test_looks_drifty_false_when_onsets_on_voice():
+    # All line starts sit inside a voiced region → tight, not drifty.
+    regions = [(10.0, 14.0), (20.0, 24.0), (30.0, 34.0), (40.0, 44.0),
+               (50.0, 54.0), (60.0, 64.0)]
+    segs = [{"start": s} for s in (10.5, 20.5, 30.5, 40.5, 50.5, 60.5)]
+    assert rp._looks_drifty(segs, regions) is False
+
+
+def test_looks_drifty_true_when_onsets_off_voice():
+    # Voice only early; later starts land in instrumental gaps → drifty.
+    regions = [(10.0, 14.0), (20.0, 24.0)]
+    segs = [{"start": s} for s in (10.5, 20.5, 33.0, 38.0, 47.0, 56.0)]
+    assert rp._looks_drifty(segs, regions) is True
+
+
+def test_looks_drifty_false_for_short_output():
+    regions = [(10.0, 14.0)]
+    segs = [{"start": 30.0}, {"start": 40.0}]  # <6 lines → can't measure
+    assert rp._looks_drifty(segs, regions) is False
+
+
 if __name__ == "__main__":
     import sys
     fns = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
