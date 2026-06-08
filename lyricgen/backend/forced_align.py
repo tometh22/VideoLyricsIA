@@ -629,6 +629,82 @@ def _assign_lines_to_windows(
     return out
 
 
+def _force_monotonic(segs: list[dict]) -> list[dict]:
+    """Clamp line onsets to be non-decreasing (a later line can't start before
+    an earlier one). Pure; preserves segs without a start."""
+    out: list[dict] = []
+    prev = None
+    for s in segs:
+        st = s.get("start")
+        if st is None:
+            out.append(s)
+            continue
+        st = float(st)
+        if prev is not None and st < prev:
+            ns = dict(s)
+            ns["start"] = round(prev + 0.05, 3)
+            if ns.get("end") is not None and float(ns["end"]) < ns["start"]:
+                ns["end"] = round(ns["start"] + 0.5, 3)
+            out.append(ns)
+            prev = ns["start"]
+        else:
+            out.append(s)
+            prev = st
+    return out
+
+
+def repair_outlier_onsets(
+    segs: list[dict], lyric_lines: list[str] | None = None, duration_s: float = 0.0,
+    vocal_regions=None, *, min_spike_s: float = 3.0, max_passes: int = 3,
+) -> list[dict]:
+    """Repair ORDER-SPIKE onset outliers — the REPEATED-IDENTICAL-CHORUS failure.
+
+    When a line repeats verbatim (e.g. "Me gustas mucho" ×8) the aligner can bind
+    one instance to the WRONG occurrence's audio, stranding it 10-15s off. A
+    correctly-ordered line always sits BETWEEN its neighbours, so a line whose
+    onset is higher (or lower) than BOTH neighbours by > `min_spike_s` is an
+    unambiguous mis-bind — re-place it at the midpoint of its neighbours. This is
+    PURELY LOCAL (no expected-time estimate, which proved unreliable on songs
+    with odd structure and made Puesto worse): a monotonic-but-offset sequence
+    has no spikes, so it is left completely untouched. Iterates a few passes
+    (fixing one spike can expose another), then clamps monotonic. Never raises.
+
+    Extra args kept for signature stability; only `segs` is used."""
+    try:
+        out = [dict(s) for s in segs]
+        n = len(out)
+        if n < 3:
+            return _force_monotonic(out)
+        n_fixed = 0
+        for _ in range(max_passes):
+            changed = False
+            for i in range(1, n - 1):
+                a, b, c = out[i - 1].get("start"), out[i].get("start"), out[i + 1].get("start")
+                if a is None or b is None or c is None:
+                    continue
+                a, b, c = float(a), float(b), float(c)
+                spike_up = b > a + min_spike_s and b > c + min_spike_s
+                spike_down = b < a - min_spike_s and b < c - min_spike_s
+                if (spike_up or spike_down) and a <= c:
+                    new = round((a + c) / 2.0, 3)
+                    old = segs[i]
+                    dur = (float(old["end"]) - float(old["start"])
+                           if old.get("end") is not None and old.get("start") is not None else 1.5)
+                    out[i]["start"] = new
+                    out[i]["end"] = round(new + max(0.3, min(dur, 4.0)), 3)
+                    out[i]["repaired"] = True
+                    n_fixed += 1
+                    changed = True
+            if not changed:
+                break
+        if n_fixed:
+            logger.info("[FORCED] repaired %d order-spike onset(s) (repeated-line rescue)", n_fixed)
+        return _force_monotonic(out)
+    except Exception as e:
+        logger.warning("[FORCED] outlier repair declined: %s", e)
+        return segs
+
+
 def snap_starts_to_vocal_onsets(
     segs: list[dict], vocal_regions, *, max_snap_s: float = 2.0,
 ) -> list[dict]:
@@ -955,6 +1031,9 @@ def forced_align_lyrics_chunked(
             covered, n_lines, ok_windows, len(windows),
         )
         return None
+    # Repeated-chorus rescue: re-place any line stranded far from its expected
+    # (voiced-proportional) time — the verbatim-repeat failure — before snap.
+    final = repair_outlier_onsets(final, lyric_lines, duration_s, vocal_regions)
     # Jitter fix: pin each line start to the true vocal onset (VAD on the
     # stem), capping the move. Gated ON by default when we have a VAD signal;
     # FORCED_ALIGN_ONSET_SNAP=0 disables, FORCED_ALIGN_SNAP_MAX_S tunes the cap.
