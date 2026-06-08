@@ -51,7 +51,8 @@ def _output_filename() -> str:
     lets the operator run with just one flag at a time if they want
     to attribute a delta to a single helper.
     """
-    if _env_truthy("ENABLE_TIER1") or _env_truthy("VALIDATE_SEGMENTS") or _env_truthy("POLISH_TEXT"):
+    if (_env_truthy("ENABLE_TIER1") or _env_truthy("VALIDATE_SEGMENTS")
+            or _env_truthy("POLISH_TEXT") or _env_truthy("ROTOR_PIPELINE_ENABLED")):
         return "improvement_output.json"
     return "baseline_output.json"
 
