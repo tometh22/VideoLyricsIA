@@ -236,4 +236,9 @@ restartPolicyType = "ON_FAILURE"
 restartPolicyMaxRetries = 10
 # Short jobs are light (no ProRes/Veo); 2 replicas comfortably drain
 # transcription + bg_preview even during a full UMG render batch.
-numReplicas = 2
+# Bumped 2→3 (2026-06-09) as defense-in-depth after the P0: the recycle fix
+# (worker re-execs itself, worker.py) already makes the consumer survival
+# independent of replica count, but a 3rd replica widens the margin so a
+# correlated recycle/restart of two replicas never leaves the transcription
+# queue thin. Cost is trivial (short jobs, small footprint).
+numReplicas = 3
