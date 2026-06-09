@@ -13,10 +13,12 @@ import uuid
 from datetime import datetime, timedelta, timezone
 
 from database import AIProvenance, Job, SessionLocal
+import reaper as _reaper
 from reaper import (
     find_abandoned_edits,
     find_abandoned_transcribed,
     find_orphan_polling_jobs,
+    find_queues_without_consumer,
     find_stalled_renders,
     find_stuck_jobs,
     find_stuck_transcriptions,
@@ -913,3 +915,74 @@ def test_sentry_capture_noop_on_empty_batch(monkeypatch):
     monkeypatch.setitem(sys.modules, "sentry_sdk", fake)
 
     _sentry_capture([])  # must not raise nor capture
+
+
+# --- Queue-without-consumer active alert (P0 2026-06-08 follow-up) ------------
+
+class _FakeWorker:
+    def __init__(self, qs):
+        self._qs = qs
+
+    def queue_names(self):
+        return self._qs
+
+
+def test_find_queues_without_consumer_flags_dead_pool(monkeypatch):
+    """A dead pool leaves its queues with NO live worker — caught regardless of
+    depth (the exact gap that made the P0 invisible: ShortWorker died with the
+    transcription queue empty)."""
+    import queue_jobs
+    import rq
+
+    monkeypatch.setattr(queue_jobs, "_init_redis", lambda: ("redis", None, None))
+    # Only the render pool alive → transcription + bg_preview have no consumer.
+    monkeypatch.setattr(rq.Worker, "all",
+                        lambda connection=None: [_FakeWorker(["enterprise", "default"])])
+    monkeypatch.setattr(_reaper, "_EXPECTED_QUEUES",
+                        ["transcription", "bg_preview", "enterprise", "default"])
+
+    assert set(find_queues_without_consumer()) == {"transcription", "bg_preview"}
+
+
+def test_find_queues_without_consumer_all_served(monkeypatch):
+    import queue_jobs
+    import rq
+
+    monkeypatch.setattr(queue_jobs, "_init_redis", lambda: ("redis", None, None))
+    monkeypatch.setattr(rq.Worker, "all", lambda connection=None: [
+        _FakeWorker(["enterprise", "default"]),
+        _FakeWorker(["transcription", "bg_preview"]),
+    ])
+    monkeypatch.setattr(_reaper, "_EXPECTED_QUEUES",
+                        ["transcription", "bg_preview", "enterprise", "default"])
+
+    assert find_queues_without_consumer() == []
+
+
+def test_alert_queues_without_consumer_pages_sentry(monkeypatch):
+    """A no-consumer queue must fire an ACTIVE Sentry alert at ERROR — not just
+    a degraded /health field (that's what made the P0 invisible for 2h)."""
+    import sys
+    import types
+    from reaper import _alert_queues_without_consumer
+
+    captured = {}
+
+    class _Scope:
+        def set_tag(self, *a): pass
+        def set_extra(self, *a): pass
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+
+    fake = types.ModuleType("sentry_sdk")
+    fake.push_scope = lambda: _Scope()
+    fake.capture_message = lambda msg, level=None: captured.update(msg=msg, level=level)
+    monkeypatch.setitem(sys.modules, "sentry_sdk", fake)
+
+    _alert_queues_without_consumer(["transcription"])
+    assert captured.get("level") == "error"
+    assert "transcription" in captured.get("msg", "")
+
+    captured.clear()
+    _alert_queues_without_consumer([])   # empty → no alert
+    assert captured == {}
