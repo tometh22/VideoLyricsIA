@@ -191,6 +191,10 @@ def _emissions(model, wav, blank_id: int, star_delta: float):
             nb[:, blank_id] = float("-inf")
             star = nb.max(dim=-1, keepdim=True).values - star_delta
             em = torch.cat([em, star], dim=-1)
+            # wav2vec2's conv stack emits floor((L-400)/320)+1 frames, so
+            # the LAST chunk (no right context) can come out one frame
+            # short of `hi` — python slicing tolerates it; the effect is
+            # ≤20-40 ms at the very tail of the song.
             lo = (start - a) // FRAME
             hi = lo + (end - start) // FRAME
             pieces.append(em[lo:hi].cpu())
@@ -227,6 +231,18 @@ def retime_segments(audio_path: str, segments: list[dict],
             return None
 
         t0 = time.time()
+        # Duration guard BEFORE decoding: a multi-hour upload would expand
+        # to several GB of float32 in RAM if we torchaudio.load() first
+        # (OOM risk in the uvicorn/ShortWorker containers).
+        try:
+            info = torchaudio.info(audio_path)
+            est_dur = info.num_frames / (info.sample_rate or SR)
+        except Exception:
+            est_dur = None
+        if est_dur is not None and (est_dur > _max_audio_s() or est_dur < 5):
+            logger.info("[CTC] decline: audio %.0fs out of range (job=%s)",
+                        est_dur, job_id)
+            return None
         wav, sr = torchaudio.load(audio_path)
         wav = wav.mean(0, keepdim=True)
         if sr != SR:
@@ -244,7 +260,11 @@ def retime_segments(audio_path: str, segments: list[dict],
             emission.unsqueeze(0),
             torch.tensor(targets, dtype=torch.int32).unsqueeze(0),
             blank=blank_id)
-        token_spans = AF.merge_tokens(aligned[0], scores[0].exp())
+        # blank= must match forced_align's: with the default (0) and a
+        # future CTC_ALIGN_MODEL whose pad token isn't 0, spans would
+        # silently desync from targets (garbage timings, no crash).
+        token_spans = AF.merge_tokens(aligned[0], scores[0].exp(),
+                                      blank=blank_id)
         spans = [(sp.start, sp.end, float(sp.score)) for sp in token_spans]
         frame_to_s = FRAME / SR
 
@@ -273,6 +293,10 @@ def retime_segments(audio_path: str, segments: list[dict],
                     {"word": w, "start": round(float(a), 3),
                      "end": round(float(b), 3), "score": round(float(sc), 3)}
                     for (w, a, b, sc) in wlist]
+            else:
+                # Interpolated line: the inherited word stamps belong to
+                # the OLD timing — keeping them would break karaoke.
+                new.pop("words", None)
             out.append(new)
         logger.info("[CTC] retimed %d lines in %.1fs (audio %.0fs, job=%s)",
                     len(out), time.time() - t0, dur, job_id)

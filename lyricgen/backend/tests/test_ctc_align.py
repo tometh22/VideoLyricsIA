@@ -86,3 +86,28 @@ def test_ctc_align_is_valid_timing_source():
     from timing_sources import CTC_ALIGN, VALID_TIMING_SOURCES
     assert CTC_ALIGN in VALID_TIMING_SOURCES
     assert len(CTC_ALIGN) <= 20  # VARCHAR(20) constraint
+
+
+def test_wrapper_flag_off_is_identity(monkeypatch):
+    """THE contract of the PR: with CTC_ALIGN_ENABLED off,
+    _maybe_ctc_retime returns the very same object — prod behaviour is
+    byte-identical to before the wiring."""
+    import asyncio
+    from main import _maybe_ctc_retime
+
+    monkeypatch.delenv("CTC_ALIGN_ENABLED", raising=False)
+    result = {"job_id": "j1", "segments": [{"text": "hola", "start": 1.0}] * 5}
+    out = asyncio.run(_maybe_ctc_retime(result, "/no/such/audio.mp3", "j1"))
+    assert out is result  # same object, not a copy
+
+
+def test_wrapper_never_raises_even_with_flag_on(monkeypatch):
+    """Flag ON + missing audio/stem must decline to identity, not 500."""
+    import asyncio
+    from main import _maybe_ctc_retime
+
+    monkeypatch.setenv("CTC_ALIGN_ENABLED", "1")
+    monkeypatch.delenv("VOCAL_SEP_ENABLED", raising=False)  # no stem possible
+    result = {"job_id": "j2", "segments": [{"text": "hola", "start": 1.0}] * 5}
+    out = asyncio.run(_maybe_ctc_retime(result, "/no/such/audio.mp3", "j2"))
+    assert out is result

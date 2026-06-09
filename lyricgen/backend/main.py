@@ -4090,19 +4090,31 @@ async def _maybe_ctc_retime(result, audio_path: str, job_id: str):
     the result at the call sites re-fetches the stem via the R2 stem
     cache (a hit — the cascade computed it seconds ago), so no second
     demucs run is paid."""
-    import ctc_align as _ctc
-    if not _ctc.is_enabled() or not isinstance(result, dict):
-        return result
-    segs = result.get("segments") or []
-    if len(segs) < 3:
-        return result
     _stem = None
     try:
+        # Everything (the import too) lives inside the try: a broken
+        # ctc_align module must degrade to "no retime", never to a 500
+        # on every transcription — including with the flag OFF.
+        import ctc_align as _ctc
+        if not _ctc.is_enabled() or not isinstance(result, dict):
+            return result
+        segs = result.get("segments") or []
+        if len(segs) < 3:
+            return result
         import vocal_sep as _vs
-        _stem = await asyncio.to_thread(_vs.separate_vocals, audio_path)
-        target = _stem or audio_path
+        # cache_only: the cascade computed the stem seconds ago, so this
+        # is an R2 download — never a second (paid, 60-180 s, hangable)
+        # demucs run. Cascade paths that skipped vocal separation have
+        # no cached stem → decline; aligning on the mix is unvalidated.
+        _stem = await asyncio.wait_for(
+            asyncio.to_thread(_vs.separate_vocals, audio_path, cache_only=True),
+            timeout=120,
+        )
+        if not _stem:
+            logger.info("[CTC] no cached stem — skipping retime (job=%s)", job_id)
+            return result
         retimed = await asyncio.wait_for(
-            asyncio.to_thread(_ctc.retime_segments, target, segs, job_id),
+            asyncio.to_thread(_ctc.retime_segments, _stem, segs, job_id),
             timeout=240,
         )
         if retimed:

@@ -213,8 +213,16 @@ def _stem_cache_key(audio_path: str) -> str:
 def separate_vocals(
     audio_path: str,
     on_progress: Optional[Callable[[float], None]] = None,
+    *,
+    cache_only: bool = False,
 ) -> str | None:
     """Isolate the vocal stem of `audio_path` via demucs on Replicate.
+
+    `cache_only=True`: return the stem ONLY if it's already in the R2
+    cache — never run Replicate. For opportunistic consumers (the CTC
+    re-time post-pass) that must not pay a second demucs run nor block
+    on Replicate latency when the transcription cascade happened to
+    skip vocal separation.
     Returns the path to a temp stem file, or None (disabled / failure).
     Never raises — callers fall back to the mixed audio.
 
@@ -272,6 +280,9 @@ def separate_vocals(
         # Cache check failures must NEVER break the main path.
         logger.warning("[VOCALSEP] cache check failed (%s) — proceeding with Replicate", e)
         cache_key = None  # don't try to upload either
+
+    if cache_only:
+        return None
 
     try:
         import replicate  # noqa: F401 — used inside `call_with_budget`
