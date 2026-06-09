@@ -3284,7 +3284,16 @@ async def transcribe_uploaded(
             or job_row.user_id != current_user["id"]
             or job_row.tenant_id != current_user["tenant_id"]):
         raise HTTPException(status_code=404, detail="Job not found.")
-    if job_row.status not in ("awaiting_upload", "transcribed_pending"):
+    # `transcription_failed` added 2026-06-09: honours the reaper's customer-
+    # facing "apretá Reintentar para volver a transcribir" promise
+    # (reaper.py:_reason_for_transcription). The audio still lives in R2
+    # (input_r2_key set; the transcription reap never clears it), so this
+    # re-runs the transcribe step from storage with no re-upload — the exact
+    # CTA the message offers. Before this, /retry rejected the state and the
+    # only path was re-uploading through the wizard (P0 follow-up: the message
+    # over-promised a one-click retry the API refused).
+    if job_row.status not in ("awaiting_upload", "transcribed_pending",
+                              "transcription_failed"):
         raise HTTPException(
             status_code=409,
             detail=f"Job is in state {job_row.status!r}, cannot transcribe.",
@@ -3341,6 +3350,13 @@ async def transcribe_uploaded(
         # devuelva un estado coherente desde el momento del enqueue.
         job_row.status = "transcribing_queued"
         job_row.current_step = "transcribing"
+        # Reset the reaper clock. find_stuck_transcriptions anchors on
+        # coalesce(last_progress_at, created_at) with a 120-min threshold
+        # (reaper.py). A retried `transcription_failed` job has an OLD
+        # created_at, so without this NOW() bump the very next reaper pass
+        # would re-kill it instantly (same class of bug retry_job guards at
+        # main.py:9107). Harmless for fresh awaiting_upload jobs.
+        job_row.last_progress_at = datetime.now(timezone.utc)
         db.commit()
         db.close()
         try:
