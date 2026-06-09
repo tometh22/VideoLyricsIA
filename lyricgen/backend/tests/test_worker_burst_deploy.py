@@ -26,7 +26,7 @@ from unittest.mock import MagicMock
 
 from rq import Worker as _RQWorker
 
-from worker import WarmOnlyWorker
+from worker import WarmOnlyWorker, _should_recycle
 
 
 def test_is_rq_worker_subclass():
@@ -56,3 +56,36 @@ def test_request_force_stop_does_not_escalate():
     stub.kill_horse.assert_not_called()
     stub.stop_scheduler.assert_not_called()
     # No SystemExit / RuntimeError escaped — reaching here is the assertion.
+
+
+# --- Self-recycle discriminator (P0 2026-06-08) ------------------------------
+# main() re-execs a fresh process when work() returns for a recyclable reason,
+# and exits (for the rolling deploy) on a warm shutdown. The whole decision
+# hinges on RQ's `_stop_requested` flag; these guard it the same way the
+# burst-deploy tests guard request_force_stop.
+
+def test_recycle_on_max_jobs_cap():
+    # max_jobs recycle (and idle/Redis-blip breaks) leave _stop_requested
+    # False → we MUST respawn so the queue keeps a consumer. This is the bug
+    # the P0 fixed: a clean exit here was never restarted under ON_FAILURE.
+    stub = MagicMock()
+    stub._stop_requested = False
+    assert _should_recycle(stub) is True
+
+
+def test_no_recycle_on_warm_shutdown():
+    # SIGTERM/SIGINT warm shutdown sets _stop_requested True → main() must
+    # exit (NOT re-exec) so a Railway deploy's rolling replace proceeds and
+    # WarmOnlyWorker's in-flight drain is honored.
+    stub = MagicMock()
+    stub._stop_requested = True
+    assert _should_recycle(stub) is False
+
+
+def test_recycle_discriminator_is_live():
+    # The discriminator reads `_stop_requested`; if a future RQ renames it,
+    # _should_recycle would silently always-recycle (re-exec'ing through a
+    # deploy). Pin the attribute so the rename trips CI instead.
+    assert hasattr(_RQWorker, "_stop_requested") or "_stop_requested" in (
+        _RQWorker.__init__.__code__.co_names
+    ), "RQ no longer sets _stop_requested — re-point _should_recycle()."
