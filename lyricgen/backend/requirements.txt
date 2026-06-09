@@ -41,3 +41,14 @@ boto3==1.35.0
 sentry-sdk[fastapi]==2.14.0
 slowapi==0.1.9
 psutil>=5.9.0,<7.0.0
+# --- Genly CTC timing engine (ctc_align.py, gated CTC_ALIGN_ENABLED) ---
+# CPU-only torch: the +cpu builds live on the pytorch index (linux); macOS
+# wheels on PyPI are already CPU. EXACT torchaudio pin: 2.9 removes
+# torchaudio.functional.forced_align (deprecation #3902) — bumping this
+# requires vendoring the Viterbi first. Adds ~800 MB to the image; the
+# model itself (~1.2 GB) downloads to the HF cache on first use.
+--extra-index-url https://download.pytorch.org/whl/cpu
+torch==2.8.0+cpu; sys_platform == "linux"
+torchaudio==2.8.0+cpu; sys_platform == "linux"
+torch==2.8.0; sys_platform == "darwin"
+torchaudio==2.8.0; sys_platform == "darwin"

@@ -60,7 +60,7 @@ def run_transcription_job(
     # Lazy import — main.py es pesado y el worker no debería pagarlo si
     # corre otros queues. asyncio.run abre/cierra su propio event loop por job,
     # que es lo que queremos (jobs independientes, sin event-loop leak).
-    from main import _run_transcription_for_job  # type: ignore
+    from main import _maybe_ctc_retime, _run_transcription_for_job  # type: ignore
     from jobs import update_job, get_job
     import storage
 
@@ -98,10 +98,17 @@ def run_transcription_job(
     # 3. Llamar al pipeline async existente. `request` y `current_user` son
     #    ignorados dentro del cuerpo (verified) — passing None es seguro.
     try:
-        result = asyncio.run(_run_transcription_for_job(
-            None, None, job_id, audio_path,
-            language=language, artist=artist, title=title, filename=filename,
-        ))
+        async def _run_with_retime():
+            r = await _run_transcription_for_job(
+                None, None, job_id, audio_path,
+                language=language, artist=artist, title=title, filename=filename,
+            )
+            # Gated CTC re-time post-pass (CTC_ALIGN_ENABLED, default OFF);
+            # no-op passthrough when the flag is off. Same wrapper the HTTP
+            # call sites use — keeps the three entry points in lockstep.
+            return await _maybe_ctc_retime(r, audio_path, job_id)
+
+        result = asyncio.run(_run_with_retime())
     except Exception as e:
         import traceback
         tb = traceback.format_exc()

@@ -106,8 +106,16 @@ WHISPER_ALIGN = "whisper_align"
 # `anchor_align.py`.
 SYNCED_SCAFFOLD = "synced_scaffold"
 
+# Genly CTC engine (ctc_align.py): full-song monotonic CTC forced
+# alignment of the FINAL line texts onto the vocal stem (local wav2vec2
+# XLSR-es, Apache-2.0, + synthetic star class). Applied as a gated
+# post-pass over whatever the cascade emitted (CTC_ALIGN_ENABLED) —
+# benchmark vs Rotor GT: median onset offset 0.04-0.10 s on all 4 songs.
+CTC_ALIGN = "ctc_align"
+
 
 VALID_TIMING_SOURCES = frozenset({
+    CTC_ALIGN,
     FORCED_ALIGN,
     WHISPERX_RECONCILED,
     WHISPERX,
