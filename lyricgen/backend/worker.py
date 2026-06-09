@@ -14,6 +14,7 @@ import os
 import signal
 import socket
 import sys
+import time
 
 logger = logging.getLogger("genly.worker")
 
@@ -174,6 +175,24 @@ def _resolve_queue_names() -> list:
     return names or _DEFAULT_QUEUES.split(",")
 
 
+def _should_recycle(worker) -> bool:
+    """True when worker.work() returned for a RECYCLABLE reason (the max_jobs
+    memory recycle, or a transient loop break like a Redis blip) rather than
+    an operator/deploy WARM shutdown.
+
+    Drives the os.execv self-recycle in main() (P0 2026-06-08). RQ sets
+    `_stop_requested = True` only from `request_stop` (the SIGTERM/SIGINT warm
+    shutdown handler, rq/worker.py:1006); the max_jobs cap, idle, Redis
+    timeout and unhandled-exception breaks all leave it False. So a False
+    `_stop_requested` after work() means "no one asked us to shut down — the
+    loop ended on its own", which is exactly when we must respawn instead of
+    letting Railway's ON_FAILURE policy leave the queue without a consumer.
+    `getattr` default keeps a future RQ rename from crashing the worker (it
+    would recycle conservatively); test_recycle_discriminator_is_live guards
+    the attribute so the rename trips CI instead."""
+    return not getattr(worker, "_stop_requested", False)
+
+
 def main():
     redis_url = os.environ.get("REDIS_URL", "").strip()
     if not redis_url:
@@ -282,6 +301,42 @@ def main():
     # active scheduler at a time; the others stand by and take over if the
     # holder dies. No coordination required here.
     worker.work(with_scheduler=True, max_jobs=max_jobs)
+
+    # Self-supervised recycle (P0 2026-06-08). worker.work() returns on three
+    # paths: (a) the max_jobs moviepy-memory recycle above, (b) a transient
+    # break (Redis blip, unhandled exception in the loop), or (c) a
+    # SIGTERM/SIGINT warm shutdown (Railway deploy). The original code let
+    # main() return in ALL three, ASSUMING — see the max_jobs comment above —
+    # that "Railway's restart policy spawns a replacement in ~30s". It does
+    # NOT: every worker service runs restartPolicyType=ON_FAILURE
+    # (railway.toml), so a CLEAN exit (code 0) is treated as success and is
+    # never restarted. After one recycle the ShortWorker pool — the sole
+    # consumer of the `transcription` queue (QUEUES=transcription,bg_preview)
+    # — exited and stayed dead; transcriptions sat in `transcribing_queued`
+    # with no consumer until the reaper flipped them to "Worker colgado"
+    # (universal_argentina, 2026-06-08). The render Worker pool masked the
+    # same latent bug via 7 replicas + frequent deploys.
+    #
+    # Fix: be our own supervisor instead of depending on Railway's restart
+    # policy. On a real warm shutdown (SIGTERM ⇒ _stop_requested) fall through
+    # and exit so the rolling deploy proceeds and WarmOnlyWorker's drain is
+    # honored. Otherwise re-exec a FRESH process image: os.execv resets the
+    # leaked moviepy heap exactly like a container restart would, and keeps
+    # the queue consumer alive across recycles. The short backoff prevents a
+    # hot loop if work() is returning immediately (e.g. a Redis outage); a
+    # real crash at STARTUP raises before work() is reached and is still
+    # caught by Railway's bounded ON_FAILURE restarts.
+    if not _should_recycle(worker):
+        logger.info("[WORKER] warm shutdown requested — exiting for deploy/drain")
+        return
+    logger.info("[WORKER] recycle — re-exec'ing a fresh worker process (max_jobs=%s)", max_jobs)
+    for _stream in (sys.stdout, sys.stderr):
+        try:
+            _stream.flush()
+        except Exception:
+            pass
+    time.sleep(float(os.environ.get("WORKER_RECYCLE_BACKOFF_S", "2")))
+    os.execv(sys.executable, [sys.executable, *sys.argv])
 
 
 if __name__ == "__main__":
