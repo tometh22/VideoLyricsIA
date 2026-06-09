@@ -545,7 +545,13 @@ function JobDetailRoute({ fetchHistory }) {
     let alive = true;
     setJob(null);
     setError(false);
-    authFetch(`${API}/status/${id}`)
+    // authFetchWithTimeout (not bare authFetch): a hung/slow /status — e.g.
+    // when the api's DB pool is briefly exhausted under a polling burst
+    // (QueuePool timeout ~30s) — must surface as the error state, NOT a
+    // permanent spinner. 2026-06-09: an operator hit an infinite spinner
+    // opening a transcribed_pending job during exactly that condition.
+    // Mirrors EditLyricsRoute, which already caps /status at 10s.
+    authFetchWithTimeout(`${API}/status/${id}`, {}, 10_000)
       .then(r => r.ok ? r.json() : Promise.reject())
       .then(j => { if (alive) setJob(j); })
       .catch(() => { if (alive) setError(true); });
