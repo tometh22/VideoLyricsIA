@@ -823,15 +823,29 @@ export default function JobDetail({ job, onBack, onJobUpdate }) {
             {job.error || t("detail.transcription_failed_unknown") || "Error desconocido durante la transcripción."}
           </p>
           <p className="text-xs text-ink-secondary mb-4 leading-relaxed">
-            {t("detail.transcription_failed_help") || "Volvé al wizard y subí el audio de nuevo. Si el archivo es muy grande, convertilo a MP3 antes."}
+            {t("detail.transcription_failed_help") || "Tu archivo sigue guardado. Apretá «Reintentar» para volver a transcribirlo sin re-subir."}
           </p>
-          <a
-            href="/new"
-            className="inline-flex items-center gap-2 px-4 py-2 rounded-lg bg-brand hover:bg-brand-light text-white font-medium text-sm transition-colors"
-          >
-            {t("detail.transcription_failed_cta") || "Volver al wizard"}
-            <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24"><path d="M5 12h14M12 5l7 7-7 7" /></svg>
-          </a>
+          <div className="flex flex-wrap items-center gap-3">
+            {/* Reintentar sin re-subir: el flujo /new?resume=<jobId> reusa el
+                audio que sigue en R2 (App.jsx resume → source-audio-url →
+                /transcribe-uploaded, que ahora acepta transcription_failed).
+                Honra el mensaje del reaper (P0 2026-06-08 follow-up). */}
+            <a
+              href={`/new?resume=${encodeURIComponent(job.job_id)}`}
+              className="inline-flex items-center gap-2 px-4 py-2 rounded-lg bg-brand hover:bg-brand-light text-white font-medium text-sm transition-colors"
+            >
+              {t("detail.transcription_failed_retry") || "Reintentar sin re-subir"}
+              <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24"><path d="M4 4v6h6M20 20v-6h-6M20 9a8 8 0 0 0-14.9-3M4 15a8 8 0 0 0 14.9 3" /></svg>
+            </a>
+            {/* Fallback: si el audio ya no está en R2 (limpieza/borrado), el
+                resume falla con 422 y el operador re-sube desde cero. */}
+            <a
+              href="/new"
+              className="inline-flex items-center gap-2 px-3 py-2 rounded-lg text-ink-secondary hover:text-white text-xs transition-colors"
+            >
+              {t("detail.transcription_failed_cta") || "Subir de nuevo"}
+            </a>
+          </div>
         </div>
       </div>
     );

@@ -711,8 +711,13 @@ def enqueue_prores_prewarm(job_id: str, file_type: str) -> str | None:
         job_timeout=PRORES_PREWARM_TIMEOUT,
         result_ttl=RESULT_TTL,
         failure_ttl=FAILURE_TTL,
-        # Use a deterministic id so an inadvertent double-enqueue is a
-        # no-op (RQ dedupes by job_id within a queue).
+        # Deterministic id: collapses concurrent double-enqueues to one
+        # QUEUED entry. NOTE: RQ (1.16.2) does NOT no-op a re-enqueue of a
+        # FINISHED id — enqueue overwrites the job hash and re-pushes the id,
+        # so it RE-RUNS. run_edit_pipeline relies on exactly that to force a
+        # fresh transcode after an edit (it cancel_rq_job's the old one first
+        # for hygiene). If RQ is ever upgraded, re-verify this re-run
+        # behavior or the post-edit re-warm silently stops firing.
         job_id=f"prewarm:{job_id}:{file_type}",
     )
     prewarm_enqueued_total += 1

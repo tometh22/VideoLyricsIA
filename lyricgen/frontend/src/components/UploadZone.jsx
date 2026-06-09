@@ -143,6 +143,12 @@ export default function UploadZone({
   onBackgroundId,
   backgroundMode,
   onBackgroundMode,
+  // Bug Ana M. 2026-06-09: el tab de fondo (auto/library/custom) ahora es
+  // estado de App, no local. Con useState local, un remount del wizard
+  // volvía el tab a "auto" visualmente mientras App conservaba el
+  // backgroundFile del batch anterior — y lo mandaba a /generate igual.
+  bgMode = "auto",
+  onBgMode,
   animateImage,
   onAnimateImage,
   inspiredByLyrics = true,
@@ -231,7 +237,9 @@ export default function UploadZone({
   const [umgFps, setUmgFps] = useState(delivery?.umg_fps || 24);
   const [umgProresProfile, setUmgProresProfile] = useState(delivery?.umg_prores_profile || 3);
   const [deliveryExpanded, setDeliveryExpanded] = useState(false);
-  const [bgMode, setBgMode] = useState("auto"); // auto | library | custom
+  // bgMode viene de App via props (ver header) — acá sólo un alias para
+  // que el resto del componente siga llamando setBgMode.
+  const setBgMode = (m) => onBgMode?.(m);
   const [libraryBgs, setLibraryBgs] = useState([]);
   const [libraryLoaded, setLibraryLoaded] = useState(false);
   const [libraryFetchFailed, setLibraryFetchFailed] = useState(false);

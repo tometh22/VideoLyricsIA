@@ -75,6 +75,7 @@ export function save({
   delivery,
   backgroundId,
   backgroundMode,
+  bgSelectMode,
   animateImage,
   inspiredByLyrics,
 }) {
@@ -95,6 +96,7 @@ export function save({
         delivery: delivery || null,
         backgroundId: backgroundId || null,
         backgroundMode: backgroundMode || null,
+        bgSelectMode: bgSelectMode || null,
         animateImage: !!animateImage,
         inspiredByLyrics: inspiredByLyrics !== false,
       },

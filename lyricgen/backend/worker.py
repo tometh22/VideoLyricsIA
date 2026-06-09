@@ -14,6 +14,7 @@ import os
 import signal
 import socket
 import sys
+import time
 
 logger = logging.getLogger("genly.worker")
 
@@ -174,6 +175,84 @@ def _resolve_queue_names() -> list:
     return names or _DEFAULT_QUEUES.split(",")
 
 
+def _should_recycle(worker) -> bool:
+    """True when worker.work() returned for a RECYCLABLE reason (the max_jobs
+    cap, or a transient loop break like a Redis blip) rather than an
+    operator/deploy WARM shutdown.
+
+    Drives the os.execve self-recycle in main() (P0 2026-06-08).
+
+    CRITICAL (adversarial review 2026-06-09): RQ 1.16.2's `_shutdown`
+    (rq/worker.py:1000-1014) sets `_stop_requested = True` ONLY when the
+    worker is BUSY at signal time; when it is IDLE (the dominant state for the
+    ShortWorker — blocked in BLPOP between ~20s jobs) it `raise StopRequested`
+    WITHOUT setting `_stop_requested`. So keying solely on `_stop_requested`
+    misfired on the common case: a deploy's SIGTERM to an idle worker would
+    look like a recycle and we'd os.execve (respawn old code, fight the
+    rolling replace) instead of exiting. The reliable signal is
+    `_shutdown_requested_date`, which `request_stop` (rq/worker.py:992) sets
+    on EVERY warm shutdown, busy or idle. The max_jobs cap, Redis-timeout and
+    unhandled-exception breaks set NEITHER flag → recycle. getattr defaults
+    keep a future RQ rename from crashing the worker (it would recycle
+    conservatively); test_recycle_discriminator_is_live pins the attributes."""
+    return not (
+        getattr(worker, "_stop_requested", False)
+        or getattr(worker, "_shutdown_requested_date", None) is not None
+    )
+
+
+# Circuit breaker for the os.execve recycle (adversarial review 2026-06-09).
+# execve keeps the SAME PID, so Railway's restartPolicyMaxRetries (ON_FAILURE)
+# NEVER counts a re-exec — a worker that keeps returning with no work done
+# (Redis outage, poison loop) would hot-loop forever. After N consecutive
+# recycles that completed ZERO jobs we sys.exit(1) instead, ceding control to
+# Railway's bounded ON_FAILURE restart. The streak survives execve via env.
+_NOWORK_STREAK_ENV = "_WORKER_NOWORK_STREAK"
+_MAX_NOWORK_RECYCLES = int(os.environ.get("WORKER_MAX_NOWORK_RECYCLES", "5"))
+
+
+def _recycle_or_exit(worker, did_work: bool, max_jobs) -> None:
+    """Decide what to do after worker.work() returns. Returns (caller should
+    then `return` from main and exit the process) on a warm shutdown; on a
+    recycle it re-execs a fresh process image (never returns) or, on a no-work
+    hot-loop past the threshold, sys.exit(1) to cede to Railway's ON_FAILURE.
+
+    `did_work` is worker.work()'s return value (bool(completed_jobs)): True ⇒
+    at least one job ran this lifetime (a real max_jobs recycle); False ⇒ the
+    loop broke without completing a job (Redis blip / unhandled exception)."""
+    if not _should_recycle(worker):
+        logger.info("[WORKER] warm shutdown requested — exiting for deploy/drain")
+        return
+
+    # No-work hot-loop guard. did_work resets the streak; a barren break grows it.
+    streak = 0 if did_work else int(os.environ.get(_NOWORK_STREAK_ENV, "0")) + 1
+    if streak >= _MAX_NOWORK_RECYCLES:
+        logger.error(
+            "[WORKER] %d recycles consecutivos sin completar trabajo — exit(1) "
+            "para ceder a Railway ON_FAILURE (probable Redis caído / job-veneno)",
+            streak,
+        )
+        sys.exit(1)
+
+    backoff = float(os.environ.get("WORKER_RECYCLE_BACKOFF_S", "2"))
+    if not did_work:  # exponential backoff on barren loops (cap 60s)
+        backoff = min(backoff * (2 ** (streak - 1)), 60.0)
+    logger.info(
+        "[WORKER] recycle — re-exec'ing fresh worker (max_jobs=%s, nowork_streak=%d, backoff=%.0fs)",
+        max_jobs, streak, backoff,
+    )
+    for _stream in (sys.stdout, sys.stderr):
+        try:
+            _stream.flush()
+        except Exception:
+            pass
+    time.sleep(backoff)
+    # os.execve (not execv) so we can thread the streak counter across the
+    # process-image replacement via the environment.
+    os.execve(sys.executable, [sys.executable, *sys.argv],
+              {**os.environ, _NOWORK_STREAK_ENV: str(streak)})
+
+
 def main():
     redis_url = os.environ.get("REDIS_URL", "").strip()
     if not redis_url:
@@ -281,7 +360,33 @@ def main():
     # RQScheduler uses Redis locks so only one of the 7 replicas runs the
     # active scheduler at a time; the others stand by and take over if the
     # holder dies. No coordination required here.
-    worker.work(with_scheduler=True, max_jobs=max_jobs)
+    did_work = worker.work(with_scheduler=True, max_jobs=max_jobs)
+
+    # Self-supervised recycle (P0 2026-06-08). worker.work() returns on three
+    # paths: (a) the max_jobs cap above, (b) a transient break (Redis blip,
+    # unhandled exception in the loop), or (c) a SIGTERM/SIGINT warm shutdown
+    # (Railway deploy). The original code let main() return in ALL three,
+    # ASSUMING — see the max_jobs comment above — that "Railway's restart
+    # policy spawns a replacement in ~30s". It does NOT: every worker service
+    # runs restartPolicyType=ON_FAILURE (railway.toml), so a CLEAN exit (code
+    # 0) is treated as success and is never restarted. After one recycle the
+    # ShortWorker pool — the sole consumer of the `transcription` queue
+    # (QUEUES=transcription,bg_preview) — exited and stayed dead;
+    # transcriptions sat in `transcribing_queued` with no consumer until the
+    # reaper flipped them to "Worker colgado" (universal_argentina,
+    # 2026-06-08). The render Worker pool masked the same latent bug via 7
+    # replicas + frequent deploys.
+    #
+    # Fix: be our own supervisor. On a warm shutdown (case c) exit so the
+    # rolling deploy proceeds and WarmOnlyWorker's drain is honored; on a
+    # recycle (a/b) re-exec a fresh process image to keep the queue consumer
+    # alive without depending on Railway's restart policy. The warm-shutdown
+    # vs recycle discrimination and the no-work hot-loop guard live in
+    # _recycle_or_exit / _should_recycle (see their docstrings). NB: the
+    # leaked memory that motivates max_jobs lives in RQ's per-job forked
+    # work-horse, which already dies per job — the recycle's real value is
+    # keeping the consumer ALIVE, not heap reset.
+    _recycle_or_exit(worker, did_work, max_jobs)
 
 
 if __name__ == "__main__":

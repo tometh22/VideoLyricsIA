@@ -835,7 +835,9 @@ def copy_object(src_key: str, dst_key: str) -> bool:
     not exist (treated as "nothing to archive"). Raises on real S3 errors so
     the caller can surface them.
     """
-    from botocore.exceptions import ClientError
+    from botocore.exceptions import (
+        ClientError, ReadTimeoutError, ConnectTimeoutError,
+    )
     client = _get_client()
     if client is None:
         return False
@@ -855,6 +857,18 @@ def copy_object(src_key: str, dst_key: str) -> bool:
             client.copy(CopySource=src, Bucket=R2_BUCKET, Key=dst_key)
         else:
             raise
+    except (ReadTimeoutError, ConnectTimeoutError) as e:
+        # Single-op server-side CopyObject holds ONE HTTP connection open for
+        # the entire server-side copy; for a multi-GB ProRes master R2's
+        # internal copy can exceed the client read_timeout (120s) →
+        # ReadTimeoutError (incident 2026-06-09: "[EDIT] snapshot copy failed
+        # for umg_master"). The docstring's "versions in milliseconds" holds
+        # for small files, not GB-scale masters. Managed client.copy() chunks
+        # into many small UploadPartCopy calls — each a fast server-side copy
+        # well under the timeout — so the same multipart path that handles
+        # EntityTooLarge also dodges the per-request timeout.
+        logger.info("[R2] %s single-copy timed out (%s) — using multipart copy", src_key, type(e).__name__)
+        client.copy(CopySource=src, Bucket=R2_BUCKET, Key=dst_key)
     logger.info("[R2] Copied %s -> %s", src_key, dst_key)
     return True
 

@@ -590,6 +590,21 @@ def run_pipeline(job_id: str, mp3_path: str, artist: str, style: str,
     job_dir = os.path.join(OUTPUTS_DIR, job_id)
     os.makedirs(job_dir, exist_ok=True)
 
+    # Drop any ProRes .mov left from a PRIOR render of this same job_id
+    # (e.g. a /retry re-render: retry_job clears s3_keys but reuses job_dir,
+    # and _cleanup_local_intermediates does not touch the .mov). A fresh
+    # full render invalidates the lazy ProRes derivative; leaving the old
+    # .mov on disk would let the post-render prewarm short-circuit on
+    # os.path.exists and re-publish the pre-render cut. Best-effort.
+    for _stale_mov in ("umg_master.mov", "umg_short.mov"):
+        _sp = os.path.join(job_dir, _stale_mov)
+        if os.path.exists(_sp):
+            try:
+                os.unlink(_sp)
+                logger.info("[PIPELINE] job=%s dropped stale %s before re-render", job_id, _stale_mov)
+            except OSError as _e:
+                logger.warning("[PIPELINE] could not drop stale %s: %s", _sp, _e)
+
     # Telemetría 2026-05-23 — text_motion + lyric_transition deprecados.
     # main.py coerce upstream a defaults, pero un job que estuviera en cola
     # antes del deploy puede traer valores no-default; loguear UNA VEZ por
@@ -10778,7 +10793,54 @@ def run_edit_pipeline(
         # the edit `error` instead of advertising broken downloads. We still
         # capture the return value (dict of successfully-uploaded keys)
         # because the audit log below reports `files_updated` from it.
-        s3_keys = _upload_deliverables_to_r2(job_id, job_dir, files)
+        #
+        # ProRes invalidation (2026-06-09 fix): the edit regenerated
+        # lyric_video.mp4 but NOT umg_master.mov / umg_short.mov — those are
+        # lazy-transcoded from the MP4 at /download time. Passing their URLs
+        # into the upload set would re-upload the STALE pre-edit .mov still
+        # sitting in job_dir (left by a prior lazy download or prewarm),
+        # cementing the old cut on R2. Exclude them from the upload; we
+        # invalidate the stale .mov + s3_keys below and re-warm fresh.
+        upload_files = {
+            k: v for k, v in files.items()
+            if k not in ("umg_master_url", "umg_short_url")
+        }
+        s3_keys = _upload_deliverables_to_r2(job_id, job_dir, upload_files)
+
+        # Invalidate the lazy ProRes cache so the next /download/umg_master
+        # re-transcodes from the freshly re-rendered lyric_video.mp4 instead
+        # of serving the pre-edit cut. _snapshot_previous_deliverables above
+        # already archived the prior .mov keys as {key}.vN, so the rollback
+        # path is preserved. Then re-enqueue prewarm (mirrors run_pipeline)
+        # so UMG gets an instant 302 instead of a cold 60-120 s transcode.
+        if wants_umg:
+            for _ft in ("umg_master", "umg_short"):
+                _stale = os.path.join(job_dir, _DELIVERABLE_FILENAMES[_ft])
+                if os.path.exists(_stale):
+                    try:
+                        os.unlink(_stale)
+                    except OSError as _e:
+                        logger.warning("[EDIT] could not drop stale %s: %s", _stale, _e)
+            try:
+                from jobs import remove_s3_keys
+                remove_s3_keys(job_id, ["umg_master", "umg_short"])
+            except Exception as _e:
+                logger.warning("[EDIT] prores s3_keys invalidation skipped: %s", _e)
+            try:
+                from queue_jobs import enqueue_prores_prewarm, cancel_rq_job
+                # Cancel any prewarm still QUEUED from a PRIOR render so it
+                # can't transcode the now-stale source and publish over our
+                # invalidation. A prewarm already MID-ffmpeg in another
+                # process won't stop here, but it's independently fenced by
+                # the edit_count/editing_started_at freshness check in
+                # ensure_prores_exists (it discards the stale .mov instead of
+                # publishing). Then re-enqueue fresh.
+                for _ft in ("umg_master", "umg_short"):
+                    cancel_rq_job(f"prewarm:{job_id}:{_ft}")
+                enqueue_prores_prewarm(job_id, "umg_master")
+                enqueue_prores_prewarm(job_id, "umg_short")
+            except Exception as _e:
+                logger.warning("[EDIT] prores prewarm re-enqueue skipped: %s", _e)
 
         _cleanup_local_intermediates(job_dir)
 
