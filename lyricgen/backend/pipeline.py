@@ -4370,6 +4370,30 @@ def _llm_segment_words(segs: list[dict], *, audio_path: str, artist: str = "",
     return out_segs
 
 
+def _recording_diverges(segs: list[dict], canonical: str,
+                        ratio: float = 1.25) -> bool:
+    """True when the recording sings MEANINGFULLY MORE than the studio lyric
+    (live/extended: repeated verses, ad-libs, long outros).
+
+    Gate for letting LLM line-segmentation PREEMPT the canonical-recovery
+    cascade (forced_align / whisper-align) after `reconcile` aborts. Reconcile
+    also aborts on plain whisperX MISHEARS of a studio song (incident "Viejas
+    Locas — 638"), and for those FA must win because it recovers the canonical
+    TEXT — LLM-segment only re-groups whisperX's own (misheard) words and never
+    compares against `canonical`, so it would ship the mishears. We therefore
+    only declare divergence when the transcribed word count clearly exceeds the
+    canonical's by `ratio` (a true live has the extra content; a misheard studio
+    song has ~the same count). Returns False when there is no canonical text."""
+    canon_n = len((canonical or "").split())
+    if canon_n <= 0:
+        return False
+    # Count words from text; fall back to the word stream when a seg has no
+    # `text` yet (whisperX segs can carry `words` with an empty `text`).
+    wx_n = sum(len((s.get("text") or "").split()) or len(s.get("words") or [])
+               for s in (segs or []))
+    return wx_n >= ratio * canon_n
+
+
 def _env_float(name: str, default: float) -> float:
     """Read env var `name` as a float, falling back to `default` on unset or
     parse error. Used for request-time tuning knobs (no redeploy)."""
@@ -4402,6 +4426,259 @@ def _word_containment(snippet: str, reference: str) -> float:
     if not snip or not ref:
         return 0.0
     return sum(1 for t in snip if t in ref) / len(snip)
+
+
+# Test/local seam: a callable (clip, sr, c0, lines) -> [stamp,…] | None. When
+# set (e.g. to a whisperX-align backend in the lab), it overrides the hosted
+# aligner below. Production leaves it None and uses the Replicate force-aligner.
+_GAP_CLIP_ALIGNER = None
+
+
+def _gap_words_to_lines(stamps: list[dict], lines: list[str]):
+    """Map flat forced-aligned word `stamps` onto the recovered `lines` by token
+    count, in order, so each recovered line gets REAL start/end + per-word timing
+    instead of a uniform guess. Returns one seg-dict per line, or None when the
+    stamps don't line up with the text (→ caller keeps uniform timing).
+
+    The aligner is fed the SAME lyric text, so it returns ~one stamp per token;
+    we keep the line's own (Gemini) spelling and take only the timing from the
+    stamps. Recovered words carry a real score (so beat_snap leaves their
+    now-accurate timing alone) and provenance='gap-recovery'."""
+    total = sum(len(l.split()) for l in lines)
+    if not stamps or total <= 0 or len(stamps) < total - 2:  # small slack
+        return None
+    out, wi = [], 0
+    for txt in lines:
+        toks = txt.split()
+        grp = stamps[wi:wi + len(toks)]
+        wi += len(toks)
+        if not grp:
+            return None
+        st = grp[0].get("start")
+        en = grp[-1].get("end")
+        if not isinstance(st, (int, float)) or not isinstance(en, (int, float)):
+            return None
+        words = []
+        for k, tok in enumerate(toks):
+            s = grp[k] if k < len(grp) else grp[-1]
+            ws, we = s.get("start"), s.get("end")
+            words.append({
+                "word": tok,
+                "start": float(ws if isinstance(ws, (int, float)) else st),
+                "end": float(we if isinstance(we, (int, float)) else en),
+                "score": float(s.get("score") if isinstance(s.get("score"),
+                                                            (int, float)) else 0.6),
+                "provenance": "gap-recovery",
+            })
+        out.append({"start": float(st), "end": float(en), "text": txt,
+                    "words": words, "provenance": "gap-recovery"})
+    return out
+
+
+def _align_words_in_clip(clip, sr: int, c0: float, lines: list[str],
+                         timeout_s: int = 60):
+    """Forced-align the recovered `lines` to the audio `clip` → REAL absolute
+    word stamps [{word,start,end,score}], or None (caller keeps uniform timing).
+
+    Gated by GAP_RECOVERY_ALIGN_ENABLED. Never raises. Default backend is the
+    hosted cureau force-aligner (the same one the canonical cascade uses), run
+    on the SHORT clip; clip-relative stamps are shifted back by `c0` to absolute
+    song time. A `_GAP_CLIP_ALIGNER` hook overrides it for the lab/tests."""
+    if not _env_flag("GAP_RECOVERY_ALIGN_ENABLED"):
+        return None
+    try:
+        if _GAP_CLIP_ALIGNER is not None:
+            return _GAP_CLIP_ALIGNER(clip, sr, c0, lines)
+        import forced_align as _fa
+        if not _fa.is_enabled():
+            return None
+        import tempfile
+        import soundfile as sf
+        tmp = None
+        handles: list = []
+        try:
+            with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tf:
+                sf.write(tf.name, clip, sr, format="WAV")
+                tmp = tf.name
+
+            def factory():
+                f = open(tmp, "rb")
+                handles.append(f)
+                return {"audio_file": f, "transcript": "\n".join(lines),
+                        "show_probabilities": True}
+            out = _fa._call_with_budget(
+                _fa._MODEL, factory,
+                total_budget_s=float(timeout_s), backoff=[0, 5])
+        finally:
+            for h in handles:
+                try:
+                    h.close()
+                except Exception:
+                    pass
+            if tmp:
+                try:
+                    os.unlink(tmp)
+                except OSError:
+                    pass
+        ws = ((out.get("wordstamps") or out.get("words"))
+              if isinstance(out, dict) else out)
+        if not ws:
+            return None
+        stamps = []
+        for w in ws:
+            s, e = w.get("start"), w.get("end")
+            if isinstance(s, (int, float)) and isinstance(e, (int, float)):
+                sc = w.get("score")
+                if not isinstance(sc, (int, float)):
+                    sc = w.get("probability")
+                stamps.append({
+                    "word": w.get("word") or w.get("text") or "",
+                    "start": float(s) + c0, "end": float(e) + c0,
+                    "score": float(sc) if isinstance(sc, (int, float)) else 0.6,
+                })
+        return stamps or None
+    except Exception as e:
+        logger.warning("[GAP-ALIGN] failed (%s); uniform timing", e)
+        return None
+
+
+# Test seam for the acoustic-twin finder: (segs, gs, ge, Csync, beat_t) ->
+# (src_segs, cost) | None. Production leaves it None and uses chroma DTW below.
+_GAP_TWIN_FINDER = None
+
+
+def _gap_warp_segments(src_segs: list[dict], gap_start: float,
+                       gap_end: float) -> list[dict] | None:
+    """Warp a run of transcribed source segments into [gap_start, gap_end] by
+    linear time-scaling (a repeated chorus shares tempo). Keeps the source TEXT
+    (clean lead lyrics) and only re-times. Pure / unit-testable. Returns
+    seg dicts tagged provenance='gap-transplant', or None."""
+    if not src_segs:
+        return None
+    ss0 = src_segs[0].get("start")
+    ss1 = src_segs[-1].get("end")
+    if not isinstance(ss0, (int, float)) or not isinstance(ss1, (int, float)):
+        return None
+    span = ss1 - ss0
+    if span <= 0 or gap_end <= gap_start:
+        return None
+
+    def warp(t):
+        # Clamp into the gap so a source word slightly outside [ss0,ss1] can't
+        # land on a neighbouring real segment after merge/sort.
+        return min(max(gap_start + (t - ss0) / span * (gap_end - gap_start),
+                       gap_start), gap_end)
+
+    out = []
+    for sg in src_segs:
+        words = []
+        for w in sg.get("words", []):
+            if not isinstance(w.get("start"), (int, float)) \
+                    or not isinstance(w.get("end"), (int, float)):
+                continue
+            if w["end"] <= w["start"]:
+                continue            # skip degenerate (zero-duration) source words
+            ws = float(warp(w["start"]))
+            we = max(float(warp(w["end"])), ws)   # enforce end >= start
+            words.append({"word": w.get("word", ""), "start": ws, "end": we,
+                          "score": 0.45, "provenance": "gap-transplant"})
+        if not words:
+            continue
+        sgs = float(warp(sg["start"]))
+        out.append({"start": sgs, "end": max(float(warp(sg["end"])), sgs),
+                    "text": (sg.get("text") or "").strip(),
+                    "words": words, "provenance": "gap-transplant"})
+    return out or None
+
+
+def _find_gap_twin(segs, gs, ge, Csync, beat_t, max_cost):
+    """Single subsequence-DTW (gap query vs the whole song): the earlier,
+    already-transcribed region most acoustically similar to the gap (typically
+    the chorus the lead sang clean). Returns (src_segs, cost) | None.
+
+    One O(L·beats) DTW call instead of a DTW per window — validated to find the
+    same twins as the per-window scan, far cheaper on long recordings."""
+    nb = Csync.shape[1]
+    hb = np.where((beat_t >= gs) & (beat_t <= ge))[0]
+    if len(hb) < 3:
+        return None
+    Q = Csync[:, hb[0]:hb[-1] + 1]
+    L = Q.shape[1]
+    if L < 3 or L >= nb:
+        return None
+    D, _ = librosa.sequence.dtw(X=Q, Y=Csync, metric="cosine", subseq=True)
+    costs = np.array(D[-1, :], dtype=float) / L   # per-step cost of ending at j
+    # Mask end-beats whose ~L-beat window overlaps the gap itself.
+    for j in range(nb):
+        if not (beat_t[j] < gs or beat_t[max(j - L + 1, 0)] > ge):
+            costs[j] = np.inf
+    # Take the best-cost window that actually CONTAINS transcribed segments —
+    # iterate in cost order so an empty (untranscribed) best window can't
+    # silently shadow a slightly-worse window that has lyrics to transplant.
+    for j in np.argsort(costs):
+        if not np.isfinite(costs[j]) or costs[j] > max_cost:
+            break
+        t0, t1 = beat_t[max(j - L + 1, 0)], beat_t[j]
+        src = [sg for sg in segs
+               if sg.get("words") and t0 <= sg.get("start", -1) <= t1]
+        if src:
+            return src, float(costs[j])
+    return None
+
+
+def _transplant_gap(segs, gs, ge, Csync, beat_t, y=None, sr=22050,
+                    voice_th=None, *, max_cost=0.12, min_words=3, canonical=""):
+    """Fill a gap by transplanting its acoustic TWIN's lyrics (earlier clean
+    chorus) warped to the gap's timeframe — clean words + real placement, no ASR
+    of the crowd. The validated heart of the combined pipeline. Self-declining
+    (returns None on weak match / too few words / low vocabulary overlap / any
+    error); the caller then falls through to the Gemini re-transcription path."""
+    try:
+        # Vocal-presence gate: never transplant lyrics over an INSTRUMENTAL gap
+        # (a solo's chord loop can match the chorus's chroma). `y` is the vocal
+        # stem, so a gap with little voiced energy is instrumental/silence →
+        # decline. Cheap (RMS) and it also skips the DTW on instrumental gaps.
+        if y is not None and voice_th is not None and ge > gs:
+            seg = y[int(gs * sr):int(ge * sr)]
+            if len(seg):
+                fl = max(int(0.05 * sr), 1)
+                rms = librosa.feature.rms(y=seg, frame_length=fl,
+                                          hop_length=fl)[0]
+                if float(np.mean(rms > voice_th)) < 0.35:
+                    logger.info("[GAP-TRANSPLANT] gap %.0f–%.0f not voiced "
+                                "(instrumental?) — declining", gs, ge)
+                    return None
+        found = (_GAP_TWIN_FINDER(segs, gs, ge, Csync, beat_t)
+                 if _GAP_TWIN_FINDER is not None
+                 else _find_gap_twin(segs, gs, ge, Csync, beat_t, max_cost))
+        if not found:
+            return None
+        src, cost = found
+        if sum(len(sg.get("words", [])) for sg in src) < min_words:
+            return None
+        out = _gap_warp_segments(src, gs, ge)
+        if not out:
+            return None
+        # Smear guard: a faithful chorus repeat packs words densely. If we'd be
+        # stretching few words across a long gap (e.g. an 84 s outro that is
+        # really screams + silence), the linear warp would smear lyrics over
+        # non-vocal audio — decline and let the bounded Gemini path handle it.
+        n_w = sum(len(s.get("words", [])) for s in out)
+        if n_w == 0 or (ge - gs) / n_w > _env_float("GAP_TRANSPLANT_MAX_WORD_S", 1.2):
+            logger.info("[GAP-TRANSPLANT] gap %.0f–%.0f too sparse "
+                        "(%.1fs/word) — declining (smear guard)", gs, ge,
+                        (ge - gs) / max(n_w, 1))
+            return None
+        ref = canonical or " ".join((w.get("word") or "")
+                                    for sg in segs for w in sg.get("words", []))
+        if _word_containment(" ".join(s["text"] for s in out), ref) < 0.5:
+            return None
+        logger.info("[GAP-TRANSPLANT] gap %.0f–%.0f ← acoustic twin "
+                    "(cost %.3f, %d line(s))", gs, ge, cost, len(out))
+        return out
+    except Exception as e:
+        logger.warning("[GAP-TRANSPLANT] failed (%s); falling back", e)
+        return None
 
 
 def _recover_gap_lyrics(segs: list[dict], *, audio_path: str, artist: str = "",
@@ -4486,8 +4763,41 @@ def _recover_gap_lyrics(segs: list[dict], *, audio_path: str, artist: str = "",
 
         ref_text = canonical or " ".join((w.get("word") or "") for w in W)
         recovered: list[dict] = []
+        n_aligned = 0
+        n_transplant = 0
+
+        # Combined-pipeline Stage 3 (GAP_RECOVERY_TRANSPLANT_ENABLED, default
+        # off): precompute beat-synchronous chroma once so each gap can look for
+        # its acoustic twin (an earlier chorus the lead sang clean). Heavy, so
+        # only when the flag is on; any failure disables it (→ Gemini path).
+        _tx_on = _env_flag("GAP_RECOVERY_TRANSPLANT_ENABLED")
+        _Csync = _beat_t = None
+        if _tx_on:
+            try:
+                _ch = librosa.feature.chroma_cqt(y=y, sr=sr, hop_length=512)
+                _, _bts = librosa.beat.beat_track(y=y, sr=sr, hop_length=512)
+                _beat_t = librosa.frames_to_time(_bts, sr=sr, hop_length=512)
+                _Csync = librosa.util.sync(_ch, _bts, aggregate=np.median)
+                _nb = min(_Csync.shape[1], len(_beat_t))
+                _Csync, _beat_t = _Csync[:, :_nb], _beat_t[:_nb]
+                if _nb < 8:        # too few beats (beatless/rubato) → can't match
+                    _tx_on = False
+            except Exception as _e:
+                logger.warning("[GAP-TRANSPLANT] chroma setup failed (%s)", _e)
+                _tx_on = False
 
         for (gs, ge) in gaps[:MAX_GAPS]:
+            # Stage 3: try transplanting the gap's acoustic twin BEFORE a blind
+            # Gemini re-transcription. Self-declines → falls through below.
+            if _tx_on and _Csync is not None:
+                _tx = _transplant_gap(
+                    segs, gs, ge, _Csync, _beat_t, y, sr, voice_th,
+                    max_cost=_env_float("GAP_TRANSPLANT_MAX_COST", 0.12),
+                    canonical=canonical)
+                if _tx:
+                    recovered.extend(_tx)
+                    n_transplant += len(_tx)
+                    continue
             # Walk frames from the gap start; capture the FIRST voiced run,
             # ending it at the first sustained silence (or the clip cap).
             run_start = run_end = None
@@ -4578,27 +4888,39 @@ def _recover_gap_lyrics(segs: list[dict], *, audio_path: str, artist: str = "",
                             "(hallucination guard); skip", gs, ge)
                 continue
 
-            span = (run_end - run_start) / len(lyric)
-            for li, txt in enumerate(lyric):
-                st = run_start + li * span
-                en = run_start + (li + 1) * span
-                toks = txt.split()
-                wsp = (en - st) / max(1, len(toks))
-                words = [{"word": tok, "start": st + wi * wsp,
-                          "end": st + (wi + 1) * wsp, "score": 0.3,
-                          "provenance": "gap-recovery"}
-                         for wi, tok in enumerate(toks)]
-                recovered.append({"start": float(st), "end": float(en),
-                                  "text": txt, "words": words,
-                                  "provenance": "gap-recovery"})
+            # Path 1: REAL per-word timing via forced-align of the recovered
+            # text against the clip (GAP_RECOVERY_ALIGN_ENABLED). Lab on "Nada":
+            # cut the recovered-line timing error 1.06s → 0.27s vs the uniform
+            # split below. Falls back to the uniform split when the aligner is
+            # off / unavailable / the stamps don't line up with the text.
+            stamps = _align_words_in_clip(clip, sr, c0, lyric)
+            aligned = _gap_words_to_lines(stamps, lyric) if stamps else None
+            if aligned:
+                recovered.extend(aligned)
+                n_aligned += len(aligned)
+            else:
+                span = (run_end - run_start) / len(lyric)
+                for li, txt in enumerate(lyric):
+                    st = run_start + li * span
+                    en = run_start + (li + 1) * span
+                    toks = txt.split()
+                    wsp = (en - st) / max(1, len(toks))
+                    words = [{"word": tok, "start": st + wi * wsp,
+                              "end": st + (wi + 1) * wsp, "score": 0.3,
+                              "provenance": "gap-recovery"}
+                             for wi, tok in enumerate(toks)]
+                    recovered.append({"start": float(st), "end": float(en),
+                                      "text": txt, "words": words,
+                                      "provenance": "gap-recovery"})
 
         if not recovered:
             return segs
         merged = list(segs) + recovered
         merged.sort(key=lambda s: s.get("start", 0.0))
         logger.info("[GAP-RECOVER] recovered %d line(s) across %d gap(s) "
-                    "(approx timing, provenance-tagged)",
-                    len(recovered), min(len(gaps), MAX_GAPS))
+                    "(%d transplanted, %d forced-aligned, %d uniform; tagged)",
+                    len(recovered), min(len(gaps), MAX_GAPS), n_transplant,
+                    n_aligned, len(recovered) - n_aligned - n_transplant)
         return merged
     except Exception as e:
         logger.warning("[GAP-RECOVER] failed (%s); keeping segments", e)

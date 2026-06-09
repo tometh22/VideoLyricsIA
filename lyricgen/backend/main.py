@@ -3284,7 +3284,16 @@ async def transcribe_uploaded(
             or job_row.user_id != current_user["id"]
             or job_row.tenant_id != current_user["tenant_id"]):
         raise HTTPException(status_code=404, detail="Job not found.")
-    if job_row.status not in ("awaiting_upload", "transcribed_pending"):
+    # `transcription_failed` added 2026-06-09: honours the reaper's customer-
+    # facing "apretá Reintentar para volver a transcribir" promise
+    # (reaper.py:_reason_for_transcription). The audio still lives in R2
+    # (input_r2_key set; the transcription reap never clears it), so this
+    # re-runs the transcribe step from storage with no re-upload — the exact
+    # CTA the message offers. Before this, /retry rejected the state and the
+    # only path was re-uploading through the wizard (P0 follow-up: the message
+    # over-promised a one-click retry the API refused).
+    if job_row.status not in ("awaiting_upload", "transcribed_pending",
+                              "transcription_failed"):
         raise HTTPException(
             status_code=409,
             detail=f"Job is in state {job_row.status!r}, cannot transcribe.",
@@ -3341,6 +3350,13 @@ async def transcribe_uploaded(
         # devuelva un estado coherente desde el momento del enqueue.
         job_row.status = "transcribing_queued"
         job_row.current_step = "transcribing"
+        # Reset the reaper clock. find_stuck_transcriptions anchors on
+        # coalesce(last_progress_at, created_at) with a 120-min threshold
+        # (reaper.py). A retried `transcription_failed` job has an OLD
+        # created_at, so without this NOW() bump the very next reaper pass
+        # would re-kill it instantly (same class of bug retry_job guards at
+        # main.py:9107). Harmless for fresh awaiting_upload jobs.
+        job_row.last_progress_at = datetime.now(timezone.utc)
         db.commit()
         db.close()
         try:
@@ -4581,7 +4597,14 @@ async def _run_transcription_for_job(
                             _llm_segment_words as _llm_seg,
                             _recover_gap_lyrics as _recover_gap,
                         )
-                        _wx_segs = _llm_seg(_wx_segs, audio_path=_aa)
+                        # Offloaded to a thread: these do blocking file I/O,
+                        # librosa decode + a Gemini call (up to ~90 s). Running
+                        # them inline would freeze the API event loop for the
+                        # whole job (starves /usage, /jobs — dashboard freeze),
+                        # so use to_thread like every other heavy step here.
+                        _wx_segs = await asyncio.to_thread(
+                            _llm_seg, _wx_segs, audio_path=_aa,
+                        )
                         # Gap-recovery (GAP_RECOVERY_ENABLED, default off): whisperX
                         # drops lyrics in loud live passages, leaving multi-second
                         # holes (lab "Nada Fue Un Error En Vivo": an 84 s hole where
@@ -4589,8 +4612,9 @@ async def _run_transcription_for_job(
                         # bounded clip at each hole's first voiced run → recovers the
                         # real line without the long-clip hallucination loop. Runs
                         # AFTER segmentation (already-clean lines) + self-declines.
-                        _wx_segs = _recover_gap(
-                            _wx_segs, audio_path=_aa, canonical=_canonical,
+                        _wx_segs = await asyncio.to_thread(
+                            _recover_gap, _wx_segs,
+                            audio_path=_aa, canonical=_canonical,
                         )
                         return _emit_segments(
                             _wx_segs, _WC_WX, reference_lyrics=_canonical,
@@ -4699,19 +4723,44 @@ async def _run_transcription_for_job(
                         from pipeline import (
                             _llm_segment_words as _llm_seg2,
                             _recover_gap_lyrics as _recover_gap2,
+                            _recording_diverges as _rec_diverges,
+                            _env_float as _env_float_p,
                         )
-                        _llm_segs = _llm_seg2(_wx_segs, audio_path=_aa)
+                        # Reconcile aborting does NOT prove the recording diverges
+                        # from the studio lyric — plain whisperX MISHEARS trip the
+                        # same drift/coverage abort (incident "Viejas Locas — 638":
+                        # FA below recovered 19/19 canonical lines whisperX mangled).
+                        # LLM-segment's gates only compare against whisperX, never
+                        # _canonical, so it would ship those mishears and preempt FA.
+                        # Only let it win when the recording actually sings MORE than
+                        # the studio lyric (live/extended: repeated verses, ad-libs,
+                        # long outros — the "Nada" case). Otherwise fall through so
+                        # whisper-align/FA recover the canonical text.
+                        _div_ratio = _env_float_p(
+                            "LLM_SEGMENT_DIVERGENCE_RATIO", 1.25
+                        )
+                        _is_divergent = _rec_diverges(
+                            _wx_segs, _canonical, _div_ratio
+                        )
+                        _llm_segs = (
+                            await asyncio.to_thread(
+                                _llm_seg2, _wx_segs, audio_path=_aa,
+                            )
+                            if _is_divergent else _wx_segs
+                        )
                         if _llm_segs is not _wx_segs and len(_llm_segs) >= 2:
                             # Same gap-recovery as the no-hint path: fill the
                             # multi-second holes whisperX leaves in loud lives with
                             # a short bounded re-transcription (default off).
-                            _llm_segs = _recover_gap2(
-                                _llm_segs, audio_path=_aa, canonical=_canonical,
+                            _llm_segs = await asyncio.to_thread(
+                                _recover_gap2, _llm_segs,
+                                audio_path=_aa, canonical=_canonical,
                             )
                             logger.info(
-                                "[WC] reconcile aborted → LLM line-segmentation of "
-                                "whisperX (%d lines) — divergent recording, FA would "
-                                "force the wrong studio structure", len(_llm_segs))
+                                "[WC] reconcile aborted + recording diverges from "
+                                "studio lyric → LLM line-segmentation of whisperX "
+                                "(%d lines); FA would force the wrong studio "
+                                "structure", len(_llm_segs))
                             return _emit_segments(
                                 _llm_segs, _WC_WX, reference_lyrics=_canonical,
                             )
