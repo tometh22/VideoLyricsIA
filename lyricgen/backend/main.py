@@ -3411,12 +3411,13 @@ async def transcribe_uploaded(
         # use job_row.artist / job_row.song_title (committed at /upload-url
         # time), NOT body.artist / body.title which can diverge from the
         # row and create ghost jobs.
-        return await _run_transcription_for_job(
+        _result = await _run_transcription_for_job(
             request, current_user, job_id, audio_path,
             language=body.language,
             artist=job_row.artist or "",
             title=job_row.song_title or "",
         )
+        return await _maybe_ctc_retime(_result, audio_path, job_id)
     finally:
         _release_transcription_slot(transcription_lease)
 
@@ -4066,11 +4067,71 @@ async def transcribe_endpoint(
     # Release the pooled connection before the long transcription (pool
     # starvation fix) — the function opens its own short-lived session.
     db.close()
-    return await _run_transcription_for_job(
+    _result = await _run_transcription_for_job(
         request, current_user, job_id, audio_path,
         language=language, artist=artist, title=title,
         filename=file.filename,
     )
+    return await _maybe_ctc_retime(_result, audio_path, job_id)
+
+
+async def _maybe_ctc_retime(result, audio_path: str, job_id: str):
+    """Gated post-pass over the cascade's FINAL output (CTC_ALIGN_ENABLED,
+    default OFF): re-time every line by full-song monotonic CTC forced
+    alignment on the vocal stem (`ctc_align.py`). Texts pass through
+    verbatim — only start/end + word stamps change. Declines (returns
+    `result` untouched) on any failure, so behaviour with the flag off
+    is byte-identical.
+
+    Lives OUTSIDE `_run_transcription_for_job` on purpose: the
+    orchestrator deletes its vocal stem in its `finally`, and its exit
+    paths all funnel through `_emit_segments` (AST-guarded — adding a
+    second mutation point inside would weaken that contract). Wrapping
+    the result at the call sites re-fetches the stem via the R2 stem
+    cache (a hit — the cascade computed it seconds ago), so no second
+    demucs run is paid."""
+    _stem = None
+    try:
+        # Everything (the import too) lives inside the try: a broken
+        # ctc_align module must degrade to "no retime", never to a 500
+        # on every transcription — including with the flag OFF.
+        import ctc_align as _ctc
+        if not _ctc.is_enabled() or not isinstance(result, dict):
+            return result
+        segs = result.get("segments") or []
+        if len(segs) < 3:
+            return result
+        import vocal_sep as _vs
+        # cache_only: the cascade computed the stem seconds ago, so this
+        # is an R2 download — never a second (paid, 60-180 s, hangable)
+        # demucs run. Cascade paths that skipped vocal separation have
+        # no cached stem → decline; aligning on the mix is unvalidated.
+        _stem = await asyncio.wait_for(
+            asyncio.to_thread(_vs.separate_vocals, audio_path, cache_only=True),
+            timeout=120,
+        )
+        if not _stem:
+            logger.info("[CTC] no cached stem — skipping retime (job=%s)", job_id)
+            return result
+        retimed = await asyncio.wait_for(
+            asyncio.to_thread(_ctc.retime_segments, _stem, segs, job_id),
+            timeout=240,
+        )
+        if retimed:
+            result = dict(result)
+            result["segments"] = retimed
+            from jobs import set_timing_source
+            from timing_sources import CTC_ALIGN
+            set_timing_source(job_id, CTC_ALIGN)
+    except Exception as e:
+        logger.warning("[CTC] retime wrapper declined: %s (job=%s)", e, job_id)
+    finally:
+        if _stem:
+            try:
+                os.unlink(_stem)
+            except OSError:
+                pass
+    return result
 
 
 async def _run_transcription_for_job(
