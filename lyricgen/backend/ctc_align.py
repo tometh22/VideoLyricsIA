@@ -161,6 +161,113 @@ def spans_to_lines(spans, words, n_lines: int, frame_to_s: float):
     return [tuple(o) if o else None for o in out]
 
 
+def skip_arc_align(emission, targets, line_token_ranges, blank_id: int,
+                   lam: float = 6.0):
+    """Forced alignment with per-line SKIP ARCS — our own CTC Viterbi.
+
+    Standard CTC forced alignment must spend every target token somewhere:
+    a lyric line that was never sung (lrclib returns the studio bridge for
+    a live that skips it) steals audio from its neighbours (measured:
+    ghost-line blocks displace real lines by 8-14 s). Here every line has
+    an explicit alternative path — an epsilon arc from the state before
+    its first token to the state after its last token, paid once with
+    penalty `lam` — so the Viterbi can declare "this line was not sung"
+    when the acoustics don't support it.
+
+    Trellis: the classic 2L+1 CTC states (blank interleaved between
+    tokens). Per frame: stay / advance-1 / advance-2 (the standard skip
+    over a blank between distinct tokens), then a relaxation pass over
+    the epsilon skip arcs (they consume no frames; forward-only, so one
+    pass per frame is exact).
+
+    With lam=inf this degenerates to vanilla forced alignment — the
+    parity test pins it against torchaudio's forced_align. Replacing the
+    torchaudio call also removes the dependency on an API deleted in
+    torchaudio 2.9.
+
+    Args:
+      emission: (T, C) log-probs (star column already appended).
+      targets: list[int] token ids.
+      line_token_ranges: [(tok_start, tok_end_exclusive)] per REAL line
+        (indices into `targets`) — each gets a skip arc.
+      lam: one-time log-prob penalty for skipping a line.
+    Returns (spans, skipped): spans = [(start_frame, end_frame, score)]
+      per target token (skipped lines get zero-length spans at their skip
+      point); skipped = set of line_range indices the Viterbi bypassed.
+    """
+    import numpy as np
+
+    em = emission.numpy() if hasattr(emission, "numpy") else np.asarray(emission)
+    T = em.shape[0]
+    L = len(targets)
+    S = 2 * L + 1  # blank,tok,blank,tok,...,blank
+    NEG = -1e30
+
+    state_tok = np.full(S, blank_id, dtype=np.int64)
+    state_tok[1::2] = targets
+    # advance-2 allowed into token state s when its token differs from the
+    # previous token state's (CTC rule)
+    adv2_ok = np.zeros(S, dtype=bool)
+    for s in range(3, S, 2):
+        adv2_ok[s] = targets[(s - 1) // 2] != targets[(s - 3) // 2]
+    # skip arcs in STATE space: from blank state before the line's first
+    # token to blank state after its last token
+    arcs = [(2 * a, 2 * b, li) for li, (a, b) in enumerate(line_token_ranges)]
+
+    alpha = np.full(S, NEG)
+    alpha[0] = em[0, blank_id]
+    if S > 1:
+        alpha[1] = em[0, state_tok[1]]
+    bp = np.zeros((T, S), dtype=np.int8)  # 0=stay 1=adv1 2=adv2 3=skip-arc
+    for src, dst, li in arcs:
+        if alpha[src] - lam > alpha[dst]:
+            alpha[dst] = alpha[src] - lam
+            bp[0, dst] = 3
+    for t in range(1, T):
+        stay = alpha
+        adv1 = np.concatenate(([NEG], alpha[:-1]))
+        adv2 = np.where(adv2_ok, np.concatenate(([NEG, NEG], alpha[:-2])), NEG)
+        best = np.maximum(np.maximum(stay, adv1), adv2)
+        choice = np.zeros(S, dtype=np.int8)
+        choice[adv1 > stay] = 1
+        choice[adv2 > np.maximum(stay, adv1)] = 2
+        alpha = best + em[t, state_tok]
+        bp[t] = choice
+        for src, dst, li in arcs:  # epsilon relaxation, forward-only
+            if alpha[src] - lam > alpha[dst]:
+                alpha[dst] = alpha[src] - lam
+                bp[t, dst] = 3
+    # backtrack from the better of the two legal CTC end states
+    s = S - 1 if alpha[S - 1] >= alpha[S - 2] or S < 2 else S - 2
+    arc_by_dst = {dst: (src, li) for src, dst, li in arcs}
+    tok_frames: list[list] = [[] for _ in range(L)]
+    skipped: set[int] = set()
+    t = T - 1
+    while t >= 0:
+        if s % 2 == 1:
+            tok_frames[(s - 1) // 2].append(t)
+        move = bp[t, s]
+        if move == 3 and s in arc_by_dst:
+            src, li = arc_by_dst[s]
+            skipped.add(li)
+            s = src
+            continue  # epsilon: no frame consumed
+        if move == 1:
+            s -= 1
+        elif move == 2:
+            s -= 2
+        t -= 1
+    spans = []
+    for ti in range(L):
+        fr = tok_frames[ti]
+        if fr:
+            spans.append((min(fr), max(fr) + 1,
+                          float(np.exp(em[fr, targets[ti]].mean()))))
+        else:
+            spans.append((0, 0, 0.0))
+    return spans, skipped
+
+
 # Spanish vs English function words — language guard. The XLSR-es vocab
 # covers a-z, so English text passes the char-alignability gate with
 # ratio 1.0 and aligns SILENTLY WRONG (measured: 7 rings → median word
@@ -421,16 +528,40 @@ def retime_segments(audio_path: str, segments: list[dict],
             return None
 
         emission = _emissions(model, wav, blank_id, _star_delta())
-        aligned, scores = AF.forced_align(
-            emission.unsqueeze(0),
-            torch.tensor(targets, dtype=torch.int32).unsqueeze(0),
-            blank=blank_id)
-        # blank= must match forced_align's: with the default (0) and a
-        # future CTC_ALIGN_MODEL whose pad token isn't 0, spans would
-        # silently desync from targets (garbage timings, no crash).
-        token_spans = AF.merge_tokens(aligned[0], scores[0].exp(),
-                                      blank=blank_id)
-        frame_scores = scores[0]            # chosen-path log prob per frame
+        use_skip = os.environ.get("CTC_ALIGN_SKIP_ARCS", "0").strip().lower() in _TRUE
+        skipped_lines: set[int] = set()
+        if use_skip:
+            # Our own Viterbi with per-line skip arcs: a ghost line (lrclib
+            # studio text over a live that skips it) costs lam instead of
+            # stealing audio from its neighbours. Also removes the
+            # torchaudio.forced_align dependency (deleted in 2.9).
+            tok_pos, line_ranges, line_of_range = 0, [], []
+            for li, _raw, n_tok in words:
+                if li >= 0:
+                    if not line_of_range or line_of_range[-1] != li:
+                        line_ranges.append([tok_pos, tok_pos + n_tok])
+                        line_of_range.append(li)
+                    else:
+                        line_ranges[-1][1] = tok_pos + n_tok
+                tok_pos += n_tok
+            lam = float(os.environ.get("CTC_ALIGN_SKIP_LAMBDA", "6.0"))
+            spans, skipped_ranges = skip_arc_align(
+                emission, targets, [tuple(r) for r in line_ranges],
+                blank_id, lam=lam)
+            skipped_lines = {line_of_range[i] for i in skipped_ranges}
+            frame_scores = None  # LR telemetry only on the torchaudio path
+        else:
+            aligned, scores = AF.forced_align(
+                emission.unsqueeze(0),
+                torch.tensor(targets, dtype=torch.int32).unsqueeze(0),
+                blank=blank_id)
+            # blank= must match forced_align's: with the default (0) and a
+            # future CTC_ALIGN_MODEL whose pad token isn't 0, spans would
+            # silently desync from targets (garbage timings, no crash).
+            token_spans = AF.merge_tokens(aligned[0], scores[0].exp(),
+                                          blank=blank_id)
+            frame_scores = scores[0]        # chosen-path log prob per frame
+            spans = [(sp.start, sp.end, float(sp.score)) for sp in token_spans]
         # The null hypothesis for a line is NOT the star alone: if the
         # line didn't exist, the Viterbi would alternate star and BLANK
         # over its span (blank scores very high on silence). Comparing
@@ -439,10 +570,14 @@ def retime_segments(audio_path: str, segments: list[dict],
         # per-frame max(star, blank) is the 1-state Viterbi of the
         # line-absent path.
         star_col = torch.maximum(emission[:, star_id], emission[:, blank_id])
-        spans = [(sp.start, sp.end, float(sp.score)) for sp in token_spans]
         frame_to_s = FRAME / SR
 
         line_times = spans_to_lines(spans, words, len(lines), frame_to_s)
+        for li in skipped_lines:
+            # The Viterbi declared this line not sung — its (zero-length)
+            # spans are meaningless. Interpolation below places it between
+            # its neighbours; telemetry marks it for the editor/shadow logs.
+            line_times[li] = None
         if looks_collapsed(line_times):
             logger.warning("[CTC] decline: collapsed alignment (job=%s)", job_id)
             return None
@@ -475,7 +610,8 @@ def retime_segments(audio_path: str, segments: list[dict],
             fe = max(fs + 1, min(fe, len(frame_scores)))
             return float((frame_scores[fs:fe] - star_col[fs:fe]).mean())
 
-        lrs = [(_line_lr(lt[0], lt[1]) if lt else None) for lt in line_times]
+        lrs = [(_line_lr(lt[0], lt[1]) if (lt and frame_scores is not None) else None)
+               for lt in line_times]
         word_scores = [w[3] for lt in line_times if lt for w in lt[2]]
         med_score = sorted(word_scores)[len(word_scores) // 2] if word_scores else 0.0
         min_med = float(os.environ.get("CTC_ALIGN_MIN_MED_SCORE", "0.35"))
@@ -488,12 +624,14 @@ def retime_segments(audio_path: str, segments: list[dict],
             return None
 
         out = []
-        for seg, (ls, le, wlist), lr in zip(segments, line_times, lrs):
+        for li, (seg, (ls, le, wlist), lr) in enumerate(zip(segments, line_times, lrs)):
             new = dict(seg)
             new["start"] = round(float(ls), 3)
             new["end"] = round(float(le), 3)
             if lr is not None:
                 new["ctc_lr"] = round(lr, 3)
+            if li in skipped_lines:
+                new["ctc_skipped"] = True  # Viterbi: línea no cantada
             if wlist:
                 new["words"] = [
                     {"word": w, "start": round(float(a), 3),
