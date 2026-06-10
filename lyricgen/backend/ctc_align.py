@@ -431,7 +431,14 @@ def retime_segments(audio_path: str, segments: list[dict],
         token_spans = AF.merge_tokens(aligned[0], scores[0].exp(),
                                       blank=blank_id)
         frame_scores = scores[0]            # chosen-path log prob per frame
-        star_col = emission[:, star_id]     # what the star would have paid
+        # The null hypothesis for a line is NOT the star alone: if the
+        # line didn't exist, the Viterbi would alternate star and BLANK
+        # over its span (blank scores very high on silence). Comparing
+        # against star only inflates the ratio of any line with pauses —
+        # measured: bad lines outscored good ones on megustas. The
+        # per-frame max(star, blank) is the 1-state Viterbi of the
+        # line-absent path.
+        star_col = torch.maximum(emission[:, star_id], emission[:, blank_id])
         spans = [(sp.start, sp.end, float(sp.score)) for sp in token_spans]
         frame_to_s = FRAME / SR
 
