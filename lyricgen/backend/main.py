@@ -638,6 +638,38 @@ def on_startup():
     ).start()
     logger.info("user-sessions-cleanup thread started (TTL=90d, daily)")
 
+    # Guardia de masters ProRes stale (post-incidente 2026-06-10): un .mov
+    # en R2 más viejo que su lyric_video.mp4 = la descarga sirve un cut
+    # viejo. El fix #622 evita que se CREEN casos nuevos; este scan diario
+    # detecta cualquier reaparición (o caso legacy que se nos escapó) y
+    # alerta por Sentry ANTES de que lo descubra un cliente descargando.
+    _STALE_PRORES_SCAN_LOCK_KEY = 9118364455199105
+
+    def _stale_prores_scan_loop():
+        _time.sleep(300)  # let the API come up first
+        while True:
+            try:
+                def _do_stale_scan():
+                    from prores import scan_stale_prores
+                    scan_stale_prores(limit=300)
+                _run_with_advisory_lock(
+                    _STALE_PRORES_SCAN_LOCK_KEY, _do_stale_scan,
+                    name="stale_prores_scan",
+                )
+            except Exception:  # pragma: no cover
+                try:
+                    import sentry_sdk
+                    sentry_sdk.capture_exception()
+                except Exception:
+                    pass
+                _time.sleep(60)
+            _time.sleep(24 * 3600)  # diario
+
+    threading.Thread(
+        target=_stale_prores_scan_loop, daemon=True, name="stale-prores-scan",
+    ).start()
+    logger.info("stale-prores-scan thread started (daily)")
+
 
 # --- Background library (public, authenticated) ---
 _BACKGROUNDS_LIB = os.path.join(os.path.dirname(__file__), "..", "assets", "backgrounds", "library")
