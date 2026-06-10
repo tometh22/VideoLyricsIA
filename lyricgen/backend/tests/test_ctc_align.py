@@ -238,3 +238,15 @@ def test_perf_text_parse_ts_line():
     assert pt.parse_ts_line("[01:32.5] Tengo una mala noticia") == (
         92.5, "Tengo una mala noticia")
     assert pt.parse_ts_line("[00:")[1] == ""
+
+
+def test_perf_text_label_leaks_from_staging():
+    """Labels observed leaking into a real staging video as lines."""
+    import performance_text as pt
+    items = [(10.0, "Tengo una mala noticia"),
+             (20.0, "Público cantando y aplaudiendo"),
+             (30.0, "silence"),
+             (40.0, "Aplausos y ovación"),
+             (50.0, "No fue de casualidad")]
+    assert pt.clean_libretto(items) == ["Tengo una mala noticia",
+                                        "No fue de casualidad"]
