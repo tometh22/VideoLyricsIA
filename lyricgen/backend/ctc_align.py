@@ -95,24 +95,45 @@ def norm_word(w: str) -> str:
     return re.sub(r"[^a-záéíóúñü']", "", w)
 
 
-def build_targets(lines: list[str], dictionary: dict, star_id: int):
+def build_targets(lines: list[str], dictionary: dict, star_id: int,
+                  word_sep_id: int | None = None):
     """Flat token sequence for the whole lyric + per-word bookkeeping.
 
     Returns (targets, words) where words is a list of
     (line_idx, raw_word, n_tokens); line_idx == -1 marks a star filler.
     Words with no vocab-representable chars are skipped (the line is
-    later interpolated if ALL its words drop). Pure — unit-testable."""
+    later interpolated if ALL its words drop). Pure — unit-testable.
+
+    A star goes BETWEEN lines and also BEFORE the first / AFTER the last:
+    without the edge stars, a spoken intro (live dedications, stage talk —
+    it IS voice in the stem) can only bind to line 1's tokens, dragging it
+    seconds early; same for outros on the last line (measured on
+    Costumbres Argentinas live: line 1 stretched 3.1→36.6s, last line
+    stretched 36s over the outro).
+
+    `word_sep_id`: the CTC word-delimiter class ('|' in the XLSR vocab),
+    inserted between words WITHIN a line. The model was trained emitting
+    it at word boundaries; giving the Viterbi that anchor measurably
+    tightens tails (nada_fue p95 26.5→9.2s in the corruption harness).
+    The separator token is appended to the PRECEDING word's token count
+    so span bookkeeping stays 1:1 with targets."""
     words: list[tuple[int, str, int]] = []
     targets: list[int] = []
+    words.append((-1, "*", 1))
+    targets.append(star_id)
     for li, line in enumerate(lines):
+        line_words = []
         for raw in line.split():
             ids = [dictionary[c] for c in norm_word(raw) if c in dictionary]
             if ids:
-                words.append((li, raw, len(ids)))
-                targets.extend(ids)
-        if li < len(lines) - 1:
-            words.append((-1, "*", 1))
-            targets.append(star_id)
+                line_words.append((raw, ids))
+        for wi, (raw, ids) in enumerate(line_words):
+            if word_sep_id is not None and wi < len(line_words) - 1:
+                ids = ids + [word_sep_id]
+            words.append((li, raw, len(ids)))
+            targets.extend(ids)
+        words.append((-1, "*", 1))
+        targets.append(star_id)
     return targets, words
 
 
@@ -138,6 +159,245 @@ def spans_to_lines(spans, words, n_lines: int, frame_to_s: float):
         out[li][1] = we
         out[li][2].append((raw, ws, we, score))
     return [tuple(o) if o else None for o in out]
+
+
+def skip_arc_align(emission, targets, line_token_ranges, blank_id: int,
+                   lam: float = 6.0):
+    """Forced alignment with per-line SKIP ARCS — our own CTC Viterbi.
+
+    Standard CTC forced alignment must spend every target token somewhere:
+    a lyric line that was never sung (lrclib returns the studio bridge for
+    a live that skips it) steals audio from its neighbours (measured:
+    ghost-line blocks displace real lines by 8-14 s). Here every line has
+    an explicit alternative path — an epsilon arc from the state before
+    its first token to the state after its last token, paid once with
+    penalty `lam` — so the Viterbi can declare "this line was not sung"
+    when the acoustics don't support it.
+
+    Trellis: the classic 2L+1 CTC states (blank interleaved between
+    tokens). Per frame: stay / advance-1 / advance-2 (the standard skip
+    over a blank between distinct tokens), then a relaxation pass over
+    the epsilon skip arcs (they consume no frames; forward-only, so one
+    pass per frame is exact).
+
+    With lam=inf this degenerates to vanilla forced alignment — the
+    parity test pins it against torchaudio's forced_align. Replacing the
+    torchaudio call also removes the dependency on an API deleted in
+    torchaudio 2.9.
+
+    Args:
+      emission: (T, C) log-probs (star column already appended).
+      targets: list[int] token ids.
+      line_token_ranges: [(tok_start, tok_end_exclusive)] per REAL line
+        (indices into `targets`) — each gets a skip arc.
+      lam: one-time log-prob penalty for skipping a line.
+    Returns (spans, skipped): spans = [(start_frame, end_frame, score)]
+      per target token (skipped lines get zero-length spans at their skip
+      point); skipped = set of line_range indices the Viterbi bypassed.
+    """
+    import numpy as np
+
+    em = emission.numpy() if hasattr(emission, "numpy") else np.asarray(emission)
+    T = em.shape[0]
+    L = len(targets)
+    S = 2 * L + 1  # blank,tok,blank,tok,...,blank
+    NEG = -1e30
+
+    state_tok = np.full(S, blank_id, dtype=np.int64)
+    state_tok[1::2] = targets
+    # advance-2 allowed into token state s when its token differs from the
+    # previous token state's (CTC rule)
+    adv2_ok = np.zeros(S, dtype=bool)
+    for s in range(3, S, 2):
+        adv2_ok[s] = targets[(s - 1) // 2] != targets[(s - 3) // 2]
+    # skip arcs in STATE space: from blank state before the line's first
+    # token to blank state after its last token
+    arcs = [(2 * a, 2 * b, li) for li, (a, b) in enumerate(line_token_ranges)]
+
+    alpha = np.full(S, NEG)
+    alpha[0] = em[0, blank_id]
+    if S > 1:
+        alpha[1] = em[0, state_tok[1]]
+    bp = np.zeros((T, S), dtype=np.int8)  # 0=stay 1=adv1 2=adv2 3=skip-arc
+    for src, dst, li in arcs:
+        if alpha[src] - lam > alpha[dst]:
+            alpha[dst] = alpha[src] - lam
+            bp[0, dst] = 3
+    for t in range(1, T):
+        stay = alpha
+        adv1 = np.concatenate(([NEG], alpha[:-1]))
+        adv2 = np.where(adv2_ok, np.concatenate(([NEG, NEG], alpha[:-2])), NEG)
+        best = np.maximum(np.maximum(stay, adv1), adv2)
+        choice = np.zeros(S, dtype=np.int8)
+        choice[adv1 > stay] = 1
+        choice[adv2 > np.maximum(stay, adv1)] = 2
+        alpha = best + em[t, state_tok]
+        bp[t] = choice
+        for src, dst, li in arcs:  # epsilon relaxation, forward-only
+            if alpha[src] - lam > alpha[dst]:
+                alpha[dst] = alpha[src] - lam
+                bp[t, dst] = 3
+    # backtrack from the better of the two legal CTC end states
+    s = S - 1 if alpha[S - 1] >= alpha[S - 2] or S < 2 else S - 2
+    arc_by_dst = {dst: (src, li) for src, dst, li in arcs}
+    tok_frames: list[list] = [[] for _ in range(L)]
+    skipped: set[int] = set()
+    t = T - 1
+    while t >= 0:
+        if s % 2 == 1:
+            tok_frames[(s - 1) // 2].append(t)
+        move = bp[t, s]
+        if move == 3 and s in arc_by_dst:
+            src, li = arc_by_dst[s]
+            skipped.add(li)
+            s = src
+            continue  # epsilon: no frame consumed
+        if move == 1:
+            s -= 1
+        elif move == 2:
+            s -= 2
+        t -= 1
+    spans = []
+    for ti in range(L):
+        fr = tok_frames[ti]
+        if fr:
+            spans.append((min(fr), max(fr) + 1,
+                          float(np.exp(em[fr, targets[ti]].mean()))))
+        else:
+            spans.append((0, 0, 0.0))
+    return spans, skipped
+
+
+# Spanish vs English function words — language guard. The XLSR-es vocab
+# covers a-z, so English text passes the char-alignability gate with
+# ratio 1.0 and aligns SILENTLY WRONG (measured: 7 rings → median word
+# score 0.21 vs 0.62-0.87 on Spanish songs, lines off by +54/+133s).
+_ES_STOP = frozenset(
+    "de la que el en y a los se del las un por con no una su para es al lo "
+    "como mas pero sus le ya o este si porque esta entre cuando muy sin "
+    "sobre tambien me hasta donde quien desde todo nos ni contra eso yo tu "
+    "te mi tus vos usted nunca siempre aqui asi fue soy eres somos estoy "
+    "esta estas estoy son era eran tengo tiene tienes vamos voy va".split())
+_EN_STOP = frozenset(
+    "the and you that was for are with his her they this have from not but "
+    "what can out get got like just know take into your some could them see "
+    "other than then now look only come its over think also back after use "
+    "two how our work well way even new want because any these give day i "
+    "it my me a to of in is on he as do at by we or an will so if no when "
+    "all be been being am dont aint gonna wanna".split())
+
+
+def guess_text_lang(lines: list[str]) -> str:
+    """'es' / 'en' / 'unknown' by function-word voting. Pure."""
+    es = en = 0
+    for line in lines:
+        for w in line.lower().split():
+            w = re.sub(r"[^a-záéíóúñü']", "", w)
+            if w in _ES_STOP:
+                es += 1
+            if w in _EN_STOP:
+                en += 1
+    total = es + en
+    if total < 5:
+        return "unknown"
+    if es >= 2 * en:
+        return "es"
+    if en >= 2 * es:
+        return "en"
+    return "unknown"
+
+
+BRIDGE_S = 8.0  # no word lasts 8s; no intra-line silence lasts 8s
+
+
+def _eff_dur(word: str) -> float:
+    """Plausible sung duration of a word: ~0.45s per alignable char +
+    slack for held notes. 'anzuelo' → ~3.7s, never 27s."""
+    return 0.45 * max(len(norm_word(word)), 2) + 0.6
+
+
+def repair_bridge_words(line_times, regions=None):
+    """Fix 'bridge' lines: a word stretched implausibly long (or a huge
+    intra-line gap) is the CTC bridging two distinct vocal events — e.g.
+    a live intro where the singer talks (binds the first words) and the
+    real verse 30s later (binds the rest), with one word spanning the
+    instrumental in between. Measured on Costumbres live: 'anzuelo'
+    8.3→35.1s, 'decir' 157→180s over no-voice audio.
+
+    For each line whose words contain a bridge (duration or gap >
+    BRIDGE_S): split the words into clusters at the bridges (the bridge
+    word joins the side it's temporally closer to, trimmed to its
+    plausible duration), keep the cluster with the most words (tie:
+    higher mean score), and re-derive the line's start/end from it.
+    Dropped words lose their (wrong) stamps. `regions` (vocal VAD spans)
+    break score ties toward clusters that overlap voice. Pure."""
+    def in_voice(a, b):
+        if not regions:
+            return True
+        return any(ra - 0.3 <= a <= rb + 0.3 or ra - 0.3 <= b <= rb + 0.3
+                   or (a <= ra and b >= rb) for ra, rb in regions)
+
+    out = []
+    for lt in line_times:
+        if lt is None or not lt[2]:
+            out.append(lt)
+            continue
+        s, e, ws = lt
+        # break BEFORE word i when the gap from word i-1 exceeds BRIDGE_S
+        clusters, cur = [], [0]
+        for i in range(1, len(ws)):
+            gap = ws[i][1] - ws[i - 1][2]
+            if gap > BRIDGE_S:
+                clusters.append(cur)
+                cur = []
+            cur.append(i)
+        clusters.append(cur)
+        # a bridge WORD splits its own line: assign it to the nearer side
+        # with its duration trimmed to plausible
+        rebuilt = []
+        for cl in clusters:
+            parts = []
+            for i in cl:
+                w, a, b, sc = ws[i]
+                if b - a > BRIDGE_S:
+                    gap_l = a - ws[i - 1][2] if i > 0 else float("inf")
+                    gap_r = ws[i + 1][1] - b if i + 1 < len(ws) else float("inf")
+                    if gap_r <= gap_l:
+                        a = max(a, b - _eff_dur(w))   # word belongs at its end
+                    else:
+                        b = min(b, a + _eff_dur(w))   # word belongs at its start
+                parts.append((w, a, b, sc))
+            # the trim may itself have created a >BRIDGE_S hole — re-split
+            sub, cur2 = [], [parts[0]]
+            for p in parts[1:]:
+                if p[1] - cur2[-1][2] > BRIDGE_S:
+                    sub.append(cur2)
+                    cur2 = []
+                cur2.append(p)
+            sub.append(cur2)
+            rebuilt.extend(sub)
+        if len(rebuilt) == 1:
+            cl = rebuilt[0]
+            out.append((cl[0][1], cl[-1][2], cl))
+            continue
+        def rank(cl):
+            mean_sc = sum(p[3] for p in cl) / len(cl)
+            return (len(cl), in_voice(cl[0][1], cl[-1][2]), mean_sc)
+        best = max(rebuilt, key=rank)
+        out.append((best[0][1], best[-1][2], best))
+    # repairs must not break global monotonicity
+    prev_end = 0.0
+    fixed = []
+    for lt in out:
+        if lt is None:
+            fixed.append(lt)
+            continue
+        s, e, ws = lt
+        s = max(s, prev_end - 0.2)
+        e = max(e, s + 0.2)
+        fixed.append((s, e, ws))
+        prev_end = e
+    return fixed
 
 
 def looks_collapsed(line_times, min_dur_s: float = 0.15,
@@ -213,6 +473,16 @@ def retime_segments(audio_path: str, segments: list[dict],
         if not audio_path or not os.path.exists(audio_path):
             return None
 
+        lines = [(s.get("text") or "").strip() for s in segments]
+        lang = guess_text_lang(lines)
+        if lang != "es":
+            # The model is Spanish-only; English aligns silently wrong
+            # (it passes the char gate with ratio 1.0). Until a per-language
+            # model registry exists, declining is the honest move. Checked
+            # BEFORE any torch import / 1.2 GB model load.
+            logger.info("[CTC] decline: text language=%s (job=%s)", lang, job_id)
+            return None
+
         import torch
         import torchaudio
         import torchaudio.functional as AF
@@ -221,8 +491,10 @@ def retime_segments(audio_path: str, segments: list[dict],
         # star class is appended LAST in _emissions; its id == n_classes
         star_id = model.config.vocab_size
 
-        lines = [(s.get("text") or "").strip() for s in segments]
-        targets, words = build_targets(lines, dictionary, star_id)
+        use_sep = os.environ.get("CTC_ALIGN_WORD_SEP", "1").strip().lower() in _TRUE
+        word_sep_id = dictionary.get("|") if use_sep else None
+        targets, words = build_targets(lines, dictionary, star_id,
+                                       word_sep_id=word_sep_id)
         n_real_tokens = sum(n for li, _, n in words if li >= 0)
         n_chars = sum(len(norm_word(w)) for ln in lines for w in ln.split()) or 1
         if n_real_tokens / n_chars < 0.6:
@@ -256,22 +528,65 @@ def retime_segments(audio_path: str, segments: list[dict],
             return None
 
         emission = _emissions(model, wav, blank_id, _star_delta())
-        aligned, scores = AF.forced_align(
-            emission.unsqueeze(0),
-            torch.tensor(targets, dtype=torch.int32).unsqueeze(0),
-            blank=blank_id)
-        # blank= must match forced_align's: with the default (0) and a
-        # future CTC_ALIGN_MODEL whose pad token isn't 0, spans would
-        # silently desync from targets (garbage timings, no crash).
-        token_spans = AF.merge_tokens(aligned[0], scores[0].exp(),
-                                      blank=blank_id)
-        spans = [(sp.start, sp.end, float(sp.score)) for sp in token_spans]
+        use_skip = os.environ.get("CTC_ALIGN_SKIP_ARCS", "0").strip().lower() in _TRUE
+        skipped_lines: set[int] = set()
+        if use_skip:
+            # Our own Viterbi with per-line skip arcs: a ghost line (lrclib
+            # studio text over a live that skips it) costs lam instead of
+            # stealing audio from its neighbours. Also removes the
+            # torchaudio.forced_align dependency (deleted in 2.9).
+            tok_pos, line_ranges, line_of_range = 0, [], []
+            for li, _raw, n_tok in words:
+                if li >= 0:
+                    if not line_of_range or line_of_range[-1] != li:
+                        line_ranges.append([tok_pos, tok_pos + n_tok])
+                        line_of_range.append(li)
+                    else:
+                        line_ranges[-1][1] = tok_pos + n_tok
+                tok_pos += n_tok
+            lam = float(os.environ.get("CTC_ALIGN_SKIP_LAMBDA", "6.0"))
+            spans, skipped_ranges = skip_arc_align(
+                emission, targets, [tuple(r) for r in line_ranges],
+                blank_id, lam=lam)
+            skipped_lines = {line_of_range[i] for i in skipped_ranges}
+            frame_scores = None  # LR telemetry only on the torchaudio path
+        else:
+            aligned, scores = AF.forced_align(
+                emission.unsqueeze(0),
+                torch.tensor(targets, dtype=torch.int32).unsqueeze(0),
+                blank=blank_id)
+            # blank= must match forced_align's: with the default (0) and a
+            # future CTC_ALIGN_MODEL whose pad token isn't 0, spans would
+            # silently desync from targets (garbage timings, no crash).
+            token_spans = AF.merge_tokens(aligned[0], scores[0].exp(),
+                                          blank=blank_id)
+            frame_scores = scores[0]        # chosen-path log prob per frame
+            spans = [(sp.start, sp.end, float(sp.score)) for sp in token_spans]
+        # The null hypothesis for a line is NOT the star alone: if the
+        # line didn't exist, the Viterbi would alternate star and BLANK
+        # over its span (blank scores very high on silence). Comparing
+        # against star only inflates the ratio of any line with pauses —
+        # measured: bad lines outscored good ones on megustas. The
+        # per-frame max(star, blank) is the 1-state Viterbi of the
+        # line-absent path.
+        star_col = torch.maximum(emission[:, star_id], emission[:, blank_id])
         frame_to_s = FRAME / SR
 
         line_times = spans_to_lines(spans, words, len(lines), frame_to_s)
+        for li in skipped_lines:
+            # The Viterbi declared this line not sung — its (zero-length)
+            # spans are meaningless. Interpolation below places it between
+            # its neighbours; telemetry marks it for the editor/shadow logs.
+            line_times[li] = None
         if looks_collapsed(line_times):
             logger.warning("[CTC] decline: collapsed alignment (job=%s)", job_id)
             return None
+        try:
+            import anchor_align
+            _regions = anchor_align.vocal_regions(audio_path)
+        except Exception:
+            _regions = []
+        line_times = repair_bridge_words(line_times, _regions)
 
         # Interpolate lines whose words were all unalignable (numbers,
         # emoji): midpoint between neighbours keeps monotonic order.
@@ -283,11 +598,40 @@ def retime_segments(audio_path: str, segments: list[dict],
                                   if line_times[j]), dur)
                 line_times[i] = (prev_end, max(prev_end, nxt_start), [])
 
+        # Per-line confidence as a LIKELIHOOD-RATIO vs the star: how much
+        # better does this line explain its span than "unlabeled singing"?
+        # Raw word posteriors are NOT calibrated across songs (measured:
+        # real crowd-chorus lines score 0.087 while a ghost line scores
+        # 0.13); the ratio is. lr ≈ star_delta when the text IS the best
+        # explanation; strongly negative on ghosts / wrong language.
+        def _line_lr(ls: float, le: float) -> float:
+            fs, fe = int(ls / frame_to_s), max(int(le / frame_to_s), 1)
+            fs = max(0, min(fs, len(frame_scores) - 1))
+            fe = max(fs + 1, min(fe, len(frame_scores)))
+            return float((frame_scores[fs:fe] - star_col[fs:fe]).mean())
+
+        lrs = [(_line_lr(lt[0], lt[1]) if (lt and frame_scores is not None) else None)
+               for lt in line_times]
+        word_scores = [w[3] for lt in line_times if lt for w in lt[2]]
+        med_score = sorted(word_scores)[len(word_scores) // 2] if word_scores else 0.0
+        min_med = float(os.environ.get("CTC_ALIGN_MIN_MED_SCORE", "0.35"))
+        if med_score < min_med:
+            # Whole-song low confidence = wrong language / unintelligible
+            # vocals / broken stem (measured: English song med 0.21 vs
+            # 0.62-0.87 on healthy Spanish material).
+            logger.warning("[CTC] decline: median word score %.2f < %.2f (job=%s)",
+                           med_score, min_med, job_id)
+            return None
+
         out = []
-        for seg, (ls, le, wlist) in zip(segments, line_times):
+        for li, (seg, (ls, le, wlist), lr) in enumerate(zip(segments, line_times, lrs)):
             new = dict(seg)
             new["start"] = round(float(ls), 3)
             new["end"] = round(float(le), 3)
+            if lr is not None:
+                new["ctc_lr"] = round(lr, 3)
+            if li in skipped_lines:
+                new["ctc_skipped"] = True  # Viterbi: línea no cantada
             if wlist:
                 new["words"] = [
                     {"word": w, "start": round(float(a), 3),

@@ -28,25 +28,41 @@ def test_norm_word_keeps_spanish_chars():
     assert ctc_align.norm_word("123") == ""
 
 
-def test_build_targets_star_between_lines_only():
+def test_build_targets_stars_at_edges_and_between_lines():
     targets, words = ctc_align.build_targets(["la la", "si"], VOCAB, STAR)
-    # words: (0,'la',2) (0,'la',2) (-1,'*',1) (1,'si',2) — star NOT after last
-    assert [w[0] for w in words] == [0, 0, -1, 1]
-    assert targets.count(STAR) == 1
-    assert len(targets) == 2 + 2 + 1 + 2
+    # leading star + line0 + star + line1 + trailing star: spoken intros /
+    # outros must have somewhere to go that isn't the first/last line
+    assert [w[0] for w in words] == [-1, 0, 0, -1, 1, -1]
+    assert targets.count(STAR) == 3
+    assert len(targets) == 1 + 2 + 2 + 1 + 2 + 1
+
+
+def test_build_targets_word_separator_within_lines():
+    sep = 777
+    targets, words = ctc_align.build_targets(["la la", "si"], VOCAB, STAR,
+                                             word_sep_id=sep)
+    # separator BETWEEN words of a line (appended to the preceding word's
+    # count), never at line edges
+    assert targets.count(sep) == 1
+    first_la = next(w for w in words if w[0] == 0)
+    assert first_la[2] == 3  # 'l','a',sep
+    # bookkeeping stays 1:1 with targets
+    assert sum(n for _, _, n in words) == len(targets)
 
 
 def test_build_targets_skips_unalignable_words():
     targets, words = ctc_align.build_targets(["123 ok"], VOCAB, STAR)
-    assert [w[1] for w in words] == ["ok"]
+    assert [w[1] for w in words if w[0] >= 0] == ["ok"]
 
 
 def test_spans_to_lines_groups_words_and_lines():
-    # two lines: "ab" / "cd", star between → 5 tokens
+    # leading star + "ab" + star + "cd" + trailing star → 7 tokens
     targets, words = ctc_align.build_targets(["ab", "cd"], VOCAB, STAR)
-    # frames: ab=[10,20],[20,30]; star=[30,80]; cd=[80,85],[85,90]
-    spans = [(10, 20, 0.9), (20, 30, 0.8), (30, 80, 0.5),
-             (80, 85, 0.7), (85, 90, 0.6)]
+    spans = [(0, 5, 0.5),                      # leading star
+             (10, 20, 0.9), (20, 30, 0.8),     # ab
+             (30, 80, 0.5),                    # star
+             (80, 85, 0.7), (85, 90, 0.6),     # cd
+             (90, 95, 0.5)]                    # trailing star
     lines = ctc_align.spans_to_lines(spans, words, 2, frame_to_s=0.02)
     (s0, e0, w0), (s1, e1, w1) = lines
     assert (s0, e0) == (10 * 0.02, 30 * 0.02)
@@ -57,9 +73,66 @@ def test_spans_to_lines_groups_words_and_lines():
 
 def test_spans_to_lines_none_for_unalignable_line():
     targets, words = ctc_align.build_targets(["ab", "123"], VOCAB, STAR)
-    spans = [(10, 20, 0.9), (20, 30, 0.8), (30, 40, 0.5)]
+    spans = [(0, 5, 0.5), (10, 20, 0.9), (20, 30, 0.8),
+             (30, 40, 0.5), (40, 45, 0.5)]
     lines = ctc_align.spans_to_lines(spans, words, 2, frame_to_s=0.02)
     assert lines[0] is not None and lines[1] is None
+
+
+def test_repair_bridge_intro_case():
+    """Costumbres line 0 shape: first words bind to spoken-intro voice,
+    one word bridges 27s of instrumental, the rest sits at the real
+    verse. The bigger cluster (real verse side) must win."""
+    ws = [("Muerdo", 3.54, 5.66, 0.75), ("el", 5.80, 6.98, 0.98),
+          ("anzuelo", 8.30, 35.12, 0.88),  # 27s bridge word
+          ("y", 35.90, 36.00, 0.66), ("vuelvo", 36.04, 36.56, 0.98)]
+    regions = [(3.0, 10.2), (32.9, 41.8)]
+    (s, e, kept), = ctc_align.repair_bridge_words([(3.54, 36.56, ws)], regions)
+    assert e == 36.56
+    assert s > 25  # snapped to the real verse, not the spoken intro
+    assert [w[0] for w in kept] == ["anzuelo", "y", "vuelvo"]
+
+
+def test_repair_bridge_outro_case():
+    """Costumbres line 19 shape: last words dragged over the outro where
+    the stem has no voice. The line must end near the real singing."""
+    ws = [("Costumbres", 152.76, 154.12, 0.98), ("argentinas", 154.22, 155.68, 0.91),
+          ("de,", 155.72, 156.80, 0.93),
+          ("decir,", 157.18, 180.16, 0.61),  # 23s bridge word
+          ("no", 183.40, 187.18, 0.20)]
+    regions = [(147.2, 159.2)]
+    (s, e, kept), = ctc_align.repair_bridge_words([(152.76, 187.18, ws)], regions)
+    assert s == 152.76
+    assert e < 161  # trimmed to plausible duration, near voice end
+    assert kept[-1][0] == "decir,"
+
+
+def test_repair_bridge_no_op_on_healthy_lines():
+    ws = [("hola", 10.0, 10.5, 0.9), ("que", 10.6, 10.9, 0.9),
+          ("tal", 11.0, 11.4, 0.9)]
+    out = ctc_align.repair_bridge_words([(10.0, 11.4, ws)], [(9.0, 12.0)])
+    assert out == [(10.0, 11.4, ws)]
+
+
+def test_guess_text_lang():
+    es = ["No quiero que me perdones", "Y no me pidas perdón",
+          "Yo quería que nos pasara", "Para bien o para mal"]
+    en = ["I want it I got it", "You like my hair gee thanks just bought it",
+          "Ain't got enough money to pay me respect", "Look at my neck"]
+    assert ctc_align.guess_text_lang(es) == "es"
+    assert ctc_align.guess_text_lang(en) == "en"
+    assert ctc_align.guess_text_lang(["la"]) == "unknown"
+
+
+def test_retime_declines_on_english_text(monkeypatch, tmp_path):
+    """The English guard fires BEFORE any audio/model work."""
+    monkeypatch.setenv("CTC_ALIGN_ENABLED", "1")
+    f = tmp_path / "a.wav"
+    f.write_bytes(b"RIFF")
+    segs = [{"text": t, "start": 0, "end": 0} for t in
+            ["I want it I got it", "You like my hair gee thanks",
+             "Just bought it yeah", "And I want it I got it"]]
+    assert ctc_align.retime_segments(str(f), segs) is None
 
 
 def test_looks_collapsed_detects_crammed_alignment():
