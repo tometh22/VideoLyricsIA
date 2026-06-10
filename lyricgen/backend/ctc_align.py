@@ -95,24 +95,45 @@ def norm_word(w: str) -> str:
     return re.sub(r"[^a-záéíóúñü']", "", w)
 
 
-def build_targets(lines: list[str], dictionary: dict, star_id: int):
+def build_targets(lines: list[str], dictionary: dict, star_id: int,
+                  word_sep_id: int | None = None):
     """Flat token sequence for the whole lyric + per-word bookkeeping.
 
     Returns (targets, words) where words is a list of
     (line_idx, raw_word, n_tokens); line_idx == -1 marks a star filler.
     Words with no vocab-representable chars are skipped (the line is
-    later interpolated if ALL its words drop). Pure — unit-testable."""
+    later interpolated if ALL its words drop). Pure — unit-testable.
+
+    A star goes BETWEEN lines and also BEFORE the first / AFTER the last:
+    without the edge stars, a spoken intro (live dedications, stage talk —
+    it IS voice in the stem) can only bind to line 1's tokens, dragging it
+    seconds early; same for outros on the last line (measured on
+    Costumbres Argentinas live: line 1 stretched 3.1→36.6s, last line
+    stretched 36s over the outro).
+
+    `word_sep_id`: the CTC word-delimiter class ('|' in the XLSR vocab),
+    inserted between words WITHIN a line. The model was trained emitting
+    it at word boundaries; giving the Viterbi that anchor measurably
+    tightens tails (nada_fue p95 26.5→9.2s in the corruption harness).
+    The separator token is appended to the PRECEDING word's token count
+    so span bookkeeping stays 1:1 with targets."""
     words: list[tuple[int, str, int]] = []
     targets: list[int] = []
+    words.append((-1, "*", 1))
+    targets.append(star_id)
     for li, line in enumerate(lines):
+        line_words = []
         for raw in line.split():
             ids = [dictionary[c] for c in norm_word(raw) if c in dictionary]
             if ids:
-                words.append((li, raw, len(ids)))
-                targets.extend(ids)
-        if li < len(lines) - 1:
-            words.append((-1, "*", 1))
-            targets.append(star_id)
+                line_words.append((raw, ids))
+        for wi, (raw, ids) in enumerate(line_words):
+            if word_sep_id is not None and wi < len(line_words) - 1:
+                ids = ids + [word_sep_id]
+            words.append((li, raw, len(ids)))
+            targets.extend(ids)
+        words.append((-1, "*", 1))
+        targets.append(star_id)
     return targets, words
 
 
@@ -138,6 +159,99 @@ def spans_to_lines(spans, words, n_lines: int, frame_to_s: float):
         out[li][1] = we
         out[li][2].append((raw, ws, we, score))
     return [tuple(o) if o else None for o in out]
+
+
+BRIDGE_S = 8.0  # no word lasts 8s; no intra-line silence lasts 8s
+
+
+def _eff_dur(word: str) -> float:
+    """Plausible sung duration of a word: ~0.45s per alignable char +
+    slack for held notes. 'anzuelo' → ~3.7s, never 27s."""
+    return 0.45 * max(len(norm_word(word)), 2) + 0.6
+
+
+def repair_bridge_words(line_times, regions=None):
+    """Fix 'bridge' lines: a word stretched implausibly long (or a huge
+    intra-line gap) is the CTC bridging two distinct vocal events — e.g.
+    a live intro where the singer talks (binds the first words) and the
+    real verse 30s later (binds the rest), with one word spanning the
+    instrumental in between. Measured on Costumbres live: 'anzuelo'
+    8.3→35.1s, 'decir' 157→180s over no-voice audio.
+
+    For each line whose words contain a bridge (duration or gap >
+    BRIDGE_S): split the words into clusters at the bridges (the bridge
+    word joins the side it's temporally closer to, trimmed to its
+    plausible duration), keep the cluster with the most words (tie:
+    higher mean score), and re-derive the line's start/end from it.
+    Dropped words lose their (wrong) stamps. `regions` (vocal VAD spans)
+    break score ties toward clusters that overlap voice. Pure."""
+    def in_voice(a, b):
+        if not regions:
+            return True
+        return any(ra - 0.3 <= a <= rb + 0.3 or ra - 0.3 <= b <= rb + 0.3
+                   or (a <= ra and b >= rb) for ra, rb in regions)
+
+    out = []
+    for lt in line_times:
+        if lt is None or not lt[2]:
+            out.append(lt)
+            continue
+        s, e, ws = lt
+        # break BEFORE word i when the gap from word i-1 exceeds BRIDGE_S
+        clusters, cur = [], [0]
+        for i in range(1, len(ws)):
+            gap = ws[i][1] - ws[i - 1][2]
+            if gap > BRIDGE_S:
+                clusters.append(cur)
+                cur = []
+            cur.append(i)
+        clusters.append(cur)
+        # a bridge WORD splits its own line: assign it to the nearer side
+        # with its duration trimmed to plausible
+        rebuilt = []
+        for cl in clusters:
+            parts = []
+            for i in cl:
+                w, a, b, sc = ws[i]
+                if b - a > BRIDGE_S:
+                    gap_l = a - ws[i - 1][2] if i > 0 else float("inf")
+                    gap_r = ws[i + 1][1] - b if i + 1 < len(ws) else float("inf")
+                    if gap_r <= gap_l:
+                        a = max(a, b - _eff_dur(w))   # word belongs at its end
+                    else:
+                        b = min(b, a + _eff_dur(w))   # word belongs at its start
+                parts.append((w, a, b, sc))
+            # the trim may itself have created a >BRIDGE_S hole — re-split
+            sub, cur2 = [], [parts[0]]
+            for p in parts[1:]:
+                if p[1] - cur2[-1][2] > BRIDGE_S:
+                    sub.append(cur2)
+                    cur2 = []
+                cur2.append(p)
+            sub.append(cur2)
+            rebuilt.extend(sub)
+        if len(rebuilt) == 1:
+            cl = rebuilt[0]
+            out.append((cl[0][1], cl[-1][2], cl))
+            continue
+        def rank(cl):
+            mean_sc = sum(p[3] for p in cl) / len(cl)
+            return (len(cl), in_voice(cl[0][1], cl[-1][2]), mean_sc)
+        best = max(rebuilt, key=rank)
+        out.append((best[0][1], best[-1][2], best))
+    # repairs must not break global monotonicity
+    prev_end = 0.0
+    fixed = []
+    for lt in out:
+        if lt is None:
+            fixed.append(lt)
+            continue
+        s, e, ws = lt
+        s = max(s, prev_end - 0.2)
+        e = max(e, s + 0.2)
+        fixed.append((s, e, ws))
+        prev_end = e
+    return fixed
 
 
 def looks_collapsed(line_times, min_dur_s: float = 0.15,
@@ -222,7 +336,10 @@ def retime_segments(audio_path: str, segments: list[dict],
         star_id = model.config.vocab_size
 
         lines = [(s.get("text") or "").strip() for s in segments]
-        targets, words = build_targets(lines, dictionary, star_id)
+        use_sep = os.environ.get("CTC_ALIGN_WORD_SEP", "1").strip().lower() in _TRUE
+        word_sep_id = dictionary.get("|") if use_sep else None
+        targets, words = build_targets(lines, dictionary, star_id,
+                                       word_sep_id=word_sep_id)
         n_real_tokens = sum(n for li, _, n in words if li >= 0)
         n_chars = sum(len(norm_word(w)) for ln in lines for w in ln.split()) or 1
         if n_real_tokens / n_chars < 0.6:
@@ -272,6 +389,12 @@ def retime_segments(audio_path: str, segments: list[dict],
         if looks_collapsed(line_times):
             logger.warning("[CTC] decline: collapsed alignment (job=%s)", job_id)
             return None
+        try:
+            import anchor_align
+            _regions = anchor_align.vocal_regions(audio_path)
+        except Exception:
+            _regions = []
+        line_times = repair_bridge_words(line_times, _regions)
 
         # Interpolate lines whose words were all unalignable (numbers,
         # emoji): midpoint between neighbours keeps monotonic order.
