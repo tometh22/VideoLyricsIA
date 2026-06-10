@@ -712,6 +712,24 @@ def retime_segments(audio_path: str, segments: list[dict],
                             job_id)
                 skipped_lines -= recovered_lines
 
+        # STRUCTURAL-MISMATCH guard (staging lesson, Nada Fue live): when
+        # the live's structure differs from the reference text (extra
+        # verse/chorus repetitions the text doesn't list), the monotonic
+        # Viterbi binds lines to the WRONG occurrence with high confidence
+        # — the user heard verse 2 sung at 1:32 while the engine placed it
+        # at 3:03 (its third occurrence). A high skip fraction IS the
+        # symptom (8/49=16% there; 0 on every healthy song measured).
+        # No timing engine can fix structurally-wrong text → decline the
+        # whole song, keep the cascade. The real fix is performance text
+        # (Etapa A: ASR of the actual live + reference orthography).
+        max_skip_frac = float(os.environ.get("CTC_ALIGN_MAX_SKIP_FRAC", "0.10"))
+        if len(skipped_lines) / max(len(lines), 1) > max_skip_frac:
+            logger.warning("[CTC] decline: %d/%d lines skipped (>%.0f%%) — "
+                           "structural mismatch between text and performance "
+                           "(job=%s)", len(skipped_lines), len(lines),
+                           100 * max_skip_frac, job_id)
+            return None
+
         # Lines the engine could not time (skipped / unalignable words):
         # prefer the CASCADE's original timing inside the hole over a
         # blind spread — see place_unaligned's docstring (staging lesson).
