@@ -48,7 +48,15 @@ _SYS_TS = (
 
 _TS_RE = re.compile(r"^\s*[\[(]?\s*(\d{1,2}):(\d{2}(?:\.\d{1,2})?)\s*[\])]?\s*(.*)$")
 _JUNK = re.compile(r"^[\[\]()0-9:.\s¡!¿?]*$")
-_LABEL = re.compile(r"^\(?(grito|silencio|instrumental|aplausos?|m[uú]sica[^)]*)\)?$", re.I)
+# Stage labels Gemini emits despite the prompt — observed leaking into a
+# real staging video as displayed lines: "Público cantando y aplaudiendo",
+# "silence" (English!), "Aplausos y ovación". Match generously: anything
+# that DESCRIBES the room instead of quoting a lyric.
+_LABEL = re.compile(
+    r"^\(?\s*(grito|silencio|silence|instrumental|"
+    r"aplausos?\b[^)]*|m[uú]sica\b[^)]*|p[uú]blico\b[^)]*|"
+    r"ovaci[oó]n[^)]*|multitud\b[^)]*|crowd\b[^)]*|audiencia\b[^)]*)\s*\)?$",
+    re.I)
 _CHATTER = re.compile(r"^(gracias|chau|chao|adi[oó]s|buenas noches|muchas gracias|che)\b", re.I)
 _PURE_VOCAL = re.compile(
     r"^[¡!\s]*((o+h+|a+h+|e+h+|u+h+|na+|la+|ja+|je+|wo+|yeah|hey|uh)[\s,.!¡]*)+$", re.I)
