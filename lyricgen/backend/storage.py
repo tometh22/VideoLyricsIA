@@ -744,13 +744,22 @@ def cleanup_old_inputs(retention_days: int = 365, apply: bool = False, prefix: s
         # event with the count + caller so the operator sees it whether
         # or not they check Railway logs. A delete is rare; multiple in
         # a day means something is wrong.
+        # FINGERPRINT 2026-06-10: agrupado por caller+prefix — el sweep
+        # diario de retención (bg_preview TTL) acumula eventos en UN
+        # issue en vez de crear uno por corrida. Conteo/retención van en
+        # extra; un spike de eventos sigue disparando las alert rules.
         try:
             import sentry_sdk
-            sentry_sdk.capture_message(
-                f"[R2-BULK-DELETE] cleanup_old_inputs deleting {len(expired)} inputs "
-                f"(retention={retention_days}d, caller={caller}, prefix={prefix})",
-                level="error",  # bulk delete is operationally significant
-            )
+            with sentry_sdk.push_scope() as _scope:
+                _scope.fingerprint = ["r2-bulk-delete", caller, prefix or ""]
+                _scope.set_tag("r2.caller", caller)
+                _scope.set_tag("r2.prefix", prefix or "")
+                _scope.set_extra("r2.expired_count", len(expired))
+                _scope.set_extra("r2.retention_days", retention_days)
+                sentry_sdk.capture_message(
+                    f"[R2-BULK-DELETE] cleanup_old_inputs via {caller} (prefix={prefix})",
+                    level="error",  # bulk delete is operationally significant
+                )
         except Exception:
             pass
         for i in range(0, len(expired), 1000):
@@ -808,12 +817,23 @@ def delete_object(key: str) -> None:
         # — these deletes should be rare, and a flood here means the
         # incident is recurring. Idempotent: if sentry_sdk isn't init
         # or the DSN isn't set, it's a no-op.
+        #
+        # FINGERPRINT 2026-06-10: el título original incluía la key única
+        # → cada borrado creaba un issue NUEVO en el feed (6 issues por
+        # una corrida del reaper) y enterraba errores reales. Fingerprint
+        # estable por caller: UN issue por code path, contador de eventos
+        # acumulando — el spike sigue visible (que era el punto del
+        # tripwire) y la key queda en extra para la forensia.
         try:
             import sentry_sdk
-            sentry_sdk.capture_message(
-                f"[R2-DELETE-INPUT] {key} from {caller}",
-                level="warning",
-            )
+            with sentry_sdk.push_scope() as _scope:
+                _scope.fingerprint = ["r2-delete-input", caller]
+                _scope.set_tag("r2.caller", caller)
+                _scope.set_extra("r2.key", key)
+                sentry_sdk.capture_message(
+                    f"[R2-DELETE-INPUT] via {caller}",
+                    level="warning",
+                )
         except Exception:
             pass
     try:
