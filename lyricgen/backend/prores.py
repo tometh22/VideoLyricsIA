@@ -334,6 +334,9 @@ def prewarm_prores(job_id: str, file_type: str) -> str | None:
     while this worker was queued, ensure_prores_exists short-circuits
     on os.path.exists. Returns the path either way.
     """
+    # Observability 2026-06-10: toda línea de log de este job lleva job_id.
+    from observability import set_job_log_context
+    set_job_log_context(job_id)
     from jobs import get_job_model
     from database import SessionLocal
 
