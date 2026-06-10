@@ -489,6 +489,79 @@ def _best_effort_lyrics_hint(artist: str, song_title: str) -> str | None:
         return None
 
 
+def _validate_bg_cache_key(bg_cache_key, *, job_id, artist, song_title, style,
+                           movement_style, effect, custom_colors, genre,
+                           concept, background_hint, bg_verbatim, match_lyrics):
+    """Valida que el bg_cache_key del cliente corresponda a ESTE job.
+
+    Audit adversarial 2026-06-09: el key viene del CLIENTE y se usaba sin
+    validar — un key stale (el operador cambió params después del preview)
+    o directamente ajeno (otro tenant, request crafteado) servía CUALQUIER
+    fondo de bg_cache/ como si fuera de este job. Acá el servidor recomputa
+    el hash desde los params reales del job con la MISMA función que usó el
+    preview (bg_preview.compute_bg_cache_key) y descarta el key si no
+    coincide. Peor caso de un falso mismatch = generación fresh (correcta,
+    solo más lenta y ~$0.80-3.20 de Veo) — nunca un fondo equivocado.
+
+    Returns:
+        El key si coincide; None si no (o si la validación misma falla).
+    """
+    try:
+        from bg_preview import compute_bg_cache_key
+        expected = compute_bg_cache_key({
+            "artist": artist or "",
+            "song_title": song_title or "",
+            "style": style or "",
+            "movement_style": movement_style or "",
+            "effect": effect or "",
+            "custom_colors": custom_colors or "",
+            "genre": genre or "",
+            "concept": concept or "",
+            "background_hint": background_hint or "",
+            "bg_verbatim": bool(bg_verbatim),
+            # El preview siempre hashea con background_mode="veo"
+            # (App.jsx previewEntry lo hardcodea) y animate_image solo es
+            # true con custom file — caso que nunca llega al fast path
+            # (_animate_user_image lo excluye en el caller).
+            "background_mode": "veo",
+            "animate_image": False,
+            "match_lyrics": bool(match_lyrics),
+        })
+        if bg_cache_key != expected:
+            logger.warning(
+                "[BG] bg_cache_key DESCARTADO job=%s: cliente=%s esperado=%s "
+                "(params del job no coinciden con los del preview) — fondo fresh",
+                job_id, bg_cache_key, expected,
+            )
+            return None
+        return bg_cache_key
+    except Exception as exc:
+        # Best-effort: si el recompute falla, mejor generar fresh que
+        # arriesgar un fondo ajeno.
+        logger.warning("[BG] bg_cache_key validation error job=%s: %s — fondo fresh",
+                       job_id, exc)
+        return None
+
+
+def _seed_image_digest(image_path, job_id=None):
+    """sha256-16 del contenido de la imagen semilla de image-to-video.
+
+    Entra al cache key de Veo (audit adversarial 2026-06-09): sin esto, el
+    hash era prompt+model+params y omitía la imagen — mismo namespace
+    (artista|tema) + mismo prompt con DOS imágenes distintas servía el clip
+    cacheado de la otra (caso real: re-render de la misma canción cambiando
+    la foto recibía la animación de la foto anterior). Si la imagen no se
+    puede leer, devolvemos un marcador único por job para no envenenar el
+    cache compartido.
+    """
+    import hashlib as _ih
+    try:
+        with open(image_path, "rb") as _imf:
+            return _ih.sha256(_imf.read()).hexdigest()[:16]
+    except OSError:
+        return f"unreadable:{job_id or 'nojob'}"
+
+
 def run_pipeline(job_id: str, mp3_path: str, artist: str, style: str,
                  language: str = None, segments_override: list[dict] = None,
                  delivery_profile: str = "youtube", umg_spec: dict | None = None,
@@ -807,6 +880,15 @@ def run_pipeline(job_id: str, mp3_path: str, artist: str, style: str,
             # opciones después del preview, o el preview falló, o el TTL
             # de 24h del cache lo limpió), seguimos con el flow normal.
             bg_image_path = None
+            if bg_cache_key and not _animate_user_image:
+                bg_cache_key = _validate_bg_cache_key(
+                    bg_cache_key, job_id=job_id, artist=artist,
+                    song_title=song_title, style=style,
+                    movement_style=movement_style, effect=effect,
+                    custom_colors=custom_colors, genre=genre, concept=concept,
+                    background_hint=background_hint, bg_verbatim=bg_verbatim,
+                    match_lyrics=match_lyrics,
+                )
             if bg_cache_key and not _animate_user_image:
                 try:
                     from bg_preview import cache_check, cache_download
@@ -4436,6 +4518,563 @@ def _llm_segment_words(segs: list[dict], *, audio_path: str, artist: str = "",
     return out_segs
 
 
+def _recording_diverges(segs: list[dict], canonical: str,
+                        ratio: float = 1.25) -> bool:
+    """True when the recording sings MEANINGFULLY MORE than the studio lyric
+    (live/extended: repeated verses, ad-libs, long outros).
+
+    Gate for letting LLM line-segmentation PREEMPT the canonical-recovery
+    cascade (forced_align / whisper-align) after `reconcile` aborts. Reconcile
+    also aborts on plain whisperX MISHEARS of a studio song (incident "Viejas
+    Locas — 638"), and for those FA must win because it recovers the canonical
+    TEXT — LLM-segment only re-groups whisperX's own (misheard) words and never
+    compares against `canonical`, so it would ship the mishears. We therefore
+    only declare divergence when the transcribed word count clearly exceeds the
+    canonical's by `ratio` (a true live has the extra content; a misheard studio
+    song has ~the same count). Returns False when there is no canonical text."""
+    canon_n = len((canonical or "").split())
+    if canon_n <= 0:
+        return False
+    # Count words from text; fall back to the word stream when a seg has no
+    # `text` yet (whisperX segs can carry `words` with an empty `text`).
+    wx_n = sum(len((s.get("text") or "").split()) or len(s.get("words") or [])
+               for s in (segs or []))
+    return wx_n >= ratio * canon_n
+
+
+def _env_float(name: str, default: float) -> float:
+    """Read env var `name` as a float, falling back to `default` on unset or
+    parse error. Used for request-time tuning knobs (no redeploy)."""
+    try:
+        v = os.environ.get(name, "").strip()
+        return float(v) if v else default
+    except (TypeError, ValueError):
+        return default
+
+
+def _word_containment(snippet: str, reference: str) -> float:
+    """Fraction of `snippet`'s content words (accents stripped, stop-words
+    dropped) that also appear in `reference`. Unlike Jaccard overlap, this does
+    NOT penalise a short snippet against a long reference — the right gate for
+    "are these few recovered words real vocabulary from this song?". A total
+    hallucination scores low; a real (even repeated) line scores high (the loop
+    case is caught separately by the repeat guard). Returns 0..1."""
+    import unicodedata
+
+    def words(s: str) -> list[str]:
+        s = unicodedata.normalize("NFKD", s or "")
+        s = "".join(c for c in s if not unicodedata.combining(c))
+        toks = re.findall(r"[a-z0-9]+", s.lower())
+        stop = {"el", "la", "los", "las", "de", "del", "y", "o", "a", "en",
+                "que", "se", "un", "una", "es", "con", "por", "para", "no", "si"}
+        return [t for t in toks if t not in stop and len(t) >= 2]
+
+    snip = words(snippet)
+    ref = set(words(reference))
+    if not snip or not ref:
+        return 0.0
+    return sum(1 for t in snip if t in ref) / len(snip)
+
+
+# Test/local seam: a callable (clip, sr, c0, lines) -> [stamp,…] | None. When
+# set (e.g. to a whisperX-align backend in the lab), it overrides the hosted
+# aligner below. Production leaves it None and uses the Replicate force-aligner.
+_GAP_CLIP_ALIGNER = None
+
+
+def _gap_words_to_lines(stamps: list[dict], lines: list[str]):
+    """Map flat forced-aligned word `stamps` onto the recovered `lines` by token
+    count, in order, so each recovered line gets REAL start/end + per-word timing
+    instead of a uniform guess. Returns one seg-dict per line, or None when the
+    stamps don't line up with the text (→ caller keeps uniform timing).
+
+    The aligner is fed the SAME lyric text, so it returns ~one stamp per token;
+    we keep the line's own (Gemini) spelling and take only the timing from the
+    stamps. Recovered words carry a real score (so beat_snap leaves their
+    now-accurate timing alone) and provenance='gap-recovery'."""
+    total = sum(len(l.split()) for l in lines)
+    if not stamps or total <= 0 or len(stamps) < total - 2:  # small slack
+        return None
+    out, wi = [], 0
+    for txt in lines:
+        toks = txt.split()
+        grp = stamps[wi:wi + len(toks)]
+        wi += len(toks)
+        if not grp:
+            return None
+        st = grp[0].get("start")
+        en = grp[-1].get("end")
+        if not isinstance(st, (int, float)) or not isinstance(en, (int, float)):
+            return None
+        words = []
+        for k, tok in enumerate(toks):
+            s = grp[k] if k < len(grp) else grp[-1]
+            ws, we = s.get("start"), s.get("end")
+            words.append({
+                "word": tok,
+                "start": float(ws if isinstance(ws, (int, float)) else st),
+                "end": float(we if isinstance(we, (int, float)) else en),
+                "score": float(s.get("score") if isinstance(s.get("score"),
+                                                            (int, float)) else 0.6),
+                "provenance": "gap-recovery",
+            })
+        out.append({"start": float(st), "end": float(en), "text": txt,
+                    "words": words, "provenance": "gap-recovery"})
+    return out
+
+
+def _align_words_in_clip(clip, sr: int, c0: float, lines: list[str],
+                         timeout_s: int = 60):
+    """Forced-align the recovered `lines` to the audio `clip` → REAL absolute
+    word stamps [{word,start,end,score}], or None (caller keeps uniform timing).
+
+    Gated by GAP_RECOVERY_ALIGN_ENABLED. Never raises. Default backend is the
+    hosted cureau force-aligner (the same one the canonical cascade uses), run
+    on the SHORT clip; clip-relative stamps are shifted back by `c0` to absolute
+    song time. A `_GAP_CLIP_ALIGNER` hook overrides it for the lab/tests."""
+    if not _env_flag("GAP_RECOVERY_ALIGN_ENABLED"):
+        return None
+    try:
+        if _GAP_CLIP_ALIGNER is not None:
+            return _GAP_CLIP_ALIGNER(clip, sr, c0, lines)
+        import forced_align as _fa
+        if not _fa.is_enabled():
+            return None
+        import tempfile
+        import soundfile as sf
+        tmp = None
+        handles: list = []
+        try:
+            with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tf:
+                sf.write(tf.name, clip, sr, format="WAV")
+                tmp = tf.name
+
+            def factory():
+                f = open(tmp, "rb")
+                handles.append(f)
+                return {"audio_file": f, "transcript": "\n".join(lines),
+                        "show_probabilities": True}
+            out = _fa._call_with_budget(
+                _fa._MODEL, factory,
+                total_budget_s=float(timeout_s), backoff=[0, 5])
+        finally:
+            for h in handles:
+                try:
+                    h.close()
+                except Exception:
+                    pass
+            if tmp:
+                try:
+                    os.unlink(tmp)
+                except OSError:
+                    pass
+        ws = ((out.get("wordstamps") or out.get("words"))
+              if isinstance(out, dict) else out)
+        if not ws:
+            return None
+        stamps = []
+        for w in ws:
+            s, e = w.get("start"), w.get("end")
+            if isinstance(s, (int, float)) and isinstance(e, (int, float)):
+                sc = w.get("score")
+                if not isinstance(sc, (int, float)):
+                    sc = w.get("probability")
+                stamps.append({
+                    "word": w.get("word") or w.get("text") or "",
+                    "start": float(s) + c0, "end": float(e) + c0,
+                    "score": float(sc) if isinstance(sc, (int, float)) else 0.6,
+                })
+        return stamps or None
+    except Exception as e:
+        logger.warning("[GAP-ALIGN] failed (%s); uniform timing", e)
+        return None
+
+
+# Test seam for the acoustic-twin finder: (segs, gs, ge, Csync, beat_t) ->
+# (src_segs, cost) | None. Production leaves it None and uses chroma DTW below.
+_GAP_TWIN_FINDER = None
+
+
+def _gap_warp_segments(src_segs: list[dict], gap_start: float,
+                       gap_end: float) -> list[dict] | None:
+    """Warp a run of transcribed source segments into [gap_start, gap_end] by
+    linear time-scaling (a repeated chorus shares tempo). Keeps the source TEXT
+    (clean lead lyrics) and only re-times. Pure / unit-testable. Returns
+    seg dicts tagged provenance='gap-transplant', or None."""
+    if not src_segs:
+        return None
+    ss0 = src_segs[0].get("start")
+    ss1 = src_segs[-1].get("end")
+    if not isinstance(ss0, (int, float)) or not isinstance(ss1, (int, float)):
+        return None
+    span = ss1 - ss0
+    if span <= 0 or gap_end <= gap_start:
+        return None
+
+    def warp(t):
+        # Clamp into the gap so a source word slightly outside [ss0,ss1] can't
+        # land on a neighbouring real segment after merge/sort.
+        return min(max(gap_start + (t - ss0) / span * (gap_end - gap_start),
+                       gap_start), gap_end)
+
+    out = []
+    for sg in src_segs:
+        words = []
+        for w in sg.get("words", []):
+            if not isinstance(w.get("start"), (int, float)) \
+                    or not isinstance(w.get("end"), (int, float)):
+                continue
+            if w["end"] <= w["start"]:
+                continue            # skip degenerate (zero-duration) source words
+            ws = float(warp(w["start"]))
+            we = max(float(warp(w["end"])), ws)   # enforce end >= start
+            words.append({"word": w.get("word", ""), "start": ws, "end": we,
+                          "score": 0.45, "provenance": "gap-transplant"})
+        if not words:
+            continue
+        sgs = float(warp(sg["start"]))
+        out.append({"start": sgs, "end": max(float(warp(sg["end"])), sgs),
+                    "text": (sg.get("text") or "").strip(),
+                    "words": words, "provenance": "gap-transplant"})
+    return out or None
+
+
+def _find_gap_twin(segs, gs, ge, Csync, beat_t, max_cost):
+    """Single subsequence-DTW (gap query vs the whole song): the earlier,
+    already-transcribed region most acoustically similar to the gap (typically
+    the chorus the lead sang clean). Returns (src_segs, cost) | None.
+
+    One O(L·beats) DTW call instead of a DTW per window — validated to find the
+    same twins as the per-window scan, far cheaper on long recordings."""
+    nb = Csync.shape[1]
+    hb = np.where((beat_t >= gs) & (beat_t <= ge))[0]
+    if len(hb) < 3:
+        return None
+    Q = Csync[:, hb[0]:hb[-1] + 1]
+    L = Q.shape[1]
+    if L < 3 or L >= nb:
+        return None
+    D, _ = librosa.sequence.dtw(X=Q, Y=Csync, metric="cosine", subseq=True)
+    costs = np.array(D[-1, :], dtype=float) / L   # per-step cost of ending at j
+    # Mask end-beats whose ~L-beat window overlaps the gap itself.
+    for j in range(nb):
+        if not (beat_t[j] < gs or beat_t[max(j - L + 1, 0)] > ge):
+            costs[j] = np.inf
+    # Take the best-cost window that actually CONTAINS transcribed segments —
+    # iterate in cost order so an empty (untranscribed) best window can't
+    # silently shadow a slightly-worse window that has lyrics to transplant.
+    for j in np.argsort(costs):
+        if not np.isfinite(costs[j]) or costs[j] > max_cost:
+            break
+        t0, t1 = beat_t[max(j - L + 1, 0)], beat_t[j]
+        src = [sg for sg in segs
+               if sg.get("words") and t0 <= sg.get("start", -1) <= t1]
+        if src:
+            return src, float(costs[j])
+    return None
+
+
+def _transplant_gap(segs, gs, ge, Csync, beat_t, y=None, sr=22050,
+                    voice_th=None, *, max_cost=0.12, min_words=3, canonical=""):
+    """Fill a gap by transplanting its acoustic TWIN's lyrics (earlier clean
+    chorus) warped to the gap's timeframe — clean words + real placement, no ASR
+    of the crowd. The validated heart of the combined pipeline. Self-declining
+    (returns None on weak match / too few words / low vocabulary overlap / any
+    error); the caller then falls through to the Gemini re-transcription path."""
+    try:
+        # Vocal-presence gate: never transplant lyrics over an INSTRUMENTAL gap
+        # (a solo's chord loop can match the chorus's chroma). `y` is the vocal
+        # stem, so a gap with little voiced energy is instrumental/silence →
+        # decline. Cheap (RMS) and it also skips the DTW on instrumental gaps.
+        if y is not None and voice_th is not None and ge > gs:
+            seg = y[int(gs * sr):int(ge * sr)]
+            if len(seg):
+                fl = max(int(0.05 * sr), 1)
+                rms = librosa.feature.rms(y=seg, frame_length=fl,
+                                          hop_length=fl)[0]
+                if float(np.mean(rms > voice_th)) < 0.35:
+                    logger.info("[GAP-TRANSPLANT] gap %.0f–%.0f not voiced "
+                                "(instrumental?) — declining", gs, ge)
+                    return None
+        found = (_GAP_TWIN_FINDER(segs, gs, ge, Csync, beat_t)
+                 if _GAP_TWIN_FINDER is not None
+                 else _find_gap_twin(segs, gs, ge, Csync, beat_t, max_cost))
+        if not found:
+            return None
+        src, cost = found
+        if sum(len(sg.get("words", [])) for sg in src) < min_words:
+            return None
+        out = _gap_warp_segments(src, gs, ge)
+        if not out:
+            return None
+        # Smear guard: a faithful chorus repeat packs words densely. If we'd be
+        # stretching few words across a long gap (e.g. an 84 s outro that is
+        # really screams + silence), the linear warp would smear lyrics over
+        # non-vocal audio — decline and let the bounded Gemini path handle it.
+        n_w = sum(len(s.get("words", [])) for s in out)
+        if n_w == 0 or (ge - gs) / n_w > _env_float("GAP_TRANSPLANT_MAX_WORD_S", 1.2):
+            logger.info("[GAP-TRANSPLANT] gap %.0f–%.0f too sparse "
+                        "(%.1fs/word) — declining (smear guard)", gs, ge,
+                        (ge - gs) / max(n_w, 1))
+            return None
+        ref = canonical or " ".join((w.get("word") or "")
+                                    for sg in segs for w in sg.get("words", []))
+        if _word_containment(" ".join(s["text"] for s in out), ref) < 0.5:
+            return None
+        logger.info("[GAP-TRANSPLANT] gap %.0f–%.0f ← acoustic twin "
+                    "(cost %.3f, %d line(s))", gs, ge, cost, len(out))
+        return out
+    except Exception as e:
+        logger.warning("[GAP-TRANSPLANT] failed (%s); falling back", e)
+        return None
+
+
+def _recover_gap_lyrics(segs: list[dict], *, audio_path: str, artist: str = "",
+                        song: str = "", canonical: str = "",
+                        timeout_s: int = 60) -> list[dict]:
+    """Recover lyrics whisperX DROPPED inside large gaps, by re-transcribing a
+    SHORT, BOUNDED clip at the start of each gap.
+
+    Why bounded+short (the core finding): a LONG clip makes Gemini pattern-
+    complete the chorus into a mechanical loop — lab on "Nada Fue Un Error (En
+    Vivo)": an 84 s outro clip returned "Nada fue un error / Nada de esto fue"
+    x84, a pure hallucination over what is actually screams + a held "¡papá!"
+    (which Rotor itself only LABELS as "(grito)"). The SAME audio cut to ~8 s
+    returns the real 1–2 lines, no loop. So we recover ONLY the first voiced run
+    after a gap (the part adjacent to real lyrics) and STOP at the first
+    sustained silence — we never try to fill the whole gap. Screams/instrumental
+    stay untranscribed (as today), to be labelled by the operator.
+
+    Timing for recovered lines is APPROXIMATE (distributed across the detected
+    voiced run) — gap regions have no whisperX word timing by definition. Every
+    whisperX-timed line is left byte-identical; recovered words carry
+    provenance="gap-recovery" + low score so downstream can tell them apart.
+
+    Self-declining (returns INPUT unchanged) on: flag off, short/again-less word
+    stream, no qualifying gap, stem unreadable, librosa/Gemini failure,
+    unparseable / looping / low-overlap output. Never raises. Gated behind
+    GAP_RECOVERY_ENABLED (default off)."""
+    if not _env_flag("GAP_RECOVERY_ENABLED"):
+        return segs
+    try:
+        W: list[dict] = []
+        for s in (segs or []):
+            ws = s.get("words")
+            if not isinstance(ws, list):
+                return segs  # no word timing → can't locate gaps
+            for w in ws:
+                if (isinstance(w, dict)
+                        and isinstance(w.get("start"), (int, float))
+                        and isinstance(w.get("end"), (int, float))):
+                    W.append(w)
+        if len(W) < 8 or not audio_path or not os.path.exists(audio_path):
+            return segs
+        W.sort(key=lambda w: w["start"])
+
+        GAP_MIN = _env_float("GAP_RECOVERY_MIN_GAP", 8.0)
+        CLIP_MAX = _env_float("GAP_RECOVERY_CLIP_MAX", 10.0)
+        MAX_GAPS = int(_env_float("GAP_RECOVERY_MAX_GAPS", 4))
+        MAX_LINES = int(_env_float("GAP_RECOVERY_MAX_LINES", 6))
+        MIN_OVERLAP = _env_float("GAP_RECOVERY_MIN_OVERLAP", 0.45)
+
+        import soundfile as sf
+        import io
+        from google import genai
+        client = _get_genai_client()
+        if client is None:
+            return segs
+
+        sr = 22050
+        y, _sr = librosa.load(audio_path, sr=sr, mono=True)
+        audio_end = len(y) / sr
+
+        # Gaps = silences between consecutive words PLUS a trailing gap from the
+        # last word to end-of-audio. The trailing one matters because an
+        # upstream cleaner (LLM-segment / hallucination filter) may DROP the
+        # outro shouts, so the dropped lyrics are no longer "between" two words
+        # — they sit past the last surviving word.
+        gaps = [(W[i]["end"], W[i + 1]["start"]) for i in range(len(W) - 1)
+                if W[i + 1]["start"] - W[i]["end"] >= GAP_MIN]
+        if audio_end - W[-1]["end"] >= GAP_MIN:
+            gaps.append((W[-1]["end"], audio_end))
+        if not gaps:
+            return segs
+
+        # Reference voiced loudness: median RMS of the stem's louder frames
+        # (robust to the long quiet tails). Voiced threshold = 10% of it.
+        fl = int(0.25 * sr)
+        rms_all = librosa.feature.rms(y=y, frame_length=fl, hop_length=fl)[0]
+        loud = rms_all[rms_all > np.percentile(rms_all, 60)]
+        ref = float(np.median(loud)) if loud.size else 1e-6
+        voice_th = 0.10 * max(ref, 1e-6)
+        SIL_END = 0.8  # a silence this long ends the voiced run
+
+        ref_text = canonical or " ".join((w.get("word") or "") for w in W)
+        recovered: list[dict] = []
+        n_aligned = 0
+        n_transplant = 0
+
+        # Combined-pipeline Stage 3 (GAP_RECOVERY_TRANSPLANT_ENABLED, default
+        # off): precompute beat-synchronous chroma once so each gap can look for
+        # its acoustic twin (an earlier chorus the lead sang clean). Heavy, so
+        # only when the flag is on; any failure disables it (→ Gemini path).
+        _tx_on = _env_flag("GAP_RECOVERY_TRANSPLANT_ENABLED")
+        _Csync = _beat_t = None
+        if _tx_on:
+            try:
+                _ch = librosa.feature.chroma_cqt(y=y, sr=sr, hop_length=512)
+                _, _bts = librosa.beat.beat_track(y=y, sr=sr, hop_length=512)
+                _beat_t = librosa.frames_to_time(_bts, sr=sr, hop_length=512)
+                _Csync = librosa.util.sync(_ch, _bts, aggregate=np.median)
+                _nb = min(_Csync.shape[1], len(_beat_t))
+                _Csync, _beat_t = _Csync[:, :_nb], _beat_t[:_nb]
+                if _nb < 8:        # too few beats (beatless/rubato) → can't match
+                    _tx_on = False
+            except Exception as _e:
+                logger.warning("[GAP-TRANSPLANT] chroma setup failed (%s)", _e)
+                _tx_on = False
+
+        for (gs, ge) in gaps[:MAX_GAPS]:
+            # Stage 3: try transplanting the gap's acoustic twin BEFORE a blind
+            # Gemini re-transcription. Self-declines → falls through below.
+            if _tx_on and _Csync is not None:
+                _tx = _transplant_gap(
+                    segs, gs, ge, _Csync, _beat_t, y, sr, voice_th,
+                    max_cost=_env_float("GAP_TRANSPLANT_MAX_COST", 0.12),
+                    canonical=canonical)
+                if _tx:
+                    recovered.extend(_tx)
+                    n_transplant += len(_tx)
+                    continue
+            # Walk frames from the gap start; capture the FIRST voiced run,
+            # ending it at the first sustained silence (or the clip cap).
+            run_start = run_end = None
+            sil = 0
+            tt = gs
+            cap = min(ge, gs + CLIP_MAX + 2.0)
+            while tt < cap:
+                seg = y[int(tt * sr):int((tt + 0.25) * sr)]
+                rms = float(np.sqrt(np.mean(seg ** 2))) if len(seg) else 0.0
+                if rms > voice_th:
+                    if run_start is None:
+                        run_start = tt
+                    run_end = tt + 0.25
+                    sil = 0
+                elif run_start is not None:
+                    sil += 1
+                    if sil * 0.25 >= SIL_END:
+                        break
+                tt += 0.25
+            if run_start is None or run_end is None or (run_end - run_start) < 1.5:
+                continue
+            c0 = max(gs, run_start - 0.3)
+            c1 = min(c0 + CLIP_MAX, run_end + 0.3, ge)
+            if c1 - c0 < 1.5:
+                continue
+
+            clip = y[int(c0 * sr):int(c1 * sr)]
+            buf = io.BytesIO()
+            sf.write(buf, clip, sr, format="WAV")
+            sysp = (
+                "Sos un transcriptor experto de lyric videos en español, nivel "
+                "Rotor.\n"
+                f"Te doy un FRAGMENTO CORTO de audio ({c1 - c0:.0f} s) de un vivo"
+                + (f" ({artist} — {song})" if artist else "") + ".\n"
+                "Transcribí EXACTAMENTE lo que se canta en ESTE fragmento corto.\n\n"
+                "REGLAS:\n"
+                "1. SOLO lo que escuchás en estos pocos segundos — son 1 o 2 "
+                "frases. NO repitas en loop, NO completes el estribillo entero.\n"
+                "2. Si es grito/instrumental/silencio, etiquetá: "
+                "(grito)/(instrumental)/(silencio).\n"
+                "3. Una frase por línea, mayúscula al inicio.\n"
+                + (f"- Letra oficial (ortografía, NO forzar): {ref_text}\n"
+                   if canonical else "")
+                + "FORMATO por línea, sin nada más: texto"
+            )
+            try:
+                resp = _call_with_timeout(
+                    lambda: client.models.generate_content(
+                        model="gemini-2.5-flash",
+                        contents=[
+                            genai.types.Part.from_bytes(
+                                data=buf.getvalue(), mime_type="audio/wav"),
+                            genai.types.Part.from_text(
+                                text="Transcribí este fragmento corto."),
+                        ],
+                        config=genai.types.GenerateContentConfig(
+                            system_instruction=sysp, temperature=0.1,
+                            max_output_tokens=400,
+                            thinking_config=genai.types.ThinkingConfig(
+                                thinking_budget=0),
+                        ),
+                    ),
+                    timeout_s=float(timeout_s), label="GAP-RECOVER",
+                )
+                out = (resp.text or "").strip()
+            except Exception as e:
+                logger.warning("[GAP-RECOVER] Gemini failed on gap %.0f–%.0f: %s",
+                               gs, ge, e)
+                continue
+
+            lines = [re.sub(r"^\s*\[\d+(?:\.\d+)?\]\s*", "", ln).strip()
+                     for ln in out.splitlines() if ln.strip()]
+            lines = [l for l in lines if l]
+            if not lines or len(lines) > MAX_LINES:
+                continue
+            # Loop guard: any phrase repeated ≥3× is the hallucination tell.
+            if any(lines.count(x) >= 3 for x in lines):
+                logger.info("[GAP-RECOVER] loop detected in gap %.0f–%.0f; skip",
+                            gs, ge)
+                continue
+            # v1: keep only LYRIC lines (drop pure (label) / ¡shout! lines —
+            # non-lyrical labelling is a separate feature).
+            lyric = [l for l in lines if not re.match(r"^\s*[\(¡]", l)]
+            if not lyric:
+                continue
+            if _word_containment(" ".join(lyric), ref_text) < MIN_OVERLAP:
+                logger.info("[GAP-RECOVER] low containment in gap %.0f–%.0f "
+                            "(hallucination guard); skip", gs, ge)
+                continue
+
+            # Path 1: REAL per-word timing via forced-align of the recovered
+            # text against the clip (GAP_RECOVERY_ALIGN_ENABLED). Lab on "Nada":
+            # cut the recovered-line timing error 1.06s → 0.27s vs the uniform
+            # split below. Falls back to the uniform split when the aligner is
+            # off / unavailable / the stamps don't line up with the text.
+            stamps = _align_words_in_clip(clip, sr, c0, lyric)
+            aligned = _gap_words_to_lines(stamps, lyric) if stamps else None
+            if aligned:
+                recovered.extend(aligned)
+                n_aligned += len(aligned)
+            else:
+                span = (run_end - run_start) / len(lyric)
+                for li, txt in enumerate(lyric):
+                    st = run_start + li * span
+                    en = run_start + (li + 1) * span
+                    toks = txt.split()
+                    wsp = (en - st) / max(1, len(toks))
+                    words = [{"word": tok, "start": st + wi * wsp,
+                              "end": st + (wi + 1) * wsp, "score": 0.3,
+                              "provenance": "gap-recovery"}
+                             for wi, tok in enumerate(toks)]
+                    recovered.append({"start": float(st), "end": float(en),
+                                      "text": txt, "words": words,
+                                      "provenance": "gap-recovery"})
+
+        if not recovered:
+            return segs
+        merged = list(segs) + recovered
+        merged.sort(key=lambda s: s.get("start", 0.0))
+        logger.info("[GAP-RECOVER] recovered %d line(s) across %d gap(s) "
+                    "(%d transplanted, %d forced-aligned, %d uniform; tagged)",
+                    len(recovered), min(len(gaps), MAX_GAPS), n_transplant,
+                    n_aligned, len(recovered) - n_aligned - n_transplant)
+        return merged
+    except Exception as e:
+        logger.warning("[GAP-RECOVER] failed (%s); keeping segments", e)
+        return segs
+
+
 def _sanitize_gemini_lyrics(text):
     """Strip section/pilcrow markers that some Spanish lyrics sites use
     as estrofa separators (Letras.com, AZLyrics, etc.). These are HTML
@@ -5425,6 +6064,12 @@ def _analyze_lyrics_for_background(lyrics_text: str, artist: str, job_id: str = 
         "single clear subject — avoid centered 'product shot' framing and over-"
         "saturated color clichés (no symmetric leaves-framing-sunset, no perfectly-"
         "lined silhouettes against gradient skies, no \"AI sunset\" aesthetic)."
+        "\n- TECHNICAL QUALITY (required): shot on a full-frame camera, RAZOR-SHARP "
+        "focus on the subject, high dynamic range with rich tonal depth and true "
+        "blacks, professional cinematic color grade, fine natural film grain, "
+        "tack-sharp micro-detail and realistic textures, photographed (NOT "
+        "illustrated/3D-rendered/CGI), no plastic or waxy surfaces, no over-"
+        "smoothing, no HDR halos, no oversharpening artifacts, no watermark."
         if _is_imagen else ""
     )
     _PROMPT_RULES = (
@@ -6244,6 +6889,10 @@ def _generate_veo_video(prompt: str, output_path: str, job_id: str = None,
     # Without this, all problem-songs ended up sharing one cached video
     # because the cache key was prompt-only.
     cache_params = {**veo_params, "blur_sigma": blur_sigma, "ns": cache_namespace or ""}
+    # Image-to-video: la imagen semilla entra al hash vía digest del
+    # contenido — ver _seed_image_digest para el porqué (audit 2026-06-09).
+    if image_path:
+        cache_params["img"] = _seed_image_digest(image_path, job_id)
     cache_key_hash = _veo_cache_key(safe_prompt, model, cache_params)
     cache_object_key = f"cache/veo/{cache_key_hash}.mp4"
 
@@ -6726,6 +7375,83 @@ def _extract_frame_from_video(video_path: str, output_image_path: str) -> str:
     return output_image_path
 
 
+# Umbral del detector de corte de escena. Calibrado 2026-06-10 con los
+# clips REALES del incidente del mural (universal_argentina): los morphs
+# contaminados (mural→café, mural→bosque) midieron 0.261-0.270; los clips
+# sanos (café text-to-video, café edit, mural estático) midieron
+# 0.004-0.059. 0.18 deja 3x de margen contra falsos positivos (un retry
+# innecesario cuesta ~$0.80-3.20 de Veo) y 1.4x contra falsos negativos.
+_BG_SCENE_CUT_THRESHOLD = float(os.environ.get("BG_SCENE_CUT_THRESHOLD", "0.18"))
+
+
+def _frame_pair_discontinuity(frame_a, frame_b) -> float:
+    """Núcleo puro del detector: distancia entre dos frames RGB (0.0-1.0).
+
+    Métrica: 0.5 * MAE de píxeles (downsampleado 8x) + 0.5 * distancia
+    de variación total de histogramas RGB (16 bins). El histograma
+    aguanta movimiento de cámara/gente (escena igual, píxeles corridos);
+    el MAE aguanta paletas parecidas con contenido distinto.
+    """
+    import numpy as _np
+    a = _np.asarray(frame_a, dtype="float32")[::8, ::8]
+    b = _np.asarray(frame_b, dtype="float32")[::8, ::8]
+    mae = float(_np.mean(_np.abs(a - b))) / 255.0
+    hist_d = 0.0
+    for c in range(3):
+        ha, _ = _np.histogram(a[..., c], bins=16, range=(0, 255))
+        hb, _ = _np.histogram(b[..., c], bins=16, range=(0, 255))
+        ha = ha / max(1, ha.sum())
+        hb = hb / max(1, hb.sum())
+        hist_d += float(_np.abs(ha - hb).sum()) / 2.0
+    return 0.5 * mae + 0.5 * (hist_d / 3.0)
+
+
+def _bg_scene_discontinuity(video_path: str) -> float:
+    """Mide si el clip de fondo contiene un cambio de escena (0.0-1.0).
+
+    Incidente 2026-06-09 (mural de Bersuit): Veo image-to-video con una
+    semilla que no matchea el prompt devuelve un clip que ARRANCA en la
+    semilla y morphea hacia el prompt — dos escenas en 8s que el loop
+    palindrómico repite todo el video. El único QA previo era el
+    relevance score sobre UN frame (t=4s), ciego al corte. Acá
+    comparamos el primer y el último frame del clip: si son escenas
+    distintas, el clip no sirve como fondo loopeable.
+
+    Extracción vía ffmpeg subprocess (no moviepy): más liviano que abrir
+    un VideoFileClip y testeable con el stub de moviepy del conftest.
+
+    Fail-open: ante cualquier error devuelve 0.0 — un bug acá jamás
+    debe bloquear un fondo bueno (mismo contrato que el relevance score).
+    """
+    try:
+        from PIL import Image as _Img
+
+        def _grab(out_png: str, seek: list[str]):
+            run_checked(
+                ["ffmpeg", "-y", "-loglevel", "error", *seek,
+                 "-i", video_path, "-frames:v", "1", out_png],
+                label="ffmpeg-scene-cut-frame",
+                timeout=60,
+                output_path=out_png,
+            )
+            with _Img.open(out_png) as im:
+                return im.convert("RGB").copy()
+
+        base = video_path + ".scenecut"
+        first = _grab(base + "_a.png", ["-ss", "0.05"])
+        # sseof busca desde el final — no necesitamos conocer la duración.
+        last = _grab(base + "_b.png", ["-sseof", "-0.3"])
+        for _p in (base + "_a.png", base + "_b.png"):
+            try:
+                os.unlink(_p)
+            except OSError:
+                pass
+        return _frame_pair_discontinuity(first, last)
+    except Exception as e:
+        logger.warning("[BG][SCENE-CUT] check failed (fail-open): %s", e)
+        return 0.0
+
+
 def _score_video_relevance(video_path: str, prompt: str) -> int:
     """Ask Gemini Vision whether the video matches the intended scene prompt.
 
@@ -7062,14 +7788,28 @@ def _ensure_background(style_hint: str, job_dir: str, lyrics_text: str = None,
             # result is also evaluated before we accept and return it.
             score = _score_video_relevance(bg_path, prompt)
             logger.info("[BG] Relevance score: %s/10 for prompt: %s...", score, prompt[:60])
+            # Detector de corte de escena (incidente mural 2026-06-09):
+            # un clip cuyo primer y último frame son escenas distintas
+            # produce un fondo que alterna escenas todo el video al
+            # loopearse. El relevance score no lo ve (mira UN frame).
+            discont = _bg_scene_discontinuity(bg_path)
+            if discont >= _BG_SCENE_CUT_THRESHOLD:
+                logger.warning(
+                    "[BG][SCENE-CUT] discontinuidad %.3f >= %.2f en %s (job=%s) — "
+                    "el clip contiene un cambio de escena",
+                    discont, _BG_SCENE_CUT_THRESHOLD,
+                    os.path.basename(bg_path), job_id,
+                )
             # Verbatim: never re-roll. A re-roll re-runs _get_unique_prompt
             # which short-circuits to the SAME verbatim text → identical
             # safe_prompt → Veo cache HIT → same clip, wasting a scoring pass
             # and never improving. The operator asked for their exact prompt;
             # we accept the first result and just log the score.
-            if score < 7 and not quality_retry_used and not bg_verbatim:
+            _needs_retry = (score < 7) or (discont >= _BG_SCENE_CUT_THRESHOLD)
+            if _needs_retry and not quality_retry_used and not bg_verbatim:
                 quality_retry_used = True
-                logger.info("[BG] Score %s < 7 — generating new prompt and retrying VEO", score)
+                logger.info("[BG] Score %s / discontinuidad %.3f — generating new prompt and retrying VEO",
+                            score, discont)
                 # Propagate background_hint into the quality retry. Without it,
                 # Gemini regenerates from lyrics/genre alone and the operator's
                 # explicit guidance is silently dropped — the same input that
@@ -7089,6 +7829,29 @@ def _ensure_background(style_hint: str, job_dir: str, lyrics_text: str = None,
                 continue
             if score < 7:
                 logger.warning("[BG] Score %s < 7 after retry — accepting best available result", score)
+            if discont >= _BG_SCENE_CUT_THRESHOLD:
+                # Aceptamos igual (fail-open: bloquear el render es peor que
+                # un fondo feo que la review humana atrapa), pero el operador
+                # se entera por Sentry ANTES de que lo vea el cliente.
+                # Fingerprint estable (estilo #630): un issue agrupado, no
+                # uno por job.
+                logger.warning(
+                    "[BG][SCENE-CUT] aceptando clip con discontinuidad %.3f tras retry (job=%s) — revisar antes de aprobar",
+                    discont, job_id,
+                )
+                try:
+                    import sentry_sdk
+                    with sentry_sdk.push_scope() as _scope:
+                        _scope.fingerprint = ["bg-scene-cut"]
+                        _scope.set_tag("job_id", job_id or "unknown")
+                        _scope.set_extra("discontinuity", discont)
+                        _scope.set_extra("prompt", (prompt or "")[:200])
+                        sentry_sdk.capture_message(
+                            "[BG][SCENE-CUT] fondo con cambio de escena aceptado tras retry",
+                            level="warning",
+                        )
+                except Exception:
+                    pass
             return bg_path
         except _JobTimeoutException:
             # Real RQ death-penalty timeout — propagate (don't degrade to
@@ -7849,16 +8612,17 @@ _FONTS_DIR = next(
     _FONTS_DIR_CANDIDATES[0],
 )
 _LYRIC_FONTS = [
-    # Sans-serif (clean, modern)
-    "Montserrat-Bold.ttf",
-    "Montserrat-ExtraBold.ttf",
-    "Poppins-Bold.ttf",
-    "Outfit-Bold.ttf",       # Gilroy alternative
-    "Roboto-Bold.ttf",
-    # Display (impactful, bold)
-    "BebasNeue-Regular.ttf",
-    "Oswald-Bold.ttf",
-    "Anton-Regular.ttf",
+    # AUTO-selection pool — soft, friendly, rounded faces first (operators asked
+    # for warmer, less "robotic" type). The condensed/industrial display faces
+    # (Bebas / Oswald / Anton) stay user-selectable in _FONT_CATALOGUE but are
+    # intentionally kept OUT of this random Auto pool so the default look is
+    # friendly, not mechanical.
+    "Fredoka-SemiBold.ttf",   # rounded, warm
+    "Quicksand-Bold.ttf",     # rounded geometric, soft
+    "Nunito-ExtraBold.ttf",   # rounded terminals, friendly
+    "Poppins-Bold.ttf",       # geometric but rounded
+    "Montserrat-Bold.ttf",    # neutral modern
+    "Outfit-Bold.ttf",        # clean (Gilroy-ish)
 ]
 _FONT_POOL = [
     os.path.join(_FONTS_DIR, f)
@@ -7876,6 +8640,10 @@ _FONT_POOL = [
 # substitutes (Jost / Outfit) and label the option honestly so the
 # operator knows it's a stylistic match, not the licensed face.
 _FONT_CATALOGUE = [
+    # Soft / friendly / rounded (the warm default family)
+    {"id": "fredoka",          "filename": "Fredoka-SemiBold.ttf",     "label": "Fredoka (redondeada)",      "google_family": "Fredoka",     "google_weight": 600},
+    {"id": "quicksand",        "filename": "Quicksand-Bold.ttf",       "label": "Quicksand (suave)",         "google_family": "Quicksand",   "google_weight": 700},
+    {"id": "nunito",           "filename": "Nunito-ExtraBold.ttf",     "label": "Nunito (amigable)",         "google_family": "Nunito",      "google_weight": 800},
     {"id": "jost-bold",        "filename": "Jost-Bold.ttf",            "label": "Jost (estilo Futura)",     "google_family": "Jost",        "google_weight": 700},
     {"id": "montserrat-bold",  "filename": "Montserrat-Bold.ttf",      "label": "Montserrat",                "google_family": "Montserrat",  "google_weight": 700},
     {"id": "poppins-bold",     "filename": "Poppins-Bold.ttf",         "label": "Poppins",                   "google_family": "Poppins",     "google_weight": 700},

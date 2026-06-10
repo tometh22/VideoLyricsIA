@@ -90,3 +90,54 @@ def test_self_declines_on_hallucination(tiny_audio, monkeypatch):
                  "[0-3] aaaa bbbb cccc dddd\n[4-7] eeee ffff gggg hhhh")
     out = pipeline._llm_segment_words(SEGS, audio_path=tiny_audio)
     assert out is SEGS
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# _recording_diverges — the gate that decides whether LLM line-segmentation
+# may PREEMPT the canonical-recovery cascade (forced_align) after reconcile
+# aborts. Reconcile aborts on BOTH true lives AND plain whisperX mishears;
+# only the former should let LLM-segment win (the latter needs FA to recover
+# the canonical text). See pipeline._recording_diverges.
+# ─────────────────────────────────────────────────────────────────────────
+
+def _seg(text):
+    return {"start": 0.0, "end": 1.0, "text": text, "words": []}
+
+
+def test_diverges_true_for_extended_live():
+    # "Nada Fue Un Error En Vivo": the live sings the studio lyric plus repeated
+    # verses, ad-libs and a long outro → far more words than the studio lyric.
+    canonical = "Tengo una mala noticia\nNo fue de casualidad"
+    live = [
+        _seg("Tengo una mala noticia"),
+        _seg("No fue de casualidad"),
+        _seg("Y te digo los dolores nos dirigen"),
+        _seg("Para bien o para mal no pase cuando viniste"),
+        _seg("Nada fue un error nada de esto fue"),
+    ]
+    assert pipeline._recording_diverges(live, canonical) is True
+
+
+def test_diverges_false_for_misheard_studio_song():
+    # Incident "Viejas Locas — 638": reconcile aborted because whisperX MISHEARD
+    # a few words ("638" → "780465"), NOT because the recording diverges. Word
+    # count ~matches the canonical → must NOT preempt FA (which recovers 19/19).
+    canonical = "Marca el seis tres ocho\nY empece a llamarte"
+    misheard = [
+        _seg("Marca el siete ocho cero"),   # same length, wrong digits
+        _seg("Y empece y empece a llamarte"),  # one duplicated word
+    ]
+    assert pipeline._recording_diverges(misheard, canonical) is False
+
+
+def test_diverges_false_when_no_canonical():
+    # No studio lyric to recover → divergence is undefined; never preempt.
+    assert pipeline._recording_diverges([_seg("anything at all here")], "") is False
+    assert pipeline._recording_diverges([_seg("x y z")], None) is False
+
+
+def test_diverges_ratio_is_tunable():
+    canonical = "uno dos tres cuatro"          # 4 words
+    segs = [_seg("uno dos tres cuatro cinco")]  # 5 words → 1.25×
+    assert pipeline._recording_diverges(segs, canonical, ratio=1.25) is True
+    assert pipeline._recording_diverges(segs, canonical, ratio=1.5) is False

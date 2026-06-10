@@ -638,6 +638,38 @@ def on_startup():
     ).start()
     logger.info("user-sessions-cleanup thread started (TTL=90d, daily)")
 
+    # Guardia de masters ProRes stale (post-incidente 2026-06-10): un .mov
+    # en R2 más viejo que su lyric_video.mp4 = la descarga sirve un cut
+    # viejo. El fix #622 evita que se CREEN casos nuevos; este scan diario
+    # detecta cualquier reaparición (o caso legacy que se nos escapó) y
+    # alerta por Sentry ANTES de que lo descubra un cliente descargando.
+    _STALE_PRORES_SCAN_LOCK_KEY = 9118364455199105
+
+    def _stale_prores_scan_loop():
+        _time.sleep(300)  # let the API come up first
+        while True:
+            try:
+                def _do_stale_scan():
+                    from prores import scan_stale_prores
+                    scan_stale_prores(limit=300)
+                _run_with_advisory_lock(
+                    _STALE_PRORES_SCAN_LOCK_KEY, _do_stale_scan,
+                    name="stale_prores_scan",
+                )
+            except Exception:  # pragma: no cover
+                try:
+                    import sentry_sdk
+                    sentry_sdk.capture_exception()
+                except Exception:
+                    pass
+                _time.sleep(60)
+            _time.sleep(24 * 3600)  # diario
+
+    threading.Thread(
+        target=_stale_prores_scan_loop, daemon=True, name="stale-prores-scan",
+    ).start()
+    logger.info("stale-prores-scan thread started (daily)")
+
 
 # --- Background library (public, authenticated) ---
 _BACKGROUNDS_LIB = os.path.join(os.path.dirname(__file__), "..", "assets", "backgrounds", "library")
@@ -3411,12 +3443,15 @@ async def transcribe_uploaded(
         # use job_row.artist / job_row.song_title (committed at /upload-url
         # time), NOT body.artist / body.title which can diverge from the
         # row and create ghost jobs.
-        return await _run_transcription_for_job(
+        _result = await _run_transcription_for_job(
             request, current_user, job_id, audio_path,
             language=body.language,
             artist=job_row.artist or "",
             title=job_row.song_title or "",
         )
+        return await _maybe_ctc_retime(_result, audio_path, job_id,
+                                       job_row.artist or "",
+                                       job_row.song_title or "")
     finally:
         _release_transcription_slot(transcription_lease)
 
@@ -4066,11 +4101,99 @@ async def transcribe_endpoint(
     # Release the pooled connection before the long transcription (pool
     # starvation fix) — the function opens its own short-lived session.
     db.close()
-    return await _run_transcription_for_job(
+    _result = await _run_transcription_for_job(
         request, current_user, job_id, audio_path,
         language=language, artist=artist, title=title,
         filename=file.filename,
     )
+    return await _maybe_ctc_retime(_result, audio_path, job_id, artist, title)
+
+
+async def _maybe_ctc_retime(result, audio_path: str, job_id: str,
+                            artist: str = "", title: str = ""):
+    """Gated post-pass over the cascade's FINAL output (CTC_ALIGN_ENABLED,
+    default OFF): re-time every line by full-song monotonic CTC forced
+    alignment on the vocal stem (`ctc_align.py`). Texts pass through
+    verbatim — only start/end + word stamps change. Declines (returns
+    `result` untouched) on any failure, so behaviour with the flag off
+    is byte-identical.
+
+    Lives OUTSIDE `_run_transcription_for_job` on purpose: the
+    orchestrator deletes its vocal stem in its `finally`, and its exit
+    paths all funnel through `_emit_segments` (AST-guarded — adding a
+    second mutation point inside would weaken that contract). Wrapping
+    the result at the call sites re-fetches the stem via the R2 stem
+    cache (a hit — the cascade computed it seconds ago), so no second
+    demucs run is paid."""
+    _stem = None
+    try:
+        # Everything (the import too) lives inside the try: a broken
+        # ctc_align module must degrade to "no retime", never to a 500
+        # on every transcription — including with the flag OFF.
+        import ctc_align as _ctc
+        if not _ctc.is_enabled() or not isinstance(result, dict):
+            return result
+        segs = result.get("segments") or []
+        if len(segs) < 3:
+            return result
+        import vocal_sep as _vs
+        # cache_only: the cascade computed the stem seconds ago, so this
+        # is an R2 download — never a second (paid, 60-180 s, hangable)
+        # demucs run. Cascade paths that skipped vocal separation have
+        # no cached stem → decline; aligning on the mix is unvalidated.
+        _stem = await asyncio.wait_for(
+            asyncio.to_thread(_vs.separate_vocals, audio_path, cache_only=True),
+            timeout=120,
+        )
+        if not _stem:
+            logger.info("[CTC] no cached stem — skipping retime (job=%s)", job_id)
+            return result
+        retimed = await asyncio.wait_for(
+            asyncio.to_thread(_ctc.retime_segments, _stem, segs, job_id,
+                              audio_path),  # mix_path — M5 crowd recovery
+            timeout=240,
+        )
+        if (retimed is None and _ctc.last_decline_reason == "structural"
+                and os.environ.get("CTC_ALIGN_PERF_TEXT", "0").strip().lower()
+                in ("1", "true", "yes", "on")):
+            # ETAPA A — the cascade's text doesn't match what this live
+            # actually performs (extra verse/chorus repetitions, crowd
+            # variants). Transcribe THE PERFORMANCE (Gemini chunked,
+            # ~$0.03 / 60-90 s) and retime that libretto instead. Higher
+            # skip tolerance: crowd lines ARE in the libretto but
+            # invisible in the stem until M5/transplant pick them up.
+            import performance_text as _pt
+            texts = await asyncio.wait_for(
+                asyncio.to_thread(_pt.transcribe_performance, audio_path,
+                                  artist, title),
+                timeout=300,
+            )
+            if texts:
+                psegs = [{"text": t, "start": 0.0, "end": 0.0} for t in texts]
+                retimed = await asyncio.wait_for(
+                    asyncio.to_thread(_ctc.retime_segments, _stem, psegs,
+                                      job_id, audio_path, 0.5),
+                    timeout=240,
+                )
+                if retimed:
+                    logger.info("[CTC] performance-libretto retime: %d líneas "
+                                "(reemplaza el texto de la cascada, job=%s)",
+                                len(retimed), job_id)
+        if retimed:
+            result = dict(result)
+            result["segments"] = retimed
+            from jobs import set_timing_source
+            from timing_sources import CTC_ALIGN
+            set_timing_source(job_id, CTC_ALIGN)
+    except Exception as e:
+        logger.warning("[CTC] retime wrapper declined: %s (job=%s)", e, job_id)
+    finally:
+        if _stem:
+            try:
+                os.unlink(_stem)
+            except OSError:
+                pass
+    return result
 
 
 async def _run_transcription_for_job(
@@ -4593,8 +4716,29 @@ async def _run_transcription_for_job(
                         # (reconcile aborts here). Self-declining → keeps _wx_segs on
                         # any failure. Lab on "Nada Fue Un Error (En Vivo)": matches
                         # Rotor line-for-line, timing byte-identical.
-                        from pipeline import _llm_segment_words as _llm_seg
-                        _wx_segs = _llm_seg(_wx_segs, audio_path=_aa)
+                        from pipeline import (
+                            _llm_segment_words as _llm_seg,
+                            _recover_gap_lyrics as _recover_gap,
+                        )
+                        # Offloaded to a thread: these do blocking file I/O,
+                        # librosa decode + a Gemini call (up to ~90 s). Running
+                        # them inline would freeze the API event loop for the
+                        # whole job (starves /usage, /jobs — dashboard freeze),
+                        # so use to_thread like every other heavy step here.
+                        _wx_segs = await asyncio.to_thread(
+                            _llm_seg, _wx_segs, audio_path=_aa,
+                        )
+                        # Gap-recovery (GAP_RECOVERY_ENABLED, default off): whisperX
+                        # drops lyrics in loud live passages, leaving multi-second
+                        # holes (lab "Nada Fue Un Error En Vivo": an 84 s hole where
+                        # the chorus keeps going + the outro). Re-transcribe a SHORT
+                        # bounded clip at each hole's first voiced run → recovers the
+                        # real line without the long-clip hallucination loop. Runs
+                        # AFTER segmentation (already-clean lines) + self-declines.
+                        _wx_segs = await asyncio.to_thread(
+                            _recover_gap, _wx_segs,
+                            audio_path=_aa, canonical=_canonical,
+                        )
                         return _emit_segments(
                             _wx_segs, _WC_WX, reference_lyrics=_canonical,
                         )
@@ -4699,13 +4843,47 @@ async def _run_transcription_for_job(
                         # returns _wx_segs unchanged → cascade continues to FA.
                         # Gated by LLM_SEGMENT_ENABLED. (The _live_no_hint raw path
                         # above also runs it, for lives detected by duration.)
-                        from pipeline import _llm_segment_words as _llm_seg2
-                        _llm_segs = _llm_seg2(_wx_segs, audio_path=_aa)
+                        from pipeline import (
+                            _llm_segment_words as _llm_seg2,
+                            _recover_gap_lyrics as _recover_gap2,
+                            _recording_diverges as _rec_diverges,
+                            _env_float as _env_float_p,
+                        )
+                        # Reconcile aborting does NOT prove the recording diverges
+                        # from the studio lyric — plain whisperX MISHEARS trip the
+                        # same drift/coverage abort (incident "Viejas Locas — 638":
+                        # FA below recovered 19/19 canonical lines whisperX mangled).
+                        # LLM-segment's gates only compare against whisperX, never
+                        # _canonical, so it would ship those mishears and preempt FA.
+                        # Only let it win when the recording actually sings MORE than
+                        # the studio lyric (live/extended: repeated verses, ad-libs,
+                        # long outros — the "Nada" case). Otherwise fall through so
+                        # whisper-align/FA recover the canonical text.
+                        _div_ratio = _env_float_p(
+                            "LLM_SEGMENT_DIVERGENCE_RATIO", 1.25
+                        )
+                        _is_divergent = _rec_diverges(
+                            _wx_segs, _canonical, _div_ratio
+                        )
+                        _llm_segs = (
+                            await asyncio.to_thread(
+                                _llm_seg2, _wx_segs, audio_path=_aa,
+                            )
+                            if _is_divergent else _wx_segs
+                        )
                         if _llm_segs is not _wx_segs and len(_llm_segs) >= 2:
+                            # Same gap-recovery as the no-hint path: fill the
+                            # multi-second holes whisperX leaves in loud lives with
+                            # a short bounded re-transcription (default off).
+                            _llm_segs = await asyncio.to_thread(
+                                _recover_gap2, _llm_segs,
+                                audio_path=_aa, canonical=_canonical,
+                            )
                             logger.info(
-                                "[WC] reconcile aborted → LLM line-segmentation of "
-                                "whisperX (%d lines) — divergent recording, FA would "
-                                "force the wrong studio structure", len(_llm_segs))
+                                "[WC] reconcile aborted + recording diverges from "
+                                "studio lyric → LLM line-segmentation of whisperX "
+                                "(%d lines); FA would force the wrong studio "
+                                "structure", len(_llm_segs))
                             return _emit_segments(
                                 _llm_segs, _WC_WX, reference_lyrics=_canonical,
                             )
@@ -7577,10 +7755,23 @@ async def approve_job(
     job.approved_at = datetime.now(timezone.utc)
     job.review_notes = body.notes or None
 
+    # Archivado Fase 1 (2026-06-10): el éxito aprobado archiva los
+    # intentos fallidos previos del mismo audio (mismo user+filename) —
+    # dejan de ensuciar la historia sin borrarse (audit trail). Misma tx
+    # que la aprobación; best-effort: si falla, la aprobación NO se cae.
+    _archived_n = 0
+    try:
+        from jobs import archive_failed_attempts
+        _archived_n = archive_failed_attempts(db, keep_job=job)
+    except Exception as _arch_exc:
+        logger.warning("[ARCHIVE] archive_failed_attempts falló para %s: %s",
+                       job_id, _arch_exc)
+
     db.add(AuditLog(
         user_id=current_user["id"],
         action="job.approve",
-        detail={"job_id": job_id, "notes": body.notes},
+        detail={"job_id": job_id, "notes": body.notes,
+                "archived_failed_attempts": _archived_n},
     ))
     db.commit()
 
