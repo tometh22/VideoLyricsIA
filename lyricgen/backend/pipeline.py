@@ -489,6 +489,79 @@ def _best_effort_lyrics_hint(artist: str, song_title: str) -> str | None:
         return None
 
 
+def _validate_bg_cache_key(bg_cache_key, *, job_id, artist, song_title, style,
+                           movement_style, effect, custom_colors, genre,
+                           concept, background_hint, bg_verbatim, match_lyrics):
+    """Valida que el bg_cache_key del cliente corresponda a ESTE job.
+
+    Audit adversarial 2026-06-09: el key viene del CLIENTE y se usaba sin
+    validar — un key stale (el operador cambió params después del preview)
+    o directamente ajeno (otro tenant, request crafteado) servía CUALQUIER
+    fondo de bg_cache/ como si fuera de este job. Acá el servidor recomputa
+    el hash desde los params reales del job con la MISMA función que usó el
+    preview (bg_preview.compute_bg_cache_key) y descarta el key si no
+    coincide. Peor caso de un falso mismatch = generación fresh (correcta,
+    solo más lenta y ~$0.80-3.20 de Veo) — nunca un fondo equivocado.
+
+    Returns:
+        El key si coincide; None si no (o si la validación misma falla).
+    """
+    try:
+        from bg_preview import compute_bg_cache_key
+        expected = compute_bg_cache_key({
+            "artist": artist or "",
+            "song_title": song_title or "",
+            "style": style or "",
+            "movement_style": movement_style or "",
+            "effect": effect or "",
+            "custom_colors": custom_colors or "",
+            "genre": genre or "",
+            "concept": concept or "",
+            "background_hint": background_hint or "",
+            "bg_verbatim": bool(bg_verbatim),
+            # El preview siempre hashea con background_mode="veo"
+            # (App.jsx previewEntry lo hardcodea) y animate_image solo es
+            # true con custom file — caso que nunca llega al fast path
+            # (_animate_user_image lo excluye en el caller).
+            "background_mode": "veo",
+            "animate_image": False,
+            "match_lyrics": bool(match_lyrics),
+        })
+        if bg_cache_key != expected:
+            logger.warning(
+                "[BG] bg_cache_key DESCARTADO job=%s: cliente=%s esperado=%s "
+                "(params del job no coinciden con los del preview) — fondo fresh",
+                job_id, bg_cache_key, expected,
+            )
+            return None
+        return bg_cache_key
+    except Exception as exc:
+        # Best-effort: si el recompute falla, mejor generar fresh que
+        # arriesgar un fondo ajeno.
+        logger.warning("[BG] bg_cache_key validation error job=%s: %s — fondo fresh",
+                       job_id, exc)
+        return None
+
+
+def _seed_image_digest(image_path, job_id=None):
+    """sha256-16 del contenido de la imagen semilla de image-to-video.
+
+    Entra al cache key de Veo (audit adversarial 2026-06-09): sin esto, el
+    hash era prompt+model+params y omitía la imagen — mismo namespace
+    (artista|tema) + mismo prompt con DOS imágenes distintas servía el clip
+    cacheado de la otra (caso real: re-render de la misma canción cambiando
+    la foto recibía la animación de la foto anterior). Si la imagen no se
+    puede leer, devolvemos un marcador único por job para no envenenar el
+    cache compartido.
+    """
+    import hashlib as _ih
+    try:
+        with open(image_path, "rb") as _imf:
+            return _ih.sha256(_imf.read()).hexdigest()[:16]
+    except OSError:
+        return f"unreadable:{job_id or 'nojob'}"
+
+
 def run_pipeline(job_id: str, mp3_path: str, artist: str, style: str,
                  language: str = None, segments_override: list[dict] = None,
                  delivery_profile: str = "youtube", umg_spec: dict | None = None,
@@ -807,6 +880,15 @@ def run_pipeline(job_id: str, mp3_path: str, artist: str, style: str,
             # opciones después del preview, o el preview falló, o el TTL
             # de 24h del cache lo limpió), seguimos con el flow normal.
             bg_image_path = None
+            if bg_cache_key and not _animate_user_image:
+                bg_cache_key = _validate_bg_cache_key(
+                    bg_cache_key, job_id=job_id, artist=artist,
+                    song_title=song_title, style=style,
+                    movement_style=movement_style, effect=effect,
+                    custom_colors=custom_colors, genre=genre, concept=concept,
+                    background_hint=background_hint, bg_verbatim=bg_verbatim,
+                    match_lyrics=match_lyrics,
+                )
             if bg_cache_key and not _animate_user_image:
                 try:
                     from bg_preview import cache_check, cache_download
@@ -6807,6 +6889,10 @@ def _generate_veo_video(prompt: str, output_path: str, job_id: str = None,
     # Without this, all problem-songs ended up sharing one cached video
     # because the cache key was prompt-only.
     cache_params = {**veo_params, "blur_sigma": blur_sigma, "ns": cache_namespace or ""}
+    # Image-to-video: la imagen semilla entra al hash vía digest del
+    # contenido — ver _seed_image_digest para el porqué (audit 2026-06-09).
+    if image_path:
+        cache_params["img"] = _seed_image_digest(image_path, job_id)
     cache_key_hash = _veo_cache_key(safe_prompt, model, cache_params)
     cache_object_key = f"cache/veo/{cache_key_hash}.mp4"
 
