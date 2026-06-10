@@ -4148,10 +4148,15 @@ async def _maybe_ctc_retime(result, audio_path: str, job_id: str,
         if not _stem:
             logger.info("[CTC] no cached stem — skipping retime (job=%s)", job_id)
             return result
+        # Container CPU is ~4x slower than dev (measured: 165s for 49
+        # lines; 277s for a 102-line libretto with M5 windows) — 240s
+        # threw away a GOOD result 37s before it finished (job
+        # 033e3ba2ee38). Generous ceilings: this is a queue worker, not
+        # a request thread.
         retimed = await asyncio.wait_for(
             asyncio.to_thread(_ctc.retime_segments, _stem, segs, job_id,
                               audio_path),  # mix_path — M5 crowd recovery
-            timeout=240,
+            timeout=420,
         )
         if (retimed is None and _ctc.last_decline_reason == "structural"
                 and os.environ.get("CTC_ALIGN_PERF_TEXT", "0").strip().lower()
@@ -4174,7 +4179,7 @@ async def _maybe_ctc_retime(result, audio_path: str, job_id: str,
                 retimed = await asyncio.wait_for(
                     asyncio.to_thread(_ctc.retime_segments, _stem, psegs,
                                       job_id, audio_path, 0.5),
-                    timeout=240,
+                    timeout=600,
                 )
                 if retimed:
                     # Rotor-style: crowd repetitions the stem can't anchor
@@ -4191,7 +4196,7 @@ async def _maybe_ctc_retime(result, audio_path: str, job_id: str,
             from timing_sources import CTC_ALIGN
             set_timing_source(job_id, CTC_ALIGN)
     except Exception as e:
-        logger.warning("[CTC] retime wrapper declined: %s (job=%s)", e, job_id)
+        logger.warning("[CTC] retime wrapper declined: %r (job=%s)", e, job_id)
     finally:
         if _stem:
             try:
