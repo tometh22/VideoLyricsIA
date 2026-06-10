@@ -660,6 +660,9 @@ def run_pipeline(job_id: str, mp3_path: str, artist: str, style: str,
         gets a unique video off a library asset without needing a real
         video-to-video model (Veo 3.1 only supports image-to-video).
     """
+    # Observability 2026-06-10: toda línea de log de este job lleva job_id.
+    from observability import set_job_log_context
+    set_job_log_context(job_id)
     job_dir = os.path.join(OUTPUTS_DIR, job_id)
     os.makedirs(job_dir, exist_ok=True)
 
@@ -10700,6 +10703,9 @@ def run_edit_pipeline(
     After completion the job returns to "pending_review" so the reviewer
     can approve, reject, or request another edit (up to _MAX_EDITS total).
     """
+    # Observability 2026-06-10: toda línea de log de este job lleva job_id.
+    from observability import set_job_log_context
+    set_job_log_context(job_id)
     import time as _time
     from database import SessionLocal, Job as JobModel
 
