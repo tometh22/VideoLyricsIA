@@ -493,8 +493,14 @@ def condense_repeated_skips(segments: list[dict]) -> list[dict]:
                           or (p["end"] - p["start"]) < 0.3)
             if similar and unanchored:
                 p["end"] = max(p["end"], s["end"])
-                if len(s.get("text") or "") > len(p.get("text") or ""):
-                    p["text"] = s["text"]
+                # Rotor-style chained text: the block reads
+                # "Oh, nada fue un error, nada fue un error, nada fue un
+                # error" — each real repetition written out, capped so a
+                # crowd chanting 8x doesn't produce a monster line.
+                st = (s.get("text") or "").strip()
+                chained = f"{p['text']}, {st[:1].lower() + st[1:]}" if st else p["text"]
+                if len(chained) <= 90:
+                    p["text"] = chained
                 p["ctc_condensed"] = p.get("ctc_condensed", 1) + 1
                 p.pop("ctc_skipped", None)
                 continue

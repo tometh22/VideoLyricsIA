@@ -303,9 +303,11 @@ def test_condense_repeated_skips_rotor_style():
         {"text": "¡Dos! ¡One, two, three, va!", "start": 76.6, "end": 78.8, "ctc_skipped": True},
     ]
     out = ctc_align.condense_repeated_skips(segs)
-    low = [s["text"].lower() for s in out]
-    assert low.count("nada de esto fue un error") == 1
-    merged = next(s for s in out if s["text"].lower() == "nada de esto fue un error")
+    merged = next(s for s in out if s.get("ctc_condensed"))
+    # Rotor-style chained text: repetitions written out in ONE block line
+    assert merged["text"].lower().count("nada de esto fue un error") >= 2
     assert merged.get("ctc_condensed", 0) >= 2 and merged["end"] >= 76.1
+    # only one condensed block for the repetition run
+    assert sum(1 for s in out if "esto fue un error" in s["text"].lower()) == 1
     assert "Nada fue un error" in [s["text"] for s in out]
     assert "No me niegues que me buscaste" in [s["text"] for s in out]
