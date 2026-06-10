@@ -390,6 +390,13 @@ class Job(Base):
     approved_at = Column(DateTime(timezone=True), nullable=True)
     review_notes = Column(Text, nullable=True)
 
+    # Archivado de intentos fallidos (2026-06-10, Fase 1). Cuando un job
+    # del mismo user+filename llega a `done`, los intentos previos
+    # fallidos (error / rejected / validation_failed / transcription_
+    # failed) se marcan aca — NUNCA se borran (audit trail UMG). La
+    # historia los esconde por default detras de un toggle. NULL = visible.
+    archived_at = Column(DateTime(timezone=True), nullable=True)
+
     # Edit requests (post-approval partial re-renders)
     # segments_json — persisted Whisper output so re-renders skip re-transcription.
     # render_params  — font/typography/motion settings used at render time.
@@ -518,6 +525,8 @@ class Job(Base):
             # para evitar lazy load N+1.
             "parent_job_id": self.parent_job_id,
             "created_at": self.created_at.timestamp() if self.created_at else None,
+            # Archivado Fase 1: la historia esconde archived por default.
+            "archived_at": self.archived_at.timestamp() if self.archived_at else None,
         }
 
 
