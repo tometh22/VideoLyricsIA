@@ -504,3 +504,84 @@ def check_prores_readiness(
         retry_after_seconds=60,
         detail="ProRes transcode queued; please retry in ~60 seconds.",
     )
+
+
+def scan_stale_prores(limit: int = 300) -> list[dict]:
+    """Detecta masters ProRes más viejos que su MP4 fuente (drift de cache).
+
+    Guardia post-incidente 2026-06-10: los edits previos al fix de
+    invalidación (#622) dejaron 15 masters stale latentes que solo se
+    descubrieron cuando una operadora de universal_argentina descargó
+    uno. Este scan es la versión automática de la auditoría manual de
+    ese día: si un .mov en R2 es más viejo que el lyric_video.mp4 del
+    que debería derivar, la descarga va a servir un cut viejo.
+
+    Solo LECTURA (head_object x2 por job con ambos keys). El remediador
+    es scripts/fix_stale_prores.py --apply --rewarm por cada job_id
+    reportado.
+
+    Returns:
+        Lista de dicts {job_id, tenant_id, lag_seconds} — vacía si todo
+        está fresco.
+    """
+    from database import SessionLocal, Job
+    import storage as _storage
+
+    if not _storage.is_enabled():
+        return []
+    client = _storage._get_client()
+    if client is None:
+        return []
+
+    stale: list[dict] = []
+    db = SessionLocal()
+    try:
+        jobs = (
+            db.query(Job)
+            .filter(Job.s3_keys.isnot(None))
+            .order_by(Job.created_at.desc())
+            .limit(limit)
+            .all()
+        )
+        for j in jobs:
+            s3 = j.s3_keys or {}
+            master_key = s3.get("umg_master")
+            video_key = s3.get("video")
+            if not master_key or not video_key:
+                continue
+            try:
+                m = client.head_object(Bucket=_storage.R2_BUCKET, Key=master_key)["LastModified"]
+                v = client.head_object(Bucket=_storage.R2_BUCKET, Key=video_key)["LastModified"]
+            except Exception:
+                # Objeto borrado/permiso/red — no es señal de staleness.
+                continue
+            if m < v:
+                stale.append({
+                    "job_id": j.job_id,
+                    "tenant_id": j.tenant_id,
+                    "lag_seconds": int((v - m).total_seconds()),
+                })
+    finally:
+        db.close()
+
+    if stale:
+        logger.warning(
+            "[PRORES][STALE-SCAN] %d master(s) más viejos que su MP4: %s",
+            len(stale), ", ".join(s["job_id"] for s in stale),
+        )
+        # Sentry con fingerprint estable (estilo #630): UN issue agrupado
+        # cuyo event count crece — las alert rules disparan por frecuencia.
+        try:
+            import sentry_sdk
+            with sentry_sdk.push_scope() as _scope:
+                _scope.fingerprint = ["stale-prores-scan"]
+                _scope.set_extra("stale_jobs", stale[:50])
+                _scope.set_extra("count", len(stale))
+                sentry_sdk.capture_message(
+                    f"[PRORES][STALE-SCAN] {len(stale)} master(s) stale — "
+                    "remediar con scripts/fix_stale_prores.py",
+                    level="error",
+                )
+        except Exception:
+            pass
+    return stale

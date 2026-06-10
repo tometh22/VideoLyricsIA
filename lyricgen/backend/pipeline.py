@@ -7375,6 +7375,83 @@ def _extract_frame_from_video(video_path: str, output_image_path: str) -> str:
     return output_image_path
 
 
+# Umbral del detector de corte de escena. Calibrado 2026-06-10 con los
+# clips REALES del incidente del mural (universal_argentina): los morphs
+# contaminados (mural→café, mural→bosque) midieron 0.261-0.270; los clips
+# sanos (café text-to-video, café edit, mural estático) midieron
+# 0.004-0.059. 0.18 deja 3x de margen contra falsos positivos (un retry
+# innecesario cuesta ~$0.80-3.20 de Veo) y 1.4x contra falsos negativos.
+_BG_SCENE_CUT_THRESHOLD = float(os.environ.get("BG_SCENE_CUT_THRESHOLD", "0.18"))
+
+
+def _frame_pair_discontinuity(frame_a, frame_b) -> float:
+    """Núcleo puro del detector: distancia entre dos frames RGB (0.0-1.0).
+
+    Métrica: 0.5 * MAE de píxeles (downsampleado 8x) + 0.5 * distancia
+    de variación total de histogramas RGB (16 bins). El histograma
+    aguanta movimiento de cámara/gente (escena igual, píxeles corridos);
+    el MAE aguanta paletas parecidas con contenido distinto.
+    """
+    import numpy as _np
+    a = _np.asarray(frame_a, dtype="float32")[::8, ::8]
+    b = _np.asarray(frame_b, dtype="float32")[::8, ::8]
+    mae = float(_np.mean(_np.abs(a - b))) / 255.0
+    hist_d = 0.0
+    for c in range(3):
+        ha, _ = _np.histogram(a[..., c], bins=16, range=(0, 255))
+        hb, _ = _np.histogram(b[..., c], bins=16, range=(0, 255))
+        ha = ha / max(1, ha.sum())
+        hb = hb / max(1, hb.sum())
+        hist_d += float(_np.abs(ha - hb).sum()) / 2.0
+    return 0.5 * mae + 0.5 * (hist_d / 3.0)
+
+
+def _bg_scene_discontinuity(video_path: str) -> float:
+    """Mide si el clip de fondo contiene un cambio de escena (0.0-1.0).
+
+    Incidente 2026-06-09 (mural de Bersuit): Veo image-to-video con una
+    semilla que no matchea el prompt devuelve un clip que ARRANCA en la
+    semilla y morphea hacia el prompt — dos escenas en 8s que el loop
+    palindrómico repite todo el video. El único QA previo era el
+    relevance score sobre UN frame (t=4s), ciego al corte. Acá
+    comparamos el primer y el último frame del clip: si son escenas
+    distintas, el clip no sirve como fondo loopeable.
+
+    Extracción vía ffmpeg subprocess (no moviepy): más liviano que abrir
+    un VideoFileClip y testeable con el stub de moviepy del conftest.
+
+    Fail-open: ante cualquier error devuelve 0.0 — un bug acá jamás
+    debe bloquear un fondo bueno (mismo contrato que el relevance score).
+    """
+    try:
+        from PIL import Image as _Img
+
+        def _grab(out_png: str, seek: list[str]):
+            run_checked(
+                ["ffmpeg", "-y", "-loglevel", "error", *seek,
+                 "-i", video_path, "-frames:v", "1", out_png],
+                label="ffmpeg-scene-cut-frame",
+                timeout=60,
+                output_path=out_png,
+            )
+            with _Img.open(out_png) as im:
+                return im.convert("RGB").copy()
+
+        base = video_path + ".scenecut"
+        first = _grab(base + "_a.png", ["-ss", "0.05"])
+        # sseof busca desde el final — no necesitamos conocer la duración.
+        last = _grab(base + "_b.png", ["-sseof", "-0.3"])
+        for _p in (base + "_a.png", base + "_b.png"):
+            try:
+                os.unlink(_p)
+            except OSError:
+                pass
+        return _frame_pair_discontinuity(first, last)
+    except Exception as e:
+        logger.warning("[BG][SCENE-CUT] check failed (fail-open): %s", e)
+        return 0.0
+
+
 def _score_video_relevance(video_path: str, prompt: str) -> int:
     """Ask Gemini Vision whether the video matches the intended scene prompt.
 
@@ -7711,14 +7788,28 @@ def _ensure_background(style_hint: str, job_dir: str, lyrics_text: str = None,
             # result is also evaluated before we accept and return it.
             score = _score_video_relevance(bg_path, prompt)
             logger.info("[BG] Relevance score: %s/10 for prompt: %s...", score, prompt[:60])
+            # Detector de corte de escena (incidente mural 2026-06-09):
+            # un clip cuyo primer y último frame son escenas distintas
+            # produce un fondo que alterna escenas todo el video al
+            # loopearse. El relevance score no lo ve (mira UN frame).
+            discont = _bg_scene_discontinuity(bg_path)
+            if discont >= _BG_SCENE_CUT_THRESHOLD:
+                logger.warning(
+                    "[BG][SCENE-CUT] discontinuidad %.3f >= %.2f en %s (job=%s) — "
+                    "el clip contiene un cambio de escena",
+                    discont, _BG_SCENE_CUT_THRESHOLD,
+                    os.path.basename(bg_path), job_id,
+                )
             # Verbatim: never re-roll. A re-roll re-runs _get_unique_prompt
             # which short-circuits to the SAME verbatim text → identical
             # safe_prompt → Veo cache HIT → same clip, wasting a scoring pass
             # and never improving. The operator asked for their exact prompt;
             # we accept the first result and just log the score.
-            if score < 7 and not quality_retry_used and not bg_verbatim:
+            _needs_retry = (score < 7) or (discont >= _BG_SCENE_CUT_THRESHOLD)
+            if _needs_retry and not quality_retry_used and not bg_verbatim:
                 quality_retry_used = True
-                logger.info("[BG] Score %s < 7 — generating new prompt and retrying VEO", score)
+                logger.info("[BG] Score %s / discontinuidad %.3f — generating new prompt and retrying VEO",
+                            score, discont)
                 # Propagate background_hint into the quality retry. Without it,
                 # Gemini regenerates from lyrics/genre alone and the operator's
                 # explicit guidance is silently dropped — the same input that
@@ -7738,6 +7829,29 @@ def _ensure_background(style_hint: str, job_dir: str, lyrics_text: str = None,
                 continue
             if score < 7:
                 logger.warning("[BG] Score %s < 7 after retry — accepting best available result", score)
+            if discont >= _BG_SCENE_CUT_THRESHOLD:
+                # Aceptamos igual (fail-open: bloquear el render es peor que
+                # un fondo feo que la review humana atrapa), pero el operador
+                # se entera por Sentry ANTES de que lo vea el cliente.
+                # Fingerprint estable (estilo #630): un issue agrupado, no
+                # uno por job.
+                logger.warning(
+                    "[BG][SCENE-CUT] aceptando clip con discontinuidad %.3f tras retry (job=%s) — revisar antes de aprobar",
+                    discont, job_id,
+                )
+                try:
+                    import sentry_sdk
+                    with sentry_sdk.push_scope() as _scope:
+                        _scope.fingerprint = ["bg-scene-cut"]
+                        _scope.set_tag("job_id", job_id or "unknown")
+                        _scope.set_extra("discontinuity", discont)
+                        _scope.set_extra("prompt", (prompt or "")[:200])
+                        sentry_sdk.capture_message(
+                            "[BG][SCENE-CUT] fondo con cambio de escena aceptado tras retry",
+                            level="warning",
+                        )
+                except Exception:
+                    pass
             return bg_path
         except _JobTimeoutException:
             # Real RQ death-penalty timeout — propagate (don't degrade to
