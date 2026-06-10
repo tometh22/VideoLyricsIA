@@ -646,6 +646,7 @@ export const translations = {
 
     // History
     "history.title": "Historial",
+    "history.archived": "Archivados",
     "history.videos": "videos",
     "history.empty": "No hay videos en el historial",
     "history.loading": "Cargando historial…",
@@ -1839,6 +1840,7 @@ export const translations = {
     "ready.cancel": "Cancel",
 
     "history.title": "History",
+    "history.archived": "Archived",
     "history.videos": "videos",
     "history.empty": "No videos in history",
     "history.loading": "Loading history…",
@@ -2796,6 +2798,7 @@ export const translations = {
     "ready.cancel": "Cancelar",
 
     "history.title": "Histórico",
+    "history.archived": "Arquivados",
     "history.videos": "vídeos",
     "history.empty": "Não há vídeos no histórico",
     "history.done": "Pronto",

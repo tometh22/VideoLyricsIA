@@ -7694,10 +7694,23 @@ async def approve_job(
     job.approved_at = datetime.now(timezone.utc)
     job.review_notes = body.notes or None
 
+    # Archivado Fase 1 (2026-06-10): el éxito aprobado archiva los
+    # intentos fallidos previos del mismo audio (mismo user+filename) —
+    # dejan de ensuciar la historia sin borrarse (audit trail). Misma tx
+    # que la aprobación; best-effort: si falla, la aprobación NO se cae.
+    _archived_n = 0
+    try:
+        from jobs import archive_failed_attempts
+        _archived_n = archive_failed_attempts(db, keep_job=job)
+    except Exception as _arch_exc:
+        logger.warning("[ARCHIVE] archive_failed_attempts falló para %s: %s",
+                       job_id, _arch_exc)
+
     db.add(AuditLog(
         user_id=current_user["id"],
         action="job.approve",
-        detail={"job_id": job_id, "notes": body.notes},
+        detail={"job_id": job_id, "notes": body.notes,
+                "archived_failed_attempts": _archived_n},
     ))
     db.commit()
 

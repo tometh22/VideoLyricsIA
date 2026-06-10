@@ -686,6 +686,8 @@ export default function HistoryView({
   const { t } = useI18n();
   const navigate = useNavigate();
   const [filter, setFilter] = useState("all");
+  // Archivado Fase 1: ver intentos fallidos archivados (default oculto).
+  const [showArchived, setShowArchived] = useState(false);
   const [selectedIds, setSelectedIds] = useState(() => new Set());
   // 2026-05-25 PR-3 — Estado nuevo: search query (inline), sort key,
   // view toggle (table|grid). View y sort persisten en localStorage para
@@ -744,9 +746,22 @@ export default function HistoryView({
     () => new Set(["bg_preview_queued", "bg_preview_done", "bg_preview_failed"]),
     [],
   );
-  const realHistory = useMemo(
+  const nonGhostHistory = useMemo(
     () => history.filter((j) => !GHOST_STATUSES.has(j.status)),
     [history, GHOST_STATUSES],
+  );
+
+  // Archivado Fase 1 (2026-06-10): los intentos fallidos previos de un
+  // audio que después salió `done` vienen con archived_at seteado (el
+  // backend los marca al aprobar — nunca los borra). Por default no se
+  // muestran; el toggle los trae de vuelta para auditoría.
+  const archivedCount = useMemo(
+    () => nonGhostHistory.filter((j) => j.archived_at).length,
+    [nonGhostHistory],
+  );
+  const realHistory = useMemo(
+    () => (showArchived ? nonGhostHistory : nonGhostHistory.filter((j) => !j.archived_at)),
+    [nonGhostHistory, showArchived],
   );
 
   const counts = useMemo(() => {
@@ -769,7 +784,7 @@ export default function HistoryView({
       });
     }
     return sortJobs(filtered, sortKey);
-  }, [history, filter, query, sortKey]);
+  }, [realHistory, filter, query, sortKey]);
 
   // Buckets temporales — solo para vista tabla con date groups.
   // En grid mantenemos lista plana para no quebrar el flow visual.
@@ -970,6 +985,15 @@ export default function HistoryView({
               {f.label}
             </FilterPill>
           ))}
+          {archivedCount > 0 && (
+            <FilterPill
+              active={showArchived}
+              count={archivedCount}
+              onClick={() => setShowArchived((v) => !v)}
+            >
+              {t("history.archived") || "Archivados"}
+            </FilterPill>
+          )}
         </div>
       )}
 
