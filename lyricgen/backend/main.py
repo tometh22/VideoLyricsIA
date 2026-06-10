@@ -4177,6 +4177,10 @@ async def _maybe_ctc_retime(result, audio_path: str, job_id: str,
                     timeout=240,
                 )
                 if retimed:
+                    # Rotor-style: crowd repetitions the stem can't anchor
+                    # individually condense into one block line; leftover
+                    # unplaced lines drop instead of stacking.
+                    retimed = _ctc.condense_repeated_skips(retimed)
                     logger.info("[CTC] performance-libretto retime: %d líneas "
                                 "(reemplaza el texto de la cascada, job=%s)",
                                 len(retimed), job_id)
