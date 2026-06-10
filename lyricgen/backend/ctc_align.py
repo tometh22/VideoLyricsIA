@@ -436,6 +436,37 @@ def repair_bridge_words(line_times, regions=None):
     return fixed
 
 
+def place_unaligned(line_times, originals, total_dur: float, slack: float = 4.0):
+    """Place lines the engine could NOT time (skipped / unalignable).
+
+    Spreading them evenly over the hole (the v1 behaviour) looks
+    DISASTROUS in the real video: each chorus line sits frozen 15-20 s in
+    the wrong place (staging job 8be12628e28b). The cascade's original
+    timing for those lines — whisperX heard the chorus roughly right — is
+    a far better prior: use it whenever it falls inside the hole (±slack),
+    clamped to the anchored neighbours. Fall back to the spread only when
+    the original is missing/implausible. `originals` = [(start,end)|None]
+    per line. Pure."""
+    out = list(line_times)
+    for i, lt in enumerate(out):
+        if lt is not None:
+            continue
+        prev_end = next((out[j][1] for j in range(i - 1, -1, -1)
+                         if out[j] is not None), 0.0)
+        nxt_start = next((out[j][0] for j in range(i + 1, len(out))
+                          if out[j] is not None), total_dur)
+        o = originals[i] if i < len(originals) else None
+        if (o and o[1] > o[0] > 0
+                and prev_end - slack <= o[0] <= nxt_start + slack):
+            hi = max(nxt_start, prev_end + 0.4)
+            s = min(max(o[0], prev_end), hi - 0.2)
+            e = max(min(o[1], hi), s + 0.2)
+            out[i] = (s, e, [])
+        else:
+            out[i] = (prev_end, max(prev_end, nxt_start), [])
+    return out
+
+
 def looks_collapsed(line_times, min_dur_s: float = 0.15,
                     max_collapsed_frac: float = 0.25) -> bool:
     """Structural failure guard: when alignment fails (wrong language,
@@ -681,15 +712,13 @@ def retime_segments(audio_path: str, segments: list[dict],
                             job_id)
                 skipped_lines -= recovered_lines
 
-        # Interpolate lines whose words were all unalignable (numbers,
-        # emoji): midpoint between neighbours keeps monotonic order.
-        for i, lt in enumerate(line_times):
-            if lt is None:
-                prev_end = next((line_times[j][1] for j in range(i - 1, -1, -1)
-                                 if line_times[j]), 0.0)
-                nxt_start = next((line_times[j][0] for j in range(i + 1, len(line_times))
-                                  if line_times[j]), dur)
-                line_times[i] = (prev_end, max(prev_end, nxt_start), [])
+        # Lines the engine could not time (skipped / unalignable words):
+        # prefer the CASCADE's original timing inside the hole over a
+        # blind spread — see place_unaligned's docstring (staging lesson).
+        originals = [((float(s.get("start") or 0), float(s.get("end") or 0))
+                      if s.get("start") is not None else None)
+                     for s in segments]
+        line_times = place_unaligned(line_times, originals, dur)
 
         # Per-line confidence as a LIKELIHOOD-RATIO vs the star: how much
         # better does this line explain its span than "unlabeled singing"?
