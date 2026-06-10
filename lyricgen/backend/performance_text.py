@@ -80,6 +80,50 @@ def parse_ts_line(line: str):
     return rel, text
 
 
+def drop_phantom_intro(rows: list[tuple[float, str]],
+                       min_gap_s: float = 12.0) -> list[tuple[float, str]]:
+    """Operator-reported (staging, Nada Fue): at 0:00 the crowd faintly
+    pre-sings the chorus and Gemini transcribes it — a line isolated
+    >12 s before the song's body, whose text repeats later (it IS the
+    chorus). Rotor doesn't show it; neither do we. Pure."""
+    while len(rows) >= 2 and rows[1][0] - rows[0][0] > min_gap_s:
+        n0 = _norm(rows[0][1])
+        if any(n0 in _norm(t) or _norm(t) in n0 for _, t in rows[1:]):
+            rows = rows[1:]
+            continue
+        break
+    return rows
+
+
+def drop_hallucinated_lines(texts: list[str], reference: str,
+                            min_words: int = 6,
+                            min_overlap: float = 0.35) -> list[str]:
+    """Operator-reported: Gemini INVENTED a plausible verse ('el error es
+    todo lo que no hicimos por temor') that is never sung. Long
+    lyric-like lines (>= min_words) whose content words barely appear in
+    the reference lyrics are hallucinations → drop. Short lines and
+    ad-libs ('¡Mirá dónde estamos, papá!') stay — show moments are
+    real and wanted even though the reference doesn't list them. Pure."""
+    if not reference:
+        return texts
+    ref_vocab = {w for w in re.findall(r"[a-záéíóúñü']+", reference.lower())
+                 if len(w) > 3}
+    if len(ref_vocab) < 10:
+        return texts
+    out = []
+    for t in texts:
+        words = [w for w in re.findall(r"[a-záéíóúñü']+", t.lower())
+                 if len(w) > 3]
+        if len(t.split()) >= min_words and words:
+            overlap = sum(1 for w in words if w in ref_vocab) / len(words)
+            if overlap < min_overlap:
+                logger.info("[PERF-TEXT] drop alucinación (overlap %.0f%%): %s",
+                            100 * overlap, t[:60])
+                continue
+        out.append(t)
+    return out
+
+
 def clean_libretto(items: list[tuple[float, str]]) -> list[str]:
     """Window-seam artifacts → ordered clean line texts. Drops stage
     directions / pure-vocal intros / chatter / counts; strips
@@ -101,10 +145,12 @@ def clean_libretto(items: list[tuple[float, str]]) -> list[str]:
         merged = False
         for j in range(len(rows) - 1, -1, -1):
             pts, pt = rows[j]
-            if ts - pts > 6.0:
+            # 10 s window / 0.80 ratio: a seam duplicate slipped through at
+            # 6 s / 0.85 (operator-reported: "aprendí la diferencia" ×2)
+            if ts - pts > 10.0:
                 break
             pn = _norm(pt)
-            if n in pn or SequenceMatcher(None, n, pn).ratio() >= 0.85:
+            if n in pn or SequenceMatcher(None, n, pn).ratio() >= 0.80:
                 merged = True
                 break
             if pn in n:
@@ -113,14 +159,17 @@ def clean_libretto(items: list[tuple[float, str]]) -> list[str]:
                 break
         if not merged:
             rows.append((ts, t))
-    # phantom intro: pure-vocal lines before the first lexical line
+    # pure-vocal lines before the first lexical line
     first = next((i for i, (_, t) in enumerate(rows)
                   if not _PURE_VOCAL.match(t)), 0)
-    return [t for _, t in rows[first:]]
+    rows = rows[first:]
+    rows = drop_phantom_intro(rows)
+    return [t for _, t in rows]
 
 
 def transcribe_performance(audio_path: str, artist: str = "",
-                           title: str = "") -> list[str] | None:
+                           title: str = "",
+                           reference: str = "") -> list[str] | None:
     """Ordered line texts of what THIS audio performs. None on any
     failure (caller falls back). Cost ~$0.02-0.05/song, ~60-90 s."""
     try:
@@ -176,6 +225,7 @@ def transcribe_performance(audio_path: str, artist: str = "",
                                            c1 - c0), text))
             t += CHUNK_S - OVERLAP_S
         out = clean_libretto(items)
+        out = drop_hallucinated_lines(out, reference)
         logger.info("[PERF-TEXT] libreto: %d líneas de %.0fs de audio (%s)",
                     len(out), dur, MODEL)
         return out if len(out) >= 8 else None

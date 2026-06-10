@@ -4165,7 +4165,8 @@ async def _maybe_ctc_retime(result, audio_path: str, job_id: str,
             import performance_text as _pt
             texts = await asyncio.wait_for(
                 asyncio.to_thread(_pt.transcribe_performance, audio_path,
-                                  artist, title),
+                                  artist, title,
+                                  result.get("reference_lyrics") or ""),
                 timeout=300,
             )
             if texts:

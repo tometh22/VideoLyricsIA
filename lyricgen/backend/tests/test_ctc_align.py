@@ -250,3 +250,26 @@ def test_perf_text_label_leaks_from_staging():
              (50.0, "No fue de casualidad")]
     assert pt.clean_libretto(items) == ["Tengo una mala noticia",
                                         "No fue de casualidad"]
+
+
+def test_perf_text_phantom_intro_and_hallucination():
+    """Operator report (staging, Nada Fue): crowd pre-sings the chorus at
+    0:00 (isolated 39s before the body) and Gemini invented a verse that
+    is never sung."""
+    import performance_text as pt
+    rows = [(0.5, "Nada de esto fue un error"),
+            (39.6, "Tengo una mala noticia"),
+            (42.9, "No fue de casualidad"),
+            (75.0, "Nada de esto fue un error")]
+    out = pt.drop_phantom_intro(rows)
+    assert out[0][1] == "Tengo una mala noticia"
+
+    ref = "tengo una mala noticia no fue de casualidad quería que nos " \
+          "pasara dejaste pasar perdones perdón niegues buscaste errores " \
+          "eligen diferencia juego azar entrega"
+    texts = ["Tengo una mala noticia",
+             "El error es todo lo que no hicimos por temor",  # hallucinated
+             "¡Mirá dónde estamos, papá!"]                    # ad-lib: keep
+    out2 = pt.drop_hallucinated_lines(texts, ref)
+    assert "El error es todo lo que no hicimos por temor" not in out2
+    assert "¡Mirá dónde estamos, papá!" in out2
