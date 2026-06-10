@@ -114,6 +114,27 @@ def test_repair_bridge_no_op_on_healthy_lines():
     assert out == [(10.0, 11.4, ws)]
 
 
+def test_guess_text_lang():
+    es = ["No quiero que me perdones", "Y no me pidas perdón",
+          "Yo quería que nos pasara", "Para bien o para mal"]
+    en = ["I want it I got it", "You like my hair gee thanks just bought it",
+          "Ain't got enough money to pay me respect", "Look at my neck"]
+    assert ctc_align.guess_text_lang(es) == "es"
+    assert ctc_align.guess_text_lang(en) == "en"
+    assert ctc_align.guess_text_lang(["la"]) == "unknown"
+
+
+def test_retime_declines_on_english_text(monkeypatch, tmp_path):
+    """The English guard fires BEFORE any audio/model work."""
+    monkeypatch.setenv("CTC_ALIGN_ENABLED", "1")
+    f = tmp_path / "a.wav"
+    f.write_bytes(b"RIFF")
+    segs = [{"text": t, "start": 0, "end": 0} for t in
+            ["I want it I got it", "You like my hair gee thanks",
+             "Just bought it yeah", "And I want it I got it"]]
+    assert ctc_align.retime_segments(str(f), segs) is None
+
+
 def test_looks_collapsed_detects_crammed_alignment():
     ok = [(0.0, 2.0, []), (3.0, 5.0, []), (6.0, 8.0, [])]
     assert not ctc_align.looks_collapsed(ok)
