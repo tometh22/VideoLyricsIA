@@ -243,6 +243,60 @@ def set_timing_source(job_id: str, source: str) -> None:
         _logger.warning("[TIMING] set_timing_source failed for %s: %s", job_id, e)
 
 
+# Estados terminales que cuentan como "intento fallido" para el archivado.
+# `done` y `pending_review` quedan AFUERA siempre: son entregables o trabajo
+# en revisión — jamás se archivan automáticamente.
+_ARCHIVABLE_FAILED_STATUSES = (
+    "error", "rejected", "validation_failed", "transcription_failed",
+)
+
+
+def archive_failed_attempts(db: Session, *, keep_job) -> int:
+    """Marca archived_at en los intentos FALLIDOS previos del mismo audio.
+
+    Fase 1 (2026-06-10): identidad = user_id + tenant_id + filename exacto.
+    (Fase 2 prevista: identidad por hash de contenido del audio, calculado
+    por el worker — cubre renombres tipo "Catupecu" vs "Catupecu Machu".)
+
+    Se invoca cuando `keep_job` llega a `done` (aprobación del operador):
+    los reintentos fallidos que llevaron a ese éxito dejan de ensuciar la
+    historia. A diferencia de supersede_sibling_drafts, acá NO se borra
+    nada — audit trail UMG intacto, el cliente los ve con el toggle
+    "mostrar archivados".
+
+    Reglas:
+      - Solo estados de _ARCHIVABLE_FAILED_STATUSES.
+      - Solo intentos ANTERIORES (created_at < keep_job.created_at): un
+        fallo posterior al éxito es información nueva, no ruido.
+      - Idempotente: archived_at IS NULL filtra los ya archivados.
+
+    Returns: cantidad de filas archivadas. El caller commitea (misma tx
+    que la aprobación, así un rollback no deja estados a medias).
+    """
+    if not keep_job or not keep_job.filename:
+        return 0
+    now = datetime.now(timezone.utc)
+    siblings = (
+        db.query(Job)
+        .filter(Job.user_id == keep_job.user_id,
+                Job.tenant_id == keep_job.tenant_id)
+        .filter(Job.job_id != keep_job.job_id)
+        .filter(Job.filename == keep_job.filename)
+        .filter(Job.status.in_(_ARCHIVABLE_FAILED_STATUSES))
+        .filter(Job.archived_at.is_(None))
+        .filter(Job.created_at < keep_job.created_at)
+        .all()
+    )
+    for sib in siblings:
+        sib.archived_at = now
+    if siblings:
+        logging.getLogger("genly").info(
+            "[ARCHIVE] %s intento(s) fallido(s) archivados bajo %s (%r)",
+            len(siblings), keep_job.job_id, keep_job.filename,
+        )
+    return len(siblings)
+
+
 def supersede_sibling_drafts(
     db: Session, *, keep_job_id: str, user_id: int, tenant_id: str,
     filename: str, window_min: int = 20,
