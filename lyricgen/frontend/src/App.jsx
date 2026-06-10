@@ -41,6 +41,7 @@ import HelpButton from "./components/HelpCenter/HelpButton";
 import { useBackgroundPreview } from "./hooks/useBackgroundPreview";
 import { useMediaUrl, clearMediaCache } from "./mediaUrl";
 import { translateBackendError } from "./lib/lyricsEditSubmit";
+import { mergeEditedSegments } from "./lib/reviewSegments";
 import { appendBackgroundFields } from "./lib/bgPayload";
 import { computeFieldDiff, buildEditPayloads } from "./lib/editWizardDiff";
 import { prefetchKey } from "./lib/prefetchKey";
@@ -2466,27 +2467,20 @@ export default function App() {
           status: res.status,
         };
       }
-      // Bug-fix 2026-05-26 (PR A timeline-drag-persists): tras POST exitoso,
-      // propagar los segments recién persistidos a currentReview. Sin esto,
-      // cualquier re-render del padre que pase un array nuevo de segments
-      // (rehydrate desde sessionStorage, drift-sync de typography, polling)
-      // dispara el useEffect de prop-sync en LyricsEditor.jsx:440-448 que
-      // reescribe `edited` con datos viejos. Los drags del timeline (que ya
-      // viven en backend) "vuelven a su lugar" visualmente. Reportado por
-      // operador con un caso reproducible en producción.
-      //
-      // El backend retorna { ok, job_id, saved_at, count } (no eco de
-      // segments), así que usamos el array que enviamos como source of truth.
-      // Match contra ambos paths: wizard pre-render usa transcribeJobId,
-      // editor post-render (EditLyricsRoute) usa editingJobId.
-      console.warn("[drag-persist] POST 200, propagating to currentReview", { jobId });
-      setCurrentReview((prev) => {
-        if (!prev) return prev;
-        const matchesWizard = prev.transcribeJobId === jobId;
-        const matchesEditor = prev.editingJobId === jobId;
-        if (!matchesWizard && !matchesEditor) return prev;
-        return { ...prev, segments };
-      });
+      // Auditoría 2026-06-10 (reporte operadora "se mueve y pierde
+      // cambios"): acá vivía el ECO del autosave — tras el 200,
+      // setCurrentReview({...prev, segments}) escribía de vuelta el
+      // snapshot ENVIADO. Cuando se agregó (2026-05-26) era la única
+      // forma de mantener currentReview al día; desde que el mirror
+      // sincrónico onEditedChange (handleEditedChange) propaga CADA
+      // edición al instante, el eco solo puede ser igual o MÁS VIEJO
+      // que currentReview. Si la operadora editaba mientras el POST
+      // volaba, el eco pisaba esas ediciones y el prop-sync de
+      // LyricsEditor reseedeaba `edited` hacia atrás: snap-back visual
+      // ("empieza como a moverse"), drag en curso muerto (las _id se
+      // reasignan y React remonta el bloque) y, con POSTs fuera de
+      // orden o un unmount de por medio, pérdida real de trabajo.
+      // El eco se ELIMINA: el mirror es la única fuente de frescura.
       return { ok: true };
     } catch (err) {
       console.warn("[autosave] /save-segments network error", err);
@@ -3055,6 +3049,21 @@ export default function App() {
   //     so it can be re-approved.
   //   - canción 1 (no approved yet) → /new with files[] still intact.
   // Distinct from handleReset (which discards the whole batch).
+  // Mirror sincrónico editor → currentReview. Auditoría 2026-06-10: la
+  // versión anterior era un arrow INLINE en el JSX — identidad nueva en
+  // cada render de App. Como LyricsEditor lo tiene en las deps de su
+  // effect espejo, cada render re-corría el effect → setCurrentReview con
+  // objeto nuevo → otro render de App → loop perpetuo (confirmado
+  // empíricamente: ~5000 ciclos/100ms). El loop saturaba el main thread
+  // (drags y taps caían en frames perdidos — parte del "se mueve y no me
+  // deja"), ensanchaba la ventana de la race del autosave y cancelaba en
+  // cada ciclo el requestIdleCallback de wizardPersistence.save.
+  // Dos cortes: identidad estable (useCallback) + no-op cuando los
+  // valores no cambiaron (devolver el MISMO objeto corta el re-render).
+  const handleEditedChange = useCallback((segs) => {
+    setCurrentReview((r) => mergeEditedSegments(r, segs));
+  }, []);
+
   const handleBackInReview = () => {
     if (approvedJobs.length > 0) {
       const last = approvedJobs[approvedJobs.length - 1];
@@ -3062,6 +3071,13 @@ export default function App() {
       setCurrentReview({
         file: last.file,
         artist: last.artist,
+        // Auditoría 2026-06-10: SIN transcribeJobId el autosave del editor
+        // queda mudo (guard en LyricsEditor: no persiste sin jobId) — todo
+        // lo que la operadora retocara al volver atrás se perdía en
+        // silencio. El entry de approvedJobs siempre lo trae.
+        transcribeJobId: last.transcribeJobId || null,
+        songTitle: last.songTitle || "",
+        bgCacheKey: last.bgCacheKey || null,
         language: last.language,
         genre: last.genre || "",
         font: last.font || "",
@@ -3085,6 +3101,20 @@ export default function App() {
       setTranscribeError(null);
       return;
     }
+    // Auditoría 2026-06-10: al volver desde la PRIMERA canción, el
+    // prefetchCache conserva la transcripción ORIGINAL — si la operadora
+    // re-entra a review, transcribeNext la sirve y pisa visualmente todo
+    // lo sincronizado (el "tengo que volver a comenzar"). Refrescamos el
+    // cache con los segments vigentes antes de soltar la review.
+    try {
+      if (currentReview?.file && Array.isArray(currentReview.segments)) {
+        const k = prefetchKey(currentReview.file);
+        const cached = prefetchCache.current[k];
+        if (cached?.status === "ready" && cached.data) {
+          cached.data = { ...cached.data, segments: currentReview.segments };
+        }
+      }
+    } catch { /* best-effort: el cache es una optimización, no la verdad */ }
     setCurrentReview(null);
     setReviewQueue([]);
     setTranscribing(false);
@@ -3708,14 +3738,10 @@ export default function App() {
             // local del LyricsEditor a currentReview.segments para que el
             // WizardLivePreview central (que lee `reviewSegments`) refleje
             // los drag-resize de timings sin esperar al autosave de 3s +
-            // network roundtrip. onEditedChange ya existe (fue pensado
-            // para el modal /edit antiguo); reusar evita un callback nuevo.
-            // El prop-sync useEffect de LyricsEditor (con la guard de
-            // segmentsValuesEqual del PR #433) hace que esta propagación
-            // NO trigger un reseed — los valores son idénticos.
-            onEditedChange={(segs) =>
-              setCurrentReview((r) => (r ? { ...r, segments: segs } : r))
-            }
+            // network roundtrip. Auditoría 2026-06-10: memoizado + guard de
+            // no-op — ver handleEditedChange (el arrow inline acá causaba
+            // un loop perpetuo de re-renders App↔editor).
+            onEditedChange={handleEditedChange}
             isBatch={currentReview.queue.length > 1}
             batchProgress={currentReview.queue.length > 1
               ? `${currentReview.queueIdx + 1} ${t("editor.song_of")} ${currentReview.queue.length}`
