@@ -528,13 +528,25 @@ def _emissions(model, wav, blank_id: int, star_delta: float):
     return torch.cat(pieces)
 
 
+# Why the last retime_segments call declined ("structural" | "other" | "").
+# The wrapper composes on it: structural mismatch → try the performance
+# libretto (performance_text) and retry. Workers process one job at a time
+# (single-threaded per process), so a module global is safe here.
+last_decline_reason = ""
+
+
 def retime_segments(audio_path: str, segments: list[dict],
                     job_id: str = "",
-                    mix_path: Optional[str] = None) -> Optional[list[dict]]:
+                    mix_path: Optional[str] = None,
+                    max_skip_frac: Optional[float] = None) -> Optional[list[dict]]:
     """Align the segments' text onto `audio_path` (vocal stem preferred)
     and return NEW segments with replaced start/end + word stamps.
     Texts pass through verbatim. Returns None to decline (caller keeps
     the original timings). Never raises.
+
+    `max_skip_frac` overrides CTC_ALIGN_MAX_SKIP_FRAC for this call — the
+    performance-libretto retry tolerates more skips (crowd lines ARE in
+    the libretto but invisible in the stem until M5/transplant get them).
 
     `mix_path` (the original un-separated audio): when given and the
     skip-arc pass skipped lines, a M5 RECOVERY pass re-aligns each
@@ -543,6 +555,8 @@ def retime_segments(audio_path: str, segments: list[dict],
     erases it from the stem (the reason those lines were skipped).
     Acceptance-gated: measured on the live benchmark, recoveries with
     mean word score ≥0.35 landed at 0.10 s of Rotor; <0.25 were wrong."""
+    global last_decline_reason
+    last_decline_reason = ""
     try:
         if not is_enabled() or not segments or len(segments) < 3:
             return None
@@ -722,12 +736,14 @@ def retime_segments(audio_path: str, segments: list[dict],
         # No timing engine can fix structurally-wrong text → decline the
         # whole song, keep the cascade. The real fix is performance text
         # (Etapa A: ASR of the actual live + reference orthography).
-        max_skip_frac = float(os.environ.get("CTC_ALIGN_MAX_SKIP_FRAC", "0.10"))
+        if max_skip_frac is None:
+            max_skip_frac = float(os.environ.get("CTC_ALIGN_MAX_SKIP_FRAC", "0.10"))
         if len(skipped_lines) / max(len(lines), 1) > max_skip_frac:
             logger.warning("[CTC] decline: %d/%d lines skipped (>%.0f%%) — "
                            "structural mismatch between text and performance "
                            "(job=%s)", len(skipped_lines), len(lines),
                            100 * max_skip_frac, job_id)
+            last_decline_reason = "structural"
             return None
 
         # Lines the engine could not time (skipped / unalignable words):

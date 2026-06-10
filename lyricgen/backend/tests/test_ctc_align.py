@@ -214,3 +214,27 @@ def test_wrapper_never_raises_even_with_flag_on(monkeypatch):
     result = {"job_id": "j2", "segments": [{"text": "hola", "start": 1.0}] * 5}
     out = asyncio.run(_maybe_ctc_retime(result, "/no/such/audio.mp3", "j2"))
     assert out is result
+
+
+def test_perf_text_clean_libretto():
+    import performance_text as pt
+    items = [
+        (61.0, "(Público cantando) Nada de eso fue un error"),
+        (64.0, "¡Eh!"),                      # pure exclamation → drop
+        (48.0, "lo dejaste pasar"),
+        (50.0, "lo dejaste pasar, no quiero que me perdones"),  # contains prev
+        (122.0, "música y aplausos"),        # label → drop
+        (40.0, "Tengo una mala noticia"),
+        (183.0, "¡Gracias, Ciel!"),          # chatter → drop
+    ]
+    out = pt.clean_libretto(items)
+    assert out == ["Tengo una mala noticia",
+                   "lo dejaste pasar, no quiero que me perdones",
+                   "Nada de eso fue un error"]
+
+
+def test_perf_text_parse_ts_line():
+    import performance_text as pt
+    assert pt.parse_ts_line("[01:32.5] Tengo una mala noticia") == (
+        92.5, "Tengo una mala noticia")
+    assert pt.parse_ts_line("[00:")[1] == ""

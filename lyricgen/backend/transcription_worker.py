@@ -106,7 +106,7 @@ def run_transcription_job(
             # Gated CTC re-time post-pass (CTC_ALIGN_ENABLED, default OFF);
             # no-op passthrough when the flag is off. Same wrapper the HTTP
             # call sites use — keeps the three entry points in lockstep.
-            return await _maybe_ctc_retime(r, audio_path, job_id)
+            return await _maybe_ctc_retime(r, audio_path, job_id, artist, title)
 
         result = asyncio.run(_run_with_retime())
     except Exception as e:

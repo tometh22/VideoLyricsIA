@@ -3449,7 +3449,9 @@ async def transcribe_uploaded(
             artist=job_row.artist or "",
             title=job_row.song_title or "",
         )
-        return await _maybe_ctc_retime(_result, audio_path, job_id)
+        return await _maybe_ctc_retime(_result, audio_path, job_id,
+                                       job_row.artist or "",
+                                       job_row.song_title or "")
     finally:
         _release_transcription_slot(transcription_lease)
 
@@ -4104,10 +4106,11 @@ async def transcribe_endpoint(
         language=language, artist=artist, title=title,
         filename=file.filename,
     )
-    return await _maybe_ctc_retime(_result, audio_path, job_id)
+    return await _maybe_ctc_retime(_result, audio_path, job_id, artist, title)
 
 
-async def _maybe_ctc_retime(result, audio_path: str, job_id: str):
+async def _maybe_ctc_retime(result, audio_path: str, job_id: str,
+                            artist: str = "", title: str = ""):
     """Gated post-pass over the cascade's FINAL output (CTC_ALIGN_ENABLED,
     default OFF): re-time every line by full-song monotonic CTC forced
     alignment on the vocal stem (`ctc_align.py`). Texts pass through
@@ -4150,6 +4153,32 @@ async def _maybe_ctc_retime(result, audio_path: str, job_id: str):
                               audio_path),  # mix_path — M5 crowd recovery
             timeout=240,
         )
+        if (retimed is None and _ctc.last_decline_reason == "structural"
+                and os.environ.get("CTC_ALIGN_PERF_TEXT", "0").strip().lower()
+                in ("1", "true", "yes", "on")):
+            # ETAPA A — the cascade's text doesn't match what this live
+            # actually performs (extra verse/chorus repetitions, crowd
+            # variants). Transcribe THE PERFORMANCE (Gemini chunked,
+            # ~$0.03 / 60-90 s) and retime that libretto instead. Higher
+            # skip tolerance: crowd lines ARE in the libretto but
+            # invisible in the stem until M5/transplant pick them up.
+            import performance_text as _pt
+            texts = await asyncio.wait_for(
+                asyncio.to_thread(_pt.transcribe_performance, audio_path,
+                                  artist, title),
+                timeout=300,
+            )
+            if texts:
+                psegs = [{"text": t, "start": 0.0, "end": 0.0} for t in texts]
+                retimed = await asyncio.wait_for(
+                    asyncio.to_thread(_ctc.retime_segments, _stem, psegs,
+                                      job_id, audio_path, 0.5),
+                    timeout=240,
+                )
+                if retimed:
+                    logger.info("[CTC] performance-libretto retime: %d líneas "
+                                "(reemplaza el texto de la cascada, job=%s)",
+                                len(retimed), job_id)
         if retimed:
             result = dict(result)
             result["segments"] = retimed
