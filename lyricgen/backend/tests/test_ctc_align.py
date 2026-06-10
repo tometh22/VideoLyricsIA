@@ -114,6 +114,21 @@ def test_repair_bridge_no_op_on_healthy_lines():
     assert out == [(10.0, 11.4, ws)]
 
 
+def test_place_unaligned_prefers_cascade_over_spread():
+    """Staging lesson (job 8be12628e28b): a skipped chorus line spread
+    over a 48s hole sits frozen ~20s in the wrong place. The cascade's
+    original timing inside the hole must win."""
+    lt = [(58.0, 60.0, [1]), None, None, (108.0, 110.0, [1])]
+    originals = [(57.9, 60.1), (65.2, 68.0), (85.5, 88.0), (107.9, 110.2)]
+    out = ctc_align.place_unaligned(lt, originals, 200.0)
+    assert out[1][0] == 65.2 and out[1][1] == 68.0   # cascade timing kept
+    assert out[2][0] == 85.5
+    # no original (0,0) → falls back to the spread
+    out2 = ctc_align.place_unaligned([(58.0, 60.0, [1]), None],
+                                     [(58.0, 60.0), (0.0, 0.0)], 200.0)
+    assert out2[1] == (60.0, 200.0, [])
+
+
 def test_group_consecutive():
     assert ctc_align.group_consecutive([7, 8, 20, 31, 32]) == [[7, 8], [20], [31, 32]]
     assert ctc_align.group_consecutive([]) == []
