@@ -30,6 +30,40 @@ const ENV = import.meta.env?.VITE_SENTRY_ENV
 
 let _initialized = false;
 
+// ── Console-tag forwarding (observability world-class, 2026-06-10) ──
+//
+// Incidente del editor de sync: los console.warn de diagnóstico
+// ("[drag-persist] prop-sync RESEEDING") dispararon en el browser de la
+// operadora y murieron ahí — el bug no dejó NINGÚN rastro server-side
+// porque nunca lanzó una excepción. Regla nueva: todo console.warn que
+// empiece con un tag "[algo]" se forwardea a Sentry como evento warning
+// agrupado por tag (un issue por tag, contador de eventos). Lo no
+// tagueado se descarta (ruido de libs/React).
+
+/** Extrae el tag "[xxx]" del inicio de un mensaje de consola, o null. */
+export function consoleTagOf(message) {
+  if (typeof message !== "string") return null;
+  const m = message.match(/^\[([\w-]{2,40})\]/);
+  return m ? m[1].toLowerCase() : null;
+}
+
+// Throttle client-side por tag: protege la cuota de Sentry si un warn
+// taggeado entra en loop (la lección del loop de re-renders: 5000
+// ciclos/100ms habrían sido 5000 eventos/seg). 1 evento por tag por
+// minuto; la frecuencia real igual se ve en el issue agrupado.
+const _TAG_THROTTLE_MS = 60_000;
+const _lastSentByTag = new Map();
+
+/** Decide si un mensaje de consola se forwardea. Exportado para tests. */
+export function shouldForwardConsoleEvent(message, now = Date.now()) {
+  const tag = consoleTagOf(message);
+  if (!tag) return { forward: false, tag: null };
+  const last = _lastSentByTag.get(tag) || 0;
+  if (now - last < _TAG_THROTTLE_MS) return { forward: false, tag };
+  _lastSentByTag.set(tag, now);
+  return { forward: true, tag };
+}
+
 export function initSentry() {
   if (_initialized) return;
   _initialized = true;
@@ -41,14 +75,51 @@ export function initSentry() {
     Sentry.init({
       dsn: DSN,
       environment: ENV,
-      // 10% trace sampling — mirrors backend traces_sample_rate. Enough
-      // to spot regressions, low enough to stay in Sentry free tier.
-      tracesSampleRate: 0.1,
-      // Replay disabled by default (extra cost + privacy review). Turn
-      // on per-session via Sentry.replayIntegration() if we ever want
-      // session-replay debugging for a specific incident.
-      replaysSessionSampleRate: 0,
-      replaysOnErrorSampleRate: 0,
+      // Observability world-class (2026-06-10, post incidente del editor):
+      //
+      // browserTracingIntegration — SIN esta integración explícita,
+      // tracesSampleRate solo era decorativo (v8+ no la incluye por
+      // default): hoy descubrimos que NUNCA capturamos traces ni Web
+      // Vitals. Con ella: pageload/navigation + INP/LCP/CLS. El loop de
+      // re-renders del editor (5000 ciclos/100ms) habría pintado un INP
+      // catastrófico ANTES del reporte de la operadora.
+      //
+      // replayIntegration — graba la sesión (DOM + consola + red) con
+      // masking TOTAL de texto e inputs (las lyrics de los tenants son
+      // contenido bajo contrato — jamás salen legibles). 100% de las
+      // sesiones con error + muestra del resto. El bug del editor no
+      // dejó rastro server-side; con replay, el reporte de la operadora
+      // se convierte en "mirar el minuto exacto".
+      //
+      // captureConsoleIntegration — los console.warn taggeados
+      // ("[drag-persist] …") suben como eventos agrupados por tag (ver
+      // beforeSend). Lo no-tagueado se descarta.
+      integrations: [
+        Sentry.browserTracingIntegration(),
+        Sentry.replayIntegration({
+          maskAllText: true,
+          maskAllInputs: true,
+          blockAllMedia: true,
+        }),
+        Sentry.captureConsoleIntegration({ levels: ["warn"] }),
+      ],
+      tracesSampleRate: parseFloat(import.meta.env?.VITE_SENTRY_TRACES_RATE || "0.1"),
+      replaysSessionSampleRate: parseFloat(import.meta.env?.VITE_SENTRY_REPLAY_SESSION_RATE || "0.1"),
+      replaysOnErrorSampleRate: 1.0,
+      // Filtro de eventos de consola: solo pasan los warn taggeados, con
+      // fingerprint por tag (un issue agrupado por familia de diagnóstico)
+      // y throttle client-side de 1/min por tag para cuidar la cuota.
+      beforeSend(event) {
+        if (event.logger !== "console") return event;
+        const msg = event.message
+          || event.logentry?.message
+          || (event.logentry?.formatted ?? "");
+        const { forward, tag } = shouldForwardConsoleEvent(msg);
+        if (!forward) return null;
+        event.fingerprint = ["console-tag", tag];
+        event.level = "warning";
+        return event;
+      },
       // Don't send PII in default events. We send tenant_id and role
       // via setUser below (non-PII identifiers), enough to scope
       // incidents to the affected operator without leaking emails.

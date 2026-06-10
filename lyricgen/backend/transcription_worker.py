@@ -57,6 +57,9 @@ def run_transcription_job(
     Devuelve el mismo dict que el handler legacy para que /transcription-status
     pueda servirlo idéntico al frontend.
     """
+    # Observability 2026-06-10: toda línea de log de este job lleva job_id.
+    from observability import set_job_log_context
+    set_job_log_context(job_id)
     # Lazy import — main.py es pesado y el worker no debería pagarlo si
     # corre otros queues. asyncio.run abre/cierra su propio event loop por job,
     # que es lo que queremos (jobs independientes, sin event-loop leak).
