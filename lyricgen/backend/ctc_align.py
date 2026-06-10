@@ -161,6 +161,42 @@ def spans_to_lines(spans, words, n_lines: int, frame_to_s: float):
     return [tuple(o) if o else None for o in out]
 
 
+def group_consecutive(idxs: list[int]) -> list[list[int]]:
+    """[7,8,20,31,32] → [[7,8],[20],[31,32]]. Pure."""
+    if not idxs:
+        return []
+    groups, cur = [], [idxs[0]]
+    for i in idxs[1:]:
+        if i == cur[-1] + 1:
+            cur.append(i)
+        else:
+            groups.append(cur)
+            cur = [i]
+    groups.append(cur)
+    return groups
+
+
+def recovery_window(line_times, grp: list[int], total_dur: float,
+                    pad: float = 1.0, min_s: float = 2.0, max_s: float = 60.0):
+    """Window for re-aligning a skipped group: the span between its
+    anchored (non-None) neighbours. None when the window is degenerate
+    or too large to trust (an 82 s outro window aligns garbage). Pure."""
+    lo = 0.0
+    for j in range(grp[0] - 1, -1, -1):
+        if line_times[j] is not None:
+            lo = line_times[j][1]
+            break
+    hi = total_dur
+    for j in range(grp[-1] + 1, len(line_times)):
+        if line_times[j] is not None:
+            hi = line_times[j][0]
+            break
+    lo, hi = max(0.0, lo - pad), min(total_dur, hi + pad)
+    if hi - lo < min_s or hi - lo > max_s:
+        return None
+    return lo, hi
+
+
 def skip_arc_align(emission, targets, line_token_ranges, blank_id: int,
                    lam: float = 6.0):
     """Forced alignment with per-line SKIP ARCS — our own CTC Viterbi.
@@ -462,11 +498,20 @@ def _emissions(model, wav, blank_id: int, star_delta: float):
 
 
 def retime_segments(audio_path: str, segments: list[dict],
-                    job_id: str = "") -> Optional[list[dict]]:
+                    job_id: str = "",
+                    mix_path: Optional[str] = None) -> Optional[list[dict]]:
     """Align the segments' text onto `audio_path` (vocal stem preferred)
     and return NEW segments with replaced start/end + word stamps.
     Texts pass through verbatim. Returns None to decline (caller keeps
-    the original timings). Never raises."""
+    the original timings). Never raises.
+
+    `mix_path` (the original un-separated audio): when given and the
+    skip-arc pass skipped lines, a M5 RECOVERY pass re-aligns each
+    skipped group against MIX emissions, confined to the window between
+    its anchored neighbours. The crowd's voice IS in the mix — demucs
+    erases it from the stem (the reason those lines were skipped).
+    Acceptance-gated: measured on the live benchmark, recoveries with
+    mean word score ≥0.35 landed at 0.10 s of Rotor; <0.25 were wrong."""
     try:
         if not is_enabled() or not segments or len(segments) < 3:
             return None
@@ -588,6 +633,54 @@ def retime_segments(audio_path: str, segments: list[dict],
             _regions = []
         line_times = repair_bridge_words(line_times, _regions)
 
+        # M5 — recover skipped lines from the MIX, window-confined.
+        recovered_lines: set[int] = set()
+        mix_ok = (skipped_lines and mix_path and os.path.exists(mix_path)
+                  and os.environ.get("CTC_ALIGN_MIX_RECOVER", "1").strip().lower() in _TRUE)
+        if mix_ok:
+            accept = float(os.environ.get("CTC_ALIGN_MIX_ACCEPT", "0.35"))
+            mwav, msr = torchaudio.load(mix_path)
+            mwav = mwav.mean(0, keepdim=True)
+            if msr != SR:
+                mwav = torchaudio.functional.resample(mwav, msr, SR)
+            for grp in group_consecutive(sorted(skipped_lines)):
+                win = recovery_window(line_times, grp, mwav.shape[1] / SR)
+                if not win:
+                    continue
+                lo, hi = win
+                chunk = mwav[:, int(lo * SR):int(hi * SR)]
+                gem = _emissions(model, chunk, blank_id, _star_delta())
+                gtexts = [lines[i] for i in grp]
+                gtargets, gwords = build_targets(gtexts, dictionary, star_id,
+                                                 word_sep_id=word_sep_id)
+                if len(gtargets) >= gem.shape[0]:
+                    continue
+                galigned, gscores = AF.forced_align(
+                    gem.unsqueeze(0),
+                    torch.tensor(gtargets, dtype=torch.int32).unsqueeze(0),
+                    blank=blank_id)
+                gspans_t = AF.merge_tokens(galigned[0], gscores[0].exp(),
+                                           blank=blank_id)
+                gspans = [(sp.start, sp.end, float(sp.score)) for sp in gspans_t]
+                glt = spans_to_lines(gspans, gwords, len(gtexts), frame_to_s)
+                for k, li in enumerate(grp):
+                    if glt[k] is None or not glt[k][2]:
+                        continue
+                    gs, ge, gws = glt[k]
+                    msc = sum(w[3] for w in gws) / len(gws)
+                    if msc < accept:
+                        continue
+                    off = lo
+                    line_times[li] = (gs + off, ge + off,
+                                      [(w, a + off, b + off, sc)
+                                       for (w, a, b, sc) in gws])
+                    recovered_lines.add(li)
+            if recovered_lines:
+                logger.info("[CTC] mix-recovery: %d/%d skipped lines recovered "
+                            "(job=%s)", len(recovered_lines), len(skipped_lines),
+                            job_id)
+                skipped_lines -= recovered_lines
+
         # Interpolate lines whose words were all unalignable (numbers,
         # emoji): midpoint between neighbours keeps monotonic order.
         for i, lt in enumerate(line_times):
@@ -632,6 +725,8 @@ def retime_segments(audio_path: str, segments: list[dict],
                 new["ctc_lr"] = round(lr, 3)
             if li in skipped_lines:
                 new["ctc_skipped"] = True  # Viterbi: línea no cantada
+            if li in recovered_lines:
+                new["ctc_recovered"] = "mix"  # M5: rescatada del mix
             if wlist:
                 new["words"] = [
                     {"word": w, "start": round(float(a), 3),
