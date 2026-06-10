@@ -2174,6 +2174,9 @@ export default function App() {
     }));
     setJobs(jobList);
     navigate("/generating");
+    // Mismo cleanup que startGenerationWithSegments: el batch ya está en
+    // jobList; dejar `files` staged duplica renders en el próximo batch.
+    setFiles([]);
     processQueueDirect(jobList);
   };
 
@@ -2777,6 +2780,15 @@ export default function App() {
     navigate("/generating");
     setReadyToGenerate(false);
     setApprovedJobs([]);
+    // Audit 2026-06-09 ("siempre queda cargado en el wizard"): los inputs
+    // ya fueron consumidos en jobList — si quedan en `files`/`reviewQueue`,
+    // el próximo /new (sidebar, sin reset) muestra los audios del batch
+    // ANTERIOR staged; el operador suma los nuevos, genera, y los viejos
+    // se re-renderizan (videos duplicados + costo Veo duplicado). Limpiar
+    // acá también vacía el snapshot de sesión (effect anyState), así el
+    // banner "batch sin terminar" no ofrece retomar un batch ya generado.
+    setFiles([]);
+    setReviewQueue([]);
 
     let nextIdx = 0;
     const worker = async () => {
