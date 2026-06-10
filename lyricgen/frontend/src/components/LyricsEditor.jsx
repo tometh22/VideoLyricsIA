@@ -511,13 +511,22 @@ export default function LyricsEditor({
   // and-forget tragaba errores. Ahora si la red cae o el backend
   // rechaza, saveStatus pasa a "error" y el chip rojo + bloqueo del
   // botón Aprobar se activan.
+  // Auditoría 2026-06-10 ("hay partes que no se graban"): el cleanup del
+  // debounce cancelaba el guardado pendiente SIN flush. Salir del step 6
+  // del wizard DESMONTA este componente — los últimos <3s de anclas/drags
+  // morían con él, y al volver el remount sembraba desde datos viejos.
+  // `_pendingFlushRef` guarda el estado más fresco aún-no-persistido; el
+  // effect de unmount (deps vacías, abajo) lo dispara fire-and-forget.
+  const _pendingFlushRef = useRef(null);
   useEffect(() => {
     if (disableAutosave) return undefined;
     if (!onPersistSegments || !transcribeJobId) return undefined;
     if (!Array.isArray(edited) || edited.length === 0) return undefined;
     let cancelled = false;
+    _pendingFlushRef.current = { onPersistSegments, transcribeJobId, edited };
     const tid = setTimeout(async () => {
       if (cancelled) return;
+      _pendingFlushRef.current = null;
       setSaveStatus("saving");
       const cleaned = edited.map(({ _id, review, ...rest }) => rest);
       try {
@@ -538,6 +547,23 @@ export default function LyricsEditor({
     return () => { cancelled = true; clearTimeout(tid); };
   }, [edited, transcribeJobId, onPersistSegments, disableAutosave]);
 
+  // Flush-on-unmount: si el componente muere con un autosave pendiente
+  // (debounce sin disparar), persistimos el estado vigente igual. Fire-
+  // and-forget: no hay UI que actualizar — el objetivo es que el backend
+  // (y el remount posterior, que siembra desde currentReview) no pierdan
+  // los últimos segundos de trabajo de la operadora.
+  useEffect(() => {
+    return () => {
+      const p = _pendingFlushRef.current;
+      if (!p) return;
+      _pendingFlushRef.current = null;
+      try {
+        const cleaned = p.edited.map(({ _id, review, ...rest }) => rest);
+        Promise.resolve(p.onPersistSegments(p.transcribeJobId, cleaned)).catch(() => {});
+      } catch { /* best-effort */ }
+    };
+  }, []);
+
   // Flush-save on a timeline drag (no 3 s wait) + drive the "Guardado ✓"
   // chip. Runs only when flushCounter bumps. By the time this effect fires,
   // setEdited from the same handler has already applied, so `edited` is the
@@ -546,6 +572,9 @@ export default function LyricsEditor({
     if (flushCounter === 0) return undefined;
     if (disableAutosave || !onPersistSegments || !transcribeJobId) return undefined;
     let cancelled = false;
+    // El flush persiste el `edited` vigente ya mismo — el flush-on-unmount
+    // no tiene nada pendiente que rescatar.
+    _pendingFlushRef.current = null;
     setSaveStatus("saving");
     const cleaned = edited.map(({ _id, review, ...rest }) => rest);
     // [drag-persist] diagnostic — remove after staging confirms the fix.
@@ -1221,6 +1250,14 @@ export default function LyricsEditor({
     }
     if (!isPlaying || activeId === null) return;
     if (lastScrolledIdRef.current === activeId) return;
+    // Auditoría 2026-06-10 ("se mueve y no me deja hacer cambios"): este
+    // auto-centrado corre durante playback SIN ninguna supresión — si la
+    // operadora está escribiendo o ajustando una línea, el panel entero
+    // se le va al centro de la fila activa cada 2-5s. Suprimimos cuando
+    // hay un input/textarea con foco (está editando texto) — el timeline
+    // ya tiene su propia supresión por interacción (FOLLOW_SUPPRESS_MS).
+    const ae = typeof document !== "undefined" ? document.activeElement : null;
+    if (ae && (ae.tagName === "INPUT" || ae.tagName === "TEXTAREA")) return;
     lastScrolledIdRef.current = activeId;
     const el = rowRefs.current[activeId];
     if (el) el.scrollIntoView({ block: "center", behavior: "smooth" });
