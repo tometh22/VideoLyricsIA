@@ -4114,7 +4114,8 @@ async def _maybe_ctc_retime(result, audio_path: str, job_id: str):
             logger.info("[CTC] no cached stem — skipping retime (job=%s)", job_id)
             return result
         retimed = await asyncio.wait_for(
-            asyncio.to_thread(_ctc.retime_segments, _stem, segs, job_id),
+            asyncio.to_thread(_ctc.retime_segments, _stem, segs, job_id,
+                              audio_path),  # mix_path — M5 crowd recovery
             timeout=240,
         )
         if retimed:

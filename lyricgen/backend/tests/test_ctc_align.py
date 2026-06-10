@@ -114,6 +114,21 @@ def test_repair_bridge_no_op_on_healthy_lines():
     assert out == [(10.0, 11.4, ws)]
 
 
+def test_group_consecutive():
+    assert ctc_align.group_consecutive([7, 8, 20, 31, 32]) == [[7, 8], [20], [31, 32]]
+    assert ctc_align.group_consecutive([]) == []
+
+
+def test_recovery_window_between_anchors():
+    lt = [(10.0, 12.0, []), None, None, (40.0, 42.0, [])]
+    assert ctc_align.recovery_window(lt, [1, 2], 200.0) == (11.0, 41.0)
+    # degenerate (too small, pad=0) and oversized windows are rejected
+    lt2 = [(10.0, 12.0, []), None, (12.5, 13.0, [])]
+    assert ctc_align.recovery_window(lt2, [1], 200.0, pad=0.0) is None
+    lt3 = [(10.0, 12.0, []), None]  # open-ended → until total_dur (189s)
+    assert ctc_align.recovery_window(lt3, [1], 200.0) is None
+
+
 def test_guess_text_lang():
     es = ["No quiero que me perdones", "Y no me pidas perdón",
           "Yo quería que nos pasara", "Para bien o para mal"]
