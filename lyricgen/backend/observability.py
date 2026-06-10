@@ -4,6 +4,7 @@ All helpers are no-ops when the relevant env vars are missing, so this module
 never becomes the reason a local dev session fails to start.
 """
 
+import contextvars
 import json
 import logging
 import os
@@ -191,6 +192,40 @@ class _JsonFormatter(logging.Formatter):
         return json.dumps(payload, ensure_ascii=False)
 
 
+# ── Job context en CADA línea de log (observability 2026-06-10) ──
+#
+# Autopsia del incidente del mural: las líneas [BG]/[EDIT] del pipeline
+# no llevan job_id en el mensaje — filtrar los logs de Railway por job
+# era imposible (hubo que reconstruir por ventanas de tiempo entre 3
+# renders concurrentes). El formatter de arriba YA soporta job_id como
+# attr del record; este contextvar + filter lo inyectan automáticamente
+# en todo log emitido dentro de un job, sin tocar miles de call sites.
+# `railway logs --filter "<job_id>"` ahora matchea todas sus líneas.
+_current_job_id = contextvars.ContextVar("genly_job_id", default=None)
+
+
+def set_job_log_context(job_id):
+    """Marca el job activo del proceso/contexto. Llamar al ENTRAR a cada
+    entrypoint de worker (run_pipeline, run_edit_pipeline, transcripción,
+    prewarm, bg_preview). RQ corre un job por vez por worker, así que el
+    set en el entrypoint siguiente pisa al anterior — no hace falta
+    reset explícito (clear_job_log_context existe para los tests)."""
+    _current_job_id.set(str(job_id) if job_id else None)
+
+
+def clear_job_log_context():
+    _current_job_id.set(None)
+
+
+class _JobContextFilter(logging.Filter):
+    def filter(self, record: logging.LogRecord) -> bool:
+        if not hasattr(record, "job_id"):
+            jid = _current_job_id.get()
+            if jid:
+                record.job_id = jid
+        return True
+
+
 def init_logging():
     """Reconfigure root logger to emit JSON to stdout. Idempotent."""
     root = logging.getLogger()
@@ -200,6 +235,7 @@ def init_logging():
         root.removeHandler(h)
     handler = logging.StreamHandler(sys.stdout)
     handler.setFormatter(_JsonFormatter())
+    handler.addFilter(_JobContextFilter())
     root.addHandler(handler)
 
 

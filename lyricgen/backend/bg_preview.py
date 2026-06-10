@@ -133,6 +133,9 @@ def run_bg_preview_job(job_id: str, bg_cache_key: str, params: dict) -> dict:
     (ej. dos previews paralelos con mismo hash), el segundo detect que ya
     existe y skip.
     """
+    # Observability 2026-06-10: toda línea de log de este job lleva job_id.
+    from observability import set_job_log_context
+    set_job_log_context(job_id)
     from jobs import update_job
 
     # Idempotency check — race window entre enqueue y worker pickup.
