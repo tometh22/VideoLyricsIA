@@ -9183,6 +9183,20 @@ async def retry_job(
     # ahora hace coalesce(last_progress_at, created_at) en ese mismo PR.
     job.last_progress_at = datetime.now(timezone.utc)
 
+    # Cancel any ProRes prewarm still queued from the PRIOR render. The retry
+    # re-renders lyric_video.mp4 from scratch, so an in-flight prewarm of the
+    # old cut would otherwise publish a stale .mov / re-add a stale s3_key
+    # after we cleared s3_keys above (same hazard run_edit_pipeline guards on
+    # the edit path). A prewarm already mid-ffmpeg won't stop here, but it's
+    # independently fenced by the source-mtime freshness check in
+    # ensure_prores_exists (the retry's rewrite bumps the source mtime).
+    try:
+        from queue_jobs import cancel_rq_job
+        for _ft in ("umg_master", "umg_short"):
+            cancel_rq_job(f"prewarm:{job_id}:{_ft}")
+    except Exception as _exc:
+        logger.warning("retry_job: prewarm cancel skipped for %s: %s", job_id, _exc)
+
     db.add(AuditLog(
         user_id=current_user["id"],
         action="job.retry",

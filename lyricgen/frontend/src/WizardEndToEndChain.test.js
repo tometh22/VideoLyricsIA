@@ -12,6 +12,7 @@
 // el caso "verificar que todos los campos se persisten".
 
 import { describe, it, expect } from "vitest";
+import { appendBackgroundFields } from "./lib/bgPayload";
 
 // Mirror de la lógica de handleApproveLyrics (App.jsx:1495+) en su forma
 // pura: dado un currentReview + edited segments, qué shape va a
@@ -43,7 +44,14 @@ function _approvedJobFromReview(r, editedSegments, bgCacheKey) {
 // Mirror de startGenerationWithSegments (App.jsx:1599+): qué fields se
 // appendean al FormData del POST /generate. Verifica que para cada job
 // del batch se envíen TODOS los axes que el operador eligió.
-function _formDataFromJob(job, delivery, style, customColors, backgroundId, animateImage, inspiredByLyrics, backgroundMode) {
+//
+// Audit adversarial 2026-06-09: los campos de FONDO ya no se espejan a
+// mano — usan el helper REAL appendBackgroundFields (lib/bgPayload.js),
+// el mismo que App.jsx. La versión anterior de este mirror codificaba la
+// lógica PRE-fix ("if (backgroundId) ...") como comportamiento esperado.
+function _formDataFromJob(job, delivery, style, customColors, bg, inspiredByLyrics) {
+  const { bgSelectMode = "auto", backgroundId = null, backgroundMode = null,
+          backgroundFile = null, animateImage = false } = bg || {};
   const f = {};
   if (job.transcribeJobId) f["job_id"] = job.transcribeJobId;
   f["artist"] = job.artist;
@@ -65,7 +73,6 @@ function _formDataFromJob(job, delivery, style, customColors, backgroundId, anim
   f["lyrics_animation"] = job.lyricsAnimation || "none";
   f["line_transition"] = job.lineTransition || "none";
   f["text_contrast"] = job.textContrast || "medium";
-  if (animateImage) f["animate_image"] = "true";
   f["match_lyrics"] = inspiredByLyrics ? "true" : "false";
   if (job.bgCacheKey) {
     f["bg_cache_key"] = job.bgCacheKey;
@@ -77,11 +84,11 @@ function _formDataFromJob(job, delivery, style, customColors, backgroundId, anim
     f["umg_fps"] = String(delivery.umg_fps || 24);
     f["umg_prores_profile"] = String(delivery.umg_prores_profile ?? 3);
   }
-  // Background mode/asset
-  if (backgroundId) {
-    f["background_id"] = backgroundId;
-    if (backgroundMode) f["background_mode"] = backgroundMode;
-  }
+  // Background: el helper de producción, vía un adapter append() → dict.
+  appendBackgroundFields(
+    { append: (k, v) => { f[k] = v instanceof File ? v : String(v); } },
+    { bgSelectMode, backgroundId, backgroundMode, backgroundFile, animateImage },
+  );
   f["segments_json"] = JSON.stringify(job.segments);
   return f;
 }
@@ -121,7 +128,7 @@ describe("Wizard end-to-end chain — todas las elecciones persisten al /generat
     };
 
     const job = _approvedJobFromReview(currentReview, editedSegments, "bgkey789");
-    const fd = _formDataFromJob(job, delivery, "oscuro", "", null, false, true, null);
+    const fd = _formDataFromJob(job, delivery, "oscuro", "", { bgSelectMode: "auto" }, true);
 
     // Identidad
     expect(fd.artist).toBe("Viejas Locas");
@@ -169,7 +176,7 @@ describe("Wizard end-to-end chain — todas las elecciones persisten al /generat
       transcribeJobId: "j1",
     };
     const job = _approvedJobFromReview(review, [], null);
-    const fd = _formDataFromJob(job, { delivery_profile: "youtube" }, "auto", "", null, false, true, null);
+    const fd = _formDataFromJob(job, { delivery_profile: "youtube" }, "auto", "", { bgSelectMode: "auto" }, true);
     expect(fd.delivery_profile).toBe("youtube");
     expect(fd.umg_frame_size).toBeUndefined();
     expect(fd.umg_fps).toBeUndefined();
@@ -187,10 +194,37 @@ describe("Wizard end-to-end chain — todas las elecciones persisten al /generat
     const job = _approvedJobFromReview(review, [], null);
     const fd = _formDataFromJob(
       job, { delivery_profile: "youtube" }, "auto", "",
-      "lib-asset-42", false, true, "variation"
+      { bgSelectMode: "library", backgroundId: "lib-asset-42", backgroundMode: "variation" },
+      true
     );
     expect(fd.background_id).toBe("lib-asset-42");
     expect(fd.background_mode).toBe("variation");
+  });
+
+  it("REGRESIÓN bug Ana M. 2026-06-09 — fondo stale con tab 'IA' NO viaja al /generate", () => {
+    // El vector exacto del incidente: backgroundFile + animateImage
+    // residuales de un batch anterior (el File sobrevive en App), pero el
+    // wizard remontado muestra "Generar con IA" (bgSelectMode="auto").
+    // Los 3 videos de la clienta salieron con bg_custom.png por esto.
+    const review = {
+      file: { name: "rata-blanca-hada-mago.wav" },
+      artist: "Rata Blanca", songTitle: "La Leyenda Del Hada Y El Mago",
+      language: "es", textCase: "upper", fontScale: "1.3",
+      textContrast: "medium", lyricsAnimation: "none", lineTransition: "none",
+      transcribeJobId: "953265aef19a",
+    };
+    const staleFile = new File(["x"], "bg_custom.png", { type: "image/png" });
+    const job = _approvedJobFromReview(review, [], null);
+    const fd = _formDataFromJob(
+      job, { delivery_profile: "both", umg_frame_size: "HD", umg_fps: 24, umg_prores_profile: 3 },
+      "auto", "",
+      // Estado residual del batch anterior + tab visual en IA:
+      { bgSelectMode: "auto", backgroundFile: staleFile, backgroundId: 7, animateImage: true },
+      true
+    );
+    expect(fd.background_file).toBeUndefined();
+    expect(fd.background_id).toBeUndefined();
+    expect(fd.animate_image).toBeUndefined();
   });
 
   it("Custom colors — custom_colors se envía cuando style=custom", () => {
@@ -204,7 +238,7 @@ describe("Wizard end-to-end chain — todas las elecciones persisten al /generat
     const job = _approvedJobFromReview(review, [], null);
     const fd = _formDataFromJob(
       job, { delivery_profile: "youtube" }, "custom", "#FF00FF, #00FFFF",
-      null, false, true, null
+      { bgSelectMode: "auto" }, true
     );
     expect(fd.style).toBe("custom");
     expect(fd.custom_colors).toBe("#FF00FF, #00FFFF");
@@ -229,7 +263,7 @@ describe("Wizard end-to-end chain — todas las elecciones persisten al /generat
         movementStyle: "estatico", effect: "", transcribeJobId: "j3" },
     ];
     const jobs = reviews.map((r) => _approvedJobFromReview(r, [], null));
-    const fds = jobs.map((j) => _formDataFromJob(j, { delivery_profile: "youtube" }, "auto", "", null, false, true, null));
+    const fds = jobs.map((j) => _formDataFromJob(j, { delivery_profile: "youtube" }, "auto", "", { bgSelectMode: "auto" }, true));
 
     expect(fds[0].font).toBe("anton");
     expect(fds[1].font).toBe("bebas");  // ← override per-track preservado
@@ -254,7 +288,7 @@ describe("Wizard end-to-end chain — todas las elecciones persisten al /generat
       transcribeJobId: "j1",
     };
     const job = _approvedJobFromReview(review, [], null);
-    const fd = _formDataFromJob(job, { delivery_profile: "youtube" }, "auto", "", null, false, true, null);
+    const fd = _formDataFromJob(job, { delivery_profile: "youtube" }, "auto", "", { bgSelectMode: "auto" }, true);
     // Fallbacks correctos al no haber elegido nada.
     expect(fd.text_case).toBe("upper");
     expect(fd.font_scale).toBe("1.0");

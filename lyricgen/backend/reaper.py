@@ -877,6 +877,69 @@ def _email_owner(reaped: list[Job]) -> None:
 # arbitrary; just don't reuse it elsewhere in the app.
 _REAPER_ADVISORY_LOCK_KEY = 9118364455199101
 
+# Queues that must ALWAYS have a live RQ consumer. With the Tier-3 segmented
+# fleet, Worker serves enterprise/default and ShortWorker serves
+# transcription/bg_preview — if any pool dies, its queues go unserved.
+# Env-tunable so a future queue rename/split doesn't need a code change.
+_EXPECTED_QUEUES = [
+    q.strip() for q in os.environ.get(
+        "EXPECTED_QUEUES", "transcription,bg_preview,enterprise,default"
+    ).split(",") if q.strip()
+]
+
+
+def find_queues_without_consumer() -> list:
+    """Return expected queues that have NO live RQ worker listening, regardless
+    of depth.
+
+    The P0 2026-06-08 was invisible for ~2h because the only signal
+    (observability.py queue_*_no_consumer) needed depth>0 AND merely set
+    /health=degraded — nobody was paged. ShortWorker died with an EMPTY
+    transcription queue, so depth was 0 and the signal never fired; the jobs
+    arrived later and starved. This check is depth-INDEPENDENT and runs in the
+    reaper's 5-min loop (single runner via advisory lock) to drive an ACTIVE
+    Sentry alert. Best-effort: any failure returns [] (never breaks the reap)."""
+    try:
+        from queue_jobs import _init_redis
+        r, _, _ = _init_redis()
+        if r is None:
+            return []
+        from rq import Worker
+        listened = set()
+        for w in Worker.all(connection=r):
+            try:
+                listened.update(w.queue_names())
+            except Exception:
+                pass
+        return [q for q in _EXPECTED_QUEUES if q not in listened]
+    except Exception as e:  # pragma: no cover
+        logger.debug("find_queues_without_consumer skipped: %s", e)
+        return []
+
+
+def _alert_queues_without_consumer(orphan_queues: list) -> None:
+    """Loud, active alert when a queue has no consumer — the gap that made the
+    P0 invisible. Sentry capture_message at ERROR (the channel ops watches) +
+    a logger.error. Best-effort; never raises into the reap pass."""
+    if not orphan_queues:
+        return
+    logger.error(
+        "[REAPER] queue(s) WITHOUT a live consumer: %s — jobs on these queues "
+        "will starve until a worker comes back", ", ".join(orphan_queues),
+    )
+    try:
+        import sentry_sdk
+        with sentry_sdk.push_scope() as scope:
+            scope.set_tag("event", "queue.no_consumer")
+            scope.set_extra("queues", orphan_queues)
+            sentry_sdk.capture_message(
+                f"Queue(s) without a live worker: {', '.join(orphan_queues)} "
+                f"— transcriptions/renders on them will starve",
+                level="error",
+            )
+    except Exception as e:  # pragma: no cover
+        logger.warning(f"sentry capture (no_consumer) failed: {e}")
+
 
 def reap_all_stuck(threshold_min: int = _DEFAULT_THRESHOLD_MIN) -> int:
     """Public entrypoint with a transient-error retry. The reaper runs
@@ -938,6 +1001,12 @@ def _reap_all_stuck_inner(threshold_min: int) -> int:
                     "skipping this cycle",
                 )
                 return 0
+
+        # Active "queue has no consumer" alert (P0 2026-06-08 follow-up). Runs
+        # here — under the advisory lock, once per 5-min cycle on a single
+        # replica — so it pages exactly once per cycle, not per /health probe.
+        # Depth-independent: catches a dead pool BEFORE jobs pile up.
+        _alert_queues_without_consumer(find_queues_without_consumer())
 
         stuck = find_stuck_jobs(db, threshold_min)
         orphans = find_orphan_polling_jobs(db)

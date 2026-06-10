@@ -41,6 +41,7 @@ import HelpButton from "./components/HelpCenter/HelpButton";
 import { useBackgroundPreview } from "./hooks/useBackgroundPreview";
 import { useMediaUrl, clearMediaCache } from "./mediaUrl";
 import { translateBackendError } from "./lib/lyricsEditSubmit";
+import { appendBackgroundFields } from "./lib/bgPayload";
 import { computeFieldDiff, buildEditPayloads } from "./lib/editWizardDiff";
 import { prefetchKey } from "./lib/prefetchKey";
 
@@ -545,7 +546,13 @@ function JobDetailRoute({ fetchHistory }) {
     let alive = true;
     setJob(null);
     setError(false);
-    authFetch(`${API}/status/${id}`)
+    // authFetchWithTimeout (not bare authFetch): a hung/slow /status — e.g.
+    // when the api's DB pool is briefly exhausted under a polling burst
+    // (QueuePool timeout ~30s) — must surface as the error state, NOT a
+    // permanent spinner. 2026-06-09: an operator hit an infinite spinner
+    // opening a transcribed_pending job during exactly that condition.
+    // Mirrors EditLyricsRoute, which already caps /status at 10s.
+    authFetchWithTimeout(`${API}/status/${id}`, {}, 10_000)
       .then(r => r.ok ? r.json() : Promise.reject())
       .then(j => { if (alive) setJob(j); })
       .catch(() => { if (alive) setError(true); });
@@ -1199,6 +1206,15 @@ export default function App() {
   // de teclado funciona desde cualquier ruta (Dashboard/Historial/Editor).
   const [searchOpen, setSearchOpen] = useState(false);
   const [backgroundFile, setBackgroundFile] = useState(null);
+  // Bug cliente 2026-06-09 (Ana M.): qué fuente de fondo usar es decisión
+  // del operador y vive ACÁ, no en UploadZone. Antes el tab (auto/library/
+  // custom) era useState local de UploadZone: al desmontar/remontar el
+  // wizard volvía visualmente a "Generar con IA" pero backgroundFile/
+  // backgroundId seguían seteados en App — y /generate los mandaba igual.
+  // Resultado: un batch nuevo de 3 audios salió con la imagen custom de un
+  // video anterior mientras la UI prometía fondo IA. El envío ahora se
+  // gatea por este modo: sólo se manda lo que el tab activo dice.
+  const [bgSelectMode, setBgSelectMode] = useState("auto"); // auto | library | custom
   const [animateImage, setAnimateImage] = useState(false);
   // match_lyrics toggle: when ON (default), Gemini reads the lyrics and
   // builds the background around the song's primary visual subject. OFF
@@ -1324,7 +1340,7 @@ export default function App() {
     const snapshot = {
       files, approvedJobs, currentReview, reviewQueue, wizardStage,
       style, customColors, delivery, backgroundId, backgroundMode,
-      animateImage, inspiredByLyrics,
+      bgSelectMode, animateImage, inspiredByLyrics,
     };
     const schedule = typeof requestIdleCallback !== "undefined"
       ? (cb) => requestIdleCallback(cb, { timeout: 1500 })
@@ -1339,7 +1355,7 @@ export default function App() {
   }, [
     files, approvedJobs, currentReview, reviewQueue, wizardStage,
     style, customColors, delivery, backgroundId, backgroundMode,
-    animateImage, inspiredByLyrics,
+    bgSelectMode, animateImage, inspiredByLyrics,
     resumableWizard,
   ]);
 
@@ -1430,6 +1446,14 @@ export default function App() {
           queueIdx: 0,
           queue: [{ filename: job.filename || "audio.wav" }],
         });
+        // Audit adversarial 2026-06-09: este flujo entra DIRECTO a review —
+        // las tabs de fondo del upload stage nunca se ven. Una selección
+        // custom/library residual de un batch anterior se mandaría en
+        // silencio (la variante "resume" del bug de Ana M.). El job
+        // resumido no trae fondo propio (transcribed, pre-/generate), así
+        // que IA es el default correcto.
+        setBackgroundFile(null); setBackgroundId(null);
+        setBgSelectMode("auto"); setAnimateImage(false);
         setWizardStage("review");
         // Limpiar el query param sin agregar a history (replace).
         navigate("/new", { replace: true });
@@ -1473,6 +1497,16 @@ export default function App() {
         if (snap.topLevel.delivery) setDelivery(snap.topLevel.delivery);
         if (snap.topLevel.backgroundId != null) setBackgroundId(snap.topLevel.backgroundId);
         if (snap.topLevel.backgroundMode != null) setBackgroundMode(snap.topLevel.backgroundMode);
+        // bgSelectMode: snaps nuevos lo traen explícito; para snaps viejos
+        // lo inferimos — si había backgroundId era el tab Library, si no,
+        // auto. backgroundFile nunca sobrevive el snapshot (File no es
+        // serializable), así que "custom" sin file degrada a auto y el
+        // backend genera con IA — el fallback inofensivo.
+        if (snap.topLevel.bgSelectMode != null) {
+          setBgSelectMode(snap.topLevel.bgSelectMode === "custom" ? "auto" : snap.topLevel.bgSelectMode);
+        } else if (snap.topLevel.backgroundId != null) {
+          setBgSelectMode("library");
+        }
         if (typeof snap.topLevel.animateImage === "boolean") setAnimateImage(snap.topLevel.animateImage);
         if (typeof snap.topLevel.inspiredByLyrics === "boolean") setInspiredByLyrics(snap.topLevel.inspiredByLyrics);
       }
@@ -2789,7 +2823,6 @@ export default function App() {
         formData.append("title_artist_font", jobList[i].titleArtistFont || "");
         formData.append("title_song_font", jobList[i].titleSongFont || "");
         formData.append("title_song_break", jobList[i].titleSongBreak || "");
-        if (animateImage && backgroundFile) formData.append("animate_image", "true");
         formData.append("match_lyrics", String(!!inspiredByLyrics));
         // Capa C 2026-05-24 — si el operador hizo pre-gen del background
         // mientras editaba lyrics (POST /generate-preview), el hash del
@@ -2804,10 +2837,9 @@ export default function App() {
           formData.append("umg_fps", String(delivery.umg_fps));
           formData.append("umg_prores_profile", String(delivery.umg_prores_profile));
         }
-        if (backgroundId) {
-          formData.append("background_id", backgroundId);
-          formData.append("background_mode", backgroundMode);
-        } else if (backgroundFile) formData.append("background_file", backgroundFile);
+        appendBackgroundFields(formData, {
+          bgSelectMode, backgroundId, backgroundMode, backgroundFile, animateImage,
+        });
 
         let res = null;
         try {
@@ -2934,12 +2966,10 @@ export default function App() {
         generateBody.append("title_artist_font", jobList[i].titleArtistFont || "");
         generateBody.append("title_song_font", jobList[i].titleSongFont || "");
         generateBody.append("title_song_break", jobList[i].titleSongBreak || "");
-        if (animateImage && backgroundFile) generateBody.append("animate_image", "true");
         generateBody.append("match_lyrics", String(!!inspiredByLyrics));
-        if (backgroundId) {
-          generateBody.append("background_id", backgroundId);
-          generateBody.append("background_mode", backgroundMode);
-        } else if (backgroundFile) generateBody.append("background_file", backgroundFile);
+        appendBackgroundFields(generateBody, {
+          bgSelectMode, backgroundId, backgroundMode, backgroundFile, animateImage,
+        });
 
         let genRes = null;
         try {
@@ -2997,6 +3027,7 @@ export default function App() {
     try { prefetchAbortRef.current && prefetchAbortRef.current.abort(); } catch {}
     prefetchAbortRef.current = new AbortController();
     setFiles([]); setJobs([]); setBackgroundFile(null); setBackgroundId(null);
+    setBgSelectMode("auto"); setAnimateImage(false);
     setReviewQueue([]); setCurrentReview(null); setApprovedJobs([]);
     setTranscribing(false); setReadyToGenerate(false); setTranscribeError(null);
     // Capa B 2026-05-24: el wizard descartó todo → vuelve al upload state.
@@ -3179,7 +3210,10 @@ export default function App() {
     style,                   // batch-level
     customColors,            // batch-level
     backgroundMode: "veo",
-    animateImage: animateImage && !!backgroundFile,
+    // Mismo gate por bgSelectMode que el payload de /generate (bgPayload.js):
+    // un backgroundFile residual con el tab en "IA" no debe alterar los
+    // params del pre-gen — el hash saldría distinto al del render real.
+    animateImage: bgSelectMode === "custom" && animateImage && !!backgroundFile,
     matchLyrics: inspiredByLyrics,
   } : null;
   // bgPreview se invoca por side-effect (POST + polling). El status/error
@@ -3201,9 +3235,17 @@ export default function App() {
     enabled: !!currentReview && !currentReview.editMode,
     api: API,
     authHeaders,
-    onCacheKey: (key) => {
-      // Update currentReview si aún estamos editando ese file.
-      setCurrentReview((r) => (r ? { ...r, bgCacheKey: key } : r));
+    onCacheKey: (key, meta) => {
+      // Audit adversarial 2026-06-09: si el hook marca la respuesta como
+      // stale (los params cambiaron mientras el fetch volaba), el key NO
+      // puede tocar la review actual — currentReview puede ser ya OTRA
+      // canción y le estaríamos cruzando el fondo. Solo sirve para el
+      // backfill de abajo, que matchea por filename del entry original.
+      if (!meta?.stale) {
+        // Update currentReview si aún estamos editando ese file.
+        setCurrentReview((r) => (r ? { ...r, bgCacheKey: key } : r));
+      }
+      if (key == null) return;
       // R-FRONT-2 (2026-05-24): si el operador aprobó ANTES que el preview
       // terminara (review rápido < 30s), currentReview ya es null. El cache
       // key se hubiera perdido y POST /generate correría Veo de vuelta.
@@ -3214,7 +3256,10 @@ export default function App() {
         if (!target) return prev;
         let changed = false;
         const next = prev.map((j) => {
-          if (j.bgCacheKey === key) return j;
+          // Solo completar entries SIN key: un job aprobado ya copió el
+          // key que le correspondía al aprobarse; pisarlo acá habilita
+          // last-writer-wins entre canciones con el mismo filename.
+          if (j.bgCacheKey) return j;
           if (j.file && j.file.name === target) {
             changed = true;
             return { ...j, bgCacheKey: key };
@@ -3421,6 +3466,8 @@ export default function App() {
         onBackgroundId={setBackgroundId}
         backgroundMode={backgroundMode}
         onBackgroundMode={setBackgroundMode}
+        bgMode={bgSelectMode}
+        onBgMode={setBgSelectMode}
         animateImage={animateImage}
         onAnimateImage={setAnimateImage}
         inspiredByLyrics={inspiredByLyrics}
@@ -3869,6 +3916,11 @@ export default function App() {
                 setApprovedJobs([]);
                 setCurrentReview(null);
                 setReviewQueue([]);
+                // Audit adversarial 2026-06-09: este CTA limpiaba el batch
+                // pero NO la selección de fondo — mismo carryover que el
+                // bug de Ana M., por otra puerta. Paridad con handleReset.
+                setBackgroundFile(null); setBackgroundId(null);
+                setBgSelectMode("auto"); setAnimateImage(false);
                 wizardPersistence.clear();
                 navigate("/new");
               }}

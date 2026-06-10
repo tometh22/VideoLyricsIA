@@ -80,6 +80,15 @@ export function useBackgroundPreview(entry, {
   const lastKeyRef = useRef(null);
 
   const startPreview = useCallback(async (params) => {
+    // Staleness guard (audit adversarial 2026-06-09): el fetch no se
+    // cancela cuando el operador cambia un param — la respuesta vieja
+    // llegaba DESPUÉS del onCacheKey(null) y re-envenenaba el key. Cada
+    // respuesta se compara contra los params vigentes (lastKeyRef): si
+    // ya no coinciden, el key se entrega con stale=true para que el
+    // consumer NO lo escriba en la review actual (sí sirve para el
+    // backfill R-FRONT-2 de jobs ya aprobados con esos params).
+    const myParamsKey = paramsKey(params);
+    const isCurrent = () => lastKeyRef.current === myParamsKey;
     setStatus("queued");
     setError(null);
     try {
@@ -89,6 +98,7 @@ export function useBackgroundPreview(entry, {
         body: JSON.stringify(params),
       });
       if (!res.ok) {
+        if (!isCurrent()) return;
         const txt = await res.text();
         setStatus("error");
         setError(`HTTP ${res.status}: ${txt.slice(0, 200)}`);
@@ -99,13 +109,19 @@ export function useBackgroundPreview(entry, {
       // queda "disabled" + bgCacheKey null. El POST /generate igual corre
       // Veo/Imagen como siempre — solo no hay pre-warming.
       if (data.skipped) {
-        setStatus("disabled");
-        setError(null);
+        if (isCurrent()) {
+          setStatus("disabled");
+          setError(null);
+        }
         return;
       }
       const key = data.bg_cache_key;
+      if (!isCurrent()) {
+        if (onCacheKey) onCacheKey(key, { stale: true });
+        return;
+      }
       setBgCacheKey(key);
-      if (onCacheKey) onCacheKey(key);
+      if (onCacheKey) onCacheKey(key, { stale: false });
 
       if (data.cached) {
         setStatus("done");
@@ -114,6 +130,7 @@ export function useBackgroundPreview(entry, {
       // Async path — pollear hasta done/failed.
       pollUntilDone(data.job_id);
     } catch (e) {
+      if (!isCurrent()) return;
       setStatus("error");
       setError(e.message || String(e));
     }
@@ -172,6 +189,13 @@ export function useBackgroundPreview(entry, {
     if (pollAbortRef.current) pollAbortRef.current.abort();
     setStatus("idle");
     setBgCacheKey(null);
+    // Audit 2026-06-09 (familia del bug Ana M.): avisar al consumer que el
+    // key quedó obsoleto. Sin esto, currentReview.bgCacheKey retiene el
+    // hash de los params VIEJOS durante toda la ventana del debounce
+    // (10s) + el roundtrip; si el operador aprueba ahí adentro, /generate
+    // manda el key viejo y el backend cache-hitea el fondo de los params
+    // anteriores — video con fondo que no refleja lo que se pidió.
+    if (onCacheKey) onCacheKey(null);
 
     debounceRef.current = setTimeout(() => {
       startPreview(params);
