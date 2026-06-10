@@ -182,6 +182,14 @@ export default function LyricsTimeline({
       e.stopPropagation();
       e.currentTarget.setPointerCapture?.(e.pointerId);
       onDragStart?.();
+      // Auditoría 2026-06-10: si hay un smooth-scroll del auto-follow EN
+      // VUELO al agarrar el bloque, el viewport sigue moviéndose bajo el
+      // cursor durante el drag ("el bloque se escapa"). Reasignar
+      // scrollTop a sí mismo cancela la animación en curso, y marcamos
+      // interacción para que el follow no re-dispare ya mismo.
+      markUserScroll();
+      const _sc = scrollRef.current;
+      if (_sc) _sc.scrollTop = _sc.scrollTop;
       // FIX 2 (2026-05-25): snapshot pxPerSec al inicio del drag. Si el
       // operador clickea zoom +/- mid-drag, el live pxPerSec cambia y el
       // delta (deltaPx / pxPerSec) queda mal escalado → el segmento
@@ -195,7 +203,7 @@ export default function LyricsTimeline({
       };
       setPreview({ id: seg._id, start: seg.start, end: seg.end });
     },
-    [onDragStart]
+    [onDragStart, markUserScroll]
   );
 
   const onPointerMove = useCallback(
@@ -246,6 +254,11 @@ export default function LyricsTimeline({
         return;
       }
       if (p && (Math.abs(p.start - seg.start) > 1e-3 || Math.abs(p.end - seg.end) > 1e-3)) {
+        // Auditoría 2026-06-10: el commit de un drag NO marcaba interacción
+        // — al soltar, el auto-follow podía yankear el viewport al instante
+        // (dragRef ya está limpio) y el bloque recién acomodado "se iba".
+        // El click-path de arriba ya lo hacía; esto empareja el drag-path.
+        markUserScroll();
         onTimingChange?.(seg._id, p.start, p.end);
       }
     },
