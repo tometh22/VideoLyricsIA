@@ -219,18 +219,33 @@ def test_wrapper_never_raises_even_with_flag_on(monkeypatch):
 def test_perf_text_clean_libretto():
     import performance_text as pt
     items = [
-        (61.0, "(Público cantando) Nada de eso fue un error"),
-        (64.0, "¡Eh!"),                      # pure exclamation → drop
-        (48.0, "lo dejaste pasar"),
-        (50.0, "lo dejaste pasar, no quiero que me perdones"),  # contains prev
-        (122.0, "música y aplausos"),        # label → drop
-        (40.0, "Tengo una mala noticia"),
-        (183.0, "¡Gracias, Ciel!"),          # chatter → drop
+        (61.0, "(Público cantando) Nada de eso fue un error", 2),
+        (64.0, "¡Eh!", 2),                      # pure exclamation → drop
+        (48.0, "lo dejaste pasar", 1),
+        # cross-window seam: contains prev within overlap → merge
+        (50.0, "lo dejaste pasar, no quiero que me perdones", 2),
+        (122.0, "música y aplausos", 4),        # label → drop
+        (40.0, "Tengo una mala noticia", 1),
+        (183.0, "¡Gracias, Ciel!", 7),          # chatter → drop
     ]
     out = pt.clean_libretto(items)
     assert out == ["Tengo una mala noticia",
                    "lo dejaste pasar, no quiero que me perdones",
                    "Nada de eso fue un error"]
+
+
+def test_perf_text_real_repetitions_survive_dedup():
+    """The crowd repeats the chorus 8x a few seconds apart, heard by the
+    SAME window: real repetitions, not seams — keep all. A cross-window
+    duplicate in the overlap zone is a seam — merge."""
+    import performance_text as pt
+    same_win = [(65.0, "Nada de esto fue un error", 2),
+                (69.0, "Nada de esto fue un error", 2),
+                (73.0, "Nada de esto fue un error", 2)]
+    assert len(pt.clean_libretto(same_win)) == 3
+    seam = [(28.0, "No quiero que me perdones", 0),
+            (29.0, "No quiero que me perdones", 1)]
+    assert len(pt.clean_libretto(seam)) == 1
 
 
 def test_perf_text_parse_ts_line():
@@ -273,3 +288,24 @@ def test_perf_text_phantom_intro_and_hallucination():
     out2 = pt.drop_hallucinated_lines(texts, ref)
     assert "El error es todo lo que no hicimos por temor" not in out2
     assert "¡Mirá dónde estamos, papá!" in out2
+
+
+def test_condense_repeated_skips_rotor_style():
+    """v3 e2e shape: crowd repetitions stacked/skipped at one timestamp
+    must condense into one block line (like Rotor's own GT does)."""
+    segs = [
+        {"text": "No me niegues que me buscaste", "start": 59.0, "end": 61.6},
+        {"text": "Nada, nada de esto", "start": 61.6, "end": 75.1, "ctc_skipped": True},
+        {"text": "nada de esto fue un error", "start": 75.1, "end": 75.1, "ctc_skipped": True},
+        {"text": "Nada de esto fue un error", "start": 75.1, "end": 75.1, "ctc_skipped": True},
+        {"text": "Nada de esto fue un error", "start": 75.1, "end": 76.1, "ctc_recovered": "mix"},
+        {"text": "Nada fue un error", "start": 75.1, "end": 76.6},
+        {"text": "¡Dos! ¡One, two, three, va!", "start": 76.6, "end": 78.8, "ctc_skipped": True},
+    ]
+    out = ctc_align.condense_repeated_skips(segs)
+    low = [s["text"].lower() for s in out]
+    assert low.count("nada de esto fue un error") == 1
+    merged = next(s for s in out if s["text"].lower() == "nada de esto fue un error")
+    assert merged.get("ctc_condensed", 0) >= 2 and merged["end"] >= 76.1
+    assert "Nada fue un error" in [s["text"] for s in out]
+    assert "No me niegues que me buscaste" in [s["text"] for s in out]

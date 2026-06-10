@@ -467,6 +467,42 @@ def place_unaligned(line_times, originals, total_dur: float, slack: float = 4.0)
     return out
 
 
+def condense_repeated_skips(segments: list[dict]) -> list[dict]:
+    """Rotor-style condensation for crowd-chorus repetitions (libretto
+    path). When the crowd repeats a phrase Nx, the libretto now lists
+    every repetition (window-aware dedup) but the stem can't anchor them
+    individually (demucs erases the crowd; the speech model reads 1-2 of
+    4 in the mush) — they end up stacked at one timestamp. Rotor's own
+    GT does NOT anchor them either: it bundles the block into ONE long
+    line ('Oh, nada fue un error, nada fue un error, ...' 65.2→76.2).
+    Same move: consecutive text-similar lines where at least one side is
+    unanchored merge into one line spanning the block; leftover
+    zero-length skipped lines are dropped, not stacked. Pure."""
+    def n(t):
+        return re.sub(r"\W+", "", (t or "").lower())
+
+    out: list[dict] = []
+    for s in segments:
+        if out:
+            p = out[-1]
+            a, b = n(p.get("text")), n(s.get("text"))
+            similar = len(b) > 8 and (a == b or a in b or b in a)
+            unanchored = (s.get("ctc_skipped") or p.get("ctc_skipped")
+                          or p.get("ctc_condensed")
+                          or (s["end"] - s["start"]) < 0.3
+                          or (p["end"] - p["start"]) < 0.3)
+            if similar and unanchored:
+                p["end"] = max(p["end"], s["end"])
+                if len(s.get("text") or "") > len(p.get("text") or ""):
+                    p["text"] = s["text"]
+                p["ctc_condensed"] = p.get("ctc_condensed", 1) + 1
+                p.pop("ctc_skipped", None)
+                continue
+        out.append(dict(s))
+    return [s for s in out
+            if (s["end"] - s["start"]) >= 0.3 or not s.get("ctc_skipped")]
+
+
 def looks_collapsed(line_times, min_dur_s: float = 0.15,
                     max_collapsed_frac: float = 0.25) -> bool:
     """Structural failure guard: when alignment fails (wrong language,
@@ -684,6 +720,16 @@ def retime_segments(audio_path: str, segments: list[dict],
                   and os.environ.get("CTC_ALIGN_MIX_RECOVER", "1").strip().lower() in _TRUE)
         if mix_ok:
             accept = float(os.environ.get("CTC_ALIGN_MIX_ACCEPT", "0.35"))
+            # CONTEXTUAL threshold (root-cause test, Nada Fue block 1:05):
+            # with the CORRECT chorus text the mix-CTC places crowd lines at
+            # +0.6/+1.7 s of Rotor but scores 0.21-0.29 — the flat 0.35
+            # threshold rejected good placements. When the skipped line's
+            # text REPEATS an already-anchored line (a known chorus, not
+            # inventable), the prior is strong → accept from 0.20.
+            accept_known = float(os.environ.get("CTC_ALIGN_MIX_ACCEPT_KNOWN", "0.20"))
+            anchored_norms = [re.sub(r"\W+", "", lines[i].lower())
+                              for i in range(len(lines))
+                              if i not in skipped_lines and len(lines[i]) > 10]
             mwav, msr = torchaudio.load(mix_path)
             mwav = mwav.mean(0, keepdim=True)
             if msr != SR:
@@ -713,7 +759,10 @@ def retime_segments(audio_path: str, segments: list[dict],
                         continue
                     gs, ge, gws = glt[k]
                     msc = sum(w[3] for w in gws) / len(gws)
-                    if msc < accept:
+                    n = re.sub(r"\W+", "", lines[li].lower())
+                    known = len(n) > 10 and any(
+                        n in a or a in n for a in anchored_norms)
+                    if msc < (accept_known if known else accept):
                         continue
                     off = lo
                     line_times[li] = (gs + off, ge + off,

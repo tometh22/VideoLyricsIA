@@ -37,9 +37,11 @@ _SYS_TS = (
     "FORMATO EXACTO de cada linea: [mm:ss.s] texto de la frase\n"
     "Ejemplo:\n[00:01.2] Tengo una mala noticia\n[00:03.0] No fue de casualidad\n\n"
     "REGLAS DURAS:\n"
-    "1. SOLO lo que escuchas en estos segundos. NO completes el estribillo entero,\n"
-    "   NO repitas en loop una frase que no se repite en el audio.\n"
-    "2. SI transcribi TODAS las repeticiones que realmente se cantan.\n"
+    "1. SOLO lo que se OYE en estos segundos: no completes de memoria un\n"
+    "   estribillo que no suene en el audio.\n"
+    "2. Si una frase se canta VARIAS veces — la repita el cantante O LA COREE\n"
+    "   EL PUBLICO — escribila TODAS las veces que suene, una linea por\n"
+    "   repeticion. El publico coreando TAMBIEN es letra: transcribilo.\n"
     "3. NO cortes una frase a la mitad: escribila completa con el timestamp de cuando EMPIEZA.\n"
     "4. Ad-libs/gritos como se oyen ('Oh, oh', '¡papa!'). Si solo hay musica/aplausos NO escribas nada.\n"
     "5. NO inventes palabras: si no entendes, lo mas parecido foneticamente.\n"
@@ -88,7 +90,7 @@ def drop_phantom_intro(rows: list[tuple[float, str]],
     chorus). Rotor doesn't show it; neither do we. Pure."""
     while len(rows) >= 2 and rows[1][0] - rows[0][0] > min_gap_s:
         n0 = _norm(rows[0][1])
-        if any(n0 in _norm(t) or _norm(t) in n0 for _, t in rows[1:]):
+        if any(n0 in _norm(r[1]) or _norm(r[1]) in n0 for r in rows[1:]):
             rows = rows[1:]
             continue
         break
@@ -124,14 +126,23 @@ def drop_hallucinated_lines(texts: list[str], reference: str,
     return out
 
 
-def clean_libretto(items: list[tuple[float, str]]) -> list[str]:
+def clean_libretto(items: list[tuple]) -> list[str]:
     """Window-seam artifacts → ordered clean line texts. Drops stage
     directions / pure-vocal intros / chatter / counts; strips
-    '(Público cantando) ' prefixes; merges contained duplicates within
-    6 s (a fragment and its fuller version from overlapping windows).
-    Pure — unit-testable."""
-    rows: list[tuple[float, str]] = []
-    for ts, raw in sorted(items, key=lambda x: x[0]):
+    '(Público cantando) ' prefixes. Pure — unit-testable.
+
+    Dedup is WINDOW-AWARE (root-cause fix): a crowd chorus repeats the
+    SAME phrase 8× a few seconds apart — a time-only dedup fused real
+    repetitions into one line (measured: block 1:00-1:16 reduced to a
+    single line). A duplicate is a SEAM only when it comes from a
+    DIFFERENT window within the overlap zone, or from the same window at
+    a near-identical timestamp (Gemini stutter). Same window, distinct
+    timestamps, same text = the crowd really repeating → KEEP ALL.
+    Items: (ts, text) or (ts, text, window_idx)."""
+    rows: list[tuple[float, str, int]] = []
+    for it in sorted(items, key=lambda x: x[0]):
+        ts, raw = it[0], it[1]
+        win = it[2] if len(it) > 2 else 0
         t = raw.strip()
         if ")" in t[:25]:
             t = re.sub(r"^[^)]*\)\s*", "", t).strip()
@@ -144,27 +155,29 @@ def clean_libretto(items: list[tuple[float, str]]) -> list[str]:
         n = _norm(t)
         merged = False
         for j in range(len(rows) - 1, -1, -1):
-            pts, pt = rows[j]
-            # 10 s window / 0.80 ratio: a seam duplicate slipped through at
-            # 6 s / 0.85 (operator-reported: "aprendí la diferencia" ×2)
-            if ts - pts > 10.0:
+            pts, pt, pwin = rows[j]
+            if ts - pts > OVERLAP_S + 4.0:
                 break
+            seam = (win != pwin and ts - pts <= OVERLAP_S + 4.0) or \
+                   (win == pwin and ts - pts < 1.5)
+            if not seam:
+                continue
             pn = _norm(pt)
             if n in pn or SequenceMatcher(None, n, pn).ratio() >= 0.80:
                 merged = True
                 break
             if pn in n:
-                rows[j] = (pts, t)
+                rows[j] = (pts, t, pwin)
                 merged = True
                 break
         if not merged:
-            rows.append((ts, t))
+            rows.append((ts, t, win))
     # pure-vocal lines before the first lexical line
-    first = next((i for i, (_, t) in enumerate(rows)
-                  if not _PURE_VOCAL.match(t)), 0)
+    first = next((i for i, r in enumerate(rows)
+                  if not _PURE_VOCAL.match(r[1])), 0)
     rows = rows[first:]
     rows = drop_phantom_intro(rows)
-    return [t for _, t in rows]
+    return [r[1] for r in rows]
 
 
 def transcribe_performance(audio_path: str, artist: str = "",
@@ -184,9 +197,10 @@ def transcribe_performance(audio_path: str, artist: str = "",
         y, _ = librosa.load(audio_path, sr=sr, mono=True)
         dur = len(y) / sr
         who = f" ({artist} — {title})" if artist else ""
-        items: list[tuple[float, str]] = []
+        items: list[tuple[float, str, int]] = []
         t = 0.0
         fails = 0
+        wi = 0
         while t < dur - 0.5:
             c0, c1 = t, min(dur, t + CHUNK_S)
             clip = y[int(c0 * sr):int(c1 * sr)]
@@ -222,8 +236,9 @@ def transcribe_performance(audio_path: str, artist: str = "",
                 rel, text = parse_ts_line(line)
                 if text:
                     items.append((c0 + min(rel if rel is not None else 0.0,
-                                           c1 - c0), text))
+                                           c1 - c0), text, wi))
             t += CHUNK_S - OVERLAP_S
+            wi += 1
         out = clean_libretto(items)
         out = drop_hallucinated_lines(out, reference)
         logger.info("[PERF-TEXT] libreto: %d líneas de %.0fs de audio (%s)",
