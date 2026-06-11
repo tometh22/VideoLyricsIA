@@ -578,15 +578,15 @@ export default function UploadZone({
           const list = Array.isArray(data) ? data : [];
           setLibraryBgs(list);
           setLibraryLoaded(true);
-          // Fan out per-asset usage probes. The backend returns the
-          // tenant-scoped count, so this is what powers the "ya usado"
-          // chip. Failures are swallowed — a missing badge is fine.
-          list.forEach((bg) => {
-            fetch(`${API}/backgrounds/${bg.id}/usage`, { headers: authHeaders() })
-              .then((r) => (r.ok ? r.json() : null))
-              .then((u) => { if (u) setUsageMap((prev) => ({ ...prev, [bg.id]: u })); })
-              .catch(() => {});
-          });
+          // Un solo GET batch para el "ya usado" de toda la grilla.
+          // Incidente 2026-06-11: el fan-out anterior (un GET por asset)
+          // escaló a 80 requests simultáneos al crecer la biblioteca y
+          // agotó el pool de Postgres (SSL drops en Sentry, thumbnails
+          // sin cargar). Failures swallowed — un badge ausente es fine.
+          fetch(`${API}/backgrounds/usage`, { headers: authHeaders() })
+            .then((r) => (r.ok ? r.json() : null))
+            .then((data) => { if (data?.usage) setUsageMap(data.usage); })
+            .catch(() => {});
         })
         .catch(() => { setLibraryFetchFailed(true); setLibraryLoaded(true); });
     }
@@ -1887,6 +1887,11 @@ export default function UploadZone({
                                   src={`${API}/backgrounds/${bg.id}/preview?${tokenParam()}`}
                                   className="w-full h-full object-cover group-hover:scale-[1.02] transition-transform duration-500"
                                   alt={bg.name}
+                                  /* 80 assets full-res: sin lazy, el grid
+                                     dispara TODO junto y la biblioteca
+                                     "no carga" (incidente 2026-06-11). */
+                                  loading="lazy"
+                                  decoding="async"
                                 />
                               )}
                               {selected && (
