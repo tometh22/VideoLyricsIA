@@ -65,6 +65,7 @@ from auth import (
     has_drive_access,
     telemetry_enabled,
     generate_api_key,
+    is_super_admin,
 )
 import storage
 from datetime import datetime, timedelta, timezone
@@ -72,7 +73,7 @@ from datetime import datetime, timedelta, timezone
 from database import (
     Job, User, UserSettings, AuditLog, APIKey, get_db, init_db,
     BackgroundAsset, AssetUsage, Delivery, DeliveryChangeRequest,
-    SalesLead, UserSession, LoginSession, scoped_db, pool_stats,
+    SalesLead, UserSession, LoginSession, UiEvent, scoped_db, pool_stats,
 )
 from jobs import bulk_delete_jobs, create_job, delete_job, get_job, get_all_jobs, update_job
 from observability import init_sentry, init_logging, health_snapshot
@@ -670,6 +671,43 @@ def on_startup():
     ).start()
     logger.info("stale-prores-scan thread started (daily)")
 
+    # Alertas de negocio por tenant (Fase 2 panel world-class, 2026-06-11):
+    # health score diario por cuenta — caída de uso WoW, spike de
+    # retrabajos, tasa de error. La señal de churn que Sentry técnico no
+    # da: "UMG bajó 40% su uso esta semana" tiene que sonar ANTES de que
+    # el cliente lo mencione en una llamada.
+    _BUSINESS_ALERTS_LOCK_KEY = 9118364455199106
+
+    def _business_alerts_loop():
+        _time.sleep(360)  # let the API come up first
+        while True:
+            try:
+                def _do_business_alerts():
+                    from admin_metrics import run_business_alerts
+                    from database import SessionLocal as _SL
+                    _db = _SL()
+                    try:
+                        run_business_alerts(_db)
+                    finally:
+                        _db.close()
+                _run_with_advisory_lock(
+                    _BUSINESS_ALERTS_LOCK_KEY, _do_business_alerts,
+                    name="business_alerts",
+                )
+            except Exception:  # pragma: no cover
+                try:
+                    import sentry_sdk
+                    sentry_sdk.capture_exception()
+                except Exception:
+                    pass
+                _time.sleep(60)
+            _time.sleep(24 * 3600)  # diario
+
+    threading.Thread(
+        target=_business_alerts_loop, daemon=True, name="business-alerts",
+    ).start()
+    logger.info("business-alerts thread started (daily)")
+
 
 # --- Background library (public, authenticated) ---
 _BACKGROUNDS_LIB = os.path.join(os.path.dirname(__file__), "..", "assets", "backgrounds", "library")
@@ -1060,6 +1098,9 @@ async def login(body: LoginRequest, request: Request, db: Session = Depends(get_
             "username": user.username,
             "email": user.email,
             "role": user.role,
+            # Visibilidad inmediata de Insights post-login, sin esperar el
+            # freshen de /auth/me. Solo UI; el gate real es el backend.
+            "is_super_admin": is_super_admin(user.username, user.email, user.role),
             "tenant_id": user.tenant_id,
             "plan": user.plan_id,
             "allow_overage": getattr(user, "allow_overage", False) or False,
@@ -1498,6 +1539,91 @@ def telemetry_heartbeat(
         except Exception:
             pass
         return {"ok": True, "recorded": False}
+
+
+# Whitelist de eventos de UI aceptados por /telemetry/events. Un tipo fuera
+# de la lista se descarta en silencio (no es un error del cliente: versiones
+# viejas/nuevas del frontend pueden diferir durante un deploy). Mantener en
+# sync con frontend/src/lib/telemetryTrack.js y con admin_insights.insights_wizard.
+_UI_EVENT_TYPES = frozenset({
+    "wizard.step",           # {step_from, step_to, trigger}
+    "wizard.scene_mode",     # {mode}
+    "wizard.style",          # {style}
+    "wizard.library_filter", # {filter}
+    "wizard.library_select", # {asset_id, file_type, had_used_badge}
+    "wizard.library_mode",   # {asset_id, mode: as_is|variation}
+    "wizard.start_review",   # {}
+    "wizard.generate",       # {batch_size, mode: direct|reviewed}
+    "wizard.approve_lyrics", # {segments_edited}
+    "edit.entered",          # {job_id}
+    "edit.submitted",        # {job_id, fields}
+})
+_UI_EVENTS_MAX_BATCH = 25
+_UI_EVENT_DATA_MAX_BYTES = 2048
+
+
+class UiEventIn(BaseModel):
+    type: str
+    data: dict | None = None
+
+
+class UiEventsBatch(BaseModel):
+    events: list[UiEventIn]
+
+
+@app.post("/telemetry/events")
+@limiter.limit("60/minute")
+def telemetry_events(
+    body: UiEventsBatch,
+    request: Request,
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Batch de eventos de comportamiento del wizard (best-effort).
+
+    Alimenta ui_events, que backs el funnel del wizard del panel Insights
+    (super-admin). Mismo contrato de resiliencia que /telemetry/heartbeat:
+    NUNCA 5xx, con TELEMETRY_ENABLED apagada responde 200 sin escribir.
+
+    Defensas: batch capado a _UI_EVENTS_MAX_BATCH, event_type whitelisted,
+    event_data descartado si excede _UI_EVENT_DATA_MAX_BYTES serializado —
+    un cliente roto no puede inflar la tabla.
+    """
+    if not telemetry_enabled():
+        return {"ok": True, "recorded": 0}
+
+    try:
+        now = datetime.now(timezone.utc)
+        recorded = 0
+        for ev in body.events[:_UI_EVENTS_MAX_BATCH]:
+            if ev.type not in _UI_EVENT_TYPES:
+                continue
+            data = ev.data
+            if data is not None:
+                try:
+                    if len(json.dumps(data)) > _UI_EVENT_DATA_MAX_BYTES:
+                        data = None
+                except (TypeError, ValueError):
+                    data = None
+            db.add(UiEvent(
+                user_id=current_user["id"],
+                tenant_id=current_user.get("tenant_id") or "default",
+                event_type=ev.type,
+                event_data=data,
+                created_at=now,
+            ))
+            recorded += 1
+        if recorded:
+            db.commit()
+        return {"ok": True, "recorded": recorded}
+    except Exception as e:
+        logger.warning("[TELEMETRY] events write failed for user %s: %s",
+                       current_user.get("id"), e)
+        try:
+            db.rollback()
+        except Exception:
+            pass
+        return {"ok": True, "recorded": 0}
 
 
 @app.post("/auth/change-password")
@@ -4151,7 +4277,7 @@ async def _maybe_ctc_retime(result, audio_path: str, job_id: str,
         retimed = await asyncio.wait_for(
             asyncio.to_thread(_ctc.retime_segments, _stem, segs, job_id,
                               audio_path),  # mix_path — M5 crowd recovery
-            timeout=240,
+            timeout=420,
         )
         if (retimed is None and _ctc.last_decline_reason == "structural"
                 and os.environ.get("CTC_ALIGN_PERF_TEXT", "0").strip().lower()
@@ -4165,7 +4291,8 @@ async def _maybe_ctc_retime(result, audio_path: str, job_id: str,
             import performance_text as _pt
             texts = await asyncio.wait_for(
                 asyncio.to_thread(_pt.transcribe_performance, audio_path,
-                                  artist, title),
+                                  artist, title,
+                                  result.get("reference_lyrics") or ""),
                 timeout=300,
             )
             if texts:
@@ -4173,9 +4300,13 @@ async def _maybe_ctc_retime(result, audio_path: str, job_id: str,
                 retimed = await asyncio.wait_for(
                     asyncio.to_thread(_ctc.retime_segments, _stem, psegs,
                                       job_id, audio_path, 0.5),
-                    timeout=240,
+                    timeout=600,
                 )
                 if retimed:
+                    # Rotor-style: crowd repetitions the stem can't anchor
+                    # individually condense into one block line; leftover
+                    # unplaced lines drop instead of stacking.
+                    retimed = _ctc.condense_repeated_skips(retimed)
                     logger.info("[CTC] performance-libretto retime: %d líneas "
                                 "(reemplaza el texto de la cascada, job=%s)",
                                 len(retimed), job_id)
@@ -4186,7 +4317,7 @@ async def _maybe_ctc_retime(result, audio_path: str, job_id: str,
             from timing_sources import CTC_ALIGN
             set_timing_source(job_id, CTC_ALIGN)
     except Exception as e:
-        logger.warning("[CTC] retime wrapper declined: %s (job=%s)", e, job_id)
+        logger.warning("[CTC] retime wrapper declined: %r (job=%s)", e, job_id)
     finally:
         if _stem:
             try:

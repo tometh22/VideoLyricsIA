@@ -886,6 +886,47 @@ class UserSession(Base):
         }
 
 
+class UiEvent(Base):
+    """Eventos de comportamiento de UI (wizard), alimentados por POST /telemetry/events.
+
+    Backs el funnel del wizard del panel Insights: qué paso alcanza cada
+    sesión de creación, dónde se abandona, qué fondos se seleccionan, etc.
+    El frontend manda batches best-effort (telemetryTrack.js); el endpoint
+    whitelistea event_type y acota event_data, así que la tabla solo
+    contiene eventos conocidos con payloads chicos.
+
+    Gateado por TELEMETRY_ENABLED igual que user_sessions — sin la flag el
+    endpoint no escribe. Retención/purga: pendiente (volumen acotado por
+    cap de batch + whitelist; revisar cuando crezca).
+    """
+    __tablename__ = "ui_events"
+    __table_args__ = (
+        Index("ix_ui_events_user_created", "user_id", text("created_at DESC")),
+        Index("ix_ui_events_type_created", "event_type", text("created_at DESC")),
+    )
+
+    # BigInteger en Postgres (la tabla puede crecer mucho); variant Integer
+    # en SQLite porque solo INTEGER PRIMARY KEY autoincrementa ahí (tests).
+    id = Column(BigInteger().with_variant(Integer, "sqlite"), primary_key=True, autoincrement=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    # Desnormalizado para filtrar por tenant sin join (mismo criterio que
+    # user_sessions).
+    tenant_id = Column(String(100), nullable=False, index=True)
+    event_type = Column(String(64), nullable=False)
+    event_data = Column(JSONB, nullable=True)
+    created_at = Column(DateTime(timezone=True), default=utcnow, nullable=False)
+
+    def to_dict(self):
+        return {
+            "id": self.id,
+            "user_id": self.user_id,
+            "tenant_id": self.tenant_id,
+            "event_type": self.event_type,
+            "event_data": self.event_data,
+            "created_at": self.created_at.isoformat() if self.created_at else None,
+        }
+
+
 class LoginSession(Base):
     """Sesión de login = un dispositivo/navegador con un token activo.
 

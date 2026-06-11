@@ -219,13 +219,14 @@ def test_wrapper_never_raises_even_with_flag_on(monkeypatch):
 def test_perf_text_clean_libretto():
     import performance_text as pt
     items = [
-        (61.0, "(Público cantando) Nada de eso fue un error"),
-        (64.0, "¡Eh!"),                      # pure exclamation → drop
-        (48.0, "lo dejaste pasar"),
-        (50.0, "lo dejaste pasar, no quiero que me perdones"),  # contains prev
-        (122.0, "música y aplausos"),        # label → drop
-        (40.0, "Tengo una mala noticia"),
-        (183.0, "¡Gracias, Ciel!"),          # chatter → drop
+        (61.0, "(Público cantando) Nada de eso fue un error", 2),
+        (64.0, "¡Eh!", 2),                      # pure exclamation → drop
+        (48.0, "lo dejaste pasar", 1),
+        # cross-window seam: contains prev within overlap → merge
+        (50.0, "lo dejaste pasar, no quiero que me perdones", 2),
+        (122.0, "música y aplausos", 4),        # label → drop
+        (40.0, "Tengo una mala noticia", 1),
+        (183.0, "¡Gracias, Ciel!", 7),          # chatter → drop
     ]
     out = pt.clean_libretto(items)
     assert out == ["Tengo una mala noticia",
@@ -233,8 +234,95 @@ def test_perf_text_clean_libretto():
                    "Nada de eso fue un error"]
 
 
+def test_perf_text_real_repetitions_survive_dedup():
+    """The crowd repeats the chorus 8x a few seconds apart, heard by the
+    SAME window: real repetitions, not seams — keep all. A cross-window
+    duplicate in the overlap zone is a seam — merge."""
+    import performance_text as pt
+    same_win = [(65.0, "Nada de esto fue un error", 2),
+                (69.0, "Nada de esto fue un error", 2),
+                (73.0, "Nada de esto fue un error", 2)]
+    assert len(pt.clean_libretto(same_win)) == 3
+    seam = [(28.0, "No quiero que me perdones", 0),
+            (29.0, "No quiero que me perdones", 1)]
+    assert len(pt.clean_libretto(seam)) == 1
+
+
 def test_perf_text_parse_ts_line():
     import performance_text as pt
     assert pt.parse_ts_line("[01:32.5] Tengo una mala noticia") == (
         92.5, "Tengo una mala noticia")
     assert pt.parse_ts_line("[00:")[1] == ""
+
+
+def test_perf_text_label_leaks_from_staging():
+    """Labels observed leaking into a real staging video as lines."""
+    import performance_text as pt
+    items = [(10.0, "Tengo una mala noticia"),
+             (20.0, "Público cantando y aplaudiendo"),
+             (30.0, "silence"),
+             (40.0, "Aplausos y ovación"),
+             (50.0, "No fue de casualidad")]
+    assert pt.clean_libretto(items) == ["Tengo una mala noticia",
+                                        "No fue de casualidad"]
+
+
+def test_perf_text_phantom_intro_and_hallucination():
+    """Operator report (staging, Nada Fue): crowd pre-sings the chorus at
+    0:00 (isolated 39s before the body) and Gemini invented a verse that
+    is never sung."""
+    import performance_text as pt
+    rows = [(0.5, "Nada de esto fue un error"),
+            (39.6, "Tengo una mala noticia"),
+            (42.9, "No fue de casualidad"),
+            (75.0, "Nada de esto fue un error")]
+    out = pt.drop_phantom_intro(rows)
+    assert out[0][1] == "Tengo una mala noticia"
+
+    ref = "tengo una mala noticia no fue de casualidad quería que nos " \
+          "pasara dejaste pasar perdones perdón niegues buscaste errores " \
+          "eligen diferencia juego azar entrega"
+    texts = ["Tengo una mala noticia",
+             "El error es todo lo que no hicimos por temor",  # hallucinated
+             "¡Mirá dónde estamos, papá!"]                    # ad-lib: keep
+    out2 = pt.drop_hallucinated_lines(texts, ref)
+    assert "El error es todo lo que no hicimos por temor" not in out2
+    assert "¡Mirá dónde estamos, papá!" in out2
+
+
+def test_condense_repeated_skips_rotor_style():
+    """Run-based block: consecutive UNANCHORED lines with a repeated-text
+    signature become ONE block whose text is the run's REAL sequence
+    (variants and interjections included), spanning to the next anchor."""
+    segs = [
+        {"text": "No me niegues que me buscaste", "start": 59.0, "end": 61.6},
+        {"text": "Nada, nada de esto", "start": 61.6, "end": 75.1, "ctc_skipped": True},
+        {"text": "nada de esto fue un error", "start": 75.1, "end": 75.1, "ctc_skipped": True},
+        {"text": "Oh, oh", "start": 75.1, "end": 75.1, "ctc_skipped": True},
+        {"text": "Nada de esto fue un error", "start": 75.1, "end": 75.1, "ctc_skipped": True},
+        {"text": "Nada fue un error", "start": 75.1, "end": 76.6},  # anclada: corta el run
+    ]
+    out = ctc_align.condense_repeated_skips(segs)
+    assert len(out) == 3
+    blk = out[1]
+    assert blk.get("ctc_condensed") == 4
+    # secuencia REAL: lead-in + repeticion + interjeccion "oh, oh" adentro
+    assert blk["text"].lower().startswith("nada, nada de esto, nada de esto fue un error")
+    assert "oh, oh" in blk["text"].lower()
+    # span: desde el inicio del run hasta la proxima ancla
+    assert blk["start"] == 61.6 and abs(blk["end"] - 75.1) < 0.3
+    # la linea anclada sigue individual (dinamismo intacto)
+    assert out[2]["text"] == "Nada fue un error"
+
+
+def test_condense_extends_block_to_next_anchor():
+    """Job 400 chorus 1: the COND2 block stayed 61.5-65.0 while the crowd
+    chants until 75.1 — must extend Rotor-style (their block 65.2→76.24)."""
+    segs = [
+        {"text": "Nada de esto fue un error", "start": 61.5, "end": 62.0, "ctc_skipped": True},
+        {"text": "Nada de esto fue un error", "start": 62.0, "end": 65.0, "ctc_skipped": True},
+        {"text": "Nada fue un error", "start": 75.1, "end": 76.6},
+    ]
+    out = ctc_align.condense_repeated_skips(segs)
+    assert out[0].get("ctc_condensed") == 2
+    assert abs(out[0]["end"] - 74.9) < 0.01  # extendido hasta la próxima ancla
