@@ -6,11 +6,15 @@
 // siguiendo el patrón de Usuarios. La data vive en useNegocio; esta sección
 // solo cablea el hook a la vista correspondiente.
 import CostosView from "./CostosView";
+import MargenTenantsView from "./MargenTenantsView";
 import InvoicesView from "./InvoicesView";
 import useNegocio from "./useNegocio";
 
 export default function NegocioSection({ subTab }) {
   const {
+    economics,
+    economicsForbidden,
+    economicsLoading,
     costSinceDays,
     setCostSinceDays,
     costRevenuePerVideo,
@@ -27,14 +31,21 @@ export default function NegocioSection({ subTab }) {
 
   if (subTab === "costos") {
     return (
-      <CostosView
-        costSinceDays={costSinceDays}
-        setCostSinceDays={setCostSinceDays}
-        costRevenuePerVideo={costRevenuePerVideo}
-        setCostRevenuePerVideo={setCostRevenuePerVideo}
-        costDashboard={costDashboard}
-        costLoading={costLoading}
-      />
+      <>
+        <CostosView
+          costSinceDays={costSinceDays}
+          setCostSinceDays={setCostSinceDays}
+          costRevenuePerVideo={costRevenuePerVideo}
+          setCostRevenuePerVideo={setCostRevenuePerVideo}
+          costDashboard={costDashboard}
+          costLoading={costLoading}
+        />
+        <MargenTenantsView
+          economics={economics}
+          loading={economicsLoading}
+          forbidden={economicsForbidden}
+        />
+      </>
     );
   }
 

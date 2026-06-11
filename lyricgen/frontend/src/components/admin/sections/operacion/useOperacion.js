@@ -16,6 +16,22 @@ const STUCK_THRESHOLD_MIN = 100;
 export default function useOperacion() {
   const { flashError } = useAdmin();
 
+  // --- Métricas de decisión (Fases 1+2): health por tenant + funnel -------
+  // Carga on-mount, sin polling: son agregados diarios/semanales, no
+  // telemetría en vivo.
+  const [tenantHealth, setTenantHealth] = useState(null);
+  const [funnel, setFunnel] = useState(null);
+  useEffect(() => {
+    (async () => {
+      try {
+        setTenantHealth(await fetchJson(`${API}/admin/metrics/health`));
+      } catch { /* best-effort: sin cards si falla */ }
+      try {
+        setFunnel(await fetchJson(`${API}/admin/metrics/funnel?days=7`));
+      } catch { /* ídem */ }
+    })();
+  }, []);
+
   // --- Health + stuck jobs (15 s) ------------------------------------------
   const [health, setHealth] = useState(null);
   const [stuckJobs, setStuckJobs] = useState({ count: 0, jobs: [] });
@@ -116,6 +132,8 @@ export default function useOperacion() {
   }, [jobsAutoRefresh, loadJobs]);
 
   return {
+    tenantHealth,
+    funnel,
     // health + reaper
     health,
     stuckJobs,
