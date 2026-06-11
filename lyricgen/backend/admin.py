@@ -1432,3 +1432,54 @@ async def cleanup_inputs(
     ))
     db.commit()
     return report
+
+
+# ---------------------------------------------------------------------------
+# Métricas de decisión — Fases 1+2 del panel world-class (2026-06-11).
+# Lógica en admin_metrics.py; acá solo routing + gates.
+# ---------------------------------------------------------------------------
+
+@router.get("/metrics/timeseries")
+async def admin_metrics_timeseries(
+    days: int = Query(28, ge=7, le=90),
+    admin: dict = Depends(require_admin),
+    db: Session = Depends(get_db),
+):
+    """Series por día/tenant (creados, aprobados, retrabajos, costo IA).
+    El frontend deriva los deltas WoW de las dos ventanas de 7 días."""
+    from admin_metrics import metrics_timeseries
+    return metrics_timeseries(db, days=days)
+
+
+@router.get("/metrics/funnel")
+async def admin_metrics_funnel(
+    days: int = Query(7, ge=1, le=28),
+    admin: dict = Depends(require_admin),
+    db: Session = Depends(get_db),
+):
+    """Funnel operativo con conversión y p50/p95 por etapa."""
+    from admin_metrics import metrics_funnel
+    return metrics_funnel(db, days=days)
+
+
+@router.get("/metrics/economics")
+async def admin_metrics_economics(
+    days: int = Query(28, ge=7, le=90),
+    admin: dict = Depends(require_super_admin),
+    db: Session = Depends(get_db),
+):
+    """Margen por tenant (revenue del plan vs costo IA real). Información
+    de negocio sensible → gate super-admin (SUPER_ADMIN_USERS)."""
+    from admin_metrics import metrics_economics
+    return metrics_economics(db, days=days)
+
+
+@router.get("/metrics/health")
+async def admin_metrics_health(
+    admin: dict = Depends(require_admin),
+    db: Session = Depends(get_db),
+):
+    """Health score 0-100 por tenant con componentes (uso WoW, first-pass,
+    retrabajo, errores). Los umbrales de alerta viven en admin_metrics."""
+    from admin_metrics import metrics_health
+    return metrics_health(db)
