@@ -83,7 +83,7 @@ def parse_ts_line(line: str):
 
 
 def drop_phantom_intro(rows: list[tuple[float, str]],
-                       min_gap_s: float = 12.0) -> list[tuple[float, str]]:
+                       min_gap_s: float = 8.0) -> list[tuple[float, str]]:
     """Operator-reported (staging, Nada Fue): at 0:00 the crowd faintly
     pre-sings the chorus and Gemini transcribes it — a line isolated
     >12 s before the song's body, whose text repeats later (it IS the
