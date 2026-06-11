@@ -1040,12 +1040,12 @@ def run_pipeline(job_id: str, mp3_path: str, artist: str, style: str,
                     logger.warning("[EDIT] Warning: background cache upload failed: %s", _e)
 
         files = {}
-        # When the operator picked an explicit font id, resolve it to a
-        # path now and seed `chosen_font`. generate_lyric_video reuses a
-        # truthy `font` argument as-is and only random-picks when None.
-        chosen_font = _resolve_font(font)
+        # La elección de tipografía se hace UNA vez acá (operador o pick
+        # del pool) y fluye a video + short + persiste para re-renders.
+        # Fix incidente UMG Chile 2026-06-11 — ver _pick_concrete_font.
+        chosen_font = _pick_concrete_font(font, job_id, job_dir, deterministic=wants_umg)
         if chosen_font:
-            logger.info("[FONT] Operator-selected: %s", os.path.basename(chosen_font))
+            logger.info("[FONT] Selected: %s", os.path.basename(chosen_font))
         bg_source = bg_image_path
 
         # Step 1b — Pre-render content validation (UMG Guideline 15).
@@ -8680,6 +8680,44 @@ _FONT_CATALOGUE = [
 ]
 
 
+def _pick_concrete_font(font_id: str, job_id: str, job_dir: str, deterministic: bool) -> str | None:
+    """Resuelve el font id del operador a un path; si vino vacío ("Auto"),
+    ELIGE del pool acá — una sola vez por render — y persiste el id elegido
+    en render_params para que retries/edits/re-renders mantengan la misma
+    tipografía.
+
+    Incidente UMG Chile 2026-06-11 ("les está cambiando la letra en los
+    shorts"): con Auto, generate_lyric_video elegía la fuente ADENTRO y el
+    short recibía font=None → moviepy caía a la fuente default de
+    ImageMagick (una stencil hueca que no está en el catálogo). Video y
+    short nunca compartían la elección, y cada re-render rotaba la fuente.
+    deterministic=True (perfil UMG) usa el seed por job_dir, igual que el
+    pick histórico de generate_lyric_video.
+    """
+    path = _resolve_font(font_id)
+    if path:
+        return path
+    if not _FONT_POOL:
+        return None
+    if deterministic:
+        seed = int(hashlib.sha1(job_dir.encode()).hexdigest()[:8], 16)
+        path = _FONT_POOL[seed % len(_FONT_POOL)]
+    else:
+        path = random.choice(_FONT_POOL)
+    # Persistir el id (no el path) para que el próximo render del job no
+    # vuelva a sortear. Best-effort: si falla, el render sigue igual.
+    picked = os.path.basename(path)
+    picked_id = next((e["id"] for e in _FONT_CATALOGUE if e["filename"] == picked), None)
+    if picked_id:
+        try:
+            from jobs import merge_render_params
+            merge_render_params(job_id, {"font": picked_id})
+            logger.info("[FONT] Auto pick persistido: %s (%s)", picked_id, picked)
+        except Exception as e:
+            logger.warning("[FONT] no pude persistir el pick %s: %s", picked_id, e)
+    return path
+
+
 def _resolve_font(font_id: str) -> str | None:
     """Map a public font id to a real path under _FONTS_DIR. Empty string
     or unknown id → None, signaling the caller to use the random pool
@@ -10473,6 +10511,16 @@ def generate_short(
     do a pure recode when UMG asks for a non-24 frame rate. Stays at 24
     by default for the YouTube-only path.
     """
+    # Cinturón (incidente UMG Chile 2026-06-11): si por CUALQUIER camino
+    # llega font vacío/None, elegir del pool con seed determinístico por
+    # job_dir en vez de dejar que moviepy caiga a la stencil default de
+    # ImageMagick — el short SIEMPRE sale con una fuente del catálogo.
+    if not font and _FONT_POOL:
+        _seed = int(hashlib.sha1(job_dir.encode()).hexdigest()[:8], 16)
+        font = _FONT_POOL[_seed % len(_FONT_POOL)]
+        logger.warning("[SHORT] font vacío — fallback determinístico del pool: %s",
+                       os.path.basename(font))
+
     import fx_compositor as _fx
 
     audio = AudioFileClip(mp3_path)
@@ -10929,11 +10977,12 @@ def run_edit_pipeline(
             raise ValueError(f"Unknown edit_type {edit_type!r}")
 
         # ----------------------------------------------------------------
-        # Resolve font
+        # Resolve font — misma elección para video Y short, persistida
+        # (fix incidente UMG Chile 2026-06-11, ver _pick_concrete_font).
         # ----------------------------------------------------------------
-        chosen_font = _resolve_font(font_id)
+        chosen_font = _pick_concrete_font(font_id, job_id, job_dir, deterministic=wants_umg)
         if chosen_font:
-            logger.info("[EDIT] Operator font: %s", os.path.basename(chosen_font))
+            logger.info("[EDIT] Font: %s", os.path.basename(chosen_font))
 
         # ----------------------------------------------------------------
         # Re-render video
