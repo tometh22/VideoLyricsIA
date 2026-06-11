@@ -502,12 +502,31 @@ def condense_repeated_skips(segments: list[dict]) -> list[dict]:
         j = i
         while j < len(segments) and unanchored(segments[j]):
             j += 1
-        run = segments[i:j]
+        run = [dict(x) for x in segments[i:j]]
         norms = [n(x.get("text")) for x in run]
         chant = len(run) >= 2 and any(
             len(a) > 8 and len(b) > 8 and (a in b or b in a)
             for k, a in enumerate(norms) for b in norms[k + 1:])
         if chant:
+            # CANONICAL text (operator finding, gen-6): the block must not
+            # inherit Gemini mishears ("nada de ESO") nor vary run-to-run.
+            # Each run line whose text is ~equal to an ANCHORED line of the
+            # song (the known chorus) is rewritten with that canonical
+            # text; Gemini contributes only the COUNT and order.
+            from difflib import SequenceMatcher as _SM
+            canon = {}
+            for x in segments:
+                if not unanchored(x):
+                    cn = n(x.get("text"))
+                    if len(cn) > 8 and cn not in canon:
+                        canon[cn] = (x.get("text") or "").strip()
+            for x in run:
+                xn = n(x.get("text"))
+                if len(xn) > 8:
+                    for cn, ct in canon.items():
+                        if xn == cn or _SM(None, xn, cn).ratio() >= 0.85:
+                            x["text"] = ct
+                            break
             start_t = min(x["start"] for x in run)
             nxt = segments[j]["start"] if j < len(segments) else None
             end_t = max(x["end"] for x in run)
@@ -538,9 +557,18 @@ def condense_repeated_skips(segments: list[dict]) -> list[dict]:
     # a stray skipped singleton spread over a huge hole (job-400 outro:
     # one mishear line stretched 290→366 s) has no evidence and no chant
     # signature — drop it rather than freeze it on screen for a minute
-    return [s for s in out
-            if (0.3 <= (s["end"] - s["start"]) <= 15.0)
-            or not s.get("ctc_skipped")]
+    final = [s for s in out
+             if (0.3 <= (s["end"] - s["start"]) <= 15.0)
+             or not s.get("ctc_skipped")]
+    # GUARANTEED extension on the final list (gen-6: a C6 block ended at
+    # 70.1 leaving a 5 s hole before the 75.1 anchor): any condensed
+    # block followed by a gap stretches to the next line's start.
+    for k, s in enumerate(final):
+        if s.get("ctc_condensed") and k + 1 < len(final):
+            nxt = final[k + 1]["start"]
+            if nxt - 0.2 > s["end"]:
+                s["end"] = round(nxt - 0.2, 3)
+    return final
 
 
 def looks_collapsed(line_times, min_dur_s: float = 0.15,
@@ -800,7 +828,15 @@ def retime_segments(audio_path: str, segments: list[dict],
                     gs, ge, gws = glt[k]
                     msc = sum(w[3] for w in gws) / len(gws)
                     n = re.sub(r"\W+", "", lines[li].lower())
-                    known = len(n) > 10 and any(
+                    gn = [re.sub(r"\W+", "", t.lower()) for t in gtexts]
+                    group_chant = sum(
+                        1 for k2, a2 in enumerate(gn) for b2 in gn[k2 + 1:]
+                        if len(a2) > 8 and len(b2) > 8
+                        and (a2 in b2 or b2 in a2)) >= 1
+                    # the relaxed threshold let a chorus line land where the
+                    # bridge is sung (gen-6, 224.57): known-text acceptance
+                    # only when the GROUP itself has a chant signature
+                    known = group_chant and len(n) > 10 and any(
                         n in a or a in n for a in anchored_norms)
                     if msc < (accept_known if known else accept):
                         continue
