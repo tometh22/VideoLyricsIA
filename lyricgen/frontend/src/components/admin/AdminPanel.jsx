@@ -11,15 +11,14 @@ import { useState } from "react";
 import { AdminProvider, useAdmin } from "./AdminContext";
 import AdminSidebar, { defaultSubTab } from "./layout/AdminSidebar";
 import OperacionSection from "./sections/operacion/OperacionSection";
+import RendimientoSection from "./sections/rendimiento/RendimientoSection";
 import InsightsSection from "./sections/insights/InsightsSection";
-import UsuariosSection from "./sections/usuarios/UsuariosSection";
-import ContenidoSection from "./sections/contenido/ContenidoSection";
-import NegocioSection from "./sections/negocio/NegocioSection";
+import GestionSection from "./sections/gestion/GestionSection";
 
 function AdminShell({ onBack, isSuperAdmin }) {
   const { adminError, setAdminError, stats } = useAdmin();
-  const [section, setSection] = useState("operacion");
-  const [subTab, setSubTab] = useState(defaultSubTab("operacion"));
+  const [section, setSection] = useState("ahora");
+  const [subTab, setSubTab] = useState(defaultSubTab("ahora"));
 
   const navigate = (nextSection, nextSubTab) => {
     setSection(nextSection);
@@ -28,7 +27,7 @@ function AdminShell({ onBack, isSuperAdmin }) {
 
   // Badges vivos del sidebar: cosas que necesitan atención del operador.
   const badges = {
-    operacion: stats?.jobs?.pending_review || 0,
+    ahora: stats?.jobs?.pending_review || 0,
   };
 
   return (
@@ -79,14 +78,13 @@ function AdminShell({ onBack, isSuperAdmin }) {
           showInsights={isSuperAdmin}
         />
         <div className="flex-1 min-w-0">
-          {section === "operacion" && <OperacionSection />}
+          {section === "ahora" && <OperacionSection />}
+          {section === "rendimiento" && <RendimientoSection />}
           {/* Doble guard: el sidebar ya oculta la entrada, pero si el flag
               quedó stale en localStorage el render también la niega. La
               seguridad real son los 403 del backend. */}
           {section === "insights" && isSuperAdmin && <InsightsSection />}
-          {section === "usuarios" && <UsuariosSection subTab={subTab} onSubTabChange={setSubTab} />}
-          {section === "contenido" && <ContenidoSection subTab={subTab} onSubTabChange={setSubTab} />}
-          {section === "negocio" && <NegocioSection subTab={subTab} onSubTabChange={setSubTab} />}
+          {section === "gestion" && <GestionSection subTab={subTab} />}
         </div>
       </div>
     </div>

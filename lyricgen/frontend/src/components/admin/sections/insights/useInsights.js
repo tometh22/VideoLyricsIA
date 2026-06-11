@@ -25,9 +25,11 @@ function scopeParams(nav, days) {
 }
 
 export default function useInsights() {
-  const { flashError } = useAdmin();
+  const { flashError, periodDays, setPeriodDays } = useAdmin();
   const [nav, setNav] = useState({ level: "app", tenantId: null, userId: null });
-  const [days, setDays] = useState(30);
+  // Período global del panel (AdminContext) — compartido con Rendimiento.
+  const days = periodDays;
+  const setDays = setPeriodDays;
   const [data, setData] = useState(null);
   const [loading, setLoading] = useState(true);
   const cacheRef = useRef(new Map());
@@ -44,7 +46,7 @@ export default function useInsights() {
       const qs = scopeParams(targetNav, targetDays);
       // overview no acepta user_id — el nivel usuario lo cubre activity/{id}.
       const overviewQs = scopeParams({ ...targetNav, userId: null }, targetDays);
-      const [overview, adoption, wizard, detail] = await Promise.all([
+      const [overview, adoption, wizard, detail, economics] = await Promise.all([
         targetNav.level === "user"
           ? Promise.resolve(null)
           : fetchJson(`${API}/admin/insights/overview?${overviewQs}`),
@@ -53,8 +55,14 @@ export default function useInsights() {
         targetNav.level === "user"
           ? fetchJson(`${API}/admin/activity/${targetNav.userId}?since_days=${targetDays}`)
           : Promise.resolve(null),
+        // Margen por tenant (consolidación 2026-06-11: vivía escondido en
+        // Negocio→Costos; acá está con el resto de la vista por-tenant).
+        // economics acepta days 7..90 — clamp inferior.
+        targetNav.level === "app"
+          ? fetchJson(`${API}/admin/metrics/economics?days=${Math.max(targetDays, 7)}`).catch(() => null)
+          : Promise.resolve(null),
       ]);
-      const bundle = { overview, adoption, wizard, detail };
+      const bundle = { overview, adoption, wizard, detail, economics };
       cacheRef.current.set(key, bundle);
       setData(bundle);
     } catch (e) {
@@ -90,6 +98,7 @@ export default function useInsights() {
     adoption: data?.adoption ?? null,
     wizard: data?.wizard ?? null,
     detail: data?.detail ?? null,
+    economics: data?.economics ?? null,
     drillTenant,
     drillUser,
     upToApp,
