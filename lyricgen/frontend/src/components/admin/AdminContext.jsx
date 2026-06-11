@@ -24,6 +24,12 @@ export function AdminProvider({ children }) {
     setTimeout(() => setAdminError((cur) => (cur === msg ? null : cur)), 8000);
   }, []);
 
+  // Período global de análisis (7/30/90 días) — consolidación 2026-06-11:
+  // Rendimiento e Insights comparten UNA ventana en vez de selectores
+  // locales desincronizados (uno de los "misma pregunta, números
+  // distintos" del diagnóstico).
+  const [periodDays, setPeriodDays] = useState(30);
+
   // Stats globales (/admin/stats) — para KPIs y badges.
   const [stats, setStats] = useState(null);
   const [statsLoading, setStatsLoading] = useState(true);
@@ -39,7 +45,7 @@ export function AdminProvider({ children }) {
   useEffect(() => { refreshStats(); }, [refreshStats]);
 
   return (
-    <AdminContext.Provider value={{ adminError, setAdminError, flashError, stats, statsLoading, refreshStats }}>
+    <AdminContext.Provider value={{ adminError, setAdminError, flashError, stats, statsLoading, refreshStats, periodDays, setPeriodDays }}>
       {children}
     </AdminContext.Provider>
   );

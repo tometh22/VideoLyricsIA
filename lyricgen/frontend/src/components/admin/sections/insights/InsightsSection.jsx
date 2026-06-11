@@ -13,6 +13,7 @@ import DataTable from "../../primitives/DataTable";
 import EmptyState from "../../primitives/EmptyState";
 import FilterBar from "../../primitives/FilterBar";
 import KpiCard from "../../primitives/KpiCard";
+import MargenTenantsView from "../negocio/MargenTenantsView";
 import AdoptionPanel from "./AdoptionPanel";
 import ProblemsPanel from "./ProblemsPanel";
 import UserProfileView from "./UserProfileView";
@@ -53,7 +54,7 @@ function DeltaHint({ delta }) {
 
 export default function InsightsSection() {
   const ins = useInsights();
-  const { nav, overview, adoption, wizard, detail, loading } = ins;
+  const { nav, overview, adoption, wizard, detail, economics, loading } = ins;
   const [userSearch, setUserSearch] = useState("");
   // Fila del ranking del usuario clickeado — alimenta los KPIs del perfil
   // (retrabajo/costo ya computados por overview, sin re-fetch).
@@ -239,6 +240,12 @@ export default function InsightsSection() {
 
           <AdoptionPanel adoption={adoption} />
           <WizardFunnelPanel wizard={wizard} />
+
+          {/* Margen por tenant (solo nivel app; super-admin como toda la
+              sección — mudado desde Negocio→Costos en la consolidación) */}
+          {nav.level === "app" && economics && (
+            <MargenTenantsView economics={economics} loading={false} forbidden={false} />
+          )}
 
           {/* Drill-down: tenants (solo nivel app) */}
           {nav.level === "app" && (overview?.tenants?.length ?? 0) > 1 && (
