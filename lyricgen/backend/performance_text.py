@@ -194,6 +194,53 @@ def clean_libretto(items: list[tuple]) -> list[str]:
     return [r[1] for r in rows]
 
 
+def _one_pass(client, genai, y, sr, dur, who, win_base: int = 0):
+    """Una pasada de ventanas Gemini → items (ts, texto, win)."""
+    items: list[tuple[float, str, int]] = []
+    t = 0.0
+    fails = 0
+    wi = win_base
+    while t < dur - 0.5:
+        c0, c1 = t, min(dur, t + CHUNK_S)
+        clip = y[int(c0 * sr):int(c1 * sr)]
+        try:
+            import io as _io
+            import soundfile as sf
+            buf = _io.BytesIO()
+            sf.write(buf, clip, sr, format="WAV")
+            resp = client.models.generate_content(
+                model=MODEL,
+                contents=[
+                    genai.types.Part.from_bytes(
+                        data=buf.getvalue(), mime_type="audio/wav"),
+                    genai.types.Part.from_text(
+                        text="Transcribi este fragmento."),
+                ],
+                config=genai.types.GenerateContentConfig(
+                    system_instruction=_SYS_TS.format(dur=c1 - c0, who=who),
+                    temperature=0.0,
+                    max_output_tokens=900,
+                    thinking_config=genai.types.ThinkingConfig(
+                        thinking_budget=0 if "flash" in MODEL else 128),
+                ),
+            )
+            lines = [l for l in (resp.text or "").splitlines() if l.strip()]
+        except Exception as e:
+            logger.warning("[PERF-TEXT] window %.0f-%.0f failed: %s", c0, c1, e)
+            lines = []
+            fails += 1
+            if fails >= 4:
+                return items
+        for line in lines:
+            rel, text = parse_ts_line(line)
+            if text:
+                items.append((c0 + min(rel if rel is not None else 0.0,
+                                       c1 - c0), text, wi))
+        t += CHUNK_S - OVERLAP_S
+        wi += 1
+    return items
+
+
 def transcribe_performance(audio_path: str, artist: str = "",
                            title: str = "",
                            reference: str = "") -> list[str] | None:
@@ -211,48 +258,36 @@ def transcribe_performance(audio_path: str, artist: str = "",
         y, _ = librosa.load(audio_path, sr=sr, mono=True)
         dur = len(y) / sr
         who = f" ({artist} — {title})" if artist else ""
-        items: list[tuple[float, str, int]] = []
-        t = 0.0
-        fails = 0
-        wi = 0
-        while t < dur - 0.5:
-            c0, c1 = t, min(dur, t + CHUNK_S)
-            clip = y[int(c0 * sr):int(c1 * sr)]
-            try:
-                import soundfile as sf
-                buf = io.BytesIO()
-                sf.write(buf, clip, sr, format="WAV")
-                resp = client.models.generate_content(
-                    model=MODEL,
-                    contents=[
-                        genai.types.Part.from_bytes(
-                            data=buf.getvalue(), mime_type="audio/wav"),
-                        genai.types.Part.from_text(
-                            text="Transcribi este fragmento."),
-                    ],
-                    config=genai.types.GenerateContentConfig(
-                        system_instruction=_SYS_TS.format(dur=c1 - c0, who=who),
-                        temperature=0.0,
-                        max_output_tokens=900,
-                        # pro exige thinking_budget>=128; flash acepta 0
-                        thinking_config=genai.types.ThinkingConfig(
-                            thinking_budget=0 if "flash" in MODEL else 128),
-                    ),
-                )
-                lines = [l for l in (resp.text or "").splitlines() if l.strip()]
-            except Exception as e:
-                logger.warning("[PERF-TEXT] window %.0f-%.0f failed: %s", c0, c1, e)
-                lines = []
-                fails += 1
-                if fails >= 4:
-                    return None
-            for line in lines:
-                rel, text = parse_ts_line(line)
-                if text:
-                    items.append((c0 + min(rel if rel is not None else 0.0,
-                                           c1 - c0), text, wi))
-            t += CHUNK_S - OVERLAP_S
-            wi += 1
+        items = _one_pass(client, genai, y, sr, dur, who)
+        if os.environ.get("PERF_TEXT_PASSES", "2").strip() == "2":
+            # DUAL-PASS UNION (la lección de las 7 generaciones): la
+            # varianza corrida-a-corrida de Gemini en zonas de público es
+            # estructural (59/71/99/104/106 líneas). La unión de DOS
+            # pasadas mata la varianza en el origen: si una pasada trae el
+            # coro y la otra no, la unión lo trae. El dedup por ventana ya
+            # distingue costura (otra ventana, mismo momento) de
+            # repetición real — la pasada 2 usa índices de ventana
+            # corridos (+1000) así sus líneas dedupean contra la pasada 1
+            # como costuras del mismo momento.
+            items2 = _one_pass(client, genai, y, sr, dur, who, win_base=1000)
+            # semántica de unión (gate-1 del dual-pass): la pasada 1 es la
+            # BASE; la 2 solo aporta momentos donde la 1 no tiene NADA en
+            # ±2s — variantes del mismo momento no se duplican (116 líneas
+            # con 64 saltos en la unión ingenua).
+            base_ts = sorted(t0 for t0, _, _ in items)
+            import bisect as _bi
+            extra = []
+            for it2 in items2:
+                k = _bi.bisect_left(base_ts, it2[0])
+                near = min((abs(base_ts[j] - it2[0])
+                            for j in (k - 1, k) if 0 <= j < len(base_ts)),
+                           default=99.0)
+                if near > 2.0:
+                    extra.append(it2)
+            if extra:
+                logger.info("[PERF-TEXT] dual-pass: +%d momentos que la "
+                            "pasada 1 no tenía", len(extra))
+            items = sorted(items + extra, key=lambda x: x[0])
         out = clean_libretto(items)
         out = drop_hallucinated_lines(out, reference)
         logger.info("[PERF-TEXT] libreto: %d líneas de %.0fs de audio (%s)",
