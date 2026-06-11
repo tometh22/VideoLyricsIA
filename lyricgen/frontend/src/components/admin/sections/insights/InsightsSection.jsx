@@ -52,7 +52,7 @@ function DeltaHint({ delta }) {
   return `${arrow} ${Math.abs(pct)}% vs ventana anterior`;
 }
 
-export default function InsightsSection() {
+export default function InsightsSection({ subTab = "resumen" }) {
   const ins = useInsights();
   const { nav, overview, adoption, wizard, detail, economics, loading } = ins;
   const [userSearch, setUserSearch] = useState("");
@@ -199,14 +199,36 @@ export default function InsightsSection() {
           <Spinner />
         </div>
       ) : nav.level === "user" ? (
+        // El perfil de usuario es una página completa — ignora las tabs
+        // (es el nivel más profundo del drill, todo el detalle junto).
         <>
           <UserProfileView detail={detail} summaryRow={selectedUserRow} />
           <AdoptionPanel adoption={adoption} title="Qué features usa (y cuáles nunca tocó)" />
           <WizardFunnelPanel wizard={wizard} />
         </>
+      ) : subTab === "features" ? (
+        <AdoptionPanel
+          adoption={adoption}
+          title={nav.level === "tenant" ? `Features que usa ${nav.tenantId}` : "Qué features se usan"}
+        />
+      ) : subTab === "wizard" ? (
+        <WizardFunnelPanel wizard={wizard} />
+      ) : subTab === "margen" ? (
+        nav.level === "app" ? (
+          <MargenTenantsView economics={economics} loading={!economics} forbidden={false} />
+        ) : (
+          <MargenTenantsView
+            economics={economics && {
+              ...economics,
+              tenants: (economics.tenants || []).filter((t) => t.tenant_id === nav.tenantId),
+            }}
+            loading={!economics}
+            forbidden={false}
+          />
+        )
       ) : (
         <>
-          {/* KPIs del nivel */}
+          {/* Tab Resumen: KPIs + qué falló + drill-down de tenants/usuarios */}
           {kpis && (
             <div className="grid grid-cols-2 lg:grid-cols-4 gap-4">
               <KpiCard
@@ -237,15 +259,6 @@ export default function InsightsSection() {
             recentErrors={overview?.recent_errors || []}
             errorsByCategory={overview?.errors_by_category}
           />
-
-          <AdoptionPanel adoption={adoption} />
-          <WizardFunnelPanel wizard={wizard} />
-
-          {/* Margen por tenant (solo nivel app; super-admin como toda la
-              sección — mudado desde Negocio→Costos en la consolidación) */}
-          {nav.level === "app" && economics && (
-            <MargenTenantsView economics={economics} loading={false} forbidden={false} />
-          )}
 
           {/* Drill-down: tenants (solo nivel app) */}
           {nav.level === "app" && (overview?.tenants?.length ?? 0) > 1 && (
