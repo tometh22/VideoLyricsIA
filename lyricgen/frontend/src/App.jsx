@@ -2166,6 +2166,21 @@ export default function App() {
 
   const handleGenerateDirect = () => {
     if (!files.length || !files.every((f) => f.artist.trim())) return;
+    // Guard audit 2026-06-11: el tab "Upload" activo sin archivo real
+    // (nunca eligió uno, o quedó un stub post-refresh) generaba con
+    // fondo IA EN SILENCIO — el usuario creía que iba su archivo.
+    // Mismo principio que el guard de audio stub más abajo: avisar y
+    // abortar, nunca degradar en silencio.
+    if (bgSelectMode === "custom" && (!backgroundFile || typeof backgroundFile.slice !== "function")) {
+      alert({
+        title: t("wizard.custom_bg_missing_title") || "Falta el fondo",
+        description: t("wizard.custom_bg_missing_desc") ||
+          "Elegiste \"Upload\" como fondo pero no hay ningún archivo cargado. Subí tu imagen o video en el paso Modo, o cambiá a \"Generar con IA\".",
+        tone: "warning",
+      });
+      return;
+    }
+
     const jobList = files.map((f) => ({
       filename: f.file.name, _file: f.file, artist: f.artist.trim(),
       songTitle: (f.songTitle || "").trim(),
@@ -2723,6 +2738,20 @@ export default function App() {
   };
 
   const startGenerationWithSegments = async (approved) => {
+    // Guard audit 2026-06-11: el tab "Upload" activo sin archivo real
+    // (nunca eligió uno, o quedó un stub post-refresh) generaba con
+    // fondo IA EN SILENCIO — el usuario creía que iba su archivo.
+    // Mismo principio que el guard de audio stub más abajo: avisar y
+    // abortar, nunca degradar en silencio.
+    if (bgSelectMode === "custom" && (!backgroundFile || typeof backgroundFile.slice !== "function")) {
+      alert({
+        title: t("wizard.custom_bg_missing_title") || "Falta el fondo",
+        description: t("wizard.custom_bg_missing_desc") ||
+          "Elegiste \"Upload\" como fondo pero no hay ningún archivo cargado. Subí tu imagen o video en el paso Modo, o cambiá a \"Generar con IA\".",
+        tone: "warning",
+      });
+      return;
+    }
     track("wizard.generate", { mode: "reviewed", batch_size: (approved || []).length });
     // HOTFIX 2026-05-29 (#473.2): si el operador refrescó la pestaña entre
     // upload y "Aprobar y generar", `a.file` quedó como stub serializado
@@ -3138,6 +3167,18 @@ export default function App() {
     // navigate from an already-navigated page; cleaner to short-circuit
     // here than to let two parallel POSTs collide in the API).
     if (generateLockRef.current) {
+      return;
+    }
+    // El guard de fondo custom faltante corre ANTES de ocultar el resumen:
+    // si aborta, el operador sigue viendo "Crear N videos" y puede
+    // corregir el fondo sin perder el estado del batch.
+    if (bgSelectMode === "custom" && (!backgroundFile || typeof backgroundFile.slice !== "function")) {
+      alert({
+        title: t("wizard.custom_bg_missing_title") || "Falta el fondo",
+        description: t("wizard.custom_bg_missing_desc") ||
+          "Elegiste \"Upload\" como fondo pero no hay ningún archivo cargado. Subí tu imagen o video en el paso Modo, o cambiá a \"Generar con IA\".",
+        tone: "warning",
+      });
       return;
     }
     generateLockRef.current = true;

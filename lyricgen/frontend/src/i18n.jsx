@@ -966,6 +966,8 @@ export const translations = {
     "wizard.session_expired_desc": "El audio se perdió al refrescar la pestaña. Volvé a Crear video y re-subí el archivo.",
     "wizard.generate_failed_title": "No pudimos disparar la generación",
     "wizard.generate_failed_desc": "Hubo un error inesperado al iniciar la generación. Recargá la página y volvé a intentar.",
+    "wizard.custom_bg_missing_title": "Falta el fondo",
+    "wizard.custom_bg_missing_desc": "Elegiste \"Upload\" como fondo pero no hay ningún archivo cargado. Subí tu imagen o video en el paso Modo, o cambiá a \"Generar con IA\".",
     "wizard.resume_failed_title": "No pudimos retomar tu sesión",
     "wizard.resume_failed_desc": "El estado guardado no es compatible con esta versión. Empezamos limpio.",
 
