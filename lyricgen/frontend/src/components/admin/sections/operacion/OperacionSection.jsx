@@ -12,6 +12,8 @@ import SectionHeader from "../../layout/SectionHeader";
 
 import useOperacion from "./useOperacion";
 import StuckJobsAlert from "./StuckJobsAlert";
+import TenantHealthCards from "./TenantHealthCards";
+import FunnelCard from "./FunnelCard";
 import HealthStrip from "./HealthStrip";
 import LivePipeline from "./LivePipeline";
 
@@ -35,6 +37,10 @@ export default function OperacionSection() {
 
       {/* 2 · Salud del sistema */}
       <HealthStrip health={op.health} />
+
+      {/* 2b · Salud por cuenta + funnel (métricas de decisión, Fases 1+2) */}
+      <TenantHealthCards health={op.tenantHealth} />
+      <FunnelCard funnel={op.funnel} />
 
       {/* 3 · KPIs del día */}
       <div className="grid grid-cols-2 lg:grid-cols-4 gap-4">
