@@ -38,26 +38,8 @@ export default function useNegocio() {
 
   useEffect(() => { loadCostDashboard(); }, [loadCostDashboard]);
 
-  // --- Margen por tenant (Fase 1, gate super-admin) -------------------------
-  // 403 = el usuario no está en SUPER_ADMIN_USERS → ocultar el bloque en
-  // silencio (sin flashError: no es un error, es un permiso).
-  const [economics, setEconomics] = useState(null);
-  const [economicsForbidden, setEconomicsForbidden] = useState(false);
-  const [economicsLoading, setEconomicsLoading] = useState(false);
-  useEffect(() => {
-    (async () => {
-      setEconomicsLoading(true);
-      try {
-        setEconomics(await fetchJson(`${API}/admin/metrics/economics?days=28`));
-      } catch (err) {
-        if (String(err?.message || "").toLowerCase().includes("super admin")) {
-          setEconomicsForbidden(true);
-        }
-      } finally {
-        setEconomicsLoading(false);
-      }
-    })();
-  }, []);
+  // El "Margen por tenant" (economics, super-admin) se mudó al panel
+  // Insights en la consolidación 2026-06-11 — su fetch vive en useInsights.
 
   // --- Invoices -------------------------------------------------------------
   const [invoices, setInvoices] = useState([]);
@@ -78,9 +60,6 @@ export default function useNegocio() {
   useEffect(() => { loadInvoices(); }, [loadInvoices]);
 
   return {
-    economics,
-    economicsForbidden,
-    economicsLoading,
     // costos
     costSinceDays,
     setCostSinceDays,

@@ -16,7 +16,12 @@ function CategoryChip({ category }) {
 
 export default function ProblemsPanel({ recentErrors = [], errorsByCategory = {} }) {
   const [expanded, setExpanded] = useState(true);
+  // Profundidad 2026-06-11: click en un chip de categoría → filtra la lista.
+  const [categoryFilter, setCategoryFilter] = useState(null);
   if (recentErrors.length === 0) return null;
+  const visible = categoryFilter
+    ? recentErrors.filter((e) => e.category === categoryFilter)
+    : recentErrors;
 
   return (
     <div className="glass-elevated rounded-card overflow-hidden ring-1 ring-red-500/20">
@@ -34,7 +39,22 @@ export default function ProblemsPanel({ recentErrors = [], errorsByCategory = {}
             .sort((a, b) => b[1] - a[1])
             .slice(0, 4)
             .map(([cat, n]) => (
-              <span key={cat} className="px-2 py-0.5 rounded-full bg-red-500/10 text-label text-red-300">
+              <span
+                key={cat}
+                role="button"
+                tabIndex={0}
+                onClick={(ev) => {
+                  ev.stopPropagation();
+                  setCategoryFilter((cur) => (cur === cat ? null : cat));
+                  setExpanded(true);
+                }}
+                className={`px-2 py-0.5 rounded-full text-label cursor-pointer transition-colors duration-brand ${
+                  categoryFilter === cat
+                    ? "bg-red-500/30 ring-1 ring-red-400 text-white"
+                    : "bg-red-500/10 text-red-300 hover:bg-red-500/20"
+                }`}
+                title="Click: filtrar por esta categoría"
+              >
                 {ERROR_CATEGORY_LABELS[cat] || cat}: {n}
               </span>
             ))}
@@ -49,7 +69,7 @@ export default function ProblemsPanel({ recentErrors = [], errorsByCategory = {}
 
       {expanded && (
         <div className="px-5 pb-4 divide-y divide-white/[0.04]">
-          {recentErrors.slice(0, 10).map((e, i) => (
+          {visible.slice(0, 10).map((e, i) => (
             <div key={`${e.job_id}-${i}`} className="py-2.5 flex items-start gap-3">
               <CategoryChip category={e.category} />
               <div className="flex-1 min-w-0">
@@ -64,9 +84,9 @@ export default function ProblemsPanel({ recentErrors = [], errorsByCategory = {}
               <span className="shrink-0 text-label text-gray-500 whitespace-nowrap">{fmtAgo(e.created_at)}</span>
             </div>
           ))}
-          {recentErrors.length > 10 && (
+          {visible.length > 10 && (
             <p className="pt-2.5 text-label text-gray-500">
-              … y {recentErrors.length - 10} más en la ventana
+              … y {visible.length - 10} más en la ventana
             </p>
           )}
         </div>

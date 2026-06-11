@@ -1,5 +1,7 @@
-// Sección Operación — el centro de triaje del operador.
+// Sección "Ahora" — el centro de triaje del operador (¿está sano AHORA?).
 //
+// Consolidación 2026-06-11: la analítica (salud por cuenta, funnel) se
+// mudó a la sección Rendimiento — acá queda solo lo accionable en vivo.
 // Orden por prioridad: primero lo que rompe (zombies), después la salud del
 // sistema, los KPIs del día, y abajo el pipeline en vivo.
 //
@@ -12,8 +14,6 @@ import SectionHeader from "../../layout/SectionHeader";
 
 import useOperacion from "./useOperacion";
 import StuckJobsAlert from "./StuckJobsAlert";
-import TenantHealthCards from "./TenantHealthCards";
-import FunnelCard from "./FunnelCard";
 import HealthStrip from "./HealthStrip";
 import LivePipeline from "./LivePipeline";
 
@@ -38,10 +38,6 @@ export default function OperacionSection() {
       {/* 2 · Salud del sistema */}
       <HealthStrip health={op.health} />
 
-      {/* 2b · Salud por cuenta + funnel (métricas de decisión, Fases 1+2) */}
-      <TenantHealthCards health={op.tenantHealth} />
-      <FunnelCard funnel={op.funnel} />
-
       {/* 3 · KPIs del día */}
       <div className="grid grid-cols-2 lg:grid-cols-4 gap-4">
         <KpiCard
@@ -51,7 +47,7 @@ export default function OperacionSection() {
           loading={statsLoading}
         />
         <KpiCard value={jobsStats.processing ?? 0} label="En proceso" tone="brand" loading={statsLoading} />
-        <KpiCard value={errors} label="Errores" tone={errors > 0 ? "danger" : "default"} loading={statsLoading} />
+        <KpiCard value={errors} label="Errores este mes" tone={errors > 0 ? "danger" : "default"} loading={statsLoading} />
         <KpiCard value={jobsStats.this_month ?? 0} label="Videos este mes" loading={statsLoading} />
       </div>
 
