@@ -31,7 +31,7 @@ const BG_BADGE = {
   ai_image: "fondo: IA imagen",
 };
 
-export default function UserProfileView({ user, detail, summaryRow }) {
+export default function UserProfileView({ user, detail, summaryRow, wizardSessions, onJobClick }) {
   if (!detail) return null;
   const u = detail.user || user || {};
   const jobs = detail.jobs || [];
@@ -144,9 +144,49 @@ export default function UserProfileView({ user, detail, summaryRow }) {
           columns={jobColumns}
           rows={jobs}
           rowKey={(j) => j.job_id}
+          onRowClick={onJobClick ? (j) => onJobClick(j.job_id) : undefined}
           empty={<EmptyState title="Sin videos en la ventana" />}
         />
+        {onJobClick && jobs.length > 0 && (
+          <p className="text-label text-gray-500 mt-2">click en un video para la ficha completa</p>
+        )}
       </div>
+
+      {/* Sesiones de wizard reconstruidas desde ui_events (profundidad
+          2026-06-11): qué recorrió y dónde abandonó, sesión por sesión. */}
+      {wizardSessions && (wizardSessions.sessions?.length ?? 0) > 0 && (
+        <div className="glass rounded-card p-5">
+          <p className="text-section uppercase text-gray-500 mb-3">
+            Sesiones de wizard ({wizardSessions.sessions.length})
+          </p>
+          <div className="space-y-2 max-h-72 overflow-y-auto pr-1">
+            {wizardSessions.sessions.map((s, i) => (
+              <details key={i} className="rounded-card bg-surface-3/30 ring-1 ring-white/[0.04] px-3 py-2">
+                <summary className="cursor-pointer select-none text-caption flex items-center gap-2">
+                  <span className={`inline-block w-2 h-2 rounded-full shrink-0 ${s.generated ? "bg-accent" : "bg-amber-400"}`} />
+                  <span className="text-gray-300">{fmtAgo(s.started_at)}</span>
+                  <span className="text-gray-500">· {s.events.length} acciones ·</span>
+                  <span className={s.generated ? "text-accent" : "text-amber-300"}>
+                    {s.generated ? "generó" : "abandonó"}
+                  </span>
+                </summary>
+                <div className="mt-2 space-y-0.5 pl-4">
+                  {s.events.map((e, j) => (
+                    <div key={j} className="text-label text-gray-500 font-mono truncate">
+                      {e.type.replace("wizard.", "")}
+                      {e.data?.step_to ? ` → paso ${e.data.step_to}` : ""}
+                      {e.data?.mode ? ` · ${e.data.mode}` : ""}
+                      {e.data?.style ? ` · ${e.data.style}` : ""}
+                      {e.data?.asset_id ? ` · asset ${e.data.asset_id}` : ""}
+                      {e.data?.batch_size ? ` · ${e.data.batch_size} video(s)` : ""}
+                    </div>
+                  ))}
+                </div>
+              </details>
+            ))}
+          </div>
+        </div>
+      )}
 
       <div className="grid lg:grid-cols-2 gap-5">
         {/* Descargas + eventos de edición */}

@@ -1543,3 +1543,45 @@ async def admin_insights_wizard(
     conversión a generate). {empty: true} hasta que la telemetría acumule."""
     from admin_insights import insights_wizard
     return insights_wizard(db, days=days, tenant_id=tenant_id, user_id=user_id)
+
+
+@router.get("/insights/feature/{feature}")
+async def admin_insights_feature_detail(
+    feature: str,
+    value: str = Query(..., max_length=120),
+    days: int = Query(30, ge=1, le=365),
+    tenant_id: Optional[str] = Query(None),
+    admin: dict = Depends(require_super_admin),
+    db: Session = Depends(get_db),
+):
+    """Drill de una barra de adopción: qué usuarios y videos usan ese
+    valor de la feature (whitelist en admin_insights)."""
+    from admin_insights import insights_feature_detail
+    return insights_feature_detail(db, feature, value, days=days, tenant_id=tenant_id)
+
+
+@router.get("/insights/job/{job_id}")
+async def admin_insights_job_detail(
+    job_id: str,
+    admin: dict = Depends(require_super_admin),
+    db: Session = Depends(get_db),
+):
+    """Ficha completa de un video: parámetros, llamadas IA con costo,
+    eventos y error."""
+    from admin_insights import insights_job_detail
+    detail = insights_job_detail(db, job_id)
+    if detail is None:
+        raise HTTPException(status_code=404, detail="Job not found")
+    return detail
+
+
+@router.get("/insights/user/{user_id}/events")
+async def admin_insights_user_events(
+    user_id: int,
+    days: int = Query(30, ge=1, le=365),
+    admin: dict = Depends(require_super_admin),
+    db: Session = Depends(get_db),
+):
+    """Sesiones de wizard del usuario, reconstruidas desde ui_events."""
+    from admin_insights import insights_user_events
+    return insights_user_events(db, user_id, days=days)
