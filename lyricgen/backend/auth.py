@@ -126,6 +126,37 @@ def telemetry_enabled() -> bool:
     return os.environ.get("TELEMETRY_ENABLED", "").strip().lower() in ("1", "true", "yes", "on")
 
 
+def _super_admin_allowlist() -> set:
+    """Parse SUPER_ADMIN_USERS (comma-separated usernames/emails, case-insensitive).
+
+    Leído en cada request (no a import-time) para que los tests puedan
+    monkeypatchear el env y para que un cambio de la var en Railway
+    aplique con el redeploy sin sorpresas de orden de import.
+
+    Vive en auth (y no en admin) porque el flag is_super_admin se computa
+    en get_current_user/verify_api_key — admin.py ya importa de auth, así
+    que esta es la única dirección sin ciclo.
+    """
+    raw = os.environ.get("SUPER_ADMIN_USERS", "")
+    return {x.strip().lower() for x in raw.split(",") if x.strip()}
+
+
+def is_super_admin(username, email, role) -> bool:
+    """Mismo criterio que admin.require_super_admin, como predicado puro.
+
+    Sin SUPER_ADMIN_USERS seteado (dev/tests/staging) todo admin es super
+    admin — debe coincidir EXACTO con el fallback del gate del backend
+    para que el sidebar del frontend nunca muestre una sección que después
+    responde 403 (ni la esconda cuando respondería 200).
+    """
+    if role != "admin":
+        return False
+    allow = _super_admin_allowlist()
+    if not allow:
+        return True
+    return (username or "").lower() in allow or (email or "").lower() in allow
+
+
 # Anyone who knows the default secret can forge admin tokens, so running with
 # it in production is unacceptable. Fail fast at import time.
 _ENV = (
@@ -216,6 +247,7 @@ def verify_api_key(db: Session, full_key: str) -> Optional[dict]:
         "username": user.username,
         "email": user.email,
         "role": user.role,
+        "is_super_admin": is_super_admin(user.username, user.email, user.role),
         "tenant_id": user.tenant_id,
         "plan": user.plan_id,
         "allow_overage": getattr(user, "allow_overage", False) or False,
@@ -661,6 +693,9 @@ def get_current_user(
         "avatar_url": getattr(user, "avatar_url", None),
         "jti": jti,
         "role": user.role,
+        # Visibilidad de la sección Insights (panel CEO). Solo gating de UI:
+        # la seguridad real es require_super_admin en cada endpoint.
+        "is_super_admin": is_super_admin(user.username, user.email, user.role),
         "tenant_id": user.tenant_id,
         "plan": user.plan_id,
         # Cuenta de facturación compartida entre tenants (None = cuota por

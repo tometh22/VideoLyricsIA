@@ -1,10 +1,10 @@
-// Sección "Usuarios" del Admin Panel v2. Dos sub-vistas — Actividad y Gestión —
-// que se eligen desde el sidebar del admin (no hay tabs internos acá): el
-// padre pasa subTab y esta sección renderiza la vista correspondiente.
-import ActividadView from "./ActividadView";
+// Sección "Usuarios" del Admin Panel v2 — gestión de cuentas.
+//
+// La sub-vista "Actividad" (solo super-admin) fue absorbida por la sección
+// Insights (2026-06-10): mismo dato, mejor dispuesto — jerarquía
+// app → tenant → usuario en vez de drill-down anidado en una tabla.
 import GestionView from "./GestionView";
 
-export default function UsuariosSection({ subTab }) {
-  if (subTab === "gestion") return <GestionView />;
-  return <ActividadView />;
+export default function UsuariosSection() {
+  return <GestionView />;
 }

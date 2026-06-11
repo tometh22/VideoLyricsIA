@@ -18,9 +18,24 @@ const NAV = [
     subTabs: null,
   },
   {
+    // Solo super-admin (showInsights) — el panel del CEO: comportamiento
+    // detallado por app/tenant/usuario. Oculto por completo para el resto.
+    id: "insights",
+    label: "Insights",
+    description: "Uso, features y retrabajo",
+    icon: (
+      <svg className="w-4 h-4" fill="none" stroke="currentColor" strokeWidth="1.8" viewBox="0 0 24 24">
+        <path d="M3 3v18h18" />
+        <path d="M7 14l4-4 4 4 5-6" />
+      </svg>
+    ),
+    subTabs: null,
+  },
+  {
     id: "usuarios",
     label: "Usuarios",
-    description: "Actividad y gestión",
+    // La vieja sub-vista "Actividad" fue absorbida por Insights (2026-06-10).
+    description: "Gestión de cuentas",
     icon: (
       <svg className="w-4 h-4" fill="none" stroke="currentColor" strokeWidth="1.8" viewBox="0 0 24 24">
         <path d="M17 21v-2a4 4 0 00-4-4H5a4 4 0 00-4 4v2" />
@@ -28,10 +43,7 @@ const NAV = [
         <path d="M23 21v-2a4 4 0 00-3-3.87M16 3.13a4 4 0 010 7.75" />
       </svg>
     ),
-    subTabs: [
-      { id: "actividad", label: "Actividad" },
-      { id: "gestion", label: "Gestión" },
-    ],
+    subTabs: null,
   },
   {
     id: "contenido",
@@ -72,10 +84,11 @@ export function defaultSubTab(sectionId) {
   return section?.subTabs?.[0]?.id ?? null;
 }
 
-export default function AdminSidebar({ section, subTab, onNavigate, badges = {} }) {
+export default function AdminSidebar({ section, subTab, onNavigate, badges = {}, showInsights = false }) {
+  const items = NAV.filter((item) => item.id !== "insights" || showInsights);
   return (
     <nav className="w-52 shrink-0 space-y-1">
-      {NAV.map((item) => {
+      {items.map((item) => {
         const isActive = section === item.id;
         return (
           <div key={item.id}>

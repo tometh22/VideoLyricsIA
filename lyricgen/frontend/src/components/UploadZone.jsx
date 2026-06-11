@@ -5,6 +5,7 @@ import { UploadTour } from "./OnboardingTour";
 import WizardLivePreview from "./WizardLivePreview";
 import TitleCardPreview from "./TitleCardPreview";
 import HelpTip from "./HelpCenter/HelpTip";
+import { track } from "../lib/telemetryTrack";
 
 const API = import.meta.env.VITE_API_URL || "";
 
@@ -355,6 +356,7 @@ export default function UploadZone({
   const _hint = (batchDefaults.backgroundHint || "").trim();
   const [sceneMode, setSceneMode] = useState(_hint ? "prompt" : (inspiredByLyrics ? "lyrics" : "auto"));
   const selectSceneMode = (m) => {
+    track("wizard.scene_mode", { mode: m });
     setSceneMode(m);
     if (m === "auto") {
       onInspiredByLyricsChange && onInspiredByLyricsChange(false);
@@ -437,6 +439,9 @@ export default function UploadZone({
   const goStep = (n) => {
     const clamped = Math.max(1, Math.min(_maxInteractiveStep, n));
     if (_lockedSet.has(clamped)) return;
+    if (clamped !== wizardStep) {
+      track("wizard.step", { step_from: wizardStep, step_to: clamped, trigger: "nav" });
+    }
     setWizardStep(clamped);
   };
   // Auto-advance a step 6 cuando aparece contenido de review O cuando
@@ -1818,7 +1823,7 @@ export default function UploadZone({
                         <button
                           key={f.id}
                           type="button"
-                          onClick={() => setLibraryFilter(f.id)}
+                          onClick={() => { track("wizard.library_filter", { filter: f.id }); setLibraryFilter(f.id); }}
                           className={`flex items-center gap-2 h-8 px-3 rounded-full text-label transition-all ${
                             libraryFilter === f.id
                               ? "bg-brand/15 text-brand-light ring-1 ring-brand/40"
@@ -1839,7 +1844,14 @@ export default function UploadZone({
                         return (
                           <button
                             key={bg.id}
-                            onClick={() => { onBackgroundId?.(bg.id); onBackgroundFile?.(null); }}
+                            onClick={() => {
+                              track("wizard.library_select", {
+                                asset_id: bg.id,
+                                file_type: bg.file_type,
+                                had_used_badge: Boolean(usageMap[bg.id]?.used),
+                              });
+                              onBackgroundId?.(bg.id); onBackgroundFile?.(null);
+                            }}
                             className={`rounded-card overflow-hidden text-left group bg-surface-2/40 transition-all ${
                               selected
                                 ? "ring-2 ring-brand shadow-glow"
@@ -1902,7 +1914,7 @@ export default function UploadZone({
                             <button
                               key={m.id}
                               type="button"
-                              onClick={() => onBackgroundMode?.(m.id)}
+                              onClick={() => { track("wizard.library_mode", { asset_id: backgroundId, mode: m.id }); onBackgroundMode?.(m.id); }}
                               className={`h-8 px-3 rounded-full text-label transition-all ${
                                 backgroundMode === m.id
                                   ? "bg-brand/15 text-brand-light ring-1 ring-brand/40"
@@ -2415,7 +2427,7 @@ export default function UploadZone({
                       {/* Auto — default, the AI picks colors from the song */}
                       <button
                         type="button"
-                        onClick={() => onStyleChange("auto")}
+                        onClick={() => { track("wizard.style", { style: "auto" }); onStyleChange("auto"); }}
                         className={`w-full flex items-center gap-3 px-3 py-2.5 rounded-xl border text-left transition-all duration-200 mb-2 ${
                           style === "auto" ? "border-transparent ring-1 ring-brand/50 bg-brand/[0.08]" : "border-white/[0.06] hover:border-white/[0.16]"
                         }`}
@@ -2433,7 +2445,7 @@ export default function UploadZone({
                           <button
                             key={s.code}
                             type="button"
-                            onClick={() => onStyleChange(s.code)}
+                            onClick={() => { track("wizard.style", { style: s.code }); onStyleChange(s.code); }}
                             className={`flex flex-col items-center gap-2 px-2 py-2.5 rounded-xl border text-label transition-all duration-200
                               ${style === s.code
                                 ? "border-brand/50 text-white ring-1 ring-brand/40 scale-[1.02]"
@@ -2457,7 +2469,7 @@ export default function UploadZone({
                       {/* Personalizado — pick your own colors */}
                       <button
                         type="button"
-                        onClick={() => onStyleChange("custom")}
+                        onClick={() => { track("wizard.style", { style: "custom" }); onStyleChange("custom"); }}
                         className={`w-full flex items-center gap-3 px-3 py-2.5 rounded-xl border text-left transition-all duration-200 mt-2 ${
                           style === "custom" ? "border-transparent ring-1 ring-brand/50 bg-brand/[0.08]" : "border-white/[0.06] hover:border-white/[0.16]"
                         }`}
@@ -3129,7 +3141,7 @@ export default function UploadZone({
               <>
                 {onGenerateDirect && (
                   <button
-                    onClick={onGenerateDirect}
+                    onClick={() => { track("wizard.generate", { mode: "direct", batch_size: (files || []).length }); onGenerateDirect(); }}
                     disabled={!allHaveArtist}
                     className="btn-secondary text-xs h-11 px-4 disabled:opacity-40 disabled:cursor-not-allowed"
                   >
@@ -3138,7 +3150,7 @@ export default function UploadZone({
                 )}
                 {onStartReview && (
                   <button
-                    onClick={onStartReview}
+                    onClick={() => { track("wizard.start_review", {}); onStartReview(); }}
                     disabled={!allHaveArtist}
                     className="btn-primary h-11 px-6 disabled:opacity-40 disabled:cursor-not-allowed"
                   >
