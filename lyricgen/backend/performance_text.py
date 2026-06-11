@@ -170,6 +170,20 @@ def clean_libretto(items: list[tuple]) -> list[str]:
                 rows[j] = (pts, t, pwin)
                 merged = True
                 break
+            # PARTIAL seam (job 400: "no quisiste fallar, aprendí la
+            # diferencia" + "ahora aprendí la diferencia entre el juego
+            # y el azar" overlapping by 3 s): window A cut the phrase,
+            # window B completed it — whole-line similarity misses it.
+            # A shared chunk of ≥14 normalized chars across windows in
+            # the overlap zone = the same sung moment → keep the longer.
+            if win != pwin and len(n) >= 14 and len(pn) >= 14:
+                shared = any(n[k:k + 14] in pn
+                             for k in range(0, len(n) - 13, 4))
+                if shared:
+                    if len(n) > len(pn):
+                        rows[j] = (pts, t, pwin)
+                    merged = True
+                    break
         if not merged:
             rows.append((ts, t, win))
     # pure-vocal lines before the first lexical line
