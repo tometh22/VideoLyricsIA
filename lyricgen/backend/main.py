@@ -670,6 +670,43 @@ def on_startup():
     ).start()
     logger.info("stale-prores-scan thread started (daily)")
 
+    # Alertas de negocio por tenant (Fase 2 panel world-class, 2026-06-11):
+    # health score diario por cuenta — caída de uso WoW, spike de
+    # retrabajos, tasa de error. La señal de churn que Sentry técnico no
+    # da: "UMG bajó 40% su uso esta semana" tiene que sonar ANTES de que
+    # el cliente lo mencione en una llamada.
+    _BUSINESS_ALERTS_LOCK_KEY = 9118364455199106
+
+    def _business_alerts_loop():
+        _time.sleep(360)  # let the API come up first
+        while True:
+            try:
+                def _do_business_alerts():
+                    from admin_metrics import run_business_alerts
+                    from database import SessionLocal as _SL
+                    _db = _SL()
+                    try:
+                        run_business_alerts(_db)
+                    finally:
+                        _db.close()
+                _run_with_advisory_lock(
+                    _BUSINESS_ALERTS_LOCK_KEY, _do_business_alerts,
+                    name="business_alerts",
+                )
+            except Exception:  # pragma: no cover
+                try:
+                    import sentry_sdk
+                    sentry_sdk.capture_exception()
+                except Exception:
+                    pass
+                _time.sleep(60)
+            _time.sleep(24 * 3600)  # diario
+
+    threading.Thread(
+        target=_business_alerts_loop, daemon=True, name="business-alerts",
+    ).start()
+    logger.info("business-alerts thread started (daily)")
+
 
 # --- Background library (public, authenticated) ---
 _BACKGROUNDS_LIB = os.path.join(os.path.dirname(__file__), "..", "assets", "backgrounds", "library")
