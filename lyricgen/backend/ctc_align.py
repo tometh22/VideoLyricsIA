@@ -468,69 +468,79 @@ def place_unaligned(line_times, originals, total_dur: float, slack: float = 4.0)
 
 
 def condense_repeated_skips(segments: list[dict]) -> list[dict]:
-    """Rotor-style condensation for crowd-chorus repetitions (libretto
-    path). When the crowd repeats a phrase Nx, the libretto now lists
-    every repetition (window-aware dedup) but the stem can't anchor them
-    individually (demucs erases the crowd; the speech model reads 1-2 of
-    4 in the mush) — they end up stacked at one timestamp. Rotor's own
-    GT does NOT anchor them either: it bundles the block into ONE long
-    line ('Oh, nada fue un error, nada fue un error, ...' 65.2→76.2).
-    Same move: consecutive text-similar lines where at least one side is
-    unanchored merge into one line spanning the block; leftover
-    zero-length skipped lines are dropped, not stacked. Pure."""
+    """Rotor-style condensation for crowd-chorus passages (libretto path).
+
+    REDESIGN after the operator's text-fidelity findings: the old version
+    chained only text-SIMILAR neighbours, so (a) the block read the same
+    phrase repeated mechanically while the real chant has variants and
+    interjections ("nada, nada de esto fue un error OH OH, nada de esto
+    fue un error"), (b) dissimilar interjections broke the chain leaving
+    stacked zero-length leftovers (job 400: COND3+COND2+COND17 at 251.8).
+
+    Now: a RUN of consecutive UNANCHORED lines (skipped or near-zero
+    duration — the engine had no individual acoustic evidence) that
+    contains a repeated-text signature (>=2 mutually similar lines)
+    becomes ONE block: span from the run's start to the next anchored
+    line, text = the run's REAL line sequence joined in order (variants
+    and interjections included), capped at ~90 chars. Anchored lines
+    (including mix-recovered ones with real duration) are never touched —
+    studio songs and well-heard verses keep full per-line dynamism.
+    Single stray skips stay as-is (cascade fallback placement). Pure."""
     def n(t):
         return re.sub(r"\W+", "", (t or "").lower())
 
+    def unanchored(s):
+        return bool(s.get("ctc_skipped")) or (s["end"] - s["start"]) < 0.3
+
     out: list[dict] = []
-    for s in segments:
-        if out:
-            p = out[-1]
-            a, b = n(p.get("text")), n(s.get("text"))
-            similar = len(b) > 8 and (a == b or a in b or b in a)
-            unanchored = (s.get("ctc_skipped") or p.get("ctc_skipped")
-                          or p.get("ctc_condensed")
-                          or (s["end"] - s["start"]) < 0.3
-                          or (p["end"] - p["start"]) < 0.3)
-            if similar and unanchored:
-                p["end"] = max(p["end"], s["end"])
-                # Rotor-style chained text ("Oh, nada fue un error, nada
-                # fue un error, nada fue un error"), capped so an 8x chant
-                # doesn't produce a monster line.
-                st = (s.get("text") or "").strip()
-                chained = f"{p['text']}, {st[:1].lower() + st[1:]}" if st else p["text"]
-                if len(chained) <= 90:
-                    p["text"] = chained
-                p["ctc_condensed"] = p.get("ctc_condensed", 1) + 1
-                p.pop("ctc_skipped", None)
-                continue
-        out.append(dict(s))
-    # THE span bug (job 400, all three bad crowd spots): the merged
-    # repetitions were zero-length stacks, so the condensed block stayed
-    # 3.5 s while the crowd actually chants until the next anchored line
-    # (61.5→75.1). Extend each condensed block to the next line's start —
-    # Rotor's own block spans 65.2→76.24.
-    for i, s in enumerate(out):
-        if s.get("ctc_condensed") and i + 1 < len(out):
-            nxt = out[i + 1]["start"]
-            if nxt - 0.2 > s["end"]:
-                s["end"] = round(nxt - 0.2, 3)
-    # second merge pass: a zero-length condensed block can be left stacked
-    # on a same-text neighbour (job 400: the 251.72 COND3+COND18 pair)
-    merged2: list[dict] = []
-    for s in out:
-        if merged2:
-            p = merged2[-1]
-            a, b = n(p.get("text")), n(s.get("text"))
-            if len(b) > 8 and (a == b or a in b or b in a) and (
-                    (p["end"] - p["start"]) < 0.3 or (s["end"] - s["start"]) < 0.3):
-                p["end"] = max(p["end"], s["end"])
-                p["start"] = min(p["start"], s["start"])
-                p["ctc_condensed"] = (p.get("ctc_condensed", 1)
-                                      + s.get("ctc_condensed", 1))
-                continue
-        merged2.append(s)
-    return [s for s in merged2
-            if (s["end"] - s["start"]) >= 0.3 or not s.get("ctc_skipped")]
+    i = 0
+    while i < len(segments):
+        if not unanchored(segments[i]):
+            out.append(dict(segments[i]))
+            i += 1
+            continue
+        j = i
+        while j < len(segments) and unanchored(segments[j]):
+            j += 1
+        run = segments[i:j]
+        norms = [n(x.get("text")) for x in run]
+        chant = len(run) >= 2 and any(
+            len(a) > 8 and len(b) > 8 and (a in b or b in a)
+            for k, a in enumerate(norms) for b in norms[k + 1:])
+        if chant:
+            start_t = min(x["start"] for x in run)
+            nxt = segments[j]["start"] if j < len(segments) else None
+            end_t = max(x["end"] for x in run)
+            if nxt is not None and nxt - 0.2 > end_t:
+                end_t = nxt - 0.2
+            if end_t <= start_t:
+                end_t = start_t + 0.4
+            text = (run[0].get("text") or "").strip()
+            for x in run[1:]:
+                t2 = (x.get("text") or "").strip()
+                if not t2:
+                    continue
+                cand = f"{text}, {t2[:1].lower() + t2[1:]}"
+                if len(cand) > 90:
+                    break
+                text = cand
+            blk = dict(run[0])
+            blk["start"] = round(start_t, 3)
+            blk["end"] = round(end_t, 3)
+            blk["text"] = text
+            blk["ctc_condensed"] = len(run)
+            blk.pop("ctc_skipped", None)
+            blk.pop("words", None)
+            out.append(blk)
+        else:
+            out.extend(dict(x) for x in run)
+        i = j
+    # a stray skipped singleton spread over a huge hole (job-400 outro:
+    # one mishear line stretched 290→366 s) has no evidence and no chant
+    # signature — drop it rather than freeze it on screen for a minute
+    return [s for s in out
+            if (0.3 <= (s["end"] - s["start"]) <= 15.0)
+            or not s.get("ctc_skipped")]
 
 
 def looks_collapsed(line_times, min_dur_s: float = 0.15,
@@ -794,6 +804,15 @@ def retime_segments(audio_path: str, segments: list[dict],
                         n in a or a in n for a in anchored_norms)
                     if msc < (accept_known if known else accept):
                         continue
+                    # End discipline: a recovered line whose CTC end drags
+                    # across the window (job 400: '¡Dos!...' 75.9→92.9,
+                    # 17 s) gets clamped to a plausible sung duration.
+                    max_dur = max(2.0, sum(_eff_dur(w) for (w, _a, _b, _sc)
+                                           in gws))
+                    if ge - gs > max_dur:
+                        ge = gs + max_dur
+                        gws = [(w, a, min(b, gs + max_dur), sc)
+                               for (w, a, b, sc) in gws if a < gs + max_dur]
                     off = lo
                     line_times[li] = (gs + off, ge + off,
                                       [(w, a + off, b + off, sc)
