@@ -137,23 +137,49 @@ def probe_r2() -> tuple[bool, int, str | None]:
     """Live R2 reachability check for /health.
 
     Does a head_bucket against R2_BUCKET via the isolated _health_client.
-    Returns (ok, elapsed_ms, error_msg). Total wall-clock is bounded by
-    connect_timeout + read_timeout (~5 s worst case).
+    Returns (ok, elapsed_ms, error_msg). Total wall-clock acotado por el
+    hard cap de 6 s del executor (ver abajo).
 
     Used by observability.health_snapshot to flag the API as degraded
     when R2 is unreachable or slow (>1.5 s round-trip = pool churn or
     network issue), even when nothing has crashed yet.
+
+    Incidente 2026-06-11: un blip de red dejó las 2 conexiones del pool
+    del _health_client colgadas. Como el cliente es un global cacheado,
+    cada head_bucket posterior esperaba un slot del pool PARA SIEMPRE →
+    /health tardaba >20 s (timeout del que pregunta), el panel mostraba
+    "degraded · r2_probe_failed" y los monitores daban falsa alarma —
+    con R2 perfectamente sano (un cliente fresco respondía en 200 ms).
+    Fix doble: hard cap de wall-clock con un executor, y ante CUALQUIER
+    fallo se descarta el cliente cacheado para que el próximo probe
+    arranque con pool nuevo (auto-curación en ≤15 s, el período de
+    refresh del panel).
     """
+    global _health_client
     client = _get_health_client()
     if client is None:
         return False, 0, "not_configured"
     import time as _time
+    from concurrent.futures import ThreadPoolExecutor, TimeoutError as _FutTimeout
     t0 = _time.monotonic()
+    # OJO: sin context manager — `with ThreadPoolExecutor(...)` llama
+    # shutdown(wait=True) en el __exit__ y se quedaría esperando el
+    # head_bucket colgado, anulando el timeout.
+    _ex = ThreadPoolExecutor(max_workers=1, thread_name_prefix="r2-probe")
     try:
-        client.head_bucket(Bucket=R2_BUCKET)
+        fut = _ex.submit(client.head_bucket, Bucket=R2_BUCKET)
+        fut.result(timeout=6)
         return True, int((_time.monotonic() - t0) * 1000), None
+    except _FutTimeout:
+        # El thread del head_bucket puede quedar vivo un rato más, pero
+        # el cliente (y su pool envenenado) se descarta acá mismo.
+        _health_client = None
+        return False, int((_time.monotonic() - t0) * 1000), "probe_timeout (health client reset)"
     except Exception as e:
+        _health_client = None
         return False, int((_time.monotonic() - t0) * 1000), str(e)[:120]
+    finally:
+        _ex.shutdown(wait=False, cancel_futures=True)
 
 
 def _transfer_config():
