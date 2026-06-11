@@ -795,6 +795,55 @@ def background_usage(
     }
 
 
+@app.get("/backgrounds/usage")
+def backgrounds_usage_batch(
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Resumen de uso de TODOS los assets visibles, en una sola query.
+
+    Incidente 2026-06-11: la grilla de biblioteca hacía un GET
+    /backgrounds/{id}/usage POR ASSET (con 80 assets = 80 requests
+    simultáneos, cada uno con su auth + queries) y el pool de Postgres
+    se quedaba sin conexiones (OperationalError "SSL connection has been
+    closed" en Sentry, thumbnails sin cargar). Mismo shape por asset que
+    el endpoint individual, keyed por asset_id; el viejo queda por compat.
+
+    NOTA ruta: definido ANTES en orden de matching que
+    /backgrounds/{asset_id}/usage no hace falta — "usage" no parsea como
+    int, así que FastAPI no lo captura como asset_id (path param int).
+    """
+    tenant_id = current_user["tenant_id"]
+    q = db.query(BackgroundAsset.id).filter(BackgroundAsset.is_active == True)  # noqa: E712
+    q = _apply_asset_tenant_filter(q, current_user)
+    visible_ids = {row[0] for row in q.all()}
+    if not visible_ids:
+        return {"tenant_id": tenant_id, "usage": {}}
+    rows = (
+        db.query(AssetUsage)
+        .filter(AssetUsage.asset_id.in_(visible_ids), AssetUsage.tenant_id == tenant_id)
+        .order_by(AssetUsage.used_at.desc())
+        .all()
+    )
+    usage = {}
+    for r in rows:
+        agg = usage.setdefault(r.asset_id, {
+            "asset_id": r.asset_id,
+            "tenant_id": tenant_id,
+            "used": True,
+            "use_count": 0,
+            "as_is_count": 0,
+            "variation_count": 0,
+            "last_used_at": r.used_at.isoformat() if r.used_at else None,
+        })
+        agg["use_count"] += 1
+        if r.mode == "variation":
+            agg["variation_count"] += 1
+        else:
+            agg["as_is_count"] += 1
+    return {"tenant_id": tenant_id, "usage": usage}
+
+
 def _resolve_library_background(
     background_id: int,
     background_mode: str,

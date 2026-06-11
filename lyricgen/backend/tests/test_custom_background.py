@@ -218,3 +218,38 @@ def test_pipeline_derives_background_path_from_bg_r2_key():
     src = inspect.getsource(pipeline.run_pipeline)
     assert "if background_path is None and bg_r2_key:" in src
     assert "os.path.basename(bg_r2_key)" in src
+
+
+# ---------------------------------------------------------------------------
+# 6. Batch usage de biblioteca (incidente 2026-06-11: fan-out de 80 GETs)
+# ---------------------------------------------------------------------------
+
+def test_backgrounds_usage_batch_single_request(client, user_token, db):
+    from database import AssetUsage, BackgroundAsset
+    me = _decode_user(client, user_token)
+    a1 = BackgroundAsset(name="batch-usage-1", filename="library/bu1.jpg", file_type="jpg")
+    a2 = BackgroundAsset(name="batch-usage-2", filename="library/bu2.mp4", file_type="mp4")
+    db.add_all([a1, a2]); db.flush()
+    db.add_all([
+        AssetUsage(asset_id=a1.id, user_id=me["id"], tenant_id=me["tenant_id"],
+                   job_id="bu_job1", mode="as_is"),
+        AssetUsage(asset_id=a1.id, user_id=me["id"], tenant_id=me["tenant_id"],
+                   job_id="bu_job2", mode="variation"),
+        # Uso de OTRO tenant: no debe filtrar al caller
+        AssetUsage(asset_id=a2.id, user_id=me["id"], tenant_id="otro-tenant",
+                   job_id="bu_job3", mode="as_is"),
+    ])
+    db.commit()
+    try:
+        r = client.get("/backgrounds/usage", headers=auth(user_token))
+        assert r.status_code == 200, r.text
+        usage = r.json()["usage"]
+        u1 = usage[str(a1.id)] if str(a1.id) in usage else usage.get(a1.id)
+        assert u1 and u1["use_count"] == 2
+        assert u1["as_is_count"] == 1 and u1["variation_count"] == 1
+        # a2 solo fue usado por otro tenant → ausente para este caller
+        assert str(a2.id) not in usage and a2.id not in {int(k) for k in usage}
+    finally:
+        db.query(AssetUsage).filter(AssetUsage.job_id.like("bu_job%")).delete(synchronize_session=False)
+        db.query(BackgroundAsset).filter(BackgroundAsset.name.like("batch-usage-%")).delete(synchronize_session=False)
+        db.commit()
