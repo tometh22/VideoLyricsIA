@@ -46,7 +46,7 @@ export default function useInsights() {
       const qs = scopeParams(targetNav, targetDays);
       // overview no acepta user_id — el nivel usuario lo cubre activity/{id}.
       const overviewQs = scopeParams({ ...targetNav, userId: null }, targetDays);
-      const [overview, adoption, wizard, detail, economics] = await Promise.all([
+      const [overview, adoption, wizard, detail, economics, userEvents] = await Promise.all([
         targetNav.level === "user"
           ? Promise.resolve(null)
           : fetchJson(`${API}/admin/insights/overview?${overviewQs}`),
@@ -61,8 +61,12 @@ export default function useInsights() {
         targetNav.level === "app"
           ? fetchJson(`${API}/admin/metrics/economics?days=${Math.max(targetDays, 7)}`).catch(() => null)
           : Promise.resolve(null),
+        // Sesiones de wizard del usuario (profundidad 2026-06-11).
+        targetNav.level === "user"
+          ? fetchJson(`${API}/admin/insights/user/${targetNav.userId}/events?days=${targetDays}`).catch(() => null)
+          : Promise.resolve(null),
       ]);
-      const bundle = { overview, adoption, wizard, detail, economics };
+      const bundle = { overview, adoption, wizard, detail, economics, userEvents };
       cacheRef.current.set(key, bundle);
       setData(bundle);
     } catch (e) {
@@ -99,6 +103,7 @@ export default function useInsights() {
     wizard: data?.wizard ?? null,
     detail: data?.detail ?? null,
     economics: data?.economics ?? null,
+    userEvents: data?.userEvents ?? null,
     drillTenant,
     drillUser,
     upToApp,

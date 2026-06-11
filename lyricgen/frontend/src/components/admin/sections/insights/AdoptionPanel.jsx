@@ -60,7 +60,7 @@ const BG_SOURCE_LABELS = {
   other: "Otro / sin rastro",
 };
 
-function Bars({ dist, total }) {
+function Bars({ dist, total, onDrill }) {
   const entries = Object.entries(dist || {}).sort((a, b) => b[1] - a[1]);
   if (entries.length === 0) {
     return <p className="text-label text-gray-600">nunca usó</p>;
@@ -68,26 +68,42 @@ function Bars({ dist, total }) {
   const max = Math.max(total, 1);
   return (
     <div className="space-y-1">
-      {entries.slice(0, 6).map(([value, count]) => (
-        <div key={value} className="flex items-center gap-2">
-          <span className="text-label text-gray-400 w-28 shrink-0 truncate" title={value}>
-            {VALUE_LABELS[value] || value}
-          </span>
-          <div className="flex-1 h-4 bg-white/[0.04] rounded overflow-hidden">
-            <div
-              className="h-full bg-brand/60 rounded flex items-center px-1.5"
-              style={{ width: `${Math.max(4, Math.round((count / max) * 100))}%` }}
-            >
-              <span className="text-label text-white tabular-nums">{count}</span>
+      {entries.slice(0, 6).map(([value, count]) => {
+        const row = (
+          <>
+            <span className="text-label text-gray-400 w-28 shrink-0 truncate" title={value}>
+              {VALUE_LABELS[value] || value}
+            </span>
+            <div className="flex-1 h-4 bg-white/[0.04] rounded overflow-hidden">
+              <div
+                className="h-full bg-brand/60 rounded flex items-center px-1.5"
+                style={{ width: `${Math.max(4, Math.round((count / max) * 100))}%` }}
+              >
+                <span className="text-label text-white tabular-nums">{count}</span>
+              </div>
             </div>
-          </div>
-        </div>
-      ))}
+          </>
+        );
+        // Con onDrill la barra es un botón: click → quién/qué la usa.
+        return onDrill ? (
+          <button
+            key={value}
+            type="button"
+            onClick={() => onDrill(value, VALUE_LABELS[value] || value)}
+            className="w-full flex items-center gap-2 rounded hover:bg-white/[0.03] transition-colors duration-brand text-left"
+            title="Click: quién la usa"
+          >
+            {row}
+          </button>
+        ) : (
+          <div key={value} className="flex items-center gap-2">{row}</div>
+        );
+      })}
     </div>
   );
 }
 
-export default function AdoptionPanel({ adoption, title = "Qué features se usan" }) {
+export default function AdoptionPanel({ adoption, title = "Qué features se usan", onDrill }) {
   if (!adoption || adoption.total_jobs === 0) return null;
   const denom = adoption.jobs_with_params || adoption.total_jobs;
   const flags = Object.entries(adoption.flags || {});
@@ -109,6 +125,7 @@ export default function AdoptionPanel({ adoption, title = "Qué features se usan
             <Bars
               dist={adoption.features?.[key]}
               total={key === "style" || key === "delivery_profile" ? adoption.total_jobs : denom}
+              onDrill={onDrill ? (value, lbl) => onDrill(key, value, lbl) : undefined}
             />
           </div>
         ))}
@@ -122,6 +139,7 @@ export default function AdoptionPanel({ adoption, title = "Qué features se usan
             <Bars
               dist={Object.fromEntries(fonts.map((f) => [f.value, f.count]))}
               total={denom}
+              onDrill={onDrill ? (value, lbl) => onDrill("font", value, lbl) : undefined}
             />
           )}
         </div>

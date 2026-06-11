@@ -660,3 +660,205 @@ def user_detail_extras(db: Session, user_id: int, since) -> dict:
     ]
 
     return {"sessions": sessions, "logins": logins, "library_usage": library_usage}
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# 5. Profundidad (iteración "quiero más detalle en todo", 2026-06-11)
+# ─────────────────────────────────────────────────────────────────────────
+
+# Features drilleables: las distribuciones de adoption + las columnas
+# directas del Job. Whitelist explícita — el endpoint recibe strings del
+# frontend y NUNCA deben tocar atributos arbitrarios.
+_DRILLABLE_PARAM_FEATURES = set(_DISTRIBUTION_KEYS) | {"font"}
+_DRILLABLE_COLUMN_FEATURES = {"style", "delivery_profile"}
+
+
+def insights_feature_detail(db: Session, feature: str, value: str,
+                            days: int = 30, tenant_id=None) -> dict:
+    """¿QUIÉNES usan esta feature con este valor, y en qué videos?
+
+    El drill de las barras de adopción: click en "Karaoke" → usuarios
+    que la usan (con conteo) + los jobs concretos. value="(default)"
+    matchea jobs con params pero sin valor para esa key.
+    """
+    if feature not in _DRILLABLE_PARAM_FEATURES | _DRILLABLE_COLUMN_FEATURES:
+        return {"error": f"feature no drilleable: {feature}", "users": [], "jobs": []}
+
+    since = _utcnow() - timedelta(days=days)
+    rows = _scoped_job_query(
+        db, since, tenant_id, None,
+        Job.job_id, Job.user_id, Job.artist, Job.song_title, Job.status,
+        Job.created_at, Job.style, Job.delivery_profile, Job.render_params,
+    ).order_by(Job.created_at.desc()).all()
+
+    def _matches(r):
+        if feature in _DRILLABLE_COLUMN_FEATURES:
+            actual = r.style if feature == "style" else r.delivery_profile
+            return (actual or "") == value
+        params = r.render_params
+        if not params:
+            return False
+        actual = params.get(feature)
+        if value == "(default)":
+            return actual in (None, "")
+        return str(actual) == value
+
+    matched = [r for r in rows if _matches(r)]
+    by_user = defaultdict(lambda: {"count": 0, "last": None})
+    for r in matched:
+        agg = by_user[r.user_id]
+        agg["count"] += 1
+        created = _aware(r.created_at)
+        if created and (agg["last"] is None or created > agg["last"]):
+            agg["last"] = created
+    users_by_id = {
+        u.id: u.username
+        for u in db.query(User).filter(User.id.in_(by_user.keys())).all()
+    } if by_user else {}
+
+    return {
+        "feature": feature,
+        "value": value,
+        "days": days,
+        "tenant_id": tenant_id,
+        "total_jobs": len(matched),
+        "users": sorted(
+            (
+                {
+                    "user_id": uid,
+                    "username": users_by_id.get(uid, f"user:{uid}"),
+                    "count": agg["count"],
+                    "last_used": agg["last"].isoformat() if agg["last"] else None,
+                }
+                for uid, agg in by_user.items()
+            ),
+            key=lambda r: -r["count"],
+        ),
+        "jobs": [
+            {
+                "job_id": r.job_id,
+                "user_id": r.user_id,
+                "username": users_by_id.get(r.user_id, f"user:{r.user_id}"),
+                "artist": r.artist,
+                "song_title": r.song_title,
+                "status": r.status,
+                "created_at": r.created_at.isoformat() if r.created_at else None,
+            }
+            for r in matched[:50]
+        ],
+    }
+
+
+def insights_job_detail(db: Session, job_id: str) -> dict | None:
+    """La ficha completa de UN video: parámetros elegidos, cada llamada IA
+    con su costo, eventos de auditoría y error. El fondo del drill-down
+    (perfil de usuario → video → ficha)."""
+    job = db.query(Job).filter(Job.job_id == job_id).first()
+    if not job:
+        return None
+    user = db.query(User).filter(User.id == job.user_id).first()
+
+    prov = (
+        db.query(AIProvenance)
+        .filter(AIProvenance.job_id == job_id)
+        .order_by(AIProvenance.created_at)
+        .all()
+    )
+    calls = [
+        {
+            "step": p.step,
+            "tool_name": p.tool_name,
+            "tool_provider": p.tool_provider,
+            "duration_ms": p.duration_ms,
+            "cost_usd": round(cost_for_record(p.tool_name, p.tool_provider), 4),
+            "created_at": p.created_at.isoformat() if p.created_at else None,
+        }
+        for p in prov
+    ]
+
+    events = [
+        {
+            "action": e.action,
+            "detail": e.detail,
+            "created_at": e.created_at.isoformat() if e.created_at else None,
+        }
+        for e in db.query(AuditLog)
+        .filter(AuditLog.detail.isnot(None), AuditLog.created_at >= (_aware(job.created_at) or _utcnow()) - timedelta(days=1))
+        .order_by(AuditLog.created_at)
+        .limit(2000)
+        .all()
+        if (e.detail or {}).get("job_id") == job_id
+    ]
+
+    choices = job_choices(job) or {}
+    src_map = background_source_map(db, [job_id])
+    choices["background_source"] = src_map.get(job_id, "other")
+
+    return {
+        "job_id": job.job_id,
+        "username": user.username if user else None,
+        "user_id": job.user_id,
+        "tenant_id": job.tenant_id,
+        "artist": job.artist,
+        "song_title": job.song_title,
+        "status": job.status,
+        "current_step": job.current_step,
+        "error": (job.error or "")[:500] or None,
+        "error_category": job.error_category,
+        "edit_count": job.edit_count or 0,
+        "parent_job_id": job.parent_job_id,
+        "delivery_profile": job.delivery_profile,
+        "created_at": job.created_at.isoformat() if job.created_at else None,
+        "completed_at": job.completed_at.isoformat() if job.completed_at else None,
+        "approved_at": job.approved_at.isoformat() if job.approved_at else None,
+        "choices": choices,
+        "render_params": {
+            k: v for k, v in (job.render_params or {}).items()
+            if v not in (None, "")
+        },
+        "ai_calls": calls,
+        "ai_cost_usd": round(sum(c["cost_usd"] for c in calls), 2),
+        "events": events,
+    }
+
+
+def insights_user_events(db: Session, user_id: int, days: int = 30) -> dict:
+    """Sesiones de wizard de UN usuario, reconstruidas desde ui_events:
+    qué pasos recorrió, qué fondos tocó, dónde abandonó. La lupa de
+    comportamiento del perfil."""
+    since = _utcnow() - timedelta(days=days)
+    rows = (
+        db.query(UiEvent.event_type, UiEvent.event_data, UiEvent.created_at)
+        .filter(UiEvent.user_id == user_id, UiEvent.created_at >= since)
+        .order_by(UiEvent.created_at)
+        .limit(2000)
+        .all()
+    )
+    sessions = []
+    current = None
+    prev_time = None
+    for etype, data, created_at in rows:
+        created_at = _aware(created_at)
+        if prev_time is None or (created_at - prev_time) > _WIZARD_SESSION_GAP:
+            current = {
+                "started_at": created_at.isoformat(),
+                "events": [],
+                "generated": False,
+            }
+            sessions.append(current)
+        prev_time = created_at
+        current["events"].append({
+            "type": etype,
+            "data": data or {},
+            "at": created_at.isoformat(),
+        })
+        if etype == "wizard.generate":
+            current["generated"] = True
+    sessions.reverse()  # más recientes primero
+    return {
+        "user_id": user_id,
+        "days": days,
+        "telemetry_enabled": telemetry_enabled(),
+        "sessions": sessions[:30],
+        "total_events": len(rows),
+    }
