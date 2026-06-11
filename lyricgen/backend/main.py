@@ -2282,6 +2282,109 @@ def _validate_audio_file_on_disk(filename: str, path: str) -> None:
             )
 
 
+# --- Fondo personalizado (audit 2026-06-11: lifecycle de imagen subida) ----
+#
+# Antes de este fix el fondo custom solo validaba la EXTENSIÓN (un HEIC
+# renombrado .jpg entraba y reventaba a mitad de pipeline) y no tenía cap
+# de tamaño (asimetría con el audio, que valida magic bytes y tamaño desde
+# siempre). Además el archivo subido quedaba huérfano del ciclo de vida:
+# bg_r2_key_cached nunca se seteaba para fondos humanos → los edits
+# rápidos (typography/lyrics/metadata) devolvían 400 y /retry regeneraba
+# con Veo pisando la imagen del usuario.
+_BG_EXTENSIONS = (".mp4", ".mov", ".jpg", ".jpeg", ".png")
+MAX_BG_IMAGE_MB = int(os.environ.get("MAX_BG_IMAGE_MB", "25"))
+# Los videos de fondo comparten el techo global de upload (MAX_UPLOAD_MB).
+_JPEG_MAGIC = b"\xff\xd8\xff"
+_PNG_MAGIC = b"\x89PNG\r\n\x1a\n"
+
+
+def _validate_background_file_on_disk(filename: str, path: str) -> None:
+    """Magic-bytes + size validation para el fondo custom, espejo de
+    `_validate_audio_file_on_disk`. Lanza 400 con mensaje claro y borra
+    el archivo inválido — nunca dejarlo seguir al pipeline, donde el
+    error aparecería recién a mitad de render como "El render falló"."""
+    name_lower = (filename or "").lower()
+    ext = os.path.splitext(name_lower)[1]
+
+    def _reject(detail: str):
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+        raise HTTPException(status_code=400, detail=detail)
+
+    try:
+        size_mb = os.path.getsize(path) / (1024 * 1024)
+        with open(path, "rb") as fh:
+            header = fh.read(16)
+    except OSError as e:
+        _reject(f"Could not read uploaded background for validation: {e}")
+
+    if ext in (".jpg", ".jpeg", ".png"):
+        if size_mb > MAX_BG_IMAGE_MB:
+            _reject(
+                f"Background image too large ({size_mb:.1f} MB). "
+                f"Max allowed: {MAX_BG_IMAGE_MB} MB."
+            )
+        if ext == ".png":
+            if not header.startswith(_PNG_MAGIC):
+                _reject("File does not look like a valid PNG (magic bytes check failed).")
+        elif not header.startswith(_JPEG_MAGIC):
+            # Cubre el caso real: HEIC/WebP renombrado a .jpg.
+            _reject("File does not look like a valid JPEG (magic bytes check failed).")
+    else:  # .mp4 / .mov
+        if size_mb > MAX_UPLOAD_MB:
+            _reject(
+                f"Background video too large ({size_mb:.1f} MB). "
+                f"Max allowed: {MAX_UPLOAD_MB} MB."
+            )
+        # ISO-BMFF: el box `ftyp` vive en los bytes 4..8 en cualquier
+        # MP4/MOV bien formado de uploads reales.
+        if header[4:8] != b"ftyp":
+            _reject("File does not look like a valid MP4/MOV (magic bytes check failed).")
+
+
+def _save_custom_background(background_file, job_dir: str, job_id: str, tenant_id: str):
+    """Materializa el fondo subido por el usuario: valida (extensión +
+    magic bytes + tamaño), escribe a disco, sube a R2 y — clave del fix
+    2026-06-11 — persiste la key en `bg_r2_key_cached` para que los edits
+    rápidos y /retry preserven el archivo del usuario en vez de
+    regenerar con Veo. Devuelve (bg_path, bg_r2_key) o (None, None) si
+    no vino archivo."""
+    if not (background_file and background_file.filename):
+        return None, None
+    bg_ext = os.path.splitext(background_file.filename)[1].lower()
+    if bg_ext not in _BG_EXTENSIONS:
+        # Antes se ignoraba en silencio y el job salía con fondo IA — el
+        # usuario creía que su archivo se usó. Rechazo explícito.
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Unsupported background format '{bg_ext or '?'}'. "
+                "Use MP4, MOV, JPG or PNG."
+            ),
+        )
+    bg_filename = f"bg_custom{bg_ext}"
+    bg_path = os.path.join(job_dir, bg_filename)
+    with open(bg_path, "wb") as f:
+        shutil.copyfileobj(background_file.file, f)
+    _validate_background_file_on_disk(background_file.filename, bg_path)
+    bg_r2_key = None
+    if storage.is_enabled():
+        bg_r2_key = storage.upload_input(bg_path, tenant_id, job_id, bg_filename)
+        if bg_r2_key:
+            # El archivo humano YA vive en R2: esa misma key habilita el
+            # fast-path de edits (gate en request_edit) y la preservación
+            # en /retry (preserved_bg_r2_key) desde el minuto cero. Si el
+            # fondo termina animado con Veo, el pipeline re-cachea el clip
+            # resultante encima (mejor aún: el edit reusa la animación).
+            try:
+                update_job(job_id, bg_r2_key_cached=bg_r2_key)
+            except Exception as e:
+                logger.warning("[BG] could not persist bg_r2_key_cached for %s: %s", job_id, e)
+    return bg_path, bg_r2_key
+
+
 def _clamp_title_size(raw) -> float:
     """Parse + clamp the title-card size multiplier (Full Rotor v1) to
     0.5–2.0. Tolerates junk/empty input → 1.0 (no scaling)."""
@@ -4052,17 +4155,11 @@ async def upload(
             )
         )
     elif background_file and background_file.filename:
-        bg_ext = os.path.splitext(background_file.filename)[1].lower()
-        if bg_ext in (".mp4", ".mov", ".jpg", ".jpeg", ".png"):
-            bg_filename = f"bg_custom{bg_ext}"
-            bg_path = os.path.join(job_dir, bg_filename)
-            with open(bg_path, "wb") as f:
-                shutil.copyfileobj(background_file.file, f)
-            # User-provided backgrounds also need to cross to the worker.
-            if storage.is_enabled():
-                bg_r2_key = storage.upload_input(
-                    bg_path, tenant_id, job_id, bg_filename,
-                )
+        # Valida (magic bytes + tamaño), sube a R2 y persiste
+        # bg_r2_key_cached para que edits y /retry preserven el archivo.
+        bg_path, bg_r2_key = _save_custom_background(
+            background_file, job_dir, job_id, tenant_id,
+        )
 
     lang = language.strip() if language.strip() else None
 
@@ -6663,16 +6760,11 @@ async def generate_with_segments(
             )
         )
     elif background_file and background_file.filename:
-        bg_ext = os.path.splitext(background_file.filename)[1].lower()
-        if bg_ext in (".mp4", ".mov", ".jpg", ".jpeg", ".png"):
-            bg_filename = f"bg_custom{bg_ext}"
-            bg_path = os.path.join(job_dir, bg_filename)
-            with open(bg_path, "wb") as f:
-                shutil.copyfileobj(background_file.file, f)
-            if storage.is_enabled():
-                bg_r2_key = storage.upload_input(
-                    bg_path, current_user["tenant_id"], job_id, bg_filename,
-                )
+        # Valida (magic bytes + tamaño), sube a R2 y persiste
+        # bg_r2_key_cached para que edits y /retry preserven el archivo.
+        bg_path, bg_r2_key = _save_custom_background(
+            background_file, job_dir, job_id, current_user["tenant_id"],
+        )
 
     _font_scale_gen = 1.0
     try:

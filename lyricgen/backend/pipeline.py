@@ -730,6 +730,15 @@ def run_pipeline(job_id: str, mp3_path: str, artist: str, style: str,
                 error=f"Failed to fetch input from R2: {input_r2_key}",
             )
             return
+    # Mismo derive que mp3_path: /retry pasa bg_r2_key (preserved_bg_r2_key)
+    # con background_path=None porque el archivo solo vive en R2. Sin esta
+    # línea la condición de abajo nunca se cumplía y el "fondo preservado"
+    # del retry se descartaba en silencio — el pipeline regeneraba con Veo
+    # pisando el fondo aprobado/subido (audit 2026-06-11: afectaba tanto
+    # fondos IA cacheados como imágenes del usuario). El basename conserva
+    # la extensión, de la que depende _is_still más abajo.
+    if background_path is None and bg_r2_key:
+        background_path = os.path.join(job_dir, os.path.basename(bg_r2_key))
     if bg_r2_key and background_path and not os.path.exists(background_path):
         if not storage.download_object(bg_r2_key, background_path):
             update_job(
@@ -997,14 +1006,27 @@ def run_pipeline(job_id: str, mp3_path: str, artist: str, style: str,
         except Exception as _rp_exc:
             logger.warning("[BG] merge_render_params failed: %s", _rp_exc)
 
-        # Cache AI-generated background to R2 so a typography-only edit
-        # can re-use it without another Veo call ($0.80 saved per edit).
-        # Only worth doing when storage is available and the background is
-        # a file we own (not a human-provided upload — those already have
-        # their own R2 key in bg_r2_key).
-        if bg_image_path and os.path.exists(bg_image_path) and not background_path:
+        # Cache the FINAL background to R2 so a typography/lyrics/metadata
+        # edit can re-use it without another Veo call ($0.80 saved per edit)
+        # and /retry can preserve it.
+        #
+        # Audit 2026-06-11: antes la condición era `not background_path`
+        # ("los fondos humanos ya tienen su key en bg_r2_key") — pero esa
+        # key nunca llegaba a bg_r2_key_cached, así que los jobs con fondo
+        # subido por el usuario tenían los edits rápidos bloqueados con 400
+        # y el retry les pisaba la imagen. Ahora:
+        #   - Fondo humano usado tal cual (bg_image_path == background_path):
+        #     reutilizamos bg_r2_key como cached (sin re-subir nada).
+        #   - Cualquier otro caso (Veo, Imagen, imagen del usuario ANIMADA
+        #     con i2v): subimos el resultado final — así un edit sobre una
+        #     imagen animada reusa el clip animado, no la foto fija.
+        if bg_image_path and os.path.exists(bg_image_path):
             import storage as _storage
-            if _storage.is_enabled():
+            if background_path and bg_image_path == background_path:
+                if bg_r2_key:
+                    update_job(job_id, bg_r2_key_cached=bg_r2_key)
+                    logger.info("[EDIT] Cached human-provided background key: %s", bg_r2_key)
+            elif _storage.is_enabled():
                 try:
                     _bg_ext = os.path.splitext(bg_image_path)[1] or ".mp4"
                     _bg_cache_key = _storage.upload_file(
@@ -10858,7 +10880,13 @@ def run_edit_pipeline(
             # artist/song_title (already persisted by the /edit handler
             # before this worker spawned — see main.py:request_edit).
             update_job(job_id, status="editing", current_step="video", progress=35)
-            bg_image_path = os.path.join(job_dir, "bg_cached_edit.mp4")
+            # La extensión viene de la key cacheada: para fondos humanos
+            # puede ser .jpg/.png (imagen fija del usuario) y de ella
+            # depende el manejo de stills aguas abajo. Antes estaba
+            # hardcodeada .mp4 — un jpg cacheado se bajaba con nombre de
+            # video (audit 2026-06-11).
+            _cached_ext = os.path.splitext(bg_r2_key_cached or "")[1].lower() or ".mp4"
+            bg_image_path = os.path.join(job_dir, f"bg_cached_edit{_cached_ext}")
             if not os.path.exists(bg_image_path):
                 if bg_r2_key_cached and storage.is_enabled():
                     ok = storage.download_object(bg_r2_key_cached, bg_image_path)
