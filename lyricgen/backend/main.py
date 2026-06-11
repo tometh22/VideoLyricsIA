@@ -65,6 +65,7 @@ from auth import (
     has_drive_access,
     telemetry_enabled,
     generate_api_key,
+    is_super_admin,
 )
 import storage
 from datetime import datetime, timedelta, timezone
@@ -72,7 +73,7 @@ from datetime import datetime, timedelta, timezone
 from database import (
     Job, User, UserSettings, AuditLog, APIKey, get_db, init_db,
     BackgroundAsset, AssetUsage, Delivery, DeliveryChangeRequest,
-    SalesLead, UserSession, LoginSession, scoped_db, pool_stats,
+    SalesLead, UserSession, LoginSession, UiEvent, scoped_db, pool_stats,
 )
 from jobs import bulk_delete_jobs, create_job, delete_job, get_job, get_all_jobs, update_job
 from observability import init_sentry, init_logging, health_snapshot
@@ -1097,6 +1098,9 @@ async def login(body: LoginRequest, request: Request, db: Session = Depends(get_
             "username": user.username,
             "email": user.email,
             "role": user.role,
+            # Visibilidad inmediata de Insights post-login, sin esperar el
+            # freshen de /auth/me. Solo UI; el gate real es el backend.
+            "is_super_admin": is_super_admin(user.username, user.email, user.role),
             "tenant_id": user.tenant_id,
             "plan": user.plan_id,
             "allow_overage": getattr(user, "allow_overage", False) or False,
@@ -1535,6 +1539,91 @@ def telemetry_heartbeat(
         except Exception:
             pass
         return {"ok": True, "recorded": False}
+
+
+# Whitelist de eventos de UI aceptados por /telemetry/events. Un tipo fuera
+# de la lista se descarta en silencio (no es un error del cliente: versiones
+# viejas/nuevas del frontend pueden diferir durante un deploy). Mantener en
+# sync con frontend/src/lib/telemetryTrack.js y con admin_insights.insights_wizard.
+_UI_EVENT_TYPES = frozenset({
+    "wizard.step",           # {step_from, step_to, trigger}
+    "wizard.scene_mode",     # {mode}
+    "wizard.style",          # {style}
+    "wizard.library_filter", # {filter}
+    "wizard.library_select", # {asset_id, file_type, had_used_badge}
+    "wizard.library_mode",   # {asset_id, mode: as_is|variation}
+    "wizard.start_review",   # {}
+    "wizard.generate",       # {batch_size, mode: direct|reviewed}
+    "wizard.approve_lyrics", # {segments_edited}
+    "edit.entered",          # {job_id}
+    "edit.submitted",        # {job_id, fields}
+})
+_UI_EVENTS_MAX_BATCH = 25
+_UI_EVENT_DATA_MAX_BYTES = 2048
+
+
+class UiEventIn(BaseModel):
+    type: str
+    data: dict | None = None
+
+
+class UiEventsBatch(BaseModel):
+    events: list[UiEventIn]
+
+
+@app.post("/telemetry/events")
+@limiter.limit("60/minute")
+def telemetry_events(
+    body: UiEventsBatch,
+    request: Request,
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Batch de eventos de comportamiento del wizard (best-effort).
+
+    Alimenta ui_events, que backs el funnel del wizard del panel Insights
+    (super-admin). Mismo contrato de resiliencia que /telemetry/heartbeat:
+    NUNCA 5xx, con TELEMETRY_ENABLED apagada responde 200 sin escribir.
+
+    Defensas: batch capado a _UI_EVENTS_MAX_BATCH, event_type whitelisted,
+    event_data descartado si excede _UI_EVENT_DATA_MAX_BYTES serializado —
+    un cliente roto no puede inflar la tabla.
+    """
+    if not telemetry_enabled():
+        return {"ok": True, "recorded": 0}
+
+    try:
+        now = datetime.now(timezone.utc)
+        recorded = 0
+        for ev in body.events[:_UI_EVENTS_MAX_BATCH]:
+            if ev.type not in _UI_EVENT_TYPES:
+                continue
+            data = ev.data
+            if data is not None:
+                try:
+                    if len(json.dumps(data)) > _UI_EVENT_DATA_MAX_BYTES:
+                        data = None
+                except (TypeError, ValueError):
+                    data = None
+            db.add(UiEvent(
+                user_id=current_user["id"],
+                tenant_id=current_user.get("tenant_id") or "default",
+                event_type=ev.type,
+                event_data=data,
+                created_at=now,
+            ))
+            recorded += 1
+        if recorded:
+            db.commit()
+        return {"ok": True, "recorded": recorded}
+    except Exception as e:
+        logger.warning("[TELEMETRY] events write failed for user %s: %s",
+                       current_user.get("id"), e)
+        try:
+            db.rollback()
+        except Exception:
+            pass
+        return {"ok": True, "recorded": 0}
 
 
 @app.post("/auth/change-password")

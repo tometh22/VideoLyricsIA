@@ -45,6 +45,7 @@ import { mergeEditedSegments } from "./lib/reviewSegments";
 import { appendBackgroundFields } from "./lib/bgPayload";
 import { computeFieldDiff, buildEditPayloads } from "./lib/editWizardDiff";
 import { prefetchKey } from "./lib/prefetchKey";
+import { track } from "./lib/telemetryTrack";
 
 const API = import.meta.env.VITE_API_URL || "";
 
@@ -720,6 +721,7 @@ function EditLyricsRoute({ setCurrentReview, setWizardStage, wizardScreen, t }) 
   useEffect(() => {
     let alive = true;
     setState({ status: "loading" });
+    track("edit.entered", { job_id: id });
 
     // Re-hidrate from snapshot when refreshing mid-edit: el operador
     // ya tenía edits in-flight, el snapshot persistido por wizardPersistence
@@ -2602,6 +2604,7 @@ export default function App() {
         // Backend aplica los ungated en cualquier edit_type; los gated
         // (background_*, segments para lyrics) sólo se aplican si el
         // edit_type matchea.
+        track("edit.submitted", { job_id: editedJobId, fields: presentBuckets });
         const payload = { edit_type: chosenType };
         if (diff.metadata) Object.assign(payload, diff.metadata);
         if (diff.typography) Object.assign(payload, diff.typography);
@@ -2681,6 +2684,7 @@ export default function App() {
       // o params no estables); pipeline corre Veo/Imagen como siempre.
       bgCacheKey: r.bgCacheKey || null,
     }];
+    track("wizard.approve_lyrics", { segments: (editedSegments || []).length });
     setApprovedJobs(newApproved);
     setCurrentReview(null);
 
@@ -2719,6 +2723,7 @@ export default function App() {
   };
 
   const startGenerationWithSegments = async (approved) => {
+    track("wizard.generate", { mode: "reviewed", batch_size: (approved || []).length });
     // HOTFIX 2026-05-29 (#473.2): si el operador refrescó la pestaña entre
     // upload y "Aprobar y generar", `a.file` quedó como stub serializado
     // (sin Blob real, sin .slice). El POST /generate necesita el audio en
@@ -4019,7 +4024,10 @@ export default function App() {
             user?.role === "admin"
               ? (
                 <Suspense fallback={<RouteSuspenseFallback />}>
-                  <AdminPanel onBack={() => navigate("/dashboard")} />
+                  <AdminPanel
+                    onBack={() => navigate("/dashboard")}
+                    isSuperAdmin={Boolean(user?.is_super_admin)}
+                  />
                 </Suspense>
               )
               : <Navigate to="/dashboard" replace />

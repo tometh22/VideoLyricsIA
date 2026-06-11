@@ -13,7 +13,14 @@ from pydantic import BaseModel
 from sqlalchemy import case, func
 from sqlalchemy.orm import Session
 
-from auth import get_current_user, PLANS, pwd_context, telemetry_enabled, validate_password_strength
+from auth import (
+    get_current_user,
+    PLANS,
+    pwd_context,
+    telemetry_enabled,
+    validate_password_strength,
+    _super_admin_allowlist,
+)
 from database import User, Job, Invoice, AuditLog, AIProvenance, AssetUsage, BackgroundAsset, UserSession, get_db
 from error_taxonomy import classify_error
 
@@ -32,15 +39,9 @@ def require_admin(current_user: dict = Depends(get_current_user)):
     return current_user
 
 
-def _super_admin_allowlist() -> set:
-    """Parse SUPER_ADMIN_USERS (comma-separated usernames/emails, case-insensitive).
-
-    Leído en cada request (no a import-time) para que los tests puedan
-    monkeypatchear el env y para que un cambio de la var en Railway
-    aplique con el redeploy sin sorpresas de orden de import.
-    """
-    raw = os.environ.get("SUPER_ADMIN_USERS", "")
-    return {x.strip().lower() for x in raw.split(",") if x.strip()}
+# _super_admin_allowlist vive en auth.py (se movió para computar el flag
+# is_super_admin en get_current_user sin import circular); se re-importa
+# arriba para mantener compatibilidad con quien lo use desde admin.
 
 
 def require_super_admin(current_user: dict = Depends(get_current_user)):
@@ -1136,8 +1137,17 @@ async def admin_activity_detail(
         .limit(100)
         .all()
     )
-    job_rows = [
-        {
+    # Resumen de la config elegida por job (render_params) + fuente del
+    # fondo — backs la columna "elecciones" del perfil de usuario en
+    # Insights. Aditivo: el shape histórico no cambia.
+    from admin_insights import background_source_map, job_choices, user_detail_extras
+    bg_sources = background_source_map(db, [j.job_id for j in jobs])
+    job_rows = []
+    for j in jobs:
+        choices = job_choices(j)
+        if choices is not None:
+            choices["background_source"] = bg_sources.get(j.job_id, "other")
+        job_rows.append({
             "job_id": j.job_id,
             "artist": j.artist,
             "song_title": j.song_title,
@@ -1150,9 +1160,8 @@ async def admin_activity_detail(
             "approved_at": j.approved_at.isoformat() if j.approved_at else None,
             "created_at": j.created_at.isoformat() if j.created_at else None,
             "completed_at": j.completed_at.isoformat() if j.completed_at else None,
-        }
-        for j in jobs
-    ]
+            "choices": choices,
+        })
 
     audit_events = (
         db.query(AuditLog)
@@ -1192,6 +1201,9 @@ async def admin_activity_detail(
         "jobs": job_rows,
         "downloads": downloads,
         "events": rework_events,
+        # sessions (null sin TELEMETRY_ENABLED) / logins / library_usage —
+        # consumidos por UserProfileView del panel Insights.
+        **user_detail_extras(db, user_id, since),
     }
 
 
@@ -1483,3 +1495,51 @@ async def admin_metrics_health(
     retrabajo, errores). Los umbrales de alerta viven en admin_metrics."""
     from admin_metrics import metrics_health
     return metrics_health(db)
+
+
+# ---------------------------------------------------------------------------
+# Insights de comportamiento — panel CEO (2026-06-10). Lógica en
+# admin_insights.py; acá solo routing + gates. TODO super-admin: es
+# observabilidad de usuarios, no del tenant.
+# ---------------------------------------------------------------------------
+
+@router.get("/insights/adoption")
+async def admin_insights_adoption(
+    days: int = Query(30, ge=1, le=365),
+    tenant_id: Optional[str] = Query(None),
+    user_id: Optional[int] = Query(None),
+    admin: dict = Depends(require_super_admin),
+    db: Session = Depends(get_db),
+):
+    """Qué features usa la gente (agregación de Job.render_params): animaciones,
+    transiciones, efectos, tipografías, estilos, fuente del fondo. Un solo
+    endpoint para los 3 niveles vía tenant_id/user_id."""
+    from admin_insights import insights_adoption
+    return insights_adoption(db, days=days, tenant_id=tenant_id, user_id=user_id)
+
+
+@router.get("/insights/overview")
+async def admin_insights_overview(
+    days: int = Query(30, ge=1, le=365),
+    tenant_id: Optional[str] = Query(None),
+    admin: dict = Depends(require_super_admin),
+    db: Session = Depends(get_db),
+):
+    """KPIs de uso/calidad/costo + ranking de tenants y usuarios para el
+    drill-down del panel Insights."""
+    from admin_insights import insights_overview
+    return insights_overview(db, days=days, tenant_id=tenant_id)
+
+
+@router.get("/insights/wizard")
+async def admin_insights_wizard(
+    days: int = Query(30, ge=1, le=365),
+    tenant_id: Optional[str] = Query(None),
+    user_id: Optional[int] = Query(None),
+    admin: dict = Depends(require_super_admin),
+    db: Session = Depends(get_db),
+):
+    """Funnel del wizard desde ui_events (pasos alcanzados, abandono,
+    conversión a generate). {empty: true} hasta que la telemetría acumule."""
+    from admin_insights import insights_wizard
+    return insights_wizard(db, days=days, tenant_id=tenant_id, user_id=user_id)
