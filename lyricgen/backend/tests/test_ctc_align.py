@@ -291,25 +291,28 @@ def test_perf_text_phantom_intro_and_hallucination():
 
 
 def test_condense_repeated_skips_rotor_style():
-    """v3 e2e shape: crowd repetitions stacked/skipped at one timestamp
-    must condense into one block line (like Rotor's own GT does)."""
+    """Run-based block: consecutive UNANCHORED lines with a repeated-text
+    signature become ONE block whose text is the run's REAL sequence
+    (variants and interjections included), spanning to the next anchor."""
     segs = [
         {"text": "No me niegues que me buscaste", "start": 59.0, "end": 61.6},
         {"text": "Nada, nada de esto", "start": 61.6, "end": 75.1, "ctc_skipped": True},
         {"text": "nada de esto fue un error", "start": 75.1, "end": 75.1, "ctc_skipped": True},
+        {"text": "Oh, oh", "start": 75.1, "end": 75.1, "ctc_skipped": True},
         {"text": "Nada de esto fue un error", "start": 75.1, "end": 75.1, "ctc_skipped": True},
-        {"text": "Nada de esto fue un error", "start": 75.1, "end": 76.1, "ctc_recovered": "mix"},
-        {"text": "Nada fue un error", "start": 75.1, "end": 76.6},
-        {"text": "¡Dos! ¡One, two, three, va!", "start": 76.6, "end": 78.8, "ctc_skipped": True},
+        {"text": "Nada fue un error", "start": 75.1, "end": 76.6},  # anclada: corta el run
     ]
     out = ctc_align.condense_repeated_skips(segs)
-    merged = next(s for s in out if s.get("ctc_condensed"))
-    # Rotor-style: ONE block, chained text, condensed count carried
-    assert merged["text"].lower().count("nada de esto fue un error") >= 2
-    assert merged.get("ctc_condensed", 0) >= 2
-    assert sum(1 for s in out if "esto fue un error" in s["text"].lower()) == 1
-    assert "Nada fue un error" in [s["text"] for s in out]
-    assert "No me niegues que me buscaste" in [s["text"] for s in out]
+    assert len(out) == 3
+    blk = out[1]
+    assert blk.get("ctc_condensed") == 4
+    # secuencia REAL: lead-in + repeticion + interjeccion "oh, oh" adentro
+    assert blk["text"].lower().startswith("nada, nada de esto, nada de esto fue un error")
+    assert "oh, oh" in blk["text"].lower()
+    # span: desde el inicio del run hasta la proxima ancla
+    assert blk["start"] == 61.6 and abs(blk["end"] - 75.1) < 0.3
+    # la linea anclada sigue individual (dinamismo intacto)
+    assert out[2]["text"] == "Nada fue un error"
 
 
 def test_condense_extends_block_to_next_anchor():
