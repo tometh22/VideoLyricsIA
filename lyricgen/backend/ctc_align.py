@@ -493,13 +493,43 @@ def condense_repeated_skips(segments: list[dict]) -> list[dict]:
                           or (p["end"] - p["start"]) < 0.3)
             if similar and unanchored:
                 p["end"] = max(p["end"], s["end"])
-                if len(s.get("text") or "") > len(p.get("text") or ""):
-                    p["text"] = s["text"]
+                # Rotor-style chained text ("Oh, nada fue un error, nada
+                # fue un error, nada fue un error"), capped so an 8x chant
+                # doesn't produce a monster line.
+                st = (s.get("text") or "").strip()
+                chained = f"{p['text']}, {st[:1].lower() + st[1:]}" if st else p["text"]
+                if len(chained) <= 90:
+                    p["text"] = chained
                 p["ctc_condensed"] = p.get("ctc_condensed", 1) + 1
                 p.pop("ctc_skipped", None)
                 continue
         out.append(dict(s))
-    return [s for s in out
+    # THE span bug (job 400, all three bad crowd spots): the merged
+    # repetitions were zero-length stacks, so the condensed block stayed
+    # 3.5 s while the crowd actually chants until the next anchored line
+    # (61.5→75.1). Extend each condensed block to the next line's start —
+    # Rotor's own block spans 65.2→76.24.
+    for i, s in enumerate(out):
+        if s.get("ctc_condensed") and i + 1 < len(out):
+            nxt = out[i + 1]["start"]
+            if nxt - 0.2 > s["end"]:
+                s["end"] = round(nxt - 0.2, 3)
+    # second merge pass: a zero-length condensed block can be left stacked
+    # on a same-text neighbour (job 400: the 251.72 COND3+COND18 pair)
+    merged2: list[dict] = []
+    for s in out:
+        if merged2:
+            p = merged2[-1]
+            a, b = n(p.get("text")), n(s.get("text"))
+            if len(b) > 8 and (a == b or a in b or b in a) and (
+                    (p["end"] - p["start"]) < 0.3 or (s["end"] - s["start"]) < 0.3):
+                p["end"] = max(p["end"], s["end"])
+                p["start"] = min(p["start"], s["start"])
+                p["ctc_condensed"] = (p.get("ctc_condensed", 1)
+                                      + s.get("ctc_condensed", 1))
+                continue
+        merged2.append(s)
+    return [s for s in merged2
             if (s["end"] - s["start"]) >= 0.3 or not s.get("ctc_skipped")]
 
 

@@ -303,9 +303,23 @@ def test_condense_repeated_skips_rotor_style():
         {"text": "¡Dos! ¡One, two, three, va!", "start": 76.6, "end": 78.8, "ctc_skipped": True},
     ]
     out = ctc_align.condense_repeated_skips(segs)
-    low = [s["text"].lower() for s in out]
-    assert low.count("nada de esto fue un error") == 1
-    merged = next(s for s in out if s["text"].lower() == "nada de esto fue un error")
-    assert merged.get("ctc_condensed", 0) >= 2 and merged["end"] >= 76.1
+    merged = next(s for s in out if s.get("ctc_condensed"))
+    # Rotor-style: ONE block, chained text, condensed count carried
+    assert merged["text"].lower().count("nada de esto fue un error") >= 2
+    assert merged.get("ctc_condensed", 0) >= 2
+    assert sum(1 for s in out if "esto fue un error" in s["text"].lower()) == 1
     assert "Nada fue un error" in [s["text"] for s in out]
     assert "No me niegues que me buscaste" in [s["text"] for s in out]
+
+
+def test_condense_extends_block_to_next_anchor():
+    """Job 400 chorus 1: the COND2 block stayed 61.5-65.0 while the crowd
+    chants until 75.1 — must extend Rotor-style (their block 65.2→76.24)."""
+    segs = [
+        {"text": "Nada de esto fue un error", "start": 61.5, "end": 62.0, "ctc_skipped": True},
+        {"text": "Nada de esto fue un error", "start": 62.0, "end": 65.0, "ctc_skipped": True},
+        {"text": "Nada fue un error", "start": 75.1, "end": 76.6},
+    ]
+    out = ctc_align.condense_repeated_skips(segs)
+    assert out[0].get("ctc_condensed") == 2
+    assert abs(out[0]["end"] - 74.9) < 0.01  # extendido hasta la próxima ancla
