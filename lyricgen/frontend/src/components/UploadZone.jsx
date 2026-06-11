@@ -355,6 +355,20 @@ export default function UploadZone({
   // operator can open "Mi prompt" before typing anything.
   const _hint = (batchDefaults.backgroundHint || "").trim();
   const [sceneMode, setSceneMode] = useState(_hint ? "prompt" : (inspiredByLyrics ? "lyrics" : "auto"));
+  // Preview del fondo subido por el usuario (audit 2026-06-11): antes el
+  // operador generaba a ciegas — el branch custom del preview era un
+  // placeholder "Fondo subido". Object URL con revoke en cleanup; el guard
+  // de .slice cubre los File stubs restaurados post-refresh.
+  const [customPreviewUrl, setCustomPreviewUrl] = useState(null);
+  useEffect(() => {
+    if (!backgroundFile || typeof backgroundFile.slice !== "function") {
+      setCustomPreviewUrl(null);
+      return undefined;
+    }
+    const url = URL.createObjectURL(backgroundFile);
+    setCustomPreviewUrl(url);
+    return () => URL.revokeObjectURL(url);
+  }, [backgroundFile]);
   const selectSceneMode = (m) => {
     track("wizard.scene_mode", { mode: m });
     setSceneMode(m);
@@ -2211,7 +2225,7 @@ export default function UploadZone({
                   : null
               }
             />
-          ) : (bgMode === "auto" || bgMode === "library") ? (
+          ) : (bgMode === "auto" || bgMode === "library" || (bgMode === "custom" && customPreviewUrl)) ? (
             <WizardLivePreview
               style={style}
               customColors={customColors}
@@ -2230,12 +2244,18 @@ export default function UploadZone({
                  cuando elegía un asset image porque el <video> element
                  fallaba a cargar la imagen. */
               clipSrc={(() => {
+                if (bgMode === "custom" && customPreviewUrl) {
+                  return customPreviewUrl;
+                }
                 if (bgMode === "library" && backgroundId) {
                   return `${API}/backgrounds/${backgroundId}/preview?${tokenParam()}`;
                 }
                 return (MOVEMENT_STYLES.find((m) => m.code === (hoverMovement ?? batchDefaults.movementStyle))?.sample) || "/movement_samples/estandar.mp4";
               })()}
               clipIsVideo={(() => {
+                if (bgMode === "custom" && customPreviewUrl) {
+                  return /\.(mp4|mov)$/i.test(backgroundFile?.name || "");
+                }
                 if (bgMode === "library" && backgroundId) {
                   const sel = libraryBgs.find((b) => b.id === backgroundId);
                   return sel?.file_type === "mp4";
@@ -2289,9 +2309,9 @@ export default function UploadZone({
               placeholderBg={isStep6 && bgStatus !== "done"}
             />
           ) : (
-            // Custom file: hasta que el archivo cargue no podemos mostrar
-            // nada útil — placeholder por ahora. Cuando se procese el File,
-            // un follow-up puede mostrarlo como background overlay.
+            // Custom SIN archivo todavía (o stub post-refresh): no hay
+            // nada que mostrar — con archivo real, el branch de arriba lo
+            // usa como base del live preview (fix audit 2026-06-11).
             <div className="aspect-video rounded-2xl ring-1 ring-white/[0.08] bg-surface-2/50 grid place-items-center text-gray-500 text-[13px]">
               {t("upload.bg_custom_tab") || "Fondo subido"}
             </div>
