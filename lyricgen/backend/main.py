@@ -2456,7 +2456,41 @@ def _job_scope(current_user: dict) -> dict:
     tests/test_tenant_isolation.py::test_two_users_same_tenant_share_jobs
     for the contract this enforces.
     """
+    # Cross-tenant para admins (pedido CEO 2026-06-11): el rol admin es de
+    # PLATAFORMA, no de tenant — necesita abrir el video de cualquier
+    # cliente para verificar incidentes con sus propios ojos (caso UMG
+    # Chile: el link /videos/{id} de otro tenant daba 404 incluso para el
+    # dueño de la empresa). El acceso a media queda auditado en
+    # /media-token y /download vía _audit_cross_tenant_access.
+    if current_user.get("role") == "admin":
+        return {}
     return {"tenant_id": current_user["tenant_id"]}
+
+
+def _audit_cross_tenant_access(db: Session, current_user: dict, job: dict, kind: str) -> None:
+    """Deja rastro cuando un admin accede a media de OTRO tenant.
+
+    Parte del contrato de la apertura cross-tenant: la visibilidad de
+    plataforma para admins viene con trail de auditoría (compliance UMG).
+    Best-effort: un fallo acá no bloquea el acceso."""
+    try:
+        if current_user.get("role") != "admin":
+            return
+        job_tenant = job.get("tenant_id") if isinstance(job, dict) else getattr(job, "tenant_id", None)
+        if not job_tenant or job_tenant == current_user.get("tenant_id"):
+            return
+        db.add(AuditLog(
+            user_id=current_user["id"],
+            action="admin.cross_tenant_access",
+            detail={
+                "job_id": job.get("job_id") if isinstance(job, dict) else job.job_id,
+                "job_tenant": job_tenant,
+                "kind": kind,
+            },
+        ))
+        db.commit()
+    except Exception as e:
+        logger.warning("[AUDIT] cross-tenant access log failed: %s", e)
 
 
 def _lock_user_for_quota(db: Session, user_id: int) -> None:
@@ -7374,6 +7408,9 @@ async def issue_media_token(
     job = get_job(db, job_id, **_job_scope(current_user))
     if job is None:
         raise HTTPException(status_code=404, detail="Job not found.")
+    # El media-token es la puerta a VER el media: si un admin cruza de
+    # tenant, queda en el audit trail (contrato de la apertura cross-tenant).
+    _audit_cross_tenant_access(db, current_user, job, kind=f"media-token:{file_type}")
     user_model = db.query(User).filter(User.id == current_user["id"]).first()
     return {"token": create_media_token(user_model, job_id, file_type)}
 
