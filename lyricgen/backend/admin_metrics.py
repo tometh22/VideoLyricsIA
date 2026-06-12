@@ -79,19 +79,36 @@ def metrics_timeseries(db: Session, days: int = 28) -> dict:
     ):
         series[_day_key(approved_at)][tenant]["approved"] += 1
 
-    edit_rows = (
-        db.query(AuditLog.created_at, Job.tenant_id)
-        .join(User, User.id == AuditLog.user_id)
-        .outerjoin(Job, Job.job_id == func.coalesce(AuditLog.detail["job_id"].astext, ""))
-        .filter(AuditLog.action == "job.edit_request", AuditLog.created_at >= since)
-        .all()
-    ) if db.bind.dialect.name == "postgresql" else [
-        # SQLite (tests): el detail JSON no soporta .astext — resolvemos en Python.
-        (r.created_at, _tenant_for_job(db, (r.detail or {}).get("job_id")))
-        for r in db.query(AuditLog)
-        .filter(AuditLog.action == "job.edit_request", AuditLog.created_at >= since)
-        .all()
-    ]
+    # Incidente prod 2026-06-11 (Sentry AttributeError "no attribute
+    # 'astext'"): detail es nuestro TypeDecorator JSONB y al indexarlo el
+    # comparator NO expone .astext (eso es del tipo nativo de
+    # sqlalchemy.dialects.postgresql) → el primer hit a /metrics/timeseries
+    # en prod tiró 500 y los KPIs de Rendimiento quedaron en "—".
+    # as_string() es el accessor portable del comparator JSON genérico; y
+    # ante CUALQUIER sorpresa de dialecto caemos al camino Python (mismo
+    # resultado, más lento) en vez de romper el endpoint.
+    def _edit_rows_python():
+        return [
+            (r.created_at, _tenant_for_job(db, (r.detail or {}).get("job_id")))
+            for r in db.query(AuditLog)
+            .filter(AuditLog.action == "job.edit_request", AuditLog.created_at >= since)
+            .all()
+        ]
+
+    if db.bind.dialect.name == "postgresql":
+        try:
+            edit_rows = (
+                db.query(AuditLog.created_at, Job.tenant_id)
+                .join(User, User.id == AuditLog.user_id)
+                .outerjoin(Job, Job.job_id == func.coalesce(AuditLog.detail["job_id"].as_string(), ""))
+                .filter(AuditLog.action == "job.edit_request", AuditLog.created_at >= since)
+                .all()
+            )
+        except Exception as e:
+            logger.warning("[METRICS] timeseries: SQL JSON path falló (%s) — fallback Python", e)
+            edit_rows = _edit_rows_python()
+    else:
+        edit_rows = _edit_rows_python()
     for created_at, tenant in edit_rows:
         if tenant:
             series[_day_key(created_at)][tenant]["edit_requests"] += 1
