@@ -60,6 +60,22 @@ export default function useRendimiento() {
 
   // KPIs 7d vs 7d previos (las dos ventanas para las que timeseries trae
   // margen — independientes del período global, siempre "última semana").
+  // Serie diaria total (suma de tenants) para el área chart + sparklines.
+  const daily = series
+    ? Object.entries(series)
+        .sort(([a], [b]) => a.localeCompare(b))
+        .map(([day, tenants]) => {
+          const tot = { created: 0, approved: 0, edit_requests: 0, ai_cost_usd: 0 };
+          for (const m of Object.values(tenants)) {
+            tot.created += m.created || 0;
+            tot.approved += m.approved || 0;
+            tot.edit_requests += m.edit_requests || 0;
+            tot.ai_cost_usd += m.ai_cost_usd || 0;
+          }
+          return { day: day.slice(5), ...tot };
+        })
+    : null;
+
   const kpis = series
     ? {
         created: sumWindow(series, "created", 7, 0),
@@ -73,5 +89,15 @@ export default function useRendimiento() {
       }
     : null;
 
-  return { tenantHealth, funnel, kpis, loading };
+  // Sparklines: últimos 14 días de cada métrica.
+  const sparks = daily
+    ? {
+        created: daily.slice(-14).map((d) => d.created),
+        approved: daily.slice(-14).map((d) => d.approved),
+        edits: daily.slice(-14).map((d) => d.edit_requests),
+        cost: daily.slice(-14).map((d) => Math.round(d.ai_cost_usd * 100) / 100),
+      }
+    : null;
+
+  return { tenantHealth, funnel, kpis, daily, sparks, loading };
 }
