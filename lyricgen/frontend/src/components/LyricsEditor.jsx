@@ -462,13 +462,9 @@ export default function LyricsEditor({
     // to where it was before. We bump the ref so we don't re-check on
     // every render, but skip the destructive reseed.
     if (segmentsValuesEqual(prevSegmentsRef.current, segments)) {
-      // [drag-persist] diagnostic — remove after staging confirms.
-      console.warn("[drag-persist] prop-sync skipping reseed (values equal)");
       prevSegmentsRef.current = segments;
       return;
     }
-    // [drag-persist] diagnostic — remove after staging confirms.
-    console.warn("[drag-persist] prop-sync RESEEDING", { count: segments.length });
     prevSegmentsRef.current = segments;
     const seeded = segments.map((s, i) => ({ ...s, _id: i }));
     setEdited(seeded);
@@ -577,12 +573,6 @@ export default function LyricsEditor({
     _pendingFlushRef.current = null;
     setSaveStatus("saving");
     const cleaned = edited.map(({ _id, review, ...rest }) => rest);
-    // [drag-persist] diagnostic — remove after staging confirms the fix.
-    console.warn("[drag-persist] flush firing", {
-      transcribeJobId,
-      flushCounter,
-      count: cleaned.length,
-    });
     Promise.resolve(onPersistSegments(transcribeJobId, cleaned))
       .then((result) => {
         if (cancelled) return;
@@ -812,12 +802,6 @@ export default function LyricsEditor({
   // auto-extending it (hold-until-next). The undo snapshot is pushed by the
   // timeline on pointerdown (onDragStart), so this only mutates `edited`.
   const handleTimelineTimingChange = useCallback((id, newStart, newEnd) => {
-    // [drag-persist] diagnostic — remove after staging confirms the fix.
-    console.warn("[drag-persist] drag end", {
-      id,
-      newStart: Math.round(newStart * 1000) / 1000,
-      newEnd: Math.round(newEnd * 1000) / 1000,
-    });
     setIsDirty(true);
     setEdited((prev) => prev.map((s) =>
       s._id === id ? { ...s, start: newStart, end: newEnd, locked: true } : s
