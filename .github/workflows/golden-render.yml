@@ -45,6 +45,16 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Esperar el deploy de staging (solo en push)
+        if: github.event_name == 'push'
+        run: |
+          # El push que disparó este run también disparó el deploy de
+          # staging en Railway (~3-5 min). Sin esta espera, los renders
+          # correrían sobre el Worker VIEJO y auditaríamos el código
+          # anterior al cambio.
+          echo "esperando 7 min a que staging termine de deployar..."
+          sleep 420
+
       - name: Dependencias (ffmpeg + pillow)
         run: |
           sudo apt-get update -q && sudo apt-get install -y -q ffmpeg
