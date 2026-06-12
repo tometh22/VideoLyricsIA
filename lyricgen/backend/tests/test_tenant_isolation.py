@@ -237,3 +237,70 @@ def test_get_job_scoped_call_does_not_log_warning(caplog):
         assert not warnings, "scoped get_job() must not warn"
     finally:
         db.close()
+
+
+# ---------------------------------------------------------------------------
+# Cross-tenant para ADMINS (pedido CEO 2026-06-11): el rol admin es de
+# plataforma — puede abrir el video de cualquier tenant (con audit trail);
+# los usuarios comunes siguen aislados.
+# ---------------------------------------------------------------------------
+
+def _seed_foreign_job(db, jid, tenant="otro-tenant-x"):
+    from database import Job, User
+    # user_id es NOT NULL: colgamos el job del primer usuario que exista
+    # (el bootstrap admin); lo que se prueba es el AISLAMIENTO POR TENANT.
+    any_uid = db.query(User.id).order_by(User.id).first()[0]
+    db.add(Job(job_id=jid, user_id=any_uid, tenant_id=tenant, artist="X",
+               song_title="Cross", filename="x.mp3", status="done",
+               s3_keys={"video": f"outputs/{jid}/video.mp4"}))
+    db.commit()
+
+
+def test_admin_can_read_other_tenant_job(client, admin_token, db):
+    from tests.conftest import auth
+    _seed_foreign_job(db, "xtenant00001")
+    try:
+        r = client.get("/status/xtenant00001", headers=auth(admin_token))
+        assert r.status_code == 200, r.text
+        assert r.json()["job_id"] == "xtenant00001"
+    finally:
+        from database import Job
+        db.query(Job).filter(Job.job_id == "xtenant00001").delete(synchronize_session=False)
+        db.commit()
+
+
+def test_regular_user_still_isolated(client, user_token, db):
+    from tests.conftest import auth
+    _seed_foreign_job(db, "xtenant00002")
+    try:
+        r = client.get("/status/xtenant00002", headers=auth(user_token))
+        assert r.status_code == 404
+    finally:
+        from database import Job
+        db.query(Job).filter(Job.job_id == "xtenant00002").delete(synchronize_session=False)
+        db.commit()
+
+
+def test_admin_cross_tenant_media_token_is_audited(client, admin_token, db):
+    from tests.conftest import auth
+    from database import AuditLog, Job
+    _seed_foreign_job(db, "xtenant00003")
+    try:
+        r = client.get("/media-token/xtenant00003/video", headers=auth(admin_token))
+        assert r.status_code == 200, r.text
+        rows = (
+            db.query(AuditLog)
+            .filter(AuditLog.action == "admin.cross_tenant_access")
+            .order_by(AuditLog.id.desc())
+            .limit(5)
+            .all()
+        )
+        assert any(
+            (e.detail or {}).get("job_id") == "xtenant00003"
+            and (e.detail or {}).get("job_tenant") == "otro-tenant-x"
+            for e in rows
+        ), "falta el rastro de auditoría cross-tenant"
+    finally:
+        db.query(Job).filter(Job.job_id == "xtenant00003").delete(synchronize_session=False)
+        db.query(AuditLog).filter(AuditLog.action == "admin.cross_tenant_access").delete(synchronize_session=False)
+        db.commit()
