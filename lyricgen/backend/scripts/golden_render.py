@@ -173,6 +173,25 @@ def _mean_abs_diff(path_a, path_b) -> float:
     return sum(ImageStat.Stat(diff).mean) / 3.0
 
 
+def _cleanup_bot_jobs(base, token):
+    """Rechaza los jobs pendientes del bot. Sin esto, el límite de 5
+    videos en proceso/revisión por usuario rompe el nocturno a la
+    tercera corrida (visto en la validación inicial 2026-06-12)."""
+    try:
+        jobs = _req(base, "/jobs", token=token)
+        items = jobs if isinstance(jobs, list) else jobs.get("jobs", [])
+        for j in items:
+            if j.get("status") in ("pending_review", "done"):
+                try:
+                    _req(base, f"/reject/{j['job_id']}", token=token,
+                         data=b"{}", headers={"Content-Type": "application/json"},
+                         method="POST")
+                except Exception:
+                    pass
+    except Exception as e:
+        print(f"[GOLDEN] cleanup de jobs del bot falló (no fatal): {e}")
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--base-url", required=True)
@@ -188,6 +207,7 @@ def main():
     os.makedirs(work, exist_ok=True)
 
     token = _login(base)
+    _cleanup_bot_jobs(base, token)  # liberar el cupo de 5 pendientes
     assets = _stable_assets(base, token)
     audio_path = os.path.join(work, "golden_tone.mp3")
     _make_audio(audio_path)
@@ -269,6 +289,8 @@ def main():
                     import shutil
                     shutil.copy(frame, os.path.join(DIFF_DIR, f"{name}_{ft}_{suffix}_actual.png"))
                     shutil.copy(golden, os.path.join(DIFF_DIR, f"{name}_{ft}_{suffix}_golden.png"))
+
+    _cleanup_bot_jobs(base, token)  # dejar el cupo libre para la próxima
 
     if args.bless:
         print("[GOLDEN] goldens regenerados — commitear tests/golden_frames/")
