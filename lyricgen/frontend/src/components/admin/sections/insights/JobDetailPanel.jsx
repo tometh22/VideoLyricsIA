@@ -50,13 +50,24 @@ export default function JobDetailPanel({ jobId, onClose }) {
               {detail?.tenant_id && ` · ${detail.tenant_id}`}
             </p>
           </div>
-          <button
-            type="button"
-            onClick={onClose}
-            className="text-gray-400 hover:text-white px-2 py-1 text-caption shrink-0"
-          >
-            ✕ cerrar
-          </button>
+          <div className="flex items-center gap-2 shrink-0">
+            <a
+              href={`/videos/${jobId}`}
+              target="_blank"
+              rel="noopener noreferrer"
+              className="px-3 py-1 rounded-md bg-brand/15 ring-1 ring-brand/40 text-caption text-brand-light hover:bg-brand/25 transition-colors duration-brand whitespace-nowrap"
+              title="Abrir el video en la plataforma (pestaña nueva)"
+            >
+              Ver video ↗
+            </a>
+            <button
+              type="button"
+              onClick={onClose}
+              className="text-gray-400 hover:text-white px-2 py-1 text-caption"
+            >
+              ✕ cerrar
+            </button>
+          </div>
         </div>
 
         {error && <p className="text-caption text-red-300">{error}</p>}
@@ -96,7 +107,9 @@ export default function JobDetailPanel({ jobId, onClose }) {
                 <span className="px-2 py-0.5 rounded-full bg-surface-3/50 ring-1 ring-white/[0.06] text-label text-gray-300">
                   fondo: {detail.choices?.background_source || "?"}
                 </span>
-                {Object.entries(detail.render_params || {}).map(([k, v]) => (
+                {Object.entries(detail.render_params || {})
+                  .filter(([, v]) => typeof v !== "object" || v === null)
+                  .map(([k, v]) => (
                   <span key={k} className="px-2 py-0.5 rounded-full bg-brand/10 ring-1 ring-brand/25 text-label text-brand-light">
                     {k}: {String(v).slice(0, 40)}
                   </span>
@@ -115,7 +128,7 @@ export default function JobDetailPanel({ jobId, onClose }) {
                 )}
                 {detail.ai_calls.map((c, i) => (
                   <div key={i} className="flex items-center gap-2 text-caption">
-                    <span className="font-mono text-gray-400 w-24 shrink-0">{c.step}</span>
+                    <span className="font-mono text-gray-400 w-32 shrink-0 truncate" title={c.step}>{c.step}</span>
                     <span className="flex-1 text-gray-300 truncate">{c.tool_name}</span>
                     <span className="text-gray-500 tabular-nums">
                       {c.duration_ms != null ? `${(c.duration_ms / 1000).toFixed(1)}s` : "—"}
