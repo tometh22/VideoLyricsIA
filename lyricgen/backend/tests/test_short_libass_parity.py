@@ -98,3 +98,14 @@ def test_generate_short_uses_libass_with_moviepy_fallback():
     assert "_burn_short_text_ass(" in src
     assert "_make_short_text_clip(" in src  # fallback presente
     assert src.index("_burn_short_text_ass(") < src.index("_make_short_text_clip(")
+
+
+def test_fallback_alerts_sentry():
+    """El fallback moviepy es el ÚNICO camino que puede reproducir la
+    divergencia tipográfica — debe alertar en Sentry, no degradar en
+    silencio (regresión textual)."""
+    import inspect
+    import pipeline as _p
+    src = inspect.getsource(_p.generate_short)
+    assert "short-libass-fallback" in src
+    assert "capture_message" in src
