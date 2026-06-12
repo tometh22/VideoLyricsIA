@@ -4445,7 +4445,7 @@ async def _maybe_ctc_retime(result, audio_path: str, job_id: str,
                 psegs = [{"text": t, "start": 0.0, "end": 0.0} for t in texts]
                 retimed = await asyncio.wait_for(
                     asyncio.to_thread(_ctc.retime_segments, _stem, psegs,
-                                      job_id, audio_path, 0.5),
+                                      job_id, audio_path, 0.65),
                     timeout=600,
                 )
                 if retimed:
