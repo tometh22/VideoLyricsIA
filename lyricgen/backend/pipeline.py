@@ -10756,7 +10756,23 @@ def generate_short(
         os.replace(burned, out_path)
     else:
         # Fallback histórico (moviepy/ImageMagick): texto menos idéntico al
-        # video, pero un short SIN letra sería peor. Queda loggeado arriba.
+        # video, pero un short SIN letra sería peor. Además de loggearse,
+        # se ALERTA en Sentry: este es el único camino que puede volver a
+        # producir la divergencia tipográfica del incidente UMG Chile —
+        # si dispara, hay que enterarse antes que el cliente.
+        try:
+            import sentry_sdk
+            with sentry_sdk.push_scope() as _scope:
+                _job_tag = os.path.basename(job_dir.rstrip("/"))
+                _scope.fingerprint = ["short-libass-fallback"]
+                _scope.set_tag("job_id", _job_tag)
+                sentry_sdk.capture_message(
+                    f"[SHORT-FALLBACK] {_job_tag}: la pasada libass falló — el short "
+                    "salió con el motor moviepy (tipografía puede diferir del video)",
+                    level="error",
+                )
+        except Exception:
+            pass  # sin Sentry (dev/tests) el log de arriba alcanza
         _do_fade = (line_transition or "none") not in ("none", "cut", "")
         text_layers = []
         for seg in window_segments:
