@@ -10607,8 +10607,8 @@ def _burn_short_text_ass(
             logger.warning("[SHORT] libass text burn failed (%s) — fallback moviepy",
                            (r.stderr or "")[-300:])
             return None
-        logger.info("[SHORT] texto quemado con libass (familia=%s bold=%s anim=%s)",
-                    family, bold, lyrics_animation)
+        logger.info("[SHORT] texto quemado con libass (font=%s anim=%s)",
+                    os.path.basename(font_path), lyrics_animation)
         return out_tmp
     except Exception as e:
         logger.warning("[SHORT] libass text pass errored (%s) — fallback moviepy", e)
