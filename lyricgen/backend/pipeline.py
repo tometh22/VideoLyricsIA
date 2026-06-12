@@ -10477,6 +10477,144 @@ def _apply_short_effect(short_path: str, fx_path: str, fps: float, job_dir: str)
     return short_path
 
 
+def _build_short_ass_doc(
+    window_segments: list[dict],
+    *,
+    font_path: str,
+    text_case: str,
+    font_scale: float,
+    lyric_color: str,
+    lyric_sung_color: str,
+    text_contrast: str,
+    lyrics_animation: str,
+    line_transition: str,
+) -> str:
+    """Documento ASS del short (1080x1920) con EXACTAMENTE las mismas
+    derivaciones de estilo que _render_lyrics_ass usa para el video
+    (familia/bold por font_family, fontsize por lyric_fontsize a
+    scale=1.0, outline por contraste, shadow=3) — función pura para que
+    el test de paridad compare Style line contra el doc del video."""
+    import ass_render as _ass
+
+    scale = 1.0
+    contrast = _CONTRAST_SETTINGS.get(text_contrast, _CONTRAST_SETTINGS["medium"])
+    outline = max(1.0, contrast["stroke_mult"] * scale)
+    shadow = max(1, int(round(3 * scale)))
+    family, bold = _ass.font_family(font_path)
+    font_factor = _ass.font_size_factor(family)
+
+    # Segmentos re-basados, SIN overrides de layout del editor (pos/scale/
+    # rot son coordenadas del frame 16:9 — el short siempre centra).
+    clean_segments = [
+        {"start": s["start"], "end": s["end"], "text": s["text"]}
+        for s in window_segments
+    ]
+    lines = _ass.segments_to_lines(
+        clean_segments,
+        text_scale=scale,
+        font_scale=font_scale,
+        font_factor=font_factor,
+        lyric_transition="cut",
+        animation=lyrics_animation,
+        transition=line_transition,
+        case_fn=lambda t: _apply_case(t, text_case),
+    )
+    if lyrics_animation == "karaoke":
+        primary_for_lines = lyric_sung_color or ""
+        secondary_for_lines = lyric_color or ""
+    else:
+        primary_for_lines = lyric_color or ""
+        secondary_for_lines = ""
+    base_fs = _ass.lyric_fontsize(40, scale, font_scale, font_factor=font_factor)
+    return _ass.build_ass(
+        width=1080, height=1920,
+        font_name=family, base_fontsize=base_fs,
+        outline=outline, shadow=shadow, lines=lines, bold=bold,
+        margin_v=0, alignment=5,
+        primary_color=primary_for_lines,
+        secondary_color=secondary_for_lines,
+    )
+
+
+def _burn_short_text_ass(
+    bg_short_path: str,
+    window_segments: list[dict],
+    job_dir: str,
+    short_dur: float,
+    fps: float,
+    *,
+    font_path: str,
+    text_case: str,
+    font_scale: float,
+    lyric_color: str,
+    lyric_sung_color: str,
+    text_contrast: str,
+    lyrics_animation: str,
+    line_transition: str,
+) -> str | None:
+    """Quema la letra del short con LIBASS — el MISMO motor del video.
+
+    Incidente UMG Chile 2026-06-11/12 (tercera vuelta): aunque video y
+    short usaran la MISMA TTF, se veían distintos — el video renderiza
+    con libass (faux-bold + outline exterior) y el short con
+    ImageMagick/moviepy (stroke centrado que se come el relleno → letras
+    más flacas, look "hueco"). Dos motores nunca van a ser idénticos:
+    la única paridad real es UN solo motor. Bonus: el short hereda las
+    animaciones reales (karaoke per-word, transiciones) que el camino
+    moviepy no replicaba.
+
+    Misma derivación que _render_lyrics_ass: text_scale=1.0 (el frame es
+    1080 de ANCHO, igual que el alto del video 1080p → mismo tamaño de
+    glifo), outline/shadow por contraste, font_size_factor por familia.
+    Las líneas largas las envuelve libass (WrapStyle 0). Los overrides de
+    posición/escala del editor (pos/scale/rot, coordenadas del frame
+    16:9) NO se trasladan al frame vertical — el short siempre centra
+    (\an5), igual que el comportamiento histórico.
+
+    Devuelve el path del short con texto, o None si la pasada falla (el
+    caller cae al camino moviepy histórico — un short con texto "menos
+    idéntico" es mejor que un short sin letra)."""
+    import ass_render as _ass
+
+    try:
+        font_dir = _ass.single_font_dir(font_path)
+        ass_doc = _build_short_ass_doc(
+            window_segments,
+            font_path=font_path,
+            text_case=text_case, font_scale=font_scale,
+            lyric_color=lyric_color, lyric_sung_color=lyric_sung_color,
+            text_contrast=text_contrast,
+            lyrics_animation=lyrics_animation, line_transition=line_transition,
+        )
+        ass_path = os.path.join(job_dir, "short_lyrics.ass")
+        with open(ass_path, "w", encoding="utf-8") as f:
+            f.write(ass_doc)
+
+        out_tmp = os.path.join(job_dir, "short_ass_tmp.mp4")
+        # Mismo escaping canónico que el burn del video (fx_compositor).
+        cmd = [
+            "ffmpeg", "-y", "-loglevel", "error",
+            "-i", os.path.basename(bg_short_path),
+            "-vf", f"subtitles=short_lyrics.ass:fontsdir={_ffmpeg_filter_escape(font_dir)}",
+            "-c:v", "libx264", "-preset", "veryfast", "-crf", "20",
+            "-pix_fmt", "yuv420p",
+            "-c:a", "copy", "-movflags", "+faststart",
+            "-r", str(fps), os.path.basename(out_tmp),
+        ]
+        r = subprocess.run(cmd, capture_output=True, text=True,
+                           timeout=600, cwd=job_dir)
+        if r.returncode != 0 or not os.path.exists(out_tmp):
+            logger.warning("[SHORT] libass text burn failed (%s) — fallback moviepy",
+                           (r.stderr or "")[-300:])
+            return None
+        logger.info("[SHORT] texto quemado con libass (familia=%s bold=%s anim=%s)",
+                    family, bold, lyrics_animation)
+        return out_tmp
+    except Exception as e:
+        logger.warning("[SHORT] libass text pass errored (%s) — fallback moviepy", e)
+        return None
+
+
 def generate_short(
     mp3_path: str,
     segments: list[dict],
@@ -10565,11 +10703,9 @@ def generate_short(
             .clip(0, 255).astype("uint8")
         )
 
-    # Build text clips for this 30s window. Honor the operator's case/scale/
-    # color/contrast (parity with the main video); apply a soft crossfade when
-    # a line transition is selected.
-    _do_fade = (line_transition or "none") not in ("none", "cut", "")
-    text_layers = []
+    # Ventana de segmentos del short, re-basada a t=0 (la consumen tanto la
+    # pasada libass como el fallback moviepy).
+    window_segments = []
     for seg in segments:
         if seg["end"] <= start_time or seg["start"] >= end_time:
             continue
@@ -10577,17 +10713,15 @@ def generate_short(
         e = min(short_dur, seg["end"] - start_time)
         if e - s < 0.1:
             continue
-        layers = _make_short_text_clip(
-            seg["text"], s, e, font,
-            text_case=text_case, font_scale=font_scale,
-            lyric_color=lyric_color, text_contrast=text_contrast,
-        )
-        if _do_fade:
-            fd = min(0.25, (e - s) / 3.0)
-            layers = [c.crossfadein(fd).crossfadeout(fd) for c in layers]
-        text_layers.extend(layers)
+        window_segments.append({**seg, "start": s, "end": e})
 
-    final = CompositeVideoClip([bg] + text_layers, size=(1080, 1920))
+    # PASADA 1 — fondo + audio, SIN texto (moviepy, como siempre).
+    # PASADA 2 — el texto lo quema LIBASS, el mismo motor del video.
+    # Incidente UMG Chile (3ª vuelta, 2026-06-12): misma TTF en dos motores
+    # ≠ misma letra en pantalla — ImageMagick dibuja el stroke comiéndose
+    # el relleno y sin el faux-bold de libass. Un solo motor = paridad real
+    # (y el short hereda karaoke/transiciones de verdad).
+    final = CompositeVideoClip([bg], size=(1080, 1920))
     final = final.set_audio(short_audio).set_duration(short_dur)
 
     # 2026-05-26 OOM mitigation: workers SIGKILL'd at progress=75% on
@@ -10596,8 +10730,9 @@ def generate_short(
     gc.collect()
 
     out_path = os.path.join(job_dir, "short.mp4")
+    bg_only_path = os.path.join(job_dir, "short_bg_only.mp4")
     final.write_videofile(
-        out_path,
+        bg_only_path,
         fps=fps,
         codec="libx264",
         audio_codec="aac",
@@ -10608,6 +10743,52 @@ def generate_short(
     )
     audio.close()
     final.close()
+
+    burned = _burn_short_text_ass(
+        bg_only_path, window_segments, job_dir, short_dur, fps,
+        font_path=font,
+        text_case=text_case, font_scale=font_scale,
+        lyric_color=lyric_color, lyric_sung_color=lyric_sung_color,
+        text_contrast=text_contrast,
+        lyrics_animation=lyrics_animation, line_transition=line_transition,
+    )
+    if burned:
+        os.replace(burned, out_path)
+    else:
+        # Fallback histórico (moviepy/ImageMagick): texto menos idéntico al
+        # video, pero un short SIN letra sería peor. Queda loggeado arriba.
+        _do_fade = (line_transition or "none") not in ("none", "cut", "")
+        text_layers = []
+        for seg in window_segments:
+            layers = _make_short_text_clip(
+                seg["text"], seg["start"], seg["end"], font,
+                text_case=text_case, font_scale=font_scale,
+                lyric_color=lyric_color, text_contrast=text_contrast,
+            )
+            if _do_fade:
+                fd = min(0.25, (seg["end"] - seg["start"]) / 3.0)
+                layers = [c.crossfadein(fd).crossfadeout(fd) for c in layers]
+            text_layers.extend(layers)
+        bg_clip = VideoFileClip(bg_only_path)
+        composite = CompositeVideoClip([bg_clip] + text_layers, size=(1080, 1920))
+        composite = composite.set_duration(short_dur)
+        gc.collect()
+        composite.write_videofile(
+            out_path,
+            fps=fps,
+            codec="libx264",
+            audio_codec="aac",
+            threads=2,
+            preset="veryfast",
+            ffmpeg_params=["-movflags", "+faststart"],
+            logger=None,
+        )
+        composite.close()
+        bg_clip.close()
+    try:
+        os.unlink(bg_only_path)
+    except OSError:
+        pass
 
     # Effect overlay (snow/rain/stars/bokeh/light/aurora): screen-blend the
     # pre-baked fx loop over the short with ffmpeg — the SAME fx assets the
