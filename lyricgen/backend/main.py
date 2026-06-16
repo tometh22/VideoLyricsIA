@@ -7044,6 +7044,8 @@ def status(
             .first()
             is not None
         ),
+        "youtube": job.get("youtube"),
+        "youtube_short": job.get("youtube_short"),
     }
 
 
@@ -10169,13 +10171,88 @@ async def youtube_upload(
     import asyncio
     from youtube_upload import upload_to_youtube
     loop = asyncio.get_event_loop()
-    result = await loop.run_in_executor(
-        None, upload_to_youtube, video_path, thumb_path, artist, song, "", privacy, job_id,
-    )
+    try:
+        result = await loop.run_in_executor(
+            None, upload_to_youtube, video_path, thumb_path, artist, song, "", privacy, job_id,
+        )
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"YouTube upload failed: {e}")
 
     update_job(job_id, youtube=result)
 
     return result
+
+
+@app.post("/youtube/upload-short/{job_id}")
+async def youtube_upload_short(
+    job_id: str,
+    privacy: str = "unlisted",
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Upload a completed job's Short (vertical 9:16) to YouTube Shorts."""
+    job = get_job(db, job_id, **_job_scope(current_user))
+    if job is None:
+        raise HTTPException(status_code=404, detail="Job not found.")
+    if job["status"] != "done":
+        raise HTTPException(status_code=400, detail="Job is not done yet.")
+
+    short_path = os.path.join(OUTPUTS_DIR, job_id, "short.mp4")
+    thumb_path = os.path.join(OUTPUTS_DIR, job_id, "thumbnail.jpg")
+
+    if not os.path.exists(short_path):
+        raise HTTPException(status_code=404, detail="Short file not found. The job may not have generated a short.")
+
+    filename = job.get("filename", "")
+    song = filename.replace(".mp3", "")
+    if " - " in song:
+        song = song.split(" - ", 1)[1]
+    for sfx in ["(Official Video)", "(Official Audio)", "(En Vivo)", "(Live)", "(Lyrics)"]:
+        song = song.replace(sfx, "").strip()
+
+    artist = job.get("artist", "")
+
+    import asyncio
+    from youtube_upload import upload_short_to_youtube
+    loop = asyncio.get_event_loop()
+    try:
+        result = await loop.run_in_executor(
+            None, upload_short_to_youtube, short_path, thumb_path, artist, song, "", privacy, job_id,
+        )
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"YouTube upload failed: {e}")
+
+    update_job(job_id, youtube_short=result)
+
+    return result
+
+
+@app.post("/youtube/metadata-short/{job_id}")
+async def youtube_short_metadata_preview(
+    job_id: str,
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Preview the AI-generated YouTube Shorts metadata without uploading."""
+    job = get_job(db, job_id, **_job_scope(current_user))
+    if job is None:
+        raise HTTPException(status_code=404, detail="Job not found.")
+
+    filename = job.get("filename", "")
+    song = filename.replace(".mp3", "")
+    if " - " in song:
+        song = song.split(" - ", 1)[1]
+    for sfx in ["(Official Video)", "(Official Audio)", "(En Vivo)", "(Live)", "(Lyrics)"]:
+        song = song.replace(sfx, "").strip()
+
+    from youtube_upload import generate_short_metadata
+    from functools import partial
+    import asyncio
+    loop = asyncio.get_event_loop()
+    metadata = await loop.run_in_executor(
+        None, partial(generate_short_metadata, job.get("artist", ""), song, "", job_id=job_id),
+    )
+    return metadata
 
 
 @app.post("/youtube/metadata/{job_id}")

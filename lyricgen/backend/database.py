@@ -381,6 +381,7 @@ class Job(Base):
 
     # YouTube info
     youtube_data = Column(JSONB, nullable=True)
+    youtube_short_data = Column(JSONB, nullable=True)
 
     # Content validation (UMG Guideline 15)
     validation_result = Column(JSONB, nullable=True)
@@ -479,6 +480,7 @@ class Job(Base):
             "error": self.error,
             "error_category": self.error_category,
             "youtube": self.youtube_data,
+            "youtube_short": self.youtube_short_data,
             "validation_result": self.validation_result,
             "approved_by": self.approved_by,
             "approved_at": self.approved_at.isoformat() if self.approved_at else None,
@@ -527,6 +529,8 @@ class Job(Base):
             "created_at": self.created_at.timestamp() if self.created_at else None,
             # Archivado Fase 1: la historia esconde archived por default.
             "archived_at": self.archived_at.timestamp() if self.archived_at else None,
+            "youtube": self.youtube_data,
+            "youtube_short": self.youtube_short_data,
         }
 
 
@@ -1142,6 +1146,7 @@ def _migrate_user_columns():
         # full_name/avatar_url. login_sessions la crea create_all().
         "ALTER TABLE users ADD COLUMN IF NOT EXISTS full_name VARCHAR(200)",
         "ALTER TABLE users ADD COLUMN IF NOT EXISTS avatar_url VARCHAR(500)",
+        "ALTER TABLE jobs ADD COLUMN IF NOT EXISTS youtube_short_data JSONB",
     ]
     # Each statement gets its own transaction. In Postgres, a failed statement
     # inside a transaction puts it in aborted state — subsequent execute()
@@ -1168,6 +1173,7 @@ def _migrate_user_columns():
     _cast_json_to_jsonb("jobs", "umg_spec")
     _cast_json_to_jsonb("jobs", "s3_keys")
     _cast_json_to_jsonb("jobs", "youtube_data")
+    _cast_json_to_jsonb("jobs", "youtube_short_data")
     _cast_json_to_jsonb("jobs", "validation_result")
     _cast_json_to_jsonb("jobs", "segments_json")
     _cast_json_to_jsonb("jobs", "render_params")

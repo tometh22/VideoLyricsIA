@@ -744,6 +744,9 @@ export const translations = {
     "detail.upload_public": "Subir como Público",
     "detail.uploading": "Subiendo...",
     "detail.published": "Video publicado en YouTube",
+    "detail.publish_short_youtube": "Publicar Short en YouTube",
+    "detail.view_short_youtube": "Ver Short en YouTube",
+    "detail.published_short": "Short publicado en YouTube",
     "detail.cancel": "Cancelar",
 
     // Settings
@@ -1890,6 +1893,9 @@ export const translations = {
     "detail.upload_public": "Upload as Public",
     "detail.uploading": "Uploading...",
     "detail.published": "Video published on YouTube",
+    "detail.publish_short_youtube": "Publish Short to YouTube",
+    "detail.view_short_youtube": "View Short on YouTube",
+    "detail.published_short": "Short published on YouTube",
     "detail.cancel": "Cancel",
 
     "settings.title": "Settings",
@@ -2846,6 +2852,9 @@ export const translations = {
     "detail.upload_public": "Enviar como Público",
     "detail.uploading": "Enviando...",
     "detail.published": "Vídeo publicado no YouTube",
+    "detail.publish_short_youtube": "Publicar Short no YouTube",
+    "detail.view_short_youtube": "Ver Short no YouTube",
+    "detail.published_short": "Short publicado no YouTube",
     "detail.cancel": "Cancelar",
 
     "settings.title": "Configurações",

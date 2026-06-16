@@ -173,6 +173,20 @@ def generate_youtube_metadata(artist: str, song: str, lyrics_text: str = "", job
     return metadata
 
 
+def generate_short_metadata(artist: str, song: str, lyrics_text: str = "", job_id: str = None) -> dict:
+    """Generate YouTube metadata optimized for Shorts (adds #Shorts signal)."""
+    metadata = generate_youtube_metadata(artist, song, lyrics_text, job_id=job_id)
+    # YouTube detects Shorts by aspect ratio (9:16) + duration (≤60 s), but
+    # adding #Shorts in title and description accelerates indexing.
+    if "#Shorts" not in metadata["title"]:
+        metadata["title"] = f"{metadata['title']} #Shorts"[:100]
+    if "#Shorts" not in metadata["description"]:
+        metadata["description"] = f"#Shorts\n\n{metadata['description']}"
+    if "shorts" not in [t.lower() for t in metadata.get("tags", [])]:
+        metadata["tags"] = ["Shorts", "YouTubeShorts"] + metadata.get("tags", [])
+    return metadata
+
+
 def upload_to_youtube(
     video_path: str,
     thumbnail_path: str,
@@ -240,6 +254,73 @@ def upload_to_youtube(
     return {
         "video_id": video_id,
         "url": f"https://youtube.com/watch?v={video_id}",
+        "title": metadata["title"],
+        "privacy": privacy,
+    }
+
+
+def upload_short_to_youtube(
+    short_path: str,
+    thumbnail_path: str,
+    artist: str,
+    song: str,
+    lyrics_text: str = "",
+    privacy: str = "unlisted",
+    job_id: str = None,
+) -> dict:
+    """Upload the Short (vertical 9:16) to YouTube with Shorts-optimized metadata."""
+    print(f"[YOUTUBE SHORT] Generating metadata for '{artist} - {song}'...")
+    metadata = generate_short_metadata(artist, song, lyrics_text, job_id=job_id)
+    print(f"[YOUTUBE SHORT] Title: {metadata['title']}")
+
+    youtube = _get_youtube_client()
+
+    body = {
+        "snippet": {
+            "title": metadata["title"],
+            "description": metadata["description"],
+            "tags": metadata.get("tags", []),
+            "categoryId": metadata.get("category", "10"),
+            "defaultLanguage": "es",
+        },
+        "status": {
+            "privacyStatus": privacy,
+            "selfDeclaredMadeForKids": False,
+        },
+    }
+
+    print(f"[YOUTUBE SHORT] Uploading short ({os.path.getsize(short_path)/1024/1024:.1f} MB)...")
+    media = MediaFileUpload(short_path, mimetype="video/mp4", resumable=True)
+
+    request = youtube.videos().insert(
+        part="snippet,status",
+        body=body,
+        media_body=media,
+    )
+
+    response = None
+    while response is None:
+        status, response = request.next_chunk()
+        if status:
+            print(f"[YOUTUBE SHORT] Upload progress: {int(status.progress() * 100)}%")
+
+    video_id = response["id"]
+    print(f"[YOUTUBE SHORT] Short uploaded: https://youtube.com/shorts/{video_id}")
+
+    if thumbnail_path and os.path.exists(thumbnail_path):
+        try:
+            print("[YOUTUBE SHORT] Setting thumbnail...")
+            youtube.thumbnails().set(
+                videoId=video_id,
+                media_body=MediaFileUpload(thumbnail_path, mimetype="image/jpeg"),
+            ).execute()
+            print("[YOUTUBE SHORT] Thumbnail set!")
+        except Exception as e:
+            print(f"[YOUTUBE SHORT] Thumbnail failed (needs verified account): {e}")
+
+    return {
+        "video_id": video_id,
+        "url": f"https://youtube.com/shorts/{video_id}",
         "title": metadata["title"],
         "privacy": privacy,
     }

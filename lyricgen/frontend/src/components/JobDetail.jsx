@@ -364,6 +364,10 @@ export default function JobDetail({ job, onBack, onJobUpdate }) {
   const [youtubeResult, setYoutubeResult] = useState(job.youtube || null);
   const [metadataPreview, setMetadataPreview] = useState(null);
   const [showYoutubePanel, setShowYoutubePanel] = useState(false);
+  const [youtubeShortResult, setYoutubeShortResult] = useState(job.youtube_short || null);
+  const [shortMetadataPreview, setShortMetadataPreview] = useState(null);
+  const [showYoutubeShortPanel, setShowYoutubeShortPanel] = useState(false);
+  const [uploadingShort, setUploadingShort] = useState(false);
   const [reviewNotes, setReviewNotes] = useState("");
   const [approving, setApproving] = useState(false);
   const [retrying, setRetrying] = useState(false);
@@ -1075,6 +1079,37 @@ export default function JobDetail({ job, onBack, onJobUpdate }) {
     setUploading(false);
   };
 
+  const previewShortMetadata = async () => {
+    setShowYoutubeShortPanel(true);
+    try {
+      const res = await fetch(`${API}/youtube/metadata-short/${job.job_id}`, { method: "POST", headers: authHeaders() });
+      if (!res.ok) {
+        const data = await res.json().catch(() => ({}));
+        throw new Error(data.detail || `Error ${res.status}`);
+      }
+      const data = await res.json();
+      setShortMetadataPreview(data);
+    } catch (err) {
+      setShortMetadataPreview({ error: err.message });
+    }
+  };
+
+  const uploadShortToYoutube = async (privacy = "unlisted") => {
+    setUploadingShort(true);
+    try {
+      const res = await fetch(`${API}/youtube/upload-short/${job.job_id}?privacy=${privacy}`, { method: "POST", headers: authHeaders() });
+      if (!res.ok) {
+        const data = await res.json().catch(() => ({}));
+        throw new Error(data.detail || `Error ${res.status}`);
+      }
+      const data = await res.json();
+      setYoutubeShortResult(data);
+    } catch (err) {
+      setYoutubeShortResult({ error: err.message });
+    }
+    setUploadingShort(false);
+  };
+
   const handleApprove = async () => {
     if (approveLockRef.current) return;
     approveLockRef.current = true;
@@ -1339,6 +1374,23 @@ export default function JobDetail({ job, onBack, onJobUpdate }) {
                 <path d="M22.54 6.42a2.78 2.78 0 00-1.94-2C18.88 4 12 4 12 4s-6.88 0-8.6.46a2.78 2.78 0 00-1.94 2A29 29 0 001 11.75a29 29 0 00.46 5.33A2.78 2.78 0 003.4 19.13C5.12 19.56 12 19.56 12 19.56s6.88 0 8.6-.46a2.78 2.78 0 001.94-2A29 29 0 0023 11.75a29 29 0 00-.46-5.33z"/><polygon points="9.75 15.02 15.5 11.75 9.75 8.48 9.75 15.02"/>
               </svg>
               {t("detail.view_youtube")}
+            </a>
+          )}
+          {canDownload && !youtubeShortResult && (
+            <button onClick={previewShortMetadata} className="btn-secondary text-xs h-10 px-5">
+              <svg className="inline-block w-4 h-4 mr-1.5 -mt-0.5" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
+                <path d="M22.54 6.42a2.78 2.78 0 00-1.94-2C18.88 4 12 4 12 4s-6.88 0-8.6.46a2.78 2.78 0 00-1.94 2A29 29 0 001 11.75a29 29 0 00.46 5.33A2.78 2.78 0 003.4 19.13C5.12 19.56 12 19.56 12 19.56s6.88 0 8.6-.46a2.78 2.78 0 001.94-2A29 29 0 0023 11.75a29 29 0 00-.46-5.33z"/><polygon points="9.75 15.02 15.5 11.75 9.75 8.48 9.75 15.02"/>
+              </svg>
+              {t("detail.publish_short_youtube")}
+            </button>
+          )}
+          {canDownload && youtubeShortResult && !youtubeShortResult.error && (
+            <a href={youtubeShortResult.url} target="_blank" rel="noopener noreferrer"
+              className="inline-flex items-center h-10 px-5 rounded-button text-xs font-semibold text-white bg-red-600 hover:bg-red-700 transition-colors">
+              <svg className="inline-block w-4 h-4 mr-1.5" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
+                <path d="M22.54 6.42a2.78 2.78 0 00-1.94-2C18.88 4 12 4 12 4s-6.88 0-8.6.46a2.78 2.78 0 00-1.94 2A29 29 0 001 11.75a29 29 0 00.46 5.33A2.78 2.78 0 003.4 19.13C5.12 19.56 12 19.56 12 19.56s6.88 0 8.6-.46a2.78 2.78 0 001.94-2A29 29 0 0023 11.75a29 29 0 00-.46-5.33z"/><polygon points="9.75 15.02 15.5 11.75 9.75 8.48 9.75 15.02"/>
+              </svg>
+              {t("detail.view_short_youtube")}
             </a>
           )}
         </div>
@@ -1777,6 +1829,87 @@ export default function JobDetail({ job, onBack, onJobUpdate }) {
           {(metadataPreview?.error || youtubeResult?.error) && (
             <div className="rounded-xl bg-red-500/10 border border-red-500/20 px-4 py-3 text-center">
               <p className="text-sm text-red-400">{metadataPreview?.error || youtubeResult?.error}</p>
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* YouTube Shorts Panel */}
+      {canDownload && showYoutubeShortPanel && (
+        <div className="rounded-card bg-surface-2/40 ring-1 ring-white/[0.04] p-6 animate-fade-in">
+          <h3 className="font-semibold mb-4 flex items-center gap-2">
+            <svg className="w-5 h-5 text-red-500" fill="currentColor" viewBox="0 0 24 24">
+              <path d="M22.54 6.42a2.78 2.78 0 00-1.94-2C18.88 4 12 4 12 4s-6.88 0-8.6.46a2.78 2.78 0 00-1.94 2A29 29 0 001 11.75a29 29 0 00.46 5.33A2.78 2.78 0 003.4 19.13C5.12 19.56 12 19.56 12 19.56s6.88 0 8.6-.46a2.78 2.78 0 001.94-2A29 29 0 0023 11.75a29 29 0 00-.46-5.33z"/><polygon points="9.75 15.02 15.5 11.75 9.75 8.48 9.75 15.02" fill="white"/>
+            </svg>
+            {t("detail.publish_short_youtube")}
+          </h3>
+
+          {!shortMetadataPreview && !youtubeShortResult && (
+            <div className="flex items-center justify-center py-8">
+              <div className="w-6 h-6 border-2 border-brand border-t-transparent rounded-full animate-spin" />
+              <span className="ml-3 text-sm text-gray-400">{t("detail.generating_meta")}</span>
+            </div>
+          )}
+
+          {shortMetadataPreview && !shortMetadataPreview.error && !youtubeShortResult && (
+            <div className="space-y-4">
+              <div>
+                <label className="text-xs text-gray-500 uppercase tracking-wider">{t("settings.title_format").split(" ")[0]}</label>
+                <p className="text-sm text-white mt-1 glass rounded-xl px-4 py-2.5">{shortMetadataPreview.title}</p>
+              </div>
+              <div>
+                <label className="text-xs text-gray-500 uppercase tracking-wider">{t("settings.desc_header").split(" ")[0]}</label>
+                <p className="text-sm text-gray-300 mt-1 glass rounded-xl px-4 py-2.5 whitespace-pre-line">{shortMetadataPreview.description}</p>
+              </div>
+              <div>
+                <label className="text-xs text-gray-500 uppercase tracking-wider">Tags</label>
+                <div className="flex flex-wrap gap-1.5 mt-1">
+                  {(shortMetadataPreview.tags || []).map((tag, i) => (
+                    <span key={i} className="px-2 py-1 rounded-lg bg-surface-3/50 text-xs text-gray-400">{tag}</span>
+                  ))}
+                </div>
+              </div>
+
+              <div className="flex gap-3 pt-2">
+                <button onClick={() => uploadShortToYoutube("unlisted")} disabled={uploadingShort}
+                  className="btn-primary text-sm py-2.5 px-5 disabled:opacity-50">
+                  {uploadingShort ? (
+                    <><div className="inline-block w-4 h-4 border-2 border-white border-t-transparent rounded-full animate-spin mr-2" />{t("detail.uploading")}</>
+                  ) : (
+                    t("detail.upload_unlisted")
+                  )}
+                </button>
+                <button onClick={() => uploadShortToYoutube("public")} disabled={uploadingShort}
+                  className="btn-secondary text-sm py-2.5 px-5 disabled:opacity-50">
+                  {t("detail.upload_public")}
+                </button>
+                <button onClick={() => setShowYoutubeShortPanel(false)}
+                  className="text-xs text-gray-500 hover:text-white transition-colors ml-auto">
+                  {t("detail.cancel")}
+                </button>
+              </div>
+            </div>
+          )}
+
+          {youtubeShortResult && !youtubeShortResult.error && (
+            <div className="text-center py-6">
+              <div className="w-12 h-12 mx-auto mb-3 rounded-2xl bg-accent/10 flex items-center justify-center">
+                <svg className="w-6 h-6 text-accent" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
+                  <polyline points="20 6 9 17 4 12" />
+                </svg>
+              </div>
+              <p className="text-sm font-medium text-white mb-1">{t("detail.published_short")}</p>
+              <a href={youtubeShortResult.url} target="_blank" rel="noopener noreferrer"
+                className="text-sm text-brand hover:text-brand-light transition-colors underline">
+                {youtubeShortResult.url}
+              </a>
+              <p className="text-xs text-gray-500 mt-2">Estado: {youtubeShortResult.privacy}</p>
+            </div>
+          )}
+
+          {(shortMetadataPreview?.error || youtubeShortResult?.error) && (
+            <div className="rounded-xl bg-red-500/10 border border-red-500/20 px-4 py-3 text-center">
+              <p className="text-sm text-red-400">{shortMetadataPreview?.error || youtubeShortResult?.error}</p>
             </div>
           )}
         </div>
