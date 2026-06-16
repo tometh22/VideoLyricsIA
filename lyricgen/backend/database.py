@@ -732,6 +732,32 @@ class UserDriveTokens(Base):
     last_used_at = Column(DateTime(timezone=True), nullable=True)
 
 
+class SystemYoutubeToken(Base):
+    """Token OAuth de la cuenta de YouTube del SISTEMA (global, singleton).
+
+    A diferencia de UserDriveTokens (uno por user), YouTube usa una única
+    cuenta central a la que suben los videos de todos los tenants. Por eso
+    es singleton: siempre hay 0 o 1 fila.
+
+    El token completo (access + refresh + client info, formato compatible
+    con google.oauth2.credentials.Credentials) va Fernet-encrypted at rest,
+    reusando DRIVE_TOKEN_ENCRYPTION_KEY. Por qué DB y no archivo: el
+    filesystem de Railway es efímero (se borra en cada deploy), así que
+    persistir acá es lo que hace que la conexión a YouTube sobreviva los
+    redeploys en vez de obligar a reconectar cada vez.
+    """
+    __tablename__ = "system_youtube_token"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    encrypted_token_json = Column(Text, nullable=False)
+    channel_id = Column(String(255), nullable=True)
+    channel_name = Column(String(255), nullable=True)
+    channel_thumbnail = Column(String(500), nullable=True)
+    connected_by_user_id = Column(Integer, nullable=True)  # auditoría
+    connected_at = Column(DateTime(timezone=True), default=utcnow)
+    updated_at = Column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)
+
+
 class DriveTransfer(Base):
     """Track de una transferencia R2 → Google Drive (uno por click de
     'Guardar en Drive'). El worker que corre rclone va updateando

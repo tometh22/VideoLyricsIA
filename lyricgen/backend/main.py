@@ -10157,57 +10157,94 @@ async def youtube_connection_status(current_user: dict = Depends(get_current_use
 
 @app.get("/youtube/auth-url")
 async def youtube_auth_url(current_user: dict = Depends(get_current_user)):
-    """Return the Google OAuth URL for connecting a YouTube account."""
-    from youtube_upload import generate_auth_url
-    redirect_uri = os.environ.get(
-        "YOUTUBE_REDIRECT_URI",
-        "http://localhost:8000/youtube/callback",
-    )
+    """Return the Google OAuth URL for connecting the system YouTube account.
+
+    Solo admin: YouTube es una cuenta central del sistema (todos los tenants
+    suben ahí), así que conectarla/cambiarla es una acción de administración.
+    El state token bindea el flujo a este admin (CSRF)."""
+    if current_user.get("role") != "admin":
+        raise HTTPException(status_code=403, detail="Solo un administrador puede conectar la cuenta de YouTube.")
+    from youtube_oauth import build_authorization_url, YoutubeOAuthError
     try:
-        url = generate_auth_url(redirect_uri)
-    except RuntimeError as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        url = build_authorization_url(current_user["id"])
+    except YoutubeOAuthError as e:
+        raise HTTPException(status_code=503, detail=str(e))
     return {"auth_url": url}
 
 
 @app.get("/youtube/callback")
-async def youtube_oauth_callback(code: str, state: str = None):
-    """Handle Google OAuth callback — saves token and closes the popup."""
-    from youtube_upload import handle_oauth_callback
+async def youtube_oauth_callback(
+    code: str = Query("", max_length=2048),
+    state: str = Query("", max_length=2048),
+    error: str = Query("", max_length=200),
+    db: Session = Depends(get_db),
+):
+    """Callback de Google tras el consent. Verifica el state (HMAC),
+    intercambia el code, cachea el channel y guarda el token encriptado en
+    system_youtube_token. Cierra el popup vía postMessage.
+
+    NO usa get_current_user: Google no manda el JWT — la identidad viene
+    del state token firmado al construir la auth URL."""
     from fastapi.responses import HTMLResponse
-    redirect_uri = os.environ.get(
-        "YOUTUBE_REDIRECT_URI",
-        "http://localhost:8000/youtube/callback",
+    from youtube_oauth import (
+        YoutubeOAuthError, verify_state_token, exchange_code_for_tokens,
+        fetch_channel_info, save_system_token,
     )
-    try:
-        handle_oauth_callback(code, redirect_uri)
-    except Exception as e:
+
+    def _popup(html_body: str, status: int = 200):
         return HTMLResponse(f"""
         <html><body style="font-family:sans-serif;text-align:center;padding-top:3rem;background:#111;color:#eee;">
-        <h2 style="color:#f87171">Error al conectar</h2>
-        <p style="color:#aaa">{str(e)}</p>
-        <script>setTimeout(()=>window.close(),3000);</script>
-        </body></html>
-        """, status_code=400)
-    return HTMLResponse("""
-    <html><body style="font-family:sans-serif;text-align:center;padding-top:3rem;background:#111;color:#eee;">
-    <div style="font-size:3rem;margin-bottom:1rem">✓</div>
-    <h2 style="color:#a3e635">YouTube conectado</h2>
-    <p style="color:#888;font-size:0.9rem">Ya podés cerrar esta ventana.</p>
-    <script>
-      if(window.opener){window.opener.postMessage('yt_connected','*');}
-      setTimeout(()=>window.close(),1500);
-    </script>
-    </body></html>
-    """)
+        {html_body}
+        </body></html>""", status_code=status)
+
+    if error:
+        return _popup(f'<h2 style="color:#f87171">Conexión cancelada</h2><p style="color:#aaa">{error}</p>'
+                      '<script>setTimeout(()=>window.close(),2500);</script>', 400)
+
+    try:
+        user_id = verify_state_token(state)
+    except YoutubeOAuthError as e:
+        return _popup(f'<h2 style="color:#f87171">Error de seguridad</h2><p style="color:#aaa">{e}</p>'
+                      '<script>setTimeout(()=>window.close(),3000);</script>', 400)
+
+    # Re-chequeo de rol: el admin pudo perder el rol entre auth-url y callback.
+    cb_user = db.query(User).filter(User.id == user_id).first()
+    if cb_user is None or cb_user.role != "admin":
+        return _popup('<h2 style="color:#f87171">Sin permisos</h2>'
+                      '<p style="color:#aaa">Solo un administrador puede conectar YouTube.</p>'
+                      '<script>setTimeout(()=>window.close(),3000);</script>', 403)
+
+    try:
+        token_data = exchange_code_for_tokens(code)
+    except YoutubeOAuthError as e:
+        return _popup(f'<h2 style="color:#f87171">Error al conectar</h2><p style="color:#aaa">{e}</p>'
+                      '<script>setTimeout(()=>window.close(),3000);</script>', 400)
+
+    # Channel info es best-effort (para mostrar "Conectado como X").
+    channel = fetch_channel_info(token_data.get("token", ""))
+    save_system_token(db, token_data, channel=channel, user_id=user_id)
+
+    ch_name = channel.get("channel_name") or "tu canal"
+    return _popup(
+        '<div style="font-size:3rem;margin-bottom:1rem">✓</div>'
+        '<h2 style="color:#a3e635">YouTube conectado</h2>'
+        f'<p style="color:#888;font-size:0.9rem">Cuenta: {ch_name}. Ya podés cerrar esta ventana.</p>'
+        '<script>if(window.opener){window.opener.postMessage("yt_connected","*");}'
+        'setTimeout(()=>window.close(),1500);</script>'
+    )
 
 
 @app.post("/youtube/disconnect")
-async def youtube_disconnect(current_user: dict = Depends(get_current_user)):
-    """Remove stored YouTube credentials."""
-    from youtube_upload import disconnect_youtube
-    disconnect_youtube()
-    return {"disconnected": True}
+async def youtube_disconnect(
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Disconnect the system YouTube account (admin only)."""
+    if current_user.get("role") != "admin":
+        raise HTTPException(status_code=403, detail="Solo un administrador puede desconectar YouTube.")
+    from youtube_oauth import delete_system_token
+    removed = delete_system_token(db)
+    return {"disconnected": removed}
 
 
 @app.get("/youtube/upload-progress/{job_id}")
