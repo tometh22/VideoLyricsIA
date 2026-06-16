@@ -321,6 +321,55 @@ export default function Settings({ onBack }) {
     }
   }, []);
 
+  // YouTube account connection
+  const [ytStatus, setYtStatus] = useState(null); // null=loading, {connected, channel_name, ...}
+  const [ytStatusError, setYtStatusError] = useState(null);
+  const [ytDisconnecting, setYtDisconnecting] = useState(false);
+
+  const checkYtStatus = () => {
+    setYtStatus(null);
+    setYtStatusError(null);
+    fetch(`${API}/youtube/connection-status`, { headers: authHeaders() })
+      .then((r) => r.json())
+      .then(setYtStatus)
+      .catch(() => setYtStatusError("Error al verificar la conexión."));
+  };
+
+  useEffect(() => {
+    if (activeSection === "youtube") checkYtStatus();
+  }, [activeSection]);
+
+  useEffect(() => {
+    const handler = (e) => {
+      if (e.data === "yt_connected") checkYtStatus();
+    };
+    window.addEventListener("message", handler);
+    return () => window.removeEventListener("message", handler);
+  }, []);
+
+  const handleYtConnect = async () => {
+    try {
+      const res = await fetch(`${API}/youtube/auth-url`, { headers: authHeaders() });
+      if (!res.ok) throw new Error("Error al obtener la URL de autenticación.");
+      const data = await res.json();
+      window.open(data.auth_url, "_blank", "width=600,height=700,noopener");
+    } catch (err) {
+      setYtStatusError(err.message);
+    }
+  };
+
+  const handleYtDisconnect = async () => {
+    setYtDisconnecting(true);
+    try {
+      await fetch(`${API}/youtube/disconnect`, { method: "POST", headers: authHeaders() });
+      checkYtStatus();
+    } catch {
+      setYtStatusError("Error al desconectar.");
+    } finally {
+      setYtDisconnecting(false);
+    }
+  };
+
   const [saveError, setSaveError] = useState(null);
   const handleSave = async () => {
     setSaveError(null);
@@ -1434,6 +1483,71 @@ export default function Settings({ onBack }) {
         {/* ════════════════════ YOUTUBE ════════════════════ */}
         {activeSection === "youtube" && (
           <>
+            {/* ── YouTube account connection ── */}
+            <Card>
+              <SectionLabel>{t("settings.yt_account")}</SectionLabel>
+              <p className="text-xs text-ink-secondary mb-4 -mt-1">{t("settings.yt_account_sub")}</p>
+
+              {ytStatusError && (
+                <div className="mb-3"><InlineError message={ytStatusError} /></div>
+              )}
+
+              {ytStatus === null && !ytStatusError && (
+                <div className="flex items-center gap-2 text-xs text-ink-secondary">
+                  <div className="w-4 h-4 border-2 border-brand border-t-transparent rounded-full animate-spin" />
+                  {t("settings.yt_checking")}
+                </div>
+              )}
+
+              {ytStatus && !ytStatus.connected && (
+                <div className="flex items-center gap-4">
+                  <div className="flex-1">
+                    <p className="text-sm text-ink-secondary">{t("settings.yt_not_connected")}</p>
+                  </div>
+                  <button onClick={handleYtConnect}
+                    className="shrink-0 btn-primary text-sm py-2 px-4 flex items-center gap-2">
+                    <svg className="w-4 h-4" fill="currentColor" viewBox="0 0 24 24">
+                      <path d="M22.54 6.42a2.78 2.78 0 00-1.94-2C18.88 4 12 4 12 4s-6.88 0-8.6.46a2.78 2.78 0 00-1.94 2A29 29 0 001 11.75a29 29 0 00.46 5.33A2.78 2.78 0 003.4 19.13C5.12 19.56 12 19.56 12 19.56s6.88 0 8.6-.46a2.78 2.78 0 001.94-2A29 29 0 0023 11.75a29 29 0 00-.46-5.33z"/>
+                      <polygon points="9.75 15.02 15.5 11.75 9.75 8.48 9.75 15.02" fill="white"/>
+                    </svg>
+                    {t("settings.yt_connect")}
+                  </button>
+                </div>
+              )}
+
+              {ytStatus && ytStatus.connected && (
+                <div className="flex items-center gap-3">
+                  {ytStatus.thumbnail ? (
+                    <img src={ytStatus.thumbnail} alt="" className="w-10 h-10 rounded-full ring-1 ring-white/10 shrink-0" />
+                  ) : (
+                    <div className="w-10 h-10 rounded-full bg-red-500/20 flex items-center justify-center shrink-0 ring-1 ring-white/10">
+                      <svg className="w-5 h-5 text-red-400" fill="currentColor" viewBox="0 0 24 24">
+                        <path d="M22.54 6.42a2.78 2.78 0 00-1.94-2C18.88 4 12 4 12 4s-6.88 0-8.6.46a2.78 2.78 0 00-1.94 2A29 29 0 001 11.75a29 29 0 00.46 5.33A2.78 2.78 0 003.4 19.13C5.12 19.56 12 19.56 12 19.56s6.88 0 8.6-.46a2.78 2.78 0 001.94-2A29 29 0 0023 11.75a29 29 0 00-.46-5.33z"/>
+                        <polygon points="9.75 15.02 15.5 11.75 9.75 8.48 9.75 15.02" fill="white"/>
+                      </svg>
+                    </div>
+                  )}
+                  <div className="flex-1 min-w-0">
+                    <p className="text-xs text-ink-secondary mb-0.5">{t("settings.yt_connected_as")}</p>
+                    <p className="text-sm font-medium text-white truncate">{ytStatus.channel_name || "—"}</p>
+                    {ytStatus.channel_url && (
+                      <a href={ytStatus.channel_url} target="_blank" rel="noopener noreferrer"
+                        className="text-[11px] text-brand-light hover:text-white transition-colors">
+                        {t("settings.yt_open_channel")} ↗
+                      </a>
+                    )}
+                  </div>
+                  <div className="flex items-center gap-1.5 shrink-0">
+                    <span className="w-2 h-2 rounded-full bg-accent inline-block" />
+                    <button onClick={handleYtDisconnect} disabled={ytDisconnecting}
+                      className="text-xs text-ink-secondary hover:text-red-400 transition-colors disabled:opacity-50">
+                      {ytDisconnecting ? t("settings.yt_disconnecting") : t("settings.yt_disconnect")}
+                    </button>
+                  </div>
+                </div>
+              )}
+            </Card>
+
             <Card>
               <SectionLabel>{t("settings.app_lang")}</SectionLabel>
               <div className="flex flex-wrap gap-2">

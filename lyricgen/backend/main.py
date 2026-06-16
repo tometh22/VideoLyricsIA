@@ -10139,14 +10139,95 @@ def save_settings(
 # YouTube
 # ---------------------------------------------------------------------------
 
+class YoutubeUploadBody(BaseModel):
+    privacy: str = "unlisted"
+    title: str | None = None
+    description: str | None = None
+
+
+@app.get("/youtube/connection-status")
+async def youtube_connection_status(current_user: dict = Depends(get_current_user)):
+    """Check if a YouTube account is connected and return channel info."""
+    import asyncio
+    from youtube_upload import get_connection_status
+    loop = asyncio.get_event_loop()
+    status = await loop.run_in_executor(None, get_connection_status)
+    return status
+
+
+@app.get("/youtube/auth-url")
+async def youtube_auth_url(current_user: dict = Depends(get_current_user)):
+    """Return the Google OAuth URL for connecting a YouTube account."""
+    from youtube_upload import generate_auth_url
+    redirect_uri = os.environ.get(
+        "YOUTUBE_REDIRECT_URI",
+        "http://localhost:8000/youtube/callback",
+    )
+    try:
+        url = generate_auth_url(redirect_uri)
+    except RuntimeError as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    return {"auth_url": url}
+
+
+@app.get("/youtube/callback")
+async def youtube_oauth_callback(code: str, state: str = None):
+    """Handle Google OAuth callback — saves token and closes the popup."""
+    from youtube_upload import handle_oauth_callback
+    from fastapi.responses import HTMLResponse
+    redirect_uri = os.environ.get(
+        "YOUTUBE_REDIRECT_URI",
+        "http://localhost:8000/youtube/callback",
+    )
+    try:
+        handle_oauth_callback(code, redirect_uri)
+    except Exception as e:
+        return HTMLResponse(f"""
+        <html><body style="font-family:sans-serif;text-align:center;padding-top:3rem;background:#111;color:#eee;">
+        <h2 style="color:#f87171">Error al conectar</h2>
+        <p style="color:#aaa">{str(e)}</p>
+        <script>setTimeout(()=>window.close(),3000);</script>
+        </body></html>
+        """, status_code=400)
+    return HTMLResponse("""
+    <html><body style="font-family:sans-serif;text-align:center;padding-top:3rem;background:#111;color:#eee;">
+    <div style="font-size:3rem;margin-bottom:1rem">✓</div>
+    <h2 style="color:#a3e635">YouTube conectado</h2>
+    <p style="color:#888;font-size:0.9rem">Ya podés cerrar esta ventana.</p>
+    <script>
+      if(window.opener){window.opener.postMessage('yt_connected','*');}
+      setTimeout(()=>window.close(),1500);
+    </script>
+    </body></html>
+    """)
+
+
+@app.post("/youtube/disconnect")
+async def youtube_disconnect(current_user: dict = Depends(get_current_user)):
+    """Remove stored YouTube credentials."""
+    from youtube_upload import disconnect_youtube
+    disconnect_youtube()
+    return {"disconnected": True}
+
+
+@app.get("/youtube/upload-progress/{job_id}")
+async def youtube_upload_progress(job_id: str, current_user: dict = Depends(get_current_user)):
+    """Return the current upload progress (0-100) for a job, or -1 if not uploading."""
+    from youtube_upload import get_upload_progress
+    return {"progress": get_upload_progress(job_id), "short_progress": get_upload_progress(job_id + "_short")}
+
+
 @app.post("/youtube/upload/{job_id}")
 async def youtube_upload(
     job_id: str,
+    body: YoutubeUploadBody = None,
     privacy: str = "unlisted",
     current_user: dict = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
     """Upload a completed job's video to YouTube with AI-generated metadata."""
+    if body:
+        privacy = body.privacy
     job = get_job(db, job_id, **_job_scope(current_user))
     if job is None:
         raise HTTPException(status_code=404, detail="Job not found.")
@@ -10169,28 +10250,35 @@ async def youtube_upload(
     artist = job.get("artist", "")
 
     import asyncio
+    from functools import partial
     from youtube_upload import upload_to_youtube
     loop = asyncio.get_event_loop()
     try:
-        result = await loop.run_in_executor(
-            None, upload_to_youtube, video_path, thumb_path, artist, song, "", privacy, job_id,
+        fn = partial(
+            upload_to_youtube,
+            video_path, thumb_path, artist, song, "", privacy, job_id,
+            body.title if body else None,
+            body.description if body else None,
         )
+        result = await loop.run_in_executor(None, fn)
     except Exception as e:
-        raise HTTPException(status_code=502, detail=f"YouTube upload failed: {e}")
+        raise HTTPException(status_code=502, detail={"message": f"YouTube upload failed: {e}", "code": str(e)})
 
     update_job(job_id, youtube=result)
-
     return result
 
 
 @app.post("/youtube/upload-short/{job_id}")
 async def youtube_upload_short(
     job_id: str,
+    body: YoutubeUploadBody = None,
     privacy: str = "unlisted",
     current_user: dict = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
     """Upload a completed job's Short (vertical 9:16) to YouTube Shorts."""
+    if body:
+        privacy = body.privacy
     job = get_job(db, job_id, **_job_scope(current_user))
     if job is None:
         raise HTTPException(status_code=404, detail="Job not found.")
@@ -10213,17 +10301,21 @@ async def youtube_upload_short(
     artist = job.get("artist", "")
 
     import asyncio
+    from functools import partial
     from youtube_upload import upload_short_to_youtube
     loop = asyncio.get_event_loop()
     try:
-        result = await loop.run_in_executor(
-            None, upload_short_to_youtube, short_path, thumb_path, artist, song, "", privacy, job_id,
+        fn = partial(
+            upload_short_to_youtube,
+            short_path, thumb_path, artist, song, "", privacy, job_id,
+            body.title if body else None,
+            body.description if body else None,
         )
+        result = await loop.run_in_executor(None, fn)
     except Exception as e:
-        raise HTTPException(status_code=502, detail=f"YouTube upload failed: {e}")
+        raise HTTPException(status_code=502, detail={"message": f"YouTube upload failed: {e}", "code": str(e)})
 
     update_job(job_id, youtube_short=result)
-
     return result
 
 
