@@ -41,13 +41,43 @@ def _clear_progress(job_id: str):
     _upload_progress.pop(job_id, None)
 
 
-def _get_youtube_client():
-    """Get authenticated YouTube API client, auto-refreshing expired tokens."""
-    if not os.path.exists(_TOKEN_PATH):
-        raise RuntimeError("youtube_not_connected")
+def _load_token_data():
+    """Carga el token de YouTube. Orden: DB (producción, sobrevive deploys)
+    → archivo local (dev). Devuelve (token_dict, source) donde source es
+    'db' | 'file' | None."""
+    try:
+        import youtube_oauth
+        data = youtube_oauth.load_system_token_standalone()
+        if data:
+            return data, "db"
+    except Exception:
+        # DriveTokenDecryptError u otra — cae al archivo si existe.
+        pass
+    if os.path.exists(_TOKEN_PATH):
+        with open(_TOKEN_PATH) as f:
+            return json.load(f), "file"
+    return None, None
 
-    with open(_TOKEN_PATH) as f:
-        token_data = json.load(f)
+
+def _persist_token_data(token_data: dict, source: str):
+    """Guarda un access_token refrescado de vuelta en su origen."""
+    if source == "db":
+        import youtube_oauth
+        youtube_oauth.update_access_token_standalone(token_data)
+    else:
+        with open(_TOKEN_PATH, "w") as f:
+            json.dump(token_data, f)
+
+
+def _get_youtube_client():
+    """Get authenticated YouTube API client, auto-refreshing expired tokens.
+
+    Lee el token de la DB (cuenta del sistema, persistente entre deploys)
+    con fallback al archivo local para dev. Si el access_token expiró, lo
+    refresca y persiste el nuevo en el mismo origen."""
+    token_data, source = _load_token_data()
+    if not token_data:
+        raise RuntimeError("youtube_not_connected")
 
     creds = Credentials(
         token=token_data.get("token"),
@@ -63,8 +93,7 @@ def _get_youtube_client():
         try:
             creds.refresh(Request())
             token_data["token"] = creds.token
-            with open(_TOKEN_PATH, "w") as f:
-                json.dump(token_data, f)
+            _persist_token_data(token_data, source)
         except Exception as e:
             if "invalid_grant" in str(e) or "Token has been expired or revoked" in str(e):
                 raise RuntimeError("youtube_token_expired")
@@ -94,8 +123,14 @@ def _map_youtube_error(e: Exception) -> str:
 
 
 def get_connection_status() -> dict:
-    """Check if YouTube is connected and return channel info."""
-    if not os.path.exists(_TOKEN_PATH):
+    """Check if YouTube is connected and return live channel info.
+
+    Lee el token (DB → archivo) y hace un live check contra la YouTube
+    Data API, así reporta 'desconectado' si el token fue revocado aunque
+    siga existiendo la fila. El OAuth flow (connect/callback/disconnect)
+    vive en youtube_oauth.py, orquestado por los endpoints con `db`."""
+    token_data, _ = _load_token_data()
+    if not token_data:
         return {"connected": False}
     try:
         youtube = _get_youtube_client()
@@ -112,64 +147,9 @@ def get_connection_status() -> dict:
             "channel_url": f"https://youtube.com/channel/{ch['id']}",
         }
     except RuntimeError as e:
-        return {"connected": False, "error": str(e)}
+        return {"connected": False, "error": _map_youtube_error(e)}
     except Exception as e:
         return {"connected": False, "error": _map_youtube_error(e)}
-
-
-def generate_auth_url(redirect_uri: str) -> str:
-    """Generate Google OAuth authorization URL."""
-    from google_auth_oauthlib.flow import Flow
-
-    if not os.path.exists(_OAUTH_PATH):
-        raise RuntimeError("youtube_oauth_config_missing")
-
-    with open(_OAUTH_PATH) as f:
-        client_config = json.load(f)
-
-    # Wrap bare client_secret format if needed
-    if "installed" not in client_config and "web" not in client_config:
-        client_config = {"web": client_config}
-
-    flow = Flow.from_client_config(client_config, scopes=_YOUTUBE_SCOPES, redirect_uri=redirect_uri)
-    auth_url, _ = flow.authorization_url(
-        access_type="offline",
-        include_granted_scopes="true",
-        prompt="consent",
-    )
-    return auth_url
-
-
-def handle_oauth_callback(code: str, redirect_uri: str):
-    """Exchange OAuth authorization code for token and persist it."""
-    from google_auth_oauthlib.flow import Flow
-
-    with open(_OAUTH_PATH) as f:
-        client_config = json.load(f)
-
-    if "installed" not in client_config and "web" not in client_config:
-        client_config = {"web": client_config}
-
-    flow = Flow.from_client_config(client_config, scopes=_YOUTUBE_SCOPES, redirect_uri=redirect_uri)
-    flow.fetch_token(code=code)
-    creds = flow.credentials
-
-    token_data = {
-        "token": creds.token,
-        "refresh_token": creds.refresh_token,
-        "token_uri": creds.token_uri,
-        "client_id": creds.client_id,
-        "client_secret": creds.client_secret,
-        "scopes": list(creds.scopes) if creds.scopes else _YOUTUBE_SCOPES,
-    }
-    with open(_TOKEN_PATH, "w") as f:
-        json.dump(token_data, f)
-
-
-def disconnect_youtube():
-    """Remove stored YouTube credentials."""
-    if os.path.exists(_TOKEN_PATH):
-        os.remove(_TOKEN_PATH)
 
 
 _LANG_NAMES = {
