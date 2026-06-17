@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import { useI18n } from "../i18n";
 import { REF_W, tierForLength, fontSizeFactor } from "../lib/lyricTiers";
+import { FONT_BY_CODE, applyCase } from "./fontCatalog";
 
 // Studio Console live preview. Shows a sample lyric line over the selected
 // palette/mood with the selected camera movement applied as a real CSS
@@ -34,35 +35,11 @@ const MOVE_ANIM = {
   animado:        "wlp-anim 1.8s linear infinite",
 };
 
-// Typography mirrors the render pipeline / EditRequestPanel codes — same
-// table as UploadZone.FONTS and LyricsEditor.EDITOR_FONTS. The CSS family
-// is what the preview applies live; the weight matches each face's
-// intended display weight (Anton/Bebas are 400-only display fonts, the
-// rest are 700-bold). "" = Auto → leave the wrapper's Tailwind defaults
-// (Montserrat-ish via font-extrabold) untouched so the historical look
-// stays put when the operator hasn't picked anything. 2026-05-26.
-const FONT_BY_CODE = {
-  "":                { css: undefined,                weight: undefined },
-  "jost-bold":       { css: "'Jost', sans-serif",       weight: 700 },
-  "montserrat-bold": { css: "'Montserrat', sans-serif", weight: 700 },
-  "poppins-bold":    { css: "'Poppins', sans-serif",    weight: 700 },
-  "outfit-bold":     { css: "'Outfit', sans-serif",     weight: 700 },
-  "roboto-bold":     { css: "'Roboto', sans-serif",     weight: 700 },
-  "bebas-neue":      { css: "'Bebas Neue', sans-serif", weight: 400 },
-  "oswald-bold":     { css: "'Oswald', sans-serif",     weight: 700 },
-  "anton":           { css: "'Anton', sans-serif",      weight: 400 },
-};
-
-// Mirrors UploadZone.applyTextCase and LyricsEditor.applyCase so the
-// preview reads exactly like the eventual libass render (which the
-// pipeline upper-cases by default).
-function applyCase(text, c) {
-  if (!text) return text;
-  if (c === "upper") return text.toUpperCase();
-  if (c === "title") return text.replace(/\b\w/g, (ch) => ch.toUpperCase());
-  if (c === "lower") return text.toLowerCase();
-  return text;
-}
+// Typography + case transform now come from the shared ./fontCatalog so the
+// preview can't drift from the picker. The inline copy here used to omit
+// fredoka/quicksand/nunito, so those three fell through FONT_BY_CODE[font]
+// to the "" (Auto) default and rendered in the generic Tailwind sans — the
+// operator picked "Fredoka (redondeada)" and saw a plain sans (2026-06-17).
 
 // Outline + shadow strength per contrast code. Same shape as
 // LyricVideoPreview.CONTRAST_STYLES (paso 6) so the wizard preview
