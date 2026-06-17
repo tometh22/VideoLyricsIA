@@ -157,20 +157,44 @@ export default function WizardLivePreview({
   // re-render del preview, NO de los componentes padres (gracias al ref).
   const [livePlaybackTick, setLivePlaybackTick] = useState(null);
   const lastTickRef = useRef({ activeLine: "", currentTime: -1 });
+  // Render-storm detector (P0 UMG Chile 2026-06-16: "duplicar una línea hace
+  // titilar toda la pantalla y se queda pegado"). A flicker is the active line
+  // changing many times per second — but the 3 s debounced autosave can't
+  // record a 60 fps loop, so prod had no trace. We count activeLine changes
+  // per 1 s window; if it exceeds a clearly-abnormal rate (normal playback
+  // changes lines every few seconds, i.e. <1/s), we emit one tagged warning
+  // that observability.js forwards to Sentry (throttled 1/min/tag) with the
+  // two oscillating texts. The URL already carries the job_id (/videos/.../edit-lyrics).
+  const _stormRef = useRef({ windowStart: 0, changes: 0 });
+  const STORM_CHANGES_PER_S = 12; // >12 active-line flips/s = oscillation, not playback
   useEffect(() => {
     if (!playbackTickRef) return undefined;
     let raf = 0;
-    const loop = () => {
+    const loop = (ts) => {
       const tick = playbackTickRef.current;
       if (tick && tick.activeLine) {
         // Solo dispara setState si cambió la línea activa o el currentTime
         // se movió >40ms (suficiente para word-jump perceptible, ~25Hz).
         // Sin este guard, setState a 60fps haría thrashing.
         const last = lastTickRef.current;
-        if (
-          tick.activeLine !== last.activeLine ||
-          Math.abs(tick.currentTime - last.currentTime) > 0.04
-        ) {
+        const lineChanged = tick.activeLine !== last.activeLine;
+        if (lineChanged) {
+          const st = _stormRef.current;
+          if (ts - st.windowStart > 1000) {
+            if (st.changes >= STORM_CHANGES_PER_S) {
+              // eslint-disable-next-line no-console
+              console.warn("[render-storm] preview active line oscillating", {
+                changesPerSec: st.changes,
+                between: [String(last.activeLine).slice(0, 40), String(tick.activeLine).slice(0, 40)],
+                currentTime: Math.round((tick.currentTime || 0) * 100) / 100,
+              });
+            }
+            st.windowStart = ts;
+            st.changes = 0;
+          }
+          st.changes += 1;
+        }
+        if (lineChanged || Math.abs(tick.currentTime - last.currentTime) > 0.04) {
           lastTickRef.current = { activeLine: tick.activeLine, currentTime: tick.currentTime };
           setLivePlaybackTick({ ...tick });
         }

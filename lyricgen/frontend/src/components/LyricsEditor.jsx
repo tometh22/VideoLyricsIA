@@ -8,6 +8,7 @@ import LyricVideoPreview from "./LyricVideoPreview";
 import { tierForLength } from "../lib/lyricTiers";
 import { prettifySongTitle } from "../lib/prettifySongTitle";
 import { segmentsValuesEqual } from "../lib/segmentsValuesEqual";
+import { useUiStormDetector, recordEditorAction } from "../hooks/useUiStormDetector";
 import { splitWordsAtCharOffset, firstWordStart, lastWordEnd } from "../lib/splitWords";
 import useLocalStorage from "../hooks/useLocalStorage";
 
@@ -447,6 +448,7 @@ export default function LyricsEditor({
   // application so re-seeding a new job re-triggers; routine edits
   // (typing in a line) do NOT, because they don't change the ref.
   const autoTrimAppliedRef = useRef(false);
+  const _reseedStormRef = useRef({ windowStart: 0, count: 0 });
   useEffect(() => {
     if (prevSegmentsRef.current === segments) return;
     // QA fix 2026-05-27 (drag-resize regression): the autosave POST
@@ -464,6 +466,32 @@ export default function LyricsEditor({
     if (segmentsValuesEqual(prevSegmentsRef.current, segments)) {
       prevSegmentsRef.current = segments;
       return;
+    }
+    // [reseed-storm] capture (P0 UMG Chile 2026-06-16: "las líneas cambian de
+    // posición en loop"). This reseed reassigns _id by index, so rows keyed by
+    // _id REMOUNT. segmentsValuesEqual is POSITIONAL, so a writeback that hands
+    // back a REORDERED segments array (backend sorts by start #184 while local
+    // is out-of-order from a split/overlap) fails the guard above and makes
+    // this fire on every cycle → rows reposition in a loop. If it fires
+    // repeatedly we emit the OLD vs NEW order so we can see the swap.
+    {
+      const _now = typeof performance !== "undefined" && performance.now ? performance.now() : 0;
+      const _rs = _reseedStormRef.current;
+      if (_now - _rs.windowStart > 1000) {
+        if (_rs.count >= 6) {
+          const _ord = (arr) => (Array.isArray(arr) ? arr : []).slice(0, 5).map((s) => String(s.text || "").slice(0, 18));
+          // eslint-disable-next-line no-console
+          console.warn("[reseed-storm] rows reseeding/remounting repeatedly", {
+            perSec: _rs.count,
+            prevOrder: _ord(prevSegmentsRef.current),
+            newOrder: _ord(segments),
+            segments: Array.isArray(segments) ? segments.length : null,
+          });
+        }
+        _rs.windowStart = _now;
+        _rs.count = 0;
+      }
+      _rs.count += 1;
     }
     prevSegmentsRef.current = segments;
     const seeded = segments.map((s, i) => ({ ...s, _id: i }));
@@ -922,6 +950,36 @@ export default function LyricsEditor({
     }
     return (containing || lastStarted)?._id ?? null;
   }, [edited, currentTime]);
+
+  // UI freeze / render-storm capture (P0 UMG Chile 2026-06-16). Cause-agnostic
+  // safety net: if the main thread saturates (the "se queda pegado" + flicker),
+  // emit a Sentry-forwarded report with the segment shape + last action so we
+  // can finally diagnose the real trigger. getContext is read at report time.
+  useUiStormDetector({
+    active: true,
+    getContext: () => {
+      const segs = Array.isArray(edited) ? edited : [];
+      const sorted = [...segs].sort((a, b) => a.start - b.start);
+      let overlaps = 0;
+      let maxOverlapDepth = 0;
+      for (let i = 0; i < sorted.length - 1; i++) {
+        if (sorted[i].end > sorted[i + 1].start + 0.001) {
+          overlaps += 1;
+          let depth = 0;
+          for (let j = i + 1; j < sorted.length && sorted[j].start < sorted[i].end; j++) depth += 1;
+          if (depth > maxOverlapDepth) maxOverlapDepth = depth;
+        }
+      }
+      return {
+        segments: segs.length,
+        overlapping_pairs: overlaps,
+        max_overlap_depth: maxOverlapDepth,
+        is_playing: isPlaying,
+        sync_mode: syncMode,
+        duration: Math.round((duration || 0) * 10) / 10,
+      };
+    },
+  });
 
   // Tap handler: anchor the line at syncCursor to currentTime, then
   // propagate the same delta to every line AFTER it (the unanchored
@@ -1484,6 +1542,7 @@ export default function LyricsEditor({
   }, [pushEditHistory, duration]);
 
   const deleteSeg = (id) => {
+    recordEditorAction("delete", { id });
     setEdited((prev) => prev.filter((seg) => seg._id !== id));
   };
 
@@ -1627,6 +1686,7 @@ export default function LyricsEditor({
   // can't fabricate timing for the gap → drop words (karaoke falls back to
   // uniform distribution, consistent with the split fallback).
   const mergeSeg = (id) => {
+    recordEditorAction("merge", { id });
     pushEditHistory();
     setEdited((prev) => {
       const idx = prev.findIndex((s) => s._id === id);
@@ -1652,6 +1712,7 @@ export default function LyricsEditor({
   // Sync mode tap or manual edit. Useful when Whisper missed a chorus
   // repeat — duplicate the chorus block, then tap-sync the copies.
   const duplicateSeg = (id) => {
+    recordEditorAction("duplicate", { id, segments: Array.isArray(edited) ? edited.length : null });
     setEdited((prev) => {
       const idx = prev.findIndex((s) => s._id === id);
       if (idx === -1) return prev;
@@ -1668,6 +1729,7 @@ export default function LyricsEditor({
   // Append a blank line at the end of the list. Operator types the
   // missing lyrics into the text input, then tap-syncs it.
   const addBlankLine = () => {
+    recordEditorAction("addLine", { segments: Array.isArray(edited) ? edited.length : null });
     setEdited((prev) => {
       // Insert the new line at the audio playhead — that's where the
       // operator is listening when they realise something's missing
@@ -1714,6 +1776,7 @@ export default function LyricsEditor({
   // the MIDDLE of the song" affordance — the bottom "Agregar línea" button
   // forced the operator to scroll away from where they were working.
   const insertLineAfter = (idx) => {
+    recordEditorAction("insertLine", { idx });
     setEdited((prev) => {
       const cur = prev[idx];
       const nxt = prev[idx + 1];

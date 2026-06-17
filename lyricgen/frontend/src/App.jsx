@@ -639,6 +639,25 @@ function EditingNotEditablePanel({ jobId, jobStatus, isRendering, onBack, t }) {
         // EditLyricsRoute corra su bootstrap de nuevo y monte el editor.
         const editable = ["done", "pending_review", "rejected"].includes(newStatus);
         if (editable) {
+          // [editor-reload-loop] capture (P0 UMG Chile 2026-06-16). This reload
+          // re-runs EditLyricsRoute's bootstrap. If the job keeps flipping back
+          // to a rendering/editing status (so this panel re-mounts and reloads
+          // again), the page reloads on a ~5s cadence — looks like the editor
+          // "freezing and re-laying-out in a loop". Count reloads per job in
+          // sessionStorage; a burst means we found the cycle.
+          try {
+            const k = `editreload:${jobId}`;
+            const prev = JSON.parse(sessionStorage.getItem(k) || "null");
+            const now = Date.now();
+            const recent = prev && now - prev.first < 60000 ? prev.count + 1 : 1;
+            sessionStorage.setItem(k, JSON.stringify({ first: recent === 1 ? now : prev.first, count: recent }));
+            if (recent >= 3) {
+              // eslint-disable-next-line no-console
+              console.warn("[editor-reload-loop] job reloaded the editor repeatedly", {
+                jobId, reloadsInWindow: recent, fromStatus: jobStatus, toStatus: newStatus,
+              });
+            }
+          } catch { /* sessionStorage unavailable — proceed with the reload */ }
           window.location.reload();
         }
       } catch {
