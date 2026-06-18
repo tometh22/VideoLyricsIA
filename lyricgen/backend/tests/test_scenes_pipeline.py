@@ -29,6 +29,39 @@ def test_parse_json_object_tolerant():
     assert pipeline._parse_json_object("") is None
 
 
+def test_visual_bible_disables_thinking_and_forces_json(monkeypatch):
+    """Regresión 2026-06-18: gemini-2.5-flash es un modelo de *thinking*. Con la
+    config vieja (max_output_tokens=500, thinking ON) el JSON de la biblia salía
+    TRUNCADO (finish_reason=MAX_TOKENS, ~478 tokens gastados en thinking) → parse
+    fallaba → TODA biblia caía al fallback genérico. Confirmado contra Vertex
+    real. Este test fija la config que lo evita: thinking apagado, JSON forzado
+    y margen de tokens suficiente."""
+    captured = {}
+
+    class _Resp:
+        text = '{"world":"w","palette":"p","texture":"t","camera":"c","motif":"m"}'
+
+    class _Models:
+        def generate_content(self, model, contents, config):
+            captured["config"] = config
+            return _Resp()
+
+    class _Client:
+        models = _Models()
+
+    monkeypatch.setattr(pipeline, "_get_genai_client", lambda: _Client())
+    bible = pipeline._build_visual_bible("una letra", "Artista", genre="rock", style="neon")
+    # Usó la respuesta de Gemini (no el fallback).
+    assert bible["world"] == "w" and bible["motif"] == "m"
+    cfg = captured["config"]
+    # thinking apagado (si no, vuelve la truncación).
+    assert cfg.thinking_config is not None and cfg.thinking_config.thinking_budget == 0
+    # JSON puro forzado (sin ```json a parsear).
+    assert cfg.response_mime_type == "application/json"
+    # margen de tokens por encima del viejo 500 que truncaba.
+    assert (cfg.max_output_tokens or 0) >= 800
+
+
 def test_scene_clips_graceful_degradation(monkeypatch, tmp_path):
     import veo_breaker
     monkeypatch.setattr(veo_breaker, "is_open", lambda: False)

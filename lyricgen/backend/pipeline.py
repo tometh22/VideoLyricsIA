@@ -7670,7 +7670,18 @@ def _build_visual_bible(lyrics_text: str, artist: str, song_title: str = "",
                 config=genai.types.GenerateContentConfig(
                     system_instruction=sys_instr,
                     temperature=0.7,
-                    max_output_tokens=500,
+                    # gemini-2.5-flash es un modelo de *thinking*: por default
+                    # gasta tokens de razonamiento que cuentan contra
+                    # max_output_tokens. Con 500 y thinking ON, el JSON salía
+                    # TRUNCADO (finish_reason=MAX_TOKENS, ~478 tokens de
+                    # thinking y la respuesta cortada) → parse fallaba → toda
+                    # biblia caía al fallback genérico por género, perdiendo la
+                    # coherencia "mismo film" que es el corazón del feature.
+                    # Apagamos el thinking (no lo necesita para un look-book) y
+                    # forzamos JSON puro vía response_mime_type (sin ```json).
+                    max_output_tokens=800,
+                    response_mime_type="application/json",
+                    thinking_config=genai.types.ThinkingConfig(thinking_budget=0),
                 ),
             ),
             timeout_s=45.0, label="SCENES-BIBLE",
