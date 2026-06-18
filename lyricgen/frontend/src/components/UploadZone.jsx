@@ -138,6 +138,10 @@ export default function UploadZone({
   onStyleChange,
   customColors = "",
   onCustomColorsChange,
+  // Add-on premium "Escenas" (multi-escena). Sólo se renderiza el toggle si
+  // user.features.scenes; el backend re-valida igual.
+  enableScenes = false,
+  onEnableScenesChange,
   backgroundFile,
   onBackgroundFile,
   backgroundId,
@@ -2521,6 +2525,33 @@ export default function UploadZone({
                           </div>
                         );
                       })()}
+
+                      {/* Escenas (multi-escena) — add-on premium. Sólo visible
+                          para usuarios elegibles (features.scenes). Convierte el
+                          fondo único en un conjunto de escenas con arco narrativo:
+                          una biblia visual compartida, cortes en límites musicales
+                          y el coro que vuelve siempre a la misma escena. */}
+                      {user?.features?.scenes && onEnableScenesChange && (
+                        <button
+                          type="button"
+                          onClick={() => { track("wizard.scenes", { enabled: !enableScenes }); onEnableScenesChange(!enableScenes); }}
+                          className={`w-full flex items-center gap-3 px-3 py-2.5 rounded-xl border text-left transition-all duration-200 mt-2 ${
+                            enableScenes ? "border-transparent ring-1 ring-brand/50 bg-brand/[0.08]" : "border-white/[0.06] hover:border-white/[0.16]"
+                          }`}
+                        >
+                          <span className="w-8 h-8 rounded-lg shrink-0 grid place-items-center text-[15px] bg-surface-3">🎬</span>
+                          <span className="flex-1">
+                            <span className={`block text-[12px] font-semibold ${enableScenes ? "text-white" : "text-gray-200"}`}>
+                              {t("upload.scenes_title") || "Escenas (multi-escena)"}
+                              <span className="ml-1.5 align-middle text-[9px] font-bold uppercase tracking-wide text-brand bg-brand/15 rounded px-1 py-0.5">Premium</span>
+                            </span>
+                            <span className="block text-[10px] text-gray-500">{t("upload.scenes_desc") || "Varias escenas con arco narrativo en vez de un fondo único"}</span>
+                          </span>
+                          <span className={`shrink-0 w-9 h-5 rounded-full transition-colors relative ${enableScenes ? "bg-brand" : "bg-white/10"}`}>
+                            <span className={`absolute top-0.5 w-4 h-4 rounded-full bg-white transition-all ${enableScenes ? "left-[18px]" : "left-0.5"}`} />
+                          </span>
+                        </button>
+                      )}
                     </div>
                   )}
                 </>

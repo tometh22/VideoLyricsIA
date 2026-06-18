@@ -617,6 +617,8 @@ export const translations = {
     "upload.style_custom": "Personalizado",
     "upload.style_custom_desc": "Elegí tus colores (marca, artista…)",
     "upload.style_custom_hint": "2 colores dominantes para el fondo",
+    "upload.scenes_title": "Escenas (multi-escena)",
+    "upload.scenes_desc": "Varias escenas con arco narrativo en vez de un fondo único",
     // Lyric text color pickers en Step 4 (Animación). El segundo solo
     // aparece cuando lyricsAnimation === "karaoke".
     "upload.lyric_color_title": "Color del texto",

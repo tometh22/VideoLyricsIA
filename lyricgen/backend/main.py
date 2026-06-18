@@ -63,6 +63,7 @@ from auth import (
     validate_password_strength,
     has_prores_access,
     has_drive_access,
+    has_scenes_access,
     telemetry_enabled,
     generate_api_key,
     is_super_admin,
@@ -1155,6 +1156,7 @@ async def login(body: LoginRequest, request: Request, db: Session = Depends(get_
             "allow_overage": getattr(user, "allow_overage", False) or False,
             "features": {
                 "prores_export": has_prores_access(user),
+                "scenes": has_scenes_access(user),
                 "telemetry": telemetry_enabled(),
             },
         },
@@ -1253,6 +1255,7 @@ async def register(body: RegisterRequest, request: Request, db: Session = Depend
             "allow_overage": getattr(user, "allow_overage", False) or False,
             "features": {
                 "prores_export": has_prores_access(user),
+                "scenes": has_scenes_access(user),
                 "telemetry": telemetry_enabled(),
             },
         },
@@ -4108,6 +4111,9 @@ async def upload(
     background_hint: str = Form("", max_length=2000),
     bg_verbatim: bool = Form(False),
     custom_colors: str = Form("", max_length=200),
+    # Add-on premium "Escenas" (multi-escena). Parity con /generate; la
+    # elegibilidad se valida con has_scenes_access antes de forwardear.
+    enable_scenes: bool = Form(False),
     # Title-card customization (Full Rotor v1). Defaults = historical look.
     title_template: str = Form("auto", max_length=16),
     title_size: str = Form("1.0", max_length=8),
@@ -4298,6 +4304,8 @@ async def upload(
         background_hint=(background_hint.strip() or None),
         bg_verbatim=bg_verbatim,
         custom_colors=(custom_colors.strip() or ""),
+        # Escenas (multi-escena): opt-in AND elegibilidad real (parity /generate).
+        enable_scenes=bool(enable_scenes) and has_scenes_access(current_user),
         title_template=title_template if title_template in ("auto", "centered", "lower_third", "badge") else "auto",
         title_size=_clamp_title_size(title_size),
         title_artist_font=(title_artist_font.strip() or ""),
@@ -6637,6 +6645,11 @@ async def generate_with_segments(
     background_hint: str = Form("", max_length=2000),
     bg_verbatim: bool = Form(False),
     custom_colors: str = Form("", max_length=200),
+    # Add-on premium "Escenas" (multi-escena). Opt-in del operador en el
+    # wizard. La ELEGIBILIDAD se chequea contra has_scenes_access ANTES de
+    # forwardearlo al pipeline (un usuario sin acceso que mande el flag igual
+    # cae al fondo único). Default False = comportamiento histórico.
+    enable_scenes: bool = Form(False),
     # Capa C 2026-05-24: si el operador hizo pre-gen via /generate-preview
     # mientras editaba lyrics, este field contiene el hash que mapea al
     # background pre-cacheado en R2. La pipeline lo reusa antes de llamar
@@ -6936,6 +6949,10 @@ async def generate_with_segments(
         # Si el cache hit, _ensure_background se skip y el job ahorra
         # ~60-180s + $0.80-3.20 de cuota Veo. Vacío = flow tradicional.
         bg_cache_key=(bg_cache_key.strip() or None),
+        # Escenas (multi-escena): opt-in del operador AND elegibilidad real.
+        # Si el flag llega pero el usuario no tiene acceso, se ignora (fondo
+        # único) — el gate de feature vive en el backend, no en el form.
+        enable_scenes=bool(enable_scenes) and has_scenes_access(current_user),
         title_template=title_template if title_template in ("auto", "centered", "lower_third", "badge") else "auto",
         title_size=_clamp_title_size(title_size),
         title_artist_font=(title_artist_font.strip() or ""),
@@ -9656,7 +9673,12 @@ async def retry_job(
               "title_artist_font", "title_song_font",
               # UI v1.1 (2026-05-30): manual song split. Inheritable so
               # a retry/variant respects the operator's chosen break.
-              "title_song_break"):
+              "title_song_break",
+              # Escenas (multi-escena): heredable, así un retry de un job
+              # multi-escena vuelve a armar las escenas en vez de caer al
+              # fondo único. Persistido por pipeline en render_params cuando
+              # el render corre con enable_scenes=True.
+              "enable_scenes"):
         if k in _retry_render_params and _retry_render_params[k] not in (None, ""):
             retry_pipeline_kwargs[k] = _retry_render_params[k]
 
