@@ -7813,14 +7813,14 @@ def _persist_scene_thumb(clip_path: str, key: str, job_id: str) -> str | None:
 def _generate_scene_clips(scene_plan: dict, job_dir: str, *, artist: str,
                           song_title: str, concept: str = "", job_id: str = None,
                           allow_people: bool = False,
-                          only_keys: set | None = None) -> dict:
+                          regen_keys: set | None = None) -> dict:
     """Genera un clip Veo por escena ÚNICA. Devuelve {recurrence_key: clip_path}.
 
     - cache_namespace incluye la recurrence_key + el cache_token de la escena →
       escenas distintas no colisionan, los coros recurrentes (1 escena) pegan
       caché, y una escena regenerada (token nuevo) genera fresco mientras las
       otras re-bajan su caché sin costo.
-    - `only_keys`: si se pasa, SÓLO esas escenas pueden generar fresco en Veo;
+    - `regen_keys`: si se pasa, SÓLO esas escenas pueden generar fresco en Veo;
       el resto va `cache_only=True` → se sirven de la caché R2 o se degradan,
       pero NUNCA re-cobran. Garantía de costo del regen: regenerar 1 escena no
       puede facturar las otras N aunque la caché falle (antes sí podía).
@@ -7839,9 +7839,9 @@ def _generate_scene_clips(scene_plan: dict, job_dir: str, *, artist: str,
         if key in clip_for_key:
             continue
         clip_path = os.path.join(job_dir, f"bg_scene_{key}.mp4")
-        # En un regen (only_keys set), las escenas NO-target son cache_only:
+        # En un regen (regen_keys set), las escenas NO-target son cache_only:
         # se sirven de caché o se degradan, nunca pagan Veo de nuevo.
-        _cache_only = only_keys is not None and key not in only_keys
+        _cache_only = regen_keys is not None and key not in regen_keys
         _meta = {}
         try:
             _generate_veo_video(
@@ -7855,12 +7855,14 @@ def _generate_scene_clips(scene_plan: dict, job_dir: str, *, artist: str,
             )
             if not os.path.exists(clip_path):
                 raise RuntimeError("clip no escrito")
-            scene["clip_path"] = clip_path
+            # NIT: no persistimos clip_path (es un path local efímero del job_dir
+            # que filtraba el filesystem del contenedor al JSON/DB). El stitch usa
+            # clip_for_key (abajo), no scene["clip_path"].
             scene["status"] = "generated"
             if _meta.get("cache_object_key"):
                 scene["clip_cache_key"] = _meta["cache_object_key"]
             # Póster para el filmstrip (best-effort). Sólo si cambió el clip.
-            if only_keys is None or key in only_keys or not scene.get("thumb_key"):
+            if regen_keys is None or key in regen_keys or not scene.get("thumb_key"):
                 _tk = _persist_scene_thumb(clip_path, key, job_id)
                 if _tk:
                     scene["thumb_key"] = _tk
@@ -7983,7 +7985,7 @@ def _regenerate_scene_background(scene_plan: dict, recurrence_key: str, job_dir:
     clip_for_key = _generate_scene_clips(scene_plan, job_dir, artist=artist,
                                          song_title=song_title, concept=concept,
                                          job_id=job_id, allow_people=allow_people,
-                                         only_keys={recurrence_key})
+                                         regen_keys={recurrence_key})
     # GC del clip viejo (audit M8): sólo si la regen produjo uno NUEVO distinto.
     _new_clip_key = target.get("clip_cache_key")
     if _old_clip_key and _new_clip_key and _old_clip_key != _new_clip_key:
@@ -8021,11 +8023,11 @@ def _restitch_scenes_for_edit(scene_plan: dict, segments: list[dict],
     if not new_keys or not new_keys.issubset(have_keys):
         return None, scene_plan  # estructura cambió → no es seguro re-stitch
     scene_plan = {**scene_plan, "sections": [s.to_dict() for s in new_secs]}
-    # only_keys=set() → TODAS las escenas son cache_only (ninguna paga Veo).
+    # regen_keys=set() → TODAS las escenas son cache_only (ninguna paga Veo).
     clip_for_key = _generate_scene_clips(scene_plan, job_dir, artist=artist,
                                          song_title=song_title, concept=concept,
                                          job_id=job_id, allow_people=allow_people,
-                                         only_keys=set())
+                                         regen_keys=set())
     timeline = _scenes.stitch_timeline(new_secs, clip_for_key, audio_duration,
                                        job_dir, target_w=target_w, target_h=target_h)
     return timeline, scene_plan

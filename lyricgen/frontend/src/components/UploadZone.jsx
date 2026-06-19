@@ -371,6 +371,13 @@ export default function UploadZone({
   // los admin siempre califican aunque la sesión cacheada no traiga el flag.
   const scenesEligible = user?.features?.scenes === true || user?.role === "admin";
   const [showScenesUpsell, setShowScenesUpsell] = useState(false);
+  // Escape cierra el modal de upsell (a11y — audit NIT).
+  useEffect(() => {
+    if (!showScenesUpsell) return undefined;
+    const onKey = (e) => { if (e.key === "Escape") setShowScenesUpsell(false); };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [showScenesUpsell]);
   // Preview del fondo subido por el usuario (audit 2026-06-11): antes el
   // operador generaba a ciegas — el branch custom del preview era un
   // placeholder "Fondo subido". Object URL con revoke en cleanup; el guard

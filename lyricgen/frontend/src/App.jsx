@@ -1479,7 +1479,7 @@ export default function App() {
         // resumido no trae fondo propio (transcribed, pre-/generate), así
         // que IA es el default correcto.
         setBackgroundFile(null); setBackgroundId(null);
-        setBgSelectMode("auto"); setAnimateImage(false);
+        setBgSelectMode("auto"); setAnimateImage(false); setEnableScenes(false);
         setWizardStage("review");
         // Limpiar el query param sin agregar a history (replace).
         navigate("/new", { replace: true });
@@ -3097,7 +3097,7 @@ export default function App() {
     try { prefetchAbortRef.current && prefetchAbortRef.current.abort(); } catch {}
     prefetchAbortRef.current = new AbortController();
     setFiles([]); setJobs([]); setBackgroundFile(null); setBackgroundId(null);
-    setBgSelectMode("auto"); setAnimateImage(false);
+    setBgSelectMode("auto"); setAnimateImage(false); setEnableScenes(false);
     setReviewQueue([]); setCurrentReview(null); setApprovedJobs([]);
     setTranscribing(false); setReadyToGenerate(false); setTranscribeError(null);
     // Capa B 2026-05-24: el wizard descartó todo → vuelve al upload state.
@@ -4036,7 +4036,7 @@ export default function App() {
                 // pero NO la selección de fondo — mismo carryover que el
                 // bug de Ana M., por otra puerta. Paridad con handleReset.
                 setBackgroundFile(null); setBackgroundId(null);
-                setBgSelectMode("auto"); setAnimateImage(false);
+                setBgSelectMode("auto"); setAnimateImage(false); setEnableScenes(false);
                 wizardPersistence.clear();
                 navigate("/new");
               }}

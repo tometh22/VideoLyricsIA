@@ -470,8 +470,10 @@ def build_scene_plan(
             "energy": sec.energy,
             "movement_style": movement,
             "prompt": prompt,
-            "bg_cache_key": None,   # se completa al generar (caché R2 por-prompt)
-            "clip_path": None,
+            # cache_token: bust de caché por regen (lo setea el regen).
+            "cache_token": "",
+            # clip_cache_key: key R2 del clip generado (para GC en regen).
+            "clip_cache_key": None,
             "status": "planned",
         }
         seen[key] = scene
