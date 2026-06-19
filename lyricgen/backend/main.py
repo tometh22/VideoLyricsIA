@@ -7061,6 +7061,8 @@ def status(
             .first()
             is not None
         ),
+        "youtube": job.get("youtube"),
+        "youtube_short": job.get("youtube_short"),
     }
 
 
@@ -10327,14 +10329,132 @@ def save_settings(
 # YouTube
 # ---------------------------------------------------------------------------
 
+class YoutubeUploadBody(BaseModel):
+    privacy: str = "unlisted"
+    title: str | None = None
+    description: str | None = None
+
+
+@app.get("/youtube/connection-status")
+async def youtube_connection_status(current_user: dict = Depends(get_current_user)):
+    """Check if a YouTube account is connected and return channel info."""
+    import asyncio
+    from youtube_upload import get_connection_status
+    loop = asyncio.get_event_loop()
+    status = await loop.run_in_executor(None, get_connection_status)
+    return status
+
+
+@app.get("/youtube/auth-url")
+async def youtube_auth_url(current_user: dict = Depends(get_current_user)):
+    """Return the Google OAuth URL for connecting the system YouTube account.
+
+    Solo admin: YouTube es una cuenta central del sistema (todos los tenants
+    suben ahí), así que conectarla/cambiarla es una acción de administración.
+    El state token bindea el flujo a este admin (CSRF)."""
+    if current_user.get("role") != "admin":
+        raise HTTPException(status_code=403, detail="Solo un administrador puede conectar la cuenta de YouTube.")
+    from youtube_oauth import build_authorization_url, YoutubeOAuthError
+    try:
+        url = build_authorization_url(current_user["id"])
+    except YoutubeOAuthError as e:
+        raise HTTPException(status_code=503, detail=str(e))
+    return {"auth_url": url}
+
+
+@app.get("/youtube/callback")
+async def youtube_oauth_callback(
+    code: str = Query("", max_length=2048),
+    state: str = Query("", max_length=2048),
+    error: str = Query("", max_length=200),
+    db: Session = Depends(get_db),
+):
+    """Callback de Google tras el consent. Verifica el state (HMAC),
+    intercambia el code, cachea el channel y guarda el token encriptado en
+    system_youtube_token. Cierra el popup vía postMessage.
+
+    NO usa get_current_user: Google no manda el JWT — la identidad viene
+    del state token firmado al construir la auth URL."""
+    from fastapi.responses import HTMLResponse
+    from youtube_oauth import (
+        YoutubeOAuthError, verify_state_token, exchange_code_for_tokens,
+        fetch_channel_info, save_system_token,
+    )
+
+    def _popup(html_body: str, status: int = 200):
+        return HTMLResponse(f"""
+        <html><body style="font-family:sans-serif;text-align:center;padding-top:3rem;background:#111;color:#eee;">
+        {html_body}
+        </body></html>""", status_code=status)
+
+    if error:
+        return _popup(f'<h2 style="color:#f87171">Conexión cancelada</h2><p style="color:#aaa">{error}</p>'
+                      '<script>setTimeout(()=>window.close(),2500);</script>', 400)
+
+    try:
+        user_id = verify_state_token(state)
+    except YoutubeOAuthError as e:
+        return _popup(f'<h2 style="color:#f87171">Error de seguridad</h2><p style="color:#aaa">{e}</p>'
+                      '<script>setTimeout(()=>window.close(),3000);</script>', 400)
+
+    # Re-chequeo de rol: el admin pudo perder el rol entre auth-url y callback.
+    cb_user = db.query(User).filter(User.id == user_id).first()
+    if cb_user is None or cb_user.role != "admin":
+        return _popup('<h2 style="color:#f87171">Sin permisos</h2>'
+                      '<p style="color:#aaa">Solo un administrador puede conectar YouTube.</p>'
+                      '<script>setTimeout(()=>window.close(),3000);</script>', 403)
+
+    try:
+        token_data = exchange_code_for_tokens(code)
+    except YoutubeOAuthError as e:
+        return _popup(f'<h2 style="color:#f87171">Error al conectar</h2><p style="color:#aaa">{e}</p>'
+                      '<script>setTimeout(()=>window.close(),3000);</script>', 400)
+
+    # Channel info es best-effort (para mostrar "Conectado como X").
+    channel = fetch_channel_info(token_data.get("token", ""))
+    save_system_token(db, token_data, channel=channel, user_id=user_id)
+
+    ch_name = channel.get("channel_name") or "tu canal"
+    return _popup(
+        '<div style="font-size:3rem;margin-bottom:1rem">✓</div>'
+        '<h2 style="color:#a3e635">YouTube conectado</h2>'
+        f'<p style="color:#888;font-size:0.9rem">Cuenta: {ch_name}. Ya podés cerrar esta ventana.</p>'
+        '<script>if(window.opener){window.opener.postMessage("yt_connected","*");}'
+        'setTimeout(()=>window.close(),1500);</script>'
+    )
+
+
+@app.post("/youtube/disconnect")
+async def youtube_disconnect(
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Disconnect the system YouTube account (admin only)."""
+    if current_user.get("role") != "admin":
+        raise HTTPException(status_code=403, detail="Solo un administrador puede desconectar YouTube.")
+    from youtube_oauth import delete_system_token
+    removed = delete_system_token(db)
+    return {"disconnected": removed}
+
+
+@app.get("/youtube/upload-progress/{job_id}")
+async def youtube_upload_progress(job_id: str, current_user: dict = Depends(get_current_user)):
+    """Return the current upload progress (0-100) for a job, or -1 if not uploading."""
+    from youtube_upload import get_upload_progress
+    return {"progress": get_upload_progress(job_id), "short_progress": get_upload_progress(job_id + "_short")}
+
+
 @app.post("/youtube/upload/{job_id}")
 async def youtube_upload(
     job_id: str,
+    body: YoutubeUploadBody = None,
     privacy: str = "unlisted",
     current_user: dict = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
     """Upload a completed job's video to YouTube with AI-generated metadata."""
+    if body:
+        privacy = body.privacy
     job = get_job(db, job_id, **_job_scope(current_user))
     if job is None:
         raise HTTPException(status_code=404, detail="Job not found.")
@@ -10357,15 +10477,101 @@ async def youtube_upload(
     artist = job.get("artist", "")
 
     import asyncio
+    from functools import partial
     from youtube_upload import upload_to_youtube
     loop = asyncio.get_event_loop()
-    result = await loop.run_in_executor(
-        None, upload_to_youtube, video_path, thumb_path, artist, song, "", privacy, job_id,
-    )
+    try:
+        fn = partial(
+            upload_to_youtube,
+            video_path, thumb_path, artist, song, "", privacy, job_id,
+            body.title if body else None,
+            body.description if body else None,
+        )
+        result = await loop.run_in_executor(None, fn)
+    except Exception as e:
+        raise HTTPException(status_code=502, detail={"message": f"YouTube upload failed: {e}", "code": str(e)})
 
     update_job(job_id, youtube=result)
-
     return result
+
+
+@app.post("/youtube/upload-short/{job_id}")
+async def youtube_upload_short(
+    job_id: str,
+    body: YoutubeUploadBody = None,
+    privacy: str = "unlisted",
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Upload a completed job's Short (vertical 9:16) to YouTube Shorts."""
+    if body:
+        privacy = body.privacy
+    job = get_job(db, job_id, **_job_scope(current_user))
+    if job is None:
+        raise HTTPException(status_code=404, detail="Job not found.")
+    if job["status"] != "done":
+        raise HTTPException(status_code=400, detail="Job is not done yet.")
+
+    short_path = os.path.join(OUTPUTS_DIR, job_id, "short.mp4")
+    thumb_path = os.path.join(OUTPUTS_DIR, job_id, "thumbnail.jpg")
+
+    if not os.path.exists(short_path):
+        raise HTTPException(status_code=404, detail="Short file not found. The job may not have generated a short.")
+
+    filename = job.get("filename", "")
+    song = filename.replace(".mp3", "")
+    if " - " in song:
+        song = song.split(" - ", 1)[1]
+    for sfx in ["(Official Video)", "(Official Audio)", "(En Vivo)", "(Live)", "(Lyrics)"]:
+        song = song.replace(sfx, "").strip()
+
+    artist = job.get("artist", "")
+
+    import asyncio
+    from functools import partial
+    from youtube_upload import upload_short_to_youtube
+    loop = asyncio.get_event_loop()
+    try:
+        fn = partial(
+            upload_short_to_youtube,
+            short_path, thumb_path, artist, song, "", privacy, job_id,
+            body.title if body else None,
+            body.description if body else None,
+        )
+        result = await loop.run_in_executor(None, fn)
+    except Exception as e:
+        raise HTTPException(status_code=502, detail={"message": f"YouTube upload failed: {e}", "code": str(e)})
+
+    update_job(job_id, youtube_short=result)
+    return result
+
+
+@app.post("/youtube/metadata-short/{job_id}")
+async def youtube_short_metadata_preview(
+    job_id: str,
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Preview the AI-generated YouTube Shorts metadata without uploading."""
+    job = get_job(db, job_id, **_job_scope(current_user))
+    if job is None:
+        raise HTTPException(status_code=404, detail="Job not found.")
+
+    filename = job.get("filename", "")
+    song = filename.replace(".mp3", "")
+    if " - " in song:
+        song = song.split(" - ", 1)[1]
+    for sfx in ["(Official Video)", "(Official Audio)", "(En Vivo)", "(Live)", "(Lyrics)"]:
+        song = song.replace(sfx, "").strip()
+
+    from youtube_upload import generate_short_metadata
+    from functools import partial
+    import asyncio
+    loop = asyncio.get_event_loop()
+    metadata = await loop.run_in_executor(
+        None, partial(generate_short_metadata, job.get("artist", ""), song, "", job_id=job_id),
+    )
+    return metadata
 
 
 @app.post("/youtube/metadata/{job_id}")

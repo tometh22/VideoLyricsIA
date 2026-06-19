@@ -381,6 +381,7 @@ class Job(Base):
 
     # YouTube info
     youtube_data = Column(JSONB, nullable=True)
+    youtube_short_data = Column(JSONB, nullable=True)
 
     # Content validation (UMG Guideline 15)
     validation_result = Column(JSONB, nullable=True)
@@ -488,6 +489,7 @@ class Job(Base):
             "error": self.error,
             "error_category": self.error_category,
             "youtube": self.youtube_data,
+            "youtube_short": self.youtube_short_data,
             "validation_result": self.validation_result,
             "approved_by": self.approved_by,
             "approved_at": self.approved_at.isoformat() if self.approved_at else None,
@@ -540,6 +542,8 @@ class Job(Base):
             "created_at": self.created_at.timestamp() if self.created_at else None,
             # Archivado Fase 1: la historia esconde archived por default.
             "archived_at": self.archived_at.timestamp() if self.archived_at else None,
+            "youtube": self.youtube_data,
+            "youtube_short": self.youtube_short_data,
         }
 
 
@@ -739,6 +743,32 @@ class UserDriveTokens(Base):
     google_email = Column(String(255), nullable=True)  # display only en Settings
     connected_at = Column(DateTime(timezone=True), default=utcnow)
     last_used_at = Column(DateTime(timezone=True), nullable=True)
+
+
+class SystemYoutubeToken(Base):
+    """Token OAuth de la cuenta de YouTube del SISTEMA (global, singleton).
+
+    A diferencia de UserDriveTokens (uno por user), YouTube usa una única
+    cuenta central a la que suben los videos de todos los tenants. Por eso
+    es singleton: siempre hay 0 o 1 fila.
+
+    El token completo (access + refresh + client info, formato compatible
+    con google.oauth2.credentials.Credentials) va Fernet-encrypted at rest,
+    reusando DRIVE_TOKEN_ENCRYPTION_KEY. Por qué DB y no archivo: el
+    filesystem de Railway es efímero (se borra en cada deploy), así que
+    persistir acá es lo que hace que la conexión a YouTube sobreviva los
+    redeploys en vez de obligar a reconectar cada vez.
+    """
+    __tablename__ = "system_youtube_token"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    encrypted_token_json = Column(Text, nullable=False)
+    channel_id = Column(String(255), nullable=True)
+    channel_name = Column(String(255), nullable=True)
+    channel_thumbnail = Column(String(500), nullable=True)
+    connected_by_user_id = Column(Integer, nullable=True)  # auditoría
+    connected_at = Column(DateTime(timezone=True), default=utcnow)
+    updated_at = Column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)
 
 
 class DriveTransfer(Base):
@@ -1155,6 +1185,7 @@ def _migrate_user_columns():
         # full_name/avatar_url. login_sessions la crea create_all().
         "ALTER TABLE users ADD COLUMN IF NOT EXISTS full_name VARCHAR(200)",
         "ALTER TABLE users ADD COLUMN IF NOT EXISTS avatar_url VARCHAR(500)",
+        "ALTER TABLE jobs ADD COLUMN IF NOT EXISTS youtube_short_data JSONB",
     ]
     # Each statement gets its own transaction. In Postgres, a failed statement
     # inside a transaction puts it in aborted state — subsequent execute()
@@ -1181,6 +1212,7 @@ def _migrate_user_columns():
     _cast_json_to_jsonb("jobs", "umg_spec")
     _cast_json_to_jsonb("jobs", "s3_keys")
     _cast_json_to_jsonb("jobs", "youtube_data")
+    _cast_json_to_jsonb("jobs", "youtube_short_data")
     _cast_json_to_jsonb("jobs", "validation_result")
     _cast_json_to_jsonb("jobs", "segments_json")
     _cast_json_to_jsonb("jobs", "render_params")

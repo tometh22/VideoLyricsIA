@@ -365,7 +365,23 @@ export default function JobDetail({ job, onBack, onJobUpdate }) {
   const [uploading, setUploading] = useState(false);
   const [youtubeResult, setYoutubeResult] = useState(job.youtube || null);
   const [metadataPreview, setMetadataPreview] = useState(null);
+  const [editingMeta, setEditingMeta] = useState(false);
+  const [editedTitle, setEditedTitle] = useState("");
+  const [editedDescription, setEditedDescription] = useState("");
   const [showYoutubePanel, setShowYoutubePanel] = useState(false);
+  const [confirmPublicYoutube, setConfirmPublicYoutube] = useState(false);
+  const [uploadProgress, setUploadProgress] = useState(-1);
+  const [copiedUrl, setCopiedUrl] = useState(false);
+  const [youtubeShortResult, setYoutubeShortResult] = useState(job.youtube_short || null);
+  const [shortMetadataPreview, setShortMetadataPreview] = useState(null);
+  const [editingShortMeta, setEditingShortMeta] = useState(false);
+  const [editedShortTitle, setEditedShortTitle] = useState("");
+  const [editedShortDescription, setEditedShortDescription] = useState("");
+  const [showYoutubeShortPanel, setShowYoutubeShortPanel] = useState(false);
+  const [confirmPublicYoutubeShort, setConfirmPublicYoutubeShort] = useState(false);
+  const [uploadShortProgress, setUploadShortProgress] = useState(-1);
+  const [copiedShortUrl, setCopiedShortUrl] = useState(false);
+  const [uploadingShort, setUploadingShort] = useState(false);
   const [reviewNotes, setReviewNotes] = useState("");
   const [approving, setApproving] = useState(false);
   const [retrying, setRetrying] = useState(false);
@@ -1142,29 +1158,115 @@ export default function JobDetail({ job, onBack, onJobUpdate }) {
       const res = await fetch(`${API}/youtube/metadata/${job.job_id}`, { method: "POST", headers: authHeaders() });
       if (!res.ok) {
         const data = await res.json().catch(() => ({}));
-        throw new Error(data.detail || `Error ${res.status}`);
+        throw new Error(_resolveYtError(data.detail));
       }
       const data = await res.json();
       setMetadataPreview(data);
+      setEditedTitle(data.title || "");
+      setEditedDescription(data.description || "");
     } catch (err) {
       setMetadataPreview({ error: err.message });
     }
   };
 
+  const _resolveYtError = (detail) => {
+    if (!detail) return "Error desconocido";
+    const code = typeof detail === "object" ? detail.code : detail;
+    const i18nKey = `detail.yt_error.${code}`;
+    const mapped = t(i18nKey);
+    if (mapped && mapped !== i18nKey) return mapped;
+    return typeof detail === "object" ? (detail.message || JSON.stringify(detail)) : detail;
+  };
+
+  const _pollProgress = (progressKey, setter) => {
+    const interval = setInterval(async () => {
+      try {
+        const r = await fetch(`${API}/youtube/upload-progress/${job.job_id}`, { headers: authHeaders() });
+        if (!r.ok) { clearInterval(interval); return; }
+        const d = await r.json();
+        const val = progressKey === "short" ? d.short_progress : d.progress;
+        setter(val);
+        if (val === 100 || val === -1) clearInterval(interval);
+      } catch { clearInterval(interval); }
+    }, 2000);
+    return interval;
+  };
+
   const uploadToYoutube = async (privacy = "unlisted") => {
+    setConfirmPublicYoutube(false);
     setUploading(true);
+    setUploadProgress(0);
+    const pollId = _pollProgress("video", setUploadProgress);
     try {
-      const res = await fetch(`${API}/youtube/upload/${job.job_id}?privacy=${privacy}`, { method: "POST", headers: authHeaders() });
+      const res = await fetch(`${API}/youtube/upload/${job.job_id}`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", ...authHeaders() },
+        body: JSON.stringify({
+          privacy,
+          title: editingMeta ? editedTitle : undefined,
+          description: editingMeta ? editedDescription : undefined,
+        }),
+      });
+      clearInterval(pollId);
       if (!res.ok) {
         const data = await res.json().catch(() => ({}));
-        throw new Error(data.detail || `Error ${res.status}`);
+        throw new Error(_resolveYtError(data.detail));
       }
       const data = await res.json();
       setYoutubeResult(data);
     } catch (err) {
+      clearInterval(pollId);
       setYoutubeResult({ error: err.message });
     }
+    setUploadProgress(-1);
     setUploading(false);
+  };
+
+  const previewShortMetadata = async () => {
+    setShowYoutubeShortPanel(true);
+    try {
+      const res = await fetch(`${API}/youtube/metadata-short/${job.job_id}`, { method: "POST", headers: authHeaders() });
+      if (!res.ok) {
+        const data = await res.json().catch(() => ({}));
+        throw new Error(_resolveYtError(data.detail));
+      }
+      const data = await res.json();
+      setShortMetadataPreview(data);
+      setEditedShortTitle(data.title || "");
+      setEditedShortDescription(data.description || "");
+    } catch (err) {
+      setShortMetadataPreview({ error: err.message });
+    }
+  };
+
+  const uploadShortToYoutube = async (privacy = "unlisted") => {
+    setConfirmPublicYoutubeShort(false);
+    setUploadingShort(true);
+    setUploadShortProgress(0);
+    const pollId = _pollProgress("short", setUploadShortProgress);
+    try {
+      const res = await fetch(`${API}/youtube/upload-short/${job.job_id}`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", ...authHeaders() },
+        body: JSON.stringify({
+          privacy,
+          title: editingShortMeta ? editedShortTitle : undefined,
+          description: editingShortMeta ? editedShortDescription : undefined,
+        }),
+      });
+      clearInterval(pollId);
+      if (!res.ok) {
+        const data = await res.json().catch(() => ({}));
+        throw new Error(_resolveYtError(data.detail));
+      }
+      const data = await res.json();
+      setYoutubeShortResult(data);
+    } catch (err) {
+      clearInterval(pollId);
+      setYoutubeShortResult({ error: err.message });
+    }
+    setUploadShortProgress(-1);
+    setUploadingShort(false);
   };
 
   const handleApprove = async () => {
@@ -1431,6 +1533,23 @@ export default function JobDetail({ job, onBack, onJobUpdate }) {
                 <path d="M22.54 6.42a2.78 2.78 0 00-1.94-2C18.88 4 12 4 12 4s-6.88 0-8.6.46a2.78 2.78 0 00-1.94 2A29 29 0 001 11.75a29 29 0 00.46 5.33A2.78 2.78 0 003.4 19.13C5.12 19.56 12 19.56 12 19.56s6.88 0 8.6-.46a2.78 2.78 0 001.94-2A29 29 0 0023 11.75a29 29 0 00-.46-5.33z"/><polygon points="9.75 15.02 15.5 11.75 9.75 8.48 9.75 15.02"/>
               </svg>
               {t("detail.view_youtube")}
+            </a>
+          )}
+          {canDownload && !youtubeShortResult && (
+            <button onClick={previewShortMetadata} className="btn-secondary text-xs h-10 px-5">
+              <svg className="inline-block w-4 h-4 mr-1.5 -mt-0.5" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
+                <path d="M22.54 6.42a2.78 2.78 0 00-1.94-2C18.88 4 12 4 12 4s-6.88 0-8.6.46a2.78 2.78 0 00-1.94 2A29 29 0 001 11.75a29 29 0 00.46 5.33A2.78 2.78 0 003.4 19.13C5.12 19.56 12 19.56 12 19.56s6.88 0 8.6-.46a2.78 2.78 0 001.94-2A29 29 0 0023 11.75a29 29 0 00-.46-5.33z"/><polygon points="9.75 15.02 15.5 11.75 9.75 8.48 9.75 15.02"/>
+              </svg>
+              {t("detail.publish_short_youtube")}
+            </button>
+          )}
+          {canDownload && youtubeShortResult && !youtubeShortResult.error && (
+            <a href={youtubeShortResult.url} target="_blank" rel="noopener noreferrer"
+              className="inline-flex items-center h-10 px-5 rounded-button text-xs font-semibold text-white bg-red-600 hover:bg-red-700 transition-colors">
+              <svg className="inline-block w-4 h-4 mr-1.5" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
+                <path d="M22.54 6.42a2.78 2.78 0 00-1.94-2C18.88 4 12 4 12 4s-6.88 0-8.6.46a2.78 2.78 0 00-1.94 2A29 29 0 001 11.75a29 29 0 00.46 5.33A2.78 2.78 0 003.4 19.13C5.12 19.56 12 19.56 12 19.56s6.88 0 8.6-.46a2.78 2.78 0 001.94-2A29 29 0 0023 11.75a29 29 0 00-.46-5.33z"/><polygon points="9.75 15.02 15.5 11.75 9.75 8.48 9.75 15.02"/>
+              </svg>
+              {t("detail.view_short_youtube")}
             </a>
           )}
         </div>
@@ -1838,40 +1957,89 @@ export default function JobDetail({ job, onBack, onJobUpdate }) {
           {metadataPreview && !metadataPreview.error && !youtubeResult && (
             <div className="space-y-4">
               <div>
-                <label className="text-xs text-gray-500 uppercase tracking-wider">{t("settings.title_format").split(" ")[0]}</label>
-                <p className="text-sm text-white mt-1 glass rounded-xl px-4 py-2.5">{metadataPreview.title}</p>
+                <div className="flex items-center justify-between mb-1">
+                  <label className="text-xs text-gray-500 uppercase tracking-wider">Título</label>
+                  <button onClick={() => setEditingMeta((v) => !v)}
+                    className="text-[11px] text-brand-light hover:text-white transition-colors">
+                    {t("detail.edit_metadata")}
+                  </button>
+                </div>
+                {editingMeta ? (
+                  <input value={editedTitle} onChange={(e) => setEditedTitle(e.target.value)}
+                    className="input-field text-sm w-full" maxLength={100} />
+                ) : (
+                  <p className="text-sm text-white mt-1 glass rounded-xl px-4 py-2.5">{metadataPreview.title}</p>
+                )}
               </div>
               <div>
-                <label className="text-xs text-gray-500 uppercase tracking-wider">{t("settings.desc_header").split(" ")[0]}</label>
-                <p className="text-sm text-gray-300 mt-1 glass rounded-xl px-4 py-2.5 whitespace-pre-line">{metadataPreview.description}</p>
+                <label className="text-xs text-gray-500 uppercase tracking-wider">Descripción</label>
+                {editingMeta ? (
+                  <textarea value={editedDescription} onChange={(e) => setEditedDescription(e.target.value)}
+                    rows={5} className="input-field text-sm w-full resize-none mt-1" />
+                ) : (
+                  <p className="text-sm text-gray-300 mt-1 glass rounded-xl px-4 py-2.5 whitespace-pre-line line-clamp-4">{metadataPreview.description}</p>
+                )}
               </div>
               <div>
                 <label className="text-xs text-gray-500 uppercase tracking-wider">Tags</label>
                 <div className="flex flex-wrap gap-1.5 mt-1">
-                  {(metadataPreview.tags || []).map((tag, i) => (
+                  {(metadataPreview.tags || []).slice(0, 12).map((tag, i) => (
                     <span key={i} className="px-2 py-1 rounded-lg bg-surface-3/50 text-xs text-gray-400">{tag}</span>
                   ))}
+                  {(metadataPreview.tags || []).length > 12 && (
+                    <span className="px-2 py-1 text-xs text-gray-600">+{(metadataPreview.tags || []).length - 12}</span>
+                  )}
                 </div>
               </div>
 
-              <div className="flex gap-3 pt-2">
-                <button onClick={() => uploadToYoutube("unlisted")} disabled={uploading}
-                  className="btn-primary text-sm py-2.5 px-5 disabled:opacity-50">
-                  {uploading ? (
-                    <><div className="inline-block w-4 h-4 border-2 border-white border-t-transparent rounded-full animate-spin mr-2" />{t("detail.uploading")}</>
-                  ) : (
-                    t("detail.upload_unlisted")
-                  )}
-                </button>
-                <button onClick={() => uploadToYoutube("public")} disabled={uploading}
-                  className="btn-secondary text-sm py-2.5 px-5 disabled:opacity-50">
-                  {t("detail.upload_public")}
-                </button>
-                <button onClick={() => setShowYoutubePanel(false)}
-                  className="text-xs text-gray-500 hover:text-white transition-colors ml-auto">
-                  {t("detail.cancel")}
-                </button>
-              </div>
+              {/* Upload progress bar */}
+              {uploading && uploadProgress >= 0 && (
+                <div className="space-y-1.5">
+                  <div className="flex justify-between text-xs text-gray-500">
+                    <span>{t("detail.upload_progress")}</span>
+                    <span>{uploadProgress}%</span>
+                  </div>
+                  <div className="h-1.5 w-full rounded-full bg-surface-3/40 overflow-hidden">
+                    <div className="h-full rounded-full bg-red-500 transition-all duration-500"
+                      style={{ width: `${uploadProgress}%` }} />
+                  </div>
+                </div>
+              )}
+
+              {/* Confirm public dialog */}
+              {confirmPublicYoutube ? (
+                <div className="rounded-xl bg-amber-500/10 ring-1 ring-amber-500/30 px-4 py-3 space-y-3">
+                  <p className="text-sm font-medium text-amber-300">{t("detail.confirm_public_title")}</p>
+                  <p className="text-xs text-amber-200/70">{t("detail.confirm_public_body")}</p>
+                  <div className="flex gap-2">
+                    <button onClick={() => uploadToYoutube("public")} disabled={uploading}
+                      className="btn-primary text-sm py-2 px-4 bg-amber-500 hover:bg-amber-400 disabled:opacity-50">
+                      {t("detail.confirm_public_cta")}
+                    </button>
+                    <button onClick={() => setConfirmPublicYoutube(false)}
+                      className="text-xs text-gray-400 hover:text-white transition-colors px-3">
+                      {t("detail.cancel")}
+                    </button>
+                  </div>
+                </div>
+              ) : (
+                <div className="flex gap-3 pt-2">
+                  <button onClick={() => uploadToYoutube("unlisted")} disabled={uploading}
+                    className="btn-primary text-sm py-2.5 px-5 disabled:opacity-50">
+                    {uploading ? (
+                      <><div className="inline-block w-4 h-4 border-2 border-white border-t-transparent rounded-full animate-spin mr-2" />{t("detail.uploading")}</>
+                    ) : t("detail.upload_unlisted")}
+                  </button>
+                  <button onClick={() => setConfirmPublicYoutube(true)} disabled={uploading}
+                    className="btn-secondary text-sm py-2.5 px-5 disabled:opacity-50">
+                    {t("detail.upload_public")}
+                  </button>
+                  <button onClick={() => setShowYoutubePanel(false)}
+                    className="text-xs text-gray-500 hover:text-white transition-colors ml-auto">
+                    {t("detail.cancel")}
+                  </button>
+                </div>
+              )}
             </div>
           )}
 
@@ -1882,18 +2050,182 @@ export default function JobDetail({ job, onBack, onJobUpdate }) {
                   <polyline points="20 6 9 17 4 12" />
                 </svg>
               </div>
-              <p className="text-sm font-medium text-white mb-1">{t("detail.published")}</p>
-              <a href={youtubeResult.url} target="_blank" rel="noopener noreferrer"
-                className="text-sm text-brand hover:text-brand-light transition-colors underline">
-                {youtubeResult.url}
-              </a>
-              <p className="text-xs text-gray-500 mt-2">Estado: {youtubeResult.privacy}</p>
+              <p className="text-sm font-medium text-white mb-2">{t("detail.published")}</p>
+              <p className="text-xs text-gray-500 mb-3">
+                {youtubeResult.privacy === "public" ? "Público" : "No listado"}
+                {youtubeResult.thumbnail_set === false && (
+                  <span className="ml-2 text-amber-400">· {t("detail.thumbnail_warning")}</span>
+                )}
+              </p>
+              <div className="flex items-center justify-center gap-2 flex-wrap">
+                <a href={youtubeResult.url} target="_blank" rel="noopener noreferrer"
+                  className="btn-secondary text-xs py-1.5 px-3 flex items-center gap-1.5">
+                  <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
+                    <path d="M18 13v6a2 2 0 01-2 2H5a2 2 0 01-2-2V8a2 2 0 012-2h6"/><polyline points="15 3 21 3 21 9"/><line x1="10" y1="14" x2="21" y2="3"/>
+                  </svg>
+                  {t("detail.open_youtube")}
+                </a>
+                <button onClick={() => { navigator.clipboard.writeText(youtubeResult.url); setCopiedUrl(true); setTimeout(() => setCopiedUrl(false), 2000); }}
+                  className="btn-secondary text-xs py-1.5 px-3 flex items-center gap-1.5">
+                  <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
+                    <rect x="9" y="9" width="13" height="13" rx="2" ry="2"/><path d="M5 15H4a2 2 0 01-2-2V4a2 2 0 012-2h9a2 2 0 012 2v1"/>
+                  </svg>
+                  {copiedUrl ? t("detail.copied") : t("detail.copy_url")}
+                </button>
+              </div>
             </div>
           )}
 
           {(metadataPreview?.error || youtubeResult?.error) && (
-            <div className="rounded-xl bg-red-500/10 border border-red-500/20 px-4 py-3 text-center">
+            <div className="rounded-xl bg-red-500/10 border border-red-500/20 px-4 py-3">
               <p className="text-sm text-red-400">{metadataPreview?.error || youtubeResult?.error}</p>
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* YouTube Shorts Panel */}
+      {canDownload && showYoutubeShortPanel && (
+        <div className="rounded-card bg-surface-2/40 ring-1 ring-white/[0.04] p-6 animate-fade-in">
+          <h3 className="font-semibold mb-4 flex items-center gap-2">
+            <svg className="w-5 h-5 text-red-500" fill="currentColor" viewBox="0 0 24 24">
+              <path d="M22.54 6.42a2.78 2.78 0 00-1.94-2C18.88 4 12 4 12 4s-6.88 0-8.6.46a2.78 2.78 0 00-1.94 2A29 29 0 001 11.75a29 29 0 00.46 5.33A2.78 2.78 0 003.4 19.13C5.12 19.56 12 19.56 12 19.56s6.88 0 8.6-.46a2.78 2.78 0 001.94-2A29 29 0 0023 11.75a29 29 0 00-.46-5.33z"/><polygon points="9.75 15.02 15.5 11.75 9.75 8.48 9.75 15.02" fill="white"/>
+            </svg>
+            {t("detail.publish_short_youtube")}
+          </h3>
+
+          {!shortMetadataPreview && !youtubeShortResult && (
+            <div className="flex items-center justify-center py-8">
+              <div className="w-6 h-6 border-2 border-brand border-t-transparent rounded-full animate-spin" />
+              <span className="ml-3 text-sm text-gray-400">{t("detail.generating_meta")}</span>
+            </div>
+          )}
+
+          {shortMetadataPreview && !shortMetadataPreview.error && !youtubeShortResult && (
+            <div className="space-y-4">
+              <div>
+                <div className="flex items-center justify-between mb-1">
+                  <label className="text-xs text-gray-500 uppercase tracking-wider">Título</label>
+                  <button onClick={() => setEditingShortMeta((v) => !v)}
+                    className="text-[11px] text-brand-light hover:text-white transition-colors">
+                    {t("detail.edit_metadata")}
+                  </button>
+                </div>
+                {editingShortMeta ? (
+                  <input value={editedShortTitle} onChange={(e) => setEditedShortTitle(e.target.value)}
+                    className="input-field text-sm w-full" maxLength={100} />
+                ) : (
+                  <p className="text-sm text-white mt-1 glass rounded-xl px-4 py-2.5">{shortMetadataPreview.title}</p>
+                )}
+              </div>
+              <div>
+                <label className="text-xs text-gray-500 uppercase tracking-wider">Descripción</label>
+                {editingShortMeta ? (
+                  <textarea value={editedShortDescription} onChange={(e) => setEditedShortDescription(e.target.value)}
+                    rows={5} className="input-field text-sm w-full resize-none mt-1" />
+                ) : (
+                  <p className="text-sm text-gray-300 mt-1 glass rounded-xl px-4 py-2.5 whitespace-pre-line line-clamp-4">{shortMetadataPreview.description}</p>
+                )}
+              </div>
+              <div>
+                <label className="text-xs text-gray-500 uppercase tracking-wider">Tags</label>
+                <div className="flex flex-wrap gap-1.5 mt-1">
+                  {(shortMetadataPreview.tags || []).slice(0, 12).map((tag, i) => (
+                    <span key={i} className="px-2 py-1 rounded-lg bg-surface-3/50 text-xs text-gray-400">{tag}</span>
+                  ))}
+                  {(shortMetadataPreview.tags || []).length > 12 && (
+                    <span className="px-2 py-1 text-xs text-gray-600">+{(shortMetadataPreview.tags || []).length - 12}</span>
+                  )}
+                </div>
+              </div>
+
+              {/* Upload progress bar */}
+              {uploadingShort && uploadShortProgress >= 0 && (
+                <div className="space-y-1.5">
+                  <div className="flex justify-between text-xs text-gray-500">
+                    <span>{t("detail.upload_progress")}</span>
+                    <span>{uploadShortProgress}%</span>
+                  </div>
+                  <div className="h-1.5 w-full rounded-full bg-surface-3/40 overflow-hidden">
+                    <div className="h-full rounded-full bg-red-500 transition-all duration-500"
+                      style={{ width: `${uploadShortProgress}%` }} />
+                  </div>
+                </div>
+              )}
+
+              {/* Confirm public dialog */}
+              {confirmPublicYoutubeShort ? (
+                <div className="rounded-xl bg-amber-500/10 ring-1 ring-amber-500/30 px-4 py-3 space-y-3">
+                  <p className="text-sm font-medium text-amber-300">{t("detail.confirm_public_title")}</p>
+                  <p className="text-xs text-amber-200/70">{t("detail.confirm_public_body")}</p>
+                  <div className="flex gap-2">
+                    <button onClick={() => uploadShortToYoutube("public")} disabled={uploadingShort}
+                      className="btn-primary text-sm py-2 px-4 bg-amber-500 hover:bg-amber-400 disabled:opacity-50">
+                      {t("detail.confirm_public_cta")}
+                    </button>
+                    <button onClick={() => setConfirmPublicYoutubeShort(false)}
+                      className="text-xs text-gray-400 hover:text-white transition-colors px-3">
+                      {t("detail.cancel")}
+                    </button>
+                  </div>
+                </div>
+              ) : (
+                <div className="flex gap-3 pt-2">
+                  <button onClick={() => uploadShortToYoutube("unlisted")} disabled={uploadingShort}
+                    className="btn-primary text-sm py-2.5 px-5 disabled:opacity-50">
+                    {uploadingShort ? (
+                      <><div className="inline-block w-4 h-4 border-2 border-white border-t-transparent rounded-full animate-spin mr-2" />{t("detail.uploading")}</>
+                    ) : t("detail.upload_unlisted")}
+                  </button>
+                  <button onClick={() => setConfirmPublicYoutubeShort(true)} disabled={uploadingShort}
+                    className="btn-secondary text-sm py-2.5 px-5 disabled:opacity-50">
+                    {t("detail.upload_public")}
+                  </button>
+                  <button onClick={() => setShowYoutubeShortPanel(false)}
+                    className="text-xs text-gray-500 hover:text-white transition-colors ml-auto">
+                    {t("detail.cancel")}
+                  </button>
+                </div>
+              )}
+            </div>
+          )}
+
+          {youtubeShortResult && !youtubeShortResult.error && (
+            <div className="text-center py-6">
+              <div className="w-12 h-12 mx-auto mb-3 rounded-2xl bg-accent/10 flex items-center justify-center">
+                <svg className="w-6 h-6 text-accent" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
+                  <polyline points="20 6 9 17 4 12" />
+                </svg>
+              </div>
+              <p className="text-sm font-medium text-white mb-2">{t("detail.published_short")}</p>
+              <p className="text-xs text-gray-500 mb-3">
+                {youtubeShortResult.privacy === "public" ? "Público" : "No listado"}
+                {youtubeShortResult.thumbnail_set === false && (
+                  <span className="ml-2 text-amber-400">· {t("detail.thumbnail_warning")}</span>
+                )}
+              </p>
+              <div className="flex items-center justify-center gap-2 flex-wrap">
+                <a href={youtubeShortResult.url} target="_blank" rel="noopener noreferrer"
+                  className="btn-secondary text-xs py-1.5 px-3 flex items-center gap-1.5">
+                  <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
+                    <path d="M18 13v6a2 2 0 01-2 2H5a2 2 0 01-2-2V8a2 2 0 012-2h6"/><polyline points="15 3 21 3 21 9"/><line x1="10" y1="14" x2="21" y2="3"/>
+                  </svg>
+                  {t("detail.open_youtube")}
+                </a>
+                <button onClick={() => { navigator.clipboard.writeText(youtubeShortResult.url); setCopiedShortUrl(true); setTimeout(() => setCopiedShortUrl(false), 2000); }}
+                  className="btn-secondary text-xs py-1.5 px-3 flex items-center gap-1.5">
+                  <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
+                    <rect x="9" y="9" width="13" height="13" rx="2" ry="2"/><path d="M5 15H4a2 2 0 01-2-2V4a2 2 0 012-2h9a2 2 0 012 2v1"/>
+                  </svg>
+                  {copiedShortUrl ? t("detail.copied") : t("detail.copy_url")}
+                </button>
+              </div>
+            </div>
+          )}
+
+          {(shortMetadataPreview?.error || youtubeShortResult?.error) && (
+            <div className="rounded-xl bg-red-500/10 border border-red-500/20 px-4 py-3">
+              <p className="text-sm text-red-400">{shortMetadataPreview?.error || youtubeShortResult?.error}</p>
             </div>
           )}
         </div>

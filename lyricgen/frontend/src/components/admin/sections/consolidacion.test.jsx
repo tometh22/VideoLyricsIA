@@ -77,13 +77,13 @@ describe("RendimientoSection", () => {
         <RendimientoSection />
       </AdminProvider>
     );
-    // creados 6v3 y aprobados 4v2: ambos +100% → getAllByText
+    // creados 6v3 y aprobados 4v2: ambos +100% → delta chips "↗ 100%"
     await waitFor(() =>
-      expect(screen.getAllByText(/↑ 100% vs semana anterior/).length).toBe(2)
+      expect(screen.getAllByText(/↗ 100%/).length).toBeGreaterThanOrEqual(2)  // +1 del health card del fixture
     );
     expect(screen.getByText("Videos creados")).toBeInTheDocument();
-    // Ediciones bajaron 2 vs 4 → ↓ 50%
-    expect(screen.getByText(/↓ 50% vs semana anterior/)).toBeInTheDocument();
+    // Ediciones bajaron 2 vs 4 → ↘ 50%
+    expect(screen.getByText(/↘ 50%/)).toBeInTheDocument();
     // Salud por cuenta y funnel presentes
     await waitFor(() => expect(screen.getByText("umg")).toBeInTheDocument());
     expect(screen.getByText(/Funnel · últimos 28 días · 6 jobs/)).toBeInTheDocument();
