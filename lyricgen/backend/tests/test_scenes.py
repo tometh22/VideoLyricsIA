@@ -162,6 +162,24 @@ def test_section_from_dict_tolerates_malformed():
     assert scenes.sections_from_plan({"sections": [{}, {"type": "coro", "start": 0, "end": 3}]})
 
 
+def test_build_scene_plan_respects_operator_static(monkeypatch):
+    """Bug 2026-06-19: el operador pedía 'estático' pero las escenas se movían
+    (el movimiento salía de la energía). Ahora estatico/sutil overridean todo."""
+    secs = scenes.detect_sections(_song_with_repeated_chorus(), audio_duration=100.0)
+    bible = {"world": "w", "palette": "p", "texture": "t", "camera": "c", "motif": "m"}
+    pf = lambda **k: {"style": "video", "prompt": "x"}
+    # estatico → TODAS las escenas estaticas (override del energy-derived).
+    plan = scenes.build_scene_plan(secs, bible, pf, operator_movement="estatico")
+    assert all(s["movement_style"] == "estatico" for s in plan["scenes"])
+    # sutil → todas sutiles.
+    plan_s = scenes.build_scene_plan(secs, bible, pf, operator_movement="sutil")
+    assert all(s["movement_style"] == "sutil" for s in plan_s["scenes"])
+    # vacío/estandar → energy-derived (el coro de alta energía NO es estatico).
+    plan0 = scenes.build_scene_plan(secs, bible, pf, operator_movement="")
+    movs = {s["movement_style"] for s in plan0["scenes"]}
+    assert movs != {"estatico"}, "sin override debe variar por energía"
+
+
 def test_energy_to_movement_mapping():
     assert scenes.energy_to_movement(0.9) == "dinamico"
     assert scenes.energy_to_movement(0.5) == "sutil"

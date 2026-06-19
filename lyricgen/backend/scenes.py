@@ -435,6 +435,7 @@ def build_scene_plan(
     artist: str = "",
     song_title: str = "",
     style: str = "",
+    operator_movement: str = "",
 ) -> dict:
     """Construye el storyboard: una escena por recurrence_key única.
 
@@ -442,15 +443,24 @@ def build_scene_plan(
     `_get_unique_prompt`). Recibe el contexto de la escena + la biblia como
     `background_hint` y devuelve {"style","prompt"}. Así toda escena hereda
     la biblia (mundo/paleta/textura/cámara/motivo) → coherencia "mismo film".
+
+    `operator_movement`: si el operador eligió un movimiento que REDUCE la
+    cámara (estatico/sutil), se respeta en TODAS las escenas (override del
+    energy-derived). El bug 2026-06-19: el operador pedía "estático" pero las
+    escenas se movían igual porque el movimiento salía sólo de la energía de la
+    sección. Los modos de MÁS movimiento (estandar/animado/vacío) caen al
+    energy-derived, que ya da movimiento.
     """
     bible_text = _bible_to_prompt_fragment(bible)
+    _om = (operator_movement or "").strip().lower()
+    _forced_movement = _om if _om in ("estatico", "sutil") else None
     scenes: list[dict] = []
     seen: dict[str, dict] = {}
     for sec in sections:
         key = sec.recurrence_key
         if key in seen:
             continue
-        movement = energy_to_movement(sec.energy)
+        movement = _forced_movement or energy_to_movement(sec.energy)
         hint = _scene_hint(bible_text, sec)
         try:
             result = prompt_fn(
