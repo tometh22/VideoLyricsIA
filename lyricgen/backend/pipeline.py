@@ -6823,6 +6823,14 @@ def _generate_veo_video(prompt: str, output_path: str, job_id: str = None,
         "No text, no words, no letters, no signs, no billboards, no posters, "
         "no banners, no graffiti, no shop windows, no street signs, no neon "
         f"signs, no logos, no trademarks, no brand symbols,{_people_clause}"
+        # Anti-UI-de-cámara (incidente 2026-06-19, multi-escena "No Hay Santos"):
+        # la biblia "found footage / film viejo" hacía que Veo dibujara una
+        # interfaz de camcorder falsa — visor, indicador REC, timecode, texto de
+        # grabadora, un recuadro/botón en una esquina. Prohibido explícitamente.
+        " no camera viewfinder, no recording overlay, no REC indicator, no "
+        "timecode, no on-screen camera UI, no HUD, no camcorder interface, no "
+        "VHS overlay, no film-frame border graphic, no lens UI, no corner "
+        "buttons or icons,"
     )
     # Camera-motion negatives — the LAST line of defense for static intent.
     # Veo's payload exposes no structured camera-lock field, so these words
@@ -7690,7 +7698,10 @@ def _build_visual_bible(lyrics_text: str, artist: str, song_title: str = "",
             "environment family), palette (colors + lighting), texture (film stock/"
             "grain/lens feel), camera (the camera language), motif (one recurring "
             "visual element). Keep each value under 25 words. No people's faces, "
-            "no text/letters/logos in the described world."
+            "no text/letters/logos in the described world. The 'texture' is a film "
+            "stock / grain / color feel ONLY — never describe found-footage, "
+            "camcorder, VHS, viewfinder, or on-screen camera-UI aesthetics (they "
+            "make the AI render fake recording chrome over the scene)."
         )
         # Dirección del operador ("Mi prompt"): moldea TODA la biblia → multi-
         # escena respeta auto/letra/prompt igual que el fondo único. Verbatim =
@@ -7913,7 +7924,8 @@ def _generate_scene_background(segments: list[dict], audio_duration: float,
                                       concept, style_hint, custom_colors, job_id,
                                       allow_people)
     plan = _scenes.build_scene_plan(secs, bible, prompt_fn, artist=artist,
-                                    song_title=song_title, style=style_hint)
+                                    song_title=song_title, style=style_hint,
+                                    operator_movement=movement_style)
     clip_for_key = _generate_scene_clips(plan, job_dir, artist=artist,
                                          song_title=song_title, concept=concept,
                                          job_id=job_id, allow_people=allow_people)
