@@ -88,6 +88,26 @@ def drop_phantom_intro(rows: list[tuple[float, str]],
     pre-sings the chorus and Gemini transcribes it — a line isolated
     >12 s before the song's body, whose text repeats later (it IS the
     chorus). Rotor doesn't show it; neither do we. Pure."""
+    # CLUSTER pre-canción (gen-9): el dual-pass enriquece el pre-canto
+    # débil del público en VARIAS líneas (0.5/5/31s) — el drop línea-a-
+    # línea con gap>8s no lo caza. Regla general: la primera línea de
+    # texto ÚNICO (no se repite después = verso) marca el inicio real;
+    # todo lo anterior que se repita más adelante Y esté a >8s de ese
+    # inicio es pre-canto → fuera. Un tema que ARRANCA con su estribillo
+    # (gap <8s al cuerpo) no pierde nada.
+    def _repeats_later(idx):
+        ni = _norm(rows[idx][1])
+        return any(ni in _norm(r[1]) or _norm(r[1]) in ni
+                   for r in rows[idx + 1:])
+
+    first_unique = next((i for i in range(len(rows))
+                         if not _repeats_later(i)), 0)
+    if first_unique > 0:
+        body_ts = rows[first_unique][0]
+        keep = [r for i, r in enumerate(rows)
+                if i >= first_unique
+                or not (_repeats_later(i) and body_ts - r[0] > min_gap_s)]
+        rows = keep
     while len(rows) >= 2 and rows[1][0] - rows[0][0] > min_gap_s:
         n0 = _norm(rows[0][1])
         if any(n0 in _norm(r[1]) or _norm(r[1]) in n0 for r in rows[1:]):
