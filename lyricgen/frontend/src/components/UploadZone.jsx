@@ -358,7 +358,14 @@ export default function UploadZone({
   // Derive the current mode from that state, with a local override so the
   // operator can open "Mi prompt" before typing anything.
   const _hint = (batchDefaults.backgroundHint || "").trim();
-  const [sceneMode, setSceneMode] = useState(_hint ? "prompt" : (inspiredByLyrics ? "lyrics" : "auto"));
+  const [sceneMode, setSceneMode] = useState(
+    enableScenes ? "escenas" : (_hint ? "prompt" : (inspiredByLyrics ? "lyrics" : "auto"))
+  );
+  // Elegibilidad del add-on premium "Escenas" (multi-escena). Robusto: el
+  // backend manda vía features.scenes (admin OR SCENES_ENABLED_TENANTS), pero
+  // los admin siempre califican aunque la sesión cacheada no traiga el flag.
+  const scenesEligible = user?.features?.scenes === true || user?.role === "admin";
+  const [showScenesUpsell, setShowScenesUpsell] = useState(false);
   // Preview del fondo subido por el usuario (audit 2026-06-11): antes el
   // operador generaba a ciegas — el branch custom del preview era un
   // placeholder "Fondo subido". Object URL con revoke en cleanup; el guard
@@ -374,14 +381,24 @@ export default function UploadZone({
     return () => URL.revokeObjectURL(url);
   }, [backgroundFile]);
   const selectSceneMode = (m) => {
+    // "Escenas" es premium: si el usuario no califica, mostramos el upsell en
+    // vez de seleccionarlo (la card es visible para todos como novedad).
+    if (m === "escenas" && !scenesEligible) {
+      track("wizard.scenes_upsell");
+      setShowScenesUpsell(true);
+      return;
+    }
     track("wizard.scene_mode", { mode: m });
     setSceneMode(m);
+    // El modo "escenas" prende multi-escena; cualquier otro lo apaga.
+    onEnableScenesChange && onEnableScenesChange(m === "escenas");
     if (m === "auto") {
       onInspiredByLyricsChange && onInspiredByLyricsChange(false);
       if (_hint) updateBatchDefault("backgroundHint", "");   // stale prompt must not override
-    } else if (m === "lyrics") {
+    } else if (m === "lyrics" || m === "escenas") {
+      // Las escenas también nacen de la letra (heredan la biblia visual).
       onInspiredByLyricsChange && onInspiredByLyricsChange(true);
-      if (_hint) updateBatchDefault("backgroundHint", "");
+      if (_hint && m === "lyrics") updateBatchDefault("backgroundHint", "");
     }
     // prompt: leave inspired as-is; the textarea below drives it.
   };
@@ -2373,30 +2390,86 @@ export default function UploadZone({
                       { code: "auto",   icon: "✨", label: t("upload.mode_auto") || "Auto",                                 desc: t("upload.mode_auto_desc") || "La IA elige la escena por el género y el mood." },
                       { code: "lyrics", icon: "🎤", label: t("upload.inspired_by_lyrics_label") || "Inspirado en la letra", desc: t("upload.mode_lyrics_desc") || "El fondo nace de lo que dice la canción.", badge: t("upload.mode_edge") || "ÚNICO" },
                       { code: "prompt", icon: "✍️", label: t("upload.bg_prompt_label_short") || "Mi prompt",                desc: t("upload.mode_prompt_desc") || "Vos describís el fondo, con opción usar tal cual." },
+                      // Add-on premium "Escenas" (multi-escena). Siempre visible
+                      // (novedad/upsell del plan superior); desbloqueado sólo si
+                      // scenesEligible. Click sin acceso → modal de upsell.
+                      { code: "escenas", icon: "🎬", label: t("upload.mode_scenes") || "Escenas", desc: t("upload.mode_scenes_desc") || "Varias escenas con arco narrativo, no un fondo único.", premium: true },
                     ].map((m) => {
                       const sel = sceneMode === m.code;
+                      const locked = m.premium && !scenesEligible;
                       return (
                         <button
                           key={m.code}
                           type="button"
                           onClick={() => selectSceneMode(m.code)}
-                          className={`text-left rounded-card px-4 py-3 flex items-start gap-3 border transition-all duration-200 ${
+                          className={`relative text-left rounded-card px-4 py-3 flex items-start gap-3 border transition-all duration-200 ${
                             sel ? "border-transparent ring-1 ring-brand/50 bg-brand/[0.08] shadow-glow"
-                                : "border-white/[0.06] bg-surface-2/40 hover:border-white/[0.18]"
+                                : m.premium
+                                  ? "border-amber-400/25 bg-gradient-to-r from-amber-500/[0.06] to-transparent hover:border-amber-400/45"
+                                  : "border-white/[0.06] bg-surface-2/40 hover:border-white/[0.18]"
                           }`}
                         >
-                          <span className={`w-9 h-9 rounded-xl grid place-items-center text-[17px] shrink-0 ${sel ? "bg-brand" : "bg-surface-3"}`}>{m.icon}</span>
-                          <span className="min-w-0">
+                          <span className={`w-9 h-9 rounded-xl grid place-items-center text-[17px] shrink-0 ${
+                            sel ? "bg-brand" : m.premium ? "bg-amber-400/15" : "bg-surface-3"
+                          }`}>{m.icon}</span>
+                          <span className="min-w-0 flex-1">
                             <span className="flex items-center gap-2">
                               <span className={`text-[13px] font-semibold ${sel ? "text-white" : "text-gray-200"}`}>{m.label}</span>
                               {m.badge && <span className="text-[8px] font-bold tracking-[0.04em] px-1.5 py-0.5 rounded bg-accent/15 text-accent">{m.badge}</span>}
+                              {m.premium && (
+                                <span className="text-[8px] font-bold tracking-[0.04em] px-1.5 py-0.5 rounded bg-amber-400/15 text-amber-300">
+                                  {t("upload.premium_badge") || "PREMIUM"}
+                                </span>
+                              )}
                             </span>
                             <span className="block text-[11px] text-gray-500 mt-0.5 leading-snug">{m.desc}</span>
                           </span>
+                          {locked && (
+                            <span className="absolute top-2.5 right-3 text-[12px] text-amber-300/80" title={t("upload.scenes_locked") || "Plan superior"}>🔒</span>
+                          )}
                         </button>
                       );
                     })}
                   </div>
+
+                  {/* Upsell de Escenas: aparece al tocar la card sin acceso. */}
+                  {showScenesUpsell && (
+                    <div className="fixed inset-0 z-50 grid place-items-center bg-black/60 p-4" onClick={() => setShowScenesUpsell(false)}>
+                      <div className="w-full max-w-sm rounded-card bg-surface-2 ring-1 ring-amber-400/25 p-5 text-center" onClick={(e) => e.stopPropagation()}>
+                        <div className="text-[28px] mb-1">🎬</div>
+                        <h3 className="text-[15px] font-bold text-white flex items-center justify-center gap-2">
+                          {t("upload.mode_scenes") || "Escenas"}
+                          <span className="text-[8px] font-bold tracking-[0.04em] px-1.5 py-0.5 rounded bg-amber-400/15 text-amber-300">{t("upload.premium_badge") || "PREMIUM"}</span>
+                        </h3>
+                        <p className="text-[12px] text-gray-400 mt-2">
+                          {t("upload.scenes_upsell_body") || "Convertí tus videos en un conjunto de escenas con arco narrativo, en vez de un fondo único. Disponible en el plan superior."}
+                        </p>
+                        <div className="mt-4 flex gap-2 justify-center">
+                          <button onClick={() => setShowScenesUpsell(false)} className="text-[12px] font-medium px-3 py-1.5 rounded-lg bg-white/[0.04] hover:bg-white/[0.08] text-gray-300">
+                            {t("common.cancel") || "Cancelar"}
+                          </button>
+                          <button onClick={() => { track("wizard.scenes_upgrade_click"); setShowScenesUpsell(false); }} className="text-[12px] font-semibold px-3 py-1.5 rounded-lg bg-amber-400 hover:bg-amber-300 text-black">
+                            {t("upload.scenes_upsell_cta") || "Quiero mejorar mi plan"}
+                          </button>
+                        </div>
+                      </div>
+                    </div>
+                  )}
+
+                  {/* Explainer de Escenas (sólo cuando está activo). Refuerza el
+                      valor premium: arco narrativo, cortes musicales, rima del coro. */}
+                  {sceneMode === "escenas" && (
+                    <div className="rounded-card bg-gradient-to-br from-amber-500/[0.07] to-transparent ring-1 ring-amber-400/20 px-4 py-3">
+                      <p className="text-[12px] font-semibold text-amber-200 mb-1.5 flex items-center gap-1.5">
+                        🎬 {t("upload.scenes_on_title") || "Tu video tendrá varias escenas"}
+                      </p>
+                      <ul className="text-[11px] text-gray-400 space-y-1">
+                        <li>• {t("upload.scenes_b1") || "Una biblia visual compartida → todas parecen el mismo film."}</li>
+                        <li>• {t("upload.scenes_b2") || "Los cortes caen en los cambios de la canción (entra el coro, el puente)."}</li>
+                        <li>• {t("upload.scenes_b3") || "El coro vuelve siempre a la misma escena."}</li>
+                      </ul>
+                    </div>
+                  )}
 
                   {sceneMode === "prompt" ? (
                     <div className="rounded-card bg-surface-2/40 ring-1 ring-white/[0.04] px-4 py-3">
@@ -2525,33 +2598,6 @@ export default function UploadZone({
                           </div>
                         );
                       })()}
-
-                      {/* Escenas (multi-escena) — add-on premium. Sólo visible
-                          para usuarios elegibles (features.scenes). Convierte el
-                          fondo único en un conjunto de escenas con arco narrativo:
-                          una biblia visual compartida, cortes en límites musicales
-                          y el coro que vuelve siempre a la misma escena. */}
-                      {user?.features?.scenes && onEnableScenesChange && (
-                        <button
-                          type="button"
-                          onClick={() => { track("wizard.scenes", { enabled: !enableScenes }); onEnableScenesChange(!enableScenes); }}
-                          className={`w-full flex items-center gap-3 px-3 py-2.5 rounded-xl border text-left transition-all duration-200 mt-2 ${
-                            enableScenes ? "border-transparent ring-1 ring-brand/50 bg-brand/[0.08]" : "border-white/[0.06] hover:border-white/[0.16]"
-                          }`}
-                        >
-                          <span className="w-8 h-8 rounded-lg shrink-0 grid place-items-center text-[15px] bg-surface-3">🎬</span>
-                          <span className="flex-1">
-                            <span className={`block text-[12px] font-semibold ${enableScenes ? "text-white" : "text-gray-200"}`}>
-                              {t("upload.scenes_title") || "Escenas (multi-escena)"}
-                              <span className="ml-1.5 align-middle text-[9px] font-bold uppercase tracking-wide text-brand bg-brand/15 rounded px-1 py-0.5">Premium</span>
-                            </span>
-                            <span className="block text-[10px] text-gray-500">{t("upload.scenes_desc") || "Varias escenas con arco narrativo en vez de un fondo único"}</span>
-                          </span>
-                          <span className={`shrink-0 w-9 h-5 rounded-full transition-colors relative ${enableScenes ? "bg-brand" : "bg-white/10"}`}>
-                            <span className={`absolute top-0.5 w-4 h-4 rounded-full bg-white transition-all ${enableScenes ? "left-[18px]" : "left-0.5"}`} />
-                          </span>
-                        </button>
-                      )}
                     </div>
                   )}
                 </>
