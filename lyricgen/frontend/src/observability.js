@@ -54,6 +54,18 @@ export function consoleTagOf(message) {
 const _TAG_THROTTLE_MS = 60_000;
 const _lastSentByTag = new Map();
 
+// Tags that signal a UI freeze / render-storm (P0 UMG Chile 2026-06-16). These
+// escalate to `error` level in beforeSend so Sentry's replaysOnErrorSampleRate
+// (1.0) records a Session Replay of the moment — a watchable clip of the freeze
+// instead of just a counter. Everything else stays `warning` (no replay).
+const _FREEZE_TAGS = new Set([
+  "ui-freeze",
+  "reseed-storm",
+  "render-storm",
+  "editor-reload-loop",
+  "ui-longtask-burst",
+]);
+
 /** Decide si un mensaje de consola se forwardea. Exportado para tests. */
 export function shouldForwardConsoleEvent(message, now = Date.now()) {
   const tag = consoleTagOf(message);
@@ -117,7 +129,12 @@ export function initSentry() {
         const { forward, tag } = shouldForwardConsoleEvent(msg);
         if (!forward) return null;
         event.fingerprint = ["console-tag", tag];
-        event.level = "warning";
+        // Freeze/storm diagnostics escalate to `error` so replaysOnErrorSampleRate
+        // (1.0) records a Session Replay of the ~60s leading up to the freeze —
+        // turning the operator's "se traba / titila" into a watchable clip with
+        // the exact action sequence (P0 UMG Chile 2026-06-16). Other tagged
+        // diagnostics stay `warning` (no replay, saves quota).
+        event.level = _FREEZE_TAGS.has(tag) ? "error" : "warning";
         return event;
       },
       // Don't send PII in default events. We send tenant_id and role

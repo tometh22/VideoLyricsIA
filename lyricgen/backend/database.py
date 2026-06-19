@@ -408,6 +408,15 @@ class Job(Base):
     render_params = Column(JSONB, nullable=True)
     edit_count = Column(Integer, default=0, nullable=False, server_default="0")
     bg_r2_key_cached = Column(Text, nullable=True)
+    # Add-on premium "Escenas" (multi-escena). Storyboard generado por
+    # scenes.build_scene_plan: { bible:{...}, sections:[...], scenes:[{ id,
+    # recurrence_key, section_type, energy, movement_style, prompt,
+    # bg_cache_key, clip_path, status }], params:{...} }. NULL = job de fondo
+    # único (camino histórico). El toggle de opt-in vive en render_params
+    # ("enable_scenes": true) porque es un setting de render, no un deliverable.
+    # Las keys de clip por escena viven DENTRO de scene_plan (extiende el
+    # concepto de bg_r2_key_cached, que es un único fondo).
+    scene_plan = Column(JSONB, nullable=True)
     # Variantes: cuando este job fue creado via POST /jobs/{id}/variant,
     # parent_job_id apunta al job_id que sirvió de base (mismo audio +
     # mismo segments_json, distinto Veo prompt / concept / style).
@@ -495,6 +504,10 @@ class Job(Base):
             # then rejects with a raw English error.
             "segments_json": self.segments_json,
             "bg_r2_key_cached": self.bg_r2_key_cached,
+            # Storyboard multi-escena (NULL en jobs de fondo único). El panel
+            # de edición lo usa para mostrar las escenas y ofrecer "regenerar
+            # escena" sin rehacer todo el video.
+            "scene_plan": self.scene_plan,
             # Lineage de variantes — el JobDetail muestra un pill "Variante
             # de X" cuando este field está set. variant_count se calcula
             # en el handler (query separada para evitar lazy load N+1).

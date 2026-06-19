@@ -63,6 +63,7 @@ from auth import (
     validate_password_strength,
     has_prores_access,
     has_drive_access,
+    has_scenes_access,
     telemetry_enabled,
     generate_api_key,
     is_super_admin,
@@ -1155,6 +1156,7 @@ async def login(body: LoginRequest, request: Request, db: Session = Depends(get_
             "allow_overage": getattr(user, "allow_overage", False) or False,
             "features": {
                 "prores_export": has_prores_access(user),
+                "scenes": has_scenes_access(user),
                 "telemetry": telemetry_enabled(),
             },
         },
@@ -1253,6 +1255,7 @@ async def register(body: RegisterRequest, request: Request, db: Session = Depend
             "allow_overage": getattr(user, "allow_overage", False) or False,
             "features": {
                 "prores_export": has_prores_access(user),
+                "scenes": has_scenes_access(user),
                 "telemetry": telemetry_enabled(),
             },
         },
@@ -4108,6 +4111,9 @@ async def upload(
     background_hint: str = Form("", max_length=2000),
     bg_verbatim: bool = Form(False),
     custom_colors: str = Form("", max_length=200),
+    # Add-on premium "Escenas" (multi-escena). Parity con /generate; la
+    # elegibilidad se valida con has_scenes_access antes de forwardear.
+    enable_scenes: bool = Form(False),
     # Title-card customization (Full Rotor v1). Defaults = historical look.
     title_template: str = Form("auto", max_length=16),
     title_size: str = Form("1.0", max_length=8),
@@ -4298,6 +4304,8 @@ async def upload(
         background_hint=(background_hint.strip() or None),
         bg_verbatim=bg_verbatim,
         custom_colors=(custom_colors.strip() or ""),
+        # Escenas (multi-escena): opt-in AND elegibilidad real (parity /generate).
+        enable_scenes=bool(enable_scenes) and has_scenes_access(current_user),
         title_template=title_template if title_template in ("auto", "centered", "lower_third", "badge") else "auto",
         title_size=_clamp_title_size(title_size),
         title_artist_font=(title_artist_font.strip() or ""),
@@ -6637,6 +6645,11 @@ async def generate_with_segments(
     background_hint: str = Form("", max_length=2000),
     bg_verbatim: bool = Form(False),
     custom_colors: str = Form("", max_length=200),
+    # Add-on premium "Escenas" (multi-escena). Opt-in del operador en el
+    # wizard. La ELEGIBILIDAD se chequea contra has_scenes_access ANTES de
+    # forwardearlo al pipeline (un usuario sin acceso que mande el flag igual
+    # cae al fondo único). Default False = comportamiento histórico.
+    enable_scenes: bool = Form(False),
     # Capa C 2026-05-24: si el operador hizo pre-gen via /generate-preview
     # mientras editaba lyrics, este field contiene el hash que mapea al
     # background pre-cacheado en R2. La pipeline lo reusa antes de llamar
@@ -6936,6 +6949,10 @@ async def generate_with_segments(
         # Si el cache hit, _ensure_background se skip y el job ahorra
         # ~60-180s + $0.80-3.20 de cuota Veo. Vacío = flow tradicional.
         bg_cache_key=(bg_cache_key.strip() or None),
+        # Escenas (multi-escena): opt-in del operador AND elegibilidad real.
+        # Si el flag llega pero el usuario no tiene acceso, se ignora (fondo
+        # único) — el gate de feature vive en el backend, no en el form.
+        enable_scenes=bool(enable_scenes) and has_scenes_access(current_user),
         title_template=title_template if title_template in ("auto", "centered", "lower_third", "badge") else "auto",
         title_size=_clamp_title_size(title_size),
         title_artist_font=(title_artist_font.strip() or ""),
@@ -9186,6 +9203,174 @@ async def request_edit(
     }
 
 
+class RegenerateSceneRequest(BaseModel):
+    """Body de POST /jobs/{job_id}/scenes/{recurrence_key}/regenerate.
+
+    Sin campos = "otra toma" (mismo prompt, semilla nueva → otra versión).
+    `prompt` reemplaza el prompt de la escena; `hint` lo re-deriva heredando la
+    biblia. `movement_style` ∈ estatico|sutil|dinamico."""
+    prompt: str | None = Field(default=None, max_length=2000)
+    hint: str | None = Field(default=None, max_length=2000)
+    movement_style: str | None = Field(default=None, max_length=16)
+    allow_youtube_drift: bool = False
+
+
+@app.post("/jobs/{job_id}/scenes/{recurrence_key}/regenerate")
+async def regenerate_scene(
+    job_id: str,
+    recurrence_key: str,
+    body: RegenerateSceneRequest | None = None,
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Regenera UNA escena del fondo multi-escena y re-renderiza el video.
+
+    Cuesta ~1 clip Veo (~US$0.90) y cuenta como un edit. Sólo la escena pedida
+    toca Veo; las demás re-bajan de la caché R2. Si la escena es recurrente (un
+    coro), regenerarla cambia TODAS sus apariciones (el frontend lo confirma).
+    """
+    from pipeline import _MAX_EDITS
+    from database import Job as JobModel, AuditLog
+
+    body = body or RegenerateSceneRequest()
+    if not has_scenes_access(current_user):
+        raise HTTPException(status_code=403, detail="Escenas no habilitado para esta cuenta.")
+
+    # Row-lock para serializar el read-validate-write de edit_count (igual que
+    # /edit: dos regen del mismo job no deben saltar el cap ni cobrar Veo extra).
+    job = (
+        db.query(JobModel)
+        .filter(JobModel.job_id == job_id)
+        .filter(JobModel.tenant_id == current_user["tenant_id"])
+        .with_for_update()
+        .first()
+    )
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+
+    plan = job.scene_plan if isinstance(job.scene_plan, dict) else None
+    if not plan or not plan.get("scenes"):
+        raise HTTPException(status_code=400, detail="Este job no es multi-escena.")
+    if not any(s.get("recurrence_key") == recurrence_key for s in plan["scenes"]):
+        raise HTTPException(status_code=404, detail=f"Escena '{recurrence_key}' no existe en este job.")
+
+    # Estado: la corrección de escena es un arreglo post-hoc, así que se admite
+    # en videos terminados/en revisión (igual criterio que lyrics/metadata).
+    allowed = ("done", "pending_review", "rejected")
+    if job.status not in allowed:
+        raise HTTPException(
+            status_code=400,
+            detail=f"La escena se puede regenerar con el job done, pending_review o rejected (actual: {job.status}).",
+        )
+
+    # YouTube ya publicado: re-renderizar cambia el archivo en la plataforma
+    # pero NO reemplaza el video de YouTube. Fail-closed salvo override.
+    if job.youtube_data and not body.allow_youtube_drift:
+        yt_url = job.youtube_data.get("url") if isinstance(job.youtube_data, dict) else None
+        raise HTTPException(status_code=409, detail={
+            "code": "youtube_already_published",
+            "message": ("El job ya está publicado en YouTube. Regenerar la escena actualiza "
+                        "el archivo acá pero NO reemplaza el video de YouTube. Pasá "
+                        "allow_youtube_drift=true para continuar."),
+            "youtube_url": yt_url,
+        })
+
+    current_edit_count = job.edit_count or 0
+    _is_admin = current_user.get("role") == "admin"
+    if not _is_admin and current_edit_count >= _MAX_EDITS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Llegaste al máximo de ediciones ({_MAX_EDITS}). Aprobá o rechazá el job.",
+        )
+    if not job.input_r2_key:
+        raise HTTPException(status_code=422, detail="Audio original no disponible — no se puede re-renderizar.")
+
+    _mv = (body.movement_style or "").strip()
+    edit_params = {
+        "scene_key": recurrence_key,
+        "scene_prompt": (body.prompt or "").strip(),
+        "scene_hint": (body.hint or "").strip(),
+        "scene_movement": _mv if _mv in ("estatico", "sutil", "dinamico") else "",
+    }
+
+    new_edit_count = current_edit_count + 1
+    job.status = "editing"
+    job.edit_count = new_edit_count
+    job.current_step = "scenes"
+    job.progress = 0
+    job.editing_started_at = datetime.now(timezone.utc)
+    db.add(AuditLog(
+        user_id=current_user["id"],
+        action="job.scene_regenerate",
+        detail={"job_id": job_id, "recurrence_key": recurrence_key,
+                "edit_params": edit_params, "edit_count": new_edit_count},
+    ))
+    db.commit()
+
+    try:
+        enqueue_edit(
+            job_id=job_id,
+            edit_type="scene",
+            edit_params=edit_params,
+            plan=current_user.get("plan", "100"),
+            tenant_id=current_user.get("tenant_id", ""),
+        )
+    except Exception as exc:
+        logger.error("enqueue_edit (scene) failed for %s: %s", job_id, exc)
+        job.status = "pending_review"
+        job.edit_count = current_edit_count
+        job.editing_started_at = None
+        job.progress = 100
+        job.current_step = "thumbnail"
+        db.commit()
+        raise HTTPException(status_code=503, detail="No se pudo encolar la regeneración. Reintentá.")
+
+    return {
+        "ok": True,
+        "job_id": job_id,
+        "recurrence_key": recurrence_key,
+        "edit_count": new_edit_count,
+        "edits_remaining": max(0, _MAX_EDITS - new_edit_count),
+        "edit_limit_exempt": _is_admin,
+    }
+
+
+@app.get("/jobs/{job_id}/scenes/thumbs")
+async def get_scene_thumbnails(
+    job_id: str,
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """URLs firmadas (R2, 1h) de los pósters de todas las escenas, en una sola
+    llamada autenticada. El frontend las pone directo en <img src> (las URLs
+    firmadas no necesitan header). Devuelve {recurrence_key: url} sólo para las
+    escenas que tienen thumb_key."""
+    from database import Job as JobModel
+
+    job = (
+        db.query(JobModel)
+        .filter(JobModel.job_id == job_id)
+        .filter(JobModel.tenant_id == current_user["tenant_id"])
+        .first()
+    )
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+    plan = job.scene_plan if isinstance(job.scene_plan, dict) else None
+    out: dict[str, str] = {}
+    if plan and storage.is_enabled():
+        for s in plan.get("scenes", []):
+            tk = s.get("thumb_key")
+            key = s.get("recurrence_key")
+            if tk and key:
+                try:
+                    u = storage.generate_signed_url(tk, expiry_seconds=3600)
+                    if u:
+                        out[key] = u
+                except Exception as _e:  # noqa: BLE001
+                    logger.warning("[SCENES] firma de thumb %s falló: %s", key, _e)
+    return {"thumbs": out}
+
+
 @app.post("/enable-prores/{job_id}")
 async def enable_prores_for_job(
     job_id: str,
@@ -9658,7 +9843,12 @@ async def retry_job(
               "title_artist_font", "title_song_font",
               # UI v1.1 (2026-05-30): manual song split. Inheritable so
               # a retry/variant respects the operator's chosen break.
-              "title_song_break"):
+              "title_song_break",
+              # Escenas (multi-escena): heredable, así un retry de un job
+              # multi-escena vuelve a armar las escenas en vez de caer al
+              # fondo único. Persistido por pipeline en render_params cuando
+              # el render corre con enable_scenes=True.
+              "enable_scenes"):
         if k in _retry_render_params and _retry_render_params[k] not in (None, ""):
             retry_pipeline_kwargs[k] = _retry_render_params[k]
 

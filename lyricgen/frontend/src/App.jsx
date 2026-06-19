@@ -639,6 +639,25 @@ function EditingNotEditablePanel({ jobId, jobStatus, isRendering, onBack, t }) {
         // EditLyricsRoute corra su bootstrap de nuevo y monte el editor.
         const editable = ["done", "pending_review", "rejected"].includes(newStatus);
         if (editable) {
+          // [editor-reload-loop] capture (P0 UMG Chile 2026-06-16). This reload
+          // re-runs EditLyricsRoute's bootstrap. If the job keeps flipping back
+          // to a rendering/editing status (so this panel re-mounts and reloads
+          // again), the page reloads on a ~5s cadence — looks like the editor
+          // "freezing and re-laying-out in a loop". Count reloads per job in
+          // sessionStorage; a burst means we found the cycle.
+          try {
+            const k = `editreload:${jobId}`;
+            const prev = JSON.parse(sessionStorage.getItem(k) || "null");
+            const now = Date.now();
+            const recent = prev && now - prev.first < 60000 ? prev.count + 1 : 1;
+            sessionStorage.setItem(k, JSON.stringify({ first: recent === 1 ? now : prev.first, count: recent }));
+            if (recent >= 3) {
+              // eslint-disable-next-line no-console
+              console.warn("[editor-reload-loop] job reloaded the editor repeatedly", {
+                jobId, reloadsInWindow: recent, fromStatus: jobStatus, toStatus: newStatus,
+              });
+            }
+          } catch { /* sessionStorage unavailable — proceed with the reload */ }
           window.location.reload();
         }
       } catch {
@@ -1117,6 +1136,10 @@ export default function App() {
   const [style, setStyle] = useState("auto");
   // Custom palette (hex/names, comma-sep) used when style === "custom".
   const [customColors, setCustomColors] = useState("");
+  // Add-on premium "Escenas" (multi-escena): decisión global de look para el
+  // batch, igual que `style`. El toggle sólo se muestra a usuarios elegibles
+  // (user.features.scenes); el backend re-valida has_scenes_access igual.
+  const [enableScenes, setEnableScenes] = useState(false);
 
   const [reviewQueue, setReviewQueue] = useState([]);
   const [currentReview, setCurrentReview] = useState(null);
@@ -1342,7 +1365,7 @@ export default function App() {
     // when the effect re-runs to coalesce rapid mutations.
     const snapshot = {
       files, approvedJobs, currentReview, reviewQueue, wizardStage,
-      style, customColors, delivery, backgroundId, backgroundMode,
+      style, customColors, enableScenes, delivery, backgroundId, backgroundMode,
       bgSelectMode, animateImage, inspiredByLyrics,
     };
     const schedule = typeof requestIdleCallback !== "undefined"
@@ -1357,7 +1380,7 @@ export default function App() {
     return () => cancel(id);
   }, [
     files, approvedJobs, currentReview, reviewQueue, wizardStage,
-    style, customColors, delivery, backgroundId, backgroundMode,
+    style, customColors, enableScenes, delivery, backgroundId, backgroundMode,
     bgSelectMode, animateImage, inspiredByLyrics,
     resumableWizard,
   ]);
@@ -1497,6 +1520,7 @@ export default function App() {
       if (snap.topLevel) {
         if (snap.topLevel.style != null) setStyle(snap.topLevel.style);
         if (snap.topLevel.customColors != null) setCustomColors(snap.topLevel.customColors);
+        if (snap.topLevel.enableScenes != null) setEnableScenes(!!snap.topLevel.enableScenes);
         if (snap.topLevel.delivery) setDelivery(snap.topLevel.delivery);
         if (snap.topLevel.backgroundId != null) setBackgroundId(snap.topLevel.backgroundId);
         if (snap.topLevel.backgroundMode != null) setBackgroundMode(snap.topLevel.backgroundMode);
@@ -2849,6 +2873,8 @@ export default function App() {
           formData.append("background_hint", jobList[i].backgroundHint.trim());
           if (jobList[i].bgVerbatim) formData.append("bg_verbatim", "true");
         }
+        // Escenas (multi-escena): el backend re-valida elegibilidad.
+        if (enableScenes) formData.append("enable_scenes", "true");
         formData.append("text_case", jobList[i].textCase || "upper");
         formData.append("font_scale", String(jobList[i].fontScale || "1.0"));
         // lyric_transition + text_motion: deprecados 2026-05-23 (no se envían).
@@ -2992,6 +3018,8 @@ export default function App() {
           generateBody.append("background_hint", jobList[i].backgroundHint.trim());
           if (jobList[i].bgVerbatim) generateBody.append("bg_verbatim", "true");
         }
+        // Escenas (multi-escena): el backend re-valida elegibilidad.
+        if (enableScenes) generateBody.append("enable_scenes", "true");
         generateBody.append("text_case", jobList[i].textCase || "upper");
         generateBody.append("font_scale", String(jobList[i].fontScale || "1.0"));
         // lyric_transition + text_motion: deprecados 2026-05-23 (no se envían).
@@ -3548,6 +3576,8 @@ export default function App() {
         onStyleChange={setStyle}
         customColors={customColors}
         onCustomColorsChange={setCustomColors}
+        enableScenes={enableScenes}
+        onEnableScenesChange={setEnableScenes}
         backgroundFile={backgroundFile}
         onBackgroundFile={setBackgroundFile}
         backgroundId={backgroundId}
