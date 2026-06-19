@@ -6756,7 +6756,8 @@ def _generate_veo_video(prompt: str, output_path: str, job_id: str = None,
                         normalized_concept: str = "",
                         high_fidelity: bool = False,
                         allow_people: bool = False,
-                        verbatim: bool = False) -> str:
+                        verbatim: bool = False,
+                        cache_only: bool = False) -> str:
     """Generate a video clip with Google Veo 3 via direct Vertex AI REST API.
 
     We bypass google-genai SDK for Veo specifically because its internal auth
@@ -6975,6 +6976,25 @@ def _generate_veo_video(prompt: str, output_path: str, job_id: str = None,
         prompt=safe_prompt,
         input_data_types=["generated_prompt"],
     ) if job_id else None
+
+    # cache_only (multi-escena regen): SÓLO servir de caché, NUNCA generar
+    # fresco. Garantiza que regenerar UNA escena no re-cobre las otras N: si su
+    # clip no está cacheado, levantamos y el caller degrada (reusa otro clip) en
+    # vez de pagar Veo. Sin esto, un cache miss en una regen re-facturaba todo.
+    if cache_only:
+        if (_storage.is_enabled() and _storage.object_exists(cache_object_key)
+                and _storage.download_object(cache_object_key, output_path)):
+            size_mb = os.path.getsize(output_path) / 1024 / 1024
+            logger.info("[BG] Veo cache HIT (cache_only, %s): %.1f MB", cache_key_hash, size_mb)
+            if recorder:
+                recorder.finish(response_summary=f"cache_hit(cache_only): {size_mb:.1f}MB key={cache_key_hash}",
+                                output_artifact=output_path)
+            return output_path
+        if recorder:
+            recorder.finish(response_summary=f"cache_only_miss: key={cache_key_hash}")
+        raise RuntimeError(
+            f"[BG] cache_only: sin clip cacheado ({cache_key_hash}) — no se genera "
+            "para no re-cobrar Veo en una regeneración de escena")
 
     if _storage.is_enabled() and _storage.object_exists(cache_object_key):
         if _storage.download_object(cache_object_key, output_path):
@@ -7795,12 +7815,13 @@ def _generate_scene_clips(scene_plan: dict, job_dir: str, *, artist: str,
       escenas distintas no colisionan, los coros recurrentes (1 escena) pegan
       caché, y una escena regenerada (token nuevo) genera fresco mientras las
       otras re-bajan su caché sin costo.
-    - `only_keys`: si se pasa, sólo se (re)generan esas escenas vía Veo; el resto
-      se re-baja de la caché R2 igual (mismo prompt+token → cache HIT). Sirve al
-      re-stitch de un edit: la target genera fresca, las demás bajan de caché.
-    - Degradación elegante: si una escena falla, reusa el primer clip exitoso en
-      vez de tumbar el video. Si NINGUNA generó, levanta para que el caller caiga
-      al fondo único.
+    - `only_keys`: si se pasa, SÓLO esas escenas pueden generar fresco en Veo;
+      el resto va `cache_only=True` → se sirven de la caché R2 o se degradan,
+      pero NUNCA re-cobran. Garantía de costo del regen: regenerar 1 escena no
+      puede facturar las otras N aunque la caché falle (antes sí podía).
+    - Degradación elegante: si una escena falla (incl. cache_only miss), reusa el
+      primer clip exitoso en vez de tumbar el video. Si NINGUNA generó, levanta
+      para que el caller caiga al fondo único.
     """
     import veo_breaker
     if veo_breaker.is_open():
@@ -7813,6 +7834,9 @@ def _generate_scene_clips(scene_plan: dict, job_dir: str, *, artist: str,
         if key in clip_for_key:
             continue
         clip_path = os.path.join(job_dir, f"bg_scene_{key}.mp4")
+        # En un regen (only_keys set), las escenas NO-target son cache_only:
+        # se sirven de caché o se degradan, nunca pagan Veo de nuevo.
+        _cache_only = only_keys is not None and key not in only_keys
         try:
             _generate_veo_video(
                 scene["prompt"], clip_path, job_id=job_id,
@@ -7820,6 +7844,7 @@ def _generate_scene_clips(scene_plan: dict, job_dir: str, *, artist: str,
                 movement_style=scene.get("movement_style", ""),
                 normalized_concept=_normalize_concept(concept),
                 allow_people=allow_people,
+                cache_only=_cache_only,
             )
             if not os.path.exists(clip_path):
                 raise RuntimeError("clip no escrito")

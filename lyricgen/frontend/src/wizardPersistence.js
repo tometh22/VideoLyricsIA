@@ -78,6 +78,9 @@ export function save({
   bgSelectMode,
   animateImage,
   inspiredByLyrics,
+  // Add-on premium "Escenas" (multi-escena). Sin esto el toggle se perdía en
+  // un refresh/remount → el job se degradaba a fondo único en silencio.
+  enableScenes,
 }) {
   try {
     const payload = {
@@ -99,6 +102,7 @@ export function save({
         bgSelectMode: bgSelectMode || null,
         animateImage: !!animateImage,
         inspiredByLyrics: inspiredByLyrics !== false,
+        enableScenes: !!enableScenes,
       },
     };
     sessionStorage.setItem(KEY, JSON.stringify(payload));
