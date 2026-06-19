@@ -851,6 +851,13 @@ def run_pipeline(job_id: str, mp3_path: str, artist: str, style: str,
                      background_path.lower().endswith((".jpg", ".jpeg", ".png")))
         _animate_user_image = bool(animate_image and _is_still)
 
+        # P0 fix 2026-06-19: _scenes_active se usa SIEMPRE en el render
+        # (bg_prelooped=_scenes_active) pero antes sólo se inicializaba dentro de
+        # la rama de fondo IA (el else de abajo). Con un fondo humano/library la
+        # variable quedaba sin asignar → UnboundLocalError tumbaba TODO job de
+        # fondo no-IA (incl. los golden renders). Inicializar acá, incondicional.
+        _scenes_active = False
+
         if background_path and not _animate_user_image:
             # Human-provided background — skip AI generation (UMG Guideline 10)
             from provenance import record_ai_call
