@@ -1,0 +1,219 @@
+"""Unit tests for post_reconcile helpers."""
+
+from post_reconcile import (
+    _is_adlib_loop,
+    _split_adlib_by_time,
+    _split_at_word_gaps,
+    post_reconcile_cleanup,
+    ADLIB_MIN_DUR,
+    ADLIB_CHUNK_DUR,
+    LONG_LINE_MIN_WORDS,
+    LONG_LINE_MIN_DUR,
+    LONG_LINE_GAP_THRESH,
+    STRETCH_GAP_THRESH,
+    STRETCH_MARGIN,
+)
+
+
+def _w(word, start, end=None):
+    return {"word": word, "start": start, "end": (end or start + 0.3)}
+
+
+def _seg(text, start, end, words=None):
+    s = {"text": text, "start": start, "end": end}
+    if words is not None:
+        s["words"] = words
+    return s
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# _split_adlib_by_time
+# ──────────────────────────────────────────────────────────────────────────────
+
+def test_adlib_chunker_splits_26s_block():
+    """The archetypal 'No Hay Santos' pattern: one 26-second uh-block."""
+    words = [_w("uh", 69.04 + i * 1.87) for i in range(14)]
+    words.append(_w("uh-oh-oh-oh-oh-oh-oh", 94.2, 95.22))
+    seg = _seg("Uh, uh, uh, uh, uh, uh, uh, uh, uh, uh, uh, uh, uh, uh., uh-oh-oh-oh-oh-oh-oh",
+               69.04, 95.22, words)
+    chunks = _split_adlib_by_time(seg, words)
+    assert len(chunks) >= 4, f"expected ≥4 chunks, got {len(chunks)}"
+    # Each chunk should be roughly ADLIB_CHUNK_DUR long (within 2.5×).
+    for c in chunks:
+        dur = c["end"] - c["start"]
+        assert dur < ADLIB_CHUNK_DUR * 2.5, f"chunk too long: {dur:.1f}s"
+    # No timing overlaps.
+    for i in range(len(chunks) - 1):
+        assert chunks[i]["end"] <= chunks[i + 1]["start"] + 0.01
+    # Total span preserved.
+    assert chunks[0]["start"] == seg["start"]
+    assert chunks[-1]["end"] == seg["end"]
+
+
+def test_adlib_chunker_no_words_falls_back_to_equal_split():
+    seg = _seg("uh uh uh uh uh uh uh uh uh uh", 70.0, 90.0, words=None)
+    chunks = _split_adlib_by_time(seg, [])
+    assert len(chunks) >= 4
+    assert all(c["text"] == seg["text"] for c in chunks)
+
+
+def test_adlib_chunker_short_segment_not_split():
+    """A 4-second ad-lib block should stay as-is (< ADLIB_MIN_DUR)."""
+    words = [_w("uh", 70.0 + i * 0.5) for i in range(8)]
+    seg = _seg("uh uh uh uh uh uh uh uh", 70.0, 74.0, words)
+    # The post_reconcile_cleanup gate would not call the splitter here,
+    # but verify the splitter itself still returns a reasonable count.
+    chunks = _split_adlib_by_time(seg, words)
+    # 4 seconds / 3.5 chunk ≈ 1-2 chunks — should not over-fragment.
+    assert len(chunks) <= 2
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# _split_at_word_gaps
+# ──────────────────────────────────────────────────────────────────────────────
+
+def test_gap_splitter_two_phrases():
+    """'Iluminados por el fuego | que dejaste arder' with 0.8s gap."""
+    words = [
+        _w("iluminados", 17.0, 17.6),
+        _w("por", 17.6, 17.8),
+        _w("el", 17.8, 17.9),
+        _w("fuego", 17.9, 18.4),      # 0.8s gap after here
+        _w("que", 19.2, 19.4),
+        _w("dejaste", 19.4, 19.9),
+        _w("arder", 19.9, 20.5),
+    ]
+    seg = _seg("Iluminados por el fuego que dejaste arder", 17.0, 22.34, words)
+    parts = _split_at_word_gaps(seg, words)
+    assert len(parts) == 2
+    assert parts[0]["text"] == "Iluminados por el fuego"
+    assert parts[1]["text"] == "que dejaste arder"
+    assert parts[0]["end"] == words[3]["end"]    # ends at "fuego"
+    assert parts[1]["start"] == words[4]["start"]  # starts at "que"
+
+
+def test_gap_splitter_three_phrases():
+    """'Como tantos vas | buscando las respuestas | que nada te responden.'"""
+    words = [
+        _w("como", 41.06, 41.3),
+        _w("tantos", 41.3, 41.8),
+        _w("vas", 41.8, 42.1),         # 0.8s gap
+        _w("buscando", 42.9, 43.5),
+        _w("las", 43.5, 43.7),
+        _w("respuestas", 43.7, 44.4),  # 0.8s gap
+        _w("que", 45.2, 45.4),
+        _w("nada", 45.4, 45.7),
+        _w("te", 45.7, 45.9),
+        _w("responden", 45.9, 46.5),
+    ]
+    seg = _seg("Como tantos vas buscando las respuestas que nada te responden.",
+               41.06, 48.34, words)
+    parts = _split_at_word_gaps(seg, words)
+    assert len(parts) == 3
+    assert parts[0]["text"] == "Como tantos vas"
+    assert parts[1]["text"] == "buscando las respuestas"
+    assert "que nada te responden" in parts[2]["text"]
+
+
+def test_gap_splitter_no_gap_returns_original():
+    words = [
+        _w("hola", 1.0, 1.3),
+        _w("como", 1.3, 1.6),
+        _w("estas", 1.6, 1.9),
+        _w("che", 1.9, 2.2),
+        _w("amigo", 2.2, 2.6),
+        _w("mio", 2.6, 2.9),
+        _w("querido", 2.9, 3.3),
+    ]
+    seg = _seg("hola como estas che amigo mio querido", 1.0, 3.5, words)
+    parts = _split_at_word_gaps(seg, words)  # max gap = 0.0s between tight words
+    assert len(parts) == 1
+    assert parts[0] is seg
+
+
+def test_gap_splitter_too_few_words():
+    words = [_w("hola", 1.0), _w("mundo", 1.5)]
+    seg = _seg("hola mundo", 1.0, 2.0, words)
+    assert _split_at_word_gaps(seg, words) == [seg]
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# post_reconcile_cleanup (full pipeline)
+# ──────────────────────────────────────────────────────────────────────────────
+
+def test_cleanup_splits_adlib_mega_block():
+    words = [_w("uh", 69.04 + i * 1.87) for i in range(14)]
+    words.append(_w("uh-oh-oh-oh-oh-oh-oh", 94.2, 95.22))
+    mega = _seg("Uh, uh, uh, uh, uh, uh, uh, uh, uh, uh, uh, uh, uh, uh., uh-oh-oh-oh-oh-oh-oh",
+                69.04, 95.22, words)
+    normal = _seg("Tomas del miedo tu don", 102.011, 105.511,
+                  [_w("tomas", 102.011), _w("del", 102.3), _w("miedo", 102.6),
+                   _w("tu", 103.0), _w("don", 103.3, 103.7)])
+    out = post_reconcile_cleanup([mega, normal])
+    assert len(out) > 2, "mega-block should have been split"
+    # Normal segment preserved.
+    assert out[-1]["text"] == "Tomas del miedo tu don"
+
+
+def test_cleanup_splits_merged_phrases():
+    words = [
+        _w("iluminados", 17.0, 17.6), _w("por", 17.6, 17.8),
+        _w("el", 17.8, 17.9), _w("fuego", 17.9, 18.4),
+        _w("que", 19.2, 19.4), _w("dejaste", 19.4, 19.9),
+        _w("arder", 19.9, 20.5),
+    ]
+    merged = _seg("Iluminados por el fuego que dejaste arder", 17.0, 22.34, words)
+    short = _seg("¿Para qué?", 24.3, 25.02,
+                 [_w("para", 24.3), _w("que", 24.6)])
+    out = post_reconcile_cleanup([merged, short])
+    assert len(out) == 3  # merged → 2 parts + short stays as 1
+    assert out[0]["text"] == "Iluminados por el fuego"
+    assert out[1]["text"] == "que dejaste arder"
+    assert out[2]["text"] == "¿Para qué?"
+
+
+def test_cleanup_does_not_split_normal_segments():
+    segs = [
+        _seg("¿Para qué?", 57.12, 58.57,
+             [_w("para", 57.12), _w("que", 57.5)]),
+        _seg("¿Para qué tus santos de papel?", 26.08, 29.22,
+             [_w("para", 26.08), _w("que", 26.4), _w("tus", 26.7),
+              _w("santos", 26.9), _w("de", 27.3), _w("papel", 27.5)]),
+    ]
+    out = post_reconcile_cleanup(segs)
+    assert len(out) == len(segs), "normal segments must not be split"
+
+
+def test_stretch_trimmer_real_pattern():
+    """Realistic pattern: Whisper extends 'papel' from 28s to 33.5s, next seg at 36.1s."""
+    seg_a = _seg("Para qué tus santos de papel", 26.08, 33.5,
+                 [_w("para", 26.08), _w("que", 26.4), _w("tus", 26.7),
+                  _w("santos", 26.9), _w("de", 27.3), _w("papel", 27.5, 28.0)])
+    seg_b = _seg("Iluminados por el fuego", 36.1, 38.5,
+                 [_w("iluminados", 36.1), _w("por", 36.5), _w("el", 36.7), _w("fuego", 36.9)])
+    out = post_reconcile_cleanup([seg_a, seg_b])
+    # gap = 36.1 - 33.5 = 2.6s > STRETCH_GAP_THRESH=1.5 → trim
+    assert out[0]["end"] == round(36.1 - STRETCH_MARGIN, 3), (
+        f"expected {round(36.1 - STRETCH_MARGIN, 3)}, got {out[0]['end']}"
+    )
+    assert out[1]["start"] == 36.1  # next seg untouched
+    assert out[0]["start"] == 26.08  # start untouched
+
+
+def test_stretch_trimmer_small_gap_untouched():
+    """A 1.0s gap is below threshold — end must not be trimmed."""
+    seg_a = _seg("Normal phrase", 10.0, 14.0, [_w("normal", 10.0), _w("phrase", 10.5)])
+    seg_b = _seg("Next phrase", 15.0, 17.0, [_w("next", 15.0), _w("phrase", 15.4)])
+    out = post_reconcile_cleanup([seg_a, seg_b])
+    # gap = 15.0 - 14.0 = 1.0s < 1.5s → no trim
+    assert out[0]["end"] == 14.0
+
+
+def test_cleanup_disabled_via_env(monkeypatch):
+    monkeypatch.setenv("POST_RECONCILE_CLEANUP_ENABLED", "0")
+    words = [_w("uh", 69.04 + i * 1.87) for i in range(14)]
+    words.append(_w("uh-oh-oh-oh-oh-oh-oh", 94.2, 95.22))
+    mega = _seg("Uh, uh, uh, uh, uh, uh, uh, uh, uh, uh, uh, uh, uh, uh., uh-oh-oh-oh-oh-oh-oh",
+                69.04, 95.22, words)
+    out = post_reconcile_cleanup([mega])
+    assert len(out) == 1, "when disabled, cleanup must be a no-op"

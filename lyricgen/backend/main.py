@@ -5029,6 +5029,8 @@ async def _run_transcription_for_job(
                                         len([l for l in _canonical.splitlines() if l.strip()]),
                                         "lrclib" if lyrics_source == "lrclib"
                                         else (lyrics_source or "unknown"))
+                            from pipeline import _post_reconcile_cleanup as _prc
+                            _reconciled = _prc(_reconciled)
                             return _emit_segments(
                                 _reconciled, _WC_WX_REC,
                                 reference_lyrics=_canonical,
@@ -5436,6 +5438,8 @@ async def _run_transcription_for_job(
                                     reference_lyrics=_canonical,
                                 )
                         logger.info("[WC] no synced hint — emitting whisperX raw with mishear text (operator edits)")
+                    from pipeline import _post_reconcile_cleanup as _prc
+                    _wx_segs = _prc(_wx_segs)
                     return _emit_segments(
                         _wx_segs, _WC_WX,
                         reference_lyrics=_canonical,

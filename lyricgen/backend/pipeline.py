@@ -1622,6 +1622,15 @@ def _filter_whisper_hallucinations(segments: list[dict]) -> tuple[list[dict], in
     return out, len(segments) - len(out)
 
 
+# ── Post-reconcile cleanup ────────────────────────────────────────────────────
+# Logic lives in post_reconcile.py (lightweight, no heavy deps) so it can be
+# unit-tested in isolation. The alias below preserves the internal call-site.
+
+def _post_reconcile_cleanup(segments: list[dict]) -> list[dict]:
+    from post_reconcile import post_reconcile_cleanup
+    return post_reconcile_cleanup(segments)
+
+
 def _filter_intro_song_overlap(
     intro_segs: list[dict],
     song_segs: list[dict],
