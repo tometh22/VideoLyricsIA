@@ -381,6 +381,7 @@ class Job(Base):
 
     # YouTube info
     youtube_data = Column(JSONB, nullable=True)
+    youtube_short_data = Column(JSONB, nullable=True)
 
     # Content validation (UMG Guideline 15)
     validation_result = Column(JSONB, nullable=True)
@@ -407,6 +408,15 @@ class Job(Base):
     render_params = Column(JSONB, nullable=True)
     edit_count = Column(Integer, default=0, nullable=False, server_default="0")
     bg_r2_key_cached = Column(Text, nullable=True)
+    # Add-on premium "Escenas" (multi-escena). Storyboard generado por
+    # scenes.build_scene_plan: { bible:{...}, sections:[...], scenes:[{ id,
+    # recurrence_key, section_type, energy, movement_style, prompt, cache_token,
+    # clip_cache_key, thumb_key, status }], params:{...}, degraded:{failed,total},
+    # audio_duration }. NULL = job de fondo único (camino histórico). El toggle de
+    # opt-in vive en render_params ("enable_scenes": true) porque es un setting de
+    # render. cache_token bustea la caché Veo por escena en un regen; clip_cache_key
+    # es la key R2 del clip (para GC); thumb_key alimenta el filmstrip.
+    scene_plan = Column(JSONB, nullable=True)
     # Variantes: cuando este job fue creado via POST /jobs/{id}/variant,
     # parent_job_id apunta al job_id que sirvió de base (mismo audio +
     # mismo segments_json, distinto Veo prompt / concept / style).
@@ -479,6 +489,7 @@ class Job(Base):
             "error": self.error,
             "error_category": self.error_category,
             "youtube": self.youtube_data,
+            "youtube_short": self.youtube_short_data,
             "validation_result": self.validation_result,
             "approved_by": self.approved_by,
             "approved_at": self.approved_at.isoformat() if self.approved_at else None,
@@ -493,6 +504,10 @@ class Job(Base):
             # then rejects with a raw English error.
             "segments_json": self.segments_json,
             "bg_r2_key_cached": self.bg_r2_key_cached,
+            # Storyboard multi-escena (NULL en jobs de fondo único). El panel
+            # de edición lo usa para mostrar las escenas y ofrecer "regenerar
+            # escena" sin rehacer todo el video.
+            "scene_plan": self.scene_plan,
             # Lineage de variantes — el JobDetail muestra un pill "Variante
             # de X" cuando este field está set. variant_count se calcula
             # en el handler (query separada para evitar lazy load N+1).
@@ -527,6 +542,8 @@ class Job(Base):
             "created_at": self.created_at.timestamp() if self.created_at else None,
             # Archivado Fase 1: la historia esconde archived por default.
             "archived_at": self.archived_at.timestamp() if self.archived_at else None,
+            "youtube": self.youtube_data,
+            "youtube_short": self.youtube_short_data,
         }
 
 
@@ -726,6 +743,32 @@ class UserDriveTokens(Base):
     google_email = Column(String(255), nullable=True)  # display only en Settings
     connected_at = Column(DateTime(timezone=True), default=utcnow)
     last_used_at = Column(DateTime(timezone=True), nullable=True)
+
+
+class SystemYoutubeToken(Base):
+    """Token OAuth de la cuenta de YouTube del SISTEMA (global, singleton).
+
+    A diferencia de UserDriveTokens (uno por user), YouTube usa una única
+    cuenta central a la que suben los videos de todos los tenants. Por eso
+    es singleton: siempre hay 0 o 1 fila.
+
+    El token completo (access + refresh + client info, formato compatible
+    con google.oauth2.credentials.Credentials) va Fernet-encrypted at rest,
+    reusando DRIVE_TOKEN_ENCRYPTION_KEY. Por qué DB y no archivo: el
+    filesystem de Railway es efímero (se borra en cada deploy), así que
+    persistir acá es lo que hace que la conexión a YouTube sobreviva los
+    redeploys en vez de obligar a reconectar cada vez.
+    """
+    __tablename__ = "system_youtube_token"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    encrypted_token_json = Column(Text, nullable=False)
+    channel_id = Column(String(255), nullable=True)
+    channel_name = Column(String(255), nullable=True)
+    channel_thumbnail = Column(String(500), nullable=True)
+    connected_by_user_id = Column(Integer, nullable=True)  # auditoría
+    connected_at = Column(DateTime(timezone=True), default=utcnow)
+    updated_at = Column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)
 
 
 class DriveTransfer(Base):
@@ -1142,6 +1185,7 @@ def _migrate_user_columns():
         # full_name/avatar_url. login_sessions la crea create_all().
         "ALTER TABLE users ADD COLUMN IF NOT EXISTS full_name VARCHAR(200)",
         "ALTER TABLE users ADD COLUMN IF NOT EXISTS avatar_url VARCHAR(500)",
+        "ALTER TABLE jobs ADD COLUMN IF NOT EXISTS youtube_short_data JSONB",
     ]
     # Each statement gets its own transaction. In Postgres, a failed statement
     # inside a transaction puts it in aborted state — subsequent execute()
@@ -1168,6 +1212,7 @@ def _migrate_user_columns():
     _cast_json_to_jsonb("jobs", "umg_spec")
     _cast_json_to_jsonb("jobs", "s3_keys")
     _cast_json_to_jsonb("jobs", "youtube_data")
+    _cast_json_to_jsonb("jobs", "youtube_short_data")
     _cast_json_to_jsonb("jobs", "validation_result")
     _cast_json_to_jsonb("jobs", "segments_json")
     _cast_json_to_jsonb("jobs", "render_params")

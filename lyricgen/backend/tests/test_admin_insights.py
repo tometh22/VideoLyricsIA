@@ -334,3 +334,102 @@ def test_activity_detail_enriched(client, admin_token, db, monkeypatch):
         assert data["library_usage"][0]["mode"] == "as_is"
     finally:
         _cleanup(db, "insd1", [uid])
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# Profundidad (2026-06-11): feature drill + job detail + eventos de usuario
+# ─────────────────────────────────────────────────────────────────────────
+
+def test_feature_detail_drill(client, admin_token, db):
+    from database import Job
+    uid, username, _ = _register_user(client)
+    db.add_all([
+        Job(job_id="insf1a", user_id=uid, tenant_id="ins-fd", artist="F",
+            song_title="K1", filename="f.mp3", status="done",
+            render_params={"lyrics_animation": "karaoke"}),
+        Job(job_id="insf1b", user_id=uid, tenant_id="ins-fd", artist="F",
+            song_title="K2", filename="f.mp3", status="done",
+            render_params={"lyrics_animation": "pop"}),
+        # Sin valor → bucket "(default)"
+        Job(job_id="insf1c", user_id=uid, tenant_id="ins-fd", artist="F",
+            song_title="K3", filename="f.mp3", status="done",
+            render_params={"font": "Anton"}),
+    ])
+    db.commit()
+    try:
+        r = client.get(
+            "/admin/insights/feature/lyrics_animation?value=karaoke&tenant_id=ins-fd",
+            headers=auth(admin_token))
+        assert r.status_code == 200
+        d = r.json()
+        assert d["total_jobs"] == 1
+        assert d["users"][0]["username"] == username
+        assert d["jobs"][0]["job_id"] == "insf1a"
+        # bucket default
+        r2 = client.get(
+            "/admin/insights/feature/lyrics_animation?value=(default)&tenant_id=ins-fd",
+            headers=auth(admin_token))
+        assert r2.json()["total_jobs"] == 1
+        # feature fuera de whitelist no explota ni drillea
+        r3 = client.get(
+            "/admin/insights/feature/__proto__?value=x", headers=auth(admin_token))
+        assert r3.json()["users"] == []
+    finally:
+        _cleanup(db, "insf1", [uid])
+
+
+def test_job_detail_full(client, admin_token, db):
+    from database import Job, AIProvenance, AuditLog
+    uid, username, _ = _register_user(client)
+    db.add_all([
+        Job(job_id="insj1a", user_id=uid, tenant_id="ins-jd", artist="J",
+            song_title="Detalle", filename="j.mp3", status="done", style="neon",
+            render_params={"font": "Anton", "lyrics_animation": "glow"}),
+        AIProvenance(job_id="insj1a", step="video_bg", tool_name="veo-3.1-fast-generate-001",
+                     tool_provider="google_vertex", prompt_sent="p", duration_ms=8000),
+        AuditLog(user_id=uid, action="job.download",
+                 detail={"job_id": "insj1a", "file_type": "video"}),
+    ])
+    db.commit()
+    try:
+        r = client.get("/admin/insights/job/insj1a", headers=auth(admin_token))
+        assert r.status_code == 200
+        d = r.json()
+        assert d["username"] == username
+        assert d["choices"]["lyrics_animation"] == "glow"
+        assert d["render_params"]["font"] == "Anton"
+        assert len(d["ai_calls"]) == 1 and d["ai_calls"][0]["step"] == "video_bg"
+        assert d["ai_cost_usd"] > 0
+        assert any(e["action"] == "job.download" for e in d["events"])
+        assert client.get("/admin/insights/job/nope404", headers=auth(admin_token)).status_code == 404
+    finally:
+        _cleanup(db, "insj1", [uid])
+
+
+def test_user_events_sessions(client, admin_token, db, monkeypatch):
+    from database import UiEvent
+    monkeypatch.setenv("TELEMETRY_ENABLED", "true")
+    uid, _, _ = _register_user(client)
+    now = datetime.now(timezone.utc)
+    db.add_all([
+        UiEvent(user_id=uid, tenant_id="ins-ue", event_type="wizard.step",
+                event_data={"step_to": 2}, created_at=now - timedelta(hours=2)),
+        UiEvent(user_id=uid, tenant_id="ins-ue", event_type="wizard.generate",
+                event_data={"batch_size": 1}, created_at=now - timedelta(hours=2) + timedelta(minutes=3)),
+        # gap > 30 min → sesión nueva, sin generate (abandono)
+        UiEvent(user_id=uid, tenant_id="ins-ue", event_type="wizard.scene_mode",
+                event_data={"mode": "library"}, created_at=now - timedelta(minutes=10)),
+    ])
+    db.commit()
+    try:
+        r = client.get(f"/admin/insights/user/{uid}/events", headers=auth(admin_token))
+        assert r.status_code == 200
+        d = r.json()
+        assert len(d["sessions"]) == 2
+        # más reciente primero: la sesión abandonada
+        assert d["sessions"][0]["generated"] is False
+        assert d["sessions"][1]["generated"] is True
+        assert d["total_events"] == 3
+    finally:
+        db.query(UiEvent).filter(UiEvent.user_id == uid).delete(synchronize_session=False)
+        db.commit()

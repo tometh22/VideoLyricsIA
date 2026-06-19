@@ -43,7 +43,15 @@ const NAV = [
         <path d="M21 21l-4.35-4.35" />
       </svg>
     ),
-    subTabs: null,
+    // Feedback Tomi 2026-06-11: "todo como scroll, sin sub-pestañas, no
+    // podés profundizar". Cada tab es UNA pregunta; el alcance
+    // (app→tenant→usuario) se elige con el breadcrumb dentro de la sección.
+    subTabs: [
+      { id: "resumen", label: "Resumen" },
+      { id: "features", label: "Features" },
+      { id: "wizard", label: "Wizard" },
+      { id: "margen", label: "Margen" },
+    ],
   },
   {
     // Administrar: cuentas, fondos, compliance, costos, facturación.

@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import { useI18n } from "../i18n";
 import { REF_W, tierForLength, fontSizeFactor } from "../lib/lyricTiers";
+import { FONT_BY_CODE, applyCase } from "./fontCatalog";
 
 // Studio Console live preview. Shows a sample lyric line over the selected
 // palette/mood with the selected camera movement applied as a real CSS
@@ -34,35 +35,11 @@ const MOVE_ANIM = {
   animado:        "wlp-anim 1.8s linear infinite",
 };
 
-// Typography mirrors the render pipeline / EditRequestPanel codes — same
-// table as UploadZone.FONTS and LyricsEditor.EDITOR_FONTS. The CSS family
-// is what the preview applies live; the weight matches each face's
-// intended display weight (Anton/Bebas are 400-only display fonts, the
-// rest are 700-bold). "" = Auto → leave the wrapper's Tailwind defaults
-// (Montserrat-ish via font-extrabold) untouched so the historical look
-// stays put when the operator hasn't picked anything. 2026-05-26.
-const FONT_BY_CODE = {
-  "":                { css: undefined,                weight: undefined },
-  "jost-bold":       { css: "'Jost', sans-serif",       weight: 700 },
-  "montserrat-bold": { css: "'Montserrat', sans-serif", weight: 700 },
-  "poppins-bold":    { css: "'Poppins', sans-serif",    weight: 700 },
-  "outfit-bold":     { css: "'Outfit', sans-serif",     weight: 700 },
-  "roboto-bold":     { css: "'Roboto', sans-serif",     weight: 700 },
-  "bebas-neue":      { css: "'Bebas Neue', sans-serif", weight: 400 },
-  "oswald-bold":     { css: "'Oswald', sans-serif",     weight: 700 },
-  "anton":           { css: "'Anton', sans-serif",      weight: 400 },
-};
-
-// Mirrors UploadZone.applyTextCase and LyricsEditor.applyCase so the
-// preview reads exactly like the eventual libass render (which the
-// pipeline upper-cases by default).
-function applyCase(text, c) {
-  if (!text) return text;
-  if (c === "upper") return text.toUpperCase();
-  if (c === "title") return text.replace(/\b\w/g, (ch) => ch.toUpperCase());
-  if (c === "lower") return text.toLowerCase();
-  return text;
-}
+// Typography + case transform now come from the shared ./fontCatalog so the
+// preview can't drift from the picker. The inline copy here used to omit
+// fredoka/quicksand/nunito, so those three fell through FONT_BY_CODE[font]
+// to the "" (Auto) default and rendered in the generic Tailwind sans — the
+// operator picked "Fredoka (redondeada)" and saw a plain sans (2026-06-17).
 
 // Outline + shadow strength per contrast code. Same shape as
 // LyricVideoPreview.CONTRAST_STYLES (paso 6) so the wizard preview
@@ -157,20 +134,44 @@ export default function WizardLivePreview({
   // re-render del preview, NO de los componentes padres (gracias al ref).
   const [livePlaybackTick, setLivePlaybackTick] = useState(null);
   const lastTickRef = useRef({ activeLine: "", currentTime: -1 });
+  // Render-storm detector (P0 UMG Chile 2026-06-16: "duplicar una línea hace
+  // titilar toda la pantalla y se queda pegado"). A flicker is the active line
+  // changing many times per second — but the 3 s debounced autosave can't
+  // record a 60 fps loop, so prod had no trace. We count activeLine changes
+  // per 1 s window; if it exceeds a clearly-abnormal rate (normal playback
+  // changes lines every few seconds, i.e. <1/s), we emit one tagged warning
+  // that observability.js forwards to Sentry (throttled 1/min/tag) with the
+  // two oscillating texts. The URL already carries the job_id (/videos/.../edit-lyrics).
+  const _stormRef = useRef({ windowStart: 0, changes: 0 });
+  const STORM_CHANGES_PER_S = 12; // >12 active-line flips/s = oscillation, not playback
   useEffect(() => {
     if (!playbackTickRef) return undefined;
     let raf = 0;
-    const loop = () => {
+    const loop = (ts) => {
       const tick = playbackTickRef.current;
       if (tick && tick.activeLine) {
         // Solo dispara setState si cambió la línea activa o el currentTime
         // se movió >40ms (suficiente para word-jump perceptible, ~25Hz).
         // Sin este guard, setState a 60fps haría thrashing.
         const last = lastTickRef.current;
-        if (
-          tick.activeLine !== last.activeLine ||
-          Math.abs(tick.currentTime - last.currentTime) > 0.04
-        ) {
+        const lineChanged = tick.activeLine !== last.activeLine;
+        if (lineChanged) {
+          const st = _stormRef.current;
+          if (ts - st.windowStart > 1000) {
+            if (st.changes >= STORM_CHANGES_PER_S) {
+              // eslint-disable-next-line no-console
+              console.warn("[render-storm] preview active line oscillating", {
+                changesPerSec: st.changes,
+                between: [String(last.activeLine).slice(0, 40), String(tick.activeLine).slice(0, 40)],
+                currentTime: Math.round((tick.currentTime || 0) * 100) / 100,
+              });
+            }
+            st.windowStart = ts;
+            st.changes = 0;
+          }
+          st.changes += 1;
+        }
+        if (lineChanged || Math.abs(tick.currentTime - last.currentTime) > 0.04) {
           lastTickRef.current = { activeLine: tick.activeLine, currentTime: tick.currentTime };
           setLivePlaybackTick({ ...tick });
         }

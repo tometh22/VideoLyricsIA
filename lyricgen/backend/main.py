@@ -63,6 +63,7 @@ from auth import (
     validate_password_strength,
     has_prores_access,
     has_drive_access,
+    has_scenes_access,
     telemetry_enabled,
     generate_api_key,
     is_super_admin,
@@ -1155,6 +1156,7 @@ async def login(body: LoginRequest, request: Request, db: Session = Depends(get_
             "allow_overage": getattr(user, "allow_overage", False) or False,
             "features": {
                 "prores_export": has_prores_access(user),
+                "scenes": has_scenes_access(user),
                 "telemetry": telemetry_enabled(),
             },
         },
@@ -1253,6 +1255,7 @@ async def register(body: RegisterRequest, request: Request, db: Session = Depend
             "allow_overage": getattr(user, "allow_overage", False) or False,
             "features": {
                 "prores_export": has_prores_access(user),
+                "scenes": has_scenes_access(user),
                 "telemetry": telemetry_enabled(),
             },
         },
@@ -1305,9 +1308,24 @@ async def verify_email_endpoint(body: VerifyEmailRequest, request: Request, db: 
 
 
 @app.get("/auth/me")
-def me(current_user: dict = Depends(get_current_user)):
-    """Return current user info."""
-    return current_user
+def me(current_user: dict = Depends(get_current_user), db: Session = Depends(get_db)):
+    """Return current user info, incluyendo los feature flags.
+
+    Audit A6: antes /auth/me devolvía sólo los claims del token (sin `features`),
+    así que el refresh del frontend NUNCA repoblaba `features.scenes` — un
+    cliente recién habilitado quedaba bloqueado hasta re-login. Ahora calculamos
+    `features` del modelo de DB (autoritativo, incl. acceso por billing_group),
+    igual que /auth/login, para que un reload capte el cambio de entitlement."""
+    user = get_user_by_id(db, current_user["id"])
+    _u = user if user else current_user
+    return {
+        **current_user,
+        "features": {
+            "prores_export": has_prores_access(_u),
+            "scenes": has_scenes_access(_u),
+            "telemetry": telemetry_enabled(),
+        },
+    }
 
 
 @app.post("/auth/refresh")
@@ -2456,7 +2474,41 @@ def _job_scope(current_user: dict) -> dict:
     tests/test_tenant_isolation.py::test_two_users_same_tenant_share_jobs
     for the contract this enforces.
     """
+    # Cross-tenant para admins (pedido CEO 2026-06-11): el rol admin es de
+    # PLATAFORMA, no de tenant — necesita abrir el video de cualquier
+    # cliente para verificar incidentes con sus propios ojos (caso UMG
+    # Chile: el link /videos/{id} de otro tenant daba 404 incluso para el
+    # dueño de la empresa). El acceso a media queda auditado en
+    # /media-token y /download vía _audit_cross_tenant_access.
+    if current_user.get("role") == "admin":
+        return {}
     return {"tenant_id": current_user["tenant_id"]}
+
+
+def _audit_cross_tenant_access(db: Session, current_user: dict, job: dict, kind: str) -> None:
+    """Deja rastro cuando un admin accede a media de OTRO tenant.
+
+    Parte del contrato de la apertura cross-tenant: la visibilidad de
+    plataforma para admins viene con trail de auditoría (compliance UMG).
+    Best-effort: un fallo acá no bloquea el acceso."""
+    try:
+        if current_user.get("role") != "admin":
+            return
+        job_tenant = job.get("tenant_id") if isinstance(job, dict) else getattr(job, "tenant_id", None)
+        if not job_tenant or job_tenant == current_user.get("tenant_id"):
+            return
+        db.add(AuditLog(
+            user_id=current_user["id"],
+            action="admin.cross_tenant_access",
+            detail={
+                "job_id": job.get("job_id") if isinstance(job, dict) else job.job_id,
+                "job_tenant": job_tenant,
+                "kind": kind,
+            },
+        ))
+        db.commit()
+    except Exception as e:
+        logger.warning("[AUDIT] cross-tenant access log failed: %s", e)
 
 
 def _lock_user_for_quota(db: Session, user_id: int) -> None:
@@ -4074,6 +4126,9 @@ async def upload(
     background_hint: str = Form("", max_length=2000),
     bg_verbatim: bool = Form(False),
     custom_colors: str = Form("", max_length=200),
+    # Add-on premium "Escenas" (multi-escena). Parity con /generate; la
+    # elegibilidad se valida con has_scenes_access antes de forwardear.
+    enable_scenes: bool = Form(False),
     # Title-card customization (Full Rotor v1). Defaults = historical look.
     title_template: str = Form("auto", max_length=16),
     title_size: str = Form("1.0", max_length=8),
@@ -4264,6 +4319,8 @@ async def upload(
         background_hint=(background_hint.strip() or None),
         bg_verbatim=bg_verbatim,
         custom_colors=(custom_colors.strip() or ""),
+        # Escenas (multi-escena): opt-in AND elegibilidad real (parity /generate).
+        enable_scenes=bool(enable_scenes) and has_scenes_access(current_user),
         title_template=title_template if title_template in ("auto", "centered", "lower_third", "badge") else "auto",
         title_size=_clamp_title_size(title_size),
         title_artist_font=(title_artist_font.strip() or ""),
@@ -6607,6 +6664,11 @@ async def generate_with_segments(
     background_hint: str = Form("", max_length=2000),
     bg_verbatim: bool = Form(False),
     custom_colors: str = Form("", max_length=200),
+    # Add-on premium "Escenas" (multi-escena). Opt-in del operador en el
+    # wizard. La ELEGIBILIDAD se chequea contra has_scenes_access ANTES de
+    # forwardearlo al pipeline (un usuario sin acceso que mande el flag igual
+    # cae al fondo único). Default False = comportamiento histórico.
+    enable_scenes: bool = Form(False),
     # Capa C 2026-05-24: si el operador hizo pre-gen via /generate-preview
     # mientras editaba lyrics, este field contiene el hash que mapea al
     # background pre-cacheado en R2. La pipeline lo reusa antes de llamar
@@ -6906,6 +6968,10 @@ async def generate_with_segments(
         # Si el cache hit, _ensure_background se skip y el job ahorra
         # ~60-180s + $0.80-3.20 de cuota Veo. Vacío = flow tradicional.
         bg_cache_key=(bg_cache_key.strip() or None),
+        # Escenas (multi-escena): opt-in del operador AND elegibilidad real.
+        # Si el flag llega pero el usuario no tiene acceso, se ignora (fondo
+        # único) — el gate de feature vive en el backend, no en el form.
+        enable_scenes=bool(enable_scenes) and has_scenes_access(current_user),
         title_template=title_template if title_template in ("auto", "centered", "lower_third", "badge") else "auto",
         title_size=_clamp_title_size(title_size),
         title_artist_font=(title_artist_font.strip() or ""),
@@ -7014,6 +7080,8 @@ def status(
             .first()
             is not None
         ),
+        "youtube": job.get("youtube"),
+        "youtube_short": job.get("youtube_short"),
     }
 
 
@@ -7378,6 +7446,9 @@ async def issue_media_token(
     job = get_job(db, job_id, **_job_scope(current_user))
     if job is None:
         raise HTTPException(status_code=404, detail="Job not found.")
+    # El media-token es la puerta a VER el media: si un admin cruza de
+    # tenant, queda en el audit trail (contrato de la apertura cross-tenant).
+    _audit_cross_tenant_access(db, current_user, job, kind=f"media-token:{file_type}")
     user_model = db.query(User).filter(User.id == current_user["id"]).first()
     return {"token": create_media_token(user_model, job_id, file_type)}
 
@@ -9151,6 +9222,174 @@ async def request_edit(
     }
 
 
+class RegenerateSceneRequest(BaseModel):
+    """Body de POST /jobs/{job_id}/scenes/{recurrence_key}/regenerate.
+
+    Sin campos = "otra toma" (mismo prompt, semilla nueva → otra versión).
+    `prompt` reemplaza el prompt de la escena; `hint` lo re-deriva heredando la
+    biblia. `movement_style` ∈ estatico|sutil|dinamico."""
+    prompt: str | None = Field(default=None, max_length=2000)
+    hint: str | None = Field(default=None, max_length=2000)
+    movement_style: str | None = Field(default=None, max_length=16)
+    allow_youtube_drift: bool = False
+
+
+@app.post("/jobs/{job_id}/scenes/{recurrence_key}/regenerate")
+async def regenerate_scene(
+    job_id: str,
+    recurrence_key: str,
+    body: RegenerateSceneRequest | None = None,
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Regenera UNA escena del fondo multi-escena y re-renderiza el video.
+
+    Cuesta ~1 clip Veo (~US$0.90) y cuenta como un edit. Sólo la escena pedida
+    toca Veo; las demás re-bajan de la caché R2. Si la escena es recurrente (un
+    coro), regenerarla cambia TODAS sus apariciones (el frontend lo confirma).
+    """
+    from pipeline import _MAX_EDITS
+    from database import Job as JobModel, AuditLog
+
+    body = body or RegenerateSceneRequest()
+    if not has_scenes_access(current_user):
+        raise HTTPException(status_code=403, detail="Escenas no habilitado para esta cuenta.")
+
+    # Row-lock para serializar el read-validate-write de edit_count (igual que
+    # /edit: dos regen del mismo job no deben saltar el cap ni cobrar Veo extra).
+    job = (
+        db.query(JobModel)
+        .filter(JobModel.job_id == job_id)
+        .filter(JobModel.tenant_id == current_user["tenant_id"])
+        .with_for_update()
+        .first()
+    )
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+
+    plan = job.scene_plan if isinstance(job.scene_plan, dict) else None
+    if not plan or not plan.get("scenes"):
+        raise HTTPException(status_code=400, detail="Este job no es multi-escena.")
+    if not any(s.get("recurrence_key") == recurrence_key for s in plan["scenes"]):
+        raise HTTPException(status_code=404, detail=f"Escena '{recurrence_key}' no existe en este job.")
+
+    # Estado: la corrección de escena es un arreglo post-hoc, así que se admite
+    # en videos terminados/en revisión (igual criterio que lyrics/metadata).
+    allowed = ("done", "pending_review", "rejected")
+    if job.status not in allowed:
+        raise HTTPException(
+            status_code=400,
+            detail=f"La escena se puede regenerar con el job done, pending_review o rejected (actual: {job.status}).",
+        )
+
+    # YouTube ya publicado: re-renderizar cambia el archivo en la plataforma
+    # pero NO reemplaza el video de YouTube. Fail-closed salvo override.
+    if job.youtube_data and not body.allow_youtube_drift:
+        yt_url = job.youtube_data.get("url") if isinstance(job.youtube_data, dict) else None
+        raise HTTPException(status_code=409, detail={
+            "code": "youtube_already_published",
+            "message": ("El job ya está publicado en YouTube. Regenerar la escena actualiza "
+                        "el archivo acá pero NO reemplaza el video de YouTube. Pasá "
+                        "allow_youtube_drift=true para continuar."),
+            "youtube_url": yt_url,
+        })
+
+    current_edit_count = job.edit_count or 0
+    _is_admin = current_user.get("role") == "admin"
+    if not _is_admin and current_edit_count >= _MAX_EDITS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Llegaste al máximo de ediciones ({_MAX_EDITS}). Aprobá o rechazá el job.",
+        )
+    if not job.input_r2_key:
+        raise HTTPException(status_code=422, detail="Audio original no disponible — no se puede re-renderizar.")
+
+    _mv = (body.movement_style or "").strip()
+    edit_params = {
+        "scene_key": recurrence_key,
+        "scene_prompt": (body.prompt or "").strip(),
+        "scene_hint": (body.hint or "").strip(),
+        "scene_movement": _mv if _mv in ("estatico", "sutil", "dinamico") else "",
+    }
+
+    new_edit_count = current_edit_count + 1
+    job.status = "editing"
+    job.edit_count = new_edit_count
+    job.current_step = "scenes"
+    job.progress = 0
+    job.editing_started_at = datetime.now(timezone.utc)
+    db.add(AuditLog(
+        user_id=current_user["id"],
+        action="job.scene_regenerate",
+        detail={"job_id": job_id, "recurrence_key": recurrence_key,
+                "edit_params": edit_params, "edit_count": new_edit_count},
+    ))
+    db.commit()
+
+    try:
+        enqueue_edit(
+            job_id=job_id,
+            edit_type="scene",
+            edit_params=edit_params,
+            plan=current_user.get("plan", "100"),
+            tenant_id=current_user.get("tenant_id", ""),
+        )
+    except Exception as exc:
+        logger.error("enqueue_edit (scene) failed for %s: %s", job_id, exc)
+        job.status = "pending_review"
+        job.edit_count = current_edit_count
+        job.editing_started_at = None
+        job.progress = 100
+        job.current_step = "thumbnail"
+        db.commit()
+        raise HTTPException(status_code=503, detail="No se pudo encolar la regeneración. Reintentá.")
+
+    return {
+        "ok": True,
+        "job_id": job_id,
+        "recurrence_key": recurrence_key,
+        "edit_count": new_edit_count,
+        "edits_remaining": max(0, _MAX_EDITS - new_edit_count),
+        "edit_limit_exempt": _is_admin,
+    }
+
+
+@app.get("/jobs/{job_id}/scenes/thumbs")
+async def get_scene_thumbnails(
+    job_id: str,
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """URLs firmadas (R2, 1h) de los pósters de todas las escenas, en una sola
+    llamada autenticada. El frontend las pone directo en <img src> (las URLs
+    firmadas no necesitan header). Devuelve {recurrence_key: url} sólo para las
+    escenas que tienen thumb_key."""
+    from database import Job as JobModel
+
+    job = (
+        db.query(JobModel)
+        .filter(JobModel.job_id == job_id)
+        .filter(JobModel.tenant_id == current_user["tenant_id"])
+        .first()
+    )
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+    plan = job.scene_plan if isinstance(job.scene_plan, dict) else None
+    out: dict[str, str] = {}
+    if plan and storage.is_enabled():
+        for s in plan.get("scenes", []):
+            tk = s.get("thumb_key")
+            key = s.get("recurrence_key")
+            if tk and key:
+                try:
+                    u = storage.generate_signed_url(tk, expiry_seconds=3600)
+                    if u:
+                        out[key] = u
+                except Exception as _e:  # noqa: BLE001
+                    logger.warning("[SCENES] firma de thumb %s falló: %s", key, _e)
+    return {"thumbs": out}
+
+
 @app.post("/enable-prores/{job_id}")
 async def enable_prores_for_job(
     job_id: str,
@@ -9623,9 +9862,21 @@ async def retry_job(
               "title_artist_font", "title_song_font",
               # UI v1.1 (2026-05-30): manual song split. Inheritable so
               # a retry/variant respects the operator's chosen break.
-              "title_song_break"):
+              "title_song_break",
+              # Escenas (multi-escena): heredable, así un retry de un job
+              # multi-escena vuelve a armar las escenas en vez de caer al
+              # fondo único. Persistido por pipeline en render_params cuando
+              # el render corre con enable_scenes=True.
+              "enable_scenes"):
         if k in _retry_render_params and _retry_render_params[k] not in (None, ""):
             retry_pipeline_kwargs[k] = _retry_render_params[k]
+
+    # Audit A5: re-gatear enable_scenes con el acceso ACTUAL del usuario, igual
+    # que /generate y /upload. Un tenant al que se le sacó el acceso (o se cayó
+    # de SCENES_ENABLED_TENANTS) no debe seguir generando multi-escena —y su
+    # costo Veo extra— al reintentar un job viejo.
+    if retry_pipeline_kwargs.get("enable_scenes"):
+        retry_pipeline_kwargs["enable_scenes"] = has_scenes_access(current_user)
 
     enqueue_pipeline(
         job_id=job_id,
@@ -10104,14 +10355,132 @@ def save_settings(
 # YouTube
 # ---------------------------------------------------------------------------
 
+class YoutubeUploadBody(BaseModel):
+    privacy: str = "unlisted"
+    title: str | None = None
+    description: str | None = None
+
+
+@app.get("/youtube/connection-status")
+async def youtube_connection_status(current_user: dict = Depends(get_current_user)):
+    """Check if a YouTube account is connected and return channel info."""
+    import asyncio
+    from youtube_upload import get_connection_status
+    loop = asyncio.get_event_loop()
+    status = await loop.run_in_executor(None, get_connection_status)
+    return status
+
+
+@app.get("/youtube/auth-url")
+async def youtube_auth_url(current_user: dict = Depends(get_current_user)):
+    """Return the Google OAuth URL for connecting the system YouTube account.
+
+    Solo admin: YouTube es una cuenta central del sistema (todos los tenants
+    suben ahí), así que conectarla/cambiarla es una acción de administración.
+    El state token bindea el flujo a este admin (CSRF)."""
+    if current_user.get("role") != "admin":
+        raise HTTPException(status_code=403, detail="Solo un administrador puede conectar la cuenta de YouTube.")
+    from youtube_oauth import build_authorization_url, YoutubeOAuthError
+    try:
+        url = build_authorization_url(current_user["id"])
+    except YoutubeOAuthError as e:
+        raise HTTPException(status_code=503, detail=str(e))
+    return {"auth_url": url}
+
+
+@app.get("/youtube/callback")
+async def youtube_oauth_callback(
+    code: str = Query("", max_length=2048),
+    state: str = Query("", max_length=2048),
+    error: str = Query("", max_length=200),
+    db: Session = Depends(get_db),
+):
+    """Callback de Google tras el consent. Verifica el state (HMAC),
+    intercambia el code, cachea el channel y guarda el token encriptado en
+    system_youtube_token. Cierra el popup vía postMessage.
+
+    NO usa get_current_user: Google no manda el JWT — la identidad viene
+    del state token firmado al construir la auth URL."""
+    from fastapi.responses import HTMLResponse
+    from youtube_oauth import (
+        YoutubeOAuthError, verify_state_token, exchange_code_for_tokens,
+        fetch_channel_info, save_system_token,
+    )
+
+    def _popup(html_body: str, status: int = 200):
+        return HTMLResponse(f"""
+        <html><body style="font-family:sans-serif;text-align:center;padding-top:3rem;background:#111;color:#eee;">
+        {html_body}
+        </body></html>""", status_code=status)
+
+    if error:
+        return _popup(f'<h2 style="color:#f87171">Conexión cancelada</h2><p style="color:#aaa">{error}</p>'
+                      '<script>setTimeout(()=>window.close(),2500);</script>', 400)
+
+    try:
+        user_id = verify_state_token(state)
+    except YoutubeOAuthError as e:
+        return _popup(f'<h2 style="color:#f87171">Error de seguridad</h2><p style="color:#aaa">{e}</p>'
+                      '<script>setTimeout(()=>window.close(),3000);</script>', 400)
+
+    # Re-chequeo de rol: el admin pudo perder el rol entre auth-url y callback.
+    cb_user = db.query(User).filter(User.id == user_id).first()
+    if cb_user is None or cb_user.role != "admin":
+        return _popup('<h2 style="color:#f87171">Sin permisos</h2>'
+                      '<p style="color:#aaa">Solo un administrador puede conectar YouTube.</p>'
+                      '<script>setTimeout(()=>window.close(),3000);</script>', 403)
+
+    try:
+        token_data = exchange_code_for_tokens(code)
+    except YoutubeOAuthError as e:
+        return _popup(f'<h2 style="color:#f87171">Error al conectar</h2><p style="color:#aaa">{e}</p>'
+                      '<script>setTimeout(()=>window.close(),3000);</script>', 400)
+
+    # Channel info es best-effort (para mostrar "Conectado como X").
+    channel = fetch_channel_info(token_data.get("token", ""))
+    save_system_token(db, token_data, channel=channel, user_id=user_id)
+
+    ch_name = channel.get("channel_name") or "tu canal"
+    return _popup(
+        '<div style="font-size:3rem;margin-bottom:1rem">✓</div>'
+        '<h2 style="color:#a3e635">YouTube conectado</h2>'
+        f'<p style="color:#888;font-size:0.9rem">Cuenta: {ch_name}. Ya podés cerrar esta ventana.</p>'
+        '<script>if(window.opener){window.opener.postMessage("yt_connected","*");}'
+        'setTimeout(()=>window.close(),1500);</script>'
+    )
+
+
+@app.post("/youtube/disconnect")
+async def youtube_disconnect(
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Disconnect the system YouTube account (admin only)."""
+    if current_user.get("role") != "admin":
+        raise HTTPException(status_code=403, detail="Solo un administrador puede desconectar YouTube.")
+    from youtube_oauth import delete_system_token
+    removed = delete_system_token(db)
+    return {"disconnected": removed}
+
+
+@app.get("/youtube/upload-progress/{job_id}")
+async def youtube_upload_progress(job_id: str, current_user: dict = Depends(get_current_user)):
+    """Return the current upload progress (0-100) for a job, or -1 if not uploading."""
+    from youtube_upload import get_upload_progress
+    return {"progress": get_upload_progress(job_id), "short_progress": get_upload_progress(job_id + "_short")}
+
+
 @app.post("/youtube/upload/{job_id}")
 async def youtube_upload(
     job_id: str,
+    body: YoutubeUploadBody = None,
     privacy: str = "unlisted",
     current_user: dict = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
     """Upload a completed job's video to YouTube with AI-generated metadata."""
+    if body:
+        privacy = body.privacy
     job = get_job(db, job_id, **_job_scope(current_user))
     if job is None:
         raise HTTPException(status_code=404, detail="Job not found.")
@@ -10134,15 +10503,101 @@ async def youtube_upload(
     artist = job.get("artist", "")
 
     import asyncio
+    from functools import partial
     from youtube_upload import upload_to_youtube
     loop = asyncio.get_event_loop()
-    result = await loop.run_in_executor(
-        None, upload_to_youtube, video_path, thumb_path, artist, song, "", privacy, job_id,
-    )
+    try:
+        fn = partial(
+            upload_to_youtube,
+            video_path, thumb_path, artist, song, "", privacy, job_id,
+            body.title if body else None,
+            body.description if body else None,
+        )
+        result = await loop.run_in_executor(None, fn)
+    except Exception as e:
+        raise HTTPException(status_code=502, detail={"message": f"YouTube upload failed: {e}", "code": str(e)})
 
     update_job(job_id, youtube=result)
-
     return result
+
+
+@app.post("/youtube/upload-short/{job_id}")
+async def youtube_upload_short(
+    job_id: str,
+    body: YoutubeUploadBody = None,
+    privacy: str = "unlisted",
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Upload a completed job's Short (vertical 9:16) to YouTube Shorts."""
+    if body:
+        privacy = body.privacy
+    job = get_job(db, job_id, **_job_scope(current_user))
+    if job is None:
+        raise HTTPException(status_code=404, detail="Job not found.")
+    if job["status"] != "done":
+        raise HTTPException(status_code=400, detail="Job is not done yet.")
+
+    short_path = os.path.join(OUTPUTS_DIR, job_id, "short.mp4")
+    thumb_path = os.path.join(OUTPUTS_DIR, job_id, "thumbnail.jpg")
+
+    if not os.path.exists(short_path):
+        raise HTTPException(status_code=404, detail="Short file not found. The job may not have generated a short.")
+
+    filename = job.get("filename", "")
+    song = filename.replace(".mp3", "")
+    if " - " in song:
+        song = song.split(" - ", 1)[1]
+    for sfx in ["(Official Video)", "(Official Audio)", "(En Vivo)", "(Live)", "(Lyrics)"]:
+        song = song.replace(sfx, "").strip()
+
+    artist = job.get("artist", "")
+
+    import asyncio
+    from functools import partial
+    from youtube_upload import upload_short_to_youtube
+    loop = asyncio.get_event_loop()
+    try:
+        fn = partial(
+            upload_short_to_youtube,
+            short_path, thumb_path, artist, song, "", privacy, job_id,
+            body.title if body else None,
+            body.description if body else None,
+        )
+        result = await loop.run_in_executor(None, fn)
+    except Exception as e:
+        raise HTTPException(status_code=502, detail={"message": f"YouTube upload failed: {e}", "code": str(e)})
+
+    update_job(job_id, youtube_short=result)
+    return result
+
+
+@app.post("/youtube/metadata-short/{job_id}")
+async def youtube_short_metadata_preview(
+    job_id: str,
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Preview the AI-generated YouTube Shorts metadata without uploading."""
+    job = get_job(db, job_id, **_job_scope(current_user))
+    if job is None:
+        raise HTTPException(status_code=404, detail="Job not found.")
+
+    filename = job.get("filename", "")
+    song = filename.replace(".mp3", "")
+    if " - " in song:
+        song = song.split(" - ", 1)[1]
+    for sfx in ["(Official Video)", "(Official Audio)", "(En Vivo)", "(Live)", "(Lyrics)"]:
+        song = song.replace(sfx, "").strip()
+
+    from youtube_upload import generate_short_metadata
+    from functools import partial
+    import asyncio
+    loop = asyncio.get_event_loop()
+    metadata = await loop.run_in_executor(
+        None, partial(generate_short_metadata, job.get("artist", ""), song, "", job_id=job_id),
+    )
+    return metadata
 
 
 @app.post("/youtube/metadata/{job_id}")

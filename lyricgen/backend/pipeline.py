@@ -619,6 +619,13 @@ def run_pipeline(job_id: str, mp3_path: str, artist: str, style: str,
                  # path en R2. None = no chequear cache (fallback al flow
                  # tradicional de Veo/Imagen inline).
                  bg_cache_key: str | None = None,
+                 # Add-on premium "Escenas" (multi-escena). Cuando es True el
+                 # fondo se arma como un CONJUNTO de escenas (detect→biblia→
+                 # plan→N clips Veo→stitch xfade) en vez de un loop único. El
+                 # endpoint ya validó has_scenes_access antes de setearlo, así
+                 # que acá se confía. Cualquier fallo cae al fondo único (cero
+                 # regresión). Default False = comportamiento histórico.
+                 enable_scenes: bool = False,
                  # Title-card customization (Full Rotor v1). Defaults reproduce
                  # the historical look. title_size clamps 0.5-2.0; the font ids
                  # resolve via _resolve_font ("" → ExtraBold artist / lyric song);
@@ -844,6 +851,13 @@ def run_pipeline(job_id: str, mp3_path: str, artist: str, style: str,
                      background_path.lower().endswith((".jpg", ".jpeg", ".png")))
         _animate_user_image = bool(animate_image and _is_still)
 
+        # P0 fix 2026-06-19: _scenes_active se usa SIEMPRE en el render
+        # (bg_prelooped=_scenes_active) pero antes sólo se inicializaba dentro de
+        # la rama de fondo IA (el else de abajo). Con un fondo humano/library la
+        # variable quedaba sin asignar → UnboundLocalError tumbaba TODO job de
+        # fondo no-IA (incl. los golden renders). Inicializar acá, incondicional.
+        _scenes_active = False
+
         if background_path and not _animate_user_image:
             # Human-provided background — skip AI generation (UMG Guideline 10)
             from provenance import record_ai_call
@@ -925,6 +939,37 @@ def run_pipeline(job_id: str, mp3_path: str, artist: str, style: str,
                     _audio_dur_for_kb = _audio_duration(mp3_path)
                 except Exception:
                     _audio_dur_for_kb = None
+            # Add-on premium "Escenas": si está activo (y no es un fondo a partir
+            # de imagen del usuario), armamos el timeline multi-escena. El
+            # resultado entra al render como un fondo ya del largo completo
+            # (_scenes_active → bg_prelooped=True). Si algo falla, log + caemos al
+            # fondo único de _ensure_background (no rompemos el job).
+            _scenes_active = False
+            if bg_image_path is None and enable_scenes and not _animate_user_image:
+                try:
+                    update_job(job_id, current_step="scenes", progress=22)
+                    _scene_timeline, _scene_plan = _generate_scene_background(
+                        segments, _audio_dur_for_kb or _audio_duration(mp3_path),
+                        job_dir, style_hint=style, lyrics_text=lyrics_text,
+                        artist=artist, song_title=_song_title, genre=genre,
+                        concept=concept, movement_style=movement_style,
+                        custom_colors=custom_colors,
+                        # El prompt del operador ("Mi prompt") moldea TODA la
+                        # biblia → multi-escena respeta auto/letra/prompt igual
+                        # que el fondo único. bg_verbatim ="usá mi texto tal cual".
+                        background_hint=background_hint, bg_verbatim=bg_verbatim,
+                        allow_people=_compute_allow_people(job_id),
+                        job_id=job_id,
+                    )
+                    bg_image_path = _scene_timeline
+                    _scenes_active = True
+                    update_job(job_id, scene_plan=_scene_plan)
+                    logger.info("[SCENES] timeline multi-escena listo para job=%s", job_id)
+                except Exception as e:  # noqa: BLE001
+                    logger.error("[SCENES] multi-escena falló para job=%s (%s) — "
+                                 "fallback a fondo único", job_id, e)
+                    _scenes_active = False
+            if bg_image_path is None:
                 bg_image_path = _ensure_background(
                     style, job_dir,
                     lyrics_text=lyrics_text, artist=artist, job_id=job_id,
@@ -995,6 +1040,12 @@ def run_pipeline(job_id: str, mp3_path: str, artist: str, style: str,
             _new_rp["bg_verbatim"] = True
         if custom_colors:
             _new_rp["custom_colors"] = custom_colors
+        # Escenas (multi-escena): persistimos sólo cuando está ON (mismo
+        # criterio que bg_verbatim) — así un edit de tipografía que no manda
+        # el flag no apaga un job que ya era multi-escena, y retry/variant lo
+        # heredan vía la whitelist de render_params en main.py.
+        if enable_scenes:
+            _new_rp["enable_scenes"] = True
         # U5 (audit 2026-05-25): merge atómico vía jobs.merge_render_params.
         # El read-then-write fuera de un row lock dejaba race: 2 callers
         # concurrentes (worker + /edit endpoint, o 2 /edit calls) podían
@@ -1040,12 +1091,12 @@ def run_pipeline(job_id: str, mp3_path: str, artist: str, style: str,
                     logger.warning("[EDIT] Warning: background cache upload failed: %s", _e)
 
         files = {}
-        # When the operator picked an explicit font id, resolve it to a
-        # path now and seed `chosen_font`. generate_lyric_video reuses a
-        # truthy `font` argument as-is and only random-picks when None.
-        chosen_font = _resolve_font(font)
+        # La elección de tipografía se hace UNA vez acá (operador o pick
+        # del pool) y fluye a video + short + persiste para re-renders.
+        # Fix incidente UMG Chile 2026-06-11 — ver _pick_concrete_font.
+        chosen_font = _pick_concrete_font(font, job_id, job_dir, deterministic=wants_umg)
         if chosen_font:
-            logger.info("[FONT] Operator-selected: %s", os.path.basename(chosen_font))
+            logger.info("[FONT] Selected: %s", os.path.basename(chosen_font))
         bg_source = bg_image_path
 
         # Step 1b — Pre-render content validation (UMG Guideline 15).
@@ -1206,6 +1257,8 @@ def run_pipeline(job_id: str, mp3_path: str, artist: str, style: str,
                 title_template=title_template, title_size=title_size,
                 title_artist_font=title_artist_font, title_song_font=title_song_font,
                 title_song_break=title_song_break,
+                # Multi-escena: el fondo ya es un timeline del largo completo.
+                bg_prelooped=_scenes_active,
             )
             files["video_url"] = f"/download/{job_id}/video"
             update_job(job_id, progress=55)
@@ -6719,7 +6772,9 @@ def _generate_veo_video(prompt: str, output_path: str, job_id: str = None,
                         normalized_concept: str = "",
                         high_fidelity: bool = False,
                         allow_people: bool = False,
-                        verbatim: bool = False) -> str:
+                        verbatim: bool = False,
+                        cache_only: bool = False,
+                        out_meta: dict | None = None) -> str:
     """Generate a video clip with Google Veo 3 via direct Vertex AI REST API.
 
     We bypass google-genai SDK for Veo specifically because its internal auth
@@ -6777,6 +6832,14 @@ def _generate_veo_video(prompt: str, output_path: str, job_id: str = None,
         "No text, no words, no letters, no signs, no billboards, no posters, "
         "no banners, no graffiti, no shop windows, no street signs, no neon "
         f"signs, no logos, no trademarks, no brand symbols,{_people_clause}"
+        # Anti-UI-de-cámara (incidente 2026-06-19, multi-escena "No Hay Santos"):
+        # la biblia "found footage / film viejo" hacía que Veo dibujara una
+        # interfaz de camcorder falsa — visor, indicador REC, timecode, texto de
+        # grabadora, un recuadro/botón en una esquina. Prohibido explícitamente.
+        " no camera viewfinder, no recording overlay, no REC indicator, no "
+        "timecode, no on-screen camera UI, no HUD, no camcorder interface, no "
+        "VHS overlay, no film-frame border graphic, no lens UI, no corner "
+        "buttons or icons,"
     )
     # Camera-motion negatives — the LAST line of defense for static intent.
     # Veo's payload exposes no structured camera-lock field, so these words
@@ -6929,6 +6992,10 @@ def _generate_veo_video(prompt: str, output_path: str, job_id: str = None,
         cache_params["img"] = _seed_image_digest(image_path, job_id)
     cache_key_hash = _veo_cache_key(safe_prompt, model, cache_params)
     cache_object_key = f"cache/veo/{cache_key_hash}.mp4"
+    # Audit M8: exponer la cache key usada para que el caller pueda GC el clip
+    # viejo cuando una escena se regenera (evita huérfanos en cache/veo/).
+    if out_meta is not None:
+        out_meta["cache_object_key"] = cache_object_key
 
     recorder = record_ai_call(
         job_id=job_id or "unknown",
@@ -6938,6 +7005,25 @@ def _generate_veo_video(prompt: str, output_path: str, job_id: str = None,
         prompt=safe_prompt,
         input_data_types=["generated_prompt"],
     ) if job_id else None
+
+    # cache_only (multi-escena regen): SÓLO servir de caché, NUNCA generar
+    # fresco. Garantiza que regenerar UNA escena no re-cobre las otras N: si su
+    # clip no está cacheado, levantamos y el caller degrada (reusa otro clip) en
+    # vez de pagar Veo. Sin esto, un cache miss en una regen re-facturaba todo.
+    if cache_only:
+        if (_storage.is_enabled() and _storage.object_exists(cache_object_key)
+                and _storage.download_object(cache_object_key, output_path)):
+            size_mb = os.path.getsize(output_path) / 1024 / 1024
+            logger.info("[BG] Veo cache HIT (cache_only, %s): %.1f MB", cache_key_hash, size_mb)
+            if recorder:
+                recorder.finish(response_summary=f"cache_hit(cache_only): {size_mb:.1f}MB key={cache_key_hash}",
+                                output_artifact=output_path)
+            return output_path
+        if recorder:
+            recorder.finish(response_summary=f"cache_only_miss: key={cache_key_hash}")
+        raise RuntimeError(
+            f"[BG] cache_only: sin clip cacheado ({cache_key_hash}) — no se genera "
+            "para no re-cobrar Veo en una regeneración de escena")
 
     if _storage.is_enabled() and _storage.object_exists(cache_object_key):
         if _storage.download_object(cache_object_key, output_path):
@@ -7570,6 +7656,409 @@ def _darken_prompt_for_effect(prompt: str, effect: str) -> str:
         " leave dark negative space for the particles to glow against. Keep the"
         " same subject and setting; only grade it darker and moodier."
     )
+
+
+# ───────────────────────── Multi-escena ("Escenas") ──────────────────────
+# Add-on premium: el video deja de ser un loop y pasa a ser un CONJUNTO DE
+# ESCENAS con arco. La detección de secciones + el stitch viven en scenes.py
+# (determinista, testeable). Acá quedan las piezas que SÍ dependen del
+# pipeline: la biblia visual (Gemini), el wrapper de prompt por escena, la
+# generación de los N clips Veo y la orquestación. Todo ADITIVO — el camino
+# de fondo único de _ensure_background queda intacto.
+
+_BIBLE_FALLBACK_PALETTE = {
+    "oscuro": "deep shadows, low-key, desaturated cool tones",
+    "neon": "saturated neon magenta and cyan, high contrast",
+    "minimal": "muted minimal palette, lots of negative space",
+    "calido": "warm golden amber tones, soft light",
+    "custom": "cohesive cinematic palette",
+}
+
+
+def _build_visual_bible(lyrics_text: str, artist: str, song_title: str = "",
+                        genre: str = "", concept: str = "", style: str = "",
+                        custom_colors: str = "", job_id: str = None,
+                        background_hint: str | None = None,
+                        bg_verbatim: bool = False) -> dict:
+    """Una sola llamada Gemini que fija el "look book" del video.
+
+    Devuelve {world, palette, texture, camera, motif} — el ADN visual que TODA
+    escena hereda (esto es lo que evita el "random": todas parecen el mismo
+    film). Best-effort: si Gemini falla, cae a una biblia determinista derivada
+    de style/genre/concept para que el feature nunca tumbe el job.
+    """
+    fallback = {
+        "world": (concept or genre or "cinematic scene grounded in the song's mood"),
+        "palette": (custom_colors or _BIBLE_FALLBACK_PALETTE.get(style, "cohesive cinematic palette")),
+        "texture": "subtle film grain, soft cinematic depth of field",
+        "camera": "slow, deliberate camera language",
+        "motif": "a single recurring light source tying the scenes together",
+    }
+    try:
+        from google import genai
+        from provenance import record_ai_call
+        client = _get_genai_client()
+        sys_instr = (
+            "You are an art director designing the VISUAL BIBLE for a premium "
+            "lyric video. Read the song and define ONE coherent visual world that "
+            "every scene of the video will share — this is what makes the video "
+            "feel like a single film instead of random clips. Respond ONLY with a "
+            "JSON object with exactly these string keys: world (the setting/"
+            "environment family), palette (colors + lighting), texture (film stock/"
+            "grain/lens feel), camera (the camera language), motif (one recurring "
+            "visual element). Keep each value under 25 words. No people's faces, "
+            "no text/letters/logos in the described world. The 'texture' is a film "
+            "stock / grain / color feel ONLY — never describe found-footage, "
+            "camcorder, VHS, viewfinder, or on-screen camera-UI aesthetics (they "
+            "make the AI render fake recording chrome over the scene)."
+        )
+        # Dirección del operador ("Mi prompt"): moldea TODA la biblia → multi-
+        # escena respeta auto/letra/prompt igual que el fondo único. Verbatim =
+        # "usá mi visión tal cual" (manda sobre género/letra).
+        _hint = (background_hint or "").strip()
+        _direction = ""
+        if _hint:
+            _direction = (
+                f"\nOPERATOR DIRECTION (this is the world the operator wants — "
+                f"{'use it as the definitive vision, it OVERRIDES genre/lyrics inference' if bg_verbatim else 'honor it strongly while staying coherent with the song'}): {_hint[:600]}"
+            )
+        user = (f"Artist: {artist}\nTitle: {song_title}\nGenre: {genre}\n"
+                f"Concept: {concept}\nPalette hint: {style} {custom_colors}{_direction}\n"
+                f"Lyrics (excerpt):\n{(lyrics_text or '')[:600]}")
+        recorder = record_ai_call(
+            job_id=job_id or "unknown", step="visual_bible",
+            tool_name="gemini-2.5-flash", tool_provider="google_vertex",
+            prompt=f"system:{sys_instr}\nuser:{user}",
+            input_data_types=["artist_name", "lyrics_text_600chars"],
+        ) if job_id else None
+        resp = _call_with_timeout(
+            lambda: client.models.generate_content(
+                model="gemini-2.5-flash",
+                contents=user,
+                config=genai.types.GenerateContentConfig(
+                    system_instruction=sys_instr,
+                    temperature=0.7,
+                    # gemini-2.5-flash es un modelo de *thinking*: por default
+                    # gasta tokens de razonamiento que cuentan contra
+                    # max_output_tokens. Con 500 y thinking ON, el JSON salía
+                    # TRUNCADO (finish_reason=MAX_TOKENS, ~478 tokens de
+                    # thinking y la respuesta cortada) → parse fallaba → toda
+                    # biblia caía al fallback genérico por género, perdiendo la
+                    # coherencia "mismo film" que es el corazón del feature.
+                    # Apagamos el thinking (no lo necesita para un look-book) y
+                    # forzamos JSON puro vía response_mime_type (sin ```json).
+                    max_output_tokens=800,
+                    response_mime_type="application/json",
+                    thinking_config=genai.types.ThinkingConfig(thinking_budget=0),
+                ),
+            ),
+            timeout_s=45.0, label="SCENES-BIBLE",
+        )
+        text = (resp.text or "").strip()
+        bible = _parse_json_object(text)
+        if recorder:
+            recorder.finish(response_summary=text[:300])
+        if bible and isinstance(bible, dict):
+            # Completar claves faltantes con el fallback (Gemini a veces omite una).
+            return {k: (str(bible.get(k) or fallback[k]).strip()) for k in fallback}
+        logger.warning("[SCENES] biblia: parse falló, uso fallback. raw=%s", text[:200])
+    except Exception as e:  # noqa: BLE001
+        logger.warning("[SCENES] biblia visual falló (%s) — uso fallback determinista", e)
+    return fallback
+
+
+def _parse_json_object(text: str) -> dict | None:
+    """Parser tolerante: JSON pelado o envuelto en ```json ... ```."""
+    if not text:
+        return None
+    import json as _json
+    t = text.strip()
+    if t.startswith("```"):
+        t = t.strip("`")
+        if t.lower().startswith("json"):
+            t = t[4:]
+    a, b = t.find("{"), t.rfind("}")
+    if a >= 0 and b > a:
+        t = t[a:b + 1]
+    try:
+        obj = _json.loads(t)
+        return obj if isinstance(obj, dict) else None
+    except Exception:
+        return None
+
+
+def _make_scene_prompt_fn(lyrics_text, artist, song_title, genre, concept,
+                          style, custom_colors, job_id, allow_people):
+    """Fabrica la callable que scenes.build_scene_plan usa por escena.
+
+    Reusa _get_unique_prompt (toda la maquinaria de seguridad/de-bias de Gemini)
+    pasando la biblia + el beat de la sección como background_hint NO-verbatim,
+    así Gemini ancla por sección pero hereda el ADN visual de la biblia.
+    """
+    def prompt_fn(background_hint="", movement_style="", section_type="", energy=0.0):
+        return _get_unique_prompt(
+            lyrics_text=lyrics_text, artist=artist, job_id=job_id,
+            song_title=song_title, genre=genre, concept=concept,
+            movement_style=movement_style, match_lyrics=True,
+            background_hint=background_hint, bg_verbatim=False,
+            palette_style=style, custom_colors=custom_colors,
+            allow_people=allow_people,
+        )
+    return prompt_fn
+
+
+def _scene_cache_ns(artist: str, song_title: str, key: str, token: str = "") -> str:
+    """Namespace de caché R2 por escena. El `cache_token` (vacío en la
+    generación inicial) cambia cuando el operador regenera UNA escena: así su
+    clip se cachea bajo una key NUEVA (cache miss → Veo fresco) mientras las
+    demás escenas siguen pegando su caché original (re-stitch sin costo). Al
+    persistirse el token en scene_plan, un edit posterior re-baja la versión
+    regenerada, no la vieja."""
+    base = f"{artist}|{song_title}|{key}"
+    return f"{base}|{token}" if token else base
+
+
+def _persist_scene_thumb(clip_path: str, key: str, job_id: str) -> str | None:
+    """Extrae un póster del clip y lo sube a R2; devuelve la key (o None).
+    Best-effort: un thumb faltante no debe tumbar la generación del video."""
+    if not job_id:
+        return None
+    try:
+        import storage as _storage
+        import scenes as _scenes
+        if not _storage.is_enabled():
+            return None
+        thumb_local = os.path.join(os.path.dirname(clip_path), f"thumb_{key}.jpg")
+        if not _scenes.extract_thumbnail(clip_path, thumb_local):
+            return None
+        return _storage.upload_file(thumb_local, f"scenes/{job_id}/thumb_{key}.jpg") or None
+    except Exception as e:  # noqa: BLE001
+        logger.warning("[SCENES] thumb de %s falló (%s) — sin póster", key, e)
+        return None
+
+
+def _generate_scene_clips(scene_plan: dict, job_dir: str, *, artist: str,
+                          song_title: str, concept: str = "", job_id: str = None,
+                          allow_people: bool = False,
+                          regen_keys: set | None = None) -> dict:
+    """Genera un clip Veo por escena ÚNICA. Devuelve {recurrence_key: clip_path}.
+
+    - cache_namespace incluye la recurrence_key + el cache_token de la escena →
+      escenas distintas no colisionan, los coros recurrentes (1 escena) pegan
+      caché, y una escena regenerada (token nuevo) genera fresco mientras las
+      otras re-bajan su caché sin costo.
+    - `regen_keys`: si se pasa, SÓLO esas escenas pueden generar fresco en Veo;
+      el resto va `cache_only=True` → se sirven de la caché R2 o se degradan,
+      pero NUNCA re-cobran. Garantía de costo del regen: regenerar 1 escena no
+      puede facturar las otras N aunque la caché falle (antes sí podía).
+    - Degradación elegante: si una escena falla (incl. cache_only miss), reusa el
+      primer clip exitoso en vez de tumbar el video. Si NINGUNA generó, levanta
+      para que el caller caiga al fondo único.
+    """
+    import veo_breaker
+    if veo_breaker.is_open():
+        raise RuntimeError("veo breaker OPEN — multi-escena no puede generar clips")
+
+    clip_for_key: dict[str, str] = {}
+    first_ok = None
+    for scene in scene_plan.get("scenes", []):
+        key = scene["recurrence_key"]
+        if key in clip_for_key:
+            continue
+        clip_path = os.path.join(job_dir, f"bg_scene_{key}.mp4")
+        # En un regen (regen_keys set), las escenas NO-target son cache_only:
+        # se sirven de caché o se degradan, nunca pagan Veo de nuevo.
+        _cache_only = regen_keys is not None and key not in regen_keys
+        _meta = {}
+        try:
+            _generate_veo_video(
+                scene["prompt"], clip_path, job_id=job_id,
+                cache_namespace=_scene_cache_ns(artist, song_title, key, scene.get("cache_token", "")),
+                movement_style=scene.get("movement_style", ""),
+                normalized_concept=_normalize_concept(concept),
+                allow_people=allow_people,
+                cache_only=_cache_only,
+                out_meta=_meta,
+            )
+            if not os.path.exists(clip_path):
+                raise RuntimeError("clip no escrito")
+            # NIT: no persistimos clip_path (es un path local efímero del job_dir
+            # que filtraba el filesystem del contenedor al JSON/DB). El stitch usa
+            # clip_for_key (abajo), no scene["clip_path"].
+            scene["status"] = "generated"
+            if _meta.get("cache_object_key"):
+                scene["clip_cache_key"] = _meta["cache_object_key"]
+            # Póster para el filmstrip (best-effort). Sólo si cambió el clip.
+            if regen_keys is None or key in regen_keys or not scene.get("thumb_key"):
+                _tk = _persist_scene_thumb(clip_path, key, job_id)
+                if _tk:
+                    scene["thumb_key"] = _tk
+            clip_for_key[key] = clip_path
+            first_ok = first_ok or clip_path
+        except Exception as e:  # noqa: BLE001
+            logger.error("[SCENES] escena %s falló (%s) — se sustituye por una válida", key, e)
+            scene["status"] = "failed"
+    if not first_ok:
+        raise RuntimeError("ninguna escena Veo se generó — fallback a fondo único")
+    # Rellenar las que fallaron con un clip válido (mantiene el timeline entero).
+    for scene in scene_plan.get("scenes", []):
+        clip_for_key.setdefault(scene["recurrence_key"], first_ok)
+    return clip_for_key
+
+
+def _generate_scene_background(segments: list[dict], audio_duration: float,
+                              job_dir: str, *, style_hint: str, lyrics_text: str,
+                              artist: str, song_title: str = "", genre: str = "",
+                              concept: str = "", movement_style: str = "",
+                              custom_colors: str = "", background_hint: str | None = None,
+                              bg_verbatim: bool = False, allow_people: bool = False,
+                              job_id: str = None, target_w: int = 1920,
+                              target_h: int = 1080) -> tuple[str, dict]:
+    """Orquesta el fondo multi-escena. Devuelve (timeline_path, scene_plan).
+
+    detect → biblia → scene plan → N clips Veo (con recurrencia de coro) →
+    stitch con xfade. El timeline cubre toda la canción y entra al render con
+    bg_prelooped=True. Cualquier fallo levanta para que run_pipeline caiga al
+    camino de fondo único (cero regresión).
+    """
+    import scenes as _scenes
+    secs = _scenes.detect_sections(segments, audio_duration)
+    n_unique = len({s.recurrence_key for s in secs})
+    logger.info("[SCENES] %d secciones, %d escenas únicas (canción %.0fs)",
+                len(secs), n_unique, audio_duration or 0.0)
+    bible = _build_visual_bible(lyrics_text, artist, song_title, genre, concept,
+                                style_hint, custom_colors, job_id,
+                                background_hint=background_hint, bg_verbatim=bg_verbatim)
+    prompt_fn = _make_scene_prompt_fn(lyrics_text, artist, song_title, genre,
+                                      concept, style_hint, custom_colors, job_id,
+                                      allow_people)
+    plan = _scenes.build_scene_plan(secs, bible, prompt_fn, artist=artist,
+                                    song_title=song_title, style=style_hint,
+                                    operator_movement=movement_style)
+    clip_for_key = _generate_scene_clips(plan, job_dir, artist=artist,
+                                         song_title=song_title, concept=concept,
+                                         job_id=job_id, allow_people=allow_people)
+    # Audit M3: exponer fallo parcial a nivel job. Las escenas fallidas se
+    # sustituyen por un clip válido (degradación), pero el operador debe saber
+    # cuántas — el filmstrip ya marca ⚠ por escena; esto da el agregado para un
+    # badge a nivel job sin abrir el filmstrip.
+    _failed = sum(1 for s in plan.get("scenes", []) if s.get("status") == "failed")
+    plan["degraded"] = {"failed": _failed, "total": len(plan.get("scenes", []))}
+    # Audit LOW: persistir la duración usada como fuente única, así el re-stitch
+    # de un edit/regen no difiere por un frame entre _audio_duration y ffprobe.
+    plan["audio_duration"] = float(audio_duration or 0.0)
+    if _failed:
+        logger.warning("[SCENES] %d/%d escenas fallaron (degradado a clip reusado) para job=%s",
+                       _failed, len(plan.get("scenes", [])), job_id)
+    timeline = _scenes.stitch_timeline(secs, clip_for_key, audio_duration, job_dir,
+                                       target_w=target_w, target_h=target_h)
+    return timeline, plan
+
+
+def _regenerate_scene_background(scene_plan: dict, recurrence_key: str, job_dir: str, *,
+                                 artist: str, song_title: str, audio_duration: float,
+                                 concept: str = "", allow_people: bool = False,
+                                 job_id: str = None, prompt_override: str = "",
+                                 hint: str = "", movement_style: str = "",
+                                 lyrics_text: str = "", genre: str = "",
+                                 style_hint: str = "", custom_colors: str = "",
+                                 target_w: int = 1920, target_h: int = 1080) -> tuple[str, dict]:
+    """Regenera UNA escena del plan y re-arma el timeline. Devuelve
+    (timeline_path, scene_plan_actualizado).
+
+    Quirúrgico y barato: sólo la escena `recurrence_key` se regenera en Veo
+    (cache_token nuevo → cache miss); las demás re-bajan su clip de la caché R2
+    (mismo prompt+token → cache HIT, sin costo). Luego re-stitch del timeline.
+
+    Tres modos según lo que pida el operador:
+      - prompt_override: reemplaza el prompt de la escena tal cual.
+      - hint: re-deriva el prompt heredando la biblia + el hint del operador.
+      - ninguno ("otra toma"): mismo prompt, sólo el token nuevo → otra versión.
+    """
+    import scenes as _scenes
+    import uuid
+
+    target = next((s for s in scene_plan.get("scenes", [])
+                   if s.get("recurrence_key") == recurrence_key), None)
+    if target is None:
+        raise ValueError(f"escena {recurrence_key!r} no existe en el plan")
+
+    if movement_style:
+        target["movement_style"] = movement_style
+    if (prompt_override or "").strip():
+        target["prompt"] = prompt_override.strip()
+    elif (hint or "").strip():
+        # Re-derivar el prompt con el hint, heredando la biblia (coherencia).
+        prompt_fn = _make_scene_prompt_fn(lyrics_text, artist, song_title, genre,
+                                          concept, style_hint, custom_colors, job_id,
+                                          allow_people)
+        bible_text = _scenes._bible_to_prompt_fragment(scene_plan.get("bible") or {})
+        base_hint = ". ".join(x for x in (bible_text, hint.strip()) if x)
+        try:
+            res = prompt_fn(background_hint=base_hint,
+                            movement_style=target.get("movement_style", ""),
+                            section_type=target.get("section_type", ""),
+                            energy=target.get("energy", 0.5))
+            target["prompt"] = (res or {}).get("prompt") or target["prompt"]
+        except Exception as e:  # noqa: BLE001
+            logger.warning("[SCENES] regen prompt_fn falló (%s); mantengo prompt", e)
+
+    # Bust de caché → Veo fresco SÓLO para esta escena. Guardamos la key vieja
+    # para GC tras generar la nueva (audit M8: sin esto cada "otra toma" deja un
+    # clip pago huérfano en cache/veo/ para siempre).
+    _old_clip_key = target.get("clip_cache_key")
+    target["cache_token"] = uuid.uuid4().hex[:8]
+    target["status"] = "planned"
+
+    clip_for_key = _generate_scene_clips(scene_plan, job_dir, artist=artist,
+                                         song_title=song_title, concept=concept,
+                                         job_id=job_id, allow_people=allow_people,
+                                         regen_keys={recurrence_key})
+    # GC del clip viejo (audit M8): sólo si la regen produjo uno NUEVO distinto.
+    _new_clip_key = target.get("clip_cache_key")
+    if _old_clip_key and _new_clip_key and _old_clip_key != _new_clip_key:
+        try:
+            import storage as _storage
+            if _storage.is_enabled():
+                _storage.delete_object(_old_clip_key)
+                logger.info("[SCENES] GC clip Veo viejo %s (regen %s)", _old_clip_key, recurrence_key)
+        except Exception as _e:  # noqa: BLE001
+            logger.warning("[SCENES] GC del clip viejo falló (%s) — huérfano queda en R2", _e)
+    sections = _scenes.sections_from_plan(scene_plan)
+    timeline = _scenes.stitch_timeline(sections, clip_for_key, audio_duration, job_dir,
+                                       target_w=target_w, target_h=target_h)
+    return timeline, scene_plan
+
+
+def _restitch_scenes_for_edit(scene_plan: dict, segments: list[dict],
+                              audio_duration: float, job_dir: str, *, artist: str,
+                              song_title: str, concept: str = "",
+                              allow_people: bool = False, job_id: str = None,
+                              target_w: int = 1920, target_h: int = 1080):
+    """Re-arma el timeline multi-escena con la LETRA editada, SIN Veo.
+
+    Audit M1: un edit de lyrics cambia los timings; las secciones persistidas
+    quedan stale y los cortes desincronizan. Acá re-detectamos secciones con los
+    segments nuevos y re-stitcheamos desde los clips CACHEADOS (cache_only → cero
+    costo). Sólo si la estructura de recurrencia no cambió (las keys nuevas son
+    subconjunto de las que ya tienen clip); si cambió, devolvemos (None, plan)
+    y el caller reusa el timeline cacheado estático (degradación segura).
+    """
+    import scenes as _scenes
+    new_secs = _scenes.detect_sections(segments, audio_duration)
+    new_keys = {s.recurrence_key for s in new_secs}
+    have_keys = {sc.get("recurrence_key") for sc in scene_plan.get("scenes", [])}
+    if not new_keys or not new_keys.issubset(have_keys):
+        return None, scene_plan  # estructura cambió → no es seguro re-stitch
+    scene_plan = {**scene_plan, "sections": [s.to_dict() for s in new_secs]}
+    # regen_keys=set() → TODAS las escenas son cache_only (ninguna paga Veo).
+    clip_for_key = _generate_scene_clips(scene_plan, job_dir, artist=artist,
+                                         song_title=song_title, concept=concept,
+                                         job_id=job_id, allow_people=allow_people,
+                                         regen_keys=set())
+    timeline = _scenes.stitch_timeline(new_secs, clip_for_key, audio_duration,
+                                       job_dir, target_w=target_w, target_h=target_h)
+    return timeline, scene_plan
 
 
 def _ensure_background(style_hint: str, job_dir: str, lyrics_text: str = None,
@@ -8358,6 +8847,52 @@ def _cover_resize(clip, target_w=1920, target_h=1080):
     return resized.crop(x1=x_offset, y1=y_offset, width=target_w, height=target_h)
 
 
+def _video_dims(path: str) -> tuple[int, int] | None:
+    """Return (width, height) of a video's first stream, or None on failure."""
+    try:
+        r = subprocess.run(
+            ["ffprobe", "-v", "error", "-select_streams", "v:0",
+             "-show_entries", "stream=width,height",
+             "-of", "csv=s=x:p=0", path],
+            capture_output=True, text=True, timeout=30,
+        )
+        w, h = (r.stdout or "").strip().split("x")
+        return int(w), int(h)
+    except Exception:
+        return None
+
+
+def _normalize_bg_to_spec(bg_path: str, job_dir: str,
+                          target_w=1920, target_h=1080,
+                          out_name: str = "bg_normalized.mp4") -> str:
+    """Scale/crop a full-length background to the spec dims WITHOUT looping.
+
+    Used by the multi-escena path: scenes.stitch_timeline already produced a
+    timeline covering the whole song, so we must not palindrome-loop it (that
+    would play the scenes in reverse at the tail). If the timeline already
+    matches the target dims this is a no-op (returns the input path) to avoid
+    a wasteful full-length re-encode — common case, since the stitch runs at
+    the YouTube 1920x1080 dims and only off-size UMG specs need a rescale.
+    """
+    dims = _video_dims(bg_path)
+    if dims == (target_w, target_h):
+        return bg_path
+    out_path = os.path.join(job_dir, out_name)
+    cmd = [
+        "ffmpeg", "-y", "-loglevel", "error",
+        "-i", bg_path,
+        "-vf", (
+            f"scale={target_w}:{target_h}:force_original_aspect_ratio=increase,"
+            f"crop={target_w}:{target_h},setsar=1"
+        ),
+        "-c:v", "libx264", "-preset", "fast", "-crf", "20",
+        "-pix_fmt", "yuv420p", "-an",
+        out_path,
+    ]
+    run_checked(cmd, label="ffmpeg-scenes-normalize", timeout=1800, output_path=out_path)
+    return out_path
+
+
 def _prerender_looped_bg(bg_path: str, duration: float, job_dir: str,
                          target_w=1920, target_h=1080,
                          out_name: str = "bg_looped.mp4") -> str:
@@ -8561,7 +9096,8 @@ def _attach_close_chain(target_clip, owned_clips):
 
 
 def _get_background_clip_from_path(bg_path: str, style: str, duration: float,
-                                   job_dir: str = None, spec: RenderSpec | None = None):
+                                   job_dir: str = None, spec: RenderSpec | None = None,
+                                   bg_prelooped: bool = False):
     """Load a background video, loop it seamlessly via ffmpeg, return clip.
 
     Always returns a single VideoFileClip whose lifetime is owned by the
@@ -8583,12 +9119,16 @@ def _get_background_clip_from_path(bg_path: str, style: str, duration: float,
     except Exception as e:
         raise RuntimeError(f"Cannot load background video: {e}")
 
-    if clip_dur >= duration:
+    # Audit M2: bg_prelooped = timeline full-length de multi-escena → NUNCA
+    # palindromear (las escenas se reproducirían en reversa al final). Forzamos
+    # el branch de subclip aunque por redondeo el clip quede unos ms más corto.
+    if bg_prelooped or clip_dur >= duration:
         # Open ONCE, derive subclip + cover-resize, attach the source so
         # the caller's eventual close() releases the underlying ffmpeg
         # reader.
         src = VideoFileClip(bg_path)
-        derived = _cover_resize(src.subclip(0, duration), spec.width, spec.height)
+        _end = min(duration, clip_dur) if bg_prelooped else duration
+        derived = _cover_resize(src.subclip(0, _end), spec.width, spec.height)
         return _attach_close_chain(derived, [src])
 
     # Always pre-render a single seamless loop file. The job_dir-supplied
@@ -8687,6 +9227,44 @@ _FONT_CATALOGUE = [
     {"id": "oswald-bold",      "filename": "Oswald-Bold.ttf",          "label": "Oswald",                    "google_family": "Oswald",      "google_weight": 700},
     {"id": "anton",            "filename": "Anton-Regular.ttf",        "label": "Anton",                     "google_family": "Anton",       "google_weight": 400},
 ]
+
+
+def _pick_concrete_font(font_id: str, job_id: str, job_dir: str, deterministic: bool) -> str | None:
+    """Resuelve el font id del operador a un path; si vino vacío ("Auto"),
+    ELIGE del pool acá — una sola vez por render — y persiste el id elegido
+    en render_params para que retries/edits/re-renders mantengan la misma
+    tipografía.
+
+    Incidente UMG Chile 2026-06-11 ("les está cambiando la letra en los
+    shorts"): con Auto, generate_lyric_video elegía la fuente ADENTRO y el
+    short recibía font=None → moviepy caía a la fuente default de
+    ImageMagick (una stencil hueca que no está en el catálogo). Video y
+    short nunca compartían la elección, y cada re-render rotaba la fuente.
+    deterministic=True (perfil UMG) usa el seed por job_dir, igual que el
+    pick histórico de generate_lyric_video.
+    """
+    path = _resolve_font(font_id)
+    if path:
+        return path
+    if not _FONT_POOL:
+        return None
+    if deterministic:
+        seed = int(hashlib.sha1(job_dir.encode()).hexdigest()[:8], 16)
+        path = _FONT_POOL[seed % len(_FONT_POOL)]
+    else:
+        path = random.choice(_FONT_POOL)
+    # Persistir el id (no el path) para que el próximo render del job no
+    # vuelva a sortear. Best-effort: si falla, el render sigue igual.
+    picked = os.path.basename(path)
+    picked_id = next((e["id"] for e in _FONT_CATALOGUE if e["filename"] == picked), None)
+    if picked_id:
+        try:
+            from jobs import merge_render_params
+            merge_render_params(job_id, {"font": picked_id})
+            logger.info("[FONT] Auto pick persistido: %s (%s)", picked_id, picked)
+        except Exception as e:
+            logger.warning("[FONT] no pude persistir el pick %s: %s", picked_id, e)
+    return path
 
 
 def _resolve_font(font_id: str) -> str | None:
@@ -9528,6 +10106,12 @@ def _render_lyrics_ass(
     title_song_font: str = "",
     # UI v1.1 (2026-05-30): manual song-title line break. "" = auto wrap.
     title_song_break: str = "",
+    # Multi-escena ("Escenas"): cuando el caller ya armó un timeline del largo
+    # completo (scenes.stitch_timeline concatena las escenas con xfade), pasa
+    # bg_prelooped=True para que NO se vuelva a loopear/palindromear acá — el
+    # timeline ya cubre toda la canción. Default False = camino histórico de
+    # fondo único (se loopea el clip Veo corto).
+    bg_prelooped: bool = False,
 ) -> str:
     """Fast lyric render: burn the lyrics with libass in a single ffmpeg
     pass over the (ffmpeg-looped) background — no moviepy frame loop.
@@ -9552,11 +10136,23 @@ def _render_lyrics_ass(
     shadow = max(1, int(round(3 * scale)))
 
     # 1) Background → looped file at the target dims (ffmpeg, C-level).
-    bg_looped = _prerender_looped_bg(
-        bg_video_path, duration, job_dir,
-        target_w=spec.width, target_h=spec.height,
-        out_name="bg_looped_ass.mp4",
-    )
+    #    Multi-escena: si el caller ya entregó un timeline del largo completo
+    #    (escenas concatenadas con xfade), lo usamos tal cual — re-loopearlo
+    #    haría un palíndromo del timeline entero (reproduciría las escenas en
+    #    reversa al final). Igual lo normalizamos a las dims del spec por si el
+    #    stitch corrió a otra resolución.
+    if bg_prelooped:
+        bg_looped = _normalize_bg_to_spec(
+            bg_video_path, job_dir,
+            target_w=spec.width, target_h=spec.height,
+            out_name="bg_looped_ass.mp4",
+        )
+    else:
+        bg_looped = _prerender_looped_bg(
+            bg_video_path, duration, job_dir,
+            target_w=spec.width, target_h=spec.height,
+            out_name="bg_looped_ass.mp4",
+        )
 
     # 2) Fonts: the lyric font + the title-card fonts. The title card can use
     #    operator-chosen fonts per element (Full Rotor v1); defaults keep the
@@ -9798,6 +10394,9 @@ def generate_lyric_video(
     title_song_font: str = "",
     # UI v1.1 (2026-05-30): manual song-title line break ("" = auto wrap).
     title_song_break: str = "",
+    # Multi-escena: bg_image_path ya es un timeline del largo completo (escenas
+    # con xfade) → no re-loopear en el render. Se propaga a _render_lyrics_ass.
+    bg_prelooped: bool = False,
 ) -> tuple[str, str, str | None]:
     """Generate a lyric video. Returns (video_path, font, bg_source).
 
@@ -9907,6 +10506,7 @@ def generate_lyric_video(
                 title_template=title_template, title_size=title_size,
                 title_artist_font=title_artist_font, title_song_font=title_song_font,
                 title_song_break=title_song_break,
+                bg_prelooped=bg_prelooped,
             )
             logger.info("[ASS] render: %.1fs (engine=ass)", _time.monotonic() - _t0)
             audio.close()
@@ -9922,7 +10522,8 @@ def generate_lyric_video(
     if bg_source.lower().endswith((".jpg", ".jpeg", ".png")):
         bg = _ken_burns_clip(bg_source, duration, spec=spec)
     else:
-        bg = _get_background_clip_from_path(bg_source, style, duration, job_dir, spec=spec)
+        bg = _get_background_clip_from_path(bg_source, style, duration, job_dir, spec=spec,
+                                            bg_prelooped=bg_prelooped)
 
     # Build text clips — each segment gets its own shadow + text
     text_layers = []
@@ -10448,6 +11049,144 @@ def _apply_short_effect(short_path: str, fx_path: str, fps: float, job_dir: str)
     return short_path
 
 
+def _build_short_ass_doc(
+    window_segments: list[dict],
+    *,
+    font_path: str,
+    text_case: str,
+    font_scale: float,
+    lyric_color: str,
+    lyric_sung_color: str,
+    text_contrast: str,
+    lyrics_animation: str,
+    line_transition: str,
+) -> str:
+    """Documento ASS del short (1080x1920) con EXACTAMENTE las mismas
+    derivaciones de estilo que _render_lyrics_ass usa para el video
+    (familia/bold por font_family, fontsize por lyric_fontsize a
+    scale=1.0, outline por contraste, shadow=3) — función pura para que
+    el test de paridad compare Style line contra el doc del video."""
+    import ass_render as _ass
+
+    scale = 1.0
+    contrast = _CONTRAST_SETTINGS.get(text_contrast, _CONTRAST_SETTINGS["medium"])
+    outline = max(1.0, contrast["stroke_mult"] * scale)
+    shadow = max(1, int(round(3 * scale)))
+    family, bold = _ass.font_family(font_path)
+    font_factor = _ass.font_size_factor(family)
+
+    # Segmentos re-basados, SIN overrides de layout del editor (pos/scale/
+    # rot son coordenadas del frame 16:9 — el short siempre centra).
+    clean_segments = [
+        {"start": s["start"], "end": s["end"], "text": s["text"]}
+        for s in window_segments
+    ]
+    lines = _ass.segments_to_lines(
+        clean_segments,
+        text_scale=scale,
+        font_scale=font_scale,
+        font_factor=font_factor,
+        lyric_transition="cut",
+        animation=lyrics_animation,
+        transition=line_transition,
+        case_fn=lambda t: _apply_case(t, text_case),
+    )
+    if lyrics_animation == "karaoke":
+        primary_for_lines = lyric_sung_color or ""
+        secondary_for_lines = lyric_color or ""
+    else:
+        primary_for_lines = lyric_color or ""
+        secondary_for_lines = ""
+    base_fs = _ass.lyric_fontsize(40, scale, font_scale, font_factor=font_factor)
+    return _ass.build_ass(
+        width=1080, height=1920,
+        font_name=family, base_fontsize=base_fs,
+        outline=outline, shadow=shadow, lines=lines, bold=bold,
+        margin_v=0, alignment=5,
+        primary_color=primary_for_lines,
+        secondary_color=secondary_for_lines,
+    )
+
+
+def _burn_short_text_ass(
+    bg_short_path: str,
+    window_segments: list[dict],
+    job_dir: str,
+    short_dur: float,
+    fps: float,
+    *,
+    font_path: str,
+    text_case: str,
+    font_scale: float,
+    lyric_color: str,
+    lyric_sung_color: str,
+    text_contrast: str,
+    lyrics_animation: str,
+    line_transition: str,
+) -> str | None:
+    """Quema la letra del short con LIBASS — el MISMO motor del video.
+
+    Incidente UMG Chile 2026-06-11/12 (tercera vuelta): aunque video y
+    short usaran la MISMA TTF, se veían distintos — el video renderiza
+    con libass (faux-bold + outline exterior) y el short con
+    ImageMagick/moviepy (stroke centrado que se come el relleno → letras
+    más flacas, look "hueco"). Dos motores nunca van a ser idénticos:
+    la única paridad real es UN solo motor. Bonus: el short hereda las
+    animaciones reales (karaoke per-word, transiciones) que el camino
+    moviepy no replicaba.
+
+    Misma derivación que _render_lyrics_ass: text_scale=1.0 (el frame es
+    1080 de ANCHO, igual que el alto del video 1080p → mismo tamaño de
+    glifo), outline/shadow por contraste, font_size_factor por familia.
+    Las líneas largas las envuelve libass (WrapStyle 0). Los overrides de
+    posición/escala del editor (pos/scale/rot, coordenadas del frame
+    16:9) NO se trasladan al frame vertical — el short siempre centra
+    (\an5), igual que el comportamiento histórico.
+
+    Devuelve el path del short con texto, o None si la pasada falla (el
+    caller cae al camino moviepy histórico — un short con texto "menos
+    idéntico" es mejor que un short sin letra)."""
+    import ass_render as _ass
+
+    try:
+        font_dir = _ass.single_font_dir(font_path)
+        ass_doc = _build_short_ass_doc(
+            window_segments,
+            font_path=font_path,
+            text_case=text_case, font_scale=font_scale,
+            lyric_color=lyric_color, lyric_sung_color=lyric_sung_color,
+            text_contrast=text_contrast,
+            lyrics_animation=lyrics_animation, line_transition=line_transition,
+        )
+        ass_path = os.path.join(job_dir, "short_lyrics.ass")
+        with open(ass_path, "w", encoding="utf-8") as f:
+            f.write(ass_doc)
+
+        out_tmp = os.path.join(job_dir, "short_ass_tmp.mp4")
+        # Mismo escaping canónico que el burn del video (fx_compositor).
+        cmd = [
+            "ffmpeg", "-y", "-loglevel", "error",
+            "-i", os.path.basename(bg_short_path),
+            "-vf", f"subtitles=short_lyrics.ass:fontsdir={_ffmpeg_filter_escape(font_dir)}",
+            "-c:v", "libx264", "-preset", "veryfast", "-crf", "20",
+            "-pix_fmt", "yuv420p",
+            "-c:a", "copy", "-movflags", "+faststart",
+            "-r", str(fps), os.path.basename(out_tmp),
+        ]
+        r = subprocess.run(cmd, capture_output=True, text=True,
+                           timeout=600, cwd=job_dir)
+        if r.returncode != 0 or not os.path.exists(out_tmp):
+            logger.warning("[SHORT] libass text burn failed (%s) — fallback moviepy",
+                           (r.stderr or "")[-300:])
+            return None
+        logger.info("[SHORT] texto quemado con libass (font=%s anim=%s)",
+                    os.path.basename(font_path), lyrics_animation)
+        return out_tmp
+    except Exception as e:
+        logger.warning("[SHORT] libass text pass errored (%s) — fallback moviepy", e)
+        return None
+
+
 def generate_short(
     mp3_path: str,
     segments: list[dict],
@@ -10482,6 +11221,16 @@ def generate_short(
     do a pure recode when UMG asks for a non-24 frame rate. Stays at 24
     by default for the YouTube-only path.
     """
+    # Cinturón (incidente UMG Chile 2026-06-11): si por CUALQUIER camino
+    # llega font vacío/None, elegir del pool con seed determinístico por
+    # job_dir en vez de dejar que moviepy caiga a la stencil default de
+    # ImageMagick — el short SIEMPRE sale con una fuente del catálogo.
+    if not font and _FONT_POOL:
+        _seed = int(hashlib.sha1(job_dir.encode()).hexdigest()[:8], 16)
+        font = _FONT_POOL[_seed % len(_FONT_POOL)]
+        logger.warning("[SHORT] font vacío — fallback determinístico del pool: %s",
+                       os.path.basename(font))
+
     import fx_compositor as _fx
 
     audio = AudioFileClip(mp3_path)
@@ -10526,11 +11275,9 @@ def generate_short(
             .clip(0, 255).astype("uint8")
         )
 
-    # Build text clips for this 30s window. Honor the operator's case/scale/
-    # color/contrast (parity with the main video); apply a soft crossfade when
-    # a line transition is selected.
-    _do_fade = (line_transition or "none") not in ("none", "cut", "")
-    text_layers = []
+    # Ventana de segmentos del short, re-basada a t=0 (la consumen tanto la
+    # pasada libass como el fallback moviepy).
+    window_segments = []
     for seg in segments:
         if seg["end"] <= start_time or seg["start"] >= end_time:
             continue
@@ -10538,17 +11285,15 @@ def generate_short(
         e = min(short_dur, seg["end"] - start_time)
         if e - s < 0.1:
             continue
-        layers = _make_short_text_clip(
-            seg["text"], s, e, font,
-            text_case=text_case, font_scale=font_scale,
-            lyric_color=lyric_color, text_contrast=text_contrast,
-        )
-        if _do_fade:
-            fd = min(0.25, (e - s) / 3.0)
-            layers = [c.crossfadein(fd).crossfadeout(fd) for c in layers]
-        text_layers.extend(layers)
+        window_segments.append({**seg, "start": s, "end": e})
 
-    final = CompositeVideoClip([bg] + text_layers, size=(1080, 1920))
+    # PASADA 1 — fondo + audio, SIN texto (moviepy, como siempre).
+    # PASADA 2 — el texto lo quema LIBASS, el mismo motor del video.
+    # Incidente UMG Chile (3ª vuelta, 2026-06-12): misma TTF en dos motores
+    # ≠ misma letra en pantalla — ImageMagick dibuja el stroke comiéndose
+    # el relleno y sin el faux-bold de libass. Un solo motor = paridad real
+    # (y el short hereda karaoke/transiciones de verdad).
+    final = CompositeVideoClip([bg], size=(1080, 1920))
     final = final.set_audio(short_audio).set_duration(short_dur)
 
     # 2026-05-26 OOM mitigation: workers SIGKILL'd at progress=75% on
@@ -10557,8 +11302,9 @@ def generate_short(
     gc.collect()
 
     out_path = os.path.join(job_dir, "short.mp4")
+    bg_only_path = os.path.join(job_dir, "short_bg_only.mp4")
     final.write_videofile(
-        out_path,
+        bg_only_path,
         fps=fps,
         codec="libx264",
         audio_codec="aac",
@@ -10569,6 +11315,68 @@ def generate_short(
     )
     audio.close()
     final.close()
+
+    burned = _burn_short_text_ass(
+        bg_only_path, window_segments, job_dir, short_dur, fps,
+        font_path=font,
+        text_case=text_case, font_scale=font_scale,
+        lyric_color=lyric_color, lyric_sung_color=lyric_sung_color,
+        text_contrast=text_contrast,
+        lyrics_animation=lyrics_animation, line_transition=line_transition,
+    )
+    if burned:
+        os.replace(burned, out_path)
+    else:
+        # Fallback histórico (moviepy/ImageMagick): texto menos idéntico al
+        # video, pero un short SIN letra sería peor. Además de loggearse,
+        # se ALERTA en Sentry: este es el único camino que puede volver a
+        # producir la divergencia tipográfica del incidente UMG Chile —
+        # si dispara, hay que enterarse antes que el cliente.
+        try:
+            import sentry_sdk
+            with sentry_sdk.push_scope() as _scope:
+                _job_tag = os.path.basename(job_dir.rstrip("/"))
+                _scope.fingerprint = ["short-libass-fallback"]
+                _scope.set_tag("job_id", _job_tag)
+                sentry_sdk.capture_message(
+                    f"[SHORT-FALLBACK] {_job_tag}: la pasada libass falló — el short "
+                    "salió con el motor moviepy (tipografía puede diferir del video)",
+                    level="error",
+                )
+        except Exception:
+            pass  # sin Sentry (dev/tests) el log de arriba alcanza
+        _do_fade = (line_transition or "none") not in ("none", "cut", "")
+        text_layers = []
+        for seg in window_segments:
+            layers = _make_short_text_clip(
+                seg["text"], seg["start"], seg["end"], font,
+                text_case=text_case, font_scale=font_scale,
+                lyric_color=lyric_color, text_contrast=text_contrast,
+            )
+            if _do_fade:
+                fd = min(0.25, (seg["end"] - seg["start"]) / 3.0)
+                layers = [c.crossfadein(fd).crossfadeout(fd) for c in layers]
+            text_layers.extend(layers)
+        bg_clip = VideoFileClip(bg_only_path)
+        composite = CompositeVideoClip([bg_clip] + text_layers, size=(1080, 1920))
+        composite = composite.set_duration(short_dur)
+        gc.collect()
+        composite.write_videofile(
+            out_path,
+            fps=fps,
+            codec="libx264",
+            audio_codec="aac",
+            threads=2,
+            preset="veryfast",
+            ffmpeg_params=["-movflags", "+faststart"],
+            logger=None,
+        )
+        composite.close()
+        bg_clip.close()
+    try:
+        os.unlink(bg_only_path)
+    except OSError:
+        pass
 
     # Effect overlay (snow/rain/stars/bokeh/light/aurora): screen-blend the
     # pre-baked fx loop over the short with ffmpeg — the SAME fx assets the
@@ -10777,6 +11585,9 @@ def run_edit_pipeline(
         prior_s3_keys = dict(job_row.s3_keys) if job_row.s3_keys else None
         version_n = int(job_row.edit_count or 0)
         prior_versions = list(job_row.previous_versions or [])
+        # Multi-escena: para edit_type=="scene" reconstruimos el timeline desde
+        # el storyboard persistido (regenerando sólo la escena pedida).
+        scene_plan = dict(job_row.scene_plan) if job_row.scene_plan else None
     finally:
         db.close()
 
@@ -10827,6 +11638,14 @@ def run_edit_pipeline(
     # generate time survives, but it only takes effect in the background
     # branch when a hint is actually present (see _get_unique_prompt).
     bg_verbatim = bool(merged.get("bg_verbatim"))
+    # Multi-escena (edit_type=="scene"): qué escena regenerar y cómo. El
+    # timeline ya es full-length → bg_prelooped=True para que el render NO lo
+    # vuelva a loopear/palindromear.
+    scene_key = edit_params.get("scene_key") or ""
+    scene_prompt_override = edit_params.get("scene_prompt") or ""
+    scene_hint = edit_params.get("scene_hint") or ""
+    scene_movement = edit_params.get("scene_movement") or ""
+    bg_prelooped = False
 
     job_dir = os.path.join(OUTPUTS_DIR, job_id)
     os.makedirs(job_dir, exist_ok=True)
@@ -10889,23 +11708,54 @@ def run_edit_pipeline(
             # artist/song_title (already persisted by the /edit handler
             # before this worker spawned — see main.py:request_edit).
             update_job(job_id, status="editing", current_step="video", progress=35)
+            _is_scene_job = bool(scene_plan and scene_plan.get("scenes"))
+            # Audit M1: en un edit de LYRICS sobre un job multi-escena, los
+            # timings cambiaron → re-detectamos secciones y re-stitcheamos desde
+            # los clips cacheados (sin Veo) para que los cortes sigan cayendo en
+            # los cambios de la canción. Si la estructura cambió o falla, caemos
+            # al timeline cacheado estático.
+            if edit_type == "lyrics" and _is_scene_job:
+                _sc_audio = scene_plan.get("audio_duration")
+                if not _sc_audio:
+                    try:
+                        _sc_audio = _audio_duration(mp3_path)
+                    except Exception:
+                        _sc_audio = _ffprobe_duration(mp3_path)
+                try:
+                    _re_tl, scene_plan = _restitch_scenes_for_edit(
+                        scene_plan, segments, _sc_audio, job_dir, artist=artist,
+                        song_title=song_title, concept=concept,
+                        allow_people=_compute_allow_people(job_id), job_id=job_id)
+                    if _re_tl:
+                        bg_image_path = _re_tl
+                        bg_prelooped = True
+                        update_job(job_id, scene_plan=scene_plan)
+                        logger.info("[EDIT] escenas re-stitcheadas con la letra editada (job=%s)", job_id)
+                except Exception as _e:  # noqa: BLE001
+                    logger.warning("[EDIT] re-stitch de escenas falló (%s) — uso timeline cacheado", _e)
             # La extensión viene de la key cacheada: para fondos humanos
             # puede ser .jpg/.png (imagen fija del usuario) y de ella
             # depende el manejo de stills aguas abajo. Antes estaba
             # hardcodeada .mp4 — un jpg cacheado se bajaba con nombre de
             # video (audit 2026-06-11).
-            _cached_ext = os.path.splitext(bg_r2_key_cached or "")[1].lower() or ".mp4"
-            bg_image_path = os.path.join(job_dir, f"bg_cached_edit{_cached_ext}")
-            if not os.path.exists(bg_image_path):
-                if bg_r2_key_cached and storage.is_enabled():
-                    ok = storage.download_object(bg_r2_key_cached, bg_image_path)
-                    if not ok:
-                        raise RuntimeError("Could not download cached background from R2")
-                else:
-                    raise RuntimeError(
-                        f"No cached background available for {edit_type} edit. "
-                        "Use edit_type='background' to regenerate it."
-                    )
+            if not bg_prelooped:
+                _cached_ext = os.path.splitext(bg_r2_key_cached or "")[1].lower() or ".mp4"
+                bg_image_path = os.path.join(job_dir, f"bg_cached_edit{_cached_ext}")
+                if not os.path.exists(bg_image_path):
+                    if bg_r2_key_cached and storage.is_enabled():
+                        ok = storage.download_object(bg_r2_key_cached, bg_image_path)
+                        if not ok:
+                            raise RuntimeError("Could not download cached background from R2")
+                    else:
+                        raise RuntimeError(
+                            f"No cached background available for {edit_type} edit. "
+                            "Use edit_type='background' to regenerate it."
+                        )
+                # Audit M1/M2: el bg cacheado de un job multi-escena ES el timeline
+                # full-length → bg_prelooped=True para que el render NO lo
+                # palindromee (si no, las escenas se reproducen en reversa al final).
+                if _is_scene_job:
+                    bg_prelooped = True
 
         elif edit_type == "background":
             update_job(job_id, status="editing", current_step="background", progress=22)
@@ -10934,15 +11784,48 @@ def run_edit_pipeline(
                         update_job(job_id, bg_r2_key_cached=new_bg_key)
                 except Exception as _e:
                     logger.warning("[EDIT] Warning: re-cache of new background failed: %s", _e)
+
+        elif edit_type == "scene":
+            # Regenerar UNA escena del storyboard y re-armar el timeline. Sólo
+            # esa escena toca Veo (cache_token nuevo); las demás re-bajan de la
+            # caché R2. El timeline resultante es full-length → bg_prelooped.
+            if not scene_plan or not scene_plan.get("scenes"):
+                raise RuntimeError("Este job no es multi-escena (sin scene_plan).")
+            if not scene_key:
+                raise RuntimeError("edit_type='scene' requiere scene_key.")
+            update_job(job_id, status="editing", current_step="scenes", progress=22)
+            lyrics_text = " ".join(seg.get("text", "") for seg in segments)
+            _scene_audio_dur = scene_plan.get("audio_duration")
+            if not _scene_audio_dur:
+                try:
+                    _scene_audio_dur = _audio_duration(mp3_path)
+                except Exception:
+                    _scene_audio_dur = _ffprobe_duration(mp3_path)
+            bg_image_path, scene_plan = _regenerate_scene_background(
+                scene_plan, scene_key, job_dir,
+                artist=artist, song_title=song_title,
+                audio_duration=_scene_audio_dur,
+                concept=concept, allow_people=_compute_allow_people(job_id),
+                job_id=job_id,
+                prompt_override=scene_prompt_override, hint=scene_hint,
+                movement_style=scene_movement,
+                lyrics_text=lyrics_text, genre=genre,
+                style_hint=style, custom_colors=custom_colors,
+            )
+            bg_prelooped = True
+            # Persistir el plan actualizado (clip nuevo, cache_token, thumb).
+            update_job(job_id, scene_plan=scene_plan, progress=35)
+
         else:
             raise ValueError(f"Unknown edit_type {edit_type!r}")
 
         # ----------------------------------------------------------------
-        # Resolve font
+        # Resolve font — misma elección para video Y short, persistida
+        # (fix incidente UMG Chile 2026-06-11, ver _pick_concrete_font).
         # ----------------------------------------------------------------
-        chosen_font = _resolve_font(font_id)
+        chosen_font = _pick_concrete_font(font_id, job_id, job_dir, deterministic=wants_umg)
         if chosen_font:
-            logger.info("[EDIT] Operator font: %s", os.path.basename(chosen_font))
+            logger.info("[EDIT] Font: %s", os.path.basename(chosen_font))
 
         # ----------------------------------------------------------------
         # Re-render video
@@ -10978,6 +11861,8 @@ def run_edit_pipeline(
             title_template=title_template, title_size=title_size,
             title_artist_font=title_artist_font, title_song_font=title_song_font,
             title_song_break=title_song_break,
+            # Multi-escena: el timeline ya cubre toda la canción → no re-loopear.
+            bg_prelooped=bg_prelooped,
         )
         files = {"video_url": f"/download/{job_id}/video"}
         update_job(job_id, progress=55)

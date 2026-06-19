@@ -14,7 +14,6 @@ _TOKEN_PATH = os.environ.get(
     "YOUTUBE_TOKEN_PATH",
     os.path.join(os.path.dirname(__file__), "youtube_token.json"),
 )
-# Make relative paths relative to backend dir
 if not os.path.isabs(_TOKEN_PATH):
     _TOKEN_PATH = os.path.join(os.path.dirname(__file__), _TOKEN_PATH)
 
@@ -25,22 +24,132 @@ _OAUTH_PATH = os.environ.get(
 if not os.path.isabs(_OAUTH_PATH):
     _OAUTH_PATH = os.path.join(os.path.dirname(__file__), _OAUTH_PATH)
 
+_YOUTUBE_SCOPES = [
+    "https://www.googleapis.com/auth/youtube.upload",
+    "https://www.googleapis.com/auth/youtube.readonly",
+]
+
+# In-memory upload progress: job_id → 0-100 int
+_upload_progress: dict = {}
+
+
+def get_upload_progress(job_id: str) -> int:
+    return _upload_progress.get(job_id, -1)
+
+
+def _clear_progress(job_id: str):
+    _upload_progress.pop(job_id, None)
+
+
+def _load_token_data():
+    """Carga el token de YouTube. Orden: DB (producción, sobrevive deploys)
+    → archivo local (dev). Devuelve (token_dict, source) donde source es
+    'db' | 'file' | None."""
+    try:
+        import youtube_oauth
+        data = youtube_oauth.load_system_token_standalone()
+        if data:
+            return data, "db"
+    except Exception:
+        # DriveTokenDecryptError u otra — cae al archivo si existe.
+        pass
+    if os.path.exists(_TOKEN_PATH):
+        with open(_TOKEN_PATH) as f:
+            return json.load(f), "file"
+    return None, None
+
+
+def _persist_token_data(token_data: dict, source: str):
+    """Guarda un access_token refrescado de vuelta en su origen."""
+    if source == "db":
+        import youtube_oauth
+        youtube_oauth.update_access_token_standalone(token_data)
+    else:
+        with open(_TOKEN_PATH, "w") as f:
+            json.dump(token_data, f)
+
 
 def _get_youtube_client():
-    """Get authenticated YouTube API client."""
-    with open(_TOKEN_PATH) as f:
-        token_data = json.load(f)
+    """Get authenticated YouTube API client, auto-refreshing expired tokens.
+
+    Lee el token de la DB (cuenta del sistema, persistente entre deploys)
+    con fallback al archivo local para dev. Si el access_token expiró, lo
+    refresca y persiste el nuevo en el mismo origen."""
+    token_data, source = _load_token_data()
+    if not token_data:
+        raise RuntimeError("youtube_not_connected")
 
     creds = Credentials(
-        token=token_data["token"],
-        refresh_token=token_data["refresh_token"],
-        token_uri=token_data["token_uri"],
-        client_id=token_data["client_id"],
-        client_secret=token_data["client_secret"],
-        scopes=token_data["scopes"],
+        token=token_data.get("token"),
+        refresh_token=token_data.get("refresh_token"),
+        token_uri=token_data.get("token_uri", "https://oauth2.googleapis.com/token"),
+        client_id=token_data.get("client_id"),
+        client_secret=token_data.get("client_secret"),
+        scopes=token_data.get("scopes"),
     )
 
+    if creds.expired and creds.refresh_token:
+        from google.auth.transport.requests import Request
+        try:
+            creds.refresh(Request())
+            token_data["token"] = creds.token
+            _persist_token_data(token_data, source)
+        except Exception as e:
+            if "invalid_grant" in str(e) or "Token has been expired or revoked" in str(e):
+                raise RuntimeError("youtube_token_expired")
+            raise
+
     return build("youtube", "v3", credentials=creds)
+
+
+def _map_youtube_error(e: Exception) -> str:
+    """Map raw Google API errors to frontend error codes."""
+    msg = str(e)
+    if "youtube_not_connected" in msg:
+        return "yt_not_connected"
+    if "youtube_token_expired" in msg or "invalid_grant" in msg or "Token has been expired" in msg:
+        return "yt_token_expired"
+    if "quotaExceeded" in msg or "dailyLimitExceeded" in msg:
+        return "yt_quota_exceeded"
+    if "uploadLimitExceeded" in msg:
+        return "yt_upload_limit"
+    if "forbidden" in msg.lower() or "insufficientPermissions" in msg:
+        return "yt_forbidden"
+    if "The user has not enabled" in msg or "disabled" in msg.lower():
+        return "yt_api_disabled"
+    if "videoNotFound" in msg:
+        return "yt_video_not_found"
+    return msg
+
+
+def get_connection_status() -> dict:
+    """Check if YouTube is connected and return live channel info.
+
+    Lee el token (DB → archivo) y hace un live check contra la YouTube
+    Data API, así reporta 'desconectado' si el token fue revocado aunque
+    siga existiendo la fila. El OAuth flow (connect/callback/disconnect)
+    vive en youtube_oauth.py, orquestado por los endpoints con `db`."""
+    token_data, _ = _load_token_data()
+    if not token_data:
+        return {"connected": False}
+    try:
+        youtube = _get_youtube_client()
+        resp = youtube.channels().list(part="snippet", mine=True).execute()
+        items = resp.get("items", [])
+        if not items:
+            return {"connected": True, "channel_name": None, "channel_id": None, "thumbnail": None}
+        ch = items[0]
+        return {
+            "connected": True,
+            "channel_name": ch["snippet"]["title"],
+            "channel_id": ch["id"],
+            "thumbnail": ch["snippet"].get("thumbnails", {}).get("default", {}).get("url"),
+            "channel_url": f"https://youtube.com/channel/{ch['id']}",
+        }
+    except RuntimeError as e:
+        return {"connected": False, "error": _map_youtube_error(e)}
+    except Exception as e:
+        return {"connected": False, "error": _map_youtube_error(e)}
 
 
 _LANG_NAMES = {
@@ -145,12 +254,10 @@ def generate_youtube_metadata(artist: str, song: str, lyrics_text: str = "", job
     # Apply client settings (template overrides)
     settings = _load_settings()
 
-    # Title from template
     title_fmt = settings.get("titleFormat", "")
     if title_fmt:
         metadata["title"] = title_fmt.replace("{artista}", artist).replace("{cancion}", song)
 
-    # Description: header + AI description + footer + hashtags
     desc_parts = []
     header = settings.get("descriptionHeader", "")
     if header:
@@ -164,12 +271,23 @@ def generate_youtube_metadata(artist: str, song: str, lyrics_text: str = "", job
         desc_parts.append(hashtags.replace("{artista}", artist).replace("{cancion}", song))
     metadata["description"] = "\n\n".join(desc_parts)
 
-    # Add mandatory tags
     mandatory = settings.get("mandatoryTags", "")
     if mandatory:
         extra_tags = [t.strip() for t in mandatory.split(",") if t.strip()]
         metadata["tags"] = extra_tags + metadata.get("tags", [])
 
+    return metadata
+
+
+def generate_short_metadata(artist: str, song: str, lyrics_text: str = "", job_id: str = None) -> dict:
+    """Generate YouTube metadata optimized for Shorts (adds #Shorts signal)."""
+    metadata = generate_youtube_metadata(artist, song, lyrics_text, job_id=job_id)
+    if "#Shorts" not in metadata["title"]:
+        metadata["title"] = f"{metadata['title']} #Shorts"[:100]
+    if "#Shorts" not in metadata["description"]:
+        metadata["description"] = f"#Shorts\n\n{metadata['description']}"
+    if "shorts" not in [t.lower() for t in metadata.get("tags", [])]:
+        metadata["tags"] = ["Shorts", "YouTubeShorts"] + metadata.get("tags", [])
     return metadata
 
 
@@ -181,18 +299,23 @@ def upload_to_youtube(
     lyrics_text: str = "",
     privacy: str = "unlisted",
     job_id: str = None,
+    title_override: str = None,
+    description_override: str = None,
 ) -> dict:
-    """Upload video + thumbnail to YouTube with AI-generated metadata.
-
-    Returns dict with video_id and url.
-    """
+    """Upload video + thumbnail to YouTube. Returns dict with video_id, url, title, privacy."""
     print(f"[YOUTUBE] Generating metadata for '{artist} - {song}'...")
     metadata = generate_youtube_metadata(artist, song, lyrics_text, job_id=job_id)
+    if title_override:
+        metadata["title"] = title_override
+    if description_override:
+        metadata["description"] = description_override
     print(f"[YOUTUBE] Title: {metadata['title']}")
 
-    youtube = _get_youtube_client()
+    try:
+        youtube = _get_youtube_client()
+    except RuntimeError as e:
+        raise RuntimeError(_map_youtube_error(e))
 
-    # Upload video
     body = {
         "snippet": {
             "title": metadata["title"],
@@ -202,7 +325,7 @@ def upload_to_youtube(
             "defaultLanguage": "es",
         },
         "status": {
-            "privacyStatus": privacy,  # unlisted for testing, public for production
+            "privacyStatus": privacy,
             "selfDeclaredMadeForKids": False,
         },
     }
@@ -210,22 +333,30 @@ def upload_to_youtube(
     print(f"[YOUTUBE] Uploading video ({os.path.getsize(video_path)/1024/1024:.1f} MB)...")
     media = MediaFileUpload(video_path, mimetype="video/mp4", resumable=True)
 
-    request = youtube.videos().insert(
-        part="snippet,status",
-        body=body,
-        media_body=media,
-    )
+    if job_id:
+        _upload_progress[job_id] = 0
 
-    response = None
-    while response is None:
-        status, response = request.next_chunk()
-        if status:
-            print(f"[YOUTUBE] Upload progress: {int(status.progress() * 100)}%")
+    try:
+        request = youtube.videos().insert(part="snippet,status", body=body, media_body=media)
+        response = None
+        while response is None:
+            status, response = request.next_chunk()
+            if status:
+                pct = int(status.progress() * 100)
+                if job_id:
+                    _upload_progress[job_id] = pct
+                print(f"[YOUTUBE] Upload progress: {pct}%")
+    except Exception as e:
+        _clear_progress(job_id)
+        raise RuntimeError(_map_youtube_error(e))
+
+    if job_id:
+        _upload_progress[job_id] = 100
 
     video_id = response["id"]
     print(f"[YOUTUBE] Video uploaded: https://youtube.com/watch?v={video_id}")
 
-    # Upload thumbnail
+    thumbnail_set = False
     if thumbnail_path and os.path.exists(thumbnail_path):
         try:
             print("[YOUTUBE] Setting thumbnail...")
@@ -233,13 +364,106 @@ def upload_to_youtube(
                 videoId=video_id,
                 media_body=MediaFileUpload(thumbnail_path, mimetype="image/jpeg"),
             ).execute()
+            thumbnail_set = True
             print("[YOUTUBE] Thumbnail set!")
         except Exception as e:
             print(f"[YOUTUBE] Thumbnail failed (needs verified account): {e}")
+
+    _clear_progress(job_id)
 
     return {
         "video_id": video_id,
         "url": f"https://youtube.com/watch?v={video_id}",
         "title": metadata["title"],
         "privacy": privacy,
+        "thumbnail_set": thumbnail_set,
+    }
+
+
+def upload_short_to_youtube(
+    short_path: str,
+    thumbnail_path: str,
+    artist: str,
+    song: str,
+    lyrics_text: str = "",
+    privacy: str = "unlisted",
+    job_id: str = None,
+    title_override: str = None,
+    description_override: str = None,
+) -> dict:
+    """Upload the Short (vertical 9:16) to YouTube with Shorts-optimised metadata."""
+    print(f"[YOUTUBE SHORT] Generating metadata for '{artist} - {song}'...")
+    metadata = generate_short_metadata(artist, song, lyrics_text, job_id=job_id)
+    if title_override:
+        metadata["title"] = title_override
+    if description_override:
+        metadata["description"] = description_override
+    print(f"[YOUTUBE SHORT] Title: {metadata['title']}")
+
+    try:
+        youtube = _get_youtube_client()
+    except RuntimeError as e:
+        raise RuntimeError(_map_youtube_error(e))
+
+    body = {
+        "snippet": {
+            "title": metadata["title"],
+            "description": metadata["description"],
+            "tags": metadata.get("tags", []),
+            "categoryId": metadata.get("category", "10"),
+            "defaultLanguage": "es",
+        },
+        "status": {
+            "privacyStatus": privacy,
+            "selfDeclaredMadeForKids": False,
+        },
+    }
+
+    print(f"[YOUTUBE SHORT] Uploading short ({os.path.getsize(short_path)/1024/1024:.1f} MB)...")
+    media = MediaFileUpload(short_path, mimetype="video/mp4", resumable=True)
+
+    if job_id:
+        _upload_progress[job_id + "_short"] = 0
+
+    try:
+        request = youtube.videos().insert(part="snippet,status", body=body, media_body=media)
+        response = None
+        while response is None:
+            status, response = request.next_chunk()
+            if status:
+                pct = int(status.progress() * 100)
+                if job_id:
+                    _upload_progress[job_id + "_short"] = pct
+                print(f"[YOUTUBE SHORT] Upload progress: {pct}%")
+    except Exception as e:
+        _clear_progress(job_id + "_short" if job_id else None)
+        raise RuntimeError(_map_youtube_error(e))
+
+    if job_id:
+        _upload_progress[job_id + "_short"] = 100
+
+    video_id = response["id"]
+    print(f"[YOUTUBE SHORT] Short uploaded: https://youtube.com/shorts/{video_id}")
+
+    thumbnail_set = False
+    if thumbnail_path and os.path.exists(thumbnail_path):
+        try:
+            print("[YOUTUBE SHORT] Setting thumbnail...")
+            youtube.thumbnails().set(
+                videoId=video_id,
+                media_body=MediaFileUpload(thumbnail_path, mimetype="image/jpeg"),
+            ).execute()
+            thumbnail_set = True
+            print("[YOUTUBE SHORT] Thumbnail set!")
+        except Exception as e:
+            print(f"[YOUTUBE SHORT] Thumbnail failed (needs verified account): {e}")
+
+    _clear_progress(job_id + "_short" if job_id else None)
+
+    return {
+        "video_id": video_id,
+        "url": f"https://youtube.com/shorts/{video_id}",
+        "title": metadata["title"],
+        "privacy": privacy,
+        "thumbnail_set": thumbnail_set,
     }

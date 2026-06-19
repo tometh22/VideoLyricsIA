@@ -83,7 +83,7 @@ function AdminShell({ onBack, isSuperAdmin }) {
           {/* Doble guard: el sidebar ya oculta la entrada, pero si el flag
               quedó stale en localStorage el render también la niega. La
               seguridad real son los 403 del backend. */}
-          {section === "insights" && isSuperAdmin && <InsightsSection />}
+          {section === "insights" && isSuperAdmin && <InsightsSection subTab={subTab} />}
           {section === "gestion" && <GestionSection subTab={subTab} />}
         </div>
       </div>

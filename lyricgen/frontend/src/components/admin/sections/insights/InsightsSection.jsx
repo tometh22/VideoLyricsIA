@@ -15,6 +15,8 @@ import FilterBar from "../../primitives/FilterBar";
 import KpiCard from "../../primitives/KpiCard";
 import MargenTenantsView from "../negocio/MargenTenantsView";
 import AdoptionPanel from "./AdoptionPanel";
+import FeatureDetailPanel from "./FeatureDetailPanel";
+import JobDetailPanel from "./JobDetailPanel";
 import ProblemsPanel from "./ProblemsPanel";
 import UserProfileView from "./UserProfileView";
 import WizardFunnelPanel from "./WizardFunnelPanel";
@@ -52,13 +54,17 @@ function DeltaHint({ delta }) {
   return `${arrow} ${Math.abs(pct)}% vs ventana anterior`;
 }
 
-export default function InsightsSection() {
+export default function InsightsSection({ subTab = "resumen" }) {
   const ins = useInsights();
   const { nav, overview, adoption, wizard, detail, economics, loading } = ins;
   const [userSearch, setUserSearch] = useState("");
   // Fila del ranking del usuario clickeado — alimenta los KPIs del perfil
   // (retrabajo/costo ya computados por overview, sin re-fetch).
   const [selectedUserRow, setSelectedUserRow] = useState(null);
+  // Profundidad (2026-06-11): drill de una barra de features + ficha de
+  // un video (modal, se abre desde cualquier lista).
+  const [featureDrill, setFeatureDrill] = useState(null);
+  const [jobDetailId, setJobDetailId] = useState(null);
 
   const kpis = overview?.kpis;
 
@@ -199,14 +205,57 @@ export default function InsightsSection() {
           <Spinner />
         </div>
       ) : nav.level === "user" ? (
+        // El perfil de usuario es una página completa — ignora las tabs
+        // (es el nivel más profundo del drill, todo el detalle junto).
         <>
-          <UserProfileView detail={detail} summaryRow={selectedUserRow} />
+          <UserProfileView
+            detail={detail}
+            summaryRow={selectedUserRow}
+            wizardSessions={ins.userEvents}
+            onJobClick={(jobId) => setJobDetailId(jobId)}
+          />
           <AdoptionPanel adoption={adoption} title="Qué features usa (y cuáles nunca tocó)" />
           <WizardFunnelPanel wizard={wizard} />
         </>
+      ) : subTab === "features" ? (
+        <>
+          <AdoptionPanel
+            adoption={adoption}
+            title={nav.level === "tenant" ? `Features que usa ${nav.tenantId}` : "Qué features se usan"}
+            onDrill={(feature, value, label) => setFeatureDrill({ feature, value, label })}
+          />
+          {featureDrill && (
+            <FeatureDetailPanel
+              drill={featureDrill}
+              days={ins.days}
+              tenantId={nav.tenantId}
+              onClose={() => setFeatureDrill(null)}
+              onUserClick={(u) => {
+                setFeatureDrill(null);
+                ins.drillUser(u.user_id);
+              }}
+              onJobClick={(jobId) => setJobDetailId(jobId)}
+            />
+          )}
+        </>
+      ) : subTab === "wizard" ? (
+        <WizardFunnelPanel wizard={wizard} />
+      ) : subTab === "margen" ? (
+        nav.level === "app" ? (
+          <MargenTenantsView economics={economics} loading={!economics} forbidden={false} />
+        ) : (
+          <MargenTenantsView
+            economics={economics && {
+              ...economics,
+              tenants: (economics.tenants || []).filter((t) => t.tenant_id === nav.tenantId),
+            }}
+            loading={!economics}
+            forbidden={false}
+          />
+        )
       ) : (
         <>
-          {/* KPIs del nivel */}
+          {/* Tab Resumen: KPIs + qué falló + drill-down de tenants/usuarios */}
           {kpis && (
             <div className="grid grid-cols-2 lg:grid-cols-4 gap-4">
               <KpiCard
@@ -237,15 +286,6 @@ export default function InsightsSection() {
             recentErrors={overview?.recent_errors || []}
             errorsByCategory={overview?.errors_by_category}
           />
-
-          <AdoptionPanel adoption={adoption} />
-          <WizardFunnelPanel wizard={wizard} />
-
-          {/* Margen por tenant (solo nivel app; super-admin como toda la
-              sección — mudado desde Negocio→Costos en la consolidación) */}
-          {nav.level === "app" && economics && (
-            <MargenTenantsView economics={economics} loading={false} forbidden={false} />
-          )}
 
           {/* Drill-down: tenants (solo nivel app) */}
           {nav.level === "app" && (overview?.tenants?.length ?? 0) > 1 && (
@@ -290,6 +330,10 @@ export default function InsightsSection() {
             />
           </div>
         </>
+      )}
+
+      {jobDetailId && (
+        <JobDetailPanel jobId={jobDetailId} onClose={() => setJobDetailId(null)} />
       )}
     </div>
   );

@@ -114,6 +114,37 @@ def has_drive_access(user) -> bool:
     return (tenant_id or "").lower() in DRIVE_ENABLED_TENANTS or (billing_group or "").lower() in DRIVE_ENABLED_TENANTS
 
 
+# Tenants/cuentas con acceso al add-on premium "Escenas" (multi-escena).
+# Mismo patrón canario que PRORES_TENANTS/DRIVE_ENABLED_TENANTS: default
+# vacío → solo admin. Se abre por env var sin redeploy de código:
+#   SCENES_ENABLED_TENANTS=umg,universal_music
+# Es un add-on OPT-IN: además del acceso, el job debe pedir enable_scenes.
+SCENES_ENABLED_TENANTS = {
+    t.strip().lower()
+    for t in os.environ.get("SCENES_ENABLED_TENANTS", "").split(",")
+    if t.strip()
+}
+
+
+def has_scenes_access(user) -> bool:
+    """True iff `user` puede usar el add-on premium "Escenas" (multi-escena).
+
+    Admin siempre pasa. Para no-admin se chequea contra SCENES_ENABLED_TENANTS
+    (vacío por defecto = solo admin), por tenant O por billing_group — mismo
+    criterio que has_prores_access, para que mover un usuario entre tenants de
+    la misma cuenta B2B no le saque el acceso. El opt-in real (enable_scenes)
+    se decide por job; esto sólo gobierna la ELEGIBILIDAD.
+    """
+    if user is None:
+        return False
+    role = getattr(user, "role", None) if not isinstance(user, dict) else user.get("role")
+    if role == "admin":
+        return True
+    tenant_id = getattr(user, "tenant_id", None) if not isinstance(user, dict) else user.get("tenant_id")
+    billing_group = getattr(user, "billing_group", None) if not isinstance(user, dict) else user.get("billing_group")
+    return (tenant_id or "").lower() in SCENES_ENABLED_TENANTS or (billing_group or "").lower() in SCENES_ENABLED_TENANTS
+
+
 def telemetry_enabled() -> bool:
     """True si la telemetría de sesiones (heartbeat de tiempo-en-app) está prendida.
 

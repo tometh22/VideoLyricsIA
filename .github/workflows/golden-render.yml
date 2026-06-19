@@ -1,0 +1,84 @@
+# Golden renders nocturnos — regresión visual del pipeline de render.
+#
+# Renderiza la matriz fija de scripts/golden_render.py contra STAGING y
+# compara frames del video Y el short contra los masters dorados del repo.
+# Cualquier cambio visual no intencional (fuente, peso, color, layout,
+# fondo) rompe el workflow → notificación de GitHub antes de que un
+# cliente lo vea. Nació de la semana 2026-06-08/12: tres defectos
+# visuales llegaron al cliente porque ningún test miraba el artefacto
+# final.
+#
+# Re-bendecir goldens tras un cambio visual INTENCIONAL:
+#   correr este workflow a mano con bless=true, bajar el artifact
+#   "golden-frames" y commitearlo en lyricgen/backend/tests/golden_frames/
+#   (o local: python3 scripts/golden_render.py --base-url ... --bless)
+name: golden-render
+
+on:
+  schedule:
+    - cron: "0 6 * * *"   # 03:00 Argentina — la guardia nocturna de base
+  # Hallazgo de Tomi 2026-06-12: los HOTFIXES van directo a main→prod y el
+  # nocturno recién los veía a las 3am — horas de ventana sin guardia.
+  # Como todo termina en staging (features antes de prod; hotfixes minutos
+  # después vía back-merge), correr en cada push a staging que toque el
+  # pipeline de render achica esa ventana a ~minutos.
+  push:
+    branches: [staging]
+    paths:
+      - "lyricgen/backend/pipeline.py"
+      - "lyricgen/backend/ass_render.py"
+      - "lyricgen/backend/fx_compositor.py"
+      - "lyricgen/backend/prores.py"
+      - "lyricgen/backend/fonts/**"
+      - "lyricgen/backend/scripts/golden_render.py"
+  workflow_dispatch:
+    inputs:
+      bless:
+        description: "Regenerar goldens (true) en vez de comparar"
+        required: false
+        default: "false"
+
+jobs:
+  golden:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Esperar el deploy de staging (solo en push)
+        if: github.event_name == 'push'
+        run: |
+          # El push que disparó este run también disparó el deploy de
+          # staging en Railway (~3-5 min). Sin esta espera, los renders
+          # correrían sobre el Worker VIEJO y auditaríamos el código
+          # anterior al cambio.
+          echo "esperando 7 min a que staging termine de deployar..."
+          sleep 420
+
+      - name: Dependencias (ffmpeg + pillow)
+        run: |
+          sudo apt-get update -q && sudo apt-get install -y -q ffmpeg
+          pip install --quiet pillow
+
+      - name: Golden render vs staging
+        working-directory: lyricgen/backend
+        run: |
+          EXTRA=""
+          if [ "${{ github.event.inputs.bless }}" = "true" ]; then EXTRA="--bless"; fi
+          python3 scripts/golden_render.py \
+            --base-url https://api-staging-9b82.up.railway.app $EXTRA
+
+      - name: Subir diffs si hay regresión
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: golden-diffs
+          path: lyricgen/backend/golden_diffs/
+          if-no-files-found: ignore
+
+      - name: Subir goldens nuevos (modo bless)
+        if: github.event.inputs.bless == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: golden-frames
+          path: lyricgen/backend/tests/golden_frames/
