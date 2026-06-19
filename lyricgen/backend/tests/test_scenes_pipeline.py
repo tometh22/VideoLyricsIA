@@ -184,6 +184,59 @@ def test_regenerate_scene_unknown_key_raises(monkeypatch, tmp_path):
             artist="A", song_title="S", audio_duration=36.0)
 
 
+def test_restitch_for_edit_realigns_when_structure_unchanged(monkeypatch, tmp_path):
+    """Audit M1: un edit de lyrics que NO cambia la estructura de recurrencia
+    re-stitchea desde clips cacheados (cache_only, sin Veo) y re-alinea cortes."""
+    import veo_breaker, scenes
+    monkeypatch.setattr(veo_breaker, "is_open", lambda: False)
+    veo_calls = []
+
+    def fake_veo(prompt, output_path, **kw):
+        veo_calls.append(kw.get("cache_only", False))
+        with open(output_path, "w") as f:
+            f.write("clip")
+        return output_path
+
+    monkeypatch.setattr(pipeline, "_generate_veo_video", fake_veo)
+    captured = {}
+    monkeypatch.setattr(scenes, "stitch_timeline",
+                        lambda secs, *a, **k: (captured.update(secs=secs) or "/tmp/tl.mp4"))
+
+    plan = {
+        "scenes": [
+            {"recurrence_key": "verso_1", "prompt": "P1", "movement_style": "sutil"},
+            {"recurrence_key": "coro_1", "prompt": "P2", "movement_style": "dinamico"},
+        ],
+        "sections": [],
+    }
+    # Letra: verso (único) + coro (repetido) → keys verso_1 + coro_1 (subset de have).
+    segs, t = [], 0.0
+    for ln in ["camino solo en la noche", "busco una señal aqui",
+               "y vuelvo a ti otra vez", "no hay nadie mas que vos",
+               "y vuelvo a ti otra vez", "no hay nadie mas que vos"]:
+        segs.append({"text": ln, "start": t, "end": t + 5.0}); t += 5.0
+
+    tl, newplan = pipeline._restitch_scenes_for_edit(
+        plan, segs, t, str(tmp_path), artist="A", song_title="S")
+    assert tl == "/tmp/tl.mp4"
+    # CERO Veo pagado: todas las llamadas fueron cache_only.
+    assert veo_calls and all(c is True for c in veo_calls)
+    # Las sections del plan se actualizaron (re-detectadas).
+    assert newplan["sections"], "debe re-detectar y persistir las nuevas secciones"
+
+
+def test_restitch_for_edit_bails_when_structure_changed(tmp_path):
+    """Si la edición cambia la estructura (key nueva sin clip), NO re-stitch:
+    devuelve (None, plan) y el caller usa el timeline cacheado estático."""
+    plan = {"scenes": [{"recurrence_key": "coro_1", "prompt": "p"}], "sections": []}
+    # Letra sin repeticiones → detect produce verso_1 (no coro_1) → no subset.
+    segs = [{"text": f"linea distinta numero {i}", "start": i * 6.0, "end": i * 6.0 + 6.0}
+            for i in range(4)]
+    tl, newplan = pipeline._restitch_scenes_for_edit(
+        plan, segs, 24.0, str(tmp_path), artist="A", song_title="S")
+    assert tl is None
+
+
 def test_scene_cache_ns_token():
     assert pipeline._scene_cache_ns("A", "S", "coro_1") == "A|S|coro_1"
     assert pipeline._scene_cache_ns("A", "S", "coro_1", "ab12") == "A|S|coro_1|ab12"

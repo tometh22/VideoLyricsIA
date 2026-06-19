@@ -7899,6 +7899,15 @@ def _generate_scene_background(segments: list[dict], audio_duration: float,
     clip_for_key = _generate_scene_clips(plan, job_dir, artist=artist,
                                          song_title=song_title, concept=concept,
                                          job_id=job_id, allow_people=allow_people)
+    # Audit M3: exponer fallo parcial a nivel job. Las escenas fallidas se
+    # sustituyen por un clip válido (degradación), pero el operador debe saber
+    # cuántas — el filmstrip ya marca ⚠ por escena; esto da el agregado para un
+    # badge a nivel job sin abrir el filmstrip.
+    _failed = sum(1 for s in plan.get("scenes", []) if s.get("status") == "failed")
+    plan["degraded"] = {"failed": _failed, "total": len(plan.get("scenes", []))}
+    if _failed:
+        logger.warning("[SCENES] %d/%d escenas fallaron (degradado a clip reusado) para job=%s",
+                       _failed, len(plan.get("scenes", [])), job_id)
     timeline = _scenes.stitch_timeline(secs, clip_for_key, audio_duration, job_dir,
                                        target_w=target_w, target_h=target_h)
     return timeline, plan
@@ -7963,6 +7972,37 @@ def _regenerate_scene_background(scene_plan: dict, recurrence_key: str, job_dir:
     sections = _scenes.sections_from_plan(scene_plan)
     timeline = _scenes.stitch_timeline(sections, clip_for_key, audio_duration, job_dir,
                                        target_w=target_w, target_h=target_h)
+    return timeline, scene_plan
+
+
+def _restitch_scenes_for_edit(scene_plan: dict, segments: list[dict],
+                              audio_duration: float, job_dir: str, *, artist: str,
+                              song_title: str, concept: str = "",
+                              allow_people: bool = False, job_id: str = None,
+                              target_w: int = 1920, target_h: int = 1080):
+    """Re-arma el timeline multi-escena con la LETRA editada, SIN Veo.
+
+    Audit M1: un edit de lyrics cambia los timings; las secciones persistidas
+    quedan stale y los cortes desincronizan. Acá re-detectamos secciones con los
+    segments nuevos y re-stitcheamos desde los clips CACHEADOS (cache_only → cero
+    costo). Sólo si la estructura de recurrencia no cambió (las keys nuevas son
+    subconjunto de las que ya tienen clip); si cambió, devolvemos (None, plan)
+    y el caller reusa el timeline cacheado estático (degradación segura).
+    """
+    import scenes as _scenes
+    new_secs = _scenes.detect_sections(segments, audio_duration)
+    new_keys = {s.recurrence_key for s in new_secs}
+    have_keys = {sc.get("recurrence_key") for sc in scene_plan.get("scenes", [])}
+    if not new_keys or not new_keys.issubset(have_keys):
+        return None, scene_plan  # estructura cambió → no es seguro re-stitch
+    scene_plan = {**scene_plan, "sections": [s.to_dict() for s in new_secs]}
+    # only_keys=set() → TODAS las escenas son cache_only (ninguna paga Veo).
+    clip_for_key = _generate_scene_clips(scene_plan, job_dir, artist=artist,
+                                         song_title=song_title, concept=concept,
+                                         job_id=job_id, allow_people=allow_people,
+                                         only_keys=set())
+    timeline = _scenes.stitch_timeline(new_secs, clip_for_key, audio_duration,
+                                       job_dir, target_w=target_w, target_h=target_h)
     return timeline, scene_plan
 
 
@@ -9001,7 +9041,8 @@ def _attach_close_chain(target_clip, owned_clips):
 
 
 def _get_background_clip_from_path(bg_path: str, style: str, duration: float,
-                                   job_dir: str = None, spec: RenderSpec | None = None):
+                                   job_dir: str = None, spec: RenderSpec | None = None,
+                                   bg_prelooped: bool = False):
     """Load a background video, loop it seamlessly via ffmpeg, return clip.
 
     Always returns a single VideoFileClip whose lifetime is owned by the
@@ -9023,12 +9064,16 @@ def _get_background_clip_from_path(bg_path: str, style: str, duration: float,
     except Exception as e:
         raise RuntimeError(f"Cannot load background video: {e}")
 
-    if clip_dur >= duration:
+    # Audit M2: bg_prelooped = timeline full-length de multi-escena → NUNCA
+    # palindromear (las escenas se reproducirían en reversa al final). Forzamos
+    # el branch de subclip aunque por redondeo el clip quede unos ms más corto.
+    if bg_prelooped or clip_dur >= duration:
         # Open ONCE, derive subclip + cover-resize, attach the source so
         # the caller's eventual close() releases the underlying ffmpeg
         # reader.
         src = VideoFileClip(bg_path)
-        derived = _cover_resize(src.subclip(0, duration), spec.width, spec.height)
+        _end = min(duration, clip_dur) if bg_prelooped else duration
+        derived = _cover_resize(src.subclip(0, _end), spec.width, spec.height)
         return _attach_close_chain(derived, [src])
 
     # Always pre-render a single seamless loop file. The job_dir-supplied
@@ -10422,7 +10467,8 @@ def generate_lyric_video(
     if bg_source.lower().endswith((".jpg", ".jpeg", ".png")):
         bg = _ken_burns_clip(bg_source, duration, spec=spec)
     else:
-        bg = _get_background_clip_from_path(bg_source, style, duration, job_dir, spec=spec)
+        bg = _get_background_clip_from_path(bg_source, style, duration, job_dir, spec=spec,
+                                            bg_prelooped=bg_prelooped)
 
     # Build text clips — each segment gets its own shadow + text
     text_layers = []
@@ -11607,23 +11653,52 @@ def run_edit_pipeline(
             # artist/song_title (already persisted by the /edit handler
             # before this worker spawned — see main.py:request_edit).
             update_job(job_id, status="editing", current_step="video", progress=35)
+            _is_scene_job = bool(scene_plan and scene_plan.get("scenes"))
+            # Audit M1: en un edit de LYRICS sobre un job multi-escena, los
+            # timings cambiaron → re-detectamos secciones y re-stitcheamos desde
+            # los clips cacheados (sin Veo) para que los cortes sigan cayendo en
+            # los cambios de la canción. Si la estructura cambió o falla, caemos
+            # al timeline cacheado estático.
+            if edit_type == "lyrics" and _is_scene_job:
+                try:
+                    _sc_audio = _audio_duration(mp3_path)
+                except Exception:
+                    _sc_audio = _ffprobe_duration(mp3_path)
+                try:
+                    _re_tl, scene_plan = _restitch_scenes_for_edit(
+                        scene_plan, segments, _sc_audio, job_dir, artist=artist,
+                        song_title=song_title, concept=concept,
+                        allow_people=_compute_allow_people(job_id), job_id=job_id)
+                    if _re_tl:
+                        bg_image_path = _re_tl
+                        bg_prelooped = True
+                        update_job(job_id, scene_plan=scene_plan)
+                        logger.info("[EDIT] escenas re-stitcheadas con la letra editada (job=%s)", job_id)
+                except Exception as _e:  # noqa: BLE001
+                    logger.warning("[EDIT] re-stitch de escenas falló (%s) — uso timeline cacheado", _e)
             # La extensión viene de la key cacheada: para fondos humanos
             # puede ser .jpg/.png (imagen fija del usuario) y de ella
             # depende el manejo de stills aguas abajo. Antes estaba
             # hardcodeada .mp4 — un jpg cacheado se bajaba con nombre de
             # video (audit 2026-06-11).
-            _cached_ext = os.path.splitext(bg_r2_key_cached or "")[1].lower() or ".mp4"
-            bg_image_path = os.path.join(job_dir, f"bg_cached_edit{_cached_ext}")
-            if not os.path.exists(bg_image_path):
-                if bg_r2_key_cached and storage.is_enabled():
-                    ok = storage.download_object(bg_r2_key_cached, bg_image_path)
-                    if not ok:
-                        raise RuntimeError("Could not download cached background from R2")
-                else:
-                    raise RuntimeError(
-                        f"No cached background available for {edit_type} edit. "
-                        "Use edit_type='background' to regenerate it."
-                    )
+            if not bg_prelooped:
+                _cached_ext = os.path.splitext(bg_r2_key_cached or "")[1].lower() or ".mp4"
+                bg_image_path = os.path.join(job_dir, f"bg_cached_edit{_cached_ext}")
+                if not os.path.exists(bg_image_path):
+                    if bg_r2_key_cached and storage.is_enabled():
+                        ok = storage.download_object(bg_r2_key_cached, bg_image_path)
+                        if not ok:
+                            raise RuntimeError("Could not download cached background from R2")
+                    else:
+                        raise RuntimeError(
+                            f"No cached background available for {edit_type} edit. "
+                            "Use edit_type='background' to regenerate it."
+                        )
+                # Audit M1/M2: el bg cacheado de un job multi-escena ES el timeline
+                # full-length → bg_prelooped=True para que el render NO lo
+                # palindromee (si no, las escenas se reproducen en reversa al final).
+                if _is_scene_job:
+                    bg_prelooped = True
 
         elif edit_type == "background":
             update_job(job_id, status="editing", current_step="background", progress=22)

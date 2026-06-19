@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useState, useEffect } from "react";
 import { useI18n } from "../i18n.jsx";
 
 const _TYPE_LABEL = { intro: "Intro", verso: "Verso", pre: "Pre", coro: "Coro", puente: "Puente", outro: "Outro" };
@@ -25,9 +25,19 @@ export default function SceneEditModal({ scene, onClose, onSubmit }) {
   const label = _TYPE_LABEL[scene.section_type] || scene.section_type || "Escena";
   const canSubmit = hint.trim().length > 0 || (movement && movement !== "");
 
+  // Escape cierra el modal (a11y — audit M6/NIT).
+  useEffect(() => {
+    const onKey = (e) => { if (e.key === "Escape") onClose(); };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [onClose]);
+
   return (
     <div className="fixed inset-0 z-50 grid place-items-center bg-black/60 p-4" onClick={onClose}>
       <div
+        role="dialog"
+        aria-modal="true"
+        aria-label={(t("scenes.edit_title") || "Editar escena: {label}").replace("{label}", label)}
         className="w-full max-w-md rounded-card bg-surface-2 ring-1 ring-white/[0.08] p-5"
         onClick={(e) => e.stopPropagation()}
       >
@@ -36,7 +46,7 @@ export default function SceneEditModal({ scene, onClose, onSubmit }) {
             <span>🎬</span>
             {(t("scenes.edit_title") || "Editar escena: {label}").replace("{label}", label)}
           </h3>
-          <button onClick={onClose} className="text-gray-500 hover:text-gray-300 text-lg leading-none">×</button>
+          <button onClick={onClose} aria-label={t("common.cancel") || "Cancelar"} className="text-gray-400 hover:text-gray-200 text-lg leading-none outline-none focus-visible:ring-2 focus-visible:ring-brand/60 rounded">×</button>
         </div>
 
         <p className="text-[11px] text-gray-500 mb-3">
@@ -85,18 +95,18 @@ export default function SceneEditModal({ scene, onClose, onSubmit }) {
         )}
 
         <div className="mt-4 flex items-center justify-between">
-          <span className="text-[10px] text-gray-600">{t("scenes.edit_cost") || "~US$0.90 · cuenta como un edit"}</span>
+          <span className="text-[11px] text-ink-secondary">{t("scenes.edit_cost") || "~US$0.90 · cuenta como un edit"}</span>
           <div className="flex gap-2">
             <button
               onClick={onClose}
-              className="text-[12px] font-medium px-3 py-1.5 rounded-lg bg-white/[0.04] hover:bg-white/[0.08] text-gray-300"
+              className="text-[12px] font-medium px-3 py-1.5 rounded-lg bg-white/[0.04] hover:bg-white/[0.08] text-gray-300 outline-none focus-visible:ring-2 focus-visible:ring-brand/60"
             >
               {t("common.cancel") || "Cancelar"}
             </button>
             <button
               disabled={!canSubmit}
               onClick={() => onSubmit({ hint: hint.trim(), movement_style: movement })}
-              className="text-[12px] font-semibold px-3 py-1.5 rounded-lg bg-brand hover:bg-brand-light text-white disabled:opacity-40 disabled:cursor-not-allowed"
+              className="text-[12px] font-semibold px-3 py-1.5 rounded-lg bg-brand hover:bg-brand-light text-white outline-none focus-visible:ring-2 focus-visible:ring-brand/60 disabled:opacity-40 disabled:cursor-not-allowed"
             >
               {t("scenes.regen_submit") || "Regenerar escena"}
             </button>
