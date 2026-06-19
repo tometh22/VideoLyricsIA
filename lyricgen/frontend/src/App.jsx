@@ -2874,7 +2874,8 @@ export default function App() {
           if (jobList[i].bgVerbatim) formData.append("bg_verbatim", "true");
         }
         // Escenas (multi-escena): el backend re-valida elegibilidad.
-        if (enableScenes) formData.append("enable_scenes", "true");
+        // Multi-escena sólo con fondo generado por IA (no Biblioteca/Subir).
+        if (enableScenes && bgSelectMode === "auto") formData.append("enable_scenes", "true");
         formData.append("text_case", jobList[i].textCase || "upper");
         formData.append("font_scale", String(jobList[i].fontScale || "1.0"));
         // lyric_transition + text_motion: deprecados 2026-05-23 (no se envían).
@@ -3019,7 +3020,8 @@ export default function App() {
           if (jobList[i].bgVerbatim) generateBody.append("bg_verbatim", "true");
         }
         // Escenas (multi-escena): el backend re-valida elegibilidad.
-        if (enableScenes) generateBody.append("enable_scenes", "true");
+        // Multi-escena sólo con fondo generado por IA (no Biblioteca/Subir).
+        if (enableScenes && bgSelectMode === "auto") generateBody.append("enable_scenes", "true");
         generateBody.append("text_case", jobList[i].textCase || "upper");
         generateBody.append("font_scale", String(jobList[i].fontScale || "1.0"));
         // lyric_transition + text_motion: deprecados 2026-05-23 (no se envían).
