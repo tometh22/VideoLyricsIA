@@ -79,9 +79,20 @@ class Section:
     @classmethod
     def from_dict(cls, d: dict) -> "Section":
         """Reconstruye una Section desde su forma serializada en scene_plan
-        (ignora claves extra como `duration`, que es property, no campo)."""
-        fields = {"type", "start", "end", "energy", "recurrence_key", "text"}
-        return cls(**{k: v for k, v in (d or {}).items() if k in fields})
+        (ignora claves extra como `duration`, que es property, no campo).
+
+        Tolera planes malformados/truncados (audit LOW): aplica defaults para
+        campos faltantes en vez de TypeError — coherente con el resto del módulo
+        que es best-effort y nunca tumba el job."""
+        d = d or {}
+        return cls(
+            type=str(d.get("type") or "verso"),
+            start=float(d.get("start") or 0.0),
+            end=float(d.get("end") or 0.0),
+            energy=float(d.get("energy") if d.get("energy") is not None else 0.5),
+            recurrence_key=str(d.get("recurrence_key") or ""),
+            text=str(d.get("text") or ""),
+        )
 
 
 def sections_from_plan(plan: dict) -> list["Section"]:
@@ -459,8 +470,10 @@ def build_scene_plan(
             "energy": sec.energy,
             "movement_style": movement,
             "prompt": prompt,
-            "bg_cache_key": None,   # se completa al generar (caché R2 por-prompt)
-            "clip_path": None,
+            # cache_token: bust de caché por regen (lo setea el regen).
+            "cache_token": "",
+            # clip_cache_key: key R2 del clip generado (para GC en regen).
+            "clip_cache_key": None,
             "status": "planned",
         }
         seen[key] = scene
@@ -581,7 +594,10 @@ def stitch_timeline(
         labels.append(lbl)
 
     prev = labels[0]
-    offset = sections[0].duration - xfade
+    # Clamp ≥0 (audit LOW): si la primera escena fuera más corta que el xfade
+    # (no debería tras el merge, pero stitch_timeline es público y testeable),
+    # un offset negativo rompe el filter graph de ffmpeg.
+    offset = max(0.0, sections[0].duration - xfade)
     for i in range(1, len(section_files)):
         nxt = labels[i]
         out_lbl = f"x{i}" if i < len(section_files) - 1 else "vout"

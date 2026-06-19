@@ -410,12 +410,12 @@ class Job(Base):
     bg_r2_key_cached = Column(Text, nullable=True)
     # Add-on premium "Escenas" (multi-escena). Storyboard generado por
     # scenes.build_scene_plan: { bible:{...}, sections:[...], scenes:[{ id,
-    # recurrence_key, section_type, energy, movement_style, prompt,
-    # bg_cache_key, clip_path, status }], params:{...} }. NULL = job de fondo
-    # único (camino histórico). El toggle de opt-in vive en render_params
-    # ("enable_scenes": true) porque es un setting de render, no un deliverable.
-    # Las keys de clip por escena viven DENTRO de scene_plan (extiende el
-    # concepto de bg_r2_key_cached, que es un único fondo).
+    # recurrence_key, section_type, energy, movement_style, prompt, cache_token,
+    # clip_cache_key, thumb_key, status }], params:{...}, degraded:{failed,total},
+    # audio_duration }. NULL = job de fondo único (camino histórico). El toggle de
+    # opt-in vive en render_params ("enable_scenes": true) porque es un setting de
+    # render. cache_token bustea la caché Veo por escena en un regen; clip_cache_key
+    # es la key R2 del clip (para GC); thumb_key alimenta el filmstrip.
     scene_plan = Column(JSONB, nullable=True)
     # Variantes: cuando este job fue creado via POST /jobs/{id}/variant,
     # parent_job_id apunta al job_id que sirvió de base (mismo audio +

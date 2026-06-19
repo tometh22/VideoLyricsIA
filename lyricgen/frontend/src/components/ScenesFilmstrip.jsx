@@ -95,7 +95,11 @@ export default function ScenesFilmstrip({
         )}
       </div>
 
-      <div className="flex gap-3 overflow-x-auto pb-1 -mx-1 px-1">
+      {/* Edge-fade a la derecha cuando hay muchas escenas → señal de que se
+          puede scrollear (audit LOW L1). */}
+      <div className={`flex gap-3 overflow-x-auto pb-1 -mx-1 px-1 scroll-smooth ${
+        scenes.length > 4 ? "[mask-image:linear-gradient(to_right,#000_94%,transparent)]" : ""
+      }`}>
         {scenes.map((scene) => {
           const apps = appearances[scene.recurrence_key] || [];
           const firstStart = apps.length ? apps[0].start : 0;
@@ -117,7 +121,8 @@ export default function ScenesFilmstrip({
                 type="button"
                 onClick={() => onSeek && onSeek(firstStart)}
                 title={t("scenes.seek_tooltip") || "Ver en el video"}
-                className={`relative block w-full aspect-video rounded-lg overflow-hidden ring-1 transition-all ${
+                aria-label={`${sceneLabel(scene)} — ${t("scenes.seek_tooltip") || "Ver en el video"}`}
+                className={`relative block w-full aspect-video rounded-lg overflow-hidden ring-1 transition-all outline-none focus-visible:ring-2 focus-visible:ring-brand/60 ${
                   isFailed ? "ring-amber-400/40" : "ring-white/[0.08]"
                 } ${active ? "ring-brand/50" : ""}`}
               >
@@ -138,14 +143,16 @@ export default function ScenesFilmstrip({
                 <div className="absolute top-1 left-1 flex gap-1">
                   {recurrent && (
                     <span
-                      className="text-[9px] font-bold text-white/90 bg-black/55 rounded px-1 py-0.5"
+                      className="text-[10px] font-bold text-white/90 bg-black/55 rounded px-1 py-0.5"
                       title={apps.map((a) => fmtTime(a.start)).join(" · ")}
+                      aria-label={(t("scenes.appears_fmt") || "aparece {n}×").replace("{n}", apps.length)}
                     >
                       ↻{apps.length}×
                     </span>
                   )}
                   {isFailed && (
-                    <span className="text-[9px] font-bold text-amber-200 bg-amber-900/70 rounded px-1 py-0.5">⚠</span>
+                    <span className="text-[10px] font-bold text-amber-200 bg-amber-900/70 rounded px-1 py-0.5"
+                          aria-label={t("scenes.failed_aria") || "escena reusada — regenerá"}>⚠</span>
                   )}
                 </div>
                 <span className="absolute bottom-1 right-1 text-[9px] text-white/80 bg-black/55 rounded px-1 py-0.5">
@@ -156,7 +163,7 @@ export default function ScenesFilmstrip({
               {/* Label */}
               <div className="mt-1.5 px-0.5">
                 <div className="text-[11px] font-semibold text-gray-200 leading-tight">{sceneLabel(scene)}</div>
-                <div className="text-[10px] text-gray-500">
+                <div className="text-[10px] text-ink-secondary">
                   {recurrent
                     ? (t("scenes.appears_fmt")
                         ? t("scenes.appears_fmt").replace("{n}", apps.length)
@@ -167,14 +174,16 @@ export default function ScenesFilmstrip({
                 </div>
               </div>
 
-              {/* Acciones (siempre visibles en touch; resaltan en hover) */}
-              <div className={`mt-1.5 flex gap-1 transition-opacity ${active ? "opacity-100" : "opacity-70"}`}>
+              {/* Acciones (visibles siempre; sin dimming en touch para no leerse
+                  como deshabilitadas — audit L6) */}
+              <div className="mt-1.5 flex gap-1">
                 <button
                   type="button"
                   disabled={disabled || busy}
                   onClick={() => onRegenerate && onRegenerate(scene)}
                   title={t("scenes.regen_tooltip") || "Generar otra versión de esta escena"}
-                  className="flex-1 text-[10px] font-medium rounded-md px-1.5 py-1 bg-white/[0.04] hover:bg-white/[0.08] text-gray-200 disabled:opacity-40 disabled:cursor-not-allowed"
+                  aria-label={t("scenes.regen_tooltip") || "Generar otra versión de esta escena"}
+                  className="flex-1 text-[10px] font-medium rounded-md px-1.5 py-1 bg-white/[0.04] hover:bg-white/[0.08] text-gray-200 outline-none focus-visible:ring-2 focus-visible:ring-brand/60 disabled:opacity-40 disabled:cursor-not-allowed"
                 >
                   ↻ {t("scenes.regen") || "Otra toma"}
                 </button>
@@ -183,7 +192,8 @@ export default function ScenesFilmstrip({
                   disabled={disabled || busy}
                   onClick={() => onEditPrompt && onEditPrompt(scene)}
                   title={t("scenes.edit_tooltip") || "Editar el prompt de esta escena"}
-                  className="text-[10px] font-medium rounded-md px-1.5 py-1 bg-white/[0.04] hover:bg-white/[0.08] text-gray-200 disabled:opacity-40 disabled:cursor-not-allowed"
+                  aria-label={t("scenes.edit_tooltip") || "Editar el prompt de esta escena"}
+                  className="text-[10px] font-medium rounded-md px-1.5 py-1 bg-white/[0.04] hover:bg-white/[0.08] text-gray-200 outline-none focus-visible:ring-2 focus-visible:ring-brand/60 disabled:opacity-40 disabled:cursor-not-allowed"
                 >
                   ✎
                 </button>

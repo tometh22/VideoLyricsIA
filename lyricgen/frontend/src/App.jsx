@@ -1479,7 +1479,7 @@ export default function App() {
         // resumido no trae fondo propio (transcribed, pre-/generate), así
         // que IA es el default correcto.
         setBackgroundFile(null); setBackgroundId(null);
-        setBgSelectMode("auto"); setAnimateImage(false);
+        setBgSelectMode("auto"); setAnimateImage(false); setEnableScenes(false);
         setWizardStage("review");
         // Limpiar el query param sin agregar a history (replace).
         navigate("/new", { replace: true });
@@ -2874,7 +2874,8 @@ export default function App() {
           if (jobList[i].bgVerbatim) formData.append("bg_verbatim", "true");
         }
         // Escenas (multi-escena): el backend re-valida elegibilidad.
-        if (enableScenes) formData.append("enable_scenes", "true");
+        // Multi-escena sólo con fondo generado por IA (no Biblioteca/Subir).
+        if (enableScenes && bgSelectMode === "auto") formData.append("enable_scenes", "true");
         formData.append("text_case", jobList[i].textCase || "upper");
         formData.append("font_scale", String(jobList[i].fontScale || "1.0"));
         // lyric_transition + text_motion: deprecados 2026-05-23 (no se envían).
@@ -3019,7 +3020,8 @@ export default function App() {
           if (jobList[i].bgVerbatim) generateBody.append("bg_verbatim", "true");
         }
         // Escenas (multi-escena): el backend re-valida elegibilidad.
-        if (enableScenes) generateBody.append("enable_scenes", "true");
+        // Multi-escena sólo con fondo generado por IA (no Biblioteca/Subir).
+        if (enableScenes && bgSelectMode === "auto") generateBody.append("enable_scenes", "true");
         generateBody.append("text_case", jobList[i].textCase || "upper");
         generateBody.append("font_scale", String(jobList[i].fontScale || "1.0"));
         // lyric_transition + text_motion: deprecados 2026-05-23 (no se envían).
@@ -3095,7 +3097,7 @@ export default function App() {
     try { prefetchAbortRef.current && prefetchAbortRef.current.abort(); } catch {}
     prefetchAbortRef.current = new AbortController();
     setFiles([]); setJobs([]); setBackgroundFile(null); setBackgroundId(null);
-    setBgSelectMode("auto"); setAnimateImage(false);
+    setBgSelectMode("auto"); setAnimateImage(false); setEnableScenes(false);
     setReviewQueue([]); setCurrentReview(null); setApprovedJobs([]);
     setTranscribing(false); setReadyToGenerate(false); setTranscribeError(null);
     // Capa B 2026-05-24: el wizard descartó todo → vuelve al upload state.
@@ -4034,7 +4036,7 @@ export default function App() {
                 // pero NO la selección de fondo — mismo carryover que el
                 // bug de Ana M., por otra puerta. Paridad con handleReset.
                 setBackgroundFile(null); setBackgroundId(null);
-                setBgSelectMode("auto"); setAnimateImage(false);
+                setBgSelectMode("auto"); setAnimateImage(false); setEnableScenes(false);
                 wizardPersistence.clear();
                 navigate("/new");
               }}

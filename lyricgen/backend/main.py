@@ -1308,9 +1308,24 @@ async def verify_email_endpoint(body: VerifyEmailRequest, request: Request, db: 
 
 
 @app.get("/auth/me")
-def me(current_user: dict = Depends(get_current_user)):
-    """Return current user info."""
-    return current_user
+def me(current_user: dict = Depends(get_current_user), db: Session = Depends(get_db)):
+    """Return current user info, incluyendo los feature flags.
+
+    Audit A6: antes /auth/me devolvía sólo los claims del token (sin `features`),
+    así que el refresh del frontend NUNCA repoblaba `features.scenes` — un
+    cliente recién habilitado quedaba bloqueado hasta re-login. Ahora calculamos
+    `features` del modelo de DB (autoritativo, incl. acceso por billing_group),
+    igual que /auth/login, para que un reload capte el cambio de entitlement."""
+    user = get_user_by_id(db, current_user["id"])
+    _u = user if user else current_user
+    return {
+        **current_user,
+        "features": {
+            "prores_export": has_prores_access(_u),
+            "scenes": has_scenes_access(_u),
+            "telemetry": telemetry_enabled(),
+        },
+    }
 
 
 @app.post("/auth/refresh")
@@ -9851,6 +9866,13 @@ async def retry_job(
               "enable_scenes"):
         if k in _retry_render_params and _retry_render_params[k] not in (None, ""):
             retry_pipeline_kwargs[k] = _retry_render_params[k]
+
+    # Audit A5: re-gatear enable_scenes con el acceso ACTUAL del usuario, igual
+    # que /generate y /upload. Un tenant al que se le sacó el acceso (o se cayó
+    # de SCENES_ENABLED_TENANTS) no debe seguir generando multi-escena —y su
+    # costo Veo extra— al reintentar un job viejo.
+    if retry_pipeline_kwargs.get("enable_scenes"):
+        retry_pipeline_kwargs["enable_scenes"] = has_scenes_access(current_user)
 
     enqueue_pipeline(
         job_id=job_id,

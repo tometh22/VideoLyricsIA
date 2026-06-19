@@ -128,7 +128,8 @@ def test_regenerate_scene_busts_only_target(monkeypatch, tmp_path):
     calls = []
 
     def fake_veo(prompt, output_path, **kw):
-        calls.append((kw.get("cache_namespace"), prompt))
+        calls.append({"ns": kw.get("cache_namespace"), "prompt": prompt,
+                      "cache_only": kw.get("cache_only", False)})
         with open(output_path, "w") as f:
             f.write("clip")
         return output_path
@@ -148,13 +149,29 @@ def test_regenerate_scene_busts_only_target(monkeypatch, tmp_path):
     assert coro["prompt"] == "NUEVO PROMPT"
     assert coro["cache_token"] and coro["cache_token"] != ""
     assert verso["cache_token"] == ""
-    # El namespace de la target lleva su token nuevo → cache miss → Veo fresco.
-    coro_ns = next(ns for ns, p in calls if p == "NUEVO PROMPT")
-    assert coro["cache_token"] in coro_ns
-    # La otra escena se pidió con su namespace sin token (cache HIT en prod).
-    verso_ns = next(ns for ns, p in calls if p == "P1")
-    assert verso_ns == "A|S|verso_1"
+    # GARANTÍA DE COSTO (audit B2): la TARGET genera fresco (cache_only=False),
+    # la NO-target es cache_only=True (nunca re-cobra Veo).
+    coro_call = next(c for c in calls if c["prompt"] == "NUEVO PROMPT")
+    verso_call = next(c for c in calls if c["prompt"] == "P1")
+    assert coro_call["cache_only"] is False
+    assert verso_call["cache_only"] is True
+    assert coro["cache_token"] in coro_call["ns"]
+    assert verso_call["ns"] == "A|S|verso_1"
     assert tl == "/tmp/timeline.mp4"
+
+
+def test_veo_cache_only_raises_on_miss_never_bills(monkeypatch):
+    """Audit B2: con cache_only=True y la caché vacía, _generate_veo_video LEVANTA
+    (no genera fresco) → un regen de 1 escena no puede re-cobrar las otras N."""
+    import storage as _storage
+    # Caché disponible pero SIN el objeto → debe levantar, no pagar Veo.
+    monkeypatch.setattr(_storage, "is_enabled", lambda: True)
+    monkeypatch.setattr(_storage, "object_exists", lambda *a, **k: False)
+    # Si llegara a intentar generar, esto lo delataría (no debería llamarse).
+    import pytest
+    with pytest.raises(RuntimeError, match="cache_only"):
+        pipeline._generate_veo_video("un prompt", "/tmp/should_not_exist.mp4",
+                                     job_id=None, cache_only=True)
 
 
 def test_regenerate_scene_unknown_key_raises(monkeypatch, tmp_path):
@@ -165,6 +182,59 @@ def test_regenerate_scene_unknown_key_raises(monkeypatch, tmp_path):
         pipeline._regenerate_scene_background(
             _two_scene_plan(), "no_existe", str(tmp_path),
             artist="A", song_title="S", audio_duration=36.0)
+
+
+def test_restitch_for_edit_realigns_when_structure_unchanged(monkeypatch, tmp_path):
+    """Audit M1: un edit de lyrics que NO cambia la estructura de recurrencia
+    re-stitchea desde clips cacheados (cache_only, sin Veo) y re-alinea cortes."""
+    import veo_breaker, scenes
+    monkeypatch.setattr(veo_breaker, "is_open", lambda: False)
+    veo_calls = []
+
+    def fake_veo(prompt, output_path, **kw):
+        veo_calls.append(kw.get("cache_only", False))
+        with open(output_path, "w") as f:
+            f.write("clip")
+        return output_path
+
+    monkeypatch.setattr(pipeline, "_generate_veo_video", fake_veo)
+    captured = {}
+    monkeypatch.setattr(scenes, "stitch_timeline",
+                        lambda secs, *a, **k: (captured.update(secs=secs) or "/tmp/tl.mp4"))
+
+    plan = {
+        "scenes": [
+            {"recurrence_key": "verso_1", "prompt": "P1", "movement_style": "sutil"},
+            {"recurrence_key": "coro_1", "prompt": "P2", "movement_style": "dinamico"},
+        ],
+        "sections": [],
+    }
+    # Letra: verso (único) + coro (repetido) → keys verso_1 + coro_1 (subset de have).
+    segs, t = [], 0.0
+    for ln in ["camino solo en la noche", "busco una señal aqui",
+               "y vuelvo a ti otra vez", "no hay nadie mas que vos",
+               "y vuelvo a ti otra vez", "no hay nadie mas que vos"]:
+        segs.append({"text": ln, "start": t, "end": t + 5.0}); t += 5.0
+
+    tl, newplan = pipeline._restitch_scenes_for_edit(
+        plan, segs, t, str(tmp_path), artist="A", song_title="S")
+    assert tl == "/tmp/tl.mp4"
+    # CERO Veo pagado: todas las llamadas fueron cache_only.
+    assert veo_calls and all(c is True for c in veo_calls)
+    # Las sections del plan se actualizaron (re-detectadas).
+    assert newplan["sections"], "debe re-detectar y persistir las nuevas secciones"
+
+
+def test_restitch_for_edit_bails_when_structure_changed(tmp_path):
+    """Si la edición cambia la estructura (key nueva sin clip), NO re-stitch:
+    devuelve (None, plan) y el caller usa el timeline cacheado estático."""
+    plan = {"scenes": [{"recurrence_key": "coro_1", "prompt": "p"}], "sections": []}
+    # Letra sin repeticiones → detect produce verso_1 (no coro_1) → no subset.
+    segs = [{"text": f"linea distinta numero {i}", "start": i * 6.0, "end": i * 6.0 + 6.0}
+            for i in range(4)]
+    tl, newplan = pipeline._restitch_scenes_for_edit(
+        plan, segs, 24.0, str(tmp_path), artist="A", song_title="S")
+    assert tl is None
 
 
 def test_scene_cache_ns_token():
