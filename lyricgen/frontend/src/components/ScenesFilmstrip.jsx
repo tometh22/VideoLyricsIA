@@ -95,7 +95,11 @@ export default function ScenesFilmstrip({
         )}
       </div>
 
-      <div className="flex gap-3 overflow-x-auto pb-1 -mx-1 px-1">
+      {/* Edge-fade a la derecha cuando hay muchas escenas → señal de que se
+          puede scrollear (audit LOW L1). */}
+      <div className={`flex gap-3 overflow-x-auto pb-1 -mx-1 px-1 scroll-smooth ${
+        scenes.length > 4 ? "[mask-image:linear-gradient(to_right,#000_94%,transparent)]" : ""
+      }`}>
         {scenes.map((scene) => {
           const apps = appearances[scene.recurrence_key] || [];
           const firstStart = apps.length ? apps[0].start : 0;

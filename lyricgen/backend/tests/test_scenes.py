@@ -150,6 +150,18 @@ def test_sections_from_plan_roundtrip():
     assert extra.duration == 5.0
 
 
+def test_section_from_dict_tolerates_malformed():
+    """Audit LOW: un scene_plan truncado/parcial no debe tumbar el re-stitch."""
+    # dict vacío → defaults, sin TypeError.
+    s = scenes.Section.from_dict({})
+    assert s.type == "verso" and s.start == 0.0 and s.end == 0.0
+    # campos parciales / None → coerción segura.
+    s2 = scenes.Section.from_dict({"type": "coro", "start": "5", "end": None, "energy": None})
+    assert s2.type == "coro" and s2.start == 5.0 and s2.end == 0.0 and s2.energy == 0.5
+    # sections_from_plan sobre un plan con sección vacía no levanta.
+    assert scenes.sections_from_plan({"sections": [{}, {"type": "coro", "start": 0, "end": 3}]})
+
+
 def test_energy_to_movement_mapping():
     assert scenes.energy_to_movement(0.9) == "dinamico"
     assert scenes.energy_to_movement(0.5) == "sutil"

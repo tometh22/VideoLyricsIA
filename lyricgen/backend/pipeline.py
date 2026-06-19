@@ -6757,7 +6757,8 @@ def _generate_veo_video(prompt: str, output_path: str, job_id: str = None,
                         high_fidelity: bool = False,
                         allow_people: bool = False,
                         verbatim: bool = False,
-                        cache_only: bool = False) -> str:
+                        cache_only: bool = False,
+                        out_meta: dict | None = None) -> str:
     """Generate a video clip with Google Veo 3 via direct Vertex AI REST API.
 
     We bypass google-genai SDK for Veo specifically because its internal auth
@@ -6967,6 +6968,10 @@ def _generate_veo_video(prompt: str, output_path: str, job_id: str = None,
         cache_params["img"] = _seed_image_digest(image_path, job_id)
     cache_key_hash = _veo_cache_key(safe_prompt, model, cache_params)
     cache_object_key = f"cache/veo/{cache_key_hash}.mp4"
+    # Audit M8: exponer la cache key usada para que el caller pueda GC el clip
+    # viejo cuando una escena se regenera (evita huérfanos en cache/veo/).
+    if out_meta is not None:
+        out_meta["cache_object_key"] = cache_object_key
 
     recorder = record_ai_call(
         job_id=job_id or "unknown",
@@ -7837,6 +7842,7 @@ def _generate_scene_clips(scene_plan: dict, job_dir: str, *, artist: str,
         # En un regen (only_keys set), las escenas NO-target son cache_only:
         # se sirven de caché o se degradan, nunca pagan Veo de nuevo.
         _cache_only = only_keys is not None and key not in only_keys
+        _meta = {}
         try:
             _generate_veo_video(
                 scene["prompt"], clip_path, job_id=job_id,
@@ -7845,11 +7851,14 @@ def _generate_scene_clips(scene_plan: dict, job_dir: str, *, artist: str,
                 normalized_concept=_normalize_concept(concept),
                 allow_people=allow_people,
                 cache_only=_cache_only,
+                out_meta=_meta,
             )
             if not os.path.exists(clip_path):
                 raise RuntimeError("clip no escrito")
             scene["clip_path"] = clip_path
             scene["status"] = "generated"
+            if _meta.get("cache_object_key"):
+                scene["clip_cache_key"] = _meta["cache_object_key"]
             # Póster para el filmstrip (best-effort). Sólo si cambió el clip.
             if only_keys is None or key in only_keys or not scene.get("thumb_key"):
                 _tk = _persist_scene_thumb(clip_path, key, job_id)
@@ -7905,6 +7914,9 @@ def _generate_scene_background(segments: list[dict], audio_duration: float,
     # badge a nivel job sin abrir el filmstrip.
     _failed = sum(1 for s in plan.get("scenes", []) if s.get("status") == "failed")
     plan["degraded"] = {"failed": _failed, "total": len(plan.get("scenes", []))}
+    # Audit LOW: persistir la duración usada como fuente única, así el re-stitch
+    # de un edit/regen no difiere por un frame entre _audio_duration y ffprobe.
+    plan["audio_duration"] = float(audio_duration or 0.0)
     if _failed:
         logger.warning("[SCENES] %d/%d escenas fallaron (degradado a clip reusado) para job=%s",
                        _failed, len(plan.get("scenes", [])), job_id)
@@ -7961,7 +7973,10 @@ def _regenerate_scene_background(scene_plan: dict, recurrence_key: str, job_dir:
         except Exception as e:  # noqa: BLE001
             logger.warning("[SCENES] regen prompt_fn falló (%s); mantengo prompt", e)
 
-    # Bust de caché → Veo fresco SÓLO para esta escena.
+    # Bust de caché → Veo fresco SÓLO para esta escena. Guardamos la key vieja
+    # para GC tras generar la nueva (audit M8: sin esto cada "otra toma" deja un
+    # clip pago huérfano en cache/veo/ para siempre).
+    _old_clip_key = target.get("clip_cache_key")
     target["cache_token"] = uuid.uuid4().hex[:8]
     target["status"] = "planned"
 
@@ -7969,6 +7984,16 @@ def _regenerate_scene_background(scene_plan: dict, recurrence_key: str, job_dir:
                                          song_title=song_title, concept=concept,
                                          job_id=job_id, allow_people=allow_people,
                                          only_keys={recurrence_key})
+    # GC del clip viejo (audit M8): sólo si la regen produjo uno NUEVO distinto.
+    _new_clip_key = target.get("clip_cache_key")
+    if _old_clip_key and _new_clip_key and _old_clip_key != _new_clip_key:
+        try:
+            import storage as _storage
+            if _storage.is_enabled():
+                _storage.delete_object(_old_clip_key)
+                logger.info("[SCENES] GC clip Veo viejo %s (regen %s)", _old_clip_key, recurrence_key)
+        except Exception as _e:  # noqa: BLE001
+            logger.warning("[SCENES] GC del clip viejo falló (%s) — huérfano queda en R2", _e)
     sections = _scenes.sections_from_plan(scene_plan)
     timeline = _scenes.stitch_timeline(sections, clip_for_key, audio_duration, job_dir,
                                        target_w=target_w, target_h=target_h)
@@ -11660,10 +11685,12 @@ def run_edit_pipeline(
             # los cambios de la canción. Si la estructura cambió o falla, caemos
             # al timeline cacheado estático.
             if edit_type == "lyrics" and _is_scene_job:
-                try:
-                    _sc_audio = _audio_duration(mp3_path)
-                except Exception:
-                    _sc_audio = _ffprobe_duration(mp3_path)
+                _sc_audio = scene_plan.get("audio_duration")
+                if not _sc_audio:
+                    try:
+                        _sc_audio = _audio_duration(mp3_path)
+                    except Exception:
+                        _sc_audio = _ffprobe_duration(mp3_path)
                 try:
                     _re_tl, scene_plan = _restitch_scenes_for_edit(
                         scene_plan, segments, _sc_audio, job_dir, artist=artist,
@@ -11738,10 +11765,12 @@ def run_edit_pipeline(
                 raise RuntimeError("edit_type='scene' requiere scene_key.")
             update_job(job_id, status="editing", current_step="scenes", progress=22)
             lyrics_text = " ".join(seg.get("text", "") for seg in segments)
-            try:
-                _scene_audio_dur = _audio_duration(mp3_path)
-            except Exception:
-                _scene_audio_dur = _ffprobe_duration(mp3_path)
+            _scene_audio_dur = scene_plan.get("audio_duration")
+            if not _scene_audio_dur:
+                try:
+                    _scene_audio_dur = _audio_duration(mp3_path)
+                except Exception:
+                    _scene_audio_dur = _ffprobe_duration(mp3_path)
             bg_image_path, scene_plan = _regenerate_scene_background(
                 scene_plan, scene_key, job_dir,
                 artist=artist, song_title=song_title,

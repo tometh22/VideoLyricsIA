@@ -694,6 +694,14 @@ export default function JobDetail({ job, onBack, onJobUpdate }) {
 
   // El spinner de la escena se apaga cuando el job deja de re-renderizar.
   useEffect(() => { if (!isEditing) setSceneBusyKey(null); }, [isEditing]);
+  // Audit M7: watchdog — si el job queda trabado en "editing" (worker muerto,
+  // poll que no avanza), liberá el spinner de la escena igual a los 10 min para
+  // no dejar la card girando para siempre.
+  useEffect(() => {
+    if (!sceneBusyKey) return undefined;
+    const id = setTimeout(() => setSceneBusyKey(null), 600000);
+    return () => clearTimeout(id);
+  }, [sceneBusyKey]);
 
   const regenerateScene = useCallback(async (scene, opts = {}, allowYoutubeDrift = false) => {
     if (!scene) return;
