@@ -11,6 +11,8 @@ import HelpTip from "./HelpCenter/HelpTip";
 import EnableProResModal from "./EnableProResModal";
 import DriveTransferModal from "./DriveTransferModal";
 import VariantCreateModal from "./VariantCreateModal";
+import ScenesFilmstrip from "./ScenesFilmstrip";
+import SceneEditModal from "./SceneEditModal";
 
 const API = import.meta.env.VITE_API_URL || "";
 
@@ -645,6 +647,96 @@ export default function JobDetail({ job, onBack, onJobUpdate }) {
       });
     }
   };
+
+  // ── Multi-escena: filmstrip + regenerar escena ──────────────────────────
+  const videoRef = useRef(null);
+  const scenePlan = job.scene_plan && job.scene_plan.scenes ? job.scene_plan : null;
+  const [sceneThumbs, setSceneThumbs] = useState({});
+  const [sceneBusyKey, setSceneBusyKey] = useState(null);
+  const [editingScene, setEditingScene] = useState(null);
+  const scenesEditable = (isPendingReview || isDone || isRejected) && !isEditing;
+
+  // Pósters firmados (1 llamada). Recarga cuando cambia el plan (cache_token
+  // distinto tras regenerar) para traer el thumb nuevo.
+  const _sceneSig = scenePlan
+    ? scenePlan.scenes.map((s) => `${s.recurrence_key}:${s.cache_token || ""}`).join(",")
+    : "";
+  useEffect(() => {
+    if (!scenePlan) { setSceneThumbs({}); return; }
+    let cancelled = false;
+    (async () => {
+      try {
+        const res = await fetch(`${API}/jobs/${job.job_id}/scenes/thumbs`, { headers: authHeaders() });
+        if (!res.ok || cancelled) return;
+        const data = await res.json();
+        if (!cancelled) setSceneThumbs(data.thumbs || {});
+      } catch { /* sin thumbs → placeholder */ }
+    })();
+    return () => { cancelled = true; };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [job.job_id, _sceneSig]);
+
+  // El spinner de la escena se apaga cuando el job deja de re-renderizar.
+  useEffect(() => { if (!isEditing) setSceneBusyKey(null); }, [isEditing]);
+
+  const regenerateScene = useCallback(async (scene, opts = {}, allowYoutubeDrift = false) => {
+    if (!scene) return;
+    const key = scene.recurrence_key;
+    const apps = (scenePlan?.sections || []).filter((s) => s.recurrence_key === key).length;
+    const isOtraToma = !opts.prompt && !opts.hint && !opts.movement_style;
+    if (isOtraToma && apps > 1) {
+      const ok = window.confirm(
+        (t("scenes.recurrence_confirm") ||
+          "Esta escena aparece {n} veces (es recurrente). Regenerarla cambia todas sus apariciones. ¿Continuar?").replace("{n}", apps)
+      );
+      if (!ok) return;
+    }
+    setSceneBusyKey(key);
+    try {
+      const body = {};
+      if (opts.prompt) body.prompt = opts.prompt;
+      if (opts.hint) body.hint = opts.hint;
+      if (opts.movement_style) body.movement_style = opts.movement_style;
+      if (allowYoutubeDrift) body.allow_youtube_drift = true;
+      const res = await fetch(`${API}/jobs/${job.job_id}/scenes/${encodeURIComponent(key)}/regenerate`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", ...authHeaders() },
+        body: JSON.stringify(body),
+      });
+      if (res.status === 409) {
+        const detail = (await res.json()).detail || {};
+        if (detail.code === "youtube_already_published") {
+          setSceneBusyKey(null);
+          if (window.confirm(t("edit.youtube_drift_confirm") ||
+            "Este video ya fue subido a YouTube. El cambio se guardará en la plataforma pero NO va a reemplazar el archivo en YouTube. ¿Continuar?")) {
+            return regenerateScene(scene, opts, true);
+          }
+          return;
+        }
+      }
+      if (!res.ok) {
+        let msg = `Error ${res.status}`;
+        try { const j = await res.json(); if (j.detail && typeof j.detail === "string") msg = j.detail; } catch { /* keep */ }
+        setSceneBusyKey(null);
+        window.alert(msg);
+        return;
+      }
+      const resp = await res.json();
+      setEditingScene(null);
+      handleEditTriggered({ ...resp, edit_type: "scene" });
+    } catch {
+      setSceneBusyKey(null);
+      window.alert(t("scenes.regen_error") || "No se pudo regenerar la escena.");
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [scenePlan, job.job_id, t]);
+
+  const seekVideo = useCallback((seconds) => {
+    const v = videoRef.current;
+    if (v && Number.isFinite(seconds)) {
+      try { v.currentTime = seconds; v.play?.(); } catch { /* ignore */ }
+    }
+  }, []);
 
   // Editing in progress: render a focused panel instead of falling through
   // to the "not available" early-return below. canPreview is false during
@@ -1488,6 +1580,7 @@ export default function JobDetail({ job, onBack, onJobUpdate }) {
               previewSrc ? (
                 <video
                   key={`${activeTab}-${videoReloadKey}`}
+                  ref={activeTab === "video" ? videoRef : undefined}
                   src={previewSrc}
                   controls
                   onError={handleVideoError}
@@ -1518,7 +1611,31 @@ export default function JobDetail({ job, onBack, onJobUpdate }) {
               </a>
             )}
           </div>
+
+          {/* Filmstrip de escenas (add-on multi-escena). Sólo si el job tiene
+              scene_plan. Permite regenerar una escena puntual sin rehacer todo. */}
+          {scenePlan && (
+            <div className="mb-6">
+              <ScenesFilmstrip
+                scenePlan={scenePlan}
+                thumbUrlFor={(scene) => sceneThumbs[scene.recurrence_key] || null}
+                onRegenerate={(scene) => regenerateScene(scene)}
+                onEditPrompt={(scene) => setEditingScene(scene)}
+                onSeek={seekVideo}
+                busyKey={sceneBusyKey}
+                disabled={!scenesEditable}
+              />
+            </div>
+          )}
         </>
+      )}
+
+      {editingScene && (
+        <SceneEditModal
+          scene={editingScene}
+          onClose={() => setEditingScene(null)}
+          onSubmit={(opts) => regenerateScene(editingScene, opts)}
+        />
       )}
 
       {/* The dedicated full-page editing UI lives in the early return at

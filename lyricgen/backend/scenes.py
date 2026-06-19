@@ -76,6 +76,18 @@ class Section:
     def to_dict(self) -> dict:
         return asdict(self)
 
+    @classmethod
+    def from_dict(cls, d: dict) -> "Section":
+        """Reconstruye una Section desde su forma serializada en scene_plan
+        (ignora claves extra como `duration`, que es property, no campo)."""
+        fields = {"type", "start", "end", "energy", "recurrence_key", "text"}
+        return cls(**{k: v for k, v in (d or {}).items() if k in fields})
+
+
+def sections_from_plan(plan: dict) -> list["Section"]:
+    """Lista de Section a partir de plan["sections"] (para re-stitch en edits)."""
+    return [Section.from_dict(s) for s in (plan or {}).get("sections", [])]
+
 
 # ── Normalización de texto para detectar repeticiones de coro ──────────────
 _WORD_RE = re.compile(r"[^\wáéíóúñü\s]", re.UNICODE)
@@ -603,3 +615,35 @@ def stitch_timeline(
     logger.info("[SCENES] timeline armado: %d escenas, %.0fs, %.1f MB",
                 len(section_files), audio_duration, size_mb)
     return out_path
+
+
+def extract_thumbnail(video_path: str, out_path: str, at_seconds: float = 1.0,
+                      width: int = 320) -> Optional[str]:
+    """Extrae un frame del clip de una escena como póster para el filmstrip.
+
+    Best-effort: si falla (clip corto/corrupto), devuelve None y el caller cae a
+    un placeholder — un thumb faltante no debe tumbar la generación del video.
+    `at_seconds` se clampa para no pedir un frame más allá del fin del clip.
+    """
+    if not video_path or not os.path.exists(video_path):
+        return None
+    ss = max(0.0, float(at_seconds))
+    cmd = [
+        "ffmpeg", "-y", "-loglevel", "error",
+        "-ss", f"{ss:.2f}", "-i", video_path,
+        "-frames:v", "1",
+        "-vf", f"scale={int(width)}:-2",
+        "-q:v", "4",
+        out_path,
+    ]
+    try:
+        from subprocess_utils import run_checked
+        run_checked(cmd, label="ffmpeg-scene-thumb", timeout=60, output_path=out_path)
+    except ImportError:
+        try:
+            subprocess.run(cmd, check=True, timeout=60)
+        except Exception:
+            return None
+    except Exception:
+        return None
+    return out_path if os.path.exists(out_path) and os.path.getsize(out_path) > 0 else None

@@ -105,6 +105,73 @@ def test_scene_clips_all_fail_raises(monkeypatch, tmp_path):
         pipeline._generate_scene_clips(plan, str(tmp_path), artist="A", song_title="S")
 
 
+def _two_scene_plan():
+    return {
+        "bible": {"world": "w", "palette": "p", "texture": "t", "camera": "c", "motif": "m"},
+        "sections": [
+            {"type": "verso", "start": 0.0, "end": 18.0, "energy": 0.5, "recurrence_key": "verso_1", "text": ""},
+            {"type": "coro", "start": 18.0, "end": 36.0, "energy": 0.85, "recurrence_key": "coro_1", "text": ""},
+        ],
+        "scenes": [
+            {"recurrence_key": "verso_1", "section_type": "verso", "energy": 0.5,
+             "movement_style": "sutil", "prompt": "P1", "status": "generated", "cache_token": ""},
+            {"recurrence_key": "coro_1", "section_type": "coro", "energy": 0.85,
+             "movement_style": "dinamico", "prompt": "P2", "status": "generated", "cache_token": ""},
+        ],
+    }
+
+
+def test_regenerate_scene_busts_only_target(monkeypatch, tmp_path):
+    import veo_breaker
+    import scenes
+    monkeypatch.setattr(veo_breaker, "is_open", lambda: False)
+    calls = []
+
+    def fake_veo(prompt, output_path, **kw):
+        calls.append((kw.get("cache_namespace"), prompt))
+        with open(output_path, "w") as f:
+            f.write("clip")
+        return output_path
+
+    monkeypatch.setattr(pipeline, "_generate_veo_video", fake_veo)
+    # Evita ffmpeg real en el test offline.
+    monkeypatch.setattr(scenes, "stitch_timeline", lambda *a, **k: "/tmp/timeline.mp4")
+
+    plan = _two_scene_plan()
+    tl, newplan = pipeline._regenerate_scene_background(
+        plan, "coro_1", str(tmp_path), artist="A", song_title="S",
+        audio_duration=36.0, prompt_override="NUEVO PROMPT")
+
+    coro = next(s for s in newplan["scenes"] if s["recurrence_key"] == "coro_1")
+    verso = next(s for s in newplan["scenes"] if s["recurrence_key"] == "verso_1")
+    # La target tomó el prompt nuevo y un cache_token nuevo (bust); la otra no.
+    assert coro["prompt"] == "NUEVO PROMPT"
+    assert coro["cache_token"] and coro["cache_token"] != ""
+    assert verso["cache_token"] == ""
+    # El namespace de la target lleva su token nuevo → cache miss → Veo fresco.
+    coro_ns = next(ns for ns, p in calls if p == "NUEVO PROMPT")
+    assert coro["cache_token"] in coro_ns
+    # La otra escena se pidió con su namespace sin token (cache HIT en prod).
+    verso_ns = next(ns for ns, p in calls if p == "P1")
+    assert verso_ns == "A|S|verso_1"
+    assert tl == "/tmp/timeline.mp4"
+
+
+def test_regenerate_scene_unknown_key_raises(monkeypatch, tmp_path):
+    import scenes
+    monkeypatch.setattr(scenes, "stitch_timeline", lambda *a, **k: "/tmp/t.mp4")
+    import pytest
+    with pytest.raises(ValueError):
+        pipeline._regenerate_scene_background(
+            _two_scene_plan(), "no_existe", str(tmp_path),
+            artist="A", song_title="S", audio_duration=36.0)
+
+
+def test_scene_cache_ns_token():
+    assert pipeline._scene_cache_ns("A", "S", "coro_1") == "A|S|coro_1"
+    assert pipeline._scene_cache_ns("A", "S", "coro_1", "ab12") == "A|S|coro_1|ab12"
+
+
 def test_scene_clips_breaker_open_raises(monkeypatch, tmp_path):
     import veo_breaker
     monkeypatch.setattr(veo_breaker, "is_open", lambda: True)

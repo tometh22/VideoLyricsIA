@@ -134,6 +134,22 @@ def test_short_verses_keep_their_own_scene():
         assert s.duration >= scenes._hard_min(s) - 0.01
 
 
+def test_sections_from_plan_roundtrip():
+    """El re-stitch de un edit reconstruye Section desde el plan persistido."""
+    secs = scenes.detect_sections(_song_with_repeated_chorus(), audio_duration=100.0)
+    plan = {"sections": [s.to_dict() for s in secs]}
+    rebuilt = scenes.sections_from_plan(plan)
+    assert len(rebuilt) == len(secs)
+    for a, b in zip(secs, rebuilt):
+        assert (a.type, a.start, a.end, a.recurrence_key) == (b.type, b.start, b.end, b.recurrence_key)
+        assert abs(a.duration - b.duration) < 0.01
+    # Ignora claves extra (p.ej. duration) sin romper.
+    extra = scenes.Section.from_dict({"type": "coro", "start": 0.0, "end": 5.0,
+                                      "energy": 0.85, "recurrence_key": "coro_1",
+                                      "text": "x", "duration": 999})
+    assert extra.duration == 5.0
+
+
 def test_energy_to_movement_mapping():
     assert scenes.energy_to_movement(0.9) == "dinamico"
     assert scenes.energy_to_movement(0.5) == "sutil"

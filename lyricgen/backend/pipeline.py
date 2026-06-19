@@ -7739,14 +7739,49 @@ def _make_scene_prompt_fn(lyrics_text, artist, song_title, genre, concept,
     return prompt_fn
 
 
+def _scene_cache_ns(artist: str, song_title: str, key: str, token: str = "") -> str:
+    """Namespace de caché R2 por escena. El `cache_token` (vacío en la
+    generación inicial) cambia cuando el operador regenera UNA escena: así su
+    clip se cachea bajo una key NUEVA (cache miss → Veo fresco) mientras las
+    demás escenas siguen pegando su caché original (re-stitch sin costo). Al
+    persistirse el token en scene_plan, un edit posterior re-baja la versión
+    regenerada, no la vieja."""
+    base = f"{artist}|{song_title}|{key}"
+    return f"{base}|{token}" if token else base
+
+
+def _persist_scene_thumb(clip_path: str, key: str, job_id: str) -> str | None:
+    """Extrae un póster del clip y lo sube a R2; devuelve la key (o None).
+    Best-effort: un thumb faltante no debe tumbar la generación del video."""
+    if not job_id:
+        return None
+    try:
+        import storage as _storage
+        import scenes as _scenes
+        if not _storage.is_enabled():
+            return None
+        thumb_local = os.path.join(os.path.dirname(clip_path), f"thumb_{key}.jpg")
+        if not _scenes.extract_thumbnail(clip_path, thumb_local):
+            return None
+        return _storage.upload_file(thumb_local, f"scenes/{job_id}/thumb_{key}.jpg") or None
+    except Exception as e:  # noqa: BLE001
+        logger.warning("[SCENES] thumb de %s falló (%s) — sin póster", key, e)
+        return None
+
+
 def _generate_scene_clips(scene_plan: dict, job_dir: str, *, artist: str,
                           song_title: str, concept: str = "", job_id: str = None,
-                          allow_people: bool = False) -> dict:
+                          allow_people: bool = False,
+                          only_keys: set | None = None) -> dict:
     """Genera un clip Veo por escena ÚNICA. Devuelve {recurrence_key: clip_path}.
 
-    - cache_namespace incluye la recurrence_key → escenas distintas de la misma
-      canción no colisionan en la caché R2 (y los coros recurrentes, que son UNA
-      escena, pegan caché entre renders).
+    - cache_namespace incluye la recurrence_key + el cache_token de la escena →
+      escenas distintas no colisionan, los coros recurrentes (1 escena) pegan
+      caché, y una escena regenerada (token nuevo) genera fresco mientras las
+      otras re-bajan su caché sin costo.
+    - `only_keys`: si se pasa, sólo se (re)generan esas escenas vía Veo; el resto
+      se re-baja de la caché R2 igual (mismo prompt+token → cache HIT). Sirve al
+      re-stitch de un edit: la target genera fresca, las demás bajan de caché.
     - Degradación elegante: si una escena falla, reusa el primer clip exitoso en
       vez de tumbar el video. Si NINGUNA generó, levanta para que el caller caiga
       al fondo único.
@@ -7765,7 +7800,7 @@ def _generate_scene_clips(scene_plan: dict, job_dir: str, *, artist: str,
         try:
             _generate_veo_video(
                 scene["prompt"], clip_path, job_id=job_id,
-                cache_namespace=f"{artist}|{song_title}|{key}",
+                cache_namespace=_scene_cache_ns(artist, song_title, key, scene.get("cache_token", "")),
                 movement_style=scene.get("movement_style", ""),
                 normalized_concept=_normalize_concept(concept),
                 allow_people=allow_people,
@@ -7774,6 +7809,11 @@ def _generate_scene_clips(scene_plan: dict, job_dir: str, *, artist: str,
                 raise RuntimeError("clip no escrito")
             scene["clip_path"] = clip_path
             scene["status"] = "generated"
+            # Póster para el filmstrip (best-effort). Sólo si cambió el clip.
+            if only_keys is None or key in only_keys or not scene.get("thumb_key"):
+                _tk = _persist_scene_thumb(clip_path, key, job_id)
+                if _tk:
+                    scene["thumb_key"] = _tk
             clip_for_key[key] = clip_path
             first_ok = first_ok or clip_path
         except Exception as e:  # noqa: BLE001
@@ -7819,6 +7859,68 @@ def _generate_scene_background(segments: list[dict], audio_duration: float,
     timeline = _scenes.stitch_timeline(secs, clip_for_key, audio_duration, job_dir,
                                        target_w=target_w, target_h=target_h)
     return timeline, plan
+
+
+def _regenerate_scene_background(scene_plan: dict, recurrence_key: str, job_dir: str, *,
+                                 artist: str, song_title: str, audio_duration: float,
+                                 concept: str = "", allow_people: bool = False,
+                                 job_id: str = None, prompt_override: str = "",
+                                 hint: str = "", movement_style: str = "",
+                                 lyrics_text: str = "", genre: str = "",
+                                 style_hint: str = "", custom_colors: str = "",
+                                 target_w: int = 1920, target_h: int = 1080) -> tuple[str, dict]:
+    """Regenera UNA escena del plan y re-arma el timeline. Devuelve
+    (timeline_path, scene_plan_actualizado).
+
+    Quirúrgico y barato: sólo la escena `recurrence_key` se regenera en Veo
+    (cache_token nuevo → cache miss); las demás re-bajan su clip de la caché R2
+    (mismo prompt+token → cache HIT, sin costo). Luego re-stitch del timeline.
+
+    Tres modos según lo que pida el operador:
+      - prompt_override: reemplaza el prompt de la escena tal cual.
+      - hint: re-deriva el prompt heredando la biblia + el hint del operador.
+      - ninguno ("otra toma"): mismo prompt, sólo el token nuevo → otra versión.
+    """
+    import scenes as _scenes
+    import uuid
+
+    target = next((s for s in scene_plan.get("scenes", [])
+                   if s.get("recurrence_key") == recurrence_key), None)
+    if target is None:
+        raise ValueError(f"escena {recurrence_key!r} no existe en el plan")
+
+    if movement_style:
+        target["movement_style"] = movement_style
+    if (prompt_override or "").strip():
+        target["prompt"] = prompt_override.strip()
+    elif (hint or "").strip():
+        # Re-derivar el prompt con el hint, heredando la biblia (coherencia).
+        prompt_fn = _make_scene_prompt_fn(lyrics_text, artist, song_title, genre,
+                                          concept, style_hint, custom_colors, job_id,
+                                          allow_people)
+        bible_text = _scenes._bible_to_prompt_fragment(scene_plan.get("bible") or {})
+        base_hint = ". ".join(x for x in (bible_text, hint.strip()) if x)
+        try:
+            res = prompt_fn(background_hint=base_hint,
+                            movement_style=target.get("movement_style", ""),
+                            section_type=target.get("section_type", ""),
+                            energy=target.get("energy", 0.5))
+            target["prompt"] = (res or {}).get("prompt") or target["prompt"]
+        except Exception as e:  # noqa: BLE001
+            logger.warning("[SCENES] regen prompt_fn falló (%s); mantengo prompt", e)
+
+    # Bust de caché → Veo fresco SÓLO para esta escena.
+    target["cache_token"] = uuid.uuid4().hex[:8]
+    target["status"] = "planned"
+
+    clip_for_key = _generate_scene_clips(scene_plan, job_dir, artist=artist,
+                                         song_title=song_title, concept=concept,
+                                         job_id=job_id, allow_people=allow_people,
+                                         only_keys={recurrence_key})
+    sections = _scenes.sections_from_plan(scene_plan)
+    timeline = _scenes.stitch_timeline(sections, clip_for_key, audio_duration, job_dir,
+                                       target_w=target_w, target_h=target_h)
+    return timeline, scene_plan
 
 
 def _ensure_background(style_hint: str, job_dir: str, lyrics_text: str = None,
@@ -11339,6 +11441,9 @@ def run_edit_pipeline(
         prior_s3_keys = dict(job_row.s3_keys) if job_row.s3_keys else None
         version_n = int(job_row.edit_count or 0)
         prior_versions = list(job_row.previous_versions or [])
+        # Multi-escena: para edit_type=="scene" reconstruimos el timeline desde
+        # el storyboard persistido (regenerando sólo la escena pedida).
+        scene_plan = dict(job_row.scene_plan) if job_row.scene_plan else None
     finally:
         db.close()
 
@@ -11389,6 +11494,14 @@ def run_edit_pipeline(
     # generate time survives, but it only takes effect in the background
     # branch when a hint is actually present (see _get_unique_prompt).
     bg_verbatim = bool(merged.get("bg_verbatim"))
+    # Multi-escena (edit_type=="scene"): qué escena regenerar y cómo. El
+    # timeline ya es full-length → bg_prelooped=True para que el render NO lo
+    # vuelva a loopear/palindromear.
+    scene_key = edit_params.get("scene_key") or ""
+    scene_prompt_override = edit_params.get("scene_prompt") or ""
+    scene_hint = edit_params.get("scene_hint") or ""
+    scene_movement = edit_params.get("scene_movement") or ""
+    bg_prelooped = False
 
     job_dir = os.path.join(OUTPUTS_DIR, job_id)
     os.makedirs(job_dir, exist_ok=True)
@@ -11496,6 +11609,36 @@ def run_edit_pipeline(
                         update_job(job_id, bg_r2_key_cached=new_bg_key)
                 except Exception as _e:
                     logger.warning("[EDIT] Warning: re-cache of new background failed: %s", _e)
+
+        elif edit_type == "scene":
+            # Regenerar UNA escena del storyboard y re-armar el timeline. Sólo
+            # esa escena toca Veo (cache_token nuevo); las demás re-bajan de la
+            # caché R2. El timeline resultante es full-length → bg_prelooped.
+            if not scene_plan or not scene_plan.get("scenes"):
+                raise RuntimeError("Este job no es multi-escena (sin scene_plan).")
+            if not scene_key:
+                raise RuntimeError("edit_type='scene' requiere scene_key.")
+            update_job(job_id, status="editing", current_step="scenes", progress=22)
+            lyrics_text = " ".join(seg.get("text", "") for seg in segments)
+            try:
+                _scene_audio_dur = _audio_duration(mp3_path)
+            except Exception:
+                _scene_audio_dur = _ffprobe_duration(mp3_path)
+            bg_image_path, scene_plan = _regenerate_scene_background(
+                scene_plan, scene_key, job_dir,
+                artist=artist, song_title=song_title,
+                audio_duration=_scene_audio_dur,
+                concept=concept, allow_people=_compute_allow_people(job_id),
+                job_id=job_id,
+                prompt_override=scene_prompt_override, hint=scene_hint,
+                movement_style=scene_movement,
+                lyrics_text=lyrics_text, genre=genre,
+                style_hint=style, custom_colors=custom_colors,
+            )
+            bg_prelooped = True
+            # Persistir el plan actualizado (clip nuevo, cache_token, thumb).
+            update_job(job_id, scene_plan=scene_plan, progress=35)
+
         else:
             raise ValueError(f"Unknown edit_type {edit_type!r}")
 
@@ -11541,6 +11684,8 @@ def run_edit_pipeline(
             title_template=title_template, title_size=title_size,
             title_artist_font=title_artist_font, title_song_font=title_song_font,
             title_song_break=title_song_break,
+            # Multi-escena: el timeline ya cubre toda la canción → no re-loopear.
+            bg_prelooped=bg_prelooped,
         )
         files = {"video_url": f"/download/{job_id}/video"}
         update_job(job_id, progress=55)

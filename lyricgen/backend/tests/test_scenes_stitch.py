@@ -98,3 +98,22 @@ def test_stitch_single_scene_no_xfade(tmp_path):
     sections = [Section(type="verso", start=0, end=40, energy=0.5, recurrence_key="scene_0")]
     out = _stitch(sections, 40.0, tmp_path)
     assert abs(_probe_dur(out) - 40.0) < 0.6
+
+
+def test_extract_thumbnail(tmp_path):
+    clip = os.path.join(str(tmp_path), "clip.mp4")
+    _make_clip(clip, "blue", secs=4)
+    out = os.path.join(str(tmp_path), "thumb.jpg")
+    res = scenes.extract_thumbnail(clip, out, at_seconds=1.0, width=160)
+    assert res == out and os.path.exists(out) and os.path.getsize(out) > 0
+    # ancho respetado (alto par por scale=-2)
+    w = int(subprocess.run(
+        ["ffprobe", "-v", "error", "-select_streams", "v:0",
+         "-show_entries", "stream=width", "-of", "default=nw=1:nk=1", out],
+        capture_output=True, text=True).stdout.strip())
+    assert w == 160
+
+
+def test_extract_thumbnail_missing_clip_returns_none(tmp_path):
+    assert scenes.extract_thumbnail(os.path.join(str(tmp_path), "nope.mp4"),
+                                    os.path.join(str(tmp_path), "t.jpg")) is None
