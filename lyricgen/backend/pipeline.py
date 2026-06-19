@@ -947,6 +947,10 @@ def run_pipeline(job_id: str, mp3_path: str, artist: str, style: str,
                         artist=artist, song_title=_song_title, genre=genre,
                         concept=concept, movement_style=movement_style,
                         custom_colors=custom_colors,
+                        # El prompt del operador ("Mi prompt") moldea TODA la
+                        # biblia → multi-escena respeta auto/letra/prompt igual
+                        # que el fondo único. bg_verbatim ="usá mi texto tal cual".
+                        background_hint=background_hint, bg_verbatim=bg_verbatim,
                         allow_people=_compute_allow_people(job_id),
                         job_id=job_id,
                     )
@@ -7624,7 +7628,9 @@ _BIBLE_FALLBACK_PALETTE = {
 
 def _build_visual_bible(lyrics_text: str, artist: str, song_title: str = "",
                         genre: str = "", concept: str = "", style: str = "",
-                        custom_colors: str = "", job_id: str = None) -> dict:
+                        custom_colors: str = "", job_id: str = None,
+                        background_hint: str | None = None,
+                        bg_verbatim: bool = False) -> dict:
     """Una sola llamada Gemini que fija el "look book" del video.
 
     Devuelve {world, palette, texture, camera, motif} — el ADN visual que TODA
@@ -7654,8 +7660,18 @@ def _build_visual_bible(lyrics_text: str, artist: str, song_title: str = "",
             "visual element). Keep each value under 25 words. No people's faces, "
             "no text/letters/logos in the described world."
         )
+        # Dirección del operador ("Mi prompt"): moldea TODA la biblia → multi-
+        # escena respeta auto/letra/prompt igual que el fondo único. Verbatim =
+        # "usá mi visión tal cual" (manda sobre género/letra).
+        _hint = (background_hint or "").strip()
+        _direction = ""
+        if _hint:
+            _direction = (
+                f"\nOPERATOR DIRECTION (this is the world the operator wants — "
+                f"{'use it as the definitive vision, it OVERRIDES genre/lyrics inference' if bg_verbatim else 'honor it strongly while staying coherent with the song'}): {_hint[:600]}"
+            )
         user = (f"Artist: {artist}\nTitle: {song_title}\nGenre: {genre}\n"
-                f"Concept: {concept}\nPalette hint: {style} {custom_colors}\n"
+                f"Concept: {concept}\nPalette hint: {style} {custom_colors}{_direction}\n"
                 f"Lyrics (excerpt):\n{(lyrics_text or '')[:600]}")
         recorder = record_ai_call(
             job_id=job_id or "unknown", step="visual_bible",
@@ -7831,7 +7847,8 @@ def _generate_scene_background(segments: list[dict], audio_duration: float,
                               job_dir: str, *, style_hint: str, lyrics_text: str,
                               artist: str, song_title: str = "", genre: str = "",
                               concept: str = "", movement_style: str = "",
-                              custom_colors: str = "", allow_people: bool = False,
+                              custom_colors: str = "", background_hint: str | None = None,
+                              bg_verbatim: bool = False, allow_people: bool = False,
                               job_id: str = None, target_w: int = 1920,
                               target_h: int = 1080) -> tuple[str, dict]:
     """Orquesta el fondo multi-escena. Devuelve (timeline_path, scene_plan).
@@ -7847,7 +7864,8 @@ def _generate_scene_background(segments: list[dict], audio_duration: float,
     logger.info("[SCENES] %d secciones, %d escenas únicas (canción %.0fs)",
                 len(secs), n_unique, audio_duration or 0.0)
     bible = _build_visual_bible(lyrics_text, artist, song_title, genre, concept,
-                                style_hint, custom_colors, job_id)
+                                style_hint, custom_colors, job_id,
+                                background_hint=background_hint, bg_verbatim=bg_verbatim)
     prompt_fn = _make_scene_prompt_fn(lyrics_text, artist, song_title, genre,
                                       concept, style_hint, custom_colors, job_id,
                                       allow_people)

@@ -622,6 +622,8 @@ export const translations = {
     "upload.scenes_desc": "Varias escenas con arco narrativo en vez de un fondo único",
     "upload.mode_scenes": "Escenas",
     "upload.mode_scenes_desc": "Varias escenas con arco narrativo, no un fondo único.",
+    "upload.scenes_toggle": "Multi-escena",
+    "upload.scenes_toggle_desc": "Varias escenas con arco narrativo en vez de un fondo único.",
     "upload.premium_badge": "PREMIUM",
     "upload.scenes_locked": "Plan superior",
     "upload.scenes_on_title": "Tu video tendrá varias escenas",
