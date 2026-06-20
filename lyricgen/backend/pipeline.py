@@ -2445,6 +2445,16 @@ def _vad_chunk_transcribe(mp3_path: str, language: str | None = None,
     all_segments: list[dict] = []
     rolling_prompt: str | None = lyrics_hint  # seed with lyrics_hint; rolls forward
 
+    # Emit incremental progress so the frontend stuck-detector doesn't fire.
+    # Whisper API path runs inside a thread executor (no async context here),
+    # so we use the sync update_job() from jobs.py directly.
+    _update_job_fn = None
+    if job_id:
+        try:
+            from jobs import update_job as _update_job_fn
+        except Exception:
+            pass
+
     for i, (c_start, c_end) in enumerate(chunks):
         chunk_path: str | None = None
         try:
@@ -2498,6 +2508,16 @@ def _vad_chunk_transcribe(mp3_path: str, language: str | None = None,
                 rolling_prompt = chunk_segs[-1]["text"][:800]
 
             all_segments.extend(chunk_segs)
+
+            # Emit progress so the frontend knows we're still alive.
+            # Spread chunks across the 50-54% band (transcribe.transcribe step).
+            # The caller will advance to 55%+ after we return.
+            if _update_job_fn and len(chunks) > 1:
+                chunk_pct = int(50 + round(4 * (i + 1) / len(chunks)))
+                try:
+                    _update_job_fn(job_id, progress=chunk_pct)
+                except Exception:
+                    pass
 
         except Exception as exc:
             logger.warning("[VAD-CHUNK] chunk %d/%d error (%s); skipping", i + 1, len(chunks), exc)
