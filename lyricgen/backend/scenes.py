@@ -446,8 +446,10 @@ def build_scene_plan(
 
     `prompt_fn` es inyectada por el caller (pipeline pasa un wrapper de su
     `_get_unique_prompt`). Recibe el contexto de la escena + la biblia como
-    `background_hint` y devuelve {"style","prompt"}. Así toda escena hereda
-    la biblia (mundo/paleta/textura/cámara/motivo) → coherencia "mismo film".
+    `background_hint` y devuelve {"style","prompt"}. Toda escena hereda el
+    MUNDO/PALETA/MOTIVO de la biblia (coherencia "mismo film"); la textura y la
+    cinematografía las decide el motor por-escena desde la canción, igual que
+    Auto/Inspirado (ver _bible_to_prompt_fragment).
 
     `operator_movement`: si el operador eligió un movimiento que REDUCE la
     cámara (estatico/sutil), se respeta en TODAS las escenas (override del
@@ -507,11 +509,20 @@ def build_scene_plan(
 
 
 def _bible_to_prompt_fragment(bible: dict) -> str:
-    """Aplana la biblia visual a un fragmento de prompt que toda escena hereda."""
+    """Aplana la biblia a un fragmento de prompt que toda escena hereda.
+
+    Sólo inyectamos lo que hace falta para que las escenas se sientan el MISMO
+    film: el MUNDO (lugar/entorno), la PALETA (colores/luz) y el MOTIVO
+    recurrente. La textura/cinematografía NO se imponen desde la biblia — las
+    deriva por-escena el mismo motor que usa Auto/Inspirado (_get_unique_prompt),
+    a partir de la canción. Así multi-escena no arrastra un patrón fijo (era el
+    origen del sesgo "16mm film grain" que dibujaba un fotograma físico): la
+    biblia da coherencia, el motor da el look — exactamente como el fondo único.
+    """
     if not bible:
         return ""
     parts = []
-    for k in ("world", "palette", "texture", "camera", "motif"):
+    for k in ("world", "palette", "motif"):
         v = (bible.get(k) or "").strip()
         if v:
             parts.append(v)

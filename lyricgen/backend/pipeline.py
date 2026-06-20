@@ -7705,28 +7705,25 @@ def _build_visual_bible(lyrics_text: str, artist: str, song_title: str = "",
         from provenance import record_ai_call
         client = _get_genai_client()
         sys_instr = (
-            "You are an art director designing the VISUAL BIBLE for a premium "
-            "lyric video. Read the song and define ONE coherent visual world that "
-            "every scene of the video will share — this is what makes the video "
-            "feel like a single film instead of random clips. Respond ONLY with a "
-            "JSON object with exactly these string keys: world (the setting/"
-            "environment family), palette (colors + lighting), texture (grain/"
-            "lens/color-grade feel), camera (the camera language), motif (one "
-            "recurring visual element). Keep each value under 25 words. No people's "
-            "faces, no text/letters/logos in the described world. "
-            # Contra-sesgo (medido 2026-06-19: 4/4 biblias caían en "gritty film
-            # grain" y 3/4 nombraban un calibre). El default del modelo para
-            # "cinematográfico" es el cliché de film analógico, que hace que Veo
-            # dibuje el fotograma físico. Empujamos a digital moderno limpio.
-            "For 'texture': DEFAULT to a clean, modern, full-frame DIGITAL "
-            "cinematic look — contemporary premium music-video / commercial grade, "
-            "crisp and edge-to-edge (e.g. 'clean modern digital grade, crisp "
-            "detail, fine subtle grain, soft natural light'). Describe the GRADE "
-            "and grain MOOD only. AVOID the reflexive 'gritty film grain' cliché; "
-            "only lean vintage/analog if the song's era or lyrics explicitly "
-            "demand it. NEVER name a film FORMAT or gauge (no '16mm', '35mm', "
-            "'8mm', 'Super 8', 'VHS', 'celluloid', 'film stock', 'analog tape'), "
-            "and never describe found-footage, camcorder, viewfinder, film-strip/"
+            "You are an art director defining the SHARED visual world for a "
+            "premium lyric video so its scenes feel like ONE film instead of "
+            "random clips. Define ONLY what must be consistent across scenes — "
+            "the per-scene look, texture and cinematography are decided later by "
+            "the scene engine from the song itself, so DON'T impose a fixed "
+            "aesthetic. Respond ONLY with a JSON object with exactly these string "
+            "keys: world (the setting/environment family), palette (colors + "
+            "lighting), texture (a light grade/mood note, kept neutral), camera "
+            "(a light note on the camera language), motif (one recurring visual "
+            "element). Keep each value under 25 words. No people's faces, no "
+            "text/letters/logos in the described world. "
+            # Prohibición factual (no es un patrón — evita un bug): nombrar un
+            # formato/calibre de film hace que Veo dibuje el fotograma físico
+            # (incidente 2026-06-19, "16mm film grain" → sprockets + marco negro).
+            # Belt-and-suspenders: texture/camera además ya NO se inyectan al
+            # prompt por-escena (ver scenes._bible_to_prompt_fragment).
+            "NEVER name a film FORMAT or gauge (no '16mm', '35mm', '8mm', "
+            "'Super 8', 'VHS', 'celluloid', 'film stock', 'analog tape'), and "
+            "never describe found-footage, camcorder, viewfinder, film-strip/"
             "sprocket, or on-screen camera-UI aesthetics: naming a physical film "
             "format makes the AI render a literal film frame — sprocket holes, "
             "edge markings, a black border and fake recording chrome — over the "
