@@ -20,6 +20,11 @@ def test_visual_bible_fallback_when_gemini_unavailable(monkeypatch):
     assert all(isinstance(v, str) and v.strip() for v in bible.values())
     # La paleta del fallback refleja el style elegido.
     assert "neon" in bible["palette"].lower()
+    # El fallback determinista NO debe traer sesgo de film/calibre (no pasa por
+    # el sanitizador): un fallback con "16mm/film grain" reintroduce el bug.
+    blob = " ".join(bible.values()).lower()
+    for bad in ["16mm", "35mm", "film grain", "film stock", "vhs"]:
+        assert bad not in blob, f"fallback sesgado contiene {bad!r}: {blob}"
 
 
 def test_parse_json_object_tolerant():

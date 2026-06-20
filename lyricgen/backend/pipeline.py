@@ -7696,7 +7696,7 @@ def _build_visual_bible(lyrics_text: str, artist: str, song_title: str = "",
     fallback = {
         "world": (concept or genre or "cinematic scene grounded in the song's mood"),
         "palette": (custom_colors or _BIBLE_FALLBACK_PALETTE.get(style, "cohesive cinematic palette")),
-        "texture": "subtle film grain, soft cinematic depth of field",
+        "texture": "clean modern digital grade, fine subtle grain, soft cinematic depth of field",
         "camera": "slow, deliberate camera language",
         "motif": "a single recurring light source tying the scenes together",
     }
@@ -7713,15 +7713,24 @@ def _build_visual_bible(lyrics_text: str, artist: str, song_title: str = "",
             "environment family), palette (colors + lighting), texture (grain/"
             "lens/color-grade feel), camera (the camera language), motif (one "
             "recurring visual element). Keep each value under 25 words. No people's "
-            "faces, no text/letters/logos in the described world. The 'texture' "
-            "describes the GRADE and grain MOOD only (e.g. 'soft filmic grade, fine "
-            "grain, gentle halation') — NEVER name a film FORMAT or gauge (no "
-            "'16mm', '35mm', '8mm', 'Super 8', 'VHS', 'celluloid', 'film stock', "
-            "'analog tape'), and never describe found-footage, camcorder, "
-            "viewfinder, film-strip/sprocket, or on-screen camera-UI aesthetics: "
-            "naming a physical film format makes the AI render a literal film "
-            "frame — sprocket holes, edge markings, a black border and fake "
-            "recording chrome — over the scene."
+            "faces, no text/letters/logos in the described world. "
+            # Contra-sesgo (medido 2026-06-19: 4/4 biblias caían en "gritty film
+            # grain" y 3/4 nombraban un calibre). El default del modelo para
+            # "cinematográfico" es el cliché de film analógico, que hace que Veo
+            # dibuje el fotograma físico. Empujamos a digital moderno limpio.
+            "For 'texture': DEFAULT to a clean, modern, full-frame DIGITAL "
+            "cinematic look — contemporary premium music-video / commercial grade, "
+            "crisp and edge-to-edge (e.g. 'clean modern digital grade, crisp "
+            "detail, fine subtle grain, soft natural light'). Describe the GRADE "
+            "and grain MOOD only. AVOID the reflexive 'gritty film grain' cliché; "
+            "only lean vintage/analog if the song's era or lyrics explicitly "
+            "demand it. NEVER name a film FORMAT or gauge (no '16mm', '35mm', "
+            "'8mm', 'Super 8', 'VHS', 'celluloid', 'film stock', 'analog tape'), "
+            "and never describe found-footage, camcorder, viewfinder, film-strip/"
+            "sprocket, or on-screen camera-UI aesthetics: naming a physical film "
+            "format makes the AI render a literal film frame — sprocket holes, "
+            "edge markings, a black border and fake recording chrome — over the "
+            "scene."
         )
         # Dirección del operador ("Mi prompt"): moldea TODA la biblia → multi-
         # escena respeta auto/letra/prompt igual que el fondo único. Verbatim =
