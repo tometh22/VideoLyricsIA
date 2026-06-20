@@ -652,26 +652,21 @@ export default function LyricsEditor({
   // seconds in once the initial buffered range is consumed.
   const [audioUrl, setAudioUrl] = useState(null);
   const blobUrlRef = useRef(null);
+
+  // Effect A: blob URL lifecycle — only re-runs when audioFile changes.
+  // audioUrlProp is intentionally NOT in the deps: including it would cause
+  // the cleanup (which revokes the blob) to fire when Phase B sets audioUrlProp,
+  // creating an ERR_FILE_NOT_FOUND race before the R2 URL reaches the <audio>
+  // element. Effect B handles the audioUrlProp upgrade independently.
   useEffect(() => {
-    // audioUrlProp wins over audioFile when the parent already has a
-    // streamable URL (post-approval modal: signed R2 URL via GET
-    // /jobs/{id}/source-audio-url). Don't createObjectURL in that case —
-    // the URL is already valid for <audio src> and revoking would be a
-    // no-op anyway.
-    if (audioUrlProp) { setAudioUrl(audioUrlProp); return undefined; }
     if (!audioFile) { setAudioUrl(null); return undefined; }
     // HOTFIX 2026-05-29: when a wizard session is resumed from
     // sessionStorage (wizardPersistence), `audioFile` is a STUB object
     // — { name, size, type, lastModified, _restoredStub: true } — not
     // a real Blob/File. URL.createObjectURL on a non-Blob throws
     // "Failed to execute 'createObjectURL' on 'URL': Overload
-    // resolution failed", which propagates as an unhandled promise
-    // rejection and trips the GlobalErrorBoundary ("Algo salió mal").
-    // Detect the stub and silently skip URL creation; segment editing
-    // still works, audio playback is just disabled until the operator
-    // re-uploads. Matches the documented contract in wizardPersistence
-    // header: "audio playback won't work until the operator re-uploads
-    // the file".
+    // resolution failed". Detect the stub and silently skip; segment
+    // editing still works, audio playback is disabled until re-upload.
     const isRealBlob =
       typeof Blob !== "undefined" && audioFile instanceof Blob;
     if (!isRealBlob || audioFile._restoredStub) {
@@ -680,21 +675,24 @@ export default function LyricsEditor({
     }
     const url = URL.createObjectURL(audioFile);
     setAudioUrl(url);
-    // Revoke on unmount OR when audioFile changes — but NOT when
-    // audioUrlProp becomes non-null (Phase B switching to R2 URL).
-    // Previously `return () => revokeObjectURL(url)` ran unconditionally,
-    // so when Phase B set audioUrlProp the cleanup fired, killed the blob
-    // mid-play, and the <audio> got ERR_FILE_NOT_FOUND before R2 loaded.
-    // Instead we track the created URL in a ref and only revoke when
-    // audioFile itself changes (i.e. a brand-new upload, not a URL upgrade).
     blobUrlRef.current = url;
     return () => {
-      if (blobUrlRef.current === url) {
-        URL.revokeObjectURL(url);
-        blobUrlRef.current = null;
-      }
+      URL.revokeObjectURL(url);
+      blobUrlRef.current = null;
     };
-  }, [audioFile, audioUrlProp]);
+  }, [audioFile]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // Effect B: R2/signed URL upgrade (Phase B). When the parent fetches a
+  // durable server-side URL after job creation, we revoke the ephemeral blob
+  // here (not in Effect A's cleanup) so the <audio> never sees a dead URL.
+  useEffect(() => {
+    if (!audioUrlProp) return;
+    if (blobUrlRef.current) {
+      URL.revokeObjectURL(blobUrlRef.current);
+      blobUrlRef.current = null;
+    }
+    setAudioUrl(audioUrlProp);
+  }, [audioUrlProp]);
 
   const audioRef = useRef(null);
   const listRef = useRef(null);
