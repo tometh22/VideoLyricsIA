@@ -48,9 +48,14 @@ def _is_adlib_loop(text: str) -> bool:
     from collections import Counter
     counts = Counter(tokens)
     top_token, top_count = counts.most_common(1)[0]
-    if len(top_token) > 4:
+    concentration = top_count / len(tokens)
+    # Allow tokens longer than 4 chars only when they're 100 % of tokens
+    # (e.g. "Uoh-oh-oh-oh-oh" repeated × 5 normalises to "uohohohohoh" but
+    # is unambiguously a melismatic ad-lib block). Mixed cases (e.g. "uh" +
+    # "uoh-oh-oh-oh-oh") hit the ≤4-char branch on the short token instead.
+    if len(top_token) > 4 and concentration < 1.0:
         return False
-    return top_count / len(tokens) >= 0.85 and top_count >= ADLIB_MIN_REPEATS
+    return concentration >= 0.85 and top_count >= ADLIB_MIN_REPEATS
 
 
 def _clean_adlib_chunk_text(words: list[dict]) -> str:
