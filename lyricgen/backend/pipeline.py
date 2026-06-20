@@ -2318,6 +2318,207 @@ def _transcribe_via_openai_api(mp3_path: str, language: str | None = None,
     return segments
 
 
+# ── Chunked transcription ─────────────────────────────────────────────────────
+#
+# Splits audio into short windows ≤25 s before sending to Whisper.
+# Prevents the main hallucination class: Whisper filling long silent/uh sections
+# with repeated chorus phrases because the full-song context window makes them
+# plausible. Each short chunk resets the model's context — it can only
+# hallucinate within that window, which is too short to build repetition momentum.
+#
+# Strategy:
+#   1. Try VAD (librosa energy-based). Works well for a cappella / sparse tracks.
+#   2. If VAD produces only 1 chunk (full-mix songs where music fills all "silence"),
+#      fall back to fixed time-based chunking (every _CHUNK_TIME_S seconds).
+#
+# Gated by VAD_CHUNK_ENABLED env var (default "1"). Set to "0" to revert to the
+# single full-file call.
+
+_VAD_CHUNK_MAX_S: float = 25.0   # max span per VAD-driven chunk (s)
+_VAD_CHUNK_PAD_S: float = 0.5    # silence padding around each voice region (s)
+_CHUNK_TIME_S: float = 20.0      # fixed-time chunk size when VAD finds no gaps (s)
+
+
+def _build_chunks_from_audio(mp3_path: str) -> list[tuple[float, float]]:
+    """Return (start, end) pairs for transcription chunks.
+
+    Tries VAD-based splitting first; falls back to fixed-time chunks when
+    the full-mix background music prevents VAD from finding real gaps.
+    """
+    import subprocess
+
+    # 1. Get audio duration.
+    audio_duration: float | None = None
+    try:
+        _ff = subprocess.run(
+            ["ffprobe", "-v", "quiet", "-show_entries", "format=duration",
+             "-of", "default=noprint_wrappers=1:nokey=1", mp3_path],
+            capture_output=True, text=True, timeout=10,
+        )
+        if _ff.returncode == 0:
+            audio_duration = float(_ff.stdout.strip())
+    except Exception:
+        pass
+
+    # 2. Try VAD-based grouping.
+    regions = _detect_speech_regions(
+        mp3_path,
+        top_db=35,         # more aggressive than gap-fill VAD (top_db=30)
+        min_region_s=0.5,
+        merge_gap_s=2.0,   # merge phrases ≤2s apart into one region
+    )
+
+    if regions:
+        chunks: list[tuple[float, float]] = []
+        c_start: float | None = None
+        c_end: float | None = None
+        for reg_start, reg_end in regions:
+            p_start = max(0.0, reg_start - _VAD_CHUNK_PAD_S)
+            p_end = reg_end + _VAD_CHUNK_PAD_S
+            if audio_duration is not None:
+                p_end = min(p_end, audio_duration)
+            if c_start is None:
+                c_start, c_end = p_start, p_end
+            elif p_end - c_start <= _VAD_CHUNK_MAX_S:
+                c_end = p_end
+            else:
+                chunks.append((c_start, c_end))
+                c_start, c_end = p_start, p_end
+        if c_start is not None:
+            chunks.append((c_start, c_end))
+
+        if len(chunks) > 1:
+            logger.info("[CHUNK] VAD: %d regions → %d chunks", len(regions), len(chunks))
+            return chunks
+
+        logger.info(
+            "[CHUNK] VAD produced %d chunk (full-mix song); switching to time-based",
+            len(chunks),
+        )
+
+    # 3. Fall back to fixed time-based chunking.
+    if not audio_duration:
+        logger.warning("[CHUNK] audio duration unknown; cannot time-chunk; full-file fallback")
+        return []
+
+    step = _CHUNK_TIME_S
+    chunks = []
+    t = 0.0
+    while t < audio_duration:
+        chunks.append((t, min(t + step, audio_duration)))
+        t += step
+
+    logger.info("[CHUNK] time-based: %.1fs audio → %d chunks of %.0fs", audio_duration, len(chunks), step)
+    return chunks
+
+
+def _vad_chunk_transcribe(mp3_path: str, language: str | None = None,
+                           lyrics_hint: str | None = None,
+                           job_id: str | None = None,
+                           return_words: bool = False) -> list[dict]:
+    """Chunked Whisper API transcription (VAD-split or time-split).
+
+    1. Build transcription chunks via _build_chunks_from_audio():
+       VAD-based if the song has detectable silence gaps; time-based otherwise.
+    2. Extract each chunk to a temp file via ffmpeg.
+    3. Call _transcribe_via_openai_api() on each chunk with a rolling prompt.
+    4. Offset timestamps by chunk start and concatenate.
+
+    Falls back to single-file _transcribe_via_openai_api() only when
+    chunking itself fails (ffmpeg error, all chunks fail, etc.).
+    """
+    import subprocess
+    import tempfile
+
+    chunks = _build_chunks_from_audio(mp3_path)
+
+    if len(chunks) <= 1:
+        logger.info("[VAD-CHUNK] ≤1 chunk; single-file fallback")
+        return _transcribe_via_openai_api(
+            mp3_path, language=language, lyrics_hint=lyrics_hint,
+            job_id=job_id, return_words=return_words,
+        )
+
+    logger.info("[VAD-CHUNK] %d chunks to transcribe", len(chunks))
+
+    # 4. Transcribe each chunk, offset timestamps, concatenate.
+    all_segments: list[dict] = []
+    rolling_prompt: str | None = lyrics_hint  # seed with lyrics_hint; rolls forward
+
+    for i, (c_start, c_end) in enumerate(chunks):
+        chunk_path: str | None = None
+        try:
+            with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as tf:
+                chunk_path = tf.name
+
+            rc = subprocess.run(
+                [
+                    "ffmpeg", "-y",
+                    "-ss", str(c_start),
+                    "-to", str(c_end),
+                    "-i", mp3_path,
+                    "-ar", "16000", "-ac", "1",
+                    "-codec:a", "libmp3lame", "-q:a", "5",
+                    chunk_path,
+                ],
+                capture_output=True, timeout=90,
+            )
+            if rc.returncode != 0:
+                logger.warning(
+                    "[VAD-CHUNK] ffmpeg chunk %d/%d failed (rc=%d); skipping",
+                    i + 1, len(chunks), rc.returncode,
+                )
+                continue
+
+            logger.info(
+                "[VAD-CHUNK] chunk %d/%d: %.1f–%.1fs (%.1fs)",
+                i + 1, len(chunks), c_start, c_end, c_end - c_start,
+            )
+
+            chunk_segs = _transcribe_via_openai_api(
+                chunk_path,
+                language=language,
+                lyrics_hint=rolling_prompt,
+                job_id=job_id,   # record every chunk for accurate cost tracking
+                return_words=return_words,
+            )
+
+            # Offset timestamps by chunk's absolute start time.
+            for seg in chunk_segs:
+                seg["start"] = round(float(seg["start"]) + c_start, 3)
+                seg["end"] = round(float(seg["end"]) + c_start, 3)
+                if return_words and seg.get("words"):
+                    for w in seg["words"]:
+                        w["start"] = round(float(w["start"]) + c_start, 3)
+                        w["end"] = round(float(w["end"]) + c_start, 3)
+
+            # Roll the prompt: seed the next chunk with the last segment's text
+            # so Whisper continues in the same lyrical register.
+            if chunk_segs:
+                rolling_prompt = chunk_segs[-1]["text"][:800]
+
+            all_segments.extend(chunk_segs)
+
+        except Exception as exc:
+            logger.warning("[VAD-CHUNK] chunk %d/%d error (%s); skipping", i + 1, len(chunks), exc)
+        finally:
+            if chunk_path:
+                try:
+                    os.unlink(chunk_path)
+                except OSError:
+                    pass
+
+    if not all_segments:
+        logger.warning("[VAD-CHUNK] all %d chunks failed; single-file fallback", len(chunks))
+        return _transcribe_via_openai_api(
+            mp3_path, language=language, lyrics_hint=lyrics_hint,
+            job_id=job_id, return_words=return_words,
+        )
+
+    logger.info("[VAD-CHUNK] %d total segments from %d chunks", len(all_segments), len(chunks))
+    return sorted(all_segments, key=lambda s: s["start"])
+
+
 def transcribe(mp3_path: str, language: str = None,
                lyrics_hint: str | None = None,
                job_id: str | None = None,
@@ -2340,6 +2541,11 @@ def transcribe(mp3_path: str, language: str = None,
     has_key = bool(os.environ.get("OPENAI_API_KEY", "").strip())
     logger.info("[transcribe] OPENAI_API_KEY=%s", 'set' if has_key else 'EMPTY')
     if has_key:
+        if os.environ.get("VAD_CHUNK_ENABLED", "1") != "0":
+            return _vad_chunk_transcribe(
+                mp3_path, language=language, lyrics_hint=lyrics_hint,
+                job_id=job_id, return_words=return_words,
+            )
         return _transcribe_via_openai_api(
             mp3_path, language=language, lyrics_hint=lyrics_hint,
             job_id=job_id, return_words=return_words,
