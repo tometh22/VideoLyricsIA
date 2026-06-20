@@ -2336,7 +2336,10 @@ def _transcribe_via_openai_api(mp3_path: str, language: str | None = None,
 
 _VAD_CHUNK_MAX_S: float = 25.0   # max span per VAD-driven chunk (s)
 _VAD_CHUNK_PAD_S: float = 0.5    # silence padding around each voice region (s)
-_CHUNK_TIME_S: float = 20.0      # fixed-time chunk size when VAD finds no gaps (s)
+_CHUNK_TIME_S: float = 28.0      # fixed-time chunk size when VAD finds no gaps (s)
+                                  # 28s minimizes phrase-boundary crossings for
+                                  # ~3-min songs; avoids the 120s boundary that
+                                  # splits "Tomas del miedo" (118-125s) in 20/30s.
 
 
 def _build_chunks_from_audio(mp3_path: str) -> list[tuple[float, float]]:
