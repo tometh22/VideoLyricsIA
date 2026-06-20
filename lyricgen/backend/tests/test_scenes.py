@@ -208,3 +208,32 @@ def test_build_scene_plan_inherits_bible_and_dedups():
     # Toda escena heredó la biblia (el "mundo" aparece en el hint enviado).
     assert all("neon-soaked rainy metropolis" in c for c in calls)
     assert plan["bible"] == bible
+
+
+def test_scene_hint_carries_coherence_not_texture_or_camera():
+    """La biblia sólo inyecta MUNDO/PALETA/MOTIVO en el hint por-escena; la
+    textura y la cinematografía las deriva el motor por-escena desde la canción
+    (como Auto/Inspirado). Regresión 2026-06-19: inyectar texture="16mm film
+    grain" propagaba el sesgo a TODAS las escenas y dibujaba un fotograma físico."""
+    secs = scenes.detect_sections(_song_with_repeated_chorus(), audio_duration=100.0)
+    bible = {
+        "world": "neon-soaked rainy metropolis at night",
+        "palette": "deep blues and magenta",
+        "texture": "gritty 16mm film grain, sprocket holes",   # NO debe inyectarse
+        "camera": "handheld camcorder, slow zoom",             # NO debe inyectarse
+        "motif": "reflections on wet asphalt",
+    }
+    calls = []
+
+    def fake_prompt_fn(background_hint="", movement_style="", section_type="", energy=0.0):
+        calls.append(background_hint)
+        return {"style": "video", "prompt": "ok"}
+
+    scenes.build_scene_plan(secs, bible, fake_prompt_fn)
+    blob = " ".join(calls).lower()
+    # Coherencia presente.
+    assert "neon-soaked rainy metropolis" in blob and "deep blues" in blob
+    assert "reflections on wet asphalt" in blob
+    # Textura/cámara de la biblia AUSENTES del hint (no se imponen).
+    for leaked in ["16mm", "film grain", "sprocket", "camcorder"]:
+        assert leaked not in blob, f"la biblia filtró {leaked!r} al hint por-escena"
