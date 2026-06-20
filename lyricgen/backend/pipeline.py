@@ -1540,7 +1540,9 @@ def _is_whisper_hallucination(text: str) -> bool:
     return False
 
 
-def _is_single_word_loop(text: str, min_repeats: int = 8) -> bool:
+def _is_single_word_loop(
+    text: str, min_repeats: int = 8, seg_duration: float | None = None
+) -> bool:
     """True if `text` is essentially the same short word repeated many
     times — Whisper-1's classic outro/sustained-vocal failure mode
     ("oh, oh, oh, oh, …" × 100). We detect by checking that, after
@@ -1551,6 +1553,14 @@ def _is_single_word_loop(text: str, min_repeats: int = 8) -> bool:
     segment) without flagging real lyrics: a chorus like "oh-oh-oh I
     love you oh-oh" stays mixed enough that the dominant token never
     reaches 90 % concentration.
+
+    `seg_duration` (seconds): when provided, the loop is NOT treated as a
+    hallucination if the average pace is ≥ 0.5 s/token. Real musical
+    vocalisations ("uh uh uh" ad-libs) run at 0.7–0.9 s/syllable; Whisper
+    hallucinations run at 0.1–0.3 s/token (the model streams tokens faster
+    than the audio supports). This avoids dropping genuine "uh × 9–12"
+    blocks that Whisper transcribes correctly for songs where the artist
+    sustains an ad-lib section.
     """
     if not text:
         return False
@@ -1564,7 +1574,14 @@ def _is_single_word_loop(text: str, min_repeats: int = 8) -> bool:
     # collapse a verse that legitimately repeats a longer word.
     if len(top_token) > 4:
         return False
-    return top_count / len(tokens) >= 0.9 and top_count >= min_repeats
+    if top_count / len(tokens) < 0.9 or top_count < min_repeats:
+        return False
+    # Duration guard: if pace is ≥ 0.5 s/token the content is musically
+    # paced — keep it. Hallucination loops pack tokens at 0.1–0.3 s each.
+    if seg_duration is not None and len(tokens) > 0:
+        if seg_duration / len(tokens) >= 0.5:
+            return False
+    return True
 
 
 def _collapse_consecutive_duplicates(
@@ -1667,9 +1684,10 @@ def _filter_whisper_hallucinations(segments: list[dict]) -> tuple[list[dict], in
         text = s.get("text") or ""
         if _is_whisper_hallucination(text):
             continue
-        if _is_single_word_loop(text):
-            logger.info("[WHISPER] dropping single-word loop (%.1fs): %r",
-                        float(s.get('end', 0)) - float(s.get('start', 0)), text[:60])
+        dur = float(s.get("end", 0)) - float(s.get("start", 0))
+        if _is_single_word_loop(text, seg_duration=dur):
+            logger.info("[WHISPER] dropping single-word loop (%.1fs, %.2fs/tok): %r",
+                        dur, dur / max(len(text.split()), 1), text[:60])
             continue
         out.append(s)
     return out, len(segments) - len(out)
