@@ -651,6 +651,7 @@ export default function LyricsEditor({
   // <audio> element in the DOM still references it — playback dies a few
   // seconds in once the initial buffered range is consumed.
   const [audioUrl, setAudioUrl] = useState(null);
+  const blobUrlRef = useRef(null);
   useEffect(() => {
     // audioUrlProp wins over audioFile when the parent already has a
     // streamable URL (post-approval modal: signed R2 URL via GET
@@ -679,7 +680,20 @@ export default function LyricsEditor({
     }
     const url = URL.createObjectURL(audioFile);
     setAudioUrl(url);
-    return () => URL.revokeObjectURL(url);
+    // Revoke on unmount OR when audioFile changes — but NOT when
+    // audioUrlProp becomes non-null (Phase B switching to R2 URL).
+    // Previously `return () => revokeObjectURL(url)` ran unconditionally,
+    // so when Phase B set audioUrlProp the cleanup fired, killed the blob
+    // mid-play, and the <audio> got ERR_FILE_NOT_FOUND before R2 loaded.
+    // Instead we track the created URL in a ref and only revoke when
+    // audioFile itself changes (i.e. a brand-new upload, not a URL upgrade).
+    blobUrlRef.current = url;
+    return () => {
+      if (blobUrlRef.current === url) {
+        URL.revokeObjectURL(url);
+        blobUrlRef.current = null;
+      }
+    };
   }, [audioFile, audioUrlProp]);
 
   const audioRef = useRef(null);
