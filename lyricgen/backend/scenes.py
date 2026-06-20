@@ -44,6 +44,11 @@ GAP_THRESHOLD = float(os.environ.get("SCENES_GAP_THRESHOLD", "4.0"))
 # Duración del crossfade entre escenas (segundos). Set chico de transiciones:
 # xfade default + fadeblack al entrar al puente.
 XFADE_DURATION = float(os.environ.get("SCENES_XFADE", "0.8"))
+# Margen (s) que se suma al pad de la última escena para absorber cuantización
+# de frames/redondeo de punta a punta. El `-t audio_duration` recorta el
+# sobrante, así el timeline nunca queda corto (un timeline corto rebota el
+# fast-path libass —tolerancia 3s— al render lento de moviepy).
+LAST_SCENE_SAFETY = float(os.environ.get("SCENES_LAST_PAD_SAFETY", "0.5"))
 
 # Energía heurística por tipo de sección (0..1). Maneja cámara/movimiento de
 # la escena. Un LLM puede refinar esto luego; el default es musicalmente sano.
@@ -558,21 +563,32 @@ def stitch_timeline(
     # `Σdur − (N−1)·xfade` → si looperáramos cada escena a su duración exacta
     # el timeline terminaría (N−1)·xfade ANTES que el audio (cola negra/freeze
     # al final). Las escenas intermedias ya tienen el largo justo para su
-    # transición; sólo la ÚLTIMA hay que estirarla `(N−1)·xfade` para recuperar
-    # todo el déficit acumulado → el total queda EXACTO en Σdur = audio_dur.
-    # El `-t audio_dur` de abajo recorta el sobrante por redondeo. Una sola
-    # escena no cruza nada → xfade=0.
+    # transición; sólo la ÚLTIMA hay que estirarla para recuperar el déficit.
+    # Una sola escena no cruza nada → xfade=0.
     xfade = min(XFADE_DURATION, max(0.1, MIN_SCENE_DURATION / 4.0)) if multi else 0.0
 
-    # 1) Loop por sección (reusa el palíndromo seamless). El pad de xfade va
-    #    sólo en la última escena (ver nota de arriba).
+    # Las secciones pueden terminar ANTES que el audio: detect_sections cubre
+    # hasta la última línea cantada, pero la canción suele tener una cola
+    # instrumental (outro) después. Σdur < audio_duration en ese caso, y ni el
+    # `-t audio_dur` de abajo puede estirar material que no existe → el timeline
+    # queda corto (fondo congelado al final + rebota el fast-path libass, que
+    # tolera ≤3s, al render lento de moviepy). La última escena absorbe AMBOS
+    # déficits: el del xfade `(N−1)·xfade` y el hueco de cobertura
+    # `audio − Σdur`, más un pelín de margen; el `-t audio_dur` recorta el
+    # sobrante → el total cae EXACTO en audio_duration.
+    total_dur = sum(s.duration for s in sections)
+    coverage_gap = max(0.0, audio_duration - total_dur)
+    last_pad = (n - 1) * xfade + coverage_gap + (LAST_SCENE_SAFETY if multi else 0.0)
+
+    # 1) Loop por sección (reusa el palíndromo seamless). El pad va sólo en la
+    #    última escena (ver nota de arriba).
     section_files: list[str] = []
     for i, sec in enumerate(sections):
         clip = clip_for_key.get(sec.recurrence_key)
         if not clip or not os.path.exists(clip):
             raise FileNotFoundError(
                 f"[SCENES] sin clip para recurrence_key={sec.recurrence_key!r} (sección {i})")
-        pad = (n - 1) * xfade if (multi and i == n - 1) else 0.0
+        pad = last_pad if i == n - 1 else 0.0
         seg_path = loop_fn(
             clip, sec.duration + pad, job_dir,
             target_w=target_w, target_h=target_h,
