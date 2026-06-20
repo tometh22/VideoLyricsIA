@@ -6840,6 +6840,12 @@ def _generate_veo_video(prompt: str, output_path: str, job_id: str = None,
         "timecode, no on-screen camera UI, no HUD, no camcorder interface, no "
         "VHS overlay, no film-frame border graphic, no lens UI, no corner "
         "buttons or icons,"
+        # Anti-fotograma-físico (incidente 2026-06-19, "Intoxicados"): una biblia
+        # con "16mm film grain" hacía que Veo dibujara el rollo de película entero
+        # —perforaciones, marcas de borde, marco negro— como si fuera un escaneo.
+        " no film sprocket holes, no film perforations, no film strip, no film "
+        "edge markings, no 16mm or 35mm frame, no scanned film border, no black "
+        "frame border, full-bleed edge-to-edge image,"
     )
     # Camera-motion negatives — the LAST line of defense for static intent.
     # Veo's payload exposes no structured camera-lock field, so these words
@@ -7704,13 +7710,18 @@ def _build_visual_bible(lyrics_text: str, artist: str, song_title: str = "",
             "every scene of the video will share — this is what makes the video "
             "feel like a single film instead of random clips. Respond ONLY with a "
             "JSON object with exactly these string keys: world (the setting/"
-            "environment family), palette (colors + lighting), texture (film stock/"
-            "grain/lens feel), camera (the camera language), motif (one recurring "
-            "visual element). Keep each value under 25 words. No people's faces, "
-            "no text/letters/logos in the described world. The 'texture' is a film "
-            "stock / grain / color feel ONLY — never describe found-footage, "
-            "camcorder, VHS, viewfinder, or on-screen camera-UI aesthetics (they "
-            "make the AI render fake recording chrome over the scene)."
+            "environment family), palette (colors + lighting), texture (grain/"
+            "lens/color-grade feel), camera (the camera language), motif (one "
+            "recurring visual element). Keep each value under 25 words. No people's "
+            "faces, no text/letters/logos in the described world. The 'texture' "
+            "describes the GRADE and grain MOOD only (e.g. 'soft filmic grade, fine "
+            "grain, gentle halation') — NEVER name a film FORMAT or gauge (no "
+            "'16mm', '35mm', '8mm', 'Super 8', 'VHS', 'celluloid', 'film stock', "
+            "'analog tape'), and never describe found-footage, camcorder, "
+            "viewfinder, film-strip/sprocket, or on-screen camera-UI aesthetics: "
+            "naming a physical film format makes the AI render a literal film "
+            "frame — sprocket holes, edge markings, a black border and fake "
+            "recording chrome — over the scene."
         )
         # Dirección del operador ("Mi prompt"): moldea TODA la biblia → multi-
         # escena respeta auto/letra/prompt igual que el fondo único. Verbatim =
@@ -7760,11 +7771,53 @@ def _build_visual_bible(lyrics_text: str, artist: str, song_title: str = "",
             recorder.finish(response_summary=text[:300])
         if bible and isinstance(bible, dict):
             # Completar claves faltantes con el fallback (Gemini a veces omite una).
-            return {k: (str(bible.get(k) or fallback[k]).strip()) for k in fallback}
+            merged = {k: (str(bible.get(k) or fallback[k]).strip()) for k in fallback}
+            # Sanitizar formatos de film aunque el LLM los emita igual: nombrar un
+            # calibre (16mm/35mm/Super8/VHS…) hace que Veo dibuje el fotograma
+            # físico —sprockets, marcas de borde, marco negro, UI falsa— (incidente
+            # 2026-06-19, "Intoxicados": texture="16mm film grain" → marco de film).
+            return _sanitize_bible_film_formats(merged)
         logger.warning("[SCENES] biblia: parse falló, uso fallback. raw=%s", text[:200])
     except Exception as e:  # noqa: BLE001
         logger.warning("[SCENES] biblia visual falló (%s) — uso fallback determinista", e)
     return fallback
+
+
+# Tokens que hacen que Veo dibuje un fotograma de film FÍSICO (sprockets, marcas
+# de borde, marco negro) o cromo de grabación falso. Nombrar un calibre/formato
+# es el disparador; "grain" como mood es inofensivo, así que sólo le sacamos el
+# "film". Orden importa: los multi-palabra antes que los sueltos.
+_FILM_FORMAT_SUBS = [
+    (re.compile(r"\bsuper\s*-?\s*8\b", re.I), "fine"),
+    (re.compile(r"\b(?:8|16|35|65|70)\s*mm\b", re.I), "fine"),
+    (re.compile(r"\bfound[\s-]*footage\b", re.I), ""),
+    (re.compile(r"\b(?:film\s+stock|celluloid|analog(?:ue)?\s+tape|"
+                r"magnetic\s+tape|betacam|hi-?8|mini-?dv)\b", re.I), ""),
+    (re.compile(r"\b(?:vhs|camcorder|viewfinder|sprocket(?:\s+holes?)?|"
+                r"film\s+strip|film\s+border|film[\s-]*frame)\b", re.I), ""),
+    (re.compile(r"\bfilm\s+grain\b", re.I), "grain"),
+]
+
+
+def _sanitize_bible_film_formats(bible: dict) -> dict:
+    """Saca nombres de formato/calibre de film de los valores de la biblia.
+
+    Nombrar "16mm/35mm/Super 8/VHS/film stock" hace que Veo renderice el
+    fotograma físico (sprockets, marco negro, UI de grabación falsa) por mucho
+    que el system prompt lo prohíba. Esto lo limpia post-parse —no depende de que
+    el LLM obedezca— y deja el grano/grade como mood ('grain', 'soft grade').
+    """
+    out = {}
+    for k, v in bible.items():
+        s = str(v or "")
+        for pat, repl in _FILM_FORMAT_SUBS:
+            s = pat.sub(repl, s)
+        # Limpieza cosmética: espacios dobles y comas/espacios colgando.
+        s = re.sub(r"\s{2,}", " ", s)
+        s = re.sub(r"\s+([,.;])", r"\1", s)
+        s = re.sub(r"([,;])\s*(?=[,;])", "", s)
+        out[k] = s.strip(" ,;").strip()
+    return out
 
 
 def _parse_json_object(text: str) -> dict | None:
