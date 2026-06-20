@@ -50,7 +50,7 @@ def _is_adlib_loop(text: str) -> bool:
     top_token, top_count = counts.most_common(1)[0]
     if len(top_token) > 4:
         return False
-    return top_count / len(tokens) >= 0.9 and top_count >= ADLIB_MIN_REPEATS
+    return top_count / len(tokens) >= 0.85 and top_count >= ADLIB_MIN_REPEATS
 
 
 def _clean_adlib_chunk_text(words: list[dict]) -> str:
