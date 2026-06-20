@@ -2443,6 +2443,20 @@ export default function App() {
         transcribeJobId: data.job_id || uploadJobId,
         queueIdx: idx, queue,
       });
+      // Phase B: fetch signed R2 audio URL in background so LyricsEditor
+      // can use a durable server-side URL instead of the ephemeral blob.
+      // Fire-and-forget — editor already works with the blob URL; this just
+      // upgrades it to avoid ERR_FILE_NOT_FOUND when the blob gets revoked.
+      const _newJobId = data.job_id || uploadJobId;
+      if (_newJobId) {
+        authFetch(`${API}/jobs/${_newJobId}/source-audio-url`)
+          .then((r) => r.ok ? r.json() : null)
+          .then((d) => {
+            const url = d?.url || null;
+            if (url) setCurrentReview((prev) => prev?.transcribeJobId === _newJobId ? { ...prev, audioUrl: url } : prev);
+          })
+          .catch(() => { /* blob URL still works as fallback */ });
+      }
       // Kick off background upload+transcription for songs idx+1..N-1
       // while the user is reading/editing the current song's lyrics.
       prefetchRemaining(queue, idx + 1);
