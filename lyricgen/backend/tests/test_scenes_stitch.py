@@ -100,6 +100,22 @@ def test_stitch_single_scene_no_xfade(tmp_path):
     assert abs(_probe_dur(out) - 40.0) < 0.6
 
 
+def test_stitch_covers_instrumental_outro(tmp_path):
+    """Regresión 2026-06-19 (job e5bbc6a63861): las secciones cubren hasta la
+    última línea cantada (Σdur=80) pero la canción dura 86s — 6s de cola
+    instrumental. El timeline debe estirarse a los 86s (no 80), si no el fondo
+    se congela al final Y el mismatch >3s rebota el fast-path libass a moviepy."""
+    sections = [
+        Section(type="intro", start=0, end=16, energy=0.25, recurrence_key="intro"),
+        Section(type="verso", start=16, end=42, energy=0.5, recurrence_key="verso_1"),
+        Section(type="coro", start=42, end=80, energy=0.85, recurrence_key="coro_1"),
+    ]
+    # Σdur = 80, pero el audio dura 86 (outro instrumental de 6s).
+    out = _stitch(sections, 86.0, tmp_path)
+    # El fondo cubre TODA la canción dentro de la tolerancia de la guarda (3s).
+    assert abs(_probe_dur(out) - 86.0) < 0.6
+
+
 def test_extract_thumbnail(tmp_path):
     clip = os.path.join(str(tmp_path), "clip.mp4")
     _make_clip(clip, "blue", secs=4)
