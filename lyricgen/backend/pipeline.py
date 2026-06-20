@@ -1693,6 +1693,50 @@ def _filter_whisper_hallucinations(segments: list[dict]) -> tuple[list[dict], in
     return out, len(segments) - len(out)
 
 
+# Tunables for _filter_lyric_loops
+_LYRIC_LOOP_MAX_PACE = 1.5   # s/tok — above this is implausibly slow for singing
+_LYRIC_LOOP_MIN_DUR  = 8.0   # s    — only inspect sufficiently long segments
+
+
+def _filter_lyric_loops(segments: list[dict]) -> tuple[list[dict], int]:
+    """Drop segments that repeat the previous segment's text AND are paced
+    implausibly slowly for sung content (> 1.5 s/token).
+
+    Whisper's 'lyric-loop' hallucination fills a sustained-vocal passage
+    (e.g. 'uh uh uh' ad-libs) by repeating a nearby chorus phrase at
+    increasingly stretched timestamps.  Example from Amanda Pujó – No Hay
+    Santos:
+        56–64s  '¿Para qué? … papel'  0.99 s/tok  ← real sung line, keep
+        64–79s  same text             1.87 s/tok  ← hallucination, drop
+        79–102s same text             2.86 s/tok  ← hallucination, drop
+
+    Conservative: BOTH conditions must hold (same text + slow pace) so that
+    a legitimate chorus refrain repeated 3× is never dropped (the second and
+    third occurrence would have normal pace ≤ 1.2 s/tok).
+    """
+    if not segments:
+        return segments, 0
+    out = [segments[0]]
+    dropped = 0
+    for seg in segments[1:]:
+        text = (seg.get("text") or "").strip().lower()
+        prev_text = (out[-1].get("text") or "").strip().lower()
+        dur = float(seg.get("end", 0)) - float(seg.get("start", 0))
+        n_tok = max(len(text.split()), 1)
+        pace = dur / n_tok
+        if (text == prev_text
+                and pace > _LYRIC_LOOP_MAX_PACE
+                and dur > _LYRIC_LOOP_MIN_DUR):
+            logger.info(
+                "[WHISPER] dropping lyric-loop dup (%.1fs, %.2fs/tok): %r",
+                dur, pace, seg.get("text", "")[:60],
+            )
+            dropped += 1
+        else:
+            out.append(seg)
+    return out, dropped
+
+
 # ── Post-reconcile cleanup ────────────────────────────────────────────────────
 # Logic lives in post_reconcile.py (lightweight, no heavy deps) so it can be
 # unit-tested in isolation. The alias below preserves the internal call-site.
@@ -2266,6 +2310,10 @@ def _transcribe_via_openai_api(mp3_path: str, language: str | None = None,
     if _dropped_loops:
         logger.info("[WHISPER-API] filtered %s hallucination/loop segment(s)", _dropped_loops)
 
+    segments, _dropped_lyric_loops = _filter_lyric_loops(segments)
+    if _dropped_lyric_loops:
+        logger.info("[WHISPER-API] filtered %s lyric-loop segment(s)", _dropped_lyric_loops)
+
     logger.info("[WHISPER-API] %s segments", len(segments))
     return segments
 
@@ -2428,6 +2476,10 @@ def transcribe(mp3_path: str, language: str = None,
     segments, _dropped_loops = _filter_whisper_hallucinations(segments)
     if _dropped_loops:
         logger.info("[WHISPER] filtered %s hallucination/loop segment(s)", _dropped_loops)
+
+    segments, _dropped_lyric_loops = _filter_lyric_loops(segments)
+    if _dropped_lyric_loops:
+        logger.info("[WHISPER] filtered %s lyric-loop segment(s)", _dropped_lyric_loops)
 
     return segments
 
