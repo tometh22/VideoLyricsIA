@@ -209,6 +209,43 @@ def test_stretch_trimmer_small_gap_untouched():
     assert out[0]["end"] == 14.0
 
 
+def test_adlib_loop_all_long_tokens():
+    """'Uoh-oh-oh-oh-oh' × 5: all tokens normalise to >4-char 'uohohohohoh'.
+    Must be detected as ad-lib (100 % concentration, even though token is long).
+    """
+    text = "Uoh-oh-oh-oh-oh, uoh-oh-oh-oh-oh, uoh-oh-oh-oh-oh, uoh-oh-oh-oh-oh, uoh-oh-oh-oh-oh"
+    assert _is_adlib_loop(text), "pure long-token repetition should be detected as ad-lib"
+
+
+def test_adlib_loop_mixed_short_and_long():
+    """'uh' (short) + 'uoh-oh-oh-oh-oh' (long): concentration of 'uh' ≥ 85 %."""
+    # 14 'uh' + 1 long token: 14/15 ≈ 93 % → still True (hits the ≤4-char branch)
+    tokens = ["uh"] * 14 + ["uoh-oh-oh-oh-oh"]
+    text = " ".join(tokens)
+    assert _is_adlib_loop(text)
+
+
+def test_adlib_loop_mixed_long_token_below_100pct():
+    """Two different long tokens: neither is 100 %, neither is ≤4 chars → False."""
+    tokens = ["uoh-oh-oh-oh-oh"] * 4 + ["yeah-yeah-yeah"] * 2
+    text = " ".join(tokens)
+    assert not _is_adlib_loop(text)
+
+
+def test_adlib_chunker_all_long_tokens():
+    """Full pipeline: 9.3-second pure 'Uoh-oh-oh-oh-oh' block must be split."""
+    words = [_w("uoh-oh-oh-oh-oh", 69.04 + i * 1.86, 69.04 + i * 1.86 + 1.5)
+             for i in range(5)]
+    text = "Uoh-oh-oh-oh-oh, uoh-oh-oh-oh-oh, uoh-oh-oh-oh-oh, uoh-oh-oh-oh-oh, uoh-oh-oh-oh-oh"
+    mega = _seg(text, 69.04, 78.34, words)
+    normal = _seg("Tomas del miedo tu don", 95.22, 98.72,
+                  [_w("tomas", 95.22), _w("del", 95.6), _w("miedo", 96.0),
+                   _w("tu", 96.5), _w("don", 96.8, 97.1)])
+    out = post_reconcile_cleanup([mega, normal])
+    assert len(out) > 2, "9.3-second uoh block must be chunked"
+    assert out[-1]["text"] == "Tomas del miedo tu don"
+
+
 def test_cleanup_disabled_via_env(monkeypatch):
     monkeypatch.setenv("POST_RECONCILE_CLEANUP_ENABLED", "0")
     words = [_w("uh", 69.04 + i * 1.87) for i in range(14)]
