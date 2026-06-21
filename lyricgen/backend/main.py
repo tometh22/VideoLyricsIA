@@ -6338,9 +6338,39 @@ async def _run_transcription_for_job(
             os.environ.get("LRCLIB_PLAIN_ALIGNER_ENABLED", "0")
             .strip().lower() in ("1", "true", "yes", "on", "y", "t")
         )
+
+        # Pre-fetch vocal stem so the chunked Whisper-1 transcription uses
+        # clean audio (no backing music). The full mix causes timing compression
+        # in uh/adlib sections — music fills every frame so Whisper can't anchor
+        # phrase onsets against real silence. The stem has actual silence between
+        # phrases, which gives Whisper accurate onset timestamps.
+        #
+        # _get_align_audio() is lazy + cached: subsequent calls (whisperX, FA)
+        # return instantly. Gated by VAD_CHUNK_USE_STEM (default on); falls back
+        # to full mix on any demucs error so the path never hard-fails.
+        _whisper_audio = tmp_path
+        if os.environ.get("VAD_CHUNK_USE_STEM", "1").strip().lower() in (
+            "1", "true", "yes", "on"
+        ):
+            try:
+                _stem = await _get_align_audio()
+                # _get_align_audio() returns tmp_path on demucs failure, so
+                # check that we got a *different* file before switching over.
+                if _stem and _stem != tmp_path and os.path.exists(_stem):
+                    _whisper_audio = _stem
+                    logger.info(
+                        "[LYRICS] no-lrclib Whisper using vocal stem (%s) for timing accuracy",
+                        os.path.basename(_stem),
+                    )
+            except Exception as _e_stem:
+                logger.warning(
+                    "[LYRICS] vocal stem unavailable for Whisper (%s) — using full mix",
+                    _e_stem,
+                )
+
         segments = await loop.run_in_executor(
             None,
-            lambda: transcribe(tmp_path, lang, return_words=aligner_enabled),
+            lambda: transcribe(_whisper_audio, lang, return_words=aligner_enabled),
         )
 
         # Wait up to 2s after Whisper finishes for Gemini to complete.
