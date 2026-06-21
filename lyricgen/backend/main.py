@@ -6354,7 +6354,9 @@ async def _run_transcription_for_job(
         ):
             try:
                 _stem = await _get_align_audio()
-                if _stem and os.path.exists(_stem):
+                # _get_align_audio() returns tmp_path on demucs failure, so
+                # check that we got a *different* file before switching over.
+                if _stem and _stem != tmp_path and os.path.exists(_stem):
                     _whisper_audio = _stem
                     logger.info(
                         "[LYRICS] no-lrclib Whisper using vocal stem (%s) for timing accuracy",
