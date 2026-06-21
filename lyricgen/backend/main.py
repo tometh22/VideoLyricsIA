@@ -6503,6 +6503,12 @@ async def _run_transcription_for_job(
                 if wx_segs:
                     from pipeline import _filter_whisper_hallucinations as _fwh
                     wx_segs, _ = _fwh(wx_segs)
+                    # Same adlib-split guard as the no-reference whisperX path.
+                    try:
+                        from post_reconcile import post_reconcile_cleanup
+                        wx_segs = post_reconcile_cleanup(wx_segs)
+                    except Exception:
+                        pass
                     _hall, _why = _detect_hallucination(wx_segs, user_dur, language=lang)
                     # 3rd whisperX path — same `is_suspiciously_repetitive`
                     # guard as the other two. Catches the stuck-phoneme
@@ -6607,6 +6613,17 @@ async def _run_transcription_for_job(
                 if wx_segs:
                     from pipeline import _filter_whisper_hallucinations as _fwh
                     wx_segs, _ = _fwh(wx_segs)
+                    # Split adlib mega-blocks (e.g. "uh, uh, uh…" × 26s) BEFORE
+                    # the hallucination check. _has_fuzzy_intra_loop fires on any
+                    # segment with 12+ identical short tokens (Jaccard 1.0 on a
+                    # 4-token window) — a 26s uh section is legitimate ad-lib, not
+                    # a hallucination. Splitting into ~3.5s chunks gives each sub-
+                    # segment ≤ 3 tokens, safely below the 12-token detection floor.
+                    try:
+                        from post_reconcile import post_reconcile_cleanup
+                        wx_segs = post_reconcile_cleanup(wx_segs)
+                    except Exception:
+                        pass
                     _wx_dur = await asyncio.to_thread(_audio_duration, tmp_path)
                     _hall, _why = _detect_hallucination(wx_segs, _wx_dur, language=lang)
                     if not _hall and len(wx_segs) >= 2:
