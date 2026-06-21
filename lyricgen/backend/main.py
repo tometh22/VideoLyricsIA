@@ -6339,6 +6339,33 @@ async def _run_transcription_for_job(
             .strip().lower() in ("1", "true", "yes", "on", "y", "t")
         )
 
+        # ── Pre-fetch Gemini lyrics BEFORE running Whisper ──────────────────
+        # Without this, Whisper is vocabulary-blind: it doesn't know what words
+        # to expect and confabulates (e.g. "tanto miedo tu don" for "Frágil
+        # espejo de voz"). Passing the reference text as lyrics_hint to each
+        # chunk tells Whisper the vocabulary and dramatically improves accuracy.
+        #
+        # asyncio.shield() prevents the wait_for timeout from cancelling the
+        # background task — Gemini keeps running and the result is cached in
+        # Postgres for the next request regardless.
+        # Timeout: 10s — typical Gemini latency is 2-4 s on a warm request;
+        # we tolerate up to 10 s before running Whisper without a hint.
+        _gemini_pre = ""
+        try:
+            _gemini_pre = (
+                await asyncio.wait_for(asyncio.shield(gemini_task), timeout=10.0)
+                or ""
+            )
+            if _gemini_pre:
+                logger.info(
+                    "[LYRICS] Gemini returned %d chars before Whisper — using as lyrics_hint",
+                    len(_gemini_pre),
+                )
+        except asyncio.TimeoutError:
+            logger.info("[LYRICS] Gemini hint not ready in 10s — Whisper runs without hint")
+        except Exception as _e_gem:
+            logger.info("[LYRICS] Gemini pre-fetch error (%s) — Whisper runs without hint", _e_gem)
+
         # Pre-fetch vocal stem so the chunked Whisper-1 transcription uses
         # clean audio (no backing music). The full mix causes timing compression
         # in uh/adlib sections — music fills every frame so Whisper can't anchor
@@ -6370,22 +6397,30 @@ async def _run_transcription_for_job(
 
         segments = await loop.run_in_executor(
             None,
-            lambda: transcribe(_whisper_audio, lang, return_words=aligner_enabled),
+            lambda: transcribe(
+                _whisper_audio, lang,
+                lyrics_hint=_gemini_pre or None,
+                return_words=aligner_enabled,
+            ),
         )
 
-        # Wait up to 2s after Whisper finishes for Gemini to complete.
+        # reference: reuse what Gemini already returned (instant), or wait
+        # up to 2s more if it didn't complete within the pre-fetch window.
         reference = ""
-        try:
-            result = await asyncio.wait_for(gemini_task, timeout=2.0)
-            reference = result or ""
-        except asyncio.TimeoutError:
-            # Gemini still pending — let it finish in the background and
-            # cache the result for the next request. Don't block the user.
-            logger.warning("[LYRICS] gemini fetch slower than Whisper+2s — moving on")
-            reference = ""
-        except Exception as e:
-            logger.error("[LYRICS] gemini task failed: %s", e, exc_info=True)
-            reference = ""
+        if _gemini_pre:
+            reference = _gemini_pre
+        else:
+            try:
+                result = await asyncio.wait_for(gemini_task, timeout=2.0)
+                reference = result or ""
+            except asyncio.TimeoutError:
+                # Gemini still pending — let it finish in the background and
+                # cache the result for the next request. Don't block the user.
+                logger.warning("[LYRICS] gemini fetch slower than Whisper+2s — moving on")
+                reference = ""
+            except Exception as e:
+                logger.error("[LYRICS] gemini task failed: %s", e, exc_info=True)
+                reference = ""
 
         # Final fallback: lyrics.ovh (free, no auth, thin catalogue but
         # covers some mainstream songs Gemini might miss or block).
