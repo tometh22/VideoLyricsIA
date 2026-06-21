@@ -2336,7 +2336,10 @@ def _transcribe_via_openai_api(mp3_path: str, language: str | None = None,
 
 _VAD_CHUNK_MAX_S: float = 25.0   # max span per VAD-driven chunk (s)
 _VAD_CHUNK_PAD_S: float = 0.5    # silence padding around each voice region (s)
-_CHUNK_TIME_S: float = 20.0      # fixed-time chunk size when VAD finds no gaps (s)
+_CHUNK_TIME_S: float = 28.0      # fixed-time chunk size when VAD finds no gaps (s)
+                                  # 28s minimizes phrase-boundary crossings for
+                                  # ~3-min songs; avoids the 120s boundary that
+                                  # splits "Tomas del miedo" (118-125s) in 20/30s.
 
 
 def _build_chunks_from_audio(mp3_path: str) -> list[tuple[float, float]]:
@@ -2445,6 +2448,16 @@ def _vad_chunk_transcribe(mp3_path: str, language: str | None = None,
     all_segments: list[dict] = []
     rolling_prompt: str | None = lyrics_hint  # seed with lyrics_hint; rolls forward
 
+    # Emit incremental progress so the frontend stuck-detector doesn't fire.
+    # Whisper API path runs inside a thread executor (no async context here),
+    # so we use the sync update_job() from jobs.py directly.
+    _update_job_fn = None
+    if job_id:
+        try:
+            from jobs import update_job as _update_job_fn
+        except Exception:
+            pass
+
     for i, (c_start, c_end) in enumerate(chunks):
         chunk_path: str | None = None
         try:
@@ -2499,6 +2512,16 @@ def _vad_chunk_transcribe(mp3_path: str, language: str | None = None,
 
             all_segments.extend(chunk_segs)
 
+            # Emit progress so the frontend knows we're still alive.
+            # Spread chunks across the 50-54% band (transcribe.transcribe step).
+            # The caller will advance to 55%+ after we return.
+            if _update_job_fn and len(chunks) > 1:
+                chunk_pct = int(50 + round(4 * (i + 1) / len(chunks)))
+                try:
+                    _update_job_fn(job_id, progress=chunk_pct)
+                except Exception:
+                    pass
+
         except Exception as exc:
             logger.warning("[VAD-CHUNK] chunk %d/%d error (%s); skipping", i + 1, len(chunks), exc)
         finally:
@@ -2542,14 +2565,24 @@ def transcribe(mp3_path: str, language: str = None,
     logger.info("[transcribe] OPENAI_API_KEY=%s", 'set' if has_key else 'EMPTY')
     if has_key:
         if os.environ.get("VAD_CHUNK_ENABLED", "1") != "0":
-            return _vad_chunk_transcribe(
+            segs = _vad_chunk_transcribe(
                 mp3_path, language=language, lyrics_hint=lyrics_hint,
                 job_id=job_id, return_words=return_words,
             )
-        return _transcribe_via_openai_api(
-            mp3_path, language=language, lyrics_hint=lyrics_hint,
-            job_id=job_id, return_words=return_words,
-        )
+        else:
+            segs = _transcribe_via_openai_api(
+                mp3_path, language=language, lyrics_hint=lyrics_hint,
+                job_id=job_id, return_words=return_words,
+            )
+        # Split long ad-lib blocks (uh×N, melismatic sections) and trim
+        # over-extended segment ends. Same cleanup the reconcile path gets.
+        # Falls back silently if post_reconcile is unavailable.
+        try:
+            from post_reconcile import post_reconcile_cleanup
+            segs = post_reconcile_cleanup(segs)
+        except Exception:
+            pass
+        return segs
 
     # --- local Whisper path ---
     audio_path = mp3_path
