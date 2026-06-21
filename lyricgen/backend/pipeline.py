@@ -2446,7 +2446,12 @@ def _vad_chunk_transcribe(mp3_path: str, language: str | None = None,
 
     # 4. Transcribe each chunk, offset timestamps, concatenate.
     all_segments: list[dict] = []
-    rolling_prompt: str | None = lyrics_hint  # seed with lyrics_hint; rolls forward
+    # Use a fixed prompt for every chunk (either the caller's lyrics_hint or None →
+    # falls back to "Letras de canción:" in _transcribe_via_openai_api).
+    # Rolling the last segment's text forward was causing cascade contamination:
+    # chunk 3's last line ("Tomas del miedo tu don") biased chunk 4 to mishear
+    # the next distinct phrase ("Frágil espejo de voz") as "tan miedo, tan".
+    chunk_prompt: str | None = lyrics_hint
 
     # Emit incremental progress so the frontend stuck-detector doesn't fire.
     # Whisper API path runs inside a thread executor (no async context here),
@@ -2491,7 +2496,7 @@ def _vad_chunk_transcribe(mp3_path: str, language: str | None = None,
             chunk_segs = _transcribe_via_openai_api(
                 chunk_path,
                 language=language,
-                lyrics_hint=rolling_prompt,
+                lyrics_hint=chunk_prompt,
                 job_id=job_id,   # record every chunk for accurate cost tracking
                 return_words=return_words,
             )
@@ -2504,11 +2509,6 @@ def _vad_chunk_transcribe(mp3_path: str, language: str | None = None,
                     for w in seg["words"]:
                         w["start"] = round(float(w["start"]) + c_start, 3)
                         w["end"] = round(float(w["end"]) + c_start, 3)
-
-            # Roll the prompt: seed the next chunk with the last segment's text
-            # so Whisper continues in the same lyrical register.
-            if chunk_segs:
-                rolling_prompt = chunk_segs[-1]["text"][:800]
 
             all_segments.extend(chunk_segs)
 
