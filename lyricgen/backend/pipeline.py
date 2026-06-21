@@ -2565,14 +2565,24 @@ def transcribe(mp3_path: str, language: str = None,
     logger.info("[transcribe] OPENAI_API_KEY=%s", 'set' if has_key else 'EMPTY')
     if has_key:
         if os.environ.get("VAD_CHUNK_ENABLED", "1") != "0":
-            return _vad_chunk_transcribe(
+            segs = _vad_chunk_transcribe(
                 mp3_path, language=language, lyrics_hint=lyrics_hint,
                 job_id=job_id, return_words=return_words,
             )
-        return _transcribe_via_openai_api(
-            mp3_path, language=language, lyrics_hint=lyrics_hint,
-            job_id=job_id, return_words=return_words,
-        )
+        else:
+            segs = _transcribe_via_openai_api(
+                mp3_path, language=language, lyrics_hint=lyrics_hint,
+                job_id=job_id, return_words=return_words,
+            )
+        # Split long ad-lib blocks (uh×N, melismatic sections) and trim
+        # over-extended segment ends. Same cleanup the reconcile path gets.
+        # Falls back silently if post_reconcile is unavailable.
+        try:
+            from post_reconcile import post_reconcile_cleanup
+            segs = post_reconcile_cleanup(segs)
+        except Exception:
+            pass
+        return segs
 
     # --- local Whisper path ---
     audio_path = mp3_path
