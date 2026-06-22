@@ -29,6 +29,12 @@ logger = logging.getLogger("genly.whisperx")
 
 _TRUE = ("1", "true", "yes", "on", "y", "t")
 
+# ── VAD-first ad-lib re-transcription (PR #708) ───────────────────────────────
+_ADLIB_VAD_TOP_DB: float = 25.0        # more sensitive than pipeline's 30-35
+_ADLIB_VAD_MERGE_GAP_S: float = 0.3   # preserve ~0.43s gaps between uh clusters
+_ADLIB_VAD_MIN_REGION_S: float = 2.0  # discard sub-2s noise blips
+_ADLIB_MIN_DUR: float = 6.0           # keep in sync with post_reconcile.ADLIB_MIN_DUR
+
 # Replicate whisperX model. Override via env once a version is verified for
 # prod. NOTE: pin to a known-good version hash before enabling in production.
 _MODEL = os.environ.get(
@@ -42,6 +48,236 @@ def is_enabled() -> bool:
     """On only when the flag is set AND a Replicate token is present."""
     flag = os.environ.get("WHISPERX_ENABLED", "0").strip().lower() in _TRUE
     return flag and bool(os.environ.get("REPLICATE_API_TOKEN", "").strip())
+
+
+def _detect_adlib_voice_regions(
+    audio_path: str,
+    seg_start: float,
+    seg_end: float,
+) -> list[tuple[float, float]]:
+    """Return VAD-detected non-silent regions within [seg_start, seg_end].
+
+    Loads only the audio slice (offset + duration) via librosa to avoid
+    decoding a full 5-min WAV for a 40s ad-lib block. sr=16000 matches the
+    ffmpeg extraction in _retranscribe_slice. Returns [(seg_start, seg_end)]
+    as a no-split sentinel when ≤1 region is found or on any failure.
+    Never raises.
+    """
+    try:
+        import librosa
+        duration = seg_end - seg_start
+        if duration <= 0:
+            return [(seg_start, seg_end)]
+        y, sr = librosa.load(
+            audio_path, sr=16000, mono=True,
+            offset=seg_start, duration=duration,
+        )
+        intervals = librosa.effects.split(y, top_db=_ADLIB_VAD_TOP_DB)
+        regions: list[tuple[float, float]] = []
+        for s_samp, e_samp in intervals:
+            t_s = seg_start + float(s_samp) / sr
+            t_e = seg_start + float(e_samp) / sr
+            if t_e - t_s >= _ADLIB_VAD_MIN_REGION_S:
+                regions.append((t_s, t_e))
+        if not regions:
+            return [(seg_start, seg_end)]
+        # Merge regions separated by < _ADLIB_VAD_MERGE_GAP_S.
+        # Less aggressive than pipeline._detect_speech_regions (0.5s) to
+        # preserve the ~0.43s natural silences between uh clusters.
+        merged: list[tuple[float, float]] = [regions[0]]
+        for r_s, r_e in regions[1:]:
+            if r_s - merged[-1][1] <= _ADLIB_VAD_MERGE_GAP_S:
+                merged[-1] = (merged[-1][0], r_e)
+            else:
+                merged.append((r_s, r_e))
+        return merged if len(merged) >= 2 else [(seg_start, seg_end)]
+    except Exception as exc:
+        logger.warning(
+            "[ADLIB-VAD] detect failed (%.1f-%.1fs): %s", seg_start, seg_end, exc,
+        )
+        return [(seg_start, seg_end)]
+
+
+def _retranscribe_slice(
+    audio_path: str,
+    start_s: float,
+    end_s: float,
+    language: str | None = None,
+) -> list[dict] | None:
+    """Extract [start_s, end_s] from audio_path as a temp MP3 and transcribe
+    via Whisper-1 API. Returns segments with timestamps offset to absolute
+    time. Returns None on any failure. Never raises.
+
+    Uses lazy import of pipeline._transcribe_via_openai_api to avoid circular
+    imports (pipeline.py imports whisperx_transcribe at module level).
+
+    No lyrics_hint: short context lets Whisper's LM break the uh-attractor
+    and correctly transcribe the singing passage that follows.
+    """
+    import subprocess
+    import tempfile
+    import os as _os
+
+    chunk_path: str | None = None
+    try:
+        from pipeline import _transcribe_via_openai_api  # lazy: safe after both modules load
+        with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as tf:
+            chunk_path = tf.name
+        rc = subprocess.run(
+            [
+                "ffmpeg", "-y",
+                "-ss", str(start_s), "-to", str(end_s),
+                "-i", audio_path,
+                "-ar", "16000", "-ac", "1",
+                "-codec:a", "libmp3lame", "-q:a", "5",
+                chunk_path,
+            ],
+            capture_output=True,
+            timeout=60,
+        )
+        if rc.returncode != 0:
+            logger.warning(
+                "[ADLIB-VAD] ffmpeg extract %.1f-%.1fs failed (rc=%d)",
+                start_s, end_s, rc.returncode,
+            )
+            return None
+        raw = _transcribe_via_openai_api(chunk_path, language=language)
+        if not raw:
+            return None
+        result: list[dict] = []
+        for seg in raw:
+            try:
+                out_seg = {
+                    **seg,
+                    "start": round(float(seg["start"]) + start_s, 3),
+                    "end": round(float(seg["end"]) + start_s, 3),
+                }
+                if out_seg.get("words"):
+                    out_seg["words"] = [
+                        {**w,
+                         "start": round(float(w["start"]) + start_s, 3),
+                         "end": round(float(w["end"]) + start_s, 3)}
+                        for w in out_seg["words"]
+                    ]
+                result.append(out_seg)
+            except (KeyError, TypeError, ValueError):
+                continue
+        return result or None
+    except Exception as exc:
+        logger.warning(
+            "[ADLIB-VAD] _retranscribe_slice %.1f-%.1fs failed: %s", start_s, end_s, exc,
+        )
+        return None
+    finally:
+        if chunk_path:
+            try:
+                _os.unlink(chunk_path)
+            except OSError:
+                pass
+
+
+def _vad_split_adlib_segments(
+    segs: list[dict],
+    audio_path: str,
+    language: str | None = None,
+) -> list[dict]:
+    """For ad-lib mega-blocks with no word stamps, run VAD-based split and
+    per-region re-transcription so each cluster becomes its own segment.
+
+    This replicates Rotor's VAD-first approach: instead of transcribing a
+    40s mega-block of uh sounds (which causes Whisper's LM to stay stuck in
+    the uh-attractor), we detect natural silence boundaries, then transcribe
+    each 5-15s region independently. Short context allows Whisper to correctly
+    identify singing passages (e.g., "Tomas del miedo tu don") within what
+    was previously a single undifferentiated uh block.
+
+    Entry conditions for processing a segment:
+      - _is_adlib_loop(text) is True (lazy import from post_reconcile)
+      - no "words" key (already-aligned segments skip this step)
+      - duration >= _ADLIB_MIN_DUR
+      - ADLIB_VAD_RETRANSCRIBE_ENABLED env var is not "0" / falsy
+
+    Fallback chain (defense in depth):
+      1. VAD returns ≥2 regions AND ALL retranscriptions succeed → new segs
+      2. Any failure → keep original segment; post_reconcile._split_adlib_by_time
+         (PR #707 equal-time split) still handles it downstream.
+    """
+    _enabled = os.environ.get(
+        "ADLIB_VAD_RETRANSCRIBE_ENABLED", "1"
+    ).strip().lower() in _TRUE
+
+    if not _enabled or not audio_path or not os.path.exists(audio_path):
+        return segs
+
+    try:
+        from post_reconcile import _is_adlib_loop  # safe: post_reconcile doesn't import us
+    except ImportError:
+        logger.warning("[ADLIB-VAD] could not import _is_adlib_loop; skipping")
+        return segs
+
+    out: list[dict] = []
+    for seg in segs:
+        text = (seg.get("text") or "").strip()
+        words = seg.get("words") or []
+        try:
+            seg_start = float(seg["start"])
+            seg_end = float(seg["end"])
+        except (KeyError, TypeError, ValueError):
+            out.append(seg)
+            continue
+        dur = seg_end - seg_start
+
+        if not (dur >= _ADLIB_MIN_DUR and _is_adlib_loop(text) and not words):
+            out.append(seg)
+            continue
+
+        logger.info(
+            "[ADLIB-VAD] candidate: %.1f-%.1fs (%.1fs) %r…",
+            seg_start, seg_end, dur, text[:40],
+        )
+        regions = _detect_adlib_voice_regions(audio_path, seg_start, seg_end)
+        if len(regions) < 2:
+            logger.info(
+                "[ADLIB-VAD] VAD found %d region(s) → fallback to equal-time split",
+                len(regions),
+            )
+            out.append(seg)
+            continue
+
+        logger.info("[ADLIB-VAD] %d regions detected; re-transcribing each", len(regions))
+        sub_segs: list[list[dict]] = []
+        all_ok = True
+        for r_start, r_end in regions:
+            result = _retranscribe_slice(audio_path, r_start, r_end, language)
+            if result is None:
+                logger.warning(
+                    "[ADLIB-VAD] retranscribe failed for %.1f-%.1fs — keeping original",
+                    r_start, r_end,
+                )
+                all_ok = False
+                break
+            sub_segs.append(result)
+
+        if not all_ok or not sub_segs:
+            out.append(seg)
+            continue
+
+        flat = sorted(
+            [s for region_segs in sub_segs for s in region_segs],
+            key=lambda s: s.get("start", 0),
+        )
+        if not flat:
+            out.append(seg)
+            continue
+
+        logger.info(
+            "[ADLIB-VAD] replaced %.1f-%.1fs with %d sub-segment(s): %s",
+            seg_start, seg_end, len(flat),
+            ", ".join(f"{s['start']:.1f}-{s['end']:.1f}s" for s in flat[:6]),
+        )
+        out.extend(flat)
+
+    return out
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -475,6 +711,7 @@ def transcribe_whisperx(audio_path: str, language: str | None = None,
 
     segs = _map_segments(output)
     raw_n = len(segs)
+    segs = _vad_split_adlib_segments(segs, audio_path, language)
     segs = _filter_ghosts(segs)
     segs = _split_long_segments(segs)
     segs = _apply_lead_in(segs)
