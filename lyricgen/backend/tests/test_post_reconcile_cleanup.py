@@ -51,10 +51,17 @@ def test_adlib_chunker_splits_26s_block():
 
 
 def test_adlib_chunker_no_words_falls_back_to_equal_split():
+    # Each chunk must get a SHORT text slice (≤ ~3 tokens), NOT the full
+    # mega-text — otherwise _has_fuzzy_intra_loop still fires on 15-token text.
     seg = _seg("uh uh uh uh uh uh uh uh uh uh", 70.0, 90.0, words=None)
     chunks = _split_adlib_by_time(seg, [])
     assert len(chunks) >= 4
-    assert all(c["text"] == seg["text"] for c in chunks)
+    # Every chunk must have fewer tokens than the full segment text.
+    full_tokens = len(seg["text"].split())
+    for c in chunks:
+        assert len(c["text"].split()) < full_tokens, (
+            f"chunk text has same token count as full text: {c['text']!r}"
+        )
 
 
 def test_adlib_chunker_short_segment_not_split():

@@ -80,17 +80,26 @@ def _split_adlib_by_time(seg: dict, words: list[dict]) -> list[dict]:
     dur = seg["end"] - seg["start"]
 
     if not words:
-        # No word stamps — equal-time split keeping the same text label.
+        # No word stamps — equal-time split. Distribute text tokens across
+        # chunks so each chunk gets a SHORT label (e.g. "uh, uh, uh") instead
+        # of repeating the full mega-text. Repeating the full text in every
+        # chunk re-triggers _has_fuzzy_intra_loop (needs < 12 tokens per
+        # segment to stay below the detection floor).
         n = max(2, round(dur / ADLIB_CHUNK_DUR))
         step = dur / n
-        return [
-            {
+        text_tokens = [t for t in (seg.get("text") or "").split() if t]
+        toks_per = max(1, round(len(text_tokens) / n)) if text_tokens else 1
+        chunks = []
+        for i in range(n):
+            t_start = i * toks_per
+            t_end = min((i + 1) * toks_per, len(text_tokens))
+            chunk_text = " ".join(text_tokens[t_start:t_end]) if t_start < len(text_tokens) else (text_tokens[-1] if text_tokens else "")
+            chunks.append({
                 "start": round(seg["start"] + i * step, 3),
                 "end": round(seg["start"] + (i + 1) * step, 3) if i < n - 1 else seg["end"],
-                "text": seg["text"],
-            }
-            for i in range(n)
-        ]
+                "text": chunk_text,
+            })
+        return chunks
 
     out_segs: list[dict] = []
     chunk_words: list[dict] = []
