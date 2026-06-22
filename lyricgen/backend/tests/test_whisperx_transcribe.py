@@ -272,3 +272,114 @@ def test_transcribe_maps_on_success(monkeypatch, tmp_path):
     _fake_replicate(monkeypatch, run=MagicMock(return_value=out))
     segs = wx.transcribe_whisperx(str(f), language="es")
     assert [s["text"] for s in segs] == ["uno", "dos"]
+
+
+# ──────────────────────────────────────────────────────────────────────
+# VAD-first ad-lib splitting (PR #708)
+# ──────────────────────────────────────────────────────────────────────
+
+def _make_seg(text, start, end, words=None):
+    s = {"start": start, "end": end, "text": text}
+    if words is not None:
+        s["words"] = words
+    return s
+
+
+def test_vad_split_adlib_splits_on_silence(monkeypatch, tmp_path):
+    """Happy path: VAD finds 3 regions → all re-transcriptions succeed → 3 sub-segments."""
+    f = tmp_path / "vocals.wav"
+    f.write_bytes(b"RIFF\x00\x00\x00\x00WAVE" + b"\x00" * 256)
+    audio_path = str(f)
+
+    monkeypatch.setattr(wx, "_detect_adlib_voice_regions",
+                        lambda *a, **k: [(73.0, 84.0), (84.5, 92.5), (93.0, 101.0)])
+
+    def _fake_retranscribe(audio_path, start_s, end_s, language=None):
+        return [{"start": start_s + 0.1, "end": end_s - 0.1, "text": "uh uh uh"}]
+
+    monkeypatch.setattr(wx, "_retranscribe_slice", _fake_retranscribe)
+    monkeypatch.setenv("ADLIB_VAD_RETRANSCRIBE_ENABLED", "1")
+
+    mega = _make_seg("uh uh uh uh uh uh uh uh uh uh", 69.0, 101.0)
+    normal = _make_seg("Tomas del miedo tu don", 102.0, 107.0)
+    out = wx._vad_split_adlib_segments([mega, normal], audio_path, language="es")
+
+    assert len(out) == 4, f"expected 3 sub-segs + 1 normal = 4, got {len(out)}: {out}"
+    assert out[0]["start"] >= 73.0
+    assert out[-1]["text"] == "Tomas del miedo tu don"
+
+
+def test_vad_split_falls_back_when_single_region(monkeypatch, tmp_path):
+    """VAD finds only 1 region (no clear silences) → original segment unchanged."""
+    f = tmp_path / "vocals.wav"
+    f.write_bytes(b"RIFF\x00\x00\x00\x00WAVE" + b"\x00" * 256)
+    audio_path = str(f)
+
+    monkeypatch.setattr(wx, "_detect_adlib_voice_regions",
+                        lambda *a, **k: [(69.0, 101.0)])
+    monkeypatch.setenv("ADLIB_VAD_RETRANSCRIBE_ENABLED", "1")
+
+    mega = _make_seg("uh uh uh uh uh uh uh uh uh uh", 69.0, 101.0)
+    out = wx._vad_split_adlib_segments([mega], audio_path)
+    assert len(out) == 1
+    assert out[0] is mega
+
+
+def test_vad_split_falls_back_when_retranscribe_fails(monkeypatch, tmp_path):
+    """If ANY region retranscription returns None, entire original segment is kept."""
+    f = tmp_path / "vocals.wav"
+    f.write_bytes(b"RIFF\x00\x00\x00\x00WAVE" + b"\x00" * 256)
+    audio_path = str(f)
+
+    monkeypatch.setattr(wx, "_detect_adlib_voice_regions",
+                        lambda *a, **k: [(73.0, 84.0), (84.5, 92.5)])
+
+    call_count = {"n": 0}
+
+    def _partial_fail(audio_path, start_s, end_s, language=None):
+        call_count["n"] += 1
+        if call_count["n"] > 1:
+            return None
+        return [{"start": start_s + 0.1, "end": end_s - 0.1, "text": "uh uh uh"}]
+
+    monkeypatch.setattr(wx, "_retranscribe_slice", _partial_fail)
+    monkeypatch.setenv("ADLIB_VAD_RETRANSCRIBE_ENABLED", "1")
+
+    mega = _make_seg("uh uh uh uh uh uh uh uh uh uh", 69.0, 101.0)
+    out = wx._vad_split_adlib_segments([mega], audio_path)
+    assert len(out) == 1
+    assert out[0] is mega
+
+
+def test_vad_split_noop_when_disabled(monkeypatch, tmp_path):
+    """ADLIB_VAD_RETRANSCRIBE_ENABLED=0 must be a complete no-op."""
+    f = tmp_path / "vocals.wav"
+    f.write_bytes(b"RIFF\x00\x00\x00\x00WAVE" + b"\x00" * 256)
+    audio_path = str(f)
+
+    monkeypatch.setenv("ADLIB_VAD_RETRANSCRIBE_ENABLED", "0")
+    mega = _make_seg("uh uh uh uh uh uh uh uh uh uh", 69.0, 101.0)
+    out = wx._vad_split_adlib_segments([mega], audio_path)
+    assert out == [mega]
+
+
+def test_vad_split_skips_segment_with_words(monkeypatch, tmp_path):
+    """Segment WITH word stamps (already aligned by whisperX) must be skipped."""
+    f = tmp_path / "vocals.wav"
+    f.write_bytes(b"RIFF\x00\x00\x00\x00WAVE" + b"\x00" * 256)
+    audio_path = str(f)
+
+    vad_called = {"n": 0}
+
+    def _counting_vad(*a, **k):
+        vad_called["n"] += 1
+        return [(73.0, 84.0), (84.5, 92.5)]
+
+    monkeypatch.setattr(wx, "_detect_adlib_voice_regions", _counting_vad)
+    monkeypatch.setenv("ADLIB_VAD_RETRANSCRIBE_ENABLED", "1")
+
+    words = [{"word": "uh", "start": 69.0 + i * 2, "end": 70.0 + i * 2} for i in range(8)]
+    seg_with_words = _make_seg("uh uh uh uh uh uh uh uh", 69.0, 101.0, words)
+    out = wx._vad_split_adlib_segments([seg_with_words], audio_path)
+    assert out == [seg_with_words]
+    assert vad_called["n"] == 0, "VAD must not run on segments with word stamps"
