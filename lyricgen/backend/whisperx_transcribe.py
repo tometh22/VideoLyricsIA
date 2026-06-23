@@ -227,7 +227,9 @@ def _vad_split_adlib_segments(
             continue
         dur = seg_end - seg_start
 
-        if not (dur >= _ADLIB_MIN_DUR and _is_adlib_loop(text) and not words):
+        # Don't skip segments that have word stamps — forced alignment succeeds
+        # on "uh" tokens but still produces one mega-block that needs VAD split.
+        if not (dur >= _ADLIB_MIN_DUR and _is_adlib_loop(text)):
             out.append(seg)
             continue
 
