@@ -364,7 +364,13 @@ def test_vad_split_noop_when_disabled(monkeypatch, tmp_path):
 
 
 def test_vad_split_skips_segment_with_words(monkeypatch, tmp_path):
-    """Segment WITH word stamps (already aligned by whisperX) must be skipped."""
+    """VAD runs on adlib segments even when word stamps are present.
+
+    whisperX force-alignment always populates word stamps — including on
+    hallucinated adlib text — so `not words` was a broken guard (PR #710
+    removed it). VAD still runs; when retranscription fails the original
+    segment is kept as fallback.
+    """
     f = tmp_path / "vocals.wav"
     f.write_bytes(b"RIFF\x00\x00\x00\x00WAVE" + b"\x00" * 256)
     audio_path = str(f)
@@ -376,10 +382,11 @@ def test_vad_split_skips_segment_with_words(monkeypatch, tmp_path):
         return [(73.0, 84.0), (84.5, 92.5)]
 
     monkeypatch.setattr(wx, "_detect_adlib_voice_regions", _counting_vad)
+    monkeypatch.setattr(wx, "_retranscribe_slice", lambda *a, **k: None)  # simulate failure
     monkeypatch.setenv("ADLIB_VAD_RETRANSCRIBE_ENABLED", "1")
 
     words = [{"word": "uh", "start": 69.0 + i * 2, "end": 70.0 + i * 2} for i in range(8)]
     seg_with_words = _make_seg("uh uh uh uh uh uh uh uh", 69.0, 101.0, words)
     out = wx._vad_split_adlib_segments([seg_with_words], audio_path)
-    assert out == [seg_with_words]
-    assert vad_called["n"] == 0, "VAD must not run on segments with word stamps"
+    assert out == [seg_with_words]   # fallback: original kept when retranscription fails
+    assert vad_called["n"] == 1, "VAD must run on adlib segments even with word stamps"
