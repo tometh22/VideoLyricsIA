@@ -3779,9 +3779,11 @@ async def transcribe_uploaded(
             artist=job_row.artist or "",
             title=job_row.song_title or "",
         )
-        return await _maybe_ctc_retime(_result, audio_path, job_id,
-                                       job_row.artist or "",
-                                       job_row.song_title or "")
+        _result = await _maybe_ctc_retime(_result, audio_path, job_id,
+                                          job_row.artist or "",
+                                          job_row.song_title or "")
+        from lyrics_format import format_lyrics_pass as _fmt
+        return await _fmt(_result, language=body.language or "es")
     finally:
         _release_transcription_slot(transcription_lease)
 
@@ -4435,7 +4437,9 @@ async def transcribe_endpoint(
         language=language, artist=artist, title=title,
         filename=file.filename,
     )
-    return await _maybe_ctc_retime(_result, audio_path, job_id, artist, title)
+    _result = await _maybe_ctc_retime(_result, audio_path, job_id, artist, title)
+    from lyrics_format import format_lyrics_pass as _fmt
+    return await _fmt(_result, language=language or "es")
 
 
 def _ctc_cascade_veto(retimed_segs, cascade_segs, *,
