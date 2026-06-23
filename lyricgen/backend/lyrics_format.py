@@ -112,20 +112,19 @@ def _build_prompt(texts: list, lang: str) -> str:
     n = len(texts)
     numbered = "\n".join(f"{i + 1}. {t}" for i, t in enumerate(texts))
     return (
-        f"You are formatting song lyrics in {lang}.\n\n"
-        "For each numbered line, do ALL of the following:\n"
-        f"1. Fix {lang} orthography: accents/diacritics, capitalization of first word, "
-        "punctuation, inverted ¿/¡ for Spanish questions/exclamations.\n"
-        f"2. If a line has more than {_SPLIT_MIN_WORDS} words AND contains two or more "
-        "distinct musical phrases, split it into 2–3 shorter lyric lines.\n\n"
-        "Output format rules:\n"
-        f"- Single line: output it once → '3. Corrected text'\n"
-        f"- Split line: repeat the SAME number for each part → '3. Part one\\n3. Part two'\n"
-        "- Never merge two separate input lines into one.\n"
-        "- Never skip an input line.\n"
-        f"- Total output lines must be >= {n} (splits only, never merges).\n\n"
+        f"You are correcting song lyric transcription orthography for a {lang} song.\n\n"
+        "For each numbered line:\n"
+        f"- Fix {lang} accents and diacritics (e.g. fragil→frágil, mas→más)\n"
+        "- Capitalize the first word of each line\n"
+        "- Fix punctuation (commas, periods, ellipsis)\n"
+        "- For Spanish: add inverted opening marks (¿, ¡) where the line is a question or exclamation\n\n"
+        "Rules:\n"
+        f"- Output EXACTLY {n} lines — one per input line, same order\n"
+        "- Do NOT add, remove, merge, or split lines\n"
+        "- Do NOT change any words — only fix spelling/accents/punctuation\n"
+        f"- Use the same '1. text' format\n\n"
         f"Input ({n} lines):\n{numbered}\n\n"
-        "Output:"
+        f"Output ({n} lines):"
     )
 
 
@@ -224,8 +223,8 @@ async def format_lyrics_pass(result: dict, language: str = "es") -> dict:
                 new_segs.extend(_split_by_words(seg, sub_texts))
 
         logger.info(
-            "[FORMAT] %s: %d/%d lines corrected, %d segments split → %d total",
-            lang, n_corrected, len(segs), n_split, len(new_segs),
+            "[FORMAT] %s: %d/%d lines corrected",
+            lang, n_corrected, len(segs),
         )
 
         result = dict(result)
