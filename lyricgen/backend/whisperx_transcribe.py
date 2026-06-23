@@ -713,6 +713,14 @@ def transcribe_whisperx(audio_path: str, language: str | None = None,
     raw_n = len(segs)
     segs = _vad_split_adlib_segments(segs, audio_path, language)
     segs = _filter_ghosts(segs)
+    # Acoustic similarity correction: replace low-confidence ASR hallucinations
+    # with text from acoustically similar high-confidence segments (chorus repeats,
+    # bridge variations). Runs after ghost-filter so word scores are populated.
+    try:
+        from acoustic_match import correct_by_acoustic_similarity
+        segs = correct_by_acoustic_similarity(segs, audio_path)
+    except Exception as _am_err:
+        logger.warning("[ACOUSTIC] correction skipped: %s", _am_err)
     segs = _split_long_segments(segs)
     segs = _apply_lead_in(segs)
     if len(segs) < 2:
