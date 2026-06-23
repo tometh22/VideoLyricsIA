@@ -4441,18 +4441,26 @@ async def transcribe_endpoint(
 def _ctc_cascade_veto(retimed_segs, cascade_segs, *,
                       ws_floor=None, overlap_frac=0.5):
     """Protect high-confidence cascade segments from being overwritten by the
-    Gemini performance-libretto.
+    Gemini performance-libretto — but ONLY when the texts are completely
+    different (not when Gemini is adding a prefix, fixing punctuation, etc.).
 
-    For each retimed segment, find the cascade segment with the most overlap.
-    If that overlap covers ≥ overlap_frac of the retimed segment's duration,
-    AND the cascade segment's mean forced-alignment word-score ≥ ws_floor,
-    AND the texts differ → keep the cascade text.
+    Veto fires when ALL four conditions hold:
+    1. Overlap ≥ overlap_frac of the retimed segment's duration
+    2. Cascade mean word-score ≥ ws_floor (default 0.70)
+    3. Texts differ
+    4. containment < 0.40 — fewer than 40% of cascade's (≥3) unique words
+       appear in Gemini's text. This distinguishes a true hallucination
+       ("tanto miedo tu don" vs "frágil espejo de voz", containment=0) from
+       a correction ("Dentro de tu piel…" vs "tu piel…", containment=1.0).
 
     Rationale: whisperX forced-alignment is phoneme-level; ws ≥ 0.70 means
     the audio genuinely matches the cascade words. Gemini can hallucinate at
-    repeated melodic phrases (e.g. "tanto miedo tu don" instead of "frágil
-    espejo de voz") because it lacks the per-phoneme alignment signal.
+    repeated melodic phrases because it lacks the per-phoneme alignment signal,
+    but it's also the canonical text-cleaner — the containment guard lets
+    small corrections through.
     """
+    import re as _re
+
     if ws_floor is None:
         try:
             ws_floor = float(
@@ -4465,6 +4473,10 @@ def _ctc_cascade_veto(retimed_segs, cascade_segs, *,
         words = seg.get("words") or []
         scores = [float(w["score"]) for w in words if w.get("score") is not None]
         return sum(scores) / len(scores) if scores else None
+
+    def _tokens(text):
+        return set(_re.sub(r"[^a-z0-9áéíóúüñ\s]", " ",
+                           text.lower()).split())
 
     out = []
     for seg in retimed_segs:
@@ -4484,18 +4496,30 @@ def _ctc_cascade_veto(retimed_segs, cascade_segs, *,
             if ws is not None and ov > best_overlap:
                 best_overlap, best_ws, best_text = ov, ws, (cs.get("text") or "").strip()
 
-        if (best_text and dur > 0
+        if not (best_text and dur > 0
                 and best_overlap >= overlap_frac * dur
                 and best_ws >= ws_floor
                 and best_text != retimed_text):
-            logger.info(
-                "[CTC-VETO] %.1f–%.1fs cascade ws=%.2f preserves %r "
-                "(gemini had: %r)",
-                t0, t1, best_ws, best_text[:50], retimed_text[:50],
-            )
-            out.append({**seg, "text": best_text})
-        else:
             out.append(seg)
+            continue
+
+        # Containment guard: if most cascade words appear in Gemini text,
+        # Gemini is likely correcting/extending — let it through.
+        cascade_tok = _tokens(best_text)
+        if len(cascade_tok) < 3:
+            out.append(seg)
+            continue
+        containment = len(cascade_tok & _tokens(retimed_text)) / len(cascade_tok)
+        if containment >= 0.40:
+            out.append(seg)
+            continue
+
+        logger.info(
+            "[CTC-VETO] %.1f–%.1fs cascade ws=%.2f preserves %r "
+            "(gemini had: %r, containment=%.2f)",
+            t0, t1, best_ws, best_text[:50], retimed_text[:50], containment,
+        )
+        out.append({**seg, "text": best_text})
     return out
 
 
