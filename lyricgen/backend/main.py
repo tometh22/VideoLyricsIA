@@ -4438,6 +4438,67 @@ async def transcribe_endpoint(
     return await _maybe_ctc_retime(_result, audio_path, job_id, artist, title)
 
 
+def _ctc_cascade_veto(retimed_segs, cascade_segs, *,
+                      ws_floor=None, overlap_frac=0.5):
+    """Protect high-confidence cascade segments from being overwritten by the
+    Gemini performance-libretto.
+
+    For each retimed segment, find the cascade segment with the most overlap.
+    If that overlap covers ≥ overlap_frac of the retimed segment's duration,
+    AND the cascade segment's mean forced-alignment word-score ≥ ws_floor,
+    AND the texts differ → keep the cascade text.
+
+    Rationale: whisperX forced-alignment is phoneme-level; ws ≥ 0.70 means
+    the audio genuinely matches the cascade words. Gemini can hallucinate at
+    repeated melodic phrases (e.g. "tanto miedo tu don" instead of "frágil
+    espejo de voz") because it lacks the per-phoneme alignment signal.
+    """
+    if ws_floor is None:
+        try:
+            ws_floor = float(
+                os.environ.get("CTC_CASCADE_VETO_WS_FLOOR", "0.70")
+            )
+        except (TypeError, ValueError):
+            ws_floor = 0.70
+
+    def _mean_ws(seg):
+        words = seg.get("words") or []
+        scores = [float(w["score"]) for w in words if w.get("score") is not None]
+        return sum(scores) / len(scores) if scores else None
+
+    out = []
+    for seg in retimed_segs:
+        t0 = float(seg.get("start", 0))
+        t1 = float(seg.get("end", 0))
+        dur = t1 - t0
+        retimed_text = (seg.get("text") or "").strip()
+
+        best_overlap, best_ws, best_text = 0.0, 0.0, None
+        for cs in cascade_segs:
+            cs0 = float(cs.get("start", 0))
+            cs1 = float(cs.get("end", 0))
+            ov = min(t1, cs1) - max(t0, cs0)
+            if ov <= 0:
+                continue
+            ws = _mean_ws(cs)
+            if ws is not None and ov > best_overlap:
+                best_overlap, best_ws, best_text = ov, ws, (cs.get("text") or "").strip()
+
+        if (best_text and dur > 0
+                and best_overlap >= overlap_frac * dur
+                and best_ws >= ws_floor
+                and best_text != retimed_text):
+            logger.info(
+                "[CTC-VETO] %.1f–%.1fs cascade ws=%.2f preserves %r "
+                "(gemini had: %r)",
+                t0, t1, best_ws, best_text[:50], retimed_text[:50],
+            )
+            out.append({**seg, "text": best_text})
+        else:
+            out.append(seg)
+    return out
+
+
 async def _maybe_ctc_retime(result, audio_path: str, job_id: str,
                             artist: str = "", title: str = ""):
     """Gated post-pass over the cascade's FINAL output (CTC_ALIGN_ENABLED,
@@ -4510,6 +4571,9 @@ async def _maybe_ctc_retime(result, audio_path: str, job_id: str,
                     # individually condense into one block line; leftover
                     # unplaced lines drop instead of stacking.
                     retimed = _ctc.condense_repeated_skips(retimed)
+                    # Veto: protect high-confidence cascade segments from
+                    # Gemini hallucinations at repeated melodic phrases.
+                    retimed = _ctc_cascade_veto(retimed, segs)
                     logger.info("[CTC] performance-libretto retime: %d líneas "
                                 "(reemplaza el texto de la cascada, job=%s)",
                                 len(retimed), job_id)
