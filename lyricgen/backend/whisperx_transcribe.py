@@ -308,7 +308,11 @@ def _compute_cache_key(audio_path: str, language: str | None, lyrics_hint: str |
     hint = (lyrics_hint or "").strip()
     hint_hash = hashlib.sha1(hint.encode("utf-8")).hexdigest()[:16] if hint else ""
     lang = (language or "").lower()
-    key = f"wx:{audio_hash}:{lang}:{hint_hash}"
+    # WHISPERX_CACHE_VERSION lets ops invalidate all cached results by bumping
+    # this env var (e.g. "2") without touching the DB. Default "1" preserves
+    # all pre-existing rows so changing it is a deliberate opt-in bust.
+    ver = os.environ.get("WHISPERX_CACHE_VERSION", "1").strip() or "1"
+    key = f"wx:{audio_hash}:{lang}:{hint_hash}:{ver}"
     return (key, audio_hash, hint_hash)
 
 
