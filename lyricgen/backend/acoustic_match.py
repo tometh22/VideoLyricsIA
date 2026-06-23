@@ -163,6 +163,10 @@ def correct_by_acoustic_similarity(
         if ws is None:
             continue  # no word stamps → can't assess confidence
 
+        # Temporary diagnostic: log every candidate's word score
+        logger.info("[ACOUSTIC-WS] %.1f–%.1fs ws=%.3f %r",
+                    start, end, ws, text[:40])
+
         if ws >= _HIGH_CONF:
             seq = _mfcc_sequence(audio_path, start, end)
             if seq is not None:
