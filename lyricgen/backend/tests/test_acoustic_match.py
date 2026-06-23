@@ -1,6 +1,11 @@
 """Tests for acoustic_match.correct_by_acoustic_similarity.
 
-All tests mock _mel_embedding so no audio I/O or librosa dependency.
+All tests mock _mfcc_sequence so no audio I/O needed.
+_dtw_similarity runs for real (with numpy arrays) — no librosa I/O.
+
+Similarity values:
+  identical sequences (np.zeros vs np.zeros) → DTW dist = 0 → sim = 1.0
+  very different     (np.zeros vs large-const) → dist >> 0 → sim ≈ 0
 """
 import os
 import sys
@@ -22,33 +27,33 @@ def _seg(text, start, end, word_score=None):
 
 # ── helpers ──────────────────────────────────────────────────────────────────
 
-def _patch_embed(monkeypatch, mapping: dict):
+def _patch_seq(monkeypatch, mapping: dict):
     """mapping: {(start, end): np.ndarray | None}"""
     def fake(audio_path, start_s, end_s):
         return mapping.get((start_s, end_s))
-    monkeypatch.setattr(am, "_mel_embedding", fake)
+    monkeypatch.setattr(am, "_mfcc_sequence", fake)
 
 
 # ── tests ─────────────────────────────────────────────────────────────────────
 
 def test_replaces_low_confidence_with_similar_anchor(monkeypatch, tmp_path):
-    """Low-score segment acoustically similar to high-score anchor → text replaced."""
+    """Low-score segment acoustically similar (DTW dist = 0) to anchor → text replaced."""
     audio = str(tmp_path / "audio.wav")
-    open(audio, "w").close()            # dummy file so os.path.exists passes
+    open(audio, "w").close()
 
-    anchor_emb = np.array([1.0, 0.0] * 32, dtype=float)  # (64,)
-    uncert_emb = np.array([0.99, 0.0] * 32, dtype=float) # very similar
+    # Identical MFCC sequences → DTW cost = 0 → similarity = 1.0
+    shared_seq = np.zeros((39, 50), dtype=float)
 
     segments = [
         _seg("Frágil espejo de voz", 110.0, 116.0, word_score=0.85),  # anchor
         _seg("tan miedo, tu don",    127.0, 133.0, word_score=0.40),  # uncertain
     ]
-    _patch_embed(monkeypatch, {
-        (110.0, 116.0): anchor_emb,
-        (127.0, 133.0): uncert_emb,
+    _patch_seq(monkeypatch, {
+        (110.0, 116.0): shared_seq,
+        (127.0, 133.0): shared_seq,
     })
 
-    result = am.correct_by_acoustic_similarity(segments, audio, threshold=0.80)
+    result = am.correct_by_acoustic_similarity(segments, audio, threshold=0.50)
 
     assert result[0]["text"] == "Frágil espejo de voz"          # anchor unchanged
     assert result[1]["text"] == "Frágil espejo de voz"          # corrected
@@ -56,16 +61,16 @@ def test_replaces_low_confidence_with_similar_anchor(monkeypatch, tmp_path):
 
 
 def test_no_correction_when_texts_already_match(monkeypatch, tmp_path):
-    """Same text → no action even if acoustically similar."""
+    """Same text → no action even if acoustically identical."""
     audio = str(tmp_path / "audio.wav")
     open(audio, "w").close()
 
-    emb = np.ones(64)
+    seq = np.zeros((39, 50), dtype=float)
     segments = [
         _seg("Para qué", 50.0, 53.0, word_score=0.90),
         _seg("Para qué", 80.0, 83.0, word_score=0.35),
     ]
-    _patch_embed(monkeypatch, {(50.0, 53.0): emb, (80.0, 83.0): emb})
+    _patch_seq(monkeypatch, {(50.0, 53.0): seq, (80.0, 83.0): seq})
 
     result = am.correct_by_acoustic_similarity(segments, audio)
     assert result[1]["text"] == "Para qué"
@@ -73,23 +78,23 @@ def test_no_correction_when_texts_already_match(monkeypatch, tmp_path):
 
 
 def test_no_correction_below_threshold(monkeypatch, tmp_path):
-    """Acoustically dissimilar segment is left alone."""
+    """Acoustically dissimilar segment (DTW dist >> 0) is left alone."""
     audio = str(tmp_path / "audio.wav")
     open(audio, "w").close()
 
-    anchor_emb = np.array([1.0, 0.0] * 32)
-    diff_emb   = np.array([0.0, 1.0] * 32)  # orthogonal → cosine = 0
+    anchor_seq = np.zeros((39, 50), dtype=float)
+    diff_seq   = np.full((39, 50), 200.0, dtype=float)  # huge distance → sim ≈ 0
 
     segments = [
         _seg("Frágil espejo de voz", 110.0, 116.0, word_score=0.85),
         _seg("tan miedo, tu don",    127.0, 133.0, word_score=0.40),
     ]
-    _patch_embed(monkeypatch, {
-        (110.0, 116.0): anchor_emb,
-        (127.0, 133.0): diff_emb,
+    _patch_seq(monkeypatch, {
+        (110.0, 116.0): anchor_seq,
+        (127.0, 133.0): diff_seq,
     })
 
-    result = am.correct_by_acoustic_similarity(segments, audio, threshold=0.80)
+    result = am.correct_by_acoustic_similarity(segments, audio, threshold=0.50)
     assert result[1]["text"] == "tan miedo, tu don"   # unchanged
     assert "acoustic_corrected" not in result[1]
 
@@ -113,15 +118,14 @@ def test_skips_adlib_segments(monkeypatch, tmp_path):
     audio = str(tmp_path / "audio.wav")
     open(audio, "w").close()
 
-    emb = np.ones(64)
+    seq = np.zeros((39, 50), dtype=float)
     segments = [
         _seg("uh, uh, uh, uh, uh, uh", 70.0, 95.0, word_score=0.30),  # adlib
         _seg("Frágil espejo de voz",   110.0, 116.0, word_score=0.85),
     ]
-    # If adlib were used as uncertain target, it might get "Frágil espejo" text
-    _patch_embed(monkeypatch, {
-        (70.0, 95.0):  emb,
-        (110.0, 116.0): emb,
+    _patch_seq(monkeypatch, {
+        (70.0, 95.0):  seq,
+        (110.0, 116.0): seq,
     })
 
     result = am.correct_by_acoustic_similarity(segments, audio)
