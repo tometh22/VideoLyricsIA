@@ -536,36 +536,42 @@ def scan_stale_prores(limit: int = 300) -> list[dict]:
     if client is None:
         return []
 
-    stale: list[dict] = []
+    # Fetch only the columns we need and close the session immediately —
+    # the S3 head_object loop below can take several minutes (up to 300
+    # jobs × 2 calls each), which exceeds Neon's 5-minute idle timeout.
+    # Keeping an open session across those calls causes "SSL connection
+    # has been closed unexpectedly" on db.close() (Sentry #7548893603).
     db = SessionLocal()
     try:
-        jobs = (
-            db.query(Job)
+        rows = (
+            db.query(Job.job_id, Job.tenant_id, Job.s3_keys)
             .filter(Job.s3_keys.isnot(None))
             .order_by(Job.created_at.desc())
             .limit(limit)
             .all()
         )
-        for j in jobs:
-            s3 = j.s3_keys or {}
-            master_key = s3.get("umg_master")
-            video_key = s3.get("video")
-            if not master_key or not video_key:
-                continue
-            try:
-                m = client.head_object(Bucket=_storage.R2_BUCKET, Key=master_key)["LastModified"]
-                v = client.head_object(Bucket=_storage.R2_BUCKET, Key=video_key)["LastModified"]
-            except Exception:
-                # Objeto borrado/permiso/red — no es señal de staleness.
-                continue
-            if m < v:
-                stale.append({
-                    "job_id": j.job_id,
-                    "tenant_id": j.tenant_id,
-                    "lag_seconds": int((v - m).total_seconds()),
-                })
     finally:
         db.close()
+
+    stale: list[dict] = []
+    for job_id, tenant_id, s3_keys in rows:
+        s3 = s3_keys or {}
+        master_key = s3.get("umg_master")
+        video_key = s3.get("video")
+        if not master_key or not video_key:
+            continue
+        try:
+            m = client.head_object(Bucket=_storage.R2_BUCKET, Key=master_key)["LastModified"]
+            v = client.head_object(Bucket=_storage.R2_BUCKET, Key=video_key)["LastModified"]
+        except Exception:
+            # Objeto borrado/permiso/red — no es señal de staleness.
+            continue
+        if m < v:
+            stale.append({
+                "job_id": job_id,
+                "tenant_id": tenant_id,
+                "lag_seconds": int((v - m).total_seconds()),
+            })
 
     if stale:
         logger.warning(
