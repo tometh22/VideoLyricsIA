@@ -58,6 +58,13 @@ def _ctc_cascade_veto(
     def _tokens(text: str) -> set:
         return set(_re.sub(r"[^a-z0-9áéíóúüñ\s]", " ", text.lower()).split())
 
+    # Each cascade segment can only be "claimed" by the retimed segment whose
+    # midpoint is closest to it. Once claimed, it won't match any other retimed
+    # segment. This prevents a cascade "Tomas del miedo" from vetoing a later
+    # CTC "Frágil espejo" when whisperX's fresh run placed "Frágil espejo"
+    # nowhere near 1:50 (leaving "Tomas del miedo" as the only nearby cascade).
+    claimed: set = set()
+
     out = []
     for seg in retimed_segs:
         t0 = float(seg.get("start", 0))
@@ -65,14 +72,16 @@ def _ctc_cascade_veto(
         dur = t1 - t0
         retimed_text = (seg.get("text") or "").strip()
 
-        # Find nearest cascade segment by midpoint distance within the window.
+        # Find nearest unclaimed cascade segment by midpoint distance within window.
         # Midpoint matching is robust to whisperX timestamp variance: even if
         # whisperX places "frágil espejo" at 110s in one run and 126s in
         # another, Gemini retimes the wrong text to ~127s both times, so
         # midpoint distance stays ≤20s regardless of the run.
         r_mid = (t0 + t1) / 2
-        best_dist, best_ws, best_text = float("inf"), 0.0, None
-        for cs in cascade_segs:
+        best_dist, best_ws, best_text, best_ci = float("inf"), 0.0, None, -1
+        for ci, cs in enumerate(cascade_segs):
+            if ci in claimed:
+                continue
             cs0 = float(cs.get("start", 0))
             cs1 = float(cs.get("end", 0))
             c_mid = (cs0 + cs1) / 2
@@ -81,7 +90,14 @@ def _ctc_cascade_veto(
                 continue
             ws = _mean_ws(cs)
             if ws is not None and ws >= ws_floor and dist < best_dist:
-                best_dist, best_ws, best_text = dist, ws, (cs.get("text") or "").strip()
+                best_dist, best_ws, best_text, best_ci = (
+                    dist, ws, (cs.get("text") or "").strip(), ci
+                )
+
+        # Claim this cascade segment regardless of whether the veto fires —
+        # it won't be available to match a different retimed segment.
+        if best_ci >= 0:
+            claimed.add(best_ci)
 
         if not (best_text and dur > 0 and best_text != retimed_text):
             out.append(seg)
