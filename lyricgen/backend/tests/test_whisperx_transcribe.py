@@ -436,3 +436,114 @@ def test_vad_split_skips_segment_with_words(monkeypatch, tmp_path):
     out = wx._vad_split_adlib_segments([seg_with_words], audio_path)
     assert out == [seg_with_words]   # fallback: original kept when retranscription fails
     assert vad_called["n"] == 1, "VAD must run on adlib segments even with word stamps"
+
+
+# ── _correct_post_adlib_timing ───────────────────────────────────────────────
+
+def test_correct_post_adlib_timing_shifts_tail(monkeypatch, tmp_path):
+    """No Hay Santos regression: 'Tomas del miedo' 7s too early → shifted to true onset.
+
+    The adlib block ends at 95.2s. whisperX places 'Tomas del miedo' at 95.2s
+    (0s gap), but uh sounds continue until ~102s. VAD finds two intervals:
+    [95.2-101.0] (uh sounds) and [102.0-106.0] (actual lyric). Largest gap
+    (1s) precedes the 102s interval → 'Tomas del miedo' shifts to 102.0s.
+    """
+    import numpy as np
+
+    f = tmp_path / "vocals.wav"
+    f.write_bytes(b"RIFF\x00\x00\x00\x00WAVE" + b"\x00" * 256)
+    audio_path = str(f)
+
+    # VAD returns two intervals (in sample space for a 16000 sr signal):
+    # [95.2+0, 95.2+5.8s] = uh sounds; [95.2+6.8s, 95.2+10.8s] = lyric
+    def _fake_vad(path, offset, duration):
+        sr = 16000
+        return np.array([
+            [0,              int(5.8 * sr)],   # uh cluster
+            [int(6.8 * sr),  int(10.8 * sr)],  # lyric onset
+        ])
+
+    import librosa as _lib_real
+    monkeypatch.setattr(_lib_real.effects, "split", lambda y, top_db: _fake_vad(None, None, None))
+    monkeypatch.setattr(_lib_real, "load", lambda *a, **k: (None, 16000))
+
+    adlib = _make_seg("uh uh uh uh uh uh", 69.4, 95.2)
+    lyric = _make_seg("Tomas del miedo tu don", 95.2, 100.0)
+    out = wx._correct_post_adlib_timing([adlib, lyric], audio_path)
+
+    assert out[0] == adlib
+    corrected = out[1]
+    assert abs(corrected["start"] - (95.2 + 6.8)) < 0.1, (
+        f"Expected start ~102s, got {corrected['start']}"
+    )
+    assert corrected["text"] == "Tomas del miedo tu don"
+
+
+def test_correct_post_adlib_timing_noop_when_no_clear_gap(monkeypatch, tmp_path):
+    """No shift when all gaps are < 0.4s (lyric really does start right after adlib)."""
+    import numpy as np
+
+    f = tmp_path / "vocals.wav"
+    f.write_bytes(b"RIFF\x00\x00\x00\x00WAVE" + b"\x00" * 256)
+    audio_path = str(f)
+
+    # Single interval: no gap found → returns None → no shift
+    def _fake_vad(y, top_db):
+        sr = 16000
+        return np.array([[0, int(4.0 * sr)]])
+
+    import librosa as _lib_real
+    monkeypatch.setattr(_lib_real.effects, "split", lambda y, top_db: _fake_vad(y, top_db))
+    monkeypatch.setattr(_lib_real, "load", lambda *a, **k: (None, 16000))
+
+    adlib = _make_seg("uh uh uh uh", 69.4, 95.2)
+    lyric = _make_seg("Tomas del miedo tu don", 95.2, 99.0)
+    out = wx._correct_post_adlib_timing([adlib, lyric], audio_path)
+
+    assert out[1]["start"] == 95.2  # unchanged
+
+
+def test_correct_post_adlib_timing_skips_large_gap_between_segs(monkeypatch, tmp_path):
+    """No shift when next segment starts >2s after adlib block (already correct gap)."""
+    f = tmp_path / "vocals.wav"
+    f.write_bytes(b"RIFF\x00\x00\x00\x00WAVE" + b"\x00" * 256)
+    audio_path = str(f)
+
+    called = {"n": 0}
+
+    def _counting_load(*a, **k):
+        called["n"] += 1
+        return (None, 16000)
+
+    import librosa as _lib_real
+    monkeypatch.setattr(_lib_real, "load", _counting_load)
+
+    adlib = _make_seg("uh uh uh uh", 69.4, 95.2)
+    lyric = _make_seg("Tomas del miedo tu don", 98.0, 103.0)  # 2.8s gap → skip
+    out = wx._correct_post_adlib_timing([adlib, lyric], audio_path)
+
+    assert called["n"] == 0, "Should not call librosa when gap > 2s"
+    assert out[1]["start"] == 98.0
+
+
+def test_correct_post_adlib_timing_never_changes_text(monkeypatch, tmp_path):
+    """Text is never modified by timing correction."""
+    import numpy as np
+
+    f = tmp_path / "vocals.wav"
+    f.write_bytes(b"RIFF\x00\x00\x00\x00WAVE" + b"\x00" * 256)
+    audio_path = str(f)
+
+    def _fake_vad(y, top_db):
+        sr = 16000
+        return np.array([[0, int(5.0 * sr)], [int(7.0 * sr), int(11.0 * sr)]])
+
+    import librosa as _lib_real
+    monkeypatch.setattr(_lib_real.effects, "split", lambda y, top_db: _fake_vad(y, top_db))
+    monkeypatch.setattr(_lib_real, "load", lambda *a, **k: (None, 16000))
+
+    adlib = _make_seg("uh uh uh uh", 69.4, 95.2)
+    lyric = _make_seg("Frágil espejo de voz", 95.2, 99.0)
+    out = wx._correct_post_adlib_timing([adlib, lyric], audio_path)
+
+    assert out[1]["text"] == "Frágil espejo de voz"
