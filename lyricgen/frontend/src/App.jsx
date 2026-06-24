@@ -2474,6 +2474,13 @@ export default function App() {
     if (!jobId || !Array.isArray(segments) || segments.length === 0) {
       return { ok: false, reason: "no-data" };
     }
+    // [drag-persist] diagnostic — remove after 2026-07-01 if reseed-storm
+    // stays silent (fix landed in #724). Kept one extra week to confirm.
+    const _sample = segments.slice(0, 2).map((s) => ({
+      start: Math.round((s.start || 0) * 1000) / 1000,
+      end: Math.round((s.end || 0) * 1000) / 1000,
+    }));
+    console.warn("[drag-persist] POST", { jobId, count: segments.length, sample: _sample });
     try {
       const res = await authFetch(`${API}/jobs/${jobId}/save-segments`, {
         method: "POST",
