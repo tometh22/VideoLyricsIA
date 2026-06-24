@@ -469,10 +469,14 @@ export default function LyricsEditor({
     }
     // [reseed-storm] capture (P0 UMG Chile 2026-06-16: "las líneas cambian de
     // posición en loop"). This reseed reassigns _id by index, so rows keyed by
-    // _id REMOUNT. segmentsValuesEqual is POSITIONAL, so a writeback that hands
-    // back a REORDERED segments array (backend sorts by start #184 while local
-    // is out-of-order from a split/overlap) fails the guard above and makes
-    // this fire on every cycle → rows reposition in a loop. If it fires
+    // _id REMOUNT. The original root cause: segmentsValuesEqual was POSITIONAL,
+    // so a writeback that handed back a REORDERED segments array (backend sorts
+    // by start #184 while local is out-of-order from a split/overlap) failed the
+    // guard above and made this fire on every cycle → rows reposition in a loop.
+    // FIXED in #724: segmentsValuesEqual now sorts both sides by start before
+    // comparing, so a pure reorder no longer reseeds. This detector is KEPT as a
+    // backstop — it still catches a GENUINE rapid-content storm (not reorder),
+    // and stays until the 2026-07-01 monitoring window closes. If it fires
     // repeatedly we emit the OLD vs NEW order so we can see the swap.
     {
       const _now = typeof performance !== "undefined" && performance.now ? performance.now() : 0;
