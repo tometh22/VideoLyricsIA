@@ -2474,15 +2474,6 @@ export default function App() {
     if (!jobId || !Array.isArray(segments) || segments.length === 0) {
       return { ok: false, reason: "no-data" };
     }
-    // [drag-persist] diagnostic logging — remove after staging confirms
-    // the value-equality fix in LyricsEditor's prop-sync resolves the
-    // regression. Captures the full autosave roundtrip so we can correlate
-    // a "snap back to original" with the exact sequence the user saw.
-    const _sample = segments.slice(0, 2).map((s) => ({
-      start: Math.round((s.start || 0) * 1000) / 1000,
-      end: Math.round((s.end || 0) * 1000) / 1000,
-    }));
-    console.warn("[drag-persist] POST", { jobId, count: segments.length, sample: _sample });
     try {
       const res = await authFetch(`${API}/jobs/${jobId}/save-segments`, {
         method: "POST",
