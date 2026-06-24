@@ -173,6 +173,32 @@ def test_empty_retimed_returns_empty():
     assert _ctc_cascade_veto([], cascade) == []
 
 
+def test_cascade_claimed_only_once():
+    """Each cascade segment can only veto ONE retimed segment (the nearest).
+
+    Regression case: fresh whisperX run places "Frágil espejo" far from 1:50.
+    CTC correctly puts "Frágil espejo" at 1:50, but the only nearby cascade
+    is "Tomas del miedo" at 1:42 (dist=8s). Without exclusive claiming,
+    the veto would incorrectly replace "Frágil espejo" with "Tomas del miedo".
+    With exclusive claiming, "Tomas del miedo" cascade is already claimed
+    by the earlier CTC "Tomas del miedo" segment → not available → no wrong veto.
+    """
+    cascade = [
+        _seg("tomas del miedo tu don", 102.0, 108.0,
+             words=_high_ws_words("tomas del miedo tu don", score=0.81)),
+    ]
+    retimed = [
+        # CTC correctly places "Tomas del miedo" — texts match, no veto, but claims cascade[0]
+        _seg("tomas del miedo tu don", 104.0, 109.0),
+        # CTC correctly places "Frágil espejo" — cascade[0] already claimed → no wrong veto
+        _seg("frágil espejo de voz", 112.0, 118.0),
+    ]
+    out = _ctc_cascade_veto(retimed, cascade)
+    assert len(out) == 2
+    assert out[0]["text"] == "tomas del miedo tu don"   # unchanged (texts matched)
+    assert out[1]["text"] == "frágil espejo de voz"     # NOT replaced by cascade's text
+
+
 def test_ws_floor_env_override(monkeypatch):
     """CTC_CASCADE_VETO_WS_FLOOR env var overrides default 0.70."""
     monkeypatch.setenv("CTC_CASCADE_VETO_WS_FLOOR", "0.95")
