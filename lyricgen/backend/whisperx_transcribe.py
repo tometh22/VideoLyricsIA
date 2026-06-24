@@ -34,6 +34,11 @@ _ADLIB_VAD_TOP_DB: float = 25.0        # more sensitive than pipeline's 30-35
 _ADLIB_VAD_MERGE_GAP_S: float = 0.3   # preserve ~0.43s gaps between uh clusters
 _ADLIB_VAD_MIN_REGION_S: float = 2.0  # discard sub-2s noise blips
 _ADLIB_MIN_DUR: float = 6.0           # keep in sync with post_reconcile.ADLIB_MIN_DUR
+# When an adlib block ends and the next segment starts within this many seconds,
+# pull that segment into the VAD window too. Fixes cases where whisperX places
+# the wrong text at the adlib tail (e.g. "Tomas del miedo" at 95s when it
+# actually starts at 102s — the adlib is still running at 95s).
+_ADLIB_NEXT_MERGE_GAP_S: float = 2.0
 
 # Replicate whisperX model. Override via env once a version is verified for
 # prod. NOTE: pin to a known-good version hash before enabling in production.
@@ -216,14 +221,16 @@ def _vad_split_adlib_segments(
         return segs
 
     out: list[dict] = []
-    for seg in segs:
+    idx = 0
+    while idx < len(segs):
+        seg = segs[idx]
         text = (seg.get("text") or "").strip()
-        words = seg.get("words") or []
         try:
             seg_start = float(seg["start"])
             seg_end = float(seg["end"])
         except (KeyError, TypeError, ValueError):
             out.append(seg)
+            idx += 1
             continue
         dur = seg_end - seg_start
 
@@ -231,19 +238,48 @@ def _vad_split_adlib_segments(
         # on "uh" tokens but still produces one mega-block that needs VAD split.
         if not (dur >= _ADLIB_MIN_DUR and _is_adlib_loop(text)):
             out.append(seg)
+            idx += 1
             continue
+
+        # Lookforward: if the segment immediately following this adlib block
+        # starts within _ADLIB_NEXT_MERGE_GAP_S seconds, pull it into the VAD
+        # window. whisperX sometimes identifies the adlib tail (still uh sounds)
+        # as the first lyric line (e.g. "Tomas del miedo" at 95s when it really
+        # starts at 102s). Extending the window lets VAD find the true boundary.
+        n_consumed = 1
+        process_end = seg_end
+        next_seg = segs[idx + 1] if idx + 1 < len(segs) else None
+        if next_seg is not None:
+            try:
+                ns_start = float(next_seg["start"])
+                ns_end = float(next_seg["end"])
+                ns_text = (next_seg.get("text") or "").strip()
+            except (KeyError, TypeError, ValueError):
+                ns_start = seg_end + 999
+                ns_end = ns_start
+                ns_text = ""
+            if (ns_start - seg_end <= _ADLIB_NEXT_MERGE_GAP_S
+                    and not _is_adlib_loop(ns_text)):
+                process_end = ns_end
+                n_consumed = 2
+                logger.info(
+                    "[ADLIB-VAD] extending window to %.1fs to include %r",
+                    process_end, ns_text[:40],
+                )
 
         logger.info(
             "[ADLIB-VAD] candidate: %.1f-%.1fs (%.1fs) %r…",
-            seg_start, seg_end, dur, text[:40],
+            seg_start, process_end, process_end - seg_start, text[:40],
         )
-        regions = _detect_adlib_voice_regions(audio_path, seg_start, seg_end)
+        regions = _detect_adlib_voice_regions(audio_path, seg_start, process_end)
         if len(regions) < 2:
             logger.info(
                 "[ADLIB-VAD] VAD found %d region(s) → fallback to equal-time split",
                 len(regions),
             )
-            out.append(seg)
+            for k in range(n_consumed):
+                out.append(segs[idx + k])
+            idx += n_consumed
             continue
 
         logger.info("[ADLIB-VAD] %d regions detected; re-transcribing each", len(regions))
@@ -261,7 +297,9 @@ def _vad_split_adlib_segments(
             sub_segs.append(result)
 
         if not all_ok or not sub_segs:
-            out.append(seg)
+            for k in range(n_consumed):
+                out.append(segs[idx + k])
+            idx += n_consumed
             continue
 
         flat = sorted(
@@ -269,15 +307,18 @@ def _vad_split_adlib_segments(
             key=lambda s: s.get("start", 0),
         )
         if not flat:
-            out.append(seg)
+            for k in range(n_consumed):
+                out.append(segs[idx + k])
+            idx += n_consumed
             continue
 
         logger.info(
-            "[ADLIB-VAD] replaced %.1f-%.1fs with %d sub-segment(s): %s",
-            seg_start, seg_end, len(flat),
+            "[ADLIB-VAD] replaced %.1f-%.1fs (%d orig seg(s)) with %d sub-segment(s): %s",
+            seg_start, process_end, n_consumed, len(flat),
             ", ".join(f"{s['start']:.1f}-{s['end']:.1f}s" for s in flat[:6]),
         )
         out.extend(flat)
+        idx += n_consumed
 
     return out
 

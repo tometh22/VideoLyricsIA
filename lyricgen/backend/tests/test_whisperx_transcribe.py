@@ -286,7 +286,11 @@ def _make_seg(text, start, end, words=None):
 
 
 def test_vad_split_adlib_splits_on_silence(monkeypatch, tmp_path):
-    """Happy path: VAD finds 3 regions → all re-transcriptions succeed → 3 sub-segments."""
+    """Happy path: VAD finds 3 regions → all re-transcriptions succeed → 3 sub-segments.
+
+    The following normal segment starts 3s after the adlib end (gap > _ADLIB_NEXT_MERGE_GAP_S),
+    so lookforward does NOT apply — the normal segment passes through unchanged.
+    """
     f = tmp_path / "vocals.wav"
     f.write_bytes(b"RIFF\x00\x00\x00\x00WAVE" + b"\x00" * 256)
     audio_path = str(f)
@@ -301,12 +305,54 @@ def test_vad_split_adlib_splits_on_silence(monkeypatch, tmp_path):
     monkeypatch.setenv("ADLIB_VAD_RETRANSCRIBE_ENABLED", "1")
 
     mega = _make_seg("uh uh uh uh uh uh uh uh uh uh", 69.0, 101.0)
-    normal = _make_seg("Tomas del miedo tu don", 102.0, 107.0)
+    # 3s gap → outside _ADLIB_NEXT_MERGE_GAP_S (2s) → no lookforward
+    normal = _make_seg("Tomas del miedo tu don", 104.0, 109.0)
     out = wx._vad_split_adlib_segments([mega, normal], audio_path, language="es")
 
     assert len(out) == 4, f"expected 3 sub-segs + 1 normal = 4, got {len(out)}: {out}"
     assert out[0]["start"] >= 73.0
     assert out[-1]["text"] == "Tomas del miedo tu don"
+
+
+def test_vad_split_extends_window_for_mislabeled_tail(monkeypatch, tmp_path):
+    """Lookforward fixes the No Hay Santos 1:35 bug.
+
+    whisperX places the adlib at 69.4-95.2s and misidentifies the adlib tail
+    as "Tomas del miedo tu don" starting at 95.2s (gap=0 ≤ 2s). The new code
+    extends the VAD window to 110.2s. VAD finds the real singing at 102s and
+    re-transcribes it with correct timing. Both original segments are consumed.
+    """
+    import pytest
+    f = tmp_path / "vocals.wav"
+    f.write_bytes(b"RIFF\x00\x00\x00\x00WAVE" + b"\x00" * 256)
+    audio_path = str(f)
+
+    # Extended window: 69.4-110.2s → VAD finds 3 uh clusters + 1 real lyric region
+    monkeypatch.setattr(
+        wx, "_detect_adlib_voice_regions",
+        lambda *a, **k: [(73.0, 84.0), (84.5, 92.5), (93.0, 101.0), (102.0, 107.0)],
+    )
+
+    def _fake_retranscribe(audio_path, start_s, end_s, language=None):
+        if start_s >= 102.0:
+            return [{"start": 102.3, "end": 105.1, "text": "Tomas del miedo tu don"}]
+        return [{"start": start_s + 0.1, "end": end_s - 0.1, "text": "uh uh uh"}]
+
+    monkeypatch.setattr(wx, "_retranscribe_slice", _fake_retranscribe)
+    monkeypatch.setenv("ADLIB_VAD_RETRANSCRIBE_ENABLED", "1")
+
+    mega = _make_seg("uh uh uh uh uh uh uh uh uh uh", 69.4, 95.2)
+    mislabeled = _make_seg("Tomas del miedo tu don", 95.2, 110.2)  # gap=0 → lookforward
+    out = wx._vad_split_adlib_segments([mega, mislabeled], audio_path, language="es")
+
+    # Both original segs consumed; replaced by 3 uh + 1 lyric
+    assert len(out) == 4, f"expected 4 sub-segs, got {len(out)}: {out}"
+    lyric_seg = next((s for s in out if "Tomas" in s.get("text", "")), None)
+    assert lyric_seg is not None, "Lyric segment must appear in output"
+    assert lyric_seg["start"] == pytest.approx(102.3, abs=0.01), (
+        f"Expected ~102.3s, got {lyric_seg['start']:.1f}s — lookforward fix failed"
+    )
+    assert lyric_seg["start"] > 100.0, "Timing must be past the adlib, not at 95s"
 
 
 def test_vad_split_falls_back_when_single_region(monkeypatch, tmp_path):
