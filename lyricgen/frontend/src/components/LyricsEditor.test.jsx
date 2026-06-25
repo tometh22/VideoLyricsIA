@@ -419,3 +419,98 @@ describe("LyricsEditor — Enter-to-split is word-aware (2026-06-05)", () => {
     expect(out[0].words).toHaveLength(3);
   });
 });
+
+describe("LyricsEditor — durable save on page unload (refresh/close) (2026-06-24)", () => {
+  // BUG (reporte Gaby): el editor titiló a toda velocidad, refrescó la página
+  // para salir del error y perdió TODO el trabajo no persistido. El autosave
+  // es debounced 3s y el beforeunload solo AVISA — no guarda. Un F5 mata el
+  // contexto JS antes de que el debounce o el flush-on-unmount (unmount de
+  // React) terminen, y un fetch normal se cancela a mitad de vuelo.
+  //
+  // Fix: en pagehide/beforeunload re-disparamos el guardado pendiente con
+  // `keepalive: true`, que el browser entrega aunque la página se esté
+  // descargando. Este test monta el editor, edita una línea (deja un guardado
+  // pendiente en el ref) y verifica que pagehide persiste con keepalive.
+  it("flushes pending edits with keepalive on pagehide", () => {
+    const onPersistSegments = vi.fn().mockResolvedValue({ ok: true });
+    const props = baseProps({
+      segments: [{ start: 1.0, end: 2.0, text: "alpha line" }],
+      transcribeJobId: "job-1",
+      onPersistSegments,
+    });
+    render(<LyricsEditor {...props} />);
+
+    // Operadora edita una línea — queda un guardado pendiente (debounce 3s
+    // aún sin disparar; en el test no avanzamos timers).
+    const input = screen.getByDisplayValue("alpha line");
+    fireEvent.change(input, { target: { value: "alpha EDITED" } });
+
+    // Sin la corrección, refrescar pierde esta edición. Con ella, pagehide
+    // la persiste antes de que la página muera.
+    window.dispatchEvent(new Event("pagehide"));
+
+    expect(onPersistSegments).toHaveBeenCalledTimes(1);
+    const [jobId, segments, opts] = onPersistSegments.mock.calls[0];
+    expect(jobId).toBe("job-1");
+    expect(segments).toEqual([{ start: 1.0, end: 2.0, text: "alpha EDITED" }]);
+    expect(opts).toEqual({ keepalive: true });
+  });
+
+  it("does not fire a save on unload when there is nothing pending", () => {
+    const onPersistSegments = vi.fn().mockResolvedValue({ ok: true });
+    // disableAutosave → el debounce nunca arma un pendiente, así que pagehide
+    // no debe intentar guardar (no hay trabajo que perder).
+    const props = baseProps({
+      segments: [{ start: 1.0, end: 2.0, text: "alpha line" }],
+      transcribeJobId: "job-1",
+      onPersistSegments,
+      disableAutosave: true,
+    });
+    render(<LyricsEditor {...props} />);
+
+    window.dispatchEvent(new Event("pagehide"));
+    expect(onPersistSegments).not.toHaveBeenCalled();
+  });
+});
+
+describe("LyricsEditor — reseed-storm fix is end-to-end (integration proof of #724)", () => {
+  // ACTIVE PROOF of #724 that doesn't depend on real users hitting the bug.
+  // The reseed-storm / data-loss root cause: the backend sorts segments by
+  // `start` on every /save-segments write, so the writeback hands the editor a
+  // segments prop with the SAME values in a DIFFERENT order than the local
+  // out-of-order array. The OLD positional segmentsValuesEqual saw that as
+  // "new content" → reseeded `edited` from the prop → the operator's in-flight
+  // edit got clobbered (and, repeated every autosave cycle, the flicker loop).
+  //
+  // This test reproduces exactly that: edit a line locally, then push a
+  // reordered-but-equal segments prop. With #724 the guard treats it as equal
+  // and SKIPS the reseed, so the local edit survives. On the pre-#724 build
+  // this test fails — the edit is replaced by the reordered original.
+  it("a reordered-but-equal segments writeback does NOT clobber a local edit", () => {
+    const ordered = [
+      { start: 0, end: 3, text: "alpha line" },
+      { start: 3, end: 5, text: "beta line" },
+      { start: 5, end: 8, text: "gamma line" },
+    ];
+    const { rerender } = render(<LyricsEditor {...baseProps({ segments: ordered })} />);
+
+    // Operator edits the first line locally (changes `edited`, not the prop).
+    const input = screen.getByDisplayValue("alpha line");
+    fireEvent.change(input, { target: { value: "alpha EDITED" } });
+    expect(screen.getByDisplayValue("alpha EDITED")).toBeInTheDocument();
+
+    // Backend roundtrip: same values, sorted differently, fresh reference —
+    // the exact shape that used to trigger the destructive reseed.
+    const reorderedSameValues = [
+      { start: 5, end: 8, text: "gamma line" },
+      { start: 0, end: 3, text: "alpha line" },
+      { start: 3, end: 5, text: "beta line" },
+    ];
+    rerender(<LyricsEditor {...baseProps({ segments: reorderedSameValues })} />);
+
+    // The local edit must survive (guard skipped the reseed). On the buggy
+    // build, "alpha EDITED" is gone and the original "alpha line" is back.
+    expect(screen.getByDisplayValue("alpha EDITED")).toBeInTheDocument();
+    expect(screen.queryByDisplayValue("alpha line")).not.toBeInTheDocument();
+  });
+});

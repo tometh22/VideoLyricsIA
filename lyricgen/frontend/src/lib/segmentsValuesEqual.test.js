@@ -106,4 +106,23 @@ describe("segmentsValuesEqual", () => {
     ];
     expect(segmentsValuesEqual(edited, fromAutosave)).toBe(true);
   });
+
+  it("still detects a genuine text swap between two segments with the SAME start (sort-invariance must not mask a real edit)", () => {
+    // Guards the reseed-storm fix (#724): the sort-by-start comparison must
+    // not collapse a real edit to "equal". Two lines share an identical start
+    // and their text is genuinely swapped. JS Array.sort is stable, so equal
+    // `start` keys keep their original order — the positional text compare
+    // after the sort must therefore see the swap and return false. If a future
+    // refactor makes the sort unstable (or compares as a multiset), this flips
+    // to true and the editor would silently drop the operator's change.
+    const before = [
+      { start: 1.0, end: 2.0, text: "A" },
+      { start: 1.0, end: 2.0, text: "B" },
+    ];
+    const afterSwap = [
+      { start: 1.0, end: 2.0, text: "B" },
+      { start: 1.0, end: 2.0, text: "A" },
+    ];
+    expect(segmentsValuesEqual(before, afterSwap)).toBe(false);
+  });
 });

@@ -469,10 +469,14 @@ export default function LyricsEditor({
     }
     // [reseed-storm] capture (P0 UMG Chile 2026-06-16: "las líneas cambian de
     // posición en loop"). This reseed reassigns _id by index, so rows keyed by
-    // _id REMOUNT. segmentsValuesEqual is POSITIONAL, so a writeback that hands
-    // back a REORDERED segments array (backend sorts by start #184 while local
-    // is out-of-order from a split/overlap) fails the guard above and makes
-    // this fire on every cycle → rows reposition in a loop. If it fires
+    // _id REMOUNT. The original root cause: segmentsValuesEqual was POSITIONAL,
+    // so a writeback that handed back a REORDERED segments array (backend sorts
+    // by start #184 while local is out-of-order from a split/overlap) failed the
+    // guard above and made this fire on every cycle → rows reposition in a loop.
+    // FIXED in #724: segmentsValuesEqual now sorts both sides by start before
+    // comparing, so a pure reorder no longer reseeds. This detector is KEPT as a
+    // backstop — it still catches a GENUINE rapid-content storm (not reorder),
+    // and stays until the 2026-07-01 monitoring window closes. If it fires
     // repeatedly we emit the OLD vs NEW order so we can see the swap.
     {
       const _now = typeof performance !== "undefined" && performance.now ? performance.now() : 0;
@@ -587,6 +591,38 @@ export default function LyricsEditor({
       } catch { /* best-effort */ }
     };
   }, []);
+
+  // Durable flush on page unload (refresh / tab close). The beforeunload
+  // handler above only WARNS via a native dialog — it does not persist. And
+  // the flush-on-unmount above runs on React unmount (SPA navigation), which
+  // a hard refresh (F5) skips: the browser tears down the JS context before
+  // the 3s debounce or the unmount cleanup can finish, and an ordinary fetch
+  // is canceled mid-flight. So on pagehide/beforeunload we re-fire the pending
+  // save with `keepalive: true`, which the browser is required to deliver even
+  // as the page goes away. Auth headers ride along (authFetch adds them) —
+  // navigator.sendBeacon can't set Authorization, so /save-segments would 401.
+  // (Reporte Gaby 2026-06-24: el editor titiló, refrescó para salir y perdió
+  // TODO el trabajo no persistido.)
+  useEffect(() => {
+    if (disableAutosave || !onPersistSegments || !transcribeJobId) return undefined;
+    const flushOnUnload = () => {
+      const p = _pendingFlushRef.current;
+      if (!p) return;
+      _pendingFlushRef.current = null;
+      try {
+        const cleaned = p.edited.map(({ _id, review, ...rest }) => rest);
+        Promise.resolve(
+          p.onPersistSegments(p.transcribeJobId, cleaned, { keepalive: true })
+        ).catch(() => {});
+      } catch { /* best-effort */ }
+    };
+    window.addEventListener("pagehide", flushOnUnload);
+    window.addEventListener("beforeunload", flushOnUnload);
+    return () => {
+      window.removeEventListener("pagehide", flushOnUnload);
+      window.removeEventListener("beforeunload", flushOnUnload);
+    };
+  }, [disableAutosave, onPersistSegments, transcribeJobId]);
 
   // Flush-save on a timeline drag (no 3 s wait) + drive the "Guardado ✓"
   // chip. Runs only when flushCounter bumps. By the time this effect fires,
