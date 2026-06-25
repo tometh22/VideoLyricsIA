@@ -472,3 +472,45 @@ describe("LyricsEditor — durable save on page unload (refresh/close) (2026-06-
     expect(onPersistSegments).not.toHaveBeenCalled();
   });
 });
+
+describe("LyricsEditor — reseed-storm fix is end-to-end (integration proof of #724)", () => {
+  // ACTIVE PROOF of #724 that doesn't depend on real users hitting the bug.
+  // The reseed-storm / data-loss root cause: the backend sorts segments by
+  // `start` on every /save-segments write, so the writeback hands the editor a
+  // segments prop with the SAME values in a DIFFERENT order than the local
+  // out-of-order array. The OLD positional segmentsValuesEqual saw that as
+  // "new content" → reseeded `edited` from the prop → the operator's in-flight
+  // edit got clobbered (and, repeated every autosave cycle, the flicker loop).
+  //
+  // This test reproduces exactly that: edit a line locally, then push a
+  // reordered-but-equal segments prop. With #724 the guard treats it as equal
+  // and SKIPS the reseed, so the local edit survives. On the pre-#724 build
+  // this test fails — the edit is replaced by the reordered original.
+  it("a reordered-but-equal segments writeback does NOT clobber a local edit", () => {
+    const ordered = [
+      { start: 0, end: 3, text: "alpha line" },
+      { start: 3, end: 5, text: "beta line" },
+      { start: 5, end: 8, text: "gamma line" },
+    ];
+    const { rerender } = render(<LyricsEditor {...baseProps({ segments: ordered })} />);
+
+    // Operator edits the first line locally (changes `edited`, not the prop).
+    const input = screen.getByDisplayValue("alpha line");
+    fireEvent.change(input, { target: { value: "alpha EDITED" } });
+    expect(screen.getByDisplayValue("alpha EDITED")).toBeInTheDocument();
+
+    // Backend roundtrip: same values, sorted differently, fresh reference —
+    // the exact shape that used to trigger the destructive reseed.
+    const reorderedSameValues = [
+      { start: 5, end: 8, text: "gamma line" },
+      { start: 0, end: 3, text: "alpha line" },
+      { start: 3, end: 5, text: "beta line" },
+    ];
+    rerender(<LyricsEditor {...baseProps({ segments: reorderedSameValues })} />);
+
+    // The local edit must survive (guard skipped the reseed). On the buggy
+    // build, "alpha EDITED" is gone and the original "alpha line" is back.
+    expect(screen.getByDisplayValue("alpha EDITED")).toBeInTheDocument();
+    expect(screen.queryByDisplayValue("alpha line")).not.toBeInTheDocument();
+  });
+});
