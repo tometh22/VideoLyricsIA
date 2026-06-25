@@ -2470,7 +2470,7 @@ export default function App() {
   // anterior al cambio. Ahora el caller (LyricsEditor) usa el
   // resultado para mover saveStatus a "error" y mostrar un banner +
   // bloquear el botón Aprobar.
-  const persistSegmentsToBackend = useCallback(async (jobId, segments) => {
+  const persistSegmentsToBackend = useCallback(async (jobId, segments, opts = {}) => {
     if (!jobId || !Array.isArray(segments) || segments.length === 0) {
       return { ok: false, reason: "no-data" };
     }
@@ -2486,6 +2486,12 @@ export default function App() {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ segments }),
+        // keepalive lets this POST survive a page unload (refresh / tab close).
+        // The unload flush in LyricsEditor sets it so the operator's last,
+        // not-yet-debounced edits aren't canceled mid-flight by the browser
+        // (reporte Gaby 2026-06-24: refrescó para salir del titileo y perdió
+        // TODO). Body cap is 64KB — fine for a lyrics segment list.
+        keepalive: opts.keepalive === true,
       });
       if (!res.ok) {
         if (res.status !== 404) {

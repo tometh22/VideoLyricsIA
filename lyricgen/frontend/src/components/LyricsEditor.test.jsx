@@ -419,3 +419,56 @@ describe("LyricsEditor — Enter-to-split is word-aware (2026-06-05)", () => {
     expect(out[0].words).toHaveLength(3);
   });
 });
+
+describe("LyricsEditor — durable save on page unload (refresh/close) (2026-06-24)", () => {
+  // BUG (reporte Gaby): el editor titiló a toda velocidad, refrescó la página
+  // para salir del error y perdió TODO el trabajo no persistido. El autosave
+  // es debounced 3s y el beforeunload solo AVISA — no guarda. Un F5 mata el
+  // contexto JS antes de que el debounce o el flush-on-unmount (unmount de
+  // React) terminen, y un fetch normal se cancela a mitad de vuelo.
+  //
+  // Fix: en pagehide/beforeunload re-disparamos el guardado pendiente con
+  // `keepalive: true`, que el browser entrega aunque la página se esté
+  // descargando. Este test monta el editor, edita una línea (deja un guardado
+  // pendiente en el ref) y verifica que pagehide persiste con keepalive.
+  it("flushes pending edits with keepalive on pagehide", () => {
+    const onPersistSegments = vi.fn().mockResolvedValue({ ok: true });
+    const props = baseProps({
+      segments: [{ start: 1.0, end: 2.0, text: "alpha line" }],
+      transcribeJobId: "job-1",
+      onPersistSegments,
+    });
+    render(<LyricsEditor {...props} />);
+
+    // Operadora edita una línea — queda un guardado pendiente (debounce 3s
+    // aún sin disparar; en el test no avanzamos timers).
+    const input = screen.getByDisplayValue("alpha line");
+    fireEvent.change(input, { target: { value: "alpha EDITED" } });
+
+    // Sin la corrección, refrescar pierde esta edición. Con ella, pagehide
+    // la persiste antes de que la página muera.
+    window.dispatchEvent(new Event("pagehide"));
+
+    expect(onPersistSegments).toHaveBeenCalledTimes(1);
+    const [jobId, segments, opts] = onPersistSegments.mock.calls[0];
+    expect(jobId).toBe("job-1");
+    expect(segments).toEqual([{ start: 1.0, end: 2.0, text: "alpha EDITED" }]);
+    expect(opts).toEqual({ keepalive: true });
+  });
+
+  it("does not fire a save on unload when there is nothing pending", () => {
+    const onPersistSegments = vi.fn().mockResolvedValue({ ok: true });
+    // disableAutosave → el debounce nunca arma un pendiente, así que pagehide
+    // no debe intentar guardar (no hay trabajo que perder).
+    const props = baseProps({
+      segments: [{ start: 1.0, end: 2.0, text: "alpha line" }],
+      transcribeJobId: "job-1",
+      onPersistSegments,
+      disableAutosave: true,
+    });
+    render(<LyricsEditor {...props} />);
+
+    window.dispatchEvent(new Event("pagehide"));
+    expect(onPersistSegments).not.toHaveBeenCalled();
+  });
+});

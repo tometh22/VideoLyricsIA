@@ -592,6 +592,38 @@ export default function LyricsEditor({
     };
   }, []);
 
+  // Durable flush on page unload (refresh / tab close). The beforeunload
+  // handler above only WARNS via a native dialog — it does not persist. And
+  // the flush-on-unmount above runs on React unmount (SPA navigation), which
+  // a hard refresh (F5) skips: the browser tears down the JS context before
+  // the 3s debounce or the unmount cleanup can finish, and an ordinary fetch
+  // is canceled mid-flight. So on pagehide/beforeunload we re-fire the pending
+  // save with `keepalive: true`, which the browser is required to deliver even
+  // as the page goes away. Auth headers ride along (authFetch adds them) —
+  // navigator.sendBeacon can't set Authorization, so /save-segments would 401.
+  // (Reporte Gaby 2026-06-24: el editor titiló, refrescó para salir y perdió
+  // TODO el trabajo no persistido.)
+  useEffect(() => {
+    if (disableAutosave || !onPersistSegments || !transcribeJobId) return undefined;
+    const flushOnUnload = () => {
+      const p = _pendingFlushRef.current;
+      if (!p) return;
+      _pendingFlushRef.current = null;
+      try {
+        const cleaned = p.edited.map(({ _id, review, ...rest }) => rest);
+        Promise.resolve(
+          p.onPersistSegments(p.transcribeJobId, cleaned, { keepalive: true })
+        ).catch(() => {});
+      } catch { /* best-effort */ }
+    };
+    window.addEventListener("pagehide", flushOnUnload);
+    window.addEventListener("beforeunload", flushOnUnload);
+    return () => {
+      window.removeEventListener("pagehide", flushOnUnload);
+      window.removeEventListener("beforeunload", flushOnUnload);
+    };
+  }, [disableAutosave, onPersistSegments, transcribeJobId]);
+
   // Flush-save on a timeline drag (no 3 s wait) + drive the "Guardado ✓"
   // chip. Runs only when flushCounter bumps. By the time this effect fires,
   // setEdited from the same handler has already applied, so `edited` is the
