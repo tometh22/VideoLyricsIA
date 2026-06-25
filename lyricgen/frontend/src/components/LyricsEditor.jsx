@@ -441,6 +441,13 @@ export default function LyricsEditor({
   // that need to track a parent's source of truth across remounts.
   // Bug B7 from 2026-05-18 audit.
   const prevSegmentsRef = useRef(segments);
+  // Live mirror of `edited` so the prop-sync effect below can tell our OWN echo
+  // from a genuine external change. App.jsx feeds every local edit straight back
+  // as the `segments` prop (onEditedChange → mergeEditedSegments →
+  // currentReview.segments), so the effect must compare the incoming prop
+  // against what we're SHOWING right now — not a one-tick-stale ref.
+  const editedRef = useRef(edited);
+  editedRef.current = edited;
   // Operator feedback 2026-05-25 (UMG): "Debería hacerlo solo, no
   // preguntarme" — the auto-trim banner ("Recortar N líneas con texto
   // colgado · Aplicar") was friction. Detection is reliable enough to
@@ -451,6 +458,21 @@ export default function LyricsEditor({
   const _reseedStormRef = useRef({ windowStart: 0, count: 0 });
   useEffect(() => {
     if (prevSegmentsRef.current === segments) return;
+    // ROOT-CAUSE FIX (P0 UMG Chile, "titila todo el editor" — still firing on
+    // the #724 build): skip the destructive reseed when the incoming `segments`
+    // already matches what we're SHOWING (`edited`). App.jsx mirrors every local
+    // edit up to currentReview.segments (onEditedChange → mergeEditedSegments)
+    // and feeds it straight back as this prop. During a timeline drag the values
+    // change every tick, so comparing against the one-tick-stale prevSegmentsRef
+    // (below) saw each echo as "new content" and reseeded → _id reassigned by
+    // index → all rows REMOUNT 6-7×/s → reseed-storm / ui-freeze. #724 only
+    // neutralised the equal-VALUES reorder echo; this catches the live-edit echo
+    // because the prop equals our current `edited`. A genuine external change
+    // (load another song, undo) differs from `edited` and still reseeds.
+    if (segmentsValuesEqual(editedRef.current, segments)) {
+      prevSegmentsRef.current = segments;
+      return;
+    }
     // QA fix 2026-05-27 (drag-resize regression): the autosave POST
     // roundtrip (App.jsx::persistSegmentsToBackend) calls
     // setCurrentReview({...prev, segments: cleaned}) after a successful
