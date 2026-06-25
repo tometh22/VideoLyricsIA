@@ -4748,11 +4748,21 @@ async def _run_transcription_for_job(
             _audio_dur_for_lrc = await asyncio.to_thread(_audio_duration, tmp_path)
         except Exception:
             _audio_dur_for_lrc = None
-        with scoped_db() as _lrc_db:
-            lrc, _lrc_meta = await asyncio.to_thread(
-                _fetch_lrclib_with_swap_retry, artist_hint, song_hint, _lrc_db,
-                _audio_dur_for_lrc,
+        try:
+            with scoped_db() as _lrc_db:
+                lrc, _lrc_meta = await asyncio.to_thread(
+                    _fetch_lrclib_with_swap_retry, artist_hint, song_hint, _lrc_db,
+                    _audio_dur_for_lrc,
+                )
+        except Exception as _lrc_db_err:
+            # Transient Postgres SSL drop (Neon cold-start after idle period).
+            # Same fallback as the genius/gemini blocks: treat as a cache miss
+            # so the pipeline continues with whisperX + fallbacks.
+            logger.warning(
+                "[LYRICS] lrclib DB lookup raised (%s) — treating as miss",
+                _lrc_db_err,
             )
+            lrc, _lrc_meta = None, {"swapped": False, "artist_used": artist_hint, "song_used": song_hint}
         # Auto-correct inverted metadata: when the swap-retry hit, the upload
         # had artist/title swapped (incident 2026-05-24 Viejas Locas /
         # Legalícenla in staging — frontend parser assumes Title_Artist for
