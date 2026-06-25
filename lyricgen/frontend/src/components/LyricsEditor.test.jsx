@@ -5,7 +5,9 @@
 import { render, screen, cleanup, fireEvent, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, describe, it, expect, vi } from "vitest";
+import { useState, useCallback, useRef } from "react";
 import LyricsEditor from "./LyricsEditor";
+import { segmentsValuesEqual } from "../lib/segmentsValuesEqual";
 
 // useI18n + OnboardingTour pull in joyride / locale loading we don't
 // need for these unit tests. Mock them to noops so the editor renders
@@ -512,5 +514,62 @@ describe("LyricsEditor — reseed-storm fix is end-to-end (integration proof of 
     // build, "alpha EDITED" is gone and the original "alpha line" is back.
     expect(screen.getByDisplayValue("alpha EDITED")).toBeInTheDocument();
     expect(screen.queryByDisplayValue("alpha line")).not.toBeInTheDocument();
+  });
+});
+
+describe("LyricsEditor — no reseed storm from the editor's own edit echo (P0 titileo)", () => {
+  // Reproduces the production storm that #724 did NOT fix (Sentry: [reseed-storm]
+  // perSec 6-7 on release 0ffa76f, which already has #724). App.jsx mirrors every
+  // local edit up to currentReview.segments (onEditedChange → mergeEditedSegments)
+  // and feeds it straight back as the `segments` prop. During editing the
+  // prop-sync effect compared that echo against a one-tick-stale ref → saw it as
+  // new content → reseeded `edited` (reassigning _id by index → rows REMOUNT) on
+  // every edit → "titila todo el editor". The fix compares the echo against the
+  // LIVE `edited`, recognises it, and skips the reseed.
+  //
+  // Detection: a reseed calls setEdited, which re-fires the onEditedChange mirror.
+  // So a single user edit that triggers a reseed produces an EXTRA mirror call
+  // (the echo of the reseed). No reseed → exactly one mirror call per edit.
+  function MirrorHarness({ onMirror }) {
+    const [segments, setSegments] = useState([
+      { start: 0, end: 2, text: "alpha" },
+      { start: 2, end: 4, text: "beta" },
+    ]);
+    // STABLE identity, exactly like App.jsx's `useCallback(..., [])` handler —
+    // otherwise an inline arrow re-fires the editor's [edited, onEditedChange]
+    // effect on every render and masks the reseed signal.
+    const onMirrorRef = useRef(onMirror);
+    onMirrorRef.current = onMirror;
+    const handleMirror = useCallback((segs) => {
+      onMirrorRef.current(segs);
+      // Faithful to App.jsx mergeEditedSegments: no-op when values are equal,
+      // else store the edited values straight back as the prop (the loop).
+      setSegments((prev) => (segmentsValuesEqual(prev, segs) ? prev : segs));
+    }, []);
+    return (
+      <LyricsEditor
+        {...baseProps({
+          segments,
+          transcribeJobId: "job-1",
+          onPersistSegments: vi.fn().mockResolvedValue({ ok: true }),
+        })}
+        onEditedChange={handleMirror}
+      />
+    );
+  }
+
+  it("a single edit triggers exactly one mirror call — no self-echo reseed", () => {
+    const onMirror = vi.fn();
+    render(<MirrorHarness onMirror={onMirror} />);
+
+    const baseline = onMirror.mock.calls.length; // mount fires the mirror once
+    const input = screen.getByDisplayValue("alpha");
+    fireEvent.change(input, { target: { value: "alpha EDITED" } });
+
+    // One user edit = one mirror call. On the buggy build the echo reseeds and
+    // setEdited re-fires the mirror → 2+ calls (the storm, one bounce per edit).
+    expect(onMirror.mock.calls.length - baseline).toBe(1);
+    // And the edit is shown (sanity).
+    expect(screen.getByDisplayValue("alpha EDITED")).toBeInTheDocument();
   });
 });
