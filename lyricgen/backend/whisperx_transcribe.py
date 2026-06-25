@@ -111,7 +111,10 @@ def _correct_post_adlib_timing(segs: list[dict], audio_path: str) -> list[dict]:
     Only fires when the next segment starts ≤2s after the adlib block ends
     and a clear gap (≥0.4s) is detected in the audio.
     """
-    if not audio_path or not os.path.exists(audio_path):
+    _enabled = os.environ.get(
+        "ADLIB_TAIL_TIMING_FIX_ENABLED", "1"
+    ).strip().lower() in _TRUE
+    if not _enabled or not audio_path or not os.path.exists(audio_path):
         return segs
 
     try:
