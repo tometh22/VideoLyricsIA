@@ -55,6 +55,114 @@ def is_enabled() -> bool:
     return flag and bool(os.environ.get("REPLICATE_API_TOKEN", "").strip())
 
 
+def _find_voice_onset_after_adlib(
+    audio_path: str,
+    search_from: float,
+    search_to: float,
+) -> float | None:
+    """Return the voice onset after the largest silence gap in [search_from, search_to].
+
+    After a whisperX adlib block, uh sounds often continue for several seconds
+    past the segment boundary. This finds the first voice region that starts
+    after the largest silence gap — which is the true onset of the next lyric
+    line. Returns None if no clear gap (≥0.4s) is found or on any error.
+    """
+    try:
+        import librosa
+        duration = search_to - search_from
+        if duration <= 0:
+            return None
+        y, sr = librosa.load(
+            audio_path, sr=16000, mono=True,
+            offset=search_from, duration=duration,
+        )
+        intervals = librosa.effects.split(y, top_db=_ADLIB_VAD_TOP_DB)
+        if len(intervals) < 2:
+            return None
+
+        max_gap = 0.0
+        best_onset: float | None = None
+        for i in range(1, len(intervals)):
+            gap = (intervals[i][0] - intervals[i - 1][1]) / sr
+            if gap > max_gap:
+                max_gap = gap
+                best_onset = search_from + intervals[i][0] / sr
+
+        if max_gap < 0.4 or best_onset is None:
+            return None
+        return best_onset
+    except Exception as exc:
+        logger.debug(
+            "[ADLIB-VAD] _find_voice_onset_after_adlib %.1f-%.1fs: %s",
+            search_from, search_to, exc,
+        )
+        return None
+
+
+def _correct_post_adlib_timing(segs: list[dict], audio_path: str) -> list[dict]:
+    """Shift the timing of the lyric segment immediately following an adlib block.
+
+    whisperX sometimes places the adlib tail (uh/uoh that continue past the
+    block boundary) as the first lyric line — e.g. "Tomas del miedo tu don"
+    appears 7s too early. We run VAD from the adlib block's end, find the
+    real voice onset after the last uh cluster (identified by the largest
+    silence gap), and correct the start/end timestamps. Text is never changed.
+
+    Only fires when the next segment starts ≤2s after the adlib block ends
+    and a clear gap (≥0.4s) is detected in the audio.
+    """
+    _enabled = os.environ.get(
+        "ADLIB_TAIL_TIMING_FIX_ENABLED", "1"
+    ).strip().lower() in _TRUE
+    if not _enabled or not audio_path or not os.path.exists(audio_path):
+        return segs
+
+    try:
+        from post_reconcile import _is_adlib_loop
+    except ImportError:
+        return segs
+
+    out = list(segs)
+    for i, seg in enumerate(out):
+        if i + 1 >= len(out):
+            break
+        text = (seg.get("text") or "").strip()
+        if not _is_adlib_loop(text):
+            continue
+        try:
+            seg_end = float(seg["end"])
+        except (KeyError, TypeError, ValueError):
+            continue
+
+        next_seg = out[i + 1]
+        try:
+            ns_start = float(next_seg["start"])
+            ns_end = float(next_seg["end"])
+            ns_text = (next_seg.get("text") or "").strip()
+        except (KeyError, TypeError, ValueError):
+            continue
+
+        if ns_start - seg_end > 2.0 or _is_adlib_loop(ns_text):
+            continue
+
+        true_start = _find_voice_onset_after_adlib(audio_path, seg_end, seg_end + 20.0)
+        if true_start is None or true_start <= ns_start + 0.5:
+            continue
+
+        orig_dur = max(ns_end - ns_start, 2.0)
+        out[i + 1] = {
+            **next_seg,
+            "start": round(true_start, 3),
+            "end": round(true_start + orig_dur, 3),
+        }
+        logger.info(
+            "[ADLIB-VAD] tail timing corrected: %r %.1fs→%.1fs (gap=%.2fs)",
+            ns_text[:30], ns_start, true_start, true_start - ns_start,
+        )
+
+    return out
+
+
 def _detect_adlib_voice_regions(
     audio_path: str,
     seg_start: float,
@@ -759,6 +867,7 @@ def transcribe_whisperx(audio_path: str, language: str | None = None,
     segs = _map_segments(output)
     raw_n = len(segs)
     segs = _vad_split_adlib_segments(segs, audio_path, language)
+    segs = _correct_post_adlib_timing(segs, audio_path)
     segs = _filter_ghosts(segs)
     segs = _split_long_segments(segs)
     # Acoustic similarity correction: replace low-confidence ASR hallucinations
