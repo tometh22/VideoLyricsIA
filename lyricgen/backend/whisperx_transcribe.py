@@ -29,6 +29,19 @@ logger = logging.getLogger("genly.whisperx")
 
 _TRUE = ("1", "true", "yes", "on", "y", "t")
 
+# ── VAD-first ad-lib re-transcription (PR #708) ───────────────────────────────
+_ADLIB_VAD_TOP_DB: float = 25.0        # more sensitive than pipeline's 30-35
+_ADLIB_VAD_MERGE_GAP_S: float = 0.3   # preserve ~0.43s gaps between uh clusters
+_ADLIB_VAD_MIN_REGION_S: float = 2.0  # discard sub-2s noise blips
+_ADLIB_MIN_DUR: float = 6.0           # keep in sync with post_reconcile.ADLIB_MIN_DUR
+# Fixed lookahead past the adlib block end. whisperX often places displaced
+# lyric segments (e.g. "Tomas del miedo" at 95.8s when it actually starts at
+# 102.02s) immediately after the adlib. Extending the VAD window by this
+# amount lets us detect AND retranscribe those segments at correct timestamps.
+# n_consumed is then set dynamically based on the last VAD region found
+# (old approach: fixed ns_end which was only ~3s wide, missing the real onset).
+_ADLIB_LOOKAHEAD_S: float = 20.0
+
 # Replicate whisperX model. Override via env once a version is verified for
 # prod. NOTE: pin to a known-good version hash before enabling in production.
 _MODEL = os.environ.get(
@@ -42,6 +55,569 @@ def is_enabled() -> bool:
     """On only when the flag is set AND a Replicate token is present."""
     flag = os.environ.get("WHISPERX_ENABLED", "0").strip().lower() in _TRUE
     return flag and bool(os.environ.get("REPLICATE_API_TOKEN", "").strip())
+
+
+def _find_voice_onset_after_adlib(
+    audio_path: str,
+    search_from: float,
+    search_to: float,
+) -> float | None:
+    """Return the voice onset after the largest silence gap in [search_from, search_to].
+
+    After a whisperX adlib block, uh sounds often continue for several seconds
+    past the segment boundary. This finds the first voice region that starts
+    after the largest silence gap — which is the true onset of the next lyric
+    line. Returns None if no clear gap (≥0.4s) is found or on any error.
+    """
+    try:
+        import librosa
+        duration = search_to - search_from
+        if duration <= 0:
+            return None
+        y, sr = librosa.load(
+            audio_path, sr=16000, mono=True,
+            offset=search_from, duration=duration,
+        )
+        intervals = librosa.effects.split(y, top_db=_ADLIB_VAD_TOP_DB)
+        if len(intervals) < 2:
+            return None
+
+        max_gap = 0.0
+        best_onset: float | None = None
+        for i in range(1, len(intervals)):
+            gap = (intervals[i][0] - intervals[i - 1][1]) / sr
+            if gap > max_gap:
+                max_gap = gap
+                best_onset = search_from + intervals[i][0] / sr
+
+        if max_gap < 0.4 or best_onset is None:
+            return None
+        return best_onset
+    except Exception as exc:
+        logger.debug(
+            "[ADLIB-VAD] _find_voice_onset_after_adlib %.1f-%.1fs: %s",
+            search_from, search_to, exc,
+        )
+        return None
+
+
+def _correct_post_adlib_timing(segs: list[dict], audio_path: str) -> list[dict]:
+    """Shift the timing of the lyric segment immediately following an adlib block.
+
+    whisperX sometimes places the adlib tail (uh/uoh that continue past the
+    block boundary) as the first lyric line — e.g. "Tomas del miedo tu don"
+    appears 7s too early. We run VAD from the adlib block's end, find the
+    real voice onset after the last uh cluster (identified by the largest
+    silence gap), and correct the start/end timestamps. Text is never changed.
+
+    Only fires when the next segment starts ≤2s after the adlib block ends
+    and a clear gap (≥0.4s) is detected in the audio.
+    """
+    _enabled = os.environ.get(
+        "ADLIB_TAIL_TIMING_FIX_ENABLED", "1"
+    ).strip().lower() in _TRUE
+    if not _enabled or not audio_path or not os.path.exists(audio_path):
+        return segs
+
+    try:
+        from post_reconcile import _is_adlib_loop
+    except ImportError:
+        return segs
+
+    out = list(segs)
+    for i, seg in enumerate(out):
+        if i + 1 >= len(out):
+            break
+        text = (seg.get("text") or "").strip()
+        if not _is_adlib_loop(text):
+            continue
+        try:
+            seg_end = float(seg["end"])
+        except (KeyError, TypeError, ValueError):
+            continue
+
+        next_seg = out[i + 1]
+        try:
+            ns_start = float(next_seg["start"])
+            ns_end = float(next_seg["end"])
+            ns_text = (next_seg.get("text") or "").strip()
+        except (KeyError, TypeError, ValueError):
+            continue
+
+        if ns_start - seg_end > 2.0 or _is_adlib_loop(ns_text):
+            continue
+
+        true_start = _find_voice_onset_after_adlib(audio_path, seg_end, seg_end + 20.0)
+        if true_start is None or true_start <= ns_start + 0.5:
+            continue
+
+        orig_dur = max(ns_end - ns_start, 2.0)
+        out[i + 1] = {
+            **next_seg,
+            "start": round(true_start, 3),
+            "end": round(true_start + orig_dur, 3),
+        }
+        logger.info(
+            "[ADLIB-VAD] tail timing corrected: %r %.1fs→%.1fs (gap=%.2fs)",
+            ns_text[:30], ns_start, true_start, true_start - ns_start,
+        )
+
+    return out
+
+
+def _detect_adlib_voice_regions(
+    audio_path: str,
+    seg_start: float,
+    seg_end: float,
+) -> list[tuple[float, float]]:
+    """Return VAD-detected non-silent regions within [seg_start, seg_end].
+
+    Loads only the audio slice (offset + duration) via librosa to avoid
+    decoding a full 5-min WAV for a 40s ad-lib block. sr=16000 matches the
+    ffmpeg extraction in _retranscribe_slice. Returns [(seg_start, seg_end)]
+    as a no-split sentinel when ≤1 region is found or on any failure.
+    Never raises.
+    """
+    try:
+        import librosa
+        duration = seg_end - seg_start
+        if duration <= 0:
+            return [(seg_start, seg_end)]
+        y, sr = librosa.load(
+            audio_path, sr=16000, mono=True,
+            offset=seg_start, duration=duration,
+        )
+        intervals = librosa.effects.split(y, top_db=_ADLIB_VAD_TOP_DB)
+        regions: list[tuple[float, float]] = []
+        for s_samp, e_samp in intervals:
+            t_s = seg_start + float(s_samp) / sr
+            t_e = seg_start + float(e_samp) / sr
+            if t_e - t_s >= _ADLIB_VAD_MIN_REGION_S:
+                regions.append((t_s, t_e))
+        if not regions:
+            return [(seg_start, seg_end)]
+        # Merge regions separated by < _ADLIB_VAD_MERGE_GAP_S.
+        # Less aggressive than pipeline._detect_speech_regions (0.5s) to
+        # preserve the ~0.43s natural silences between uh clusters.
+        merged: list[tuple[float, float]] = [regions[0]]
+        for r_s, r_e in regions[1:]:
+            if r_s - merged[-1][1] <= _ADLIB_VAD_MERGE_GAP_S:
+                merged[-1] = (merged[-1][0], r_e)
+            else:
+                merged.append((r_s, r_e))
+        return merged if len(merged) >= 2 else [(seg_start, seg_end)]
+    except Exception as exc:
+        logger.warning(
+            "[ADLIB-VAD] detect failed (%.1f-%.1fs): %s", seg_start, seg_end, exc,
+        )
+        return [(seg_start, seg_end)]
+
+
+def _retranscribe_slice(
+    audio_path: str,
+    start_s: float,
+    end_s: float,
+    language: str | None = None,
+) -> list[dict] | None:
+    """Extract [start_s, end_s] from audio_path as a temp MP3 and transcribe
+    via Whisper-1 API. Returns segments with timestamps offset to absolute
+    time. Returns None on any failure. Never raises.
+
+    Uses lazy import of pipeline._transcribe_via_openai_api to avoid circular
+    imports (pipeline.py imports whisperx_transcribe at module level).
+
+    No lyrics_hint: short context lets Whisper's LM break the uh-attractor
+    and correctly transcribe the singing passage that follows.
+    """
+    import subprocess
+    import tempfile
+    import os as _os
+
+    chunk_path: str | None = None
+    try:
+        from pipeline import _transcribe_via_openai_api  # lazy: safe after both modules load
+        with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as tf:
+            chunk_path = tf.name
+        rc = subprocess.run(
+            [
+                "ffmpeg", "-y",
+                "-ss", str(start_s), "-to", str(end_s),
+                "-i", audio_path,
+                "-ar", "16000", "-ac", "1",
+                "-codec:a", "libmp3lame", "-q:a", "5",
+                chunk_path,
+            ],
+            capture_output=True,
+            timeout=60,
+        )
+        if rc.returncode != 0:
+            logger.warning(
+                "[ADLIB-VAD] ffmpeg extract %.1f-%.1fs failed (rc=%d)",
+                start_s, end_s, rc.returncode,
+            )
+            return None
+        raw = _transcribe_via_openai_api(chunk_path, language=language)
+        if not raw:
+            return None
+        result: list[dict] = []
+        for seg in raw:
+            try:
+                out_seg = {
+                    **seg,
+                    "start": round(float(seg["start"]) + start_s, 3),
+                    "end": round(float(seg["end"]) + start_s, 3),
+                }
+                if out_seg.get("words"):
+                    out_seg["words"] = [
+                        {**w,
+                         "start": round(float(w["start"]) + start_s, 3),
+                         "end": round(float(w["end"]) + start_s, 3)}
+                        for w in out_seg["words"]
+                    ]
+                result.append(out_seg)
+            except (KeyError, TypeError, ValueError):
+                continue
+        return result or None
+    except Exception as exc:
+        logger.warning(
+            "[ADLIB-VAD] _retranscribe_slice %.1f-%.1fs failed: %s", start_s, end_s, exc,
+        )
+        return None
+    finally:
+        if chunk_path:
+            try:
+                _os.unlink(chunk_path)
+            except OSError:
+                pass
+
+
+def _vad_split_adlib_segments(
+    segs: list[dict],
+    audio_path: str,
+    language: str | None = None,
+) -> list[dict]:
+    """For ad-lib mega-blocks with no word stamps, run VAD-based split and
+    per-region re-transcription so each cluster becomes its own segment.
+
+    This replicates Rotor's VAD-first approach: instead of transcribing a
+    40s mega-block of uh sounds (which causes Whisper's LM to stay stuck in
+    the uh-attractor), we detect natural silence boundaries, then transcribe
+    each 5-15s region independently. Short context allows Whisper to correctly
+    identify singing passages (e.g., "Tomas del miedo tu don") within what
+    was previously a single undifferentiated uh block.
+
+    Entry conditions for processing a segment:
+      - _is_adlib_loop(text) is True (lazy import from post_reconcile)
+      - no "words" key (already-aligned segments skip this step)
+      - duration >= _ADLIB_MIN_DUR
+      - ADLIB_VAD_RETRANSCRIBE_ENABLED env var is not "0" / falsy
+
+    Fallback chain (defense in depth):
+      1. VAD returns ≥2 regions AND ALL retranscriptions succeed → new segs
+      2. Any failure → keep original segment; post_reconcile._split_adlib_by_time
+         (PR #707 equal-time split) still handles it downstream.
+    """
+    _enabled = os.environ.get(
+        "ADLIB_VAD_RETRANSCRIBE_ENABLED", "1"
+    ).strip().lower() in _TRUE
+
+    if not _enabled or not audio_path or not os.path.exists(audio_path):
+        return segs
+
+    try:
+        from post_reconcile import _is_adlib_loop  # safe: post_reconcile doesn't import us
+    except ImportError:
+        logger.warning("[ADLIB-VAD] could not import _is_adlib_loop; skipping")
+        return segs
+
+    out: list[dict] = []
+    idx = 0
+    while idx < len(segs):
+        seg = segs[idx]
+        text = (seg.get("text") or "").strip()
+        try:
+            seg_start = float(seg["start"])
+            seg_end = float(seg["end"])
+        except (KeyError, TypeError, ValueError):
+            out.append(seg)
+            idx += 1
+            continue
+        dur = seg_end - seg_start
+
+        # Don't skip segments that have word stamps — forced alignment succeeds
+        # on "uh" tokens but still produces one mega-block that needs VAD split.
+        if not (dur >= _ADLIB_MIN_DUR and _is_adlib_loop(text)):
+            out.append(seg)
+            idx += 1
+            continue
+
+        # Fixed lookahead: extend VAD window past seg_end so we can detect
+        # displaced singing segments. n_consumed is determined AFTER VAD runs,
+        # based on the last voice region found — segments after that point keep
+        # their whisperX timestamps and are left untouched.
+        n_consumed = 1
+        process_end = seg_end + _ADLIB_LOOKAHEAD_S
+
+        logger.info(
+            "[ADLIB-VAD] candidate: %.1f-%.1fs (%.1fs, lookahead→%.1fs) %r…",
+            seg_start, seg_end, seg_end - seg_start, process_end, text[:40],
+        )
+        regions = _detect_adlib_voice_regions(audio_path, seg_start, process_end)
+        if len(regions) < 2:
+            logger.info(
+                "[ADLIB-VAD] VAD found %d region(s) → fallback to equal-time split",
+                len(regions),
+            )
+            out.append(seg)
+            idx += 1
+            continue
+
+        # Dynamic n_consumed: absorb whisperX segments whose start times fall
+        # within the last detected VAD region. Those segments have displaced
+        # timing due to the adlib block and will be replaced by retranscription.
+        # Segments starting at or after last_region_end keep correct timing.
+        last_region_end = regions[-1][1]
+        _ci = idx + 1
+        while _ci < len(segs):
+            ns = segs[_ci]
+            try:
+                ns_start = float(ns["start"])
+                ns_text_raw = (ns.get("text") or "").strip()
+            except (KeyError, TypeError, ValueError):
+                break
+            if ns_start >= last_region_end or _is_adlib_loop(ns_text_raw):
+                break
+            n_consumed += 1
+            logger.info(
+                "[ADLIB-VAD] consuming displaced segment %r at %.1fs (< last region %.1fs)",
+                ns_text_raw[:40], ns_start, last_region_end,
+            )
+            _ci += 1
+
+        logger.info("[ADLIB-VAD] %d regions detected; re-transcribing each", len(regions))
+        sub_segs: list[list[dict]] = []
+        all_ok = True
+        for r_start, r_end in regions:
+            result = _retranscribe_slice(audio_path, r_start, r_end, language)
+            if result is None:
+                logger.warning(
+                    "[ADLIB-VAD] retranscribe failed for %.1f-%.1fs — keeping original",
+                    r_start, r_end,
+                )
+                all_ok = False
+                break
+            sub_segs.append(result)
+
+        if not all_ok or not sub_segs:
+            for k in range(n_consumed):
+                out.append(segs[idx + k])
+            idx += n_consumed
+            continue
+
+        flat = sorted(
+            [s for region_segs in sub_segs for s in region_segs],
+            key=lambda s: s.get("start", 0),
+        )
+        if not flat:
+            for k in range(n_consumed):
+                out.append(segs[idx + k])
+            idx += n_consumed
+            continue
+
+        logger.info(
+            "[ADLIB-VAD] replaced %.1f-%.1fs (%d orig seg(s)) with %d sub-segment(s): %s",
+            seg_start, process_end, n_consumed, len(flat),
+            ", ".join(f"{s['start']:.1f}-{s['end']:.1f}s" for s in flat[:6]),
+        )
+        out.extend(flat)
+        idx += n_consumed
+
+    return out
+
+
+# ── Post-reconcile large-gap cluster correction ───────────────────────
+# Fixes displaced timing in the reconciled output BEFORE post_reconcile's
+# stretch-trim fills the gaps. Root cause: whisperX doesn't produce adlib
+# segments for some songs ("No Hay Santos"), so _vad_split_adlib_segments
+# never fires. The reconciler maps canonical text to whisperX's (wrong)
+# timestamps. We detect the large gap in the reconciled output, find the
+# true voice onset via VAD + retranscription, and shift the cluster.
+_LARGE_GAP_CLUSTER_GAP_THRESH: float = 12.0  # gap (prev.end → seg.start) to trigger
+_LARGE_GAP_CLUSTER_SPAN_S: float = 8.0       # max start-to-start span to extend cluster
+_LARGE_GAP_CLUSTER_LOOKAHEAD_S: float = 20.0  # window past cluster_last_start for VAD
+_LARGE_GAP_CLUSTER_MIN_SHIFT: float = 1.5    # don't correct unless onset is >1.5s later
+
+
+def _correct_large_gap_cluster(
+    segs: list[dict],
+    audio_path: str,
+    language: str | None = None,
+) -> list[dict]:
+    """Correct timing of lyric segments displaced after an invisible adlib block.
+
+    Runs on the RECONCILED output (before post_reconcile stretch-trim).
+    When the reconciled list has a gap > _LARGE_GAP_CLUSTER_GAP_THRESH from
+    prev.end to seg.start, uses VAD + per-region retranscription to find the
+    real voice onsets. Adlib regions (uh/uoh) are filtered; remaining lyric
+    regions are assigned to the cluster segments in order.
+
+    Safety checks:
+      - Only fires if the first lyric region onset is >_LARGE_GAP_CLUSTER_MIN_SHIFT
+        later than the cluster's current start (already-correct clusters skip).
+      - If retranscription fails for any region the cluster is left untouched.
+      - Gated by LARGE_GAP_CLUSTER_FIX_ENABLED (default "1").
+
+    Example — "No Hay Santos" (Amanda Pujó):
+      Reconciler gives "Tomas del miedo" at 95.8s (true onset: 102.02s) and
+      "Frágil espejo" at 98.8s (true onset: 110.17s) because whisperX jumps
+      from "para qué" (68s) to the post-adlib lyric without seeing the uh
+      blocks. This function shifts both segments to the VAD-detected onsets.
+    """
+    _enabled = os.environ.get(
+        "LARGE_GAP_CLUSTER_FIX_ENABLED", "1"
+    ).strip().lower() in _TRUE
+    if not _enabled or not audio_path or not os.path.exists(audio_path):
+        return segs
+
+    try:
+        from post_reconcile import _is_adlib_loop
+    except ImportError:
+        logger.warning("[GAP-CLUSTER] could not import _is_adlib_loop; skipping")
+        return segs
+
+    out = list(segs)
+    i = 1
+    while i < len(out):
+        try:
+            prev_end = float(out[i - 1].get("end", 0))
+            seg_start = float(out[i].get("start", 0))
+        except (TypeError, ValueError):
+            i += 1
+            continue
+
+        gap = seg_start - prev_end
+        if gap <= _LARGE_GAP_CLUSTER_GAP_THRESH:
+            i += 1
+            continue
+
+        # Build the cluster: consecutive segments with small start-to-start span.
+        cluster: list[int] = [i]
+        j = i + 1
+        while j < len(out):
+            try:
+                prev_s = float(out[j - 1].get("start", 0))
+                curr_s = float(out[j].get("start", 0))
+            except (TypeError, ValueError):
+                break
+            if curr_s - prev_s > _LARGE_GAP_CLUSTER_SPAN_S:
+                break
+            cluster.append(j)
+            j += 1
+
+        try:
+            c_last_start = float(out[cluster[-1]].get("start", 0))
+        except (TypeError, ValueError):
+            i = j
+            continue
+
+        # VAD window: prev_end → min(c_last_start + lookahead, next_seg.start - 2s)
+        if j < len(out):
+            try:
+                next_start = float(out[j].get("start", 0))
+                vad_end = min(c_last_start + _LARGE_GAP_CLUSTER_LOOKAHEAD_S,
+                              next_start - 2.0)
+            except (TypeError, ValueError):
+                vad_end = c_last_start + _LARGE_GAP_CLUSTER_LOOKAHEAD_S
+        else:
+            vad_end = c_last_start + _LARGE_GAP_CLUSTER_LOOKAHEAD_S
+
+        vad_start = prev_end
+        if vad_end <= vad_start + 3.0:
+            i = j
+            continue
+
+        logger.info(
+            "[GAP-CLUSTER] gap %.1fs before %r at %.1fs — VAD %.1f-%.1fs (cluster=%d segs)",
+            gap, (out[i].get("text") or "")[:25], seg_start,
+            vad_start, vad_end, len(cluster),
+        )
+
+        regions = _detect_adlib_voice_regions(audio_path, vad_start, vad_end)
+        if len(regions) <= 1 and (not regions or regions[0] == (vad_start, vad_end)):
+            logger.info("[GAP-CLUSTER] VAD found no sub-regions; skipping cluster")
+            i = j
+            continue
+
+        # Retranscribe each region; filter adlib loops.
+        lyric_regions: list[tuple[float, float]] = []
+        retrans_ok = True
+        for r_start, r_end in regions:
+            sub = _retranscribe_slice(audio_path, r_start, r_end, language)
+            if sub is None:
+                logger.info(
+                    "[GAP-CLUSTER] retranscribe %.1f-%.1fs failed; aborting cluster",
+                    r_start, r_end,
+                )
+                retrans_ok = False
+                break
+            combined = " ".join((s.get("text") or "").strip() for s in sub).strip()
+            if _is_adlib_loop(combined):
+                logger.info(
+                    "[GAP-CLUSTER] skip adlib region %.1f-%.1fs: %r",
+                    r_start, r_end, combined[:30],
+                )
+                continue
+            lyric_regions.append((r_start, r_end))
+
+        if not retrans_ok:
+            i = j
+            continue
+
+        if len(lyric_regions) < len(cluster):
+            logger.info(
+                "[GAP-CLUSTER] only %d lyric region(s) for %d cluster seg(s); skipping",
+                len(lyric_regions), len(cluster),
+            )
+            i = j
+            continue
+
+        # Safety: only correct if the first lyric onset is meaningfully later
+        # than the cluster's current start. Prevents double-correction when the
+        # cluster is already in the right position (e.g. the second couplet).
+        try:
+            c_start = float(out[cluster[0]].get("start", 0))
+        except (TypeError, ValueError):
+            i = j
+            continue
+
+        if lyric_regions[0][0] <= c_start + _LARGE_GAP_CLUSTER_MIN_SHIFT:
+            logger.info(
+                "[GAP-CLUSTER] cluster at %.1fs already correct (first lyric onset %.1fs); skipping",
+                c_start, lyric_regions[0][0],
+            )
+            i = j
+            continue
+
+        # Apply: assign each lyric region to the corresponding cluster segment.
+        for k, ci in enumerate(cluster):
+            r_start, r_end = lyric_regions[k]
+            old_start = float(out[ci].get("start", 0))
+            old_end = float(out[ci].get("end", 0))
+            old_dur = max(old_end - old_start, 1.5)
+            out[ci] = {
+                **out[ci],
+                "start": round(r_start, 3),
+                "end": round(r_end, 3),
+            }
+            logger.info(
+                "[GAP-CLUSTER] corrected %r %.1fs→%.1fs (+%.1fs)",
+                (out[ci].get("text") or "")[:30],
+                old_start, r_start, r_start - old_start,
+            )
+
+        i = j
+
+    return out
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -72,7 +648,11 @@ def _compute_cache_key(audio_path: str, language: str | None, lyrics_hint: str |
     hint = (lyrics_hint or "").strip()
     hint_hash = hashlib.sha1(hint.encode("utf-8")).hexdigest()[:16] if hint else ""
     lang = (language or "").lower()
-    key = f"wx:{audio_hash}:{lang}:{hint_hash}"
+    # WHISPERX_CACHE_VERSION lets ops invalidate all cached results by bumping
+    # this env var (e.g. "2") without touching the DB. Default "1" preserves
+    # all pre-existing rows so changing it is a deliberate opt-in bust.
+    ver = os.environ.get("WHISPERX_CACHE_VERSION", "1").strip() or "1"
+    key = f"wx:{audio_hash}:{lang}:{hint_hash}:{ver}"
     return (key, audio_hash, hint_hash)
 
 
@@ -475,8 +1055,21 @@ def transcribe_whisperx(audio_path: str, language: str | None = None,
 
     segs = _map_segments(output)
     raw_n = len(segs)
+    segs = _vad_split_adlib_segments(segs, audio_path, language)
+    segs = _correct_post_adlib_timing(segs, audio_path)
     segs = _filter_ghosts(segs)
     segs = _split_long_segments(segs)
+    # Acoustic similarity correction: replace low-confidence ASR hallucinations
+    # with text from acoustically similar high-confidence segments (chorus repeats,
+    # bridge variations). Runs AFTER _split_long_segments so long merged segments
+    # (e.g. "Tomas del miedo tu don, frágil espejo de voz.") are already split
+    # into individual lines before we compare — otherwise the anchor text would
+    # be the combined phrase, producing wrong replacements.
+    try:
+        from acoustic_match import correct_by_acoustic_similarity
+        segs = correct_by_acoustic_similarity(segs, audio_path)
+    except Exception as _am_err:
+        logger.warning("[ACOUSTIC] correction skipped: %s", _am_err)
     segs = _apply_lead_in(segs)
     if len(segs) < 2:
         logger.warning("[WHISPERX] thin/empty result (%s raw -> %s usable) — falling back",

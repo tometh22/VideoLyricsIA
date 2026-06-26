@@ -523,10 +523,19 @@ def condense_repeated_skips(segments: list[dict]) -> list[dict]:
             for x in run:
                 xn = n(x.get("text"))
                 if len(xn) > 8:
-                    for cn, ct in canon.items():
-                        if xn == cn or _SM(None, xn, cn).ratio() >= 0.85:
-                            x["text"] = ct
-                            break
+                    # DESAMBIGUACIÓN (GT Rotor: el tema tiene DOS frases de
+                    # coro 87% similares — "nada fue un error" y "nada de
+                    # esto fue un error" — y el primer-match las confundía
+                    # homogeneizando el bloque). Solo canonizar con el MEJOR
+                    # match y margen claro sobre el segundo.
+                    scored = sorted(((_SM(None, xn, cn).ratio(), ct)
+                                     for cn, ct in canon.items()),
+                                    reverse=True)
+                    if scored and scored[0][0] >= 0.85 and (
+                            len(scored) < 2
+                            or scored[0][0] - scored[1][0] >= 0.06
+                            or scored[0][0] >= 0.97):
+                        x["text"] = scored[0][1]
             start_t = min(x["start"] for x in run)
             nxt = segments[j]["start"] if j < len(segments) else None
             end_t = max(x["end"] for x in run)

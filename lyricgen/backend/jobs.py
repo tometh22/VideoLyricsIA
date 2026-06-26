@@ -674,6 +674,8 @@ def update_job(job_id: str, **kwargs) -> None:
                         job.thumbnail_url = value["thumbnail_url"]
             elif key == "youtube":
                 job.youtube_data = value
+            elif key == "youtube_short":
+                job.youtube_short_data = value
             elif hasattr(job, key):
                 setattr(job, key, value)
 

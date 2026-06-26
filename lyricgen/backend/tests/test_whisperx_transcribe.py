@@ -272,3 +272,516 @@ def test_transcribe_maps_on_success(monkeypatch, tmp_path):
     _fake_replicate(monkeypatch, run=MagicMock(return_value=out))
     segs = wx.transcribe_whisperx(str(f), language="es")
     assert [s["text"] for s in segs] == ["uno", "dos"]
+
+
+# ──────────────────────────────────────────────────────────────────────
+# VAD-first ad-lib splitting (PR #708)
+# ──────────────────────────────────────────────────────────────────────
+
+def _make_seg(text, start, end, words=None):
+    s = {"start": start, "end": end, "text": text}
+    if words is not None:
+        s["words"] = words
+    return s
+
+
+def test_vad_split_adlib_splits_on_silence(monkeypatch, tmp_path):
+    """Happy path: VAD finds 3 regions → all re-transcriptions succeed → 3 sub-segments.
+
+    The normal segment starts 3s after the last VAD region ends (104s > last_region_end=101s),
+    so n_consumed stays at 1 and the normal segment passes through unchanged.
+    """
+    f = tmp_path / "vocals.wav"
+    f.write_bytes(b"RIFF\x00\x00\x00\x00WAVE" + b"\x00" * 256)
+    audio_path = str(f)
+
+    monkeypatch.setattr(wx, "_detect_adlib_voice_regions",
+                        lambda *a, **k: [(73.0, 84.0), (84.5, 92.5), (93.0, 101.0)])
+
+    def _fake_retranscribe(audio_path, start_s, end_s, language=None):
+        return [{"start": start_s + 0.1, "end": end_s - 0.1, "text": "uh uh uh"}]
+
+    monkeypatch.setattr(wx, "_retranscribe_slice", _fake_retranscribe)
+    monkeypatch.setenv("ADLIB_VAD_RETRANSCRIBE_ENABLED", "1")
+
+    mega = _make_seg("uh uh uh uh uh uh uh uh uh uh", 69.0, 101.0)
+    # 3s gap → outside _ADLIB_NEXT_MERGE_GAP_S (2s) → no lookforward
+    normal = _make_seg("Tomas del miedo tu don", 104.0, 109.0)
+    out = wx._vad_split_adlib_segments([mega, normal], audio_path, language="es")
+
+    assert len(out) == 4, f"expected 3 sub-segs + 1 normal = 4, got {len(out)}: {out}"
+    assert out[0]["start"] >= 73.0
+    assert out[-1]["text"] == "Tomas del miedo tu don"
+
+
+def test_vad_split_extends_window_for_mislabeled_tail(monkeypatch, tmp_path):
+    """Fixed lookahead recovers 'Tomas del miedo' from a single displaced segment.
+
+    whisperX places the adlib at 69.4-95.2s and puts "Tomas del miedo tu don"
+    at 95.2-110.2s (wrong timing). VAD window = 69.4 + 20s = 89.2... wait,
+    process_end = seg_end + 20 = 115.2s. VAD finds the real singing at 102s.
+    last_region_end=107s; mislabeled starts at 95.2 < 107 → n_consumed=2.
+    Retranscription of all 4 regions gives correct timing.
+    """
+    import pytest
+    f = tmp_path / "vocals.wav"
+    f.write_bytes(b"RIFF\x00\x00\x00\x00WAVE" + b"\x00" * 256)
+    audio_path = str(f)
+
+    # Window 69.4-115.2s → VAD finds 3 uh clusters + 1 real lyric region at 102s
+    monkeypatch.setattr(
+        wx, "_detect_adlib_voice_regions",
+        lambda *a, **k: [(73.0, 84.0), (84.5, 92.5), (93.0, 101.0), (102.0, 107.0)],
+    )
+
+    def _fake_retranscribe(audio_path, start_s, end_s, language=None):
+        if start_s >= 102.0:
+            return [{"start": 102.3, "end": 105.1, "text": "Tomas del miedo tu don"}]
+        return [{"start": start_s + 0.1, "end": end_s - 0.1, "text": "uh uh uh"}]
+
+    monkeypatch.setattr(wx, "_retranscribe_slice", _fake_retranscribe)
+    monkeypatch.setenv("ADLIB_VAD_RETRANSCRIBE_ENABLED", "1")
+
+    mega = _make_seg("uh uh uh uh uh uh uh uh uh uh", 69.4, 95.2)
+    # last_region_end=107 > 95.2 → mislabeled is consumed (n_consumed=2)
+    mislabeled = _make_seg("Tomas del miedo tu don", 95.2, 110.2)
+    out = wx._vad_split_adlib_segments([mega, mislabeled], audio_path, language="es")
+
+    # Both original segs consumed; replaced by 3 uh + 1 lyric
+    assert len(out) == 4, f"expected 4 sub-segs, got {len(out)}: {out}"
+    lyric_seg = next((s for s in out if "Tomas" in s.get("text", "")), None)
+    assert lyric_seg is not None, "Lyric segment must appear in output"
+    assert lyric_seg["start"] == pytest.approx(102.3, abs=0.01), (
+        f"Expected ~102.3s, got {lyric_seg['start']:.1f}s — lookahead fix failed"
+    )
+    assert lyric_seg["start"] > 100.0, "Timing must be past the adlib, not at 95s"
+
+
+def test_vad_split_consumes_multiple_displaced_segments(monkeypatch, tmp_path):
+    """No Hay Santos root-cause: TWO misplaced segments follow the adlib block.
+
+    whisperX output:
+      - adlib mega-block: 65.0-95.8s
+      - wrong "Tomas del miedo": 95.8-98.7s  (should be 102s)
+      - wrong "Frágil espejo":   98.8-104.0s (should be 110s)
+      - CORRECT "Tomas del miedo 2nd": 118.2s (large gap → must NOT be consumed)
+
+    Old logic (ns_end extension): only consumed 1 extra segment (to 98.7s),
+    leaving "Tomas del miedo" at 102s outside the VAD window → timing bug.
+
+    New logic (dynamic n_consumed via last_region_end=107):
+      - 95.8s < 107 → consumed
+      - 98.8s < 107 → consumed
+      - 118.2s >= 107 → stop, n_consumed=3
+    Retranscription of 4 VAD regions gives "Tomas del miedo" at ~102.3s.
+    """
+    import pytest
+    f = tmp_path / "vocals.wav"
+    f.write_bytes(b"RIFF\x00\x00\x00\x00WAVE" + b"\x00" * 256)
+    audio_path = str(f)
+
+    monkeypatch.setattr(
+        wx, "_detect_adlib_voice_regions",
+        lambda *a, **k: [(73.0, 84.0), (84.5, 92.5), (93.0, 101.0), (102.0, 107.0)],
+    )
+
+    def _fake_retranscribe(audio_path, start_s, end_s, language=None):
+        if start_s >= 102.0:
+            return [{"start": 102.3, "end": 105.1, "text": "Tomas del miedo tu don"}]
+        return [{"start": start_s + 0.1, "end": end_s - 0.1, "text": "uh uh uh"}]
+
+    monkeypatch.setattr(wx, "_retranscribe_slice", _fake_retranscribe)
+    monkeypatch.setenv("ADLIB_VAD_RETRANSCRIBE_ENABLED", "1")
+
+    adlib = _make_seg("uh uh uh uh uh uh uh uh uh uh", 65.0, 95.8)
+    wrong_tomas = _make_seg("Tomas del miedo tu don", 95.8, 98.7)
+    wrong_fragil = _make_seg("Frágil espejo de vos", 98.8, 104.0)
+    correct_tomas2 = _make_seg("Tomas del miedo tu don", 118.2, 124.5)
+
+    out = wx._vad_split_adlib_segments(
+        [adlib, wrong_tomas, wrong_fragil, correct_tomas2], audio_path, language="es"
+    )
+
+    # adlib + wrong_tomas + wrong_fragil consumed → replaced by 3 uh + lyric at 102s
+    # correct_tomas2 NOT consumed → passes through unchanged
+    assert len(out) == 5, f"expected 4 retranscribed + 1 unchanged = 5, got {len(out)}: {out}"
+
+    lyric_seg = next((s for s in out if "Tomas" in s.get("text", "") and s["start"] < 110), None)
+    assert lyric_seg is not None, "Retranscribed 'Tomas del miedo' must appear"
+    assert lyric_seg["start"] == pytest.approx(102.3, abs=0.01), (
+        f"Expected 102.3s (correct timing), got {lyric_seg['start']:.1f}s"
+    )
+
+    unchanged = out[-1]
+    assert unchanged["text"] == "Tomas del miedo tu don"
+    assert unchanged["start"] == pytest.approx(118.2, abs=0.01), (
+        f"Second 'Tomas del miedo' must be unchanged at 118.2s, got {unchanged['start']:.1f}s"
+    )
+
+
+def test_vad_split_falls_back_when_single_region(monkeypatch, tmp_path):
+    """VAD finds only 1 region (no clear silences) → original segment unchanged."""
+    f = tmp_path / "vocals.wav"
+    f.write_bytes(b"RIFF\x00\x00\x00\x00WAVE" + b"\x00" * 256)
+    audio_path = str(f)
+
+    monkeypatch.setattr(wx, "_detect_adlib_voice_regions",
+                        lambda *a, **k: [(69.0, 101.0)])
+    monkeypatch.setenv("ADLIB_VAD_RETRANSCRIBE_ENABLED", "1")
+
+    mega = _make_seg("uh uh uh uh uh uh uh uh uh uh", 69.0, 101.0)
+    out = wx._vad_split_adlib_segments([mega], audio_path)
+    assert len(out) == 1
+    assert out[0] is mega
+
+
+def test_vad_split_falls_back_when_retranscribe_fails(monkeypatch, tmp_path):
+    """If ANY region retranscription returns None, entire original segment is kept."""
+    f = tmp_path / "vocals.wav"
+    f.write_bytes(b"RIFF\x00\x00\x00\x00WAVE" + b"\x00" * 256)
+    audio_path = str(f)
+
+    monkeypatch.setattr(wx, "_detect_adlib_voice_regions",
+                        lambda *a, **k: [(73.0, 84.0), (84.5, 92.5)])
+
+    call_count = {"n": 0}
+
+    def _partial_fail(audio_path, start_s, end_s, language=None):
+        call_count["n"] += 1
+        if call_count["n"] > 1:
+            return None
+        return [{"start": start_s + 0.1, "end": end_s - 0.1, "text": "uh uh uh"}]
+
+    monkeypatch.setattr(wx, "_retranscribe_slice", _partial_fail)
+    monkeypatch.setenv("ADLIB_VAD_RETRANSCRIBE_ENABLED", "1")
+
+    mega = _make_seg("uh uh uh uh uh uh uh uh uh uh", 69.0, 101.0)
+    out = wx._vad_split_adlib_segments([mega], audio_path)
+    assert len(out) == 1
+    assert out[0] is mega
+
+
+def test_vad_split_noop_when_disabled(monkeypatch, tmp_path):
+    """ADLIB_VAD_RETRANSCRIBE_ENABLED=0 must be a complete no-op."""
+    f = tmp_path / "vocals.wav"
+    f.write_bytes(b"RIFF\x00\x00\x00\x00WAVE" + b"\x00" * 256)
+    audio_path = str(f)
+
+    monkeypatch.setenv("ADLIB_VAD_RETRANSCRIBE_ENABLED", "0")
+    mega = _make_seg("uh uh uh uh uh uh uh uh uh uh", 69.0, 101.0)
+    out = wx._vad_split_adlib_segments([mega], audio_path)
+    assert out == [mega]
+
+
+def test_vad_split_skips_segment_with_words(monkeypatch, tmp_path):
+    """VAD runs on adlib segments even when word stamps are present.
+
+    whisperX force-alignment always populates word stamps — including on
+    hallucinated adlib text — so `not words` was a broken guard (PR #710
+    removed it). VAD still runs; when retranscription fails the original
+    segment is kept as fallback.
+    """
+    f = tmp_path / "vocals.wav"
+    f.write_bytes(b"RIFF\x00\x00\x00\x00WAVE" + b"\x00" * 256)
+    audio_path = str(f)
+
+    vad_called = {"n": 0}
+
+    def _counting_vad(*a, **k):
+        vad_called["n"] += 1
+        return [(73.0, 84.0), (84.5, 92.5)]
+
+    monkeypatch.setattr(wx, "_detect_adlib_voice_regions", _counting_vad)
+    monkeypatch.setattr(wx, "_retranscribe_slice", lambda *a, **k: None)  # simulate failure
+    monkeypatch.setenv("ADLIB_VAD_RETRANSCRIBE_ENABLED", "1")
+
+    words = [{"word": "uh", "start": 69.0 + i * 2, "end": 70.0 + i * 2} for i in range(8)]
+    seg_with_words = _make_seg("uh uh uh uh uh uh uh uh", 69.0, 101.0, words)
+    out = wx._vad_split_adlib_segments([seg_with_words], audio_path)
+    assert out == [seg_with_words]   # fallback: original kept when retranscription fails
+    assert vad_called["n"] == 1, "VAD must run on adlib segments even with word stamps"
+
+
+# ── _correct_post_adlib_timing ───────────────────────────────────────────────
+
+def test_correct_post_adlib_timing_shifts_tail(monkeypatch, tmp_path):
+    """No Hay Santos regression: 'Tomas del miedo' 7s too early → shifted to true onset.
+
+    The adlib block ends at 95.2s. whisperX places 'Tomas del miedo' at 95.2s
+    (0s gap), but uh sounds continue until ~102s. VAD finds two intervals:
+    [95.2-101.0] (uh sounds) and [102.0-106.0] (actual lyric). Largest gap
+    (1s) precedes the 102s interval → 'Tomas del miedo' shifts to 102.0s.
+    """
+    import numpy as np
+
+    f = tmp_path / "vocals.wav"
+    f.write_bytes(b"RIFF\x00\x00\x00\x00WAVE" + b"\x00" * 256)
+    audio_path = str(f)
+
+    # VAD returns two intervals (in sample space for a 16000 sr signal):
+    # [95.2+0, 95.2+5.8s] = uh sounds; [95.2+6.8s, 95.2+10.8s] = lyric
+    def _fake_vad(path, offset, duration):
+        sr = 16000
+        return np.array([
+            [0,              int(5.8 * sr)],   # uh cluster
+            [int(6.8 * sr),  int(10.8 * sr)],  # lyric onset
+        ])
+
+    import librosa as _lib_real
+    monkeypatch.setattr(_lib_real.effects, "split", lambda y, top_db: _fake_vad(None, None, None))
+    monkeypatch.setattr(_lib_real, "load", lambda *a, **k: (None, 16000))
+
+    adlib = _make_seg("uh uh uh uh uh uh", 69.4, 95.2)
+    lyric = _make_seg("Tomas del miedo tu don", 95.2, 100.0)
+    out = wx._correct_post_adlib_timing([adlib, lyric], audio_path)
+
+    assert out[0] == adlib
+    corrected = out[1]
+    assert abs(corrected["start"] - (95.2 + 6.8)) < 0.1, (
+        f"Expected start ~102s, got {corrected['start']}"
+    )
+    assert corrected["text"] == "Tomas del miedo tu don"
+
+
+def test_correct_post_adlib_timing_noop_when_no_clear_gap(monkeypatch, tmp_path):
+    """No shift when all gaps are < 0.4s (lyric really does start right after adlib)."""
+    import numpy as np
+
+    f = tmp_path / "vocals.wav"
+    f.write_bytes(b"RIFF\x00\x00\x00\x00WAVE" + b"\x00" * 256)
+    audio_path = str(f)
+
+    # Single interval: no gap found → returns None → no shift
+    def _fake_vad(y, top_db):
+        sr = 16000
+        return np.array([[0, int(4.0 * sr)]])
+
+    import librosa as _lib_real
+    monkeypatch.setattr(_lib_real.effects, "split", lambda y, top_db: _fake_vad(y, top_db))
+    monkeypatch.setattr(_lib_real, "load", lambda *a, **k: (None, 16000))
+
+    adlib = _make_seg("uh uh uh uh", 69.4, 95.2)
+    lyric = _make_seg("Tomas del miedo tu don", 95.2, 99.0)
+    out = wx._correct_post_adlib_timing([adlib, lyric], audio_path)
+
+    assert out[1]["start"] == 95.2  # unchanged
+
+
+def test_correct_post_adlib_timing_skips_large_gap_between_segs(monkeypatch, tmp_path):
+    """No shift when next segment starts >2s after adlib block (already correct gap)."""
+    f = tmp_path / "vocals.wav"
+    f.write_bytes(b"RIFF\x00\x00\x00\x00WAVE" + b"\x00" * 256)
+    audio_path = str(f)
+
+    called = {"n": 0}
+
+    def _counting_load(*a, **k):
+        called["n"] += 1
+        return (None, 16000)
+
+    import librosa as _lib_real
+    monkeypatch.setattr(_lib_real, "load", _counting_load)
+
+    adlib = _make_seg("uh uh uh uh", 69.4, 95.2)
+    lyric = _make_seg("Tomas del miedo tu don", 98.0, 103.0)  # 2.8s gap → skip
+    out = wx._correct_post_adlib_timing([adlib, lyric], audio_path)
+
+    assert called["n"] == 0, "Should not call librosa when gap > 2s"
+    assert out[1]["start"] == 98.0
+
+
+def test_correct_post_adlib_timing_never_changes_text(monkeypatch, tmp_path):
+    """Text is never modified by timing correction."""
+    import numpy as np
+
+    f = tmp_path / "vocals.wav"
+    f.write_bytes(b"RIFF\x00\x00\x00\x00WAVE" + b"\x00" * 256)
+    audio_path = str(f)
+
+    def _fake_vad(y, top_db):
+        sr = 16000
+        return np.array([[0, int(5.0 * sr)], [int(7.0 * sr), int(11.0 * sr)]])
+
+    import librosa as _lib_real
+    monkeypatch.setattr(_lib_real.effects, "split", lambda y, top_db: _fake_vad(y, top_db))
+    monkeypatch.setattr(_lib_real, "load", lambda *a, **k: (None, 16000))
+
+    adlib = _make_seg("uh uh uh uh", 69.4, 95.2)
+    lyric = _make_seg("Frágil espejo de voz", 95.2, 99.0)
+    out = wx._correct_post_adlib_timing([adlib, lyric], audio_path)
+
+    assert out[1]["text"] == "Frágil espejo de voz"
+
+
+# ── _correct_large_gap_cluster tests ──────────────────────────────────
+
+
+def _patch_lgc(monkeypatch, tmp_path, *, vad_regions, retrans_map):
+    """Shared setup: real audio_path (empty file), patched VAD + retranscribe."""
+    audio_path = str(tmp_path / "audio.wav")
+    open(audio_path, "wb").close()
+
+    import librosa as _lib
+    import numpy as np
+
+    def _fake_load(*a, offset=0.0, duration=None, **kw):
+        sr = 16000
+        n = int((duration or 5.0) * sr)
+        return np.zeros(n), sr
+
+    def _fake_split(y, top_db):
+        sr = 16000
+        return np.array([[0, len(y)]])  # one region = no-split sentinel handled by detect
+
+    monkeypatch.setattr(_lib, "load", _fake_load)
+    monkeypatch.setattr(_lib.effects, "split", _fake_split)
+
+    # Patch _detect_adlib_voice_regions to return fixed regions
+    def _fake_detect(ap, seg_start, seg_end):
+        return vad_regions
+
+    monkeypatch.setattr(wx, "_detect_adlib_voice_regions", _fake_detect)
+
+    # Patch _retranscribe_slice to return from retrans_map by (start, end)
+    def _fake_retrans(ap, start_s, end_s, language=None):
+        return retrans_map.get((start_s, end_s))
+
+    monkeypatch.setattr(wx, "_retranscribe_slice", _fake_retrans)
+    return audio_path
+
+
+def test_correct_large_gap_cluster_no_hay_santos(monkeypatch, tmp_path):
+    """Root cause: two lyric segments displaced after invisible adlib block.
+
+    Reconciled output:
+      para_que: start=50.0, end=68.996
+      tomas: start=95.810 (should be 102.0)
+      fragil: start=98.800 (should be 110.0)
+      tomas_2nd: start=118.211 (already correct)
+
+    VAD finds 5 regions: 3 adlib + 2 lyric.
+    After filtering adlibs, lyric[0]=102.0 and lyric[1]=110.0.
+    lyric[0].start (102) > tomas.start (95.81) + 1.5 → correction fires.
+    """
+    vad_regions = [
+        (69.0, 84.0),   # uh block 1 → adlib
+        (85.0, 92.0),   # uh block 2 → adlib
+        (93.0, 101.0),  # uh block 3 → adlib
+        (102.0, 107.0), # "Tomas del miedo" → lyric
+        (110.0, 116.0), # "Frágil espejo" → lyric
+    ]
+    retrans_map = {
+        # Need ≥5 same tokens for _is_adlib_loop to return True
+        (69.0, 84.0):   [_make_seg("uh uh uh uh uh uh", 69.0, 84.0)],
+        (85.0, 92.0):   [_make_seg("uh uh uh uh uh", 85.0, 92.0)],
+        (93.0, 101.0):  [_make_seg("uoh uoh uoh uoh uoh uoh", 93.0, 101.0)],
+        (102.0, 107.0): [_make_seg("Tomas del miedo tu don", 102.0, 107.0)],
+        (110.0, 116.0): [_make_seg("Frágil espejo de vos", 110.0, 116.0)],
+    }
+    audio_path = _patch_lgc(monkeypatch, tmp_path, vad_regions=vad_regions, retrans_map=retrans_map)
+
+    segs = [
+        _make_seg("para qué tus santos", 50.0, 68.996),
+        _make_seg("Tomas del miedo tu don", 95.810, 98.5),   # displaced
+        _make_seg("Frágil espejo de vos", 98.800, 100.034),  # displaced
+        _make_seg("Tomas del miedo tu don", 118.211, 124.0), # correct
+    ]
+    out = wx._correct_large_gap_cluster(segs, audio_path)
+
+    assert out[1]["start"] == 102.0, f"Expected 102.0, got {out[1]['start']}"
+    assert out[1]["end"] == 107.0
+    assert out[1]["text"] == "Tomas del miedo tu don"
+    assert out[2]["start"] == 110.0, f"Expected 110.0, got {out[2]['start']}"
+    assert out[2]["end"] == 116.0
+    assert out[2]["text"] == "Frágil espejo de vos"
+    # Second pair untouched
+    assert out[3]["start"] == 118.211
+    assert out[3]["text"] == "Tomas del miedo tu don"
+
+
+def test_correct_large_gap_cluster_already_correct_skipped(monkeypatch, tmp_path):
+    """When the cluster is already in the correct position, no correction is applied.
+
+    The safety check: lyric_regions[0].start <= cluster[0].start + 1.5 → skip.
+    Models the second couplet (already at 118s) when VAD still shows lyric at 102s.
+    """
+    vad_regions = [
+        (102.0, 107.0),  # lyric (already before cluster start 118s)
+        (110.0, 116.0),  # lyric
+    ]
+    retrans_map = {
+        (102.0, 107.0): [_make_seg("Tomas del miedo tu don", 102.0, 107.0)],
+        (110.0, 116.0): [_make_seg("Frágil espejo de vos", 110.0, 116.0)],
+    }
+    audio_path = _patch_lgc(monkeypatch, tmp_path, vad_regions=vad_regions, retrans_map=retrans_map)
+
+    segs = [
+        _make_seg("para qué tus santos", 50.0, 100.0),
+        _make_seg("Tomas del miedo tu don", 118.211, 124.0),  # correct
+        _make_seg("Frágil espejo de vos", 126.43, 132.0),    # correct
+    ]
+    out = wx._correct_large_gap_cluster(segs, audio_path)
+
+    # lyric[0].start = 102 ≤ 118.211 + 1.5 = 119.711 → safety check fires, no change
+    assert out[1]["start"] == 118.211
+    assert out[2]["start"] == 126.43
+
+
+def test_correct_large_gap_cluster_small_gap_noop(monkeypatch, tmp_path):
+    """Gap < GAP_THRESH (12s) → function is a no-op."""
+    called = []
+
+    def _fake_detect(ap, seg_start, seg_end):
+        called.append(True)
+        return [(seg_start, seg_end)]
+
+    monkeypatch.setattr(wx, "_detect_adlib_voice_regions", _fake_detect)
+
+    audio_path = str(tmp_path / "a.wav")
+    open(audio_path, "wb").close()
+
+    segs = [
+        _make_seg("first", 0.0, 5.0),
+        _make_seg("second", 10.0, 15.0),  # gap = 5s < 12s
+    ]
+    out = wx._correct_large_gap_cluster(segs, audio_path)
+    assert out == segs
+    assert not called
+
+
+def test_correct_large_gap_cluster_retranscribe_fail_aborts(monkeypatch, tmp_path):
+    """If any retranscribe call returns None the cluster is left untouched."""
+    vad_regions = [
+        (70.0, 84.0),   # adlib
+        (102.0, 107.0), # lyric
+    ]
+    retrans_map = {
+        (70.0, 84.0): None,  # fails → abort
+    }
+    audio_path = _patch_lgc(monkeypatch, tmp_path, vad_regions=vad_regions, retrans_map=retrans_map)
+
+    segs = [
+        _make_seg("prev", 40.0, 55.0),
+        _make_seg("Tomas del miedo tu don", 95.0, 100.0),  # would be displaced
+    ]
+    out = wx._correct_large_gap_cluster(segs, audio_path)
+    assert out[1]["start"] == 95.0  # unchanged
+
+
+def test_correct_large_gap_cluster_disabled(monkeypatch, tmp_path):
+    """LARGE_GAP_CLUSTER_FIX_ENABLED=0 → function is a no-op."""
+    monkeypatch.setenv("LARGE_GAP_CLUSTER_FIX_ENABLED", "0")
+    called = []
+
+    def _fake_detect(*a, **kw):
+        called.append(True)
+        return []
+
+    monkeypatch.setattr(wx, "_detect_adlib_voice_regions", _fake_detect)
+    audio_path = str(tmp_path / "a.wav")
+    open(audio_path, "wb").close()
+
+    segs = [_make_seg("a", 0.0, 5.0), _make_seg("b", 30.0, 35.0)]
+    out = wx._correct_large_gap_cluster(segs, audio_path)
+    assert out == segs
+    assert not called

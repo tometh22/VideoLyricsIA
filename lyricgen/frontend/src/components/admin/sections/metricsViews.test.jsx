@@ -28,9 +28,9 @@ describe("TenantHealthCards", () => {
     render(<TenantHealthCards health={HEALTH} />);
     expect(screen.getByText("universal_argentina")).toBeInTheDocument();
     expect(screen.getByText("82")).toBeInTheDocument();
-    expect(screen.getByText(/↑ 20% WoW/)).toBeInTheDocument();
+    expect(screen.getByText(/↗ 20% WoW/)).toBeInTheDocument();
     expect(screen.getByText("30")).toBeInTheDocument();
-    expect(screen.getByText(/↓ 88% WoW/)).toBeInTheDocument();
+    expect(screen.getByText(/↘ 88% WoW/)).toBeInTheDocument();
   });
 
   it("sin tenants no renderiza nada", () => {

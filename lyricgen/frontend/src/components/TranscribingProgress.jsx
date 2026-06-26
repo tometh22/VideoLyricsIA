@@ -43,7 +43,7 @@ const STAGES = [
 // p50s; demucs alone hits 90-120 s in cold-start. Result was ETA
 // hitting 0 well before demucs finished and the user seeing "viene
 // muy lento". These numbers reflect the actual p50 wallclock.
-const STAGE_DURATIONS_S = [3, 8, 100, 75, 5];
+const STAGE_DURATIONS_S = [3, 8, 100, 150, 5];
 
 function activeStageFromState(currentStep, progress) {
   if (currentStep && STAGE_BY_BACKEND_LABEL[currentStep] != null) {
@@ -124,7 +124,7 @@ export default function TranscribingProgress({
   //                              race + lrclib lookup. >90 s suggests
   //                              cascade or non-retryable error.
   //   done          (stage 5): no hint (already finalising).
-  const STUCK_AFTER_BY_STAGE = [30, 30, 150, 90, 9999];
+  const STUCK_AFTER_BY_STAGE = [30, 30, 150, 300, 9999];
   const STUCK_AFTER_S = STUCK_AFTER_BY_STAGE[active - 1] ?? 45;
   const [displayEta, setDisplayEta] = useState(() => etaSeconds(active, progress));
   const [stuck, setStuck] = useState(false);
