@@ -5111,11 +5111,19 @@ async def _run_transcription_for_job(
                             # the gap (post_reconcile pass 3). The gap is
                             # visible here (raw reconciler end-times); after
                             # stretch-trim it closes to ~80ms.
+                            # Runs in a thread: makes blocking librosa + OpenAI
+                            # calls that would otherwise stall the event loop.
+                            logger.info(
+                                "[WC] gap-cluster: invoking on %d segs, audio=%s",
+                                len(_reconciled), _aa,
+                            )
                             try:
                                 from whisperx_transcribe import _correct_large_gap_cluster as _clgc
-                                _reconciled = _clgc(_reconciled, _aa)
+                                _reconciled = await asyncio.to_thread(
+                                    _clgc, _reconciled, _aa,
+                                )
                             except Exception as _clgc_err:
-                                logger.debug("[WC] gap-cluster correction skipped: %s", _clgc_err)
+                                logger.warning("[WC] gap-cluster FAILED: %s", _clgc_err)
                             from pipeline import _post_reconcile_cleanup as _prc
                             _reconciled = _prc(_reconciled)
                             return _emit_segments(
