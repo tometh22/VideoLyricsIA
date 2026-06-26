@@ -9,6 +9,7 @@ import { ToastProvider } from "./components/ToastProvider";
 import { HelpProvider } from "./components/HelpCenter/HelpProvider";
 import { initSentry } from "./observability";
 import { registerServiceWorker } from "./registerSW";
+import { initAutoUpdate } from "./autoUpdate";
 import "./index.css";
 
 // Sentry init runs before React mounts so the SDK is ready to catch
@@ -50,6 +51,13 @@ window.addEventListener("vite:preloadError", (event) => {
 // the safety contract. The SW never caches HTML or API responses so it
 // can't serve stale builds or leak per-user data.
 registerServiceWorker();
+
+// Auto-update on new deploy: an open SPA tab never re-fetches index.html on its
+// own and the static SW doesn't change between deploys, so a long-lived editor
+// tab stays on the old build until a manual reload. This polls for a new build
+// and reloads while the tab is backgrounded (never mid-edit; keepalive #727
+// persists unsaved work on the reload). See autoUpdate.js.
+initAutoUpdate();
 
 ReactDOM.createRoot(document.getElementById("root")).render(
   <React.StrictMode>
