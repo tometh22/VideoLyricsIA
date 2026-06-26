@@ -5,6 +5,7 @@ import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
+from sqlalchemy import or_
 from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import Session
 
@@ -299,7 +300,7 @@ def archive_failed_attempts(db: Session, *, keep_job) -> int:
 
 def supersede_sibling_drafts(
     db: Session, *, keep_job_id: str, user_id: int, tenant_id: str,
-    filename: str, window_min: int = 20,
+    filename: str, window_min: int = 20, active_within_min: int = 20,
 ) -> int:
     """Delete sibling DRAFT jobs (transcribed_pending / awaiting_upload) for
     the same user + same filename created within `window_min`, excluding
@@ -311,10 +312,22 @@ def supersede_sibling_drafts(
     removes that orphan at generate time. Time-windowed (default 20 min) so
     it never touches an INTENTIONAL re-upload of the same song hours later.
     Returns the number of rows deleted. Caller need not commit (we do).
+
+    Guard (incident 2026-06-26): NEVER supersede a sibling the operator is
+    actively editing. `last_user_activity_at` is bumped only on POST
+    /save-segments (a real lyric edit), so a recent non-null value means
+    "this is the draft they're working on" — not an accidental double-upload.
+    Deleting it left the wizard pointing at a now-missing job ("Job not
+    found.") AND threw away the in-progress edits. (The cascade fix #734 made
+    this delete actually succeed, so the previously-silent bug surfaced when
+    re-uploading the same audio.) Drafts never touched (last_user_activity_at
+    IS NULL) are still accidental dupes → still superseded.
     """
     if not filename:
         return 0
-    cutoff = datetime.now(timezone.utc) - timedelta(minutes=window_min)
+    now = datetime.now(timezone.utc)
+    cutoff = now - timedelta(minutes=window_min)
+    active_cutoff = now - timedelta(minutes=active_within_min)
     siblings = (
         db.query(Job)
         .filter(Job.user_id == user_id, Job.tenant_id == tenant_id)
@@ -322,6 +335,10 @@ def supersede_sibling_drafts(
         .filter(Job.filename == filename)
         .filter(Job.status.in_(("transcribed_pending", "awaiting_upload")))
         .filter(Job.created_at >= cutoff)
+        .filter(or_(
+            Job.last_user_activity_at.is_(None),
+            Job.last_user_activity_at < active_cutoff,
+        ))
         .all()
     )
     n = 0
