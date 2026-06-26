@@ -463,7 +463,17 @@ class Job(Base):
 
     # Relationships
     user = relationship("User", back_populates="jobs", foreign_keys=[user_id])
-    provenance = relationship("AIProvenance", back_populates="job", lazy="dynamic")
+    # cascade="all, delete-orphan": deleting a Job deletes its ai_provenance
+    # audit rows with it. Without this, SQLAlchemy's default is to NULL the FK
+    # on the children before deleting the parent — but ai_provenance.job_id is
+    # NOT NULL, so the `UPDATE ai_provenance SET job_id=NULL` raised
+    # IntegrityError, poisoned the session (PendingRollbackError → HTTP 500
+    # "Sin respuesta del servidor"), and left an undeleteable stale job that
+    # blocked re-uploading the same audio (incident 2026-06-26, Universal).
+    provenance = relationship(
+        "AIProvenance", back_populates="job", lazy="dynamic",
+        cascade="all, delete-orphan",
+    )
 
     def to_dict(self):
         return {
