@@ -5106,6 +5106,16 @@ async def _run_transcription_for_job(
                                         len([l for l in _canonical.splitlines() if l.strip()]),
                                         "lrclib" if lyrics_source == "lrclib"
                                         else (lyrics_source or "unknown"))
+                            # Correct timing of segments displaced after an
+                            # invisible adlib block BEFORE stretch-trim fills
+                            # the gap (post_reconcile pass 3). The gap is
+                            # visible here (raw reconciler end-times); after
+                            # stretch-trim it closes to ~80ms.
+                            try:
+                                from whisperx_transcribe import _correct_large_gap_cluster as _clgc
+                                _reconciled = _clgc(_reconciled, _aa)
+                            except Exception as _clgc_err:
+                                logger.debug("[WC] gap-cluster correction skipped: %s", _clgc_err)
                             from pipeline import _post_reconcile_cleanup as _prc
                             _reconciled = _prc(_reconciled)
                             return _emit_segments(
