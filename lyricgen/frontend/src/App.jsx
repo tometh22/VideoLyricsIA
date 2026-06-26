@@ -1137,6 +1137,10 @@ export default function App() {
   const [style, setStyle] = useState("auto");
   // Custom palette (hex/names, comma-sep) used when style === "custom".
   const [customColors, setCustomColors] = useState("");
+  // Add-on premium "Escenas" (multi-escena): decisión global de look para el
+  // batch, igual que `style`. El toggle sólo se muestra a usuarios elegibles
+  // (user.features.scenes); el backend re-valida has_scenes_access igual.
+  const [enableScenes, setEnableScenes] = useState(false);
 
   const [reviewQueue, setReviewQueue] = useState([]);
   const [currentReview, setCurrentReview] = useState(null);
@@ -1362,7 +1366,7 @@ export default function App() {
     // when the effect re-runs to coalesce rapid mutations.
     const snapshot = {
       files, approvedJobs, currentReview, reviewQueue, wizardStage,
-      style, customColors, delivery, backgroundId, backgroundMode,
+      style, customColors, enableScenes, delivery, backgroundId, backgroundMode,
       bgSelectMode, animateImage, inspiredByLyrics,
     };
     const schedule = typeof requestIdleCallback !== "undefined"
@@ -1377,7 +1381,7 @@ export default function App() {
     return () => cancel(id);
   }, [
     files, approvedJobs, currentReview, reviewQueue, wizardStage,
-    style, customColors, delivery, backgroundId, backgroundMode,
+    style, customColors, enableScenes, delivery, backgroundId, backgroundMode,
     bgSelectMode, animateImage, inspiredByLyrics,
     resumableWizard,
   ]);
@@ -1476,7 +1480,7 @@ export default function App() {
         // resumido no trae fondo propio (transcribed, pre-/generate), así
         // que IA es el default correcto.
         setBackgroundFile(null); setBackgroundId(null);
-        setBgSelectMode("auto"); setAnimateImage(false);
+        setBgSelectMode("auto"); setAnimateImage(false); setEnableScenes(false);
         setWizardStage("review");
         // Limpiar el query param sin agregar a history (replace).
         navigate("/new", { replace: true });
@@ -1517,6 +1521,7 @@ export default function App() {
       if (snap.topLevel) {
         if (snap.topLevel.style != null) setStyle(snap.topLevel.style);
         if (snap.topLevel.customColors != null) setCustomColors(snap.topLevel.customColors);
+        if (snap.topLevel.enableScenes != null) setEnableScenes(!!snap.topLevel.enableScenes);
         if (snap.topLevel.delivery) setDelivery(snap.topLevel.delivery);
         if (snap.topLevel.backgroundId != null) setBackgroundId(snap.topLevel.backgroundId);
         if (snap.topLevel.backgroundMode != null) setBackgroundMode(snap.topLevel.backgroundMode);
@@ -2439,6 +2444,20 @@ export default function App() {
         transcribeJobId: data.job_id || uploadJobId,
         queueIdx: idx, queue,
       });
+      // Phase B: fetch signed R2 audio URL in background so LyricsEditor
+      // can use a durable server-side URL instead of the ephemeral blob.
+      // Fire-and-forget — editor already works with the blob URL; this just
+      // upgrades it to avoid ERR_FILE_NOT_FOUND when the blob gets revoked.
+      const _newJobId = data.job_id || uploadJobId;
+      if (_newJobId) {
+        authFetch(`${API}/jobs/${_newJobId}/source-audio-url`)
+          .then((r) => r.ok ? r.json() : null)
+          .then((d) => {
+            const url = d?.url || null;
+            if (url) setCurrentReview((prev) => prev?.transcribeJobId === _newJobId ? { ...prev, audioUrl: url } : prev);
+          })
+          .catch(() => { /* blob URL still works as fallback */ });
+      }
       // Kick off background upload+transcription for songs idx+1..N-1
       // while the user is reading/editing the current song's lyrics.
       prefetchRemaining(queue, idx + 1);
@@ -2895,6 +2914,9 @@ export default function App() {
           formData.append("background_hint", jobList[i].backgroundHint.trim());
           if (jobList[i].bgVerbatim) formData.append("bg_verbatim", "true");
         }
+        // Escenas (multi-escena): el backend re-valida elegibilidad.
+        // Multi-escena sólo con fondo generado por IA (no Biblioteca/Subir).
+        if (enableScenes && bgSelectMode === "auto") formData.append("enable_scenes", "true");
         formData.append("text_case", jobList[i].textCase || "upper");
         formData.append("font_scale", String(jobList[i].fontScale || "1.0"));
         // lyric_transition + text_motion: deprecados 2026-05-23 (no se envían).
@@ -3038,6 +3060,9 @@ export default function App() {
           generateBody.append("background_hint", jobList[i].backgroundHint.trim());
           if (jobList[i].bgVerbatim) generateBody.append("bg_verbatim", "true");
         }
+        // Escenas (multi-escena): el backend re-valida elegibilidad.
+        // Multi-escena sólo con fondo generado por IA (no Biblioteca/Subir).
+        if (enableScenes && bgSelectMode === "auto") generateBody.append("enable_scenes", "true");
         generateBody.append("text_case", jobList[i].textCase || "upper");
         generateBody.append("font_scale", String(jobList[i].fontScale || "1.0"));
         // lyric_transition + text_motion: deprecados 2026-05-23 (no se envían).
@@ -3113,7 +3138,7 @@ export default function App() {
     try { prefetchAbortRef.current && prefetchAbortRef.current.abort(); } catch {}
     prefetchAbortRef.current = new AbortController();
     setFiles([]); setJobs([]); setBackgroundFile(null); setBackgroundId(null);
-    setBgSelectMode("auto"); setAnimateImage(false);
+    setBgSelectMode("auto"); setAnimateImage(false); setEnableScenes(false);
     setReviewQueue([]); setCurrentReview(null); setApprovedJobs([]);
     setTranscribing(false); setReadyToGenerate(false); setTranscribeError(null);
     // Capa B 2026-05-24: el wizard descartó todo → vuelve al upload state.
@@ -3594,6 +3619,8 @@ export default function App() {
         onStyleChange={setStyle}
         customColors={customColors}
         onCustomColorsChange={setCustomColors}
+        enableScenes={enableScenes}
+        onEnableScenesChange={setEnableScenes}
         backgroundFile={backgroundFile}
         onBackgroundFile={setBackgroundFile}
         backgroundId={backgroundId}
@@ -4050,7 +4077,7 @@ export default function App() {
                 // pero NO la selección de fondo — mismo carryover que el
                 // bug de Ana M., por otra puerta. Paridad con handleReset.
                 setBackgroundFile(null); setBackgroundId(null);
-                setBgSelectMode("auto"); setAnimateImage(false);
+                setBgSelectMode("auto"); setAnimateImage(false); setEnableScenes(false);
                 wizardPersistence.clear();
                 navigate("/new");
               }}

@@ -67,21 +67,26 @@ function Bars({ dist, total, onDrill }) {
   }
   const max = Math.max(total, 1);
   return (
-    <div className="space-y-1">
+    <div className="space-y-1.5">
       {entries.slice(0, 6).map(([value, count]) => {
+        const pct = Math.round((count / max) * 100);
         const row = (
           <>
             <span className="text-label text-gray-400 w-28 shrink-0 truncate" title={value}>
               {VALUE_LABELS[value] || value}
             </span>
-            <div className="flex-1 h-4 bg-white/[0.04] rounded overflow-hidden">
+            <div className="flex-1 h-5 bg-white/[0.03] rounded-md overflow-hidden ring-1 ring-white/[0.04]">
               <div
-                className="h-full bg-brand/60 rounded flex items-center px-1.5"
-                style={{ width: `${Math.max(4, Math.round((count / max) * 100))}%` }}
+                className="h-full rounded-md flex items-center px-1.5"
+                style={{
+                  width: `${Math.max(5, pct)}%`,
+                  background: "linear-gradient(90deg, rgba(139,92,246,0.8), rgba(139,92,246,0.4))",
+                }}
               >
-                <span className="text-label text-white tabular-nums">{count}</span>
+                <span className="text-label font-semibold text-white tabular-nums">{count}</span>
               </div>
             </div>
+            <span className="text-label text-gray-600 w-9 text-right tabular-nums shrink-0">{pct}%</span>
           </>
         );
         // Con onDrill la barra es un botón: click → quién/qué la usa.

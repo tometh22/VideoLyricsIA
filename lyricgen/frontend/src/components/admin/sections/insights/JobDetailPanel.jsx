@@ -32,11 +32,14 @@ export default function JobDetailPanel({ jobId, onClose }) {
 
   return (
     <div
-      className="fixed inset-0 z-50 bg-black/60 backdrop-blur-sm flex items-start justify-center overflow-y-auto py-10 px-4"
+      className="fixed inset-0 z-50 bg-black/50 backdrop-blur-[2px] flex justify-end"
       onClick={onClose}
     >
+      {/* Drawer lateral (rediseño world-class 2026-06-12): la ficha entra
+          desde la derecha como en Stripe/Linear, con el contexto de fondo
+          visible — chau modal flotante crudo. */}
       <div
-        className="glass-elevated rounded-card w-full max-w-2xl p-6 space-y-4"
+        className="h-full w-full max-w-xl bg-[#101016]/97 ring-1 ring-white/10 shadow-2xl p-6 space-y-4 overflow-y-auto animate-slide-in-right"
         onClick={(e) => e.stopPropagation()}
       >
         <div className="flex items-start justify-between gap-3">
