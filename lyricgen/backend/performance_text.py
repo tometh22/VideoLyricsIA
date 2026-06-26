@@ -228,21 +228,26 @@ def _one_pass(client, genai, y, sr, dur, who, win_base: int = 0):
             import soundfile as sf
             buf = _io.BytesIO()
             sf.write(buf, clip, sr, format="WAV")
-            resp = client.models.generate_content(
-                model=MODEL,
-                contents=[
-                    genai.types.Part.from_bytes(
-                        data=buf.getvalue(), mime_type="audio/wav"),
-                    genai.types.Part.from_text(
-                        text="Transcribi este fragmento."),
-                ],
-                config=genai.types.GenerateContentConfig(
-                    system_instruction=_SYS_TS.format(dur=c1 - c0, who=who),
-                    temperature=0.0,
-                    max_output_tokens=900,
-                    thinking_config=genai.types.ThinkingConfig(
-                        thinking_budget=0 if "flash" in MODEL else 128),
+            from pipeline import _call_with_timeout
+            resp = _call_with_timeout(
+                lambda: client.models.generate_content(
+                    model=MODEL,
+                    contents=[
+                        genai.types.Part.from_bytes(
+                            data=buf.getvalue(), mime_type="audio/wav"),
+                        genai.types.Part.from_text(
+                            text="Transcribi este fragmento."),
+                    ],
+                    config=genai.types.GenerateContentConfig(
+                        system_instruction=_SYS_TS.format(dur=c1 - c0, who=who),
+                        temperature=0.0,
+                        max_output_tokens=900,
+                        thinking_config=genai.types.ThinkingConfig(
+                            thinking_budget=0 if "flash" in MODEL else 128),
+                    ),
                 ),
+                45.0,
+                label=f"perf-text chunk {c0:.0f}-{c1:.0f}s",
             )
             lines = [l for l in (resp.text or "").splitlines() if l.strip()]
         except Exception as e:

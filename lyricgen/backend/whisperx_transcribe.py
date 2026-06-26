@@ -34,11 +34,13 @@ _ADLIB_VAD_TOP_DB: float = 25.0        # more sensitive than pipeline's 30-35
 _ADLIB_VAD_MERGE_GAP_S: float = 0.3   # preserve ~0.43s gaps between uh clusters
 _ADLIB_VAD_MIN_REGION_S: float = 2.0  # discard sub-2s noise blips
 _ADLIB_MIN_DUR: float = 6.0           # keep in sync with post_reconcile.ADLIB_MIN_DUR
-# When an adlib block ends and the next segment starts within this many seconds,
-# pull that segment into the VAD window too. Fixes cases where whisperX places
-# the wrong text at the adlib tail (e.g. "Tomas del miedo" at 95s when it
-# actually starts at 102s — the adlib is still running at 95s).
-_ADLIB_NEXT_MERGE_GAP_S: float = 2.0
+# Fixed lookahead past the adlib block end. whisperX often places displaced
+# lyric segments (e.g. "Tomas del miedo" at 95.8s when it actually starts at
+# 102.02s) immediately after the adlib. Extending the VAD window by this
+# amount lets us detect AND retranscribe those segments at correct timestamps.
+# n_consumed is then set dynamically based on the last VAD region found
+# (old approach: fixed ns_end which was only ~3s wide, missing the real onset).
+_ADLIB_LOOKAHEAD_S: float = 20.0
 
 # Replicate whisperX model. Override via env once a version is verified for
 # prod. NOTE: pin to a known-good version hash before enabling in production.
@@ -349,35 +351,16 @@ def _vad_split_adlib_segments(
             idx += 1
             continue
 
-        # Lookforward: if the segment immediately following this adlib block
-        # starts within _ADLIB_NEXT_MERGE_GAP_S seconds, pull it into the VAD
-        # window. whisperX sometimes identifies the adlib tail (still uh sounds)
-        # as the first lyric line (e.g. "Tomas del miedo" at 95s when it really
-        # starts at 102s). Extending the window lets VAD find the true boundary.
+        # Fixed lookahead: extend VAD window past seg_end so we can detect
+        # displaced singing segments. n_consumed is determined AFTER VAD runs,
+        # based on the last voice region found — segments after that point keep
+        # their whisperX timestamps and are left untouched.
         n_consumed = 1
-        process_end = seg_end
-        next_seg = segs[idx + 1] if idx + 1 < len(segs) else None
-        if next_seg is not None:
-            try:
-                ns_start = float(next_seg["start"])
-                ns_end = float(next_seg["end"])
-                ns_text = (next_seg.get("text") or "").strip()
-            except (KeyError, TypeError, ValueError):
-                ns_start = seg_end + 999
-                ns_end = ns_start
-                ns_text = ""
-            if (ns_start - seg_end <= _ADLIB_NEXT_MERGE_GAP_S
-                    and not _is_adlib_loop(ns_text)):
-                process_end = ns_end
-                n_consumed = 2
-                logger.info(
-                    "[ADLIB-VAD] extending window to %.1fs to include %r",
-                    process_end, ns_text[:40],
-                )
+        process_end = seg_end + _ADLIB_LOOKAHEAD_S
 
         logger.info(
-            "[ADLIB-VAD] candidate: %.1f-%.1fs (%.1fs) %r…",
-            seg_start, process_end, process_end - seg_start, text[:40],
+            "[ADLIB-VAD] candidate: %.1f-%.1fs (%.1fs, lookahead→%.1fs) %r…",
+            seg_start, seg_end, seg_end - seg_start, process_end, text[:40],
         )
         regions = _detect_adlib_voice_regions(audio_path, seg_start, process_end)
         if len(regions) < 2:
@@ -385,10 +368,31 @@ def _vad_split_adlib_segments(
                 "[ADLIB-VAD] VAD found %d region(s) → fallback to equal-time split",
                 len(regions),
             )
-            for k in range(n_consumed):
-                out.append(segs[idx + k])
-            idx += n_consumed
+            out.append(seg)
+            idx += 1
             continue
+
+        # Dynamic n_consumed: absorb whisperX segments whose start times fall
+        # within the last detected VAD region. Those segments have displaced
+        # timing due to the adlib block and will be replaced by retranscription.
+        # Segments starting at or after last_region_end keep correct timing.
+        last_region_end = regions[-1][1]
+        _ci = idx + 1
+        while _ci < len(segs):
+            ns = segs[_ci]
+            try:
+                ns_start = float(ns["start"])
+                ns_text_raw = (ns.get("text") or "").strip()
+            except (KeyError, TypeError, ValueError):
+                break
+            if ns_start >= last_region_end or _is_adlib_loop(ns_text_raw):
+                break
+            n_consumed += 1
+            logger.info(
+                "[ADLIB-VAD] consuming displaced segment %r at %.1fs (< last region %.1fs)",
+                ns_text_raw[:40], ns_start, last_region_end,
+            )
+            _ci += 1
 
         logger.info("[ADLIB-VAD] %d regions detected; re-transcribing each", len(regions))
         sub_segs: list[list[dict]] = []

@@ -288,8 +288,8 @@ def _make_seg(text, start, end, words=None):
 def test_vad_split_adlib_splits_on_silence(monkeypatch, tmp_path):
     """Happy path: VAD finds 3 regions → all re-transcriptions succeed → 3 sub-segments.
 
-    The following normal segment starts 3s after the adlib end (gap > _ADLIB_NEXT_MERGE_GAP_S),
-    so lookforward does NOT apply — the normal segment passes through unchanged.
+    The normal segment starts 3s after the last VAD region ends (104s > last_region_end=101s),
+    so n_consumed stays at 1 and the normal segment passes through unchanged.
     """
     f = tmp_path / "vocals.wav"
     f.write_bytes(b"RIFF\x00\x00\x00\x00WAVE" + b"\x00" * 256)
@@ -315,19 +315,20 @@ def test_vad_split_adlib_splits_on_silence(monkeypatch, tmp_path):
 
 
 def test_vad_split_extends_window_for_mislabeled_tail(monkeypatch, tmp_path):
-    """Lookforward fixes the No Hay Santos 1:35 bug.
+    """Fixed lookahead recovers 'Tomas del miedo' from a single displaced segment.
 
-    whisperX places the adlib at 69.4-95.2s and misidentifies the adlib tail
-    as "Tomas del miedo tu don" starting at 95.2s (gap=0 ≤ 2s). The new code
-    extends the VAD window to 110.2s. VAD finds the real singing at 102s and
-    re-transcribes it with correct timing. Both original segments are consumed.
+    whisperX places the adlib at 69.4-95.2s and puts "Tomas del miedo tu don"
+    at 95.2-110.2s (wrong timing). VAD window = 69.4 + 20s = 89.2... wait,
+    process_end = seg_end + 20 = 115.2s. VAD finds the real singing at 102s.
+    last_region_end=107s; mislabeled starts at 95.2 < 107 → n_consumed=2.
+    Retranscription of all 4 regions gives correct timing.
     """
     import pytest
     f = tmp_path / "vocals.wav"
     f.write_bytes(b"RIFF\x00\x00\x00\x00WAVE" + b"\x00" * 256)
     audio_path = str(f)
 
-    # Extended window: 69.4-110.2s → VAD finds 3 uh clusters + 1 real lyric region
+    # Window 69.4-115.2s → VAD finds 3 uh clusters + 1 real lyric region at 102s
     monkeypatch.setattr(
         wx, "_detect_adlib_voice_regions",
         lambda *a, **k: [(73.0, 84.0), (84.5, 92.5), (93.0, 101.0), (102.0, 107.0)],
@@ -342,7 +343,8 @@ def test_vad_split_extends_window_for_mislabeled_tail(monkeypatch, tmp_path):
     monkeypatch.setenv("ADLIB_VAD_RETRANSCRIBE_ENABLED", "1")
 
     mega = _make_seg("uh uh uh uh uh uh uh uh uh uh", 69.4, 95.2)
-    mislabeled = _make_seg("Tomas del miedo tu don", 95.2, 110.2)  # gap=0 → lookforward
+    # last_region_end=107 > 95.2 → mislabeled is consumed (n_consumed=2)
+    mislabeled = _make_seg("Tomas del miedo tu don", 95.2, 110.2)
     out = wx._vad_split_adlib_segments([mega, mislabeled], audio_path, language="es")
 
     # Both original segs consumed; replaced by 3 uh + 1 lyric
@@ -350,9 +352,71 @@ def test_vad_split_extends_window_for_mislabeled_tail(monkeypatch, tmp_path):
     lyric_seg = next((s for s in out if "Tomas" in s.get("text", "")), None)
     assert lyric_seg is not None, "Lyric segment must appear in output"
     assert lyric_seg["start"] == pytest.approx(102.3, abs=0.01), (
-        f"Expected ~102.3s, got {lyric_seg['start']:.1f}s — lookforward fix failed"
+        f"Expected ~102.3s, got {lyric_seg['start']:.1f}s — lookahead fix failed"
     )
     assert lyric_seg["start"] > 100.0, "Timing must be past the adlib, not at 95s"
+
+
+def test_vad_split_consumes_multiple_displaced_segments(monkeypatch, tmp_path):
+    """No Hay Santos root-cause: TWO misplaced segments follow the adlib block.
+
+    whisperX output:
+      - adlib mega-block: 65.0-95.8s
+      - wrong "Tomas del miedo": 95.8-98.7s  (should be 102s)
+      - wrong "Frágil espejo":   98.8-104.0s (should be 110s)
+      - CORRECT "Tomas del miedo 2nd": 118.2s (large gap → must NOT be consumed)
+
+    Old logic (ns_end extension): only consumed 1 extra segment (to 98.7s),
+    leaving "Tomas del miedo" at 102s outside the VAD window → timing bug.
+
+    New logic (dynamic n_consumed via last_region_end=107):
+      - 95.8s < 107 → consumed
+      - 98.8s < 107 → consumed
+      - 118.2s >= 107 → stop, n_consumed=3
+    Retranscription of 4 VAD regions gives "Tomas del miedo" at ~102.3s.
+    """
+    import pytest
+    f = tmp_path / "vocals.wav"
+    f.write_bytes(b"RIFF\x00\x00\x00\x00WAVE" + b"\x00" * 256)
+    audio_path = str(f)
+
+    monkeypatch.setattr(
+        wx, "_detect_adlib_voice_regions",
+        lambda *a, **k: [(73.0, 84.0), (84.5, 92.5), (93.0, 101.0), (102.0, 107.0)],
+    )
+
+    def _fake_retranscribe(audio_path, start_s, end_s, language=None):
+        if start_s >= 102.0:
+            return [{"start": 102.3, "end": 105.1, "text": "Tomas del miedo tu don"}]
+        return [{"start": start_s + 0.1, "end": end_s - 0.1, "text": "uh uh uh"}]
+
+    monkeypatch.setattr(wx, "_retranscribe_slice", _fake_retranscribe)
+    monkeypatch.setenv("ADLIB_VAD_RETRANSCRIBE_ENABLED", "1")
+
+    adlib = _make_seg("uh uh uh uh uh uh uh uh uh uh", 65.0, 95.8)
+    wrong_tomas = _make_seg("Tomas del miedo tu don", 95.8, 98.7)
+    wrong_fragil = _make_seg("Frágil espejo de vos", 98.8, 104.0)
+    correct_tomas2 = _make_seg("Tomas del miedo tu don", 118.2, 124.5)
+
+    out = wx._vad_split_adlib_segments(
+        [adlib, wrong_tomas, wrong_fragil, correct_tomas2], audio_path, language="es"
+    )
+
+    # adlib + wrong_tomas + wrong_fragil consumed → replaced by 3 uh + lyric at 102s
+    # correct_tomas2 NOT consumed → passes through unchanged
+    assert len(out) == 5, f"expected 4 retranscribed + 1 unchanged = 5, got {len(out)}: {out}"
+
+    lyric_seg = next((s for s in out if "Tomas" in s.get("text", "") and s["start"] < 110), None)
+    assert lyric_seg is not None, "Retranscribed 'Tomas del miedo' must appear"
+    assert lyric_seg["start"] == pytest.approx(102.3, abs=0.01), (
+        f"Expected 102.3s (correct timing), got {lyric_seg['start']:.1f}s"
+    )
+
+    unchanged = out[-1]
+    assert unchanged["text"] == "Tomas del miedo tu don"
+    assert unchanged["start"] == pytest.approx(118.2, abs=0.01), (
+        f"Second 'Tomas del miedo' must be unchanged at 118.2s, got {unchanged['start']:.1f}s"
+    )
 
 
 def test_vad_split_falls_back_when_single_region(monkeypatch, tmp_path):
