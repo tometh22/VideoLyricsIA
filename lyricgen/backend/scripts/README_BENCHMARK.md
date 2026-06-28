@@ -136,3 +136,39 @@ El reporte trae:
 - WER mezcla todo el texto en un string — no diferencia entre "una
   línea entera mal" y "una palabra mal en cada línea". Mirar el
   detalle por job si una canción tiene WER alta.
+
+## A/B local rápido (sin prod DB) — comparar configs de transcribe()
+
+Cuando tenés el audio local y un ground-truth de referencia (p.ej. de un
+competidor o de un job aprobado exportado a `ground_truth.json`), podés
+comparar configs del pipeline SIN bajar el dataset de prod:
+
+```bash
+cd lyricgen/backend && source venv/bin/activate && export OPENAI_API_KEY=...
+# misma canción, 2 configs (toggles por env, sin tocar código):
+VAD_CHUNK_ENABLED=0 python scripts/bench_runner.py "cancion.mp3" dataset/<id>/baseline_output.json main_singlepass
+TRANSCRIBE_VAD_FIRST=1 python scripts/bench_runner.py "cancion.mp3" dataset/<id>/improvement_output.json vad_first
+python scripts/score_benchmark.py
+```
+
+`bench_runner.py` corre `pipeline.transcribe()` del checkout actual; los flags
+`VAD_CHUNK_ENABLED` / `TRANSCRIBE_VAD_FIRST` seleccionan la variante.
+
+### Métricas del scorer (2026-06)
+
+- **WER** (texto) y **AOO** (timing) como antes. El AOO ahora usa matching
+  **uno-a-uno** output↔ground: antes un estribillo repetido 7× matcheaba todo
+  contra la 1ª aparición e inflaba el p95 (~77s en "No Hay Santos"); ahora cada
+  línea reclama una distinta.
+- **recall**: fracción de líneas del ground-truth encontradas en el output.
+  Detecta líneas perdidas / colapso (1 segmento gigante) que el WER enmascara.
+
+`tests/test_score_benchmark.py` fija esta matemática (corre en CI, sin audio).
+
+### Pendiente: benchmark nightly en CI
+
+El loop completo (transcribir N canciones y medir WER/recall) NO corre en el CI
+por-PR: necesita audio + `OPENAI_API_KEY` + costo de API. Propuesta: un workflow
+`schedule:` (como `daily-smoke.yml`) que use `DATABASE_URL`+R2 para
+`build_benchmark_dataset.py` y un secret `OPENAI_API_KEY` para transcribir, y
+trackee la regresión. Requiere agregar ese secret.
